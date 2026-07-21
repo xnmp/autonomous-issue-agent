@@ -1,0 +1,17 @@
+[Unit]
+Description=Autonomous issue agent — architecture steward
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=uv run --extra sdk --with tree-sitter --with tree-sitter-bash python -m issue_agent.app.main steward
+WorkingDirectory=@HARNESS_ROOT@
+Environment=AGENT_ENV=@CONFIG@
+Environment=TARGET_DIR=@TARGET_DIR@
+Restart=always
+RestartSec=60
+StandardOutput=append:/tmp/issue-agent-steward.log
+StandardError=append:/tmp/issue-agent-steward.log
+
+[Install]
+WantedBy=default.target

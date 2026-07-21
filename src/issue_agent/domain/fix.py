@@ -1,0 +1,411 @@
+"""Fix-watcher decision logic — pure port of watcher.sh:poll_once + helpers.
+
+Structure mirrors the bash: small lesson-bearing cores (pick_ready_issue,
+issues_needing_resume, should_automerge, reap_actions, cleanup_actions) plus a
+`decide_fix` that composes them in the same priority order poll_once uses.
+
+Orchestration state that lives in STATE_DIR files (sessions, resumed-at marks,
+automerge markers) is passed in explicitly as `FixState`, and the live-fixer
+run-lock as `fixer_busy` — so the decision stays a pure function of its inputs.
+
+Concurrency model (preserved): ONE fixer, sequential dispatch. Within a single
+poll only ONE fixer-consuming action is emitted; non-fixer actions (auto-merge,
+cleanup) are independent of the lock.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+from .actions import (
+    Action,
+    AgentKind,
+    CloseIssue,
+    EnableAutoMerge,
+    UpdateBranch,
+    Relabel,
+    RemoveWorktree,
+    RunAgent,
+    Target,
+)
+from .ci import ci_state, latest_other_review
+from .labels import Label, priority_rank
+from .lifecycle import issue_lifecycle, pr_escalation, pr_lifecycle, retry_breaker
+from .refs import issue_from_branch
+from .world import (
+    CIState,
+    IssueView,
+    PRView,
+    WorldState,
+    REVIEW_APPROVED,
+    REVIEW_CHANGES_REQUESTED,
+    paths_overlap_open_prs,
+)
+
+
+@dataclass(frozen=True)
+class FixConfig:
+    fix_bot: str
+    identity_mode: str = "three"
+    auto_merge: bool = True
+    merge_method: str = "squash"
+    ci_ignore_checks: str = ""
+    close_issue_on_merge: bool = True
+    max_ci_retries: int = 3
+    max_review_retries: int = 3
+    auto_rebase_conflicts: bool = True
+    max_rebase_retries: int = 3
+
+
+@dataclass(frozen=True)
+class FixState:
+    """Persistent orchestration state (STATE_DIR files), passed in purely."""
+
+    sessions: frozenset[int] = frozenset()        # issues with a saved session
+    resumed_at: dict[int, str] = field(default_factory=dict)  # issue → last reply ts resumed on
+    automerge_enabled: frozenset[int] = frozenset()  # PRs already auto-merge-enabled (marker)
+    # Per-issue retry counters (issue → count). Drive the circuit breakers: an
+    # unbounded fix-CI / address-review loop burns budget forever, so at the cap
+    # we escalate to a human instead of re-dispatching. Default 0 (no attempts).
+    ci_retries: dict[int, int] = field(default_factory=dict)
+    review_retries: dict[int, int] = field(default_factory=dict)
+    rebase_retries: dict[int, int] = field(default_factory=dict)
+
+
+# ── cores ────────────────────────────────────────────────────────────────────
+def pick_ready_issue(world: WorldState) -> int | None:
+    """Highest-priority ai-ready issue number, or None. Port of watcher.sh §1
+    (P1<P2<P3<none; ties broken by issue number for determinism — the bash relied
+    on gh's list order, we make it explicit).
+
+    An issue with an OPEN GitHub-native "blocked by" dependency is SKIPPED — its
+    prerequisite isn't on the base branch yet, so dispatching it makes the fixer
+    build against a missing layer (observed with the P3–P6 series depending on the
+    P2 route layer). The blocker resolves via GitHub's dependency graph; when the
+    last blocker closes, the issue becomes pickable automatically next poll.
+
+    Also SKIPPED: an issue whose body-declared file paths overlap the changed
+    files of an OPEN PR. Two issues editing the same files in parallel produce a
+    guaranteed merge conflict when the second PR tries to land (observed: #59 vs
+    #60 both rewired the ConversationService composition root). Holding the second
+    issue until the first PR merges serialises the collision away. Fail-open: an
+    issue that declares no paths can't be predicted, so it is NOT held (the gate
+    only fires on a concrete, known overlap)."""
+    ready = [
+        i for i in world.open_issues()
+        if issue_lifecycle(i).is_ready
+        and not i.blocked_by_open
+        and not paths_overlap_open_prs(i.declared_paths, world.prs)
+    ]
+    if not ready:
+        return None
+    ready.sort(key=lambda i: (priority_rank(i.labels), i.number))
+    return ready[0].number
+
+
+def _last_human_reply_at(issue: IssueView, fix_bot: str) -> str | None:
+    """createdAt of the latest comment by a real human (not the fixer, not any
+    [bot]). Port of the jq in watcher.sh §2 / resume-issue.sh."""
+    humans = [
+        c for c in issue.comments
+        if c.author != fix_bot and not c.is_bot
+    ]
+    if not humans:
+        return None
+    return humans[-1].created_at or None
+
+
+def issues_needing_resume(
+    world: WorldState, state: FixState, cfg: FixConfig
+) -> list[tuple[int, str]]:
+    """ai-blocked issues with a session AND a human reply we have NOT yet resumed
+    on. Returns (issue_number, reply_at). The resumed-at dedupe is the anti-loop
+    lesson: a single reply must not re-trigger resume every poll."""
+    out: list[tuple[int, str]] = []
+    for issue in world.issues:
+        lifecycle = issue_lifecycle(issue)
+        if not lifecycle.is_blocked or issue.number not in state.sessions:
+            continue
+        last_at = _last_human_reply_at(issue, cfg.fix_bot)
+        if last_at is None:
+            continue
+        if last_at != state.resumed_at.get(issue.number, ""):
+            out.append((issue.number, last_at))
+    return out
+
+
+def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
+    """Port of watcher-lib.sh:maybe_automerge gating. Requires: AUTO_MERGE on, no
+    existing marker, an APPROVED review by a DISTINCT actor, CI ok|none, and
+    three-identity mode (solo has no independent approver → 422 on self-merge)."""
+    if not cfg.auto_merge:
+        return False
+    if pr.number in state.automerge_enabled:
+        return False
+    if cfg.identity_mode != "three":
+        return False
+    review = latest_other_review(pr.reviews, cfg.fix_bot)
+    if review is None or review.state != REVIEW_APPROVED:
+        return False
+    return ci_state(pr.checks, cfg.ci_ignore_checks) in (CIState.OK, CIState.NONE)
+
+
+def should_update_branch(pr: PRView, cfg: FixConfig) -> bool:
+    """A merge-ready PR (distinct APPROVED review + CI ok/none) that is BEHIND its
+    base needs its branch brought up to date so an armed auto-merge can land it.
+
+    Deliberately INDEPENDENT of the automerge-enabled marker (unlike
+    should_automerge): a PR armed while CLEAN that LATER goes BEHIND (its base
+    advanced) — or one armed on a poll BEFORE this update-branch logic existed —
+    would otherwise stay stuck forever, armed-but-behind. Only MERGEABLE+BEHIND:
+    a CONFLICTING branch takes the REBASE agent path (§3a). Self-limiting: after
+    an update the branch is no longer BEHIND until the base advances again, so this
+    does not re-fire every poll."""
+    if not cfg.auto_merge or cfg.identity_mode != "three":
+        return False
+    if not pr.is_behind():
+        return False
+    review = latest_other_review(pr.reviews, cfg.fix_bot)
+    if review is None or review.state != REVIEW_APPROVED:
+        return False
+    return ci_state(pr.checks, cfg.ci_ignore_checks) in (CIState.OK, CIState.NONE)
+
+
+def reap_actions(world: WorldState) -> list[Action]:
+    """When no fixer is alive, anything still ai-working is orphaned (the script
+    died before resetting the label). Requeue issues → ai-ready; clear ai-working
+    on PRs (a PR must NOT go to ai-ready — that label is for issues). Port of
+    watcher-lib.sh:reap."""
+    actions: list[Action] = []
+    for issue in world.issues_with(Label.AI_WORKING):
+        actions.append(
+            Relabel(Target.ISSUE, issue.number, Label.AI_WORKING, Label.AI_READY)
+        )
+    for pr in world.prs_with(Label.AI_WORKING):
+        actions.append(Relabel(Target.PR, pr.number, Label.AI_WORKING, None))
+    return actions
+
+
+def cleanup_actions(
+    pr: PRView, issue_number: int | None, cfg: FixConfig
+) -> list[Action]:
+    """Merged/closed PR cleanup. Port of cleanup.sh. MERGED → issue ai-pr-open→
+    ai-done (+ optional close, since GitHub only auto-closes on default-branch
+    merges); CLOSED-unmerged → issue ai-pr-open→ai-ready (re-queue). Always drop
+    ai-pr-open from the PR and remove the worktree."""
+    actions: list[Action] = []
+    if issue_number is not None:
+        actions.append(RemoveWorktree(issue_number))
+    if pr.state == "MERGED":
+        if issue_number is not None:
+            actions.append(
+                Relabel(Target.ISSUE, issue_number, Label.AI_PR_OPEN, Label.AI_DONE)
+            )
+            if cfg.close_issue_on_merge:
+                actions.append(
+                    CloseIssue(
+                        issue_number,
+                        comment=f"Resolved by #{pr.number} (merged).",
+                    )
+                )
+    else:  # CLOSED unmerged → re-queue the issue
+        if issue_number is not None:
+            actions.append(
+                Relabel(Target.ISSUE, issue_number, Label.AI_PR_OPEN, Label.AI_READY)
+            )
+    actions.append(Relabel(Target.PR, pr.number, Label.AI_PR_OPEN, None))
+    return actions
+
+
+def _issue_for_pr(pr: PRView) -> int | None:
+    """Linked issue: prefer GitHub's closing-reference, fall back to the branch
+    number. Port of issue_for_pr || issue_from_branch."""
+    if pr.closing_issue is not None:
+        return pr.closing_issue
+    return issue_from_branch(pr.head_ref_name)
+
+
+def breaker_key(pr: PRView) -> int:
+    """Stable retry-counter key for a PR. Prefer the linked issue number; when a
+    PR has NO resolvable issue (no closing-ref AND a branch without a numeric issue
+    — e.g. a Jira-keyed `feat/ACME-2468-…` branch), fall back to the NEGATED PR
+    number so the counter still accumulates per-PR. The old `issue_n or -1` sentinel
+    collapsed EVERY issue-less PR onto the single dead key -1: it was never written
+    (the workflow incremented under the PR's own None→? key) so the breaker never
+    tripped → infinite REBASE/CI loop (observed: PR #112). Negated so it can't
+    collide with a real issue N. The workflow increments under the SAME key."""
+    n = _issue_for_pr(pr)
+    return n if n is not None else -pr.number
+
+
+# ── circuit breakers ──────────────────────────────────────────────────────────
+def breaker_tripped(count: int, cap: int) -> bool:
+    """A retry loop has hit its ceiling. cap<=0 disables the breaker (unbounded).
+    `count` is attempts already made; tripped once it reaches the cap."""
+    return retry_breaker(count, cap).tripped
+
+
+def _escalate_pr(pr: int, reason: str) -> list[Action]:
+    """Stop dispatching a stuck PR leg: comment why, then swap ai-pr-open for
+    needs-human-review so neither the fixer nor the reviewer re-acts on it."""
+    return pr_escalation(pr, reason).actions()
+
+
+# ── composition ────────────────────────────────────────────────────────────
+def decide_fix(
+    world: WorldState,
+    cfg: FixConfig,
+    state: FixState,
+    fixer_busy: bool,
+) -> list[Action]:
+    """One fix-watcher poll. Emits, in poll_once order:
+
+      reap (when idle) → at most ONE fixer-consuming dispatch (resolve > resume >
+      address-review > fix-ci, in that priority) → auto-merge (lock-free) →
+      cleanup of merged/closed PRs (lock-free).
+
+    Only ONE fixer-consuming action is ever returned per poll (the single-fixer
+    invariant). `fixer_busy` reflects the live run-lock.
+    """
+    actions: list[Action] = []
+
+    # reap runs only when idle (bash: reap() returns early if fixer_busy).
+    if not fixer_busy:
+        actions.extend(reap_actions(world))
+
+    consumed = fixer_busy
+    # Only the fixer's OWN PRs are actionable here. The reviewer "adopts" rogue PRs
+    # (labels any unlabelled OPEN PR with ai-pr-open so it gets reviewed) — including
+    # PRs opened by humans. But the fixer has a worktree + session ONLY for its own
+    # issue-branch PRs, so dispatching ADDRESS_REVIEW/FIX_CI/REBASE on someone else's
+    # PR does no work (nothing to push) yet still burns a fixer leg and mislabels the
+    # PR ai-blocked (observed: PR #351, opened by a human, adopted for review, then
+    # the fixer commented + blocked it). Gate on authorship: a PR whose author is not
+    # FIX_BOT belongs to a human — leave it for them. `author == ""` (unknown) is
+    # treated as NOT-ours (fail-safe: never touch a PR we can't confirm we authored).
+    open_prs = [
+        p for p in world.prs
+        if p.has(Label.AI_PR_OPEN) and p.state == "OPEN" and p.author == cfg.fix_bot
+    ]
+
+    # 1) New ai-ready issue (highest priority).
+    if not consumed:
+        n = pick_ready_issue(world)
+        if n is not None:
+            actions.append(
+                Relabel(Target.ISSUE, n, Label.AI_READY, Label.AI_WORKING)
+            )
+            actions.append(RunAgent(AgentKind.RESOLVE, n))
+            consumed = True
+
+    # 2) Blocked issue with a NEW human reply (first one only).
+    if not consumed:
+        needing = issues_needing_resume(world, state, cfg)
+        if needing:
+            n, _at = needing[0]
+            # Flip ai-blocked → ai-working for the duration of the resume run, so an
+            # actively-resuming issue reads as working (not still-blocked) and a
+            # second poll can't treat it as awaiting-human. Mirrors the RESOLVE
+            # dispatch relabel. resume_actions transitions FROM ai-working at the
+            # tail (pr-open / back-to-blocked / etc.), so this closes the loop.
+            actions.append(
+                Relabel(Target.ISSUE, n, Label.AI_BLOCKED, Label.AI_WORKING)
+            )
+            actions.append(RunAgent(AgentKind.RESUME, n))
+            consumed = True
+
+    # 3) Open PRs: review responses + CI (one fixer-consuming action total).
+    for pr in open_prs:
+        lifecycle = pr_lifecycle(pr)
+        if lifecycle.is_blocked:
+            continue  # awaiting human clarification — leave alone
+        if not consumed:
+            issue_n = _issue_for_pr(pr)
+            bkey = breaker_key(pr)  # retry-counter key (issue N, or -PR when issueless)
+            # 3·0) A PR the fixer CANNOT resolve to an issue (no closing-ref AND a
+            # non-numeric branch — e.g. a Jira-keyed `feat/ACME-2468-…` PR opened
+            # outside the harness) has no issue-keyed worktree/session, so every
+            # fixer agent (rebase/address-review/fix-ci) early-returns without doing
+            # work — re-dispatching forever (observed: PR #112 rebase loop). The
+            # fixer can't drive it; hand it to a human ONCE and stop re-acting. Only
+            # when it actually needs the fixer (conflict / changes-requested / CI
+            # fail); a clean issueless PR is left for the reviewer + auto-merge.
+            if issue_n is None:
+                _rev = latest_other_review(pr.reviews, cfg.fix_bot)
+                needs_fix = (
+                    (cfg.auto_rebase_conflicts and pr.is_conflicting())
+                    or (_rev is not None and _rev.state == REVIEW_CHANGES_REQUESTED)
+                    or (not pr_lifecycle(pr).is_working
+                        and ci_state(pr.checks, cfg.ci_ignore_checks) == CIState.FAILURE)
+                )
+                if needs_fix:
+                    actions.extend(_escalate_pr(
+                        pr.number,
+                        "this PR has no linked GitHub issue (no `Closes #n` and a "
+                        "branch without an issue number), so the issue-scoped fixer "
+                        "can't drive it — a human needs to rebase/fix or link an issue.",
+                    ))
+                continue
+            # 3a) CONFLICTING branch → wake the fixer to rebase onto base. The
+            # backup plan for a conflict that slipped past the pre-dispatch
+            # file-overlap gate (two in-flight PRs colliding, or an issue that
+            # declared no paths). The agent already has the worktree + session —
+            # it just needs re-triggering (its session ended at pr_opened, before
+            # the conflict existed). Bounded by a breaker → needs-human-review, so
+            # a conflict it genuinely can't resolve escalates instead of looping.
+            if cfg.auto_rebase_conflicts and pr.is_conflicting():
+                if breaker_tripped(state.rebase_retries.get(bkey, 0),
+                                   cfg.max_rebase_retries):
+                    actions.extend(_escalate_pr(
+                        pr.number,
+                        f"rebase failed {cfg.max_rebase_retries}× without a clean "
+                        "merge — the conflict needs a human.",
+                    ))
+                    continue
+                actions.append(RunAgent(AgentKind.REBASE, pr.number))
+                consumed = True
+                continue
+            review = latest_other_review(pr.reviews, cfg.fix_bot)
+            if review is not None and review.state == REVIEW_CHANGES_REQUESTED:
+                # Circuit breaker: repeated failed address-review attempts on the
+                # same PR escalate to a human rather than looping forever.
+                if breaker_tripped(state.review_retries.get(bkey, 0),
+                                   cfg.max_review_retries):
+                    actions.extend(_escalate_pr(
+                        pr.number,
+                        f"address-review failed {cfg.max_review_retries}× without resolution.",
+                    ))
+                    continue
+                actions.append(RunAgent(AgentKind.ADDRESS_REVIEW, pr.number))
+                consumed = True
+                continue
+            if not lifecycle.is_working and ci_state(
+                pr.checks, cfg.ci_ignore_checks
+            ) == CIState.FAILURE:
+                if breaker_tripped(state.ci_retries.get(bkey, 0),
+                                   cfg.max_ci_retries):
+                    actions.extend(_escalate_pr(
+                        pr.number,
+                        f"CI fix failed {cfg.max_ci_retries}× without going green.",
+                    ))
+                    continue
+                actions.append(RunAgent(AgentKind.FIX_CI, pr.number))
+                consumed = True
+                continue
+        # 3c) auto-merge + branch-update do NOT need the lock and are INDEPENDENT.
+        #   arm auto-merge once (marker-guarded), AND
+        #   update a merge-ready-but-BEHIND branch so the armed auto-merge lands —
+        #   even if it was armed on an earlier poll (CLEAN then base advanced) or
+        #   before this logic existed. should_update_branch is marker-independent by
+        #   design; both are self-limiting so neither re-fires needlessly.
+        if should_automerge(pr, state, cfg):
+            actions.append(EnableAutoMerge(pr.number, cfg.merge_method))
+        if should_update_branch(pr, cfg):
+            actions.append(UpdateBranch(pr.number))
+
+    # 4) Merged/closed PRs → cleanup (lock-free).
+    for pr in world.prs:
+        if pr_lifecycle(pr).needs_cleanup:
+            actions.extend(cleanup_actions(pr, _issue_for_pr(pr), cfg))
+
+    return actions

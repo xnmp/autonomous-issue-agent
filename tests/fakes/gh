@@ -1,0 +1,402 @@
+#!/usr/bin/env python3
+"""Stateful fake `gh` for orchestration tests.
+
+Backs issues / PRs / reviews / checks with a JSON file (env ISSUE_AGENT_FAKE_STATE).
+Emits the JSON real `gh --json <fields>` would, then — if `--jq <expr>` is given —
+pipes that JSON through the REAL `jq` binary so the scripts' jq expressions are
+exercised verbatim. Mutations (create/edit/comment/merge) update the state file.
+
+Only the subset of subcommands the harness uses is implemented; anything else is
+a no-op that exits 0 (so an unanticipated call never wedges a test).
+"""
+import json
+import os
+import subprocess
+import sys
+
+STATE = os.environ["ISSUE_AGENT_FAKE_STATE"]
+
+
+def load():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"issues": {}, "prs": {}, "labels": [], "runs": {}, "next_pr": 100}
+
+
+def save(s):
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(s, f, indent=2)
+    os.replace(tmp, STATE)
+
+
+def emit(obj, args):
+    """Serialize obj; if --jq present, pipe through real jq; else print JSON.
+    Forwards any --arg NAME VALUE pairs to jq (real gh accepts them alongside --jq)."""
+    payload = json.dumps(obj)
+    jq = flag(args, "--jq")
+    if jq is not None:
+        argv = ["jq", "-r"]
+        for i, a in enumerate(args):
+            if a == "--arg" and i + 2 < len(args):
+                argv += ["--arg", args[i + 1], args[i + 2]]
+        argv.append(jq)
+        p = subprocess.run(argv, input=payload, capture_output=True, text=True)
+        sys.stdout.write(p.stdout)
+        sys.stderr.write(p.stderr)
+        sys.exit(p.returncode)
+    print(payload)
+    sys.exit(0)
+
+
+def flag(args, name):
+    """Value of --name X (or None). Supports --name=value too."""
+    for i, a in enumerate(args):
+        if a == name and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith(name + "="):
+            return a.split("=", 1)[1]
+    return None
+
+
+def has(args, name):
+    return name in args
+
+
+def all_flags(args, name):
+    """All values of a repeatable flag like -f event=x -f body=y."""
+    out = []
+    for i, a in enumerate(args):
+        if a == name and i + 1 < len(args):
+            out.append(args[i + 1])
+    return out
+
+
+def pos(args):
+    """Positional args (skip flags and their values)."""
+    skip_next = False
+    out = []
+    valued = {
+        "--repo", "--json", "--jq", "--label", "--add-label", "--remove-label",
+        "--body", "--body-file", "--title", "--state", "--search", "--head",
+        "--base", "--status", "--branch", "--method", "-f", "-F", "--field",
+        "--limit", "--add-dir",
+    }
+    for i, a in enumerate(args):
+        if skip_next:
+            skip_next = False
+            continue
+        if a in valued:
+            skip_next = True
+            continue
+        if a.startswith("-"):
+            continue
+        out.append(a)
+    return out
+
+
+def labels_of(obj):
+    return [{"name": n} for n in obj.get("labels", [])]
+
+
+def touch(s, iss):
+    """Bump updatedAt like real GitHub does on any mutation (comment/edit/close),
+    using a monotonic per-state counter (deterministic — no wallclock in tests).
+    This is what makes the steward's own comment advance updatedAt, so the triage
+    idempotency guard is exercised faithfully."""
+    nxt = int(s.get("_clock", 0)) + 1
+    s["_clock"] = nxt
+    iss["updatedAt"] = "2026-06-25T00:00:%02dZ" % (nxt % 60)
+    if nxt >= 60:  # carry into minutes so ordering stays monotonic past 60 ticks
+        iss["updatedAt"] = "2026-06-25T00:%02d:00Z" % (nxt // 60)
+
+
+# ── command handlers ──────────────────────────────────────────────────────────
+def cmd_issue(args, s):
+    sub = args[0]
+    rest = args[1:]
+    p = pos(rest)
+    if sub == "list":
+        label = flag(rest, "--label")
+        search = flag(rest, "--search")
+        items = []
+        for n, iss in sorted(s["issues"].items(), key=lambda kv: int(kv[0])):
+            if iss.get("state", "open") != "open" and flag(rest, "--state") != "all":
+                # default list shows open only unless --state all/closed
+                st = flag(rest, "--state")
+                if st not in ("all",) and not (st == iss.get("state")):
+                    if st != "closed":
+                        continue
+            if label and label not in iss.get("labels", []):
+                continue
+            if search and " in:title" in search:
+                term = search.replace(" in:title", "").strip()
+                if term.lower() not in iss.get("title", "").lower():
+                    continue
+            items.append({"number": int(n), "title": iss.get("title", ""),
+                          "labels": labels_of(iss),
+                          "updatedAt": iss.get("updatedAt", ""),
+                          "author": {"login": iss.get("author", {}).get("login",
+                                     iss.get("authorLogin", "issue-author"))}})
+        emit(items, rest)
+    elif sub == "view":
+        n = p[0]
+        iss = s["issues"].get(n, {})
+        obj = {
+            "title": iss.get("title", ""),
+            "body": iss.get("body", ""),
+            "comments": iss.get("comments", []),
+            "labels": labels_of(iss),
+            "number": int(n) if n.isdigit() else n,
+            "state": iss.get("state", "open").upper(),
+            "stateReason": iss.get("stateReason", ""),
+            "updatedAt": iss.get("updatedAt", ""),
+            "author": {"login": iss.get("author", {}).get("login",
+                       iss.get("authorLogin", "issue-author"))},
+        }
+        emit(obj, rest)
+    elif sub == "create":
+        nums = [int(x) for x in s["issues"].keys()] or [0]
+        n = str(max(nums) + 1)
+        lab = flag(rest, "--label") or ""
+        s["issues"][n] = {
+            "number": int(n), "title": flag(rest, "--title") or "",
+            "body": flag(rest, "--body") or "",
+            "labels": [x for x in lab.split(",") if x], "comments": [], "state": "open",
+        }
+        save(s)
+        print(f"https://example/issues/{n}")
+    elif sub == "edit":
+        n = p[0]
+        iss = s["issues"].setdefault(n, {"number": int(n), "labels": [], "comments": []})
+        labs = set(iss.get("labels", []))
+        add = flag(rest, "--add-label")
+        rm = flag(rest, "--remove-label")
+        if add:
+            labs |= {x for x in add.split(",") if x}
+        if rm:
+            labs -= {x for x in rm.split(",") if x}
+        iss["labels"] = sorted(labs)
+        touch(s, iss)
+        save(s)
+    elif sub == "comment":
+        n = p[0]
+        iss = s["issues"].setdefault(n, {"number": int(n), "labels": [], "comments": []})
+        author = os.environ.get("FAKE_GH_LOGIN", "human-user")
+        iss.setdefault("comments", []).append({"author": {"login": author},
+                                               "body": flag(rest, "--body") or ""})
+        touch(s, iss)
+        save(s)
+    elif sub == "close":
+        n = p[0]
+        iss = s["issues"].setdefault(n, {"number": int(n), "labels": [], "comments": []})
+        iss["state"] = "closed"
+        iss["stateReason"] = flag(rest, "--reason") or "completed"
+        c = flag(rest, "--comment")
+        if c:
+            author = os.environ.get("FAKE_GH_LOGIN", "human-user")
+            iss.setdefault("comments", []).append({"author": {"login": author}, "body": c})
+        touch(s, iss)
+        save(s)
+    sys.exit(0)
+
+
+def cmd_pr(args, s):
+    sub = args[0]
+    rest = args[1:]
+    p = pos(rest)
+    if sub == "list":
+        head = flag(rest, "--head")
+        label = flag(rest, "--label")
+        state = flag(rest, "--state")
+        base = flag(rest, "--base")
+        items = []
+        for n, pr in sorted(s["prs"].items(), key=lambda kv: int(kv[0])):
+            prstate = pr.get("state", "OPEN")
+            if state == "open" and prstate != "OPEN":
+                continue
+            if state == "merged" and prstate != "MERGED":
+                continue
+            if state in (None, "") and prstate != "OPEN":
+                continue
+            # --state all → no filter
+            if head and pr.get("headRefName") != head:
+                continue
+            if label and label not in pr.get("labels", []):
+                continue
+            if base and pr.get("base") != base:
+                continue
+            items.append({
+                "number": int(n), "state": prstate,
+                "title": pr.get("title", ""),
+                "headRefName": pr.get("headRefName", ""),
+                "labels": labels_of(pr),
+                "reviews": pr.get("reviews", []),
+            })
+        emit(items, rest)
+    elif sub == "view":
+        n = p[0]
+        pr = s["prs"].get(n, {})
+        obj = {
+            "number": int(n) if n.isdigit() else n,
+            "title": pr.get("title", ""),
+            "body": pr.get("body", ""),
+            "headRefName": pr.get("headRefName", ""),
+            "headRefOid": pr.get("headRefOid", ""),
+            "state": pr.get("state", "OPEN"),
+            "labels": labels_of(pr),
+            "reviews": pr.get("reviews", []),
+            "closingIssuesReferences":
+                [{"number": pr["issue"]}] if pr.get("issue") else [],
+        }
+        emit(obj, rest)
+    elif sub == "edit":
+        n = p[0]
+        pr = s["prs"].setdefault(n, {"number": int(n), "labels": []})
+        labs = set(pr.get("labels", []))
+        add = flag(rest, "--add-label")
+        rm = flag(rest, "--remove-label")
+        if add:
+            labs |= {x for x in add.split(",") if x}
+        if rm:
+            labs -= {x for x in rm.split(",") if x}
+        pr["labels"] = sorted(labs)
+        save(s)
+    elif sub == "comment":
+        n = p[0]
+        pr = s["prs"].setdefault(n, {"number": int(n), "labels": []})
+        pr.setdefault("pr_comments", []).append(flag(rest, "--body") or "")
+        save(s)
+    elif sub == "checks":
+        n = p[0]
+        pr = s["prs"].get(n, {})
+        checks = pr.get("checks", [])
+        # Real `gh pr checks` supports --jq but NOT --arg (only `gh api` does).
+        # Reject --arg here so the fake can't paper over an arg the real CLI errors
+        # on (this exact gap let a broken ci_state pass tests yet fail live).
+        if flag(rest, "--arg") is not None:
+            sys.stderr.write("unknown flag: --arg\n")
+            sys.exit(1)
+        if has(rest, "--json"):
+            emit(checks, rest)
+        # plain-text form: one line per check; failing lines contain 'fail'
+        for c in checks:
+            print(f"{c.get('name','check')}\t{c.get('bucket', c.get('state',''))}\thttp://x")
+        # exit non-zero if any failing (real gh behaviour); scripts tolerate it
+        sys.exit(1 if any(c.get("bucket") == "fail" for c in checks) else 0)
+    elif sub == "diff":
+        n = p[0]
+        print(s["prs"].get(n, {}).get("diff", "diff --git a/x b/x\n+change"))
+        sys.exit(0)
+    elif sub == "merge":
+        n = p[0]
+        pr = s["prs"].setdefault(n, {"number": int(n), "labels": []})
+        # --auto: mark auto-merge enabled; the test 'lands' it explicitly later.
+        if has(rest, "--auto"):
+            pr["automerge"] = True
+        else:
+            pr["state"] = "MERGED"
+        save(s)
+    elif sub == "checkout":
+        sys.exit(0)
+    sys.exit(0)
+
+
+def cmd_api(args, s):
+    path = pos(args)[0] if pos(args) else ""
+    method = flag(args, "--method") or "GET"
+    # POST a review
+    if path.endswith("/reviews") and method == "POST":
+        parts = path.split("/")
+        n = parts[parts.index("pulls") + 1]
+        fields = {}
+        for kv in all_flags(args, "-f"):
+            k, _, v = kv.partition("=")
+            fields[k] = v
+        pr = s["prs"].setdefault(n, {"number": int(n), "labels": [], "reviews": []})
+        state_map = {"APPROVE": "APPROVED", "REQUEST_CHANGES": "CHANGES_REQUESTED",
+                     "COMMENT": "COMMENTED"}
+        login = os.environ.get("FAKE_GH_LOGIN", "review-bot")
+        idx = len(pr.get("reviews", []))
+        pr.setdefault("reviews", []).append({
+            "state": state_map.get(fields.get("event"), fields.get("event")),
+            "user": {"login": login},
+            "submitted_at": f"2026-01-01T00:00:{idx:02d}Z",
+            "body": fields.get("body", ""),
+        })
+        save(s)
+        print("{}")
+        sys.exit(0)
+    # GET reviews
+    if path.endswith("/reviews"):
+        parts = path.split("/")
+        n = parts[parts.index("pulls") + 1]
+        emit(s["prs"].get(n, {}).get("reviews", []), args)
+    # GET pull comments
+    if path.endswith("/comments"):
+        parts = path.split("/")
+        n = parts[parts.index("pulls") + 1]
+        emit(s["prs"].get(n, {}).get("inline_comments", []), args)
+    # compare endpoint
+    if "/compare/" in path:
+        emit({"files": [{"filename": "x.py", "patch": "@@ +new"}]}, args)
+    if path == "user":
+        emit({"login": os.environ.get("FAKE_GH_LOGIN", "fix-bot")}, args)
+    print("{}")
+    sys.exit(0)
+
+
+def cmd_run(args, s):
+    sub = args[0]
+    rest = args[1:]
+    if sub == "list":
+        branch = flag(rest, "--branch")
+        runs = s.get("runs", {}).get(branch, [])
+        emit(runs, rest)
+    elif sub == "view":
+        print(s.get("run_log", "FAIL test_x: assertion error\n"))
+    sys.exit(0)
+
+
+def cmd_repo(args, s):
+    if args[0] == "view":
+        emit({"name": pos(args[1:])[0] if pos(args[1:]) else "repo"}, args[1:])
+    sys.exit(0)
+
+
+def cmd_label(args, s):
+    if args[0] == "create":
+        name = pos(args[1:])[0] if pos(args[1:]) else ""
+        if name and name not in s.setdefault("labels", []):
+            s["labels"].append(name)
+            save(s)
+    sys.exit(0)
+
+
+def cmd_auth(args, s):
+    print("Logged in (fake)")
+    sys.exit(0)
+
+
+def main():
+    args = sys.argv[1:]
+    if not args:
+        sys.exit(0)
+    s = load()
+    cmd, rest = args[0], args[1:]
+    handlers = {
+        "issue": cmd_issue, "pr": cmd_pr, "api": cmd_api, "run": cmd_run,
+        "repo": cmd_repo, "label": cmd_label, "auth": cmd_auth,
+    }
+    h = handlers.get(cmd)
+    if h is None:
+        sys.exit(0)  # unknown command → no-op, never wedge a test
+    # cmd_api inspects the path positionally from its own args (without the
+    # leading "api"); every other handler takes the post-subcommand args.
+    h(rest, s)
+
+
+if __name__ == "__main__":
+    main()

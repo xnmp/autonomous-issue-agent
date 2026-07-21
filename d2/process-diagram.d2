@@ -1,0 +1,92 @@
+# Autonomous Issue Resolution — Lifecycle (Diagram 1 of 2)
+# D2 rendering for comparison against the hand-authored SVG.
+
+direction: down
+
+vars: {
+  d2-config: {
+    layout-engine: elk
+  }
+}
+
+classes: {
+  human:   { style: { fill: "#fef3c7"; stroke: "#d97706"; font-color: "#92400e" } }
+  fix:     { style: { fill: "#dbeafe"; stroke: "#2563eb"; font-color: "#1e3a8a" } }
+  review:  { style: { fill: "#d1fae5"; stroke: "#059669"; font-color: "#065f46" } }
+  steward: { style: { fill: "#f5f3ff"; stroke: "#7c3aed"; font-color: "#5b21b6" } }
+  label:   { style: { fill: "#e2e8f0"; stroke: "#334155"; font-color: "#1e293b"; border-radius: 20 } }
+  good:    { style: { fill: "#dcfce7"; stroke: "#16a34a"; font-color: "#15803d"; border-radius: 20 } }
+  decision:{ shape: diamond; style: { fill: "#fff7ed"; stroke: "#ea580c"; font-color: "#9a3412" } }
+  gate:    { shape: hexagon; style: { fill: "#fee2e2"; stroke: "#dc2626"; font-color: "#b91c1c" } }
+  merge:   { style: { fill: "#334155"; stroke: "#1e293b"; font-color: "#ffffff" } }
+}
+
+steward: ARCHITECTURE STEWARD · steward-bot {
+  class: steward
+  near: top-center
+  tooltip: persistent, stateful — owns INVARIANTS.md + ADRs; mines merged PRs into durable defaults
+}
+
+# ---- States (GitHub labels) ----
+ai_ready: ai-ready { class: label }
+ai_blocked: ai-blocked { class: label }
+ai_pr_open: "ai-pr-open\n(PR → dev)" { class: label }
+needs_human: needs-human-review { class: review }
+approved: approved { class: good }
+ai_done: ai-done { class: label }
+
+# ---- Human actions ----
+file_issue: "① File issue\nhuman writes acceptance criteria" { class: human }
+human_replies: "Human replies\nany teammate · async" { class: human }
+human_takeover: "Human takes over\nreviews / decides" { class: human }
+prod: "Merge dev → prod\nhuman · out of scope" { class: human }
+
+# ---- Fix agent ----
+resolve: "resolve-issue.sh\nclaude -p --worktree · sets ai-working\nTDD internals → see Diagram 2" { class: fix }
+fix_ci: "fix-ci.sh\nclaude -p --resume · ≤3 tries" { class: fix }
+address: "address-review.sh\nclaude -p --resume → push" { class: fix }
+
+# ---- Gate + decisions ----
+gate: "GATE — hooks\non gh pr create\nbranch·commit·PR" { class: gate }
+ci_green: "CI green?" { class: decision }
+verdict: "verdict?\nschema decision" { class: decision }
+
+# ---- Review agent ----
+review_pr: "review-pr.sh / re-review-pr.sh\nclaude -p · diff (+ optional checkout)\ndifferent model recommended" { class: review }
+merge: "merge → dev\nauto-merge or human" { class: merge }
+
+# ============ HAPPY PATH ============
+file_issue -> ai_ready: fix-watcher
+ai_ready -> resolve
+resolve -> gate
+gate -> ai_pr_open: PR created → dev
+ai_pr_open -> ci_green
+ci_green -> review_pr: "yes · pass → review-watcher"
+review_pr -> verdict
+verdict -> approved: APPROVE
+approved -> merge
+merge -> ai_done
+
+# ============ BLOCKED LOOP (agent self-marks, before the gate) ============
+resolve -> ai_blocked: "blocked" { style.stroke-dash: 4; style.stroke: "#d97706" }
+ai_blocked -> human_replies { style.stroke-dash: 4; style.stroke: "#d97706" }
+human_replies -> resolve: "resume-issue.sh" { style.stroke-dash: 4; style.stroke: "#d97706" }
+
+# ============ CI FAIL LOOP ============
+ci_green -> fix_ci: "fail" { style.stroke-dash: 4; style.stroke: "#2563eb" }
+fix_ci -> ai_pr_open: "push ⟳ CI (≤3 → ai-blocked)" { style.stroke-dash: 4; style.stroke: "#2563eb" }
+
+# ============ REVIEW CHANGES LOOP ============
+verdict -> address: "REQUEST_CHANGES → comment" { style.stroke-dash: 4; style.stroke: "#059669" }
+address -> ai_pr_open: "push ⟳ (new commits re-trigger CI + review)" { style.stroke-dash: 4; style.stroke: "#2563eb" }
+
+# ============ ESCALATE ============
+verdict -> needs_human: "ESCALATE (round 5)" { style.stroke-dash: 4; style.stroke: "#059669" }
+needs_human -> human_takeover: "human manages" { style.stroke-dash: 4; style.stroke: "#d97706" }
+
+# ============ ai-done → prod ============
+ai_done -> prod { style.stroke-dash: 4; style.stroke: "#d97706" }
+
+# ============ STEWARD influence ============
+steward -> ai_ready: "design context (pre-work)" { style.stroke-dash: 4; style.stroke: "#7c3aed" }
+ai_done -> steward: "mines merged PRs → invariants / ADRs" { style.stroke-dash: 4; style.stroke: "#7c3aed" }

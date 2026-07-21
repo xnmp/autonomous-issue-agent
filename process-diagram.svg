@@ -1,0 +1,229 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="1270" viewBox="0 0 1320 1270" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <filter id="sh" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="2" flood-color="#0f172a" flood-opacity="0.18"/>
+    </filter>
+    <marker id="aDark" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#1e293b"/></marker>
+    <marker id="aBlue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2563eb"/></marker>
+    <marker id="aGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#059669"/></marker>
+    <marker id="aAmber" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#d97706"/></marker>
+    <marker id="aPurple" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#7c3aed"/></marker>
+  </defs>
+
+  <rect x="0" y="0" width="1320" height="1270" fill="#ffffff"/>
+  <text x="660" y="34" text-anchor="middle" font-size="23" font-weight="700" fill="#0f172a">Autonomous Issue Resolution — Lifecycle</text>
+  <text x="660" y="56" text-anchor="middle" font-size="13" fill="#64748b">Diagram 1 of 2 · states down the centre · fix-agent actions left · review-agent actions right · everything targets the dev branch</text>
+
+  <!-- swimlane bands -->
+  <rect x="45"  y="176" width="210" height="1016" rx="10" fill="#fffbeb" stroke="#fde68a"/>
+  <rect x="267" y="176" width="296" height="1016" rx="10" fill="#eff6ff" stroke="#bfdbfe"/>
+  <rect x="575" y="176" width="170" height="1016" rx="10" fill="#f8fafc" stroke="#e2e8f0"/>
+  <rect x="757" y="176" width="518" height="1016" rx="10" fill="#ecfdf5" stroke="#a7f3d0"/>
+  <text x="150"  y="197" text-anchor="middle" font-size="12.5" font-weight="700" fill="#b45309">HUMAN</text>
+  <text x="415"  y="197" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1d4ed8">FIX AGENT · fix-bot</text>
+  <text x="660"  y="197" text-anchor="middle" font-size="12.5" font-weight="700" fill="#334155">GitHub state</text>
+  <text x="1016" y="197" text-anchor="middle" font-size="12.5" font-weight="700" fill="#047857">REVIEW AGENT · review-bot</text>
+
+  <!-- steward band -->
+  <g filter="url(#sh)"><rect x="45" y="70" width="1230" height="86" rx="12" fill="#f5f3ff" stroke="#7c3aed" stroke-width="1.5"/></g>
+  <text x="64" y="96" font-size="14" font-weight="700" fill="#6d28d9">ARCHITECTURE STEWARD · steward-bot  (persistent, stateful — memory in files, slow cadence)</text>
+  <text x="64" y="118" font-size="11.5" fill="#5b21b6">owns INVARIANTS.md + ADRs (priors that defeat shared blind spots) · drift metrics as signal-not-gate</text>
+  <text x="64" y="136" font-size="11.5" fill="#5b21b6">attaches pre-work design context to issues · mines recurring review feedback into durable defaults · curates docs</text>
+
+  <!-- ============ NODES ============ -->
+  <!-- H1 file issue -->
+  <g filter="url(#sh)"><rect x="58" y="214" width="184" height="56" rx="9" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/></g>
+  <text x="150" y="238" text-anchor="middle" font-size="12.5" font-weight="700" fill="#92400e">① File issue</text>
+  <text x="150" y="256" text-anchor="middle" font-size="11" fill="#b45309">human writes acceptance criteria</text>
+
+  <!-- ai-ready -->
+  <g filter="url(#sh)"><rect x="593" y="220" width="134" height="42" rx="21" fill="#e2e8f0" stroke="#334155" stroke-width="2"/></g>
+  <text x="660" y="246" text-anchor="middle" font-size="13" font-weight="700" fill="#1e293b">ai-ready</text>
+
+  <!-- resolve-issue -->
+  <g filter="url(#sh)"><rect x="285" y="300" width="260" height="78" rx="9" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/></g>
+  <text x="415" y="324" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1e3a8a">resolve-issue.sh</text>
+  <text x="415" y="341" text-anchor="middle" font-size="11" fill="#1d4ed8">claude -p --worktree · sets ai-working</text>
+  <text x="415" y="358" text-anchor="middle" font-size="10.5" font-style="italic" fill="#3b82f6">TDD internals → see Diagram 2</text>
+  <text x="415" y="372" text-anchor="middle" font-size="10.5" fill="#1d4ed8">(resume-issue.sh after a block)</text>
+
+  <!-- GATE shield (fires only on gh pr create — the PR-creation path) -->
+  <g filter="url(#sh)"><polygon points="415,470 487,494 487,540 415,564 343,540 343,494" fill="#fee2e2" stroke="#dc2626" stroke-width="1.5"/></g>
+  <text x="415" y="512" text-anchor="middle" font-size="11.5" font-weight="700" fill="#b91c1c">GATE — hooks</text>
+  <text x="415" y="528" text-anchor="middle" font-size="9.5" fill="#dc2626">on gh pr create</text>
+  <text x="415" y="541" text-anchor="middle" font-size="9.5" fill="#dc2626">branch·commit·PR</text>
+
+  <!-- ai-blocked (the AGENT itself sets this label when it can't proceed — not the hooks) -->
+  <g filter="url(#sh)"><rect x="92" y="318" width="138" height="42" rx="21" fill="#e2e8f0" stroke="#334155" stroke-width="1.5"/></g>
+  <text x="161" y="344" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1e293b">ai-blocked</text>
+
+  <!-- human replies -->
+  <g filter="url(#sh)"><rect x="58" y="408" width="184" height="56" rx="9" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/></g>
+  <text x="150" y="432" text-anchor="middle" font-size="12.5" font-weight="700" fill="#92400e">Human replies</text>
+  <text x="150" y="450" text-anchor="middle" font-size="11" fill="#b45309">any teammate · async</text>
+
+  <!-- ai-pr-open -->
+  <g filter="url(#sh)"><rect x="590" y="606" width="140" height="44" rx="22" fill="#e2e8f0" stroke="#334155" stroke-width="2"/></g>
+  <text x="660" y="628" text-anchor="middle" font-size="13" font-weight="700" fill="#1e293b">ai-pr-open</text>
+  <text x="660" y="643" text-anchor="middle" font-size="9.5" fill="#64748b">PR → dev</text>
+
+  <!-- decision CI green? -->
+  <g filter="url(#sh)"><polygon points="660,676 726,716 660,756 594,716" fill="#fff7ed" stroke="#ea580c" stroke-width="1.5"/></g>
+  <text x="660" y="720" text-anchor="middle" font-size="11.5" font-weight="700" fill="#9a3412">CI green?</text>
+
+  <!-- fix-ci -->
+  <g filter="url(#sh)"><rect x="290" y="688" width="250" height="60" rx="9" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/></g>
+  <text x="415" y="712" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1e3a8a">fix-ci.sh</text>
+  <text x="415" y="730" text-anchor="middle" font-size="11" fill="#1d4ed8">claude -p --resume · ≤3 tries</text>
+
+  <!-- review-pr / re-review -->
+  <g filter="url(#sh)"><rect x="893" y="688" width="236" height="76" rx="9" fill="#d1fae5" stroke="#059669" stroke-width="1.5"/></g>
+  <text x="1011" y="712" text-anchor="middle" font-size="12.5" font-weight="700" fill="#065f46">review-pr.sh / re-review-pr.sh</text>
+  <text x="1011" y="730" text-anchor="middle" font-size="11" fill="#047857">claude -p · diff (+ optional checkout)</text>
+  <text x="1011" y="747" text-anchor="middle" font-size="10.5" fill="#047857">different model recommended</text>
+
+  <!-- decision verdict -->
+  <g filter="url(#sh)"><polygon points="1011,792 1089,838 1011,884 933,838" fill="#fff7ed" stroke="#ea580c" stroke-width="1.5"/></g>
+  <text x="1011" y="834" text-anchor="middle" font-size="11.5" font-weight="700" fill="#9a3412">verdict?</text>
+  <text x="1011" y="850" text-anchor="middle" font-size="9" fill="#c2410c">schema decision</text>
+
+  <!-- address-review -->
+  <g filter="url(#sh)"><rect x="290" y="812" width="250" height="64" rx="9" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/></g>
+  <text x="415" y="836" text-anchor="middle" font-size="12.5" font-weight="700" fill="#1e3a8a">address-review.sh</text>
+  <text x="415" y="854" text-anchor="middle" font-size="11" fill="#1d4ed8">claude -p --resume → push</text>
+  <text x="415" y="869" text-anchor="middle" font-size="10" fill="#1d4ed8">(reads the review comment)</text>
+
+  <!-- needs-human-review -->
+  <g filter="url(#sh)"><rect x="900" y="916" width="222" height="44" rx="22" fill="#d1fae5" stroke="#059669" stroke-width="1.6"/></g>
+  <text x="1011" y="943" text-anchor="middle" font-size="12.5" font-weight="700" fill="#065f46">needs-human-review</text>
+
+  <!-- human reviews -->
+  <g filter="url(#sh)"><rect x="58" y="950" width="184" height="54" rx="9" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/></g>
+  <text x="150" y="973" text-anchor="middle" font-size="12.5" font-weight="700" fill="#92400e">Human takes over</text>
+  <text x="150" y="991" text-anchor="middle" font-size="11" fill="#b45309">reviews / decides</text>
+
+  <!-- approved -->
+  <g filter="url(#sh)"><rect x="592" y="904" width="136" height="42" rx="21" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/></g>
+  <text x="660" y="930" text-anchor="middle" font-size="13" font-weight="700" fill="#15803d">approved</text>
+
+  <!-- merge -> dev -->
+  <g filter="url(#sh)"><rect x="573" y="984" width="174" height="50" rx="9" fill="#334155" stroke="#1e293b" stroke-width="1.5"/></g>
+  <text x="660" y="1005" text-anchor="middle" font-size="12.5" font-weight="700" fill="#ffffff">merge → dev</text>
+  <text x="660" y="1022" text-anchor="middle" font-size="10.5" fill="#cbd5e1">auto-merge or human</text>
+
+  <!-- ai-done -->
+  <g filter="url(#sh)"><rect x="592" y="1076" width="136" height="42" rx="21" fill="#e2e8f0" stroke="#334155" stroke-width="2"/></g>
+  <text x="660" y="1102" text-anchor="middle" font-size="13" font-weight="700" fill="#1e293b">ai-done</text>
+
+  <!-- merge dev->prod -->
+  <g filter="url(#sh)"><rect x="58" y="1074" width="184" height="56" rx="9" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/></g>
+  <text x="150" y="1098" text-anchor="middle" font-size="12.5" font-weight="700" fill="#92400e">Merge dev → prod</text>
+  <text x="150" y="1116" text-anchor="middle" font-size="11" fill="#b45309">human · out of scope</text>
+
+  <!-- cleanup note -->
+  <text x="757" y="1100" font-size="10.5" fill="#64748b">cleanup.sh: worktree · session · labels</text>
+
+  <!-- ============ HAPPY PATH (bold dark) ============ -->
+  <g fill="none" stroke="#1e293b" stroke-width="2.5">
+    <path d="M242,240 L589,240" marker-end="url(#aDark)"/>                       <!-- file -> ai-ready -->
+    <path d="M660,262 C660,284 470,278 470,298" marker-end="url(#aDark)"/>      <!-- ai-ready -> resolve -->
+    <path d="M415,378 L415,468" marker-end="url(#aDark)"/>                       <!-- resolve -> GATE -->
+    <path d="M487,540 C560,560 595,594 622,612" marker-end="url(#aDark)"/>       <!-- GATE -> ai-pr-open -->
+    <path d="M660,650 L660,674" marker-end="url(#aDark)"/>                       <!-- ai-pr-open -> CI green? -->
+    <path d="M726,716 C800,716 818,724 891,724" marker-end="url(#aDark)"/>       <!-- CI yes -> review -->
+    <path d="M933,838 C840,838 770,924 730,925" marker-end="url(#aDark)"/>       <!-- verdict APPROVE -> approved -->
+    <path d="M660,946 L660,984" marker-end="url(#aDark)"/>                       <!-- approved -> merge -->
+    <path d="M660,1034 L660,1076" marker-end="url(#aDark)"/>                     <!-- merge -> ai-done -->
+  </g>
+  <!-- happy-path edge labels -->
+  <g font-size="10.5" font-weight="600">
+    <rect x="498" y="262" width="92" height="16" rx="3" fill="#eff6ff"/><text x="544" y="274" text-anchor="middle" fill="#1d4ed8">fix-watcher</text>
+    <rect x="500" y="566" width="118" height="16" rx="3" fill="#ffffff"/><text x="559" y="578" text-anchor="middle" fill="#15803d">PR created → dev</text>
+    <rect x="744" y="700" width="118" height="16" rx="3" fill="#ecfdf5"/><text x="803" y="712" text-anchor="middle" fill="#047857">pass → review-watcher</text>
+    <rect x="676" y="700" width="34" height="16" rx="3" fill="#ffffff"/><text x="693" y="712" text-anchor="middle" fill="#15803d">yes</text>
+  </g>
+
+  <!-- ============ BLOCKED LOOP (amber dashed) — agent self-marks, BEFORE the gate ============ -->
+  <g fill="none" stroke="#d97706" stroke-width="1.6" stroke-dasharray="5 4">
+    <path d="M285,338 L232,338" marker-end="url(#aAmber)"/>                       <!-- resolve -> ai-blocked (agent sets label) -->
+    <path d="M150,408 C150,392 155,372 158,362" marker-end="url(#aAmber)"/>      <!-- ai-blocked -> human replies -->
+    <path d="M242,440 C300,440 300,360 284,344" marker-end="url(#aAmber)"/>      <!-- human replies -> resume into resolve -->
+  </g>
+  <g font-size="10" font-weight="600">
+    <rect x="236" y="316" width="52" height="15" rx="3" fill="#fffbeb"/><text x="262" y="327" text-anchor="middle" fill="#b45309">blocked</text>
+    <rect x="246" y="430" width="110" height="15" rx="3" fill="#fffbeb"/><text x="301" y="441" text-anchor="middle" fill="#b45309">resume-issue.sh</text>
+  </g>
+
+  <!-- ============ CI FAIL LOOP (blue dashed) ============ -->
+  <g fill="none" stroke="#2563eb" stroke-width="1.6" stroke-dasharray="5 4">
+    <path d="M594,716 L542,717" marker-end="url(#aBlue)"/>
+    <path d="M415,688 C415,650 590,648 624,648" marker-end="url(#aBlue)"/>
+  </g>
+  <g font-size="10" font-weight="600">
+    <rect x="548" y="700" width="38" height="15" rx="3" fill="#eff6ff"/><text x="567" y="711" text-anchor="middle" fill="#b91c1c">fail</text>
+    <rect x="430" y="668" width="160" height="15" rx="3" fill="#eff6ff"/><text x="510" y="679" text-anchor="middle" fill="#1d4ed8">push ⟳ CI  (≤3 → ai-blocked)</text>
+  </g>
+
+  <!-- review box -> verdict diamond (the missing exit edge) -->
+  <g fill="none" stroke="#059669" stroke-width="2.5">
+    <path d="M1011,764 L1011,790" marker-end="url(#aGreen)"/>
+  </g>
+
+  <!-- ============ REVIEW CHANGES LOOP ============ -->
+  <!-- verdict REQUEST_CHANGES -> address-review (green dashed, leftward, well below the approved/verdict row) -->
+  <g fill="none" stroke="#059669" stroke-width="1.6" stroke-dasharray="5 4">
+    <path d="M1011,884 C1011,912 660,906 540,872" marker-end="url(#aGreen)"/>
+  </g>
+  <!-- address-review push -> back to ai-pr-open via the clear left channel (blue dashed) -->
+  <g fill="none" stroke="#2563eb" stroke-width="1.6" stroke-dasharray="5 4">
+    <path d="M290,840 C276,840 276,672 276,656 C276,640 470,632 588,632" marker-end="url(#aBlue)"/>
+  </g>
+  <g font-size="10" font-weight="600">
+    <!-- APPROVE: on the dark verdict->approved edge, placed high-left of the diamond -->
+    <rect x="772" y="812" width="74" height="16" rx="3" fill="#ecfdf5"/><text x="809" y="824" text-anchor="middle" fill="#047857">APPROVE</text>
+    <!-- REQUEST_CHANGES: on the green dashed edge, placed lower so it can't touch APPROVE -->
+    <rect x="616" y="898" width="196" height="16" rx="3" fill="#ecfdf5"/><text x="714" y="910" text-anchor="middle" fill="#047857">REQUEST_CHANGES → comment</text>
+    <rect x="300" y="610" width="172" height="15" rx="3" fill="#eff6ff"/><text x="386" y="621" text-anchor="middle" fill="#1d4ed8">push ⟳  (new commits re-trigger CI + review)</text>
+  </g>
+
+  <!-- ============ ESCALATE -> needs-human-review -> human (amber) ============ -->
+  <g fill="none" stroke="#059669" stroke-width="1.6" stroke-dasharray="5 4">
+    <path d="M1089,838 C1140,838 1135,905 1100,916" marker-end="url(#aGreen)"/>
+  </g>
+  <g fill="none" stroke="#d97706" stroke-width="1.8" stroke-dasharray="6 4">
+    <path d="M900,945 C600,985 360,978 244,977" marker-end="url(#aAmber)"/>
+  </g>
+  <g font-size="10" font-weight="600">
+    <rect x="1096" y="872" width="120" height="15" rx="3" fill="#ecfdf5"/><text x="1156" y="883" text-anchor="middle" fill="#047857">ESCALATE (round 5)</text>
+    <rect x="470" y="958" width="120" height="15" rx="3" fill="#fffbeb"/><text x="530" y="969" text-anchor="middle" fill="#b45309">human manages</text>
+  </g>
+
+  <!-- ============ ai-done -> human prod (amber) ============ -->
+  <g fill="none" stroke="#d97706" stroke-width="1.6" stroke-dasharray="5 4">
+    <path d="M592,1100 L244,1101" marker-end="url(#aAmber)"/>
+  </g>
+
+  <!-- ============ STEWARD influence (purple dashed) ============ -->
+  <g fill="none" stroke="#7c3aed" stroke-width="1.6" stroke-dasharray="6 4">
+    <path d="M660,156 L660,218" marker-end="url(#aPurple)"/>
+    <path d="M728,1097 C1295,1097 1295,156 1240,150" marker-end="url(#aPurple)"/>
+  </g>
+  <g font-size="10" font-weight="600">
+    <rect x="666" y="178" width="128" height="15" rx="3" fill="#f5f3ff"/><text x="730" y="189" text-anchor="middle" fill="#6d28d9">design context (pre-work)</text>
+    <text x="1303" y="640" text-anchor="middle" font-size="10" font-weight="600" fill="#6d28d9" transform="rotate(90 1303 640)">mines merged PRs → invariants / ADRs</text>
+  </g>
+
+  <!-- ============ LEGEND ============ -->
+  <rect x="45" y="1206" width="1230" height="52" rx="9" fill="#f8fafc" stroke="#e2e8f0"/>
+  <g font-size="11.5">
+    <rect x="62" y="1224" width="18" height="12" rx="3" fill="#dbeafe" stroke="#2563eb"/><text x="86" y="1234" fill="#334155">Fix agent</text>
+    <rect x="168" y="1224" width="18" height="12" rx="3" fill="#d1fae5" stroke="#059669"/><text x="192" y="1234" fill="#334155">Review agent</text>
+    <rect x="296" y="1224" width="18" height="12" rx="3" fill="#f5f3ff" stroke="#7c3aed"/><text x="320" y="1234" fill="#334155">Steward</text>
+    <rect x="392" y="1224" width="18" height="12" rx="3" fill="#fef3c7" stroke="#d97706"/><text x="416" y="1234" fill="#334155">Human</text>
+    <rect x="486" y="1224" width="18" height="12" rx="3" fill="#e2e8f0" stroke="#334155"/><text x="510" y="1234" fill="#334155">GitHub label (state)</text>
+    <polygon points="640,1224 652,1228 652,1236 640,1240 628,1236 628,1228" fill="#fff7ed" stroke="#ea580c"/><text x="660" y="1234" fill="#334155">decision</text>
+    <polygon points="734,1223 745,1227 745,1235 734,1239 723,1235 723,1227" fill="#fee2e2" stroke="#dc2626"/><text x="752" y="1234" fill="#334155">mandatory gate</text>
+    <line x1="852" y1="1230" x2="892" y2="1230" stroke="#1e293b" stroke-width="2.5" marker-end="url(#aDark)"/><text x="898" y="1234" fill="#334155">happy path</text>
+    <line x1="1010" y1="1230" x2="1050" y2="1230" stroke="#64748b" stroke-width="1.6" stroke-dasharray="5 4"/><text x="1056" y="1234" fill="#334155">loop / branch</text>
+  </g>
+</svg>

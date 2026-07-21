@@ -1,0 +1,226 @@
+"""Fix workflow dispatch.
+
+This module owns the impure fix-side agent dispatch sequence: gather GitHub and
+store state, build an agent task, run it, persist session/counter markers, then
+apply the pure follow-up actions. It is extracted from AgentDispatcher so the
+central dispatcher can become a thin role router.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from dataclasses import dataclass
+
+from ...domain import outcome
+from ..planners import tasks as task_builders
+from ..planners.tasks import FixTaskConfig
+from ...domain.agent_task import AgentRuntime
+from ...domain.refs import slugify
+from ..mcp import mcp_servers_for_checks
+
+
+@dataclass(frozen=True)
+class FixWorkflowConfig:
+    base_branch: str
+    fix: FixTaskConfig | None
+    fork_threshold: int
+    author_tests_split: bool
+    max_contract_rounds: int
+    fix_mcp_config: str
+    harness_root: str
+    log: Callable[[str], None]
+
+
+@dataclass
+class FixWorkflow:
+    cfg: FixWorkflowConfig
+    gateway: object
+    store: object
+    worktrees: object
+    runner: AgentRuntime
+    executor: object
+    prepare_cwd: Callable[[str], None] | None = None
+
+    def _ensure_cwd(self, issue: int, branch: str) -> str:
+        cwd = self.worktrees.ensure(issue, branch)
+        if self.prepare_cwd is not None:
+            self.prepare_cwd(cwd)
+        self.cfg.log(f"worktree #{issue}: ready on '{branch}' → {cwd}")
+        return cwd
+
+    async def _run_logged(self, label: str, issue: int, task):
+        self.cfg.log(f"agent #{issue}: {label} — running")
+        result = await self.runner.run(task)
+        self.cfg.log(
+            f"agent #{issue}: {label} — done "
+            f"(status={result.status or ('error' if result.is_error else 'ok')}"
+            f"{f', ${result.cost_usd:.2f}' if result.cost_usd else ''})"
+        )
+        return result
+
+    async def resolve(self, issue: int) -> None:
+        if self.cfg.author_tests_split:
+            await self.resolve_split(issue)
+            return
+        iss = self.gateway.get_issue(issue)
+        branch = f"fix/{issue}-{slugify(iss.title) or 'issue'}"
+        cwd = self._ensure_cwd(issue, branch)
+        task = task_builders.build_resolve_task(issue, iss.title, iss.body, cwd, self.cfg.fix)
+        result = await self._run_logged("resolve", issue, task)
+        self.store.save_session(issue, result.session_id)
+        pr = self.gateway.pr_for_issue(issue)
+        self.executor.execute_all(outcome.resolve_actions(issue, result, pr))
+
+    async def resolve_split(self, issue: int) -> None:
+        iss = self.gateway.get_issue(issue)
+        branch = f"fix/{issue}-{slugify(iss.title) or 'issue'}"
+        cwd = self._ensure_cwd(issue, branch)
+
+        if self.store.get_phase(issue) != "authored":
+            author = await self.runner.run(
+                task_builders.build_author_task(issue, iss.title, iss.body, cwd, self.cfg.fix)
+            )
+            self.store.save_session(issue, author.session_id)
+            if outcome.author_followup(author) is not outcome.AuthorFollowup.AUTHORED:
+                self.executor.execute_all(outcome.author_actions(issue, author))
+                return
+            self.store.set_phase(issue, "authored")
+
+        await self._implement_loop(issue, iss, cwd)
+
+    async def _implement_loop(self, issue: int, iss, cwd: str) -> None:
+        uphold_note = ""
+        trail: list[str] = []
+        rounds = 0
+        while True:
+            impl = await self.runner.run(
+                task_builders.build_implement_task(
+                    issue, iss.title, iss.body, cwd, self.cfg.fix, uphold_note=uphold_note
+                )
+            )
+            self.store.save_session(issue, impl.session_id)
+            pr = self.gateway.pr_for_issue(issue)
+            fu = outcome.implement_followup(impl, pr is not None)
+            if fu is not outcome.ImplementFollowup.CONTRACT_CHANGE:
+                self.executor.execute_all(outcome.resolve_actions(issue, impl, pr))
+                return
+
+            objection = impl.needs or impl.summary or "see logs"
+            if rounds >= self.cfg.max_contract_rounds:
+                self.executor.execute_all(
+                    outcome.contract_escalation_actions(issue, objection, "\n".join(trail))
+                )
+                return
+            rounds += 1
+            self.worktrees.reset(issue)
+            adj = await self.runner.run(
+                task_builders.build_adjudicate_task(
+                    issue, iss.title, iss.body, objection, cwd, self.cfg.fix
+                )
+            )
+            self.store.save_session(issue, adj.session_id)
+            verdict = outcome.adjudication(adj)
+            trail.append(
+                f"round {rounds}: {adj.field('verdict') or 'upheld'} — "
+                f"{adj.field('rationale') or adj.summary}"
+            )
+            uphold_note = (
+                "" if verdict is outcome.Adjudication.REVISED
+                else (adj.field("rationale") or adj.summary or "the contract is correct")
+            )
+
+    async def resume(self, issue: int) -> None:
+        iss = self.gateway.get_issue(issue)
+        reply = self.latest_human_reply(iss)
+        if not reply:
+            return
+        pr_existing = self.gateway.pr_for_issue(issue)
+        if self.cfg.author_tests_split and pr_existing is None:
+            await self.resolve_split(issue)
+            return
+        branch = self.gateway.get_pr(pr_existing).head_ref_name if pr_existing else f"fix/{issue}-issue"
+        cwd = self._ensure_cwd(issue, branch)
+        fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
+        task = task_builders.build_resume_task(
+            reply, cwd, self.store.get_session(issue), self.cfg.fix, fork=fork
+        )
+        result = await self.runner.run(task)
+        self.store.save_session(issue, result.session_id)
+        pr = self.gateway.pr_for_issue(issue)
+        self.executor.execute_all(outcome.resume_actions(issue, result, pr))
+
+    async def address_review(self, pr: int) -> None:
+        issue = self.gateway.issue_for_pr(pr)
+        if issue is None:
+            return
+        p = self.gateway.get_pr(pr)
+        cwd = self._ensure_cwd(issue, p.head_ref_name)
+        review_body = self.latest_review_body(p)
+        fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
+        task = task_builders.build_address_review_task(
+            pr, review_body, "", cwd, self.store.get_session(issue), self.cfg.fix, fork=fork
+        )
+        result = await self.runner.run(task)
+        self.store.save_session(issue, result.session_id)
+        out = outcome.address_review_actions(pr, result)
+        self.executor.execute_all(out.actions)
+        review_at = self.latest_changes_requested_at(p)
+        if out.clear_retry:
+            self.store.clear_review_retry(issue)
+        elif out.bump_retry:
+            _at, n = self.store.get_review_retry(issue)
+            self.store.set_review_retry(issue, review_at, n + 1)
+
+    async def fix_ci(self, pr: int) -> None:
+        issue = self.gateway.issue_for_pr(pr)
+        if issue is None:
+            return
+        p = self.gateway.get_pr(pr)
+        cwd = self._ensure_cwd(issue, p.head_ref_name)
+        failed = "\n".join(c.name for c in p.checks if c.bucket == "fail")
+        mcp_servers = mcp_servers_for_checks(
+            self.cfg.fix_mcp_config, [c.name for c in p.checks], self.cfg.harness_root
+        )
+        task = task_builders.build_fix_ci_task(
+            pr, failed, "", cwd, self.store.get_session(issue), self.cfg.fix,
+            mcp_servers=mcp_servers,
+        )
+        result = await self.runner.run(task)
+        self.store.save_session(issue, result.session_id)
+        self.store.set_ci_retries(issue, self.store.get_ci_retries(issue) + 1)
+        self.executor.execute_all(outcome.fix_ci_actions(pr, result))
+
+    async def rebase(self, pr: int) -> None:
+        issue = self.gateway.issue_for_pr(pr)
+        if issue is None:
+            return
+        p = self.gateway.get_pr(pr)
+        cwd = self._ensure_cwd(issue, p.head_ref_name)
+        task = task_builders.build_rebase_task(
+            pr, self.cfg.base_branch, cwd, self.store.get_session(issue), self.cfg.fix
+        )
+        result = await self.runner.run(task)
+        self.store.save_session(issue, result.session_id)
+        self.store.set_rebase_retries(issue, self.store.get_rebase_retries(issue) + 1)
+        self.executor.execute_all(outcome.fix_ci_actions(pr, result))
+
+    @staticmethod
+    def latest_human_reply(issue) -> str:
+        for comment in reversed(issue.comments):
+            if not comment.is_bot:
+                return comment.body
+        return ""
+
+    @staticmethod
+    def latest_review_body(pr) -> str:
+        for review in reversed(pr.reviews):
+            if review.body.strip():
+                return review.body
+        return ""
+
+    @staticmethod
+    def latest_changes_requested_at(pr) -> str:
+        for review in reversed(pr.reviews):
+            if review.state == "CHANGES_REQUESTED":
+                return review.submitted_at
+        return ""

@@ -1,0 +1,73 @@
+# Inside the Fix Agent — resolve-issue.sh (DDD + TDD)  (Diagram 2 of 2)
+
+direction: down
+
+vars: {
+  d2-config: {
+    layout-engine: elk
+  }
+}
+
+classes: {
+  state:    { style: { fill: "#e2e8f0"; stroke: "#334155"; font-color: "#1e293b"; border-radius: 20 } }
+  prior:    { style: { fill: "#f5f3ff"; stroke: "#7c3aed"; font-color: "#5b21b6" } }
+  action:   { style: { fill: "#dbeafe"; stroke: "#2563eb"; font-color: "#1e3a8a" } }
+  commit:   { style: { fill: "#eff6ff"; stroke: "#3b82f6"; font-color: "#1e3a8a" } }
+  adv:      { style: { fill: "#fdf4ff"; stroke: "#a21caf"; font-color: "#86198f" } }
+  decision: { shape: diamond; style: { fill: "#fff7ed"; stroke: "#ea580c"; font-color: "#9a3412" } }
+  diagnose: { style: { fill: "#eef2ff"; stroke: "#6366f1"; font-color: "#3730a3" } }
+  blocked:  { style: { fill: "#fef9c3"; stroke: "#ca8a04"; font-color: "#854d0e" } }
+}
+
+gate: "GATE (hooks)\nfires per commit/PR · tree-sitter governor\nblocks --no-verify, hooksPath bypass,\nbad prefixes/branch, missing test/AC/evidence" {
+  class: adv
+  style: { fill: "#fef2f2"; stroke: "#dc2626"; font-color: "#b91c1c" }
+}
+
+start: "issue dispatched (ai-working)" { class: state }
+priors: "Read design priors FIRST\nINVARIANTS.md · ADRs · folder CLAUDE.md\n+ steward's design-context comment" { class: prior }
+branch: "Create branch  feat/<n>-… or fix/<n>-…\nchecked: branch-name hook" { class: action }
+ac: "Write & post Acceptance Criteria\nFIRST — before code\nposted as an issue comment" { class: action }
+testplan: "Post ## Test Plan comment\nwrites .claude/.test-plan-posted" { class: action }
+interfaces: "Domain interfaces / types\ncommit plan: · lint+typecheck" { class: commit }
+red: "Write tests (expected to fail)\ncommit red: · written before impl" { class: commit }
+green: "Implement until tests pass\ncommit green: · + structured logging" { class: commit }
+tests_pass: "tests pass?\nrun locally" { class: decision }
+diagnose: "/diagnose\nreproduce→minimise→hypothesise\n→instrument→fix→regression-test" { class: diagnose }
+evidence: "Collect proof → evidence/\ngitignored · NOT committed (posted on PR)" { class: action }
+docs: "Update folder CLAUDE.md\ncommit docs: · non-obvious learnings" { class: commit }
+adversarial: "Adversarial pre-PR review\nfix agent spawns a SUBAGENT (fresh context)\ndiff + evidence + AC → PASS / FAIL" { class: adv }
+pass: "PASS?\nverdict file" { class: decision }
+open_pr: "gh pr create → dev\n## Acceptance Criteria · Fixes #n · PR-gate hook" { class: action }
+exit: "ai-pr-open\n→ Diagram 1, PHASE 2" { class: state }
+blocked: "status = blocked\nstate exactly what's needed,\nstop → ai-blocked (Diagram 1)" { class: blocked }
+
+# ---- happy path ----
+start -> priors
+priors -> branch
+branch -> ac
+ac -> testplan
+testplan -> interfaces
+interfaces -> red
+red -> green
+green -> tests_pass
+tests_pass -> evidence: yes
+evidence -> docs
+docs -> adversarial
+adversarial -> pass
+pass -> open_pr: yes
+open_pr -> exit
+
+# ---- loops ----
+tests_pass -> diagnose: "no" { style.stroke-dash: 4; style.stroke: "#dc2626" }
+diagnose -> green: "fix → re-run green:" { style.stroke-dash: 4; style.stroke: "#6366f1" }
+pass -> green: "FAIL → fix & re-verify" { style.stroke-dash: 4; style.stroke: "#a21caf" }
+priors -> blocked: "stuck" { style.stroke-dash: 4; style.stroke: "#d97706" }
+
+# ---- gate checks ----
+branch -> gate { style.stroke-dash: 3; style.stroke: "#fca5a5" }
+interfaces -> gate { style.stroke-dash: 3; style.stroke: "#fca5a5" }
+red -> gate { style.stroke-dash: 3; style.stroke: "#fca5a5" }
+green -> gate { style.stroke-dash: 3; style.stroke: "#fca5a5" }
+docs -> gate { style.stroke-dash: 3; style.stroke: "#fca5a5" }
+open_pr -> gate { style.stroke-dash: 3; style.stroke: "#fca5a5" }

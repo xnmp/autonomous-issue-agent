@@ -1,0 +1,51 @@
+{
+  "direction": "TB",
+  "nodes": [
+    {"id": "start", "label": "issue dispatched (ai-working)", "width": 300, "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#e2e8f0;strokeColor=#334155;fontColor=#1e293b;"},
+    {"id": "priors", "label": "Read design priors FIRST\nINVARIANTS.md · ADRs · folder CLAUDE.md\n+ steward's design-context comment", "width": 320, "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f3ff;strokeColor=#7c3aed;fontColor=#5b21b6;"},
+    {"id": "branch", "label": "Create branch  feat/<n>-… or fix/<n>-…\nchecked: branch-name hook", "width": 300, "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#2563eb;fontColor=#1e3a8a;"},
+    {"id": "ac", "label": "Write & post Acceptance Criteria\nFIRST — before code\nposted as an issue comment", "width": 320, "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#2563eb;fontColor=#1e3a8a;"},
+    {"id": "testplan", "label": "Post ## Test Plan comment\nwrites .claude/.test-plan-posted", "width": 300, "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#2563eb;fontColor=#1e3a8a;"},
+    {"id": "interfaces", "label": "Domain interfaces / types\ncommit plan: · lint+typecheck", "width": 300, "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#eff6ff;strokeColor=#3b82f6;fontColor=#1e3a8a;"},
+    {"id": "red", "label": "Write tests (expected to fail)\ncommit red: · written before impl", "width": 300, "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#eff6ff;strokeColor=#3b82f6;fontColor=#1e3a8a;"},
+    {"id": "green", "label": "Implement until tests pass\ncommit green: · + structured logging", "width": 300, "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#eff6ff;strokeColor=#3b82f6;fontColor=#1e3a8a;"},
+    {"id": "tests_pass", "label": "tests pass?\nrun locally", "width": 130, "height": 100, "style": "rhombus;whiteSpace=wrap;html=1;fillColor=#fff7ed;strokeColor=#ea580c;fontColor=#9a3412;"},
+    {"id": "diagnose", "label": "/diagnose\nreproduce→minimise→hypothesise\n→instrument→fix→regression-test", "width": 260, "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#eef2ff;strokeColor=#6366f1;fontColor=#3730a3;"},
+    {"id": "evidence", "label": "Collect proof → evidence/\ngitignored · NOT committed (posted on PR)", "width": 300, "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#2563eb;fontColor=#1e3a8a;"},
+    {"id": "docs", "label": "Update folder CLAUDE.md\ncommit docs: · non-obvious learnings", "width": 300, "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#eff6ff;strokeColor=#3b82f6;fontColor=#1e3a8a;"},
+    {"id": "adversarial", "label": "Adversarial pre-PR review\nfix agent spawns a SUBAGENT (fresh context)\ndiff + evidence + AC → PASS / FAIL", "width": 360, "height": 80, "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#fdf4ff;strokeColor=#a21caf;fontColor=#86198f;"},
+    {"id": "pass", "label": "PASS?\nverdict file", "width": 130, "height": 100, "style": "rhombus;whiteSpace=wrap;html=1;fillColor=#fff7ed;strokeColor=#ea580c;fontColor=#9a3412;"},
+    {"id": "open_pr", "label": "gh pr create → dev\n## Acceptance Criteria · Fixes #n · PR-gate hook", "width": 330, "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#2563eb;fontColor=#1e3a8a;"},
+    {"id": "exit", "label": "ai-pr-open\n→ Diagram 1, PHASE 2", "width": 230, "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#e2e8f0;strokeColor=#334155;fontColor=#1e293b;"},
+    {"id": "blocked", "label": "status = blocked\nstate exactly what's needed,\nstop → ai-blocked (Diagram 1)", "width": 220, "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#fef9c3;strokeColor=#ca8a04;fontColor=#854d0e;"},
+    {"id": "gate", "label": "GATE (hooks)\nfires per commit/PR · tree-sitter governor\nblocks --no-verify, hooksPath bypass,\nbad prefixes/branch, missing test/AC/evidence", "width": 300, "height": 90, "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#fef2f2;strokeColor=#dc2626;fontColor=#b91c1c;"}
+  ],
+  "edges": [
+    {"source": "start", "target": "priors"},
+    {"source": "priors", "target": "branch"},
+    {"source": "branch", "target": "ac"},
+    {"source": "ac", "target": "testplan"},
+    {"source": "testplan", "target": "interfaces"},
+    {"source": "interfaces", "target": "red"},
+    {"source": "red", "target": "green"},
+    {"source": "green", "target": "tests_pass"},
+    {"source": "tests_pass", "target": "evidence", "label": "yes"},
+    {"source": "evidence", "target": "docs"},
+    {"source": "docs", "target": "adversarial"},
+    {"source": "adversarial", "target": "pass"},
+    {"source": "pass", "target": "open_pr", "label": "yes"},
+    {"source": "open_pr", "target": "exit"},
+
+    {"source": "tests_pass", "target": "diagnose", "label": "no"},
+    {"source": "diagnose", "target": "green", "label": "fix → re-run green:"},
+    {"source": "pass", "target": "green", "label": "FAIL → fix & re-verify"},
+    {"source": "priors", "target": "blocked", "label": "stuck"},
+
+    {"source": "branch", "target": "gate"},
+    {"source": "interfaces", "target": "gate"},
+    {"source": "red", "target": "gate"},
+    {"source": "green", "target": "gate"},
+    {"source": "docs", "target": "gate"},
+    {"source": "open_pr", "target": "gate"}
+  ]
+}

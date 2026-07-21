@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+*.egg-info/
+build/
+dist/
+# Lockfile: resolves against the local package index (may be an internal mirror).
+# Not committed — users run `uv lock` against their own index.
+uv.lock
+
+# Local config (may hold tokens/keys/paths) — ship only the .example.
+# Multi-repo layout: shared identity + per-repo overlays + the composed run file.
+config/agent.env
+config/shared.env
+config/repos/
+config/.active.env
+
+# Demo scratch
+examples/demo-target/.scratch/
+examples/demo-target/.git/
+
+# Agent runtime state (when testing in-tree)
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+.claude/scheduled_tasks.json
+evidence/
+
+
+# CI-fix MCP server configs (hold tokens)
+config/mcp/
+
+# Deployment-specific launcher + handover (kept local, never committed)
+
+docs/handover/
+
+# macOS
+.DS_Store
+
+# Local personal tooling / scratch (not part of the harness)
+.agents/
+i-have-adhd/
+skills-lock.json
+.run/

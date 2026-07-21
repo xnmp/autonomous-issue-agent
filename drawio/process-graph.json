@@ -1,0 +1,58 @@
+{
+  "direction": "TB",
+  "nodes": [
+    {"id": "steward", "label": "ARCHITECTURE STEWARD · steward-bot\nowns INVARIANTS.md + ADRs · mines merged PRs into durable defaults", "width": 460, "height": 56, "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f3ff;strokeColor=#7c3aed;fontColor=#5b21b6;"},
+
+    {"id": "file_issue", "label": "① File issue\nhuman writes acceptance criteria", "group": "human", "groupLabel": "HUMAN", "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#fef3c7;strokeColor=#d97706;fontColor=#92400e;"},
+    {"id": "human_replies", "label": "Human replies\nany teammate · async", "group": "human", "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#fef3c7;strokeColor=#d97706;fontColor=#92400e;"},
+    {"id": "human_takeover", "label": "Human takes over\nreviews / decides", "group": "human", "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#fef3c7;strokeColor=#d97706;fontColor=#92400e;"},
+    {"id": "prod", "label": "Merge dev → prod\nhuman · out of scope", "group": "human", "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#fef3c7;strokeColor=#d97706;fontColor=#92400e;"},
+
+    {"id": "resolve", "label": "resolve-issue.sh\nclaude -p --worktree · sets ai-working\nTDD internals → see Diagram 2", "group": "fix", "groupLabel": "FIX AGENT · fix-bot", "width": 240, "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#2563eb;fontColor=#1e3a8a;"},
+    {"id": "fix_ci", "label": "fix-ci.sh\nclaude -p --resume · ≤3 tries", "group": "fix", "width": 240, "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#2563eb;fontColor=#1e3a8a;"},
+    {"id": "address", "label": "address-review.sh\nclaude -p --resume → push", "group": "fix", "width": 240, "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#2563eb;fontColor=#1e3a8a;"},
+
+    {"id": "ai_ready", "label": "ai-ready", "group": "state", "groupLabel": "GitHub state", "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#e2e8f0;strokeColor=#334155;fontColor=#1e293b;"},
+    {"id": "ai_blocked", "label": "ai-blocked", "group": "state", "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#e2e8f0;strokeColor=#334155;fontColor=#1e293b;"},
+    {"id": "gate", "label": "GATE — hooks\non gh pr create\nbranch · commit · PR", "group": "state", "width": 140, "height": 80, "style": "shape=hexagon;whiteSpace=wrap;html=1;fillColor=#fee2e2;strokeColor=#dc2626;fontColor=#b91c1c;"},
+    {"id": "ai_pr_open", "label": "ai-pr-open\nPR → dev", "group": "state", "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#e2e8f0;strokeColor=#334155;fontColor=#1e293b;"},
+    {"id": "ci_green", "label": "CI green?", "group": "state", "width": 110, "height": 90, "style": "rhombus;whiteSpace=wrap;html=1;fillColor=#fff7ed;strokeColor=#ea580c;fontColor=#9a3412;"},
+    {"id": "verdict", "label": "verdict?\nschema decision", "group": "state", "width": 120, "height": 90, "style": "rhombus;whiteSpace=wrap;html=1;fillColor=#fff7ed;strokeColor=#ea580c;fontColor=#9a3412;"},
+    {"id": "approved", "label": "approved", "group": "state", "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#dcfce7;strokeColor=#16a34a;fontColor=#15803d;"},
+    {"id": "merge", "label": "merge → dev\nauto-merge or human", "group": "state", "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#334155;strokeColor=#1e293b;fontColor=#ffffff;"},
+    {"id": "ai_done", "label": "ai-done", "group": "state", "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#e2e8f0;strokeColor=#334155;fontColor=#1e293b;"},
+
+    {"id": "review_pr", "label": "review-pr.sh / re-review-pr.sh\nclaude -p · diff (+ optional checkout)\ndifferent model recommended", "group": "review", "groupLabel": "REVIEW AGENT · review-bot", "width": 250, "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#d1fae5;strokeColor=#059669;fontColor=#065f46;"},
+    {"id": "needs_human", "label": "needs-human-review", "group": "review", "width": 200, "style": "rounded=1;whiteSpace=wrap;html=1;fillColor=#d1fae5;strokeColor=#059669;fontColor=#065f46;"}
+  ],
+  "edges": [
+    {"source": "file_issue", "target": "ai_ready", "label": "fix-watcher"},
+    {"source": "ai_ready", "target": "resolve"},
+    {"source": "resolve", "target": "gate"},
+    {"source": "gate", "target": "ai_pr_open", "label": "PR created → dev"},
+    {"source": "ai_pr_open", "target": "ci_green"},
+    {"source": "ci_green", "target": "review_pr", "label": "yes · pass"},
+    {"source": "review_pr", "target": "verdict"},
+    {"source": "verdict", "target": "approved", "label": "APPROVE"},
+    {"source": "approved", "target": "merge"},
+    {"source": "merge", "target": "ai_done"},
+
+    {"source": "resolve", "target": "ai_blocked", "label": "blocked"},
+    {"source": "ai_blocked", "target": "human_replies"},
+    {"source": "human_replies", "target": "resolve", "label": "resume-issue.sh"},
+
+    {"source": "ci_green", "target": "fix_ci", "label": "fail"},
+    {"source": "fix_ci", "target": "ai_pr_open", "label": "push ⟳ CI (≤3 → ai-blocked)"},
+
+    {"source": "verdict", "target": "address", "label": "REQUEST_CHANGES → comment"},
+    {"source": "address", "target": "ai_pr_open", "label": "push ⟳ re-trigger CI + review"},
+
+    {"source": "verdict", "target": "needs_human", "label": "ESCALATE (round 5)"},
+    {"source": "needs_human", "target": "human_takeover", "label": "human manages"},
+
+    {"source": "ai_done", "target": "prod"},
+
+    {"source": "steward", "target": "ai_ready", "label": "design context (pre-work)"},
+    {"source": "ai_done", "target": "steward", "label": "mines merged PRs → invariants / ADRs"}
+  ]
+}

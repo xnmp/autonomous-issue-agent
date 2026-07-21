@@ -1,0 +1,82 @@
+[project]
+name = "issue-agent"
+version = "0.1.0"
+description = "Autonomous issue-resolving harness — Python + Claude Agent SDK port"
+requires-python = ">=3.10"
+# The domain layer is dependency-free by design (pure stdlib). Adapters that
+# import the SDK / pydantic are added in later phases as optional extras.
+dependencies = []
+
+# The operator-facing CLI (`issue-agent <cmd>`). Pure argparse + stdlib, so it
+# adds no dependency; it resolves the harness checkout from its own __file__ and
+# delegates the heavy lifting to bin/point-at.sh. Installed by `bin/install.sh`
+# via an EDITABLE install (`uv sync`), which is what keeps the __file__ walk able
+# to find the sibling plugin/ + config/ trees — a plain wheel omits them.
+[project.scripts]
+issue-agent = "issue_agent.app.cli:main"
+
+# The adapter layer (Phase 2+) imports the Claude Agent SDK. Kept as an optional
+# extra so the domain layer + its tests stay installable with zero third-party deps.
+[project.optional-dependencies]
+# PyJWT[crypto] backs the GitHub App installation-token mint (adapters/app_token).
+# tree-sitter(+bash) back the in-process bash governor (plugin/hooks/bash_governor.py),
+# which adapters/governor imports at module load — so it is required for EVERY role
+# (fix/review/steward), not just the fixer. Declared here (not only as Makefile
+# `--with`) so `python -m issue_agent.app.main <role>` works after a plain install.
+sdk = [
+    "claude-agent-sdk>=0.2.110",
+    "pyjwt[crypto]>=2.8",
+    "tree-sitter>=0.21",
+    "tree-sitter-bash>=0.21",
+]
+dev = [
+    "pytest>=8",
+    "claude-agent-sdk>=0.2.110",
+    "pyjwt[crypto]>=2.8",
+    "import-linter>=2.0",
+    "tree-sitter>=0.21",
+    "tree-sitter-bash>=0.21",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/issue_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/domain", "tests/adapters"]
+python_files = ["test_*.py"]
+addopts = "-q"
+
+# ── Architectural linting (import-linter) ─────────────────────────────────────
+# Enforces the hexagonal layering the design depends on: the domain is pure
+# (no adapters, no app, no SDK), and dependencies only ever point downward
+# (app → adapters → domain). A violation here is a design regression, not a
+# style nit — `make arch` (in `make test`) fails the build on it.
+[tool.importlinter]
+root_package = "issue_agent"
+# Required so the "forbidden" contract can reason about imports of external
+# packages (claude_agent_sdk / openai) leaving the domain layer.
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Layered: app → adapters → domain (no upward imports)"
+type = "layers"
+layers = [
+    "issue_agent.app",
+    "issue_agent.adapters",
+    "issue_agent.domain",
+]
+
+[[tool.importlinter.contracts]]
+name = "Domain is pure (no adapters/app/SDK imports)"
+type = "forbidden"
+source_modules = ["issue_agent.domain"]
+forbidden_modules = [
+    "issue_agent.adapters",
+    "issue_agent.app",
+    "claude_agent_sdk",
+    "openai",
+]

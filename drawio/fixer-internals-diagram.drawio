@@ -1,0 +1,160 @@
+<mxfile>
+  <diagram id="autolayout" name="Page-1">
+    <mxGraphModel dx="800" dy="600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <mxCell id="start" value="issue dispatched (ai-working)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e2e8f0;strokeColor=#334155;fontColor=#1e293b;" vertex="1" parent="1">
+          <mxGeometry x="620" y="0" width="300" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="priors" value="Read design priors FIRST
+INVARIANTS.md · ADRs · folder CLAUDE.md
++ steward's design-context comment" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f3ff;strokeColor=#7c3aed;fontColor=#5b21b6;" vertex="1" parent="1">
+          <mxGeometry x="600" y="100" width="320" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="branch" value="Create branch  feat/&lt;n&gt;-… or fix/&lt;n&gt;-…
+checked: branch-name hook" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#2563eb;fontColor=#1e3a8a;" vertex="1" parent="1">
+          <mxGeometry x="480" y="190" width="300" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="ac" value="Write &amp; post Acceptance Criteria
+FIRST — before code
+posted as an issue comment" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#2563eb;fontColor=#1e3a8a;" vertex="1" parent="1">
+          <mxGeometry x="370" y="290" width="320" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="testplan" value="Post ## Test Plan comment
+writes .claude/.test-plan-posted" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#2563eb;fontColor=#1e3a8a;" vertex="1" parent="1">
+          <mxGeometry x="380" y="380" width="300" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="interfaces" value="Domain interfaces / types
+commit plan: · lint+typecheck" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#eff6ff;strokeColor=#3b82f6;fontColor=#1e3a8a;" vertex="1" parent="1">
+          <mxGeometry x="380" y="480" width="300" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="red" value="Write tests (expected to fail)
+commit red: · written before impl" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#eff6ff;strokeColor=#3b82f6;fontColor=#1e3a8a;" vertex="1" parent="1">
+          <mxGeometry x="350" y="580" width="300" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="green" value="Implement until tests pass
+commit green: · + structured logging" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#eff6ff;strokeColor=#3b82f6;fontColor=#1e3a8a;" vertex="1" parent="1">
+          <mxGeometry x="310" y="670" width="300" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="tests_pass" value="tests pass?
+run locally" style="rhombus;whiteSpace=wrap;html=1;fillColor=#fff7ed;strokeColor=#ea580c;fontColor=#9a3412;" vertex="1" parent="1">
+          <mxGeometry x="300" y="770" width="130" height="100" as="geometry"/>
+        </mxCell>
+        <mxCell id="diagnose" value="/diagnose
+reproduce→minimise→hypothesise
+→instrument→fix→regression-test" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#eef2ff;strokeColor=#6366f1;fontColor=#3730a3;" vertex="1" parent="1">
+          <mxGeometry x="320" y="900" width="260" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="evidence" value="Collect proof → evidence/
+gitignored · NOT committed (posted on PR)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#2563eb;fontColor=#1e3a8a;" vertex="1" parent="1">
+          <mxGeometry x="0" y="900" width="300" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="docs" value="Update folder CLAUDE.md
+commit docs: · non-obvious learnings" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#eff6ff;strokeColor=#3b82f6;fontColor=#1e3a8a;" vertex="1" parent="1">
+          <mxGeometry x="110" y="1000" width="300" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="adversarial" value="Adversarial pre-PR review
+fix agent spawns a SUBAGENT (fresh context)
+diff + evidence + AC → PASS / FAIL" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fdf4ff;strokeColor=#a21caf;fontColor=#86198f;" vertex="1" parent="1">
+          <mxGeometry x="80" y="1100" width="360" height="80" as="geometry"/>
+        </mxCell>
+        <mxCell id="pass" value="PASS?
+verdict file" style="rhombus;whiteSpace=wrap;html=1;fillColor=#fff7ed;strokeColor=#ea580c;fontColor=#9a3412;" vertex="1" parent="1">
+          <mxGeometry x="200" y="1210" width="130" height="100" as="geometry"/>
+        </mxCell>
+        <mxCell id="open_pr" value="gh pr create → dev
+## Acceptance Criteria · Fixes #n · PR-gate hook" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#2563eb;fontColor=#1e3a8a;" vertex="1" parent="1">
+          <mxGeometry x="180" y="1350" width="330" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="exit" value="ai-pr-open
+→ Diagram 1, PHASE 2" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e2e8f0;strokeColor=#334155;fontColor=#1e293b;" vertex="1" parent="1">
+          <mxGeometry x="230" y="1460" width="230" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="blocked" value="status = blocked
+state exactly what's needed,
+stop → ai-blocked (Diagram 1)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fef9c3;strokeColor=#ca8a04;fontColor=#854d0e;" vertex="1" parent="1">
+          <mxGeometry x="790" y="190" width="220" height="60" as="geometry"/>
+        </mxCell>
+        <mxCell id="gate" value="GATE (hooks)
+fires per commit/PR · tree-sitter governor
+blocks --no-verify, hooksPath bypass,
+bad prefixes/branch, missing test/AC/evidence" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fef2f2;strokeColor=#dc2626;fontColor=#b91c1c;" vertex="1" parent="1">
+          <mxGeometry x="480" y="1440" width="300" height="90" as="geometry"/>
+        </mxCell>
+        <mxCell id="e0" value="" style="html=1;rounded=0;" edge="1" parent="1" source="start" target="priors">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="760" y="60"/><mxPoint x="760" y="80"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e1" value="" style="html=1;rounded=0;" edge="1" parent="1" source="priors" target="branch">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="690" y="160"/><mxPoint x="690" y="180"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e2" value="" style="html=1;rounded=0;" edge="1" parent="1" source="branch" target="ac">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="580" y="250"/><mxPoint x="580" y="280"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e3" value="" style="html=1;rounded=0;" edge="1" parent="1" source="ac" target="testplan">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="530" y="350"/><mxPoint x="530" y="370"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e4" value="" style="html=1;rounded=0;" edge="1" parent="1" source="testplan" target="interfaces">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="530" y="440"/><mxPoint x="530" y="470"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e5" value="" style="html=1;rounded=0;" edge="1" parent="1" source="interfaces" target="red">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="520" y="540"/><mxPoint x="520" y="560"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e6" value="" style="html=1;rounded=0;" edge="1" parent="1" source="red" target="green">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="480" y="640"/><mxPoint x="480" y="660"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e7" value="" style="html=1;rounded=0;" edge="1" parent="1" source="green" target="tests_pass">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="370" y="730"/><mxPoint x="370" y="760"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e8" value="yes" style="html=1;rounded=0;" edge="1" parent="1" source="tests_pass" target="evidence">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="310" y="900"/><mxPoint x="310" y="930"/><mxPoint x="310" y="930"/><mxPoint x="310" y="930"/><mxPoint x="310" y="930"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e9" value="" style="html=1;rounded=0;" edge="1" parent="1" source="evidence" target="docs">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="210" y="960"/><mxPoint x="210" y="990"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e10" value="" style="html=1;rounded=0;" edge="1" parent="1" source="docs" target="adversarial">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="260" y="1060"/><mxPoint x="260" y="1080"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e11" value="" style="html=1;rounded=0;" edge="1" parent="1" source="adversarial" target="pass">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="260" y="1180"/><mxPoint x="260" y="1200"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e12" value="yes" style="html=1;rounded=0;" edge="1" parent="1" source="pass" target="open_pr">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="260" y="1310"/><mxPoint x="260" y="1340"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e13" value="" style="html=1;rounded=0;" edge="1" parent="1" source="open_pr" target="exit">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="340" y="1410"/><mxPoint x="340" y="1450"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e14" value="no" style="html=1;rounded=0;" edge="1" parent="1" source="tests_pass" target="diagnose">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="370" y="870"/><mxPoint x="370" y="890"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e15" value="fix → re-run green:" style="html=1;rounded=0;" edge="1" parent="1" source="diagnose" target="green">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="500" y="900"/><mxPoint x="500" y="740"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e16" value="FAIL → fix &amp; re-verify" style="html=1;rounded=0;" edge="1" parent="1" source="pass" target="green">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="420" y="1260"/><mxPoint x="590" y="1260"/><mxPoint x="590" y="1260"/><mxPoint x="590" y="1260"/><mxPoint x="590" y="740"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e17" value="stuck" style="html=1;rounded=0;" edge="1" parent="1" source="priors" target="blocked">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="860" y="160"/><mxPoint x="860" y="180"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e18" value="" style="html=1;rounded=0;" edge="1" parent="1" source="branch" target="gate">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="730" y="250"/><mxPoint x="730" y="1430"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e19" value="" style="html=1;rounded=0;" edge="1" parent="1" source="interfaces" target="gate">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="670" y="540"/><mxPoint x="670" y="1430"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e20" value="" style="html=1;rounded=0;" edge="1" parent="1" source="red" target="gate">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="630" y="640"/><mxPoint x="630" y="1430"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e21" value="" style="html=1;rounded=0;" edge="1" parent="1" source="green" target="gate">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="600" y="730"/><mxPoint x="600" y="1430"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e22" value="" style="html=1;rounded=0;" edge="1" parent="1" source="docs" target="gate">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="480" y="1030"/><mxPoint x="540" y="1030"/><mxPoint x="540" y="1030"/><mxPoint x="540" y="1030"/><mxPoint x="540" y="1430"/></Array></mxGeometry>
+        </mxCell>
+        <mxCell id="e23" value="" style="html=1;rounded=0;" edge="1" parent="1" source="open_pr" target="gate">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="490" y="1410"/><mxPoint x="490" y="1430"/></Array></mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

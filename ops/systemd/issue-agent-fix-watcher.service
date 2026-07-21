@@ -1,0 +1,20 @@
+# Linux systemd unit (user service). Install:
+#   bin/install-systemd.sh   (fills @HARNESS_ROOT@/@CONFIG@, installs to
+#   ~/.config/systemd/user/, then `systemctl --user enable --now ...`).
+[Unit]
+Description=Autonomous issue agent — fix watcher
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=uv run --extra sdk --with tree-sitter --with tree-sitter-bash python -m issue_agent.app.main fix
+WorkingDirectory=@HARNESS_ROOT@
+Environment=AGENT_ENV=@CONFIG@
+Environment=TARGET_DIR=@TARGET_DIR@
+Restart=always
+RestartSec=30
+StandardOutput=append:/tmp/issue-agent-fix-watcher.log
+StandardError=append:/tmp/issue-agent-fix-watcher.log
+
+[Install]
+WantedBy=default.target

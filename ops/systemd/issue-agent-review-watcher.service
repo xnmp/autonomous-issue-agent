@@ -1,0 +1,17 @@
+[Unit]
+Description=Autonomous issue agent — review watcher
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=uv run --extra sdk --with tree-sitter --with tree-sitter-bash python -m issue_agent.app.main review
+WorkingDirectory=@HARNESS_ROOT@
+Environment=AGENT_ENV=@CONFIG@
+Environment=TARGET_DIR=@TARGET_DIR@
+Restart=always
+RestartSec=30
+StandardOutput=append:/tmp/issue-agent-review-watcher.log
+StandardError=append:/tmp/issue-agent-review-watcher.log
+
+[Install]
+WantedBy=default.target

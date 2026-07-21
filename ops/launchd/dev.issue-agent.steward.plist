@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.issue-agent.steward</string>
+  <key>ProgramArguments</key>
+  <array>
+	    <string>uv</string>
+	    <string>run</string>
+	    <string>--extra</string>
+	    <string>sdk</string>
+	    <string>--with</string>
+	    <string>tree-sitter</string>
+	    <string>--with</string>
+	    <string>tree-sitter-bash</string>
+	    <string>python</string>
+	    <string>-m</string>
+	    <string>issue_agent.app.main</string>
+	    <string>steward</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+	    <key>AGENT_ENV</key><string>@CONFIG@</string>
+	    <key>TARGET_DIR</key><string>@TARGET_DIR@</string>
+	    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	  </dict>
+	  <key>WorkingDirectory</key><string>@HARNESS_ROOT@</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>StandardOutPath</key><string>/tmp/issue-agent-steward.out.log</string>
+  <key>StandardErrorPath</key><string>/tmp/issue-agent-steward.err.log</string>
+</dict>
+</plist>
