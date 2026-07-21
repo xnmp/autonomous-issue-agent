@@ -332,6 +332,22 @@ def make_pretooluse_hook(
         command = ""
         try:
             tool_input = input_data.get("tool_input") or {}
+            # Reject backgrounded Bash. `run_in_background=true` spawns an SDK
+            # background TASK; in SDK 0.2.110 the main turn then ends with
+            # terminal_reason="background_requested" and NO terminal ResultMessage,
+            # so our single-shot runner sees "no ResultMessage" ($0.00) and loses the
+            # whole run (observed persistently on the reviewer — see
+            # docs/issues/review-no-resultmessage-background-tasks.md). These agents
+            # are single-shot and never need async background work, so deny it
+            # unconditionally — before (and independent of) the command-content gate.
+            if tool_input.get("run_in_background"):
+                if debug:
+                    log("gate: DENY background Bash (run_in_background=true)")
+                return _deny(
+                    "background execution is disabled for this agent — run the "
+                    "command in the foreground (omit run_in_background) so the "
+                    "session returns a result."
+                )
             command = tool_input.get("command", "")
             if not command:
                 return {}

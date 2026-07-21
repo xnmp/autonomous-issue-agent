@@ -198,7 +198,7 @@ class HarnessConfig:
     fixer_runtime: str = "claude"
     codex_bin: str = "codex"
     codex_model: str = ""              # blank → CodexRunner default (GPT-5.5)
-    codex_provider_id: str = "openai"
+    codex_provider_id: str = "openai-custom"  # NOT "openai": reserved by codex-cli ≥0.142
     codex_provider_name: str = "OpenAI"
     codex_base_url: str = ""            # REQUIRED for codex runtime: your OpenAI-compatible gateway
     codex_env_key: str = "OPENAI_API_KEY"
@@ -451,7 +451,7 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         fixer_runtime=e.get("FIXER_RUNTIME", "claude"),
         codex_bin=e.get("CODEX_BIN", "codex"),
         codex_model=e.get("CODEX_MODEL", ""),
-        codex_provider_id=e.get("CODEX_PROVIDER_ID", "openai"),
+        codex_provider_id=e.get("CODEX_PROVIDER_ID", "openai-custom"),
         codex_provider_name=e.get("CODEX_PROVIDER_NAME", "OpenAI"),
         codex_base_url=e.get("CODEX_BASE_URL", ""),
         codex_env_key=e.get("CODEX_ENV_KEY", "OPENAI_API_KEY"),

@@ -207,6 +207,24 @@ def test_run_honours_result_despite_post_result_raise(monkeypatch):
     assert r.is_error is False
 
 
+def test_run_skips_task_notification_followup_result(monkeypatch):
+    """A background task finishing injects a synthetic follow-up whose ResultMessage
+    carries origin={"kind":"task-notification"}. It must NOT be taken as our result —
+    the runner keeps the ResultMessage that answers our prompt. Here the follow-up
+    (a bare/empty result) arrives BEFORE the real verdict; the runner must skip the
+    former and return the latter, not clobber it."""
+    followup = _ResultMessage(is_error=False, structured_output={"status": "ignored"})
+    followup.origin = {"kind": "task-notification"}
+    real = _ResultMessage(
+        is_error=False, structured_output={"status": "pr_opened", "summary": "ok"},
+        session_id="real",
+    )
+    _install_fake_sdk(monkeypatch, [followup, real])
+    r = asyncio.run(AgentRunner().run(AgentTask(prompt="x")))
+    assert r.status == "pr_opened"
+    assert r.session_id == "real"
+
+
 def test_run_reraises_when_crash_before_any_result(monkeypatch):
     _install_fake_sdk(monkeypatch, [], raise_after=True)
     try:

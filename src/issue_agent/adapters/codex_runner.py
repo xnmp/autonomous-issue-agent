@@ -46,7 +46,12 @@ class CodexProvider:
     OpenAI-compatible endpoint; `env_key` names the env var Codex reads the key
     from (we keep the secret in the env, never in argv)."""
 
-    provider_id: str = "openai"
+    # NOT "openai": codex-cli ≥0.142 reserves the built-in provider IDs (`openai`,
+    # etc.) and aborts at config-load ("Built-in providers cannot be overridden")
+    # if you try to redefine one under `model_providers`. The id is purely an
+    # internal config-table key + `model_provider=` pointer (the model itself is
+    # passed via -m), so any non-reserved name works.
+    provider_id: str = "openai-custom"
     name: str = "OpenAI"
     base_url: str = ""                 # set to your OpenAI-compatible gateway
     # Codex's convention is OPENAI_API_KEY; behind a proxy you typically alias it

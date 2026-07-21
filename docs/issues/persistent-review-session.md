@@ -23,18 +23,15 @@ re-hydrates state from scratch. There is no long-lived client kept across rounds
 1. **Cost + latency.** Every re-review round re-pays process startup, preset bootstrap, and
    (SINGLE) full transcript replay. On a PR that takes N rounds to converge this is N× the
    fixed overhead.
-2. **Fragility at result-delivery.** Observed 2026-07-21 (Myapp #352/#354): long review
-   sessions (full PR diff + structured-output schema) intermittently die with
-   `error: Stream closed` in the CLI↔SDK control roundtrip **right before** the
-   `ResultMessage` is emitted — so the whole review is computed, then lost, and
-   `AgentRunner.run` returns `is_error=True, cost=$0.00, "no ResultMessage from query()"`
-   (`agent_runner.py:326`). The daemon retries next poll → the *entire* review re-runs from
-   a cold process. A persistent, warm session would (a) cut the surface area of these
-   cold-start/teardown transport drops and (b) make a retry cheap instead of a full redo.
-
-   Note: this is distinct from the existing "post-result raise" guard — that survives a
-   crash *after* a ResultMessage is captured. Here the stream closes *before* any
-   ResultMessage, so nothing is captured.
+2. **Fragility at result-delivery.** Observed 2026-07-21 (Myapp #352/#354): reviews
+   frequently return `is_error=True, cost=$0.00, "no ResultMessage from query()"`
+   (`agent_runner.py`), so the whole review is computed then lost and the daemon
+   retries from a cold process. **NOTE — root cause corrected:** this was initially
+   blamed here on a gateway "Stream closed" transport drop; that was WRONG. It's the
+   SDK 0.2.110 background-Task stream never yielding a terminal `ResultMessage` —
+   see **`review-no-resultmessage-background-tasks.md`** for the evidence and fix.
+   A persistent warm session helps the *cost* of retrying, but the actual result-loss
+   bug is fixed there, not here.
 
 ## Proposed fix
 

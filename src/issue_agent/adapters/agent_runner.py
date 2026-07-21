@@ -36,6 +36,30 @@ def _default_wall_clock() -> float:
     return time.time()
 
 
+def _option_field_names() -> frozenset[str]:
+    """Names of ClaudeAgentOptions fields for the installed SDK build, cached.
+    Guards optional kwargs (e.g. `stderr`) so we only pass them when the build
+    accepts them — an older SDK would reject an unknown field at construction."""
+    global _OPTION_FIELDS
+    if _OPTION_FIELDS is None:
+        import dataclasses
+
+        try:
+            from claude_agent_sdk import ClaudeAgentOptions
+
+            _OPTION_FIELDS = frozenset(
+                f.name for f in dataclasses.fields(ClaudeAgentOptions)
+            )
+        except (ImportError, TypeError):
+            # Older SDK, or a stubbed test double that isn't a dataclass → treat as
+            # "no optional fields known"; callers fall back to the base kwargs.
+            _OPTION_FIELDS = frozenset()
+    return _OPTION_FIELDS
+
+
+_OPTION_FIELDS: frozenset[str] | None = None
+
+
 # Default governed permission posture. `auto` exists in the Python SDK
 # (Literal includes it) but we default to bypassPermissions so the in-process
 # governor hook is unambiguously THE gate — matching the bash design where the
@@ -241,9 +265,31 @@ class AgentRunner(AgentRuntime):
             kwargs["agents"] = {
                 name: AgentDefinition(**spec) for name, spec in kwargs["agents"].items()
             }
+        # Capture the bundled CLI's OWN stderr. The SDK otherwise swallows it, so a
+        # gateway-side failure (an HTTP status, an SSE `response.failed`, a reconnect
+        # loop) that kills the result-delivery turn is invisible — we see only the
+        # symptom ("no ResultMessage"), never the cause. Route each stderr line into
+        # our log (tagged) so the real reason sits next to the $0.00 error. Only
+        # wired when the SDK build exposes the `stderr` option (older builds don't).
+        if "stderr" in _option_field_names():
+            def _cli_stderr(line: str) -> None:
+                s = (line or "").rstrip()
+                if s:
+                    self._log(f"sdk-stderr: {s[:500]}")
+            kwargs["stderr"] = _cli_stderr
+
         options = ClaudeAgentOptions(**kwargs)
         final: Any = None
         last_trace = ""  # last thing we saw before a transport death (for the log)
+        # Diagnostics for the clean-end-no-result drop (gateway fails at result
+        # delivery): the stream ends via StopAsyncIteration WITHOUT ever yielding a
+        # ResultMessage, so the "transport died" exception branch never fires and
+        # nothing explains the $0.00 error. Track how far we got — total messages
+        # seen and the KIND of the last one — so the log distinguishes "died on the
+        # first event" (never started) from "died mid-task after N tool turns"
+        # (gateway dropped the final result turn). ALWAYS logged (not debug-gated).
+        msg_count = 0
+        last_kind = "none"
         agen = query(prompt=task.prompt, options=options).__aiter__()
         try:
             while True:
@@ -297,10 +343,26 @@ class AgentRunner(AgentRuntime):
                         message = await agen.__anext__()
                     except StopAsyncIteration:
                         break
+                msg_count += 1
+                last_kind = type(message).__name__
                 if self._debug:
                     last_trace = _trace_message(message)
                     self._log(f"sdk: {last_trace}")
                 if isinstance(message, ResultMessage):
+                    # Skip background-task follow-up results. When a background task
+                    # finishes, the SDK injects a synthetic follow-up turn whose
+                    # ResultMessage carries origin={"kind":"task-notification"} — it
+                    # does NOT answer our prompt, and letting it overwrite `final`
+                    # would clobber (or stand in for) the real verdict. Keep only the
+                    # result for our own turn. (Background Bash is separately blocked
+                    # at the governor hook; this is defense-in-depth for any other
+                    # background path the preset may open.) Duck-typed: older SDK
+                    # builds have no `origin` → getattr None → treated as ours.
+                    origin = getattr(message, "origin", None)
+                    if isinstance(origin, dict) and origin.get("kind") == "task-notification":
+                        if self._debug:
+                            self._log("sdk: skipping task-notification follow-up result")
+                        continue
                     final = message
         except Exception as exc:
             # The SDK raises the CLI's trailing ProcessError when Claude Code
@@ -323,5 +385,19 @@ class AgentRunner(AgentRuntime):
         if final is None:
             # No ResultMessage emitted (transport died) → surface as an error,
             # never silently as success. Matches the bash rc!=0 path.
+            #
+            # This is the clean-end drop (stream StopAsyncIteration without a
+            # ResultMessage), NOT the exception path above — so log WHY here or the
+            # $0.00 error is opaque. `msg_count`/`last_kind` distinguish a stream
+            # that never started (0 msgs → auth/launch/gateway-reject) from one that
+            # ran N turns then lost only the final result turn (mid-task gateway
+            # drop). ALWAYS logged (this is the diagnostic for the persistent
+            # result-delivery failure).
+            self._log(
+                f"sdk: stream ENDED cleanly with NO ResultMessage after "
+                f"{msg_count} message(s); last kind={last_kind}"
+                + (f", last={last_trace}" if last_trace else "")
+                + " — result-delivery drop (no exception raised)"
+            )
             return AgentResult(is_error=True, summary="no ResultMessage from query()")
         return result_to_agent_result(final)

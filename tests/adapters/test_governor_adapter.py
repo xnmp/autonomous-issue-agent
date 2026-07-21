@@ -202,6 +202,32 @@ def test_hook_allows_clean_command():
     assert out == {}
 
 
+def test_hook_denies_background_bash():
+    """`run_in_background=true` spawns an SDK background task; in SDK 0.2.110 the
+    main turn then ends with no terminal ResultMessage and the single-shot runner
+    loses the whole run. The governor denies it BEFORE the command-content gate —
+    even for an otherwise-clean command like `ls`."""
+    hook = make_pretooluse_hook(lambda cwd: ctx())
+    out = asyncio.run(hook(
+        {"tool_input": {"command": "ls", "run_in_background": True}, "cwd": "/x"},
+        "id", None,
+    ))
+    hso = out["hookSpecificOutput"]
+    assert hso["permissionDecision"] == "deny"
+    assert "background" in hso["permissionDecisionReason"].lower()
+
+
+def test_hook_allows_foreground_bash_that_would_be_backgroundable():
+    """The deny is gated on the flag, not the command — the same command in the
+    foreground (no run_in_background) passes."""
+    hook = make_pretooluse_hook(lambda cwd: ctx())
+    out = asyncio.run(hook(
+        {"tool_input": {"command": "ls", "run_in_background": False}, "cwd": "/x"},
+        "id", None,
+    ))
+    assert out == {}
+
+
 def test_hook_logs_allowed_commit_with_issue_number():
     """An allowed commit emits a live breadcrumb tagged with the issue number
     parsed from the worktree cwd — the per-commit half of the fix log that closes
