@@ -97,12 +97,12 @@ ADOPT = ReviewConfig(review_bot="review-bot", adopt_unlabeled=True)
 
 
 def test_adopts_unlabeled_open_pr():
-    # A PR with no trigger label → labelled with it (enters review next poll).
+    # A PR with no trigger label → labelled with it AND reviewed the same poll,
+    # so a comment lands on the first tick (not a poll later).
     p = pr(200, head_ref_oid="abc", author="human")
     acts = decide_review(world(prs=[p]), ADOPT, ReviewState())
     assert Relabel(Target.PR, 200, None, Label.AI_PR_OPEN) in acts
-    # not reviewed THIS poll (waits for the label to land)
-    assert not any(isinstance(a, RunAgent) for a in acts)
+    assert RunAgent(AgentKind.REVIEW, 200) in acts
 
 
 def test_adopt_off_by_default_leaves_rogue_pr_alone():

@@ -111,9 +111,12 @@ def decide_review(
     are independent (no shared lock), so every eligible PR gets an action.
 
     Rogue-PR adoption: an OPEN PR with no trigger label (opened directly, never
-    via the pipeline) is LABELLED with the trigger label this poll; next poll it's
-    a normal review candidate. Adoption is one action (the relabel); the review
-    itself waits for the label to land, keeping the two steps observable."""
+    via the pipeline) is LABELLED with the trigger label AND reviewed the SAME
+    poll — the relabel records that the PR is now in-pipeline; the review runs
+    immediately so a comment lands on the first tick instead of a poll later.
+    (The review reads the diff by PR number and does not depend on the label
+    being present yet; saving the session this tick means the labelled PR is not
+    re-reviewed next poll.)"""
     if cfg.identity_mode == "solo":
         return []
     actions: list[Action] = []
@@ -126,9 +129,8 @@ def decide_review(
             actions.append(RunAgent(AgentKind.RE_REVIEW, pr.number))
     for pr in world.prs:
         if should_adopt(pr, cfg):
-            actions.append(
-                Relabel(Target.PR, pr.number, None, cfg.trigger_label)
-            )
+            actions.append(Relabel(Target.PR, pr.number, None, cfg.trigger_label))
+            actions.append(RunAgent(AgentKind.REVIEW, pr.number))
     return actions
 
 
