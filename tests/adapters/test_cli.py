@@ -62,6 +62,38 @@ def test_resolve_name_derives_when_no_match(tmp_path):
     assert name == "new-repo"
 
 
+def test_resolve_name_prefers_target_dir_match(tmp_path):
+    """Regression: two overlays share a REPO but point at different working copies.
+    The launched-from dir (target_dir) must decide — NOT the alphabetically-first
+    match. `-wt` sorts before the primary name, so alpha-only picked the wrong one
+    and silently ran against the wrong TARGET_DIR."""
+    repo = "acme/App-combined-agent"
+    (tmp_path / "app-wt.env").write_text(f'REPO="{repo}"\nTARGET_DIR="/repos/app-harness"\n')
+    (tmp_path / "app.env").write_text(f'REPO="{repo}"\nTARGET_DIR="/repos/app"\n')
+    # Launched from the primary checkout → the primary overlay, not the alpha-first -wt.
+    assert cli.resolve_name(repo, repos_dir=str(tmp_path), target_dir="/repos/app") == "app"
+    # Launched from the worktree copy → the -wt overlay.
+    assert cli.resolve_name(repo, repos_dir=str(tmp_path), target_dir="/repos/app-harness") == "app-wt"
+
+
+def test_resolve_name_target_dir_realpath_normalized(tmp_path):
+    """Trailing slash / `.` segment variants of the same dir still match."""
+    repo = "acme/App"
+    (tmp_path / "app.env").write_text(f'REPO="{repo}"\nTARGET_DIR="/repos/app"\n')
+    assert cli.resolve_name(repo, repos_dir=str(tmp_path), target_dir="/repos/app/") == "app"
+    assert cli.resolve_name(repo, repos_dir=str(tmp_path), target_dir="/repos/./app") == "app"
+
+
+def test_resolve_name_falls_back_to_repo_only_when_no_target_match(tmp_path):
+    """target_dir given but no overlay's TARGET_DIR matches → existing REPO-first
+    (alpha) behavior, preserving back-compat."""
+    repo = "acme/App-combined-agent"
+    (tmp_path / "app-wt.env").write_text(f'REPO="{repo}"\nTARGET_DIR="/repos/app-harness"\n')
+    (tmp_path / "app.env").write_text(f'REPO="{repo}"\nTARGET_DIR="/repos/app"\n')
+    # Detected dir matches neither overlay → first alpha REPO match (app-wt).
+    assert cli.resolve_name(repo, repos_dir=str(tmp_path), target_dir="/somewhere/else") == "app-wt"
+
+
 # ── synth_repo_env round-trips through the daemon's reader ─────────────────────
 def _source_env(text: str) -> dict:
     """Parse a synthesized overlay the way from_env consumes it: only the simple

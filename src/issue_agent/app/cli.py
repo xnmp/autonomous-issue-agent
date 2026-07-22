@@ -100,18 +100,38 @@ def derive_name(repo: str) -> str:
     return re.sub(r"[^a-z0-9._-]", "-", base).strip("-") or "target"
 
 
-def resolve_name(repo: str, explicit: str = "", repos_dir: str = REPOS_DIR) -> str:
-    """Overlay name for this repo. Priority: explicit --name → an existing
-    config/repos/*.env whose REPO== the detected repo (transparent reuse) →
-    derived from the repo basename."""
+def resolve_name(
+    repo: str, explicit: str = "", repos_dir: str = REPOS_DIR, target_dir: str = ""
+) -> str:
+    """Overlay name for this repo. Priority:
+    1. explicit --name.
+    2. An overlay whose REPO==repo AND TARGET_DIR==`target_dir` — the cwd-honoring
+       match. When several overlays share a REPO (e.g. a primary `myapp.env` and a
+       worktree `myapp-wt.env`, both my-org/example-agent), this picks the
+       one for the working copy you actually launched from, instead of the
+       alphabetically-first REPO match (which silently ran against the wrong dir).
+    3. An overlay whose REPO==repo (first alpha) — back-compat fallback when
+       target_dir is unknown or no overlay's TARGET_DIR matches it.
+    4. Derived from the repo basename.
+    """
     if explicit:
         return explicit
     if repo and os.path.isdir(repos_dir):
-        for fn in sorted(os.listdir(repos_dir)):
-            if not fn.endswith(".env"):
-                continue
-            if read_repo_env_field(os.path.join(repos_dir, fn), "REPO") == repo:
-                return fn[: -len(".env")]
+        envs = [fn for fn in sorted(os.listdir(repos_dir)) if fn.endswith(".env")]
+        repo_matches = [
+            fn for fn in envs
+            if read_repo_env_field(os.path.join(repos_dir, fn), "REPO") == repo
+        ]
+        # Tier 2: prefer the overlay whose TARGET_DIR IS the detected working copy.
+        if target_dir:
+            want = os.path.realpath(target_dir)
+            for fn in repo_matches:
+                td = read_repo_env_field(os.path.join(repos_dir, fn), "TARGET_DIR")
+                if td and os.path.realpath(td) == want:
+                    return fn[: -len(".env")]
+        # Tier 3: any REPO match (first alpha) — back-compat.
+        if repo_matches:
+            return repo_matches[0][: -len(".env")]
     return derive_name(repo)
 
 
@@ -390,7 +410,9 @@ def _resolve_context(args) -> tuple[str, str, str]:
     cwd = os.getcwd()
     target_dir = args.target_dir or detect_target_dir(cwd)
     repo = args.repo or detect_repo(cwd)
-    name = resolve_name(repo, getattr(args, "name", "") or "")
+    # Pass target_dir so a repo with several overlays resolves to the one for THIS
+    # working copy (cwd wins), not the alphabetically-first REPO match.
+    name = resolve_name(repo, getattr(args, "name", "") or "", target_dir=target_dir)
     return repo, target_dir, name
 
 
