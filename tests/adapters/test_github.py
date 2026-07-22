@@ -454,3 +454,62 @@ def test_build_world_enriches_only_ready_issues_with_blocker_gate():
     by_num = {i.number: i for i in w.issues}
     assert by_num[5].blocked_by_open is True     # ready issue gated + blocked
     assert by_num[6].blocked_by_open is False    # working issue never gated
+
+
+# ── _subprocess_runner: benign statusCheckRollup noise gated behind debug ──────
+import subprocess as _subprocess  # noqa: E402
+from dataclasses import dataclass as _dc  # noqa: E402
+from issue_agent.adapters.github import _subprocess_runner  # noqa: E402
+
+
+@_dc
+class _FakeCompleted:
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
+
+
+def _fake_run_factory(rc, stderr):
+    def _run(argv, capture_output, text, env, timeout):  # match subprocess.run kw
+        return _FakeCompleted(returncode=rc, stdout="", stderr=stderr)
+    return _run
+
+
+_ROLLUP_ERR = (
+    "GraphQL: Resource not accessible by integration "
+    "(node.statusCheckRollup.nodes.0.commit.statusCheckRollup)"
+)
+
+
+def test_benign_statuscheckrollup_failure_is_silent_without_debug(monkeypatch, capsys):
+    """The `gh pr checks` statusCheckRollup failure (App token lacks checks read)
+    is known-benign noise — one line per PR per poll. With debug OFF it must NOT
+    hit stderr."""
+    monkeypatch.delenv("ISSUE_AGENT_DEBUG", raising=False)
+    monkeypatch.setattr(_subprocess, "run", _fake_run_factory(1, _ROLLUP_ERR))
+    out = _subprocess_runner(["gh", "pr", "checks", "112", "--repo", "o/r"], None)
+    assert out == ""                       # still fail-soft (empty result)
+    assert capsys.readouterr().err == ""   # but silent
+
+
+def test_benign_statuscheckrollup_failure_shown_with_debug(monkeypatch, capsys):
+    """Debug ON → the benign noise IS logged (operator asked to see everything)."""
+    monkeypatch.setenv("ISSUE_AGENT_DEBUG", "1")
+    monkeypatch.setattr(_subprocess, "run", _fake_run_factory(1, _ROLLUP_ERR))
+    _subprocess_runner(["gh", "pr", "checks", "112", "--repo", "o/r"], None)
+    assert "gh failed" in capsys.readouterr().err
+
+
+def test_non_benign_gh_failure_stays_loud_without_debug(monkeypatch, capsys):
+    """A REAL failure (e.g. a 422 self-approval on submit) must never be silenced —
+    the whole reason the stderr write exists. Not a pr-checks/rollup error → loud."""
+    monkeypatch.delenv("ISSUE_AGENT_DEBUG", raising=False)
+    monkeypatch.setattr(
+        _subprocess, "run",
+        _fake_run_factory(1, "HTTP 422: Can not approve your own pull request"),
+    )
+    _subprocess_runner(
+        ["gh", "api", "repos/o/r/pulls/1/reviews", "--method", "POST"], None
+    )
+    err = capsys.readouterr().err
+    assert "gh failed" in err and "422" in err

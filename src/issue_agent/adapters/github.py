@@ -550,6 +550,20 @@ def _subprocess_runner(argv: list[str], token: str | None) -> str:
         # from env, not argv — but be defensive about logging command lines).
         printable = " ".join(argv)
         detail = (res.stderr or res.stdout or "").strip()
-        sys.stderr.write(f"gh failed (exit {res.returncode}): {printable}\n  {detail}\n")
+        # A KNOWN-benign failure — `gh pr checks` reading statusCheckRollup with an
+        # App token that lacks the checks read scope ("Resource not accessible by
+        # integration"). The reviewer does not gate on checks, so this is pure noise:
+        # one line per PR per poll, flooding stdout. Gate it behind ISSUE_AGENT_DEBUG.
+        # Every OTHER gh failure stays loud — the stderr write exists precisely so a
+        # real failure (e.g. a 422 self-approval that made the reviewer look like it
+        # did nothing) is visible rather than silently swallowed.
+        benign_checks_rollup = (
+            "pr checks" in printable
+            and "statusCheckRollup" in detail
+            and "Resource not accessible by integration" in detail
+        )
+        debug_on = os.environ.get("ISSUE_AGENT_DEBUG", "0") not in ("", "0", "false", "False")
+        if not benign_checks_rollup or debug_on:
+            sys.stderr.write(f"gh failed (exit {res.returncode}): {printable}\n  {detail}\n")
         return ""
     return res.stdout
