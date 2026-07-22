@@ -20,6 +20,19 @@ the test would actually FAIL if the change were reverted. REQUEST_CHANGES if:
 Read the test file ON DISK (it may differ from the diff) and trace the change to the
 layer that truly produces the observed result before approving.
 
+Test coverage must match the CHANGE TYPE (judge by the diff + PR intent, not prose):
+- Bug fix / refactor / debugging PR → REQUEST_CHANGES if no test pins the corrected
+  behaviour. A bugfix without a regression test that would have caught the bug (and
+  fails on the pre-fix code) leaves the bug free to return. A behaviour-preserving
+  refactor needs tests proving the behaviour is in fact preserved — existing tests
+  that already exercise the refactored seam satisfy this; if none exist, one is owed.
+- Feature PR → REQUEST_CHANGES if no test asserts the user-visible/contract-level
+  outcome end-to-end (the seam the acceptance criterion names), not just a unit
+  mock. One real e2e/integration assertion at the outcome seam clears this.
+- Genuinely test-free changes are EXEMPT: docs, comments, formatting, config/env,
+  generated/vendored code, or glue with no observable behaviour. Do not manufacture
+  a test demand where there is no behaviour to assert.
+
 ## Dimension 6 — Proof of work / no signal suppression
 REQUEST_CHANGES if the PR makes a check pass by SUPPRESSING a quality/security
 signal for the code it adds or modifies: adding the changed file to coverage or
