@@ -290,6 +290,8 @@ class AgentRunner(AgentRuntime):
         # (gateway dropped the final result turn). ALWAYS logged (not debug-gated).
         msg_count = 0
         last_kind = "none"
+        last_msg: Any = None  # the actual last message object (for drop-path forensics)
+        terminal_seen = ""    # any terminal_reason observed across the stream
         agen = query(prompt=task.prompt, options=options).__aiter__()
         try:
             while True:
@@ -307,35 +309,56 @@ class AgentRunner(AgentRuntime):
                 message: Any = _NO_MESSAGE
                 stream_ended = False
                 if self._idle_timeout is not None:
+                    # Poll the NEXT event without cancelling the in-flight receive.
+                    #
+                    # The previous form — asyncio.wait_for(agen.__anext__(), slice) —
+                    # cancelled the pending __anext__() on every slice timeout. The SDK
+                    # generator awaits its transport read inside __anext__(); cancelling
+                    # that mid-read closes the stream, so the NEXT __anext__() returns
+                    # StopAsyncIteration and the whole run ends with NO ResultMessage
+                    # ($0.00 "result-delivery drop"). Any run where the model pauses
+                    # longer than one slice between messages (routine for a reviewer
+                    # thinking over a large diff) hit this — the persistent ~all-review
+                    # failure. See the wait_for-cancel repro in the drop investigation.
+                    #
+                    # Fix: start the __anext__() ONCE as a task and OBSERVE it across
+                    # slices with asyncio.wait (which does NOT cancel on timeout). The
+                    # receive runs to completion regardless of how many slices elapse;
+                    # slices exist only to re-check the wall-clock idle budget (so a
+                    # true hang, or a sleep-spanning gap on macOS where the monotonic
+                    # clock freezes, still trips the idle timeout and frees the laptop).
                     last_event = self._wall_clock()
+                    pending = asyncio.ensure_future(agen.__anext__())
                     while True:
-                        try:
-                            message = await asyncio.wait_for(
-                                agen.__anext__(),
-                                timeout=min(self._poll_slice, self._idle_timeout),
+                        done, _ = await asyncio.wait(
+                            {pending},
+                            timeout=min(self._poll_slice, self._idle_timeout),
+                        )
+                        if done:
+                            try:
+                                message = pending.result()
+                            except StopAsyncIteration:
+                                stream_ended = True
+                            break  # got an event (or the stream ended)
+                        idle = self._wall_clock() - last_event
+                        if idle >= self._idle_timeout:
+                            self._log(
+                                f"sdk: IDLE — no stream event for {idle:.0f}s "
+                                f"(>{self._idle_timeout:.0f}s); treating as hung "
+                                f"(last: {last_trace or 'none'})"
                             )
-                            break  # got an event
-                        except StopAsyncIteration:
-                            stream_ended = True
-                            break
-                        except asyncio.TimeoutError:
-                            idle = self._wall_clock() - last_event
-                            if idle >= self._idle_timeout:
-                                self._log(
-                                    f"sdk: IDLE — no stream event for {idle:.0f}s "
-                                    f"(>{self._idle_timeout:.0f}s); treating as hung "
-                                    f"(last: {last_trace or 'none'})"
+                            pending.cancel()
+                            await _aclose_quietly(agen)
+                            if final is None:
+                                return AgentResult(
+                                    is_error=True, status="timeout",
+                                    summary=f"agent idle >{self._idle_timeout:.0f}s "
+                                            "(no stream event)",
                                 )
-                                await _aclose_quietly(agen)
-                                if final is None:
-                                    return AgentResult(
-                                        is_error=True, status="timeout",
-                                        summary=f"agent idle >{self._idle_timeout:.0f}s "
-                                                "(no stream event)",
-                                    )
-                                stream_ended = True  # had a result; honour it below
-                                break
-                            # slice elapsed but still inside the window — keep waiting
+                            stream_ended = True  # had a result; honour it below
+                            break
+                        # slice elapsed but still inside the window — keep observing the
+                        # SAME pending receive (do NOT cancel/restart it)
                     if stream_ended:
                         break
                 else:
@@ -345,6 +368,14 @@ class AgentRunner(AgentRuntime):
                         break
                 msg_count += 1
                 last_kind = type(message).__name__
+                last_msg = message
+                # Capture any terminal_reason the SDK attaches to ANY message — a
+                # background-requested turn end carries it on a non-Result message,
+                # so it never reaches the ResultMessage branch. This is the forensic
+                # for the persistent no-ResultMessage drop on subagent-spawning runs.
+                tr = getattr(message, "terminal_reason", None)
+                if tr:
+                    terminal_seen = str(tr)
                 if self._debug:
                     last_trace = _trace_message(message)
                     self._log(f"sdk: {last_trace}")
@@ -393,11 +424,30 @@ class AgentRunner(AgentRuntime):
             # ran N turns then lost only the final result turn (mid-task gateway
             # drop). ALWAYS logged (this is the diagnostic for the persistent
             # result-delivery failure).
+            # Forensic dump of the LAST message: its public non-callable attrs, so a
+            # terminal_reason / subtype / num_turns / origin that explains the drop is
+            # captured instead of guessed. Truncated per-value to keep the log sane.
+            forensic = ""
+            if last_msg is not None:
+                fields = {}
+                for a in dir(last_msg):
+                    if a.startswith("_"):
+                        continue
+                    try:
+                        v = getattr(last_msg, a)
+                    except Exception:
+                        continue
+                    if callable(v):
+                        continue
+                    fields[a] = repr(v)[:120]
+                forensic = f"; last_msg_fields={fields}"
             self._log(
                 f"sdk: stream ENDED cleanly with NO ResultMessage after "
                 f"{msg_count} message(s); last kind={last_kind}"
+                + (f", terminal_reason={terminal_seen}" if terminal_seen else "")
                 + (f", last={last_trace}" if last_trace else "")
                 + " — result-delivery drop (no exception raised)"
+                + forensic
             )
             return AgentResult(is_error=True, summary="no ResultMessage from query()")
         return result_to_agent_result(final)

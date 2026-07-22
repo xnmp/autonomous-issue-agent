@@ -353,6 +353,44 @@ def test_idle_timeout_does_not_trip_on_steady_stream(monkeypatch):
     assert r.is_error is False and r.status == "pr_opened"  # completed, never tripped
 
 
+def test_gap_longer_than_poll_slice_still_delivers_result(monkeypatch):
+    """Regression: the persistent reviewer $0.00 "no ResultMessage" drop.
+
+    When the model pauses LONGER than one poll_slice between messages (routine for
+    a reviewer thinking over a large diff), the old code — wait_for(__anext__(),
+    slice) — cancelled the in-flight receive on every slice timeout, closing the
+    SDK stream so the next __anext__() returned StopAsyncIteration and the run
+    ended with NO ResultMessage. The watchdog must instead keep observing the SAME
+    receive across slices: a gap > poll_slice but < idle_timeout must NOT drop the
+    stream, and the terminal ResultMessage must still arrive."""
+    async def fake_query(prompt, options):
+        yield object()                    # early event
+        await asyncio.sleep(0.15)         # gap > poll_slice (0.05), < idle_timeout (5.0)
+        yield object()                    # event after a multi-slice pause
+        await asyncio.sleep(0.15)         # another long-ish pause before the result
+        yield _ResultMessage(is_error=False,
+                             structured_output={"status": "pr_opened"}, session_id="s")
+
+    import sys
+    import types
+    fake = types.ModuleType("claude_agent_sdk")
+    fake.ClaudeAgentOptions = lambda **kw: object()
+    fake.ResultMessage = _ResultMessage
+    fake.query = fake_query
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake)
+
+    logged: list[str] = []
+    r = asyncio.run(
+        AgentRunner(log=logged.append, idle_timeout=5.0, poll_slice=0.05).run(
+            AgentTask(prompt="x")
+        )
+    )
+    # The result survives the > poll_slice gaps; no idle trip, no drop.
+    assert r.is_error is False and r.status == "pr_opened"
+    assert not any("IDLE" in m for m in logged)
+    assert not any("NO ResultMessage" in m for m in logged)
+
+
 # ── debug tracing: make a mid-session "Stream closed" wedge diagnosable ────────
 from issue_agent.adapters.agent_runner import _trace_message  # noqa: E402
 

@@ -310,6 +310,50 @@ def test_build_review_world_queries_trigger_label_and_no_issues():
     assert list_calls and "ai-review" in list_calls[0]
 
 
+def test_review_world_pr_view_omits_mergeability_fields():
+    """The reviewer must never request mergeable/mergeStateStatus: GitHub computes
+    them lazily and the call can hang forever on a just-merged PR, freezing the
+    poll. Only the fixer (rebase logic) needs them. Regression for the review
+    daemon wedging behind a hung `gh pr view` and never leaving a comment."""
+    pr_resp = {"number": 815, "headRefName": "feature/x", "state": "OPEN",
+               "labels": [{"name": "ai-review"}]}
+    fr = FakeRunner({"pr list": [{"number": 815}], "pr view 815": pr_resp,
+                     "pr checks 815": []})
+    gw = GitHubGateway("o/ext", runner=fr, review_pr_label="ai-review")
+    gw.build_review_world()
+    view_calls = [c[0] for c in fr.calls if c[0][1:3] == ["pr", "view"]]
+    assert view_calls, "expected a pr view call"
+    fields = view_calls[0][view_calls[0].index("--json") + 1]
+    assert "mergeable" not in fields and "mergeStateStatus" not in fields
+    # the fixer path DOES ask for them (auto-rebase needs is_conflicting/needs_rebase)
+    fr2 = FakeRunner({"pr view 815": pr_resp, "pr checks 815": []})
+    GitHubGateway("o/r", runner=fr2).get_pr(815)
+    v2 = [c[0] for c in fr2.calls if c[0][1:3] == ["pr", "view"]][0]
+    assert "mergeable" in v2[v2.index("--json") + 1]
+
+
+def test_review_world_survives_one_failing_pr_fetch():
+    """One PR whose `gh pr view` returns empty (hung/killed → parse_pr(None) raises)
+    must NOT abort the whole poll: the other PRs still populate the world, so a
+    newer PR isn't stranded behind a broken older one. Regression for #382 going
+    unreviewed while #374's view hung."""
+    good = {"number": 900, "state": "OPEN", "labels": [{"name": "ai-review"}]}
+
+    def runner(argv, token):
+        key = " ".join(argv)
+        if "pr list" in key:
+            return json.dumps([{"number": 374}, {"number": 900}])
+        if "pr view 374" in key:
+            return ""  # the hung/killed PR → empty → parse would raise
+        if "pr view 900" in key:
+            return json.dumps(good)
+        return ""
+
+    gw = GitHubGateway("o/r", runner=runner, review_pr_label="ai-review")
+    w = gw.build_review_world()
+    assert [p.number for p in w.prs] == [900]  # 374 dropped, 900 survived
+
+
 def test_build_steward_world_includes_open_and_closed_ai_done():
     # open issue list returns #5; closed-ai-done list returns #9. The world must
     # union them so the final Done transition isn't missed on an already-closed issue.

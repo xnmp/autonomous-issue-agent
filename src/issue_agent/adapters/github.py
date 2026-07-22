@@ -36,6 +36,13 @@ from ..domain.world import (
 )
 
 
+# Hard ceiling on any single `gh` subprocess. A `gh pr view` requesting lazily
+# computed fields (mergeable / mergeStateStatus) can hang indefinitely on a
+# just-merged PR; without a timeout that wedges the synchronous poll loop. 120s is
+# far above a healthy call (<2s) yet bounds the pathological hang.
+_GH_TIMEOUT_S = 120.0
+
+
 # ── pure parsers ──────────────────────────────────────────────────────────────
 def _labels(raw: list | None) -> frozenset[Label]:
     """gh returns labels as [{"name": "ai-ready"}, …] (issue/pr view) or as bare
@@ -288,11 +295,19 @@ class GitHubGateway:
         except Exception:
             return False
 
-    def get_pr(self, number: int) -> PRView:
+    def get_pr(self, number: int, *, mergeability: bool = True) -> PRView:
+        """Fetch one PR. `mergeability=False` DROPS the mergeable/mergeStateStatus
+        fields from the query — GitHub computes those lazily and can hang the call
+        indefinitely on a just-merged PR (see _GH_TIMEOUT_S). Only the fixer's
+        auto-rebase logic consumes them (is_conflicting / needs_rebase); the reviewer
+        never does, so the review world fetches without them and cannot hang on that
+        computation. Fields left absent parse to '' → is_conflicting/needs_rebase are
+        simply False, which is correct for the review path (it doesn't rebase)."""
+        base = ("number,title,body,headRefName,headRefOid,baseRefName,labels,"
+                "reviews,state,closingIssuesReferences,files,isDraft,author")
+        fields = base + (",mergeable,mergeStateStatus" if mergeability else "")
         d = self._gh_json(
-            ["pr", "view", str(number), "--repo", self.repo, "--json",
-             "number,title,body,headRefName,headRefOid,baseRefName,labels,"
-             "reviews,state,closingIssuesReferences,files,mergeable,mergeStateStatus,isDraft,author"]
+            ["pr", "view", str(number), "--repo", self.repo, "--json", fields]
         )
         pr = parse_pr(d)  # type: ignore[arg-type]
         # checks come from a separate endpoint (bash `pr checks`).
@@ -300,6 +315,24 @@ class GitHubGateway:
             ["pr", "checks", str(number), "--repo", self.repo, "--json", "name,state,bucket"]
         ) or []
         return replace(pr, checks=_checks(checks))  # type: ignore[arg-type]
+
+    def _safe_get_pr(self, number: int, *, mergeability: bool = True) -> PRView | None:
+        """`get_pr` that isolates a single PR's failure. A hung/empty `gh pr view`
+        (→ parse_pr(None) → AttributeError) or any transient read error must NOT
+        abort the whole world-build: previously one such PR raised out of the
+        generator in build_*_world, killing the entire poll pass so EVERY later PR
+        (sorted after it) went unseen — a just-merged PR whose mergeable field hung
+        stranded newer PRs from review. Here a failed PR drops to None (logged) and
+        the poll re-derives it next tick."""
+        try:
+            return self.get_pr(number, mergeability=mergeability)
+        except Exception as exc:  # noqa: BLE001 — deliberately broad: one PR ≠ whole pass
+            import sys
+            sys.stderr.write(
+                f"skip PR #{number} this poll ({type(exc).__name__}: {str(exc)[:120]}) "
+                "— re-derived next tick\n"
+            )
+            return None
 
     def list_pr_numbers(self, label: str, state: str = "open") -> list[int]:
         data = self._gh_json(
@@ -338,7 +371,9 @@ class GitHubGateway:
             if n in ready_numbers else self.get_issue(n)
             for n in sorted(issue_numbers)
         )
-        prs = tuple(self.get_pr(n) for n in sorted(prs_numbers))
+        prs = tuple(
+            p for n in sorted(prs_numbers) if (p := self._safe_get_pr(n)) is not None
+        )
         return WorldState(issues=issues, prs=prs)
 
     def build_review_world(self) -> WorldState:
@@ -359,7 +394,14 @@ class GitHubGateway:
         # adopt a closed rogue PR).
         if self.review_adopt_unlabeled:
             prs_numbers.update(self.list_all_open_pr_numbers())
-        prs = tuple(self.get_pr(n) for n in sorted(prs_numbers))
+        # mergeability=False: the reviewer never reads mergeable/merge_state (only the
+        # fixer's rebase logic does), and requesting them can hang gh indefinitely on a
+        # just-merged PR — which previously froze the whole review poll. Fetch without
+        # them so a comment can always be left.
+        prs = tuple(
+            p for n in sorted(prs_numbers)
+            if (p := self._safe_get_pr(n, mergeability=False)) is not None
+        )
         return WorldState(issues=(), prs=prs)
 
     def build_triage_world(self) -> WorldState:
@@ -486,7 +528,23 @@ def _subprocess_runner(argv: list[str], token: str | None) -> str:
     env = dict(os.environ)
     if token:
         env["GH_TOKEN"] = token
-    res = subprocess.run(argv, capture_output=True, text=True, env=env)
+    # Bound EVERY gh call. `gh pr view --json mergeable,mergeStateStatus` triggers a
+    # server-side merge-commit computation that GitHub streams lazily; for a
+    # just-merged PR whose head ref was deleted it can never settle, so gh blocks on
+    # the open socket indefinitely (observed: a single `gh pr view` hung ~14 min and,
+    # because the poll loop is synchronous, froze the whole review daemon — no PR
+    # opened after it got reviewed). A hard timeout turns an unbounded wedge into a
+    # transient error the poll re-derives next tick.
+    try:
+        res = subprocess.run(
+            argv, capture_output=True, text=True, env=env, timeout=_GH_TIMEOUT_S
+        )
+    except subprocess.TimeoutExpired:
+        sys.stderr.write(
+            f"gh timed out (>{_GH_TIMEOUT_S:.0f}s): {' '.join(argv)}\n"
+            "  killed; treating as empty result (poll re-derives next tick)\n"
+        )
+        return ""
     if res.returncode != 0:
         # redact a token if one ever appears in argv (it shouldn't — gh reads GH_TOKEN
         # from env, not argv — but be defensive about logging command lines).
