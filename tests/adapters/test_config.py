@@ -43,7 +43,7 @@ def test_defaults():
     assert c.auto_merge is True
     assert c.steward_triage is True   # default-on; promote stays human
     assert c.steward_promote is False
-    assert c.poll_seconds == 60
+    assert c.poll_seconds == 20
     assert c.review_trigger_label == "ai-pr-open"  # default unchanged
     # Jira sync defaults ON but inert (no project key), MCP spec path defaulted.
     assert c.jira_sync is True
