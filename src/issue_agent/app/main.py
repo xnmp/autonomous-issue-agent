@@ -88,6 +88,22 @@ def _agent_md(cfg: HarnessConfig) -> str:
         return ""
 
 
+def _review_prompt(cfg: HarnessConfig) -> str:
+    """Reviewer system prompt. An operator REVIEW_PROMPT (cfg.review_prompt, from
+    the env) wins wholesale; otherwise load the built-in dimension scaffold from
+    plugin/REVIEW_PROMPT.md. File I/O lives here (not in the pure from_env mapping),
+    mirroring _agent_md. `$ROUND_NUMBER` is substituted per round downstream."""
+    if cfg.review_prompt:
+        return cfg.review_prompt
+    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    path = os.path.join(here, "plugin", "REVIEW_PROMPT.md")
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
 def build_role(role: str, env: dict | None = None):
     env = _load_agent_env(env if env is not None else dict(os.environ))
     cfg = from_env(env)
@@ -99,7 +115,12 @@ def build_role(role: str, env: dict | None = None):
     harness_root = cfg.harness_root or os.path.dirname(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     )
-    cfg = HarnessConfig(**{**cfg.__dict__, "agent_md": _agent_md(cfg), "harness_root": harness_root})
+    cfg = HarnessConfig(**{
+        **cfg.__dict__,
+        "agent_md": _agent_md(cfg),
+        "review_prompt": _review_prompt(cfg),
+        "harness_root": harness_root,
+    })
 
     target_dir = cfg.target_dir or os.getcwd()
 

@@ -427,6 +427,11 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         review_mode=ReviewMode.from_env(
             e.get("REVIEW_MODE", ""), _b(e, "REVIEW_MULTI_AGENT", False)
         ),
+        # Operator REVIEW_PROMPT override, if any (wins wholesale). Blank/unset →
+        # "", and main.py loads the default from plugin/REVIEW_PROMPT.md (kept out
+        # of this pure dict→config mapping, like agent_md). A whitespace-only value
+        # is treated as unset so it can't strip the reviewer's whole rubric.
+        review_prompt=(e.get("REVIEW_PROMPT") or "").strip(),
         review_adopt_unlabeled=_b(e, "REVIEW_ADOPT_UNLABELED", True),
         review_gate_model=e.get("REVIEW_GATE_MODEL", "haiku") or None,
         review_validation_model=e.get("REVIEW_VALIDATION_MODEL", "haiku") or None,

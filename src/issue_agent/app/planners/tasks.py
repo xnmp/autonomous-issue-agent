@@ -383,11 +383,25 @@ REVIEW_DIMENSIONS: tuple[tuple[str, str], ...] = (
      "Injection, auth/authz bypass, secrets in code, unsafe deserialization, SSRF, "
      "path traversal, and missing validation on trust boundaries in the diff."),
     ("architecture",
-     "Violations of the repo's documented constraints — read ARCHITECTURE.md / "
-     "INVARIANTS.md / relevant CLAUDE.md if present — layering breaks, and "
+     "Violations of the repo's documented constraints — read the relevant CLAUDE.md "
+     "(and any docs it points to) if present — layering breaks, and "
      "signal-suppression (adding changed code to coverage/analysis exclusions, "
      "blanket noqa/nosec/eslint-disable over a real finding) that hides rather "
      "than fixes."),
+    ("maintainability",
+     "VERY IMPORTANT — weight heavily. Whether the CHANGED code stays easy to "
+     "understand, test, and change. Reason from that principle; the examples are "
+     "ILLUSTRATIVE, not a closed checklist. Common smells: god object/function, "
+     "conflated responsibilities (SRP break), hidden/temporal coupling, duplicated "
+     "logic with an existing home, leaky abstraction, long parameter / boolean-flag "
+     "lists, primitive obsession, feature envy, shotgun surgery, deep nesting, dead "
+     "or speculative generality, swallowed errors. STRICT anti-pedantry so this "
+     "never causes bouncing: BLOCKING only when the smell is concrete AND "
+     "consequential — name the unit, the responsibilities it conflates, and the "
+     "future change it breaks. A design you'd merely write differently, subjective "
+     "taste, or a smell already pervasive in the repo → non-blocking note or "
+     "silence. Judge against this repo's own CLAUDE.md patterns, not an external "
+     "ideal. When torn, APPROVE with a note."),
 )
 
 
