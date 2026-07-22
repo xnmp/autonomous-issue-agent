@@ -43,6 +43,24 @@ def test_single_review_submits_before_persisting_state():
     assert store.rounds[100] == 1
 
 
+def test_successful_submit_logs_verdict():
+    """A clean review must announce its OUTCOME on stdout — not go silent between
+    `dispatch` and the next poll. Regression for the observability gap where only
+    the error path logged, so an APPROVE was invisible except on GitHub."""
+    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    gw = FakeGateway(prs={100: pr})
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(
+        is_error=False, session_id="rs",
+        structured={"decision": "APPROVE", "body": "looks good"},
+    ))
+    logs: list[str] = []
+
+    asyncio.run(_workflow(gw, store, runner, log=logs.append).review(100))
+
+    assert any("review #100 r1: submitted APPROVE" in m for m in logs)
+
+
 def test_single_review_failed_submit_does_not_persist_state():
     pr = PRView(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr}, submit_ok=False)

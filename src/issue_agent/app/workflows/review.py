@@ -251,6 +251,12 @@ class ReviewWorkflow:
         )
         if not self.gateway.submit_review(pr, sub.event, sub.body):
             return False
+        # Log the OUTCOME of a successful submit — always on (not DEBUG-gated). Without
+        # this, a clean review was invisible on stdout: `dispatch` then silence until
+        # the next poll (the per-message sdk: trace is DEBUG-only, and only the ERROR
+        # path logged). The verdict is the one line an operator needs to see land.
+        escalated = " → escalated (needs-human-review)" if sub.escalate else ""
+        self.cfg.log(f"review #{pr} r{round_number}: submitted {sub.event}{escalated}")
         if sub.escalate:
             self.gateway.relabel("pr", pr, self.cfg.review_trigger_label, "needs-human-review")
         return True
