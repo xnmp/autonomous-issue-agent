@@ -176,6 +176,16 @@ run_role() {
       python -m issue_agent.app.main "$role" ) >"$log" 2>&1 &
 }
 
+# Keep the machine awake while the watchers run — on a sleeping Mac the poll loop
+# stalls and pickup latency balloons to "whenever it next wakes". `-w $$` ties the
+# assertion to THIS process: when point-at exits (Ctrl-C, crash), caffeinate sees
+# its wait-target gone and exits too, so there's no orphan holding the machine
+# awake. macOS-only (Linux has no caffeinate); skipped silently elsewhere.
+if command -v caffeinate >/dev/null 2>&1; then
+  caffeinate -i -w $$ &
+  info "caffeinate: idle-sleep suppressed while watchers run (pid $!)"
+fi
+
 pids=()
 trap 'echo; info "stopping watchers…"; kill 0 2>/dev/null; wait 2>/dev/null; exit 0' INT TERM
 
