@@ -61,6 +61,23 @@ short-lived auto-minted tokens. One-time setup:
    login. See [`config/shared.example.env`](config/shared.example.env) for the full
    annotated template, and [HARNESS.md](HARNESS.md) for the operator's manual.
 
+### LLM credentials — the daemons use *your* Anthropic auth
+
+The GitHub App identity is only for git actions. The **model** each agent drives uses
+whatever Anthropic auth is in the shell that launches the harness — the daemons inherit
+that environment (nothing is hardcoded). Two ways to provide it:
+
+- **Env (wins if set):** export `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN` +
+  `ANTHROPIC_BASE_URL` for a gateway) before `issue-agent start`. Put these in the
+  launching shell, not `shared.env` — they're operator/machine-level, not repo config.
+- **On-disk Claude Code login:** if no `ANTHROPIC_*` env var is set, the SDK falls back
+  to your interactive `claude` credentials (`~/.claude/.credentials.json`).
+
+Either way this bills **your** Anthropic account/quota — the reviewer is *not* a
+separately-metered LLM identity (unlike its distinct GitHub App). A long-running
+three-daemon deployment can consume meaningful token spend; the per-agent budget caps
+(`MAX_BUDGET_USD`, `REVIEW_BUDGET_USD`, `STEWARD_TRIAGE_BUDGET_USD`) bound each run.
+
 ## Document map
 
 This design is split across files (each is self-contained and edit-friendly):
