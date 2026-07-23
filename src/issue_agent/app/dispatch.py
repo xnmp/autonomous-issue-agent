@@ -36,7 +36,7 @@ class DispatchConfig:
     triage_cfg: triage_dom.TriageConfig | None = None
     jira: JiraTaskConfig | None = None
     fork_threshold: int = 5
-    max_review_rounds: int = 5
+    max_review_rejections: int = 4
     author_tests_split: bool = False
     max_contract_rounds: int = 2
     # REVIEW_MODE: which reviewer strategy to run —
@@ -46,6 +46,10 @@ class DispatchConfig:
     #   DELEGATED — SINGLE + a cheap code-scout subagent the reviewer delegates
     #               codebase search to (expensive model reasons over summaries).
     review_mode: review_dom.ReviewMode = review_dom.ReviewMode.SINGLE
+    # Reviewer bot login — used to count the reviewer's OWN prior REQUEST_CHANGES
+    # verdicts on a PR (the rejection ceiling), distinguishing them from any human
+    # or other-bot reviews.
+    review_bot: str = ""
     fix_mcp_config: str = ""
     harness_root: str = ""
     # PR label removed when a review escalates to needs-human-review. Matches the
@@ -70,7 +74,8 @@ class DispatchConfig:
         return ReviewWorkflowConfig(
             review=self.review,
             review_mode=self.review_mode,
-            max_review_rounds=self.max_review_rounds,
+            max_review_rejections=self.max_review_rejections,
+            review_bot=self.review_bot,
             review_trigger_label=self.review_trigger_label,
             log=self.log,
         )

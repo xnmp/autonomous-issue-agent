@@ -145,7 +145,7 @@ def test_validation_rejects_invalid_retry_caps_and_poll_seconds():
         "MAX_CI_RETRIES": "-1",
         "MAX_REVIEW_RETRIES": "-2",
         "MAX_REBASE_RETRIES": "-3",
-        "REVIEW_MAX_ROUNDS": "-4",
+        "REVIEW_MAX_REJECTIONS": "-4",
         "MAX_CONTRACT_ROUNDS": "-5",
     })
 
@@ -154,7 +154,7 @@ def test_validation_rejects_invalid_retry_caps_and_poll_seconds():
         "MAX_CI_RETRIES must be >= 0",
         "MAX_REVIEW_RETRIES must be >= 0",
         "MAX_REBASE_RETRIES must be >= 0",
-        "REVIEW_MAX_ROUNDS must be >= 0",
+        "REVIEW_MAX_REJECTIONS must be >= 0",
         "MAX_CONTRACT_ROUNDS must be >= 0",
     )
 

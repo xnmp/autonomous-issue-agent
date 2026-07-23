@@ -14,7 +14,7 @@ from enum import Enum
 
 from .actions import Action, AgentKind, Relabel, RunAgent, Target
 from .labels import Label
-from .world import PRView, WorldState
+from .world import PRView, WorldState, REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED
 
 
 class ReviewMode(str, Enum):
@@ -88,6 +88,45 @@ def needs_re_review(pr: PRView, state: ReviewState) -> bool:
     return bool(cur) and cur != state.last_sha.get(pr.number, "")
 
 
+def _login_eq(a: str, b: str) -> bool:
+    """Compare two GitHub logins, tolerating the `[bot]` suffix asymmetry. A
+    GitHub App configured as `my-reviewer-bot[bot]` surfaces as that literal
+    in some API shapes but as the bare `my-reviewer-bot` in the review
+    author field `gh pr view --json reviews` returns. A raw `==` therefore never
+    matches, which would silently defeat both the self-review guard and the
+    rejection ceiling. Strip the suffix on both sides before comparing."""
+    strip = lambda s: (s or "").removesuffix("[bot]")
+    return strip(a) == strip(b)
+
+
+def count_prior_rejections(reviews: tuple, review_bot: str) -> int:
+    """How many times the review bot has REQUESTED_CHANGES on this PR SINCE its
+    most recent APPROVE. This — not the number of author pushes — is what the
+    escalation ceiling counts, with two properties:
+
+      * a rebase or a post-approval housekeeping push advances the push counter
+        but is not a rejection, so it never consumes a round; and
+      * an APPROVE resets the count. If the bot approved and the author then
+        re-opened work (a new commit on an approved-but-unmerged PR — CI failed,
+        auto-merge off, etc.), the prior rejections were SATISFIED; the reviewer
+        rejecting the new revision starts a fresh cycle, not the ceiling-breaker.
+        Escalation must reflect UNRESOLVED dissatisfaction, and an APPROVE clears
+        that.
+
+    Derived purely from GitHub review state (no persisted counter), so it is
+    correct across daemon restarts. `reviews` is chronologically ordered (gh
+    returns oldest-first / by submittedAt), so 'since the last APPROVE' is the
+    suffix after the last APPROVE index."""
+    mine = [r for r in reviews if _login_eq(r.author, review_bot)]
+    last_approve = max(
+        (i for i, r in enumerate(mine) if r.state == REVIEW_APPROVED),
+        default=-1,
+    )
+    return sum(
+        1 for r in mine[last_approve + 1:] if r.state == REVIEW_CHANGES_REQUESTED
+    )
+
+
 def should_adopt(pr: PRView, cfg: ReviewConfig) -> bool:
     """A rogue (non-pipeline) PR that should be pulled into review. True iff
     adoption is on, the PR is OPEN, carries neither the trigger label nor the
@@ -99,7 +138,7 @@ def should_adopt(pr: PRView, cfg: ReviewConfig) -> bool:
         and not pr.has(cfg.trigger_label)
         and not pr.has(Label.NO_AI_REVIEW)
         and not pr.is_draft
-        and pr.author != cfg.review_bot
+        and not _login_eq(pr.author, cfg.review_bot)
     )
 
 
@@ -147,26 +186,32 @@ class ReviewSubmission:
 
 
 def review_submission(
-    decision: str, body: str, round_number: int, max_rounds: int
+    decision: str, body: str, prior_rejections: int, max_rejections: int
 ) -> ReviewSubmission:
     """Port of the review-pr.sh / re-review-pr.sh decision tails.
 
-    APPROVE → APPROVE; ESCALATE (or unresolved at the final round) → a COMMENT
-    review + needs-human-review; anything else → REQUEST_CHANGES.
+    APPROVE → APPROVE; ESCALATE (or the ceiling reached) → a COMMENT review +
+    needs-human-review; anything else → REQUEST_CHANGES.
 
-    Hard round ceiling: an APPROVE always wins (a satisfied reviewer ends the
-    loop), but a REQUEST_CHANGES at or past the final round can no longer bounce
-    the PR back to the fixer — it escalates. Previously escalation depended on the
-    model voluntarily returning ESCALATE; this makes the ceiling a real breaker.
-    """
+    Rejection ceiling: an APPROVE always wins (a satisfied reviewer ends the
+    loop), but a REQUEST_CHANGES that would be the `max_rejections`-th rejection
+    can no longer bounce the PR back to the fixer — it escalates. The ceiling
+    counts the reviewer's OWN prior REQUEST_CHANGES verdicts (`prior_rejections`),
+    NOT author pushes: a rebase or a post-approval housekeeping push that never
+    drew a rejection does not consume a round toward the human handoff. This
+    verdict is the (prior_rejections + 1)-th rejection, so escalate when that
+    reaches the cap. Previously escalation counted every push and depended on the
+    model voluntarily returning ESCALATE; this makes the ceiling a real breaker
+    keyed on genuine dissatisfaction."""
     if decision == "APPROVE":
         return ReviewSubmission(event="APPROVE", body=body)
-    if decision == "ESCALATE" or round_number >= max_rounds:
+    this_rejection = prior_rejections + 1
+    if decision == "ESCALATE" or this_rejection >= max_rejections:
         return ReviewSubmission(
             event="COMMENT",
             body=(
-                f"Through {round_number} review rounds without resolution. "
-                f"Requesting human review.\n\n{body}"
+                f"Through {this_rejection} rounds of requested changes without "
+                f"resolution. Requesting human review.\n\n{body}"
             ),
             escalate=True,
         )
@@ -249,20 +294,21 @@ def _render_body(confirmed: list[Finding], approving: bool) -> str:
     return "\n".join(parts)
 
 
-def gate_submission(round_number: int, max_rounds: int) -> ReviewSubmission:
+def gate_submission(prior_rejections: int, max_rejections: int) -> ReviewSubmission:
     """A non-reviewable PR (the skip-gate found no behavioural change: docs /
     formatting / config only) → APPROVE. Pure so the gate→verdict mapping is a
     tested domain decision, not an inline dispatcher policy (same contract as
-    synthesize_review / review_submission)."""
+    synthesize_review / review_submission). The counts are passed for signature
+    symmetry only — an APPROVE never escalates regardless."""
     return review_submission(
         "APPROVE",
         "No behavioural change to review (docs/formatting/config only).",
-        round_number, max_rounds,
+        prior_rejections, max_rejections,
     )
 
 
 def synthesize_review(
-    findings: list[Finding], round_number: int, max_rounds: int,
+    findings: list[Finding], prior_rejections: int, max_rejections: int,
     complete: bool = True,
 ) -> ReviewSubmission | None:
     """Pure synthesis of validated findings into a verdict, then through the same
@@ -284,4 +330,4 @@ def synthesize_review(
         return None  # incomplete + nothing found → do not approve; retry next poll
     decision = "REQUEST_CHANGES" if has_blocking else "APPROVE"
     body = _render_body(confirmed, approving=not has_blocking)
-    return review_submission(decision, body, round_number, max_rounds)
+    return review_submission(decision, body, prior_rejections, max_rejections)

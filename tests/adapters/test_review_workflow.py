@@ -16,7 +16,8 @@ def _workflow(gw, store, runner, **cfg_overrides):
     cfg_kwargs = dict(
         review=ReviewTaskConfig("o/r", review_prompt="round=$ROUND_NUMBER"),
         review_mode=ReviewMode.SINGLE,
-        max_review_rounds=5,
+        max_review_rejections=4,
+        review_bot="review-bot",
         review_trigger_label="ai-pr-open",
         log=lambda _m: None,
     )
@@ -374,7 +375,13 @@ def test_multi_review_leg_that_raises_does_not_abort_review():
 
 
 def test_multi_re_review_at_ceiling_escalates():
-    pr = PRView(100, head_ref_oid="new", title="t", body="b")
+    # Ceiling is driven by the reviewer's OWN prior rejections, not the round
+    # counter: 3 prior CHANGES_REQUESTED verdicts → this 4th blocking review (cap 4)
+    # can no longer bounce back, it escalates.
+    prior = tuple(
+        Review("CHANGES_REQUESTED", "review-bot", f"t{i}", body="fix") for i in range(3)
+    )
+    pr = PRView(100, head_ref_oid="new", title="t", body="b", reviews=prior)
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     store.set_round(100, 4)

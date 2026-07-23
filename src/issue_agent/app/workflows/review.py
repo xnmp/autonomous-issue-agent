@@ -21,7 +21,8 @@ from ...domain.outcome import AgentResult
 class ReviewWorkflowConfig:
     review: ReviewTaskConfig | None
     review_mode: review_dom.ReviewMode
-    max_review_rounds: int
+    max_review_rejections: int
+    review_bot: str
     review_trigger_label: str
     log: Callable[[str], None]
 
@@ -75,7 +76,8 @@ class ReviewWorkflow:
         # self-approval from a misconfigured identity), we must NOT record a session/
         # sha — otherwise the PR looks reviewed-once and never gets retried, with no
         # review on it. State advances only on a confirmed submit.
-        if not self._submit_review(pr, result, 1):
+        prior = review_dom.count_prior_rejections(p.reviews, self.cfg.review_bot)
+        if not self._submit_review(pr, result, 1, prior):
             return
         self.store.save_pr_session(pr, result.session_id)
         self.store.set_last_sha(pr, p.head_ref_oid)
@@ -117,7 +119,8 @@ class ReviewWorkflow:
             )
             return
         # Submit first; advance sha/round only on a confirmed submit (see _review).
-        if not self._submit_review(pr, result, round_number):
+        prior = review_dom.count_prior_rejections(p.reviews, self.cfg.review_bot)
+        if not self._submit_review(pr, result, round_number, prior):
             return
         self.store.set_last_sha(pr, p.head_ref_oid)
         self.store.set_round(pr, round_number)
@@ -153,6 +156,10 @@ class ReviewWorkflow:
         p = self.gateway.get_pr(pr)
         diff = self.gateway.pr_diff(pr)
         rcfg = self.cfg.review
+        # Escalation counts the reviewer's OWN prior rejections, not pushes (a
+        # rebase that lands here without a prior REQUEST_CHANGES must not consume a
+        # round). Derived from GitHub review state, robust across daemon restarts.
+        prior = review_dom.count_prior_rejections(p.reviews, self.cfg.review_bot)
 
         # 1. skip-gate — a pure doc/format/config diff short-circuits to APPROVE.
         gate = await self._run_logged("review-gate", pr,
@@ -166,7 +173,7 @@ class ReviewWorkflow:
         if not gate.field_bool("reviewable", default=True):
             self.cfg.log(f"review #{pr}: gate says non-reviewable "
                          f"({gate.field('reason') or 'no behavioural change'}) → APPROVE")
-            sub = review_dom.gate_submission(round_number, self.cfg.max_review_rounds)
+            sub = review_dom.gate_submission(prior, self.cfg.max_review_rejections)
             if self.gateway.submit_review(pr, sub.event, sub.body):
                 self._persist_review_state(pr, p.head_ref_oid, round_number)
             return
@@ -222,7 +229,7 @@ class ReviewWorkflow:
         # review was incomplete AND nothing blocking survived → submit nothing,
         # retry next poll (mirrors the gate.is_error path; never a silent APPROVE).
         sub = review_dom.synthesize_review(
-            validated, round_number, self.cfg.max_review_rounds, complete=complete)
+            validated, prior, self.cfg.max_review_rejections, complete=complete)
         if sub is None:
             self.cfg.log(f"review #{pr}: incomplete and no blocking finding — "
                          "submitting nothing, will retry next poll")
@@ -241,13 +248,18 @@ class ReviewWorkflow:
         self.store.set_last_sha(pr, head_oid)
         self.store.set_round(pr, round_number)
 
-    def _submit_review(self, pr: int, result, round_number: int) -> bool:
+    def _submit_review(
+        self, pr: int, result, round_number: int, prior_rejections: int
+    ) -> bool:
         """Submit the verdict; return True iff the gh POST succeeded. On a failed
         submit, return False WITHOUT escalating/relabelling — the caller leaves state
-        untouched so the PR is retried next poll rather than stranded as "reviewed"."""
+        untouched so the PR is retried next poll rather than stranded as "reviewed".
+        `round_number` is for the human-facing log line only; `prior_rejections`
+        (the reviewer's own prior REQUEST_CHANGES count) drives the escalation
+        ceiling."""
         sub = review_dom.review_submission(
             result.field("decision"), result.field("body"),
-            round_number, self.cfg.max_review_rounds,
+            prior_rejections, self.cfg.max_review_rejections,
         )
         if not self.gateway.submit_review(pr, sub.event, sub.body):
             return False
@@ -256,7 +268,17 @@ class ReviewWorkflow:
         # the next poll (the per-message sdk: trace is DEBUG-only, and only the ERROR
         # path logged). The verdict is the one line an operator needs to see land.
         escalated = " → escalated (needs-human-review)" if sub.escalate else ""
-        self.cfg.log(f"review #{pr} r{round_number}: submitted {sub.event}{escalated}")
+        # Show the rejection tally (what actually drives escalation) for a
+        # REQUEST_CHANGES/escalate, not just the push-based round_number — the
+        # latter is derived from stored state and reads wrong after a STATE_DIR
+        # wipe, whereas prior_rejections is recomputed from GitHub every time.
+        tally = (
+            f", rejection {prior_rejections + 1}/{self.cfg.max_review_rejections}"
+            if sub.event != "APPROVE" else ""
+        )
+        self.cfg.log(
+            f"review #{pr} r{round_number}{tally}: submitted {sub.event}{escalated}"
+        )
         if sub.escalate:
             self.gateway.relabel("pr", pr, self.cfg.review_trigger_label, "needs-human-review")
         return True

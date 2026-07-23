@@ -139,18 +139,18 @@ def test_fix_ci_blocked_adds_blocked():
     assert Relabel(Target.PR, 100, None, Label.AI_BLOCKED) in acts
 
 
-# ── review submission tail ──
+# ── review submission tail (args: decision, body, prior_rejections, max_rejections) ──
 def test_review_approve():
-    s = review_submission("APPROVE", "lgtm", 1, 5)
+    s = review_submission("APPROVE", "lgtm", 0, 4)
     assert s.event == "APPROVE" and s.escalate is False
 
 
 def test_review_request_changes():
-    s = review_submission("REQUEST_CHANGES", "fix x", 2, 5)
+    s = review_submission("REQUEST_CHANGES", "fix x", 1, 4)
     assert s.event == "REQUEST_CHANGES" and s.escalate is False
 
 
 def test_review_escalate_comments_and_flags():
-    s = review_submission("ESCALATE", "still broken", 5, 5)
+    s = review_submission("ESCALATE", "still broken", 3, 4)
     assert s.event == "COMMENT" and s.escalate is True
-    assert "5 review rounds" in s.body
+    assert "rounds of requested changes" in s.body

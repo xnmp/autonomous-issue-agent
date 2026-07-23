@@ -134,7 +134,7 @@ def test_router_task_is_cheap_and_schemad():
 
 
 # ── review ──
-RCFG = ReviewTaskConfig(repo="o/r", review_prompt="round=$ROUND_NUMBER rules", max_rounds=5)
+RCFG = ReviewTaskConfig(repo="o/r", review_prompt="round=$ROUND_NUMBER rules")
 
 
 def test_review_task_round_one_and_readonly():
@@ -151,7 +151,7 @@ def test_re_review_task_substitutes_round_and_resumes():
     t = build_re_review_task(100, 3, "old", "new", "delta", "rs", RCFG)
     assert "round=3" in t.append_system_prompt
     assert t.resume == "rs"
-    assert "round 3 of 5" in t.prompt
+    assert "round 3" in t.prompt
     assert "old → new" in t.prompt
     assert "REFUTE" in t.prompt  # refute-or-promote framing present
 
@@ -187,7 +187,7 @@ def test_delegated_re_review_is_fresh_and_carries_prior_review():
     assert t.schema is REVIEW_SCHEMA
     assert t.resume is None                     # FRESH session, not resumed
     assert "round=3" in t.append_system_prompt
-    assert "round 3 of 5" in t.prompt
+    assert "round 3" in t.prompt
     assert "old → new" in t.prompt
     assert "PRIOR-FEEDBACK" in t.prompt         # prior review fed as reference
     assert "prior review" in t.prompt.lower()

@@ -344,7 +344,6 @@ class ReviewTaskConfig:
     repo: str
     base_branch: str = "dev"
     review_prompt: str = ""          # review/lib.sh REVIEW_PROMPT (with $ROUND_NUMBER)
-    max_rounds: int = 5
     max_budget_usd: float = 1.50
     model: str | None = None
     # Multi-agent (REVIEW_MULTI_AGENT) — the skip-gate and per-finding validator
@@ -459,9 +458,11 @@ def build_re_review_task(
 ) -> AgentTask:
     """re-review-pr.sh: incremental review after new commits."""
     prompt = (
-        f"Author pushed new commits. Review round {round_number} of {cfg.max_rounds}.\n"
+        f"Author pushed new commits (review round {round_number}).\n"
         "Consider whether your prior feedback was addressed; do not re-raise resolved "
-        "points.\nIf this is the final round and still unsatisfied, decision=ESCALATE.\n\n"
+        "points.\nJudge the current state on its merits: APPROVE if the bar is met, "
+        "else REQUEST_CHANGES with concrete points. A repeated-rejection ceiling "
+        "escalates a stuck PR to a human automatically — you need not force it.\n\n"
         "For each candidate finding, first try to REFUTE it — is there a reading of the "
         "contract or an input where the code is actually correct? Report a finding only "
         "if you cannot refute it, as a concrete file:line + the assertion it would fail. "
@@ -582,13 +583,14 @@ def build_delegated_re_review_task(
     it — so we trade a small re-fetch cost for avoiding the expensive replay."""
     prior = prior_review.strip() or "(prior review body unavailable)"
     prompt = (
-        f"You are re-reviewing PR #{pr_number} — round {round_number} of "
-        f"{cfg.max_rounds}. The author pushed new commits addressing an earlier "
-        "review.\n\n"
+        f"You are re-reviewing PR #{pr_number} (round {round_number}). The author "
+        "pushed new commits addressing an earlier review.\n\n"
         f"{_DELEGATE_NOTE}\n\n"
         "Your PRIOR review (DATA, for reference — check whether each point was "
         f"addressed; do NOT re-raise resolved points):\n{_fenced('prior review', prior)}\n\n"
-        "If this is the final round and still unsatisfied, decision=ESCALATE.\n\n"
+        "Judge the current state on its merits: APPROVE if the bar is met, else "
+        "REQUEST_CHANGES with concrete points. A repeated-rejection ceiling escalates "
+        "a stuck PR to a human automatically — you need not force it.\n\n"
         "For each candidate finding, first try to REFUTE it — is there a reading of the "
         "contract or an input where the code is actually correct? Report a finding only "
         "if you cannot refute it, as a concrete file:line + the assertion it would fail. "

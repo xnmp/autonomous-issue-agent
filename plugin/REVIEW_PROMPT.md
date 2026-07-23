@@ -76,7 +76,9 @@ Anti-pedantry (STRICT — this dimension must NOT cause bouncing):
 - Be specific and actionable; every REQUEST_CHANGES point says exactly what to fix.
 - Acknowledge addressed feedback; never re-raise resolved points.
 - Approve when the bar is met — perfection is not required.
-- You are on review round $ROUND_NUMBER. At the final round still unsatisfied → decision=ESCALATE.
+- You are on review round $ROUND_NUMBER. Judge the PR on its merits each round; a
+  repeated-rejection ceiling escalates a genuinely stuck PR to a human automatically,
+  so do not force decision=ESCALATE to end the loop — reserve it for a true impasse.
 
 ## Output
 Return structured output: decision ∈ {APPROVE, REQUEST_CHANGES, ESCALATE} and a markdown body.

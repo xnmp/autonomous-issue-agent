@@ -9,6 +9,7 @@ from issue_agent.domain.review import (
     ReviewConfig,
     ReviewMode,
     ReviewState,
+    count_prior_rejections,
     decide_review,
     gate_submission,
     needs_initial_review,
@@ -17,6 +18,7 @@ from issue_agent.domain.review import (
     review_submission,
     synthesize_review,
 )
+from builders import Review
 
 CFG = ReviewConfig(review_bot="review-bot")
 
@@ -146,26 +148,78 @@ def test_needs_helpers():
     assert needs_re_review(p, st) is False
 
 
-# ── review_submission: verdict → effect, with the hard round ceiling ──────────
-def test_submission_approve_wins_even_at_final_round():
-    sub = review_submission("APPROVE", "lgtm", round_number=5, max_rounds=5)
+# ── count_prior_rejections: the ceiling counts rejections, not pushes ─────────
+def test_count_prior_rejections_counts_only_bot_changes_requested():
+    # No intervening APPROVE here — pure exclusion test: only the bot's own
+    # CHANGES_REQUESTED count; human RCs, the bot's COMMENTs are excluded.
+    reviews = (
+        Review(state="CHANGES_REQUESTED", author="my-reviewer-bot"),
+        Review(state="CHANGES_REQUESTED", author="some-human"),        # not the bot
+        Review(state="COMMENTED", author="my-reviewer-bot"),      # not a rejection
+        Review(state="CHANGES_REQUESTED", author="my-reviewer-bot"),
+    )
+    assert count_prior_rejections(reviews, "my-reviewer-bot") == 2
+
+
+def test_count_prior_rejections_normalizes_bot_suffix():
+    # gh returns the review author WITHOUT the [bot] suffix, but REVIEW_BOT config
+    # carries it. A raw == would count zero and the ceiling would never fire.
+    reviews = (Review(state="CHANGES_REQUESTED", author="my-reviewer-bot"),)
+    assert count_prior_rejections(reviews, "my-reviewer-bot[bot]") == 1
+
+
+def test_count_prior_rejections_empty():
+    assert count_prior_rejections((), "review-bot") == 0
+
+
+def test_count_prior_rejections_resets_on_approve():
+    # RC → RC → RC → APPROVE (fixer satisfied it) → author reopens work → RC on the
+    # new revision. The 3 pre-approval rejections were RESOLVED; the ceiling must see
+    # only the ONE post-approve rejection, not 4. Otherwise a satisfied cycle would
+    # escalate the very next rejection.
+    reviews = (
+        Review(state="CHANGES_REQUESTED", author="review-bot", submitted_at="t1"),
+        Review(state="CHANGES_REQUESTED", author="review-bot", submitted_at="t2"),
+        Review(state="CHANGES_REQUESTED", author="review-bot", submitted_at="t3"),
+        Review(state="APPROVED", author="review-bot", submitted_at="t4"),
+        Review(state="CHANGES_REQUESTED", author="review-bot", submitted_at="t5"),
+    )
+    assert count_prior_rejections(reviews, "review-bot") == 1
+
+
+def test_count_prior_rejections_all_before_approve_is_zero():
+    # Approved and nothing since → a fresh push draws its first rejection at prior=0.
+    reviews = (
+        Review(state="CHANGES_REQUESTED", author="review-bot", submitted_at="t1"),
+        Review(state="APPROVED", author="review-bot", submitted_at="t2"),
+    )
+    assert count_prior_rejections(reviews, "review-bot") == 0
+
+
+# ── review_submission: verdict → effect, with the rejection ceiling ───────────
+# The verdict under test is the (prior_rejections + 1)-th rejection; cap here is 4.
+def test_submission_approve_wins_even_at_ceiling():
+    # A rebase/housekeeping push that ends in APPROVE never escalates, whatever the
+    # prior rejection count.
+    sub = review_submission("APPROVE", "lgtm", prior_rejections=3, max_rejections=4)
     assert sub.event == "APPROVE" and sub.escalate is False
 
 
 def test_submission_request_changes_below_ceiling_bounces_back():
-    sub = review_submission("REQUEST_CHANGES", "fix x", round_number=2, max_rounds=5)
+    # 3rd rejection (2 prior) with a cap of 4 → still bounces back to the fixer.
+    sub = review_submission("REQUEST_CHANGES", "fix x", prior_rejections=2, max_rejections=4)
     assert sub.event == "REQUEST_CHANGES" and sub.escalate is False
 
 
 def test_submission_request_changes_at_ceiling_escalates():
-    # The hard breaker: at the final round an unsatisfied reviewer can no longer
-    # bounce the PR back — it escalates to a human regardless of the model verdict.
-    sub = review_submission("REQUEST_CHANGES", "still wrong", round_number=5, max_rounds=5)
+    # The breaker: the 4th rejection (3 prior) can no longer bounce the PR back —
+    # it escalates to a human regardless of the model verdict.
+    sub = review_submission("REQUEST_CHANGES", "still wrong", prior_rejections=3, max_rejections=4)
     assert sub.event == "COMMENT" and sub.escalate is True
 
 
 def test_submission_explicit_escalate_always_escalates():
-    sub = review_submission("ESCALATE", "deadlocked", round_number=2, max_rounds=5)
+    sub = review_submission("ESCALATE", "deadlocked", prior_rejections=0, max_rejections=4)
     assert sub.escalate is True
 
 
@@ -193,12 +247,12 @@ def test_parse_findings_tolerates_missing_envelope():
 
 def test_synthesis_no_confirmed_findings_approves():
     fs = [Finding("correctness", "a.py:1", "maybe", "blocking", confirmed=False)]
-    sub = synthesize_review(fs, round_number=1, max_rounds=5)
+    sub = synthesize_review(fs, prior_rejections=0, max_rejections=4)
     assert sub.event == "APPROVE" and sub.escalate is False
 
 
 def test_synthesis_empty_approves():
-    sub = synthesize_review([], round_number=1, max_rounds=5)
+    sub = synthesize_review([], prior_rejections=0, max_rejections=4)
     assert sub.event == "APPROVE"
     assert "LGTM" in sub.body
 
@@ -209,7 +263,7 @@ def test_synthesis_confirmed_blocking_requests_changes():
                 verdict="user input concatenated"),
         Finding("correctness", "y.py:2", "nit", "advisory", confirmed=True),
     ]
-    sub = synthesize_review(fs, round_number=2, max_rounds=5)
+    sub = synthesize_review(fs, prior_rejections=1, max_rejections=4)
     assert sub.event == "REQUEST_CHANGES"
     assert "x.py:9" in sub.body and "Must fix" in sub.body
     assert "SQL injection" in sub.body
@@ -217,16 +271,16 @@ def test_synthesis_confirmed_blocking_requests_changes():
 
 def test_synthesis_only_advisory_confirmed_approves_with_notes():
     fs = [Finding("architecture", "z.py:4", "consider extracting", "advisory", confirmed=True)]
-    sub = synthesize_review(fs, round_number=1, max_rounds=5)
+    sub = synthesize_review(fs, prior_rejections=0, max_rejections=4)
     assert sub.event == "APPROVE"
     assert "z.py:4" in sub.body and "Non-blocking" in sub.body
 
 
-def test_synthesis_blocking_at_final_round_escalates():
-    # The round ceiling still bites: a confirmed blocking finding at the last round
-    # can no longer bounce the PR back — it escalates to a human.
+def test_synthesis_blocking_at_ceiling_escalates():
+    # The rejection ceiling still bites: a confirmed blocking finding that would be
+    # the 4th rejection (3 prior) can no longer bounce the PR back — it escalates.
     fs = [Finding("correctness", "a.py:1", "real bug", "blocking", confirmed=True)]
-    sub = synthesize_review(fs, round_number=5, max_rounds=5)
+    sub = synthesize_review(fs, prior_rejections=3, max_rejections=4)
     assert sub.event == "COMMENT" and sub.escalate is True
 
 
@@ -237,7 +291,7 @@ def test_synthesis_unconfirmed_blocking_ignored():
         Finding("security", "a.py:1", "false alarm", "blocking", confirmed=False),
         Finding("correctness", "b.py:2", "real advisory", "advisory", confirmed=True),
     ]
-    sub = synthesize_review(fs, round_number=1, max_rounds=5)
+    sub = synthesize_review(fs, prior_rejections=0, max_rejections=4)
     assert sub.event == "APPROVE"
 
 
@@ -246,24 +300,24 @@ def test_synthesis_incomplete_and_no_finding_returns_none():
     # A dimension/validator leg errored (complete=False) and nothing blocking
     # survived → return None so the caller submits NOTHING and retries, rather than
     # approving a PR whose defect-detecting lens may never have run.
-    assert synthesize_review([], round_number=1, max_rounds=5, complete=False) is None
+    assert synthesize_review([], prior_rejections=0, max_rejections=4, complete=False) is None
 
 
 def test_synthesis_incomplete_but_blocking_still_reports():
     # A confirmed blocking finding is reported even when incomplete — a real bug
     # doesn't wait on the flaky leg.
     fs = [Finding("security", "a.py:1", "real", "blocking", confirmed=True)]
-    sub = synthesize_review(fs, round_number=1, max_rounds=5, complete=False)
+    sub = synthesize_review(fs, prior_rejections=0, max_rejections=4, complete=False)
     assert sub is not None and sub.event == "REQUEST_CHANGES"
 
 
 def test_synthesis_complete_no_finding_approves():
     # The default (complete=True) still approves on a clean review.
-    sub = synthesize_review([], round_number=1, max_rounds=5, complete=True)
+    sub = synthesize_review([], prior_rejections=0, max_rejections=4, complete=True)
     assert sub is not None and sub.event == "APPROVE"
 
 
 def test_gate_submission_approves():
-    sub = gate_submission(round_number=1, max_rounds=5)
+    sub = gate_submission(prior_rejections=0, max_rejections=4)
     assert sub.event == "APPROVE" and sub.escalate is False
     assert "docs/formatting/config" in sub.body

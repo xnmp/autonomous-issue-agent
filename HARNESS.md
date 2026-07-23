@@ -186,7 +186,7 @@ and non-circumventable; "Prompt" = honor-system instruction in `AGENT.md`;
 | 24 | Reviewer/steward can't modify code | **Mechanical** | `--disallowed-tools Edit,Write` + restricted `--tools` |
 | 25 | No self-approval (GitHub 422) | **By construction** | distinct `review-bot`; solo/unknown `IDENTITY_MODE` skips auto-merge |
 | 26 | Auto-merge only on approve+green by another identity | **Ground truth** | `watcher-lib.sh` `maybe_automerge()` |
-| 27 | Bounded retries (CI, review) → escalate, don't loop | **Counter** | `fix-ci.sh` (`MAX_CI_RETRIES`), `address-review.sh` (`MAX_REVIEW_RETRIES`), review rounds (`REVIEW_MAX_ROUNDS`) |
+| 27 | Bounded retries (CI, review) → escalate, don't loop | **Counter** | `fix-ci.sh` (`MAX_CI_RETRIES`), `address-review.sh` (`MAX_REVIEW_RETRIES`), reviewer rejections (`REVIEW_MAX_REJECTIONS` — counts REQUEST_CHANGES, not pushes) |
 | 28 | Promotion `dev → prod` stays human | **Out of scope** | nothing here merges past `dev` |
 | 29 | Pushes to an open-PR branch re-verify state (tests, commit log, evidence, test-immutability) | **Hook** (NEW) | `checks/check-push.sh` (governor routes `git-push`); no-op until the branch has an open PR; shares `_pr_common.sh` with `check-pr.sh` |
 | 30 | **New tests must ACTUALLY fail without the implementation** (anti-tautology / anti-wrong-layer) | **Hook** (NEW) | `check-pr.sh` §7c → `prc_check_red_fails`: reverts the impl in the worktree, keeps the new tests, re-runs `TEST_CMD`, requires red. Create-only; `RED_MUST_FAIL=0` disables; fail-open on infra error |

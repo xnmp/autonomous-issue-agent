@@ -50,7 +50,7 @@ class ReviewRuntimeConfig:
     prompt: str
     mode: ReviewMode
     budget_usd: float
-    max_rounds: int
+    max_rejections: int
     trigger_label: str
     adopt_unlabeled: bool
     gate_model: str | None
@@ -119,7 +119,12 @@ class HarnessConfig:
     ci_ignore_checks: str = ""
     close_issue_on_merge: bool = True
     max_ci_retries: int = 3
-    max_review_rounds: int = 5
+    # Escalation ceiling for the reviewer: after this many REQUEST_CHANGES verdicts
+    # on one PR (counting the reviewer's OWN rejections, NOT author pushes — a
+    # rebase/housekeeping push that ends in APPROVE never counts), the next
+    # unsatisfied review escalates to a human instead of bouncing back to the
+    # fixer. Default 4 = 3 rejections bounce, the 4th escalates.
+    max_review_rejections: int = 4
     max_review_retries: int = 3
     # Auto-rebase a PR that goes CONFLICTING/DIRTY after its base advances (the
     # backup plan for a conflict that slips past the pre-dispatch file-overlap
@@ -271,7 +276,7 @@ class HarnessConfig:
             prompt=self.review_prompt,
             mode=self.review_mode,
             budget_usd=self.review_budget_usd,
-            max_rounds=self.max_review_rounds,
+            max_rejections=self.max_review_rejections,
             trigger_label=self.review_trigger_label,
             adopt_unlabeled=self.review_adopt_unlabeled,
             gate_model=self.review_gate_model,
@@ -330,7 +335,7 @@ class HarnessConfig:
         _require_non_negative(errors, "MAX_CI_RETRIES", self.max_ci_retries)
         _require_non_negative(errors, "MAX_REVIEW_RETRIES", self.max_review_retries)
         _require_non_negative(errors, "MAX_REBASE_RETRIES", self.max_rebase_retries)
-        _require_non_negative(errors, "REVIEW_MAX_ROUNDS", self.max_review_rounds)
+        _require_non_negative(errors, "REVIEW_MAX_REJECTIONS", self.max_review_rejections)
         _require_non_negative(errors, "MAX_CONTRACT_ROUNDS", self.max_contract_rounds)
         for name, value in (
             ("MAX_BUDGET_USD", self.fix_budget_usd),
@@ -415,7 +420,7 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         auto_rebase_conflicts=_b(e, "AUTO_REBASE_CONFLICTS", True),
         max_rebase_retries=int(e.get("MAX_REBASE_RETRIES", "3")),
         max_ci_retries=int(e.get("MAX_CI_RETRIES", "3")),
-        max_review_rounds=int(e.get("REVIEW_MAX_ROUNDS", "5")),
+        max_review_rejections=int(e.get("REVIEW_MAX_REJECTIONS", "4")),
         max_review_retries=int(e.get("MAX_REVIEW_RETRIES", "3")),
         review_trigger_label=e.get("REVIEW_TRIGGER_LABEL", "ai-pr-open"),
         fix_model=e.get("FIX_MODEL") or None,
