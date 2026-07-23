@@ -107,8 +107,8 @@ class HarnessConfig:
     target_dir: str = ""
     identity_mode: str = "three"
     fix_bot: str = ""
-    review_bot: str = "review-bot"
-    steward_bot: str = "steward-bot"
+    review_bot: str = "my-reviewer-bot[bot]"
+    steward_bot: str = "my-reviewer-bot[bot]"
     state_dir: str = ""
     review_state_dir: str = ""
     steward_state_dir: str = ""
@@ -406,8 +406,11 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         target_dir=e.get("TARGET_DIR", ""),
         identity_mode=e.get("IDENTITY_MODE", "three"),
         fix_bot=e.get("FIX_BOT", ""),
-        review_bot=e.get("REVIEW_BOT", "review-bot"),
-        steward_bot=e.get("STEWARD_BOT", "steward-bot"),
+        # Default to the shared GitHub App login so an operator only needs to
+        # supply the App credentials (GH_APP_*), not restate the bot name. Override
+        # per-repo/shared only if running a differently-named App.
+        review_bot=e.get("REVIEW_BOT", "my-reviewer-bot[bot]"),
+        steward_bot=e.get("STEWARD_BOT", "my-reviewer-bot[bot]"),
         state_dir=e.get("STATE_DIR", os.path.expanduser("~/.local/state/issue-agent")),
         review_state_dir=e.get("REVIEW_STATE_DIR", os.path.expanduser("~/.local/state/review-agent")),
         steward_state_dir=e.get("STEWARD_STATE_DIR", os.path.expanduser("~/.local/state/steward-agent")),

@@ -16,6 +16,51 @@ GitHub repo, any OpenAI-compatible or Anthropic model gateway, via environment c
 > (orchestration), `bin/` `ops/` (setup), and `examples/demo-target/` (a repo to watch
 > the loop run). These nine docs remain the design spec.
 
+## Quickstart
+
+Install once, then point the harness at any repo from inside it:
+
+```bash
+make install                       # uv sync (editable) + ~/.local/bin/issue-agent shim
+
+cp config/shared.example.env config/shared.env   # then fill it in (see below)
+
+cd /path/to/your-repo
+issue-agent start                  # auto-init, auto-detect repo + test cmd, run all 3 daemons
+issue-agent ready <issue-number>   # label an issue ai-ready → the fixer picks it up
+```
+
+`issue-agent start` runs in the foreground (Ctrl-C stops everything) and does the
+whole first-run flow: creates `config/shared.env` interactively if absent, detects
+`REPO`/`TARGET_DIR` from the cwd, discovers your `TEST_CMD`, and launches the fix +
+review + steward daemons. `issue-agent doctor` checks prerequisites; `issue-agent
+status` shows what's running.
+
+### What you must supply — the reviewer runs as a GitHub App
+
+The fixer acts as **your** `gh auth` login. The **reviewer + steward act as a GitHub
+App**, not a PAT — GitHub returns *422 "can not approve your own pull request"* if the
+reviewer shares the author's identity, and an App gives a clean second bot with
+short-lived auto-minted tokens. One-time setup:
+
+1. **Create a GitHub App** (org-level). Permissions: `pull_requests:write`,
+   `issues:write`, `contents:read`, `metadata:read`.
+2. **Generate + download its private key** (`.pem`).
+3. **Install the App** on your org/repo and note the installation ID.
+4. In `config/shared.env` set the three App values + your fixer login:
+
+   ```bash
+   GH_APP_ID="<app-id>"
+   GH_APP_INSTALL_ID="<installation-id>"
+   GH_APP_KEY_FILE="$HOME/.config/<app>/private-key.pem"
+   FIX_BOT="<your-gh-login>"        # MUST differ from the App (the 422 rule)
+   ```
+
+   `REVIEW_BOT`/`STEWARD_BOT` default to `my-reviewer-bot[bot]`, so if you name
+   your App that you need only supply the key file. Otherwise set them to your App's
+   login. See [`config/shared.example.env`](config/shared.example.env) for the full
+   annotated template, and [HARNESS.md](HARNESS.md) for the operator's manual.
+
 ## Document map
 
 This design is split across files (each is self-contained and edit-friendly):
@@ -103,7 +148,7 @@ issue (ai-ready)
                                             → re-review headless
   CI fails                                  → APPROVE / REQUEST_CHANGES
   → fix CI headless                       
-  → push                                  ...max 5 rounds, then ESCALATE...
+  → push                                  ...4 rejections, then ESCALATE...
 
                 approved → merge to dev (auto or human)
                 watcher detects merge → both agents clean up
@@ -154,7 +199,7 @@ PHASE 2 — CI
 PHASE 3 — Address review
   review-bot requests changes
     address-review.sh → claude -p --resume → push
-       └──→ loop until APPROVE (or review agent ESCALATEs at round 5)
+       └──→ loop until APPROVE (or review agent ESCALATEs after 4 rejections)
 
 PHASE 4 — Merge + cleanup (dev branch)
   PR approved + merged into dev (auto-merge or human)
