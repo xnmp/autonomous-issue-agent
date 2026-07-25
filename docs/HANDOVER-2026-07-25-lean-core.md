@@ -8,6 +8,17 @@ delta: what was actually built, the decisions made *during* implementation
 that the plan doesn't record, the known gaps, and how to decide what to do
 next.
 
+> **Correction notice (2026-07-25, later the same day).** An adversarial
+> review ([REVIEW-2026-07-25-adversarial.md](REVIEW-2026-07-25-adversarial.md))
+> audited this handover against the tree and **falsified three of its claims**;
+> corrections are marked **[CORRECTED]** inline below. The remediation plan is
+> [PLAN-2026-07-25-review-remediation.md](PLAN-2026-07-25-review-remediation.md);
+> its P0 wave must land before pointing the harness at real repos — §7's
+> "point at 2–3 real repos and let the ledger run" is **deferred until then**
+> (the review shows the ledger itself currently cannot be trusted: pre-result
+> deaths are unrecorded, Codex spend is invisible, and `status` reads only the
+> fix journal).
+
 ## 1. What landed (all on `main`, each leg committed only after full `make test`)
 
 | Commit | Content |
@@ -30,15 +41,24 @@ These are the load-bearing choices a future refactor must not silently undo:
   under an older review reads as 0. There is deliberately **no
   clear-on-success** — supersession (a new review) is the only reset. Both
   sides (decide read, workflow write) use the *same selector*
-  (`latest_other_review`, CHANGES_REQUESTED only); T3's mirror will fail if
-  either side drifts.
+  (`latest_other_review`, CHANGES_REQUESTED only). **[CORRECTED]** The claim
+  "T3's mirror will fail if either side drifts" is false: T3's `_after_run`
+  hand-mirrors the workflow, so it guards the decide/**read** side only —
+  deleting the workflow's own breaker bump left T3 10/10 green
+  (mutation-proven). `tests/adapters/test_fix_workflow.py` is the actual
+  write-side guard; every new counter needs a test there, not just a T3 row.
 - **A superseded CHANGES_REQUESTED review falls through to FIX_CI** — while
   awaiting re-review, a CI failure on the new head is still the fixer's job.
 - **Infra deaths (`killed_externally`, `transport_death`) are not attempts**:
   no breaker increments, no relabel — the issue stays `ai-working` and the
   reaper settles it. But **ground truth wins over cause of death**: if a PR
   actually opened, it gets labeled even when the session died (deliberate
-  deviation from the plan's "return [] unconditionally").
+  deviation from the plan's "return [] unconditionally"). **[REVIEW NOTE]**
+  the review's C3 shows the raise-path variant (AgentRunner pre-result death)
+  is also unrecorded — no journal event, no ledger line, invisible to the
+  loop detector — so the reap→redispatch cycle is unbounded, unbilled, and
+  undetectable. Remediation plan D2 adds pre-await attempt recording and a
+  separate `MAX_INFRA_DEATHS` ceiling without changing this rule.
 - **`AgentRunner`'s pre-result exception path still raises** (it *is* the
   transport-death signal there); only CodexRunner returns classified error
   results. The `asyncio.wait` observation pattern in the runner must never be
@@ -81,7 +101,12 @@ These are the load-bearing choices a future refactor must not silently undo:
   needs it). Under `bypassPermissions`, `disallowed_tools` is the only policy
   the SDK honors — settings.json deny rules are dead on the SDK path.
 
-## 3. New env knobs (all documented in `config/agent.env.example`)
+## 3. New env knobs
+
+**[CORRECTED]** "all documented in `config/agent.env.example`" was false:
+`MAX_RESOLVE_RETRIES` and `LOG_DIR` are missing from that file, and
+`compose-env.sh`'s hand-maintained allow-list drops these plus ~18 other
+documented knobs on the systemd path (review C5; plan wave P0-A fixes both).
 
 | Knob | Default | Meaning |
 |---|---|---|
@@ -107,7 +132,11 @@ These are the load-bearing choices a future refactor must not silently undo:
 - **`issue-agent status`**: now shows today's global spend vs cap, last 5
   agent runs, and warnings (repeated same-target dispatches within an hour,
   spend blocks today, escalations in 24h). Log tail falls back to the old
-  /tmp path for pre-move daemons.
+  /tmp path for pre-move daemons. **[REVIEW NOTE]** it reads the *fix*
+  daemon's journal only — review/steward runs, their spend blocks, and their
+  loops are invisible (review M11; plan agent B3). Review-side escalations
+  additionally bypass the executor funnel entirely, so they emit no
+  `escalation` event and no `ALERT_CMD` (review M10; plan agent B1).
 - **No rotation yet** — journals grow unbounded. Fine for months at current
   volume; add rotation when a file is annoying, not before.
 
@@ -118,9 +147,13 @@ These are the load-bearing choices a future refactor must not silently undo:
    deployment matters.
 2. **Python push gate is still inert on the SDK path**: `OpenPrLookup`
    (tri-state) exists in `domain/gate.py` with tests, but
-   `build_gate_context` never populates `has_open_pr` — the *bash* §push gate
-   is the live one (invoked via the governor's checker). Wiring it needs a
-   gh probe in `build_gate_context` mapping errors → `ERROR`.
+   `build_gate_context` never populates `has_open_pr`. **[CORRECTED]** the
+   original claim that "the *bash* §push gate is the live one" is false — the
+   bash checkers are invoked only under `FIXER_RUNTIME=codex`; on the default
+   SDK path **nothing** gates pushes to an open PR, so every ADDRESS_REVIEW /
+   FIX_CI push runs with no test/commit-log/evidence gate at all. Wiring the
+   gh probe (errors → `ERROR`) is P0 in the remediation plan (wave P0-B,
+   agent B6).
 3. **Commit-time red-check** (`check-commit.sh` / `check_red_is_red`) still
    silently no-ops with no test command — the PR/push gates now deny, so the
    window is one commit, not a merge. Close it opportunistically.
@@ -177,9 +210,13 @@ their evidence source:
    `make lint` still shellchecks it all.
 
 The T3 convergence suite (`tests/domain/test_convergence.py`) is the
-regression guard for the entire anti-loop class — **any new dispatch leg or
-retry counter must add a scenario row there** (one table row; the harness
-mirrors workflow transitions and will catch read/write drift).
+regression guard for the **decide-side** anti-loop class — any new dispatch
+leg or retry counter must add a scenario row there. **[CORRECTED]** the
+original claim that the mirror "will catch read/write drift" is
+mutation-proven false: `_after_run` re-implements the workflow by hand and
+cannot detect drift in it. Until plan item D13 replaces `_after_run` with the
+real `FixWorkflow`, every new leg/counter ALSO requires a write-side test in
+`tests/adapters/test_fix_workflow.py`.
 
 ## 8. Execution pattern that worked (for the next big push)
 
