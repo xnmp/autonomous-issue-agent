@@ -216,8 +216,19 @@ resolve. Keep the swallow (its sibling-isolation rationale is sound).
 
 - **R3-F8** `sh -c`/`bash -c`/`eval`/`xargs` still classify as nothing, so
   `sh -c 'git push …'` skips the push gate entirely (M9/Appendix C, known). Any
-  "enforcement closed" claim is bounded by that prefix. The strict-xfail record
-  is scheduled (wave P1-2/C2d).
+  "enforcement closed" claim is bounded by that prefix. Now recorded as five
+  `xfail(strict=True)` tests (`e9024ef`), each paired with a passing test that
+  the direct form IS blocked, so the xfails cannot pass for the wrong reason
+  and will flip to failures the day the hole closes.
+  **Root cause, for whoever executes backlog P3.2:** `classify()` inspects only
+  `words[0]` (after unwrapping `env`/passthrough wrappers) looking for
+  `git`/`gh`. `sh`/`bash`/`python`/`eval` hide the real command inside an opaque
+  `string`/`raw_string` AST leaf that `tree-sitter-bash` never re-parses as a
+  nested command; `xargs` puts it at `words[1]`, past where classify looks. The
+  fix is either recursive re-parsing of `-c`/`eval` payloads plus unwrapping
+  `xargs`'s leading command argument, or flipping to an allow-list
+  (govern-by-default) stance. The parsing core itself is sound and shared with
+  the bash governor — the weakness is structural indirection, not parsing.
 - **R2-7** `issue-agent status`/`stop`/`ready` now source **every** overlay in
   `config/repos/` through bash, so an unrelated overlay's `$(…)` executes on
   read-only-looking commands. Operator-owned local files, so not a privilege
