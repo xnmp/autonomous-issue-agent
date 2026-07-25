@@ -181,6 +181,17 @@ def synth_repo_env(
         for key, value in opt:
             if value:
                 lines.append(f"{key}={_q(value)}")
+    if not test_cmd:
+        # The tests gate is fail-CLOSED (check_tests): with no TEST_CMD and no
+        # opt-out, every pr-create/push would be denied. A repo that genuinely
+        # has no tests gets the explicit operator opt-out written into its
+        # overlay — loud (the NO TESTS banner already fired) but not wedged.
+        lines += [
+            "",
+            "# No test suite discovered. The PR/push gates fail closed without a",
+            "# TEST_CMD; this opt-out keeps them passable. REMOVE once tests exist.",
+            "ALLOW_UNTESTED=1",
+        ]
     return "\n".join(lines) + "\n"
 
 

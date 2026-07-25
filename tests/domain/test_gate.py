@@ -1,6 +1,7 @@
 """Gate-rule behaviour (Phase 1) — pure ports of check-*.sh + _pr_common.sh."""
 
 from issue_agent.domain.gate import (
+    OpenPrLookup,
     RedFailInputs,
     check_adversarial_verdict,
     check_branch_name,
@@ -14,6 +15,7 @@ from issue_agent.domain.gate import (
     check_visual_evidence,
     check_pr_base,
     check_pr_body,
+    check_push_precondition,
     check_red_fails,
     check_red_is_red,
     check_required_test,
@@ -21,6 +23,8 @@ from issue_agent.domain.gate import (
     check_tests_immutable,
     gate_is_toothless,
     partition_changed,
+    push_gate_applies,
+    resolve_open_pr,
     resolve_test_cmd,
 )
 
@@ -224,7 +228,25 @@ def test_resolve_empty_when_neither():
 def test_check_tests_runs_command():
     assert check_tests("pytest", lambda c: True).ok
     assert not check_tests("pytest", lambda c: False).ok
-    assert check_tests("", lambda c: False).ok  # empty → allow (warn elsewhere)
+
+
+def test_check_tests_denies_when_no_test_command():
+    # "no test command" must NOT look like "tests passed": with nothing to run,
+    # §1 and §10 are both toothless, so the gate fails CLOSED and says how to fix.
+    res = check_tests("", lambda c: True)
+    assert not res.ok
+    assert ".harness/test-cmd" in res.reason and "ALLOW_UNTESTED" in res.reason
+
+
+def test_check_tests_no_command_allowed_with_explicit_opt_out():
+    # A genuinely test-less repo opts out deliberately (operator-set ALLOW_UNTESTED=1).
+    assert check_tests("", lambda c: True, allow_untested=True).ok
+
+
+def test_check_tests_opt_out_does_not_excuse_failing_tests():
+    # The opt-out only covers the ABSENCE of a command — a command that runs and
+    # fails is still a hard deny.
+    assert not check_tests("pytest", lambda c: False, allow_untested=True).ok
 
 
 # ── §10 red-fail (the anti-tautological-test gate) ─────────────────────────────
@@ -264,12 +286,38 @@ def test_red_fail_skips_pure_test_diff():
     assert check_red_fails(inp, revert_and_run=lambda impl: True).ok
 
 
-def test_red_fail_skips_when_disabled_or_no_cmd():
+def test_red_fail_skips_when_explicitly_disabled():
     base = dict(new_test_files=("tests/test_x.py",), impl_files=("src/x.py",))
-    assert check_red_fails(RedFailInputs(test_cmd="", **base), lambda i: True).ok
     assert check_red_fails(
         RedFailInputs(test_cmd="pytest", red_must_fail=False, **base), lambda i: True
     ).ok
+
+
+def test_red_fail_denies_when_no_test_command():
+    # No command ⇒ the anti-tautology check never ran ⇒ deny (the #39 hole),
+    # rather than silently allowing an unproven "red".
+    base = dict(new_test_files=("tests/test_x.py",), impl_files=("src/x.py",))
+
+    def boom(impl):
+        raise AssertionError("must not attempt a revert with no test command")
+
+    res = check_red_fails(RedFailInputs(test_cmd="", **base), boom)
+    assert not res.ok and "no test command" in res.reason
+
+
+def test_red_fail_no_command_allowed_with_explicit_opt_out():
+    base = dict(new_test_files=("tests/test_x.py",), impl_files=("src/x.py",))
+    assert check_red_fails(
+        RedFailInputs(test_cmd="", allow_untested=True, **base), lambda i: True
+    ).ok
+
+
+def test_red_fail_opt_out_does_not_excuse_a_tautological_test():
+    # ALLOW_UNTESTED only covers a MISSING command; with one present the revert
+    # simulation still runs and still blocks a test that passes without the impl.
+    inp = RedFailInputs(test_cmd="pytest", new_test_files=("tests/test_x.py",),
+                        impl_files=("src/x.py",), allow_untested=True)
+    assert not check_red_fails(inp, revert_and_run=lambda impl: True).ok
 
 
 def test_red_fail_fails_open_on_unresolvable_base():
@@ -297,3 +345,72 @@ def test_red_is_red_allows_failing_red_commit():
 def test_red_is_red_skips_when_no_cmd_or_disabled():
     assert check_red_is_red("red: t", "", lambda c: True).ok            # no test cmd
     assert check_red_is_red("red: t", "pytest", lambda c: True, enabled=False).ok
+
+
+# ── push-gate precondition: the open-PR lookup (check-push.sh) ────────────────
+def _probe(*answers):
+    """A probe returning the given answers in order (then repeating the last),
+    recording how many times it was called."""
+    calls = []
+
+    def probe():
+        calls.append(len(calls))
+        return answers[min(len(calls) - 1, len(answers) - 1)]
+
+    return probe, calls
+
+
+def test_resolve_open_pr_returns_first_answer_without_retrying():
+    probe, calls = _probe(OpenPrLookup.OPEN, OpenPrLookup.NONE)
+    assert resolve_open_pr(probe) is OpenPrLookup.OPEN
+    assert len(calls) == 1  # a good answer is never second-guessed
+
+
+def test_resolve_open_pr_retries_a_transient_error():
+    probe, calls = _probe(OpenPrLookup.ERROR, OpenPrLookup.OPEN)
+    slept = []
+    assert resolve_open_pr(probe, sleep=lambda: slept.append(1)) is OpenPrLookup.OPEN
+    assert len(calls) == 2
+    assert len(slept) == 1  # backoff happens BETWEEN attempts, not before the first
+
+
+def test_resolve_open_pr_reports_error_when_retry_also_fails():
+    probe, calls = _probe(OpenPrLookup.ERROR)
+    assert resolve_open_pr(probe) is OpenPrLookup.ERROR
+    assert len(calls) == 2  # exactly one retry, then give up
+
+
+def test_resolve_open_pr_single_attempt_does_not_sleep():
+    probe, calls = _probe(OpenPrLookup.ERROR)
+    slept = []
+    assert resolve_open_pr(probe, attempts=1, sleep=lambda: slept.append(1)) is OpenPrLookup.ERROR
+    assert len(calls) == 1 and slept == []
+
+
+def test_push_denied_when_pr_state_unknown():
+    # The fail-open hole: a failed gh lookup used to read as "no PR" and skip the
+    # ENTIRE push gate. An unknown state must block instead.
+    res = check_push_precondition("fix/7-token", OpenPrLookup.ERROR)
+    assert not res.ok
+    assert "retry" in res.reason.lower()          # tells the agent what to do next
+    assert "fix/7-token" in res.reason
+
+
+def test_push_allowed_when_lookup_succeeds():
+    assert check_push_precondition("fix/7-token", OpenPrLookup.OPEN).ok
+    assert check_push_precondition("fix/7-token", OpenPrLookup.NONE).ok
+
+
+def test_push_lookup_error_ignored_on_ungoverned_branch():
+    # An ungoverned branch is never gated (the bash exits before it even calls
+    # gh), so an unknown PR state there is irrelevant — don't wedge it.
+    assert check_push_precondition("scratch-branch", OpenPrLookup.ERROR).ok
+    assert check_push_precondition("", OpenPrLookup.ERROR).ok
+
+
+def test_push_gate_enforced_only_for_governed_branch_with_open_pr():
+    assert push_gate_applies("fix/7-token", OpenPrLookup.OPEN) is True
+    assert push_gate_applies("fix/7-token", OpenPrLookup.NONE) is False   # pre-PR push
+    assert push_gate_applies("main", OpenPrLookup.OPEN) is False
+    # ERROR never enforces the shared checks — check_push_precondition denies first.
+    assert push_gate_applies("fix/7-token", OpenPrLookup.ERROR) is False

@@ -49,6 +49,10 @@ class GateContext:
     screenshots_read: tuple[str, ...] = ()   # evidence images the agent actually read
     harness_test_cmd: str | None = None
     env_test_cmd: str | None = None
+    # Operator opt-out for a genuinely test-less repo (ALLOW_UNTESTED=1 in the
+    # repo overlay). Read from the DAEMON's env, never the agent's command line —
+    # the agent must not be able to grant itself the exemption.
+    allow_untested: bool = False
     exists_at_base: Callable[[str], bool] = lambda f: False
     run_tests: Callable[[str], bool] = lambda c: True
     revert_and_run: Callable[[tuple[str, ...]], bool] = lambda impl: False
@@ -87,7 +91,7 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
     chk(gate.check_pr_base(pr_base, ctx.base_branch))
 
     test_cmd = gate.resolve_test_cmd(ctx.harness_test_cmd, ctx.env_test_cmd)
-    chk(gate.check_tests(test_cmd, ctx.run_tests))
+    chk(gate.check_tests(test_cmd, ctx.run_tests, allow_untested=ctx.allow_untested))
 
     body = _extract_after_flag(argv, "--body", "-b")
     # --body-file/-F content is supplied via env_test_cmd-style injection in the
@@ -109,6 +113,7 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
                 impl_files=impl,
                 red_must_fail=ctx.red_must_fail,
                 base_resolvable=ctx.base_resolvable,
+                allow_untested=ctx.allow_untested,
             ),
             ctx.revert_and_run,
         )
@@ -130,7 +135,7 @@ def _push_gate(ctx: GateContext) -> list[str]:
             reasons.append(result.reason)
 
     test_cmd = gate.resolve_test_cmd(ctx.harness_test_cmd, ctx.env_test_cmd)
-    chk(gate.check_tests(test_cmd, ctx.run_tests))
+    chk(gate.check_tests(test_cmd, ctx.run_tests, allow_untested=ctx.allow_untested))
     chk(gate.check_commit_log(ctx.branch_subjects))
     chk(gate.check_no_evidence(ctx.changed_files))
     chk(gate.check_tests_immutable(ctx.changed_files, ctx.exists_at_base))

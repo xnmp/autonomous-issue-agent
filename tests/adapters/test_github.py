@@ -7,6 +7,7 @@ records argv and returns canned JSON (no network, no real gh)."""
 import json
 
 from issue_agent.adapters.github import (
+    _LIST_LIMIT,
     GitHubGateway,
     Identity,
     build_add_blocked_by_args,
@@ -55,7 +56,10 @@ def test_parse_pr_maps_reviews_and_closing_ref():
         "headRefOid": "abc123",
         "baseRefName": "dev",
         "labels": [{"name": "ai-pr-open"}],
-        "reviews": [{"author": {"login": "review-bot"}, "state": "APPROVED", "submittedAt": "t2"}],
+        "reviews": [{
+            "author": {"login": "review-bot"}, "state": "APPROVED", "submittedAt": "t2",
+            "commit": {"oid": "sha-graphql"},
+        }],
         "state": "OPEN",
         "closingIssuesReferences": [{"number": 5}],
     }
@@ -66,13 +70,40 @@ def test_parse_pr_maps_reviews_and_closing_ref():
     assert pr.closing_issue == 5
     assert pr.reviews[0].author == "review-bot"
     assert pr.reviews[0].state == "APPROVED"
+    # GraphQL shape (`gh pr view --json reviews`) nests the commit under commit.oid.
+    assert pr.reviews[0].commit_id == "sha-graphql"
 
 
 def test_parse_pr_review_api_user_shape():
-    # the reviews API uses .user.login + .submitted_at (snake) instead of author
-    d = {"number": 1, "reviews": [{"user": {"login": "x"}, "state": "APPROVED", "submitted_at": "t1"}]}
+    # the reviews API uses .user.login + .submitted_at (snake) instead of author,
+    # and carries the commit flat as commit_id (REST shape) instead of commit.oid.
+    d = {"number": 1, "reviews": [{
+        "user": {"login": "x"}, "state": "APPROVED", "submitted_at": "t1",
+        "commit_id": "sha-rest",
+    }]}
     pr = parse_pr(d)
     assert pr.reviews[0].author == "x" and pr.reviews[0].submitted_at == "t1"
+    assert pr.reviews[0].commit_id == "sha-rest"
+
+
+def test_parse_pr_review_commit_id_defaults_empty_when_absent():
+    # neither commit.oid nor commit_id present → "" (unknown), not a crash. The
+    # ADDRESS_REVIEW supersession gate treats "" as "stay open" (see world.py).
+    d = {"number": 1, "reviews": [{"author": {"login": "x"}, "state": "APPROVED"}]}
+    pr = parse_pr(d)
+    assert pr.reviews[0].commit_id == ""
+
+
+def test_parse_pr_review_commit_id_tolerates_malformed_commit_field():
+    # a non-dict "commit" (or a commit dict missing "oid") must not crash the
+    # parse — falls through to the commit_id fallback, then to "".
+    d = {"number": 1, "reviews": [
+        {"author": {"login": "x"}, "state": "APPROVED", "commit": "not-a-dict"},
+        {"author": {"login": "y"}, "state": "APPROVED", "commit": {}},
+    ]}
+    pr = parse_pr(d)
+    assert pr.reviews[0].commit_id == ""
+    assert pr.reviews[1].commit_id == ""
 
 
 def test_parse_pr_checks_feed_ci_state():
@@ -373,6 +404,59 @@ def test_build_steward_world_includes_open_and_closed_ai_done():
     gw = GitHubGateway("o/r", runner=runner)
     w = gw.build_steward_world()
     assert sorted(i.number for i in w.issues) == [5, 9]
+
+
+# ── P0.7: loud warning when a world-building list hits the --limit cap ────────
+def test_build_triage_world_warns_when_issue_list_hits_limit(capsys):
+    # exactly _LIST_LIMIT items: gh gives no "there were more" signal short of
+    # pagination, so a count that HITS the cap is the only observable proxy for
+    # truncation — this must be LOUD (FAILURE-MODES #66), not silently dropped.
+    def runner(argv, token):
+        key = " ".join(argv)
+        if "issue list" in key:
+            return json.dumps([{"number": n} for n in range(1, _LIST_LIMIT + 1)])
+        if "issue view" in key:
+            return json.dumps({"number": int(argv[3]), "state": "OPEN"})
+        return ""
+
+    gw = GitHubGateway("o/r", runner=runner)
+    w = gw.build_triage_world()
+    assert len(w.issues) == _LIST_LIMIT
+    err = capsys.readouterr().err
+    assert "TRUNCATED" in err and str(_LIST_LIMIT) in err
+
+
+def test_build_triage_world_no_warning_when_issue_list_below_limit(capsys):
+    def runner(argv, token):
+        key = " ".join(argv)
+        if "issue list" in key:
+            return json.dumps([{"number": 1}, {"number": 2}])
+        if "issue view" in key:
+            return json.dumps({"number": int(argv[3]), "state": "OPEN"})
+        return ""
+
+    gw = GitHubGateway("o/r", runner=runner)
+    gw.build_triage_world()
+    assert capsys.readouterr().err == ""
+
+
+def test_list_all_open_pr_numbers_warns_when_pr_list_hits_limit(capsys):
+    # same helper, `gh pr list` call site — proves the warning isn't wired to
+    # only one of the two list kinds named in P0.7.
+    prs = [{"number": n} for n in range(1, _LIST_LIMIT + 1)]
+    fr = FakeRunner({"pr list": prs})
+    gw = GitHubGateway("o/r", runner=fr)
+    nums = gw.list_all_open_pr_numbers()
+    assert len(nums) == _LIST_LIMIT
+    err = capsys.readouterr().err
+    assert "TRUNCATED" in err and str(_LIST_LIMIT) in err
+
+
+def test_list_all_open_pr_numbers_no_warning_below_limit(capsys):
+    fr = FakeRunner({"pr list": [{"number": 1}]})
+    gw = GitHubGateway("o/r", runner=fr)
+    gw.list_all_open_pr_numbers()
+    assert capsys.readouterr().err == ""
 
 
 # ── native "blocked by" dependency gate ───────────────────────────────────────

@@ -80,6 +80,8 @@ Status legend: **FIXED** · **OPEN / KNOWN** · **BY-DESIGN / OPERATIONAL**
 - Symptom: one human reply on a blocked issue re-triggered a resume agent run every poll tick.
 - Root cause: watcher polled "ai-blocked with reply newer than last action" but never recorded which reply it had acted on.
 - Fix: `resumed_at` marker in state; `issues_needing_resume` requires reply timestamp strictly newer than `get_resumed_at()`.
+- Regressed: the SDK port carried the read-side dedup (`issues_needing_resume`) but dropped the write side — `Store.set_resumed_at` was defined and read, but never called, so the guard was silently inert again.
+- Re-fixed 2026-07-25: `workflows/fix.py`'s `resume()` now calls `store.set_resumed_at(issue, reply_comment.created_at)` before dispatch, using the same comment selection (`last_human_reply`) as the read side.
 
 **14. Steward duplicate triage comments — `updatedAt` feedback loop**
 - Symptom: #40 got duplicate triage comments in a loop (observed live).
@@ -326,7 +328,7 @@ Status legend: **FIXED** · **OPEN / KNOWN** · **BY-DESIGN / OPERATIONAL**
 **61. Reaper didn't reset `ai-working` after external session kill**
 - Symptom: suspend-killed session left `ai-working` set with no active session; no reaper reset logged; issue stranded until manual relabel.
 - Root cause: reaper didn't fire on death-by-external-kill vs normal completion. (Orphaned `ai-working` from a prior dead harness also caused re-dispatch churn on restart.)
-- Status: OPEN (manual relabel workaround).
+- Status: HALF-TRUE, clarified — the in-process reaper (`reap_actions`, `fix.py`) DOES run every tick and self-heals orphaned `ai-working` while the daemon process is alive; that part already works. The real remaining gap is process-level restart: foreground `point-at.sh` has no supervisor, so a killed *process* (not just a killed session) stays dead until a human relaunches it. `ops/systemd/*.service` units already carry `Restart=always` and close this gap — they're being promoted to the default deployment path (see `docs/IMPROVEMENT-PLAN.md` P2.6).
 
 **62. transient `urlopen [Errno 9] Bad file descriptor` after OS suspend**
 - Symptom: review daemon threw it after a long suspend.
@@ -418,7 +420,7 @@ Status legend: **FIXED** · **OPEN / KNOWN** · **BY-DESIGN / OPERATIONAL**
 **78. `FIX_MCP_CONFIG` (conditional SonarQube MCP) not wired into the Python port**
 - Symptom: fixer ran without SonarQube MCP on repos needing it.
 - Root cause: `from_env` ignored `FIX_MCP_CONFIG` (bash harness injected it; port omitted).
-- Status: KNOWN at first live run; didn't block that run (Sonar passed). Current status needs verifying against `config.py`.
+- Status: FIXED — fully wired end-to-end: `app/config.py` reads `FIX_MCP_CONFIG` into `FixConfig.mcp_config`; `app/workflows/fix.py` resolves it via `mcp_servers_for_checks(...)` and passes `mcp_servers` into the task; `adapters/agent_runner.py` feeds `task.mcp_servers` into `ClaudeAgentOptions.mcp_servers`.
 
 **79. Multi-agent reviewer skip-gate prompt-injection surface**
 - Symptom: LLM skip-gate ingests raw diff + PR title/body — a malicious PR could instruct it to skip/approve.

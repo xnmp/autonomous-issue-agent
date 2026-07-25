@@ -111,21 +111,25 @@ def test_resume_pr_opened_success():
 
 
 # ── address-review tail (retry-counter decisions) ──
-def test_address_review_success_clears_retry():
+def test_address_review_success_still_counts_attempt():
+    # V2 lesson: a claimed push is NOT trusted as progress — only a superseding
+    # review resets the counter (it re-keys to the new review's timestamp), so a
+    # successful attempt bumps exactly like an error. Without this, clear-on-push
+    # reset the breaker every round and it could never trip.
     out = address_review_actions(100, _ok("pushed"))
-    assert out.clear_retry is True and out.bump_retry is False
+    assert out.bump_retry is True
     assert Relabel(Target.PR, 100, Label.AI_WORKING, None) in out.actions
 
 
 def test_address_review_blocked_no_retry_burn():
     out = address_review_actions(100, _ok("blocked", summary="unclear"))
-    assert out.clear_retry is False and out.bump_retry is False
+    assert out.bump_retry is False
     assert any(isinstance(a, Relabel) and a.add is Label.AI_BLOCKED for a in out.actions)
 
 
 def test_address_review_error_bumps_retry():
     out = address_review_actions(100, AgentResult(is_error=True))
-    assert out.bump_retry is True and out.clear_retry is False
+    assert out.bump_retry is True
 
 
 # ── fix-ci tail ──

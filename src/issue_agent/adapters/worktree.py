@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -111,6 +112,26 @@ class Worktrees:
 
 
 # ── GateContext builder ───────────────────────────────────────────────────────
+_DEFAULT_TEST_TIMEOUT_S = 600.0
+
+
+def _test_timeout_s() -> float:
+    """GATE_TEST_TIMEOUT_S in seconds, read fresh on every call (not cached at
+    import/build time) so a test can override it per-case and an operator's env
+    edit takes effect without restarting the daemon. A hung TEST_CMD must never
+    wedge the gate hook — same failure class as FAILURE-MODES #24 — so an
+    empty or malformed value falls back to the default rather than disabling
+    the timeout outright (precedent: governor.py's edit-check uses a fixed
+    120s; the test suite gets a generous but finite default since it can
+    legitimately run longer)."""
+    raw = os.environ.get("GATE_TEST_TIMEOUT_S", "")
+    try:
+        seconds = float(raw)
+    except ValueError:
+        return _DEFAULT_TEST_TIMEOUT_S
+    return seconds if seconds > 0 else _DEFAULT_TEST_TIMEOUT_S
+
+
 def _resolve_base_ref(git: GitRunner, cwd: str, base: str) -> str | None:
     for ref in (f"origin/{base}", base):
         if git(["rev-parse", "--verify", "--quiet", ref], cwd).code == 0:
@@ -125,6 +146,7 @@ def build_gate_context(
     red_must_fail: bool = True,
     verify_red_at_commit: bool = True,
     has_open_pr: bool = False,
+    allow_untested: bool = False,
     git: GitRunner = _subprocess_git,
     run_tests: Callable[[str], bool] | None = None,
 ) -> GateContext:
@@ -151,7 +173,27 @@ def build_gate_context(
         return git(["cat-file", "-e", f"{baseref}:{path}"], cwd).code == 0
 
     def _default_run_tests(cmd: str) -> bool:
-        return subprocess.run(cmd, shell=True, cwd=cwd).returncode == 0
+        """Real shell eval of the test command, bounded by GATE_TEST_TIMEOUT_S
+        (default 600s). A hang must resolve to 'did not pass' (False), never
+        propagate — `evaluate_command` (which calls this via GateContext) runs
+        inside governor.py's make_pretooluse_hook under a broad fail-OPEN
+        except; an uncaught TimeoutExpired there would silently ALLOW the very
+        command the gate exists to block. subprocess.run's own TimeoutExpired
+        handling already kills the direct child (the `sh -c` process spawned by
+        shell=True) before raising, so no explicit process-group cleanup is
+        needed for the common case — a command that further backgrounds its
+        own grandchildren can still outlive us, a pre-existing footgun of
+        shell=True this doesn't newly introduce."""
+        timeout = _test_timeout_s()
+        try:
+            return subprocess.run(cmd, shell=True, cwd=cwd, timeout=timeout).returncode == 0
+        except subprocess.TimeoutExpired:
+            print(
+                f"[gate] TEST_CMD timed out after {timeout:g}s and was killed "
+                f"(reported as a FAILING run, not a pass): {cmd}",
+                file=sys.stderr,
+            )
+            return False
 
     rt = run_tests or _default_run_tests
 
@@ -159,7 +201,11 @@ def build_gate_context(
         """§10: drop new impl / revert modified impl to base, run the test cmd,
         restore HEAD. Returns whether the suite PASSED with impl reverted (True
         ⇒ tautological). Fail-open (return False ⇒ 'genuine red') on any git
-        error, matching prc_check_red_fails."""
+        error, matching prc_check_red_fails. A timed-out run (see
+        `_default_run_tests`) also surfaces as this same False/'did not pass'
+        signal — indistinguishable here from a real fail, which is the
+        existing fail-open contract for §10, not something introduced by the
+        timeout."""
         if not baseref:
             return False
         test_cmd = (markers.test_cmd() or env_test_cmd or "")
@@ -186,6 +232,7 @@ def build_gate_context(
         base_resolvable=base_resolvable,
         changed_files=changed,
         has_open_pr=has_open_pr,
+        allow_untested=allow_untested,
         ac_posted=markers.ac_posted(),
         test_plan_posted=markers.test_plan_posted(),
         adversarial_verdict=markers.adversarial_verdict(),

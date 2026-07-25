@@ -34,8 +34,10 @@ from .lifecycle import issue_lifecycle, pr_escalation, pr_lifecycle, retry_break
 from .refs import issue_from_branch
 from .world import (
     CIState,
+    Comment,
     IssueView,
     PRView,
+    Review,
     WorldState,
     REVIEW_APPROVED,
     REVIEW_CHANGES_REQUESTED,
@@ -68,7 +70,13 @@ class FixState:
     # unbounded fix-CI / address-review loop burns budget forever, so at the cap
     # we escalate to a human instead of re-dispatching. Default 0 (no attempts).
     ci_retries: dict[int, int] = field(default_factory=dict)
-    review_retries: dict[int, int] = field(default_factory=dict)
+    # review_retries values are (review_submitted_at, count): the counter is
+    # KEYED to the specific CHANGES_REQUESTED review it accumulated against. A
+    # NEW review (different submitted_at) reads as count 0 — supersession is the
+    # ONLY thing that resets it. The V2 lesson: the old clear-on-push-success
+    # reset the counter every round, so the breaker could never trip and a downed
+    # review daemon meant an infinite full-session-cost loop.
+    review_retries: dict[int, tuple[str, int]] = field(default_factory=dict)
     rebase_retries: dict[int, int] = field(default_factory=dict)
 
 
@@ -103,16 +111,28 @@ def pick_ready_issue(world: WorldState) -> int | None:
     return ready[0].number
 
 
-def _last_human_reply_at(issue: IssueView, fix_bot: str) -> str | None:
-    """createdAt of the latest comment by a real human (not the fixer, not any
-    [bot]). Port of the jq in watcher.sh §2 / resume-issue.sh."""
+def last_human_reply(issue: IssueView, fix_bot: str) -> Comment | None:
+    """Latest comment by a real human (not the fixer, not any [bot]), or None.
+    Port of the jq in watcher.sh §2 / resume-issue.sh.
+
+    Public because BOTH sides of the resume dedup must select the SAME comment:
+    the decide-side read (issues_needing_resume, comparing created_at against
+    the resumed-at mark) and the workflow's write side (set_resumed_at after
+    dispatch). When the two sides used different filters the write recorded a
+    different comment than the read compared, and one unanswered reply re-fired
+    a paid RESUME session every poll (V1/#13)."""
     humans = [
         c for c in issue.comments
         if c.author != fix_bot and not c.is_bot
     ]
-    if not humans:
+    return humans[-1] if humans else None
+
+
+def _last_human_reply_at(issue: IssueView, fix_bot: str) -> str | None:
+    reply = last_human_reply(issue, fix_bot)
+    if reply is None:
         return None
-    return humans[-1].created_at or None
+    return reply.created_at or None
 
 
 def issues_needing_resume(
@@ -236,6 +256,22 @@ def breaker_key(pr: PRView) -> int:
     collide with a real issue N. The workflow increments under the SAME key."""
     n = _issue_for_pr(pr)
     return n if n is not None else -pr.number
+
+
+def review_superseded(review: Review, pr: PRView) -> bool:
+    """A CHANGES_REQUESTED review is superseded when the PR head has moved past
+    the commit it judged: the fixer already pushed a response, and the next move
+    belongs to the REVIEWER (a re-review of the new head), not the fixer.
+
+    Without this gate the fixer re-dispatched ADDRESS_REVIEW on the same stale
+    review every poll until a new review arrived — and if the review daemon was
+    down, forever, at full session cost (V2/#64). Unknown commit_id or head
+    ("") fails open to dispatch: the attempt-counting breaker is the backstop."""
+    return bool(
+        review.commit_id
+        and pr.head_ref_oid
+        and review.commit_id != pr.head_ref_oid
+    )
 
 
 # ── circuit breakers ──────────────────────────────────────────────────────────
@@ -366,11 +402,19 @@ def decide_fix(
                 consumed = True
                 continue
             review = latest_other_review(pr.reviews, cfg.fix_bot)
-            if review is not None and review.state == REVIEW_CHANGES_REQUESTED:
-                # Circuit breaker: repeated failed address-review attempts on the
-                # same PR escalate to a human rather than looping forever.
-                if breaker_tripped(state.review_retries.get(bkey, 0),
-                                   cfg.max_review_retries):
+            if (
+                review is not None
+                and review.state == REVIEW_CHANGES_REQUESTED
+                and not review_superseded(review, pr)
+            ):
+                # Circuit breaker: repeated address-review ATTEMPTS on the SAME
+                # review escalate to a human rather than looping forever. The
+                # counter is keyed to the review's submitted_at — a stored count
+                # from an OLDER review reads as 0 (superseded = reset), and
+                # nothing else resets it (see FixState.review_retries).
+                at, n = state.review_retries.get(bkey, ("", 0))
+                count = n if at == review.submitted_at else 0
+                if breaker_tripped(count, cfg.max_review_retries):
                     actions.extend(_escalate_pr(
                         pr.number,
                         f"address-review failed {cfg.max_review_retries}× without resolution.",
@@ -379,6 +423,9 @@ def decide_fix(
                 actions.append(RunAgent(AgentKind.ADDRESS_REVIEW, pr.number))
                 consumed = True
                 continue
+            # A superseded CHANGES_REQUESTED review (head moved past it) falls
+            # through: the fixer's push is awaiting re-review, but a CI failure
+            # on the NEW head is still the fixer's to fix.
             if not lifecycle.is_working and ci_state(
                 pr.checks, cfg.ci_ignore_checks
             ) == CIState.FAILURE:

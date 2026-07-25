@@ -48,7 +48,9 @@ done
 [ "$pr_base" = "$base" ] \
   || fail "PR base is '$pr_base' but must be '$base' (BASE_BRANCH). Re-create with '--base $base'."
 
-# ── 1. Tests pass once, locally, before the PR (shared with check-push.sh) ─────
+# ── 1. Tests pass once, locally, before the PR (shared with check-push.sh).
+#       Fails CLOSED when no test command resolves — "untested" must not look
+#       like "green" — unless the operator opted out with ALLOW_UNTESTED=1. ────
 prc_check_tests
 
 # ── 2. PR body carries acceptance criteria ─────────────────────────────────────

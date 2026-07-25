@@ -224,23 +224,28 @@ def resume_actions(
 
 @dataclass(frozen=True)
 class AddressReviewOutcome:
-    """address-review.sh tail. The retry counter (keyed to the review timestamp)
-    is orchestration state, so this returns the action list AND the decision the
-    caller persists: clear_retry on success, bump_retry on error, neither on
-    blocked (waiting on a human ≠ a failed attempt)."""
+    """address-review.sh tail. The retry counter (keyed to the review's
+    submitted_at) is orchestration state, so this returns the action list AND
+    whether the attempt should COUNT: bump_retry on ok AND on error — an attempt
+    was made either way, and a claimed "pushed" is not trusted as progress (a
+    no-op push, or a push the reviewer rejects again, must still march the
+    breaker forward). No bump on blocked (waiting on a human ≠ a failed
+    attempt; ai-blocked already stops re-dispatch).
+
+    Deliberately NO clear-on-success (the V2 lesson): the counter resets only
+    when a NEW review re-keys it (supersession, see FixState.review_retries).
+    The old clear_retry-on-push reset the counter every round, so the breaker
+    could never trip and a downed review daemon meant an infinite loop at full
+    session cost."""
 
     actions: list[Action]
-    clear_retry: bool = False
     bump_retry: bool = False
 
 
 def address_review_actions(pr: int, result: AgentResult) -> AddressReviewOutcome:
     # The watcher added ai-working before dispatch; the tail always clears it.
     clear_working = Relabel(Target.PR, pr, Label.AI_WORKING, None)
-    outcome = classify_outcome(result)
-    if outcome is Outcome.OK or result.status == "pushed":
-        return AddressReviewOutcome([clear_working], clear_retry=True)
-    if outcome is Outcome.BLOCKED:
+    if classify_outcome(result) is Outcome.BLOCKED:
         body = (
             "**Agent needs clarification on review:**\n\n"
             f"{result.summary or result.needs}\n\n---\n_Reply to unblock._"
@@ -250,7 +255,7 @@ def address_review_actions(pr: int, result: AgentResult) -> AddressReviewOutcome
             [clear_working, PostComment(Target.PR, pr, body),
              Relabel(Target.PR, pr, None, Label.AI_BLOCKED)]
         )
-    # error/crash → count it so repeated failures on the SAME review escalate.
+    # ok AND error both count: only a superseding review proves progress.
     return AddressReviewOutcome([clear_working], bump_retry=True)
 
 

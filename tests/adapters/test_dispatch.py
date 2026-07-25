@@ -104,6 +104,18 @@ class FakeStore:
         self.resumes[i] = self.resumes.get(i, 0) + 1
         return self.resumes[i]
 
+    def set_resumed_at(self, i, at):
+        self.__dict__.setdefault("resumed_at", {})[i] = at
+
+    def get_resumed_at(self, i):
+        return getattr(self, "resumed_at", {}).get(i, "")
+
+    def get_review_retry(self, i):
+        return getattr(self, "review_retries", {}).get(i, ("", 0))
+
+    def set_review_retry(self, i, at, n):
+        self.__dict__.setdefault("review_retries", {})[i] = (at, n)
+
     def set_triage_at(self, i, at):
         self.triage_at[i] = at
 

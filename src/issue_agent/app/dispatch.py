@@ -57,6 +57,9 @@ class DispatchConfig:
     review_trigger_label: str = "ai-pr-open"
     # Diagnostic logger (stderr in production; the steward passes its tagged logger).
     log: Callable[[str], None] = lambda _m: None
+    # Fixer login, threaded to FixWorkflow so its resume path filters comments
+    # with the same rule the decide side uses (see FixWorkflowConfig.fix_bot).
+    fix_bot: str = ""
 
     def fix_workflow_config(self) -> FixWorkflowConfig:
         return FixWorkflowConfig(
@@ -68,6 +71,7 @@ class DispatchConfig:
             fix_mcp_config=self.fix_mcp_config,
             harness_root=self.harness_root,
             log=self.log,
+            fix_bot=self.fix_bot,
         )
 
     def review_workflow_config(self) -> ReviewWorkflowConfig:

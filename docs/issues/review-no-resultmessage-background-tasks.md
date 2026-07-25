@@ -1,5 +1,7 @@
 # Review agent returns $0.00 "no ResultMessage" — SDK 0.2.110 background-Task stream never yields a terminal ResultMessage
 
+**RESOLVED (2026-07-25):** the fix this doc proposes — denying `Bash(run_in_background=true)` — is live: `src/issue_agent/adapters/governor.py:343-350` rejects it unconditionally in the `PreToolUse(Bash)` hook, before the command-content gate. Denying other background-capable tools (e.g. `Monitor`, `Agent`) fixer-side is tracked separately as its own item, not this one — see `docs/IMPROVEMENT-PLAN.md` P0.10/P3.1.
+
 **Labels:** bug, reviewer, agent-runtime, sdk-upgrade, HIGH
 
 ## Summary

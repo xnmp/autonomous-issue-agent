@@ -62,7 +62,10 @@ def _fix_state(store: Store, world) -> FixState:
     # breaker reads 0 forever and the retry loop never escalates (was PR #112).
     keys = {breaker_key(p) for p in world.prs}
     ci_retries = {k: store.get_ci_retries(k) for k in keys}
-    review_retries = {k: store.get_review_retry(k)[1] for k in keys}
+    # Full (review_at, count) tuple: the domain compares the stored timestamp
+    # against the CURRENT review's submitted_at so a superseding review reads
+    # as count 0 (see FixState.review_retries).
+    review_retries = {k: store.get_review_retry(k) for k in keys}
     rebase_retries = {k: store.get_rebase_retries(k) for k in keys}
     return FixState(
         sessions=sessions, resumed_at=resumed, automerge_enabled=automerge,
@@ -106,6 +109,7 @@ def build_fix_daemon(
         fix_mcp_config=fix_runtime.mcp_config,
         harness_root=cfg.runtime_paths.harness_root,
         log=_log("fix"),
+        fix_bot=fix_runtime.bot,
     )
     # Fixer runtime: Codex (GPT-5.5) swaps the runner AND installs the governor as
     # a Codex hook in each worktree (the Claude runner gets its governor via SDK

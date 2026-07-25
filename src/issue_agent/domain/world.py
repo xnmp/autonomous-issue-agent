@@ -52,12 +52,21 @@ class Check:
 
 @dataclass(frozen=True)
 class Review:
-    """A submitted review. `author` is the login; `submitted_at` orders them."""
+    """A submitted review. `author` is the login; `submitted_at` orders them.
+
+    `commit_id` is the head SHA the review was submitted against (gh: the
+    review's `commit.oid`, REST: `commit_id`). It drives the ADDRESS_REVIEW
+    supersession gate: a CHANGES_REQUESTED review whose commit is no longer the
+    PR head has already been answered by a push — re-dispatching the fixer on it
+    burns a full session per poll until the reviewer re-reviews (V2/#64).
+    Empty = unknown (adapter couldn't resolve it) → the gate stays open and the
+    attempt-counting breaker is the backstop."""
 
     state: str
     author: str
     submitted_at: str = ""
     body: str = ""
+    commit_id: str = ""
 
 
 @dataclass(frozen=True)

@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from ...domain import fix as fix_domain
 from ...domain import outcome
 from ..planners import tasks as task_builders
 from ..planners.tasks import FixTaskConfig
@@ -29,6 +30,11 @@ class FixWorkflowConfig:
     fix_mcp_config: str
     harness_root: str
     log: Callable[[str], None]
+    # The fixer's own login. The resume path must exclude the fixer's comments
+    # with the SAME filter the decide side uses (domain.fix.last_human_reply),
+    # or the resumed-at dedup mark records a different comment than the decide
+    # loop compares against (V1/#13). Default "" keeps existing tests working.
+    fix_bot: str = ""
 
 
 @dataclass
@@ -131,9 +137,18 @@ class FixWorkflow:
 
     async def resume(self, issue: int) -> None:
         iss = self.gateway.get_issue(issue)
-        reply = self.latest_human_reply(iss)
-        if not reply:
+        reply_comment = fix_domain.last_human_reply(iss, self.cfg.fix_bot)
+        if reply_comment is None or not reply_comment.body:
             return
+        reply = reply_comment.body
+        # V1/#13 write side: record WHICH reply this dispatch consumes, BEFORE
+        # running — the decide loop's dedup (issues_needing_resume) compares
+        # this mark against the thread, and without it one unanswered reply
+        # re-fired a paid RESUME session every poll tick. Written pre-run so
+        # even a crashed/blocked leg cannot loop on the same reply; a crashed
+        # leg is requeued by the reaper (ai-working → ai-ready), not by
+        # re-resuming.
+        self.store.set_resumed_at(issue, reply_comment.created_at)
         pr_existing = self.gateway.pr_for_issue(issue)
         if self.cfg.author_tests_split and pr_existing is None:
             await self.resolve_split(issue)
@@ -164,12 +179,16 @@ class FixWorkflow:
         self.store.save_session(issue, result.session_id)
         out = outcome.address_review_actions(pr, result)
         self.executor.execute_all(out.actions)
-        review_at = self.latest_changes_requested_at(p)
-        if out.clear_retry:
-            self.store.clear_review_retry(issue)
-        elif out.bump_retry:
-            _at, n = self.store.get_review_retry(issue)
-            self.store.set_review_retry(issue, review_at, n + 1)
+        if out.bump_retry:
+            # Attempt counter keyed to the review being addressed: a count
+            # stored under an OLDER review's timestamp restarts at 0 (that
+            # review was superseded). There is deliberately no clear-on-success
+            # — only a NEW review re-keys the counter (V2/#64; see
+            # domain.outcome.AddressReviewOutcome).
+            review_at = self.latest_changes_requested_at(p)
+            at, n = self.store.get_review_retry(issue)
+            base = n if at == review_at else 0
+            self.store.set_review_retry(issue, review_at, base + 1)
 
     async def fix_ci(self, pr: int) -> None:
         issue = self.gateway.issue_for_pr(pr)
@@ -203,13 +222,6 @@ class FixWorkflow:
         self.store.save_session(issue, result.session_id)
         self.store.set_rebase_retries(issue, self.store.get_rebase_retries(issue) + 1)
         self.executor.execute_all(outcome.fix_ci_actions(pr, result))
-
-    @staticmethod
-    def latest_human_reply(issue) -> str:
-        for comment in reversed(issue.comments):
-            if not comment.is_bot:
-                return comment.body
-        return ""
 
     @staticmethod
     def latest_review_body(pr) -> str:

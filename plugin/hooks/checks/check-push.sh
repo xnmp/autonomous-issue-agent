@@ -23,9 +23,25 @@ case "$branch" in
 esac
 
 # Is there an OPEN PR for this branch? If not, this is a pre-PR push → allow
-# (the create gate will enforce later). Fail OPEN on any gh/network error so a
-# transient lookup failure never wedges the agent mid-work.
-pr=$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // ""' 2>/dev/null || echo "")
+# (the create gate will enforce later).
+#
+# FAIL CLOSED when the lookup itself fails. This used to `|| echo ""` and treat
+# a gh/network error as "no PR" — i.e. the gate's own precondition was a bypass:
+# one flaky `gh` call (proxy hiccup, expired token, rate limit) silently skipped
+# the ENTIRE push gate on a branch that does have an open PR. Retry once first,
+# because a transient blip is the common case and a needless denial costs the
+# agent a turn; if it still fails we deny, since a blocked push is recoverable
+# (the agent just pushes again) but an ungated push is not.
+# GATE_GH_RETRY_SLEEP is a knob only so the self-test can drive this path fast.
+pr=""; pr_rc=1
+for _attempt in 1 2; do
+  pr=$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // ""' 2>/dev/null)
+  pr_rc=$?
+  [ "$pr_rc" -eq 0 ] && break
+  [ "$_attempt" = 1 ] && sleep "${GATE_GH_RETRY_SLEEP:-2}"
+done
+[ "$pr_rc" -eq 0 ] \
+  || fail "could not verify PR state for branch '$branch' — 'gh pr list' failed twice (gh/network/auth error). The push gate needs to know whether an open PR exists, so it fails CLOSED rather than letting an unverified push through. Check connectivity and 'gh auth status', then retry the push shortly."
 [ -n "$pr" ] || exit 0
 
 # An open PR exists → re-verify the new state. Resolve the diff range vs base.

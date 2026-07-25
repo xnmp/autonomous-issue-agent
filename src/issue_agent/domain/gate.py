@@ -21,6 +21,7 @@ import os
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from enum import Enum
 
 from .refs import is_governed_branch
 
@@ -339,19 +340,107 @@ def resolve_test_cmd(harness_test_cmd: str | None, env_test_cmd: str | None) -> 
 
 
 # ── §1 tests + §10 red-fail (impure rules expressed over injected callables) ──
-def check_tests(test_cmd: str, run_tests: Callable[[str], bool]) -> GateResult:
-    """§1: the test suite must pass. Empty command → ALLOW but the caller should
-    surface the toothless-gate warning (no command means §10 is also disabled).
-    `run_tests(cmd) -> passed?`."""
+# The message the agent sees when no test command resolves. Single-sourced so §1
+# and §10 give identical, actionable instructions. Keep in sync with
+# _pr_common.sh:prc_check_tests / prc_check_red_fails.
+NO_TEST_CMD_HINT = (
+    "Write the exact command you used to run your tests into .harness/test-cmd "
+    "(one line, non-watch, must exit), or have the operator set TEST_CMD. If this "
+    "repo genuinely has no test suite, the operator sets ALLOW_UNTESTED=1 in its "
+    "overlay config."
+)
+
+
+def check_tests(
+    test_cmd: str, run_tests: Callable[[str], bool], allow_untested: bool = False
+) -> GateResult:
+    """§1: the test suite must pass. `run_tests(cmd) -> passed?`.
+
+    NO test command → DENY, not allow. An empty command used to pass silently,
+    which made "this repo has no test command" indistinguishable from "the tests
+    passed" — the gate exited 0 either way, and §10 (anti-tautological-test) was
+    disabled along with it. Fail CLOSED and require a deliberate operator opt-out
+    (`allow_untested`, from ALLOW_UNTESTED=1 in the repo overlay) for the genuinely
+    test-less repo. The flag is an OPERATOR fact, never an agent-supplied one."""
     if not test_cmd:
-        return ALLOW  # caller warns; genuinely optional for some repos
+        if allow_untested:
+            return ALLOW  # caller warns; explicit opt-out for a test-less repo
+        return deny(
+            "no test command resolved (neither .harness/test-cmd nor TEST_CMD) — the "
+            "test gate and the red-fail (anti-tautological-test) check cannot run, so "
+            "the gate fails CLOSED instead of passing you silently. " + NO_TEST_CMD_HINT
+        )
     return ALLOW if run_tests(test_cmd) else deny(f"local test suite failed: {test_cmd}")
 
 
 def gate_is_toothless(test_cmd: str) -> bool:
-    """True when there is no test command — §1 and §10 both silently no-op. The
+    """True when there is no test command — §1 and §10 have no teeth. Now only
+    reachable with the ALLOW_UNTESTED opt-out (otherwise the gate denies); the
     caller emits the GATE WARNING. (Pure helper so the warning is testable.)"""
     return not test_cmd
+
+
+# ── push-gate precondition: "does this branch have an open PR?" ───────────────
+class OpenPrLookup(Enum):
+    """Tri-state answer to the push gate's precondition (check-push.sh's
+    `gh pr list --head <branch> --state open`).
+
+    ERROR is the whole point of the type: the bash used to collapse a failed `gh`
+    call into "" — the same value as "no PR" — so a network/auth blip skipped the
+    ENTIRE push gate on a branch that DID have an open PR. The gate's own
+    precondition was the bypass. An unknown state must be representable so it can
+    be denied, hence a tri-state rather than a bool. The retry lives in
+    `resolve_open_pr`."""
+
+    OPEN = "open"
+    NONE = "none"
+    ERROR = "error"
+
+
+def resolve_open_pr(
+    probe: Callable[[], OpenPrLookup],
+    attempts: int = 2,
+    sleep: Callable[[], None] = lambda: None,
+) -> OpenPrLookup:
+    """Run the injected `probe` up to `attempts` times, returning the first
+    non-ERROR answer (else ERROR). `sleep` is called BETWEEN attempts only — the
+    delay is the adapter's (impure) business, defaulted to a no-op so the retry
+    POLICY is pure and testable. Mirrors check-push.sh's two `gh pr list` calls
+    with a sleep between: a transient blip is the common case and a needless
+    denial costs the agent a turn, so retry before failing closed."""
+    result = OpenPrLookup.ERROR
+    for attempt in range(max(attempts, 1)):
+        if attempt:
+            sleep()
+        result = probe()
+        if result is not OpenPrLookup.ERROR:
+            return result
+    return result
+
+
+def check_push_precondition(branch: str, lookup: OpenPrLookup) -> GateResult:
+    """DENY a push whose PR state could not be determined. Only governed branches
+    are gated at all (an ungoverned branch never even calls gh in the bash), so a
+    lookup error there is irrelevant. A blocked push is recoverable — the agent
+    retries — while an ungated push is not, so the unknown state loses."""
+    if not is_governed_branch(branch):
+        return ALLOW
+    if lookup is OpenPrLookup.ERROR:
+        return deny(
+            f"could not verify PR state for branch '{branch}' — the open-PR lookup "
+            "failed (gh/network/auth error) even after a retry. The push gate needs to "
+            "know whether an open PR exists, so it fails CLOSED rather than letting an "
+            "unverified push through. Check connectivity and 'gh auth status', then "
+            "retry the push shortly."
+        )
+    return ALLOW
+
+
+def push_gate_applies(branch: str, lookup: OpenPrLookup) -> bool:
+    """The state-derived push checks run ONLY for a governed branch with a
+    confirmed open PR (pre-PR pushes stay free; the create gate enforces later).
+    ERROR never reaches here — `check_push_precondition` denies first."""
+    return is_governed_branch(branch) and lookup is OpenPrLookup.OPEN
 
 
 def check_red_is_red(
@@ -390,6 +479,7 @@ class RedFailInputs:
     impl_files: tuple[str, ...]       # implementation/non-test changes (reverted)
     red_must_fail: bool = True
     base_resolvable: bool = True
+    allow_untested: bool = False      # operator opt-out (ALLOW_UNTESTED=1)
 
 
 def partition_changed(
@@ -417,18 +507,26 @@ def check_red_fails(
     """§10: with the implementation reverted, the NEW tests MUST fail (real red).
     Catches the tautological / wrong-layer test (#39 class).
 
-    Skips (ALLOW) when: RED_MUST_FAIL=0, no test command, base unresolvable, no
+    Skips (ALLOW) when: RED_MUST_FAIL=0 (explicit disable), base unresolvable, no
     new tests (§5 owns "must add a test"), or a pure-test diff (nothing to
-    revert). `revert_and_run(impl_files) -> passed?` performs the transient
-    revert + test run in the worktree and is responsible for restoring HEAD; it
-    fails OPEN (returns False ⇒ red ⇒ ALLOW only via this function's logic) — see
-    note below. A passing suite with the impl gone ⇒ the tests don't exercise the
-    change ⇒ DENY.
+    revert). NO test command is NOT a skip: it means this check never ran at all,
+    which is exactly how #39 slipped through, so it DENIES unless the operator set
+    `allow_untested` (ALLOW_UNTESTED=1) — same rule as §1, which denies first.
+    `revert_and_run(impl_files) -> passed?` performs the transient revert + test
+    run in the worktree and is responsible for restoring HEAD; it fails OPEN
+    (returns False ⇒ red ⇒ ALLOW only via this function's logic) — see note below.
+    A passing suite with the impl gone ⇒ the tests don't exercise the change ⇒ DENY.
     """
     if not inputs.red_must_fail:
         return ALLOW
     if not inputs.test_cmd:
-        return ALLOW
+        if inputs.allow_untested:
+            return ALLOW
+        return deny(
+            "no test command resolved (neither .harness/test-cmd nor TEST_CMD) — the "
+            "red-fail (anti-tautological-test) check cannot prove the new tests fail "
+            "without the implementation. " + NO_TEST_CMD_HINT
+        )
     if not inputs.base_resolvable:
         return ALLOW  # fail-open: degraded simulation must never wedge a real PR
     if not inputs.new_test_files:

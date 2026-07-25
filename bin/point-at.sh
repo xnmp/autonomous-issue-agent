@@ -156,8 +156,10 @@ fi
 # duplicate anyway (the authoritative guard). But catch it HERE too, before the
 # doctor/branch/label dance, so a double `point-at` fails fast with a clear
 # message instead of racing to the flock. Match other point-at.sh processes for
-# THIS repo name, excluding ourselves and our parent.
-_others="$(pgrep -f "point-at.sh $NAME" 2>/dev/null | grep -vx "$$" | grep -vx "$PPID" || true)"
+# THIS repo name, excluding ourselves and our parent. Anchored with a trailing
+# word boundary (end-of-string or space) — unanchored `pgrep -f` substring-
+# matches, so NAME=app would also catch a launcher for NAME=myapp.
+_others="$(pgrep -f "point-at\.sh ${NAME}([[:space:]]|\$)" 2>/dev/null | grep -vx "$$" | grep -vx "$PPID" || true)"
 if [ -n "$_others" ]; then
   red "a point-at launcher for '$NAME' is already running (pids: $(echo $_others | tr '\n' ' '))."
   red "Refusing to start a second — duplicate daemons double-dispatch. Stop it first:"

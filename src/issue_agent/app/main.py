@@ -131,6 +131,10 @@ def build_role(role: str, env: dict | None = None):
             env_test_cmd=env.get("TEST_CMD"),
             red_must_fail=env.get("RED_MUST_FAIL", "1") != "0",
             verify_red_at_commit=env.get("VERIFY_RED_AT_COMMIT", "1") != "0",
+            # Operator opt-out for a test-less repo: without it the fail-closed
+            # tests gate (check_tests) denies every pr-create/push. Mirrors the
+            # bash checks' ALLOW_UNTESTED — an overlay fact, never agent-set.
+            allow_untested=env.get("ALLOW_UNTESTED", "") == "1",
         )
 
     # Live per-commit breadcrumb (red:/green:/docs:) from inside the agent session,

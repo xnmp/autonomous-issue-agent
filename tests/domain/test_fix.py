@@ -394,17 +394,64 @@ def _ci_fail_pr():
 
 
 def test_address_review_under_cap_still_dispatches():
-    st = FixState(review_retries={9: 2})
+    st = FixState(review_retries={9: ("t1", 2)})  # counted against THIS review
     actions = decide_fix(world(prs=[_changes_requested_pr()]), CFG, st, fixer_busy=False)
     assert RunAgent(AgentKind.ADDRESS_REVIEW, 100) in _run_agents(actions)
 
 
 def test_address_review_at_cap_escalates_not_dispatches():
-    st = FixState(review_retries={9: 3})  # cap is 3 (default)
+    st = FixState(review_retries={9: ("t1", 3)})  # cap is 3 (default)
     actions = decide_fix(world(prs=[_changes_requested_pr()]), CFG, st, fixer_busy=False)
     assert _run_agents(actions) == []  # no fixer dispatch
     assert Relabel(Target.PR, 100, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW) in actions
     assert any(isinstance(a, PostComment) and a.number == 100 for a in actions)
+
+
+def test_address_review_counter_from_older_review_reads_as_zero():
+    # The counter is keyed to the review it accumulated against: a count stored
+    # under an OLDER review's timestamp must not block a NEW review (supersession
+    # is the only reset — see FixState.review_retries).
+    st = FixState(review_retries={9: ("t0", 3)})  # at cap, but for review t0
+    actions = decide_fix(world(prs=[_changes_requested_pr()]), CFG, st, fixer_busy=False)
+    assert RunAgent(AgentKind.ADDRESS_REVIEW, 100) in _run_agents(actions)
+
+
+# ── ADDRESS_REVIEW supersession gate (V2/#64) ────────────────────────────────
+def _reviewed_pr(commit_id: str, head_oid: str, checks=()):
+    return pr(100, "ai-pr-open", closing_issue=9, head_ref_oid=head_oid,
+              checks=tuple(checks),
+              reviews=(Review("CHANGES_REQUESTED", "review-bot", "t1",
+                              commit_id=commit_id),))
+
+
+def test_superseded_review_not_redispatched():
+    # Head moved past the reviewed commit: the fixer already answered; the next
+    # move is the reviewer's. Re-dispatching here was the V2 full-cost loop.
+    w = world(prs=[_reviewed_pr(commit_id="aaa", head_oid="bbb")])
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+    assert _run_agents(actions) == []
+
+
+def test_superseded_review_still_allows_ci_fix():
+    # While awaiting re-review, a CI failure on the NEW head is still ours.
+    w = world(prs=[_reviewed_pr(commit_id="aaa", head_oid="bbb",
+                                checks=[Check("unit", bucket="fail")])])
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+    assert RunAgent(AgentKind.FIX_CI, 100) in _run_agents(actions)
+
+
+def test_review_on_current_head_dispatches():
+    w = world(prs=[_reviewed_pr(commit_id="aaa", head_oid="aaa")])
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+    assert RunAgent(AgentKind.ADDRESS_REVIEW, 100) in _run_agents(actions)
+
+
+def test_review_with_unknown_commit_dispatches():
+    # commit_id unknown → fail open to dispatch; the attempt counter is the
+    # backstop against looping.
+    w = world(prs=[_reviewed_pr(commit_id="", head_oid="bbb")])
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+    assert RunAgent(AgentKind.ADDRESS_REVIEW, 100) in _run_agents(actions)
 
 
 def test_fix_ci_at_cap_escalates_not_dispatches():

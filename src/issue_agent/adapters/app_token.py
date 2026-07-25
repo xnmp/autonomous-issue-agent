@@ -15,11 +15,18 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
 # Re-mint when fewer than this many seconds of life remain (bash: 5 min).
 REFRESH_MARGIN_S = 300
+
+# Mint retry: total attempts and the backoff (seconds) slept *between* them, so
+# a transient GitHub hiccup (FAILURE-MODES #21-adjacent) doesn't kill the
+# daemon's identity on the first blip. len(MINT_BACKOFF_S) == MINT_ATTEMPTS - 1.
+MINT_ATTEMPTS = 3
+MINT_BACKOFF_S = (2, 8)
 
 
 @dataclass(frozen=True)
@@ -72,28 +79,51 @@ class AppTokenMinter:
     """Mints + caches installation tokens. The crypto+HTTP exchange is injected
     (`mint_fn`) so the cache logic is unit-tested without network or a real key;
     the production wiring passes a `mint_fn` that signs a JWT and POSTs to GitHub
-    (see `default_mint_fn`)."""
+    (see `default_mint_fn`).
+
+    A transient GitHub hiccup (rate limit, network blip) used to kill the mint
+    on the first failure, taking the daemon's identity down with it. `get()`
+    retries MINT_ATTEMPTS times with backoff (`sleep_fn`, injected so tests don't
+    actually sleep) before giving up and raising the last error."""
 
     def __init__(
         self,
         creds: AppCredentials,
         mint_fn: Callable[[AppCredentials], tuple[str, str, int]],
         now_fn: Callable[[], int],
+        sleep_fn: Callable[[float], None] = time.sleep,
     ):
         # mint_fn(creds) -> (token, expires_at_iso, expires_epoch)
         self._creds = creds
         self._mint = mint_fn
         self._now = now_fn
+        self._sleep = sleep_fn
 
     def get(self) -> str:
         cached = load_cache(self._creds.cache_path)
         if token_is_fresh(cached, self._now()):
             return cached.token  # type: ignore[union-attr]
-        token, expires_at, expires_epoch = self._mint(self._creds)
-        if not token:
-            raise RuntimeError("gh-app-token: mint returned empty token")
+        token, expires_at, expires_epoch = self._mint_with_retry()
         write_cache(self._creds.cache_path, token, expires_at, expires_epoch)
         return token
+
+    def _mint_with_retry(self) -> tuple[str, str, int]:
+        """Attempt `self._mint` up to MINT_ATTEMPTS times, sleeping MINT_BACKOFF_S
+        between attempts (not after the last). An empty token counts as a failure
+        too (the pre-retry behavior). Re-raises the final attempt's own error
+        untouched, so callers see the real cause, not a wrapper."""
+        last_error: Exception = RuntimeError("gh-app-token: mint never attempted")
+        for attempt in range(MINT_ATTEMPTS):
+            try:
+                token, expires_at, expires_epoch = self._mint(self._creds)
+                if not token:
+                    raise RuntimeError("gh-app-token: mint returned empty token")
+                return token, expires_at, expires_epoch
+            except Exception as exc:
+                last_error = exc
+                if attempt < MINT_ATTEMPTS - 1:
+                    self._sleep(MINT_BACKOFF_S[attempt])
+        raise last_error
 
 
 def default_mint_fn(creds: AppCredentials) -> tuple[str, str, int]:

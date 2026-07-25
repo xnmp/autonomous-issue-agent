@@ -130,6 +130,11 @@ setup_pr_repo() {
     git -c core.hooksPath=/dev/null commit -qm "green: implement token"
     : > .harness/ac-posted; : > .harness/test-plan-posted
     echo "PASS looks good" > .harness/adversarial-verdict
+    # A GENUINE test command: passes only WITH the impl, so §1 is green and §7c
+    # goes red on revert. The gate now fails CLOSED without one (ALLOW_UNTESTED=1
+    # is the opt-out), so every case below would otherwise be blocked at §1 —
+    # i.e. "blocked" would stop proving anything about the rule under test.
+    echo 'test -f token.py' > .harness/test-cmd
   )
   echo "$d"
 }
@@ -177,8 +182,9 @@ d=$(fresh_repo)
     && echo x>x.py && git add x.py && git -c core.hooksPath=/dev/null commit -qm "red: placeholder" \
     && echo y>y.py && git add y.py && git -c core.hooksPath=/dev/null commit -qm "green: impl" \
     && : > .harness/ac-posted; : > .harness/test-plan-posted && echo PASS > .harness/adversarial-verdict )
-out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-[ "$rc" -eq 1 ] && ok "fix/ without regression test blocked" || no "fix/ without regression test blocked" "rc=$rc out=${out:0:160}"
+out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'regression test'; } \
+  && ok "fix/ without regression test blocked" || no "fix/ without regression test blocked" "rc=$rc out=${out:0:160}"
 rm -rf "$d"
 
 # evidence/ NON-IMAGE committed → blocked.
@@ -207,8 +213,9 @@ d=$(fresh_repo)
     && echo "def test_x(): pass" > test_x_regression.py && git add test_x_regression.py \
     && echo z>z.py && git add z.py && git -c core.hooksPath=/dev/null commit -qm "green: impl no red" \
     && : > .harness/ac-posted; : > .harness/test-plan-posted && echo PASS > .harness/adversarial-verdict )
-out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-[ "$rc" -eq 1 ] && ok "PR gate catches green-without-red" || no "PR gate catches green-without-red" "rc=$rc out=${out:0:160}"
+out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'TDD ordering'; } \
+  && ok "PR gate catches green-without-red" || no "PR gate catches green-without-red" "rc=$rc out=${out:0:160}"
 rm -rf "$d"
 
 echo "== check-pr.sh §0b (PR base must equal BASE_BRANCH) =="
@@ -247,8 +254,9 @@ d=$(fresh_repo)
     && printf 'wip arbitrary message no prefix\n' > /tmp/cm.txt \
     && git -c core.hooksPath=/dev/null commit -qF /tmp/cm.txt \
     && : > .harness/ac-posted; : > .harness/test-plan-posted && echo PASS > .harness/adversarial-verdict )
-out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-[ "$rc" -eq 1 ] && ok "PR gate catches -F bad-prefix commit" || no "PR gate catches -F bad-prefix commit" "rc=$rc out=${out:0:160}"
+out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'allowed prefix'; } \
+  && ok "PR gate catches -F bad-prefix commit" || no "PR gate catches -F bad-prefix commit" "rc=$rc out=${out:0:160}"
 rm -rf "$d"
 
 # Modifying an EXISTING test file is blocked (only new test files allowed).
@@ -265,8 +273,9 @@ d=$(fresh_repo)
   echo impl>impl.py; git add tests/test_keep.py impl.py
   git -c core.hooksPath=/dev/null commit -qm "green: impl + weaken existing test"
   : > .harness/ac-posted; : > .harness/test-plan-posted; echo PASS > .harness/adversarial-verdict )
-out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-[ "$rc" -eq 1 ] && ok "modifying existing test blocked" || no "modifying existing test blocked" "rc=$rc out=${out:0:160}"
+out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'existing test file'; } \
+  && ok "modifying existing test blocked" || no "modifying existing test blocked" "rc=$rc out=${out:0:160}"
 rm -rf "$d"
 
 # feat/ branch accepts a conventionally-named test (test_*.py), not just e2e/integration.
@@ -277,7 +286,7 @@ d=$(fresh_repo)
     && echo "def modulo(a,b): return a%b" > mod.py && git add mod.py \
     && git -c core.hooksPath=/dev/null commit -qm "green: modulo" \
     && : > .harness/ac-posted; : > .harness/test-plan-posted && echo PASS > .harness/adversarial-verdict )
-out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body '## Acceptance Criteria
+out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='test -f mod.py' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body '## Acceptance Criteria
 - modulo
 
 Fixes #14' 2>&1 ); rc=$?
@@ -327,17 +336,34 @@ out=$( cd "$d" && BASE_BRANCH=dev RED_MUST_FAIL=0 TEST_CMD='true' bash "$CHECKS/
 [ "$rc" -eq 0 ] && ok "RED_MUST_FAIL=0 disables the check" || no "RED_MUST_FAIL=0 disables the check" "rc=$rc out=${out:0:200}"
 rm -rf "$d"
 
-# (i) no TEST_CMD → check is a no-op (the existing compliant-PR cases prove this,
-#     since setup_pr_repo runs check-pr.sh with TEST_CMD unset and still passes).
-
-# (j) no test command at all → the gate must ALLOW but emit a LOUD warning
-#     (silent-degradation regression: no command disables the anti-tautological
-#     red-fail check, and that must never be silent).
+# (i) no test command at all → the gate must fail CLOSED. A warning was not
+#     enough: with nothing to run, "untested" exited 0 exactly like "tests
+#     passed", so §1 AND the anti-tautological §7c were silently disabled on any
+#     target that never set TEST_CMD. The message must tell the agent how to fix it.
 d=$(setup_redfail_repo feat/20-add)
 out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$RF_BODY" 2>&1 ); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "no test command resolved"; } \
+  && ok "no test command → PR blocked (fail-closed)" \
+  || no "no-test-command fails closed" "rc=$rc out=${out:0:200}"
+printf '%s' "$out" | grep -q '.harness/test-cmd' \
+  && ok "no-test-command message says how to fix it" \
+  || no "no-test-command message actionable" "out=${out:0:200}"
+rm -rf "$d"
+
+# (j) ALLOW_UNTESTED=1 → the operator's explicit opt-out for a genuinely
+#     test-less repo restores the old warn-and-pass behaviour (and still warns,
+#     so the degradation is never silent).
+d=$(setup_redfail_repo feat/20-add)
+out=$( cd "$d" && BASE_BRANCH=dev ALLOW_UNTESTED=1 bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$RF_BODY" 2>&1 ); rc=$?
 { [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q "GATE WARNING: no test command"; } \
-  && ok "no test command → allowed but warns gate is toothless" \
-  || no "no-test-command warning" "rc=$rc out=${out:0:200}"
+  && ok "ALLOW_UNTESTED=1 → allowed, but still warns" \
+  || no "ALLOW_UNTESTED opt-out" "rc=$rc out=${out:0:200}"
+rm -rf "$d"
+
+# (j2) the opt-out covers only a MISSING command — a failing one still blocks.
+d=$(setup_redfail_repo feat/20-add)
+out=$( cd "$d" && BASE_BRANCH=dev ALLOW_UNTESTED=1 TEST_CMD='false' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$RF_BODY" 2>&1 ); rc=$?
+[ "$rc" -eq 1 ] && ok "ALLOW_UNTESTED does not excuse failing tests" || no "ALLOW_UNTESTED vs failing tests" "rc=$rc out=${out:0:200}"
 rm -rf "$d"
 
 # (k) .harness/test-cmd is PREFERRED over $TEST_CMD. Agent declares a genuine
@@ -384,8 +410,10 @@ out=$( cd "$d" && PATH="$d/bin:$PATH" BASE_BRANCH=dev bash "$CHECKS/check-push.s
 [ "$rc" -eq 0 ] && ok "push w/ no open PR allowed" || no "push w/ no open PR allowed" "rc=$rc out=${out:0:160}"
 rm -rf "$d"
 
-# (b) open PR + failing TEST_CMD → blocked.
-d=$(setup_pr_repo); make_gh_stub "$d" "7"
+# (b) open PR + failing TEST_CMD → blocked. Drop the fixture's .harness/test-cmd
+#     first: the marker deliberately WINS over $TEST_CMD, so leaving it would make
+#     this case assert the marker's command, not the failing one.
+d=$(setup_pr_repo); make_gh_stub "$d" "7"; rm -f "$d/.harness/test-cmd"
 out=$( cd "$d" && PATH="$d/bin:$PATH" BASE_BRANCH=dev TEST_CMD='false' bash "$CHECKS/check-push.sh" push 2>&1 ); rc=$?
 [ "$rc" -eq 1 ] && ok "push w/ open PR + failing tests blocked" || no "push w/ open PR + failing tests blocked" "rc=$rc out=${out:0:160}"
 rm -rf "$d"
@@ -413,6 +441,71 @@ rm -rf "$d"
 d=$(fresh_repo); ( cd "$d" && git switch -qc scratch-branch )
 out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='false' bash "$CHECKS/check-push.sh" push 2>&1 ); rc=$?
 [ "$rc" -eq 0 ] && ok "push on non-governed branch allowed" || no "push on non-governed branch allowed" "rc=$rc out=${out:0:160}"
+rm -rf "$d"
+
+# A `gh` that FAILS the lookup (network/auth error), logging one line per call so
+# the retry is observable. GH_CALL_LOG selects the log file.
+make_gh_failing_stub() {  # make_gh_failing_stub <dir> [<attempt-that-succeeds> <pr-number>]
+  local d="$1" ok_at="${2:-0}" n="${3:-}"
+  mkdir -p "$d/bin"
+  cat > "$d/bin/gh" <<EOF
+#!/usr/bin/env bash
+case " \$* " in
+  *" pr list "*)
+    echo call >> "\$GH_CALL_LOG"
+    if [ "$ok_at" != 0 ] && [ "\$(wc -l < "\$GH_CALL_LOG")" -ge "$ok_at" ]; then
+      printf '%s' "$n"; exit 0
+    fi
+    echo "error connecting to api.github.com" >&2; exit 1 ;;
+  *) : ;;
+esac
+EOF
+  chmod +x "$d/bin/gh"
+}
+
+# (f) the lookup fails on BOTH attempts → the push is BLOCKED (fail-closed).
+#     Regression: this used to be `|| echo ""`, i.e. a gh error looked exactly
+#     like "no open PR" and skipped the ENTIRE push gate — the gate's own
+#     precondition was the bypass.
+d=$(setup_pr_repo); make_gh_failing_stub "$d"
+out=$( cd "$d" && PATH="$d/bin:$PATH" GH_CALL_LOG="$d/gh-calls" GATE_GH_RETRY_SLEEP=0 \
+       BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-push.sh" push 2>&1 ); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'could not verify PR state'; } \
+  && ok "push blocked when the PR-state lookup fails (fail-closed)" \
+  || no "gh lookup failure fails closed" "rc=$rc out=${out:0:200}"
+printf '%s' "$out" | grep -qi 'retry the push' \
+  && ok "gh-failure message tells the agent to retry" || no "gh-failure message actionable" "out=${out:0:200}"
+[ "$(wc -l < "$d/gh-calls")" -eq 2 ] \
+  && ok "PR-state lookup is retried once before denying" \
+  || no "lookup retried once" "calls=$(wc -l < "$d/gh-calls")"
+rm -rf "$d"
+
+# (g) a TRANSIENT failure (first call fails, retry succeeds) must NOT deny — the
+#     retry exists so a network blip doesn't cost the agent a turn.
+d=$(setup_pr_repo); make_gh_failing_stub "$d" 2 ""      # 2nd call answers "no PR"
+out=$( cd "$d" && PATH="$d/bin:$PATH" GH_CALL_LOG="$d/gh-calls" GATE_GH_RETRY_SLEEP=0 \
+       BASE_BRANCH=dev TEST_CMD='false' bash "$CHECKS/check-push.sh" push 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] && ok "transient lookup failure recovers on retry" || no "transient lookup recovers" "rc=$rc out=${out:0:200}"
+rm -rf "$d"
+
+# (h) retry succeeds and reports an OPEN PR → the shared checks still run
+#     (recovering must not skip enforcement).
+d=$(setup_pr_repo); make_gh_failing_stub "$d" 2 "7"; rm -f "$d/.harness/test-cmd"
+out=$( cd "$d" && PATH="$d/bin:$PATH" GH_CALL_LOG="$d/gh-calls" GATE_GH_RETRY_SLEEP=0 \
+       BASE_BRANCH=dev TEST_CMD='false' bash "$CHECKS/check-push.sh" push 2>&1 ); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'test suite failed'; } \
+  && ok "open PR found on retry still enforces the push gate" \
+  || no "retry then enforce" "rc=$rc out=${out:0:200}"
+rm -rf "$d"
+
+# (i) no test command + open PR → the push gate fails CLOSED too (prc_check_tests
+#     is shared with check-pr.sh), and ALLOW_UNTESTED=1 opts out.
+d=$(setup_pr_repo); make_gh_stub "$d" "7"; rm -f "$d/.harness/test-cmd"
+out=$( cd "$d" && PATH="$d/bin:$PATH" BASE_BRANCH=dev bash "$CHECKS/check-push.sh" push 2>&1 ); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'no test command resolved'; } \
+  && ok "push w/ open PR + no test command blocked" || no "push no-test-command fails closed" "rc=$rc out=${out:0:200}"
+out=$( cd "$d" && PATH="$d/bin:$PATH" BASE_BRANCH=dev ALLOW_UNTESTED=1 bash "$CHECKS/check-push.sh" push 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] && ok "push w/ ALLOW_UNTESTED=1 allowed" || no "push ALLOW_UNTESTED opt-out" "rc=$rc out=${out:0:200}"
 rm -rf "$d"
 
 echo ""

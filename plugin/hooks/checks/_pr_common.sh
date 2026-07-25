@@ -50,20 +50,31 @@ prc_resolve_test_cmd() {
   printf '%s' "$c"
 }
 
+# Is running untested (no resolvable test command) explicitly permitted? This is
+# an OPERATOR decision made in the repo overlay (config/repos/<name>.env), never
+# an agent one: the checker inherits the daemon's environment, so an inline
+# `ALLOW_UNTESTED=1 gh pr create …` from the agent does NOT reach here.
+# Keep in sync with domain/gate.py (the `allow_untested` flag threaded through
+# check_tests/check_red_fails).
+prc_allow_untested() { [ "${ALLOW_UNTESTED:-0}" = 1 ]; }
+
 # §1 — local test suite must pass (CI re-runs authoritatively, when present).
 #
-# With no TEST_CMD this check AND the red-fail check (§10) silently do nothing —
-# the gate fires but has no teeth, so a tautological/wrong-layer test (the #39
-# class) sails through. That is a silent degradation on any target that hasn't
-# set TEST_CMD, so make it LOUD: warn to stderr (the agent sees it; it lands in
-# the hook log) exactly once per process. We still allow — TEST_CMD is genuinely
-# optional for some repos — but never silently.
+# With no test command this check AND the red-fail check (§10) have no teeth, so
+# a tautological/wrong-layer test (the #39 class) sails through. Warning to
+# stderr was not enough: "no test command" then looked EXACTLY like "tests
+# passed" to everything downstream (the gate exits 0 either way), which is a
+# silent fail-open on any target that never set TEST_CMD. So DENY by default and
+# make the operator opt out deliberately with ALLOW_UNTESTED=1 (then we keep the
+# old warn-and-pass, because a genuinely test-less repo does exist).
 prc_check_tests() {
   local tcmd; tcmd="$(prc_resolve_test_cmd)"
   if [ -n "$tcmd" ]; then
     eval "$tcmd" || fail "local test suite failed: $tcmd"
+  elif prc_allow_untested; then
+    echo "GATE WARNING: no test command (neither .harness/test-cmd nor TEST_CMD) — the test gate AND the red-fail (anti-tautological-test) check are DISABLED by ALLOW_UNTESTED=1. A test that passes without the change will not be caught." >&2
   else
-    echo "GATE WARNING: no test command (neither .harness/test-cmd nor TEST_CMD) — the test gate AND the red-fail (anti-tautological-test) check are DISABLED. A test that passes without the change will not be caught. Have the agent write .harness/test-cmd, or set TEST_CMD." >&2
+    fail "no test command resolved (neither .harness/test-cmd nor TEST_CMD) — the test gate and the red-fail (anti-tautological-test) check cannot run, so the gate fails CLOSED instead of passing you silently. Write the exact command you used to run your tests into .harness/test-cmd (one line, non-watch, must exit), or have the operator set TEST_CMD. If this repo genuinely has no test suite, the operator sets ALLOW_UNTESTED=1 in its overlay config."
   fi
 }
 
@@ -128,14 +139,24 @@ prc_check_tests_immutable() {  # prc_check_tests_immutable "<changed-file-list>"
 #
 # Deliberately create-only (check-pr.sh), not on every push: it runs TEST_CMD an
 # extra time and only the initial diff has a clean red/green split to simulate.
-# Skipped when TEST_CMD is empty, RED_MUST_FAIL=0, there are no new tests, or
-# there is no implementation to revert (a pure-test diff can't be made red).
+# Skipped when RED_MUST_FAIL=0, there are no new tests, or there is no
+# implementation to revert (a pure-test diff can't be made red).
 # Fail-OPEN on any git/infra error — a degraded simulation must never wedge a
 # legitimate PR; it logs and allows.
+#
+# NO test command is NOT such an infra error, though: it means this gate never
+# ran at all, which is the exact condition #39 slipped through. So it fails
+# CLOSED (unless the operator set ALLOW_UNTESTED=1), same rule as §1. §1 runs
+# first in check-pr.sh and would already have denied — this is defence in depth,
+# so reordering the sections can never silently reopen the hole.
 prc_check_red_fails() {  # prc_check_red_fails "<changed-file-list>"
   [ "${RED_MUST_FAIL:-1}" = 0 ] && return 0
   local tcmd; tcmd="$(prc_resolve_test_cmd)"
-  [ -n "$tcmd" ] || return 0
+  if [ -z "$tcmd" ]; then
+    prc_allow_untested \
+      && { echo "red-check: no test command — anti-tautological-test check DISABLED by ALLOW_UNTESTED=1" >&2; return 0; }
+    fail "no test command resolved (neither .harness/test-cmd nor TEST_CMD) — the red-fail (anti-tautological-test) check cannot prove the new tests fail without the implementation. Write the command you used into .harness/test-cmd (one line, non-watch), or have the operator set TEST_CMD / ALLOW_UNTESTED=1."
+  fi
 
   # Resolve the bare base ref (prefer origin/, fall back to local).
   local baseref="" ref

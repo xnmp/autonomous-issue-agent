@@ -129,3 +129,47 @@ def test_build_gate_context_wires_run_tests():
                              run_tests=lambda cmd: cmd == "pytest")
     assert ctx.run_tests("pytest") is True
     assert ctx.run_tests("false") is False
+
+
+# ── default run_tests: timeout (P0.5 — a hung TEST_CMD must not wedge the gate) ──
+def test_default_run_tests_denies_on_timeout(tmp_path, monkeypatch, capsys):
+    """A hung TEST_CMD must resolve to FAILURE (False), not hang forever and not
+    be silently swallowed as a pass — same failure class as FAILURE-MODES #24.
+    No `run_tests` override is passed, so this exercises the real subprocess
+    default, bounded by a tiny GATE_TEST_TIMEOUT_S."""
+    monkeypatch.setenv("GATE_TEST_TIMEOUT_S", "1")
+    ctx = build_gate_context(str(tmp_path), base_branch="dev", git=_builder_git())
+
+    passed = ctx.run_tests("sleep 5")
+
+    assert passed is False
+    err = capsys.readouterr().err
+    assert "timed out" in err.lower()
+    assert "1" in err  # names the configured timeout
+
+
+def test_default_run_tests_passes_fast_command_unaffected(tmp_path, monkeypatch):
+    """The timeout must not disturb the ordinary (fast, well-behaved) case."""
+    monkeypatch.setenv("GATE_TEST_TIMEOUT_S", "5")
+    ctx = build_gate_context(str(tmp_path), base_branch="dev", git=_builder_git())
+
+    assert ctx.run_tests("true") is True
+    assert ctx.run_tests("false") is False
+
+
+def test_default_run_tests_malformed_timeout_env_falls_back_to_default(tmp_path, monkeypatch):
+    """A garbled or empty GATE_TEST_TIMEOUT_S must fall back to the default
+    rather than disabling the timeout (or crashing) — don't actually wait out
+    the 600s default, just confirm a fast command still runs and passes under
+    it."""
+    monkeypatch.setenv("GATE_TEST_TIMEOUT_S", "not-a-number")
+    ctx = build_gate_context(str(tmp_path), base_branch="dev", git=_builder_git())
+    assert ctx.run_tests("true") is True
+
+    monkeypatch.setenv("GATE_TEST_TIMEOUT_S", "")
+    ctx = build_gate_context(str(tmp_path), base_branch="dev", git=_builder_git())
+    assert ctx.run_tests("true") is True
+
+    monkeypatch.setenv("GATE_TEST_TIMEOUT_S", "-5")
+    ctx = build_gate_context(str(tmp_path), base_branch="dev", git=_builder_git())
+    assert ctx.run_tests("true") is True

@@ -42,6 +42,32 @@ from ..domain.world import (
 # far above a healthy call (<2s) yet bounds the pathological hang.
 _GH_TIMEOUT_S = 120.0
 
+# Cap on `gh issue list` / `gh pr list` world-building calls. gh has no
+# "there were more" signal short of paginating (cursor-following, unshipped
+# here) — a returned count that HITS this ceiling is the only observable proxy
+# for truncation, and it means the OLDEST issues/PRs silently vanished from
+# consideration this poll, no error, no signal (suspected root cause of
+# FAILURE-MODES #66 — triage candidates going missing). 500 covers real-world
+# open-issue/PR counts with headroom over the old 200; _warn_if_list_truncated
+# below makes a hit LOUD instead of silent (P0.7).
+_LIST_LIMIT = 500
+
+
+def _warn_if_list_truncated(query: str, count: int) -> None:
+    """Emit a loud stderr warning when a `gh … list` call returns exactly
+    `_LIST_LIMIT` items. Unlike the fail-soft gh-error path (transient, re-derived
+    next tick), a truncated listing recurs every poll and drops the same items
+    every time until an operator raises `_LIST_LIMIT` or pagination ships — so
+    this is intentionally NOT swallowed."""
+    if count == _LIST_LIMIT:
+        import sys
+
+        sys.stderr.write(
+            f"WARNING: {query} returned {count} items (== --limit {_LIST_LIMIT}) — "
+            "results may be TRUNCATED; oldest items silently dropped this poll. "
+            "Raise _LIST_LIMIT or add pagination.\n"
+        )
+
 
 # ── pure parsers ──────────────────────────────────────────────────────────────
 def _labels(raw: list | None) -> frozenset[Label]:
@@ -76,12 +102,25 @@ def _reviews(raw: list | None) -> tuple[Review, ...]:
             author = r["author"].get("login", "")
         elif isinstance(r.get("user"), dict):  # API shape
             author = r["user"].get("login", "")
+        # `commit_id` feeds the ADDRESS_REVIEW supersession gate (Review docstring
+        # in domain/world.py). Two incompatible gh shapes carry it: the GraphQL-backed
+        # `gh pr view --json reviews` nests it under commit.oid; the plain REST
+        # reviews API (`/pulls/{n}/reviews`) has it flat as commit_id. Try both,
+        # defensively (isinstance guards a malformed/absent "commit"); "" (unknown)
+        # if neither is present — the gate stays open and the attempt-counting
+        # breaker is the backstop, never a crash on an unrecognized shape.
+        commit_id = ""
+        if isinstance(r.get("commit"), dict):  # GraphQL shape
+            commit_id = r["commit"].get("oid", "") or ""
+        if not commit_id:
+            commit_id = r.get("commit_id", "") or ""  # REST shape
         out.append(
             Review(
                 state=r.get("state", "") or "",
                 author=author or "",
                 submitted_at=r.get("submittedAt") or r.get("submitted_at") or "",
                 body=r.get("body", "") or "",
+                commit_id=commit_id,
             )
         )
     return tuple(out)
@@ -345,8 +384,9 @@ class GitHubGateway:
         """Every OPEN PR number, no label filter — feeds rogue-PR adoption."""
         data = self._gh_json(
             ["pr", "list", "--repo", self.repo, "--state", "open",
-             "--json", "number", "--limit", "200"]
+             "--json", "number", "--limit", str(_LIST_LIMIT)]
         ) or []
+        _warn_if_list_truncated("gh pr list --state open", len(data))
         return [int(p["number"]) for p in data]
 
     def build_world(self) -> WorldState:
@@ -409,8 +449,9 @@ class GitHubGateway:
         lifecycle label — so it must see every open issue, not just labelled ones)."""
         nums = self._gh_json(
             ["issue", "list", "--repo", self.repo, "--state", "open",
-             "--json", "number", "--limit", "200"]
+             "--json", "number", "--limit", str(_LIST_LIMIT)]
         ) or []
+        _warn_if_list_truncated("gh issue list --state open", len(nums))
         issues = tuple(self.get_issue(int(i["number"])) for i in nums)
         return WorldState(issues=issues)
 
@@ -422,10 +463,12 @@ class GitHubGateway:
         steward selects this builder (jira on), so a jira-off deployment pays
         nothing."""
         nums: dict[int, None] = {}
-        for i in (self._gh_json(
+        open_issues = self._gh_json(
             ["issue", "list", "--repo", self.repo, "--state", "open",
-             "--json", "number", "--limit", "200"]
-        ) or []):
+             "--json", "number", "--limit", str(_LIST_LIMIT)]
+        ) or []
+        _warn_if_list_truncated("gh issue list --state open", len(open_issues))
+        for i in open_issues:
             nums[int(i["number"])] = None
         for i in (self._gh_json(
             ["issue", "list", "--repo", self.repo, "--state", "closed",

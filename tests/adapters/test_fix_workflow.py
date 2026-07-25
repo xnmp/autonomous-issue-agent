@@ -10,7 +10,7 @@ from issue_agent.app.execute import Executor
 from issue_agent.app.workflows.fix import FixWorkflow, FixWorkflowConfig
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.app.planners.tasks import FixTaskConfig
-from issue_agent.domain.world import Check, IssueView, PRView
+from issue_agent.domain.world import Check, Comment, IssueView, PRView, Review
 
 from test_dispatch import FakeGateway, FakeRunner, FakeStore, FakeWorktrees, SeqRunner
 
@@ -118,6 +118,70 @@ def test_fix_ci_no_mcp_when_no_check_matches():
     ).fix_ci(100))
 
     assert runner.tasks[0].mcp_servers == ()
+
+
+def test_resume_writes_resumed_at_mark():
+    # V1/#13 regression: a dispatched resume must record WHICH reply it
+    # consumed. Without the write, this blocked-again issue re-fires a paid
+    # RESUME on the same unchanged thread every poll tick.
+    iss = IssueView(5, title="t", body="b", comments=(
+        Comment("fix-bot", "asking", "t1"),
+        Comment("alice", "the answer", "t2"),
+    ))
+    gw = FakeGateway(issues={5: iss}, pr_for_issue={})
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(is_error=False, status="blocked", session_id="s5"))
+
+    asyncio.run(_workflow(gw, store, runner, fix_bot="fix-bot").resume(5))
+
+    assert store.get_resumed_at(5) == "t2"
+    assert "the answer" in runner.tasks[0].prompt
+
+
+def test_resume_without_human_reply_does_not_run():
+    # Only fixer/bot comments on the thread → nothing to resume on; no session
+    # spend, no resumed-at mark.
+    iss = IssueView(5, title="t", body="b", comments=(
+        Comment("fix-bot", "asking", "t1"),
+        Comment("ci[bot]", "noise", "t2"),
+    ))
+    gw = FakeGateway(issues={5: iss}, pr_for_issue={})
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(is_error=False, status="blocked", session_id="s5"))
+
+    asyncio.run(_workflow(gw, store, runner, fix_bot="fix-bot").resume(5))
+
+    assert runner.tasks == []
+    assert store.get_resumed_at(5) == ""
+
+
+def test_address_review_attempt_rekeys_counter_to_current_review():
+    # The counter follows the review being addressed: a count accumulated
+    # against an OLDER review restarts at 1 for the new one, and a successful
+    # push still counts (no clear-on-success — V2/#64).
+    p = PRView(100, head_ref_name="fix/5-x", closing_issue=5,
+               reviews=(Review("CHANGES_REQUESTED", "rev-bot", "t9", body="fix it"),))
+    gw = FakeGateway(prs={100: p})
+    store = FakeStore()
+    store.set_review_retry(5, "t1", 3)  # stale: keyed to a superseded review
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s"))
+
+    asyncio.run(_workflow(gw, store, runner).address_review(100))
+
+    assert store.get_review_retry(5) == ("t9", 1)
+
+
+def test_address_review_blocked_does_not_bump_counter():
+    p = PRView(100, head_ref_name="fix/5-x", closing_issue=5,
+               reviews=(Review("CHANGES_REQUESTED", "rev-bot", "t9", body="fix it"),))
+    gw = FakeGateway(prs={100: p})
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(is_error=False, status="blocked",
+                                    summary="unclear", session_id="s"))
+
+    asyncio.run(_workflow(gw, store, runner).address_review(100))
+
+    assert store.get_review_retry(5) == ("", 0)
 
 
 def test_split_majority_case_author_then_implement_opens_pr():
