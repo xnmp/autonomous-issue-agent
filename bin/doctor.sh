@@ -12,13 +12,23 @@ ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 warn() { WARN=$((WARN+1)); printf '  \033[33m⚠\033[0m %s\n' "$1"; }
 bad()  { ERR=$((ERR+1));  printf '  \033[31m✗\033[0m %s\n' "$1"; }
 
-# review C1: the ONE place doctor compares GitHub logins. Mirrors
-# domain/identity.py's normalize_login (casefold, then strip ONE trailing
-# `[bot]` suffix) — a raw `!=` lets `fix-bot` vs `fix-bot[bot]` pass doctor
-# even though they're the SAME GitHub identity in two API surface forms,
-# and GitHub then 422s the self-approval on every PR, forever.
+# review C1/P1R-6: the ONE place doctor compares GitHub logins. Mirrors
+# domain/identity.py's normalize_login (strip whitespace, casefold, then
+# strip ONE trailing `[bot]` suffix) — a raw `!=` lets `fix-bot` vs
+# `fix-bot[bot]` pass doctor even though they're the SAME GitHub identity in
+# two API surface forms, and GitHub then 422s the self-approval on every PR,
+# forever. The whitespace strip MUST run first: `FIX_BOT='fix-bot '` (a
+# trailing space, e.g. round-tripped through a shell env file) has to lose
+# the space BEFORE the `[bot]`-suffix check, or the two never normalize to
+# the same string and doctor prints "two distinct identities" over a pair
+# that GitHub-side is really the SAME bot with padding (review P1R-6 — this
+# used to defeat the check entirely, reproducing the original C1 symptom).
 _normalize_login() {
-  local l="${1,,}"
+  local l="$1"
+  # trim leading/trailing whitespace (standard bash idiom — no external tools)
+  l="${l#"${l%%[![:space:]]*}"}"
+  l="${l%"${l##*[![:space:]]}"}"
+  l="${l,,}"
   printf '%s\n' "${l%\[bot\]}"
 }
 
@@ -55,13 +65,24 @@ echo "== per-repo state-dir collisions (config/repos/*.env) =="
 # two different overlays resolve to.
 _REPOS_DIR="$HARNESS_ROOT/config/repos"
 if [ -d "$_REPOS_DIR" ] && compgen -G "$_REPOS_DIR/*.env" >/dev/null 2>&1; then
-  # Mirrors app/config.py::_repo_slug — "owner/name" -> "owner-name",
-  # blank/unset REPO -> the fixed "unknown" slug.
+  # Mirrors app/config.py::_repo_slug — "owner/name" -> "owner__name"
+  # (casefolded), blank/unset REPO -> the fixed "unknown" slug.
+  #
+  # R2-10: the separator changed from "-" to "__". A single "-" collided
+  # whenever EITHER segment already contained a hyphen (`acme/app-b` and
+  # `acme-app/b` both -> `acme-app-b`), since "-" is legal inside both a
+  # GitHub owner login and a repo name. "_" is NOT legal in a GitHub owner
+  # login at all, so splitting on "__" can never be ambiguous. Casefolded too,
+  # so case-variant spellings of the same repo share one state dir.
   _repo_slug() {
     local r
     r="$(printf '%s' "${1:-}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-    r="${r//\//-}"
-    printf '%s\n' "${r:-unknown}"
+    if [ -z "$r" ]; then
+      printf 'unknown\n'
+      return
+    fi
+    r="${r//\//__}"
+    printf '%s\n' "${r,,}"
   }
   # Mirrors app/config.py::_default_state_dir.
   _default_state_dir() {
@@ -108,7 +129,9 @@ fi
 
 : "${REPO:=}"; : "${IDENTITY_MODE:=three}"; : "${FIX_BOT:=}"
 [ -n "$REPO" ] && ok "REPO=$REPO" || bad "REPO unset"
-[ -n "$FIX_BOT" ] && ok "FIX_BOT=$FIX_BOT" || bad "FIX_BOT unset"
+# P1R-6: check the NORMALIZED value, not the raw one — a whitespace-only
+# FIX_BOT ("   ") is non-empty by `-n` but carries no real identity.
+[ -n "$(_normalize_login "$FIX_BOT")" ] && ok "FIX_BOT=$FIX_BOT" || bad "FIX_BOT unset"
 
 if [ "$IDENTITY_MODE" = "three" ]; then
   : "${REVIEW_BOT:=}"; : "${STEWARD_BOT:=}"

@@ -875,3 +875,58 @@ def test_cleanup_issueless_pr_still_emits_clear_with_no_issue():
     clears = [a for a in acts if isinstance(a, ClearIssueState)]
     assert clears == [ClearIssueState(pr=100, issue=None, merged=True)]
     assert not any(isinstance(a, RemoveWorktree) for a in acts)
+
+
+# ── P1R-15: cleanup must not stomp a dispatch made in the SAME poll ──────────
+# Repro (no failure required): close a PR, then `issue-agent ready N`. The
+# world snapshot then shows issue N as ai-ready (dispatchable) AND its own
+# stale CLOSED PR still carrying ai-pr-open (not yet cleaned up). Before the
+# gate, cleanup_actions unconditionally applied its issue-side arm — assuming
+# the observed issue was still awaiting THIS PR's outcome — deleting the
+# brand-new worktree the fresh dispatch just created, requeuing the issue that
+# just got a new RunAgent, and wiping the session the SAME poll's dispatch
+# path had just recorded.
+def test_cleanup_does_not_stomp_a_fresh_dispatch_in_the_same_poll():
+    stale_pr = pr(50, "ai-pr-open", state="CLOSED", closing_issue=8,
+                  head_ref_name="fix/8-thing")
+    w = world(issues=[issue(8, "ai-ready")], prs=[stale_pr])
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+
+    # the fresh dispatch happened
+    assert Relabel(Target.ISSUE, 8, Label.AI_READY, Label.AI_WORKING) in actions
+    assert RunAgent(AgentKind.RESOLVE, 8) in actions
+
+    # …and cleanup's ISSUE-side arm must NOT fire on top of it
+    assert RemoveWorktree(8) not in actions
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_READY) not in actions
+    assert not any(isinstance(a, ClearIssueState) and a.issue == 8 for a in actions)
+
+    # the PR-side arm (dropping ai-pr-open from the genuinely-dead PR) still
+    # fires — that half of the world really is stale and safe to act on.
+    assert Relabel(Target.PR, 50, Label.AI_PR_OPEN, None) in actions
+    assert any(isinstance(a, ClearIssueState) and a.pr == 50 for a in actions)
+
+
+def test_cleanup_issue_side_arm_still_fires_when_issue_genuinely_awaits_cleanup():
+    # anti-vacuity twin: when the issue in the SAME snapshot still carries
+    # ai-pr-open (the ordinary, non-racing case), the gate must not suppress
+    # the real cleanup — same stale-PR world as above, only the issue's own
+    # label differs.
+    stale_pr = pr(50, "ai-pr-open", state="CLOSED", closing_issue=8,
+                  head_ref_name="fix/8-thing")
+    w = world(issues=[issue(8, "ai-pr-open")], prs=[stale_pr])
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_READY) in actions
+    assert RemoveWorktree(8) in actions
+    assert ClearIssueState(pr=50, issue=8, merged=False) in actions
+
+
+def test_cleanup_actions_direct_call_defaults_to_the_ordinary_case():
+    # cleanup_actions is also called directly (existing tests above all do
+    # this without knowing an issue's current label) — the default must keep
+    # exercising the ordinary "issue genuinely awaits cleanup" path so none of
+    # those pre-existing direct-call tests silently regressed to a no-op.
+    p = pr(100, "ai-pr-open", state="MERGED", head_ref_name="fix/9-x")
+    acts = cleanup_actions(p, 9, CFG)
+    assert RemoveWorktree(9) in acts
+    assert Relabel(Target.ISSUE, 9, Label.AI_PR_OPEN, Label.AI_DONE) in acts

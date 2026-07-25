@@ -2,6 +2,7 @@
 
 from issue_agent.domain.gate import (
     OpenPrLookup,
+    PushGateMode,
     RedFailInputs,
     check_adversarial_verdict,
     check_branch_name,
@@ -18,16 +19,20 @@ from issue_agent.domain.gate import (
     check_pr_base,
     check_pr_body,
     check_push_precondition,
+    check_push_target,
     check_red_fails,
     check_red_is_red,
     check_required_test,
     check_tests,
     check_tests_immutable,
     gate_is_toothless,
+    head_is_detached,
     partition_changed,
-    push_gate_applies,
+    push_gate_mode,
     resolve_open_pr,
+    resolve_push_targets,
     resolve_test_cmd,
+    unverified_push_denial,
 )
 
 
@@ -308,8 +313,22 @@ def test_adversarial_verdict_must_pass():
 
 
 # ── test command resolution + §1 ──────────────────────────────────────────────
-def test_resolve_prefers_harness_cmd():
-    assert resolve_test_cmd("pytest tests/test_x.py", "pytest") == "pytest tests/test_x.py"
+# P1R-18: `check_tests` is the push gate's only real teeth and the GATED AGENT
+# writes `.harness/test-cmd` (under bypassPermissions, with a governor that only
+# inspects git/gh shapes). Preferring that file over the operator's TEST_CMD made
+# `echo true > .harness/test-cmd` a one-line disarm of §1 AND §10.
+def test_p1r_18_operator_test_cmd_wins_over_the_agent_written_marker():
+    assert resolve_test_cmd("true", "make test") == "make test"
+    assert resolve_test_cmd("pytest tests/test_x.py", "pytest") == "pytest"
+
+
+def test_p1r_18_agent_marker_is_still_used_when_the_operator_set_none():
+    """Anti-vacuity twin: the marker is not ignored — it is the whole answer for
+    a repo where the operator has no TEST_CMD (what the discovery path writes it
+    for), and a blank/whitespace operator value does not count as set."""
+    assert resolve_test_cmd("pytest tests/test_x.py", None) == "pytest tests/test_x.py"
+    assert resolve_test_cmd("pytest tests/test_x.py", "") == "pytest tests/test_x.py"
+    assert resolve_test_cmd("pytest tests/test_x.py", "  \n ") == "pytest tests/test_x.py"
 
 
 def test_resolve_falls_back_to_env():
@@ -485,30 +504,103 @@ def test_resolve_open_pr_single_attempt_does_not_sleep():
     assert len(calls) == 1 and slept == []
 
 
-def test_push_denied_when_pr_state_unknown():
+def test_push_denied_when_pr_state_unknown_and_nothing_is_checkable():
     # The fail-open hole: a failed gh lookup used to read as "no PR" and skip the
-    # ENTIRE push gate. An unknown state must block instead.
-    res = check_push_precondition("fix/7-token", OpenPrLookup.ERROR)
+    # ENTIRE push gate. When the state-derived checks cannot run either, there is
+    # nothing left to verify, so an unknown state must block.
+    res = check_push_precondition("fix/7-token", OpenPrLookup.ERROR, checks_runnable=False)
     assert not res.ok
     assert "retry" in res.reason.lower()          # tells the agent what to do next
     assert "fix/7-token" in res.reason
 
 
 def test_push_allowed_when_lookup_succeeds():
-    assert check_push_precondition("fix/7-token", OpenPrLookup.OPEN).ok
-    assert check_push_precondition("fix/7-token", OpenPrLookup.NONE).ok
+    for runnable in (True, False):
+        assert check_push_precondition("fix/7-token", OpenPrLookup.OPEN, runnable).ok
+        assert check_push_precondition("fix/7-token", OpenPrLookup.NONE, runnable).ok
 
 
 def test_push_lookup_error_ignored_on_ungoverned_branch():
     # An ungoverned branch is never gated (the bash exits before it even calls
     # gh), so an unknown PR state there is irrelevant — don't wedge it.
-    assert check_push_precondition("scratch-branch", OpenPrLookup.ERROR).ok
-    assert check_push_precondition("", OpenPrLookup.ERROR).ok
+    assert check_push_precondition("scratch-branch", OpenPrLookup.ERROR, False).ok
+    assert check_push_precondition("", OpenPrLookup.ERROR, False).ok
 
 
-def test_push_gate_enforced_only_for_governed_branch_with_open_pr():
-    assert push_gate_applies("fix/7-token", OpenPrLookup.OPEN) is True
-    assert push_gate_applies("fix/7-token", OpenPrLookup.NONE) is False   # pre-PR push
-    assert push_gate_applies("main", OpenPrLookup.OPEN) is False
-    # ERROR never enforces the shared checks — check_push_precondition denies first.
-    assert push_gate_applies("fix/7-token", OpenPrLookup.ERROR) is False
+# ── P1R-12: the ERROR arm ran the agent's whole leg into the ground ───────────
+# Denying EVERY push on a failed lookup also denied the first, pre-PR push, so
+# `gh pr create` never happened and max_resolve_retries walked a healthy issue to
+# a human. Unknown state now costs a test run, not the leg — while an
+# unknown-state push that FAILS a rule is still denied.
+def test_p1r_12_unknown_pr_state_still_runs_the_state_derived_checks():
+    assert push_gate_mode("fix/7-token", OpenPrLookup.ERROR) is PushGateMode.UNVERIFIED
+
+
+def test_p1r_12_unknown_pr_state_does_not_deny_on_the_precondition_alone():
+    """Anti-vacuity twin: with the checks runnable, ERROR no longer denies by
+    itself — the checks decide, so a CLEAN push during a rate limit goes through."""
+    assert check_push_precondition("fix/7-token", OpenPrLookup.ERROR, checks_runnable=True).ok
+
+
+def test_push_gate_mode_maps_the_tri_state_and_governedness():
+    assert push_gate_mode("fix/7-token", OpenPrLookup.OPEN) is PushGateMode.ENFORCE
+    assert push_gate_mode("fix/7-token", OpenPrLookup.NONE) is PushGateMode.SKIP  # pre-PR
+    assert push_gate_mode("main", OpenPrLookup.OPEN) is PushGateMode.SKIP
+    assert push_gate_mode("main", OpenPrLookup.ERROR) is PushGateMode.SKIP
+
+
+def test_unverified_denial_names_the_rule_and_the_unknown_state():
+    """An unverified denial must not read as 'the gate is offline' — the rule is
+    real and fixing it unblocks the push even while the lookup stays down."""
+    msg = unverified_push_denial("local test suite failed: pytest", "fix/7-token")
+    assert "local test suite failed: pytest" in msg
+    assert "fix/7-token" in msg and "lookup" in msg
+
+
+# ── P1R-10: the gate must key on the ref being WRITTEN, not the checked-out one ──
+def test_p1r_10_no_refspec_falls_back_to_the_checked_out_branch():
+    assert resolve_push_targets((), "fix/42-x") == ("fix/42-x",)
+
+
+def test_p1r_10_explicit_destination_wins_over_the_checked_out_branch():
+    """`git push origin HEAD:other` writes `other`; checking `fix/42-x` was the bug."""
+    assert resolve_push_targets(("other/thing",), "fix/42-x") == ("other/thing",)
+
+
+def test_p1r_10_head_alias_destination_resolves_to_the_checked_out_branch():
+    assert resolve_push_targets(("HEAD",), "fix/42-x") == ("fix/42-x",)
+    assert resolve_push_targets(("@",), "fix/42-x") == ("fix/42-x",)
+
+
+def test_p1r_10_detached_head_with_no_refspec_is_undeterminable():
+    """A conflicted rebase leaves `rev-parse --abbrev-ref HEAD` == 'HEAD'; a
+    failed rev-parse leaves ''. Neither is a branch, so the destination of a
+    refspec-less push is unknown — and unknown denies, it does not skip."""
+    for head in ("HEAD", "", "  "):
+        assert resolve_push_targets((), head) is None
+        assert resolve_push_targets(("HEAD",), head) is None
+        assert not check_push_target(resolve_push_targets((), head)).ok
+
+
+def test_p1r_10_detached_head_with_an_explicit_destination_is_determinable():
+    """Anti-vacuity twin: the deny is about the UNKNOWN destination, not about
+    being detached — naming the ref (what git demands anyway) is the way out."""
+    targets = resolve_push_targets(("fix/42-x",), "HEAD")
+    assert targets == ("fix/42-x",)
+    assert check_push_target(targets).ok
+
+
+def test_p1r_10_detached_head_denial_tells_the_agent_the_way_out():
+    reason = check_push_target(None).reason
+    assert "detached" in reason.lower()
+    assert "HEAD:" in reason  # the exact refspec form that unblocks it
+
+
+def test_p1r_10_multiple_destinations_are_deduped_in_order():
+    assert resolve_push_targets(("a", "b", "a"), "fix/42-x") == ("a", "b")
+
+
+def test_head_is_detached_only_for_non_branch_head_values():
+    assert head_is_detached("HEAD") and head_is_detached("") and head_is_detached(" ")
+    assert not head_is_detached("fix/42-x")
+    assert not head_is_detached("dev")

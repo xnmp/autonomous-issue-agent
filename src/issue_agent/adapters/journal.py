@@ -523,7 +523,7 @@ def events_within(events, seconds: float, now_fn=_now) -> list[dict]:
 
 
 def repeated_dispatch_warning(events, window_s: float, threshold: int) -> str:
-    """Warn when the same (kind, number) was dispatched `threshold`+ times inside
+    """Warn when the same (kind, number) was DISPATCHED `threshold`+ times inside
     any `window_s` span. Returns "" when nothing is looping.
 
     This is the cheap detector for the failure shape that costs the most money:
@@ -536,13 +536,26 @@ def repeated_dispatch_warning(events, window_s: float, threshold: int) -> str:
     Counts STARTS as well as settled runs (review C3): the loop that costs the
     most is the one where the session dies before any result, which used to emit
     no `agent_run` at all and so was invisible here — the detector reported
-    health while the harness burned a session every other poll. A healthy run
-    emits both halves, so a target's dispatch count is max(starts, settleds),
-    never their sum; only the half that is missing (a start with no settlement,
-    or a pre-`agent_run_start` journal) falls back to the other.
+    health while the harness burned a session every other poll.
+
+    **A dispatch, not a leg** (review P1R-4). Every leg of one dispatch carries
+    the `dispatch` id `set_context` mints, so legs collapse to ONE timestamp
+    (the earliest of the group). Counting legs made a single healthy
+    `REVIEW_MODE=multi` review — a gate, five dimension specialists and N
+    validators, 8+ start/settled pairs under one (kind, number) — report
+    "dispatched 8x … likely a non-converging retry loop" on EVERY review. A
+    warning that is always on is a warning that is off, and this is the only
+    operator-visible signal for the process deaths of P0R-4.
+
+    Events with no `dispatch` field (journals written before the id existed)
+    keep the old rule: a target's count is max(starts, settleds), never their
+    sum, since a healthy run emits both halves and only the missing half falls
+    back to the other. The two rules add, so a journal that spans the upgrade
+    counts its old and new events once each.
     """
     if threshold <= 1:
         return ""
+    dispatched: dict[tuple, dict[str, datetime]] = {}
     starts: dict[tuple, list[datetime]] = {}
     settled: dict[tuple, list[datetime]] = {}
     for e in events:
@@ -552,10 +565,21 @@ def repeated_dispatch_warning(events, window_s: float, threshold: int) -> str:
         ts = parse_ts(e.get("ts"))
         if ts is None:
             continue
-        bucket.setdefault((e.get("kind", ""), _int(e.get("number"))), []).append(ts)
+        key = (e.get("kind", ""), _int(e.get("number")))
+        dispatch = str(e.get("dispatch") or "")
+        if not dispatch:
+            bucket.setdefault(key, []).append(ts)
+            continue
+        seen = dispatched.setdefault(key, {})
+        first = seen.get(dispatch)
+        if first is None or ts < first:
+            seen[dispatch] = ts  # a dispatch is stamped when it STARTED
     groups: dict[tuple, list[datetime]] = {
-        key: max(starts.get(key, []), settled.get(key, []), key=len)
-        for key in {**starts, **settled}
+        key: [
+            *dispatched.get(key, {}).values(),
+            *max(starts.get(key, []), settled.get(key, []), key=len),
+        ]
+        for key in {**dispatched, **starts, **settled}
     }
     worst = ""
     for (kind, number), stamps in sorted(groups.items(), key=lambda kv: str(kv[0])):
@@ -569,6 +593,85 @@ def repeated_dispatch_warning(events, window_s: float, threshold: int) -> str:
                 )
                 break
     return worst
+
+
+def spend_blocked_keys(events) -> set[str]:
+    """The `block_key`s a `spend_block` event has ALREADY been emitted for.
+
+    The read half of the spend cap's edge trigger (review P1R-2). A cap is a
+    LEVEL — once an issue is over its lifetime cap it stays over — so the naive
+    "emit on every blocked dispatch" wrote one journal event and ran one
+    `ALERT_CMD` subprocess per poll, ~4,300 a day at POLL_SECONDS=20, which is
+    how a pager gets muted. Deduping through the journal rather than in memory
+    is deliberate: the shape that generates the flood is a wedged daemon under
+    `Restart=always`, and an in-process set is empty again after every restart.
+
+    Events with no `block_key` (written before the field existed) are ignored
+    rather than guessed at — the cost of that is at most one extra alert per
+    key after an upgrade.
+    """
+    return {
+        str(e["block_key"])
+        for e in events
+        if e.get("event") == "spend_block" and e.get("block_key")
+    }
+
+
+# How many settled runs must agree before the ledger is declared blind. Small
+# enough to fire within one poll cycle of a fresh daemon, large enough that a
+# single genuinely-free run (a session that died before billing) is not it.
+COST_BLINDSPOT_MIN_RUNS = 5
+
+
+def cost_blindspot_warning(
+    runs,
+    *,
+    issue_spend_cap_usd: float,
+    daily_spend_cap_usd: float,
+    min_runs: int = COST_BLINDSPOT_MIN_RUNS,
+) -> str | None:
+    """The ONE loud line for a spend cap that cannot see a single dollar
+    (review P1R-5). `runs` is the settled `agent_run` events; returns None
+    (silence) when no cap is armed, when there is not enough evidence yet, or
+    when any run DID record a cost — there is then nothing to mislead about.
+
+    `JournalingRuntime._record` writes a ledger line only when `cost > 0`, and
+    that is the right call (a $0.00 line is noise in the file both caps scan on
+    every dispatch). The consequence is what needed saying out loud: a
+    subscription-plan Claude gateway reports $0.00 for every run and an
+    un-priced Codex reports nothing at all, so the ledger stays EMPTY, both caps
+    read $0.00 forever, and neither can fire for any loop shape. The D2
+    acceptance ("the wall cap and the infra ceiling bound it") does not cover
+    it: the wall cap bounds one session's LENGTH, not the number of sessions.
+
+    Sibling of `codex_cost_blindspot_warning`, which announces the same blind
+    spot for the one cause it can detect at startup (missing codex prices); this
+    one is evidence-based and catches every cause, including the plan.
+    """
+    if issue_spend_cap_usd <= 0 and daily_spend_cap_usd <= 0:
+        return None
+    runs = list(runs)
+    if len(runs) < max(1, min_runs):
+        return None
+    if any(_cost(r) > 0 for r in runs):
+        return None
+    caps = ", ".join(
+        part
+        for part in (
+            f"issue=${issue_spend_cap_usd:.2f}" if issue_spend_cap_usd > 0 else "",
+            f"daily=${daily_spend_cap_usd:.2f}" if daily_spend_cap_usd > 0 else "",
+        )
+        if part
+    )
+    return (
+        f"spend: WARNING — spend caps are armed ({caps}) but the last "
+        f"{len(runs)} agent runs all recorded $0.00, so NOTHING reaches the "
+        "spend ledger and NEITHER cap can ever fire. A subscription-plan Claude "
+        "gateway reports no per-run cost, and codex reports none unless "
+        "CODEX_COST_PER_MTOK_IN/OUT are set. Until a run records a cost, the "
+        "only bounds on this harness's spend are the wall cap (one session's "
+        "length) and the retry/infra ceilings (a loop's length) — not dollars."
+    )
 
 
 def _cost(event: dict) -> float:
@@ -586,10 +689,12 @@ def _int(value) -> int | None:
 
 
 __all__ = [
+    "COST_BLINDSPOT_MIN_RUNS",
     "Journal",
     "JournalingRuntime",
     "RunContext",
     "alert",
+    "cost_blindspot_warning",
     "death_key",
     "default_ledger_path",
     "event_line",
@@ -599,6 +704,7 @@ __all__ = [
     "read_events_tail",
     "recent_runs",
     "repeated_dispatch_warning",
+    "spend_blocked_keys",
     "sum_issue",
     "sum_today",
     "unsettled_starts",

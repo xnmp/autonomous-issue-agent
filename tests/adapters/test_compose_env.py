@@ -540,7 +540,9 @@ def test_build_role_does_not_reload_env_when_already_provided(monkeypatch):
 
     monkeypatch.setattr(main_module, "_load_agent_env", _must_not_be_called)
 
-    daemon = main_module.build_role("fix", {"REPO": "o/r"})
+    # FIX_BOT is required as of review P1R-7 (an unset one made every
+    # unresolvable PR author read as ours), so a config built here must carry it.
+    daemon = main_module.build_role("fix", {"REPO": "o/r", "FIX_BOT": "fix-bot"})
     assert daemon is not None
 
 
@@ -557,6 +559,7 @@ def test_build_role_self_loads_env_when_called_standalone_without_one(monkeypatc
 
     monkeypatch.setattr(main_module, "_load_agent_env", _counting)
     monkeypatch.setenv("REPO", "o/r")
+    monkeypatch.setenv("FIX_BOT", "fix-bot")  # required since review P1R-7
     monkeypatch.delenv("AGENT_ENV", raising=False)
 
     daemon = main_module.build_role("fix")

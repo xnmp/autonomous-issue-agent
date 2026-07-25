@@ -766,3 +766,57 @@ def test_the_steward_suppression_is_per_issue(tmp_path, monkeypatch):
     ))
 
     assert decide(world) == [RunAgent(AgentKind.TRIAGE, 31)]
+
+
+# ── infra-death key split (review P1R-1) ───────────────────────────────────────
+def test_infra_deaths_written_under_the_orphan_key_still_reach_the_ceiling(tmp_path):
+    """review P1R-1. When the dispatcher's pre-handler `issue_for_pr` lookup
+    RAISES, the death is recorded under `-pr` while the decide side asks for
+    `breaker_key(pr)` (the linked issue). The flakiness that drops a session is
+    the same flakiness that fails that lookup, so before this the counts split
+    across two keys and the ceiling never tripped — the breaker failed exactly
+    when it was needed. `_fix_state` now folds the orphan half back in."""
+    store = Store(str(tmp_path))
+    pr = _ci_pr(5)  # breaker_key == 5 (its closing issue)
+    w = WorldState(prs=(pr,))
+    cap = 5
+
+    # Deaths split: 3 landed under the resolved issue, 2 under the orphan key.
+    for _ in range(3):
+        store.bump_infra_deaths(5)
+    for _ in range(2):
+        store.bump_infra_deaths(-100)
+
+    state = _fix_state(store, w)
+    assert state.infra_deaths[breaker_key(pr)] == cap, "both halves must be summed"
+
+    cfg = _cfg(max_infra_deaths=cap)
+    actions = decide_fix(w, cfg, state, fixer_busy=False)
+    assert not _has_run(actions, AgentKind.FIX_CI), "at the ceiling: no paid dispatch"
+
+
+def test_the_orphan_key_is_not_double_counted_for_an_issueless_pr(tmp_path):
+    """Anti-vacuity twin: for an ISSUELESS PR `breaker_key(pr)` IS `-pr`, so
+    summing both would count every death twice and escalate at half the cap."""
+    store = Store(str(tmp_path))
+    pr = PRView(
+        100, head_ref_name="chore/no-issue-here", closing_issue=None,
+        checks=(Check("unit", bucket="fail"),),
+        labels=frozenset({Label.AI_PR_OPEN}), author=FIX_BOT,
+    )
+    w = WorldState(prs=(pr,))
+    assert breaker_key(pr) == -100, "fixture must exercise the coinciding-key case"
+
+    for _ in range(3):
+        store.bump_infra_deaths(-100)
+
+    state = _fix_state(store, w)
+    assert state.infra_deaths[-100] == 3, "3 deaths must read as 3, not 6"
+
+    # Anti-vacuity on the sum itself: one more death reads as 4, not 8 — i.e.
+    # the count tracks reality rather than being frozen. (This PR escalates for
+    # a DIFFERENT, pre-existing reason — decide_fix escalates any issueless PR
+    # needing work — so asserting on dispatch here would test that rule, not
+    # this one.)
+    store.bump_infra_deaths(-100)
+    assert _fix_state(store, w).infra_deaths[-100] == 4

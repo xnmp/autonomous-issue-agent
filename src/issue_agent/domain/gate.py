@@ -406,9 +406,26 @@ def check_adversarial_verdict(verdict: str) -> GateResult:
 
 # ── test command resolution (_pr_common.sh:prc_resolve_test_cmd) ──────────────
 def resolve_test_cmd(harness_test_cmd: str | None, env_test_cmd: str | None) -> str:
-    """Prefer the agent-declared per-PR command (.harness/test-cmd), else
-    $TEST_CMD. Strips blanks; returns '' when neither is set."""
-    for candidate in (harness_test_cmd, env_test_cmd):
+    """Prefer the OPERATOR's $TEST_CMD; fall back to the agent-declared
+    `.harness/test-cmd` only when the operator set none. Strips blanks; returns
+    '' when neither is set.
+
+    The precedence used to be the other way round, and that made the gate
+    self-defeating (P1R-18): `check_tests` is the push gate's only real teeth,
+    the gated agent WRITES `.harness/test-cmd`, and it runs under
+    bypassPermissions — so `echo true > .harness/test-cmd` disarmed §1 and §10
+    (the anti-tautological-test check) in one line, without tripping any bypass
+    detection, because the governor only inspects git/gh shapes.
+
+    The old order was not accidental: AGENT.md asks the agent to declare a
+    *scoped* command so the gate's revert-and-rerun is fast and hits the changed
+    package in a monorepo. That intent survives — the marker is still the whole
+    answer for a repo where the operator has no TEST_CMD (the test-discovery
+    path that writes it exists for exactly those), and a scoped command a subject
+    can forge is not a safety property to begin with. Where an operator command
+    exists it is the authority; the cost is a slower gate run, which is the right
+    trade against a one-line disarm."""
+    for candidate in (env_test_cmd, harness_test_cmd):
         if candidate:
             first = next(
                 (ln for ln in candidate.replace("\r", "").splitlines() if ln.strip()),
@@ -498,29 +515,150 @@ def resolve_open_pr(
     return result
 
 
-def check_push_precondition(branch: str, lookup: OpenPrLookup) -> GateResult:
-    """DENY a push whose PR state could not be determined. Only governed branches
-    are gated at all (an ungoverned branch never even calls gh in the bash), so a
-    lookup error there is irrelevant. A blocked push is recoverable — the agent
-    retries — while an ungated push is not, so the unknown state loses."""
+class PushGateMode(Enum):
+    """What the push gate does for one destination branch.
+
+    * SKIP — ungoverned branch, or governed with NO open PR: the pre-PR TDD
+      phase stays free and the create gate enforces later.
+    * ENFORCE — governed + a confirmed open PR: the state-derived checks run and
+      a denial is a real rule violation.
+    * UNVERIFIED — governed, PR state UNKNOWN (the gh lookup failed even after a
+      retry). The checks run ANYWAY and a clean push is allowed.
+
+    UNVERIFIED exists because the previous policy (deny every push on ERROR) had
+    a failure mode worse than the one it closed: during a GitHub rate limit it
+    also denied the FIRST, pre-PR push, so `gh pr create` never happened and the
+    resolve-retry counter walked a healthy issue to a human (P1R-12). Running
+    the checks costs the agent a test run; denying the leg costs the issue. The
+    property that matters is still fail-closed: an unknown-state push that FAILS
+    any rule is denied, exactly as if the PR were known to be open."""
+
+    SKIP = "skip"
+    ENFORCE = "enforce"
+    UNVERIFIED = "unverified"
+
+
+def push_gate_mode(branch: str, lookup: OpenPrLookup) -> PushGateMode:
+    """Tri-state lookup + governed-ness → what the gate does. Pure."""
+    if not is_governed_branch(branch):
+        return PushGateMode.SKIP
+    if lookup is OpenPrLookup.OPEN:
+        return PushGateMode.ENFORCE
+    if lookup is OpenPrLookup.ERROR:
+        return PushGateMode.UNVERIFIED
+    return PushGateMode.SKIP
+
+
+def check_push_precondition(
+    branch: str, lookup: OpenPrLookup, checks_runnable: bool
+) -> GateResult:
+    """DENY a push whose PR state could not be determined AND whose state-derived
+    checks cannot be run either — nothing at all would be verified, so the
+    unknown state loses (a blocked push is recoverable; an ungated push is not).
+
+    `checks_runnable` is a REQUIRED argument, not a defaulted one: the whole bug
+    class this guard sits in is "the permissive value was the default and nobody
+    populated it" (the original `has_open_pr: bool = False`). A caller that
+    cannot say whether it will run the checks has to decide, in the open.
+
+    Only governed branches are gated at all (an ungoverned branch never even
+    calls gh in the bash), so a lookup error there is irrelevant."""
     if not is_governed_branch(branch):
         return ALLOW
-    if lookup is OpenPrLookup.ERROR:
+    if lookup is OpenPrLookup.ERROR and not checks_runnable:
         return deny(
             f"could not verify PR state for branch '{branch}' — the open-PR lookup "
-            "failed (gh/network/auth error) even after a retry. The push gate needs to "
-            "know whether an open PR exists, so it fails CLOSED rather than letting an "
-            "unverified push through. Check connectivity and 'gh auth status', then "
+            "failed (gh/network/auth error) even after a retry, and the state-derived "
+            "checks cannot run here either (the base ref does not resolve), so nothing "
+            "about this push would be verified. It fails CLOSED rather than going "
+            "through unchecked. Check connectivity and 'gh auth status', then "
             "retry the push shortly."
         )
     return ALLOW
 
 
-def push_gate_applies(branch: str, lookup: OpenPrLookup) -> bool:
-    """The state-derived push checks run ONLY for a governed branch with a
-    confirmed open PR (pre-PR pushes stay free; the create gate enforces later).
-    ERROR never reaches here — `check_push_precondition` denies first."""
-    return is_governed_branch(branch) and lookup is OpenPrLookup.OPEN
+def unverified_push_denial(reason: str, branch: str) -> str:
+    """Annotate a push denial that was reached with the PR state UNKNOWN, so the
+    agent does not read it as "the gate is broken/offline": the rule it failed is
+    a real one, and fixing it makes the push go through even while the lookup is
+    still failing."""
+    return (
+        f"{reason} (the open-PR lookup for '{branch}' failed, so the gate ran its "
+        "state-derived checks regardless of PR state — fix the above and the push is "
+        "allowed even while the lookup is down)"
+    )
+
+
+# ── which branch(es) a push actually writes (P1R-10) ─────────────────────────
+# `git rev-parse --abbrev-ref HEAD` returns the literal string "HEAD" on a
+# detached HEAD — which is exactly the state a CONFLICTED REBASE leaves the
+# worktree in, i.e. the one leg whose prompt tells the agent to force-push. An
+# empty string means the rev-parse itself failed. Neither is a branch name.
+_DETACHED_HEAD_NAMES = ("", "HEAD")
+# Refspec destinations that mean "whatever branch is checked out".
+_HEAD_ALIASES = ("HEAD", "@")
+
+
+def head_is_detached(head_branch: str) -> bool:
+    return (head_branch or "").strip() in _DETACHED_HEAD_NAMES
+
+
+def resolve_push_targets(
+    explicit_destinations: Iterable[str], head_branch: str
+) -> tuple[str, ...] | None:
+    """The branch(es) a push writes → what the gate must key on.
+
+    `explicit_destinations` are the refspec destinations parsed out of the argv
+    (`governor_policy.push_destination_refs`); `head_branch` is the worktree's
+    checked-out branch. Returns the resolved destinations, or **None** when the
+    destination cannot be determined at all.
+
+    The gate used to key on `head_branch` unconditionally, which is wrong three
+    ways (P1R-10): `git push origin HEAD:other-branch` was checked against the
+    wrong branch; a push from a detached HEAD read as "ungoverned" and skipped
+    the gate entirely on the rebase leg; and the pushed ref is the thing an open
+    PR is attached to, not the thing that happens to be checked out. Keying on
+    the DESTINATION is also what makes the gate's scope honest: a push to a ref
+    no PR points at cannot update a PR, so it is not this gate's business.
+
+    A bare `HEAD`/`@` destination (`git push origin HEAD`) means the current
+    branch, so it resolves to `head_branch` — and is undeterminable when HEAD is
+    detached, same as having no refspec at all."""
+    resolved: list[str] = []
+    for dst in explicit_destinations:
+        if dst in _HEAD_ALIASES:
+            if head_is_detached(head_branch):
+                return None
+            resolved.append(head_branch)
+        elif dst:
+            resolved.append(dst)
+    if resolved:
+        return tuple(dict.fromkeys(resolved))
+    if head_is_detached(head_branch):
+        return None
+    return (head_branch,)
+
+
+def check_push_target(targets: tuple[str, ...] | None) -> GateResult:
+    """DENY a push whose destination the gate could not determine — a detached
+    HEAD (mid-rebase, mid-bisect, or a failed rev-parse) with no explicit
+    refspec. The gate cannot tell whether the destination is governed, so it
+    cannot tell whether to enforce; skipping is the silent bypass this rule
+    exists to close, and denying costs one turn plus a one-line instruction.
+
+    Note the deny is nearly free in practice: `git push` with no refspec on a
+    detached HEAD is an error in git itself ("You are not currently on a
+    branch"). The agent's way out is the same refspec git would demand."""
+    if targets is not None:
+        return ALLOW
+    return deny(
+        "cannot determine which branch this push writes: HEAD is detached (a "
+        "conflicted rebase, a bisect, or a failed rev-parse) and the command names "
+        "no refspec, so the gate cannot tell whether the destination is a governed "
+        "branch. Name the destination explicitly — e.g. "
+        "'git push --force-with-lease origin HEAD:<your-branch>' — or finish/abort "
+        "the rebase first ('git rebase --continue' / '--abort')."
+    )
 
 
 def check_red_is_red(

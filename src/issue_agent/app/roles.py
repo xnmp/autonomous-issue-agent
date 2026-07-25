@@ -127,11 +127,30 @@ def _fix_state(store: Store, world) -> FixState:
     # knowing about the other (review P0R-4). A raise-path death is in the store
     # counter AND has a settled `transport_death` line, so `unsettled_starts`
     # nets it to zero and it is counted exactly once.
+    #
+    # A PR's entry SUMS both key spaces (review P1R-1, matching `_review_state`).
+    # When the dispatcher's pre-handler `issue_for_pr` lookup fails — and the
+    # network flakiness that drops a session is exactly the flakiness that fails
+    # that lookup — the death lands under `-pr` while the decide side asks for
+    # `breaker_key(pr)`, splitting one loop across two counters so the ceiling
+    # never trips. Summing folds the orphaned half back into the key the domain
+    # actually reads. `alt` is skipped when it IS the breaker key (an issueless
+    # PR, where breaker_key already == -pr), so nothing is counted twice.
     deaths = _process_deaths(store)
-    infra_deaths = {
-        k: store.get_infra_deaths(k) + deaths.get(k, 0)
-        for k in keys | {i.number for i in world.issues}
-    }
+
+    def _infra_for_pr(p) -> int:
+        k = breaker_key(p)
+        alt = -p.number
+        total = store.get_infra_deaths(k) + deaths.get(k, 0)
+        if alt != k:
+            total += store.get_infra_deaths(alt) + deaths.get(alt, 0)
+        return total
+
+    infra_deaths = {breaker_key(p): _infra_for_pr(p) for p in world.prs}
+    for i in world.issues:
+        infra_deaths.setdefault(
+            i.number, store.get_infra_deaths(i.number) + deaths.get(i.number, 0)
+        )
     return FixState(
         sessions=sessions, resumed_at=resumed, automerge_enabled=automerge,
         ci_retries=ci_retries, review_retries=review_retries,

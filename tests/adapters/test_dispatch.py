@@ -188,6 +188,9 @@ class FakeStore:
         self.infra_deaths[key] = self.infra_deaths.get(key, 0) + 1
         return self.infra_deaths[key]
 
+    def clear_infra_deaths(self, key):
+        self.infra_deaths.pop(key, None)
+
 
 class FakeWorktrees:
     def __init__(self):
@@ -555,6 +558,154 @@ def test_pre_result_death_on_an_issueless_pr_uses_the_negated_pr_key(tmp_path):
         asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
 
     assert store.get_infra_deaths(-100) == 1
+
+
+# ── review P1R-1: a flaky issue lookup must not relocate the counter ──────────
+# The trap is the COUPLING: the flakiness that kills sessions is the flakiness
+# that fails `gateway.issue_for_pr`, so the old catch-everything→None→`-pr`
+# fallback moved the infra-death counter into a key space the fix role's decide
+# side never reads — the ceiling failed exactly when it was needed.
+class FlakyIssueLookup(FakeGateway):
+    """`issue_for_pr` raises on the listed call numbers (1-based); `always`
+    raises on every call. Counts its calls so a test can pin the retry."""
+
+    def __init__(self, prs, issue, fail_calls=(), always=False):
+        super().__init__(prs=prs)
+        self._issue = issue
+        self._fail_calls = set(fail_calls)
+        self._always = always
+        self.lookups = 0
+
+    def issue_for_pr(self, pr):
+        self.lookups += 1
+        if self._always or self.lookups in self._fail_calls:
+            raise GhUnavailable("network", "issue_for_pr timed out (test-injected)")
+        return self._issue
+
+
+def _review_pr():
+    return PRView(100, head_ref_name="fix/5-x", closing_issue=5)
+
+
+def test_a_death_whose_issue_lookup_failed_retries_before_changing_key_space(tmp_path):
+    """The transient that fails the pre-handler lookup is frequently over by the
+    time the exception unwinds, and one extra gh call on a path that just burned
+    a whole session is free. Without the retry this death lands on -100, which
+    `_fix_state` never reads."""
+    store = Store(state_dir=str(tmp_path))
+    gw = FlakyIssueLookup(prs={100: _review_pr()}, issue=5, fail_calls={1})
+    d = _dispatcher(gw, store, RaisingRunner())
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
+
+    assert gw.lookups == 2, "the lookup was retried on the death path"
+    assert store.get_infra_deaths(5) == 1
+    assert store.get_infra_deaths(-100) == 0
+
+
+def test_a_permanently_flaky_lookup_reuses_the_issue_this_process_resolved(tmp_path):
+    """The review's repro: six paid deaths on one PR while the gateway is sick.
+    All six must land under ONE key the decide side reads — the last issue this
+    process successfully resolved for that PR — not split across two key spaces
+    where neither half reaches the ceiling."""
+    store = Store(state_dir=str(tmp_path))
+    gw = FlakyIssueLookup(prs={100: _review_pr()}, issue=5, fail_calls=set(range(2, 99)))
+    d = _dispatcher(gw, store, RaisingRunner())
+
+    for _ in range(6):
+        with pytest.raises(RuntimeError):
+            asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
+
+    assert store.get_infra_deaths(5) == 6, "one key, six deaths"
+    assert store.get_infra_deaths(-100) == 0
+
+
+def test_a_lookup_that_never_answers_falls_back_loudly_to_the_negated_key(tmp_path):
+    """When neither attempt answers and this process has never resolved the PR,
+    `-pr` is all there is — but the operator must be told, because the fix
+    role's `_fix_state` reads `breaker_key(pr)` and may not see it."""
+    store = Store(state_dir=str(tmp_path))
+    logged: list[str] = []
+    gw = FlakyIssueLookup(prs={100: _review_pr()}, issue=5, always=True)
+    cfg = DispatchConfig(review=ReviewTaskConfig("o/r"), log=logged.append)
+    d = AgentDispatcher(cfg, gw, store, None, RaisingRunner(), Executor(gw))
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
+
+    assert store.get_infra_deaths(-100) == 1
+    assert any("could not be resolved on either attempt" in m for m in logged)
+    assert any("could not resolve issue for PR #100" in m for m in logged)
+
+
+def test_a_clean_none_is_still_a_genuinely_issueless_pr(tmp_path):
+    """Anti-vacuity twin: a lookup that ANSWERS None is a fact, not an outage.
+    `-pr` is exactly `breaker_key`'s convention for it, and treating that as
+    unknown would strand every Jira-keyed PR's counter."""
+    store = Store(state_dir=str(tmp_path))
+    gw = FakeGateway(prs={100: PRView(100, head_ref_name="feat/ACME-2468-x")})
+    d = _dispatcher(gw, store, RaisingRunner())
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
+
+    assert store.get_infra_deaths(-100) == 1
+
+
+# ── review P1R-3: an operator stopping the daemon is not an infra death ───────
+class InterruptingRunner:
+    def __init__(self, exc):
+        self.exc = exc
+        self.tasks = []
+
+    async def run(self, task):
+        self.tasks.append(task)
+        raise self.exc
+
+
+@pytest.mark.parametrize(
+    "exc", [KeyboardInterrupt(), SystemExit(0), asyncio.CancelledError()],
+    ids=["ctrl-c", "sys.exit", "cancelled"],
+)
+def test_stopping_the_daemon_burns_no_infra_death_life(tmp_path, exc):
+    """review P1R-3. `issue-agent start` runs in the FOREGROUND and Ctrl-C is
+    the documented way to stop it, so counting these meant five ordinary stops
+    escalated a healthy issue to needs-human-review — while a SIGTERM (systemd's
+    stop signal, which raises nothing) counted zero. CancelledError is in the
+    list because `asyncio.run` turns a Ctrl-C at an await point into exactly
+    that before it re-raises KeyboardInterrupt to the caller."""
+    store = Store(state_dir=str(tmp_path))
+    d = _dispatcher(_resolve_gateway(), store, InterruptingRunner(exc))
+
+    with pytest.raises(type(exc)):
+        asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
+
+    assert store.get_infra_deaths(5) == 0
+
+
+def test_five_operator_stops_do_not_escalate_a_healthy_issue(tmp_path):
+    """The repro, at the ceiling: five Ctrl-Cs used to be five 'deaths'."""
+    store = Store(state_dir=str(tmp_path))
+    d = _dispatcher(_resolve_gateway(), store, InterruptingRunner(KeyboardInterrupt()))
+
+    for _ in range(5):
+        with pytest.raises(KeyboardInterrupt):
+            asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
+
+    assert store.get_infra_deaths(5) == 0
+
+
+def test_an_ordinary_exception_is_still_counted(tmp_path):
+    """Anti-vacuity twin: exempting the interrupt family must not exempt the
+    transport death the counter exists for."""
+    store = Store(state_dir=str(tmp_path))
+    d = _dispatcher(_resolve_gateway(), store, InterruptingRunner(RuntimeError("stream gone")))
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
+
+    assert store.get_infra_deaths(5) == 1
 
 
 def test_a_counter_write_failure_does_not_replace_the_original_death():

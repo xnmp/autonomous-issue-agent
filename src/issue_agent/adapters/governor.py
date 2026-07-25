@@ -54,7 +54,11 @@ class GateContext:
     #     the SDK path. The default is therefore ERROR — "nobody told me" is an
     #     unknown, and an unknown fails closed; a builder that forgets to wire
     #     the probe now denies loudly instead of disabling the gate silently.
-    open_pr: Callable[[], gate.OpenPrLookup] = lambda: gate.OpenPrLookup.ERROR
+    #
+    # It takes the DESTINATION BRANCH as its argument, not zero args: the branch
+    # a push writes is derived from the push argv (P1R-10), so the branch the
+    # question is about is only known at gate time, never at context-build time.
+    open_pr: Callable[[str], gate.OpenPrLookup] = lambda _branch: gate.OpenPrLookup.ERROR
     # Delay between the probe's two attempts (`resolve_open_pr`). The retry
     # POLICY is pure/domain; the actual sleeping is the adapter's business, so it
     # is injected and defaults to a no-op (tests never wait).
@@ -159,30 +163,38 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
     return []
 
 
-def _push_gate(ctx: GateContext) -> list[str]:
-    """Push gate (check-push.sh): only when a governed branch HAS an open PR.
+def _push_gate_for_branch(branch: str, ctx: GateContext) -> list[str]:
+    """The push gate (check-push.sh) for ONE destination branch.
 
     The open-PR lookup is resolved HERE — this is the only place that pays for
     the `gh` round-trip, because it is the only place whose decision depends on
     it (review known-gap-2: the context is rebuilt per Bash call, so an eager
-    probe would put a GitHub call behind every command the agent runs).
+    probe would put a GitHub call behind every command the agent runs). It is
+    asked about `branch` — the ref being WRITTEN — because that is the ref a PR
+    is attached to.
 
-    Order matters and mirrors check-push.sh:
-      1. ungoverned branch → not our business, and never call gh;
+    Order:
+      1. ungoverned destination → not our business, and never call gh;
       2. resolve the lookup (retry once — a transient blip is the common case);
-      3. an UNKNOWN state fails CLOSED (`check_push_precondition`): a denied push
-         costs the agent a turn, an ungated push to an open PR costs the gate;
-      4. only a CONFIRMED open PR arms the state-derived checks — a pre-PR push
-         stays free (the create gate enforces those later).
+      3. mode: ENFORCE (open PR) / UNVERIFIED (lookup failed) both run the
+         state-derived checks; SKIP (no PR) leaves the pre-PR TDD phase free;
+      4. UNVERIFIED with nothing checkable at all (unresolvable base) fails
+         CLOSED via `check_push_precondition`; a UNVERIFIED denial is annotated
+         so the agent knows the rule it failed is real.
     """
-    if not is_governed_branch(ctx.branch):
+    if not is_governed_branch(branch):
         return []
-    lookup = gate.resolve_open_pr(ctx.open_pr, sleep=ctx.open_pr_retry_sleep)
-    precondition = gate.check_push_precondition(ctx.branch, lookup)
+    lookup = gate.resolve_open_pr(
+        lambda: ctx.open_pr(branch), sleep=ctx.open_pr_retry_sleep
+    )
+    mode = gate.push_gate_mode(branch, lookup)
+    if mode is gate.PushGateMode.SKIP:
+        return []
+    precondition = gate.check_push_precondition(
+        branch, lookup, checks_runnable=ctx.base_resolvable
+    )
     if not precondition.ok:
         return [precondition.reason]
-    if not gate.push_gate_applies(ctx.branch, lookup):
-        return []
     if not ctx.base_resolvable:
         return []
     reasons: list[str] = []
@@ -196,7 +208,38 @@ def _push_gate(ctx: GateContext) -> list[str]:
     chk(gate.check_commit_log(ctx.branch_subjects))
     chk(gate.check_no_evidence(ctx.changed_files))
     chk(gate.check_tests_immutable(ctx.changed_files, ctx.exists_at_base))
+    if reasons and mode is gate.PushGateMode.UNVERIFIED:
+        return [gate.unverified_push_denial(reasons[0], branch)]
     return reasons
+
+
+def _push_gate(push_argv: list[str], ctx: GateContext) -> list[str]:
+    """Push gate, keyed on the branch(es) the push actually WRITES.
+
+    It used to key on `ctx.branch` (the worktree's checked-out branch) for every
+    push, which is not the ref being written (P1R-10). The destinations come from
+    the same AST parse the protected-branch guard uses
+    (`governor_policy.push_destination_refs`); resolving them against the
+    checked-out branch — including the "detached HEAD, no refspec ⇒ unknown"
+    verdict — is pure policy and lives in the domain.
+
+    KNOWN BOUND (unchanged here): `git -C /other/worktree push` is still checked
+    against THIS worktree's facts (subjects/diff/markers), because the context is
+    built once from the hook's cwd. The destination is now right; the state it is
+    checked against can still be the wrong worktree's. Likewise `sh -c 'git push
+    …'` classifies as nothing and never reaches this gate at all (M9/R3-F8)."""
+    targets = gate.resolve_push_targets(
+        governor_policy.push_destination_refs(push_argv), ctx.branch
+    )
+    known = gate.check_push_target(targets)
+    if not known.ok:
+        return [known.reason]
+    assert targets is not None  # check_push_target denies exactly the None case
+    for branch in targets:
+        reasons = _push_gate_for_branch(branch, ctx)
+        if reasons:
+            return reasons
+    return []
 
 
 @dataclass(frozen=True)
@@ -245,7 +288,7 @@ def evaluate_command(command: str, ctx: GateContext) -> Verdict:
             if reasons:
                 return Verdict(False, f"PR blocked: {reasons[0]}")
         elif g.kind == "git-push":
-            reasons = _push_gate(ctx)
+            reasons = _push_gate(list(g.checker_args), ctx)
             if reasons:
                 return Verdict(False, f"Push blocked: {reasons[0]}")
         # git-config: bypass-only (handled above).
@@ -413,7 +456,25 @@ def make_pretooluse_hook(
             command = tool_input.get("command", "")
             if not command:
                 return {}
-            cwd = input_data.get("cwd", "") or os.getcwd()
+            # A MISSING cwd must DENY, never fall back to os.getcwd() (P1R-17).
+            # The daemon's own cwd is TARGET_DIR, checked out on dev/main — an
+            # ungoverned branch — so building the context from it silently
+            # disables the push gate (and every other worktree-derived rule)
+            # instead of failing. `cwd` is a required field of the SDK's
+            # PreToolUse hook input, so this arm is unreachable in a healthy
+            # session; if it ever fires, the gate has lost its subject and the
+            # only honest verdict is "I cannot check this".
+            cwd = input_data.get("cwd", "") or ""
+            if not cwd:
+                if debug:
+                    log(f"gate: DENY (no cwd in hook input) {_cmd_head(command)}")
+                return _deny(
+                    "the gate could not determine this command's working directory "
+                    "(no `cwd` in the hook input), so it cannot read the worktree it "
+                    "is supposed to check. Refusing rather than checking the wrong "
+                    "directory — retry the command; if it persists, this is a harness "
+                    "bug to report, not something to work around."
+                )
             ctx = build_ctx(cwd)
             verdict = evaluate_command(command, ctx)
         except Exception as exc:

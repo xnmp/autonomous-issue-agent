@@ -7,9 +7,12 @@ records argv and returns canned JSON (no network, no real gh)."""
 import json
 
 from issue_agent.adapters.github import (
+    _FAILED_LOG_BYTES,
     _FAILED_LOG_LINES,
     _INLINE_COMMENT_LIMIT,
     _LIST_LIMIT,
+    _REVIEW_COMMENT_BODY_BYTES,
+    _REVIEW_COMMENTS_TOTAL_BYTES,
     GitHubGateway,
     Identity,
     MissingListLimit,
@@ -1112,3 +1115,65 @@ def test_failed_run_log_does_not_swallow_a_programmer_error():
     gw = GitHubGateway("o/r", runner=_raising_runner(MissingListLimit("no --limit")))
     with pytest.raises(MissingListLimit):
         gw.failed_run_log(100, branch="b")
+
+
+# ── P1R-13: `tail -150` bounds LINE count, not bytes ──────────────────────────
+def test_failed_run_log_bounds_by_bytes_not_just_lines():
+    """Repro: a log whose lines are individually enormous (a minified bundle,
+    a base64 blob, a per-line JSON dump) sails straight through the 150-LINE
+    cap — measured, a 200MB CI log's last 150 lines was still a
+    150,001,711-char prompt. ONE 5MB line (well within the 150-line cap) is
+    enough to demonstrate the byte ceiling holds independently."""
+    huge_line = "x" * 5_000_000
+    fr = FakeRunner({"run list": [{"databaseId": 1}], "run view 1": huge_line})
+    gw = GitHubGateway("o/r", runner=fr)
+    out = gw.failed_run_log(100, branch="b")
+    assert len(out.encode("utf-8")) <= _FAILED_LOG_BYTES
+    assert out  # anti-vacuity: real (truncated) content survives, not wiped to ""
+
+
+def test_failed_run_log_under_the_byte_cap_is_untouched():
+    # anti-vacuity twin: a normal, small log is NOT truncated by the new cap —
+    # the byte ceiling only bites the pathological case.
+    log = "\n".join(f"line {i}" for i in range(1, 301))
+    fr = FakeRunner({"run list": [{"databaseId": 1}], "run view 1": log})
+    gw = GitHubGateway("o/r", runner=fr)
+    out = gw.failed_run_log(100, branch="b")
+    assert out.splitlines() == [f"line {i}" for i in range(301 - _FAILED_LOG_LINES, 301)]
+    assert len(out.encode("utf-8")) < _FAILED_LOG_BYTES
+
+
+def test_format_review_comments_bounds_pathological_comment_bytes():
+    """P1R-13 repro: an inline review comment is writable by ANY user with
+    read access to the repo (not just the PR author) — 10 x 500KB comments is
+    otherwise a ~4MB prompt slipping through the OLD item-count-only cap."""
+    huge = "A" * 500_000
+    raw = [
+        {"path": f"f{n}.py", "line": n, "user": {"login": "rev"}, "body": huge,
+         "created_at": f"t{n:02d}"}
+        for n in range(1, 11)
+    ]
+    out = format_review_comments(raw)
+    assert len(out.encode("utf-8")) <= _REVIEW_COMMENTS_TOTAL_BYTES
+    assert out  # anti-vacuity: not wiped to "", just bounded
+
+
+def test_format_review_comments_per_comment_cap_applies_even_under_the_item_limit():
+    # anti-vacuity twin: a SINGLE oversized comment (well under the 8-item
+    # count limit) must still be capped by the per-comment byte ceiling, not
+    # just the overall-block ceiling kicking in once several are combined.
+    huge = "B" * 100_000
+    raw = [{"path": "a.py", "line": 1, "user": {"login": "rev"}, "body": huge,
+            "created_at": "t1"}]
+    out = format_review_comments(raw)
+    assert len(out.encode("utf-8")) <= _REVIEW_COMMENT_BODY_BYTES + 20  # + "path:line (author): " prefix
+    assert out.startswith("a.py:1 (rev): B")
+
+
+def test_format_review_comments_small_bodies_are_unaffected_by_the_cap():
+    # anti-vacuity twin for the ordinary case (already covered above, restated
+    # explicitly against the new byte constants so a regression that shrinks
+    # them below a real comment's size is caught here too).
+    raw = [{"path": "a.py", "line": 12, "user": {"login": "rev"}, "body": "rename this",
+            "created_at": "t1", "in_reply_to_id": None}]
+    assert format_review_comments(raw) == "a.py:12 (rev): rename this"

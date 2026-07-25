@@ -380,6 +380,116 @@ def test_resolve_infra_death_counts_against_the_infra_ceiling(tmp_path):
     assert store.get_resolve_retries(5) == 0
 
 
+# ── review P1R-3: the infra ceiling decays on a leg that RETURNED ─────────────
+# The counter bounds CONSECUTIVE deaths. Nothing ever reset it, so it was a
+# lifetime tally: deaths accumulated across weeks of otherwise healthy work
+# until a perfectly serviceable issue was handed to a human. The only cleaner
+# that removed it (`cleanup_pr(merged=True)`) runs on work that already
+# SUCCEEDED — never on the issue that is still trying.
+def _death(reason=ExitReason.TRANSPORT_DEATH):
+    return AgentResult(is_error=True, status="timeout", exit_reason=reason)
+
+
+def test_a_returned_result_resets_the_infra_ceiling(tmp_path):
+    """Two deaths, then one leg that came back: the ceiling starts over."""
+    gw = FakeGateway(prs={100: _ci_pr()})
+    store = Store(state_dir=str(tmp_path))
+    seq = SeqRunner([_death(), _death(),
+                     AgentResult(is_error=False, status="pushed", session_id="s")])
+    wf = _workflow(gw, store, seq)
+
+    asyncio.run(wf.fix_ci(100))
+    asyncio.run(wf.fix_ci(100))
+    assert store.get_infra_deaths(5) == 2, "anti-vacuity: the deaths were counted"
+
+    asyncio.run(wf.fix_ci(100))
+
+    assert store.get_infra_deaths(5) == 0
+
+
+def test_an_errored_result_also_resets_it(tmp_path):
+    """The ceiling asks "did the session survive to deliver anything?", not "was
+    the answer good" — an honest failure is bounded by the CI breaker, which
+    this same leg advanced."""
+    gw = FakeGateway(prs={100: _ci_pr()})
+    store = Store(state_dir=str(tmp_path))
+    seq = SeqRunner([_death(),
+                     AgentResult(is_error=True, exit_reason=ExitReason.AGENT_ERROR)])
+    wf = _workflow(gw, store, seq)
+
+    asyncio.run(wf.fix_ci(100))
+    asyncio.run(wf.fix_ci(100))
+
+    assert store.get_infra_deaths(5) == 0
+    assert store.get_ci_retries(5) == 1
+
+
+def test_deaths_that_never_return_still_reach_the_ceiling(tmp_path):
+    """Anti-vacuity twin: a decay that fired on the death path itself would
+    disarm the ceiling completely. Five consecutive deaths must still count
+    five — that unbounded paid loop is why the counter exists."""
+    gw = FakeGateway(prs={100: _ci_pr()})
+    store = Store(state_dir=str(tmp_path))
+    wf = _workflow(gw, store, FakeRunner(_death()))
+
+    for _ in range(5):
+        asyncio.run(wf.fix_ci(100))
+
+    assert store.get_infra_deaths(5) == 5
+
+
+def test_consecutive_resolve_deaths_still_reach_the_ceiling(tmp_path):
+    """The same anti-vacuity check on the leg whose decay is NOT inside an
+    `if not infra_death` branch: `resolve` calls the decay for every returned
+    result, so a decay that forgot to exempt the death path would reset the
+    counter it had just bumped and disarm the ceiling on the most expensive
+    leg in the harness."""
+    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
+    store = Store(state_dir=str(tmp_path))
+    wf = _workflow(gw, store, FakeRunner(_death()))
+
+    for _ in range(5):
+        asyncio.run(wf.resolve(5))
+
+    assert store.get_infra_deaths(5) == 5
+    assert store.get_resolve_retries(5) == 0, "a death is never an attempt"
+
+
+def test_the_resolve_leg_decays_it_too(tmp_path):
+    """The expensive leg, and the one whose deaths leave the issue ai-working
+    for the reaper — so it is the one that accumulates a stale tally fastest."""
+    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
+    store = Store(state_dir=str(tmp_path))
+    seq = SeqRunner([_death(ExitReason.KILLED_EXTERNALLY),
+                     AgentResult(is_error=True, exit_reason=ExitReason.AGENT_ERROR)])
+    wf = _workflow(gw, store, seq)
+
+    asyncio.run(wf.resolve(5))
+    assert store.get_infra_deaths(5) == 1
+
+    asyncio.run(wf.resolve(5))
+
+    assert store.get_infra_deaths(5) == 0
+    assert store.get_resolve_retries(5) == 1  # the honest failure is bounded elsewhere
+
+
+def test_the_rebase_and_address_review_legs_decay_it_too(tmp_path):
+    gw = FakeGateway(prs={100: PRView(
+        100, head_ref_name="fix/5-x", closing_issue=5,
+        reviews=(Review("CHANGES_REQUESTED", "rev-bot", "t9", body="fix it"),),
+    )})
+    store = Store(state_dir=str(tmp_path))
+    ok = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s"))
+
+    store.bump_infra_deaths(5)
+    asyncio.run(_workflow(gw, store, ok).rebase(100))
+    assert store.get_infra_deaths(5) == 0
+
+    store.bump_infra_deaths(5)
+    asyncio.run(_workflow(gw, store, ok).address_review(100))
+    assert store.get_infra_deaths(5) == 0
+
+
 def test_address_review_infra_death_does_not_burn_a_review_retry():
     p = PRView(100, head_ref_name="fix/5-x", closing_issue=5,
                reviews=(Review("CHANGES_REQUESTED", "rev-bot", "t9", body="fix it"),))

@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from enum import Enum
 
+from .identity import is_bot_login
 from .labels import Label
 
 
@@ -77,7 +78,11 @@ class Comment:
 
     @property
     def is_bot(self) -> bool:
-        return self.author.endswith("[bot]")
+        # Routed through identity.is_bot_login (review R2-11) rather than a
+        # raw `.endswith("[bot]")`: the one other login-shaped comparison in
+        # the codebase, now case/whitespace-tolerant like everything else
+        # identity.py owns.
+        return is_bot_login(self.author)
 
 
 @dataclass(frozen=True)

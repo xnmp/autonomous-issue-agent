@@ -7,6 +7,7 @@ hook test drives the async callback with a stub build_ctx.
 
 import asyncio
 
+from issue_agent.adapters import governor_policy
 from issue_agent.adapters.governor import (
     GateContext,
     evaluate_command,
@@ -53,8 +54,14 @@ def test_force_push_protected_blocked_via_evaluate():
 
 
 def test_force_push_own_branch_allowed_via_evaluate():
+    """The bypass layer must not block the legitimate rebase-and-repush of the
+    fixer's own branch. Driven through a realistic push context (a governed
+    destination now reaches the push gate — P1R-10 — so a bare GateContext would
+    be denied by the gate's own rules, which is a different thing than the
+    protected-branch bypass firing)."""
     force = "--for" "ce"
-    assert evaluate_command(f"git push {force} origin fix/42-x", ctx()).allowed
+    probe, _ = _probe(OpenPrLookup.NONE)
+    assert evaluate_command(f"git push {force} origin fix/42-x", _push_ctx(probe)).allowed
 
 
 def test_delete_protected_branch_blocked_via_evaluate():
@@ -234,11 +241,14 @@ def test_pr_gate_runs_expensive_checks_when_nothing_cheap_denies():
 # domain tri-state behind a probe, so these tests drive the real wiring.
 def _probe(*answers):
     """A fake open-PR probe returning `answers` in order (last one repeats), and
-    the call log — laziness and retry are both observable through it."""
-    calls: list[int] = []
+    the call log — laziness, retry AND *which branch was asked about* are all
+    observable through it (the last one is P1R-10's contract: the probe must be
+    asked about the ref being written, not the one that happens to be checked
+    out)."""
+    calls: list[str] = []
 
-    def probe():
-        calls.append(1)
+    def probe(branch: str):
+        calls.append(branch)
         return answers[min(len(calls) - 1, len(answers) - 1)]
 
     return probe, calls
@@ -288,17 +298,37 @@ def test_push_without_open_pr_allowed():
     assert evaluate_command("git push", c).allowed
 
 
-def test_push_denied_when_the_open_pr_lookup_errors():
-    """A failed lookup must never read as "no PR" (the bash's old collapse) —
-    it is denied with the retry guidance the domain defines, after the retry."""
+# ── P1R-12: an unknown PR state costs a test run, not the whole leg ───────────
+# The ERROR arm used to deny EVERY push, including the very first pre-PR one, so
+# during a rate limit `gh pr create` never happened and max_resolve_retries
+# escalated a healthy issue to a human. The checks now run regardless of PR
+# state — fail-closed where it matters (a rule violation is still denied),
+# fail-workable where it does not (a clean push goes through).
+def test_p1r_12_unknown_pr_state_denies_a_push_that_breaks_a_rule():
     probe, calls = _probe(OpenPrLookup.ERROR)
     slept: list[int] = []
-    c = _push_ctx(probe, open_pr_retry_sleep=lambda: slept.append(1))
+    c = _push_ctx(probe, run_tests=lambda _c: False, open_pr_retry_sleep=lambda: slept.append(1))
     v = evaluate_command("git push", c)
     assert not v.allowed
-    assert "could not verify PR state" in v.reason
-    assert "retry the push" in v.reason
-    assert len(calls) == 2 and len(slept) == 1  # retried once, with a pause
+    assert "local test suite failed" in v.reason      # the REAL rule it broke…
+    assert "lookup for 'fix/5-x' failed" in v.reason  # …annotated as unverified
+    assert len(calls) == 2 and len(slept) == 1        # retried once, with a pause
+
+
+def test_p1r_12_unknown_pr_state_allows_a_clean_push():
+    """The finding itself: a healthy pre-PR push during a GitHub rate limit must
+    NOT be denied — that is what stalled `gh pr create` and burned the retries."""
+    probe, calls = _probe(OpenPrLookup.ERROR)
+    assert evaluate_command("git push", _push_ctx(probe)).allowed
+    assert len(calls) == 2  # it still paid for the retry before giving up
+
+
+def test_p1r_12_unknown_pr_state_denies_when_nothing_at_all_is_checkable():
+    """The residual fail-closed arm: with the base unresolvable the state-derived
+    checks are vacuous, so an unknown PR state leaves NOTHING verified → deny."""
+    probe, _ = _probe(OpenPrLookup.ERROR)
+    v = evaluate_command("git push", _push_ctx(probe, base_resolvable=False))
+    assert not v.allowed and "could not verify PR state" in v.reason
 
 
 def test_push_allowed_when_a_transient_lookup_error_clears_on_retry():
@@ -335,9 +365,143 @@ def test_open_pr_probe_never_fires_for_non_push_commands():
 def test_open_pr_defaults_to_unknown_and_fails_closed():
     """A GateContext built without wiring the probe must DENY the push, not
     silently disable the gate — the shape of the original bug (`has_open_pr`
-    defaulted to the permissive value and was never populated)."""
+    defaulted to the permissive value and was never populated). Post-P1R-12 the
+    unknown state runs the checks instead of denying outright, and an unwired
+    context has no test command either, so it is `check_tests` that denies —
+    still loudly, still annotated as unverified."""
     v = evaluate_command("git push", ctx(branch="fix/5-x"))
-    assert not v.allowed and "could not verify PR state" in v.reason
+    assert not v.allowed
+    assert "no test command resolved" in v.reason
+    assert "lookup for 'fix/5-x' failed" in v.reason
+
+
+# ── P1R-10: the gate keys on the ref being WRITTEN, not the checked-out one ───
+# The gate read `ctx.branch` (`git rev-parse --abbrev-ref HEAD`) for every push.
+# Three consequences: a conflicted rebase makes that the literal string "HEAD"
+# → ungoverned → the gate returned BEFORE probing, on exactly the leg whose
+# prompt says "force-with-lease if you rebased"; `git push origin HEAD:other`
+# was checked against the wrong branch; and the probe asked GitHub about a
+# branch the push was not writing.
+_REAL_PUSH_ARGVS = (
+    "git push",
+    "git push origin HEAD:refs/heads/fix/5-x",
+    "git push --force-with-lease origin fix/5-x",
+    "git push -u origin fix/5-x",
+    "git push origin HEAD",
+    "git push origin fix/5-x",
+)
+
+
+def test_p1r_10_every_real_push_shape_reaches_the_gate_on_its_destination():
+    """All the argv shapes the fixer actually emits must gate, and must ask
+    GitHub about the branch they WRITE (fix/5-x), not about `HEAD`."""
+    for cmd in _REAL_PUSH_ARGVS:
+        probe, calls = _probe(OpenPrLookup.OPEN)
+        v = evaluate_command(cmd, _push_ctx(probe, run_tests=lambda _c: False))
+        assert not v.allowed, cmd
+        assert "test suite failed" in v.reason, cmd
+        assert calls == ["fix/5-x"], (cmd, calls)
+
+
+def test_p1r_10_every_real_push_shape_is_allowed_when_clean():
+    """Anti-vacuity twin: the shapes above are gated, not blanket-denied."""
+    for cmd in _REAL_PUSH_ARGVS:
+        probe, _ = _probe(OpenPrLookup.OPEN)
+        assert evaluate_command(cmd, _push_ctx(probe)).allowed, cmd
+
+
+def test_p1r_10_conflicted_rebase_force_push_is_gated_not_skipped():
+    """THE repro: mid-rebase `rev-parse --abbrev-ref HEAD` is the literal string
+    'HEAD'. That read as an ungoverned branch and skipped the gate entirely on
+    the one leg that force-pushes. The refspec names the destination, so the
+    gate now applies — and probes the destination."""
+    force = "--force-with-lease"
+    probe, calls = _probe(OpenPrLookup.OPEN)
+    c = _push_ctx(probe, branch="HEAD", run_tests=lambda _c: False)
+    v = evaluate_command(f"git push {force} origin fix/5-x", c)
+    assert not v.allowed and "test suite failed" in v.reason
+    assert calls == ["fix/5-x"]
+
+
+def test_p1r_10_conflicted_rebase_force_push_allowed_when_clean():
+    """Anti-vacuity twin: gated, not blocked — a clean rebase-and-repush works."""
+    force = "--force-with-lease"
+    probe, _ = _probe(OpenPrLookup.OPEN)
+    c = _push_ctx(probe, branch="HEAD")
+    assert evaluate_command(f"git push {force} origin fix/5-x", c).allowed
+
+
+def test_p1r_10_detached_head_without_a_refspec_is_denied_not_skipped():
+    """Detached HEAD and no refspec: the gate cannot tell whether the destination
+    is governed, so it cannot tell whether to enforce. Unknown denies (and git
+    itself would reject this push anyway); the message names the way out."""
+    probe, calls = _probe(OpenPrLookup.OPEN)
+    for head in ("HEAD", ""):
+        v = evaluate_command("git push", _push_ctx(probe, branch=head))
+        assert not v.allowed
+        assert "detached" in v.reason.lower() and "HEAD:" in v.reason
+    assert calls == []  # undeterminable ⇒ never worth a gh round-trip
+
+
+def test_p1r_10_push_to_a_non_pr_ref_is_not_this_gates_business():
+    """The scope the destination rule buys: a push to a ref no PR points at
+    cannot update a PR, so it is not gated — and costs no gh call. (Opening a PR
+    from it still goes through the create gate.)"""
+    probe, calls = _probe(OpenPrLookup.OPEN)
+    c = _push_ctx(probe, run_tests=lambda _c: False)
+    assert evaluate_command("git push origin HEAD:refs/heads/scratch", c).allowed
+    assert calls == []
+
+
+def test_p1r_10_governed_destination_from_an_ungoverned_head_is_gated():
+    """The mirror image of the rebase case: HEAD sits on an ungoverned branch but
+    the push writes a governed one. Keying on HEAD skipped it entirely."""
+    probe, calls = _probe(OpenPrLookup.OPEN)
+    c = _push_ctx(probe, branch="dev", run_tests=lambda _c: False)
+    v = evaluate_command("git push origin HEAD:refs/heads/fix/42-x", c)
+    assert not v.allowed and "test suite failed" in v.reason
+    assert calls == ["fix/42-x"]
+
+
+def test_absence_p1r_10_destination_derivation_is_load_bearing(monkeypatch):
+    """§5's counter-measure: REMOVE the destination derivation and assert the
+    bypass reopens, loudly. Without it the gate keys on the checked-out branch
+    again — ungoverned `dev` — and a push that writes a governed branch with an
+    open PR and a red suite sails through without even a probe."""
+    argv = "git push origin HEAD:refs/heads/fix/42-x"
+
+    probe, calls = _probe(OpenPrLookup.OPEN)
+    c = _push_ctx(probe, branch="dev", run_tests=lambda _c: False)
+    assert not evaluate_command(argv, c).allowed          # guard present: gated
+    assert calls == ["fix/42-x"]
+
+    monkeypatch.setattr(governor_policy, "push_destination_refs", lambda _argv: ())
+    probe2, calls2 = _probe(OpenPrLookup.OPEN)
+    c2 = _push_ctx(probe2, branch="dev", run_tests=lambda _c: False)
+    assert evaluate_command(argv, c2).allowed             # guard gone: bypass back
+    assert calls2 == []
+
+
+def test_absence_p1r_10_derivation_removal_also_reopens_the_rebase_leg(monkeypatch):
+    """Second arm of the same absence check, on the detached-HEAD repro: with the
+    derivation removed the force-push mid-rebase is no longer checked against the
+    branch it writes."""
+    force = "--force-with-lease"
+    argv = f"git push {force} origin fix/5-x"
+
+    probe, calls = _probe(OpenPrLookup.OPEN)
+    c = _push_ctx(probe, branch="HEAD", run_tests=lambda _c: False)
+    v = evaluate_command(argv, c)
+    assert not v.allowed and "test suite failed" in v.reason
+    assert calls == ["fix/5-x"]
+
+    monkeypatch.setattr(governor_policy, "push_destination_refs", lambda _argv: ())
+    probe2, calls2 = _probe(OpenPrLookup.OPEN)
+    c2 = _push_ctx(probe2, branch="HEAD", run_tests=lambda _c: False)
+    v2 = evaluate_command(argv, c2)
+    # no longer the real rule violation — it degrades to "I have no idea"
+    assert "test suite failed" not in v2.reason
+    assert calls2 == []
 
 
 # ── SDK hook deny shape ────────────────────────────────────────────────────────
@@ -382,6 +546,45 @@ def test_hook_allows_foreground_bash_that_would_be_backgroundable():
         "id", None,
     ))
     assert out == {}
+
+
+# ── P1R-17: a missing cwd must DENY, never fall back to os.getcwd() ───────────
+# The daemon's own cwd is TARGET_DIR, checked out on dev/main — ungoverned — so
+# the fallback silently deleted the push gate instead of failing.
+def test_p1r_17_missing_cwd_denies_instead_of_using_the_daemons_own_cwd():
+    built: list[str] = []
+
+    def build(cwd):
+        built.append(cwd)
+        return ctx()
+
+    hook = make_pretooluse_hook(build)
+    for payload in ({"tool_input": {"command": "git push"}},
+                    {"tool_input": {"command": "git push"}, "cwd": ""},
+                    {"tool_input": {"command": "git push"}, "cwd": None}):
+        out = asyncio.run(hook(payload, "id", None))
+        hso = out["hookSpecificOutput"]
+        assert hso["permissionDecision"] == "deny"
+        assert "working directory" in hso["permissionDecisionReason"]
+    assert built == []  # never built a context against the wrong directory
+
+
+def test_p1r_17_present_cwd_is_used_and_the_command_still_flows():
+    """Anti-vacuity twin: the deny is about the MISSING cwd, not about pushes —
+    a normal call still builds the context from the cwd it was handed."""
+    built: list[str] = []
+
+    def build(cwd):
+        built.append(cwd)
+        return ctx(branch="dev")   # ungoverned ⇒ the push gate skips
+
+    hook = make_pretooluse_hook(build)
+    out = asyncio.run(hook(
+        {"tool_input": {"command": "git push"}, "cwd": "/repo/.claude/worktrees/issue-5"},
+        "id", None,
+    ))
+    assert out == {}
+    assert built == ["/repo/.claude/worktrees/issue-5"]
 
 
 def test_hook_logs_allowed_commit_with_issue_number():

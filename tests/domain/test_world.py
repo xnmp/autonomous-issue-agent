@@ -6,6 +6,7 @@ a guaranteed merge conflict (the #59-vs-#60 collision).
 """
 
 from issue_agent.domain.world import (
+    Comment,
     PRView,
     extract_declared_paths,
     paths_overlap_open_prs,
@@ -66,3 +67,20 @@ def test_overlap_ignores_non_open_prs():
 def test_overlap_empty_declared_is_failopen():
     prs = (_pr(1, "OPEN", {"a.py"}),)
     assert paths_overlap_open_prs(frozenset(), prs) is False
+
+
+# ── Comment.is_bot (review R2-11: routed through identity.is_bot_login) ──────
+def test_comment_is_bot_true_for_bot_suffixed_author():
+    assert Comment(author="dependabot[bot]").is_bot is True
+
+
+def test_comment_is_bot_false_for_human_author():
+    # Anti-vacuity twin.
+    assert Comment(author="a-human").is_bot is False
+
+
+def test_comment_is_bot_tolerates_case_and_whitespace():
+    # Same tolerance identity.py's login comparisons get everywhere else — a
+    # raw `.endswith("[bot]")` (the pre-fix implementation) would miss both.
+    assert Comment(author="DEPENDABOT[BOT]").is_bot is True
+    assert Comment(author=" dependabot[bot] ").is_bot is True

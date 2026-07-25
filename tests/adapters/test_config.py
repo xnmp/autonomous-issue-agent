@@ -169,7 +169,7 @@ def test_agent_max_runtime_zero_disables_the_cap():
     # 0 is the documented opt-out (a repo whose test suite alone outruns any sane
     # ceiling). It must parse as a valid config, not a rejected one — the runner
     # wiring turns 0 into "no cap".
-    c = from_env({"REPO": "x", "AGENT_MAX_RUNTIME_SECONDS": "0"})
+    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "AGENT_MAX_RUNTIME_SECONDS": "0"})
     assert c.agent_max_runtime == 0.0
     assert c.validation_errors() == ()
 
@@ -178,18 +178,21 @@ def test_agent_max_runtime_empty_means_unset_not_zero():
     # review M2: an exported-but-empty numeric knob must mean UNSET (fall back
     # to the field default), never a different valid value ("0" = disabled).
     # Explicit "0" (above) and blank (here) are NOT the same thing.
-    c = from_env({"REPO": "x", "AGENT_MAX_RUNTIME_SECONDS": ""})
+    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "AGENT_MAX_RUNTIME_SECONDS": ""})
     assert c.agent_max_runtime == 2700.0
     assert c.validation_errors() == ()
 
 
 def test_valid_defaults_have_no_validation_errors():
-    assert from_env({"REPO": "o/r"}).validation_errors() == ()
+    # REPO and FIX_BOT are both required for a "valid" config (review P1R-7 added
+    # the FIX_BOT requirement) — this is the minimal env that passes.
+    assert from_env({"REPO": "o/r", "FIX_BOT": "fix-bot"}).validation_errors() == ()
 
 
 def test_validation_rejects_invalid_retry_caps_and_poll_seconds():
     c = from_env({
         "REPO": "x",
+        "FIX_BOT": "fix-bot",
         "POLL_SECONDS": "0",
         "MAX_CI_RETRIES": "-1",
         "MAX_REVIEW_RETRIES": "-2",
@@ -211,6 +214,7 @@ def test_validation_rejects_invalid_retry_caps_and_poll_seconds():
 def test_validation_rejects_invalid_budgets():
     c = from_env({
         "REPO": "x",
+        "FIX_BOT": "fix-bot",
         "MAX_BUDGET_USD": "0",
         "REVIEW_BUDGET_USD": "-1",
         "STEWARD_TRIAGE_BUDGET_USD": "0",
@@ -234,6 +238,7 @@ def test_validation_rejects_invalid_budgets():
 def test_validation_rejects_invalid_runtime_settings():
     c = from_env({
         "REPO": "x",
+        "FIX_BOT": "fix-bot",
         "FIXER_RUNTIME": "python",
         "AGENT_IDLE_TIMEOUT_SECONDS": "-1",
         "AGENT_MAX_RUNTIME_SECONDS": "-1",
@@ -251,7 +256,7 @@ def test_validation_rejects_invalid_runtime_settings():
 
 
 def test_validate_raises_combined_error_message():
-    c = from_env({"REPO": "x", "FIXER_RUNTIME": "python"})
+    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "FIXER_RUNTIME": "python"})
 
     try:
         c.validate()
@@ -262,7 +267,7 @@ def test_validate_raises_combined_error_message():
 
 
 def test_jira_sync_without_project_key_stays_valid_and_inert():
-    c = from_env({"REPO": "x", "JIRA_SYNC": "1"})
+    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "JIRA_SYNC": "1"})
 
     assert c.jira_runtime.sync is True
     assert c.jira_runtime.project_key == ""
@@ -282,7 +287,7 @@ def test_malformed_numeric_does_not_traceback_and_lands_in_validation_errors():
 
 def test_well_formed_numeric_produces_no_parse_error():
     # Anti-vacuity twin of the above: a well-formed value must NOT be flagged.
-    c = from_env({"REPO": "x", "POLL_SECONDS": "45"})
+    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "POLL_SECONDS": "45"})
     assert c.poll_seconds == 45
     assert c.validation_errors() == ()
 
@@ -291,7 +296,7 @@ def test_empty_spend_cap_falls_back_to_default_not_disabled():
     # review M2: `float(v or 0)` made an exported-but-empty ISSUE_SPEND_CAP_USD
     # silently mean "cap disabled" instead of "unset, use the default" —
     # describe() would then print issue=$0.00 as if that were intentional.
-    c = from_env({"REPO": "x", "ISSUE_SPEND_CAP_USD": ""})
+    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "ISSUE_SPEND_CAP_USD": ""})
     assert c.issue_spend_cap_usd == 25.0
     assert c.validation_errors() == ()
 
@@ -299,7 +304,7 @@ def test_empty_spend_cap_falls_back_to_default_not_disabled():
 def test_explicit_zero_spend_cap_still_means_disabled():
     # Anti-vacuity twin: an OPERATOR-CHOSEN 0 is a real, valid "off" and must
     # not be conflated with "unset" — only empty string means unset.
-    c = from_env({"REPO": "x", "ISSUE_SPEND_CAP_USD": "0"})
+    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "ISSUE_SPEND_CAP_USD": "0"})
     assert c.issue_spend_cap_usd == 0.0
     assert c.validation_errors() == ()
 
@@ -307,7 +312,7 @@ def test_explicit_zero_spend_cap_still_means_disabled():
 def test_empty_max_budget_falls_back_to_default_without_crashing():
     # review M2: MAX_BUDGET_USD= used to crash with a bare ValueError
     # (float("")). Must resolve to the documented default instead.
-    c = from_env({"REPO": "x", "MAX_BUDGET_USD": ""})
+    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "MAX_BUDGET_USD": ""})
     assert c.fix_budget_usd == 10.0
     assert c.validation_errors() == ()
 
@@ -329,6 +334,91 @@ def test_explicit_zero_auto_merge_still_disables():
     assert from_env({"REPO": "x", "AUTO_MERGE": "0"}).auto_merge is False
 
 
+# ── P1R-8: `_b` must strip+casefold and reject unrecognized tokens ───────────
+@pytest.mark.parametrize(
+    "token,expected",
+    [
+        ("False", False), ("FALSE", False), (" false ", False), ("No", False),
+        ("Off", False), ("0", False), (" 0 ", False),
+        ("True", True), ("TRUE", True), (" true ", True), ("Yes", True),
+        ("On", True), ("1", True), (" 1 ", True),
+    ],
+)
+def test_b_is_case_and_whitespace_insensitive(token, expected):
+    # THE P1R-8 repro: AUTO_MERGE=False (capital F) used to compare unstripped
+    # and case-sensitively against a raw ("0","false","no","off") tuple, miss
+    # every one of them, and fall into "anything else is true" — turning
+    # auto-merge ON when the operator asked for it OFF. Parametrized on one
+    # knob per the acceptance note (full spelling set here, not every knob).
+    assert from_env({"REPO": "x", "AUTO_MERGE": token}).auto_merge is expected
+
+
+def test_b_records_a_validation_error_for_an_unrecognized_token_not_silent_truthy():
+    # The rest of the fix: an unrecognized token must not silently default to
+    # True (the old "anything not in the false set" behaviour) — it falls
+    # back to the field default AND is reported, matching _coerce_int's
+    # malformed-value contract.
+    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "AUTO_MERGE": "maybe"})
+    assert c.auto_merge is True  # substituted the default (True), not a guess
+    errors = c.validation_errors()
+    assert any("AUTO_MERGE" in e and "maybe" in e for e in errors)
+
+
+def test_b_well_formed_token_produces_no_validation_error():
+    # Anti-vacuity twin: a recognized token must NOT be flagged.
+    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "AUTO_MERGE": "off"})
+    assert c.auto_merge is False
+    assert c.validation_errors() == ()
+
+
+def test_b_absence_of_the_token_set_would_default_every_unrecognized_value_true():
+    # ABSENCE test (review §5): proves the OLD bug shape directly — "anything
+    # not in the false set" (no strip/casefold, no recognized-true-set) reads
+    # "False" as truthy. If someone reverts `_b` to that shape, THIS assertion
+    # (not just the happy-path parametrization above) documents the regression
+    # it would reintroduce.
+    old_buggy_contract = "False" not in ("0", "false", "no", "off")
+    assert old_buggy_contract is True  # the bug: "False" reads as truthy
+    assert from_env({"REPO": "x", "AUTO_MERGE": "False"}).auto_merge is False  # the fix
+
+
+# ── P1R-9: non-finite floats must be rejected, not silently accepted ─────────
+@pytest.mark.parametrize("bad", ["nan", "NaN", "inf", "-inf", "Infinity", "1e400"])
+def test_coerce_float_rejects_non_finite_spend_cap(bad):
+    # THE P1R-9 repro: ISSUE_SPEND_CAP_USD=nan used to pass `float()` cleanly,
+    # and `_require_non_negative`'s `value < 0` is False for nan — so a nan
+    # cap silently disabled the cap it names. `1e400` overflows float() to
+    # `inf`, same failure mode via a spelling that looks like an ordinary number.
+    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "ISSUE_SPEND_CAP_USD": bad})
+    assert c.issue_spend_cap_usd == 25.0  # substituted default, not nan/inf
+    errors = c.validation_errors()
+    assert any("ISSUE_SPEND_CAP_USD" in e and bad in e for e in errors)
+
+
+def test_coerce_float_rejects_non_finite_wall_cap():
+    # Same hole, the other cap the finding names: AGENT_MAX_RUNTIME_SECONDS=nan
+    # used to make `cfg.agent_max_runtime > 0` False, disabling the wall cap.
+    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "AGENT_MAX_RUNTIME_SECONDS": "nan"})
+    assert c.agent_max_runtime == 2700.0
+    assert any("AGENT_MAX_RUNTIME_SECONDS" in e for e in c.validation_errors())
+
+
+def test_coerce_float_still_accepts_ordinary_finite_values():
+    # Anti-vacuity twin: a normal well-formed float must NOT be flagged.
+    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "ISSUE_SPEND_CAP_USD": "12.5"})
+    assert c.issue_spend_cap_usd == 12.5
+    assert c.validation_errors() == ()
+
+
+def test_coerce_float_absence_of_isfinite_check_would_let_nan_through():
+    # ABSENCE test (review §5): bare float() parses "nan" without raising —
+    # proves the finite check, not the try/except, is what's doing the work.
+    import math
+
+    assert math.isnan(float("nan"))  # the old code path's blind spot
+    assert not math.isfinite(float("nan"))  # …and what the fix now checks for
+
+
 def test_poll_seconds_default_is_20_everywhere():
     # review S7: the dataclass default (was 60) used to disagree with
     # from_env's own literal ("20"). Both paths must now agree — from_env
@@ -341,10 +431,48 @@ def test_state_dirs_default_per_repo():
     # review M5/D7: default STATE_DIR used to be per-role but not per-repo —
     # two repos' fix daemons shared issue-N.session and one resumed the
     # other's transcript. Assert the default is now namespaced by repo.
+    #
+    # R2-10: the join separator changed from "-" to "__" (acme-widget ->
+    # acme__widget) to fix a collision ("/" and "-" both mapping to "-" let
+    # `acme/app-b` and `acme-app/b` collide — see
+    # test_repo_slug_does_not_collide_when_either_segment_has_a_hyphen below).
+    # Nothing real is deployed yet, so this default-path shape change is safe.
     c = from_env({"REPO": "acme/widget"})
-    assert c.state_dir.endswith("issue-agent/acme-widget")
-    assert c.review_state_dir.endswith("review-agent/acme-widget")
-    assert c.steward_state_dir.endswith("steward-agent/acme-widget")
+    assert c.state_dir.endswith("issue-agent/acme__widget")
+    assert c.review_state_dir.endswith("review-agent/acme__widget")
+    assert c.steward_state_dir.endswith("steward-agent/acme__widget")
+
+
+def test_repo_slug_does_not_collide_when_either_segment_has_a_hyphen():
+    # R2-10: the OLD `owner/name -> owner-name` join collided whenever EITHER
+    # segment itself contained a hyphen, because "/" and "-" both mapped to
+    # the same output character: `acme/app-b` and `acme-app/b` both produced
+    # `acme-app-b`. Two genuinely distinct repos must get distinct state dirs.
+    a = from_env({"REPO": "acme/app-b"})
+    b = from_env({"REPO": "acme-app/b"})
+    assert a.state_dir != b.state_dir
+    assert a.review_state_dir != b.review_state_dir
+    assert a.steward_state_dir != b.steward_state_dir
+
+
+def test_repo_slug_is_case_insensitive_like_github_repo_identity():
+    # R2-10: GitHub owner/repo identity is case-insensitive — `Acme/Widget`
+    # and `acme/widget` name the SAME repo and must share ONE state dir, not
+    # silently split it across two (the same failure shape M5/D7 closed for
+    # genuinely distinct repos, but here for case variants of one repo).
+    a = from_env({"REPO": "Acme/Widget"})
+    b = from_env({"REPO": "acme/widget"})
+    assert a.state_dir == b.state_dir
+    assert a.review_state_dir == b.review_state_dir
+    assert a.steward_state_dir == b.steward_state_dir
+
+
+def test_repo_slug_case_insensitivity_does_not_collapse_distinct_repos():
+    # Anti-vacuity twin: casefolding must not make GENUINELY different repos
+    # (not just case variants of the same one) collide.
+    a = from_env({"REPO": "acme/widget"})
+    b = from_env({"REPO": "acme/gizmo"})
+    assert a.state_dir != b.state_dir
 
 
 def test_state_dirs_do_not_collide_across_repos():
@@ -450,6 +578,71 @@ def test_from_env_leaves_bot_values_as_written_display_form():
     assert c.fix_bot == "Fix-Bot[bot]"
 
 
+# ── P1R-6: trailing/leading whitespace on FIX_BOT must not defeat validation ──
+def test_identity_cross_check_fires_despite_trailing_whitespace_on_fix_bot():
+    # THE P1R-6 repro at the config layer: FIX_BOT='fix-bot ' (trailing space,
+    # e.g. round-tripped through a shell env file/%q) used to defeat the
+    # cross-check entirely — normalize_login didn't strip, so "fix-bot "
+    # normalized to itself while "fix-bot[bot]" normalized to "fix-bot", and
+    # the (unequal-looking) strings never tripped the self-approval guard.
+    c = from_env({
+        "REPO": "x", "IDENTITY_MODE": "three",
+        "FIX_BOT": "fix-bot ", "REVIEW_BOT": "fix-bot[bot]",
+    })
+    errors = c.validation_errors()
+    assert any("FIX_BOT" in e and "REVIEW_BOT" in e for e in errors)
+
+
+def test_identity_cross_check_whitespace_does_not_flag_genuinely_distinct_bots():
+    # Anti-vacuity twin: the whitespace-tolerant normalization must not start
+    # flagging genuinely distinct identities just because one has padding.
+    c = from_env({
+        "REPO": "x", "IDENTITY_MODE": "three",
+        "FIX_BOT": " fix-bot ", "REVIEW_BOT": "review-bot",
+    })
+    assert c.validation_errors() == ()
+
+
+# ── P1R-7(b): FIX_BOT is now a required knob ──────────────────────────────────
+def test_validation_requires_fix_bot_to_be_set():
+    # Before this, validation_errors() had NO check for FIX_BOT at all — an
+    # unset FIX_BOT sailed through validate() silently, and (pre-P1R-7(a))
+    # `login_eq("", "")` being True meant an unresolvable PR author read as
+    # the fixer's own.
+    c = from_env({"REPO": "x"})
+    assert any("FIX_BOT" in e for e in c.validation_errors())
+
+
+def test_validation_requires_fix_bot_non_whitespace():
+    # A whitespace-only FIX_BOT is functionally unset too.
+    c = from_env({"REPO": "x", "FIX_BOT": "   "})
+    assert any("FIX_BOT" in e for e in c.validation_errors())
+
+
+def test_validation_does_not_flag_fix_bot_when_set():
+    # Anti-vacuity twin.
+    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot"})
+    assert not any("FIX_BOT" in e for e in c.validation_errors())
+
+
+def test_validate_raises_when_fix_bot_unset():
+    with pytest.raises(ValueError, match="FIX_BOT"):
+        from_env({"REPO": "x"}).validate()
+
+
+def test_absence_of_fix_bot_check_would_have_validated_silently():
+    # ABSENCE test (review §5): isolates that NOTHING ELSE in
+    # validation_errors() catches an unset FIX_BOT — only the dedicated check
+    # added for P1R-7(b) does. If that check is ever removed, this assertion
+    # (rather than just the happy-path tests above) makes the gap loud: the
+    # remaining errors are empty even though FIX_BOT is unset.
+    c = from_env({"REPO": "x"})  # FIX_BOT unset
+    errors = c.validation_errors()
+    non_fix_bot_errors = tuple(e for e in errors if "FIX_BOT" not in e)
+    assert non_fix_bot_errors == ()  # nothing else would have caught this
+    assert errors != ()  # …but the dedicated check does
+
+
 def test_max_infra_deaths_default_and_override():
     assert from_env({"REPO": "x"}).max_infra_deaths == 5
     c = from_env({"REPO": "x", "MAX_INFRA_DEATHS": "2"})
@@ -458,7 +651,7 @@ def test_max_infra_deaths_default_and_override():
 
 
 def test_max_infra_deaths_zero_is_a_valid_off_value():
-    c = from_env({"REPO": "x", "MAX_INFRA_DEATHS": "0"})
+    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "MAX_INFRA_DEATHS": "0"})
     assert c.max_infra_deaths == 0
     assert c.validation_errors() == ()
 
@@ -469,7 +662,8 @@ def test_codex_cost_per_mtok_defaults_and_override():
     assert c.codex_cost_per_mtok_out == 0.0
     assert c.codex_runtime.cost_per_mtok_in == 0.0
     c2 = from_env({
-        "REPO": "x", "CODEX_COST_PER_MTOK_IN": "3.00", "CODEX_COST_PER_MTOK_OUT": "15.00",
+        "REPO": "x", "FIX_BOT": "fix-bot",
+        "CODEX_COST_PER_MTOK_IN": "3.00", "CODEX_COST_PER_MTOK_OUT": "15.00",
     })
     assert c2.codex_cost_per_mtok_in == 3.00
     assert c2.codex_cost_per_mtok_out == 15.00

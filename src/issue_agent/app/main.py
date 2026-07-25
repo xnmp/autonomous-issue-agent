@@ -152,6 +152,11 @@ def build_role(role: str, env: dict | None = None):
     def build_ctx(cwd: str):
         return build_gate_context(
             cwd, base_branch=cfg.base_branch,
+            # Pin the open-PR probe to THIS repo (review P1R-11). Without it gh
+            # resolves the repo from the worktree's remotes, and on a target with
+            # more than one remote it answers about the wrong repository — where
+            # the branch has no PR, so the push gate silently does not apply.
+            repo=cfg.repo,
             env_test_cmd=env.get("TEST_CMD"),
             red_must_fail=env.get("RED_MUST_FAIL", "1") != "0",
             verify_red_at_commit=env.get("VERIFY_RED_AT_COMMIT", "1") != "0",

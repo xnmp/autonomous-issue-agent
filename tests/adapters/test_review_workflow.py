@@ -661,3 +661,37 @@ def test_rounds_accumulate_across_polls():
         asyncio.run(wf.review(100))
 
     assert _counter(store) == 3
+
+
+# ── unproductive-round decay (reviewer twin of review P1R-3) ───────────────────
+def test_a_confirmed_submit_clears_the_unproductive_round_tally():
+    """Without decay the P0R-3 ceiling is a LIFETIME tally: a long-lived PR that
+    accumulates flaky rounds over weeks of healthy reviewing escalates on its
+    next needed review, having never looped. A confirmed submit proves the PR is
+    not stuck, so it resets the counter."""
+    pr = PRView(100, head_ref_oid="abc", title="t", body="b", closing_issue=7)
+    gw = FakeGateway(prs={100: pr})
+    store = FakeStore()
+    store.infra_deaths[7] = 4  # four earlier rounds bought nothing
+    runner = FakeRunner(AgentResult(
+        is_error=False, session_id="rs",
+        structured={"decision": "APPROVE", "body": "looks good"},
+    ))
+
+    asyncio.run(_workflow(gw, store, runner).review(100))
+
+    assert store.get_infra_deaths(7) == 0, "a productive round must reset the tally"
+
+
+def test_a_round_that_submits_nothing_still_counts():
+    """Anti-vacuity twin: decay must not swallow the very rounds the ceiling
+    exists to count — an errored round leaves the tally standing and growing."""
+    pr = PRView(100, head_ref_oid="abc", title="t", body="b", closing_issue=7)
+    gw = FakeGateway(prs={100: pr})
+    store = FakeStore()
+    store.infra_deaths[7] = 4
+    runner = FakeRunner(AgentResult(is_error=True, status="error"))
+
+    asyncio.run(_workflow(gw, store, runner).review(100))
+
+    assert store.get_infra_deaths(7) == 5, "an unproductive round still counts up"

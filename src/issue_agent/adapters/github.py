@@ -64,6 +64,29 @@ _INLINE_COMMENT_LIMIT = 8
 # of a 50k-line Actions log is pure setup noise.
 _FAILED_LOG_LINES = 150
 
+# Byte ceiling on the SAME tail, independent of the line count (review P1R-13).
+# `tail -150` bounds LINES, not bytes: a log whose lines are individually huge —
+# one minified bundle, a base64 blob, a per-line JSON dump — sails straight
+# through it. Measured: a 200MB CI log's last 150 lines was still a
+# 150,001,711-char prompt. 20_000 bytes (~5-6k tokens at a typical ~3.5
+# bytes/token) comfortably fits a real multi-hundred-line stack trace (a
+# genuine failure line runs 80-150 bytes) while capping the fix-ci leg's
+# worst-case prompt to a few cents of context on even the cheapest model —
+# compare `_one_line`'s 200-char bound for a single gh error line.
+_FAILED_LOG_BYTES = 20_000
+
+# Per-comment + overall byte ceilings on the inline-review-comments block
+# (review P1R-13). Unlike an issue/PR body, an inline review comment is
+# writable by ANY user with read access to the repo — not just the PR author —
+# so it is a wider attack surface than most prompt inputs. 2_000 bytes/comment
+# is generous for an actual review remark (a paragraph is well under 500
+# bytes) while making a weaponized paste (measured repro: 10 x 500KB comments
+# -> ~4MB) harmless; the 20_000-byte overall ceiling matches the CI-log budget
+# above and is defense-in-depth beyond the per-comment cap (it also bounds a
+# future caller that raises `limit` past `_INLINE_COMMENT_LIMIT`).
+_REVIEW_COMMENT_BODY_BYTES = 2_000
+_REVIEW_COMMENTS_TOTAL_BYTES = 20_000
+
 
 class MissingListLimit(ValueError):
     """Programmer error: a `gh … list` argv was built without `--limit`.
@@ -93,9 +116,34 @@ def _require_list_limit(args: list[str]) -> None:
         )
 
 
-def _tail(text: str, lines: int) -> str:
-    """Last `lines` lines of `text` (port of `tail -N`). Tolerates ""/None."""
-    return "\n".join((text or "").splitlines()[-lines:])
+def _tail(text: str, lines: int, max_bytes: int | None = None) -> str:
+    """Last `lines` lines of `text` (port of `tail -N`), ADDITIONALLY capped to
+    the last `max_bytes` UTF-8 bytes when given (review P1R-13). The two caps
+    are independent: `tail -N` bounds line COUNT, not size, so a log with a
+    handful of enormous lines needs a separate byte cut to stay bounded.
+    Slicing bytes can land mid multi-byte character at the cut point;
+    `errors="ignore"` drops that partial character rather than raising.
+    Tolerates ""/None."""
+    out = "\n".join((text or "").splitlines()[-lines:])
+    if max_bytes is None:
+        return out
+    encoded = out.encode("utf-8", errors="ignore")
+    if len(encoded) <= max_bytes:
+        return out
+    return encoded[-max_bytes:].decode("utf-8", errors="ignore")
+
+
+def _cap_bytes(text: str, max_bytes: int) -> str:
+    """Truncate `text` to at most `max_bytes` of UTF-8 encoded content, keeping
+    the FRONT (review P1R-13) — unlike `_tail`'s from-the-end truncation for a
+    CI log, a review comment's substance is normally stated up front, so
+    keeping the start preserves whatever legitimate point the comment opens
+    with. `errors="ignore"` drops a partial multi-byte character at the cut
+    point rather than raising."""
+    encoded = text.encode("utf-8", errors="ignore")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
 def _warn_if_list_truncated(query: str, count: int) -> None:
@@ -370,7 +418,13 @@ def format_review_comments(raw: object, limit: int = _INLINE_COMMENT_LIMIT) -> s
     == null` — replies are the fixer's own thread, not new asks), oldest→newest,
     the last `limit`. Tolerant of every shape it might be handed (a non-list error
     object, a missing path/line/user) — this feeds a prompt, so a malformed field
-    degrades to a weaker prompt, never to a dead dispatch."""
+    degrades to a weaker prompt, never to a dead dispatch.
+
+    Each comment body is capped at `_REVIEW_COMMENT_BODY_BYTES` and the whole
+    formatted block at `_REVIEW_COMMENTS_TOTAL_BYTES` (review P1R-13): unlike an
+    issue/PR body, an inline comment is writable by ANY user with read access to
+    the repo, so `limit` alone (item COUNT) does not bound the paste — a handful
+    of huge comments still blow the prompt."""
     if not isinstance(raw, list):
         return ""
     tops = [
@@ -386,10 +440,9 @@ def format_review_comments(raw: object, limit: int = _INLINE_COMMENT_LIMIT) -> s
                 author = c[key].get("login", "") or ""
                 break
         line = c.get("line") or c.get("original_line") or 0
-        out.append(
-            f"{c.get('path', '') or ''}:{line} ({author}): {(c.get('body', '') or '').strip()}"
-        )
-    return "\n".join(out)
+        body = _cap_bytes((c.get("body", "") or "").strip(), _REVIEW_COMMENT_BODY_BYTES)
+        out.append(f"{c.get('path', '') or ''}:{line} ({author}): {body}")
+    return _cap_bytes("\n".join(out), _REVIEW_COMMENTS_TOTAL_BYTES)
 
 
 def parse_world(issues: list[dict], prs: list[dict]) -> WorldState:
@@ -809,7 +862,7 @@ class GitHubGateway:
             log = self._gh(
                 ["run", "view", str(run_id), "--repo", self.repo, "--log-failed"]
             )
-            return _tail(log, lines)
+            return _tail(log, lines, max_bytes=_FAILED_LOG_BYTES)
         except MissingListLimit:
             raise
         except Exception:  # noqa: BLE001 — a missing log must not block the fix

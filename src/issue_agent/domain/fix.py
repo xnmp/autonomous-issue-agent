@@ -258,7 +258,8 @@ def reap_actions(world: WorldState) -> list[Action]:
 
 
 def cleanup_actions(
-    pr: PRView, issue_number: int | None, cfg: FixConfig
+    pr: PRView, issue_number: int | None, cfg: FixConfig,
+    issue_observed_pr_open: bool = True,
 ) -> list[Action]:
     """Merged/closed PR cleanup. Port of cleanup.sh. MERGED → issue ai-pr-open→
     ai-done (+ optional close, since GitHub only auto-closes on default-branch
@@ -271,13 +272,31 @@ def cleanup_actions(
     session with a preloaded breaker. MERGED clears everything (incl.
     infra-deaths + the pr-N.automerge marker); CLOSED-unmerged only clears the
     resume-blocking markers, keeping resolve-retries/infra-deaths (handover
-    §5.7's deliberate conservatism — fewer retries after a human closed the PR)."""
+    §5.7's deliberate conservatism — fewer retries after a human closed the PR).
+
+    `issue_observed_pr_open` gates the whole ISSUE-side arm — RemoveWorktree,
+    the issue Relabel, CloseIssue, and the issue half of ClearIssueState
+    (review P1R-15). `decide_fix` passes whether the OBSERVED issue, in the
+    SAME world snapshot, still carries ai-pr-open. Without this gate: an
+    ai-ready issue and its own stale CLOSED/MERGED PR (not yet cleaned up) can
+    appear together in one snapshot — decide_fix dispatches a FRESH RunAgent
+    on the issue (relabelling it ai-working) in the same poll that also walks
+    this stale PR to cleanup. Unconditional issue-side cleanup then deletes the
+    worktree the dispatch just created, requeues the issue that just got a new
+    session, and wipes the session ClearIssueState had just written — a second
+    PR next tick, reachable with NO failure (close a PR, then
+    `issue-agent ready N`). The PR-side arm (dropping ai-pr-open from the PR,
+    and its half of ClearIssueState) stays UNCONDITIONAL: the PR really is
+    closed/merged regardless of what its issue currently shows, and that part
+    of the world is never stale. Default True is the ordinary case (the issue
+    genuinely still is ai-pr-open) and matches every existing direct caller."""
     actions: list[Action] = []
     merged = pr.state == "MERGED"
-    if issue_number is not None:
+    issue_arm = issue_number is not None and issue_observed_pr_open
+    if issue_arm:
         actions.append(RemoveWorktree(issue_number))
     if merged:
-        if issue_number is not None:
+        if issue_arm:
             actions.append(
                 Relabel(Target.ISSUE, issue_number, Label.AI_PR_OPEN, Label.AI_DONE)
             )
@@ -289,13 +308,24 @@ def cleanup_actions(
                     )
                 )
     else:  # CLOSED unmerged → re-queue the issue
-        if issue_number is not None:
+        if issue_arm:
             actions.append(
                 Relabel(Target.ISSUE, issue_number, Label.AI_PR_OPEN, Label.AI_READY)
             )
     actions.append(Relabel(Target.PR, pr.number, Label.AI_PR_OPEN, None))
-    actions.append(ClearIssueState(pr.number, issue_number, merged))
+    actions.append(ClearIssueState(pr.number, issue_number if issue_arm else None, merged))
     return actions
+
+
+def _issue_carries_ai_pr_open(world: WorldState, issue_number: int | None) -> bool:
+    """Whether the OBSERVED issue — in THIS world snapshot — still shows
+    ai-pr-open. The gate `cleanup_actions` uses (review P1R-15) to tell a
+    genuinely-awaiting-cleanup issue from one a fresh dispatch already moved
+    off ai-pr-open (or that never carried it, or no longer exists) within the
+    same poll."""
+    if issue_number is None:
+        return False
+    return any(i.number == issue_number for i in world.issues_with(Label.AI_PR_OPEN))
 
 
 def _issue_for_pr(pr: PRView) -> int | None:
@@ -617,6 +647,10 @@ def decide_fix(
     # 4) Merged/closed PRs → cleanup (lock-free).
     for pr in world.prs:
         if pr_lifecycle(pr).needs_cleanup:
-            actions.extend(cleanup_actions(pr, _issue_for_pr(pr), cfg))
+            issue_n = _issue_for_pr(pr)
+            actions.extend(cleanup_actions(
+                pr, issue_n, cfg,
+                issue_observed_pr_open=_issue_carries_ai_pr_open(world, issue_n),
+            ))
 
     return actions

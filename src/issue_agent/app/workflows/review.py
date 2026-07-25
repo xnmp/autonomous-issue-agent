@@ -152,6 +152,7 @@ class ReviewWorkflow:
         self.store.save_pr_session(pr, result.session_id)
         self.store.set_last_sha(pr, p.head_ref_oid)
         self.store.set_round(pr, 1)
+        self._progress(p)
 
     async def re_review(self, pr: int) -> None:
         if self.cfg.review_mode is review_dom.ReviewMode.MULTI:
@@ -196,6 +197,7 @@ class ReviewWorkflow:
             return
         self.store.set_last_sha(pr, p.head_ref_oid)
         self.store.set_round(pr, round_number)
+        self._progress(p)
 
     async def _gather_legs(self, coros: list) -> list:
         """asyncio.gather that never lets one leg's exception abort the fan-out.
@@ -252,6 +254,7 @@ class ReviewWorkflow:
             sub = review_dom.gate_submission(prior, self.cfg.max_review_rejections)
             if self.gateway.submit_review(pr, sub.event, sub.body):
                 self._persist_review_state(pr, p.head_ref_oid, round_number)
+                self._progress(p)
             else:
                 self._no_progress(p, "gate APPROVE POST failed")
             return
@@ -322,6 +325,23 @@ class ReviewWorkflow:
         if sub.escalate:
             self._escalate(pr, prior + 1)
         self._persist_review_state(pr, p.head_ref_oid, round_number)
+        self._progress(p)
+
+    def _progress(self, p) -> None:
+        """A round DID advance: clear the no-progress tally (the reviewer's twin
+        of review P1R-3's decay).
+
+        Without this the ceiling is a LIFETIME tally: a long-lived PR that
+        accumulates five flaky rounds over weeks of otherwise healthy reviewing
+        escalates on its next needed review, having never actually looped. The
+        counter's question is "is this PR stuck in a non-converging round?", and
+        a confirmed submit answers no — so success resets it, exactly as the fix
+        role's legs do. Keyed off the PRView so it matches `_no_progress`'s
+        `breaker_key(pr)` write with no extra gh call."""
+        try:
+            self.store.clear_infra_deaths(breaker_key(p))
+        except Exception as exc:  # noqa: BLE001 — decay is best-effort, never fatal
+            self.cfg.log(f"review #{p.number}: no-progress counter not cleared ({exc})")
 
     def _persist_review_state(self, pr: int, head_oid: str, round_number: int) -> None:
         """Advance per-PR review state after a confirmed submit. The multi-agent

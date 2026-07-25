@@ -265,6 +265,47 @@ def test_plain_push_to_protected_not_force_allowed():
     assert not gov.find_violations("git push origin HEAD:dev")
 
 
+# ── push destination refs (P1R-10) — the push gate's half of the same parse ───
+# The stateful push gate used to key on the checked-out branch for EVERY push,
+# so `git push origin HEAD:other` was checked against the wrong branch and a
+# detached (mid-rebase) HEAD skipped the gate entirely. It now derives the
+# destination from the argv through this shared parser, so the destructive-push
+# guard and the gate can never disagree about what counts as a refspec.
+def test_push_destination_refs_for_the_real_fixer_argvs():
+    ref = gov.push_destination_refs
+    # no refspec at all → the caller must fall back to the checked-out branch
+    assert ref(["push"]) == ()
+    assert ref(["push", "origin"]) == ()
+    assert ref(["push", "-u", "origin"]) == ()
+    # explicit destinations, in every shape the fixer actually emits
+    assert ref(["push", "origin", "HEAD:refs/heads/fix/42-x"]) == ("fix/42-x",)
+    assert ref(["push", "--force-with-lease", "origin", "fix/42-x"]) == ("fix/42-x",)
+    assert ref(["push", "-u", "origin", "fix/42-x"]) == ("fix/42-x",)
+    assert ref(["push", "origin", "+fix/42-x"]) == ("fix/42-x",)
+    assert ref(["push", "origin", "--delete", "fix/42-x"]) == ("fix/42-x",)
+
+
+def test_push_destination_refs_keeps_the_whole_branch_name():
+    # `_basename` would truncate `fix/42-x` to `42-x`, which is_governed_branch
+    # would then read as UNGOVERNED — the exact silent skip being closed.
+    assert gov.push_destination_refs(
+        ["push", "origin", "refs/heads/feat/7-thing"]
+    ) == ("feat/7-thing",)
+
+
+def test_push_destination_refs_returns_head_alias_verbatim():
+    # Resolving `HEAD` against the checked-out branch is POLICY (domain/gate);
+    # the parser reports what the argv said.
+    assert gov.push_destination_refs(["push", "origin", "HEAD"]) == ("HEAD",)
+
+
+def test_push_destination_refs_ignores_the_remote_slot_and_dedupes():
+    assert gov.push_destination_refs(["push", "fix/42-x"]) == ()   # that's a remote
+    assert gov.push_destination_refs(
+        ["push", "origin", "fix/42-x", "fix/42-x", "feat/1-y"]
+    ) == ("fix/42-x", "feat/1-y")
+
+
 def test_force_push_no_refspec_deferred_to_check_push():
     # No explicit refspec → current branch is runtime state the governor cannot
     # see; defer to the stateful check-push.sh. The bypass guard must NOT fire.

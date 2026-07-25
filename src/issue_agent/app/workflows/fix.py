@@ -79,6 +79,30 @@ class FixWorkflow:
             self.cfg.log(f"prompt input '{method}' unavailable: {exc}")
             return ""
 
+    def _decay_infra_deaths(self, key: int, result) -> None:
+        """A leg that RETURNED a result clears `key`'s infra-death ceiling
+        (review P1R-3, and the residual P0R-3 flagged).
+
+        The counter bounds CONSECUTIVE deaths — "the session keeps dying" — but
+        nothing ever reset it, so it was a lifetime tally: five unrelated deaths
+        spread over a month of otherwise healthy work eventually walk a healthy
+        issue to needs-human-review. The one cleaner that removed it,
+        `cleanup_pr(merged=True)`, only runs on work that already SUCCEEDED —
+        never on the issue that is still trying.
+
+        Any returned result counts, including an errored one: the ceiling asks
+        "did this session survive to deliver anything?", not "was the answer
+        good". An honest failure still marches the ordinary retry breakers,
+        which are what bound it. A key that never returns a result never reaches
+        here, so the loop this ceiling was tuned for still escalates.
+
+        Called instead of, never as well as, the bump sites below — a leg is
+        either an infra death or it is not.
+        """
+        if outcome.infra_death(result.exit_reason):
+            return
+        self.store.clear_infra_deaths(key)
+
     async def _run_logged(self, label: str, issue: int, task):
         self.cfg.log(f"agent #{issue}: {label} — running")
         result = await self.runner.run(task)
@@ -99,6 +123,7 @@ class FixWorkflow:
         task = task_builders.build_resolve_task(issue, iss.title, iss.body, cwd, self.cfg.fix)
         result = await self._run_logged("resolve", issue, task)
         self.store.save_session(issue, result.session_id)
+        self._decay_infra_deaths(issue, result)
         pr = self.gateway.pr_for_issue(issue)
         if outcome.resolve_followup(result, pr is not None) is outcome.ResolveFollowup.RETRY:
             self._bump_resolve_retry(issue, result)
@@ -114,6 +139,7 @@ class FixWorkflow:
                 task_builders.build_author_task(issue, iss.title, iss.body, cwd, self.cfg.fix)
             )
             self.store.save_session(issue, author.session_id)
+            self._decay_infra_deaths(issue, author)
             fu_author = outcome.author_followup(author)
             if fu_author is not outcome.AuthorFollowup.AUTHORED:
                 if fu_author is outcome.AuthorFollowup.RETRY:
@@ -135,6 +161,7 @@ class FixWorkflow:
                 )
             )
             self.store.save_session(issue, impl.session_id)
+            self._decay_infra_deaths(issue, impl)
             pr = self.gateway.pr_for_issue(issue)
             fu = outcome.implement_followup(impl, pr is not None)
             if fu is not outcome.ImplementFollowup.CONTRACT_CHANGE:
@@ -223,14 +250,32 @@ class FixWorkflow:
         self.store.save_session(issue, result.session_id)
         pr = self.gateway.pr_for_issue(issue)
         if outcome.infra_death(result.exit_reason):
-            # review C3/D2c, RETURNED-result half. resume_actions deliberately
-            # does NOTHING on an infra death (the reply must not be consumed by
-            # a session that never ran) — so the issue stays ai-working, the
-            # reaper requeues it, and the next poll pays for the same resume
-            # again with no counter moving anywhere. This is the only bound on
-            # that loop. A leg either raises (AgentDispatcher.dispatch bumps) or
-            # returns (here), never both, so a death is counted exactly once.
+            # review C3/D2c, RETURNED-result half.
+            #
+            # R1-F10: this used to claim resume_actions "does NOTHING… so the
+            # reply must not be consumed by a session that never ran… the
+            # issue stays ai-working, the reaper requeues it, and the next
+            # poll pays for the SAME resume again." Both halves were wrong.
+            # The reply is ALREADY consumed regardless of this session's fate:
+            # set_resumed_at (above) is written BEFORE the run, precisely so
+            # the dedup mark holds even if the session that follows dies —
+            # not only after a successful resume. And the orphaned ai-working
+            # issue is not requeued back into "awaiting the same reply":
+            # domain.fix.reap_actions repairs it to ai-pr-open when it already
+            # has an open PR (the common case here — most resumes happen on an
+            # issue that already opened one; as of HEAD f0b4040, review
+            # P0R-5), or to ai-ready when it does not. Either way the NEXT
+            # poll pays for a fresh RESOLVE or PR-leg dispatch, never "the
+            # same resume again" — issues_needing_resume won't re-fire on a
+            # reply whose timestamp already matches the (pre-run) resumed-at
+            # mark. What this counter actually bounds is that repeat-dispatch
+            # loop — the session dying before producing ANY result, over and
+            # over, with no retry counter of its own to catch it. A leg either
+            # raises (AgentDispatcher.dispatch bumps) or returns (here), never
+            # both, so a death is counted exactly once.
             self.store.bump_infra_deaths(issue)
+        else:
+            self._decay_infra_deaths(issue, result)
         self.executor.execute_all(outcome.resume_actions(issue, result, pr))
 
     async def address_review(self, pr: int) -> None:
@@ -263,6 +308,8 @@ class FixWorkflow:
             # uses, so the decide side reads one key per issue. A leg either
             # raises or returns, so a death is counted exactly once.
             self.store.bump_infra_deaths(issue)
+        else:
+            self._decay_infra_deaths(issue, result)
         if out.bump_retry:
             # Attempt counter keyed to the review being addressed: a count
             # stored under an OLDER review's timestamp restarts at 0 (that
@@ -301,6 +348,7 @@ class FixWorkflow:
         # one PR burned the whole budget on work that never ran).
         if not outcome.infra_death(result.exit_reason):
             self.store.set_ci_retries(issue, self.store.get_ci_retries(issue) + 1)
+            self._decay_infra_deaths(issue, result)
         else:
             # Separate, higher ceiling for the deaths themselves (review C3/D2c)
             # — same key the CI counter uses, so the decide side reads one key.
@@ -321,6 +369,7 @@ class FixWorkflow:
         # Same rule as fix_ci: an infra kill is not a failed rebase attempt.
         if not outcome.infra_death(result.exit_reason):
             self.store.set_rebase_retries(issue, self.store.get_rebase_retries(issue) + 1)
+            self._decay_infra_deaths(issue, result)
         else:
             self.store.bump_infra_deaths(issue)  # review C3/D2c, as in fix_ci
         self.executor.execute_all(outcome.fix_ci_actions(pr, result))

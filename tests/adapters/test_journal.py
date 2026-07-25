@@ -17,9 +17,11 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from issue_agent.adapters.journal import (
+    COST_BLINDSPOT_MIN_RUNS,
     Journal,
     JournalingRuntime,
     alert,
+    cost_blindspot_warning,
     death_key,
     default_ledger_path,
     events_within,
@@ -27,13 +29,14 @@ from issue_agent.adapters.journal import (
     read_events_tail,
     recent_runs,
     repeated_dispatch_warning,
+    spend_blocked_keys,
     sum_issue,
     sum_today,
     unsettled_starts,
 )
 from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
 from issue_agent.app.execute import Executor
-from issue_agent.app.planners.tasks import FixTaskConfig
+from issue_agent.app.planners.tasks import FixTaskConfig, ReviewTaskConfig
 from issue_agent.domain.actions import AgentKind, Relabel, RunAgent, Target
 from issue_agent.domain.agent_task import AgentRuntime, AgentTask
 from issue_agent.domain.labels import Label
@@ -267,6 +270,67 @@ def test_repeated_dispatch_warning_counts_a_start_and_its_settlement_once():
     ]
     assert repeated_dispatch_warning(events, 3600, 5) == "", "8 events, 4 dispatches"
     assert "dispatched 4x" in repeated_dispatch_warning(events, 3600, 4)
+
+
+def test_one_healthy_multi_agent_review_is_not_a_retry_loop():
+    """review P1R-4. A `REVIEW_MODE=multi` dispatch fans a gate + five dimension
+    specialists + validators out under ONE (kind, number), so counting LEGS
+    reported "dispatched 16x … likely a non-converging retry loop" for every
+    healthy review. A warning that is always on is a warning that is off — and
+    this is the only operator-visible signal for the process deaths of P0R-4."""
+    legs = [
+        {"ts": _at(NOW - timedelta(seconds=60 - i)), "event": ev,
+         "kind": "REVIEW", "number": 100, "dispatch": "d1"}
+        for i in range(8)
+        for ev in ("agent_run_start", "agent_run")
+    ]
+    assert repeated_dispatch_warning(legs, 3600, 4) == "", "16 legs, ONE dispatch"
+
+
+def test_five_separate_dispatches_of_one_target_still_warn():
+    """Anti-vacuity twin: collapsing legs must not collapse POLLS. Five
+    consecutive re-dispatches are five paid rounds and the exact shape the
+    detector exists for."""
+    events = [
+        {"ts": _at(NOW - timedelta(minutes=m)), "event": ev,
+         "kind": "REVIEW", "number": 100, "dispatch": f"d{m}"}
+        for m in (50, 40, 30, 20, 10)
+        for ev in ("agent_run_start", "agent_run")
+    ]
+    warning = repeated_dispatch_warning(events, 3600, 5)
+    assert "REVIEW" in warning and "#100" in warning and "dispatched 5x" in warning
+
+
+def test_a_dispatch_is_stamped_when_it_started_not_when_its_last_leg_settled():
+    """The window is measured between dispatches, so a long fan-out must not
+    push its own dispatch outside the span and hide a loop."""
+    events = []
+    for i, minutes in enumerate((59, 40, 20, 1)):
+        events.append({"ts": _at(NOW - timedelta(minutes=minutes)),
+                       "event": "agent_run_start", "kind": "RESOLVE",
+                       "number": 5, "dispatch": f"d{i}"})
+        events.append({"ts": _at(NOW - timedelta(minutes=minutes) + timedelta(minutes=5)),
+                       "event": "agent_run", "kind": "RESOLVE",
+                       "number": 5, "dispatch": f"d{i}"})
+    assert "dispatched 4x" in repeated_dispatch_warning(events, 3600, 4)
+
+
+def test_ided_and_legacy_events_for_one_target_are_each_counted_once():
+    """A journal that spans the upgrade holds both shapes. Neither may be
+    dropped (a missed loop) nor double counted (a phantom one)."""
+    ided = [
+        {"ts": _at(NOW - timedelta(minutes=m)), "event": ev,
+         "kind": "RESOLVE", "number": 5, "dispatch": f"d{m}"}
+        for m in (40, 30)
+        for ev in ("agent_run_start", "agent_run")
+    ]
+    legacy = [
+        {"ts": _at(NOW - timedelta(minutes=m)), "event": "agent_run",
+         "kind": "RESOLVE", "number": 5}
+        for m in (20, 10)
+    ]
+    assert repeated_dispatch_warning(ided + legacy, 3600, 5) == "", "4 dispatches"
+    assert "dispatched 4x" in repeated_dispatch_warning(ided + legacy, 3600, 4)
 
 
 def test_repeated_dispatch_warning_still_reads_a_journal_with_no_start_events():
@@ -806,12 +870,14 @@ class RecordingRunner:
 
 
 def _cap_dispatcher(tmp_path, ledger, *, issue_cap=0.0, daily_cap=0.0,
-                    alert_cmd="", gw=None, logs=None):
+                    alert_cmd="", gw=None, logs=None, trigger_label="ai-pr-open"):
     gw = gw or CapGateway()
     runner = RecordingRunner()
     journal = Journal(str(tmp_path / "j.jsonl"))
     cfg = DispatchConfig(
         fix=FixTaskConfig("o/r", agent_md="AM"),
+        review=ReviewTaskConfig("o/r"),
+        review_trigger_label=trigger_label,
         role="fix", repo="o/r", spend_ledger_path=ledger,
         issue_spend_cap_usd=issue_cap, daily_spend_cap_usd=daily_cap,
         alert_cmd=alert_cmd,
@@ -864,6 +930,15 @@ class _FakeStore:
     def set_ci_retries(self, i, n):
         pass
 
+    def get_infra_deaths(self, key):
+        return 0
+
+    def bump_infra_deaths(self, key):
+        return 1
+
+    def clear_infra_deaths(self, key):
+        pass
+
 
 def test_issue_cap_escalates_to_needs_human_review_and_never_dispatches(tmp_path):
     ledger = _write(str(tmp_path / "spend.jsonl"), _spend(NOW, 30.0, issue=5))
@@ -912,12 +987,108 @@ def test_zero_disables_a_cap(tmp_path):
 
 
 def test_pr_keyed_kinds_resolve_their_issue_for_the_per_issue_cap(tmp_path):
+    """The cap is charged to the ISSUE behind the PR — but the escalation moves
+    the PR, because a PR leg is picked from the PR's own labels (review P1R-2).
+    Relabelling only the issue left the PR ai-pr-open and pickable, so the very
+    next poll hit the same cap again."""
     ledger = _write(str(tmp_path / "spend.jsonl"), _spend(NOW, 30.0, issue=5))
     gw = CapGateway(issue_for_pr={100: 5})
-    d, gw, runner, _ = _cap_dispatcher(tmp_path, ledger, issue_cap=25.0, gw=gw)
+    d, gw, runner, journal = _cap_dispatcher(tmp_path, ledger, issue_cap=25.0, gw=gw)
     asyncio.run(d.dispatch(RunAgent(AgentKind.FIX_CI, 100)))
     assert runner.runs == 0
+    assert ("relabel", "pr", 100, "ai-pr-open", "needs-human-review") in gw.calls
+    # …and the money is still attributed to the issue that spent it.
+    block = [e for e in read_events(journal.path) if e["event"] == "spend_block"][0]
+    assert block["issue"] == 5 and (block["target"], block["number"]) == ("pr", 100)
+
+
+def test_a_review_leg_escalates_the_pr_from_the_configured_trigger_label(tmp_path):
+    """A repo where another bot owns ai-pr-open runs the reviewer on ai-review;
+    removing the wrong label leaves the PR in the reviewer's pickable set
+    forever (review M10/D4), which is the loop this escalation exists to end."""
+    ledger = _write(str(tmp_path / "spend.jsonl"), _spend(NOW, 30.0, issue=5))
+    gw = CapGateway(issue_for_pr={100: 5})
+    d, gw, _, _ = _cap_dispatcher(
+        tmp_path, ledger, issue_cap=25.0, gw=gw, trigger_label="ai-review")
+    asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
+    assert ("relabel", "pr", 100, "ai-review", "needs-human-review") in gw.calls
+
+
+def test_an_issue_keyed_leg_still_escalates_the_issue(tmp_path):
+    """Anti-vacuity twin of the two above: RESOLVE is gated on the ISSUE's
+    labels, so moving the PR there would escalate nothing that stops dispatch."""
+    ledger = _write(str(tmp_path / "spend.jsonl"), _spend(NOW, 30.0, issue=5))
+    d, gw, _, _ = _cap_dispatcher(tmp_path, ledger, issue_cap=25.0)
+    asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
     assert ("relabel", "issue", 5, "ai-working", "needs-human-review") in gw.calls
+
+
+def test_ten_polls_of_a_capped_leg_emit_one_block_and_one_alert(tmp_path):
+    """review P1R-2. A cap is a LEVEL, not an event: it stays tripped on every
+    later poll. Un-deduped that was 10 journal events + 10 ALERT_CMD subprocesses
+    per 10 polls — ~4,300 a day at POLL_SECONDS=20, which is how a pager gets
+    muted. The gateway here never actually applies the escalation (the PR keeps
+    coming back), which is exactly the wedged shape that produced the flood."""
+    ledger = _write(str(tmp_path / "spend.jsonl"), _spend(NOW, 30.0, issue=5))
+    sink = tmp_path / "alerts.jsonl"
+    gw = CapGateway(issue_for_pr={100: 5})
+    d, gw, runner, journal = _cap_dispatcher(
+        tmp_path, ledger, issue_cap=25.0, gw=gw, alert_cmd=f"cat >> {sink}")
+
+    for _ in range(10):
+        asyncio.run(d.dispatch(RunAgent(AgentKind.FIX_CI, 100)))
+
+    assert runner.runs == 0
+    blocks = [e for e in read_events(journal.path) if e["event"] == "spend_block"]
+    assert len(blocks) == 1, "the block is an edge, not a level"
+    payloads = [json.loads(ln) for ln in sink.read_text().splitlines() if ln.strip()]
+    assert [p["event"] for p in payloads].count("spend_block") == 1
+
+
+def test_the_block_dedup_survives_a_restart(tmp_path):
+    """The flood shape is a wedged daemon under `Restart=always`, so an
+    in-process set alone is empty again every few seconds. A SECOND dispatcher
+    over the same journal — a restarted daemon — must stay silent."""
+    ledger = _write(str(tmp_path / "spend.jsonl"), _spend(NOW, 30.0, issue=5))
+    first, _, _, journal = _cap_dispatcher(
+        tmp_path, ledger, issue_cap=25.0, gw=CapGateway(issue_for_pr={100: 5}))
+    asyncio.run(first.dispatch(RunAgent(AgentKind.FIX_CI, 100)))
+
+    restarted, _, _, _ = _cap_dispatcher(
+        tmp_path, ledger, issue_cap=25.0, gw=CapGateway(issue_for_pr={100: 5}))
+    asyncio.run(restarted.dispatch(RunAgent(AgentKind.FIX_CI, 100)))
+
+    assert len([e for e in read_events(journal.path) if e["event"] == "spend_block"]) == 1
+
+
+def test_a_different_capped_issue_still_gets_its_own_block(tmp_path):
+    """Anti-vacuity twin: a dedup keyed too coarsely would silence every issue
+    after the first, and the second issue's block is new information."""
+    ledger = _write(str(tmp_path / "spend.jsonl"),
+                    _spend(NOW, 30.0, issue=5), _spend(NOW, 30.0, issue=6))
+    d, _, _, journal = _cap_dispatcher(tmp_path, ledger, issue_cap=25.0)
+
+    asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
+    asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 6)))
+
+    blocks = [e for e in read_events(journal.path) if e["event"] == "spend_block"]
+    assert {b["issue"] for b in blocks} == {5, 6}
+
+
+def test_the_daily_block_is_keyed_to_the_utc_day_it_pauses(tmp_path):
+    """The daily cap heals itself at 00:00 UTC, so its dedup must too — a key
+    without the date would silence the pause forever after the first day."""
+    ledger = _write(str(tmp_path / "spend.jsonl"),
+                    _spend(datetime.now(timezone.utc), 60.0))
+    d, _, _, journal = _cap_dispatcher(tmp_path, ledger, daily_cap=50.0)
+
+    for _ in range(5):
+        asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
+
+    blocks = [e for e in read_events(journal.path) if e["event"] == "spend_block"]
+    assert len(blocks) == 1
+    today = datetime.now(timezone.utc).date().isoformat()
+    assert blocks[0]["block_key"] == f"daily:{today}"
 
 
 def test_an_unresolvable_issue_costs_attribution_not_a_block(tmp_path):
@@ -947,6 +1118,90 @@ def test_caps_are_inert_without_a_ledger_path(tmp_path):
     d, _, runner, _ = _cap_dispatcher(tmp_path, "", issue_cap=25.0, daily_cap=50.0)
     asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
     assert runner.runs == 1
+
+
+# ── the caps are blind when every run costs $0 (review P1R-5) ────────────────
+def _zero_runs(n, cost=0.0):
+    return [{"ts": _at(NOW), "event": "agent_run", "kind": "RESOLVE",
+             "number": 5, "cost_usd": cost} for _ in range(n)]
+
+
+def test_a_ledger_that_can_never_receive_a_line_is_announced():
+    """`_record` writes a ledger line only when cost > 0 — right, because a
+    $0.00 line is noise in the file both caps scan every dispatch. But a
+    subscription plan reports $0.00 for EVERY run, so the ledger stays empty,
+    both caps read $0.00 forever and neither can fire for any loop shape. The
+    operator has to be told the cap they configured is inert."""
+    warning = cost_blindspot_warning(
+        _zero_runs(COST_BLINDSPOT_MIN_RUNS),
+        issue_spend_cap_usd=25.0, daily_spend_cap_usd=50.0,
+    )
+    assert warning is not None
+    assert "$25.00" in warning and "$50.00" in warning
+    assert "$0.00" in warning and "NEITHER cap can ever fire" in warning
+
+
+def test_one_costed_run_proves_the_ledger_works_and_silences_the_warning():
+    """Anti-vacuity twin: on a metered plan this must say nothing at all, or it
+    becomes the permanently-on line operators learn to scroll past."""
+    runs = _zero_runs(COST_BLINDSPOT_MIN_RUNS) + _zero_runs(1, cost=0.42)
+    assert cost_blindspot_warning(
+        runs, issue_spend_cap_usd=25.0, daily_spend_cap_usd=50.0) is None
+
+
+def test_no_armed_cap_means_nothing_to_be_blind_about():
+    assert cost_blindspot_warning(
+        _zero_runs(50), issue_spend_cap_usd=0.0, daily_spend_cap_usd=0.0) is None
+
+
+def test_too_few_runs_is_not_yet_evidence():
+    """One free run is a session that died before billing, not a blind cap."""
+    assert cost_blindspot_warning(
+        _zero_runs(COST_BLINDSPOT_MIN_RUNS - 1),
+        issue_spend_cap_usd=25.0, daily_spend_cap_usd=50.0) is None
+
+
+def test_the_dispatcher_warns_once_when_its_caps_cannot_see_a_dollar(tmp_path):
+    """End to end through the dispatcher: a journal of free runs + an armed cap
+    → exactly ONE line, however many dispatches follow."""
+    ledger = str(tmp_path / "spend.jsonl")
+    _write(str(tmp_path / "j.jsonl"),
+           *[json.dumps(r) for r in _zero_runs(COST_BLINDSPOT_MIN_RUNS)])
+    logs: list[str] = []
+    d, _, runner, journal = _cap_dispatcher(
+        tmp_path, ledger, issue_cap=25.0, logs=logs)
+
+    asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
+    asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
+
+    assert runner.runs == 2, "a blind cap must not also block work"
+    blind = [ln for ln in logs if "NEITHER cap can ever fire" in ln]
+    assert len(blind) == 1
+    assert len([e for e in read_events(journal.path)
+                if e["event"] == "cost_blindspot"]) == 1
+
+
+def test_the_dispatcher_stays_silent_when_the_ledger_is_being_written(tmp_path):
+    """Anti-vacuity twin: the same journal with costed runs must produce no line
+    — otherwise the warning is decoration, not a signal."""
+    ledger = str(tmp_path / "spend.jsonl")
+    _write(str(tmp_path / "j.jsonl"),
+           *[json.dumps(r) for r in _zero_runs(COST_BLINDSPOT_MIN_RUNS, cost=1.0)])
+    logs: list[str] = []
+    d, _, _, _ = _cap_dispatcher(tmp_path, ledger, issue_cap=100.0, logs=logs)
+
+    asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
+
+    assert [ln for ln in logs if "NEITHER cap can ever fire" in ln] == []
+
+
+def test_spend_blocked_keys_reads_only_keyed_blocks():
+    events = [
+        {"event": "spend_block", "block_key": "issue:o/r:5"},
+        {"event": "spend_block", "scope": "daily"},          # pre-upgrade line
+        {"event": "agent_run", "block_key": "issue:o/r:9"},  # not a block
+    ]
+    assert spend_blocked_keys(events) == {"issue:o/r:5"}
 
 
 def test_dispatcher_tags_the_runtime_with_the_dispatch_context(tmp_path):

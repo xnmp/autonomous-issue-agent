@@ -319,6 +319,80 @@ def test_cleanup_pr_issueless_unmerged_is_a_noop():
     assert s.automerge_enabled(100) is True
 
 
+# ── P1R-16: an issueless PR's NEGATED-key counters were never cleaned ───────
+# `domain.fix.breaker_key` falls back to the NEGATED pr number for a PR with
+# no resolvable issue, so infra-deaths (at least) for such a PR accumulates at
+# issue_path(-pr, "infra-deaths") — e.g. the literal file "issue--112.infra-
+# deaths". Before the fix, cleanup_pr(112, None, …) cleared ONLY pr-112.* and
+# this namespace leaked forever — reachable in production any time an
+# issueless PR's fixer leg dies pre-result enough times to trip the infra
+# ceiling and then gets merged/closed.
+def test_cleanup_pr_issueless_merged_clears_the_negated_key_issue_state():
+    s, _ = _store()
+    s.mark_automerge(100)
+    s.bump_infra_deaths(-100)          # the negated-PR breaker key
+    s.cleanup_pr(100, None, merged=True)
+    assert s.automerge_enabled(100) is False       # PR-side still clears (regression guard)
+    assert s.get_infra_deaths(-100) == 0           # NEW: the negated-key namespace clears too
+
+
+def test_cleanup_pr_issueless_unmerged_keeps_negated_key_infra_deaths():
+    # anti-vacuity twin, mirroring the real-issue conservatism (handover
+    # §5.7): the closed-unmerged path clears only resume-blocking markers, so
+    # infra-deaths under the negated key must survive — proving the fix
+    # routes through clear_issue_resume_state, not a blanket clear_issue.
+    s, _ = _store()
+    s.mark_automerge(100)
+    s.bump_infra_deaths(-100)
+    s.cleanup_pr(100, None, merged=False)
+    assert s.automerge_enabled(100) is True        # PR-side untouched, as before
+    assert s.get_infra_deaths(-100) == 1           # kept — same conservatism as a real issue
+
+
+# ── namespace-level coverage across ALL THREE path methods (review P1R-16 /
+# process finding §5) ────────────────────────────────────────────────────────
+# The two suffix-only tests above are blind to two distinct gaps: (1) a key
+# NAMESPACE distinct from the issue/PR number itself — the negated-PR breaker
+# key `-pr` shares every suffix STRING with a real issue, so a suffix-only
+# diff can never see that `issue--112.*` needed its own clear call (P1R-16's
+# core bug); (2) a path method that carries NO suffix parameter at all —
+# `triage_at_path`'s "at" is baked into its f-string, not passed as an
+# argument, so it never appears in the suffix regex and was silently absent
+# from BOTH `_ISSUE_SUFFIXES`/`_PR_SUFFIXES`. This test derives both the
+# "used" and "cleared" sides independently from Store's own source and asserts
+# SET EQUALITY — never membership of a couple of examples (§5's lesson: an
+# absence bug survives a membership check by construction).
+def _triage_at_has_a_cleaner() -> bool:
+    """Does Store's OWN source retire `triage_at_path` from within a
+    `_remove` call anywhere (a cleaner) — as opposed to only ever reading it
+    (`get_triage_at`) or writing it (`set_triage_at`)?"""
+    src = inspect.getsource(Store)
+    return bool(re.search(r"self\._remove\(self\.triage_at_path\(", src))
+
+
+def test_every_state_namespace_across_all_three_path_methods_has_a_cleaner():
+    used = {("issue_path", s) for s in _accessor_suffixes("issue_path")}
+    used |= {("pr_path", s) for s in _accessor_suffixes("pr_path")}
+    used.add(("triage_at_path", None))  # single fixed namespace, no suffix param
+
+    cleared = {("issue_path", s) for s in store_module._ISSUE_SUFFIXES}
+    cleared |= {("pr_path", s) for s in store_module._PR_SUFFIXES}
+    if _triage_at_has_a_cleaner():
+        cleared.add(("triage_at_path", None))
+
+    assert used == cleared
+
+
+def test_namespace_coverage_check_is_not_vacuously_true():
+    # anti-vacuity twin: prove the SET EQUALITY check above can actually FAIL.
+    # Simulate the pre-fix shape (a namespace nothing clears) and confirm the
+    # equality breaks — otherwise the test above could pass "by construction"
+    # regardless of whether clear_issue genuinely retires triage_at_path.
+    used = {("triage_at_path", None)}
+    cleared: set[tuple[str, str | None]] = set()
+    assert used != cleared
+
+
 # ── .harness markers ──
 def test_harness_markers():
     with tempfile.TemporaryDirectory() as root:

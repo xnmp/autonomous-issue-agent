@@ -290,9 +290,9 @@ class FakeGh:
         return self.result
 
 
-def _ctx_with_gh(gh, branch="fix/5-x"):
+def _ctx_with_gh(gh, branch="fix/5-x", repo="acme/app"):
     return build_gate_context(
-        "/wt", base_branch="dev", git=_builder_git(branch=branch), gh=gh,
+        "/wt", base_branch="dev", repo=repo, git=_builder_git(branch=branch), gh=gh,
         retry_sleep=lambda: None,
     )
 
@@ -304,35 +304,66 @@ def test_build_gate_context_does_not_call_gh_until_a_push_is_gated():
 
     ctx = _ctx_with_gh(gh)
 
-    assert gh.calls == []                       # built without touching GitHub
-    assert ctx.open_pr() is OpenPrLookup.OPEN   # …and answers when asked
+    assert gh.calls == []                              # built without touching GitHub
+    assert ctx.open_pr("fix/5-x") is OpenPrLookup.OPEN  # …and answers when asked
     assert len(gh.calls) == 1
 
 
-def test_open_pr_probe_asks_about_the_current_branch_with_an_explicit_limit():
+def test_open_pr_probe_asks_about_the_branch_it_was_given_with_an_explicit_limit():
+    """P1R-10 at the adapter seam: the probe answers about the branch the PUSH
+    WRITES, which the caller passes in — not about whatever HEAD happens to be."""
     gh = FakeGh(GitResult(0, "[]"))
-    _ctx_with_gh(gh, branch="fix/9-thing").open_pr()
+    _ctx_with_gh(gh, branch="fix/9-thing").open_pr("fix/42-elsewhere")
 
     (argv, cwd), = gh.calls
     assert argv[:2] == ["pr", "list"]
-    assert "--head" in argv and argv[argv.index("--head") + 1] == "fix/9-thing"
+    assert "--head" in argv and argv[argv.index("--head") + 1] == "fix/42-elsewhere"
     assert "--state" in argv and argv[argv.index("--state") + 1] == "open"
     assert "--limit" in argv          # review C2: a list call always states its ceiling
     assert cwd == "/wt"               # asked from inside the worktree
 
 
+# ── P1R-11: the probe was the ONE gh call in the harness with no --repo ───────
+# Unpinned, gh resolves a repo from the worktree's remotes; on a fork/two-remote
+# checkout that can be the WRONG repo, where this branch has no PR → NONE → the
+# gate silently does not apply. That is the exact bypass OpenPrLookup exists to
+# kill, wearing a valid-looking answer.
+def test_p1r_11_open_pr_probe_pins_the_repo():
+    gh = FakeGh(GitResult(0, "[]"))
+    _ctx_with_gh(gh, repo="acme/app").open_pr("fix/5-x")
+
+    (argv, _cwd), = gh.calls
+    assert "--repo" in argv and argv[argv.index("--repo") + 1] == "acme/app"
+
+
+def test_p1r_11_unpinned_probe_still_works_but_warns_loudly(capsys, monkeypatch):
+    """Anti-vacuity twin: an unwired repo does not break the probe (the wiring
+    lives in the orchestrator), but it must not degrade in silence — §5's rule
+    for absence bugs. The warning is once-per-process, so reset the latch."""
+    monkeypatch.setattr(wt_mod, "_repo_unset_warned", False)
+    gh = FakeGh(GitResult(0, "[]"))
+
+    assert _ctx_with_gh(gh, repo="").open_pr("fix/5-x") is OpenPrLookup.NONE
+
+    (argv, _cwd), = gh.calls
+    assert "--repo" not in argv
+    err = capsys.readouterr().err
+    assert "--repo" in err and "push gate" in err.lower()
+
+
 def test_open_pr_probe_reports_open_none_and_error_distinctly():
     """The tri-state's whole point: a failed lookup must NOT look like 'no PR'."""
-    assert _ctx_with_gh(FakeGh(GitResult(0, '[{"number": 7}]'))).open_pr() is OpenPrLookup.OPEN
-    assert _ctx_with_gh(FakeGh(GitResult(0, "[]"))).open_pr() is OpenPrLookup.NONE
-    assert _ctx_with_gh(FakeGh(GitResult(1, ""))).open_pr() is OpenPrLookup.ERROR
+    assert _ctx_with_gh(
+        FakeGh(GitResult(0, '[{"number": 7}]'))).open_pr("fix/5-x") is OpenPrLookup.OPEN
+    assert _ctx_with_gh(FakeGh(GitResult(0, "[]"))).open_pr("fix/5-x") is OpenPrLookup.NONE
+    assert _ctx_with_gh(FakeGh(GitResult(1, ""))).open_pr("fix/5-x") is OpenPrLookup.ERROR
 
 
 def test_open_pr_probe_reports_error_on_unreadable_output():
     """Blank / malformed / non-list output on a 0 exit is an answer we cannot
     read — an error, never an absence."""
     for out in ("", "not json", "null", '{"number": 7}'):
-        assert _ctx_with_gh(FakeGh(GitResult(0, out))).open_pr() is OpenPrLookup.ERROR
+        assert _ctx_with_gh(FakeGh(GitResult(0, out))).open_pr("fix/5-x") is OpenPrLookup.ERROR
 
 
 def test_default_gh_runner_is_bounded_and_reports_error_on_timeout(monkeypatch):
@@ -346,9 +377,9 @@ def test_default_gh_runner_is_bounded_and_reports_error_on_timeout(monkeypatch):
         raise subprocess.TimeoutExpired(argv, kwargs.get("timeout", 0))
 
     monkeypatch.setattr(wt_mod.subprocess, "run", fake_run)
-    ctx = build_gate_context("/wt", base_branch="dev", git=_builder_git())
+    ctx = build_gate_context("/wt", base_branch="dev", repo="acme/app", git=_builder_git())
 
-    assert ctx.open_pr() is OpenPrLookup.ERROR
+    assert ctx.open_pr("fix/5-x") is OpenPrLookup.ERROR
     assert seen["argv"][0] == "gh"
     assert seen["kwargs"]["timeout"] > 0        # bounded from day one
 
@@ -359,9 +390,9 @@ def test_default_gh_runner_reports_error_when_gh_is_missing(monkeypatch):
         raise FileNotFoundError("gh")
 
     monkeypatch.setattr(wt_mod.subprocess, "run", boom)
-    ctx = build_gate_context("/wt", base_branch="dev", git=_builder_git())
+    ctx = build_gate_context("/wt", base_branch="dev", repo="acme/app", git=_builder_git())
 
-    assert ctx.open_pr() is OpenPrLookup.ERROR
+    assert ctx.open_pr("fix/5-x") is OpenPrLookup.ERROR
 
 
 def test_default_gh_runner_returns_open_for_a_listed_pr(monkeypatch):
@@ -372,16 +403,16 @@ def test_default_gh_runner_returns_open_for_a_listed_pr(monkeypatch):
         stdout = '[{"number": 7}]'
 
     monkeypatch.setattr(wt_mod.subprocess, "run", lambda argv, **kw: Done())
-    ctx = build_gate_context("/wt", base_branch="dev", git=_builder_git())
+    ctx = build_gate_context("/wt", base_branch="dev", repo="acme/app", git=_builder_git())
 
-    assert ctx.open_pr() is OpenPrLookup.OPEN
+    assert ctx.open_pr("fix/5-x") is OpenPrLookup.OPEN
 
 
-def _context_for_push(gh):
+def _context_for_push(gh, run_tests=lambda cmd: False, **kw):
     return build_gate_context(
-        "/wt", base_branch="dev", git=_builder_git(), gh=gh,
-        env_test_cmd="pytest", run_tests=lambda cmd: False,   # suite is RED
-        retry_sleep=lambda: None,
+        "/wt", base_branch="dev", repo="acme/app", git=_builder_git(), gh=gh,
+        env_test_cmd="pytest", run_tests=run_tests,   # suite is RED by default
+        retry_sleep=lambda: None, **kw,
     )
 
 
@@ -398,11 +429,59 @@ def test_a_built_context_actually_arms_the_push_gate():
     assert allowed.allowed
 
 
-def test_a_built_context_fails_a_push_closed_when_gh_cannot_answer():
-    """…and a `gh` that cannot answer denies rather than waving the push through
-    (the collapse of "could not look" into "no PR" that the bash used to make)."""
+def test_a_built_context_still_checks_a_push_when_gh_cannot_answer():
+    """P1R-12 end-to-end: a `gh` that cannot answer no longer denies outright
+    (that stalled `gh pr create` under a rate limit) — it runs the state-derived
+    checks, and the failing suite is what denies."""
     gh = FakeGh(GitResult(1, ""))
     v = evaluate_command("git push", _context_for_push(gh))
 
-    assert not v.allowed and "could not verify PR state" in v.reason
+    assert not v.allowed
+    assert "local test suite failed" in v.reason
+    assert "lookup for 'fix/5-x' failed" in v.reason
     assert len(gh.calls) == 2  # the domain's retry actually reached gh twice
+
+
+def test_a_built_context_allows_a_clean_push_when_gh_cannot_answer():
+    """Anti-vacuity twin: with everything clean, an unknown PR state costs a test
+    run and lets the push through — the pre-PR push that used to be denied."""
+    gh = FakeGh(GitResult(1, ""))
+    v = evaluate_command("git push", _context_for_push(gh, run_tests=lambda cmd: True))
+
+    assert v.allowed
+
+
+# ── P1R-18: the operator's TEST_CMD outranks the agent-written marker ─────────
+def test_p1r_18_built_context_runs_the_operator_test_cmd_not_the_agents(tmp_path):
+    """`echo true > .harness/test-cmd` used to disarm §1 and §10 in one line. The
+    built context must resolve the OPERATOR's command for both the gate rules and
+    the §10 revert simulation."""
+    hdir = tmp_path / ".harness"
+    hdir.mkdir()
+    (hdir / "test-cmd").write_text("true\n")
+    ran: list[str] = []
+    ctx = build_gate_context(
+        str(tmp_path), base_branch="dev", repo="acme/app", git=_builder_git(),
+        env_test_cmd="make test", run_tests=lambda cmd: ran.append(cmd) or False,
+    )
+
+    assert ctx.harness_test_cmd == "true"          # the marker is still READ…
+    assert ctx.env_test_cmd == "make test"
+    ctx.revert_and_run(("src/x.py",))              # …but §10 runs the operator's
+    assert ran == ["make test"]
+
+
+def test_p1r_18_built_context_falls_back_to_the_marker_without_an_operator_cmd(tmp_path):
+    """Anti-vacuity twin: with no TEST_CMD the marker is still the whole answer
+    (the test-discovery path writes it for exactly those repos)."""
+    hdir = tmp_path / ".harness"
+    hdir.mkdir()
+    (hdir / "test-cmd").write_text("pytest tests/test_x.py\n")
+    ran: list[str] = []
+    ctx = build_gate_context(
+        str(tmp_path), base_branch="dev", repo="acme/app", git=_builder_git(),
+        env_test_cmd=None, run_tests=lambda cmd: ran.append(cmd) or False,
+    )
+
+    ctx.revert_and_run(("src/x.py",))
+    assert ran == ["pytest tests/test_x.py"]

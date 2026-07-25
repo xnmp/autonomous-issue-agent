@@ -181,6 +181,23 @@ class Store:
         self._write(path, str(n))
         return n
 
+    def clear_infra_deaths(self, key: int) -> None:
+        """Decay: this key just produced a RETURNED result, so the transport and
+        the process are demonstrably alive (review P1R-3/P0R-3 residual).
+
+        The counter bounds CONSECUTIVE deaths — "the session keeps dying" — and
+        without a reset it is a lifetime tally instead: five unrelated deaths
+        spread over a month of otherwise healthy work eventually walk a healthy
+        issue to needs-human-review, and the cleanup path only clears it on a
+        MERGED PR, which is precisely the issue that never got there. A key that
+        never returns a result never reaches this, so the loop it was tuned for
+        still escalates.
+
+        Uses `_remove` rather than writing "0": absent and zero already read
+        identically (`_read_int` defaults to 0), and not creating a file is the
+        only form that cannot leave a torn one behind."""
+        self._remove(self.issue_path(key, "infra-deaths"))
+
     def get_review_retry(self, issue: int) -> tuple[str, int]:
         """(review_at, count). Bash stored "<at> <n>" in issue-N.review-retries."""
         raw = self._read(self.issue_path(issue, "review-retries"))
@@ -252,9 +269,15 @@ class Store:
     def clear_issue(self, issue: int) -> None:
         """Full issue-state retirement. Derives from `_ISSUE_SUFFIXES` (review
         M4) so a suffix added anywhere above and forgotten here fails
-        test_store.py's coverage test instead of leaking a file forever."""
+        test_store.py's coverage test instead of leaking a file forever.
+
+        Also retires the steward's triage baseline (`triage-N.at`, via
+        `triage_at_path`; review P1R-16) — a suffix-less namespace that
+        `_ISSUE_SUFFIXES` can't carry (triage_at_path takes no suffix
+        argument), and that consequently had NO cleaner at all before this."""
         for suffix in _ISSUE_SUFFIXES:
             self._remove(self.issue_path(issue, suffix))
+        self._remove(self.triage_at_path(issue))
 
     def clear_pr_review(self, pr: int) -> None:
         """Full PR-state retirement, incl. the automerge marker (review M4:
@@ -286,13 +309,25 @@ class Store:
         merged=False → closed-unmerged requeue: only the resume-blocking
                        markers on the issue are cleared; resolve-retries/
                        infra-deaths persist on purpose (handover §5.7). PR-side
-                       state is left alone — the PR is dead, not reused."""
+                       state is left alone — the PR is dead, not reused.
+
+        `issue=None` (review P1R-16): `domain.fix.breaker_key` falls back to
+        the NEGATED pr number for a PR with no resolvable issue, so counters
+        such as infra-deaths for that PR accumulate at `issue_path(-pr, …)` —
+        e.g. `issue--112.infra-deaths` — a namespace this method used to leave
+        untouched forever (it only ever cleared `pr-N.*`, and the "exactly one
+        cleaner" coverage test was blind to the gap because it introspects
+        SUFFIXES, not key namespaces: `issue-9.infra-deaths` and
+        `issue--112.infra-deaths` share the same suffix). Route the negated
+        key through the SAME clear_issue/clear_issue_resume_state helpers a
+        real issue gets, instead of a bespoke clear, so any suffix later added
+        to `_ISSUE_SUFFIXES` stays covered here automatically too."""
+        issue_key = issue if issue is not None else -pr
         if merged:
             self.clear_pr_review(pr)
-            if issue is not None:
-                self.clear_issue(issue)
-        elif issue is not None:
-            self.clear_issue_resume_state(issue)
+            self.clear_issue(issue_key)
+        else:
+            self.clear_issue_resume_state(issue_key)
 
 
 # ── worktree .harness/ markers (the agent's on-disk declaration) ──────────────

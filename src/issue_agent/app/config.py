@@ -6,6 +6,7 @@ Names mirror config/agent.env.example so operators carry the same env file over.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, fields
 
@@ -424,6 +425,22 @@ class HarnessConfig:
             # poll: an empty REPO means a missing/mis-composed overlay (the
             # silent-default class, #50).
             errors.append("REPO must be set (owner/name) — is the repo overlay composed?")
+        if not (self.fix_bot or "").strip():
+            # review P1R-7: an unset FIX_BOT used to pass validate() silently.
+            # Worse, `login_eq("", "")` used to be True, so with fix_bot=="" a
+            # PR whose author the adapter could not resolve (`author: null` ->
+            # "", e.g. a deleted/ghost account) read as OURS — the opposite of
+            # the fail-safe the authorship filter's own comment claimed.
+            # login_eq now refuses to match two unknowns (see identity.py),
+            # but a harness that never has a real FIX_BOT identity to compare
+            # against is still misconfigured and must not start silently —
+            # `install-systemd.sh` starts the unit directly and never runs
+            # doctor, so this is the ONLY gate on the production path.
+            errors.append(
+                "FIX_BOT must be set — an unset FIX_BOT means the fixer's own "
+                "PRs/reviews can never be identified, and (pre-P1R-7) let an "
+                "unresolvable PR author read as the fixer's own"
+            )
         if self.identity_mode == IdentityMode.THREE and normalize_login(self.fix_bot) == normalize_login(
             self.review_bot
         ):
@@ -514,14 +531,37 @@ def render_agent_md(text: str, cfg: "HarnessConfig") -> str:
     return text
 
 
-def _b(env: dict, key: str, default: bool) -> bool:
+# review P1R-8: the recognized true/false spellings. Deliberately explicit
+# (not "anything not in the false set is true") — an unrecognized token now
+# falls back to `default` + a validation-error entry instead of silently
+# defaulting truthy, matching `_coerce_int`'s malformed-value contract.
+_TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
+_FALSE_TOKENS = frozenset({"0", "false", "no", "off"})
+
+
+def _b(env: dict, key: str, default: bool, errors: list[str]) -> bool:
     v = env.get(key)
     if v is None or v.strip() == "":
         # review M2: an exported-but-empty knob (AUTO_MERGE= with nothing after
         # the `=`) must mean UNSET, not False — a raw `v not in (...)` treated
         # "" as a falsy token, silently flipping every default-ON flag off.
         return default
-    return v not in ("0", "false", "no", "off")
+    # review P1R-8: compared unstripped and case-sensitively — `AUTO_MERGE=False`
+    # (capital F) matched neither raw string in the old false-tuple, so it fell
+    # through to the "anything else is true" branch and turned auto-merge ON
+    # when the operator explicitly asked for it off. Every boolean knob shared
+    # this bug. strip().casefold() first, so "False"/" FALSE "/"no"/"Off" all
+    # normalize the same way "fix-bot[BOT]" does in identity.py.
+    token = v.strip().casefold()
+    if token in _TRUE_TOKENS:
+        return True
+    if token in _FALSE_TOKENS:
+        return False
+    errors.append(
+        f"{key} must be one of {sorted(_TRUE_TOKENS | _FALSE_TOKENS)}, "
+        f"got {v!r} — using default {default}"
+    )
+    return default
 
 
 def _require_non_negative(errors: list[str], name: str, value: int | float) -> None:
@@ -565,15 +605,28 @@ def _coerce_float(env: dict, key: str, default: float, errors: list[str]) -> flo
     """Float twin of `_coerce_int` — same empty=unset / malformed=fallback+error
     contract. Closes the ISSUE_SPEND_CAP_USD hole specifically: `float(v or 0)`
     used to make an exported-but-empty cap silently mean "disabled" instead of
-    "use the default"."""
+    "use the default".
+
+    review P1R-9: bare `float()` also happily parses `"nan"`/`"inf"`/`"1e400"`,
+    and every range check downstream (`_require_non_negative`: `value < 0`) is
+    False for `nan` — so `ISSUE_SPEND_CAP_USD=nan` disabled the cap it names
+    and `AGENT_MAX_RUNTIME_SECONDS=nan` disabled the wall cap, both silently.
+    `math.isfinite` rejects non-finite results the same way a genuinely
+    malformed string is rejected: fall back to `default`, record why."""
     raw = env.get(key)
     if raw is None or raw.strip() == "":
         return default
     try:
-        return float(raw.strip())
+        value = float(raw.strip())
     except ValueError:
         errors.append(f"{key} must be a number, got {raw!r} — using default {default}")
         return default
+    if not math.isfinite(value):
+        errors.append(
+            f"{key} must be a finite number, got {raw!r} — using default {default}"
+        )
+        return default
+    return value
 
 
 def _coerce_identity_mode(env: dict, errors: list[str]) -> IdentityMode:
@@ -604,12 +657,33 @@ def _coerce_identity_mode(env: dict, errors: list[str]) -> IdentityMode:
 
 
 def _repo_slug(repo: str) -> str:
-    """`owner/name` → `owner-name`, a filesystem-safe per-repo state-dir
-    component (review M5/D7). Unset/blank REPO falls back to a fixed "unknown"
-    slug rather than collapsing every repo-less config onto the bare role dir
-    (which would recreate the exact collision this fix closes)."""
-    slug = (repo or "").strip().replace("/", "-")
-    return slug or "unknown"
+    """`owner/name` → a filesystem-safe, COLLISION-FREE per-repo state-dir
+    component (review M5/D7; separator fixed under R2-10). Unset/blank REPO
+    falls back to a fixed "unknown" slug rather than collapsing every
+    repo-less config onto the bare role dir (which would recreate the exact
+    collision this fix closes).
+
+    R2-10: the prior `owner/name -> owner-name` join (replacing "/" with "-")
+    collided whenever EITHER segment itself contained a hyphen — `acme/app-b`
+    and `acme-app/b` both produced `acme-app-b`, because "-" is legal inside
+    both a GitHub owner login and a repo name, so the join character wasn't
+    distinguishable from a character either side could already contain.
+
+    "_" is NOT a legal character in a GitHub owner/org login (owners are
+    alphanumeric + single, non-leading/trailing, non-consecutive hyphens
+    only), so joining on "__" is provably unambiguous: whatever the repo name
+    contains, the FIRST "__" in the slug is always the true owner/name
+    boundary, because no valid owner can contain "_" at all (so no owner-only
+    prefix can itself contain "__"). Two distinct (owner, name) pairs can
+    therefore never produce the same slug.
+
+    Casefolded too — GitHub owner/repo names are case-insensitive identity
+    (`Acme/Widget` and `acme/widget` are the SAME repo), so case-variant
+    spellings share one state dir instead of silently splitting it in two."""
+    repo = (repo or "").strip()
+    if not repo:
+        return "unknown"
+    return repo.replace("/", "__").casefold()
 
 
 def _default_state_dir(repo: str, role_dir: str) -> str:
@@ -649,11 +723,11 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         steward_state_dir=e.get("STEWARD_STATE_DIR") or _default_state_dir(repo, "steward-agent"),
         worktree_root=e.get("WORKTREE_ROOT", _dc_default("worktree_root")),
         poll_seconds=_coerce_int(e, "POLL_SECONDS", _dc_default("poll_seconds"), errors),
-        auto_merge=_b(e, "AUTO_MERGE", _dc_default("auto_merge")),
+        auto_merge=_b(e, "AUTO_MERGE", _dc_default("auto_merge"), errors),
         merge_method=e.get("MERGE_METHOD", _dc_default("merge_method")),
         ci_ignore_checks=e.get("CI_IGNORE_CHECKS", _dc_default("ci_ignore_checks")),
-        close_issue_on_merge=_b(e, "CLOSE_ISSUE_ON_MERGE", _dc_default("close_issue_on_merge")),
-        auto_rebase_conflicts=_b(e, "AUTO_REBASE_CONFLICTS", _dc_default("auto_rebase_conflicts")),
+        close_issue_on_merge=_b(e, "CLOSE_ISSUE_ON_MERGE", _dc_default("close_issue_on_merge"), errors),
+        auto_rebase_conflicts=_b(e, "AUTO_REBASE_CONFLICTS", _dc_default("auto_rebase_conflicts"), errors),
         max_rebase_retries=_coerce_int(e, "MAX_REBASE_RETRIES", _dc_default("max_rebase_retries"), errors),
         max_resolve_retries=_coerce_int(
             e, "MAX_RESOLVE_RETRIES", _dc_default("max_resolve_retries"), errors
@@ -683,14 +757,16 @@ def from_env(env: dict | None = None) -> HarnessConfig:
             e, "STEWARD_TRIAGE_BUDGET_USD", _dc_default("triage_budget_usd"), errors
         ),
         review_mode=ReviewMode.from_env(
-            e.get("REVIEW_MODE", ""), _b(e, "REVIEW_MULTI_AGENT", False)
+            e.get("REVIEW_MODE", ""), _b(e, "REVIEW_MULTI_AGENT", False, errors)
         ),
         # Operator REVIEW_PROMPT override, if any (wins wholesale). Blank/unset →
         # "", and main.py loads the default from plugin/REVIEW_PROMPT.md (kept out
         # of this pure dict→config mapping, like agent_md). A whitespace-only value
         # is treated as unset so it can't strip the reviewer's whole rubric.
         review_prompt=(e.get("REVIEW_PROMPT") or "").strip(),
-        review_adopt_unlabeled=_b(e, "REVIEW_ADOPT_UNLABELED", _dc_default("review_adopt_unlabeled")),
+        review_adopt_unlabeled=_b(
+            e, "REVIEW_ADOPT_UNLABELED", _dc_default("review_adopt_unlabeled"), errors
+        ),
         review_gate_model=e.get("REVIEW_GATE_MODEL", _dc_default("review_gate_model")) or None,
         review_validation_model=(
             e.get("REVIEW_VALIDATION_MODEL", _dc_default("review_validation_model")) or None
@@ -705,17 +781,17 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         review_validation_budget_usd=_coerce_float(
             e, "REVIEW_VALIDATION_BUDGET_USD", _dc_default("review_validation_budget_usd"), errors
         ),
-        steward_triage=_b(e, "STEWARD_TRIAGE", _dc_default("steward_triage")),
-        steward_promote=_b(e, "STEWARD_PROMOTE", _dc_default("steward_promote")),
+        steward_triage=_b(e, "STEWARD_TRIAGE", _dc_default("steward_triage"), errors),
+        steward_promote=_b(e, "STEWARD_PROMOTE", _dc_default("steward_promote"), errors),
         steward_owner=e.get("STEWARD_OWNER", _dc_default("steward_owner")),
         edit_check_cmd=e.get("EDIT_CHECK_CMD", _dc_default("edit_check_cmd")),
-        author_tests_split=_b(e, "AUTHOR_TESTS_SPLIT", _dc_default("author_tests_split")),
+        author_tests_split=_b(e, "AUTHOR_TESTS_SPLIT", _dc_default("author_tests_split"), errors),
         max_contract_rounds=_coerce_int(
             e, "MAX_CONTRACT_ROUNDS", _dc_default("max_contract_rounds"), errors
         ),
         fix_mcp_config=e.get("FIX_MCP_CONFIG", _dc_default("fix_mcp_config")),
         harness_root=e.get("HARNESS_ROOT_DIR", _dc_default("harness_root")),
-        jira_sync=_b(e, "JIRA_SYNC", _dc_default("jira_sync")),
+        jira_sync=_b(e, "JIRA_SYNC", _dc_default("jira_sync"), errors),
         jira_project_key=e.get("JIRA_PROJECT_KEY", _dc_default("jira_project_key")),
         jira_cloud_id=e.get("JIRA_CLOUD_ID", _dc_default("jira_cloud_id")),
         jira_mcp_config=e.get("JIRA_MCP_CONFIG", _dc_default("jira_mcp_config")),

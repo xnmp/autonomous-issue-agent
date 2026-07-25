@@ -22,7 +22,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from ..domain.gate import OpenPrLookup
+from ..domain.gate import OpenPrLookup, resolve_test_cmd
 from .governor import GateContext
 from .store import HarnessMarkers
 
@@ -274,17 +274,51 @@ def classify_open_pr(result: GitResult) -> OpenPrLookup:
     return OpenPrLookup.OPEN if prs else OpenPrLookup.NONE
 
 
-def probe_open_pr(branch: str, cwd: str, gh: GhRunner = _subprocess_gh) -> OpenPrLookup:
-    """One `gh pr list --head <branch> --state open` round-trip → tri-state.
-    Port of check-push.sh's precondition. The retry lives in the domain
-    (`resolve_open_pr`), so this stays a single honest observation."""
-    return classify_open_pr(
-        gh(
-            ["pr", "list", "--head", branch, "--state", "open",
-             "--limit", _OPEN_PR_LIMIT, "--json", "number"],
-            cwd,
-        )
+_repo_unset_warned = False
+
+
+def _warn_repo_unset_once() -> None:
+    """The open-PR probe is the ONE gh call in the harness that can silently
+    change meaning when it is not pinned to a repo (P1R-11): unpinned, gh
+    resolves a repo from the worktree's remotes, and on a fork/two-remote
+    checkout it can pick a DIFFERENT repo where this branch has no PR — which
+    answers NONE, and NONE means "no gate". That is precisely the bypass
+    `OpenPrLookup` exists to kill, wearing a valid-looking answer. If the
+    orchestrator ever stops threading `repo=`, say so loudly rather than
+    degrading in silence (§5: an absence bug is invisible by construction)."""
+    global _repo_unset_warned
+    if _repo_unset_warned:
+        return
+    _repo_unset_warned = True
+    print(
+        "[gate] WARNING: the open-PR probe is running WITHOUT --repo (no `repo=` was "
+        "passed to build_gate_context). gh will resolve a repo from the worktree's "
+        "remotes; on a fork or two-remote checkout that can be the wrong one, and a "
+        "wrong repo answers 'no open PR' — which silently disables the push gate. "
+        "Wire cfg.repo through to build_gate_context.",
+        file=sys.stderr,
     )
+
+
+def probe_open_pr(
+    branch: str, cwd: str, gh: GhRunner = _subprocess_gh, repo: str = ""
+) -> OpenPrLookup:
+    """One `gh pr list --repo <repo> --head <branch> --state open` round-trip →
+    tri-state. Port of check-push.sh's precondition. The retry lives in the
+    domain (`resolve_open_pr`), so this stays a single honest observation.
+
+    `branch` is the ref the push WRITES (not necessarily the checked-out one) —
+    see `governor._push_gate`. `repo` pins the question to the target repo, like
+    every other gh call in the harness; empty falls back to gh's own remote
+    resolution and warns once."""
+    if not repo:
+        _warn_repo_unset_once()
+    args = ["pr", "list"]
+    if repo:
+        args += ["--repo", repo]
+    args += ["--head", branch, "--state", "open",
+             "--limit", _OPEN_PR_LIMIT, "--json", "number"]
+    return classify_open_pr(gh(args, cwd))
 
 
 def _sleep_between_probes() -> None:
@@ -301,6 +335,7 @@ def _resolve_base_ref(git: GitRunner, cwd: str, base: str) -> str | None:
 def build_gate_context(
     cwd: str,
     base_branch: str = "dev",
+    repo: str = "",
     env_test_cmd: str | None = None,
     red_must_fail: bool = True,
     verify_red_at_commit: bool = True,
@@ -332,10 +367,15 @@ def build_gate_context(
 
     markers = HarnessMarkers(cwd)
 
-    def open_pr() -> OpenPrLookup:
+    def open_pr(target_branch: str) -> OpenPrLookup:
         """Resolved ONLY when the governor actually gates a push (see
-        `governor._push_gate`) — building this context must stay gh-free."""
-        return probe_open_pr(branch, cwd, gh)
+        `governor._push_gate`) — building this context must stay gh-free.
+
+        `target_branch` is the ref the push writes, derived from the push argv;
+        it is NOT necessarily `branch` (the checked-out one), which is the whole
+        of P1R-10 — `git push origin HEAD:x` and any push from a detached
+        mid-rebase HEAD used to ask about the wrong branch, or skip the gate."""
+        return probe_open_pr(target_branch, cwd, gh, repo=repo)
 
     def exists_at_base(path: str) -> bool:
         if not baseref:
@@ -378,7 +418,12 @@ def build_gate_context(
         timeout."""
         if not baseref:
             return False
-        test_cmd = (markers.test_cmd() or env_test_cmd or "")
+        # Same precedence as every other gate rule — operator TEST_CMD first
+        # (P1R-18). This site used to inline its own `markers.test_cmd() or
+        # env_test_cmd` order, so §10 would have kept running the agent-written
+        # command even after the domain's `resolve_test_cmd` stopped preferring
+        # it. One resolver, one order.
+        test_cmd = resolve_test_cmd(markers.test_cmd(), env_test_cmd)
         if not test_cmd:
             return False
         try:

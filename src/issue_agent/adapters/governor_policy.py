@@ -276,28 +276,26 @@ PROTECTED_BRANCHES = ("main", "master", "dev")
 _FORCE_PUSH_FLAGS = ("--force", "-f", "--force-with-lease", "--force-if-includes")
 
 
-def _push_destructive_target(push_words: list[str]) -> str | None:
-    """AST-derived (not regex): given the tokenised `git push …` args, return a
-    protected branch name iff this push would force-overwrite or delete its
-    history. Two structural signals, evaluated over the parsed tokens:
+@dataclass(frozen=True)
+class PushArgs:
+    """The structural facts a `git push …` argv carries, parsed from the AST
+    tokens (never a regex over the raw string).
 
-      * a force flag (--force / -f / --force-with-lease / clustered short flag
-        containing 'f' like -fu) PLUS an explicit refspec whose destination is a
-        protected branch — `git push --force origin main`,
-        `git push -f origin HEAD:dev`;
-      * a leading-'+' refspec (force syntax) whose destination is protected —
-        `git push origin +main`, `git push origin develop:+master` is not valid;
-        the '+' leads the refspec: `+<src>:<dst>` or `+<branch>`;
-      * a `--delete` / `-d` of a protected branch — `git push origin --delete main`.
+    `candidate_refspecs` already has the REMOTE slot removed: the first bare
+    positional is the remote (`origin`) unless it carries refspec syntax ('+' or
+    ':'), in which case it is a refspec even in slot 0. Everything downstream —
+    the protected-branch force/delete guard AND the push gate's destination
+    derivation — reads this one parse, so the two can never drift apart on what
+    counts as a refspec."""
 
-    Returns the offending branch, or None. A force-push to the fixer's own
-    fix/feat/… branch (no protected destination) is intentionally allowed — that
-    is the legitimate rebase-and-repush in the address-review loop. Pushes with
-    NO explicit refspec are left to the stateful check-push.sh (the current
-    branch is runtime state the governor cannot see)."""
+    has_force: bool
+    is_delete: bool
+    candidate_refspecs: tuple[str, ...]
 
-    # Separate flags from positionals (remote + refspecs). We only look at tokens
-    # AFTER the `push` subcommand (push_words[0] == "push").
+
+def parse_push_args(push_words: list[str]) -> PushArgs:
+    """Tokenised `git push …` args → `PushArgs`. `push_words[0]` may be the
+    `push` subcommand itself (the slice `_git_subcommand` hands back)."""
     args = push_words[1:] if push_words and push_words[0] == "push" else push_words
     has_force = False
     is_delete = False
@@ -325,26 +323,75 @@ def _push_destructive_target(push_words: list[str]) -> str | None:
         # also test the remote slot — a protected name there is harmless (it's a
         # remote, not a ref) UNLESS it carries '+'/':' refspec syntax.
         refspecs.append(w)
-
-    def _dest_branch(refspec: str) -> tuple[str, bool]:
-        """(destination branch, is_plus_forced) for a refspec. `+a:b`→(b,True);
-        `+a`→(a,True); `a:b`→(b,False); `a`→(a,False)."""
-        forced = refspec.startswith("+")
-        body = refspec[1:] if forced else refspec
-        dst = body.split(":", 1)[1] if ":" in body else body
-        return _basename(dst), forced  # strip refs/heads/ prefix if present
-
-    # Drop the remote slot from refspec analysis only when it has no ref syntax;
-    # a token with ':' or leading '+' is always a refspec even in slot 0.
-    candidate_refspecs = [
+    candidates = tuple(
         r for i, r in enumerate(refspecs)
         if i != 0 or r.startswith("+") or ":" in r
-    ]
+    )
+    return PushArgs(has_force=has_force, is_delete=is_delete, candidate_refspecs=candidates)
 
-    for r in candidate_refspecs:
-        dst, plus_forced = _dest_branch(r)
-        if dst in PROTECTED_BRANCHES and (has_force or plus_forced or is_delete):
-            return dst
+
+def _refspec_destination(refspec: str) -> tuple[str, bool]:
+    """(destination ref, is_plus_forced) for a refspec, WITHOUT truncating the
+    ref: `+a:b`→(b,True); `+a`→(a,True); `a:b`→(b,False); `a`→(a,False), and a
+    fully-qualified `refs/heads/fix/42-x` keeps its full branch name `fix/42-x`.
+
+    Keeping the whole name matters for the push gate — `is_governed_branch`
+    needs `fix/42-x`, not the trailing path component `42-x`."""
+    forced = refspec.startswith("+")
+    body = refspec[1:] if forced else refspec
+    dst = body.split(":", 1)[1] if ":" in body else body
+    return dst.removeprefix("refs/heads/"), forced
+
+
+def push_destination_refs(push_words: list[str]) -> tuple[str, ...]:
+    """Branch refs this `git push …` argv EXPLICITLY writes, in order, deduped.
+
+    `()` when the argv names no refspec at all (`git push`, `git push origin`,
+    `git push -u origin` with the branch omitted) — git then resolves the
+    destination from the CURRENT branch via push.default, which is runtime state
+    this parse cannot see, so the caller must fall back to the checked-out branch
+    (and, when HEAD is detached, has no answer at all).
+
+    This is the push gate's half of the parse that `_push_destructive_target`
+    already did for the protected-branch guard — same `parse_push_args`, so
+    `git push origin HEAD:refs/heads/x`, `git push --force-with-lease origin
+    fix/42-x` and `git push -u origin fix/42-x` are seen identically by both.
+    A bare `HEAD`/`@` destination is returned verbatim; resolving it against the
+    checked-out branch is policy, and policy lives in the domain."""
+    return tuple(dict.fromkeys(
+        _refspec_destination(r)[0]
+        for r in parse_push_args(push_words).candidate_refspecs
+    ))
+
+
+def _push_destructive_target(push_words: list[str]) -> str | None:
+    """AST-derived (not regex): given the tokenised `git push …` args, return a
+    protected branch name iff this push would force-overwrite or delete its
+    history. Two structural signals, evaluated over the parsed tokens:
+
+      * a force flag (--force / -f / --force-with-lease / clustered short flag
+        containing 'f' like -fu) PLUS an explicit refspec whose destination is a
+        protected branch — `git push --force origin main`,
+        `git push -f origin HEAD:dev`;
+      * a leading-'+' refspec (force syntax) whose destination is protected —
+        `git push origin +main`, `git push origin develop:+master` is not valid;
+        the '+' leads the refspec: `+<src>:<dst>` or `+<branch>`;
+      * a `--delete` / `-d` of a protected branch — `git push origin --delete main`.
+
+    Returns the offending branch, or None. A force-push to the fixer's own
+    fix/feat/… branch (no protected destination) is intentionally allowed — that
+    is the legitimate rebase-and-repush in the address-review loop. Pushes with
+    NO explicit refspec are left to the stateful check-push.sh (the current
+    branch is runtime state the governor cannot see)."""
+    parsed = parse_push_args(push_words)
+    for r in parsed.candidate_refspecs:
+        dst, plus_forced = _refspec_destination(r)
+        # `_basename` here (not in `_refspec_destination`) because the protected
+        # set is bare names: `refs/heads/main` → `main`.
+        if _basename(dst) in PROTECTED_BRANCHES and (
+            parsed.has_force or plus_forced or parsed.is_delete
+        ):
+            return _basename(dst)
     # `git push --delete <remote> main` puts the branch in a bare positional that
     # we treated as a refspec above; the loop already covers it. Force-push with
     # no refspec is deferred to check-push.sh.
