@@ -442,10 +442,14 @@ def decide_fix(
     # the fixer commented + blocked it). Gate on authorship: a PR whose author is not
     # FIX_BOT belongs to a human — leave it for them. An unknown author
     # (`author == ""`, e.g. a PR whose author field didn't resolve) or an unset
-    # FIX_BOT is treated as NOT-ours EXPLICITLY: `login_eq("", "")` is True, so
-    # with both blank the fail-safe this comment used to claim inverted — a
-    # stranger's PR with an unresolvable author read as the fixer's own. The
-    # explicit guard, not the comparison, is what makes it fail safe.
+    # FIX_BOT is treated as NOT-ours EXPLICITLY, by the `p.author and cfg.fix_bot`
+    # guard below. That guard predates the comparison being safe: `login_eq("","")`
+    # used to return True, so with both blank a stranger's PR with an unresolvable
+    # author read as the fixer's own — the exact inversion of the fail-safe this
+    # comment claimed. `login_eq` now returns False when either side is unknown
+    # (review P1R-7), so the two are belt and braces; the explicit guard stays
+    # because a filter this consequential should not depend on a helper's edge
+    # case being read correctly by the next person.
     # The match goes through `login_eq`, never `==`: a FIX_BOT written with the
     # `[bot]` suffix would otherwise match NO PR, silently disabling every fixer PR
     # leg (address-review / fix-ci / rebase / auto-merge) forever (review C1).

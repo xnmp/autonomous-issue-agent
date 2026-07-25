@@ -337,11 +337,20 @@ class ReviewWorkflow:
         counter's question is "is this PR stuck in a non-converging round?", and
         a confirmed submit answers no — so success resets it, exactly as the fix
         role's legs do. Keyed off the PRView so it matches `_no_progress`'s
-        `breaker_key(pr)` write with no extra gh call."""
-        try:
-            self.store.clear_infra_deaths(breaker_key(p))
-        except Exception as exc:  # noqa: BLE001 — decay is best-effort, never fatal
-            self.cfg.log(f"review #{p.number}: no-progress counter not cleared ({exc})")
+        `breaker_key(pr)` write with no extra gh call.
+
+        BOTH halves of the key space are cleared, because `roles._review_state`
+        READS their union (review P1R-1): the dispatcher records a raise-path
+        death under `-pr` whenever its `issue_for_pr` lookup failed, and the
+        transient that fails that lookup is the same transient that kills the
+        session. Clearing only the resolved key would strand that death forever
+        — it reads as real on every later poll and walks a healthy PR toward
+        needs-human-review. Decay must clear exactly the set the read unions."""
+        for key in {breaker_key(p), -p.number}:
+            try:
+                self.store.clear_infra_deaths(key)
+            except Exception as exc:  # noqa: BLE001 — decay is best-effort, never fatal
+                self.cfg.log(f"review #{p.number}: no-progress counter not cleared ({exc})")
 
     def _persist_review_state(self, pr: int, head_oid: str, round_number: int) -> None:
         """Advance per-PR review state after a confirmed submit. The multi-agent

@@ -79,7 +79,7 @@ class FixWorkflow:
             self.cfg.log(f"prompt input '{method}' unavailable: {exc}")
             return ""
 
-    def _decay_infra_deaths(self, key: int, result) -> None:
+    def _decay_infra_deaths(self, key: int, result, alt_key: int | None = None) -> None:
         """A leg that RETURNED a result clears `key`'s infra-death ceiling
         (review P1R-3, and the residual P0R-3 flagged).
 
@@ -98,10 +98,24 @@ class FixWorkflow:
 
         Called instead of, never as well as, the bump sites below — a leg is
         either an infra death or it is not.
+
+        `alt_key` exists because the READ side unions two key spaces (review
+        P1R-1): the dispatcher records a raise-path death under `-pr` whenever
+        its pre-handler `issue_for_pr` lookup failed, and `roles._fix_state`
+        therefore sums `breaker_key(pr)` and `-pr` into the key the domain asks
+        for. Clearing only the key THIS leg resolved to would leave a death
+        stranded in the other half forever: the transient that fails the lookup
+        is the same transient that kills the session, so the pair is not rare,
+        and `cleanup_pr` only ever clears whichever key is current at cleanup
+        time. The stale count then reads as a real death on every later poll and
+        walks a healthy PR toward needs-human-review. Decay must clear exactly
+        the set the read unions.
         """
         if outcome.infra_death(result.exit_reason):
             return
         self.store.clear_infra_deaths(key)
+        if alt_key is not None and alt_key != key:
+            self.store.clear_infra_deaths(alt_key)
 
     async def _run_logged(self, label: str, issue: int, task):
         self.cfg.log(f"agent #{issue}: {label} — running")
@@ -275,6 +289,10 @@ class FixWorkflow:
             # both, so a death is counted exactly once.
             self.store.bump_infra_deaths(issue)
         else:
+            # No alt_key: RESUME is issue-keyed at the dispatcher
+            # (`_issue_number` returns action.number without a lookup), so its
+            # count can never land in the `-pr` half — and `pr` here is an
+            # Optional from `pr_for_issue`, which `-pr` would not survive.
             self._decay_infra_deaths(issue, result)
         self.executor.execute_all(outcome.resume_actions(issue, result, pr))
 
@@ -309,7 +327,7 @@ class FixWorkflow:
             # raises or returns, so a death is counted exactly once.
             self.store.bump_infra_deaths(issue)
         else:
-            self._decay_infra_deaths(issue, result)
+            self._decay_infra_deaths(issue, result, alt_key=-pr)
         if out.bump_retry:
             # Attempt counter keyed to the review being addressed: a count
             # stored under an OLDER review's timestamp restarts at 0 (that
@@ -348,7 +366,7 @@ class FixWorkflow:
         # one PR burned the whole budget on work that never ran).
         if not outcome.infra_death(result.exit_reason):
             self.store.set_ci_retries(issue, self.store.get_ci_retries(issue) + 1)
-            self._decay_infra_deaths(issue, result)
+            self._decay_infra_deaths(issue, result, alt_key=-pr)
         else:
             # Separate, higher ceiling for the deaths themselves (review C3/D2c)
             # — same key the CI counter uses, so the decide side reads one key.
@@ -369,7 +387,7 @@ class FixWorkflow:
         # Same rule as fix_ci: an infra kill is not a failed rebase attempt.
         if not outcome.infra_death(result.exit_reason):
             self.store.set_rebase_retries(issue, self.store.get_rebase_retries(issue) + 1)
-            self._decay_infra_deaths(issue, result)
+            self._decay_infra_deaths(issue, result, alt_key=-pr)
         else:
             self.store.bump_infra_deaths(issue)  # review C3/D2c, as in fix_ci
         self.executor.execute_all(outcome.fix_ci_actions(pr, result))

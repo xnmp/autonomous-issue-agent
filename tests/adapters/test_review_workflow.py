@@ -695,3 +695,24 @@ def test_a_round_that_submits_nothing_still_counts():
     asyncio.run(_workflow(gw, store, runner).review(100))
 
     assert store.get_infra_deaths(7) == 5, "an unproductive round still counts up"
+
+
+def test_a_productive_round_clears_the_orphaned_half_too():
+    """Same composition gap as the fix role (verification sweep):
+    `roles._review_state` READS the union {breaker_key(pr), -pr}, so decay that
+    cleared only the resolved key left a phantom unproductive round that read as
+    real on every later poll and walked a healthy PR toward escalation."""
+    pr = PRView(100, head_ref_oid="abc", title="t", body="b", closing_issue=7)
+    gw = FakeGateway(prs={100: pr})
+    store = FakeStore()
+    store.infra_deaths[7] = 2
+    store.infra_deaths[-100] = 3  # recorded while issue_for_pr was down
+    runner = FakeRunner(AgentResult(
+        is_error=False, session_id="rs",
+        structured={"decision": "APPROVE", "body": "looks good"},
+    ))
+
+    asyncio.run(_workflow(gw, store, runner).review(100))
+
+    assert store.get_infra_deaths(7) == 0
+    assert store.get_infra_deaths(-100) == 0, "the orphaned half must clear too"

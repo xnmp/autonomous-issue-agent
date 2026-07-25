@@ -825,3 +825,39 @@ def test_resume_error_does_not_touch_the_infra_ceiling(tmp_path):
 
     assert store.get_infra_deaths(5) == 0
     assert ("relabel", "issue", 5, "ai-working", "ai-blocked") in gw.calls
+
+
+# ── decay must clear the whole key set the read unions (verification sweep) ────
+def test_a_clean_pr_leg_clears_a_death_stranded_under_the_orphan_key(tmp_path):
+    """The composition gap between P1R-1 (read unions {breaker_key, -pr}) and
+    P1R-3 (decay cleared ONE key): a transient `issue_for_pr` failure that
+    coincides with a session death records under `-pr`, and the next clean run
+    only cleared the resolved key — so the phantom death read as real forever
+    and walked a healthy PR toward needs-human-review. `cleanup_pr` never
+    reached it either: it clears whichever key is current at cleanup time."""
+    store = Store(str(tmp_path))
+    store.bump_infra_deaths(-100)  # death recorded while the lookup was down
+    store.bump_infra_deaths(5)     # and one under the resolved issue
+
+    gw = FakeGateway(prs={100: _review_pr()})
+    runner = FakeRunner(_PUSHED)
+
+    asyncio.run(_workflow(gw, store, runner).address_review(100))
+
+    assert store.get_infra_deaths(5) == 0
+    assert store.get_infra_deaths(-100) == 0, "the orphaned half must clear too"
+
+
+def test_an_infra_death_still_leaves_both_halves_standing(tmp_path):
+    """Anti-vacuity twin: decay must not fire on the very deaths the ceiling
+    counts, in either half."""
+    store = Store(str(tmp_path))
+    store.bump_infra_deaths(-100)
+
+    gw = FakeGateway(prs={100: _review_pr()})
+    runner = FakeRunner(_death())
+
+    asyncio.run(_workflow(gw, store, runner).address_review(100))
+
+    assert store.get_infra_deaths(-100) == 1, "a death must not clear itself"
+    assert store.get_infra_deaths(5) == 1, "and the leg's own death is counted"
