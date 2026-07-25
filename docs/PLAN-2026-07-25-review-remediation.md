@@ -375,6 +375,55 @@ mechanism.
   exactly one wave above; when a wave commits, tick its IDs off in the
   commit message (e.g. `fix(p0-a): C2 M19 M13-gateway …`).
 
+## 6b. EXECUTION RECORD (2026-07-26) — what actually happened
+
+This plan was executed end-to-end. Commits, in order:
+
+| Commit | Wave | Notes |
+|---|---|---|
+| `44fbd16` | P0-A | C1 C2 C3(a)(b) C5 M2 M5 M19 M13-gateway + S7/T6 |
+| `9ecb0ae` | P0-B | C3(c) C4 M3 M4 M10 M11 M12 M13-workflow T3 + push gate |
+| `299c825` | P1-1 | M14 M15 M16 M22 M17 M1 M20 M21 M23 |
+| `f0b4040` | P0R | the 5 P0s found by the re-review of P0 |
+| `cebf088` | P1R | the 18 P1s found by the re-review |
+| `e9024ef`, `dd805eb` | P1-2a | M9 xfails, handover/FAILURE-MODES updates |
+| `25e257a` | — | decay/read key-set gap found by the verification sweep |
+| `1968888` | P1-2 | M6 gate parity, D13 convergence, T2/T5 repairs |
+
+**The plan's §5 protocol worked, and its most important step was the one that
+is easy to skip.** The P0 exit gate passed cleanly — all four mutation
+spot-checks failed as required, doctor was green, the env-delivery smoke test
+proved C5 closed. The adversarial re-review then found **five more P0s**, two of
+which the P0 waves had *introduced*. A third such gap (between two fixes in the
+same commit) was found later by a verification sweep. All three were **absence
+bugs**: a var no longer emitted, a failure no longer counted, a key no longer
+cleared. Mutation testing cannot catch these — it proves a guard fires when code
+changes, never that a guard exists for a path nobody wrote a test for. If you
+execute a plan like this again, budget for the re-review as a mandatory phase,
+not a formality, and write ABSENCE tests as you go (remove the handling, assert
+a loud failure) and set-equality assertions for anything that emits a set.
+
+**Deviations from §3 worth carrying forward:**
+- D5: `cli.journal_path` kept as a compat shim beside `journal_paths` (a test
+  file no wave owned still calls it). Migrate and drop the shim.
+- D9: `fixer_busy` and its reap gating were KEPT (the plan said delete); the
+  parameter still truthfully gates reap during a dispatch tick, and its call
+  site was outside the owning agent's file set.
+- D2: infra deaths now DECAY on any leg that returns a result — the plan
+  specified only the ceiling. Without decay it was a lifetime tally.
+- The reviewer and steward got ceilings the plan never scoped (P0R-3); the
+  review role's unbounded fan-out was the largest money exposure in the tree.
+- P0R-5 was fixed at its root (the reaper repairs an `ai-working` issue that
+  already has an open PR instead of requeueing it) rather than by adding a
+  counter to the swallow path the symptom appeared on.
+
+**Known-open, deliberately:** the `sh -c`/`bash -c`/`eval`/`xargs` governor
+bypass (M9 — now five `xfail(strict=True)` tests with the root cause recorded
+in the re-review doc §4); the three asserted parity divergences between the two
+gate stacks; `$0`-cost plans still make the spend caps blind (the harness now
+says so loudly); and P2 structural work (S1–S8, M18), which the plan gates on a
+week of real-repo operation.
+
 ## 6. Open items for the executing session
 
 - Record any deviation from §3 decisions here (or in the commit message) with

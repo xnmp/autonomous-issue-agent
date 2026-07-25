@@ -1,5 +1,14 @@
 # Adversarial re-review of the P0 diff — 2026-07-26
 
+> **STATUS: all findings closed.** The 5 P0s are fixed in `f0b4040`, the 18 P1s
+> in `cebf088`. A later verification sweep at HEAD re-ran the four original
+> mutation spot-checks (still failing as required), confirmed all 8 spot-checked
+> fixes live with direct reproductions, and found one further HIGH composition
+> gap — decay cleared one key while the ceiling READ the union of two, stranding
+> a phantom death that crept a healthy PR toward escalation — fixed in
+> `25e257a`. §4's accepted residuals remain open **by choice**; read them before
+> pointing the harness at anything you care about.
+
 Scope: commits `44fbd16` (wave P0-A) + `9ecb0ae` (wave P0-B), reviewed by three
 independent Opus agents in isolated worktrees, each prompted to **refute** that
 its assigned findings from

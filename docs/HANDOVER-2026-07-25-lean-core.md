@@ -243,14 +243,28 @@ their evidence source:
 6. **Legacy deletion P6.1** (~1.6k LOC bash + 18K fakes): opportunistic;
    `make lint` still shellchecks it all.
 
-The T3 convergence suite (`tests/domain/test_convergence.py`) is the
-regression guard for the **decide-side** anti-loop class — any new dispatch
-leg or retry counter must add a scenario row there. **[CORRECTED]** the
-original claim that the mirror "will catch read/write drift" is
-mutation-proven false: `_after_run` re-implements the workflow by hand and
-cannot detect drift in it. Until plan item D13 replaces `_after_run` with the
-real `FixWorkflow`, every new leg/counter ALSO requires a write-side test in
-`tests/adapters/test_fix_workflow.py`.
+The convergence suite (`tests/domain/test_convergence.py`) is the regression
+guard for the anti-loop class — any new dispatch leg or retry counter must add
+a scenario row there. **[CORRECTED — fixed in `1968888`]** the original claim
+that the mirror "will catch read/write drift" was mutation-proven false:
+`_after_run` re-implemented the workflow by hand and could not detect drift in
+it (deleting the workflow's own breaker bump left it 10/10 green). D13 has now
+replaced it: each row drives a real `Daemon` tick loop over the real
+`FixWorkflow` → `AgentDispatcher` → `Executor` → `Store`, with `roles._fix_state`
+as the read side, so both halves are production code and the only remaining
+double is a gateway that mutates an in-memory world the way GitHub would. The
+same mutation now FAILS the suite (12 dispatches instead of the capped 3), so a
+new leg no longer needs a separate write-side test purely to catch drift —
+though `tests/adapters/test_fix_workflow.py` is still where leg-specific
+persistence belongs.
+
+**Two mechanisms this codebase now has that it lacked, and should not lose:**
+`tests/test_gate_parity.py` runs golden cases through BOTH enforcement stacks
+and fails on disagreement — the sync mechanism that replaces "keep in sync"
+comments, which had already drifted every time the review checked. And the
+convergence suite above is now an oracle rather than a mirror. Both exist
+because a hand-maintained restatement of behaviour will drift, silently, and
+the drift is only ever found by someone deliberately looking.
 
 ## 8. Execution pattern that worked (for the next big push)
 
