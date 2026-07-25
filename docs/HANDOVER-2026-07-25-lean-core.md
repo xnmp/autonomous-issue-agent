@@ -12,12 +12,21 @@ next.
 > review ([REVIEW-2026-07-25-adversarial.md](REVIEW-2026-07-25-adversarial.md))
 > audited this handover against the tree and **falsified three of its claims**;
 > corrections are marked **[CORRECTED]** inline below. The remediation plan is
-> [PLAN-2026-07-25-review-remediation.md](PLAN-2026-07-25-review-remediation.md);
-> its P0 wave must land before pointing the harness at real repos — §7's
-> "point at 2–3 real repos and let the ledger run" is **deferred until then**
-> (the review shows the ledger itself currently cannot be trusted: pre-result
-> deaths are unrecorded, Codex spend is invisible, and `status` reads only the
-> fix journal).
+> [PLAN-2026-07-25-review-remediation.md](PLAN-2026-07-25-review-remediation.md).
+>
+> **Status update (2026-07-26).** The plan's P0 and P1 waves have landed —
+> `44fbd16` (P0-A), `9ecb0ae` (P0-B), `299c825` (P1-1) — followed by a
+> **second, independent adversarial re-review of that work**
+> ([REVIEW-2026-07-26-p0-rereview.md](REVIEW-2026-07-26-p0-rereview.md)), which
+> confirmed the headline repros closed but found 5 further P0s (two of them
+> *introduced by* the remediation) and 18 P1s. Those are fixed in `f0b4040`
+> (P0R) and `cebf088` (P1R). Each [CORRECTED] note below now carries the commit
+> that closed it. §7's "point at 2–3 real repos and let the ledger run" is
+> **no longer blocked on correctness work**, but read
+> [REVIEW-2026-07-26-p0-rereview.md](REVIEW-2026-07-26-p0-rereview.md) §4
+> (accepted residuals) and §5 (the process finding) before doing it: the
+> `sh -c` governor bypass is still open by design, and the ledger still cannot
+> see spend on plans that report $0 (it now warns loudly instead of lying).
 
 ## 1. What landed (all on `main`, each leg committed only after full `make test`)
 
@@ -103,10 +112,17 @@ These are the load-bearing choices a future refactor must not silently undo:
 
 ## 3. New env knobs
 
-**[CORRECTED]** "all documented in `config/agent.env.example`" was false:
-`MAX_RESOLVE_RETRIES` and `LOG_DIR` are missing from that file, and
-`compose-env.sh`'s hand-maintained allow-list drops these plus ~18 other
-documented knobs on the systemd path (review C5; plan wave P0-A fixes both).
+**[CORRECTED — fixed in `44fbd16`, hardened in `f0b4040`]** "all documented in
+`config/agent.env.example`" was false: `MAX_RESOLVE_RETRIES` and `LOG_DIR` were
+missing from that file, and `compose-env.sh`'s hand-maintained allow-list
+dropped these plus ~18 other documented knobs on the systemd path (review C5).
+Both are fixed: the knobs are documented, and `compose-env.sh` no longer has an
+allow-list at all — it emits the union of an `env -0` pre/post diff and the
+names the config files textually assign. The re-review found the *first* version
+of that fix silently dropped any var whose composed value matched the launching
+shell's (P0R-1, a regression that made `TEST_CMD` vanish under systemd and the
+gate fail closed on every push); `f0b4040` closes it, and the test asserting
+"a var the files assign is still emitted" is the guard.
 
 | Knob | Default | Meaning |
 |---|---|---|
@@ -132,11 +148,21 @@ documented knobs on the systemd path (review C5; plan wave P0-A fixes both).
 - **`issue-agent status`**: now shows today's global spend vs cap, last 5
   agent runs, and warnings (repeated same-target dispatches within an hour,
   spend blocks today, escalations in 24h). Log tail falls back to the old
-  /tmp path for pre-move daemons. **[REVIEW NOTE]** it reads the *fix*
-  daemon's journal only — review/steward runs, their spend blocks, and their
-  loops are invisible (review M11; plan agent B3). Review-side escalations
-  additionally bypass the executor funnel entirely, so they emit no
-  `escalation` event and no `ALERT_CMD` (review M10; plan agent B1).
+  /tmp path for pre-move daemons. **[REVIEW NOTE — fixed in `9ecb0ae`]** it
+  read the *fix* daemon's journal only, so review/steward runs, their spend
+  blocks and their loops were invisible (M11); it now merge-sorts all three
+  role journals by `ts`. Review-side escalations bypassed the executor funnel
+  entirely, emitting no `escalation` event and no `ALERT_CMD` (M10); they now
+  route through it, so they alert like every other breaker.
+- **What the journal cannot tell you (read before trusting it).** Runs that
+  cost `$0.00` write no ledger line at all — true for subscription-plan Claude
+  and for Codex without `CODEX_COST_PER_MTOK_*` — so on those deployments the
+  spend caps cannot fire for *any* loop shape. `cebf088` makes the harness say
+  so out loud (one warning when settled runs keep costing $0 while a cap is
+  armed) rather than reporting a reassuring $0.00. A session the daemon did not
+  outlive (SIGKILL/OOM/`systemctl restart`) still reaches no bump site; it
+  leaves an unsettled `agent_run_start`, which `f0b4040` teaches the decide side
+  to count, so it is now bounded even though it remains unbilled.
 - **No rotation yet** — journals grow unbounded. Fine for months at current
   volume; add rotation when a file is annoying, not before.
 
@@ -145,15 +171,23 @@ documented knobs on the systemd path (review C5; plan wave P0-A fixes both).
 1. **launchd installer** still has both bugs its systemd twin had fixed:
    /tmp logs and fixed unit names that collide across repos. Fix when a mac
    deployment matters.
-2. **Python push gate is still inert on the SDK path**: `OpenPrLookup`
-   (tri-state) exists in `domain/gate.py` with tests, but
-   `build_gate_context` never populates `has_open_pr`. **[CORRECTED]** the
-   original claim that "the *bash* §push gate is the live one" is false — the
-   bash checkers are invoked only under `FIXER_RUNTIME=codex`; on the default
-   SDK path **nothing** gates pushes to an open PR, so every ADDRESS_REVIEW /
-   FIX_CI push runs with no test/commit-log/evidence gate at all. Wiring the
-   gh probe (errors → `ERROR`) is P0 in the remediation plan (wave P0-B,
-   agent B6).
+2. **Python push gate — WIRED as of `9ecb0ae`, corrected in `cebf088`.**
+   **[CORRECTED]** the original claim that "the *bash* push gate is the live
+   one" was false — the bash checkers run only under `FIXER_RUNTIME=codex`, so
+   on the default SDK path **nothing** gated pushes to an open PR and every
+   ADDRESS_REVIEW / FIX_CI push ran with no test/commit-log/evidence gate at
+   all. `9ecb0ae` wired a lazy `gh pr list` probe into `GateContext.open_pr`
+   (tri-state; unwired default and probe errors both fail closed; zero gh calls
+   on non-push commands). The re-review then found three ways it still didn't
+   bite, all fixed in `cebf088`: it keyed on the worktree's HEAD branch rather
+   than the **pushed ref** (so a conflicted rebase — literally the REBASE leg's
+   normal state — reported branch `HEAD`, was read as ungoverned, and skipped
+   the gate); the probe omitted `--repo`, so on a multi-remote target gh
+   answered about the wrong repository and reported "no PR"; and the ERROR arm
+   denied *clean* pushes, so a rate limit walked healthy issues to a human.
+   **Still open by design:** `sh -c 'git push …'` and friends classify as
+   nothing and bypass the gate entirely (M9 / backlog P3.2) — now recorded as
+   `xfail(strict=True)` tests rather than prose.
 3. **Commit-time red-check** (`check-commit.sh` / `check_red_is_red`) still
    silently no-ops with no test command — the PR/push gates now deny, so the
    window is one commit, not a merge. Close it opportunistically.

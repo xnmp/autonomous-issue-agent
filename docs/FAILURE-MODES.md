@@ -535,9 +535,63 @@ operator mistakes — recorded so they aren't re-diagnosed as bugs.
   probe. FIXED 2026-07-25: the empty reply is consumed (resumed-at mark) and
   the issue is relabeled back to `ai-blocked`.
 
+**107. Silent identity mismatch — a `[bot]`-suffixed FIX_BOT disabled every fixer PR leg**
+- GitHub surfaces an App login as both `name[bot]` and bare `name` depending on
+  the API shape, so a raw `==` between an operator's `FIX_BOT` and a PR author
+  never matched: address-review / fix-ci / rebase / auto-merge simply never
+  dispatched, forever, with no error anywhere. The knowledge existed — one
+  module had a `_login_eq` helper with a docstring explaining the asymmetry —
+  but three other comparison sites used `==`. **Class: a convention that lives
+  in a comment instead of a type.** FIXED 2026-07-25 (`44fbd16`): one
+  `domain/identity.py`, every site routed through it. Two follow-ons proved the
+  class is subtle: whitespace defeated the normalizer (`FIX_BOT='fix-bot '`
+  reproduced the whole failure), and `login_eq("","")` returning True made an
+  unresolvable author match an unset bot — both fixed 2026-07-26 (`cebf088`).
+
+**108. Silent truncation — the world was capped at gh's default 30 items**
+- `gh … list` returns 30 newest without `--limit`. Past 30 `ai-ready` issues
+  the oldest were never dispatched; past 30 open PRs their CI failures were
+  never fixed — every poll, no error, and a world that looks complete.
+  Truncation warnings existed and were wired into three call sites; three
+  others predated them. **Class: a defence added at the site of one incident
+  rather than at the mechanism.** FIXED 2026-07-25 (`44fbd16`): `--limit` +
+  warnings everywhere, plus a guard that rejects any `list` argv built without
+  one, so the omission is now unrepresentable rather than merely unlikely.
+
+**109. Unbilled loop — a session that dies before returning a result**
+- Every attempt-recording write happened strictly *after* `await runner.run()`.
+  A pre-result transport death raises, so the workflow tail was skipped: no
+  journal line, no ledger line, no counter bump — while the reaper requeued the
+  issue and the next poll paid for a full session again. Steady state: one paid
+  session every two polls, forever, with `$0.00` on the ledger and nothing on
+  `issue-agent status`. **Class: the observability and the bound both lived on
+  the success path.** FIXED 2026-07-25/26: an `agent_run_start` written BEFORE
+  the await (`44fbd16`), a `MAX_INFRA_DEATHS` ceiling (`9ecb0ae`), and the
+  variants the first fix missed (`f0b4040`) — the review/steward roles had no
+  ceiling at all, and process death (SIGKILL/OOM/restart) reaches no bump site,
+  so unsettled starts are now counted from the journal instead.
+
+**110. A remediation that introduced two of the defects it was fixing**
+- The fix for #C5 replaced a hand-maintained env allow-list with an `env -0`
+  pre/post diff — which silently dropped any var whose composed value equalled
+  the launching shell's, so `TEST_CMD` vanished under systemd and the push gate
+  failed closed on every push. Separately, making `execute_all` isolate
+  per-action failures removed the only thing bounding a paid RESOLVE loop whose
+  follow-up relabel kept failing. Both passed a full green suite and a diff
+  review. **Class: absence bugs — a var no longer emitted, a failure no longer
+  counted — which mutation testing cannot catch, because it proves a guard
+  fires when code changes, never that a guard exists.** FIXED 2026-07-26
+  (`f0b4040`). The counter-measure, now standing practice: for every "we handle
+  X" claim write the test that REMOVES the handling and asserts a loud failure,
+  and for anything emitting a set assert set equality against an independently
+  derived expectation, never membership of the happy-path examples.
+
 ---
 
 _Generated from transcript mining, 2026-07-21. ~103 distinct entries after
 dedup across 7 parallel search passes over the full transcript corpus.
 #104–#106 added 2026-07-25 from the T3 convergence-test probe (see
-docs/IMPROVEMENT-PLAN.md)._
+docs/IMPROVEMENT-PLAN.md). #107–#110 added 2026-07-26 from the two adversarial
+reviews (docs/REVIEW-2026-07-25-adversarial.md,
+docs/REVIEW-2026-07-26-p0-rereview.md) — the first three are new failure
+CLASSES, not instances; #110 is about the remediation process itself._

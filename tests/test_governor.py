@@ -363,5 +363,104 @@ def test_passthrough_does_not_overmatch():
     assert gov.find_violations("time git status") == []
 
 
+# ── KNOWN OPEN HOLE: indirect-execution bypass (M9 / R3-F8) ───────────────────
+# `classify()` only recognises a governed command when the FIRST word of a
+# `command` AST node (after `env`/passthrough-wrapper unwrapping, see
+# `_strip_env_wrapper`) is `git` or `gh`. `sh -c '<payload>'`, `bash -c
+# '<payload>'`, `python -c '<payload>'`, `eval '<payload>'`, and `xargs <cmd>
+# <args>` all put the real command's name in a position `classify` never
+# looks: as the second word of the outer node (`sh`/`bash`/`eval`/`xargs`), or
+# buried inside an opaque interpreter-language string that tree-sitter-bash
+# parses as a single string/raw_string leaf, never as a nested `command` node
+# with its own child commands. `extract_commands_with_env` therefore reports
+# `kinds=[]` for the whole line and `find_violations` returns `[]` — the gate
+# is not merely weak against these, it is never consulted at all.
+#
+# This is NOT a parser bug: `governor_policy.py` is the exact same module the
+# shell hook (`bash_governor.py`, see `test_shell_hook_reuses_shared_policy_
+# functions` above) and the in-process SDK/Codex adapter both import — the
+# AST parsing and bypass-string detection that this file spends 300+ lines
+# testing are sound. The hole is structural: an indirection layer (a shell
+# invoked with `-c`, an `eval`, a language interpreter, an argument-forwarder
+# like `xargs`) that classify()'s single-first-word heuristic was never
+# designed to see through. Closing it (backlog P3.2) requires either
+# recursively re-parsing `-c`/`eval` string payloads as bash and unwrapping
+# `xargs`'s leading non-flag argument as the real command name, or an
+# allow-list stance (govern-by-default, not bypass-by-default).
+#
+# Blast radius: the fixer runs the SDK agent with `permission_mode=
+# bypassPermissions` (see adapters/governor.py + app/main.py), where this
+# governor hook plus `disallowed_tools` are the ONLY two policy layers left —
+# there is no allow-list to fall back on. Any of these five vectors lets a
+# fixer session commit with `--no-verify`, push straight past the push gate,
+# or write `core.hooksPath`, with the governor never even entering the
+# decision (not "misclassifies" — never called).
+#
+# Each bypass below is paired with a PASSING test proving the governor DOES
+# block the exact same payload in its direct form — the anti-vacuity check
+# that rules out an xfail merely encoding a typo'd payload nothing would ever
+# catch. `strict=True` means the day someone closes this hole, the xfail
+# flips to a hard failure here, forcing this record to be updated rather than
+# silently going stale.
+def test_direct_no_verify_is_blocked_anti_vacuity_baseline():
+    # Baseline for every xfail below: the DIRECT form of the exact payload
+    # each bypass smuggles through IS blocked today.
+    assert gov.find_violations("git commit --no-verify -m x")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="M9/R3-F8: `sh -c '<payload>'` puts the payload in an opaque "
+    "string leaf; classify() never sees a nested `git` command, so "
+    "`sh -c 'git commit --no-verify -m x'` skips the gate entirely.",
+)
+def test_sh_c_bypasses_the_no_verify_block():
+    assert gov.find_violations("sh -c 'git commit --no-verify -m x'")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="M9/R3-F8: same as sh -c — `bash -c '<payload>'` is an opaque "
+    "string leaf to the parser, so `bash -c 'git commit --no-verify -m x'` "
+    "skips the gate entirely.",
+)
+def test_bash_c_bypasses_the_no_verify_block():
+    assert gov.find_violations("bash -c 'git commit --no-verify -m x'")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="M9/R3-F8: `python -c '<payload>'` hides the git invocation "
+    "inside a language-interpreter string classify() never inspects, so "
+    "`python -c \"...os.system('git commit --no-verify -m x')\"` skips the "
+    "gate entirely.",
+)
+def test_python_c_bypasses_the_no_verify_block():
+    assert gov.find_violations(
+        "python -c \"import os; os.system('git commit --no-verify -m x')\""
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="M9/R3-F8: `eval '<payload>'` re-executes its string argument as "
+    "shell at runtime, but statically it is one opaque string leaf, so "
+    "`eval 'git commit --no-verify -m x'` skips the gate entirely.",
+)
+def test_eval_bypasses_the_no_verify_block():
+    assert gov.find_violations("eval 'git commit --no-verify -m x'")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="M9/R3-F8: `xargs <cmd> <args>` puts `git` as the SECOND word of "
+    "the command node (first is `xargs`), which classify()'s "
+    "first-word-only check never looks past, so `xargs git commit "
+    "--no-verify -m x` skips the gate entirely.",
+)
+def test_xargs_bypasses_the_no_verify_block():
+    assert gov.find_violations("xargs git commit --no-verify -m x")
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
