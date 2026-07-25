@@ -64,8 +64,10 @@ def test_author_task_writes_tests_not_impl():
     assert t.append_system_prompt == "AGENTMD"
     assert t.cwd == "/wt/issue-5"
     assert t.resume is None                   # fresh session
-    assert "AUTHOR" in t.prompt
-    assert "Do NOT write the implementation" in t.prompt
+    # T5 (review): "AUTHOR" / "Do NOT write the implementation" were prose-only —
+    # no code parses them, and AUTHOR_SCHEMA already proves this is the author
+    # builder. "tests_authored" is the one REQUIRED marker: `author_followup`
+    # (domain/outcome.py) branches on this literal status string.
     assert "tests_authored" in t.prompt
 
 
@@ -73,15 +75,19 @@ def test_implement_task_is_fresh_and_test_immutable():
     t = build_implement_task(5, "Null token", "crashes", "/wt/issue-5", FIX_CFG)
     assert t.schema is IMPLEMENT_SCHEMA       # opens PR OR petitions → implement schema
     assert t.resume is None                   # FRESH session, NOT a resume of the author
-    assert "IMPLEMENTER" in t.prompt
-    assert "do NOT modify" in t.prompt and "test files" in t.prompt
-    assert "Fixes #5" in t.prompt
-    assert "contract_change" in t.prompt      # escape hatch present
+    # T5 (review): "IMPLEMENTER" / "do NOT modify … test files" were prose-only —
+    # IMPLEMENT_SCHEMA already proves builder identity, and test-immutability is
+    # actually ENFORCED by the PR gate's test-immutability check, not by this
+    # prompt's wording (the prompt only informs the agent of a rule the gate
+    # already guarantees).
+    assert "Fixes #5" in t.prompt             # interpolated issue number
+    assert "contract_change" in t.prompt      # required marker: ImplementFollowup parses it
 
 
 def test_implement_task_carries_uphold_note():
     t = build_implement_task(5, "t", "b", "/wt", FIX_CFG, uphold_note="the AC is correct because X")
-    assert "UPHELD" in t.prompt
+    # T5 (review): "UPHELD" alone was prose (a heading word); the interpolated
+    # note content below is the real contract this test is named for.
     assert "the AC is correct because X" in t.prompt
 
 
@@ -89,17 +95,23 @@ def test_adjudicate_task_is_blind_to_impl():
     t = build_adjudicate_task(5, "Null token", "crashes", "test asserts the wrong layer", "/wt/issue-5", FIX_CFG)
     assert t.schema is ADJUDICATE_SCHEMA
     assert t.resume is None                   # fresh session
-    assert "adjudicating" in t.prompt
     assert "test asserts the wrong layer" in t.prompt  # the objection is DATA in the prompt
+    # T5 (review): "adjudicating" (role label, redundant with ADJUDICATE_SCHEMA)
+    # and "Default to UPHELD" (a bias-polarity instruction unrelated to this
+    # test's namesake claim) were prose-only, pruned. "do NOT see the
+    # implementer's code" is kept: it is this test's whole point, and the
+    # real blindness MECHANISM (worktree reset before this leg runs) lives in
+    # app/workflows/fix.py, not in this module, so this is the only place that
+    # documents the agent is TOLD it is blind.
     assert "do NOT see the implementer's code" in t.prompt
-    assert "Default to UPHELD" in t.prompt
 
 
 def test_resume_task_carries_session_and_reply():
     t = build_resume_task("use endpoint X", "/wt", "sess-1", FIX_CFG, fork=True)
     assert t.resume == "sess-1" and t.fork_session is True
+    # T5 (review): "DATA, not new instructions" was prose-only (no fence, no
+    # parser) — pruned. The interpolated reply text below is the real contract.
     assert "use endpoint X" in t.prompt
-    assert "DATA, not new instructions" in t.prompt
 
 
 def test_address_review_task():
@@ -122,10 +134,13 @@ def test_fix_ci_task_includes_diagnosis_and_mcp():
 def test_rebase_task_resumes_session_and_names_base():
     from issue_agent.app.planners.tasks import build_rebase_task
     t = build_rebase_task(100, "dev", "/wt/issue-5", "sess-9", FIX_CFG)
-    assert "PR #100" in t.prompt and "CONFLICTS" in t.prompt
+    # T5 (review): "CONFLICTS" / "Do NOT weaken your tests" were prose-only,
+    # unrelated to this test's named claims (resumes session, names base) —
+    # pruned. "PR #100"/"origin/dev" are interpolated values; "force-with-lease"
+    # is a precise, required git-flag token (not a paraphrasable instruction).
+    assert "PR #100" in t.prompt
     assert "origin/dev" in t.prompt          # tells it what to rebase onto
     assert "force-with-lease" in t.prompt    # push guidance
-    assert "Do NOT weaken your tests" in t.prompt  # no cheating to force a pass
     assert t.resume == "sess-9"              # reuses the author's session context
     assert t.cwd == "/wt/issue-5"
 
@@ -310,7 +325,10 @@ def test_review_task_round_one_and_readonly():
     assert "Edit" in t.disallowed_tools and "Write" in t.disallowed_tools
     assert "Read" in t.allowed_tools                  # can open committed screenshots
     assert "the diff" in t.prompt
-    assert "evidence/" in t.prompt and "substantiates" in t.prompt  # screenshot-judgment
+    # T5 (review): "substantiates" was prose-only, pruned; "evidence/" is kept —
+    # the actual directory-naming convention (evidence/*.png) the screenshot
+    # gate reads, not a paraphrasable instruction.
+    assert "evidence/" in t.prompt
 
 
 def test_re_review_task_substitutes_round_and_resumes():
@@ -318,8 +336,10 @@ def test_re_review_task_substitutes_round_and_resumes():
     assert "round=3" in t.append_system_prompt
     assert t.resume == "rs"
     assert "round 3" in t.prompt
+    # T5 (review): "REFUTE" pruned here — incidental to this test's named claim
+    # (round substitution + resume), prose-only, and the adversarial-refute
+    # framing itself is the NAMED point of test_review_validation_task_is_adversarial.
     assert "old → new" in t.prompt
-    assert "REFUTE" in t.prompt  # refute-or-promote framing present
 
 
 # ── delegated review (REVIEW_MODE=delegated) ──
@@ -340,8 +360,10 @@ def test_delegated_review_attaches_scout_and_keeps_read():
     scout = t.subagents[0]
     assert scout.name == "code-scout" and scout.model == "sonnet"
     assert "Read" in scout.tools and "Grep" in scout.tools
-    # prompt tells the reviewer to delegate search
-    assert "code-scout" in t.prompt and "delegat" in t.prompt.lower()
+    # prompt names the scout subagent (required: the Task-tool delegation call
+    # must reference it by this exact name). T5 (review): the generic
+    # "delegat" wording check alongside it was prose-only, pruned.
+    assert "code-scout" in t.prompt
     # Task tool is auto-added so the delegation is invokable
     assert "Task" in t.all_allowed_tools()
 
@@ -355,8 +377,9 @@ def test_delegated_re_review_is_fresh_and_carries_prior_review():
     assert "round=3" in t.append_system_prompt
     assert "round 3" in t.prompt
     assert "old → new" in t.prompt
+    # T5 (review): "prior review" (generic phrase) was redundant with the
+    # interpolated sentinel below and prose-only on its own — pruned.
     assert "PRIOR-FEEDBACK" in t.prompt         # prior review fed as reference
-    assert "prior review" in t.prompt.lower()
     assert t.subagents and t.subagents[0].name == "code-scout"
     assert "Task" in t.all_allowed_tools()
 
@@ -608,9 +631,10 @@ def test_triage_task_readonly_and_thread():
     assert t.append_system_prompt == "TRIAGE"
     assert t.model == "sonnet"
     assert "Edit" in t.disallowed_tools
+    # T5 (review): "ANSWERS to your earlier" / "strangler fig" were prose-only
+    # guidance wording (no parser, no interpolation) — pruned. The interpolated
+    # thread content below is the real contract.
     assert "@alice: which columns?" in t.prompt
-    assert "ANSWERS to your earlier" in t.prompt     # anti-re-ask instruction ported
-    assert "strangler fig" in t.prompt               # breaking-rewrite → incremental slicing
 
 
 def test_triage_task_no_comments_placeholder():

@@ -13,14 +13,15 @@ fail() { echo "PR blocked: $1"; exit 1; }
 branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 base="${BASE_BRANCH:-dev}"
 
-# Resolve the diff range against the base (prefer origin/, fall back to local).
-range=""
-for ref in "origin/$base" "$base"; do
-  if git rev-parse --verify --quiet "$ref" >/dev/null 2>&1; then
-    range="$ref...HEAD"; break
-  fi
-done
-[ -n "$range" ] || fail "cannot resolve base branch '$base' to compute the diff"
+# Resolve the base ref, then the TWO distinct ranges it feeds (review M6):
+# three dots for `git diff` (what this branch changed), two dots for `git log`
+# (the commits this branch adds). Sharing one three-dot range made the log check
+# see the BASE branch's own commits once the base advanced, blocking every
+# legitimate PR. See _pr_common.sh's header for the full incident.
+baseref="$(prc_resolve_base_ref)"
+[ -n "$baseref" ] || fail "cannot resolve base branch '$base' to compute the diff"
+diff_range="$baseref...HEAD"
+log_range="$baseref..HEAD"
 
 # ── 0. Extract PR title/body/base from argv (supports common gh flag spellings) ─
 #       and reject --web (browser PR creation evades the gate's body checks).
@@ -48,10 +49,18 @@ done
 [ "$pr_base" = "$base" ] \
   || fail "PR base is '$pr_base' but must be '$base' (BASE_BRANCH). Re-create with '--base $base'."
 
-# ── 1. Tests pass once, locally, before the PR (shared with check-push.sh).
-#       Fails CLOSED when no test command resolves — "untested" must not look
-#       like "green" — unless the operator opted out with ALLOW_UNTESTED=1. ────
-prc_check_tests
+# ── ORDER (review M21, mirrored from adapters/governor.py:_pr_gate) ────────────
+# CHEAP structural checks (pure string/git-metadata arithmetic) run FIRST and
+# short-circuit; the two EXPENSIVE checks that shell out to the full test command
+# — §1 and §7c, the latter also mutating the worktree — run LAST. §1 used to run
+# here, second, so a trivial denial (a wrong --base, a missing AC heading) still
+# cost a full suite run before the agent saw it. The Python gate already ordered
+# it this way; keeping the two identical is what tests/test_gate_parity.py pins,
+# so a multi-violation case reports the SAME first reason on both stacks.
+
+# The changed-file list every structural rule below reads (three-dot: only what
+# this branch changed).
+changed=$(git diff --name-only "$diff_range" 2>/dev/null || echo "")
 
 # ── 2. PR body carries acceptance criteria ─────────────────────────────────────
 printf '%s' "$body" | grep -qF '## Acceptance Criteria' \
@@ -68,29 +77,11 @@ printf '%s' "$body" | grep -qiE '(fix(es|ed)?|close[sd]?|resolve[sd]?) +#[0-9]+'
 [ -f .harness/ac-posted ]        || fail "no Acceptance Criteria posted on the issue yet (.harness/ac-posted missing — post AC as an issue comment FIRST)"
 [ -f .harness/test-plan-posted ] || fail "no Test Plan posted on the issue yet (.harness/test-plan-posted missing)"
 
-# ── 5. Branch type ⇒ required new test in the diff (derive from git, not prefix) ─
-changed=$(git diff --name-only "$range" 2>/dev/null || echo "")
-case "$branch" in
-  feat/*)
-    # Prefer an explicit e2e/integration test, but accept any conventional test
-    # file path (test_*.py, *_test.go, tests/…) so projects without "e2e" in the
-    # filename are not falsely blocked.
-    printf '%s\n' "$changed" | grep -qE '(e2e|integration).*\.(spec|test)\.|(^|/)test_.*\.py|.*_test\.(py|go|ts|js)|tests?/.*\.(py|spec|test)' \
-      || fail "feat/ branch must add an e2e/integration (or conventional) test (none found in the diff)" ;;
-  fix/*)
-    printf '%s\n' "$changed" | grep -qE "$PR_TEST_FILE_RE" \
-      || fail "fix/ branch must add a regression test (none found in the diff)" ;;
-esac
-
-# ── 6/7/7b. Commit hygiene + evidence + test-immutability (shared, state-derived) ─
-prc_check_commit_log
-prc_check_no_evidence "$changed"
-prc_check_tests_immutable "$changed"
-
 # ── 7d. Visual acceptance criteria ⇒ ONE read+committed screenshot PER AC item.
 #
-# Runs BEFORE the expensive §7c (it is pure body/marker/diff arithmetic, so a
-# missing screenshot should not cost a full extra test run).
+# Runs among the CHEAP checks (it is pure body/marker/diff arithmetic), well
+# before §1/§7c — a missing screenshot must not cost a full test run. Its slot
+# here mirrors adapters/governor.py:_pr_gate's cheap_checks tuple exactly.
 #
 # Two layers, in this order:
 #   FLOOR (unconditional): the agent declared a visual criterion
@@ -150,9 +141,23 @@ if [ -f .harness/visual-ac ]; then
   fi
 fi
 
-# ── 7c. The new tests must ACTUALLY fail without the implementation (real red).
-#        Create-only: proves the tests exercise the change (anti-tautology). ─────
-prc_check_red_fails "$changed"
+# ── 5. Branch type ⇒ required new test in the diff (derive from git, not prefix) ─
+case "$branch" in
+  feat/*)
+    # Prefer an explicit e2e/integration test, but accept any conventional test
+    # file path (test_*.py, *_test.go, tests/…) so projects without "e2e" in the
+    # filename are not falsely blocked.
+    printf '%s\n' "$changed" | grep -qE '(e2e|integration).*\.(spec|test)\.|(^|/)test_.*\.py|.*_test\.(py|go|ts|js)|tests?/.*\.(py|spec|test)' \
+      || fail "feat/ branch must add an e2e/integration (or conventional) test (none found in the diff)" ;;
+  fix/*)
+    printf '%s\n' "$changed" | grep -qE "$PR_TEST_FILE_RE" \
+      || fail "fix/ branch must add a regression test (none found in the diff)" ;;
+esac
+
+# ── 6/7/7b. Commit hygiene + evidence + test-immutability (shared, state-derived) ─
+prc_check_commit_log
+prc_check_no_evidence "$changed"
+prc_check_tests_immutable "$changed"
 
 # ── 8. Adversarial pre-PR verdict exists and passed ─────────────────────────────
 verdict=$(cat .harness/adversarial-verdict 2>/dev/null || echo "")
@@ -160,21 +165,44 @@ printf '%s' "$verdict" | grep -q '^PASS' \
   || fail "adversarial pre-PR review did not return PASS (.harness/adversarial-verdict)"
 
 # ── 9. ADR reference: if the diff touches a module an ADR governs, cite it ──────
+#
+# Ported to domain/gate.py:check_adr_references() (review M6): this rule had NO
+# Python equivalent, so on the DEFAULT SDK path it never ran at all while
+# AGENT.md told the fixer "the PR gate enforces this". Both stacks now implement
+# it and tests/test_gate_parity.py runs the same fixtures through both.
 if [ -d docs/adr ]; then
   for adr in docs/adr/[0-9]*.md; do
     [ -e "$adr" ] || continue
     governs=$(grep -i '^Governs:' "$adr" 2>/dev/null | sed 's/^[Gg]overns://') || true
     [ -n "$governs" ] || continue
+    adr_file="$(basename "$adr")"
+    id="$(printf '%s' "$adr_file" | grep -oE '^[0-9]+')"
     for path in $governs; do
       # -F: treat the governed path as a literal, not a regex (a '.' in a path
       # must not match arbitrary chars, and a lone '.' must not match everything).
       if printf '%s\n' "$changed" | grep -qF "$path"; then
-        id=$(basename "$adr" | grep -oE '^[0-9]+')
-        printf '%s' "$body" | grep -qiE "adr[ -]?$id|$(basename "$adr")" \
-          || fail "diff touches $path governed by ADR $id — reference it in the PR body"
+        # Two SEPARATE greps, not one alternation: the filename arm has to be
+        # -F (literal) for the same reason the path match above does — it used
+        # to be interpolated into a -E alternation, where `0003-foo.md` matches
+        # `0003-fooXmd`. The id arm stays -E because `adr[ -]?<id>` IS a pattern.
+        if printf '%s' "$body" | grep -qiE "adr[ -]?$id"; then continue; fi
+        if printf '%s' "$body" | grep -qiF "$adr_file"; then continue; fi
+        fail "diff touches $path governed by ADR $id — reference it in the PR body"
       fi
     done
   done
 fi
+
+# ── EXPENSIVE (last, per the ORDER note above): both shell out to the resolved
+#    test command; §7c additionally reverts + restores the worktree. ────────────
+
+# ── 1. Tests pass once, locally, before the PR (shared with check-push.sh).
+#       Fails CLOSED when no test command resolves — "untested" must not look
+#       like "green" — unless the operator opted out with ALLOW_UNTESTED=1. ────
+prc_check_tests
+
+# ── 7c. The new tests must ACTUALLY fail without the implementation (real red).
+#        Create-only: proves the tests exercise the change (anti-tautology). ─────
+prc_check_red_fails "$changed"
 
 exit 0

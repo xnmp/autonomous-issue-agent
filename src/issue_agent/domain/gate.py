@@ -383,6 +383,104 @@ def check_tests_immutable(
     return ALLOW
 
 
+# ── ADR citation (check-pr.sh §9) ─────────────────────────────────────────────
+# Ported from bash in wave P1-2 (review M6). It had NO Python equivalent, so on
+# the DEFAULT SDK path — the one every Claude-driven fixer takes — this rule was
+# dead, while plugin/AGENT.md told the agent "the PR gate enforces this". Docs
+# that describe the union of two implementations, with no path satisfying them,
+# are worse than either implementation alone.
+@dataclass(frozen=True)
+class Adr:
+    """One architecture decision record, as the gate needs to see it.
+
+    `filename` is the basename (`0003-storage-layer.md`); `governs` are the
+    whitespace-separated paths from its `Governs:` line(s). Loading is the
+    adapter's job (`adapters/governor.read_adrs`) — this stays a value."""
+
+    filename: str
+    governs: tuple[str, ...] = ()
+
+    @property
+    def id(self) -> str:
+        """The leading digits of the filename (`0003-storage.md` → `0003`), which
+        is what the PR body must cite. '' when the name doesn't start with digits
+        — the loader's glob (`[0-9]*.md`) makes that unreachable in practice."""
+        m = re.match(r"^([0-9]+)", self.filename)
+        return m.group(1) if m else ""
+
+
+_ADR_GOVERNS_RE = re.compile(r"^Governs:(.*)$", re.IGNORECASE | re.MULTILINE)
+
+
+def parse_adr(filename: str, text: str) -> Adr:
+    """An ADR file's basename + contents → the value the rule reads. Mirrors the
+    bash `grep -i '^Governs:' | sed 's/^[Gg]overns://'` + word-split: EVERY
+    `Governs:` line contributes, and each line's value is split on whitespace."""
+    governs: list[str] = []
+    for m in _ADR_GOVERNS_RE.finditer(text or ""):
+        governs.extend(m.group(1).split())
+    return Adr(filename=filename, governs=tuple(governs))
+
+
+def adr_is_cited(body: str, adr: Adr) -> bool:
+    """Does the PR body reference this ADR? Either `ADR <id>` (any case, with an
+    optional space or hyphen: `adr-0003`, `ADR 0003`, `adr0003`) or the ADR's
+    filename verbatim. The filename is matched LITERALLY — the bash interpolated
+    it into a regex alternation, where `0003-foo.md` also matched `0003-fooXmd`;
+    both stacks now use a literal compare (`grep -qiF`)."""
+    hay = body or ""
+    if adr.id and re.search(rf"adr[ -]?{re.escape(adr.id)}", hay, re.IGNORECASE):
+        return True
+    return adr.filename.lower() in hay.lower()
+
+
+def check_adr_references(
+    load_adrs: Callable[[], tuple[Adr, ...]], changed: Iterable[str], body: str
+) -> GateResult:
+    """§9: if the diff touches a path an ADR governs, the PR body must cite that
+    ADR. Higher-order over an injected loader (the `check_tests` shape) because
+    reading `docs/adr/` is I/O and this rule runs inside a hook: the loader is
+    called ONLY when this check is reached, never at context-build time.
+
+    A repo with no `docs/adr/` yields no ADRs and the rule is inert — that is the
+    common case and must stay free. A governed path matches as a SUBSTRING of a
+    changed path (bash `grep -qF`), so `Governs: src/auth` covers
+    `src/auth/token.py`."""
+    files = [f for f in changed if f]
+    for adr in load_adrs():
+        for path in adr.governs:
+            if not any(path in f for f in files):
+                continue
+            if adr_is_cited(body, adr):
+                continue
+            return deny(
+                f"diff touches {path} governed by ADR {adr.id} — "
+                "reference it in the PR body"
+            )
+    return ALLOW
+
+
+# ── project lint / typecheck at commit time (check-commit.sh:54-59) ───────────
+def check_project_commands(
+    lint_cmd: str, typecheck_cmd: str, run: Callable[[str], bool]
+) -> GateResult:
+    """The commit-time fast gates: run `LINT_CMD` then `TYPECHECK_CMD` in the
+    worktree and DENY on a non-zero exit. Ported from bash in wave P1-2 (review
+    M6) — the SDK path had no equivalent, so `bin/doctor.sh` printed
+    "✓ LINT_CMD set" about a command nothing ran.
+
+    Order matters and lives here, not in the caller: lint before typecheck, both
+    before the far more expensive `check_red_is_red` (which runs the whole test
+    suite). Either being unset skips it — an operator who configured neither pays
+    nothing. Tests are deliberately NOT run here; a blocking commit hook that ran
+    the suite would time out and serialise the agent (see check-commit.sh)."""
+    if lint_cmd and not run(lint_cmd):
+        return deny(f"Lint failed (LINT_CMD): {lint_cmd}")
+    if typecheck_cmd and not run(typecheck_cmd):
+        return deny(f"Typecheck failed (TYPECHECK_CMD): {typecheck_cmd}")
+    return ALLOW
+
+
 # ── markers + adversarial verdict (check-pr.sh §4/§8) ─────────────────────────
 def check_markers(ac_posted: bool, test_plan_posted: bool) -> GateResult:
     if not ac_posted:

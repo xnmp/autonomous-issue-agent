@@ -53,6 +53,10 @@ fi
 : "$amend"  # referenced for clarity; green: is constrained whether or not amend
 
 # Resolve a base..HEAD range to list commits already on this branch.
+# TWO dots, deliberately: three dots is `git log`'s SYMMETRIC difference, which
+# would also list the base branch's own commits. This checker was always right;
+# _pr_common.sh's shared range was not (review M6) — do not "unify" them into one
+# variable, they are different ranges. See _pr_common.sh's header.
 range=""
 for ref in "origin/$BASE_BRANCH" "$BASE_BRANCH"; do
   if git rev-parse --verify --quiet "$ref" >/dev/null 2>&1; then

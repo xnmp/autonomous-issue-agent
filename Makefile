@@ -2,7 +2,7 @@
 SHELL := /bin/bash
 HARNESS_ROOT := $(shell pwd)
 
-.PHONY: help test test-governor test-hooks test-orchestration test-domain test-adapters arch doctor \
+.PHONY: help test test-governor test-hooks test-orchestration test-domain test-adapters test-parity arch doctor \
 	        install bootstrap point-at run-fix run-review run-steward run-fix-sh run-review-sh run-steward-sh demo-gate \
         install-launchd install-systemd \
         uninstall-launchd uninstall-systemd demo-init lint clean
@@ -12,6 +12,7 @@ help:
 	@echo "  make test               run the full self-test suite (governor + hooks + orchestration + domain)"
 	@echo "  make test-domain        run the pure Python domain behavioural suite (Phase 0/1 port)"
 	@echo "  make test-adapters      run the Python adapter suite (Phase 2: AgentRunner + governor)"
+	@echo "  make test-parity        run the gate PARITY suite (same case through bash + Python gates)"
 	@echo "  make doctor             preflight: tooling, config, identities, repo access"
 	@echo "  make install            install the 'issue-agent' CLI (uv sync + ~/.local/bin shim)"
 	@echo "  make bootstrap TARGET=/path/to/repo   install the plugin into a target repo"
@@ -25,7 +26,7 @@ help:
 	@echo "  make demo-init          create + seed the local demo target repo"
 	@echo "  make clean              remove caches and demo scratch"
 
-test: test-governor test-hooks test-orchestration test-domain test-adapters arch
+test: test-governor test-hooks test-orchestration test-domain test-adapters test-parity arch
 	@echo ""
 	@echo "✓ all suites passed"
 
@@ -51,6 +52,17 @@ test-domain:
 test-adapters:
 	@echo "== adapters (pytest: AgentRunner mapping + in-process governor) =="
 	@uv run --quiet --with pytest --with tree-sitter --with tree-sitter-bash pytest tests/adapters/
+
+# Gate parity (review M6). The harness has TWO gate implementations — the bash
+# checkers (live for codex) and domain/gate.py + adapters/governor.py (live for
+# the SDK/Claude path, the reviewer and the steward) — that shared a spec, not
+# code, and drifted. This suite runs golden cases through BOTH and fails on any
+# disagreement; it is the sync mechanism that replaced the "keep in sync"
+# comments. Deps mirror test-adapters (tree-sitter for the classifier); it is a
+# PEP 723 script, so `uv run` self-bootstraps pytest.
+test-parity:
+	@echo "== gate parity (pytest: bash checkers vs domain/gate.py) =="
+	@uv run --quiet tests/test_gate_parity.py
 
 # Architectural lint: the hexagonal layering contracts in pyproject.toml
 # ([tool.importlinter]). Needs the SDK importable (adapters/app import it), so

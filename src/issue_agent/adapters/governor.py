@@ -25,12 +25,29 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ..domain import gate
 from ..domain.refs import is_governed_branch
 from . import governor_policy
+
+
+def _no_adrs() -> tuple[gate.Adr, ...]:
+    """Default `GateContext.load_adrs`: no ADRs ⇒ the §9 citation rule is inert.
+
+    A NAMED function, not a lambda, so `complete_gate_context` can distinguish
+    "the context builder never wired this" (fill it in from the worktree) from
+    "a caller deliberately injected a loader that finds nothing" (leave it
+    alone). An identity check against a lambda default would work too, but only
+    by accident of where the lambda was written."""
+    return ()
+
+
+def _no_check(_cmd: str) -> bool:
+    """Default `GateContext.run_check`: nothing runs, nothing fails. Inert, and
+    only ever consulted when `lint_cmd`/`typecheck_cmd` are non-empty."""
+    return True
 
 
 # ── worktree facts the gate rules need (injected; built from git in Phase 4) ──
@@ -79,6 +96,124 @@ class GateContext:
     revert_and_run: Callable[[tuple[str, ...]], bool] = lambda impl: False
     red_must_fail: bool = True
     verify_red_at_commit: bool = True   # run the suite on a `red:` commit, require failure
+    # ── the two rules ported from bash in wave P1-2 (review M6) ───────────────
+    # The worktree the gate is judging. Filled by `complete_gate_context` from
+    # the hook's cwd; "" means "nobody said", which makes the worktree-derived
+    # facts below inert rather than wrong.
+    worktree_dir: str = ""
+    # Commit-time fast gates (check-commit.sh:54-59). OPERATOR facts read from
+    # the daemon's environment — exactly the environment the bash checker
+    # inherits — never from the agent's command line.
+    lint_cmd: str = ""
+    typecheck_cmd: str = ""
+    # Runs a fast project command (lint/typecheck) in the worktree → passed?
+    # Separate from `run_tests` because these are commit-hook-fast by contract
+    # and must not inherit the test suite's timeout budget. Default is inert.
+    run_check: Callable[[str], bool] = _no_check
+    # ADR facts, as a LAZY loader for the same reason `open_pr` is one: this
+    # context is rebuilt for EVERY Bash call, and reading docs/adr/ is a
+    # directory walk plus N file reads. Only `_pr_gate` ever calls it.
+    load_adrs: Callable[[], tuple[gate.Adr, ...]] = _no_adrs
+
+
+# ── worktree/env facts for the two rules ported from bash (review M6) ─────────
+# `docs/adr/[0-9]*.md`, the same glob check-pr.sh §9 uses.
+_ADR_GLOB = "[0-9]*.md"
+# A single ADR is a short markdown file; this bounds a pathological one (and a
+# non-ADR file that happens to match the glob) without truncating any real one.
+_ADR_MAX_BYTES = 64 * 1024
+
+
+def read_adrs(adr_dir: str) -> tuple[gate.Adr, ...]:
+    """Load `docs/adr/[0-9]*.md` into the domain's `Adr` values, sorted by
+    filename (the bash glob's order, so both stacks report the SAME first
+    offending ADR when a diff violates several).
+
+    Never raises: a missing directory, an unreadable file, or a permission error
+    yields fewer ADRs, never an exception — this runs inside the PreToolUse hook,
+    whose only other option is to fail open on the whole gate."""
+    import glob
+
+    adrs: list[gate.Adr] = []
+    try:
+        # `glob.escape` on the DIRECTORY only: a worktree path containing `[` or
+        # `?` would otherwise be read as part of the pattern and silently match
+        # nothing — i.e. the rule would go quiet instead of failing.
+        paths = sorted(glob.glob(os.path.join(glob.escape(adr_dir), _ADR_GLOB)))
+    except OSError:
+        return ()
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                text = fh.read(_ADR_MAX_BYTES)
+        except OSError:
+            continue
+        adrs.append(gate.parse_adr(os.path.basename(path), text))
+    return tuple(adrs)
+
+
+# Commit-time lint/typecheck must be commit-hook-fast by contract (check-commit.sh
+# runs them synchronously inside a PreToolUse hook). This is a hard ceiling, not a
+# budget: a lint that hangs would otherwise hold the agent's whole turn open.
+_CHECK_TIMEOUT_S = 120.0
+
+
+def _run_project_check(cmd: str, cwd: str) -> bool:
+    """Run a project lint/typecheck command in `cwd` → did it pass?
+
+    A timeout or a spawn failure reports FALSE (did not pass), matching the
+    bash's `eval "$LINT_CMD" || fail`: a check that cannot complete has not
+    passed. Never raises — `evaluate_command` runs under a broad fail-OPEN
+    except, so an escaping exception would silently ALLOW the commit."""
+    import subprocess
+
+    try:
+        return subprocess.run(
+            cmd, shell=True, cwd=cwd or None, timeout=_CHECK_TIMEOUT_S
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def complete_gate_context(
+    ctx: GateContext,
+    cwd: str,
+    env: dict[str, str] | None = None,
+    read_adrs_fn: Callable[[str], tuple[gate.Adr, ...]] = read_adrs,
+    run_check_fn: Callable[[str, str], bool] = _run_project_check,
+) -> GateContext:
+    """Fill in the facts the two ported rules (review M6) need, from the hook's
+    cwd and the daemon's environment.
+
+    Why here and not in `build_gate_context`: those are worktree/env facts the
+    git-backed builder does not currently gather, and the SDK hook is the one
+    place that provably knows the worktree (it DENIES when `cwd` is missing —
+    P1R-17). Every field is filled only when the builder left it at its inert
+    default, so a caller that wires them explicitly (tests, a future
+    `build_gate_context` that takes them as parameters) is never overridden. When
+    `build_gate_context` grows these parameters this function collapses to
+    nothing and can be deleted — the sentinel checks make that a no-op change.
+
+    `LINT_CMD`/`TYPECHECK_CMD` come from the process environment because that is
+    literally the same source the bash checker reads: check-commit.sh is spawned
+    by the daemon and inherits its env, and on the SDK path the governor IS the
+    daemon process. They are operator knobs (`config/agent.env.example`), never
+    agent-settable — the agent's own `KEY=val cmd` prefixes are recovered by
+    `governor_policy` for bypass detection and never reach here."""
+    values = os.environ if env is None else env
+    fields: dict[str, Any] = {}
+    if not ctx.worktree_dir:
+        fields["worktree_dir"] = cwd
+    if ctx.load_adrs is _no_adrs:
+        adr_dir = os.path.join(cwd, "docs", "adr")
+        fields["load_adrs"] = lambda: read_adrs_fn(adr_dir)
+    if not ctx.lint_cmd:
+        fields["lint_cmd"] = values.get("LINT_CMD", "") or ""
+    if not ctx.typecheck_cmd:
+        fields["typecheck_cmd"] = values.get("TYPECHECK_CMD", "") or ""
+    if ctx.run_check is _no_check:
+        fields["run_check"] = lambda cmd: run_check_fn(cmd, cwd)
+    return replace(ctx, **fields) if fields else ctx
 
 
 def _extract_after_flag(argv: list[str], *flags: str) -> str:
@@ -99,6 +234,30 @@ def _argv_has(argv: list[str], flag: str) -> bool:
     return flag in argv
 
 
+def _pr_body(argv: list[str], ctx: GateContext) -> str:
+    """The PR body `gh pr create` will post, from either spelling.
+
+    `--body-file`/`-F` support exists because without it the two stacks
+    disagreed on every `gh pr create --body-file …`: check-pr.sh reads the file,
+    the Python gate saw an empty body and denied "missing '## Acceptance
+    Criteria'" on a PR whose body has one. Fail-closed, so never a hole — but a
+    denial whose reason is false is one the agent cannot act on. The path is
+    resolved against the worktree (the agent's cwd), and an unreadable file
+    yields "" exactly like the bash's `cat … || true`."""
+    inline = _extract_after_flag(argv, "--body", "-b")
+    if inline:
+        return inline
+    path = _extract_after_flag(argv, "--body-file", "-F")
+    if not path:
+        return ""
+    try:
+        with open(os.path.join(ctx.worktree_dir, path), encoding="utf-8",
+                  errors="replace") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
 def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
     """Full PR-creation gate (check-pr.sh) as a list of deny reasons (review M21).
 
@@ -115,17 +274,18 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
     later cheap check's own cost — negligible here, but the property is the
     point — never runs past an earlier denial either.
     """
-    body = _extract_after_flag(argv, "--body", "-b")
+    body = _pr_body(argv, ctx)
     pr_base = _extract_after_flag(argv, "--base", "-B")
 
+    # The tuple order IS the contract check-pr.sh mirrors, section for section
+    # (§0, §0b, §2/§3, §4, §7d, §5, §6, §7, §7b, §8, §9, then §1 and §7c).
+    # tests/test_gate_parity.py runs golden cases through both and compares the
+    # first denial, so a reorder on one side without the other fails loudly.
     cheap_checks: tuple[Callable[[], gate.GateResult], ...] = (
         lambda: gate.check_no_web(argv),
         lambda: gate.check_pr_base(pr_base, ctx.base_branch),
         lambda: gate.check_pr_body(body),
         lambda: gate.check_markers(ctx.ac_posted, ctx.test_plan_posted),
-        # pr_body arms the per-AC-item screenshot rule (§7d); inline --body/-b
-        # only — --body-file is handled by the bash §7d, a pre-existing
-        # extractor limitation.
         lambda: gate.check_visual_evidence(
             ctx.visual_ac, ctx.changed_files, ctx.screenshots_read, body
         ),
@@ -134,6 +294,11 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
         lambda: gate.check_no_evidence(ctx.changed_files),
         lambda: gate.check_tests_immutable(ctx.changed_files, ctx.exists_at_base),
         lambda: gate.check_adversarial_verdict(ctx.adversarial_verdict),
+        # §9 — ported from bash in wave P1-2 (review M6). Cheap only in the sense
+        # that matters here (no test run), but it does touch the filesystem, so
+        # it sits LAST among the cheap checks: a repo with no docs/adr/ pays one
+        # failed glob, and only once every earlier rule has passed.
+        lambda: gate.check_adr_references(ctx.load_adrs, ctx.changed_files, body),
     )
     for check in cheap_checks:
         result = check()
@@ -197,20 +362,37 @@ def _push_gate_for_branch(branch: str, ctx: GateContext) -> list[str]:
         return [precondition.reason]
     if not ctx.base_resolvable:
         return []
-    reasons: list[str] = []
 
-    def chk(result: gate.GateResult) -> None:
+    # Cheap structural checks first, the suite-running one LAST, short-circuiting
+    # on the first denial (review M21 — `_pr_gate` was fixed in wave P1-1, this
+    # gate was not). It used to run `check_tests` FIRST and then evaluate every
+    # remaining rule regardless, so a push with a bad commit prefix still paid a
+    # full GATE_TEST_TIMEOUT_S test run before being told about the prefix. The
+    # caller only ever reads `reasons[0]`, so returning one element changes
+    # nothing observable. check-push.sh runs the same four in the same order.
+    cheap_checks: tuple[Callable[[], gate.GateResult], ...] = (
+        lambda: gate.check_commit_log(ctx.branch_subjects),
+        lambda: gate.check_no_evidence(ctx.changed_files),
+        lambda: gate.check_tests_immutable(ctx.changed_files, ctx.exists_at_base),
+    )
+    for check in cheap_checks:
+        result = check()
         if not result.ok:
-            reasons.append(result.reason)
+            return [_annotate(result.reason, branch, mode)]
 
     test_cmd = gate.resolve_test_cmd(ctx.harness_test_cmd, ctx.env_test_cmd)
-    chk(gate.check_tests(test_cmd, ctx.run_tests, allow_untested=ctx.allow_untested))
-    chk(gate.check_commit_log(ctx.branch_subjects))
-    chk(gate.check_no_evidence(ctx.changed_files))
-    chk(gate.check_tests_immutable(ctx.changed_files, ctx.exists_at_base))
-    if reasons and mode is gate.PushGateMode.UNVERIFIED:
-        return [gate.unverified_push_denial(reasons[0], branch)]
-    return reasons
+    tests = gate.check_tests(test_cmd, ctx.run_tests, allow_untested=ctx.allow_untested)
+    if not tests.ok:
+        return [_annotate(tests.reason, branch, mode)]
+    return []
+
+
+def _annotate(reason: str, branch: str, mode: gate.PushGateMode) -> str:
+    """A denial reached with the PR state UNKNOWN gets the 'the lookup failed,
+    the rule is still real' note; an ENFORCE denial is returned verbatim."""
+    if mode is gate.PushGateMode.UNVERIFIED:
+        return gate.unverified_push_denial(reason, branch)
+    return reason
 
 
 def _push_gate(push_argv: list[str], ctx: GateContext) -> list[str]:
@@ -275,6 +457,16 @@ def evaluate_command(command: str, ctx: GateContext) -> Verdict:
             order = gate.check_commit_order(msg, ctx.branch_subjects, ctx.base_resolvable)
             if not order.ok:
                 return Verdict(False, order.reason)
+            # Project lint + typecheck (check-commit.sh:54-59), ported in wave
+            # P1-2 (review M6): the SDK path never ran them, so doctor's
+            # "✓ LINT_CMD set" described a command nothing executed. Between the
+            # pure checks above and the suite-running one below — same slot, same
+            # order (lint then typecheck) as the bash.
+            project = gate.check_project_commands(
+                ctx.lint_cmd, ctx.typecheck_cmd, ctx.run_check
+            )
+            if not project.ok:
+                return Verdict(False, project.reason)
             # Fail-fast: a `red:` commit's tests must actually fail (run on the
             # working tree now). §10 at PR time remains the committed-state backstop.
             test_cmd = gate.resolve_test_cmd(ctx.harness_test_cmd, ctx.env_test_cmd)
@@ -475,7 +667,13 @@ def make_pretooluse_hook(
                     "directory — retry the command; if it persists, this is a harness "
                     "bug to report, not something to work around."
                 )
-            ctx = build_ctx(cwd)
+            # `build_ctx` gathers the git-derived facts; `complete_gate_context`
+            # adds the worktree/env facts the two rules ported from bash need
+            # (ADRs, LINT_CMD/TYPECHECK_CMD — review M6). Without this line both
+            # rules go inert on the SDK path, which is the exact state M6 found;
+            # tests/test_gate_parity.py's absence tests remove it and assert the
+            # parity suite fails.
+            ctx = complete_gate_context(build_ctx(cwd), cwd)
             verdict = evaluate_command(command, ctx)
         except Exception as exc:
             # Fail OPEN on our own errors — never wedge the agent over a bug in

@@ -1,4 +1,5 @@
-"""Loop-convergence property for the pure fix decision (T3).
+"""Loop-convergence property for the pure fix decision (T3), driven end-to-end
+through the REAL orchestration layer (review D13).
 
 `decide_fix` is edge-triggered: it dispatches a PAID agent session when the world
 looks a certain way, and the ONLY thing that stops it re-dispatching on the next
@@ -9,43 +10,52 @@ compared against a different fact than the read side, so an UNCHANGED world
 re-fired a full session every tick, forever.
 
 This file tests that shape rather than one instance of it. Each scenario runs the
-daemon's tick loop against a FROZEN GitHub world — the pathological case where
-the agent accomplishes nothing (no push, no PR, no new review, no comment) —
-while faithfully applying the two things the daemon itself changes:
-
-  a) its own ``Relabel`` writes (labels are the coordination channel), and
-  b) the orchestration state ``app/workflows/fix.py`` persists around each
-     dispatch (resumed-at mark, review / CI / rebase retry counters).
+REAL `app.loop.Daemon` tick loop — `decide_fix` → `Executor.execute` →
+`AgentDispatcher.dispatch` → the REAL `app/workflows/fix.py` → a REAL
+`Store(tmp_path)` — against a FROZEN GitHub world (a `_SimGateway` double whose
+only behaviour beyond plain data is applying the daemon's OWN `relabel`/
+`close_issue` writes, exactly as GitHub itself would). The agent's own run is the
+pathological case where it accomplishes nothing (no push, no PR, no comment);
+the read side (`app.roles._fix_state`) is imported from production, not
+reimplemented, so both halves of the decide/write pair are the actual code.
 
 Asserted property: the number of PAID ``RunAgent`` dispatches over an unbounded
 poll loop is capped by the relevant circuit breaker, and `decide_fix` then
 settles on a STABLE, RunAgent-free fixed point. Repeated $0 actions (an
 idempotent auto-merge arm) are acceptable; repeated sessions are not.
 
-The harness is deliberately tiny and explicit: `_apply_relabels` +
-`_after_run` are the whole simulator, so a new scenario is one table row.
+review D13 / T2 (docs/REVIEW-2026-07-25-adversarial.md §2, §5): the previous
+version of this file hand-mirrored `app/workflows/fix.py`'s decide/write pairing
+in a private `_after_run` — a description of the workflow, not the workflow. The
+review mutation-proved the gap: deleting the workflow's resolve-breaker bump left
+this suite 10/10 green (only `test_fix_workflow.py` caught it), and `_after_run`'s
+own `:189` comment described an unconditional CI bump the workflow had already
+stopped performing. Driving the real `FixWorkflow`/`Store`/`AgentDispatcher`
+means that class of drift now fails THIS suite too — see the module's final
+report for the mutation re-run that confirms it.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+import asyncio
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 
 import pytest
 from builders import Check, Comment, Review, issue, pr, world
 
-from issue_agent.domain import fix as fix_domain
+from issue_agent.adapters.store import Store
+from issue_agent.app import roles
+from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
+from issue_agent.app.execute import Executor
+from issue_agent.app.loop import Daemon
+from issue_agent.app.planners.tasks import FixTaskConfig
 from issue_agent.domain import outcome
-from issue_agent.domain.ci import latest_other_review
-from issue_agent.domain.actions import (
-    Action,
-    AgentKind,
-    Relabel,
-    RunAgent,
-    Target,
-)
+from issue_agent.domain.actions import Action, AgentKind, Relabel, RunAgent, Target
 from issue_agent.domain.fix import FixConfig, FixState, decide_fix
 from issue_agent.domain.labels import Label
-from issue_agent.domain.world import WorldState
+from issue_agent.domain.refs import issue_from_branch
+from issue_agent.domain.world import IssueView, PRView, WorldState
 
 CFG = FixConfig(fix_bot="fix-bot")
 
@@ -60,42 +70,48 @@ STABLE_TAIL = 3
 ERRORED_RUN = outcome.AgentResult(is_error=True)
 
 
-# ── simulator ────────────────────────────────────────────────────────────────
-def _moved(labels: frozenset[Label], action: Relabel) -> frozenset[Label]:
-    out = set(labels)
-    if action.remove is not None:
-        out.discard(action.remove)
-    if action.add is not None:
-        out.add(action.add)
-    return frozenset(out)
+# ── adapter doubles ──────────────────────────────────────────────────────────
+# Everything past this point that used to be a hand-written mirror of decide/
+# write logic is now the REAL `app.workflows.fix.FixWorkflow` /
+# `app.dispatch.AgentDispatcher` / `adapters.store.Store` / `app.roles._fix_state`.
+# The only things this file still fakes are: the GitHub transport (a PR/issue
+# store that must persist a `relabel`/`close_issue` write so the NEXT poll
+# observes it — GitHub does exactly that) and the worktree/agent-runner I/O.
+class _FakeWorktrees:
+    def ensure(self, issue: int, branch: str) -> str:
+        return f"/wt/issue-{issue}"
+
+    def remove(self, issue: int) -> None:
+        pass
+
+    def reset(self, issue: int) -> None:
+        pass
 
 
-def _apply_relabels(state_of_world: WorldState, actions) -> WorldState:
-    """Apply the daemon's OWN Relabel writes back into the simulated world.
+class _FakeRunner:
+    """Every dispatch in this file scripts the SAME pathological result — the
+    agent errors and changes nothing on GitHub — unless overridden."""
 
-    These are not incidental: the label move IS how a decision records that it
-    already fired (ai-ready→ai-working, ai-pr-open→needs-human-review). A
-    simulation that dropped them would invent loops that don't exist and — far
-    worse — hide the ones that do. Every other action (PostComment, CloseIssue,
-    EnableAutoMerge, RemoveWorktree) is $0 and does not feed back into
-    `decide_fix`, so the world ignores them.
-    """
-    issues = list(state_of_world.issues)
-    prs = list(state_of_world.prs)
-    for action in actions:
-        if not isinstance(action, Relabel):
-            continue
-        if action.target is Target.ISSUE:
-            issues = [
-                replace(i, labels=_moved(i.labels, action)) if i.number == action.number else i
-                for i in issues
-            ]
-        else:
-            prs = [
-                replace(p, labels=_moved(p.labels, action)) if p.number == action.number else p
-                for p in prs
-            ]
-    return WorldState(issues=tuple(issues), prs=tuple(prs))
+    def __init__(self, result: outcome.AgentResult = ERRORED_RUN):
+        self.result = result
+        self.tasks: list = []
+
+    async def run(self, task):
+        self.tasks.append(task)
+        return self.result
+
+
+class _RaisingRunner:
+    """The C3 shape (review): the session dies BEFORE `runner.run` returns, so
+    the run RAISES rather than returning a result — the whole workflow tail
+    (save_session, the retry bump, the follow-up actions) never executes."""
+
+    def __init__(self):
+        self.tasks: list = []
+
+    async def run(self, task):
+        self.tasks.append(task)
+        raise RuntimeError("stream closed before any result")
 
 
 def _find(views, number: int):
@@ -105,133 +121,90 @@ def _find(views, number: int):
     raise AssertionError(f"scenario world has no #{number}")
 
 
-def _latest_changes_requested_at(pr_view, fix_bot: str) -> str:
-    """Mirror of `FixWorkflow._current_review_at` (app/workflows/fix.py) — the
-    key the review retry counter is stored under: the latest DISTINCT-actor
-    review iff it requests changes, i.e. the SAME selector `decide_fix` gates
-    dispatch on. Re-implemented here rather than imported so the domain suite
-    stays free of the app layer; if the workflow's keying changes, this must
-    too."""
-    review = latest_other_review(pr_view.reviews, fix_bot)
-    if review is not None and review.state == "CHANGES_REQUESTED":
-        return review.submitted_at
-    return ""
+def _issue_for(p: PRView) -> int | None:
+    """The SAME fallback the real gateway and `domain.fix.breaker_key` use:
+    prefer the closing-reference, else the branch-encoded issue number
+    (adapters/github.py:823-829). Re-implemented here (rather than imported)
+    so this double stays a plain data object — the exact convention
+    `tests/adapters/test_roles.py`'s own `FakeGateway` already uses for the
+    same reason, including for the C4 key-agreement property this suite also
+    depends on."""
+    if p.closing_issue is not None:
+        return p.closing_issue
+    return issue_from_branch(p.head_ref_name)
 
 
-def _with_session(state: FixState, issue_number: int, session_id: str) -> FixState:
-    """`store.save_session` (adapters/store.py:72-74) is a no-op for an empty id,
-    so an errored run leaves the session set untouched."""
-    if not session_id:
-        return state
-    return replace(state, sessions=state.sessions | {issue_number})
+def _moved(labels: frozenset[Label], remove: Label | None, add: Label | None) -> frozenset[Label]:
+    out = set(labels)
+    if remove is not None:
+        out.discard(remove)
+    if add is not None:
+        out.add(add)
+    return frozenset(out)
 
 
-def _after_raised_run(
-    run: RunAgent, state_of_world: WorldState, state: FixState
-) -> tuple[list[Action], FixState]:
-    """The OTHER terminal shape (review C3): the session dies BEFORE
-    `runner.run` returns, so `AgentRunner` raises and the workflow tail never
-    executes — no session saved, no retry counter, no follow-up actions, and the
-    label stays wherever the dispatch relabel left it. The ONLY write is
-    `AgentDispatcher.dispatch`'s bump-then-re-raise, mirrored here.
+class _SimGateway:
+    """A GitHubGateway double whose `relabel`/`close_issue` MUTATE the observed
+    world. That mutation is not a decision-logic mirror (the thing D13 removes)
+    — it is what GitHub itself does when the real gateway is asked to write,
+    and it has to persist here for the identical reason it must in production:
+    so the NEXT poll's `build_world()` observes it. Every actual DECISION
+    (which counter moves, which follow-up action fires, whether a breaker
+    trips) is made by the real `FixWorkflow`/`decide_fix`/`Store` from here
+    down."""
 
-    Key: the issue behind the work, or the negated PR number when a PR has no
-    resolvable issue — `breaker_key`'s convention, which is what the dispatcher
-    uses (`issue if issue is not None else -action.number`).
-    """
-    key = run.number
-    if run.kind in (AgentKind.ADDRESS_REVIEW, AgentKind.FIX_CI, AgentKind.REBASE):
-        key = fix_domain.breaker_key(_find(state_of_world.prs, run.number))
-    deaths = dict(state.infra_deaths)
-    deaths[key] = deaths.get(key, 0) + 1
-    return [], replace(state, infra_deaths=deaths)
+    def __init__(self, world_state: WorldState):
+        self.world = world_state
+        self.calls: list = []
 
+    def build_world(self) -> WorldState:
+        return self.world
 
-def _after_run(
-    run: RunAgent, state_of_world: WorldState, state: FixState, cfg: FixConfig
-) -> tuple[list[Action], FixState]:
-    """The state transition the fix workflow persists around one dispatch, plus
-    the follow-up actions it executes — for a run that ERRORED and changed
-    nothing. Returns (follow-up actions, new FixState).
+    def get_issue(self, n: int) -> IssueView:
+        return _find(self.world.issues, n)
 
-    Each branch mirrors `app/workflows/fix.py` exactly; the anti-loop guarantee
-    lives in the pairing of these writes with `decide_fix`'s reads, so any drift
-    between the two is the bug this file exists to catch. It is a HAND-mirror —
-    nothing forces it to stay in step with the workflow, which is why every
-    scenario here has a write-side twin in tests/adapters/test_fix_workflow.py.
-    """
-    if run.kind is AgentKind.RESOLVE:
-        # fix.py resolve(): save_session, bump the resolve counter when the
-        # follow-up is a REQUEUE (`_bump_resolve_retry` — the T3 gap fix), then
-        # resolve_actions with the ground-truth PR (None — nothing opened).
-        # ERROR → requeue ai-ready.
-        new_state = _with_session(state, run.number, ERRORED_RUN.session_id)
-        if outcome.resolve_followup(ERRORED_RUN, False) is outcome.ResolveFollowup.RETRY:
-            resolves = dict(new_state.resolve_retries)
-            resolves[run.number] = resolves.get(run.number, 0) + 1
-            new_state = replace(new_state, resolve_retries=resolves)
-        return (
-            outcome.resolve_actions(run.number, ERRORED_RUN, None),
-            new_state,
-        )
+    def get_pr(self, n: int) -> PRView:
+        return _find(self.world.prs, n)
 
-    if run.kind is AgentKind.RESUME:
-        # fix.py:138-165 resume(): the resumed-at mark is written BEFORE the run
-        # (fix.py:151) with the SAME comment selector the decide side reads
-        # (`last_human_reply`) — that pairing is the V1/#13 fix. Then
-        # resume_actions on the result: ERROR keeps the issue ai-blocked.
-        iss = _find(state_of_world.issues, run.number)
-        reply = fix_domain.last_human_reply(iss, cfg.fix_bot)
-        resumed = dict(state.resumed_at)
-        if reply is not None:
-            resumed[run.number] = reply.created_at
-        return (
-            outcome.resume_actions(run.number, ERRORED_RUN, None),
-            _with_session(replace(state, resumed_at=resumed), run.number, ERRORED_RUN.session_id),
-        )
+    def pr_for_issue(self, issue_number: int) -> int | None:
+        for p in self.world.prs:
+            if p.state == "OPEN" and _issue_for(p) == issue_number:
+                return p.number
+        return None
 
-    if run.kind is AgentKind.ADDRESS_REVIEW:
-        # fix.py:167-191 address_review(): the counter is re-keyed to the review
-        # being addressed — a count stored under an OLDER review restarts at 0,
-        # and there is deliberately NO clear-on-success (V2/#64).
-        pr_view = _find(state_of_world.prs, run.number)
-        key = fix_domain.breaker_key(pr_view)
-        result = outcome.address_review_actions(run.number, ERRORED_RUN)
-        retries = dict(state.review_retries)
-        if result.bump_retry:
-            review_at = _latest_changes_requested_at(pr_view, cfg.fix_bot)
-            at, n = retries.get(key, ("", 0))
-            retries[key] = (review_at, (n if at == review_at else 0) + 1)
-        issue_n = fix_domain._issue_for_pr(pr_view)
-        new_state = replace(state, review_retries=retries)
-        if issue_n is not None:
-            new_state = _with_session(new_state, issue_n, ERRORED_RUN.session_id)
-        return result.actions, new_state
+    def issue_for_pr(self, pr_number: int) -> int | None:
+        return _issue_for(self.get_pr(pr_number))
 
-    if run.kind is AgentKind.FIX_CI:
-        # fix.py:193-210 fix_ci(): counter bumped unconditionally after the run.
-        pr_view = _find(state_of_world.prs, run.number)
-        key = fix_domain.breaker_key(pr_view)
-        retries = dict(state.ci_retries)
-        retries[key] = retries.get(key, 0) + 1
-        return (
-            outcome.fix_ci_actions(run.number, ERRORED_RUN),
-            replace(state, ci_retries=retries),
-        )
+    def relabel(self, kind: str, number: int, remove, add) -> None:
+        self.calls.append(("relabel", kind, number, remove, add))
+        rm = Label(remove) if remove else None
+        ad = Label(add) if add else None
+        if kind == "issue":
+            self.world = replace(self.world, issues=tuple(
+                replace(i, labels=_moved(i.labels, rm, ad)) if i.number == number else i
+                for i in self.world.issues
+            ))
+        else:
+            self.world = replace(self.world, prs=tuple(
+                replace(p, labels=_moved(p.labels, rm, ad)) if p.number == number else p
+                for p in self.world.prs
+            ))
 
-    if run.kind is AgentKind.REBASE:
-        # fix.py:212-224 rebase(): same shape as fix_ci, own counter, and it
-        # reuses fix_ci_actions for the tail.
-        pr_view = _find(state_of_world.prs, run.number)
-        key = fix_domain.breaker_key(pr_view)
-        retries = dict(state.rebase_retries)
-        retries[key] = retries.get(key, 0) + 1
-        return (
-            outcome.fix_ci_actions(run.number, ERRORED_RUN),
-            replace(state, rebase_retries=retries),
-        )
+    def comment(self, kind: str, number: int, body: str) -> None:
+        self.calls.append(("comment", kind, number, body))
 
-    raise AssertionError(f"unmodelled fixer dispatch: {run.kind}")
+    def close_issue(self, number: int, reason: str, comment: str) -> None:
+        self.calls.append(("close", number))
+        self.world = replace(self.world, issues=tuple(
+            replace(i, state="closed") if i.number == number else i
+            for i in self.world.issues
+        ))
+
+    def enable_auto_merge(self, pr_number: int, method: str) -> None:
+        self.calls.append(("automerge", pr_number))
+
+    def update_branch(self, pr_number: int) -> None:
+        self.calls.append(("update_branch", pr_number))
 
 
 @dataclass(frozen=True)
@@ -246,35 +219,58 @@ class Scenario:
 
     name: str
     world: WorldState
-    state: FixState = field(default_factory=FixState)
     cfg: FixConfig = CFG
     expect_dispatches: int = 0            # exact PAID sessions over the whole run
     expect_kinds: frozenset = frozenset()  # which legs fired
     cap: int = 0                          # the retry cap that must bound them
     # The agent dies pre-result (raises) instead of returning an errored result
-    # — the C3 shape, whose tail is `_after_raised_run` rather than `_after_run`.
+    # — the C3 shape, driven by `_RaisingRunner` rather than `_FakeRunner`.
     runner_raises: bool = False
+    # Pre-seed the REAL Store before the loop starts — the store-backed
+    # equivalent of what used to be a hand-built `FixState(sessions=...)` seed
+    # (e.g. "a resolve already ran and saved a session for this issue").
+    seed: Callable[[Store], None] | None = None
 
 
-def simulate(scenario: Scenario, ticks: int = TICKS) -> list[Tick]:
-    """Run the daemon's poll loop. The GitHub world only ever changes through the
-    daemon's own writes — the agent is inert, and no human intervenes."""
-    state_of_world, state = scenario.world, scenario.state
+def simulate(scenario: Scenario, tmp_path, ticks: int = TICKS) -> list[Tick]:
+    """Run the daemon's REAL poll loop (`app.loop.Daemon`) against a frozen
+    GitHub world — the world only ever changes through the daemon's own writes,
+    and the agent is inert. Wires the SAME pieces `app.roles.build_fix_daemon`
+    does:
+
+        decide_fix(world, cfg, roles._fix_state(store, world), fixer_busy=False)
+            → Daemon.tick() → Executor.execute → AgentDispatcher.dispatch
+            → FixWorkflow.<leg>() → a REAL Store(tmp_path)
+
+    so a decide/write drift — the review's D13 finding — fails THIS suite
+    instead of only `tests/adapters/test_fix_workflow.py`.
+    """
+    store = Store(state_dir=str(tmp_path))
+    if scenario.seed is not None:
+        scenario.seed(store)
+    gw = _SimGateway(scenario.world)
+    worktrees = _FakeWorktrees()
+    runner = _RaisingRunner() if scenario.runner_raises else _FakeRunner()
+    log: Callable[[str], None] = lambda _m: None  # noqa: E731
+    executor = Executor(
+        gw, remove_worktree=worktrees.remove, log=log,
+        mark_automerge=store.mark_automerge, clear_issue_state=store.cleanup_pr,
+    )
+    dcfg = DispatchConfig(
+        fix=FixTaskConfig("o/r", agent_md="AM"), fix_bot=scenario.cfg.fix_bot, log=log,
+    )
+    dispatcher = AgentDispatcher(dcfg, gw, store, worktrees, runner, executor)
+    executor._run_agent = lambda a: asyncio.run(dispatcher.dispatch(a))  # noqa: SLF001
+
+    def decide(w: WorldState) -> list[Action]:
+        return decide_fix(w, scenario.cfg, roles._fix_state(store, w), fixer_busy=False)
+
+    daemon = Daemon("fix", gw.build_world, decide, executor, poll_seconds=1, log=log)
+
     trace: list[Tick] = []
     for _ in range(ticks):
-        decided = decide_fix(state_of_world, scenario.cfg, state, fixer_busy=False)
-        # The dispatch relabel lands before the agent runs (executor order), and
-        # the run is synchronous (roles.py runs it with asyncio.run), so the next
-        # poll observes both the relabel and the run's tail.
-        state_of_world = _apply_relabels(state_of_world, decided)
+        decided = daemon.tick()
         dispatches = tuple(a for a in decided if isinstance(a, RunAgent))
-        for run in dispatches:
-            followup, state = (
-                _after_raised_run(run, state_of_world, state)
-                if scenario.runner_raises
-                else _after_run(run, state_of_world, state, scenario.cfg)
-            )
-            state_of_world = _apply_relabels(state_of_world, followup)
         trace.append(Tick(tuple(decided), dispatches))
     return trace
 
@@ -291,7 +287,9 @@ def _resume_dedup() -> Scenario:
                 Comment("alice", "here is the missing context", "2026-01-01T00:00:00Z"),
             )),
         ]),
-        state=FixState(sessions=frozenset({7})),
+        # A resolve already ran and saved a session for issue 7 — the
+        # precondition `issues_needing_resume` requires.
+        seed=lambda store: store.save_session(7, "prior-session"),
         expect_dispatches=1,
         expect_kinds=frozenset({AgentKind.RESUME}),
         cap=0,  # not a retry loop: the dedup mark alone must hold it to one
@@ -430,8 +428,8 @@ SCENARIOS = [
 
 # ── the property ─────────────────────────────────────────────────────────────
 @pytest.mark.parametrize("scenario", SCENARIOS)
-def test_fix_loop_converges_on_a_frozen_world(scenario: Scenario):
-    trace = simulate(scenario)
+def test_fix_loop_converges_on_a_frozen_world(scenario: Scenario, tmp_path):
+    trace = simulate(scenario, tmp_path)
     dispatches = [run for tick in trace for run in tick.dispatches]
 
     # 1) PAID work is bounded by the circuit breaker, not by the poll count.
@@ -456,11 +454,11 @@ def test_fix_loop_converges_on_a_frozen_world(scenario: Scenario):
     )
 
 
-def test_escalation_is_the_only_thing_that_stops_a_stuck_pr():
+def test_escalation_is_the_only_thing_that_stops_a_stuck_pr(tmp_path):
     """The breaker must escalate to a human exactly ONCE and then go silent —
     an escalation that re-fires every poll would spam the PR (and would mean the
     label write-back that removes it from scope never happened)."""
-    trace = simulate(_address_review_breaker())
+    trace = simulate(_address_review_breaker(), tmp_path)
     escalated = [
         i for i, tick in enumerate(trace)
         if Relabel(Target.PR, 100, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW) in tick.decided
@@ -469,10 +467,10 @@ def test_escalation_is_the_only_thing_that_stops_a_stuck_pr():
     assert all(tick.decided == () for tick in trace[CFG.max_review_retries + 1:])
 
 
-def test_cleanup_stops_once_its_labels_are_applied():
+def test_cleanup_stops_once_its_labels_are_applied(tmp_path):
     """Merged-PR cleanup is $0 but not free of consequences (it closes the issue
     and drops worktrees) — it must run once, not every poll."""
-    trace = simulate(_zero_spend_steady_state())
+    trace = simulate(_zero_spend_steady_state(), tmp_path)
     cleanup_ticks = [
         i for i, tick in enumerate(trace)
         if Relabel(Target.PR, 104, Label.AI_PR_OPEN, None) in tick.decided
@@ -480,26 +478,29 @@ def test_cleanup_stops_once_its_labels_are_applied():
     assert cleanup_ticks == [0]
 
 
-def test_pre_result_death_is_unbounded_without_the_infra_ceiling():
+def test_pre_result_death_is_unbounded_without_the_infra_ceiling(tmp_path):
     """Anti-vacuity twin for the pre-result-death row: with the ceiling disabled
     (MAX_INFRA_DEATHS=0) the SAME frozen world pays for a full session every
     other tick, forever — dispatch, die, reaper requeues, dispatch. That is the
     C3 signature, and no other breaker in the file can see it, because a raised
     run records no attempt anywhere."""
     scenario = replace(_pre_result_death_loop(), cfg=replace(CFG, max_infra_deaths=0))
-    trace = simulate(scenario)
+    trace = simulate(scenario, tmp_path)
     assert sum(len(tick.dispatches) for tick in trace) == TICKS // 2
 
 
 def test_simulator_can_detect_an_unbounded_loop():
-    """Guard against a vacuously-passing harness: if the daemon's label
-    write-backs are NOT fed to the next poll, the resume leg re-fires every
-    tick. The property above is only meaningful because this fails."""
+    """Guard against a vacuously-passing property (not the harness — that part
+    is real `Daemon`/`Store`/`FixWorkflow` code now, see the module docstring):
+    `decide_fix` given the SAME, never-updated `FixState` re-fires the resume
+    leg every tick, because the resumed-at dedup mark it depends on is never
+    written back. The property above is only meaningful because a `decide_fix`
+    that ignored its own state entirely would fail it."""
     scenario = _resume_dedup()
-    state_of_world, state = scenario.world, scenario.state
+    frozen_state = FixState(sessions=frozenset({7}))
     dispatches = 0
     for _ in range(TICKS):
-        decided = decide_fix(state_of_world, scenario.cfg, state, fixer_busy=False)
+        decided = decide_fix(scenario.world, scenario.cfg, frozen_state, fixer_busy=False)
         dispatches += sum(1 for a in decided if isinstance(a, RunAgent))
-        # deliberately drop both feedback channels (no relabels, no state writes)
+        # deliberately never updates frozen_state / scenario.world
     assert dispatches == TICKS

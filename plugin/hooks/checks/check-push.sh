@@ -44,22 +44,26 @@ done
   || fail "could not verify PR state for branch '$branch' — 'gh pr list' failed twice (gh/network/auth error). The push gate needs to know whether an open PR exists, so it fails CLOSED rather than letting an unverified push through. Check connectivity and 'gh auth status', then retry the push shortly."
 [ -n "$pr" ] || exit 0
 
-# An open PR exists → re-verify the new state. Resolve the diff range vs base.
-range=""
-for ref in "origin/$base" "$base"; do
-  if git rev-parse --verify --quiet "$ref" >/dev/null 2>&1; then
-    range="$ref...HEAD"; break
-  fi
-done
+# An open PR exists → re-verify the new state. Resolve the base ref, then the two
+# distinct ranges (review M6): three dots for `git diff`, TWO for `git log`. One
+# shared three-dot range made prc_check_commit_log read the base branch's own
+# commits, so every push to an open PR was blocked as soon as anything merged
+# into the base ("Merge pull request #7 …" carries no allowed prefix) — on the
+# ADDRESS_REVIEW / FIX_CI legs, i.e. exactly when the base HAS advanced.
+baseref="$(prc_resolve_base_ref)"
 # Can't resolve base → fail open (don't block a push over a local ref gap).
-[ -n "$range" ] || exit 0
+[ -n "$baseref" ] || exit 0
+diff_range="$baseref...HEAD"
+log_range="$baseref..HEAD"
 
-changed=$(git diff --name-only "$range" 2>/dev/null || echo "")
+changed=$(git diff --name-only "$diff_range" 2>/dev/null || echo "")
 
-# Shared, state-derived checks (same code path as check-pr.sh).
-prc_check_tests
+# Shared, state-derived checks (same code path as check-pr.sh). Cheap structural
+# checks first, the suite-running one last — same order as
+# adapters/governor.py:_push_gate_for_branch (review M21).
 prc_check_commit_log
 prc_check_no_evidence "$changed"
 prc_check_tests_immutable "$changed"
+prc_check_tests
 
 exit 0

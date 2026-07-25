@@ -439,23 +439,30 @@ out=$( cd "$d" && BASE_BRANCH=dev ALLOW_UNTESTED=1 TEST_CMD='false' bash "$CHECK
 [ "$rc" -eq 1 ] && ok "ALLOW_UNTESTED does not excuse failing tests" || no "ALLOW_UNTESTED vs failing tests" "rc=$rc out=${out:0:200}"
 rm -rf "$d"
 
-# (k) .harness/test-cmd is PREFERRED over $TEST_CMD. Agent declares a genuine
-#     command (passes only with impl); a DIFFERENT, irrelevant $TEST_CMD='true' is
-#     set. The gate must use the marker → revert makes it red → allow. Proves the
-#     marker wins (with TEST_CMD='true' alone the tautology check would BLOCK).
-d=$(setup_redfail_repo feat/20-add)
-( cd "$d" && echo 'test -f add.py' > .harness/test-cmd )
-out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$RF_BODY" 2>&1 ); rc=$?
-[ "$rc" -eq 0 ] && ok ".harness/test-cmd preferred over TEST_CMD (genuine red passes)" || no "test-cmd marker preferred" "rc=$rc out=${out:0:200}"
-rm -rf "$d"
-
-# (l) Agent cannot cheat the gate by declaring a weak command: a tautological
-#     .harness/test-cmd ('true') stays green on revert → BLOCKED, even though the
-#     repo-wide TEST_CMD is a genuine one. Teeth come from "must fail on revert",
-#     regardless of who chose the command.
+# (k) The OPERATOR's $TEST_CMD WINS over the agent-written .harness/test-cmd
+#     (review P1R-18 — precedence flipped; these two cases asserted the old
+#     order). The agent declares a tautological 'true'; the operator's TEST_CMD
+#     is genuine (passes only with the impl). The gate must run the OPERATOR's →
+#     revert makes it red → allow. With the marker winning this would BLOCK, so
+#     the case still distinguishes the two orders, just the other way round.
+#     Why the flip: prc_check_tests is the push gate's only real teeth, and the
+#     gated agent writes that marker under bypassPermissions — `echo true >
+#     .harness/test-cmd` disarmed §1 AND §7c in one line.
 d=$(setup_redfail_repo feat/20-add)
 ( cd "$d" && echo 'true' > .harness/test-cmd )
 out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='test -f add.py' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$RF_BODY" 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] && ok "operator TEST_CMD preferred over .harness/test-cmd (P1R-18)" || no "operator TEST_CMD preferred" "rc=$rc out=${out:0:200}"
+rm -rf "$d"
+
+# (l) A weak agent-declared command can no longer disarm the gate: the marker is
+#     'true' (always green on revert ⇒ would be read as tautological) but the
+#     operator set none, so the marker IS the resolved command and red-fail
+#     blocks it. The marker still governs where the operator has no TEST_CMD —
+#     that fallback is the whole reason the marker exists — and it is still
+#     self-policing there, because §7c requires whatever command runs to go red.
+d=$(setup_redfail_repo feat/20-add)
+( cd "$d" && echo 'true' > .harness/test-cmd )
+out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$RF_BODY" 2>&1 ); rc=$?
 [ "$rc" -eq 1 ] && ok "weak agent-declared test-cmd still blocked by red-fail (self-policing)" || no "weak test-cmd self-policed" "rc=$rc out=${out:0:200}"
 rm -rf "$d"
 

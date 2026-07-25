@@ -54,6 +54,66 @@ else
   bad "config not found: $CONFIG (copy config/agent.env.example → config/agent.env)"
 fi
 
+echo "== config snapshot (config/.active.env) =="
+# review P0R-1 fold-in: `.active.env` is a SNAPSHOT. A machine whose snapshot was
+# composed by the pre-P0R-1 bin/compose-env.sh (whose PRE/POST diff silently
+# dropped any var the files assign to the value the launching shell already had)
+# keeps that broken file until somebody re-runs point-at — and `install-systemd.sh`
+# copies it, so the omission survives reboots. The observed symptom was total:
+# TEST_CMD missing → the gate resolves no test command → every push and every
+# `gh pr create` denied, forever, with nothing anywhere saying why.
+#
+# The check recomposes the two SOURCE files in a subshell and compares the
+# variable NAMES against the snapshot. That expectation is derived independently
+# of compose-env.sh's own logic (re-review §5: "assert set equality against an
+# independently-derived expectation, never membership of the happy-path
+# examples"), and there is no hand-maintained knob list to fall out of date.
+# Sourcing — rather than only scanning assignment lines — is what keeps it quiet
+# about a name the overlay assigns and then `unset`s (R2-11): absent from both
+# sides, so not a discrepancy.
+_ACTIVE_ENV="$HARNESS_ROOT/config/.active.env"
+if [ ! -f "$_ACTIVE_ENV" ]; then
+  ok "no config/.active.env yet — nothing to compare (point-at writes it)"
+else
+  _SHARED_ENV="$HARNESS_ROOT/config/shared.env"
+  # compose-env.sh stamps the composing overlay into the first line.
+  _ACTIVE_NAME="$(sed -n '1s|.*repos/\([A-Za-z0-9_.-]*\)\.env.*|\1|p' "$_ACTIVE_ENV")"
+  _ACTIVE_OVERLAY="$HARNESS_ROOT/config/repos/$_ACTIVE_NAME.env"
+  if [ -z "$_ACTIVE_NAME" ] || [ ! -f "$_ACTIVE_OVERLAY" ]; then
+    warn "cannot tell which overlay composed config/.active.env (missing/edited AUTO-GENERATED header) — skipping the staleness check; re-run 'make point-at REPO=<name>' to regenerate it"
+  else
+    # Names the two files assign AND that survive sourcing them.
+    _expected_names="$(
+      set +u
+      set -a
+      # shellcheck disable=SC1090
+      [ -f "$_SHARED_ENV" ] && . "$_SHARED_ENV"
+      # shellcheck disable=SC1090
+      . "$_ACTIVE_OVERLAY"
+      set +a
+      grep -hoE '^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=' \
+        "$_SHARED_ENV" "$_ACTIVE_OVERLAY" 2>/dev/null \
+        | sed -E 's/^[[:space:]]*(export[[:space:]]+)?//; s/=$//' \
+        | sort -u \
+        | while IFS= read -r _n; do
+            [ -n "$_n" ] || continue
+            [ -n "${!_n+set}" ] && printf '%s\n' "$_n"
+          done
+    )"
+    _snapshot_names="$(grep -oE '^[A-Za-z_][A-Za-z0-9_]*=' "$_ACTIVE_ENV" \
+      | sed 's/=$//' | sort -u)"
+    _missing_names="$(comm -23 \
+      <(printf '%s\n' "$_expected_names" | sed '/^$/d' | sort -u) \
+      <(printf '%s\n' "$_snapshot_names" | sed '/^$/d' | sort -u) | tr '\n' ' ')"
+    _missing_names="${_missing_names%"${_missing_names##*[![:space:]]}"}"
+    if [ -n "$_missing_names" ]; then
+      bad "config/.active.env is STALE — it omits $(printf '%s' "$_missing_names" | wc -w | tr -d ' ') variable(s) that config/shared.env or config/repos/$_ACTIVE_NAME.env assign: $_missing_names — regenerate it with 'make point-at REPO=$_ACTIVE_NAME' (or 'issue-agent start'). A snapshot written by the pre-P0R-1 compose-env.sh drops assigned vars silently; if TEST_CMD is among them the gate denies every push and 'gh pr create' until this is fixed."
+    else
+      ok "config snapshot matches config/shared.env + repos/$_ACTIVE_NAME.env"
+    fi
+  fi
+fi
+
 echo "== per-repo state-dir collisions (config/repos/*.env) =="
 # review M5/D7: default STATE_DIR/REVIEW_STATE_DIR/STEWARD_STATE_DIR are now
 # per-repo (app/config.py::_default_state_dir), but nothing stopped two
@@ -177,15 +237,31 @@ fi
 
 echo "== project commands =="
 if [ -n "${TEST_CMD:-}" ]; then
-  ok "TEST_CMD=$TEST_CMD"
+  ok "TEST_CMD=$TEST_CMD (the gate runs THIS; it wins over the agent's .harness/test-cmd — review P1R-18)"
   [ "${RED_MUST_FAIL:-1}" = 0 ] \
     && warn "RED_MUST_FAIL=0 — the anti-tautological-test (red-fail) gate is OFF; a test that passes without the change won't be caught"
 else
-  # The bigger consequence than "no tests": the red-fail gate that catches
-  # tautological / wrong-layer tests (the #39 class) is disabled with it.
-  warn "TEST_CMD unset → PR gate + reviewer run NO tests AND the anti-tautological-test (red-fail) gate is DISABLED. The hook still fires but has no teeth. Set TEST_CMD to arm it."
+  # Corrected claim (review M6/§4): with no TEST_CMD the gate does NOT "run no
+  # tests" — it falls back to the agent's own .harness/test-cmd, and if that is
+  # missing too it fails CLOSED (denies every push and `gh pr create`) unless
+  # ALLOW_UNTESTED=1. Both are worse than they sound: the fallback is a command
+  # the gated agent chose, and the fail-closed path halts the harness.
+  if [ "${ALLOW_UNTESTED:-0}" = 1 ]; then
+    warn "TEST_CMD unset + ALLOW_UNTESTED=1 → if the agent writes no .harness/test-cmd, the test gate AND the anti-tautological-test (red-fail) gate are BOTH skipped. Set TEST_CMD to arm them."
+  else
+    warn "TEST_CMD unset → the gate falls back to the agent-written .harness/test-cmd, and denies every push / 'gh pr create' when that is missing too (fail-closed; ALLOW_UNTESTED=1 is the opt-out). Set TEST_CMD so the command the gate runs is yours, not the agent's."
+  fi
 fi
-[ -n "${LINT_CMD:-}" ] && ok "LINT_CMD set" || warn "LINT_CMD unset (commit hook won't lint)"
+# Corrected claim (review M6/§4): this used to print "✓ LINT_CMD set" while the
+# rule ran on the codex path ONLY — the default SDK path had no equivalent, so
+# the ✓ described a command nothing executed. It is now enforced by both
+# (domain/gate.py:check_project_commands), which is what makes the ✓ true.
+[ -n "${LINT_CMD:-}" ] \
+  && ok "LINT_CMD=$LINT_CMD (blocks a commit on failure)" \
+  || warn "LINT_CMD unset (commit gate won't lint)"
+[ -n "${TYPECHECK_CMD:-}" ] \
+  && ok "TYPECHECK_CMD=$TYPECHECK_CMD (blocks a commit on failure)" \
+  || warn "TYPECHECK_CMD unset (commit gate won't typecheck)"
 
 echo ""
 printf 'doctor: %d error(s), %d warning(s)\n' "$ERR" "$WARN"

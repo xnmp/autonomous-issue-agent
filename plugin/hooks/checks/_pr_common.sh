@@ -6,7 +6,29 @@
 # creation; a push carries no body).
 #
 # Source this AFTER defining a `fail()` that prints a reason and exits non-zero.
-# Callers set: base (base branch), range (origin/base...HEAD), branch (current).
+# Callers set: base (base branch), branch (current), and the TWO ranges below
+# (see prc_resolve_base_ref) — `diff_range` and `log_range` are NOT
+# interchangeable, which is what review M6 caught:
+#
+#   diff_range = "<baseref>...HEAD"   THREE dots. For `git diff`, three dots
+#                                     means "base..merge-base..HEAD", i.e. only
+#                                     what THIS branch changed. Correct.
+#   log_range  = "<baseref>..HEAD"    TWO dots. For `git log`, THREE dots is the
+#                                     SYMMETRIC difference — it also lists the
+#                                     commits that are on the BASE and not on
+#                                     the branch. The gate reused one
+#                                     three-dot `range` var for both, so as soon
+#                                     as the base branch advanced (any merge into
+#                                     dev), prc_check_commit_log saw base-only
+#                                     subjects like "Merge pull request #7 …",
+#                                     which carry no allowed prefix, and BLOCKED
+#                                     legitimate PRs and pushes on the codex path
+#                                     — permanently, for every branch, until the
+#                                     branch was rebased. The Python gate
+#                                     (adapters/worktree.py:build_gate_context)
+#                                     always used `..` for the log and `...` for
+#                                     the diff; tests/test_gate_parity.py now
+#                                     pins the two stacks together.
 #
 # bash 3.2-safe: no mapfile, no process substitution — here-strings only.
 
@@ -34,20 +56,48 @@ commit_phase() {
   esac
 }
 
-# Resolve the test command to run. PREFER the agent-declared, per-PR command in
-# .harness/test-cmd over the static $TEST_CMD. The agent knows what it tested,
-# the repo's runner, and which fixtures to avoid (e.g. scoping pytest to one file
-# to dodge pytest-docker) — a single static config string cannot track that
-# per-issue. Letting the agent choose does NOT weaken the gate: §10 reverts the
-# implementation and requires THIS command to go red, so a weak/irrelevant command
-# stays green on revert and is blocked. The command's relevance is exactly what
-# red-fail proves. Falls back to $TEST_CMD when the marker is absent/blank.
+# Resolve the test command to run. PREFER the OPERATOR's $TEST_CMD; fall back to
+# the agent-declared, per-PR `.harness/test-cmd` only when the operator set none.
 # Echoes the resolved command (empty if neither is set).
+#
+# The precedence used to be the other way round, and that made the gate
+# self-defeating (review P1R-18): prc_check_tests is the push gate's only real
+# teeth, the gated agent WRITES `.harness/test-cmd`, and it runs under
+# bypassPermissions — so `echo true > .harness/test-cmd` disarmed §1 AND §10 (the
+# anti-tautological-test check) in one line, without tripping any bypass
+# detection, because the governor only inspects git/gh shapes.
+#
+# The old order was not accidental: AGENT.md asks for a SCOPED command so the
+# revert-and-rerun is fast and hits the changed package in a monorepo. That
+# intent survives — the marker is still the whole answer on a repo where the
+# operator has no TEST_CMD (the test-discovery path that writes it exists for
+# exactly those) — but where an operator command exists it is the authority. The
+# cost is a slower gate run; the alternative is a one-line disarm.
+#
+# Byte-for-byte the same order as domain/gate.py:resolve_test_cmd(). The two
+# stacks disagreed on this for one wave (the Python side flipped in P1R-18, the
+# bash did not), which is exactly the drift tests/test_gate_parity.py exists to
+# make impossible.
 prc_resolve_test_cmd() {
-  local m=".harness/test-cmd" c=""
-  [ -f "$m" ] && c="$(tr -d '\r' < "$m" | sed '/^[[:space:]]*$/d' | head -1)"
-  [ -n "$c" ] || c="${TEST_CMD:-}"
+  local m=".harness/test-cmd" c="${TEST_CMD:-}"
+  if [ -z "$c" ] && [ -f "$m" ]; then
+    c="$(tr -d '\r' < "$m" | sed '/^[[:space:]]*$/d' | head -1)"
+  fi
   printf '%s' "$c"
+}
+
+# The base ref the gate compares against: prefer the remote-tracking `origin/<base>`
+# (what the PR will actually merge into), fall back to a local `<base>`. Echoes
+# '' when neither resolves. Single source of truth so check-pr.sh, check-push.sh
+# and prc_check_red_fails cannot drift apart on which ref they mean.
+prc_resolve_base_ref() {
+  local ref
+  for ref in "origin/$base" "$base"; do
+    if git rev-parse --verify --quiet "$ref" >/dev/null 2>&1; then
+      printf '%s' "$ref"; return 0
+    fi
+  done
+  printf ''
 }
 
 # Is running untested (no resolvable test command) explicitly permitted? This is
@@ -80,9 +130,13 @@ prc_check_tests() {
 
 # §6 — every commit subject on the branch uses an allowed prefix, and no `green:`
 #       precedes a `red:` (re-derived from the git LOG, closes the -F bypass).
+#
+# Uses `log_range` (TWO dots) — the commits THIS branch adds. It used to share the
+# diff's three-dot `range`, which for `git log` is the symmetric difference and
+# therefore also fed it the base branch's own commits (review M6). See the header.
 prc_check_commit_log() {
   local seen_red=0 green_before_red=0 s log_subjects phase
-  log_subjects=$(git log "$range" --reverse --format='%s' 2>/dev/null || true)
+  log_subjects=$(git log "$log_range" --reverse --format='%s' 2>/dev/null || true)
   while IFS= read -r s; do
     [ -n "$s" ] || continue
     [[ "$s" =~ $PR_VALID_PREFIX_RE ]] \
@@ -158,11 +212,8 @@ prc_check_red_fails() {  # prc_check_red_fails "<changed-file-list>"
     fail "no test command resolved (neither .harness/test-cmd nor TEST_CMD) — the red-fail (anti-tautological-test) check cannot prove the new tests fail without the implementation. Write the command you used into .harness/test-cmd (one line, non-watch), or have the operator set TEST_CMD / ALLOW_UNTESTED=1."
   fi
 
-  # Resolve the bare base ref (prefer origin/, fall back to local).
-  local baseref="" ref
-  for ref in "origin/$base" "$base"; do
-    git rev-parse --verify --quiet "$ref" >/dev/null 2>&1 && { baseref="$ref"; break; }
-  done
+  # Resolve the bare base ref (shared resolver — see prc_resolve_base_ref).
+  local baseref; baseref="$(prc_resolve_base_ref)"
   [ -n "$baseref" ] || { echo "red-check: cannot resolve base '$base' — skipping (fail-open)" >&2; return 0; }
 
   # Partition changed files: new tests (keep at HEAD) vs implementation (revert).

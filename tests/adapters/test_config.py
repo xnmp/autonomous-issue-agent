@@ -189,6 +189,24 @@ def test_valid_defaults_have_no_validation_errors():
     assert from_env({"REPO": "o/r", "FIX_BOT": "fix-bot"}).validation_errors() == ()
 
 
+def _assert_each_knob_flagged_once(errors: tuple[str, ...], expected_knobs: set[str]) -> None:
+    """T5 (review): membership + shape, not exact-tuple-and-order.
+
+    The three tests below used to pin `validation_errors()`'s exact tuple AND
+    its element order — coupling every one of them to `_coerce_int`'s literal
+    wording and to whatever order `HarnessConfig`'s fields happen to be
+    declared in, so reordering two dataclass fields (a pure refactor) would
+    fail tests that have nothing to do with ordering. This asserts the
+    CONTRACT instead: every invalid knob is named in some error (membership,
+    checked as a set — the process lesson at review §5: set equality against
+    an independently-derived expectation, not membership of hand-picked
+    examples), and the error COUNT matches the knob count, so a knob that
+    silently stopped being validated (or one validated twice) still fails."""
+    flagged = {knob for knob in expected_knobs if any(knob in e for e in errors)}
+    assert flagged == expected_knobs
+    assert len(errors) == len(expected_knobs)
+
+
 def test_validation_rejects_invalid_retry_caps_and_poll_seconds():
     c = from_env({
         "REPO": "x",
@@ -201,14 +219,10 @@ def test_validation_rejects_invalid_retry_caps_and_poll_seconds():
         "MAX_CONTRACT_ROUNDS": "-5",
     })
 
-    assert c.validation_errors() == (
-        "POLL_SECONDS must be > 0",
-        "MAX_CI_RETRIES must be >= 0",
-        "MAX_REVIEW_RETRIES must be >= 0",
-        "MAX_REBASE_RETRIES must be >= 0",
-        "REVIEW_MAX_REJECTIONS must be >= 0",
-        "MAX_CONTRACT_ROUNDS must be >= 0",
-    )
+    _assert_each_knob_flagged_once(c.validation_errors(), {
+        "POLL_SECONDS", "MAX_CI_RETRIES", "MAX_REVIEW_RETRIES",
+        "MAX_REBASE_RETRIES", "REVIEW_MAX_REJECTIONS", "MAX_CONTRACT_ROUNDS",
+    })
 
 
 def test_validation_rejects_invalid_budgets():
@@ -224,15 +238,11 @@ def test_validation_rejects_invalid_budgets():
         "JIRA_SYNC_BUDGET_USD": "0",
     })
 
-    assert c.validation_errors() == (
-        "MAX_BUDGET_USD must be > 0",
-        "REVIEW_BUDGET_USD must be > 0",
-        "STEWARD_TRIAGE_BUDGET_USD must be > 0",
-        "REVIEW_GATE_BUDGET_USD must be > 0",
-        "REVIEW_DIMENSION_BUDGET_USD must be > 0",
-        "REVIEW_VALIDATION_BUDGET_USD must be > 0",
-        "JIRA_SYNC_BUDGET_USD must be > 0",
-    )
+    _assert_each_knob_flagged_once(c.validation_errors(), {
+        "MAX_BUDGET_USD", "REVIEW_BUDGET_USD", "STEWARD_TRIAGE_BUDGET_USD",
+        "REVIEW_GATE_BUDGET_USD", "REVIEW_DIMENSION_BUDGET_USD",
+        "REVIEW_VALIDATION_BUDGET_USD", "JIRA_SYNC_BUDGET_USD",
+    })
 
 
 def test_validation_rejects_invalid_runtime_settings():
@@ -246,13 +256,10 @@ def test_validation_rejects_invalid_runtime_settings():
         "CODEX_BACKOFF_BASE_SECONDS": "0",
     })
 
-    assert c.validation_errors() == (
-        "FIXER_RUNTIME must be 'claude' or 'codex'",
-        "AGENT_IDLE_TIMEOUT_SECONDS must be >= 0",
-        "AGENT_MAX_RUNTIME_SECONDS must be >= 0",
-        "CODEX_TRANSPORT_RETRIES must be >= 0",
-        "CODEX_BACKOFF_BASE_SECONDS must be > 0",
-    )
+    _assert_each_knob_flagged_once(c.validation_errors(), {
+        "FIXER_RUNTIME", "AGENT_IDLE_TIMEOUT_SECONDS", "AGENT_MAX_RUNTIME_SECONDS",
+        "CODEX_TRANSPORT_RETRIES", "CODEX_BACKOFF_BASE_SECONDS",
+    })
 
 
 def test_validate_raises_combined_error_message():
