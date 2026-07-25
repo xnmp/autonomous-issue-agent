@@ -1,5 +1,11 @@
+# Linux systemd unit (user service) TEMPLATE — do not install by hand, the
+# placeholder tokens below (wrapped in "at" signs) are filled in and this file
+# is copied to ~/.config/systemd/user/issue-agent-steward-NAME.service by:
+#   bin/install-systemd.sh
+# Logs go to the journal — tail with:
+#   journalctl --user -u issue-agent-steward-NAME -f
 [Unit]
-Description=Autonomous issue agent — architecture steward
+Description=Autonomous issue agent — architecture steward (@NAME@)
 After=network-online.target
 
 [Service]
@@ -9,9 +15,9 @@ WorkingDirectory=@HARNESS_ROOT@
 Environment=AGENT_ENV=@CONFIG@
 Environment=TARGET_DIR=@TARGET_DIR@
 Restart=always
-RestartSec=60
-StandardOutput=append:/tmp/issue-agent-steward.log
-StandardError=append:/tmp/issue-agent-steward.log
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=default.target

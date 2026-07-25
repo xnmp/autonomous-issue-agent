@@ -293,6 +293,79 @@ Fixes #14' 2>&1 ); rc=$?
 [ "$rc" -eq 0 ] && ok "feat/ accepts conventional test name" || no "feat/ accepts conventional test name" "rc=$rc out=${out:0:200}"
 rm -rf "$d"
 
+echo "== check-pr.sh §7d (one screenshot per AC item) =="
+# Fixture: a compliant fix/ PR that ALSO declares a visual acceptance criterion
+# and commits <n> screenshots, all recorded as read by the agent.
+setup_visual_repo() {  # setup_visual_repo <n-screenshots> [<n-read>]
+  local d n read_n i; d=$(setup_pr_repo); n="$1"; read_n="${2:-$1}"
+  ( cd "$d"
+    mkdir -p evidence
+    : > .harness/visual-ac
+    : > .harness/screenshots-read
+    i=1
+    while [ "$i" -le "$n" ]; do
+      printf '\x89PNG' > "evidence/ac-$i.png"
+      [ "$i" -le "$read_n" ] && echo "ac-$i.png" >> .harness/screenshots-read
+      i=$((i + 1))
+    done
+    if [ "$n" -gt 0 ]; then
+      git add evidence
+      git -c core.hooksPath=/dev/null commit -qm "evidence: screenshots"
+    fi )
+  echo "$d"
+}
+AC3_LINKED=$'## Acceptance Criteria\n- [ ] one\n  ![AC 1](evidence/ac-1.png)\n- [ ] two\n  ![AC 2](evidence/ac-2.png)\n- [ ] three\n  ![AC 3](evidence/ac-3.png)\n\nFixes #7'
+AC3_ONE_LINK=$'## Acceptance Criteria\n- [ ] one\n- [ ] two\n- [ ] three\n\n![only one](evidence/ac-1.png)\n\nFixes #7'
+
+# 3 AC items but only 2 screenshots → blocked, message names both counts.
+d=$(setup_visual_repo 2)
+out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_LINKED" 2>&1 ); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '3 AC items but only 2'; } \
+  && ok "3 AC items with 2 screenshots blocked (counts named)" \
+  || no "per-AC screenshot count enforced" "rc=$rc out=${out:0:200}"
+rm -rf "$d"
+
+# 3 AC items, 3 read+committed screenshots, each referenced → allowed.
+d=$(setup_visual_repo 3)
+out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_LINKED" 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] && ok "one screenshot per AC item passes" || no "one screenshot per AC item passes" "rc=$rc out=${out:0:200}"
+rm -rf "$d"
+
+# Enough screenshots, but the body links only one → blocked (unlinked shots are
+# invisible to the reviewer).
+d=$(setup_visual_repo 3)
+out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_ONE_LINK" 2>&1 ); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'references only 1'; } \
+  && ok "unreferenced screenshots blocked" || no "body must reference each screenshot" "rc=$rc out=${out:0:200}"
+rm -rf "$d"
+
+# Unparseable (prose) AC section → falls back to the ≥1-screenshot floor: one
+# read+committed shot passes even though the body links nothing.
+d=$(setup_visual_repo 1)
+out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] && ok "prose AC section falls back to the 1-screenshot floor" || no "AC parse miss must not deny" "rc=$rc out=${out:0:200}"
+rm -rf "$d"
+
+# Floor still holds: visual-ac declared with no screenshot committed → blocked.
+d=$(setup_visual_repo 0)
+out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_LINKED" 2>&1 ); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'no screenshot is committed'; } \
+  && ok "visual-ac without any screenshot blocked" || no "visual-ac floor (>=1 shot)" "rc=$rc out=${out:0:200}"
+rm -rf "$d"
+
+# Floor still holds: a committed screenshot the agent never READ → blocked.
+d=$(setup_visual_repo 3 2)
+out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_LINKED" 2>&1 ); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'never read/verified'; } \
+  && ok "unread screenshot blocked" || no "visual-ac floor (all shots read)" "rc=$rc out=${out:0:200}"
+rm -rf "$d"
+
+# No .harness/visual-ac → the whole rule is inert, even with a 3-item checklist.
+d=$(setup_pr_repo)
+out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_LINKED" 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] && ok "no visual-ac declared → no screenshot demanded" || no "non-visual PR unaffected" "rc=$rc out=${out:0:200}"
+rm -rf "$d"
+
 echo "== check-pr.sh §7c (red-must-actually-fail) =="
 # Build a feat/ branch whose NEW test genuinely depends on the implementation:
 # TEST_CMD passes iff the impl file exists. The gate reverts the impl and re-runs;

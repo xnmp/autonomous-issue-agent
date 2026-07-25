@@ -15,8 +15,12 @@ from ...domain import fix as fix_domain
 from ...domain import outcome
 from ..planners import tasks as task_builders
 from ..planners.tasks import FixTaskConfig
+from ...domain.actions import Relabel, Target
 from ...domain.agent_task import AgentRuntime
+from ...domain.ci import latest_other_review
+from ...domain.labels import Label
 from ...domain.refs import slugify
+from ...domain.world import REVIEW_CHANGES_REQUESTED
 from ..mcp import mcp_servers_for_checks
 
 
@@ -75,6 +79,8 @@ class FixWorkflow:
         result = await self._run_logged("resolve", issue, task)
         self.store.save_session(issue, result.session_id)
         pr = self.gateway.pr_for_issue(issue)
+        if outcome.resolve_followup(result, pr is not None) is outcome.ResolveFollowup.RETRY:
+            self._bump_resolve_retry(issue, result)
         self.executor.execute_all(outcome.resolve_actions(issue, result, pr))
 
     async def resolve_split(self, issue: int) -> None:
@@ -87,7 +93,10 @@ class FixWorkflow:
                 task_builders.build_author_task(issue, iss.title, iss.body, cwd, self.cfg.fix)
             )
             self.store.save_session(issue, author.session_id)
-            if outcome.author_followup(author) is not outcome.AuthorFollowup.AUTHORED:
+            fu_author = outcome.author_followup(author)
+            if fu_author is not outcome.AuthorFollowup.AUTHORED:
+                if fu_author is outcome.AuthorFollowup.RETRY:
+                    self._bump_resolve_retry(issue, author)
                 self.executor.execute_all(outcome.author_actions(issue, author))
                 return
             self.store.set_phase(issue, "authored")
@@ -108,6 +117,8 @@ class FixWorkflow:
             pr = self.gateway.pr_for_issue(issue)
             fu = outcome.implement_followup(impl, pr is not None)
             if fu is not outcome.ImplementFollowup.CONTRACT_CHANGE:
+                if fu is outcome.ImplementFollowup.RETRY:
+                    self._bump_resolve_retry(issue, impl)
                 self.executor.execute_all(outcome.resolve_actions(issue, impl, pr))
                 return
 
@@ -135,10 +146,32 @@ class FixWorkflow:
                 else (adj.field("rationale") or adj.summary or "the contract is correct")
             )
 
+    def _bump_resolve_retry(self, issue: int, result) -> None:
+        """A resolve-family leg that ends in a REQUEUE (error, or a claimed
+        'done' with no PR on GitHub) counts toward the resolve breaker. The T3
+        convergence probe proved this leg loops UNBOUNDED without one — a full
+        paid session per poll on the most expensive leg (#39's shape). Infra
+        deaths don't count (no attempt was made); blocked / PR-opened outcomes
+        don't requeue, so they never reach here."""
+        if outcome.infra_death(result.exit_reason):
+            return
+        self.store.set_resolve_retries(issue, self.store.get_resolve_retries(issue) + 1)
+
     async def resume(self, issue: int) -> None:
         iss = self.gateway.get_issue(issue)
         reply_comment = fix_domain.last_human_reply(iss, self.cfg.fix_bot)
-        if reply_comment is None or not reply_comment.body:
+        if reply_comment is None or not reply_comment.body.strip():
+            # Dispatched on a reply that vanished on re-fetch or has an empty
+            # body: nothing to resume on. The decide side already flipped
+            # ai-blocked → ai-working; leaving that stands strands the issue
+            # into the reaper (→ ai-ready → a full RESOLVE loop — T3 probe
+            # finding). Consume the reply (if any) and put the issue back to
+            # awaiting-human.
+            if reply_comment is not None:
+                self.store.set_resumed_at(issue, reply_comment.created_at)
+            self.executor.execute_all([
+                Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED)
+            ])
             return
         reply = reply_comment.body
         # V1/#13 write side: record WHICH reply this dispatch consumes, BEFORE
@@ -185,7 +218,7 @@ class FixWorkflow:
             # review was superseded). There is deliberately no clear-on-success
             # — only a NEW review re-keys the counter (V2/#64; see
             # domain.outcome.AddressReviewOutcome).
-            review_at = self.latest_changes_requested_at(p)
+            review_at = self._current_review_at(p)
             at, n = self.store.get_review_retry(issue)
             base = n if at == review_at else 0
             self.store.set_review_retry(issue, review_at, base + 1)
@@ -206,7 +239,11 @@ class FixWorkflow:
         )
         result = await self.runner.run(task)
         self.store.save_session(issue, result.session_id)
-        self.store.set_ci_retries(issue, self.store.get_ci_retries(issue) + 1)
+        # An externally-killed session made no attempt, so it must not march the
+        # CI breaker toward needs-human-review (FAILURE-MODES #58: six SIGKILLs on
+        # one PR burned the whole budget on work that never ran).
+        if not outcome.infra_death(result.exit_reason):
+            self.store.set_ci_retries(issue, self.store.get_ci_retries(issue) + 1)
         self.executor.execute_all(outcome.fix_ci_actions(pr, result))
 
     async def rebase(self, pr: int) -> None:
@@ -220,7 +257,9 @@ class FixWorkflow:
         )
         result = await self.runner.run(task)
         self.store.save_session(issue, result.session_id)
-        self.store.set_rebase_retries(issue, self.store.get_rebase_retries(issue) + 1)
+        # Same rule as fix_ci: an infra kill is not a failed rebase attempt.
+        if not outcome.infra_death(result.exit_reason):
+            self.store.set_rebase_retries(issue, self.store.get_rebase_retries(issue) + 1)
         self.executor.execute_all(outcome.fix_ci_actions(pr, result))
 
     @staticmethod
@@ -230,9 +269,14 @@ class FixWorkflow:
                 return review.body
         return ""
 
-    @staticmethod
-    def latest_changes_requested_at(pr) -> str:
-        for review in reversed(pr.reviews):
-            if review.state == "CHANGES_REQUESTED":
-                return review.submitted_at
+    def _current_review_at(self, pr) -> str:
+        """Timestamp key of the review being addressed: the latest review by a
+        DISTINCT actor iff it requests changes — the SAME selector the decide
+        side gates dispatch on (latest_other_review). The previous scan (last
+        CHANGES_REQUESTED in tuple order, author-agnostic) could key the
+        counter to a DIFFERENT review than the one dispatched on; a mis-keyed
+        counter reads 0 forever and the breaker never trips (the V2 shape)."""
+        review = latest_other_review(pr.reviews, self.cfg.fix_bot)
+        if review is not None and review.state == REVIEW_CHANGES_REQUESTED:
+            return review.submitted_at
         return ""

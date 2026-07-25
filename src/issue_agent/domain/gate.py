@@ -124,6 +124,53 @@ def is_evidence_image(path: str) -> bool:
     return path.startswith("evidence/") and path.lower().endswith(IMAGE_EXTS)
 
 
+# ── Acceptance-Criteria checklist parsing (PR body) ───────────────────────────
+# The contract, mirrored line-for-line by check-pr.sh:count_ac_items():
+#   * the AC SECTION starts at a heading line whose text begins "Acceptance
+#     Criteria" (any heading level, any case) and ends at the next heading line
+#     (or EOF);
+#   * an AC ITEM is a markdown task-list line inside that section: `- [ ]` /
+#     `- [x]` (`*` and `+` bullets too), any indentation.
+# A prose bullet ("- the tab title is right") is deliberately NOT an item, so a
+# body written without a checklist counts 0. ZERO IS NOT A DENIAL: callers treat
+# an unparseable section as "fall back to the one-screenshot floor" — a parse
+# miss must never block a PR on its own.
+_AC_HEADING_RE = re.compile(r"^\s*#+\s*acceptance criteria", re.IGNORECASE)
+_ANY_HEADING_RE = re.compile(r"^\s*#+\s")
+_AC_ITEM_RE = re.compile(r"^\s*[-*+]\s+\[[ xX]\]")
+
+# An evidence image path REFERENCED in the PR body — markdown image/link or a
+# bare path; the reviewer needs the link to know which shot proves which AC.
+# Keep in sync with check-pr.sh (PR_EVIDENCE_REF_RE).
+_EVIDENCE_REF_RE = re.compile(r"evidence/[\w./-]+\.(?:png|jpe?g|gif|webp)", re.IGNORECASE)
+
+
+def count_ac_items(body: str) -> int:
+    """How many acceptance-criteria checklist items the PR body declares.
+    0 when the section is absent or holds no checklist (see the contract above)."""
+    count = 0
+    in_ac = False
+    for line in (body or "").splitlines():
+        if _AC_HEADING_RE.match(line):
+            in_ac = True
+            continue
+        if in_ac and _ANY_HEADING_RE.match(line):
+            in_ac = False
+            continue
+        if in_ac and _AC_ITEM_RE.match(line):
+            count += 1
+    return count
+
+
+def referenced_evidence_images(body: str) -> tuple[str, ...]:
+    """Distinct evidence/ image paths referenced anywhere in the PR body
+    (deduped case-insensitively, first spelling kept, order preserved)."""
+    seen: dict[str, str] = {}
+    for m in _EVIDENCE_REF_RE.finditer(body or ""):
+        seen.setdefault(m.group(0).lower(), m.group(0))
+    return tuple(seen.values())
+
+
 # ── branch name (check-branch-name.sh) ────────────────────────────────────────
 def check_branch_name(name: str) -> GateResult:
     """Branch must be <type>/<issue>-<desc>. Empty name → allow (not a
@@ -262,14 +309,29 @@ def check_no_evidence(changed: Iterable[str]) -> GateResult:
 
 
 def check_visual_evidence(
-    visual_ac: bool, changed: Iterable[str], screenshots_read: Iterable[str]
+    visual_ac: bool,
+    changed: Iterable[str],
+    screenshots_read: Iterable[str],
+    pr_body: str = "",
 ) -> GateResult:
     """When the agent declared a visual acceptance criterion (.harness/visual-ac),
-    the PR must commit at least one screenshot under evidence/ AND the agent must
-    have actually READ each committed screenshot (loaded it into its vision context,
-    recorded by the PostToolUse(Read) hook in .harness/screenshots-read). A captured-
-    but-unread screenshot is unverified proof → blocked. Non-visual issues (the
-    common case) → ALLOW."""
+    the PR must commit screenshots under evidence/ AND the agent must have actually
+    READ each committed screenshot (loaded it into its vision context, recorded by
+    the PostToolUse(Read) hook in .harness/screenshots-read). A captured-but-unread
+    screenshot is unverified proof → blocked. Non-visual issues (the common case) →
+    ALLOW.
+
+    ONE SCREENSHOT PER AC ITEM (P3.6-lite). One screenshot for a five-criterion PR
+    proves one criterion, so when the body's `## Acceptance Criteria` section parses
+    into N checklist items the PR must carry N read+committed images AND reference N
+    distinct evidence/ paths in the body — an image nobody links is invisible to the
+    reviewer, who verifies each shot against its criterion.
+
+    The floor is unconditional and comes FIRST: ≥1 committed image, all of them read.
+    The per-AC rule is additive and only fires when the section actually parses
+    (N ≥ 1); an unparseable/prose AC section (N = 0) leaves exactly today's
+    behaviour, so a parsing miss can never deny by itself. `pr_body` defaults to ""
+    (⇒ N = 0) so a caller that has no body in hand still gets the floor."""
     if not visual_ac:
         return ALLOW
     images = [f for f in changed if is_evidence_image(f)]
@@ -285,6 +347,24 @@ def check_visual_evidence(
             "committed screenshot(s) were never read/verified by the agent: "
             f"{', '.join(unread)} — open each with the Read tool and confirm it shows "
             "the criterion met before opening the PR"
+        )
+    # Every image is read+committed by here, so len(images) IS the verified count.
+    ac_items = count_ac_items(pr_body)
+    if ac_items == 0:
+        return ALLOW  # no parsable checklist → the ≥1 floor above is the whole rule
+    if len(images) < ac_items:
+        return deny(
+            f"{ac_items} AC items but only {len(images)} read+committed screenshots — "
+            "capture one per AC item and reference each in the PR body (name the file "
+            "after the criterion it proves, e.g. evidence/ac-2-empty-state.png)"
+        )
+    refs = referenced_evidence_images(pr_body)
+    if len(refs) < ac_items:
+        return deny(
+            f"{ac_items} AC items but the PR body references only {len(refs)} "
+            "evidence/ image path(s) — embed each screenshot next to its AC item "
+            "(e.g. '![AC 2](evidence/ac-2-empty-state.png)' under that checklist "
+            "item); a screenshot nobody links is invisible to the reviewer"
         )
     return ALLOW
 

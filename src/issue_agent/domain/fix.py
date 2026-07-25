@@ -30,7 +30,13 @@ from .actions import (
 )
 from .ci import ci_state, latest_other_review
 from .labels import Label, priority_rank
-from .lifecycle import issue_lifecycle, pr_escalation, pr_lifecycle, retry_breaker
+from .lifecycle import (
+    issue_escalation,
+    issue_lifecycle,
+    pr_escalation,
+    pr_lifecycle,
+    retry_breaker,
+)
 from .refs import issue_from_branch
 from .world import (
     CIState,
@@ -57,6 +63,7 @@ class FixConfig:
     max_review_retries: int = 3
     auto_rebase_conflicts: bool = True
     max_rebase_retries: int = 3
+    max_resolve_retries: int = 3
 
 
 @dataclass(frozen=True)
@@ -78,6 +85,10 @@ class FixState:
     # review daemon meant an infinite full-session-cost loop.
     review_retries: dict[int, tuple[str, int]] = field(default_factory=dict)
     rebase_retries: dict[int, int] = field(default_factory=dict)
+    # Per-ISSUE resolve requeue counter (T3 finding): an always-failing resolve
+    # requeues ai-ready each round; without a breaker that is a full paid
+    # session per poll, forever — #39's shape on the most expensive leg.
+    resolve_retries: dict[int, int] = field(default_factory=dict)
 
 
 # ── cores ────────────────────────────────────────────────────────────────────
@@ -328,11 +339,26 @@ def decide_fix(
     if not consumed:
         n = pick_ready_issue(world)
         if n is not None:
-            actions.append(
-                Relabel(Target.ISSUE, n, Label.AI_READY, Label.AI_WORKING)
-            )
-            actions.append(RunAgent(AgentKind.RESOLVE, n))
-            consumed = True
+            # Resolve breaker (T3 finding): every other paid leg has a retry
+            # ceiling; resolve — the most expensive — had none, so an
+            # always-erroring resolve requeued ai-ready and re-dispatched a
+            # full session every poll forever. At the cap, hand it to a human.
+            # The escalation relabel takes the issue out of the pickable set,
+            # so this is one-shot; other ready issues are picked next tick.
+            if breaker_tripped(state.resolve_retries.get(n, 0),
+                               cfg.max_resolve_retries):
+                actions.extend(issue_escalation(
+                    n,
+                    f"resolve failed {cfg.max_resolve_retries}× without "
+                    "opening a PR — this issue needs a human look.",
+                    Label.AI_READY,
+                ).actions())
+            else:
+                actions.append(
+                    Relabel(Target.ISSUE, n, Label.AI_READY, Label.AI_WORKING)
+                )
+                actions.append(RunAgent(AgentKind.RESOLVE, n))
+                consumed = True
 
     # 2) Blocked issue with a NEW human reply (first one only).
     if not consumed:

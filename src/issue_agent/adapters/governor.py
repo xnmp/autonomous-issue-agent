@@ -98,7 +98,11 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
     # real builder; here body may be empty and the body checks fire accordingly.
     chk(gate.check_pr_body(body))
     chk(gate.check_markers(ctx.ac_posted, ctx.test_plan_posted))
-    chk(gate.check_visual_evidence(ctx.visual_ac, ctx.changed_files, ctx.screenshots_read))
+    # pr_body arms the per-AC-item screenshot rule (§7d); inline --body/-b only —
+    # --body-file is handled by the bash §7d, a pre-existing extractor limitation.
+    chk(gate.check_visual_evidence(
+        ctx.visual_ac, ctx.changed_files, ctx.screenshots_read, body
+    ))
     chk(gate.check_required_test(ctx.branch, ctx.changed_files))
     chk(gate.check_commit_log(ctx.branch_subjects))
     chk(gate.check_no_evidence(ctx.changed_files))

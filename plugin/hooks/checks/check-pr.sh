@@ -87,6 +87,69 @@ prc_check_commit_log
 prc_check_no_evidence "$changed"
 prc_check_tests_immutable "$changed"
 
+# ── 7d. Visual acceptance criteria ⇒ ONE read+committed screenshot PER AC item.
+#
+# Runs BEFORE the expensive §7c (it is pure body/marker/diff arithmetic, so a
+# missing screenshot should not cost a full extra test run).
+#
+# Two layers, in this order:
+#   FLOOR (unconditional): the agent declared a visual criterion
+#   (.harness/visual-ac), so ≥1 screenshot image must be COMMITTED under
+#   evidence/, and EVERY committed image must have been READ by the agent
+#   (basename recorded in .harness/screenshots-read by the PostToolUse(Read)
+#   hook) — an unread capture is unverified proof.
+#   PER-AC (additive, only when the body's AC section parses into N ≥ 1 items):
+#   N read+committed images AND N distinct evidence/ paths referenced in the
+#   body. One shot for a five-criterion PR proves one criterion, and a shot
+#   nobody links is invisible to the reviewer who must check each against its AC.
+# An unparseable AC section counts 0 and therefore only applies the floor — a
+# parse miss must never DENY on its own.
+# Keep in sync with domain/gate.py:check_visual_evidence().
+
+# Count the AC checklist items in the PR body. Contract (kept in sync with
+# domain/gate.py:count_ac_items()): the SECTION starts at a heading line reading
+# "Acceptance Criteria" (any level, any case) and ends at the next heading line
+# or EOF; an ITEM is a markdown task-list line `- [ ]` / `- [x]` (also `*`/`+`),
+# any indentation. Prose bullets are NOT items → 0 → "unparseable, floor only".
+count_ac_items() {  # count_ac_items "<pr-body>"
+  printf '%s\n' "$1" | awk '
+    tolower($0) ~ /^[[:space:]]*#+[[:space:]]*acceptance criteria/ { in_ac = 1; next }
+    in_ac && /^[[:space:]]*#+[[:space:]]/                          { in_ac = 0; next }
+    in_ac && /^[[:space:]]*[-*+][[:space:]]+\[[ xX]\]/             { n++ }
+    END { print n + 0 }'
+}
+
+if [ -f .harness/visual-ac ]; then
+  # Committed screenshot images in the diff (same extension set as §7 /
+  # domain/gate.py:IMAGE_EXTS).
+  shots=$(printf '%s\n' "$changed" | grep -iE '^evidence/.*\.(png|jpg|jpeg|gif|webp)$' || true)
+  [ -n "$shots" ] \
+    || fail "a visual acceptance criterion was declared (.harness/visual-ac) but no screenshot is committed under evidence/ — capture one with agent-browser"
+
+  unread=""
+  while IFS= read -r shot; do
+    [ -n "$shot" ] || continue
+    b="$(basename "$shot")"
+    grep -qxF "$b" .harness/screenshots-read 2>/dev/null || unread="$unread $b"
+  done <<< "$shots"
+  [ -z "$unread" ] \
+    || fail "committed screenshot(s) were never read/verified by the agent:$unread — open each with the Read tool and confirm it shows the criterion met before opening the PR"
+
+  ac_items=$(count_ac_items "$body")
+  if [ "$ac_items" -gt 0 ]; then
+    n_shots=$(printf '%s\n' "$shots" | grep -c '.')
+    [ "$n_shots" -ge "$ac_items" ] \
+      || fail "$ac_items AC items but only $n_shots read+committed screenshots — capture one per AC item and reference each in the PR body (name the file after the criterion it proves, e.g. evidence/ac-2-empty-state.png)"
+    # Distinct evidence/ image paths REFERENCED in the body (kept in sync with
+    # domain/gate.py:_EVIDENCE_REF_RE).
+    n_refs=$(printf '%s\n' "$body" \
+      | grep -oiE 'evidence/[A-Za-z0-9._/-]+\.(png|jpg|jpeg|gif|webp)' \
+      | sort -fu | grep -c '.')
+    [ "${n_refs:-0}" -ge "$ac_items" ] \
+      || fail "$ac_items AC items but the PR body references only ${n_refs:-0} evidence/ image path(s) — embed each screenshot next to its AC item (e.g. '![AC 2](evidence/ac-2-empty-state.png)' under that checklist item); a screenshot nobody links is invisible to the reviewer"
+  fi
+fi
+
 # ── 7c. The new tests must ACTUALLY fail without the implementation (real red).
 #        Create-only: proves the tests exercise the change (anti-tautology). ─────
 prc_check_red_fails "$changed"

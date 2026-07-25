@@ -2,9 +2,11 @@
 
 from issue_agent.domain.outcome import (
     AgentResult,
+    ExitReason,
     Outcome,
     ResolveFollowup,
     classify_outcome,
+    infra_death,
     resolve_followup,
 )
 
@@ -59,3 +61,32 @@ def test_field_bool_missing_key_uses_default():
     assert r.field_bool("reviewable", default=True) is True
     assert r.field_bool("reviewable") is False        # default default is False
     assert AgentResult(is_error=False, structured=None).field_bool("x", default=True) is True
+
+
+# ── infra death: WHY the session ended, separate from WHAT it decided ─────────
+def test_infra_death_only_for_external_kill_and_transport_death():
+    assert infra_death(ExitReason.KILLED_EXTERNALLY) is True
+    assert infra_death(ExitReason.TRANSPORT_DEATH) is True
+
+
+def test_timeouts_are_attempts_not_infra_deaths():
+    # A hang is NOT free: the agent was alive and had its chance, so a reliably
+    # hanging task must still march the breaker forward rather than loop at full
+    # session cost forever.
+    assert infra_death(ExitReason.IDLE_TIMEOUT) is False
+    assert infra_death(ExitReason.WALL_TIMEOUT) is False
+
+
+def test_agent_side_reasons_are_not_infra_deaths():
+    assert infra_death(ExitReason.OK) is False
+    assert infra_death(ExitReason.AGENT_ERROR) is False
+    assert infra_death(ExitReason.BUDGET_EXHAUSTED) is False
+    assert infra_death(ExitReason.NO_RESULT) is False
+
+
+def test_unclassified_result_is_never_an_infra_death():
+    # None = a legacy/hand-built result. Every consumer must keep pre-taxonomy
+    # behavior, so adopting the field is additive and can't silently change policy.
+    assert infra_death(None) is False
+    assert AgentResult(is_error=True).exit_reason is None
+    assert AgentResult(is_error=True).usage is None

@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..domain.agent_task import AgentRuntime, AgentTask
-from ..domain.outcome import AgentResult
+from ..domain.outcome import AgentResult, ExitReason
 
 
 # Model the CodexRunner defaults to when neither CODEX_MODEL nor a task's `model`
@@ -182,20 +182,28 @@ def parse_codex_envelope(
                 is_error=True,
                 summary=(stderr.strip() or raw or f"codex exec exit {exit_code}")[:2000],
                 session_id=session_id,
+                exit_reason=ExitReason.AGENT_ERROR,
             )
-        return AgentResult(is_error=False, summary=raw[:2000], session_id=session_id)
+        return AgentResult(
+            is_error=False, summary=raw[:2000], session_id=session_id,
+            exit_reason=ExitReason.OK,
+        )
 
     status = str(structured.get("status", "") or "")
     summary = str(structured.get("summary", "") or "")
     needs = str(structured.get("needs", "") or "")
+    is_error = status == "error"
     return AgentResult(
-        is_error=(status == "error"),
+        is_error=is_error,
         status=status,
         summary=summary,
         needs=needs,
         cost_usd=0.0,  # codex exposes no per-run cost; left 0 (see model-catalog note)
         session_id=session_id,
         structured=structured,
+        # A parsed envelope means the agentic loop reached its own terminal —
+        # including `blocked`, which is a normal completion, not a failure to run.
+        exit_reason=ExitReason.AGENT_ERROR if is_error else ExitReason.OK,
     )
 
 
@@ -226,6 +234,12 @@ class CodexRunner(AgentRuntime):
     # the monotonic clock freezes during macOS suspend, which would otherwise delay
     # post-wake recovery by a full idle window (same fix as the Claude AgentRunner).
     idle_timeout: float | None = None
+    # Total-runtime ceiling, the cap the idle watchdog cannot provide: a gateway
+    # stream that "limps" (a stderr line every few minutes) resets the idle clock
+    # forever and runs unbounded (FAILURE-MODES #60). Only elapsed wall time bounds
+    # that. Enforced in the same stderr pump, with the same killpg teardown. None
+    # disables. See AGENT_MAX_RUNTIME_SECONDS.
+    max_runtime: float | None = None
     # Injected wall clock (time.time) + poll slice for the idle watchdog: we wait for
     # the next stderr line in `poll_slice` chunks and re-check wall-clock elapsed each
     # chunk, so a sleep-spanning gap trips promptly on wake rather than after a fresh
@@ -260,6 +274,17 @@ class CodexRunner(AgentRuntime):
     def __post_init__(self) -> None:
         self._log = self.log or (lambda _m: None)
         self._wall_clock = self.wall_clock or time.time
+
+    def _pump_slice(self) -> float:
+        """How long one stderr-readline chunk blocks. The poll slice floored by
+        whichever caps are armed, so a cap SHORTER than the slice still trips on
+        time instead of waiting out a full slice."""
+        caps = [self.poll_slice]
+        if self.idle_timeout is not None:
+            caps.append(self.idle_timeout)
+        if self.max_runtime is not None:
+            caps.append(self.max_runtime)
+        return min(caps)
 
     def _log_codex_line(self, line: str) -> None:
         """Classify one live stderr line from `codex exec` and log it. Codex is a
@@ -364,11 +389,20 @@ class CodexRunner(AgentRuntime):
                 argv, run_task, output_path
             )
             if hung:
-                # Idle watchdog fired — surface as a retryable timeout, not a
+                # A watchdog fired — surface as a retryable timeout, not a
                 # blocked verdict (the daemon leaves the issue ai-working →
                 # re-dispatch). A hang is not a transport drop; don't loop here.
+                if result.exit_reason is ExitReason.WALL_TIMEOUT:
+                    return AgentResult(
+                        is_error=True, status="timeout",
+                        exit_reason=ExitReason.WALL_TIMEOUT,
+                        summary=(
+                            f"codex exceeded max runtime {self.max_runtime:.0f}s; killed"
+                        ),
+                    )
                 return AgentResult(
                     is_error=True, status="timeout",
+                    exit_reason=ExitReason.IDLE_TIMEOUT,
                     summary=f"codex idle >{self.idle_timeout:.0f}s (no stderr event); killed",
                 )
 
@@ -390,6 +424,9 @@ class CodexRunner(AgentRuntime):
                     )
                     return AgentResult(
                         is_error=True, status="timeout",
+                        # Upstream refused to serve us at all — the agent never got a
+                        # turn, so this is transport, not an agent attempt.
+                        exit_reason=ExitReason.TRANSPORT_DEATH,
                         summary=(
                             "codex hit provider rate limit (HTTP 429) that survived "
                             f"{rl_attempts + 1} attempts; retryable"
@@ -419,6 +456,9 @@ class CodexRunner(AgentRuntime):
                 )
                 return AgentResult(
                     is_error=True, status="timeout",
+                    # Every attempt died on the wire before a turn completed — the
+                    # textbook TRANSPORT_DEATH: no attempt was made, so no breaker.
+                    exit_reason=ExitReason.TRANSPORT_DEATH,
                     summary=(
                         "codex gateway stream drop (response.failed) survived "
                         f"{net_attempts + 1} attempts; retryable"
@@ -474,12 +514,30 @@ class CodexRunner(AgentRuntime):
         # watchdog: a gap > idle_timeout between stderr events is a hang → kill.
         err_chunks: list[str] = []
         hung = False
+        wall_tripped = False
+        # Wall-cap baseline, read ONLY when the cap is armed (the clock is injectable
+        # and a spurious read would shift a test's fake sequence).
+        started_at = self._wall_clock() if self.max_runtime is not None else 0.0
 
         async def _pump_stderr() -> None:
-            nonlocal hung
+            nonlocal hung, wall_tripped
             assert proc.stderr is not None
             while True:
-                if self.idle_timeout is None:
+                # Between-lines wall check. A chatty run never times out a chunk, so
+                # the in-chunk check alone would leave a runaway session that keeps
+                # printing tool traces unbounded — the spend hole the cap closes.
+                if self.max_runtime is not None:
+                    elapsed = self._wall_clock() - started_at
+                    if elapsed >= self.max_runtime:
+                        hung = True
+                        wall_tripped = True
+                        self._log(
+                            f"codex: WALL — total runtime {elapsed:.0f}s exceeded "
+                            f"max {self.max_runtime:.0f}s; killing subprocess"
+                        )
+                        _kill_quietly(proc)
+                        return
+                if self.idle_timeout is None and self.max_runtime is None:
                     raw = await proc.stderr.readline()
                     if not raw:  # EOF
                         return
@@ -487,24 +545,27 @@ class CodexRunner(AgentRuntime):
                     err_chunks.append(line)
                     self._log_codex_line(line)
                     continue
-                # Wall-clock idle watchdog: wait for the next line in poll_slice
-                # chunks, re-checking elapsed WALL time each chunk. The monotonic
-                # clock freezes across macOS sleep, so a one-shot wait_for spanning a
+                # Wall-clock watchdogs: wait for the next line in poll_slice chunks,
+                # re-checking elapsed WALL time each chunk. The monotonic clock
+                # freezes across macOS sleep, so a one-shot wait_for spanning a
                 # suspend would not count the sleep — polling wall time makes a
-                # sleep-spanning silence trip on the first chunk after wake.
+                # sleep-spanning silence trip on the first chunk after wake. Both caps
+                # share this loop; each is checked only when armed, so arming only the
+                # wall cap must not fall through to the unbounded readline above.
                 last_line = self._wall_clock()
                 got = False
                 while True:
                     try:
                         raw = await asyncio.wait_for(
-                            proc.stderr.readline(),
-                            timeout=min(self.poll_slice, self.idle_timeout),
+                            proc.stderr.readline(), timeout=self._pump_slice()
                         )
                         got = True
                         break
                     except asyncio.TimeoutError:
-                        idle = self._wall_clock() - last_line
-                        if idle >= self.idle_timeout:
+                        # ONE clock read per chunk, shared by both checks.
+                        now = self._wall_clock()
+                        idle = now - last_line
+                        if self.idle_timeout is not None and idle >= self.idle_timeout:
                             hung = True
                             self._log(
                                 f"codex: IDLE — no stderr event for {idle:.0f}s "
@@ -513,7 +574,21 @@ class CodexRunner(AgentRuntime):
                             )
                             _kill_quietly(proc)
                             return
-                        # chunk elapsed but still inside the window — keep waiting
+                        elapsed = now - started_at
+                        if self.max_runtime is not None and elapsed >= self.max_runtime:
+                            # Limping stream: stderr keeps arriving so the idle
+                            # watchdog never fires, but the run has outlived any
+                            # plausible task. Same killpg teardown — the whole process
+                            # GROUP, or a leaked test server holds the pipe forever.
+                            hung = True
+                            wall_tripped = True
+                            self._log(
+                                f"codex: WALL — total runtime {elapsed:.0f}s exceeded "
+                                f"max {self.max_runtime:.0f}s; killing subprocess"
+                            )
+                            _kill_quietly(proc)
+                            return
+                        # chunk elapsed but still inside both windows — keep waiting
                 if not got or not raw:  # EOF
                     return
                 line = raw.decode("utf-8", "replace").rstrip("\n")
@@ -544,7 +619,11 @@ class CodexRunner(AgentRuntime):
         try:
             stdout = await asyncio.wait_for(
                 stdout_task,
-                timeout=(self.post_hang_drain_timeout if self.idle_timeout else None),
+                timeout=(
+                    self.post_hang_drain_timeout
+                    if (self.idle_timeout or self.max_runtime)
+                    else None
+                ),
             )
         except asyncio.TimeoutError:
             hung = True
@@ -564,8 +643,16 @@ class CodexRunner(AgentRuntime):
         self._log(f"codex: exit {exit_code} (stderr {len(stderr)}B, out {len(stdout)}B)")
 
         if hung:
+            # Carry WHICH watchdog fired on the result so run() can phrase the
+            # summary without widening this tuple further.
             return (
-                AgentResult(is_error=True, status="timeout", summary="hung"),
+                AgentResult(
+                    is_error=True, status="timeout", summary="hung",
+                    exit_reason=(
+                        ExitReason.WALL_TIMEOUT if wall_tripped
+                        else ExitReason.IDLE_TIMEOUT
+                    ),
+                ),
                 exit_code, stderr, stdout, True,
             )
 
@@ -586,6 +673,20 @@ class CodexRunner(AgentRuntime):
             session_id=session_id,
             stderr=stderr,
         )
+        if exit_code < 0 and not hung:
+            # A NEGATIVE returncode means terminated by signal -exit_code, and we did
+            # not do it (our own killpg paths set `hung` and returned above). So this
+            # is the OOM/jetsam kill of FAILURE-MODES #58, an operator `kill`, or a
+            # Ctrl-C that reached the process group — infra death, not a failed
+            # attempt. The domain reads exit_reason to skip the breaker bump and the
+            # ai-ready relabel that raced a manual ai-blocked (#65).
+            from dataclasses import replace as _replace
+
+            self._log(
+                f"codex: killed by signal {-exit_code} (not by our watchdog) — "
+                "treating as infra death, not an agent attempt"
+            )
+            result = _replace(result, exit_reason=ExitReason.KILLED_EXTERNALLY)
         return result, exit_code, stderr, stdout, False
 
 

@@ -19,12 +19,12 @@ from collections.abc import Callable
 from typing import Any
 
 from ..domain.agent_task import AgentRuntime, AgentTask
-from ..domain.outcome import AgentResult
+from ..domain.outcome import AgentResult, ExitReason
 
 # Longest single slice we block waiting for the next stream event before we come
 # up for air to re-check the WALL clock. Small enough that a sleep-spanning gap is
 # noticed promptly on wake; large enough to add negligible overhead on a healthy
-# steadily-streaming run. Only relevant when idle_timeout is set.
+# steadily-streaming run. Only relevant when idle_timeout or max_runtime is set.
 _WATCHDOG_POLL_SLICE = 30.0
 
 # Sentinel: "no event this iteration" (idle slice elapsed / stream ended). Distinct
@@ -137,6 +137,25 @@ def build_option_kwargs(
     return kwargs
 
 
+def exit_reason_from_envelope(subtype: str, is_error: bool) -> ExitReason:
+    """Pure: SDK ResultMessage (subtype, is_error) → why the session ended.
+
+    Read off the ENVELOPE, like every other decision here — never from prose or an
+    exit code. The one case worth singling out is budget: the SDK reports it as
+    just another `is_error` subtype, but a spend ceiling is an operator-knob
+    outcome, not a failure of the agent's reasoning, and the cost ledger needs to
+    tell them apart. Everything else that errored is AGENT_ERROR: the agent was
+    alive and answering, so it made an attempt (contrast `infra_death`)."""
+    st = (subtype or "").lower()
+    if st == "success" and not is_error:
+        return ExitReason.OK
+    if "budget" in st:
+        return ExitReason.BUDGET_EXHAUSTED
+    if is_error:
+        return ExitReason.AGENT_ERROR
+    return ExitReason.OK
+
+
 def result_to_agent_result(msg: Any) -> AgentResult:
     """Pure: SDK ResultMessage → domain AgentResult. Duck-typed (reads attrs) so
     a test can pass a stand-in object. Mirrors claude_outcome / save_session:
@@ -156,14 +175,23 @@ def result_to_agent_result(msg: Any) -> AgentResult:
         needs = structured.get("needs", "")
     else:
         summary = getattr(msg, "result", "") or ""
+    is_error = bool(getattr(msg, "is_error", True)) or status == "error"
+    # Raw usage block, verbatim: it carries cache_read/cache_creation token counts
+    # that no other field exposes, and a subscription-plan run reports
+    # total_cost_usd == 0.00 — tokens are the only cost substrate that survives.
+    usage = getattr(msg, "usage", None)
     return AgentResult(
-        is_error=bool(getattr(msg, "is_error", True)) or status == "error",
+        is_error=is_error,
         status=status,
         summary=summary,
         needs=needs,
         cost_usd=float(getattr(msg, "total_cost_usd", 0.0) or 0.0),
         session_id=getattr(msg, "session_id", "") or "",
         structured=structured if isinstance(structured, dict) else None,
+        exit_reason=exit_reason_from_envelope(
+            str(getattr(msg, "subtype", "") or ""), is_error
+        ),
+        usage=usage if isinstance(usage, dict) else None,
     )
 
 
@@ -220,6 +248,7 @@ class AgentRunner(AgentRuntime):
         idle_timeout: float | None = None,
         wall_clock: Callable[[], float] | None = None,
         poll_slice: float = _WATCHDOG_POLL_SLICE,
+        max_runtime: float | None = None,
     ):
         self.permission_mode = permission_mode
         # Pre-built {"PreToolUse": [HookMatcher(...)]} from the governor adapter.
@@ -246,6 +275,35 @@ class AgentRunner(AgentRuntime):
         # slice after wake → prompt recovery, and lets the Mac sleep freely.
         self._wall_clock = wall_clock or _default_wall_clock
         self._poll_slice = poll_slice
+        # Total-runtime ceiling — the cap the idle watchdog CANNOT provide. A stream
+        # left "limping" by a suspend/resume (FAILURE-MODES #60) emits an event every
+        # few minutes: each one resets the idle clock, so a session burned 58 minutes
+        # on 3.6s of CPU and never tripped. Only elapsed wall time bounds that shape.
+        # None disables. See AGENT_MAX_RUNTIME_SECONDS.
+        self._max_runtime = max_runtime
+
+    def _slice_timeout(self) -> float:
+        """How long to block on one observation slice. The poll slice, floored by
+        whichever caps are active so a cap SHORTER than the slice still trips on
+        time (a 0.2s cap must not wait 30s to notice)."""
+        caps = [self._poll_slice]
+        if self._idle_timeout is not None:
+            caps.append(self._idle_timeout)
+        if self._max_runtime is not None:
+            caps.append(self._max_runtime)
+        return min(caps)
+
+    def _wall_timeout(self, elapsed: float, last_trace: str) -> AgentResult:
+        """Log + build the terminal result for a tripped total-runtime cap."""
+        self._log(
+            f"sdk: WALL — total runtime {elapsed:.0f}s exceeded "
+            f"max {self._max_runtime:.0f}s; aborting (last: {last_trace or 'none'})"
+        )
+        return AgentResult(
+            is_error=True, status="timeout",
+            exit_reason=ExitReason.WALL_TIMEOUT,
+            summary=f"agent exceeded max runtime {self._max_runtime:.0f}s",
+        )
 
     async def run(self, task: AgentTask) -> AgentResult:
         # Lazy import: keeps the SDK out of domain-only / unit-test paths.
@@ -292,9 +350,32 @@ class AgentRunner(AgentRuntime):
         last_kind = "none"
         last_msg: Any = None  # the actual last message object (for drop-path forensics)
         terminal_seen = ""    # any terminal_reason observed across the stream
+        # Wall-cap baseline. Read the clock ONLY when the cap is armed: the clock is
+        # injectable and a spurious read would shift a test's fake sequence, and an
+        # unarmed cap has no baseline to keep.
+        started_at = self._wall_clock() if self._max_runtime is not None else 0.0
         agen = query(prompt=task.prompt, options=options).__aiter__()
         try:
             while True:
+                # Total-runtime cap, checked BETWEEN receives as well as inside the
+                # slice loop below. A stream delivering events FASTER than one poll
+                # slice never expires a slice, so the in-slice check alone would
+                # leave a chatty runaway session unbounded — exactly the spend hole
+                # the cap exists to close. Between receives there is no in-flight
+                # task to cancel; just close the generator (tears down the query
+                # subprocess) and honour any result we already captured.
+                if self._max_runtime is not None:
+                    elapsed = self._wall_clock() - started_at
+                    if elapsed >= self._max_runtime:
+                        await _aclose_quietly(agen)
+                        if final is None:
+                            return self._wall_timeout(elapsed, last_trace)
+                        self._log(
+                            f"sdk: WALL — {elapsed:.0f}s exceeded max "
+                            f"{self._max_runtime:.0f}s, but a ResultMessage was "
+                            "already captured; honouring it"
+                        )
+                        break
                 # Bound the wait for the NEXT event, not the whole run. A hard task
                 # emits messages continuously so the idle clock resets every few
                 # seconds; only a true hang (no event at all) exceeds the window.
@@ -308,7 +389,13 @@ class AgentRunner(AgentRuntime):
                 # on the first slice after wake — and the laptop is free to sleep.
                 message: Any = _NO_MESSAGE
                 stream_ended = False
-                if self._idle_timeout is not None:
+                if self._idle_timeout is not None or self._max_runtime is not None:
+                    # ONE observation loop serves BOTH caps. They are checked
+                    # independently (each only when armed) but share the slice
+                    # machinery — arming only the wall cap must not fall through to
+                    # the unbounded `await __anext__()` branch below, or the cap
+                    # would silently never fire.
+                    #
                     # Poll the NEXT event without cancelling the in-flight receive.
                     #
                     # The previous form — asyncio.wait_for(agen.__anext__(), slice) —
@@ -331,8 +418,7 @@ class AgentRunner(AgentRuntime):
                     pending = asyncio.ensure_future(agen.__anext__())
                     while True:
                         done, _ = await asyncio.wait(
-                            {pending},
-                            timeout=min(self._poll_slice, self._idle_timeout),
+                            {pending}, timeout=self._slice_timeout()
                         )
                         if done:
                             try:
@@ -340,8 +426,11 @@ class AgentRunner(AgentRuntime):
                             except StopAsyncIteration:
                                 stream_ended = True
                             break  # got an event (or the stream ended)
-                        idle = self._wall_clock() - last_event
-                        if idle >= self._idle_timeout:
+                        # ONE clock read per slice, shared by both checks — the clock
+                        # is injectable and extra reads would advance a fake sequence.
+                        now = self._wall_clock()
+                        idle = now - last_event
+                        if self._idle_timeout is not None and idle >= self._idle_timeout:
                             self._log(
                                 f"sdk: IDLE — no stream event for {idle:.0f}s "
                                 f"(>{self._idle_timeout:.0f}s); treating as hung "
@@ -352,13 +441,31 @@ class AgentRunner(AgentRuntime):
                             if final is None:
                                 return AgentResult(
                                     is_error=True, status="timeout",
+                                    exit_reason=ExitReason.IDLE_TIMEOUT,
                                     summary=f"agent idle >{self._idle_timeout:.0f}s "
                                             "(no stream event)",
                                 )
                             stream_ended = True  # had a result; honour it below
                             break
-                        # slice elapsed but still inside the window — keep observing the
-                        # SAME pending receive (do NOT cancel/restart it)
+                        elapsed = now - started_at
+                        if self._max_runtime is not None and elapsed >= self._max_runtime:
+                            # The limping-stream cap: events keep arriving (so the idle
+                            # watchdog never fires) but the session has run past any
+                            # plausible task length. Tear down exactly like the idle
+                            # path — a capped session must not leak its subprocess.
+                            pending.cancel()
+                            await _aclose_quietly(agen)
+                            if final is None:
+                                return self._wall_timeout(elapsed, last_trace)
+                            self._log(
+                                f"sdk: WALL — {elapsed:.0f}s exceeded max "
+                                f"{self._max_runtime:.0f}s, but a ResultMessage was "
+                                "already captured; honouring it"
+                            )
+                            stream_ended = True  # had a result; honour it below
+                            break
+                        # slice elapsed but still inside both windows — keep observing
+                        # the SAME pending receive (do NOT cancel/restart it)
                     if stream_ended:
                         break
                 else:
@@ -412,6 +519,15 @@ class AgentRunner(AgentRuntime):
                     f"{type(exc).__name__}: {str(exc)[:200]}"
                     + (f" (last: {last_trace})" if last_trace else "")
                 )
+                # This raise IS the TRANSPORT_DEATH path for the SDK runtime —
+                # deliberately NOT converted into an AgentResult(exit_reason=
+                # TRANSPORT_DEATH). Callers depend on the exception for crash
+                # isolation: Daemon.tick catches it, so the issue keeps ai-working
+                # and the reaper requeues it — precisely the settle path
+                # infra_death() produces for a returned result. Returning instead
+                # would run the follow-up tail on a session that never happened.
+                # The enum member exists for the runtimes that CAN'T raise
+                # (CodexRunner reads an exit code) and for future supervision.
                 raise
         if final is None:
             # No ResultMessage emitted (transport died) → surface as an error,
@@ -449,5 +565,9 @@ class AgentRunner(AgentRuntime):
                 + " — result-delivery drop (no exception raised)"
                 + forensic
             )
-            return AgentResult(is_error=True, summary="no ResultMessage from query()")
+            return AgentResult(
+                is_error=True,
+                summary="no ResultMessage from query()",
+                exit_reason=ExitReason.NO_RESULT,
+            )
         return result_to_agent_result(final)

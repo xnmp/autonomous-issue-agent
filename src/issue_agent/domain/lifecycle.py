@@ -160,12 +160,35 @@ class PrEscalation:
         ]
 
 
+@dataclass(frozen=True)
+class IssueEscalation:
+    """Issue-side twin of PrEscalation. `from_label` is whatever lifecycle label
+    the issue currently carries (AI_READY for the resolve breaker; AI_WORKING
+    for contract escalation) — swapping it for NEEDS_HUMAN_REVIEW is what makes
+    the escalation one-shot: the issue leaves the pickable set."""
+
+    issue: int
+    reason: str
+    from_label: Label
+
+    def actions(self) -> list:
+        return [
+            PostComment(Target.ISSUE, self.issue,
+                        f"**Circuit breaker:** {self.reason} Escalating to a human."),
+            Relabel(Target.ISSUE, self.issue, self.from_label, Label.NEEDS_HUMAN_REVIEW),
+        ]
+
+
 def retry_breaker(attempts: int, cap: int) -> RetryBreaker:
     return RetryBreaker(attempts=attempts, cap=cap)
 
 
 def pr_escalation(pr: int, reason: str) -> PrEscalation:
     return PrEscalation(pr=pr, reason=reason)
+
+
+def issue_escalation(issue: int, reason: str, from_label: Label) -> IssueEscalation:
+    return IssueEscalation(issue=issue, reason=reason, from_label=from_label)
 
 
 def issue_lifecycle(issue) -> IssueLifecycle:

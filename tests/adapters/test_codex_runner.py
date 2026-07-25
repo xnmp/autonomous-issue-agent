@@ -23,7 +23,7 @@ from issue_agent.adapters.codex_runner import (
     build_codex_argv,
     parse_codex_envelope,
 )
-from issue_agent.domain.outcome import AgentResult
+from issue_agent.domain.outcome import AgentResult, ExitReason, infra_death
 from issue_agent.domain.agent_task import AgentTask
 
 
@@ -185,6 +185,28 @@ def test_envelope_zero_exit_freetext_not_error():
     # codex printed prose but no schema (e.g. no --output-schema) and exited 0.
     r = parse_codex_envelope(exit_code=0, last_message="PONG")
     assert r.is_error is False and r.summary == "PONG"
+
+
+# ── exit_reason on the codex envelope ────────────────────────────────────────
+def test_envelope_exit_reason_separates_agent_error_from_normal_terminals():
+    ok = parse_codex_envelope(
+        exit_code=0, last_message=json.dumps({"status": "pr_opened"})
+    )
+    # `blocked` is a NORMAL completion — the agent finished and asked a question.
+    blocked = parse_codex_envelope(
+        exit_code=0, last_message=json.dumps({"status": "blocked", "needs": "?"})
+    )
+    err = parse_codex_envelope(exit_code=0, last_message=json.dumps({"status": "error"}))
+    no_envelope = parse_codex_envelope(exit_code=1, last_message="", stderr="401")
+
+    assert ok.exit_reason is ExitReason.OK
+    assert blocked.exit_reason is ExitReason.OK
+    assert err.exit_reason is ExitReason.AGENT_ERROR
+    assert no_envelope.exit_reason is ExitReason.AGENT_ERROR
+    # None of these excuse a retry — they are all attempts the agent actually made.
+    assert not any(
+        infra_death(r.exit_reason) for r in (ok, blocked, err, no_envelope)
+    )
 
 
 def test_session_id_from_lines():
@@ -350,6 +372,160 @@ def test_run_gives_up_after_max_rate_limit_retries():
     assert r.is_error is True
     assert r.status == "timeout"
     assert "rate limit" in r.summary.lower()
+    # Upstream never gave the agent a turn → infra death, so the daemon must not
+    # burn a breaker slot on it.
+    assert r.exit_reason is ExitReason.TRANSPORT_DEATH
+
+
+def test_run_exhausted_transport_retries_is_infra_death():
+    """Every attempt died on the wire before a turn completed. The agent made no
+    attempt, so the CI/review breakers must not advance (FAILURE-MODES #58/#65)."""
+    tmp = tempfile.mkdtemp()
+    body = (
+        'echo "session id: sess-drop" >&2\n'
+        'echo "stream disconnected before completion" >&2\n'
+        'exit 1\n'
+    )
+    codex = _fake_codex(tmp, body)
+    runner = CodexRunner(
+        codex_bin=codex, env={"OPENAI_API_KEY": "k"},
+        transport_retries=1, backoff_base=0.01,
+    )
+
+    r = asyncio.run(runner.run(AgentTask(prompt="x")))
+
+    assert r.is_error is True and r.status == "timeout"
+    assert r.exit_reason is ExitReason.TRANSPORT_DEATH
+    assert infra_death(r.exit_reason) is True
+
+
+def test_run_process_killed_by_signal_is_infra_death_not_an_attempt():
+    """FAILURE-MODES #58: codex died `exit -9` six times on one PR (suspected macOS
+    jetsam during the Playwright RSS burst) and each death marched the breaker to
+    needs-human-review. A NEGATIVE returncode means killed-by-signal and we didn't
+    do it, so it is infra, not a failed attempt."""
+    tmp = tempfile.mkdtemp()
+    codex = _fake_codex(tmp, "kill -9 $$\n")  # self-SIGKILL → returncode -9
+    runner = CodexRunner(codex_bin=codex, env={"OPENAI_API_KEY": "k"})
+
+    r = asyncio.run(runner.run(AgentTask(prompt="x")))
+
+    assert r.is_error is True
+    assert r.exit_reason is ExitReason.KILLED_EXTERNALLY
+    assert infra_death(r.exit_reason) is True
+
+
+def test_run_ordinary_nonzero_exit_is_an_agent_error_not_infra_death():
+    """The boundary of the exemption: a POSITIVE exit code is codex reporting
+    failure after running. That IS an attempt and must still count."""
+    tmp = tempfile.mkdtemp()
+    codex = _fake_codex(tmp, 'echo "boom" >&2\nexit 1\n')
+    runner = CodexRunner(codex_bin=codex, env={"OPENAI_API_KEY": "k"})
+
+    r = asyncio.run(runner.run(AgentTask(prompt="x")))
+
+    assert r.is_error is True
+    assert r.exit_reason is ExitReason.AGENT_ERROR
+    assert infra_death(r.exit_reason) is False
+
+
+# ── total-runtime (wall) cap ─────────────────────────────────────────────────
+def test_wall_cap_kills_a_run_the_idle_watchdog_never_catches():
+    """A codex run that keeps printing tool traces resets the idle window forever
+    (FAILURE-MODES #60). Here stderr flows steadily while the injected WALL clock
+    jumps past the cap: only elapsed-time accounting can stop it, and it must use
+    the same killpg teardown (the process group, not just the pid)."""
+    import time as _time
+
+    tmp = tempfile.mkdtemp()
+    # One stderr line straight away (so the idle watchdog is satisfied), then a long
+    # sleep the cap must cut short.
+    codex = _fake_codex(tmp, 'echo "codex tool: step 1" >&2\nsleep 30\n')
+    # started_at, between-lines check, last_line, then the post-line check jumps.
+    ticks = iter([1000.0, 1000.0, 1000.0, 4600.0])
+    held = {"t": 1000.0}
+
+    def wall():
+        try:
+            held["t"] = next(ticks)
+        except StopIteration:
+            pass
+        return held["t"]
+
+    logged: list[str] = []
+    runner = CodexRunner(
+        codex_bin=codex, env={"OPENAI_API_KEY": "k"},
+        idle_timeout=900.0, max_runtime=900.0, poll_slice=0.1,
+        wall_clock=wall, log=logged.append,
+    )
+
+    start = _time.monotonic()
+    r = asyncio.run(runner.run(AgentTask(prompt="x")))
+    elapsed = _time.monotonic() - start
+
+    assert elapsed < 20, f"wall cap did not trip promptly (took {elapsed:.1f}s)"
+    assert r.is_error is True and r.status == "timeout"
+    assert r.exit_reason is ExitReason.WALL_TIMEOUT
+    assert any("WALL" in m for m in logged)
+    assert not any("IDLE" in m for m in logged)  # the idle watchdog never saw it
+
+
+def test_wall_cap_alone_still_bounds_a_run_when_idle_timeout_is_disabled():
+    """With only the wall cap armed the pump must NOT fall through to the unbounded
+    readline branch, or the cap would silently never fire."""
+    import time as _time
+
+    tmp = tempfile.mkdtemp()
+    codex = _fake_codex(tmp, 'echo "codex tool: step 1" >&2\nsleep 30\n')
+    ticks = iter([1000.0, 1000.0, 1000.0, 4600.0])
+    held = {"t": 1000.0}
+
+    def wall():
+        try:
+            held["t"] = next(ticks)
+        except StopIteration:
+            pass
+        return held["t"]
+
+    runner = CodexRunner(
+        codex_bin=codex, env={"OPENAI_API_KEY": "k"},
+        idle_timeout=None, max_runtime=900.0, poll_slice=0.1, wall_clock=wall,
+    )
+
+    start = _time.monotonic()
+    r = asyncio.run(runner.run(AgentTask(prompt="x")))
+
+    assert _time.monotonic() - start < 20
+    assert r.exit_reason is ExitReason.WALL_TIMEOUT
+
+
+def test_healthy_run_inside_both_caps_is_untouched():
+    """False-positive guard: a normal run with both caps armed returns its envelope
+    and carries no timeout classification."""
+    tmp = tempfile.mkdtemp()
+    body = r'''
+out=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then out="$a"; fi
+  prev="$a"
+done
+echo "session id: sess-ok" >&2
+printf '%s' '{"status":"pr_opened","summary":"done","needs":""}' > "$out"
+exit 0
+'''
+    codex = _fake_codex(tmp, body)
+    runner = CodexRunner(
+        codex_bin=codex, env={"OPENAI_API_KEY": "k"},
+        idle_timeout=900.0, max_runtime=2700.0,
+    )
+
+    r = asyncio.run(runner.run(AgentTask(prompt="x", schema={
+        "type": "object", "properties": {"status": {"type": "string"},
+        "summary": {"type": "string"}, "needs": {"type": "string"}}})))
+
+    assert r.is_error is False and r.status == "pr_opened"
+    assert r.exit_reason is ExitReason.OK
 
 
 # ── idle watchdog measures wall-clock so it survives laptop sleep ─────────────

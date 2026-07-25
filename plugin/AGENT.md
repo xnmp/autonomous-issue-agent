@@ -84,9 +84,32 @@ don't keep going back to edit it — each re-plan costs a full model round-trip.
 6. Put proof artifacts in `evidence/`. Non-image artifacts (logs, dumps) are
    gitignored — do NOT commit them. Screenshot IMAGES (`.png/.jpg/.jpeg/.gif/.webp`)
    under `evidence/` ARE committed — they render in the reviewer's Files-changed tab.
-   **Visual acceptance criteria:** if a criterion is visual (a rendered UI, a page
-   state, a chart), capture the MINIMUM shots that prove it (usually one) into
-   `evidence/<name>.png` at a reasonable resolution, and `touch .harness/visual-ac`.
+   **Visual acceptance criteria:** if any criterion is visual (a rendered UI, a page
+   state, a chart), `touch .harness/visual-ac` and capture **one screenshot per AC
+   item** — not one screenshot for the whole PR. One shot proves one criterion, and
+   the reviewer opens each image and judges it against the criterion it claims to
+   prove. Concretely:
+   - **One image per AC checklist item**, captured from the ACTUALLY RUNNING app
+     (a real server/browser rendering your branch) — never a mockup, a hand-edited
+     image, a design file, or a screenshot of source code.
+   - **Name the file after the criterion it proves**: `evidence/ac-<n>-<slug>.png`
+     (e.g. `evidence/ac-2-empty-state.png`), at a resolution where the asserted
+     text/state is legible.
+   - **Write the PR's `## Acceptance Criteria` section as a `- [ ]` checklist** (one
+     line per criterion) and reference each image directly under its own item:
+
+         ## Acceptance Criteria
+         - [ ] the browser tab title reads "My App"
+           ![AC 1](evidence/ac-1-tab-title.png)
+         - [ ] the empty list shows the "Add your first item" CTA
+           ![AC 2](evidence/ac-2-empty-state.png)
+
+     The PR gate counts those checklist items and requires that many read+committed
+     screenshots AND that many `evidence/…` references in the body — a screenshot
+     nobody links is invisible to the reviewer. (A prose, non-checklist AC section
+     falls back to requiring a single screenshot, but then the reviewer has to guess
+     which criterion it proves — write the checklist.)
+
    Two ways to capture — pick by whether the shot is a byproduct of the asserting test:
      - **Playwright-native (preferred IF the repo's e2e test already drives the page
        to the asserted state):** capture inside that test as a side-effect of the
@@ -123,7 +146,9 @@ don't keep going back to edit it — each re-plan costs a full model round-trip.
    `--base "$BASE_BRANCH"` to `gh pr create`. Without it, `gh` targets the repo's
    DEFAULT branch (often `main`), which routes the PR through the wrong branch's CI
    and breaks auto-merge; the PR gate rejects a PR whose base ≠ `$BASE_BRANCH`.
-   Include a `## Acceptance Criteria` section and `Fixes #$ISSUE_NUMBER` in the body.
+   Include a `## Acceptance Criteria` section — written as a `- [ ]` checklist, one
+   line per criterion, each visual one followed by its `evidence/…` image reference
+   (step 6) — and `Fixes #$ISSUE_NUMBER` in the body.
 
 ## Hard rules
 - Do NOT use `--no-verify`, `-n` on commit, `HUSKY=0`, or override

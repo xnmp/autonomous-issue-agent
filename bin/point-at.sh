@@ -16,6 +16,14 @@
 # Env knobs:
 #   ROLES="fix review steward"    which watchers to start (default: all three)
 #   ISSUE_AGENT_MAX_TICKS=N       bound each daemon's loop (dry run / CI); unset = forever
+#   LOG_DIR=<path>                 daemon log directory (default:
+#                                  ${XDG_STATE_HOME:-$HOME/.local/state}/issue-agent/logs)
+#
+# NOTE: this foreground mode is the dev / first-run path. For real (unattended)
+# operation, prefer the systemd units (`issue-agent install-service` /
+# `make install-systemd`) — they auto-restart the process itself across a
+# suspend/OOM-kill/reboot, which foreground mode (no supervisor) cannot. See
+# HARNESS.md "Running for real: systemd".
 set -uo pipefail
 
 HARNESS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -23,6 +31,11 @@ NAME="${1:?usage: bin/point-at.sh <name>  (reads config/repos/<name>.env)}"
 SHARED="$HARNESS_ROOT/config/shared.env"
 REPO_ENV="$HARNESS_ROOT/config/repos/$NAME.env"
 ROLES="${ROLES:-fix review steward}"
+# Private, persistent log dir — NOT world-readable /tmp (any local user could
+# read prior /tmp/issue-agent-*.log, which may carry issue/PR content) and NOT
+# lost on reboot (tmpfs / systemd-tmpfiles clears /tmp). XDG_STATE_HOME is the
+# freedesktop convention for this kind of non-essential, host-local log data.
+LOG_DIR="${LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/issue-agent/logs}"
 
 red()  { printf '\033[31m%s\033[0m\n' "$1"; }
 grn()  { printf '\033[32m%s\033[0m\n' "$1"; }
@@ -30,6 +43,9 @@ info() { printf '\033[36m▸ %s\033[0m\n' "$1"; }
 
 [ -f "$SHARED" ]   || { red "missing $SHARED";   exit 1; }
 [ -f "$REPO_ENV" ] || { red "missing $REPO_ENV (create config/repos/$NAME.env)"; exit 1; }
+
+mkdir -p "$LOG_DIR" || { red "could not create log dir $LOG_DIR"; exit 1; }
+chmod 700 "$(dirname "$LOG_DIR")" 2>/dev/null || true
 
 # ── 1. Compose: shared first, per-repo overlays (per-repo wins) ───────────────
 # Delegated to bin/compose-env.sh (the single source of truth for the compose
@@ -169,7 +185,7 @@ fi
 
 # ── 5. Run the watchers in the foreground; Ctrl-C stops all ───────────────────
 run_role() {
-  local role="$1" log="/tmp/issue-agent-$1-$NAME.log"
+  local role="$1" log="$LOG_DIR/$1-$NAME.log"
   info "starting $role watcher → $log"
   # Run uv from the HARNESS root (that's where the issue_agent package + project
   # live). The daemon self-chdirs into TARGET_DIR (config.py os.chdir(target_dir)),
@@ -199,10 +215,10 @@ for role in $ROLES; do
 done
 
 [ "${#pids[@]}" -gt 0 ] || { red "no watchers started"; exit 1; }
-grn "✓ $ROLES watchers running against $REPO (Ctrl-C stops all). Tailing logs:"
+grn "✓ $ROLES watchers running against $REPO (Ctrl-C stops all). Tailing logs from $LOG_DIR:"
 echo
 # Follow all role logs together until the daemons exit or Ctrl-C.
-tail -n +1 -F /tmp/issue-agent-*-"$NAME".log &
+tail -n +1 -F "$LOG_DIR"/*-"$NAME".log &
 tail_pid=$!
 wait "${pids[@]}"
 kill "$tail_pid" 2>/dev/null || true

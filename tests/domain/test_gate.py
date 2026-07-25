@@ -13,6 +13,8 @@ from issue_agent.domain.gate import (
     check_no_evidence,
     check_no_web,
     check_visual_evidence,
+    count_ac_items,
+    referenced_evidence_images,
     check_pr_base,
     check_pr_body,
     check_push_precondition,
@@ -186,6 +188,102 @@ def test_visual_evidence_all_images_must_be_read():
     # one read, one not → blocked, names the unread one.
     res = check_visual_evidence(True, ["evidence/a.png", "evidence/b.png"], ["a.png"])
     assert not res.ok and "b.png" in res.reason
+
+
+# ── AC-item counting + one screenshot PER AC item (P3.6-lite) ─────────────────
+def test_count_ac_items_counts_checklist_items_inside_the_section():
+    body = (
+        "- [ ] decoy above the heading\n"
+        "## Acceptance Criteria\n"
+        "- [ ] the tab title reads 'My App'\n"
+        "* [x] the empty state shows the CTA\n"
+        "  + [ ] indented items count too\n"
+        "- a prose bullet is not a criterion checkbox\n"
+        "### Test Plan\n"
+        "- [ ] decoy after the section\n"
+    )
+    assert count_ac_items(body) == 3
+
+
+def test_count_ac_items_is_zero_when_unparseable():
+    # prose AC section (today's common body), no section at all, empty body.
+    assert count_ac_items("## Acceptance Criteria\n- token works\n\nFixes #7") == 0
+    assert count_ac_items("no sections here") == 0
+    assert count_ac_items("") == 0
+
+
+def test_count_ac_items_accepts_any_heading_level_and_case():
+    assert count_ac_items("#### acceptance criteria (v2)\n- [ ] a\n- [x] b") == 2
+
+
+def test_referenced_evidence_images_are_distinct_paths():
+    body = (
+        "![AC 1](evidence/ac-1-title.png)\n"
+        "see evidence/ac-2-empty.PNG and [again](evidence/ac-1-title.png)\n"
+        "evidence/notes.txt is not an image\n"
+    )
+    assert referenced_evidence_images(body) == (
+        "evidence/ac-1-title.png",
+        "evidence/ac-2-empty.PNG",
+    )
+
+
+_AC3 = "## Acceptance Criteria\n- [ ] one\n- [ ] two\n- [ ] three\n\nFixes #7\n"
+_AC3_LINKED = _AC3 + (
+    "![AC 1](evidence/ac-1.png)\n![AC 2](evidence/ac-2.png)\n![AC 3](evidence/ac-3.png)\n"
+)
+
+
+def test_visual_evidence_requires_one_screenshot_per_ac_item():
+    res = check_visual_evidence(
+        True,
+        ["evidence/ac-1.png", "evidence/ac-2.png"],
+        ["ac-1.png", "ac-2.png"],
+        _AC3_LINKED,
+    )
+    assert not res.ok
+    assert "3 AC items" in res.reason and "only 2" in res.reason
+
+
+def test_visual_evidence_passes_with_one_read_screenshot_per_ac_item():
+    assert check_visual_evidence(
+        True,
+        ["evidence/ac-1.png", "evidence/ac-2.png", "evidence/ac-3.png"],
+        ["ac-1.png", "ac-2.png", "ac-3.png"],
+        _AC3_LINKED,
+    ).ok
+
+
+def test_visual_evidence_requires_each_screenshot_be_referenced_in_the_body():
+    # enough images, all read — but the body links only one, so the reviewer
+    # cannot tell which shot proves which criterion.
+    res = check_visual_evidence(
+        True,
+        ["evidence/ac-1.png", "evidence/ac-2.png", "evidence/ac-3.png"],
+        ["ac-1.png", "ac-2.png", "ac-3.png"],
+        _AC3 + "![only one](evidence/ac-1.png)\n",
+    )
+    assert not res.ok
+    assert "references only 1" in res.reason
+
+
+def test_visual_evidence_falls_back_to_the_floor_when_ac_unparseable():
+    # prose AC section → 0 items → exactly today's rule: ONE read+committed shot,
+    # no body reference required. A parse miss must never deny on its own.
+    prose = "## Acceptance Criteria\n- the tab title is right\n\nFixes #7"
+    assert check_visual_evidence(True, ["evidence/tab.png"], ["tab.png"], prose).ok
+    res = check_visual_evidence(True, ["src/x.ts"], [], prose)
+    assert not res.ok and "no screenshot" in res.reason
+
+
+def test_visual_evidence_per_ac_rule_ignored_when_not_visual():
+    # a non-visual PR with a 3-item checklist and no screenshots is untouched.
+    assert check_visual_evidence(False, ["src/x.ts"], [], _AC3).ok
+
+
+def test_visual_evidence_body_defaults_to_the_floor_rule():
+    # caller without the body in hand keeps the pre-P3.6 behaviour.
+    assert check_visual_evidence(True, ["evidence/tab.png"], ["tab.png"]).ok
 
 
 def test_existing_test_must_not_change():

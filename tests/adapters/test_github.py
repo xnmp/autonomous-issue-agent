@@ -597,3 +597,172 @@ def test_non_benign_gh_failure_stays_loud_without_debug(monkeypatch, capsys):
     )
     err = capsys.readouterr().err
     assert "gh failed" in err and "422" in err
+
+
+# ── V10: infra failure ≠ "nothing to do" ──────────────────────────────────────
+import pytest  # noqa: E402
+from issue_agent.adapters.github import (  # noqa: E402
+    GhUnavailable,
+    classify_gh_failure,
+)
+
+
+def _run_with(monkeypatch, stderr, rc=1):
+    monkeypatch.setattr(_subprocess, "run", _fake_run_factory(rc, stderr))
+    return lambda argv=None: _subprocess_runner(argv or ["gh", "pr", "view", "1"], None)
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "GraphQL: Could not resolve to a PullRequest with the number of 999.",
+        "HTTP 404: Not Found (https://api.github.com/repos/o/r/issues/999)",
+        "HTTP 422: Can not approve your own pull request",
+        "GraphQL: Resource not accessible by integration",  # bare 403, permanent
+        "could not find any label named ai-review",
+    ],
+)
+def test_runner_keeps_failsoft_for_ordinary_non_zero_exits(monkeypatch, stderr):
+    """Regression guard for the fail-soft contract the whole gateway rests on: a
+    deleted PR, a 404, a 422 self-approval and a missing label are ANSWERS from
+    the API, not outages. They must keep degrading to "" — `_safe_get_pr`,
+    `build_review_world`'s missing-label tolerance and `submit_review`'s False
+    all depend on it, so a blanket raise would wedge the daemon."""
+    assert _run_with(monkeypatch, stderr)() == ""
+    assert classify_gh_failure(stderr) is None
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "HTTP 403: API rate limit exceeded for user ID 583231. (https://api.github.com/…)",
+        "HTTP 429: Too Many Requests",
+        "You have exceeded a secondary rate limit. Please wait a few minutes.",
+        "HTTP 403: x-ratelimit-remaining: 0",
+    ],
+)
+def test_runner_raises_rate_limit(monkeypatch, stderr):
+    """The V10 case: throttling used to return "" → the tick observed an empty
+    world and acted on it. It must now be an exception carrying its kind."""
+    with pytest.raises(GhUnavailable) as ei:
+        _run_with(monkeypatch, stderr)()
+    assert ei.value.kind == "rate-limit"
+    assert ei.value.timed_out is False
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "error connecting to api.github.com",
+        "Could not resolve host: api.github.com",
+        "dial tcp: lookup api.github.com: no such host",
+        "Get https://api.github.com: net/http: TLS handshake timeout",
+        "connection refused",
+    ],
+)
+def test_runner_raises_network(monkeypatch, stderr):
+    with pytest.raises(GhUnavailable) as ei:
+        _run_with(monkeypatch, stderr)()
+    assert ei.value.kind == "network"
+
+
+@pytest.mark.parametrize(
+    "stderr, kind",
+    [
+        ("HTTP 502: Bad gateway", "server"),
+        ("HTTP 503 (https://api.github.com/graphql)", "server"),
+        # contains "timeout" — the 5xx test must win, or a GitHub outage reads as
+        # a local network fault and the operator debugs the wrong box.
+        ("HTTP 504: Gateway Timeout", "server"),
+        # a bare 5xx-looking number is NOT an outage — it's an issue number.
+        ("GraphQL: Could not resolve to an Issue with the number 502.", None),
+    ],
+)
+def test_server_5xx_classification_requires_the_http_token(stderr, kind):
+    assert classify_gh_failure(stderr) == kind
+
+
+def test_runner_raises_network_on_timeout(monkeypatch, capsys):
+    """The 120s kill produced NO data; returning "" made a hung `gh pr view` look
+    like a successful read of an empty world. `timed_out` marks it as the
+    per-call case so `_safe_get_pr` can still isolate one wedged PR."""
+    def _timeout(argv, capture_output, text, env, timeout):
+        raise _subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
+
+    monkeypatch.setattr(_subprocess, "run", _timeout)
+    with pytest.raises(GhUnavailable) as ei:
+        _subprocess_runner(["gh", "pr", "view", "374", "--repo", "o/r"], None)
+    assert ei.value.kind == "network" and ei.value.timed_out is True
+    assert "timed out" in capsys.readouterr().err
+
+
+def test_gh_unavailable_detail_is_one_bounded_line():
+    exc = GhUnavailable("rate-limit", "API rate limit exceeded\n  for user ID 1\n" + "x" * 500)
+    assert "\n" not in exc.detail and len(exc.detail) <= 200
+    assert "rate-limited" in str(exc)
+
+
+def _raising_runner(exc):
+    def runner(argv, token):
+        raise exc
+    return runner
+
+
+def test_build_world_propagates_gh_unavailable():
+    """A world built on a failed read is a lie. The builders must NOT degrade it
+    to an empty WorldState — that is exactly how a throttled poll came to see
+    zero issues and zero PRs."""
+    gw = GitHubGateway("o/r", runner=_raising_runner(GhUnavailable("rate-limit", "exceeded")))
+    with pytest.raises(GhUnavailable):
+        gw.build_world()
+
+
+@pytest.mark.parametrize(
+    "build", ["build_review_world", "build_triage_world", "build_steward_world"]
+)
+def test_all_world_builders_propagate_gh_unavailable(build):
+    gw = GitHubGateway("o/r", runner=_raising_runner(GhUnavailable("server", "HTTP 503")))
+    with pytest.raises(GhUnavailable):
+        getattr(gw, build)()
+
+
+def test_review_world_isolates_a_timed_out_pr_but_not_a_rate_limit(capsys):
+    """Two infra failures, two different blast radii. A single hung `gh pr view`
+    recurs every poll while the PR exists, so isolating it keeps newer PRs
+    reviewable (the #374/#382 incident). A rate limit fails EVERY fetch, so
+    isolating it would rebuild the empty world V10 is about."""
+    good = {"number": 900, "state": "OPEN", "labels": [{"name": "ai-review"}]}
+
+    def runner(argv, token):
+        key = " ".join(argv)
+        if "pr list" in key:
+            return json.dumps([{"number": 374}, {"number": 900}])
+        if "pr view 374" in key:
+            raise GhUnavailable("network", "gh timed out after 120s", timed_out=True)
+        if "pr view 900" in key:
+            return json.dumps(good)
+        return ""
+
+    gw = GitHubGateway("o/r", runner=runner, review_pr_label="ai-review")
+    assert [p.number for p in gw.build_review_world().prs] == [900]
+    assert "skip PR #374" in capsys.readouterr().err
+
+    def throttled(argv, token):
+        if "pr list" in " ".join(argv):
+            return json.dumps([{"number": 374}, {"number": 900}])
+        raise GhUnavailable("rate-limit", "API rate limit exceeded")
+
+    gw2 = GitHubGateway("o/r", runner=throttled, review_pr_label="ai-review")
+    with pytest.raises(GhUnavailable):
+        gw2.build_review_world()
+
+
+def test_has_open_blocker_failsoft_for_api_answers_but_not_for_infra():
+    """"False" is not a neutral degradation here — it means "not blocked", which
+    DISPATCHES the issue. Fine when the API genuinely answered (no dependencies
+    endpoint); wrong when it answered nothing at all."""
+    gw_ok = GitHubGateway("o/r", runner=_raising_runner(ValueError("odd shape")))
+    assert gw_ok.has_open_blocker(5) is False
+    gw_infra = GitHubGateway("o/r", runner=_raising_runner(GhUnavailable("rate-limit", "x")))
+    with pytest.raises(GhUnavailable):
+        gw_infra.has_open_blocker(5)

@@ -6,6 +6,7 @@ from issue_agent.domain.outcome import (
     AgentResult,
     Adjudication,
     AuthorFollowup,
+    ExitReason,
     ImplementFollowup,
     address_review_actions,
     adjudication,
@@ -158,3 +159,58 @@ def test_review_escalate_comments_and_flags():
     s = review_submission("ESCALATE", "still broken", 3, 4)
     assert s.event == "COMMENT" and s.escalate is True
     assert "rounds of requested changes" in s.body
+
+
+# ── infra death: the session never happened, so no leg may act on it ──────────
+def _killed(**kw):
+    return AgentResult(is_error=True, exit_reason=ExitReason.KILLED_EXTERNALLY, **kw)
+
+
+def test_resolve_infra_death_leaves_issue_working_for_the_reaper():
+    # #65: the old path relabelled ai-working→ai-ready on a forcefully killed
+    # session, racing an operator's manual ai-blocked. Emitting NOTHING keeps the
+    # issue ai-working; the reaper requeues it once on the next idle tick.
+    assert resolve_actions(5, _killed(), pr=None) == []
+
+
+def test_resolve_infra_death_still_labels_a_pr_that_actually_opened():
+    # Ground truth outranks cause-of-death: how the session ended says nothing
+    # about whether a PR exists, and a real PR must never be stranded unlabelled.
+    acts = resolve_actions(5, _killed(), pr=100)
+    assert Relabel(Target.ISSUE, 5, Label.AI_WORKING, Label.AI_PR_OPEN) in acts
+    assert Relabel(Target.PR, 100, None, Label.AI_PR_OPEN) in acts
+
+
+def test_resume_infra_death_does_not_consume_the_human_reply():
+    # Contrast test_resume_error_stays_blocked: an ordinary error moves to
+    # ai-blocked, a killed session moves nothing at all.
+    assert resume_actions(5, _killed(), pr=None) == []
+
+
+def test_transport_death_is_also_an_infra_death_on_the_issue_legs():
+    r = AgentResult(is_error=True, exit_reason=ExitReason.TRANSPORT_DEATH)
+    assert resolve_actions(5, r, pr=None) == []
+    assert resume_actions(5, r, pr=None) == []
+
+
+def test_address_review_infra_death_clears_working_without_burning_a_retry():
+    # #58: six SIGKILLs on one PR walked the breaker to needs-human-review on work
+    # that never ran. The PR must stop looking busy, but the counter must not move.
+    out = address_review_actions(100, _killed())
+    assert out.bump_retry is False
+    assert out.actions == [Relabel(Target.PR, 100, Label.AI_WORKING, None)]
+
+
+def test_address_review_timeout_still_burns_a_retry():
+    # The boundary of the exemption: a hang IS an attempt (see infra_death).
+    out = address_review_actions(
+        100, AgentResult(is_error=True, status="timeout", exit_reason=ExitReason.IDLE_TIMEOUT)
+    )
+    assert out.bump_retry is True
+
+
+def test_fix_ci_infra_death_clears_working_only():
+    # Never add ai-blocked for a session that was killed rather than stuck —
+    # ai-blocked would stop re-dispatch and strand the PR on a human.
+    acts = fix_ci_actions(100, _killed(status="blocked"))
+    assert acts == [Relabel(Target.PR, 100, Label.AI_WORKING, None)]

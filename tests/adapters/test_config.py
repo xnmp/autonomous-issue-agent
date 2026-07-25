@@ -90,9 +90,29 @@ def test_edit_check_cmd():
 
 
 def test_retry_caps():
-    c = from_env({"REPO": "x", "MAX_CI_RETRIES": "5", "MAX_REVIEW_RETRIES": "2"})
+    c = from_env({"REPO": "x", "MAX_CI_RETRIES": "5", "MAX_REVIEW_RETRIES": "2",
+                  "MAX_RESOLVE_RETRIES": "4"})
     assert c.max_ci_retries == 5
     assert c.max_review_retries == 2
+    assert c.max_resolve_retries == 4
+
+
+def test_validate_fails_loud_on_empty_repo():
+    # Silent-default class (#50): an empty REPO must die at startup with a
+    # pointed message, not surface as an opaque gh error on the first poll.
+    import pytest
+
+    with pytest.raises(ValueError, match="REPO"):
+        from_env({}).validate()
+
+
+def test_describe_reports_effective_values_and_no_secrets():
+    c = from_env({"REPO": "o/r", "MAX_RESOLVE_RETRIES": "2",
+                  "FIX_BOT_TOKEN": "sekret-token"})
+    d = c.describe()
+    assert "repo=o/r" in d
+    assert "resolve=2" in d
+    assert "sekret" not in d
 
 
 def test_grouped_config_preserves_flat_env_mapping():
@@ -132,6 +152,26 @@ def test_grouped_config_preserves_flat_env_mapping():
     assert c.jira_runtime.project_key == "ABC"
     assert c.codex_runtime.binary == "codex-dev"
     assert c.codex_runtime.model == "gpt-next"
+    # Both session caps reach the codex runtime through the same grouped config the
+    # Claude runner reads off HarnessConfig — one knob, both runtimes.
+    assert c.codex_runtime.idle_timeout == c.agent_idle_timeout
+    assert c.codex_runtime.max_runtime == c.agent_max_runtime
+
+
+def test_agent_max_runtime_defaults_and_parses():
+    assert from_env({"REPO": "x"}).agent_max_runtime == 2700.0
+    assert from_env({"REPO": "x", "AGENT_MAX_RUNTIME_SECONDS": "600"}).agent_max_runtime == 600.0
+
+
+def test_agent_max_runtime_zero_disables_the_cap():
+    # 0 is the documented opt-out (a repo whose test suite alone outruns any sane
+    # ceiling). It must parse as a valid config, not a rejected one — the runner
+    # wiring turns 0 into "no cap".
+    c = from_env({"REPO": "x", "AGENT_MAX_RUNTIME_SECONDS": "0"})
+    assert c.agent_max_runtime == 0.0
+    assert c.validation_errors() == ()
+    # And an empty value falls back the same way rather than raising.
+    assert from_env({"REPO": "x", "AGENT_MAX_RUNTIME_SECONDS": ""}).agent_max_runtime == 0.0
 
 
 def test_valid_defaults_have_no_validation_errors():
@@ -187,6 +227,7 @@ def test_validation_rejects_invalid_runtime_settings():
         "REPO": "x",
         "FIXER_RUNTIME": "python",
         "AGENT_IDLE_TIMEOUT_SECONDS": "-1",
+        "AGENT_MAX_RUNTIME_SECONDS": "-1",
         "CODEX_TRANSPORT_RETRIES": "-1",
         "CODEX_BACKOFF_BASE_SECONDS": "0",
     })
@@ -194,6 +235,7 @@ def test_validation_rejects_invalid_runtime_settings():
     assert c.validation_errors() == (
         "FIXER_RUNTIME must be 'claude' or 'codex'",
         "AGENT_IDLE_TIMEOUT_SECONDS must be >= 0",
+        "AGENT_MAX_RUNTIME_SECONDS must be >= 0",
         "CODEX_TRANSPORT_RETRIES must be >= 0",
         "CODEX_BACKOFF_BASE_SECONDS must be > 0",
     )

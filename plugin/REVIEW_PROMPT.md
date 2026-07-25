@@ -46,6 +46,27 @@ not hide it. Do NOT flag legitimate, justified suppression: generated/vendored c
 glue — provided it is justified in the PR description / at the site and scoped
 narrowly.
 
+**Visual evidence: verify the IMAGES, not the filenames.** When the PR commits
+screenshots under `evidence/` (or its `## Acceptance Criteria` names a visual
+outcome), go criterion by criterion: for EACH AC checklist item, find the image the
+body references for it and OPEN it — you are multimodal, so actually read the image
+(the committed blob is in the PR's Files-changed tab and at its `evidence/…` path in
+the checked-out branch). Then judge whether that image SHOWS that criterion met: the
+right screen/state, the asserted text or value visible and legible, in the app as it
+actually runs. REQUEST_CHANGES — quoting the AC item verbatim — if any of these holds
+for any item:
+- no screenshot is referenced for that AC item (an unreferenced pile of images does
+  not tell you which shot proves which criterion);
+- the referenced image is missing, unopenable/corrupt, blank, or illegible at the
+  point that matters;
+- the image does not demonstrate that criterion: wrong page or state, the asserted
+  text absent or different from the AC, an error/placeholder/loading/logged-out
+  state, an obvious mockup or hand-edited render, a screenshot of source code, or a
+  shot that merely proves the app started.
+"A file exists" and "the PR says it shows X" are NOT proof of work — the whole point
+of this dimension is that you looked. Never approve a visual criterion on the
+strength of a filename, a caption, or the PR's prose claim about the image.
+
 ## Dimension 9 — Maintainability (VERY IMPORTANT — weight this heavily)
 Long-term reason-about-ability is the top design concern. Judge whether the CHANGED
 code will stay easy to understand, test, and change. Reason from that principle —

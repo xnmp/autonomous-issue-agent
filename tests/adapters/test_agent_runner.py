@@ -12,6 +12,7 @@ from issue_agent.adapters.agent_runner import (
     result_to_agent_result,
 )
 from issue_agent.domain.agent_task import AgentTask, McpServer, SubagentDef
+from issue_agent.domain.outcome import ExitReason
 
 
 def test_default_permission_mode_is_bypass():
@@ -123,6 +124,8 @@ class FakeResult:
     result: str = ""
     total_cost_usd: float = 0.0
     session_id: str = ""
+    subtype: str = ""
+    usage: object = None
 
 
 def test_result_reads_structured_output():
@@ -155,6 +158,58 @@ def test_result_falls_back_to_result_text_when_no_structured():
     msg = FakeResult(structured_output=None, result="free text")
     r = result_to_agent_result(msg)
     assert r.summary == "free text"
+
+
+# ── exit_reason: WHY the session ended, read off the envelope ─────────────────
+def test_successful_envelope_classifies_ok():
+    r = result_to_agent_result(
+        FakeResult(is_error=False, subtype="success",
+                   structured_output={"status": "pr_opened"})
+    )
+    assert r.exit_reason is ExitReason.OK
+
+
+def test_budget_subtype_is_distinguished_from_a_plain_agent_error():
+    # A spend ceiling is an operator-knob outcome, not a failure of the agent's
+    # reasoning — the ledger and any future policy must be able to tell them apart.
+    budget = result_to_agent_result(
+        FakeResult(is_error=True, subtype="error_max_budget_usd")
+    )
+    turns = result_to_agent_result(FakeResult(is_error=True, subtype="error_max_turns"))
+    assert budget.exit_reason is ExitReason.BUDGET_EXHAUSTED
+    assert turns.exit_reason is ExitReason.AGENT_ERROR
+
+
+def test_structured_error_status_classifies_as_agent_error():
+    # is_error false on the envelope but status=="error" inside it still counts as
+    # the agent reporting failure (the existing is_error coercion).
+    r = result_to_agent_result(
+        FakeResult(is_error=False, structured_output={"status": "error"})
+    )
+    assert r.is_error is True
+    assert r.exit_reason is ExitReason.AGENT_ERROR
+
+
+def test_non_error_envelope_without_subtype_is_ok():
+    # An SDK build that omits `subtype` must not be classified as a failure.
+    r = result_to_agent_result(FakeResult(is_error=False, structured_output={"status": "blocked"}))
+    assert r.exit_reason is ExitReason.OK
+
+
+def test_usage_block_is_captured_verbatim_for_the_cost_ledger():
+    # cost_usd is 0.00 on a subscription plan, so tokens (incl. the cache counters
+    # nothing else exposes) are the only cost substrate that always exists.
+    usage = {"input_tokens": 12, "output_tokens": 3,
+             "cache_read_input_tokens": 900, "cache_creation_input_tokens": 40}
+    r = result_to_agent_result(
+        FakeResult(is_error=False, subtype="success", total_cost_usd=0.0, usage=usage)
+    )
+    assert r.usage == usage
+
+
+def test_non_dict_usage_is_dropped_rather_than_stored():
+    r = result_to_agent_result(FakeResult(is_error=False, usage="not-a-dict"))
+    assert r.usage is None
 
 
 # ── AgentRunner.run stream handling ─────────────────────────────────────────────
@@ -296,7 +351,18 @@ def test_idle_timeout_trips_on_hang(monkeypatch):
         AgentRunner(log=logged.append, idle_timeout=0.2).run(AgentTask(prompt="x"))
     )
     assert r.is_error and r.status == "timeout"
+    assert r.exit_reason is ExitReason.IDLE_TIMEOUT
     assert any("IDLE" in m for m in logged)
+
+
+def test_clean_end_without_result_classifies_as_no_result(monkeypatch):
+    """The result-delivery drop: the stream ends via StopAsyncIteration having never
+    yielded a ResultMessage. It is an error, but a DIFFERENT one from the agent
+    reporting failure — the taxonomy has to say which."""
+    _install_fake_sdk(monkeypatch, [])  # ends cleanly, no result, no raise
+    r = asyncio.run(AgentRunner().run(AgentTask(prompt="x")))
+    assert r.is_error is True
+    assert r.exit_reason is ExitReason.NO_RESULT
 
 
 def test_idle_watchdog_trips_on_wall_clock_not_monotonic(monkeypatch):
@@ -389,6 +455,116 @@ def test_gap_longer_than_poll_slice_still_delivers_result(monkeypatch):
     assert r.is_error is False and r.status == "pr_opened"
     assert not any("IDLE" in m for m in logged)
     assert not any("NO ResultMessage" in m for m in logged)
+
+
+# ── total-runtime (wall) cap: the bound the idle watchdog structurally can't give ─
+def _jumping_wall(ticks):
+    """Injected wall clock that walks `ticks`, then holds the last value. Lets a
+    test simulate hours of elapsed time without waiting for them."""
+    it = iter(ticks)
+    held = {"t": ticks[0]}
+
+    def wall():
+        try:
+            held["t"] = next(it)
+        except StopIteration:
+            pass
+        return held["t"]
+
+    return wall
+
+
+def test_wall_cap_trips_when_idle_timeout_is_disabled(monkeypatch):
+    """With only the wall cap armed there is no idle watchdog to borrow the slice
+    loop from — the runner must still observe in slices rather than falling through
+    to an unbounded `await __anext__()`, or the cap would silently never fire."""
+    _install_hanging_sdk(monkeypatch, [], hang_after=True)
+    # started_at=1000, first between-receive check 1000 (0s elapsed), last_event
+    # 1000, then the slice expires with the clock 3600s later (a suspend).
+    wall = _jumping_wall([1000.0, 1000.0, 1000.0, 4600.0])
+    logged: list[str] = []
+
+    r = asyncio.run(
+        AgentRunner(
+            log=logged.append, idle_timeout=None, max_runtime=900.0,
+            poll_slice=0.05, wall_clock=wall,
+        ).run(AgentTask(prompt="x"))
+    )
+
+    assert r.is_error and r.status == "timeout"
+    assert r.exit_reason is ExitReason.WALL_TIMEOUT
+    assert "900" in r.summary
+    assert any("WALL" in m for m in logged)
+
+
+def test_wall_cap_trips_on_a_limping_stream_the_idle_watchdog_never_catches(monkeypatch):
+    """FAILURE-MODES #60. A post-suspend stream keeps delivering events, so every
+    idle window is reset and the idle watchdog is structurally blind to it — the run
+    burned 58 minutes on 3.6s of CPU. Here events arrive faster than a poll slice
+    (so no slice ever expires) while the wall clock advances past the cap: only a
+    between-receives elapsed check can stop this."""
+    async def fake_query(prompt, options):
+        while True:
+            yield object()  # always ready → asyncio.wait returns before any timeout
+
+    import sys
+    import types
+    fake = types.ModuleType("claude_agent_sdk")
+    fake.ClaudeAgentOptions = lambda **kw: object()
+    fake.ResultMessage = _ResultMessage
+    fake.query = fake_query
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake)
+
+    wall = _jumping_wall([1000.0, 1000.0, 1000.0, 4600.0])
+    logged: list[str] = []
+
+    r = asyncio.run(
+        AgentRunner(
+            log=logged.append, idle_timeout=900.0, max_runtime=900.0, wall_clock=wall
+        ).run(AgentTask(prompt="x"))
+    )
+
+    assert r.exit_reason is ExitReason.WALL_TIMEOUT
+    assert not any("IDLE" in m for m in logged)  # the idle watchdog never saw it
+
+
+def test_wall_cap_honours_a_result_already_captured(monkeypatch):
+    """The envelope always wins over a watchdog. If the agent delivered its verdict
+    and only THEN the cap expires, the run must return that verdict — aborting it
+    into a timeout would discard finished, paid-for work."""
+    msg = _ResultMessage(
+        is_error=False, subtype="success",
+        structured_output={"status": "pr_opened", "summary": "opened"}, session_id="s1",
+    )
+    _install_fake_sdk(monkeypatch, [msg])
+    wall = _jumping_wall([1000.0, 1000.0, 1000.0, 4600.0])
+
+    r = asyncio.run(
+        AgentRunner(max_runtime=900.0, wall_clock=wall).run(AgentTask(prompt="x"))
+    )
+
+    assert r.status == "pr_opened"
+    assert r.is_error is False
+    assert r.exit_reason is ExitReason.OK
+
+
+def test_healthy_short_run_is_not_capped(monkeypatch):
+    """False-positive guard: a run well inside the cap completes normally, and the
+    cap leaves no trace on the result."""
+    msg = _ResultMessage(
+        is_error=False, subtype="success", structured_output={"status": "pr_opened"}
+    )
+    _install_fake_sdk(monkeypatch, [msg])
+    logged: list[str] = []
+
+    r = asyncio.run(
+        AgentRunner(log=logged.append, idle_timeout=900.0, max_runtime=2700.0).run(
+            AgentTask(prompt="x")
+        )
+    )
+
+    assert r.status == "pr_opened" and r.is_error is False
+    assert not any("WALL" in m or "IDLE" in m for m in logged)
 
 
 # ── debug tracing: make a mid-session "Stream closed" wedge diagnosable ────────

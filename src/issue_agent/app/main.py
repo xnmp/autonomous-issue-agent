@@ -124,6 +124,18 @@ def build_role(role: str, env: dict | None = None):
 
     target_dir = cfg.target_dir or os.getcwd()
 
+    # Resolved-config print (lean P5.1): every daemon start states what it
+    # ACTUALLY loaded — the only structural defense against the silent-default
+    # class (#16/#49/#50/#78). TEST_CMD/ALLOW_UNTESTED are env facts the gate
+    # reads directly, so they're reported here alongside the config.
+    for line in cfg.describe().splitlines():
+        sys.stderr.write(f"{role}: config: {line}\n")
+    sys.stderr.write(
+        f"{role}: config: TEST_CMD={'set' if env.get('TEST_CMD') else 'EMPTY'} "
+        f"ALLOW_UNTESTED={env.get('ALLOW_UNTESTED', '0') or '0'}\n"
+    )
+    sys.stderr.flush()
+
     # The governor hook needs a GateContext built from the agent's worktree cwd.
     def build_ctx(cwd: str):
         return build_gate_context(
@@ -152,7 +164,14 @@ def build_role(role: str, env: dict | None = None):
         build_ctx, edit_check_cmd=cfg.edit_check_cmd or None, log=_commit_log, debug=debug
     )
     _idle = cfg.agent_idle_timeout if cfg.agent_idle_timeout > 0 else None
-    runner = AgentRunner(hooks=hooks, log=_commit_log, debug=debug, idle_timeout=_idle)
+    # Two independent caps: silence (idle) and total elapsed (wall). The wall cap is
+    # what bounds a limping post-suspend stream, which never goes silent enough to
+    # trip the idle watchdog. 0 on either knob disables that one only.
+    _wall = cfg.agent_max_runtime if cfg.agent_max_runtime > 0 else None
+    runner = AgentRunner(
+        hooks=hooks, log=_commit_log, debug=debug,
+        idle_timeout=_idle, max_runtime=_wall,
+    )
     worktrees = Worktrees(target_dir, cfg.worktree_root, cfg.base_branch)
 
     if role == "fix":

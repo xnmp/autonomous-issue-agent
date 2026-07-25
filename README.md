@@ -36,6 +36,12 @@ whole first-run flow: creates `config/shared.env` interactively if absent, detec
 review + steward daemons. `issue-agent doctor` checks prerequisites; `issue-agent
 status` shows what's running.
 
+**Foreground is the dev / first-run mode.** Once it's proven your config works,
+run it for real — supervised, auto-restarting across a suspend/OOM-kill/reboot —
+with `issue-agent install-service` (systemd on Linux, launchd on macOS). See
+[HARNESS.md "Running for real"](HARNESS.md#running-for-real-systemdlaunchd-is-the-documented-default)
+for details.
+
 ### What you must supply — the reviewer runs as a GitHub App
 
 The fixer acts as **your** `gh auth` login. The **reviewer + steward act as a GitHub

@@ -20,6 +20,7 @@ bucket) so the mapping is mechanical and auditable.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -67,6 +68,129 @@ def _warn_if_list_truncated(query: str, count: int) -> None:
             "results may be TRUNCATED; oldest items silently dropped this poll. "
             "Raise _LIST_LIMIT or add pagination.\n"
         )
+
+
+# ── infra-failure detection (V10) ─────────────────────────────────────────────
+class GhUnavailable(RuntimeError):
+    """GitHub could not ANSWER — the `gh` call failed for infrastructure reasons
+    (rate limit, network, 5xx), not because the world is empty.
+
+    The lesson: `_subprocess_runner` used to map every failure to `""`, so a
+    rate-limited poll observed an EMPTY world — zero PRs, zero issues — and the
+    domain, being honest about what it saw, acted on it (nothing to review,
+    nothing in flight, cleanup fair game). "Nothing to do" and "I could not
+    look" must never be the same value. Raising is the entire fix: a world built
+    on a failed read is a lie, so the daemon skips the tick and the poll loop —
+    which IS the retry — looks again next interval. No backoff lives here.
+
+    `kind` is one of "rate-limit" | "network" | "server"; `timed_out` marks the
+    one sub-case that is per-CALL rather than systemic (the `_GH_TIMEOUT_S` kill
+    of a single hung `gh pr view`), which `_safe_get_pr` still isolates per PR.
+    """
+
+    _HEADLINES = {
+        "rate-limit": "rate-limited",
+        "network": "unreachable (network)",
+        "server": "server error (5xx)",
+    }
+
+    def __init__(
+        self,
+        kind: str,
+        detail: str,
+        argv: list[str] | None = None,
+        timed_out: bool = False,
+    ):
+        self.kind = kind
+        self.detail = _one_line(detail)
+        self.argv = tuple(argv or ())
+        self.timed_out = timed_out
+        super().__init__(f"GitHub {self.headline}: {self.detail}")
+
+    @property
+    def headline(self) -> str:
+        """Operator-facing phrase for the kind (the loud loop line reads it)."""
+        return self._HEADLINES.get(self.kind, self.kind)
+
+
+def _one_line(text: str, limit: int = 200) -> str:
+    """Collapse a multi-line gh error into ONE bounded line. Daemon logs are
+    scanned by eye and grepped by line; a 40-line curl dump buries the signal."""
+    flat = " ".join((text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
+# Lower-cased substrings that mark a failed `gh` call as INFRA rather than as an
+# ordinary API answer. Pattern-matching is deliberate — a non-zero exit is ALSO
+# how gh reports "PR not found", "label does not exist", and a 422 self-approval,
+# and callers depend on those still degrading to "" (see `_safe_get_pr`,
+# `build_review_world`'s missing-label tolerance, `submit_review`'s False). A
+# blanket raise would trade a silent-empty-world bug for a wedged daemon.
+_RATE_LIMIT_PATTERNS = (
+    "rate limit",        # "API rate limit exceeded for user ID …" (arrives as HTTP 403)
+    "rate-limit",
+    "ratelimit",         # header echo, e.g. "x-ratelimit-remaining: 0"
+    "secondary rate",    # secondary/abuse limits (short-lived but real)
+    "abuse detection",
+    "http 429",
+    "too many requests",
+    "retry-after",
+)
+# NB: a bare HTTP 403 is NOT infra — "Resource not accessible by integration"
+# (App token missing a scope) is a permanent, benign permission answer that the
+# reviewer already tolerates. Only 403s carrying rate-limit text match above.
+
+_NETWORK_PATTERNS = (
+    "error connecting",                     # gh: "error connecting to api.github.com"
+    # DNS — the "host" is load-bearing: gh's GraphQL 404 reads "Could not resolve
+    # to a PullRequest with the number of 999", a perfectly good ANSWER that a
+    # bare "could not resolve" would misfile as an outage and skip ticks over.
+    "could not resolve host",
+    "could not resolve hostname",
+    "no such host",
+    "temporary failure in name resolution",
+    "connection refused",
+    "connection reset",
+    "network is unreachable",
+    "dial tcp",
+    "tls handshake",
+    "proxyconnect",                         # broken/absent outbound proxy (see CLAUDE.md)
+    "i/o timeout",
+    "timed out",
+    "timeout",
+)
+
+_SERVER_PATTERNS = (
+    "bad gateway",
+    "service unavailable",
+    "gateway timeout",
+    "gateway time-out",
+    "internal server error",
+)
+# Match the STATUS TOKEN only next to an explicit "HTTP": gh prints "HTTP 503
+# (https://api.github.com/…)". A bare "502" is not enough — it could be an issue
+# number in "issue #502 not found", and misreading that as an outage would skip
+# ticks forever.
+_SERVER_RE = re.compile(r"http[/ ]?\s*5\d\d")
+
+
+def classify_gh_failure(detail: str) -> str | None:
+    """Map a failed `gh` invocation's stderr/stdout to an infra kind
+    ("rate-limit" | "network" | "server"), or None when the failure is an
+    ordinary API answer the caller should keep treating as "" (fail-soft).
+
+    Order matters: rate-limit → server → network. "504 Gateway Timeout" contains
+    "timeout", so the 5xx test must run before the network test or a GitHub
+    outage would be misfiled as a local network fault (same tick-skip either way,
+    but the operator reads the kind to decide whether to fix their box)."""
+    text = (detail or "").lower()
+    if any(p in text for p in _RATE_LIMIT_PATTERNS):
+        return "rate-limit"
+    if _SERVER_RE.search(text) or any(p in text for p in _SERVER_PATTERNS):
+        return "server"
+    if any(p in text for p in _NETWORK_PATTERNS):
+        return "network"
+    return None
 
 
 # ── pure parsers ──────────────────────────────────────────────────────────────
@@ -331,6 +455,12 @@ class GitHubGateway:
                  "--jq", "[.[] | .state]"]
             ) or []
             return any(str(s).lower() == "open" for s in blockers)  # type: ignore[union-attr]
+        except GhUnavailable:
+            # Fail-soft covers a genuine API ANSWER (endpoint absent, 404, odd
+            # shape). An infra failure answered nothing, and "False" here is not
+            # neutral — it says "not blocked", which DISPATCHES an issue that may
+            # well be blocked. Propagate: skipping the tick is the cheap mistake.
+            raise
         except Exception:
             return False
 
@@ -362,16 +492,32 @@ class GitHubGateway:
         generator in build_*_world, killing the entire poll pass so EVERY later PR
         (sorted after it) went unseen — a just-merged PR whose mergeable field hung
         stranded newer PRs from review. Here a failed PR drops to None (logged) and
-        the poll re-derives it next tick."""
+        the poll re-derives it next tick.
+
+        The ONE thing it must not isolate is a systemic `GhUnavailable`: a rate
+        limit or a 5xx fails every subsequent PR fetch identically, so per-item
+        degradation would silently rebuild the exact empty world V10 is about.
+        Those propagate and the tick is skipped. A `timed_out` GhUnavailable is
+        the opposite — it is this ONE PR wedging the socket (the incident above,
+        which recurs every poll while the PR exists), so it stays isolated."""
         try:
             return self.get_pr(number, mergeability=mergeability)
-        except Exception as exc:  # noqa: BLE001 — deliberately broad: one PR ≠ whole pass
-            import sys
-            sys.stderr.write(
-                f"skip PR #{number} this poll ({type(exc).__name__}: {str(exc)[:120]}) "
-                "— re-derived next tick\n"
-            )
+        except GhUnavailable as exc:
+            if not exc.timed_out:
+                raise
+            self._skip_pr(number, exc)
             return None
+        except Exception as exc:  # noqa: BLE001 — deliberately broad: one PR ≠ whole pass
+            self._skip_pr(number, exc)
+            return None
+
+    @staticmethod
+    def _skip_pr(number: int, exc: BaseException) -> None:
+        import sys
+        sys.stderr.write(
+            f"skip PR #{number} this poll ({type(exc).__name__}: {str(exc)[:120]}) "
+            "— re-derived next tick\n"
+        )
 
     def list_pr_numbers(self, label: str, state: str = "open") -> list[int]:
         data = self._gh_json(
@@ -392,7 +538,13 @@ class GitHubGateway:
     def build_world(self) -> WorldState:
         """Fetch the slice the daemons need: ai-ready/ai-working/ai-blocked issues
         and ai-pr-open PRs (open + recently merged/closed for cleanup). Composed
-        from the typed reads above so it's exercised by the gateway tests."""
+        from the typed reads above so it's exercised by the gateway tests.
+
+        `GhUnavailable` PROPAGATES out of here (all four world builders): a
+        partially-read world is not a world, and the caller (`Daemon.tick`) is
+        the only layer that can decide "skip this pass". Note the list calls run
+        FIRST, so a throttled poll aborts before any per-item fetch — the empty
+        world of V10 is unreachable rather than merely unlikely."""
         issue_numbers: set[int] = set()
         ready_numbers: set[int] = set()
         for lbl in ("ai-ready", "ai-working", "ai-blocked"):
@@ -564,7 +716,15 @@ def _subprocess_runner(argv: list[str], token: str | None) -> str:
     reviewer "did nothing": the agent ran, state advanced, no review appeared, no
     message. So on non-zero exit we now also write gh's stderr (and the command) to
     OUR stderr. This stays fail-soft (still returns "" — callers that care, e.g.
-    submit_review, check the empty result) while making the failure visible."""
+    submit_review, check the empty result) while making the failure visible.
+
+    AND (V10) fail-soft is wrong for INFRA failures. A rate limit, a dead network
+    or a GitHub 5xx is not an answer about the world; returning "" for those made
+    a throttled tick see zero issues and zero PRs — indistinguishable from a calm
+    repo, exactly when scale makes throttling likely. Those (and only those,
+    matched by `classify_gh_failure`) now raise `GhUnavailable`; every other
+    non-zero exit keeps returning "" so "PR not found" / "no such label" / 422
+    still degrade the way their callers expect."""
     import os
     import sys
 
@@ -582,12 +742,21 @@ def _subprocess_runner(argv: list[str], token: str | None) -> str:
         res = subprocess.run(
             argv, capture_output=True, text=True, env=env, timeout=_GH_TIMEOUT_S
         )
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as exc:
+        # A killed call produced NO data — the one thing it must not look like is
+        # a successful read of an empty result. `timed_out=True` marks it as the
+        # per-CALL infra case (this PR hangs) rather than a systemic one, which is
+        # what lets `_safe_get_pr` keep isolating a single wedged `gh pr view`.
         sys.stderr.write(
             f"gh timed out (>{_GH_TIMEOUT_S:.0f}s): {' '.join(argv)}\n"
-            "  killed; treating as empty result (poll re-derives next tick)\n"
+            "  killed; treating as INFRA failure (poll re-derives next tick)\n"
         )
-        return ""
+        raise GhUnavailable(
+            "network",
+            f"gh timed out after {_GH_TIMEOUT_S:.0f}s: {' '.join(argv[:4])}",
+            argv=argv,
+            timed_out=True,
+        ) from exc
     if res.returncode != 0:
         # redact a token if one ever appears in argv (it shouldn't — gh reads GH_TOKEN
         # from env, not argv — but be defensive about logging command lines).
@@ -608,5 +777,13 @@ def _subprocess_runner(argv: list[str], token: str | None) -> str:
         debug_on = os.environ.get("ISSUE_AGENT_DEBUG", "0") not in ("", "0", "false", "False")
         if not benign_checks_rollup or debug_on:
             sys.stderr.write(f"gh failed (exit {res.returncode}): {printable}\n  {detail}\n")
+        # Infra? Then this is NOT an answer — raise so the caller can refuse to
+        # act on a world it never actually observed. The stderr line above is
+        # kept for the raise path too: some callers legitimately swallow
+        # GhUnavailable (update_branch, add_blocked_by), and a swallowed infra
+        # failure with no trace on stderr is the very bug this section fixes.
+        kind = classify_gh_failure(detail)
+        if kind is not None:
+            raise GhUnavailable(kind, detail, argv=argv)
         return ""
     return res.stdout

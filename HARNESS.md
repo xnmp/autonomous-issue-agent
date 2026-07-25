@@ -40,17 +40,23 @@ tested engine `make point-at` uses.
 make install                     # uv sync (editable) + ~/.local/bin/issue-agent shim
 
 cd /path/to/target-repo          # a normal working copy of the target repo
-issue-agent start                # that's it — see below for what it does
+issue-agent start                # DEV / FIRST RUN — foreground, Ctrl-C to stop
 
 issue-agent ready 42             # label issue #42 ai-ready → the fixer picks it up
 issue-agent status               # which watchers are running + recent log tails
-issue-agent stop                 # stop this repo's watchers
-issue-agent install-service      # optional: launchd (macOS) / systemd (Linux) units
+issue-agent stop                 # stop this repo's foreground watchers
+
+# Once `start` has proven your config works, run it FOR REAL under systemd/
+# launchd — see "Running for real" below:
+issue-agent install-service      # installs + enables + starts the OS service units
 ```
 
-**`issue-agent start` is the whole first-run flow**, in the **foreground**
-(Ctrl-C stops all watchers; logs tail live to the terminal, and to
-`/tmp/issue-agent-<role>-<name>.log`):
+**`issue-agent start` is the dev / first-run flow** — it runs in the
+**foreground** (Ctrl-C stops all watchers; logs tail live to the terminal, and
+to `$LOG_DIR/<role>-<name>.log`, default
+`${XDG_STATE_HOME:-$HOME/.local/state}/issue-agent/logs/`, override with
+`LOG_DIR`). Foreground has **no process supervisor** — see "Running for real"
+below for the documented default for unattended operation:
 
 1. **Auto-`init`** — if `config/shared.env` (global identity/secrets — App key,
    Jira, gateway) doesn't exist yet, it runs the interactive `init` first. So a
@@ -81,6 +87,58 @@ The overlay is written once and **reused** thereafter (edit by hand, or
 
 The lower-level `make point-at REPO=<name>` entry (below) still works unchanged —
 the CLI is a thin wrapper over it.
+
+### Running for real: systemd/launchd is the documented default
+
+Foreground `issue-agent start` / `make point-at` is the **dev / first-run
+mode** — good for proving a repo's config (identities, `TEST_CMD`, GitHub
+access) actually works, with logs streaming live where mistakes are visible
+immediately. It has **no process supervisor**: a laptop suspend, an OOM/jetsam
+kill, or just closing the terminal kills the daemons and nothing brings them
+back. That's exactly the class of incident in FAILURE-MODES #58–#62 — Codex
+SIGKILL'd under memory pressure (#58), a machine suspend severing the SDK
+control stream (#59), a review daemon "limping" for 58 minutes after a Mac
+sleep (#60), a reaper that (partially) couldn't reset `ai-working` after an
+external kill (#61), and a transient bad-fd after suspend (#62). Once you've
+confirmed `issue-agent start` works, run it for real instead:
+
+```bash
+issue-agent install-service      # launchd (macOS) / systemd (Linux) user units
+```
+
+This is exactly `bin/install-launchd.sh` / `bin/install-systemd.sh` under the
+hood (`src/issue_agent/app/cli.py:cmd_install_service`), invoked against the
+config `issue-agent start` already composed for this repo. On Linux it fills
+in the `ops/systemd/issue-agent-{fix-watcher,review-watcher,steward}.service`
+templates and installs them to `~/.config/systemd/user/` as
+`issue-agent-<role>-<name>.service`, where `<name>` is derived from
+`TARGET_DIR` — so pointing the harness at several repos and running
+`install-service` in each gives every repo its own independent, non-colliding
+set of units (each with its own config snapshot under
+`~/.config/issue-agent/<name>.env`, `chmod 600`). Every unit ships
+`Restart=always` + `RestartSec=30`: systemd restarts a killed *process* on its
+own, closing the whole suspend/jetsam/process-death class above. It's not a
+full recovery story — an in-flight session's actual work can still be lost —
+but the daemon's own reaper (`reap_actions`) self-heals a stranded
+`ai-working` label on its next tick once the process is back up, instead of an
+issue staying silently stuck until a human notices and relaunches by hand.
+
+Logs go to the **journal**, not a file — tail with:
+```bash
+journalctl --user -u issue-agent-fix-watcher-<name> -f
+systemctl --user status 'issue-agent-*-<name>'
+```
+
+Uninstall: `issue-agent uninstall-service` (equivalently
+`bash bin/install-systemd.sh uninstall [<name>]` — omit `<name>` to remove
+every repo's units at once).
+
+Lower-level equivalent, without the CLI (per `config/repos/<name>.env`):
+```bash
+bash bin/compose-env.sh myapp                              # writes config/.active.env
+AGENT_ENV=config/.active.env bash bin/install-systemd.sh    # Linux
+# or: AGENT_ENV=config/.active.env bash bin/install-launchd.sh   # macOS
+```
 
 ## Quickstart (make / lower level)
 
@@ -123,15 +181,33 @@ make bootstrap TARGET=/path/to/your/repo     # installs .claude/, labels, gitign
 cd /path/to/your/repo && git add .claude INVARIANTS.md docs/adr && git commit -m "chore: install agent harness"
 ```
 
-### 3. Run the watchers (foreground to try; service units to "set and forget")
+### 3. Run the watchers
+
+**For real (documented default):** install as systemd (Linux) / launchd
+(macOS) user services — supervised, auto-restarting, survives a suspend/
+OOM-kill/reboot (see "Running for real" above; closes FAILURE-MODES #58–#62,
+which foreground mode below is exposed to):
+```bash
+make install-systemd    # Linux — reads AGENT_ENV (default config/agent.env)
+make install-launchd    # macOS
+```
+On the multi-repo layout, compose the per-repo config first (this just writes
+the file — it does not launch anything), then point `AGENT_ENV` at it:
+```bash
+bash bin/compose-env.sh myapp                         # writes config/.active.env
+AGENT_ENV=config/.active.env make install-systemd
+```
+Uninstall: `make uninstall-systemd` / `make uninstall-launchd`.
+
+**Dev / first run (foreground, no supervisor):**
 ```bash
 make run-fix            # fix watcher
 make run-review         # review watcher (three-bot mode)
 make run-steward        # steward (slow cadence)
-# or install as background services:
-make install-launchd    # macOS
-make install-systemd    # Linux
 ```
+Ctrl-C stops each. Use this to prove config (`TEST_CMD`, identities, GitHub
+access) works before installing the service units.
+
 Watchers must run with cwd = the target repo (git/worktree ops are cwd-relative).
 Set `TARGET_DIR` in the config and `lib.sh` `cd`s there automatically; the
 launchd/systemd installers read `TARGET_DIR` and set the unit's `WorkingDirectory`.
@@ -188,7 +264,7 @@ and non-circumventable; "Prompt" = honor-system instruction in `AGENT.md`;
 | 26 | Auto-merge only on approve+green by another identity | **Ground truth** | `watcher-lib.sh` `maybe_automerge()` |
 | 27 | Bounded retries (CI, review) → escalate, don't loop | **Counter** | `fix-ci.sh` (`MAX_CI_RETRIES`), `address-review.sh` (`MAX_REVIEW_RETRIES`), reviewer rejections (`REVIEW_MAX_REJECTIONS` — counts REQUEST_CHANGES, not pushes) |
 | 28 | Promotion `dev → prod` stays human | **Out of scope** | nothing here merges past `dev` |
-| 29 | Pushes to an open-PR branch re-verify state (tests, commit log, evidence, test-immutability) | **Hook** (NEW) | `checks/check-push.sh` (governor routes `git-push`); no-op until the branch has an open PR; shares `_pr_common.sh` with `check-pr.sh` |
+| 29 | Pushes to an open-PR branch re-verify state (tests, commit log, evidence, test-immutability) | **Hook** (NEW) | `checks/check-push.sh` (governor routes `git-push`); no-op until the branch has an open PR; shares `_pr_common.sh` with `check-pr.sh`. The `gh pr list` lookup that decides "does this branch have an open PR" fails **CLOSED**: one retry (`GATE_GH_RETRY_SLEEP`, default 2s) then DENY the push if `gh` still errors — a transient `gh`/network blip must never be silently read as "no PR" (that would skip the whole gate on a branch that *does* have one open) |
 | 30 | **New tests must ACTUALLY fail without the implementation** (anti-tautology / anti-wrong-layer) | **Hook** (NEW) | `check-pr.sh` §7c → `prc_check_red_fails`: reverts the impl in the worktree, keeps the new tests, re-runs `TEST_CMD`, requires red. Create-only; `RED_MUST_FAIL=0` disables; fail-open on infra error |
 | 31 | **PR must target `BASE_BRANCH`** (not the repo default branch) | **Hook** (NEW) + prompt | `check-pr.sh` §0b requires an explicit `--base`==`BASE_BRANCH`; `AGENT.md` step 9 tells the agent to pass it. Without `--base`, `gh pr create` defaults to the repo default (often `main`), routing the PR through the wrong branch's CI and breaking auto-merge |
 
@@ -301,7 +377,12 @@ These are deliberate, tested choices — see commit messages and code comments.
 13. **Push gate (`check-push.sh`).** The governor routes `git push` to a checker
     that re-runs the state-derived gate when the branch has an open PR (closes the
     "address-review pushes were never re-checked" hole). Shares `_pr_common.sh` with
-    `check-pr.sh` so the two can't drift.
+    `check-pr.sh` so the two can't drift. Its own precondition check — "does this
+    branch have an open PR" via `gh pr list` — fails **CLOSED**, not open: a `gh`
+    error is retried once (`GATE_GH_RETRY_SLEEP`, default 2s) and then DENIES the
+    push. Earlier this treated a `gh` error the same as "no open PR" (allow) —
+    one flaky `gh` call (proxy hiccup, expired token, rate limit) silently
+    bypassed the entire push gate on a branch that *did* have an open PR.
 14. **`TARGET_DIR` cwd.** Watchers do cwd-relative git/worktree ops, so they must run
     *inside* the target repo. `lib.sh` `cd`s to `TARGET_DIR`; the launchd/systemd
     installers also set the unit `WorkingDirectory` from it. Without it, worktrees

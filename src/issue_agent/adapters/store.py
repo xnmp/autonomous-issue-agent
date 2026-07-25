@@ -105,6 +105,12 @@ class Store:
     def set_ci_retries(self, issue: int, n: int) -> None:
         self._write(self.issue_path(issue, "ci-retries"), str(n))
 
+    def get_resolve_retries(self, issue: int) -> int:
+        return self._read_int(self.issue_path(issue, "resolve-retries"))
+
+    def set_resolve_retries(self, issue: int, n: int) -> None:
+        self._write(self.issue_path(issue, "resolve-retries"), str(n))
+
     def get_rebase_retries(self, issue: int) -> int:
         return self._read_int(self.issue_path(issue, "rebase-retries"))
 
@@ -181,7 +187,8 @@ class Store:
     # ── cleanup (mirror cleanup.sh's rm -f set) ──
     def clear_issue(self, issue: int) -> None:
         for suffix in ("session", "ci-retries", "resumes", "resumed-at",
-                       "automerge", "review-retries", "phase", "jira", "jira-phase"):
+                       "automerge", "review-retries", "resolve-retries",
+                       "rebase-retries", "phase", "jira", "jira-phase"):
             self._remove(self.issue_path(issue, suffix))
 
     def clear_pr_review(self, pr: int) -> None:

@@ -132,12 +132,23 @@ def test_clear_issue_removes_all():
     s, _ = _store()
     s.save_session(5, "x")
     s.set_ci_retries(5, 2)
+    s.set_resolve_retries(5, 2)
+    s.set_rebase_retries(5, 1)
     s.set_resumed_at(5, "t")
     s.set_phase(5, "authored")
     s.clear_issue(5)
     assert not s.has_session(5)
     assert s.get_ci_retries(5) == 0
+    assert s.get_resolve_retries(5) == 0  # resolve breaker resets with the issue
+    assert s.get_rebase_retries(5) == 0
     assert s.get_phase(5) == ""           # phase cleared on teardown
+
+
+def test_resolve_retries_roundtrip():
+    s, _ = _store()
+    assert s.get_resolve_retries(5) == 0
+    s.set_resolve_retries(5, 2)
+    assert s.get_resolve_retries(5) == 2
 
 
 def test_clear_pr_review():

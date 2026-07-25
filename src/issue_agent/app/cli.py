@@ -533,8 +533,16 @@ def cmd_status(args) -> int:
         pids = roles[role]
         state = _c("32", "running") + f" {pids}" if pids else _c("33", "stopped")
         print(f"  {role:8s}: {state}")
+    log_dir = os.environ.get("LOG_DIR") or os.path.join(
+        os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+        "issue-agent", "logs",
+    )
     for role in ROLES:
-        log = f"/tmp/issue-agent-{role}-{name}.log"
+        # Same default as point-at.sh's LOG_DIR; the old /tmp path is checked as
+        # a fallback so status still tails logs of a daemon started pre-move.
+        log = os.path.join(log_dir, f"{role}-{name}.log")
+        if not os.path.isfile(log):
+            log = f"/tmp/issue-agent-{role}-{name}.log"
         if os.path.isfile(log):
             print(_c("36", f"\n── tail {log} ──"))
             print(_run(["tail", "-n", str(args.lines), log]) or "  (empty)")

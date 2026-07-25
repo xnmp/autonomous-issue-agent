@@ -1,5 +1,6 @@
 """Daemon loop — tick sequencing, crash isolation, heartbeat."""
 
+from issue_agent.adapters.github import GhUnavailable
 from issue_agent.app.execute import Executor
 from issue_agent.app.loop import Daemon
 from issue_agent.domain.actions import NoOp, Relabel, Target
@@ -56,6 +57,70 @@ def test_tick_isolated_from_action_crash():
                Executor(BadGateway()), log=logs.append)
     d.tick()  # must not raise
     assert any("action" in m and "failed" in m for m in logs)
+
+
+def test_tick_skips_the_pass_when_github_is_unavailable():
+    """The V10 contract at the loop layer: an unreadable GitHub must produce NO
+    decide, NO execute — not a pass over an empty world. Asserted on the observable
+    outcome (zero side-effects on the gateway), not on how tick branches."""
+    logs = []
+    def rate_limited():
+        raise GhUnavailable("rate-limit", "HTTP 403: API rate limit exceeded for user 42")
+    decided = []
+    def decide(world):
+        decided.append(world)
+        return [Relabel(Target.ISSUE, 5, Label.AI_READY, Label.AI_WORKING)]
+
+    d, gw = _daemon(decide, observe=rate_limited, logs=logs)
+    assert d.tick() == []
+    assert decided == []          # never asked the domain about a world we can't see
+    assert gw.calls == []         # and never touched the repo
+
+
+def test_gh_unavailable_logs_one_concise_loud_line():
+    """An operator scanning the log needs the cause and the consequence on ONE
+    grep-able line — not a generic 'poll pass failed' dump that reads like a bug."""
+    logs = []
+    def unavailable():
+        raise GhUnavailable(
+            "rate-limit", "HTTP 403: API rate limit exceeded\n  for user ID 42\n  see docs"
+        )
+    d, _ = _daemon(lambda w: [], observe=unavailable, logs=logs)
+    d.tick()
+    assert len(logs) == 1
+    line = logs[0]
+    assert "\n" not in line
+    assert "world build failed" in line and "rate-limited" in line
+    assert "skipping tick" in line
+    assert "API rate limit exceeded" in line          # the cause survives
+    assert "poll pass failed" not in line             # not the generic arm
+
+
+def test_non_infra_observe_failure_still_uses_the_generic_arm():
+    """Only infra gets the special line; a real bug in observe must stay
+    recognisable as a bug rather than be dressed up as a rate limit."""
+    logs = []
+    def boom():
+        raise KeyError("headRefName")
+    d, _ = _daemon(lambda w: [], observe=boom, logs=logs)
+    assert d.tick() == []
+    assert any("poll pass failed" in m for m in logs)
+    assert not any("world build failed" in m for m in logs)
+
+
+def test_action_raising_gh_unavailable_does_not_kill_the_daemon():
+    """Side-effect calls share the low-level runner, so a rate limit can surface
+    mid-execute. The executor's per-action isolation must absorb it: the action is
+    logged as failed and the daemon keeps polling."""
+    logs = []
+    class ThrottledGateway:
+        def relabel(self, *a):
+            raise GhUnavailable("rate-limit", "HTTP 429: Too Many Requests")
+    d = Daemon("fix", lambda: WorldState(),
+               lambda w: [Relabel(Target.ISSUE, 5, Label.AI_READY, None)],
+               Executor(ThrottledGateway()), log=logs.append)
+    d.tick()  # must not raise
+    assert any("action" in m and "failed" in m and "rate-limited" in m for m in logs)
 
 
 def test_run_forever_bounded_by_max_ticks():

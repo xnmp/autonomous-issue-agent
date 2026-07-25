@@ -8,11 +8,34 @@ import asyncio
 
 from issue_agent.app.execute import Executor
 from issue_agent.app.workflows.fix import FixWorkflow, FixWorkflowConfig
-from issue_agent.domain.outcome import AgentResult
+from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.app.planners.tasks import FixTaskConfig
 from issue_agent.domain.world import Check, Comment, IssueView, PRView, Review
 
 from test_dispatch import FakeGateway, FakeRunner, FakeStore, FakeWorktrees, SeqRunner
+
+
+class RetryRecordingStore(FakeStore):
+    """FakeStore swallows the CI counter (set_ci_retries is a no-op) and has no
+    rebase counter at all, so the breaker-advance decision is unobservable through
+    it. Record both here — these tests are about WHETHER a counter moves."""
+
+    def __init__(self):
+        super().__init__()
+        self.ci_retries: dict[int, int] = {}
+        self.rebase_retries: dict[int, int] = {}
+
+    def set_ci_retries(self, i, n):
+        self.ci_retries[i] = n
+
+    def get_ci_retries(self, i):
+        return self.ci_retries.get(i, 0)
+
+    def set_rebase_retries(self, i, n):
+        self.rebase_retries[i] = n
+
+    def get_rebase_retries(self, i):
+        return self.rebase_retries.get(i, 0)
 
 
 def _workflow(gw, store, runner, wt=None, **cfg_overrides):
@@ -120,6 +143,58 @@ def test_fix_ci_no_mcp_when_no_check_matches():
     assert runner.tasks[0].mcp_servers == ()
 
 
+def test_resolve_error_bumps_resolve_counter():
+    # T3 finding: an erroring resolve requeues ai-ready; the requeue must COUNT
+    # or the loop is unbounded at full session cost.
+    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(is_error=True))
+
+    asyncio.run(_workflow(gw, store, runner).resolve(5))
+
+    assert store.get_resolve_retries(5) == 1
+
+
+def test_resolve_blocked_does_not_bump_resolve_counter():
+    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(is_error=False, status="blocked", needs="x", session_id="s"))
+
+    asyncio.run(_workflow(gw, store, runner).resolve(5))
+
+    assert store.get_resolve_retries(5) == 0
+
+
+def test_resolve_infra_death_does_not_bump_resolve_counter():
+    # An externally-killed session made no attempt (same rule as fix_ci/rebase).
+    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(is_error=True, exit_reason=ExitReason.TRANSPORT_DEATH))
+
+    asyncio.run(_workflow(gw, store, runner).resolve(5))
+
+    assert store.get_resolve_retries(5) == 0
+
+
+def test_resume_empty_body_reply_returns_issue_to_blocked():
+    # T3 probe finding: the old early-return left the issue ai-working, which
+    # the reaper turned into ai-ready → an unbounded RESOLVE loop. An empty
+    # reply must be consumed AND the issue put back to awaiting-human.
+    iss = IssueView(5, title="t", body="b", comments=(
+        Comment("fix-bot", "asking", "t1"),
+        Comment("alice", "   ", "t2"),
+    ))
+    gw = FakeGateway(issues={5: iss}, pr_for_issue={})
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(is_error=False, status="blocked", session_id="s"))
+
+    asyncio.run(_workflow(gw, store, runner, fix_bot="fix-bot").resume(5))
+
+    assert runner.tasks == []
+    assert store.get_resumed_at(5) == "t2"
+    assert ("relabel", "issue", 5, "ai-working", "ai-blocked") in gw.calls
+
+
 def test_resume_writes_resumed_at_mark():
     # V1/#13 regression: a dispatched resume must record WHICH reply it
     # consumed. Without the write, this blocked-again issue re-fires a paid
@@ -182,6 +257,80 @@ def test_address_review_blocked_does_not_bump_counter():
     asyncio.run(_workflow(gw, store, runner).address_review(100))
 
     assert store.get_review_retry(5) == ("", 0)
+
+
+# ── infra death must not advance a breaker (FAILURE-MODES #58) ───────────────
+def _ci_pr():
+    return PRView(100, head_ref_name="fix/5-token", closing_issue=5,
+                  checks=(Check("unit", bucket="fail"),))
+
+
+def test_fix_ci_error_advances_the_breaker():
+    # Baseline for the exemption below: a genuine failed attempt DOES count.
+    gw = FakeGateway(prs={100: _ci_pr()})
+    store = RetryRecordingStore()
+    runner = FakeRunner(AgentResult(is_error=True, exit_reason=ExitReason.AGENT_ERROR))
+
+    asyncio.run(_workflow(gw, store, runner).fix_ci(100))
+
+    assert store.get_ci_retries(5) == 1
+
+
+def test_fix_ci_infra_death_does_not_advance_the_breaker():
+    # #58: six SIGKILLs on one PR walked the CI breaker to needs-human-review on
+    # work that never ran. The PR still stops looking busy.
+    gw = FakeGateway(prs={100: _ci_pr()})
+    store = RetryRecordingStore()
+    store.set_ci_retries(5, 2)
+    runner = FakeRunner(
+        AgentResult(is_error=True, status="timeout",
+                    exit_reason=ExitReason.KILLED_EXTERNALLY)
+    )
+
+    asyncio.run(_workflow(gw, store, runner).fix_ci(100))
+
+    assert store.get_ci_retries(5) == 2
+    assert ("relabel", "pr", 100, "ai-working", None) in gw.calls
+
+
+def test_rebase_error_advances_the_breaker():
+    gw = FakeGateway(prs={100: PRView(100, head_ref_name="fix/5-token", closing_issue=5)})
+    store = RetryRecordingStore()
+    runner = FakeRunner(AgentResult(is_error=True, exit_reason=ExitReason.AGENT_ERROR))
+
+    asyncio.run(_workflow(gw, store, runner).rebase(100))
+
+    assert store.get_rebase_retries(5) == 1
+
+
+def test_rebase_infra_death_does_not_advance_the_breaker():
+    gw = FakeGateway(prs={100: PRView(100, head_ref_name="fix/5-token", closing_issue=5)})
+    store = RetryRecordingStore()
+    store.set_rebase_retries(5, 1)
+    runner = FakeRunner(
+        AgentResult(is_error=True, status="timeout",
+                    exit_reason=ExitReason.TRANSPORT_DEATH)
+    )
+
+    asyncio.run(_workflow(gw, store, runner).rebase(100))
+
+    assert store.get_rebase_retries(5) == 1
+
+
+def test_address_review_infra_death_does_not_burn_a_review_retry():
+    p = PRView(100, head_ref_name="fix/5-x", closing_issue=5,
+               reviews=(Review("CHANGES_REQUESTED", "rev-bot", "t9", body="fix it"),))
+    gw = FakeGateway(prs={100: p})
+    store = RetryRecordingStore()
+    store.set_review_retry(5, "t9", 2)
+    runner = FakeRunner(
+        AgentResult(is_error=True, status="timeout",
+                    exit_reason=ExitReason.KILLED_EXTERNALLY, session_id="s")
+    )
+
+    asyncio.run(_workflow(gw, store, runner).address_review(100))
+
+    assert store.get_review_retry(5) == ("t9", 2)
 
 
 def test_split_majority_case_author_then_implement_opens_pr():

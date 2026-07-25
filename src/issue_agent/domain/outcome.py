@@ -1,12 +1,45 @@
 """Agent-result interpretation + post-run follow-up decisions.
 
-Two pure concerns ported from agent/lib.sh + resolve/resume/address-review:
+Three pure concerns ported from agent/lib.sh + resolve/resume/address-review:
   * `classify_outcome` — read the decision from the envelope, NEVER prose. The
     is_error subtlety (jq `//` treats false as empty) is the key lesson: only an
     explicit is_error==false counts as success.
   * `followup_*` — given the outcome AND GitHub ground truth (did a PR actually
     open?), decide the label moves + comments. Ground truth wins over prose: a
     PR that opened means success even if the model said "blocked".
+  * `ExitReason` / `infra_death` — WHY the session ended, separate from WHAT it
+    decided. An agent that errored made an attempt; a session the OS killed made
+    none, and must not spend a retry or move a label (see the table below).
+
+## Terminal transition table (outcome × leg → label move)
+
+Read it as: given this classification, what does the leg's `*_actions` emit?
+
+    outcome        resolve                resume                 address-review        fix-ci / rebase
+    -------------  ---------------------  ---------------------  --------------------  ------------------
+    PR opened      →ai-pr-open (+PR)      →ai-pr-open (+PR)      n/a                   n/a
+    blocked        ask + →ai-blocked      ask + →ai-blocked      ask + +ai-blocked,    clear + +ai-blocked
+                                                                 NO retry bump
+    error          →ai-ready (requeue)    →ai-blocked  (*)       clear + retry bump    clear (+ retry bump)
+    infra death    (no move — stay        (no move — stay        clear, NO retry bump  clear, NO retry bump
+                   ai-working)            ai-working)
+
+(*) The resolve-ERROR→`ai-ready` vs resume-ERROR→`ai-blocked` divergence is
+INTENTIONAL, not an oversight. A resolve error is unattended work that must never
+strand in `ai-working`, so it requeues. A resume error happens on a thread where a
+HUMAN is already engaged (they answered a question to get here); silently
+requeueing would discard that engagement and re-run a paid session on the same
+unanswered ambiguity. Keeping it `ai-blocked` keeps the human in the loop.
+
+**Infra death** (`KILLED_EXTERNALLY` / `TRANSPORT_DEATH`) emits no label move on
+the issue legs and burns no retry anywhere. The session died for a reason the
+agent had no part in — an OOM/jetsam SIGKILL mid-e2e (FAILURE-MODES #58), an
+operator kill, a severed control stream. Treating that as an attempt did two
+concrete harms: it marched the CI/review/rebase breakers toward
+`needs-human-review` on work that was never actually tried, and it relabelled
+`ai-working`→`ai-ready`, racing an operator's manual `ai-blocked` (#65). Leaving
+the issue `ai-working` is the DESIGNED settle path: the in-process reaper sees an
+`ai-working` issue with no live session on the next idle tick and requeues it once.
 """
 
 from __future__ import annotations
@@ -22,6 +55,39 @@ class Outcome(str, Enum):
     OK = "ok"
     BLOCKED = "blocked"
     ERROR = "error"
+
+
+class ExitReason(str, Enum):
+    """WHY a session ended — orthogonal to `Outcome` (what it decided).
+
+    `Outcome` answers "did the agent succeed?"; this answers "did the agent even
+    get to finish?". The distinction only matters for the two infra members (see
+    `infra_death`), but naming every terminal path keeps the classification total
+    and makes a log line say which watchdog fired.
+    """
+
+    OK = "ok"                              # clean envelope, no error
+    AGENT_ERROR = "agent_error"            # the agent finished and reported failure
+    BUDGET_EXHAUSTED = "budget_exhausted"  # spend ceiling hit mid-run
+    IDLE_TIMEOUT = "idle_timeout"          # no stream event within the idle window
+    WALL_TIMEOUT = "wall_timeout"          # total runtime exceeded the wall cap
+    KILLED_EXTERNALLY = "killed_externally"  # SIGKILL from outside (OOM, operator)
+    TRANSPORT_DEATH = "transport_death"    # stream/gateway died before any result
+    NO_RESULT = "no_result"                # stream ended cleanly, no ResultMessage
+
+
+def infra_death(reason: ExitReason | None) -> bool:
+    """True iff the session died from something the AGENT had no part in, so the
+    run must not count as an attempt.
+
+    Deliberately narrow: only an external kill and a pre-result transport death
+    qualify. A timeout (idle or wall) does NOT — the agent was alive and had the
+    chance to make progress, so a hang must still march the breaker forward or a
+    reliably-hanging task loops at full session cost forever. `None` (an
+    unclassified/legacy result) is never an infra death, which keeps every caller
+    at exactly today's behavior until an adapter starts populating the field.
+    """
+    return reason in (ExitReason.KILLED_EXTERNALLY, ExitReason.TRANSPORT_DEATH)
 
 
 @dataclass(frozen=True)
@@ -40,6 +106,17 @@ class AgentResult:
     cost_usd: float = 0.0
     session_id: str = ""
     structured: dict | None = None  # the full structured_output (any schema)
+    # WHY the session ended. None = unclassified (a legacy/hand-built result, or a
+    # runtime that doesn't classify yet) and every consumer treats it exactly as it
+    # treated results before the taxonomy existed — so populating it is additive,
+    # never a silent behavior change.
+    exit_reason: "ExitReason | None" = None
+    # Raw SDK usage block (input/output/cache_read/cache_creation token counts).
+    # `cost_usd` is the gateway's own dollar figure, which is 0.00 on a subscription
+    # plan and absent on Codex — tokens are the only substrate that always exists,
+    # so capture them verbatim now to feed the cost ledger rather than re-deriving
+    # them later from a log.
+    usage: dict | None = None
 
     def field(self, name: str, default: str = "") -> str:
         if isinstance(self.structured, dict):
@@ -97,7 +174,8 @@ def resolve_actions(
 ) -> list[Action]:
     """resolve-issue.sh tail as Actions. pr is the discovered PR number (ground
     truth) or None. PR opened → label issue+PR ai-pr-open; blocked → comment the
-    'needs' and ai-blocked; error → back to ai-ready (never strand ai-working)."""
+    'needs' and ai-blocked; error → back to ai-ready (never strand ai-working);
+    infra death → NOTHING (stay ai-working for the reaper; see module docstring)."""
     fu = resolve_followup(result, pr is not None)
     if fu is ResolveFollowup.PR_OPENED:
         assert pr is not None
@@ -105,6 +183,11 @@ def resolve_actions(
             Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_PR_OPEN),
             Relabel(Target.PR, pr, None, Label.AI_PR_OPEN),
         ]
+    # Checked AFTER the ground-truth PR branch: how the session died says nothing
+    # about whether a PR exists on GitHub, and a real PR must never be stranded
+    # unlabelled just because the session was killed a second after opening it.
+    if infra_death(result.exit_reason):
+        return []
     if fu is ResolveFollowup.BLOCKED:
         needs = result.needs or result.summary or "see logs"
         return [
@@ -207,12 +290,16 @@ def resume_actions(
 ) -> list[Action]:
     """resume-issue.sh tail. Same PR-opened success path; but on blocked OR error
     the issue stays ai-blocked (a human is already engaged) — error does NOT
-    requeue to ai-ready here (differs from resolve)."""
+    requeue to ai-ready here (differs from resolve; the divergence is documented
+    as intentional in the module docstring). Infra death → NOTHING: the session
+    never ran, so it must not consume the human's reply by moving the label."""
     if pr is not None:
         return [
             Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_PR_OPEN),
             Relabel(Target.PR, pr, None, Label.AI_PR_OPEN),
         ]
+    if infra_death(result.exit_reason):
+        return []
     if classify_outcome(result) == Outcome.BLOCKED:
         needs = result.needs or result.summary or "see logs"
         return [
@@ -245,6 +332,12 @@ class AddressReviewOutcome:
 def address_review_actions(pr: int, result: AgentResult) -> AddressReviewOutcome:
     # The watcher added ai-working before dispatch; the tail always clears it.
     clear_working = Relabel(Target.PR, pr, Label.AI_WORKING, None)
+    if infra_death(result.exit_reason):
+        # An external kill is not an attempt. Clear ai-working (the PR must not
+        # look busy) but leave the breaker where it was — otherwise a machine
+        # under memory pressure walks a healthy PR to needs-human-review without
+        # the fixer ever having read the review.
+        return AddressReviewOutcome([clear_working], bump_retry=False)
     if classify_outcome(result) is Outcome.BLOCKED:
         body = (
             "**Agent needs clarification on review:**\n\n"
@@ -262,8 +355,12 @@ def address_review_actions(pr: int, result: AgentResult) -> AddressReviewOutcome
 def fix_ci_actions(pr: int, result: AgentResult) -> list[Action]:
     """fix-ci.sh tail. Always clear ai-working; on blocked also add ai-blocked.
     (The pushed/ok path just clears ai-working — CI re-runs and the watcher
-    re-evaluates next poll.)"""
+    re-evaluates next poll.) On infra death: clear only — never add ai-blocked
+    for a session that was killed rather than stuck, and the CALLER additionally
+    skips its retry bump (see app/workflows/fix.py)."""
     clear_working = Relabel(Target.PR, pr, Label.AI_WORKING, None)
+    if infra_death(result.exit_reason):
+        return [clear_working]
     outcome = classify_outcome(result)
     if outcome is Outcome.OK or result.status == "pushed":
         return [clear_working]

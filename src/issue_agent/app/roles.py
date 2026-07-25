@@ -67,10 +67,11 @@ def _fix_state(store: Store, world) -> FixState:
     # as count 0 (see FixState.review_retries).
     review_retries = {k: store.get_review_retry(k) for k in keys}
     rebase_retries = {k: store.get_rebase_retries(k) for k in keys}
+    resolve_retries = {i.number: store.get_resolve_retries(i.number) for i in world.issues}
     return FixState(
         sessions=sessions, resumed_at=resumed, automerge_enabled=automerge,
         ci_retries=ci_retries, review_retries=review_retries,
-        rebase_retries=rebase_retries,
+        rebase_retries=rebase_retries, resolve_retries=resolve_retries,
     )
 
 
@@ -96,6 +97,7 @@ def build_fix_daemon(
         max_review_retries=fix_runtime.max_review_retries,
         auto_rebase_conflicts=fix_runtime.auto_rebase_conflicts,
         max_rebase_retries=fix_runtime.max_rebase_retries,
+        max_resolve_retries=fix_runtime.max_resolve_retries,
     )
     dcfg = DispatchConfig(
         base_branch=repo_cfg.base_branch,
@@ -137,6 +139,7 @@ def build_fix_daemon(
             log=_log("fix"),
             debug=os.environ.get("ISSUE_AGENT_DEBUG", "0") not in ("", "0", "false", "False"),
             idle_timeout=(codex_runtime.idle_timeout if codex_runtime.idle_timeout > 0 else None),
+            max_runtime=(codex_runtime.max_runtime if codex_runtime.max_runtime > 0 else None),
             transport_retries=codex_runtime.transport_retries,
             backoff_base=codex_runtime.backoff_base,
             rate_limit_backoff_base=codex_runtime.rate_limit_backoff_base,
@@ -158,7 +161,10 @@ def build_fix_daemon(
             write_hook_config, agents_md=cfg.agent_md, edit_check_cmd=cfg.edit_check_cmd
         )
 
-    executor = Executor(gateway, remove_worktree=worktrees.remove, log=_log("fix"))
+    executor = Executor(
+        gateway, remove_worktree=worktrees.remove, log=_log("fix"),
+        mark_automerge=store.mark_automerge,
+    )
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, worktrees, fix_runner, executor, prepare_cwd=prepare_cwd
     )

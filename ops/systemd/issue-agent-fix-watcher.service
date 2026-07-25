@@ -1,8 +1,11 @@
-# Linux systemd unit (user service). Install:
-#   bin/install-systemd.sh   (fills @HARNESS_ROOT@/@CONFIG@, installs to
-#   ~/.config/systemd/user/, then `systemctl --user enable --now ...`).
+# Linux systemd unit (user service) TEMPLATE — do not install by hand, the
+# placeholder tokens below (wrapped in "at" signs) are filled in and this file
+# is copied to ~/.config/systemd/user/issue-agent-fix-watcher-NAME.service by:
+#   bin/install-systemd.sh
+# Logs go to the journal — tail with:
+#   journalctl --user -u issue-agent-fix-watcher-NAME -f
 [Unit]
-Description=Autonomous issue agent — fix watcher
+Description=Autonomous issue agent — fix watcher (@NAME@)
 After=network-online.target
 
 [Service]
@@ -13,8 +16,8 @@ Environment=AGENT_ENV=@CONFIG@
 Environment=TARGET_DIR=@TARGET_DIR@
 Restart=always
 RestartSec=30
-StandardOutput=append:/tmp/issue-agent-fix-watcher.log
-StandardError=append:/tmp/issue-agent-fix-watcher.log
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=default.target

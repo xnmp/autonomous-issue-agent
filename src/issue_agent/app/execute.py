@@ -44,10 +44,17 @@ class Executor:
         remove_worktree: Callable[[int], None] | None = None,
         run_agent: Callable[[RunAgent], None] | None = None,
         log: Callable[[str], None] | None = None,
+        mark_automerge: Callable[[int], None] | None = None,
     ):
         self.gateway = gateway
         self._remove_worktree = remove_worktree or (lambda issue: None)
         self._run_agent = run_agent or (lambda action: None)
+        # Persist the "already armed" marker the decide side reads
+        # (FixState.automerge_enabled). Without this write the marker file was
+        # never created (T3 probe finding: store.mark_automerge had zero
+        # production call sites), so should_automerge re-armed every poll —
+        # one wasted `gh pr merge --auto` per merge-ready PR per tick.
+        self._mark_automerge = mark_automerge or (lambda pr: None)
         # Log EVERY applied action so state changes (label moves, comments, close,
         # auto-merge, worktree removal, agent dispatch) are visible instead of
         # inferred. One funnel = one audit trail. Default no-op keeps tests quiet.
@@ -93,6 +100,7 @@ class Executor:
             self.gateway.close_issue(action.number, action.reason, action.comment)
         elif isinstance(action, EnableAutoMerge):
             self.gateway.enable_auto_merge(action.pr, action.method)
+            self._mark_automerge(action.pr)
         elif isinstance(action, UpdateBranch):
             self.gateway.update_branch(action.pr)
         elif isinstance(action, AddDependency):

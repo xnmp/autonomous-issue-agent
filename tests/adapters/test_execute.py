@@ -73,6 +73,17 @@ def test_enable_auto_merge():
     assert gw.calls == [("automerge", 100, "squash")]
 
 
+def test_enable_auto_merge_persists_the_armed_marker():
+    # The decide side's marker guard (FixState.automerge_enabled) only works if
+    # arming WRITES the marker — it never did (T3 probe: zero production call
+    # sites), so every merge-ready PR re-armed on every poll.
+    gw = FakeGateway()
+    marked = []
+    ex = Executor(gw, mark_automerge=marked.append)
+    ex.execute(EnableAutoMerge(100, "squash"))
+    assert marked == [100]
+
+
 def test_update_branch():
     ex, gw, _, _ = _exec()
     ex.execute(UpdateBranch(100))

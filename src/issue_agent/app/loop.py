@@ -18,6 +18,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from ..adapters.github import GhUnavailable
 from ..domain.actions import Action
 from ..domain.world import WorldState
 from .execute import Executor
@@ -35,10 +36,23 @@ class Daemon:
     def tick(self) -> list[Action]:
         """One observe→decide→execute pass. Returns the actions taken (for tests
         / logging). Never raises out: a failed pass logs and yields [] so the
-        daemon loop continues (the bash `poll_once || log` contract)."""
+        daemon loop continues (the bash `poll_once || log` contract).
+
+        `GhUnavailable` (rate limit / network / 5xx) gets its own arm: it is not
+        a bug to debug from a stack-ish dump but an expected operating condition
+        with exactly one correct response — observe NOTHING, decide NOTHING,
+        execute NOTHING, say so in one loud line. There is deliberately no retry
+        or backoff here: the poll loop IS the retry, and a rate limit that
+        outlives one interval will simply announce itself again."""
         try:
             world = self.observe()
             actions = self.decide(world)
+        except GhUnavailable as exc:
+            self.log(
+                f"{self.name}: world build failed: GitHub {exc.headline} — "
+                f"skipping tick, no actions taken ({exc.detail})"
+            )
+            return []
         except Exception as exc:  # noqa: BLE001 - crash-isolate a poll
             self.log(f"{self.name}: poll pass failed (continuing): {exc}")
             return []

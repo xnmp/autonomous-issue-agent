@@ -38,6 +38,7 @@ class FixRuntimeConfig:
     max_review_retries: int
     auto_rebase_conflicts: bool
     max_rebase_retries: int
+    max_resolve_retries: int
     author_tests_split: bool
     max_contract_rounds: int
     mcp_config: str
@@ -93,6 +94,7 @@ class CodexRuntimeConfig:
     wire_api: str
     sandbox: str
     idle_timeout: float
+    max_runtime: float
     transport_retries: int
     backoff_base: float
     rate_limit_backoff_base: float
@@ -134,6 +136,10 @@ class HarnessConfig:
     # AUTO_REBASE_CONFLICTS=0 to instead escalate to a human on the first conflict.
     auto_rebase_conflicts: bool = True
     max_rebase_retries: int = 3
+    # Resolve breaker (T3 finding): every other paid leg had a retry ceiling;
+    # resolve — the most expensive — had none, so an always-erroring resolve
+    # requeued ai-ready and re-dispatched a full session every poll forever.
+    max_resolve_retries: int = 3
     review_trigger_label: str = "ai-pr-open"
     fix_model: str | None = None
     review_model: str | None = None
@@ -220,6 +226,15 @@ class HarnessConfig:
     # run — raise it or set 0 to disable). See the liveness-check enhancement issue
     # for a CPU-aware alternative that removes the threshold guess. 0 disables.
     agent_idle_timeout: float = 900.0
+    # Total-runtime ceiling for ONE agent session — the cap the idle watchdog
+    # structurally cannot provide. A stream left "limping" by a suspend/resume
+    # delivers an event every few minutes: each one resets the idle clock, so a
+    # review ran 58 minutes on 3.6s of CPU and never tripped (FAILURE-MODES #60).
+    # Only elapsed wall time bounds that shape. 45 min sits well above a genuinely
+    # hard resolve (observed p99 ~20 min) while making a limping session recoverable
+    # within one poll cycle. Raise it for a repo whose test suite alone runs longer;
+    # 0 disables (back to idle-watchdog-only).
+    agent_max_runtime: float = 2700.0
     # Codex gateway transport-drop retry: a `response.failed`/`stream disconnected`
     # from the LLM gateway is upstream, not agent error. Retry the whole `codex
     # exec` (resumed) up to N times with jittered exponential backoff (base * 2^n).
@@ -263,6 +278,7 @@ class HarnessConfig:
             max_review_retries=self.max_review_retries,
             auto_rebase_conflicts=self.auto_rebase_conflicts,
             max_rebase_retries=self.max_rebase_retries,
+            max_resolve_retries=self.max_resolve_retries,
             author_tests_split=self.author_tests_split,
             max_contract_rounds=self.max_contract_rounds,
             mcp_config=self.fix_mcp_config,
@@ -322,6 +338,7 @@ class HarnessConfig:
             wire_api=self.codex_wire_api,
             sandbox=self.codex_sandbox,
             idle_timeout=self.agent_idle_timeout,
+            max_runtime=self.agent_max_runtime,
             transport_retries=self.codex_transport_retries,
             backoff_base=self.codex_backoff_base,
             rate_limit_backoff_base=self.codex_rate_limit_backoff_base,
@@ -335,6 +352,12 @@ class HarnessConfig:
         _require_non_negative(errors, "MAX_CI_RETRIES", self.max_ci_retries)
         _require_non_negative(errors, "MAX_REVIEW_RETRIES", self.max_review_retries)
         _require_non_negative(errors, "MAX_REBASE_RETRIES", self.max_rebase_retries)
+        _require_non_negative(errors, "MAX_RESOLVE_RETRIES", self.max_resolve_retries)
+        if not (self.repo or "").strip():
+            # Fail LOUD at startup, not with an opaque gh error on the first
+            # poll: an empty REPO means a missing/mis-composed overlay (the
+            # silent-default class, #50).
+            errors.append("REPO must be set (owner/name) — is the repo overlay composed?")
         _require_non_negative(errors, "REVIEW_MAX_REJECTIONS", self.max_review_rejections)
         _require_non_negative(errors, "MAX_CONTRACT_ROUNDS", self.max_contract_rounds)
         for name, value in (
@@ -350,6 +373,7 @@ class HarnessConfig:
         if self.fixer_runtime not in ("claude", "codex"):
             errors.append("FIXER_RUNTIME must be 'claude' or 'codex'")
         _require_non_negative(errors, "AGENT_IDLE_TIMEOUT_SECONDS", self.agent_idle_timeout)
+        _require_non_negative(errors, "AGENT_MAX_RUNTIME_SECONDS", self.agent_max_runtime)
         _require_non_negative(errors, "CODEX_TRANSPORT_RETRIES", self.codex_transport_retries)
         _require_positive(errors, "CODEX_BACKOFF_BASE_SECONDS", self.codex_backoff_base)
         _require_non_negative(errors, "CODEX_MAX_RATE_LIMIT_RETRIES", self.codex_max_rate_limit_retries)
@@ -361,6 +385,29 @@ class HarnessConfig:
         errors = self.validation_errors()
         if errors:
             raise ValueError("invalid harness config: " + "; ".join(errors))
+
+    def describe(self) -> str:
+        """Resolved-config summary printed at daemon startup (lean P5.1): the
+        silent-default class (#16/#49/#50/#78) is only diagnosable when the
+        EFFECTIVE values are visible somewhere. Curated, one knob-group per
+        line; never includes secrets (tokens/keys live in env, not here)."""
+        def model(m: str | None) -> str:
+            return m or "(sdk default)"
+
+        return "\n".join([
+            f"repo={self.repo or '(UNSET)'} base={self.base_branch} "
+            f"identity={self.identity_mode} poll={self.poll_seconds}s",
+            f"fixer={self.fixer_runtime} fix_model={model(self.fix_model)} "
+            f"fix_budget=${self.fix_budget_usd:.2f}",
+            f"review_model={model(self.review_model)} mode={self.review_mode.value} "
+            f"review_budget=${self.review_budget_usd:.2f} "
+            f"rejections_cap={self.max_review_rejections}",
+            f"retry_caps: resolve={self.max_resolve_retries} ci={self.max_ci_retries} "
+            f"review={self.max_review_retries} rebase={self.max_rebase_retries}",
+            f"timeouts: idle={self.agent_idle_timeout:.0f}s "
+            f"wall={self.agent_max_runtime:.0f}s",
+            f"state={self.state_dir or '(unset)'} target={self.target_dir or '(cwd)'}",
+        ])
 
 
 def render_agent_md(text: str, cfg: "HarnessConfig") -> str:
@@ -422,6 +469,7 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         close_issue_on_merge=_b(e, "CLOSE_ISSUE_ON_MERGE", True),
         auto_rebase_conflicts=_b(e, "AUTO_REBASE_CONFLICTS", True),
         max_rebase_retries=int(e.get("MAX_REBASE_RETRIES", "3")),
+        max_resolve_retries=int(e.get("MAX_RESOLVE_RETRIES", "3")),
         max_ci_retries=int(e.get("MAX_CI_RETRIES", "3")),
         max_review_rejections=int(e.get("REVIEW_MAX_REJECTIONS", "4")),
         max_review_retries=int(e.get("MAX_REVIEW_RETRIES", "3")),
@@ -471,6 +519,7 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         codex_wire_api=e.get("CODEX_WIRE_API", "responses"),
         codex_sandbox=e.get("CODEX_SANDBOX", "danger-full-access"),
         agent_idle_timeout=float(e.get("AGENT_IDLE_TIMEOUT_SECONDS", "900") or 0),
+        agent_max_runtime=float(e.get("AGENT_MAX_RUNTIME_SECONDS", "2700") or 0),
         codex_transport_retries=int(e.get("CODEX_TRANSPORT_RETRIES", "4") or 0),
         codex_backoff_base=float(e.get("CODEX_BACKOFF_BASE_SECONDS", "2") or 0),
         codex_rate_limit_backoff_base=float(

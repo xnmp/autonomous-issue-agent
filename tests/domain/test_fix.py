@@ -454,6 +454,21 @@ def test_review_with_unknown_commit_dispatches():
     assert RunAgent(AgentKind.ADDRESS_REVIEW, 100) in _run_agents(actions)
 
 
+# ── resolve breaker (T3 finding: the most expensive leg had no ceiling) ──────
+def test_resolve_under_cap_dispatches():
+    st = FixState(resolve_retries={5: 2})
+    actions = decide_fix(world(issues=[issue(5, "ai-ready")]), CFG, st, fixer_busy=False)
+    assert RunAgent(AgentKind.RESOLVE, 5) in _run_agents(actions)
+
+
+def test_resolve_at_cap_escalates_issue_not_dispatches():
+    st = FixState(resolve_retries={5: 3})  # cap is 3 (default)
+    actions = decide_fix(world(issues=[issue(5, "ai-ready")]), CFG, st, fixer_busy=False)
+    assert _run_agents(actions) == []
+    assert Relabel(Target.ISSUE, 5, Label.AI_READY, Label.NEEDS_HUMAN_REVIEW) in actions
+    assert any(isinstance(a, PostComment) and a.number == 5 for a in actions)
+
+
 def test_fix_ci_at_cap_escalates_not_dispatches():
     st = FixState(ci_retries={9: 3})
     actions = decide_fix(world(prs=[_ci_fail_pr()]), CFG, st, fixer_busy=False)

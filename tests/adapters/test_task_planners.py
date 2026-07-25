@@ -16,6 +16,7 @@ from issue_agent.app.planners.schemas import (
     TRIAGE_SCHEMA,
 )
 from issue_agent.app.planners.tasks import (
+    FIXER_DENY,
     REVIEW_DIMENSIONS,
     FixTaskConfig,
     JiraTaskConfig,
@@ -38,6 +39,7 @@ from issue_agent.app.planners.tasks import (
     build_review_validation_task,
     build_router_task,
     build_triage_task,
+    scope_diff,
 )
 
 FIX_CFG = FixTaskConfig(repo="o/r", base_branch="dev", agent_md="AGENTMD", max_budget_usd=3.0)
@@ -131,6 +133,167 @@ def test_router_task_is_cheap_and_schemad():
     assert t.model == "haiku"
     assert t.max_budget_usd == 0.10
     assert t.append_system_prompt == ""            # no system prompt for the router
+
+
+# ── fixer deny-list (P3.1) ──
+# The fixer runs bypassPermissions, so settings.json's deny list never applies:
+# disallowed_tools on the task is the ONLY thing standing between an
+# issue-body-driven agent and `curl`/`gh auth`/`.env`.
+def _every_fixer_task():
+    from issue_agent.app.planners.tasks import build_rebase_task
+    return {
+        "resolve": build_resolve_task(5, "t", "b", "/wt", FIX_CFG),
+        "author": build_author_task(5, "t", "b", "/wt", FIX_CFG),
+        "implement": build_implement_task(5, "t", "b", "/wt", FIX_CFG),
+        "adjudicate": build_adjudicate_task(5, "t", "b", "obj", "/wt", FIX_CFG),
+        "resume": build_resume_task("reply", "/wt", "s1", FIX_CFG),
+        "address_review": build_address_review_task(9, "rb", "il", "/wt", "s1", FIX_CFG),
+        "fix_ci": build_fix_ci_task(9, "fail", "log", "/wt", "s1", FIX_CFG),
+        "rebase": build_rebase_task(9, "dev", "/wt", "s1", FIX_CFG),
+        "router": build_router_task("t", "b"),
+    }
+
+
+def test_every_fixer_leg_carries_the_deny_list():
+    for name, task in _every_fixer_task().items():
+        assert task.disallowed_tools == FIXER_DENY, f"{name} leg has no tool denies"
+
+
+def test_deny_list_blocks_exfiltration_and_credential_paths():
+    denied = set(FIXER_DENY)
+    # outbound network the governor cannot see inside
+    assert {"WebFetch", "WebSearch", "Bash(curl:*)", "Bash(wget:*)"} <= denied
+    # credential + raw-API escape hatches around the gh guardrails
+    assert {"Bash(gh auth:*)", "Bash(gh secret:*)", "Bash(gh api:*)"} <= denied
+    # secrets on disk, at the root and at any depth
+    assert {"Read(.env)", "Read(.env.*)", "Read(**/.env)", "Read(**/.env.*)"} <= denied
+    assert {"Read(**/*.pem)", "Read(**/id_rsa*)"} <= denied
+
+
+def test_deny_list_keeps_the_fixer_able_to_work():
+    # Denying these would break the harness itself: the adversarial pre-PR review
+    # is a Task subagent, and the whole TDD loop is git/test/gh Bash calls.
+    assert "Task" not in FIXER_DENY
+    assert "Bash" not in FIXER_DENY
+    assert not any(d.startswith("Bash(git") or d.startswith("Bash(gh pr")
+                   or d.startswith("Bash(gh issue") for d in FIXER_DENY)
+
+
+# ── AGENT.md prompt diet on resumed legs (P4.5) ──
+def _resuming_builders(session: str):
+    from issue_agent.app.planners.tasks import build_rebase_task
+    return {
+        "resume": build_resume_task("reply", "/wt", session, FIX_CFG),
+        "address_review": build_address_review_task(9, "rb", "il", "/wt", session, FIX_CFG),
+        "fix_ci": build_fix_ci_task(9, "fail", "log", "/wt", session, FIX_CFG),
+        "rebase": build_rebase_task(9, "dev", "/wt", session, FIX_CFG),
+    }
+
+
+def test_resumed_legs_do_not_repay_for_agent_md():
+    # AGENT.md is already in the resumed transcript server-side; re-appending it
+    # buys nothing and is billed again every round.
+    for name, task in _resuming_builders("sess-1").items():
+        assert task.append_system_prompt != "AGENTMD", f"{name} re-appended AGENT.md"
+        assert "AGENTMD" not in task.append_system_prompt, name
+        # …but the contract must still be asserted as in force.
+        low = task.append_system_prompt.lower()
+        assert "still applies" in low and "agent.md" in low, name
+        assert len(task.append_system_prompt) < 1000, f"{name} reminder is not short"
+
+
+def test_forked_legs_also_skip_agent_md():
+    # A fork inherits the parent transcript, so AGENT.md is in-context there too.
+    t = build_resume_task("reply", "/wt", "sess-1", FIX_CFG, fork=True)
+    assert t.fork_session is True
+    assert "AGENTMD" not in t.append_system_prompt
+
+
+def test_fresh_legs_still_get_the_full_agent_md():
+    # No session id → nothing is in context yet; the full contract must be sent.
+    for name, task in _resuming_builders("").items():
+        assert task.append_system_prompt == "AGENTMD", f"{name} dropped AGENT.md"
+    for name in ("resolve", "author", "implement", "adjudicate"):
+        assert _every_fixer_task()[name].append_system_prompt == "AGENTMD", name
+
+
+# ── diff scoping (P4.2) ──
+MULTI_DIFF = (
+    "diff --git a/src/app/pay.py b/src/app/pay.py\n"
+    "index 111..222 100644\n"
+    "--- a/src/app/pay.py\n"
+    "+++ b/src/app/pay.py\n"
+    "@@ -1,3 +1,4 @@\n"
+    " def charge(x):\n"
+    "-    return x\n"
+    "+    return x * RATE\n"
+    "diff --git a/README.md b/README.md\n"
+    "--- a/README.md\n"
+    "+++ b/README.md\n"
+    "@@ -1 +1 @@\n"
+    "-old docs\n"
+    "+new docs\n"
+    "diff --git a/tests/test_pay.py b/tests/test_pay.py\n"
+    "--- a/tests/test_pay.py\n"
+    "+++ b/tests/test_pay.py\n"
+    "@@ -1 +1,2 @@\n"
+    "+def test_charge(): assert charge(2) == 4\n"
+)
+
+
+def test_scope_diff_keeps_only_the_named_files_hunks():
+    out = scope_diff(MULTI_DIFF, ["src/app/pay.py"])
+    assert "return x * RATE" in out              # the named file's hunk survives
+    assert "@@ -1,3 +1,4 @@" in out              # hunk header kept intact
+    assert "new docs" not in out                 # unrelated files dropped
+    assert "test_charge" not in out
+
+
+def test_scope_diff_matches_bare_and_b_side_names():
+    # findings are LLM-written: a bare filename and a b/-prefixed one both resolve.
+    assert "return x * RATE" in scope_diff(MULTI_DIFF, ["pay.py"])
+    assert "return x * RATE" in scope_diff(MULTI_DIFF, ["b/src/app/pay.py"])
+
+
+def test_scope_diff_does_not_match_on_a_partial_component():
+    # `ay.py` is a suffix of `pay.py` but not a path component of it.
+    assert scope_diff(MULTI_DIFF, ["ay.py"]) == ""
+
+
+def test_scope_diff_multiple_paths_and_context_files():
+    out = scope_diff(MULTI_DIFF, ["src/app/pay.py", "tests/test_pay.py"])
+    assert "return x * RATE" in out and "test_charge" in out
+    assert "new docs" not in out
+    # context_files pulls in neighbouring sections
+    ctx = scope_diff(MULTI_DIFF, ["README.md"], context_files=1)
+    assert "new docs" in ctx and "return x * RATE" in ctx and "test_charge" in ctx
+
+
+def test_scope_diff_returns_empty_on_no_match_or_bad_input():
+    assert scope_diff(MULTI_DIFF, ["nope/absent.py"]) == ""
+    assert scope_diff(MULTI_DIFF, []) == ""
+    assert scope_diff("", ["src/app/pay.py"]) == ""
+    assert scope_diff("   \n\n", ["src/app/pay.py"]) == ""
+    assert scope_diff("not a diff at all", ["src/app/pay.py"]) == ""
+    assert scope_diff("x" * 100_000, ["src/app/pay.py"]) == ""
+
+
+def test_scope_diff_handles_headerless_unified_diff():
+    plain = (
+        "--- old/pay.py\n+++ new/pay.py\n@@ -1 +1 @@\n-a\n+b\n"
+        "--- old/other.py\n+++ new/other.py\n@@ -1 +1 @@\n-c\n+d\n"
+    )
+    out = scope_diff(plain, ["pay.py"])
+    assert "+b" in out and "+d" not in out
+
+
+def test_scope_diff_ignores_dev_null_side_of_an_added_file():
+    added = (
+        "diff --git a/src/new.py b/src/new.py\n"
+        "--- /dev/null\n+++ b/src/new.py\n@@ -0,0 +1 @@\n+x = 1\n"
+    )
+    assert "x = 1" in scope_diff(added, ["src/new.py"])
+    assert scope_diff(added, ["/dev/null"]) == ""
 
 
 # ── review ──
@@ -227,6 +390,33 @@ def test_review_validation_task_is_adversarial():
     assert t.model == "haiku"
     assert "REFUTE" in t.prompt
     assert "a.py:10" in t.prompt and "off-by-one" in t.prompt
+
+
+def test_review_validation_task_scopes_the_diff_to_the_finding():
+    t = build_review_validation_task(
+        100, "correctness", "src/app/pay.py:7", "off-by-one", MULTI_DIFF, RCFG)
+    assert "return x * RATE" in t.prompt          # the finding's own file is present
+    assert "new docs" not in t.prompt             # the rest of the PR is not paid for
+    assert "test_charge" not in t.prompt
+    assert "SCOPED" in t.prompt                   # told why other files are missing
+
+
+def test_review_validation_task_falls_back_to_the_full_diff():
+    # An unresolvable location must never leave the refuter with an empty diff —
+    # it would refute everything by default and silently drop real findings.
+    t = build_review_validation_task(
+        100, "security", "somewhere in the payment flow", "leaks a token",
+        MULTI_DIFF, RCFG)
+    assert "return x * RATE" in t.prompt and "new docs" in t.prompt
+    assert "SCOPED" not in t.prompt
+
+
+def test_review_validation_task_falls_back_on_unknown_path_or_bad_diff():
+    t = build_review_validation_task(
+        100, "correctness", "vendor/absent.py:3", "bug", MULTI_DIFF, RCFG)
+    assert "new docs" in t.prompt                 # full diff, not an empty one
+    t2 = build_review_validation_task(100, "correctness", "a.py:1", "bug", "", RCFG)
+    assert t2.schema is REVIEW_VALIDATION_SCHEMA  # empty diff does not explode
 
 
 def test_review_dimensions_cover_the_core_lenses():
