@@ -10,7 +10,7 @@ import os
 from dataclasses import dataclass, fields
 
 from ..domain.identity import normalize_login
-from ..domain.review import ReviewMode
+from ..domain.review import IdentityMode, ReviewMode
 
 
 @dataclass(frozen=True)
@@ -18,7 +18,7 @@ class RepositoryConfig:
     repo: str
     base_branch: str
     target_dir: str
-    identity_mode: str
+    identity_mode: IdentityMode
 
 
 @dataclass(frozen=True)
@@ -111,7 +111,7 @@ class HarnessConfig:
     repo: str
     base_branch: str = "dev"
     target_dir: str = ""
-    identity_mode: str = "three"
+    identity_mode: IdentityMode = IdentityMode.THREE
     fix_bot: str = ""
     review_bot: str = "my-reviewer-bot[bot]"
     steward_bot: str = "my-reviewer-bot[bot]"
@@ -410,7 +410,7 @@ class HarnessConfig:
             # poll: an empty REPO means a missing/mis-composed overlay (the
             # silent-default class, #50).
             errors.append("REPO must be set (owner/name) — is the repo overlay composed?")
-        if self.identity_mode == "three" and normalize_login(self.fix_bot) == normalize_login(
+        if self.identity_mode == IdentityMode.THREE and normalize_login(self.fix_bot) == normalize_login(
             self.review_bot
         ):
             # review C1/D1 belt-and-braces: a raw string compare would miss
@@ -462,7 +462,10 @@ class HarnessConfig:
 
         return "\n".join([
             f"repo={self.repo or '(UNSET)'} base={self.base_branch} "
-            f"identity={self.identity_mode} poll={self.poll_seconds}s",
+            # getattr, not IdentityMode(...): describe() is the startup diagnostic
+            # and must print whatever it was handed rather than raise on it.
+            f"identity={getattr(self.identity_mode, 'value', self.identity_mode)} "
+            f"poll={self.poll_seconds}s",
             f"fixer={self.fixer_runtime} fix_model={model(self.fix_model)} "
             f"fix_budget=${self.fix_budget_usd:.2f}",
             f"review_model={model(self.review_model)} mode={self.review_mode.value} "
@@ -559,6 +562,33 @@ def _coerce_float(env: dict, key: str, default: float, errors: list[str]) -> flo
         return default
 
 
+def _coerce_identity_mode(env: dict, errors: list[str]) -> IdentityMode:
+    """IDENTITY_MODE → `IdentityMode`, with the same contract as `_coerce_int`:
+    empty/absent = unset (the field default), malformed = the default PLUS a
+    readable entry in validation_errors() (review M16).
+
+    `IDENTITY_MODE=Three` used to pass straight through as a string and land
+    BETWEEN the two guards that read it — `!= "three"` disabled auto-merge while
+    `== "solo"` left the reviewer enabled, so the harness reviewed, approved and
+    then never merged anything, with no log line naming the cause. There is no
+    safe silent fallback for this knob, so the value has to be named as wrong at
+    startup where `validate()` can refuse to run on it."""
+    raw = env.get("IDENTITY_MODE")
+    default: IdentityMode = _dc_default("identity_mode")
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return IdentityMode.from_env(raw)
+    except ValueError:
+        allowed = "|".join(m.value for m in IdentityMode)
+        errors.append(
+            f"IDENTITY_MODE must be exactly one of {allowed}, got {raw!r} "
+            f"(case-sensitive — the bash half compares it literally) — "
+            f"using default {default.value}"
+        )
+        return default
+
+
 def _repo_slug(repo: str) -> str:
     """`owner/name` → `owner-name`, a filesystem-safe per-repo state-dir
     component (review M5/D7). Unset/blank REPO falls back to a fixed "unknown"
@@ -589,7 +619,7 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         repo=repo,
         base_branch=e.get("BASE_BRANCH", _dc_default("base_branch")),
         target_dir=e.get("TARGET_DIR", _dc_default("target_dir")),
-        identity_mode=e.get("IDENTITY_MODE", _dc_default("identity_mode")),
+        identity_mode=_coerce_identity_mode(e, errors),
         fix_bot=e.get("FIX_BOT", _dc_default("fix_bot")),
         # Default to the shared GitHub App login so an operator only needs to
         # supply the App credentials (GH_APP_*), not restate the bot name. Override

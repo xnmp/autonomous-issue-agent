@@ -18,11 +18,19 @@ Read it as: given this classification, what does the leg's `*_actions` emit?
     outcome        resolve                resume                 address-review        fix-ci / rebase
     -------------  ---------------------  ---------------------  --------------------  ------------------
     PR opened      →ai-pr-open (+PR)      →ai-pr-open (+PR)      n/a                   n/a
-    blocked        ask + →ai-blocked      ask + →ai-blocked      ask + +ai-blocked,    clear + +ai-blocked
+    blocked        ask + →ai-blocked      ask + →ai-blocked      ask + +ai-blocked,    +ai-blocked
                                                                  NO retry bump
-    error          →ai-ready (requeue)    →ai-blocked  (*)       clear + retry bump    clear (+ retry bump)
-    infra death    (no move — stay        (no move — stay        clear, NO retry bump  clear, NO retry bump
-                   ai-working)            ai-working)
+    error          →ai-ready (requeue)    →ai-blocked  (*)       retry bump, no move   no move (+ retry bump)
+    infra death    (no move — stay        (no move — stay        no move, NO retry     no move, NO retry
+                   ai-working)            ai-working)            bump                  bump
+
+The author/implement legs (AUTHOR_TESTS_SPLIT) read as extra rows of the resolve
+column: AUTHORED keeps ai-working for the implementer, blocked asks, error
+requeues, and an infra death moves nothing (review M15).
+
+The two PR columns move NO label except on blocked, because the PR-side
+`ai-working` remove they used to open with was deleted (review M22/D9): nothing
+ever added that label, so it was a `gh` call per leg removing nothing.
 
 (*) The resolve-ERROR→`ai-ready` vs resume-ERROR→`ai-blocked` divergence is
 INTENTIONAL, not an oversight. A resolve error is unattended work that must never
@@ -219,10 +227,21 @@ def author_followup(result: AgentResult) -> AuthorFollowup:
 def author_actions(issue: int, result: AgentResult) -> list[Action]:
     """author leg tail. AUTHORED → keep ai-working (the implementer leg picks it up
     on the next dispatch; the phase marker is persisted by the dispatcher). BLOCKED
-    → ask the human + ai-blocked. ERROR → back to ai-ready (never strand)."""
+    → ask the human + ai-blocked. ERROR → back to ai-ready (never strand);
+    infra death → NOTHING (stay ai-working for the reaper, like every other leg)."""
     fu = author_followup(result)
     if fu is AuthorFollowup.AUTHORED:
         return []  # stay ai-working; dispatcher persists phase=authored
+    # The same guard the other three tails carry (review M15) — this leg was the
+    # one that missed it. `author_followup` maps a killed session to RETRY, so an
+    # OOM'd author leg relabelled ai-working→ai-ready, the fixer re-picked the
+    # issue next poll, and the author leg was dispatched into the same OOM: a
+    # relabel→dispatch→kill loop at full session cost with no breaker in it (the
+    # infra-death ceiling only counts, it doesn't stop the requeue). Emitting
+    # nothing leaves the issue ai-working, which is the designed settle path —
+    # see the module docstring's "infra deaths are not attempts".
+    if infra_death(result.exit_reason):
+        return []
     if fu is AuthorFollowup.BLOCKED:
         needs = result.needs or result.summary or "see logs"
         return [
@@ -330,14 +349,17 @@ class AddressReviewOutcome:
 
 
 def address_review_actions(pr: int, result: AgentResult) -> AddressReviewOutcome:
-    # The watcher added ai-working before dispatch; the tail always clears it.
-    clear_working = Relabel(Target.PR, pr, Label.AI_WORKING, None)
+    """The clear-ai-working relabel this tail used to open with is GONE (review
+    M22/D9): nothing in the SDK port ever ADDS ai-working to a PR, so every
+    address-review leg spent a real `gh pr edit --remove-label` call removing a
+    label that was never there — a busy-marker protocol with only a receiving
+    half. Single-fixer is enforced by process topology (see `decide_fix`), so
+    the ok/error paths now emit nothing at all."""
     if infra_death(result.exit_reason):
-        # An external kill is not an attempt. Clear ai-working (the PR must not
-        # look busy) but leave the breaker where it was — otherwise a machine
-        # under memory pressure walks a healthy PR to needs-human-review without
-        # the fixer ever having read the review.
-        return AddressReviewOutcome([clear_working], bump_retry=False)
+        # An external kill is not an attempt: leave the breaker where it was, or
+        # a machine under memory pressure walks a healthy PR to
+        # needs-human-review without the fixer ever having read the review.
+        return AddressReviewOutcome([], bump_retry=False)
     if classify_outcome(result) is Outcome.BLOCKED:
         body = (
             "**Agent needs clarification on review:**\n\n"
@@ -345,25 +367,25 @@ def address_review_actions(pr: int, result: AgentResult) -> AddressReviewOutcome
         )
         # blocked: do NOT burn a retry; ai-blocked stops re-dispatch until a reply.
         return AddressReviewOutcome(
-            [clear_working, PostComment(Target.PR, pr, body),
+            [PostComment(Target.PR, pr, body),
              Relabel(Target.PR, pr, None, Label.AI_BLOCKED)]
         )
     # ok AND error both count: only a superseding review proves progress.
-    return AddressReviewOutcome([clear_working], bump_retry=True)
+    return AddressReviewOutcome([], bump_retry=True)
 
 
 def fix_ci_actions(pr: int, result: AgentResult) -> list[Action]:
-    """fix-ci.sh tail. Always clear ai-working; on blocked also add ai-blocked.
-    (The pushed/ok path just clears ai-working — CI re-runs and the watcher
-    re-evaluates next poll.) On infra death: clear only — never add ai-blocked
-    for a session that was killed rather than stuck, and the CALLER additionally
-    skips its retry bump (see app/workflows/fix.py)."""
-    clear_working = Relabel(Target.PR, pr, Label.AI_WORKING, None)
+    """fix-ci.sh tail (also the rebase tail). ONLY blocked moves a label: add
+    ai-blocked so the watcher stops re-dispatching until a human replies. The
+    pushed/ok/error paths emit nothing — CI re-runs and the watcher re-evaluates
+    next poll. On infra death: nothing either — never add ai-blocked for a
+    session that was killed rather than stuck, and the CALLER additionally skips
+    its retry bump (see app/workflows/fix.py).
+
+    The clear-ai-working relabel that used to lead every one of these branches
+    is GONE (review M22/D9) — see `address_review_actions` for why."""
     if infra_death(result.exit_reason):
-        return [clear_working]
-    outcome = classify_outcome(result)
-    if outcome is Outcome.OK or result.status == "pushed":
-        return [clear_working]
-    if outcome is Outcome.BLOCKED:
-        return [clear_working, Relabel(Target.PR, pr, None, Label.AI_BLOCKED)]
-    return [clear_working]
+        return []
+    if classify_outcome(result) is Outcome.BLOCKED:
+        return [Relabel(Target.PR, pr, None, Label.AI_BLOCKED)]
+    return []

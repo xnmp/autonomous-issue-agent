@@ -165,6 +165,68 @@ def test_pr_tautological_test_blocked():
     assert not v.allowed and "tautological" in v.reason
 
 
+# ── PR gate ORDERING (review M21) ─────────────────────────────────────────────
+# `_pr_gate` used to evaluate every rule eagerly and only ever report
+# `reasons[0]` — so a trivial, cheap denial (e.g. the wrong --base) still paid
+# for check_tests AND check_red_fails (both run the full TEST_CMD; the latter
+# also mutates the worktree via revert_and_run) before the agent ever saw it,
+# up to 2×GATE_TEST_TIMEOUT_S (600s default each). These pin the reorder:
+# cheap structural checks first, short-circuiting on the first denial, so the
+# suite-running checks are never even invoked once a cheap one has failed.
+def _counting(return_value):
+    """A fake callable that records how many times it was invoked — the
+    "assert on the money" pattern: proving a check did NOT run is stronger
+    than asserting on the verdict alone."""
+    calls = {"n": 0}
+
+    def fn(*_args, **_kwargs):
+        calls["n"] += 1
+        return return_value
+
+    return fn, calls
+
+
+def test_pr_gate_short_circuits_cheap_denial_before_running_expensive_checks():
+    """A cheap, wrong-base denial must arrive WITHOUT ever running
+    check_tests or check_red_fails."""
+    run_tests, run_calls = _counting(True)
+    revert_and_run, revert_calls = _counting(False)
+    c = GateContext(**{
+        **_good_pr_ctx().__dict__,
+        "run_tests": run_tests,
+        "revert_and_run": revert_and_run,
+    })
+    cmd = (
+        "gh pr create --base wrong-branch --title t "
+        "--body '## Acceptance Criteria\n- x\n\nFixes #5'"
+    )
+
+    v = evaluate_command(cmd, c)
+
+    assert not v.allowed and "base" in v.reason.lower()
+    assert run_calls["n"] == 0      # check_tests: never invoked
+    assert revert_calls["n"] == 0   # check_red_fails: never invoked (worktree untouched)
+
+
+def test_pr_gate_runs_expensive_checks_when_nothing_cheap_denies():
+    """Anti-vacuity twin: the short-circuit must not accidentally skip the
+    suite-running checks on a genuinely compliant PR — both must actually run
+    exactly once."""
+    run_tests, run_calls = _counting(True)
+    revert_and_run, revert_calls = _counting(False)  # False ⇒ genuinely red ⇒ ALLOW
+    c = GateContext(**{
+        **_good_pr_ctx().__dict__,
+        "run_tests": run_tests,
+        "revert_and_run": revert_and_run,
+    })
+
+    v = evaluate_command(_good_pr_cmd(), c)
+
+    assert v.allowed
+    assert run_calls["n"] == 1
+    assert revert_calls["n"] == 1
+
+
 # ── push gate (open-PR-only, LAZY probe) — review known-gap-2 ─────────────────
 # The hole this section pins: `has_open_pr` defaulted False and the builder never
 # populated it, so on the SDK path EVERY push to an open PR (every

@@ -1,11 +1,15 @@
 """Worktree management + GateContext builder, driven by a fake git runner."""
 
+import os
 import subprocess
+
+import pytest
 
 from issue_agent.adapters import worktree as wt_mod
 from issue_agent.adapters.governor import evaluate_command
 from issue_agent.adapters.worktree import (
     GitResult,
+    WorktreeUnavailable,
     Worktrees,
     build_gate_context,
     worktree_list_contains_issue,
@@ -36,7 +40,9 @@ class FakeGit:
 
 def test_ensure_reuses_existing_worktree():
     fg = FakeGit({"worktree list": GitResult(0, "worktree /repo/.claude/worktrees/issue-5\n")})
-    wt = Worktrees("/repo", run=fg)
+    # /repo isn't a real directory in the test environment — the honesty check
+    # (M20, below) is exercised separately; these git-wiring tests fake it away.
+    wt = Worktrees("/repo", run=fg, path_exists=lambda p: True)
     path = wt.ensure(5, "fix/5-x")
     assert path.endswith("issue-5")
     # existing → no `worktree add`
@@ -59,7 +65,7 @@ def test_ensure_does_not_reuse_issue_with_prefix_collision():
         "worktree list": GitResult(0, "worktree /repo/.claude/worktrees/issue-50\n"),
         "show-ref": GitResult(1, ""),
     })
-    Worktrees("/repo", base_branch="dev", run=fg).ensure(5, "fix/5-x")
+    Worktrees("/repo", base_branch="dev", run=fg, path_exists=lambda p: True).ensure(5, "fix/5-x")
 
     assert any(a[0][:2] == ["worktree", "add"] for a in fg.calls)
 
@@ -69,10 +75,101 @@ def test_ensure_creates_from_base_when_no_branch():
         "worktree list": GitResult(0, ""),                 # none yet
         "show-ref": GitResult(1, ""),                       # branch doesn't exist
     })
-    wt = Worktrees("/repo", base_branch="dev", run=fg)
+    wt = Worktrees("/repo", base_branch="dev", run=fg, path_exists=lambda p: True)
     wt.ensure(5, "fix/5-x")
     add = [a for a in fg.calls if a[0][:2] == ["worktree", "add"]]
     assert add and "-b" in add[0][0] and "origin/dev" in add[0][0]
+
+
+# ── M20: `ensure` must be HONEST about readiness ──────────────────────────────
+def test_ensure_raises_when_every_worktree_add_attempt_fails():
+    """Before this, `ensure` returned the path regardless of whether any
+    `worktree add` actually succeeded — the caller logged "ready" and
+    dispatched the agent into a directory that was never created. With the
+    REAL default `path_exists` (os.path.isdir) and a repo dir that plainly
+    doesn't exist on disk, `ensure` must raise rather than lie."""
+    fg = FakeGit({
+        "worktree list": GitResult(0, ""),                       # none yet
+        "show-ref": GitResult(1, ""),                             # branch doesn't exist
+        "worktree add": GitResult(1, "fatal: boom"),              # every add attempt fails
+    })
+    wt = Worktrees("/definitely/not/a/real/repo-dir", base_branch="dev", run=fg)
+
+    with pytest.raises(WorktreeUnavailable):
+        wt.ensure(5, "fix/5-x")
+
+
+def test_ensure_returns_real_path_when_worktree_add_actually_creates_it(tmp_path):
+    """Anti-vacuity twin: when a 'worktree add' genuinely produces the
+    directory, `ensure` must still succeed — the honesty check is a real
+    verification, not a trap that also denies the success path. Uses the REAL
+    default `path_exists` against a real tmp_path directory."""
+    repo_dir = str(tmp_path)
+    expected_rel = Worktrees(repo_dir).path(7)
+    expected_abs = os.path.join(repo_dir, expected_rel)
+
+    def git(args, cwd):
+        if args[:2] == ["worktree", "add"]:
+            os.makedirs(expected_abs, exist_ok=True)
+            return GitResult(0, "")
+        if args[0] == "show-ref":
+            return GitResult(1, "")
+        return GitResult(0, "")
+
+    wt = Worktrees(repo_dir, base_branch="dev", run=git)
+
+    path = wt.ensure(7, "fix/7-x")
+
+    assert path == expected_abs
+    assert os.path.isdir(path)
+
+
+# ── M20: the git runner must be bounded and must surface failures ────────────
+def test_default_git_runner_times_out_and_reports_rather_than_hanging(tmp_path, monkeypatch, capsys):
+    """A hanging `git` subprocess must be killed and reported as a failure, not
+    hang the daemon or the agent's session — same failure class as the 14-min
+    `gh pr view` hang (github.py's `_GH_TIMEOUT_S`). Uses a REAL subprocess: a
+    fake `git` on PATH that sleeps, with `_GIT_TIMEOUT_S` monkeypatched tiny."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text("#!/bin/sh\nsleep 5\n")
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ.get('PATH', '')}")
+    monkeypatch.setattr(wt_mod, "_GIT_TIMEOUT_S", 0.2)
+
+    result = wt_mod._subprocess_git(["status"], str(tmp_path))
+
+    assert result.code != 0            # reported as failure, never a silent pass
+    err = capsys.readouterr().err
+    assert "timed out" in err.lower()
+
+
+def test_default_git_runner_surfaces_stderr_on_failure(tmp_path, monkeypatch, capsys):
+    """A non-zero `git` exit must be surfaced (not silently swallowed) so a
+    wedged worktree op is visible in the daemon log — the other half of M20."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text("#!/bin/sh\necho 'fatal: kaboom' >&2\nexit 1\n")
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ.get('PATH', '')}")
+
+    result = wt_mod._subprocess_git(["worktree", "add", "x", "y"], str(tmp_path))
+
+    assert result.code == 1
+    err = capsys.readouterr().err
+    assert "kaboom" in err
+
+
+def test_default_git_runner_real_success_path_unaffected(tmp_path):
+    """Anti-vacuity twin: the timeout/stderr-surfacing changes must not disturb
+    the ordinary (fast, well-behaved) case — a real `git` invocation still
+    returns its stdout untouched."""
+    result = wt_mod._subprocess_git(["--version"], str(tmp_path))
+
+    assert result.code == 0
+    assert "git version" in result.out
 
 
 def test_remove_calls_remove_and_prune():

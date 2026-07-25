@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..domain.agent_task import AgentRuntime, AgentTask
-from ..domain.outcome import AgentResult, ExitReason
+from ..domain.outcome import AgentResult, ExitReason, Outcome, classify_outcome
 
 
 # Model the CodexRunner defaults to when neither CODEX_MODEL nor a task's `model`
@@ -157,13 +157,173 @@ def build_codex_argv(
     return argv
 
 
+# ── token accounting (review M1 / plan D12) ──────────────────────────────────
+# Codex reports no dollar figure — there is no `total_cost_usd` anywhere on the
+# `codex exec` path — so tokens × a configured price table is the ONLY substrate
+# from which codex spend can reach the ledger. Without it `cost_usd` stays 0.0,
+# the ledger write is gated on `cost > 0` (journal.py), and BOTH spend caps are
+# blind to every codex run by construction (review M1).
+#
+# Two stderr shapes seen across codex-cli versions. Both are matched WITHIN one
+# line (never spanning lines), so an "input=" from one trace line and an
+# "output=" from another can never be stitched into a fake usage report:
+#   "Token usage: total=52341 input=48000 (+ 12000 cached) output=4341"
+#   "tokens used: 52341"           (older exec builds — total only, no split)
+_TOKEN_SPLIT_RE = re.compile(
+    r"input[\s_-]*(?:tokens)?[=:\s]+([\d,]+)"
+    r"(?:[^\d]{0,20}\+\s*([\d,]+)\s*cached)?"
+    r"[^\d]{0,40}?output[\s_-]*(?:tokens)?[=:\s]+([\d,]+)",
+    re.IGNORECASE,
+)
+_TOKEN_TOTAL_RE = re.compile(
+    r"tokens?[\s_-]*used[=:\s]+([\d,]+)|token[\s_-]*usage[^\d]{0,20}total[=:\s]+([\d,]+)",
+    re.IGNORECASE,
+)
+
+
+def _int_tokens(raw: str | None) -> int:
+    if not raw:
+        return 0
+    try:
+        return int(raw.replace(",", ""))
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_codex_usage(stderr: str) -> dict | None:
+    """Pure: codex stderr → the token counters, or None when codex printed none.
+
+    Shaped like the SDK usage block (`adapters.journal._USAGE_KEYS`) so the
+    journal records codex and Claude runs identically. `total_tokens` is carried
+    ONLY on the older total-only line, where no input/output split exists;
+    `cache_creation_input_tokens` is always 0 (codex reports no such counter, and
+    inventing one would be a fabricated receipt).
+
+    The LAST matching line wins: codex prints its usage line once, at the end,
+    and it is cumulative for the session — so a later line supersedes an earlier
+    one rather than adding to it.
+
+    Unlike the retry classifiers (see `_stderr_tail`), this deliberately reads
+    the WHOLE buffer. The two have opposite worst cases: a missed transport
+    signature costs one retry, whereas a missed usage line costs the accounting
+    entirely — back to $0.00 and caps that cannot see codex, which is the very
+    hole M1 describes. Last-match-wins already makes codex's own trailing line
+    beat anything the agent echoed earlier."""
+    found: dict | None = None
+    for line in (stderr or "").splitlines():
+        m = _TOKEN_SPLIT_RE.search(line)
+        if m:
+            found = {
+                "input_tokens": _int_tokens(m.group(1)),
+                "output_tokens": _int_tokens(m.group(3)),
+                "cache_read_input_tokens": _int_tokens(m.group(2)),
+                "cache_creation_input_tokens": 0,
+            }
+            continue
+        m2 = _TOKEN_TOTAL_RE.search(line)
+        if m2:
+            found = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "total_tokens": _int_tokens(m2.group(1) or m2.group(2)),
+            }
+    return found
+
+
+def codex_cost_usd(
+    usage: dict | None, *, cost_per_mtok_in: float, cost_per_mtok_out: float
+) -> float:
+    """Pure: token counters × the configured USD-per-MILLION-token rates.
+
+    Both rates 0 (the default) → 0.0: pricing is opt-in because it is
+    gateway-specific, and a wrong price table is worse than a loud "the caps
+    cannot see this runtime" warning (see `codex_cost_blindspot_warning`).
+
+    An older codex that printed only a TOTAL is priced at the HIGHER of the two
+    rates. Caps exist to stop runaway spend, so the only safe rounding direction
+    is over-estimation — an under-counted cap is a cap that never fires."""
+    if not isinstance(usage, dict):
+        return 0.0
+    rate_in = max(float(cost_per_mtok_in or 0.0), 0.0)
+    rate_out = max(float(cost_per_mtok_out or 0.0), 0.0)
+    if rate_in <= 0 and rate_out <= 0:
+        return 0.0
+    tokens_in = int(usage.get("input_tokens", 0) or 0)
+    tokens_out = int(usage.get("output_tokens", 0) or 0)
+    if tokens_in or tokens_out:
+        # Cached input reads are already inside `input_tokens` on the codex line
+        # (it prints "input=N (+ M cached)"), so they are NOT added again.
+        return (tokens_in * rate_in + tokens_out * rate_out) / 1_000_000.0
+    total = int(usage.get("total_tokens", 0) or 0)
+    return total * max(rate_in, rate_out) / 1_000_000.0
+
+
+def codex_cost_blindspot_warning(
+    *,
+    cost_per_mtok_in: float,
+    cost_per_mtok_out: float,
+    issue_spend_cap_usd: float,
+    daily_spend_cap_usd: float,
+    max_runtime: float = 0.0,
+) -> str | None:
+    """The ONE startup line D12 requires: with a spend cap armed but no codex
+    price table, every codex run costs $0.00 on the ledger and neither cap can
+    ever fire. Returns None (silence) when the rates ARE configured or when no
+    cap is armed — there is nothing to mislead the operator about.
+
+    Both rates must be >0 to count as configured: pricing only the input side
+    still under-counts every run, which is the same blind spot in weaker form.
+
+    The second half is D12's other half: `build_codex_argv` has no analogue of
+    the SDK's per-session budget (`AgentTask.max_budget_usd`), so once dispatch
+    starts, the wall cap is the only thing bounding one run's spend."""
+    if cost_per_mtok_in > 0 and cost_per_mtok_out > 0:
+        return None
+    if issue_spend_cap_usd <= 0 and daily_spend_cap_usd <= 0:
+        return None
+    caps = ", ".join(
+        part
+        for part in (
+            f"issue=${issue_spend_cap_usd:.2f}" if issue_spend_cap_usd > 0 else "",
+            f"daily=${daily_spend_cap_usd:.2f}" if daily_spend_cap_usd > 0 else "",
+        )
+        if part
+    )
+    bound = (
+        f"the wall cap (CODEX_MAX_RUNTIME_SECONDS={max_runtime:.0f}s)"
+        if max_runtime > 0
+        else "NOTHING (CODEX_MAX_RUNTIME_SECONDS is unset — set it)"
+    )
+    return (
+        "codex: WARNING — spend caps are armed "
+        f"({caps}) but CODEX_COST_PER_MTOK_IN/OUT are unset, so every codex run "
+        "records $0.00 and NEITHER cap can ever fire. Set both to your gateway's "
+        "USD-per-million-token prices. Note also that codex has no per-session "
+        f"budget flag (MAX_BUDGET_USD is a Claude-SDK-only bound), so {bound} "
+        "limits a single run. (FIXER_RUNTIME=codex)"
+    )
+
+
 def parse_codex_envelope(
-    *, exit_code: int, last_message: str, session_id: str = "", stderr: str = ""
+    *,
+    exit_code: int,
+    last_message: str,
+    session_id: str = "",
+    stderr: str = "",
+    cost_per_mtok_in: float = 0.0,
+    cost_per_mtok_out: float = 0.0,
 ) -> AgentResult:
     """Pure: codex exec result → AgentResult. Mirrors result_to_agent_result —
     decision read from the ENVELOPE (the -o JSON), not the exit code. is_error
     only when there is no parseable envelope AND exit was non-zero, OR the
-    envelope itself signals an error status."""
+    envelope itself signals an error status.
+
+    Token usage is read off `stderr` (codex's only usage report) and priced with
+    the caller's rates — review M1: this is what makes codex spend visible to the
+    ledger and therefore to both spend caps. A run that DIED still burned tokens,
+    so usage/cost ride on every return path, not just the happy one."""
     structured: dict | None = None
     raw = (last_message or "").strip()
     if raw:
@@ -174,6 +334,11 @@ def parse_codex_envelope(
         except (json.JSONDecodeError, ValueError):
             structured = None
 
+    usage = parse_codex_usage(stderr)
+    cost = codex_cost_usd(
+        usage, cost_per_mtok_in=cost_per_mtok_in, cost_per_mtok_out=cost_per_mtok_out
+    )
+
     if structured is None:
         # No envelope. If codex also exited non-zero, it's a genuine failure;
         # otherwise surface the free text as the summary (best-effort).
@@ -182,10 +347,13 @@ def parse_codex_envelope(
                 is_error=True,
                 summary=(stderr.strip() or raw or f"codex exec exit {exit_code}")[:2000],
                 session_id=session_id,
+                cost_usd=cost,
+                usage=usage,
                 exit_reason=ExitReason.AGENT_ERROR,
             )
         return AgentResult(
             is_error=False, summary=raw[:2000], session_id=session_id,
+            cost_usd=cost, usage=usage,
             exit_reason=ExitReason.OK,
         )
 
@@ -198,7 +366,10 @@ def parse_codex_envelope(
         status=status,
         summary=summary,
         needs=needs,
-        cost_usd=0.0,  # codex exposes no per-run cost; left 0 (see model-catalog note)
+        # Priced from the token counters codex prints (review M1): 0.0 only when
+        # no rates are configured or codex printed no usage line.
+        cost_usd=cost,
+        usage=usage,
         session_id=session_id,
         structured=structured,
         # A parsed envelope means the agentic loop reached its own terminal —
@@ -270,6 +441,12 @@ class CodexRunner(AgentRuntime):
     rate_limit_backoff_base: float = 60.0
     max_rate_limit_wait: float = 180.0
     max_rate_limit_retries: int = 5
+    # Price table for codex spend (review M1 / D12), USD per MILLION tokens. Both
+    # 0 (the default) → cost_usd stays 0.0 and codex runs never reach the ledger,
+    # which is exactly the blind spot `codex_cost_blindspot_warning` announces at
+    # startup. Set them and every codex run becomes visible to both spend caps.
+    cost_per_mtok_in: float = 0.0
+    cost_per_mtok_out: float = 0.0
 
     def __post_init__(self) -> None:
         self._log = self.log or (lambda _m: None)
@@ -334,10 +511,6 @@ class CodexRunner(AgentRuntime):
         return None
 
     async def run(self, task: AgentTask) -> AgentResult:
-        import asyncio
-        import random
-        from dataclasses import replace
-
         # Fail LOUD, not opaque: if the runtime isn't set up, surface the exact
         # reason as the result summary (and log it) instead of a bare exit-1.
         reason = self.preflight()
@@ -345,7 +518,23 @@ class CodexRunner(AgentRuntime):
             self._log(f"codex: NOT READY — {reason}")
             return AgentResult(is_error=True, status="blocked", summary=reason)
 
-        tmpdir = tempfile.mkdtemp(prefix="codex-run-")
+        # Review M17: the per-run scratch dir used to be an un-removed mkdtemp, so
+        # a long-lived daemon leaked one `codex-run-*` directory (schema + the last
+        # envelope) per dispatch into /tmp. TemporaryDirectory removes it on EVERY
+        # exit path below — return, raise, or cancellation. `ignore_cleanup_errors`
+        # keeps a stray file codex left behind from turning teardown into a failed
+        # run; a leaked temp file must never be the reason an issue doesn't resolve.
+        with tempfile.TemporaryDirectory(
+            prefix="codex-run-", ignore_cleanup_errors=True
+        ) as tmpdir:
+            return await self._run_in(task, tmpdir)
+
+    async def _run_in(self, task: AgentTask, tmpdir: str) -> AgentResult:
+        """The retry loop, given a scratch dir whose lifetime `run` owns."""
+        import asyncio
+        import random
+        from dataclasses import replace
+
         schema_path = None
         if task.schema is not None:
             schema_path = os.path.join(tmpdir, "schema.json")
@@ -374,6 +563,12 @@ class CodexRunner(AgentRuntime):
         net_attempts = 0
         rl_attempts = 0
         while True:
+            # Review M17: truncate the envelope BEFORE each attempt. Codex writes
+            # `-o` only when a turn completes, so a retry after a mid-turn drop
+            # would otherwise re-read the PREVIOUS attempt's envelope and attribute
+            # it to this one — reporting a stale success (or a stale `blocked`) for
+            # a run that produced nothing.
+            _unlink_quietly(output_path)
             run_task = replace(task, resume=resume_id) if resume_id else task
             argv = build_codex_argv(
                 run_task,
@@ -672,6 +867,8 @@ class CodexRunner(AgentRuntime):
             last_message=last_message,
             session_id=session_id,
             stderr=stderr,
+            cost_per_mtok_in=self.cost_per_mtok_in,
+            cost_per_mtok_out=self.cost_per_mtok_out,
         )
         if exit_code < 0 and not hung:
             # A NEGATIVE returncode means terminated by signal -exit_code, and we did
@@ -729,33 +926,77 @@ _RETRY_AFTER_RE = re.compile(
 )
 
 
+# Review M17: retry classification reads only the TAIL of stderr, never the whole
+# accumulated trace. Codex streams the agent's entire tool output (test runs,
+# diffs, greps) to stderr, so substring-matching the full buffer let the agent's
+# OWN text decide retry policy — a test named `test_rate_limit_backoff` scrolling
+# past was read as provider pushback, bought 15 minutes of 60s waits, and then
+# laundered a genuine agent error into TRANSPORT_DEATH, the one exit reason the
+# breakers exempt. A fatal transport error is the LAST thing codex prints before
+# exiting, so the tail is where it lives; the window is generous enough to cover
+# codex's own post-error reconnect chatter.
+_CLASSIFY_TAIL_LINES = 20
+
+
+def _stderr_tail(stderr: str, lines: int = _CLASSIFY_TAIL_LINES) -> str:
+    """The last `lines` lines of stderr — the only window retry classification
+    may look at (see _CLASSIFY_TAIL_LINES)."""
+    return "\n".join((stderr or "").splitlines()[-lines:])
+
+
 def _is_transport_drop(exit_code: int, stderr: str, result: AgentResult) -> bool:
     """True iff this looks like a gateway stream drop worth retrying: codex
-    exited non-zero, its stderr carries a transport-drop signature, and no valid
-    success/blocked envelope was produced (a captured envelope means the turn
-    actually completed — never retry over real output)."""
+    exited non-zero, the TAIL of its stderr carries a transport-drop signature,
+    and no envelope was produced (a captured envelope means the turn actually
+    completed — never retry over real output).
+
+    Review M17: the "real output" guard defers to `classify_outcome`, the single
+    place that knows the schemas' terminal vocabulary. The old hand-copied tuple
+    had drifted — it listed `done` (in no schema) while MISSING `pushed`, so a
+    completed force-push whose connection died on the way out was re-run on
+    resume: duplicate spend on the one branch-mutating leg. Deferring means a new
+    terminal status is covered the moment the schema and the domain agree on it,
+    with no third list to forget.
+
+    On this branch (exit_code != 0) a non-ERROR classification implies an envelope
+    was captured: `parse_codex_envelope` returns is_error=True for every nonzero
+    exit that produced no parseable envelope. So "not an error" IS "real output"."""
     if exit_code == 0:
         return False
-    if result.status in ("pr_opened", "blocked", "done") and not result.is_error:
+    if classify_outcome(result) is not Outcome.ERROR:
         return False
-    low = stderr.lower()
-    return any(sig in low for sig in _TRANSPORT_DROP_SIGNATURES) or _is_rate_limited(stderr)
+    tail = _stderr_tail(stderr)
+    low = tail.lower()
+    return any(sig in low for sig in _TRANSPORT_DROP_SIGNATURES) or _is_rate_limited(tail)
 
 
 def _is_rate_limited(stderr: str) -> bool:
     """True iff the failure is a provider rate limit (HTTP 429 / quota), the
-    transport-drop subset that needs the LONGER window-aligned backoff."""
-    low = stderr.lower()
+    transport-drop subset that needs the LONGER window-aligned backoff. Matched
+    on the stderr TAIL only — see _CLASSIFY_TAIL_LINES."""
+    low = _stderr_tail(stderr).lower()
     return any(sig in low for sig in _RATE_LIMIT_SIGNATURES)
+
+
+def _unlink_quietly(path: str) -> None:
+    """Remove a scratch file if it exists. Best-effort: a leftover temp file must
+    never be the reason a run fails."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
 
 
 def _extract_retry_after_seconds(stderr: str) -> float | None:
     """Parse a Retry-After / rate-limit-reset hint from stderr, in seconds. Returns
     None when absent (caller falls back to the window-aligned default). Picks the
     LARGEST hint found — the reset furthest out is the safe one to wait for.
-    Milliseconds ('ms') are normalised to seconds; a bare number is seconds."""
+    Milliseconds ('ms') are normalised to seconds; a bare number is seconds.
+
+    Read from the stderr TAIL only, for the same reason the classifiers are
+    (review M17): a number the AGENT printed must never set how long we sleep."""
     best: float | None = None
-    for m in _RETRY_AFTER_RE.finditer(stderr):
+    for m in _RETRY_AFTER_RE.finditer(_stderr_tail(stderr)):
         try:
             val = float(m.group(1))
         except (TypeError, ValueError):

@@ -36,10 +36,57 @@ class GitResult:
 GitRunner = Callable[[list[str], str], GitResult]  # (args, cwd) -> result
 
 
+# Hard ceiling on any single `git` subprocess (review M20 — this runner had NO
+# timeout at all, unlike `_GH_TIMEOUT_S` in github.py, added after a recorded
+# `gh pr view` hang that blocked ~14 minutes and froze the whole review daemon
+# because the poll loop is synchronous). This same runner is used on BOTH the
+# dispatch path (`Worktrees.ensure`'s `git fetch origin`, a real network call)
+# AND inside `build_gate_context`'s local ops, which run on EVERY Bash call the
+# agent makes via the PreToolUse hook — an unbounded hang on either path wedges
+# the daemon or the agent's whole session, the identical failure class as the
+# gh hang above, just via a different command. 60s is far above a healthy call
+# (local git plumbing is sub-second; a `fetch` against a live remote is at most
+# a few seconds) yet bounds a pathological one (a stale `index.lock`, a dead
+# proxy holding a fetch open — see CLAUDE.md's proxy note).
+_GIT_TIMEOUT_S = 60.0
+
+
 def _subprocess_git(args: list[str], cwd: str) -> GitResult:
-    res = subprocess.run(
-        ["git", *args], cwd=cwd, capture_output=True, text=True
-    )
+    """Run `git` in `cwd`, bounded by `_GIT_TIMEOUT_S`.
+
+    NEVER raises: a timeout, a missing `git`, or a spawn failure all come back
+    as a non-zero `GitResult` — the same "never raise across this seam"
+    contract `_subprocess_gh` below already uses, so every existing `if
+    result.code != 0` caller keeps working unchanged. Unlike `_subprocess_gh`
+    (whose failures are routine and expected — "no branch yet" is not an
+    error), a git failure here is surfaced on OUR stderr with the captured
+    stderr text, because a silently-swallowed `worktree add` failure is
+    exactly how `ensure` used to hand back a path to a worktree that was never
+    created (M20's other half — see `Worktrees.ensure`)."""
+    try:
+        res = subprocess.run(
+            ["git", *args], cwd=cwd, capture_output=True, text=True,
+            timeout=_GIT_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"[worktree] git timed out after {_GIT_TIMEOUT_S:g}s and was killed: "
+            f"git {' '.join(args)} (cwd={cwd})",
+            file=sys.stderr,
+        )
+        return GitResult(1, "")
+    except OSError as exc:
+        print(
+            f"[worktree] git failed to start: git {' '.join(args)} (cwd={cwd}) — {exc}",
+            file=sys.stderr,
+        )
+        return GitResult(1, "")
+    if res.returncode != 0:
+        print(
+            f"[worktree] git {' '.join(args)} (cwd={cwd}) failed "
+            f"(exit {res.returncode}): {(res.stderr or '').strip()[:500]}",
+            file=sys.stderr,
+        )
     return GitResult(res.returncode, res.stdout)
 
 
@@ -54,6 +101,26 @@ def worktree_list_contains_issue(listing: str, issue: int) -> bool:
     return False
 
 
+class WorktreeUnavailable(RuntimeError):
+    """`Worktrees.ensure` could not produce a usable worktree — every `git
+    worktree add` attempt failed (a locked index, a stale lockfile, a race
+    with a concurrent worktree op, disk pressure…) and the path still doesn't
+    exist as a directory. Before this existed, `ensure` returned that (missing)
+    path regardless, and the caller logged "worktree #N: ready on '<branch>' →
+    <path>" and dispatched the agent straight into a nonexistent cwd (review
+    M20).
+
+    Raising joins the SAME "session died before it started" contract
+    `AgentDispatcher.dispatch` already has for a leg that raises before
+    `runner.run` returns (review C3): the whole workflow tail (save_session,
+    retry-counter bump, follow-up actions) is skipped, the infra-death counter
+    is bumped, and the exception is re-raised so `Daemon.tick`'s crash
+    isolation puts the issue back for the next poll. Nothing new to add at any
+    call site — `_ensure_cwd` (app/workflows/fix.py) has no try/except around
+    `self.worktrees.ensure(...)`, so this propagates straight into that
+    existing handler."""
+
+
 class Worktrees:
     """Create/remove per-issue worktrees under WORKTREE_ROOT, relative to the
     target repo (`repo_dir`). Branch shape is the harness's
@@ -66,11 +133,13 @@ class Worktrees:
         worktree_root: str = ".claude/worktrees",
         base_branch: str = "dev",
         run: GitRunner = _subprocess_git,
+        path_exists: Callable[[str], bool] = os.path.isdir,
     ):
         self.repo_dir = repo_dir
         self.worktree_root = worktree_root
         self.base_branch = base_branch
         self._git = run
+        self._path_exists = path_exists
 
     def path(self, issue: int) -> str:
         return os.path.join(self.worktree_root, f"issue-{issue}")
@@ -78,7 +147,12 @@ class Worktrees:
     def ensure(self, issue: int, branch: str) -> str:
         """Ensure a worktree for the issue exists on `branch`; return its abs
         path. Port of ensure_worktree: reuse existing, else create from the
-        branch ref or off origin/base."""
+        branch ref or off origin/base.
+
+        Raises `WorktreeUnavailable` if the path still isn't a real directory
+        afterward (M20): every `git worktree add` attempt can fail, and
+        returning a path that doesn't exist is a lie the caller has no way to
+        catch before dispatching the agent into it."""
         wt = self.path(issue)
         listing = self._git(["worktree", "list", "--porcelain"], self.repo_dir)
         if not worktree_list_contains_issue(listing.out, issue):
@@ -98,7 +172,14 @@ class Worktrees:
                         ["worktree", "add", "-b", branch, wt, self.base_branch],
                         self.repo_dir,
                     )
-        return os.path.join(self.repo_dir, wt)
+        abs_path = os.path.join(self.repo_dir, wt)
+        if not self._path_exists(abs_path):
+            raise WorktreeUnavailable(
+                f"worktree for issue #{issue} on branch '{branch}' is not ready at "
+                f"{abs_path!r} — every 'git worktree add' attempt failed (see the git "
+                "runner's stderr surfacing for why)."
+            )
+        return abs_path
 
     def remove(self, issue: int) -> None:
         self._git(["worktree", "remove", self.path(issue), "--force"], self.repo_dir)

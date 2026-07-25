@@ -154,7 +154,11 @@ def build_fix_daemon(
     fix_runner = runner
     prepare_cwd = None
     if cfg.fixer_runtime == "codex":
-        from ..adapters.codex_runner import CodexRunner, CodexProvider
+        from ..adapters.codex_runner import (
+            CodexRunner,
+            CodexProvider,
+            codex_cost_blindspot_warning,
+        )
         from ..adapters.codex_hook import write_hook_config
 
         fix_runner = CodexRunner(
@@ -180,6 +184,8 @@ def build_fix_daemon(
             rate_limit_backoff_base=codex_runtime.rate_limit_backoff_base,
             max_rate_limit_wait=codex_runtime.max_rate_limit_wait,
             max_rate_limit_retries=codex_runtime.max_rate_limit_retries,
+            cost_per_mtok_in=codex_runtime.cost_per_mtok_in,
+            cost_per_mtok_out=codex_runtime.cost_per_mtok_out,
             **({"default_model": codex_runtime.model} if codex_runtime.model else {}),
         )
         # Surface a codex misconfig (missing bin/key) at STARTUP, not on the first
@@ -189,6 +195,19 @@ def build_fix_daemon(
             _log("fix")(f"codex: NOT READY at startup — {_reason}")
         else:
             _log("fix")("codex: runtime ready (bin + key present)")
+        # Review M1 / D12: ONE loud line at build time (never per dispatch) when a
+        # spend cap is armed but no codex price table is set — those caps cannot see
+        # a single codex dollar, and codex has no per-session budget flag either.
+        # Structurally unreachable on FIXER_RUNTIME=claude (this whole block is).
+        _blindspot = codex_cost_blindspot_warning(
+            cost_per_mtok_in=codex_runtime.cost_per_mtok_in,
+            cost_per_mtok_out=codex_runtime.cost_per_mtok_out,
+            issue_spend_cap_usd=cfg.issue_spend_cap_usd,
+            daily_spend_cap_usd=cfg.daily_spend_cap_usd,
+            max_runtime=codex_runtime.max_runtime,
+        )
+        if _blindspot is not None:
+            _log("fix")(_blindspot)
         # prepare_cwd installs the governor hook AND writes AGENTS.md (= AGENT.md)
         # into each worktree, Codex's native per-project instructions file. It also
         # installs the PostToolUse edit-check when EDIT_CHECK_CMD is set.

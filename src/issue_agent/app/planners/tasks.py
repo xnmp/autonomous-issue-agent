@@ -644,13 +644,14 @@ def build_review_task(
 ) -> AgentTask:
     """review-pr.sh: initial review (round 1)."""
     prompt = (
-        f"Review PR #{pr_number}: {title}\n\nDescription:\n{body}\n\n"
+        f"Review PR #{pr_number}.\n\n"
+        f"{_fenced('title', title)}\n\n{_fenced('description', body)}\n\n"
         "If the PR commits screenshots under `evidence/` for a visual acceptance "
         "criterion, READ each one and judge whether it actually substantiates that "
         "criterion (right screen, right state, the criterion visibly met). "
         "REQUEST_CHANGES if a screenshot is missing, irrelevant, or does not show the "
         "behaviour the criterion claims.\n\n"
-        f"{checkout_note}\n\nDiff:\n{diff}"
+        f"{checkout_note}\n\n{_fenced_diff(diff)}"
     )
     return AgentTask(
         prompt=prompt,
@@ -678,7 +679,7 @@ def build_re_review_task(
         "contract or an input where the code is actually correct? Report a finding only "
         "if you cannot refute it, as a concrete file:line + the assertion it would fail. "
         "Drop findings you can't make concrete.\n\n"
-        f"Changes since last review ({last_sha} → {head_sha}):\n{new_diff}"
+        f"Changes since last review ({last_sha} → {head_sha}):\n{_fenced_diff(new_diff)}"
     )
     return AgentTask(
         prompt=prompt,
@@ -760,14 +761,15 @@ def build_delegated_review_task(
     it delegates search to. Identical decision contract (REVIEW_SCHEMA, submit +
     persist session) — only the token economics differ."""
     prompt = (
-        f"Review PR #{pr_number}: {title}\n\nDescription:\n{body}\n\n"
+        f"Review PR #{pr_number}.\n\n"
+        f"{_fenced('title', title)}\n\n{_fenced('description', body)}\n\n"
         f"{_DELEGATE_NOTE}\n\n"
         "If the PR commits screenshots under `evidence/` for a visual acceptance "
         "criterion, READ each one and judge whether it actually substantiates that "
         "criterion (right screen, right state, the criterion visibly met). "
         "REQUEST_CHANGES if a screenshot is missing, irrelevant, or does not show the "
         "behaviour the criterion claims.\n\n"
-        f"{checkout_note}\n\nDiff:\n{diff}"
+        f"{checkout_note}\n\n{_fenced_diff(diff)}"
     )
     return AgentTask(
         prompt=prompt,

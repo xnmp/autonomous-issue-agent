@@ -119,13 +119,21 @@ def test_address_review_success_still_counts_attempt():
     # reset the breaker every round and it could never trip.
     out = address_review_actions(100, _ok("pushed"))
     assert out.bump_retry is True
-    assert Relabel(Target.PR, 100, Label.AI_WORKING, None) in out.actions
+    # review M22/D9: a successful leg writes NO label. The clear-ai-working
+    # relabel that used to lead this list removed a label nothing ever added —
+    # one wasted `gh pr edit` per leg, and a busy marker future readers would
+    # have trusted. The counter, not a label, is what bounds this loop.
+    assert out.actions == []
 
 
 def test_address_review_blocked_no_retry_burn():
     out = address_review_actions(100, _ok("blocked", summary="unclear"))
     assert out.bump_retry is False
     assert any(isinstance(a, Relabel) and a.add is Label.AI_BLOCKED for a in out.actions)
+    # Anti-vacuity twin for the M22 deletion above: blocked is the ONE address-review
+    # outcome that still writes a label, so an empty list on the other paths means
+    # "nothing to write", not "this tail stopped emitting actions".
+    assert out.actions != []
 
 
 def test_address_review_error_bumps_retry():
@@ -134,14 +142,19 @@ def test_address_review_error_bumps_retry():
 
 
 # ── fix-ci tail ──
-def test_fix_ci_pushed_clears_working():
-    acts = fix_ci_actions(100, _ok("pushed"))
-    assert acts == [Relabel(Target.PR, 100, Label.AI_WORKING, None)]
+def test_fix_ci_pushed_writes_no_label():
+    # review M22/D9: a pushed fix-CI leg leaves the PR's labels alone — CI re-runs
+    # and the watcher re-evaluates next poll. (Was a clear-ai-working relabel for a
+    # label nothing ever added.)
+    assert fix_ci_actions(100, _ok("pushed")) == []
 
 
 def test_fix_ci_blocked_adds_blocked():
     acts = fix_ci_actions(100, _ok("blocked"))
     assert Relabel(Target.PR, 100, None, Label.AI_BLOCKED) in acts
+    # Anti-vacuity twin for the deletion above: blocked still writes, so [] on the
+    # other paths is a decision, not a dead function.
+    assert acts != []
 
 
 # ── review submission tail (args: decision, body, prior_rejections, max_rejections) ──
@@ -181,6 +194,36 @@ def test_resolve_infra_death_still_labels_a_pr_that_actually_opened():
     assert Relabel(Target.PR, 100, None, Label.AI_PR_OPEN) in acts
 
 
+def test_author_infra_death_leaves_issue_working_for_the_reaper():
+    # review M15 — the fifth outcome tail, and the one that was missing this
+    # guard. author_followup maps a killed session to RETRY, so the leg used to
+    # relabel ai-working→ai-ready; the fixer then re-picked the issue on the next
+    # poll and dispatched the author leg straight back into whatever killed it
+    # (with split mode + Codex, an OOM). relabel→dispatch→kill, forever, at full
+    # session cost: the infra-death ceiling COUNTS deaths, it does not stop the
+    # requeue that feeds them. Emitting nothing leaves the issue ai-working, the
+    # designed settle path.
+    assert author_actions(5, _killed()) == []
+    # Anti-vacuity twin: the SAME shape of result WITHOUT the exit_reason still
+    # requeues, so [] above is the guard firing, not author_actions gone quiet.
+    assert author_actions(5, AgentResult(is_error=True)) == [
+        Relabel(Target.ISSUE, 5, Label.AI_WORKING, Label.AI_READY)
+    ]
+
+
+def test_author_infra_death_outranks_a_blocked_envelope():
+    # Guard ORDER, not just presence. `exit_reason` is classified by the runtime
+    # independently of what the agent said (see AgentResult), so a leg can carry a
+    # 'blocked' envelope AND a kill. The kill wins: posting the question and moving
+    # to ai-blocked would park the issue on a human for a machine failure.
+    # Contrast test_author_blocked_asks_and_blocks — same status, no exit_reason.
+    killed_after_blocking = AgentResult(
+        is_error=False, status="blocked", needs="which schema?",
+        exit_reason=ExitReason.KILLED_EXTERNALLY,
+    )
+    assert author_actions(5, killed_after_blocking) == []
+
+
 def test_resume_infra_death_does_not_consume_the_human_reply():
     # Contrast test_resume_error_stays_blocked: an ordinary error moves to
     # ai-blocked, a killed session moves nothing at all.
@@ -193,12 +236,13 @@ def test_transport_death_is_also_an_infra_death_on_the_issue_legs():
     assert resume_actions(5, r, pr=None) == []
 
 
-def test_address_review_infra_death_clears_working_without_burning_a_retry():
+def test_address_review_infra_death_burns_no_retry_and_writes_nothing():
     # #58: six SIGKILLs on one PR walked the breaker to needs-human-review on work
-    # that never ran. The PR must stop looking busy, but the counter must not move.
+    # that never ran. The counter must not move, and (M22/D9) no label is written:
+    # an infra death must leave the PR exactly as it found it.
     out = address_review_actions(100, _killed())
     assert out.bump_retry is False
-    assert out.actions == [Relabel(Target.PR, 100, Label.AI_WORKING, None)]
+    assert out.actions == []
 
 
 def test_address_review_timeout_still_burns_a_retry():
@@ -209,8 +253,10 @@ def test_address_review_timeout_still_burns_a_retry():
     assert out.bump_retry is True
 
 
-def test_fix_ci_infra_death_clears_working_only():
+def test_fix_ci_infra_death_writes_nothing_not_even_blocked():
     # Never add ai-blocked for a session that was killed rather than stuck —
-    # ai-blocked would stop re-dispatch and strand the PR on a human.
-    acts = fix_ci_actions(100, _killed(status="blocked"))
-    assert acts == [Relabel(Target.PR, 100, Label.AI_WORKING, None)]
+    # ai-blocked would stop re-dispatch and strand the PR on a human. Contrast
+    # test_fix_ci_blocked_adds_blocked: the SAME 'blocked' status DOES relabel
+    # when the session actually reached that decision itself.
+    assert fix_ci_actions(100, _killed(status="blocked")) == []
+    assert fix_ci_actions(100, _ok("blocked")) != []

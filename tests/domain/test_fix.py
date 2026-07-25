@@ -322,6 +322,67 @@ def test_conflicting_takes_rebase_not_update_branch():
     assert not p.is_behind()
 
 
+# ── M14: auto-merge is INDEPENDENT of the fixer lock ──────────────────────────
+# It is documented as lock-free but used to live at the tail of the PR-consuming
+# loop, so every `continue` in that loop skipped it. The issueless arm `continue`s
+# unconditionally, so an approved+green issueless PR armed auto-merge ONLY on the
+# polls where the fixer happened to be BUSY — busy skips the whole consuming block,
+# so the `continue` never ran. Same world, opposite outcome, decided by an
+# unrelated lock. These pin the invariant: for one world, both lock states agree.
+def _issueless_approved_green_pr(**kw):
+    return pr(113, "ai-pr-open", head_ref_name="feat/ACME-9-x",
+              reviews=(Review("APPROVED", "review-bot", "t1"),),
+              checks=(Check("build", bucket="pass"),), **kw)
+
+
+def test_issueless_approved_green_pr_arms_automerge_idle_and_busy():
+    w = world(prs=[_issueless_approved_green_pr()])
+    idle = decide_fix(w, CFG, FixState(), fixer_busy=False)
+    busy = decide_fix(w, CFG, FixState(), fixer_busy=True)
+    assert EnableAutoMerge(113, "squash") in idle   # this was the missing half
+    assert EnableAutoMerge(113, "squash") in busy
+
+
+def test_issueless_behind_pr_updates_branch_idle_and_busy():
+    # Same divergence on the other 3c arm: an armed-but-BEHIND branch stayed
+    # behind forever on idle polls, so the armed auto-merge never landed.
+    w = world(prs=[_issueless_approved_green_pr(mergeable="MERGEABLE", merge_state="BEHIND")])
+    assert UpdateBranch(113) in decide_fix(w, CFG, FixState(), fixer_busy=False)
+    assert UpdateBranch(113) in decide_fix(w, CFG, FixState(), fixer_busy=True)
+
+
+def test_dispatching_on_a_pr_no_longer_skips_its_automerge_evaluation():
+    # The other family of skipped `continue`s: a DISPATCH used to skip 3c for the
+    # same PR. An approved+green PR that went CONFLICTING is both — rebase it AND
+    # arm it, so the rebase push lands through auto-merge instead of waiting for a
+    # later poll to notice. Idle and busy agree on the arming; only the dispatch
+    # (which genuinely needs the lock) differs.
+    p = pr(100, "ai-pr-open", mergeable="CONFLICTING",
+           reviews=(Review("APPROVED", "review-bot", "t1"),),
+           checks=(Check("build", bucket="pass"),))
+    idle = decide_fix(world(prs=[p]), CFG, FixState(), fixer_busy=False)
+    busy = decide_fix(world(prs=[p]), CFG, FixState(), fixer_busy=True)
+    assert RunAgent(AgentKind.REBASE, 100) in _run_agents(idle)
+    assert _run_agents(busy) == []                        # the lock still bounds dispatch
+    assert EnableAutoMerge(100, "squash") in idle         # …but not the arming
+    assert EnableAutoMerge(100, "squash") in busy
+
+
+def test_blocked_pr_is_never_armed_in_either_lock_state():
+    # Anti-vacuity twin for the split: 3c is not "arm everything now". A PR whose
+    # next move belongs to a human (ai-blocked / needs-human-review) is skipped —
+    # in BOTH lock states, so the skip is a property of the world, not the lock.
+    w = world(prs=[_issueless_approved_green_pr(), pr(
+        114, "ai-pr-open", "needs-human-review", head_ref_name="feat/ACME-8-x",
+        reviews=(Review("APPROVED", "review-bot", "t1"),),
+        checks=(Check("build", bucket="pass"),),
+    )])
+    for busy in (False, True):
+        actions = decide_fix(w, CFG, FixState(), fixer_busy=busy)
+        assert EnableAutoMerge(113, "squash") in actions          # the unblocked one arms
+        assert EnableAutoMerge(114, "squash") not in actions      # the blocked one does not
+
+
 # ── changes-requested → address-review; failure → fix-ci ───────────────────────
 def test_changes_requested_dispatches_address_review():
     p = pr(100, "ai-pr-open", reviews=(Review("CHANGES_REQUESTED", "review-bot", "t1"),))
@@ -354,6 +415,33 @@ def test_unknown_author_pr_is_not_driven_by_fixer():
            reviews=(Review("CHANGES_REQUESTED", "review-bot", "t1"),))
     actions = decide_fix(world(prs=[p]), CFG, FixState(), fixer_busy=False)
     assert _run_agents(actions) == []
+
+
+BLANK_BOT_CFG = FixConfig(fix_bot="")
+
+
+def test_unknown_author_is_not_ours_even_when_fix_bot_is_also_unset():
+    """The fail-safe above INVERTED when both sides were blank: `login_eq("", "")`
+    is True, so an unset FIX_BOT plus a PR whose author didn't resolve read as the
+    fixer's OWN PR — a stranger's PR driven by the fixer, the exact #351 shape the
+    authorship gate exists to prevent. Blank never matches, in either position."""
+    p = pr(100, "ai-pr-open", author="",
+           reviews=(Review("CHANGES_REQUESTED", "review-bot", "t1"),))
+    assert _run_agents(decide_fix(world(prs=[p]), BLANK_BOT_CFG, FixState(), fixer_busy=False)) == []
+
+
+def test_unset_fix_bot_claims_no_pr_at_all():
+    """The other direction: an unset FIX_BOT owns nothing, even a PR whose author
+    IS resolvable. A misconfigured (empty) FIX_BOT must disable the fixer's PR legs,
+    not hand it every PR it can see."""
+    p = pr(100, "ai-pr-open", author="fix-bot",
+           reviews=(Review("CHANGES_REQUESTED", "review-bot", "t1"),))
+    assert _run_agents(decide_fix(world(prs=[p]), BLANK_BOT_CFG, FixState(), fixer_busy=False)) == []
+    # Anti-vacuity twin: the SAME PR under a configured fixer still dispatches, so
+    # the empty lists above are the blank guard, not a broken world fixture.
+    assert RunAgent(AgentKind.ADDRESS_REVIEW, 100) in _run_agents(
+        decide_fix(world(prs=[p]), CFG, FixState(), fixer_busy=False)
+    )
 
 
 # ── review C1: the `[bot]` suffix must not disable the fixer ──────────────────
@@ -665,11 +753,17 @@ def test_reap_requeues_orphaned_issue_to_ready():
     assert Relabel(Target.ISSUE, 8, Label.AI_WORKING, Label.AI_READY) in reap_actions(w)
 
 
-def test_reap_clears_working_on_pr_without_readying_it():
-    w = world(prs=[pr(101, "ai-working")])
-    acts = reap_actions(w)
-    assert Relabel(Target.PR, 101, Label.AI_WORKING, None) in acts
-    assert all(getattr(a, "add", None) is not Label.AI_READY for a in acts)
+def test_reap_ignores_prs_entirely():
+    # review M22/D9: the PR arm is deleted, not merely unused. Nothing in the SDK
+    # port adds ai-working to a PR, so the arm could only ever fire on a label a
+    # HUMAN applied by hand — a reaper that "protects" a busy marker no writer
+    # ever sets is a mechanism that reads live and isn't.
+    assert reap_actions(world(prs=[pr(101, "ai-working")])) == []
+    # Anti-vacuity twin: the ISSUE arm on the same world still fires, so an empty
+    # list here means "PRs are out of scope", not "reap_actions stopped working".
+    assert reap_actions(world(issues=[issue(8, "ai-working")], prs=[pr(101, "ai-working")])) == [
+        Relabel(Target.ISSUE, 8, Label.AI_WORKING, Label.AI_READY)
+    ]
 
 
 # ── cleanup (merge close + re-queue) ────────────────────────────────────────────

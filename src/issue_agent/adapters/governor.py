@@ -96,49 +96,67 @@ def _argv_has(argv: list[str], flag: str) -> bool:
 
 
 def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
-    """Full PR-creation gate (check-pr.sh) as a list of deny reasons."""
-    reasons: list[str] = []
+    """Full PR-creation gate (check-pr.sh) as a list of deny reasons (review M21).
 
-    def chk(result: gate.GateResult) -> None:
-        if not result.ok:
-            reasons.append(result.reason)
-
-    chk(gate.check_no_web(argv))
-    pr_base = _extract_after_flag(argv, "--base", "-B")
-    chk(gate.check_pr_base(pr_base, ctx.base_branch))
-
-    test_cmd = gate.resolve_test_cmd(ctx.harness_test_cmd, ctx.env_test_cmd)
-    chk(gate.check_tests(test_cmd, ctx.run_tests, allow_untested=ctx.allow_untested))
-
+    Ordered CHEAP structural checks (pure string/tuple logic, no subprocess)
+    BEFORE the two EXPENSIVE checks that run the full TEST_CMD —
+    `check_red_fails` also mutates the worktree via `revert_and_run` (a
+    checkout-revert-run-restore cycle) — and short-circuits on the FIRST
+    denial. The caller (`evaluate_command`) only ever reads `reasons[0]`, so
+    returning a single-element list on first hit changes nothing it
+    observes. Before this, a trivial denial (e.g. wrong --base) still paid up
+    to 2×GATE_TEST_TIMEOUT_S (default 600s each) before the agent saw it,
+    because every rule ran regardless of whether an earlier one had already
+    failed. The cheap checks are still evaluated lazily (one at a time) so a
+    later cheap check's own cost — negligible here, but the property is the
+    point — never runs past an earlier denial either.
+    """
     body = _extract_after_flag(argv, "--body", "-b")
-    chk(gate.check_pr_body(body))
-    chk(gate.check_markers(ctx.ac_posted, ctx.test_plan_posted))
-    # pr_body arms the per-AC-item screenshot rule (§7d); inline --body/-b only —
-    # --body-file is handled by the bash §7d, a pre-existing extractor limitation.
-    chk(gate.check_visual_evidence(
-        ctx.visual_ac, ctx.changed_files, ctx.screenshots_read, body
-    ))
-    chk(gate.check_required_test(ctx.branch, ctx.changed_files))
-    chk(gate.check_commit_log(ctx.branch_subjects))
-    chk(gate.check_no_evidence(ctx.changed_files))
-    chk(gate.check_tests_immutable(ctx.changed_files, ctx.exists_at_base))
+    pr_base = _extract_after_flag(argv, "--base", "-B")
+
+    cheap_checks: tuple[Callable[[], gate.GateResult], ...] = (
+        lambda: gate.check_no_web(argv),
+        lambda: gate.check_pr_base(pr_base, ctx.base_branch),
+        lambda: gate.check_pr_body(body),
+        lambda: gate.check_markers(ctx.ac_posted, ctx.test_plan_posted),
+        # pr_body arms the per-AC-item screenshot rule (§7d); inline --body/-b
+        # only — --body-file is handled by the bash §7d, a pre-existing
+        # extractor limitation.
+        lambda: gate.check_visual_evidence(
+            ctx.visual_ac, ctx.changed_files, ctx.screenshots_read, body
+        ),
+        lambda: gate.check_required_test(ctx.branch, ctx.changed_files),
+        lambda: gate.check_commit_log(ctx.branch_subjects),
+        lambda: gate.check_no_evidence(ctx.changed_files),
+        lambda: gate.check_tests_immutable(ctx.changed_files, ctx.exists_at_base),
+        lambda: gate.check_adversarial_verdict(ctx.adversarial_verdict),
+    )
+    for check in cheap_checks:
+        result = check()
+        if not result.ok:
+            return [result.reason]
+
+    # ── expensive: both run the full TEST_CMD; never reached above a cheap denial ──
+    test_cmd = gate.resolve_test_cmd(ctx.harness_test_cmd, ctx.env_test_cmd)
+    tests_result = gate.check_tests(test_cmd, ctx.run_tests, allow_untested=ctx.allow_untested)
+    if not tests_result.ok:
+        return [tests_result.reason]
 
     new_tests, impl = gate.partition_changed(ctx.changed_files, ctx.exists_at_base)
-    chk(
-        gate.check_red_fails(
-            gate.RedFailInputs(
-                test_cmd=test_cmd,
-                new_test_files=new_tests,
-                impl_files=impl,
-                red_must_fail=ctx.red_must_fail,
-                base_resolvable=ctx.base_resolvable,
-                allow_untested=ctx.allow_untested,
-            ),
-            ctx.revert_and_run,
-        )
+    red_fail_result = gate.check_red_fails(
+        gate.RedFailInputs(
+            test_cmd=test_cmd,
+            new_test_files=new_tests,
+            impl_files=impl,
+            red_must_fail=ctx.red_must_fail,
+            base_resolvable=ctx.base_resolvable,
+            allow_untested=ctx.allow_untested,
+        ),
+        ctx.revert_and_run,
     )
-    chk(gate.check_adversarial_verdict(ctx.adversarial_verdict))
-    return reasons
+    if not red_fail_result.ok:
+        return [red_fail_result.reason]
+    return []
 
 
 def _push_gate(ctx: GateContext) -> list[str]:

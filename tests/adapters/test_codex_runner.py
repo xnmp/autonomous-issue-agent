@@ -10,6 +10,8 @@ import os
 import stat
 import tempfile
 
+import pytest
+
 from issue_agent.adapters.codex_runner import (
     DEFAULT_CODEX_MODEL,
     DEFAULT_SANDBOX,
@@ -21,9 +23,13 @@ from issue_agent.adapters.codex_runner import (
     _session_id_from_lines,
     _strict_schema,
     build_codex_argv,
+    codex_cost_blindspot_warning,
+    codex_cost_usd,
     parse_codex_envelope,
+    parse_codex_usage,
 )
-from issue_agent.domain.outcome import AgentResult, ExitReason, infra_death
+from issue_agent.app.planners.schemas import AUTHOR_SCHEMA, FIX_SCHEMA, IMPLEMENT_SCHEMA
+from issue_agent.domain.outcome import AgentResult, ExitReason, Outcome, classify_outcome, infra_death
 from issue_agent.domain.agent_task import AgentTask
 
 
@@ -873,3 +879,455 @@ def test_transport_retries_zero_disables_loop():
     r = asyncio.run(runner.run(AgentTask(prompt="x")))
     assert r.is_error and r.status == "timeout"
     assert "survived 1 attempts" in r.summary
+
+
+# ══ review M1 / plan D12 — codex token accounting ═══════════════════════════
+# Without a price table `cost_usd` was hardcoded 0.0, the ledger write is gated
+# on `cost > 0`, and BOTH spend caps were blind to every codex run.
+
+# Real `codex exec` usage lines (the two shapes across codex-cli versions).
+_MODERN_USAGE_LINE = (
+    "[2026-06-28T12:00:04] Token usage: total=52,341 input=48,000 "
+    "(+ 12,000 cached) output=4,341"
+)
+_LEGACY_USAGE_LINE = "[2026-06-28T12:00:04] tokens used: 52341"
+
+
+def test_usage_read_from_the_modern_split_token_line():
+    # review M1: tokens are the ONLY cost substrate codex exposes.
+    u = parse_codex_usage(f"exec bash -lc pytest\n{_MODERN_USAGE_LINE}\n")
+    assert u == {
+        "input_tokens": 48000,
+        "output_tokens": 4341,
+        "cache_read_input_tokens": 12000,
+        "cache_creation_input_tokens": 0,
+    }
+
+
+def test_usage_read_from_the_legacy_total_only_line():
+    # Older exec builds print only a total — no input/output split exists to invent.
+    u = parse_codex_usage(_LEGACY_USAGE_LINE)
+    assert u["total_tokens"] == 52341
+    assert u["input_tokens"] == 0 and u["output_tokens"] == 0
+
+
+def test_usage_is_none_when_codex_printed_no_token_line():
+    # Anti-vacuity: 'no usage reported' stays distinct from 'zero tokens', so the
+    # journal never records a fabricated $0 receipt as a measured one.
+    assert parse_codex_usage("exec bash -lc pytest\n2 passed\n") is None
+    assert parse_codex_usage("") is None
+
+
+def test_usage_takes_the_last_line_because_codex_totals_are_cumulative():
+    stderr = "Token usage: input=10 output=5\nmore work\nToken usage: input=90 output=40"
+    assert parse_codex_usage(stderr)["input_tokens"] == 90
+
+
+def test_cost_prices_input_and_output_at_their_own_rates():
+    usage = {"input_tokens": 48000, "output_tokens": 4341, "cache_read_input_tokens": 12000}
+    cost = codex_cost_usd(usage, cost_per_mtok_in=1.25, cost_per_mtok_out=10.0)
+    # (48000 * 1.25 + 4341 * 10) / 1e6 — cached reads are already inside input.
+    assert cost == pytest.approx(0.10341)
+
+
+def test_cost_is_zero_without_rates():
+    # Anti-vacuity twin: the same usage, no price table → nothing is invented.
+    usage = {"input_tokens": 48000, "output_tokens": 4341}
+    assert codex_cost_usd(usage, cost_per_mtok_in=0.0, cost_per_mtok_out=0.0) == 0.0
+    assert codex_cost_usd(None, cost_per_mtok_in=1.25, cost_per_mtok_out=10.0) == 0.0
+
+
+def test_total_only_usage_is_priced_at_the_higher_rate():
+    # A cap that under-counts is a cap that never fires, so an unsplit total
+    # rounds toward over-estimation.
+    cost = codex_cost_usd(
+        {"total_tokens": 1_000_000}, cost_per_mtok_in=1.25, cost_per_mtok_out=10.0
+    )
+    assert cost == pytest.approx(10.0)
+
+
+def test_envelope_carries_cost_and_usage_when_rates_are_set():
+    msg = json.dumps({"status": "pr_opened", "summary": "opened #5"})
+    r = parse_codex_envelope(
+        exit_code=0, last_message=msg, stderr=_MODERN_USAGE_LINE,
+        cost_per_mtok_in=1.25, cost_per_mtok_out=10.0,
+    )
+    assert r.cost_usd == pytest.approx(0.10341)
+    assert r.usage == {
+        "input_tokens": 48000, "output_tokens": 4341,
+        "cache_read_input_tokens": 12000, "cache_creation_input_tokens": 0,
+    }
+
+
+def test_envelope_cost_stays_zero_when_rates_are_unset():
+    # Anti-vacuity twin of the above: identical envelope + usage line, no rates.
+    msg = json.dumps({"status": "pr_opened", "summary": "opened #5"})
+    r = parse_codex_envelope(exit_code=0, last_message=msg, stderr=_MODERN_USAGE_LINE)
+    assert r.cost_usd == 0.0
+    assert r.usage is not None  # tokens still captured for the journal
+
+
+def test_a_failed_codex_run_still_reports_the_tokens_it_burned():
+    # A run that died mid-way still spent money; charging it 0 is exactly the
+    # blind spot M1 describes, one attempt smaller.
+    r = parse_codex_envelope(
+        exit_code=1, last_message="", stderr=f"boom\n{_MODERN_USAGE_LINE}",
+        cost_per_mtok_in=1.25, cost_per_mtok_out=10.0,
+    )
+    assert r.is_error is True
+    assert r.cost_usd == pytest.approx(0.10341)
+
+
+def _costed_codex(tmp) -> str:
+    """A stub that writes an envelope AND prints a codex token-usage line."""
+    body = (
+        'out=""; prev=""\n'
+        'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
+        'echo "session id: sess-cost" >&2\n'
+        'echo "' + _MODERN_USAGE_LINE + '" >&2\n'
+        'printf \'%s\' \'{"status":"pr_opened","summary":"done","needs":""}\' > "$out"\n'
+        'exit 0\n'
+    )
+    return _fake_codex(tmp, body)
+
+
+def test_run_flows_codex_cost_into_the_result():
+    """End to end: rates configured → the AgentResult the dispatcher journals
+    carries a non-zero cost, which is what lets the ledger (cost > 0) and both
+    spend caps see codex at all."""
+    tmp = tempfile.mkdtemp()
+    runner = CodexRunner(
+        codex_bin=_costed_codex(tmp), env={"OPENAI_API_KEY": "k"},
+        cost_per_mtok_in=1.25, cost_per_mtok_out=10.0,
+    )
+    r = asyncio.run(runner.run(AgentTask(prompt="x")))
+    assert r.status == "pr_opened"
+    assert r.cost_usd == pytest.approx(0.10341)
+
+
+def test_run_reports_zero_cost_without_rates():
+    """Anti-vacuity twin: same stub, no price table → 0.0 (and the startup
+    warning below is the operator's only signal)."""
+    tmp = tempfile.mkdtemp()
+    runner = CodexRunner(codex_bin=_costed_codex(tmp), env={"OPENAI_API_KEY": "k"})
+    r = asyncio.run(runner.run(AgentTask(prompt="x")))
+    assert r.status == "pr_opened"
+    assert r.cost_usd == 0.0
+
+
+# ── D12: the ONE startup warning when caps are armed but pricing is not ───────
+def test_blindspot_warning_fires_when_caps_are_armed_without_a_price_table():
+    w = codex_cost_blindspot_warning(
+        cost_per_mtok_in=0.0, cost_per_mtok_out=0.0,
+        issue_spend_cap_usd=25.0, daily_spend_cap_usd=50.0, max_runtime=2700.0,
+    )
+    assert w is not None
+    assert "CODEX_COST_PER_MTOK_IN/OUT" in w
+    assert "$0.00" in w and "NEITHER cap can ever fire" in w
+    # D12's second sentence: codex has no per-session budget analogue, so the
+    # wall cap is the only bound on one run.
+    assert "no per-session budget" in w and "2700s" in w
+
+
+def test_blindspot_warning_names_the_missing_wall_cap_when_it_is_unset():
+    w = codex_cost_blindspot_warning(
+        cost_per_mtok_in=0.0, cost_per_mtok_out=0.0,
+        issue_spend_cap_usd=25.0, daily_spend_cap_usd=0.0, max_runtime=0.0,
+    )
+    assert w is not None and "CODEX_MAX_RUNTIME_SECONDS is unset" in w
+    assert "issue=$25.00" in w and "daily=" not in w  # only the armed cap is named
+
+
+def test_no_blindspot_warning_once_the_rates_are_configured():
+    # Anti-vacuity 1: pricing set → caps CAN see codex spend → silence.
+    assert codex_cost_blindspot_warning(
+        cost_per_mtok_in=1.25, cost_per_mtok_out=10.0,
+        issue_spend_cap_usd=25.0, daily_spend_cap_usd=50.0,
+    ) is None
+
+
+def test_no_blindspot_warning_when_no_cap_is_armed():
+    # Anti-vacuity 2: no cap → nothing is being misled about.
+    assert codex_cost_blindspot_warning(
+        cost_per_mtok_in=0.0, cost_per_mtok_out=0.0,
+        issue_spend_cap_usd=0.0, daily_spend_cap_usd=0.0,
+    ) is None
+
+
+def test_blindspot_warning_still_fires_on_a_half_configured_price_table():
+    # Pricing only the input side still under-counts every run — the same blind
+    # spot in weaker form, so it must not buy silence.
+    assert codex_cost_blindspot_warning(
+        cost_per_mtok_in=1.25, cost_per_mtok_out=0.0,
+        issue_spend_cap_usd=25.0, daily_spend_cap_usd=0.0,
+    ) is not None
+
+
+# ══ review M17a — the "real output" guard must use the real status vocabulary ═
+# The old guard was a hand-copied tuple ("pr_opened", "blocked", "done") that had
+# drifted from every schema: `done` exists in none of them, and `pushed` — the
+# status of a COMPLETED FORCE-PUSH — was missing, so that leg could be re-run on
+# resume. Pin the vocabulary here so a schema change breaks loudly.
+_FIXER_TERMINAL_STATUSES = frozenset(
+    {"pr_opened", "pushed", "blocked", "failed", "tests_authored", "contract_change"}
+)
+# `done` is in no schema; agent/lib.sh and classify_outcome still accept it, so a
+# codex run that emits it must still count as real output.
+_LEGACY_OK_ALIASES = frozenset({"done"})
+
+
+def test_fixer_status_vocabulary_is_exactly_the_schemas_union():
+    """Drift alarm: if a leg's schema gains or loses a terminal status, this
+    fails and whoever changed it must re-check the retry guard below."""
+    union = set()
+    for schema in (FIX_SCHEMA, AUTHOR_SCHEMA, IMPLEMENT_SCHEMA):
+        union |= set(schema["properties"]["status"]["enum"])
+    assert union == set(_FIXER_TERMINAL_STATUSES)
+
+
+@pytest.mark.parametrize("status", sorted(_FIXER_TERMINAL_STATUSES | _LEGACY_OK_ALIASES))
+def test_a_captured_envelope_is_never_retried_whatever_its_terminal_status(status):
+    """review M17a: every terminal status in the schemas means the turn COMPLETED.
+    Retrying over one re-runs paid, side-effecting work (`pushed` = a force-push
+    that already landed on the branch)."""
+    result = parse_codex_envelope(
+        exit_code=1,
+        last_message=json.dumps({"status": status, "summary": "s"}),
+        stderr="ERROR: stream disconnected before completion",
+    )
+    assert classify_outcome(result) is not Outcome.ERROR
+    assert _is_transport_drop(1, "ERROR: stream disconnected before completion",
+                              result) is False
+
+
+def test_an_error_envelope_with_a_drop_signature_is_still_retried():
+    """Anti-vacuity for the guard: it must not swallow everything. An `error`
+    envelope classifies as ERROR, so a transport signature still buys a retry."""
+    result = parse_codex_envelope(
+        exit_code=1, last_message=json.dumps({"status": "error", "summary": "s"}),
+        stderr="ERROR: stream disconnected before completion",
+    )
+    assert _is_transport_drop(1, "ERROR: stream disconnected before completion",
+                              result) is True
+
+
+def _pushed_then_dropped_codex(tmp, counter: str) -> str:
+    """A stub whose turn COMPLETES (writes a `pushed` envelope) but whose
+    connection then dies on the way out: drop signature + nonzero exit."""
+    body = (
+        'n=$(cat "' + counter + '" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "' + counter + '"\n'
+        'out=""; prev=""\n'
+        'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
+        'echo "session id: sess-push" >&2\n'
+        'printf \'%s\' \'{"status":"pushed","summary":"force-pushed the rebase","needs":""}\' > "$out"\n'
+        'echo "ERROR: stream disconnected before completion" >&2\n'
+        'exit 1\n'
+    )
+    return _fake_codex(tmp, body)
+
+
+def test_a_completed_force_push_is_not_re_run(tmp_path):
+    """review M17a, the concrete harm: `pushed` was missing from the old guard, so
+    a completed force-push whose stream died on the way out got RE-RUN on resume —
+    duplicate spend on the one branch-mutating leg."""
+    tmp = tempfile.mkdtemp()
+    counter = str(tmp_path / "n")
+    runner = CodexRunner(
+        codex_bin=_pushed_then_dropped_codex(tmp, counter),
+        env={"OPENAI_API_KEY": "k"}, transport_retries=4, backoff_base=0.01,
+    )
+
+    r = asyncio.run(runner.run(AgentTask(prompt="rebase")))
+
+    with open(counter) as f:
+        assert int(f.read().strip()) == 1, "the completed push leg was run twice"
+    assert r.status == "pushed" and r.is_error is False
+
+
+def test_an_envelope_less_drop_still_retries(tmp_path):
+    """Anti-vacuity twin: the guard only suppresses retries over REAL output. A
+    drop that produced no envelope must still get its retry."""
+    tmp = tempfile.mkdtemp()
+    codex = _flaky_codex(tmp, fail_times=1)
+    runner = CodexRunner(codex_bin=codex, env={"OPENAI_API_KEY": "k"},
+                         transport_retries=4, backoff_base=0.01)
+
+    r = asyncio.run(runner.run(AgentTask(prompt="x")))
+
+    assert r.is_error is False and r.status == "pr_opened"
+    with open(os.path.join(tmp, "count")) as f:
+        assert int(f.read().strip()) == 1  # one failure consumed → it retried
+
+
+# ══ review M17b — classify on the stderr TAIL, not the whole agent trace ══════
+# Codex streams the agent's whole tool trace (patches, test output, greps) to
+# stderr. A fixer working on ANY throttling code prints provider-pushback wording
+# verbatim as it patches — which is the wording the retry classifier matches on.
+_POISON_PATCH_LINE = (
+    "apply_patch: +    raise HTTPException(429, Too Many Requests)  "
+    "# rate limit exceeded"
+)
+
+
+def _trace_with(tail: str, poison: str = _POISON_PATCH_LINE) -> str:
+    """A realistic accumulated codex trace: the agent's own output carries the
+    poison wording early, then 30 lines of unrelated trace, then `tail`."""
+    return "\n".join([poison] + [f"codex| trace line {i}" for i in range(30)] + [tail])
+
+
+def test_rate_limit_text_in_the_agent_trace_is_not_provider_pushback():
+    """review M17b: matching the whole accumulated trace let the AGENT'S OWN TEXT
+    buy 15 minutes of 60s retries and then launder a plain agent error into
+    TRANSPORT_DEATH, the one exit reason the breakers exempt."""
+    trace = _trace_with("Error: 2 tests failed")
+    assert _is_rate_limited(trace) is False
+    assert _is_transport_drop(1, trace, AgentResult(is_error=True)) is False
+
+
+def test_a_real_429_in_the_stderr_tail_is_still_detected():
+    """Anti-vacuity twin: same trace, but the provider's 429 is where a real one
+    lands — the last thing printed before exit."""
+    trace = _trace_with("azure-openai error: have exceeded rate limit.")
+    assert _is_rate_limited(trace) is True
+    assert _is_transport_drop(1, trace, AgentResult(is_error=True)) is True
+
+
+def test_a_transport_signature_in_the_agent_trace_is_not_a_drop():
+    """Same narrowing for the network-drop signatures: the agent quoting
+    'stream disconnected before completion' (a log it read, a test it wrote) must
+    not buy a retry."""
+    trace = _trace_with(
+        "Error: 2 tests failed",
+        poison='apply_patch: +    assert e.msg == stream disconnected before completion',
+    )
+    assert _is_transport_drop(1, trace, AgentResult(is_error=True)) is False
+
+
+def test_retry_after_hint_is_read_from_the_tail_not_the_agent_trace():
+    """A number the AGENT printed must never decide how long we sleep (the
+    parser takes the LARGEST hint, so one bogus big number in the trace would
+    otherwise park the daemon)."""
+    trace = _trace_with(
+        "azure-openai error: exceeded rate limit. retry-after: 3",
+        poison="apply_patch: +    # honour Retry-After: 99999 from the provider",
+    )
+    assert _extract_retry_after_seconds(trace) == 3.0
+
+
+def test_run_does_not_retry_when_only_the_agent_trace_mentions_a_rate_limit(tmp_path):
+    """The behavioural half of M17b: a genuine agent error whose trace happens to
+    contain 'rate limit' must return AGENT_ERROR on the FIRST attempt — no waits,
+    and no TRANSPORT_DEATH laundering (which would exempt the breaker)."""
+    tmp = tempfile.mkdtemp()
+    counter = str(tmp_path / "n")
+    body = (
+        'n=$(cat "' + counter + '" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "' + counter + '"\n'
+        "echo '" + _POISON_PATCH_LINE + "' >&2\n"
+        'for i in $(seq 1 30); do echo "codex| trace line $i" >&2; done\n'
+        'echo "Error: 2 tests failed" >&2\n'
+        'exit 1\n'
+    )
+    runner = CodexRunner(
+        codex_bin=_fake_codex(tmp, body), env={"OPENAI_API_KEY": "k"},
+        rate_limit_backoff_base=0.01, max_rate_limit_wait=0.02,
+        transport_retries=4, backoff_base=0.01,
+    )
+
+    r = asyncio.run(runner.run(AgentTask(prompt="x")))
+
+    with open(counter) as f:
+        assert int(f.read().strip()) == 1, "the agent's own text triggered a retry"
+    assert r.is_error is True
+    assert r.exit_reason is ExitReason.AGENT_ERROR
+    assert infra_death(r.exit_reason) is False
+
+
+def test_run_still_retries_a_real_429_in_the_tail(tmp_path):
+    """Anti-vacuity twin of the above, through run(): identical trace, but the
+    provider's 429 is the last line → the rate-limit path engages and recovers."""
+    tmp = tempfile.mkdtemp()
+    counter = str(tmp_path / "n")
+    body = (
+        'n=$(cat "' + counter + '" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "' + counter + '"\n'
+        'out=""; prev=""\n'
+        'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
+        'echo "session id: sess-rl3" >&2\n'
+        "echo '" + _POISON_PATCH_LINE + "' >&2\n"
+        'for i in $(seq 1 30); do echo "codex| trace line $i" >&2; done\n'
+        'if [ "$n" -eq 1 ]; then\n'
+        '  echo "azure-openai error: have exceeded rate limit. retry-after: 0" >&2\n'
+        '  exit 1\n'
+        'fi\n'
+        'printf \'%s\' \'{"status":"pr_opened","summary":"done","needs":""}\' > "$out"\n'
+        'exit 0\n'
+    )
+    runner = CodexRunner(
+        codex_bin=_fake_codex(tmp, body), env={"OPENAI_API_KEY": "k"},
+        rate_limit_backoff_base=0.01, max_rate_limit_wait=0.02, max_rate_limit_retries=3,
+    )
+
+    r = asyncio.run(runner.run(AgentTask(prompt="x")))
+
+    assert r.is_error is False and r.status == "pr_opened"
+    with open(counter) as f:
+        assert int(f.read().strip()) == 2
+
+
+# ══ review M17c — per-run scratch dir is removed; last.json truncated per attempt ═
+def test_a_stale_envelope_is_not_attributed_to_the_next_attempt(tmp_path):
+    """review M17c: codex writes `-o` only when a turn completes, so a retry that
+    produced NOTHING used to re-read the previous attempt's envelope and report
+    it as its own result. Attempt 1 leaves an `error` envelope and drops; attempt 2
+    writes no envelope and exits 0 — its result must be attempt 2's."""
+    tmp = tempfile.mkdtemp()
+    counter = str(tmp_path / "n")
+    body = (
+        'n=$(cat "' + counter + '" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "' + counter + '"\n'
+        'out=""; prev=""\n'
+        'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
+        'echo "session id: sess-stale" >&2\n'
+        'if [ "$n" -eq 1 ]; then\n'
+        '  printf \'%s\' \'{"status":"error","summary":"ATTEMPT ONE ENVELOPE"}\' > "$out"\n'
+        '  echo "ERROR: stream disconnected before completion" >&2\n'
+        '  exit 1\n'
+        'fi\n'
+        'echo "SECOND ATTEMPT PROSE"\n'
+        'exit 0\n'
+    )
+    runner = CodexRunner(
+        codex_bin=_fake_codex(tmp, body), env={"OPENAI_API_KEY": "k"},
+        transport_retries=4, backoff_base=0.01,
+    )
+
+    r = asyncio.run(runner.run(AgentTask(prompt="x")))
+
+    with open(counter) as f:
+        assert int(f.read().strip()) == 2  # it did retry (guard: the test is live)
+    assert "ATTEMPT ONE ENVELOPE" not in r.summary
+    assert r.is_error is False and "SECOND ATTEMPT PROSE" in r.summary
+
+
+def test_the_per_run_scratch_dir_is_removed(tmp_path):
+    """review M17c: the run dir used to be an un-removed mkdtemp, so a long-lived
+    daemon leaked one `codex-run-*` directory per dispatch. The stub records the
+    -o path it was given; that whole directory must be gone once run() returns."""
+    tmp = tempfile.mkdtemp()
+    marker = str(tmp_path / "outpath")
+    body = (
+        'out=""; prev=""\n'
+        'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
+        'echo "$out" > "' + marker + '"\n'
+        'printf \'%s\' \'{"status":"pr_opened","summary":"done"}\' > "$out"\n'
+        'exit 0\n'
+    )
+    runner = CodexRunner(codex_bin=_fake_codex(tmp, body), env={"OPENAI_API_KEY": "k"})
+
+    r = asyncio.run(runner.run(AgentTask(prompt="x", schema=FIX_SCHEMA)))
+
+    assert r.status == "pr_opened"
+    with open(marker) as f:
+        out_path = f.read().strip()
+    assert out_path, "stub never saw an -o path"
+    run_dir = os.path.dirname(out_path)
+    assert os.path.basename(run_dir).startswith("codex-run-")
+    assert not os.path.exists(run_dir), f"scratch dir leaked: {run_dir}"

@@ -40,6 +40,7 @@ from .lifecycle import (
     retry_breaker,
 )
 from .refs import issue_from_branch
+from .review import IdentityMode
 from .world import (
     CIState,
     Comment,
@@ -56,7 +57,9 @@ from .world import (
 @dataclass(frozen=True)
 class FixConfig:
     fix_bot: str
-    identity_mode: str = "three"
+    # A plain "three"/"solo" string still compares equal (str-Enum), so a
+    # hand-built config keeps working; the config boundary hands over a member.
+    identity_mode: IdentityMode = IdentityMode.THREE
     auto_merge: bool = True
     merge_method: str = "squash"
     ci_ignore_checks: str = ""
@@ -187,7 +190,7 @@ def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
         return False
     if pr.number in state.automerge_enabled:
         return False
-    if cfg.identity_mode != "three":
+    if cfg.identity_mode != IdentityMode.THREE:
         return False
     review = latest_other_review(pr.reviews, cfg.fix_bot)
     if review is None or review.state != REVIEW_APPROVED:
@@ -206,7 +209,7 @@ def should_update_branch(pr: PRView, cfg: FixConfig) -> bool:
     a CONFLICTING branch takes the REBASE agent path (§3a). Self-limiting: after
     an update the branch is no longer BEHIND until the base advances again, so this
     does not re-fire every poll."""
-    if not cfg.auto_merge or cfg.identity_mode != "three":
+    if not cfg.auto_merge or cfg.identity_mode != IdentityMode.THREE:
         return False
     if not pr.is_behind():
         return False
@@ -217,18 +220,19 @@ def should_update_branch(pr: PRView, cfg: FixConfig) -> bool:
 
 
 def reap_actions(world: WorldState) -> list[Action]:
-    """When no fixer is alive, anything still ai-working is orphaned (the script
-    died before resetting the label). Requeue issues → ai-ready; clear ai-working
-    on PRs (a PR must NOT go to ai-ready — that label is for issues). Port of
-    watcher-lib.sh:reap."""
-    actions: list[Action] = []
-    for issue in world.issues_with(Label.AI_WORKING):
-        actions.append(
-            Relabel(Target.ISSUE, issue.number, Label.AI_WORKING, Label.AI_READY)
-        )
-    for pr in world.prs_with(Label.AI_WORKING):
-        actions.append(Relabel(Target.PR, pr.number, Label.AI_WORKING, None))
-    return actions
+    """When no fixer is alive, an ISSUE still ai-working is orphaned (the run
+    died before resetting the label) → requeue it to ai-ready. Port of
+    watcher-lib.sh:reap.
+
+    The PR arm is GONE (review M22/D9): the SDK port never adds ai-working to a
+    PR, so `prs_with(AI_WORKING)` was permanently empty — a reaper arm that
+    looked like protection for a busy-marker that does not exist. If a PR-side
+    busy marker is ever reintroduced (P2 parallel dispatch), restore this arm
+    WITH the code that adds the label, not before."""
+    return [
+        Relabel(Target.ISSUE, issue.number, Label.AI_WORKING, Label.AI_READY)
+        for issue in world.issues_with(Label.AI_WORKING)
+    ]
 
 
 def cleanup_actions(
@@ -358,7 +362,17 @@ def decide_fix(
       cleanup of merged/closed PRs (lock-free).
 
     Only ONE fixer-consuming action is ever returned per poll (the single-fixer
-    invariant). `fixer_busy` reflects the live run-lock.
+    invariant). `fixer_busy` reflects the live run-lock and gates the reap step.
+
+    **Single-fixer is enforced by process TOPOLOGY, not by labels** (review
+    M22/D9). One daemon per repo (`single_instance` flock) dispatching
+    synchronously is the whole mechanism: the poll cannot run while a dispatch
+    is in flight, so `consumed` only has to bound ONE poll's emissions. There is
+    deliberately no PR-side `ai-working` busy marker — the SDK port never added
+    one, and the removes/guards that pretended otherwise were deleted rather
+    than left to read as protection a future parallel dispatcher could trust.
+    Reintroducing parallelism (P2) means designing a real lease, not restoring
+    those label writes.
     """
     actions: list[Action] = []
 
@@ -374,14 +388,19 @@ def decide_fix(
     # PR does no work (nothing to push) yet still burns a fixer leg and mislabels the
     # PR ai-blocked (observed: PR #351, opened by a human, adopted for review, then
     # the fixer commented + blocked it). Gate on authorship: a PR whose author is not
-    # FIX_BOT belongs to a human — leave it for them. `author == ""` (unknown) is
-    # treated as NOT-ours (fail-safe: never touch a PR we can't confirm we authored).
+    # FIX_BOT belongs to a human — leave it for them. An unknown author
+    # (`author == ""`, e.g. a PR whose author field didn't resolve) or an unset
+    # FIX_BOT is treated as NOT-ours EXPLICITLY: `login_eq("", "")` is True, so
+    # with both blank the fail-safe this comment used to claim inverted — a
+    # stranger's PR with an unresolvable author read as the fixer's own. The
+    # explicit guard, not the comparison, is what makes it fail safe.
     # The match goes through `login_eq`, never `==`: a FIX_BOT written with the
     # `[bot]` suffix would otherwise match NO PR, silently disabling every fixer PR
     # leg (address-review / fix-ci / rebase / auto-merge) forever (review C1).
     open_prs = [
         p for p in world.prs
         if p.has(Label.AI_PR_OPEN) and p.state == "OPEN"
+        and p.author and cfg.fix_bot
         and login_eq(p.author, cfg.fix_bot)
     ]
 
@@ -463,8 +482,7 @@ def decide_fix(
                 needs_fix = (
                     (cfg.auto_rebase_conflicts and pr.is_conflicting())
                     or (_rev is not None and _rev.state == REVIEW_CHANGES_REQUESTED)
-                    or (not pr_lifecycle(pr).is_working
-                        and ci_state(pr.checks, cfg.ci_ignore_checks) == CIState.FAILURE)
+                    or ci_state(pr.checks, cfg.ci_ignore_checks) == CIState.FAILURE
                 )
                 if needs_fix:
                     actions.extend(_escalate_pr(
@@ -526,9 +544,12 @@ def decide_fix(
             # A superseded CHANGES_REQUESTED review (head moved past it) falls
             # through: the fixer's push is awaiting re-review, but a CI failure
             # on the NEW head is still the fixer's to fix.
-            if not lifecycle.is_working and ci_state(
-                pr.checks, cfg.ci_ignore_checks
-            ) == CIState.FAILURE:
+            # (The `not lifecycle.is_working` conjunct that used to guard this
+            # was deleted with the rest of the phantom PR busy-marker — review
+            # M22/D9: nothing ever adds ai-working to a PR, so it was
+            # permanently true. See decide_fix's docstring for what actually
+            # enforces single-fixer.)
+            if ci_state(pr.checks, cfg.ci_ignore_checks) == CIState.FAILURE:
                 if infra_ceiling_hit(state, cfg, bkey):
                     actions.extend(_escalate_pr(
                         pr.number, infra_escalation_reason(cfg.max_infra_deaths)))
@@ -543,12 +564,29 @@ def decide_fix(
                 actions.append(RunAgent(AgentKind.FIX_CI, pr.number))
                 consumed = True
                 continue
-        # 3c) auto-merge + branch-update do NOT need the lock and are INDEPENDENT.
-        #   arm auto-merge once (marker-guarded), AND
-        #   update a merge-ready-but-BEHIND branch so the armed auto-merge lands —
-        #   even if it was armed on an earlier poll (CLEAN then base advanced) or
-        #   before this logic existed. should_update_branch is marker-independent by
-        #   design; both are self-limiting so neither re-fires needlessly.
+
+    # 3c) auto-merge + branch-update: lock-free and INDEPENDENT of the fixer, so
+    # they get their OWN pass over the same PRs (review M14). They used to sit at
+    # the tail of the loop above, where every `continue` in it — the issueless
+    # arm, each breaker escalation, each dispatch — skipped them: an approved,
+    # green, ISSUELESS PR armed auto-merge only on the polls where the fixer
+    # happened to be BUSY (busy ⇒ the consuming block is skipped ⇒ the `continue`
+    # never runs). Same world, opposite outcome depending on an unrelated lock.
+    #   arm auto-merge once (marker-guarded), AND
+    #   update a merge-ready-but-BEHIND branch so the armed auto-merge lands —
+    #   even if it was armed on an earlier poll (CLEAN then base advanced) or
+    #   before this logic existed. should_update_branch is marker-independent by
+    #   design; both are self-limiting so neither re-fires needlessly.
+    # Every predicate here reads the WORLD only (labels, reviews, checks, the
+    # marker) — never `consumed`/`fixer_busy` — which is what makes "independent"
+    # checkable: for a given world these two arms emit the same actions in both
+    # lock states. (A PR escalated on an EARLIER poll carries needs-human-review,
+    # so is_blocked keeps it out; a PR escalated on THIS poll is not filtered,
+    # because reading this poll's escalations would re-import the lock dependence
+    # — escalation itself only happens when the fixer is idle.)
+    for pr in open_prs:
+        if pr_lifecycle(pr).is_blocked:
+            continue  # a human owns the next move — don't arm anything
         if should_automerge(pr, state, cfg):
             actions.append(EnableAutoMerge(pr.number, cfg.merge_method))
         if should_update_branch(pr, cfg):

@@ -1,0 +1,260 @@
+# Adversarial re-review of the P0 diff — 2026-07-26
+
+Scope: commits `44fbd16` (wave P0-A) + `9ecb0ae` (wave P0-B), reviewed by three
+independent Opus agents in isolated worktrees, each prompted to **refute** that
+its assigned findings from
+[REVIEW-2026-07-25-adversarial.md](REVIEW-2026-07-25-adversarial.md) were
+closed. Lenses: R1 money-safety (C3, caps, `execute_all`), R2
+identity/config/env (C1, C5, M2, D7, M12), R3 gates/world-read/cleanup (push
+gate, C2, M19, M4/D8, M10, M13).
+
+Evidence tags as before: **[repro]** = ran it, **[verified]** = re-read the
+exact code, **[plausible]** = analysis only.
+
+## 1. Verdict
+
+The P0 waves closed what they claimed for the paths they targeted — each
+reviewer independently confirmed the headline repros are fixed:
+
+- **C1** [repro] `FIX_BOT='fix-bot[bot]'` + bare `fix-bot` author → the
+  ADDRESS_REVIEW dispatch happens. Mixed case and `[BOT]` also match.
+- **C3 fix-role raise path** [repro] dispatch → `agent_run_start` + settled
+  `transport_death` → store bump → `_fix_state` → escalation at **exactly** 5
+  paid attempts, with no requeue path back out of `needs-human-review`.
+- **C5 value fidelity** [repro] embedded newlines, quotes, `$VAR`, backticks
+  round-trip byte-exactly through `%q` → `.active.env` → `_load_agent_env`;
+  `os.environ.update` provably precedes every consumer.
+- **M4** [repro] the original scenario (closed-unmerged PR requeued → next
+  resolve resumed a dead session) is fixed end-to-end and mutation-pinned.
+- **M10** [repro] escalation event + `ALERT_CMD` fire through a real
+  `Executor`; no direct `gateway.relabel` remains in workflow code.
+- **M19 / C2** [repro] one poisoned issue drops itself and the poll survives;
+  rate-limit/5xx still propagate (blast radius intact); no `gh … list` argv in
+  `src/` lacks `--limit`.
+
+**But the P0 exit criteria were met while five P0-severity holes remained**, two
+of them created or widened by the P0 work itself. The meta-pattern from the
+original review recurs in a new form: *a fix applied to the path that had the
+incident, not to the mechanism*. C3 was fixed for the fix role's raise path —
+not for the review role, not for process death, not for the one leg whose
+success path has no counter.
+
+## 2. P0 findings (block real-repo operation)
+
+### P0R-1 (was R2-1). `compose-env.sh` drops any var whose composed value equals the launching shell's — a REGRESSION [repro]
+The `env -0` PRE/POST diff emits a var only when it is new or changed. A var
+the config files **do** assign, to the value the ambient shell already had, is
+byte-identical in both snapshots and therefore **omitted**. Triggers are
+everyday: the `${VAR:-default}` idiom that `main.py`'s own comment cites as the
+reason these files are shell syntax, and `TEST_CMD` matching the operator's
+exported value. Side-by-side on identical inputs, the OLD allow-list version
+emitted `TEST_CMD`/`OPENAI_API_KEY` and the NEW one emits neither; loading the
+result under the real systemd environment yields `TEST_CMD = None` →
+`prc_check_tests` fails closed → **every push and `gh pr create` denied,
+forever**. `install-systemd.sh` snapshots the file, so the omission persists
+across reboots. The suite is green with the bug present: a test asserts ambient
+vars don't leak *in*, none asserts that assigned vars are still emitted.
+**Fix:** union the diff with the assignment names scanned out of the two files
+(`grep -oE '^[[:space:]]*(export )?[A-Za-z_][A-Za-z0-9_]*='`) — no
+hand-maintained list, so C5(a) stays closed.
+
+### P0R-2 (was R2-2). `issue-agent start` can launch all three daemons against the wrong repository [repro]
+`derive_name` is the repo **basename**, so `acme/app` and `other/app` both →
+`"app"`. `resolve_name` finds no `REPO` match and no `TARGET_DIR` match, so the
+new M12 warning (which only fires on a `TARGET_DIR` match) stays silent and it
+falls through to `derive_name`. `cmd_start` then prints `✓ reusing
+config/repos/app.env` and delegates — labelling issues, opening PRs and merging
+in a different repo and checkout. `doctor.sh`'s collision check cannot see it
+(only one overlay exists).
+**Fix:** before the reuse branch, compare the overlay's `REPO`/`TARGET_DIR`
+against the detected pair and refuse on mismatch; include the owner in
+`derive_name`.
+
+### P0R-3 (was R1-F1). The review and steward roles have no ceiling of any kind [repro]
+`decide_review` emits one `RunAgent` per eligible PR per poll with no
+`consumed` gate and no breaker read. A pre-result death — or any `is_error` —
+skips `save_pr_session`, so `needs_initial_review` stays True forever: 20 polls
+→ 20 paid REVIEW dispatches, zero counters. Worse under `REVIEW_MODE=multi`: if
+the gate succeeds and dimension legs die, `synthesize_review` returns `None` and
+the workflow returns without persisting, so **the entire fan-out (gate + 5
+dimensions + N validators) re-runs every poll on a RETURNED result**, never
+touching the raise path the P0 fix covers. The dispatcher does bump
+`infra-deaths` in the review state dir; nothing reads it. This is now the
+largest money exposure in the codebase and is strictly worse than the fix-role
+loop C3 described.
+**Fix:** `ReviewState.infra_deaths` read under the PR number + a ceiling guard
+in `decide_review` mirroring `infra_ceiling_hit`; count non-submitting rounds
+against a per-PR attempt ceiling.
+
+### P0R-4 (was R1-F2). Process death is visible but neither bounded nor billed [repro]
+Real `SIGKILL` mid-`await`: journal has `agent_run_start` only, no settled line,
+ledger empty, `infra_deaths == 0`. Every bump site requires the process to
+survive its own death. The systemd template is `Restart=always` +
+`RestartSec=30` with no `StartLimitBurst` override, so at 30s restarts the
+default limiter can never trip: one full paid session per (30s + session
+length), forever, `$0.00` on the ledger, `0` on every counter. This is verbatim
+the "daemon death has the same signature without any transport bug" case the
+original review named, and D2 does not address it.
+**Fix (no new writes):** in `_fix_state`, add unsettled `agent_run_start`
+events (a start with no matching `agent_run`) to the store counter.
+
+### P0R-5 (was R1-F3). The `execute_all` swallow enables one uncounted, unbounded paid loop [repro]
+`resolve` is the only leg with no counter on its **success** path
+(`resolve_followup == PR_OPENED` skips the bump), so the sole thing preventing
+re-dispatch is the follow-up `Relabel(ai-working → ai-pr-open)` — whose failure
+wave P0-B made swallowed. With `ai-pr-open` deleted/renamed in the repo: 10
+polls → 5 paid RESOLVE sessions (the dispatch/reap-requeue alternation, i.e.
+C3's "one paid session every two polls"), `resolve_retries=0`,
+`infra_deaths=0`. Pre-swallow, that raise reached the dispatcher's
+`except BaseException` and was counted.
+**Root cause (deeper than the swallow):** `reap_actions` requeues an
+`ai-working` issue to `ai-ready` **without checking whether that issue already
+has an open PR**. The label write failing is one way to reach that state; a
+crash between the PR opening and the relabel is another. The reaper should
+*repair* an issue with an open PR to `ai-pr-open`, not requeue it for a second
+resolve. Keep the swallow (its sibling-isolation rationale is sound).
+
+## 3. P1 findings
+
+**Money / bounds**
+- **P1R-1** (R1-F5, R3-F12) [repro] `_issue_number` catches every exception →
+  `None` → key `-PR`, while the decide side only reads `breaker_key(pr)`. 6
+  paid deaths → `infra_deaths(-100)=6`, `infra_deaths(5)=0`, no escalation. The
+  coupling is the trap: the flakiness causing transport deaths is the flakiness
+  making the pre-handler lookup fail, so **the ceiling fails exactly when
+  needed**. Fix: read the union of `{key, -number}`, and don't let a lookup
+  failure silently change key space.
+- **P1R-2** (R1-F6) [repro] The per-issue spend cap escalates the **issue**,
+  but PR legs gate on the **PR's** labels: 10 polls → 10 "Circuit breaker"
+  comments + 10 `spend_block` events + 10 `ALERT_CMD` runs (~4,300/day at
+  `POLL_SECONDS=20`). Money-safe, but not the one-shot the docstring claims.
+  Fix: escalate the PR for `_PR_KEYED` kinds; edge-trigger the alert.
+- **P1R-3** (R1-F7) [repro] `except BaseException` counts `KeyboardInterrupt`:
+  5 operator Ctrl-Cs escalate a healthy issue to `needs-human-review`, while
+  SIGTERM counts nothing. The asymmetry is backwards. Fix: exclude
+  `KeyboardInterrupt`/`SystemExit`; decay the counter on a clean result.
+- **P1R-4** (R1-F8) [repro] `repeated_dispatch_warning` counts legs, not
+  dispatches: one healthy `REVIEW_MODE=multi` review → "dispatched 8x … likely
+  a non-converging retry loop". A permanently-on warning is a disabled warning —
+  and it is the only signal for P0R-4. Fix: per-dispatch correlation id.
+- **P1R-5** (R1-F9) [repro] `cost > 0` gating means subscription-plan Claude and
+  un-priced Codex write **no ledger lines at all**, so both caps are inert for
+  every loop shape — the D2 acceptance ("wall cap + infra ceiling bound it") is
+  unsound as written: the wall cap bounds one session's length, not their
+  number. Fix: warn loudly when the ledger stays empty across costed-looking runs.
+
+**Identity / config**
+- **P1R-6** (R2-3) [repro] `normalize_login` never trims: `FIX_BOT='fix-bot '`
+  reproduces the **original C1 symptom** (every fixer PR leg dead) and defeats
+  both new self-approval guards — `validation_errors()` returns `()` and doctor
+  prints `✓ two distinct identities (fix=fix-bot , review+steward=fix-bot)`.
+  Fix: `.strip()` in `normalize_login` and doctor's `_normalize_login`.
+- **P1R-7** (R2-4) [repro] `FIX_BOT` unset passes `validate()` entirely (no
+  check), and the systemd path never runs doctor. With `fix_bot=""`,
+  `login_eq("","")` is True, so a PR whose author the adapter could not resolve
+  (`author: null` → `""`, a deleted account) reads as **ours** — falsifying the
+  fail-safe comment at the filter. Fix: require `FIX_BOT`; make `login_eq`
+  return False when either side normalizes empty.
+- **P1R-8** (R2-5) [repro] `_b` compares unstripped and case-sensitively:
+  `AUTO_MERGE=False` → **True**. Affects every boolean knob. Fix:
+  `strip().casefold()`, and record an error for unrecognized tokens.
+- **P1R-9** (R2-6) [repro] `nan`/`inf` pass every check (`nan < 0` is False):
+  `ISSUE_SPEND_CAP_USD=nan` disables the cap it names;
+  `AGENT_MAX_RUNTIME_SECONDS=nan` disables the wall cap. Fix: `math.isfinite`.
+
+**Gates / inputs / cleanup**
+- **P1R-10** (R3-F1) [repro] The push gate keys on the worktree's HEAD branch,
+  never the pushed ref. During a conflicted rebase `rev-parse --abbrev-ref HEAD`
+  returns literal `HEAD` → ungoverned → gate returns before probing, on exactly
+  the leg whose prompt says "force-with-lease if you rebased". Also:
+  `git push origin HEAD:other-branch` is checked against the wrong branch, and
+  `git -C /other-worktree push` against the wrong worktree. Fix: parse
+  destinations from the argv (`_push_destructive_target` already does refspecs);
+  deny on detached HEAD when the argv names a governed destination.
+- **P1R-11** (R3-F2) [repro] The probe omits `--repo` — the only gh call in the
+  codebase that doesn't pin it. On a two-remote target gh resolved `upstream`
+  and errored; if the wrong repo *resolves*, the branch has no PR there →
+  `NONE` → **the gate silently doesn't apply**, which is the bypass
+  `OpenPrLookup` exists to kill. Fix: thread `cfg.repo`, pass `--repo`.
+- **P1R-12** (R3-F3) During a rate limit the ERROR arm denies **all** pushes
+  including the first pre-PR push, so `gh pr create` never happens and
+  `max_resolve_retries` walks a healthy issue to a human. Fix: on ERROR run the
+  state-derived checks anyway and allow if they all pass (unknown PR state costs
+  a test run, not the leg). Note doctor asserts a *different* argv than the
+  probe, so it passes on exactly the repos where P1R-11 fails.
+- **P1R-13** (R3-F4) [repro] `failed_run_log` bounds 150 **lines**, not bytes:
+  a 200MB log → a 150MB prompt (measured 150,001,711 chars); 10 × 500KB inline
+  comments → 4MB. Compare `_one_line`'s 200 chars. Fix: byte caps.
+- **P1R-14** (R3-F5, C1d's own out-of-scope note) [repro] Both new M13 inputs
+  are **unfenced** in `build_address_review_task` / `build_fix_ci_task` while
+  `_fenced` sits in the same module. Materially worse than M23's shape: inline
+  review comments are writable by **any user with read access**, and the
+  consumer is the fixer under `bypassPermissions` with a governor that only
+  inspects git/gh shapes. Fix: fence both.
+- **P1R-15** (R3-F6) [repro] Cleanup can execute **after** a fresh dispatch in
+  the same tick: with an `ai-ready` issue and a stale CLOSED PR in one snapshot,
+  the real `decide_fix` returns dispatch-then-cleanup, so the new session is
+  wiped, the new worktree deleted, and the issue that just got a PR requeued →
+  a second PR next tick. Reachable with no failure at all (close a PR, then
+  `issue-agent ready N`). Fix: gate the issue-side cleanup arm on the observed
+  issue still carrying `ai-pr-open`.
+- **P1R-16** (R3-F7) [repro] An issueless PR's counters (`issue--112.*`) are
+  never cleaned — `cleanup_pr(112, None, …)` clears only `pr-112.*`. The
+  coverage test is blind because it introspects suffixes, not key namespaces;
+  `triage-N.at` has no cleaner either. Fix: clear the negated-key issue
+  suffixes; extend the test to all three path methods.
+- **P1R-17** (R3-F9) `make_pretooluse_hook` falls back to `os.getcwd()` when
+  `cwd` is absent; the daemon's cwd is `TARGET_DIR`, whose branch is
+  `dev`/`main` → ungoverned → the push gate silently vanishes. A missing `cwd`
+  should deny.
+- **P1R-18** (R3-F10) `resolve_test_cmd` prefers the **agent-written**
+  `.harness/test-cmd` over the operator's `TEST_CMD`, and `check_tests` is the
+  push gate's only real teeth: `echo true > .harness/test-cmd` neuters it.
+  Pre-existing in both stacks, but it is what the newly-wired gate's value rests on.
+
+## 4. Notes / accepted
+
+- **R3-F8** `sh -c`/`bash -c`/`eval`/`xargs` still classify as nothing, so
+  `sh -c 'git push …'` skips the push gate entirely (M9/Appendix C, known). Any
+  "enforcement closed" claim is bounded by that prefix. The strict-xfail record
+  is scheduled (wave P1-2/C2d).
+- **R2-7** `issue-agent status`/`stop`/`ready` now source **every** overlay in
+  `config/repos/` through bash, so an unrelated overlay's `$(…)` executes on
+  read-only-looking commands. Operator-owned local files, so not a privilege
+  crossing — but the blast radius and the read-only-command surface are new.
+  Document in HARNESS.md; consider scoping the scan.
+- **R2-8** `_normalize_assignment_spacing` rewrites lines inside multi-line
+  quoted values (`TEST_CMD` with `FOO = 1` on a continuation line). Cosmetic
+  today; a reader claiming bash semantics that mutates the file is a trap.
+- **R2-9** `_source_env_file` returns the whole environment; only
+  `_OVERLAY_FIELDS` are shielded from ambient values. One call site away from a
+  silent wrong-value bug. Prefer the pre-source-snapshot diff.
+- **R2-10** Residual `_repo_slug` collisions (`acme/app-b` vs `acme-app/b`),
+  case-variant repos splitting state, and the CLI-synth layout
+  (`issue-agent-<name>`) still disagreeing with `config.py`'s default
+  (`issue-agent/<owner-repo>`).
+- **R2-11** An overlay's `unset FOO` leaves no record in `.active.env`
+  (honoured foreground, ignored under systemd); `PATH="$PATH:/opt"`-style
+  transforms bake the interactive value into the persisted snapshot.
+  `world.Comment.is_bot` is the one remaining raw login-shaped comparison.
+- **R3-F11** `_require_list_limit` rejects the `--limit=100` equals form. No
+  production argv hits it; accept both spellings.
+- **R1-F10** `FixWorkflow.resume`'s justification comment is confidently wrong
+  in both halves (`set_resumed_at` is written *before* the run, so the reply is
+  already consumed; the reaper requeues to `ai-ready`, so the next poll pays for
+  a RESOLVE, not a resume). Not a hole, but the comment class this codebase
+  relies on for defence.
+
+## 5. Process finding
+
+Two of the five P0s (P0R-1's regression, P0R-5's swallow consequence) were
+introduced by the remediation itself and passed both the wave's `make test` and
+my diff review. The exit-gate mutation checks all passed *and* missed them,
+because both are **absence** bugs: a var that is no longer emitted, a failure
+that is no longer counted. Mutation testing proves a guard fires when code
+changes; it cannot prove a guard exists for a path nobody wrote a test for.
+The cheap structural counter-measure, for the next wave: for every "we now
+handle X" claim, write the test that **removes** the handling and asserts a
+loud failure — and for anything that emits a set (env vars, suffixes, actions),
+assert set equality against an independently-derived expectation, never
+membership of the happy-path examples.

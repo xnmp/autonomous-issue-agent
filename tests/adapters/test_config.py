@@ -1,8 +1,10 @@
 """Config-from-env mapping."""
 
+import pytest
+
 from issue_agent.app.config import HarnessConfig, from_env, render_agent_md
 from issue_agent.app.main import _load_agent_env
-from issue_agent.domain.review import ReviewMode
+from issue_agent.domain.review import IdentityMode, ReviewMode
 
 
 def test_review_mode_defaults_single():
@@ -388,6 +390,45 @@ def test_identity_cross_check_does_not_fire_on_distinct_bots():
         "FIX_BOT": "fix-bot", "REVIEW_BOT": "review-bot",
     })
     assert c.validation_errors() == ()
+
+
+# ── M16: IDENTITY_MODE is an enum with a validation entry, not a bare string ──
+# `IDENTITY_MODE=Three` used to sail through as a string and land BETWEEN the two
+# guards that read it, which have OPPOSITE polarity: `!= "three"` disabled
+# auto-merge while `== "solo"` left the reviewer enabled. The harness reviewed,
+# approved, and never merged anything — with nothing in the log naming the cause.
+def test_identity_mode_parses_to_the_enum():
+    assert from_env({"REPO": "x", "IDENTITY_MODE": "solo"}).identity_mode is IdentityMode.SOLO
+    assert from_env({"REPO": "x", "IDENTITY_MODE": "three"}).identity_mode is IdentityMode.THREE
+    assert from_env({"REPO": "x"}).identity_mode is IdentityMode.THREE  # unset → default
+
+
+def test_identity_mode_casing_typo_is_a_validation_error_not_a_silent_mode():
+    c = from_env({"REPO": "x", "IDENTITY_MODE": "Three", "FIX_BOT": "f", "REVIEW_BOT": "r"})
+    assert any("IDENTITY_MODE" in e and "Three" in e for e in c.validation_errors())
+    # …and the value the daemons would run on is the SAFE default, not the typo:
+    # nothing downstream may see a mode that matches neither guard.
+    assert c.identity_mode is IdentityMode.THREE
+
+
+def test_identity_mode_misspelling_is_a_validation_error_too():
+    c = from_env({"REPO": "x", "IDENTITY_MODE": "thre", "FIX_BOT": "f", "REVIEW_BOT": "r"})
+    assert any("IDENTITY_MODE" in e for e in c.validation_errors())
+
+
+def test_identity_mode_whitespace_is_tolerated_not_flagged():
+    # Anti-vacuity twin: a value that only differs by the whitespace a shell heredoc
+    # or `export IDENTITY_MODE="solo "` leaves behind is NOT a misconfiguration.
+    c = from_env({"REPO": "x", "IDENTITY_MODE": " solo "})
+    assert c.identity_mode is IdentityMode.SOLO
+    assert not any("IDENTITY_MODE" in e for e in c.validation_errors())
+
+
+def test_identity_mode_bad_value_refuses_to_start():
+    # validate() is what main.py calls: a mode nothing can act on must stop the
+    # daemon at startup rather than produce a half-working harness.
+    with pytest.raises(ValueError, match="IDENTITY_MODE"):
+        from_env({"REPO": "x", "IDENTITY_MODE": "THREE"}).validate()
 
 
 def test_identity_cross_check_does_not_fire_outside_three_mode():

@@ -12,8 +12,7 @@ from issue_agent.adapters.github import GhUnavailable
 from issue_agent.adapters.store import Store
 from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
 from issue_agent.app.execute import Executor
-from issue_agent.domain.actions import AgentKind, Relabel, RunAgent, Target
-from issue_agent.domain.fix import reap_actions
+from issue_agent.domain.actions import AgentKind, RunAgent
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.app.planners.tasks import (
     FixTaskConfig,
@@ -31,7 +30,6 @@ from issue_agent.domain.world import (
     PRView,
     Review,
     REVIEW_CHANGES_REQUESTED,
-    WorldState,
 )
 from issue_agent.domain.labels import Label
 
@@ -632,41 +630,41 @@ def test_resolve_mid_dispatch_failure_persists_the_session_before_the_gh_read_fa
 ## `execute_all` behavior on disk as of THIS commit (full swallow, no
 ## re-raise); if `app/execute.py` changes again, re-run this file — a
 ## disagreement here is a real signal, not a stale test.
-def test_fix_ci_mid_dispatch_failure_keeps_the_retry_counted_and_the_label_recoverable(tmp_path):
-    """fix_ci: ci-retries is bumped BEFORE the follow-up clear-ai-working
-    relabel is attempted — the attempt genuinely happened, so the counter must
-    survive even though the relabel then fails. `Executor.execute_all` isolates
-    the failing action (logs it, does not re-raise), so `dispatch()` completes
-    normally instead of the follow-up write being conflated with a pre-result
-    session death (infra-deaths — the dispatcher's OTHER, separate
-    crash-isolation net — stays untouched). The stuck ai-working label is
-    still recoverable: decide_fix's own reap step re-issues exactly the
-    relabel that failed, the next time the fixer is idle."""
+## The three legs below run on a BLOCKED envelope because that is now the only
+## PR-leg outcome that writes a label at all: review M22/D9 deleted the
+## clear-ai-working relabel every branch used to open with (nothing in the SDK
+## port ever ADDED ai-working to a PR, so it removed nothing). A leg with no
+## follow-up write can't exercise a follow-up-write failure.
+def test_fix_ci_mid_dispatch_failure_keeps_the_retry_counted(tmp_path):
+    """fix_ci: ci-retries is bumped BEFORE the follow-up label write is
+    attempted — the attempt genuinely happened, so the counter must survive even
+    though the write then fails. `Executor.execute_all` isolates the failing
+    action (logs it, does not re-raise), so `dispatch()` completes normally
+    instead of the follow-up write being conflated with a pre-result session
+    death (infra-deaths — the dispatcher's OTHER, separate crash-isolation net —
+    stays untouched). The dropped ai-blocked write is self-correcting: the next
+    poll sees the same red CI and re-dispatches, bounded by the very counter
+    this test proves advanced."""
     store = Store(state_dir=str(tmp_path))
     gw = FakeGateway(prs={100: _ci_pr()}, fail_on={"relabel"})
-    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="c-live"))
+    runner = FakeRunner(AgentResult(is_error=False, status="blocked", session_id="c-live"))
     d = _ci_dispatcher(gw, store, runner)
 
     asyncio.run(d.dispatch(RunAgent(AgentKind.FIX_CI, 100)))  # completes: the bad action is isolated, not raised
 
     assert store.get_session(5) == "c-live"              # money spent → persisted
     assert store.get_ci_retries(5) == 1                   # the attempt DID count
-    assert not any(c[0] == "relabel" for c in gw.calls)    # the clear-ai-working write never landed
+    assert not any(c[0] == "relabel" for c in gw.calls)    # the ai-blocked write never landed
     assert store.get_infra_deaths(5) == 0                  # isolated at the action level, not the session level
 
-    # Recoverable, not silently stranded: with ai-working still on the PR, the
-    # idle-tick reap step re-issues exactly the relabel that failed.
-    reaped = reap_actions(WorldState(prs=(PRView(100, labels=frozenset({Label.AI_WORKING})),)))
-    assert Relabel(Target.PR, 100, Label.AI_WORKING, None) in reaped
 
-
-def test_rebase_mid_dispatch_failure_keeps_the_retry_counted_and_the_label_recoverable(tmp_path):
+def test_rebase_mid_dispatch_failure_keeps_the_retry_counted(tmp_path):
     """rebase: same ordering as fix_ci (retry bump before the follow-up
     relabel), so the same invariants hold for the CONFLICTING-branch leg."""
     store = Store(state_dir=str(tmp_path))
     pr = PRView(100, head_ref_name="fix/5-x", closing_issue=5, mergeable="CONFLICTING")
     gw = FakeGateway(prs={100: pr}, fail_on={"relabel"})
-    runner = FakeRunner(AgentResult(is_error=True, session_id="reb-live"))  # a failed attempt, not an infra death
+    runner = FakeRunner(AgentResult(is_error=False, status="blocked", session_id="reb-live"))
     d = _ci_dispatcher(gw, store, runner)
 
     asyncio.run(d.dispatch(RunAgent(AgentKind.REBASE, 100)))
@@ -677,22 +675,40 @@ def test_rebase_mid_dispatch_failure_keeps_the_retry_counted_and_the_label_recov
     assert store.get_infra_deaths(5) == 0
 
 
-def test_address_review_mid_dispatch_failure_still_counts_the_retry(tmp_path):
-    """address_review: the review-retry bump is coded AFTER
-    `executor.execute_all` (workflows/fix.py's address_review tail). Because
-    `execute_all` isolates the failing relabel instead of raising, control
-    still reaches the bump: the attempt is correctly counted even though its
-    relabel write failed and never landed."""
+def test_address_review_mid_dispatch_failure_still_applies_the_rest_of_the_tail(tmp_path):
+    """address_review on a BLOCKED envelope emits an ask + ai-blocked. When the
+    ask fails mid-tail, `execute_all` isolates it and the ai-blocked relabel —
+    the action that actually stops re-dispatch — still lands. (Blocked burns no
+    retry by design: waiting on a human is not a failed attempt.)"""
     store = Store(state_dir=str(tmp_path))
     pr = PRView(100, head_ref_name="fix/5-x", closing_issue=5,
                reviews=(Review(state=REVIEW_CHANGES_REQUESTED, author="human1", submitted_at="T1"),))
-    gw = FakeGateway(prs={100: pr}, fail_on={"relabel"})
+    gw = FakeGateway(prs={100: pr}, fail_on={"comment"})
+    runner = FakeRunner(AgentResult(is_error=False, status="blocked", session_id="ar-live"))
+    d = _ci_dispatcher(gw, store, runner)
+
+    asyncio.run(d.dispatch(RunAgent(AgentKind.ADDRESS_REVIEW, 100)))
+
+    assert store.get_session(5) == "ar-live"
+    assert ("relabel", "pr", 100, None, "ai-blocked") in gw.calls
+    assert store.get_review_retry(5) == ("", 0)
+    assert store.get_infra_deaths(5) == 0
+
+
+def test_address_review_success_counts_the_retry_and_touches_no_label(tmp_path):
+    """The ok path's whole tail is the counter (review M22/D9): the bump is coded
+    AFTER `executor.execute_all`, and with nothing left to execute it must still
+    run — the review-retry breaker is the ONLY thing bounding this leg now."""
+    store = Store(state_dir=str(tmp_path))
+    pr = PRView(100, head_ref_name="fix/5-x", closing_issue=5,
+               reviews=(Review(state=REVIEW_CHANGES_REQUESTED, author="human1", submitted_at="T1"),))
+    gw = FakeGateway(prs={100: pr})
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="ar-live"))
     d = _ci_dispatcher(gw, store, runner)
 
     asyncio.run(d.dispatch(RunAgent(AgentKind.ADDRESS_REVIEW, 100)))
 
     assert store.get_session(5) == "ar-live"
-    assert store.get_review_retry(5) == ("T1", 1)   # the bump still runs (execute_all isolates, doesn't raise)
-    assert not any(c[0] == "relabel" for c in gw.calls)
+    assert store.get_review_retry(5) == ("T1", 1)
+    assert not any(c[0] == "relabel" for c in gw.calls)  # no gh write at all, not a failed one
     assert store.get_infra_deaths(5) == 0

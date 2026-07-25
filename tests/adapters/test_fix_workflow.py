@@ -89,7 +89,7 @@ def test_resolve_blocked_comments_and_blocks_issue():
     assert ("relabel", "issue", 5, "ai-working", "ai-blocked") in gw.calls
 
 
-def test_fix_ci_records_retry_and_clears_working_on_push():
+def test_fix_ci_records_retry_and_writes_no_label_on_push():
     gw = FakeGateway(
         prs={100: PRView(100, head_ref_name="fix/5-token", closing_issue=5,
                          checks=(Check("unit", bucket="fail"),))},
@@ -101,7 +101,11 @@ def test_fix_ci_records_retry_and_clears_working_on_push():
 
     assert store.sessions[5] == "c5"
     assert "unit" in runner.tasks[0].prompt
-    assert ("relabel", "pr", 100, "ai-working", None) in gw.calls
+    # review M22/D9: a pushed leg makes NO label write. The clear-ai-working
+    # relabel this used to assert removed a label nothing ever added — a `gh pr
+    # edit` per leg, and a busy marker a future parallel dispatcher would have
+    # trusted. Progress is recorded in the counter, not on the PR.
+    assert not any(c[0] == "relabel" for c in gw.calls)
 
 
 def test_fix_ci_attaches_mcp_when_check_matches(tmp_path):
@@ -279,7 +283,8 @@ def test_fix_ci_error_advances_the_breaker():
 
 def test_fix_ci_infra_death_does_not_advance_the_breaker():
     # #58: six SIGKILLs on one PR walked the CI breaker to needs-human-review on
-    # work that never ran. The PR still stops looking busy.
+    # work that never ran. The PR is left exactly as it was found (M22/D9: there
+    # is no PR busy marker to clear).
     gw = FakeGateway(prs={100: _ci_pr()})
     store = RetryRecordingStore()
     store.set_ci_retries(5, 2)
@@ -291,7 +296,7 @@ def test_fix_ci_infra_death_does_not_advance_the_breaker():
     asyncio.run(_workflow(gw, store, runner).fix_ci(100))
 
     assert store.get_ci_retries(5) == 2
-    assert ("relabel", "pr", 100, "ai-working", None) in gw.calls
+    assert not any(c[0] == "relabel" for c in gw.calls)  # M22/D9: no PR label writes
 
 
 def test_rebase_error_advances_the_breaker():
@@ -320,8 +325,8 @@ def test_rebase_infra_death_does_not_advance_the_breaker():
 
 def test_fix_ci_infra_death_counts_against_the_infra_ceiling(tmp_path):
     """review C3/D2c, the RETURNED-result half. The exemption above (an infra
-    death is not a CI attempt) left the deaths themselves unbounded: the PR
-    clears ai-working, the next poll sees the same red CI, and pays again. The
+    death is not a CI attempt) left the deaths themselves unbounded: the tail
+    moves no label, the next poll sees the same red CI, and pays again. The
     separate counter is what bounds it — under the SAME key the CI counter uses,
     so the decide side reads one key per PR leg."""
     gw = FakeGateway(prs={100: _ci_pr()})
@@ -571,7 +576,7 @@ def test_fix_ci_dispatches_when_the_failed_run_log_is_empty():
 
     assert len(runner.tasks) == 1
     assert "unit" in runner.tasks[0].prompt
-    assert ("relabel", "pr", 100, "ai-working", None) in gw.calls
+    assert not any(c[0] == "relabel" for c in gw.calls)  # M22/D9: no PR label writes
 
 
 def test_fix_ci_dispatches_when_the_failed_run_log_raises():
@@ -584,7 +589,7 @@ def test_fix_ci_dispatches_when_the_failed_run_log_raises():
     asyncio.run(_workflow(gw, FakeStore(), runner).fix_ci(100))
 
     assert len(runner.tasks) == 1
-    assert ("relabel", "pr", 100, "ai-working", None) in gw.calls
+    assert not any(c[0] == "relabel" for c in gw.calls)  # M22/D9: no PR label writes
 
 
 def test_fix_ci_dispatches_when_the_gateway_has_no_failed_run_log():
@@ -595,7 +600,7 @@ def test_fix_ci_dispatches_when_the_gateway_has_no_failed_run_log():
     asyncio.run(_workflow(gw, FakeStore(), runner).fix_ci(100))
 
     assert len(runner.tasks) == 1
-    assert ("relabel", "pr", 100, "ai-working", None) in gw.calls
+    assert not any(c[0] == "relabel" for c in gw.calls)  # M22/D9: no PR label writes
 
 
 def test_address_review_prompt_carries_the_inline_comments():
@@ -623,7 +628,7 @@ def test_address_review_dispatches_when_there_are_no_inline_comments():
 
     assert len(runner.tasks) == 1
     assert "fix it" in runner.tasks[0].prompt
-    assert ("relabel", "pr", 100, "ai-working", None) in gw.calls
+    assert not any(c[0] == "relabel" for c in gw.calls)  # M22/D9: no PR label writes
 
 
 def test_address_review_dispatches_when_review_comments_raises():
@@ -633,7 +638,7 @@ def test_address_review_dispatches_when_review_comments_raises():
     asyncio.run(_workflow(gw, FakeStore(), runner).address_review(100))
 
     assert len(runner.tasks) == 1
-    assert ("relabel", "pr", 100, "ai-working", None) in gw.calls
+    assert not any(c[0] == "relabel" for c in gw.calls)  # M22/D9: no PR label writes
 
 
 def test_address_review_dispatches_when_the_gateway_has_no_review_comments():
@@ -643,13 +648,13 @@ def test_address_review_dispatches_when_the_gateway_has_no_review_comments():
     asyncio.run(_workflow(gw, FakeStore(), runner).address_review(100))
 
     assert len(runner.tasks) == 1
-    assert ("relabel", "pr", 100, "ai-working", None) in gw.calls
+    assert not any(c[0] == "relabel" for c in gw.calls)  # M22/D9: no PR label writes
 
 
 # ── review C3/D2c: the two legs B1 left uncounted ────────────────────────────
 def test_address_review_infra_death_counts_against_the_infra_ceiling(tmp_path):
     """The review-retry exemption (an external kill is not an attempt) left the
-    deaths unbounded: the tail clears ai-working, the next poll sees the same
+    deaths unbounded: the tail moves no label, the next poll sees the same
     CHANGES_REQUESTED review and pays again. Same key the review counter uses."""
     gw = FakeGateway(prs={100: _review_pr()})
     store = Store(state_dir=str(tmp_path))

@@ -257,7 +257,7 @@ class FixWorkflow:
         if outcome.infra_death(result.exit_reason):
             # review C3/D2c, RETURNED-result half. address_review_actions
             # exempts an external kill from the review-retry ceiling (no attempt
-            # was made) and clears ai-working, so the next poll sees the same
+            # was made) and leaves the PR untouched, so the next poll sees the same
             # CHANGES_REQUESTED review and pays for the leg again — unbounded
             # until this counter bounds it. Same key the review-retry counter
             # uses, so the decide side reads one key per issue. A leg either

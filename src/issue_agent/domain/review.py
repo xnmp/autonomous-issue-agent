@@ -18,6 +18,42 @@ from .labels import Label
 from .world import PRView, WorldState, REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED
 
 
+class IdentityMode(str, Enum):
+    """How many GitHub identities the harness runs under.
+
+      THREE — fix, review and steward are DISTINCT logins, so the reviewer can
+              approve the fixer's PR and auto-merge can land it.
+      SOLO  — one login does everything; GitHub 422s self-approval, so the
+              reviewer is disabled and a human reviews + merges.
+
+    An enum, not a bare string (review M16): the two guards that read this knob
+    have OPPOSITE polarity (`!= three` disables auto-merge, `== solo` disables
+    the reviewer), so an unrecognised value such as `Three` used to fall
+    BETWEEN them — the reviewer ran and spent, approvals landed, and nothing
+    ever merged, with nothing in the log saying why.
+    """
+
+    THREE = "three"
+    SOLO = "solo"
+
+    @classmethod
+    def from_env(cls, mode: str) -> "IdentityMode":
+        """Resolve IDENTITY_MODE. Whitespace is trimmed; anything else must
+        match a member EXACTLY or this raises ValueError for the config
+        boundary to turn into a validation error (review M16).
+
+        Deliberately stricter than `ReviewMode.from_env`, which falls back to
+        SINGLE. ReviewMode has a safe default — the cheapest, most-proven
+        review path. This knob has none: guessing THREE makes every approval
+        422 on a solo install, guessing SOLO silently disables the reviewer.
+        Case is NOT folded either, because the bash half of the harness
+        (`bin/doctor.sh`, `agent/watcher-lib.sh`, `review/review-watcher.sh`)
+        compares this env var with `[ "$IDENTITY_MODE" = three ]` — accepting
+        `Three` here while bash rejects it would just move the divergence."""
+        raw = (mode or "").strip()
+        return cls(raw)  # ValueError on anything unrecognised — see docstring
+
+
 class ReviewMode(str, Enum):
     """How the reviewer examines a PR. Three genuine strategies (was a single
     REVIEW_MULTI_AGENT bool; a bool can't encode three states without an illegal
@@ -55,7 +91,9 @@ class ReviewMode(str, Enum):
 @dataclass(frozen=True)
 class ReviewConfig:
     review_bot: str
-    identity_mode: str = "three"
+    # A plain "three"/"solo" string still compares equal (str-Enum), so a
+    # hand-built config keeps working; the config boundary hands over a member.
+    identity_mode: IdentityMode = IdentityMode.THREE
     # The PR label the reviewer triggers on. Default `ai-pr-open` (the harness's own
     # pipeline PRs); an external-repo deployment sets this to `ai-review` so the same
     # daemon reviews human-authored PRs carrying that tag.
@@ -146,7 +184,7 @@ def decide_review(
     (The review reads the diff by PR number and does not depend on the label
     being present yet; saving the session this tick means the labelled PR is not
     re-reviewed next poll.)"""
-    if cfg.identity_mode == "solo":
+    if cfg.identity_mode == IdentityMode.SOLO:
         return []
     actions: list[Action] = []
     for pr in world.prs_with(cfg.trigger_label):
