@@ -7,8 +7,9 @@ Names mirror config/agent.env.example so operators carry the same env file over.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
+from ..domain.identity import normalize_login
 from ..domain.review import ReviewMode
 
 
@@ -39,6 +40,7 @@ class FixRuntimeConfig:
     auto_rebase_conflicts: bool
     max_rebase_retries: int
     max_resolve_retries: int
+    max_infra_deaths: int
     author_tests_split: bool
     max_contract_rounds: int
     mcp_config: str
@@ -100,6 +102,8 @@ class CodexRuntimeConfig:
     rate_limit_backoff_base: float
     max_rate_limit_wait: float
     max_rate_limit_retries: int
+    cost_per_mtok_in: float
+    cost_per_mtok_out: float
 
 
 @dataclass(frozen=True)
@@ -115,7 +119,10 @@ class HarnessConfig:
     review_state_dir: str = ""
     steward_state_dir: str = ""
     worktree_root: str = ".claude/worktrees"
-    poll_seconds: int = 60
+    # review S7: this literal used to disagree with from_env's own "20" literal
+    # (60 here, "20" there) — from_env now reads its default off THIS field, so
+    # there is exactly one source and 20 (the value that actually shipped) wins.
+    poll_seconds: int = 20
     auto_merge: bool = True
     merge_method: str = "squash"
     ci_ignore_checks: str = ""
@@ -140,6 +147,14 @@ class HarnessConfig:
     # resolve — the most expensive — had none, so an always-erroring resolve
     # requeued ai-ready and re-dispatched a full session every poll forever.
     max_resolve_retries: int = 3
+    # Infra-death ceiling (review C3/D2c): a pre-result session death (transport
+    # drop, daemon restart/OOM between dispatch and workflow tail) used to be
+    # unbounded, unbilled, and invisible — the crash-isolation contract means
+    # the *retry* breakers never see it (infra deaths are not attempts), so a
+    # separate, higher ceiling escalates once dying itself becomes the loop.
+    # 0 disables (wave P0-B wires the counter; this field/knob lands now so the
+    # config surface is stable for that wave).
+    max_infra_deaths: int = 5
     review_trigger_label: str = "ai-pr-open"
     fix_model: str | None = None
     review_model: str | None = None
@@ -248,6 +263,15 @@ class HarnessConfig:
     codex_rate_limit_backoff_base: float = 60.0
     codex_max_rate_limit_wait: float = 180.0
     codex_max_rate_limit_retries: int = 5
+    # Codex spend accounting (review M1/D12): codex_runner.py hardcodes
+    # cost_usd=0.0, so codex spend is invisible to both the issue and daily
+    # caps by construction. When both are >0, roles.py (a later wave) prices
+    # the envelope's token usage against these USD-per-million-token rates;
+    # 0.0 (default) means codex spend stays untracked and a loud startup
+    # warning fires instead. USD per MILLION tokens, matching provider pricing
+    # tables (not per-token, which would need too many decimal places).
+    codex_cost_per_mtok_in: float = 0.0
+    codex_cost_per_mtok_out: float = 0.0
     # ── spend circuit breakers ────────────────────────────────────────────────
     # Per-agent budgets (MAX_BUDGET_USD et al) bound ONE session; nothing bounded
     # the aggregate, so a leg that retries forever spent without limit while every
@@ -261,6 +285,13 @@ class HarnessConfig:
     # Shell command fed each spend_block / escalation event as JSON on stdin.
     # Blank = no alerting (the events are still journalled).
     alert_cmd: str = ""
+    # Malformed-numeric fallbacks recorded by from_env (review M2): a bad
+    # POLL_SECONDS/MAX_BUDGET_USD/etc must not traceback at startup — from_env
+    # substitutes the field default and records what it did here, so
+    # validation_errors() can surface it as a readable, fail-loud entry instead
+    # of an opaque ValueError three frames deep in int()/float(). Not itself an
+    # env knob; never set this directly.
+    parse_errors: tuple[str, ...] = ()
 
     @property
     def repository(self) -> RepositoryConfig:
@@ -292,6 +323,7 @@ class HarnessConfig:
             auto_rebase_conflicts=self.auto_rebase_conflicts,
             max_rebase_retries=self.max_rebase_retries,
             max_resolve_retries=self.max_resolve_retries,
+            max_infra_deaths=self.max_infra_deaths,
             author_tests_split=self.author_tests_split,
             max_contract_rounds=self.max_contract_rounds,
             mcp_config=self.fix_mcp_config,
@@ -357,20 +389,37 @@ class HarnessConfig:
             rate_limit_backoff_base=self.codex_rate_limit_backoff_base,
             max_rate_limit_wait=self.codex_max_rate_limit_wait,
             max_rate_limit_retries=self.codex_max_rate_limit_retries,
+            cost_per_mtok_in=self.codex_cost_per_mtok_in,
+            cost_per_mtok_out=self.codex_cost_per_mtok_out,
         )
 
     def validation_errors(self) -> tuple[str, ...]:
-        errors: list[str] = []
+        # M2: malformed numerics recorded by from_env come first — they are the
+        # loudest class of misconfiguration (a typo that would otherwise
+        # traceback three frames deep in int()/float()) and must never be lost
+        # behind a range check on the substituted default.
+        errors: list[str] = list(self.parse_errors)
         _require_positive(errors, "POLL_SECONDS", self.poll_seconds)
         _require_non_negative(errors, "MAX_CI_RETRIES", self.max_ci_retries)
         _require_non_negative(errors, "MAX_REVIEW_RETRIES", self.max_review_retries)
         _require_non_negative(errors, "MAX_REBASE_RETRIES", self.max_rebase_retries)
         _require_non_negative(errors, "MAX_RESOLVE_RETRIES", self.max_resolve_retries)
+        _require_non_negative(errors, "MAX_INFRA_DEATHS", self.max_infra_deaths)
         if not (self.repo or "").strip():
             # Fail LOUD at startup, not with an opaque gh error on the first
             # poll: an empty REPO means a missing/mis-composed overlay (the
             # silent-default class, #50).
             errors.append("REPO must be set (owner/name) — is the repo overlay composed?")
+        if self.identity_mode == "three" and normalize_login(self.fix_bot) == normalize_login(
+            self.review_bot
+        ):
+            # review C1/D1 belt-and-braces: a raw string compare would miss
+            # `fix-bot` vs `fix-bot[bot]` and let a self-approving identity
+            # pair through — GitHub then 422s every approval, forever.
+            errors.append(
+                "FIX_BOT and REVIEW_BOT normalize to the same identity under "
+                "IDENTITY_MODE=three (GitHub rejects self-approval with a 422)"
+            )
         _require_non_negative(errors, "REVIEW_MAX_REJECTIONS", self.max_review_rejections)
         _require_non_negative(errors, "MAX_CONTRACT_ROUNDS", self.max_contract_rounds)
         for name, value in (
@@ -392,6 +441,8 @@ class HarnessConfig:
         _require_non_negative(errors, "CODEX_MAX_RATE_LIMIT_RETRIES", self.codex_max_rate_limit_retries)
         _require_positive(errors, "CODEX_RATE_LIMIT_BACKOFF_BASE_SECONDS", self.codex_rate_limit_backoff_base)
         _require_positive(errors, "CODEX_MAX_RATE_LIMIT_WAIT_SECONDS", self.codex_max_rate_limit_wait)
+        _require_non_negative(errors, "CODEX_COST_PER_MTOK_IN", self.codex_cost_per_mtok_in)
+        _require_non_negative(errors, "CODEX_COST_PER_MTOK_OUT", self.codex_cost_per_mtok_out)
         _require_non_negative(errors, "ISSUE_SPEND_CAP_USD", self.issue_spend_cap_usd)
         _require_non_negative(errors, "DAILY_SPEND_CAP_USD", self.daily_spend_cap_usd)
         return tuple(errors)
@@ -448,9 +499,12 @@ def render_agent_md(text: str, cfg: "HarnessConfig") -> str:
 
 def _b(env: dict, key: str, default: bool) -> bool:
     v = env.get(key)
-    if v is None:
+    if v is None or v.strip() == "":
+        # review M2: an exported-but-empty knob (AUTO_MERGE= with nothing after
+        # the `=`) must mean UNSET, not False — a raw `v not in (...)` treated
+        # "" as a falsy token, silently flipping every default-ON flag off.
         return default
-    return v not in ("0", "false", "no", "off", "")
+    return v not in ("0", "false", "no", "off")
 
 
 def _require_non_negative(errors: list[str], name: str, value: int | float) -> None:
@@ -463,41 +517,123 @@ def _require_positive(errors: list[str], name: str, value: int | float) -> None:
         errors.append(f"{name} must be > 0")
 
 
+# review M2: the single source of truth for "what does an absent/empty numeric
+# knob default to" is the HarnessConfig dataclass field itself — from_env reads
+# it here instead of restating a literal (the drift class that produced the
+# POLL_SECONDS 60-vs-20 mismatch, review S7).
+_FIELD_DEFAULTS = {f.name: f.default for f in fields(HarnessConfig)}
+
+
+def _dc_default(field: str):
+    return _FIELD_DEFAULTS[field]
+
+
+def _coerce_int(env: dict, key: str, default: int, errors: list[str]) -> int:
+    """Empty/absent → `default` (unset, not an error). A malformed value also
+    falls back to `default` but is recorded in `errors` so it reaches
+    validation_errors() as a readable entry — config construction must never
+    traceback on operator input (review M2: `POLL_SECONDS=abc` used to raise a
+    bare ValueError three frames inside int())."""
+    raw = env.get(key)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        errors.append(f"{key} must be an integer, got {raw!r} — using default {default}")
+        return default
+
+
+def _coerce_float(env: dict, key: str, default: float, errors: list[str]) -> float:
+    """Float twin of `_coerce_int` — same empty=unset / malformed=fallback+error
+    contract. Closes the ISSUE_SPEND_CAP_USD hole specifically: `float(v or 0)`
+    used to make an exported-but-empty cap silently mean "disabled" instead of
+    "use the default"."""
+    raw = env.get(key)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        errors.append(f"{key} must be a number, got {raw!r} — using default {default}")
+        return default
+
+
+def _repo_slug(repo: str) -> str:
+    """`owner/name` → `owner-name`, a filesystem-safe per-repo state-dir
+    component (review M5/D7). Unset/blank REPO falls back to a fixed "unknown"
+    slug rather than collapsing every repo-less config onto the bare role dir
+    (which would recreate the exact collision this fix closes)."""
+    slug = (repo or "").strip().replace("/", "-")
+    return slug or "unknown"
+
+
+def _default_state_dir(repo: str, role_dir: str) -> str:
+    """Default STATE_DIR/REVIEW_STATE_DIR/STEWARD_STATE_DIR (review M5/D7): the
+    old default was per-role but not per-repo, so two repos' fix daemons shared
+    `issue-N.session` etc. — issue #5 in repo B would resume repo A's
+    transcript. Nothing real is deployed yet, so the default itself moves
+    per-repo; an operator who already set the env var explicitly is unaffected
+    (from_env only calls this when the var is absent/empty)."""
+    return os.path.expanduser(f"~/.local/state/{role_dir}/{_repo_slug(repo)}")
+
+
 def from_env(env: dict | None = None) -> HarnessConfig:
     e = env if env is not None else os.environ
+    # Malformed-numeric fallbacks accumulate here and ride along on the config
+    # (HarnessConfig.parse_errors) so validation_errors() can report them —
+    # from_env itself must never traceback on operator input (review M2).
+    errors: list[str] = []
+    repo = e.get("REPO", "")
     return HarnessConfig(
-        repo=e.get("REPO", ""),
-        base_branch=e.get("BASE_BRANCH", "dev"),
-        target_dir=e.get("TARGET_DIR", ""),
-        identity_mode=e.get("IDENTITY_MODE", "three"),
-        fix_bot=e.get("FIX_BOT", ""),
+        repo=repo,
+        base_branch=e.get("BASE_BRANCH", _dc_default("base_branch")),
+        target_dir=e.get("TARGET_DIR", _dc_default("target_dir")),
+        identity_mode=e.get("IDENTITY_MODE", _dc_default("identity_mode")),
+        fix_bot=e.get("FIX_BOT", _dc_default("fix_bot")),
         # Default to the shared GitHub App login so an operator only needs to
         # supply the App credentials (GH_APP_*), not restate the bot name. Override
         # per-repo/shared only if running a differently-named App.
-        review_bot=e.get("REVIEW_BOT", "my-reviewer-bot[bot]"),
-        steward_bot=e.get("STEWARD_BOT", "my-reviewer-bot[bot]"),
-        state_dir=e.get("STATE_DIR", os.path.expanduser("~/.local/state/issue-agent")),
-        review_state_dir=e.get("REVIEW_STATE_DIR", os.path.expanduser("~/.local/state/review-agent")),
-        steward_state_dir=e.get("STEWARD_STATE_DIR", os.path.expanduser("~/.local/state/steward-agent")),
-        worktree_root=e.get("WORKTREE_ROOT", ".claude/worktrees"),
-        poll_seconds=int(e.get("POLL_SECONDS", "20")),
-        auto_merge=_b(e, "AUTO_MERGE", True),
-        merge_method=e.get("MERGE_METHOD", "squash"),
-        ci_ignore_checks=e.get("CI_IGNORE_CHECKS", ""),
-        close_issue_on_merge=_b(e, "CLOSE_ISSUE_ON_MERGE", True),
-        auto_rebase_conflicts=_b(e, "AUTO_REBASE_CONFLICTS", True),
-        max_rebase_retries=int(e.get("MAX_REBASE_RETRIES", "3")),
-        max_resolve_retries=int(e.get("MAX_RESOLVE_RETRIES", "3")),
-        max_ci_retries=int(e.get("MAX_CI_RETRIES", "3")),
-        max_review_rejections=int(e.get("REVIEW_MAX_REJECTIONS", "4")),
-        max_review_retries=int(e.get("MAX_REVIEW_RETRIES", "3")),
-        review_trigger_label=e.get("REVIEW_TRIGGER_LABEL", "ai-pr-open"),
-        fix_model=e.get("FIX_MODEL") or None,
-        review_model=e.get("REVIEW_MODEL") or None,
-        steward_triage_model=e.get("STEWARD_TRIAGE_MODEL", "sonnet") or None,
-        fix_budget_usd=float(e.get("MAX_BUDGET_USD", "10.00")),
-        review_budget_usd=float(e.get("REVIEW_BUDGET_USD", "8.00")),
-        triage_budget_usd=float(e.get("STEWARD_TRIAGE_BUDGET_USD", "0.75")),
+        review_bot=e.get("REVIEW_BOT", _dc_default("review_bot")),
+        steward_bot=e.get("STEWARD_BOT", _dc_default("steward_bot")),
+        # review M5/D7: default state dirs are now per-repo (see
+        # _default_state_dir) — an explicit env value (even if it happens to
+        # equal the computed default) always wins; only absent/empty falls
+        # through to the per-repo default.
+        state_dir=e.get("STATE_DIR") or _default_state_dir(repo, "issue-agent"),
+        review_state_dir=e.get("REVIEW_STATE_DIR") or _default_state_dir(repo, "review-agent"),
+        steward_state_dir=e.get("STEWARD_STATE_DIR") or _default_state_dir(repo, "steward-agent"),
+        worktree_root=e.get("WORKTREE_ROOT", _dc_default("worktree_root")),
+        poll_seconds=_coerce_int(e, "POLL_SECONDS", _dc_default("poll_seconds"), errors),
+        auto_merge=_b(e, "AUTO_MERGE", _dc_default("auto_merge")),
+        merge_method=e.get("MERGE_METHOD", _dc_default("merge_method")),
+        ci_ignore_checks=e.get("CI_IGNORE_CHECKS", _dc_default("ci_ignore_checks")),
+        close_issue_on_merge=_b(e, "CLOSE_ISSUE_ON_MERGE", _dc_default("close_issue_on_merge")),
+        auto_rebase_conflicts=_b(e, "AUTO_REBASE_CONFLICTS", _dc_default("auto_rebase_conflicts")),
+        max_rebase_retries=_coerce_int(e, "MAX_REBASE_RETRIES", _dc_default("max_rebase_retries"), errors),
+        max_resolve_retries=_coerce_int(
+            e, "MAX_RESOLVE_RETRIES", _dc_default("max_resolve_retries"), errors
+        ),
+        max_ci_retries=_coerce_int(e, "MAX_CI_RETRIES", _dc_default("max_ci_retries"), errors),
+        max_infra_deaths=_coerce_int(e, "MAX_INFRA_DEATHS", _dc_default("max_infra_deaths"), errors),
+        max_review_rejections=_coerce_int(
+            e, "REVIEW_MAX_REJECTIONS", _dc_default("max_review_rejections"), errors
+        ),
+        max_review_retries=_coerce_int(
+            e, "MAX_REVIEW_RETRIES", _dc_default("max_review_retries"), errors
+        ),
+        review_trigger_label=e.get("REVIEW_TRIGGER_LABEL", _dc_default("review_trigger_label")),
+        fix_model=e.get("FIX_MODEL") or _dc_default("fix_model"),
+        review_model=e.get("REVIEW_MODEL") or _dc_default("review_model"),
+        steward_triage_model=e.get("STEWARD_TRIAGE_MODEL", _dc_default("steward_triage_model"))
+        or None,
+        fix_budget_usd=_coerce_float(e, "MAX_BUDGET_USD", _dc_default("fix_budget_usd"), errors),
+        review_budget_usd=_coerce_float(
+            e, "REVIEW_BUDGET_USD", _dc_default("review_budget_usd"), errors
+        ),
+        triage_budget_usd=_coerce_float(
+            e, "STEWARD_TRIAGE_BUDGET_USD", _dc_default("triage_budget_usd"), errors
+        ),
         review_mode=ReviewMode.from_env(
             e.get("REVIEW_MODE", ""), _b(e, "REVIEW_MULTI_AGENT", False)
         ),
@@ -506,46 +642,82 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         # of this pure dict→config mapping, like agent_md). A whitespace-only value
         # is treated as unset so it can't strip the reviewer's whole rubric.
         review_prompt=(e.get("REVIEW_PROMPT") or "").strip(),
-        review_adopt_unlabeled=_b(e, "REVIEW_ADOPT_UNLABELED", True),
-        review_gate_model=e.get("REVIEW_GATE_MODEL", "haiku") or None,
-        review_validation_model=e.get("REVIEW_VALIDATION_MODEL", "haiku") or None,
-        review_scout_model=e.get("REVIEW_SCOUT_MODEL", "sonnet") or None,
-        review_gate_budget_usd=float(e.get("REVIEW_GATE_BUDGET_USD", "0.10")),
-        review_dimension_budget_usd=float(e.get("REVIEW_DIMENSION_BUDGET_USD", "0.75")),
-        review_validation_budget_usd=float(e.get("REVIEW_VALIDATION_BUDGET_USD", "0.20")),
-        steward_triage=_b(e, "STEWARD_TRIAGE", True),
-        steward_promote=_b(e, "STEWARD_PROMOTE", False),
-        steward_owner=e.get("STEWARD_OWNER", ""),
-        edit_check_cmd=e.get("EDIT_CHECK_CMD", ""),
-        author_tests_split=_b(e, "AUTHOR_TESTS_SPLIT", False),
-        max_contract_rounds=int(e.get("MAX_CONTRACT_ROUNDS", "2")),
-        fix_mcp_config=e.get("FIX_MCP_CONFIG", ""),
-        harness_root=e.get("HARNESS_ROOT_DIR", ""),
-        jira_sync=_b(e, "JIRA_SYNC", True),
-        jira_project_key=e.get("JIRA_PROJECT_KEY", ""),
-        jira_cloud_id=e.get("JIRA_CLOUD_ID", ""),
-        jira_mcp_config=e.get("JIRA_MCP_CONFIG", "config/mcp/atlassian.json"),
-        jira_mcp_tools=e.get("JIRA_MCP_TOOLS", "mcp__atlassian__*"),
-        jira_budget_usd=float(e.get("JIRA_SYNC_BUDGET_USD", "0.50")),
-        fixer_runtime=e.get("FIXER_RUNTIME", "claude"),
-        codex_bin=e.get("CODEX_BIN", "codex"),
-        codex_model=e.get("CODEX_MODEL", ""),
-        codex_provider_id=e.get("CODEX_PROVIDER_ID", "openai-custom"),
-        codex_provider_name=e.get("CODEX_PROVIDER_NAME", "OpenAI"),
-        codex_base_url=e.get("CODEX_BASE_URL", ""),
-        codex_env_key=e.get("CODEX_ENV_KEY", "OPENAI_API_KEY"),
-        codex_wire_api=e.get("CODEX_WIRE_API", "responses"),
-        codex_sandbox=e.get("CODEX_SANDBOX", "danger-full-access"),
-        agent_idle_timeout=float(e.get("AGENT_IDLE_TIMEOUT_SECONDS", "900") or 0),
-        agent_max_runtime=float(e.get("AGENT_MAX_RUNTIME_SECONDS", "2700") or 0),
-        codex_transport_retries=int(e.get("CODEX_TRANSPORT_RETRIES", "4") or 0),
-        codex_backoff_base=float(e.get("CODEX_BACKOFF_BASE_SECONDS", "2") or 0),
-        codex_rate_limit_backoff_base=float(
-            e.get("CODEX_RATE_LIMIT_BACKOFF_BASE_SECONDS", "60") or 0
+        review_adopt_unlabeled=_b(e, "REVIEW_ADOPT_UNLABELED", _dc_default("review_adopt_unlabeled")),
+        review_gate_model=e.get("REVIEW_GATE_MODEL", _dc_default("review_gate_model")) or None,
+        review_validation_model=(
+            e.get("REVIEW_VALIDATION_MODEL", _dc_default("review_validation_model")) or None
         ),
-        codex_max_rate_limit_wait=float(e.get("CODEX_MAX_RATE_LIMIT_WAIT_SECONDS", "180") or 0),
-        codex_max_rate_limit_retries=int(e.get("CODEX_MAX_RATE_LIMIT_RETRIES", "5") or 0),
-        issue_spend_cap_usd=float(e.get("ISSUE_SPEND_CAP_USD", "25") or 0),
-        daily_spend_cap_usd=float(e.get("DAILY_SPEND_CAP_USD", "50") or 0),
-        alert_cmd=e.get("ALERT_CMD", ""),
+        review_scout_model=e.get("REVIEW_SCOUT_MODEL", _dc_default("review_scout_model")) or None,
+        review_gate_budget_usd=_coerce_float(
+            e, "REVIEW_GATE_BUDGET_USD", _dc_default("review_gate_budget_usd"), errors
+        ),
+        review_dimension_budget_usd=_coerce_float(
+            e, "REVIEW_DIMENSION_BUDGET_USD", _dc_default("review_dimension_budget_usd"), errors
+        ),
+        review_validation_budget_usd=_coerce_float(
+            e, "REVIEW_VALIDATION_BUDGET_USD", _dc_default("review_validation_budget_usd"), errors
+        ),
+        steward_triage=_b(e, "STEWARD_TRIAGE", _dc_default("steward_triage")),
+        steward_promote=_b(e, "STEWARD_PROMOTE", _dc_default("steward_promote")),
+        steward_owner=e.get("STEWARD_OWNER", _dc_default("steward_owner")),
+        edit_check_cmd=e.get("EDIT_CHECK_CMD", _dc_default("edit_check_cmd")),
+        author_tests_split=_b(e, "AUTHOR_TESTS_SPLIT", _dc_default("author_tests_split")),
+        max_contract_rounds=_coerce_int(
+            e, "MAX_CONTRACT_ROUNDS", _dc_default("max_contract_rounds"), errors
+        ),
+        fix_mcp_config=e.get("FIX_MCP_CONFIG", _dc_default("fix_mcp_config")),
+        harness_root=e.get("HARNESS_ROOT_DIR", _dc_default("harness_root")),
+        jira_sync=_b(e, "JIRA_SYNC", _dc_default("jira_sync")),
+        jira_project_key=e.get("JIRA_PROJECT_KEY", _dc_default("jira_project_key")),
+        jira_cloud_id=e.get("JIRA_CLOUD_ID", _dc_default("jira_cloud_id")),
+        jira_mcp_config=e.get("JIRA_MCP_CONFIG", _dc_default("jira_mcp_config")),
+        jira_mcp_tools=e.get("JIRA_MCP_TOOLS", _dc_default("jira_mcp_tools")),
+        jira_budget_usd=_coerce_float(e, "JIRA_SYNC_BUDGET_USD", _dc_default("jira_budget_usd"), errors),
+        fixer_runtime=e.get("FIXER_RUNTIME", _dc_default("fixer_runtime")),
+        codex_bin=e.get("CODEX_BIN", _dc_default("codex_bin")),
+        codex_model=e.get("CODEX_MODEL", _dc_default("codex_model")),
+        codex_provider_id=e.get("CODEX_PROVIDER_ID", _dc_default("codex_provider_id")),
+        codex_provider_name=e.get("CODEX_PROVIDER_NAME", _dc_default("codex_provider_name")),
+        codex_base_url=e.get("CODEX_BASE_URL", _dc_default("codex_base_url")),
+        codex_env_key=e.get("CODEX_ENV_KEY", _dc_default("codex_env_key")),
+        codex_wire_api=e.get("CODEX_WIRE_API", _dc_default("codex_wire_api")),
+        codex_sandbox=e.get("CODEX_SANDBOX", _dc_default("codex_sandbox")),
+        agent_idle_timeout=_coerce_float(
+            e, "AGENT_IDLE_TIMEOUT_SECONDS", _dc_default("agent_idle_timeout"), errors
+        ),
+        agent_max_runtime=_coerce_float(
+            e, "AGENT_MAX_RUNTIME_SECONDS", _dc_default("agent_max_runtime"), errors
+        ),
+        codex_transport_retries=_coerce_int(
+            e, "CODEX_TRANSPORT_RETRIES", _dc_default("codex_transport_retries"), errors
+        ),
+        codex_backoff_base=_coerce_float(
+            e, "CODEX_BACKOFF_BASE_SECONDS", _dc_default("codex_backoff_base"), errors
+        ),
+        codex_rate_limit_backoff_base=_coerce_float(
+            e,
+            "CODEX_RATE_LIMIT_BACKOFF_BASE_SECONDS",
+            _dc_default("codex_rate_limit_backoff_base"),
+            errors,
+        ),
+        codex_max_rate_limit_wait=_coerce_float(
+            e, "CODEX_MAX_RATE_LIMIT_WAIT_SECONDS", _dc_default("codex_max_rate_limit_wait"), errors
+        ),
+        codex_max_rate_limit_retries=_coerce_int(
+            e, "CODEX_MAX_RATE_LIMIT_RETRIES", _dc_default("codex_max_rate_limit_retries"), errors
+        ),
+        codex_cost_per_mtok_in=_coerce_float(
+            e, "CODEX_COST_PER_MTOK_IN", _dc_default("codex_cost_per_mtok_in"), errors
+        ),
+        codex_cost_per_mtok_out=_coerce_float(
+            e, "CODEX_COST_PER_MTOK_OUT", _dc_default("codex_cost_per_mtok_out"), errors
+        ),
+        issue_spend_cap_usd=_coerce_float(
+            e, "ISSUE_SPEND_CAP_USD", _dc_default("issue_spend_cap_usd"), errors
+        ),
+        daily_spend_cap_usd=_coerce_float(
+            e, "DAILY_SPEND_CAP_USD", _dc_default("daily_spend_cap_usd"), errors
+        ),
+        alert_cmd=e.get("ALERT_CMD", _dc_default("alert_cmd")),
+        parse_errors=tuple(errors),
     )

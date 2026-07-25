@@ -29,6 +29,7 @@ from .actions import (
     Target,
 )
 from .ci import ci_state, latest_other_review
+from .identity import login_eq
 from .labels import Label, priority_rank
 from .lifecycle import (
     issue_escalation,
@@ -134,7 +135,7 @@ def last_human_reply(issue: IssueView, fix_bot: str) -> Comment | None:
     a paid RESUME session every poll (V1/#13)."""
     humans = [
         c for c in issue.comments
-        if c.author != fix_bot and not c.is_bot
+        if not login_eq(c.author, fix_bot) and not c.is_bot
     ]
     return humans[-1] if humans else None
 
@@ -330,9 +331,13 @@ def decide_fix(
     # the fixer commented + blocked it). Gate on authorship: a PR whose author is not
     # FIX_BOT belongs to a human — leave it for them. `author == ""` (unknown) is
     # treated as NOT-ours (fail-safe: never touch a PR we can't confirm we authored).
+    # The match goes through `login_eq`, never `==`: a FIX_BOT written with the
+    # `[bot]` suffix would otherwise match NO PR, silently disabling every fixer PR
+    # leg (address-review / fix-ci / rebase / auto-merge) forever (review C1).
     open_prs = [
         p for p in world.prs
-        if p.has(Label.AI_PR_OPEN) and p.state == "OPEN" and p.author == cfg.fix_bot
+        if p.has(Label.AI_PR_OPEN) and p.state == "OPEN"
+        and login_eq(p.author, cfg.fix_bot)
     ]
 
     # 1) New ai-ready issue (highest priority).

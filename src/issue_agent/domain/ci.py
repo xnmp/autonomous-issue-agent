@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 
+from .identity import login_eq
 from .world import Check, Review, CIState
 
 
@@ -54,8 +55,13 @@ def latest_other_review(reviews: Iterable[Review], fix_bot: str) -> Review | Non
     and auto-merge requires a genuinely independent approver. Reviews by the
     fix bot are filtered out; the latest remaining one (by submitted_at) wins.
     Returns None when no distinct actor has reviewed.
+
+    Identity comparison goes through `login_eq`, never `==`: a `FIX_BOT` written
+    with the `[bot]` suffix would otherwise never match the bare login gh reports
+    in the review author field, and the fixer would treat its OWN approval as an
+    independent one (review C1).
     """
-    others = [r for r in reviews if r.author != fix_bot]
+    others = [r for r in reviews if not login_eq(r.author, fix_bot)]
     if not others:
         return None
     return max(others, key=lambda r: r.submitted_at)

@@ -355,6 +355,79 @@ def test_unknown_author_pr_is_not_driven_by_fixer():
     assert _run_agents(actions) == []
 
 
+# ── review C1: the `[bot]` suffix must not disable the fixer ──────────────────
+# An operator putting a GitHub App on the fixer writes FIX_BOT='fix-bot[bot]',
+# but gh reports the PR author bare as `fix-bot`. Under a raw `==` the authorship
+# filter above matched NOTHING, so address-review / fix-ci / rebase / auto-merge
+# never dispatched — forever, with no error.
+SUFFIXED_CFG = FixConfig(fix_bot="fix-bot[bot]")
+
+
+def test_c1_suffixed_fix_bot_still_addresses_review_on_its_own_pr():
+    p = pr(100, "ai-pr-open", author="fix-bot",
+           reviews=(Review("CHANGES_REQUESTED", "review-bot", "t1"),))
+    actions = decide_fix(world(prs=[p]), SUFFIXED_CFG, FixState(), fixer_busy=False)
+    assert RunAgent(AgentKind.ADDRESS_REVIEW, 100) in _run_agents(actions)
+
+
+def test_c1_suffixed_fix_bot_still_fixes_ci_on_its_own_pr():
+    p = pr(100, "ai-pr-open", author="fix-bot", checks=(Check("unit", bucket="fail"),))
+    actions = decide_fix(world(prs=[p]), SUFFIXED_CFG, FixState(), fixer_busy=False)
+    assert RunAgent(AgentKind.FIX_CI, 100) in _run_agents(actions)
+
+
+def test_c1_suffixed_fix_bot_still_rebases_its_own_conflicting_pr():
+    p = pr(100, "ai-pr-open", author="fix-bot", mergeable="CONFLICTING")
+    actions = decide_fix(world(prs=[p]), SUFFIXED_CFG, FixState(), fixer_busy=False)
+    assert RunAgent(AgentKind.REBASE, 100) in _run_agents(actions)
+
+
+def test_c1_bare_fix_bot_matches_a_suffixed_pr_author():
+    # The asymmetry runs both ways: the config may be bare while the API reports
+    # the App's login suffixed.
+    p = pr(100, "ai-pr-open", author="fix-bot[bot]",
+           reviews=(Review("CHANGES_REQUESTED", "review-bot", "t1"),))
+    actions = decide_fix(world(prs=[p]), CFG, FixState(), fixer_busy=False)
+    assert RunAgent(AgentKind.ADDRESS_REVIEW, 100) in _run_agents(actions)
+
+
+def test_c1_suffixed_fix_bot_still_leaves_a_humans_pr_alone():
+    # Anti-vacuity twin: the authorship gate must still EXCLUDE strangers — the
+    # suffix tolerance is not "match anything".
+    p = pr(100, "ai-pr-open", author="some-human",
+           reviews=(Review("CHANGES_REQUESTED", "review-bot", "t1"),))
+    actions = decide_fix(world(prs=[p]), SUFFIXED_CFG, FixState(), fixer_busy=False)
+    assert _run_agents(actions) == []
+
+
+def test_c1_suffixed_fix_bot_does_not_treat_its_own_approval_as_independent():
+    # `latest_other_review` under the same asymmetry: the fixer's own APPROVE,
+    # reported bare, must not satisfy the distinct-approver requirement.
+    p = pr(100, "ai-pr-open", author="fix-bot",
+           reviews=(Review("APPROVED", "fix-bot", "t1"),),
+           checks=(Check("build", bucket="pass"),))
+    assert not should_automerge(p, FixState(), SUFFIXED_CFG)
+    # Anti-vacuity twin: a genuinely distinct approver still arms auto-merge.
+    q = pr(101, "ai-pr-open", author="fix-bot",
+           reviews=(Review("APPROVED", "review-bot", "t1"),),
+           checks=(Check("build", bucket="pass"),))
+    assert should_automerge(q, FixState(), SUFFIXED_CFG)
+
+
+def test_c1_suffixed_fix_bot_does_not_read_its_own_comment_as_a_human_reply():
+    # `last_human_reply` under the same asymmetry: the fixer's own bare-login
+    # comment must not count as a new human reply, or one unanswered question
+    # re-fires a paid RESUME session every poll.
+    iss = issue(7, "ai-blocked", comments=(Comment("fix-bot", "asking", "t1"),))
+    st = FixState(sessions=frozenset({7}))
+    assert issues_needing_resume(world(issues=[iss]), st, SUFFIXED_CFG) == []
+    # Anti-vacuity twin: a real human's reply on the same world still resumes.
+    iss2 = issue(7, "ai-blocked", comments=(
+        Comment("fix-bot", "asking", "t1"), Comment("alice", "here you go", "t2"),
+    ))
+    assert issues_needing_resume(world(issues=[iss2]), st, SUFFIXED_CFG) == [(7, "t2")]
+
+
 def test_ci_failure_dispatches_fix_ci():
     p = pr(100, "ai-pr-open", checks=(Check("unit", bucket="fail"),))
     actions = decide_fix(world(prs=[p]), CFG, FixState(), fixer_busy=False)

@@ -61,3 +61,34 @@ def test_latest_other_review_picks_newest_distinct_actor():
     latest = latest_other_review(reviews, "fix-bot")
     assert latest is not None and latest.state == "APPROVED"
     assert latest.submitted_at == "2026-01-02T00:00:00Z"
+
+
+# ── review C1: the self-review guard survives the `[bot]` suffix asymmetry ─────
+def test_c1_suffixed_fix_bot_still_excludes_its_own_bare_login_review():
+    # FIX_BOT='fix-bot[bot]' (App form) vs the bare `fix-bot` gh reports in the
+    # review author field. Under a raw `==` the fixer's OWN approval survived the
+    # filter and read as an independent one — the 422 self-approval shape.
+    reviews = [Review("APPROVED", "fix-bot", "2026-01-01T00:00:00Z")]
+    assert latest_other_review(reviews, "fix-bot[bot]") is None
+
+
+def test_c1_bare_fix_bot_still_excludes_its_own_suffixed_login_review():
+    # The asymmetry runs both ways.
+    reviews = [Review("APPROVED", "fix-bot[bot]", "2026-01-01T00:00:00Z")]
+    assert latest_other_review(reviews, "fix-bot") is None
+
+
+def test_c1_suffix_tolerance_does_not_swallow_a_genuine_reviewer():
+    # Anti-vacuity twin: a genuinely distinct actor is still returned, whichever
+    # form either side is written in.
+    reviews = [
+        Review("APPROVED", "fix-bot", "2026-01-01T00:00:00Z"),        # self
+        Review("APPROVED", "review-bot", "2026-01-02T00:00:00Z"),     # distinct
+    ]
+    latest = latest_other_review(reviews, "fix-bot[bot]")
+    assert latest is not None and latest.author == "review-bot"
+
+
+def test_c1_login_comparison_is_case_insensitive():
+    reviews = [Review("APPROVED", "Fix-Bot", "2026-01-01T00:00:00Z")]
+    assert latest_other_review(reviews, "fix-bot[bot]") is None

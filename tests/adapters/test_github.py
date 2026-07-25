@@ -7,9 +7,13 @@ records argv and returns canned JSON (no network, no real gh)."""
 import json
 
 from issue_agent.adapters.github import (
+    _FAILED_LOG_LINES,
+    _INLINE_COMMENT_LIMIT,
     _LIST_LIMIT,
     GitHubGateway,
     Identity,
+    MissingListLimit,
+    format_review_comments,
     build_add_blocked_by_args,
     build_blocker_id_args,
     build_close_issue_args,
@@ -766,3 +770,345 @@ def test_has_open_blocker_failsoft_for_api_answers_but_not_for_infra():
     gw_infra = GitHubGateway("o/r", runner=_raising_runner(GhUnavailable("rate-limit", "x")))
     with pytest.raises(GhUnavailable):
         gw_infra.has_open_blocker(5)
+
+
+# ── review C2: every `gh … list` states its ceiling ───────────────────────────
+def _limit_of(argv):
+    return argv[argv.index("--limit") + 1] if "--limit" in argv else None
+
+
+def test_list_issue_numbers_passes_limit_and_warns_on_truncation(capsys):
+    """review C2. Without --limit gh answers with the 30 NEWEST issues and looks
+    exactly like a complete answer, so past 30 ai-ready issues the OLDEST are
+    never dispatched — every poll, no error. The cap must be stated, and hitting
+    it must be loud."""
+    fr = FakeRunner({"issue list": [{"number": n} for n in range(1, _LIST_LIMIT + 1)]})
+    gw = GitHubGateway("o/r", runner=fr)
+    nums = gw.list_issue_numbers("ai-ready")
+    assert len(nums) == _LIST_LIMIT
+    assert _limit_of(fr.calls[0][0]) == str(_LIST_LIMIT)
+    err = capsys.readouterr().err
+    assert "TRUNCATED" in err and "ai-ready" in err
+
+
+def test_list_issue_numbers_no_warning_below_limit(capsys):
+    fr = FakeRunner({"issue list": [{"number": 1}, {"number": 2}]})
+    gw = GitHubGateway("o/r", runner=fr)
+    assert gw.list_issue_numbers("ai-ready") == [1, 2]
+    assert capsys.readouterr().err == ""
+
+
+def test_list_pr_numbers_passes_limit_and_warns_on_truncation(capsys):
+    """review C2, PR half: past 30 open ai-pr-open PRs the oldest vanish from the
+    world, so their failing CI is never fixed and they never merge."""
+    fr = FakeRunner({"pr list": [{"number": n} for n in range(1, _LIST_LIMIT + 1)]})
+    gw = GitHubGateway("o/r", runner=fr)
+    nums = gw.list_pr_numbers("ai-pr-open")
+    assert len(nums) == _LIST_LIMIT
+    assert _limit_of(fr.calls[0][0]) == str(_LIST_LIMIT)
+    err = capsys.readouterr().err
+    assert "TRUNCATED" in err and "ai-pr-open" in err
+
+
+def test_list_pr_numbers_no_warning_below_limit(capsys):
+    fr = FakeRunner({"pr list": [{"number": 1}]})
+    gw = GitHubGateway("o/r", runner=fr)
+    assert gw.list_pr_numbers("ai-pr-open") == [1]
+    assert capsys.readouterr().err == ""
+
+
+def test_pr_for_issue_passes_limit_and_warns_on_truncation(capsys):
+    """review C2. pr_for_issue scans open PRs for a `fix/<issue>-…` head; capped
+    at 30 it reports "no PR" for a PR that exists, and the fixer re-opens work
+    that is already in flight."""
+    prs = [{"number": n, "headRefName": f"feat/{n}-x"} for n in range(1, _LIST_LIMIT + 1)]
+    fr = FakeRunner({"pr list": prs})
+    gw = GitHubGateway("o/r", runner=fr)
+    assert gw.pr_for_issue(_LIST_LIMIT) == _LIST_LIMIT   # the OLDEST-ranked entry still found
+    assert _limit_of(fr.calls[0][0]) == str(_LIST_LIMIT)
+    assert "TRUNCATED" in capsys.readouterr().err
+
+
+def test_pr_for_issue_no_warning_below_limit(capsys):
+    fr = FakeRunner({"pr list": [{"number": 100, "headRefName": "fix/5-null-token"}]})
+    gw = GitHubGateway("o/r", runner=fr)
+    assert gw.pr_for_issue(5) == 100
+    assert gw.pr_for_issue(6) is None
+    assert capsys.readouterr().err == ""
+
+
+def test_gh_rejects_a_list_subcommand_without_limit():
+    """review C2, made structural: a `gh … list` argv with no --limit is a BUG in
+    this module (silent 30-item truncation), so it raises before gh ever runs
+    rather than returning a plausible-looking short answer."""
+    fr = FakeRunner()
+    gw = GitHubGateway("o/r", runner=fr)
+    with pytest.raises(ValueError):
+        gw._gh_json(["issue", "list", "--repo", "o/r", "--json", "number"])
+    with pytest.raises(MissingListLimit):
+        gw._gh(["pr", "list", "--repo", "o/r"])          # raw-text list calls too
+    assert fr.calls == []                                 # guard fires BEFORE gh runs
+    # anti-vacuity: the same calls WITH --limit go through, and non-list
+    # subcommands are untouched.
+    gw._gh_json(["issue", "list", "--repo", "o/r", "--json", "number", "--limit", "500"])
+    gw._gh(["pr", "view", "1", "--repo", "o/r"])
+    gw._gh(["api", "repos/o/r/issues/5/dependencies/blocked_by"])
+    assert len(fr.calls) == 3
+
+
+@pytest.mark.parametrize(
+    "build", ["build_world", "build_review_world", "build_triage_world", "build_steward_world"]
+)
+def test_every_world_builder_list_call_carries_a_limit(build):
+    """review C2 sweep across all four builders — the observable contract, not the
+    guard: no world is ever built from a silently-capped listing."""
+    calls = []
+
+    def runner(argv, token):
+        calls.append(argv)
+        return "[]"
+
+    gw = GitHubGateway("o/r", runner=runner, review_adopt_unlabeled=True)
+    getattr(gw, build)()
+    lists = [a for a in calls if len(a) > 2 and a[2] == "list"]
+    assert lists, f"{build} made no list call"
+    for argv in lists:
+        assert _limit_of(argv) is not None, f"{build}: {' '.join(argv)} has no --limit"
+
+
+# ── review M19: one unreadable issue ≠ a dead poll ────────────────────────────
+def _issue_world_runner(bad, *, label="ai-working", raises=None):
+    """Two issues (#7, #8) carrying `label`; #7 is broken per `bad`/`raises`."""
+    def runner(argv, token):
+        key = " ".join(argv)
+        if "issue list" in key:
+            return json.dumps([{"number": 7}, {"number": 8}]) if label in key else "[]"
+        if "pr list" in key:
+            return "[]"
+        if "issue view 7" in key:
+            if raises is not None:
+                raise raises
+            return bad
+        if "issue view 8" in key:
+            return json.dumps({"number": 8, "state": "OPEN", "labels": [{"name": label}]})
+        return ""
+    return runner
+
+
+@pytest.mark.parametrize("bad", ["", "{}"])
+def test_build_world_survives_one_unreadable_issue(bad, capsys):
+    """review M19: `gh issue view` on an issue that was transferred, converted to a
+    discussion or locked answers empty/partial → parse_issue raises (AttributeError
+    / KeyError) → the exception used to leave the world-build generator and kill the
+    ENTIRE poll, every tick, permanently (the incident _safe_get_pr records, on the
+    other item type). Only the bad issue may be dropped."""
+    gw = GitHubGateway("o/r", runner=_issue_world_runner(bad))
+    w = gw.build_world()
+    assert [i.number for i in w.issues] == [8]
+    assert "skip issue #7" in capsys.readouterr().err
+
+
+def test_build_world_keeps_both_issues_when_both_are_readable(capsys):
+    # anti-vacuity twin: the isolation above is not just dropping everything.
+    gw = GitHubGateway(
+        "o/r",
+        runner=_issue_world_runner(json.dumps({"number": 7, "state": "OPEN", "labels": []})),
+    )
+    assert [i.number for i in gw.build_world().issues] == [7, 8]
+    assert capsys.readouterr().err == ""
+
+
+def test_build_world_isolates_a_timed_out_issue_but_not_a_rate_limit(capsys):
+    """review M19, blast radius — the exact twin of the PR test above. A single
+    wedged `gh issue view` recurs every poll while that issue exists, so isolating
+    it keeps every other issue dispatchable. A rate limit fails EVERY fetch, so
+    isolating it would rebuild the empty world V10 is about."""
+    timed_out = GhUnavailable("network", "gh timed out after 120s", timed_out=True)
+    gw = GitHubGateway("o/r", runner=_issue_world_runner(None, raises=timed_out))
+    assert [i.number for i in gw.build_world().issues] == [8]
+    assert "skip issue #7" in capsys.readouterr().err
+
+    throttled = _issue_world_runner(
+        None, raises=GhUnavailable("rate-limit", "API rate limit exceeded")
+    )
+    with pytest.raises(GhUnavailable):
+        GitHubGateway("o/r", runner=throttled).build_world()
+
+
+def test_build_world_isolates_a_wedged_blocker_read(capsys):
+    """The ai-ready dependency read shares the issue's isolation boundary: a
+    `gh api …/dependencies/blocked_by` that wedges on ONE issue drops that issue
+    for a tick (safer than dispatching it ungated) instead of killing the poll."""
+    def runner(argv, token):
+        key = " ".join(argv)
+        if "issue list" in key:
+            return json.dumps([{"number": 7}, {"number": 8}]) if "ai-ready" in key else "[]"
+        if "pr list" in key:
+            return "[]"
+        if "issue view" in key:
+            return json.dumps(
+                {"number": int(argv[3]), "state": "OPEN", "labels": [{"name": "ai-ready"}]}
+            )
+        if "issues/7" in key:
+            raise GhUnavailable("network", "gh timed out after 120s", timed_out=True)
+        return "0"                      # #8: no declared blockers
+
+    gw = GitHubGateway("o/r", runner=runner)
+    assert [i.number for i in gw.build_world().issues] == [8]
+    assert "skip issue #7" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("build", ["build_triage_world", "build_steward_world"])
+def test_steward_issue_worlds_survive_one_unreadable_issue(build, capsys):
+    # review M19: the steward/triage polls read EVERY open issue, so they are the
+    # most likely to meet the one bad one.
+    def runner(argv, token):
+        key = " ".join(argv)
+        if "issue list" in key and "--state open" in key:
+            return json.dumps([{"number": 7}, {"number": 8}])
+        if "issue list" in key:
+            return "[]"
+        if "issue view 7" in key:
+            return "{}"                                   # KeyError in parse_issue
+        if "issue view 8" in key:
+            return json.dumps({"number": 8, "state": "OPEN"})
+        return ""
+
+    gw = GitHubGateway("o/r", runner=runner)
+    w = getattr(gw, build)()
+    assert [i.number for i in w.issues] == [8]
+    assert "skip issue #7" in capsys.readouterr().err
+
+
+# ── review M13 / D6: the two repair legs' prompt inputs ───────────────────────
+def test_format_review_comments_renders_path_line_author_body():
+    """review M13: the fixer never saw the file:line asks reviewers actually make.
+    Formatting lives in Python (not in a jq filter inside an argv) so this text —
+    the whole point of the feature — is assertable."""
+    raw = [
+        {"path": "a.py", "line": 12, "user": {"login": "rev"}, "body": "rename this",
+         "created_at": "t1", "in_reply_to_id": None},
+        # line null (outdated hunk) → original_line, as the bash's `.line // 0` did
+        {"path": "b.py", "line": None, "original_line": 3, "user": {"login": "rev"},
+         "body": "  drop the flag  ", "created_at": "t2"},
+        # a REPLY is the fixer's own thread, not a new ask → excluded
+        {"path": "a.py", "line": 12, "user": {"login": "fixer"}, "body": "done",
+         "created_at": "t3", "in_reply_to_id": 99},
+    ]
+    assert format_review_comments(raw).splitlines() == [
+        "a.py:12 (rev): rename this",
+        "b.py:3 (rev): drop the flag",
+    ]
+
+
+def test_format_review_comments_keeps_the_newest_and_bounds_the_paste():
+    # oldest→newest, last _INLINE_COMMENT_LIMIT — an unbounded paste is how a long
+    # review thread blows the context window on the leg that must not fail.
+    raw = [
+        {"path": "f.py", "line": n, "user": {"login": "rev"}, "body": f"c{n}",
+         "created_at": f"t{n:02d}"}
+        for n in range(1, 21)
+    ]
+    lines = format_review_comments(list(reversed(raw))).splitlines()
+    assert len(lines) == _INLINE_COMMENT_LIMIT
+    assert lines[0].endswith("c13") and lines[-1].endswith("c20")
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        None,
+        [],
+        {"message": "Not Found"},                       # an API error object
+        [{"body": "no path, no line, no user"}],        # every field missing
+        ["not-a-dict"],
+    ],
+)
+def test_format_review_comments_tolerates_every_malformed_shape(raw):
+    out = format_review_comments(raw)
+    assert isinstance(out, str)                         # never raises
+
+
+def test_review_comments_fetches_top_level_comments_and_formats_them():
+    raw = [{"path": "a.py", "line": 4, "user": {"login": "rev"}, "body": "fix",
+            "created_at": "t1"}]
+    fr = FakeRunner({"api repos/o/r/pulls/100/comments": raw})
+    gw = GitHubGateway("o/r", runner=fr)
+    assert gw.review_comments(100) == "a.py:4 (rev): fix"
+    argv = fr.calls[0][0]
+    assert argv[1] == "api" and argv[2].startswith("repos/o/r/pulls/100/comments")
+    # per_page: the endpoint's default page is 30 and we keep the NEWEST few —
+    # reading page 1 only would hand the fixer the OLDEST asks (review C2's shape).
+    assert "per_page=100" in argv[2]
+
+
+@pytest.mark.parametrize(
+    "runner",
+    [
+        _raising_runner(GhUnavailable("rate-limit", "API rate limit exceeded")),
+        _raising_runner(RuntimeError("gh boom")),
+        FakeRunner(),                                   # gh answered ""
+    ],
+)
+def test_review_comments_fails_soft_to_empty_string(runner):
+    """D6: a comment fetch may never kill a dispatch — address-review must still
+    run with the review BODY alone rather than not run at all."""
+    assert GitHubGateway("o/r", runner=runner).review_comments(100) == ""
+
+
+def test_failed_run_log_tails_the_newest_failed_run_on_the_head_branch():
+    """review M13 / port of agent/fix-ci.sh:39-42. Keyed on the REAL head branch —
+    `gh run list` has no PR filter, and the bash's first version guessed the branch
+    from the issue number and read the wrong repo's runs."""
+    log = "\n".join(f"line {i}" for i in range(1, 301))
+    fr = FakeRunner({"run list": [{"databaseId": 4242}], "run view 4242": log})
+    gw = GitHubGateway("o/r", runner=fr)
+    out = gw.failed_run_log(100, branch="fix/5-null-token")
+    assert out.splitlines() == [f"line {i}" for i in range(301 - _FAILED_LOG_LINES, 301)]
+    list_argv = fr.calls[0][0]
+    assert list_argv[1:3] == ["run", "list"]
+    assert "fix/5-null-token" in list_argv
+    assert "--status" in list_argv and "failure" in list_argv
+    assert _limit_of(list_argv) is not None          # review C2 applies here too
+    view_argv = fr.calls[1][0]
+    assert view_argv[1:4] == ["run", "view", "4242"] and "--log-failed" in view_argv
+
+
+def test_failed_run_log_resolves_the_head_branch_when_not_supplied():
+    fr = FakeRunner({
+        "pr view 100": {"number": 100, "headRefName": "fix/5-x", "state": "OPEN"},
+        "pr checks 100": [], "run list": [{"databaseId": 1}], "run view 1": "boom",
+    })
+    gw = GitHubGateway("o/r", runner=fr)
+    assert gw.failed_run_log(100) == "boom"
+    run_list = [c[0] for c in fr.calls if c[0][1:3] == ["run", "list"]][0]
+    assert "fix/5-x" in run_list
+
+
+def test_failed_run_log_empty_when_no_run_failed():
+    fr = FakeRunner({"run list": []})
+    gw = GitHubGateway("o/r", runner=fr)
+    assert gw.failed_run_log(100, branch="b") == ""
+    assert not any(c[0][1:3] == ["run", "view"] for c in fr.calls)   # no pointless fetch
+
+
+@pytest.mark.parametrize(
+    "runner",
+    [
+        _raising_runner(GhUnavailable("rate-limit", "API rate limit exceeded")),
+        _raising_runner(RuntimeError("gh boom")),
+        FakeRunner(),                                   # gh answered ""
+    ],
+)
+def test_failed_run_log_fails_soft_to_empty_string(runner):
+    """D6: a log fetch may never kill a dispatch — the fixer can rediscover the
+    failure itself, but only if it is actually dispatched."""
+    assert GitHubGateway("o/r", runner=runner).failed_run_log(100, branch="b") == ""
+
+
+def test_failed_run_log_does_not_swallow_a_programmer_error():
+    """The fail-soft catch must not hide review C2's guard: a list argv built
+    without --limit is a bug in this module, not a transient gh failure."""
+    gw = GitHubGateway("o/r", runner=_raising_runner(MissingListLimit("no --limit")))
+    with pytest.raises(MissingListLimit):
+        gw.failed_run_log(100, branch="b")

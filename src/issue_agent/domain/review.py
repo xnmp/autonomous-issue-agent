@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from .actions import Action, AgentKind, Relabel, RunAgent, Target
+from .identity import login_eq
 from .labels import Label
 from .world import PRView, WorldState, REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED
 
@@ -88,17 +89,6 @@ def needs_re_review(pr: PRView, state: ReviewState) -> bool:
     return bool(cur) and cur != state.last_sha.get(pr.number, "")
 
 
-def _login_eq(a: str, b: str) -> bool:
-    """Compare two GitHub logins, tolerating the `[bot]` suffix asymmetry. A
-    GitHub App configured as `my-reviewer-bot[bot]` surfaces as that literal
-    in some API shapes but as the bare `my-reviewer-bot` in the review
-    author field `gh pr view --json reviews` returns. A raw `==` therefore never
-    matches, which would silently defeat both the self-review guard and the
-    rejection ceiling. Strip the suffix on both sides before comparing."""
-    strip = lambda s: (s or "").removesuffix("[bot]")
-    return strip(a) == strip(b)
-
-
 def count_prior_rejections(reviews: tuple, review_bot: str) -> int:
     """How many times the review bot has REQUESTED_CHANGES on this PR SINCE its
     most recent APPROVE. This — not the number of author pushes — is what the
@@ -117,7 +107,7 @@ def count_prior_rejections(reviews: tuple, review_bot: str) -> int:
     correct across daemon restarts. `reviews` is chronologically ordered (gh
     returns oldest-first / by submittedAt), so 'since the last APPROVE' is the
     suffix after the last APPROVE index."""
-    mine = [r for r in reviews if _login_eq(r.author, review_bot)]
+    mine = [r for r in reviews if login_eq(r.author, review_bot)]
     last_approve = max(
         (i for i, r in enumerate(mine) if r.state == REVIEW_APPROVED),
         default=-1,
@@ -138,7 +128,7 @@ def should_adopt(pr: PRView, cfg: ReviewConfig) -> bool:
         and not pr.has(cfg.trigger_label)
         and not pr.has(Label.NO_AI_REVIEW)
         and not pr.is_draft
-        and not _login_eq(pr.author, cfg.review_bot)
+        and not login_eq(pr.author, cfg.review_bot)
     )
 
 

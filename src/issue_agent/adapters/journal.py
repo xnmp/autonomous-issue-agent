@@ -37,7 +37,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from ..domain.agent_task import AgentTask
-from ..domain.outcome import AgentResult
+from ..domain.outcome import AgentResult, ExitReason
 
 # The four SDK usage counters worth keeping. `cost_usd` is the gateway's dollar
 # figure, which is 0.00 on a subscription plan and absent on Codex — tokens are
@@ -175,13 +175,86 @@ class JournalingRuntime:
         journal reads."""
         self.context = RunContext(role=role, kind=kind, number=number, issue=issue)
 
+    def __getattr__(self, name: str):
+        """Delegate anything this decorator does not define to the wrapped
+        runtime. Without it (review S7) a decorated runtime silently loses the
+        inner surface callers use — e.g. `roles.py`'s startup
+        `fix_runner.preflight()` codex readiness check would become an
+        AttributeError (or, behind a `getattr(..., None)` probe, a silent
+        no-op) the moment the wrap order changed.
+
+        Dunders are NOT delegated: implicit special-method lookup bypasses
+        `__getattr__` anyway, so delegating them only produces half-working
+        protocols (`__await__`, copy/pickle) that lie about what this object is.
+        `inner` is read off `__dict__` directly so a half-initialised instance
+        raises AttributeError instead of recursing forever.
+        """
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        try:
+            inner = object.__getattribute__(self, "inner")
+        except AttributeError:
+            raise AttributeError(name) from None
+        return getattr(inner, name)
+
     async def run(self, task: AgentTask) -> AgentResult:
+        """Journal the dispatch BEFORE the await and the settlement after it —
+        including when the await raises.
+
+        Review C3: `AgentRunner` deliberately *raises* on a pre-result transport
+        death (`agent_runner.py:522-531`), which used to skip every
+        attempt-recording write — no journal line, no ledger line — while
+        gh-side reaping requeued the issue and re-dispatched it next poll. One
+        full paid session every two polls, forever, with `$0.00` on the ledger
+        and nothing on `issue-agent status`. So: `agent_run_start` first (it is
+        the only durable trace if this process is killed mid-run), and the raise
+        path gets its own settled line before the exception continues upward
+        UNCHANGED — the crash isolation the raise buys (`Daemon.tick` catches,
+        issue keeps `ai-working`, reaper requeues) must not change.
+        """
+        self._record_start(task)
         t0 = time.monotonic()
-        result = await self.inner.run(task)
+        try:
+            result = await self.inner.run(task)
+        except BaseException as exc:  # noqa: BLE001 — recorded, never handled
+            # BaseException, not Exception: a cancellation or Ctrl-C mid-run
+            # leaves exactly the same requeue-and-re-dispatch signature, so it
+            # deserves the same receipt. The bare `raise` preserves the
+            # exception object and its traceback verbatim.
+            self._record(
+                task,
+                AgentResult(
+                    is_error=True,
+                    status="raised",
+                    cost_usd=0.0,
+                    exit_reason=ExitReason.TRANSPORT_DEATH,
+                ),
+                time.monotonic() - t0,
+                error=f"{type(exc).__name__}: {str(exc)[:200]}",
+            )
+            raise
         self._record(task, result, time.monotonic() - t0)
         return result
 
-    def _record(self, task: AgentTask, result: AgentResult, duration_s: float) -> None:
+    def _record_start(self, task: AgentTask) -> None:
+        """The pre-await half of the pair. Carries the same
+        role/kind/number/issue as the settled line so the two correlate."""
+        try:
+            ctx = self.context
+            self.journal.emit(
+                "agent_run_start",
+                role=ctx.role,
+                kind=ctx.kind,
+                number=ctx.number,
+                issue=ctx.issue,
+                model=task.model or "",
+            )
+        except Exception as exc:  # noqa: BLE001 — never fail a run over its receipt
+            sys.stderr.write(f"journal: could not record agent_run_start ({exc})\n")
+
+    def _record(
+        self, task: AgentTask, result: AgentResult, duration_s: float, **extra
+    ) -> None:
         try:
             ctx = self.context
             cost = float(getattr(result, "cost_usd", 0.0) or 0.0)
@@ -199,6 +272,7 @@ class JournalingRuntime:
                 exit_reason=(result.exit_reason.value if result.exit_reason else None),
                 session_id=result.session_id,
                 usage=_usage(result.usage),
+                **extra,
             )
             # Only costed runs reach the ledger: a $0.00 line is pure noise in the
             # file the spend caps scan on every dispatch.
@@ -304,17 +378,31 @@ def repeated_dispatch_warning(events, window_s: float, threshold: int) -> str:
     Pure over `events` and self-referenced — the window is measured between the
     events themselves, not against wall-clock now — so it is deterministic to
     test and does not need a clock injected.
+
+    Counts STARTS as well as settled runs (review C3): the loop that costs the
+    most is the one where the session dies before any result, which used to emit
+    no `agent_run` at all and so was invisible here — the detector reported
+    health while the harness burned a session every other poll. A healthy run
+    emits both halves, so a target's dispatch count is max(starts, settleds),
+    never their sum; only the half that is missing (a start with no settlement,
+    or a pre-`agent_run_start` journal) falls back to the other.
     """
     if threshold <= 1:
         return ""
-    groups: dict[tuple, list[datetime]] = {}
+    starts: dict[tuple, list[datetime]] = {}
+    settled: dict[tuple, list[datetime]] = {}
     for e in events:
-        if e.get("event") != "agent_run":
+        bucket = {"agent_run_start": starts, "agent_run": settled}.get(e.get("event"))
+        if bucket is None:
             continue
         ts = parse_ts(e.get("ts"))
         if ts is None:
             continue
-        groups.setdefault((e.get("kind", ""), _int(e.get("number"))), []).append(ts)
+        bucket.setdefault((e.get("kind", ""), _int(e.get("number"))), []).append(ts)
+    groups: dict[tuple, list[datetime]] = {
+        key: max(starts.get(key, []), settled.get(key, []), key=len)
+        for key in {**starts, **settled}
+    }
     worst = ""
     for (kind, number), stamps in sorted(groups.items(), key=lambda kv: str(kv[0])):
         stamps.sort()

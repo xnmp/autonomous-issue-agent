@@ -83,6 +83,69 @@ def test_emit_serialises_unjsonable_values_instead_of_dropping_the_event(tmp_pat
     assert read_events(j.path)[0]["exit_reason"].endswith("wall_timeout")
 
 
+def test_an_event_with_a_multiline_field_is_still_exactly_one_line(tmp_path):
+    # review T6: lock-free appending by three daemons rests entirely on POSIX
+    # O_APPEND atomicity for ONE write() of ONE line. A field carrying embedded
+    # newlines — an agent summary, a traceback, a diff — must be escaped into
+    # that single line; the moment an event spans two writes, a concurrent
+    # appender interleaves between them and BOTH records become unreadable.
+    j = Journal(str(tmp_path / "j.jsonl"))
+    body = "summary line one\nline two\r\n\nline four"
+    j.emit("agent_run", summary=body)
+    j.emit("action", desc="a second event lands after it")
+
+    with open(j.path, encoding="utf-8") as fh:
+        raw = fh.read()
+    assert raw.count("\n") == 2, "one newline per event and not one more"
+    assert len(raw.splitlines()) == 2
+    # Anti-vacuity: one line because it was ESCAPED, not because it was mangled.
+    assert json.loads(raw.splitlines()[0])["summary"] == body
+    assert read_events(j.path)[1]["event"] == "action"
+
+
+def test_an_event_is_appended_with_exactly_one_write_call(tmp_path, monkeypatch):
+    # review T6, the other half: POSIX guarantees only that a SINGLE write() to
+    # an O_APPEND fd is not interleaved with another appender's. `write(line)`
+    # then `write("\n")` yields byte-identical output single-threaded and a
+    # shredded ledger the moment the review daemon appends between the two — so
+    # the contract here is the write COUNT, which no assertion on the resulting
+    # file can see. (Rewriting `emit` on top of a different single-shot writer is
+    # fine; splitting one event across two writes is not.)
+    import builtins
+
+    real_open = builtins.open
+    writes: list[str] = []
+
+    class _CountingHandle:
+        def __init__(self, fh):
+            self._fh = fh
+
+        def write(self, text):
+            writes.append(text)
+            return self._fh.write(text)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return self._fh.__exit__(*exc)
+
+    def spying_open(file, mode="r", *args, **kwargs):
+        fh = real_open(file, mode, *args, **kwargs)
+        return _CountingHandle(fh) if "a" in mode else fh
+
+    j = Journal(str(tmp_path / "j.jsonl"))
+    monkeypatch.setattr(builtins, "open", spying_open)
+    try:
+        j.emit("agent_run", summary="one\ntwo", number=5)
+    finally:
+        monkeypatch.undo()
+
+    assert len(writes) == 1, "one event must reach the fd as one write()"
+    assert writes[0].endswith("\n") and writes[0].count("\n") == 1
+    assert read_events(j.path)[0]["number"] == 5  # and it really landed
+
+
 # ── readers ───────────────────────────────────────────────────────────────────
 def test_read_events_skips_malformed_and_truncated_lines(tmp_path):
     path = _write(
@@ -176,6 +239,44 @@ def test_repeated_dispatch_warning_does_not_conflate_different_targets():
     assert repeated_dispatch_warning(events, 3600, 4) == ""
 
 
+def test_repeated_dispatch_warning_sees_a_loop_made_only_of_starts():
+    # review C3: a session that dies before any ResultMessage never produces a
+    # settled `agent_run`, so a detector that reads only settled runs reported a
+    # healthy harness while it bought a full session every other poll, forever.
+    events = [
+        {"ts": _at(NOW - timedelta(minutes=m)), "event": "agent_run_start",
+         "kind": "RESOLVE", "number": 5}
+        for m in (40, 30, 20, 10)
+    ]
+    warning = repeated_dispatch_warning(events, 3600, 4)
+    assert "RESOLVE" in warning and "#5" in warning
+
+
+def test_repeated_dispatch_warning_counts_a_start_and_its_settlement_once():
+    # Anti-vacuity twin of the above: every HEALTHY run now emits both halves,
+    # so counting events rather than dispatches would halve every operator's
+    # threshold overnight and warn about four ordinary runs as if they were eight.
+    events = [
+        {"ts": _at(NOW - timedelta(minutes=m)), "event": ev,
+         "kind": "RESOLVE", "number": 5}
+        for m in (40, 30, 20, 10)
+        for ev in ("agent_run_start", "agent_run")
+    ]
+    assert repeated_dispatch_warning(events, 3600, 5) == "", "8 events, 4 dispatches"
+    assert "dispatched 4x" in repeated_dispatch_warning(events, 3600, 4)
+
+
+def test_repeated_dispatch_warning_still_reads_a_journal_with_no_start_events():
+    # Journals written before `agent_run_start` existed (and any run whose start
+    # line was lost) must keep tripping the detector on settled runs alone.
+    events = [
+        {"ts": _at(NOW - timedelta(minutes=m)), "event": "agent_run",
+         "kind": "REVIEW", "number": 7}
+        for m in (40, 30, 20, 10)
+    ]
+    assert "#7" in repeated_dispatch_warning(events, 3600, 4)
+
+
 def test_default_ledger_path_is_global_and_honours_xdg(monkeypatch):
     monkeypatch.setenv("XDG_STATE_HOME", "/xdg")
     assert default_ledger_path() == "/xdg/issue-agent/spend.jsonl"
@@ -198,6 +299,12 @@ def _runtime(tmp_path, result, repo="o/r"):
     return JournalingRuntime(FakeInner(result), journal, ledger, repo, "fix"), journal, ledger
 
 
+def _settled(journal_path) -> list[dict]:
+    """The settled halves only — every dispatch also writes an `agent_run_start`
+    before the await (review C3), so a positional index is meaningless."""
+    return [e for e in read_events(journal_path) if e["event"] == "agent_run"]
+
+
 def test_journaling_runtime_satisfies_the_agent_runtime_port(tmp_path):
     rt, _, _ = _runtime(tmp_path, AgentResult(is_error=False))
     assert isinstance(rt, AgentRuntime)
@@ -214,7 +321,7 @@ def test_agent_run_records_context_cost_and_usage(tmp_path):
     rt.set_context("fix", "RESOLVE", 5, 5)
     asyncio.run(rt.run(AgentTask(prompt="p", model="opus")))
 
-    run = read_events(journal.path)[0]
+    run = _settled(journal.path)[0]
     assert run["event"] == "agent_run"
     assert (run["role"], run["kind"], run["number"], run["issue"]) == ("fix", "RESOLVE", 5, 5)
     assert run["model"] == "opus" and run["cost_usd"] == 1.25
@@ -232,7 +339,7 @@ def test_agent_run_records_context_cost_and_usage(tmp_path):
 def test_missing_usage_stays_distinct_from_zero_tokens(tmp_path):
     rt, journal, _ = _runtime(tmp_path, AgentResult(is_error=False, usage=None))
     asyncio.run(rt.run(AgentTask(prompt="p")))
-    assert read_events(journal.path)[0]["usage"] is None
+    assert _settled(journal.path)[0]["usage"] is None
 
 
 def test_a_free_run_is_journalled_but_never_hits_the_ledger(tmp_path):
@@ -240,7 +347,7 @@ def test_a_free_run_is_journalled_but_never_hits_the_ledger(tmp_path):
     # zero lines is noise in the file the caps scan on every dispatch.
     rt, journal, ledger = _runtime(tmp_path, AgentResult(is_error=False, cost_usd=0.0))
     asyncio.run(rt.run(AgentTask(prompt="p")))
-    assert len(read_events(journal.path)) == 1
+    assert len(_settled(journal.path)) == 1
     assert read_events(ledger) == []
 
 
@@ -249,7 +356,7 @@ def test_each_leg_of_a_multi_leg_dispatch_gets_its_own_attributed_line(tmp_path)
     rt.set_context("review", "REVIEW", 100, 5)
     for _ in range(3):
         asyncio.run(rt.run(AgentTask(prompt="leg")))
-    assert len(read_events(journal.path)) == 3
+    assert len(_settled(journal.path)) == 3
     assert sum_issue(ledger, "o/r", 5) == pytest.approx(1.5)
 
 
@@ -259,6 +366,162 @@ def test_result_is_returned_unchanged_and_inner_still_sees_the_task(tmp_path):
     task = AgentTask(prompt="p")
     assert asyncio.run(rt.run(task)) is expected
     assert rt.inner.tasks == [task]
+
+
+# ── JournalingRuntime: the pre-result death (review C3) ───────────────────────
+class SnoopingInner:
+    """Reads the journal from INSIDE the run — i.e. at exactly the moment a
+    transport death would strike."""
+
+    def __init__(self, journal_path, result):
+        self.journal_path = journal_path
+        self.result = result
+        self.seen: list[dict] = []
+
+    async def run(self, task):
+        self.seen = read_events(self.journal_path)
+        return self.result
+
+
+class RaisingInner:
+    """A runtime that dies before delivering any result — `AgentRunner`'s
+    deliberate pre-result behaviour (`agent_runner.py:522-531`)."""
+
+    def __init__(self, exc):
+        self.exc = exc
+        self.tasks = []
+
+    async def run(self, task):
+        self.tasks.append(task)
+        raise self.exc
+
+
+class PoisonedJournal:
+    """A journal whose sink is gone (read-only state dir, full disk). `Journal`
+    swallows this itself; this fake proves the RUNTIME survives a journal that
+    does not."""
+
+    path = "/dev/null/nope"
+
+    def emit(self, event, **fields):
+        raise OSError("state dir went read-only")
+
+
+def test_the_dispatch_is_journalled_before_the_await(tmp_path):
+    # review C3: every attempt-recording write used to happen strictly AFTER the
+    # await, so a session that died mid-run left no trace anywhere — no journal
+    # line, no ledger line — while the reaper requeued the issue and the fixer
+    # re-dispatched it next poll. The start line is the only durable evidence
+    # that this dispatch ever happened.
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    inner = SnoopingInner(journal.path, AgentResult(is_error=False))
+    rt = JournalingRuntime(inner, journal, "", "o/r", "fix")
+    rt.set_context("fix", "RESOLVE", 5, 5)
+
+    asyncio.run(rt.run(AgentTask(prompt="p", model="opus")))
+
+    assert [e["event"] for e in inner.seen] == ["agent_run_start"]
+    start = inner.seen[0]
+    assert (start["role"], start["kind"], start["number"], start["issue"]) == (
+        "fix", "RESOLVE", 5, 5)
+    assert start["model"] == "opus"
+
+
+def test_a_run_that_raises_is_settled_as_a_transport_death_and_re_raises(tmp_path):
+    # review C3: the raise IS the crash-isolation contract (Daemon.tick catches,
+    # the issue keeps ai-working, the reaper requeues). It must reach the caller
+    # untouched — the journal only witnesses it.
+    boom = RuntimeError("Stream closed unexpectedly")
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    ledger = str(tmp_path / "spend.jsonl")
+    rt = JournalingRuntime(RaisingInner(boom), journal, ledger, "o/r", "fix")
+    rt.set_context("fix", "RESOLVE", 5, 5)
+
+    with pytest.raises(RuntimeError) as raised:
+        asyncio.run(rt.run(AgentTask(prompt="p", model="opus")))
+    assert raised.value is boom, "the exception object must propagate unchanged"
+
+    start, settled = read_events(journal.path)
+    assert start["event"] == "agent_run_start" and settled["event"] == "agent_run"
+    # The two halves correlate: same dispatch, same target.
+    for key in ("role", "kind", "number", "issue", "model"):
+        assert start[key] == settled[key]
+    assert settled["exit_reason"] == "transport_death"
+    assert settled["status"] == "raised" and settled["is_error"] is True
+    assert settled["cost_usd"] == 0.0
+    assert "RuntimeError" in settled["error"] and "Stream closed" in settled["error"]
+    # A session that never delivered a result costs nothing to attribute.
+    assert read_events(ledger) == []
+
+
+def test_a_normal_run_is_never_settled_as_a_transport_death(tmp_path):
+    # Anti-vacuity twin: the raise path must not be reachable from a run that
+    # merely returned an error result — those still count as attempts.
+    rt, journal, _ = _runtime(
+        tmp_path, AgentResult(is_error=True, status="failed", exit_reason=ExitReason.AGENT_ERROR))
+    rt.set_context("fix", "RESOLVE", 5, 5)
+    asyncio.run(rt.run(AgentTask(prompt="p")))
+
+    events = read_events(journal.path)
+    assert [e["event"] for e in events] == ["agent_run_start", "agent_run"]
+    assert events[1]["exit_reason"] == "agent_error" and events[1]["status"] == "failed"
+    assert "error" not in events[1]
+
+
+def test_a_journal_that_cannot_write_never_fails_a_run(tmp_path, capsys):
+    # Observability is never a failure mode (module rule 1) — and that has to
+    # hold for the two NEW writes as well, on both paths.
+    expected = AgentResult(is_error=False, status="done")
+    ok = JournalingRuntime(FakeInner(expected), PoisonedJournal())
+    assert asyncio.run(ok.run(AgentTask(prompt="p"))) is expected
+
+    boom = RuntimeError("Stream closed unexpectedly")
+    dead = JournalingRuntime(RaisingInner(boom), PoisonedJournal())
+    with pytest.raises(RuntimeError) as raised:
+        asyncio.run(dead.run(AgentTask(prompt="p")))
+    # The journal's own failure must not stand in for the run's failure.
+    assert raised.value is boom
+    assert "journal" in capsys.readouterr().err
+
+
+# ── JournalingRuntime: the decorator keeps the inner surface (review S7) ──────
+class InnerWithSurface:
+    def __init__(self):
+        self.bot = "fix-bot"
+
+    async def run(self, task):
+        return AgentResult(is_error=False)
+
+    def preflight(self):
+        return "codex binary not found"
+
+
+def test_wrapping_a_runtime_does_not_hide_its_own_surface(tmp_path):
+    # review S7: `roles.py` calls `fix_runner.preflight()` for the codex
+    # readiness banner. A decorator without passthrough turns that into an
+    # AttributeError — or, behind a `getattr(..., None)` probe, a silent no-op
+    # that reports "ready" for a runtime with no binary.
+    rt = JournalingRuntime(InnerWithSurface(), Journal(str(tmp_path / "j.jsonl")))
+    assert rt.preflight() == "codex binary not found"
+    assert rt.bot == "fix-bot"
+
+
+def test_passthrough_does_not_invent_attributes_neither_object_has(tmp_path):
+    # Anti-vacuity twin: passthrough must not turn every typo into a live object.
+    rt = JournalingRuntime(InnerWithSurface(), Journal(str(tmp_path / "j.jsonl")))
+    with pytest.raises(AttributeError):
+        rt.no_such_attribute
+    with pytest.raises(AttributeError):
+        JournalingRuntime.__new__(JournalingRuntime).preflight  # half-built, no inner
+
+
+def test_the_wrappers_own_attributes_win_over_the_inners(tmp_path):
+    class Shadowing(InnerWithSurface):
+        role = "steward"
+
+    journal = Journal(str(tmp_path / "j.jsonl"))
+    rt = JournalingRuntime(Shadowing(), journal, "", "o/r", "fix")
+    assert rt.role == "fix" and rt.journal is journal
 
 
 # ── alert hook ────────────────────────────────────────────────────────────────

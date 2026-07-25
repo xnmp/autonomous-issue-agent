@@ -122,6 +122,36 @@ def test_adopt_skips_review_bots_own_pr():
     assert decide_review(world(prs=[p]), ADOPT, ReviewState()) == []
 
 
+def test_c1_adopt_skips_own_pr_when_config_carries_the_bot_suffix():
+    # review C1: REVIEW_BOT='review-bot[bot]' (App form) vs the bare `review-bot`
+    # gh reports as the PR author. A raw `==` would ADOPT the reviewer's own PR
+    # and review it — the self-review loop the guard exists to prevent.
+    cfg = ReviewConfig(review_bot="review-bot[bot]", adopt_unlabeled=True)
+    p = pr(200, head_ref_oid="abc", author="review-bot")
+    assert decide_review(world(prs=[p]), cfg, ReviewState()) == []
+
+
+def test_c1_adopt_skips_own_pr_when_author_carries_the_bot_suffix():
+    # The asymmetry runs both ways: bare config, suffixed author.
+    p = pr(200, head_ref_oid="abc", author="review-bot[bot]")
+    assert decide_review(world(prs=[p]), ADOPT, ReviewState()) == []
+
+
+def test_c1_adopt_self_guard_is_case_insensitive():
+    p = pr(200, head_ref_oid="abc", author="Review-Bot")
+    assert decide_review(world(prs=[p]), ADOPT, ReviewState()) == []
+
+
+def test_c1_suffix_tolerance_still_adopts_a_strangers_pr():
+    # Anti-vacuity twin: the self-guard must not swallow everyone — a genuinely
+    # different author's rogue PR is still adopted and reviewed.
+    cfg = ReviewConfig(review_bot="review-bot[bot]", adopt_unlabeled=True)
+    p = pr(200, head_ref_oid="abc", author="some-human")
+    acts = decide_review(world(prs=[p]), cfg, ReviewState())
+    assert Relabel(Target.PR, 200, None, Label.AI_PR_OPEN) in acts
+    assert RunAgent(AgentKind.REVIEW, 200) in acts
+
+
 def test_adopt_skips_opt_out_label():
     p = pr(200, "no-ai-review", head_ref_oid="abc", author="human")
     assert decide_review(world(prs=[p]), ADOPT, ReviewState()) == []
@@ -166,6 +196,23 @@ def test_count_prior_rejections_normalizes_bot_suffix():
     # carries it. A raw == would count zero and the ceiling would never fire.
     reviews = (Review(state="CHANGES_REQUESTED", author="my-reviewer-bot"),)
     assert count_prior_rejections(reviews, "my-reviewer-bot[bot]") == 1
+
+
+def test_c1_count_prior_rejections_is_case_insensitive():
+    # GitHub logins are case-insensitive; the rejection ceiling must not miss the
+    # bot's own rejections because the config differs in case (review C1).
+    reviews = (Review(state="CHANGES_REQUESTED", author="My-Reviewer-Bot"),)
+    assert count_prior_rejections(reviews, "my-reviewer-bot[bot]") == 1
+
+
+def test_c1_count_prior_rejections_still_excludes_other_actors():
+    # Anti-vacuity twin: suffix/case tolerance must not count a stranger's
+    # rejection toward the reviewer's own ceiling.
+    reviews = (
+        Review(state="CHANGES_REQUESTED", author="some-human"),
+        Review(state="CHANGES_REQUESTED", author="other-bot[bot]"),
+    )
+    assert count_prior_rejections(reviews, "my-reviewer-bot[bot]") == 0
 
 
 def test_count_prior_rejections_empty():

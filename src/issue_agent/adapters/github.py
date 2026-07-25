@@ -53,6 +53,50 @@ _GH_TIMEOUT_S = 120.0
 # below makes a hit LOUD instead of silent (P0.7).
 _LIST_LIMIT = 500
 
+# Inline review comments pulled per PR (port of agent/address-review.sh:41's
+# `.[-8:]`) — the NEWEST 8. A bound is required: the whole list is pasted into a
+# prompt, and an unbounded paste is how a long review thread blows the context
+# window on the one leg that must not fail.
+_INLINE_COMMENT_LIMIT = 8
+
+# Tail of the failed-CI log handed to the fixer (port of `tail -150` in
+# agent/fix-ci.sh:42). The failure is almost always in the last frames; the head
+# of a 50k-line Actions log is pure setup noise.
+_FAILED_LOG_LINES = 150
+
+
+class MissingListLimit(ValueError):
+    """Programmer error: a `gh … list` argv was built without `--limit`.
+
+    Not a runtime condition — a bug in this module, raised eagerly so it can
+    never reach production as a silent truncation. gh's default page size is 30,
+    and a `list` call without `--limit` therefore answers with the 30 NEWEST
+    items while looking exactly like a complete answer: past 30 ai-ready issues
+    the oldest were never dispatched, past 30 open PRs their CI was never fixed —
+    every poll, no error (review C2; FAILURE-MODES #66's signature). Subclasses
+    ValueError so it reads as the programmer error it is, but is distinguishable
+    from a JSONDecodeError in the fail-soft methods that swallow everything else.
+    """
+
+
+def _require_list_limit(args: list[str]) -> None:
+    """Reject a `gh <thing> list …` argv that carries no `--limit` (review C2).
+
+    Every list call in this module must state its ceiling so `_warn_if_list_truncated`
+    has something to compare against; this guard makes the omission impossible to
+    reintroduce rather than merely unlikely."""
+    if len(args) >= 2 and args[1] == "list" and "--limit" not in args:
+        raise MissingListLimit(
+            f"gh {args[0]} list built without --limit: {' '.join(args)} — "
+            "gh would silently return only the 30 newest items. Pass "
+            "--limit str(_LIST_LIMIT) (and call _warn_if_list_truncated on the count)."
+        )
+
+
+def _tail(text: str, lines: int) -> str:
+    """Last `lines` lines of `text` (port of `tail -N`). Tolerates ""/None."""
+    return "\n".join((text or "").splitlines()[-lines:])
+
 
 def _warn_if_list_truncated(query: str, count: int) -> None:
     """Emit a loud stderr warning when a `gh … list` call returns exactly
@@ -314,6 +358,40 @@ def _changed_files(files: object) -> frozenset[str]:
     return frozenset(out)
 
 
+def format_review_comments(raw: object, limit: int = _INLINE_COMMENT_LIMIT) -> str:
+    """`GET /repos/{repo}/pulls/{n}/comments` JSON → the prompt block the fixer
+    reads, one comment per entry as `path:line (author): body` (review M13, D6).
+
+    Port of agent/address-review.sh:41 with the formatting moved OUT of the jq
+    filter and into Python: jq inside an argv is invisible to the tests, and this
+    text is the fixer's only view of the file:line asks reviewers actually make.
+
+    Selection mirrors the bash exactly: top-level comments only (`in_reply_to_id
+    == null` — replies are the fixer's own thread, not new asks), oldest→newest,
+    the last `limit`. Tolerant of every shape it might be handed (a non-list error
+    object, a missing path/line/user) — this feeds a prompt, so a malformed field
+    degrades to a weaker prompt, never to a dead dispatch."""
+    if not isinstance(raw, list):
+        return ""
+    tops = [
+        c for c in raw
+        if isinstance(c, dict) and c.get("in_reply_to_id") is None
+    ]
+    tops.sort(key=lambda c: str(c.get("created_at") or c.get("createdAt") or ""))
+    out = []
+    for c in tops[-limit:] if limit > 0 else tops:
+        author = ""
+        for key in ("user", "author"):  # REST shape, then GraphQL shape
+            if isinstance(c.get(key), dict):
+                author = c[key].get("login", "") or ""
+                break
+        line = c.get("line") or c.get("original_line") or 0
+        out.append(
+            f"{c.get('path', '') or ''}:{line} ({author}): {(c.get('body', '') or '').strip()}"
+        )
+    return "\n".join(out)
+
+
 def parse_world(issues: list[dict], prs: list[dict]) -> WorldState:
     return WorldState(
         issues=tuple(parse_issue(i) for i in issues),
@@ -413,6 +491,9 @@ class GitHubGateway:
         self.review_adopt_unlabeled = review_adopt_unlabeled
 
     def _gh(self, args: list[str]) -> str:
+        # Guard EVERY call, not just the _gh_json ones: a list subcommand read as
+        # raw text (`--jq`) truncates just as silently (review C2).
+        _require_list_limit(args)
         return self._run(["gh", *args], self.identity.env_token())
 
     def _gh_json(self, args: list[str]) -> object:
@@ -423,8 +504,9 @@ class GitHubGateway:
     def list_issue_numbers(self, label: str, state: str = "open") -> list[int]:
         data = self._gh_json(
             ["issue", "list", "--repo", self.repo, "--label", label,
-             "--state", state, "--json", "number"]
+             "--state", state, "--json", "number", "--limit", str(_LIST_LIMIT)]
         ) or []
+        _warn_if_list_truncated(f"gh issue list --label {label} --state {state}", len(data))
         return [int(i["number"]) for i in data]
 
     def get_issue(self, number: int) -> IssueView:
@@ -505,25 +587,60 @@ class GitHubGateway:
         except GhUnavailable as exc:
             if not exc.timed_out:
                 raise
-            self._skip_pr(number, exc)
+            self._skip_item("PR", number, exc)
             return None
         except Exception as exc:  # noqa: BLE001 — deliberately broad: one PR ≠ whole pass
-            self._skip_pr(number, exc)
+            self._skip_item("PR", number, exc)
+            return None
+
+    def _safe_get_issue(self, number: int, *, blocker_gate: bool = False) -> IssueView | None:
+        """`get_issue` that isolates a single ISSUE's failure — the exact twin of
+        `_safe_get_pr` above, and for the exact same recorded incident on the other
+        item type (review M19). `parse_issue({})` raises KeyError and
+        `parse_issue(None)` AttributeError, so ONE unreadable issue (transferred to
+        another repo, converted to a discussion, locked, or simply a `gh issue view`
+        that returns empty) raised straight out of the world-build generator and
+        killed the whole fix/steward/triage poll — every tick, permanently, because
+        the bad issue is still there next tick. Here it drops to None (logged) and
+        every OTHER issue still reaches the domain.
+
+        Same one exception as the PR twin: a non-`timed_out` `GhUnavailable`
+        (rate limit, 5xx) fails every subsequent fetch identically, so isolating it
+        would silently rebuild the empty world V10 is about — those propagate and
+        the tick is skipped.
+
+        `blocker_gate` folds the ai-ready dependency read into the SAME isolation
+        boundary: a `gh api …/dependencies/blocked_by` that wedges on one issue is
+        that issue's problem, and dropping the issue for a tick is strictly safer
+        than either dispatching it ungated or killing the poll."""
+        try:
+            issue = self.get_issue(number)
+            if blocker_gate:
+                issue = replace(issue, blocked_by_open=self.has_open_blocker(number))
+            return issue
+        except GhUnavailable as exc:
+            if not exc.timed_out:
+                raise
+            self._skip_item("issue", number, exc)
+            return None
+        except Exception as exc:  # noqa: BLE001 — deliberately broad: one issue ≠ whole pass
+            self._skip_item("issue", number, exc)
             return None
 
     @staticmethod
-    def _skip_pr(number: int, exc: BaseException) -> None:
+    def _skip_item(kind: str, number: int, exc: BaseException) -> None:
         import sys
         sys.stderr.write(
-            f"skip PR #{number} this poll ({type(exc).__name__}: {str(exc)[:120]}) "
+            f"skip {kind} #{number} this poll ({type(exc).__name__}: {str(exc)[:120]}) "
             "— re-derived next tick\n"
         )
 
     def list_pr_numbers(self, label: str, state: str = "open") -> list[int]:
         data = self._gh_json(
             ["pr", "list", "--repo", self.repo, "--label", label,
-             "--state", state, "--json", "number"]
+             "--state", state, "--json", "number", "--limit", str(_LIST_LIMIT)]
         ) or []
+        _warn_if_list_truncated(f"gh pr list --label {label} --state {state}", len(data))
         return [int(p["number"]) for p in data]
 
     def list_all_open_pr_numbers(self) -> list[int]:
@@ -559,9 +676,8 @@ class GitHubGateway:
         # only they pay the blocked-by read — an ai-working/blocked issue never
         # needs it. Cheapest-first inside has_open_blocker keeps it ~1 call each.
         issues = tuple(
-            replace(self.get_issue(n), blocked_by_open=self.has_open_blocker(n))
-            if n in ready_numbers else self.get_issue(n)
-            for n in sorted(issue_numbers)
+            i for n in sorted(issue_numbers)
+            if (i := self._safe_get_issue(n, blocker_gate=n in ready_numbers)) is not None
         )
         prs = tuple(
             p for n in sorted(prs_numbers) if (p := self._safe_get_pr(n)) is not None
@@ -604,7 +720,10 @@ class GitHubGateway:
              "--json", "number", "--limit", str(_LIST_LIMIT)]
         ) or []
         _warn_if_list_truncated("gh issue list --state open", len(nums))
-        issues = tuple(self.get_issue(int(i["number"])) for i in nums)
+        issues = tuple(
+            i for n in sorted(int(x["number"]) for x in nums)
+            if (i := self._safe_get_issue(n)) is not None
+        )
         return WorldState(issues=issues)
 
     def build_steward_world(self) -> WorldState:
@@ -627,7 +746,9 @@ class GitHubGateway:
              "--label", "ai-done", "--json", "number", "--limit", "100"]
         ) or []):
             nums[int(i["number"])] = None
-        issues = tuple(self.get_issue(n) for n in sorted(nums))
+        issues = tuple(
+            i for n in sorted(nums) if (i := self._safe_get_issue(n)) is not None
+        )
         return WorldState(issues=issues)
 
     def pr_for_issue(self, issue: int) -> int | None:
@@ -635,8 +756,9 @@ class GitHubGateway:
         Port of agent/lib.sh:pr_for_issue (closing-ref graph is default-branch only)."""
         data = self._gh_json(
             ["pr", "list", "--repo", self.repo, "--state", "open",
-             "--json", "number,headRefName"]
+             "--json", "number,headRefName", "--limit", str(_LIST_LIMIT)]
         ) or []
+        _warn_if_list_truncated("gh pr list --state open (pr_for_issue)", len(data))
         import re
 
         pat = re.compile(rf"^(feat|fix|chore|refactor)/{issue}-")
@@ -655,6 +777,60 @@ class GitHubGateway:
 
     def pr_diff(self, pr: int) -> str:
         return self._gh(["pr", "diff", str(pr), "--repo", self.repo])
+
+    # ── prompt inputs for the two repair legs (review M13 / D6) ──
+    # Both of these feed a prompt and nothing else, so both fail SOFT to "": the
+    # CI-fix / address-review dispatch must still happen with a weaker prompt (the
+    # agent can rediscover the failure itself) rather than not happen at all. A log
+    # fetch may never kill a dispatch. The one exception is `MissingListLimit`,
+    # which is a bug in this module, not a runtime condition (review C2).
+    def failed_run_log(
+        self, pr: int, *, branch: str = "", lines: int = _FAILED_LOG_LINES
+    ) -> str:
+        """Tail of the newest FAILED Actions run on this PR's head branch.
+
+        Port of agent/fix-ci.sh:39-42 (`gh run list --branch … --status failure`
+        → `gh run view <id> --log-failed | tail -150`). Keyed on the REAL head
+        branch, as the bash comment insists: `gh run list` has no PR filter, and
+        deriving the branch from the issue number is what the bash got wrong
+        first. Pass `branch` when the caller already holds the PRView, to save the
+        `gh pr view` round-trip."""
+        try:
+            head = branch or self.get_pr(pr, mergeability=False).head_ref_name
+            if not head:
+                return ""
+            runs = self._gh_json(
+                ["run", "list", "--repo", self.repo, "--branch", head,
+                 "--status", "failure", "--json", "databaseId", "--limit", "1"]
+            ) or []
+            run_id = runs[0].get("databaseId") if runs else None  # type: ignore[union-attr]
+            if not run_id:
+                return ""  # green branch, or runs exist but none failed
+            log = self._gh(
+                ["run", "view", str(run_id), "--repo", self.repo, "--log-failed"]
+            )
+            return _tail(log, lines)
+        except MissingListLimit:
+            raise
+        except Exception:  # noqa: BLE001 — a missing log must not block the fix
+            return ""
+
+    def review_comments(self, pr: int, *, limit: int = _INLINE_COMMENT_LIMIT) -> str:
+        """The PR's newest inline (file:line) review comments, formatted for the
+        prompt. Port of agent/address-review.sh:41; formatting lives in the pure
+        `format_review_comments` so it is testable without a real gh.
+
+        `per_page=100` is deliberate: the endpoint's default page is 30 and we take
+        the NEWEST `limit` — reading only the first page would hand the fixer the
+        OLDEST comments on a busy PR while looking complete (the same silent
+        truncation as review C2)."""
+        try:
+            raw = self._gh_json(
+                ["api", f"repos/{self.repo}/pulls/{pr}/comments?per_page=100"]
+            )
+            return format_review_comments(raw, limit=limit)
+        except Exception:  # noqa: BLE001 — a missing comment list must not block the fix
+            return ""
 
     def submit_review(self, pr: int, event: str, body: str) -> bool:
         """POST a review. Returns True iff gh succeeded. A failed submit (e.g. 422

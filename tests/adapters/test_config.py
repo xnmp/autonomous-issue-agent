@@ -170,8 +170,15 @@ def test_agent_max_runtime_zero_disables_the_cap():
     c = from_env({"REPO": "x", "AGENT_MAX_RUNTIME_SECONDS": "0"})
     assert c.agent_max_runtime == 0.0
     assert c.validation_errors() == ()
-    # And an empty value falls back the same way rather than raising.
-    assert from_env({"REPO": "x", "AGENT_MAX_RUNTIME_SECONDS": ""}).agent_max_runtime == 0.0
+
+
+def test_agent_max_runtime_empty_means_unset_not_zero():
+    # review M2: an exported-but-empty numeric knob must mean UNSET (fall back
+    # to the field default), never a different valid value ("0" = disabled).
+    # Explicit "0" (above) and blank (here) are NOT the same thing.
+    c = from_env({"REPO": "x", "AGENT_MAX_RUNTIME_SECONDS": ""})
+    assert c.agent_max_runtime == 2700.0
+    assert c.validation_errors() == ()
 
 
 def test_valid_defaults_have_no_validation_errors():
@@ -258,6 +265,175 @@ def test_jira_sync_without_project_key_stays_valid_and_inert():
     assert c.jira_runtime.sync is True
     assert c.jira_runtime.project_key == ""
     assert c.validation_errors() == ()
+
+
+def test_malformed_numeric_does_not_traceback_and_lands_in_validation_errors():
+    # review M2: POLL_SECONDS=abc used to raise a bare ValueError deep inside
+    # int() — construction itself must never crash; the field falls back to
+    # its dataclass default and the problem surfaces as a readable, fail-loud
+    # validation entry instead.
+    c = from_env({"REPO": "x", "POLL_SECONDS": "abc"})
+    assert c.poll_seconds == 20  # substituted the default, not a traceback
+    errors = c.validation_errors()
+    assert any("POLL_SECONDS" in e and "abc" in e for e in errors)
+
+
+def test_well_formed_numeric_produces_no_parse_error():
+    # Anti-vacuity twin of the above: a well-formed value must NOT be flagged.
+    c = from_env({"REPO": "x", "POLL_SECONDS": "45"})
+    assert c.poll_seconds == 45
+    assert c.validation_errors() == ()
+
+
+def test_empty_spend_cap_falls_back_to_default_not_disabled():
+    # review M2: `float(v or 0)` made an exported-but-empty ISSUE_SPEND_CAP_USD
+    # silently mean "cap disabled" instead of "unset, use the default" —
+    # describe() would then print issue=$0.00 as if that were intentional.
+    c = from_env({"REPO": "x", "ISSUE_SPEND_CAP_USD": ""})
+    assert c.issue_spend_cap_usd == 25.0
+    assert c.validation_errors() == ()
+
+
+def test_explicit_zero_spend_cap_still_means_disabled():
+    # Anti-vacuity twin: an OPERATOR-CHOSEN 0 is a real, valid "off" and must
+    # not be conflated with "unset" — only empty string means unset.
+    c = from_env({"REPO": "x", "ISSUE_SPEND_CAP_USD": "0"})
+    assert c.issue_spend_cap_usd == 0.0
+    assert c.validation_errors() == ()
+
+
+def test_empty_max_budget_falls_back_to_default_without_crashing():
+    # review M2: MAX_BUDGET_USD= used to crash with a bare ValueError
+    # (float("")). Must resolve to the documented default instead.
+    c = from_env({"REPO": "x", "MAX_BUDGET_USD": ""})
+    assert c.fix_budget_usd == 10.0
+    assert c.validation_errors() == ()
+
+
+def test_malformed_max_budget_is_reported_not_raised():
+    c = from_env({"REPO": "x", "MAX_BUDGET_USD": "ten dollars"})
+    assert c.fix_budget_usd == 10.0
+    assert any("MAX_BUDGET_USD" in e for e in c.validation_errors())
+
+
+def test_empty_auto_merge_uses_default_on_not_off():
+    # review M2: _b treated an exported-but-empty value as False, silently
+    # flipping a default-ON flag off.
+    assert from_env({"REPO": "x", "AUTO_MERGE": ""}).auto_merge is True
+
+
+def test_explicit_zero_auto_merge_still_disables():
+    # Anti-vacuity twin: "0" is a real, explicit opt-out and must still work.
+    assert from_env({"REPO": "x", "AUTO_MERGE": "0"}).auto_merge is False
+
+
+def test_poll_seconds_default_is_20_everywhere():
+    # review S7: the dataclass default (was 60) used to disagree with
+    # from_env's own literal ("20"). Both paths must now agree — from_env
+    # reads its default off the dataclass field, so there is one source.
+    assert HarnessConfig(repo="x").poll_seconds == 20
+    assert from_env({"REPO": "x"}).poll_seconds == 20
+
+
+def test_state_dirs_default_per_repo():
+    # review M5/D7: default STATE_DIR used to be per-role but not per-repo —
+    # two repos' fix daemons shared issue-N.session and one resumed the
+    # other's transcript. Assert the default is now namespaced by repo.
+    c = from_env({"REPO": "acme/widget"})
+    assert c.state_dir.endswith("issue-agent/acme-widget")
+    assert c.review_state_dir.endswith("review-agent/acme-widget")
+    assert c.steward_state_dir.endswith("steward-agent/acme-widget")
+
+
+def test_state_dirs_do_not_collide_across_repos():
+    # The actual finding, reproduced directly: two repos must not resolve to
+    # the same default state dir.
+    a = from_env({"REPO": "acme/widget"})
+    b = from_env({"REPO": "acme/gadget"})
+    assert a.state_dir != b.state_dir
+    assert a.review_state_dir != b.review_state_dir
+    assert a.steward_state_dir != b.steward_state_dir
+
+
+def test_explicit_state_dir_still_wins_over_the_per_repo_default():
+    # Anti-vacuity twin: an operator who set STATE_DIR explicitly is
+    # unaffected by the new default.
+    c = from_env({"REPO": "acme/widget", "STATE_DIR": "/custom/state"})
+    assert c.state_dir == "/custom/state"
+
+
+def test_empty_repo_falls_back_to_a_fixed_slug_not_a_shared_default():
+    # No REPO set at all — handle gracefully rather than crashing on the
+    # slug computation; falls back to a fixed "unknown" component.
+    c = from_env({})
+    assert c.state_dir.endswith("issue-agent/unknown")
+
+
+def test_identity_cross_check_fires_on_normalized_equal_bots_under_three_mode():
+    # review C1/D1 belt-and-braces: a raw string compare would miss
+    # `fix-bot` vs `fix-bot[bot]` and let a self-approving pair through,
+    # which GitHub rejects with a 422 on every approval, forever.
+    c = from_env({
+        "REPO": "x", "IDENTITY_MODE": "three",
+        "FIX_BOT": "fix-bot", "REVIEW_BOT": "fix-bot[bot]",
+    })
+    errors = c.validation_errors()
+    assert any("FIX_BOT" in e and "REVIEW_BOT" in e for e in errors)
+
+
+def test_identity_cross_check_does_not_fire_on_distinct_bots():
+    # Anti-vacuity twin: genuinely distinct identities must not be flagged.
+    c = from_env({
+        "REPO": "x", "IDENTITY_MODE": "three",
+        "FIX_BOT": "fix-bot", "REVIEW_BOT": "review-bot",
+    })
+    assert c.validation_errors() == ()
+
+
+def test_identity_cross_check_does_not_fire_outside_three_mode():
+    # Same normalized-equal bots, but not in three-identity mode — the
+    # self-approval trap only applies when review is expected to be a
+    # distinct identity from the fixer.
+    c = from_env({
+        "REPO": "x", "IDENTITY_MODE": "solo",
+        "FIX_BOT": "fix-bot", "REVIEW_BOT": "fix-bot[bot]",
+    })
+    assert c.validation_errors() == ()
+
+
+def test_from_env_leaves_bot_values_as_written_display_form():
+    # D1: from_env does NOT normalize the stored values themselves — only
+    # validation_errors() compares normalized forms. describe()/gh calls see
+    # exactly what the operator wrote.
+    c = from_env({"REPO": "x", "FIX_BOT": "Fix-Bot[bot]"})
+    assert c.fix_bot == "Fix-Bot[bot]"
+
+
+def test_max_infra_deaths_default_and_override():
+    assert from_env({"REPO": "x"}).max_infra_deaths == 5
+    c = from_env({"REPO": "x", "MAX_INFRA_DEATHS": "2"})
+    assert c.max_infra_deaths == 2
+    assert c.fix_runtime.max_infra_deaths == 2
+
+
+def test_max_infra_deaths_zero_is_a_valid_off_value():
+    c = from_env({"REPO": "x", "MAX_INFRA_DEATHS": "0"})
+    assert c.max_infra_deaths == 0
+    assert c.validation_errors() == ()
+
+
+def test_codex_cost_per_mtok_defaults_and_override():
+    c = from_env({"REPO": "x"})
+    assert c.codex_cost_per_mtok_in == 0.0
+    assert c.codex_cost_per_mtok_out == 0.0
+    assert c.codex_runtime.cost_per_mtok_in == 0.0
+    c2 = from_env({
+        "REPO": "x", "CODEX_COST_PER_MTOK_IN": "3.00", "CODEX_COST_PER_MTOK_OUT": "15.00",
+    })
+    assert c2.codex_cost_per_mtok_in == 3.00
+    assert c2.codex_cost_per_mtok_out == 15.00
+    assert c2.codex_runtime.cost_per_mtok_out == 15.00
+    assert c2.validation_errors() == ()
 
 
 def test_agent_env_file_is_loaded_with_shell_expansion(tmp_path):

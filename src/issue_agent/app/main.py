@@ -7,6 +7,7 @@ adapters, the governor hook, and runs the chosen role's daemon forever.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import subprocess
 import sys
@@ -105,7 +106,13 @@ def _review_prompt(cfg: HarnessConfig) -> str:
 
 
 def build_role(role: str, env: dict | None = None):
-    env = _load_agent_env(env if env is not None else dict(os.environ))
+    # review S7/D3: `main()` already loads AGENT_ENV once (via `_load_agent_env`,
+    # which shells out to `bash -c ... env -0`) and passes the merged dict here —
+    # only self-load when called standalone (env=None) so the documented
+    # entrypoint (`python -m issue_agent.app.main <role>`) never pays for that
+    # subprocess twice per boot.
+    if env is None:
+        env = _load_agent_env(dict(os.environ))
     cfg = from_env(env)
     cfg.validate()
     if cfg.target_dir and os.path.isdir(cfg.target_dir):
@@ -115,12 +122,17 @@ def build_role(role: str, env: dict | None = None):
     harness_root = cfg.harness_root or os.path.dirname(
         os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     )
-    cfg = HarnessConfig(**{
-        **cfg.__dict__,
-        "agent_md": _agent_md(cfg),
-        "review_prompt": _review_prompt(cfg),
-        "harness_root": harness_root,
-    })
+    # review S7: was `HarnessConfig(**{**cfg.__dict__, ...})` — a manual rebuild
+    # of a frozen dataclass from its own __dict__. `dataclasses.replace` is the
+    # stdlib-blessed way to derive one frozen instance from another and, unlike
+    # the __dict__ spread, raises on a typo'd/renamed field instead of silently
+    # constructing a HarnessConfig with the wrong shape.
+    cfg = dataclasses.replace(
+        cfg,
+        agent_md=_agent_md(cfg),
+        review_prompt=_review_prompt(cfg),
+        harness_root=harness_root,
+    )
 
     target_dir = cfg.target_dir or os.getcwd()
 
@@ -205,6 +217,21 @@ def main(argv: list[str] | None = None) -> None:
     # on process death, so there's no stale-lock hazard. Held for the whole run
     # via `_lock` (the open fd IS the lock; GC/exit releases it).
     env = _load_agent_env(dict(os.environ))
+    # review C5(b): export the composed config into THIS process's environment
+    # before building anything. No adapter subprocess call passes `env=`
+    # explicitly, so every shell-out downstream (bash gate checkers, git, gh,
+    # codex) inherits os.environ as it stood at spawn time. Foreground
+    # `point-at.sh` happens to `set -a`-source the same files into its own
+    # shell first, so dev mode worked by accident; systemd units set only
+    # AGENT_ENV + TARGET_DIR, so without this update the bash checkers read
+    # TEST_CMD/ALLOW_UNTESTED/BASE_BRANCH from an empty environment — the
+    # test-less-repo escape hatch became unreachable (fail-closed gate) and
+    # operator knobs like CI_IGNORE_CHECKS were honoured in dev and silently
+    # ignored under the service. `update()` (not a fresh dict) matches
+    # foreground `set -a` sourcing semantics: the overlay wins over whatever
+    # the service unit already set, inherited env stays for anything the
+    # overlay didn't touch.
+    os.environ.update(env)
     repo = env.get("REPO", "")
     try:
         _lock = acquire(role, repo)  # noqa: F841 — kept alive for process lifetime
