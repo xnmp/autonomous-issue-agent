@@ -90,10 +90,19 @@ def _fix_state(store: Store, world) -> FixState:
     review_retries = {k: store.get_review_retry(k) for k in keys}
     rebase_retries = {k: store.get_rebase_retries(k) for k in keys}
     resolve_retries = {i.number: store.get_resolve_retries(i.number) for i in world.issues}
+    # Infra deaths (review C3) span BOTH key spaces: the issue legs (resolve /
+    # resume) escalate on the issue number, the PR legs on breaker_key(pr) —
+    # and the dispatcher writes under whichever one the dying leg used. Read the
+    # union, or a leg escalates on a counter nobody reads.
+    infra_deaths = {
+        k: store.get_infra_deaths(k)
+        for k in keys | {i.number for i in world.issues}
+    }
     return FixState(
         sessions=sessions, resumed_at=resumed, automerge_enabled=automerge,
         ci_retries=ci_retries, review_retries=review_retries,
         rebase_retries=rebase_retries, resolve_retries=resolve_retries,
+        infra_deaths=infra_deaths,
     )
 
 
@@ -120,6 +129,7 @@ def build_fix_daemon(
         auto_rebase_conflicts=fix_runtime.auto_rebase_conflicts,
         max_rebase_retries=fix_runtime.max_rebase_retries,
         max_resolve_retries=fix_runtime.max_resolve_retries,
+        max_infra_deaths=fix_runtime.max_infra_deaths,
     )
     journal = _journal(store)
     ledger = default_ledger_path()
@@ -188,7 +198,8 @@ def build_fix_daemon(
 
     executor = Executor(
         gateway, remove_worktree=worktrees.remove, log=_log("fix"),
-        mark_automerge=store.mark_automerge, journal=journal, alert_cmd=cfg.alert_cmd,
+        mark_automerge=store.mark_automerge, clear_issue_state=store.cleanup_pr,
+        journal=journal, alert_cmd=cfg.alert_cmd,
     )
     # Wrapped LAST, so the decorator sees whichever runtime actually ran (Claude or
     # the Codex swap above) and the ledger is runtime-agnostic.

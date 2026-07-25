@@ -150,13 +150,19 @@ class RetryBreaker:
 
 @dataclass(frozen=True)
 class PrEscalation:
+    """`from_label` is the lifecycle label the PR currently carries — normally
+    AI_PR_OPEN, but the reviewer's trigger label is configurable (AI_REVIEW on a
+    repo where another bot owns ai-pr-open), and removing the wrong one leaves
+    the PR in the reviewer's pickable set forever (review M10/D4)."""
+
     pr: int
     reason: str
+    from_label: Label = Label.AI_PR_OPEN
 
     def actions(self) -> list:
         return [
             PostComment(Target.PR, self.pr, f"**Circuit breaker:** {self.reason} Escalating to a human."),
-            Relabel(Target.PR, self.pr, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW),
+            Relabel(Target.PR, self.pr, self.from_label, Label.NEEDS_HUMAN_REVIEW),
         ]
 
 
@@ -183,8 +189,10 @@ def retry_breaker(attempts: int, cap: int) -> RetryBreaker:
     return RetryBreaker(attempts=attempts, cap=cap)
 
 
-def pr_escalation(pr: int, reason: str) -> PrEscalation:
-    return PrEscalation(pr=pr, reason=reason)
+def pr_escalation(
+    pr: int, reason: str, from_label: Label = Label.AI_PR_OPEN
+) -> PrEscalation:
+    return PrEscalation(pr=pr, reason=reason, from_label=from_label)
 
 
 def issue_escalation(issue: int, reason: str, from_label: Label) -> IssueEscalation:
@@ -206,8 +214,10 @@ __all__ = [
     "PrLifecycle",
     "RetryBreaker",
     "PrEscalation",
+    "IssueEscalation",
     "issue_lifecycle",
     "pr_lifecycle",
     "retry_breaker",
     "pr_escalation",
+    "issue_escalation",
 ]

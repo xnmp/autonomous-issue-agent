@@ -2,6 +2,7 @@
 
 from issue_agent.app.execute import Executor
 from issue_agent.domain.actions import (
+    ClearIssueState,
     CloseIssue,
     EnableAutoMerge,
     UpdateBranch,
@@ -134,3 +135,59 @@ def test_execute_all_sequences():
     ])
     assert gw.calls[0][0] == "relabel"
     assert len(ran) == 1
+
+
+# ── ClearIssueState wiring (review M4/D8) ───────────────────────────────────
+def test_clear_issue_state_action_invokes_injected_callable():
+    gw = FakeGateway()
+    calls = []
+    ex = Executor(
+        gw,
+        clear_issue_state=lambda pr, issue, merged: calls.append((pr, issue, merged)),
+    )
+    ex.execute(ClearIssueState(pr=100, issue=9, merged=True))
+    assert calls == [(100, 9, True)]
+
+
+def test_clear_issue_state_default_is_a_noop():
+    # anti-vacuity twin: absent an injected callable (review/steward Executors
+    # never wire one), applying the action must not raise or fake success.
+    ex, gw, removed, ran = _exec()
+    ex.execute(ClearIssueState(pr=100, issue=9, merged=False))  # must not raise
+    assert gw.calls == [] and removed == [] and ran == []
+
+
+# ── execute_all per-action isolation (review S7) ────────────────────────────
+def test_execute_all_isolates_a_failing_action_and_runs_the_rest():
+    # Before this fix, a raising Relabel propagated out of execute_all
+    # IMMEDIATELY, so the sibling RemoveWorktree never ran and the caller
+    # (e.g. AgentDispatcher.dispatch's tail) never completed the batch. Now
+    # the failure is isolated + logged, and the batch completes.
+    gw = FakeGateway()
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("gh 500")
+
+    gw.relabel = _boom
+    removed = []
+    logged: list[str] = []
+    ex = Executor(gw, remove_worktree=removed.append, log=logged.append)
+
+    ex.execute_all([
+        Relabel(Target.ISSUE, 7, Label.AI_READY, Label.AI_WORKING),  # raises
+        RemoveWorktree(9),  # must still run despite the sibling failure above
+    ])
+
+    assert removed == [9]
+    assert any("FAILED" in line and "relabel issue #7" in line for line in logged)
+
+
+def test_execute_all_logs_nothing_extra_when_every_action_succeeds():
+    # anti-vacuity twin: a clean batch reports no failure line.
+    gw = FakeGateway()
+    removed = []
+    logged: list[str] = []
+    ex = Executor(gw, remove_worktree=removed.append, log=logged.append)
+    ex.execute_all([RemoveWorktree(9)])
+    assert removed == [9]
+    assert not any("FAILED" in line for line in logged)

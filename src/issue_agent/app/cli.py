@@ -23,6 +23,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 
 # HARNESS_ROOT: …/src/issue_agent/app/cli.py → repo root. Same walk main.py uses.
 # This is what makes the CLI checkout-resident: plugin/ + config/ are siblings.
@@ -51,6 +52,10 @@ def err(msg: str) -> None:
     print(_c("31", msg), file=sys.stderr)
 
 
+def warn(msg: str) -> None:
+    print(_c("33", f"⚠ {msg}"), file=sys.stderr)
+
+
 # ── pure helpers (unit-tested; no git/network) ────────────────────────────────
 _SSH_RE = re.compile(r"^git@[^:]+:(?P<slug>.+?)(?:\.git)?$")
 _HTTPS_RE = re.compile(r"^https?://[^/]+/(?P<slug>.+?)(?:\.git)?/?$")
@@ -70,25 +75,95 @@ def parse_remote_url(url: str) -> str:
     return ""
 
 
-def read_repo_env_field(path: str, field: str) -> str:
-    """Best-effort read of `FIELD="value"` from a shell env file (no sourcing).
+# M12: fields the CLI ever reads out of a per-repo overlay via
+# read_repo_env_field/_source_env_file. Cleared from the sourcing subprocess's
+# BASE environment (see _source_env_file) so a same-named var already present
+# in the CLI's own process (e.g. an operator's shell that `source`d an overlay
+# by hand) can never masquerade as a value the FILE itself set — only what the
+# file actually assigns is ever returned. Add a name here before reading it
+# elsewhere in this module.
+_OVERLAY_FIELDS = (
+    "REPO", "TARGET_DIR", "STATE_DIR", "REVIEW_STATE_DIR", "STEWARD_STATE_DIR",
+    "TEST_CMD", "DAILY_SPEND_CAP_USD",
+)
 
-    Only used to match an existing overlay's REPO against the detected repo, so a
-    simple line scan (last assignment wins, quotes stripped) is enough — the real
-    expansion happens in bin/compose-env.sh at launch.
+# M12: a hand-edited overlay's KEY <spaces> = <spaces> VALUE is not valid bash
+# (sourcing it either no-ops the assignment or errors), but it is an obvious,
+# common typo. Collapse the spacing on assignment-SHAPED lines only — before
+# handing the file to real bash — so the typo is forgiven while quoting,
+# `${VAR}` expansion, and trailing `# comment`s still get real shell semantics
+# from the `source` below (not a second bespoke parser).
+_ASSIGNMENT_SPACING_RE = re.compile(r"^(\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
+
+
+def _normalize_assignment_spacing(text: str) -> str:
+    out = []
+    for line in text.splitlines():
+        m = _ASSIGNMENT_SPACING_RE.match(line)
+        out.append(f"{m.group(1)}={m.group(2)}" if m else line)
+    return "\n".join(out) + "\n"
+
+
+def _source_env_file(path: str) -> dict[str, str]:
+    """Shell-semantics read of every var a single overlay/env file sets (M12).
+
+    The prior `read_repo_env_field` was a regex line-scanner
+    (`^FIELD=(.*)$`) that silently mis-parsed a trailing ` # comment`, `KEY =
+    VALUE` spacing, or a `${VAR}` reference — so `resolve_name` could MISS an
+    existing overlay's REPO/TARGET_DIR match, and `cmd_start` would then
+    synthesize a brand-new overlay with fresh `*_STATE_DIR`s, orphaning every
+    counter/session/dedup mark for that deployment in one command. This
+    mirrors the `set -a; source; env -0` technique `app/main.py`'s
+    `_load_agent_env` and `bin/compose-env.sh` already use at launch, so the
+    CLI's read of an overlay agrees with what actually runs.
+
+    Returns {} for a missing/unreadable file or a script bash rejects (e.g. a
+    stray syntax error) — same "absent, not an error" contract the regex
+    reader had.
     """
     try:
         with open(path) as f:
-            lines = f.readlines()
+            raw = f.read()
     except OSError:
-        return ""
-    value = ""
-    pat = re.compile(rf"^\s*(?:export\s+)?{re.escape(field)}=(.*)$")
-    for line in lines:
-        m = pat.match(line)
-        if m:
-            value = m.group(1).strip().strip('"').strip("'")
-    return value
+        return {}
+    normalized = _normalize_assignment_spacing(raw)
+    env = os.environ.copy()
+    for key in _OVERLAY_FIELDS:
+        env.pop(key, None)
+    tmp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", suffix=".env", delete=False, encoding="utf-8"
+        ) as tmp:
+            tmp.write(normalized)
+            tmp_path = tmp.name
+        proc = subprocess.run(
+            ["bash", "-c", 'set -a; source "$1"; set +a; env -0', "issue-agent-overlay", tmp_path],
+            env=env, capture_output=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    if proc.returncode != 0:
+        return {}
+    result: dict[str, str] = {}
+    for item in proc.stdout.split(b"\0"):
+        if not item or b"=" not in item:
+            continue
+        key, _sep, val = item.partition(b"=")
+        result[key.decode(errors="replace")] = val.decode(errors="replace")
+    return result
+
+
+def read_repo_env_field(path: str, field: str) -> str:
+    """Read `FIELD`'s value out of a shell env file the way bash actually
+    resolves it (M12) — see `_source_env_file`. "" for missing/unset."""
+    return _source_env_file(path).get(field, "")
 
 
 def derive_name(repo: str) -> str:
@@ -113,18 +188,28 @@ def resolve_name(
     3. An overlay whose REPO==repo (first alpha) — back-compat fallback when
        target_dir is unknown or no overlay's TARGET_DIR matches it.
     4. Derived from the repo basename.
+
+    M12: if none of the above match by REPO, but some OTHER overlay's
+    TARGET_DIR already points at this exact working copy, warn loudly (stderr)
+    before falling through to (4) — proceeding silently would synthesize a
+    SECOND overlay (fresh `*_STATE_DIR`s) for the same checkout, orphaning the
+    first one's counters/sessions/dedup marks. This is the residual case even
+    after the M12 parser fix: a genuine repo rename, or an explicit --repo
+    that disagrees with what the existing overlay recorded — only the
+    operator can resolve it, so this warns rather than silently reusing or
+    silently duplicating.
     """
     if explicit:
         return explicit
     if repo and os.path.isdir(repos_dir):
         envs = [fn for fn in sorted(os.listdir(repos_dir)) if fn.endswith(".env")]
+        want = os.path.realpath(target_dir) if target_dir else ""
         repo_matches = [
             fn for fn in envs
             if read_repo_env_field(os.path.join(repos_dir, fn), "REPO") == repo
         ]
         # Tier 2: prefer the overlay whose TARGET_DIR IS the detected working copy.
-        if target_dir:
-            want = os.path.realpath(target_dir)
+        if want:
             for fn in repo_matches:
                 td = read_repo_env_field(os.path.join(repos_dir, fn), "TARGET_DIR")
                 if td and os.path.realpath(td) == want:
@@ -132,6 +217,19 @@ def resolve_name(
         # Tier 3: any REPO match (first alpha) — back-compat.
         if repo_matches:
             return repo_matches[0][: -len(".env")]
+        # M12: about to fall through to derive_name (4) — last chance to catch
+        # a same-checkout duplicate that REPO-matching couldn't see.
+        if want:
+            for fn in envs:
+                td = read_repo_env_field(os.path.join(repos_dir, fn), "TARGET_DIR")
+                if td and os.path.realpath(td) == want:
+                    warn(
+                        f"config/repos/{fn} already targets {target_dir} but its "
+                        f"REPO does not match {repo!r} — about to synthesize a "
+                        f"NEW overlay for the same working copy. If this should "
+                        f"reuse it, pass --name {fn[: -len('.env')]}."
+                    )
+                    break
     return derive_name(repo)
 
 
@@ -523,17 +621,46 @@ def cmd_stop(args) -> int:
     return 0
 
 
-def journal_path(name: str) -> str:
-    """The repo journal for overlay `name`. STATE_DIR from the overlay is the
-    truth (an operator may point it anywhere); the fallback mirrors the layout
-    `synth_repo_env` writes, so status works on an overlay-less checkout too."""
+# M11: STATE_DIR/REVIEW_STATE_DIR/STEWARD_STATE_DIR paired with the synth
+# default dirname pattern `synth_repo_env` writes for each (issue-agent-<name>
+# / review-agent-<name> / steward-agent-<name>) — one place both journal_paths
+# and synth_repo_env's isolated-state block agree on the naming.
+_JOURNAL_ROLE_DEFAULTS = (
+    ("STATE_DIR", "issue-agent"),
+    ("REVIEW_STATE_DIR", "review-agent"),
+    ("STEWARD_STATE_DIR", "steward-agent"),
+)
+
+
+def journal_paths(name: str) -> list[str]:
+    """Every per-role journal overlay `name`'s daemons may have written (M11):
+    fix, review, and steward each get their OWN STATE_DIR and therefore their
+    own journal.jsonl. Reading STATE_DIR alone (the pre-M11 `journal_path`)
+    made review/steward runs, their spend blocks, and their loops invisible to
+    `issue-agent status`. Overlay value wins per role; an absent/empty one
+    falls back to the same per-role default `synth_repo_env` writes into a
+    freshly generated overlay. A role that never ran still gets a path here —
+    `read_events` (adapters/journal.py) already treats a missing file as an
+    empty history, not an error, so callers need no existence check and a
+    role that never ran is silently skipped, not flagged."""
     overlay = os.path.join(REPOS_DIR, f"{name}.env")
-    raw = read_repo_env_field(overlay, "STATE_DIR")
-    state = (
-        os.path.expandvars(os.path.expanduser(raw)) if raw
-        else os.path.expanduser(f"~/.local/state/issue-agent-{name}")
-    )
-    return os.path.join(state, "journal.jsonl")
+    paths = []
+    for env_key, dirname in _JOURNAL_ROLE_DEFAULTS:
+        raw = read_repo_env_field(overlay, env_key)
+        state = (
+            os.path.expandvars(os.path.expanduser(raw)) if raw
+            else os.path.expanduser(f"~/.local/state/{dirname}-{name}")
+        )
+        paths.append(os.path.join(state, "journal.jsonl"))
+    return paths
+
+
+def journal_path(name: str) -> str:
+    """The fix-role journal for overlay `name` (STATE_DIR only). Kept for
+    back-compat (tests/adapters/test_journal.py, outside this leg's file
+    ownership, calls this directly) — prefer `journal_paths` (M11), which also
+    covers review/steward and is what `cmd_status` now reads."""
+    return journal_paths(name)[0]
 
 
 def daily_cap(name: str) -> float:
@@ -551,13 +678,25 @@ def daily_cap(name: str) -> float:
 
 
 def spend_status_lines(
-    journal_file: str, ledger_file: str, cap: float = 0.0, now_fn=None
+    journal_file: str | list[str], ledger_file: str, cap: float = 0.0, now_fn=None
 ) -> list[str]:
     """The spend/health section of `issue-agent status`, as plain lines.
 
-    Pure over the two files so it is testable without daemons: reads only, and an
+    Pure over the files so it is testable without daemons: reads only, and an
     absent or empty journal yields `[]` — a status command that shouts about a
     missing file on a fresh install teaches operators to ignore it.
+
+    M11: `journal_file` may be a single path (back-compat — pre-M11 callers,
+    e.g. tests/adapters/test_journal.py outside this leg's file ownership,
+    pass the fix journal alone) or a list of per-role journals. `cmd_status`
+    now passes `journal_paths(name)`, the STATE_DIR/REVIEW_STATE_DIR/
+    STEWARD_STATE_DIR triple — reading STATE_DIR alone made review/steward
+    runs, their spend blocks, and their loops invisible here. Every file's
+    events are read then merge-sorted into ONE global `ts` timeline before
+    anything below is computed, so a review run interleaves correctly with a
+    fix run instead of rendering as three disjoint, file-ordered lists. A role
+    that never ran contributes no events (`read_events` tolerates a missing
+    file), so it is silently absent, not an error.
 
     The three warnings are the failure shapes that cost real money and are
     otherwise invisible until the bill: a leg that re-dispatches without
@@ -568,14 +707,21 @@ def spend_status_lines(
 
     from ..adapters.journal import (
         events_within,
+        parse_ts,
         read_events,
-        recent_runs,
         repeated_dispatch_warning,
         sum_today,
     )
 
     now_fn = now_fn or (lambda: datetime.now(timezone.utc))
-    events = read_events(journal_file)
+    paths = [journal_file] if isinstance(journal_file, str) else list(journal_file)
+    events: list[dict] = []
+    for path in paths:
+        events.extend(read_events(path))
+    # Global order across files. A missing/garbled `ts` sorts first (never
+    # corrupts the ordering of the events after it) rather than raising —
+    # readers tolerating garbage is the module's own contract (journal.py).
+    events.sort(key=lambda e: parse_ts(e.get("ts")) or datetime.min.replace(tzinfo=timezone.utc))
     spent = sum_today(ledger_file, now_fn)
     if not events and not spent:
         return []
@@ -584,7 +730,11 @@ def spend_status_lines(
     budget = f" / ${cap:.2f} cap" if cap > 0 else " (no daily cap)"
     lines.append(f"  today, all repos: ${spent:.2f}{budget}")
 
-    runs = recent_runs(journal_file, 5)
+    # `agent_run` only, not `agent_run_start` — the latter (wave-A
+    # JournalingRuntime pre-await receipt) is the other half of the same
+    # dispatch and would double-list a run still in flight, or one that never
+    # settled, as if it were a completed one.
+    runs = [e for e in events if e.get("event") == "agent_run"][-5:]
     if runs:
         lines.append("  last runs:")
         for r in runs:
@@ -646,7 +796,7 @@ def cmd_status(args) -> int:
         from ..adapters.journal import default_ledger_path
 
         for line in spend_status_lines(
-            journal_path(name), default_ledger_path(), daily_cap(name)
+            journal_paths(name), default_ledger_path(), daily_cap(name)
         ):
             print(line)
     except Exception as exc:  # noqa: BLE001
@@ -699,7 +849,17 @@ def cmd_install_service(args) -> int:
     if not (os.path.isfile(SHARED_ENV) and os.path.isfile(overlay)):
         err(f"need config/shared.env + config/repos/{name}.env first (run `issue-agent start` once).")
         return 2
-    subprocess.run(["/bin/bash", _bin("compose-env.sh"), name], check=False)
+    # A4 fold-in: this used to run with check=False and never look at the
+    # return code — a compose failure (bad overlay syntax, missing file
+    # between check above and here, etc.) fell through silently, and the
+    # service unit got installed pointing AGENT_ENV at a STALE or missing
+    # config/.active.env (whatever a prior successful compose left behind, or
+    # nothing). Fail loud and abort instead of installing against unknown env.
+    r = subprocess.run(["/bin/bash", _bin("compose-env.sh"), name])
+    if r.returncode != 0:
+        err(f"compose-env.sh failed (exit {r.returncode}) — not installing the "
+            f"service against a stale/missing config/.active.env.")
+        return r.returncode
     env = dict(os.environ, AGENT_ENV=os.path.join(HARNESS_ROOT, "config", ".active.env"))
     script = "install-launchd.sh" if sys.platform == "darwin" else "install-systemd.sh"
     cmd = ["/bin/bash", _bin(script)]

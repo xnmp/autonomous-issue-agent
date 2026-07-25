@@ -132,7 +132,8 @@ class AgentDispatcher:
             cfg.fix_workflow_config(), gateway, store, worktrees, runner, executor, prepare_cwd
         )
         self.review_workflow = ReviewWorkflow(
-            cfg.review_workflow_config(), gateway, store, runner, self._run_logged
+            cfg.review_workflow_config(), gateway, store, runner, executor,
+            self._run_logged,
         )
         self.steward_workflow = StewardWorkflow(
             cfg.steward_workflow_config(), gateway, store, runner, executor
@@ -249,4 +250,29 @@ class AgentDispatcher:
         set_context = getattr(self.runner, "set_context", None)
         if set_context is not None:
             set_context(self.cfg.role, action.kind.name, action.number, issue)
-        await handler(action.number)
+        try:
+            await handler(action.number)
+        except BaseException:
+            # Review C3. A session that dies BEFORE `runner.run` returns RAISES
+            # (agent_runner.py, deliberately), so the whole workflow tail —
+            # save_session, the retry-counter bump, the follow-up actions — is
+            # skipped. The death was therefore unbounded, unbilled and invisible:
+            # `Daemon.tick` swallowed, the reaper put the issue back to ai-ready,
+            # and the next poll paid for a full session again, forever. Wave A
+            # made it VISIBLE (agent_run_start + a settled transport_death
+            # journal line); this counter BOUNDS it (decide_fix escalates at
+            # cfg.max_infra_deaths). Bump then re-raise UNCHANGED — the crash
+            # isolation the raise buys is the contract, not a bug to fix here.
+            #
+            # `issue` is already resolved above: for the non-PR-keyed kinds it IS
+            # action.number, and the -action.number fallback is exactly
+            # domain.fix.breaker_key's negated-PR convention, so the decide side
+            # reads the counter under the key the write side used.
+            key = issue if issue is not None else -action.number
+            try:
+                self.store.bump_infra_deaths(key)
+            except Exception as exc:  # noqa: BLE001
+                # A counter we could not persist must not replace the death we
+                # are trying to report (the traceback is the diagnosis).
+                self.cfg.log(f"infra-death counter not persisted for #{key}: {exc}")
+            raise

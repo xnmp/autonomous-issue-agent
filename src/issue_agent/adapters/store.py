@@ -19,6 +19,37 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+# ── suffix universe (review M4/D8) ──────────────────────────────────────────
+# Every accessor below writes `issue-N.<suffix>` or `pr-N.<suffix>` via
+# issue_path/pr_path. These two tuples are the SAME suffix universe the
+# accessors use — clear_issue/clear_pr_review derive from them instead of
+# hand-maintaining a parallel list, and
+# tests/adapters/test_store.py::test_every_*_accessor_suffix_is_covered_by_*
+# introspects the module source to assert every literal suffix an accessor
+# passes to issue_path/pr_path appears in exactly one of these — so a new
+# accessor with an unlisted suffix fails a test instead of silently leaking a
+# STATE_DIR file forever. `session` legitimately appears in BOTH: issue-N.session
+# (resolve/resume/address-review) and pr-N.session (review) are different files
+# in different namespaces, not a collision.
+#
+# `automerge` is a PR suffix — this is the M4 fix. It used to live in the issue
+# tuple (`issue-N.automerge`), which nothing ever wrote (mark_automerge/
+# automerge_enabled always used pr_path), so clear_issue's removal was a no-op
+# and the real pr-N.automerge marker was cleared by NEITHER cleaner.
+_ISSUE_SUFFIXES = (
+    "session", "resumed-at", "resumes", "ci-retries", "resolve-retries",
+    "rebase-retries", "infra-deaths", "review-retries", "phase", "jira",
+    "jira-phase",
+)
+_PR_SUFFIXES = ("session", "last-sha", "round", "automerge")
+
+# Closed-unmerged requeue cleanup (review M4/D8, handover §5.7): only the
+# resume-blocking markers are cleared — resolve-retries and infra-deaths are
+# DELIBERATELY kept (fewer retries after a human closed the PR). This is a
+# strict subset of _ISSUE_SUFFIXES, not a third partition member, so it does
+# not participate in the "exactly one cleaner" coverage test above.
+_RESUME_STATE_SUFFIXES = ("session", "phase", "resumed-at")
+
 
 @dataclass(frozen=True)
 class Store:
@@ -46,10 +77,20 @@ class Store:
             return ""
 
     def _write(self, path: str, value: str) -> None:
+        # review M3: pid-suffix the tmp name — two daemons sharing a STATE_DIR
+        # (or a restarted process racing its predecessor's in-flight write)
+        # must not collide on one shared "<path>.tmp" and truncate each
+        # other's write mid-flight. flush()+fsync() before os.replace closes
+        # the crash window where a torn/zero-length tmp file (data still in
+        # the page cache, not on disk) could get installed at `path` by a
+        # power loss / kill between write() and replace() — see _read_int's
+        # comment for which counter that silently resets.
         os.makedirs(self.state_dir, exist_ok=True)
-        tmp = path + ".tmp"
+        tmp = f"{path}.{os.getpid()}.tmp"
         with open(tmp, "w") as f:
             f.write(value)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
 
     def _remove(self, path: str) -> None:
@@ -59,6 +100,13 @@ class Store:
             pass
 
     def _read_int(self, path: str, default: int = 0) -> int:
+        # review M3: an empty/zero-length file reads back as `default` here —
+        # the one counter this bites is resolve-retries, whose entire purpose
+        # is stopping an infinite loop. Before the fsync above, a power loss
+        # mid-write could leave exactly this (a torn, zero-length file) and
+        # silently reset a tripped breaker to a full budget; fsync narrows the
+        # crash window to "before os.replace", where the OLD value still reads
+        # back intact instead.
         raw = self._read(path)
         if not raw:
             return default
@@ -116,6 +164,22 @@ class Store:
 
     def set_rebase_retries(self, issue: int, n: int) -> None:
         self._write(self.issue_path(issue, "rebase-retries"), str(n))
+
+    # ── infra-death ceiling (review C3/D2c) ──
+    # NOT a retry counter: a session that dies before returning a result made no
+    # attempt, so it must never march ci-/review-/rebase-/resolve-retries (that
+    # exemption is FAILURE-MODES #58). It gets its own, higher ceiling instead,
+    # because "the session keeps dying" is itself a paid loop. `key` is the same
+    # key the leg's retry counter uses: the issue number, or the NEGATED PR
+    # number for a PR with no resolvable issue (domain.fix.breaker_key).
+    def get_infra_deaths(self, key: int) -> int:
+        return self._read_int(self.issue_path(key, "infra-deaths"))
+
+    def bump_infra_deaths(self, key: int) -> int:
+        path = self.issue_path(key, "infra-deaths")
+        n = self._read_int(path) + 1
+        self._write(path, str(n))
+        return n
 
     def get_review_retry(self, issue: int) -> tuple[str, int]:
         """(review_at, count). Bash stored "<at> <n>" in issue-N.review-retries."""
@@ -186,14 +250,49 @@ class Store:
 
     # ── cleanup (mirror cleanup.sh's rm -f set) ──
     def clear_issue(self, issue: int) -> None:
-        for suffix in ("session", "ci-retries", "resumes", "resumed-at",
-                       "automerge", "review-retries", "resolve-retries",
-                       "rebase-retries", "phase", "jira", "jira-phase"):
+        """Full issue-state retirement. Derives from `_ISSUE_SUFFIXES` (review
+        M4) so a suffix added anywhere above and forgotten here fails
+        test_store.py's coverage test instead of leaking a file forever."""
+        for suffix in _ISSUE_SUFFIXES:
             self._remove(self.issue_path(issue, suffix))
 
     def clear_pr_review(self, pr: int) -> None:
-        for suffix in ("session", "last-sha", "round"):
+        """Full PR-state retirement, incl. the automerge marker (review M4:
+        `automerge` is a PR suffix — it used to live in `clear_issue`, which
+        cleared a file nothing wrote, while the real pr-N.automerge marker was
+        cleared by neither cleaner)."""
+        for suffix in _PR_SUFFIXES:
             self._remove(self.pr_path(pr, suffix))
+
+    def clear_issue_resume_state(self, issue: int) -> None:
+        """Closed-unmerged requeue's conservative partial clear (review M4/D8):
+        drop only the resume-blocking markers (session/phase/resumed-at) so
+        the next lifecycle doesn't try to resume a dead PR's session — but
+        DELIBERATELY keep resolve-retries and infra-deaths (handover §5.7:
+        fewer retries after a human closed the PR is intentional, not a bug)."""
+        for suffix in _RESUME_STATE_SUFFIXES:
+            self._remove(self.issue_path(issue, suffix))
+
+    def cleanup_pr(self, pr: int, issue: int | None, merged: bool) -> None:
+        """Single entry point the Executor's `ClearIssueState` action wiring
+        calls (review M4: `clear_issue`/`clear_pr_review` had ZERO production
+        call sites — a closed-unmerged PR requeued its issue while
+        issue-N.session/.phase survived, so the next lifecycle resumed a dead
+        PR's session with a preloaded breaker).
+
+        merged=True  → retire everything: full issue state (incl.
+                       infra-deaths) AND the PR's own state (incl. the
+                       pr-N.automerge marker).
+        merged=False → closed-unmerged requeue: only the resume-blocking
+                       markers on the issue are cleared; resolve-retries/
+                       infra-deaths persist on purpose (handover §5.7). PR-side
+                       state is left alone — the PR is dead, not reused."""
+        if merged:
+            self.clear_pr_review(pr)
+            if issue is not None:
+                self.clear_issue(issue)
+        elif issue is not None:
+            self.clear_issue_resume_state(issue)
 
 
 # ── worktree .harness/ markers (the agent's on-disk declaration) ──────────────

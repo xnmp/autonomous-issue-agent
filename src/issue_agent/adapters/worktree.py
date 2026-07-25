@@ -4,8 +4,8 @@
 `git worktree remove`. `build_gate_context` is the git/fs fact-gatherer the
 governor's `make_pretooluse_hook(build_ctx)` needs — it reads the worktree's
 branch, the commit subjects since base, the changed-file list, the `.harness/`
-markers, and wires the `run_tests` / `revert_and_run` / `exists_at_base`
-callables (§1 + §10 of the gate) over real git.
+markers, and wires the `run_tests` / `revert_and_run` / `exists_at_base` /
+`open_pr` callables (§1 + §10 + the push gate) over real git and `gh`.
 
 git/subprocess is injected as `run` so the path/branch logic is testable with a
 fake; the production default shells out. The §10 revert simulation mirrors
@@ -14,12 +14,15 @@ _pr_common.sh:prc_check_red_fails (revert impl to base, run tests, restore HEAD)
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from ..domain.gate import OpenPrLookup
 from .governor import GateContext
 from .store import HarnessMarkers
 
@@ -132,6 +135,81 @@ def _test_timeout_s() -> float:
     return seconds if seconds > 0 else _DEFAULT_TEST_TIMEOUT_S
 
 
+# ── open-PR probe: the push gate's precondition (review known-gap-2) ─────────
+# Bounded from day one because this runs INLINE in the PreToolUse hook, on the
+# agent's own `git push`: an unbounded `gh` (dead proxy, auth prompt, a GitHub
+# 5xx holding the socket) would wedge the session mid-push. Same failure class
+# as the TEST_CMD timeout above; 20s is far above a healthy call (<2s).
+_OPEN_PR_TIMEOUT_S = 20.0
+
+# Pause between the probe's two attempts (`resolve_open_pr`'s retry) — long
+# enough for a transient blip to clear, short enough that the agent is not left
+# waiting on its own push.
+_OPEN_PR_RETRY_SLEEP_S = 1.0
+
+# A `gh … list` argv MUST state its ceiling (review C2) — without `--limit`, gh
+# silently answers with the 30 NEWEST items and looks complete. The question
+# here is purely existential ("does this head have an open PR?"), so 1 is a
+# complete answer by construction rather than a truncation; the flag is still
+# passed explicitly so this call can never be mistaken for another instance of
+# the C2 omission.
+_OPEN_PR_LIMIT = "1"
+
+GhRunner = Callable[[list[str], str], GitResult]  # (args, cwd) -> result
+
+
+def _subprocess_gh(args: list[str], cwd: str) -> GitResult:
+    """Run `gh` in `cwd`, bounded by `_OPEN_PR_TIMEOUT_S`.
+
+    NEVER raises: a timeout, a missing `gh`, an auth failure and a 5xx all come
+    back as a non-zero result, which `classify_open_pr` turns into
+    `OpenPrLookup.ERROR` — "I could not look", never "there is no PR". That
+    collapse is the exact bug `OpenPrLookup` exists to prevent."""
+    try:
+        res = subprocess.run(
+            ["gh", *args], cwd=cwd, capture_output=True, text=True,
+            timeout=_OPEN_PR_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return GitResult(1, "")
+    return GitResult(res.returncode, res.stdout)
+
+
+def classify_open_pr(result: GitResult) -> OpenPrLookup:
+    """`gh pr list --json number` result → the domain's tri-state. Pure, so the
+    error-vs-empty distinction the whole type exists for is unit-testable.
+
+    Non-zero exit, unparseable output, or a non-list payload ⇒ ERROR. Only a
+    well-formed EMPTY list means "no open PR"; a blank stdout on a 0 exit is an
+    answer we cannot read, so it is an error, not an absence."""
+    if result.code != 0:
+        return OpenPrLookup.ERROR
+    try:
+        prs = json.loads(result.out)
+    except ValueError:
+        return OpenPrLookup.ERROR
+    if not isinstance(prs, list):
+        return OpenPrLookup.ERROR
+    return OpenPrLookup.OPEN if prs else OpenPrLookup.NONE
+
+
+def probe_open_pr(branch: str, cwd: str, gh: GhRunner = _subprocess_gh) -> OpenPrLookup:
+    """One `gh pr list --head <branch> --state open` round-trip → tri-state.
+    Port of check-push.sh's precondition. The retry lives in the domain
+    (`resolve_open_pr`), so this stays a single honest observation."""
+    return classify_open_pr(
+        gh(
+            ["pr", "list", "--head", branch, "--state", "open",
+             "--limit", _OPEN_PR_LIMIT, "--json", "number"],
+            cwd,
+        )
+    )
+
+
+def _sleep_between_probes() -> None:
+    time.sleep(_OPEN_PR_RETRY_SLEEP_S)
+
+
 def _resolve_base_ref(git: GitRunner, cwd: str, base: str) -> str | None:
     for ref in (f"origin/{base}", base):
         if git(["rev-parse", "--verify", "--quiet", ref], cwd).code == 0:
@@ -145,14 +223,20 @@ def build_gate_context(
     env_test_cmd: str | None = None,
     red_must_fail: bool = True,
     verify_red_at_commit: bool = True,
-    has_open_pr: bool = False,
     allow_untested: bool = False,
     git: GitRunner = _subprocess_git,
+    gh: GhRunner = _subprocess_gh,
     run_tests: Callable[[str], bool] | None = None,
+    retry_sleep: Callable[[], None] = _sleep_between_probes,
 ) -> GateContext:
     """Gather the worktree facts the governor's gate rules need. Pure-ish: all
-    git access goes through the injected `git`, so a fake exercises the wiring
-    without a real repo. `run_tests` defaults to a real shell eval in `cwd`."""
+    git/gh access goes through the injected `git`/`gh` runners, so a fake
+    exercises the wiring without a real repo. `run_tests` defaults to a real
+    shell eval in `cwd`.
+
+    The open-PR lookup is wired as a LAZY probe, never a value: this function
+    runs on EVERY Bash call the agent makes, and resolving it eagerly would put
+    a `gh` round-trip behind every `ls` (review known-gap-2)."""
     branch = git(["rev-parse", "--abbrev-ref", "HEAD"], cwd).out.strip()
     baseref = _resolve_base_ref(git, cwd, base_branch)
     base_resolvable = baseref is not None
@@ -166,6 +250,11 @@ def build_gate_context(
         changed = tuple(f for f in diff.out.splitlines() if f)
 
     markers = HarnessMarkers(cwd)
+
+    def open_pr() -> OpenPrLookup:
+        """Resolved ONLY when the governor actually gates a push (see
+        `governor._push_gate`) — building this context must stay gh-free."""
+        return probe_open_pr(branch, cwd, gh)
 
     def exists_at_base(path: str) -> bool:
         if not baseref:
@@ -231,7 +320,8 @@ def build_gate_context(
         branch_subjects=subjects,
         base_resolvable=base_resolvable,
         changed_files=changed,
-        has_open_pr=has_open_pr,
+        open_pr=open_pr,
+        open_pr_retry_sleep=retry_sleep,
         allow_untested=allow_untested,
         ac_posted=markers.ac_posted(),
         test_plan_posted=markers.test_plan_posted(),

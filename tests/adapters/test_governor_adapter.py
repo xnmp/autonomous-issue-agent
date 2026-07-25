@@ -14,6 +14,7 @@ from issue_agent.adapters.governor import (
     make_pretooluse_hook,
     make_read_record_hook,
 )
+from issue_agent.domain.gate import OpenPrLookup
 
 
 def ctx(**kw) -> GateContext:
@@ -164,24 +165,117 @@ def test_pr_tautological_test_blocked():
     assert not v.allowed and "tautological" in v.reason
 
 
-# ── push gate (open-PR-only) ──────────────────────────────────────────────────
-def test_push_without_open_pr_allowed():
-    c = ctx(branch="fix/5-x", has_open_pr=False, harness_test_cmd="pytest",
-            run_tests=lambda c: False)
-    assert evaluate_command("git push", c).allowed  # no PR → not enforced
+# ── push gate (open-PR-only, LAZY probe) — review known-gap-2 ─────────────────
+# The hole this section pins: `has_open_pr` defaulted False and the builder never
+# populated it, so on the SDK path EVERY push to an open PR (every
+# ADDRESS_REVIEW / FIX_CI leg) ran with no gate at all. The field is now the
+# domain tri-state behind a probe, so these tests drive the real wiring.
+def _probe(*answers):
+    """A fake open-PR probe returning `answers` in order (last one repeats), and
+    the call log — laziness and retry are both observable through it."""
+    calls: list[int] = []
+
+    def probe():
+        calls.append(1)
+        return answers[min(len(calls) - 1, len(answers) - 1)]
+
+    return probe, calls
 
 
-def test_push_with_open_pr_failing_tests_blocked():
-    c = ctx(branch="fix/5-x", has_open_pr=True, branch_subjects=("red: t",),
-            harness_test_cmd="pytest", run_tests=lambda c: False)
-    v = evaluate_command("git push", c)
+def _push_ctx(probe, **kw):
+    """A governed branch mid-work: one red: commit, a clean diff, a test command."""
+    base = dict(
+        branch="fix/5-x",
+        branch_subjects=("red: t",),
+        changed_files=("src/x.py", "tests/test_x.py"),
+        harness_test_cmd="pytest",
+        run_tests=lambda c: True,
+        open_pr=probe,
+    )
+    return ctx(**{**base, **kw})
+
+
+def test_push_to_open_pr_is_gated_and_blocks_a_failing_suite():
+    """The P0 hole: with an open PR the push gate must actually RUN. A failing
+    local suite is a real rule violation (§1), so the push is denied."""
+    probe, calls = _probe(OpenPrLookup.OPEN)
+    v = evaluate_command("git push", _push_ctx(probe, run_tests=lambda c: False))
     assert not v.allowed and "test suite failed" in v.reason
+    assert len(calls) == 1  # probed exactly once for one push
 
 
-def test_push_on_ungoverned_branch_allowed():
-    c = ctx(branch="main", has_open_pr=True, harness_test_cmd="pytest",
-            run_tests=lambda c: False)
+def test_push_to_open_pr_with_everything_clean_is_allowed():
+    """Anti-vacuity twin: the gate denies the violation above, not every push."""
+    probe, _ = _probe(OpenPrLookup.OPEN)
+    assert evaluate_command("git push", _push_ctx(probe)).allowed
+
+
+def test_push_to_open_pr_blocks_committed_evidence():
+    """A second rule proves the whole open-PR rule set is armed, not just §1."""
+    probe, _ = _probe(OpenPrLookup.OPEN)
+    c = _push_ctx(probe, changed_files=("src/x.py", "evidence/run.log"))
+    v = evaluate_command("git push", c)
+    assert not v.allowed and "evidence" in v.reason.lower()
+
+
+def test_push_without_open_pr_allowed():
+    """The pre-PR TDD phase must stay free — a red: commit's push happens before
+    any PR exists, and gating it on a failing suite would make TDD impossible."""
+    probe, _ = _probe(OpenPrLookup.NONE)
+    c = _push_ctx(probe, run_tests=lambda c: False)
     assert evaluate_command("git push", c).allowed
+
+
+def test_push_denied_when_the_open_pr_lookup_errors():
+    """A failed lookup must never read as "no PR" (the bash's old collapse) —
+    it is denied with the retry guidance the domain defines, after the retry."""
+    probe, calls = _probe(OpenPrLookup.ERROR)
+    slept: list[int] = []
+    c = _push_ctx(probe, open_pr_retry_sleep=lambda: slept.append(1))
+    v = evaluate_command("git push", c)
+    assert not v.allowed
+    assert "could not verify PR state" in v.reason
+    assert "retry the push" in v.reason
+    assert len(calls) == 2 and len(slept) == 1  # retried once, with a pause
+
+
+def test_push_allowed_when_a_transient_lookup_error_clears_on_retry():
+    """Anti-vacuity twin for the retry: a blip must not cost the agent a turn."""
+    probe, calls = _probe(OpenPrLookup.ERROR, OpenPrLookup.NONE)
+    c = _push_ctx(probe, run_tests=lambda c: False)
+    assert evaluate_command("git push", c).allowed
+    assert len(calls) == 2
+
+
+def test_push_on_ungoverned_branch_is_allowed_without_probing():
+    """An ungoverned branch is not our business — and must not cost a `gh` call
+    (mirrors check-push.sh, which never reaches gh on that path)."""
+    probe, calls = _probe(OpenPrLookup.OPEN)
+    c = _push_ctx(probe, branch="main", run_tests=lambda c: False)
+    assert evaluate_command("git push", c).allowed
+    assert calls == []
+
+
+def test_open_pr_probe_never_fires_for_non_push_commands():
+    """Laziness contract: the context is rebuilt for EVERY Bash call, so a `gh`
+    round-trip must happen only when a push is actually being gated."""
+    probe, calls = _probe(OpenPrLookup.OPEN)
+    for cmd in (
+        "ls -la && cat README.md",
+        "git status",
+        "git commit -m 'green: impl'",
+        "gh pr view 5",
+    ):
+        evaluate_command(cmd, _push_ctx(probe, branch_subjects=("red: t",)))
+    assert calls == []
+
+
+def test_open_pr_defaults_to_unknown_and_fails_closed():
+    """A GateContext built without wiring the probe must DENY the push, not
+    silently disable the gate — the shape of the original bug (`has_open_pr`
+    defaulted to the permissive value and was never populated)."""
+    v = evaluate_command("git push", ctx(branch="fix/5-x"))
+    assert not v.allowed and "could not verify PR state" in v.reason
 
 
 # ── SDK hook deny shape ────────────────────────────────────────────────────────

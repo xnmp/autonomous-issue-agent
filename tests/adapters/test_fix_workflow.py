@@ -6,6 +6,7 @@ shrinking into a router without losing behavior coverage.
 
 import asyncio
 
+from issue_agent.adapters.store import Store
 from issue_agent.app.execute import Executor
 from issue_agent.app.workflows.fix import FixWorkflow, FixWorkflowConfig
 from issue_agent.domain.outcome import AgentResult, ExitReason
@@ -317,6 +318,63 @@ def test_rebase_infra_death_does_not_advance_the_breaker():
     assert store.get_rebase_retries(5) == 1
 
 
+def test_fix_ci_infra_death_counts_against_the_infra_ceiling(tmp_path):
+    """review C3/D2c, the RETURNED-result half. The exemption above (an infra
+    death is not a CI attempt) left the deaths themselves unbounded: the PR
+    clears ai-working, the next poll sees the same red CI, and pays again. The
+    separate counter is what bounds it — under the SAME key the CI counter uses,
+    so the decide side reads one key per PR leg."""
+    gw = FakeGateway(prs={100: _ci_pr()})
+    store = Store(state_dir=str(tmp_path))
+    runner = FakeRunner(AgentResult(is_error=True, status="timeout",
+                                    exit_reason=ExitReason.TRANSPORT_DEATH))
+
+    asyncio.run(_workflow(gw, store, runner).fix_ci(100))
+
+    assert store.get_infra_deaths(5) == 1
+    assert store.get_ci_retries(5) == 0  # still not an attempt
+
+
+def test_fix_ci_error_does_not_touch_the_infra_ceiling(tmp_path):
+    """Anti-vacuity twin: a genuine failed attempt marches the CI breaker, NOT
+    the infra ceiling. Counting it twice would escalate a normally-failing PR
+    through whichever breaker tripped first, for the wrong stated reason."""
+    gw = FakeGateway(prs={100: _ci_pr()})
+    store = Store(state_dir=str(tmp_path))
+    runner = FakeRunner(AgentResult(is_error=True, exit_reason=ExitReason.AGENT_ERROR))
+
+    asyncio.run(_workflow(gw, store, runner).fix_ci(100))
+
+    assert store.get_infra_deaths(5) == 0
+    assert store.get_ci_retries(5) == 1
+
+
+def test_rebase_infra_death_counts_against_the_infra_ceiling(tmp_path):
+    gw = FakeGateway(prs={100: PRView(100, head_ref_name="fix/5-token", closing_issue=5)})
+    store = Store(state_dir=str(tmp_path))
+    runner = FakeRunner(AgentResult(is_error=True, status="timeout",
+                                    exit_reason=ExitReason.KILLED_EXTERNALLY))
+
+    asyncio.run(_workflow(gw, store, runner).rebase(100))
+
+    assert store.get_infra_deaths(5) == 1
+    assert store.get_rebase_retries(5) == 0
+
+
+def test_resolve_infra_death_counts_against_the_infra_ceiling(tmp_path):
+    """The resolve leg is the expensive one, and its infra deaths leave the
+    issue ai-working for the reaper → ai-ready → dispatched again. Without this
+    counter that cycle is unbounded (review C3)."""
+    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
+    store = Store(state_dir=str(tmp_path))
+    runner = FakeRunner(AgentResult(is_error=True, exit_reason=ExitReason.TRANSPORT_DEATH))
+
+    asyncio.run(_workflow(gw, store, runner).resolve(5))
+
+    assert store.get_infra_deaths(5) == 1
+    assert store.get_resolve_retries(5) == 0
+
+
 def test_address_review_infra_death_does_not_burn_a_review_retry():
     p = PRView(100, head_ref_name="fix/5-x", closing_issue=5,
                reviews=(Review("CHANGES_REQUESTED", "rev-bot", "t9", body="fix it"),))
@@ -438,3 +496,217 @@ def test_split_contract_change_resets_before_adjudication_and_escalates_at_cap()
     assert wt.resets == []
     assert store.phases[5] == "authored"
     assert ("relabel", "issue", 5, "ai-working", "needs-human-review") in gw.calls
+
+
+# ── review M13: the two repair prompts must carry their primary inputs ───────
+class PromptInputGateway(FakeGateway):
+    """FakeGateway + the two M13 prompt-input methods.
+
+    These tests assert at the WORKFLOW level on purpose: the prompt builders
+    take `failed_log` / `inline` as parameters, so a builder test supplying its
+    own fixture text passes happily while the workflow hands the builder "" —
+    which is exactly the bug M13 found sitting in production code."""
+
+    def __init__(self, *a, run_log="", inline="", boom=False, **kw):
+        super().__init__(*a, **kw)
+        self._run_log = run_log
+        self._inline = inline
+        self._boom = boom
+        self.log_args = []
+
+    def failed_run_log(self, pr, *, branch="", lines=150):
+        if self._boom:
+            raise RuntimeError("gh run list exploded")
+        self.log_args.append((pr, branch))
+        return self._run_log
+
+    def review_comments(self, pr, *, limit=20):
+        if self._boom:
+            raise RuntimeError("gh api exploded")
+        return self._inline
+
+
+class LegacyGateway(FakeGateway):
+    """A gateway from before D6: neither prompt-input method exists on it.
+
+    The absence is pinned here rather than inherited from the shared FakeGateway,
+    so that adding those methods to the shared fake cannot silently retire this
+    coverage — the point is that the workflow tolerates a gateway without them."""
+
+    def __getattribute__(self, name):
+        if name in ("failed_run_log", "review_comments"):
+            raise AttributeError(name)
+        return super().__getattribute__(name)
+
+
+def _review_pr():
+    return PRView(100, head_ref_name="fix/5-x", closing_issue=5,
+                  reviews=(Review("CHANGES_REQUESTED", "rev-bot", "t9", body="fix it"),))
+
+
+_PUSHED = AgentResult(is_error=False, status="pushed", session_id="s")
+
+
+def test_fix_ci_prompt_carries_the_failed_run_log():
+    # M13: the prompt rendered "Log (last 150 lines):" over nothing, so the
+    # fixer had to rediscover the failure with `gh api` denied by the governor.
+    gw = PromptInputGateway(prs={100: _ci_pr()}, run_log="E   assert 1 == 2  # SENTINEL")
+    runner = FakeRunner(_PUSHED)
+
+    asyncio.run(_workflow(gw, FakeStore(), runner).fix_ci(100))
+
+    assert "E   assert 1 == 2  # SENTINEL" in runner.tasks[0].prompt
+    # keyed to the REAL head branch, and handed over so the gateway need not
+    # re-fetch the PR the workflow already holds
+    assert gw.log_args == [(100, "fix/5-token")]
+
+
+def test_fix_ci_dispatches_when_the_failed_run_log_is_empty():
+    # Anti-vacuity twin of the above: a log fetch that finds nothing must not
+    # cost the repair leg — the agent can still diagnose from the check names.
+    gw = PromptInputGateway(prs={100: _ci_pr()}, run_log="")
+    runner = FakeRunner(_PUSHED)
+
+    asyncio.run(_workflow(gw, FakeStore(), runner).fix_ci(100))
+
+    assert len(runner.tasks) == 1
+    assert "unit" in runner.tasks[0].prompt
+    assert ("relabel", "pr", 100, "ai-working", None) in gw.calls
+
+
+def test_fix_ci_dispatches_when_the_failed_run_log_raises():
+    # M13's contract at the workflow level: the gateway fails soft, but a
+    # gateway that does NOT (a raising fake, a legacy adapter, a gh binary that
+    # dies mid-call) must still not turn a cosmetic gap into a dead repair leg.
+    gw = PromptInputGateway(prs={100: _ci_pr()}, boom=True)
+    runner = FakeRunner(_PUSHED)
+
+    asyncio.run(_workflow(gw, FakeStore(), runner).fix_ci(100))
+
+    assert len(runner.tasks) == 1
+    assert ("relabel", "pr", 100, "ai-working", None) in gw.calls
+
+
+def test_fix_ci_dispatches_when_the_gateway_has_no_failed_run_log():
+    # An injected gateway predating D6 has no such method at all.
+    gw = LegacyGateway(prs={100: _ci_pr()})
+    runner = FakeRunner(_PUSHED)
+
+    asyncio.run(_workflow(gw, FakeStore(), runner).fix_ci(100))
+
+    assert len(runner.tasks) == 1
+    assert ("relabel", "pr", 100, "ai-working", None) in gw.calls
+
+
+def test_address_review_prompt_carries_the_inline_comments():
+    # M13: the file:line asks reviewers actually make live in the inline
+    # comments; the workflow passed "" and the fixer never saw them, burning
+    # rounds off the 4-rejection ceiling guessing at the review body.
+    gw = PromptInputGateway(
+        prs={100: _review_pr()},
+        inline="src/a.py:12 (rev-bot): SENTINEL null check missing",
+    )
+    runner = FakeRunner(_PUSHED)
+
+    asyncio.run(_workflow(gw, FakeStore(), runner).address_review(100))
+
+    assert "SENTINEL null check missing" in runner.tasks[0].prompt
+    assert "fix it" in runner.tasks[0].prompt  # review body still carried
+
+
+def test_address_review_dispatches_when_there_are_no_inline_comments():
+    # Anti-vacuity twin: a review with only a body is the common case.
+    gw = PromptInputGateway(prs={100: _review_pr()}, inline="")
+    runner = FakeRunner(_PUSHED)
+
+    asyncio.run(_workflow(gw, FakeStore(), runner).address_review(100))
+
+    assert len(runner.tasks) == 1
+    assert "fix it" in runner.tasks[0].prompt
+    assert ("relabel", "pr", 100, "ai-working", None) in gw.calls
+
+
+def test_address_review_dispatches_when_review_comments_raises():
+    gw = PromptInputGateway(prs={100: _review_pr()}, boom=True)
+    runner = FakeRunner(_PUSHED)
+
+    asyncio.run(_workflow(gw, FakeStore(), runner).address_review(100))
+
+    assert len(runner.tasks) == 1
+    assert ("relabel", "pr", 100, "ai-working", None) in gw.calls
+
+
+def test_address_review_dispatches_when_the_gateway_has_no_review_comments():
+    gw = LegacyGateway(prs={100: _review_pr()})
+    runner = FakeRunner(_PUSHED)
+
+    asyncio.run(_workflow(gw, FakeStore(), runner).address_review(100))
+
+    assert len(runner.tasks) == 1
+    assert ("relabel", "pr", 100, "ai-working", None) in gw.calls
+
+
+# ── review C3/D2c: the two legs B1 left uncounted ────────────────────────────
+def test_address_review_infra_death_counts_against_the_infra_ceiling(tmp_path):
+    """The review-retry exemption (an external kill is not an attempt) left the
+    deaths unbounded: the tail clears ai-working, the next poll sees the same
+    CHANGES_REQUESTED review and pays again. Same key the review counter uses."""
+    gw = FakeGateway(prs={100: _review_pr()})
+    store = Store(state_dir=str(tmp_path))
+    runner = FakeRunner(AgentResult(is_error=True, status="timeout",
+                                    exit_reason=ExitReason.TRANSPORT_DEATH, session_id="s"))
+
+    asyncio.run(_workflow(gw, store, runner).address_review(100))
+
+    assert store.get_infra_deaths(5) == 1
+    assert store.get_review_retry(5) == ("", 0)  # still not an attempt
+
+
+def test_address_review_error_does_not_touch_the_infra_ceiling(tmp_path):
+    """Anti-vacuity twin: a genuine failed attempt marches the review breaker,
+    not the infra ceiling — counting both escalates for the wrong reason."""
+    gw = FakeGateway(prs={100: _review_pr()})
+    store = Store(state_dir=str(tmp_path))
+    runner = FakeRunner(AgentResult(is_error=True, exit_reason=ExitReason.AGENT_ERROR,
+                                    session_id="s"))
+
+    asyncio.run(_workflow(gw, store, runner).address_review(100))
+
+    assert store.get_infra_deaths(5) == 0
+    assert store.get_review_retry(5) == ("t9", 1)
+
+
+def _resume_issue():
+    return IssueView(5, title="t", body="b", comments=(
+        Comment("fix-bot", "asking", "t1"),
+        Comment("alice", "the answer", "t2"),
+    ))
+
+
+def test_resume_infra_death_counts_against_the_infra_ceiling(tmp_path):
+    """resume_actions deliberately does NOTHING on an infra death (the human's
+    reply must not be consumed by a session that never ran), so the issue stays
+    ai-working → reaper → ai-ready → paid again. Nothing else bounds that."""
+    gw = FakeGateway(issues={5: _resume_issue()}, pr_for_issue={})
+    store = Store(state_dir=str(tmp_path))
+    runner = FakeRunner(AgentResult(is_error=True, status="timeout",
+                                    exit_reason=ExitReason.KILLED_EXTERNALLY, session_id="s"))
+
+    asyncio.run(_workflow(gw, store, runner, fix_bot="fix-bot").resume(5))
+
+    assert store.get_infra_deaths(5) == 1
+    assert store.get_resolve_retries(5) == 0  # no attempt was made
+
+
+def test_resume_error_does_not_touch_the_infra_ceiling(tmp_path):
+    """Anti-vacuity twin: an agent that ran and failed is not an infra death;
+    the resume leg parks the issue back on ai-blocked and no counter moves."""
+    gw = FakeGateway(issues={5: _resume_issue()}, pr_for_issue={})
+    store = Store(state_dir=str(tmp_path))
+    runner = FakeRunner(AgentResult(is_error=True, exit_reason=ExitReason.AGENT_ERROR,
+                                    session_id="s"))
+
+    asyncio.run(_workflow(gw, store, runner, fix_bot="fix-bot").resume(5))
+
+    assert store.get_infra_deaths(5) == 0
+    assert ("relabel", "issue", 5, "ai-working", "ai-blocked") in gw.calls

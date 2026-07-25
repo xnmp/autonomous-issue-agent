@@ -141,6 +141,12 @@ if command -v gh >/dev/null 2>&1; then
   [ -n "$who" ] && ok "gh authenticated as $who" || bad "gh not authenticated (run: gh auth login)"
   if [ -n "$REPO" ]; then
     gh repo view "$REPO" --json name >/dev/null 2>&1 && ok "can read $REPO" || bad "cannot access repo $REPO"
+    # The push gate (wave P0-B/B6) probes `gh pr list` per gated push and FAILS
+    # CLOSED on error — an unauthed/broken gh here means every governed-branch
+    # push is denied forever, not silently allowed. Assert the probe works now.
+    gh pr list -R "$REPO" --state open --limit 1 --json number >/dev/null 2>&1 \
+      && ok "gh pr list works ($REPO) — push-gate probe healthy" \
+      || bad "gh pr list failed for $REPO — the fail-closed push gate would deny every governed push (fix gh auth/network first)"
   fi
 else
   bad "gh missing"

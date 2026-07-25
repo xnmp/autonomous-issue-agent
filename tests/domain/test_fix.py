@@ -4,6 +4,7 @@ from builders import Check, Comment, Review, issue, pr, world
 
 from issue_agent.domain.actions import (
     AgentKind,
+    ClearIssueState,
     CloseIssue,
     EnableAutoMerge,
     UpdateBranch,
@@ -555,6 +556,109 @@ def test_fix_ci_under_cap_still_dispatches():
     assert RunAgent(AgentKind.FIX_CI, 100) in _run_agents(actions)
 
 
+# ── infra-death ceiling (review C3/D2c) ──────────────────────────────────────
+# A session that dies BEFORE returning a result records no attempt anywhere (that
+# exemption is FAILURE-MODES #58), so none of the retry breakers above can see it
+# — the death cycle was unbounded. These pin the SEPARATE, higher ceiling: same
+# escalation shape, its own counter, its own reason text.
+INFRA_CFG = FixConfig(fix_bot="fix-bot", max_infra_deaths=2)
+
+
+def test_ready_issue_at_infra_ceiling_escalates_instead_of_dispatching():
+    st = FixState(infra_deaths={5: 2})
+    actions = decide_fix(world(issues=[issue(5, "ai-ready")]), INFRA_CFG, st, fixer_busy=False)
+    assert _run_agents(actions) == []
+    assert Relabel(Target.ISSUE, 5, Label.AI_READY, Label.NEEDS_HUMAN_REVIEW) in actions
+    assert any(isinstance(a, PostComment) and "died 2×" in a.body for a in actions)
+
+
+def test_ready_issue_below_infra_ceiling_still_dispatches():
+    # Anti-vacuity twin: the ceiling is HIGHER than the retry caps on purpose —
+    # a couple of transport deaths must not stop a healthy issue.
+    st = FixState(infra_deaths={5: 1})
+    actions = decide_fix(world(issues=[issue(5, "ai-ready")]), INFRA_CFG, st, fixer_busy=False)
+    assert RunAgent(AgentKind.RESOLVE, 5) in _run_agents(actions)
+
+
+def test_infra_deaths_are_counted_against_their_own_higher_cap():
+    # Defaults: max_resolve_retries=3, max_infra_deaths=5. Four infra deaths is
+    # past the RETRY cap and must still dispatch — the two counters are separate
+    # ceilings, and "resolve failed 4× without opening a PR" would be a lie
+    # about work that never ran.
+    st = FixState(infra_deaths={5: 4}, resolve_retries={5: 0})
+    actions = decide_fix(world(issues=[issue(5, "ai-ready")]), CFG, st, fixer_busy=False)
+    assert RunAgent(AgentKind.RESOLVE, 5) in _run_agents(actions)
+
+
+def test_infra_ceiling_of_zero_never_escalates():
+    st = FixState(infra_deaths={5: 99})
+    cfg = FixConfig(fix_bot="fix-bot", max_infra_deaths=0)  # 0 = off, like every cap
+    actions = decide_fix(world(issues=[issue(5, "ai-ready")]), cfg, st, fixer_busy=False)
+    assert RunAgent(AgentKind.RESOLVE, 5) in _run_agents(actions)
+
+
+def _blocked_issue_with_reply():
+    return issue(7, "ai-blocked", comments=(Comment("alice", "more context", "t1"),))
+
+
+def test_resume_at_infra_ceiling_escalates_from_blocked():
+    # A resume that dies pre-result never consumes the reply (resume_actions
+    # returns nothing on an infra death), so the dedup mark cannot stop the loop
+    # either — only this ceiling can. The issue is ai-blocked here, so that is
+    # the label the escalation removes.
+    st = FixState(sessions=frozenset({7}), infra_deaths={7: 2})
+    actions = decide_fix(world(issues=[_blocked_issue_with_reply()]), INFRA_CFG, st,
+                         fixer_busy=False)
+    assert _run_agents(actions) == []
+    assert Relabel(Target.ISSUE, 7, Label.AI_BLOCKED, Label.NEEDS_HUMAN_REVIEW) in actions
+
+
+def test_resume_below_infra_ceiling_still_dispatches():
+    st = FixState(sessions=frozenset({7}), infra_deaths={7: 1})
+    actions = decide_fix(world(issues=[_blocked_issue_with_reply()]), INFRA_CFG, st,
+                         fixer_busy=False)
+    assert RunAgent(AgentKind.RESUME, 7) in _run_agents(actions)
+
+
+def test_ci_leg_at_infra_ceiling_escalates_the_pr():
+    st = FixState(infra_deaths={9: 2})  # keyed by breaker_key → closing_issue 9
+    actions = decide_fix(world(prs=[_ci_fail_pr()]), INFRA_CFG, st, fixer_busy=False)
+    assert _run_agents(actions) == []
+    assert Relabel(Target.PR, 100, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW) in actions
+
+
+def test_address_review_leg_at_infra_ceiling_escalates_the_pr():
+    st = FixState(infra_deaths={9: 2})
+    actions = decide_fix(world(prs=[_changes_requested_pr()]), INFRA_CFG, st,
+                         fixer_busy=False)
+    assert _run_agents(actions) == []
+    assert Relabel(Target.PR, 100, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW) in actions
+
+
+def test_rebase_leg_at_infra_ceiling_escalates_the_pr():
+    st = FixState(infra_deaths={9: 2})
+    p = pr(100, "ai-pr-open", closing_issue=9, mergeable="CONFLICTING")
+    actions = decide_fix(world(prs=[p]), INFRA_CFG, st, fixer_busy=False)
+    assert _run_agents(actions) == []
+    assert Relabel(Target.PR, 100, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW) in actions
+
+
+def test_pr_leg_below_infra_ceiling_still_dispatches():
+    st = FixState(infra_deaths={9: 1})
+    actions = decide_fix(world(prs=[_ci_fail_pr()]), INFRA_CFG, st, fixer_busy=False)
+    assert RunAgent(AgentKind.FIX_CI, 100) in _run_agents(actions)
+
+
+def test_infra_ceiling_does_not_escalate_a_pr_with_no_work_to_do():
+    # A clean, green PR carrying stale infra deaths from an earlier leg must be
+    # left alone: the ceiling gates DISPATCH, it is not a standing verdict on
+    # the PR. Escalating here would hand a healthy PR to a human for nothing.
+    st = FixState(infra_deaths={9: 5})
+    p = pr(100, "ai-pr-open", closing_issue=9, checks=(Check("unit", bucket="pass"),))
+    actions = decide_fix(world(prs=[p]), INFRA_CFG, st, fixer_busy=False)
+    assert actions == []
+
+
 # ── reap ────────────────────────────────────────────────────────────────────────
 def test_reap_requeues_orphaned_issue_to_ready():
     w = world(issues=[issue(8, "ai-working")])
@@ -596,3 +700,36 @@ def test_cleanup_uses_closing_ref_over_branch():
     p = pr(100, "ai-pr-open", state="MERGED", head_ref_name="fix/9-x", closing_issue=42)
     acts = cleanup_actions(p, 42, CFG)
     assert any(isinstance(a, CloseIssue) and a.number == 42 for a in acts)
+
+
+# ── cleanup emits ClearIssueState (review M4/D8) ────────────────────────────
+def test_cleanup_merged_emits_full_clear_flag():
+    # review M4/D8: merged cleanup must retire ALL issue state (incl.
+    # infra-deaths, via Store.cleanup_pr's merged=True path) plus the PR's own
+    # state (incl. the pr-N.automerge marker, the M4 drift fix).
+    p = pr(100, "ai-pr-open", state="MERGED", head_ref_name="fix/9-x")
+    acts = cleanup_actions(p, 9, CFG)
+    clears = [a for a in acts if isinstance(a, ClearIssueState)]
+    assert clears == [ClearIssueState(pr=100, issue=9, merged=True)]
+
+
+def test_cleanup_closed_unmerged_emits_partial_clear_flag():
+    # anti-vacuity twin: the SAME PR, only CLOSED instead of MERGED, must flip
+    # the flag to merged=False so Store.cleanup_pr takes the conservative path
+    # (keeps resolve-retries/infra-deaths — handover §5.7).
+    p = pr(100, "ai-pr-open", state="CLOSED", head_ref_name="fix/9-x")
+    acts = cleanup_actions(p, 9, CFG)
+    clears = [a for a in acts if isinstance(a, ClearIssueState)]
+    assert clears == [ClearIssueState(pr=100, issue=9, merged=False)]
+
+
+def test_cleanup_issueless_pr_still_emits_clear_with_no_issue():
+    # An issueless PR (no closing ref, no numeric branch) has no worktree/issue
+    # to touch, but its own state (e.g. a stray automerge marker) still needs
+    # retiring — cleanup_actions must not skip ClearIssueState just because
+    # issue_number is None.
+    p = pr(100, "ai-pr-open", state="MERGED", head_ref_name="feat/ACME-1-x")
+    acts = cleanup_actions(p, None, CFG)
+    clears = [a for a in acts if isinstance(a, ClearIssueState)]
+    assert clears == [ClearIssueState(pr=100, issue=None, merged=True)]
+    assert not any(isinstance(a, RemoveWorktree) for a in acts)

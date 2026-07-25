@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from .actions import (
     Action,
     AgentKind,
+    ClearIssueState,
     CloseIssue,
     EnableAutoMerge,
     UpdateBranch,
@@ -65,6 +66,12 @@ class FixConfig:
     auto_rebase_conflicts: bool = True
     max_rebase_retries: int = 3
     max_resolve_retries: int = 3
+    # SEPARATE, HIGHER ceiling for sessions that die BEFORE returning a result
+    # (review C3/D2c). "Infra deaths are not attempts" stays true for every
+    # retry breaker above (FAILURE-MODES #58) — but a leg whose session keeps
+    # dying pre-result never records an attempt at all, so nothing bounded it:
+    # one full paid session every two polls, forever. 0 disables.
+    max_infra_deaths: int = 5
 
 
 @dataclass(frozen=True)
@@ -90,6 +97,12 @@ class FixState:
     # requeues ai-ready each round; without a breaker that is a full paid
     # session per poll, forever — #39's shape on the most expensive leg.
     resolve_retries: dict[int, int] = field(default_factory=dict)
+    # Pre-result session deaths (review C3), keyed the same way the retry
+    # counters are: issue number for the issue legs, `breaker_key(pr)` for the
+    # PR legs. Written by the dispatcher (on a raised handler) and by the fix
+    # workflow (on a RETURNED infra-death result) — the two are mutually
+    # exclusive, so a single death counts once.
+    infra_deaths: dict[int, int] = field(default_factory=dict)
 
 
 # ── cores ────────────────────────────────────────────────────────────────────
@@ -224,11 +237,20 @@ def cleanup_actions(
     """Merged/closed PR cleanup. Port of cleanup.sh. MERGED → issue ai-pr-open→
     ai-done (+ optional close, since GitHub only auto-closes on default-branch
     merges); CLOSED-unmerged → issue ai-pr-open→ai-ready (re-queue). Always drop
-    ai-pr-open from the PR and remove the worktree."""
+    ai-pr-open from the PR and remove the worktree.
+
+    Also emits `ClearIssueState` (review M4/D8): `clear_issue`/`clear_pr_review`
+    had zero production call sites, so a closed-unmerged requeue left
+    issue-N.session/.phase alive and the next lifecycle resumed a dead PR's
+    session with a preloaded breaker. MERGED clears everything (incl.
+    infra-deaths + the pr-N.automerge marker); CLOSED-unmerged only clears the
+    resume-blocking markers, keeping resolve-retries/infra-deaths (handover
+    §5.7's deliberate conservatism — fewer retries after a human closed the PR)."""
     actions: list[Action] = []
+    merged = pr.state == "MERGED"
     if issue_number is not None:
         actions.append(RemoveWorktree(issue_number))
-    if pr.state == "MERGED":
+    if merged:
         if issue_number is not None:
             actions.append(
                 Relabel(Target.ISSUE, issue_number, Label.AI_PR_OPEN, Label.AI_DONE)
@@ -246,6 +268,7 @@ def cleanup_actions(
                 Relabel(Target.ISSUE, issue_number, Label.AI_PR_OPEN, Label.AI_READY)
             )
     actions.append(Relabel(Target.PR, pr.number, Label.AI_PR_OPEN, None))
+    actions.append(ClearIssueState(pr.number, issue_number, merged))
     return actions
 
 
@@ -297,6 +320,28 @@ def _escalate_pr(pr: int, reason: str) -> list[Action]:
     """Stop dispatching a stuck PR leg: comment why, then swap ai-pr-open for
     needs-human-review so neither the fixer nor the reviewer re-acts on it."""
     return pr_escalation(pr, reason).actions()
+
+
+def infra_ceiling_hit(state: FixState, cfg: FixConfig, key: int) -> bool:
+    """The infra-death breaker (review C3/D2c). A session that dies before
+    returning a result records NO attempt — deliberately, so a machine under
+    memory pressure can't walk a healthy issue to needs-human-review
+    (FAILURE-MODES #58). The cost of that exemption was that nothing bounded
+    dying itself: the reaper requeued and the next poll paid for another full
+    session. This is the separate, HIGHER ceiling that stops it. cap<=0
+    disables, like every other breaker here."""
+    return breaker_tripped(state.infra_deaths.get(key, 0), cfg.max_infra_deaths)
+
+
+def infra_escalation_reason(cap: int) -> str:
+    """Human-facing text for an infra-death escalation. Says what the harness
+    saw (deaths before any result) so the human looks at the runtime/daemon,
+    not at the code the agent never got to touch."""
+    return (
+        f"the agent session died {cap}× before returning a result — a transport "
+        "drop, an external kill, or a daemon restart mid-run, so no attempt was "
+        "ever recorded. The harness/runtime needs a human look."
+    )
 
 
 # ── composition ────────────────────────────────────────────────────────────
@@ -358,6 +403,13 @@ def decide_fix(
                     "opening a PR — this issue needs a human look.",
                     Label.AI_READY,
                 ).actions())
+            elif infra_ceiling_hit(state, cfg, n):
+                # The resolve counter above never sees these (an infra death is
+                # not an attempt), so without this the requeue→re-dispatch cycle
+                # is unbounded — the C3 loop.
+                actions.extend(issue_escalation(
+                    n, infra_escalation_reason(cfg.max_infra_deaths), Label.AI_READY,
+                ).actions())
             else:
                 actions.append(
                     Relabel(Target.ISSUE, n, Label.AI_READY, Label.AI_WORKING)
@@ -370,16 +422,25 @@ def decide_fix(
         needing = issues_needing_resume(world, state, cfg)
         if needing:
             n, _at = needing[0]
-            # Flip ai-blocked → ai-working for the duration of the resume run, so an
-            # actively-resuming issue reads as working (not still-blocked) and a
-            # second poll can't treat it as awaiting-human. Mirrors the RESOLVE
-            # dispatch relabel. resume_actions transitions FROM ai-working at the
-            # tail (pr-open / back-to-blocked / etc.), so this closes the loop.
-            actions.append(
-                Relabel(Target.ISSUE, n, Label.AI_BLOCKED, Label.AI_WORKING)
-            )
-            actions.append(RunAgent(AgentKind.RESUME, n))
-            consumed = True
+            if infra_ceiling_hit(state, cfg, n):
+                # A resume whose session keeps dying pre-result never consumes
+                # the reply (resume_actions returns NOTHING on an infra death),
+                # so the dedup mark can't stop it either — only this ceiling can
+                # (review C3). ai-blocked is the label the issue carries here.
+                actions.extend(issue_escalation(
+                    n, infra_escalation_reason(cfg.max_infra_deaths), Label.AI_BLOCKED,
+                ).actions())
+            else:
+                # Flip ai-blocked → ai-working for the duration of the resume run, so an
+                # actively-resuming issue reads as working (not still-blocked) and a
+                # second poll can't treat it as awaiting-human. Mirrors the RESOLVE
+                # dispatch relabel. resume_actions transitions FROM ai-working at the
+                # tail (pr-open / back-to-blocked / etc.), so this closes the loop.
+                actions.append(
+                    Relabel(Target.ISSUE, n, Label.AI_BLOCKED, Label.AI_WORKING)
+                )
+                actions.append(RunAgent(AgentKind.RESUME, n))
+                consumed = True
 
     # 3) Open PRs: review responses + CI (one fixer-consuming action total).
     for pr in open_prs:
@@ -421,6 +482,10 @@ def decide_fix(
             # the conflict existed). Bounded by a breaker → needs-human-review, so
             # a conflict it genuinely can't resolve escalates instead of looping.
             if cfg.auto_rebase_conflicts and pr.is_conflicting():
+                if infra_ceiling_hit(state, cfg, bkey):
+                    actions.extend(_escalate_pr(
+                        pr.number, infra_escalation_reason(cfg.max_infra_deaths)))
+                    continue
                 if breaker_tripped(state.rebase_retries.get(bkey, 0),
                                    cfg.max_rebase_retries):
                     actions.extend(_escalate_pr(
@@ -443,6 +508,10 @@ def decide_fix(
                 # counter is keyed to the review's submitted_at — a stored count
                 # from an OLDER review reads as 0 (superseded = reset), and
                 # nothing else resets it (see FixState.review_retries).
+                if infra_ceiling_hit(state, cfg, bkey):
+                    actions.extend(_escalate_pr(
+                        pr.number, infra_escalation_reason(cfg.max_infra_deaths)))
+                    continue
                 at, n = state.review_retries.get(bkey, ("", 0))
                 count = n if at == review.submitted_at else 0
                 if breaker_tripped(count, cfg.max_review_retries):
@@ -460,6 +529,10 @@ def decide_fix(
             if not lifecycle.is_working and ci_state(
                 pr.checks, cfg.ci_ignore_checks
             ) == CIState.FAILURE:
+                if infra_ceiling_hit(state, cfg, bkey):
+                    actions.extend(_escalate_pr(
+                        pr.number, infra_escalation_reason(cfg.max_infra_deaths)))
+                    continue
                 if breaker_tripped(state.ci_retries.get(bkey, 0),
                                    cfg.max_ci_retries):
                     actions.extend(_escalate_pr(

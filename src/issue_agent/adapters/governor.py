@@ -41,7 +41,24 @@ class GateContext:
     branch_subjects: tuple[str, ...] = ()    # commit subjects on branch since base
     base_resolvable: bool = True
     changed_files: tuple[str, ...] = ()      # diff vs base
-    has_open_pr: bool = False                # for the push gate
+    # Push-gate precondition, as a LAZY probe rather than a value (review
+    # known-gap-2 / M7). Two properties this shape buys:
+    #   * cost — this context is rebuilt for EVERY Bash call the agent makes and
+    #     the answer costs a `gh` round-trip, so it is resolved only when a push
+    #     is actually being gated (see `_push_gate`), never behind an `ls`.
+    #   * honesty — the answer is the domain's tri-state, so "I could not look"
+    #     stays distinguishable from "there is no PR". The old
+    #     `has_open_pr: bool = False` collapsed both into the permissive value
+    #     AND was never populated by `build_gate_context`, so every push to an
+    #     open PR (every ADDRESS_REVIEW / FIX_CI leg) ran with NO gate at all on
+    #     the SDK path. The default is therefore ERROR — "nobody told me" is an
+    #     unknown, and an unknown fails closed; a builder that forgets to wire
+    #     the probe now denies loudly instead of disabling the gate silently.
+    open_pr: Callable[[], gate.OpenPrLookup] = lambda: gate.OpenPrLookup.ERROR
+    # Delay between the probe's two attempts (`resolve_open_pr`). The retry
+    # POLICY is pure/domain; the actual sleeping is the adapter's business, so it
+    # is injected and defaults to a no-op (tests never wait).
+    open_pr_retry_sleep: Callable[[], None] = lambda: None
     ac_posted: bool = False
     test_plan_posted: bool = False
     adversarial_verdict: str = ""
@@ -94,8 +111,6 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
     chk(gate.check_tests(test_cmd, ctx.run_tests, allow_untested=ctx.allow_untested))
 
     body = _extract_after_flag(argv, "--body", "-b")
-    # --body-file/-F content is supplied via env_test_cmd-style injection in the
-    # real builder; here body may be empty and the body checks fire accordingly.
     chk(gate.check_pr_body(body))
     chk(gate.check_markers(ctx.ac_posted, ctx.test_plan_posted))
     # pr_body arms the per-AC-item screenshot rule (§7d); inline --body/-b only —
@@ -127,8 +142,28 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
 
 
 def _push_gate(ctx: GateContext) -> list[str]:
-    """Push gate (check-push.sh): only when a governed branch HAS an open PR."""
-    if not is_governed_branch(ctx.branch) or not ctx.has_open_pr:
+    """Push gate (check-push.sh): only when a governed branch HAS an open PR.
+
+    The open-PR lookup is resolved HERE — this is the only place that pays for
+    the `gh` round-trip, because it is the only place whose decision depends on
+    it (review known-gap-2: the context is rebuilt per Bash call, so an eager
+    probe would put a GitHub call behind every command the agent runs).
+
+    Order matters and mirrors check-push.sh:
+      1. ungoverned branch → not our business, and never call gh;
+      2. resolve the lookup (retry once — a transient blip is the common case);
+      3. an UNKNOWN state fails CLOSED (`check_push_precondition`): a denied push
+         costs the agent a turn, an ungated push to an open PR costs the gate;
+      4. only a CONFIRMED open PR arms the state-derived checks — a pre-PR push
+         stays free (the create gate enforces those later).
+    """
+    if not is_governed_branch(ctx.branch):
+        return []
+    lookup = gate.resolve_open_pr(ctx.open_pr, sleep=ctx.open_pr_retry_sleep)
+    precondition = gate.check_push_precondition(ctx.branch, lookup)
+    if not precondition.ok:
+        return [precondition.reason]
+    if not gate.push_gate_applies(ctx.branch, lookup):
         return []
     if not ctx.base_resolvable:
         return []

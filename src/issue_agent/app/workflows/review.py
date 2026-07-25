@@ -14,6 +14,8 @@ from ...domain import review as review_dom
 from ..planners import tasks as task_builders
 from ..planners.tasks import ReviewTaskConfig
 from ...domain.agent_task import AgentRuntime
+from ...domain.labels import Label
+from ...domain.lifecycle import pr_escalation
 from ...domain.outcome import AgentResult
 
 
@@ -33,7 +35,44 @@ class ReviewWorkflow:
     gateway: object
     store: object
     runner: AgentRuntime
+    # Required, not optional: escalation writes go through the funnel or not at
+    # all (review M10). A default would let a caller silently reintroduce the
+    # direct-gateway bypass this field exists to remove.
+    executor: object
     log_run: Callable[[str, int, object], object] | None = None
+
+    def _trigger_label(self) -> Label:
+        """The reviewer's trigger label as a domain Label. Both the default
+        (ai-pr-open) and the external-repo value (ai-review) are real Labels; an
+        unknown string is a misconfiguration, and crashing here — after a verdict
+        has already been POSTed — would strand the PR mid-escalation, so fall
+        back loudly to ai-pr-open."""
+        try:
+            return Label(self.cfg.review_trigger_label)
+        except ValueError:
+            self.cfg.log(
+                f"review: REVIEW_TRIGGER_LABEL '{self.cfg.review_trigger_label}' is not a "
+                f"known lifecycle label — escalating from '{Label.AI_PR_OPEN.value}' instead"
+            )
+            return Label.AI_PR_OPEN
+
+    def _escalate(self, pr: int, rejections: int) -> None:
+        """The reviewer is out of rounds → hand the PR to a human, THROUGH the
+        write funnel (review M10/D4).
+
+        This used to be a bare `gateway.relabel(..., "needs-human-review")` with
+        a raw string, so the one state change an operator most needs to hear
+        about — the reviewer giving up on a PR — emitted no `escalation` journal
+        event and fired no ALERT_CMD, while the spend-cap escalation on the very
+        same daemon did. `Executor` detects the needs-human-review move itself,
+        so routing the actions through it is what restores both."""
+        reason = (
+            f"the reviewer requested changes {rejections} time(s) without the PR "
+            f"converging (ceiling {self.cfg.max_review_rejections})."
+        )
+        self.executor.execute_all(
+            pr_escalation(pr, reason, from_label=self._trigger_label()).actions()
+        )
 
     async def _run_logged(self, label: str, pr: int, task):
         if self.log_run is not None:
@@ -237,7 +276,7 @@ class ReviewWorkflow:
         if not self.gateway.submit_review(pr, sub.event, sub.body):
             return  # failed POST → leave state untouched (retried next poll)
         if sub.escalate:
-            self.gateway.relabel("pr", pr, self.cfg.review_trigger_label, "needs-human-review")
+            self._escalate(pr, prior + 1)
         self._persist_review_state(pr, p.head_ref_oid, round_number)
 
     def _persist_review_state(self, pr: int, head_oid: str, round_number: int) -> None:
@@ -280,5 +319,5 @@ class ReviewWorkflow:
             f"review #{pr} r{round_number}{tally}: submitted {sub.event}{escalated}"
         )
         if sub.escalate:
-            self.gateway.relabel("pr", pr, self.cfg.review_trigger_label, "needs-human-review")
+            self._escalate(pr, prior_rejections + 1)
         return True

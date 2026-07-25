@@ -4,7 +4,10 @@ synthesized per-repo env. No git/network: every helper here is deterministic.
 The key invariant: synth_repo_env's keys must round-trip through config.from_env
 (the daemon's reader), so the CLI and the daemon can't drift on key names."""
 
+import argparse
+import json
 import os
+from datetime import datetime, timezone
 
 from issue_agent.app import cli
 from issue_agent.app.config import from_env
@@ -44,6 +47,91 @@ def test_read_repo_env_field_last_assignment_wins(tmp_path):
     p = tmp_path / "r.env"
     p.write_text('REPO="a/one"\nexport REPO="a/two"\nOTHER=x\n')
     assert cli.read_repo_env_field(str(p), "REPO") == "a/two"
+
+
+# ── review M12: shell-semantics reader replaces the regex line-scanner ────────
+# The prior regex (`^FIELD=(.*)$`) silently mis-parsed each of these — the
+# repro table from the review — so resolve_name MISSED an existing overlay
+# and cmd_start synthesized a duplicate with fresh *_STATE_DIRs.
+def test_read_repo_env_field_survives_trailing_comment(tmp_path):
+    p = tmp_path / "r.env"
+    p.write_text('REPO="owner/name"  # prod\n')
+    assert cli.read_repo_env_field(str(p), "REPO") == "owner/name"
+
+
+def test_read_repo_env_field_survives_spaces_around_equals(tmp_path):
+    p = tmp_path / "r.env"
+    p.write_text("REPO = owner/name\n")
+    assert cli.read_repo_env_field(str(p), "REPO") == "owner/name"
+
+
+def test_read_repo_env_field_expands_var_reference(tmp_path):
+    p = tmp_path / "r.env"
+    p.write_text("OWNER_REPO=owner/name\nREPO=${OWNER_REPO}\n")
+    assert cli.read_repo_env_field(str(p), "REPO") == "owner/name"
+
+
+# Anti-vacuity twins: a reader that always returns something regardless of
+# input (or one that leaks the CLI process's own environment) would pass the
+# three tests above for the wrong reason.
+def test_read_repo_env_field_missing_field_is_empty(tmp_path):
+    p = tmp_path / "r.env"
+    p.write_text('OTHER="x"\n')
+    assert cli.read_repo_env_field(str(p), "REPO") == ""
+
+
+def test_read_repo_env_field_missing_file_is_empty():
+    assert cli.read_repo_env_field("/no/such/file.env", "REPO") == ""
+
+
+def test_read_repo_env_field_does_not_leak_ambient_env(tmp_path, monkeypatch):
+    """A field the FILE does not set must read as unset even if the CLI
+    process's own environment happens to carry a same-named var (e.g. an
+    operator's shell that `source`d an overlay by hand) — otherwise
+    resolve_name could match an overlay by accident."""
+    monkeypatch.setenv("REPO", "ambient/leak")
+    p = tmp_path / "r.env"
+    p.write_text('OTHER="x"\n')
+    assert cli.read_repo_env_field(str(p), "REPO") == ""
+
+
+def test_resolve_name_matches_overlay_despite_trailing_comment(tmp_path):
+    (tmp_path / "myapp.env").write_text('REPO="acme/App"  # prod\n')
+    assert cli.resolve_name("acme/App", repos_dir=str(tmp_path)) == "myapp"
+
+
+def test_resolve_name_matches_overlay_with_spaced_equals(tmp_path):
+    (tmp_path / "myapp.env").write_text("REPO = acme/App\n")
+    assert cli.resolve_name("acme/App", repos_dir=str(tmp_path)) == "myapp"
+
+
+def test_resolve_name_matches_overlay_with_var_expansion(tmp_path):
+    (tmp_path / "myapp.env").write_text("OWNER_REPO=acme/App\nREPO=${OWNER_REPO}\n")
+    assert cli.resolve_name("acme/App", repos_dir=str(tmp_path)) == "myapp"
+
+
+def test_resolve_name_warns_before_synthesizing_duplicate(tmp_path, capsys):
+    """M12: an overlay already targets this exact working copy but its REPO
+    field disagrees (rename, or a still-mismatched parse) — resolve_name must
+    warn loudly (stderr) before falling through to derive_name, which would
+    synthesize a SECOND overlay (and a second STATE_DIR) for the same
+    checkout."""
+    (tmp_path / "myapp.env").write_text('REPO="acme/OldName"\nTARGET_DIR="/repos/app"\n')
+    name = cli.resolve_name("acme/NewName", repos_dir=str(tmp_path), target_dir="/repos/app")
+    assert name == cli.derive_name("acme/NewName")  # still falls through to derive_name
+    captured = capsys.readouterr()
+    assert "myapp" in captured.err
+    assert "synthesize" in captured.err.lower()
+
+
+def test_resolve_name_no_warning_when_no_target_dir_collision(tmp_path, capsys):
+    """Anti-vacuity twin: an overlay pointed at a DIFFERENT working copy must
+    not trigger the warning."""
+    (tmp_path / "myapp.env").write_text('REPO="acme/OldName"\nTARGET_DIR="/repos/other"\n')
+    name = cli.resolve_name("acme/NewName", repos_dir=str(tmp_path), target_dir="/repos/app")
+    assert name == cli.derive_name("acme/NewName")
+    captured = capsys.readouterr()
+    assert captured.err == ""
 
 
 def test_resolve_name_explicit_wins(tmp_path):
@@ -261,3 +349,183 @@ def test_parse_test_cmd_missing_marker_is_empty():
 def test_parse_test_cmd_monorepo_composite():
     cmd = "set -e; (cd backend && uv run pytest) && (cd frontend && pnpm exec tsc -b)"
     assert cli._parse_test_cmd_reply(f"TEST_CMD: {cmd}") == cmd
+
+
+# ── review M11: status merges STATE_DIR/REVIEW_STATE_DIR/STEWARD_STATE_DIR ────
+def test_journal_paths_overlay_values_win(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
+    (tmp_path / "myapp.env").write_text(
+        'STATE_DIR="/custom/fix"\n'
+        'REVIEW_STATE_DIR="/custom/review"\n'
+        'STEWARD_STATE_DIR="/custom/steward"\n'
+    )
+    assert cli.journal_paths("myapp") == [
+        "/custom/fix/journal.jsonl",
+        "/custom/review/journal.jsonl",
+        "/custom/steward/journal.jsonl",
+    ]
+
+
+def test_journal_paths_falls_back_to_synth_defaults(tmp_path, monkeypatch):
+    """No overlay at all → the same per-role layout `synth_repo_env` writes."""
+    monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
+    fix, review, steward = cli.journal_paths("other")
+    assert fix.endswith(os.path.join(".local", "state", "issue-agent-other", "journal.jsonl"))
+    assert review.endswith(os.path.join(".local", "state", "review-agent-other", "journal.jsonl"))
+    assert steward.endswith(os.path.join(".local", "state", "steward-agent-other", "journal.jsonl"))
+
+
+def test_journal_path_backcompat_is_the_fix_journal(tmp_path, monkeypatch):
+    """journal_path (singular, back-compat) stays the fix-only journal — same
+    contract tests/adapters/test_journal.py (outside this leg's ownership)
+    already relies on."""
+    monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
+    (tmp_path / "myapp.env").write_text('STATE_DIR="/custom/fix"\n')
+    assert cli.journal_path("myapp") == cli.journal_paths("myapp")[0] == "/custom/fix/journal.jsonl"
+
+
+def _write_jsonl(path: str, *lines: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        for line in lines:
+            f.write(line + "\n")
+
+
+def test_status_merges_all_three_journals_in_global_ts_order(tmp_path):
+    """review M11: a STATE_DIR-only read made review/steward runs, spend
+    blocks, and escalations invisible to `issue-agent status`. Interleaved
+    events across all three files must render as ONE global timeline."""
+    fix_j = str(tmp_path / "fix" / "journal.jsonl")
+    review_j = str(tmp_path / "review" / "journal.jsonl")
+    steward_j = str(tmp_path / "steward" / "journal.jsonl")
+    _write_jsonl(
+        fix_j,
+        json.dumps({"ts": "2026-07-25T10:00:00+00:00", "event": "agent_run",
+                    "kind": "RESOLVE", "number": 1, "cost_usd": 1.0, "status": "ok"}),
+    )
+    _write_jsonl(
+        review_j,
+        json.dumps({"ts": "2026-07-25T10:05:00+00:00", "event": "agent_run",
+                    "kind": "REVIEW", "number": 9, "cost_usd": 2.0, "status": "ok"}),
+        json.dumps({"ts": "2026-07-25T10:06:00+00:00", "event": "spend_block",
+                    "scope": "issue", "issue": 9}),
+    )
+    _write_jsonl(
+        steward_j,
+        json.dumps({"ts": "2026-07-25T10:07:00+00:00", "event": "escalation",
+                    "target": "issue", "number": 3}),
+    )
+    now = datetime(2026, 7, 25, 12, tzinfo=timezone.utc)
+    out = "\n".join(cli.spend_status_lines(
+        [fix_j, review_j, steward_j], str(tmp_path / "ledger.jsonl"), 10.0, lambda: now
+    ))
+    # review/steward events reach the render — the M11 blind spot.
+    assert "REVIEW" in out and "#9" in out
+    assert "1 spend block(s) today" in out
+    assert "1 escalation(s) to needs-human-review in 24h" in out
+    # Global ts order: RESOLVE (10:00, fix) precedes REVIEW (10:05, review) in
+    # the "last runs" listing, matching timestamp order across files, not
+    # per-file read order.
+    assert out.index("RESOLVE") < out.index("REVIEW")
+
+
+def test_status_merge_anti_vacuity_single_populated_journal_unchanged(tmp_path):
+    """With only the fix journal populated (review/steward never ran — their
+    files don't exist), passing the full journal_paths triple must render
+    IDENTICALLY to passing the fix journal alone (pre-M11 behaviour) — a role
+    that never ran must not perturb the output."""
+    fix_j = str(tmp_path / "fix" / "journal.jsonl")
+    _write_jsonl(
+        fix_j,
+        json.dumps({"ts": "2026-07-25T10:00:00+00:00", "event": "agent_run",
+                    "kind": "RESOLVE", "number": 1, "cost_usd": 1.0, "status": "ok"}),
+    )
+    missing_review = str(tmp_path / "review" / "journal.jsonl")
+    missing_steward = str(tmp_path / "steward" / "journal.jsonl")
+    ledger = str(tmp_path / "ledger.jsonl")
+    now = datetime(2026, 7, 25, 12, tzinfo=timezone.utc)
+    out_single = cli.spend_status_lines(fix_j, ledger, 10.0, lambda: now)
+    out_multi = cli.spend_status_lines(
+        [fix_j, missing_review, missing_steward], ledger, 10.0, lambda: now
+    )
+    assert out_single == out_multi
+    assert out_single != []  # sanity: the fixture actually produced output
+
+
+def test_status_merge_agent_run_start_does_not_appear_in_last_runs(tmp_path):
+    """The journal now also carries `agent_run_start` events (wave A's
+    pre-await receipt). The merged 'last runs' listing must only show settled
+    `agent_run` events, never the start half, or an in-flight/never-settled
+    run renders as if it completed."""
+    fix_j = str(tmp_path / "fix" / "journal.jsonl")
+    _write_jsonl(
+        fix_j,
+        json.dumps({"ts": "2026-07-25T10:00:00+00:00", "event": "agent_run_start",
+                    "kind": "RESOLVE", "number": 1}),
+        json.dumps({"ts": "2026-07-25T10:00:05+00:00", "event": "agent_run",
+                    "kind": "RESOLVE", "number": 1, "cost_usd": 1.0, "status": "ok"}),
+    )
+    now = datetime(2026, 7, 25, 12, tzinfo=timezone.utc)
+    out = "\n".join(cli.spend_status_lines(fix_j, str(tmp_path / "ledger.jsonl"), 10.0, lambda: now))
+    assert out.count("RESOLVE") == 1
+
+
+# ── review M12/A4 fold-in: cmd_install_service fails loud on compose failure ──
+def _install_args(tmp_path) -> argparse.Namespace:
+    # Explicit repo/target_dir/name → _resolve_context never shells out to
+    # git/gh; resolve_name(explicit=name) returns immediately.
+    return argparse.Namespace(repo="o/r", target_dir=str(tmp_path), name="myapp", roles=None)
+
+
+def test_install_service_aborts_on_compose_failure(tmp_path, monkeypatch):
+    """A4's out-of-scope report: compose-env.sh ran with check=False and its
+    return code was never inspected — a compose failure proceeded straight to
+    installing the service against a stale/missing config/.active.env."""
+    monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
+    (tmp_path / "myapp.env").write_text('REPO="o/r"\n')
+    shared = tmp_path / "shared.env"
+    shared.write_text("")
+    monkeypatch.setattr(cli, "SHARED_ENV", str(shared))
+
+    calls: list[list[str]] = []
+
+    class _Result:
+        def __init__(self, returncode: int) -> None:
+            self.returncode = returncode
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return _Result(1 if "compose-env.sh" in cmd[1] else 0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    rc = cli.cmd_install_service(_install_args(tmp_path))
+    assert rc != 0
+    assert not any(
+        "install-systemd.sh" in c[1] or "install-launchd.sh" in c[1] for c in calls
+    )
+
+
+def test_install_service_proceeds_on_compose_success(tmp_path, monkeypatch):
+    """Anti-vacuity twin: a successful compose still installs the service."""
+    monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
+    (tmp_path / "myapp.env").write_text('REPO="o/r"\n')
+    shared = tmp_path / "shared.env"
+    shared.write_text("")
+    monkeypatch.setattr(cli, "SHARED_ENV", str(shared))
+
+    calls: list[list[str]] = []
+
+    class _Result:
+        def __init__(self, returncode: int) -> None:
+            self.returncode = returncode
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return _Result(0)
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    rc = cli.cmd_install_service(_install_args(tmp_path))
+    assert rc == 0
+    assert any(
+        "install-systemd.sh" in c[1] or "install-launchd.sh" in c[1] for c in calls
+    )

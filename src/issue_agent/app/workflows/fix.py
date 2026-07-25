@@ -58,6 +58,27 @@ class FixWorkflow:
         self.cfg.log(f"worktree #{issue}: ready on '{branch}' → {cwd}")
         return cwd
 
+    def _prompt_input(self, method: str, *args, **kwargs) -> str:
+        """Best-effort fetch of a prompt INPUT (review M13/D6).
+
+        The two repair legs feed the agent a failed-CI log and the reviewer's
+        inline comments; both are context, not control flow. `GitHubGateway`
+        already fails soft to "", but the workflow must survive a gateway that
+        lacks the method entirely (an injected fake, a legacy adapter) or that
+        raises unexpectedly — M13's contract is that a missing log may never
+        kill the dispatch: the leg still runs, with the weaker prompt the code
+        shipped before the methods existed, and the agent rediscovers the
+        failure itself. The alternative (an AttributeError out of fix_ci) turns
+        a cosmetic gap into a dead repair leg."""
+        fn = getattr(self.gateway, method, None)
+        if fn is None:
+            return ""
+        try:
+            return fn(*args, **kwargs) or ""
+        except Exception as exc:  # noqa: BLE001 — see docstring
+            self.cfg.log(f"prompt input '{method}' unavailable: {exc}")
+            return ""
+
     async def _run_logged(self, label: str, issue: int, task):
         self.cfg.log(f"agent #{issue}: {label} — running")
         result = await self.runner.run(task)
@@ -154,6 +175,12 @@ class FixWorkflow:
         deaths don't count (no attempt was made); blocked / PR-opened outcomes
         don't requeue, so they never reach here."""
         if outcome.infra_death(result.exit_reason):
+            # …but it IS counted against the separate, higher infra ceiling
+            # (review C3/D2c): dying before a result is its own paid loop, and
+            # nothing else bounds it. This is the RETURNED-result twin of
+            # AgentDispatcher.dispatch's bump-on-raise; a leg either raises or
+            # returns, so a single death is counted exactly once.
+            self.store.bump_infra_deaths(issue)
             return
         self.store.set_resolve_retries(issue, self.store.get_resolve_retries(issue) + 1)
 
@@ -195,6 +222,15 @@ class FixWorkflow:
         result = await self.runner.run(task)
         self.store.save_session(issue, result.session_id)
         pr = self.gateway.pr_for_issue(issue)
+        if outcome.infra_death(result.exit_reason):
+            # review C3/D2c, RETURNED-result half. resume_actions deliberately
+            # does NOTHING on an infra death (the reply must not be consumed by
+            # a session that never ran) — so the issue stays ai-working, the
+            # reaper requeues it, and the next poll pays for the same resume
+            # again with no counter moving anywhere. This is the only bound on
+            # that loop. A leg either raises (AgentDispatcher.dispatch bumps) or
+            # returns (here), never both, so a death is counted exactly once.
+            self.store.bump_infra_deaths(issue)
         self.executor.execute_all(outcome.resume_actions(issue, result, pr))
 
     async def address_review(self, pr: int) -> None:
@@ -204,14 +240,29 @@ class FixWorkflow:
         p = self.gateway.get_pr(pr)
         cwd = self._ensure_cwd(issue, p.head_ref_name)
         review_body = self.latest_review_body(p)
+        # The file:line asks reviewers actually make live in the INLINE comments,
+        # not the review body (review M13): dispatching without them rendered an
+        # empty "Inline comments:" header and cost rounds off the 4-rejection
+        # ceiling while the fixer guessed at what was being asked.
+        inline = self._prompt_input("review_comments", pr)
         fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
         task = task_builders.build_address_review_task(
-            pr, review_body, "", cwd, self.store.get_session(issue), self.cfg.fix, fork=fork
+            pr, review_body, inline, cwd, self.store.get_session(issue), self.cfg.fix,
+            fork=fork,
         )
         result = await self.runner.run(task)
         self.store.save_session(issue, result.session_id)
         out = outcome.address_review_actions(pr, result)
         self.executor.execute_all(out.actions)
+        if outcome.infra_death(result.exit_reason):
+            # review C3/D2c, RETURNED-result half. address_review_actions
+            # exempts an external kill from the review-retry ceiling (no attempt
+            # was made) and clears ai-working, so the next poll sees the same
+            # CHANGES_REQUESTED review and pays for the leg again — unbounded
+            # until this counter bounds it. Same key the review-retry counter
+            # uses, so the decide side reads one key per issue. A leg either
+            # raises or returns, so a death is counted exactly once.
+            self.store.bump_infra_deaths(issue)
         if out.bump_retry:
             # Attempt counter keyed to the review being addressed: a count
             # stored under an OLDER review's timestamp restarts at 0 (that
@@ -230,11 +281,17 @@ class FixWorkflow:
         p = self.gateway.get_pr(pr)
         cwd = self._ensure_cwd(issue, p.head_ref_name)
         failed = "\n".join(c.name for c in p.checks if c.bucket == "fail")
+        # Check NAMES alone were all the prompt carried (review M13) — the agent
+        # had to rediscover every failure with `gh api` denied by the governor.
+        # `branch` is passed because the PRView is already in hand: it saves the
+        # gateway a `gh pr view` round-trip it would otherwise make to find the
+        # head branch `gh run list` needs.
+        failed_log = self._prompt_input("failed_run_log", pr, branch=p.head_ref_name)
         mcp_servers = mcp_servers_for_checks(
             self.cfg.fix_mcp_config, [c.name for c in p.checks], self.cfg.harness_root
         )
         task = task_builders.build_fix_ci_task(
-            pr, failed, "", cwd, self.store.get_session(issue), self.cfg.fix,
+            pr, failed, failed_log, cwd, self.store.get_session(issue), self.cfg.fix,
             mcp_servers=mcp_servers,
         )
         result = await self.runner.run(task)
@@ -244,6 +301,10 @@ class FixWorkflow:
         # one PR burned the whole budget on work that never ran).
         if not outcome.infra_death(result.exit_reason):
             self.store.set_ci_retries(issue, self.store.get_ci_retries(issue) + 1)
+        else:
+            # Separate, higher ceiling for the deaths themselves (review C3/D2c)
+            # — same key the CI counter uses, so the decide side reads one key.
+            self.store.bump_infra_deaths(issue)
         self.executor.execute_all(outcome.fix_ci_actions(pr, result))
 
     async def rebase(self, pr: int) -> None:
@@ -260,6 +321,8 @@ class FixWorkflow:
         # Same rule as fix_ci: an infra kill is not a failed rebase attempt.
         if not outcome.infra_death(result.exit_reason):
             self.store.set_rebase_retries(issue, self.store.get_rebase_retries(issue) + 1)
+        else:
+            self.store.bump_infra_deaths(issue)  # review C3/D2c, as in fix_ci
         self.executor.execute_all(outcome.fix_ci_actions(pr, result))
 
     @staticmethod

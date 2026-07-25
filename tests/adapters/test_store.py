@@ -1,8 +1,11 @@
 """Store adapter — path construction + read/write/clear round-trips + markers."""
 
+import inspect
 import os
+import re
 import tempfile
 
+from issue_agent.adapters import store as store_module
 from issue_agent.adapters.store import HarnessMarkers, Store
 
 
@@ -68,13 +71,78 @@ def test_malformed_numeric_state_fails_soft_to_defaults():
         assert f.read() == "1"
 
 
-def test_write_is_atomic_and_leaves_no_tmp_file():
+# review M3/T2: the old `test_write_is_atomic_and_leaves_no_tmp_file` above
+# passed against a truncate-and-write implementation (it only ever checked
+# that one hardcoded, non-pid-suffixed ".tmp" path was absent — a truncating
+# `_write` never creates that path either, so the mutation sailed through).
+# These replace it with tests that actually exercise the crash window and the
+# collision the pid-suffixed tmp name exists to avoid.
+def test_write_leaves_no_tmp_file_after_success():
     s, root = _store()
     s.set_ci_retries(5, 4)
 
     assert s.get_ci_retries(5) == 4
     assert os.path.exists(os.path.join(root, "issue-5.ci-retries"))
-    assert not os.path.exists(os.path.join(root, "issue-5.ci-retries.tmp"))
+    leftover = [f for f in os.listdir(root) if f.endswith(".tmp")]
+    assert leftover == []
+
+
+def test_write_survives_crash_before_replace(monkeypatch):
+    # The honest atomicity test: os.replace fails AFTER the tmp file is fully
+    # written (simulating a kill/power-loss between fsync and rename). The
+    # real state file must still hold the OLD value — never a torn or
+    # zero-length one. A truncate-and-write `_write` has no os.replace call to
+    # fail, so it would silently install the new (wrong-for-this-test) value
+    # and this assertion would catch it.
+    s, _ = _store()
+    s.set_ci_retries(5, 4)
+
+    def _boom(_src, _dst):
+        raise OSError("simulated crash before replace")
+
+    monkeypatch.setattr(os, "replace", _boom)
+    try:
+        s.set_ci_retries(5, 9)
+    except OSError:
+        pass
+    assert s.get_ci_retries(5) == 4
+
+
+def test_write_syncs_tmp_file_before_replace(monkeypatch):
+    # review M3: fsync narrows the crash window a bare os.replace(tmp, path)
+    # leaves open — without it, a torn tmp file (still in the page-cache, not
+    # on disk) could get installed as the real state file by a kill between
+    # write() and replace().
+    s, _ = _store()
+    calls = []
+    real_fsync = os.fsync
+
+    def _tracking_fsync(fd):
+        calls.append(fd)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", _tracking_fsync)
+    s.set_ci_retries(5, 4)
+    assert calls, "Store._write must fsync the tmp file before os.replace"
+    assert s.get_ci_retries(5) == 4
+
+
+def test_tmp_name_is_pid_suffixed(monkeypatch):
+    # review M3: two daemons (fix + review) sharing a STATE_DIR, or a
+    # restarted process racing its predecessor, must not collide on one
+    # shared "<path>.tmp" name and truncate each other's in-flight write.
+    s, _ = _store()
+    seen = {}
+    real_replace = os.replace
+
+    def _capture(src, dst):
+        seen["src"] = src
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", _capture)
+    s.set_ci_retries(5, 4)
+    assert str(os.getpid()) in seen["src"]
+    assert s.get_ci_retries(5) == 4
 
 
 def test_review_retry_pair():
@@ -136,12 +204,24 @@ def test_clear_issue_removes_all():
     s.set_rebase_retries(5, 1)
     s.set_resumed_at(5, "t")
     s.set_phase(5, "authored")
+    s.bump_infra_deaths(5)
     s.clear_issue(5)
     assert not s.has_session(5)
     assert s.get_ci_retries(5) == 0
     assert s.get_resolve_retries(5) == 0  # resolve breaker resets with the issue
     assert s.get_rebase_retries(5) == 0
     assert s.get_phase(5) == ""           # phase cleared on teardown
+    assert s.get_infra_deaths(5) == 0     # review M4/D8: infra-deaths clears too
+
+
+def test_clear_issue_does_not_touch_pr_automerge_marker():
+    # review M4: `automerge` is a PR suffix now — clear_issue must not remove
+    # issue-N.automerge (the drift this fixes: that file was never written by
+    # anything, so removing it was a no-op masquerading as cleanup).
+    s, _ = _store()
+    s.mark_automerge(100)
+    s.clear_issue(9)
+    assert s.automerge_enabled(100) is True
 
 
 def test_resolve_retries_roundtrip():
@@ -155,9 +235,88 @@ def test_clear_pr_review():
     s, _ = _store()
     s.save_pr_session(100, "rs")
     s.set_last_sha(100, "abc")
+    s.mark_automerge(100)
     s.clear_pr_review(100)
     assert s.get_pr_session(100) == ""
     assert s.get_last_sha(100) == ""
+    assert s.automerge_enabled(100) is False  # review M4: the real marker, now cleared
+
+
+# ── suffix-coverage (review M4/D8) ──────────────────────────────────────────
+def _accessor_suffixes(path_method: str) -> set[str]:
+    """Suffix literals Store passes as the 2nd positional arg to `path_method`
+    (issue_path/pr_path) anywhere in its own source. clear_issue/clear_pr_review/
+    clear_issue_resume_state loop over a suffix VARIABLE (from the module
+    constants), never a quoted literal, so they don't inflate this set with
+    themselves — only genuine accessors do."""
+    src = inspect.getsource(Store)
+    pattern = rf'self\.{path_method}\([^,]+,\s*"([\w-]+)"\)'
+    return set(re.findall(pattern, src))
+
+
+def test_every_issue_accessor_suffix_is_covered_by_exactly_one_cleaner():
+    # review M4: a new accessor with an unlisted suffix must fail this test
+    # instead of silently leaking a STATE_DIR file forever (introspects the
+    # module: accessors' suffix strings vs _ISSUE_SUFFIXES).
+    assert _accessor_suffixes("issue_path") == set(store_module._ISSUE_SUFFIXES)
+
+
+def test_every_pr_accessor_suffix_is_covered_by_exactly_one_cleaner():
+    # Same check for the PR namespace — this is what catches the `automerge`
+    # drift: automerge_enabled/mark_automerge use pr_path, so `automerge` must
+    # be in _PR_SUFFIXES (it used to sit, unused, in the issue tuple instead).
+    assert _accessor_suffixes("pr_path") == set(store_module._PR_SUFFIXES)
+
+
+# ── merged/closed-unmerged cleanup orchestration (review M4/D8) ────────────
+def test_cleanup_pr_merged_clears_full_issue_state_and_automerge_marker():
+    s, _ = _store()
+    s.save_session(9, "sess-1")
+    s.set_resolve_retries(9, 3)
+    s.bump_infra_deaths(9)
+    s.mark_automerge(100)
+    s.cleanup_pr(100, 9, merged=True)
+    assert s.get_session(9) == ""
+    assert s.get_resolve_retries(9) == 0
+    assert s.get_infra_deaths(9) == 0
+    assert s.automerge_enabled(100) is False
+
+
+def test_cleanup_pr_closed_unmerged_keeps_resolve_retries_and_infra_deaths():
+    # review M4/D8 + handover §5.7: fewer retries after a human closed the PR
+    # is deliberate — only the resume-blocking markers clear.
+    s, _ = _store()
+    s.save_session(9, "sess-1")
+    s.set_phase(9, "authoring")
+    s.set_resumed_at(9, "t1")
+    s.set_resolve_retries(9, 3)
+    s.bump_infra_deaths(9)
+    s.mark_automerge(100)
+    s.cleanup_pr(100, 9, merged=False)
+    assert s.get_session(9) == ""
+    assert s.get_phase(9) == ""
+    assert s.get_resumed_at(9) == ""
+    # anti-vacuity twin: prove these are KEPT, not "everything got cleared"
+    assert s.get_resolve_retries(9) == 3
+    assert s.get_infra_deaths(9) == 1
+    # closed-unmerged is silent on PR-side state (spec covers issue state only)
+    assert s.automerge_enabled(100) is True
+
+
+def test_cleanup_pr_issueless_merged_only_clears_pr_state():
+    s, _ = _store()
+    s.mark_automerge(100)
+    s.cleanup_pr(100, None, merged=True)
+    assert s.automerge_enabled(100) is False
+
+
+def test_cleanup_pr_issueless_unmerged_is_a_noop():
+    # anti-vacuity twin for the case above: an issueless closed-unmerged PR
+    # has no issue state to clear and cleanup_pr must not crash on None.
+    s, _ = _store()
+    s.mark_automerge(100)
+    s.cleanup_pr(100, None, merged=False)
+    assert s.automerge_enabled(100) is True
 
 
 # ── .harness markers ──

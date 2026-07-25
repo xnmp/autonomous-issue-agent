@@ -19,6 +19,7 @@ from ..adapters.journal import alert, event_line
 from ..domain.actions import (
     Action,
     AddDependency,
+    ClearIssueState,
     CloseIssue,
     EnableAutoMerge,
     UpdateBranch,
@@ -47,6 +48,7 @@ class Executor:
         run_agent: Callable[[RunAgent], None] | None = None,
         log: Callable[[str], None] | None = None,
         mark_automerge: Callable[[int], None] | None = None,
+        clear_issue_state: Callable[[int, int | None, bool], None] | None = None,
         journal=None,
         alert_cmd: str = "",
     ):
@@ -59,6 +61,13 @@ class Executor:
         # production call sites), so should_automerge re-armed every poll —
         # one wasted `gh pr merge --auto` per merge-ready PR per tick.
         self._mark_automerge = mark_automerge or (lambda pr: None)
+        # Retires STATE_DIR files on the ClearIssueState arm (review M4/D8:
+        # Store.clear_issue/clear_pr_review had zero production call sites).
+        # Default no-op keeps tests/other roles' Executors quiet — only the
+        # fix daemon wires this (Store.cleanup_pr).
+        self._clear_issue_state = clear_issue_state or (
+            lambda pr, issue, merged: None
+        )
         # Log EVERY applied action so state changes (label moves, comments, close,
         # auto-merge, worktree removal, agent dispatch) are visible instead of
         # inferred. One funnel = one audit trail. Default no-op keeps tests quiet.
@@ -89,6 +98,10 @@ class Executor:
             return f"link #{action.issue} blocked-by #{action.blocker}"
         if isinstance(action, RemoveWorktree):
             return f"remove worktree for #{action.issue}"
+        if isinstance(action, ClearIssueState):
+            scope = "merged" if action.merged else "closed-unmerged"
+            issue_part = f", issue #{action.issue}" if action.issue is not None else ""
+            return f"clear state for pr #{action.pr}{issue_part} ({scope})"
         if isinstance(action, RunAgent):
             return f"dispatch {action.kind.name} #{action.number}"
         return repr(action)
@@ -133,6 +146,8 @@ class Executor:
             self.gateway.add_blocked_by(action.issue, action.blocker)
         elif isinstance(action, RemoveWorktree):
             self._remove_worktree(action.issue)
+        elif isinstance(action, ClearIssueState):
+            self._clear_issue_state(action.pr, action.issue, action.merged)
         elif isinstance(action, RunAgent):
             self._run_agent(action)
         elif isinstance(action, NoOp):
@@ -141,5 +156,34 @@ class Executor:
             raise TypeError(f"unhandled action: {action!r}")
 
     def execute_all(self, actions) -> None:
+        """Apply every action, even if one raises (review S7): before this, one
+        raising action propagated IMMEDIATELY out of the whole call, so sibling
+        cleanup after it never ran (a failed relabel could strand a worktree
+        RemoveWorktree never reached), and the exception surfaced wherever this
+        batch was awaited — typically a workflow's post-run tail — which read
+        as "the agent run failed" when the run had actually succeeded and only
+        a follow-up write broke. Each failure is now logged loudly (naming the
+        action — misattribution gone) and NOT re-raised: every remaining
+        action still gets its turn, and the caller (e.g.
+        `AgentDispatcher.dispatch`'s tail) sees the batch complete normally
+        instead of unwinding on the first bad write —
+        tests/adapters/test_dispatch.py's mid-dispatch-failure suite (review
+        T3, landed concurrently) pins this: a follow-up relabel failure is now
+        isolated at the ACTION level, not conflated with a pre-result session
+        death (infra-deaths stays untouched; that counter is for the dispatch
+        handler's own outer crash-isolation net, a different failure mode).
+
+        RunAgent never flows through this method today (outcome.py only ever
+        emits Relabel/PostComment/CloseIssue/EnableAutoMerge/RemoveWorktree/
+        ClearIssueState follow-ups here — decide_fix's own RunAgent actions
+        are applied one-at-a-time by Daemon.tick, which already isolates per
+        action)."""
         for action in actions:
-            self.execute(action)
+            try:
+                self.execute(action)
+            except Exception as exc:  # noqa: BLE001 - one bad action must not sink its siblings
+                desc = self._describe(action)
+                msg = f"FAILED: {desc} — {exc!r}; continuing with remaining actions"
+                self._log(msg)
+                if self._journal is not None:
+                    self._journal.emit("action_failed", desc=desc, error=str(exc))

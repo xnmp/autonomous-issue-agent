@@ -126,6 +126,27 @@ def _with_session(state: FixState, issue_number: int, session_id: str) -> FixSta
     return replace(state, sessions=state.sessions | {issue_number})
 
 
+def _after_raised_run(
+    run: RunAgent, state_of_world: WorldState, state: FixState
+) -> tuple[list[Action], FixState]:
+    """The OTHER terminal shape (review C3): the session dies BEFORE
+    `runner.run` returns, so `AgentRunner` raises and the workflow tail never
+    executes — no session saved, no retry counter, no follow-up actions, and the
+    label stays wherever the dispatch relabel left it. The ONLY write is
+    `AgentDispatcher.dispatch`'s bump-then-re-raise, mirrored here.
+
+    Key: the issue behind the work, or the negated PR number when a PR has no
+    resolvable issue — `breaker_key`'s convention, which is what the dispatcher
+    uses (`issue if issue is not None else -action.number`).
+    """
+    key = run.number
+    if run.kind in (AgentKind.ADDRESS_REVIEW, AgentKind.FIX_CI, AgentKind.REBASE):
+        key = fix_domain.breaker_key(_find(state_of_world.prs, run.number))
+    deaths = dict(state.infra_deaths)
+    deaths[key] = deaths.get(key, 0) + 1
+    return [], replace(state, infra_deaths=deaths)
+
+
 def _after_run(
     run: RunAgent, state_of_world: WorldState, state: FixState, cfg: FixConfig
 ) -> tuple[list[Action], FixState]:
@@ -135,7 +156,9 @@ def _after_run(
 
     Each branch mirrors `app/workflows/fix.py` exactly; the anti-loop guarantee
     lives in the pairing of these writes with `decide_fix`'s reads, so any drift
-    between the two is the bug this file exists to catch.
+    between the two is the bug this file exists to catch. It is a HAND-mirror —
+    nothing forces it to stay in step with the workflow, which is why every
+    scenario here has a write-side twin in tests/adapters/test_fix_workflow.py.
     """
     if run.kind is AgentKind.RESOLVE:
         # fix.py resolve(): save_session, bump the resolve counter when the
@@ -228,6 +251,9 @@ class Scenario:
     expect_dispatches: int = 0            # exact PAID sessions over the whole run
     expect_kinds: frozenset = frozenset()  # which legs fired
     cap: int = 0                          # the retry cap that must bound them
+    # The agent dies pre-result (raises) instead of returning an errored result
+    # — the C3 shape, whose tail is `_after_raised_run` rather than `_after_run`.
+    runner_raises: bool = False
 
 
 def simulate(scenario: Scenario, ticks: int = TICKS) -> list[Tick]:
@@ -243,7 +269,11 @@ def simulate(scenario: Scenario, ticks: int = TICKS) -> list[Tick]:
         state_of_world = _apply_relabels(state_of_world, decided)
         dispatches = tuple(a for a in decided if isinstance(a, RunAgent))
         for run in dispatches:
-            followup, state = _after_run(run, state_of_world, state, scenario.cfg)
+            followup, state = (
+                _after_raised_run(run, state_of_world, state)
+                if scenario.runner_raises
+                else _after_run(run, state_of_world, state, scenario.cfg)
+            )
             state_of_world = _apply_relabels(state_of_world, followup)
         trace.append(Tick(tuple(decided), dispatches))
     return trace
@@ -363,6 +393,29 @@ def _resolve_retry_loop() -> Scenario:
     )
 
 
+def _pre_result_death_loop() -> Scenario:
+    """Review C3, as a convergence row. The session dies before returning a
+    result, so `AgentRunner` raises: the workflow tail never runs, the issue is
+    left ai-working, the reaper requeues it to ai-ready, and the poll after that
+    pays for another full session — the observed "one paid session every two
+    polls, forever", with $0.00 on the ledger and every retry breaker reading 0.
+
+    The infra-death counter (bumped by `AgentDispatcher.dispatch` on the raise
+    path) is the ONLY thing that can bound this, because no attempt is ever
+    recorded. Cap 2 here rather than the production default 5 purely to fit the
+    tick budget; the shape is what matters.
+    """
+    return Scenario(
+        name="pre-result-death-loop",
+        world=world(issues=[issue(5, "ai-ready")]),
+        cfg=replace(CFG, max_infra_deaths=2),
+        expect_dispatches=2,
+        expect_kinds=frozenset({AgentKind.RESOLVE}),
+        cap=2,
+        runner_raises=True,
+    )
+
+
 SCENARIOS = [
     pytest.param(_resume_dedup(), id="resume-dedup"),
     pytest.param(_address_review_breaker(), id="address-review-breaker"),
@@ -371,6 +424,7 @@ SCENARIOS = [
     pytest.param(_rebase_breaker(), id="rebase-breaker"),
     pytest.param(_zero_spend_steady_state(), id="zero-spend-steady-state"),
     pytest.param(_resolve_retry_loop(), id="resolve-retry-loop"),
+    pytest.param(_pre_result_death_loop(), id="pre-result-death-loop"),
 ]
 
 
@@ -424,6 +478,17 @@ def test_cleanup_stops_once_its_labels_are_applied():
         if Relabel(Target.PR, 104, Label.AI_PR_OPEN, None) in tick.decided
     ]
     assert cleanup_ticks == [0]
+
+
+def test_pre_result_death_is_unbounded_without_the_infra_ceiling():
+    """Anti-vacuity twin for the pre-result-death row: with the ceiling disabled
+    (MAX_INFRA_DEATHS=0) the SAME frozen world pays for a full session every
+    other tick, forever — dispatch, die, reaper requeues, dispatch. That is the
+    C3 signature, and no other breaker in the file can see it, because a raised
+    run records no attempt anywhere."""
+    scenario = replace(_pre_result_death_loop(), cfg=replace(CFG, max_infra_deaths=0))
+    trace = simulate(scenario)
+    assert sum(len(tick.dispatches) for tick in trace) == TICKS // 2
 
 
 def test_simulator_can_detect_an_unbounded_loop():

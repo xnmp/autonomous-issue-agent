@@ -109,6 +109,30 @@ class RemoveWorktree:
 
 
 @dataclass(frozen=True)
+class ClearIssueState:
+    """Retire STATE_DIR files for a resolved PR (review M4/D8: `Store.clear_issue`
+    /`clear_pr_review` had ZERO production call sites — a closed-unmerged PR
+    requeued its issue while issue-N.session/.phase survived, so the next
+    lifecycle resumed a dead PR's session with a preloaded breaker). Emitted by
+    `domain.fix.cleanup_actions` alongside RemoveWorktree/Relabel, one per PR
+    cleanup, and applied by the Executor through an injected callable — a
+    second Action rather than a flag on RemoveWorktree so existing
+    RemoveWorktree equality assertions elsewhere are undisturbed.
+
+    `merged=True`  → full retirement: all issue state (incl. infra-deaths) AND
+                     the PR's own state (incl. the pr-N.automerge marker).
+    `merged=False` → closed-unmerged requeue: only the resume-blocking markers
+                     on the issue clear; resolve-retries/infra-deaths persist
+                     on purpose (handover §5.7 conservatism).
+    `issue` is None for an issueless PR — only the PR's own state is retired.
+    """
+
+    pr: int
+    issue: int | None
+    merged: bool
+
+
+@dataclass(frozen=True)
 class NoOp:
     reason: str = ""
 
@@ -122,6 +146,7 @@ Action = Union[
     AddDependency,
     RunAgent,
     RemoveWorktree,
+    ClearIssueState,
     NoOp,
 ]
 
@@ -136,6 +161,7 @@ __all__ = [
     "AddDependency",
     "RunAgent",
     "RemoveWorktree",
+    "ClearIssueState",
     "NoOp",
     "Action",
 ]
