@@ -62,6 +62,7 @@ class ReviewRuntimeConfig:
     gate_budget_usd: float
     dimension_budget_usd: float
     validation_budget_usd: float
+    max_unproductive_rounds: int
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,7 @@ class StewardRuntimeConfig:
     triage_prompt: str
     triage_model: str | None
     triage_budget_usd: float
+    max_infra_deaths: int
 
 
 @dataclass(frozen=True)
@@ -155,6 +157,13 @@ class HarnessConfig:
     # 0 disables (wave P0-B wires the counter; this field/knob lands now so the
     # config surface is stable for that wave).
     max_infra_deaths: int = 5
+    # Reviewer twin of max_infra_deaths (re-review P0R-3). Counts paid review
+    # rounds that advanced NOTHING — a session that died pre-result, but also a
+    # fan-out whose synthesis returned None, a failed submit POST, or an errored
+    # gate. Those returned-result stalls never touch the raise path, so before
+    # this the multi-mode fan-out (gate + dimensions + validators) re-ran every
+    # poll, forever, on a PR nobody was waiting on. 0 disables.
+    max_unproductive_review_rounds: int = 5
     review_trigger_label: str = "ai-pr-open"
     fix_model: str | None = None
     review_model: str | None = None
@@ -346,6 +355,7 @@ class HarnessConfig:
             gate_budget_usd=self.review_gate_budget_usd,
             dimension_budget_usd=self.review_dimension_budget_usd,
             validation_budget_usd=self.review_validation_budget_usd,
+            max_unproductive_rounds=self.max_unproductive_review_rounds,
         )
 
     @property
@@ -358,6 +368,7 @@ class HarnessConfig:
             triage_prompt=self.triage_prompt,
             triage_model=self.steward_triage_model,
             triage_budget_usd=self.triage_budget_usd,
+            max_infra_deaths=self.max_infra_deaths,
         )
 
     @property
@@ -405,6 +416,9 @@ class HarnessConfig:
         _require_non_negative(errors, "MAX_REBASE_RETRIES", self.max_rebase_retries)
         _require_non_negative(errors, "MAX_RESOLVE_RETRIES", self.max_resolve_retries)
         _require_non_negative(errors, "MAX_INFRA_DEATHS", self.max_infra_deaths)
+        _require_non_negative(
+            errors, "MAX_UNPRODUCTIVE_REVIEW_ROUNDS", self.max_unproductive_review_rounds
+        )
         if not (self.repo or "").strip():
             # Fail LOUD at startup, not with an opaque gh error on the first
             # poll: an empty REPO means a missing/mis-composed overlay (the
@@ -646,6 +660,10 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         ),
         max_ci_retries=_coerce_int(e, "MAX_CI_RETRIES", _dc_default("max_ci_retries"), errors),
         max_infra_deaths=_coerce_int(e, "MAX_INFRA_DEATHS", _dc_default("max_infra_deaths"), errors),
+        max_unproductive_review_rounds=_coerce_int(
+            e, "MAX_UNPRODUCTIVE_REVIEW_ROUNDS",
+            _dc_default("max_unproductive_review_rounds"), errors,
+        ),
         max_review_rejections=_coerce_int(
             e, "REVIEW_MAX_REJECTIONS", _dc_default("max_review_rejections"), errors
         ),

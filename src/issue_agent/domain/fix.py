@@ -221,16 +221,38 @@ def should_update_branch(pr: PRView, cfg: FixConfig) -> bool:
 
 def reap_actions(world: WorldState) -> list[Action]:
     """When no fixer is alive, an ISSUE still ai-working is orphaned (the run
-    died before resetting the label) → requeue it to ai-ready. Port of
-    watcher-lib.sh:reap.
+    died before resetting the label) → requeue it. Port of watcher-lib.sh:reap.
+
+    Where it requeues TO depends on ground truth, not on how the run died
+    (re-review P0R-5): an issue that ALREADY HAS AN OPEN PR is repaired to
+    ai-pr-open, never to ai-ready. Requeueing such an issue sends it back
+    through RESOLVE, which opens a SECOND PR for work that is already up — and
+    because the resolve leg has no counter on its success path, nothing bounds
+    the repeat. Reproduced: with the follow-up `ai-working → ai-pr-open` relabel
+    failing (a renamed label, a 403, or a crash between the PR opening and the
+    relabel — and since review S7 that failure is swallowed per-action), the
+    reaper requeued every other poll and the harness paid for a full RESOLVE
+    session each time, with `resolve_retries` and `infra_deaths` both reading 0.
+    Repairing instead of requeueing removes the loop at its source: the label is
+    re-derived from the world, so the same tick that observes the PR fixes the
+    label, and the PR legs (address-review / fix-ci / rebase) take over.
 
     The PR arm is GONE (review M22/D9): the SDK port never adds ai-working to a
     PR, so `prs_with(AI_WORKING)` was permanently empty — a reaper arm that
     looked like protection for a busy-marker that does not exist. If a PR-side
     busy marker is ever reintroduced (P2 parallel dispatch), restore this arm
     WITH the code that adds the label, not before."""
+    # Issues with an OPEN PR pointing at them. Deliberately NOT filtered by
+    # author: whoever opened it, a second PR for the same issue is the harm.
+    with_open_pr = {
+        n for pr in world.prs if pr.state == "OPEN"
+        and (n := _issue_for_pr(pr)) is not None
+    }
     return [
-        Relabel(Target.ISSUE, issue.number, Label.AI_WORKING, Label.AI_READY)
+        Relabel(
+            Target.ISSUE, issue.number, Label.AI_WORKING,
+            Label.AI_PR_OPEN if issue.number in with_open_pr else Label.AI_READY,
+        )
         for issue in world.issues_with(Label.AI_WORKING)
     ]
 

@@ -766,6 +766,54 @@ def test_reap_ignores_prs_entirely():
     ]
 
 
+# re-review P0R-5: the reaper must never send an issue that ALREADY has an open
+# PR back through RESOLVE — that opens a second PR for work already up, and the
+# resolve leg has no counter on its success path, so nothing bounds the repeat.
+def test_reap_repairs_to_pr_open_when_the_issue_already_has_an_open_pr():
+    w = world(issues=[issue(8, "ai-working")], prs=[pr(50, "ai-pr-open", closing_issue=8)])
+    assert reap_actions(w) == [
+        Relabel(Target.ISSUE, 8, Label.AI_WORKING, Label.AI_PR_OPEN)
+    ]
+
+
+def test_reap_repairs_via_branch_linkage_not_just_closing_ref():
+    # The PR that a died-before-relabel session opened often has no closing-ref
+    # yet (the body edit is a separate call), so branch linkage is the case that
+    # actually fires in the incident this guards.
+    w = world(issues=[issue(8, "ai-working")], prs=[pr(50, head_ref_name="fix/8-thing")])
+    assert reap_actions(w) == [
+        Relabel(Target.ISSUE, 8, Label.AI_WORKING, Label.AI_PR_OPEN)
+    ]
+
+
+def test_reap_still_requeues_when_the_issues_pr_is_closed():
+    # Anti-vacuity twin: a CLOSED PR is not work-already-up, so ai-ready remains
+    # correct — otherwise this "fix" would strand every issue whose PR a human
+    # closed.
+    w = world(
+        issues=[issue(8, "ai-working")],
+        prs=[pr(50, closing_issue=8, state="CLOSED")],
+    )
+    assert reap_actions(w) == [
+        Relabel(Target.ISSUE, 8, Label.AI_WORKING, Label.AI_READY)
+    ]
+
+
+def test_reap_does_not_pay_for_a_second_resolve_when_the_relabel_keeps_failing():
+    # The loop the re-review reproduced, at the decide level: an issue whose
+    # ai-working → ai-pr-open follow-up never landed (swallowed write) is
+    # observed with an open PR. Before P0R-5 this world requeued to ai-ready and
+    # the NEXT poll dispatched a full paid RESOLVE. Assert on the money: no
+    # RunAgent for issue 8 anywhere in the poll.
+    w = world(
+        issues=[issue(8, "ai-working")],
+        prs=[pr(50, "ai-pr-open", closing_issue=8, checks=(Check("unit", bucket="pass"),))],
+    )
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+    assert Relabel(Target.ISSUE, 8, Label.AI_WORKING, Label.AI_PR_OPEN) in actions
+    assert not [a for a in actions if isinstance(a, RunAgent) and a.number == 8]
+
+
 # ── cleanup (merge close + re-queue) ────────────────────────────────────────────
 def test_cleanup_merged_closes_issue():
     p = pr(100, "ai-pr-open", state="MERGED", head_ref_name="fix/9-x")

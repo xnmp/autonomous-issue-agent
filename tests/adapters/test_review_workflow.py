@@ -515,3 +515,149 @@ def test_multi_re_review_at_ceiling_escalates():
     assert any(c[0] == "review" and c[2] == "COMMENT" for c in gw.calls)
     assert ("relabel", "pr", 100, "ai-pr-open", "needs-human-review") in gw.calls
     assert store.rounds[100] == 5
+
+
+# ── the no-progress counter (review P0R-3) ────────────────────────────────────
+# Every `return` above that skips save_pr_session/set_last_sha leaves
+# `needs_initial_review`/`needs_re_review` True, so the IDENTICAL dispatch is
+# bought again next poll — under MULTI that is a gate + 5 dimensions + N
+# validators re-run on a RESULT the workflow chose not to use. None of them
+# raise, so the dispatcher's `except BaseException` bump never sees them. These
+# pin the write half of the ceiling: the read half lives in
+# tests/adapters/test_roles.py, which drives it through decide_review.
+def _counter(store, pr_number=100, issue=None):
+    """The counter under the key the dispatcher's death bump would use."""
+    return store.get_infra_deaths(issue if issue is not None else -pr_number)
+
+
+def _bumps(store) -> int:
+    return sum(store.infra_deaths.values())
+
+
+def test_a_healthy_review_counts_no_unproductive_round():
+    """Anti-vacuity, and the one that matters most: a counter that ticks on the
+    happy path escalates every PR the reviewer ever succeeds on."""
+    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="abc", title="t", body="b")})
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(is_error=False, session_id="rs",
+                                    structured={"decision": "APPROVE", "body": "lgtm"}))
+
+    asyncio.run(_workflow(gw, store, runner).review(100))
+
+    assert _bumps(store) == 0
+
+
+def test_a_healthy_multi_review_counts_no_unproductive_round():
+    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="abc", title="t", body="b")})
+    store = FakeStore()
+    runner = SchemaRunner(gate=_gate(), dimension=lambda t: _dim([]),
+                          validation=lambda t: _val(True))
+
+    asyncio.run(_workflow(gw, store, runner, review_mode=ReviewMode.MULTI).review(100))
+
+    assert any(c[0] == "review" and c[2] == "APPROVE" for c in gw.calls)
+    assert _bumps(store) == 0
+
+
+def test_an_errored_review_counts_one_unproductive_round():
+    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="abc")})
+    store = FakeStore()
+
+    asyncio.run(_workflow(gw, store, FakeRunner(AgentResult(is_error=True))).review(100))
+
+    assert _counter(store) == 1
+    assert _bumps(store) == 1  # exactly one — no second key was written
+
+
+def test_a_failed_review_post_counts_one_unproductive_round():
+    """Money-identical to an agent error: the verdict exists but nothing
+    persists, so the whole session is bought again next poll."""
+    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="abc")}, submit_ok=False)
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(is_error=False, session_id="rs",
+                                    structured={"decision": "APPROVE", "body": "lgtm"}))
+
+    asyncio.run(_workflow(gw, store, runner).review(100))
+
+    assert 100 not in store.pr_sessions and _counter(store) == 1
+
+
+def test_an_errored_re_review_counts_one_unproductive_round():
+    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="def")})
+    store = FakeStore()
+    store.save_pr_session(100, "rs")
+    store.set_last_sha(100, "abc")
+
+    asyncio.run(_workflow(gw, store, FakeRunner(AgentResult(is_error=True))).re_review(100))
+
+    assert store.last_sha[100] == "abc" and _counter(store) == 1
+
+
+def test_a_multi_review_gate_error_counts_one_unproductive_round():
+    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="abc", title="t", body="b")})
+    store = FakeStore()
+    runner = SchemaRunner(gate=AgentResult(is_error=True))
+
+    asyncio.run(_workflow(gw, store, runner, review_mode=ReviewMode.MULTI).review(100))
+
+    assert _counter(store) == 1
+
+
+def test_a_multi_fanout_that_synthesises_nothing_counts_one_unproductive_round():
+    """The headline P0R-3 shape: the gate SUCCEEDS, the dimension legs die,
+    `synthesize_review` returns None and the workflow returns — a RETURNED
+    result, so nothing on the raise path ever sees it, and the entire fan-out
+    re-runs every poll."""
+    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="abc", title="t", body="b")})
+    store = FakeStore()
+    runner = SchemaRunner(gate=_gate(), dimension=lambda t: AgentResult(is_error=True),
+                          validation=lambda t: _val(True))
+
+    asyncio.run(_workflow(gw, store, runner, review_mode=ReviewMode.MULTI).review(100))
+
+    assert gw.calls == [], "nothing was submitted — the round bought nothing"
+    assert _counter(store) == 1
+
+
+def test_a_multi_leg_that_raises_is_counted_by_the_workflow_not_the_dispatcher():
+    """`_gather_legs` coerces a raised leg to an errored result, so the raise
+    NEVER reaches `AgentDispatcher.dispatch`'s counter — the workflow returns
+    normally. Without this bump that death is bounded by nothing at all."""
+    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="abc", title="t", body="b")})
+    store = FakeStore()
+
+    def dim(_task):
+        raise RuntimeError("stream closed before any result")
+
+    runner = SchemaRunner(gate=_gate(), dimension=dim, validation=lambda t: _val(True))
+
+    asyncio.run(_workflow(gw, store, runner, review_mode=ReviewMode.MULTI).review(100))
+
+    assert _counter(store) == 1
+
+
+def test_the_counter_key_is_the_linked_issue_when_the_pr_has_one():
+    """Key agreement with `AgentDispatcher.dispatch`, which bumps under
+    `gateway.issue_for_pr(pr)`. A disagreement here reproduces PR #112: the
+    write lands under one key and the ceiling reads another, forever."""
+    pr = PRView(100, head_ref_oid="abc", head_ref_name="fix/42-x", closing_issue=42)
+    gw = FakeGateway(prs={100: pr})
+    store = FakeStore()
+
+    asyncio.run(_workflow(gw, store, FakeRunner(AgentResult(is_error=True))).review(100))
+
+    assert store.infra_deaths == {42: 1}
+    assert gw.issue_for_pr(100) == 42  # the key the dispatcher would have used
+
+
+def test_rounds_accumulate_across_polls():
+    """One counter, many polls: the ceiling is only a ceiling if the count
+    survives the poll that produced it."""
+    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="abc")})
+    store = FakeStore()
+    wf = _workflow(gw, store, FakeRunner(AgentResult(is_error=True)))
+
+    for _ in range(3):
+        asyncio.run(wf.review(100))
+
+    assert _counter(store) == 3

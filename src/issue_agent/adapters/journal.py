@@ -33,6 +33,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -136,12 +137,22 @@ def alert(cmd: str, event_json: str) -> None:
 class RunContext:
     """Which dispatch a run belongs to. Set once per dispatch; a multi-leg review
     (gate → dimensions → validation) emits one `agent_run` per leg all carrying
-    the SAME context, which is per-leg cost attribution for free."""
+    the SAME context, which is per-leg cost attribution for free.
+
+    `dispatch_id` is what makes those legs identifiable AS one dispatch. Minted
+    here rather than passed in, so no call site has to thread it: the dispatcher
+    already calls `set_context` exactly once per dispatch, which is the same
+    boundary. Without it, "how many dispatches never settled?" is unanswerable —
+    a daemon killed mid-fan-out leaves six unsettled starts for ONE dead review,
+    and a ceiling of five would hand the PR to a human after a single
+    `systemctl restart` (see `unsettled_starts`).
+    """
 
     role: str = ""
     kind: str = ""
     number: int = 0
     issue: int | None = None
+    dispatch_id: str = ""
 
 
 class JournalingRuntime:
@@ -172,8 +183,16 @@ class JournalingRuntime:
         """Called by the dispatcher immediately before it hands off to a handler.
         Mutable state on purpose: threading a context through every workflow
         signature would touch a dozen call sites to carry a field only the
-        journal reads."""
-        self.context = RunContext(role=role, kind=kind, number=number, issue=issue)
+        journal reads.
+
+        Each call mints a fresh `dispatch_id`; every leg the handler runs
+        inherits it. Random rather than sequential because the counter's whole
+        purpose is surviving a process death, and a per-process sequence
+        restarts at 0 with the daemon."""
+        self.context = RunContext(
+            role=role, kind=kind, number=number, issue=issue,
+            dispatch_id=uuid.uuid4().hex[:12],
+        )
 
     def __getattr__(self, name: str):
         """Delegate anything this decorator does not define to the wrapped
@@ -247,6 +266,7 @@ class JournalingRuntime:
                 kind=ctx.kind,
                 number=ctx.number,
                 issue=ctx.issue,
+                dispatch=ctx.dispatch_id,
                 model=task.model or "",
             )
         except Exception as exc:  # noqa: BLE001 — never fail a run over its receipt
@@ -264,6 +284,7 @@ class JournalingRuntime:
                 kind=ctx.kind,
                 number=ctx.number,
                 issue=ctx.issue,
+                dispatch=ctx.dispatch_id,
                 model=task.model or "",
                 duration_s=round(duration_s, 1),
                 cost_usd=cost,
@@ -293,15 +314,7 @@ def _usage(raw) -> dict | None:
 
 
 # ── readers (pure over the file's bytes; tolerate a truncated tail) ───────────
-def read_events(path: str) -> list[dict]:
-    """Every parseable JSON object in `path`, oldest first. A missing file is an
-    empty history, not an error — the first status check runs before any daemon
-    has written a line."""
-    try:
-        with open(path, encoding="utf-8") as fh:
-            lines = fh.readlines()
-    except OSError:
-        return []
+def _parse_lines(lines) -> list[dict]:
     events: list[dict] = []
     for line in lines:
         line = line.strip()
@@ -314,6 +327,147 @@ def read_events(path: str) -> list[dict]:
         if isinstance(obj, dict):
             events.append(obj)
     return events
+
+
+def read_events(path: str) -> list[dict]:
+    """Every parseable JSON object in `path`, oldest first. A missing file is an
+    empty history, not an error — the first status check runs before any daemon
+    has written a line."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return []
+    return _parse_lines(lines)
+
+
+# How much journal tail a per-poll reader looks at. 1 MiB is ~3-4k events (a
+# settled `agent_run` line is ~300 bytes) — days of a busy daemon — and it is
+# read on EVERY poll, so the cost of the scan must not grow with the age of the
+# install. Bytes rather than lines because a byte offset is one `seek`, whereas
+# "the last N lines" of a growing file is a full read.
+_TAIL_BYTES = 1 << 20
+
+
+def read_events_tail(path: str, max_bytes: int = _TAIL_BYTES) -> list[dict]:
+    """`read_events` over at most the LAST `max_bytes` of the file.
+
+    For the readers that run on the poll loop rather than on an operator's
+    `status` command. The first line of the window is dropped whenever the
+    window did not start at byte 0, because a mid-line seek would otherwise hand
+    the parser a truncated object — the same tolerance rule as a killed writer's
+    torn tail, applied to the read side.
+    """
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            start = max(0, fh.tell() - max(0, max_bytes))
+            fh.seek(start)
+            blob = fh.read()
+    except OSError:
+        return []
+    text = blob.decode("utf-8", errors="replace")
+    if start > 0:
+        _, _, text = text.partition("\n")  # discard the partial leading line
+    return _parse_lines(text.splitlines())
+
+
+def death_key(event: dict) -> int | None:
+    """The `infra-deaths` counter key an event's dispatch would have been
+    charged to, or None if the event names no usable target.
+
+    Mirrors `AgentDispatcher.dispatch`'s `key = issue if issue is not None else
+    -action.number` exactly — including `domain.fix.breaker_key`'s negated-PR
+    convention for a PR with no resolvable issue — because the whole point of
+    `unsettled_starts` is to feed the SAME per-key ceiling the surviving-process
+    bump feeds. Duplicated as a convention (a one-line formula) rather than
+    imported: adapters must not depend on app.
+    """
+    issue = _int(event.get("issue"))
+    if issue is not None:
+        return issue
+    number = _int(event.get("number"))
+    return None if number is None else -number
+
+
+def unsettled_starts(
+    events, window_s: float = 86400.0, now_fn=_now
+) -> dict[int, int]:
+    """Paid agent runs that never reached ANY settlement, per `death_key`.
+
+    Review P0R-4: every place that counts a dead session requires the daemon to
+    survive that session. A SIGKILL, an OOM kill or a `systemctl restart`
+    mid-`await` leaves an `agent_run_start` and nothing else — no settled line,
+    no ledger line, no counter — while systemd's `Restart=always` brings the
+    daemon back to re-dispatch the very same work. One full paid session per
+    (RestartSec + session length), forever, invisible to every breaker. This is
+    the read that makes those deaths countable WITHOUT adding a write on the
+    death path (there is no such write to add: the process is already gone).
+
+    **Matching rule.** Group by `dispatch` — the id `set_context` mints once per
+    dispatch and every leg inherits — and count a group as ONE death when it has
+    more starts than settled runs. Then, for pre-`dispatch` journals, fall back
+    to grouping by `(kind, number)` and counting `starts - settled`, floored at
+    zero.
+
+    Two decisions, both of which cost real money to get wrong:
+
+      * **A dispatch, not a leg.** A `REVIEW_MODE=multi` dispatch fans 8+ legs
+        out under one context. Counting legs would charge one `systemctl
+        restart` mid-review as six deaths — a ceiling of five, tuned for "the
+        session keeps dying", tripped by a single routine restart. FAILURE-MODES
+        #58 is explicit that a machine under memory pressure must not walk
+        healthy work to a human.
+      * **Counting, not positional pairing.** Those legs settle in arbitrary
+        order, so "a start with no settled event before the next start" reports
+        7 phantom deaths for every healthy multi-agent review. Counting is
+        order-free and answers the only question that matters: is this dispatch
+        still owed a settlement?
+
+    Consequences worth stating, all of which the tests pin:
+      * the RAISE path (a pre-result transport death the process SURVIVED) emits
+        a settled `transport_death` line, so it nets to zero here and is counted
+        exactly once — by the dispatcher's store bump, not twice;
+      * a window edge that cuts a start off from its settlement can only make
+        the count NEGATIVE, and negatives floor at zero, so the bound can
+        under-report but never invent a death.
+
+    `window_s<=0` scans every event given. The default 24h matches the horizon
+    an operator debugs over; older deaths are already spent money and their
+    counter file, if the process lived to write one, persists anyway.
+    """
+    scoped = events_within(events, window_s, now_fn) if window_s > 0 else list(events)
+    starts: dict[tuple, list[dict]] = {}
+    settled: dict[tuple, int] = {}
+    for e in scoped:
+        event = e.get("event")
+        if event not in ("agent_run_start", "agent_run"):
+            continue
+        dispatch = str(e.get("dispatch") or "")
+        key = (
+            ("dispatch", dispatch) if dispatch
+            else ("context", str(e.get("kind", "")), _int(e.get("number")))
+        )
+        if event == "agent_run_start":
+            starts.setdefault(key, []).append(e)
+        else:
+            settled[key] = settled.get(key, 0) + 1
+    out: dict[int, int] = {}
+    for key, start_events in starts.items():
+        if key[0] == "dispatch":
+            missing = 1 if len(start_events) > settled.get(key, 0) else 0
+        else:
+            missing = len(start_events) - settled.get(key, 0)
+        if missing <= 0:
+            continue
+        # Attribute to the MOST RECENT unsettled starts: when a key's context
+        # changed (a PR whose closing-ref appeared between runs), the newest
+        # events describe the dispatch the next poll will repeat.
+        for e in start_events[-missing:]:
+            k = death_key(e)
+            if k is not None:
+                out[k] = out.get(k, 0) + 1
+    return out
 
 
 def parse_ts(value) -> datetime | None:
@@ -436,13 +590,16 @@ __all__ = [
     "JournalingRuntime",
     "RunContext",
     "alert",
+    "death_key",
     "default_ledger_path",
     "event_line",
     "events_within",
     "parse_ts",
     "read_events",
+    "read_events_tail",
     "recent_runs",
     "repeated_dispatch_warning",
     "sum_issue",
     "sum_today",
+    "unsettled_starts",
 ]

@@ -1,8 +1,10 @@
 """Review-watcher decision behaviour."""
 
+from dataclasses import replace
+
 from builders import pr, world
 
-from issue_agent.domain.actions import AgentKind, Relabel, RunAgent, Target
+from issue_agent.domain.actions import AgentKind, PostComment, Relabel, RunAgent, Target
 from issue_agent.domain.labels import Label
 from issue_agent.domain.review import (
     Finding,
@@ -17,6 +19,8 @@ from issue_agent.domain.review import (
     parse_findings,
     review_submission,
     synthesize_review,
+    unproductive_ceiling_hit,
+    unproductive_escalation_reason,
 )
 from builders import Review
 
@@ -176,6 +180,118 @@ def test_needs_helpers():
     st = ReviewState(sessions=frozenset({100}), last_sha={100: "abc"})
     assert needs_initial_review(p, st) is False
     assert needs_re_review(p, st) is False
+
+
+# ── unproductive-round ceiling (review P0R-3) ─────────────────────────────────
+# The reviewer used to have NO ceiling of any kind: one RunAgent per eligible PR
+# per poll, no `consumed` gate, no breaker read. A PR whose review never
+# persists state (session dies pre-result, agent errors, MULTI fan-out
+# synthesises nothing) was re-dispatched at full cost every poll, forever.
+CAPPED = ReviewConfig(review_bot="review-bot", max_unproductive_rounds=3)
+
+
+def _state(pr_number, rounds, **kw):
+    return ReviewState(unproductive_rounds={pr_number: rounds}, **kw)
+
+
+def test_below_the_ceiling_the_review_still_dispatches():
+    """Anti-vacuity FIRST: a ceiling that fires early is a reviewer that never
+    reviews. Two dead rounds out of three still buys the third."""
+    p = pr(100, "ai-pr-open", head_ref_oid="abc")
+    acts = decide_review(world(prs=[p]), CAPPED, _state(100, 2))
+    assert acts == [RunAgent(AgentKind.REVIEW, 100)]
+
+
+def test_at_the_ceiling_the_dispatch_is_withheld_and_the_pr_escalates():
+    p = pr(100, "ai-pr-open", head_ref_oid="abc")
+    acts = decide_review(world(prs=[p]), CAPPED, _state(100, 3))
+    # Set equality, not membership (review §5): the ONLY thing this poll may emit
+    # is the human handoff — no RunAgent hiding beside it.
+    assert acts == [
+        PostComment(Target.PR, 100, "**Circuit breaker:** "
+                    + unproductive_escalation_reason(3) + " Escalating to a human."),
+        Relabel(Target.PR, 100, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW),
+    ]
+
+
+def test_the_ceiling_also_stops_a_re_review_loop():
+    """A PR that was reviewed once and then advances its SHA re-enters through
+    `needs_re_review` — a second, equally unbounded entrance."""
+    p = pr(100, "ai-pr-open", head_ref_oid="def")
+    st = ReviewState(sessions=frozenset({100}), last_sha={100: "abc"},
+                     unproductive_rounds={100: 3})
+    acts = decide_review(world(prs=[p]), CAPPED, st)
+    assert not any(isinstance(a, RunAgent) for a in acts)
+    assert Relabel(Target.PR, 100, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW) in acts
+
+
+def test_escalation_is_edge_triggered_on_the_needs_human_review_label():
+    """P1R-2's shape, pre-empted: a PR already handed to a human emits NOTHING.
+    Without this a stuck relabel converts one paid loop into a comment loop —
+    one 'Circuit breaker' comment + one ALERT_CMD run per poll, ~4,300/day."""
+    p = pr(100, "ai-pr-open", "needs-human-review", head_ref_oid="abc")
+    assert decide_review(world(prs=[p]), CAPPED, _state(100, 3)) == []
+
+
+def test_a_ceiling_of_zero_disables_the_breaker():
+    """cap<=0 disables, like every other breaker in the harness."""
+    cfg = ReviewConfig(review_bot="review-bot", max_unproductive_rounds=0)
+    p = pr(100, "ai-pr-open", head_ref_oid="abc")
+    assert decide_review(world(prs=[p]), cfg, _state(100, 99)) == [
+        RunAgent(AgentKind.REVIEW, 100)
+    ]
+
+
+def test_the_ceiling_is_per_pr_and_does_not_leak_across_prs():
+    a = pr(100, "ai-pr-open", head_ref_oid="abc")
+    b = pr(101, "ai-pr-open", head_ref_oid="abc")
+    acts = decide_review(world(prs=[a, b]), CAPPED, _state(100, 3))
+    assert RunAgent(AgentKind.REVIEW, 101) in acts
+    assert RunAgent(AgentKind.REVIEW, 100) not in acts
+
+
+def test_default_ceiling_is_armed_without_any_configuration():
+    """The default MUST be a finite number. A ReviewConfig built with no ceiling
+    argument is what every existing caller constructs, and 'unset' meaning
+    'unbounded' is exactly the state P0R-3 describes."""
+    assert ReviewConfig(review_bot="r").max_unproductive_rounds == 5
+    p = pr(100, "ai-pr-open", head_ref_oid="abc")
+    st = _state(100, 5)
+    assert not any(
+        isinstance(a, RunAgent)
+        for a in decide_review(world(prs=[p]), ReviewConfig(review_bot="r"), st)
+    )
+
+
+def test_adoption_is_a_second_entrance_and_is_bounded_too():
+    """A rogue PR is adopted AND reviewed the same tick, so the adoption arm
+    needs the same guard — otherwise the ceiling just moves the loop."""
+    p = pr(200, head_ref_oid="abc", author="human")
+    assert decide_review(world(prs=[p]), replace(ADOPT, max_unproductive_rounds=3),
+                         _state(200, 3)) == []
+    # anti-vacuity: below the cap the rogue PR is still adopted and reviewed.
+    acts = decide_review(world(prs=[p]), replace(ADOPT, max_unproductive_rounds=3),
+                         _state(200, 2))
+    assert Relabel(Target.PR, 200, None, Label.AI_PR_OPEN) in acts
+    assert RunAgent(AgentKind.REVIEW, 200) in acts
+
+
+def test_an_escalated_pr_is_not_re_adopted_into_the_loop():
+    """The escalation swaps the trigger label for needs-human-review, which
+    drops the PR out of `prs_with(trigger_label)` — straight into the adoption
+    sweep. Without the needs-human-review exclusion, an adopting deployment
+    re-labels and re-dispatches the escalated PR on the very next poll and the
+    ceiling buys nothing at all."""
+    escalated = pr(200, "needs-human-review", head_ref_oid="abc", author="human")
+    assert decide_review(world(prs=[escalated]), ADOPT, ReviewState()) == []
+
+
+def test_unproductive_ceiling_hit_is_the_shared_breaker_primitive():
+    cfg = ReviewConfig(review_bot="r", max_unproductive_rounds=2)
+    assert unproductive_ceiling_hit(_state(1, 1), cfg, 1) is False
+    assert unproductive_ceiling_hit(_state(1, 2), cfg, 1) is True
+    assert unproductive_ceiling_hit(_state(1, 9), cfg, 1) is True
+    assert unproductive_ceiling_hit(ReviewState(), cfg, 1) is False  # unknown PR = 0
 
 
 # ── count_prior_rejections: the ceiling counts rejections, not pushes ─────────

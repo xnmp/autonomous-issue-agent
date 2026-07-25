@@ -14,6 +14,7 @@ from ...domain import review as review_dom
 from ..planners import tasks as task_builders
 from ..planners.tasks import ReviewTaskConfig
 from ...domain.agent_task import AgentRuntime
+from ...domain.fix import breaker_key
 from ...domain.labels import Label
 from ...domain.lifecycle import pr_escalation
 from ...domain.outcome import AgentResult
@@ -74,6 +75,34 @@ class ReviewWorkflow:
             pr_escalation(pr, reason, from_label=self._trigger_label()).actions()
         )
 
+    def _no_progress(self, pr, reason: str) -> None:
+        """Record that a PAID review round advanced nothing (review P0R-3).
+
+        Every `return` in this class that skips `save_pr_session`/`set_last_sha`
+        leaves `needs_initial_review`/`needs_re_review` True, so the identical
+        dispatch is bought again on the next poll — under REVIEW_MODE=multi that
+        is a gate + 5 dimensions + N validators, re-run every poll on a RESULT
+        the workflow chose not to use. Nothing counted those rounds: the
+        dispatcher's `except BaseException` bump only fires when the leg RAISED
+        out of the workflow, and these paths all return normally.
+
+        Written under `breaker_key(pr)` — the same counter the dispatcher's
+        death bump uses, and `app.roles._review_state` reads the union of that
+        key and `-pr.number`, so writer and reader agree whichever branch each
+        took. `pr` is the PRView (not the number) so the key is derived purely,
+        with no extra gh call on a path that is already a failure.
+        """
+        key = breaker_key(pr)
+        try:
+            n = self.store.bump_infra_deaths(key)
+        except Exception as exc:  # noqa: BLE001 — a counter must not mask the failure
+            self.cfg.log(f"review #{pr.number}: no-progress counter not persisted ({exc})")
+            return
+        self.cfg.log(
+            f"review #{pr.number}: round bought nothing ({reason}) — "
+            f"unproductive round {n}"
+        )
+
     async def _run_logged(self, label: str, pr: int, task):
         if self.log_run is not None:
             return await self.log_run(label, pr, task)
@@ -110,6 +139,7 @@ class ReviewWorkflow:
                 f"near the budget cap, raise REVIEW_BUDGET_USD (delegated review + "
                 f"scout subagents share one budget)."
             )
+            self._no_progress(p, f"agent error: {result.status or 'error'}")
             return
         # Submit BEFORE persisting "reviewed" state. If the POST fails (e.g. a 422
         # self-approval from a misconfigured identity), we must NOT record a session/
@@ -117,6 +147,7 @@ class ReviewWorkflow:
         # review on it. State advances only on a confirmed submit.
         prior = review_dom.count_prior_rejections(p.reviews, self.cfg.review_bot)
         if not self._submit_review(pr, result, 1, prior):
+            self._no_progress(p, "review POST failed")
             return
         self.store.save_pr_session(pr, result.session_id)
         self.store.set_last_sha(pr, p.head_ref_oid)
@@ -156,10 +187,12 @@ class ReviewWorkflow:
                 f"(status={result.status or 'error'}, cost=${result.cost_usd:.2f}) — "
                 f"no verdict, will retry. Raise REVIEW_BUDGET_USD if cost is near cap."
             )
+            self._no_progress(p, f"agent error: {result.status or 'error'}")
             return
         # Submit first; advance sha/round only on a confirmed submit (see _review).
         prior = review_dom.count_prior_rejections(p.reviews, self.cfg.review_bot)
         if not self._submit_review(pr, result, round_number, prior):
+            self._no_progress(p, "review POST failed")
             return
         self.store.set_last_sha(pr, p.head_ref_oid)
         self.store.set_round(pr, round_number)
@@ -204,7 +237,11 @@ class ReviewWorkflow:
         gate = await self._run_logged("review-gate", pr,
             task_builders.build_review_gate_task(pr, p.title, p.body, diff, rcfg))
         if gate.is_error:
-            return  # transport failure — leave state untouched, retry next poll
+            # transport failure — leave state untouched, retry next poll (but
+            # COUNT the round: the retry is not free, and an is_error gate that
+            # keeps repeating is the cheapest shape of the P0R-3 loop).
+            self._no_progress(p, "gate leg errored")
+            return
         # Fail SAFE: a degenerate gate result (is_error=False but empty envelope)
         # must default to reviewable=True — the conservative choice is to RUN the
         # full review, never to silently APPROVE unreviewed code. Only an explicit
@@ -215,6 +252,8 @@ class ReviewWorkflow:
             sub = review_dom.gate_submission(prior, self.cfg.max_review_rejections)
             if self.gateway.submit_review(pr, sub.event, sub.body):
                 self._persist_review_state(pr, p.head_ref_oid, round_number)
+            else:
+                self._no_progress(p, "gate APPROVE POST failed")
             return
 
         # 2. dimension specialists — parallel, independent, each hunts one lens.
@@ -272,8 +311,13 @@ class ReviewWorkflow:
         if sub is None:
             self.cfg.log(f"review #{pr}: incomplete and no blocking finding — "
                          "submitting nothing, will retry next poll")
+            # The expensive shape: gate + every dimension + every validator were
+            # PAID FOR and the whole fan-out re-runs next poll on a returned
+            # result, never touching the dispatcher's raise-path counter.
+            self._no_progress(p, "incomplete fan-out, no verdict to submit")
             return
         if not self.gateway.submit_review(pr, sub.event, sub.body):
+            self._no_progress(p, "review POST failed")
             return  # failed POST → leave state untouched (retried next poll)
         if sub.escalate:
             self._escalate(pr, prior + 1)

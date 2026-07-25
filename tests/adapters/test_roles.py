@@ -29,19 +29,29 @@ exact result.
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+from dataclasses import replace
+from datetime import datetime, timezone
 
 import pytest
 
+from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
 from issue_agent.adapters.store import Store
 from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
 from issue_agent.app.execute import Executor
-from issue_agent.app.planners.tasks import FixTaskConfig, ReviewTaskConfig
-from issue_agent.app.roles import _fix_state
+from issue_agent.app.planners.tasks import (
+    FixTaskConfig,
+    REVIEW_DIMENSIONS,
+    ReviewTaskConfig,
+)
+from issue_agent.app.roles import _fix_state, _review_state
 from issue_agent.domain.actions import AgentKind, Relabel, RunAgent, Target
 from issue_agent.domain.fix import FixConfig, breaker_key, decide_fix
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.refs import issue_from_branch
+from issue_agent.domain.review import ReviewConfig, ReviewMode, decide_review
 from issue_agent.domain.world import (
     Check,
     IssueView,
@@ -51,7 +61,14 @@ from issue_agent.domain.world import (
     WorldState,
 )
 
-from test_dispatch import FakeRunner, FakeWorktrees, RaisingRunner
+from test_dispatch import (
+    FakeRunner,
+    FakeWorktrees,
+    RaisingRunner,
+    SchemaRunner,
+    _gate,
+    _val,
+)
 
 FIX_BOT = "fix-bot"
 
@@ -368,3 +385,384 @@ def test_breaker_key_agrees_with_gateway_issue_for_pr_when_branch_numbered_no_cl
     state = _fix_state(store, WorldState(prs=(pr,)))
     assert state.ci_retries[breaker_key(pr)] == 1
     assert store.get_ci_retries(issue) == 1  # explicit: the real issue number, not -401
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# review P0R-3 — the reviewer's ceiling, measured in PAID DISPATCHES
+#
+# `decide_review` emitted one RunAgent per eligible PR per poll with no
+# `consumed` gate and no breaker read: a review that never persists state is
+# bought again on the very next poll, forever. These tests assert on the money
+# (how many dispatches the loop bought over 20 polls), not on a label, and they
+# feed the escalation's own relabel back into the observed world so the
+# structural stop — the PR leaving `prs_with(trigger_label)` — is exercised
+# rather than assumed.
+# ══════════════════════════════════════════════════════════════════════════════
+REVIEW_BOT = "review-bot"
+
+
+def _review_dispatcher(gw, store, runner, **overrides):
+    kwargs = dict(review=ReviewTaskConfig("o/r", review_prompt="p"), review_bot=REVIEW_BOT)
+    kwargs.update(overrides)
+    executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
+    return AgentDispatcher(DispatchConfig(**kwargs), gw, store, None, runner, executor)
+
+
+def _simulate_review_polls(store, dispatcher, rcfg, base_pr, polls):
+    """`polls` review-daemon ticks: observe → decide_review → execute.
+
+    Returns (paid dispatches, escalation comments, the PR's final label set).
+    Relabel actions are applied to the observed world exactly as GitHub would,
+    so a poll after an escalation sees the PR the way the next real poll does.
+    `Daemon.tick` swallows a dispatch that raises, so this does too — that
+    swallow is precisely why a pre-result death used to cost nothing but money.
+    """
+    labels = set(base_pr.labels)
+    dispatches = comments = 0
+    for _ in range(polls):
+        observed = replace(base_pr, labels=frozenset(labels))
+        w = WorldState(prs=(observed,))
+        for action in decide_review(w, rcfg, _review_state(store, w)):
+            if isinstance(action, RunAgent):
+                dispatches += 1
+                try:
+                    asyncio.run(dispatcher.dispatch(action))
+                except BaseException:  # noqa: BLE001 — Daemon.tick's swallow
+                    pass
+            elif isinstance(action, Relabel):
+                labels.discard(action.remove) if action.remove else None
+                labels.add(action.add) if action.add else None
+            else:
+                comments += 1
+    return dispatches, comments, labels
+
+
+def _open_pr(number=500, issue=9, sha="abc"):
+    return PRView(
+        number, head_ref_name=f"fix/{issue}-x", head_ref_oid=sha, closing_issue=issue,
+        title="t", body="b", labels=frozenset({Label.AI_PR_OPEN}), state="OPEN",
+        author=FIX_BOT,
+    )
+
+
+def test_a_review_that_always_dies_pre_result_is_bounded_at_the_ceiling(tmp_path):
+    """review P0R-3, the headline repro. 20 polls against a runner that dies
+    before returning a result used to buy 20 full REVIEW sessions with every
+    counter reading zero. The dispatcher already bumped `infra-deaths` in the
+    review STATE_DIR — nothing read it."""
+    pr_view = _open_pr()
+    gw = FakeGateway(prs={pr_view.number: pr_view})
+    store = Store(state_dir=str(tmp_path))
+    d = _review_dispatcher(gw, store, RaisingRunner())
+    rcfg = ReviewConfig(review_bot=REVIEW_BOT, max_unproductive_rounds=5)
+
+    dispatches, comments, labels = _simulate_review_polls(store, d, rcfg, pr_view, 20)
+
+    assert dispatches == 5, "20 polls must not buy 20 review sessions"
+    assert comments == 1, "the handoff is announced once, not once per poll"
+    assert Label.NEEDS_HUMAN_REVIEW in labels and Label.AI_PR_OPEN not in labels
+    assert store.get_infra_deaths(9) == 5  # written under the linked issue number
+
+
+def test_without_the_ceiling_the_same_run_buys_a_session_every_poll(tmp_path, monkeypatch):
+    """The ABSENCE test (re-review §5): delete the handling, assert the loud
+    failure. With `unproductive_ceiling_hit` stubbed to False — the pre-P0R-3
+    code — the identical scenario buys one paid session per poll, forever. If
+    this ever reports 5 the test above has stopped proving anything."""
+    import issue_agent.domain.review as review_dom
+
+    monkeypatch.setattr(review_dom, "unproductive_ceiling_hit", lambda *_a: False)
+    pr_view = _open_pr()
+    gw = FakeGateway(prs={pr_view.number: pr_view})
+    store = Store(state_dir=str(tmp_path))
+    d = _review_dispatcher(gw, store, RaisingRunner())
+    rcfg = ReviewConfig(review_bot=REVIEW_BOT, max_unproductive_rounds=5)
+
+    dispatches, comments, labels = _simulate_review_polls(store, d, rcfg, pr_view, 20)
+
+    assert dispatches == 20 and comments == 0
+    assert Label.NEEDS_HUMAN_REVIEW not in labels
+
+
+def test_a_multi_mode_fanout_that_never_synthesises_is_bounded(tmp_path):
+    """review P0R-3's worst case. The gate SUCCEEDS and the dimension legs die,
+    so `synthesize_review` returns None and the workflow returns — a RETURNED
+    result, which never touches the raise path the earlier P0 fix covers. The
+    whole fan-out (gate + every dimension) was re-run every poll."""
+    pr_view = _open_pr()
+    gw = FakeGateway(prs={pr_view.number: pr_view})
+    store = Store(state_dir=str(tmp_path))
+    runner = SchemaRunner(gate=_gate(), dimension=lambda _t: AgentResult(is_error=True),
+                          validation=lambda _t: _val(True))
+    d = _review_dispatcher(gw, store, runner, review_mode=ReviewMode.MULTI)
+    rcfg = ReviewConfig(review_bot=REVIEW_BOT, max_unproductive_rounds=3)
+
+    dispatches, _comments, labels = _simulate_review_polls(store, d, rcfg, pr_view, 20)
+
+    assert dispatches == 3
+    # The money is in the LEGS, not the dispatches: one round is a gate plus
+    # every dimension specialist. 20 polls would have been 20x this.
+    assert len(runner.tasks) == 3 * (1 + len(REVIEW_DIMENSIONS))
+    assert Label.NEEDS_HUMAN_REVIEW in labels
+
+
+def test_a_healthy_review_dispatches_once_and_never_hits_the_ceiling(tmp_path):
+    """Anti-vacuity. A ceiling that fires on a working reviewer is worse than no
+    ceiling: 20 polls of a healthy PR buy exactly ONE review (the second poll
+    sees the saved session), submit it, and escalate nothing."""
+    pr_view = _open_pr()
+    gw = FakeGateway(prs={pr_view.number: pr_view})
+    store = Store(state_dir=str(tmp_path))
+    runner = FakeRunner(AgentResult(is_error=False, session_id="rs",
+                                    structured={"decision": "APPROVE", "body": "lgtm"}))
+    d = _review_dispatcher(gw, store, runner)
+    rcfg = ReviewConfig(review_bot=REVIEW_BOT, max_unproductive_rounds=5)
+
+    dispatches, comments, labels = _simulate_review_polls(store, d, rcfg, pr_view, 20)
+
+    assert dispatches == 1 and comments == 0
+    assert any(c[0] == "review" and c[2] == "APPROVE" for c in gw.calls)
+    assert store.get_pr_session(pr_view.number) == "rs"
+    assert store.get_infra_deaths(9) == 0
+    assert labels == {Label.AI_PR_OPEN}
+
+
+def test_the_reviewers_counter_survives_a_key_space_split(tmp_path):
+    """P1R-1's trap, closed for the review role. The dispatcher bumps under
+    `gateway.issue_for_pr(pr)` — but that lookup is a gh call, and the flakiness
+    that kills review sessions is the flakiness that fails it, so the SAME PR's
+    deaths land under the issue number on some polls and under `-pr` on others.
+    A reader that knows only one key space reads a permanently-short count."""
+    pr_view = _open_pr()
+    store = Store(state_dir=str(tmp_path))
+    store.bump_infra_deaths(9)                  # a poll where issue_for_pr worked
+    store.bump_infra_deaths(-pr_view.number)    # a poll where it raised
+    w = WorldState(prs=(pr_view,))
+
+    assert _review_state(store, w).unproductive_rounds[pr_view.number] == 2
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# review P0R-4 — process death (SIGKILL / OOM / systemctl restart)
+#
+# Every bump site requires the process to survive its own death. A daemon killed
+# mid-`await` leaves an `agent_run_start` and nothing else: no settled line, no
+# ledger line, `infra_deaths == 0` — and systemd's Restart=always brings it back
+# to buy the same session again. These drive the reconstruction from the
+# journal through `_fix_state` / `_review_state` into the real decide functions.
+# ══════════════════════════════════════════════════════════════════════════════
+def _journal_lines(tmp_path, *events) -> None:
+    with open(os.path.join(str(tmp_path), "journal.jsonl"), "w", encoding="utf-8") as fh:
+        for e in events:
+            fh.write(json.dumps({"ts": _now_stamp(), **e}) + "\n")
+
+
+def _now_stamp() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+_DISPATCH = iter(f"d{i}" for i in range(1000))
+
+
+def _killed(kind, number, issue, dispatch=None):
+    """The ONLY trace a SIGKILL mid-`await` leaves. `dispatch` is the id
+    `set_context` mints per dispatch — distinct ids are distinct paid rounds."""
+    return {"event": "agent_run_start", "role": "fix", "kind": kind,
+            "number": number, "issue": issue, "model": "opus",
+            "dispatch": dispatch or next(_DISPATCH)}
+
+
+def _settled(kind, number, issue, dispatch=None):
+    return {"event": "agent_run", "role": "fix", "kind": kind, "number": number,
+            "issue": issue, "cost_usd": 0.0, "is_error": False, "status": "ok",
+            "dispatch": dispatch or next(_DISPATCH)}
+
+
+def test_process_deaths_are_counted_and_escalate_the_fix_role(tmp_path):
+    """review P0R-4. Two SIGKILLs mid-run leave two unsettled starts and NOTHING
+    else — no store counter was ever written, because the code that writes it
+    died with the process. `_fix_state` reconstructs them and `decide_fix`
+    escalates at the same cap it uses for survivable deaths."""
+    issue = 8
+    store = Store(state_dir=str(tmp_path))
+    cfg = _cfg(max_infra_deaths=2)
+
+    def world():
+        return WorldState(issues=(
+            IssueView(issue, title="t", body="b", labels=frozenset({Label.AI_READY})),
+        ))
+
+    _journal_lines(tmp_path, _killed("RESOLVE", issue, issue))
+    assert store.get_infra_deaths(issue) == 0, "no write survived the kill"
+    assert _fix_state(store, world()).infra_deaths[issue] == 1
+    assert _has_run(decide_fix(world(), cfg, _fix_state(store, world()), False),
+                    AgentKind.RESOLVE), "1 death < cap of 2"
+
+    _journal_lines(tmp_path, _killed("RESOLVE", issue, issue),
+                   _killed("RESOLVE", issue, issue))
+    actions = decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False)
+    assert not _has_run(actions, AgentKind.RESOLVE)
+    assert Relabel(Target.ISSUE, issue, Label.AI_READY, Label.NEEDS_HUMAN_REVIEW) in actions
+
+
+def test_healthy_runs_in_the_journal_are_not_process_deaths(tmp_path):
+    """Anti-vacuity: N start+settled pairs are N healthy runs, not N deaths. A
+    reader that counted starts alone would escalate every issue the harness has
+    ever worked on the moment this landed."""
+    issue = 8
+    store = Store(state_dir=str(tmp_path))
+    world = WorldState(issues=(
+        IssueView(issue, title="t", body="b", labels=frozenset({Label.AI_READY})),
+    ))
+    _journal_lines(tmp_path, *[
+        e for d in ("d1", "d2", "d3", "d4")
+        for e in (_killed("RESOLVE", issue, issue, d),
+                  _settled("RESOLVE", issue, issue, d))
+    ])
+
+    assert _fix_state(store, world).infra_deaths[issue] == 0
+    assert _has_run(decide_fix(world, _cfg(max_infra_deaths=2), _fix_state(store, world),
+                               False), AgentKind.RESOLVE)
+
+
+def test_a_raise_path_death_is_counted_once_not_twice(tmp_path):
+    """Anti-double-count, driven through the REAL write side. A pre-result
+    transport death the process SURVIVED bumps the store counter AND emits a
+    settled `transport_death` line, so the journal reconstruction must net it to
+    zero. Counting it twice would halve MAX_INFRA_DEATHS for the exact failure
+    mode it was tuned on — and would make the fix role escalate a healthy issue
+    after two flaky sessions."""
+    issue = 8
+    gw = FakeGateway(issues={issue: IssueView(issue, title="t", body="b")})
+    store = Store(state_dir=str(tmp_path))
+    journal = Journal(os.path.join(str(tmp_path), "journal.jsonl"))
+    runner = JournalingRuntime(RaisingRunner(), journal, "", "o/r", "fix")
+    d = _dispatcher(gw, store, runner)
+
+    def world():
+        return WorldState(issues=(
+            IssueView(issue, title="t", body="b", labels=frozenset({Label.AI_READY})),
+        ))
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, issue)))
+
+    events = read_events(journal.path)
+    assert [e["event"] for e in events] == ["agent_run_start", "agent_run"]
+    assert events[1]["exit_reason"] == "transport_death"
+    assert store.get_infra_deaths(issue) == 1
+    assert _fix_state(store, world()).infra_deaths[issue] == 1, "counted once"
+    # …and one more of the same still leaves the cap-of-3 breaker untripped.
+    with pytest.raises(RuntimeError):
+        asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, issue)))
+    assert _fix_state(store, world()).infra_deaths[issue] == 2
+    assert _has_run(decide_fix(world(), _cfg(max_infra_deaths=3),
+                               _fix_state(store, world()), False), AgentKind.RESOLVE)
+
+
+def test_process_deaths_bound_the_review_role_with_no_store_write_at_all(tmp_path):
+    """The review half of P0R-4: a daemon killed mid-review writes NO counter,
+    so without the journal reconstruction the reviewer's brand-new ceiling would
+    be blind to exactly the death that restarts it every 30 seconds."""
+    pr_view = _open_pr()
+    store = Store(state_dir=str(tmp_path))
+    rcfg = ReviewConfig(review_bot=REVIEW_BOT, max_unproductive_rounds=2)
+    w = WorldState(prs=(pr_view,))
+
+    _journal_lines(tmp_path, _killed("REVIEW", pr_view.number, 9))
+    assert _review_state(store, w).unproductive_rounds[pr_view.number] == 1
+    assert RunAgent(AgentKind.REVIEW, pr_view.number) in decide_review(
+        w, rcfg, _review_state(store, w))
+
+    _journal_lines(tmp_path, _killed("REVIEW", pr_view.number, 9),
+                   _killed("RE_REVIEW", pr_view.number, 9))
+    actions = decide_review(w, rcfg, _review_state(store, w))
+    assert not any(isinstance(a, RunAgent) for a in actions)
+    assert Relabel(Target.PR, pr_view.number, Label.AI_PR_OPEN,
+                   Label.NEEDS_HUMAN_REVIEW) in actions
+
+
+def test_an_issueless_prs_process_death_lands_on_the_key_the_reader_uses(tmp_path):
+    """The PR #112 key space, for the death nobody could write: with no closing
+    ref and a Jira-keyed branch the dispatcher would have used `-pr`, so the
+    journal reconstruction must too."""
+    pr_view = PRView(112, head_ref_name="feat/ACME-2468-x", head_ref_oid="abc",
+                     labels=frozenset({Label.AI_PR_OPEN}), state="OPEN")
+    store = Store(state_dir=str(tmp_path))
+    w = WorldState(prs=(pr_view,))
+    _journal_lines(tmp_path, _killed("REVIEW", 112, None))
+
+    assert _review_state(store, w).unproductive_rounds[112] == 1
+
+
+# ── steward: the third role P0R-3 names, bounded on the SAME two mechanisms ────
+# `triage-N.at` (and the jira phase) are written ONLY on success, so a session
+# that dies leaves the issue in `triage_candidates` forever — one paid TRIAGE
+# per untriaged issue per poll, which in aggregate is larger than the reviewer's
+# loop. Driven through the REAL `build_steward_daemon` closure, not a
+# re-implementation of its gate: a test that restates the implementation cannot
+# fail when the implementation is deleted.
+def _steward_decide(tmp_path, monkeypatch, **cfg_kw):
+    from issue_agent.app import roles
+    from issue_agent.app.config import HarnessConfig
+
+    store = Store(state_dir=str(tmp_path))
+    # Pin the journal beside this store (production does exactly this; the
+    # HarnessConfig default would point at the real XDG state dir).
+    monkeypatch.setattr(
+        roles, "_journal",
+        lambda _s: Journal(os.path.join(str(tmp_path), "journal.jsonl")),
+    )
+    cfg = HarnessConfig(repo="o/r", target_dir=str(tmp_path), **cfg_kw)
+    gw = FakeGateway()
+    gw.build_triage_world = lambda: WorldState()   # observe is never called here
+    daemon = roles.build_steward_daemon(cfg, gw, store, FakeRunner(AgentResult(is_error=False)))
+    return daemon.decide, store
+
+
+def _triaged(number=30):
+    return WorldState(issues=(IssueView(number, title="t", body="b", updated_at="T1"),))
+
+
+def test_the_steward_stops_dispatching_for_an_issue_whose_sessions_keep_dying(
+    tmp_path, monkeypatch
+):
+    decide, store = _steward_decide(tmp_path, monkeypatch)
+    world = _triaged()
+
+    for _ in range(5):
+        assert decide(world) == [RunAgent(AgentKind.TRIAGE, 30)]  # anti-vacuity
+        store.bump_infra_deaths(30)
+
+    assert decide(world) == [], "5 dead sessions must stop the paid loop"
+
+
+def test_the_steward_still_triages_a_healthy_issue(tmp_path, monkeypatch):
+    """Anti-vacuity twin: a steward that suppressed everything would look
+    identical to a bounded one on the test above."""
+    decide, store = _steward_decide(tmp_path, monkeypatch)
+    assert decide(_triaged()) == [RunAgent(AgentKind.TRIAGE, 30)]
+    store.set_triage_at(30, "T1")
+    assert decide(_triaged()) == [], "unchanged since last triage — not the ceiling"
+
+
+def test_the_stewards_ceiling_also_sees_a_process_death(tmp_path, monkeypatch):
+    """Without the journal read a daemon OOM-killed on every triage never
+    reaches any ceiling: nothing it could write survived (review P0R-4)."""
+    decide, store = _steward_decide(tmp_path, monkeypatch)
+    _journal_lines(tmp_path, *[_killed("TRIAGE", 30, 30) for _ in range(5)])
+
+    assert store.get_infra_deaths(30) == 0, "no write survived the kills"
+    assert decide(_triaged()) == []
+
+
+def test_the_steward_suppression_is_per_issue(tmp_path, monkeypatch):
+    decide, store = _steward_decide(tmp_path, monkeypatch)
+    for _ in range(5):
+        store.bump_infra_deaths(30)
+    world = WorldState(issues=(
+        IssueView(30, title="t", body="b", updated_at="T1"),
+        IssueView(31, title="t", body="b", updated_at="T1"),
+    ))
+
+    assert decide(world) == [RunAgent(AgentKind.TRIAGE, 31)]

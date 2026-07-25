@@ -20,12 +20,24 @@ from functools import partial
 
 from ..adapters.agent_runner import AgentRunner
 from ..adapters.github import GitHubGateway, Identity
-from ..adapters.journal import Journal, JournalingRuntime, default_ledger_path
+from ..adapters.journal import (
+    Journal,
+    JournalingRuntime,
+    default_ledger_path,
+    read_events_tail,
+    unsettled_starts,
+)
 from ..adapters.store import Store
 from ..adapters.worktree import Worktrees
 from ..domain.fix import FixConfig, FixState, breaker_key, decide_fix
 from ..domain.labels import Label
-from ..domain.review import ReviewConfig, ReviewState, decide_review
+from ..domain.lifecycle import retry_breaker
+from ..domain.review import (
+    DEFAULT_MAX_UNPRODUCTIVE_ROUNDS,
+    ReviewConfig,
+    ReviewState,
+    decide_review,
+)
 from .planners.tasks import FixTaskConfig, JiraTaskConfig, ReviewTaskConfig, TriageTaskConfig
 from ..domain.triage import (
     TriageConfig,
@@ -73,6 +85,19 @@ def _spend_cfg(cfg: HarnessConfig, role: str, ledger: str) -> dict:
     }
 
 
+def _process_deaths(store: Store) -> dict[int, int]:
+    """Paid runs this role's journal shows starting and never settling, keyed
+    the way the `infra-deaths` counter is (review P0R-4).
+
+    A session the DAEMON did not outlive — SIGKILL, OOM, `systemctl restart`
+    mid-run — reaches none of the bump sites, because every one of them is code
+    that runs after the death. The `agent_run_start` line written before the
+    await is the only durable trace, so the decide side reconstructs the count
+    from it. Read-side only: nothing new is written on the hot path, and the
+    scan is a bounded tail of a file this role already owns."""
+    return unsettled_starts(read_events_tail(_journal(store).path))
+
+
 def _fix_state(store: Store, world) -> FixState:
     """Read the per-issue/PR orchestration state the fix decision needs."""
     sessions = frozenset(i.number for i in world.issues if store.has_session(i.number))
@@ -94,8 +119,17 @@ def _fix_state(store: Store, world) -> FixState:
     # resume) escalate on the issue number, the PR legs on breaker_key(pr) —
     # and the dispatcher writes under whichever one the dying leg used. Read the
     # union, or a leg escalates on a counter nobody reads.
+    #
+    # The store counter only ever sees deaths the PROCESS SURVIVED. Deaths that
+    # took the daemon with them (SIGKILL/OOM/restart) left an unsettled
+    # `agent_run_start` in the journal and nothing else, so they are added here
+    # — the one place where both halves can be summed without either write side
+    # knowing about the other (review P0R-4). A raise-path death is in the store
+    # counter AND has a settled `transport_death` line, so `unsettled_starts`
+    # nets it to zero and it is counted exactly once.
+    deaths = _process_deaths(store)
     infra_deaths = {
-        k: store.get_infra_deaths(k)
+        k: store.get_infra_deaths(k) + deaths.get(k, 0)
         for k in keys | {i.number for i in world.issues}
     }
     return FixState(
@@ -237,9 +271,38 @@ def build_fix_daemon(
 
 
 def _review_state(store: Store, world) -> ReviewState:
+    """Read the per-PR state `decide_review` needs — including the ceiling
+    counter that stops the reviewer paying for a PR that never converges.
+
+    `unproductive_rounds` is PR-keyed in the domain but reconciled from TWO
+    store key spaces here, because the two write sides disagree by construction
+    (review P0R-3):
+
+      * `AgentDispatcher.dispatch` bumps `infra-deaths` under
+        `gateway.issue_for_pr(pr)`, falling back to `-pr` when that lookup
+        returns None *or raises* — and the flakiness that kills sessions is
+        exactly the flakiness that fails the lookup, so a PR's deaths can land
+        in BOTH key spaces across a run of polls;
+      * `ReviewWorkflow` bumps the same counter under `breaker_key(pr)` (pure,
+        from the PRView it already fetched) for a round that ran and persisted
+        nothing.
+
+    Summing the union is what makes the ceiling see every paid round regardless
+    of which key the writer chose. `breaker_key(pr) == -pr` for an issueless PR,
+    and a set literal dedupes it, so nothing is double counted."""
     sessions = frozenset(p.number for p in world.prs if store.get_pr_session(p.number))
     last = {p.number: store.get_last_sha(p.number) for p in world.prs}
-    return ReviewState(sessions=sessions, last_sha=last)
+    deaths = _process_deaths(store)  # review P0R-4 — see _fix_state
+    unproductive = {
+        p.number: sum(
+            store.get_infra_deaths(k) + deaths.get(k, 0)
+            for k in {breaker_key(p), -p.number}
+        )
+        for p in world.prs
+    }
+    return ReviewState(
+        sessions=sessions, last_sha=last, unproductive_rounds=unproductive
+    )
 
 
 def build_review_daemon(
@@ -253,6 +316,14 @@ def build_review_daemon(
         review_bot=review_runtime.bot, identity_mode=repo_cfg.identity_mode,
         trigger_label=Label(review_runtime.trigger_label),
         adopt_unlabeled=review_runtime.adopt_unlabeled,
+        # getattr, not a plain attribute read: the env knob
+        # (MAX_UNPRODUCTIVE_REVIEW_ROUNDS) is wired into ReviewRuntimeConfig
+        # separately from this ceiling. Until it lands the domain default
+        # applies — a missing knob must never mean "no ceiling", which is the
+        # unbounded state P0R-3 describes.
+        max_unproductive_rounds=getattr(
+            review_runtime, "max_unproductive_rounds", DEFAULT_MAX_UNPRODUCTIVE_ROUNDS
+        ),
     )
     dcfg = DispatchConfig(
         base_branch=repo_cfg.base_branch,
@@ -376,16 +447,51 @@ def build_steward_daemon(
     )
     executor._run_agent = lambda a: asyncio.run(dispatcher.dispatch(a))  # noqa: SLF001
 
+    # Same ceiling shape as the reviewer's (review P0R-3), for the same reason:
+    # the steward's "already handled" markers — `triage-N.at` and the jira phase
+    # — are written ONLY on success, so a session that dies leaves the issue in
+    # the candidate set and the next poll buys it again. Unlike the other two
+    # roles the steward escalates NOTHING: an untriaged issue is not work anyone
+    # promised to finish, and moving it to needs-human-review would be the
+    # steward inventing lifecycle state for an issue it never triaged. It stops
+    # spending and says so, once per change in the suppressed set (not once per
+    # poll — a line repeated 4,300 times a day is a line nobody reads).
+    max_deaths = getattr(
+        steward_runtime, "max_infra_deaths", DEFAULT_MAX_UNPRODUCTIVE_ROUNDS
+    )
+    suppressed_last: set[int] = set()
+
     def decide(world):
         state = TriageState(seen_at={i.number: store.get_triage_at(i.number) for i in world.issues})
-        actions = [RunAgent(AgentKind.TRIAGE, n) for n in triage_candidates(world, tcfg_dom, state)]
+        deaths = _process_deaths(store)
+
+        def exhausted(n: int) -> bool:
+            spent = store.get_infra_deaths(n) + deaths.get(n, 0)
+            return retry_breaker(spent, max_deaths).tripped
+
+        actions = [
+            RunAgent(AgentKind.TRIAGE, n)
+            for n in triage_candidates(world, tcfg_dom, state)
+            if not exhausted(n)
+        ]
         if jira_on:
             for i in world.issues:
                 target = jira_phase(i.labels)
-                if target is not None and jira_sync_needed(
+                if target is not None and not exhausted(i.number) and jira_sync_needed(
                     target, store.get_jira_key(i.number), store.get_jira_phase(i.number)
                 ):
                     actions.append(RunAgent(AgentKind.JIRA_SYNC, i.number))
+        suppressed = {i.number for i in world.issues if exhausted(i.number)}
+        if suppressed != suppressed_last:
+            if suppressed:
+                steward_log(
+                    f"steward: no longer dispatching for issue(s) "
+                    f"{sorted(suppressed)} — {max_deaths} sessions died before "
+                    "returning a result. Check the runtime/daemon; clear the "
+                    "issue-N.infra-deaths marker in the steward STATE_DIR to retry."
+                )
+            suppressed_last.clear()
+            suppressed_last.update(suppressed)
         return actions
 
     # Jira needs closed ai-done issues too (for the final Done transition); triage

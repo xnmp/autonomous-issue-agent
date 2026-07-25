@@ -20,13 +20,16 @@ from issue_agent.adapters.journal import (
     Journal,
     JournalingRuntime,
     alert,
+    death_key,
     default_ledger_path,
     events_within,
     read_events,
+    read_events_tail,
     recent_runs,
     repeated_dispatch_warning,
     sum_issue,
     sum_today,
+    unsettled_starts,
 )
 from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
 from issue_agent.app.execute import Executor
@@ -280,6 +283,195 @@ def test_repeated_dispatch_warning_still_reads_a_journal_with_no_start_events():
 def test_default_ledger_path_is_global_and_honours_xdg(monkeypatch):
     monkeypatch.setenv("XDG_STATE_HOME", "/xdg")
     assert default_ledger_path() == "/xdg/issue-agent/spend.jsonl"
+
+
+# ── unsettled starts / bounded tail read (review P0R-4) ───────────────────────
+# The counter for the death nobody could record: SIGKILL / OOM / systemctl
+# restart mid-`await`. Every existing bump site is code that runs AFTER the
+# session ends, so a death that takes the daemon with it leaves an
+# `agent_run_start` and nothing else — and systemd brings the process back to
+# buy the same session again.
+def _start(dt, kind="RESOLVE", number=5, issue=5, dispatch=""):
+    return {"ts": _at(dt), "event": "agent_run_start", "role": "fix",
+            "kind": kind, "number": number, "issue": issue, "model": "opus",
+            "dispatch": dispatch}
+
+
+def _run(dt, kind="RESOLVE", number=5, issue=5, dispatch="", **extra):
+    return {"ts": _at(dt), "event": "agent_run", "role": "fix", "kind": kind,
+            "number": number, "issue": issue, "cost_usd": 0.0,
+            "dispatch": dispatch, **extra}
+
+
+def test_a_start_with_no_settlement_is_one_unsettled_death():
+    assert unsettled_starts([_start(NOW)], now_fn=lambda: NOW) == {5: 1}
+
+
+def test_a_start_and_its_settlement_are_not_a_death():
+    """Anti-vacuity: the shape of EVERY healthy run. A counter that read starts
+    alone would escalate every issue the harness ever worked on."""
+    events = [_start(NOW - timedelta(minutes=m + 1)) for m in range(4)]
+    events += [_run(NOW - timedelta(minutes=m)) for m in range(4)]
+    assert unsettled_starts(events, now_fn=lambda: NOW) == {}
+
+
+def test_the_raise_path_death_settles_and_so_is_not_counted_here():
+    """Anti-double-count. A pre-result transport death the PROCESS SURVIVED is
+    already counted once, by the dispatcher's store bump; `JournalingRuntime`
+    also writes it a settled `transport_death` line. Counting it here too would
+    halve `MAX_INFRA_DEATHS` for the failure mode it was tuned on."""
+    events = [
+        _start(NOW - timedelta(minutes=1)),
+        _run(NOW, status="raised", is_error=True, exit_reason="transport_death",
+             error="RuntimeError: stream closed before any result"),
+    ]
+    assert unsettled_starts(events, now_fn=lambda: NOW) == {}
+
+
+def test_a_concurrent_fanout_of_legs_reports_no_deaths():
+    """The rule that forces COUNTING over positional pairing. A
+    REVIEW_MODE=multi dispatch runs its gate, 5 dimensions and N validators
+    concurrently under ONE context, so its journal is a run of interleaved
+    starts and settlements in arbitrary order. Pairing "a start is unsettled if
+    no settlement precedes the next start" would report 7 phantom deaths for
+    this — one healthy review would trip a ceiling of 5 on its own."""
+    starts = [_start(NOW - timedelta(seconds=60 - i), kind="REVIEW", number=100, issue=7)
+              for i in range(8)]
+    settles = [_run(NOW - timedelta(seconds=30 - i), kind="REVIEW", number=100, issue=7)
+               for i in range(8)]
+    assert unsettled_starts(starts + settles, now_fn=lambda: NOW) == {}
+    # …and the same journal WITH one leg killed reports exactly one death.
+    assert unsettled_starts(starts + settles[:-1], now_fn=lambda: NOW) == {7: 1}
+
+
+def test_a_dispatch_killed_mid_fanout_is_ONE_death_not_one_per_leg():
+    """The money question a per-leg count gets wrong. A `systemctl restart`
+    during a REVIEW_MODE=multi review kills a gate + 5 dimension legs at once;
+    charging six deaths trips a ceiling of five on a single routine restart,
+    which is exactly the "memory pressure must not walk healthy work to a human"
+    rule (FAILURE-MODES #58) inverted."""
+    legs = [_start(NOW - timedelta(seconds=60 - i), kind="REVIEW", number=100,
+                   issue=7, dispatch="d1") for i in range(6)]
+    settled_two = [_run(NOW - timedelta(seconds=30 - i), kind="REVIEW", number=100,
+                        issue=7, dispatch="d1") for i in range(2)]
+    assert unsettled_starts(legs + settled_two, now_fn=lambda: NOW) == {7: 1}
+
+
+def test_separate_dispatches_are_separate_deaths():
+    """Anti-vacuity twin: collapsing legs must not collapse POLLS. Three
+    consecutive killed dispatches are three paid rounds, and a ceiling that saw
+    one would never trip on the loop it exists for."""
+    events = [
+        _start(NOW - timedelta(minutes=m), kind="REVIEW", number=100, issue=7,
+               dispatch=f"d{m}")
+        for m in (30, 20, 10)
+    ]
+    assert unsettled_starts(events, now_fn=lambda: NOW) == {7: 3}
+
+
+def test_a_fully_settled_dispatch_is_no_death():
+    legs = [_start(NOW - timedelta(seconds=60 - i), kind="REVIEW", number=100,
+                   issue=7, dispatch="d1") for i in range(6)]
+    settles = [_run(NOW - timedelta(seconds=30 - i), kind="REVIEW", number=100,
+                    issue=7, dispatch="d1") for i in range(6)]
+    assert unsettled_starts(legs + settles, now_fn=lambda: NOW) == {}
+
+
+def test_the_real_runtime_stamps_one_dispatch_id_across_every_leg(tmp_path):
+    """Pins the producer half of the rule: `set_context` is called once per
+    dispatch, so every leg it runs must carry the SAME id — and the next
+    dispatch a DIFFERENT one, or two polls' deaths collapse into one."""
+    rt, journal, _ = _runtime(tmp_path, AgentResult(is_error=False))
+    rt.set_context("review", "REVIEW", 100, 7)
+    asyncio.run(rt.run(AgentTask(prompt="gate")))
+    asyncio.run(rt.run(AgentTask(prompt="dimension")))
+    first = {e["dispatch"] for e in read_events(journal.path)}
+    assert len(first) == 1 and "" not in first
+
+    rt.set_context("review", "REVIEW", 100, 7)
+    asyncio.run(rt.run(AgentTask(prompt="gate")))
+    assert len({e["dispatch"] for e in read_events(journal.path)}) == 2
+
+
+def test_a_journal_written_before_dispatch_ids_still_counts_deaths():
+    """Backward compatibility: an upgrade must not silently zero the counter for
+    every run already on disk. With no `dispatch` field the rule falls back to
+    (kind, number) counting."""
+    legacy = {"ts": _at(NOW), "event": "agent_run_start", "kind": "RESOLVE",
+              "number": 5, "issue": 5}
+    assert unsettled_starts([legacy], now_fn=lambda: NOW) == {5: 1}
+
+
+def test_deaths_key_to_the_issue_so_they_meet_the_dispatchers_counter():
+    """The key must be the one `AgentDispatcher.dispatch` bumps `infra-deaths`
+    under, or the ceiling reads a counter nobody writes (the PR #112 class)."""
+    assert unsettled_starts(
+        [_start(NOW, kind="REVIEW", number=100, issue=7)], now_fn=lambda: NOW
+    ) == {7: 1}
+
+
+def test_an_issueless_prs_death_keys_to_the_negated_pr_number():
+    """`breaker_key`'s convention for a PR with no closing ref and a Jira-keyed
+    branch: the dispatcher falls back to `-action.number`, so this must too."""
+    assert unsettled_starts(
+        [_start(NOW, kind="RE_REVIEW", number=112, issue=None)], now_fn=lambda: NOW
+    ) == {-112: 1}
+    assert death_key({"number": 112, "issue": None}) == -112
+    assert death_key({"number": 112, "issue": 9}) == 9
+    assert death_key({}) is None
+
+
+def test_different_kinds_on_one_issue_sum_into_one_ceiling_key():
+    events = [_start(NOW, kind="RESOLVE"), _start(NOW, kind="RESUME")]
+    assert unsettled_starts(events, now_fn=lambda: NOW) == {5: 2}
+
+
+def test_deaths_older_than_the_window_are_not_counted():
+    assert unsettled_starts([_start(NOW - timedelta(hours=25))], now_fn=lambda: NOW) == {}
+    assert unsettled_starts(
+        [_start(NOW - timedelta(hours=25))], window_s=0, now_fn=lambda: NOW
+    ) == {5: 1}
+
+
+def test_a_settlement_whose_start_fell_outside_the_window_invents_no_death():
+    """The window can only cut a pair the wrong way round; a bound that
+    over-reports would walk a healthy issue to a human on a long session."""
+    assert unsettled_starts([_run(NOW)], now_fn=lambda: NOW) == {}
+
+
+def test_unstamped_and_unrelated_events_are_ignored():
+    events = [
+        {"event": "agent_run_start", "kind": "RESOLVE", "number": 5, "issue": 5},  # no ts
+        {"ts": _at(NOW), "event": "escalation", "number": 5},
+        {"ts": _at(NOW), "event": "agent_run_start", "kind": "RESOLVE",
+         "number": "not-a-number", "issue": None},
+    ]
+    assert unsettled_starts(events, now_fn=lambda: NOW) == {}
+
+
+# ── read_events_tail ──────────────────────────────────────────────────────────
+# The poll-loop reader must not grow with the age of the install; a byte window
+# means its first line is usually torn, and a parser handed half an object must
+# skip it exactly like a killed writer's tail.
+def test_read_events_tail_reads_only_the_last_bytes(tmp_path):
+    path = str(tmp_path / "journal.jsonl")
+    lines = [json.dumps({"event": "agent_run", "number": n, "pad": "x" * 100})
+             for n in range(50)]
+    _write(path, *lines)
+    tail = read_events_tail(path, max_bytes=500)
+    assert tail, "a bounded read must still return events"
+    assert [e["number"] for e in tail] == list(range(50))[-len(tail):]
+    assert len(tail) < 50, "the whole file was read — the bound did nothing"
+    # Every returned object parsed cleanly: the torn leading line was dropped,
+    # not handed to json.loads and silently counted as garbage.
+    assert all(e.get("pad") == "x" * 100 for e in tail)
+
+
+def test_read_events_tail_reads_a_whole_small_file_and_tolerates_a_missing_one(tmp_path):
+    path = str(tmp_path / "journal.jsonl")
+    _write(path, json.dumps({"event": "agent_run", "number": 1}))
+    assert read_events_tail(path) == [{"event": "agent_run", "number": 1}]
+    assert read_events_tail(str(tmp_path / "nope.jsonl")) == []
 
 
 # ── JournalingRuntime ─────────────────────────────────────────────────────────

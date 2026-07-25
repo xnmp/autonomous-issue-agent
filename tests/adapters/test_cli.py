@@ -34,12 +34,29 @@ def test_parse_remote_url_garbage_is_empty():
 
 # ── derive_name ───────────────────────────────────────────────────────────────
 def test_derive_name_lowercases_basename():
-    assert cli.derive_name("acme/MyApp-combined-agent") == "myapp-combined-agent"
+    # P0R-2: owner is now part of the derived name (was basename-only).
+    assert cli.derive_name("acme/MyApp-combined-agent") == "acme-myapp-combined-agent"
 
 
 def test_derive_name_sanitizes_and_falls_back():
     assert cli.derive_name("") == "target"
-    assert cli.derive_name("o/weird name!") == "weird-name"
+    assert cli.derive_name("o/weird name!") == "o-weird-name"
+
+
+# ── P0R-2: derive_name includes the owner (collision fix) ─────────────────────
+def test_derive_name_includes_owner():
+    assert cli.derive_name("acme/app") == "acme-app"
+
+
+def test_derive_name_no_collision_across_owners():
+    """The original bug: acme/app and other/app both derived the bare
+    basename "app" — resolve_name could then reuse ONE owner's overlay while
+    running against the OTHER's checkout. Two different owners of the same
+    repo BASENAME must now derive DIFFERENT names."""
+    a = cli.derive_name("acme/app")
+    b = cli.derive_name("other/app")
+    assert a != b
+    assert {a, b} == {"acme-app", "other-app"}
 
 
 # ── read_repo_env_field + resolve_name ────────────────────────────────────────
@@ -146,8 +163,25 @@ def test_resolve_name_reuses_matching_overlay(tmp_path):
 
 
 def test_resolve_name_derives_when_no_match(tmp_path):
+    # P0R-2: derived name now includes the owner (was "new-repo").
     name = cli.resolve_name("acme/New-Repo", repos_dir=str(tmp_path))
-    assert name == "new-repo"
+    assert name == "acme-new-repo"
+
+
+# ── P0R-2: backward compat — reuse is by CONTENT (REPO field), not by
+# recomputing derive_name's (now-changed) shape against an existing filename ──
+def test_resolve_name_backcompat_old_basename_overlay_still_reused(tmp_path):
+    """An overlay named under the OLD basename-only convention (e.g. hand
+    authored, or synthesized before this fix) must still be found and reused
+    for the SAME repo — resolve_name matches by reading the overlay's actual
+    REPO field, never by recomputing derive_name against it. Only a NEWLY
+    synthesized name (no existing overlay matches) uses the new owner-
+    inclusive shape."""
+    (tmp_path / "app.env").write_text('REPO="acme/app"\n')
+    # Sanity: the NEW derive_name would NOT reproduce this filename anymore —
+    # proves the reuse below is genuinely content-based, not a coincidence.
+    assert cli.derive_name("acme/app") != "app"
+    assert cli.resolve_name("acme/app", repos_dir=str(tmp_path)) == "app"
 
 
 def test_resolve_name_prefers_target_dir_match(tmp_path):
@@ -470,6 +504,195 @@ def test_status_merge_agent_run_start_does_not_appear_in_last_runs(tmp_path):
     assert out.count("RESOLVE") == 1
 
 
+# ── P0R-2: refuse a resolved overlay that belongs to a DIFFERENT repo/checkout
+# ── check_overlay_mismatch (pure) ─────────────────────────────────────────────
+def test_check_overlay_mismatch_detects_wrong_repo(tmp_path):
+    """The exact repro: overlay app.env is for acme/app at /srv/acme-app; the
+    detected repo/checkout is other/app at /srv/other-app. Message names both
+    repos."""
+    (tmp_path / "app.env").write_text(
+        'REPO="acme/app"\nTARGET_DIR="/srv/acme-app"\n'
+    )
+    msg = cli.check_overlay_mismatch(
+        "app", "other/app", "/srv/other-app", repos_dir=str(tmp_path)
+    )
+    assert msg
+    assert "acme/app" in msg
+    assert "other/app" in msg
+
+
+def test_check_overlay_mismatch_anti_vacuity_when_repo_agrees(tmp_path):
+    """Anti-vacuity twin: same overlay, but the detected repo/checkout IS
+    acme/app at /srv/acme-app — no mismatch."""
+    (tmp_path / "app.env").write_text(
+        'REPO="acme/app"\nTARGET_DIR="/srv/acme-app"\n'
+    )
+    msg = cli.check_overlay_mismatch(
+        "app", "acme/app", "/srv/acme-app", repos_dir=str(tmp_path)
+    )
+    assert msg == ""
+
+
+def test_check_overlay_mismatch_no_file_is_not_a_mismatch(tmp_path):
+    """No overlay at that name yet → synthesis, not reuse; nothing to compare."""
+    assert cli.check_overlay_mismatch("app", "other/app", "/srv/other-app", repos_dir=str(tmp_path)) == ""
+
+
+def test_check_overlay_mismatch_same_repo_different_target_dir_is_not_fatal(tmp_path):
+    """resolve_name's Tier-3 fallback (same REPO, no TARGET_DIR-matching
+    overlay — e.g. two checkouts of one repo, or the checkout moved) is
+    legitimate, tested, back-compat behavior. A REPO-agreeing overlay whose
+    TARGET_DIR differs from the detected one must NOT be flagged — only a
+    REPO mismatch (or, absent any REPO field, a TARGET_DIR mismatch) is."""
+    (tmp_path / "app-wt.env").write_text(
+        'REPO="acme/app"\nTARGET_DIR="/srv/app-harness"\n'
+    )
+    msg = cli.check_overlay_mismatch(
+        "app-wt", "acme/app", "/srv/somewhere-else", repos_dir=str(tmp_path)
+    )
+    assert msg == ""
+
+
+def test_check_overlay_mismatch_target_dir_fallback_when_no_repo_recorded(tmp_path):
+    """A malformed/hand-edited overlay with no REPO at all: TARGET_DIR is the
+    only identity signal left, so a mismatch there is still caught."""
+    (tmp_path / "app.env").write_text('TARGET_DIR="/srv/acme-app"\n')
+    msg = cli.check_overlay_mismatch(
+        "app", "other/app", "/srv/other-app", repos_dir=str(tmp_path)
+    )
+    assert msg
+    assert "/srv/acme-app" in msg
+    assert "/srv/other-app" in msg
+
+
+# ── per-command wiring: fatal (start/stop/doctor/install-service) vs warn (status) ──
+def _start_args(**overrides) -> argparse.Namespace:
+    base = dict(
+        repo="", target_dir="", name="", roles=None, base_branch="dev",
+        test_cmd="", no_init=True, edit_check_cmd="", review_mode="",
+        max_budget="", review_budget="", max_ticks=None, write_config=False,
+        worktree=False, worktree_path="",
+    )
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def _prep_mismatch_overlay(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
+    shared = tmp_path / "shared.env"
+    shared.write_text("")
+    monkeypatch.setattr(cli, "SHARED_ENV", str(shared))
+    (tmp_path / "app.env").write_text(
+        'REPO="acme/app"\nTARGET_DIR="/srv/acme-app"\nTEST_CMD="echo ok"\n'
+    )
+
+
+def test_cmd_start_refuses_wrong_repo_overlay(tmp_path, monkeypatch, capsys):
+    """P0R-2 exact repro at the `cmd_start` level: resolving to the app.env
+    overlay (whether via an explicit --name or a stale collision) while the
+    detected repo/checkout is a DIFFERENT one must refuse — not silently
+    launch all three daemons against acme/app while sitting in other/app."""
+    _prep_mismatch_overlay(tmp_path, monkeypatch)
+    execve_calls: list = []
+    monkeypatch.setattr(cli.os, "execve", lambda *a: execve_calls.append(a))
+
+    args = _start_args(repo="other/app", target_dir="/srv/other-app", name="app")
+    rc = cli.cmd_start(args)
+
+    assert rc == 2
+    assert execve_calls == []  # never delegated to point-at.sh
+    captured = capsys.readouterr()
+    assert "acme/app" in captured.err
+    assert "other/app" in captured.err
+
+
+def test_cmd_start_reuses_matching_overlay_no_warning(tmp_path, monkeypatch, capsys):
+    """Anti-vacuity twin: same overlay, but the detected repo/checkout IS
+    acme/app at /srv/acme-app — proceeds and reuses, no refusal, no warning."""
+    _prep_mismatch_overlay(tmp_path, monkeypatch)
+    execve_calls: list = []
+    monkeypatch.setattr(cli.os, "execve", lambda *a: execve_calls.append(a))
+
+    args = _start_args(repo="acme/app", target_dir="/srv/acme-app", name="app")
+    rc = cli.cmd_start(args)
+
+    assert rc is None  # falls through to (stubbed) os.execve, never returns 2
+    assert len(execve_calls) == 1  # DID delegate to point-at.sh
+    captured = capsys.readouterr()
+    assert "reusing config/repos/app.env" in captured.out
+    assert captured.err == ""
+
+
+def test_cmd_stop_refuses_wrong_repo_overlay(tmp_path, monkeypatch, capsys):
+    """FATAL: stop is destructive (SIGTERMs another deployment's daemons if
+    it proceeded), so a mismatch here is refused, not warned."""
+    _prep_mismatch_overlay(tmp_path, monkeypatch)
+    args = argparse.Namespace(repo="other/app", target_dir="/srv/other-app", name="app")
+    rc = cli.cmd_stop(args)
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert "acme/app" in captured.err
+    assert "other/app" in captured.err
+
+
+def test_cmd_doctor_refuses_wrong_repo_overlay(tmp_path, monkeypatch, capsys):
+    """FATAL: doctor would compose env for and preflight-check the WRONG
+    repo, reporting a false all-clear right before an operator runs `start`."""
+    _prep_mismatch_overlay(tmp_path, monkeypatch)
+    args = argparse.Namespace(repo="other/app", target_dir="/srv/other-app", name="app")
+    rc = cli.cmd_doctor(args)
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert "acme/app" in captured.err
+    assert "other/app" in captured.err
+
+
+def test_install_service_refuses_wrong_repo_overlay(tmp_path, monkeypatch, capsys):
+    """FATAL: install-service is worse than a one-shot `start` against the
+    wrong repo — it installs a PERSISTENT service that keeps relaunching
+    against it. Refuses before ever invoking compose-env.sh."""
+    _prep_mismatch_overlay(tmp_path, monkeypatch)
+    real_run = cli.subprocess.run
+    calls: list = []
+
+    class _Result:
+        returncode = 0
+
+    def fake_run(cmd, **kwargs):
+        # check_overlay_mismatch reads the overlay via a REAL bash subshell
+        # (read_repo_env_field) before any compose-env.sh/install-*.sh call —
+        # let that one through untouched; only intercept the script calls.
+        if cmd[0] == "bash" and cmd[1] == "-c":
+            return real_run(cmd, **kwargs)
+        calls.append(cmd)
+        return _Result()
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    args = argparse.Namespace(
+        repo="other/app", target_dir="/srv/other-app", name="app", roles=None
+    )
+    rc = cli.cmd_install_service(args)
+    assert rc == 2
+    assert calls == []  # refused before composing env / installing anything
+    captured = capsys.readouterr()
+    assert "acme/app" in captured.err
+    assert "other/app" in captured.err
+
+
+def test_cmd_status_warns_but_proceeds_on_wrong_repo_overlay(tmp_path, monkeypatch, capsys):
+    """WARN, not fatal: status is read-only (no SIGTERM, no service install,
+    no dispatch) — a mismatch is misleading, not dangerous, and refusing
+    would prevent using `status` to diagnose this exact collision."""
+    _prep_mismatch_overlay(tmp_path, monkeypatch)
+    args = argparse.Namespace(repo="other/app", target_dir="/srv/other-app", name="app", lines=5)
+    rc = cli.cmd_status(args)
+    assert rc == 0  # proceeded
+    captured = capsys.readouterr()
+    assert "acme/app" in captured.err
+    assert "other/app" in captured.err
+    assert "status for 'app'" in captured.out  # ... and still rendered status
+
+
 # ── review M12/A4 fold-in: cmd_install_service fails loud on compose failure ──
 def _install_args(tmp_path) -> argparse.Namespace:
     # Explicit repo/target_dir/name → _resolve_context never shells out to
@@ -487,6 +710,7 @@ def test_install_service_aborts_on_compose_failure(tmp_path, monkeypatch):
     shared.write_text("")
     monkeypatch.setattr(cli, "SHARED_ENV", str(shared))
 
+    real_run = cli.subprocess.run
     calls: list[list[str]] = []
 
     class _Result:
@@ -494,6 +718,10 @@ def test_install_service_aborts_on_compose_failure(tmp_path, monkeypatch):
             self.returncode = returncode
 
     def fake_run(cmd, **kwargs):
+        # P0R-2's check_overlay_mismatch reads the overlay via a REAL bash
+        # subshell first — pass that one through; only intercept script calls.
+        if cmd[0] == "bash" and cmd[1] == "-c":
+            return real_run(cmd, **kwargs)
         calls.append(cmd)
         return _Result(1 if "compose-env.sh" in cmd[1] else 0)
 
@@ -513,6 +741,7 @@ def test_install_service_proceeds_on_compose_success(tmp_path, monkeypatch):
     shared.write_text("")
     monkeypatch.setattr(cli, "SHARED_ENV", str(shared))
 
+    real_run = cli.subprocess.run
     calls: list[list[str]] = []
 
     class _Result:
@@ -520,6 +749,8 @@ def test_install_service_proceeds_on_compose_success(tmp_path, monkeypatch):
             self.returncode = returncode
 
     def fake_run(cmd, **kwargs):
+        if cmd[0] == "bash" and cmd[1] == "-c":
+            return real_run(cmd, **kwargs)
         calls.append(cmd)
         return _Result(0)
 

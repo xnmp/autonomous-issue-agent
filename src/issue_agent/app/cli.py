@@ -167,11 +167,30 @@ def read_repo_env_field(path: str, field: str) -> str:
 
 
 def derive_name(repo: str) -> str:
-    """Fallback overlay name from a repo slug: lowercased basename, safe chars.
+    """Fallback overlay name from a repo slug: OWNER-NAME, lowercased, safe chars.
 
-    my-org/example-agent → example-agent
+    P0R-2: the prior basename-only form collided across owners — `acme/app`
+    and `other/app` both derived `"app"`, so `resolve_name` could reuse ONE
+    owner's overlay (REPO/TARGET_DIR and all) while running against the
+    OTHER's checkout, with no warning (the M12 residual-warning tier only
+    fires on a TARGET_DIR match, which a same-basename-different-owner repo
+    won't have either). Including the owner mirrors config.py::_repo_slug's
+    `owner/name` -> `owner-name` join (so overlay names and default state-dir
+    slugs stay the same shape) but ALSO lowercases + sanitizes to safe
+    filename chars, since this becomes a `config/repos/<name>.env` FILENAME,
+    not just a directory-component suffix appended to a fixed prefix.
+
+    my-org/example-agent → my-org-example-agent
+
+    Back-compat: this only changes what a NEWLY synthesized name looks like.
+    `resolve_name` finds an EXISTING overlay (any name) by reading its actual
+    REPO/TARGET_DIR fields, never by recomputing derive_name against it — so
+    an overlay from before this change (named after the old bare basename)
+    that still matches the detected repo is found and reused exactly as
+    before; derive_name is only consulted on the "nothing matched" fallback.
     """
-    base = repo.split("/")[-1].lower() if repo else ""
+    parts = [p for p in repo.split("/") if p] if repo else []
+    base = "-".join(parts).lower()
     return re.sub(r"[^a-z0-9._-]", "-", base).strip("-") or "target"
 
 
@@ -231,6 +250,66 @@ def resolve_name(
                     )
                     break
     return derive_name(repo)
+
+
+def _overlay_context_mismatch(overlay: str, repo: str, target_dir: str) -> str:
+    """'' if `overlay` (a path) agrees with the DETECTED `(repo, target_dir)`
+    pair — or the overlay doesn't record enough to compare — else a
+    human-readable description naming both sides (P0R-2).
+
+    REPO is the primary identity check: a same-basename collision across
+    owners (`derive_name`'s fallback, or a hand-picked `--name`) can point
+    `resolve_name`'s caller at an overlay for a COMPLETELY DIFFERENT repo —
+    reusing it launches all three daemons against that other repo/checkout:
+    it will label issues, open PRs, and merge there.
+
+    TARGET_DIR is consulted ONLY as a fallback identity signal when the
+    overlay records NO REPO at all — never as an independent axis once REPO
+    already agrees. `resolve_name`'s Tier-3 fallback (same REPO, but no
+    overlay's TARGET_DIR matches the detected one — e.g. two checkouts of one
+    repo, or the checkout moved) is legitimate, tested, back-compat behavior;
+    treating a REPO-agreeing, TARGET_DIR-differing overlay as a mismatch here
+    would refuse that supported case, not the wrong-repo danger this guard
+    targets.
+    """
+    repo = (repo or "").strip()
+    target_dir = (target_dir or "").strip()
+    name = os.path.basename(overlay)
+    overlay_repo = read_repo_env_field(overlay, "REPO").strip()
+    if overlay_repo:
+        if repo and overlay_repo != repo:
+            return (
+                f"config/repos/{name} is REPO={overlay_repo!r}; this checkout/flags "
+                f"detected REPO={repo!r}"
+            )
+        return ""
+    overlay_target = read_repo_env_field(overlay, "TARGET_DIR").strip()
+    if overlay_target and target_dir and (
+        os.path.realpath(overlay_target) != os.path.realpath(target_dir)
+    ):
+        return (
+            f"config/repos/{name} is TARGET_DIR={overlay_target!r} (no REPO recorded); "
+            f"this checkout is {target_dir!r}"
+        )
+    return ""
+
+
+def check_overlay_mismatch(
+    name: str, repo: str, target_dir: str, repos_dir: str | None = None
+) -> str:
+    """`_overlay_context_mismatch` for the overlay `name` resolves to in
+    `repos_dir` (default: the live `REPOS_DIR`, read at call time so a test's
+    `monkeypatch.setattr(cli, "REPOS_DIR", ...)` is honored — unlike a
+    parameter default, which would freeze the value this function was
+    DEFINED with). '' when the overlay doesn't exist yet: that path is about
+    to SYNTHESIZE a fresh overlay from the detected context, not reuse a
+    possibly-mismatched one.
+    """
+    base = repos_dir if repos_dir is not None else REPOS_DIR
+    overlay = os.path.join(base, f"{name}.env")
+    if not os.path.isfile(overlay):
+        return ""
+    return _overlay_context_mismatch(overlay, repo, target_dir)
 
 
 def _q(value: str) -> str:
@@ -564,6 +643,25 @@ def cmd_start(args) -> int:
         print()
 
     overlay = os.path.join(REPOS_DIR, f"{name}.env")
+    # P0R-2: about to REUSE (not `--write-config` regenerate) an overlay found
+    # under `name` — refuse if it was written for a different repo/checkout.
+    # Silently proceeding would label issues, open PRs, and merge in the
+    # WRONG place; silently synthesizing a second overlay would orphan
+    # whichever deployment is real. Only the operator can tell which, so this
+    # is fatal, not a warning.
+    if os.path.isfile(overlay) and not args.write_config:
+        mismatch = check_overlay_mismatch(name, repo, target_dir)
+        if mismatch:
+            err(f"REFUSING to reuse config/repos/{name}.env — wrong repo/checkout:")
+            err(f"  {mismatch}")
+            err(
+                "Reusing it would run fix/review/steward against a DIFFERENT repo "
+                "and checkout: labeling issues, opening PRs, and merging there. Pass "
+                f"--name <other> to pick the overlay that matches {repo!r} at "
+                f"{target_dir!r}, or --write-config to (re)synthesize "
+                f"config/repos/{name}.env for THIS checkout."
+            )
+            return 2
     if not os.path.isfile(overlay) or args.write_config:
         os.makedirs(REPOS_DIR, exist_ok=True)
         # Resolve TEST_CMD: explicit flag wins; else probe the repo with a cheap
@@ -603,7 +701,17 @@ def cmd_start(args) -> int:
 
 
 def cmd_stop(args) -> int:
-    repo, _target, name = _resolve_context(args)
+    repo, target_dir, name = _resolve_context(args)
+    # P0R-2: refuse rather than SIGTERM another deployment's daemons. Fatal
+    # (not a warning) because this command is destructive — unlike `status`,
+    # there is no read-only-so-warn-and-proceed option here.
+    mismatch = check_overlay_mismatch(name, repo, target_dir)
+    if mismatch:
+        err(f"REFUSING to stop '{name}' — wrong repo/checkout:")
+        err(f"  {mismatch}")
+        err("This would SIGTERM another deployment's daemons. Pass --name <other> "
+            "for the overlay that matches this checkout.")
+        return 2
     launchers = _launcher_pids(name)
     roles = _role_pids(name)
     pids = sorted(set(launchers) | {p for ps in roles.values() for p in ps})
@@ -767,7 +875,15 @@ def spend_status_lines(
 
 
 def cmd_status(args) -> int:
-    repo, _target, name = _resolve_context(args)
+    repo, target_dir, name = _resolve_context(args)
+    # P0R-2: warn, don't refuse — status is read-only (no SIGTERM, no service
+    # install, no dispatch), so a mismatched overlay is misleading, not
+    # dangerous. Showing it anyway keeps `status` usable to *diagnose* exactly
+    # this collision from either checkout, which refusing would prevent.
+    mismatch = check_overlay_mismatch(name, repo, target_dir)
+    if mismatch:
+        warn(f"config/repos/{name}.env does not match this checkout — showing it anyway (status is read-only):")
+        warn(f"  {mismatch}")
     roles = _role_pids(name)
     launchers = _launcher_pids(name)
     print(_c("36", f"▸ status for '{name}'" + (f"  ({repo})" if repo else "")))
@@ -807,7 +923,20 @@ def cmd_status(args) -> int:
 def cmd_doctor(args) -> int:
     """Compose env for this repo (if detectable) then run bin/doctor.sh, which
     reads AGENT_ENV. With no repo context it still runs tooling/identity checks."""
-    _repo, _target, name = _resolve_context(args)
+    repo, target_dir, name = _resolve_context(args)
+    # P0R-2: fatal, not a warning. doctor.sh's own per-repo state-dir collision
+    # check (bin/doctor.sh) can only compare MULTIPLE overlays against each
+    # other — it is blind to exactly this case (one overlay, wrong repo).
+    # Composing env for the wrong repo and reporting "✓" gives false
+    # confidence right before an operator runs `start` for real.
+    mismatch = check_overlay_mismatch(name, repo, target_dir)
+    if mismatch:
+        err(f"REFUSING to run doctor for '{name}' — wrong repo/checkout:")
+        err(f"  {mismatch}")
+        err("Preflight would check identities/access for the WRONG repo and could "
+            "report a false ✓. Pass --name <other> for the overlay that matches "
+            "this checkout.")
+        return 2
     env = dict(os.environ)
     overlay = os.path.join(REPOS_DIR, f"{name}.env")
     if os.path.isfile(SHARED_ENV) and os.path.isfile(overlay):
@@ -844,10 +973,20 @@ def cmd_triage(args) -> int:
 
 
 def cmd_install_service(args) -> int:
-    _repo, _target, name = _resolve_context(args)
+    repo, target_dir, name = _resolve_context(args)
     overlay = os.path.join(REPOS_DIR, f"{name}.env")
     if not (os.path.isfile(SHARED_ENV) and os.path.isfile(overlay)):
         err(f"need config/shared.env + config/repos/{name}.env first (run `issue-agent start` once).")
+        return 2
+    # P0R-2: fatal. This installs a PERSISTENT OS service (systemd/launchd) —
+    # worse than a one-shot `start` against the wrong repo, since it keeps
+    # relaunching against it after this process exits.
+    mismatch = check_overlay_mismatch(name, repo, target_dir)
+    if mismatch:
+        err(f"REFUSING to install a service for '{name}' — wrong repo/checkout:")
+        err(f"  {mismatch}")
+        err("This would install a PERSISTENT service running against a DIFFERENT "
+            "repo. Pass --name <other> for the overlay that matches this checkout.")
         return 2
     # A4 fold-in: this used to run with check=False and never look at the
     # return code — a compose failure (bad overlay syntax, missing file

@@ -15,7 +15,15 @@ from enum import Enum
 from .actions import Action, AgentKind, Relabel, RunAgent, Target
 from .identity import login_eq
 from .labels import Label
+from .lifecycle import pr_escalation, retry_breaker
 from .world import PRView, WorldState, REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED
+
+# Ceiling on UNPRODUCTIVE review rounds per PR (see ReviewConfig). Deliberately
+# the same order of magnitude as the fixer's MAX_INFRA_DEATHS: high enough that
+# ordinary transport flakiness never hands a PR to a human, low enough that a
+# permanently-broken PR costs single-digit sessions instead of one per poll
+# forever.
+DEFAULT_MAX_UNPRODUCTIVE_ROUNDS = 5
 
 
 class IdentityMode(str, Enum):
@@ -104,6 +112,17 @@ class ReviewConfig:
     # Guarded: drafts, the review bot's OWN PRs, and PRs carrying the opt-out label
     # are never adopted.
     adopt_unlabeled: bool = False
+    # Ceiling on UNPRODUCTIVE review rounds for one PR (review P0R-3). <=0 disables,
+    # like every other breaker in the harness.
+    #
+    # The reviewer had NO ceiling of any kind. Every non-persisting outcome — a
+    # session that died before returning a result, an is_error result, a MULTI
+    # fan-out whose gate or dimension legs died so `synthesize_review` returned
+    # None — leaves `needs_initial_review`/`needs_re_review` True, so the SAME
+    # dispatch (under MULTI: the whole gate + 5 dimensions + N validators
+    # fan-out) is paid for again on the very next poll, forever. This is the
+    # bound. See ReviewState.unproductive_rounds for what is counted.
+    max_unproductive_rounds: int = DEFAULT_MAX_UNPRODUCTIVE_ROUNDS
 
 
 @dataclass(frozen=True)
@@ -112,6 +131,25 @@ class ReviewState:
 
     sessions: frozenset[int] = frozenset()       # PRs already reviewed once
     last_sha: dict[int, str] = field(default_factory=dict)  # PR → last reviewed head SHA
+    # PR number → how many review rounds were PAID FOR without advancing any
+    # state (review P0R-3/P0R-4). One counter, because both shapes cost exactly
+    # one full paid round and neither leaves a trace the round-based state
+    # machine can see:
+    #
+    #   * the session died before returning a result — the dispatcher's
+    #     `except BaseException` bump, or (when the daemon itself was killed and
+    #     could not run that bump) a journal `agent_run_start` with no settled
+    #     twin; and
+    #   * the workflow ran to completion but persisted nothing — an is_error
+    #     result, a failed submit POST, a MULTI gate/dimension leg that died so
+    #     synthesis returned None.
+    #
+    # Keyed by PR NUMBER here: the two write sides use different store keys (the
+    # linked issue number, or the negated PR number when a PR has no resolvable
+    # issue), and reconciling those key spaces is the adapter's job
+    # (`app.roles._review_state` reads their union) so the domain sees one
+    # number per PR.
+    unproductive_rounds: dict[int, int] = field(default_factory=dict)
 
 
 def needs_initial_review(pr: PRView, state: ReviewState) -> bool:
@@ -158,15 +196,47 @@ def count_prior_rejections(reviews: tuple, review_bot: str) -> int:
 def should_adopt(pr: PRView, cfg: ReviewConfig) -> bool:
     """A rogue (non-pipeline) PR that should be pulled into review. True iff
     adoption is on, the PR is OPEN, carries neither the trigger label nor the
-    opt-out label, is not a draft, and was not opened by the review bot itself
-    (never review our own output; avoids a self-review loop)."""
+    opt-out label nor needs-human-review, is not a draft, and was not opened by
+    the review bot itself (never review our own output; avoids a self-review
+    loop).
+
+    The needs-human-review exclusion is what makes the unproductive-round
+    ceiling below actually STOP the money on an adopting deployment: escalation
+    swaps the trigger label for needs-human-review, which drops the PR out of
+    `prs_with(trigger_label)` — straight into the adoption sweep, which would
+    re-label and re-dispatch it on the very next poll. An escalated PR belongs
+    to a human; adoption must not take it back."""
     return (
         cfg.adopt_unlabeled
         and pr.state == "OPEN"
         and not pr.has(cfg.trigger_label)
         and not pr.has(Label.NO_AI_REVIEW)
+        and not pr.has(Label.NEEDS_HUMAN_REVIEW)
         and not pr.is_draft
         and not login_eq(pr.author, cfg.review_bot)
+    )
+
+
+# ── circuit breaker (review P0R-3) ────────────────────────────────────────────
+def unproductive_ceiling_hit(state: ReviewState, cfg: ReviewConfig, pr: int) -> bool:
+    """This PR has burned its budget of review rounds that bought nothing.
+    Mirrors `domain.fix.infra_ceiling_hit` (same `retry_breaker` primitive,
+    same cap<=0-disables convention); separate because the reviewer's counter
+    is PR-keyed and folds in the non-dispatch-death stalls too."""
+    return retry_breaker(
+        state.unproductive_rounds.get(pr, 0), cfg.max_unproductive_rounds
+    ).tripped
+
+
+def unproductive_escalation_reason(cap: int) -> str:
+    """Human-facing text for a reviewer ceiling escalation. Names both causes,
+    because the operator's next move differs: repeated pre-result deaths point
+    at the runtime/daemon, repeated no-verdict rounds at the model, the budget
+    or the PR itself (a diff too large to review)."""
+    return (
+        f"{cap} review rounds on this PR ended without a verdict — the review "
+        "session died before returning a result, errored, or could not submit. "
+        "No review was recorded, so the harness has stopped paying for retries."
     )
 
 
@@ -183,7 +253,18 @@ def decide_review(
     immediately so a comment lands on the first tick instead of a poll later.
     (The review reads the diff by PR number and does not depend on the label
     being present yet; saving the session this tick means the labelled PR is not
-    re-reviewed next poll.)"""
+    re-reviewed next poll.)
+
+    **Ceiling (review P0R-3).** Nothing here consumes a lock or a counter — one
+    RunAgent per eligible PR per poll, unconditionally — so a PR whose review
+    never persists state (session dies pre-result, agent errors, MULTI fan-out
+    synthesises nothing) is re-dispatched at FULL cost every single poll,
+    forever. `unproductive_rounds` is the bound: at the cap the dispatch is
+    withheld and the PR is handed to a human instead, through the same
+    `pr_escalation` every other breaker uses (so the Executor's funnel emits the
+    escalation event + ALERT_CMD). The escalation is edge-triggered on the
+    needs-human-review label: a PR already carrying it is silently skipped, so a
+    stuck relabel cannot turn the paid loop into a comment loop."""
     if cfg.identity_mode == IdentityMode.SOLO:
         return []
     actions: list[Action] = []
@@ -191,11 +272,28 @@ def decide_review(
         if pr.state != "OPEN":
             continue
         if needs_initial_review(pr, state):
-            actions.append(RunAgent(AgentKind.REVIEW, pr.number))
+            kind = AgentKind.REVIEW
         elif needs_re_review(pr, state):
-            actions.append(RunAgent(AgentKind.RE_REVIEW, pr.number))
+            kind = AgentKind.RE_REVIEW
+        else:
+            continue  # nothing to do — the ceiling is about DISPATCHES, not PRs
+        if unproductive_ceiling_hit(state, cfg, pr.number):
+            if not pr.has(Label.NEEDS_HUMAN_REVIEW):
+                actions.extend(pr_escalation(
+                    pr.number,
+                    unproductive_escalation_reason(cfg.max_unproductive_rounds),
+                    from_label=cfg.trigger_label,
+                ).actions())
+            continue
+        actions.append(RunAgent(kind, pr.number))
     for pr in world.prs:
-        if should_adopt(pr, cfg):
+        # A rogue PR is adopted AND reviewed the same tick, so the ceiling must be
+        # checked here too — otherwise adoption is a second, unbounded entrance to
+        # exactly the loop above. No escalation on this arm: the PR carries no
+        # trigger label to swap yet, and once adoption has labelled it (which
+        # happens on the tick BEFORE any dispatch can fail) it escalates through
+        # the labelled arm like any other.
+        if should_adopt(pr, cfg) and not unproductive_ceiling_hit(state, cfg, pr.number):
             actions.append(Relabel(Target.PR, pr.number, None, cfg.trigger_label))
             actions.append(RunAgent(AgentKind.REVIEW, pr.number))
     return actions

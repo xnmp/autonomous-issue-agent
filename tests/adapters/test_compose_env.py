@@ -6,6 +6,16 @@ operator config. It now snapshots the environment before/after sourcing
 shared.env + the per-repo overlay and emits the diff — every var either file
 defined, with no allow-list to fall out of sync.
 
+P0R-1: that C5(a) fix regressed in the opposite direction — a PRE/POST diff
+emits a var only when it is NEW or CHANGED, so a var the files DO assign to
+the value the launching shell already exported was byte-identical in both
+snapshots and silently dropped (`FOO="${FOO:-default}"`, or a TEST_CMD
+matching the operator's exported value). compose-env.sh now emits the UNION of
+the diff and the assignment names scanned out of the two files. The suite was
+green with that bug present because every test asserted MEMBERSHIP of a
+happy-path example or ABSENCE of ambient leakage; none asserted that an
+assigned var is still emitted. Hence the set-equality test below.
+
 C5(b): nothing exported the composed config into os.environ, so under systemd
 (unit files set only AGENT_ENV + TARGET_DIR) every subprocess spawned
 downstream (bash gate checkers, git, gh, codex — none of which pass `env=`
@@ -34,6 +44,8 @@ no real gh auth / tree-sitter needed) — per the wave brief's suggestion to
 from __future__ import annotations
 
 import os
+import re
+import shlex
 import stat
 import subprocess
 from pathlib import Path
@@ -108,6 +120,54 @@ def _install_compose_env(tmp_path: Path) -> Path:
     dest.write_text(COMPOSE_ENV_SH.read_text())
     dest.chmod(dest.stat().st_mode | stat.S_IEXEC)
     return dest
+
+
+def _compose(tmp_path: Path, shared: str, overlay: str, ambient: dict | None = None) -> Path:
+    """Write a shared.env + repos/demo.env fixture pair, run the REAL
+    compose-env.sh over them with `ambient` merged into the launching shell's
+    environment, and return the composed .active.env path. An `ambient` value
+    of None DELETES that var from the launching environment, so a test can
+    assert on the "operator has not exported it" case without depending on
+    whatever the developer's shell happens to hold."""
+    compose_env_sh = _install_compose_env(tmp_path)
+    (tmp_path / "config").mkdir(exist_ok=True)
+    (tmp_path / "config" / "shared.env").write_text(shared)
+    repos_dir = tmp_path / "config" / "repos"
+    repos_dir.mkdir(exist_ok=True)
+    (repos_dir / "demo.env").write_text(overlay)
+
+    env = dict(os.environ)
+    for key, value in (ambient or {}).items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
+    subprocess.run(
+        ["bash", str(compose_env_sh), "demo"],
+        check=True, capture_output=True, text=True, env=env,
+    )
+    return tmp_path / "config" / ".active.env"
+
+
+def _emitted(active: Path) -> dict[str, str]:
+    """The KEY=%q-VALUE lines of a composed .active.env, as a dict of the RAW
+    (still shell-quoted) values. `printf %q` always emits a single line, so
+    line-splitting is safe even for values containing newlines. Use
+    `_load_agent_env` when the unquoted value matters."""
+    out = {}
+    for line in active.read_text().splitlines():
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        out[key] = value
+    return out
+
+
+# `NAME=` / `export NAME=` at the start of a line — an INDEPENDENT restatement
+# (Python re, not the script's grep) of "a name these config files assign", so
+# the set-equality test below cannot pass by mirroring the implementation.
+_ASSIGN_RE = re.compile(r"^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)=", re.MULTILINE)
+_UNSET_RE = re.compile(r"^[ \t]*unset[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*$", re.MULTILINE)
 
 
 # ── C5(a) + acceptance pipeline (wave centerpiece) ─────────────────────────────
@@ -220,6 +280,223 @@ def test_compose_env_missing_overlay_fails_loud(tmp_path):
     )
     assert result.returncode != 0
     assert "nonexistent.env" in result.stderr
+
+
+# ── P0R-1: a var the files assign must be emitted even when it is unchanged ───
+def test_compose_env_emits_assigned_var_whose_value_equals_the_ambient_shells(tmp_path):
+    # THE regression test. shared.env assigns TEST_CMD; the launching shell
+    # already exports the byte-identical value, so the PRE/POST diff sees no
+    # change and (pre-fix) omitted it. Under systemd — units pass only
+    # AGENT_ENV + TARGET_DIR — the daemon then read TEST_CMD=None, the bash
+    # gate checkers failed closed, and every push / `gh pr create` was denied
+    # forever. Asserted end-to-end through the real loader, because "present in
+    # the file text" is not the property that matters; "reaches the daemon" is.
+    active = _compose(
+        tmp_path,
+        shared='TEST_CMD="uv run pytest -q"\n',
+        overlay='REPO="acme/widget"\n',
+        ambient={"TEST_CMD": "uv run pytest -q"},
+    )
+    assert "TEST_CMD" in _emitted(active)
+    assert _load_agent_env({"AGENT_ENV": str(active)})["TEST_CMD"] == "uv run pytest -q"
+
+
+def test_compose_env_file_value_wins_when_it_differs_from_the_ambient_shells(tmp_path):
+    # Anti-vacuity twin: the fix must not degrade into "emit whatever the
+    # ambient shell had". When the file disagrees with the environment, the
+    # FILE wins — that is the whole point of an overlay.
+    active = _compose(
+        tmp_path,
+        shared='TEST_CMD="uv run pytest -q"\n',
+        overlay='REPO="acme/widget"\n',
+        ambient={"TEST_CMD": "make check"},
+    )
+    assert _load_agent_env({"AGENT_ENV": str(active)})["TEST_CMD"] == "uv run pytest -q"
+
+
+def test_compose_env_emits_parameter_expansion_default_with_the_ambient_value(tmp_path):
+    # The `${VAR:-default}` idiom main.py's `_load_agent_env` docstring names as
+    # the reason these files are shell syntax. With the var already exported the
+    # assignment is a no-op — but the var IS config and must be emitted, with
+    # the ambient value (not the fallback).
+    active = _compose(
+        tmp_path,
+        shared='ANTHROPIC_AUTH_TOKEN="${ANTHROPIC_AUTH_TOKEN:-fallback}"\n',
+        overlay='REPO="acme/widget"\n',
+        ambient={"ANTHROPIC_AUTH_TOKEN": "sk-ambient-real"},
+    )
+    env = _load_agent_env({"AGENT_ENV": str(active)})
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "sk-ambient-real"
+
+
+def test_compose_env_falls_back_when_the_expansion_default_actually_fires(tmp_path):
+    # Anti-vacuity twin of the above: with nothing ambient, the documented
+    # fallback is what lands.
+    active = _compose(
+        tmp_path,
+        shared='ANTHROPIC_AUTH_TOKEN="${ANTHROPIC_AUTH_TOKEN:-fallback}"\n',
+        overlay='REPO="acme/widget"\n',
+        ambient={"ANTHROPIC_AUTH_TOKEN": None},
+    )
+    assert _load_agent_env({"AGENT_ENV": str(active)})["ANTHROPIC_AUTH_TOKEN"] == "fallback"
+
+
+def test_compose_env_emitted_key_set_equals_the_names_the_files_assign(tmp_path):
+    # review §5's structural lesson: for anything that emits a SET, assert set
+    # equality against an independently-derived expectation, never membership
+    # of the happy-path examples — membership is exactly what let P0R-1 ship
+    # green. The expectation is re-derived here from the fixture text with a
+    # Python regex, so omitting ANY var (not just the ones this test happens to
+    # name) fails, and so does leaking any extra one.
+    shared = (
+        # unchanged vs. ambient — the P0R-1 shape
+        'TEST_CMD="uv run pytest -q"\n'
+        'ANTHROPIC_AUTH_TOKEN="${ANTHROPIC_AUTH_TOKEN:-fallback}"\n'
+        # overridden by the overlay
+        'MERGE_METHOD="merge"\n'
+        # assignment-shaped lines that must NOT count
+        '# COMMENTED_KNOB="nope"\n'
+        '#TIGHT_COMMENT="nope"\n'
+        '\t# INDENTED_COMMENT="nope"\n'
+        # leading whitespace + export prefix, which MUST count
+        '  export INDENTED_EXPORT="yes"\n'
+        # assigned then unset: a name the scan sees but POST does not have, so
+        # it must not be emitted as an empty string
+        'GONE_LATER="temp"\n'
+        'unset GONE_LATER\n'
+        # set INDIRECTLY, via a nested `source` (no assignment-shaped line in
+        # either config file names it) — proves the PRE/POST diff arm of the
+        # union is still load-bearing and was not replaced by the file scan.
+        '. "$(dirname "${BASH_SOURCE[0]}")/nested.env"\n'
+    )
+    overlay = (
+        'REPO="acme/widget"\n'
+        'MERGE_METHOD="squash"\n'
+        'CI_IGNORE_CHECKS="Format.*"\n'
+        'EMPTY_ON_PURPOSE=\n'
+    )
+    (tmp_path / "config").mkdir(exist_ok=True)
+    (tmp_path / "config" / "nested.env").write_text('INDIRECT_FROM_NESTED_SOURCE="via-nested"\n')
+    active = _compose(
+        tmp_path, shared, overlay,
+        ambient={
+            "TEST_CMD": "uv run pytest -q",
+            "ANTHROPIC_AUTH_TOKEN": "sk-ambient-real",
+            "SOME_UNRELATED_AMBIENT_VAR": "should-not-leak",
+        },
+    )
+
+    expected = set(_ASSIGN_RE.findall(shared)) | set(_ASSIGN_RE.findall(overlay))
+    expected -= set(_UNSET_RE.findall(shared)) | set(_UNSET_RE.findall(overlay))
+    expected |= {"INDIRECT_FROM_NESTED_SOURCE"}
+    assert set(_emitted(active)) == expected
+
+    env = _load_agent_env({"AGENT_ENV": str(active)})
+    assert env["TEST_CMD"] == "uv run pytest -q"
+    assert env["ANTHROPIC_AUTH_TOKEN"] == "sk-ambient-real"
+    assert env["MERGE_METHOD"] == "squash"
+    assert env["INDENTED_EXPORT"] == "yes"
+    assert env["EMPTY_ON_PURPOSE"] == ""
+    assert env["INDIRECT_FROM_NESTED_SOURCE"] == "via-nested"
+
+
+def test_compose_env_emits_only_sourceable_identifier_names(tmp_path):
+    # `set -a` exports FUNCTIONS as well as variables, so a helper defined in a
+    # config file appears in `env -0` as `BASH_FUNC_name%%=() {...}`. Emitted
+    # verbatim it made .active.env unsourceable — the line parses as a command
+    # ("BASH_FUNC_name%%=...: command not found"), which is exactly the file
+    # both `_load_agent_env` and the bash tools `source`. Assert the composed
+    # file is clean AND that sourcing it is silent.
+    active = _compose(
+        tmp_path,
+        shared='_helper() { HELPED="yes"; }\n_helper\nFIX_BOT="fix-bot"\n',
+        overlay='REPO="acme/widget"\n',
+    )
+    assert not [k for k in _emitted(active) if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k)]
+    proc = subprocess.run(
+        ["bash", "-c", 'set -a; source "$1"; set +a', "check", str(active)],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0
+    assert proc.stderr == ""
+    # The variable the function set is still config and still arrives.
+    assert _load_agent_env({"AGENT_ENV": str(active)})["HELPED"] == "yes"
+
+
+def test_compose_env_skips_commented_assignments_and_names_unset_after_assignment(tmp_path):
+    # Focused twin of the set-equality test's negative half, so a failure here
+    # points straight at the file-scan's anchor rather than at the whole set.
+    active = _compose(
+        tmp_path,
+        shared=(
+            '# COMMENTED_KNOB="nope"\n'
+            '#TIGHT_COMMENT="nope"\n'
+            '  # INDENTED_COMMENT="nope"\n'
+            'GONE_LATER="temp"\n'
+            'unset GONE_LATER\n'
+            '  export INDENTED_EXPORT="yes"\n'
+        ),
+        overlay='REPO="acme/widget"\n',
+        # The commented names are ALSO exported ambiently: if the scan ever
+        # matched a comment, they would be emitted with these values, which is
+        # the leak this asserts against.
+        ambient={"COMMENTED_KNOB": "leaked", "TIGHT_COMMENT": "leaked"},
+    )
+    emitted = _emitted(active)
+    assert "COMMENTED_KNOB" not in emitted
+    assert "TIGHT_COMMENT" not in emitted
+    assert "INDENTED_COMMENT" not in emitted
+    assert "GONE_LATER" not in emitted
+    assert emitted.keys() == {"INDENTED_EXPORT", "REPO"}
+
+
+def test_compose_env_scans_a_final_line_with_no_trailing_newline(tmp_path):
+    # A hand-edited overlay whose last line has no "\n" is the shape most
+    # likely to be silently half-scanned. The last knob must still be emitted
+    # even though its value matches the ambient shell's (the P0R-1 condition).
+    active = _compose(
+        tmp_path,
+        shared='A_KNOB="one"\nB_KNOB="two"',  # deliberately unterminated
+        overlay='REPO="acme/widget"',          # deliberately unterminated
+        ambient={"A_KNOB": "one", "B_KNOB": "two", "REPO": "acme/widget"},
+    )
+    assert set(_emitted(active)) == {"A_KNOB", "B_KNOB", "REPO"}
+
+
+def test_compose_env_omits_a_conditional_assignment_that_never_fired(tmp_path):
+    # A name the file scan sees inside a branch that did not execute, and that
+    # nothing else set, must NOT be emitted as an empty string — an empty
+    # TEST_CMD reads as "no test command" and is as bad as a missing one.
+    active = _compose(
+        tmp_path,
+        shared='if [ -n "${TRIGGER:-}" ]; then\n  MAYBE_KNOB="fired"\nfi\n',
+        overlay='REPO="acme/widget"\n',
+        ambient={"MAYBE_KNOB": None, "TRIGGER": None},
+    )
+    assert "MAYBE_KNOB" not in _emitted(active)
+
+
+def test_compose_env_roundtrips_awkward_values_byte_exactly(tmp_path):
+    # %q → `set -a; source` must be lossless for the values that break naive
+    # KEY=VALUE writers: spaces, both quote flavours, a literal newline, a
+    # trailing space, and a literal `$`. These values all also equal what the
+    # shell exports ambiently, so this doubles as a P0R-1 case at the awkward
+    # end of the value space.
+    values = {
+        "TEST_CMD": 'set -e; (cd backend && uv run pytest -q) && echo "done"',
+        "MULTILINE_KNOB": "line one\nline two\ttabbed",
+        "QUOTED_KNOB": "it's got 'single' and \"double\" quotes",
+        "TRAILING_SPACE_KNOB": "value with trailing space ",
+        "DOLLAR_KNOB": "$NOT_EXPANDED and ${ALSO_NOT}",
+    }
+    # shlex.quote writes each value as an unambiguous POSIX single-quoted bash
+    # token, so the fixture encodes exactly these bytes; the assertion is on
+    # the values that come back out, not on the encoding.
+    shared = "".join(f"{k}={shlex.quote(v)}\n" for k, v in values.items())
+    active = _compose(tmp_path, shared, 'REPO="acme/widget"\n', ambient=values)
+    env = _load_agent_env({"AGENT_ENV": str(active)})
+    for k, v in values.items():
+        assert env[k] == v, f"{k} did not round-trip"
 
 
 # ── S7/D3: main.py delivers env to subprocesses + loads it once ───────────────
