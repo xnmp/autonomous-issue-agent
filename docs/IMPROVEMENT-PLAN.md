@@ -11,14 +11,29 @@ grounding claims in `file:line` evidence, followed by direct verification of
 every headline claim. The 103 failure modes collapse into ten systemic causes
 (§2); the plan (§4) attacks causes, not symptoms.
 
-> **HANDOVER STATUS (2026-07-25).** This document is the complete handover:
-> review finished, **zero code changes made** — every finding below is
-> still-live as written. This file is uncommitted. Committed work = the lean
-> core (§4, execution strategy); everything else is trigger-gated backlog.
-> Next action: Phase 0, starting with P0.1 (`set_resumed_at`) and P0.2
-> (ADDRESS_REVIEW supersession gate) — both burn money today. Appendix A has
-> per-item implementation pointers; Appendices B–F preserve the audit
-> evidence so no re-audit is needed; Appendix G lists open questions.
+> **STATUS (2026-07-25, evening): LEAN CORE IMPLEMENTED.** The findings below
+> are preserved as the audit record, but most are now FIXED — see git log
+> (`8fa32a5`→HEAD). Landed: all of Phase 0 (V1–V10 closures: resume dedup
+> write-side, ADDRESS_REVIEW supersession gate + review-keyed breaker,
+> ExitReason taxonomy + infra-death dispatch policy, wall-clock caps on both
+> runners, gate test-run timeouts, fail-closed check-push + fail-closed
+> TEST_CMD w/ ALLOW_UNTESTED, list-truncation warnings, pgrep anchor,
+> token-mint retry), fixer deny-list (P3.1), AGENT.md resume-skip +
+> validator diff-scoping (P4.5/P4.2-lite), screenshot-per-AC evidence rule
+> (P3.6-lite), rate-limit/GhUnavailable detection (V10-lite), systemd-first +
+> logs out of /tmp (P2.6), resolved-config print + fail-loud REPO (P5.1-lite),
+> T3 loop-convergence property test, journal/ledger/spend-caps (P1-lite).
+> **T3 uncovered and we fixed three NEW bugs beyond the audit:** the RESOLVE
+> leg had NO circuit breaker (unbounded full-session loop — now
+> MAX_RESOLVE_RETRIES), the automerge marker was dead code (re-armed every
+> poll), and an empty-body reply stranded a blocked issue into the resolve
+> loop. Also fixed: per-repo systemd unit collision in install-systemd.sh.
+> **Everything else below remains trigger-gated backlog** (§4 table) —
+> notably GraphQL world query, reconciliation/leases, governor policy tiers,
+> model routing, review-cost items (P4.9–P4.11), config schema, contract
+> cassettes. Open questions in Appendix G still stand except Q1 (fixer deny
+> now includes background-network tools) and Q6 (bounded-retry: superseded by
+> the review-keyed breaker).
 
 ---
 

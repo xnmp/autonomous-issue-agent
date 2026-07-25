@@ -248,6 +248,19 @@ class HarnessConfig:
     codex_rate_limit_backoff_base: float = 60.0
     codex_max_rate_limit_wait: float = 180.0
     codex_max_rate_limit_retries: int = 5
+    # ── spend circuit breakers ────────────────────────────────────────────────
+    # Per-agent budgets (MAX_BUDGET_USD et al) bound ONE session; nothing bounded
+    # the aggregate, so a leg that retries forever spent without limit while every
+    # individual run stayed under budget. These two caps close that: lifetime spend
+    # on one issue, and today's spend across EVERY repo and role on this machine
+    # (they share one ledger — see adapters.journal.default_ledger_path). Hitting
+    # the issue cap escalates that issue to a human; hitting the daily cap pauses
+    # all dispatch until 00:00 UTC without touching any label. 0 disables either.
+    issue_spend_cap_usd: float = 25.0
+    daily_spend_cap_usd: float = 50.0
+    # Shell command fed each spend_block / escalation event as JSON on stdin.
+    # Blank = no alerting (the events are still journalled).
+    alert_cmd: str = ""
 
     @property
     def repository(self) -> RepositoryConfig:
@@ -379,6 +392,8 @@ class HarnessConfig:
         _require_non_negative(errors, "CODEX_MAX_RATE_LIMIT_RETRIES", self.codex_max_rate_limit_retries)
         _require_positive(errors, "CODEX_RATE_LIMIT_BACKOFF_BASE_SECONDS", self.codex_rate_limit_backoff_base)
         _require_positive(errors, "CODEX_MAX_RATE_LIMIT_WAIT_SECONDS", self.codex_max_rate_limit_wait)
+        _require_non_negative(errors, "ISSUE_SPEND_CAP_USD", self.issue_spend_cap_usd)
+        _require_non_negative(errors, "DAILY_SPEND_CAP_USD", self.daily_spend_cap_usd)
         return tuple(errors)
 
     def validate(self) -> None:
@@ -406,6 +421,9 @@ class HarnessConfig:
             f"review={self.max_review_retries} rebase={self.max_rebase_retries}",
             f"timeouts: idle={self.agent_idle_timeout:.0f}s "
             f"wall={self.agent_max_runtime:.0f}s",
+            f"spend_caps: issue=${self.issue_spend_cap_usd:.2f} "
+            f"daily=${self.daily_spend_cap_usd:.2f} "
+            f"alert={'set' if self.alert_cmd else 'none'}",
             f"state={self.state_dir or '(unset)'} target={self.target_dir or '(cwd)'}",
         ])
 
@@ -527,4 +545,7 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         ),
         codex_max_rate_limit_wait=float(e.get("CODEX_MAX_RATE_LIMIT_WAIT_SECONDS", "180") or 0),
         codex_max_rate_limit_retries=int(e.get("CODEX_MAX_RATE_LIMIT_RETRIES", "5") or 0),
+        issue_spend_cap_usd=float(e.get("ISSUE_SPEND_CAP_USD", "25") or 0),
+        daily_spend_cap_usd=float(e.get("DAILY_SPEND_CAP_USD", "50") or 0),
+        alert_cmd=e.get("ALERT_CMD", ""),
     )

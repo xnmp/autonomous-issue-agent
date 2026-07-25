@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from ..adapters.journal import alert, event_line
 from ..domain.actions import (
     Action,
     AddDependency,
@@ -28,6 +29,7 @@ from ..domain.actions import (
     RunAgent,
     Target,
 )
+from ..domain.labels import Label
 
 # gh subcommand kind per target.
 _KIND = {Target.ISSUE: "issue", Target.PR: "pr"}
@@ -45,6 +47,8 @@ class Executor:
         run_agent: Callable[[RunAgent], None] | None = None,
         log: Callable[[str], None] | None = None,
         mark_automerge: Callable[[int], None] | None = None,
+        journal=None,
+        alert_cmd: str = "",
     ):
         self.gateway = gateway
         self._remove_worktree = remove_worktree or (lambda issue: None)
@@ -59,6 +63,11 @@ class Executor:
         # auto-merge, worktree removal, agent dispatch) are visible instead of
         # inferred. One funnel = one audit trail. Default no-op keeps tests quiet.
         self._log = log or (lambda _m: None)
+        # Structured twin of the log line above: the same audit trail, machine-
+        # readable, so `issue-agent status` can answer "what changed overnight?"
+        # from a file instead of a human eyeballing rotated stderr. None = off.
+        self._journal = journal
+        self._alert_cmd = alert_cmd
 
     def _describe(self, action: Action) -> str:
         """Human-readable one-liner for the action being applied."""
@@ -84,9 +93,22 @@ class Executor:
             return f"dispatch {action.kind.name} #{action.number}"
         return repr(action)
 
+    def _escalated(self, action: Relabel) -> None:
+        """A move to needs-human-review is the harness saying "I'm out" — the ONE
+        state change that requires a person and the only one worth waking someone
+        for. Detected here, at the single funnel every write passes through, so no
+        future escalation path can be added without it being noticed."""
+        fields = {"target": _KIND[action.target], "number": action.number}
+        if self._journal is not None:
+            self._journal.emit("escalation", **fields)
+        alert(self._alert_cmd, event_line("escalation", **fields))
+
     def execute(self, action: Action) -> None:
         if not isinstance(action, NoOp):
-            self._log(self._describe(action))
+            desc = self._describe(action)
+            self._log(desc)
+            if self._journal is not None:
+                self._journal.emit("action", desc=desc)
         if isinstance(action, Relabel):
             self.gateway.relabel(
                 _KIND[action.target],
@@ -94,6 +116,10 @@ class Executor:
                 action.remove.value if action.remove else None,
                 action.add.value if action.add else None,
             )
+            # AFTER the write: an escalation that GitHub rejected did not happen,
+            # and a journal that claims it did is worse than one that is silent.
+            if action.add is Label.NEEDS_HUMAN_REVIEW:
+                self._escalated(action)
         elif isinstance(action, PostComment):
             self.gateway.comment(_KIND[action.target], action.number, action.body)
         elif isinstance(action, CloseIssue):

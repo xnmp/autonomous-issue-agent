@@ -49,7 +49,8 @@ e.g. `make point-at REPO=myapp`. `bin/point-at.sh` does, idempotently:
    local **`.git/info/exclude`** (`.claude/worktrees/`, `.harness/`, `.codex/`,
    `AGENTS.md`, non-image `evidence/`). Nothing is committed into the target.
 5. **Run all three watchers** in the foreground under one `trap` (Ctrl-C stops
-   all). Logs → `/tmp/issue-agent-<role>-<name>.log`. `uv` runs from the harness
+   all). Logs → `${XDG_STATE_HOME:-~/.local/state}/issue-agent/logs/<role>-<name>.log`
+   (override with `LOG_DIR`; systemd units log to journald). `uv` runs from the harness
    root (that's where the `issue_agent` package lives); each daemon self-chdirs
    into `TARGET_DIR` for its git/worktree ops.
 

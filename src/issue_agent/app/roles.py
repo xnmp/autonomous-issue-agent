@@ -20,6 +20,7 @@ from functools import partial
 
 from ..adapters.agent_runner import AgentRunner
 from ..adapters.github import GitHubGateway, Identity
+from ..adapters.journal import Journal, JournalingRuntime, default_ledger_path
 from ..adapters.store import Store
 from ..adapters.worktree import Worktrees
 from ..domain.fix import FixConfig, FixState, breaker_key, decide_fix
@@ -49,6 +50,27 @@ def _log(name: str):
         sys.stderr.flush()  # unbuffered: a crash right after must not eat the line
 
     return log
+
+
+def _journal(store: Store) -> Journal:
+    """Each role journals beside its own state, because each role already has an
+    isolated STATE_DIR — so three daemons never contend on one file. The GLOBAL
+    ledger is the deliberate exception: cost is the one quantity that must be
+    summed across every role and repo, and POSIX append atomicity makes sharing
+    it safe without a lock."""
+    return Journal(os.path.join(store.state_dir, "journal.jsonl"))
+
+
+def _spend_cfg(cfg: HarnessConfig, role: str, ledger: str) -> dict:
+    """The spend-breaker slice of DispatchConfig, identical for all three roles."""
+    return {
+        "role": role,
+        "repo": cfg.repo,
+        "spend_ledger_path": ledger,
+        "issue_spend_cap_usd": cfg.issue_spend_cap_usd,
+        "daily_spend_cap_usd": cfg.daily_spend_cap_usd,
+        "alert_cmd": cfg.alert_cmd,
+    }
 
 
 def _fix_state(store: Store, world) -> FixState:
@@ -99,6 +121,8 @@ def build_fix_daemon(
         max_rebase_retries=fix_runtime.max_rebase_retries,
         max_resolve_retries=fix_runtime.max_resolve_retries,
     )
+    journal = _journal(store)
+    ledger = default_ledger_path()
     dcfg = DispatchConfig(
         base_branch=repo_cfg.base_branch,
         fix=FixTaskConfig(
@@ -112,6 +136,7 @@ def build_fix_daemon(
         harness_root=cfg.runtime_paths.harness_root,
         log=_log("fix"),
         fix_bot=fix_runtime.bot,
+        **_spend_cfg(cfg, "fix", ledger),
     )
     # Fixer runtime: Codex (GPT-5.5) swaps the runner AND installs the governor as
     # a Codex hook in each worktree (the Claude runner gets its governor via SDK
@@ -163,17 +188,22 @@ def build_fix_daemon(
 
     executor = Executor(
         gateway, remove_worktree=worktrees.remove, log=_log("fix"),
-        mark_automerge=store.mark_automerge,
+        mark_automerge=store.mark_automerge, journal=journal, alert_cmd=cfg.alert_cmd,
     )
+    # Wrapped LAST, so the decorator sees whichever runtime actually ran (Claude or
+    # the Codex swap above) and the ledger is runtime-agnostic.
+    fix_runner = JournalingRuntime(fix_runner, journal, ledger, cfg.repo, "fix")
     dispatcher = AgentDispatcher(
-        dcfg, gateway, store, worktrees, fix_runner, executor, prepare_cwd=prepare_cwd
+        dcfg, gateway, store, worktrees, fix_runner, executor,
+        prepare_cwd=prepare_cwd, journal=journal,
     )
     executor._run_agent = lambda a: asyncio.run(dispatcher.dispatch(a))  # noqa: SLF001
 
     def decide(world):
         return decide_fix(world, fix_cfg, _fix_state(store, world), fixer_busy())
 
-    return Daemon("fix", gateway.build_world, decide, executor, cfg.poll_seconds, _log("fix"))
+    return Daemon("fix", gateway.build_world, decide, executor, cfg.poll_seconds,
+                  _log("fix"), journal=journal)
 
 
 def _review_state(store: Store, world) -> ReviewState:
@@ -187,6 +217,8 @@ def build_review_daemon(
 ) -> Daemon:
     repo_cfg = cfg.repository
     review_runtime = cfg.review_runtime
+    journal = _journal(store)
+    ledger = default_ledger_path()
     rcfg = ReviewConfig(
         review_bot=review_runtime.bot, identity_mode=repo_cfg.identity_mode,
         trigger_label=Label(review_runtime.trigger_label),
@@ -209,17 +241,23 @@ def build_review_daemon(
         review_trigger_label=review_runtime.trigger_label,
         review_mode=review_runtime.mode,
         log=_log("review"),
+        **_spend_cfg(cfg, "review", ledger),
     )
     # Reviewer has no worktree/issue side; pass a no-op Worktrees-like None usage.
-    executor = Executor(gateway, log=_log("review"))
-    dispatcher = AgentDispatcher(dcfg, gateway, store, None, runner, executor)
+    executor = Executor(gateway, log=_log("review"), journal=journal,
+                        alert_cmd=cfg.alert_cmd)
+    dispatcher = AgentDispatcher(
+        dcfg, gateway, store, None,
+        JournalingRuntime(runner, journal, ledger, cfg.repo, "review"),
+        executor, journal=journal,
+    )
     executor._run_agent = lambda a: asyncio.run(dispatcher.dispatch(a))  # noqa: SLF001
 
     def decide(world):
         return decide_review(world, rcfg, _review_state(store, world))
 
     return Daemon("review", gateway.build_review_world, decide, executor,
-                  cfg.poll_seconds, _log("review"))
+                  cfg.poll_seconds, _log("review"), journal=journal)
 
 
 _CODEOWNERS_PATHS = ("CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS")
@@ -256,6 +294,8 @@ def build_steward_daemon(
 ) -> Daemon:
     steward_log = _log("steward")
     repo_cfg = cfg.repository
+    journal = _journal(store)
+    ledger = default_ledger_path()
     steward_runtime = cfg.steward_runtime
     jira_runtime = cfg.jira_runtime
     tcfg_dom = TriageConfig(
@@ -296,9 +336,14 @@ def build_steward_daemon(
         triage_cfg=tcfg_dom,
         jira=jira_cfg,
         log=steward_log,
+        **_spend_cfg(cfg, "steward", ledger),
     )
-    executor = Executor(gateway, log=steward_log)
-    dispatcher = AgentDispatcher(dcfg, gateway, store, None, runner, executor)
+    executor = Executor(gateway, log=steward_log, journal=journal, alert_cmd=cfg.alert_cmd)
+    dispatcher = AgentDispatcher(
+        dcfg, gateway, store, None,
+        JournalingRuntime(runner, journal, ledger, cfg.repo, "steward"),
+        executor, journal=journal,
+    )
     executor._run_agent = lambda a: asyncio.run(dispatcher.dispatch(a))  # noqa: SLF001
 
     def decide(world):
@@ -316,4 +361,5 @@ def build_steward_daemon(
     # Jira needs closed ai-done issues too (for the final Done transition); triage
     # alone needs just open issues.
     observe = gateway.build_steward_world if jira_on else gateway.build_triage_world
-    return Daemon("steward", observe, decide, executor, cfg.poll_seconds, steward_log)
+    return Daemon("steward", observe, decide, executor, cfg.poll_seconds, steward_log,
+                  journal=journal)

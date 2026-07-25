@@ -523,6 +523,99 @@ def cmd_stop(args) -> int:
     return 0
 
 
+def journal_path(name: str) -> str:
+    """The repo journal for overlay `name`. STATE_DIR from the overlay is the
+    truth (an operator may point it anywhere); the fallback mirrors the layout
+    `synth_repo_env` writes, so status works on an overlay-less checkout too."""
+    overlay = os.path.join(REPOS_DIR, f"{name}.env")
+    raw = read_repo_env_field(overlay, "STATE_DIR")
+    state = (
+        os.path.expandvars(os.path.expanduser(raw)) if raw
+        else os.path.expanduser(f"~/.local/state/issue-agent-{name}")
+    )
+    return os.path.join(state, "journal.jsonl")
+
+
+def daily_cap(name: str) -> float:
+    """DAILY_SPEND_CAP_USD as status should report it: overlay wins over shared,
+    and an unset/garbled value falls back to the HarnessConfig default rather
+    than silently reporting a $0 (which reads as 'disabled')."""
+    for path in (os.path.join(REPOS_DIR, f"{name}.env"), SHARED_ENV):
+        raw = read_repo_env_field(path, "DAILY_SPEND_CAP_USD")
+        if raw:
+            try:
+                return float(raw)
+            except ValueError:
+                return 0.0
+    return 50.0
+
+
+def spend_status_lines(
+    journal_file: str, ledger_file: str, cap: float = 0.0, now_fn=None
+) -> list[str]:
+    """The spend/health section of `issue-agent status`, as plain lines.
+
+    Pure over the two files so it is testable without daemons: reads only, and an
+    absent or empty journal yields `[]` — a status command that shouts about a
+    missing file on a fresh install teaches operators to ignore it.
+
+    The three warnings are the failure shapes that cost real money and are
+    otherwise invisible until the bill: a leg that re-dispatches without
+    converging, a cap that actually fired, and work that quietly stopped because
+    it escalated to a human who has not looked yet.
+    """
+    from datetime import datetime, timezone
+
+    from ..adapters.journal import (
+        events_within,
+        read_events,
+        recent_runs,
+        repeated_dispatch_warning,
+        sum_today,
+    )
+
+    now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+    events = read_events(journal_file)
+    spent = sum_today(ledger_file, now_fn)
+    if not events and not spent:
+        return []
+
+    lines = ["", _c("36", "── spend & health ──")]
+    budget = f" / ${cap:.2f} cap" if cap > 0 else " (no daily cap)"
+    lines.append(f"  today, all repos: ${spent:.2f}{budget}")
+
+    runs = recent_runs(journal_file, 5)
+    if runs:
+        lines.append("  last runs:")
+        for r in runs:
+            why = r.get("exit_reason") or ("error" if r.get("is_error") else r.get("status") or "ok")
+            lines.append(
+                f"    {str(r.get('ts', ''))[:19]}  {r.get('kind', '?'):<14} "
+                f"#{r.get('number', '?'):<6} ${float(r.get('cost_usd', 0) or 0):>6.2f}  {why}"
+            )
+
+    warnings: list[str] = []
+    hour = events_within(events, 3600, now_fn)
+    loop = repeated_dispatch_warning(hour, 3600, 4)
+    if loop:
+        warnings.append(loop)
+    today = now_fn().strftime("%Y-%m-%d")
+    blocks = [e for e in events
+              if e.get("event") == "spend_block" and str(e.get("ts", ""))[:10] == today]
+    if blocks:
+        scopes = ", ".join(sorted({str(b.get("scope", "?")) for b in blocks}))
+        warnings.append(f"{len(blocks)} spend block(s) today (scope: {scopes}) — dispatch was skipped")
+    escalations = [e for e in events_within(events, 86400, now_fn)
+                   if e.get("event") == "escalation"]
+    if escalations:
+        where = ", ".join(f"{e.get('target', '?')} #{e.get('number', '?')}" for e in escalations[:5])
+        warnings.append(f"{len(escalations)} escalation(s) to needs-human-review in 24h: {where}")
+    if warnings:
+        lines.append(_c("33", "  WARNINGS:"))
+        lines.extend(f"    ! {w}" for w in warnings)
+    return lines
+
+
 def cmd_status(args) -> int:
     repo, _target, name = _resolve_context(args)
     roles = _role_pids(name)
@@ -546,6 +639,18 @@ def cmd_status(args) -> int:
         if os.path.isfile(log):
             print(_c("36", f"\n── tail {log} ──"))
             print(_run(["tail", "-n", str(args.lines), log]) or "  (empty)")
+    # Journal-backed summary. Wrapped: status must still report daemon liveness
+    # even if the journal is unreadable — the diagnostic must not be the thing
+    # that fails when things are going wrong.
+    try:
+        from ..adapters.journal import default_ledger_path
+
+        for line in spend_status_lines(
+            journal_path(name), default_ledger_path(), daily_cap(name)
+        ):
+            print(line)
+    except Exception as exc:  # noqa: BLE001
+        err(f"(could not read the event journal: {exc})")
     return 0
 
 

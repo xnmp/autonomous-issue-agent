@@ -511,7 +511,33 @@ operator mistakes — recorded so they aren't re-diagnosed as bugs.
 **103. `parse_pr(None)` `AttributeError` on empty `--repo`**
 - A one-off repro script ran without `AGENT_ENV`, so `--repo` was empty → GraphQL error → `d=None` → `.get()` crash. Operator error in the repro (not a daemon path); secondary hardening: guard `None` in `github.py:parse_pr`.
 
+**104. RESOLVE leg had no circuit breaker (unbounded full-cost loop)**
+- Found by the T3 loop-convergence property test (2026-07-25), not an incident:
+  an always-erroring resolve was requeued `ai-working → ai-ready` by
+  `resolve_actions` with nothing counting the attempt — a full paid session per
+  poll, forever, on the most expensive leg (same class as #39/#64). FIXED
+  2026-07-25: `MAX_RESOLVE_RETRIES` (default 3) counter bumped on every
+  requeue-outcome (infra deaths excluded), escalating the issue to
+  `needs-human-review` at the cap.
+
+**105. Automerge marker was dead code — re-armed every poll**
+- `store.mark_automerge` had zero production call sites, so
+  `FixState.automerge_enabled` was always empty and `should_automerge`'s
+  marker guard never engaged: one wasted `gh pr merge --auto` per merge-ready
+  PR per tick ($0, but API churn and a guard that read as protective while
+  inert). Found by T3 probe. FIXED 2026-07-25: the executor persists the
+  marker after `EnableAutoMerge`.
+
+**106. Empty-body human reply stranded a blocked issue into the resolve loop**
+- `resume()` early-returned on a whitespace-only reply AFTER decide had flipped
+  `ai-blocked → ai-working`: the reaper then requeued it `ai-ready`, converting
+  an awaiting-human issue into #104's unbounded RESOLVE loop. Found by T3
+  probe. FIXED 2026-07-25: the empty reply is consumed (resumed-at mark) and
+  the issue is relabeled back to `ai-blocked`.
+
 ---
 
 _Generated from transcript mining, 2026-07-21. ~103 distinct entries after
-dedup across 7 parallel search passes over the full transcript corpus._
+dedup across 7 parallel search passes over the full transcript corpus.
+#104–#106 added 2026-07-25 from the T3 convergence-test probe (see
+docs/IMPROVEMENT-PLAN.md)._

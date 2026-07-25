@@ -32,6 +32,10 @@ class Daemon:
     executor: Executor
     poll_seconds: int = 60
     log: Callable[[str], None] = lambda msg: None
+    # Optional JSONL journal (adapters.journal.Journal). Default None keeps every
+    # existing construction working; when set, the skipped-tick arm becomes a
+    # countable event rather than a line in a log nobody kept.
+    journal: object | None = None
 
     def tick(self) -> list[Action]:
         """One observe→decide→execute pass. Returns the actions taken (for tests
@@ -52,6 +56,11 @@ class Daemon:
                 f"{self.name}: world build failed: GitHub {exc.headline} — "
                 f"skipping tick, no actions taken ({exc.detail})"
             )
+            # Journalled too: a run of these is the difference between "the
+            # harness did nothing because there was nothing to do" and "the
+            # harness could not see" — indistinguishable from actions alone.
+            if self.journal is not None:
+                self.journal.emit("gh_unavailable", kind=exc.kind, detail=exc.detail)
             return []
         except Exception as exc:  # noqa: BLE001 - crash-isolate a poll
             self.log(f"{self.name}: poll pass failed (continuing): {exc}")
