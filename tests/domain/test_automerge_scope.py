@@ -47,6 +47,17 @@ def test_an_adopted_foreign_pr_is_never_automerged(branch):
     assert should_automerge(_pr(branch), FixState(), _cfg()) is False
 
 
+def test_a_conflicting_pr_is_not_armed():
+    """A CONFLICTING PR cannot merge no matter what gh is told — arming it
+    burned a gh call + verification probe and logged a refusal EVERY poll
+    until the rebase landed (#534, 2026-07-26). The rebase leg owns it;
+    automerge re-fires the first poll after the branch is mergeable again."""
+    pr = _pr("fix/506-icon", mergeable="CONFLICTING")
+    assert should_automerge(pr, FixState(), _cfg()) is False
+    assert should_automerge(_pr("fix/506-icon", mergeable="MERGEABLE"),
+                            FixState(), _cfg()) is True
+
+
 def test_a_closing_reference_cannot_buy_a_foreign_pr_a_merge():
     """`Fixes #504` in a stranger's body populates closing_issue, so keying the
     check on the linked issue would let anyone opt their PR into auto-merge.

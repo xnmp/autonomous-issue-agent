@@ -210,6 +210,14 @@ def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
     review = latest_other_review(pr.reviews, cfg.fix_bot)
     if review is None or review.state != REVIEW_APPROVED:
         return False
+    # A CONFLICTING PR cannot merge no matter what gh is told — arming it just
+    # burns a gh call + verification probe per poll and logs a refusal every
+    # 20s until the REBASE leg lands (observed on #534, 2026-07-26, after the
+    # arm-verification fix stopped the failed attempt from latching its
+    # marker). The rebase path owns conflicted PRs; automerge re-fires the
+    # first poll after the branch is mergeable again.
+    if pr.is_conflicting():
+        return False
     return ci_state(pr.checks, cfg.ci_ignore_checks) in (CIState.OK, CIState.NONE)
 
 
