@@ -10,9 +10,16 @@ squash-merge into dev → issue auto-closed` with no human in the loop after the
 label. That is the first time the harness has done that, and it had never made a
 real `gh` write before this session.
 
-It also cost **~$28 for one merged PR, one approved-pending PR, and one
-abandoned issue**, and every single defect below was invisible to `make test`
-and to `doctor`. Read §3 before running it unattended.
+It also cost **$38.51 for two merged PRs and two abandoned issues**, and every
+single defect below was invisible to `make test` and to `doctor` — each one only
+exists in the presence of a real target repo, a real config file, or a real
+GitHub identity.
+
+**If you read one section, read §3.6.** Both abandoned issues died the same way:
+the agent needs a running dev server to satisfy the visual-evidence rule, the
+governor forbids background processes, and the denial message tells it to run the
+server in the foreground — which never returns. That single contradiction cost
+$22 of the $38.
 
 ---
 
@@ -21,9 +28,12 @@ and to `doctor`. Read §3 before running it unattended.
 | Issue | Outcome | Cost | Notes |
 |---|---|---|---|
 | **#504** tab title with one tab + window controls | **MERGED** (PR #532) → `dev` @ `0feb8a95`, issue auto-closed | $3.83 | full loop, unsupervised |
-| **#494** hide auxiliary info in preview pane | PR **#533 open, APPROVED, not merged** | $7.66 | see §3.4 — the fixer never got a free tick |
-| **#501** Alt+L/P/;/' directional pane focus | **abandoned**, `ai-ready` removed | $12.03 | 2 attempts, no PR. §3.1 + §4 |
-| **#506** git-repo folder icon in tab bar | in flight at handover time | — | first run with the new forensics |
+| **#494** hide auxiliary info in preview pane | **MERGED** (PR #533) → `dev` @ `930aecb8` | $7.66 | merged the instant the fixer got a free tick — see §3.4 |
+| **#501** Alt+L/P/;/' directional pane focus | **abandoned**, labels removed | $12.03 | 2 attempts, no PR. §3.1 + §3.6 + §4 |
+| **#506** git-repo folder icon in tab bar | **abandoned**, labels removed | $10.16 | budget wall at 104 turns — §3.6 |
+
+Total **$38.51 over 8 runs** for two merged PRs. Both abandoned issues died the
+same way (§3.6) and neither is a fault of the issue itself.
 
 Baseline for the target repo: `bunx vitest run` → 1253 tests / 117 files green
 in ~5s. Deliberately NOT `bun run test`, which also runs the perf tier — perf
@@ -93,7 +103,10 @@ populate `closing_issue` just by writing "Fixes #N" in a PR body.
 
 ---
 
-## 3. Open problems, in priority order
+## 3. Open problems
+
+Numbered for cross-reference, not by importance: **§3.6 is the one that matters
+most** and is the only one that is costing real money right now.
 
 ### 3.1 An agent can fail while claiming success (partially fixed)
 
@@ -148,17 +161,26 @@ rather than reasoning about the source.
 
 ### 3.3 A single issue can burn $12+ with nothing to show
 
-#501: attempt 1 errored at $1.93, attempt 2 hit `error_max_budget_usd` at $10.10
-— the full per-run `FIX_BUDGET`. Retry cap is 3, so a third would have taken it
-to ~$22 against the $25 per-issue cap. I stopped the daemons and removed
-`ai-ready` rather than let it fire.
+#501: attempt 1 errored at $1.93 (§3.1), attempt 2 hit `error_max_budget_usd` at
+$10.10 — the full per-run budget. #506: $10.16, same wall. Retry cap is 3, so
+each would have gone again had I not stopped the daemons and removed the labels.
 
-The caps did work — nothing exceeded a configured limit. But **`FIX_BUDGET=$10`
-× `resolve` retry cap 3 = $30 of authorised spend per issue**, which is above the
-$25 issue cap and reachable without ever producing a PR. Worth considering
-whether a run that ends in `BUDGET_EXHAUSTED` should count differently against
-the retry cap than one that ends in an infra death: retrying a task that
-*ran out of room* at the same budget is close to a guaranteed repeat.
+The caps did work — nothing exceeded a configured limit. Two structural points:
+
+**Retrying a BUDGET_EXHAUSTED run at the same budget is close to a guaranteed
+repeat.** It did not fail from bad luck or a flaky gateway; it ran out of room.
+Worth considering whether `BUDGET_EXHAUSTED` should consume a retry differently
+from an infra death — or should escalate to a human instead of re-dispatching.
+
+**Budget and the issue cap must be set together.** Caps were raised at end of
+session to `MAX_BUDGET_USD=20`, `ISSUE_SPEND_CAP_USD=50`,
+`DAILY_SPEND_CAP_USD=150` (see §6). Note what the OLD combination did: at
+`$20 × 3` retries = `$60` authorised per issue against a `$25` issue cap, a
+single full-budget run left `$5` and the second attempt was refused on spend —
+so "retry cap 3" was fiction. Whenever you change one, re-derive the other, or
+the binding constraint silently moves.
+
+But see §3.6 first: for these two issues, more budget is not the fix.
 
 ### 3.4 A 20-minute resolve delays a 1-second merge (cheap work should go first)
 
@@ -186,6 +208,59 @@ Fixed at the merge boundary in `13cf985`, and `REVIEW_ADOPT_UNLABELED="0"` is se
 in `config/repos/xnmp-tauri-explorer.env` with a comment. Note the code fix stops
 the harness *merging* a foreign PR; it does not stop it *paying to review* one.
 On a repo with a dependabot queue, keep the config knob too.
+
+### 3.6 THE BIG ONE: the agent is told to do the one thing that cannot work
+
+**This is the most valuable finding of the session and it is not yet fixed.**
+
+Both abandoned issues died at `error_max_budget_usd`. The new forensics (§3.1)
+caught #506's in the act:
+
+```
+subtype=error_max_budget_usd; stop_reason=tool_use; terminal_reason=budget_exhausted
+num_turns=104; duration_ms=1731892   (28.9 minutes)
+errors=['Reached maximum budget ($10)']
+permission_denials=2 [{'tool_name': 'Bash',
+  'command': 'DEV_PORT=1431 nohup bun run dev > /tmp/vite-1431.log 2>&1 &',
+  'run_in_background': True}, …]
+```
+
+The agent needed a running dev server to capture the visual-AC screenshots that
+`plugin/AGENT.md` demands ("captured from the ACTUALLY RUNNING app"). It tried to
+start one. The governor denied it — correctly, for a real reason
+(`adapters/governor.py:632`: SDK 0.2.110 ends the turn with
+`terminal_reason="background_requested"` and NO terminal `ResultMessage`, losing
+the entire run; see `docs/issues/review-no-resultmessage-background-tasks.md`).
+
+But look at what the denial tells the agent to do instead:
+
+> "background execution is disabled for this agent — run the command in the
+> foreground (omit run_in_background) so the session returns a result."
+
+**A dev server run in the foreground never returns.** The advice is impossible to
+follow in the one situation where backgrounding is legitimate, so the agent
+improvised for 104 turns and $10 and produced no PR.
+
+Why #504 and #494 succeeded anyway: this repo's Playwright config starts and
+stops vite around the test run itself, so an agent that reaches for
+`playwright test` never needs to hand-start a server. An agent that reaches for
+`bun run dev` first hits the wall. It is left to chance which one the agent tries.
+
+**Raising `MAX_BUDGET_USD` does not fix this** — it buys a more expensive version
+of the same failure. The fix is guidance, in two places:
+
+1. `adapters/governor.py` — the denial message must not prescribe the foreground
+   for a long-running process. Say what to do instead: use the repo's test runner
+   to manage its own server (Playwright `webServer`), or a one-shot
+   start-capture-kill inside a SINGLE foreground command, and never expect a
+   server to persist across tool calls.
+2. `plugin/AGENT.md` — the visual-evidence section tells the agent to capture
+   from a real running app but never says how to get one under a governor that
+   forbids background processes. That gap is where the money went.
+
+Worth measuring afterwards: `permission_denials` count per run is now logged, so
+"did the agent fight the governor?" is answerable. Two denials cost $10 here — the
+denials are cheap, the *flailing after them* is not.
 
 ---
 
@@ -242,16 +317,33 @@ vitest file under `tests/` satisfies the `fix/` arm.
 (flipped this session — approved + green now merges to `dev` with no human),
 `STEWARD_TRIAGE=0`, `FIXER_RUNTIME=claude`.
 
-Caps: `FIX_BUDGET=$10`, `REVIEW_BUDGET=$8`, issue `$25`, daily `$50`.
-Spend on 2026-07-26: **~$28**.
+Caps, as raised at the end of this session (all in the per-repo overlay):
+`MAX_BUDGET_USD=20` per session, `REVIEW_BUDGET=$8`, `ISSUE_SPEND_CAP_USD=50`,
+`DAILY_SPEND_CAP_USD=150`. They were `$10 / $25 / $50` for everything recorded
+above, so read every cost in this document against the OLD numbers.
+
+Spend on 2026-07-26: **$38.51 over 8 runs**, for two merged PRs.
 
 ## 7. Suggested next steps
 
-1. Merge or close PR #533 (approved, green, waiting only on a fixer tick).
-2. Reproduce §3.2 properly before touching `loop.py` again.
-3. Decide the §3.3 policy question: should `BUDGET_EXHAUSTED` consume a retry?
-4. Re-run #501 only if you want it — it is a genuinely harder issue than its
-   title suggests, and the branch `fix/501-feat-altlp-shortcuts-to-move-focus-betwe`
-   still has 5 commits of real work in the worktree if you want to salvage it.
-5. Keep pointing it at *additive, single-seam* issues until §3.1 has produced a
-   real forensics line, so we learn what the agent-error class actually is.
+**Do §3.6 before spending anything else.** Both abandoned issues died against the
+background-process wall, and the extra budget just bought a longer version of the
+same failure. Fix the governor's denial message and the AGENT.md screenshot
+guidance first; the two-line change plausibly recovers both issues.
+
+Then:
+
+1. Reproduce §3.2 properly before touching `loop.py` again — the diagnosis is
+   sound, my fix was not, and it is reverted rather than half-applied.
+2. Decide the §3.3 policy question: should `BUDGET_EXHAUSTED` consume a retry, or
+   escalate?
+3. Consider §3.4's ordering fix — execute a tick's cheap terminal actions
+   (merges, relabels, reaps) before dispatching any agent.
+4. Re-run #501 and #506 after §3.6 lands; both are reasonable issues that failed
+   for an infrastructural reason, not a difficulty one. #501's branch
+   `fix/501-feat-altlp-shortcuts-to-move-focus-betwe` still holds 5 commits of
+   real work (plan/red/green/evidence/docs) in its worktree if you want to
+   salvage rather than restart — it was 13 tests from green when it ran out of
+   budget.
+5. Keep preferring *additive, single-seam* issues (§4) until the failure rate
+   comes down; that heuristic held for both PRs that merged.
