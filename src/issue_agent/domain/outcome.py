@@ -132,6 +132,13 @@ class AgentResult:
     # so capture them verbatim now to feed the cost ledger rather than re-deriving
     # them later from a log.
     usage: dict | None = None
+    # The stream-summed accumulator for the SAME run (merge_usage over every
+    # stream message). NOT the same quantity as `usage`: per-message blocks
+    # re-report cache counters, so the stream sum runs ~3.5x the ResultMessage
+    # total on identical runs (measured 43.2M vs 12.1M, 2026-07-26). An aborted
+    # run only ever has the stream sum, so the abort-cost estimator must learn
+    # its $/token rate against THIS field's totals, never against `usage`'s.
+    stream_usage: dict | None = None
 
     def field(self, name: str, default: str = "") -> str:
         if isinstance(self.structured, dict):

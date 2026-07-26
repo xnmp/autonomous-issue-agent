@@ -14,6 +14,7 @@ both are tested with no live model call.
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from collections.abc import Callable
 from typing import Any
@@ -403,6 +404,7 @@ class AgentRunner(AgentRuntime):
             exit_reason=ExitReason.WALL_TIMEOUT,
             summary=f"agent exceeded max runtime {self._max_runtime:.0f}s",
             usage=usage,
+            stream_usage=usage,
         )
 
     async def run(self, task: AgentTask) -> AgentResult:
@@ -551,6 +553,7 @@ class AgentRunner(AgentRuntime):
                                     summary=f"agent idle >{self._idle_timeout:.0f}s "
                                             "(no stream event)",
                                     usage=usage_acc,
+                                    stream_usage=usage_acc,
                                 )
                             stream_ended = True  # had a result; honour it below
                             break
@@ -690,8 +693,15 @@ class AgentRunner(AgentRuntime):
                 summary="no ResultMessage from query()",
                 exit_reason=ExitReason.NO_RESULT,
                 usage=usage_acc,
+                stream_usage=usage_acc,
             )
         result = result_to_agent_result(final)
+        # Attach the stream sum to the COMPLETED result too: journaled beside the
+        # ResultMessage total, each completed run becomes a calibration pair, and
+        # the estimator learns its $/token rate in stream units — the only units
+        # an aborted run can ever be priced in (see observed_cost_per_token).
+        if usage_acc:
+            result = dataclasses.replace(result, stream_usage=dict(usage_acc))
         # Calibration line for the abort-cost estimator: on a COMPLETED run both
         # totals exist — the ResultMessage's own cumulative usage (authoritative,
         # what the ledger keeps) and merge_usage's stream-summed accumulator (all

@@ -56,12 +56,13 @@ def _spend(ledger_path) -> list[dict]:
     return [e for e in read_events(ledger_path) if e.get("event") == "spend"]
 
 
-def _seed_priced_history(rt, journal, cost=3.826, usage=None):
+def _seed_priced_history(rt, journal, cost=3.826, usage=None, stream_usage=None):
     """One COMPLETED run, so the rate has something to learn from."""
     rt.set_context("fix", "RESOLVE", 1, 1)
     rt.inner.result = AgentResult(
         is_error=False, status="pr_opened", cost_usd=cost,
         exit_reason=ExitReason.OK, usage=usage or dict(ABORT_USAGE),
+        stream_usage=stream_usage,
     )
     asyncio.run(rt.run(AgentTask(prompt="p", model="opus")))
 
@@ -88,6 +89,31 @@ def test_rate_is_zero_without_evidence_so_nothing_is_invented():
         {"event": "agent_run", "cost_usd": 5.0, "usage": None},
         {"event": "agent_run", "cost_usd": 0.0, "usage": {"input_tokens": 999}},
     ]) == 0.0
+
+
+def test_rate_is_learned_in_stream_units_when_the_run_carries_both_totals():
+    """A completed run's stream-summed total runs ~3.5x its ResultMessage total
+    (measured 43.2M vs 12.1M, 2026-07-26). Aborted runs only ever have the
+    stream total, so the rate's denominator must be the stream total too —
+    learning against the RESULT total priced every abort ~3.5x high."""
+    events = [{
+        "event": "agent_run", "cost_usd": 12.0,
+        "usage": {"input_tokens": 12_000_000},
+        "usage_stream": {"input_tokens": 42_000_000},
+    }]
+    assert observed_cost_per_token(events) == 12.0 / 42_000_000
+
+
+def test_stream_denominated_evidence_outranks_legacy_result_denominated_evidence():
+    """Once one calibrated pair exists, pre-fix journal lines (usage only, in
+    result units) must stop polluting the rate — mixing the two units in one
+    blend re-inflates every estimate."""
+    legacy = {"event": "agent_run", "cost_usd": 12.0,
+              "usage": {"input_tokens": 12_000_000}}
+    paired = {"event": "agent_run", "cost_usd": 6.0,
+              "usage": {"input_tokens": 6_000_000},
+              "usage_stream": {"input_tokens": 21_000_000}}
+    assert observed_cost_per_token([legacy, paired]) == 6.0 / 21_000_000
 
 
 def test_an_estimate_never_becomes_evidence_for_the_next_estimate():
@@ -136,6 +162,28 @@ def test_the_estimate_matches_what_the_same_tokens_really_cost(tmp_path):
     rt.inner.result = AgentResult(
         is_error=True, status="timeout", cost_usd=0.0,
         exit_reason=ExitReason.WALL_TIMEOUT, usage=dict(ABORT_USAGE),
+    )
+    rt.set_context("fix", "RESOLVE", 2, 2)
+    asyncio.run(rt.run(AgentTask(prompt="p", model="opus")))
+
+    est = [s for s in _spend(ledger) if s["issue"] == 2][0]["cost_usd"]
+    assert abs(est - 3.826) < 0.01
+
+
+def test_a_skewed_abort_is_priced_near_truth_not_3_5x_high(tmp_path):
+    """The 2026-07-26 units bug, end to end. A completed run journals BOTH totals
+    (result 2.77M / stream 9.68M — the observed ~3.5x skew) at $3.826; a wall
+    abort then spends the same stream-magnitude tokens. The ledger figure must
+    land on ~$3.83, not ~$13.4 (which is what rate-in-result-units × stream
+    tokens produced, silently eating the issue/daily caps)."""
+    stream = {k: v * 35 // 10 for k, v in ABORT_USAGE.items()}
+    rt, journal, ledger = _runtime(tmp_path, AgentResult(is_error=False))
+    _seed_priced_history(rt, journal, cost=3.826, stream_usage=dict(stream))
+
+    rt.inner.result = AgentResult(
+        is_error=True, status="timeout", cost_usd=0.0,
+        exit_reason=ExitReason.WALL_TIMEOUT,
+        usage=dict(stream), stream_usage=dict(stream),
     )
     rt.set_context("fix", "RESOLVE", 2, 2)
     asyncio.run(rt.run(AgentTask(prompt="p", model="opus")))

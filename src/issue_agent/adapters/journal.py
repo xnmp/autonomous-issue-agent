@@ -279,6 +279,12 @@ class JournalingRuntime:
             ctx = self.context
             cost = float(getattr(result, "cost_usd", 0.0) or 0.0)
             usage = _usage(result.usage)
+            # The stream-summed accumulator, journaled beside `usage`. The two are
+            # different quantities (~3.5x apart: per-message blocks re-report cache
+            # counters), so every completed run that carries both is a calibration
+            # pair, and estimates below are priced in stream units against a rate
+            # learned in stream units.
+            stream = _usage(getattr(result, "stream_usage", None))
             # An ABORTED run (wall cap, idle, dropped result) never receives the
             # ResultMessage that carries dollars, so `cost` is 0.0 however long it
             # ran. Observed on the first real deployment: 906s and four commits
@@ -291,9 +297,10 @@ class JournalingRuntime:
             # `observed_cost_per_token`). The ledger — what the caps actually read
             # — takes the true cost when there is one, else the estimate.
             estimated = 0.0
-            if cost <= 0 and total_tokens(usage) > 0:
+            basis = stream if total_tokens(stream) > 0 else usage
+            if cost <= 0 and total_tokens(basis) > 0:
                 estimated = estimate_cost_usd(
-                    usage, observed_cost_per_token(read_events_tail(self.journal.path))
+                    basis, observed_cost_per_token(read_events_tail(self.journal.path))
                 )
             self.journal.emit(
                 "agent_run",
@@ -315,6 +322,7 @@ class JournalingRuntime:
                 exit_reason=(result.exit_reason.value if result.exit_reason else None),
                 session_id=result.session_id,
                 usage=usage,
+                usage_stream=stream,
                 **extra,
             )
             # Only costed runs reach the ledger: a $0.00 line is pure noise in the
@@ -730,18 +738,37 @@ def observed_cost_per_token(events) -> float:
     Only TRUE costs feed this. Estimated runs record their figure in
     `cost_estimated_usd`, never in `cost_usd`, precisely so an estimate can never
     become evidence for the next estimate.
+
+    UNITS: the denominator is the run's `usage_stream` total (the stream-summed
+    accumulator) whenever the event has one, because that is the only total an
+    ABORTED run ever has — rate and multiplicand must be the same quantity.
+    Learning against the ResultMessage's `usage` while pricing aborts on stream
+    sums overbilled aborts ~3.5x (the two totals were measured 43.2M vs 12.1M
+    on one run, 2026-07-26). Events journaled before `usage_stream` existed
+    only feed the fallback rate, used when no stream-denominated pair exists
+    yet — a legacy-rate estimate stays overbilled, never underbilled.
     """
     cost = 0.0
     tokens = 0
+    legacy_cost = 0.0
+    legacy_tokens = 0
     for e in events:
         if e.get("event") != "agent_run":
             continue
         c = _cost(e)
-        t = total_tokens(e.get("usage"))
-        if c > 0 and t > 0:
+        if c <= 0:
+            continue
+        t_stream = total_tokens(e.get("usage_stream"))
+        t_result = total_tokens(e.get("usage"))
+        if t_stream > 0:
             cost += c
-            tokens += t
-    return cost / tokens if tokens > 0 else 0.0
+            tokens += t_stream
+        elif t_result > 0:
+            legacy_cost += c
+            legacy_tokens += t_result
+    if tokens > 0:
+        return cost / tokens
+    return legacy_cost / legacy_tokens if legacy_tokens > 0 else 0.0
 
 
 def estimate_cost_usd(usage, rate: float) -> float:
