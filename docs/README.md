@@ -12,9 +12,16 @@ existed, a new session could not tell which documents described the system as it
 | **`history/`** | Dated records of what happened: reviews, plans, handovers. Immutable once written. | As history only |
 | **`archive/`** | Superseded designs. Kept for provenance. | **No** — do not implement from these |
 
-Naming: `history/` is `YYYY-MM-DD-slug.md` and never edited after its work
-closes (a status banner at the top is the exception). Everything else is
-`lower-kebab-case.md` with no date.
+Naming: dated files are `YYYY-MM-DD-slug.md`, undated ones `lower-kebab-case.md`.
+A **date means the file is a snapshot of a moment** — a handover, a review, a
+plan. `reference/` therefore never carries dates (it describes the present).
+`history/` is all dates, and its files are not edited after their work closes (a
+status banner at the top is the exception).
+
+`open/` holds both: `residuals.md` is undated because it is continuously true,
+while a dated handover lives here **while its work is still ahead of it** and
+graduates to `history/` when that work closes. So a dated file in `open/` is a
+job someone still has to do; the same file in `history/` is a record.
 
 ## Start here
 
@@ -33,6 +40,9 @@ closes (a status banner at the top is the exception). Everything else is
 
 ## open/
 
+- [2026-07-26-first-run-handover.md](open/2026-07-26-first-run-handover.md) —
+  **the next job.** How to do the first real run: why solo mode, the exact
+  recipe, what to watch, when to abort, and how to escalate afterwards
 - [residuals.md](open/residuals.md) — everything deliberately still open, why,
   and what triggers the work. **Read §1 before pointing this at a real repo.**
 - [issues/](open/issues/) — three unresolved incident write-ups, not
