@@ -92,6 +92,45 @@ Solo also needs **no GitHub App** — the App exists to give review/steward an
 identity distinct from the fixer (GitHub 422s self-approval). Skipping it
 removes the single fiddliest setup step from the first run.
 
+### 2.1 If you want the reviewer on the first run anyway
+
+Reasonable — the reviewer is half the value, and watching it disagree with the
+fixer is the interesting part. Two things change, one of them dangerous:
+
+**You need a second identity, but NOT necessarily a GitHub App.**
+`app/main.py::_app_identity` resolves in priority order *App token → static bot
+token → ambient gh auth*, so a plain bot account with a PAT is a first-class
+supported path:
+
+1. Create a second GitHub account (their ToS permits one machine account
+   alongside a personal one), e.g. `<you>-harness-bot`.
+2. Invite it to the target repo with **write** access and accept the invite
+   from that account — it cannot review a PR it cannot see.
+3. Issue it a fine-grained PAT scoped to that repo: Pull requests R+W,
+   Issues R+W, Contents R, Metadata R.
+4. In `config/shared.env` set `REVIEW_BOT="<bot-login>"` (the bare login — the
+   `[bot]` suffix belongs to Apps only), `STEWARD_BOT` to the same value, and
+   `REVIEW_BOT_TOKEN="github_pat_…"`. Leave the whole `GH_APP_*` block
+   untouched; `doctor` knows a static token means the App fields are unused.
+
+Move to a GitHub App later, once the loop is proven: it mints ~hourly tokens
+instead of parking a long-lived secret on disk. Keep `shared.env` at `0600`
+either way.
+
+**⚠ `AUTO_MERGE` silently changes meaning.** Under solo it is inert —
+`should_automerge` requires three-identity mode, so the flag could not do
+anything. Under three-identity it **defaults to ON**, and an approved, green PR
+is merged to `BASE_BRANCH` with no human involved. On a first run that means the
+harness could merge autonomously before you have ever seen it review anything.
+
+**Set `AUTO_MERGE="0"` explicitly** and leave it off until you have read a
+review you agree with. `doctor` will not warn you about this — three-identity
+plus auto-merge is a supported configuration, just not a first-run one.
+
+With the reviewer on, use `ROLES="fix review"` and raise the tick budget
+(`ISSUE_AGENT_MAX_TICKS=3`): the review only happens on a poll *after* the PR
+opens, so a single tick will never reach it.
+
 ## 3. The recipe
 
 ```bash

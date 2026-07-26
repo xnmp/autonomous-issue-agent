@@ -200,11 +200,17 @@ fi
 # class of review C1, reintroduced through config rather than code. Any value
 # still wrapped in <angle brackets> is a placeholder nobody filled in.
 _placeholder_vars="REPO FIX_BOT TEST_CMD TARGET_DIR BASE_BRANCH"
-# The App identity is only READ under IDENTITY_MODE=three (solo has no second
-# bot). Flagging its untouched placeholders in solo would fail doctor over
-# fields that setup is correct to leave alone — see the first-run handover.
+# Scope the identity fields to the path actually in use, or doctor fails over
+# fields the operator is CORRECT to leave untouched:
+#   solo                     → no second identity at all; none of these are read
+#   three + REVIEW_BOT_TOKEN → static-token path; the GH_APP_* block is unused
+#   three, no token          → GitHub App path; the App fields are required
+# (app/main.py `_app_identity` resolves App token → static token → ambient.)
 if [ "${IDENTITY_MODE:-three}" = "three" ]; then
-  _placeholder_vars="$_placeholder_vars REVIEW_BOT STEWARD_BOT GH_APP_ID GH_APP_INSTALL_ID GH_APP_KEY_FILE"
+  _placeholder_vars="$_placeholder_vars REVIEW_BOT STEWARD_BOT"
+  if [ -z "${REVIEW_BOT_TOKEN:-}" ]; then
+    _placeholder_vars="$_placeholder_vars GH_APP_ID GH_APP_INSTALL_ID GH_APP_KEY_FILE"
+  fi
 fi
 for _var in $_placeholder_vars; do
   case "${!_var:-}" in
