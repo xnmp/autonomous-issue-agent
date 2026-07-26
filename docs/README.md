@@ -40,9 +40,15 @@ job someone still has to do; the same file in `history/` is a record.
 
 ## open/
 
+- [2026-07-26-first-real-deployment.md](open/2026-07-26-first-real-deployment.md)
+  — **start here.** What the first real deployment against xnmp/tauri-explorer
+  actually did: one PR merged end-to-end unsupervised, four blocker fixes none of
+  the tests could have caught, what is still open, and which issue shapes are
+  safe to point it at
 - [2026-07-26-first-run-handover.md](open/2026-07-26-first-run-handover.md) —
-  **the next job.** How to do the first real run: why solo mode, the exact
-  recipe, what to watch, when to abort, and how to escalate afterwards
+  how to do the first real run: why solo mode, the exact recipe, what to watch,
+  when to abort. **Its predictions are superseded** by the deployment record
+  above wherever the two disagree; the setup recipe is still good
 - [residuals.md](open/residuals.md) — everything deliberately still open, why,
   and what triggers the work. **Read §1 before pointing this at a real repo.**
 - [issues/](open/issues/) — three unresolved incident write-ups, not
