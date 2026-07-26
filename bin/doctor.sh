@@ -256,6 +256,34 @@ if command -v gh >/dev/null 2>&1; then
     gh pr list -R "$REPO" --state open --limit 1 --json number >/dev/null 2>&1 \
       && ok "gh pr list works ($REPO) — push-gate probe healthy" \
       || bad "gh pr list failed for $REPO — the fail-closed push gate would deny every governed push (fix gh auth/network first)"
+
+    # Everything above ran as the FIXER (ambient gh auth). The reviewer uses a
+    # different identity, and nothing checked it could reach the repo at all —
+    # a bot account whose collaborator invite was never accepted authenticates
+    # fine and then 404s on every PR, which surfaces as "the reviewer silently
+    # does nothing" rather than as an error. Verify the token's identity AND
+    # its access, since a PAT pasted from the wrong account is the same class
+    # of silent identity mismatch as review C1.
+    if [ -n "${REVIEW_BOT_TOKEN:-}" ]; then
+      # gh prints its error BODY to stdout on a bad token, so an unguarded
+      # capture yields `{ "message": ...` and reports it as a login. A GitHub
+      # login is [A-Za-z0-9-] only, so charset-validating the first line both
+      # sanitises the value and detects the failure.
+      _bot_login=$(GH_TOKEN="$REVIEW_BOT_TOKEN" gh api user --jq '.login' 2>/dev/null \
+                   | head -1 | tr -d '[:space:]')
+      case "$_bot_login" in
+        *[!A-Za-z0-9-]*) _bot_login="" ;;
+      esac
+      if [ -z "$_bot_login" ]; then
+        bad "REVIEW_BOT_TOKEN is invalid, expired, or lacks read:user (gh api user failed)"
+      elif [ "$(_normalize_login "$_bot_login")" != "$(_normalize_login "${REVIEW_BOT:-}")" ]; then
+        bad "REVIEW_BOT_TOKEN belongs to '$_bot_login' but REVIEW_BOT says '${REVIEW_BOT:-unset}' — GitHub would 422 every approval"
+      elif GH_TOKEN="$REVIEW_BOT_TOKEN" gh repo view "$REPO" --json name >/dev/null 2>&1; then
+        ok "review identity '$_bot_login' authenticates and can read $REPO"
+      else
+        bad "review identity '$_bot_login' cannot access $REPO — invite it as a collaborator (write) and ACCEPT the invite from that account"
+      fi
+    fi
   fi
 else
   bad "gh missing"
