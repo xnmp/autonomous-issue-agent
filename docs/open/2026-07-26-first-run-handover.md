@@ -4,6 +4,18 @@ Audience: whoever points this harness at a real GitHub repo for the first time.
 Prerequisite read: [residuals.md](residuals.md) §1. Everything below assumes the
 code state at commit `9435a4f`.
 
+> **The short version.** The code is ready; the deployment is not configured
+> yet, and that is about ten minutes of work (§1.1 — no GitHub App needed).
+> Do the first run in `IDENTITY_MODE=solo` with `ROLES="fix"` and
+> `ISSUE_AGENT_MAX_TICKS=1`: in solo the review daemon is inert and auto-merge
+> is *structurally* impossible, so the harness can open a PR but cannot merge,
+> approve, or close anything (§2). Know before you start that your spend caps
+> are probably inert — they sum a ledger that stays empty on plans reporting
+> `$0.00`, so the wall cap and the tick limit are your real bounds (§5.1). And
+> expect the first failures to be shape mismatches between real `gh` output and
+> the test fakes, not logic errors — nothing here has ever made a real `gh`
+> write.
+
 ## 1. Are we ready?
 
 **The code is. The deployment is not yet configured, and that is the only thing
@@ -23,6 +35,44 @@ every test fakes the GitHub boundary, so the first run tests the *fidelity of
 the fakes* as much as it tests the harness. Expect the first failures to be
 shape mismatches between what `gh` really returns and what `FakeGateway`
 returns — not logic errors.
+
+### 1.1 Closing the config gap (~10 minutes, no GitHub App)
+
+`config/shared.env` is gitignored and does not exist; only
+`config/shared.example.env` ships. That template assumes `IDENTITY_MODE=three`
+and therefore leads with `GH_APP_ID` / `GH_APP_INSTALL_ID` / `GH_APP_KEY_FILE` —
+**none of which solo mode needs.** Do not go set up a GitHub App for the first
+run.
+
+`issue-agent start` will create this file interactively if it is absent, but
+writing it by hand is faster and you can see exactly what you agreed to:
+
+```bash
+cat > config/shared.env <<'EOF'
+IDENTITY_MODE="solo"      # review daemon inert, auto-merge impossible — see §2
+FIX_BOT="xnmp"            # your own gh login; solo needs no second identity
+FIXER_RUNTIME="claude"
+STEWARD_TRIAGE="0"        # not on a first run
+JIRA_SYNC="0"
+EOF
+chmod 600 config/shared.env
+```
+
+The per-repo overlay (`config/repos/<name>.env`, holding `REPO`, `TARGET_DIR`,
+`BASE_BRANCH`, `TEST_CMD` and the isolated `*_STATE_DIR`s) is synthesized for you
+by `issue-agent start` from the cwd — let it, rather than hand-writing one.
+
+Verified against `HarnessConfig.from_env`: `REPO` + `FIX_BOT` +
+`IDENTITY_MODE=solo` + `TEST_CMD` + `TARGET_DIR` yields **zero validation
+errors**. `AUTO_MERGE` stays `True` by default and that is fine — solo ignores
+it structurally, and `doctor` says so explicitly rather than leaving you to
+wonder.
+
+Then, before anything else: `issue-agent doctor`, and read every line. It now
+checks state-dir collisions across overlays, normalises bot logins (so
+`fix-bot` vs `fix-bot[bot]` is caught before GitHub 422s every approval),
+asserts the push gate's `gh pr list` probe actually works, and flags an
+`.active.env` snapshot missing a variable your config assigns.
 
 ## 2. Do the first run in solo mode. It is dramatically safer.
 
@@ -50,10 +100,9 @@ removes the single fiddliest setup step from the first run.
 #    command that exits (non-watch).
 cd /path/to/scratch-repo
 
-# 2. First-run setup. `start` auto-runs `init` (creates config/shared.env
-#    interactively), auto-detects REPO/TARGET_DIR from cwd, probes for a
-#    TEST_CMD with a cheap read-only Haiku call, and synthesizes the overlay.
-#    Answer the init prompts with IDENTITY_MODE=solo.
+# 2. With config/shared.env written per §1.1, `start` auto-detects
+#    REPO/TARGET_DIR from cwd, probes for a TEST_CMD with a cheap read-only
+#    Haiku call, and synthesizes the per-repo overlay. Preflight first:
 issue-agent doctor          # run this FIRST and read every line
 
 # 3. One tick, fix daemon only, with the wall cap set deliberately.
