@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 
 from ..adapters.agent_runner import AgentRunner
 from ..adapters.app_token import AppCredentials, AppTokenMinter, default_mint_fn
@@ -62,18 +63,42 @@ def _load_agent_env(env: dict) -> dict:
     return loaded
 
 
-def _app_identity(cfg_env: dict) -> Identity:
-    """review/steward identity: GitHub App installation token if configured, else
-    a static bot token, else ambient. Mirrors gh_review/gh_steward priority."""
+def _app_identity(cfg_env: dict, warn: Callable[[str], None] = lambda _m: None) -> Identity:
+    """review/steward identity: GitHub App installation token if configured AND
+    USABLE, else a static bot token, else ambient. Mirrors gh_review/gh_steward
+    priority.
+
+    "Configured" has to mean more than "the three vars are non-empty".
+    config/shared.example.env ships GH_APP_* as literal `<your-app-id>` /
+    `$HOME/.config/<your-app>/private-key.pem` placeholders, and PATH A (bot
+    account + REVIEW_BOT_TOKEN) is documented as leaving them alone. Selecting the
+    App branch on non-emptiness alone commits to a key file that does not exist,
+    and `AppTokenMinter.get` then raises ENOENT on EVERY poll pass — observed on
+    the first real deployment as an endless `review: poll pass failed (continuing)`
+    with the reviewer never reviewing anything. So gate the branch on the key being
+    READABLE and fall through when it is not.
+
+    Fall through LOUDLY. Demoting to ambient silently would make review == FIX_BOT,
+    and under IDENTITY_MODE=three every approval is then a GitHub 422 self-approval
+    — a failure that surfaces far from its cause.
+    """
     if cfg_env.get("GH_APP_ID") and cfg_env.get("GH_APP_KEY_FILE") and cfg_env.get("GH_APP_INSTALL_ID"):
-        creds = AppCredentials(
-            app_id=cfg_env["GH_APP_ID"],
-            install_id=cfg_env["GH_APP_INSTALL_ID"],
-            key_file=cfg_env["GH_APP_KEY_FILE"],
-            cache_path=cfg_env.get("GH_APP_TOKEN_CACHE", os.path.expanduser("~/.local/state/issue-agent-bot/app-token.json")),
+        key_file = os.path.expanduser(cfg_env["GH_APP_KEY_FILE"])
+        if os.access(key_file, os.R_OK):
+            creds = AppCredentials(
+                app_id=cfg_env["GH_APP_ID"],
+                install_id=cfg_env["GH_APP_INSTALL_ID"],
+                key_file=key_file,
+                cache_path=cfg_env.get("GH_APP_TOKEN_CACHE", os.path.expanduser("~/.local/state/issue-agent-bot/app-token.json")),
+            )
+            minter = AppTokenMinter(creds, default_mint_fn, now_fn=lambda: int(time.time()))
+            return Identity(token_provider=minter.get)
+        warn(
+            f"GH_APP_KEY_FILE '{key_file}' is missing or unreadable — ignoring the "
+            "GitHub App identity and falling back to "
+            + ("REVIEW_BOT_TOKEN" if cfg_env.get("REVIEW_BOT_TOKEN")
+               else "ambient `gh auth` (which is FIX_BOT — approvals will 422)")
         )
-        minter = AppTokenMinter(creds, default_mint_fn, now_fn=lambda: int(time.time()))
-        return Identity(token_provider=minter.get)
     if cfg_env.get("REVIEW_BOT_TOKEN"):
         return Identity(static_token=cfg_env["REVIEW_BOT_TOKEN"])
     return Identity()
@@ -196,13 +221,13 @@ def build_role(role: str, env: dict | None = None):
         store = Store(cfg.state_dir)
         return build_fix_daemon(cfg, gw, store, worktrees, runner)
     if role == "review":
-        gw = GitHubGateway(cfg.repo, _app_identity(env),
+        gw = GitHubGateway(cfg.repo, _app_identity(env, warn=_commit_log),
                            review_pr_label=cfg.review_trigger_label,
                            review_adopt_unlabeled=cfg.review_adopt_unlabeled)
         store = Store(cfg.review_state_dir)
         return build_review_daemon(cfg, gw, store, runner)
     if role == "steward":
-        gw = GitHubGateway(cfg.repo, _app_identity(env))
+        gw = GitHubGateway(cfg.repo, _app_identity(env, warn=_commit_log))
         store = Store(cfg.steward_state_dir)
         return build_steward_daemon(cfg, gw, store, runner)
     raise SystemExit(f"unknown role: {role!r} (use fix|review|steward)")

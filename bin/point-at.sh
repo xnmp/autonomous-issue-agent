@@ -175,7 +175,28 @@ fi
 # THIS repo name, excluding ourselves and our parent. Anchored with a trailing
 # word boundary (end-of-string or space) — unanchored `pgrep -f` substring-
 # matches, so NAME=app would also catch a launcher for NAME=myapp.
-_others="$(pgrep -f "point-at\.sh ${NAME}([[:space:]]|\$)" 2>/dev/null | grep -vx "$$" | grep -vx "$PPID" || true)"
+#
+# Excluding $$/$PPID is NOT enough: `$(...)`, pipelines and `&&` lists all fork
+# bash subshells that INHERIT our argv, so /proc shows them as extra
+# "point-at.sh <name>" processes under fresh pids. Matching those made the guard
+# fire on literally every first run (it reported its own command-substitution
+# subshell, already reaped by the time the operator ran `ps`). A genuine second
+# launcher is never parented by us, so drop any candidate whose PPID is $$ — and
+# any that exited between pgrep and the check, since a dead process is not a
+# running duplicate.
+_others=""
+for _p in $(pgrep -f "point-at\.sh ${NAME}([[:space:]]|\$)" 2>/dev/null || true); do
+  if [ "$_p" = "$$" ] || [ "$_p" = "$PPID" ]; then
+    continue
+  fi
+  _pp="$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d '[:space:]' || true)"
+  # empty ⇒ exited between pgrep and now (not a live duplicate);
+  # $$      ⇒ a subshell we forked (inherits our argv), not a launcher.
+  if [ -z "$_pp" ] || [ "$_pp" = "$$" ]; then
+    continue
+  fi
+  _others="${_others:+$_others }$_p"
+done
 if [ -n "$_others" ]; then
   red "a point-at launcher for '$NAME' is already running (pids: $(echo $_others | tr '\n' ' '))."
   red "Refusing to start a second — duplicate daemons double-dispatch. Stop it first:"

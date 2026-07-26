@@ -304,10 +304,33 @@ if command -v gh >/dev/null 2>&1; then
         bad "REVIEW_BOT_TOKEN is invalid, expired, or lacks read:user (gh api user failed)"
       elif [ "$(_normalize_login "$_bot_login")" != "$(_normalize_login "${REVIEW_BOT:-}")" ]; then
         bad "REVIEW_BOT_TOKEN belongs to '$_bot_login' but REVIEW_BOT says '${REVIEW_BOT:-unset}' — GitHub would 422 every approval"
-      elif GH_TOKEN="$REVIEW_BOT_TOKEN" gh repo view "$REPO" --json name >/dev/null 2>&1; then
-        ok "review identity '$_bot_login' authenticates and can read $REPO"
-      else
+      elif ! GH_TOKEN="$REVIEW_BOT_TOKEN" gh repo view "$REPO" --json name >/dev/null 2>&1; then
         bad "review identity '$_bot_login' cannot access $REPO — invite it as a collaborator (write) and ACCEPT the invite from that account"
+      else
+        # Read access is NOT enough: submitting a review is a write. A bot that
+        # can read but not push sails through this section and then 403s on
+        # POST /pulls/N/reviews — after a full, paid review session has already
+        # run and produced a verdict that can never be posted. Observed exactly
+        # that way on the first real deployment (403 "Resource not accessible by
+        # personal access token"). So probe the push bit here, not at approve time.
+        _perm="$(GH_TOKEN="$REVIEW_BOT_TOKEN" gh api "repos/$REPO" --jq '.permissions.push' 2>/dev/null)"
+        if [ "$_perm" = "true" ]; then
+          ok "review identity '$_bot_login' authenticates and has WRITE access to $REPO"
+          # `.permissions.push` reports the COLLABORATOR ROLE. A fine-grained PAT
+          # carries a second, independent permission set that this (or any other
+          # read-only call) cannot introspect — so push=true still 403s the
+          # approve if the token was minted without Pull requests: Read+Write.
+          # That is exactly how the first real deployment failed: label writes
+          # succeeded (Issues: write) while POST /pulls/N/reviews came back
+          # "Resource not accessible by personal access token". Say so, because a
+          # bare ✓ here reads as "approvals will work" and it cannot promise that.
+          case "$REVIEW_BOT_TOKEN" in
+            github_pat_*)
+              warn "REVIEW_BOT_TOKEN is a fine-grained PAT — its per-scope grants are not readable via the API. If approvals 403 with 'Resource not accessible by personal access token', re-mint it with Pull requests: Read+Write (Issues: Read+Write, Contents: Read)" ;;
+          esac
+        else
+          bad "review identity '$_bot_login' can READ $REPO but not write (permissions.push=${_perm:-unknown}) — every approval will 403 AFTER the review is paid for. Invite it as a collaborator with WRITE and accept the invite from that account; a fine-grained PAT additionally needs Pull requests: Read+Write, Issues: Read+Write, Contents: Read"
+        fi
       fi
     fi
   fi
