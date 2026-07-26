@@ -603,3 +603,51 @@ def test_trace_message_bare_kind_when_no_tooluse():
         is_error: bool = False
 
     assert _trace_message(_Result()) == "_Result"
+
+
+# ── running token total, so an aborted run knows what it spent ───────────────
+# Cost only arrives on the final ResultMessage, so a wall-cap / idle / dropped-
+# result abort reported usage=None and ledgered $0.00 however long it ran (first
+# real deployment: 906s, four commits, $0.00). AssistantMessage.usage is the API
+# call's OWN per-turn block, so summing across turns gives billed totals.
+def test_merge_usage_sums_per_turn_blocks():
+    from issue_agent.adapters.agent_runner import merge_usage
+
+    acc = merge_usage(None, {"input_tokens": 10, "output_tokens": 2})
+    acc = merge_usage(acc, {"input_tokens": 30, "output_tokens": 5})
+    assert acc == {"input_tokens": 40, "output_tokens": 7}
+
+
+def test_merge_usage_distinguishes_no_usage_from_zero_tokens():
+    from issue_agent.adapters.agent_runner import merge_usage
+
+    assert merge_usage(None, None) is None          # nothing ever reported
+    assert merge_usage(None, {}) == {}              # reported, and it was empty
+    assert merge_usage(None, "not-a-dict") is None
+
+
+def test_merge_usage_ignores_non_numeric_and_boolean_fields():
+    from issue_agent.adapters.agent_runner import merge_usage
+
+    acc = merge_usage(None, {"input_tokens": 5, "cached": True, "model": "opus"})
+    assert acc == {"input_tokens": 5}
+
+
+def test_merge_usage_does_not_mutate_the_accumulator_it_is_given():
+    from issue_agent.adapters.agent_runner import merge_usage
+
+    first = merge_usage(None, {"input_tokens": 1})
+    second = merge_usage(first, {"input_tokens": 1})
+    assert first == {"input_tokens": 1} and second == {"input_tokens": 2}
+
+
+def test_wall_timeout_result_carries_the_tokens_spent_before_the_abort():
+    """The regression: this result used to be built with no usage at all, so the
+    journal had nothing to price and the run ledgered $0.00."""
+    from issue_agent.adapters.agent_runner import AgentRunner
+
+    r = AgentRunner(hooks=None, max_runtime=900)
+    res = r._wall_timeout(906.0, "Bash(pytest)", {"output_tokens": 22349})
+
+    assert res.exit_reason is ExitReason.WALL_TIMEOUT
+    assert res.usage == {"output_tokens": 22349}

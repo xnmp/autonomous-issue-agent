@@ -278,6 +278,23 @@ class JournalingRuntime:
         try:
             ctx = self.context
             cost = float(getattr(result, "cost_usd", 0.0) or 0.0)
+            usage = _usage(result.usage)
+            # An ABORTED run (wall cap, idle, dropped result) never receives the
+            # ResultMessage that carries dollars, so `cost` is 0.0 however long it
+            # ran. Observed on the first real deployment: 906s and four commits
+            # ledgered as $0.00 — meaning repeated timeouts accumulate real spend
+            # that BOTH caps are structurally blind to. Price the tokens instead,
+            # at a rate learned from this journal's own completed runs.
+            #
+            # The estimate lands in its own field and NEVER in `cost_usd`, so it
+            # cannot become evidence for the next estimate (see
+            # `observed_cost_per_token`). The ledger — what the caps actually read
+            # — takes the true cost when there is one, else the estimate.
+            estimated = 0.0
+            if cost <= 0 and total_tokens(usage) > 0:
+                estimated = estimate_cost_usd(
+                    usage, observed_cost_per_token(read_events_tail(self.journal.path))
+                )
             self.journal.emit(
                 "agent_run",
                 role=ctx.role,
@@ -288,18 +305,23 @@ class JournalingRuntime:
                 model=task.model or "",
                 duration_s=round(duration_s, 1),
                 cost_usd=cost,
+                cost_estimated_usd=(estimated or None),
                 status=result.status,
                 is_error=result.is_error,
                 exit_reason=(result.exit_reason.value if result.exit_reason else None),
                 session_id=result.session_id,
-                usage=_usage(result.usage),
+                usage=usage,
                 **extra,
             )
             # Only costed runs reach the ledger: a $0.00 line is pure noise in the
-            # file the spend caps scan on every dispatch.
-            if self.ledger is not None and cost > 0:
+            # file the spend caps scan on every dispatch. An estimated cost is not
+            # noise — it is the only figure an aborted run will ever have — so it
+            # counts, flagged so an auditor can tell measured from inferred.
+            billed = cost if cost > 0 else estimated
+            if self.ledger is not None and billed > 0:
                 self.ledger.emit(
-                    "spend", repo=self.repo, issue=ctx.issue, kind=ctx.kind, cost_usd=cost
+                    "spend", repo=self.repo, issue=ctx.issue, kind=ctx.kind,
+                    cost_usd=billed, estimated=(cost <= 0) or None, usage=usage,
                 )
         except Exception as exc:  # noqa: BLE001 — never fail a run over its receipt
             sys.stderr.write(f"journal: could not record agent_run ({exc})\n")
@@ -674,6 +696,59 @@ def cost_blindspot_warning(
     )
 
 
+def total_tokens(usage) -> int:
+    """Every token counter in an SDK usage block, summed. Input/output/cache are
+    all billed, so the total is the right cost substrate; the per-counter split
+    only matters if you are pricing them separately, which `observed_cost_per_token`
+    deliberately does not."""
+    if not isinstance(usage, dict):
+        return 0
+    return sum(
+        int(v) for v in usage.values()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    )
+
+
+def observed_cost_per_token(events) -> float:
+    """Blended $/token LEARNED from completed runs, or 0.0 with no evidence.
+
+    An aborted run reports tokens but no dollars — cost only ever arrives on the
+    final ResultMessage. Rather than hardcode a price table (which goes stale
+    silently, and is wrong for every gateway/plan that is not the list price),
+    read the rate off runs that reported BOTH. It self-calibrates to whatever the
+    operator is actually billed at, and returns 0.0 — "no estimate" — until there
+    is evidence, so a fresh install never invents a number.
+
+    A single blended rate rather than per-counter prices: cache-read dominates
+    real runs, so the counters move together. Measured on the first deployment,
+    a resolve ($1.383e-6/tok) and a review ($1.395e-6/tok) agreed to within 1%.
+
+    Only TRUE costs feed this. Estimated runs record their figure in
+    `cost_estimated_usd`, never in `cost_usd`, precisely so an estimate can never
+    become evidence for the next estimate.
+    """
+    cost = 0.0
+    tokens = 0
+    for e in events:
+        if e.get("event") != "agent_run":
+            continue
+        c = _cost(e)
+        t = total_tokens(e.get("usage"))
+        if c > 0 and t > 0:
+            cost += c
+            tokens += t
+    return cost / tokens if tokens > 0 else 0.0
+
+
+def estimate_cost_usd(usage, rate: float) -> float:
+    """Price a run's tokens at a learned blended rate. 0.0 when either is absent
+    — an unknown cost must read as unknown, never as a fabricated number."""
+    if rate <= 0:
+        return 0.0
+    tokens = total_tokens(usage)
+    return round(tokens * rate, 6) if tokens > 0 else 0.0
+
+
 def _cost(event: dict) -> float:
     try:
         return float(event.get("cost_usd", 0.0) or 0.0)
@@ -697,8 +772,10 @@ __all__ = [
     "cost_blindspot_warning",
     "death_key",
     "default_ledger_path",
+    "estimate_cost_usd",
     "event_line",
     "events_within",
+    "observed_cost_per_token",
     "parse_ts",
     "read_events",
     "read_events_tail",
@@ -707,5 +784,6 @@ __all__ = [
     "spend_blocked_keys",
     "sum_issue",
     "sum_today",
+    "total_tokens",
     "unsettled_starts",
 ]

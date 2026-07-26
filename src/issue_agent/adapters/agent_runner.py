@@ -195,6 +195,35 @@ def result_to_agent_result(msg: Any) -> AgentResult:
     )
 
 
+def merge_usage(acc: dict | None, raw: Any) -> dict | None:
+    """Accumulate one SDK per-turn usage block into a running total.
+
+    `AssistantMessage.usage` is the underlying API call's OWN usage block
+    (SDK message_parser: `usage=data["message"].get("usage")`), i.e. per turn —
+    so summing across turns gives the run's BILLED totals, since every call bills
+    its full input including cache reads. That distinction matters: if the field
+    were cumulative, summing would overcount by roughly the turn count.
+
+    Exists so an ABORTED run still knows what it spent. Cost only ever arrives on
+    the final ResultMessage, so a wall-cap/idle/dropped-result abort used to
+    report cost_usd=0.0 AND usage=None — a 906s session with four commits
+    ledgered as $0.00, invisible to both spend caps. Tokens are the only substrate
+    that survives an abort.
+
+    Returns None until something is seen, keeping "no usage reported" distinct
+    from "zero tokens".
+    """
+    if not isinstance(raw, dict):
+        return acc
+    out = dict(acc or {})
+    for k, v in raw.items():
+        # bool is an int subclass; a flag is not a token count.
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            continue
+        out[k] = out.get(k, 0) + v
+    return out
+
+
 def _trace_message(msg: Any) -> str:
     """One-line summary of an SDK stream message for debug tracing. Duck-typed so
     a test can pass a stand-in; never raises (diagnostics must not add failure
@@ -293,8 +322,13 @@ class AgentRunner(AgentRuntime):
             caps.append(self._max_runtime)
         return min(caps)
 
-    def _wall_timeout(self, elapsed: float, last_trace: str) -> AgentResult:
-        """Log + build the terminal result for a tripped total-runtime cap."""
+    def _wall_timeout(
+        self, elapsed: float, last_trace: str, usage: dict | None = None
+    ) -> AgentResult:
+        """Log + build the terminal result for a tripped total-runtime cap.
+
+        `usage` carries whatever the stream reported before the abort, so the run
+        is costed rather than ledgered as $0.00 (see `merge_usage`)."""
         self._log(
             f"sdk: WALL — total runtime {elapsed:.0f}s exceeded "
             f"max {self._max_runtime:.0f}s; aborting (last: {last_trace or 'none'})"
@@ -303,6 +337,7 @@ class AgentRunner(AgentRuntime):
             is_error=True, status="timeout",
             exit_reason=ExitReason.WALL_TIMEOUT,
             summary=f"agent exceeded max runtime {self._max_runtime:.0f}s",
+            usage=usage,
         )
 
     async def run(self, task: AgentTask) -> AgentResult:
@@ -350,6 +385,10 @@ class AgentRunner(AgentRuntime):
         last_kind = "none"
         last_msg: Any = None  # the actual last message object (for drop-path forensics)
         terminal_seen = ""    # any terminal_reason observed across the stream
+        # Running token total, so an abort still reports what it spent. Only the
+        # final ResultMessage carries dollars, so without this every wall-cap /
+        # idle / dropped-result run ledgers $0.00 no matter how long it ran.
+        usage_acc: dict | None = None
         # Wall-cap baseline. Read the clock ONLY when the cap is armed: the clock is
         # injectable and a spurious read would shift a test's fake sequence, and an
         # unarmed cap has no baseline to keep.
@@ -369,7 +408,7 @@ class AgentRunner(AgentRuntime):
                     if elapsed >= self._max_runtime:
                         await _aclose_quietly(agen)
                         if final is None:
-                            return self._wall_timeout(elapsed, last_trace)
+                            return self._wall_timeout(elapsed, last_trace, usage_acc)
                         self._log(
                             f"sdk: WALL — {elapsed:.0f}s exceeded max "
                             f"{self._max_runtime:.0f}s, but a ResultMessage was "
@@ -444,6 +483,7 @@ class AgentRunner(AgentRuntime):
                                     exit_reason=ExitReason.IDLE_TIMEOUT,
                                     summary=f"agent idle >{self._idle_timeout:.0f}s "
                                             "(no stream event)",
+                                    usage=usage_acc,
                                 )
                             stream_ended = True  # had a result; honour it below
                             break
@@ -476,6 +516,7 @@ class AgentRunner(AgentRuntime):
                 msg_count += 1
                 last_kind = type(message).__name__
                 last_msg = message
+                usage_acc = merge_usage(usage_acc, getattr(message, "usage", None))
                 # Capture any terminal_reason the SDK attaches to ANY message — a
                 # background-requested turn end carries it on a non-Result message,
                 # so it never reaches the ResultMessage branch. This is the forensic
@@ -569,5 +610,6 @@ class AgentRunner(AgentRuntime):
                 is_error=True,
                 summary="no ResultMessage from query()",
                 exit_reason=ExitReason.NO_RESULT,
+                usage=usage_acc,
             )
         return result_to_agent_result(final)
