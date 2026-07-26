@@ -274,6 +274,16 @@ def merge_usage(acc: dict | None, raw: Any) -> dict | None:
     return out
 
 
+def total_stream_tokens(usage: dict) -> int:
+    """Sum of every numeric counter in a usage block — same contract as
+    journal.total_tokens, local so the runner keeps its no-journal-import
+    layering. Used only by the calibration log line."""
+    return sum(
+        int(v) for v in usage.values()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    )
+
+
 def _trace_message(msg: Any) -> str:
     """One-line summary of an SDK stream message for debug tracing. Duck-typed so
     a test can pass a stand-in; never raises (diagnostics must not add failure
@@ -373,15 +383,20 @@ class AgentRunner(AgentRuntime):
         return min(caps)
 
     def _wall_timeout(
-        self, elapsed: float, last_trace: str, usage: dict | None = None
+        self, elapsed: float, last_trace: str, usage: dict | None = None,
+        msgs: int = 0,
     ) -> AgentResult:
         """Log + build the terminal result for a tripped total-runtime cap.
 
         `usage` carries whatever the stream reported before the abort, so the run
-        is costed rather than ledgered as $0.00 (see `merge_usage`)."""
+        is costed rather than ledgered as $0.00 (see `merge_usage`). `msgs` is how
+        many stream messages arrived first — it distinguishes "wedged early" from
+        "worked the whole time and ran out of road", which need opposite responses
+        (investigate vs. raise the cap / trim the task)."""
         self._log(
             f"sdk: WALL — total runtime {elapsed:.0f}s exceeded "
-            f"max {self._max_runtime:.0f}s; aborting (last: {last_trace or 'none'})"
+            f"max {self._max_runtime:.0f}s; aborting after {msgs} stream "
+            f"messages (last: {last_trace or 'none'})"
         )
         return AgentResult(
             is_error=True, status="timeout",
@@ -458,7 +473,9 @@ class AgentRunner(AgentRuntime):
                     if elapsed >= self._max_runtime:
                         await _aclose_quietly(agen)
                         if final is None:
-                            return self._wall_timeout(elapsed, last_trace, usage_acc)
+                            return self._wall_timeout(
+                                elapsed, last_trace, usage_acc, msg_count
+                            )
                         self._log(
                             f"sdk: WALL — {elapsed:.0f}s exceeded max "
                             f"{self._max_runtime:.0f}s, but a ResultMessage was "
@@ -546,7 +563,13 @@ class AgentRunner(AgentRuntime):
                             pending.cancel()
                             await _aclose_quietly(agen)
                             if final is None:
-                                return self._wall_timeout(elapsed, last_trace)
+                                # usage_acc MUST ride along here exactly as on the
+                                # between-receives wall path above: this branch used
+                                # to omit it, so a limping-stream wall abort ledgered
+                                # $0.00 — the precise hole merge_usage exists to close.
+                                return self._wall_timeout(
+                                    elapsed, last_trace, usage_acc, msg_count
+                                )
                             self._log(
                                 f"sdk: WALL — {elapsed:.0f}s exceeded max "
                                 f"{self._max_runtime:.0f}s, but a ResultMessage was "
@@ -574,8 +597,14 @@ class AgentRunner(AgentRuntime):
                 tr = getattr(message, "terminal_reason", None)
                 if tr:
                     terminal_seen = str(tr)
+                # ALWAYS maintained, not debug-gated: this string is what the
+                # wall/idle abort lines print as "(last: …)". Gated behind
+                # _debug it was never assigned in production, so every abort
+                # reported "(last: none)" — at the exact moment "what was the
+                # agent doing?" is the question (observed: #506's wall abort,
+                # 2026-07-26). Only the per-message log line stays debug-only.
+                last_trace = _trace_message(message)
                 if self._debug:
-                    last_trace = _trace_message(message)
                     self._log(f"sdk: {last_trace}")
                 if isinstance(message, ResultMessage):
                     # Skip background-task follow-up results. When a background task
@@ -663,6 +692,22 @@ class AgentRunner(AgentRuntime):
                 usage=usage_acc,
             )
         result = result_to_agent_result(final)
+        # Calibration line for the abort-cost estimator: on a COMPLETED run both
+        # totals exist — the ResultMessage's own cumulative usage (authoritative,
+        # what the ledger keeps) and merge_usage's stream-summed accumulator (all
+        # an ABORTED run ever has). Logging the pair is the diagnostic for how far
+        # estimates on aborted runs can be trusted, per counter. Suspected skew:
+        # per-message usage blocks appear to carry message_start-style output
+        # placeholders — #506's 2707s wall abort accumulated output_tokens=4764
+        # across ~15 commits of code, vs 55-66k on comparable completed runs.
+        if usage_acc and isinstance(result.usage, dict):
+            acc_t, res_t = total_stream_tokens(usage_acc), total_stream_tokens(result.usage)
+            self._log(
+                f"sdk: usage calibration — stream-accumulated {acc_t} tokens "
+                f"(out={usage_acc.get('output_tokens', 0)}) vs result "
+                f"{res_t} (out={result.usage.get('output_tokens', 0)})"
+            )
+        return result
         # An errored envelope gets its forensics logged AT THE MOMENT OF FAILURE,
         # while the raw ResultMessage is still in hand. Everything below is
         # dropped by the AgentResult mapping, so without this the daemon log says
