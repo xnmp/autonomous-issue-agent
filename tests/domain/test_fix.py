@@ -353,10 +353,17 @@ def test_issueless_behind_pr_updates_branch_idle_and_busy():
 
 def test_dispatching_on_a_pr_no_longer_skips_its_automerge_evaluation():
     # The other family of skipped `continue`s: a DISPATCH used to skip 3c for the
-    # same PR. An approved+green PR that went CONFLICTING is both — rebase it AND
-    # arm it, so the rebase push lands through auto-merge instead of waiting for a
-    # later poll to notice. Idle and busy agree on the arming; only the dispatch
-    # (which genuinely needs the lock) differs.
+    # same PR. The lock must bound only the dispatch, never the (cheap) arming
+    # evaluation — idle and busy agree on 3c's outcome for the same world.
+    #
+    # A CONFLICTING PR is rebased but NOT armed (changed 2026-07-26): GitHub
+    # refuses to arm a DIRTY PR, and the old arm-while-conflicted behavior only
+    # looked like it worked because the unconditional marker write hid the
+    # refusal — while actually suppressing the REAL arm forever (#537). Post-fix
+    # the arm re-fires on the first poll after mergeability returns, so the only
+    # cost is one poll of latency after the rebase push; the old behavior was a
+    # gh call + refusal EVERY poll on repos without protected-branch rules.
+    # A MERGEABLE twin proves the arming itself is lock-independent.
     p = pr(100, "ai-pr-open", mergeable="CONFLICTING",
            reviews=(Review("APPROVED", "review-bot", "t1"),),
            checks=(Check("build", bucket="pass"),))
@@ -364,8 +371,15 @@ def test_dispatching_on_a_pr_no_longer_skips_its_automerge_evaluation():
     busy = decide_fix(world(prs=[p]), CFG, FixState(), fixer_busy=True)
     assert RunAgent(AgentKind.REBASE, 100) in _run_agents(idle)
     assert _run_agents(busy) == []                        # the lock still bounds dispatch
-    assert EnableAutoMerge(100, "squash") in idle         # …but not the arming
-    assert EnableAutoMerge(100, "squash") in busy
+    assert EnableAutoMerge(100, "squash") not in idle     # conflicted: rebase owns it
+    assert EnableAutoMerge(100, "squash") not in busy
+
+    clean = pr(100, "ai-pr-open", mergeable="MERGEABLE",
+               reviews=(Review("APPROVED", "review-bot", "t1"),),
+               checks=(Check("build", bucket="pass"),))
+    for busy_flag in (False, True):
+        actions = decide_fix(world(prs=[clean]), CFG, FixState(), fixer_busy=busy_flag)
+        assert EnableAutoMerge(100, "squash") in actions  # arming is lock-independent
 
 
 def test_blocked_pr_is_never_armed_in_either_lock_state():
