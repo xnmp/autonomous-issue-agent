@@ -138,8 +138,19 @@ class Executor:
         elif isinstance(action, CloseIssue):
             self.gateway.close_issue(action.number, action.reason, action.comment)
         elif isinstance(action, EnableAutoMerge):
-            self.gateway.enable_auto_merge(action.pr, action.method)
-            self._mark_automerge(action.pr)
+            # The marker is the domain's "don't re-arm" latch, so it must record
+            # what GITHUB did, not what we attempted: an unconditional write here
+            # wedged #537 (arm failed on an unprotected base branch, marker set,
+            # should_automerge suppressed forever on a PR that was APPROVED +
+            # green + CLEAN). Falsy/None returns (old gateways, test fakes) are
+            # treated as failure — better to re-arm next poll than to latch a lie.
+            if self.gateway.enable_auto_merge(action.pr, action.method):
+                self._mark_automerge(action.pr)
+            else:
+                self._log(
+                    f"auto-merge PR #{action.pr}: NOT armed (gh failed or GitHub "
+                    "refused); marker withheld so next poll retries"
+                )
         elif isinstance(action, UpdateBranch):
             self.gateway.update_branch(action.pr)
         elif isinstance(action, AddDependency):

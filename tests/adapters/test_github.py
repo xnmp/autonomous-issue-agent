@@ -259,6 +259,25 @@ def test_enable_auto_merge_argv():
     assert "--auto" in argv and "--squash" in argv and "--delete-branch" in argv
 
 
+def test_enable_auto_merge_verifies_armed_on_github():
+    # Success is a follow-up READ, not the merge call's stdout (empty either
+    # way): armed (autoMergeRequest set) or already landed (state MERGED) →
+    # True; anything else — including the GraphQL refusal on a base branch
+    # with no required-check protection — → False, so the caller never latches
+    # the don't-re-arm marker on an arm GitHub rejected (the #537 wedge).
+    armed = FakeRunner({"pr view 100": {"autoMergeRequest": {"enabledAt": "x"}, "state": "OPEN"}})
+    assert GitHubGateway("o/r", runner=armed).enable_auto_merge(100, "squash") is True
+
+    landed = FakeRunner({"pr view 100": {"autoMergeRequest": None, "state": "MERGED"}})
+    assert GitHubGateway("o/r", runner=landed).enable_auto_merge(100, "squash") is True
+
+    refused = FakeRunner({"pr view 100": {"autoMergeRequest": None, "state": "OPEN"}})
+    assert GitHubGateway("o/r", runner=refused).enable_auto_merge(100, "squash") is False
+
+    unreadable = FakeRunner()  # probe returns "" → not armed, never a crash
+    assert GitHubGateway("o/r", runner=unreadable).enable_auto_merge(100, "squash") is False
+
+
 def test_update_branch_argv():
     fr = FakeRunner()
     gw = GitHubGateway("o/r", runner=fr)

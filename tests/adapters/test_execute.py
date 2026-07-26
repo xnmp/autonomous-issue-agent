@@ -32,6 +32,7 @@ class FakeGateway:
 
     def enable_auto_merge(self, pr, method):
         self.calls.append(("automerge", pr, method))
+        return getattr(self, "automerge_ok", True)
 
     def update_branch(self, pr):
         self.calls.append(("update_branch", pr))
@@ -83,6 +84,21 @@ def test_enable_auto_merge_persists_the_armed_marker():
     ex = Executor(gw, mark_automerge=marked.append)
     ex.execute(EnableAutoMerge(100, "squash"))
     assert marked == [100]
+
+
+def test_enable_auto_merge_failure_withholds_the_marker():
+    # The inverse guard: the marker records what GITHUB did, not what we
+    # attempted. When the arm fails (observed: GraphQL "Branch does not have
+    # required protected branch rules" on an unprotected base), writing it
+    # anyway suppresses should_automerge forever on a PR that is otherwise
+    # merge-ready — #537 sat APPROVED + green + CLEAN and never merged.
+    gw = FakeGateway()
+    gw.automerge_ok = False
+    marked = []
+    ex = Executor(gw, mark_automerge=marked.append)
+    ex.execute(EnableAutoMerge(100, "squash"))
+    assert gw.calls == [("automerge", 100, "squash")]
+    assert marked == []
 
 
 def test_update_branch():

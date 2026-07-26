@@ -907,8 +907,29 @@ class GitHubGateway:
     def close_issue(self, number: int, reason: str, comment: str) -> None:
         self._gh(build_close_issue_args(self.repo, number, reason, comment))
 
-    def enable_auto_merge(self, pr: int, method: str) -> None:
+    def enable_auto_merge(self, pr: int, method: str) -> bool:
+        """`gh pr merge --auto`. Returns True iff GitHub actually armed
+        auto-merge — or merged the PR outright (gh merges immediately when the
+        PR is already CLEAN). Success is VERIFIED with a follow-up read, not
+        inferred from stdout: this command prints nothing useful on either
+        outcome, and on a base branch with no required-check protection the
+        enablePullRequestAutoMerge mutation fails (GraphQL: "Branch does not
+        have required protected branch rules") while an already-green PR merges
+        fine. Observed 2026-07-26: the arm failed on a just-pushed PR (checks
+        NONE), the marker was written anyway, and #537 sat APPROVED+green+CLEAN
+        but unmergeable-by-harness forever — armed-in-state, never
+        armed-on-GitHub. The caller must key the marker on this return."""
         self._gh(build_enable_auto_merge_args(self.repo, pr, method))
+        try:
+            raw = self._gh_json(
+                ["pr", "view", str(pr), "--repo", self.repo,
+                 "--json", "autoMergeRequest,state"]
+            )
+        except Exception:  # noqa: BLE001 — an unreadable probe is "not armed", never a crash
+            return False
+        if not isinstance(raw, dict):
+            return False
+        return raw.get("autoMergeRequest") is not None or raw.get("state") == "MERGED"
 
     def update_branch(self, pr: int) -> None:
         """Bring a BEHIND PR branch up to date with base (merge base into head), so
