@@ -307,6 +307,10 @@ class JournalingRuntime:
                 cost_usd=cost,
                 cost_estimated_usd=(estimated or None),
                 status=result.status,
+                # The envelope's own kind, alongside the agent's claimed `status`.
+                # Without it, an errored run that self-declared "success" (#501)
+                # leaves nothing in the journal to explain WHY it errored.
+                envelope_subtype=(getattr(result, "envelope_subtype", "") or None),
                 is_error=result.is_error,
                 exit_reason=(result.exit_reason.value if result.exit_reason else None),
                 session_id=result.session_id,

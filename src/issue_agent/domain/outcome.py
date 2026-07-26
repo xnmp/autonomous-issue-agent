@@ -108,7 +108,14 @@ class AgentResult:
     the raw `structured` dict."""
 
     is_error: bool
-    status: str = ""        # structured_output.status
+    status: str = ""        # structured_output.status — the agent's own CLAIM
+    # The SDK envelope's own subtype (error_max_turns, error_during_execution,
+    # success…), captured ALWAYS. `status` is only reported when the agent chose
+    # to declare one, and it used to shadow this: #501 returned is_error=True with
+    # status="success", and because the fallback was `if not status`, the envelope's
+    # error kind was discarded — leaving "why did that run fail?" unanswerable from
+    # the journal. A claim and an observation are different things; keep both.
+    envelope_subtype: str = ""
     summary: str = ""       # structured_output.summary / .result
     needs: str = ""         # structured_output.needs
     cost_usd: float = 0.0
@@ -139,6 +146,38 @@ class AgentResult:
         if isinstance(self.structured, dict) and name in self.structured:
             return bool(self.structured.get(name))
         return default
+
+
+def status_label(result: AgentResult) -> str:
+    """What a run ACTUALLY did, for the operator's log line — envelope first.
+
+    `result.status` is `structured_output.status`: the agent's own CLAIM about
+    itself, not an observation. The two can disagree, and did. Issue #501's first
+    resolve returned `is_error=True, exit_reason=agent_error` after 290s having
+    committed nothing, while declaring `status="success"` — and the log line,
+    which read `result.status or (…)`, printed:
+
+        agent #501: resolve — done (status=success, $1.93)
+
+    An operator (or a grep) reading that sees a clean success. `classify_outcome`
+    was never fooled — error wins there, which is why the harness correctly
+    requeued the issue — but the LOG, the thing humans actually read, said the
+    opposite of what happened. A monitoring surface that reports the agent's
+    self-assessment in place of the outcome is worse than no surface at all.
+
+    So: a failed envelope can never render as a bare success. The claim is still
+    shown, marked as a claim, because a disagreement between the two is itself
+    the interesting signal.
+    """
+    if not result.is_error:
+        return result.status or "ok"
+    reason = result.exit_reason.value if result.exit_reason else "error"
+    label = f"ERROR/{reason}"
+    if result.envelope_subtype and result.envelope_subtype != reason:
+        label += f":{result.envelope_subtype}"
+    if result.status:
+        label += f" (agent claimed {result.status!r})"
+    return label
 
 
 def classify_outcome(result: AgentResult) -> Outcome:

@@ -183,6 +183,11 @@ def result_to_agent_result(msg: Any) -> AgentResult:
     return AgentResult(
         is_error=is_error,
         status=status,
+        # Captured unconditionally — NOT under `if not status` like the fallback
+        # above. When the agent declares its own status the envelope's error kind
+        # would otherwise be thrown away, which is exactly what made #501's
+        # is_error=True / status="success" run undiagnosable.
+        envelope_subtype=str(getattr(msg, "subtype", "") or ""),
         summary=summary,
         needs=needs,
         cost_usd=float(getattr(msg, "total_cost_usd", 0.0) or 0.0),
@@ -193,6 +198,51 @@ def result_to_agent_result(msg: Any) -> AgentResult:
         ),
         usage=usage if isinstance(usage, dict) else None,
     )
+
+
+def _short(value: Any, limit: int = 200) -> str:
+    """One-line, length-bounded repr. A diagnostic that floods the log is a
+    diagnostic operators disable."""
+    text = " ".join(str(value).split())
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def error_forensics(msg: Any) -> str:
+    """WHY an errored ResultMessage errored, as one grep-able line.
+
+    The SDK envelope carries far more than we map onto AgentResult:
+    `errors`, `permission_denials` (the governor blocking the agent in a loop —
+    invisible everywhere else), `num_turns` (a max-turns wall), `stop_reason`,
+    `terminal_reason`, `api_error_status`, and the model's own `result` text.
+    All of it was being discarded, so a failed run left `exit_reason=agent_error`
+    and nothing else. Duck-typed and exception-free: a diagnostic must never add
+    a failure mode to the path it is diagnosing.
+    """
+    parts: list[str] = []
+    try:
+        for name in ("subtype", "stop_reason", "terminal_reason",
+                     "api_error_status", "num_turns", "duration_ms"):
+            value = getattr(msg, name, None)
+            if value not in (None, "", 0):
+                parts.append(f"{name}={_short(value, 80)}")
+        errors = getattr(msg, "errors", None)
+        if errors:
+            parts.append(f"errors={_short(errors, 400)}")
+        denials = getattr(msg, "permission_denials", None)
+        if denials:
+            # The count matters as much as the content: one denial is a blocked
+            # command, forty is an agent wedged against the governor.
+            try:
+                count = len(denials)
+            except TypeError:
+                count = "?"
+            parts.append(f"permission_denials={count} {_short(denials, 400)}")
+        text = (getattr(msg, "result", "") or "").strip()
+        if text:
+            parts.append(f"result={_short(text, 500)}")
+    except Exception as exc:  # noqa: BLE001 — diagnostics never raise
+        parts.append(f"(forensics failed: {exc})")
+    return "; ".join(parts) or "envelope carried no diagnostic fields"
 
 
 def merge_usage(acc: dict | None, raw: Any) -> dict | None:
@@ -612,4 +662,13 @@ class AgentRunner(AgentRuntime):
                 exit_reason=ExitReason.NO_RESULT,
                 usage=usage_acc,
             )
-        return result_to_agent_result(final)
+        result = result_to_agent_result(final)
+        # An errored envelope gets its forensics logged AT THE MOMENT OF FAILURE,
+        # while the raw ResultMessage is still in hand. Everything below is
+        # dropped by the AgentResult mapping, so without this the daemon log says
+        # only "done (status=…)" and the journal only "exit_reason=agent_error" —
+        # which is what made #501's 290s / $1.93 / zero-commit failure impossible
+        # to diagnose after the fact.
+        if result.is_error:
+            self._log(f"sdk: ERRORED — {error_forensics(final)}")
+        return result

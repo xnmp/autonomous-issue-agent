@@ -122,7 +122,7 @@ class FixWorkflow:
         result = await self.runner.run(task)
         self.cfg.log(
             f"agent #{issue}: {label} — done "
-            f"(status={result.status or ('error' if result.is_error else 'ok')}"
+            f"(status={outcome.status_label(result)}"
             f"{f', ${result.cost_usd:.2f}' if result.cost_usd else ''})"
         )
         return result
