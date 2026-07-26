@@ -39,7 +39,7 @@ from .lifecycle import (
     pr_lifecycle,
     retry_breaker,
 )
-from .refs import issue_from_branch
+from .refs import is_governed_branch, issue_from_branch
 from .review import IdentityMode
 from .world import (
     CIState,
@@ -183,10 +183,25 @@ def issues_needing_resume(
 
 
 def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
-    """Port of watcher-lib.sh:maybe_automerge gating. Requires: AUTO_MERGE on, no
-    existing marker, an APPROVED review by a DISTINCT actor, CI ok|none, and
-    three-identity mode (solo has no independent approver → 422 on self-merge)."""
+    """Port of watcher-lib.sh:maybe_automerge gating. Requires: AUTO_MERGE on, a
+    branch the harness itself authored, no existing marker, an APPROVED review by
+    a DISTINCT actor, CI ok|none, and three-identity mode (solo has no independent
+    approver → 422 on self-merge)."""
     if not cfg.auto_merge:
+        return False
+    # Merge ONLY our own work. The reviewer deliberately adopts unlabelled PRs
+    # (REVIEW_ADOPT_UNLABELED, on by default) so one that bypassed the pipeline is
+    # still seen — reviewing a stranger's PR is useful, MERGING it is not what
+    # anybody asked for. Composed with AUTO_MERGE those two safe-sounding defaults
+    # meant "approve and merge any open PR into the base branch", and on the first
+    # real deployment the reviewer promptly adopted a dependabot PR (#486) on a
+    # repo with five of them queued. Adoption widens what we REVIEW; this keeps it
+    # from widening what we MERGE.
+    #
+    # Keyed on the BRANCH, not the linked issue: `_issue_for_pr` prefers GitHub's
+    # closing-reference graph, which a stranger's PR can populate just by writing
+    # "Fixes #N" in its body. The branch name is the thing only the fixer creates.
+    if not is_governed_branch(pr.head_ref_name):
         return False
     if pr.number in state.automerge_enabled:
         return False
@@ -210,6 +225,10 @@ def should_update_branch(pr: PRView, cfg: FixConfig) -> bool:
     an update the branch is no longer BEHIND until the base advances again, so this
     does not re-fire every poll."""
     if not cfg.auto_merge or cfg.identity_mode != IdentityMode.THREE:
+        return False
+    # Same containment as should_automerge: this PUSHES to the PR's branch, which
+    # is not something to do to a PR the harness did not author.
+    if not is_governed_branch(pr.head_ref_name):
         return False
     if not pr.is_behind():
         return False
