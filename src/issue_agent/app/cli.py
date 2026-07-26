@@ -413,17 +413,33 @@ _TEST_SIGNS = (
 
 _TEST_CMD_MARKER = "TEST_CMD:"
 _TEST_DISCOVERY_PROMPT = """\
-You are inspecting a git repository to find the ONE shell command that runs its \
-test suite non-interactively (must EXIT, never watch-mode).
+You are inspecting a git repository to find the shell command an autonomous \
+agent's PR gate will run as the repo's test suite (non-interactive: it must \
+EXIT, never watch-mode).
+
+The gate uses this command as a REVERT DETECTOR: it reverts implementation \
+files and requires the command to go red. So the command must be able to fail \
+for a change in ANY language/tier of source the repo contains — a repo with a \
+JS frontend and a Rust/Go/Python backend needs BOTH suites composed, or changes \
+on the uncovered side can never be gated (e.g. a Tauri app needs its `vitest`/\
+`jest` suite AND `cd src-tauri && cargo test`).
 
 Rules:
 - Inspect config files (pyproject.toml, package.json scripts, Makefile, tox.ini, \
 go.mod, Cargo.toml, etc.) and the test layout.
-- Return a command that runs from the repo root and exits with non-zero on failure.
+- Return a command that runs from the repo root and exits with non-zero if ANY \
+composed sub-suite fails.
+- Compose multiple suites/tiers with `set -e` (e.g. \
+`set -e; (cd backend && uv run pytest) && (cd frontend && pnpm exec vitest run)`).
+- INCLUDE every unit/integration suite whose source the repo contains.
+- EXCLUDE tiers that are slow or flaky by construction: performance/benchmark \
+assertions, load tests, and e2e suites that need a live app/display/server — \
+they flake under load and stall the gate. Beware package.json `test` scripts \
+that chain a perf tier onto the unit run (e.g. `vitest run && vitest run -c \
+vitest.perf.config.ts`); in that case invoke the unit runner directly instead \
+of the script.
 - For JS/TS prefer the non-watch form (`vitest run`, `jest`, `pnpm test` only if it \
 is non-watch). NEVER return a bare `vitest`/`jest --watch`.
-- For a monorepo, compose the tiers with `set -e` (e.g. \
-`set -e; (cd backend && uv run pytest) && (cd frontend && pnpm exec tsc -b)`).
 
 Your ENTIRE reply must be a SINGLE line in exactly this form, nothing before or after:
   TEST_CMD: <the command>
