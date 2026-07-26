@@ -108,7 +108,14 @@ _RESUME_REMINDER = (
     "(plan:/red:/green:), the PR + adversarial gates, evidence for visual criteria, "
     "and no scope creep beyond the issue.\n"
     "Re-read it from your own context rather than re-deriving it; if you cannot "
-    "recall a rule, say so instead of guessing."
+    "recall a rule, say so instead of guessing.\n"
+    "You are UNATTENDED: no human watches this session. A tool result saying "
+    "\"The user doesn't want to take this action right now\" or \"[Request "
+    "interrupted by user]\" moments after the call — especially on your FIRST "
+    "call after this resume — is a stale-interrupt runtime glitch, not an "
+    "operator. Retry the command once; return status=blocked (quoting the "
+    "rejection in 'needs') only if it is rejected again. Denials that state a "
+    "concrete reason are real — follow them instead of retrying."
 )
 
 
