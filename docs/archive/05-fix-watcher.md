@@ -148,4 +148,4 @@ layers against the v1 "one error kills everything forever" failure.
 
 ---
 
-← Prev: [Fix Agent Scripts](04-fix-scripts.md) · [Index](README.md) · Next: [Review Agent](06-review-agent.md)  →
+← Prev: [Fix Agent Scripts](04-fix-scripts.md) · [Index](../../README.md) · Next: [Review Agent](06-review-agent.md)  →

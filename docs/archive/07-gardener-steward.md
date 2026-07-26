@@ -268,4 +268,4 @@ governor handles compound/nested commands, so that class of harness bug shouldn'
 
 ---
 
-← Prev: [Review Agent](06-review-agent.md) · [Index](README.md) · Next: [Master Agent](08-master-agent.md)  →
+← Prev: [Review Agent](06-review-agent.md) · [Index](../../README.md) · Next: [Master Agent](08-master-agent.md)  →

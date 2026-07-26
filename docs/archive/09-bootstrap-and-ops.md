@@ -184,4 +184,4 @@ GitHub), but a given issue's fix sessions stay on one machine.
 
 ---
 
-← Prev: [Master Agent](08-master-agent.md) · [Index](README.md)
+← Prev: [Master Agent](08-master-agent.md) · [Index](../../README.md)

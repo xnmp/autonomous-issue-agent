@@ -9,12 +9,20 @@ This is a general framework meant to be dropped into any repo as a `.claude/` pl
 shared between collaborators. It is provider- and organization-agnostic: point it at any
 GitHub repo, any OpenAI-compatible or Anthropic model gateway, via environment config.
 
-> **▶ The design below is now implemented and tested.** See **[HARNESS.md](HARNESS.md)**
-> for the operator's manual: quickstart, the full constraint→hook traceability matrix,
-> the decisions made while building, and the 134-test self-test suite (`make test`).
-> The runnable code lives in `plugin/` (enforcement), `agent/` `review/` `steward/`
-> (orchestration), `bin/` `ops/` (setup), and `examples/demo-target/` (a repo to watch
-> the loop run). These nine docs remain the design spec.
+> **▶ The design below has been implemented, and then superseded.** The harness
+> was ported from bash orchestration to a Python + Claude Agent SDK core; the
+> runnable path is now `src/issue_agent/` (hexagonal: `domain/` pure, `adapters/`
+> I/O, `app/` wiring) plus `plugin/` (enforcement). The bash watchers under
+> `agent/` `review/` `steward/` still exist and still run under
+> `FIXER_RUNTIME=codex`, which is what the nine `0N-*.md` specs — now in
+> [docs/archive/](docs/archive/) — still describe accurately.
+>
+> **For the current system, start with
+> [docs/reference/architecture.md](docs/reference/architecture.md)**, then
+> **[HARNESS.md](HARNESS.md)** for the operator's manual. What is still open is
+> in [docs/open/residuals.md](docs/open/residuals.md); the self-test suite is
+> ~1,500 tests via `make test`. [docs/README.md](docs/README.md) says what every
+> document is for and whether to trust it.
 
 ## Quickstart
 
@@ -88,15 +96,15 @@ three-daemon deployment can consume meaningful token spend; the per-agent budget
 
 This design is split across files (each is self-contained and edit-friendly):
 
-1. [Fix Agent Plugin Structure](01-plugin-structure.md) — `.claude/` layout, real `settings.json` hook schema
-2. [Hook Layer: tree-sitter Bash Governor](02-hook-governor.md) — AST dispatcher, bypass detection, the three checks
-3. [Fix Agent Specification](03-fix-agent-spec.md) — DDD+TDD flow, commit prefixes, adversarial pre-PR, `AGENT.md`
-4. [Fix Agent Scripts](04-fix-scripts.md) — crash-safe `lib.sh`, resolve/resume/fix-ci/address-review/cleanup
-5. [Fix Watcher](05-fix-watcher.md) — single sequential fixer, reaper, CI-state mapping, service units
-6. [Review Agent](06-review-agent.md) — separate identity, schema decisions, `--reviewer-runs-tests` flag
-7. [Architecture Steward (Gardener)](07-gardener-steward.md) — **stateful** design/docs/drift owner *(v3 rewrite — see file)*
-8. [Master Agent](08-master-agent.md) — on-demand status query
-9. [Bootstrap, Labels, Ops, Properties](09-bootstrap-and-ops.md) — setup, taxonomy, safeguards, open risks
+1. [Fix Agent Plugin Structure](docs/archive/01-plugin-structure.md) — `.claude/` layout, real `settings.json` hook schema
+2. [Hook Layer: tree-sitter Bash Governor](docs/archive/02-hook-governor.md) — AST dispatcher, bypass detection, the three checks
+3. [Fix Agent Specification](docs/archive/03-fix-agent-spec.md) — DDD+TDD flow, commit prefixes, adversarial pre-PR, `AGENT.md`
+4. [Fix Agent Scripts](docs/archive/04-fix-scripts.md) — crash-safe `lib.sh`, resolve/resume/fix-ci/address-review/cleanup
+5. [Fix Watcher](docs/archive/05-fix-watcher.md) — single sequential fixer, reaper, CI-state mapping, service units
+6. [Review Agent](docs/archive/06-review-agent.md) — separate identity, schema decisions, `--reviewer-runs-tests` flag
+7. [Architecture Steward (Gardener)](docs/archive/07-gardener-steward.md) — **stateful** design/docs/drift owner *(v3 rewrite — see file)*
+8. [Master Agent](docs/archive/08-master-agent.md) — on-demand status query
+9. [Bootstrap, Labels, Ops, Properties](docs/archive/09-bootstrap-and-ops.md) — setup, taxonomy, safeguards, open risks
 
 **Diagrams:**
 - [`process-diagram.svg`](process-diagram.svg) — the full lifecycle as a flowchart (the four phases, all loops, three agents, human touchpoints)
@@ -108,7 +116,7 @@ This design is split across files (each is self-contained and edit-friendly):
 > encodes invariants the base model lacks (attacking shared blind spots), reads drift
 > instrumentation as a Goodhart-resistant fitness signal, mines recurring review feedback into
 > evolving `AGENT.md`/ADR defaults, and curates docs. Plus a different-model reviewer for
-> decorrelated judgement. See [07-gardener-steward.md](07-gardener-steward.md).
+> decorrelated judgement. See [07-gardener-steward.md](docs/archive/07-gardener-steward.md).
 
 > **v2 rewrite.** v1 (`autonomous-issue-agent.v1-original.md`) had a sound skeleton —
 > *detect event → `claude -p` → check outcome → loop, with GitHub as the bus* — but the
@@ -156,7 +164,7 @@ Three independent systems coordinating only through GitHub: a **fix agent**, a *
 and an **architecture steward**. Neither the fixer nor the reviewer knows the other is an agent;
 a human can substitute for either at any point. The steward (a persistent, stateful session)
 sits above the issue loop and owns conceptual integrity — see
-[07-gardener-steward.md](07-gardener-steward.md).
+[07-gardener-steward.md](docs/archive/07-gardener-steward.md).
 
 ```
 FIX AGENT  (identity: fix-bot)            REVIEW AGENT (identity: review-bot)
@@ -232,4 +240,4 @@ PHASE 4 — Merge + cleanup (dev branch)
 
 ---
 
-[Index](README.md) · Next: [Fix Agent Plugin Structure](01-plugin-structure.md)  →
+[Index](README.md) · Next: [Fix Agent Plugin Structure](docs/archive/01-plugin-structure.md)  →

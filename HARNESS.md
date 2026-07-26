@@ -6,8 +6,8 @@ This is the runnable implementation of the design in `README.md` and
 The original nine docs are the **spec**; this file documents the **code** that
 implements it, the decisions made while building, and how to run and test it.
 
-> Design docs: [README.md](README.md) (index) → [01](01-plugin-structure.md) …
-> [09](09-bootstrap-and-ops.md). This file is the operator's manual.
+> Design docs: [README.md](README.md) (index) → [01](docs/archive/01-plugin-structure.md) …
+> [09](docs/archive/09-bootstrap-and-ops.md). This file is the operator's manual.
 
 ---
 

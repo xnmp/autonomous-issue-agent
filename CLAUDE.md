@@ -2,8 +2,18 @@
 
 Headless harness that resolves GitHub issues end-to-end (issue → branch → TDD →
 PR → CI → review → merge to `dev`). Three role daemons — **fix**, **review**,
-**steward** — poll GitHub and drive Claude Agent SDK sessions. Design spec is the
-nine `0N-*.md` docs; operator manual is [HARNESS.md](HARNESS.md).
+**steward** — poll GitHub and drive Claude Agent SDK sessions.
+
+**Start here:** [docs/reference/architecture.md](docs/reference/architecture.md)
+(how it works now) · [HARNESS.md](HARNESS.md) (operator manual) ·
+[docs/open/residuals.md](docs/open/residuals.md) (what's still open — read §1
+before pointing this at a repo you care about) · [docs/README.md](docs/README.md)
+(what every other document is for, and whether to trust it).
+
+The nine `0N-*.md` specs now live in `docs/archive/`: they describe the ORIGINAL
+BASH DESIGN and are accurate only about the legacy watchers under `agent/`,
+`review/`, `steward/` — not about the default SDK path. Do not implement from
+them.
 
 ## Pointing the harness at a repo
 

@@ -2,7 +2,7 @@
 
 Date: 2026-07-25. Scope: full audit of the SDK harness (domain, adapters, app
 wiring, enforcement payload, ops scripts, docs) against the 103-entry failure
-catalogue in [FAILURE-MODES.md](FAILURE-MODES.md), aimed at making this harness
+catalogue in [FAILURE-MODES.md](../reference/failure-modes.md), aimed at making this harness
 the primary workhorse across all of the operator's repositories.
 
 Method: five parallel code audits (domain decision logic; adapters + app

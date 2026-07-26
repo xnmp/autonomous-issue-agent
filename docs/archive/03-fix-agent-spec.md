@@ -143,4 +143,4 @@ $TEST_RULES
 
 ---
 
-← Prev: [Hook Layer: tree-sitter Bash Governor](02-hook-governor.md) · [Index](README.md) · Next: [Fix Agent Scripts](04-fix-scripts.md)  →
+← Prev: [Hook Layer: tree-sitter Bash Governor](02-hook-governor.md) · [Index](../../README.md) · Next: [Fix Agent Scripts](04-fix-scripts.md)  →

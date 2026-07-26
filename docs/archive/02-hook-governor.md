@@ -301,4 +301,4 @@ exit 0
 
 ---
 
-← Prev: [Fix Agent Plugin Structure](01-plugin-structure.md) · [Index](README.md) · Next: [Fix Agent Specification](03-fix-agent-spec.md)  →
+← Prev: [Fix Agent Plugin Structure](01-plugin-structure.md) · [Index](../../README.md) · Next: [Fix Agent Specification](03-fix-agent-spec.md)  →

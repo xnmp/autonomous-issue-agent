@@ -225,4 +225,4 @@ Return structured output: decision ∈ {APPROVE, REQUEST_CHANGES, ESCALATE} and 
 
 ---
 
-← Prev: [Fix Watcher](05-fix-watcher.md) · [Index](README.md) · Next: [Architecture Steward](07-gardener-steward.md)  →
+← Prev: [Fix Watcher](05-fix-watcher.md) · [Index](../../README.md) · Next: [Architecture Steward](07-gardener-steward.md)  →

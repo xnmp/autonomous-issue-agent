@@ -6,10 +6,10 @@ design decisions already made (do not re-litigate them), wave-by-wave specs
 with file ownership, and the verification protocol.
 
 Prerequisite reading, in order:
-1. [REVIEW-2026-07-25-adversarial.md](REVIEW-2026-07-25-adversarial.md) — the
+1. [REVIEW-2026-07-25-adversarial.md](2026-07-25-adversarial-review.md) — the
    findings and their evidence. This plan references findings by ID (C1–C5,
    M1–M23, T1–T6, S1–S8) and does not restate evidence.
-2. [HANDOVER-2026-07-25-lean-core.md](HANDOVER-2026-07-25-lean-core.md) — what
+2. [HANDOVER-2026-07-25-lean-core.md](2026-07-25-lean-core-handover.md) — what
    the lean core is; **read the [CORRECTED] annotations**, three of its claims
    were falsified by the review.
 3. `CLAUDE.md` (repo root) — how the harness works operationally.

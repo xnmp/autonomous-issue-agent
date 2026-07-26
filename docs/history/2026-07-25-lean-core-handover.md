@@ -1,29 +1,29 @@
 # Handover — lean core implemented (2026-07-25)
 
 Audience: the next working session (human or agent). Prerequisite reading:
-[IMPROVEMENT-PLAN.md](IMPROVEMENT-PLAN.md) (the audit + full reference design —
+[IMPROVEMENT-PLAN.md](2026-07-25-improvement-plan.md) (the audit + full reference design —
 its appendices are still the evidence base) and
-[FAILURE-MODES.md](FAILURE-MODES.md) (now 106 entries). This document is the
+[FAILURE-MODES.md](../reference/failure-modes.md) (now 106 entries). This document is the
 delta: what was actually built, the decisions made *during* implementation
 that the plan doesn't record, the known gaps, and how to decide what to do
 next.
 
 > **Correction notice (2026-07-25, later the same day).** An adversarial
-> review ([REVIEW-2026-07-25-adversarial.md](REVIEW-2026-07-25-adversarial.md))
+> review ([REVIEW-2026-07-25-adversarial.md](2026-07-25-adversarial-review.md))
 > audited this handover against the tree and **falsified three of its claims**;
 > corrections are marked **[CORRECTED]** inline below. The remediation plan is
-> [PLAN-2026-07-25-review-remediation.md](PLAN-2026-07-25-review-remediation.md).
+> [PLAN-2026-07-25-review-remediation.md](2026-07-25-remediation-plan.md).
 >
 > **Status update (2026-07-26).** The plan's P0 and P1 waves have landed —
 > `44fbd16` (P0-A), `9ecb0ae` (P0-B), `299c825` (P1-1) — followed by a
 > **second, independent adversarial re-review of that work**
-> ([REVIEW-2026-07-26-p0-rereview.md](REVIEW-2026-07-26-p0-rereview.md)), which
+> ([REVIEW-2026-07-26-p0-rereview.md](2026-07-26-p0-rereview.md)), which
 > confirmed the headline repros closed but found 5 further P0s (two of them
 > *introduced by* the remediation) and 18 P1s. Those are fixed in `f0b4040`
 > (P0R) and `cebf088` (P1R). Each [CORRECTED] note below now carries the commit
 > that closed it. §7's "point at 2–3 real repos and let the ledger run" is
 > **no longer blocked on correctness work**, but read
-> [REVIEW-2026-07-26-p0-rereview.md](REVIEW-2026-07-26-p0-rereview.md) §4
+> [REVIEW-2026-07-26-p0-rereview.md](2026-07-26-p0-rereview.md) §4
 > (accepted residuals) and §5 (the process finding) before doing it: the
 > `sh -c` governor bypass is still open by design, and the ledger still cannot
 > see spend on plans that report $0 (it now warns loudly instead of lying).

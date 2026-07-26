@@ -15,4 +15,4 @@ harness issues raised. For each blocker, say what's needed to unblock."
 
 ---
 
-← Prev: [Architecture Steward](07-gardener-steward.md) · [Index](README.md) · Next: [Bootstrap, Labels, Ops, Properties](09-bootstrap-and-ops.md)  →
+← Prev: [Architecture Steward](07-gardener-steward.md) · [Index](../../README.md) · Next: [Bootstrap, Labels, Ops, Properties](09-bootstrap-and-ops.md)  →

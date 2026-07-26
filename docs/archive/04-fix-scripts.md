@@ -389,4 +389,4 @@ fi
 
 ---
 
-← Prev: [Fix Agent Specification](03-fix-agent-spec.md) · [Index](README.md) · Next: [Fix Watcher](05-fix-watcher.md)  →
+← Prev: [Fix Agent Specification](03-fix-agent-spec.md) · [Index](../../README.md) · Next: [Fix Watcher](05-fix-watcher.md)  →

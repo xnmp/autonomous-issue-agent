@@ -63,4 +63,4 @@ exec uv run "$(dirname "$0")/bash_governor.py"
 
 ---
 
-← Prev: [Overview & Index](README.md) · [Index](README.md) · Next: [Hook Layer: tree-sitter Bash Governor](02-hook-governor.md)  →
+← Prev: [Overview & Index](../../README.md) · [Index](../../README.md) · Next: [Hook Layer: tree-sitter Bash Governor](02-hook-governor.md)  →
