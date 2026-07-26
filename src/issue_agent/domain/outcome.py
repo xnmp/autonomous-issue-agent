@@ -426,5 +426,15 @@ def fix_ci_actions(pr: int, result: AgentResult) -> list[Action]:
     if infra_death(result.exit_reason):
         return []
     if classify_outcome(result) is Outcome.BLOCKED:
-        return [Relabel(Target.PR, pr, None, Label.AI_BLOCKED)]
+        # Post the agent's 'needs' alongside the label, same as the resolve
+        # path's blocked arm. Without it a blocked rebase/fix-ci escalated to a
+        # human with the WHY discarded — observed on PR #534 (2026-07-26): the
+        # rebase agent declared blocked over two doc-file conflicts, ai-blocked
+        # landed, and no comment, journal field, or log line anywhere said what
+        # it thought it needed. The human inherits a mystery.
+        needs = result.needs or result.summary or "see logs"
+        return [
+            PostComment(Target.PR, pr, f"**Agent needs input:**\n\n{needs}"),
+            Relabel(Target.PR, pr, None, Label.AI_BLOCKED),
+        ]
     return []
