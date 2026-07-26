@@ -7,6 +7,7 @@ The key invariant: synth_repo_env's keys must round-trip through config.from_env
 import argparse
 import json
 import os
+import subprocess
 from datetime import datetime, timezone
 
 from issue_agent.app import cli
@@ -760,3 +761,63 @@ def test_install_service_proceeds_on_compose_success(tmp_path, monkeypatch):
     assert any(
         "install-systemd.sh" in c[1] or "install-launchd.sh" in c[1] for c in calls
     )
+
+
+# ── TEST_CMD verification (a wrong command wedges the whole gate) ──────────────
+def test_verify_reports_a_passing_suite():
+    check = cli.verify_test_cmd("true", "/tmp", run=lambda c, cwd, t: 0)
+    assert check.passed and not check.timed_out
+
+
+def test_verify_reports_a_failing_suite_without_masking_it():
+    """A red suite must be REPORTED, never silently swapped for the
+    ALLOW_UNTESTED fallback — that would trade a loud problem (the gate denies
+    pushes until you fix it) for a silent one (a gate with no teeth)."""
+    check = cli.verify_test_cmd("false", "/tmp", run=lambda c, cwd, t: 1)
+    assert not check.passed and not check.timed_out and check.exit_code == 1
+
+
+def test_verify_detects_watch_mode_as_a_timeout():
+    """The signature failure: `vitest` instead of `vitest run` never exits, so
+    the gate hangs GATE_TEST_TIMEOUT_S on every push and then denies it."""
+    def _hang(cmd, cwd, timeout):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout)
+    check = cli.verify_test_cmd("vitest", "/tmp", timeout_s=0.1, run=_hang)
+    assert check.timed_out and check.exit_code is None
+
+
+def test_verify_survives_a_runner_that_explodes():
+    """Verification is best-effort: it must never be the reason `start` fails."""
+    def _boom(cmd, cwd, timeout):
+        raise OSError("no shell")
+    assert cli.verify_test_cmd("x", "/tmp", run=_boom).exit_code == -1
+
+
+def test_verify_runs_the_command_the_GATE_would_run():
+    """Anti-vacuity on the whole feature: verifying a DIFFERENT invocation than
+    the gate uses would prove nothing. The gate does
+    `subprocess.run(cmd, shell=True, cwd=<repo>)`, so the command string must
+    reach the runner intact and with the repo as cwd."""
+    seen = {}
+
+    def _spy(cmd, cwd, timeout):
+        seen.update(cmd=cmd, cwd=cwd, timeout=timeout)
+        return 0
+
+    cli.verify_test_cmd("set -e; (cd api && pytest)", "/repo/root", run=_spy)
+    assert seen["cmd"] == "set -e; (cd api && pytest)"
+    assert seen["cwd"] == "/repo/root"
+    assert seen["timeout"] > 0
+
+
+def test_report_names_watch_mode_and_the_slow_suite_alternative(capsys):
+    cli.report_test_cmd_check("vitest", cli.TestCmdCheck(exit_code=None, seconds=180.0))
+    out = capsys.readouterr()
+    combined = out.out + out.err
+    assert "WATCH MODE" in combined and "GATE_TEST_TIMEOUT_S" in combined
+
+
+def test_report_tells_you_a_red_suite_blocks_the_fixer(capsys):
+    cli.report_test_cmd_check("pytest", cli.TestCmdCheck(exit_code=1, seconds=3.0))
+    combined = "".join(capsys.readouterr())
+    assert "denies every push" in combined

@@ -23,6 +23,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+from dataclasses import dataclass
 import tempfile
 
 # HARNESS_ROOT: …/src/issue_agent/app/cli.py → repo root. Same walk main.py uses.
@@ -496,6 +498,86 @@ def _parse_test_cmd_reply(text: str) -> str:
     return cmd
 
 
+# ── test-command VERIFICATION (does the discovered command actually work?) ────
+# Discovery is an LLM guess, and until now it was written into the overlay
+# unverified — the one config value whose wrongness wedges the whole harness.
+# The three realistic failures all present identically to the operator (every
+# PR denied) but only after a paid session has already run:
+#   * watch-mode (`vitest` not `vitest run`) — hangs until GATE_TEST_TIMEOUT_S
+#     (600s) and is then reported as a FAILING run;
+#   * a binary that is not installed (`pnpm` on a machine without it) — 127;
+#   * a command that assumes a different cwd or a missing service.
+# Running it ONCE at setup turns the guess into a fact, and costs the same as
+# the run the gate will do on the very first push anyway.
+_VERIFY_TIMEOUT_S = 180.0
+
+
+@dataclass(frozen=True)
+class TestCmdCheck:
+    """Outcome of trial-running a candidate TEST_CMD. `exit_code is None` means
+    it never finished — the watch-mode signature."""
+
+    exit_code: int | None
+    seconds: float
+
+    @property
+    def timed_out(self) -> bool:
+        return self.exit_code is None
+
+    @property
+    def passed(self) -> bool:
+        return self.exit_code == 0
+
+
+def verify_test_cmd(
+    cmd: str, target_dir: str, timeout_s: float = _VERIFY_TIMEOUT_S, run=None
+) -> TestCmdCheck:
+    """Trial-run `cmd` the way the GATE will run it — `shell=True` in the repo
+    root, bounded by a timeout (mirrors `worktree._default_run_tests`). Anything
+    else would verify a command the gate never issues. `run` is injectable so
+    tests never execute a real suite. Never raises: a verification that blows up
+    must not block `start`."""
+    started = time.monotonic()
+    runner = run or (
+        lambda c, cwd, t: subprocess.run(
+            c, shell=True, cwd=cwd, timeout=t,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode
+    )
+    try:
+        code = runner(cmd, target_dir, timeout_s)
+    except subprocess.TimeoutExpired:
+        return TestCmdCheck(exit_code=None, seconds=time.monotonic() - started)
+    except Exception:  # noqa: BLE001 — verification is best-effort, never fatal
+        return TestCmdCheck(exit_code=-1, seconds=time.monotonic() - started)
+    return TestCmdCheck(exit_code=code, seconds=time.monotonic() - started)
+
+
+def report_test_cmd_check(cmd: str, check: TestCmdCheck) -> None:
+    """Tell the operator what the trial run proved. A FAILING suite is reported
+    but NOT treated as a reason to drop the command: the alternative is the
+    ALLOW_UNTESTED fallback, which trades a loud problem for a silent one (a
+    gate with no teeth). The operator is told exactly what to fix."""
+    if check.passed:
+        ok(f"verified TEST_CMD ({check.seconds:.0f}s): the suite runs and passes")
+        return
+    if check.timed_out:
+        warn(
+            f"TEST_CMD did not finish within {_VERIFY_TIMEOUT_S:.0f}s: {cmd}\n"
+            "    If this is WATCH MODE the gate will hang on every push and then "
+            "deny it — use the non-watch form (`vitest run`, `jest --ci`).\n"
+            "    If your suite is just slow, that is fine: raise "
+            "GATE_TEST_TIMEOUT_S above its real runtime."
+        )
+        return
+    warn(
+        f"TEST_CMD exited {check.exit_code} on a clean checkout: {cmd}\n"
+        "    The tests gate denies every push and `gh pr create` while this "
+        "fails, so the fixer would burn a session and then be blocked.\n"
+        "    Fix the suite, or correct TEST_CMD in the overlay before starting."
+    )
+
+
 def _no_tests_banner() -> None:
     """Loud, impossible-to-miss warning that the target repo has no test suite —
     the PR gate, the red-must-fail gate, and the reviewer's test run all lose
@@ -675,6 +757,13 @@ def cmd_start(args) -> int:
                 ok(f"discovered TEST_CMD: {test_cmd}")
             else:
                 _no_tests_banner()
+        # Verify whatever we ended up with — discovered OR hand-supplied. A typo
+        # in --test-cmd wedges the gate exactly as badly as a bad guess, and this
+        # is the last moment before the value is written into the overlay and
+        # starts denying pushes.
+        if test_cmd and not getattr(args, "no_verify_test_cmd", False):
+            info(f"trial-running the test command (up to {_VERIFY_TIMEOUT_S:.0f}s)…")
+            report_test_cmd_check(test_cmd, verify_test_cmd(test_cmd, target_dir))
         content = synth_repo_env(
             repo=repo, target_dir=target_dir, name=name,
             base_branch=args.base_branch, test_cmd=test_cmd,
@@ -1115,12 +1204,20 @@ def build_parser() -> argparse.ArgumentParser:
         description="Start the watchers in the FOREGROUND (Ctrl-C stops all; logs "
         "tail live). First run auto-creates config/shared.env via `init`. If "
         "--test-cmd is omitted, a cheap read-only LLM probe discovers the repo's "
-        "test command; a repo with no tests proceeds behind a loud warning.",
+        "test command; a repo with no tests proceeds behind a loud warning. The "
+        "resolved command is then trial-run once (--no-verify-test-cmd skips it) "
+        "so watch-mode or a missing binary is caught here rather than by every "
+        "push being denied later.",
     )
     add_context_flags(sp)
     sp.add_argument("--roles", nargs="+", choices=ROLES, help="subset to run (default: all three)")
     sp.add_argument("--base-branch", default="dev", help="base branch for PRs (default: dev)")
     sp.add_argument("--test-cmd", default="", help="TEST_CMD (arms the PR/red-fail gate); omit to auto-discover")
+    sp.add_argument(
+        "--no-verify-test-cmd", action="store_true",
+        help="skip the one trial run of TEST_CMD (it catches watch-mode and "
+             "missing binaries before they deny every push)",
+    )
     sp.add_argument("--no-init", action="store_true", help="don't auto-run init on first start; error instead")
     sp.add_argument("--edit-check-cmd", default="", help="EDIT_CHECK_CMD (post-edit typecheck)")
     sp.add_argument("--review-mode", default="", choices=["", "single", "multi", "delegated"], help="reviewer strategy")
