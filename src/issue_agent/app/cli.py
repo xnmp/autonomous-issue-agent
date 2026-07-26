@@ -943,6 +943,26 @@ def cmd_doctor(args) -> int:
         r = subprocess.run(["/bin/bash", _bin("compose-env.sh"), name])
         if r.returncode == 0:
             env["AGENT_ENV"] = os.path.join(HARNESS_ROOT, "config", ".active.env")
+    elif os.path.isfile(SHARED_ENV):
+        # shared.env exists but this repo has no overlay yet — the normal state
+        # before the first `issue-agent start`. compose-env.sh needs both files,
+        # so without this branch AGENT_ENV stayed unset and doctor.sh fell back
+        # to its `${AGENT_ENV:-config/agent.env}` default: the LEGACY
+        # single-repo file, which is a gitignored copy of agent.env.example full
+        # of dummy values. Doctor then validated a config the operator never
+        # wrote and printed "✓ three distinct identities (fix-bot / review-bot /
+        # steward-bot)" — a false green on the exact thing being preflighted.
+        # Point it at shared.env instead, and inject the DETECTED repo/dir the
+        # overlay would have supplied (shared.env deliberately holds neither),
+        # so the identity and access checks are about the real target.
+        env["AGENT_ENV"] = SHARED_ENV
+        if repo:
+            env["REPO"] = repo
+        if target_dir:
+            env["TARGET_DIR"] = target_dir
+        warn(f"no overlay config/repos/{name}.env yet — checking config/shared.env "
+             f"against the detected repo. `issue-agent start` writes the overlay "
+             f"(TEST_CMD, BASE_BRANCH, state dirs); re-run doctor after that.")
     return subprocess.run(["/bin/bash", _bin("doctor.sh")], env=env).returncode
 
 

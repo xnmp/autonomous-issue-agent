@@ -188,10 +188,11 @@ else
 fi
 
 : "${REPO:=}"; : "${IDENTITY_MODE:=three}"; : "${FIX_BOT:=}"
-[ -n "$REPO" ] && ok "REPO=$REPO" || bad "REPO unset"
+_reported_bad=""   # vars already failed by the placeholder/example scan below
+_is_bad_var() { case " $_reported_bad " in *" $1 "*) return 0 ;; esac; return 1; }
 # P1R-6: check the NORMALIZED value, not the raw one — a whitespace-only
 # FIX_BOT ("   ") is non-empty by `-n` but carries no real identity.
-[ -n "$(_normalize_login "$FIX_BOT")" ] && ok "FIX_BOT=$FIX_BOT" || bad "FIX_BOT unset"
+
 
 # An UNEDITED template value passes every emptiness check — `FIX_BOT` left as
 # the literal `<your-gh-login>` is non-empty, so doctor used to green-light it.
@@ -215,9 +216,29 @@ fi
 for _var in $_placeholder_vars; do
   case "${!_var:-}" in
     *"<"*">"*)
-      bad "$_var is still the template placeholder (${!_var}) — edit config/shared.env or the repo overlay" ;;
+      bad "$_var is still the template placeholder (${!_var}) — edit config/shared.env or the repo overlay"
+      _reported_bad="$_reported_bad $_var"
+      continue ;;
+  esac
+  # The `<angle bracket>` form is not the only unedited value that ships: the
+  # examples in config/agent.env.example are PLAUSIBLE-looking (owner/repo,
+  # fix-bot, review-bot) and so sailed through the bracket check, letting
+  # doctor report "✓ three distinct identities (fix-bot / review-bot /
+  # steward-bot)" for three accounts that do not exist. A confident green on a
+  # config nobody edited is worse than no check at all.
+  case "$_var=${!_var:-}" in
+    "REPO=owner/repo"|"REPO=owner/name"|"FIX_BOT=fix-bot"|"REVIEW_BOT=review-bot"|"STEWARD_BOT=steward-bot")
+      bad "$_var is still the shipped example value (${!_var}) — this config was never edited"
+      _reported_bad="$_reported_bad $_var" ;;
   esac
 done
+
+if _is_bad_var REPO; then :                       # already reported, no ✓
+elif [ -n "$REPO" ]; then ok "REPO=$REPO"
+else bad "REPO unset"; fi
+if _is_bad_var FIX_BOT; then :
+elif [ -n "$(_normalize_login "$FIX_BOT")" ]; then ok "FIX_BOT=$FIX_BOT"
+else bad "FIX_BOT unset"; fi
 
 if [ "$IDENTITY_MODE" = "three" ]; then
   : "${REVIEW_BOT:=}"; : "${STEWARD_BOT:=}"
@@ -229,7 +250,12 @@ if [ "$IDENTITY_MODE" = "three" ]; then
   _nfix="$(_normalize_login "$FIX_BOT")"
   _nreview="$(_normalize_login "$REVIEW_BOT")"
   _nsteward="$(_normalize_login "$STEWARD_BOT")"
-  if [ -n "$REVIEW_BOT" ] && [ -n "$STEWARD_BOT" ] \
+  # Distinctness is meaningless if the logins are unedited examples — three
+  # DIFFERENT fake names are still "distinct". Suppress the ✓ so the scan's ✗
+  # is the only verdict on this line.
+  if _is_bad_var FIX_BOT || _is_bad_var REVIEW_BOT || _is_bad_var STEWARD_BOT; then
+    :
+  elif [ -n "$REVIEW_BOT" ] && [ -n "$STEWARD_BOT" ] \
      && [ "$_nfix" != "$_nreview" ] && [ "$_nfix" != "$_nsteward" ]; then
     if [ "$_nreview" = "$_nsteward" ]; then
       ok "two distinct identities (fix=$FIX_BOT, review+steward=$REVIEW_BOT)"

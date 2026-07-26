@@ -48,6 +48,7 @@ import re
 import shlex
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -99,6 +100,17 @@ def _fake_tool_path(tmp_path: Path) -> Path:
 def _run_doctor(env: dict, cwd: Path | None = None) -> subprocess.CompletedProcess:
     full_env = dict(os.environ)
     full_env.update(env)
+    # Hermeticity: doctor.sh resolves `CONFIG="${AGENT_ENV:-$HARNESS_ROOT/config/agent.env}"`
+    # and SOURCES it with `set -a`, so without an explicit AGENT_ENV it reads the
+    # developer's own (gitignored) config/agent.env and that file's values
+    # OVERRIDE the env this helper passes in. Tests then silently assert against
+    # whatever happens to be on the machine — they passed for a while only
+    # because their fixture logins coincided with the shipped example values in
+    # that file. Point every run at an empty config unless the test supplies one.
+    if "AGENT_ENV" not in env:
+        empty = Path(tempfile.mkdtemp(prefix="doctor-cfg-")) / "empty.env"
+        empty.write_text("")
+        full_env["AGENT_ENV"] = str(empty)
     return subprocess.run(
         ["bash", str(DOCTOR_SH)],
         env=full_env,
@@ -625,16 +637,17 @@ def test_doctor_skips_state_dir_check_with_no_overlays(tmp_path):
 
 # ── D7 + C1: doctor identity-distinctness normalization ────────────────────────
 def test_doctor_rejects_bot_suffix_mismatch_under_identity_mode_three(tmp_path):
-    # review C1: fix-bot and fix-bot[bot] are the SAME GitHub identity in two
+    # review C1: acme-fixer and acme-fixer[bot] are the SAME GitHub identity in
+    # two
     # API surface forms — a raw string compare (the old check) passed this,
     # and GitHub then 422s the self-approval on every PR, forever.
     fake_bin = _fake_tool_path(tmp_path)
     result = _run_doctor({
         "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
         "IDENTITY_MODE": "three",
-        "FIX_BOT": "fix-bot",
-        "REVIEW_BOT": "fix-bot[bot]",
-        "STEWARD_BOT": "steward-bot",
+        "FIX_BOT": "acme-fixer",
+        "REVIEW_BOT": "acme-fixer[bot]",
+        "STEWARD_BOT": "acme-steward",
         "REPO": "o/r",
     })
     assert result.returncode != 0
@@ -647,9 +660,9 @@ def test_doctor_accepts_distinct_identities_under_identity_mode_three(tmp_path):
     result = _run_doctor({
         "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
         "IDENTITY_MODE": "three",
-        "FIX_BOT": "fix-bot",
-        "REVIEW_BOT": "review-bot",
-        "STEWARD_BOT": "steward-bot",
+        "FIX_BOT": "acme-fixer",
+        "REVIEW_BOT": "acme-reviewer",
+        "STEWARD_BOT": "acme-steward",
         "REPO": "o/r",
     })
     assert "three distinct identities" in result.stdout
@@ -662,9 +675,9 @@ def test_doctor_case_insensitive_bot_suffix_mismatch(tmp_path):
     result = _run_doctor({
         "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
         "IDENTITY_MODE": "three",
-        "FIX_BOT": "Fix-Bot",
-        "REVIEW_BOT": "fix-bot[BOT]",
-        "STEWARD_BOT": "steward-bot",
+        "FIX_BOT": "Acme-Fixer",
+        "REVIEW_BOT": "acme-fixer[BOT]",
+        "STEWARD_BOT": "acme-steward",
         "REPO": "o/r",
     })
     assert result.returncode != 0
