@@ -16,10 +16,12 @@ exists in the presence of a real target repo, a real config file, or a real
 GitHub identity.
 
 **If you read one section, read §3.6.** Both abandoned issues died the same way:
-the agent needs a running dev server to satisfy the visual-evidence rule, the
-governor forbids background processes, and the denial message tells it to run the
-server in the foreground — which never returns. That single contradiction cost
-$22 of the $38.
+the agent needs a running dev server to satisfy the visual-evidence rule, it
+reached for the SDK's `run_in_background` option, and the denial told it to use
+"the foreground" — which for a server never returns. It then burned its whole
+budget improvising. A plain `nohup … &` was permitted the entire time; only the
+SDK tool option is blocked. That one misleading sentence cost $22 of the $38.
+Fixed in code, **not yet verified by a re-run**.
 
 ---
 
@@ -246,21 +248,44 @@ stops vite around the test run itself, so an agent that reaches for
 `playwright test` never needs to hand-start a server. An agent that reaches for
 `bun run dev` first hits the wall. It is left to chance which one the agent tries.
 
-**Raising `MAX_BUDGET_USD` does not fix this** — it buys a more expensive version
-of the same failure. The fix is guidance, in two places:
+**The capability was there the whole time.** Measured directly against the real
+hook — the harness blocks the SDK's `run_in_background` TOOL OPTION, and nothing
+else:
 
-1. `adapters/governor.py` — the denial message must not prescribe the foreground
-   for a long-running process. Say what to do instead: use the repo's test runner
-   to manage its own server (Playwright `webServer`), or a one-shot
-   start-capture-kill inside a SINGLE foreground command, and never expect a
-   server to persist across tool calls.
-2. `plugin/AGENT.md` — the visual-evidence section tells the agent to capture
-   from a real running app but never says how to get one under a governor that
-   forbids background processes. That gap is where the money went.
+| command | verdict |
+|---|---|
+| `nohup bun run dev > /tmp/v.log 2>&1 &` (flag omitted) | **ALLOW** |
+| identical command with `run_in_background: True` | **DENY** |
+| `setsid bun run dev … &` | **ALLOW** |
 
-Worth measuring afterwards: `permission_denials` count per run is now logged, so
-"did the agent fight the governor?" is answerable. Two denials cost $10 here — the
-denials are cheap, the *flailing after them* is not.
+Two different mechanisms, conflated by the denial message:
+
+* `run_in_background: true` — the SDK's own managed background TASK. In 0.2.110
+  the turn then ends `terminal_reason="background_requested"` with no
+  `ResultMessage`, and the single-shot runner loses the run. Denying it is right.
+* `nohup … &` — an ordinary shell job. The Bash call returns immediately, the
+  `ResultMessage` arrives normally, and the process outlives the call.
+
+So the agent reached for the one mechanism that is blocked, and was pointed at
+"the foreground" — impossible for a server — instead of at the `&` that was
+permitted all along. **Raising `MAX_BUDGET_USD` does not fix this**; it buys a
+more expensive version of the same failure.
+
+Fixed in this session's final commit, in both places:
+
+1. `adapters/governor.py` — the denial now names the working alternative
+   (`nohup <cmd> > /tmp/<name>.log 2>&1 &`, flag omitted) and states explicitly
+   that this is not a ban on long-running processes.
+2. `plugin/AGENT.md` — the visual-evidence section now shows how to start a
+   server and wait for readiness, warns that a foreground server never returns,
+   and says to prefer the repo's Playwright `webServer` when it exists.
+
+**Unverified:** neither #501 nor #506 has been re-run against the new guidance.
+The mechanism is confirmed and the message is corrected, but that these two
+issues then succeed is a prediction, not a result. `permission_denials` per run
+is now journalled, so "did the agent fight the governor?" is measurable next
+time — two denials cost $10 here; the denials are cheap, the flailing after them
+is not.
 
 ---
 
@@ -326,10 +351,10 @@ Spend on 2026-07-26: **$38.51 over 8 runs**, for two merged PRs.
 
 ## 7. Suggested next steps
 
-**Do §3.6 before spending anything else.** Both abandoned issues died against the
-background-process wall, and the extra budget just bought a longer version of the
-same failure. Fix the governor's denial message and the AGENT.md screenshot
-guidance first; the two-line change plausibly recovers both issues.
+§3.6 is now FIXED in code (governor denial message + AGENT.md guidance), but
+**unverified in practice** — re-running #501 and #506 is the first thing to do,
+because it both tests the fix and recovers two issues that failed for an
+infrastructural reason rather than a difficulty one.
 
 Then:
 

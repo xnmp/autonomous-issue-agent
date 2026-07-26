@@ -126,6 +126,20 @@ don't keep going back to edit it — each re-plan costs a full model round-trip.
      - **agent-browser (otherwise — no e2e setup, or the shot is a separate action
        from the asserting test):** start the preview/dev server and
        `agent-browser open <url>` then `agent-browser screenshot evidence/<name>.png`.
+
+       **How to start that server.** The `run_in_background` TOOL OPTION is denied
+       (it ends your turn without a result and loses the whole run) — but that is
+       NOT a ban on long-running processes. Detach it in the shell instead:
+
+           nohup bun run dev > /tmp/dev-<port>.log 2>&1 &     # run_in_background omitted
+           # wait for readiness rather than sleeping blindly:
+           for i in $(seq 30); do curl -sf localhost:<port> >/dev/null && break; sleep 1; done
+
+       That returns immediately, survives across later tool calls, and is allowed.
+       Kill it when you are done. Do NOT run a server as a plain foreground command
+       — it never returns and burns your whole budget waiting. If the repo's
+       Playwright config has a `webServer` block it already does all of this for
+       you; prefer that and start nothing yourself.
    Either way, COMMIT the screenshot before step 8 (the §10 red-check transiently
    reverts the impl and re-runs the tests, which could overwrite a test-produced
    screenshot in the working tree with a reverted-state image — the COMMITTED blob is

@@ -641,9 +641,14 @@ def make_pretooluse_hook(
                 if debug:
                     log("gate: DENY background Bash (run_in_background=true)")
                 return _deny(
-                    "background execution is disabled for this agent — run the "
-                    "command in the foreground (omit run_in_background) so the "
-                    "session returns a result."
+                    "the run_in_background TOOL OPTION is disabled for this agent "
+                    "(it ends the turn without a result and loses the run). This "
+                    "is not a ban on long-running processes: to start a server, "
+                    "detach it in the SHELL instead — "
+                    "`nohup <cmd> > /tmp/<name>.log 2>&1 &` with run_in_background "
+                    "omitted. That returns immediately, keeps running across later "
+                    "tool calls, and is allowed. Poll its log or curl the port to "
+                    "wait for readiness, and kill it when you are done."
                 )
             command = tool_input.get("command", "")
             if not command:
