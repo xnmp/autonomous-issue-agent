@@ -22,6 +22,7 @@ from ..adapters.github import GhUnavailable
 from ..domain.actions import Action, RunAgent
 from ..domain.world import WorldState
 from .execute import Executor
+from .world_probe import WorldUnchanged
 
 
 def order_for_execution(actions: list[Action]) -> list[Action]:
@@ -72,6 +73,13 @@ class Daemon:
         try:
             world = self.observe()
             actions = self.decide(world)
+        except WorldUnchanged:
+            # The probe proved this tick would observe the world the last full
+            # build already observed; re-deciding it re-derives the same actions.
+            # Deliberately SILENT — a line every quiet poll is exactly the
+            # heartbeat noise the probe exists to remove, and run_forever's ♥
+            # already proves liveness.
+            return []
         except GhUnavailable as exc:
             self.log(
                 f"{self.name}: world build failed: GitHub {exc.headline} — "

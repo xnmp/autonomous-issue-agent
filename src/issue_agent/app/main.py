@@ -23,6 +23,7 @@ from ..adapters.store import Store
 from ..adapters.worktree import Worktrees, build_gate_context
 from .config import HarnessConfig, from_env, render_agent_md
 from .roles import build_fix_daemon, build_review_daemon, build_steward_daemon
+from .world_probe import WorldProbe
 
 
 def _load_agent_env(env: dict) -> dict:
@@ -220,16 +221,30 @@ def build_role(role: str, env: dict | None = None):
         gw = GitHubGateway(cfg.repo, Identity(static_token=env.get("FIX_BOT_TOKEN") or None))
         store = Store(cfg.state_dir)
         return build_fix_daemon(cfg, gw, store, worktrees, runner)
+    # Change-probe gate for review/steward observes: 1 REST point per quiet tick
+    # instead of a full GraphQL world build (the 2026-07-26 rate-limit exhaustion
+    # — two daemons on one token at 20s polls). The FIX daemon is deliberately
+    # never gated: its decide reads CI check states and mergeable/mergeStateStatus,
+    # which GitHub recomputes WITHOUT bumping any updated_at, so the probe's
+    # signature is blind to exactly the signals the fixer acts on. Review reads
+    # neither; the steward never fetches PRs at all (Jira-side edits, when sync
+    # is on, are picked up at the probe's TTL reconciliation cadence).
+    def _probed(daemon, gw):
+        if not cfg.world_probe:
+            return daemon
+        probe = WorldProbe(gw.change_signature, float(cfg.world_probe_ttl_seconds))
+        return dataclasses.replace(daemon, observe=probe.gate(daemon.observe))
+
     if role == "review":
         gw = GitHubGateway(cfg.repo, _app_identity(env, warn=_commit_log),
                            review_pr_label=cfg.review_trigger_label,
                            review_adopt_unlabeled=cfg.review_adopt_unlabeled)
         store = Store(cfg.review_state_dir)
-        return build_review_daemon(cfg, gw, store, runner)
+        return _probed(build_review_daemon(cfg, gw, store, runner), gw)
     if role == "steward":
         gw = GitHubGateway(cfg.repo, _app_identity(env, warn=_commit_log))
         store = Store(cfg.steward_state_dir)
-        return build_steward_daemon(cfg, gw, store, runner)
+        return _probed(build_steward_daemon(cfg, gw, store, runner), gw)
     raise SystemExit(f"unknown role: {role!r} (use fix|review|steward)")
 
 

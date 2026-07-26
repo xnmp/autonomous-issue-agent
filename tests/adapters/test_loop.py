@@ -182,3 +182,21 @@ def test_run_forever_warns_on_suspend_stall():
     times = iter([0, 100_000, 100_060])
     d.run_forever(sleep=lambda s: None, now=lambda: next(times), max_ticks=2)
     assert any("suspended/stalled" in m for m in logs)
+
+
+def test_world_unchanged_skips_silently_without_deciding():
+    """The probe's skip is not an incident: no decide, no execute, no log line
+    (a line every quiet poll is the noise the probe exists to remove)."""
+    from issue_agent.app.world_probe import WorldUnchanged
+
+    logs = []
+    decided = []
+
+    def unchanged():
+        raise WorldUnchanged()
+
+    d, gw = _daemon(lambda w: decided.append(w) or [], observe=unchanged, logs=logs)
+    assert d.tick() == []
+    assert decided == []
+    assert gw.calls == []
+    assert logs == []

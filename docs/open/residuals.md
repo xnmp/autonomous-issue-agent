@@ -78,6 +78,7 @@ stayed lean. Full table in `docs/history/2026-07-25-improvement-plan.md` §4.
 | P2.1–2.3 reconciliation / leases | a stranded-label or state-drift incident recurs *despite* systemd + reaper |
 | P3.2 governor tiers | before onboarding any repo with untrusted inbound issues (see §1.2) |
 | Ledger rotation + cached daily total | dispatch latency, or ledger > ~50MB |
+| Webhook push (`gh webhook forward`) + poll demoted to slow reconciler (#1) | GraphQL rate limiting recurs despite POLL_SECONDS=60 and the ETag pre-check (first hit 2026-07-26, review+steward on one token at 20s polls) |
 | P6.1 legacy deletion (`agent/ review/ steward/`, `bin/bootstrap.sh`, bash suites) | opportunistic — **note the partition:** `plugin/hooks/checks/` is NOT deletable, it is live for codex mode and now covered by the parity suite |
 
 ---

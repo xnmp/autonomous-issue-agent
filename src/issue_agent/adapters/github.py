@@ -569,6 +569,21 @@ class GitHubGateway:
         )
         return parse_issue(d)  # type: ignore[arg-type]
 
+    def change_signature(self) -> str:
+        """Cheapest possible "did anything change?" probe: number@updated_at of
+        the single most-recently-updated issue-or-PR (the REST issues list
+        includes PRs). One REST point — a pool the GraphQL-backed world builds
+        never touch. "" on an empty repo or a benignly-failed call; callers must
+        read "" as "assume changed" (fail open), never as "no change". Infra
+        failures raise GhUnavailable like every other read here."""
+        out = self._gh([
+            "api",
+            f"repos/{self.repo}/issues?state=all&sort=updated"
+            "&direction=desc&per_page=1",
+            "--jq", r'.[0] | "\(.number)@\(.updated_at)"',
+        ])
+        return out.strip()
+
     def has_open_blocker(self, number: int) -> bool:
         """True iff issue `number` has ≥1 OPEN GitHub-native 'blocked by'
         dependency. Two-step, cheapest-first: the issue object embeds an

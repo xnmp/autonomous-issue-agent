@@ -126,6 +126,12 @@ class HarnessConfig:
     # (60 here, "20" there) — from_env now reads its default off THIS field, so
     # there is exactly one source and 20 (the value that actually shipped) wins.
     poll_seconds: int = 20
+    # Change-probe gate on review/steward world builds (app/world_probe.py):
+    # 1 REST point asks "did any issue/PR update?" before paying ~14 GraphQL
+    # points for a full build. The fixer is NEVER probed regardless of this
+    # flag — its decide reads CI/mergeability, which the probe cannot see.
+    world_probe: bool = True
+    world_probe_ttl_seconds: int = 300
     auto_merge: bool = True
     merge_method: str = "squash"
     ci_ignore_checks: str = ""
@@ -496,7 +502,8 @@ class HarnessConfig:
             # getattr, not IdentityMode(...): describe() is the startup diagnostic
             # and must print whatever it was handed rather than raise on it.
             f"identity={getattr(self.identity_mode, 'value', self.identity_mode)} "
-            f"poll={self.poll_seconds}s",
+            f"poll={self.poll_seconds}s "
+            f"probe={f'on/{self.world_probe_ttl_seconds}s' if self.world_probe else 'off'}",
             f"fixer={self.fixer_runtime} fix_model={model(self.fix_model)} "
             f"fix_budget=${self.fix_budget_usd:.2f}",
             f"review_model={model(self.review_model)} mode={self.review_mode.value} "
@@ -723,6 +730,10 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         steward_state_dir=e.get("STEWARD_STATE_DIR") or _default_state_dir(repo, "steward-agent"),
         worktree_root=e.get("WORKTREE_ROOT", _dc_default("worktree_root")),
         poll_seconds=_coerce_int(e, "POLL_SECONDS", _dc_default("poll_seconds"), errors),
+        world_probe=_b(e, "WORLD_PROBE", _dc_default("world_probe"), errors),
+        world_probe_ttl_seconds=_coerce_int(
+            e, "WORLD_PROBE_TTL_SECONDS", _dc_default("world_probe_ttl_seconds"), errors
+        ),
         auto_merge=_b(e, "AUTO_MERGE", _dc_default("auto_merge"), errors),
         merge_method=e.get("MERGE_METHOD", _dc_default("merge_method")),
         ci_ignore_checks=e.get("CI_IGNORE_CHECKS", _dc_default("ci_ignore_checks")),

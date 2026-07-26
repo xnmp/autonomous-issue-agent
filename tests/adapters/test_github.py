@@ -1196,3 +1196,17 @@ def test_format_review_comments_small_bodies_are_unaffected_by_the_cap():
     raw = [{"path": "a.py", "line": 12, "user": {"login": "rev"}, "body": "rename this",
             "created_at": "t1", "in_reply_to_id": None}]
     assert format_review_comments(raw) == "a.py:12 (rev): rename this"
+
+
+def test_change_signature_is_one_rest_point_and_fails_soft():
+    """The probe read: a single REST issues?per_page=1 call (issues list includes
+    PRs), returning number@updated_at — and "" (assume-changed) when gh answered
+    nothing, because a broken probe must degrade to building, never to sleeping."""
+    fr = FakeRunner({"api repos/o/r/issues?state=all&sort=updated": "531@2026-07-27T00:00:00Z\n"})
+    gw = GitHubGateway("o/r", Identity(static_token="t"), runner=fr)
+    assert gw.change_signature() == "531@2026-07-27T00:00:00Z"
+    argv, token = fr.calls[0]
+    assert argv[1] == "api" and "per_page=1" in argv[2] and "sort=updated" in argv[2]
+    assert token == "t"
+
+    assert GitHubGateway("o/r", Identity(), runner=FakeRunner()).change_signature() == ""
