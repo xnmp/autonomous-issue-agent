@@ -47,6 +47,46 @@ def test_tick_isolated_from_decide_crash():
     assert gw.calls == []
 
 
+def test_tick_executes_cheap_actions_before_agent_dispatches():
+    # A RunAgent blocks the tick for the whole session, so a merge/relabel/reap
+    # sequenced after one waits up to the wall cap for a ~1s gh call (PR #533
+    # sat APPROVED+green across two daemon lifetimes; RESOLVE #500 was
+    # dispatched ahead of arming merge-ready #537). Cheap actions must land
+    # first — but a dispatch's OWN preceding relabel keeps preceding it, and
+    # dispatch order among dispatches is preserved.
+    from issue_agent.domain.actions import AgentKind, EnableAutoMerge, RunAgent
+
+    ran = []
+    executed = []
+
+    class OrderGateway:
+        def relabel(self, kind, number, remove, add):
+            executed.append(("relabel", number))
+
+        def enable_auto_merge(self, pr, method):
+            executed.append(("automerge", pr))
+            return True
+
+    ex = Executor(OrderGateway(), run_agent=lambda a: executed.append(("run", a.number)))
+    d = Daemon(
+        "fix", lambda: WorldState(),
+        lambda w: [
+            Relabel(Target.ISSUE, 500, Label.AI_READY, Label.AI_WORKING),
+            RunAgent(AgentKind.RESOLVE, 500),
+            EnableAutoMerge(537, "squash"),
+            RunAgent(AgentKind.REBASE, 534),
+        ],
+        ex,
+    )
+    d.tick()
+    assert executed == [
+        ("relabel", 500),      # the dispatch's own label move still precedes it
+        ("automerge", 537),    # finished work lands before any session starts
+        ("run", 500),
+        ("run", 534),          # dispatch order among dispatches preserved
+    ]
+
+
 def test_tick_isolated_from_action_crash():
     logs = []
     class BadGateway:

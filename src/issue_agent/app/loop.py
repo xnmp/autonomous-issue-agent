@@ -19,9 +19,30 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from ..adapters.github import GhUnavailable
-from ..domain.actions import Action
+from ..domain.actions import Action, RunAgent
 from ..domain.world import WorldState
 from .execute import Executor
+
+
+def order_for_execution(actions: list[Action]) -> list[Action]:
+    """Cheap, terminal actions first; agent dispatches last (stable partition).
+
+    A RunAgent blocks the tick for the whole session (dispatch is synchronous
+    by design — up to the wall cap), so any merge/relabel/reap sequenced after
+    one waits that long for a ~1s gh call. Observed twice on the first real
+    deployment: PR #533 sat APPROVED+green across two daemon lifetimes behind
+    other issues' resolves, and the first post-restart tick on 2026-07-26
+    dispatched RESOLVE #500 ahead of arming merge-ready #537 — the more work
+    the harness has, the longer FINISHED work sits unmerged, which is exactly
+    backwards.
+
+    Stable within each group: a dispatch's own preceding relabel (ai-ready →
+    ai-working) still executes before it, and multiple dispatches keep decide's
+    order. Nothing in a tick's list depends on a dispatch completing before a
+    cheap action — post-run consequences live in the workflow tails, not here."""
+    cheap = [a for a in actions if not isinstance(a, RunAgent)]
+    dispatches = [a for a in actions if isinstance(a, RunAgent)]
+    return [*cheap, *dispatches]
 
 
 @dataclass
@@ -65,12 +86,13 @@ class Daemon:
         except Exception as exc:  # noqa: BLE001 - crash-isolate a poll
             self.log(f"{self.name}: poll pass failed (continuing): {exc}")
             return []
-        for action in actions:
+        ordered = order_for_execution(actions)
+        for action in ordered:
             try:
                 self.executor.execute(action)
             except Exception as exc:  # noqa: BLE001 - one bad action ≠ dead daemon
                 self.log(f"{self.name}: action {action!r} failed: {exc}")
-        return actions
+        return ordered
 
     def run_forever(
         self,
