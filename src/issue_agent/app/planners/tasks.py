@@ -405,10 +405,13 @@ def build_rebase_task(
         f"merged into `{base_branch}` after you opened this one, touching overlapping "
         "files. Rebase your branch onto the latest `origin/" + base_branch + "` (or "
         "merge it in), resolve the conflicts preserving BOTH your change and the new "
-        "work now on base, re-run TEST_CMD until green, and push (force-with-lease if "
-        "you rebased). Do NOT weaken your tests to force a pass. Return status=pushed "
-        "when the branch is mergeable again, or status=blocked with 'needs' if the "
-        "conflict genuinely requires a human decision."
+        "work now on base, re-run TEST_CMD until green LOCALLY, and push "
+        "(force-with-lease if you rebased). Do NOT weaken your tests to force a pass. "
+        "Return status=pushed IMMEDIATELY after the push succeeds — do NOT sit in "
+        "polling loops waiting for remote CI (the daemon watches checks itself and "
+        "re-dispatches you if CI goes red; observed cost of babysitting: ~20 min of "
+        "`gh pr checks` loops per rebase). Return status=blocked with 'needs' only if "
+        "the conflict genuinely requires a human decision."
     )
     return AgentTask(
         prompt=prompt,
