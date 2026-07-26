@@ -193,6 +193,26 @@ fi
 # FIX_BOT ("   ") is non-empty by `-n` but carries no real identity.
 [ -n "$(_normalize_login "$FIX_BOT")" ] && ok "FIX_BOT=$FIX_BOT" || bad "FIX_BOT unset"
 
+# An UNEDITED template value passes every emptiness check — `FIX_BOT` left as
+# the literal `<your-gh-login>` is non-empty, so doctor used to green-light it.
+# The fixer would then compare every PR author against that literal, match
+# nothing, and silently do no work forever: the exact silent-identity-mismatch
+# class of review C1, reintroduced through config rather than code. Any value
+# still wrapped in <angle brackets> is a placeholder nobody filled in.
+_placeholder_vars="REPO FIX_BOT TEST_CMD TARGET_DIR BASE_BRANCH"
+# The App identity is only READ under IDENTITY_MODE=three (solo has no second
+# bot). Flagging its untouched placeholders in solo would fail doctor over
+# fields that setup is correct to leave alone — see the first-run handover.
+if [ "${IDENTITY_MODE:-three}" = "three" ]; then
+  _placeholder_vars="$_placeholder_vars REVIEW_BOT STEWARD_BOT GH_APP_ID GH_APP_INSTALL_ID GH_APP_KEY_FILE"
+fi
+for _var in $_placeholder_vars; do
+  case "${!_var:-}" in
+    *"<"*">"*)
+      bad "$_var is still the template placeholder (${!_var}) — edit config/shared.env or the repo overlay" ;;
+  esac
+done
+
 if [ "$IDENTITY_MODE" = "three" ]; then
   : "${REVIEW_BOT:=}"; : "${STEWARD_BOT:=}"
   # FIX must differ from REVIEW (GitHub 422 self-approval) and from STEWARD.
