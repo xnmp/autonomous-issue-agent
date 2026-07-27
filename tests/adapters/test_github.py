@@ -1237,3 +1237,33 @@ def test_merge_gate_protection_demands_both_reviews_and_checks():
     assert gw(zero_reviews).merge_gate_protection("dev") is False
     assert gw("").merge_gate_protection("dev") is False        # 404/403 → fail-soft ""
     assert gw("not json").merge_gate_protection("dev") is False
+
+
+def test_merged_prs_in_the_world_get_the_cheap_fetch():
+    """The --state all label list serves STALE search results (merged PRs
+    unlabeled a day earlier still listed), and each stale entry was paying the
+    hang-class mergeable fetch + a checks call EVERY tick. A non-OPEN PR must
+    cost one plain view: no mergeable fields, no `gh pr checks`."""
+    pr_json = {"number": 540, "title": "t", "body": "", "headRefName": "fix/9-x",
+               "headRefOid": "", "baseRefName": "dev", "labels": [], "reviews": [],
+               "state": "MERGED", "closingIssuesReferences": [], "files": [],
+               "isDraft": False, "author": {"login": "b"}}
+    open_json = {**pr_json, "number": 541, "state": "OPEN"}
+    fr = FakeRunner({
+        "pr list --repo": [{"number": 540, "state": "MERGED"},
+                           {"number": 541, "state": "OPEN"}],
+        "pr view 540": pr_json,
+        "pr view 541": open_json,
+        "pr checks 541": [],
+        "issue list --repo": [],
+    })
+    gw = GitHubGateway("o/r", Identity(static_token="t"), runner=fr)
+    world = gw.build_world()
+    assert {p.number for p in world.prs} == {540, 541}
+
+    view_540 = [a for a, _ in fr.calls if a[2:4] == ["view", "540"]]
+    view_541 = [a for a, _ in fr.calls if a[2:4] == ["view", "541"]]
+    assert view_540 and "mergeable" not in view_540[0][-1]   # cheap fields only
+    assert view_541 and "mergeable" in view_541[0][-1]       # open PR: full
+    assert not any(a[2:4] == ["checks", "540"] for a, _ in fr.calls)
+    assert any(a[2:4] == ["checks", "541"] for a, _ in fr.calls)

@@ -640,14 +640,20 @@ class GitHubGateway:
         except Exception:
             return False
 
-    def get_pr(self, number: int, *, mergeability: bool = True) -> PRView:
+    def get_pr(self, number: int, *, mergeability: bool = True, checks: bool = True) -> PRView:
         """Fetch one PR. `mergeability=False` DROPS the mergeable/mergeStateStatus
         fields from the query — GitHub computes those lazily and can hang the call
         indefinitely on a just-merged PR (see _GH_TIMEOUT_S). Only the fixer's
         auto-rebase logic consumes them (is_conflicting / needs_rebase); the reviewer
         never does, so the review world fetches without them and cannot hang on that
         computation. Fields left absent parse to '' → is_conflicting/needs_rebase are
-        simply False, which is correct for the review path (it doesn't rebase)."""
+        simply False, which is correct for the review path (it doesn't rebase).
+
+        `checks=False` skips the separate `gh pr checks` call the same way — a
+        MERGED/CLOSED PR's checks gate nothing (they gated the merge that already
+        happened), and the stale `--state all` label list keeps merged PRs in the
+        enrichment set for days (list_pr_states). Absent checks parse to () →
+        ci_state(()) is NONE, which no consumer reads for a non-open PR."""
         base = ("number,title,body,headRefName,headRefOid,baseRefName,labels,"
                 "reviews,state,closingIssuesReferences,files,isDraft,author")
         fields = base + (",mergeable,mergeStateStatus" if mergeability else "")
@@ -655,13 +661,17 @@ class GitHubGateway:
             ["pr", "view", str(number), "--repo", self.repo, "--json", fields]
         )
         pr = parse_pr(d)  # type: ignore[arg-type]
+        if not checks:
+            return pr
         # checks come from a separate endpoint (bash `pr checks`).
-        checks = self._gh_json(
+        found = self._gh_json(
             ["pr", "checks", str(number), "--repo", self.repo, "--json", "name,state,bucket"]
         ) or []
-        return replace(pr, checks=_checks(checks))  # type: ignore[arg-type]
+        return replace(pr, checks=_checks(found))  # type: ignore[arg-type]
 
-    def _safe_get_pr(self, number: int, *, mergeability: bool = True) -> PRView | None:
+    def _safe_get_pr(
+        self, number: int, *, mergeability: bool = True, checks: bool = True
+    ) -> PRView | None:
         """`get_pr` that isolates a single PR's failure. A hung/empty `gh pr view`
         (→ parse_pr(None) → AttributeError) or any transient read error must NOT
         abort the whole world-build: previously one such PR raised out of the
@@ -677,7 +687,7 @@ class GitHubGateway:
         the opposite — it is this ONE PR wedging the socket (the incident above,
         which recurs every poll while the PR exists), so it stays isolated."""
         try:
-            return self.get_pr(number, mergeability=mergeability)
+            return self.get_pr(number, mergeability=mergeability, checks=checks)
         except GhUnavailable as exc:
             if not exc.timed_out:
                 raise
@@ -730,12 +740,24 @@ class GitHubGateway:
         )
 
     def list_pr_numbers(self, label: str, state: str = "open") -> list[int]:
+        return [n for n, _ in self.list_pr_states(label, state)]
+
+    def list_pr_states(self, label: str, state: str = "open") -> list[tuple[int, str]]:
+        """(number, state) pairs, so world builders can pick per-PR enrichment
+        depth BEFORE fetching. The `--state all` label list serves STALE search
+        results for closed PRs (merged PRs unlabeled a full day earlier still
+        listed, observed 2026-07-27), so the list's membership cannot be
+        trusted to mean "needs full enrichment" — but its `state` field is the
+        PR object's own, and a MERGED/CLOSED PR needs neither `mergeable`
+        (a hang-class lazy computation) nor a `gh pr checks` call. Nine stale
+        merged PRs were costing ~18 wasted gh calls per fix tick, growing with
+        every merge."""
         data = self._gh_json(
             ["pr", "list", "--repo", self.repo, "--label", label,
-             "--state", state, "--json", "number", "--limit", str(_LIST_LIMIT)]
+             "--state", state, "--json", "number,state", "--limit", str(_LIST_LIMIT)]
         ) or []
         _warn_if_list_truncated(f"gh pr list --label {label} --state {state}", len(data))
-        return [int(p["number"]) for p in data]
+        return [(int(p["number"]), str(p.get("state", ""))) for p in data]
 
     def list_all_open_pr_numbers(self) -> list[int]:
         """Every OPEN PR number, no label filter — feeds rogue-PR adoption."""
@@ -763,9 +785,10 @@ class GitHubGateway:
             issue_numbers.update(nums)
             if lbl == "ai-ready":
                 ready_numbers.update(nums)
-        prs_numbers: set[int] = set()
+        pr_states: dict[int, str] = {}
         for state in ("open", "all"):
-            prs_numbers.update(self.list_pr_numbers("ai-pr-open", state))
+            for n, s in self.list_pr_states("ai-pr-open", state):
+                pr_states.setdefault(n, s)
         # Only ai-ready issues are gated on dependencies (pick_ready_issue), so
         # only they pay the blocked-by read — an ai-working/blocked issue never
         # needs it. Cheapest-first inside has_open_blocker keeps it ~1 call each.
@@ -773,8 +796,15 @@ class GitHubGateway:
             i for n in sorted(issue_numbers)
             if (i := self._safe_get_issue(n, blocker_gate=n in ready_numbers)) is not None
         )
+        # Non-OPEN PRs (the stale --state all tail) get the cheap fetch: no
+        # mergeable (hang-class) and no checks call — see list_pr_states.
         prs = tuple(
-            p for n in sorted(prs_numbers) if (p := self._safe_get_pr(n)) is not None
+            p for n in sorted(pr_states)
+            if (p := self._safe_get_pr(
+                n,
+                mergeability=pr_states[n] == "OPEN",
+                checks=pr_states[n] == "OPEN",
+            )) is not None
         )
         return WorldState(issues=issues, prs=prs)
 
@@ -785,9 +815,10 @@ class GitHubGateway:
         at an EXTERNAL repo (which has none of the harness's issue labels) and trigger
         on a configurable PR tag. `gh pr list --label <missing>` returns [] (exit 0),
         so an absent label degrades to "nothing to review" rather than crashing."""
-        prs_numbers: set[int] = set()
+        pr_states: dict[int, str] = {}
         for state in ("open", "all"):
-            prs_numbers.update(self.list_pr_numbers(self.review_pr_label, state))
+            for n, s in self.list_pr_states(self.review_pr_label, state):
+                pr_states.setdefault(n, s)
         # Rogue-PR adoption: also pull EVERY open PR (no label filter) so a PR that
         # never went through the pipeline (opened directly, no trigger label) is
         # visible to decide_review, which labels+adopts it. Draft/own-bot/opt-out
@@ -795,14 +826,19 @@ class GitHubGateway:
         # widens the slice. Merged/closed still come only via the label (no need to
         # adopt a closed rogue PR).
         if self.review_adopt_unlabeled:
-            prs_numbers.update(self.list_all_open_pr_numbers())
+            for n in self.list_all_open_pr_numbers():
+                pr_states.setdefault(n, "OPEN")
         # mergeability=False: the reviewer never reads mergeable/merge_state (only the
         # fixer's rebase logic does), and requesting them can hang gh indefinitely on a
         # just-merged PR — which previously froze the whole review poll. Fetch without
-        # them so a comment can always be left.
+        # them so a comment can always be left. Non-OPEN PRs (the stale --state all
+        # tail, see list_pr_states) also skip the checks call — session cleanup
+        # reads only number/state/labels.
         prs = tuple(
-            p for n in sorted(prs_numbers)
-            if (p := self._safe_get_pr(n, mergeability=False)) is not None
+            p for n in sorted(pr_states)
+            if (p := self._safe_get_pr(
+                n, mergeability=False, checks=pr_states[n] == "OPEN"
+            )) is not None
         )
         return WorldState(issues=(), prs=prs)
 
