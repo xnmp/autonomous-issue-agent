@@ -40,11 +40,16 @@ job someone still has to do; the same file in `history/` is a record.
 
 ## open/
 
+- [2026-07-27-handover-harness-issue-batch.md](open/2026-07-27-handover-harness-issue-batch.md)
+  — **start here.** The working brief for the next harness-issue session: the
+  unpushed-`main` divergence you will trip over first, #16's escalation ladder
+  (PR #18, open) and the default-on decision it leaves you, field cost data from
+  the live deployment, and the recommended order for the four remaining issues
 - [2026-07-27-handover-fourth-deployment.md](open/2026-07-27-handover-fourth-deployment.md)
-  — **start here.** The working brief for the next deployment session: current
-  daemon state, everything that changed in the optimization session and what to
-  watch on its first real dispatch (routing, synthetic codex pricing, patch-id
-  skips, holds, recurrences), candidate issue batch, monitoring recipe, gotchas
+  — the DEPLOYMENT brief that precedes it: daemon state, what to watch on the
+  first real dispatch (routing, synthetic codex pricing, patch-id skips, holds,
+  recurrences), candidate issue batch, monitoring recipe, gotchas. Its batch has
+  run; graduate it to `history/` once its per-item verifications are discharged
 - [residuals.md](open/residuals.md) — everything deliberately still open, why,
   and what triggers the work. **Read §1 before pointing this at a real repo.**
 - [issues/](open/issues/) — three unresolved incident write-ups, not
