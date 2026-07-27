@@ -1,6 +1,9 @@
 """Environment → config objects (port of the agent.env vars the bash reads).
 
-Pure mapping `dict → HarnessConfig` so tests construct it without os.environ.
+Pure mapping `dict → HarnessConfig` so tests construct it without os.environ —
+with one deliberate exception: an env carrying `AGENT_ENV` is re-resolved
+against that FILE first (`_authoritative_env`, #12), because the inherited
+environment of point-at.sh's relaunch loop cannot represent a knob's removal.
 Names mirror config/agent.env.example so operators carry the same env file over.
 """
 
@@ -8,6 +11,8 @@ from __future__ import annotations
 
 import math
 import os
+import re
+import subprocess
 from dataclasses import dataclass, fields
 
 from ..domain.identity import normalize_login
@@ -735,8 +740,99 @@ def _default_state_dir(repo: str, role_dir: str) -> str:
     return os.path.expanduser(f"~/.local/state/{role_dir}/{_repo_slug(repo)}")
 
 
+# Names an env file textually ASSIGNS. Same anchor as bin/compose-env.sh's
+# scan: a commented-out `# FOO=bar` is not a definition, `export FOO=` and
+# leading whitespace are. `.active.env` is machine-written one-line
+# `KEY=<%q-escaped>` pairs, so a per-line scan cannot straddle a value.
+_ASSIGNMENT_RE = re.compile(
+    r"^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)=", re.MULTILINE
+)
+
+
+def _file_env(path: str, inherited: dict) -> dict[str, str] | None:
+    """`{name: value}` for every variable the env file at `path` ASSIGNS, or
+    `None` when the file cannot be read or sourced (caller falls back to
+    `inherited` — a broken read must never take the daemon with it, same
+    fail-open rule as adapters/reload.py).
+
+    The file is sourced by bash UNDER `inherited`, so the parameter-expansion
+    idiom operators write (`FOO="${FOO:-default}"`, `$HOME/...`) resolves
+    exactly as it does for bin/point-at.sh. The result is then RESTRICTED to
+    the names the file itself assigns: an inherited variable the file does not
+    mention is dropped, which is the whole point of #12.
+
+    Names-plus-values (rather than a pre/post diff) for compose-env.sh's
+    P0R-1 reason: a file assigning the value the environment already carries
+    is invisible to a diff, and silently defaulting TEST_CMD/REPO that way
+    fails every gate closed.
+    """
+    try:
+        assigned = {
+            m.group(1)
+            for m in _ASSIGNMENT_RE.finditer(
+                open(path, encoding="utf-8", errors="replace").read()
+            )
+        }
+        # An empty/unreadable/garbled file assigns nothing — that reads as
+        # "every knob absent", i.e. a silent full reset to defaults. Refuse it
+        # and let the caller keep the inherited environment.
+        if not assigned:
+            return None
+        proc = subprocess.run(
+            ["bash", "-c", 'set -a; . "$1"; set +a; env -0', "issue-agent-env", path],
+            env=dict(inherited),
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        out: dict[str, str] = {}
+        for item in proc.stdout.split(b"\0"):
+            if not item or b"=" not in item:
+                continue
+            key, value = item.split(b"=", 1)
+            name = key.decode(errors="replace")
+            if name in assigned:
+                out[name] = value.decode(errors="replace")
+        return out
+    except Exception:  # noqa: BLE001 — config load must not die on a bad file
+        return None
+
+
+def _authoritative_env(e: dict) -> dict:
+    """The env `from_env` maps, with AGENT_ENV's FILE as the authority (#12).
+
+    Precedence, when AGENT_ENV names a readable file:
+
+    1. a knob the file assigns → the file's value, always (it beats anything
+       inherited);
+    2. a knob the file does NOT assign → absent, so the HarnessConfig dataclass
+       default applies — it does NOT fall back to the inherited value.
+
+    Rule 2 is the fix. bin/point-at.sh's relaunch loop re-SOURCES the composed
+    file into one long-lived wrapper shell, and sourcing can overwrite but
+    never unset: a knob the operator DELETED from .active.env stayed exported
+    from the previous reload and was inherited by every later exec (observed
+    2026-07-27 — a removed FIX_MODEL kept difficulty routing disabled while the
+    same reload's DAILY_SPEND_CAP_USD change did apply). The wrapper's
+    environment is therefore not trustworthy for harness knobs; the file is,
+    which is exactly what the mtime watch already promises the operator.
+
+    The cost is that exporting a knob in the launching shell without putting it
+    in shared.env/repos/<name>.env no longer reaches the daemon — the file is
+    the only channel.
+
+    With no AGENT_ENV, or a file that cannot be read, the passed-in environment
+    is used unchanged (fail open).
+    """
+    path = e.get("AGENT_ENV", "")
+    if not path or not os.access(path, os.R_OK):
+        return e
+    parsed = _file_env(path, e)
+    return e if parsed is None else parsed
+
+
 def from_env(env: dict | None = None) -> HarnessConfig:
-    e = env if env is not None else os.environ
+    e = _authoritative_env(env if env is not None else os.environ)
     # Malformed-numeric fallbacks accumulate here and ride along on the config
     # (HarnessConfig.parse_errors) so validation_errors() can report them —
     # from_env itself must never traceback on operator input (review M2).
