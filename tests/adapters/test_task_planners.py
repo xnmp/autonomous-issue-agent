@@ -118,6 +118,14 @@ def test_address_review_task():
     t = build_address_review_task(100, "fix the bug", "file.py:3 do x", "/wt", "s1", FIX_CFG)
     assert t.resume == "s1"
     assert "fix the bug" in t.prompt and "file.py:3 do x" in t.prompt
+    assert "evidence/ captures carry forward" in t.prompt
+    assert "Re-capture only criteria affected" in t.prompt
+
+
+def test_fix_ci_task_carries_unaffected_evidence_forward():
+    t = build_fix_ci_task(100, "tests", "failure", "/wt", "s1", FIX_CFG)
+    assert "evidence/ captures carry forward" in t.prompt
+    assert "Re-capture only criteria affected" in t.prompt
     assert t.schema is FIX_SCHEMA
 
 

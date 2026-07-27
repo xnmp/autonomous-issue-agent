@@ -393,7 +393,8 @@ def build_fix_daemon(
         # into each worktree, Codex's native per-project instructions file. It also
         # installs the PostToolUse edit-check when EDIT_CHECK_CMD is set.
         prepare_cwd = partial(
-            write_hook_config, agents_md=cfg.agent_md, edit_check_cmd=cfg.edit_check_cmd
+            write_hook_config, agents_md=cfg.agent_md, edit_check_cmd=cfg.edit_check_cmd,
+            log=_log("fix"),
         )
     elif cfg.fixer_runtime == "glm":
         # GLM speaks Anthropic's wire protocol, so the SAME Claude runner is used

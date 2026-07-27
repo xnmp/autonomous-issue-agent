@@ -7,7 +7,7 @@ AgentDispatcher so review behavior can evolve behind a role-specific module.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 
 from ...domain import review as review_dom
@@ -28,6 +28,7 @@ class ReviewWorkflowConfig:
     review_bot: str
     review_trigger_label: str
     log: Callable[[str], None]
+    journal: object | None = None
 
 
 @dataclass
@@ -40,7 +41,7 @@ class ReviewWorkflow:
     # all (review M10). A default would let a caller silently reintroduce the
     # direct-gateway bypass this field exists to remove.
     executor: object
-    log_run: Callable[[str, int, object], object] | None = None
+    log_run: Callable[[str, int, object], Awaitable[object]] | None = None
 
     def _trigger_label(self) -> Label:
         """The reviewer's trigger label as a domain Label. Both the default
@@ -116,12 +117,14 @@ class ReviewWorkflow:
         return result
 
     async def review(self, pr: int) -> None:
+        p = self.gateway.get_pr(pr)
+        if self._already_reviewed(p):
+            return
         if self.cfg.review_mode is review_dom.ReviewMode.MULTI:
-            await self._review_multi(pr, round_number=1)
+            await self._review_multi(pr, round_number=1, p=p)
             return
         # SINGLE and DELEGATED share the submit-before-persist contract; they differ
         # only in the task builder (delegated attaches a code-scout subagent).
-        p = self.gateway.get_pr(pr)
         diff = self.gateway.pr_diff(pr)
         signature = review_dom.patch_signature(diff)
         if self.cfg.review_mode is review_dom.ReviewMode.DELEGATED:
@@ -162,6 +165,8 @@ class ReviewWorkflow:
         # diff` rather than by a paid review round — most of all under MULTI,
         # whose round is a gate + 5 dimensions + N validators (harness #2).
         p = self.gateway.get_pr(pr)
+        if self._already_reviewed(p):
+            return
         diff = self.gateway.pr_diff(pr)
         signature = review_dom.patch_signature(diff)
         if self._patch_unchanged(p, signature):
@@ -208,6 +213,28 @@ class ReviewWorkflow:
         self._record_patch(pr, signature)
         self.store.set_round(pr, round_number)
         self._progress(p)
+
+    def _already_reviewed(self, p) -> bool:
+        """Settle a retried dispatch when GitHub already has our verdict on HEAD."""
+        if not review_dom.reviewer_verdict_on_head(p, self.cfg.review_bot):
+            return False
+        self.store.save_pr_session(
+            p.number, self.store.get_pr_session(p.number) or "github-review"
+        )
+        self.store.set_last_sha(p.number, p.head_ref_oid)
+        self.cfg.log(
+            f"review #{p.number}: {self.cfg.review_bot} already submitted a verdict "
+            f"for head {p.head_ref_oid[:8]} — no review agent run"
+        )
+        if self.cfg.journal is not None:
+            self.cfg.journal.emit(
+                "review_skip",
+                pr=p.number,
+                reviewer=self.cfg.review_bot,
+                head_sha=p.head_ref_oid,
+                reason="reviewer-verdict-on-head",
+            )
+        return True
 
     # ── rebase short-circuit (harness #2) ────────────────────────────────────
     def _record_patch(self, pr: int, signature: str) -> None:
