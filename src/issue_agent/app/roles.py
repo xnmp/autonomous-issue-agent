@@ -352,7 +352,7 @@ def build_fix_daemon(
             ),
             sandbox=codex_runtime.sandbox,
             reasoning_effort=codex_runtime.reasoning_effort,
-            # AGENT.md reaches GPT-5.5 via the worktree AGENTS.md (below), so the
+            # AGENT.md reaches Codex via worktree AGENTS.override.md (below), so the
             # task's append_system_prompt must NOT also be prepended to the prompt
             # (that would duplicate the whole contract). Suppress it for codex.
             inject_system_prompt=False,
@@ -389,11 +389,12 @@ def build_fix_daemon(
         )
         if _blindspot is not None:
             _log("fix")(_blindspot)
-        # prepare_cwd installs the governor hook AND writes AGENTS.md (= AGENT.md)
-        # into each worktree, Codex's native per-project instructions file. It also
+        # prepare_cwd installs the governor hook and writes AGENTS.override.md into
+        # each worktree, composing the harness + target instructions. It also
         # installs the PostToolUse edit-check when EDIT_CHECK_CMD is set.
         prepare_cwd = partial(
-            write_hook_config, agents_md=cfg.agent_md, edit_check_cmd=cfg.edit_check_cmd
+            write_hook_config, agents_md=cfg.agent_md, edit_check_cmd=cfg.edit_check_cmd,
+            log=_log("fix"),
         )
     elif cfg.fixer_runtime == "glm":
         # GLM speaks Anthropic's wire protocol, so the SAME Claude runner is used

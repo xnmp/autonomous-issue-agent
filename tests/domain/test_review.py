@@ -19,6 +19,7 @@ from issue_agent.domain.review import (
     parse_findings,
     patch_signature,
     review_submission,
+    reviewer_verdict_on_head,
     synthesize_review,
     unproductive_ceiling_hit,
     unproductive_escalation_reason,
@@ -26,6 +27,33 @@ from issue_agent.domain.review import (
 from builders import Review
 
 CFG = ReviewConfig(review_bot="review-bot")
+
+
+def test_latest_reviewer_verdict_must_target_the_current_head():
+    reviews = (
+        Review("APPROVED", "review-bot[bot]", "2026-07-27T01:00:00Z", commit_id="old"),
+        Review("CHANGES_REQUESTED", "review-bot", "2026-07-27T02:00:00Z", commit_id="new"),
+    )
+    assert reviewer_verdict_on_head(
+        pr(1, reviews=reviews, head_ref_oid="new"), "review-bot"
+    )
+    assert not reviewer_verdict_on_head(
+        pr(1, reviews=reviews, head_ref_oid="old"), "review-bot"
+    )
+
+
+def test_another_reviewers_verdict_does_not_suppress_review():
+    reviews = (Review("APPROVED", "someone-else", commit_id="head"),)
+    assert not reviewer_verdict_on_head(
+        pr(1, reviews=reviews, head_ref_oid="head"), "review-bot"
+    )
+
+
+def test_comment_review_is_not_a_verdict_on_head():
+    reviews = (Review("COMMENTED", "review-bot", commit_id="head"),)
+    assert not reviewer_verdict_on_head(
+        pr(1, reviews=reviews, head_ref_oid="head"), "review-bot"
+    )
 
 
 # ── ReviewMode resolution (REVIEW_MODE + legacy REVIEW_MULTI_AGENT alias) ──

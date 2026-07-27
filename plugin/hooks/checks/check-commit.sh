@@ -50,6 +50,20 @@ if [ -n "$msg" ] && ! [[ "$msg" =~ $VALID_PREFIX ]]; then
   exit 1
 fi
 
+# Harness-generated project instructions must never enter the target's history.
+# Local excludes do not hide a tracked AGENTS*.md, so inspect the staged blob
+# itself; target-owned instruction edits remain allowed when they lack our marker.
+for instructions_file in AGENTS.md AGENTS.override.md; do
+  git diff --cached --name-only --diff-filter=ACMR 2>/dev/null \
+    | grep -qxF "$instructions_file" || continue
+  if git show ":$instructions_file" 2>/dev/null \
+      | grep -qF '<!-- issue-agent generated instructions: start -->'; then
+    echo "Blocked: $instructions_file contains issue-agent generated instructions."
+    echo "Restore the target-owned file; harness scaffolding must not be committed."
+    exit 1
+  fi
+done
+
 # Oversized-image gate. The review agent READS evidence images, and a file whose
 # base64 exceeds the SDK's 1MB message buffer kills the review transport
 # deterministically (harness #13; observed live 2026-07-27, PR #552's ~2.3MB

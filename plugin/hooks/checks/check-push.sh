@@ -63,6 +63,7 @@ changed=$(git diff --name-only "$diff_range" 2>/dev/null || echo "")
 # adapters/governor.py:_push_gate_for_branch (review M21).
 prc_check_commit_log
 prc_check_no_evidence "$changed"
+prc_check_no_generated_instructions "$changed"
 prc_check_tests_immutable "$changed"
 prc_check_tests
 

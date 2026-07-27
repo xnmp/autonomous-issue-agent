@@ -30,7 +30,7 @@ from ..adapters.journal import (
     sum_today,
 )
 from ..domain import review as review_dom, triage as triage_dom
-from ..domain.actions import AgentKind, RunAgent
+from ..domain.actions import AgentKind, PostComment, RunAgent
 from ..domain.agent_task import AgentRuntime
 from ..domain.labels import Label
 from ..domain.lifecycle import issue_escalation, pr_escalation
@@ -175,7 +175,8 @@ class AgentDispatcher:
             gateway, store, worktrees, runner, executor, prepare_cwd,
         )
         self.review_workflow = ReviewWorkflow(
-            cfg.review_workflow_config(), gateway, store, runner, executor,
+            replace(cfg.review_workflow_config(), journal=journal),
+            gateway, store, runner, executor,
             self._run_logged,
         )
         self.steward_workflow = StewardWorkflow(
@@ -345,14 +346,18 @@ class AgentDispatcher:
                 else:
                     target, number = "issue", issue
                     escalation = issue_escalation(issue, reason, Label.AI_WORKING)
-                self._spend_block(
+                first_block = self._spend_block(
                     f"issue #{issue} has spent ${spent:.2f} of its ${cap:.2f} cap "
                     f"— escalating {target} #{number}",
-                    block_key=f"issue:{self.cfg.repo}:{issue}",
+                    block_key=f"issue:{self.cfg.repo}:{issue}:cap:{cap:g}",
                     scope="issue", issue=issue, spent=round(spent, 4), cap=cap,
                     target=target, number=number,
                 )
-                self.executor.execute_all(escalation.actions())
+                actions = escalation.actions()
+                self.executor.execute_all(
+                    actions if first_block
+                    else [action for action in actions if not isinstance(action, PostComment)]
+                )
                 return True
         cap = self.cfg.daily_spend_cap_usd
         if cap > 0:
@@ -362,17 +367,22 @@ class AgentDispatcher:
                     f"TODAY'S GLOBAL SPEND ${spent:.2f} is at or over the "
                     f"${cap:.2f} DAILY_SPEND_CAP_USD — all dispatch paused until "
                     "00:00 UTC (no labels changed; work resumes by itself)",
-                    block_key=f"daily:{datetime.now(timezone.utc).date().isoformat()}",
+                    block_key=(
+                        f"daily:{datetime.now(timezone.utc).date().isoformat()}"
+                        f":cap:{cap:g}"
+                    ),
                     scope="daily", spent=round(spent, 4), cap=cap,
                 )
                 return True
         return False
 
-    def _spend_block(self, message: str, *, block_key: str, **fields) -> None:
-        """Log every time; journal + alert ONCE per blocked key (review P1R-2).
+    def _spend_block(self, message: str, *, block_key: str, **fields) -> bool:
+        """Log every time; return True only for the first block at this key.
 
         A cap is a level, not an event: it stays tripped on every subsequent
-        poll, so an un-deduped emit is a pager that fires until it is ignored.
+        poll, so the return value gates the GitHub escalation as well as the
+        journal/alert side effects. The cap value is part of the caller's key:
+        raising or lowering it is a new operator-visible fact that may alert once.
         The identity travels IN the event (`block_key`), so the dedup survives a
         process restart by reading the journal this daemon already owns — the
         flood shape is a wedged daemon under `Restart=always`, where an
@@ -384,13 +394,14 @@ class AgentDispatcher:
         """
         self.cfg.log(f"SPEND CAP: {message}")
         if block_key in self._spend_blocked:
-            return
+            return False
         self._spend_blocked.add(block_key)
         if self.journal is not None:
             if block_key in spend_blocked_keys(read_events_tail(self.journal.path)):
-                return
+                return False
             self.journal.emit("spend_block", block_key=block_key, **fields)
         alert(self.cfg.alert_cmd, event_line("spend_block", block_key=block_key, **fields))
+        return True
 
     def _warn_if_the_caps_are_blind(self) -> None:
         """One loud line, once per process, when a spend cap is armed but every

@@ -69,6 +69,20 @@ out=$(TEST_CMD='true'  bash "$CHECKS/check-commit.sh" commit -m "green: x" 2>&1)
 out=$(VERIFY_RED_AT_COMMIT=0 TEST_CMD='true' bash "$CHECKS/check-commit.sh" commit -m "red: t" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && ok "VERIFY_RED_AT_COMMIT=0 disables" || no "VERIFY_RED_AT_COMMIT=0 disables" "rc=$rc"
 
+echo "== check-commit.sh (generated instruction guard) =="
+d=$(fresh_repo)
+( cd "$d" && printf '%s\n' '<!-- issue-agent generated instructions: start -->' \
+    > AGENTS.override.md && git add AGENTS.override.md )
+out=$( cd "$d" && bash "$CHECKS/check-commit.sh" commit -m "chore: instructions" 2>&1 ); rc=$?
+[ "$rc" -eq 1 ] && ok "generated AGENTS.override.md blocked" \
+  || no "generated AGENTS.override.md blocked" "rc=$rc out=${out:0:160}"
+( cd "$d" && printf '%s\n' '# target-owned instructions' > AGENTS.override.md \
+    && git add AGENTS.override.md )
+out=$( cd "$d" && bash "$CHECKS/check-commit.sh" commit -m "chore: instructions" 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] && ok "target-owned AGENTS.override.md allowed" \
+  || no "target-owned AGENTS.override.md allowed" "rc=$rc out=${out:0:160}"
+rm -rf "$d"
+
 echo "== check-commit.sh (oversized-image gate, harness #13) =="
 # Oversized image in evidence/ (unstaged — the compound add&&commit case) blocks.
 d=$(fresh_repo)
