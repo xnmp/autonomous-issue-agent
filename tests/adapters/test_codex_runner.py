@@ -40,8 +40,10 @@ def test_argv_basic_shape():
     assert argv[-1] == "do it"  # prompt is last positional
     assert "--sandbox" in argv and DEFAULT_SANDBOX in argv
     assert "--dangerously-bypass-hook-trust" in argv
-    # default model when task.model is None
-    assert "-m" in argv and DEFAULT_CODEX_MODEL in argv
+    # No model configured anywhere → NO -m flag: `-m ""` is not "the default",
+    # and with no -m codex uses the provider's own default (in OAuth mode, the
+    # subscription's current model).
+    assert "-m" not in argv
 
 
 def test_argv_provider_overrides_inline():
@@ -652,12 +654,43 @@ def test_preflight_missing_binary_is_actionable():
 
 
 def test_preflight_missing_key_names_the_var(monkeypatch):
+    """Gateway mode (base_url set) still hard-requires the env key."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     tmp = tempfile.mkdtemp()
     codex = _fake_codex(tmp, "exit 0\n")
-    r = CodexRunner(codex_bin=codex)  # no env key
+    prov = CodexProvider(base_url="https://gw.example/v1")
+    r = CodexRunner(codex_bin=codex, provider=prov)  # no env key
     reason = r.preflight()
     assert reason and "OPENAI_API_KEY is unset" in reason
+
+
+def test_oauth_mode_emits_no_provider_overrides_and_no_model_flag():
+    """Blank base_url = ChatGPT-subscription OAuth: codex's built-in provider
+    must stay untouched (defining a custom one forces API-key auth), and no
+    CODEX_MODEL means no -m (codex picks the subscription's default)."""
+    argv = build_codex_argv(AgentTask(prompt="x"), provider=CodexProvider())
+    joined = " ".join(argv)
+    assert "model_providers" not in joined and "model_provider=" not in joined
+    assert "-m" not in argv
+
+
+def test_oauth_mode_preflight_accepts_codex_login_credentials(monkeypatch):
+    """With no API key, the credentials `codex login` stored are sufficient —
+    and with neither, the error says to run `codex login`."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    tmp = tempfile.mkdtemp()
+    codex = _fake_codex(tmp, "exit 0\n")
+    home = tempfile.mkdtemp()
+    monkeypatch.setenv("HOME", home)
+
+    r = CodexRunner(codex_bin=codex)  # default provider = OAuth mode
+    reason = r.preflight()
+    assert reason and "codex login" in reason
+
+    os.makedirs(os.path.join(home, ".codex"), exist_ok=True)
+    with open(os.path.join(home, ".codex", "auth.json"), "w") as fh:
+        fh.write("{}")
+    assert r.preflight() is None
 
 
 def test_preflight_ok_when_bin_and_key_present():

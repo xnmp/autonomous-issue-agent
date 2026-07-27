@@ -61,7 +61,15 @@ class CodexProvider:
 
     def config_overrides(self) -> list[str]:
         """`-c key=value` pairs defining the provider inline (avoids the legacy
-        [profiles.x] table, which codex 0.142 rejects with -p)."""
+        [profiles.x] table, which codex 0.142 rejects with -p).
+
+        A BLANK base_url means "no custom gateway": emit nothing and let codex
+        use its built-in OpenAI provider with whatever `codex login` stored
+        (ChatGPT-subscription OAuth). Defining the custom provider block in that
+        case would force API-key auth and fail preflight on a machine that is
+        perfectly logged in."""
+        if not self.base_url:
+            return []
         p = f"model_providers.{self.provider_id}"
         return [
             f'{p}.name="{self.name}"',
@@ -124,7 +132,13 @@ def build_codex_argv(
     for ov in provider.config_overrides():
         argv += ["-c", ov]
 
-    argv += ["-m", task.model or default_model]
+    # Only name a model when one was actually configured: `-m ""` is not "the
+    # default", it is a broken flag. With no -m, codex uses the provider's own
+    # default — which in OAuth (blank base_url) mode is the subscription's
+    # current model, exactly what an operator with no CODEX_MODEL set wants.
+    model = task.model or default_model
+    if model:
+        argv += ["-m", model]
 
     if is_resume:
         # danger-full-access equivalent that resume DOES accept.
@@ -502,6 +516,17 @@ class CodexRunner(AgentRuntime):
             )
         key_var = self.provider.env_key
         proc_env = {**os.environ, **self.env}
+        if not self.provider.base_url:
+            # OAuth mode (no custom gateway): codex authenticates from the
+            # credentials `codex login` stored. An env key ALSO satisfies it
+            # (codex accepts either), so only the absence of both is fatal.
+            auth_file = os.path.join(os.path.expanduser("~"), ".codex", "auth.json")
+            if proc_env.get(key_var) or os.path.exists(auth_file):
+                return None
+            return (
+                f"codex has no credentials — no {auth_file} (run `codex login`) "
+                f"and {key_var} is unset. (FIXER_RUNTIME=codex, default provider)"
+            )
         if not proc_env.get(key_var):
             return (
                 f"{key_var} is unset — the Codex fixer cannot authenticate to "

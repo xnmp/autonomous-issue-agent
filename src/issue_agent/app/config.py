@@ -250,7 +250,10 @@ class HarnessConfig:
     codex_model: str = ""              # blank → CodexRunner default (GPT-5.5)
     codex_provider_id: str = "openai-custom"  # NOT "openai": reserved by codex-cli ≥0.142
     codex_provider_name: str = "OpenAI"
-    codex_base_url: str = ""            # REQUIRED for codex runtime: your OpenAI-compatible gateway
+    # Blank = codex's built-in OpenAI provider + `codex login` OAuth credentials
+    # (ChatGPT subscription). Set it only for an OpenAI-compatible gateway, which
+    # then requires the CODEX_ENV_KEY env var to hold the key.
+    codex_base_url: str = ""
     codex_env_key: str = "OPENAI_API_KEY"
     codex_wire_api: str = "responses"
     codex_sandbox: str = "danger-full-access"
