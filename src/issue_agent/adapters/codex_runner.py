@@ -251,9 +251,11 @@ def codex_cost_usd(
 ) -> float:
     """Pure: token counters × the configured USD-per-MILLION-token rates.
 
-    Both rates 0 (the default) → 0.0: pricing is opt-in because it is
-    gateway-specific, and a wrong price table is worse than a loud "the caps
-    cannot see this runtime" warning (see `codex_cost_blindspot_warning`).
+    Both rates 0 → 0.0: an operator who zeroes the price table opts out of
+    codex spend tracking entirely, and gets a loud "the caps cannot see this
+    runtime" warning instead (see `codex_cost_blindspot_warning`). HarnessConfig
+    ships non-zero list-price defaults, so this is an explicit choice, not the
+    common path.
 
     An older codex that printed only a TOTAL is priced at the HIGHER of the two
     rates. Caps exist to stop runaway spend, so the only safe rounding direction
@@ -285,7 +287,8 @@ def codex_cost_blindspot_warning(
     """The ONE startup line D12 requires: with a spend cap armed but no codex
     price table, every codex run costs $0.00 on the ledger and neither cap can
     ever fire. Returns None (silence) when the rates ARE configured or when no
-    cap is armed — there is nothing to mislead the operator about.
+    cap is armed — there is nothing to mislead the operator about. The shipped
+    defaults are non-zero, so reaching this warning means someone zeroed them.
 
     Both rates must be >0 to count as configured: pricing only the input side
     still under-counts every run, which is the same blind spot in weaker form.
@@ -312,7 +315,7 @@ def codex_cost_blindspot_warning(
     )
     return (
         "codex: WARNING — spend caps are armed "
-        f"({caps}) but CODEX_COST_PER_MTOK_IN/OUT are unset, so every codex run "
+        f"({caps}) but CODEX_COST_PER_MTOK_IN/OUT are 0, so every codex run "
         "records $0.00 and NEITHER cap can ever fire. Set both to your gateway's "
         "USD-per-million-token prices. Note also that codex has no per-session "
         f"budget flag (MAX_BUDGET_USD is a Claude-SDK-only bound), so {bound} "

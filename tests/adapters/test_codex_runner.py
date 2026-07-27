@@ -28,6 +28,7 @@ from issue_agent.adapters.codex_runner import (
     parse_codex_envelope,
     parse_codex_usage,
 )
+from issue_agent.app.config import from_env
 from issue_agent.app.planners.schemas import AUTHOR_SCHEMA, FIX_SCHEMA, IMPLEMENT_SCHEMA
 from issue_agent.domain.outcome import AgentResult, ExitReason, Outcome, classify_outcome, infra_death
 from issue_agent.domain.agent_task import AgentTask
@@ -1046,6 +1047,63 @@ def test_run_reports_zero_cost_without_rates():
     r = asyncio.run(runner.run(AgentTask(prompt="x")))
     assert r.status == "pr_opened"
     assert r.cost_usd == 0.0
+
+
+# ── harness #4: the SHIPPED config must price codex, not just be able to ──────
+def test_a_codex_run_on_shipped_defaults_ledgers_a_nonzero_cost():
+    """The operator configures nothing; a codex run still arrives at the ledger
+    carrying money. Codex bills $0 on a subscription, so these dollars are
+    synthetic — but the token volume behind them is real and exhaustible, and
+    an un-priced run is one the spend caps can never see."""
+    cfg = from_env({"REPO": "x"})
+    tmp = tempfile.mkdtemp()
+    runner = CodexRunner(
+        codex_bin=_costed_codex(tmp), env={"OPENAI_API_KEY": "k"},
+        cost_per_mtok_in=cfg.codex_runtime.cost_per_mtok_in,
+        cost_per_mtok_out=cfg.codex_runtime.cost_per_mtok_out,
+    )
+    r = asyncio.run(runner.run(AgentTask(prompt="x")))
+    assert r.status == "pr_opened"
+    assert r.cost_usd > 0
+
+
+def test_the_issue_cap_is_reachable_on_codex_only_load():
+    """The cap predicate dispatch uses is `sum(ledger) >= cap`. Priced at 0 that
+    sum stays 0 forever, so codex-only work could run unbounded under a cap that
+    looked armed. On the shipped defaults a bounded number of ordinary runs
+    trips it."""
+    cfg = from_env({"REPO": "x"})
+    per_run = codex_cost_usd(
+        {"input_tokens": 48000, "output_tokens": 4341},
+        cost_per_mtok_in=cfg.codex_cost_per_mtok_in,
+        cost_per_mtok_out=cfg.codex_cost_per_mtok_out,
+    )
+    spent, runs = 0.0, 0
+    while spent < cfg.issue_spend_cap_usd and runs < 10_000:
+        spent += per_run
+        runs += 1
+    assert spent >= cfg.issue_spend_cap_usd
+    assert runs < 10_000  # i.e. the loop exited on the cap, not the guard
+
+
+def test_zeroing_the_rates_makes_the_issue_cap_unreachable_again():
+    """Anti-vacuity twin of the above, and the reason zeroing still earns the
+    blindspot warning: no price table → no ledger line → no cap, ever."""
+    cfg = from_env({
+        "REPO": "x", "CODEX_COST_PER_MTOK_IN": "0", "CODEX_COST_PER_MTOK_OUT": "0",
+    })
+    per_run = codex_cost_usd(
+        {"input_tokens": 48000, "output_tokens": 4341},
+        cost_per_mtok_in=cfg.codex_cost_per_mtok_in,
+        cost_per_mtok_out=cfg.codex_cost_per_mtok_out,
+    )
+    assert per_run * 10_000 < cfg.issue_spend_cap_usd
+    assert codex_cost_blindspot_warning(
+        cost_per_mtok_in=cfg.codex_cost_per_mtok_in,
+        cost_per_mtok_out=cfg.codex_cost_per_mtok_out,
+        issue_spend_cap_usd=cfg.issue_spend_cap_usd,
+        daily_spend_cap_usd=cfg.daily_spend_cap_usd,
+    ) is not None
 
 
 # ── D12: the ONE startup warning when caps are armed but pricing is not ───────

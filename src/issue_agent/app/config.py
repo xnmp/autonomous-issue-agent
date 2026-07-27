@@ -290,15 +290,22 @@ class HarnessConfig:
     codex_rate_limit_backoff_base: float = 60.0
     codex_max_rate_limit_wait: float = 180.0
     codex_max_rate_limit_retries: int = 5
-    # Codex spend accounting (review M1/D12): codex_runner.py hardcodes
-    # cost_usd=0.0, so codex spend is invisible to both the issue and daily
-    # caps by construction. When both are >0, roles.py (a later wave) prices
-    # the envelope's token usage against these USD-per-million-token rates;
-    # 0.0 (default) means codex spend stays untracked and a loud startup
-    # warning fires instead. USD per MILLION tokens, matching provider pricing
-    # tables (not per-token, which would need too many decimal places).
-    codex_cost_per_mtok_in: float = 0.0
-    codex_cost_per_mtok_out: float = 0.0
+    # Codex spend accounting (review M1/D12): roles.py prices the envelope's
+    # token usage against these USD-per-million-token rates so codex runs reach
+    # the ledger and both spend caps can see them. USD per MILLION tokens,
+    # matching provider pricing tables (not per-token, which would need too many
+    # decimal places).
+    #
+    # The defaults are gpt-5.6-sol's LIST price ($5 in / $30 out per MTok). On a
+    # ChatGPT subscription the real bill is $0 — these dollars are SYNTHETIC.
+    # They exist because the quota being spent is real and exhaustible (a
+    # free-tier limit killed two RESOLVE runs on 2026-07-27), and a fictional
+    # price is the only thing that lets ISSUE/DAILY_SPEND_CAP_USD bound codex
+    # TOKEN VOLUME at all. Override with your gateway's real rates if you pay
+    # per token; set both to 0 to opt out (spend goes untracked and the loud
+    # `codex_cost_blindspot_warning` fires at startup instead).
+    codex_cost_per_mtok_in: float = 5.0
+    codex_cost_per_mtok_out: float = 30.0
     # ── spend circuit breakers ────────────────────────────────────────────────
     # Per-agent budgets (MAX_BUDGET_USD et al) bound ONE session; nothing bounded
     # the aggregate, so a leg that retries forever spent without limit while every

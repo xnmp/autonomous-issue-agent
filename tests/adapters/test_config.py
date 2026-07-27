@@ -663,11 +663,18 @@ def test_max_infra_deaths_zero_is_a_valid_off_value():
     assert c.validation_errors() == ()
 
 
-def test_codex_cost_per_mtok_defaults_and_override():
+def test_codex_is_priced_out_of_the_box_so_the_spend_caps_are_not_blind():
+    # A subscription bills $0, but the quota it draws down is real — so the
+    # shipped rates are non-zero (synthetic dollars over real token volume) and
+    # reach the runtime config the runner is built from.
     c = from_env({"REPO": "x"})
-    assert c.codex_cost_per_mtok_in == 0.0
-    assert c.codex_cost_per_mtok_out == 0.0
-    assert c.codex_runtime.cost_per_mtok_in == 0.0
+    assert c.codex_cost_per_mtok_in > 0
+    assert c.codex_cost_per_mtok_out > c.codex_cost_per_mtok_in  # output costs more
+    assert c.codex_runtime.cost_per_mtok_in == c.codex_cost_per_mtok_in
+    assert c.codex_runtime.cost_per_mtok_out == c.codex_cost_per_mtok_out
+
+
+def test_codex_cost_per_mtok_override():
     c2 = from_env({
         "REPO": "x", "FIX_BOT": "fix-bot",
         "CODEX_COST_PER_MTOK_IN": "3.00", "CODEX_COST_PER_MTOK_OUT": "15.00",
@@ -676,6 +683,19 @@ def test_codex_cost_per_mtok_defaults_and_override():
     assert c2.codex_cost_per_mtok_out == 15.00
     assert c2.codex_runtime.cost_per_mtok_out == 15.00
     assert c2.validation_errors() == ()
+
+
+def test_codex_pricing_can_be_switched_off_explicitly():
+    # "0" is a real operator choice (don't track codex spend), not a missing
+    # value to be replaced by the default — and it must validate clean.
+    c = from_env({
+        "REPO": "x", "FIX_BOT": "fix-bot",
+        "CODEX_COST_PER_MTOK_IN": "0", "CODEX_COST_PER_MTOK_OUT": "0",
+    })
+    assert c.codex_cost_per_mtok_in == 0.0
+    assert c.codex_cost_per_mtok_out == 0.0
+    assert c.codex_runtime.cost_per_mtok_in == 0.0
+    assert c.validation_errors() == ()
 
 
 def test_agent_env_file_is_loaded_with_shell_expansion(tmp_path):
