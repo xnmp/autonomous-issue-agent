@@ -15,6 +15,45 @@ BASH DESIGN and are accurate only about the legacy watchers under `agent/`,
 `review/`, `steward/` — not about the default SDK path. Do not implement from
 them.
 
+## Direction: token efficiency without losing power
+
+The harness's north star is **driving cost per merged PR down while holding the
+quality guardrails flat** — streamline aggressively, but every gap gets plugged,
+never papered over. Optimizations are **evidence-triggered, not speculative**
+(the P4.1 pattern: build the lever dormant, activate it when journal data shows
+the trigger — difficulty routing sat unwired until resolves measured $13–20
+each). An efficiency change that cannot say which metric it moves is not ready
+to land.
+
+**Efficiency metrics** — all derivable with one `jq` from the global ledger
+(`~/.local/state/issue-agent/spend.jsonl`) and the per-role
+`<STATE_DIR>/journal.jsonl` (`agent_run` events carry cost, status, exit_reason,
+and token usage):
+
+- **$ per merged PR** — the primary number. Baseline 2026-07-27: ≈$17/merge
+  claude-heavy (resolves $13–20 each, cache reads dominating); routing targets
+  $5–8. On subscription runtimes (codex/glm) the ledgered dollars are synthetic
+  — read them as a token meter, same math.
+- **Cost mix by leg** — resolve vs review vs repair (fix-ci/rebase/address-
+  review). Repair legs are pure overhead; their share should shrink.
+- **Overhead ratios** — probe hit rate (`WorldUnchanged` ticks vs full world
+  builds), patch-id re-review skips vs paid re-reviews, router runs staying
+  ≤$0.10.
+- **Issue→merge wall clock** — the critical path (post-approval rebases that
+  re-trigger CI have dominated it; see #2/#544).
+
+**Power guardrails** — an efficiency change must leave these flat, measured on
+the next deployment day before stacking further changes:
+
+- **First-pass approval rate** (review `agent_run.status` APPROVE vs
+  REQUEST_CHANGES since #7) and rounds-per-PR.
+- **Escalation rate** — `needs-human-review` relabels, resolve/CI/rebase retry
+  counters, infra deaths. A cheaper model that escalates more is a net loss.
+- **Merges per deployment day** at a given issue difficulty mix.
+
+State the pair explicitly in any efficiency PR: the metric it moves, the
+guardrail it must not move, and the measurement that will decide it.
+
 ## Pointing the harness at a repo
 
 Two equivalent entry points:
