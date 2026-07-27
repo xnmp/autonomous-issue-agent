@@ -21,6 +21,7 @@ from ..adapters.governor import build_hooks
 from ..adapters.single_instance import AlreadyRunning, acquire
 from ..adapters.store import Store
 from ..adapters.worktree import Worktrees, build_gate_context
+from ..domain.world import WorldState, fix_probe_safe
 from .config import HarnessConfig, from_env, render_agent_md
 from .roles import build_fix_daemon, build_review_daemon, build_steward_daemon
 from .world_probe import WorldProbe
@@ -217,6 +218,29 @@ def build_role(role: str, env: dict | None = None):
     )
     worktrees = Worktrees(target_dir, cfg.worktree_root, cfg.base_branch)
 
+    # Change-probe gate for the per-tick observe: 1 REST point on a quiet tick
+    # instead of a full ~14-point GraphQL world build (the 2026-07-26 rate-limit
+    # exhaustion — two daemons on one token at 20s polls). Review and steward are
+    # gated unconditionally: their decide functions read nothing the signature is
+    # blind to (the reviewer ignores checks; the steward never fetches PRs at
+    # all). The FIX daemon is gated CONDITIONALLY, via `probe_when`: its decide
+    # reads CI check states and mergeable/mergeStateStatus, which GitHub
+    # recomputes WITHOUT bumping any updated_at — but only an in-flight PR or a
+    # held issue produces those signals, so `fix_probe_safe` re-enables full
+    # builds for exactly the worlds where the blind spot bites, and lets an idle
+    # fixer coast on the cheap signature (new work always bumps updated_at).
+    # Anything no signature can see (Jira-side edits the steward mirrors, when
+    # sync is on) is picked up at the probe's TTL reconciliation cadence.
+    def _probed(daemon, gw, probe_when: Callable[[WorldState], bool] | None = None):
+        if not cfg.world_probe:
+            return daemon
+        probe = WorldProbe(
+            gw.change_signature,
+            float(cfg.world_probe_ttl_seconds),
+            probe_when=probe_when,
+        )
+        return dataclasses.replace(daemon, observe=probe.gate(daemon.observe))
+
     if role == "fix":
         gw = GitHubGateway(cfg.repo, Identity(static_token=env.get("FIX_BOT_TOKEN") or None))
         # runtime-tagged sessions: a FIXER_RUNTIME flip must cold-start resume
@@ -240,21 +264,10 @@ def build_role(role: str, env: dict | None = None):
                     "merging; auto-merge arms after APPROVE + green CI\n"
                 )
             )
-        return build_fix_daemon(cfg, gw, store, worktrees, runner)
-    # Change-probe gate for review/steward observes: 1 REST point per quiet tick
-    # instead of a full GraphQL world build (the 2026-07-26 rate-limit exhaustion
-    # — two daemons on one token at 20s polls). The FIX daemon is deliberately
-    # never gated: its decide reads CI check states and mergeable/mergeStateStatus,
-    # which GitHub recomputes WITHOUT bumping any updated_at, so the probe's
-    # signature is blind to exactly the signals the fixer acts on. Review reads
-    # neither; the steward never fetches PRs at all (Jira-side edits, when sync
-    # is on, are picked up at the probe's TTL reconciliation cadence).
-    def _probed(daemon, gw):
-        if not cfg.world_probe:
-            return daemon
-        probe = WorldProbe(gw.change_signature, float(cfg.world_probe_ttl_seconds))
-        return dataclasses.replace(daemon, observe=probe.gate(daemon.observe))
-
+        return _probed(
+            build_fix_daemon(cfg, gw, store, worktrees, runner), gw,
+            probe_when=fix_probe_safe,
+        )
     if role == "review":
         gw = GitHubGateway(cfg.repo, _app_identity(env, warn=_commit_log),
                            review_pr_label=cfg.review_trigger_label,

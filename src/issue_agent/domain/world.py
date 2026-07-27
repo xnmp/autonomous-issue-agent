@@ -218,6 +218,32 @@ class WorldState:
         return tuple(p for p in self.prs if p.has(label))
 
 
+def fix_probe_safe(world: WorldState) -> bool:
+    """True iff the fixer's world has nothing in flight: no OPEN `ai-working`
+    issue and no OPEN `ai-pr-open` PR.
+
+    The cheap change-probe signature (newest `updated_at` across issues+PRs) is
+    blind to CI check-run completion and mergeable/mergeStateStatus flips, which
+    GitHub recomputes without bumping `updated_at`. That blindness is why the
+    fixer can't be gated unconditionally — but it only MATTERS when there is a
+    harness PR whose checks/mergeability the fixer would act on, or an issue a
+    fixer already holds. In this idle shape there is neither, so the blind spot
+    is moot and the 1-point signature is a sound stand-in for a full build.
+
+    Work arriving into an idle world always bumps `updated_at`: labelling an
+    issue `ai-ready` (or any human comment/edit) defeats the probe by
+    construction, so the fixer wakes on the very next tick.
+
+    `state` is checked explicitly because `issues_with`/`prs_with` filter by
+    label only — a closed issue or a merged PR can keep its lifecycle label.
+    """
+    if any(i.has(Label.AI_WORKING) for i in world.issues if i.state == "open"):
+        return False
+    if any(p.has(Label.AI_PR_OPEN) for p in world.prs if p.state == "OPEN"):
+        return False
+    return True
+
+
 # Convenience re-export so callers can `from .world import replace`.
 __all__ = [
     "CIState",
@@ -231,5 +257,6 @@ __all__ = [
     "IssueView",
     "PRView",
     "WorldState",
+    "fix_probe_safe",
     "replace",
 ]

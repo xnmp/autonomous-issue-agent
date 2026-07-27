@@ -5,10 +5,13 @@ body-declared paths overlap an in-flight PR's changed files is held back to avoi
 a guaranteed merge conflict (the #59-vs-#60 collision).
 """
 
+from builders import issue, pr, world
+
 from issue_agent.domain.world import (
     Comment,
     PRView,
     extract_declared_paths,
+    fix_probe_safe,
     paths_overlap_open_prs,
 )
 
@@ -67,6 +70,45 @@ def test_overlap_ignores_non_open_prs():
 def test_overlap_empty_declared_is_failopen():
     prs = (_pr(1, "OPEN", {"a.py"}),)
     assert paths_overlap_open_prs(frozenset(), prs) is False
+
+
+# ── fix_probe_safe (#3: when may the fixer coast on the cheap signature?) ────
+# The 1-point change signature is blind to CI completion and mergeability flips.
+# Those only matter while something is in flight, so "nothing in flight" is the
+# whole predicate — and it must read OPEN state, not just labels.
+def test_probe_safe_on_an_empty_world():
+    assert fix_probe_safe(world()) is True
+
+
+def test_probe_unsafe_while_a_fixer_holds_an_issue():
+    assert fix_probe_safe(world(issues=[issue(1, "ai-working")])) is False
+
+
+def test_probe_unsafe_while_a_harness_pr_is_open():
+    # This is the CI/mergeability case: the fixer acts on checks and
+    # mergeStateStatus for this PR, neither of which bumps updated_at.
+    assert fix_probe_safe(world(prs=[pr(7, "ai-pr-open")])) is False
+
+
+def test_probe_safe_when_the_labelled_pr_is_already_merged_or_closed():
+    # Lifecycle labels outlive the PR; only OPEN ones are in flight.
+    merged = world(prs=[pr(7, "ai-pr-open", state="MERGED")])
+    closed = world(prs=[pr(8, "ai-pr-open", state="CLOSED")])
+    assert (fix_probe_safe(merged), fix_probe_safe(closed)) == (True, True)
+
+
+def test_probe_safe_when_the_ai_working_issue_is_closed():
+    assert fix_probe_safe(world(issues=[issue(1, "ai-working", state="closed")])) is True
+
+
+def test_probe_safe_with_only_queued_and_finished_work():
+    # ai-ready is NOT in flight: labelling it bumped updated_at, so the very
+    # signature the probe reads already announced it. ai-done is history.
+    w = world(
+        issues=[issue(1, "ai-ready"), issue(2, "ai-done")],
+        prs=[pr(3, state="OPEN")],  # an unlabelled human PR is not the fixer's
+    )
+    assert fix_probe_safe(w) is True
 
 
 # ── Comment.is_bot (review R2-11: routed through identity.is_bot_login) ──────
