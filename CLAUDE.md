@@ -50,6 +50,13 @@ the next deployment day before stacking further changes:
 - **Escalation rate** — `needs-human-review` relabels, resolve/CI/rebase retry
   counters, infra deaths. A cheaper model that escalates more is a net loss.
 - **Merges per deployment day** at a given issue difficulty mix.
+- **Recurrence rate** (#10, not yet recorded) — harness-resolved issues that
+  come back: a literal reopen, or a new issue re-reporting a fixed bug / a
+  shipped feature not working. Review cannot see these (they surface later,
+  from reality), which makes them the ground-truth guardrail; #10 records them
+  at steward-triage time (`recurrence` label + journal event naming the
+  original issue/PR). Split by routed model tier before trusting a cheaper
+  tier with more issues.
 
 State the pair explicitly in any efficiency PR: the metric it moves, the
 guardrail it must not move, and the measurement that will decide it.
