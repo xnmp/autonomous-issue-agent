@@ -34,7 +34,7 @@ def latest_reviewer_verdict(pr: PRView, reviewer: str) -> Review | None:
         (index, review)
         for index, review in enumerate(pr.reviews)
         if login_eq(review.author, reviewer)
-        and review.state.upper() not in {"", "PENDING", "DISMISSED"}
+        and review.state.upper() not in {"", "PENDING", "DISMISSED", "COMMENTED"}
     ]
     if not own_verdicts:
         return None

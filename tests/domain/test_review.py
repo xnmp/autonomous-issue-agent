@@ -49,6 +49,13 @@ def test_another_reviewers_verdict_does_not_suppress_review():
     )
 
 
+def test_comment_review_is_not_a_verdict_on_head():
+    reviews = (Review("COMMENTED", "review-bot", commit_id="head"),)
+    assert not reviewer_verdict_on_head(
+        pr(1, reviews=reviews, head_ref_oid="head"), "review-bot"
+    )
+
+
 # ── ReviewMode resolution (REVIEW_MODE + legacy REVIEW_MULTI_AGENT alias) ──
 def test_review_mode_default_is_single():
     assert ReviewMode.from_env("", False) is ReviewMode.SINGLE

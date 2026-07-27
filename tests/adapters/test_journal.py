@@ -1173,7 +1173,24 @@ def test_the_daily_block_is_keyed_to_the_utc_day_it_pauses(tmp_path):
     blocks = [e for e in read_events(journal.path) if e["event"] == "spend_block"]
     assert len(blocks) == 1
     today = datetime.now(timezone.utc).date().isoformat()
-    assert blocks[0]["block_key"] == f"daily:{today}"
+    assert blocks[0]["block_key"] == f"daily:{today}:cap:50"
+
+
+def test_a_changed_daily_cap_emits_a_new_edge(tmp_path):
+    ledger = _write(str(tmp_path / "spend.jsonl"),
+                    _spend(datetime.now(timezone.utc), 60.0))
+    first, _, _, journal = _cap_dispatcher(
+        tmp_path, ledger, daily_cap=50.0,
+    )
+    asyncio.run(first.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
+
+    changed, _, _, _ = _cap_dispatcher(
+        tmp_path, ledger, daily_cap=40.0,
+    )
+    asyncio.run(changed.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
+
+    blocks = [e for e in read_events(journal.path) if e["event"] == "spend_block"]
+    assert {event["cap"] for event in blocks} == {40.0, 50.0}
 
 
 def test_an_unresolvable_issue_costs_attribution_not_a_block(tmp_path):

@@ -367,7 +367,10 @@ class AgentDispatcher:
                     f"TODAY'S GLOBAL SPEND ${spent:.2f} is at or over the "
                     f"${cap:.2f} DAILY_SPEND_CAP_USD — all dispatch paused until "
                     "00:00 UTC (no labels changed; work resumes by itself)",
-                    block_key=f"daily:{datetime.now(timezone.utc).date().isoformat()}",
+                    block_key=(
+                        f"daily:{datetime.now(timezone.utc).date().isoformat()}"
+                        f":cap:{cap:g}"
+                    ),
                     scope="daily", spent=round(spent, 4), cap=cap,
                 )
                 return True

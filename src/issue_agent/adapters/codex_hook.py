@@ -41,10 +41,20 @@ def _repository_instructions(
 ) -> tuple[str, bool]:
     """Return checked-out CLAUDE.md files in path order, bounded for prompt safety."""
     root = Path(cwd)
-    paths = sorted(
-        (path for path in root.glob("**/CLAUDE.md") if ".git" not in path.parts),
-        key=lambda path: path.relative_to(root).as_posix(),
+    tracked = subprocess.run(
+        ["git", "-C", cwd, "ls-files", "--", "CLAUDE.md", "**/CLAUDE.md"],
+        capture_output=True,
+        text=True,
+        check=False,
     )
+    if tracked.returncode == 0:
+        paths = [root / relative for relative in tracked.stdout.splitlines()]
+    else:
+        paths = [
+            path for path in root.glob("**/CLAUDE.md")
+            if ".git" not in path.parts
+        ]
+    paths.sort(key=lambda path: path.relative_to(root).as_posix())
     remaining = max_bytes
     sections: list[str] = []
     truncated = False
@@ -70,7 +80,10 @@ def _repository_instructions(
 def _without_generated_instructions(content: str) -> str:
     """Remove this harness's prior block while preserving target-owned content."""
     start = content.find(_GENERATED_INSTRUCTIONS_START)
-    end = content.find(_GENERATED_INSTRUCTIONS_END, start)
+    # The copied repository instructions may themselves document our marker.
+    # Our delimiter is always the final END because the generated block is
+    # appended at EOF; rfind prevents embedded copies from truncating the strip.
+    end = content.rfind(_GENERATED_INSTRUCTIONS_END)
     if start < 0 or end < 0:
         return content
     suffix = content[end + len(_GENERATED_INSTRUCTIONS_END):]
