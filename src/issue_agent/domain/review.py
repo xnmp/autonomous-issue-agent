@@ -18,7 +18,7 @@ from .actions import Action, AgentKind, Relabel, RunAgent, Target
 from .identity import login_eq
 from .labels import Label
 from .lifecycle import pr_escalation, retry_breaker
-from .world import PRView, WorldState, REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED
+from .world import PRView, Review, WorldState, REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED
 
 # Ceiling on UNPRODUCTIVE review rounds per PR (see ReviewConfig). Deliberately
 # the same order of magnitude as the fixer's MAX_INFRA_DEATHS: high enough that
@@ -28,18 +28,24 @@ from .world import PRView, WorldState, REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED
 DEFAULT_MAX_UNPRODUCTIVE_ROUNDS = 5
 
 
-def reviewer_verdict_on_head(pr: PRView, reviewer: str) -> bool:
-    """Whether `reviewer`'s latest submitted verdict targets this exact head."""
+def latest_reviewer_verdict(pr: PRView, reviewer: str) -> Review | None:
+    """The reviewer's latest non-dismissed submitted verdict, if known."""
     own_verdicts = [
         (index, review)
         for index, review in enumerate(pr.reviews)
         if login_eq(review.author, reviewer)
         and review.state.upper() not in {"", "PENDING", "DISMISSED"}
     ]
-    if not own_verdicts or not pr.head_ref_oid:
-        return False
+    if not own_verdicts:
+        return None
     _, latest = max(own_verdicts, key=lambda item: (item[1].submitted_at, item[0]))
-    return latest.commit_id == pr.head_ref_oid
+    return latest
+
+
+def reviewer_verdict_on_head(pr: PRView, reviewer: str) -> bool:
+    """Whether `reviewer`'s latest submitted verdict targets this exact head."""
+    latest = latest_reviewer_verdict(pr, reviewer)
+    return bool(latest and pr.head_ref_oid and latest.commit_id == pr.head_ref_oid)
 
 
 class IdentityMode(str, Enum):

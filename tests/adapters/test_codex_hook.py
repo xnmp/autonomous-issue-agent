@@ -2,7 +2,9 @@
 
 import os
 import stat
+import subprocess
 import tempfile
+import tomllib
 
 from issue_agent.adapters.codex_hook import (
     GOVERNOR_PATH,
@@ -55,7 +57,7 @@ def test_custom_governor_path():
 def test_writes_agents_md_when_given():
     cwd = tempfile.mkdtemp()
     write_hook_config(cwd, agents_md="# Fixer contract\nred before green.")
-    agents = os.path.join(cwd, "AGENTS.md")
+    agents = os.path.join(cwd, "AGENTS.override.md")
     assert os.path.exists(agents)
     assert "red before green" in open(agents).read()
 
@@ -63,7 +65,7 @@ def test_writes_agents_md_when_given():
 def test_no_agents_md_when_empty():
     cwd = tempfile.mkdtemp()
     write_hook_config(cwd)  # agents_md="" default
-    assert not os.path.exists(os.path.join(cwd, "AGENTS.md"))
+    assert not os.path.exists(os.path.join(cwd, "AGENTS.override.md"))
 
 
 def test_appends_root_and_nested_claude_md_in_path_order(tmp_path):
@@ -74,10 +76,62 @@ def test_appends_root_and_nested_claude_md_in_path_order(tmp_path):
 
     write_hook_config(str(tmp_path), agents_md="# Harness contract")
 
-    agents = (tmp_path / "AGENTS.md").read_text()
+    agents = (tmp_path / "AGENTS.override.md").read_text()
     assert "# Repository instructions (CLAUDE.md)" in agents
     assert agents.index("## CLAUDE.md") < agents.index("## packages/api/CLAUDE.md")
     assert "root rules" in agents and "api rules" in agents
+
+
+def test_preserves_target_agents_md_and_regeneration_is_idempotent(tmp_path):
+    agents_path = tmp_path / "AGENTS.md"
+    agents_path.write_text("# Target rules\nkeep this")
+    (tmp_path / "CLAUDE.md").write_text("claude rules 😀")
+
+    write_hook_config(str(tmp_path), agents_md="# Harness contract")
+    first = (tmp_path / "AGENTS.override.md").read_text()
+    write_hook_config(str(tmp_path), agents_md="# Harness contract")
+
+    assert agents_path.read_text() == "# Target rules\nkeep this"
+    assert "# Repository instructions (AGENTS.md)" in first
+    assert "# Target rules\nkeep this" in first
+    assert first == (tmp_path / "AGENTS.override.md").read_text()
+    assert first.count("# Harness contract") == 1
+    assert first.count("claude rules") == 1
+
+
+def test_tracked_agents_override_is_untouched_and_uses_config_fallback(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"],
+        check=True,
+    )
+    override = tmp_path / "AGENTS.override.md"
+    override.write_text("# Target override")
+    (tmp_path / "CLAUDE.md").write_text("claude rules 😀")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "AGENTS.override.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-qm", "target instructions"],
+        check=True,
+    )
+
+    write_hook_config(str(tmp_path), agents_md="# Harness contract")
+
+    assert override.read_text() == "# Target override"
+    assert subprocess.run(
+        ["git", "-C", str(tmp_path), "status", "--short", "AGENTS.override.md"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout == ""
+    config = (tmp_path / ".codex" / "config.toml").read_text()
+    assert "developer_instructions" in config
+    assert "# Harness contract" in config
+    assert "claude rules" in config
+    assert "😀" in tomllib.loads(config)["developer_instructions"]
 
 
 def test_repository_instructions_are_capped_and_truncation_is_logged(tmp_path):
@@ -86,8 +140,11 @@ def test_repository_instructions_are_capped_and_truncation_is_logged(tmp_path):
 
     write_hook_config(str(tmp_path), agents_md="contract", log=logs.append)
 
-    agents = (tmp_path / "AGENTS.md").read_text()
-    section = agents[agents.index("# Repository instructions (CLAUDE.md)"):]
+    agents = (tmp_path / "AGENTS.override.md").read_text()
+    section = agents[
+        agents.index("# Repository instructions (CLAUDE.md)"):
+        agents.index("<!-- issue-agent generated instructions: end -->")
+    ]
     assert len(section.encode()) <= REPOSITORY_INSTRUCTIONS_MAX_BYTES
     assert any("truncated" in message for message in logs)
 

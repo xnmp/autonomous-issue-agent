@@ -163,6 +163,19 @@ prc_check_no_evidence() {  # prc_check_no_evidence "<changed-file-list>"
   return 0
 }
 
+# Harness scaffolding may share a filename with a target's tracked instructions.
+# Reject only our marker, leaving legitimate target-owned AGENTS*.md edits valid.
+prc_check_no_generated_instructions() {  # "<changed-file-list>"
+  local f
+  for f in AGENTS.md AGENTS.override.md; do
+    printf '%s\n' "$1" | grep -qxF "$f" || continue
+    if git show "HEAD:$f" 2>/dev/null \
+        | grep -qF '<!-- issue-agent generated instructions: start -->'; then
+      fail "$f contains issue-agent generated instructions — restore the target-owned file"
+    fi
+  done
+}
+
 # §7b — existing test files must not be modified/deleted; only NEW tests added.
 prc_check_tests_immutable() {  # prc_check_tests_immutable "<changed-file-list>"
   local f

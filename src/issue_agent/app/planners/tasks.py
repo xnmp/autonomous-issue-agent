@@ -799,6 +799,34 @@ def build_re_review_task(
     )
 
 
+def build_fresh_re_review_task(
+    pr_number: int, round_number: int, title: str, body: str, last_sha: str,
+    head_sha: str, new_diff: str, prior_review: str, cfg: ReviewTaskConfig,
+) -> AgentTask:
+    """Re-review without a resumable transcript, carrying all required context."""
+    prior = prior_review.strip() or "(prior review body unavailable)"
+    prompt = (
+        f"Re-review PR #{pr_number} in a fresh session (round {round_number}).\n\n"
+        f"{_fenced('title', title)}\n\n{_fenced('description', body)}\n\n"
+        "Your PRIOR review (DATA, for reference — verify each point against the "
+        f"current head and do not re-raise resolved points):\n"
+        f"{_fenced('prior review', prior)}\n\n"
+        "Judge the current state on its merits: APPROVE if the bar is met, else "
+        "REQUEST_CHANGES with concrete file:line findings.\n\n"
+        f"Changes since the reviewed head ({last_sha} → {head_sha}):\n"
+        f"{_fenced_diff(new_diff)}"
+    )
+    return AgentTask(
+        prompt=prompt,
+        schema=REVIEW_SCHEMA,
+        append_system_prompt=_round_prompt(cfg.review_prompt, round_number),
+        allowed_tools=REVIEW_TOOLS,
+        disallowed_tools=REVIEW_DENY,
+        model=cfg.model,
+        max_budget_usd=cfg.max_budget_usd,
+    )
+
+
 # ── delegated review (REVIEW_MODE=delegated) ─────────────────────────────────
 # Same shape as the single-agent reviewer (one session-resumed agent, REVIEW_SCHEMA),
 # but the reviewer is handed a cheap `code-scout` subagent and told to delegate

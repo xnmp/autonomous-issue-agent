@@ -30,7 +30,7 @@ from ..adapters.journal import (
     sum_today,
 )
 from ..domain import review as review_dom, triage as triage_dom
-from ..domain.actions import AgentKind, RunAgent
+from ..domain.actions import AgentKind, PostComment, RunAgent
 from ..domain.agent_task import AgentRuntime
 from ..domain.labels import Label
 from ..domain.lifecycle import issue_escalation, pr_escalation
@@ -353,8 +353,11 @@ class AgentDispatcher:
                     scope="issue", issue=issue, spent=round(spent, 4), cap=cap,
                     target=target, number=number,
                 )
-                if first_block:
-                    self.executor.execute_all(escalation.actions())
+                actions = escalation.actions()
+                self.executor.execute_all(
+                    actions if first_block
+                    else [action for action in actions if not isinstance(action, PostComment)]
+                )
                 return True
         cap = self.cfg.daily_spend_cap_usd
         if cap > 0:

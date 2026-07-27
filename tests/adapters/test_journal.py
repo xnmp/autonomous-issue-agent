@@ -1104,6 +1104,32 @@ def test_the_block_dedup_survives_a_restart(tmp_path):
     assert len([e for e in read_events(journal.path) if e["event"] == "spend_block"]) == 1
 
 
+def test_duplicate_block_retries_relabel_without_reposting_comment(tmp_path):
+    class RelabelFailsOnce(CapGateway):
+        def __init__(self):
+            super().__init__()
+            self.relabel_attempts = 0
+
+        def relabel(self, kind, number, remove, add):
+            self.relabel_attempts += 1
+            if self.relabel_attempts == 1:
+                raise RuntimeError("transient relabel failure")
+            super().relabel(kind, number, remove, add)
+
+    ledger = _write(str(tmp_path / "spend.jsonl"), _spend(NOW, 30.0, issue=5))
+    gw = RelabelFailsOnce()
+    dispatcher, _, _, _ = _cap_dispatcher(
+        tmp_path, ledger, issue_cap=25.0, gw=gw,
+    )
+
+    asyncio.run(dispatcher.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
+    asyncio.run(dispatcher.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
+
+    assert gw.relabel_attempts == 2
+    assert len([call for call in gw.calls if call[0] == "comment"]) == 1
+    assert ("relabel", "issue", 5, "ai-working", "needs-human-review") in gw.calls
+
+
 def test_a_changed_issue_cap_may_escalate_once_again(tmp_path):
     ledger = _write(str(tmp_path / "spend.jsonl"), _spend(NOW, 30.0, issue=5))
     first, first_gw, _, journal = _cap_dispatcher(

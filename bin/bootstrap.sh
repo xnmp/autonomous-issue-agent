@@ -72,6 +72,7 @@ ensure_ignore ".harness/"
 # the PR — same rationale as .harness/.
 ensure_ignore ".codex/"
 ensure_ignore "AGENTS.md"
+ensure_ignore "AGENTS.override.md"
 echo "  ✓ .gitignore updated"
 
 # ── 4. Seed steward priors ─────────────────────────────────────────────────────

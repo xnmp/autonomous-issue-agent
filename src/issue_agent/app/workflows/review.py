@@ -19,6 +19,8 @@ from ...domain.labels import Label
 from ...domain.lifecycle import pr_escalation
 from ...domain.outcome import AgentResult
 
+_EXTERNAL_REVIEW_SESSION = "github-review"
+
 
 @dataclass(frozen=True)
 class ReviewWorkflowConfig:
@@ -188,10 +190,18 @@ class ReviewWorkflow:
                 prior_review, self.cfg.review,
             )
         else:
-            task = task_builders.build_re_review_task(
-                pr, round_number, last_sha, p.head_ref_oid, diff,
-                self.store.get_pr_session(pr), self.cfg.review,
-            )
+            session_id = self.store.get_pr_session(pr)
+            if session_id == _EXTERNAL_REVIEW_SESSION:
+                prior = review_dom.latest_reviewer_verdict(p, self.cfg.review_bot)
+                task = task_builders.build_fresh_re_review_task(
+                    pr, round_number, p.title, p.body, last_sha, p.head_ref_oid,
+                    diff, prior.body if prior else "", self.cfg.review,
+                )
+            else:
+                task = task_builders.build_re_review_task(
+                    pr, round_number, last_sha, p.head_ref_oid, diff,
+                    session_id, self.cfg.review,
+                )
         result = await self.runner.run(task)
         if result.is_error:
             # do NOT advance sha/round — retry same diff next poll. Log cost so a
@@ -209,6 +219,8 @@ class ReviewWorkflow:
         if not self._submit_review(pr, result, round_number, prior):
             self._no_progress(p, "review POST failed")
             return
+        if result.session_id:
+            self.store.save_pr_session(pr, result.session_id)
         self.store.set_last_sha(pr, p.head_ref_oid)
         self._record_patch(pr, signature)
         self.store.set_round(pr, round_number)
@@ -219,7 +231,7 @@ class ReviewWorkflow:
         if not review_dom.reviewer_verdict_on_head(p, self.cfg.review_bot):
             return False
         self.store.save_pr_session(
-            p.number, self.store.get_pr_session(p.number) or "github-review"
+            p.number, self.store.get_pr_session(p.number) or _EXTERNAL_REVIEW_SESSION
         )
         self.store.set_last_sha(p.number, p.head_ref_oid)
         self.cfg.log(
