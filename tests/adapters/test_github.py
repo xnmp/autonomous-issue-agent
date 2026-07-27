@@ -1239,6 +1239,70 @@ def test_merge_gate_protection_demands_both_reviews_and_checks():
     assert gw("not json").merge_gate_protection("dev") is False
 
 
+# ── recurrence context (harness #10) ─────────────────────────────────────────
+def test_recently_merged_issues_reports_one_entry_per_closed_issue():
+    """One MergedRef per REFERENCED ISSUE, carrying the issue's own number and
+    title (a recurrence matches a new report against old REPORTS, not against the
+    PR titles that resolved them)."""
+    fr = FakeRunner({"pr list": [
+        {"number": 300, "title": "fix: null token", "mergedAt": "2026-07-20T10:00:00Z",
+         "closingIssuesReferences": [{"number": 42, "title": "Login crashes on null token"},
+                                     {"number": 43, "title": "Session drops"}]},
+        {"number": 301, "title": "chore: bump", "mergedAt": "2026-07-21T10:00:00Z",
+         "closingIssuesReferences": []},
+    ]})
+    gw = GitHubGateway("o/r", Identity(static_token="t"), runner=fr)
+
+    merged = gw.recently_merged_issues("fix-bot", limit=30)
+
+    assert [(m.issue, m.pr, m.title) for m in merged] == [
+        (42, 300, "Login crashes on null token"),
+        (43, 300, "Session drops"),
+    ]
+    assert merged[0].merged_at == "2026-07-20T10:00:00Z"
+    argv = [a for a, _ in fr.calls][0]
+    assert "--author" in argv and "fix-bot" in argv
+    assert argv[argv.index("--limit") + 1] == "30"
+    assert "merged" in argv
+
+
+def test_recently_merged_issues_fails_soft():
+    """Advisory context may never kill the leg it enriches: an unreadable list,
+    garbage JSON, or no author at all is simply "no reference set"."""
+    def boom(argv, token):
+        raise RuntimeError("gh boom")
+
+    assert GitHubGateway("o/r", runner=boom).recently_merged_issues("fix-bot") == ()
+    assert GitHubGateway(
+        "o/r", runner=lambda a, t: "not json"
+    ).recently_merged_issues("fix-bot") == ()
+    # no author → no reference set, and NO gh call at all
+    calls = []
+    gw = GitHubGateway("o/r", runner=lambda a, t: calls.append(a) or "[]")
+    assert gw.recently_merged_issues("") == ()
+    assert calls == []
+
+
+def test_issue_state_reason_normalises_the_graphql_enum():
+    fr = FakeRunner({"issue view 522": {"stateReason": "REOPENED"}})
+    gw = GitHubGateway("o/r", Identity(static_token="t"), runner=fr)
+    assert gw.issue_state_reason(522) == "reopened"
+
+
+def test_issue_state_reason_fails_soft_to_no_evidence():
+    """"" means "no evidence of a recurrence" — the silent, correct default. A
+    completed close must never read as a reopen."""
+    fr = FakeRunner({"issue view 522": {"stateReason": "COMPLETED"}})
+    assert GitHubGateway("o/r", runner=fr).issue_state_reason(522) == "completed"
+
+    def boom(argv, token):
+        raise RuntimeError("gh boom")
+
+    assert GitHubGateway("o/r", runner=boom).issue_state_reason(522) == ""
+    assert GitHubGateway("o/r", runner=lambda a, t: "").issue_state_reason(522) == ""
+    assert GitHubGateway("o/r", runner=lambda a, t: "null").issue_state_reason(522) == ""
+
+
 def test_merged_prs_in_the_world_get_the_cheap_fetch():
     """The --state all label list serves STALE search results (merged PRs
     unlabeled a day earlier still listed), and each stale entry was paying the

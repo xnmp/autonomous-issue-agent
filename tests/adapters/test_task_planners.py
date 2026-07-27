@@ -643,6 +643,26 @@ def test_triage_task_no_comments_placeholder():
     assert "(no comments yet)" in t.prompt
 
 
+def test_triage_task_carries_the_recurrence_check_when_merges_are_known():
+    cfg = TriageTaskConfig(steward_bot="sb", triage_prompt="T")
+    merges = "- #42 Login crashes (PR #300, merged 2026-07-20)"
+    t = build_triage_task(7, "t", "b", "", cfg, recent_merges=merges)
+    assert "recurrence check" in t.prompt
+    assert merges in t.prompt
+    assert "recurrence_of" in t.prompt
+    assert "DATA" in t.prompt              # the merged list is not instructions
+
+
+def test_triage_task_without_merges_is_byte_for_byte_the_old_prompt():
+    """The recurrence check must never be able to degrade triage: no reference
+    set (nothing merged yet, or the lookup failed) → the prompt that shipped
+    before the check existed."""
+    cfg = TriageTaskConfig(steward_bot="sb", triage_prompt="T")
+    assert build_triage_task(7, "t", "b", "", cfg, recent_merges="   ").prompt == \
+        build_triage_task(7, "t", "b", "", cfg).prompt
+    assert "recurrence" not in build_triage_task(7, "t", "b", "", cfg).prompt
+
+
 # ── jira sync ──
 JIRA_CFG = JiraTaskConfig(
     project_key="ABC", cloud_id="site.atlassian.net", repo="o/r",

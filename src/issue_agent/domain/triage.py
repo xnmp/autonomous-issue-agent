@@ -7,6 +7,9 @@ Split into the three independently-testable concerns the bash tangles together:
      summary + AC + blocking gaps); pure data.
   3. `actions_for_verdict` — verdict → comment/relabel actions, gated by
      STEWARD_PROMOTE.
+  4. `recurrence_actions` — the ADVISORY recurrence marker, kept separate from
+     (3) so the triage verdict mapping is unchanged whether or not the recurrence
+     context was available.
 
 The feedback-loop lesson lives in `record_after`: the baseline written for an
 issue must be its updatedAt AS OF AFTER the steward's own comment+relabel (which
@@ -15,6 +18,7 @@ themselves bump updatedAt), so only a LATER human reply re-triggers triage.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from .actions import Action, AddDependency, PostComment, Relabel, Target
@@ -77,6 +81,10 @@ class TriageVerdict:
     # The steward wires each as a native GitHub blocked_by link.
     blocked_by_issues: tuple[int, ...] = ()
     rationale: str = ""
+    # ADVISORY: the harness-merged issue this one appears to re-report (the same bug
+    # back, or a shipped feature that does not work). None = no recurrence claimed.
+    # Never acted on beyond a label + comment — see `recurrence_actions`.
+    recurrence_of: int | None = None
 
     @property
     def is_blocked(self) -> bool:
@@ -224,4 +232,40 @@ def actions_for_verdict(
         PostComment(Target.ISSUE, issue_number, body),
         Relabel(Target.ISSUE, issue_number, None, cfg.triage_label),
         *dep_actions,
+    ]
+
+
+def recurrence_actions(
+    issue_number: int,
+    verdict: TriageVerdict,
+    merged_by_issue: Mapping[int, int],
+) -> list[Action]:
+    """The ADVISORY half of harness issue #10: this new issue re-reports something
+    the harness already shipped → one comment naming the original + its PR, and the
+    `recurrence` label. Never a reopen, never a dispatch, never a blocking link.
+
+    `merged_by_issue` maps a RECENTLY-MERGED issue number to the PR that shipped it
+    — a plain int→int map rather than an adapter type, so the domain stays pure.
+    It is also the WHITELIST: a `recurrence_of` naming anything the harness did not
+    just merge yields NO actions. That is the containment for a prompt-injected or
+    hallucinated verdict — the classifier reads attacker-writable issue bodies, so
+    it must not be able to label and comment on an arbitrary issue of its choosing.
+    A self-reference is dropped for the same reason (an issue cannot recur as
+    itself, and the merged map could contain it if the fixer just shipped it).
+
+    Empty list = say nothing, which is the right default for an advisory signal:
+    a missed recurrence costs a metric, a false one costs a human's attention.
+    """
+    of = verdict.recurrence_of
+    if of is None or of == issue_number or of not in merged_by_issue:
+        return []
+    pr = merged_by_issue[of]
+    body = (
+        "**Possible recurrence** ♻️\n\n"
+        f"Possible recurrence of #{of} (shipped in PR #{pr}). "
+        "Advisory — remove the `recurrence` label if unrelated."
+    )
+    return [
+        PostComment(Target.ISSUE, issue_number, body),
+        Relabel(Target.ISSUE, issue_number, None, Label.RECURRENCE),
     ]

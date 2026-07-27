@@ -12,6 +12,7 @@ from issue_agent.domain.triage import (
     actions_for_verdict,
     is_untriaged,
     parse_codeowners_default,
+    recurrence_actions,
     triage_candidates,
 )
 
@@ -167,6 +168,58 @@ def test_ready_no_blocker_still_promotes():
     acts = actions_for_verdict(7, "alice", v, cfg)
     assert Relabel(Target.ISSUE, 7, Label.AI_TRIAGE, Label.AI_READY) in acts
     assert not any(isinstance(a, AddDependency) for a in acts)
+
+
+# ── recurrence marking (advisory; harness #10) ────────────────────────────────
+MERGED = {42: 300, 43: 301}   # issue → the PR that shipped it
+
+
+def test_recurrence_names_the_original_and_its_pr_and_adds_the_label():
+    v = TriageVerdict(verdict="ready", recurrence_of=42)
+    acts = recurrence_actions(7, v, MERGED)
+    body = next(a for a in acts if isinstance(a, PostComment)).body
+    assert "#42" in body and "PR #300" in body
+    assert "recurrence" in body           # tells the human how to undo it
+    assert Relabel(Target.ISSUE, 7, None, Label.RECURRENCE) in acts
+
+
+def test_no_recurrence_claimed_says_nothing():
+    assert recurrence_actions(7, TriageVerdict(verdict="ready"), MERGED) == []
+
+
+def test_a_recurrence_of_an_unmerged_issue_says_nothing():
+    # Containment: the classifier reads attacker-writable issue bodies, so it must
+    # not be able to label/comment on an issue the harness never shipped.
+    v = TriageVerdict(verdict="ready", recurrence_of=999)
+    assert recurrence_actions(7, v, MERGED) == []
+
+
+def test_an_issue_cannot_recur_as_itself():
+    v = TriageVerdict(verdict="ready", recurrence_of=42)
+    assert recurrence_actions(42, v, MERGED) == []
+
+
+def test_recurrence_never_reopens_dispatches_or_links():
+    """AC: advisory only — the actions are exactly one comment + one label add."""
+    acts = recurrence_actions(7, TriageVerdict(verdict="ready", recurrence_of=43), MERGED)
+    assert [type(a) for a in acts] == [PostComment, Relabel]
+
+
+def test_the_verdict_actions_are_untouched_by_a_recurrence():
+    """The two mappings are independent: a recurrence must not change what triage
+    would otherwise have done with the issue."""
+    plain = TriageVerdict(verdict="ready", plain_summary="Clear.",
+                          acceptance_criteria=("AC",))
+    recurring = TriageVerdict(verdict="ready", plain_summary="Clear.",
+                              acceptance_criteria=("AC",), recurrence_of=42)
+    assert actions_for_verdict(7, "alice", recurring, CFG) == \
+        actions_for_verdict(7, "alice", plain, CFG)
+
+
+def test_the_recurrence_label_is_not_a_lifecycle_label():
+    # An observation, not a pipeline position: labelling an issue `recurrence`
+    # must not make it look triaged nor drop it out of any selection set.
+    assert is_untriaged(issue(1, "recurrence")) is True
 
 
 # ── CODEOWNERS parsing ────────────────────────────────────────────────────────

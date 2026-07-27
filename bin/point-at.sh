@@ -104,7 +104,7 @@ fi
 info "ensuring GitHub lifecycle labels on $REPO"
 for l in ai-triage ai-ready ai-working ai-blocked ai-pr-open ai-done ai-suggestion \
          trivial minor major needs-human-review needs-design invariant \
-         P1 P2 P3 harness; do
+         recurrence P1 P2 P3 harness; do
   gh label create "$l" --repo "$REPO" >/dev/null 2>&1 || true
 done
 grn "  ✓ labels ensured"

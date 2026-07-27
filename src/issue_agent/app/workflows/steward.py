@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from ...adapters.journal import read_events_tail, recurrence_keys
 from ...domain import triage as triage_dom
 from ...domain.agent_task import AgentRuntime
 from ...domain.triage import TriageConfig
@@ -17,6 +18,24 @@ class StewardWorkflowConfig:
     triage: TriageTaskConfig | None
     triage_cfg: TriageConfig | None
     log: object
+    # Fixer login — whose merged PRs form the "already shipped by this harness"
+    # reference set the recurrence check matches against (harness #10). Blank →
+    # no reference set → the check is inert and triage is unchanged.
+    fix_bot: str = ""
+    # Repo slug, for the recurrence event's dedup key only (a journal is per-role,
+    # not per-repo-per-role, and the key must not collide across targets).
+    repo: str = ""
+    # Where recurrence events land. Optional so every existing caller/test keeps
+    # working; None → the label + comment still happen, only the metric is lost.
+    journal: object | None = None
+
+
+def _merge_lines(merged) -> str:
+    """The merged-issue reference set, rendered for the prompt. One line per
+    issue, newest first — the order `gh pr list` already returns."""
+    return "\n".join(
+        f"- #{m.issue} {m.title} (PR #{m.pr}, merged {m.merged_at})" for m in merged
+    )
 
 
 @dataclass
@@ -26,12 +45,56 @@ class StewardWorkflow:
     store: object
     runner: AgentRuntime
     executor: object
+    # `block_key`s this process has already journalled — the in-memory half of the
+    # recurrence edge trigger. The journal read below is the half that survives a
+    # daemon restart; this one keeps the steady state free of file reads.
+    _emitted: set[str] = field(default_factory=set)
+
+    def _recent_merges(self) -> tuple:
+        """The harness's recently-merged issues, or () if that cannot be answered.
+
+        Deliberately total: a gateway that lacks the method (an injected fake, a
+        legacy adapter) or one that raises must leave triage EXACTLY as it was
+        before this feature — no reference set, no prompt section, no recurrence.
+        Same contract as `FixWorkflow._prompt_input`: a context fetch may never
+        kill the leg it was only meant to enrich.
+        """
+        fn = getattr(self.gateway, "recently_merged_issues", None)
+        if fn is None or not self.cfg.fix_bot:
+            return ()
+        try:
+            return tuple(fn(self.cfg.fix_bot) or ())
+        except Exception as exc:  # noqa: BLE001 — see docstring
+            self.cfg.log(f"recurrence context unavailable: {exc}")
+            return ()
+
+    def _journal_recurrence(self, issue: int, of_issue: int, pr: int) -> None:
+        """One `recurrence` event per (repo, issue, original), ever. Deduped in
+        process AND through the journal, because the daemon restarts (hot reload,
+        Restart=always) that reset the in-memory set do not reset the file."""
+        key = f"recurrence:{self.cfg.repo}:{issue}:refiled:{of_issue}"
+        if key in self._emitted:
+            return
+        self._emitted.add(key)
+        journal = self.cfg.journal
+        if journal is None:
+            return
+        if key in recurrence_keys(read_events_tail(journal.path)):
+            return
+        journal.emit(
+            "recurrence", kind="refiled", issue=issue, of_issue=of_issue,
+            pr=pr, block_key=key,
+        )
 
     async def triage(self, issue: int) -> None:
         self.cfg.log(f"triage #{issue}: classifying")
         iss = self.gateway.get_issue(issue)
         thread = "\n\n---\n\n".join(f"@{c.author}: {c.body}" for c in iss.comments)
-        task = task_builders.build_triage_task(issue, iss.title, iss.body, thread, self.cfg.triage)
+        merged = self._recent_merges()
+        task = task_builders.build_triage_task(
+            issue, iss.title, iss.body, thread, self.cfg.triage,
+            recent_merges=_merge_lines(merged),
+        )
         result = await self.runner.run(task)
         if result.is_error or not isinstance(result.structured, dict):
             self.cfg.log(f"triage #{issue}: {result.status or 'error'} — no verdict, will retry")
@@ -47,6 +110,16 @@ class StewardWorkflow:
                 int(n) for n in (s.get("blocked_by_issues", []) or []) if isinstance(n, int)
             ),
             rationale=s.get("rationale", ""),
+            # ints only (bool is an int subclass and is NOT a number here); every
+            # other shape reads as "no claim". The number is further checked
+            # against `merged_by_issue` in the domain, which is what stops the
+            # classifier pointing the label at an arbitrary issue.
+            recurrence_of=(
+                s["recurrence_of"]
+                if isinstance(s.get("recurrence_of"), int)
+                and not isinstance(s.get("recurrence_of"), bool)
+                else None
+            ),
         )
         promote = bool(self.cfg.triage_cfg and self.cfg.triage_cfg.promote)
         if verdict.is_blocked:
@@ -62,8 +135,22 @@ class StewardWorkflow:
             )
         if verdict.blocked_by_issues:
             disp += f"; blocked-by {sorted(verdict.blocked_by_issues)}"
+        merged_by_issue = {m.issue: m.pr for m in merged}
+        rec = triage_dom.recurrence_actions(issue, verdict, merged_by_issue)
+        if rec:
+            disp += f"; possible recurrence of #{verdict.recurrence_of}"
         self.cfg.log(f"triage #{issue}: {disp}")
         self.executor.execute_all(
-            triage_dom.actions_for_verdict(issue, iss.author, verdict, self.cfg.triage_cfg)
+            [
+                *triage_dom.actions_for_verdict(
+                    issue, iss.author, verdict, self.cfg.triage_cfg
+                ),
+                *rec,
+            ]
         )
+        # After the actions, so a journalled recurrence always has its label and
+        # comment behind it — and only ever for a recurrence the DOMAIN validated.
+        if rec:
+            of = verdict.recurrence_of or 0
+            self._journal_recurrence(issue, of, merged_by_issue.get(of, 0))
         self.store.set_triage_at(issue, self.gateway.get_issue(issue).updated_at)

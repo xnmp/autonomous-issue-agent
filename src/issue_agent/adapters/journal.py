@@ -673,6 +673,20 @@ def hold_keys(events) -> set[str]:
     return _emitted_block_keys(events, "hold")
 
 
+def recurrence_keys(events) -> set[str]:
+    """The `block_key`s a `recurrence` event has ALREADY been emitted for.
+
+    Third instance of the same edge-trigger read (harness #10). A recurrence is
+    the most level-like of the three: a reopened issue stays reopened until
+    someone closes it, and the steward re-derives that fact on every fresh world
+    build, so an un-deduped emit would write the same line for days. The
+    recurrence RATE is the metric this journal has to answer, and a metric
+    computed by counting events is destroyed by duplicates — dedup here is a
+    correctness property, not just noise control.
+    """
+    return _emitted_block_keys(events, "recurrence")
+
+
 # How many settled runs must agree before the ledger is declared blind. Small
 # enough to fire within one poll cycle of a fresh daemon, large enough that a
 # single genuinely-free run (a session that died before billing) is not it.
@@ -834,6 +848,7 @@ __all__ = [
     "read_events",
     "read_events_tail",
     "recent_runs",
+    "recurrence_keys",
     "repeated_dispatch_warning",
     "spend_blocked_keys",
     "sum_issue",

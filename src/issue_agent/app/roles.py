@@ -26,6 +26,7 @@ from ..adapters.journal import (
     default_ledger_path,
     hold_keys,
     read_events_tail,
+    recurrence_keys,
     unsettled_starts,
 )
 from ..adapters.store import Store
@@ -198,6 +199,82 @@ def _hold_reporter(journal: Journal | None, repo: str, log):
             journal.emit(
                 "hold", issue=hold.issue, reason=hold.reason,
                 blocker=hold.blocker, block_key=key,
+            )
+
+    return report
+
+
+def _recurrence_reporter(journal: Journal | None, gateway, repo: str, fix_bot: str, log):
+    """Build the per-poll reporter for LITERAL reopens (harness #10, kind=reopen).
+
+    A merged PR is not ground truth that the problem is fixed. The truest
+    "losing power" signal is a resolved issue that comes back — and it is
+    invisible to review, which is why it gets recorded here rather than inferred
+    from the existing counters.
+
+    **Why `stateReason`, not "open again".** The harness merges to a non-default
+    base branch, so GitHub never auto-closes the referenced issue; the harness
+    closes it itself, and only when `close_issue_on_merge` is set. An ai-done
+    issue that is open therefore means either "a human reopened it" or "the close
+    has not happened / is not configured" — a distinction worth one gh call,
+    because the second case is every ai-done issue on a default deployment and
+    would journal a recurrence for each of them, forever.
+
+    Same two-channel shape as `_hold_reporter`: the LOG line fires every pass
+    (free, and answers "why is this labelled recurrence?" from any single poll),
+    the JOURNAL line once per issue — a reopen is a LEVEL that persists until
+    someone closes the issue again, and the recurrence RATE is computed by
+    counting these events, so duplicates would corrupt the metric rather than
+    merely add noise.
+
+    Cost: ZERO extra gh calls in the steady state. `issue_state_reason` is asked
+    only about issues that are BOTH open and ai-done — a set that is empty on a
+    healthy repo. A gateway without the method (a fake, a legacy adapter) yields
+    an inert reporter rather than an AttributeError out of the decide closure.
+    """
+    state_reason = getattr(gateway, "issue_state_reason", None)
+    recent_merges = getattr(gateway, "recently_merged_issues", None)
+    if state_reason is None:
+        return lambda _world: None
+    seen: set[str] = set()
+
+    def report(world) -> None:
+        reopened = [
+            i.number for i in world.issues
+            if i.state == "open" and i.has(Label.AI_DONE)
+            and state_reason(i.number) == "reopened"
+        ]
+        if not reopened:
+            return
+        # Only now is the merged list worth a call: it exists solely to name the
+        # PR that shipped the thing that came back.
+        shipped: dict[int, int] = {}
+        if recent_merges is not None and fix_bot:
+            try:
+                shipped = {m.issue: m.pr for m in (recent_merges(fix_bot) or ())}
+            except Exception as exc:  # noqa: BLE001 — enrichment, never fatal
+                log(f"recurrence: could not read merged PRs ({exc})")
+        for number in reopened:
+            log(
+                f"RECURRENCE: issue #{number} was resolved and is open again "
+                "(reopened)"
+            )
+            key = f"recurrence:{repo}:{number}:reopen"
+            if key in seen:
+                continue
+            seen.add(key)
+            if journal is None:
+                continue
+            if key in recurrence_keys(read_events_tail(journal.path)):
+                continue
+            # of_issue == issue: a reopen is an issue recurring as ITSELF, which
+            # keeps one event shape for both kinds so the metric reads them
+            # together. No label and no comment here — the reopened issue is
+            # already the visible artifact, and the harness must never write to
+            # an issue a human just deliberately reopened.
+            journal.emit(
+                "recurrence", kind="reopen", issue=number, of_issue=number,
+                pr=shipped.get(number, 0), block_key=key,
             )
 
     return report
@@ -531,6 +608,9 @@ def build_steward_daemon(
         triage_cfg=tcfg_dom,
         jira=jira_cfg,
         log=steward_log,
+        # Not for dispatching anything — the steward's recurrence check needs to
+        # know whose merged PRs count as "shipped by this harness".
+        fix_bot=cfg.fix_runtime.bot,
         **_spend_cfg(cfg, "steward", ledger),
     )
     executor = Executor(gateway, log=steward_log, journal=journal, alert_cmd=cfg.alert_cmd)
@@ -554,8 +634,15 @@ def build_steward_daemon(
         steward_runtime, "max_infra_deaths", DEFAULT_MAX_UNPRODUCTIVE_ROUNDS
     )
     suppressed_last: set[int] = set()
+    report_recurrences = _recurrence_reporter(
+        journal, gateway, cfg.repo, cfg.fix_runtime.bot, steward_log
+    )
 
     def decide(world):
+        # Before the pure decide, as in the fixer: if the decision raises, the
+        # tick has still recorded what came back. The steward is probe-gated, so
+        # this only runs on a genuinely fresh world.
+        report_recurrences(world)
         state = TriageState(seen_at={i.number: store.get_triage_at(i.number) for i in world.issues})
         deaths = _process_deaths(store)
 

@@ -2,6 +2,7 @@
 
 import asyncio
 
+from issue_agent.adapters.journal import Journal, read_events
 from issue_agent.app.execute import Executor
 from issue_agent.app.workflows.jira import JiraSyncWorkflow, JiraSyncWorkflowConfig
 from issue_agent.app.workflows.steward import StewardWorkflow, StewardWorkflowConfig
@@ -108,6 +109,162 @@ def test_steward_triage_error_leaves_state_untouched():
 
     assert gw.calls == []
     assert store.triage_at == {}
+
+
+# ── semantic recurrences riding the triage leg (harness #10) ─────────────────
+class _Merged:
+    def __init__(self, issue, pr, title="Login crashes", merged_at="2026-07-20"):
+        self.issue, self.pr = issue, pr
+        self.title, self.merged_at = title, merged_at
+
+
+class RecurrenceGateway(FakeGateway):
+    """FakeGateway + the merged-issue reference set the recurrence check reads."""
+
+    def __init__(self, issues, merged=(), raises=False):
+        super().__init__(issues=issues)
+        self.merged = merged
+        self.raises = raises
+
+    def recently_merged_issues(self, author, limit=30):
+        if self.raises:
+            raise RuntimeError("gh boom")
+        return self.merged
+
+
+def _verdict(**extra):
+    return AgentResult(is_error=False, structured={
+        "verdict": "ready", "plain_summary": "clear", "acceptance_criteria": ["ac"],
+        "creator_questions": [], "owner_questions": [], "blocked_by_issues": [],
+        **extra,
+    })
+
+
+def _recurrence_cfg(journal=None):
+    return StewardWorkflowConfig(
+        triage=TriageTaskConfig("steward-bot", triage_prompt="T"),
+        triage_cfg=TriageConfig("steward-bot", enabled=True),
+        log=lambda _m: None, fix_bot="fix-bot", repo="o/r", journal=journal,
+    )
+
+
+def _run(gw, cfg, runner, store=None):
+    store = store or FakeStore()
+    executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
+    asyncio.run(StewardWorkflow(cfg, gw, store, runner, executor).triage(9))
+    return store
+
+
+def _recurrences(journal):
+    return [e for e in read_events(journal.path) if e.get("event") == "recurrence"]
+
+
+def test_a_refiled_issue_gets_the_label_a_comment_naming_the_original_and_one_event(tmp_path):
+    """AC: a new issue judged to re-report a merged one gets the label + a comment
+    naming the original, and journals once."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    gw = RecurrenceGateway({9: IssueView(9, title="Still crashing", body="b", author="alice")},
+                           merged=(_Merged(42, 300),))
+
+    _run(gw, _recurrence_cfg(journal), FakeRunner(_verdict(recurrence_of=42)))
+
+    assert ("relabel", "issue", 9, None, "recurrence") in gw.calls
+    body = next(c[3] for c in gw.calls if c[0] == "comment" and "recurrence" in c[3])
+    assert "#42" in body and "PR #300" in body
+    assert _recurrences(journal) == [{
+        "ts": _recurrences(journal)[0]["ts"], "event": "recurrence", "kind": "refiled",
+        "issue": 9, "of_issue": 42, "pr": 300,
+        "block_key": "recurrence:o/r:9:refiled:42",
+    }]
+
+
+def test_the_merged_list_is_rendered_into_the_triage_prompt():
+    gw = RecurrenceGateway({9: IssueView(9, title="t", body="b", author="alice")},
+                           merged=(_Merged(42, 300),))
+    runner = FakeRunner(_verdict())
+
+    _run(gw, _recurrence_cfg(), runner)
+
+    assert "- #42 Login crashes (PR #300, merged 2026-07-20)" in runner.tasks[0].prompt
+
+
+def test_a_re_triaged_recurrence_journals_only_once(tmp_path):
+    """A recurrence is a level (the issue keeps re-entering triage as the author
+    replies); the metric counts events, so the second pass must add nothing."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    gw = RecurrenceGateway({9: IssueView(9, title="t", body="b", author="alice")},
+                           merged=(_Merged(42, 300),))
+    cfg = _recurrence_cfg(journal)
+    store, executor = FakeStore(), Executor(gw, remove_worktree=FakeWorktrees().remove)
+    wf = StewardWorkflow(cfg, gw, store, FakeRunner(_verdict(recurrence_of=42)), executor)
+
+    asyncio.run(wf.triage(9))
+    asyncio.run(wf.triage(9))
+
+    assert len(_recurrences(journal)) == 1
+
+
+def test_no_recurrence_claimed_leaves_triage_exactly_as_it_was(tmp_path):
+    """AC: an unrelated new issue gets neither the label nor a comment about it."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    gw = RecurrenceGateway({9: IssueView(9, title="t", body="b", author="alice")},
+                           merged=(_Merged(42, 300),))
+
+    store = _run(gw, _recurrence_cfg(journal), FakeRunner(_verdict()))
+
+    assert not any(c[0] == "relabel" and c[4] == "recurrence" for c in gw.calls)
+    assert not any(c[0] == "comment" and "recurrence" in c[3] for c in gw.calls)
+    assert _recurrences(journal) == []
+    assert store.triage_at[9] == ""          # triage itself still completed
+
+
+def test_a_recurrence_of_an_issue_the_harness_never_shipped_is_discarded(tmp_path):
+    """Containment: the classifier reads attacker-writable issue bodies, so a
+    number outside the supplied merged list must reach nothing."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    gw = RecurrenceGateway({9: IssueView(9, title="t", body="b", author="alice")},
+                           merged=(_Merged(42, 300),))
+
+    _run(gw, _recurrence_cfg(journal), FakeRunner(_verdict(recurrence_of=999)))
+
+    assert not any(c[0] == "relabel" and c[4] == "recurrence" for c in gw.calls)
+    assert _recurrences(journal) == []
+
+
+def test_a_non_integer_recurrence_of_is_ignored(tmp_path):
+    gw = RecurrenceGateway({9: IssueView(9, title="t", body="b", author="alice")},
+                           merged=(_Merged(42, 300),))
+
+    _run(gw, _recurrence_cfg(), FakeRunner(_verdict(recurrence_of="42")))
+
+    assert not any(c[0] == "relabel" and c[4] == "recurrence" for c in gw.calls)
+
+
+def test_a_failing_merged_list_fetch_still_triages(tmp_path):
+    """The recurrence check must never break triage: no reference set, no
+    recurrence section — and the verdict is still applied and recorded."""
+    gw = RecurrenceGateway({9: IssueView(9, title="t", body="b", author="alice",
+                                         updated_at="t_post")},
+                           merged=(), raises=True)
+    runner = FakeRunner(_verdict(recurrence_of=42))
+
+    store = _run(gw, _recurrence_cfg(), runner)
+
+    assert ("relabel", "issue", 9, None, "ai-triage") in gw.calls
+    assert store.triage_at[9] == "t_post"
+    assert "recurrence check" not in runner.tasks[0].prompt
+
+
+def test_a_gateway_without_the_merged_read_triages_unchanged():
+    """FakeGateway has no `recently_merged_issues` — a legacy adapter must not
+    turn the triage leg into an AttributeError."""
+    gw = FakeGateway(issues={9: IssueView(9, title="t", body="b", author="alice")})
+    runner = FakeRunner(_verdict(recurrence_of=42))
+
+    _run(gw, _recurrence_cfg(), runner)
+
+    assert ("relabel", "issue", 9, None, "ai-triage") in gw.calls
+    assert not any(c[0] == "relabel" and c[4] == "recurrence" for c in gw.calls)
 
 
 def test_jira_sync_creates_ticket_and_records_phase():

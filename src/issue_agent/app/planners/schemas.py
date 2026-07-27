@@ -163,6 +163,13 @@ TRIAGE_SCHEMA: dict = {
         # steward turns each into a native GitHub blocked_by link so the fixer's
         # dependency gate holds this issue until the blocker closes.
         "blocked_by_issues": {"type": "array", "items": {"type": "integer"}},
+        # ADVISORY (harness #10): the number of a RECENTLY-MERGED issue (from the
+        # list supplied in the prompt) that this issue re-reports — the same bug
+        # back, or a shipped feature that does not work. Omitted/null when this is
+        # not a recurrence, which is the default. Not `required`: a classifier that
+        # must emit the field on every issue is a classifier under pressure to
+        # invent one. The steward ignores any number not in the supplied list.
+        "recurrence_of": {"type": "integer"},
         "rationale": {"type": "string"},
     },
     "required": [

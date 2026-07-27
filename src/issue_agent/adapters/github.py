@@ -503,6 +503,19 @@ def build_add_blocked_by_args(repo: str, issue: int, blocker_id: int) -> list[st
     ]
 
 
+# ── recurrence context ──────────────────────────────────────────────────────
+@dataclass(frozen=True)
+class MergedRef:
+    """One issue the harness has already shipped: the issue, the PR that closed
+    it, and when. The unit of `recently_merged_issues` — the "did this come back?"
+    reference set (harness #10)."""
+
+    issue: int
+    pr: int
+    title: str = ""
+    merged_at: str = ""
+
+
 # ── identity ────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class Identity:
@@ -960,6 +973,76 @@ class GitHubGateway:
             )
             return format_review_comments(raw, limit=limit)
         except Exception:  # noqa: BLE001 — a missing comment list must not block the fix
+            return ""
+
+    # ── recurrence context (harness #10) ──
+    # Both of these exist to record that a shipped fix came back. Both are pure
+    # CONTEXT — advisory label/comment/journal, never a reopen or a dispatch — so
+    # both fail SOFT: a recurrence check that raises would take the steward's
+    # triage leg (or its whole poll) down with it, trading working triage for a
+    # metric. `MissingListLimit` still propagates; that is a bug here, not a
+    # runtime condition (review C2).
+    def recently_merged_issues(self, author: str, limit: int = 30) -> tuple[MergedRef, ...]:
+        """The issues `author`'s recently-MERGED PRs closed, newest PR first.
+
+        One entry per referenced issue (a PR closing two issues yields two), and
+        the issue's OWN number/title are used — the PR title describes the change,
+        the issue title describes the report, and a recurrence classifier is
+        matching a new report against old REPORTS.
+
+        `limit` is the PR page size and is deliberately small (K≈30 — the recent
+        past is what can plausibly recur), so `_warn_if_list_truncated` is NOT
+        called: truncation here is the intent, not a silent loss.
+        """
+        if not author.strip():
+            return ()
+        try:
+            data = self._gh_json(
+                ["pr", "list", "--repo", self.repo, "--state", "merged",
+                 "--author", author, "--json",
+                 "number,title,mergedAt,closingIssuesReferences",
+                 "--limit", str(limit)]
+            ) or []
+            out: list[MergedRef] = []
+            for p in data:  # type: ignore[union-attr]
+                pr = int(p.get("number") or 0)
+                merged_at = str(p.get("mergedAt") or "")
+                for ref in (p.get("closingIssuesReferences") or []):
+                    number = ref.get("number")
+                    if number:
+                        out.append(MergedRef(
+                            issue=int(number), pr=pr,
+                            title=str(ref.get("title") or ""), merged_at=merged_at,
+                        ))
+            return tuple(out)
+        except MissingListLimit:
+            raise
+        except Exception:  # noqa: BLE001 — see the section comment
+            return ()
+
+    def issue_state_reason(self, number: int) -> str:
+        """An issue's `stateReason`, lower-cased ("reopened" | "completed" |
+        "not_planned" | ""). Lower-cased because GitHub serves the GraphQL enum
+        (REOPENED), and `parse_issue` already normalises `state` the same way —
+        callers should compare against one casing, not two.
+
+        This is the DETERMINISTIC half of the recurrence signal. It is needed at
+        all because the harness merges to a non-default base branch, so GitHub
+        never auto-closes the referenced issue and the harness closes it itself:
+        "ai-done and open again" is therefore ambiguous (it can simply mean the
+        close has not happened yet), and only `reopened` says a human deliberately
+        put it back. "" on any failure — an unreadable state reason means "no
+        evidence of a recurrence", which is the silent, correct default.
+        """
+        try:
+            d = self._gh_json(
+                ["issue", "view", str(number), "--repo", self.repo,
+                 "--json", "stateReason"]
+            )
+            if not isinstance(d, dict):
+                return ""
+            return str(d.get("stateReason") or "").lower()
+        except Exception:  # noqa: BLE001 — see the section comment
             return ""
 
     def submit_review(self, pr: int, event: str, body: str) -> bool:

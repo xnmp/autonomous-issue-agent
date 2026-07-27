@@ -14,7 +14,7 @@ Async because AgentRunner.run is async (the SDK query is a coroutine).
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 from collections.abc import Callable
@@ -123,6 +123,11 @@ class DispatchConfig:
             triage=self.triage,
             triage_cfg=self.triage_cfg,
             log=self.log,
+            # The steward reads the FIXER's merged PRs (harness #10): "already
+            # shipped by this harness" means shipped by the fix bot, not by the
+            # steward's own identity.
+            fix_bot=self.fix_bot,
+            repo=self.repo,
         )
 
     def jira_workflow_config(self) -> JiraSyncWorkflowConfig:
@@ -159,7 +164,11 @@ class AgentDispatcher:
             self._run_logged,
         )
         self.steward_workflow = StewardWorkflow(
-            cfg.steward_workflow_config(), gateway, store, runner, executor
+            # The journal reaches the dispatcher as a constructor argument, not
+            # through DispatchConfig, so it is folded in here rather than being
+            # duplicated as a second config field that could disagree with it.
+            replace(cfg.steward_workflow_config(), journal=journal),
+            gateway, store, runner, executor,
         )
         self.jira_workflow = JiraSyncWorkflow(cfg.jira_workflow_config(), gateway, store, runner)
 

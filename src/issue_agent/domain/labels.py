@@ -33,6 +33,14 @@ class Label(str, Enum):
     AI_REVIEW = "ai-review"        # human-tagged: "reviewer-bot, please review this PR"
     NO_AI_REVIEW = "no-ai-review"  # human opt-OUT: never auto-adopt this PR for review
 
+    # ADVISORY marker: this issue re-reports something the harness already shipped
+    # (a literal reopen, or a new issue the triage classifier judged a refiling).
+    # Deliberately OUT of LIFECYCLE_LABELS: a recurrence is an OBSERVATION, not a
+    # pipeline position, so labelling an issue must not make it look "triaged" nor
+    # remove it from any selection set. Nothing is ever auto-reopened or
+    # auto-dispatched from it — a false positive costs one label removal.
+    RECURRENCE = "recurrence"
+
     # Steward outputs (never auto-promoted; a human disposes).
     AI_TRIAGE = "ai-triage"        # steward has seen it; awaiting author / human promote
     AI_SUGGESTION = "ai-suggestion"  # steward-filed suggestion issue
