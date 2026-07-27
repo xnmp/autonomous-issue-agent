@@ -40,6 +40,12 @@ DEFAULT_CODEX_MODEL = ""
 # Claude fixer runs in (permission_mode=bypassPermissions + governor).
 DEFAULT_SANDBOX = "danger-full-access"
 
+# `codex exec` left alone runs at reasoning effort LOW (observed in live
+# session_meta 2026-07-27) — too little thinking for an implementer writing
+# tests-first code. Medium is the deliberate default; operators override per
+# repo with CODEX_REASONING_EFFORT ("" = leave codex's own default alone).
+DEFAULT_REASONING_EFFORT = "medium"
+
 
 @dataclass(frozen=True)
 class CodexProvider:
@@ -108,6 +114,7 @@ def build_codex_argv(
     schema_path: str | None = None,
     output_path: str | None = None,
     inject_system_prompt: bool = True,
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT,
 ) -> list[str]:
     """Pure: AgentTask → `codex exec` argv. No subprocess, no I/O (the caller
     writes the schema/output temp files and passes their paths). Unit-tested.
@@ -140,6 +147,13 @@ def build_codex_argv(
     model = task.model or default_model
     if model:
         argv += ["-m", model]
+
+    # `codex exec`'s own default effort is LOW (observed in live session_meta,
+    # 2026-07-27) — an implementer tier that quietly under-thinks. Explicit on
+    # both paths (-c is legal on exec and resume); "" opts out entirely and
+    # leaves codex's default alone.
+    if reasoning_effort:
+        argv += ["-c", f"model_reasoning_effort={reasoning_effort}"]
 
     if is_resume:
         # danger-full-access equivalent that resume DOES accept.
@@ -508,6 +522,7 @@ class CodexRunner(AgentRuntime):
     provider: CodexProvider = field(default_factory=CodexProvider)
     sandbox: str = DEFAULT_SANDBOX
     default_model: str = DEFAULT_CODEX_MODEL
+    reasoning_effort: str = DEFAULT_REASONING_EFFORT
     env: dict[str, str] = field(default_factory=dict)
     # When the AGENT.md contract is delivered via the worktree AGENTS.md (the
     # default for the fix daemon), set False so the prompt isn't ALSO prepended
@@ -715,6 +730,7 @@ class CodexRunner(AgentRuntime):
                 schema_path=schema_path,
                 output_path=output_path,
                 inject_system_prompt=self.inject_system_prompt,
+                reasoning_effort=self.reasoning_effort,
             )
             result, exit_code, stderr, stdout, hung = await self._exec_once(
                 argv, run_task, output_path,

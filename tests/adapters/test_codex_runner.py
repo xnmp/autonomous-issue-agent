@@ -49,6 +49,30 @@ def test_argv_basic_shape():
     assert "-m" not in argv
 
 
+def test_argv_pins_medium_reasoning_effort_by_default():
+    # codex exec's own default is LOW (live session_meta 2026-07-27) — the
+    # harness pins medium so an implementer leg doesn't quietly under-think.
+    argv = build_codex_argv(AgentTask(prompt="x"))
+    assert "model_reasoning_effort=medium" in " ".join(argv)
+
+
+def test_argv_reasoning_effort_override_and_opt_out():
+    assert "model_reasoning_effort=high" in " ".join(
+        build_codex_argv(AgentTask(prompt="x"), reasoning_effort="high")
+    )
+    # "" = leave codex's own default alone — no pin at all.
+    assert "model_reasoning_effort" not in " ".join(
+        build_codex_argv(AgentTask(prompt="x"), reasoning_effort="")
+    )
+
+
+def test_argv_reasoning_effort_rides_the_resume_path_too():
+    # Follow-up legs resume; -c is legal on resume and the pin must not vanish
+    # exactly when the hard repair legs run.
+    argv = build_codex_argv(AgentTask(prompt="x", resume="0199-abc"))
+    assert "model_reasoning_effort=medium" in " ".join(argv)
+
+
 def test_argv_provider_overrides_inline():
     prov = CodexProvider(provider_id="acme", base_url="https://gw.example/v1")
     argv = build_codex_argv(AgentTask(prompt="x"), provider=prov)

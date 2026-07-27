@@ -350,6 +350,7 @@ def build_fix_daemon(
                 wire_api=codex_runtime.wire_api,
             ),
             sandbox=codex_runtime.sandbox,
+            reasoning_effort=codex_runtime.reasoning_effort,
             # AGENT.md reaches GPT-5.5 via the worktree AGENTS.md (below), so the
             # task's append_system_prompt must NOT also be prepended to the prompt
             # (that would duplicate the whole contract). Suppress it for codex.

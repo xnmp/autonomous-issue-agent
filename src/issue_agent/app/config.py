@@ -104,6 +104,7 @@ class CodexRuntimeConfig:
     env_key: str
     wire_api: str
     sandbox: str
+    reasoning_effort: str
     idle_timeout: float
     max_runtime: float
     transport_retries: int
@@ -265,6 +266,9 @@ class HarnessConfig:
     codex_env_key: str = "OPENAI_API_KEY"
     codex_wire_api: str = "responses"
     codex_sandbox: str = "danger-full-access"
+    # codex exec's own default is LOW effort (live session_meta, 2026-07-27);
+    # medium is the deliberate implementer default. "" = leave codex alone.
+    codex_reasoning_effort: str = "medium"
     # FIXER_RUNTIME=glm: path to a Claude Code PROFILE's settings.json (e.g.
     # ~/.cc-glm/settings.json). Its parent directory IS the profile dir, and both
     # the settings `env` block and the profile's `.env` are read at build time to
@@ -438,6 +442,7 @@ class HarnessConfig:
             env_key=self.codex_env_key,
             wire_api=self.codex_wire_api,
             sandbox=self.codex_sandbox,
+            reasoning_effort=self.codex_reasoning_effort,
             idle_timeout=self.agent_idle_timeout,
             max_runtime=self.agent_max_runtime,
             transport_retries=self.codex_transport_retries,
@@ -954,6 +959,9 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         codex_env_key=e.get("CODEX_ENV_KEY", _dc_default("codex_env_key")),
         codex_wire_api=e.get("CODEX_WIRE_API", _dc_default("codex_wire_api")),
         codex_sandbox=e.get("CODEX_SANDBOX", _dc_default("codex_sandbox")),
+        codex_reasoning_effort=e.get(
+            "CODEX_REASONING_EFFORT", _dc_default("codex_reasoning_effort")
+        ),
         glm_settings_file=e.get("GLM_SETTINGS_FILE", _dc_default("glm_settings_file")),
         agent_idle_timeout=_coerce_float(
             e, "AGENT_IDLE_TIMEOUT_SECONDS", _dc_default("agent_idle_timeout"), errors
