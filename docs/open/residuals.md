@@ -19,9 +19,11 @@ on a first real run:
 ### 1.1 Your spend caps may be structurally inert
 `ISSUE_SPEND_CAP_USD` and `DAILY_SPEND_CAP_USD` sum the cost ledger, and the
 ledger only gets a line when a run reports `cost_usd > 0`. On a subscription
-plan the SDK reports `0.00`; on Codex, cost exists only if you set
-`CODEX_COST_PER_MTOK_IN/OUT`. In both cases **the caps can never fire, for any
-loop shape**. The harness now emits one loud warning when settled runs keep
+plan the SDK reports `0.00` — **the caps can never fire, for any loop shape**.
+Codex is no longer in that bucket by default: `CODEX_COST_PER_MTOK_IN/OUT`
+default to gpt-5.6-sol list price (harness #4), so codex runs ledger synthetic
+dollars and the caps bound codex token volume — but explicitly setting both to
+`0` re-blinds them. The harness emits one loud warning when settled runs keep
 costing $0 while a cap is armed (review P1R-5) — believe the warning, not the
 `$0.00` on `issue-agent status`.
 
