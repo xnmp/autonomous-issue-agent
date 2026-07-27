@@ -41,7 +41,7 @@ _ISSUE_SUFFIXES = (
     "rebase-retries", "infra-deaths", "review-retries", "phase", "jira",
     "jira-phase",
 )
-_PR_SUFFIXES = ("session", "last-sha", "round", "automerge")
+_PR_SUFFIXES = ("session", "last-sha", "round", "automerge", "patch-id")
 
 # Closed-unmerged requeue cleanup (review M4/D8, handover §5.7): only the
 # resume-blocking markers are cleared — resolve-retries and infra-deaths are
@@ -242,6 +242,18 @@ class Store:
 
     def set_last_sha(self, pr: int, sha: str) -> None:
         self._write(self.pr_path(pr, "last-sha"), sha)
+
+    # ── reviewed-patch identity (harness #2) ──
+    # `domain.review.patch_signature` of the diff the last RECORDED review saw.
+    # The head SHA alone cannot tell a real revision from a mechanical rebase, so
+    # `last-sha` says WHICH commit was reviewed and this says WHAT was reviewed.
+    # Absent ("" — a PR last reviewed before this existed) means "unknown", which
+    # the reader must treat as "must review", never as "unchanged".
+    def get_last_patch_id(self, pr: int) -> str:
+        return self._read(self.pr_path(pr, "patch-id"))
+
+    def set_last_patch_id(self, pr: int, patch_id: str) -> None:
+        self._write(self.pr_path(pr, "patch-id"), patch_id)
 
     def get_round(self, pr: int) -> int:
         return self._read_int(self.pr_path(pr, "round"), default=1)

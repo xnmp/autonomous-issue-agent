@@ -17,6 +17,7 @@ from issue_agent.domain.review import (
     needs_initial_review,
     needs_re_review,
     parse_findings,
+    patch_signature,
     review_submission,
     synthesize_review,
     unproductive_ceiling_hit,
@@ -484,3 +485,132 @@ def test_gate_submission_approves():
     sub = gate_submission(prior_rejections=0, max_rejections=4)
     assert sub.event == "APPROVE" and sub.escalate is False
     assert "docs/formatting/config" in sub.body
+
+
+# ── rebase-invariant patch identity (harness #2) ──────────────────────────────
+# The behaviour under test is a MONEY decision: equal signature means the
+# reviewer may carry its verdict forward instead of buying another round, so the
+# tests are about which diff pairs are the same CHANGE, not about the hashing.
+
+_BEFORE = """diff --git a/app.py b/app.py
+index 1111111..2222222 100644
+--- a/app.py
++++ b/app.py
+@@ -10,7 +10,8 @@ def handler(req):
+     ctx = build(req)
+-    return ctx.render()
++    if ctx.empty:
++        return None
++    return ctx.render()
+"""
+
+# The same change after a mechanical rebase: new blob hashes (the base moved),
+# shifted hunk offsets (an unrelated hunk landed upstream), and a re-derived
+# section heading. Not one character of the change itself differs.
+_AFTER_REBASE = """diff --git a/app.py b/app.py
+index 3333333..4444444 100644
+--- a/app.py
++++ b/app.py
+@@ -42,7 +42,8 @@ def handler(req, opts):
+     ctx = build(req)
+-    return ctx.render()
++    if ctx.empty:
++        return None
++    return ctx.render()
+"""
+
+
+def test_a_mechanical_rebase_keeps_the_patch_signature():
+    # THE acceptance criterion: a force-push that only moved blob hashes and hunk
+    # offsets must be recognisable as the already-reviewed patch.
+    assert patch_signature(_BEFORE) == patch_signature(_AFTER_REBASE)
+
+
+def test_a_changed_body_line_changes_the_signature():
+    revised = _AFTER_REBASE.replace("return None", "return EMPTY")
+    assert patch_signature(revised) != patch_signature(_AFTER_REBASE)
+
+
+def test_an_added_line_changes_the_signature():
+    extended = _AFTER_REBASE.replace(
+        "+    return ctx.render()", "+    log(ctx)\n+    return ctx.render()"
+    )
+    assert patch_signature(extended) != patch_signature(_AFTER_REBASE)
+
+
+def test_changed_context_changes_the_signature():
+    # A rebase that pulled in an upstream edit ADJACENT to our change alters the
+    # context lines: the reviewer is looking at different code, so this must NOT
+    # be carried forward (matches `git patch-id`, which also hashes context).
+    moved = _AFTER_REBASE.replace("    ctx = build(req)", "    ctx = build(req, opts)")
+    assert patch_signature(moved) != patch_signature(_AFTER_REBASE)
+
+
+def test_touching_a_different_file_changes_the_signature():
+    other = _BEFORE.replace("app.py", "worker.py")
+    assert patch_signature(other) != patch_signature(_BEFORE)
+
+
+def test_a_second_file_changes_the_signature():
+    assert patch_signature(_BEFORE + _BEFORE.replace("app.py", "worker.py")) != (
+        patch_signature(_BEFORE)
+    )
+
+
+def test_a_rename_is_signature_stable_across_recomputed_similarity():
+    before = (
+        "diff --git a/old.py b/new.py\n"
+        "similarity index 96%\n"
+        "rename from old.py\n"
+        "rename to new.py\n"
+    )
+    after = before.replace("96%", "91%")
+    assert patch_signature(before) == patch_signature(after)
+
+
+def test_a_rename_to_a_different_path_changes_the_signature():
+    before = (
+        "diff --git a/old.py b/new.py\n"
+        "similarity index 96%\n"
+        "rename from old.py\n"
+        "rename to new.py\n"
+    )
+    assert patch_signature(before.replace("new.py", "other.py")) != patch_signature(before)
+
+
+def test_line_endings_are_not_a_patch_change():
+    assert patch_signature(_BEFORE.replace("\n", "\r\n")) == patch_signature(_BEFORE)
+
+
+def test_a_trailing_newline_is_not_a_patch_change():
+    assert patch_signature(_BEFORE) == patch_signature(_BEFORE.rstrip("\n"))
+
+
+def test_the_signature_is_deterministic_across_calls():
+    # It is compared against a value persisted by an EARLIER process, so a
+    # per-process salt (e.g. hash()) would silently disable the whole feature.
+    assert patch_signature(_BEFORE) == patch_signature(_BEFORE)
+
+
+def test_an_empty_diff_has_a_stable_signature():
+    assert patch_signature("") == patch_signature("")
+    assert patch_signature("") != patch_signature(_BEFORE)
+
+
+def test_malformed_input_is_total():
+    # Never raises: a crash here happens mid-poll on a PR with a verdict pending.
+    for bad in (None, 0, [], {"a": 1}, b"diff --git a/x b/x\n", "\x00\udcff not a diff"):
+        assert isinstance(patch_signature(bad), str)
+        assert len(patch_signature(bad)) == 64
+
+
+def test_a_diff_with_no_trailing_content_after_the_hunk_header_is_total():
+    assert isinstance(patch_signature("@@ -1 +1 @@"), str)
+
+
+def test_a_removed_index_like_body_line_is_not_stripped():
+    # `-index a..b 100644` is a DELETED LINE of a file that happens to look like a
+    # git header; stripping it would make two different patches collide.
+    with_body = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-index 1111111..2222222 100644\n+x\n"
+    without = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n+x\n"
+    assert patch_signature(with_body) != patch_signature(without)

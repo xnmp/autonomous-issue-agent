@@ -103,6 +103,7 @@ class FakeStore:
         self.pr_sessions = {}
         self.triage_at = {}
         self.last_sha = {}
+        self.last_patch_id = {}
         self.rounds = {}
         self.resumes = {}
         self.phases = {}
@@ -125,6 +126,12 @@ class FakeStore:
 
     def get_last_sha(self, p):
         return self.last_sha.get(p, "")
+
+    def set_last_patch_id(self, p, s):
+        self.last_patch_id[p] = s
+
+    def get_last_patch_id(self, p):
+        return self.last_patch_id.get(p, "")
 
     def set_round(self, p, n):
         self.rounds[p] = n
@@ -325,7 +332,9 @@ def test_resolve_routes_to_fix_workflow():
 
 def _split_dispatcher(gw, store, runner, wt=None, max_contract_rounds=2):
     cfg = DispatchConfig(
-        fix=FixTaskConfig("o/r", agent_md="AM"),
+        # Pinned model: split tests script exact run sequences; an unpinned
+        # config would prepend the difficulty-router leg (see test_fix_workflow).
+        fix=FixTaskConfig("o/r", agent_md="AM", model="m"),
         author_tests_split=True, max_contract_rounds=max_contract_rounds,
     )
     wt = wt or FakeWorktrees()

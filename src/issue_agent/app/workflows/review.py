@@ -123,6 +123,7 @@ class ReviewWorkflow:
         # only in the task builder (delegated attaches a code-scout subagent).
         p = self.gateway.get_pr(pr)
         diff = self.gateway.pr_diff(pr)
+        signature = review_dom.patch_signature(diff)
         if self.cfg.review_mode is review_dom.ReviewMode.DELEGATED:
             task = task_builders.build_delegated_review_task(
                 pr, p.title, p.body, diff, self.cfg.review
@@ -151,17 +152,25 @@ class ReviewWorkflow:
             return
         self.store.save_pr_session(pr, result.session_id)
         self.store.set_last_sha(pr, p.head_ref_oid)
+        self._record_patch(pr, signature)
         self.store.set_round(pr, 1)
         self._progress(p)
 
     async def re_review(self, pr: int) -> None:
-        if self.cfg.review_mode is review_dom.ReviewMode.MULTI:
-            await self._review_multi(pr, round_number=self.store.get_round(pr) + 1)
-            return
+        # The diff comes first, in EVERY mode: a head advance that leaves the
+        # patch unchanged (a mechanical rebase) must be settled by one `gh pr
+        # diff` rather than by a paid review round — most of all under MULTI,
+        # whose round is a gate + 5 dimensions + N validators (harness #2).
         p = self.gateway.get_pr(pr)
-        round_number = self.store.get_round(pr) + 1
-        last_sha = self.store.get_last_sha(pr)
         diff = self.gateway.pr_diff(pr)
+        signature = review_dom.patch_signature(diff)
+        if self._patch_unchanged(p, signature):
+            return
+        round_number = self.store.get_round(pr) + 1
+        if self.cfg.review_mode is review_dom.ReviewMode.MULTI:
+            await self._review_multi(pr, round_number=round_number, p=p, diff=diff)
+            return
+        last_sha = self.store.get_last_sha(pr)
         if self.cfg.review_mode is review_dom.ReviewMode.DELEGATED:
             # Fresh session (no resume) → feed the prior review body as reference
             # instead of replaying the transcript. Use the most recent review with a
@@ -196,8 +205,61 @@ class ReviewWorkflow:
             self._no_progress(p, "review POST failed")
             return
         self.store.set_last_sha(pr, p.head_ref_oid)
+        self._record_patch(pr, signature)
         self.store.set_round(pr, round_number)
         self._progress(p)
+
+    # ── rebase short-circuit (harness #2) ────────────────────────────────────
+    def _record_patch(self, pr: int, signature: str) -> None:
+        """Remember WHAT the review just looked at, next to `last-sha`'s WHICH.
+        Best-effort: a store that cannot record it only costs the next rebase a
+        review round, whereas raising here would undo a submitted verdict."""
+        try:
+            self.store.set_last_patch_id(pr, signature)
+        except Exception as exc:  # noqa: BLE001 — a cache write must never fail a review
+            self.cfg.log(f"review #{pr}: reviewed-patch id not persisted ({exc})")
+
+    def _patch_unchanged(self, p, signature: str) -> bool:
+        """True — and the skip is already committed — when the head SHA advanced
+        but the PATCH did not: a rebase/amend whose diff against the base is
+        identical modulo blob hashes and hunk offsets. The re-review could only
+        reach the verdict already sitting on the PR, so the approval is carried
+        forward (`require_last_push_approval=false` keeps GitHub's required
+        review satisfied across the force-push) and no review agent runs.
+
+        Advancing `last-sha` is what makes this a ONE-TIME skip rather than a new
+        per-poll loop: `decide_review` re-emits RE_REVIEW for as long as
+        `needs_re_review` is true, and that predicate reads `ReviewState.last_sha`,
+        which `app.roles._review_state` loads from exactly this `get_last_sha`
+        key. So the write below is the same state the decide loop reads, and the
+        next poll sees head == last_sha and dispatches nothing.
+
+        Fail-safe in both directions: no stored signature (a PR reviewed before
+        this existed) or an unreadable/unwritable store → return False and review
+        normally. An unreviewed revision must never be skipped; a redundant
+        review only costs money.
+        """
+        try:
+            stored = self.store.get_last_patch_id(p.number)
+        except Exception as exc:  # noqa: BLE001 — an unreadable cache means "review it"
+            self.cfg.log(f"re-review #{p.number}: reviewed-patch id unreadable ({exc})")
+            return False
+        if not stored or stored != signature:
+            return False
+        try:
+            self.store.set_last_sha(p.number, p.head_ref_oid)
+        except Exception as exc:  # noqa: BLE001 — without this write the skip would repeat
+            self.cfg.log(
+                f"re-review #{p.number}: unchanged patch, but last-sha could not be "
+                f"advanced ({exc}) — reviewing normally rather than skipping every poll"
+            )
+            return False
+        self.cfg.log(
+            f"re-review #{p.number}: head moved to {p.head_ref_oid[:8] or '?'} but the "
+            "patch is unchanged (mechanical rebase) — carrying the existing review "
+            "forward, no review agent run"
+        )
+        return True
 
     async def _gather_legs(self, coros: list) -> list:
         """asyncio.gather that never lets one leg's exception abort the fan-out.
@@ -214,7 +276,9 @@ class ReviewWorkflow:
             for r in results
         ]
 
-    async def _review_multi(self, pr: int, round_number: int) -> None:
+    async def _review_multi(
+        self, pr: int, round_number: int, p=None, diff: str | None = None
+    ) -> None:
         """The /code-review pattern as dispatcher orchestration: skip-gate →
         parallel dimension specialists → per-finding adversarial validation →
         pure synthesis. Fans the LLM legs out concurrently (each SDK query is its
@@ -226,9 +290,15 @@ class ReviewWorkflow:
         round re-derives findings from the CURRENT diff, so a re-review naturally
         re-checks the whole PR rather than only the incremental change. It stores
         a sentinel session id so the watcher's `needs_initial_review` (keyed on a
-        non-empty pr-session) flips to re-review on the next SHA advance."""
-        p = self.gateway.get_pr(pr)
-        diff = self.gateway.pr_diff(pr)
+        non-empty pr-session) flips to re-review on the next SHA advance.
+
+        `p`/`diff` are accepted pre-fetched so `re_review`'s rebase short-circuit
+        can inspect the diff before delegating here without paying for a second
+        `gh pr view`/`gh pr diff`; omitted (the initial-review path) they are
+        fetched here as before."""
+        p = self.gateway.get_pr(pr) if p is None else p
+        diff = self.gateway.pr_diff(pr) if diff is None else diff
+        signature = review_dom.patch_signature(diff)
         rcfg = self.cfg.review
         # Escalation counts the reviewer's OWN prior rejections, not pushes (a
         # rebase that lands here without a prior REQUEST_CHANGES must not consume a
@@ -253,7 +323,7 @@ class ReviewWorkflow:
                          f"({gate.field('reason') or 'no behavioural change'}) → APPROVE")
             sub = review_dom.gate_submission(prior, self.cfg.max_review_rejections)
             if self.gateway.submit_review(pr, sub.event, sub.body):
-                self._persist_review_state(pr, p.head_ref_oid, round_number)
+                self._persist_review_state(pr, p.head_ref_oid, round_number, signature)
                 self._progress(p)
             else:
                 self._no_progress(p, "gate APPROVE POST failed")
@@ -324,7 +394,7 @@ class ReviewWorkflow:
             return  # failed POST → leave state untouched (retried next poll)
         if sub.escalate:
             self._escalate(pr, prior + 1)
-        self._persist_review_state(pr, p.head_ref_oid, round_number)
+        self._persist_review_state(pr, p.head_ref_oid, round_number, signature)
         self._progress(p)
 
     def _progress(self, p) -> None:
@@ -352,12 +422,17 @@ class ReviewWorkflow:
             except Exception as exc:  # noqa: BLE001 — decay is best-effort, never fatal
                 self.cfg.log(f"review #{p.number}: no-progress counter not cleared ({exc})")
 
-    def _persist_review_state(self, pr: int, head_oid: str, round_number: int) -> None:
+    def _persist_review_state(
+        self, pr: int, head_oid: str, round_number: int, signature: str
+    ) -> None:
         """Advance per-PR review state after a confirmed submit. The multi-agent
         path has no SDK session to record, so a sentinel marks the PR reviewed-once
-        (so the watcher moves to re-review on the next SHA advance)."""
+        (so the watcher moves to re-review on the next SHA advance). `signature`
+        records WHAT was reviewed, so the next head advance can be classified as a
+        real revision or a mechanical rebase without paying for a round."""
         self.store.save_pr_session(pr, self.store.get_pr_session(pr) or "multi")
         self.store.set_last_sha(pr, head_oid)
+        self._record_patch(pr, signature)
         self.store.set_round(pr, round_number)
 
     def _submit_review(

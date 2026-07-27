@@ -9,6 +9,8 @@ reviews) — modelled here so the orchestration layer can honour it.
 
 from __future__ import annotations
 
+import hashlib
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -163,6 +165,59 @@ def needs_re_review(pr: PRView, state: ReviewState) -> bool:
         return False
     cur = pr.head_ref_oid
     return bool(cur) and cur != state.last_sha.get(pr.number, "")
+
+
+# ── rebase-invariant patch identity (harness #2) ──────────────────────────────
+# A force-push moves the head SHA even when the PR's diff against its base is
+# semantically identical (a mechanical rebase, an amended commit message, a
+# reordered-but-unchanged history). `needs_re_review` can only see the SHA, so
+# every such push used to buy a full paid re-review — three of them, ~$5 and
+# 5-10 minutes each, on one deployment. This is the cheap discriminator: hash
+# the diff after erasing exactly the parts a rebase perturbs.
+#
+# The two rebase-variant regions, and nothing else:
+#   * `index <blob>..<blob> <mode>` — blob hashes are recomputed against the new
+#     base (also `similarity index N%` on a rename, which git recomputes).
+#   * `@@ -a,b +c,d @@ <section>` — line offsets shift when unrelated hunks
+#     upstream of them move, and the trailing section heading is derived from
+#     surrounding context git found, not from the change.
+#
+# Everything else is kept VERBATIM — file headers, mode/rename lines and every
+# hunk body line (context, `+` and `-`). Keeping context lines is deliberate and
+# matches `git patch-id`: if the rebase pulled in upstream edits adjacent to our
+# change, the context differs and the signature must differ, because the reviewer
+# is now looking at different code.
+_INDEX_LINE = re.compile(r"^(?:index [0-9a-f]+\.\.[0-9a-f]+|(?:dis)?similarity index \d)")
+_HUNK_HEADER = re.compile(r"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@")
+
+
+def patch_signature(diff_text: object) -> str:
+    """Stable hex digest of a unified diff, invariant under a no-op rebase.
+
+    Two diffs share a signature iff they describe the same change to the same
+    files — blob hashes and hunk offsets excluded. Equal signature ⇒ a re-review
+    can only reach the verdict already on the PR, so the caller may carry that
+    approval forward instead of paying for the round.
+
+    TOTAL by construction (it gates a money decision, and a crash here would
+    strand the PR mid-poll): any input is coerced to text, an empty or malformed
+    diff simply hashes to whatever it hashes to. Line endings are normalised via
+    `splitlines`, so a CRLF/LF transport difference is not a patch change.
+    """
+    if isinstance(diff_text, str):
+        text = diff_text
+    elif diff_text is None:
+        text = ""
+    elif isinstance(diff_text, (bytes, bytearray)):
+        text = bytes(diff_text).decode("utf-8", "replace")
+    else:
+        text = str(diff_text)
+    normalized = [
+        "@@" if _HUNK_HEADER.match(line) else line
+        for line in text.splitlines()
+        if not _INDEX_LINE.match(line)
+    ]
+    return hashlib.sha256("\n".join(normalized).encode("utf-8", "replace")).hexdigest()
 
 
 def count_prior_rejections(reviews: tuple, review_bot: str) -> int:

@@ -163,6 +163,41 @@ def test_last_sha_and_round():
     assert s.get_round(100) == 3
 
 
+def test_last_patch_id_round_trips():
+    s, _ = _store()
+    s.set_last_patch_id(100, "deadbeef" * 8)
+    assert s.get_last_patch_id(100) == "deadbeef" * 8
+
+
+def test_an_unrecorded_patch_id_reads_as_unknown():
+    # "" is what the reviewer treats as "must review" — a PR reviewed before this
+    # existed must never look like an unchanged patch.
+    s, _ = _store()
+    assert s.get_last_patch_id(100) == ""
+
+
+def test_patch_id_is_per_pr():
+    s, _ = _store()
+    s.set_last_patch_id(100, "aaa")
+    s.set_last_patch_id(101, "bbb")
+    assert (s.get_last_patch_id(100), s.get_last_patch_id(101)) == ("aaa", "bbb")
+
+
+def test_patch_id_survives_the_process_that_wrote_it():
+    # It is compared against a value written by an EARLIER poll, possibly an
+    # earlier daemon process — an in-memory-only cache would silently no-op.
+    _, d = _store()
+    Store(state_dir=d).set_last_patch_id(100, "abc123")
+    assert Store(state_dir=d).get_last_patch_id(100) == "abc123"
+
+
+def test_a_merged_pr_forgets_its_reviewed_patch():
+    s, _ = _store()
+    s.set_last_patch_id(100, "abc123")
+    s.clear_pr_review(100)
+    assert s.get_last_patch_id(100) == ""
+
+
 def test_automerge_marker():
     s, _ = _store()
     assert s.automerge_enabled(100) is False
