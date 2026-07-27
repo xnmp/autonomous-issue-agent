@@ -154,6 +154,45 @@ def test_result_error_envelope():
     assert r.is_error is True
 
 
+def test_review_decision_becomes_the_run_status():
+    # The review schema names its terminal `decision`, not `status`, so a clean
+    # review used to journal status="" and the verdict lived only on the PR.
+    r = result_to_agent_result(
+        FakeResult(subtype="success",
+                   structured_output={"decision": "APPROVE", "body": "LGTM"})
+    )
+    assert r.status == "APPROVE"
+    assert r.is_error is False
+    assert r.exit_reason is ExitReason.OK
+
+
+def test_explicit_status_wins_over_decision():
+    r = result_to_agent_result(
+        FakeResult(structured_output={"status": "pr_opened", "decision": "APPROVE"})
+    )
+    assert r.status == "pr_opened"
+
+
+def test_errored_review_still_reports_the_envelope_error_kind():
+    # No terminal of either name → the SDK's own error subtype, unchanged.
+    r = result_to_agent_result(
+        FakeResult(is_error=True, subtype="error_max_turns", structured_output={"body": ""})
+    )
+    assert r.status == "error_max_turns"
+
+
+def test_non_string_terminal_is_ignored_rather_than_propagated():
+    # A malformed envelope must not put a non-str into the str-typed field; on an
+    # errored run the subtype fallback still fills it.
+    ok = result_to_agent_result(FakeResult(structured_output={"status": 7, "decision": None}))
+    bad = result_to_agent_result(
+        FakeResult(is_error=True, subtype="error_during_execution",
+                   structured_output={"decision": ["APPROVE"]})
+    )
+    assert ok.status == ""
+    assert bad.status == "error_during_execution"
+
+
 def test_result_falls_back_to_result_text_when_no_structured():
     msg = FakeResult(structured_output=None, result="free text")
     r = result_to_agent_result(msg)
