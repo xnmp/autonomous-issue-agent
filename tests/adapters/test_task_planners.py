@@ -674,3 +674,33 @@ def test_jira_sync_transition_when_key_present():
 def test_jira_sync_done_phrasing():
     t = build_jira_sync_task(5, "t", "b", JiraPhase.DONE, "ABC-12", JIRA_CFG)
     assert "done" in t.prompt.lower()
+
+
+def test_route_model_maps_tiers_within_the_active_runtime_family():
+    """A codex fixer must be routed to sol/terra/luna — handing it a Claude
+    alias it cannot resolve is a dispatch-time failure, not a routing choice."""
+    from issue_agent.app.planners.tasks import route_model
+
+    assert route_model("complex", "codex") == "gpt-5.6-sol"
+    assert route_model("standard", "codex") == "gpt-5.6-terra"
+    assert route_model("trivial", "codex") == "gpt-5.6-luna"
+    assert route_model("complex", "claude") == "opus"
+    assert route_model("trivial") == "haiku"
+
+
+def test_route_model_is_total_over_garbage_classifier_output():
+    """Schema drift or a garbage tier prices as `standard`; an unknown runtime
+    falls back to the Claude table — a router misfire degrades, never raises."""
+    from issue_agent.app.planners.tasks import route_model
+
+    assert route_model("nonsense", "codex") == "gpt-5.6-terra"
+    assert route_model("", "claude") == "sonnet"
+    assert route_model("complex", "gemini???") == "opus"
+
+
+def test_router_task_runs_on_the_active_runtimes_cheapest_tier():
+    from issue_agent.app.planners.tasks import build_router_task
+
+    assert build_router_task("t", "b", runtime="codex").model == "gpt-5.6-luna"
+    assert build_router_task("t", "b").model == "haiku"
+    assert build_router_task("t", "b", model="opus", runtime="codex").model == "opus"

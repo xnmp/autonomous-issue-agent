@@ -426,8 +426,38 @@ def build_rebase_task(
     )
 
 
-def build_router_task(title: str, body: str, model: str = "haiku") -> AgentTask:
+# Difficulty tier → model, PER FIXER RUNTIME. The Claude column is SDK aliases;
+# the codex column is the GPT-5.6 family (subscription default probed live
+# 2026-07-27: `codex exec` with no -m ran gpt-5.6-terra). Routing itself stays
+# trigger-gated (P4.1) — this table exists so the day it activates, a codex
+# fixer is routed within its own family instead of being handed a Claude alias
+# it cannot resolve.
+MODEL_TIERS: dict[str, dict[str, str]] = {
+    "claude": {"trivial": "haiku", "standard": "sonnet", "complex": "opus"},
+    "codex": {
+        "trivial": "gpt-5.6-luna",
+        "standard": "gpt-5.6-terra",
+        "complex": "gpt-5.6-sol",
+    },
+}
+
+
+def route_model(tier: str, runtime: str = "claude") -> str:
+    """Model for a routed difficulty tier under the given fixer runtime.
+
+    Total on classifier output: an unknown tier (schema drift, garbage) prices
+    as the runtime's `standard`, and an unknown runtime falls back to the
+    Claude table — a router misfire must degrade to a sane model, never raise
+    inside dispatch."""
+    tiers = MODEL_TIERS.get(runtime) or MODEL_TIERS["claude"]
+    return tiers.get(tier) or tiers["standard"]
+
+
+def build_router_task(
+    title: str, body: str, model: str = "", runtime: str = "claude"
+) -> AgentTask:
     """route_model: cheap difficulty classifier (no system prompt, no tools).
+    Runs on the active runtime's own cheapest tier unless `model` overrides.
 
     Carries FIXER_DENY too: it is fed a raw, attacker-controllable issue body and
     runs on the fix daemon's bypassPermissions runner, so "no tools" must be
@@ -442,7 +472,7 @@ def build_router_task(title: str, body: str, model: str = "haiku") -> AgentTask:
     )
     return AgentTask(
         prompt=prompt, schema=ROUTER_SCHEMA, disallowed_tools=FIXER_DENY,
-        model=model, max_budget_usd=0.10,
+        model=model or route_model("trivial", runtime), max_budget_usd=0.10,
     )
 
 
