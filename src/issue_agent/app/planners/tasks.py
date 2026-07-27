@@ -514,7 +514,7 @@ def build_router_task(
     )
     return AgentTask(
         prompt=prompt, schema=ROUTER_SCHEMA, disallowed_tools=FIXER_DENY,
-        model=model or route_model("trivial", runtime), max_budget_usd=0.10,
+        model=model or route_model("trivial", runtime), max_budget_usd=2.00,
     )
 
 
