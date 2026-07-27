@@ -1,5 +1,13 @@
 # Handover — optimization session (fix issues #2–#9, then resume deployment)
 
+> **COMPLETED 2026-07-27** (commits f1b3e2d…c904db7): issues #2–#9 all closed;
+> tauri-explorer#544 landed as per-issue lessons files via PR #548 (code-map
+> fragments deliberately descoped — see the PR body); plus a new
+> `FIXER_RUNTIME=glm` option (755dd41, operator request). The first live review
+> after deploy journaled `status=APPROVE` (#7 verified). Still open: #1
+> (webhook push) and `issue-agent init` not offering glm. Next: resume
+> deployment per the section below.
+
 Written 2026-07-27 ~05:00 UTC at the end of the third deployment day
 ([session record](2026-07-27-third-deployment-session.md) — read it for the
 full narrative; this file is the working brief for the NEXT session).
