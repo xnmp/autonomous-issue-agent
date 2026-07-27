@@ -16,6 +16,7 @@ isolation, and structured output that our fixer depends on.
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import re
@@ -178,11 +179,15 @@ def build_codex_argv(
 # the ledger write is gated on `cost > 0` (journal.py), and BOTH spend caps are
 # blind to every codex run by construction (review M1).
 #
-# Two stderr shapes seen across codex-cli versions. Both are matched WITHIN one
-# line (never spanning lines), so an "input=" from one trace line and an
-# "output=" from another can never be stitched into a fake usage report:
+# Three stderr shapes seen across codex-cli versions. The first two are matched
+# WITHIN one line (never spanning lines), so an "input=" from one trace line and
+# an "output=" from another can never be stitched into a fake usage report:
 #   "Token usage: total=52341 input=48000 (+ 12000 cached) output=4341"
 #   "tokens used: 52341"           (older exec builds — total only, no split)
+# The third (codex-cli 0.145.x) puts the count on the NEXT line, so it is the
+# one sanctioned two-line pairing: a bare "tokens used" header followed
+# IMMEDIATELY by a digits-only line — nothing else can pair across lines:
+#   "tokens used\n1,820"
 _TOKEN_SPLIT_RE = re.compile(
     r"input[\s_-]*(?:tokens)?[=:\s]+([\d,]+)"
     r"(?:[^\d]{0,20}\+\s*([\d,]+)\s*cached)?"
@@ -193,6 +198,8 @@ _TOKEN_TOTAL_RE = re.compile(
     r"tokens?[\s_-]*used[=:\s]+([\d,]+)|token[\s_-]*usage[^\d]{0,20}total[=:\s]+([\d,]+)",
     re.IGNORECASE,
 )
+_TOKEN_HEADER_RE = re.compile(r"^\s*tokens?[\s_-]*used\s*:?\s*$", re.IGNORECASE)
+_TOKEN_BARE_COUNT_RE = re.compile(r"^\s*([\d,]+)\s*$")
 
 
 def _int_tokens(raw: str | None) -> int:
@@ -224,7 +231,20 @@ def parse_codex_usage(stderr: str) -> dict | None:
     hole M1 describes. Last-match-wins already makes codex's own trailing line
     beat anything the agent echoed earlier."""
     found: dict | None = None
+    header_pending = False
     for line in (stderr or "").splitlines():
+        if header_pending:
+            header_pending = False
+            m3 = _TOKEN_BARE_COUNT_RE.match(line)
+            if m3:
+                found = {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "total_tokens": _int_tokens(m3.group(1)),
+                }
+                continue
         m = _TOKEN_SPLIT_RE.search(line)
         if m:
             found = {
@@ -243,7 +263,65 @@ def parse_codex_usage(stderr: str) -> dict | None:
                 "cache_creation_input_tokens": 0,
                 "total_tokens": _int_tokens(m2.group(1) or m2.group(2)),
             }
+            continue
+        header_pending = bool(_TOKEN_HEADER_RE.match(line))
     return found
+
+
+def read_rollout_usage(session_id: str, codex_home: str | None = None) -> dict | None:
+    """Exact token counters from codex's own session rollout file, or None.
+
+    codex-cli persists `token_count` events (with a cumulative
+    `total_token_usage` split) to
+    `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ts>-<session_id>.jsonl`. This is
+    the PREFERRED usage source: the stderr line degraded to a total-only shape
+    in codex-cli 0.145 and a total priced at max(rate_in, rate_out) counts
+    cached reads at the $30/MTok output rate — a single warm resolve (~1.6M
+    total, ~99% cached input) would ledger ≈$48 and spuriously trip the $50
+    issue cap, where the real split prices it ≈$8.
+
+    Last `token_count` wins: the counter is cumulative for the session, same
+    convention as the stderr line (see parse_codex_usage). Any failure — no
+    session id, no file, unparseable lines — reads as None so the caller falls
+    back to stderr parsing; losing precision must never lose the run.
+    """
+    if not session_id:
+        return None
+    home = codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    try:
+        pattern = os.path.join(
+            home, "sessions", "**", f"rollout-*-{session_id}.jsonl"
+        )
+        paths = glob.glob(pattern, recursive=True)
+        if not paths:
+            return None
+        found: dict | None = None
+        with open(max(paths, key=os.path.getmtime)) as f:
+            for line in f:
+                if '"token_count"' not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                payload = event.get("payload") or {}
+                if payload.get("type") != "token_count":
+                    continue
+                total = (payload.get("info") or {}).get("total_token_usage") or {}
+                if total:
+                    found = total
+        if not found:
+            return None
+        return {
+            "input_tokens": int(found.get("input_tokens", 0) or 0),
+            "output_tokens": int(found.get("output_tokens", 0) or 0),
+            "cache_read_input_tokens": int(found.get("cached_input_tokens", 0) or 0),
+            "cache_creation_input_tokens": int(
+                found.get("cache_write_input_tokens", 0) or 0
+            ),
+        }
+    except Exception:  # noqa: BLE001 — accounting fallback must never kill a run
+        return None
 
 
 def codex_cost_usd(
@@ -331,16 +409,19 @@ def parse_codex_envelope(
     stderr: str = "",
     cost_per_mtok_in: float = 0.0,
     cost_per_mtok_out: float = 0.0,
+    usage: dict | None = None,
 ) -> AgentResult:
     """Pure: codex exec result → AgentResult. Mirrors result_to_agent_result —
     decision read from the ENVELOPE (the -o JSON), not the exit code. is_error
     only when there is no parseable envelope AND exit was non-zero, OR the
     envelope itself signals an error status.
 
-    Token usage is read off `stderr` (codex's only usage report) and priced with
-    the caller's rates — review M1: this is what makes codex spend visible to the
-    ledger and therefore to both spend caps. A run that DIED still burned tokens,
-    so usage/cost ride on every return path, not just the happy one."""
+    Token usage: a caller-supplied `usage` (the exact split from the session
+    rollout file, see read_rollout_usage) wins; otherwise it is read off
+    `stderr` and priced with the caller's rates — review M1: this is what makes
+    codex spend visible to the ledger and therefore to both spend caps. A run
+    that DIED still burned tokens, so usage/cost ride on every return path, not
+    just the happy one."""
     structured: dict | None = None
     raw = (last_message or "").strip()
     if raw:
@@ -351,7 +432,7 @@ def parse_codex_envelope(
         except (json.JSONDecodeError, ValueError):
             structured = None
 
-    usage = parse_codex_usage(stderr)
+    usage = usage or parse_codex_usage(stderr)
     cost = codex_cost_usd(
         usage, cost_per_mtok_in=cost_per_mtok_in, cost_per_mtok_out=cost_per_mtok_out
     )
@@ -903,6 +984,7 @@ class CodexRunner(AgentRuntime):
             stderr=stderr,
             cost_per_mtok_in=self.cost_per_mtok_in,
             cost_per_mtok_out=self.cost_per_mtok_out,
+            usage=read_rollout_usage(session_id),
         )
         if exit_code < 0 and not hung:
             # A NEGATIVE returncode means terminated by signal -exit_code, and we did

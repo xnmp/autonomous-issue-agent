@@ -17,6 +17,7 @@ from issue_agent.adapters.codex_runner import (
     DEFAULT_SANDBOX,
     CodexProvider,
     CodexRunner,
+    read_rollout_usage,
     _extract_retry_after_seconds,
     _is_rate_limited,
     _is_transport_drop,
@@ -955,6 +956,97 @@ def test_usage_is_none_when_codex_printed_no_token_line():
 def test_usage_takes_the_last_line_because_codex_totals_are_cumulative():
     stderr = "Token usage: input=10 output=5\nmore work\nToken usage: input=90 output=40"
     assert parse_codex_usage(stderr)["input_tokens"] == 90
+
+
+# codex-cli 0.145.x split the total-only report across two lines (observed live
+# 2026-07-27 — every run journaled usage=None/cost $0 and the caps went blind):
+#   "tokens used\n1,820"
+_TWO_LINE_USAGE = "codex\nok\ntokens used\n1,820\n"
+
+
+def test_usage_read_from_the_two_line_total_shape():
+    u = parse_codex_usage(_TWO_LINE_USAGE)
+    assert u["total_tokens"] == 1820
+    assert u["input_tokens"] == 0 and u["output_tokens"] == 0
+
+
+def test_two_line_shape_requires_adjacency_and_a_bare_count():
+    # A stray number further from the header must NOT be stitched into a usage
+    # report — only the immediately-following digits-only line pairs.
+    assert parse_codex_usage("tokens used\nexit code 0\n1,820\n") is None
+    # A count line with prose around the digits is not a count.
+    assert parse_codex_usage("tokens used\nabout 1,820 or so\n") is None
+
+
+def test_read_rollout_usage_prefers_last_cumulative_token_count(tmp_path):
+    sid = "019fa244-56c7-7de0-8e18-e56f423bbbcc"
+    day = tmp_path / "sessions" / "2026" / "07" / "27"
+    day.mkdir(parents=True)
+    lines = [
+        {"type": "session_meta", "payload": {"type": "session_meta"}},
+        {"payload": {"type": "token_count", "info": {"total_token_usage": {
+            "input_tokens": 100, "cached_input_tokens": 50,
+            "cache_write_input_tokens": 0, "output_tokens": 10,
+            "total_tokens": 110}}}},
+        {"payload": {"type": "token_count", "info": {"total_token_usage": {
+            "input_tokens": 54019, "cached_input_tokens": 35328,
+            "cache_write_input_tokens": 7, "output_tokens": 604,
+            "total_tokens": 54623}}}},
+    ]
+    (day / f"rollout-2026-07-27T16-30-15-{sid}.jsonl").write_text(
+        "\n".join(json.dumps(x) for x in lines) + "\n"
+    )
+    u = read_rollout_usage(sid, codex_home=str(tmp_path))
+    assert u == {
+        "input_tokens": 54019,
+        "output_tokens": 604,
+        "cache_read_input_tokens": 35328,
+        "cache_creation_input_tokens": 7,
+    }
+
+
+def test_read_rollout_usage_is_none_when_file_or_session_missing(tmp_path):
+    assert read_rollout_usage("", codex_home=str(tmp_path)) is None
+    assert read_rollout_usage("no-such-session", codex_home=str(tmp_path)) is None
+    # Corrupt rollout (unparseable lines, no token_count) reads as None, not a raise.
+    day = tmp_path / "sessions" / "2026" / "07" / "27"
+    day.mkdir(parents=True)
+    (day / "rollout-2026-07-27T00-00-00-badf00d.jsonl").write_text(
+        '{"payload": {"type": "token_count"\nnot json at all\n'
+    )
+    assert read_rollout_usage("badf00d", codex_home=str(tmp_path)) is None
+
+
+def test_envelope_prefers_caller_supplied_rollout_usage_over_stderr():
+    # The rollout split prices a warm cached session at the input rate; the
+    # stderr total-only shape would price the same tokens at max(rate) and
+    # spuriously trip the issue cap.
+    r = parse_codex_envelope(
+        exit_code=0,
+        last_message='{"status": "pr_opened", "summary": "done"}',
+        stderr=_TWO_LINE_USAGE,
+        cost_per_mtok_in=5.0,
+        cost_per_mtok_out=30.0,
+        usage={
+            "input_tokens": 1_000_000, "output_tokens": 10_000,
+            "cache_read_input_tokens": 900_000, "cache_creation_input_tokens": 0,
+        },
+    )
+    assert r.usage["input_tokens"] == 1_000_000
+    assert r.cost_usd == (1_000_000 * 5.0 + 10_000 * 30.0) / 1_000_000.0
+
+
+def test_envelope_falls_back_to_stderr_usage_when_no_rollout():
+    r = parse_codex_envelope(
+        exit_code=0,
+        last_message='{"status": "pr_opened", "summary": "done"}',
+        stderr=_TWO_LINE_USAGE,
+        cost_per_mtok_in=5.0,
+        cost_per_mtok_out=30.0,
+    )
+    assert r.usage["total_tokens"] == 1820
+    # Total-only prices at the HIGHER rate — over-estimation is the safe direction.
+    assert r.cost_usd == 1820 * 30.0 / 1_000_000.0
 
 
 def test_cost_prices_input_and_output_at_their_own_rates():
