@@ -1,8 +1,9 @@
-"""Hot reload — the restart may only ever fire between ticks, and a broken
-watch must cost hot reload, never the daemon."""
+"""Hot reload — commit-gated (partial edits cannot load), fires only between
+ticks, and a broken watch costs hot reload, never the daemon."""
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 
 import pytest
@@ -13,48 +14,54 @@ from issue_agent.app.loop import Daemon
 from issue_agent.domain.world import WorldState
 
 
-def _tree(tmp_path):
-    src = tmp_path / "src"
-    src.mkdir()
-    f = src / "a.py"
-    f.write_text("x = 1\n")
-    return src, f
+def _git(repo, *args):
+    subprocess.run(
+        ["git", "-C", str(repo), *args], check=True, capture_output=True,
+        env={**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"},
+    )
 
 
-def test_watch_detects_edits_additions_and_deletions(tmp_path):
-    src, f = _tree(tmp_path)
-    w = ReloadWatch(roots=(str(src),))
+def _repo(tmp_path):
+    _git(tmp_path, "init", "-q")
+    (tmp_path / "a.py").write_text("x = 1\n")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "one")
+    return tmp_path
+
+
+def test_uncommitted_edits_do_not_trigger_but_a_commit_does(tmp_path):
+    """The whole point: a mid-edit save (half of a multi-file change) must NOT
+    reload the daemon; the commit — the 'this tree is coherent' signal — must."""
+    repo = _repo(tmp_path)
+    w = ReloadWatch(str(repo))
     assert w.changed() is False
 
-    os.utime(f, (time.time() + 5, time.time() + 5))       # edit (mtime bump)
+    (repo / "a.py").write_text("x = 2\n")          # dirty tree, no commit
+    (repo / "b.py").write_text("y = 1\n")
+    assert w.changed() is False
+
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "two")
     assert w.changed() is True
 
-    w2 = ReloadWatch(roots=(str(src),))
-    (src / "b.py").write_text("y = 2\n")                   # addition
-    assert w2.changed() is True
 
-    w3 = ReloadWatch(roots=(str(src),))
-    f.unlink()                                             # deletion
-    assert w3.changed() is True
-
-
-def test_watch_ignores_unwatched_suffixes_and_survives_missing_roots(tmp_path):
-    src, _ = _tree(tmp_path)
-    w = ReloadWatch(roots=(str(src),))
-    (src / "scratch.log").write_text("noise\n")            # not a watched suffix
-    assert w.changed() is False
-    # A root that never existed fingerprints as empty — no crash, no restart loop.
-    w2 = ReloadWatch(roots=(str(tmp_path / "nope"),))
-    assert w2.changed() is False
-
-
-def test_explicit_files_are_watched(tmp_path):
-    src, _ = _tree(tmp_path)
+def test_the_env_file_is_the_one_mtime_watched_exception(tmp_path):
+    """AGENT_ENV is gitignored by design, so commits can never carry it; an
+    operator edit to it is a single atomic save and reloads directly."""
+    repo = _repo(tmp_path)
     env = tmp_path / "active.env"
     env.write_text("A=1\n")
-    w = ReloadWatch(roots=(str(src),), files=(str(env),))
+    w = ReloadWatch(str(repo), files=(str(env),))
+    assert w.changed() is False
     os.utime(env, (time.time() + 5, time.time() + 5))
     assert w.changed() is True
+
+
+def test_a_non_repo_or_missing_env_file_never_flaps(tmp_path):
+    w = ReloadWatch(str(tmp_path / "not-a-repo"), files=(str(tmp_path / "nope"),))
+    assert w.changed() is False
+    assert w.changed() is False
 
 
 class _Gw:
