@@ -218,6 +218,13 @@ The fixer picks the highest-priority `ai-ready` issue, opens a PR against `dev`,
 the reviewer reviews, CI runs, and (with `AUTO_MERGE=1`) it merges itself. You
 get a GitHub notification only when an agent is genuinely blocked.
 
+For throughput, label `ai-ready` issues from **disjoint code areas** rather than
+several from the same one. `pick_ready_issue` holds back any `ai-ready` issue
+whose declared paths overlap an open harness PR, so three issues all touching
+(say) `scm/` run single-file, one after another; one `scm` + one `git-graph` +
+one `command-palette` issue instead run concurrently, roughly doubling
+throughput with zero code change.
+
 ### Watch the whole loop on a throwaway repo
 ```bash
 DEMO_REPO=you/calc-demo bash examples/demo-target/init-demo.sh
