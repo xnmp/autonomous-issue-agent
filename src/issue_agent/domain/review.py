@@ -258,6 +258,14 @@ def count_outstanding_change_requests(reviews: tuple, fix_bot: str) -> int:
     converging as the review bot's, and the fixer cannot tell them apart
     anyway.
 
+    Note the fail direction is INVERTED relative to its twin, deliberately: the
+    twin SELECTS `login_eq(...)`, so an unset bot login counts nothing; this one
+    EXCLUDES it, so an unset `fix_bot` excludes nothing and every rejection
+    counts. Over-counting is the safe direction here (worst case: escalating an
+    already-struggling PR), and GitHub forbids a PR's author from submitting
+    APPROVE/REQUEST_CHANGES on their own PR, so there is in practice nothing of
+    ours to over-count.
+
     Same two properties as its twin, for the same reasons: an APPROVE resets
     the count (prior dissatisfaction was satisfied), and author pushes are not
     rejections. Derived purely from GitHub review state, so it is correct

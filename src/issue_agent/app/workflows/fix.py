@@ -194,12 +194,32 @@ class FixWorkflow:
         that repairs its output — the asymmetry being worst precisely on an
         issue the harness already failed once. One gateway read against a paid
         session is a rounding error; a read that fails costs the signal, not the
-        dispatch."""
-        return self._try(lambda: self.gateway.get_issue(issue), None)
+        dispatch — logged, so "why didn't it escalate" stays answerable."""
+        try:
+            return self.gateway.get_issue(issue)
+        except Exception as exc:  # noqa: BLE001 — see docstring
+            self.cfg.log(
+                f"agent #{issue}: recurrence signal unavailable ({exc}); "
+                "escalating on the remaining evidence only"
+            )
+            return None
 
     def _journal_escalation(self, issue: int, leg: str, before: Stance, after: Stance,
-                            signals: EscalationSignals) -> None:
-        """Record the rung this leg climbed, and why.
+                            signals: EscalationSignals, model: str | None,
+                            tiered: bool) -> None:
+        """Record the rung this leg climbed, and why. ONE event per escalated
+        leg — `leg` distinguishes them, so "how many legs ran escalated" is a
+        group-by, not an inference.
+
+        The event may only report what actually reached the dispatch. A repair
+        leg has NO tier (it keeps the resumed session's model), so `tiered` is
+        False there and both tier fields are null rather than the DEFAULT_TIER
+        placeholder `_escalated` needs internally to have something to climb
+        from. Reporting that placeholder would attribute a sonnet repair leg to
+        `complex` in exactly the `group_by(.to_tier)` that CLAUDE.md makes the
+        load-bearing routing guardrail — the metric this event exists to keep
+        honest. `model` is the model that ran, so the split is derivable from
+        what happened rather than from a hypothetical stance.
 
         Named `route_escalation`, NOT `escalation`: that event name already means
         "handed to a human" (`app.execute` emits it on a needs-human-review move,
@@ -214,8 +234,10 @@ class FixWorkflow:
             journal.emit(
                 "route_escalation", issue=issue, leg=leg,
                 notches=signals.notches(),
-                from_tier=before.tier, to_tier=after.tier,
+                from_tier=before.tier if tiered else None,
+                to_tier=after.tier if tiered else None,
                 from_effort=before.effort.value, to_effort=after.effort.value,
+                model=model or "",
                 recurrence=signals.recurrence,
                 resolve_retries=signals.resolve_retries,
                 review_rounds=signals.review_rounds,
@@ -261,13 +283,21 @@ class FixWorkflow:
             task_builders.route_model(stance.tier, self.cfg.fixer_runtime)
             if tier is not None else cfg.model
         )
+        # Same rule as the journal: name the tier move only when this leg chose
+        # a tier, so the log cannot claim a climb the dispatch did not make.
+        move = (
+            f"tier {base.tier}→{stance.tier}, " if tier is not None
+            else f"model {model or '(runtime default)'} kept, "
+        )
         self.cfg.log(
             f"agent #{issue}: {leg} — escalating {notches} notch(es) "
             f"(recurrence={signals.recurrence}, resolve_retries={signals.resolve_retries}, "
             f"review_rounds={signals.review_rounds}): "
-            f"tier {base.tier}→{stance.tier}, effort {base.effort.value}→{stance.effort.value}"
+            f"{move}effort {base.effort.value}→{stance.effort.value}"
         )
-        self._journal_escalation(issue, leg, base, stance, signals)
+        self._journal_escalation(
+            issue, leg, base, stance, signals, model, tiered=tier is not None
+        )
         return dataclasses.replace(cfg, model=model, effort=stance.effort)
 
     def _repair_fix_cfg(
@@ -280,11 +310,11 @@ class FixWorkflow:
         cfg = self.cfg.fix
         if cfg is None:
             return cfg
-        return self._escalated(
-            cfg, issue, leg,
-            iss=iss if iss is not None else self._issue_for_signals(issue),
-            review_rounds=review_rounds,
-        )
+        # Behind the kill switch: with escalation off nothing reads the labels,
+        # so paying a `gh issue view` per repair leg would be pure waste.
+        if iss is None and self.cfg.escalate_on_evidence:
+            iss = self._issue_for_signals(issue)
+        return self._escalated(cfg, issue, leg, iss=iss, review_rounds=review_rounds)
 
     async def _routed_fix_cfg(self, issue: int, iss) -> FixTaskConfig:
         """Difficulty-routed, evidence-escalated FixTaskConfig for a RESOLVE
@@ -569,6 +599,11 @@ class FixWorkflow:
         )
         task = task_builders.build_fix_ci_task(
             pr, failed, failed_log, cwd, self.store.get_session(issue),
+            # No `review_rounds` here (nor on `rebase`), though `p.reviews` is in
+            # hand: review dissatisfaction is evidence about the RESOLUTION, and
+            # a red pipeline or a conflicted branch is a different failure mode.
+            # Spending the ladder on it would charge the wrong leg for the
+            # reviewer's objections. Recurrence and resolve retries still apply.
             self._repair_fix_cfg(issue, "fix-ci"),
             mcp_servers=mcp_servers,
         )

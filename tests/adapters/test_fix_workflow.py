@@ -1284,7 +1284,76 @@ def test_escalations_are_journalled_so_the_tier_split_stays_measurable():
     assert fields["issue"] == 5
     assert (fields["from_effort"], fields["to_effort"]) == ("medium", "high")
     assert (fields["from_tier"], fields["to_tier"]) == ("standard", "standard")
+    assert fields["model"] == "sonnet", "the split must be derivable from what RAN"
     assert fields["recurrence"] is True
+
+
+def test_a_repair_legs_event_reports_no_tier_because_it_chose_none():
+    """The event feeds `group_by(.to_tier)` — CLAUDE.md's load-bearing routing
+    guardrail. A repair leg keeps its resumed session's model, so reporting the
+    placeholder tier `_escalated` climbs from internally would attribute a
+    sonnet leg to `complex` in exactly that split."""
+    gw = FakeGateway(prs={100: _pr_with_rounds(4)}, issues={5: IssueView(5)})
+    journal = RecordingJournal()
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s5"))
+
+    asyncio.run(_workflow(
+        gw, FakeStore(), runner, journal=journal,
+        fix=FixTaskConfig("o/r", agent_md="AM", model="sonnet"),
+    ).address_review(100))
+
+    assert runner.tasks[0].model == "sonnet"
+    (event, fields), = journal.events
+    assert event == "route_escalation"
+    assert fields["notches"] >= 2, "enough evidence to have climbed a tier, had it one"
+    assert (fields["from_tier"], fields["to_tier"]) == (None, None)
+    assert fields["model"] == "sonnet", "what actually ran"
+    assert (fields["from_effort"], fields["to_effort"]) == ("medium", "high")
+
+
+def test_the_kill_switch_costs_no_gateway_read_on_a_repair_leg():
+    """With escalation off nothing reads the labels, so the recurrence fetch is
+    pure waste — one `gh issue view` per repair dispatch, forever."""
+
+    class CountingGateway(FakeGateway):
+        issue_reads = 0
+
+        def get_issue(self, n):
+            type(self).issue_reads += 1
+            return super().get_issue(n)
+
+    gw = CountingGateway(prs={100: _pr_with_rounds(4)}, issues={5: IssueView(5)})
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s5"))
+
+    asyncio.run(_workflow(
+        gw, FakeStore(), runner, escalate_on_evidence=False,
+        fix=FixTaskConfig("o/r", agent_md="AM", model="sonnet"),
+    ).address_review(100))
+
+    assert CountingGateway.issue_reads == 0
+    assert runner.tasks[0].effort is None
+
+
+def test_the_resume_leg_does_not_refetch_the_issue_it_already_holds():
+    class CountingGateway(FakeGateway):
+        issue_reads = 0
+
+        def get_issue(self, n):
+            type(self).issue_reads += 1
+            return super().get_issue(n)
+
+    iss = IssueView(
+        5, title="t", body="b",
+        comments=(Comment("a-human", "please continue", "2026-01-02T00:00:00Z"),),
+    )
+    gw = CountingGateway(issues={5: iss}, pr_for_issue={})
+    runner = FakeRunner(AgentResult(is_error=False, status="pr_opened", session_id="s5"))
+
+    asyncio.run(_workflow(
+        gw, FakeStore(), runner, fix=FixTaskConfig("o/r", agent_md="AM", model="sonnet"),
+    ).resume(5))
+
+    assert CountingGateway.issue_reads == 1, "the resume leg already holds the IssueView"
 
 
 def test_nothing_is_journalled_when_nothing_escalated():
