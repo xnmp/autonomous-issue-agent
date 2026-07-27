@@ -152,19 +152,36 @@ don't keep going back to edit it — each re-plan costs a full model round-trip.
        — it never returns and burns your whole budget waiting. If the repo's
        Playwright config has a `webServer` block it already does all of this for
        you; prefer that and start nothing yourself.
-   Either way, COMMIT the screenshot before step 8 (the §10 red-check transiently
-   reverts the impl and re-runs the tests, which could overwrite a test-produced
-   screenshot in the working tree with a reverted-state image — the COMMITTED blob is
-   what the reviewer sees, so commit the good one first). Then **Read every screenshot
+   Either way, COMMIT the screenshot before opening the PR (the PR gate's red-check
+   transiently reverts the impl and re-runs the tests, which could overwrite a
+   test-produced screenshot in the working tree with a reverted-state image — the
+   COMMITTED blob is what the reviewer sees, so commit the good one first). Evidence
+   must exist before the PR, NOT before the adversarial review — capture may run
+   concurrently with it (step 8). Then **Read every screenshot
    you captured** with the Read tool and confirm it actually shows the criterion met.
    A screenshot you did not Read blocks PR creation (the gate requires you to have
    looked at it), and one that does not genuinely constitute the evidence will be
    rejected by the reviewer — so verify it really demonstrates the behaviour first.
 7. `docs:` update folder `CLAUDE.md` with anything non-obvious you learned.
-8. Spawn the adversarial pre-PR subagent (fresh context, given only the diff +
-   evidence + acceptance criteria). It must return PASS. Write its verdict to
-   `.harness/adversarial-verdict` as `PASS <reason>` or `FAIL <reason>` (via Bash,
-   e.g. `echo "PASS …" > .harness/adversarial-verdict`).
+8. Adversarial review — overlap it with evidence capture instead of serializing.
+   The review judges the diff + acceptance criteria (tests, layers, seams); it does
+   not need the screenshots, which you and the harness reviewer verify separately.
+   So:
+   - **If step 6's screenshots are still uncaptured** (they were not a test
+     byproduct): spawn, IN ONE SINGLE MESSAGE so they run concurrently, BOTH the
+     adversarial pre-PR subagent AND an evidence-capture subagent that follows
+     step 6's mechanics (detached dev server, one screenshot per visual AC item
+     into `evidence/`, report the file paths). A subagent launched in a later
+     message serializes behind the first and wastes the 6–9 min review wait; a
+     background/detached subagent is NOT allowed — both must be blocking calls in
+     the same message. When both return, commit the screenshots and Read each one
+     (step 6) while acting on the verdict.
+   - **If evidence already exists** (test-byproduct screenshots, or no visual
+     ACs): commit + Read it per step 6, then spawn the adversarial subagent alone.
+   The adversarial subagent gets a fresh context and only the diff + acceptance
+   criteria + whatever evidence is already committed. It must return PASS. Write
+   its verdict to `.harness/adversarial-verdict` as `PASS <reason>` or
+   `FAIL <reason>` (via Bash, e.g. `echo "PASS …" > .harness/adversarial-verdict`).
    **On FAIL: fix the findings, then verify the FIXES — do not re-run the full
    review.** Spawn a SCOPED verifier subagent (fresh context) given only: the
    FAIL findings verbatim, the diff of your fixes (diff since the review ran),
