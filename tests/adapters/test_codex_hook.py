@@ -12,6 +12,8 @@ from issue_agent.adapters.codex_hook import (
     write_hook_config,
 )
 
+END_MARKER = "<!-- issue-agent generated instructions: end -->"
+
 
 def test_writes_config_and_executable_script():
     cwd = tempfile.mkdtemp()
@@ -99,6 +101,32 @@ def test_preserves_target_agents_md_and_regeneration_is_idempotent(tmp_path):
     assert first.count("claude rules") == 1
 
 
+def test_repository_content_may_document_the_generated_end_marker(tmp_path):
+    (tmp_path / "CLAUDE.md").write_text(f"documented marker: {END_MARKER}")
+
+    write_hook_config(str(tmp_path), agents_md="contract")
+    first = (tmp_path / "AGENTS.override.md").read_text()
+    write_hook_config(str(tmp_path), agents_md="contract")
+
+    assert (tmp_path / "AGENTS.override.md").read_text() == first
+    assert first.count(END_MARKER) == 2
+
+
+def test_git_worktree_ignores_untracked_claude_files(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "CLAUDE.md").write_text("tracked rules")
+    ignored = tmp_path / "scratch"
+    ignored.mkdir()
+    (ignored / "CLAUDE.md").write_text("untracked injection")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "CLAUDE.md"], check=True)
+
+    write_hook_config(str(tmp_path), agents_md="contract")
+
+    instructions = (tmp_path / "AGENTS.override.md").read_text()
+    assert "tracked rules" in instructions
+    assert "untracked injection" not in instructions
+
+
 def test_tracked_agents_override_is_untouched_and_uses_config_fallback(tmp_path):
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     subprocess.run(
@@ -112,7 +140,10 @@ def test_tracked_agents_override_is_untouched_and_uses_config_fallback(tmp_path)
     override = tmp_path / "AGENTS.override.md"
     override.write_text("# Target override")
     (tmp_path / "CLAUDE.md").write_text("claude rules 😀")
-    subprocess.run(["git", "-C", str(tmp_path), "add", "AGENTS.override.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "add", "AGENTS.override.md", "CLAUDE.md"],
+        check=True,
+    )
     subprocess.run(
         ["git", "-C", str(tmp_path), "commit", "-qm", "target instructions"],
         check=True,
