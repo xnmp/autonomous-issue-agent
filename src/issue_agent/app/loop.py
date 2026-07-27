@@ -108,9 +108,15 @@ class Daemon:
         now: Callable[[], int],
         heartbeat_seconds: int = 900,
         max_ticks: int | None = None,
+        reload_check: Callable[[], bool] | None = None,
     ) -> None:
         """Loop tick→sleep with a heartbeat. `now`/`sleep` injected (testable).
-        `max_ticks` bounds the loop for tests; None = forever."""
+        `max_ticks` bounds the loop for tests; None = forever.
+
+        `reload_check` (hot reload): consulted BETWEEN ticks — the one point
+        where no agent session can be in flight (dispatch is synchronous inside
+        tick), so exiting here never kills paid work. True → exit with
+        RELOAD_EXIT_CODE for point-at's relaunch loop."""
         self.log(f"{self.name}: watching (poll {self.poll_seconds}s)")
         last = now()
         last_logged = last
@@ -130,4 +136,12 @@ class Daemon:
                 last_logged = cur
             self.tick()
             ticks += 1
+            if reload_check is not None and reload_check():
+                from ..adapters.reload import RELOAD_EXIT_CODE
+
+                self.log(
+                    f"{self.name}: hot-reload — harness source changed; "
+                    f"restarting between ticks (no session in flight)"
+                )
+                raise SystemExit(RELOAD_EXIT_CODE)
             sleep(self.poll_seconds)

@@ -211,8 +211,27 @@ run_role() {
   # Run uv from the HARNESS root (that's where the issue_agent package + project
   # live). The daemon self-chdirs into TARGET_DIR (config.py os.chdir(target_dir)),
   # so git/worktree ops still land in the target repo.
-  ( cd "$HARNESS_ROOT" && exec uv run --extra sdk --with tree-sitter --with tree-sitter-bash \
-      python -m issue_agent.app.main "$role" ) >"$log" 2>&1 &
+  #
+  # Hot-reload relaunch loop: the daemon exits 87 (adapters/reload.py
+  # RELOAD_EXIT_CODE) when the harness source changed — always BETWEEN ticks,
+  # never mid-session — and we relaunch it on the new code. Going back through
+  # `uv run` also picks up dependency changes, and re-sourcing the composed env
+  # file lets config edits ride along (touch it, or edit + `touch`, to apply;
+  # regenerating the composition still needs a point-at rerun). Any other exit
+  # status is a real death and propagates as before.
+  (
+    cd "$HARNESS_ROOT"
+    while :; do
+      rc=0
+      uv run --extra sdk --with tree-sitter --with tree-sitter-bash \
+        python -m issue_agent.app.main "$role" || rc=$?
+      [ "$rc" -eq 87 ] || exit "$rc"
+      if [ -n "${AGENT_ENV:-}" ] && [ -f "$AGENT_ENV" ]; then
+        set -a; . "$AGENT_ENV"; set +a
+      fi
+      echo "hot-reload: relaunching $role on changed source (exit 87)"
+    done
+  ) >"$log" 2>&1 &
 }
 
 # Keep the machine awake while the watchers run — on a sleeping Mac the poll loop

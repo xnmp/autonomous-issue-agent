@@ -319,7 +319,28 @@ def main(argv: list[str] | None = None) -> None:
     # = run forever like the bash daemons.
     raw = env.get("ISSUE_AGENT_MAX_TICKS")
     max_ticks = int(raw) if raw else None
-    daemon.run_forever(sleep=time.sleep, now=lambda: int(time.time()), max_ticks=max_ticks)
+    # Hot reload (HOT_RELOAD=0 disables): watch the harness's own source +
+    # plugin payload + the composed env file; a change restarts this daemon at
+    # the next between-ticks point via point-at's relaunch loop.
+    reload_check = None
+    if os.environ.get("HOT_RELOAD", "1") != "0":
+        from ..adapters.reload import ReloadWatch
+
+        harness_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        )
+        watch = ReloadWatch(
+            roots=(
+                os.path.join(harness_root, "src", "issue_agent"),
+                os.path.join(harness_root, "plugin"),
+            ),
+            files=tuple(p for p in (os.environ.get("AGENT_ENV"),) if p),
+        )
+        reload_check = watch.changed
+    daemon.run_forever(
+        sleep=time.sleep, now=lambda: int(time.time()), max_ticks=max_ticks,
+        reload_check=reload_check,
+    )
 
 
 if __name__ == "__main__":
