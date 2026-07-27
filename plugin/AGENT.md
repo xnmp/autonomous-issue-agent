@@ -127,6 +127,11 @@ don't keep going back to edit it — each re-plan costs a full model round-trip.
      nobody links is invisible to the reviewer. (A prose, non-checklist AC section
      falls back to requiring a single screenshot, but then the reviewer has to guess
      which criterion it proves — write the checklist.)
+   - **Repair legs carry unaffected evidence forward.** On address-review or
+     fix-CI, keep the existing capture for every acceptance criterion whose
+     behavior the repair does not change. Re-capture only criteria touched by the
+     feedback/failure or by the repair, and keep every carried or new image directly
+     mapped to its criterion in the PR body.
 
    Two ways to capture — pick by whether the shot is a byproduct of the asserting test:
      - **Playwright-native (preferred IF the repo's e2e test already drives the page

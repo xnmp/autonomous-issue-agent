@@ -4,7 +4,11 @@ import os
 import stat
 import tempfile
 
-from issue_agent.adapters.codex_hook import GOVERNOR_PATH, write_hook_config
+from issue_agent.adapters.codex_hook import (
+    GOVERNOR_PATH,
+    REPOSITORY_INSTRUCTIONS_MAX_BYTES,
+    write_hook_config,
+)
 
 
 def test_writes_config_and_executable_script():
@@ -60,6 +64,32 @@ def test_no_agents_md_when_empty():
     cwd = tempfile.mkdtemp()
     write_hook_config(cwd)  # agents_md="" default
     assert not os.path.exists(os.path.join(cwd, "AGENTS.md"))
+
+
+def test_appends_root_and_nested_claude_md_in_path_order(tmp_path):
+    (tmp_path / "CLAUDE.md").write_text("root rules")
+    nested = tmp_path / "packages" / "api"
+    nested.mkdir(parents=True)
+    (nested / "CLAUDE.md").write_text("api rules")
+
+    write_hook_config(str(tmp_path), agents_md="# Harness contract")
+
+    agents = (tmp_path / "AGENTS.md").read_text()
+    assert "# Repository instructions (CLAUDE.md)" in agents
+    assert agents.index("## CLAUDE.md") < agents.index("## packages/api/CLAUDE.md")
+    assert "root rules" in agents and "api rules" in agents
+
+
+def test_repository_instructions_are_capped_and_truncation_is_logged(tmp_path):
+    (tmp_path / "CLAUDE.md").write_text("x" * (REPOSITORY_INSTRUCTIONS_MAX_BYTES * 2))
+    logs: list[str] = []
+
+    write_hook_config(str(tmp_path), agents_md="contract", log=logs.append)
+
+    agents = (tmp_path / "AGENTS.md").read_text()
+    section = agents[agents.index("# Repository instructions (CLAUDE.md)"):]
+    assert len(section.encode()) <= REPOSITORY_INSTRUCTIONS_MAX_BYTES
+    assert any("truncated" in message for message in logs)
 
 
 # ── PostToolUse edit-check (only when edit_check_cmd given) ────────────────────

@@ -39,6 +39,7 @@ def _workflow(gw, store, runner, journal=None, **cfg_overrides):
         review_bot="review-bot",
         review_trigger_label="ai-pr-open",
         log=lambda _m: None,
+        journal=journal,
     )
     cfg_kwargs.update(cfg_overrides)
     cfg = ReviewWorkflowConfig(**cfg_kwargs)
@@ -46,6 +47,48 @@ def _workflow(gw, store, runner, journal=None, **cfg_overrides):
     # travel the same funnel every other write does (journal event + ALERT_CMD
     # come from the funnel, not from the workflow).
     return ReviewWorkflow(cfg, gw, store, runner, Executor(gw, journal=journal))
+
+
+def test_initial_review_skips_when_our_verdict_already_targets_head():
+    review = Review(
+        "APPROVED", "review-bot[bot]", "t1", commit_id="abc",
+    )
+    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="abc", reviews=(review,))})
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(is_error=False))
+    journal = FakeJournal()
+
+    asyncio.run(_workflow(gw, store, runner, journal=journal).review(100))
+
+    assert runner.tasks == []
+    assert gw.calls == []
+    assert store.get_last_sha(100) == "abc"
+    assert store.get_pr_session(100) == "github-review"
+    assert ("review_skip", {
+        "pr": 100,
+        "reviewer": "review-bot",
+        "head_sha": "abc",
+        "reason": "reviewer-verdict-on-head",
+    }) in journal.events
+
+
+def test_re_review_skips_same_head_but_reviews_a_genuinely_new_head():
+    prior = Review("CHANGES_REQUESTED", "review-bot", "t1", commit_id="old")
+    gw = FakeGateway(prs={
+        100: PRView(100, head_ref_oid="new", reviews=(prior,)),
+    })
+    store = FakeStore()
+    store.save_pr_session(100, "rs")
+    store.set_last_sha(100, "old")
+    runner = FakeRunner(AgentResult(
+        is_error=False,
+        structured={"decision": "APPROVE", "body": "fixed"},
+    ))
+
+    asyncio.run(_workflow(gw, store, runner).re_review(100))
+
+    assert len(runner.tasks) == 1
+    assert any(call[0] == "review" for call in gw.calls)
 
 
 def test_single_review_submits_before_persisting_state():

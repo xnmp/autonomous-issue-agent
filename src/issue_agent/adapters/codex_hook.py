@@ -17,12 +17,49 @@ from __future__ import annotations
 
 import os
 import stat
+from collections.abc import Callable
+from pathlib import Path
 
 # Absolute path to the shared governor (…/src/issue_agent/adapters → repo root).
 _HARNESS_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 GOVERNOR_PATH = os.path.join(_HARNESS_ROOT, "plugin", "hooks", "bash_governor.py")
+REPOSITORY_INSTRUCTIONS_MAX_BYTES = 64 * 1024
+_REPOSITORY_INSTRUCTIONS_HEADING = "\n\n# Repository instructions (CLAUDE.md)\n"
+
+
+def _repository_instructions(
+    cwd: str,
+    *,
+    max_bytes: int = REPOSITORY_INSTRUCTIONS_MAX_BYTES,
+) -> tuple[str, bool]:
+    """Return checked-out CLAUDE.md files in path order, bounded for prompt safety."""
+    root = Path(cwd)
+    paths = sorted(
+        (path for path in root.glob("**/CLAUDE.md") if ".git" not in path.parts),
+        key=lambda path: path.relative_to(root).as_posix(),
+    )
+    remaining = max_bytes
+    sections: list[str] = []
+    truncated = False
+    for path in paths:
+        relative = path.relative_to(root).as_posix()
+        try:
+            content = path.read_text()
+        except (OSError, UnicodeError):
+            continue
+        section = f"\n\n## {relative}\n\n{content}"
+        encoded = section.encode()
+        if len(encoded) <= remaining:
+            sections.append(section)
+            remaining -= len(encoded)
+            continue
+        if remaining:
+            sections.append(encoded[:remaining].decode(errors="ignore"))
+        truncated = True
+        break
+    return "".join(sections), truncated
 
 
 def _gov_script(governor_path: str) -> str:
@@ -119,6 +156,7 @@ exit 0
 def write_hook_config(
     cwd: str, governor_path: str = GOVERNOR_PATH, agents_md: str = "",
     edit_check_cmd: str = "",
+    log: Callable[[str], None] | None = None,
 ) -> str:
     """Emit `<cwd>/.codex/config.toml` + `.codex/hooks/gov.sh` so a `codex exec`
     run in `cwd` enforces the governor on every Bash call. When `agents_md` is
@@ -164,7 +202,23 @@ def write_hook_config(
     with open(config_path, "w") as f:
         f.write(_config_toml(gov_script_path, read_record_script_path, edit_check_script_path))
 
-    if agents_md:
+    repository_instructions, truncated = _repository_instructions(
+        cwd,
+        max_bytes=(
+            REPOSITORY_INSTRUCTIONS_MAX_BYTES
+            - len(_REPOSITORY_INSTRUCTIONS_HEADING.encode())
+        ),
+    )
+    if agents_md or repository_instructions:
         with open(os.path.join(cwd, "AGENTS.md"), "w") as f:
             f.write(agents_md)
+            if repository_instructions:
+                f.write(_REPOSITORY_INSTRUCTIONS_HEADING)
+                f.write(repository_instructions)
+    if truncated:
+        message = (
+            "codex: repository CLAUDE.md instructions exceeded "
+            f"{REPOSITORY_INSTRUCTIONS_MAX_BYTES} bytes; AGENTS.md section was truncated"
+        )
+        (log or print)(message)
     return config_path

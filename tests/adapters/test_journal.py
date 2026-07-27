@@ -1084,6 +1084,8 @@ def test_ten_polls_of_a_capped_leg_emit_one_block_and_one_alert(tmp_path):
     assert len(blocks) == 1, "the block is an edge, not a level"
     payloads = [json.loads(ln) for ln in sink.read_text().splitlines() if ln.strip()]
     assert [p["event"] for p in payloads].count("spend_block") == 1
+    comments = [call for call in gw.calls if call[0] == "comment"]
+    assert len(comments) == 1, "the GitHub escalation is the same edge as the alert"
 
 
 def test_the_block_dedup_survives_a_restart(tmp_path):
@@ -1100,6 +1102,22 @@ def test_the_block_dedup_survives_a_restart(tmp_path):
     asyncio.run(restarted.dispatch(RunAgent(AgentKind.FIX_CI, 100)))
 
     assert len([e for e in read_events(journal.path) if e["event"] == "spend_block"]) == 1
+
+
+def test_a_changed_issue_cap_may_escalate_once_again(tmp_path):
+    ledger = _write(str(tmp_path / "spend.jsonl"), _spend(NOW, 30.0, issue=5))
+    first, first_gw, _, journal = _cap_dispatcher(
+        tmp_path, ledger, issue_cap=25.0, gw=CapGateway(issue_for_pr={100: 5}))
+    asyncio.run(first.dispatch(RunAgent(AgentKind.FIX_CI, 100)))
+
+    changed, changed_gw, _, _ = _cap_dispatcher(
+        tmp_path, ledger, issue_cap=20.0, gw=CapGateway(issue_for_pr={100: 5}))
+    asyncio.run(changed.dispatch(RunAgent(AgentKind.FIX_CI, 100)))
+
+    assert len([c for c in first_gw.calls if c[0] == "comment"]) == 1
+    assert len([c for c in changed_gw.calls if c[0] == "comment"]) == 1
+    blocks = [e for e in read_events(journal.path) if e["event"] == "spend_block"]
+    assert {e["cap"] for e in blocks} == {20.0, 25.0}
 
 
 def test_a_different_capped_issue_still_gets_its_own_block(tmp_path):

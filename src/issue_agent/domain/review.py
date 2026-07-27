@@ -28,6 +28,20 @@ from .world import PRView, WorldState, REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED
 DEFAULT_MAX_UNPRODUCTIVE_ROUNDS = 5
 
 
+def reviewer_verdict_on_head(pr: PRView, reviewer: str) -> bool:
+    """Whether `reviewer`'s latest submitted verdict targets this exact head."""
+    own_verdicts = [
+        (index, review)
+        for index, review in enumerate(pr.reviews)
+        if login_eq(review.author, reviewer)
+        and review.state.upper() not in {"", "PENDING", "DISMISSED"}
+    ]
+    if not own_verdicts or not pr.head_ref_oid:
+        return False
+    _, latest = max(own_verdicts, key=lambda item: (item[1].submitted_at, item[0]))
+    return latest.commit_id == pr.head_ref_oid
+
+
 class IdentityMode(str, Enum):
     """How many GitHub identities the harness runs under.
 
