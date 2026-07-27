@@ -181,10 +181,10 @@ def build_codex_argv(
         argv += ["-o", output_path]
 
     # AGENT.md parity: Codex has no system-prompt-preset append. Preferred path —
-    # the contract is written to the worktree's AGENTS.md (Codex's native
+    # the contract is written to the worktree's AGENTS.override.md (Codex's native
     # per-project instructions; see codex_hook.write_hook_config) and
     # inject_system_prompt is False, so we DON'T also prepend it here (that would
-    # duplicate the whole 131-line contract into every prompt). When AGENTS.md
+    # duplicate the whole contract into every prompt). When AGENTS.override.md
     # isn't in use (inject_system_prompt=True), fall back to prepending.
     prompt = task.prompt
     if inject_system_prompt and task.append_system_prompt:
@@ -531,9 +531,9 @@ class CodexRunner(AgentRuntime):
     default_model: str = DEFAULT_CODEX_MODEL
     reasoning_effort: str = DEFAULT_REASONING_EFFORT
     env: dict[str, str] = field(default_factory=dict)
-    # When the AGENT.md contract is delivered via the worktree AGENTS.md (the
+    # When the AGENT.md contract is delivered via worktree AGENTS.override.md (the
     # default for the fix daemon), set False so the prompt isn't ALSO prepended
-    # with it. True keeps the standalone prepend (e.g. tests / no-AGENTS.md use).
+    # with it. True keeps the standalone prepend (e.g. tests / no project-doc use).
     inject_system_prompt: bool = True
     # Diagnostics: `log` is a str->None sink (stderr in prod). codex stderr is
     # streamed LIVE (not buffered to exit) — milestone lines (TEST_CMD runs,

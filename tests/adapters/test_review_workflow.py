@@ -91,6 +91,40 @@ def test_re_review_skips_same_head_but_reviews_a_genuinely_new_head():
     assert any(call[0] == "review" for call in gw.calls)
 
 
+def test_external_review_marker_never_becomes_a_resume_session():
+    prior = Review(
+        "APPROVED", "review-bot", "t1",
+        body="check the null-token contract", commit_id="old",
+    )
+    gw = FakeGateway(prs={
+        100: PRView(
+            100, head_ref_oid="old", title="Null token", body="Fixes #7",
+            reviews=(prior,),
+        ),
+    })
+    store = FakeStore()
+    first_runner = FakeRunner(AgentResult(is_error=False))
+    asyncio.run(_workflow(gw, store, first_runner).review(100))
+
+    gw._prs[100] = PRView(
+        100, head_ref_oid="new", title="Null token", body="Fixes #7",
+        reviews=(prior,),
+    )
+    next_runner = FakeRunner(AgentResult(
+        is_error=False,
+        session_id="real-session",
+        structured={"decision": "APPROVE", "body": "new head reviewed"},
+    ))
+    asyncio.run(_workflow(gw, store, next_runner).re_review(100))
+
+    assert len(next_runner.tasks) == 1
+    assert not next_runner.tasks[0].resume
+    assert "Null token" in next_runner.tasks[0].prompt
+    assert "Fixes #7" in next_runner.tasks[0].prompt
+    assert "check the null-token contract" in next_runner.tasks[0].prompt
+    assert store.get_pr_session(100) == "real-session"
+
+
 def test_single_review_submits_before_persisting_state():
     pr = PRView(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr})
