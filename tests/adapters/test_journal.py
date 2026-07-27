@@ -1084,6 +1084,8 @@ def test_ten_polls_of_a_capped_leg_emit_one_block_and_one_alert(tmp_path):
     assert len(blocks) == 1, "the block is an edge, not a level"
     payloads = [json.loads(ln) for ln in sink.read_text().splitlines() if ln.strip()]
     assert [p["event"] for p in payloads].count("spend_block") == 1
+    comments = [call for call in gw.calls if call[0] == "comment"]
+    assert len(comments) == 1, "the GitHub escalation is the same edge as the alert"
 
 
 def test_the_block_dedup_survives_a_restart(tmp_path):
@@ -1100,6 +1102,48 @@ def test_the_block_dedup_survives_a_restart(tmp_path):
     asyncio.run(restarted.dispatch(RunAgent(AgentKind.FIX_CI, 100)))
 
     assert len([e for e in read_events(journal.path) if e["event"] == "spend_block"]) == 1
+
+
+def test_duplicate_block_retries_relabel_without_reposting_comment(tmp_path):
+    class RelabelFailsOnce(CapGateway):
+        def __init__(self):
+            super().__init__()
+            self.relabel_attempts = 0
+
+        def relabel(self, kind, number, remove, add):
+            self.relabel_attempts += 1
+            if self.relabel_attempts == 1:
+                raise RuntimeError("transient relabel failure")
+            super().relabel(kind, number, remove, add)
+
+    ledger = _write(str(tmp_path / "spend.jsonl"), _spend(NOW, 30.0, issue=5))
+    gw = RelabelFailsOnce()
+    dispatcher, _, _, _ = _cap_dispatcher(
+        tmp_path, ledger, issue_cap=25.0, gw=gw,
+    )
+
+    asyncio.run(dispatcher.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
+    asyncio.run(dispatcher.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
+
+    assert gw.relabel_attempts == 2
+    assert len([call for call in gw.calls if call[0] == "comment"]) == 1
+    assert ("relabel", "issue", 5, "ai-working", "needs-human-review") in gw.calls
+
+
+def test_a_changed_issue_cap_may_escalate_once_again(tmp_path):
+    ledger = _write(str(tmp_path / "spend.jsonl"), _spend(NOW, 30.0, issue=5))
+    first, first_gw, _, journal = _cap_dispatcher(
+        tmp_path, ledger, issue_cap=25.0, gw=CapGateway(issue_for_pr={100: 5}))
+    asyncio.run(first.dispatch(RunAgent(AgentKind.FIX_CI, 100)))
+
+    changed, changed_gw, _, _ = _cap_dispatcher(
+        tmp_path, ledger, issue_cap=20.0, gw=CapGateway(issue_for_pr={100: 5}))
+    asyncio.run(changed.dispatch(RunAgent(AgentKind.FIX_CI, 100)))
+
+    assert len([c for c in first_gw.calls if c[0] == "comment"]) == 1
+    assert len([c for c in changed_gw.calls if c[0] == "comment"]) == 1
+    blocks = [e for e in read_events(journal.path) if e["event"] == "spend_block"]
+    assert {e["cap"] for e in blocks} == {20.0, 25.0}
 
 
 def test_a_different_capped_issue_still_gets_its_own_block(tmp_path):
@@ -1129,7 +1173,24 @@ def test_the_daily_block_is_keyed_to_the_utc_day_it_pauses(tmp_path):
     blocks = [e for e in read_events(journal.path) if e["event"] == "spend_block"]
     assert len(blocks) == 1
     today = datetime.now(timezone.utc).date().isoformat()
-    assert blocks[0]["block_key"] == f"daily:{today}"
+    assert blocks[0]["block_key"] == f"daily:{today}:cap:50"
+
+
+def test_a_changed_daily_cap_emits_a_new_edge(tmp_path):
+    ledger = _write(str(tmp_path / "spend.jsonl"),
+                    _spend(datetime.now(timezone.utc), 60.0))
+    first, _, _, journal = _cap_dispatcher(
+        tmp_path, ledger, daily_cap=50.0,
+    )
+    asyncio.run(first.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
+
+    changed, _, _, _ = _cap_dispatcher(
+        tmp_path, ledger, daily_cap=40.0,
+    )
+    asyncio.run(changed.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
+
+    blocks = [e for e in read_events(journal.path) if e["event"] == "spend_block"]
+    assert {event["cap"] for event in blocks} == {40.0, 50.0}
 
 
 def test_an_unresolvable_issue_costs_attribution_not_a_block(tmp_path):

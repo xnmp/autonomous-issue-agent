@@ -157,6 +157,7 @@ esac
 # ── 6/7/7b. Commit hygiene + evidence + test-immutability (shared, state-derived) ─
 prc_check_commit_log
 prc_check_no_evidence "$changed"
+prc_check_no_generated_instructions "$changed"
 prc_check_tests_immutable "$changed"
 
 # ── 8. Adversarial pre-PR verdict exists and passed ─────────────────────────────
