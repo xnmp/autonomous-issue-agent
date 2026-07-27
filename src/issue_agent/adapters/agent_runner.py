@@ -68,11 +68,20 @@ _OPTION_FIELDS: frozenset[str] | None = None
 # AgentRunner(permission_mode=…) if a target wants the classifier too.
 DEFAULT_PERMISSION_MODE = "bypassPermissions"
 
+# Ceiling on ONE decoded SDK stream message. The SDK's own default is 1MB, and a
+# tool result carries its payload base64'd (x4/3), so any Read of a file above
+# ~750KB kills the transport mid-session — deterministically, since the next
+# dispatch reads the same file (#13, observed on a 2.3MB evidence PNG). 16MB
+# survives a ~5MB read and costs nothing until a message actually needs it: the
+# buffer bounds a decode, it is not preallocated. Override: SDK_MAX_BUFFER_BYTES.
+DEFAULT_MAX_BUFFER_BYTES = 16 * 1024 * 1024
+
 
 def build_option_kwargs(
     task: AgentTask,
     permission_mode: str = DEFAULT_PERMISSION_MODE,
     extra_hooks: dict | None = None,
+    max_buffer_size: int | None = None,
 ) -> dict[str, Any]:
     """Pure: AgentTask → kwargs for ClaudeAgentOptions. No SDK import, no I/O, so
     it is unit-tested directly. `extra_hooks` is the already-built
@@ -82,6 +91,10 @@ def build_option_kwargs(
         "permission_mode": permission_mode,
         "max_budget_usd": task.max_budget_usd,
     }
+    # Emitted unconditionally when set; `run` drops it if the installed SDK build
+    # predates the field, the same guard `stderr` gets.
+    if max_buffer_size:
+        kwargs["max_buffer_size"] = int(max_buffer_size)
 
     # System prompt: claude_code preset + append (matches --append-system-prompt,
     # and crucially keeps the full Claude Code prompt the bash agents rely on —
@@ -364,6 +377,7 @@ class AgentRunner(AgentRuntime):
         wall_clock: Callable[[], float] | None = None,
         poll_slice: float = _WATCHDOG_POLL_SLICE,
         max_runtime: float | None = None,
+        max_buffer_size: int | None = DEFAULT_MAX_BUFFER_BYTES,
     ):
         self.permission_mode = permission_mode
         # Pre-built {"PreToolUse": [HookMatcher(...)]} from the governor adapter.
@@ -396,6 +410,10 @@ class AgentRunner(AgentRuntime):
         # on 3.6s of CPU and never tripped. Only elapsed wall time bounds that shape.
         # None disables. See AGENT_MAX_RUNTIME_SECONDS.
         self._max_runtime = max_runtime
+        # Per-message decode ceiling for every session this runner drives — the
+        # reviewer's big-file Read must degrade to token cost, not a dead
+        # transport (#13). None/0 leaves the SDK's own 1MB default in place.
+        self._max_buffer_size = max_buffer_size
 
     def _slice_timeout(self) -> float:
         """How long to block on one observation slice. The poll slice, floored by
@@ -438,7 +456,16 @@ class AgentRunner(AgentRuntime):
 
         from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
-        kwargs = build_option_kwargs(task, self.permission_mode, self.hooks)
+        kwargs = build_option_kwargs(
+            task, self.permission_mode, self.hooks, self._max_buffer_size
+        )
+        # Older SDK builds have no such field and reject it at construction.
+        if "max_buffer_size" in kwargs and "max_buffer_size" not in _option_field_names():
+            kwargs.pop("max_buffer_size")
+            self._log(
+                "sdk: installed claude-agent-sdk has no max_buffer_size — "
+                "large file reads may kill the transport (harness #13)"
+            )
         # Materialise the SDK-free `agents` dict-spec into AgentDefinition objects
         # (build_option_kwargs stays SDK-free for unit tests; the SDK type is
         # applied only here, at the edge that already imports the SDK). Imported
@@ -676,6 +703,16 @@ class AgentRunner(AgentRuntime):
                 # would run the follow-up tail on a session that never happened.
                 # The enum member exists for the runtimes that CAN'T raise
                 # (CodexRunner reads an exit code) and for future supervision.
+                #
+                # The last-seen trace rides on the exception OBJECT rather than
+                # in a wrapper type: the journal and the dispatcher both need it
+                # to name the file a deterministic death (#13) died on, and
+                # re-raising unchanged is the crash-isolation contract above.
+                # Best-effort — an exception with __slots__ refuses the write.
+                try:
+                    exc.harness_last_trace = last_trace
+                except Exception:
+                    pass
                 raise
         if final is None:
             # No ResultMessage emitted (transport died) → surface as an error,

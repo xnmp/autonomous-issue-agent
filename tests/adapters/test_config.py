@@ -684,6 +684,26 @@ def test_max_infra_deaths_default_and_override():
     assert c.fix_runtime.max_infra_deaths == 2
 
 
+def test_sdk_max_buffer_default_clears_a_five_megabyte_read():
+    # #13: the SDK's own 1MB ceiling is below one base64'd hi-DPI screenshot,
+    # and blowing it kills the whole session's transport.
+    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot"})
+    assert c.sdk_max_buffer_bytes >= 5 * 1024 * 1024 * 4 // 3
+    assert c.validation_errors() == ()
+
+
+def test_sdk_max_buffer_is_overridable_and_zero_means_the_sdk_default():
+    assert from_env({"REPO": "x", "SDK_MAX_BUFFER_BYTES": "33554432"}).sdk_max_buffer_bytes == 33554432
+    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "SDK_MAX_BUFFER_BYTES": "0"})
+    assert c.sdk_max_buffer_bytes == 0
+    assert c.validation_errors() == ()
+
+
+def test_negative_sdk_max_buffer_is_a_config_error():
+    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "SDK_MAX_BUFFER_BYTES": "-1"})
+    assert any("SDK_MAX_BUFFER_BYTES" in e for e in c.validation_errors())
+
+
 def test_max_infra_deaths_zero_is_a_valid_off_value():
     c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "MAX_INFRA_DEATHS": "0"})
     assert c.max_infra_deaths == 0

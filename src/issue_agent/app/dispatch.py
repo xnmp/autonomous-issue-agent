@@ -34,6 +34,7 @@ from ..domain.actions import AgentKind, RunAgent
 from ..domain.agent_task import AgentRuntime
 from ..domain.labels import Label
 from ..domain.lifecycle import issue_escalation, pr_escalation
+from ..domain.outcome import deterministic_death
 from .planners.tasks import FixTaskConfig, JiraTaskConfig, ReviewTaskConfig, TriageTaskConfig
 from .workflows.fix import FixWorkflow, FixWorkflowConfig
 from .workflows.jira import JiraSyncWorkflow, JiraSyncWorkflowConfig
@@ -93,6 +94,13 @@ class DispatchConfig:
     issue_spend_cap_usd: float = 0.0
     daily_spend_cap_usd: float = 0.0
     alert_cmd: str = ""
+    # The ceiling this role's decide side reads off the infra-death counter
+    # (fix: max_infra_deaths; review: max_unproductive_rounds). Used ONLY to
+    # saturate the counter on a deterministic death (#13) so the role's existing
+    # escalation fires on the next poll instead of after N identical retries.
+    # 0 = unknown/disabled → the ordinary +1 bump, i.e. exactly today's behavior
+    # for every hand-built DispatchConfig.
+    max_infra_deaths: int = 0
 
     def fix_workflow_config(self) -> FixWorkflowConfig:
         return FixWorkflowConfig(
@@ -465,7 +473,7 @@ class AgentDispatcher:
             # that ignores Ctrl-C, and a swallowed CancelledError is a task that
             # refuses to die.
             raise
-        except BaseException:
+        except BaseException as exc:
             # Review C3. A session that dies BEFORE `runner.run` returns RAISES
             # (agent_runner.py, deliberately), so the whole workflow tail —
             # save_session, the retry-counter bump, the follow-up actions — is
@@ -481,10 +489,36 @@ class AgentDispatcher:
             # a failed pre-handler lookup must not silently relocate the counter
             # into a key space the decide side does not read — review P1R-1.
             key = self._death_key(action, issue, resolved)
+            # Deterministic deaths (#13) are charged the WHOLE budget at once.
+            # The breakers assume a retry might survive; when the cause is the
+            # input the retry reproduces it exactly, so a +1 bump buys the same
+            # unwinnable dispatch cap-1 more times at full session cost. Charging
+            # the cap routes the PR/issue to whatever terminal path the role
+            # already has (review: unproductive ceiling → pr_escalation →
+            # needs-human-review) on the very next poll — no new label, no new
+            # branch on the decide side.
+            det = deterministic_death(
+                f"{type(exc).__name__}: {exc}",
+                str(getattr(exc, "harness_last_trace", "") or ""),
+            )
             try:
-                self.store.bump_infra_deaths(key)
-            except Exception as exc:  # noqa: BLE001
+                if det is not None and self.cfg.max_infra_deaths > 0:
+                    charged = max(
+                        self.store.get_infra_deaths(key), self.cfg.max_infra_deaths
+                    )
+                    self.store.set_infra_deaths(key, charged)
+                    self.cfg.log(
+                        f"#{key}: deterministic session death "
+                        f"({det.signature}"
+                        + (f" on {det.path}" if det.path else "")
+                        + ") — retrying reproduces it, so the retry budget is "
+                        f"spent now ({charged}/{self.cfg.max_infra_deaths}); "
+                        "escalating to a human on the next poll"
+                    )
+                else:
+                    self.store.bump_infra_deaths(key)
+            except Exception as err:  # noqa: BLE001
                 # A counter we could not persist must not replace the death we
                 # are trying to report (the traceback is the diagnosis).
-                self.cfg.log(f"infra-death counter not persisted for #{key}: {exc}")
+                self.cfg.log(f"infra-death counter not persisted for #{key}: {err}")
             raise

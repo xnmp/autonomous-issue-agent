@@ -322,6 +322,9 @@ def build_fix_daemon(
         log=_log("fix"),
         fix_bot=fix_runtime.bot,
         fixer_runtime=cfg.fixer_runtime,
+        # The same ceiling `fix_cfg` escalates on, so a deterministic death can
+        # saturate the counter rather than pay for cap-1 identical retries (#13).
+        max_infra_deaths=fix_runtime.max_infra_deaths,
         **_spend_cfg(cfg, "fix", ledger),
     )
     # Fixer runtime: Codex (GPT-5.5) swaps the runner AND installs the governor as
@@ -513,6 +516,10 @@ def build_review_daemon(
         review_trigger_label=review_runtime.trigger_label,
         review_mode=review_runtime.mode,
         log=_log("review"),
+        # `rcfg.max_unproductive_rounds` is the ceiling the review decide side
+        # reads off this counter — same value, same getattr fallback, so a
+        # deterministic death saturates to exactly what escalates (#13).
+        max_infra_deaths=rcfg.max_unproductive_rounds,
         **_spend_cfg(cfg, "review", ledger),
     )
     # Reviewer has no worktree/issue side; pass a no-op Worktrees-like None usage.

@@ -202,6 +202,15 @@ class Store:
         self._write(path, str(n))
         return n
 
+    def set_infra_deaths(self, key: int, n: int) -> None:
+        """Write the counter directly, for a death that is worth more than one
+        life. A DETERMINISTIC death (#13) reproduces on every retry, so charging
+        it 1 buys the identical unwinnable dispatch cap-1 more times; the
+        dispatcher saturates the counter instead and the role's existing ceiling
+        escalates on the next poll. Monotonic at the call site (max of current
+        and the cap) — a saturate must never lower a tally."""
+        self._write(self.issue_path(key, "infra-deaths"), str(max(0, int(n))))
+
     def clear_infra_deaths(self, key: int) -> None:
         """Decay: this key just produced a RETURNED result, so the transport and
         the process are demonstrably alive (review P1R-3/P0R-3 residual).

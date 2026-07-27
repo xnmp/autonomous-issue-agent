@@ -15,6 +15,7 @@ import re
 import subprocess
 from dataclasses import dataclass, fields
 
+from ..adapters.agent_runner import DEFAULT_MAX_BUFFER_BYTES
 from ..domain.identity import normalize_login
 from ..domain.review import IdentityMode, ReviewMode
 
@@ -290,6 +291,12 @@ class HarnessConfig:
     # within one poll cycle. Raise it for a repo whose test suite alone runs longer;
     # 0 disables (back to idle-watchdog-only).
     agent_max_runtime: float = 2700.0
+    # Largest single decoded SDK stream message. The SDK's own 1MB default is
+    # below what one Read of a hi-DPI screenshot produces once base64'd (x4/3),
+    # and blowing it kills the transport for the whole session — deterministically,
+    # because the retry reads the same file (#13). See
+    # adapters.agent_runner.DEFAULT_MAX_BUFFER_BYTES. 0 = leave the SDK default.
+    sdk_max_buffer_bytes: int = DEFAULT_MAX_BUFFER_BYTES
     # Codex gateway transport-drop retry: a `response.failed`/`stream disconnected`
     # from the LLM gateway is upstream, not agent error. Retry the whole `codex
     # exec` (resumed) up to N times with jittered exponential backoff (base * 2^n).
@@ -510,6 +517,7 @@ class HarnessConfig:
             errors.append("GLM_SETTINGS_FILE is required when FIXER_RUNTIME=glm")
         _require_non_negative(errors, "AGENT_IDLE_TIMEOUT_SECONDS", self.agent_idle_timeout)
         _require_non_negative(errors, "AGENT_MAX_RUNTIME_SECONDS", self.agent_max_runtime)
+        _require_non_negative(errors, "SDK_MAX_BUFFER_BYTES", self.sdk_max_buffer_bytes)
         _require_non_negative(errors, "CODEX_TRANSPORT_RETRIES", self.codex_transport_retries)
         _require_positive(errors, "CODEX_BACKOFF_BASE_SECONDS", self.codex_backoff_base)
         _require_non_negative(errors, "CODEX_MAX_RATE_LIMIT_RETRIES", self.codex_max_rate_limit_retries)
@@ -952,6 +960,9 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         ),
         agent_max_runtime=_coerce_float(
             e, "AGENT_MAX_RUNTIME_SECONDS", _dc_default("agent_max_runtime"), errors
+        ),
+        sdk_max_buffer_bytes=_coerce_int(
+            e, "SDK_MAX_BUFFER_BYTES", _dc_default("sdk_max_buffer_bytes"), errors
         ),
         codex_transport_retries=_coerce_int(
             e, "CODEX_TRANSPORT_RETRIES", _dc_default("codex_transport_retries"), errors

@@ -52,6 +52,7 @@ the issue `ai-working` is the DESIGNED settle path: the in-process reaper sees a
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import Enum
 
@@ -96,6 +97,58 @@ def infra_death(reason: ExitReason | None) -> bool:
     at exactly today's behavior until an adapter starts populating the field.
     """
     return reason in (ExitReason.KILLED_EXTERNALLY, ExitReason.TRANSPORT_DEATH)
+
+
+# ── deterministic transport deaths (#13) ──────────────────────────────────────
+# The breakers assume a death is STOCHASTIC: retry the identical dispatch and it
+# may survive. Some deaths are caused by the INPUT instead, so every retry
+# reproduces them exactly — an unwinnable run bought N times at full session
+# cost. Observed 2026-07-27 (xnmp/tauri-explorer PR #552): the reviewer Read a
+# 2.3MB PNG, base64 x4/3 blew the SDK's message buffer, the transport died, and
+# two retries died on the same Read.
+#
+# Matched against the exception text, so the signature must be a substring the
+# runtime itself emits. Keep this list SHORT and specific: a false positive here
+# escalates a PR a retry would have rescued.
+DETERMINISTIC_DEATH_SIGNATURES: tuple[str, ...] = ("exceeded maximum buffer size",)
+
+# `_trace_message` renders the last stream message as e.g.
+# "AssistantMessage → Read(evidence/shot.png)". The LAST tool call in that line
+# is what the session died on.
+_TRACE_TOOL = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\(([^)]*)\)")
+
+
+@dataclass(frozen=True)
+class DeterministicDeath:
+    """Why a transport death is unwinnable, and (when the runtime captured a
+    trace) which input caused it. `path` is diagnostic only — it names the file
+    for the operator; nothing branches on it."""
+
+    signature: str
+    path: str = ""
+
+
+def deterministic_death(
+    error_text: str, last_trace: str = ""
+) -> DeterministicDeath | None:
+    """Classify a transport death as reproducible-on-retry, or None if it is the
+    ordinary stochastic kind. Pure: both arguments are strings the adapter
+    already has (the exception text and the last-message trace)."""
+    text = error_text or ""
+    for sig in DETERMINISTIC_DEATH_SIGNATURES:
+        if sig in text:
+            return DeterministicDeath(signature=sig, path=offending_path(last_trace))
+    return None
+
+
+def offending_path(last_trace: str) -> str:
+    """The argument of the last tool call in a stream trace, or "" when the
+    trace is absent/unparseable. Never raises — a diagnostic must not add a
+    failure mode to an already-failing path."""
+    matches = _TRACE_TOOL.findall(last_trace or "")
+    if not matches:
+        return ""
+    return matches[-1][1].strip()
 
 
 @dataclass(frozen=True)
