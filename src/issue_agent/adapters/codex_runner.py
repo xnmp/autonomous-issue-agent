@@ -324,6 +324,27 @@ def read_rollout_usage(session_id: str, codex_home: str | None = None) -> dict |
         return None
 
 
+def usage_delta(end: dict | None, start: dict | None) -> dict | None:
+    """Pure: end-of-run counters minus a pre-run baseline, floored at zero.
+
+    A follow-up leg (fix-ci/address-review/rebase) RESUMES the resolve's codex
+    session, and the rollout's `total_token_usage` is cumulative for the whole
+    session — so pricing the raw counter re-ledgers every token the previous
+    leg already paid for (observed 2026-07-27: a 114s fix-ci ledgered $39.57
+    because it carried its resolve's 6M tokens). The ledger wants per-leg
+    spend; the delta is that. `None` end stays None (no usage reported); a
+    missing baseline means the run started its own session — nothing to
+    subtract."""
+    if not isinstance(end, dict):
+        return None
+    if not isinstance(start, dict):
+        return end
+    keys = set(end) | set(start)
+    return {
+        k: max(0, int(end.get(k, 0) or 0) - int(start.get(k, 0) or 0)) for k in keys
+    }
+
+
 def codex_cost_usd(
     usage: dict | None, *, cost_per_mtok_in: float, cost_per_mtok_out: float
 ) -> float:
@@ -669,6 +690,12 @@ class CodexRunner(AgentRuntime):
         # vice versa. `net_attempts` counts network drops; `rl_attempts` counts
         # rate-limits. Both carry the session id forward so the retry RESUMES.
         resume_id = task.resume
+        # Per-leg accounting baseline: tokens the resumed session had ALREADY
+        # burned (and a previous leg already ledgered) before this run started.
+        # Captured once — retries inside this run resume a session whose earlier
+        # attempts were never ledgered, so their tokens must stay in the total.
+        baseline_sid = task.resume or ""
+        baseline_usage = read_rollout_usage(baseline_sid) if baseline_sid else None
         net_attempts = 0
         rl_attempts = 0
         while True:
@@ -690,7 +717,8 @@ class CodexRunner(AgentRuntime):
                 inject_system_prompt=self.inject_system_prompt,
             )
             result, exit_code, stderr, stdout, hung = await self._exec_once(
-                argv, run_task, output_path
+                argv, run_task, output_path,
+                usage_baseline=(baseline_sid, baseline_usage) if baseline_usage else None,
             )
             if hung:
                 # A watchdog fired — surface as a retryable timeout, not a
@@ -780,7 +808,8 @@ class CodexRunner(AgentRuntime):
             await asyncio.sleep(delay)
 
     async def _exec_once(
-        self, argv: list[str], task: AgentTask, output_path: str
+        self, argv: list[str], task: AgentTask, output_path: str,
+        usage_baseline: tuple[str, dict] | None = None,
     ) -> tuple[AgentResult, int, str, str, bool]:
         """One `codex exec` invocation: spawn, stream stderr live, parse the
         envelope. Returns (result, exit_code, stderr, stdout, hung) so run()'s
@@ -977,6 +1006,13 @@ class CodexRunner(AgentRuntime):
         # `codex exec` prints its `session id: <uuid>` header to STDERR (the -o
         # file holds only the final message). Check stderr first, stdout second.
         session_id = _session_id_from_lines(stderr) or _session_id_from_lines(stdout)
+        rollout_usage = read_rollout_usage(session_id)
+        # A resumed session's rollout counter is cumulative; subtract what the
+        # previous leg already ledgered (see usage_delta). Only when this run
+        # really continued THAT session — a resume that fell back to a fresh
+        # session has nothing pre-paid in its counter.
+        if usage_baseline is not None and session_id == usage_baseline[0]:
+            rollout_usage = usage_delta(rollout_usage, usage_baseline[1])
         result = parse_codex_envelope(
             exit_code=exit_code,
             last_message=last_message,
@@ -984,7 +1020,7 @@ class CodexRunner(AgentRuntime):
             stderr=stderr,
             cost_per_mtok_in=self.cost_per_mtok_in,
             cost_per_mtok_out=self.cost_per_mtok_out,
-            usage=read_rollout_usage(session_id),
+            usage=rollout_usage,
         )
         if exit_code < 0 and not hung:
             # A NEGATIVE returncode means terminated by signal -exit_code, and we did

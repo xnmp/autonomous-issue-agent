@@ -18,6 +18,7 @@ from issue_agent.adapters.codex_runner import (
     CodexProvider,
     CodexRunner,
     read_rollout_usage,
+    usage_delta,
     _extract_retry_after_seconds,
     _is_rate_limited,
     _is_transport_drop,
@@ -1034,6 +1035,30 @@ def test_envelope_prefers_caller_supplied_rollout_usage_over_stderr():
     )
     assert r.usage["input_tokens"] == 1_000_000
     assert r.cost_usd == (1_000_000 * 5.0 + 10_000 * 30.0) / 1_000_000.0
+
+
+def test_usage_delta_subtracts_the_already_ledgered_baseline():
+    # A follow-up leg resumes the resolve's session; the rollout counter is
+    # cumulative, so without the delta the leg re-ledgers the resolve's tokens
+    # (observed live: a 114s fix-ci ledgered $39.57 carrying 6M resolve tokens).
+    end = {"input_tokens": 7_809_575, "output_tokens": 17_467,
+           "cache_read_input_tokens": 7_432_192, "cache_creation_input_tokens": 0}
+    start = {"input_tokens": 6_069_388, "output_tokens": 15_541,
+             "cache_read_input_tokens": 5_837_056, "cache_creation_input_tokens": 0}
+    d = usage_delta(end, start)
+    assert d["input_tokens"] == 1_740_187
+    assert d["output_tokens"] == 1_926
+    assert d["cache_read_input_tokens"] == 1_595_136
+
+
+def test_usage_delta_edges():
+    # No end usage → None (no fabricated receipt). No baseline → end unchanged.
+    assert usage_delta(None, {"input_tokens": 5}) is None
+    end = {"input_tokens": 10, "output_tokens": 2}
+    assert usage_delta(end, None) == end
+    # A counter that shrank (rollout replaced/rotated) floors at zero rather
+    # than ledgering negative spend.
+    assert usage_delta({"input_tokens": 3}, {"input_tokens": 9})["input_tokens"] == 0
 
 
 def test_envelope_falls_back_to_stderr_usage_when_no_rollout():
