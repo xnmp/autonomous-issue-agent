@@ -8,6 +8,7 @@ central dispatcher can become a thin role router.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -39,6 +40,9 @@ class FixWorkflowConfig:
     # or the resumed-at dedup mark records a different comment than the decide
     # loop compares against (V1/#13). Default "" keeps existing tests working.
     fix_bot: str = ""
+    # Which fixer runtime the routed model must belong to ("claude" | "codex") —
+    # a codex fixer routed to a Claude alias cannot resolve it (see MODEL_TIERS).
+    fixer_runtime: str = "claude"
 
 
 @dataclass
@@ -127,6 +131,39 @@ class FixWorkflow:
         )
         return result
 
+    async def _routed_fix_cfg(self, issue: int, iss) -> FixTaskConfig:
+        """Difficulty-routed FixTaskConfig for a RESOLVE dispatch (P4.1/#8).
+
+        Runs the cheap classifier ONLY when no FIX_MODEL is pinned — an operator
+        override wins, and a pinned model must not pay the router run. Failure
+        must never cost the dispatch: a router run that errors or returns
+        garbage degrades via route_model's totality (unknown tier → the
+        runtime's `standard`), and a run that RAISES degrades all the way to
+        the unrouted default — resolving on the wrong tier beats not resolving.
+
+        Only the resolve family routes. The follow-up legs (resume/CI/review/
+        rebase) resume an existing session where the work already has shape;
+        re-classifying there would pay router runs to answer a question the
+        resolve leg already answered.
+        """
+        cfg = self.cfg.fix
+        if cfg is None or cfg.model:
+            return cfg
+        try:
+            result = await self._run_logged(
+                "route", issue,
+                task_builders.build_router_task(
+                    iss.title, iss.body, runtime=self.cfg.fixer_runtime
+                ),
+            )
+            tier = result.field("tier")
+        except Exception as exc:  # noqa: BLE001 — routing is advisory, never fatal
+            self.cfg.log(f"agent #{issue}: route — failed ({exc}); dispatching unrouted")
+            return cfg
+        model = task_builders.route_model(tier, self.cfg.fixer_runtime)
+        self.cfg.log(f"agent #{issue}: route — tier={tier or 'unknown'} → model={model}")
+        return dataclasses.replace(cfg, model=model)
+
     async def resolve(self, issue: int) -> None:
         if self.cfg.author_tests_split:
             await self.resolve_split(issue)
@@ -134,7 +171,8 @@ class FixWorkflow:
         iss = self.gateway.get_issue(issue)
         branch = f"fix/{issue}-{slugify(iss.title) or 'issue'}"
         cwd = self._ensure_cwd(issue, branch)
-        task = task_builders.build_resolve_task(issue, iss.title, iss.body, cwd, self.cfg.fix)
+        fix_cfg = await self._routed_fix_cfg(issue, iss)
+        task = task_builders.build_resolve_task(issue, iss.title, iss.body, cwd, fix_cfg)
         result = await self._run_logged("resolve", issue, task)
         self.store.save_session(issue, result.session_id)
         self._decay_infra_deaths(issue, result)
@@ -148,9 +186,10 @@ class FixWorkflow:
         branch = f"fix/{issue}-{slugify(iss.title) or 'issue'}"
         cwd = self._ensure_cwd(issue, branch)
 
+        fix_cfg = await self._routed_fix_cfg(issue, iss)
         if self.store.get_phase(issue) != "authored":
             author = await self.runner.run(
-                task_builders.build_author_task(issue, iss.title, iss.body, cwd, self.cfg.fix)
+                task_builders.build_author_task(issue, iss.title, iss.body, cwd, fix_cfg)
             )
             self.store.save_session(issue, author.session_id)
             self._decay_infra_deaths(issue, author)
@@ -162,16 +201,17 @@ class FixWorkflow:
                 return
             self.store.set_phase(issue, "authored")
 
-        await self._implement_loop(issue, iss, cwd)
+        await self._implement_loop(issue, iss, cwd, fix_cfg)
 
-    async def _implement_loop(self, issue: int, iss, cwd: str) -> None:
+    async def _implement_loop(self, issue: int, iss, cwd: str, fix_cfg=None) -> None:
+        fix_cfg = fix_cfg if fix_cfg is not None else self.cfg.fix
         uphold_note = ""
         trail: list[str] = []
         rounds = 0
         while True:
             impl = await self.runner.run(
                 task_builders.build_implement_task(
-                    issue, iss.title, iss.body, cwd, self.cfg.fix, uphold_note=uphold_note
+                    issue, iss.title, iss.body, cwd, fix_cfg, uphold_note=uphold_note
                 )
             )
             self.store.save_session(issue, impl.session_id)

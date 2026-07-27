@@ -244,6 +244,7 @@ def build_fix_daemon(
         harness_root=cfg.runtime_paths.harness_root,
         log=_log("fix"),
         fix_bot=fix_runtime.bot,
+        fixer_runtime=cfg.fixer_runtime,
         **_spend_cfg(cfg, "fix", ledger),
     )
     # Fixer runtime: Codex (GPT-5.5) swaps the runner AND installs the governor as

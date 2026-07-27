@@ -42,7 +42,10 @@ class RetryRecordingStore(FakeStore):
 def _workflow(gw, store, runner, wt=None, **cfg_overrides):
     cfg_kwargs = dict(
         base_branch="dev",
-        fix=FixTaskConfig("o/r", agent_md="AM"),
+        # Pinned model: these tests predate difficulty routing and assert leg
+        # mechanics, not model choice — a pin keeps the router leg out of their
+        # scripted run sequences. The routing tests below unpin explicitly.
+        fix=FixTaskConfig("o/r", agent_md="AM", model="m"),
         fork_threshold=5,
         author_tests_split=False,
         max_contract_rounds=2,
@@ -861,3 +864,117 @@ def test_an_infra_death_still_leaves_both_halves_standing(tmp_path):
 
     assert store.get_infra_deaths(-100) == 1, "a death must not clear itself"
     assert store.get_infra_deaths(5) == 1, "and the leg's own death is counted"
+
+
+# ── difficulty routing (#8 / P4.1) ────────────────────────────────────────────
+# The resolve family classifies the issue on a cheap router run and picks the
+# tier's model from the ACTIVE runtime's family — but only when no FIX_MODEL is
+# pinned, and never at the price of the dispatch itself.
+
+from issue_agent.app.planners.schemas import ROUTER_SCHEMA
+
+
+def _router_result(tier):
+    return AgentResult(is_error=False, session_id="rt", structured={"tier": tier})
+
+
+def test_resolve_routes_standard_issue_to_sonnet_when_model_unpinned():
+    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
+    runner = SeqRunner([
+        _router_result("standard"),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5"),
+    ])
+
+    asyncio.run(_workflow(
+        gw, FakeStore(), runner, fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    router_task, resolve_task = runner.tasks
+    assert router_task.schema is ROUTER_SCHEMA
+    assert router_task.cwd is None, "the classifier needs no worktree"
+    assert resolve_task.model == "sonnet"
+
+
+def test_resolve_skips_the_router_when_a_model_is_pinned():
+    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
+    runner = FakeRunner(AgentResult(is_error=False, status="pr_opened", session_id="s5"))
+
+    asyncio.run(_workflow(
+        gw, FakeStore(), runner,
+        fix=FixTaskConfig("o/r", agent_md="AM", model="opus"),
+    ).resolve(5))
+
+    assert len(runner.tasks) == 1, "a pinned FIX_MODEL must not pay a router run"
+    assert runner.tasks[0].model == "opus"
+
+
+def test_resolve_routes_within_the_codex_family():
+    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
+    runner = SeqRunner([
+        _router_result("complex"),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5"),
+    ])
+
+    asyncio.run(_workflow(
+        gw, FakeStore(), runner, fixer_runtime="codex",
+        fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    assert runner.tasks[0].model == "gpt-5.6-luna", "router runs on the family's cheapest tier"
+    assert runner.tasks[1].model == "gpt-5.6-sol"
+
+
+def test_garbage_router_output_degrades_to_standard():
+    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
+    runner = SeqRunner([
+        AgentResult(is_error=True, session_id="rt", structured=None),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5"),
+    ])
+
+    asyncio.run(_workflow(
+        gw, FakeStore(), runner, fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    assert runner.tasks[1].model == "sonnet"
+
+
+def test_router_raise_degrades_to_the_unrouted_default():
+    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
+
+    class RouterThenFake:
+        """First run() raises (the router leg); later runs return normally."""
+
+        def __init__(self):
+            self.tasks = []
+
+        async def run(self, task):
+            self.tasks.append(task)
+            if len(self.tasks) == 1:
+                raise RuntimeError("router transport died")
+            return AgentResult(is_error=False, status="pr_opened", session_id="s5")
+
+    runner = RouterThenFake()
+    asyncio.run(_workflow(
+        gw, FakeStore(), runner, fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    assert len(runner.tasks) == 2, "the resolve dispatch must survive a dead router"
+    assert runner.tasks[1].model is None
+
+
+def test_split_mode_routes_once_and_shares_the_model_across_legs():
+    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
+    runner = SeqRunner([
+        _router_result("trivial"),
+        AgentResult(is_error=False, status="tests_authored", session_id="a5"),
+        AgentResult(is_error=False, status="pr_opened", session_id="i5"),
+    ])
+
+    asyncio.run(_workflow(
+        gw, FakeStore(), runner, author_tests_split=True,
+        fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    assert [t.schema is ROUTER_SCHEMA for t in runner.tasks] == [True, False, False]
+    assert runner.tasks[1].model == "haiku"
+    assert runner.tasks[2].model == "haiku", "one classification covers author + implement"

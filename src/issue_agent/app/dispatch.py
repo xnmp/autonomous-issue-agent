@@ -74,6 +74,9 @@ class DispatchConfig:
     # Fixer login, threaded to FixWorkflow so its resume path filters comments
     # with the same rule the decide side uses (see FixWorkflowConfig.fix_bot).
     fix_bot: str = ""
+    # Fixer runtime ("claude" | "codex"), threaded to FixWorkflow so difficulty
+    # routing picks from the runtime's own model family (see MODEL_TIERS).
+    fixer_runtime: str = "claude"
     # ── spend circuit breakers ────────────────────────────────────────────────
     # Which daemon this dispatcher belongs to, and the repo it targets: journal
     # attribution only, but without them a shared ledger cannot answer "who spent
@@ -102,6 +105,7 @@ class DispatchConfig:
             harness_root=self.harness_root,
             log=self.log,
             fix_bot=self.fix_bot,
+            fixer_runtime=self.fixer_runtime,
         )
 
     def review_workflow_config(self) -> ReviewWorkflowConfig:
