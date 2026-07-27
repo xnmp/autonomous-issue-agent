@@ -86,3 +86,19 @@ plus plan — the id_token email claim is still the check that matters).
 - Carried: pgrep char-class breaker; gh label search staleness; stream-vs-
   result usage skew; UTC-day cap window; worktree forensics paths — see the
   fourth handover (now in docs/history/).
+
+## Addendum (post-handover, same session)
+
+- PR #18 (#16 escalation ladder) MERGED and pulled; local main pushed
+  through c8b5923. Daemons reloaded onto it — ladder is live and untested.
+- Backlog triaged with impact/effort labels; #25 filed (codex fixer never
+  sees the target CLAUDE.md — impact:high/effort:low, pairs with #20) plus a
+  tracked-AGENTS.md clobber edge commented there.
+- Quick-win batch for harness self-hosting: #20+#25+#23+#17 (disjoint
+  areas). Prereq: a `config/repos/` overlay for this repo with
+  TEST_CMD='make test'.
+- Root `AGENTS.md` added (defers to CLAUDE.md); `~/.codex/AGENTS.md` holds
+  the operator's distilled global prefs for codex sessions.
+- Next tauri-explorer candidates (fourth handover's untouched list): scm
+  #516/#518, git-graph #521 (one git-graph at a time), #546/#498 are
+  hardware/network-dependent — triage before labelling.
