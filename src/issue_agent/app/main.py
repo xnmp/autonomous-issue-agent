@@ -220,6 +220,24 @@ def build_role(role: str, env: dict | None = None):
     if role == "fix":
         gw = GitHubGateway(cfg.repo, Identity(static_token=env.get("FIX_BOT_TOKEN") or None))
         store = Store(cfg.state_dir)
+        # Arm-at-creation probe (once per boot): only a POSITIVELY verified
+        # review+checks gate on the base branch activates early arming — see
+        # FixConfig.arm_on_open for why no knob can force this on. Probed here
+        # (not in from_env) because it needs the gateway; a flip of the repo's
+        # protection therefore takes effect at the next daemon restart.
+        if cfg.arm_on_open != "0":
+            active = gw.merge_gate_protection(cfg.base_branch)
+            cfg = dataclasses.replace(cfg, arm_on_open_active=active)
+            sys.stderr.write(
+                f"{role}: arm-on-open "
+                + (
+                    f"ACTIVE — {cfg.base_branch} protection verifiably requires "
+                    "review + status checks; auto-merge arms at PR creation\n"
+                    if active else
+                    f"inactive — {cfg.base_branch} protection does not gate "
+                    "merging; auto-merge arms after APPROVE + green CI\n"
+                )
+            )
         return build_fix_daemon(cfg, gw, store, worktrees, runner)
     # Change-probe gate for review/steward observes: 1 REST point per quiet tick
     # instead of a full GraphQL world build (the 2026-07-26 rate-limit exhaustion

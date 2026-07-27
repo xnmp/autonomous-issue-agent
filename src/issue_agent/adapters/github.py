@@ -584,6 +584,32 @@ class GitHubGateway:
         ])
         return out.strip()
 
+    def merge_gate_protection(self, base_branch: str) -> bool:
+        """True iff the base branch's protection makes a merge conditional on
+        BOTH ≥1 approving review AND ≥1 required status check — the precondition
+        for arming auto-merge at PR creation (FixConfig.arm_on_open). Anything
+        less reads False: on a base where GitHub does not hold the gate, early
+        arming would merge unreviewed work. Fail-closed on every ambiguity —
+        404 (no protection), 403 (token cannot read the admin endpoint), or
+        unparseable output all mean "no verified gate"."""
+        out = self._gh(["api", f"repos/{self.repo}/branches/{base_branch}/protection"])
+        if not out.strip():
+            return False
+        try:
+            d = json.loads(out)
+        except ValueError:
+            return False
+        if not isinstance(d, dict):
+            return False
+        reviews = (d.get("required_pull_request_reviews") or {}).get(
+            "required_approving_review_count", 0
+        ) or 0
+        rsc = d.get("required_status_checks") or {}
+        contexts = rsc.get("contexts") or [
+            c.get("context") for c in (rsc.get("checks") or []) if isinstance(c, dict)
+        ]
+        return int(reviews) >= 1 and any(contexts)
+
     def has_open_blocker(self, number: int) -> bool:
         """True iff issue `number` has ≥1 OPEN GitHub-native 'blocked by'
         dependency. Two-step, cheapest-first: the issue object embeds an

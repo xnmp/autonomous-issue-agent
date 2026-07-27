@@ -183,6 +183,7 @@ def build_fix_daemon(
         max_rebase_retries=fix_runtime.max_rebase_retries,
         max_resolve_retries=fix_runtime.max_resolve_retries,
         max_infra_deaths=fix_runtime.max_infra_deaths,
+        arm_on_open=cfg.arm_on_open_active,
     )
     journal = _journal(store)
     ledger = default_ledger_path()

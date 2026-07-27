@@ -1210,3 +1210,30 @@ def test_change_signature_is_one_rest_point_and_fails_soft():
     assert token == "t"
 
     assert GitHubGateway("o/r", Identity(), runner=FakeRunner()).change_signature() == ""
+
+
+def test_merge_gate_protection_demands_both_reviews_and_checks():
+    """arm_on_open's precondition: only a base whose protection requires ≥1
+    approving review AND ≥1 status check verifies. Anything less — and every
+    ambiguity (404, 403, garbage) — must read False, because early arming
+    without the server-side gate merges unreviewed work."""
+    full = {"required_pull_request_reviews": {"required_approving_review_count": 1},
+            "required_status_checks": {"contexts": ["frontend", "rust"]}}
+    checks_only = {"required_status_checks": {"contexts": ["frontend"]}}
+    reviews_only = {"required_pull_request_reviews": {"required_approving_review_count": 2}}
+    zero_reviews = {"required_pull_request_reviews": {"required_approving_review_count": 0},
+                    "required_status_checks": {"contexts": ["frontend"]}}
+    new_shape = {"required_pull_request_reviews": {"required_approving_review_count": 1},
+                 "required_status_checks": {"checks": [{"context": "rust", "app_id": 15368}]}}
+
+    def gw(payload):
+        fr = FakeRunner({"api repos/o/r/branches/dev/protection": payload})
+        return GitHubGateway("o/r", Identity(static_token="t"), runner=fr)
+
+    assert gw(full).merge_gate_protection("dev") is True
+    assert gw(new_shape).merge_gate_protection("dev") is True
+    assert gw(checks_only).merge_gate_protection("dev") is False
+    assert gw(reviews_only).merge_gate_protection("dev") is False
+    assert gw(zero_reviews).merge_gate_protection("dev") is False
+    assert gw("").merge_gate_protection("dev") is False        # 404/403 → fail-soft ""
+    assert gw("not json").merge_gate_protection("dev") is False

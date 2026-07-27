@@ -132,6 +132,14 @@ class HarnessConfig:
     # flag — its decide reads CI/mergeability, which the probe cannot see.
     world_probe: bool = True
     world_probe_ttl_seconds: int = 300
+    # ARM_ON_OPEN knob: "auto" (default) = at fix-daemon boot, probe the base
+    # branch's protection and arm auto-merge at PR creation iff it verifiably
+    # requires ≥1 review and ≥1 status check; "0" = never arm early. There is
+    # deliberately no "1": forcing early arming without the verified server-side
+    # gate would merge unreviewed work.
+    arm_on_open: str = "auto"
+    # The probe's boot-time verdict (main.build_role fills it; never from env).
+    arm_on_open_active: bool = False
     auto_merge: bool = True
     merge_method: str = "squash"
     ci_ignore_checks: str = ""
@@ -730,6 +738,7 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         steward_state_dir=e.get("STEWARD_STATE_DIR") or _default_state_dir(repo, "steward-agent"),
         worktree_root=e.get("WORKTREE_ROOT", _dc_default("worktree_root")),
         poll_seconds=_coerce_int(e, "POLL_SECONDS", _dc_default("poll_seconds"), errors),
+        arm_on_open=e.get("ARM_ON_OPEN", _dc_default("arm_on_open")),
         world_probe=_b(e, "WORLD_PROBE", _dc_default("world_probe"), errors),
         world_probe_ttl_seconds=_coerce_int(
             e, "WORLD_PROBE_TTL_SECONDS", _dc_default("world_probe_ttl_seconds"), errors

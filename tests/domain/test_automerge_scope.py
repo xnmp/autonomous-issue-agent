@@ -79,3 +79,41 @@ def test_harness_prs_are_still_branch_updated():
                 reviews=APPROVED, checks=GREEN,
                 mergeable="MERGEABLE", merge_state="BEHIND")
     assert should_update_branch(pr, _cfg()) is True
+
+
+# ── arm_on_open: protection-verified early arming ─────────────────────────────
+PENDING = (Check(name="ci", state="IN_PROGRESS", bucket="pending"),)
+
+
+def test_arm_on_open_arms_before_review_and_ci():
+    """With a VERIFIED review+checks gate on the base branch, waiting for
+    APPROVE+green here only adds daemon latency (#539 sat approved+green for
+    the length of an unrelated resolve, 2026-07-27) — GitHub holds the gate."""
+    pr = PRView(number=540, head_ref_name="fix/522-lanes", reviews=(), checks=PENDING)
+    assert should_automerge(pr, FixState(), _cfg(arm_on_open=True)) is True
+
+
+def test_arm_on_open_still_respects_scope_marker_and_conflicts():
+    """Early arming relaxes ONLY the review/CI wait; every ownership and
+    once-only guard keeps its teeth."""
+    cfg = _cfg(arm_on_open=True)
+    foreign = PRView(number=1, head_ref_name="dependabot/npm/x", reviews=(), checks=())
+    assert should_automerge(foreign, FixState(), cfg) is False
+    ours = PRView(number=2, head_ref_name="fix/9-t", reviews=(), checks=())
+    assert should_automerge(ours, FixState(automerge_enabled=frozenset({2})), cfg) is False
+    conflicted = PRView(number=3, head_ref_name="fix/9-t", reviews=(), checks=(),
+                        mergeable="CONFLICTING")
+    assert should_automerge(conflicted, FixState(), cfg) is False
+    solo = FixConfig(auto_merge=True, identity_mode=IdentityMode.SOLO,
+                     fix_bot="fix-bot", arm_on_open=True)
+    assert should_automerge(ours, FixState(), solo) is False
+
+
+def test_without_arm_on_open_unreviewed_or_red_prs_stay_unarmed():
+    """The default path is unchanged: no verified server-side gate means the
+    harness itself is the gate, and it waits for APPROVE + green."""
+    unreviewed = PRView(number=4, head_ref_name="fix/9-t", reviews=(), checks=GREEN)
+    assert should_automerge(unreviewed, FixState(), _cfg()) is False
+    red = PRView(number=5, head_ref_name="fix/9-t", reviews=APPROVED,
+                 checks=(Check(name="ci", state="COMPLETED", bucket="fail"),))
+    assert should_automerge(red, FixState(), _cfg()) is False

@@ -69,6 +69,15 @@ class FixConfig:
     auto_rebase_conflicts: bool = True
     max_rebase_retries: int = 3
     max_resolve_retries: int = 3
+    # Arm auto-merge at PR CREATION instead of after APPROVE+CI. Only ever set
+    # True after the adapter has POSITIVELY verified that the base branch's
+    # protection requires ≥1 approving review AND ≥1 status check (see
+    # GitHubGateway.merge_gate_protection) — with the gate held server-side,
+    # arming early just delegates the same ordering to GitHub, which then merges
+    # the instant review+checks land, with no daemon on the critical path. On an
+    # unprotected base this flag would mean merging unreviewed work, which is
+    # why no env knob can force it True without the probe.
+    arm_on_open: bool = False
     # SEPARATE, HIGHER ceiling for sessions that die BEFORE returning a result
     # (review C3/D2c). "Infra deaths are not attempts" stays true for every
     # retry breaker above (FAILURE-MODES #58) — but a leg whose session keeps
@@ -184,9 +193,10 @@ def issues_needing_resume(
 
 def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
     """Port of watcher-lib.sh:maybe_automerge gating. Requires: AUTO_MERGE on, a
-    branch the harness itself authored, no existing marker, an APPROVED review by
-    a DISTINCT actor, CI ok|none, and three-identity mode (solo has no independent
-    approver → 422 on self-merge)."""
+    branch the harness itself authored, no existing marker, three-identity mode
+    (solo has no independent approver → 422 on self-merge), and then EITHER
+    arm_on_open (verified branch protection holds the review+CI gate server-side)
+    OR an APPROVED review by a DISTINCT actor with CI ok|none."""
     if not cfg.auto_merge:
         return False
     # Merge ONLY our own work. The reviewer deliberately adopts unlabelled PRs
@@ -207,9 +217,6 @@ def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
         return False
     if cfg.identity_mode != IdentityMode.THREE:
         return False
-    review = latest_other_review(pr.reviews, cfg.fix_bot)
-    if review is None or review.state != REVIEW_APPROVED:
-        return False
     # A CONFLICTING PR cannot merge no matter what gh is told — arming it just
     # burns a gh call + verification probe per poll and logs a refusal every
     # 20s until the REBASE leg lands (observed on #534, 2026-07-26, after the
@@ -217,6 +224,18 @@ def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
     # marker). The rebase path owns conflicted PRs; automerge re-fires the
     # first poll after the branch is mergeable again.
     if pr.is_conflicting():
+        return False
+    # arm_on_open: branch protection (verified at boot) already refuses the
+    # merge until a review approves and the required checks pass, so waiting
+    # for them HERE only adds daemon latency — a busy fixer (one synchronous
+    # session per tick) left #539 APPROVED+green and unmerged for the length
+    # of an unrelated resolve (2026-07-27). Arm immediately; GitHub holds the
+    # gate. The review/CI preconditions below remain the whole gate when the
+    # base is unprotected.
+    if cfg.arm_on_open:
+        return True
+    review = latest_other_review(pr.reviews, cfg.fix_bot)
+    if review is None or review.state != REVIEW_APPROVED:
         return False
     return ci_state(pr.checks, cfg.ci_ignore_checks) in (CIState.OK, CIState.NONE)
 
