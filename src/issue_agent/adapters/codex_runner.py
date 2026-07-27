@@ -25,7 +25,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from ..domain.agent_task import AgentRuntime, AgentTask
+from ..domain.agent_task import AgentRuntime, AgentTask, git_identity_env
 from ..domain.outcome import AgentResult, ExitReason, Outcome, classify_outcome
 
 
@@ -840,7 +840,14 @@ class CodexRunner(AgentRuntime):
         loop above owns only retry policy."""
         import asyncio
 
-        proc_env = {**os.environ, **self.env, **task.env}
+        # Commit attribution: author/committer name carries the effective model.
+        # Below self.env/task.env so an explicit override stays an override.
+        proc_env = {
+            **os.environ,
+            **git_identity_env(task.model or self.default_model),
+            **self.env,
+            **task.env,
+        }
         self._log(f"codex: exec model={task.model or self.default_model} cwd={task.cwd or '.'}")
         # Set cwd on the subprocess too, not only via `-C`: the resume subcommand
         # rejects `-C`, so this is how a resumed run still executes in the worktree

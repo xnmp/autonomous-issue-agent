@@ -19,7 +19,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-from ..domain.agent_task import AgentRuntime, AgentTask
+from ..domain.agent_task import AgentRuntime, AgentTask, git_identity_env
 from ..domain.outcome import AgentResult, ExitReason
 
 # Longest single slice we block waiting for the next stream event before we come
@@ -130,8 +130,11 @@ def build_option_kwargs(
         kwargs["resume"] = task.resume
     if task.fork_session:
         kwargs["fork_session"] = True
-    if task.env:
-        kwargs["env"] = dict(task.env)
+    # Commit attribution: author/committer name carries the leg's model. Task
+    # env still wins so an explicit override stays an override.
+    env = {**git_identity_env(task.model), **task.env}
+    if env:
+        kwargs["env"] = env
     if task.mcp_servers:
         kwargs["mcp_servers"] = {m.name: m.config for m in task.mcp_servers}
     if task.subagents:
