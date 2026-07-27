@@ -40,15 +40,11 @@ job someone still has to do; the same file in `history/` is a record.
 
 ## open/
 
-- [2026-07-26-first-real-deployment.md](open/2026-07-26-first-real-deployment.md)
-  — **start here.** What the first real deployment against xnmp/tauri-explorer
-  actually did: one PR merged end-to-end unsupervised, four blocker fixes none of
-  the tests could have caught, what is still open, and which issue shapes are
-  safe to point it at
-- [2026-07-26-first-run-handover.md](open/2026-07-26-first-run-handover.md) —
-  how to do the first real run: why solo mode, the exact recipe, what to watch,
-  when to abort. **Its predictions are superseded** by the deployment record
-  above wherever the two disagree; the setup recipe is still good
+- [2026-07-27-handover-fourth-deployment.md](open/2026-07-27-handover-fourth-deployment.md)
+  — **start here.** The working brief for the next deployment session: current
+  daemon state, everything that changed in the optimization session and what to
+  watch on its first real dispatch (routing, synthetic codex pricing, patch-id
+  skips, holds, recurrences), candidate issue batch, monitoring recipe, gotchas
 - [residuals.md](open/residuals.md) — everything deliberately still open, why,
   and what triggers the work. **Read §1 before pointing this at a real repo.**
 - [issues/](open/issues/) — three unresolved incident write-ups, not
@@ -72,6 +68,16 @@ Read in this order to understand how the harness got here:
    independent re-review of that remediation, which found five more P0s, **two
    of them introduced by the remediation itself**. Its §4 residuals are live and
    mirrored into `open/residuals.md`
+6. Deployment era, in order:
+   [2026-07-26-first-run-handover.md](history/2026-07-26-first-run-handover.md)
+   (the recipe) →
+   [2026-07-26-first-real-deployment.md](history/2026-07-26-first-real-deployment.md)
+   (first unsupervised merge + four blocker fixes) →
+   [2026-07-26-second-deployment-session.md](history/2026-07-26-second-deployment-session.md) →
+   [2026-07-27-third-deployment-session.md](history/2026-07-27-third-deployment-session.md)
+   (5 merges/day, codex runtime, spend telemetry) →
+   [2026-07-27-handover-optimization-session.md](history/2026-07-27-handover-optimization-session.md)
+   (the brief that became harness #2–#10 — all closed 2026-07-27)
 
 The through-line, and the reason §5 of that last document is worth reading even
 if you skip the rest: the defects that survived longest were **absence** bugs —
