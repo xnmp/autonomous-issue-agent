@@ -258,12 +258,35 @@ def check_pr_base(pr_base: str, base_branch: str) -> GateResult:
     return ALLOW
 
 
+# Denials that include the full required skeleton, so ONE retry fixes the body.
+# Both #517 and #530 (2026-07-27) hit this gate twice each: the agent drafts
+# the AC as an issue comment in minute 2, then forgets the PR-body section in
+# minute 35 — and a message naming only the missing header invited a second
+# failure on the next requirement. Cost per issue: ~1.5 min + 2 gate bounces.
+_PR_BODY_SKELETON = (
+    " Required body shape:\n"
+    "  ## Acceptance Criteria\n"
+    "  - [ ] <criterion 1>\n"
+    "    ![AC 1](evidence/ac-1-<slug>.png)   <- one image per VISUAL criterion\n"
+    "  - [ ] <criterion 2>\n"
+    "  ...\n"
+    "  Fixes #<issue-number>\n"
+    "Reuse the criteria you already posted as the issue's AC comment."
+)
+
+
 def check_pr_body(body: str) -> GateResult:
     """AC section + a closing keyword linking the issue. Port of §2/§3."""
     if "## Acceptance Criteria" not in body:
-        return deny("PR body is missing the '## Acceptance Criteria' section")
+        return deny(
+            "PR body is missing the '## Acceptance Criteria' section."
+            + _PR_BODY_SKELETON
+        )
     if not CLOSING_KEYWORD_RE.search(body):
-        return deny("PR body must link the issue, e.g. 'Fixes #<issue>'")
+        return deny(
+            "PR body must link the issue with a closing keyword, e.g. "
+            "'Fixes #<issue>'." + _PR_BODY_SKELETON
+        )
     return ALLOW
 
 

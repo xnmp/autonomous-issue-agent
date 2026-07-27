@@ -604,3 +604,14 @@ def test_head_is_detached_only_for_non_branch_head_values():
     assert head_is_detached("HEAD") and head_is_detached("") and head_is_detached(" ")
     assert not head_is_detached("fix/42-x")
     assert not head_is_detached("dev")
+
+
+def test_pr_body_denial_teaches_the_full_required_shape():
+    """Both 2026-07-27 sessions hit this gate twice: a denial naming only the
+    missing header invites a second bounce on the next requirement. The denial
+    must carry the whole skeleton so ONE retry can fix the body."""
+    missing_ac = check_pr_body("no sections here")
+    assert "## Acceptance Criteria" in missing_ac.reason
+    assert "Fixes #" in missing_ac.reason
+    missing_kw = check_pr_body("## Acceptance Criteria\n- x")
+    assert "Fixes #" in missing_kw.reason and "- [ ]" in missing_kw.reason

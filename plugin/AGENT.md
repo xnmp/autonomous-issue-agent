@@ -164,7 +164,19 @@ don't keep going back to edit it — each re-plan costs a full model round-trip.
 8. Spawn the adversarial pre-PR subagent (fresh context, given only the diff +
    evidence + acceptance criteria). It must return PASS. Write its verdict to
    `.harness/adversarial-verdict` as `PASS <reason>` or `FAIL <reason>` (via Bash,
-   e.g. `echo "PASS …" > .harness/adversarial-verdict`). On FAIL, fix and re-run it.
+   e.g. `echo "PASS …" > .harness/adversarial-verdict`).
+   **On FAIL: fix the findings, then verify the FIXES — do not re-run the full
+   review.** Spawn a SCOPED verifier subagent (fresh context) given only: the
+   FAIL findings verbatim, the diff of your fixes (diff since the review ran),
+   and the acceptance criteria. Its job: (a) confirm each finding is genuinely
+   resolved, (b) review the fix diff itself for regressions it introduces —
+   a fix that adds a guard/handler often breaks an adjacent behaviour (observed:
+   a shortcut guard that stole keys from the embedded terminal). It returns
+   PASS/FAIL the same way; on FAIL, fix and re-verify (scoped again). Only if
+   the scoped verifier fails TWICE on the same finding do you escalate back to
+   one full fresh review. (A full re-review costs 6–9 min against the scoped
+   verifier's 1–2 and, measured across sessions, was re-reading an unchanged
+   diff to re-derive the same conclusions.)
    Instruct the subagent to FAIL on any of these, not just outright bugs:
    - **Tautological test** — passes regardless of the change (asserts a literal
      against itself, imports nothing, or mocks away the thing under test).
