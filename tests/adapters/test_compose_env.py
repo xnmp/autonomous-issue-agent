@@ -43,6 +43,7 @@ no real gh auth / tree-sitter needed) — per the wave brief's suggestion to
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -707,3 +708,179 @@ def test_two_deployments_compose_to_separate_files(tmp_path):
     assert "REPO=acme/alpha" in alpha.read_text()
     assert "REPO=acme/beta" in beta.read_text()
     assert not (tmp_path / "config" / ".active.env").exists()
+
+
+# ── CI-on-base-branch preflight (keifu deployment, 2026-07-28) ─────────────────
+# Three failures found by hand on the xnmp/keifu preflight, none of which any
+# existing check could see:
+#
+#   * CI triggered on `main` while every PR targeted `chong-dev`, so no PR had
+#     ever received a check. `ci_state` returns CIState.NONE for a PR with no
+#     checks and domain/fix.py:315/:340 treat NONE identically to OK — approved
+#     PRs would have auto-merged with zero CI verification, silently.
+#   * The repo's `Security Audit` job is `continue-on-error: true`. GitHub still
+#     reports its conclusion as FAILURE, and domain/ci.py:45 makes any fail
+#     bucket a CIState.FAILURE, so the harness would have burned fix-ci legs
+#     forever on a check no change can clear.
+#   * A MERGE_METHOD the repo forbids fails at the last step of an already
+#     fully-paid-for issue.
+#
+# These drive the REAL bin/doctor.sh with a gh stub that answers the three calls
+# the section makes. `jq` is deliberately NOT stubbed here (unlike
+# _fake_tool_path) — the section's detection lives in its jq programs, so a
+# stubbed jq would test nothing.
+def _fake_ci_tools(
+    tmp_path: Path,
+    *,
+    workflows: int = 1,
+    prs: list | None = None,
+    allow_squash: bool = True,
+) -> Path:
+    """PATH dir whose `gh` answers the CI section's three queries from fixture
+    data. Everything else behaves like _fake_tool_path's stub."""
+    fake_bin = tmp_path / "fake_ci_bin"
+    fake_bin.mkdir()
+    pr_json = json.dumps(prs if prs is not None else [])
+    gh = f"""#!/usr/bin/env bash
+if [ "$1" = "--version" ]; then echo "gh version 0.0.0-fake"; exit 0; fi
+if [ "$1" = "api" ] && [ "$2" = "user" ]; then echo "fake-user"; exit 0; fi
+if [ "$1" = "repo" ] && [ "$2" = "view" ]; then exit 0; fi
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then cat <<'JSON'
+{pr_json}
+JSON
+exit 0; fi
+if [ "$1" = "api" ]; then
+  case "$2" in
+    */actions/workflows) echo '{workflows}'; exit 0 ;;
+    repos/*)             echo '{str(allow_squash).lower()}'; exit 0 ;;
+  esac
+fi
+exit 0
+"""
+    (fake_bin / "gh").write_text(gh)
+    for name, body in {
+        "claude": '#!/usr/bin/env bash\necho "claude 0.0.0-fake"\n',
+        "uv": (
+            '#!/usr/bin/env bash\n'
+            'if [ "$1" = "--version" ]; then echo "uv 0.0.0-fake"; exit 0; fi\n'
+            'exit 2\n'
+        ),
+    }.items():
+        (fake_bin / name).write_text(body)
+    for p in fake_bin.iterdir():
+        p.chmod(p.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return fake_bin
+
+
+def _ci_doctor(tmp_path: Path, extra_env: dict, **fixture) -> subprocess.CompletedProcess:
+    fake_bin = _fake_ci_tools(tmp_path, **fixture)
+    harness = tmp_path / "harness"
+    (harness / "config" / "repos").mkdir(parents=True, exist_ok=True)
+    env = {
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "HARNESS_ROOT": str(harness),
+        "REPO": "acme/widget",
+        "BASE_BRANCH": "trunk",
+        "FIX_BOT": "acme-fixer",
+        "REVIEW_BOT": "acme-review",
+        "STEWARD_BOT": "acme-review",
+    }
+    env.update(extra_env)
+    return _run_doctor(env)
+
+
+def _pr(number: int, checks: list | None) -> dict:
+    return {"number": number, "statusCheckRollup": checks}
+
+
+def test_doctor_errors_when_no_pr_into_base_ever_got_a_check(tmp_path):
+    """The keifu shape: active workflows exist, but they trigger on a different
+    branch, so every PR into the base reads CIState.NONE — which the harness
+    merges on. Must be an ERROR, not a warning: it silently removes CI from the
+    merge gate entirely."""
+    result = _ci_doctor(
+        tmp_path, {},
+        workflows=2,
+        prs=[_pr(9, []), _pr(8, []), _pr(7, None)],
+    )
+    assert result.returncode != 0
+    assert "NOT ONE of the last 3 PR(s) into 'trunk' received a single check" in result.stdout
+    # It must name the consequence, not just the symptom — an operator who does
+    # not know NONE is treated as OK will read a checkless PR as harmless.
+    assert "CIState.NONE" in result.stdout
+
+
+def test_doctor_accepts_a_base_branch_whose_prs_do_get_checks(tmp_path):
+    """Anti-vacuity twin: the same code path must stay quiet on a healthy repo."""
+    result = _ci_doctor(
+        tmp_path, {},
+        workflows=1,
+        prs=[_pr(9, [{"name": "Test", "conclusion": "SUCCESS"}])],
+    )
+    assert "NOT ONE of the last" not in result.stdout
+    assert "PRs into 'trunk' receive checks (1 of the last 1 sampled)" in result.stdout
+
+
+def test_doctor_flags_a_check_red_on_every_pr_and_escapes_the_suggested_regex(tmp_path):
+    """The continue-on-error shape. The suggested CI_IGNORE_CHECKS value must be
+    a usable ERE: real check names contain parentheses ("Test (ubuntu-latest)"),
+    which are regex metacharacters."""
+    always_red = {"name": "Test (ubuntu-latest)", "conclusion": "FAILURE"}
+    result = _ci_doctor(
+        tmp_path, {},
+        workflows=1,
+        prs=[
+            _pr(9, [{"name": "Lint", "conclusion": "SUCCESS"}, always_red]),
+            _pr(8, [{"name": "Lint", "conclusion": "SUCCESS"}, always_red]),
+        ],
+    )
+    assert "FAILED on all 2 sampled PR(s)" in result.stdout
+    assert r"CI_IGNORE_CHECKS='^Test \(ubuntu-latest\)$'" in result.stdout
+    # A check that passed at least once is NOT persistently red.
+    assert "'Lint'" not in result.stdout
+
+
+def test_doctor_does_not_flag_a_check_that_passed_at_least_once(tmp_path):
+    """One flaky red must say nothing — otherwise the check trains operators to
+    add CI_IGNORE_CHECKS entries that mask real breaks."""
+    result = _ci_doctor(
+        tmp_path, {},
+        workflows=1,
+        prs=[
+            _pr(9, [{"name": "Flaky", "conclusion": "FAILURE"}]),
+            _pr(8, [{"name": "Flaky", "conclusion": "SUCCESS"}]),
+        ],
+    )
+    assert "FAILED on all" not in result.stdout
+
+
+def test_doctor_is_quiet_when_ci_ignore_checks_already_covers_the_red_check(tmp_path):
+    result = _ci_doctor(
+        tmp_path, {"CI_IGNORE_CHECKS": "^Security Audit$"},
+        workflows=1,
+        prs=[
+            _pr(9, [{"name": "Security Audit", "conclusion": "FAILURE"}]),
+            _pr(8, [{"name": "Security Audit", "conclusion": "FAILURE"}]),
+        ],
+    )
+    assert "CI_IGNORE_CHECKS already drops it" in result.stdout
+    assert "Suppress it with" not in result.stdout
+
+
+def test_doctor_errors_when_the_repo_forbids_the_configured_merge_method(tmp_path):
+    result = _ci_doctor(
+        tmp_path, {"MERGE_METHOD": "squash"},
+        workflows=1,
+        prs=[_pr(9, [{"name": "Test", "conclusion": "SUCCESS"}])],
+        allow_squash=False,
+    )
+    assert result.returncode != 0
+    assert "MERGE_METHOD=squash is DISABLED" in result.stdout
+
+
+def test_doctor_says_so_when_the_repo_has_no_workflows_at_all(tmp_path):
+    """Not an error — a repo may legitimately have no CI. But the operator must
+    be told that this makes the reviewer and TEST_CMD the entire merge gate."""
+    result = _ci_doctor(tmp_path, {}, workflows=0)
+    assert "no active Actions workflows" in result.stdout
+    assert "NONE exactly like OK" in result.stdout
