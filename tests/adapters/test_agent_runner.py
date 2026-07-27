@@ -822,3 +822,25 @@ def test_wall_timeout_result_carries_the_tokens_spent_before_the_abort():
 
     assert res.exit_reason is ExitReason.WALL_TIMEOUT
     assert res.usage == {"output_tokens": 22349}
+
+
+# ---- commit-attribution identity (git author = "Harness - <model>") ----
+
+
+def test_env_carries_git_identity_when_model_set():
+    kw = build_option_kwargs(AgentTask(prompt="p", model="claude-sonnet-5"))
+    assert kw["env"]["GIT_AUTHOR_NAME"] == "Harness - claude-sonnet-5"
+    assert kw["env"]["GIT_COMMITTER_NAME"] == "Harness - claude-sonnet-5"
+
+
+def test_task_env_override_beats_identity():
+    kw = build_option_kwargs(
+        AgentTask(prompt="p", model="m", env={"GIT_AUTHOR_NAME": "me"})
+    )
+    assert kw["env"]["GIT_AUTHOR_NAME"] == "me"
+    assert kw["env"]["GIT_COMMITTER_NAME"] == "Harness - m"
+
+
+def test_no_model_no_task_env_emits_no_env():
+    kw = build_option_kwargs(AgentTask(prompt="p"))
+    assert "env" not in kw

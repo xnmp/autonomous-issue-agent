@@ -90,6 +90,18 @@ class AgentTask:
         return tools
 
 
+def git_identity_env(model: str | None) -> dict[str, str]:
+    """Commit-attribution identity for an agent leg: author/committer NAME is
+    "Harness - <model>" so target-repo history shows which model wrote each
+    commit. Emails are deliberately untouched — the ambient email keeps GitHub
+    account linkage intact. No model → empty dict (say nothing), so a task that
+    never resolved a model changes no environment."""
+    if not model:
+        return {}
+    name = f"Harness - {model}"
+    return {"GIT_AUTHOR_NAME": name, "GIT_COMMITTER_NAME": name}
+
+
 @runtime_checkable
 class AgentRuntime(Protocol):
     """The port an agent runtime must satisfy to run a fixer task: take an

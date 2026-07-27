@@ -158,7 +158,7 @@ def test_router_task_is_cheap_and_schemad():
     t = build_router_task("Tidy readme", "typo", model="haiku")
     assert t.schema is ROUTER_SCHEMA
     assert t.model == "haiku"
-    assert t.max_budget_usd == 0.10
+    assert t.max_budget_usd == 2.00  # raised from $0.10 in 0627d9c
     assert t.append_system_prompt == ""            # no system prompt for the router
 
 
