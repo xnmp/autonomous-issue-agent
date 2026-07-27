@@ -1420,3 +1420,63 @@ def test_a_broken_journal_never_fails_a_dispatch():
     ).resolve(5))
 
     assert runner.tasks[1].effort is Effort.HIGH
+
+
+# ── #21: repair legs inherit the resolve's routed model ──
+
+
+def _failing_ci_pr():
+    return FakeGateway(
+        prs={100: PRView(100, head_ref_name="fix/5-token", closing_issue=5,
+                         checks=(Check("unit", bucket="fail"),))},
+    )
+
+
+def test_fix_ci_inherits_the_resolves_routed_model():
+    """The resolve routed to a tiered model; the repair leg resuming that
+    session must run the SAME reasoner, not the configured default (#21)."""
+    store = FakeStore()
+    store.models[5] = "gpt-routed"
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="c5"))
+
+    asyncio.run(_workflow(
+        _failing_ci_pr(), store, runner,
+        fix=FixTaskConfig("o/r", agent_md="AM"),  # unpinned — routing owns model
+    ).fix_ci(100))
+
+    assert runner.tasks[0].model == "gpt-routed"
+
+
+def test_fix_ci_pinned_model_beats_the_stored_marker():
+    store = FakeStore()
+    store.models[5] = "gpt-routed"
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="c5"))
+
+    asyncio.run(_workflow(_failing_ci_pr(), store, runner).fix_ci(100))  # model="m"
+
+    assert runner.tasks[0].model == "m"
+
+
+def test_fix_ci_without_marker_keeps_the_runtime_default():
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="c5"))
+
+    asyncio.run(_workflow(
+        _failing_ci_pr(), FakeStore(), runner,
+        fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).fix_ci(100))
+
+    assert runner.tasks[0].model is None
+
+
+def test_resolve_persists_its_model_for_later_repair_legs():
+    gw = FakeGateway(
+        issues={5: IssueView(5, title="t", body="b")},
+        prs={100: PRView(100)},
+        pr_for_issue={5: 100},
+    )
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s5"))
+
+    asyncio.run(_workflow(gw, store, runner).resolve(5))
+
+    assert store.models[5] == "m"

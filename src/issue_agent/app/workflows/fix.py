@@ -315,6 +315,15 @@ class FixWorkflow:
         cfg = self.cfg.fix
         if cfg is None:
             return cfg
+        # #21: resume the session with the model that BUILT it. A repair leg
+        # used to dispatch with no model, and the runner's fallback silently
+        # swapped the routed reasoner for the configured default under the
+        # live transcript. A pinned FIX_MODEL still wins; no stored marker
+        # (pre-#21 sessions, unrouted resolves) keeps today's fallback.
+        if not cfg.model:
+            inherited = self.store.get_model(issue)
+            if inherited:
+                cfg = dataclasses.replace(cfg, model=inherited)
         # Behind the kill switch: with escalation off nothing reads the labels,
         # so paying a `gh issue view` per repair leg would be pure waste.
         if iss is None and self.cfg.escalate_on_evidence:
@@ -369,6 +378,7 @@ class FixWorkflow:
         branch = f"fix/{issue}-{slugify(iss.title) or 'issue'}"
         cwd = self._ensure_cwd(issue, branch)
         fix_cfg = await self._routed_fix_cfg(issue, iss)
+        self.store.save_model(issue, fix_cfg.model)
         task = task_builders.build_resolve_task(issue, iss.title, iss.body, cwd, fix_cfg)
         result = await self._run_logged("resolve", issue, task)
         self.store.save_session(issue, result.session_id)
@@ -384,6 +394,7 @@ class FixWorkflow:
         cwd = self._ensure_cwd(issue, branch)
 
         fix_cfg = await self._routed_fix_cfg(issue, iss)
+        self.store.save_model(issue, fix_cfg.model)
         if self.store.get_phase(issue) != "authored":
             author = await self.runner.run(
                 task_builders.build_author_task(issue, iss.title, iss.body, cwd, fix_cfg)
