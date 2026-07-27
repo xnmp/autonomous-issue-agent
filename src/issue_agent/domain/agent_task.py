@@ -15,6 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
+from .effort import Effort
 from .outcome import AgentResult
 
 
@@ -58,6 +59,13 @@ class AgentTask:
     allowed_tools: tuple[str, ...] = ()
     disallowed_tools: tuple[str, ...] = ()
     model: str | None = None
+    # How hard this leg should think (harness #16). None = "say nothing", which
+    # leaves each runtime on whatever default it already had — the codex runner's
+    # CODEX_REASONING_EFFORT, the Claude SDK's own. Set only when the harness has
+    # an opinion (an operator knob, or the escalation ladder), so adding this
+    # field changed no existing dispatch. Rendered per runtime at the edge:
+    # `-c model_reasoning_effort=…` for codex, the SDK's `effort` option for Claude.
+    effort: Effort | None = None
     max_budget_usd: float = 3.0
     cwd: str | None = None          # worktree path (we create the worktree ourselves)
     resume: str | None = None       # prior session id

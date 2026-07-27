@@ -34,6 +34,7 @@ from issue_agent.app.config import from_env
 from issue_agent.app.planners.schemas import AUTHOR_SCHEMA, FIX_SCHEMA, IMPLEMENT_SCHEMA
 from issue_agent.domain.outcome import AgentResult, ExitReason, Outcome, classify_outcome, infra_death
 from issue_agent.domain.agent_task import AgentTask
+from issue_agent.domain.effort import Effort
 
 
 # ── build_codex_argv (pure) ─────────────────────────────────────────────────────
@@ -71,6 +72,31 @@ def test_argv_reasoning_effort_rides_the_resume_path_too():
     # exactly when the hard repair legs run.
     argv = build_codex_argv(AgentTask(prompt="x", resume="0199-abc"))
     assert "model_reasoning_effort=medium" in " ".join(argv)
+
+
+def test_argv_task_effort_beats_the_process_knob():
+    """The escalation ladder decides per LEG (#16); `reasoning_effort` is only
+    the default for legs with no opinion of their own."""
+    argv = build_codex_argv(
+        AgentTask(prompt="x", effort=Effort.HIGH), reasoning_effort="low"
+    )
+    joined = " ".join(argv)
+    assert "model_reasoning_effort=high" in joined
+    assert "model_reasoning_effort=low" not in joined
+
+
+def test_argv_task_effort_applies_on_the_resume_path_too():
+    # The repair legs are exactly where escalation fires most; -c is legal on
+    # resume, so a raised effort must not evaporate there.
+    argv = build_codex_argv(AgentTask(prompt="x", resume="0199-abc", effort=Effort.HIGH))
+    assert "model_reasoning_effort=high" in " ".join(argv)
+
+
+def test_a_task_without_an_effort_leaves_the_process_knob_untouched():
+    """Legs the ladder never touches (review, triage, the router) must build the
+    same argv they did before the field existed."""
+    argv = build_codex_argv(AgentTask(prompt="x"), reasoning_effort="low")
+    assert "model_reasoning_effort=low" in " ".join(argv)
 
 
 def test_argv_provider_overrides_inline():

@@ -16,6 +16,7 @@ import subprocess
 from dataclasses import dataclass, fields
 
 from ..adapters.agent_runner import DEFAULT_MAX_BUFFER_BYTES
+from ..domain.effort import EFFORT_LADDER, Effort, parse_effort
 from ..domain.identity import normalize_login
 from ..domain.review import IdentityMode, ReviewMode
 
@@ -41,6 +42,9 @@ class RuntimePathsConfig:
 class FixRuntimeConfig:
     bot: str
     model: str | None
+    # Base reasoning effort for the fix legs; None = leave the runtime's default
+    # alone. The escalation ladder (#16) raises it from here, never below it.
+    effort: Effort | None
     budget_usd: float
     max_ci_retries: int
     max_review_retries: int
@@ -188,6 +192,16 @@ class HarnessConfig:
     max_unproductive_review_rounds: int = 5
     review_trigger_label: str = "ai-pr-open"
     fix_model: str | None = None
+    # FIX_EFFORT: base reasoning effort for the fix legs, runtime-agnostic
+    # (harness #16). None = say nothing and leave each runtime on its own default
+    # — CODEX_REASONING_EFFORT for codex, the SDK's own for Claude — which is
+    # exactly what every deployment did before the knob existed.
+    fix_effort: Effort | None = None
+    # ESCALATE_ON_EVIDENCE: run a leg one rung stronger when the harness already
+    # knows the previous attempt under-delivered — a recurrence label (#10), a
+    # failed resolve retry, a second-and-later review round. Off pins every leg
+    # to the router's verdict no matter what has happened before.
+    escalate_on_evidence: bool = True
     review_model: str | None = None
     steward_triage_model: str | None = "sonnet"
     fix_budget_usd: float = 10.0
@@ -375,6 +389,7 @@ class HarnessConfig:
         return FixRuntimeConfig(
             bot=self.fix_bot,
             model=self.fix_model,
+            effort=self.fix_effort,
             budget_usd=self.fix_budget_usd,
             max_ci_retries=self.max_ci_retries,
             max_review_retries=self.max_review_retries,
@@ -555,6 +570,8 @@ class HarnessConfig:
             f"poll={self.poll_seconds}s "
             f"probe={f'on/{self.world_probe_ttl_seconds}s' if self.world_probe else 'off'}",
             f"fixer={self.fixer_runtime} fix_model={model(self.fix_model)} "
+            f"fix_effort={getattr(self.fix_effort, 'value', None) or '(runtime default)'} "
+            f"escalate={'on' if self.escalate_on_evidence else 'off'} "
             f"fix_budget=${self.fix_budget_usd:.2f}",
             f"review_model={model(self.review_model)} mode={self.review_mode.value} "
             f"review_budget=${self.review_budget_usd:.2f} "
@@ -619,6 +636,25 @@ def _b(env: dict, key: str, default: bool, errors: list[str]) -> bool:
         f"got {v!r} — using default {default}"
     )
     return default
+
+
+def _effort(env: dict, key: str, default: Effort | None, errors: list[str]) -> Effort | None:
+    """FIX_EFFORT → Effort. Empty/unset means UNSET (leave the runtime's own
+    default alone), same rule `_b` applies to booleans. A typo is reported and
+    then falls back — a misspelled effort must not take the daemon down, but it
+    must not be silent either, or the operator believes a knob is live that
+    isn't (the #12 failure shape)."""
+    raw = env.get(key)
+    if raw is None or raw.strip() == "":
+        return default
+    parsed = parse_effort(raw, None)
+    if parsed is None:
+        errors.append(
+            f"{key} must be one of {[e.value for e in EFFORT_LADDER]}, "
+            f"got {raw!r} — using default {getattr(default, 'value', None)}"
+        )
+        return default
+    return parsed
 
 
 def _require_non_negative(errors: list[str], name: str, value: int | float) -> None:
@@ -899,6 +935,10 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         ),
         review_trigger_label=e.get("REVIEW_TRIGGER_LABEL", _dc_default("review_trigger_label")),
         fix_model=e.get("FIX_MODEL") or _dc_default("fix_model"),
+        fix_effort=_effort(e, "FIX_EFFORT", _dc_default("fix_effort"), errors),
+        escalate_on_evidence=_b(
+            e, "ESCALATE_ON_EVIDENCE", _dc_default("escalate_on_evidence"), errors
+        ),
         review_model=e.get("REVIEW_MODEL") or _dc_default("review_model"),
         steward_triage_model=e.get("STEWARD_TRIAGE_MODEL", _dc_default("steward_triage_model"))
         or None,

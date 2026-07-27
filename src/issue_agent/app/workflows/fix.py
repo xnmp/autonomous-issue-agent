@@ -19,6 +19,13 @@ from ..planners.tasks import FixTaskConfig
 from ...domain.actions import Relabel, Target
 from ...domain.agent_task import AgentRuntime
 from ...domain.ci import latest_other_review
+from ...domain.effort import (
+    DEFAULT_EFFORT,
+    DEFAULT_TIER,
+    EscalationSignals,
+    Stance,
+    escalate,
+)
 from ...domain.labels import Label
 from ...domain.refs import slugify
 from ...domain.world import REVIEW_CHANGES_REQUESTED
@@ -43,6 +50,15 @@ class FixWorkflowConfig:
     # Which fixer runtime the routed model must belong to ("claude" | "codex") —
     # a codex fixer routed to a Claude alias cannot resolve it (see MODEL_TIERS).
     fixer_runtime: str = "claude"
+    # Escalate tier/effort when the harness has evidence the last attempt
+    # under-delivered (#16). Off restores the pre-#16 behaviour exactly: the
+    # router's verdict and the configured effort, whatever has happened before.
+    escalate_on_evidence: bool = True
+    # Where `route_escalation` events land (adapters.journal.Journal, or None in
+    # tests / when the daemon runs without one). Escalations must be queryable:
+    # the routing guardrail is "split the metrics by tier", which is unanswerable
+    # if the tier a leg actually ran at was never recorded.
+    journal: object | None = None
 
 
 @dataclass
@@ -131,8 +147,108 @@ class FixWorkflow:
         )
         return result
 
+    # ── escalation on evidence (#16) ────────────────────────────────────────
+    def _signals(self, issue: int, iss=None) -> EscalationSignals:
+        """Evidence that the last attempt on this issue under-delivered, read
+        from state the harness already keeps — no new sensors (#16).
+
+        Every read is best-effort. These counters are an OPTIMISATION of which
+        configuration to dispatch, never a precondition for dispatching: a
+        store that cannot answer (missing file, injected fake without the
+        method) must degrade to "no evidence" and let the leg run, exactly as
+        it did before this existed. Failing a resolve because a retry counter
+        was unreadable would trade a cheap mis-tiering for a dead pipeline.
+        """
+        def _try(fn, default):
+            try:
+                return fn()
+            except Exception:  # noqa: BLE001 — see docstring
+                return default
+
+        return EscalationSignals(
+            recurrence=bool(_try(lambda: iss is not None and iss.has(Label.RECURRENCE), False)),
+            resolve_retries=int(_try(lambda: self.store.get_resolve_retries(issue), 0) or 0),
+            review_rounds=int(_try(lambda: self.store.get_review_retry(issue)[1], 0) or 0),
+        )
+
+    def _journal_escalation(self, issue: int, leg: str, before: Stance, after: Stance,
+                            signals: EscalationSignals) -> None:
+        """Record the rung this leg climbed, and why.
+
+        Named `route_escalation`, NOT `escalation`: that event name already means
+        "handed to a human" (`app.execute` emits it on a needs-human-review move,
+        and `cli.py`'s escalation-rate metric counts it). Reusing it would fold a
+        cost decision into the guardrail that is supposed to detect cheap models
+        failing — the exact signal #16 must leave measurable.
+        """
+        journal = self.cfg.journal
+        if journal is None:
+            return
+        try:
+            journal.emit(
+                "route_escalation", issue=issue, leg=leg,
+                notches=signals.notches(),
+                from_tier=before.tier, to_tier=after.tier,
+                from_effort=before.effort.value, to_effort=after.effort.value,
+                recurrence=signals.recurrence,
+                resolve_retries=signals.resolve_retries,
+                review_rounds=signals.review_rounds,
+            )
+        except Exception as exc:  # noqa: BLE001 — telemetry never fails a dispatch
+            self.cfg.log(f"agent #{issue}: escalation not journalled ({exc})")
+
+    def _escalated(
+        self, cfg: FixTaskConfig, issue: int, leg: str, *, tier: str | None = None, iss=None
+    ) -> FixTaskConfig:
+        """Apply the escalation ladder to `cfg` for one leg (#16).
+
+        `tier` is the router's verdict when this leg chose one; None means the
+        leg inherited a model (a pinned FIX_MODEL, or a resumed session's) and
+        only the EFFORT half of the ladder applies — a repair leg resumes work
+        that already has shape, and swapping the model under a live transcript
+        buys a different reasoner an unfamiliar context. So a repair leg thinks
+        harder; only a fresh resolve re-prices the model.
+
+        Returns `cfg` untouched when there is no evidence, so the common path
+        emits no effort at all and each runtime keeps its own default.
+        """
+        signals = self._signals(issue, iss)
+        notches = signals.notches() if self.cfg.escalate_on_evidence else 0
+        base = Stance(
+            tier=tier if tier is not None else DEFAULT_TIER,
+            effort=cfg.effort or DEFAULT_EFFORT,
+        )
+        if notches <= 0:
+            return cfg if tier is None else dataclasses.replace(
+                cfg, model=task_builders.route_model(tier, self.cfg.fixer_runtime)
+            )
+        stance = escalate(base, notches)
+        # Tier is only re-priced when this leg picked one; effort always applies.
+        model = (
+            task_builders.route_model(stance.tier, self.cfg.fixer_runtime)
+            if tier is not None else cfg.model
+        )
+        self.cfg.log(
+            f"agent #{issue}: {leg} — escalating {notches} notch(es) "
+            f"(recurrence={signals.recurrence}, resolve_retries={signals.resolve_retries}, "
+            f"review_rounds={signals.review_rounds}): "
+            f"tier {base.tier}→{stance.tier}, effort {base.effort.value}→{stance.effort.value}"
+        )
+        self._journal_escalation(issue, leg, base, stance, signals)
+        return dataclasses.replace(cfg, model=model, effort=stance.effort)
+
+    def _repair_fix_cfg(self, issue: int, leg: str) -> FixTaskConfig | None:
+        """Effort-escalated config for a leg that resumes an existing session
+        (address-review / fix-CI / rebase / resume). Model untouched — see
+        `_escalated`."""
+        cfg = self.cfg.fix
+        if cfg is None:
+            return cfg
+        return self._escalated(cfg, issue, leg)
+
     async def _routed_fix_cfg(self, issue: int, iss) -> FixTaskConfig:
-        """Difficulty-routed FixTaskConfig for a RESOLVE dispatch (P4.1/#8).
+        """Difficulty-routed, evidence-escalated FixTaskConfig for a RESOLVE
+        dispatch (P4.1/#8, ladder #16).
 
         Runs the cheap classifier ONLY when no FIX_MODEL is pinned — an operator
         override wins, and a pinned model must not pay the router run. Failure
@@ -140,6 +256,8 @@ class FixWorkflow:
         garbage degrades via route_model's totality (unknown tier → the
         runtime's `standard`), and a run that RAISES degrades all the way to
         the unrouted default — resolving on the wrong tier beats not resolving.
+        A pinned model still gets the EFFORT half of the ladder: the operator
+        chose the model, not how hard it thinks.
 
         Only the resolve family routes. The follow-up legs (resume/CI/review/
         rebase) resume an existing session where the work already has shape;
@@ -147,8 +265,10 @@ class FixWorkflow:
         resolve leg already answered.
         """
         cfg = self.cfg.fix
-        if cfg is None or cfg.model:
+        if cfg is None:
             return cfg
+        if cfg.model:
+            return self._escalated(cfg, issue, "resolve", iss=iss)
         try:
             result = await self._run_logged(
                 "route", issue,
@@ -159,10 +279,12 @@ class FixWorkflow:
             tier = result.field("tier")
         except Exception as exc:  # noqa: BLE001 — routing is advisory, never fatal
             self.cfg.log(f"agent #{issue}: route — failed ({exc}); dispatching unrouted")
-            return cfg
-        model = task_builders.route_model(tier, self.cfg.fixer_runtime)
-        self.cfg.log(f"agent #{issue}: route — tier={tier or 'unknown'} → model={model}")
-        return dataclasses.replace(cfg, model=model)
+            return self._escalated(cfg, issue, "resolve", iss=iss)
+        routed = self._escalated(cfg, issue, "resolve", tier=tier or DEFAULT_TIER, iss=iss)
+        self.cfg.log(
+            f"agent #{issue}: route — tier={tier or 'unknown'} → model={routed.model}"
+        )
+        return routed
 
     async def resolve(self, issue: int) -> None:
         if self.cfg.author_tests_split:
@@ -298,7 +420,8 @@ class FixWorkflow:
         cwd = self._ensure_cwd(issue, branch)
         fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
         task = task_builders.build_resume_task(
-            reply, cwd, self.store.get_session(issue), self.cfg.fix, fork=fork
+            reply, cwd, self.store.get_session(issue),
+            self._repair_fix_cfg(issue, "resume"), fork=fork
         )
         result = await self.runner.run(task)
         self.store.save_session(issue, result.session_id)
@@ -350,7 +473,8 @@ class FixWorkflow:
         inline = self._prompt_input("review_comments", pr)
         fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
         task = task_builders.build_address_review_task(
-            pr, review_body, inline, cwd, self.store.get_session(issue), self.cfg.fix,
+            pr, review_body, inline, cwd, self.store.get_session(issue),
+            self._repair_fix_cfg(issue, "address-review"),
             fork=fork,
         )
         result = await self.runner.run(task)
@@ -396,7 +520,8 @@ class FixWorkflow:
             self.cfg.fix_mcp_config, [c.name for c in p.checks], self.cfg.harness_root
         )
         task = task_builders.build_fix_ci_task(
-            pr, failed, failed_log, cwd, self.store.get_session(issue), self.cfg.fix,
+            pr, failed, failed_log, cwd, self.store.get_session(issue),
+            self._repair_fix_cfg(issue, "fix-ci"),
             mcp_servers=mcp_servers,
         )
         result = await self.runner.run(task)
@@ -420,7 +545,8 @@ class FixWorkflow:
         p = self.gateway.get_pr(pr)
         cwd = self._ensure_cwd(issue, p.head_ref_name)
         task = task_builders.build_rebase_task(
-            pr, self.cfg.base_branch, cwd, self.store.get_session(issue), self.cfg.fix
+            pr, self.cfg.base_branch, cwd, self.store.get_session(issue),
+            self._repair_fix_cfg(issue, "rebase")
         )
         result = await self.runner.run(task)
         self.store.save_session(issue, result.session_id)

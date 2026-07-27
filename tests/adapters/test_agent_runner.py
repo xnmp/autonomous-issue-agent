@@ -170,6 +170,62 @@ def test_the_installed_sdk_accepts_max_buffer_size():
     }
 
 
+# ── reasoning effort (#16) ────────────────────────────────────────────────────
+def test_effort_reaches_the_options_as_the_sdk_word():
+    from issue_agent.domain.effort import Effort
+
+    kw = build_option_kwargs(AgentTask(prompt="x", effort=Effort.HIGH))
+    assert kw["effort"] == "high"
+
+
+def test_a_task_with_no_effort_says_nothing():
+    """Adding the field must not pin every existing dispatch to the harness's
+    idea of an effort — a task with no opinion keeps the SDK's own default."""
+    assert "effort" not in build_option_kwargs(AgentTask(prompt="x"))
+
+
+def test_effort_option_is_dropped_on_an_sdk_build_without_the_field(monkeypatch):
+    # Losing the cheap lever beats failing the dispatch: the tier half of the
+    # ladder still applies.
+    from issue_agent.domain.effort import Effort
+
+    seen = {}
+    _install_fake_sdk(monkeypatch, [_ResultMessage(is_error=False)], capture=seen)
+    monkeypatch.setattr(agent_runner, "_OPTION_FIELDS", frozenset())
+    logged: list[str] = []
+    asyncio.run(AgentRunner(log=logged.append).run(AgentTask(prompt="x", effort=Effort.HIGH)))
+    assert "effort" not in seen["options"]
+    assert any("no effort option" in m for m in logged)
+
+
+def test_effort_survives_to_the_session_on_a_build_that_has_the_field(monkeypatch):
+    from issue_agent.domain.effort import Effort
+
+    seen = {}
+    _install_fake_sdk(monkeypatch, [_ResultMessage(is_error=False)], capture=seen)
+    monkeypatch.setattr(agent_runner, "_OPTION_FIELDS", frozenset({"effort"}))
+    asyncio.run(AgentRunner().run(AgentTask(prompt="x", effort=Effort.LOW)))
+    assert seen["options"]["effort"] == "low"
+
+
+def test_the_installed_sdk_accepts_every_effort_word_the_domain_can_emit():
+    """Anti-vacuity twin of the max_buffer_size check: the stubs above would not
+    notice the SDK renaming the option or narrowing its Literal."""
+    import dataclasses
+    import typing
+
+    import pytest
+
+    from issue_agent.domain.effort import EFFORT_LADDER
+
+    sdk = pytest.importorskip("claude_agent_sdk")
+    field = {f.name: f for f in dataclasses.fields(sdk.ClaudeAgentOptions)}["effort"]
+    accepted = set()
+    for arg in typing.get_args(field.type):
+        accepted.update(typing.get_args(arg))
+    assert {e.value for e in EFFORT_LADDER} <= accepted
+
+
 def test_a_transport_death_carries_the_last_trace_on_the_exception(monkeypatch):
     # The journal and the dispatcher both need the offending path, and the
     # exception must still propagate unchanged (crash isolation).

@@ -978,3 +978,273 @@ def test_split_mode_routes_once_and_shares_the_model_across_legs():
     assert [t.schema is ROUTER_SCHEMA for t in runner.tasks] == [True, False, False]
     assert runner.tasks[1].model == "haiku"
     assert runner.tasks[2].model == "haiku", "one classification covers author + implement"
+
+
+# ── escalation on evidence (#16) ──────────────────────────────────────────────
+# When the harness already knows the previous attempt under-delivered — the issue
+# came back (#10), a resolve failed, review keeps asking for changes — the retry
+# must not run the identical configuration. Effort climbs first, then tier.
+
+from issue_agent.domain.effort import Effort
+from issue_agent.domain.labels import Label
+
+
+class RecordingJournal:
+    def __init__(self):
+        self.events = []
+
+    def emit(self, event, **fields):
+        self.events.append((event, fields))
+
+
+def _issue(**kw):
+    return IssueView(5, title="t", body="b", **kw)
+
+
+def test_no_evidence_emits_no_effort_at_all():
+    """The common path must construct the SAME task it did before the ladder
+    existed, so each runtime keeps its own default rather than being pinned to
+    the harness's idea of medium."""
+    gw = FakeGateway(issues={5: _issue()}, pr_for_issue={})
+    runner = SeqRunner([
+        _router_result("standard"),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5"),
+    ])
+
+    asyncio.run(_workflow(
+        gw, FakeStore(), runner, fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    assert runner.tasks[1].effort is None
+    assert runner.tasks[1].model == "sonnet"
+
+
+def test_a_recurrence_label_buys_more_thinking_at_the_routed_tier():
+    gw = FakeGateway(
+        issues={5: _issue(labels=frozenset({Label.RECURRENCE}))}, pr_for_issue={}
+    )
+    runner = SeqRunner([
+        _router_result("standard"),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5"),
+    ])
+
+    asyncio.run(_workflow(
+        gw, FakeStore(), runner, fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    resolve_task = runner.tasks[1]
+    assert resolve_task.effort is Effort.HIGH, "one notch buys the cheap lever"
+    assert resolve_task.model == "sonnet", "…and NOT the pricier tier yet"
+
+
+def test_two_signals_climb_past_effort_into_the_next_tier():
+    gw = FakeGateway(
+        issues={5: _issue(labels=frozenset({Label.RECURRENCE}))}, pr_for_issue={}
+    )
+    store = FakeStore()
+    store.set_resolve_retries(5, 1)
+    runner = SeqRunner([
+        _router_result("standard"),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5"),
+    ])
+
+    asyncio.run(_workflow(
+        gw, store, runner, fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    assert runner.tasks[1].effort is Effort.HIGH
+    assert runner.tasks[1].model == "opus", "evidence past HIGH effort re-prices the tier"
+
+
+def test_escalation_respects_the_fixer_runtime_family():
+    gw = FakeGateway(
+        issues={5: _issue(labels=frozenset({Label.RECURRENCE}))}, pr_for_issue={}
+    )
+    store = FakeStore()
+    store.set_resolve_retries(5, 1)
+    runner = SeqRunner([
+        _router_result("standard"),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5"),
+    ])
+
+    asyncio.run(_workflow(
+        gw, store, runner, fixer_runtime="codex",
+        fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    assert runner.tasks[1].model == "gpt-5.6-sol"
+
+
+def test_a_pinned_model_still_thinks_harder_but_keeps_its_model():
+    """The operator chose the model, not how hard it thinks — and a pin must
+    still not pay for a router run."""
+    gw = FakeGateway(
+        issues={5: _issue(labels=frozenset({Label.RECURRENCE}))}, pr_for_issue={}
+    )
+    store = FakeStore()
+    store.set_resolve_retries(5, 2)
+    runner = FakeRunner(AgentResult(is_error=False, status="pr_opened", session_id="s5"))
+
+    asyncio.run(_workflow(
+        gw, store, runner, fix=FixTaskConfig("o/r", agent_md="AM", model="opus"),
+    ).resolve(5))
+
+    assert len(runner.tasks) == 1, "a pinned FIX_MODEL must not pay a router run"
+    assert runner.tasks[0].model == "opus"
+    assert runner.tasks[0].effort is Effort.HIGH
+
+
+def test_escalation_survives_a_router_that_died():
+    """Routing is advisory; the evidence is not. A dead router must not also
+    swallow the escalation the harness already had grounds for."""
+    gw = FakeGateway(
+        issues={5: _issue(labels=frozenset({Label.RECURRENCE}))}, pr_for_issue={}
+    )
+
+    class RouterDies:
+        def __init__(self):
+            self.tasks = []
+
+        async def run(self, task):
+            self.tasks.append(task)
+            if len(self.tasks) == 1:
+                raise RuntimeError("router transport died")
+            return AgentResult(is_error=False, status="pr_opened", session_id="s5")
+
+    runner = RouterDies()
+    asyncio.run(_workflow(
+        gw, FakeStore(), runner, fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    assert runner.tasks[1].model is None, "unrouted, as before"
+    assert runner.tasks[1].effort is Effort.HIGH
+
+
+def test_the_kill_switch_restores_the_pre_ladder_dispatch():
+    gw = FakeGateway(
+        issues={5: _issue(labels=frozenset({Label.RECURRENCE}))}, pr_for_issue={}
+    )
+    store = FakeStore()
+    store.set_resolve_retries(5, 3)
+    runner = SeqRunner([
+        _router_result("standard"),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5"),
+    ])
+
+    asyncio.run(_workflow(
+        gw, store, runner, escalate_on_evidence=False,
+        fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    assert runner.tasks[1].effort is None
+    assert runner.tasks[1].model == "sonnet"
+
+
+def test_a_store_that_cannot_answer_still_dispatches():
+    """The counters decide WHICH configuration to run, never WHETHER to run.
+    An unreadable counter must cost a mis-tiering, not the pipeline."""
+
+    class BrokenStore(FakeStore):
+        def get_resolve_retries(self, i):
+            raise OSError("state dir vanished")
+
+        def get_review_retry(self, i):
+            raise OSError("state dir vanished")
+
+    gw = FakeGateway(
+        issues={5: _issue()}, prs={100: PRView(100)}, pr_for_issue={5: 100}
+    )
+    runner = SeqRunner([
+        _router_result("standard"),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5"),
+    ])
+
+    asyncio.run(_workflow(
+        gw, BrokenStore(), runner, fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    assert runner.tasks[1].model == "sonnet"
+    assert runner.tasks[1].effort is None
+
+
+def test_repair_legs_think_harder_without_swapping_the_model():
+    """A repair leg resumes a live transcript — handing that context to a
+    different reasoner is a different bet than asking this one to think harder.
+    Only a fresh resolve re-prices the model."""
+    p = PRView(100, head_ref_name="fix/5-x", closing_issue=5,
+               reviews=(Review("CHANGES_REQUESTED", "rev-bot", "t9", body="fix it"),))
+    gw = FakeGateway(prs={100: p})
+    store = FakeStore()
+    store.set_review_retry(5, "t9", 2)  # two rounds already spent on THIS review
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s5"))
+
+    asyncio.run(_workflow(
+        gw, store, runner, fix=FixTaskConfig("o/r", agent_md="AM", model="sonnet"),
+    ).address_review(100))
+
+    assert runner.tasks[0].effort is Effort.HIGH
+    assert runner.tasks[0].model == "sonnet", "a resumed session keeps its reasoner"
+
+
+def test_escalations_are_journalled_so_the_tier_split_stays_measurable():
+    gw = FakeGateway(
+        issues={5: _issue(labels=frozenset({Label.RECURRENCE}))}, pr_for_issue={}
+    )
+    journal = RecordingJournal()
+    runner = SeqRunner([
+        _router_result("standard"),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5"),
+    ])
+
+    asyncio.run(_workflow(
+        gw, FakeStore(), runner, journal=journal,
+        fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    assert len(journal.events) == 1
+    event, fields = journal.events[0]
+    assert event == "route_escalation", (
+        "must NOT reuse 'escalation' — that name means handed-to-a-human and "
+        "feeds the escalation-rate guardrail"
+    )
+    assert fields["issue"] == 5
+    assert (fields["from_effort"], fields["to_effort"]) == ("medium", "high")
+    assert (fields["from_tier"], fields["to_tier"]) == ("standard", "standard")
+    assert fields["recurrence"] is True
+
+
+def test_nothing_is_journalled_when_nothing_escalated():
+    gw = FakeGateway(issues={5: _issue()}, pr_for_issue={})
+    journal = RecordingJournal()
+    runner = SeqRunner([
+        _router_result("standard"),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5"),
+    ])
+
+    asyncio.run(_workflow(
+        gw, FakeStore(), runner, journal=journal,
+        fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    assert journal.events == []
+
+
+def test_a_broken_journal_never_fails_a_dispatch():
+    class ExplodingJournal:
+        def emit(self, *a, **k):
+            raise OSError("journal disk full")
+
+    gw = FakeGateway(
+        issues={5: _issue(labels=frozenset({Label.RECURRENCE}))}, pr_for_issue={}
+    )
+    runner = SeqRunner([
+        _router_result("standard"),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5"),
+    ])
+
+    asyncio.run(_workflow(
+        gw, FakeStore(), runner, journal=ExplodingJournal(),
+        fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    assert runner.tasks[1].effort is Effort.HIGH

@@ -78,6 +78,9 @@ class DispatchConfig:
     # Fixer runtime ("claude" | "codex"), threaded to FixWorkflow so difficulty
     # routing picks from the runtime's own model family (see MODEL_TIERS).
     fixer_runtime: str = "claude"
+    # Kill switch for the evidence-driven tier/effort ladder (#16). See
+    # FixWorkflowConfig.escalate_on_evidence.
+    escalate_on_evidence: bool = True
     # ── spend circuit breakers ────────────────────────────────────────────────
     # Which daemon this dispatcher belongs to, and the repo it targets: journal
     # attribution only, but without them a shared ledger cannot answer "who spent
@@ -114,6 +117,7 @@ class DispatchConfig:
             log=self.log,
             fix_bot=self.fix_bot,
             fixer_runtime=self.fixer_runtime,
+            escalate_on_evidence=self.escalate_on_evidence,
         )
 
     def review_workflow_config(self) -> ReviewWorkflowConfig:
@@ -165,7 +169,10 @@ class AgentDispatcher:
         self._spend_blocked: set[str] = set()
         self._cost_blindspot_checked = False
         self.fix_workflow = FixWorkflow(
-            cfg.fix_workflow_config(), gateway, store, worktrees, runner, executor, prepare_cwd
+            # Journal folded in here for the same reason as the steward's below:
+            # it arrives as a constructor argument, not through DispatchConfig.
+            replace(cfg.fix_workflow_config(), journal=journal),
+            gateway, store, worktrees, runner, executor, prepare_cwd,
         )
         self.review_workflow = ReviewWorkflow(
             cfg.review_workflow_config(), gateway, store, runner, executor,

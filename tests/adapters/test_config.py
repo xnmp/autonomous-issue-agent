@@ -854,3 +854,36 @@ def test_empty_agent_env_file_falls_back_to_process_env(tmp_path):
 def test_no_agent_env_keeps_the_pure_dict_mapping(tmp_path):
     c = from_env({"REPO": "o/r", "FIX_MODEL": "haiku"})
     assert c.repo == "o/r" and c.fix_model == "haiku"
+
+
+# ── FIX_EFFORT / ESCALATE_ON_EVIDENCE (#16) ───────────────────────────────────
+def test_fix_effort_parses_to_the_domain_enum():
+    from issue_agent.domain.effort import Effort
+
+    assert from_env({"REPO": "x", "FIX_EFFORT": "high"}).fix_effort is Effort.HIGH
+    assert from_env({"REPO": "x", "FIX_EFFORT": " HIGH "}).fix_effort is Effort.HIGH
+
+
+def test_unset_fix_effort_leaves_each_runtime_on_its_own_default():
+    """Unset must mean "say nothing", not "medium" — pinning a value here would
+    silently override an operator's CODEX_REASONING_EFFORT."""
+    assert from_env({"REPO": "x"}).fix_effort is None
+    assert from_env({"REPO": "x", "FIX_EFFORT": ""}).fix_effort is None
+
+
+def test_a_misspelled_fix_effort_is_reported_and_falls_back():
+    c = from_env({"REPO": "x", "FIX_EFFORT": "hihg"})
+    assert c.fix_effort is None
+    assert any("FIX_EFFORT" in e for e in c.validation_errors())
+
+
+def test_escalation_defaults_on_and_can_be_switched_off():
+    assert from_env({"REPO": "x"}).escalate_on_evidence is True
+    assert from_env({"REPO": "x", "ESCALATE_ON_EVIDENCE": "0"}).escalate_on_evidence is False
+    assert from_env({"REPO": "x", "ESCALATE_ON_EVIDENCE": "False"}).escalate_on_evidence is False
+
+
+def test_fix_effort_reaches_the_fix_runtime_view():
+    from issue_agent.domain.effort import Effort
+
+    assert from_env({"REPO": "x", "FIX_EFFORT": "low"}).fix_runtime.effort is Effort.LOW

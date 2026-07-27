@@ -118,6 +118,12 @@ def build_option_kwargs(
         kwargs["disallowed_tools"] = list(task.disallowed_tools)
     if task.model:
         kwargs["model"] = task.model
+    # Reasoning effort (harness #16). Emitted only when the task actually has an
+    # opinion — a task with effort=None must construct the SAME options it did
+    # before the field existed. `run` drops it on an SDK build that predates the
+    # option, the same guard `max_buffer_size` and `stderr` get.
+    if task.effort is not None:
+        kwargs["effort"] = task.effort.value
     if task.cwd:
         kwargs["cwd"] = task.cwd
     if task.resume:
@@ -465,6 +471,16 @@ class AgentRunner(AgentRuntime):
             self._log(
                 "sdk: installed claude-agent-sdk has no max_buffer_size — "
                 "large file reads may kill the transport (harness #13)"
+            )
+        # Same guard for reasoning effort: an older build has no `effort` field and
+        # would reject it at construction. Dropping it costs the escalation ladder
+        # its cheap lever on this runtime (the tier half still applies), which is
+        # strictly better than failing the dispatch.
+        if "effort" in kwargs and "effort" not in _option_field_names():
+            kwargs.pop("effort")
+            self._log(
+                "sdk: installed claude-agent-sdk has no effort option — "
+                "reasoning-effort escalation is a no-op here (harness #16)"
             )
         # Materialise the SDK-free `agents` dict-spec into AgentDefinition objects
         # (build_option_kwargs stays SDK-free for unit tests; the SDK type is

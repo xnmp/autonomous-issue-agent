@@ -152,8 +152,15 @@ def build_codex_argv(
     # 2026-07-27) — an implementer tier that quietly under-thinks. Explicit on
     # both paths (-c is legal on exec and resume); "" opts out entirely and
     # leaves codex's default alone.
-    if reasoning_effort:
-        argv += ["-c", f"model_reasoning_effort={reasoning_effort}"]
+    #
+    # The TASK's effort wins over the process-level knob when it has one (harness
+    # #16): `reasoning_effort` is the default for legs with no opinion, and the
+    # escalation ladder is an opinion about THIS leg specifically. Legs that
+    # carry none (review, triage, the router) keep the knob's value untouched,
+    # which is why adding the field changed no existing dispatch.
+    effort = task.effort.value if task.effort is not None else reasoning_effort
+    if effort:
+        argv += ["-c", f"model_reasoning_effort={effort}"]
 
     if is_resume:
         # danger-full-access equivalent that resume DOES accept.
