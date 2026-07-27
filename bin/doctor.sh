@@ -345,6 +345,110 @@ else
   bad "gh missing"
 fi
 
+echo "== CI on the base branch =="
+# Why this section exists (all three found by hand on the xnmp/keifu preflight,
+# 2026-07-28, and none of them were visible to any existing check):
+#
+#   A. `ci_state` returns CIState.NONE when a PR has no checks, and
+#      domain/fix.py:315/:340 treat NONE EXACTLY like OK. So a repo whose
+#      workflows never trigger on the base branch gets fully autonomous merges
+#      with zero CI verification — the local TEST_CMD gate is all that is left,
+#      and nothing anywhere says so. keifu was in precisely this state: CI
+#      triggered on `main` while every PR targets `chong-dev`, so `gh run list`
+#      was empty and five merged PRs had received zero checks between them.
+#
+#   D. A check that is red on EVERY PR (a `continue-on-error: true` advisory
+#      job, or one that is simply broken) still reports conclusion FAILURE, and
+#      domain/ci.py:45 turns any `fail` bucket into CIState.FAILURE regardless.
+#      The harness cannot tell it apart from a real break, so it burns fix-ci
+#      legs forever on something no change can clear. CI_IGNORE_CHECKS is the
+#      cure; this finds the pattern and hands over the regex.
+#
+#   E. An auto-merge whose MERGE_METHOD the repo forbids fails at the very last
+#      step, after the whole issue has been paid for.
+#
+# The A/D probe is deliberately EMPIRICAL — it asks whether PRs into this base
+# actually received checks, rather than parsing `on.pull_request.branches` out
+# of the workflow YAML. Static parsing has to model branch globs,
+# `branches-ignore`, `paths` filters and an absent `branches:` key (= all
+# branches); the observed outcome moots all of it.
+_BASE="${BASE_BRANCH:-dev}"
+if ! command -v gh >/dev/null 2>&1 || [ -z "$REPO" ]; then
+  warn "skipping CI checks (gh missing or REPO unset)"
+else
+  # ── E. Does the repo permit the merge method the harness will use? ──────────
+  _MM="${MERGE_METHOD:-squash}"
+  case "$_MM" in
+    squash) _MM_FIELD=".allow_squash_merge" ;;
+    merge)  _MM_FIELD=".allow_merge_commit" ;;
+    rebase) _MM_FIELD=".allow_rebase_merge" ;;
+    *)      _MM_FIELD="" ;;
+  esac
+  if [ -z "$_MM_FIELD" ]; then
+    bad "MERGE_METHOD='$_MM' is not one of squash|merge|rebase"
+  else
+    _MM_OK="$(gh api "repos/$REPO" --jq "$_MM_FIELD" 2>/dev/null)"
+    case "$_MM_OK" in
+      true)  ok "MERGE_METHOD=$_MM is permitted by $REPO" ;;
+      false) bad "MERGE_METHOD=$_MM is DISABLED on $REPO — auto-merge would fail at the final step, after the issue is fully paid for. Enable it in the repo's Settings → Pull Requests, or set MERGE_METHOD to one that is allowed." ;;
+      *)     warn "could not read $REPO merge settings — cannot confirm MERGE_METHOD=$_MM is permitted" ;;
+    esac
+  fi
+
+  # ── A. Do PRs into BASE_BRANCH actually receive checks? ─────────────────────
+  _WF="$(gh api "repos/$REPO/actions/workflows" --jq '[.workflows[]|select(.state=="active")]|length' 2>/dev/null)"
+  case "${_WF:-}" in ''|*[!0-9]*) _WF="" ;; esac
+  if [ -z "$_WF" ]; then
+    warn "could not list Actions workflows for $REPO (Actions disabled, or the token lacks access) — the CI gate cannot be verified"
+  elif [ "$_WF" = "0" ]; then
+    warn "$REPO has no active Actions workflows. ci_state() therefore returns NONE, and domain/fix.py treats NONE exactly like OK — so an approved PR auto-merges with NO CI verification, gated only by the reviewer and your TEST_CMD. That may be intended; it should not be a surprise."
+  else
+    _ROLLUP="$(gh pr list -R "$REPO" --base "$_BASE" --state all --limit 10 \
+                 --json number,statusCheckRollup 2>/dev/null)"
+    _PRS="$(printf '%s' "$_ROLLUP" | jq 'length' 2>/dev/null || echo 0)"
+    case "${_PRS:-}" in ''|*[!0-9]*) _PRS=0 ;; esac
+    if [ "$_PRS" -eq 0 ]; then
+      warn "no PR has ever targeted '$_BASE' on $REPO, so it cannot be confirmed that its $_WF active workflow(s) trigger on it. Check that each workflow's on.pull_request.branches includes '$_BASE' — if none do, every PR reads CIState.NONE, which the harness treats as OK and merges."
+    else
+      _WITH="$(printf '%s' "$_ROLLUP" | jq '[.[]|select((.statusCheckRollup//[])|length > 0)]|length' 2>/dev/null || echo 0)"
+      case "${_WITH:-}" in ''|*[!0-9]*) _WITH=0 ;; esac
+      if [ "$_WITH" -eq 0 ]; then
+        bad "$REPO has $_WF active workflow(s), but NOT ONE of the last $_PRS PR(s) into '$_BASE' received a single check. Every PR the harness opens will read CIState.NONE, which domain/fix.py:315 treats identically to OK — approved PRs will auto-merge with zero CI verification. Almost always the workflow triggers on a different branch than '$_BASE': check on.pull_request.branches in .github/workflows/."
+      else
+        ok "PRs into '$_BASE' receive checks ($_WITH of the last $_PRS sampled)"
+
+        # ── D. Checks that are red on EVERY sampled PR ───────────────────────
+        # Only PRs that got checks are considered, and a name must appear on all
+        # of them AND be FAILURE every time. One flaky red therefore says
+        # nothing; a job that cannot pass says it loudly.
+        _RED="$(printf '%s' "$_ROLLUP" | jq -r '
+          [ .[] | select((.statusCheckRollup//[]) | length > 0) ] as $prs
+          | ($prs | length) as $n
+          | [ $prs[].statusCheckRollup[]
+              | {name: .name, c: ((.conclusion // .state // "") | ascii_upcase)} ]
+          | group_by(.name)
+          | map(select((length == $n) and (all(.[]; .c == "FAILURE"))))
+          | map(.[0].name)[]' 2>/dev/null)"
+        if [ -n "$_RED" ]; then
+          while IFS= read -r _name; do
+            [ -n "$_name" ] || continue
+            # Already suppressed? Compare with bash ERE, the closest available
+            # analogue of the Python re.search domain/ci.py runs.
+            if [ -n "${CI_IGNORE_CHECKS:-}" ] && [[ "$_name" =~ $CI_IGNORE_CHECKS ]]; then
+              ok "check '$_name' is red on all $_WITH sampled PR(s) but CI_IGNORE_CHECKS already drops it"
+            else
+              # Escape the ERE metacharacters GitHub check names really contain
+              # ("Test (ubuntu-latest)" has parentheses).
+              _esc="$(printf '%s' "$_name" | sed -e 's/[][(){}.*+?^$|\\]/\\&/g')"
+              warn "check '$_name' FAILED on all $_WITH sampled PR(s) into '$_BASE'. If it is advisory (a continue-on-error job — GitHub still reports its conclusion as FAILURE, and domain/ci.py:45 makes any fail bucket a CIState.FAILURE), the harness cannot tell it from a real break and will burn fix-ci legs on it forever. Suppress it with: CI_IGNORE_CHECKS='^${_esc}\$'"
+            fi
+          done <<< "$_RED"
+        fi
+      fi
+    fi
+  fi
+fi
+
 echo "== project commands =="
 if [ -n "${TEST_CMD:-}" ]; then
   ok "TEST_CMD=$TEST_CMD (the gate runs THIS; it wins over the agent's .harness/test-cmd — review P1R-18)"

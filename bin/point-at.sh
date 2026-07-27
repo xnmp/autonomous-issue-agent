@@ -18,6 +18,12 @@
 #   ISSUE_AGENT_MAX_TICKS=N       bound each daemon's loop (dry run / CI); unset = forever
 #   LOG_DIR=<path>                 daemon log directory (default:
 #                                  ${XDG_STATE_HOME:-$HOME/.local/state}/issue-agent/logs)
+#   CREATE_BASE_BRANCH=1           allow creating+pushing BASE_BRANCH when it does
+#                                  not exist on the target (default 0 — writing a
+#                                  new ref into someone's repo is opt-in)
+#   GATE_PROBE=0                   skip the "is TEST_CMD green on a pristine
+#                                  BASE_BRANCH?" probe (default: run it)
+#   GATE_PROBE_TIMEOUT=<seconds>   bound that probe (default 900)
 #
 # NOTE: this foreground mode is the dev / first-run path. For real (unattended)
 # operation, prefer the systemd units (`issue-agent install-service` /
@@ -75,18 +81,113 @@ if [ -n "${TARGET_DIR:-}" ] && git -C "$TARGET_DIR" rev-parse --is-inside-work-t
   if git -C "$TARGET_DIR" ls-remote --exit-code --heads origin "$BASE_BRANCH" >/dev/null 2>&1; then
     grn "  ✓ '$BASE_BRANCH' already exists on origin"
   else
-    default="$(git -C "$TARGET_DIR" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#origin/##')"
-    default="${default:-main}"
-    info "  creating '$BASE_BRANCH' off origin/$default"
-    git -C "$TARGET_DIR" fetch origin "$default" --quiet \
-      && git -C "$TARGET_DIR" branch "$BASE_BRANCH" "origin/$default" 2>/dev/null \
-      && git -C "$TARGET_DIR" push -u origin "$BASE_BRANCH" \
-      && grn "  ✓ created and pushed '$BASE_BRANCH'" \
-      || { red "  ✗ could not create '$BASE_BRANCH' (check push access to $REPO)"; exit 1; }
+    # The repo's REAL default branch, per GitHub. Deliberately NOT the local
+    # `refs/remotes/origin/HEAD` symbolic ref this used to read: that ref is a
+    # cache written at clone time and never refreshed, so a repo that has since
+    # changed its default branch reports the OLD one forever. Observed on
+    # xnmp/keifu (2026-07-28): origin/HEAD still said `main` while GitHub's
+    # default_branch had long been `chong-dev`.
+    default="$(gh api "repos/$REPO" --jq '.default_branch' 2>/dev/null)"
+    if [ -z "$default" ]; then
+      default="$(git -C "$TARGET_DIR" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#origin/##')"
+      default="${default:-main}"
+      warn_default=" (could not reach the GitHub API; fell back to the local, possibly stale origin/HEAD)"
+    else
+      warn_default=""
+    fi
+    # Creating this branch PUSHES a new ref into someone's repository. That is
+    # not a reasonable thing to do silently as a side effect of "start the
+    # daemons" — especially when BASE_BRANCH is simply the un-overridden `dev`
+    # default and the repo's own default branch is something else entirely.
+    # Require an explicit opt-in and say exactly what the alternative is.
+    if [ "${CREATE_BASE_BRANCH:-0}" = "1" ]; then
+      info "  creating '$BASE_BRANCH' off origin/$default$warn_default (CREATE_BASE_BRANCH=1)"
+      git -C "$TARGET_DIR" fetch origin "$default" --quiet \
+        && git -C "$TARGET_DIR" branch "$BASE_BRANCH" "origin/$default" 2>/dev/null \
+        && git -C "$TARGET_DIR" push -u origin "$BASE_BRANCH" \
+        && grn "  ✓ created and pushed '$BASE_BRANCH'" \
+        || { red "  ✗ could not create '$BASE_BRANCH' (check push access to $REPO)"; exit 1; }
+    else
+      red "  ✗ BASE_BRANCH='$BASE_BRANCH' does not exist on $REPO."
+      red "    That repo's default branch is '$default'$warn_default."
+      if [ "$BASE_BRANCH" = "$default" ]; then
+        red "    Creating it would be a no-op mismatch — check the remote is reachable."
+      else
+        red "    Did you mean BASE_BRANCH='$default'? Set it in config/repos/<name>.env."
+      fi
+      red "    To create and push '$BASE_BRANCH' off origin/$default anyway, re-run with"
+      red "    CREATE_BASE_BRANCH=1. (This writes a new branch to $REPO, so it is opt-in.)"
+      exit 1
+    fi
   fi
 else
   red "TARGET_DIR ('${TARGET_DIR:-}') is not a git working copy — cannot ensure the base branch."
   exit 1
+fi
+
+# ── 3b. Gate probe: is TEST_CMD green on an untouched BASE_BRANCH? ────────────
+# doctor only ever ECHOED TEST_CMD. Nothing ran it, so a base branch on which
+# the command is already red sailed through preflight — and every resolve then
+# burned a full session discovering that its PR gate could never go green. On
+# xnmp/keifu the tree had never been `cargo fmt`-ed, so a TEST_CMD mirroring CI
+# was red on a pristine checkout; that is a 41-second discovery here versus a
+# ~$20 one after the fact.
+#
+# Probed in a THROWAWAY WORKTREE of origin/$BASE_BRANCH, never in TARGET_DIR:
+# the operator's checkout routinely carries local edits and untracked files, and
+# "green with your junk in the tree" is not the question. The daemons' own
+# per-issue worktrees start from exactly this state.
+#
+# GATE_PROBE=0 skips it; GATE_PROBE_TIMEOUT bounds it (default 900s).
+if [ "${GATE_PROBE:-1}" = "1" ] && [ -n "${TEST_CMD:-}" ]; then
+  info "gate probe: running TEST_CMD on a clean origin/$BASE_BRANCH worktree"
+  _probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/issue-agent-gate-probe.XXXXXX")"
+  # The log lives OUTSIDE the probe worktree: `git worktree remove --force`
+  # deletes that directory, taking the evidence with it. Its own mktemp name
+  # also keeps concurrent deployments from overwriting each other's output.
+  _probe_log="$(mktemp "${TMPDIR:-/tmp}/issue-agent-gate-probe.XXXXXX.log")"
+  _probe_rc=0
+  git -C "$TARGET_DIR" fetch origin "$BASE_BRANCH" --quiet || true
+  if git -C "$TARGET_DIR" worktree add --detach --quiet "$_probe_dir" "origin/$BASE_BRANCH" 2>/dev/null; then
+    # `timeout` is coreutils and not guaranteed present; degrade to unbounded
+    # rather than skipping the probe (an unbounded green still answers the
+    # question, and Ctrl-C is available).
+    if command -v timeout >/dev/null 2>&1; then
+      ( cd "$_probe_dir" && timeout "${GATE_PROBE_TIMEOUT:-900}" bash -c "$TEST_CMD" ) >"$_probe_log" 2>&1 || _probe_rc=$?
+    else
+      ( cd "$_probe_dir" && bash -c "$TEST_CMD" ) >"$_probe_log" 2>&1 || _probe_rc=$?
+    fi
+    git -C "$TARGET_DIR" worktree remove --force "$_probe_dir" 2>/dev/null || true
+    if [ "$_probe_rc" -eq 0 ]; then
+      grn "  ✓ TEST_CMD is green on a pristine origin/$BASE_BRANCH"
+      rm -f "$_probe_log" 2>/dev/null || true
+    else
+      if [ "$_probe_rc" -eq 124 ]; then
+        red "  ✗ TEST_CMD TIMED OUT (>${GATE_PROBE_TIMEOUT:-900}s) on a pristine origin/$BASE_BRANCH."
+        red "    The gate runs this command on every commit and every push — a command"
+        red "    this slow will time the agent out too. Raise GATE_PROBE_TIMEOUT only if"
+        red "    you are sure the gate's own timeout can absorb it."
+      else
+        red "  ✗ TEST_CMD FAILED (exit $_probe_rc) on a pristine origin/$BASE_BRANCH."
+        red "    The base branch is already red, so no PR the harness opens can ever"
+        red "    reach a green gate — every resolve will burn a full session and fail."
+        red "    Fix the base branch, or narrow TEST_CMD to the tiers that pass."
+      fi
+      red "    Output: $_probe_log"
+      red "    Command: $TEST_CMD"
+      red "    Override with GATE_PROBE=0 if you know better."
+      exit 1
+    fi
+  else
+    red "  ✗ could not create a probe worktree from origin/$BASE_BRANCH — is the branch fetched?"
+    rmdir "$_probe_dir" 2>/dev/null || true
+    rm -f "$_probe_log" 2>/dev/null || true
+    exit 1
+  fi
+elif [ -z "${TEST_CMD:-}" ]; then
+  info "gate probe skipped (TEST_CMD unset — doctor already warned)"
+else
+  info "gate probe skipped (GATE_PROBE=0)"
 fi
 
 # ── 4. Point-and-fire prep: NO repo mutation ──────────────────────────────────
