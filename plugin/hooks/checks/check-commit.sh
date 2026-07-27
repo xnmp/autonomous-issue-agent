@@ -50,6 +50,41 @@ if [ -n "$msg" ] && ! [[ "$msg" =~ $VALID_PREFIX ]]; then
   exit 1
 fi
 
+# Oversized-image gate. The review agent READS evidence images, and a file whose
+# base64 exceeds the SDK's 1MB message buffer kills the review transport
+# deterministically (harness #13; observed live 2026-07-27, PR #552's ~2.3MB
+# screenshots burned review retries on an unwinnable run). Enforce at commit
+# time — where the file is created and the author can still re-capture. Checks
+# files already staged AND images sitting in evidence/: this hook fires BEFORE
+# the command executes, so a compound `git add … && git commit` has staged
+# nothing yet. 700KB default keeps base64 (×4/3) under the 1MB buffer.
+# Set EVIDENCE_MAX_IMAGE_KB to adjust; 0 disables.
+max_kb="${EVIDENCE_MAX_IMAGE_KB:-700}"
+if [ "$max_kb" != "0" ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  max_bytes=$((max_kb * 1024))
+  oversized=""
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    sz=$(wc -c < "$f" 2>/dev/null || echo 0)
+    if [ "$sz" -gt "$max_bytes" ]; then
+      oversized="${oversized}  $f ($((sz / 1024))KB > ${max_kb}KB)"$'\n'
+    fi
+  done < <(
+    { git diff --cached --name-only --diff-filter=AM 2>/dev/null
+      find evidence -maxdepth 3 -type f 2>/dev/null; } |
+      grep -iE '\.(png|jpe?g|gif|webp|bmp)$' | sort -u
+  )
+  if [ -n "$oversized" ]; then
+    echo "Blocked: image(s) exceed the ${max_kb}KB evidence size limit:"
+    printf '%s' "$oversized"
+    echo "Oversized images crash the reviewer (1MB message buffer < the file's base64),"
+    echo "so the PR cannot be reviewed. Downscale before committing, e.g.:"
+    echo "  ffmpeg -y -i img.png -vf scale=iw/2:-1 out.png && mv out.png img.png"
+    echo "or re-capture at a lower resolution."
+    exit 1
+  fi
+fi
+
 # Fast gates only. Projects supply these via env (set in AGENT.md / repo CLAUDE.md).
 if [ -n "${LINT_CMD:-}" ]; then
   eval "$LINT_CMD" || { echo "Lint failed (LINT_CMD): $LINT_CMD"; exit 1; }

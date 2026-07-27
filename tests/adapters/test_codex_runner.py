@@ -18,6 +18,7 @@ from issue_agent.adapters.codex_runner import (
     CodexProvider,
     CodexRunner,
     read_rollout_usage,
+    usage_delta,
     _extract_retry_after_seconds,
     _is_rate_limited,
     _is_transport_drop,
@@ -33,6 +34,7 @@ from issue_agent.app.config import from_env
 from issue_agent.app.planners.schemas import AUTHOR_SCHEMA, FIX_SCHEMA, IMPLEMENT_SCHEMA
 from issue_agent.domain.outcome import AgentResult, ExitReason, Outcome, classify_outcome, infra_death
 from issue_agent.domain.agent_task import AgentTask
+from issue_agent.domain.effort import Effort
 
 
 # ── build_codex_argv (pure) ─────────────────────────────────────────────────────
@@ -46,6 +48,55 @@ def test_argv_basic_shape():
     # and with no -m codex uses the provider's own default (in OAuth mode, the
     # subscription's current model).
     assert "-m" not in argv
+
+
+def test_argv_pins_medium_reasoning_effort_by_default():
+    # codex exec's own default is LOW (live session_meta 2026-07-27) — the
+    # harness pins medium so an implementer leg doesn't quietly under-think.
+    argv = build_codex_argv(AgentTask(prompt="x"))
+    assert "model_reasoning_effort=medium" in " ".join(argv)
+
+
+def test_argv_reasoning_effort_override_and_opt_out():
+    assert "model_reasoning_effort=high" in " ".join(
+        build_codex_argv(AgentTask(prompt="x"), reasoning_effort="high")
+    )
+    # "" = leave codex's own default alone — no pin at all.
+    assert "model_reasoning_effort" not in " ".join(
+        build_codex_argv(AgentTask(prompt="x"), reasoning_effort="")
+    )
+
+
+def test_argv_reasoning_effort_rides_the_resume_path_too():
+    # Follow-up legs resume; -c is legal on resume and the pin must not vanish
+    # exactly when the hard repair legs run.
+    argv = build_codex_argv(AgentTask(prompt="x", resume="0199-abc"))
+    assert "model_reasoning_effort=medium" in " ".join(argv)
+
+
+def test_argv_task_effort_beats_the_process_knob():
+    """The escalation ladder decides per LEG (#16); `reasoning_effort` is only
+    the default for legs with no opinion of their own."""
+    argv = build_codex_argv(
+        AgentTask(prompt="x", effort=Effort.HIGH), reasoning_effort="low"
+    )
+    joined = " ".join(argv)
+    assert "model_reasoning_effort=high" in joined
+    assert "model_reasoning_effort=low" not in joined
+
+
+def test_argv_task_effort_applies_on_the_resume_path_too():
+    # The repair legs are exactly where escalation fires most; -c is legal on
+    # resume, so a raised effort must not evaporate there.
+    argv = build_codex_argv(AgentTask(prompt="x", resume="0199-abc", effort=Effort.HIGH))
+    assert "model_reasoning_effort=high" in " ".join(argv)
+
+
+def test_a_task_without_an_effort_leaves_the_process_knob_untouched():
+    """Legs the ladder never touches (review, triage, the router) must build the
+    same argv they did before the field existed."""
+    argv = build_codex_argv(AgentTask(prompt="x"), reasoning_effort="low")
+    assert "model_reasoning_effort=low" in " ".join(argv)
 
 
 def test_argv_provider_overrides_inline():
@@ -1034,6 +1085,30 @@ def test_envelope_prefers_caller_supplied_rollout_usage_over_stderr():
     )
     assert r.usage["input_tokens"] == 1_000_000
     assert r.cost_usd == (1_000_000 * 5.0 + 10_000 * 30.0) / 1_000_000.0
+
+
+def test_usage_delta_subtracts_the_already_ledgered_baseline():
+    # A follow-up leg resumes the resolve's session; the rollout counter is
+    # cumulative, so without the delta the leg re-ledgers the resolve's tokens
+    # (observed live: a 114s fix-ci ledgered $39.57 carrying 6M resolve tokens).
+    end = {"input_tokens": 7_809_575, "output_tokens": 17_467,
+           "cache_read_input_tokens": 7_432_192, "cache_creation_input_tokens": 0}
+    start = {"input_tokens": 6_069_388, "output_tokens": 15_541,
+             "cache_read_input_tokens": 5_837_056, "cache_creation_input_tokens": 0}
+    d = usage_delta(end, start)
+    assert d["input_tokens"] == 1_740_187
+    assert d["output_tokens"] == 1_926
+    assert d["cache_read_input_tokens"] == 1_595_136
+
+
+def test_usage_delta_edges():
+    # No end usage → None (no fabricated receipt). No baseline → end unchanged.
+    assert usage_delta(None, {"input_tokens": 5}) is None
+    end = {"input_tokens": 10, "output_tokens": 2}
+    assert usage_delta(end, None) == end
+    # A counter that shrank (rollout replaced/rotated) floors at zero rather
+    # than ledgering negative spend.
+    assert usage_delta({"input_tokens": 3}, {"input_tokens": 9})["input_tokens"] == 0
 
 
 def test_envelope_falls_back_to_stderr_usage_when_no_rollout():

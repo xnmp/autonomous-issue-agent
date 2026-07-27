@@ -312,7 +312,7 @@ def build_fix_daemon(
         base_branch=repo_cfg.base_branch,
         fix=FixTaskConfig(
             repo_cfg.repo, repo_cfg.base_branch, cfg.agent_md,
-            fix_runtime.budget_usd, fix_runtime.model,
+            fix_runtime.budget_usd, fix_runtime.model, fix_runtime.effort,
         ),
         max_review_rejections=cfg.max_review_rejections,
         author_tests_split=fix_runtime.author_tests_split,
@@ -322,6 +322,10 @@ def build_fix_daemon(
         log=_log("fix"),
         fix_bot=fix_runtime.bot,
         fixer_runtime=cfg.fixer_runtime,
+        escalate_on_evidence=cfg.escalate_on_evidence,
+        # The same ceiling `fix_cfg` escalates on, so a deterministic death can
+        # saturate the counter rather than pay for cap-1 identical retries (#13).
+        max_infra_deaths=fix_runtime.max_infra_deaths,
         **_spend_cfg(cfg, "fix", ledger),
     )
     # Fixer runtime: Codex (GPT-5.5) swaps the runner AND installs the governor as
@@ -347,6 +351,7 @@ def build_fix_daemon(
                 wire_api=codex_runtime.wire_api,
             ),
             sandbox=codex_runtime.sandbox,
+            reasoning_effort=codex_runtime.reasoning_effort,
             # AGENT.md reaches GPT-5.5 via the worktree AGENTS.md (below), so the
             # task's append_system_prompt must NOT also be prepended to the prompt
             # (that would duplicate the whole contract). Suppress it for codex.
@@ -513,6 +518,10 @@ def build_review_daemon(
         review_trigger_label=review_runtime.trigger_label,
         review_mode=review_runtime.mode,
         log=_log("review"),
+        # `rcfg.max_unproductive_rounds` is the ceiling the review decide side
+        # reads off this counter — same value, same getattr fallback, so a
+        # deterministic death saturates to exactly what escalates (#13).
+        max_infra_deaths=rcfg.max_unproductive_rounds,
         **_spend_cfg(cfg, "review", ledger),
     )
     # Reviewer has no worktree/issue side; pass a no-op Worktrees-like None usage.

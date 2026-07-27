@@ -6,7 +6,9 @@ from issue_agent.domain.outcome import (
     Outcome,
     ResolveFollowup,
     classify_outcome,
+    deterministic_death,
     infra_death,
+    offending_path,
     resolve_followup,
 )
 
@@ -90,3 +92,51 @@ def test_unclassified_result_is_never_an_infra_death():
     assert infra_death(None) is False
     assert AgentResult(is_error=True).exit_reason is None
     assert AgentResult(is_error=True).usage is None
+
+
+# ── deterministic deaths: the retry cannot win, so it must not be bought (#13) ─
+_BUFFER_DEATH = (
+    "CLIJSONDecodeError: Fatal error in message reader: Failed to decode JSON: "
+    "JSON message exceeded maximum buffer size of 1048576 bytes"
+)
+
+
+def test_buffer_overflow_death_is_deterministic():
+    d = deterministic_death(_BUFFER_DEATH)
+    assert d is not None
+    assert d.signature == "exceeded maximum buffer size"
+
+
+def test_deterministic_death_names_the_file_the_session_died_on():
+    # The operator's first question is "which file?" — the answer is the last
+    # tool call the runtime traced before the transport went down.
+    d = deterministic_death(
+        _BUFFER_DEATH, "AssistantMessage → Read(evidence/ac-3-edge-case-titles.png)"
+    )
+    assert d.path == "evidence/ac-3-edge-case-titles.png"
+
+
+def test_ordinary_transport_deaths_are_not_deterministic():
+    # These are the stochastic shape the breakers were built for: a retry may
+    # well survive, so classifying them here would escalate PRs a retry rescues.
+    assert deterministic_death("RuntimeError: Stream closed before any result") is None
+    assert deterministic_death("ProcessError: exit status 1") is None
+    assert deterministic_death("ConnectionResetError: [Errno 104]") is None
+
+
+def test_empty_and_missing_text_is_not_deterministic():
+    assert deterministic_death("") is None
+    assert deterministic_death(None) is None
+
+
+def test_deterministic_death_without_a_trace_still_classifies():
+    d = deterministic_death(_BUFFER_DEATH, "")
+    assert d is not None and d.path == ""
+
+
+def test_offending_path_takes_the_last_tool_call_and_never_raises():
+    assert offending_path("AssistantMessage → Bash(ls), Read(a/b.png)") == "a/b.png"
+    assert offending_path("AssistantMessage") == ""
+    assert offending_path("") == ""
+    assert offending_path(None) == ""
+    assert offending_path("Read(") == ""

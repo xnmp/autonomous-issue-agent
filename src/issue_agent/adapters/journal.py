@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from ..domain.agent_task import AgentTask
-from ..domain.outcome import AgentResult, ExitReason
+from ..domain.outcome import AgentResult, ExitReason, deterministic_death
 
 # The four SDK usage counters worth keeping. `cost_usd` is the gateway's dollar
 # figure, which is 0.00 on a subscription plan and absent on Codex — tokens are
@@ -240,6 +240,15 @@ class JournalingRuntime:
             # leaves exactly the same requeue-and-re-dispatch signature, so it
             # deserves the same receipt. The bare `raise` preserves the
             # exception object and its traceback verbatim.
+            error = f"{type(exc).__name__}: {str(exc)[:200]}"
+            # A death the INPUT causes gets its own journal shape (#13): the
+            # `transport_death` exit_reason is shared with the stochastic kind,
+            # so without these fields the ledger cannot tell the loop that will
+            # never converge from the one a retry rescues.
+            det = deterministic_death(
+                f"{type(exc).__name__}: {exc}",
+                str(getattr(exc, "harness_last_trace", "") or ""),
+            )
             self._record(
                 task,
                 AgentResult(
@@ -249,7 +258,9 @@ class JournalingRuntime:
                     exit_reason=ExitReason.TRANSPORT_DEATH,
                 ),
                 time.monotonic() - t0,
-                error=f"{type(exc).__name__}: {str(exc)[:200]}",
+                error=error,
+                deterministic=(det.signature if det else None),
+                detail=((det.path or None) if det else None),
             )
             raise
         self._record(task, result, time.monotonic() - t0)
