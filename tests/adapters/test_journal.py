@@ -953,6 +953,12 @@ class _FakeStore:
     def save_session(self, i, s):
         self.data[i] = s
 
+    def get_model(self, i):
+        return ""
+
+    def save_model(self, i, m):
+        pass
+
     def get_phase(self, i):
         return ""
 

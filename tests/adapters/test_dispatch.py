@@ -108,9 +108,17 @@ class FakeStore:
         self.resumes = {}
         self.phases = {}
         self.infra_deaths = {}
+        self.models = {}
 
     def save_session(self, i, s):
         self.sessions[i] = s
+
+    def save_model(self, i, m):
+        if m:
+            self.models[i] = m
+
+    def get_model(self, i):
+        return self.models.get(i, "")
 
     def get_session(self, i):
         return self.sessions.get(i, "")

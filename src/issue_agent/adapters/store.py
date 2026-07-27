@@ -39,7 +39,7 @@ from dataclasses import dataclass
 _ISSUE_SUFFIXES = (
     "session", "resumed-at", "resumes", "ci-retries", "resolve-retries",
     "rebase-retries", "infra-deaths", "review-retries", "phase", "jira",
-    "jira-phase",
+    "jira-phase", "model",
 )
 _PR_SUFFIXES = ("session", "last-sha", "round", "automerge", "patch-id")
 
@@ -146,6 +146,18 @@ class Store:
 
     def has_session(self, issue: int) -> bool:
         return bool(self.get_session(issue))
+
+    # ── routed model (issue: the model the resolve family actually ran) ──
+    # Repair legs resume the resolve's session; without this marker they fell
+    # back to the configured default model (#21), silently swapping the
+    # reasoner under the routed transcript. Same runtime-tagging discipline as
+    # sessions: a model routed for one runtime must never leak into another.
+    def get_model(self, issue: int) -> str:
+        return self._session_for_runtime(self._read(self.issue_path(issue, "model")))
+
+    def save_model(self, issue: int, model: str | None) -> None:
+        if model:
+            self._write(self.issue_path(issue, "model"), f"{self.runtime}:{model}")
 
     def get_pr_session(self, pr: int) -> str:
         return self._session_for_runtime(self._read(self.pr_path(pr, "session")))

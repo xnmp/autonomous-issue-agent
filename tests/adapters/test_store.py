@@ -512,3 +512,15 @@ def test_pr_sessions_are_tagged_the_same_way(tmp_path):
     s.save_pr_session(41, "rev-1")
     assert s.get_pr_session(41) == "rev-1"
     assert Store(str(tmp_path), runtime="codex").get_pr_session(41) == ""
+
+
+def test_model_marker_roundtrip_and_runtime_isolation():
+    s, d = _store()
+    assert s.get_model(5) == ""
+    s.save_model(5, "gpt-5.6-terra")
+    assert s.get_model(5) == "gpt-5.6-terra"
+    s.save_model(5, None)  # no model → marker untouched, not clobbered
+    assert s.get_model(5) == "gpt-5.6-terra"
+    # A model routed for one runtime must not leak into another (#21).
+    other = Store(state_dir=d, runtime="codex")
+    assert other.get_model(5) == ""
