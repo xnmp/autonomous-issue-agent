@@ -117,6 +117,80 @@ class FixState:
     infra_deaths: dict[int, int] = field(default_factory=dict)
 
 
+# ── holds (why a ready issue was NOT picked) ─────────────────────────────────
+HOLD_BLOCKER = "blocker"
+HOLD_OVERLAP = "overlap"
+
+
+@dataclass(frozen=True)
+class Hold:
+    """One reason ONE ai-ready issue was not dispatched this poll.
+
+    A deliberate hold and an idle bug look identical from outside (harness #6: a
+    silent path-overlap hold on #522 cost ~30 minutes of live investigation), so
+    every skip `pick_ready_issue` makes silently is also reportable as a value.
+
+    `blocker` NAMES the thing being waited on — `"pr#123"` for an overlap — so
+    the operator can go look at it. It is `""` for a GitHub-native dependency
+    hold: `IssueView.blocked_by_open` is a settled boolean (the adapter resolves
+    the dependency list and the domain only ever sees "at least one is open"),
+    so there is no number to name. If that view ever carries the blocking issue
+    numbers, this is where they go.
+    """
+
+    issue: int
+    reason: str          # HOLD_BLOCKER | HOLD_OVERLAP
+    blocker: str = ""    # "pr#123" | "" (unknown/unnameable)
+
+
+def _overlapping_open_pr(
+    declared: frozenset[str], prs: tuple[PRView, ...]
+) -> PRView | None:
+    """The first OPEN PR whose changed files collide with `declared`, or None.
+
+    The WITNESS form of `world.paths_overlap_open_prs` — and it is written by
+    applying that same predicate to one PR at a time rather than by re-stating
+    the matching rule, so the two can never drift: `_overlapping_open_pr(...) is
+    not None` is `paths_overlap_open_prs(...)` by construction, including the
+    fail-open on empty `declared` and the OPEN-only filter."""
+    for pr in prs:
+        if paths_overlap_open_prs(declared, (pr,)):
+            return pr
+    return None
+
+
+def _holds(issue: IssueView, world: WorldState) -> tuple[Hold, ...]:
+    """Every reason THIS issue is held back, ignoring its label/state (the
+    caller decides who is eligible to be held). Empty ⇒ dispatchable.
+
+    THE single definition of "held": `pick_ready_issue` filters on
+    `not _holds(...)` and `issue_holds` reports exactly what it returns, so the
+    journal can never disagree with the decision it explains."""
+    holds: list[Hold] = []
+    if issue.blocked_by_open:
+        holds.append(Hold(issue.number, HOLD_BLOCKER))
+    overlap = _overlapping_open_pr(issue.declared_paths, world.prs)
+    if overlap is not None:
+        holds.append(Hold(issue.number, HOLD_OVERLAP, f"pr#{overlap.number}"))
+    return tuple(holds)
+
+
+def issue_holds(world: WorldState) -> tuple[Hold, ...]:
+    """Every hold in force this poll: for each OPEN, ai-ready issue that
+    `pick_ready_issue` will skip, why. Pure; ordered by the world's issue order,
+    then blocker-before-overlap for a doubly-held issue.
+
+    Reported, not acted on — the wiring journals these (deduped per
+    issue/reason/blocker) so a harness that looks idle can be told apart from a
+    harness that is deliberately waiting."""
+    return tuple(
+        hold
+        for issue in world.open_issues()
+        if issue_lifecycle(issue).is_ready
+        for hold in _holds(issue, world)
+    )
+
+
 # ── cores ────────────────────────────────────────────────────────────────────
 def pick_ready_issue(world: WorldState) -> int | None:
     """Highest-priority ai-ready issue number, or None. Port of watcher.sh §1
@@ -135,12 +209,13 @@ def pick_ready_issue(world: WorldState) -> int | None:
     #60 both rewired the ConversationService composition root). Holding the second
     issue until the first PR merges serialises the collision away. Fail-open: an
     issue that declares no paths can't be predicted, so it is NOT held (the gate
-    only fires on a concrete, known overlap)."""
+    only fires on a concrete, known overlap).
+
+    Both skips are delegated to `_holds`, which `issue_holds` also reads, so the
+    hold journal explains THIS decision rather than a copy of it."""
     ready = [
         i for i in world.open_issues()
-        if issue_lifecycle(i).is_ready
-        and not i.blocked_by_open
-        and not paths_overlap_open_prs(i.declared_paths, world.prs)
+        if issue_lifecycle(i).is_ready and not _holds(i, world)
     ]
     if not ready:
         return None

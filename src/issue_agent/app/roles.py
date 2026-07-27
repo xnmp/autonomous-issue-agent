@@ -24,12 +24,13 @@ from ..adapters.journal import (
     Journal,
     JournalingRuntime,
     default_ledger_path,
+    hold_keys,
     read_events_tail,
     unsettled_starts,
 )
 from ..adapters.store import Store
 from ..adapters.worktree import Worktrees
-from ..domain.fix import FixConfig, FixState, breaker_key, decide_fix
+from ..domain.fix import FixConfig, FixState, breaker_key, decide_fix, issue_holds
 from ..domain.labels import Label
 from ..domain.lifecycle import retry_breaker
 from ..domain.review import (
@@ -159,6 +160,49 @@ def _fix_state(store: Store, world) -> FixState:
     )
 
 
+def _hold_reporter(journal: Journal | None, repo: str, log):
+    """Build the per-poll reporter that makes a DELIBERATE hold visible.
+
+    `pick_ready_issue` skips an ai-ready issue whose files overlap an in-flight
+    PR, or that has an open GitHub dependency — silently, which is
+    indistinguishable from a fixer that is simply broken (harness #6: a hold on
+    #522 cost ~30 minutes of live investigation before anyone could tell which
+    it was).
+
+    Same two-channel shape as `AgentDispatcher._spend_block`, for the same
+    reasons: the LOG line fires every poll (local, free, and "why is this issue
+    not moving?" must be answerable from any single poll's log), while the
+    JOURNAL line fires once per (issue, reason, blocker) — a hold is a level,
+    not an event, so an un-deduped emit is one line every 20s for as long as
+    the blocking PR is open. The identity travels IN the event as `block_key`,
+    so the dedup survives the process restarts a hot reload produces; the
+    in-process set is the cache that keeps the steady state free of file reads.
+    """
+    seen: set[str] = set()
+
+    def report(world) -> None:
+        for hold in issue_holds(world):
+            waiting_on = f" ({hold.blocker})" if hold.blocker else ""
+            log(
+                f"HOLD: issue #{hold.issue} is ai-ready but held — "
+                f"{hold.reason}{waiting_on}; it dispatches once that clears"
+            )
+            key = f"hold:{repo}:{hold.issue}:{hold.reason}:{hold.blocker}"
+            if key in seen:
+                continue
+            seen.add(key)
+            if journal is None:
+                continue
+            if key in hold_keys(read_events_tail(journal.path)):
+                continue
+            journal.emit(
+                "hold", issue=hold.issue, reason=hold.reason,
+                blocker=hold.blocker, block_key=key,
+            )
+
+    return report
+
+
 def build_fix_daemon(
     cfg: HarnessConfig,
     gateway: GitHubGateway,
@@ -283,7 +327,12 @@ def build_fix_daemon(
     )
     executor._run_agent = lambda a: asyncio.run(dispatcher.dispatch(a))  # noqa: SLF001
 
+    report_holds = _hold_reporter(journal, cfg.repo, _log("fix"))
+
     def decide(world):
+        # Report BEFORE deciding: if decide_fix raises, the tick still leaves a
+        # record of what it was holding, which is the state hardest to diagnose.
+        report_holds(world)
         return decide_fix(world, fix_cfg, _fix_state(store, world), fixer_busy())
 
     return Daemon("fix", gateway.build_world, decide, executor, cfg.poll_seconds,

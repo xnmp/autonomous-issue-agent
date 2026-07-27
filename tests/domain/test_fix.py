@@ -17,10 +17,14 @@ from issue_agent.domain.actions import (
 from issue_agent.domain.fix import (
     FixConfig,
     FixState,
+    HOLD_BLOCKER,
+    HOLD_OVERLAP,
+    Hold,
     breaker_tripped,
     breaker_key,
     cleanup_actions,
     decide_fix,
+    issue_holds,
     issues_needing_resume,
     pick_ready_issue,
     reap_actions,
@@ -97,6 +101,76 @@ def test_pick_ready_overlap_ignores_closed_pr():
     iss = issue(2, "ai-ready", "P2", declared_paths=frozenset({"backend/app/services/x.py"}))
     merged = pr(100, state="MERGED", changed_files=frozenset({"backend/app/services/x.py"}))
     assert pick_ready_issue(world(issues=[iss], prs=[merged])) == 2
+
+
+# ── holds: WHY a ready issue was not picked (harness #6) ──────────────────────
+def test_issue_holds_names_the_overlapping_pr():
+    iss = issue(2, "ai-ready", declared_paths=frozenset({"backend/app/services/x.py"}))
+    open_pr = pr(100, "ai-pr-open", state="OPEN",
+                 changed_files=frozenset({"backend/app/services/x.py"}))
+    assert issue_holds(world(issues=[iss], prs=[open_pr])) == (
+        Hold(2, HOLD_OVERLAP, "pr#100"),
+    )
+
+
+def test_issue_holds_reports_a_dependency_hold_with_no_nameable_blocker():
+    # blocked_by_open is a settled boolean, so there is no number to name; the
+    # REASON is still the thing the operator needs.
+    w = world(issues=[issue(3, "ai-ready", blocked_by_open=True)])
+    assert issue_holds(w) == (Hold(3, HOLD_BLOCKER, ""),)
+
+
+def test_issue_holds_reports_both_reasons_for_a_doubly_held_issue():
+    iss = issue(4, "ai-ready", blocked_by_open=True,
+                declared_paths=frozenset({"a/b.py"}))
+    open_pr = pr(7, state="OPEN", changed_files=frozenset({"a/b.py"}))
+    assert issue_holds(world(issues=[iss], prs=[open_pr])) == (
+        Hold(4, HOLD_BLOCKER, ""), Hold(4, HOLD_OVERLAP, "pr#7"),
+    )
+
+
+def test_issue_holds_is_empty_when_nothing_is_held():
+    # A dispatchable issue, an unrelated open PR, and an issue that is not
+    # ai-ready at all (its non-dispatch is not a hold — it was never queued).
+    iss = issue(2, "ai-ready", declared_paths=frozenset({"routes/y.py"}))
+    other = issue(9, "ai-working", blocked_by_open=True)
+    open_pr = pr(100, state="OPEN", changed_files=frozenset({"services/x.py"}))
+    assert issue_holds(world(issues=[iss, other], prs=[open_pr])) == ()
+
+
+def test_issue_holds_ignores_a_closed_issue():
+    iss = issue(2, "ai-ready", state="closed", blocked_by_open=True)
+    assert issue_holds(world(issues=[iss])) == ()
+
+
+def test_a_held_issue_is_exactly_one_absent_from_pick_ready_issue():
+    """The anti-drift contract: the journal must explain the REAL decision, so
+    `issue_holds` reports a hold for exactly those ai-ready issues
+    `pick_ready_issue` refuses to pick. Driven over every combination of the two
+    gate inputs against one open PR (plus the fail-open no-paths case)."""
+    open_pr = pr(100, state="OPEN", changed_files=frozenset({"x.py"}))
+    for n, (blocked, paths) in enumerate(
+        [(b, p) for b in (False, True)
+         for p in (frozenset(), frozenset({"x.py"}), frozenset({"y.py"}))],
+        start=1,
+    ):
+        w = world(
+            issues=[issue(n, "ai-ready", blocked_by_open=blocked, declared_paths=paths)],
+            prs=[open_pr],
+        )
+        held = bool(issue_holds(w))
+        assert held is (pick_ready_issue(w) is None), (blocked, paths)
+
+
+def test_holds_do_not_mask_a_pickable_issue():
+    # Anti-vacuity for the consistency test: with one held and one free issue,
+    # the free one is still dispatched and only the held one is reported.
+    held = issue(1, "ai-ready", "P1", declared_paths=frozenset({"x.py"}))
+    free = issue(2, "ai-ready", "P2")
+    open_pr = pr(100, state="OPEN", changed_files=frozenset({"x.py"}))
+    w = world(issues=[held, free], prs=[open_pr])
+    assert pick_ready_issue(w) == 2
+    assert issue_holds(w) == (Hold(1, HOLD_OVERLAP, "pr#100"),)
 
 
 def test_resolve_dispatch_relabels_then_runs():

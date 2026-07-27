@@ -45,7 +45,7 @@ from issue_agent.app.planners.tasks import (
     REVIEW_DIMENSIONS,
     ReviewTaskConfig,
 )
-from issue_agent.app.roles import _fix_state, _review_state
+from issue_agent.app.roles import _fix_state, _hold_reporter, _review_state
 from issue_agent.domain.actions import AgentKind, Relabel, RunAgent, Target
 from issue_agent.domain.fix import FixConfig, breaker_key, decide_fix
 from issue_agent.domain.labels import Label
@@ -133,7 +133,9 @@ class FakeGateway:
 
 def _dispatcher(gw, store, runner, **overrides):
     kwargs = dict(
-        fix=FixTaskConfig("o/r", agent_md="AM"),
+        # Pinned model: keeps the difficulty-router leg out of these scripted
+        # sequences (see test_fix_workflow's routing tests for the unpinned path).
+        fix=FixTaskConfig("o/r", agent_md="AM", model="m"),
         review=ReviewTaskConfig("o/r", review_prompt="p"),
         fix_bot=FIX_BOT,
     )
@@ -820,3 +822,100 @@ def test_the_orphan_key_is_not_double_counted_for_an_issueless_pr(tmp_path):
     # this one.)
     store.bump_infra_deaths(-100)
     assert _fix_state(store, w).infra_deaths[-100] == 4
+
+
+# ── hold reporting (harness #6) ───────────────────────────────────────────────
+def _held_world(pr_state="OPEN"):
+    """One ai-ready issue whose declared path collides with a PR's changed
+    files. `pr_state="MERGED"` is the same world after the hold RELEASES."""
+    return WorldState(
+        issues=(
+            IssueView(522, title="t", body="b", labels=frozenset({Label.AI_READY}),
+                      declared_paths=frozenset({"backend/app/x.py"})),
+        ),
+        prs=(
+            PRView(123, head_ref_name="fix/9-x", state=pr_state, author=FIX_BOT,
+                   changed_files=frozenset({"backend/app/x.py"})),
+        ),
+    )
+
+
+def _holds_in(journal):
+    return [e for e in read_events(journal.path) if e.get("event") == "hold"]
+
+
+def test_a_hold_is_journaled_once_and_logged_every_poll(tmp_path):
+    """AC: the hold appears ONCE in the journal however many polls it survives —
+    while the LOG keeps answering "why is #522 not moving?" on every poll."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    logs = []
+    report = _hold_reporter(journal, "o/r", logs.append)
+
+    for _ in range(3):
+        report(_held_world())
+
+    assert _holds_in(journal) == [
+        {
+            "ts": _holds_in(journal)[0]["ts"], "event": "hold", "issue": 522,
+            "reason": "overlap", "blocker": "pr#123",
+            "block_key": "hold:o/r:522:overlap:pr#123",
+        }
+    ]
+    assert len(logs) == 3 and all("#522" in ln and "overlap" in ln for ln in logs)
+
+
+def test_releasing_a_hold_journals_nothing_extra(tmp_path):
+    """AC: releasing the hold journals nothing extra — the event says a hold
+    STARTED; the absence of further holds (and the PR's own merge line) is the
+    release. Re-holding on the SAME blocker stays deduped too."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    report = _hold_reporter(journal, "o/r", lambda _m: None)
+
+    report(_held_world())
+    report(_held_world("MERGED"))   # released
+    report(_held_world())           # same (issue, reason, blocker) again
+
+    assert len(_holds_in(journal)) == 1
+
+
+def test_a_second_blocker_is_its_own_hold(tmp_path):
+    """Anti-vacuity for the dedup: it keys on the TUPLE, so a different blocking
+    PR — a genuinely new fact — is still reported."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    report = _hold_reporter(journal, "o/r", lambda _m: None)
+
+    report(_held_world())
+    w = _held_world()
+    report(replace(w, prs=(replace(w.prs[0], number=124),)))
+
+    assert [e["blocker"] for e in _holds_in(journal)] == ["pr#123", "pr#124"]
+
+
+def test_the_hold_dedup_survives_a_daemon_restart(tmp_path):
+    """The flood shape is a daemon restarting (hot reload / Restart=always), so
+    an in-process set alone would re-emit every boot. A FRESH reporter over the
+    same journal must stay silent."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    _hold_reporter(journal, "o/r", lambda _m: None)(_held_world())
+    _hold_reporter(journal, "o/r", lambda _m: None)(_held_world())
+
+    assert len(_holds_in(journal)) == 1
+
+
+def test_hold_reporting_without_a_journal_still_logs(tmp_path):
+    """Observability must never add a failure mode: no journal → log only."""
+    logs = []
+    _hold_reporter(None, "o/r", logs.append)(_held_world())
+    assert len(logs) == 1
+
+
+def test_a_journaled_hold_explains_the_issue_decide_fix_actually_withheld(tmp_path):
+    """The two halves must agree: the issue named in the journal is exactly the
+    one `decide_fix` refuses to dispatch this poll."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    w = _held_world()
+    _hold_reporter(journal, "o/r", lambda _m: None)(w)
+
+    actions = decide_fix(w, _cfg(), _fix_state(Store(str(tmp_path)), w), fixer_busy=False)
+    assert not _has_run(actions, AgentKind.RESOLVE)
+    assert [e["issue"] for e in _holds_in(journal)] == [522]

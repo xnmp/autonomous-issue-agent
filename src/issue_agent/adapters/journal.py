@@ -629,6 +629,18 @@ def repeated_dispatch_warning(events, window_s: float, threshold: int) -> str:
     return worst
 
 
+def _emitted_block_keys(events, event: str) -> set[str]:
+    """The `block_key`s `event` has already been emitted for. Events with no
+    `block_key` (written before the field existed) are ignored rather than
+    guessed at — the cost of that is at most one extra emit per key after an
+    upgrade."""
+    return {
+        str(e["block_key"])
+        for e in events
+        if e.get("event") == event and e.get("block_key")
+    }
+
+
 def spend_blocked_keys(events) -> set[str]:
     """The `block_key`s a `spend_block` event has ALREADY been emitted for.
 
@@ -644,11 +656,21 @@ def spend_blocked_keys(events) -> set[str]:
     rather than guessed at — the cost of that is at most one extra alert per
     key after an upgrade.
     """
-    return {
-        str(e["block_key"])
-        for e in events
-        if e.get("event") == "spend_block" and e.get("block_key")
-    }
+    return _emitted_block_keys(events, "spend_block")
+
+
+def hold_keys(events) -> set[str]:
+    """The `block_key`s a `hold` event has ALREADY been emitted for.
+
+    Same edge-trigger read as `spend_blocked_keys`, for the same reason: a hold
+    is a LEVEL (an ai-ready issue overlapping an in-flight PR stays held until
+    that PR lands, which can be hours), so an un-deduped emit writes one line
+    per poll — ~4,300 a day at POLL_SECONDS=20 — and buries the one line that
+    answers "why is nothing being dispatched?". Deduping THROUGH the journal
+    rather than only in memory keeps that true across the daemon restarts a
+    hot reload or `Restart=always` produces.
+    """
+    return _emitted_block_keys(events, "hold")
 
 
 # How many settled runs must agree before the ledger is declared blind. Small
@@ -806,6 +828,7 @@ __all__ = [
     "estimate_cost_usd",
     "event_line",
     "events_within",
+    "hold_keys",
     "observed_cost_per_token",
     "parse_ts",
     "read_events",

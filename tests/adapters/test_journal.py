@@ -25,6 +25,7 @@ from issue_agent.adapters.journal import (
     death_key,
     default_ledger_path,
     events_within,
+    hold_keys,
     read_events,
     read_events_tail,
     recent_runs,
@@ -875,7 +876,9 @@ def _cap_dispatcher(tmp_path, ledger, *, issue_cap=0.0, daily_cap=0.0,
     runner = RecordingRunner()
     journal = Journal(str(tmp_path / "j.jsonl"))
     cfg = DispatchConfig(
-        fix=FixTaskConfig("o/r", agent_md="AM"),
+        # Pinned model: keeps the difficulty-router leg out of these scripted
+        # run counts (see test_fix_workflow's routing tests for the unpinned path).
+        fix=FixTaskConfig("o/r", agent_md="AM", model="m"),
         review=ReviewTaskConfig("o/r"),
         review_trigger_label=trigger_label,
         role="fix", repo="o/r", spend_ledger_path=ledger,
@@ -1202,6 +1205,24 @@ def test_spend_blocked_keys_reads_only_keyed_blocks():
         {"event": "agent_run", "block_key": "issue:o/r:9"},  # not a block
     ]
     assert spend_blocked_keys(events) == {"issue:o/r:5"}
+
+
+def test_hold_keys_reads_only_keyed_holds():
+    events = [
+        {"event": "hold", "block_key": "hold:o/r:522:overlap:pr#123"},
+        {"event": "hold", "reason": "blocker"},                  # unkeyed → ignored
+        {"event": "spend_block", "block_key": "issue:o/r:9"},    # a different level
+    ]
+    assert hold_keys(events) == {"hold:o/r:522:overlap:pr#123"}
+
+
+def test_hold_keys_survives_a_round_trip_through_a_real_journal(tmp_path):
+    """The dedup that matters is the one across a process restart, so the read
+    must work off what `Journal.emit` actually wrote — not a hand-built dict."""
+    journal = Journal(str(tmp_path / "j.jsonl"))
+    journal.emit("hold", issue=522, reason="overlap", blocker="pr#123",
+                 block_key="hold:o/r:522:overlap:pr#123")
+    assert hold_keys(read_events_tail(journal.path)) == {"hold:o/r:522:overlap:pr#123"}
 
 
 def test_dispatcher_tags_the_runtime_with_the_dispatch_context(tmp_path):
