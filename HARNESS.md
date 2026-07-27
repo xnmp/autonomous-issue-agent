@@ -135,9 +135,9 @@ every repo's units at once).
 
 Lower-level equivalent, without the CLI (per `config/repos/<name>.env`):
 ```bash
-bash bin/compose-env.sh myapp                              # writes config/.active.env
-AGENT_ENV=config/.active.env bash bin/install-systemd.sh    # Linux
-# or: AGENT_ENV=config/.active.env bash bin/install-launchd.sh   # macOS
+bash bin/compose-env.sh myapp                              # writes config/.active.myapp.env
+AGENT_ENV=config/.active.myapp.env bash bin/install-systemd.sh    # Linux
+# or: AGENT_ENV=config/.active.myapp.env bash bin/install-launchd.sh   # macOS
 ```
 
 ## Quickstart (make / lower level)
@@ -194,8 +194,8 @@ make install-launchd    # macOS
 On the multi-repo layout, compose the per-repo config first (this just writes
 the file — it does not launch anything), then point `AGENT_ENV` at it:
 ```bash
-bash bin/compose-env.sh myapp                         # writes config/.active.env
-AGENT_ENV=config/.active.env make install-systemd
+bash bin/compose-env.sh myapp                         # writes config/.active.myapp.env
+AGENT_ENV=config/.active.myapp.env make install-systemd
 ```
 Uninstall: `make uninstall-systemd` / `make uninstall-launchd`.
 

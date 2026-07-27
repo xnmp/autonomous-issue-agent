@@ -15,7 +15,7 @@ uv.lock
 config/agent.env
 config/shared.env
 config/repos/
-config/.active.env
+config/.active*.env
 
 # Demo scratch
 examples/demo-target/.scratch/

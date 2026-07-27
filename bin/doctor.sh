@@ -54,7 +54,7 @@ else
   bad "config not found: $CONFIG (copy config/agent.env.example → config/agent.env)"
 fi
 
-echo "== config snapshot (config/.active.env) =="
+echo "== config snapshot (config/.active.<name>.env) =="
 # review P0R-1 fold-in: `.active.env` is a SNAPSHOT. A machine whose snapshot was
 # composed by the pre-P0R-1 bin/compose-env.sh (whose PRE/POST diff silently
 # dropped any var the files assign to the value the launching shell already had)
@@ -71,16 +71,23 @@ echo "== config snapshot (config/.active.env) =="
 # Sourcing — rather than only scanning assignment lines — is what keeps it quiet
 # about a name the overlay assigns and then `unset`s (R2-11): absent from both
 # sides, so not a discrepancy.
-_ACTIVE_ENV="$HARNESS_ROOT/config/.active.env"
-if [ ! -f "$_ACTIVE_ENV" ]; then
-  ok "no config/.active.env yet — nothing to compare (point-at writes it)"
-else
+# Per-name snapshots (config/.active.<name>.env) plus the legacy fixed
+# config/.active.env a pre-per-name compose may have left behind: check ALL of
+# them — with concurrent deployments any one being stale is a real finding.
+shopt -s nullglob
+_ACTIVE_FILES=("$HARNESS_ROOT"/config/.active*.env)
+shopt -u nullglob
+if [ ${#_ACTIVE_FILES[@]} -eq 0 ]; then
+  ok "no composed config/.active.<name>.env yet — nothing to compare (point-at writes it)"
+fi
+for _ACTIVE_ENV in "${_ACTIVE_FILES[@]}"; do
+  _ACTIVE_BASE="${_ACTIVE_ENV##*/}"
   _SHARED_ENV="$HARNESS_ROOT/config/shared.env"
   # compose-env.sh stamps the composing overlay into the first line.
   _ACTIVE_NAME="$(sed -n '1s|.*repos/\([A-Za-z0-9_.-]*\)\.env.*|\1|p' "$_ACTIVE_ENV")"
   _ACTIVE_OVERLAY="$HARNESS_ROOT/config/repos/$_ACTIVE_NAME.env"
   if [ -z "$_ACTIVE_NAME" ] || [ ! -f "$_ACTIVE_OVERLAY" ]; then
-    warn "cannot tell which overlay composed config/.active.env (missing/edited AUTO-GENERATED header) — skipping the staleness check; re-run 'make point-at REPO=<name>' to regenerate it"
+    warn "cannot tell which overlay composed config/$_ACTIVE_BASE (missing/edited AUTO-GENERATED header) — skipping the staleness check; re-run 'make point-at REPO=<name>' to regenerate it"
   else
     # Names the two files assign AND that survive sourcing them.
     _expected_names="$(
@@ -107,12 +114,12 @@ else
       <(printf '%s\n' "$_snapshot_names" | sed '/^$/d' | sort -u) | tr '\n' ' ')"
     _missing_names="${_missing_names%"${_missing_names##*[![:space:]]}"}"
     if [ -n "$_missing_names" ]; then
-      bad "config/.active.env is STALE — it omits $(printf '%s' "$_missing_names" | wc -w | tr -d ' ') variable(s) that config/shared.env or config/repos/$_ACTIVE_NAME.env assign: $_missing_names — regenerate it with 'make point-at REPO=$_ACTIVE_NAME' (or 'issue-agent start'). A snapshot written by the pre-P0R-1 compose-env.sh drops assigned vars silently; if TEST_CMD is among them the gate denies every push and 'gh pr create' until this is fixed."
+      bad "config/$_ACTIVE_BASE is STALE — it omits $(printf '%s' "$_missing_names" | wc -w | tr -d ' ') variable(s) that config/shared.env or config/repos/$_ACTIVE_NAME.env assign: $_missing_names — regenerate it with 'make point-at REPO=$_ACTIVE_NAME' (or 'issue-agent start'). A snapshot written by the pre-P0R-1 compose-env.sh drops assigned vars silently; if TEST_CMD is among them the gate denies every push and 'gh pr create' until this is fixed."
     else
-      ok "config snapshot matches config/shared.env + repos/$_ACTIVE_NAME.env"
+      ok "config/$_ACTIVE_BASE matches config/shared.env + repos/$_ACTIVE_NAME.env"
     fi
   fi
-fi
+done
 
 echo "== per-repo state-dir collisions (config/repos/*.env) =="
 # review M5/D7: default STATE_DIR/REVIEW_STATE_DIR/STEWARD_STATE_DIR are now

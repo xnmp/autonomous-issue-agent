@@ -51,8 +51,8 @@ chmod 700 "$(dirname "$LOG_DIR")" 2>/dev/null || true
 # Delegated to bin/compose-env.sh (the single source of truth for the compose
 # step, shared with the `issue-agent` CLI). Sourced (not executed) so REPO /
 # TARGET_DIR / BASE_BRANCH / ROLES-relevant vars land in THIS shell for the steps
-# below; it also writes config/.active.env and exports AGENT_ENV to it.
-info "composing env: shared.env + repos/$NAME.env → config/.active.env"
+# below; it also writes config/.active.<name>.env and exports AGENT_ENV to it.
+info "composing env: shared.env + repos/$NAME.env → config/.active.$NAME.env"
 # shellcheck disable=SC1090
 . "$HARNESS_ROOT/bin/compose-env.sh" "$NAME" || { red "env compose failed"; exit 1; }
 

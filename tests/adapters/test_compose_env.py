@@ -158,7 +158,7 @@ def _compose(tmp_path: Path, shared: str, overlay: str, ambient: dict | None = N
         ["bash", str(compose_env_sh), "demo"],
         check=True, capture_output=True, text=True, env=env,
     )
-    return tmp_path / "config" / ".active.env"
+    return tmp_path / "config" / ".active.demo.env"
 
 
 def _emitted(active: Path) -> dict[str, str]:
@@ -213,7 +213,7 @@ def test_compose_env_pipeline_carries_knobs_outside_old_allow_list_to_os_environ
         ["bash", str(compose_env_sh), "demo"], check=True, capture_output=True, text=True
     )
 
-    active = tmp_path / "config" / ".active.env"
+    active = tmp_path / "config" / ".active.demo.env"
     active_text = active.read_text()
     assert "CI_IGNORE_CHECKS=" in active_text
     assert "MAX_INFRA_DEATHS=7" in active_text
@@ -248,7 +248,7 @@ def test_compose_env_repo_overlay_wins_over_shared(tmp_path):
     subprocess.run(
         ["bash", str(compose_env_sh), "demo"], check=True, capture_output=True, text=True
     )
-    active_text = (tmp_path / "config" / ".active.env").read_text()
+    active_text = (tmp_path / "config" / ".active.demo.env").read_text()
     assert "MERGE_METHOD=squash" in active_text
     assert "MERGE_METHOD=merge" not in active_text
 
@@ -273,7 +273,7 @@ def test_compose_env_does_not_leak_ambient_or_shell_owned_vars(tmp_path):
         ["bash", str(compose_env_sh), "demo"],
         check=True, capture_output=True, text=True, env=env,
     )
-    active_text = (tmp_path / "config" / ".active.env").read_text()
+    active_text = (tmp_path / "config" / ".active.demo.env").read_text()
     assert "SOME_UNRELATED_AMBIENT_VAR" not in active_text
     for shell_owned in ("PATH=", "PWD=", "SHLVL=", "\n_=", "OLDPWD="):
         assert shell_owned not in active_text
@@ -682,3 +682,28 @@ def test_doctor_case_insensitive_bot_suffix_mismatch(tmp_path):
     })
     assert result.returncode != 0
     assert "IDENTITY_MODE=three needs" in result.stdout
+
+
+def test_two_deployments_compose_to_separate_files(tmp_path):
+    """Concurrent multi-repo deployments: composing repo B must not overwrite
+    repo A's snapshot (the old fixed config/.active.env did exactly that, and
+    the mtime hot-reload watch then re-pointed A's live daemons at B)."""
+    compose_env_sh = _install_compose_env(tmp_path)
+    (tmp_path / "config").mkdir(exist_ok=True)
+    (tmp_path / "config" / "shared.env").write_text("SHARED_KNOB=x\n")
+    repos_dir = tmp_path / "config" / "repos"
+    repos_dir.mkdir(exist_ok=True)
+    (repos_dir / "alpha.env").write_text("REPO=acme/alpha\n")
+    (repos_dir / "beta.env").write_text("REPO=acme/beta\n")
+
+    for name in ("alpha", "beta"):
+        subprocess.run(
+            ["bash", str(compose_env_sh), name],
+            check=True, capture_output=True, text=True,
+        )
+
+    alpha = tmp_path / "config" / ".active.alpha.env"
+    beta = tmp_path / "config" / ".active.beta.env"
+    assert "REPO=acme/alpha" in alpha.read_text()
+    assert "REPO=acme/beta" in beta.read_text()
+    assert not (tmp_path / "config" / ".active.env").exists()

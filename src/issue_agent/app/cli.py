@@ -34,6 +34,13 @@ HARNESS_ROOT = os.path.dirname(
 )
 REPOS_DIR = os.path.join(HARNESS_ROOT, "config", "repos")
 SHARED_ENV = os.path.join(HARNESS_ROOT, "config", "shared.env")
+
+
+def _active_env_path(name: str) -> str:
+    """The composed env snapshot for one deployment. Per-NAME (not the old fixed
+    config/.active.env) so concurrent deployments never overwrite each other's
+    snapshot or trip each other's mtime hot-reload watch."""
+    return os.path.join(HARNESS_ROOT, "config", f".active.{name}.env")
 ROLES = ("fix", "review", "steward")
 
 
@@ -1047,7 +1054,7 @@ def cmd_doctor(args) -> int:
     if os.path.isfile(SHARED_ENV) and os.path.isfile(overlay):
         r = subprocess.run(["/bin/bash", _bin("compose-env.sh"), name])
         if r.returncode == 0:
-            env["AGENT_ENV"] = os.path.join(HARNESS_ROOT, "config", ".active.env")
+            env["AGENT_ENV"] = _active_env_path(name)
     elif os.path.isfile(SHARED_ENV):
         # shared.env exists but this repo has no overlay yet — the normal state
         # before the first `issue-agent start`. compose-env.sh needs both files,
@@ -1117,14 +1124,14 @@ def cmd_install_service(args) -> int:
     # return code — a compose failure (bad overlay syntax, missing file
     # between check above and here, etc.) fell through silently, and the
     # service unit got installed pointing AGENT_ENV at a STALE or missing
-    # config/.active.env (whatever a prior successful compose left behind, or
+    # the composed active env (whatever a prior successful compose left behind, or
     # nothing). Fail loud and abort instead of installing against unknown env.
     r = subprocess.run(["/bin/bash", _bin("compose-env.sh"), name])
     if r.returncode != 0:
         err(f"compose-env.sh failed (exit {r.returncode}) — not installing the "
-            f"service against a stale/missing config/.active.env.")
+            f"service against a stale/missing config/.active.{name}.env.")
         return r.returncode
-    env = dict(os.environ, AGENT_ENV=os.path.join(HARNESS_ROOT, "config", ".active.env"))
+    env = dict(os.environ, AGENT_ENV=_active_env_path(name))
     script = "install-launchd.sh" if sys.platform == "darwin" else "install-systemd.sh"
     cmd = ["/bin/bash", _bin(script)]
     # Pass a single-role selector through (launchd installer supports --fix/etc).
