@@ -919,3 +919,71 @@ def test_a_journaled_hold_explains_the_issue_decide_fix_actually_withheld(tmp_pa
     actions = decide_fix(w, _cfg(), _fix_state(Store(str(tmp_path)), w), fixer_busy=False)
     assert not _has_run(actions, AgentKind.RESOLVE)
     assert [e["issue"] for e in _holds_in(journal)] == [522]
+
+
+# ── FIXER_RUNTIME=glm wiring (build_fix_daemon) ──────────────────────────────
+# The wrapping itself (env injection, task-env precedence) is proven in
+# tests/adapters/test_claude_profile.py; what these pin is the BUILD-TIME
+# contract of the glm branch — that a profile is resolved once at startup and
+# that its outcome is announced in one operator-facing line either way. The
+# composed runner is not reachable from the returned Daemon without reading a
+# private attribute, so it is deliberately not asserted here.
+
+
+class _BuildableGateway(FakeGateway):
+    """FakeGateway plus the one member `build_fix_daemon` binds at build time."""
+
+    def build_world(self):  # pragma: no cover - never ticked in these tests
+        raise AssertionError("these tests build the daemon, they do not tick it")
+
+
+def _glm_profile(tmp_path, settings: str) -> str:
+    d = tmp_path / ".cc-glm"
+    d.mkdir()
+    (d / "settings.json").write_text(settings)
+    return str(d / "settings.json")
+
+
+def _glm_daemon(tmp_path, settings_file: str):
+    from issue_agent.app.config import from_env
+    from issue_agent.app.roles import build_fix_daemon
+
+    cfg = from_env({
+        "REPO": "o/r", "FIX_BOT": FIX_BOT, "FIXER_RUNTIME": "glm",
+        "GLM_SETTINGS_FILE": settings_file, "STATE_DIR": str(tmp_path / "state"),
+    })
+    return build_fix_daemon(
+        cfg, _BuildableGateway(), Store(str(tmp_path / "state")), FakeWorktrees(),
+        FakeRunner(AgentResult(is_error=False)),
+    )
+
+
+def test_a_glm_profile_is_resolved_once_at_startup_and_announced(tmp_path, capsys):
+    settings = json.dumps({"env": {"ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic"}})
+
+    daemon = _glm_daemon(tmp_path, _glm_profile(tmp_path, settings))
+
+    line = capsys.readouterr().err
+    assert "glm: runtime ready" in line
+    assert "api.z.ai" in line              # endpoint host: useful, not secret
+    assert "NOT READY" not in line
+    assert daemon.name == "fix"
+
+
+def test_a_missing_glm_profile_says_so_loudly_at_startup_instead_of_dying(tmp_path, capsys):
+    """A misconfig must surface as ONE startup line, not as an opaque failure on
+    the first dispatch — and the daemon must still be built (visibly wrong beats
+    a crash-looping fixer)."""
+    daemon = _glm_daemon(tmp_path, str(tmp_path / "absent" / "settings.json"))
+
+    err = capsys.readouterr().err
+    assert "glm: NOT READY at startup" in err
+    assert "settings.json" in err
+    assert daemon.name == "fix"
+
+
+def test_a_malformed_glm_profile_is_not_ready_rather_than_a_traceback(tmp_path, capsys):
+    daemon = _glm_daemon(tmp_path, _glm_profile(tmp_path, '{"env": {,,}'))
+
+    assert "glm: NOT READY at startup" in capsys.readouterr().err
+    assert daemon.name == "fix"

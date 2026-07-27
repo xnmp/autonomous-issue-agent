@@ -313,6 +313,30 @@ def build_fix_daemon(
         prepare_cwd = partial(
             write_hook_config, agents_md=cfg.agent_md, edit_check_cmd=cfg.edit_check_cmd
         )
+    elif cfg.fixer_runtime == "glm":
+        # GLM speaks Anthropic's wire protocol, so the SAME Claude runner is used
+        # with the profile's env injected (base URL + model aliases + auth token);
+        # prepare_cwd stays None because that runner gets its governor via SDK
+        # hooks, exactly as on FIXER_RUNTIME=claude.
+        from ..adapters.claude_profile import (
+            EnvInjectingRuntime,
+            claude_profile_env,
+            endpoint_host,
+        )
+
+        try:
+            _glm_env = claude_profile_env(cfg.glm_settings_file)
+        except ValueError as exc:
+            # Same contract as the codex preflight: a misconfig is ONE loud line at
+            # startup, not an opaque failure on the first dispatch. Unwrapped means
+            # the fixer runs on plain Claude — visibly wrong beats silently wrong.
+            _log("fix")(f"glm: NOT READY at startup — {exc}")
+        else:
+            fix_runner = EnvInjectingRuntime(runner, env=_glm_env)
+            _log("fix")(
+                f"glm: runtime ready (endpoint {endpoint_host(_glm_env)}, "
+                f"profile {_glm_env['CLAUDE_CONFIG_DIR']})"
+            )
 
     executor = Executor(
         gateway, remove_worktree=worktrees.remove, log=_log("fix"),

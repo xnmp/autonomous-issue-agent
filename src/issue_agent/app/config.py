@@ -242,9 +242,11 @@ class HarnessConfig:
     jira_mcp_config: str = "config/mcp/atlassian.json"
     jira_mcp_tools: str = "mcp__atlassian__*"
     jira_budget_usd: float = 0.50
-    # Fixer runtime: "claude" (default, Claude Agent SDK) or "codex" (OpenAI Codex
-    # CLI, e.g. GPT-5.5). Only the FIXER leg switches; reviewer/steward stay Claude
-    # (a distinct model decorrelates blind spots). See docs/CODEX-RUNNER.md.
+    # Fixer runtime: "claude" (default, Claude Agent SDK), "codex" (OpenAI Codex
+    # CLI, e.g. GPT-5.5), or "glm" (GLM via Z.ai's Anthropic-compatible endpoint —
+    # the SAME Claude SDK runner with the profile's env injected). Only the FIXER
+    # leg switches; reviewer/steward stay Claude (a distinct model decorrelates
+    # blind spots). See docs/CODEX-RUNNER.md.
     fixer_runtime: str = "claude"
     codex_bin: str = "codex"
     codex_model: str = ""              # blank → CodexRunner default (GPT-5.5)
@@ -257,6 +259,12 @@ class HarnessConfig:
     codex_env_key: str = "OPENAI_API_KEY"
     codex_wire_api: str = "responses"
     codex_sandbox: str = "danger-full-access"
+    # FIXER_RUNTIME=glm: path to a Claude Code PROFILE's settings.json (e.g.
+    # ~/.cc-glm/settings.json). Its parent directory IS the profile dir, and both
+    # the settings `env` block and the profile's `.env` are read at build time to
+    # form the env injected into the fixer's SDK subprocess (see
+    # adapters/claude_profile.py). Blank is a config error under glm.
+    glm_settings_file: str = ""
     # Idle watchdog: max seconds between agent stream events before a run is deemed
     # hung and aborted (retryable). NOT a total-runtime cap — a hard task streams
     # events steadily and never trips it. The one legit long gap is a single
@@ -487,8 +495,14 @@ class HarnessConfig:
             ("JIRA_SYNC_BUDGET_USD", self.jira_budget_usd),
         ):
             _require_positive(errors, name, value)
-        if self.fixer_runtime not in ("claude", "codex"):
-            errors.append("FIXER_RUNTIME must be 'claude' or 'codex'")
+        if self.fixer_runtime not in ("claude", "codex", "glm"):
+            errors.append("FIXER_RUNTIME must be 'claude', 'codex' or 'glm'")
+        elif self.fixer_runtime == "glm" and not self.glm_settings_file.strip():
+            # The glm runtime IS "the Claude runner plus a profile's env"; with no
+            # profile there is nothing to inject and the fixer would silently run
+            # on Anthropic credentials instead. Existence of the file is a
+            # build-time check (roles); emptiness is a config error.
+            errors.append("GLM_SETTINGS_FILE is required when FIXER_RUNTIME=glm")
         _require_non_negative(errors, "AGENT_IDLE_TIMEOUT_SECONDS", self.agent_idle_timeout)
         _require_non_negative(errors, "AGENT_MAX_RUNTIME_SECONDS", self.agent_max_runtime)
         _require_non_negative(errors, "CODEX_TRANSPORT_RETRIES", self.codex_transport_retries)
@@ -836,6 +850,7 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         codex_env_key=e.get("CODEX_ENV_KEY", _dc_default("codex_env_key")),
         codex_wire_api=e.get("CODEX_WIRE_API", _dc_default("codex_wire_api")),
         codex_sandbox=e.get("CODEX_SANDBOX", _dc_default("codex_sandbox")),
+        glm_settings_file=e.get("GLM_SETTINGS_FILE", _dc_default("glm_settings_file")),
         agent_idle_timeout=_coerce_float(
             e, "AGENT_IDLE_TIMEOUT_SECONDS", _dc_default("agent_idle_timeout"), errors
         ),

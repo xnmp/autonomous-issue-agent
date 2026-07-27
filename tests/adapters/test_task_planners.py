@@ -698,6 +698,17 @@ def test_route_model_is_total_over_garbage_classifier_output():
     assert route_model("complex", "gemini???") == "opus"
 
 
+def test_route_model_maps_tiers_within_the_glm_family():
+    """glm runs on the Claude SDK runner, so an unrouted Anthropic alias would
+    reach the Z.ai endpoint unresolved — the ids must come from the GLM family."""
+    from issue_agent.app.planners.tasks import route_model
+
+    assert route_model("complex", "glm") == "glm-5.2[1m]"
+    assert route_model("standard", "glm") == "glm-5.2"
+    assert route_model("trivial", "glm") == "glm-4.7"
+    assert route_model("nonsense", "glm") == "glm-5.2"
+
+
 def test_router_task_runs_on_the_active_runtimes_cheapest_tier():
     from issue_agent.app.planners.tasks import build_router_task
 

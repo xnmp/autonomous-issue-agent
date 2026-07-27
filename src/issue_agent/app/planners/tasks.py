@@ -439,6 +439,15 @@ MODEL_TIERS: dict[str, dict[str, str]] = {
         "standard": "gpt-5.6-terra",
         "complex": "gpt-5.6-sol",
     },
+    # GLM ids come from the operator's own profile alias mapping (haiku→glm-4.7,
+    # sonnet→glm-5.2, opus→glm-5.2[1m]); the runtime is the Claude SDK runner, so
+    # `--model` hands these straight to the Z.ai endpoint — no alias resolution
+    # happens locally and an Anthropic alias here would reach Z.ai unresolved.
+    "glm": {
+        "trivial": "glm-4.7",
+        "standard": "glm-5.2",
+        "complex": "glm-5.2[1m]",
+    },
 }
 
 
