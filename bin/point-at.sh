@@ -221,15 +221,29 @@ run_role() {
   # status is a real death and propagates as before.
   (
     cd "$HARNESS_ROOT"
+    reloaded=0
     while :; do
       rc=0
       uv run --extra sdk --with tree-sitter --with tree-sitter-bash \
         python -m issue_agent.app.main "$role" || rc=$?
-      [ "$rc" -eq 87 ] || exit "$rc"
-      if [ -n "${AGENT_ENV:-}" ] && [ -f "$AGENT_ENV" ]; then
-        set -a; . "$AGENT_ENV"; set +a
+      if [ "$rc" -eq 87 ]; then
+        if [ -n "${AGENT_ENV:-}" ] && [ -f "$AGENT_ENV" ]; then
+          set -a; . "$AGENT_ENV"; set +a
+        fi
+        echo "hot-reload: relaunching $role on changed source (exit 87)"
+        reloaded=1
+        continue
       fi
-      echo "hot-reload: relaunching $role on changed source (exit 87)"
+      # A crash AFTER a hot reload is most likely a bad commit (observed
+      # 2026-07-27: a mid-edit mtime reload booted a half-changed tree and
+      # TypeError'd; fix+review stayed dead while point-at ran on). Don't die:
+      # crash-loop slowly — the commit that FIXES the crash is itself picked
+      # up by the next boot's reload watch, so this self-heals. A crash on
+      # the FIRST boot (never reloaded) still propagates: that's a config
+      # error a retry loop would only hide.
+      [ "$reloaded" -eq 1 ] || exit "$rc"
+      echo "hot-reload: $role crashed post-reload (exit $rc) — retrying in 60s (fix by committing; the retry picks it up)"
+      sleep 60
     done
   ) >"$log" 2>&1 &
 }
