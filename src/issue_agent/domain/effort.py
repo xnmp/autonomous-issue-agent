@@ -21,11 +21,13 @@ GitHub, or knows which runtime will execute the result — `app.workflows.fix`
 gathers the signals, `app.planners.tasks` maps a tier to a model, and the two
 runner adapters render `Effort` in their own dialect.
 
-**Monotonicity** (the anti-thrash rule from #16) is structural, not enforced by
-a stored high-water mark: every input is itself monotone within one issue's
-attempt (a recurrence label is not removed by the harness, retry counters only
-climb until the work leaves the pipeline), so the stance derived from them can
-only strengthen. The router's verdict is therefore a FLOOR that escalation
+**Monotonicity** (the anti-thrash rule from #16) is a property of `escalate`
+itself — it can only ever return a stance at least as strong as the one it was
+given, for any notch count. It is deliberately NOT a stored high-water mark, so
+evidence that is genuinely resolved stops costing money: an APPROVE clears the
+outstanding change requests, and the next leg drops back down. What must never
+happen is a stance oscillating WITHIN one unresolved attempt, and none of the
+inputs move backwards there. The router's verdict is a FLOOR that escalation
 raises, never a value escalation can lower.
 """
 
@@ -107,10 +109,13 @@ class EscalationSignals:
     All three are already recorded by the harness — no new sensors (#16):
     `recurrence` is the advisory label the steward applies (#10),
     `resolve_retries` is the fixer's own non-infra failure counter, and
-    `review_rounds` is the address-review attempt count keyed to the current
-    review. Infra deaths are deliberately absent: a session that died before
-    returning made no attempt, so it is no evidence at all about difficulty —
-    the same exemption the retry breakers make.
+    `review_rounds` is how many CHANGES_REQUESTED reviews are outstanding on
+    the PR (`domain.review.count_outstanding_change_requests`, derived from
+    GitHub state — NOT the store's `review-retries`, which counts attempts at
+    one review and re-keys to zero whenever the reviewer comes back). Infra
+    deaths are deliberately absent: a session that died before returning made
+    no attempt, so it is no evidence at all about difficulty — the same
+    exemption the retry breakers make.
     """
 
     recurrence: bool = False

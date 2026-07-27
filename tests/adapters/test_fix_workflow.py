@@ -14,6 +14,7 @@ from issue_agent.app.planners.tasks import FixTaskConfig
 from issue_agent.domain.world import Check, Comment, IssueView, PRView, Review
 
 from test_dispatch import FakeGateway, FakeRunner, FakeStore, FakeWorktrees, SeqRunner
+from issue_agent.adapters.github import GhUnavailable
 
 
 class RetryRecordingStore(FakeStore):
@@ -1167,23 +1168,96 @@ def test_a_store_that_cannot_answer_still_dispatches():
     assert runner.tasks[1].effort is None
 
 
+def _pr_with_rounds(n, extra=()):
+    """A PR the reviewer has requested changes on `n` times."""
+    reviews = tuple(
+        Review("CHANGES_REQUESTED", "rev-bot", f"t{i}", body="fix it")
+        for i in range(1, n + 1)
+    ) + tuple(extra)
+    return PRView(100, head_ref_name="fix/5-x", closing_issue=5, reviews=reviews)
+
+
 def test_repair_legs_think_harder_without_swapping_the_model():
     """A repair leg resumes a live transcript — handing that context to a
     different reasoner is a different bet than asking this one to think harder.
     Only a fresh resolve re-prices the model."""
-    p = PRView(100, head_ref_name="fix/5-x", closing_issue=5,
-               reviews=(Review("CHANGES_REQUESTED", "rev-bot", "t9", body="fix it"),))
-    gw = FakeGateway(prs={100: p})
-    store = FakeStore()
-    store.set_review_retry(5, "t9", 2)  # two rounds already spent on THIS review
+    gw = FakeGateway(prs={100: _pr_with_rounds(2)}, issues={5: IssueView(5)})
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s5"))
 
     asyncio.run(_workflow(
-        gw, store, runner, fix=FixTaskConfig("o/r", agent_md="AM", model="sonnet"),
+        gw, FakeStore(), runner, fix=FixTaskConfig("o/r", agent_md="AM", model="sonnet"),
     ).address_review(100))
 
     assert runner.tasks[0].effort is Effort.HIGH
     assert runner.tasks[0].model == "sonnet", "a resumed session keeps its reasoner"
+
+
+def test_review_rounds_climb_with_the_reviewer_not_with_retries_at_one_review():
+    """The regression the store's `review-retries` counter cannot catch.
+
+    That counter is re-keyed to 0 by every NEW review (address_review's
+    `base = n if at == review_at else 0`), so it reads 1 forever no matter how
+    many times the reviewer comes back — reading it made this whole evidence
+    class dead on arrival. The honest source is the PR's own review list.
+    """
+    seen = []
+    for rounds in (1, 2, 3):
+        gw = FakeGateway(prs={100: _pr_with_rounds(rounds)}, issues={5: IssueView(5)})
+        runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s5"))
+        asyncio.run(_workflow(
+            gw, FakeStore(), runner,
+            fix=FixTaskConfig("o/r", agent_md="AM", model="sonnet"),
+        ).address_review(100))
+        seen.append(runner.tasks[0].effort)
+
+    assert seen == [None, Effort.HIGH, Effort.HIGH], (
+        "one REQUEST_CHANGES is the system working; the second is evidence"
+    )
+
+
+def test_an_approve_resets_the_round_count():
+    """Prior dissatisfaction that was SATISFIED is not evidence — the same rule
+    the reviewer's own escalation ceiling applies."""
+    pr = _pr_with_rounds(3, extra=(Review("APPROVED", "rev-bot", "t9", body=""),))
+    gw = FakeGateway(prs={100: pr}, issues={5: IssueView(5)})
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s5"))
+
+    asyncio.run(_workflow(
+        gw, FakeStore(), runner, fix=FixTaskConfig("o/r", agent_md="AM", model="sonnet"),
+    ).address_review(100))
+
+    assert runner.tasks[0].effort is None
+
+
+def test_a_repair_leg_sees_the_recurrence_label_too():
+    """An issue the harness already failed once is exactly the one whose REPAIR
+    legs should also try harder — the signal must not be resolve-only."""
+    gw = FakeGateway(
+        prs={100: _pr_with_rounds(1)},
+        issues={5: IssueView(5, labels=frozenset({Label.RECURRENCE}))},
+    )
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s5"))
+
+    asyncio.run(_workflow(
+        gw, FakeStore(), runner, fix=FixTaskConfig("o/r", agent_md="AM", model="sonnet"),
+    ).address_review(100))
+
+    assert runner.tasks[0].effort is Effort.HIGH
+
+
+def test_a_repair_leg_dispatches_even_when_the_issue_cannot_be_fetched():
+    class NoIssues(FakeGateway):
+        def get_issue(self, n):
+            raise GhUnavailable("network", "get_issue timed out (test-injected)")
+
+    gw = NoIssues(prs={100: _pr_with_rounds(1)})
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s5"))
+
+    asyncio.run(_workflow(
+        gw, FakeStore(), runner, fix=FixTaskConfig("o/r", agent_md="AM", model="sonnet"),
+    ).address_review(100))
+
+    assert len(runner.tasks) == 1 and runner.tasks[0].effort is None
 
 
 def test_escalations_are_journalled_so_the_tier_split_stays_measurable():

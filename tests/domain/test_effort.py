@@ -81,7 +81,7 @@ def test_each_failed_resolve_retry_is_a_notch():
 
 def test_the_first_review_round_is_not_evidence_but_later_ones_are():
     """One REQUEST_CHANGES is the system working as designed; it is the SECOND
-    round on the same review that says the model is not converging."""
+    outstanding one on the PR that says the model is not converging."""
     assert EscalationSignals(review_rounds=1).notches() == 0
     assert EscalationSignals(review_rounds=3).notches() == 2
 
@@ -163,3 +163,38 @@ def test_default_stance_is_the_middle_of_both_ladders():
     assert Stance() == Stance(DEFAULT_TIER, DEFAULT_EFFORT)
     assert DEFAULT_TIER in TIER_LADDER
     assert DEFAULT_EFFORT in EFFORT_LADDER
+
+
+# ── the sensor behind `review_rounds` (#16 P1) ────────────────────────────────
+# The store's per-review attempt counter re-keys to zero on every new review, so
+# it could never answer "rounds on this PR are climbing". These assert the
+# GitHub-derived counter that replaced it, from the FIXER's point of view.
+def test_outstanding_change_requests_counts_everyone_but_the_fixer():
+    from issue_agent.domain.review import count_outstanding_change_requests
+    from issue_agent.domain.world import Review
+
+    reviews = (
+        Review("CHANGES_REQUESTED", "rev-bot", "t1"),
+        Review("CHANGES_REQUESTED", "a-human", "t2"),
+        Review("CHANGES_REQUESTED", "fix-bot", "t3"),  # our own — not evidence
+    )
+    assert count_outstanding_change_requests(reviews, "fix-bot") == 2
+
+
+def test_an_approve_clears_the_outstanding_count():
+    from issue_agent.domain.review import count_outstanding_change_requests
+    from issue_agent.domain.world import Review
+
+    reviews = (
+        Review("CHANGES_REQUESTED", "rev-bot", "t1"),
+        Review("CHANGES_REQUESTED", "rev-bot", "t2"),
+        Review("APPROVED", "rev-bot", "t3"),
+        Review("CHANGES_REQUESTED", "rev-bot", "t4"),
+    )
+    assert count_outstanding_change_requests(reviews, "fix-bot") == 1
+
+
+def test_no_reviews_is_no_evidence():
+    from issue_agent.domain.review import count_outstanding_change_requests
+
+    assert count_outstanding_change_requests((), "fix-bot") == 0

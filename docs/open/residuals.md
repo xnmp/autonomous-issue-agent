@@ -64,6 +64,7 @@ throwaway repo, `ISSUE_AGENT_MAX_TICKS=1`, and one trivial self-authored issue.
 | `resolve_test_cmd` prefers operator `TEST_CMD`; the agent's `.harness/test-cmd` is the fallback | P1R-18 — the gated subject must not choose the gate's teeth | a monorepo's scoped command is ignored when `TEST_CMD` is set |
 | Journals/ledger never rotate | Fine for months at current volume | add rotation when a file is annoying |
 | launchd installer still has the /tmp-logs and colliding-unit-names bugs its systemd twin fixed | No mac deployment yet | macOS only |
+| A human closing a PR unmerged leaves `resolve-retries` standing, which now also pins every later resolve to a pricier tier (#16) | `clear_issue_resume_state` keeps the counter deliberately — "fewer retries after a human closed the PR" — and the escalation ladder reads the same counter. The evidence is honest (an attempt did complete and did not ship); the cost consequence was decided for the retry budget, not for routing | an issue a human bounced resolves at a higher tier/effort until it merges; clear `<STATE_DIR>/issue-N.resolve-retries` to reset |
 
 ---
 

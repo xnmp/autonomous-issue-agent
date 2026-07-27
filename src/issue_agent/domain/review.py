@@ -248,6 +248,33 @@ def count_prior_rejections(reviews: tuple, review_bot: str) -> int:
     )
 
 
+def count_outstanding_change_requests(reviews: tuple, fix_bot: str) -> int:
+    """`count_prior_rejections` read from the FIXER's side of the PR (#16).
+
+    The reviewer counts its OWN rejections because it owns the escalation
+    ceiling and knows which login it reviews as. The fixer knows only which
+    login IT pushes as, and must count everyone else's — a human reviewer's
+    CHANGES_REQUESTED is exactly as much evidence that this PR is not
+    converging as the review bot's, and the fixer cannot tell them apart
+    anyway.
+
+    Same two properties as its twin, for the same reasons: an APPROVE resets
+    the count (prior dissatisfaction was satisfied), and author pushes are not
+    rejections. Derived purely from GitHub review state, so it is correct
+    across daemon restarts and — unlike the per-review attempt counter in the
+    store — it does NOT reset when a new review supersedes the old one, which
+    is what makes it a usable "rounds on this PR are climbing" signal.
+    """
+    others = [r for r in reviews if not login_eq(r.author, fix_bot)]
+    last_approve = max(
+        (i for i, r in enumerate(others) if r.state == REVIEW_APPROVED),
+        default=-1,
+    )
+    return sum(
+        1 for r in others[last_approve + 1:] if r.state == REVIEW_CHANGES_REQUESTED
+    )
+
+
 def should_adopt(pr: PRView, cfg: ReviewConfig) -> bool:
     """A rogue (non-pipeline) PR that should be pulled into review. True iff
     adoption is on, the PR is OPEN, carries neither the trigger label nor the

@@ -471,11 +471,17 @@ MODEL_TIERS: dict[str, dict[str, str]] = {
 
 # A tier the escalation ladder can produce but the table cannot price would be a
 # silent downgrade to `standard` on the most expensive dispatch there is. Checked
-# at import, where a bad edit fails the suite instead of a deployment.
-_TIER_TABLE_COMPLETE = all(
-    set(col) >= set(TIER_LADDER) for col in MODEL_TIERS.values()
-)
-assert _TIER_TABLE_COMPLETE, "MODEL_TIERS must price every domain.effort.TIER_LADDER tier"
+# at import, where a bad edit fails the suite instead of a deployment — raised
+# rather than `assert`ed, because `python -O` strips asserts and a daemon is
+# exactly where this must not become a no-op.
+_UNPRICED_TIERS = {
+    runtime: sorted(set(TIER_LADDER) - set(col)) for runtime, col in MODEL_TIERS.items()
+}
+if any(_UNPRICED_TIERS.values()):
+    raise RuntimeError(
+        "MODEL_TIERS must price every domain.effort.TIER_LADDER tier; missing: "
+        + repr({k: v for k, v in _UNPRICED_TIERS.items() if v})
+    )
 
 
 def route_model(tier: str, runtime: str = "claude") -> str:

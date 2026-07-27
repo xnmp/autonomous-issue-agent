@@ -735,3 +735,33 @@ def test_router_task_runs_on_the_active_runtimes_cheapest_tier():
     assert build_router_task("t", "b", runtime="codex").model == "gpt-5.6-luna"
     assert build_router_task("t", "b").model == "haiku"
     assert build_router_task("t", "b", model="opus", runtime="codex").model == "opus"
+
+
+# ── tier table ↔ ladder (#16) ─────────────────────────────────────────────────
+def test_every_runtime_prices_every_tier_the_ladder_can_produce():
+    """The escalation ladder walks TIER_LADDER; a tier the table cannot price
+    would silently downgrade to `standard` on the most expensive dispatch there
+    is. tasks.py raises at import if this ever drifts — assert it here too, so
+    the failure names the missing tier instead of an ImportError three frames up.
+    """
+    from issue_agent.app.planners.tasks import MODEL_TIERS
+    from issue_agent.domain.effort import TIER_LADDER
+
+    for runtime, column in MODEL_TIERS.items():
+        assert set(column) >= set(TIER_LADDER), f"{runtime} cannot price every tier"
+
+
+def test_route_model_degrades_an_unknown_tier_to_the_default_tier():
+    from issue_agent.app.planners.tasks import MODEL_TIERS, route_model
+    from issue_agent.domain.effort import DEFAULT_TIER
+
+    for runtime in MODEL_TIERS:
+        expected = MODEL_TIERS[runtime][DEFAULT_TIER]
+        assert route_model("wibble", runtime) == expected
+        assert route_model("", runtime) == expected
+
+
+def test_route_model_degrades_an_unknown_runtime_to_the_claude_table():
+    from issue_agent.app.planners.tasks import MODEL_TIERS, route_model
+
+    assert route_model("complex", "no-such-runtime") == MODEL_TIERS["claude"]["complex"]
