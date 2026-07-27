@@ -57,6 +57,15 @@ class Store:
     STATE_DIR (fixer) or REVIEW_STATE_DIR (reviewer) or SDIR (steward)."""
 
     state_dir: str
+    # The agent runtime whose sessions this store may hand out. A session id is
+    # only resumable by the runtime that created it — `codex exec resume
+    # <claude-uuid>` dies in 0.3s with "no rollout found" (observed live on
+    # REBASE #541, 2026-07-27, the first dispatch after FIXER_RUNTIME flipped
+    # claude→codex). Sessions are therefore saved tagged (`<runtime>:<id>`) and
+    # a read under a DIFFERENT runtime returns "" — the leg cold-starts, which
+    # every resume-shaped leg supports. Legacy untagged files (bare uuid) read
+    # as "claude", the only runtime that existed when they were written.
+    runtime: str = "claude"
 
     # ── pure path helpers ──
     def issue_path(self, issue: int, suffix: str) -> str:
@@ -116,22 +125,34 @@ class Store:
             return default
 
     # ── sessions (issue: resolve/resume/address-review; pr: review) ──
+    def _session_for_runtime(self, raw: str) -> str:
+        """The stored id iff the ACTIVE runtime created it, else "" (cold
+        start). Bare legacy ids are claude's."""
+        if not raw:
+            return ""
+        tag, _, sid = raw.partition(":")
+        if not sid:  # no ":" — legacy bare id, written before tagging existed
+            tag, sid = "claude", raw
+        return sid if tag == self.runtime else ""
+
     def get_session(self, issue: int) -> str:
-        return self._read(self.issue_path(issue, "session"))
+        return self._session_for_runtime(self._read(self.issue_path(issue, "session")))
 
     def save_session(self, issue: int, session_id: str) -> None:
         if session_id:
-            self._write(self.issue_path(issue, "session"), session_id)
+            self._write(
+                self.issue_path(issue, "session"), f"{self.runtime}:{session_id}"
+            )
 
     def has_session(self, issue: int) -> bool:
         return bool(self.get_session(issue))
 
     def get_pr_session(self, pr: int) -> str:
-        return self._read(self.pr_path(pr, "session"))
+        return self._session_for_runtime(self._read(self.pr_path(pr, "session")))
 
     def save_pr_session(self, pr: int, session_id: str) -> None:
         if session_id:
-            self._write(self.pr_path(pr, "session"), session_id)
+            self._write(self.pr_path(pr, "session"), f"{self.runtime}:{session_id}")
 
     # ── resume reply mark + counter ──
     def get_resumed_at(self, issue: int) -> str:

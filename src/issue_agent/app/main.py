@@ -219,7 +219,9 @@ def build_role(role: str, env: dict | None = None):
 
     if role == "fix":
         gw = GitHubGateway(cfg.repo, Identity(static_token=env.get("FIX_BOT_TOKEN") or None))
-        store = Store(cfg.state_dir)
+        # runtime-tagged sessions: a FIXER_RUNTIME flip must cold-start resume
+        # legs, not feed the new runtime the old runtime's session ids.
+        store = Store(cfg.state_dir, runtime=cfg.fixer_runtime)
         # Arm-at-creation probe (once per boot): only a POSITIVELY verified
         # review+checks gate on the base branch activates early arming — see
         # FixConfig.arm_on_open for why no knob can force this on. Probed here

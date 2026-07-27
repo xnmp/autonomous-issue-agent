@@ -429,3 +429,40 @@ def test_visual_ac_and_screenshots_read_markers():
             f.write("tab-title.png\n\nchart.png\n")
         assert m.visual_ac() is True
         assert m.screenshots_read() == ("tab-title.png", "chart.png")  # blanks dropped
+
+
+# ── runtime-tagged sessions (the FIXER_RUNTIME flip, 2026-07-27) ──────────────
+def test_a_session_is_only_resumable_by_the_runtime_that_created_it(tmp_path):
+    """REBASE #541 died in 0.3s: codex was handed the Claude resolve's session
+    id (`codex exec resume <claude-uuid>` → "no rollout found"). A runtime
+    flip must read as NO session — the leg cold-starts."""
+    claude = Store(str(tmp_path), runtime="claude")
+    claude.save_session(7, "abc-123")
+    assert claude.get_session(7) == "abc-123"
+    assert claude.has_session(7)
+
+    codex = Store(str(tmp_path), runtime="codex")
+    assert codex.get_session(7) == ""
+    assert not codex.has_session(7)
+
+    codex.save_session(7, "thread-9")
+    assert codex.get_session(7) == "thread-9"
+    assert Store(str(tmp_path), runtime="claude").get_session(7) == ""
+
+
+def test_legacy_untagged_session_files_belong_to_claude(tmp_path):
+    """Files written before tagging existed are bare uuids; claude (the only
+    runtime that existed then) still resumes them, codex must not."""
+    with open(tmp_path / "issue-9.session", "w") as fh:
+        fh.write("966d3799-429e-44e6-a909-38c5ed27ca4f")
+    assert Store(str(tmp_path), runtime="claude").get_session(9) == (
+        "966d3799-429e-44e6-a909-38c5ed27ca4f"
+    )
+    assert Store(str(tmp_path), runtime="codex").get_session(9) == ""
+
+
+def test_pr_sessions_are_tagged_the_same_way(tmp_path):
+    s = Store(str(tmp_path), runtime="claude")
+    s.save_pr_session(41, "rev-1")
+    assert s.get_pr_session(41) == "rev-1"
+    assert Store(str(tmp_path), runtime="codex").get_pr_session(41) == ""

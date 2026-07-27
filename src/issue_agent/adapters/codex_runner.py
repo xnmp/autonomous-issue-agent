@@ -861,6 +861,12 @@ class CodexRunner(AgentRuntime):
         exit_code = proc.returncode or 0
         stderr = "\n".join(err_chunks)
         self._log(f"codex: exit {exit_code} (stderr {len(stderr)}B, out {len(stdout)}B)")
+        if exit_code != 0 and stderr:
+            # The size of the stderr is not a diagnosis. The 0.3s cross-runtime
+            # resume failure ("no rollout found") sat invisible behind
+            # "stderr 125B" until reproduced by hand — on a nonzero exit the
+            # tail IS the reason, so log it.
+            self._log(f"codex: stderr tail: {_stderr_tail(stderr, 3)[:500]}")
 
         if hung:
             # Carry WHICH watchdog fired on the result so run() can phrase the
