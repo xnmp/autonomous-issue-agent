@@ -16,7 +16,7 @@
 # second repo on next restart.
 #
 # Config snapshot: AGENT_ENV usually points at the shared, mutable
-# config/.active.env, which bin/point-at.sh / `issue-agent install-service`
+# config/.active.<name>.env, which bin/point-at.sh / `issue-agent install-service`
 # REWRITE on every run — for whichever repo composed it last. Baking that path
 # straight into the unit would mean installing repo B later silently repoints
 # repo A's unit at repo B's config the next time it restarts. Instead this

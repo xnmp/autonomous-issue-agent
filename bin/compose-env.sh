@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Compose config/shared.env + config/repos/<name>.env → config/.active.env.
+# Compose config/shared.env + config/repos/<name>.env → config/.active.<name>.env.
 #
 # Single source of truth for the env-compose step, so BOTH bin/point-at.sh (which
 # SOURCES this to keep REPO/TARGET_DIR/… in its own shell) and the `issue-agent`
 # CLI (which EXECUTES it just to produce the file) see one identical, expanded
-# .active.env. Sourcing shared FIRST then the per-repo overlay means per-repo
+# .active.<name>.env (PER-NAME, so two deployments never clobber each other's
+# composed file or trip each other's mtime reload watch). Sourcing shared FIRST
+# then the per-repo overlay means per-repo
 # values win. Snapshots the resolved (expanded) values so the Python daemons (via
 # the exported os.environ) and the bash tools (via AGENT_ENV) read the same thing.
 #
@@ -17,7 +19,7 @@ _CE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 _CE_NAME="${1:-}"
 _CE_SHARED="$_CE_ROOT/config/shared.env"
 _CE_REPO_ENV="$_CE_ROOT/config/repos/$_CE_NAME.env"
-_CE_ACTIVE="$_CE_ROOT/config/.active.env"
+_CE_ACTIVE="$_CE_ROOT/config/.active.$_CE_NAME.env"
 
 # Fail loud on a missing name/file instead of silently composing a partial
 # .active.env. `_ce_fail` only prints — it must NOT also carry the return/exit,

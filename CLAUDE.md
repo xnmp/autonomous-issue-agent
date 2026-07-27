@@ -96,7 +96,7 @@ e.g. `make point-at REPO=myapp`. `bin/point-at.sh` does, idempotently:
 
 1. **Compose env** — sources `config/shared.env` (repo-independent) then
    `config/repos/<name>.env` (per-repo, wins), writes the resolved values to a
-   gitignored `config/.active.env`, and exports `AGENT_ENV` to it. Both the bash
+   gitignored `config/.active.<name>.env`, and exports `AGENT_ENV` to it. Both the bash
    tools (via `AGENT_ENV`) and the Python daemons (via `os.environ`) read one
    source of truth.
 2. **Preflight** — `bin/doctor.sh` (tooling, identities, repo access).
@@ -167,7 +167,9 @@ harness never creates them.
 - `config/repos/<name>.env` — per-repo: `REPO`, `TARGET_DIR`, `BASE_BRANCH`,
   isolated `*_STATE_DIR`s, `TEST_CMD`/`EDIT_CHECK_CMD`, and any per-repo overrides
   (e.g. reviewer prompt/label). *gitignored.*
-- `config/.active.env` — the composed run file `point-at` regenerates each run.
+- `config/.active.<name>.env` — the composed run file `point-at` regenerates
+  each run (per-name, so concurrent deployments don't clobber each other or
+  trip each other's hot-reload watch).
   *gitignored.*
 - `config/agent.env.example` — full knob reference (legacy single-repo layout).
 
