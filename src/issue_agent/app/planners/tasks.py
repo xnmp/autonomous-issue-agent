@@ -25,6 +25,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from ...domain.agent_task import AgentTask, McpServer, SubagentDef
+from ...domain.effort import DEFAULT_TIER, Effort, TIER_LADDER
 from ...domain.jira import JiraPhase
 from .schemas import (
     ADJUDICATE_SCHEMA,
@@ -48,6 +49,11 @@ class FixTaskConfig:
     agent_md: str = ""               # plugin/AGENT.md text → appended system prompt
     max_budget_usd: float = 3.0
     model: str | None = None
+    # Reasoning effort for this leg (harness #16). None = leave the runtime on its
+    # own default, which is what every dispatch did before the escalation ladder
+    # existed; `app.workflows.fix` replaces it with a stronger value when the
+    # evidence says the previous attempt under-delivered.
+    effort: Effort | None = None
 
 
 # ── fixer tool policy ─────────────────────────────────────────────────────────
@@ -144,6 +150,7 @@ def build_resolve_task(
         append_system_prompt=cfg.agent_md,
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
+        effort=cfg.effort,
         max_budget_usd=cfg.max_budget_usd,
         cwd=cwd,
     )
@@ -187,6 +194,7 @@ def build_author_task(
         append_system_prompt=cfg.agent_md,
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
+        effort=cfg.effort,
         max_budget_usd=cfg.max_budget_usd,
         cwd=cwd,
     )
@@ -238,6 +246,7 @@ def build_implement_task(
         append_system_prompt=cfg.agent_md,
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
+        effort=cfg.effort,
         max_budget_usd=cfg.max_budget_usd,
         cwd=cwd,
     )
@@ -278,6 +287,7 @@ def build_adjudicate_task(
         append_system_prompt=cfg.agent_md,
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
+        effort=cfg.effort,
         max_budget_usd=cfg.max_budget_usd,
         cwd=cwd,
     )
@@ -298,6 +308,7 @@ def build_resume_task(
         append_system_prompt=_fix_system_prompt(cfg, session_id),
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
+        effort=cfg.effort,
         max_budget_usd=cfg.max_budget_usd,
         cwd=cwd,
         resume=session_id,
@@ -330,6 +341,7 @@ def build_address_review_task(
         append_system_prompt=_fix_system_prompt(cfg, session_id),
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
+        effort=cfg.effort,
         max_budget_usd=cfg.max_budget_usd,
         cwd=cwd,
         resume=session_id,
@@ -384,6 +396,7 @@ def build_fix_ci_task(
         append_system_prompt=_fix_system_prompt(cfg, session_id),
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
+        effort=cfg.effort,
         max_budget_usd=cfg.max_budget_usd,
         cwd=cwd,
         resume=session_id,
@@ -419,6 +432,7 @@ def build_rebase_task(
         append_system_prompt=_fix_system_prompt(cfg, session_id),
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
+        effort=cfg.effort,
         max_budget_usd=cfg.max_budget_usd,
         cwd=cwd,
         resume=session_id,
@@ -432,6 +446,10 @@ def build_rebase_task(
 # trigger-gated (P4.1) — this table exists so the day it activates, a codex
 # fixer is routed within its own family instead of being handed a Claude alias
 # it cannot resolve.
+#
+# Every column is keyed by `domain.effort.TIER_LADDER` — that tuple owns the
+# ORDER (which the escalation ladder walks, #16), this table owns the PRICES.
+# `_TIER_TABLE_COMPLETE` below keeps the two from drifting apart silently.
 MODEL_TIERS: dict[str, dict[str, str]] = {
     "claude": {"trivial": "haiku", "standard": "sonnet", "complex": "opus"},
     "codex": {
@@ -451,15 +469,30 @@ MODEL_TIERS: dict[str, dict[str, str]] = {
 }
 
 
+# A tier the escalation ladder can produce but the table cannot price would be a
+# silent downgrade to `standard` on the most expensive dispatch there is. Checked
+# at import, where a bad edit fails the suite instead of a deployment — raised
+# rather than `assert`ed, because `python -O` strips asserts and a daemon is
+# exactly where this must not become a no-op.
+_UNPRICED_TIERS = {
+    runtime: sorted(set(TIER_LADDER) - set(col)) for runtime, col in MODEL_TIERS.items()
+}
+if any(_UNPRICED_TIERS.values()):
+    raise RuntimeError(
+        "MODEL_TIERS must price every domain.effort.TIER_LADDER tier; missing: "
+        + repr({k: v for k, v in _UNPRICED_TIERS.items() if v})
+    )
+
+
 def route_model(tier: str, runtime: str = "claude") -> str:
     """Model for a routed difficulty tier under the given fixer runtime.
 
     Total on classifier output: an unknown tier (schema drift, garbage) prices
-    as the runtime's `standard`, and an unknown runtime falls back to the
+    as the runtime's `DEFAULT_TIER`, and an unknown runtime falls back to the
     Claude table — a router misfire must degrade to a sane model, never raise
     inside dispatch."""
     tiers = MODEL_TIERS.get(runtime) or MODEL_TIERS["claude"]
-    return tiers.get(tier) or tiers["standard"]
+    return tiers.get(tier) or tiers[DEFAULT_TIER]
 
 
 def build_router_task(

@@ -569,6 +569,107 @@ def test_pre_result_death_on_an_issueless_pr_uses_the_negated_pr_key(tmp_path):
     assert store.get_infra_deaths(-100) == 1
 
 
+# ── deterministic deaths must not buy the same unwinnable dispatch again (#13) ─
+_BUFFER_DEATH = RuntimeError(
+    "Fatal error in message reader: Failed to decode JSON: JSON message "
+    "exceeded maximum buffer size of 1048576 bytes"
+)
+
+
+def _capped_dispatcher(gw, store, runner, cap):
+    cfg = DispatchConfig(
+        review=ReviewTaskConfig("o/r", review_prompt="r"),
+        max_infra_deaths=cap,
+    )
+    return AgentDispatcher(
+        cfg, gw, store, None, runner, Executor(gw, remove_worktree=FakeWorktrees().remove)
+    )
+
+
+def test_a_deterministic_death_spends_the_whole_retry_budget_at_once(tmp_path):
+    """The input, not the infrastructure, killed this session — the next
+    dispatch reads the same file and dies identically. Charging it 1 buys
+    cap-1 more unwinnable sessions at full cost, which is what happened on
+    xnmp/tauri-explorer PR #552."""
+    store = Store(state_dir=str(tmp_path))
+    gw = FakeGateway(prs={100: PRView(100, head_ref_name="feat/x")})
+    d = _capped_dispatcher(gw, store, RaisingRunner(_BUFFER_DEATH), cap=5)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
+
+    assert store.get_infra_deaths(-100) == 5, "one death, the whole budget"
+
+
+def test_a_deterministic_death_reaches_the_reviewers_existing_ceiling(tmp_path):
+    """The escalation is not a new path: the saturated counter is the same one
+    `decide_review` already reads, so the PR goes to a human through the
+    unproductive-round ceiling on the next poll."""
+    from issue_agent.domain.review import ReviewState, unproductive_ceiling_hit, ReviewConfig
+
+    store = Store(state_dir=str(tmp_path))
+    gw = FakeGateway(prs={100: PRView(100, head_ref_name="feat/x")})
+    d = _capped_dispatcher(gw, store, RaisingRunner(_BUFFER_DEATH), cap=5)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
+
+    state = ReviewState(unproductive_rounds={100: store.get_infra_deaths(-100)})
+    cfg = ReviewConfig(review_bot="rb", max_unproductive_rounds=5)
+    assert unproductive_ceiling_hit(state, cfg, 100) is True
+
+
+def test_an_ordinary_transport_death_still_costs_exactly_one_life(tmp_path):
+    """Anti-vacuity. A stochastic death is what the breakers were built for; if
+    the classifier widened to cover it, every flaky network blip would escalate
+    a PR a retry would have rescued."""
+    store = Store(state_dir=str(tmp_path))
+    gw = FakeGateway(prs={100: PRView(100, head_ref_name="feat/x")})
+    d = _capped_dispatcher(gw, store, RaisingRunner(RuntimeError("Stream closed")), cap=5)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
+
+    assert store.get_infra_deaths(-100) == 1
+
+
+def test_a_deterministic_death_never_lowers_an_existing_tally(tmp_path):
+    store = Store(state_dir=str(tmp_path))
+    for _ in range(7):
+        store.bump_infra_deaths(-100)
+    gw = FakeGateway(prs={100: PRView(100, head_ref_name="feat/x")})
+    d = _capped_dispatcher(gw, store, RaisingRunner(_BUFFER_DEATH), cap=5)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
+
+    assert store.get_infra_deaths(-100) == 7
+
+
+def test_without_a_configured_ceiling_a_deterministic_death_bumps_as_before(tmp_path):
+    """cap 0 means the role's breaker is off; saturating to 0 would ERASE the
+    tally, so the ordinary bump must stand."""
+    store = Store(state_dir=str(tmp_path))
+    gw = FakeGateway(prs={100: PRView(100, head_ref_name="feat/x")})
+    d = _capped_dispatcher(gw, store, RaisingRunner(_BUFFER_DEATH), cap=0)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
+
+    assert store.get_infra_deaths(-100) == 1
+
+
+def test_a_deterministic_death_still_re_raises_unchanged(tmp_path):
+    store = Store(state_dir=str(tmp_path))
+    gw = FakeGateway(prs={100: PRView(100, head_ref_name="feat/x")})
+    d = _capped_dispatcher(gw, store, RaisingRunner(_BUFFER_DEATH), cap=5)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
+
+    assert excinfo.value is _BUFFER_DEATH
+
+
 # ── review P1R-1: a flaky issue lookup must not relocate the counter ──────────
 # The trap is the COUPLING: the flakiness that kills sessions is the flakiness
 # that fails `gateway.issue_for_pr`, so the old catch-everything→None→`-pr`

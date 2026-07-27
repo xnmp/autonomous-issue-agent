@@ -215,6 +215,7 @@ def build_role(role: str, env: dict | None = None):
     runner = AgentRunner(
         hooks=hooks, log=_commit_log, debug=debug,
         idle_timeout=_idle, max_runtime=_wall,
+        max_buffer_size=cfg.sdk_max_buffer_bytes or None,
     )
     worktrees = Worktrees(target_dir, cfg.worktree_root, cfg.base_branch)
 

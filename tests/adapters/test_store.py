@@ -249,6 +249,17 @@ def test_clear_issue_removes_all():
     assert s.get_infra_deaths(5) == 0     # review M4/D8: infra-deaths clears too
 
 
+def test_set_infra_deaths_writes_the_tally_the_reader_sees():
+    # The saturate a deterministic death needs (#13): one write, read back by
+    # the same accessor the ceiling uses.
+    s, _ = _store()
+    s.bump_infra_deaths(5)
+    s.set_infra_deaths(5, 5)
+    assert s.get_infra_deaths(5) == 5
+    s.set_infra_deaths(5, -3)  # a negative tally is meaningless, not an error
+    assert s.get_infra_deaths(5) == 0
+
+
 def test_clear_issue_does_not_touch_pr_automerge_marker():
     # review M4: `automerge` is a PR suffix now — clear_issue must not remove
     # issue-N.automerge (the drift this fixes: that file was never written by

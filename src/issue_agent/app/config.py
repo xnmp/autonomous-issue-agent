@@ -1,6 +1,9 @@
 """Environment → config objects (port of the agent.env vars the bash reads).
 
-Pure mapping `dict → HarnessConfig` so tests construct it without os.environ.
+Pure mapping `dict → HarnessConfig` so tests construct it without os.environ —
+with one deliberate exception: an env carrying `AGENT_ENV` is re-resolved
+against that FILE first (`_authoritative_env`, #12), because the inherited
+environment of point-at.sh's relaunch loop cannot represent a knob's removal.
 Names mirror config/agent.env.example so operators carry the same env file over.
 """
 
@@ -8,8 +11,12 @@ from __future__ import annotations
 
 import math
 import os
+import re
+import subprocess
 from dataclasses import dataclass, fields
 
+from ..adapters.agent_runner import DEFAULT_MAX_BUFFER_BYTES
+from ..domain.effort import EFFORT_LADDER, Effort, parse_effort
 from ..domain.identity import normalize_login
 from ..domain.review import IdentityMode, ReviewMode
 
@@ -35,6 +42,9 @@ class RuntimePathsConfig:
 class FixRuntimeConfig:
     bot: str
     model: str | None
+    # Base reasoning effort for the fix legs; None = leave the runtime's default
+    # alone. The escalation ladder (#16) raises it from here, never below it.
+    effort: Effort | None
     budget_usd: float
     max_ci_retries: int
     max_review_retries: int
@@ -98,6 +108,7 @@ class CodexRuntimeConfig:
     env_key: str
     wire_api: str
     sandbox: str
+    reasoning_effort: str
     idle_timeout: float
     max_runtime: float
     transport_retries: int
@@ -181,6 +192,16 @@ class HarnessConfig:
     max_unproductive_review_rounds: int = 5
     review_trigger_label: str = "ai-pr-open"
     fix_model: str | None = None
+    # FIX_EFFORT: base reasoning effort for the fix legs, runtime-agnostic
+    # (harness #16). None = say nothing and leave each runtime on its own default
+    # — CODEX_REASONING_EFFORT for codex, the SDK's own for Claude — which is
+    # exactly what every deployment did before the knob existed.
+    fix_effort: Effort | None = None
+    # ESCALATE_ON_EVIDENCE: run a leg one rung stronger when the harness already
+    # knows the previous attempt under-delivered — a recurrence label (#10), a
+    # failed resolve retry, a second-and-later review round. Off pins every leg
+    # to the router's verdict no matter what has happened before.
+    escalate_on_evidence: bool = True
     review_model: str | None = None
     steward_triage_model: str | None = "sonnet"
     fix_budget_usd: float = 10.0
@@ -259,6 +280,9 @@ class HarnessConfig:
     codex_env_key: str = "OPENAI_API_KEY"
     codex_wire_api: str = "responses"
     codex_sandbox: str = "danger-full-access"
+    # codex exec's own default is LOW effort (live session_meta, 2026-07-27);
+    # medium is the deliberate implementer default. "" = leave codex alone.
+    codex_reasoning_effort: str = "medium"
     # FIXER_RUNTIME=glm: path to a Claude Code PROFILE's settings.json (e.g.
     # ~/.cc-glm/settings.json). Its parent directory IS the profile dir, and both
     # the settings `env` block and the profile's `.env` are read at build time to
@@ -285,6 +309,12 @@ class HarnessConfig:
     # within one poll cycle. Raise it for a repo whose test suite alone runs longer;
     # 0 disables (back to idle-watchdog-only).
     agent_max_runtime: float = 2700.0
+    # Largest single decoded SDK stream message. The SDK's own 1MB default is
+    # below what one Read of a hi-DPI screenshot produces once base64'd (x4/3),
+    # and blowing it kills the transport for the whole session — deterministically,
+    # because the retry reads the same file (#13). See
+    # adapters.agent_runner.DEFAULT_MAX_BUFFER_BYTES. 0 = leave the SDK default.
+    sdk_max_buffer_bytes: int = DEFAULT_MAX_BUFFER_BYTES
     # Codex gateway transport-drop retry: a `response.failed`/`stream disconnected`
     # from the LLM gateway is upstream, not agent error. Retry the whole `codex
     # exec` (resumed) up to N times with jittered exponential backoff (base * 2^n).
@@ -359,6 +389,7 @@ class HarnessConfig:
         return FixRuntimeConfig(
             bot=self.fix_bot,
             model=self.fix_model,
+            effort=self.fix_effort,
             budget_usd=self.fix_budget_usd,
             max_ci_retries=self.max_ci_retries,
             max_review_retries=self.max_review_retries,
@@ -426,6 +457,7 @@ class HarnessConfig:
             env_key=self.codex_env_key,
             wire_api=self.codex_wire_api,
             sandbox=self.codex_sandbox,
+            reasoning_effort=self.codex_reasoning_effort,
             idle_timeout=self.agent_idle_timeout,
             max_runtime=self.agent_max_runtime,
             transport_retries=self.codex_transport_retries,
@@ -505,6 +537,7 @@ class HarnessConfig:
             errors.append("GLM_SETTINGS_FILE is required when FIXER_RUNTIME=glm")
         _require_non_negative(errors, "AGENT_IDLE_TIMEOUT_SECONDS", self.agent_idle_timeout)
         _require_non_negative(errors, "AGENT_MAX_RUNTIME_SECONDS", self.agent_max_runtime)
+        _require_non_negative(errors, "SDK_MAX_BUFFER_BYTES", self.sdk_max_buffer_bytes)
         _require_non_negative(errors, "CODEX_TRANSPORT_RETRIES", self.codex_transport_retries)
         _require_positive(errors, "CODEX_BACKOFF_BASE_SECONDS", self.codex_backoff_base)
         _require_non_negative(errors, "CODEX_MAX_RATE_LIMIT_RETRIES", self.codex_max_rate_limit_retries)
@@ -537,6 +570,8 @@ class HarnessConfig:
             f"poll={self.poll_seconds}s "
             f"probe={f'on/{self.world_probe_ttl_seconds}s' if self.world_probe else 'off'}",
             f"fixer={self.fixer_runtime} fix_model={model(self.fix_model)} "
+            f"fix_effort={getattr(self.fix_effort, 'value', None) or '(runtime default)'} "
+            f"escalate={'on' if self.escalate_on_evidence else 'off'} "
             f"fix_budget=${self.fix_budget_usd:.2f}",
             f"review_model={model(self.review_model)} mode={self.review_mode.value} "
             f"review_budget=${self.review_budget_usd:.2f} "
@@ -601,6 +636,25 @@ def _b(env: dict, key: str, default: bool, errors: list[str]) -> bool:
         f"got {v!r} — using default {default}"
     )
     return default
+
+
+def _effort(env: dict, key: str, default: Effort | None, errors: list[str]) -> Effort | None:
+    """FIX_EFFORT → Effort. Empty/unset means UNSET (leave the runtime's own
+    default alone), same rule `_b` applies to booleans. A typo is reported and
+    then falls back — a misspelled effort must not take the daemon down, but it
+    must not be silent either, or the operator believes a knob is live that
+    isn't (the #12 failure shape)."""
+    raw = env.get(key)
+    if raw is None or raw.strip() == "":
+        return default
+    parsed = parse_effort(raw, None)
+    if parsed is None:
+        errors.append(
+            f"{key} must be one of {[e.value for e in EFFORT_LADDER]}, "
+            f"got {raw!r} — using default {getattr(default, 'value', None)}"
+        )
+        return default
+    return parsed
 
 
 def _require_non_negative(errors: list[str], name: str, value: int | float) -> None:
@@ -735,8 +789,99 @@ def _default_state_dir(repo: str, role_dir: str) -> str:
     return os.path.expanduser(f"~/.local/state/{role_dir}/{_repo_slug(repo)}")
 
 
+# Names an env file textually ASSIGNS. Same anchor as bin/compose-env.sh's
+# scan: a commented-out `# FOO=bar` is not a definition, `export FOO=` and
+# leading whitespace are. `.active.env` is machine-written one-line
+# `KEY=<%q-escaped>` pairs, so a per-line scan cannot straddle a value.
+_ASSIGNMENT_RE = re.compile(
+    r"^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)=", re.MULTILINE
+)
+
+
+def _file_env(path: str, inherited: dict) -> dict[str, str] | None:
+    """`{name: value}` for every variable the env file at `path` ASSIGNS, or
+    `None` when the file cannot be read or sourced (caller falls back to
+    `inherited` — a broken read must never take the daemon with it, same
+    fail-open rule as adapters/reload.py).
+
+    The file is sourced by bash UNDER `inherited`, so the parameter-expansion
+    idiom operators write (`FOO="${FOO:-default}"`, `$HOME/...`) resolves
+    exactly as it does for bin/point-at.sh. The result is then RESTRICTED to
+    the names the file itself assigns: an inherited variable the file does not
+    mention is dropped, which is the whole point of #12.
+
+    Names-plus-values (rather than a pre/post diff) for compose-env.sh's
+    P0R-1 reason: a file assigning the value the environment already carries
+    is invisible to a diff, and silently defaulting TEST_CMD/REPO that way
+    fails every gate closed.
+    """
+    try:
+        assigned = {
+            m.group(1)
+            for m in _ASSIGNMENT_RE.finditer(
+                open(path, encoding="utf-8", errors="replace").read()
+            )
+        }
+        # An empty/unreadable/garbled file assigns nothing — that reads as
+        # "every knob absent", i.e. a silent full reset to defaults. Refuse it
+        # and let the caller keep the inherited environment.
+        if not assigned:
+            return None
+        proc = subprocess.run(
+            ["bash", "-c", 'set -a; . "$1"; set +a; env -0', "issue-agent-env", path],
+            env=dict(inherited),
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        out: dict[str, str] = {}
+        for item in proc.stdout.split(b"\0"):
+            if not item or b"=" not in item:
+                continue
+            key, value = item.split(b"=", 1)
+            name = key.decode(errors="replace")
+            if name in assigned:
+                out[name] = value.decode(errors="replace")
+        return out
+    except Exception:  # noqa: BLE001 — config load must not die on a bad file
+        return None
+
+
+def _authoritative_env(e: dict) -> dict:
+    """The env `from_env` maps, with AGENT_ENV's FILE as the authority (#12).
+
+    Precedence, when AGENT_ENV names a readable file:
+
+    1. a knob the file assigns → the file's value, always (it beats anything
+       inherited);
+    2. a knob the file does NOT assign → absent, so the HarnessConfig dataclass
+       default applies — it does NOT fall back to the inherited value.
+
+    Rule 2 is the fix. bin/point-at.sh's relaunch loop re-SOURCES the composed
+    file into one long-lived wrapper shell, and sourcing can overwrite but
+    never unset: a knob the operator DELETED from .active.env stayed exported
+    from the previous reload and was inherited by every later exec (observed
+    2026-07-27 — a removed FIX_MODEL kept difficulty routing disabled while the
+    same reload's DAILY_SPEND_CAP_USD change did apply). The wrapper's
+    environment is therefore not trustworthy for harness knobs; the file is,
+    which is exactly what the mtime watch already promises the operator.
+
+    The cost is that exporting a knob in the launching shell without putting it
+    in shared.env/repos/<name>.env no longer reaches the daemon — the file is
+    the only channel.
+
+    With no AGENT_ENV, or a file that cannot be read, the passed-in environment
+    is used unchanged (fail open).
+    """
+    path = e.get("AGENT_ENV", "")
+    if not path or not os.access(path, os.R_OK):
+        return e
+    parsed = _file_env(path, e)
+    return e if parsed is None else parsed
+
+
 def from_env(env: dict | None = None) -> HarnessConfig:
-    e = env if env is not None else os.environ
+    e = _authoritative_env(env if env is not None else os.environ)
     # Malformed-numeric fallbacks accumulate here and ride along on the config
     # (HarnessConfig.parse_errors) so validation_errors() can report them —
     # from_env itself must never traceback on operator input (review M2).
@@ -790,6 +935,10 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         ),
         review_trigger_label=e.get("REVIEW_TRIGGER_LABEL", _dc_default("review_trigger_label")),
         fix_model=e.get("FIX_MODEL") or _dc_default("fix_model"),
+        fix_effort=_effort(e, "FIX_EFFORT", _dc_default("fix_effort"), errors),
+        escalate_on_evidence=_b(
+            e, "ESCALATE_ON_EVIDENCE", _dc_default("escalate_on_evidence"), errors
+        ),
         review_model=e.get("REVIEW_MODEL") or _dc_default("review_model"),
         steward_triage_model=e.get("STEWARD_TRIAGE_MODEL", _dc_default("steward_triage_model"))
         or None,
@@ -850,12 +999,18 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         codex_env_key=e.get("CODEX_ENV_KEY", _dc_default("codex_env_key")),
         codex_wire_api=e.get("CODEX_WIRE_API", _dc_default("codex_wire_api")),
         codex_sandbox=e.get("CODEX_SANDBOX", _dc_default("codex_sandbox")),
+        codex_reasoning_effort=e.get(
+            "CODEX_REASONING_EFFORT", _dc_default("codex_reasoning_effort")
+        ),
         glm_settings_file=e.get("GLM_SETTINGS_FILE", _dc_default("glm_settings_file")),
         agent_idle_timeout=_coerce_float(
             e, "AGENT_IDLE_TIMEOUT_SECONDS", _dc_default("agent_idle_timeout"), errors
         ),
         agent_max_runtime=_coerce_float(
             e, "AGENT_MAX_RUNTIME_SECONDS", _dc_default("agent_max_runtime"), errors
+        ),
+        sdk_max_buffer_bytes=_coerce_int(
+            e, "SDK_MAX_BUFFER_BYTES", _dc_default("sdk_max_buffer_bytes"), errors
         ),
         codex_transport_retries=_coerce_int(
             e, "CODEX_TRANSPORT_RETRIES", _dc_default("codex_transport_retries"), errors

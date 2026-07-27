@@ -712,6 +712,43 @@ def test_a_run_that_raises_is_settled_as_a_transport_death_and_re_raises(tmp_pat
     assert read_events(ledger) == []
 
 
+def test_a_deterministic_death_is_journaled_distinctly_with_the_offending_path(tmp_path):
+    # #13: `transport_death` alone cannot distinguish a loop that will never
+    # converge from one a retry rescues, and the operator's first question is
+    # which file killed it.
+    boom = RuntimeError(
+        "Fatal error in message reader: Failed to decode JSON: JSON message "
+        "exceeded maximum buffer size of 1048576 bytes"
+    )
+    boom.harness_last_trace = "AssistantMessage → Read(evidence/ac-3-titles.png)"
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    rt = JournalingRuntime(RaisingInner(boom), journal, str(tmp_path / "spend.jsonl"), "o/r", "review")
+    rt.set_context("review", "REVIEW", 552, 545)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(rt.run(AgentTask(prompt="p")))
+
+    _, settled = read_events(journal.path)
+    assert settled["exit_reason"] == "transport_death"
+    assert settled["deterministic"] == "exceeded maximum buffer size"
+    assert settled["detail"] == "evidence/ac-3-titles.png"
+
+
+def test_an_ordinary_transport_death_is_not_marked_deterministic(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    rt = JournalingRuntime(
+        RaisingInner(RuntimeError("Stream closed unexpectedly")),
+        journal, str(tmp_path / "spend.jsonl"), "o/r", "review",
+    )
+    rt.set_context("review", "REVIEW", 552, 545)
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(rt.run(AgentTask(prompt="p")))
+
+    _, settled = read_events(journal.path)
+    assert settled["deterministic"] is None and settled["detail"] is None
+
+
 def test_a_normal_run_is_never_settled_as_a_transport_death(tmp_path):
     # Anti-vacuity twin: the raise path must not be reachable from a run that
     # merely returned an error result — those still count as attempts.

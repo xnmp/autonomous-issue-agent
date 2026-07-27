@@ -69,6 +69,34 @@ out=$(TEST_CMD='true'  bash "$CHECKS/check-commit.sh" commit -m "green: x" 2>&1)
 out=$(VERIFY_RED_AT_COMMIT=0 TEST_CMD='true' bash "$CHECKS/check-commit.sh" commit -m "red: t" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && ok "VERIFY_RED_AT_COMMIT=0 disables" || no "VERIFY_RED_AT_COMMIT=0 disables" "rc=$rc"
 
+echo "== check-commit.sh (oversized-image gate, harness #13) =="
+# Oversized image in evidence/ (unstaged — the compound add&&commit case) blocks.
+d=$(fresh_repo)
+( cd "$d" && mkdir evidence && head -c 800000 /dev/urandom > evidence/big.png )
+out=$( cd "$d" && bash "$CHECKS/check-commit.sh" commit -m "evidence: shots" 2>&1 ); rc=$?
+[ "$rc" -eq 1 ] && ok "oversized evidence/ png blocked" || no "oversized evidence/ png blocked" "rc=$rc out=${out:0:160}"
+# The block message must name the file and a remedy.
+case "$out" in *big.png*ffmpeg*|*big.png*downscale*) ok "block message names file + remedy" ;; *) no "block message names file + remedy" "out=${out:0:200}" ;; esac
+# Small image passes.
+( cd "$d" && head -c 10000 /dev/urandom > evidence/small.png && rm evidence/big.png )
+out=$( cd "$d" && bash "$CHECKS/check-commit.sh" commit -m "evidence: shots" 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] && ok "small evidence png passes" || no "small evidence png passes" "rc=$rc out=${out:0:160}"
+# Oversized STAGED image outside evidence/ also blocks.
+( cd "$d" && head -c 800000 /dev/urandom > shot.png && git add shot.png )
+out=$( cd "$d" && bash "$CHECKS/check-commit.sh" commit -m "evidence: shots" 2>&1 ); rc=$?
+[ "$rc" -eq 1 ] && ok "oversized staged png blocked" || no "oversized staged png blocked" "rc=$rc out=${out:0:160}"
+# Oversized non-image files are NOT this gate's business.
+( cd "$d" && git rm -q --cached shot.png && rm shot.png && head -c 800000 /dev/urandom > evidence/trace.txt )
+out=$( cd "$d" && bash "$CHECKS/check-commit.sh" commit -m "evidence: shots" 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] && ok "oversized non-image ignored" || no "oversized non-image ignored" "rc=$rc out=${out:0:160}"
+# EVIDENCE_MAX_IMAGE_KB=0 disables; a custom limit is honoured.
+( cd "$d" && head -c 800000 /dev/urandom > evidence/big.png )
+out=$( cd "$d" && EVIDENCE_MAX_IMAGE_KB=0 bash "$CHECKS/check-commit.sh" commit -m "evidence: shots" 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] && ok "EVIDENCE_MAX_IMAGE_KB=0 disables" || no "EVIDENCE_MAX_IMAGE_KB=0 disables" "rc=$rc"
+out=$( cd "$d" && EVIDENCE_MAX_IMAGE_KB=5 bash "$CHECKS/check-commit.sh" commit -m "evidence: shots" 2>&1 ); rc=$?
+[ "$rc" -eq 1 ] && ok "custom limit honoured" || no "custom limit honoured" "rc=$rc"
+rm -rf "$d"
+
 echo "== check-commit-order.sh (red before green) =="
 # Case A: green with NO prior red on the branch → blocked.
 d=$(fresh_repo)

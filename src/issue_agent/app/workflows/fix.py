@@ -19,8 +19,16 @@ from ..planners.tasks import FixTaskConfig
 from ...domain.actions import Relabel, Target
 from ...domain.agent_task import AgentRuntime
 from ...domain.ci import latest_other_review
+from ...domain.effort import (
+    DEFAULT_EFFORT,
+    DEFAULT_TIER,
+    EscalationSignals,
+    Stance,
+    escalate,
+)
 from ...domain.labels import Label
 from ...domain.refs import slugify
+from ...domain.review import count_outstanding_change_requests
 from ...domain.world import REVIEW_CHANGES_REQUESTED
 from ..mcp import mcp_servers_for_checks
 
@@ -43,6 +51,15 @@ class FixWorkflowConfig:
     # Which fixer runtime the routed model must belong to ("claude" | "codex") —
     # a codex fixer routed to a Claude alias cannot resolve it (see MODEL_TIERS).
     fixer_runtime: str = "claude"
+    # Escalate tier/effort when the harness has evidence the last attempt
+    # under-delivered (#16). Off restores the pre-#16 behaviour exactly: the
+    # router's verdict and the configured effort, whatever has happened before.
+    escalate_on_evidence: bool = True
+    # Where `route_escalation` events land (adapters.journal.Journal, or None in
+    # tests / when the daemon runs without one). Escalations must be queryable:
+    # the routing guardrail is "split the metrics by tier", which is unanswerable
+    # if the tier a leg actually ran at was never recorded.
+    journal: object | None = None
 
 
 @dataclass
@@ -131,8 +148,182 @@ class FixWorkflow:
         )
         return result
 
+    # ── escalation on evidence (#16) ────────────────────────────────────────
+    @staticmethod
+    def _try(fn, default):
+        try:
+            return fn()
+        except Exception:  # noqa: BLE001 — see `_signals`
+            return default
+
+    def _signals(self, issue: int, iss=None, review_rounds: int = 0) -> EscalationSignals:
+        """Evidence that the last attempt on this issue under-delivered, read
+        from state the harness already keeps — no new sensors (#16).
+
+        Every read is best-effort. These counters are an OPTIMISATION of which
+        configuration to dispatch, never a precondition for dispatching: a
+        store that cannot answer (missing file, injected fake without the
+        method) must degrade to "no evidence" and let the leg run, exactly as
+        it did before this existed. Failing a resolve because a retry counter
+        was unreadable would trade a cheap mis-tiering for a dead pipeline.
+
+        `review_rounds` is passed IN rather than read here because the only
+        honest source is the PR's own review list, which a resolve dispatch
+        does not have. The store's `review-retries` counter is deliberately NOT
+        used: it counts attempts at the CURRENT review and re-keys to 0 on every
+        new one (`address_review`'s `base = n if at == review_at else 0`), so
+        "rounds on this PR are climbing" is exactly the question it cannot
+        answer — it reads 1 forever no matter how many times the reviewer comes
+        back.
+        """
+        return EscalationSignals(
+            recurrence=bool(
+                self._try(lambda: iss is not None and iss.has(Label.RECURRENCE), False)
+            ),
+            resolve_retries=int(
+                self._try(lambda: self.store.get_resolve_retries(issue), 0) or 0
+            ),
+            review_rounds=max(0, int(review_rounds or 0)),
+        )
+
+    def _issue_for_signals(self, issue: int):
+        """The IssueView a repair leg needs to see a `recurrence` label, or None.
+
+        A repair leg holds a PR, not an issue, so without this the recurrence
+        signal would be visible to the resolve leg and invisible to every leg
+        that repairs its output — the asymmetry being worst precisely on an
+        issue the harness already failed once. One gateway read against a paid
+        session is a rounding error; a read that fails costs the signal, not the
+        dispatch — logged, so "why didn't it escalate" stays answerable."""
+        try:
+            return self.gateway.get_issue(issue)
+        except Exception as exc:  # noqa: BLE001 — see docstring
+            self.cfg.log(
+                f"agent #{issue}: recurrence signal unavailable ({exc}); "
+                "escalating on the remaining evidence only"
+            )
+            return None
+
+    def _journal_escalation(self, issue: int, leg: str, before: Stance, after: Stance,
+                            signals: EscalationSignals, model: str | None,
+                            tiered: bool) -> None:
+        """Record the rung this leg climbed, and why. ONE event per escalated
+        leg — `leg` distinguishes them, so "how many legs ran escalated" is a
+        group-by, not an inference.
+
+        The event may only report what actually reached the dispatch. A repair
+        leg has NO tier (it keeps the resumed session's model), so `tiered` is
+        False there and both tier fields are null rather than the DEFAULT_TIER
+        placeholder `_escalated` needs internally to have something to climb
+        from. Reporting that placeholder would attribute a sonnet repair leg to
+        `complex` in exactly the `group_by(.to_tier)` that CLAUDE.md makes the
+        load-bearing routing guardrail — the metric this event exists to keep
+        honest. `model` is the model that ran — None when the leg named none and
+        the runtime picked its own, matching how the tier fields encode "not
+        applicable" — so the split is derivable from what happened rather than
+        from a hypothetical stance.
+
+        Named `route_escalation`, NOT `escalation`: that event name already means
+        "handed to a human" (`app.execute` emits it on a needs-human-review move,
+        and `cli.py`'s escalation-rate metric counts it). Reusing it would fold a
+        cost decision into the guardrail that is supposed to detect cheap models
+        failing — the exact signal #16 must leave measurable.
+        """
+        journal = self.cfg.journal
+        if journal is None:
+            return
+        try:
+            journal.emit(
+                "route_escalation", issue=issue, leg=leg,
+                notches=signals.notches(),
+                from_tier=before.tier if tiered else None,
+                to_tier=after.tier if tiered else None,
+                from_effort=before.effort.value, to_effort=after.effort.value,
+                # `None`, not "" — the same "not applicable" encoding the tier
+                # fields use, so an unrouted leg (router died, no FIX_MODEL: the
+                # runtime picks) does not open a "" bucket in `group_by(.model)`.
+                model=model,
+                recurrence=signals.recurrence,
+                resolve_retries=signals.resolve_retries,
+                review_rounds=signals.review_rounds,
+            )
+        except Exception as exc:  # noqa: BLE001 — telemetry never fails a dispatch
+            self.cfg.log(f"agent #{issue}: escalation not journalled ({exc})")
+
+    def _escalated(
+        self, cfg: FixTaskConfig, issue: int, leg: str, *, tier: str | None = None,
+        iss=None, review_rounds: int = 0,
+    ) -> FixTaskConfig:
+        """Apply the escalation ladder to `cfg` for one leg (#16).
+
+        `tier` is the router's verdict when this leg chose one; None means the
+        leg inherited a model (a pinned FIX_MODEL, or a resumed session's) and
+        only the EFFORT half of the ladder applies — a repair leg resumes work
+        that already has shape, and swapping the model under a live transcript
+        buys a different reasoner an unfamiliar context. So a repair leg thinks
+        harder; only a fresh resolve re-prices the model.
+
+        Returns `cfg` untouched when there is no evidence, so the common path
+        emits no effort at all and each runtime keeps its own default.
+        """
+        signals = self._signals(issue, iss, review_rounds)
+        notches = signals.notches() if self.cfg.escalate_on_evidence else 0
+        # `cfg.effort or DEFAULT_EFFORT`: an unset FIX_EFFORT means "leave the
+        # runtime's own default alone", and the ladder has to start SOMEWHERE.
+        # It assumes that default is medium — true for codex (pinned by c995e55)
+        # and for the Claude SDK today. If a runtime's default were lower, the
+        # first notch would buy two rungs rather than one; it can never buy less,
+        # so the assumption can only over-deliver, never silently under-think.
+        base = Stance(
+            tier=tier if tier is not None else DEFAULT_TIER,
+            effort=cfg.effort or DEFAULT_EFFORT,
+        )
+        if notches <= 0:
+            return cfg if tier is None else dataclasses.replace(
+                cfg, model=task_builders.route_model(tier, self.cfg.fixer_runtime)
+            )
+        stance = escalate(base, notches)
+        # Tier is only re-priced when this leg picked one; effort always applies.
+        model = (
+            task_builders.route_model(stance.tier, self.cfg.fixer_runtime)
+            if tier is not None else cfg.model
+        )
+        # Same rule as the journal: name the tier move only when this leg chose
+        # a tier, so the log cannot claim a climb the dispatch did not make.
+        move = (
+            f"tier {base.tier}→{stance.tier}, " if tier is not None
+            else f"model {model or '(runtime default)'} kept, "
+        )
+        self.cfg.log(
+            f"agent #{issue}: {leg} — escalating {notches} notch(es) "
+            f"(recurrence={signals.recurrence}, resolve_retries={signals.resolve_retries}, "
+            f"review_rounds={signals.review_rounds}): "
+            f"{move}effort {base.effort.value}→{stance.effort.value}"
+        )
+        self._journal_escalation(
+            issue, leg, base, stance, signals, model, tiered=tier is not None
+        )
+        return dataclasses.replace(cfg, model=model, effort=stance.effort)
+
+    def _repair_fix_cfg(
+        self, issue: int, leg: str, *, iss=None, review_rounds: int = 0
+    ) -> FixTaskConfig | None:
+        """Effort-escalated config for a leg that resumes an existing session
+        (address-review / fix-CI / rebase / resume). Model untouched — see
+        `_escalated`. `iss` is fetched when the caller does not already hold it,
+        so the recurrence signal is not resolve-only."""
+        cfg = self.cfg.fix
+        if cfg is None:
+            return cfg
+        # Behind the kill switch: with escalation off nothing reads the labels,
+        # so paying a `gh issue view` per repair leg would be pure waste.
+        if iss is None and self.cfg.escalate_on_evidence:
+            iss = self._issue_for_signals(issue)
+        return self._escalated(cfg, issue, leg, iss=iss, review_rounds=review_rounds)
+
     async def _routed_fix_cfg(self, issue: int, iss) -> FixTaskConfig:
-        """Difficulty-routed FixTaskConfig for a RESOLVE dispatch (P4.1/#8).
+        """Difficulty-routed, evidence-escalated FixTaskConfig for a RESOLVE
+        dispatch (P4.1/#8, ladder #16).
 
         Runs the cheap classifier ONLY when no FIX_MODEL is pinned — an operator
         override wins, and a pinned model must not pay the router run. Failure
@@ -140,6 +331,8 @@ class FixWorkflow:
         garbage degrades via route_model's totality (unknown tier → the
         runtime's `standard`), and a run that RAISES degrades all the way to
         the unrouted default — resolving on the wrong tier beats not resolving.
+        A pinned model still gets the EFFORT half of the ladder: the operator
+        chose the model, not how hard it thinks.
 
         Only the resolve family routes. The follow-up legs (resume/CI/review/
         rebase) resume an existing session where the work already has shape;
@@ -147,8 +340,10 @@ class FixWorkflow:
         resolve leg already answered.
         """
         cfg = self.cfg.fix
-        if cfg is None or cfg.model:
+        if cfg is None:
             return cfg
+        if cfg.model:
+            return self._escalated(cfg, issue, "resolve", iss=iss)
         try:
             result = await self._run_logged(
                 "route", issue,
@@ -159,10 +354,12 @@ class FixWorkflow:
             tier = result.field("tier")
         except Exception as exc:  # noqa: BLE001 — routing is advisory, never fatal
             self.cfg.log(f"agent #{issue}: route — failed ({exc}); dispatching unrouted")
-            return cfg
-        model = task_builders.route_model(tier, self.cfg.fixer_runtime)
-        self.cfg.log(f"agent #{issue}: route — tier={tier or 'unknown'} → model={model}")
-        return dataclasses.replace(cfg, model=model)
+            return self._escalated(cfg, issue, "resolve", iss=iss)
+        routed = self._escalated(cfg, issue, "resolve", tier=tier or DEFAULT_TIER, iss=iss)
+        self.cfg.log(
+            f"agent #{issue}: route — tier={tier or 'unknown'} → model={routed.model}"
+        )
+        return routed
 
     async def resolve(self, issue: int) -> None:
         if self.cfg.author_tests_split:
@@ -233,8 +430,13 @@ class FixWorkflow:
             rounds += 1
             self.worktrees.reset(issue)
             adj = await self.runner.run(
+                # The SAME config the implementer ran on (routed + escalated),
+                # not the unrouted base: the adjudicator's job is to overrule
+                # the implementer's objection, and an arbiter that reasons
+                # weaker than the leg it is arbitrating decides the wrong way
+                # exactly when the issue is hard enough to have escalated.
                 task_builders.build_adjudicate_task(
-                    issue, iss.title, iss.body, objection, cwd, self.cfg.fix
+                    issue, iss.title, iss.body, objection, cwd, fix_cfg
                 )
             )
             self.store.save_session(issue, adj.session_id)
@@ -298,7 +500,8 @@ class FixWorkflow:
         cwd = self._ensure_cwd(issue, branch)
         fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
         task = task_builders.build_resume_task(
-            reply, cwd, self.store.get_session(issue), self.cfg.fix, fork=fork
+            reply, cwd, self.store.get_session(issue),
+            self._repair_fix_cfg(issue, "resume", iss=iss), fork=fork
         )
         result = await self.runner.run(task)
         self.store.save_session(issue, result.session_id)
@@ -350,7 +553,11 @@ class FixWorkflow:
         inline = self._prompt_input("review_comments", pr)
         fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
         task = task_builders.build_address_review_task(
-            pr, review_body, inline, cwd, self.store.get_session(issue), self.cfg.fix,
+            pr, review_body, inline, cwd, self.store.get_session(issue),
+            self._repair_fix_cfg(
+                issue, "address-review",
+                review_rounds=count_outstanding_change_requests(p.reviews, self.cfg.fix_bot),
+            ),
             fork=fork,
         )
         result = await self.runner.run(task)
@@ -396,7 +603,13 @@ class FixWorkflow:
             self.cfg.fix_mcp_config, [c.name for c in p.checks], self.cfg.harness_root
         )
         task = task_builders.build_fix_ci_task(
-            pr, failed, failed_log, cwd, self.store.get_session(issue), self.cfg.fix,
+            pr, failed, failed_log, cwd, self.store.get_session(issue),
+            # No `review_rounds` here (nor on `rebase`), though `p.reviews` is in
+            # hand: review dissatisfaction is evidence about the RESOLUTION, and
+            # a red pipeline or a conflicted branch is a different failure mode.
+            # Spending the ladder on it would charge the wrong leg for the
+            # reviewer's objections. Recurrence and resolve retries still apply.
+            self._repair_fix_cfg(issue, "fix-ci"),
             mcp_servers=mcp_servers,
         )
         result = await self.runner.run(task)
@@ -420,7 +633,8 @@ class FixWorkflow:
         p = self.gateway.get_pr(pr)
         cwd = self._ensure_cwd(issue, p.head_ref_name)
         task = task_builders.build_rebase_task(
-            pr, self.cfg.base_branch, cwd, self.store.get_session(issue), self.cfg.fix
+            pr, self.cfg.base_branch, cwd, self.store.get_session(issue),
+            self._repair_fix_cfg(issue, "rebase")
         )
         result = await self.runner.run(task)
         self.store.save_session(issue, result.session_id)

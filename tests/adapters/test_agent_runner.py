@@ -6,7 +6,9 @@ result mapping is duck-typed so a stand-in object stands in for ResultMessage.
 
 from dataclasses import dataclass
 
+from issue_agent.adapters import agent_runner
 from issue_agent.adapters.agent_runner import (
+    DEFAULT_MAX_BUFFER_BYTES,
     DEFAULT_PERMISSION_MODE,
     build_option_kwargs,
     result_to_agent_result,
@@ -114,6 +116,131 @@ def test_hooks_passed_through():
 def test_permission_mode_override():
     kw = build_option_kwargs(AgentTask(prompt="x"), permission_mode="auto")
     assert kw["permission_mode"] == "auto"
+
+
+# ── message buffer ceiling (#13) ──────────────────────────────────────────────
+def test_default_buffer_survives_a_five_megabyte_read():
+    # The SDK's own default is 1MB and a tool result is base64'd (x4/3), so the
+    # bound has to clear ~6.7MB for a 5MB file to come back alive.
+    assert DEFAULT_MAX_BUFFER_BYTES >= 5 * 1024 * 1024 * 4 // 3
+
+
+def test_buffer_knob_reaches_the_options():
+    kw = build_option_kwargs(AgentTask(prompt="x"), max_buffer_size=4096)
+    assert kw["max_buffer_size"] == 4096
+
+
+def test_no_buffer_knob_leaves_the_sdk_default_alone():
+    kw = build_option_kwargs(AgentTask(prompt="x"))
+    assert "max_buffer_size" not in kw
+    assert "max_buffer_size" not in build_option_kwargs(AgentTask(prompt="x"), max_buffer_size=0)
+
+
+def test_a_runner_applies_the_default_buffer_to_every_session(monkeypatch):
+    seen = {}
+    _install_fake_sdk(monkeypatch, [_ResultMessage(is_error=False)], capture=seen)
+    monkeypatch.setattr(agent_runner, "_OPTION_FIELDS", frozenset({"max_buffer_size"}))
+    asyncio.run(AgentRunner().run(AgentTask(prompt="x")))
+    assert seen["options"]["max_buffer_size"] == DEFAULT_MAX_BUFFER_BYTES
+
+
+def test_buffer_option_is_dropped_on_an_sdk_build_without_the_field(monkeypatch):
+    # An older SDK rejects an unknown field at construction — a harness that
+    # cannot raise the ceiling must still run, loudly.
+    seen = {}
+    _install_fake_sdk(monkeypatch, [_ResultMessage(is_error=False)], capture=seen)
+    monkeypatch.setattr(agent_runner, "_OPTION_FIELDS", frozenset())
+    logged: list[str] = []
+    asyncio.run(AgentRunner(log=logged.append).run(AgentTask(prompt="x")))
+    assert "max_buffer_size" not in seen["options"]
+    assert any("no max_buffer_size" in m for m in logged)
+
+
+def test_the_installed_sdk_accepts_max_buffer_size():
+    """Anti-vacuity: every test above stubs the SDK, so nothing else would notice
+    the pinned build dropping the field and the fix becoming a no-op. Skipped
+    where the SDK is absent — `make test-adapters` runs without it by design."""
+    import dataclasses
+
+    import pytest
+
+    sdk = pytest.importorskip("claude_agent_sdk")
+    assert "max_buffer_size" in {
+        f.name for f in dataclasses.fields(sdk.ClaudeAgentOptions)
+    }
+
+
+# ── reasoning effort (#16) ────────────────────────────────────────────────────
+def test_effort_reaches_the_options_as_the_sdk_word():
+    from issue_agent.domain.effort import Effort
+
+    kw = build_option_kwargs(AgentTask(prompt="x", effort=Effort.HIGH))
+    assert kw["effort"] == "high"
+
+
+def test_a_task_with_no_effort_says_nothing():
+    """Adding the field must not pin every existing dispatch to the harness's
+    idea of an effort — a task with no opinion keeps the SDK's own default."""
+    assert "effort" not in build_option_kwargs(AgentTask(prompt="x"))
+
+
+def test_effort_option_is_dropped_on_an_sdk_build_without_the_field(monkeypatch):
+    # Losing the cheap lever beats failing the dispatch: the tier half of the
+    # ladder still applies.
+    from issue_agent.domain.effort import Effort
+
+    seen = {}
+    _install_fake_sdk(monkeypatch, [_ResultMessage(is_error=False)], capture=seen)
+    monkeypatch.setattr(agent_runner, "_OPTION_FIELDS", frozenset())
+    logged: list[str] = []
+    asyncio.run(AgentRunner(log=logged.append).run(AgentTask(prompt="x", effort=Effort.HIGH)))
+    assert "effort" not in seen["options"]
+    assert any("no effort option" in m for m in logged)
+
+
+def test_effort_survives_to_the_session_on_a_build_that_has_the_field(monkeypatch):
+    from issue_agent.domain.effort import Effort
+
+    seen = {}
+    _install_fake_sdk(monkeypatch, [_ResultMessage(is_error=False)], capture=seen)
+    monkeypatch.setattr(agent_runner, "_OPTION_FIELDS", frozenset({"effort"}))
+    asyncio.run(AgentRunner().run(AgentTask(prompt="x", effort=Effort.LOW)))
+    assert seen["options"]["effort"] == "low"
+
+
+def test_the_installed_sdk_accepts_every_effort_word_the_domain_can_emit():
+    """Anti-vacuity twin of the max_buffer_size check: the stubs above would not
+    notice the SDK renaming the option or narrowing its Literal."""
+    import dataclasses
+    import typing
+
+    import pytest
+
+    from issue_agent.domain.effort import EFFORT_LADDER
+
+    sdk = pytest.importorskip("claude_agent_sdk")
+    field = {f.name: f for f in dataclasses.fields(sdk.ClaudeAgentOptions)}["effort"]
+    accepted = set()
+    for arg in typing.get_args(field.type):
+        accepted.update(typing.get_args(arg))
+    assert {e.value for e in EFFORT_LADDER} <= accepted
+
+
+def test_a_transport_death_carries_the_last_trace_on_the_exception(monkeypatch):
+    # The journal and the dispatcher both need the offending path, and the
+    # exception must still propagate unchanged (crash isolation).
+    blk = type("Blk", (), {})()
+    blk.name = "Read"
+    blk.input = {"file_path": "evidence/shot.png"}
+    carrier = type("Carrier", (), {})()
+    carrier.content = [blk]
+    _install_fake_sdk(monkeypatch, [carrier], raise_after=True)
+    try:
+        asyncio.run(AgentRunner().run(AgentTask(prompt="x")))
+    except RuntimeError as exc:
+        assert "Read(evidence/shot.png)" in getattr(exc, "harness_last_trace", "")
+    else:
+        raise AssertionError("expected the pre-result crash to propagate")
 
 
 # ── ResultMessage → AgentResult ────────────────────────────────────────────────
@@ -267,7 +394,7 @@ class _ResultMessage(FakeResult):
     check — we monkeypatch the SDK symbols run() lazily imports."""
 
 
-def _install_fake_sdk(monkeypatch, messages, raise_after=False):
+def _install_fake_sdk(monkeypatch, messages, raise_after=False, capture=None):
     async def fake_query(prompt, options):
         for m in messages:
             yield m
@@ -280,8 +407,13 @@ def _install_fake_sdk(monkeypatch, messages, raise_after=False):
     import sys
     import types
 
+    def _options(**kw):
+        if capture is not None:
+            capture["options"] = kw
+        return object()
+
     fake = types.ModuleType("claude_agent_sdk")
-    fake.ClaudeAgentOptions = lambda **kw: object()
+    fake.ClaudeAgentOptions = _options
     fake.ResultMessage = _ResultMessage
     fake.query = fake_query
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake)
