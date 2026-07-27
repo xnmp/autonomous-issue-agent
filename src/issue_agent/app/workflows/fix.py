@@ -218,8 +218,10 @@ class FixWorkflow:
         from. Reporting that placeholder would attribute a sonnet repair leg to
         `complex` in exactly the `group_by(.to_tier)` that CLAUDE.md makes the
         load-bearing routing guardrail — the metric this event exists to keep
-        honest. `model` is the model that ran, so the split is derivable from
-        what happened rather than from a hypothetical stance.
+        honest. `model` is the model that ran — None when the leg named none and
+        the runtime picked its own, matching how the tier fields encode "not
+        applicable" — so the split is derivable from what happened rather than
+        from a hypothetical stance.
 
         Named `route_escalation`, NOT `escalation`: that event name already means
         "handed to a human" (`app.execute` emits it on a needs-human-review move,
@@ -237,7 +239,10 @@ class FixWorkflow:
                 from_tier=before.tier if tiered else None,
                 to_tier=after.tier if tiered else None,
                 from_effort=before.effort.value, to_effort=after.effort.value,
-                model=model or "",
+                # `None`, not "" — the same "not applicable" encoding the tier
+                # fields use, so an unrouted leg (router died, no FIX_MODEL: the
+                # runtime picks) does not open a "" bucket in `group_by(.model)`.
+                model=model,
                 recurrence=signals.recurrence,
                 resolve_retries=signals.resolve_retries,
                 review_rounds=signals.review_rounds,

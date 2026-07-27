@@ -1121,6 +1121,35 @@ def test_escalation_survives_a_router_that_died():
     assert runner.tasks[1].effort is Effort.HIGH
 
 
+def test_an_unrouted_escalation_records_a_null_model_not_an_empty_one():
+    """"Not applicable" has one encoding across the event: an unrouted leg lets
+    the runtime pick, and must not open a "" bucket in `group_by(.model)`."""
+    gw = FakeGateway(
+        issues={5: _issue(labels=frozenset({Label.RECURRENCE}))}, pr_for_issue={}
+    )
+    journal = RecordingJournal()
+
+    class RouterDies:
+        def __init__(self):
+            self.tasks = []
+
+        async def run(self, task):
+            self.tasks.append(task)
+            if len(self.tasks) == 1:
+                raise RuntimeError("router transport died")
+            return AgentResult(is_error=False, status="pr_opened", session_id="s5")
+
+    runner = RouterDies()
+    asyncio.run(_workflow(
+        gw, FakeStore(), runner, journal=journal,
+        fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    (_event, fields), = journal.events
+    assert fields["model"] is None
+    assert runner.tasks[1].model is None
+
+
 def test_the_kill_switch_restores_the_pre_ladder_dispatch():
     gw = FakeGateway(
         issues={5: _issue(labels=frozenset({Label.RECURRENCE}))}, pr_for_issue={}
