@@ -33,6 +33,8 @@
 set -uo pipefail
 
 HARNESS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# shellcheck source=bin/lib/gate-probe.sh
+. "$HARNESS_ROOT/bin/lib/gate-probe.sh"
 NAME="${1:?usage: bin/point-at.sh <name>  (reads config/repos/<name>.env)}"
 SHARED="$HARNESS_ROOT/config/shared.env"
 REPO_ENV="$HARNESS_ROOT/config/repos/$NAME.env"
@@ -135,13 +137,21 @@ fi
 #
 # Probed in a THROWAWAY WORKTREE of origin/$BASE_BRANCH, never in TARGET_DIR:
 # the operator's checkout routinely carries local edits and untracked files, and
-# "green with your junk in the tree" is not the question. The daemons' own
-# per-issue worktrees start from exactly this state.
+# "green with your junk in the tree" is not the question. Keep the throwaway
+# worktree under TARGET_DIR, matching the daemon worktrees: package managers can
+# then resolve checkout-local dependency stores such as an ancestor
+# `node_modules`. A /tmp sibling made every JS probe falsely red (#49).
 #
 # GATE_PROBE=0 skips it; GATE_PROBE_TIMEOUT bounds it (default 900s).
 if [ "${GATE_PROBE:-1}" = "1" ] && [ -n "${TEST_CMD:-}" ]; then
   info "gate probe: running TEST_CMD on a clean origin/$BASE_BRANCH worktree"
-  _probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/issue-agent-gate-probe.XXXXXX")"
+  if ! _probe_dir="$(
+    create_gate_probe_worktree_dir \
+      "$TARGET_DIR" "${WORKTREE_ROOT-.claude/worktrees}"
+  )"; then
+    red "  ✗ could not create gate-probe worktree below WORKTREE_ROOT"
+    exit 1
+  fi
   # The log lives OUTSIDE the probe worktree: `git worktree remove --force`
   # deletes that directory, taking the evidence with it. Its own mktemp name
   # also keeps concurrent deployments from overwriting each other's output.
