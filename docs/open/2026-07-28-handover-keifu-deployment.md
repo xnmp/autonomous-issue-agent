@@ -204,7 +204,11 @@ review-cost work.
 - **Left deliberately as evidence**: keifu #133 and #128 are closed-but-
   `ai-pr-open` with `issue-133`/`issue-128` worktrees still present. That is #28
   reproducing live. Clean them when #28 lands, not before.
-- **6 daemons still running** against keifu (plus 6 against tauri). Stop with
+- **3 daemons still running** against keifu (fix/review/steward), plus 3 against
+  tauri. Note `pgrep -f "issue_agent[.]app[.]main"` returns **12** for those six:
+  each role is a `uv run` wrapper that spawns a python child, and the pattern
+  matches both. Count parents (`ppid` = the `point-at` shell) or grep for
+  `^uv run` to get the real daemon count. Stop with
   the `point-at` foreground process, or leave them — nothing is queued.
 - **#34 is a bug in a check added this session.** Filed against myself rather
   than quietly left; the detector needs PR history, so it would not have
