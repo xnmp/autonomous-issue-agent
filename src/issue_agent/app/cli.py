@@ -11,8 +11,8 @@ to the harness root to load `plugin/AGENT.md`, `plugin/hooks/bash_governor.py`,
 and `config/mcp/*.json` — none of which ship in the wheel. `bin/install.sh`
 installs this editable so `HARNESS_ROOT` (below) still resolves those siblings.
 
-Subcommands: init | start | stop | status | doctor | ready | triage |
-install-service | uninstall-service. The pure helpers (detect_repo,
+Subcommands: init | start | stop | status | dashboard | doctor | ready |
+triage | install-service | uninstall-service. The pure helpers (detect_repo,
 resolve_name, synth_repo_env) are unit-tested with no git/network.
 """
 
@@ -1028,14 +1028,11 @@ def cmd_status(args) -> int:
         pids = roles[role]
         state = _c("32", "running") + f" {pids}" if pids else _c("33", "stopped")
         print(f"  {role:8s}: {state}")
-    log_dir = os.environ.get("LOG_DIR") or os.path.join(
-        os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
-        "issue-agent", "logs",
-    )
+    logs = log_dir()
     for role in ROLES:
         # Same default as point-at.sh's LOG_DIR; the old /tmp path is checked as
         # a fallback so status still tails logs of a daemon started pre-move.
-        log = os.path.join(log_dir, f"{role}-{name}.log")
+        log = os.path.join(logs, f"{role}-{name}.log")
         if not os.path.isfile(log):
             log = f"/tmp/issue-agent-{role}-{name}.log"
         if os.path.isfile(log):
@@ -1055,6 +1052,65 @@ def cmd_status(args) -> int:
             print(line)
     except Exception as exc:  # noqa: BLE001
         err(f"(could not read the event journal: {exc})")
+    return 0
+
+
+def log_dir() -> str:
+    """Where point-at.sh writes `<role>-<name>.log`. Same resolution `cmd_status`
+    uses (LOG_DIR wins, else $XDG_STATE_HOME/issue-agent/logs)."""
+    return os.environ.get("LOG_DIR") or os.path.join(
+        os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+        "issue-agent", "logs",
+    )
+
+
+def cmd_dashboard(args) -> int:
+    """Every deployment, every issue, one read-only view (see app/dashboard.py).
+
+    Strictly read-only: it reads the journals + the global ledger and writes
+    nothing but the optional --html file. No `gh` calls — journal-only truth.
+    """
+    from ..adapters.journal import default_ledger_path
+    from . import dashboard as dash
+
+    names = list(args.names) or list(dash.deployment_names(REPOS_DIR))
+    if not names:
+        err(f"no deployments found in {REPOS_DIR} — run `issue-agent start` in a "
+            f"target repo first, or pass --name <overlay>.")
+        return 2
+    ledger = default_ledger_path()
+    logs = log_dir()
+
+    def build() -> list:
+        return [
+            dash.collect(
+                name,
+                read_repo_env_field(os.path.join(REPOS_DIR, f"{name}.env"), "REPO"),
+                journal_paths(name),
+                logs,
+                ledger,
+                stale_after_s=args.stale_minutes * 60.0,
+            )
+            for name in names
+        ]
+
+    if args.serve:
+        url = f"http://127.0.0.1:{args.serve}/"
+        info(f"serving the dashboard at {url} (Ctrl-C to stop) — regenerated per request")
+        try:
+            dash.serve(args.serve, lambda: dash.render_html(build()))
+        except KeyboardInterrupt:
+            print()
+        return 0
+    deployments = build()
+    if args.html:
+        path = os.path.abspath(os.path.expanduser(args.html))
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(dash.render_html(deployments))
+        ok(f"wrote {path}")
+        return 0
+    print(dash.render_text(deployments, details=args.details))
     return 0
 
 
@@ -1288,6 +1344,26 @@ def build_parser() -> argparse.ArgumentParser:
     add_context_flags(sp)
     sp.add_argument("-n", "--lines", type=int, default=15, help="log tail length (default: 15)")
     sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser(
+        "dashboard",
+        help="all repos, all issues: done / in flight / daemon health (read-only)",
+        description="Aggregate every deployment's journals into one operator "
+        "view — per-issue stage, spend, legs and drill-down, per-(role,repo) "
+        "daemon health, and the efficiency/guardrail metrics. Journal-only "
+        "truth: no GitHub calls, so a label or merge applied by a human outside "
+        "the harness is not visible here. Prints text by default; --html writes "
+        "a self-contained snapshot; --serve regenerates it per request.",
+    )
+    sp.add_argument("--name", dest="names", action="append", default=[],
+                    help="restrict to this overlay (repeatable; default: every config/repos/*.env)")
+    sp.add_argument("--html", default="", help="write a self-contained HTML snapshot to PATH and exit")
+    sp.add_argument("--serve", type=int, default=0, metavar="PORT",
+                    help="serve the HTML on 127.0.0.1:PORT, regenerated per request")
+    sp.add_argument("--details", action="store_true", help="text mode: also dump each issue's raw journal events")
+    sp.add_argument("--stale-minutes", type=int, default=30,
+                    help="flag a daemon STALE after this long with no journal event (default: 30)")
+    sp.set_defaults(func=cmd_dashboard)
 
     sp = sub.add_parser("doctor", help="preflight checks (tooling, identities, repo access)")
     add_context_flags(sp)

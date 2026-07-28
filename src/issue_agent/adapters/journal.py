@@ -463,6 +463,46 @@ def death_key(event: dict) -> int | None:
     return None if number is None else -number
 
 
+def unsettled_start_events(
+    events, window_s: float = 86400.0, now_fn=_now
+) -> list[dict]:
+    """The `agent_run_start` EVENTS that never reached a settlement, in journal
+    order. `unsettled_starts` counts these by `death_key`; the dashboard needs
+    the events themselves (which leg, which model, since when), so the selection
+    rule lives here once and both readers share it — see `unsettled_starts` for
+    why the grouping is per-dispatch and counting, not positional.
+    """
+    scoped = events_within(events, window_s, now_fn) if window_s > 0 else list(events)
+    starts: dict[tuple, list[dict]] = {}
+    settled: dict[tuple, int] = {}
+    for e in scoped:
+        event = e.get("event")
+        if event not in ("agent_run_start", "agent_run"):
+            continue
+        dispatch = str(e.get("dispatch") or "")
+        key = (
+            ("dispatch", dispatch) if dispatch
+            else ("context", str(e.get("kind", "")), _int(e.get("number")))
+        )
+        if event == "agent_run_start":
+            starts.setdefault(key, []).append(e)
+        else:
+            settled[key] = settled.get(key, 0) + 1
+    out: list[dict] = []
+    for key, start_events in starts.items():
+        if key[0] == "dispatch":
+            missing = 1 if len(start_events) > settled.get(key, 0) else 0
+        else:
+            missing = len(start_events) - settled.get(key, 0)
+        if missing <= 0:
+            continue
+        # Attribute to the MOST RECENT unsettled starts: when a key's context
+        # changed (a PR whose closing-ref appeared between runs), the newest
+        # events describe the dispatch the next poll will repeat.
+        out.extend(start_events[-missing:])
+    return out
+
+
 def unsettled_starts(
     events, window_s: float = 86400.0, now_fn=_now
 ) -> dict[int, int]:
@@ -509,37 +549,11 @@ def unsettled_starts(
     an operator debugs over; older deaths are already spent money and their
     counter file, if the process lived to write one, persists anyway.
     """
-    scoped = events_within(events, window_s, now_fn) if window_s > 0 else list(events)
-    starts: dict[tuple, list[dict]] = {}
-    settled: dict[tuple, int] = {}
-    for e in scoped:
-        event = e.get("event")
-        if event not in ("agent_run_start", "agent_run"):
-            continue
-        dispatch = str(e.get("dispatch") or "")
-        key = (
-            ("dispatch", dispatch) if dispatch
-            else ("context", str(e.get("kind", "")), _int(e.get("number")))
-        )
-        if event == "agent_run_start":
-            starts.setdefault(key, []).append(e)
-        else:
-            settled[key] = settled.get(key, 0) + 1
     out: dict[int, int] = {}
-    for key, start_events in starts.items():
-        if key[0] == "dispatch":
-            missing = 1 if len(start_events) > settled.get(key, 0) else 0
-        else:
-            missing = len(start_events) - settled.get(key, 0)
-        if missing <= 0:
-            continue
-        # Attribute to the MOST RECENT unsettled starts: when a key's context
-        # changed (a PR whose closing-ref appeared between runs), the newest
-        # events describe the dispatch the next poll will repeat.
-        for e in start_events[-missing:]:
-            k = death_key(e)
-            if k is not None:
-                out[k] = out.get(k, 0) + 1
+    for e in unsettled_start_events(events, window_s, now_fn):
+        k = death_key(e)
+        if k is not None:
+            out[k] = out.get(k, 0) + 1
     return out
 
 
@@ -944,5 +958,6 @@ __all__ = [
     "sum_issue",
     "sum_today",
     "total_tokens",
+    "unsettled_start_events",
     "unsettled_starts",
 ]
