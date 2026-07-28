@@ -42,6 +42,15 @@ jobs:
         with:
           python-version: "3.12"
 
+      # `make test-domain` calls plain `uv run pytest tests/domain/`, and
+      # tests/domain/test_convergence.py imports app.roles → adapters.governor →
+      # tree_sitter. That resolves only from a synced project venv, so the
+      # target is not self-contained despite being labelled "pure"; a clean
+      # checkout fails at collection without this. Mirrors the documented
+      # operator setup (CLAUDE.md: the daemons need the sdk extra + tree-sitter).
+      - name: Sync project venv (sdk extra)
+        run: uv sync --extra sdk
+
       # The full suite: governor + hooks + orchestration + point-at + domain +
       # adapters + gate parity + import-linter architecture contracts.
       - name: make test
