@@ -49,6 +49,13 @@ class Check:
     name: str
     state: str = ""
     bucket: str = ""
+    # ISO-8601 start of this check RUN (gh: `pr checks --json startedAt`). Drives
+    # the pending deadline (#30) — a check stuck IN_PROGRESS pins ci_state at
+    # PENDING forever, and this is the only field that says how long it has been
+    # stuck. Empty = unknown (a gh version without the field, a check that has
+    # not started, an unparseable value) → the deadline CANNOT fire on it: a
+    # missing timestamp must never be read as "infinitely old".
+    started_at: str = ""
 
 
 @dataclass(frozen=True)
@@ -207,6 +214,14 @@ class WorldState:
 
     issues: tuple[IssueView, ...] = ()
     prs: tuple[PRView, ...] = ()
+    # When this snapshot was BUILT (ISO-8601 UTC), stamped by the adapter. The
+    # domain is pure and may not read a clock, so any decision with a time
+    # component (the CI pending deadline, #30) reads it from here. Empty =
+    # unstamped (a hand-built world, a builder that predates this) → every
+    # time-based gate treats the elapsed time as unknown and does not fire.
+    # Safe to read only because a world is decided on the tick it was built:
+    # WorldProbe raises WorldUnchanged instead of re-serving a cached world.
+    now: str = ""
 
     def open_issues(self) -> tuple[IssueView, ...]:
         return tuple(i for i in self.issues if i.state == "open")

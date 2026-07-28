@@ -24,6 +24,7 @@ from ..adapters.journal import (
     Journal,
     JournalingRuntime,
     default_ledger_path,
+    ci_pending_keys,
     hold_keys,
     read_events_tail,
     recurrence_keys,
@@ -31,7 +32,14 @@ from ..adapters.journal import (
 )
 from ..adapters.store import Store
 from ..adapters.worktree import Worktrees
-from ..domain.fix import FixConfig, FixState, breaker_key, decide_fix, issue_holds
+from ..domain.fix import (
+    FixConfig,
+    FixState,
+    breaker_key,
+    ci_pending_stalls,
+    decide_fix,
+    issue_holds,
+)
 from ..domain.labels import Label
 from ..domain.lifecycle import retry_breaker
 from ..domain.review import (
@@ -219,6 +227,49 @@ def _hold_reporter(journal: Journal | None, repo: str, log):
     return report
 
 
+def _ci_stall_reporter(journal: Journal | None, repo: str, fix_cfg: FixConfig, log):
+    """Build the per-poll reporter for a CI pending-deadline breach (#30).
+
+    The escalation itself is `decide_fix`'s (a comment + needs-human-review);
+    this is the machine-readable half. Without it a wedged check leaves NO
+    trace: a pending PR dispatches no leg, so no retry counter moves and no
+    `agent_run` is written, and "the PR simply never moves and nothing anywhere
+    says why" was the whole complaint.
+
+    Same two-channel shape as `_hold_reporter`, and reads the SAME pure
+    derivation `decide_fix` escalates on, so the journal cannot disagree with
+    the action. The LOG line fires every poll it is derivable; the JOURNAL line
+    fires once per (PR, head SHA) — a re-push that wedges again is a new stall,
+    the same stuck run is not. In practice the escalation relabel takes the PR
+    out of the fixer's set on the first breach, so this dedup is the backstop
+    for the poll where that relabel fails, and for the daemon restarts a hot
+    reload produces.
+    """
+    seen: set[str] = set()
+
+    def report(world) -> None:
+        for stall in ci_pending_stalls(world, fix_cfg):
+            checks = ", ".join(stall.checks) or "unnamed"
+            log(
+                f"CI STALL: PR #{stall.pr} has been pending {stall.seconds}s "
+                f"({checks}) — escalating to needs-human-review"
+            )
+            key = f"ci-pending:{repo}:{stall.pr}:{stall.head}"
+            if key in seen:
+                continue
+            seen.add(key)
+            if journal is None:
+                continue
+            if key in ci_pending_keys(read_events_tail(journal.path)):
+                continue
+            journal.emit(
+                "ci_pending_deadline", pr=stall.pr, head=stall.head,
+                seconds=stall.seconds, checks=list(stall.checks), block_key=key,
+            )
+
+    return report
+
+
 def _recurrence_reporter(journal: Journal | None, gateway, repo: str, fix_bot: str, log):
     """Build the per-poll reporter for LITERAL reopens (harness #10, kind=reopen).
 
@@ -312,6 +363,7 @@ def build_fix_daemon(
         auto_merge=cfg.auto_merge,
         merge_method=cfg.merge_method,
         ci_ignore_checks=cfg.ci_ignore_checks,
+        ci_pending_max_seconds=cfg.ci_pending_max_seconds,
         close_issue_on_merge=cfg.close_issue_on_merge,
         max_ci_retries=fix_runtime.max_ci_retries,
         max_review_retries=fix_runtime.max_review_retries,
@@ -451,11 +503,13 @@ def build_fix_daemon(
     executor._run_agent = lambda a: asyncio.run(dispatcher.dispatch(a))  # noqa: SLF001
 
     report_holds = _hold_reporter(journal, cfg.repo, _log("fix"))
+    report_ci_stalls = _ci_stall_reporter(journal, cfg.repo, fix_cfg, _log("fix"))
 
     def decide(world):
         # Report BEFORE deciding: if decide_fix raises, the tick still leaves a
         # record of what it was holding, which is the state hardest to diagnose.
         report_holds(world)
+        report_ci_stalls(world)
         return decide_fix(world, fix_cfg, _fix_state(store, world), fixer_busy())
 
     return Daemon("fix", gateway.build_world, decide, executor, cfg.poll_seconds,

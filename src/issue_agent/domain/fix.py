@@ -29,7 +29,13 @@ from .actions import (
     RunAgent,
     Target,
 )
-from .ci import ci_state, latest_other_review
+from .ci import (
+    ci_state,
+    latest_other_review,
+    pending_age_seconds,
+    pending_checks,
+    pending_deadline_breached,
+)
 from .identity import login_eq
 from .labels import Label, priority_rank
 from .lifecycle import (
@@ -84,6 +90,16 @@ class FixConfig:
     # dying pre-result never records an attempt at all, so nothing bounded it:
     # one full paid session every two polls, forever. 0 disables.
     max_infra_deaths: int = 5
+    # How long CI may sit PENDING before the PR is handed to a human (#30),
+    # measured from the newest pending check's start. PENDING outranks FAILURE
+    # (the #49 anti-loop rule) and nothing bounded that, so one job stuck
+    # IN_PROGRESS pinned a PR forever — silently, since a pending PR dispatches
+    # no leg and therefore writes no counter, no journal event and no log line.
+    # 0 disables, like every other breaker here. The default is deliberately
+    # generous: a real pipeline can legitimately run for well over half an hour
+    # (webkit suites ~23m on the flagship target), and escalating a healthy long
+    # run would move the escalation-rate guardrail the wrong way.
+    ci_pending_max_seconds: int = 3600
 
 
 @dataclass(frozen=True)
@@ -493,6 +509,93 @@ def breaker_tripped(count: int, cap: int) -> bool:
     return retry_breaker(count, cap).tripped
 
 
+@dataclass(frozen=True)
+class CiPendingStall:
+    """One PR whose CI has been PENDING past `CI_PENDING_MAX_SECONDS` (#30).
+
+    The witness form of `pending_deadline_breached`, carrying what an operator
+    needs to act: which PR, which head it is stuck on, how long, and the names
+    of the checks doing the pinning. `head` is what makes the report one-shot
+    per commit — a push produces new check runs, so a stall on a new head is a
+    genuinely new fact and is reported again."""
+
+    pr: int
+    head: str
+    seconds: int
+    checks: tuple[str, ...]
+
+    @property
+    def reason(self) -> str:
+        names = ", ".join(self.checks) or "an unnamed check"
+        return (
+            f"CI has been pending for {self.seconds // 60} minutes without "
+            f"settling ({names}) — a stuck check pins this PR indefinitely, "
+            "since a pending check never becomes a failure the fixer can act on."
+        )
+
+
+def fixer_prs(world: WorldState, cfg: FixConfig) -> tuple[PRView, ...]:
+    """The OPEN ai-pr-open PRs the fixer may act on: its OWN.
+
+    The reviewer "adopts" rogue PRs (labels any unlabelled OPEN PR ai-pr-open so
+    it gets reviewed) — including PRs opened by humans. But the fixer has a
+    worktree + session ONLY for its own issue-branch PRs, so dispatching
+    ADDRESS_REVIEW/FIX_CI/REBASE on someone else's PR does no work (nothing to
+    push) yet still burns a fixer leg and mislabels the PR ai-blocked (observed:
+    PR #351, opened by a human, adopted for review, then the fixer commented +
+    blocked it). Gate on authorship: a PR whose author is not FIX_BOT belongs to
+    a human — leave it for them. An unknown author (`author == ""`, e.g. a PR
+    whose author field didn't resolve) or an unset FIX_BOT is treated as
+    NOT-ours EXPLICITLY, by the `p.author and cfg.fix_bot` guard below. That
+    guard predates the comparison being safe: `login_eq("","")` used to return
+    True, so with both blank a stranger's PR with an unresolvable author read as
+    the fixer's own — the exact inversion of the fail-safe this comment claimed.
+    `login_eq` now returns False when either side is unknown (review P1R-7), so
+    the two are belt and braces; the explicit guard stays because a filter this
+    consequential should not depend on a helper's edge case being read correctly
+    by the next person.
+
+    The match goes through `login_eq`, never `==`: a FIX_BOT written with the
+    `[bot]` suffix would otherwise match NO PR, silently disabling every fixer
+    PR leg (address-review / fix-ci / rebase / auto-merge) forever (review C1).
+    """
+    return tuple(
+        p for p in world.prs
+        if p.has(Label.AI_PR_OPEN) and p.state == "OPEN"
+        and p.author and cfg.fix_bot
+        and login_eq(p.author, cfg.fix_bot)
+    )
+
+
+def ci_pending_stalls(world: WorldState, cfg: FixConfig) -> tuple[CiPendingStall, ...]:
+    """Every fixer PR whose CI has been pending past the deadline this poll.
+
+    THE single definition of "stalled": `decide_fix` escalates exactly what this
+    returns and the wiring journals exactly what this returns, so the journal can
+    never disagree with the decision it explains (the `issue_holds` pattern).
+
+    Already-escalated PRs are excluded twice over — `is_blocked` covers the poll
+    the label lands on nothing else, and the escalation itself swaps ai-pr-open
+    for needs-human-review, which takes the PR out of `fixer_prs` for good."""
+    return tuple(
+        CiPendingStall(
+            pr=pr.number,
+            head=pr.head_ref_oid,
+            seconds=int(age or 0),
+            checks=tuple(
+                c.name for c in pending_checks(pr.checks, cfg.ci_ignore_checks) if c.name
+            ),
+        )
+        for pr in fixer_prs(world, cfg)
+        if not pr_lifecycle(pr).is_blocked
+        and pending_deadline_breached(
+            pr.checks, world.now, cfg.ci_pending_max_seconds, cfg.ci_ignore_checks
+        )
+        and (age := pending_age_seconds(pr.checks, world.now, cfg.ci_ignore_checks))
+        is not None
+    )
+
+
 def _escalate_pr(pr: int, reason: str) -> list[Action]:
     """Stop dispatching a stuck PR leg: comment why, then swap ai-pr-open for
     needs-human-review so neither the fixer nor the reviewer re-acts on it."""
@@ -530,9 +633,10 @@ def decide_fix(
 ) -> list[Action]:
     """One fix-watcher poll. Emits, in poll_once order:
 
-      reap (when idle) → at most ONE fixer-consuming dispatch (resolve > resume >
-      address-review > fix-ci, in that priority) → auto-merge (lock-free) →
-      cleanup of merged/closed PRs (lock-free).
+      reap (when idle) → CI pending-deadline escalation (lock-free) → at most
+      ONE fixer-consuming dispatch (resolve > resume > address-review > fix-ci,
+      in that priority) → auto-merge (lock-free) → cleanup of merged/closed PRs
+      (lock-free).
 
     Only ONE fixer-consuming action is ever returned per poll (the single-fixer
     invariant). `fixer_busy` reflects the live run-lock and gates the reap step.
@@ -554,32 +658,22 @@ def decide_fix(
         actions.extend(reap_actions(world))
 
     consumed = fixer_busy
-    # Only the fixer's OWN PRs are actionable here. The reviewer "adopts" rogue PRs
-    # (labels any unlabelled OPEN PR with ai-pr-open so it gets reviewed) — including
-    # PRs opened by humans. But the fixer has a worktree + session ONLY for its own
-    # issue-branch PRs, so dispatching ADDRESS_REVIEW/FIX_CI/REBASE on someone else's
-    # PR does no work (nothing to push) yet still burns a fixer leg and mislabels the
-    # PR ai-blocked (observed: PR #351, opened by a human, adopted for review, then
-    # the fixer commented + blocked it). Gate on authorship: a PR whose author is not
-    # FIX_BOT belongs to a human — leave it for them. An unknown author
-    # (`author == ""`, e.g. a PR whose author field didn't resolve) or an unset
-    # FIX_BOT is treated as NOT-ours EXPLICITLY, by the `p.author and cfg.fix_bot`
-    # guard below. That guard predates the comparison being safe: `login_eq("","")`
-    # used to return True, so with both blank a stranger's PR with an unresolvable
-    # author read as the fixer's own — the exact inversion of the fail-safe this
-    # comment claimed. `login_eq` now returns False when either side is unknown
-    # (review P1R-7), so the two are belt and braces; the explicit guard stays
-    # because a filter this consequential should not depend on a helper's edge
-    # case being read correctly by the next person.
-    # The match goes through `login_eq`, never `==`: a FIX_BOT written with the
-    # `[bot]` suffix would otherwise match NO PR, silently disabling every fixer PR
-    # leg (address-review / fix-ci / rebase / auto-merge) forever (review C1).
-    open_prs = [
-        p for p in world.prs
-        if p.has(Label.AI_PR_OPEN) and p.state == "OPEN"
-        and p.author and cfg.fix_bot
-        and login_eq(p.author, cfg.fix_bot)
-    ]
+    # Only the fixer's OWN PRs are actionable here — see `fixer_prs`.
+    open_prs = list(fixer_prs(world, cfg))
+
+    # 0) CI pending deadline (#30). Lock-free: it dispatches no agent, so unlike
+    # every breaker below it does not read `consumed`, and for a given world it
+    # emits the same actions whether the fixer is busy or idle. It runs FIRST and
+    # REMOVES the stalled PR from `open_prs` so no later pass can act on a PR this
+    # poll is handing to a human — escalating and dispatching the same PR in one
+    # tick would be incoherent, and a PR whose CI is wedged is exactly the one a
+    # rebase/address-review leg cannot help. That filtering imports no lock
+    # dependence (the reason the auto-merge pass below deliberately does NOT
+    # filter this poll's other escalations) precisely because this arm is
+    # lock-free itself.
+    for stall in ci_pending_stalls(world, cfg):
+        actions.extend(_escalate_pr(stall.pr, stall.reason))
+        open_prs = [p for p in open_prs if p.number != stall.pr]
 
     # 1) New ai-ready issue (highest priority).
     if not consumed:

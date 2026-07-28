@@ -155,6 +155,13 @@ class HarnessConfig:
     merge_method: str = "squash"
     ci_ignore_checks: str = ""
     close_issue_on_merge: bool = True
+    # Bound on how long CI may sit PENDING before the PR goes to a human (#30).
+    # CI_IGNORE_CHECKS was the only remedy for a wedged check, and it is a knob,
+    # not a guardrail: it cannot fire on the FIRST occurrence, which is the one
+    # that matters. Default 3600s; 0 disables. Generous on purpose — real
+    # pipelines run well over half an hour and escalating a healthy long run
+    # would move the escalation-rate guardrail the wrong way.
+    ci_pending_max_seconds: int = 3600
     max_ci_retries: int = 3
     # Escalation ceiling for the reviewer: after this many REQUEST_CHANGES verdicts
     # on one PR (counting the reviewer's OWN rejections, NOT author pushes — a
@@ -482,6 +489,9 @@ class HarnessConfig:
         errors: list[str] = list(self.parse_errors)
         _require_positive(errors, "POLL_SECONDS", self.poll_seconds)
         _require_non_negative(errors, "MAX_CI_RETRIES", self.max_ci_retries)
+        _require_non_negative(
+            errors, "CI_PENDING_MAX_SECONDS", self.ci_pending_max_seconds
+        )
         _require_non_negative(errors, "MAX_REVIEW_RETRIES", self.max_review_retries)
         _require_non_negative(errors, "MAX_REBASE_RETRIES", self.max_rebase_retries)
         _require_non_negative(errors, "MAX_RESOLVE_RETRIES", self.max_resolve_retries)
@@ -585,7 +595,9 @@ class HarnessConfig:
             f"review_budget=${self.review_budget_usd:.2f} "
             f"rejections_cap={self.max_review_rejections}",
             f"retry_caps: resolve={self.max_resolve_retries} ci={self.max_ci_retries} "
-            f"review={self.max_review_retries} rebase={self.max_rebase_retries}",
+            f"review={self.max_review_retries} rebase={self.max_rebase_retries} "
+            f"ci_pending="
+            f"{f'{self.ci_pending_max_seconds}s' if self.ci_pending_max_seconds else 'off'}",
             f"timeouts: idle={self.agent_idle_timeout:.0f}s "
             f"wall={self.agent_max_runtime:.0f}s",
             f"spend_caps: issue=${self.issue_spend_cap_usd:.2f} "
@@ -925,6 +937,9 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         auto_merge=_b(e, "AUTO_MERGE", _dc_default("auto_merge"), errors),
         merge_method=e.get("MERGE_METHOD", _dc_default("merge_method")),
         ci_ignore_checks=e.get("CI_IGNORE_CHECKS", _dc_default("ci_ignore_checks")),
+        ci_pending_max_seconds=_coerce_int(
+            e, "CI_PENDING_MAX_SECONDS", _dc_default("ci_pending_max_seconds"), errors
+        ),
         close_issue_on_merge=_b(e, "CLOSE_ISSUE_ON_MERGE", _dc_default("close_issue_on_merge"), errors),
         auto_rebase_conflicts=_b(e, "AUTO_REBASE_CONFLICTS", _dc_default("auto_rebase_conflicts"), errors),
         max_rebase_retries=_coerce_int(e, "MAX_REBASE_RETRIES", _dc_default("max_rebase_retries"), errors),

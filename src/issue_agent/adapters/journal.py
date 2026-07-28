@@ -695,6 +695,19 @@ def hold_keys(events) -> set[str]:
     return _emitted_block_keys(events, "hold")
 
 
+def ci_pending_keys(events) -> set[str]:
+    """The `block_key`s a `ci_pending_deadline` event has ALREADY been emitted for.
+
+    Fourth instance of the same edge-trigger read (#30). A wedged check is a
+    LEVEL — it stays wedged until a human cancels it — and the key carries the
+    PR's HEAD SHA, so a re-push (which starts fresh check runs, and so is a
+    genuinely new stall if it wedges again) reports again while the same stuck
+    run does not. Escalation RATE is a named power guardrail, and a rate counted
+    from duplicated events is not a rate.
+    """
+    return _emitted_block_keys(events, "ci_pending_deadline")
+
+
 def recurrence_keys(events) -> set[str]:
     """The `block_key`s a `recurrence` event has ALREADY been emitted for.
 
@@ -864,6 +877,7 @@ __all__ = [
     "estimate_cost_usd",
     "event_line",
     "events_within",
+    "ci_pending_keys",
     "hold_keys",
     "observed_cost_per_token",
     "parse_ts",
