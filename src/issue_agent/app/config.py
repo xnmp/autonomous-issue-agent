@@ -142,6 +142,10 @@ class CodexRuntimeConfig:
     max_rate_limit_retries: int
     cost_per_mtok_in: float
     cost_per_mtok_out: float
+    # Per-model (model, USD/MTok in, USD/MTok out) overrides; the scalars above
+    # remain the fallback for any model not named here. See
+    # `HarnessConfig.codex_cost_per_mtok`.
+    cost_per_mtok: tuple[tuple[str, float, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -375,6 +379,21 @@ class HarnessConfig:
     # `codex_cost_blindspot_warning` fires at startup instead).
     codex_cost_per_mtok_in: float = 5.0
     codex_cost_per_mtok_out: float = 30.0
+    # PER-MODEL rates, which the two scalars above cannot express (#43). With
+    # difficulty routing live (#8/#21) a deployment runs several models — the
+    # router on the cheap tier, the resolves on whatever tier was classified —
+    # and a flat price makes the tiers indistinguishable in the ledger: a
+    # cheaper model can only show up as FEWER tokens, never as a lower rate,
+    # which is exactly the axis routing moves. CLAUDE.md's routing guardrail
+    # ("split by routed model tier") is unsatisfiable without this.
+    #
+    # `CODEX_COST_PER_MTOK='model=IN/OUT,model=IN/OUT'`, USD per MILLION tokens,
+    # e.g. 'gpt-5.6-luna=1.25/10,gpt-5.6-terra=10/60'. Every leg is priced with
+    # the model it ACTUALLY ran (task.model, or the runner's default when the
+    # task pinned none). A model absent from the table — and the whole knob
+    # when unset — falls back to the scalars above, so an existing deployment
+    # prices exactly as it did before.
+    codex_cost_per_mtok: tuple[tuple[str, float, float], ...] = ()
     # ── spend circuit breakers ────────────────────────────────────────────────
     # Per-agent budgets (MAX_BUDGET_USD et al) bound ONE session; nothing bounded
     # the aggregate, so a leg that retries forever spent without limit while every
@@ -503,6 +522,7 @@ class HarnessConfig:
             max_rate_limit_retries=self.codex_max_rate_limit_retries,
             cost_per_mtok_in=self.codex_cost_per_mtok_in,
             cost_per_mtok_out=self.codex_cost_per_mtok_out,
+            cost_per_mtok=self.codex_cost_per_mtok,
         )
 
     def validation_errors(self) -> tuple[str, ...]:
@@ -767,6 +787,67 @@ def _coerce_float(env: dict, key: str, default: float, errors: list[str]) -> flo
         )
         return default
     return value
+
+
+def _coerce_rate_table(
+    env: dict, key: str, errors: list[str]
+) -> tuple[tuple[str, float, float], ...]:
+    """`'model=IN/OUT,model=IN/OUT'` → an ordered (model, in, out) table (#43).
+
+    Same contract as the other coercions: empty/absent is UNSET (an empty
+    table, i.e. "price everything with the scalar fallback"), and anything
+    malformed is dropped AND named in `errors`, so it surfaces through
+    `validation_errors()` instead of silently mispricing every run on this
+    runtime. Naming the offending entry matters more here than usual — a
+    typo'd model name is otherwise indistinguishable from a model the operator
+    genuinely did not want to override, and both read as "the fallback price",
+    which is the bug this knob exists to fix.
+
+    Rates must be finite and >= 0 for the same reason `_coerce_float` rejects
+    nan/inf: every downstream range check passes for nan, so a nan rate would
+    zero out the ledger and silently disarm both spend caps.
+
+    A model named twice keeps its FIRST entry (lookup scans in order) and the
+    duplicate is reported — "which of my two prices won?" should not be a
+    question an operator has to answer by reading the parser.
+    """
+    raw = env.get(key)
+    if raw is None or not raw.strip():
+        return ()
+    table: list[tuple[str, float, float]] = []
+    seen: set[str] = set()
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        model, sep, rates = entry.partition("=")
+        rate_in, slash, rate_out = rates.partition("/")
+        model = model.strip().casefold()
+        if not (sep and slash and model):
+            errors.append(
+                f"{key} entry {entry!r} must look like 'model=IN/OUT' "
+                f"(USD per million tokens) — ignoring it"
+            )
+            continue
+        try:
+            parsed = (float(rate_in.strip()), float(rate_out.strip()))
+        except ValueError:
+            errors.append(
+                f"{key} entry {entry!r} has non-numeric rates — ignoring it"
+            )
+            continue
+        if not all(math.isfinite(r) and r >= 0 for r in parsed):
+            errors.append(
+                f"{key} entry {entry!r} must have finite, non-negative rates "
+                f"— ignoring it"
+            )
+            continue
+        if model in seen:
+            errors.append(f"{key} names {model!r} more than once — keeping the first")
+            continue
+        seen.add(model)
+        table.append((model, parsed[0], parsed[1]))
+    return tuple(table)
 
 
 def _coerce_identity_mode(env: dict, errors: list[str]) -> IdentityMode:
@@ -1086,6 +1167,7 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         codex_cost_per_mtok_out=_coerce_float(
             e, "CODEX_COST_PER_MTOK_OUT", _dc_default("codex_cost_per_mtok_out"), errors
         ),
+        codex_cost_per_mtok=_coerce_rate_table(e, "CODEX_COST_PER_MTOK", errors),
         issue_spend_cap_usd=_coerce_float(
             e, "ISSUE_SPEND_CAP_USD", _dc_default("issue_spend_cap_usd"), errors
         ),

@@ -396,6 +396,31 @@ def codex_cost_usd(
     return total * max(rate_in, rate_out) / 1_000_000.0
 
 
+def rates_for_model(
+    model: str | None,
+    table: tuple[tuple[str, float, float], ...] | None,
+    *,
+    fallback_in: float,
+    fallback_out: float,
+) -> tuple[float, float]:
+    """Pure: the (in, out) USD-per-MTok rates to price ONE leg with (#43).
+
+    `table` is `CODEX_COST_PER_MTOK` — the per-model overrides. A model the
+    table does not name, an empty table, or a leg whose model is unknown all
+    fall back to the scalars, so a deployment that never sets the table prices
+    exactly as it did before this existed.
+
+    Matched casefolded because the table is stored casefolded and a model id is
+    case-insensitive identity; scanned in order so the first entry for a name
+    wins (see `_coerce_rate_table`, which refuses to store a second)."""
+    key = (model or "").strip().casefold()
+    if key:
+        for name, rate_in, rate_out in table or ():
+            if name == key:
+                return rate_in, rate_out
+    return fallback_in, fallback_out
+
+
 def codex_cost_blindspot_warning(
     *,
     cost_per_mtok_in: float,
@@ -588,10 +613,24 @@ class CodexRunner(AgentRuntime):
     # startup. Set them and every codex run becomes visible to both spend caps.
     cost_per_mtok_in: float = 0.0
     cost_per_mtok_out: float = 0.0
+    # PER-MODEL overrides of the two scalars above (#43): (model, in, out), USD
+    # per MILLION tokens. Each leg is priced with the model it actually ran
+    # (`task.model or self.default_model`), so a routed deployment's ledger can
+    # be split by tier. Empty (the default) → the scalars price everything,
+    # unchanged.
+    cost_per_mtok: tuple[tuple[str, float, float], ...] = ()
 
     def __post_init__(self) -> None:
         self._log = self.log or (lambda _m: None)
         self._wall_clock = self.wall_clock or time.time
+
+    def _resolved_model(self, task: AgentTask) -> str:
+        """The model this leg ACTUALLY runs on. An unpinned task carries
+        model=None and codex is invoked with the runner's default, so anything
+        that reports or prices a leg — commit attribution, the exec log, the
+        rate table, the journal — has to ask here rather than read task.model
+        and get None (#43)."""
+        return task.model or self.default_model
 
     def _pump_slice(self) -> float:
         """How long one stderr-readline chunk blocks. The poll slice floored by
@@ -679,7 +718,14 @@ class CodexRunner(AgentRuntime):
         with tempfile.TemporaryDirectory(
             prefix="codex-run-", ignore_cleanup_errors=True
         ) as tmpdir:
-            return await self._run_in(task, tmpdir)
+            result = await self._run_in(task, tmpdir)
+        # Stamp the model on EVERY exit path — including the aborted ones, which
+        # build their AgentResult by hand and are precisely the runs whose cost
+        # is estimated rather than measured (#43). Done once here rather than at
+        # each construction site so a new return path cannot forget it.
+        from dataclasses import replace as _replace
+
+        return _replace(result, model=result.model or self._resolved_model(task))
 
     async def _run_in(self, task: AgentTask, tmpdir: str) -> AgentResult:
         """The retry loop, given a scratch dir whose lifetime `run` owns."""
@@ -840,15 +886,16 @@ class CodexRunner(AgentRuntime):
         loop above owns only retry policy."""
         import asyncio
 
+        model = self._resolved_model(task)
         # Commit attribution: author/committer name carries the effective model.
         # Below self.env/task.env so an explicit override stays an override.
         proc_env = {
             **os.environ,
-            **git_identity_env(task.model or self.default_model),
+            **git_identity_env(model),
             **self.env,
             **task.env,
         }
-        self._log(f"codex: exec model={task.model or self.default_model} cwd={task.cwd or '.'}")
+        self._log(f"codex: exec model={model} cwd={task.cwd or '.'}")
         # Set cwd on the subprocess too, not only via `-C`: the resume subcommand
         # rejects `-C`, so this is how a resumed run still executes in the worktree
         # (harmless on the exec path — it matches the `-C` we also pass there).
@@ -1043,13 +1090,18 @@ class CodexRunner(AgentRuntime):
         # session has nothing pre-paid in its counter.
         if usage_baseline is not None and session_id == usage_baseline[0]:
             rollout_usage = usage_delta(rollout_usage, usage_baseline[1])
+        # #43: price THIS leg with the model it ran on, not with one flat rate.
+        rate_in, rate_out = rates_for_model(
+            model, self.cost_per_mtok,
+            fallback_in=self.cost_per_mtok_in, fallback_out=self.cost_per_mtok_out,
+        )
         result = parse_codex_envelope(
             exit_code=exit_code,
             last_message=last_message,
             session_id=session_id,
             stderr=stderr,
-            cost_per_mtok_in=self.cost_per_mtok_in,
-            cost_per_mtok_out=self.cost_per_mtok_out,
+            cost_per_mtok_in=rate_in,
+            cost_per_mtok_out=rate_out,
             usage=rollout_usage,
         )
         if exit_code < 0 and not hung:

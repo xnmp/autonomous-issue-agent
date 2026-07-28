@@ -785,6 +785,81 @@ def test_codex_pricing_can_be_switched_off_explicitly():
     assert c.validation_errors() == ()
 
 
+# ── #43: a PER-MODEL codex rate table ────────────────────────────────────────
+# Routing moves price, not just token count, so a single flat rate makes the
+# routed tiers indistinguishable in the ledger — which is exactly the split
+# CLAUDE.md's routing guardrail asks for.
+
+
+def test_the_rate_table_parses_a_model_per_entry():
+    c = from_env({
+        "REPO": "x", "FIX_BOT": "fix-bot",
+        "CODEX_COST_PER_MTOK": "gpt-5.6-luna=1.25/10,gpt-5.6-terra=10/60",
+    })
+    assert c.codex_cost_per_mtok == (
+        ("gpt-5.6-luna", 1.25, 10.0), ("gpt-5.6-terra", 10.0, 60.0),
+    )
+    assert c.codex_runtime.cost_per_mtok == c.codex_cost_per_mtok
+    assert c.validation_errors() == ()
+
+
+def test_an_unset_rate_table_is_empty_and_changes_nothing():
+    """The knob is additive: an existing deployment prices exactly as before."""
+    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot"})
+    assert c.codex_cost_per_mtok == ()
+    assert c.validation_errors() == ()
+    assert from_env({
+        "REPO": "x", "FIX_BOT": "fix-bot", "CODEX_COST_PER_MTOK": "   ",
+    }).codex_cost_per_mtok == ()
+
+
+def test_whitespace_and_trailing_separators_in_the_rate_table_are_tolerated():
+    c = from_env({
+        "REPO": "x", "FIX_BOT": "fix-bot",
+        "CODEX_COST_PER_MTOK": " gpt-5.6-luna = 1.25 / 10 , ,",
+    })
+    assert c.codex_cost_per_mtok == (("gpt-5.6-luna", 1.25, 10.0),)
+    assert c.validation_errors() == ()
+
+
+def test_a_malformed_rate_entry_is_named_and_fails_validation():
+    """A silently-dropped entry is indistinguishable from a model the operator
+    did not mean to override — both read as 'the fallback price', which is the
+    bug this knob exists to fix."""
+    c = from_env({
+        "REPO": "x", "FIX_BOT": "fix-bot",
+        "CODEX_COST_PER_MTOK": "gpt-5.6-luna,gpt-5.6-terra=10/60",
+    })
+    errors = c.validation_errors()
+    assert any("gpt-5.6-luna" in e for e in errors), errors
+    assert c.codex_cost_per_mtok == (("gpt-5.6-terra", 10.0, 60.0),), (
+        "the well-formed entries survive"
+    )
+
+
+@pytest.mark.parametrize("raw", [
+    "gpt-5.6-luna=abc/10",     # non-numeric
+    "gpt-5.6-luna=1.25",       # no output rate
+    "gpt-5.6-luna=1.25/-3",    # negative
+    "gpt-5.6-luna=nan/10",     # nan passes every downstream range check
+    "gpt-5.6-luna=inf/10",
+    "=1.25/10",                # no model
+])
+def test_malformed_rate_entries_never_reach_the_table(raw):
+    c = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "CODEX_COST_PER_MTOK": raw})
+    assert c.codex_cost_per_mtok == ()
+    assert any(raw.strip() in e for e in c.validation_errors()), c.validation_errors()
+
+
+def test_a_model_priced_twice_keeps_the_first_and_says_so():
+    c = from_env({
+        "REPO": "x", "FIX_BOT": "fix-bot",
+        "CODEX_COST_PER_MTOK": "gpt-5.6-luna=1.25/10,GPT-5.6-Luna=99/99",
+    })
+    assert c.codex_cost_per_mtok == (("gpt-5.6-luna", 1.25, 10.0),)
+    assert any("more than once" in e for e in c.validation_errors())
+
+
 def test_agent_env_file_is_loaded_with_shell_expansion(tmp_path):
     env_file = tmp_path / "agent.env"
     env_file.write_text(

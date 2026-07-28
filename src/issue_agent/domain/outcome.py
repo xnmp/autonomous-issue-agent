@@ -172,6 +172,15 @@ class AgentResult:
     summary: str = ""       # structured_output.summary / .result
     needs: str = ""         # structured_output.needs
     cost_usd: float = 0.0
+    # The model that ACTUALLY ran this leg, when the runtime knows it. Blank
+    # means "not reported", and every reader falls back to the task's own model
+    # exactly as it did before this field existed. It exists because a task can
+    # pin no model at all and let the runtime supply its default — codex does
+    # this on every unrouted leg — so `task.model` is None for a run that
+    # certainly ran on SOMETHING, and the journal recorded no model for it.
+    # CLAUDE.md's routing guardrail is "split by routed model tier", which that
+    # blank makes impossible (#43).
+    model: str = ""
     session_id: str = ""
     structured: dict | None = None  # the full structured_output (any schema)
     # WHY the session ended. None = unclassified (a legacy/hand-built result, or a
