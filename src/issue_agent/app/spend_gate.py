@@ -1,4 +1,15 @@
-"""The daily spend breakers: which one tripped, and the numbers that tripped it.
+"""The daily spend breakers, evaluated BEFORE a tick observes anything (#27).
+
+Both daily caps are LEVELS that heal by themselves at 00:00 UTC, and both are
+answerable from a local file (`adapters.journal.sum_today`) with no network call
+at all. Checking them at DISPATCH time — after the world build, after decide,
+after the `Relabel` that claims the issue — was therefore pure waste: the claim
+landed, the dispatch was refused, no session started, the reaper requeued the
+orphan on the next tick, and the orphaned `ai-working` label also made
+`domain.world.fix_probe_safe` false, so the cheap change-probe was skipped and a
+full ~14-point GraphQL world build ran every 20s while the daemon was, by
+definition, doing nothing (#27: ~2,520 points/hour against a 5,000-point pool,
+plus 360 label writes/hour, per capped daemon).
 
 Two caps, two scopes (#32):
 
@@ -14,6 +25,7 @@ not be charged to an arbitrary one, but it is still real money off the box.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from ..adapters.journal import sum_today
@@ -97,3 +109,31 @@ def read_daily_cap_breach(
         global_spent=sum_today(ledger_path, **kwargs) if global_cap > 0 else 0.0,
         global_cap=global_cap,
     )
+
+
+def build_daily_spend_gate(
+    ledger_path: str,
+    *,
+    repo: str,
+    repo_cap: float,
+    global_cap: float,
+    now_fn=None,
+) -> Callable[[], str | None] | None:
+    """A `Daemon.tick_gate`: returns the block message while a daily cap is
+    tripped, None otherwise. None instead of a gate when neither cap is armed —
+    an unarmed daemon must not pay a ledger read per poll.
+    """
+    if not ledger_path or (repo_cap <= 0 and global_cap <= 0):
+        return None
+
+    def gate() -> str | None:
+        breach = read_daily_cap_breach(
+            ledger_path,
+            repo=repo,
+            repo_cap=repo_cap,
+            global_cap=global_cap,
+            now_fn=now_fn,
+        )
+        return breach.message if breach is not None else None
+
+    return gate

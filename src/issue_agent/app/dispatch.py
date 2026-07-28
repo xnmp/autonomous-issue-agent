@@ -324,8 +324,15 @@ class AgentDispatcher:
         change. It is a LEVEL-triggered condition, not an event: the money comes
         back at midnight UTC, and marking each blocked issue needs-human-review
         would leave a human to hand-unwind a dozen labels the next morning for a
-        condition that healed itself. Instead the dispatch is skipped loudly, the
-        reaper requeues the issue, and the next tick re-evaluates.
+        condition that healed itself.
+
+        This is now the BACKSTOP for the daily caps, not the primary check: the
+        churn it accepted ("one no-op dispatch attempt per issue per poll") was
+        never free, because reaching here already cost a world build and the
+        claim relabel (#27). `app.spend_gate` front-runs it at the top of the
+        tick, so in a correctly wired daemon this arm should rarely fire. It
+        stays because a DispatchConfig can be built without a gate, and a
+        breaker with one enforcement point is a breaker with none.
         """
         path = self.cfg.spend_ledger_path
         if not path:

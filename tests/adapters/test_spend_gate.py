@@ -1,4 +1,5 @@
-"""The daily spend caps: which one tripped, and over whose spend (#32)."""
+"""The daily spend caps: which one tripped, over whose spend (#32), and the
+pre-observe tick gate that reads them (#27)."""
 
 import json
 from datetime import datetime, timedelta, timezone
@@ -6,7 +7,11 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from issue_agent.adapters.journal import sum_today
-from issue_agent.app.spend_gate import daily_cap_breach, read_daily_cap_breach
+from issue_agent.app.spend_gate import (
+    build_daily_spend_gate,
+    daily_cap_breach,
+    read_daily_cap_breach,
+)
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
 
@@ -161,3 +166,34 @@ def test_a_missing_ledger_file_trips_nothing(tmp_path):
 
 def test_read_daily_cap_breach_without_a_ledger_path_is_inert():
     assert read_daily_cap_breach("", repo="o/r", repo_cap=50.0, global_cap=1.0) is None
+
+
+# ── build_daily_spend_gate (the Daemon.tick_gate, #27) ────────────────────────
+def test_the_gate_reports_the_block_message_while_a_cap_is_tripped(tmp_path):
+    path = _ledger(tmp_path, _spend(60.0, repo="o/r"))
+    gate = build_daily_spend_gate(
+        path, repo="o/r", repo_cap=50.0, global_cap=0.0, now_fn=lambda: NOW
+    )
+    assert "DAILY_SPEND_CAP_USD" in gate()
+
+
+def test_the_gate_clears_at_the_utc_rollover(tmp_path):
+    """A gate that never cleared would be an off switch, not a pause."""
+    path = _ledger(tmp_path, _spend(60.0, repo="o/r", at=NOW))
+    clock = {"now": NOW}
+    gate = build_daily_spend_gate(
+        path, repo="o/r", repo_cap=50.0, global_cap=0.0, now_fn=lambda: clock["now"]
+    )
+    assert gate() is not None
+    clock["now"] = NOW + timedelta(days=1)
+    assert gate() is None
+
+
+def test_no_gate_is_built_when_neither_cap_is_armed(tmp_path):
+    """An unarmed daemon must not pay a ledger read per poll."""
+    path = _ledger(tmp_path, _spend(9_999.0))
+    assert build_daily_spend_gate(path, repo="o/r", repo_cap=0.0, global_cap=0.0) is None
+
+
+def test_no_gate_is_built_without_a_ledger():
+    assert build_daily_spend_gate("", repo="o/r", repo_cap=50.0, global_cap=0.0) is None
