@@ -340,6 +340,43 @@ if command -v gh >/dev/null 2>&1; then
         fi
       fi
     fi
+
+    # ── Adopt-unlabeled + auto-merge over THIRD-PARTY PRs (#45) ──────────────
+    # REVIEW_ADOPT_UNLABELED=1 (the DEFAULT — app/config.py's
+    # review_adopt_unlabeled is True) makes the reviewer pull EVERY open PR, not
+    # only the ones the harness labelled. Sound alone: a PR that bypassed the
+    # pipeline is still seen. Composed with AUTO_MERGE=1 (also the default) it
+    # means approving and MERGING a PR the harness did not author, into the base
+    # branch, with no human in the loop. It has already happened: the reviewer
+    # dispatched REVIEW #486 (dependabot) unprompted on tauri-explorer,
+    # 2026-07-26, on a repo carrying an open dependabot queue.
+    #
+    # bad, not warn: the outcome is an unreviewed third-party merge, it is
+    # silent, and the harness cannot undo it. Silent when every open PR is the
+    # harness's own (or there are none) — that is the configuration the default
+    # was designed for and it must not nag.
+    if [ "${REVIEW_ADOPT_UNLABELED:-1}" = "1" ] && [ "${AUTO_MERGE:-1}" = "1" ]; then
+      _nfix_author="$(_normalize_login "${FIX_BOT:-}")"
+      _foreign=""; _foreign_n=0
+      while IFS= read -r _author; do
+        [ -n "$_author" ] || continue
+        # GitHub reports an App author as `app/dependabot` on some surfaces and
+        # `dependabot[bot]` on others; strip the prefix, then compare through
+        # the ONE login comparison doctor has (which strips `[bot]`).
+        _cmp="$(_normalize_login "${_author#app/}")"
+        [ -n "$_nfix_author" ] && [ "$_cmp" = "$_nfix_author" ] && continue
+        _foreign_n=$((_foreign_n+1))
+        case " $_foreign " in
+          *" $_author "*) ;;
+          *) _foreign="$_foreign $_author" ;;
+        esac
+      done <<< "$(gh pr list -R "$REPO" --state open --limit 100 \
+                    --json author,number --jq '.[].author.login' 2>/dev/null)"
+      _foreign="${_foreign# }"
+      if [ "$_foreign_n" -gt 0 ]; then
+        bad "$REPO has $_foreign_n open PR(s) NOT authored by FIX_BOT (${FIX_BOT:-unset}): $_foreign — and REVIEW_ADOPT_UNLABELED=1 + AUTO_MERGE=1 means the reviewer adopts every open PR and an approval auto-merges it into '${BASE_BRANCH:-dev}' with no human in the loop. Set REVIEW_ADOPT_UNLABELED=0 in config/repos/<name>.env so only PRs the harness labelled are reviewed."
+      fi
+    fi
   fi
 else
   bad "gh missing"
