@@ -63,6 +63,31 @@ the next deployment day before stacking further changes:
 State the pair explicitly in any efficiency PR: the metric it moves, the
 guardrail it must not move, and the measurement that will decide it.
 
+## The manager role (babysitting a deployment)
+
+Whoever babysits a deployment — today an interactive session, eventually the
+#11 daemon — owns this lifecycle. Scope boundary: everything here is
+**reversible or additive** (comments, labels, restarts, filed issues, reports);
+the moment a fix needs harness code, file an issue with journal evidence and
+stop. Never self-modify mid-batch.
+
+- **Before**: triage doctor output with judgment (a red preflight can be a
+  false positive — verify independently before overriding, and file the gap);
+  restore caps and regenerate stale env snapshots; populate newly-landed
+  knobs; pick the batch (seam inside TEST_CMD coverage, no existing closing
+  PRs, overlap-disjoint — the steward proposes under #15, the manager approves).
+- **During**: detect and restart dead daemons; investigate wedged legs before
+  killing; answer `status=blocked` clarification questions (evidence
+  unproducible from a worktree/CI → scope it to operator post-verification;
+  genuine product ambiguity → escalate to the human, don't guess); verify
+  first contact of recently-landed harness changes; flag anomalies with
+  restraint — an expensive-but-in-cap leg is data, not an incident.
+- **After**: file surfaced issues with evidence; produce the batch readout
+  ($/merge, first-pass rate, cost mix by leg, guardrail deltas — the numbers
+  the Direction section requires before stacking changes); hand the operator a
+  single loose-ends list (post-deploy verifications, label surgery the
+  classifier reserves, superseded PRs).
+
 ## Pointing the harness at a repo
 
 Two equivalent entry points:
