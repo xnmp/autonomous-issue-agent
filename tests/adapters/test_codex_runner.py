@@ -25,6 +25,7 @@ from issue_agent.adapters.codex_runner import (
     _session_id_from_lines,
     _strict_schema,
     build_codex_argv,
+    codex_budget_not_enforced_warning,
     codex_cost_blindspot_warning,
     codex_cost_usd,
     rates_for_model,
@@ -1320,6 +1321,41 @@ def test_blindspot_warning_still_fires_on_a_half_configured_price_table():
         cost_per_mtok_in=1.25, cost_per_mtok_out=0.0,
         issue_spend_cap_usd=25.0, daily_spend_cap_usd=0.0,
     ) is not None
+
+
+# ── #29: "MAX_BUDGET_USD bounds nothing here" must not hide behind pricing ────
+# The clause used to live inside the blindspot warning, which returns early once
+# rates are set — so the operators who had configured pricing CORRECTLY were the
+# only ones who never saw it. Observed on keifu 2026-07-28: a $28.74 resolve
+# against MAX_BUDGET_USD=20, exit_reason=ok, and zero grep matches in the logs.
+
+
+def test_the_budget_warning_fires_even_when_pricing_is_fully_configured():
+    w = codex_budget_not_enforced_warning(fix_budget_usd=20.0, max_runtime=3600.0)
+    assert w is not None
+    assert "MAX_BUDGET_USD=$20.00" in w and "NOT ENFORCED" in w
+    assert "3600s" in w
+
+
+def test_the_budget_warning_is_independent_of_the_price_table():
+    """The two surfaces answer different questions; configuring one must not
+    silence the other."""
+    priced = dict(cost_per_mtok_in=1.25, cost_per_mtok_out=10.0,
+                  issue_spend_cap_usd=25.0, daily_spend_cap_usd=50.0)
+    assert codex_cost_blindspot_warning(**priced) is None
+    assert codex_budget_not_enforced_warning(
+        fix_budget_usd=20.0, max_runtime=3600.0
+    ) is not None
+
+
+def test_the_budget_warning_names_the_missing_wall_cap():
+    w = codex_budget_not_enforced_warning(fix_budget_usd=20.0, max_runtime=0.0)
+    assert w is not None and "CODEX_MAX_RUNTIME_SECONDS is unset" in w
+
+
+def test_no_budget_warning_when_no_budget_is_configured():
+    # Anti-vacuity: with no budget set there is no number being misreported.
+    assert codex_budget_not_enforced_warning(fix_budget_usd=0.0, max_runtime=3600.0) is None
 
 
 # ── #43: each leg is priced with the model it actually ran ───────────────────

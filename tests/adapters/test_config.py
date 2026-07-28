@@ -860,6 +860,38 @@ def test_a_model_priced_twice_keeps_the_first_and_says_so():
     assert any("more than once" in e for e in c.validation_errors())
 
 
+# ── #29: describe() must not claim a bound codex cannot honour ───────────────
+
+
+def test_describe_flags_the_fix_budget_as_unenforced_on_codex():
+    """`fix_budget=$20.00` was printed on every codex boot while a resolve ran
+    to $28.74 and exited `ok` — the startup log asserting a guarantee the
+    runtime cannot make."""
+    d = from_env({
+        "REPO": "o/r", "FIXER_RUNTIME": "codex", "MAX_BUDGET_USD": "20",
+        "AGENT_MAX_RUNTIME_SECONDS": "3600",
+    }).describe()
+    assert "fix_budget=$20.00" in d
+    assert "NOT ENFORCED on codex" in d and "3600s" in d
+
+
+def test_describe_says_nothing_bounds_a_codex_run_without_a_wall_cap():
+    d = from_env({
+        "REPO": "o/r", "FIXER_RUNTIME": "codex", "MAX_BUDGET_USD": "20",
+        "AGENT_MAX_RUNTIME_SECONDS": "0",
+    }).describe()
+    assert "NOT ENFORCED on codex" in d
+    assert "AGENT_MAX_RUNTIME_SECONDS is unset" in d
+
+
+def test_describe_leaves_the_fix_budget_unqualified_on_the_sdk_runtime():
+    """Anti-vacuity: claude DOES enforce the per-session budget, so the caveat
+    must not follow the number everywhere."""
+    d = from_env({"REPO": "o/r", "MAX_BUDGET_USD": "20"}).describe()
+    assert "fix_budget=$20.00" in d
+    assert "NOT ENFORCED" not in d
+
+
 def test_agent_env_file_is_loaded_with_shell_expansion(tmp_path):
     env_file = tmp_path / "agent.env"
     env_file.write_text(
