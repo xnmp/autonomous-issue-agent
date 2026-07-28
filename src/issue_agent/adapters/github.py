@@ -55,6 +55,19 @@ _GH_TIMEOUT_S = 120.0
 # below makes a hit LOUD instead of silent (P0.7).
 _LIST_LIMIT = 500
 
+# Cap on the CLOSED `ai-pr-open` slice the fix world adds for merge cleanup
+# (#28). Deliberately much smaller than _LIST_LIMIT: every number here costs a
+# `gh issue view`, and on a repo that ran the harness before the fix landed the
+# set is a BACKLOG of stuck issues, not a working set. Newest-first (gh's
+# default order), so a backlog deeper than the cap is worked off newest-first
+# over consecutive polls. `domain.fix.orphaned_cleanup_actions` is what makes
+# that terminate: it relabels each observed issue to ai-done, which removes
+# ai-pr-open and drops it out of this query for good. Without that arm this
+# slice would re-fetch the same stuck issues every poll forever. Matches the
+# shape of build_steward_world's closed ai-done slice (also 100). Steady state
+# is an empty set and one cheap list call.
+_CLOSED_CLEANUP_LIMIT = 100
+
 # Inline review comments pulled per PR (port of agent/address-review.sh:41's
 # `.[-8:]`) — the NEWEST 8. A bound is required: the whole list is pasted into a
 # prompt, and an unbounded paste is how a long review thread blows the context
@@ -148,19 +161,21 @@ def _cap_bytes(text: str, max_bytes: int) -> str:
     return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
-def _warn_if_list_truncated(query: str, count: int) -> None:
-    """Emit a loud stderr warning when a `gh … list` call returns exactly
-    `_LIST_LIMIT` items. Unlike the fail-soft gh-error path (transient, re-derived
-    next tick), a truncated listing recurs every poll and drops the same items
-    every time until an operator raises `_LIST_LIMIT` or pagination ships — so
-    this is intentionally NOT swallowed."""
-    if count == _LIST_LIMIT:
+def _warn_if_list_truncated(query: str, count: int, limit: int = _LIST_LIMIT) -> None:
+    """Emit a loud stderr warning when a `gh … list` call returns exactly as many
+    items as it asked for. Unlike the fail-soft gh-error path (transient,
+    re-derived next tick), a truncated listing recurs every poll and drops the
+    same items every time until an operator raises the cap or pagination ships —
+    so this is intentionally NOT swallowed. `limit` is a parameter because not
+    every world-building list uses `_LIST_LIMIT` (the closed ai-pr-open cleanup
+    slice is capped far lower — see `_CLOSED_CLEANUP_LIMIT`)."""
+    if count == limit:
         import sys
 
         sys.stderr.write(
-            f"WARNING: {query} returned {count} items (== --limit {_LIST_LIMIT}) — "
+            f"WARNING: {query} returned {count} items (== --limit {limit}) — "
             "results may be TRUNCATED; oldest items silently dropped this poll. "
-            "Raise _LIST_LIMIT or add pagination.\n"
+            "Raise the limit or add pagination.\n"
         )
 
 
@@ -374,6 +389,8 @@ def parse_issue(d: dict) -> IssueView:
         author=author or "",
         # gh issue state is "OPEN"/"CLOSED"; WorldState uses lower-case open/closed.
         state=(d.get("state", "open") or "open").lower(),
+        # Same normalisation as `issue_state_reason` (GraphQL serves REOPENED).
+        state_reason=str(d.get("stateReason") or "").lower(),
         # File paths the body names in backticks → the file-overlap gate.
         declared_paths=extract_declared_paths(body),
     )
@@ -627,18 +644,22 @@ class GitHubGateway:
         return json.loads(out) if out.strip() else None
 
     # ── reads ──
-    def list_issue_numbers(self, label: str, state: str = "open") -> list[int]:
+    def list_issue_numbers(
+        self, label: str, state: str = "open", limit: int = _LIST_LIMIT
+    ) -> list[int]:
         data = self._gh_json(
             ["issue", "list", "--repo", self.repo, "--label", label,
-             "--state", state, "--json", "number", "--limit", str(_LIST_LIMIT)]
+             "--state", state, "--json", "number", "--limit", str(limit)]
         ) or []
-        _warn_if_list_truncated(f"gh issue list --label {label} --state {state}", len(data))
+        _warn_if_list_truncated(
+            f"gh issue list --label {label} --state {state}", len(data), limit
+        )
         return [int(i["number"]) for i in data]
 
     def get_issue(self, number: int) -> IssueView:
         d = self._gh_json(
             ["issue", "view", str(number), "--repo", self.repo, "--json",
-             "number,title,body,labels,comments,updatedAt,author,state"]
+             "number,title,body,labels,comments,updatedAt,author,state,stateReason"]
         )
         return parse_issue(d)  # type: ignore[arg-type]
 
@@ -873,8 +894,9 @@ class GitHubGateway:
         return parse_closing_refs(data)
 
     def build_world(self) -> WorldState:
-        """Fetch the slice the daemons need: ai-ready/ai-working/ai-blocked issues
-        and ai-pr-open PRs (open + recently merged/closed for cleanup). Composed
+        """Fetch the slice the daemons need: ai-ready/ai-working/ai-blocked/
+        ai-pr-open issues (the last one open AND closed — see below) and
+        ai-pr-open PRs (open + recently merged/closed for cleanup). Composed
         from the typed reads above so it's exercised by the gateway tests.
 
         `GhUnavailable` PROPAGATES out of here (all four world builders): a
@@ -884,11 +906,32 @@ class GitHubGateway:
         world of V10 is unreachable rather than merely unlikely."""
         issue_numbers: set[int] = set()
         ready_numbers: set[int] = set()
-        for lbl in ("ai-ready", "ai-working", "ai-blocked"):
+        for lbl in ("ai-ready", "ai-working", "ai-blocked", "ai-pr-open"):
             nums = self.list_issue_numbers(lbl)
             issue_numbers.update(nums)
             if lbl == "ai-ready":
                 ready_numbers.update(nums)
+        # …and the CLOSED `ai-pr-open` issues (#28). The merge cleanup arm is
+        # gated on OBSERVING the issue still carrying ai-pr-open in the same
+        # snapshot as its merged PR (`_issue_carries_ai_pr_open`, review P1R-15
+        # — it must not stomp a fresh dispatch). But `Fixes #n` is MANDATORY in
+        # every harness PR body (check-pr.sh), so GitHub closes the issue at the
+        # instant of merge; by the next poll the issue was in neither the open
+        # slice above nor any closed slice, the gate read False, and the
+        # ai-pr-open→ai-done relabel that would have made it visible again never
+        # ran. Self-reinforcing: zero issues ever reached ai-done, the #10
+        # recurrence guardrail could never fire, and RemoveWorktree/ClearIssueState
+        # never ran (24 stale worktrees / 2.3 GB observed). Fetching the closed
+        # half makes the stuck state OBSERVABLE without touching the gate; the
+        # REPAIR is `domain.fix.orphaned_cleanup_actions`, which is also what
+        # drains this query (an unlabelled merged PR is invisible, so the
+        # PR-driven arm alone could never reach a pre-existing backlog).
+        # The OPEN half of the same label is in the loop above for the
+        # symmetric reason: a CLOSED-unmerged PR leaves its issue open+ai-pr-open,
+        # and the requeue-to-ai-ready arm was invisible in exactly the same way.
+        issue_numbers.update(
+            self.list_issue_numbers("ai-pr-open", "closed", _CLOSED_CLEANUP_LIMIT)
+        )
         pr_states: dict[int, str] = {}
         for state in ("open", "all"):
             for n, s in self.list_pr_states("ai-pr-open", state):
