@@ -108,7 +108,9 @@ def pending_deadline_breached(
     return age is not None and age >= max_seconds
 
 
-def ci_state(checks: Iterable[Check], ignore_regex: str = "") -> CIState:
+def ci_state(
+    checks: Iterable[Check], ignore_regex: str = "", *, known: bool = True
+) -> CIState:
     """Settled CI state for a PR's checks.
 
     Port of watcher-lib.sh:ci_state. CI_IGNORE_CHECKS (an extended-regex of
@@ -116,12 +118,20 @@ def ci_state(checks: Iterable[Check], ignore_regex: str = "") -> CIState:
     queued forever on a starved runner can't pin us at `pending` and deadlock
     fix-CI + auto-merge. Real failures on any non-ignored check still count.
 
+    `known=False` (pass `pr.checks_known`) says the checks were never READ this
+    tick — the fetch failed, so `checks` is not an observation. That is UNKNOWN,
+    which matches no gate: not (OK, NONE) so merge-adjacent actions hold, and
+    not FAILURE so no repair leg is dispatched off an unread world (#48).
+
     Precedence is the whole point:
+      unread fetch → unknown
       empty (after ignore) → none
       any pending/QUEUED/IN_PROGRESS → pending   (OUTRANKS failure)
       any fail bucket → failure
       else → ok
     """
+    if not known:
+        return CIState.UNKNOWN
     kept = _kept(checks, ignore_regex)
     if not kept:
         return CIState.NONE
