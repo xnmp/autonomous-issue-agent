@@ -54,6 +54,7 @@ from .dispatch import AgentDispatcher, DispatchConfig
 from .execute import Executor
 from .loop import Daemon
 from .mcp import mcp_servers_from_file
+from .spend_gate import build_daily_spend_gate
 
 
 def _log(name: str):
@@ -86,6 +87,19 @@ def _spend_cfg(cfg: HarnessConfig, role: str, ledger: str) -> dict:
         "global_daily_spend_cap_usd": cfg.global_daily_spend_cap_usd,
         "alert_cmd": cfg.alert_cmd,
     }
+
+
+def _spend_gate(cfg: HarnessConfig, ledger: str):
+    """The daily caps as a `Daemon.tick_gate` — checked before observe, so a
+    capped daemon costs no GraphQL quota and writes no labels (#27). Every role
+    that can dispatch a paid run gets one; all three share the DispatchConfig
+    caps, so all three are gated."""
+    return build_daily_spend_gate(
+        ledger,
+        repo=cfg.repo,
+        repo_cap=cfg.daily_spend_cap_usd,
+        global_cap=cfg.global_daily_spend_cap_usd,
+    )
 
 
 def _process_deaths(store: Store) -> dict[int, int]:
@@ -445,7 +459,8 @@ def build_fix_daemon(
         return decide_fix(world, fix_cfg, _fix_state(store, world), fixer_busy())
 
     return Daemon("fix", gateway.build_world, decide, executor, cfg.poll_seconds,
-                  _log("fix"), journal=journal)
+                  _log("fix"), journal=journal,
+                  tick_gate=_spend_gate(cfg, ledger))
 
 
 def _review_state(store: Store, world) -> ReviewState:
@@ -540,7 +555,8 @@ def build_review_daemon(
         return decide_review(world, rcfg, _review_state(store, world))
 
     return Daemon("review", gateway.build_review_world, decide, executor,
-                  cfg.poll_seconds, _log("review"), journal=journal)
+                  cfg.poll_seconds, _log("review"), journal=journal,
+                  tick_gate=_spend_gate(cfg, ledger))
 
 
 _CODEOWNERS_PATHS = ("CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS")
@@ -690,4 +706,4 @@ def build_steward_daemon(
     # alone needs just open issues.
     observe = gateway.build_steward_world if jira_on else gateway.build_triage_world
     return Daemon("steward", observe, decide, executor, cfg.poll_seconds, steward_log,
-                  journal=journal)
+                  journal=journal, tick_gate=_spend_gate(cfg, ledger))

@@ -1116,3 +1116,109 @@ def test_a_malformed_glm_profile_is_not_ready_rather_than_a_traceback(tmp_path, 
 
     assert "glm: NOT READY at startup" in capsys.readouterr().err
     assert daemon.name == "fix"
+
+
+# ── #27/#32: the daily caps gate the TICK, not the dispatch ──────────────────
+# Driven through the real `build_*_daemon` wiring and the real `Daemon.tick`,
+# because the defect was in HOW the loop reached the check, not in the check —
+# the pre-fix code reported the block faithfully on every one of the ticks it
+# should never have run.
+
+
+class _ObservingGateway(FakeGateway):
+    """FakeGateway that counts world builds — the thing #27 was paying for."""
+
+    def __init__(self):
+        super().__init__()
+        self.observations = 0
+
+    def _seen(self):
+        self.observations += 1
+        return WorldState()
+
+    build_world = _seen
+    build_review_world = _seen
+    build_triage_world = _seen
+    build_steward_world = _seen
+
+
+def _today_spend(cost, repo="o/r"):
+    return {"ts": datetime.now(timezone.utc).isoformat(), "event": "spend",
+            "repo": repo, "issue": 5, "kind": "RESOLVE", "cost_usd": cost}
+
+
+def _capped_daemons(tmp_path, monkeypatch, ledger_entries, **cfg_kw):
+    from issue_agent.app import roles
+    from issue_agent.app.config import HarnessConfig
+
+    ledger = tmp_path / "spend.jsonl"
+    ledger.write_text("".join(json.dumps(e) + "\n" for e in ledger_entries))
+    monkeypatch.setattr(roles, "default_ledger_path", lambda: str(ledger))
+    monkeypatch.setattr(
+        roles, "_journal",
+        lambda _s: Journal(os.path.join(str(tmp_path), "journal.jsonl")),
+    )
+    cfg = HarnessConfig(
+        repo="o/r", fix_bot=FIX_BOT, target_dir=str(tmp_path),
+        state_dir=str(tmp_path / "state"), **cfg_kw
+    )
+    store = Store(str(tmp_path / "state"))
+    runner = FakeRunner(AgentResult(is_error=False))
+    gw = _ObservingGateway()
+    return [
+        roles.build_fix_daemon(cfg, gw, store, FakeWorktrees(), runner),
+        roles.build_review_daemon(cfg, gw, store, runner),
+        roles.build_steward_daemon(cfg, gw, store, runner),
+    ], gw
+
+
+def test_every_role_skips_the_world_build_while_the_repo_cap_is_tripped(
+    tmp_path, monkeypatch
+):
+    """#27's cost was ~2,520 GraphQL points and 360 label writes per hour, per
+    capped daemon, to accomplish nothing — and the orphaned ai-working label it
+    left behind defeated the world probe built to avoid exactly that. Asserted on
+    the observation count, which is what the quota is spent on."""
+    daemons, gw = _capped_daemons(
+        tmp_path, monkeypatch, [_today_spend(60.0)], daily_spend_cap_usd=50.0
+    )
+    for daemon in daemons:
+        for _ in range(3):
+            assert daemon.tick() == []
+    assert gw.observations == 0
+    assert gw.calls == []
+
+
+def test_a_neighbours_spend_does_not_gate_this_repos_daemons(tmp_path, monkeypatch):
+    """Anti-vacuity twin (#32): the gate must be scoped to this deployment, or it
+    is just the starvation bug moved earlier in the tick."""
+    daemons, gw = _capped_daemons(
+        tmp_path, monkeypatch,
+        [_today_spend(709.55, repo="other/repo")], daily_spend_cap_usd=50.0,
+    )
+    for daemon in daemons:
+        daemon.tick()
+    assert gw.observations == 3
+
+
+def test_the_global_cap_gates_every_role_regardless_of_repo(tmp_path, monkeypatch):
+    daemons, gw = _capped_daemons(
+        tmp_path, monkeypatch,
+        [_today_spend(709.55, repo="other/repo")],
+        daily_spend_cap_usd=50.0, global_daily_spend_cap_usd=700.0,
+    )
+    for daemon in daemons:
+        assert daemon.tick() == []
+    assert gw.observations == 0
+
+
+def test_no_gate_is_wired_when_both_daily_caps_are_disabled(tmp_path, monkeypatch):
+    """0 means disabled, and an unarmed daemon must not pay a ledger read/poll."""
+    daemons, gw = _capped_daemons(
+        tmp_path, monkeypatch, [_today_spend(9_999.0)],
+        daily_spend_cap_usd=0.0, global_daily_spend_cap_usd=0.0,
+    )
+    assert all(d.tick_gate is None for d in daemons)
+    for daemon in daemons:
+        daemon.tick()
+    assert gw.observations == 3

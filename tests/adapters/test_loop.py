@@ -184,6 +184,126 @@ def test_run_forever_warns_on_suspend_stall():
     assert any("suspended/stalled" in m for m in logs)
 
 
+def _gated_daemon(gate, logs=None, journal=None):
+    """A daemon whose observe/decide would definitely act, so 'nothing happened'
+    can only mean the gate stopped the tick before either ran."""
+    observed = []
+    decided = []
+    gw = FakeGateway()
+
+    def observe():
+        observed.append(1)
+        return WorldState()
+
+    def decide(world):
+        decided.append(world)
+        return [Relabel(Target.ISSUE, 140, Label.AI_READY, Label.AI_WORKING)]
+
+    d = Daemon(
+        name="fix", observe=observe, decide=decide, executor=Executor(gw),
+        log=(logs.append if logs is not None else (lambda m: None)),
+        journal=journal, tick_gate=gate,
+    )
+    return d, gw, observed, decided
+
+
+def test_a_gated_tick_never_observes_decides_or_writes_a_label():
+    """#27's actual cost: the daily-cap check ran AFTER the world build and after
+    the claim relabel, so every 20s tick of a capped daemon burned ~14 GraphQL
+    points and two label writes to accomplish nothing — and the orphaned
+    ai-working label then defeated the world probe. Asserted on the side effects
+    (no observe, no decide, no gh call), not on the log line: the pre-fix code
+    logged the block faithfully and was still wrong."""
+    d, gw, observed, decided = _gated_daemon(lambda: "SPEND CAP: paused")
+    assert d.tick() == []
+    assert observed == []
+    assert decided == []
+    assert gw.calls == []
+
+
+def test_the_gate_logs_once_on_the_trip_and_once_on_the_clear():
+    """A level that stays tripped for hours must not print a line per poll, and
+    the resume is the edge an operator is actually waiting for."""
+    logs: list[str] = []
+    tripped = {"yes": True}
+    d, _, _, _ = _gated_daemon(
+        lambda: "SPEND CAP: paused" if tripped["yes"] else None, logs=logs
+    )
+    for _ in range(5):
+        d.tick()
+    assert [m for m in logs if "SPEND CAP" in m] == ["fix: SPEND CAP: paused"]
+
+    tripped["yes"] = False
+    d.tick()
+    assert any("resuming" in m for m in logs)
+    d.tick()
+    assert len([m for m in logs if "resuming" in m]) == 1
+
+
+def test_a_gate_that_clears_lets_the_next_tick_do_real_work():
+    """Anti-vacuity: the gate must be a pause, not an off switch."""
+    tripped = {"yes": True}
+    d, gw, observed, _ = _gated_daemon(
+        lambda: "paused" if tripped["yes"] else None
+    )
+    d.tick()
+    tripped["yes"] = False
+    d.tick()
+    assert observed == [1]
+    assert gw.calls == [("relabel", 140, "ai-ready", "ai-working")]
+
+
+def test_a_changed_gate_reason_re_announces():
+    """Repo cap → global cap is a different fact and sends an operator to a
+    different config file; silently reusing the first edge would hide it."""
+    logs: list[str] = []
+    reasons = iter(["repo cap tripped", "global cap tripped", "global cap tripped"])
+    d, _, _, _ = _gated_daemon(lambda: next(reasons), logs=logs)
+    for _ in range(3):
+        d.tick()
+    assert [m for m in logs if "tripped" in m] == [
+        "fix: repo cap tripped", "fix: global cap tripped"
+    ]
+
+
+def test_a_gate_that_raises_does_not_wedge_the_daemon():
+    """Fail OPEN: the gate is an optimisation in front of a breaker that is still
+    enforced at dispatch time, so a broken gate must cost work, not stop it."""
+    logs: list[str] = []
+
+    def boom():
+        raise RuntimeError("ledger unreadable")
+
+    d, gw, observed, _ = _gated_daemon(boom, logs=logs)
+    d.tick()
+    assert observed == [1]
+    assert gw.calls == [("relabel", 140, "ai-ready", "ai-working")]
+    assert any("tick gate failed" in m for m in logs)
+
+
+def test_a_gated_tick_is_journalled_once_per_trip():
+    """A daemon that did nothing all day and a daemon that was paused all day are
+    indistinguishable from actions alone."""
+    class FakeJournal:
+        def __init__(self):
+            self.events = []
+
+        def emit(self, event, **fields):
+            self.events.append((event, fields))
+
+    j = FakeJournal()
+    d, _, _, _ = _gated_daemon(lambda: "SPEND CAP: paused", journal=j)
+    for _ in range(4):
+        d.tick()
+    assert j.events == [("tick_gated", {"reason": "SPEND CAP: paused"})]
+
+
+def test_no_gate_is_the_default_and_changes_nothing():
+    d, gw, observed, _ = _gated_daemon(None)
+    d.tick()
+    assert observed == [1] and gw.calls != []
+
+
 def test_world_unchanged_skips_silently_without_deciding():
     """The probe's skip is not an incident: no decide, no execute, no log line
     (a line every quiet poll is the noise the probe exists to remove)."""

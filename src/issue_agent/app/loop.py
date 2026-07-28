@@ -16,7 +16,7 @@ without real time.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..adapters.github import GhUnavailable
 from ..domain.actions import Action, RunAgent
@@ -58,6 +58,38 @@ class Daemon:
     # existing construction working; when set, the skipped-tick arm becomes a
     # countable event rather than a line in a log nobody kept.
     journal: object | None = None
+    # Optional pre-observe gate (app.spend_gate). Returning a reason string
+    # means "this whole tick is pointless" — checked BEFORE observe so a
+    # level-triggered halt costs no GraphQL quota and writes no labels (#27).
+    # None (the field, or the return) = no gate.
+    tick_gate: Callable[[], str | None] | None = None
+    _gated_on: str | None = field(default=None, init=False, repr=False)
+
+    def _gate_blocks_this_tick(self) -> bool:
+        """True when `tick_gate` says to skip. Edge-triggered logging: a level
+        that stays tripped for hours must not print a line every poll, and the
+        clearing edge is the line an operator actually waits for.
+
+        Fails OPEN: a gate that raises must not wedge the daemon, and every
+        breaker it front-runs is still enforced at dispatch time."""
+        if self.tick_gate is None:
+            return False
+        try:
+            reason = self.tick_gate()
+        except Exception as exc:  # noqa: BLE001 - a broken gate ≠ a stopped daemon
+            self.log(f"{self.name}: tick gate failed (proceeding): {exc}")
+            return False
+        if reason is None:
+            if self._gated_on is not None:
+                self.log(f"{self.name}: resuming — {self._gated_on} no longer applies")
+                self._gated_on = None
+            return False
+        if reason != self._gated_on:
+            self.log(f"{self.name}: {reason}")
+            self._gated_on = reason
+            if self.journal is not None:
+                self.journal.emit("tick_gated", reason=reason)
+        return True
 
     def tick(self) -> list[Action]:
         """One observe→decide→execute pass. Returns the actions taken (for tests
@@ -70,6 +102,8 @@ class Daemon:
         execute NOTHING, say so in one loud line. There is deliberately no retry
         or backoff here: the poll loop IS the retry, and a rate limit that
         outlives one interval will simply announce itself again."""
+        if self._gate_blocks_this_tick():
+            return []
         try:
             world = self.observe()
             actions = self.decide(world)
