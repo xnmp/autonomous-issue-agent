@@ -369,7 +369,7 @@ class Store:
         for suffix in _RESUME_STATE_SUFFIXES:
             self._remove(self.issue_path(issue, suffix))
 
-    def cleanup_pr(self, pr: int, issue: int | None, merged: bool) -> None:
+    def cleanup_pr(self, pr: int | None, issue: int | None, merged: bool) -> None:
         """Single entry point the Executor's `ClearIssueState` action wiring
         calls (review M4: `clear_issue`/`clear_pr_review` had ZERO production
         call sites — a closed-unmerged PR requeued its issue while
@@ -394,10 +394,19 @@ class Store:
         `issue--112.infra-deaths` share the same suffix). Route the negated
         key through the SAME clear_issue/clear_issue_resume_state helpers a
         real issue gets, instead of a bespoke clear, so any suffix later added
-        to `_ISSUE_SUFFIXES` stays covered here automatically too."""
-        issue_key = issue if issue is not None else -pr
+        to `_ISSUE_SUFFIXES` stays covered here automatically too.
+
+        `pr=None` (#28) is the mirror: the issue-driven cleanup arm repairs an
+        issue whose PR has vanished from the world, so there is no `pr-N.*`
+        namespace to retire — the issue's half runs alone. `issue` is then
+        necessarily set (the arm is keyed on an issue), so no `-pr` fallback key
+        is needed either."""
+        if pr is None and issue is None:
+            return  # nothing addressable — the caller has no key at all
+        issue_key = issue if issue is not None else -pr  # type: ignore[operator]
         if merged:
-            self.clear_pr_review(pr)
+            if pr is not None:
+                self.clear_pr_review(pr)
             self.clear_issue(issue_key)
         else:
             self.clear_issue_resume_state(issue_key)

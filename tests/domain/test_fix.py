@@ -31,6 +31,7 @@ from issue_agent.domain.fix import (
     duplicate_pr_guards,
     issue_holds,
     issues_needing_resume,
+    orphaned_cleanup_actions,
     pick_ready_issue,
     reap_actions,
     should_automerge,
@@ -1016,6 +1017,87 @@ def test_cleanup_issue_side_arm_still_fires_when_issue_genuinely_awaits_cleanup(
     assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_READY) in actions
     assert RemoveWorktree(8) in actions
     assert ClearIssueState(pr=50, issue=8, merged=False) in actions
+
+
+def test_cleanup_does_not_reclose_an_issue_github_already_closed():
+    # #28: the world now also carries CLOSED ai-pr-open issues, so the ordinary
+    # merge cleanup runs against an issue GitHub closed at merge time from the
+    # mandatory `Fixes #n`. Closing it again is a wasted call and a duplicate
+    # "Resolved by #50" comment — everything else in the arm must still fire.
+    merged = pr(50, "ai-pr-open", state="MERGED", closing_issue=8,
+                head_ref_name="fix/8-thing")
+    w = world(issues=[issue(8, "ai-pr-open", state="closed")], prs=[merged])
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE) in actions
+    assert RemoveWorktree(8) in actions
+    assert ClearIssueState(pr=50, issue=8, merged=True) in actions
+    assert not any(isinstance(a, CloseIssue) for a in actions)
+
+
+def test_cleanup_still_closes_a_merged_issue_github_left_open():
+    # Anti-vacuity twin: on a repo whose base branch is NOT the default, GitHub
+    # does not auto-close, and the harness's own close is the only one there is.
+    merged = pr(50, "ai-pr-open", state="MERGED", closing_issue=8,
+                head_ref_name="fix/8-thing")
+    w = world(issues=[issue(8, "ai-pr-open")], prs=[merged])
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+    assert any(isinstance(a, CloseIssue) and a.number == 8 for a in actions)
+
+
+# ── issue-driven cleanup: the PR is gone from the world entirely (#28) ───────
+def test_orphaned_cleanup_repairs_a_closed_issue_with_no_covering_pr():
+    w = world(issues=[issue(8, "ai-pr-open", state="closed")])
+    assert orphaned_cleanup_actions(w) == [
+        RemoveWorktree(8),
+        Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE),
+        ClearIssueState(pr=None, issue=8, merged=True),
+    ]
+
+
+def test_orphaned_cleanup_ignores_an_issue_its_pr_still_covers():
+    # An unlabelled (stale-index) PR does NOT cover; a labelled one does, and
+    # belongs to the PR-driven arm. The two must never both fire on one issue.
+    iss = issue(8, "ai-pr-open", state="closed")
+    stale = pr(50, state="MERGED", closing_issue=8, head_ref_name="fix/8-x")
+    covering = pr(50, "ai-pr-open", state="MERGED", closing_issue=8,
+                  head_ref_name="fix/8-x")
+    assert orphaned_cleanup_actions(world(issues=[iss], prs=[stale])) != []
+    assert orphaned_cleanup_actions(world(issues=[iss], prs=[covering])) == []
+
+
+def test_orphaned_cleanup_leaves_an_open_never_closed_issue_alone():
+    # Indistinguishable from a healthy in-flight issue whose PR fell out of this
+    # one world on a transient read — acting would delete a live worktree.
+    w = world(issues=[issue(8, "ai-pr-open")])
+    assert orphaned_cleanup_actions(w) == []
+
+
+def test_orphaned_cleanup_repairs_a_human_reopen_without_closing_it():
+    # stateReason proves the lifecycle already ended once, so this is safe to
+    # repair — and ai-done is what makes the reopen legible to the steward's
+    # recurrence reporter (open + ai-done + reopened).
+    w = world(issues=[issue(8, "ai-pr-open", state_reason="reopened")])
+    acts = orphaned_cleanup_actions(w)
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE) in acts
+    assert not any(isinstance(a, CloseIssue) for a in acts)
+
+
+def test_orphaned_cleanup_is_one_shot():
+    # The repair's own relabel removes ai-pr-open, which is what drops the issue
+    # out of both queries that feed this arm — no marker needed.
+    healed = world(issues=[issue(8, "ai-done", state="closed")])
+    assert orphaned_cleanup_actions(healed) == []
+
+
+def test_cleanup_never_recloses_a_human_reopen():
+    # The PR-driven arm, merged branch: without the guard `close_issue_on_merge`
+    # would close an operator's reopen within one poll and erase the #10 signal.
+    merged = pr(50, "ai-pr-open", state="MERGED", closing_issue=8,
+                head_ref_name="fix/8-thing")
+    w = world(issues=[issue(8, "ai-pr-open", state_reason="reopened")], prs=[merged])
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE) in actions
+    assert not any(isinstance(a, CloseIssue) for a in actions)
 
 
 def test_cleanup_actions_direct_call_defaults_to_the_ordinary_case():

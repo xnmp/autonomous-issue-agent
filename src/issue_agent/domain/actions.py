@@ -153,9 +153,13 @@ class ClearIssueState:
                      on the issue clear; resolve-retries/infra-deaths persist
                      on purpose (handover §5.7 conservatism).
     `issue` is None for an issueless PR — only the PR's own state is retired.
+    `pr` is None for the mirror case (#28): the issue-driven cleanup arm repairs
+    an issue whose PR is no longer observable anywhere, so there is no PR number
+    to retire state under — only the issue's half runs. Exactly one of the two
+    may be None.
     """
 
-    pr: int
+    pr: int | None
     issue: int | None
     merged: bool
 

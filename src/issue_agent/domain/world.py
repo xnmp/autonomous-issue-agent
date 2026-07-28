@@ -102,6 +102,13 @@ class IssueView:
     updated_at: str = ""
     author: str = ""
     state: str = "open"  # open | closed
+    # GitHub's `stateReason`, lower-cased: "" | "completed" | "not_planned" |
+    # "reopened". Carried on the world (it costs nothing — the same `gh issue
+    # view` already runs) because it is the ONLY deterministic evidence that an
+    # issue's lifecycle already ended once: an OPEN issue reading "reopened" was
+    # closed and put back by a human, which is the #10 recurrence signal and must
+    # never be re-closed by the harness. "" = never closed.
+    state_reason: str = ""
     # GitHub-native issue dependencies: True iff this issue has at least one OPEN
     # "blocked by" dependency (the adapter resolves the summary + list; the domain
     # only sees the settled boolean). The fixer must NOT pick up a blocked issue —

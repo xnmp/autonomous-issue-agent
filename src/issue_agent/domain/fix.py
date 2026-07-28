@@ -507,6 +507,8 @@ def reap_actions(world: WorldState) -> list[Action]:
 def cleanup_actions(
     pr: PRView, issue_number: int | None, cfg: FixConfig,
     issue_observed_pr_open: bool = True,
+    issue_observed_closed: bool = False,
+    issue_observed_reopened: bool = False,
 ) -> list[Action]:
     """Merged/closed PR cleanup. Port of cleanup.sh. MERGED → issue ai-pr-open→
     ai-done (+ optional close, since GitHub only auto-closes on default-branch
@@ -536,7 +538,24 @@ def cleanup_actions(
     and its half of ClearIssueState) stays UNCONDITIONAL: the PR really is
     closed/merged regardless of what its issue currently shows, and that part
     of the world is never stale. Default True is the ordinary case (the issue
-    genuinely still is ai-pr-open) and matches every existing direct caller."""
+    genuinely still is ai-pr-open) and matches every existing direct caller.
+
+    `issue_observed_closed` suppresses only the CloseIssue: since the world now
+    also carries CLOSED ai-pr-open issues (#28 — that is how a post-merge issue
+    becomes observable at all), the ordinary merge cleanup runs against an issue
+    GitHub already closed from the mandatory `Fixes #n`. Re-closing it is at best
+    a wasted call and at worst a duplicate "Resolved by #N" comment; the harness
+    decides that here rather than relying on `gh issue close` treating an
+    already-closed issue as a no-op. Default False keeps direct callers on the
+    ordinary open-issue path.
+
+    `issue_observed_reopened` suppresses the CloseIssue for the opposite reason:
+    the issue is OPEN because a HUMAN put it back (GitHub `stateReason` =
+    reopened), which is the #10 recurrence signal — the truest "losing power"
+    evidence the harness has, and the one thing review cannot see. Re-closing it
+    within one poll would erase it. The ai-done relabel still runs: the steward's
+    recurrence reporter selects exactly `open + ai-done + reopened`, so ai-done on
+    a reopened issue is what MAKES the signal readable."""
     actions: list[Action] = []
     merged = pr.state == "MERGED"
     issue_arm = issue_number is not None and issue_observed_pr_open
@@ -547,7 +566,11 @@ def cleanup_actions(
             actions.append(
                 Relabel(Target.ISSUE, issue_number, Label.AI_PR_OPEN, Label.AI_DONE)
             )
-            if cfg.close_issue_on_merge:
+            if (
+                cfg.close_issue_on_merge
+                and not issue_observed_closed
+                and not issue_observed_reopened
+            ):
                 actions.append(
                     CloseIssue(
                         issue_number,
@@ -564,15 +587,93 @@ def cleanup_actions(
     return actions
 
 
+def orphaned_cleanup_actions(world: WorldState) -> list[Action]:
+    """The ISSUE-driven half of merge cleanup (#28): repair an `ai-pr-open` issue
+    whose PR is no longer observable anywhere in the world.
+
+    Cleanup is otherwise driven entirely by the PR — and the PR-side
+    `Relabel(PR, -ai-pr-open)` inside `cleanup_actions` is UNCONDITIONAL and lands
+    even when the issue-side arm was skipped or its writes failed. One tick later
+    the PR carries no label, so `list_pr_states("ai-pr-open", …)` stops covering it
+    (its `--state all` results linger in GitHub's stale search index for about a
+    day, but `_safe_get_pr` re-reads the PR's REAL labels, so `needs_cleanup` is
+    False) and the issue is unreachable from the PR side FOREVER. Verified live on
+    the flagship target: 23 closed `ai-pr-open` issues, every one of their merged
+    PRs carrying no labels at all. Without this arm the widened closed-issue slice
+    would observe those 23 forever without ever draining them — a permanent
+    per-poll cost, and no repair.
+
+    It is also the retry loop the pipeline never had. The executor applies each
+    action in its own try/except, so a transient `gh` failure on the issue relabel
+    used to be unrecoverable (the PR relabel in the same tick removed the only
+    handle). Now the next poll sees issue-still-ai-pr-open + PR-not-covering and
+    repairs it. One-shot by construction: the repair's own relabel REMOVES
+    ai-pr-open, which drops the issue out of both queries that feed this arm.
+
+    **Which issues it will touch, and why not the others.** `covered` is every
+    issue linked to a PR that genuinely still carries ai-pr-open — an in-flight PR,
+    or a merged one whose cleanup has not run yet. Those belong to the PR-driven
+    arm and are left alone. Of the rest:
+
+    * CLOSED → repair to ai-done. Whether GitHub auto-closed it from the mandatory
+      `Fixes #n` or a human closed it, the lifecycle is over and the worktree and
+      issue state should go.
+    * OPEN + `stateReason` "reopened" → repair to ai-done, and (via
+      `cleanup_actions`' sibling guard) never re-close. GitHub itself testifies the
+      issue was closed and deliberately put back; ai-done is precisely what makes
+      it legible to the steward's recurrence reporter.
+    * OPEN + never closed → DELIBERATELY NOT TOUCHED. This shape is ambiguous
+      between a closed-unmerged requeue whose relabel failed (wants ai-ready) and a
+      merged PR on a non-default base whose close failed (wants ai-done), and there
+      is no field that separates them: `closedByPullRequestsReferences` carries no
+      PR state and is empty for an open issue. Worse, it is INDISTINGUISHABLE from
+      a perfectly healthy in-flight issue whose PR was dropped from this one world
+      by a transient `_safe_get_pr` failure — and acting there would delete a live
+      session's worktree and requeue a paid resolve, the exact P1R-15 harm the
+      gate exists to prevent. Guessing wrong costs either a silently abandoned bug
+      or a duplicate $13–20 resolve; doing nothing costs one visible stuck label,
+      and the widened OPEN ai-pr-open query means an operator can now actually see
+      it. Not-acting is the only choice whose worst case is visible."""
+    covered = {
+        n for p in world.prs
+        if p.has(Label.AI_PR_OPEN) and (n := _issue_for_pr(p)) is not None
+    }
+    actions: list[Action] = []
+    for issue in world.issues_with(Label.AI_PR_OPEN):
+        if issue.number in covered:
+            continue
+        if issue.state == "open" and issue.state_reason != "reopened":
+            continue
+        actions.append(RemoveWorktree(issue.number))
+        actions.append(
+            Relabel(Target.ISSUE, issue.number, Label.AI_PR_OPEN, Label.AI_DONE)
+        )
+        # pr=None: the PR is exactly what we cannot see. Only the issue's half of
+        # the state is retirable — a `pr-N.automerge` marker for a PR that merged
+        # days ago is inert anyway.
+        actions.append(ClearIssueState(None, issue.number, True))
+    return actions
+
+
+def _observed_issue(world: WorldState, issue_number: int | None) -> IssueView | None:
+    """The linked issue AS THIS SNAPSHOT SAW IT, or None when the world does not
+    carry it (unlinked PR, or an issue outside every slice the builder fetched)."""
+    if issue_number is None:
+        return None
+    return next((i for i in world.issues if i.number == issue_number), None)
+
+
 def _issue_carries_ai_pr_open(world: WorldState, issue_number: int | None) -> bool:
     """Whether the OBSERVED issue — in THIS world snapshot — still shows
     ai-pr-open. The gate `cleanup_actions` uses (review P1R-15) to tell a
     genuinely-awaiting-cleanup issue from one a fresh dispatch already moved
     off ai-pr-open (or that never carried it, or no longer exists) within the
-    same poll."""
-    if issue_number is None:
-        return False
-    return any(i.number == issue_number for i in world.issues_with(Label.AI_PR_OPEN))
+    same poll.
+
+    Answerable only because the fix world fetches ai-pr-open issues in BOTH
+    states (#28): the post-merge issue this gate is really about is closed."""
+    observed = _observed_issue(world, issue_number)
+    return observed is not None and observed.has(Label.AI_PR_OPEN)
 
 
 def _issue_for_pr(pr: PRView) -> int | None:
@@ -1070,9 +1171,20 @@ def decide_fix(
     for pr in world.prs:
         if pr_lifecycle(pr).needs_cleanup:
             issue_n = _issue_for_pr(pr)
+            observed = _observed_issue(world, issue_n)
             actions.extend(cleanup_actions(
                 pr, issue_n, cfg,
                 issue_observed_pr_open=_issue_carries_ai_pr_open(world, issue_n),
+                issue_observed_closed=observed is not None and observed.state != "open",
+                issue_observed_reopened=(
+                    observed is not None and observed.state_reason == "reopened"
+                ),
             ))
+
+    # 5) Issue-driven cleanup (#28): the mirror of (4) for an issue whose PR the
+    # world can no longer see at all. Lock-free, and deliberately AFTER (4) so
+    # `covered` reflects the same snapshot the PR-driven arm just consumed — the
+    # two are disjoint by construction, never both acting on one issue.
+    actions.extend(orphaned_cleanup_actions(world))
 
     return actions

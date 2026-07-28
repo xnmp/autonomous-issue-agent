@@ -7,6 +7,7 @@ records argv and returns canned JSON (no network, no real gh)."""
 import json
 
 from issue_agent.adapters.github import (
+    _CLOSED_CLEANUP_LIMIT,
     _FAILED_LOG_BYTES,
     _FAILED_LOG_LINES,
     _INLINE_COMMENT_LIMIT,
@@ -29,6 +30,14 @@ from issue_agent.adapters.github import (
     parse_pr,
     parse_world,
 )
+from issue_agent.domain.actions import (
+    ClearIssueState,
+    CloseIssue,
+    Relabel,
+    RemoveWorktree,
+    Target,
+)
+from issue_agent.domain.fix import FixConfig, FixState, decide_fix
 from issue_agent.domain.labels import Label
 from issue_agent.domain.world import CIState
 from issue_agent.domain.ci import ci_state, parse_timestamp
@@ -1466,3 +1475,240 @@ def test_build_world_stamps_the_poll_time():
 
 def test_parse_world_is_unstamped_unless_told():
     assert parse_world([], []).now == ""
+
+
+# ── merge cleanup end-to-end: merge → GitHub auto-close → next poll (#28) ─────
+# These drive the REAL world build, because the defect lived in what the build
+# FETCHES, not in what the domain does with it. Every previous cleanup test
+# handed `cleanup_actions` an `issue_observed_pr_open=True` that the post-merge
+# loop never supplies, so all of them passed while zero issues in five
+# deployment days ever reached ai-done.
+
+def _gh_repo(issues, prs):
+    """A `gh` serving a whole described repo, list calls and view calls agreeing.
+
+    `issues`: {number: {"state", "labels", "stateReason"}} — served from whichever
+    `--label/--state` slice genuinely matches, so a test cannot smuggle an issue
+    into a world the real builder would not have fetched.
+    `prs`: {number: {"state", "labels", "issue", "listed"}} — `listed` is
+    deliberately independent of `labels`, because that is the live GitHub
+    behaviour this whole bug turns on: `gh pr list --label ai-pr-open --state all`
+    keeps serving merged PRs for about a day AFTER their label was removed (stale
+    search index), and only the per-PR view tells the truth."""
+    def runner(argv, token):
+        key = " ".join(argv)
+        if "issue list" in key:
+            label = argv[argv.index("--label") + 1]
+            state = argv[argv.index("--state") + 1]
+            return json.dumps([
+                {"number": n} for n, i in sorted(issues.items())
+                if label in i["labels"]
+                and (state == "all" or state == i["state"].lower())
+            ])
+        if "pr list" in key:
+            state = argv[argv.index("--state") + 1]
+            return json.dumps([
+                {"number": n, "state": p["state"]} for n, p in sorted(prs.items())
+                if p.get("listed", True)
+                and (state == "all" or state.upper() == p["state"])
+            ])
+        if "issue view" in key:
+            n = int(argv[3])
+            i = issues[n]
+            return json.dumps({
+                "number": n, "title": "t", "body": "", "state": i["state"],
+                "stateReason": i.get("stateReason", ""),
+                "labels": [{"name": x} for x in i["labels"]],
+            })
+        if "pr view" in key:
+            n = int(argv[3])
+            p = prs[n]
+            return json.dumps({
+                "number": n, "title": "t", "body": f"Fixes #{p['issue']}",
+                "state": p["state"], "headRefName": f"fix/{p['issue']}-thing",
+                "headRefOid": "abc", "baseRefName": "dev",
+                "labels": [{"name": x} for x in p["labels"]],
+                "reviews": [], "files": [], "isDraft": False,
+                "author": {"login": "fix-bot"},
+                "closingIssuesReferences": [{"number": p["issue"]}],
+            })
+        return ""
+
+    return runner
+
+
+_CFG = FixConfig(fix_bot="fix-bot")
+
+
+def _decide(runner):
+    return decide_fix(
+        GitHubGateway("o/r", runner=runner).build_world(),
+        _CFG, FixState(), fixer_busy=False,
+    )
+
+
+def test_merge_cleanup_runs_on_the_poll_after_github_auto_closed_the_issue():
+    """The invariant nothing covered: after a merge the issue ends up ai-done and
+    its worktree is gone. `Fixes #n` is mandatory (check-pr.sh), so GitHub closes
+    the issue at the instant of merge; the very next poll must still observe it."""
+    runner = _gh_repo(
+        issues={8: {"state": "CLOSED", "labels": ["ai-pr-open"]}},
+        prs={50: {"state": "MERGED", "labels": ["ai-pr-open"], "issue": 8}},
+    )
+    world = GitHubGateway("o/r", runner=runner).build_world()
+    assert 8 in {i.number for i in world.issues}, "closed ai-pr-open issue must be observable"
+
+    actions = decide_fix(world, _CFG, FixState(), fixer_busy=False)
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE) in actions
+    assert RemoveWorktree(8) in actions
+    assert ClearIssueState(pr=50, issue=8, merged=True) in actions
+    # GitHub already closed it — re-closing would re-comment "Resolved by #50".
+    assert not any(isinstance(a, CloseIssue) for a in actions)
+
+
+def test_backlog_issue_whose_pr_lost_its_label_still_gets_cleaned_up():
+    """The shape the deployed backlog is ACTUALLY in, verified live: the
+    unconditional PR-side relabel already ran at merge+1, so the merged PR carries
+    no labels and `needs_cleanup` is False for it forever. Only the issue-driven
+    arm can reach these — without it the widened query would observe the same
+    stuck issues every poll and never drain them."""
+    actions = _decide(_gh_repo(
+        issues={8: {"state": "CLOSED", "labels": ["ai-pr-open"]}},
+        # still in the stale search index, but its real label set is empty
+        prs={50: {"state": "MERGED", "labels": [], "issue": 8}},
+    ))
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE) in actions
+    assert RemoveWorktree(8) in actions
+    assert ClearIssueState(pr=None, issue=8, merged=True) in actions
+    assert not any(isinstance(a, CloseIssue) for a in actions)
+
+
+def test_backlog_issue_is_cleaned_up_even_when_the_pr_has_left_the_world():
+    # …and once the stale index expires the PR is not in `world.prs` at all.
+    actions = _decide(_gh_repo(
+        issues={8: {"state": "CLOSED", "labels": ["ai-pr-open"]}}, prs={},
+    ))
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE) in actions
+    assert RemoveWorktree(8) in actions
+
+
+def test_stranded_issue_repairs_itself_on_the_next_tick():
+    """Ordering/stranding: `cleanup_actions` emits the PR-side relabel
+    UNCONDITIONALLY, and the executor applies each action in its own try/except,
+    so a transient gh failure on the issue relabel at tick N leaves the issue
+    ai-pr-open with its only handle — the PR label — already gone. Tick N+1 is
+    exactly the backlog shape above, so the pipeline now has a retry loop it never
+    had."""
+    tick_n_plus_1 = _gh_repo(
+        issues={8: {"state": "CLOSED", "labels": ["ai-pr-open"]}},
+        prs={50: {"state": "MERGED", "labels": [], "issue": 8}},
+    )
+    actions = _decide(tick_n_plus_1)
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE) in actions
+
+    # …and it is ONE-SHOT: the repair's own relabel removes ai-pr-open, which
+    # drops the issue out of both queries that feed the arm.
+    after = _decide(_gh_repo(
+        issues={8: {"state": "CLOSED", "labels": ["ai-done"]}},
+        prs={50: {"state": "MERGED", "labels": [], "issue": 8}},
+    ))
+    assert not any(isinstance(a, RemoveWorktree) for a in after)
+    assert not any(isinstance(a, ClearIssueState) for a in after)
+
+
+def test_an_open_ai_pr_open_issue_that_was_never_closed_is_left_alone():
+    """The one ambiguous shape, deliberately not acted on: indistinguishable from
+    a healthy in-flight issue whose PR was dropped from this world by a transient
+    read failure. Acting would delete a live session's worktree."""
+    actions = _decide(_gh_repo(
+        issues={8: {"state": "OPEN", "labels": ["ai-pr-open"]}}, prs={},
+    ))
+    assert actions == []
+
+
+def test_a_human_reopen_is_relabelled_ai_done_and_never_re_closed():
+    """#10's recurrence signal is `open + ai-done + stateReason reopened`. An
+    operator reopening a stuck issue must survive the poll that repairs it —
+    ai-done is what MAKES the reopen legible to the steward, and re-closing it
+    within one poll would erase the truest guardrail the harness has."""
+    reopened = {"state": "OPEN", "labels": ["ai-pr-open"], "stateReason": "REOPENED"}
+    # (a) via the issue-driven arm — the PR is gone
+    actions = _decide(_gh_repo(issues={8: reopened}, prs={}))
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE) in actions
+    assert not any(isinstance(a, CloseIssue) for a in actions)
+    # (b) via the PR-driven arm — the merged PR is still labelled, so without the
+    # stateReason guard `close_issue_on_merge` would close the reopen outright.
+    actions = _decide(_gh_repo(
+        issues={8: reopened},
+        prs={50: {"state": "MERGED", "labels": ["ai-pr-open"], "issue": 8}},
+    ))
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE) in actions
+    assert not any(isinstance(a, CloseIssue) for a in actions)
+
+
+def test_an_in_flight_issue_is_never_touched_by_the_issue_driven_arm():
+    # Anti-vacuity for `covered`: the ordinary mid-flight shape is an OPEN
+    # ai-pr-open issue with an OPEN ai-pr-open PR. Nothing may fire on it.
+    actions = _decide(_gh_repo(
+        issues={8: {"state": "OPEN", "labels": ["ai-pr-open"]}},
+        prs={50: {"state": "OPEN", "labels": ["ai-pr-open"], "issue": 8}},
+    ))
+    assert not any(isinstance(a, RemoveWorktree) for a in actions)
+    assert not any(isinstance(a, ClearIssueState) for a in actions)
+    assert not any(
+        isinstance(a, Relabel) and a.target is Target.ISSUE for a in actions
+    )
+
+
+def test_widened_world_heals_the_backlog_without_stomping_a_fresh_dispatch():
+    """P1R-15 in the world the widening actually produces. #8 was just dispatched
+    (a dispatch MOVES the label ai-ready → ai-working, so it carries ai-working and
+    NOT ai-pr-open) while its own stale MERGED PR is still labelled; #9 is a
+    backlog issue being healed in the same tick. Both halves matter: drop the
+    widening and #9's cleanup vanishes; drop the gate and #8's live worktree is
+    deleted."""
+    actions = _decide(_gh_repo(
+        issues={
+            8: {"state": "OPEN", "labels": ["ai-working"]},
+            9: {"state": "CLOSED", "labels": ["ai-pr-open"]},
+        },
+        prs={50: {"state": "MERGED", "labels": ["ai-pr-open"], "issue": 8}},
+    ))
+    # the backlog issue is healed — this is what the widening buys
+    assert Relabel(Target.ISSUE, 9, Label.AI_PR_OPEN, Label.AI_DONE) in actions
+    assert RemoveWorktree(9) in actions
+    # …and the freshly-dispatched issue is untouched
+    assert RemoveWorktree(8) not in actions
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE) not in actions
+    assert not any(isinstance(a, ClearIssueState) and a.issue == 8 for a in actions)
+    # …while the PR-side arm, which is never stale, still fires.
+    assert Relabel(Target.PR, 50, Label.AI_PR_OPEN, None) in actions
+
+
+def test_closed_ai_pr_open_slice_is_bounded_below_the_list_limit():
+    """A repo with a backlog deeper than the cap must not turn one poll into
+    hundreds of `gh issue view` calls; it is worked off newest-first instead."""
+    fr = FakeRunner({"issue list": [], "pr list": []})
+    GitHubGateway("o/r", runner=fr).build_world()
+    closed = [
+        a for a, _ in fr.calls
+        if a[1:3] == ["issue", "list"] and "closed" in a and "ai-pr-open" in a
+    ]
+    assert len(closed) == 1
+    assert closed[0][closed[0].index("--limit") + 1] == str(_CLOSED_CLEANUP_LIMIT)
+    assert _CLOSED_CLEANUP_LIMIT < _LIST_LIMIT
+
+
+def test_closed_slice_truncation_is_loud_at_its_own_cap(capsys):
+    """The truncation guard must compare against the cap the CALL used, not
+    _LIST_LIMIT — otherwise a fully-saturated backlog slice is silent."""
+    def runner(argv, token):
+        key = " ".join(argv)
+        if "issue list" in key and "--state closed" in key:
+            return json.dumps([{"number": n} for n in range(_CLOSED_CLEANUP_LIMIT)])
+        if "issue list" in key or "pr list" in key:
+            return "[]"
+        return json.dumps({"number": 1, "state": "CLOSED", "labels": []})
+
+    GitHubGateway("o/r", runner=runner).build_world()
+    assert "TRUNCATED" in capsys.readouterr().err
