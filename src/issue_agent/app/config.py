@@ -190,6 +190,11 @@ class HarnessConfig:
     # pipelines run well over half an hour and escalating a healthy long run
     # would move the escalation-rate guardrail the wrong way.
     ci_pending_max_seconds: int = 3600
+    # Refuse to RESOLVE an issue that an OPEN, not-ours PR already closes (#39):
+    # comment naming the PR, then ai-ready → ai-blocked. The evidence was a ≈$32
+    # duplicate resolve of an issue the operator's own open PR had already fixed.
+    # Advisory — the operator un-blocks by closing the stale PR.
+    duplicate_pr_guard: bool = True
     max_ci_retries: int = 3
     # Escalation ceiling for the reviewer: after this many REQUEST_CHANGES verdicts
     # on one PR (counting the reviewer's OWN rejections, NOT author pushes — a
@@ -657,6 +662,7 @@ class HarnessConfig:
             f"review={self.max_review_retries} rebase={self.max_rebase_retries} "
             f"ci_pending="
             f"{f'{self.ci_pending_max_seconds}s' if self.ci_pending_max_seconds else 'off'}",
+            f"spend_guards: dup_pr_guard={'on' if self.duplicate_pr_guard else 'off'} "
             f"timeouts: idle={self.agent_idle_timeout:.0f}s "
             f"wall={self.agent_max_runtime:.0f}s",
             f"spend_caps: issue=${self.issue_spend_cap_usd:.2f} "
@@ -1060,6 +1066,9 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         ci_ignore_checks=e.get("CI_IGNORE_CHECKS", _dc_default("ci_ignore_checks")),
         ci_pending_max_seconds=_coerce_int(
             e, "CI_PENDING_MAX_SECONDS", _dc_default("ci_pending_max_seconds"), errors
+        ),
+        duplicate_pr_guard=_b(
+            e, "DUPLICATE_PR_GUARD", _dc_default("duplicate_pr_guard"), errors
         ),
         close_issue_on_merge=_b(e, "CLOSE_ISSUE_ON_MERGE", _dc_default("close_issue_on_merge"), errors),
         auto_rebase_conflicts=_b(e, "AUTO_REBASE_CONFLICTS", _dc_default("auto_rebase_conflicts"), errors),

@@ -25,6 +25,7 @@ from ..adapters.journal import (
     JournalingRuntime,
     default_ledger_path,
     ci_pending_keys,
+    duplicate_pr_keys,
     hold_keys,
     read_events_tail,
     recurrence_keys,
@@ -38,6 +39,7 @@ from ..domain.fix import (
     breaker_key,
     ci_pending_stalls,
     decide_fix,
+    duplicate_pr_guards,
     issue_holds,
 )
 from ..domain.labels import Label
@@ -328,6 +330,44 @@ def _ci_stall_reporter(journal: Journal | None, repo: str, fix_cfg: FixConfig, l
     return report
 
 
+def _duplicate_pr_reporter(journal: Journal | None, repo: str, fix_cfg: FixConfig, log):
+    """Build the per-poll reporter for the duplicate-PR guard (#39).
+
+    The refusal itself is `decide_fix`'s (a comment + ai-ready → ai-blocked);
+    this is the machine-readable half, and it reads the SAME pure derivation the
+    decision does, so the journal cannot disagree with the action.
+
+    The metric #39 moves is "wasted duplicate resolves" — one in five issues on
+    the night it was found — and these events ARE the count of resolves not
+    bought. Two channels, as everywhere else here: the LOG line every poll the
+    condition holds (normally exactly one, since the relabel clears it), the
+    JOURNAL line once per (issue, PR).
+    """
+    seen: set[str] = set()
+
+    def report(world) -> None:
+        for dup in duplicate_pr_guards(world, fix_cfg):
+            log(
+                f"DUPLICATE PR: issue #{dup.issue} is ai-ready but open PR "
+                f"#{dup.pr} already closes it — skipping the resolve and "
+                "moving the issue to ai-blocked"
+            )
+            key = f"duplicate-pr:{repo}:{dup.issue}:{dup.pr}"
+            if key in seen:
+                continue
+            seen.add(key)
+            if journal is None:
+                continue
+            if key in duplicate_pr_keys(read_events_tail(journal.path)):
+                continue
+            journal.emit(
+                "duplicate_pr_guard", issue=dup.issue, pr=dup.pr,
+                author=dup.author, block_key=key,
+            )
+
+    return report
+
+
 def _recurrence_reporter(journal: Journal | None, gateway, repo: str, fix_bot: str, log):
     """Build the per-poll reporter for LITERAL reopens (harness #10, kind=reopen).
 
@@ -422,6 +462,7 @@ def build_fix_daemon(
         merge_method=cfg.merge_method,
         ci_ignore_checks=cfg.ci_ignore_checks,
         ci_pending_max_seconds=cfg.ci_pending_max_seconds,
+        duplicate_pr_guard=cfg.duplicate_pr_guard,
         close_issue_on_merge=cfg.close_issue_on_merge,
         max_ci_retries=fix_runtime.max_ci_retries,
         max_review_retries=fix_runtime.max_review_retries,
@@ -575,12 +616,14 @@ def build_fix_daemon(
 
     report_holds = _hold_reporter(journal, cfg.repo, _log("fix"))
     report_ci_stalls = _ci_stall_reporter(journal, cfg.repo, fix_cfg, _log("fix"))
+    report_duplicates = _duplicate_pr_reporter(journal, cfg.repo, fix_cfg, _log("fix"))
 
     def decide(world):
         # Report BEFORE deciding: if decide_fix raises, the tick still leaves a
         # record of what it was holding, which is the state hardest to diagnose.
         report_holds(world)
         report_ci_stalls(world)
+        report_duplicates(world)
         return decide_fix(world, fix_cfg, _fix_state(store, world), fixer_busy())
 
     _log("fix")(fix_capability_line(

@@ -208,12 +208,48 @@ def paths_overlap_open_prs(
 
 
 @dataclass(frozen=True)
+class ClosingRef:
+    """An OPEN pull request GitHub's closing-reference graph says closes `issue`.
+
+    Deliberately SEPARATE from `WorldState.prs`, which the fix world populates
+    only from `ai-pr-open` — i.e. the harness's own PRs. The duplicate-resolve
+    guard (#39) needs the opposite population: PRs the harness has never touched,
+    typically a human's, which is exactly what `prs` cannot carry without
+    changing what every other fixer pass (path-overlap holds, reap, cleanup,
+    auto-merge) considers "a PR of ours". One cheap repo-wide `gh pr list` fills
+    this instead, and nothing but the guard reads it.
+
+    `author` is the opener's login, "" when GitHub didn't resolve it (a deleted
+    account) — the guard treats an unknown author as NOT the fix bot, the same
+    fail-safe direction `fixer_prs` uses.
+
+    `base_ref_name` is recorded but deliberately NOT gated on: GitHub only
+    AUTO-closes an issue when the PR merges into the default branch, so a PR
+    based elsewhere leaves the issue open — but the fix in it still exists, so
+    resolving the issue again would still buy a duplicate. The money is wasted
+    either way; the base is carried only so the comment can be honest about it
+    if that ever matters."""
+
+    pr: int
+    issue: int
+    author: str = ""
+    base_ref_name: str = ""
+
+
+@dataclass(frozen=True)
 class WorldState:
     """Everything a single daemon poll observes. A daemon reads only the slice
     it needs (the fixer reads issues+prs; the reviewer reads prs)."""
 
     issues: tuple[IssueView, ...] = ()
     prs: tuple[PRView, ...] = ()
+    # Open PRs that close one of this repo's issues, harness-authored or not
+    # (#39). Empty = NOT COLLECTED (a hand-built world, a builder that predates
+    # this, a repo with no open PRs) — indistinguishable on purpose, because the
+    # only consumer is a guard that must fail OPEN: no evidence of a duplicate
+    # is not evidence of no duplicate, but refusing to dispatch on missing data
+    # would strand every issue on any world builder that doesn't fill this.
+    closing_refs: tuple[ClosingRef, ...] = ()
     # When this snapshot was BUILT (ISO-8601 UTC), stamped by the adapter. The
     # domain is pure and may not read a clock, so any decision with a time
     # component (the CI pending deadline, #30) reads it from here. Empty =
@@ -271,6 +307,7 @@ __all__ = [
     "Comment",
     "IssueView",
     "PRView",
+    "ClosingRef",
     "WorldState",
     "fix_probe_safe",
     "replace",

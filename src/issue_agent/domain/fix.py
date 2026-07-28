@@ -24,6 +24,7 @@ from .actions import (
     CloseIssue,
     EnableAutoMerge,
     UpdateBranch,
+    PostComment,
     Relabel,
     RemoveWorktree,
     RunAgent,
@@ -49,6 +50,7 @@ from .refs import is_governed_branch, issue_from_branch
 from .review import IdentityMode
 from .world import (
     CIState,
+    ClosingRef,
     Comment,
     IssueView,
     PRView,
@@ -100,6 +102,13 @@ class FixConfig:
     # (webkit suites ~23m on the flagship target), and escalating a healthy long
     # run would move the escalation-rate guardrail the wrong way.
     ci_pending_max_seconds: int = 3600
+    # Refuse to RESOLVE an issue an open PR already closes (#39). The most
+    # expensive leg there is, spent rediscovering a fix that is already written:
+    # the operator's own PR #558 closed tauri-explorer #554, labelling the issue
+    # ai-ready anyway bought a duplicate PR for ≈$32, and the reviewer
+    # independently converged on the approach #558 already had. Off = dispatch
+    # regardless (the pre-#39 behaviour).
+    duplicate_pr_guard: bool = True
 
 
 @dataclass(frozen=True)
@@ -205,6 +214,95 @@ def issue_holds(world: WorldState) -> tuple[Hold, ...]:
         if issue_lifecycle(issue).is_ready
         for hold in _holds(issue, world)
     )
+
+
+# ── duplicate-PR guard (#39) ─────────────────────────────────────────────────
+@dataclass(frozen=True)
+class DuplicatePR:
+    """One ai-ready issue an OPEN, NOT-ours PR already closes.
+
+    NOT a `Hold`. A hold is a silent one-poll defer on a condition that clears
+    by itself (the blocking PR merges, the dependency closes) — this is a
+    terminal refusal of work the operator explicitly asked for, so it says so
+    out loud and hands the decision back: comment naming the PR, then
+    ai-ready → ai-blocked. The label swap is what makes it one-shot, exactly as
+    `_escalate_pr` relies on: the issue leaves `pick_ready_issue`'s set, so the
+    guard cannot re-fire, and the operator re-arms it by closing the stale PR
+    and re-labelling (or removes ai-ready to leave the fix to the human).
+
+    ai-blocked rather than needs-human-review: nothing is broken and no breaker
+    tripped — the work is simply already done somewhere else. ai-blocked is the
+    harness's existing "waiting on a person" state and keeps the issue in the
+    fixer's world (a human reply on a blocked issue with a session resumes it),
+    where needs-human-review would retire it from the pipeline entirely."""
+
+    issue: int
+    pr: int
+    author: str = ""
+
+    @property
+    def reason(self) -> str:
+        by = f" (opened by @{self.author})" if self.author else ""
+        return (
+            f"**Resolve skipped:** open PR #{self.pr}{by} already closes this "
+            "issue — close it or remove `ai-ready` to hand the issue to the "
+            "harness. Dispatching would open a second PR for work that is "
+            "already written."
+        )
+
+    def actions(self) -> list[Action]:
+        return [
+            PostComment(Target.ISSUE, self.issue, self.reason),
+            Relabel(Target.ISSUE, self.issue, Label.AI_READY, Label.AI_BLOCKED),
+        ]
+
+
+def _is_fixers(ref: ClosingRef, cfg: FixConfig) -> bool:
+    """Whether the fix bot opened this closing PR — the NORMAL in-flight state
+    (its issue is ai-pr-open and its PR is the harness's own work), which the
+    guard must never fire on.
+
+    Same fail-safe direction, and the same explicit both-sides-non-empty guard,
+    as `fixer_prs`: an unresolvable PR author ("" — a deleted account, a
+    GraphQL null) or an unset FIX_BOT reads as NOT-ours. The asymmetry is
+    deliberate and points the way the money does: treating an unknown author as
+    ours would dispatch a duplicate resolve (the ≈$32 mistake #39 is about),
+    while treating it as theirs at worst posts a comment on an issue the
+    operator can un-block in one click."""
+    return bool(
+        ref.author and cfg.fix_bot and login_eq(ref.author, cfg.fix_bot)
+    )
+
+
+def duplicate_pr_guards(
+    world: WorldState, cfg: FixConfig
+) -> tuple[DuplicatePR, ...]:
+    """Every ai-ready issue that an OPEN, non-fix-bot PR already closes.
+
+    THE single definition, in the `issue_holds` / `ci_pending_stalls` shape:
+    `decide_fix` refuses exactly what this returns and the wiring journals
+    exactly what this returns, so the journal cannot disagree with the action.
+
+    Reads `world.closing_refs` (a repo-wide open-PR list the fix world builder
+    fills), never `world.prs` — the fix world's `prs` are the harness's OWN
+    label-scoped PRs, so a stranger's PR is structurally absent from it, which
+    is precisely why #39 was invisible. An unfilled `closing_refs` yields no
+    guards: the guard fails OPEN (see `WorldState.closing_refs`).
+
+    Base branch is NOT part of the test — see `ClosingRef`."""
+    if not cfg.duplicate_pr_guard:
+        return ()
+    ready = {
+        i.number for i in world.open_issues() if issue_lifecycle(i).is_ready
+    }
+    seen: set[int] = set()
+    out: list[DuplicatePR] = []
+    for ref in world.closing_refs:
+        if ref.issue not in ready or ref.issue in seen or _is_fixers(ref, cfg):
+            continue
+        seen.add(ref.issue)
+        out.append(DuplicatePR(issue=ref.issue, pr=ref.pr, author=ref.author))
+    return tuple(out)
 
 
 # ── cores ────────────────────────────────────────────────────────────────────
@@ -633,10 +731,11 @@ def decide_fix(
 ) -> list[Action]:
     """One fix-watcher poll. Emits, in poll_once order:
 
-      reap (when idle) → CI pending-deadline escalation (lock-free) → at most
-      ONE fixer-consuming dispatch (resolve > resume > address-review > fix-ci,
-      in that priority) → auto-merge (lock-free) → cleanup of merged/closed PRs
-      (lock-free).
+      reap (when idle) → CI pending-deadline escalation (lock-free) →
+      duplicate-PR guard (lock-free) → at most ONE fixer-consuming dispatch
+      (resolve > resume > address-review > fix-ci, in that priority) →
+      auto-merge (lock-free) → cleanup of merged/closed PRs (lock-free).
+
 
     Only ONE fixer-consuming action is ever returned per poll (the single-fixer
     invariant). `fixer_busy` reflects the live run-lock and gates the reap step.
@@ -675,10 +774,28 @@ def decide_fix(
         actions.extend(_escalate_pr(stall.pr, stall.reason))
         open_prs = [p for p in open_prs if p.number != stall.pr]
 
+    # 0b) Duplicate-PR guard (#39). Lock-free for the same reason the pass above
+    # is: it dispatches no agent and emits the same actions for a given world
+    # whether the fixer is busy or idle. It runs BEFORE the resolve pass and
+    # names the issues that pass must not dispatch — refusing an issue and
+    # resolving it in the same tick would be incoherent, and the whole point is
+    # that the resolve never happens.
+    guarded: set[int] = set()
+    for dup in duplicate_pr_guards(world, cfg):
+        actions.extend(dup.actions())
+        guarded.add(dup.issue)
+
     # 1) New ai-ready issue (highest priority).
     if not consumed:
         n = pick_ready_issue(world)
-        if n is not None:
+        if n is not None and n in guarded:
+            # Refused above (comment + ai-ready→ai-blocked). No fixer is
+            # consumed and no other issue is picked this poll: the relabel takes
+            # this one out of the ready set, so the next-highest-priority issue
+            # is picked next tick — the same one-shot shape the resolve breaker
+            # relies on.
+            pass
+        elif n is not None:
             # Resolve breaker (T3 finding): every other paid leg has a retry
             # ceiling; resolve — the most expensive — had none, so an
             # always-erroring resolve requeued ai-ready and re-dispatched a

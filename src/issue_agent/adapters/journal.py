@@ -736,6 +736,18 @@ def ci_pending_keys(events) -> set[str]:
     return _emitted_block_keys(events, "ci_pending_deadline")
 
 
+def duplicate_pr_keys(events) -> set[str]:
+    """The `block_key`s a `duplicate_pr_guard` event has ALREADY been emitted for.
+
+    Same edge-trigger read (#39), and the same LEVEL argument: the guard's own
+    relabel (ai-ready → ai-blocked) normally makes it one-shot, but a relabel
+    that GitHub rejected leaves the issue ai-ready with the duplicate PR still
+    open — a state that re-derives identically every poll. The key carries the
+    PR number, so a DIFFERENT duplicate PR on the same issue is reported again.
+    """
+    return _emitted_block_keys(events, "duplicate_pr_guard")
+
+
 def recurrence_keys(events) -> set[str]:
     """The `block_key`s a `recurrence` event has ALREADY been emitted for.
 
@@ -906,6 +918,7 @@ __all__ = [
     "event_line",
     "events_within",
     "ci_pending_keys",
+    "duplicate_pr_keys",
     "hold_keys",
     "observed_cost_per_token",
     "parse_ts",

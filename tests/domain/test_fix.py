@@ -1,6 +1,6 @@
 """Fix-watcher decision behaviour — the poll_once control flow + invariants."""
 
-from builders import Check, Comment, Review, issue, pr, world
+from builders import Check, Comment, Review, closing_ref, issue, pr, world
 
 from issue_agent.domain.actions import (
     AgentKind,
@@ -25,6 +25,7 @@ from issue_agent.domain.fix import (
     ci_pending_stalls,
     cleanup_actions,
     decide_fix,
+    duplicate_pr_guards,
     issue_holds,
     issues_needing_resume,
     pick_ready_issue,
@@ -1180,3 +1181,125 @@ def test_stalls_are_reported_as_the_values_the_escalation_acts_on():
 
 def test_no_stalls_reported_when_nothing_is_stalled():
     assert ci_pending_stalls(world(prs=[_wedged_pr()], now=_stall_now(60)), CFG) == ()
+
+
+# ── duplicate-PR guard (#39) ─────────────────────────────────────────────────
+# Evidence: the operator's own open PR already closed the issue; labelling it
+# ai-ready dispatched a full resolve anyway → a duplicate PR for ≈$32, racing a
+# fix that was already written.
+def _guard_world(*refs, issue_labels=("ai-ready", "P1")):
+    return world(issues=[issue(7, *issue_labels)], closing_refs=refs)
+
+
+def _relabels(actions):
+    return [a for a in actions if isinstance(a, Relabel)]
+
+
+def test_third_party_open_pr_closing_the_issue_blocks_the_resolve():
+    w = _guard_world(closing_ref(558, 7, author="xnmp"))
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+    # The expensive half: no resolve is dispatched at all.
+    assert _run_agents(actions) == []
+    # The advisory half: the operator is told WHICH PR, and the issue parks in
+    # ai-blocked (not needs-human-review — nothing is broken).
+    assert Relabel(Target.ISSUE, 7, Label.AI_READY, Label.AI_BLOCKED) in actions
+    body = next(a.body for a in actions if isinstance(a, PostComment))
+    assert "#558" in body and "xnmp" in body
+    # ...and specifically NOT the ai-working relabel a dispatch would have made.
+    assert Relabel(Target.ISSUE, 7, Label.AI_READY, Label.AI_WORKING) not in actions
+
+
+def test_fix_bots_own_open_pr_is_the_normal_in_flight_state_not_a_duplicate():
+    # The fixer's own PR closes its issue by construction; guarding on that would
+    # block the harness from ever resolving anything.
+    w = _guard_world(closing_ref(558, 7, author="fix-bot"))
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+    assert RunAgent(AgentKind.RESOLVE, 7) in _run_agents(actions)
+
+
+def test_fix_bot_matched_through_login_eq_not_raw_equality():
+    # A FIX_BOT/author pair differing only by the `[bot]` suffix is the SAME
+    # identity (review C1) — reading it as a stranger would block every issue.
+    w = _guard_world(closing_ref(558, 7, author="Fix-Bot[bot]"))
+    assert RunAgent(AgentKind.RESOLVE, 7) in _run_agents(
+        decide_fix(w, CFG, FixState(), fixer_busy=False)
+    )
+
+
+def test_unknown_author_on_a_closing_pr_is_treated_as_not_ours():
+    # An unresolvable author (deleted account / GraphQL null) still means a PR
+    # exists that closes this issue, so the fix is already written. Fail toward
+    # not spending: at worst the operator un-blocks in one click.
+    w = _guard_world(closing_ref(558, 7, author=""))
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+    assert _run_agents(actions) == []
+    assert Relabel(Target.ISSUE, 7, Label.AI_READY, Label.AI_BLOCKED) in actions
+
+
+def test_no_closing_refs_collected_dispatches_as_before():
+    # Fail-open: an empty closing_refs means "not collected", never "no duplicate
+    # exists" — but a guard that refused work on missing data would strand every
+    # issue on any world builder that does not fill it.
+    actions = decide_fix(_guard_world(), CFG, FixState(), fixer_busy=False)
+    assert RunAgent(AgentKind.RESOLVE, 7) in _run_agents(actions)
+
+
+def test_a_pr_closing_a_different_issue_does_not_block_this_one():
+    w = _guard_world(closing_ref(558, 999, author="xnmp"))
+    assert RunAgent(AgentKind.RESOLVE, 7) in _run_agents(
+        decide_fix(w, CFG, FixState(), fixer_busy=False)
+    )
+
+
+def test_guard_ignores_issues_that_are_not_ai_ready():
+    # An ai-pr-open issue is mid-flight; the guard is a DISPATCH-time refusal
+    # and must not relabel work already under way.
+    w = _guard_world(closing_ref(558, 7, author="xnmp"),
+                     issue_labels=("ai-pr-open",))
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+    assert _relabels(actions) == []
+
+
+def test_guard_is_one_shot_because_the_relabel_leaves_the_ready_set():
+    # The relabel IS the dedup (the `_escalate_pr` pattern): re-deciding the
+    # world it produces yields no second comment and no second relabel.
+    ref = closing_ref(558, 7, author="xnmp")
+    first = decide_fix(_guard_world(ref), CFG, FixState(), fixer_busy=False)
+    assert len(_relabels(first)) == 1
+    after = world(issues=[issue(7, "ai-blocked")], closing_refs=[ref])
+    assert decide_fix(after, CFG, FixState(), fixer_busy=False) == []
+
+
+def test_guard_reports_exactly_what_it_refuses():
+    # Same single-definition contract as issue_holds / ci_pending_stalls: the
+    # journal reads this, decide_fix acts on this, so they cannot disagree.
+    w = _guard_world(closing_ref(558, 7, author="xnmp"))
+    dups = duplicate_pr_guards(w, CFG)
+    assert len(dups) == 1
+    assert (dups[0].issue, dups[0].pr, dups[0].author) == (7, 558, "xnmp")
+
+
+def test_guard_reports_one_pr_per_issue_even_when_several_close_it():
+    w = _guard_world(closing_ref(558, 7, author="a"), closing_ref(559, 7, author="b"))
+    dups = duplicate_pr_guards(w, CFG)
+    assert [d.pr for d in dups] == [558]      # first wins: one comment, one relabel
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+    assert len(_relabels(actions)) == 1
+
+
+def test_guard_can_be_switched_off():
+    cfg = FixConfig(fix_bot="fix-bot", duplicate_pr_guard=False)
+    w = _guard_world(closing_ref(558, 7, author="xnmp"))
+    assert duplicate_pr_guards(w, cfg) == ()
+    assert RunAgent(AgentKind.RESOLVE, 7) in _run_agents(
+        decide_fix(w, cfg, FixState(), fixer_busy=False)
+    )
+
+
+def test_guarded_issue_does_not_consume_the_polls_other_work():
+    # The guard emits no RunAgent, so a PR leg in the same world still runs —
+    # refusing a resolve must not idle the fixer.
+    p = pr(100, "ai-pr-open", head_ref_oid="sha-1",
+           checks=(Check("unit", bucket="fail"),))
+    w = world(issues=[issue(7, "ai-ready")], prs=[p],
+              closing_refs=[closing_ref(558, 7, author="xnmp")])
