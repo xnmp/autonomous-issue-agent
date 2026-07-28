@@ -46,6 +46,7 @@ from issue_agent.app.planners.tasks import (
     ReviewTaskConfig,
 )
 from issue_agent.app.roles import (
+    _ci_flake_reporter,
     _ci_stall_reporter,
     _duplicate_pr_reporter,
     _fix_state,
@@ -1509,3 +1510,56 @@ def test_the_reporter_and_the_decision_read_the_same_world(tmp_path):
     assert _duplicates_in(journal)[0]["pr"] == 558
 
 
+# ── confirmed-flake reporting (#38) ──────────────────────────────────────────
+def _rerun_world(bucket="pass", head="sha-1"):
+    return WorldState(
+        prs=(
+            PRView(144, head_ref_name="fix/9-x", head_ref_oid=head, state="OPEN",
+                   author=FIX_BOT, labels=frozenset({Label.AI_PR_OPEN}),
+                   checks=(Check("unit", bucket=bucket),)),
+        ),
+    )
+
+
+def _flakes_in(journal):
+    return [e for e in read_events(journal.path) if e.get("event") == "ci_flake"]
+
+
+def test_a_green_head_that_used_its_free_rerun_is_journaled_once(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    logs = []
+    report = _ci_flake_reporter(journal, "o/r", _GUARD_CFG, logs.append)
+    state = FixState(ci_rerun_head={144: "sha-1"})
+
+    for _ in range(3):
+        report(_rerun_world(), state)
+
+    events = _flakes_in(journal)
+    assert len(events) == 1
+    assert (events[0]["pr"], events[0]["head"]) == (144, "sha-1")
+    assert events[0]["block_key"] == "ci-flake:o/r:144:sha-1"
+    assert len(logs) == 3
+
+
+def test_a_green_pr_that_never_re_ran_is_not_a_flake(tmp_path):
+    # anti-vacuity twin: without this the "flake rate" would be the green rate.
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    logs = []
+    _ci_flake_reporter(journal, "o/r", _GUARD_CFG, logs.append)(
+        _rerun_world(), FixState()
+    )
+    assert _flakes_in(journal) == [] and logs == []
+
+
+# ── FixState carries the re-run marker (#38) ─────────────────────────────────
+def test_fix_state_reads_the_ci_rerun_marker_the_executor_wrote(tmp_path):
+    """Round trip through the REAL store: the executor's write must be the value
+    the domain reads, or the free re-run repeats forever."""
+    store = Store(str(tmp_path / "state"))
+    world = _rerun_world(bucket="fail")
+    assert _fix_state(store, world).ci_rerun_head[144] == ""   # fresh PR: unspent
+    store.set_ci_rerun_head(144, "sha-1")
+    assert _fix_state(store, world).ci_rerun_head[144] == "sha-1"
+    # ...and that is exactly what stops a second free re-run on the same head.
+    actions = decide_fix(world, _GUARD_CFG, _fix_state(store, world), fixer_busy=False)
+    assert RunAgent(AgentKind.FIX_CI, 144) in actions

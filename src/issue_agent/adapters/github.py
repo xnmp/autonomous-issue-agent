@@ -1025,6 +1025,50 @@ class GitHubGateway:
     # agent can rediscover the failure itself) rather than not happen at all. A log
     # fetch may never kill a dispatch. The one exception is `MissingListLimit`,
     # which is a bug in this module, not a runtime condition (review C2).
+    def failed_run_id(self, pr: int, *, branch: str = "") -> int | None:
+        """databaseId of the newest FAILED Actions run on this PR's head branch,
+        or None (green branch; runs exist but none failed; no Actions run at all
+        — a red PR whose only red mark is an external status context).
+
+        Extracted from `failed_run_log` so the CI-fix prompt and the free re-run
+        (#38) can never disagree about WHICH run failed. Keyed on the REAL head
+        branch for the reason the bash comment gives: `gh run list` has no PR
+        filter, and deriving the branch from the issue number is what the bash
+        got wrong first. Raises nothing but `MissingListLimit` — see the section
+        comment above."""
+        head = branch or self.get_pr(pr, mergeability=False).head_ref_name
+        if not head:
+            return None
+        runs = self._gh_json(
+            ["run", "list", "--repo", self.repo, "--branch", head,
+             "--status", "failure", "--json", "databaseId", "--limit", "1"]
+        ) or []
+        run_id = runs[0].get("databaseId") if runs else None  # type: ignore[union-attr]
+        return int(run_id) if run_id else None
+
+    def rerun_failed_checks(self, pr: int, *, branch: str = "") -> int | None:
+        """`gh run rerun <id> --failed` on this PR's newest failed run (#38).
+        Returns the run id re-run, or None if there was nothing to re-run or the
+        call failed.
+
+        Fails SOFT by contract, and the caller (the `RerunFailedChecks` arm of
+        the Executor) marks the head's allowance as spent BEFORE getting here —
+        so "no Actions run found" (external status contexts, a status with no
+        run behind it) and "gh refused" both degrade to the paid FIX_CI leg on
+        the next poll, which is exactly the pre-#38 behaviour. The failure a
+        soft return must NOT become is a retry loop, and it cannot: the marker
+        is already written."""
+        try:
+            run_id = self.failed_run_id(pr, branch=branch)
+            if run_id is None:
+                return None
+            self._gh(["run", "rerun", str(run_id), "--repo", self.repo, "--failed"])
+            return run_id
+        except MissingListLimit:
+            raise
+        except Exception:  # noqa: BLE001 — see the docstring
+            return None
+
     def failed_run_log(
         self, pr: int, *, branch: str = "", lines: int = _FAILED_LOG_LINES
     ) -> str:
@@ -1037,15 +1081,8 @@ class GitHubGateway:
         first. Pass `branch` when the caller already holds the PRView, to save the
         `gh pr view` round-trip."""
         try:
-            head = branch or self.get_pr(pr, mergeability=False).head_ref_name
-            if not head:
-                return ""
-            runs = self._gh_json(
-                ["run", "list", "--repo", self.repo, "--branch", head,
-                 "--status", "failure", "--json", "databaseId", "--limit", "1"]
-            ) or []
-            run_id = runs[0].get("databaseId") if runs else None  # type: ignore[union-attr]
-            if not run_id:
+            run_id = self.failed_run_id(pr, branch=branch)
+            if run_id is None:
                 return ""  # green branch, or runs exist but none failed
             log = self._gh(
                 ["run", "view", str(run_id), "--repo", self.repo, "--log-failed"]

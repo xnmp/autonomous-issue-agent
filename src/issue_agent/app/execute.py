@@ -27,6 +27,7 @@ from ..domain.actions import (
     PostComment,
     Relabel,
     RemoveWorktree,
+    RerunFailedChecks,
     RunAgent,
     Target,
 )
@@ -48,6 +49,7 @@ class Executor:
         run_agent: Callable[[RunAgent], None] | None = None,
         log: Callable[[str], None] | None = None,
         mark_automerge: Callable[[int], None] | None = None,
+        mark_ci_rerun: Callable[[int, str], None] | None = None,
         clear_issue_state: Callable[[int, int | None, bool], None] | None = None,
         journal=None,
         alert_cmd: str = "",
@@ -61,6 +63,12 @@ class Executor:
         # production call sites), so should_automerge re-armed every poll —
         # one wasted `gh pr merge --auto` per merge-ready PR per tick.
         self._mark_automerge = mark_automerge or (lambda pr: None)
+        # Persists the "this head has spent its ONE free CI re-run" marker the
+        # decide side reads (FixState.ci_rerun_head). Only the fix daemon wires
+        # it (Store.set_ci_rerun_head); a default no-op would make the re-run
+        # loop forever, which is why the arm below refuses to call gh at all
+        # when it is absent — see there.
+        self._mark_ci_rerun = mark_ci_rerun
         # Retires STATE_DIR files on the ClearIssueState arm (review M4/D8:
         # Store.clear_issue/clear_pr_review had zero production call sites).
         # Default no-op keeps tests/other roles' Executors quiet — only the
@@ -94,6 +102,8 @@ class Executor:
             return f"enable auto-merge PR #{action.pr} ({action.method})"
         if isinstance(action, UpdateBranch):
             return f"update branch PR #{action.pr} (BEHIND → up-to-date)"
+        if isinstance(action, RerunFailedChecks):
+            return f"re-run failed checks PR #{action.pr} ({action.head[:7]})"
         if isinstance(action, AddDependency):
             return f"link #{action.issue} blocked-by #{action.blocker}"
         if isinstance(action, RemoveWorktree):
@@ -153,6 +163,8 @@ class Executor:
                 )
         elif isinstance(action, UpdateBranch):
             self.gateway.update_branch(action.pr)
+        elif isinstance(action, RerunFailedChecks):
+            self._rerun_failed_checks(action)
         elif isinstance(action, AddDependency):
             self.gateway.add_blocked_by(action.issue, action.blocker)
         elif isinstance(action, RemoveWorktree):
@@ -165,6 +177,47 @@ class Executor:
             return
         else:  # pragma: no cover - exhaustive ADT guard
             raise TypeError(f"unhandled action: {action!r}")
+
+    def _rerun_failed_checks(self, action: RerunFailedChecks) -> None:
+        """The free CI re-run (#38): spend the head's ONE allowance, then ask
+        GitHub to re-run the failed checks.
+
+        The marker is written FIRST, deliberately. The two orderings fail in
+        opposite directions, and only one of them is bounded:
+
+          * mark → rerun: if this process dies (or gh fails) in between, the
+            allowance is spent and the next poll dispatches the paid FIX_CI leg
+            — precisely what would have happened with no re-run at all.
+          * rerun → mark: a death in between leaves a spent re-run unrecorded,
+            so the next poll re-runs again, and again — an unbounded free-CI
+            loop with no breaker anywhere behind it (every retry counter in the
+            fixer counts AGENT attempts, and this dispatches no agent).
+
+        Without an injected marker writer there is no way to record the
+        allowance, so the re-run is SKIPPED rather than run unbounded — the
+        review/steward Executors, and any test that doesn't wire one, keep the
+        pre-#38 behaviour instead of gaining a loop."""
+        if self._mark_ci_rerun is None:
+            self._log(
+                f"CI re-run PR #{action.pr}: skipped (no marker writer wired) — "
+                "the paid CI-fix leg dispatches next poll"
+            )
+            return
+        self._mark_ci_rerun(action.pr, action.head)
+        run_id = self.gateway.rerun_failed_checks(action.pr)
+        if run_id is None:
+            # Nothing to re-run (external status contexts, no Actions run) or gh
+            # refused. Soft by design: the marker above already guarantees the
+            # next poll pays for the leg instead of retrying this.
+            self._log(
+                f"CI re-run PR #{action.pr}: no failed Actions run found (or gh "
+                "refused) — the paid CI-fix leg dispatches next poll"
+            )
+        if self._journal is not None:
+            self._journal.emit(
+                "ci_rerun", pr=action.pr, head=action.head, run_id=run_id or 0,
+                ok=run_id is not None,
+            )
 
     def execute_all(self, actions) -> None:
         """Apply every action, even if one raises (review S7): before this, one

@@ -10,6 +10,7 @@ from issue_agent.domain.actions import (
     PostComment,
     Relabel,
     RemoveWorktree,
+    RerunFailedChecks,
     RunAgent,
     AgentKind,
     Target,
@@ -36,6 +37,10 @@ class FakeGateway:
 
     def update_branch(self, pr):
         self.calls.append(("update_branch", pr))
+
+    def rerun_failed_checks(self, pr):
+        self.calls.append(("rerun", pr))
+        return getattr(self, "rerun_run_id", 4242)
 
 
 def _exec():
@@ -105,6 +110,65 @@ def test_update_branch():
     ex, gw, _, _ = _exec()
     ex.execute(UpdateBranch(100))
     assert gw.calls == [("update_branch", 100)]
+
+
+# ── free CI re-run (#38) ────────────────────────────────────────────────────
+class _Journal:
+    def __init__(self):
+        self.events = []
+
+    def emit(self, event, **fields):
+        self.events.append((event, fields))
+
+
+def test_rerun_marks_the_head_before_asking_github():
+    # Ordering is the whole safety property: marker THEN gh. The reverse loses
+    # the record if the process dies in between, and a free re-run with no
+    # record is an unbounded loop (no retry counter counts a non-agent action).
+    gw = FakeGateway()
+    marked = []
+    ex = Executor(gw, mark_ci_rerun=lambda pr, head: marked.append((pr, head)))
+    ex.execute(RerunFailedChecks(100, "sha-1"))
+    assert marked == [(100, "sha-1")]
+    assert gw.calls == [("rerun", 100)]
+
+
+def test_rerun_journals_the_run_it_triggered():
+    gw = FakeGateway()
+    j = _Journal()
+    ex = Executor(gw, mark_ci_rerun=lambda pr, head: None, journal=j)
+    ex.execute(RerunFailedChecks(100, "sha-1"))
+    kind, fields = next(e for e in j.events if e[0] == "ci_rerun")
+    assert (fields["pr"], fields["head"], fields["run_id"], fields["ok"]) == (
+        100, "sha-1", 4242, True
+    )
+
+
+def test_rerun_that_finds_no_run_still_keeps_the_marker_and_says_so():
+    # External status contexts (or a gh refusal) leave nothing to re-run. Soft
+    # by design: the marker is already spent, so the next poll buys the paid leg
+    # instead of retrying this forever.
+    gw = FakeGateway()
+    gw.rerun_run_id = None
+    marked, logged = [], []
+    j = _Journal()
+    ex = Executor(gw, mark_ci_rerun=lambda pr, head: marked.append((pr, head)),
+                  journal=j, log=logged.append)
+    ex.execute(RerunFailedChecks(100, "sha-1"))
+    assert marked == [(100, "sha-1")]
+    assert any("no failed Actions run" in line for line in logged)
+    assert next(f for e, f in j.events if e == "ci_rerun")["ok"] is False
+
+
+def test_rerun_without_a_marker_writer_does_not_touch_github():
+    # The review/steward Executors wire no marker writer. Running the re-run
+    # there would be unrecordable — i.e. unbounded — so it is skipped instead.
+    gw = FakeGateway()
+    logged = []
+    ex = Executor(gw, log=logged.append)
+    ex.execute(RerunFailedChecks(100, "sha-1"))
+    assert gw.calls == []
+    assert any("no marker writer" in line for line in logged)
 
 
 def test_remove_worktree_delegated():

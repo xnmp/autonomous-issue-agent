@@ -11,10 +11,12 @@ from issue_agent.domain.actions import (
     PostComment,
     Relabel,
     RemoveWorktree,
+    RerunFailedChecks,
     RunAgent,
     Target,
 )
 from issue_agent.domain.fix import (
+    CiFlake,
     FixConfig,
     FixState,
     HOLD_BLOCKER,
@@ -22,6 +24,7 @@ from issue_agent.domain.fix import (
     Hold,
     breaker_tripped,
     breaker_key,
+    ci_flakes,
     ci_pending_stalls,
     cleanup_actions,
     decide_fix,
@@ -686,9 +689,13 @@ def test_superseded_review_not_redispatched():
 
 def test_superseded_review_still_allows_ci_fix():
     # While awaiting re-review, a CI failure on the NEW head is still ours.
+    # The free re-run (#38) is already spent on this head, so the question the
+    # test is actually about — does a superseded review suppress the CI leg? —
+    # is asked of the PAID dispatch rather than of the flake probe in front of it.
     w = world(prs=[_reviewed_pr(commit_id="aaa", head_oid="bbb",
                                 checks=[Check("unit", bucket="fail")])])
-    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+    state = FixState(ci_rerun_head={100: "bbb"})
+    actions = decide_fix(w, CFG, state, fixer_busy=False)
     assert RunAgent(AgentKind.FIX_CI, 100) in _run_agents(actions)
 
 
@@ -1303,3 +1310,124 @@ def test_guarded_issue_does_not_consume_the_polls_other_work():
            checks=(Check("unit", bucket="fail"),))
     w = world(issues=[issue(7, "ai-ready")], prs=[p],
               closing_refs=[closing_ref(558, 7, author="xnmp")])
+    state = FixState(ci_rerun_head={100: "sha-1"})   # free re-run already spent
+    actions = decide_fix(w, CFG, state, fixer_busy=False)
+    assert RunAgent(AgentKind.FIX_CI, 100) in _run_agents(actions)
+
+
+# ── flake-aware CI repair: one free re-run per head SHA (#38) ────────────────
+# Evidence: two FIX_CI legs ($13.15 + $28.88) of one night both re-fixed the
+# same pre-existing flaky test, unrelated to either PR's diff.
+def _red_pr(head="sha-1"):
+    return pr(100, "ai-pr-open", head_ref_oid=head,
+              checks=(Check("unit", bucket="fail"),))
+
+
+def _reruns(actions):
+    return [a for a in actions if isinstance(a, RerunFailedChecks)]
+
+
+def test_first_failure_on_a_head_re_runs_instead_of_paying_for_a_leg():
+    w = world(prs=[_red_pr()])
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+    assert _reruns(actions) == [RerunFailedChecks(100, "sha-1")]
+    assert _run_agents(actions) == []                # the $13–29 never happens
+
+
+def test_second_failure_on_the_same_head_pays_for_the_leg():
+    # The re-run was spent and the checks came back red on the identical commit:
+    # that is evidence about the diff, not about flake.
+    w = world(prs=[_red_pr()])
+    state = FixState(ci_rerun_head={100: "sha-1"})
+    actions = decide_fix(w, CFG, state, fixer_busy=False)
+    assert _reruns(actions) == []
+    assert RunAgent(AgentKind.FIX_CI, 100) in _run_agents(actions)
+
+
+def test_a_new_head_gets_a_fresh_free_re_run():
+    # A push is a genuinely new failure; the marker keys on the SHA so the
+    # allowance resets with no extra bookkeeping.
+    w = world(prs=[_red_pr(head="sha-2")])
+    state = FixState(ci_rerun_head={100: "sha-1"})
+    assert _reruns(decide_fix(w, CFG, state, fixer_busy=False)) == [
+        RerunFailedChecks(100, "sha-2")
+    ]
+
+
+def test_pending_checks_after_a_re_run_dispatch_nothing():
+    # The re-run flips the checks to PENDING and the existing
+    # pending-outranks-failure rule waits — no leg, no second re-run.
+    p = pr(100, "ai-pr-open", head_ref_oid="sha-1",
+           checks=(Check("unit", bucket="pending"), Check("lint", bucket="fail")))
+    state = FixState(ci_rerun_head={100: "sha-1"})
+    actions = decide_fix(world(prs=[p]), CFG, state, fixer_busy=False)
+    assert _reruns(actions) == [] and _run_agents(actions) == []
+
+
+def test_an_unknown_head_sha_never_re_runs():
+    # With no SHA the executor could not record the allowance as spent, so a
+    # re-run here would loop forever. Fall through to the paid (breaker-bounded)
+    # leg instead.
+    p = pr(100, "ai-pr-open", head_ref_oid="",
+           checks=(Check("unit", bucket="fail"),))
+    actions = decide_fix(world(prs=[p]), CFG, FixState(), fixer_busy=False)
+    assert _reruns(actions) == []
+    assert RunAgent(AgentKind.FIX_CI, 100) in _run_agents(actions)
+
+
+def test_the_re_run_consumes_no_fixer_so_another_pr_can_still_dispatch():
+    red = _red_pr()
+    other = pr(101, "ai-pr-open", head_ref_oid="sha-9",
+               checks=(Check("unit", bucket="fail"),))
+    state = FixState(ci_rerun_head={101: "sha-9"})    # #101's re-run is spent
+    actions = decide_fix(world(prs=[red, other]), CFG, state, fixer_busy=False)
+    assert _reruns(actions) == [RerunFailedChecks(100, "sha-1")]
+    assert RunAgent(AgentKind.FIX_CI, 101) in _run_agents(actions)
+
+
+def test_the_ci_breaker_still_escalates_before_a_free_re_run():
+    # A PR that has burnt its CI-fix budget belongs to a human; delaying that by
+    # a CI cycle would move the escalation latency the wrong way.
+    cfg = FixConfig(fix_bot="fix-bot", max_ci_retries=1)
+    w = world(prs=[_red_pr()])
+    actions = decide_fix(w, cfg, FixState(ci_retries={100: 1}), fixer_busy=False)
+    assert _reruns(actions) == []
+    assert Relabel(Target.PR, 100, Label.AI_PR_OPEN,
+                   Label.NEEDS_HUMAN_REVIEW) in actions
+
+
+def test_free_re_run_can_be_switched_off():
+    cfg = FixConfig(fix_bot="fix-bot", ci_free_rerun=False)
+    actions = decide_fix(world(prs=[_red_pr()]), cfg, FixState(), fixer_busy=False)
+    assert _reruns(actions) == []
+    assert RunAgent(AgentKind.FIX_CI, 100) in _run_agents(actions)
+
+
+def test_a_strangers_red_pr_is_never_re_run():
+    # Containment: the fixer acts only on its OWN PRs, and a re-run is an act.
+    p = pr(100, "ai-pr-open", author="a-human", head_ref_oid="sha-1",
+           checks=(Check("unit", bucket="fail"),))
+    actions = decide_fix(world(prs=[p]), CFG, FixState(), fixer_busy=False)
+    assert _reruns(actions) == [] and _run_agents(actions) == []
+
+
+def test_a_head_that_used_its_re_run_and_went_green_is_a_confirmed_flake():
+    # The measurement behind #38's metric: a leg that was never bought.
+    p = pr(100, "ai-pr-open", head_ref_oid="sha-1",
+           checks=(Check("unit", bucket="pass"),))
+    state = FixState(ci_rerun_head={100: "sha-1"})
+    assert ci_flakes(world(prs=[p]), CFG, state) == (CiFlake(pr=100, head="sha-1"),)
+
+
+def test_green_without_a_spent_re_run_is_not_a_flake():
+    # anti-vacuity twin: an ordinarily-green PR must not inflate the flake count.
+    p = pr(100, "ai-pr-open", head_ref_oid="sha-1",
+           checks=(Check("unit", bucket="pass"),))
+    assert ci_flakes(world(prs=[p]), CFG, FixState()) == ()
+
+
+def test_a_re_run_head_that_is_still_red_is_not_yet_a_flake():
+    p = pr(100, "ai-pr-open", head_ref_oid="sha-1",
+           checks=(Check("unit", bucket="fail"),))
+    state = FixState(ci_rerun_head={100: "sha-1"})
+    assert ci_flakes(world(prs=[p]), CFG, state) == ()

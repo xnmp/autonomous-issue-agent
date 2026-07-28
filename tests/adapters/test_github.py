@@ -638,6 +638,36 @@ def test_open_closing_refs_fails_soft_to_empty():
     assert gw.open_closing_refs() == ()
 
 
+# ── free CI re-run (#38) ─────────────────────────────────────────────────────
+def test_rerun_failed_checks_reruns_the_newest_failed_run():
+    fr = FakeRunner({"run list": [{"databaseId": 4242}]})
+    gw = GitHubGateway("o/r", runner=fr)
+    assert gw.rerun_failed_checks(100, branch="fix/5-x") == 4242
+    rerun = [c[0] for c in fr.calls if c[0][1:3] == ["run", "rerun"]][0]
+    assert rerun[1:4] == ["run", "rerun", "4242"] and "--failed" in rerun
+
+
+def test_rerun_failed_checks_is_none_when_no_actions_run_failed():
+    # A red PR whose only red mark is an external status context: nothing to
+    # re-run, so the caller falls through to the paid leg.
+    fr = FakeRunner({"run list": []})
+    gw = GitHubGateway("o/r", runner=fr)
+    assert gw.rerun_failed_checks(100, branch="b") is None
+    assert not any(c[0][1:3] == ["run", "rerun"] for c in fr.calls)
+
+
+def test_rerun_failed_checks_fails_soft_when_gh_dies():
+    gw = GitHubGateway("o/r", runner=_raising_runner(GhUnavailable("server", "HTTP 503")))
+    assert gw.rerun_failed_checks(100, branch="b") is None
+
+
+def test_failed_run_id_and_failed_run_log_agree_on_the_run():
+    # One lookup, two consumers — the CI-fix prompt and the re-run must never
+    # disagree about WHICH run failed.
+    fr = FakeRunner({"run list": [{"databaseId": 77}], "run view 77": "boom"})
+    gw = GitHubGateway("o/r", runner=fr)
+    assert gw.failed_run_id(100, branch="b") == 77
+    assert gw.failed_run_log(100, branch="b") == "boom"
 
 
 # ── _subprocess_runner: benign statusCheckRollup noise gated behind debug ──────

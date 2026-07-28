@@ -748,6 +748,18 @@ def duplicate_pr_keys(events) -> set[str]:
     return _emitted_block_keys(events, "duplicate_pr_guard")
 
 
+def ci_flake_keys(events) -> set[str]:
+    """The `block_key`s a `ci_flake` event has ALREADY been emitted for.
+
+    A confirmed flake (#38) is the most level-like signal of the set: the marker
+    and the green head both persist until the PR merges, so the derivation is
+    true on every poll in between. The key carries the head SHA — the flake
+    count is the measurement behind "repair-leg share of spend", and a count
+    inflated by one line per poll measures the poll interval, not the flakes.
+    """
+    return _emitted_block_keys(events, "ci_flake")
+
+
 def recurrence_keys(events) -> set[str]:
     """The `block_key`s a `recurrence` event has ALREADY been emitted for.
 
@@ -917,6 +929,7 @@ __all__ = [
     "estimate_cost_usd",
     "event_line",
     "events_within",
+    "ci_flake_keys",
     "ci_pending_keys",
     "duplicate_pr_keys",
     "hold_keys",
