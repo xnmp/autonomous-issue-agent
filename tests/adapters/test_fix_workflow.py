@@ -57,7 +57,11 @@ def _workflow(gw, store, runner, wt=None, **cfg_overrides):
     cfg_kwargs.update(cfg_overrides)
     cfg = FixWorkflowConfig(**cfg_kwargs)
     worktrees = wt or FakeWorktrees()
-    executor = Executor(gw, remove_worktree=worktrees.remove)
+    executor = Executor(
+        gw,
+        remove_worktree=worktrees.remove,
+        clear_issue_state=getattr(store, "cleanup_pr", None),
+    )
     return FixWorkflow(cfg, gw, store, worktrees, runner, executor)
 
 
@@ -91,6 +95,30 @@ def test_resolve_blocked_comments_and_blocks_issue():
 
     assert any(c[0] == "comment" and "which API?" in c[3] for c in gw.calls)
     assert ("relabel", "issue", 5, "ai-working", "ai-blocked") in gw.calls
+
+
+def test_resolve_closed_without_a_pr_retires_the_issue_worktree_and_state():
+    gw = FakeGateway(
+        issues={5: IssueView(5, title="t", body="b", state="closed")},
+        pr_for_issue={},
+    )
+    store = FakeStore()
+    store.cleanup_calls = []
+    store.cleanup_pr = lambda pr, issue, merged: store.cleanup_calls.append(
+        (pr, issue, merged)
+    )
+    worktrees = FakeWorktrees()
+    worktrees.removed = []
+    worktrees.remove = worktrees.removed.append
+    runner = FakeRunner(
+        AgentResult(is_error=False, status="pushed", session_id="s5")
+    )
+
+    asyncio.run(_workflow(gw, store, runner, wt=worktrees).resolve(5))
+
+    assert worktrees.removed == [5]
+    assert store.cleanup_calls == [(None, 5, True)]
+    assert not any(c[0] == "relabel" for c in gw.calls)
 
 
 def test_fix_ci_records_retry_and_writes_no_label_on_push():

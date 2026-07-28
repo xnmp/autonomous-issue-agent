@@ -25,7 +25,12 @@ def _kept(checks: Iterable[Check], ignore_regex: str) -> list[Check]:
     deadline so an operator-ignored check can never drive either — an ignored
     check is, by definition, one the harness has been told not to reason about."""
     pattern = re.compile(ignore_regex) if ignore_regex else None
-    return [c for c in checks if pattern is None or not pattern.search(c.name or "")]
+    return [
+        c
+        for c in checks
+        if not c.advisory
+        and (pattern is None or not pattern.search(c.name or ""))
+    ]
 
 
 def _is_pending(check: Check) -> bool:

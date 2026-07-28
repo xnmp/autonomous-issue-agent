@@ -43,6 +43,7 @@ _ISSUE_SUFFIXES = (
 )
 _PR_SUFFIXES = (
     "session", "last-sha", "round", "automerge", "patch-id", "ci-rerun-head",
+    "ci-pending-escalated-head",
 )
 
 # Closed-unmerged requeue cleanup (review M4/D8, handover §5.7): only the
@@ -294,6 +295,13 @@ class Store:
     def set_ci_rerun_head(self, pr: int, sha: str) -> None:
         if sha:
             self._write(self.pr_path(pr, "ci-rerun-head"), sha)
+
+    def get_ci_pending_escalated_head(self, pr: int) -> str:
+        return self._read(self.pr_path(pr, "ci-pending-escalated-head"))
+
+    def set_ci_pending_escalated_head(self, pr: int, sha: str) -> None:
+        if sha:
+            self._write(self.pr_path(pr, "ci-pending-escalated-head"), sha)
 
     def get_round(self, pr: int) -> int:
         return self._read_int(self.pr_path(pr, "round"), default=1)

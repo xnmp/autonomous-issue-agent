@@ -5,6 +5,7 @@ from issue_agent.domain.actions import (
     ClearIssueState,
     CloseIssue,
     EnableAutoMerge,
+    EscalateCiPending,
     UpdateBranch,
     NoOp,
     PostComment,
@@ -66,6 +67,33 @@ def test_post_comment():
     ex, gw, _, _ = _exec()
     ex.execute(PostComment(Target.ISSUE, 5, "hello"))
     assert gw.calls == [("comment", "issue", 5, "hello")]
+
+
+def test_ci_pending_escalation_marks_head_after_verified_write():
+    gw = FakeGateway()
+    gw.has_label = lambda kind, number, label: True
+    marked = []
+    ex = Executor(gw, mark_ci_pending_escalated=lambda pr, head: marked.append(
+        (pr, head)
+    ))
+
+    ex.execute(EscalateCiPending(100, "sha-1", "stalled"))
+
+    assert marked == [(100, "sha-1")]
+    assert [call[0] for call in gw.calls] == ["comment", "relabel"]
+
+
+def test_ci_pending_escalation_withholds_marker_when_relabel_is_not_verified():
+    gw = FakeGateway()
+    gw.has_label = lambda kind, number, label: False
+    marked = []
+    ex = Executor(gw, mark_ci_pending_escalated=lambda pr, head: marked.append(
+        (pr, head)
+    ))
+
+    ex.execute(EscalateCiPending(100, "sha-1", "stalled"))
+
+    assert marked == []
 
 
 def test_close_issue():

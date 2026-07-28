@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -101,6 +102,24 @@ def worktree_list_contains_issue(listing: str, issue: int) -> bool:
     return False
 
 
+def _issue_worktree_branch(listing: str, issue: int) -> str:
+    """Harness-owned issue branch checked out by issue-N, or "" otherwise."""
+    expected = f"issue-{issue}"
+    current = False
+    for line in listing.splitlines():
+        if line.startswith("worktree "):
+            path = line.removeprefix("worktree ").strip()
+            current = os.path.basename(path) == expected
+        elif current and line.startswith("branch refs/heads/"):
+            branch = line.removeprefix("branch refs/heads/").strip()
+            if re.fullmatch(rf"(?:fix|feat|chore|refactor)/{issue}(?:-.+)?", branch):
+                return branch
+            return ""
+        elif current and not line.strip():
+            current = False
+    return ""
+
+
 class WorktreeUnavailable(RuntimeError):
     """`Worktrees.ensure` could not produce a usable worktree — every `git
     worktree add` attempt failed (a locked index, a stale lockfile, a race
@@ -182,8 +201,12 @@ class Worktrees:
         return abs_path
 
     def remove(self, issue: int) -> None:
+        listing = self._git(["worktree", "list", "--porcelain"], self.repo_dir)
+        branch = _issue_worktree_branch(listing.out, issue)
         self._git(["worktree", "remove", self.path(issue), "--force"], self.repo_dir)
         self._git(["worktree", "prune"], self.repo_dir)
+        if branch:
+            self._git(["branch", "-D", branch], self.repo_dir)
 
     def reset(self, issue: int) -> None:
         """Discard all uncommitted work in the issue's worktree (tracked + untracked),

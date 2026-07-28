@@ -56,7 +56,15 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 
-from .actions import Action, CloseIssue, PostComment, Relabel, Target  # noqa: F401
+from .actions import (  # noqa: F401
+    Action,
+    ClearIssueState,
+    CloseIssue,
+    PostComment,
+    Relabel,
+    RemoveWorktree,
+    Target,
+)
 from .labels import Label
 
 
@@ -286,12 +294,21 @@ _BLOCKED_FOOTER = "\n\n---\n_Reply to unblock. Any team member can answer._"
 
 
 def resolve_actions(
-    issue: int, result: AgentResult, pr: int | None
+    issue: int,
+    result: AgentResult,
+    pr: int | None,
+    *,
+    issue_closed_without_pr: bool = False,
 ) -> list[Action]:
     """resolve-issue.sh tail as Actions. pr is the discovered PR number (ground
     truth) or None. PR opened → label issue+PR ai-pr-open; blocked → comment the
     'needs' and ai-blocked; error → back to ai-ready (never strand ai-working);
     infra death → NOTHING (stay ai-working for the reaper; see module docstring)."""
+    if issue_closed_without_pr:
+        return [
+            RemoveWorktree(issue),
+            ClearIssueState(pr=None, issue=issue, merged=True),
+        ]
     fu = resolve_followup(result, pr is not None)
     if fu is ResolveFollowup.PR_OPENED:
         assert pr is not None

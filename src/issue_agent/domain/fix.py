@@ -23,6 +23,7 @@ from .actions import (
     ClearIssueState,
     CloseIssue,
     EnableAutoMerge,
+    EscalateCiPending,
     UpdateBranch,
     PostComment,
     Relabel,
@@ -152,6 +153,10 @@ class FixState:
     # while a second FAILURE on the SAME head is evidence the diff is broken and
     # goes straight to a paid FIX_CI leg. Missing/"" = never re-run.
     ci_rerun_head: dict[int, str] = field(default_factory=dict)
+    # (PR, head SHA) pairs already escalated by the pending-CI deadline. Unlike
+    # the label-based one-shot used by older breakers, this survives an
+    # operator deliberately restoring ai-pr-open while the same check runs.
+    ci_pending_escalated: frozenset[tuple[int, str]] = frozenset()
 
 
 # ── holds (why a ready issue was NOT picked) ─────────────────────────────────
@@ -350,17 +355,53 @@ def pick_ready_issue(world: WorldState) -> int | None:
 
 
 def last_human_reply(issue: IssueView, fix_bot: str) -> Comment | None:
-    """Latest comment by a real human (not the fixer, not any [bot]), or None.
-    Port of the jq in watcher.sh §2 / resume-issue.sh.
+    """Latest answer posted after the harness's unblock prompt, or None.
 
     Public because BOTH sides of the resume dedup must select the SAME comment:
     the decide-side read (issues_needing_resume, comparing created_at against
     the resumed-at mark) and the workflow's write side (set_resumed_at after
     dispatch). When the two sides used different filters the write recorded a
     different comment than the read compared, and one unanswered reply re-fired
-    a paid RESUME session every poll (V1/#13)."""
+    a paid RESUME session every poll (V1/#13).
+
+    A deployment commonly uses the operator's ambient login as FIX_BOT. Author
+    filtering therefore made that operator unable to answer their own daemon;
+    filtering `[bot]` accounts also excluded the App identity they could switch
+    to (#55). The protocol boundary is temporal, not identity-based: the
+    harness prompt contains `_Reply to unblock`, and anything posted after the
+    latest such prompt is an answer. The prompt itself can never self-trigger.
+
+    The fallback preserves pre-marker blocked threads created by older harness
+    versions: choose the latest ordinary human comment under the old rule.
+    """
+    comments = list(issue.comments)
+    prompt_prefixes = (
+        "**Agent needs input:**",
+        "**Agent still needs input:**",
+        "**Author needs input:**",
+    )
+    prompt_index = next(
+        (
+            index
+            for index in range(len(comments) - 1, -1, -1)
+            if login_eq(comments[index].author, fix_bot)
+            and comments[index].body.startswith(prompt_prefixes)
+            and "_Reply to unblock" in comments[index].body
+        ),
+        None,
+    )
+    if prompt_index is not None:
+        replies = [
+            comment
+            for comment in comments[prompt_index + 1 :]
+            if login_eq(comment.author, fix_bot)
+            or not comment.is_bot
+            or comment.body.lstrip().startswith("/unblock")
+        ]
+        return replies[-1] if replies else None
     humans = [
-        c for c in issue.comments
+        c
+        for c in comments
         if not login_eq(c.author, fix_bot) and not c.is_bot
     ]
     return humans[-1] if humans else None
@@ -942,7 +983,11 @@ def decide_fix(
     # filter this poll's other escalations) precisely because this arm is
     # lock-free itself.
     for stall in ci_pending_stalls(world, cfg):
-        actions.extend(_escalate_pr(stall.pr, stall.reason))
+        if (stall.pr, stall.head) in state.ci_pending_escalated:
+            continue
+        actions.append(
+            EscalateCiPending(stall.pr, stall.head, stall.reason)
+        )
         open_prs = [p for p in open_prs if p.number != stall.pr]
 
     # 0b) Duplicate-PR guard (#39). Lock-free for the same reason the pass above
@@ -956,71 +1001,9 @@ def decide_fix(
         actions.extend(dup.actions())
         guarded.add(dup.issue)
 
-    # 1) New ai-ready issue (highest priority).
-    if not consumed:
-        n = pick_ready_issue(world)
-        if n is not None and n in guarded:
-            # Refused above (comment + ai-ready→ai-blocked). No fixer is
-            # consumed and no other issue is picked this poll: the relabel takes
-            # this one out of the ready set, so the next-highest-priority issue
-            # is picked next tick — the same one-shot shape the resolve breaker
-            # relies on.
-            pass
-        elif n is not None:
-            # Resolve breaker (T3 finding): every other paid leg has a retry
-            # ceiling; resolve — the most expensive — had none, so an
-            # always-erroring resolve requeued ai-ready and re-dispatched a
-            # full session every poll forever. At the cap, hand it to a human.
-            # The escalation relabel takes the issue out of the pickable set,
-            # so this is one-shot; other ready issues are picked next tick.
-            if breaker_tripped(state.resolve_retries.get(n, 0),
-                               cfg.max_resolve_retries):
-                actions.extend(issue_escalation(
-                    n,
-                    f"resolve failed {cfg.max_resolve_retries}× without "
-                    "opening a PR — this issue needs a human look.",
-                    Label.AI_READY,
-                ).actions())
-            elif infra_ceiling_hit(state, cfg, n):
-                # The resolve counter above never sees these (an infra death is
-                # not an attempt), so without this the requeue→re-dispatch cycle
-                # is unbounded — the C3 loop.
-                actions.extend(issue_escalation(
-                    n, infra_escalation_reason(cfg.max_infra_deaths), Label.AI_READY,
-                ).actions())
-            else:
-                actions.append(
-                    Relabel(Target.ISSUE, n, Label.AI_READY, Label.AI_WORKING)
-                )
-                actions.append(RunAgent(AgentKind.RESOLVE, n))
-                consumed = True
-
-    # 2) Blocked issue with a NEW human reply (first one only).
-    if not consumed:
-        needing = issues_needing_resume(world, state, cfg)
-        if needing:
-            n, _at = needing[0]
-            if infra_ceiling_hit(state, cfg, n):
-                # A resume whose session keeps dying pre-result never consumes
-                # the reply (resume_actions returns NOTHING on an infra death),
-                # so the dedup mark can't stop it either — only this ceiling can
-                # (review C3). ai-blocked is the label the issue carries here.
-                actions.extend(issue_escalation(
-                    n, infra_escalation_reason(cfg.max_infra_deaths), Label.AI_BLOCKED,
-                ).actions())
-            else:
-                # Flip ai-blocked → ai-working for the duration of the resume run, so an
-                # actively-resuming issue reads as working (not still-blocked) and a
-                # second poll can't treat it as awaiting-human. Mirrors the RESOLVE
-                # dispatch relabel. resume_actions transitions FROM ai-working at the
-                # tail (pr-open / back-to-blocked / etc.), so this closes the loop.
-                actions.append(
-                    Relabel(Target.ISSUE, n, Label.AI_BLOCKED, Label.AI_WORKING)
-                )
-                actions.append(RunAgent(AgentKind.RESUME, n))
-                consumed = True
-
-    # 3) Open PRs: review responses + CI (one fixer-consuming action total).
+    # 1) Open PR repairs: finish nearly-landed work before starting a fresh,
+    # expensive resolve. Under continuous ready-issue load, the old resolve-first
+    # order starved ADDRESS_REVIEW/FIX_CI/REBASE for 88 minutes (#56).
     for pr in open_prs:
         lifecycle = pr_lifecycle(pr)
         if lifecycle.is_blocked:
@@ -1151,6 +1134,50 @@ def decide_fix(
                 actions.append(RunAgent(AgentKind.FIX_CI, pr.number))
                 consumed = True
                 continue
+
+    # 2) Blocked issue with a NEW answer (first one only).
+    if not consumed:
+        needing = issues_needing_resume(world, state, cfg)
+        if needing:
+            n, _at = needing[0]
+            if infra_ceiling_hit(state, cfg, n):
+                actions.extend(issue_escalation(
+                    n, infra_escalation_reason(cfg.max_infra_deaths), Label.AI_BLOCKED,
+                ).actions())
+            else:
+                actions.append(
+                    Relabel(Target.ISSUE, n, Label.AI_BLOCKED, Label.AI_WORKING)
+                )
+                actions.append(RunAgent(AgentKind.RESUME, n))
+                consumed = True
+
+    # 3) New ai-ready issue (highest priority), only after repair work.
+    if not consumed:
+        n = pick_ready_issue(world)
+        if n is not None and n in guarded:
+            # The duplicate guard above relabels this issue out of the ready set;
+            # let the next poll pick the next candidate.
+            pass
+        elif n is not None:
+            if breaker_tripped(
+                state.resolve_retries.get(n, 0), cfg.max_resolve_retries
+            ):
+                actions.extend(issue_escalation(
+                    n,
+                    f"resolve failed {cfg.max_resolve_retries}× without "
+                    "opening a PR — this issue needs a human look.",
+                    Label.AI_READY,
+                ).actions())
+            elif infra_ceiling_hit(state, cfg, n):
+                actions.extend(issue_escalation(
+                    n, infra_escalation_reason(cfg.max_infra_deaths), Label.AI_READY,
+                ).actions())
+            else:
+                actions.append(
+                    Relabel(Target.ISSUE, n, Label.AI_READY, Label.AI_WORKING)
+                )
+                actions.append(RunAgent(AgentKind.RESOLVE, n))
+                consumed = True
 
     # 3c) auto-merge + branch-update: lock-free and INDEPENDENT of the fixer, so
     # they get their OWN pass over the same PRs (review M14). They used to sit at

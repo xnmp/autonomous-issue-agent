@@ -57,6 +57,10 @@ class Check:
     # not started, an unparseable value) → the deadline CANNOT fire on it: a
     # missing timestamp must never be read as "infinitely old".
     started_at: str = ""
+    # A failed job inside a workflow run whose overall conclusion is SUCCESS is
+    # GitHub's machine-readable representation of `continue-on-error: true`.
+    # Such a job is visible diagnostic output, not a merge-gating failure (#31).
+    advisory: bool = False
 
 
 @dataclass(frozen=True)
