@@ -184,6 +184,67 @@ def test_run_forever_warns_on_suspend_stall():
     assert any("suspended/stalled" in m for m in logs)
 
 
+def _waking_daemon(wake_check, poll_seconds=60, logs=None):
+    d, _ = _daemon(lambda w: [], logs=logs)
+    d.poll_seconds = poll_seconds
+    d.wake_check = wake_check
+    return d
+
+
+def test_a_wake_mid_sleep_ends_the_interval_early():
+    """The whole point of push: a delivery must not wait out the reconcile
+    interval. Asserted on the observable — total seconds slept — not on how the
+    sleep is chopped up."""
+    ticks = {"n": 0}
+    # Wake on the 3rd probe of the first interval, never again.
+    probes = {"n": 0}
+
+    def wake():
+        probes["n"] += 1
+        return probes["n"] == 3
+
+    d = _waking_daemon(wake, poll_seconds=300)
+    slept = []
+    d.run_forever(sleep=slept.append, now=lambda: ticks["n"], max_ticks=2)
+    assert sum(slept) == 3 + 300  # cut short once, then a full backstop interval
+
+
+def test_without_a_wake_the_full_interval_is_slept():
+    d = _waking_daemon(lambda: False, poll_seconds=5)
+    slept = []
+    d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=2)
+    assert sum(slept) == 10
+
+
+def test_wake_wiring_does_not_change_max_ticks_or_tick_count():
+    """A wake shortens sleep; it must not smuggle in extra ticks."""
+    calls = {"n": 0}
+    d = _waking_daemon(lambda: True, poll_seconds=60)
+    d.decide = lambda w: calls.__setitem__("n", calls["n"] + 1) or []
+    d.run_forever(sleep=lambda s: None, now=lambda: 0, max_ticks=3)
+    assert calls["n"] == 3
+
+
+def test_no_wake_check_sleeps_in_one_call_as_before():
+    """Regression guard on the unwired path: no slicing, no extra sleep calls."""
+    d, _ = _daemon(lambda w: [])
+    slept = []
+    d.run_forever(sleep=slept.append, now=lambda: 0, max_ticks=2)
+    assert slept == [60, 60]
+
+
+def test_a_wake_check_that_raises_leaves_the_reconciler_running():
+    """Losing push latency must never wedge the loop."""
+    logs = []
+
+    def boom():
+        raise RuntimeError("stat failed")
+
+    d = _waking_daemon(boom, poll_seconds=10, logs=logs)
+    d.run_forever(sleep=lambda s: None, now=lambda: 0, max_ticks=2)
+    assert any("wake check failed" in m for m in logs)
+
+
 def _gated_daemon(gate, logs=None, journal=None):
     """A daemon whose observe/decide would definitely act, so 'nothing happened'
     can only mean the gate stopped the tick before either ran."""

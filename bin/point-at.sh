@@ -350,6 +350,28 @@ run_role() {
   ) >"$log" 2>&1 &
 }
 
+# Webhook push (#1): a fourth supervised process. `gh webhook forward` streams
+# deliveries; the forwarder turns each one into a wake-file touch per role, so
+# the daemons notice work in ~a second instead of at the reconcile interval.
+# Deliveries are wake signals only — nothing reads the payload — so a dead
+# forwarder is a latency regression, never a correctness one: the daemons keep
+# reconciling at RECONCILE_SECONDS. Restarted with a 60s backoff because the
+# common death is structural (extension not installed, token without
+# admin:repo_hook) and a tight relaunch loop would only spin on it.
+run_webhook() {
+  local log="$LOG_DIR/webhook-$NAME.log"
+  info "starting webhook forwarder → $log"
+  (
+    cd "$HARNESS_ROOT"
+    while :; do
+      uv run --extra sdk --with tree-sitter --with tree-sitter-bash \
+        python -m issue_agent.app.webhook || true
+      echo "webhook forwarder died — retrying in 60s (daemons stay on the reconcile cadence)"
+      sleep 60
+    done
+  ) >"$log" 2>&1 &
+}
+
 # Keep the machine awake while the watchers run — on a sleeping Mac the poll loop
 # stalls and pickup latency balloons to "whenever it next wakes". `-w $$` ties the
 # assertion to THIS process: when point-at exits (Ctrl-C, crash), caffeinate sees
@@ -371,6 +393,12 @@ for role in $ROLES; do
 done
 
 [ "${#pids[@]}" -gt 0 ] || { red "no watchers started"; exit 1; }
+
+# After the watcher check on purpose: the forwarder is an accelerator, not a
+# watcher — it must never make "no watchers started" look like a healthy run.
+case "$(printf '%s' "${WEBHOOK_WAKE:-}" | tr '[:upper:]' '[:lower:]')" in
+  1|true|yes|on) run_webhook; pids+=("$!") ;;
+esac
 grn "✓ $ROLES watchers running against $REPO (Ctrl-C stops all). Tailing logs from $LOG_DIR:"
 echo
 # Follow all role logs together until the daemons exit or Ctrl-C.
