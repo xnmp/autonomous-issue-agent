@@ -21,6 +21,30 @@ from ..domain.identity import normalize_login
 from ..domain.review import IdentityMode, ReviewMode
 
 
+SHELL_CMD_LOG_LIMIT = 120
+
+
+def describe_command(value: str | None, *, empty: str = "EMPTY",
+                     limit: int = SHELL_CMD_LOG_LIMIT) -> str:
+    """Render a shell command for a boot log line: quoted, and truncated
+    DELIBERATELY rather than by accident.
+
+    The boot log used to print `TEST_CMD=set` — the literal word "set",
+    reporting presence only. For a real value like
+    `TEST_CMD='set -e; cargo test …'` that output is indistinguishable from a
+    value truncated at the first space (#35), and this is the one line an
+    operator reads to confirm which command arms the gate. So: print the value,
+    repr-quoted (whitespace and shell punctuation stay visible inside the
+    quotes), cut at `limit` with an explicit ellipsis, and always state the full
+    length so a truncation can never be mistaken for the whole command.
+    """
+    text = value or ""
+    if not text:
+        return empty
+    shown = text if len(text) <= limit else text[:limit] + "…"
+    return f"{shown!r} (len={len(text)})"
+
+
 @dataclass(frozen=True)
 class RepositoryConfig:
     repo: str
@@ -604,7 +628,8 @@ class HarnessConfig:
             f"daily/{self.repo or 'repo'}=${self.daily_spend_cap_usd:.2f} "
             f"daily/global="
             f"{f'${self.global_daily_spend_cap_usd:.2f}' if self.global_daily_spend_cap_usd > 0 else 'off'} "
-            f"alert={'set' if self.alert_cmd else 'none'}",
+            f"alert={describe_command(self.alert_cmd, empty='none')}",
+            f"edit_check={describe_command(self.edit_check_cmd, empty='none')}",
             f"state={self.state_dir or '(unset)'} target={self.target_dir or '(cwd)'}",
         ])
 
