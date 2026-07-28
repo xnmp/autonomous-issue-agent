@@ -35,6 +35,8 @@ set -uo pipefail
 HARNESS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=bin/lib/gate-probe.sh
 . "$HARNESS_ROOT/bin/lib/gate-probe.sh"
+# shellcheck source=bin/lib/logging.sh
+. "$HARNESS_ROOT/bin/lib/logging.sh"
 NAME="${1:?usage: bin/point-at.sh <name>  (reads config/repos/<name>.env)}"
 SHARED="$HARNESS_ROOT/config/shared.env"
 REPO_ENV="$HARNESS_ROOT/config/repos/$NAME.env"
@@ -320,6 +322,7 @@ fi
 run_role() {
   local role="$1" log="$LOG_DIR/$1-$NAME.log"
   info "starting $role watcher → $log"
+  : > "$log"
   # Run uv from the HARNESS root (that's where the issue_agent package + project
   # live). The daemon self-chdirs into TARGET_DIR (config.py os.chdir(target_dir)),
   # so git/worktree ops still land in the target repo.
@@ -357,7 +360,7 @@ run_role() {
       echo "hot-reload: $role crashed post-reload (exit $rc) — retrying in 60s (fix by committing; the retry picks it up)"
       sleep 60
     done
-  ) >"$log" 2>&1 &
+  ) 2>&1 | timestamp_lines >>"$log" &
 }
 
 # Webhook push (#1): a fourth supervised process. `gh webhook forward` streams
@@ -371,6 +374,7 @@ run_role() {
 run_webhook() {
   local log="$LOG_DIR/webhook-$NAME.log"
   info "starting webhook forwarder → $log"
+  : > "$log"
   (
     cd "$HARNESS_ROOT"
     while :; do
@@ -379,7 +383,7 @@ run_webhook() {
       echo "webhook forwarder died — retrying in 60s (daemons stay on the reconcile cadence)"
       sleep 60
     done
-  ) >"$log" 2>&1 &
+  ) 2>&1 | timestamp_lines >>"$log" &
 }
 
 # Keep the machine awake while the watchers run — on a sleeping Mac the poll loop

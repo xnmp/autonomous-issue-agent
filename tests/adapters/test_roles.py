@@ -54,7 +54,13 @@ from issue_agent.app.roles import (
     _recurrence_reporter,
     _review_state,
 )
-from issue_agent.domain.actions import AgentKind, Relabel, RunAgent, Target
+from issue_agent.domain.actions import (
+    AgentKind,
+    EscalateCiPending,
+    Relabel,
+    RunAgent,
+    Target,
+)
 from issue_agent.domain.fix import FixConfig, FixState, breaker_key, decide_fix
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
@@ -999,8 +1005,8 @@ def test_the_journal_agrees_with_the_escalation_it_explains(tmp_path):
     _ci_stall_reporter(journal, "o/r", _STALL_CFG, lambda _m: None)(w)
 
     escalated = {
-        a.number for a in decide_fix(w, _STALL_CFG, _EMPTY_FIX_STATE, fixer_busy=False)
-        if isinstance(a, Relabel) and a.add == Label.NEEDS_HUMAN_REVIEW
+        a.pr for a in decide_fix(w, _STALL_CFG, _EMPTY_FIX_STATE, fixer_busy=False)
+        if isinstance(a, EscalateCiPending)
     }
     assert escalated == {e["pr"] for e in _stalls_in(journal)} == {144}
 

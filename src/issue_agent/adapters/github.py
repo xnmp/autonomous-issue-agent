@@ -14,7 +14,7 @@ Two halves, the usual pure/impure split:
 Field names match what the bash queries (issue: number,title,body,labels,
 comments,updatedAt,author,state; pr: number,title,body,headRefName,headRefOid,
 baseRefName,labels,reviews,state,closingIssuesReferences; checks: name,state,
-bucket,startedAt) so the mapping is mechanical and auditable.
+bucket,startedAt,link) so the mapping is mechanical and auditable.
 """
 
 from __future__ import annotations
@@ -382,9 +382,20 @@ def _checks(raw: list | None) -> tuple[Check, ...]:
             # not started — "" means unknown, and the pending deadline treats
             # unknown as "cannot fire" rather than as "infinitely old" (#30).
             started_at=c.get("startedAt") or c.get("started_at") or "",
+            advisory=bool(c.get("advisory", False)),
         )
         for c in raw or []
     )
+
+
+_ACTIONS_RUN_RE = re.compile(r"/actions/runs/(\d+)(?:/|$)")
+
+
+def _workflow_run_id(check: object) -> int | None:
+    if not isinstance(check, dict):
+        return None
+    match = _ACTIONS_RUN_RE.search(str(check.get("link") or ""))
+    return int(match.group(1)) if match else None
 
 
 def parse_issue(d: dict) -> IssueView:
@@ -778,7 +789,7 @@ class GitHubGateway:
         # checks come from a separate endpoint (bash `pr checks`).
         found = self._gh_json(
             ["pr", "checks", str(number), "--repo", self.repo,
-             "--json", "name,state,bucket,startedAt"]
+             "--json", "name,state,bucket,startedAt,link"]
         )
         if found is None:
             # gh failed non-infra (infra raised GhUnavailable inside the runner;
@@ -794,7 +805,44 @@ class GitHubGateway:
                 "tick; merge gates hold until a successful read\n"
             )
             return replace(pr, checks_known=False)
-        return replace(pr, checks=_checks(found))  # type: ignore[arg-type]
+        raw_checks = found if isinstance(found, list) else []
+        run_conclusions: dict[int, str] = {}
+        for check in raw_checks:
+            if not isinstance(check, dict) or check.get("bucket") != "fail":
+                continue
+            run_id = _workflow_run_id(check)
+            if run_id is None or run_id in run_conclusions:
+                continue
+            try:
+                conclusion = self._gh(
+                    ["api", f"repos/{self.repo}/actions/runs/{run_id}",
+                     "--jq", ".conclusion"]
+                )
+            except Exception:  # optional enrichment: unknown stays a real failure
+                conclusion = ""
+            run_conclusions[run_id] = conclusion.strip().lower()
+
+        enriched = []
+        advisory_names = []
+        for check in raw_checks:
+            if not isinstance(check, dict):
+                continue
+            run_id = _workflow_run_id(check)
+            advisory = (
+                check.get("bucket") == "fail"
+                and run_id is not None
+                and run_conclusions.get(run_id) == "success"
+            )
+            enriched.append({**check, "advisory": advisory})
+            if advisory:
+                advisory_names.append(str(check.get("name") or "unnamed"))
+        if advisory_names:
+            import sys
+            sys.stderr.write(
+                f"PR #{number}: advisory continue-on-error checks ignored: "
+                f"{', '.join(advisory_names)}\n"
+            )
+        return replace(pr, checks=_checks(enriched))
 
     def _safe_get_pr(
         self, number: int, *, mergeability: bool = True, checks: bool = True
@@ -1270,6 +1318,17 @@ class GitHubGateway:
         args = build_relabel_args(self.repo, kind, number, remove, add)
         if args is not None:
             self._gh(args)
+
+    def has_label(self, kind: str, number: int, label: str) -> bool:
+        data = self._gh_json([
+            kind, "view", str(number), "--repo", self.repo, "--json", "labels",
+        ])
+        if not isinstance(data, dict):
+            return False
+        return any(
+            isinstance(item, dict) and item.get("name") == label
+            for item in (data.get("labels") or [])
+        )
 
     def comment(self, kind: str, number: int, body: str) -> None:
         self._gh(build_comment_args(self.repo, kind, number, body))

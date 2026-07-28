@@ -22,6 +22,7 @@ from ..domain.actions import (
     ClearIssueState,
     CloseIssue,
     EnableAutoMerge,
+    EscalateCiPending,
     UpdateBranch,
     NoOp,
     PostComment,
@@ -50,6 +51,7 @@ class Executor:
         log: Callable[[str], None] | None = None,
         mark_automerge: Callable[[int], None] | None = None,
         mark_ci_rerun: Callable[[int, str], None] | None = None,
+        mark_ci_pending_escalated: Callable[[int, str], None] | None = None,
         clear_issue_state: Callable[[int, int | None, bool], None] | None = None,
         journal=None,
         alert_cmd: str = "",
@@ -69,6 +71,9 @@ class Executor:
         # loop forever, which is why the arm below refuses to call gh at all
         # when it is absent — see there.
         self._mark_ci_rerun = mark_ci_rerun
+        self._mark_ci_pending_escalated = (
+            mark_ci_pending_escalated or (lambda pr, head: None)
+        )
         # Retires STATE_DIR files on the ClearIssueState arm (review M4/D8:
         # Store.clear_issue/clear_pr_review had zero production call sites).
         # Default no-op keeps tests/other roles' Executors quiet — only the
@@ -104,6 +109,8 @@ class Executor:
             return f"update branch PR #{action.pr} (BEHIND → up-to-date)"
         if isinstance(action, RerunFailedChecks):
             return f"re-run failed checks PR #{action.pr} ({action.head[:7]})"
+        if isinstance(action, EscalateCiPending):
+            return f"escalate stalled CI PR #{action.pr} ({action.head[:7]})"
         if isinstance(action, AddDependency):
             return f"link #{action.issue} blocked-by #{action.blocker}"
         if isinstance(action, RemoveWorktree):
@@ -143,6 +150,26 @@ class Executor:
             # and a journal that claims it did is worse than one that is silent.
             if action.add is Label.NEEDS_HUMAN_REVIEW:
                 self._escalated(action)
+        elif isinstance(action, EscalateCiPending):
+            self.gateway.comment("pr", action.pr, action.body)
+            self.gateway.relabel(
+                "pr", action.pr, Label.AI_PR_OPEN.value,
+                Label.NEEDS_HUMAN_REVIEW.value,
+            )
+            verifier = getattr(self.gateway, "has_label", None)
+            if verifier is not None and not verifier(
+                "pr", action.pr, Label.NEEDS_HUMAN_REVIEW.value
+            ):
+                self._log(
+                    f"CI stall escalation for PR #{action.pr} was not verified; "
+                    "marker withheld so the next poll retries"
+                )
+                return
+            self._mark_ci_pending_escalated(action.pr, action.head)
+            self._escalated(Relabel(
+                Target.PR, action.pr, Label.AI_PR_OPEN,
+                Label.NEEDS_HUMAN_REVIEW,
+            ))
         elif isinstance(action, PostComment):
             self.gateway.comment(_KIND[action.target], action.number, action.body)
         elif isinstance(action, CloseIssue):

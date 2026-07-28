@@ -399,6 +399,62 @@ def test_review_world_pr_view_omits_mergeability_fields():
     assert "mergeable" in v2[v2.index("--json") + 1]
 
 
+def test_get_pr_marks_failed_job_advisory_when_owning_run_succeeded(capsys):
+    fr = FakeRunner({
+        "pr view 815": {"number": 815, "state": "OPEN"},
+        "pr checks 815": [{
+            "name": "Security Audit",
+            "bucket": "fail",
+            "link": "https://github.com/o/r/actions/runs/4242/job/99",
+        }],
+        "api repos/o/r/actions/runs/4242": "success",
+    })
+
+    pr = GitHubGateway("o/r", runner=fr).get_pr(815)
+
+    assert pr.checks[0].advisory is True
+    assert ci_state(pr.checks) is CIState.NONE
+    assert "advisory continue-on-error" in capsys.readouterr().err
+
+
+def test_get_pr_keeps_failed_job_real_when_owning_run_is_not_successful():
+    fr = FakeRunner({
+        "pr view 815": {"number": 815, "state": "OPEN"},
+        "pr checks 815": [{
+            "name": "Unit",
+            "bucket": "fail",
+            "link": "https://github.com/o/r/actions/runs/4242/job/99",
+        }],
+        "api repos/o/r/actions/runs/4242": "failure",
+    })
+
+    pr = GitHubGateway("o/r", runner=fr).get_pr(815)
+
+    assert pr.checks[0].advisory is False
+    assert ci_state(pr.checks) is CIState.FAILURE
+
+
+def test_get_pr_keeps_failed_job_when_optional_run_lookup_raises():
+    def runner(argv, token):
+        key = " ".join(argv)
+        if "pr view 815" in key:
+            return json.dumps({"number": 815, "state": "OPEN"})
+        if "pr checks 815" in key:
+            return json.dumps([{
+                "name": "Unit",
+                "bucket": "fail",
+                "link": "https://github.com/o/r/actions/runs/4242/job/99",
+            }])
+        if "actions/runs/4242" in key:
+            raise RuntimeError("optional endpoint unavailable")
+        return ""
+
+    pr = GitHubGateway("o/r", runner=runner).get_pr(815)
+
+    assert pr.checks[0].advisory is False
+    assert ci_state(pr.checks) is CIState.FAILURE
+
+
 def test_review_world_survives_one_failing_pr_fetch():
     """One PR whose `gh pr view` returns empty (hung/killed → parse_pr(None) raises)
     must NOT abort the whole poll: the other PRs still populate the world, so a

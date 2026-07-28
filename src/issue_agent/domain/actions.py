@@ -110,6 +110,20 @@ class RerunFailedChecks:
 
 
 @dataclass(frozen=True)
+class EscalateCiPending:
+    """One-shot escalation for a stalled CI head.
+
+    Kept as one action so the executor can verify the label write before it
+    persists the `(PR, head)` latch. Splitting comment/relabel/marker into
+    independent actions lets a failed relabel permanently suppress its retry.
+    """
+
+    pr: int
+    head: str
+    body: str
+
+
+@dataclass(frozen=True)
 class RunAgent:
     """Dispatch a headless agent. `number` is the issue (RESOLVE/RESUME/TRIAGE)
     or PR (ADDRESS_REVIEW/FIX_CI/REVIEW/RE_REVIEW); STEWARD_DRIVE ignores it."""
@@ -177,6 +191,7 @@ Action = Union[
     UpdateBranch,
     AddDependency,
     RerunFailedChecks,
+    EscalateCiPending,
     RunAgent,
     RemoveWorktree,
     ClearIssueState,
@@ -193,6 +208,7 @@ __all__ = [
     "UpdateBranch",
     "AddDependency",
     "RerunFailedChecks",
+    "EscalateCiPending",
     "RunAgent",
     "RemoveWorktree",
     "ClearIssueState",

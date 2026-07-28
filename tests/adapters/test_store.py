@@ -226,6 +226,13 @@ def test_ci_rerun_head_ignores_an_empty_sha():
     assert s.get_ci_rerun_head(100) == "sha-1"
 
 
+def test_ci_pending_escalated_head_marker_roundtrip():
+    s, _ = _store()
+    assert s.get_ci_pending_escalated_head(100) == ""
+    s.set_ci_pending_escalated_head(100, "sha-1")
+    assert s.get_ci_pending_escalated_head(100) == "sha-1"
+
+
 def test_cleanup_pr_merged_clears_the_ci_rerun_marker():
     # The PR is gone; a stale marker under a recycled number would silently
     # suppress the next PR's free re-run.
