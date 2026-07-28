@@ -83,6 +83,7 @@ def _spend_cfg(cfg: HarnessConfig, role: str, ledger: str) -> dict:
         "spend_ledger_path": ledger,
         "issue_spend_cap_usd": cfg.issue_spend_cap_usd,
         "daily_spend_cap_usd": cfg.daily_spend_cap_usd,
+        "global_daily_spend_cap_usd": cfg.global_daily_spend_cap_usd,
         "alert_cmd": cfg.alert_cmd,
     }
 

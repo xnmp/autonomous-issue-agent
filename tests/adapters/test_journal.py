@@ -909,6 +909,7 @@ class RecordingRunner:
 
 
 def _cap_dispatcher(tmp_path, ledger, *, issue_cap=0.0, daily_cap=0.0,
+                    global_daily_cap=0.0,
                     alert_cmd="", gw=None, logs=None, trigger_label="ai-pr-open"):
     gw = gw or CapGateway()
     runner = RecordingRunner()
@@ -921,6 +922,7 @@ def _cap_dispatcher(tmp_path, ledger, *, issue_cap=0.0, daily_cap=0.0,
         review_trigger_label=trigger_label,
         role="fix", repo="o/r", spend_ledger_path=ledger,
         issue_spend_cap_usd=issue_cap, daily_spend_cap_usd=daily_cap,
+        global_daily_spend_cap_usd=global_daily_cap,
         alert_cmd=alert_cmd,
         log=(logs.append if logs is not None else (lambda _m: None)),
     )
@@ -1013,8 +1015,50 @@ def test_daily_cap_skips_dispatch_without_touching_any_label(tmp_path):
     assert runner.runs == 0
     assert gw.calls == [], "the daily cap must change no GitHub state at all"
     block = [e for e in read_events(journal.path) if e["event"] == "spend_block"]
-    assert block[0]["scope"] == "daily" and block[0]["cap"] == 50.0
+    assert block[0]["scope"] == "daily-repo" and block[0]["cap"] == 50.0
     assert any("SPEND CAP" in line for line in logs), "the pause must be loud"
+    # #32: which cap paused the box must be readable off the line itself —
+    # DAILY_SPEND_CAP_USD (this repo) and GLOBAL_DAILY_SPEND_CAP_USD send an
+    # operator to different files.
+    assert any("o/r" in line and "DAILY_SPEND_CAP_USD" in line for line in logs)
+    assert not any("GLOBAL_DAILY_SPEND_CAP_USD" in line for line in logs)
+
+
+def test_the_daily_cap_ignores_another_repos_spend(tmp_path):
+    """#32. The ledger is shared by every deployment on the box, but
+    DAILY_SPEND_CAP_USD is configured in the per-repo overlay — so summing it
+    unscoped made the first deployment to spend starve every other one (keifu was
+    blocked on tauri-explorer's $709 having spent $0 itself)."""
+    now = datetime.now(timezone.utc)
+    ledger = _write(str(tmp_path / "spend.jsonl"),
+                    _spend(now, 709.55, repo="other/repo"),
+                    _spend(now, 1.0, repo="o/r"))
+    d, _, runner, journal = _cap_dispatcher(tmp_path, ledger, daily_cap=50.0)
+
+    asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
+
+    assert runner.runs == 1
+    assert [e for e in read_events(journal.path) if e["event"] == "spend_block"] == []
+
+
+def test_the_global_cap_pauses_a_repo_that_has_spent_nothing(tmp_path):
+    """The deliberate other half of #32: a box-wide bound must be expressible,
+    and GLOBAL_DAILY_SPEND_CAP_USD is where it lives. Anti-vacuity twin of the
+    test above — the same ledger, a different knob, the opposite outcome."""
+    now = datetime.now(timezone.utc)
+    ledger = _write(str(tmp_path / "spend.jsonl"),
+                    _spend(now, 709.55, repo="other/repo"))
+    logs: list[str] = []
+    d, gw, runner, journal = _cap_dispatcher(
+        tmp_path, ledger, daily_cap=50.0, global_daily_cap=700.0, logs=logs)
+
+    asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
+
+    assert runner.runs == 0
+    assert gw.calls == []
+    block = [e for e in read_events(journal.path) if e["event"] == "spend_block"][0]
+    assert block["scope"] == "daily-global" and block["cap"] == 700.0
+    assert any("GLOBAL_DAILY_SPEND_CAP_USD" in line for line in logs)
 
 
 def test_dispatch_proceeds_when_spend_is_under_both_caps(tmp_path):
@@ -1179,7 +1223,7 @@ def test_the_daily_block_is_keyed_to_the_utc_day_it_pauses(tmp_path):
     blocks = [e for e in read_events(journal.path) if e["event"] == "spend_block"]
     assert len(blocks) == 1
     today = datetime.now(timezone.utc).date().isoformat()
-    assert blocks[0]["block_key"] == f"daily:{today}:cap:50"
+    assert blocks[0]["block_key"] == f"daily-repo:{today}:cap:50"
 
 
 def test_a_changed_daily_cap_emits_a_new_edge(tmp_path):
