@@ -70,8 +70,23 @@ def _repository_instructions(
             sections.append(section)
             remaining -= len(encoded)
             continue
-        if remaining:
-            sections.append(encoded[:remaining].decode(errors="ignore"))
+        # Out of budget: cut at a paragraph boundary and leave a pointer, so the
+        # model knows guidance exists beyond the cut and can read the file itself.
+        pointer = (
+            f"\n\n[Repository instructions truncated to fit the prompt budget — "
+            f"read {relative} (and any later CLAUDE.md files) in the worktree "
+            f"for the rest before making design decisions.]"
+        )
+        budget = remaining - len(pointer.encode())
+        if budget > 0:
+            head = encoded[:budget].decode(errors="ignore")
+            cut = head.rfind("\n\n")
+            if cut > 0:
+                head = head[:cut]
+            sections.append(head)
+            sections.append(pointer)
+        elif remaining >= len(pointer.encode()):
+            sections.append(pointer)
         truncated = True
         break
     return "".join(sections), truncated
