@@ -23,7 +23,7 @@ Rules:
 | codex per-leg usage deltas | 27565d9 2026-07-27 | repair legs ledger single-digit deltas, never resolve magnitude | VERIFIED 2026-07-27 (fifth): address legs $6–33 |
 | evidence-image commit gate | 2bcb99d 2026-07-27 | blocked commit + self-service downscale in a fixer transcript | **pending** — never fired |
 | #20 repair legs skip evidence recapture | PR #26 2026-07-27 | no $100+ ADDRESS_REVIEW; address legs cite existing evidence | VERIFIED 2026-07-28 (sixth): address legs $6–33, no repeat of the $146 leg |
-| #23 patch-id re-review skip | PR #26 2026-07-27 | re-review skipped on unchanged patch-id (journal skip event) | **pending** — eighth 2026-07-28: first natural rebase (PR #574) crossed conflicting merges, patch changed → paid re-review correct; the skip path needs a clean no-conflict rebase |
+| #23 patch-id re-review skip | PR #26 2026-07-27 | re-review skipped on unchanged patch-id (journal skip event) | VERIFIED 2026-07-28 (keifu 2nd): `review_skip` on PRs #150 and #152 (09:04Z) after empty-commit CI retriggers — patch-id unchanged, no paid re-review. (Eighth's PR #574 rebase crossed conflicting merges → patch changed → paid re-review also correct.) |
 | commit author `Harness - <model>` | 7098f47 2026-07-28 | PR commits authored `Harness - <model>` | VERIFIED 2026-07-28 (sixth): PR #561 `Harness - gpt-5.6-luna` |
 | per-name composed env | 8b39404 2026-07-28 | two concurrent deployments, no clobber/cross-reload | VERIFIED 2026-07-28 (seventh): tauri+keifu concurrent, per-name AGENT_ENV confirmed in /proc |
 | #21 repair legs inherit routed model | 665f80e 2026-07-28 | repair `agent_run.model` == its resolve's; same session_id | VERIFIED 2026-07-28 (seventh): #518 terra, #557 sol |
