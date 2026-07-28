@@ -261,11 +261,20 @@ def _fix_state(store: Store, world) -> FixState:
     # breaker-keyed) because a re-run is an act on a PR's check runs, and a PR
     # with no resolvable issue has check runs like any other.
     ci_rerun_head = {p.number: store.get_ci_rerun_head(p.number) for p in world.prs}
+    get_ci_pending_head = getattr(
+        store, "get_ci_pending_escalated_head", lambda _pr: ""
+    )
+    ci_pending_escalated = frozenset(
+        (p.number, head)
+        for p in world.prs
+        if (head := get_ci_pending_head(p.number))
+    )
     return FixState(
         sessions=sessions, resumed_at=resumed, automerge_enabled=automerge,
         ci_retries=ci_retries, review_retries=review_retries,
         rebase_retries=rebase_retries, resolve_retries=resolve_retries,
         infra_deaths=infra_deaths, ci_rerun_head=ci_rerun_head,
+        ci_pending_escalated=ci_pending_escalated,
     )
 
 
@@ -337,7 +346,7 @@ def _ci_stall_reporter(journal: Journal | None, repo: str, fix_cfg: FixConfig, l
             checks = ", ".join(stall.checks) or "unnamed"
             log(
                 f"CI STALL: PR #{stall.pr} has been pending {stall.seconds}s "
-                f"({checks}) — escalating to needs-human-review"
+                f"({checks}) — pending deadline breached"
             )
             key = f"ci-pending:{repo}:{stall.pr}:{stall.head}"
             if key in seen:
@@ -665,6 +674,7 @@ def build_fix_daemon(
     executor = Executor(
         gateway, remove_worktree=worktrees.remove, log=_log("fix"),
         mark_automerge=store.mark_automerge, mark_ci_rerun=store.set_ci_rerun_head,
+        mark_ci_pending_escalated=store.set_ci_pending_escalated_head,
         clear_issue_state=store.cleanup_pr,
         journal=journal, alert_cmd=cfg.alert_cmd,
     )

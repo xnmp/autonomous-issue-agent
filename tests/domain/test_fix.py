@@ -7,6 +7,7 @@ from issue_agent.domain.actions import (
     ClearIssueState,
     CloseIssue,
     EnableAutoMerge,
+    EscalateCiPending,
     UpdateBranch,
     PostComment,
     Relabel,
@@ -76,6 +77,24 @@ def test_pick_ready_takes_issue_once_blocker_closes():
     # blocked_by_open=False (blocker closed) → the issue is pickable again.
     w = world(issues=[issue(1, "ai-ready", "P1", blocked_by_open=False)])
     assert pick_ready_issue(w) == 1
+
+
+def test_pr_repair_is_dispatched_before_a_new_resolve():
+    ready = issue(7, "ai-ready")
+    repair = pr(
+        100,
+        "ai-pr-open",
+        state="OPEN",
+        head_ref_name="fix/5-x",
+        closing_issue=5,
+        reviews=(Review("CHANGES_REQUESTED", "review-bot", "t1"),),
+    )
+
+    actions = decide_fix(
+        world(issues=[ready], prs=[repair]), CFG, FixState(), fixer_busy=False
+    )
+
+    assert _run_agents(actions) == [RunAgent(AgentKind.ADDRESS_REVIEW, 100)]
 
 
 def test_pick_ready_skips_issue_overlapping_open_pr_files():
@@ -224,6 +243,119 @@ def test_resume_ignores_bot_and_fixer_comments():
         comments=(Comment("fix-bot", "asking", "t1"), Comment("ci[bot]", "noise", "t2")),
     )
     st = FixState(sessions=frozenset({7}))
+    assert issues_needing_resume(world(issues=[iss]), st, CFG) == []
+
+
+def test_resume_accepts_operator_reply_when_operator_is_also_fix_bot():
+    iss = issue(
+        7,
+        "ai-blocked",
+        comments=(
+            Comment(
+                "fix-bot",
+                "**Agent needs input:** choose A or B\n\n_Reply to unblock._",
+                "t1",
+            ),
+            Comment("fix-bot", "Use A.", "t2"),
+        ),
+    )
+    st = FixState(sessions=frozenset({7}))
+
+    assert issues_needing_resume(world(issues=[iss]), st, CFG) == [(7, "t2")]
+
+
+def test_resume_accepts_reply_when_fix_bot_is_an_app_identity():
+    prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
+    iss = issue(
+        7,
+        "ai-blocked",
+        comments=(
+            Comment("fix-bot[bot]", prompt, "t1"),
+            Comment("fix-bot[bot]", "Use A.", "t2"),
+        ),
+    )
+    cfg = FixConfig(fix_bot="fix-bot[bot]")
+    st = FixState(sessions=frozenset({7}))
+
+    assert issues_needing_resume(world(issues=[iss]), st, cfg) == [(7, "t2")]
+
+
+def test_unblock_prompt_does_not_count_as_its_own_reply():
+    iss = issue(
+        7,
+        "ai-blocked",
+        comments=(
+            Comment(
+                "fix-bot",
+                "**Agent needs input:** choose A or B\n\n_Reply to unblock._",
+                "t1",
+            ),
+        ),
+    )
+    st = FixState(sessions=frozenset({7}))
+
+    assert issues_needing_resume(world(issues=[iss]), st, CFG) == []
+
+
+def test_second_round_unblock_prompt_supersedes_the_original_reply():
+    first = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
+    second = "**Agent still needs input:** provide a value\n\n_Reply to unblock._"
+    iss = issue(
+        7,
+        "ai-blocked",
+        comments=(
+            Comment("fix-bot", first, "t1"),
+            Comment("alice", "Use A.", "t2"),
+            Comment("fix-bot", second, "t3"),
+        ),
+    )
+    st = FixState(sessions=frozenset({7}), resumed_at={7: "t2"})
+
+    assert issues_needing_resume(world(issues=[iss]), st, CFG) == []
+
+
+def test_author_leg_prompt_accepts_fix_bot_operator_reply():
+    prompt = "**Author needs input:** expected behavior?\n\n_Reply to unblock._"
+    iss = issue(
+        7,
+        "ai-blocked",
+        comments=(
+            Comment("fix-bot", prompt, "t1"),
+            Comment("fix-bot", "Use the documented behavior.", "t2"),
+        ),
+    )
+    st = FixState(sessions=frozenset({7}))
+
+    assert issues_needing_resume(world(issues=[iss]), st, CFG) == [(7, "t2")]
+
+
+def test_quoted_unblock_prompt_is_consumed_as_the_reply():
+    prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
+    iss = issue(
+        7,
+        "ai-blocked",
+        comments=(
+            Comment("fix-bot", prompt, "t1"),
+            Comment("alice", f"> {prompt}\n\nUse A.", "t2"),
+        ),
+    )
+    st = FixState(sessions=frozenset({7}))
+
+    assert issues_needing_resume(world(issues=[iss]), st, CFG) == [(7, "t2")]
+
+
+def test_unrelated_bot_noise_after_prompt_does_not_trigger_resume():
+    prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
+    iss = issue(
+        7,
+        "ai-blocked",
+        comments=(
+            Comment("fix-bot", prompt, "t1"),
+            Comment("ci[bot]", "build finished", "t2"),
+        ),
+    )
+    st = FixState(sessions=frozenset({7}))
+
     assert issues_needing_resume(world(issues=[iss]), st, CFG) == []
 
 
@@ -1142,10 +1274,16 @@ def _wedged_pr(started_at: str = _STALL_T0, **kw):
 
 
 def _escalated(actions):
-    return [
+    relabels = [
         a for a in actions
         if isinstance(a, Relabel) and a.add == Label.NEEDS_HUMAN_REVIEW
     ]
+    relabels.extend(
+        Relabel(Target.PR, a.pr, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW)
+        for a in actions
+        if isinstance(a, EscalateCiPending)
+    )
+    return relabels
 
 
 def test_pending_past_deadline_escalates_the_pr_to_a_human():
@@ -1156,8 +1294,20 @@ def test_pending_past_deadline_escalates_the_pr_to_a_human():
         (Target.PR, 100, Label.AI_PR_OPEN)
     ]
     # …and says why, naming the check, so the operator can go cancel it.
-    comments = [a for a in actions if isinstance(a, PostComment) and a.number == 100]
-    assert comments and "Test (windows-latest)" in comments[0].body
+    escalations = [a for a in actions if isinstance(a, EscalateCiPending)]
+    assert escalations and "Test (windows-latest)" in escalations[0].body
+
+
+def test_pending_deadline_does_not_reescalate_the_same_head_after_operator_override():
+    w = world(prs=[_wedged_pr()], now=_stall_now(7200))
+    state = FixState(ci_pending_escalated=frozenset({(100, "sha-aaa")}))
+
+    actions = decide_fix(w, CFG, state, fixer_busy=False)
+
+    assert not _escalated(actions)
+    assert not any(
+        isinstance(a, PostComment) and a.number == 100 for a in actions
+    )
 
 
 def test_pending_under_deadline_leaves_the_pr_exactly_as_before():

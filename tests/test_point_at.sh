@@ -5,6 +5,8 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=bin/lib/gate-probe.sh
 . "$ROOT/bin/lib/gate-probe.sh"
+# shellcheck source=bin/lib/logging.sh
+. "$ROOT/bin/lib/logging.sh"
 PASS=0
 FAIL=0
 
@@ -18,6 +20,16 @@ no() {
   printf '  \033[31mFAIL\033[0m %s\n' "$1"
   [ -n "${2:-}" ] && printf '       %s\n' "$2"
 }
+
+timestamped="$(printf 'one\ntwo\n' | timestamp_lines)"
+timestamp_line_one="${timestamped%%$'\n'*}"
+timestamp_line_two="${timestamped#*$'\n'}"
+if [[ "$timestamp_line_one" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\ one$ ]] \
+  && [[ "$timestamp_line_two" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\ two$ ]]; then
+  ok "role log lines receive UTC ISO timestamps"
+else
+  no "role log lines receive UTC ISO timestamps" "$timestamped"
+fi
 
 scratch="$(mktemp -d)"
 trap 'rm -rf "$scratch"' EXIT

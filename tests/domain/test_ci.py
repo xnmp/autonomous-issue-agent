@@ -24,6 +24,18 @@ def test_any_fail_is_failure():
     assert ci_state([Check("a", bucket="pass"), Check("b", bucket="fail")]) is CIState.FAILURE
 
 
+def test_failure_from_a_successful_workflow_run_is_advisory():
+    checks = [
+        Check("build", bucket="pass"),
+        Check("Security Audit", bucket="fail", advisory=True),
+    ]
+    assert ci_state(checks) is CIState.OK
+
+
+def test_advisory_is_not_inferred_without_a_successful_owning_run():
+    assert ci_state([Check("Security Audit", bucket="fail")]) is CIState.FAILURE
+
+
 def test_pending_beats_failure():
     # THE lesson (#49): a failed check + an in-flight check is NOT yet a failure.
     checks = [Check("unit", bucket="fail"), Check("e2e", state="IN_PROGRESS")]

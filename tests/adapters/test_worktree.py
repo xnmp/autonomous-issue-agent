@@ -172,11 +172,42 @@ def test_default_git_runner_real_success_path_unaffected(tmp_path):
     assert "git version" in result.out
 
 
-def test_remove_calls_remove_and_prune():
-    fg = FakeGit()
+def test_remove_calls_remove_prune_and_deletes_the_issue_branch():
+    fg = FakeGit({
+        "worktree list": GitResult(
+            0,
+            "worktree /repo/.claude/worktrees/issue-5\n"
+            "HEAD deadbeef\n"
+            "branch refs/heads/fix/5-small-win\n\n",
+        )
+    })
     Worktrees("/repo", run=fg).remove(5)
     kinds = [a[0][:2] for a in fg.calls]
     assert ["worktree", "remove"] in kinds and ["worktree", "prune"] in kinds
+    assert (["branch", "-D", "fix/5-small-win"], "/repo") in fg.calls
+
+
+def test_remove_never_deletes_a_branch_when_the_issue_worktree_is_absent():
+    fg = FakeGit({"worktree list": GitResult(0, "")})
+
+    Worktrees("/repo", run=fg).remove(5)
+
+    assert not any(args[:2] == ["branch", "-D"] for args, _cwd in fg.calls)
+
+
+def test_remove_never_deletes_an_arbitrary_branch_from_the_issue_worktree():
+    fg = FakeGit({
+        "worktree list": GitResult(
+            0,
+            "worktree /repo/.claude/worktrees/issue-5\n"
+            "HEAD deadbeef\n"
+            "branch refs/heads/dev\n\n",
+        )
+    })
+
+    Worktrees("/repo", run=fg).remove(5)
+
+    assert not any(args[:2] == ["branch", "-D"] for args, _cwd in fg.calls)
 
 
 def test_reset_discards_uncommitted_in_the_issue_worktree():

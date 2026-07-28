@@ -397,7 +397,22 @@ class FixWorkflow:
         pr = self.gateway.pr_for_issue(issue)
         if outcome.resolve_followup(result, pr is not None) is outcome.ResolveFollowup.RETRY:
             self._bump_resolve_retry(issue, result)
-        self.executor.execute_all(outcome.resolve_actions(issue, result, pr))
+        self.executor.execute_all(self._resolve_actions(issue, result, pr))
+
+    def _resolve_actions(self, issue: int, result, pr: int | None):
+        """Retire an already-implemented issue closed without opening a PR."""
+        closed_without_pr = False
+        if pr is None and not result.is_error and result.status in ("pushed", "done"):
+            refreshed = self._try(lambda: self.gateway.get_issue(issue), None)
+            closed_without_pr = (
+                refreshed is not None and refreshed.state != "open"
+            )
+        return outcome.resolve_actions(
+            issue,
+            result,
+            pr,
+            issue_closed_without_pr=closed_without_pr,
+        )
 
     async def resolve_split(self, issue: int) -> None:
         iss = self.gateway.get_issue(issue)
@@ -440,7 +455,7 @@ class FixWorkflow:
             if fu is not outcome.ImplementFollowup.CONTRACT_CHANGE:
                 if fu is outcome.ImplementFollowup.RETRY:
                     self._bump_resolve_retry(issue, impl)
-                self.executor.execute_all(outcome.resolve_actions(issue, impl, pr))
+                self.executor.execute_all(self._resolve_actions(issue, impl, pr))
                 return
 
             objection = impl.needs or impl.summary or "see logs"
