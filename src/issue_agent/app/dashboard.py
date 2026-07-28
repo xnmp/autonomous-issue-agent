@@ -909,7 +909,7 @@ def serve(port: int, build_html, host: str = "127.0.0.1") -> None:
             try:
                 body = build_html().encode("utf-8")
             except Exception as exc:  # noqa: BLE001 — a broken read is a 500, not a crash
-                body = f"dashboard error: {exc}".encode("utf-8")
+                body = f"dashboard error: {_html.escape(str(exc))}".encode("utf-8")
                 self.send_response(500)
             else:
                 self.send_response(200)

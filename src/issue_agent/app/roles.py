@@ -151,7 +151,15 @@ def _wake_check(cfg: HarnessConfig, store: Store):
     """The role's push wake, or None when WEBHOOK_WAKE is off (poll only).
 
     Watched beside the role's own state, like the journal: the forwarder touches
-    one wake file per role so a delivery wakes all three independently."""
+    one wake file per role so a delivery wakes all three independently.
+
+    Interaction with the world probe: a webhook-shortened tick lands inside the
+    probe's TTL, and check_suite/status deliveries move NO issue/PR updated_at —
+    change_signature reads unchanged and the tick observes nothing. That is fine
+    for review/steward (neither reads checks), and the FIXER only stays correct
+    because `fix_probe_safe` refuses to gate whenever an ai-pr-open PR exists —
+    exactly when a checks event matters. Weaken that predicate and CI-completion
+    wakes silently become no-ops until the TTL expires."""
     if not cfg.webhook_wake:
         return None
     return WakeSignal(wake_path(store.state_dir)).pending

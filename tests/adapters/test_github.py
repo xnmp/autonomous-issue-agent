@@ -1757,3 +1757,28 @@ def test_get_pr_keeps_honest_empty_checks_known():
     fr = FakeRunner({"pr view 100": pr_resp, "pr checks 100": []})
     pr = GitHubGateway("o/r", runner=fr).get_pr(100)
     assert pr.checks == () and pr.checks_known is True
+
+
+def test_honest_no_checks_wins_over_an_infra_looking_branch_name(monkeypatch):
+    """gh's no-checks message embeds the BRANCH NAME, and a branch like
+    fix/12-request-timeout contains 'timeout' — which the infra classifier
+    reads as a network outage. The honest answer must be recognised BEFORE
+    classification, or a no-CI repo with such a branch raises GhUnavailable
+    and skips every tick for as long as the PR exists (review F1)."""
+    monkeypatch.setattr(
+        _subprocess, "run",
+        _fake_run_factory(
+            1, "no checks reported on the 'fix/12-request-timeout' branch"
+        ),
+    )
+    out = _subprocess_runner(["gh", "pr", "checks", "26", "--repo", "o/r"], None)
+    assert json.loads(out) == []
+
+
+def test_a_skipped_checks_call_is_unread_not_empty():
+    """get_pr(checks=False) never asked — a PR that flips OPEN between the
+    list and the view must not arrive as honest-NONE mergeable (review F3)."""
+    pr_resp = {"number": 100, "headRefName": "fix/5-x", "state": "OPEN", "labels": []}
+    fr = FakeRunner({"pr view 100": pr_resp})
+    pr = GitHubGateway("o/r", runner=fr).get_pr(100, checks=False)
+    assert pr.checks_known is False

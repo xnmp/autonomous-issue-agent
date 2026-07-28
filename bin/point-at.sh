@@ -396,8 +396,12 @@ done
 
 # After the watcher check on purpose: the forwarder is an accelerator, not a
 # watcher — it must never make "no watchers started" look like a healthy run.
+# Its pid is deliberately NOT in pids: the supervising subshell is an infinite
+# relaunch loop, so waiting on it would keep point-at alive forever after every
+# actual watcher exited (bounded ISSUE_AGENT_MAX_TICKS runs would never end).
+webhook_pid=""
 case "$(printf '%s' "${WEBHOOK_WAKE:-}" | tr '[:upper:]' '[:lower:]')" in
-  1|true|yes|on) run_webhook; pids+=("$!") ;;
+  1|true|yes|on) run_webhook; webhook_pid="$!" ;;
 esac
 grn "✓ $ROLES watchers running against $REPO (Ctrl-C stops all). Tailing logs from $LOG_DIR:"
 echo
@@ -405,4 +409,14 @@ echo
 tail -n +1 -F "$LOG_DIR"/*-"$NAME".log &
 tail_pid=$!
 wait "${pids[@]}"
+# TERM on the supervising subshell alone would orphan its uv→python→gh chain
+# (a headless forwarder touching wake files and holding a relay hook), so
+# sweep the whole descendant tree. Ctrl-C never gets here — the trap's
+# `kill 0` takes the process group down as one.
+kill_tree() {
+  local child
+  for child in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$child"; done
+  kill "$1" 2>/dev/null || true
+}
+[ -n "$webhook_pid" ] && kill_tree "$webhook_pid"
 kill "$tail_pid" 2>/dev/null || true
