@@ -180,6 +180,39 @@ def test_repository_instructions_are_capped_and_truncation_is_logged(tmp_path):
     assert any("truncated" in message for message in logs)
 
 
+def test_truncation_cuts_at_a_paragraph_and_points_at_the_full_file(tmp_path):
+    # Paragraph-structured content well past the budget: the cut must land on a
+    # paragraph boundary (never mid-sentence) and be followed by a pointer that
+    # names the file, so the agent can recover the dropped guidance on demand.
+    (tmp_path / "CLAUDE.md").write_text(
+        "intact-paragraph\n\n" * (REPOSITORY_INSTRUCTIONS_MAX_BYTES // 8)
+    )
+
+    write_hook_config(str(tmp_path), agents_md="contract")
+
+    agents = (tmp_path / "AGENTS.override.md").read_text()
+    pointer_at = agents.index("[Repository instructions truncated")
+    assert "read CLAUDE.md (and any later CLAUDE.md files)" in agents
+    assert agents[:pointer_at].rstrip().endswith("intact-paragraph")
+    section = agents[agents.index("# Repository instructions (CLAUDE.md)"):agents.index(END_MARKER)]
+    assert len(section.encode()) <= REPOSITORY_INSTRUCTIONS_MAX_BYTES
+
+
+def test_truncation_pointer_names_the_first_file_that_did_not_fit(tmp_path):
+    # First file fits whole; the second overflows — the pointer must name the
+    # second file, not the first.
+    (tmp_path / "CLAUDE.md").write_text("root rules\n\n")
+    sub = tmp_path / "backend"
+    sub.mkdir()
+    (sub / "CLAUDE.md").write_text("b\n\n" * REPOSITORY_INSTRUCTIONS_MAX_BYTES)
+
+    write_hook_config(str(tmp_path), agents_md="contract")
+
+    agents = (tmp_path / "AGENTS.override.md").read_text()
+    assert "root rules" in agents
+    assert "read backend/CLAUDE.md" in agents
+
+
 # ── PostToolUse edit-check (only when edit_check_cmd given) ────────────────────
 def test_no_edit_check_block_without_edit_check_cmd():
     # The read-record PostToolUse hook is always present (observe-only); only the
