@@ -71,10 +71,11 @@ Whoever babysits a deployment — today an interactive session, eventually the
 the moment a fix needs harness code, file an issue with journal evidence and
 stop. Never self-modify mid-batch.
 
-- **Before**: build the change watch-list — `git log` since the previous
-  deployment plus the prior handover's untested items, one line per change
-  naming the journal evidence that will prove it works (e.g. "#21: repair
-  leg's `agent_run.model` must equal its resolve's"); triage doctor output
+- **Before**: read the pending rows of
+  [docs/field-verification.md](docs/field-verification.md) (the append-only
+  ledger of what has shipped vs what a live deployment has proven) and add
+  rows for anything `git log` shows landed without one — each row names the
+  journal evidence that will prove the change works; triage doctor output
   with judgment (a red preflight can be a false positive — verify
   independently before overriding, and file the gap); restore caps and
   regenerate stale env snapshots; populate newly-landed knobs; pick the batch
@@ -89,9 +90,9 @@ stop. Never self-modify mid-batch.
 - **After**: file surfaced issues with evidence; produce the batch readout
   ($/merge, first-pass rate, cost mix by leg, guardrail deltas — the numbers
   the Direction section requires before stacking changes); give every
-  watch-list entry a verdict — **verified** (cite the journal event),
-  **misbehaved** (file it), or **not exercised** (carry it to the next
-  handover; a change nothing fired is untested, not fine); hand the operator a
+  watch-list entry a verdict in the ledger — **VERIFIED** (cite the journal
+  event), **MISBEHAVED** (file it), or leave it **pending** (a change nothing
+  fired is untested, not fine); hand the operator a
   single loose-ends list (post-deploy verifications, label surgery the
   classifier reserves, superseded PRs).
 
