@@ -586,6 +586,15 @@ operator mistakes — recorded so they aren't re-diagnosed as bugs.
   and for anything emitting a set assert set equality against an independently
   derived expectation, never membership of the happy-path examples.
 
+**111. Gate probe falsely failed when dependencies were checkout-local**
+- `point-at.sh` created its pristine-base worktree under `/tmp`, while real
+  issue worktrees live below the target checkout. JavaScript issue worktrees
+  could therefore resolve the target's ancestor `node_modules`, but the probe
+  could not and reported a green base as red (`ERR_MODULE_NOT_FOUND`). FIXED
+  2026-07-28 (#49): the throwaway probe now follows the configured
+  `WORKTREE_ROOT`, preserving isolation from local edits while matching the
+  dependency-resolution environment used by issue worktrees.
+
 ---
 
 _Generated from transcript mining, 2026-07-21. ~103 distinct entries after
@@ -594,4 +603,5 @@ dedup across 7 parallel search passes over the full transcript corpus.
 docs/IMPROVEMENT-PLAN.md). #107–#110 added 2026-07-26 from the two adversarial
 reviews (docs/REVIEW-2026-07-25-adversarial.md,
 docs/REVIEW-2026-07-26-p0-rereview.md) — the first three are new failure
-CLASSES, not instances; #110 is about the remediation process itself._
+CLASSES, not instances; #110 is about the remediation process itself. #111
+added 2026-07-28 from the seventh tauri-explorer deployment._
