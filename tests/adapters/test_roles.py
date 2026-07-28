@@ -1402,3 +1402,41 @@ def test_a_working_steward_does_not_claim_it_has_nothing_to_do(
     err = capsys.readouterr().err
     assert "steward: capabilities: triage=on" in err
     assert "capabilities: NONE" not in err
+
+
+# ── #29: a codex fixer announces that MAX_BUDGET_USD bounds nothing ──────────
+
+
+def _codex_daemon(tmp_path, **env):
+    from issue_agent.app.config import from_env
+    from issue_agent.app.roles import build_fix_daemon
+
+    cfg = from_env({
+        "REPO": "o/r", "FIX_BOT": FIX_BOT, "FIXER_RUNTIME": "codex",
+        "STATE_DIR": str(tmp_path / "state"), "MAX_BUDGET_USD": "20",
+        "AGENT_MAX_RUNTIME_SECONDS": "3600", **env,
+    })
+    return build_fix_daemon(
+        cfg, _BuildableGateway(), Store(str(tmp_path / "state")), FakeWorktrees(),
+        FakeRunner(AgentResult(is_error=False)),
+    )
+
+
+def test_a_codex_fixer_warns_that_the_per_session_budget_is_not_enforced(tmp_path, capsys):
+    """It fired for nobody before: the clause lived inside the blindspot
+    warning, which goes silent as soon as pricing is configured — so the
+    operators who set up pricing correctly were the ones who never saw it."""
+    _codex_daemon(tmp_path)  # shipped (non-zero) rates → no blindspot warning
+
+    err = capsys.readouterr().err
+    assert "CODEX_COST_PER_MTOK_IN/OUT are 0" not in err, "pricing IS configured"
+    assert "NOT ENFORCED on this runtime" in err
+    assert "MAX_BUDGET_USD=$20.00" in err
+
+
+def test_the_warning_still_fires_with_the_price_table_zeroed(tmp_path, capsys):
+    _codex_daemon(tmp_path, CODEX_COST_PER_MTOK_IN="0", CODEX_COST_PER_MTOK_OUT="0")
+
+    err = capsys.readouterr().err
+    assert "NOT ENFORCED on this runtime" in err
+    assert "NEITHER cap can ever fire" in err, "the zero-price warning is unchanged"

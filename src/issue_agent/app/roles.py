@@ -462,6 +462,7 @@ def build_fix_daemon(
         from ..adapters.codex_runner import (
             CodexRunner,
             CodexProvider,
+            codex_budget_not_enforced_warning,
             codex_cost_blindspot_warning,
         )
         from ..adapters.codex_hook import write_hook_config
@@ -515,6 +516,17 @@ def build_fix_daemon(
         )
         if _blindspot is not None:
             _log("fix")(_blindspot)
+        # #29: the OTHER half, which used to be reachable only through the line
+        # above — and therefore only when pricing was left unconfigured. The
+        # per-session budget is unenforceable on codex whatever the price table
+        # says, and `describe()` prints `fix_budget=$N` on every boot, so this
+        # correction has to be independent of it.
+        _unbounded = codex_budget_not_enforced_warning(
+            fix_budget_usd=cfg.fix_budget_usd,
+            max_runtime=codex_runtime.max_runtime,
+        )
+        if _unbounded is not None:
+            _log("fix")(_unbounded)
         # prepare_cwd installs the governor hook and writes AGENTS.override.md into
         # each worktree, composing the harness + target instructions. It also
         # installs the PostToolUse edit-check when EDIT_CHECK_CMD is set.

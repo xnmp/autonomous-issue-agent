@@ -624,6 +624,21 @@ class HarnessConfig:
         def model(m: str | None) -> str:
             return m or "(sdk default)"
 
+        # #29: MAX_BUDGET_USD is the SDK's per-session bound and codex has no
+        # analogue, so on that runtime this number bounds NOTHING — a keifu
+        # resolve ran to $28.74 against a configured $20 and exited `ok`. The
+        # figure still belongs in the summary (it is the configured value, and
+        # a claude/glm daemon does enforce it), but printing it bare on codex
+        # is the startup log asserting a guarantee the runtime cannot make.
+        fix_budget = f"fix_budget=${self.fix_budget_usd:.2f}"
+        if self.fixer_runtime == "codex":
+            bound = (
+                f"wall cap {self.agent_max_runtime:.0f}s is the only per-run bound"
+                if self.agent_max_runtime > 0
+                else "NOTHING bounds a run — AGENT_MAX_RUNTIME_SECONDS is unset"
+            )
+            fix_budget += f" (NOT ENFORCED on codex — {bound})"
+
         return "\n".join([
             f"repo={self.repo or '(UNSET)'} base={self.base_branch} "
             # getattr, not IdentityMode(...): describe() is the startup diagnostic
@@ -634,7 +649,7 @@ class HarnessConfig:
             f"fixer={self.fixer_runtime} fix_model={model(self.fix_model)} "
             f"fix_effort={getattr(self.fix_effort, 'value', None) or '(runtime default)'} "
             f"escalate={'on' if self.escalate_on_evidence else 'off'} "
-            f"fix_budget=${self.fix_budget_usd:.2f}",
+            f"{fix_budget}",
             f"review_model={model(self.review_model)} mode={self.review_mode.value} "
             f"review_budget=${self.review_budget_usd:.2f} "
             f"rejections_cap={self.max_review_rejections}",

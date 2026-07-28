@@ -468,6 +468,39 @@ def codex_cost_blindspot_warning(
     )
 
 
+def codex_budget_not_enforced_warning(
+    *, fix_budget_usd: float, max_runtime: float = 0.0
+) -> str | None:
+    """The half of `codex_cost_blindspot_warning` that has nothing to do with
+    pricing, split out so it can actually be seen (#29).
+
+    `build_codex_argv` has no analogue of the SDK's per-session budget
+    (`AgentTask.max_budget_usd`): on codex, MAX_BUDGET_USD bounds NOTHING, and
+    the wall cap is the only per-run limit. That statement used to live inside
+    the blindspot warning, which returns early when the price table is set —
+    so the operators who had configured pricing CORRECTLY were exactly the ones
+    who never saw it (observed: keifu 2026-07-28, a $28.74 resolve against
+    MAX_BUDGET_USD=20, zero grep matches in the logs).
+
+    Returns None when no fix budget is configured — there is then no number
+    being misreported, and nothing to correct.
+    """
+    if fix_budget_usd <= 0:
+        return None
+    bound = (
+        f"the wall cap (CODEX_MAX_RUNTIME_SECONDS={max_runtime:.0f}s)"
+        if max_runtime > 0
+        else "NOTHING (CODEX_MAX_RUNTIME_SECONDS is unset — set it)"
+    )
+    return (
+        f"codex: WARNING — MAX_BUDGET_USD=${fix_budget_usd:.2f} is a "
+        "Claude-SDK-only bound and is NOT ENFORCED on this runtime: codex has "
+        f"no per-session budget flag, so {bound} limits a single run, and the "
+        "issue/daily spend caps (checked only BETWEEN legs) are the first real "
+        "ceiling. (FIXER_RUNTIME=codex)"
+    )
+
+
 def parse_codex_envelope(
     *,
     exit_code: int,
