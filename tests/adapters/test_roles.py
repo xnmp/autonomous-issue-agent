@@ -47,6 +47,7 @@ from issue_agent.app.planners.tasks import (
 )
 from issue_agent.app.roles import (
     _ci_stall_reporter,
+    _duplicate_pr_reporter,
     _fix_state,
     _hold_reporter,
     _recurrence_reporter,
@@ -60,6 +61,7 @@ from issue_agent.domain.refs import issue_from_branch
 from issue_agent.domain.review import ReviewConfig, ReviewMode, decide_review
 from issue_agent.domain.world import (
     Check,
+    ClosingRef,
     IssueView,
     PRView,
     Review,
@@ -1440,3 +1442,70 @@ def test_the_warning_still_fires_with_the_price_table_zeroed(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "NOT ENFORCED on this runtime" in err
     assert "NEITHER cap can ever fire" in err, "the zero-price warning is unchanged"
+
+
+# ── duplicate-PR guard reporting (#39) ───────────────────────────────────────
+_GUARD_CFG = FixConfig(fix_bot=FIX_BOT)
+
+
+def _duplicate_world(author="xnmp"):
+    """One ai-ready issue an open, NOT-ours PR already closes."""
+    return WorldState(
+        issues=(IssueView(554, title="t", labels=frozenset({Label.AI_READY})),),
+        closing_refs=(ClosingRef(pr=558, issue=554, author=author, base_ref_name="main"),),
+    )
+
+
+def _duplicates_in(journal):
+    return [
+        e for e in read_events(journal.path) if e.get("event") == "duplicate_pr_guard"
+    ]
+
+
+def test_a_duplicate_pr_is_journaled_once_and_logged_every_poll(tmp_path):
+    """The event IS the metric #39 moves — resolves not bought — so it carries
+    the issue, the PR and the author, once per pair; the log keeps answering
+    "why did my ai-ready issue go to ai-blocked?" on any poll it survives."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    logs = []
+    report = _duplicate_pr_reporter(journal, "o/r", _GUARD_CFG, logs.append)
+
+    for _ in range(3):
+        report(_duplicate_world())
+
+    events = _duplicates_in(journal)
+    assert len(events) == 1
+    assert (events[0]["issue"], events[0]["pr"], events[0]["author"]) == (554, 558, "xnmp")
+    assert events[0]["block_key"] == "duplicate-pr:o/r:554:558"
+    assert len(logs) == 3 and all("#554" in ln and "#558" in ln for ln in logs)
+
+
+def test_the_fixers_own_pr_is_never_reported_as_a_duplicate(tmp_path):
+    # anti-vacuity twin: the normal in-flight state must produce no event at all.
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    logs = []
+    _duplicate_pr_reporter(journal, "o/r", _GUARD_CFG, logs.append)(
+        _duplicate_world(author=FIX_BOT)
+    )
+    assert _duplicates_in(journal) == [] and logs == []
+
+
+def test_the_duplicate_dedup_survives_a_daemon_restart(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    _duplicate_pr_reporter(journal, "o/r", _GUARD_CFG, lambda _m: None)(_duplicate_world())
+    _duplicate_pr_reporter(journal, "o/r", _GUARD_CFG, lambda _m: None)(_duplicate_world())
+    assert len(_duplicates_in(journal)) == 1
+
+
+def test_the_reporter_and_the_decision_read_the_same_world(tmp_path):
+    """Single definition: what is journaled is what decide_fix refuses. Prove it
+    end-to-end rather than by re-stating the predicate."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    world = _duplicate_world()
+    _duplicate_pr_reporter(journal, "o/r", _GUARD_CFG, lambda _m: None)(world)
+    actions = decide_fix(world, _GUARD_CFG, FixState(), fixer_busy=False)
+    assert [a for a in actions if isinstance(a, RunAgent)] == []
+    assert Relabel(Target.ISSUE, 554, Label.AI_READY, Label.AI_BLOCKED) in actions
+    assert _duplicates_in(journal)[0]["pr"] == 558
+
+

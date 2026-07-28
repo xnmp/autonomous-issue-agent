@@ -24,6 +24,7 @@ from issue_agent.adapters.github import (
     build_enable_auto_merge_args,
     build_relabel_args,
     build_submit_review_args,
+    parse_closing_refs,
     parse_issue,
     parse_pr,
     parse_world,
@@ -564,6 +565,79 @@ def test_build_world_enriches_only_ready_issues_with_blocker_gate():
     by_num = {i.number: i for i in w.issues}
     assert by_num[5].blocked_by_open is True     # ready issue gated + blocked
     assert by_num[6].blocked_by_open is False    # working issue never gated
+
+
+# ── closing-reference graph for the duplicate-PR guard (#39) ─────────────────
+def test_parse_closing_refs_flattens_pr_to_issue_pairs():
+    data = [
+        {"number": 558, "author": {"login": "xnmp"}, "baseRefName": "main",
+         "closingIssuesReferences": [{"number": 554}, {"number": 555}]},
+        {"number": 559, "author": {"login": "fix-bot"}, "baseRefName": "dev",
+         "closingIssuesReferences": [{"number": 7}]},
+    ]
+    refs = parse_closing_refs(data)
+    assert [(r.pr, r.issue, r.author) for r in refs] == [
+        (558, 554, "xnmp"), (558, 555, "xnmp"), (559, 7, "fix-bot"),
+    ]
+    assert refs[0].base_ref_name == "main"
+
+
+def test_parse_closing_refs_tolerates_every_missing_field():
+    # This feeds a guard that REFUSES work: a shape surprise must degrade to
+    # "no evidence of a duplicate" (dispatch as before), never to an exception
+    # that kills the whole world build.
+    data = [
+        {"number": 1},                                    # no refs key
+        {"number": 2, "closingIssuesReferences": None},   # null refs
+        {"number": 3, "author": None, "closingIssuesReferences": [{"number": 9}]},
+        {"closingIssuesReferences": [{"number": 9}]},     # no PR number
+        {"number": 5, "closingIssuesReferences": [{}, {"number": "x"}]},
+        "not-a-dict",
+    ]
+    refs = parse_closing_refs(data)
+    assert [(r.pr, r.issue, r.author) for r in refs] == [(3, 9, "")]
+    assert parse_closing_refs(None) == () and parse_closing_refs({}) == ()
+
+
+def test_open_closing_refs_asks_for_every_open_pr_in_one_call():
+    fr = FakeRunner({"pr list": [
+        {"number": 558, "author": {"login": "xnmp"},
+         "closingIssuesReferences": [{"number": 554}]},
+    ]})
+    gw = GitHubGateway("o/r", runner=fr)
+    refs = gw.open_closing_refs()
+    assert [(r.pr, r.issue) for r in refs] == [(558, 554)]
+    argv = fr.calls[0][0]
+    assert argv[1:3] == ["pr", "list"]
+    assert "--label" not in argv               # the guard's subject is UNLABELLED PRs
+    assert "open" in argv and "closingIssuesReferences" in " ".join(argv)
+    assert _limit_of(argv) is not None         # review C2: never an unbounded list
+    assert len(fr.calls) == 1                  # one call, no per-PR fetch
+
+
+def test_build_world_carries_closing_refs_into_the_world():
+    def runner(argv, token):
+        key = " ".join(argv)
+        if "issue list" in key:
+            return "[]"
+        if "closingIssuesReferences" in key:
+            return json.dumps([
+                {"number": 558, "author": {"login": "xnmp"},
+                 "closingIssuesReferences": [{"number": 554}]},
+            ])
+        return "[]"
+
+    w = GitHubGateway("o/r", runner=runner).build_world()
+    assert [(r.pr, r.issue, r.author) for r in w.closing_refs] == [(558, 554, "xnmp")]
+
+
+def test_open_closing_refs_fails_soft_to_empty():
+    # A guard that refuses work must never be the thing that crashes a poll —
+    # and "" reads as the pre-#39 behaviour (dispatch).
+    gw = GitHubGateway("o/r", runner=_raising_runner(RuntimeError("boom")))
+    assert gw.open_closing_refs() == ()
+
+
 
 
 # ── _subprocess_runner: benign statusCheckRollup noise gated behind debug ──────

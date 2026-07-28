@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from ..domain.labels import Label
 from ..domain.world import (
     Check,
+    ClosingRef,
     Comment,
     IssueView,
     PRView,
@@ -413,6 +414,47 @@ def _changed_files(files: object) -> frozenset[str]:
         if isinstance(f, dict) and f.get("path"):
             out.add(str(f["path"]))
     return frozenset(out)
+
+
+def parse_closing_refs(data: object) -> tuple[ClosingRef, ...]:
+    """`gh pr list --json number,author,closingIssuesReferences,baseRefName` →
+    one `ClosingRef` per (PR, closed issue) pair (#39).
+
+    Flattened rather than one-per-PR because the guard asks a question about an
+    ISSUE ("is anyone already fixing this?"), and a PR may close several. Total
+    tolerance for shape: a null author, a missing/odd references list, an
+    unparseable number — every one of them yields fewer refs, never an
+    exception. This feeds a guard that REFUSES work, so a parse error must
+    degrade to "no evidence of a duplicate" (dispatch, as before), never to a
+    crashed world build."""
+    if not isinstance(data, list):
+        return ()
+    out: list[ClosingRef] = []
+    for p in data:
+        if not isinstance(p, dict):
+            continue
+        try:
+            number = int(p["number"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        author = ""
+        if isinstance(p.get("author"), dict):
+            author = str(p["author"].get("login") or "")
+        base = str(p.get("baseRefName") or "")
+        refs = p.get("closingIssuesReferences")
+        if not isinstance(refs, list):
+            continue
+        for ref in refs:
+            if not isinstance(ref, dict):
+                continue
+            try:
+                issue = int(ref["number"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            out.append(
+                ClosingRef(pr=number, issue=issue, author=author, base_ref_name=base)
+            )
+    return tuple(out)
 
 
 def format_review_comments(raw: object, limit: int = _INLINE_COMMENT_LIMIT) -> str:
@@ -800,6 +842,36 @@ class GitHubGateway:
         _warn_if_list_truncated("gh pr list --state open", len(data))
         return [int(p["number"]) for p in data]
 
+    def open_closing_refs(self) -> tuple[ClosingRef, ...]:
+        """Every OPEN PR's closing-issue references, repo-wide (#39).
+
+        ONE `gh pr list` per full fix world build — no label filter and no
+        per-PR fetch, because the guard's whole subject is PRs the harness never
+        labelled (an operator's own branch, a contributor's PR). Widening the
+        EXISTING per-PR enrichment to all open PRs would have cost two calls per
+        PR per poll and, worse, would have changed what `world.prs` means for the
+        path-overlap hold, the reaper and auto-merge — a large behavioural blast
+        radius for one boolean. This carries only the four fields the guard
+        reads.
+
+        Fail-soft to `()`: a guard that refuses work must never be the thing
+        that crashes a poll, and an empty result reads as "no duplicate known",
+        which is the pre-#39 behaviour. `GhUnavailable` still propagates — it is
+        raised inside `_gh_json` and means the whole world is unreadable, which
+        is `Daemon.tick`'s call, not this method's."""
+        try:
+            data = self._gh_json(
+                ["pr", "list", "--repo", self.repo, "--state", "open",
+                 "--json", "number,author,closingIssuesReferences,baseRefName",
+                 "--limit", str(_LIST_LIMIT)]
+            ) or []
+        except GhUnavailable:
+            raise
+        except Exception:  # noqa: BLE001 — see the docstring
+            return ()
+        _warn_if_list_truncated("gh pr list --state open (closing refs)", len(data))  # type: ignore[arg-type]
+        return parse_closing_refs(data)
+
     def build_world(self) -> WorldState:
         """Fetch the slice the daemons need: ai-ready/ai-working/ai-blocked issues
         and ai-pr-open PRs (open + recently merged/closed for cleanup). Composed
@@ -838,7 +910,14 @@ class GitHubGateway:
                 checks=pr_states[n] == "OPEN",
             )) is not None
         )
-        return WorldState(issues=issues, prs=prs, now=build_time())
+        # One extra list call, and only on a FULL build (a probe-gated tick never
+        # reaches here). Fetched AFTER the per-item enrichment so a duplicate
+        # guard can never be the reason a world build fails late: by this point
+        # everything else is already in hand.
+        return WorldState(
+            issues=issues, prs=prs, closing_refs=self.open_closing_refs(),
+            now=build_time(),
+        )
 
     def build_review_world(self) -> WorldState:
         """The review daemon's slice: ONLY PRs carrying `self.review_pr_label` (open
