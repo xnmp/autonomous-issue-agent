@@ -354,8 +354,11 @@ if command -v gh >/dev/null 2>&1; then
     # bad, not warn: the outcome is an unreviewed third-party merge, it is
     # silent, and the harness cannot undo it. Silent when every open PR is the
     # harness's own (or there are none) — that is the configuration the default
-    # was designed for and it must not nag.
-    if [ "${REVIEW_ADOPT_UNLABELED:-1}" = "1" ] && [ "${AUTO_MERGE:-1}" = "1" ]; then
+    # was designed for and it must not nag. Solo mode is exempt: with no second
+    # identity there is no approver, so AUTO_MERGE=1 cannot fire (the solo-mode
+    # warning above already names that) and the composition is unreachable.
+    if [ "${IDENTITY_MODE:-three}" != "solo" ] \
+       && [ "${REVIEW_ADOPT_UNLABELED:-1}" = "1" ] && [ "${AUTO_MERGE:-1}" = "1" ]; then
       _nfix_author="$(_normalize_login "${FIX_BOT:-}")"
       _foreign=""; _foreign_n=0
       while IFS= read -r _author; do
@@ -482,6 +485,63 @@ else
           done <<< "$_RED"
         fi
       fi
+    fi
+  fi
+fi
+
+# ── F. Platforms in the CI matrix that TEST_CMD cannot exercise (#34) ────────
+# The A/D probes above are EMPIRICAL, which is what makes them safe — and also
+# what makes them blind on a repo whose CI has just been switched on: no sampled
+# PR carries checks, so nothing is known. keifu was exactly that repo, and the
+# first windows job ever to run revealed 9 genuinely failing CRLF-sensitive
+# tests. The harness runs TEST_CMD on THIS box (Linux) only, so a red on
+# windows/macOS is invisible to preflight and burns fix-ci legs on a platform
+# the harness cannot execute.
+#
+# This is the cheap complement, and only that: it reads the workflow files (no
+# network) and names the exposure. It is a WARNING — a non-Linux matrix entry is
+# normal and often fine. Anything it cannot parse (`runs-on: ${{ matrix.os }}`
+# with the values elsewhere, an expression, a self-hosted label) simply does not
+# match the platform patterns and stays silent, which is the right failure mode
+# for a heuristic: guessing here would train operators to ignore the line.
+_WF_DIR="${TARGET_DIR:-}/.github/workflows"
+if [ -n "${TARGET_DIR:-}" ] && [ -d "$_WF_DIR" ]; then
+  shopt -s nullglob
+  _WF_FILES=("$_WF_DIR"/*.yml "$_WF_DIR"/*.yaml)
+  shopt -u nullglob
+  if [ ${#_WF_FILES[@]} -gt 0 ]; then
+    # Collect the values of `runs-on:` and of matrix `os:` keys, in all three
+    # YAML shapes: scalar, inline list, and block list.
+    _NONLINUX="$(awk '
+      function emit(s,   n, a, i, v) {
+        n = split(s, a, /[][,]/)
+        for (i = 1; i <= n; i++) {
+          v = a[i]
+          gsub("^[ \t\"\047]+", "", v)
+          gsub("[ \t\"\047]+$", "", v)
+          if (v != "") print v
+        }
+      }
+      FNR == 1 { inlist = 0 }
+      /^[ \t]*(runs-on|os)[ \t]*:/ {
+        rest = $0
+        sub(/^[ \t]*(runs-on|os)[ \t]*:[ \t]*/, "", rest)
+        sub(/#.*$/, "", rest)
+        if (rest == "") { inlist = 1 } else { inlist = 0; emit(rest) }
+        next
+      }
+      inlist == 1 && /^[ \t]*-/ {
+        rest = $0
+        sub(/^[ \t]*-[ \t]*/, "", rest)
+        sub(/#.*$/, "", rest)
+        emit(rest)
+        next
+      }
+      inlist == 1 && /^[ \t]*[^ \t#]/ { inlist = 0 }
+    ' "${_WF_FILES[@]}" 2>/dev/null \
+      | grep -iE '^(windows|macos)' | sort -u | paste -sd, - | sed 's/,/, /g')"
+    if [ -n "$_NONLINUX" ]; then
+      warn "CI matrix includes $_NONLINUX — TEST_CMD runs on Linux only (this box), so failures on those platforms are invisible to preflight AND to the local gate. The harness cannot reproduce or fix them; each one costs a fix-ci leg that cannot converge. Verify those jobs are green before trusting auto-merge, or exclude them with CI_IGNORE_CHECKS."
     fi
   fi
 fi
