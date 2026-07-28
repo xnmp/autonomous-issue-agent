@@ -1317,3 +1317,88 @@ def test_no_gate_is_wired_when_both_daily_caps_are_disabled(tmp_path, monkeypatc
     for daemon in daemons:
         daemon.tick()
     assert gw.observations == 3
+
+
+# ── boot capability lines (#46) ───────────────────────────────────────────────
+# The log line IS the contract here: an operator watching three healthy daemons
+# reasonably concludes three things are happening, and the steward is the role
+# that can be configured into doing literally nothing while looking identical to
+# the two that work. So these assert on the rendered text.
+def test_a_steward_with_every_feature_off_says_it_can_do_nothing():
+    from issue_agent.app.roles import steward_capability_line
+
+    line = steward_capability_line(
+        triage=False, promote=False, jira_sync=False, recurrence=True
+    )
+
+    assert "steward: capabilities: NONE" in line
+    assert "no work it can do" in line
+    # The knobs to change, named in the line that reports the problem.
+    assert "STEWARD_TRIAGE=0" in line
+    assert "STEWARD_PROMOTE=0" in line
+    assert "JIRA_SYNC=0" in line
+
+
+def test_a_steward_with_one_feature_on_reports_the_set_not_a_verdict():
+    from issue_agent.app.roles import steward_capability_line
+
+    line = steward_capability_line(
+        triage=True, promote=False, jira_sync=False, recurrence=True
+    )
+
+    assert "NONE" not in line
+    assert "triage=on" in line and "promote=off" in line and "jira_sync=off" in line
+
+
+def test_recurrence_watching_is_reported_inert_without_a_fix_bot():
+    from issue_agent.app.roles import steward_capability_line
+
+    inert = steward_capability_line(
+        triage=True, promote=False, jira_sync=False, recurrence=False
+    )
+    live = steward_capability_line(
+        triage=True, promote=False, jira_sync=False, recurrence=True
+    )
+
+    assert "recurrence=inert" in inert and "FIX_BOT" in inert
+    assert "recurrence=watch" in live
+
+
+def test_the_fix_and_review_capability_lines_name_what_the_role_can_do():
+    from issue_agent.app.roles import fix_capability_line, review_capability_line
+
+    fix = fix_capability_line(
+        auto_merge=False, auto_rebase=True, escalate_on_evidence=False,
+        arm_on_open=True,
+    )
+    review = review_capability_line(can_approve=False, adopt_unlabeled=True)
+
+    assert "fix: capabilities:" in fix
+    assert "auto_merge=off" in fix and "auto_rebase=on" in fix
+    assert "arm_on_open=on" in fix and "escalate_on_evidence=off" in fix
+    # approve=off is solo mode: the reviewer reviews but nothing it does merges.
+    assert "review: capabilities:" in review
+    assert "approve=off" in review and "adopt_unlabeled=on" in review
+
+
+def test_the_steward_daemon_prints_its_capability_set_at_boot(
+    tmp_path, monkeypatch, capsys
+):
+    """Through the REAL builder, not the pure helper: a capability line nothing
+    emits is a line no operator ever sees."""
+    _steward_decide(
+        tmp_path, monkeypatch,
+        steward_triage=False, steward_promote=False, jira_sync=False,
+    )
+
+    assert "steward: capabilities: NONE" in capsys.readouterr().err
+
+
+def test_a_working_steward_does_not_claim_it_has_nothing_to_do(
+    tmp_path, monkeypatch, capsys
+):
+    _steward_decide(tmp_path, monkeypatch, steward_triage=True)
+
+    err = capsys.readouterr().err
+    assert "steward: capabilities: triage=on" in err
+    assert "capabilities: NONE" not in err

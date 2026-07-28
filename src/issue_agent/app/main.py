@@ -80,9 +80,11 @@ def _app_identity(cfg_env: dict, warn: Callable[[str], None] = lambda _m: None) 
     with the reviewer never reviewing anything. So gate the branch on the key being
     READABLE and fall through when it is not.
 
-    Fall through LOUDLY. Demoting to ambient silently would make review == FIX_BOT,
-    and under IDENTITY_MODE=three every approval is then a GitHub 422 self-approval
-    — a failure that surfaces far from its cause.
+    Fall through AUDIBLY, and proportionately. Demoting to ambient silently would
+    make review == FIX_BOT, and under IDENTITY_MODE=three every approval is then a
+    GitHub 422 self-approval — a failure that surfaces far from its cause, so that
+    case stays a warning. Falling through to a configured REVIEW_BOT_TOKEN is a
+    working identity, not a fault; it states which identity is live instead (#46).
     """
     if cfg_env.get("GH_APP_ID") and cfg_env.get("GH_APP_KEY_FILE") and cfg_env.get("GH_APP_INSTALL_ID"):
         key_file = os.path.expanduser(cfg_env["GH_APP_KEY_FILE"])
@@ -95,12 +97,25 @@ def _app_identity(cfg_env: dict, warn: Callable[[str], None] = lambda _m: None) 
             )
             minter = AppTokenMinter(creds, default_mint_fn, now_fn=lambda: int(time.time()))
             return Identity(token_provider=minter.get)
-        warn(
-            f"GH_APP_KEY_FILE '{key_file}' is missing or unreadable — ignoring the "
-            "GitHub App identity and falling back to "
-            + ("REVIEW_BOT_TOKEN" if cfg_env.get("REVIEW_BOT_TOKEN")
-               else "ambient `gh auth` (which is FIX_BOT — approvals will 422)")
-        )
+        # Two very different situations, and printing the SAME alarm for both
+        # (#46) trains operators to ignore it. With a bot token configured the
+        # static-token path is a supported, complete identity — the missing key
+        # file is then almost always the shipped GH_APP_* placeholder, and the
+        # line should confirm which identity is live, not read as a fault on
+        # every boot of all three daemons. With no bot token the fallback is
+        # ambient == FIX_BOT and every approval 422s: that stays loud.
+        if cfg_env.get("REVIEW_BOT_TOKEN"):
+            warn(
+                "identity: static token (REVIEW_BOT_TOKEN) — GH_APP_KEY_FILE "
+                f"'{key_file}' is not present, so the GitHub App identity is "
+                "not in use"
+            )
+        else:
+            warn(
+                f"GH_APP_KEY_FILE '{key_file}' is missing or unreadable — ignoring "
+                "the GitHub App identity and falling back to ambient `gh auth` "
+                "(which is FIX_BOT — approvals will 422)"
+            )
     if cfg_env.get("REVIEW_BOT_TOKEN"):
         return Identity(static_token=cfg_env["REVIEW_BOT_TOKEN"])
     return Identity()
