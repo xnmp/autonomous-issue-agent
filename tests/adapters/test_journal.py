@@ -618,6 +618,56 @@ def test_each_leg_of_a_multi_leg_dispatch_gets_its_own_attributed_line(tmp_path)
     assert sum_issue(ledger, "o/r", 5) == pytest.approx(1.5)
 
 
+# ── #40: one leg of a dispatch under its own kind ────────────────────────────
+def test_a_leg_kind_renames_only_the_legs_inside_the_block(tmp_path):
+    rt, journal, _ = _runtime(tmp_path, AgentResult(is_error=False, cost_usd=0.5))
+    rt.set_context("fix", "RESOLVE", 5, 5)
+    with rt.leg_kind("ROUTE"):
+        asyncio.run(rt.run(AgentTask(prompt="classify")))
+    asyncio.run(rt.run(AgentTask(prompt="resolve")))
+
+    assert [r["kind"] for r in _settled(journal.path)] == ["ROUTE", "RESOLVE"]
+
+
+def test_a_leg_kind_keeps_the_dispatch_id_and_the_rest_of_the_context(tmp_path):
+    rt, journal, _ = _runtime(tmp_path, AgentResult(is_error=False, cost_usd=0.5))
+    rt.set_context("fix", "RESOLVE", 5, 5)
+    with rt.leg_kind("ROUTE"):
+        asyncio.run(rt.run(AgentTask(prompt="classify")))
+    asyncio.run(rt.run(AgentTask(prompt="resolve")))
+
+    runs = _settled(journal.path)
+    assert len({r["dispatch"] for r in runs}) == 1, "one dispatch, one id"
+    assert all((r["role"], r["number"], r["issue"]) == ("fix", 5, 5) for r in runs)
+
+
+def test_a_renamed_leg_is_still_ledgered(tmp_path):
+    """A router run is real spend — the caps must still see it, under its own
+    bucket."""
+    rt, _, ledger = _runtime(tmp_path, AgentResult(is_error=False, cost_usd=0.07))
+    rt.set_context("fix", "RESOLVE", 5, 5)
+    with rt.leg_kind("ROUTE"):
+        asyncio.run(rt.run(AgentTask(prompt="classify")))
+
+    spend = read_events(ledger)
+    assert [(s["kind"], s["cost_usd"]) for s in spend] == [("ROUTE", 0.07)]
+    assert sum_issue(ledger, "o/r", 5) == pytest.approx(0.07)
+
+
+def test_a_leg_kind_unwinds_when_the_leg_raises(tmp_path):
+    class Boom:
+        async def run(self, task):
+            raise RuntimeError("router transport died")
+
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    rt = JournalingRuntime(Boom(), journal, "", "o/r", "fix")
+    rt.set_context("fix", "RESOLVE", 5, 5)
+    with pytest.raises(RuntimeError):
+        with rt.leg_kind("ROUTE"):
+            asyncio.run(rt.run(AgentTask(prompt="classify")))
+    assert rt.context.kind == "RESOLVE", "a dead leg must not leave the dispatch renamed"
+
+
 def test_result_is_returned_unchanged_and_inner_still_sees_the_task(tmp_path):
     expected = AgentResult(is_error=False, status="done")
     rt, _, _ = _runtime(tmp_path, expected)

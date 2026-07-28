@@ -32,6 +32,14 @@ class AgentKind(Enum):
     bash scripts being replaced."""
 
     RESOLVE = auto()         # resolve-issue.sh
+    # The cheap difficulty classifier the resolve family runs BEFORE the resolve
+    # itself (#8/#16). Never an Action — nothing dispatches it, so it has no
+    # handler in `Dispatcher.dispatch`; it exists so the leg has a name of its
+    # own in the journal and the ledger. Without it the classify probe recorded
+    # `kind=RESOLVE` (it inherits the dispatch's context), which inflated the
+    # RESOLVE bucket by one ~$0.07 entry per routed dispatch and made a
+    # 4-second classify indistinguishable from a completed resolve (#40).
+    ROUTE = auto()
     RESUME = auto()          # resume-issue.sh
     ADDRESS_REVIEW = auto()  # address-review.sh
     FIX_CI = auto()          # fix-ci.sh

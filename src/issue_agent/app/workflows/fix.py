@@ -8,6 +8,7 @@ central dispatcher can become a thin role router.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ from ...domain import fix as fix_domain
 from ...domain import outcome
 from ..planners import tasks as task_builders
 from ..planners.tasks import FixTaskConfig
-from ...domain.actions import Relabel, Target
+from ...domain.actions import AgentKind, Relabel, Target
 from ...domain.agent_task import AgentRuntime
 from ...domain.ci import latest_other_review
 from ...domain.effort import (
@@ -138,9 +139,18 @@ class FixWorkflow:
         if alt_key is not None and alt_key != key:
             self.store.clear_infra_deaths(alt_key)
 
-    async def _run_logged(self, label: str, issue: int, task):
+    def _leg_kind(self, kind: str | None):
+        """Journal the next run under its own `kind` (#40), when the wrapped
+        runtime knows how. A bare/undecorated runner (an injected fake, the
+        legacy adapters) has no `leg_kind` and simply keeps the dispatch's
+        kind — a naming nicety must never be able to kill a leg."""
+        override = getattr(self.runner, "leg_kind", None) if kind else None
+        return override(kind) if override is not None else contextlib.nullcontext()
+
+    async def _run_logged(self, label: str, issue: int, task, *, kind: str | None = None):
         self.cfg.log(f"agent #{issue}: {label} — running")
-        result = await self.runner.run(task)
+        with self._leg_kind(kind):
+            result = await self.runner.run(task)
         self.cfg.log(
             f"agent #{issue}: {label} — done "
             f"(status={outcome.status_label(result)}"
@@ -359,6 +369,7 @@ class FixWorkflow:
                 task_builders.build_router_task(
                     iss.title, iss.body, runtime=self.cfg.fixer_runtime
                 ),
+                kind=AgentKind.ROUTE.name,
             )
             tier = result.field("tier")
         except Exception as exc:  # noqa: BLE001 — routing is advisory, never fatal
