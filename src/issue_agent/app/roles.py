@@ -44,6 +44,7 @@ from ..domain.labels import Label
 from ..domain.lifecycle import retry_breaker
 from ..domain.review import (
     DEFAULT_MAX_UNPRODUCTIVE_ROUNDS,
+    IdentityMode,
     ReviewConfig,
     ReviewState,
     decide_review,
@@ -73,6 +74,63 @@ def _log(name: str):
         sys.stderr.flush()  # unbuffered: a crash right after must not eat the line
 
     return log
+
+
+def _onoff(enabled: bool) -> str:
+    return "on" if enabled else "off"
+
+
+def fix_capability_line(*, auto_merge: bool, auto_rebase: bool,
+                        escalate_on_evidence: bool, arm_on_open: bool) -> str:
+    """One boot line saying what the fixer can DO in this configuration."""
+    return (
+        "fix: capabilities: resolve=on "
+        f"auto_merge={_onoff(auto_merge)} auto_rebase={_onoff(auto_rebase)} "
+        f"escalate_on_evidence={_onoff(escalate_on_evidence)} "
+        f"arm_on_open={_onoff(arm_on_open)}"
+    )
+
+
+def review_capability_line(*, can_approve: bool, adopt_unlabeled: bool) -> str:
+    """One boot line for the reviewer. `approve=off` is solo identity mode: the
+    reviewer still reviews and comments, but the verdict never becomes a GitHub
+    approval, so nothing it does can merge anything."""
+    return (
+        "review: capabilities: review=on "
+        f"approve={_onoff(can_approve)} adopt_unlabeled={_onoff(adopt_unlabeled)}"
+    )
+
+
+def steward_capability_line(*, triage: bool, promote: bool, jira_sync: bool,
+                            recurrence: bool) -> str:
+    """One boot line for the steward — the role that can be configured into
+    doing literally nothing (#46).
+
+    An operator watching three healthy daemons reasonably concludes three things
+    are happening. With STEWARD_TRIAGE=0, STEWARD_PROMOTE=0 and JIRA_SYNC=0 the
+    steward polls forever with no work it can act on, and in `ps`, in the log
+    directory and in `issue-agent status` it is indistinguishable from the two
+    daemons that are working. So say it, in the log, at boot.
+
+    Recurrence reporting is reported separately from the verdict because it is
+    passive: it journals reopened `ai-done` issues, it never dispatches an agent,
+    and it is structurally inert without a FIX_BOT to attribute merges to. It is
+    therefore not "work the daemon can do" in the sense the NONE verdict means.
+    """
+    recurrence_note = (
+        "recurrence=watch" if recurrence else "recurrence=inert (FIX_BOT unset)"
+    )
+    if triage or promote or jira_sync:
+        return (
+            "steward: capabilities: "
+            f"triage={_onoff(triage)} promote={_onoff(promote)} "
+            f"jira_sync={_onoff(jira_sync)} {recurrence_note}"
+        )
+    return (
+        "steward: capabilities: NONE — this daemon will poll but has no work it "
+        "can do (STEWARD_TRIAGE=0 STEWARD_PROMOTE=0 JIRA_SYNC=0)"
+        f" — {recurrence_note}"
+    )
 
 
 def _journal(store: Store) -> Journal:
@@ -512,6 +570,12 @@ def build_fix_daemon(
         report_ci_stalls(world)
         return decide_fix(world, fix_cfg, _fix_state(store, world), fixer_busy())
 
+    _log("fix")(fix_capability_line(
+        auto_merge=fix_cfg.auto_merge,
+        auto_rebase=fix_cfg.auto_rebase_conflicts,
+        escalate_on_evidence=cfg.escalate_on_evidence,
+        arm_on_open=fix_cfg.arm_on_open,
+    ))
     return Daemon("fix", gateway.build_world, decide, executor, cfg.poll_seconds,
                   _log("fix"), journal=journal,
                   tick_gate=_spend_gate(cfg, ledger))
@@ -607,6 +671,11 @@ def build_review_daemon(
 
     def decide(world):
         return decide_review(world, rcfg, _review_state(store, world))
+
+    _log("review")(review_capability_line(
+        can_approve=rcfg.identity_mode == IdentityMode.THREE,
+        adopt_unlabeled=rcfg.adopt_unlabeled,
+    ))
 
     return Daemon("review", gateway.build_review_world, decide, executor,
                   cfg.poll_seconds, _log("review"), journal=journal,
@@ -718,6 +787,16 @@ def build_steward_daemon(
     report_recurrences = _recurrence_reporter(
         journal, gateway, cfg.repo, cfg.fix_runtime.bot, steward_log
     )
+    # What this daemon can actually DO here — not what it is configured with
+    # (#46). The two differ: JIRA_SYNC=1 with no project key is `jira_sync=off`,
+    # and recurrence watching needs a FIX_BOT to attribute merged PRs to.
+    steward_log(steward_capability_line(
+        triage=tcfg_dom.enabled,
+        promote=tcfg_dom.promote,
+        jira_sync=jira_on,
+        recurrence=bool(cfg.fix_runtime.bot)
+        and getattr(gateway, "issue_state_reason", None) is not None,
+    ))
 
     def decide(world):
         # Before the pure decide, as in the fixer: if the decision raises, the
