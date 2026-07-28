@@ -28,8 +28,9 @@ existing adapter or an injected callable.
 
 ## The five properties worth preserving
 
-These are what the 2026-07-25 review identified as load-bearing. A refactor that
-breaks one of them is a regression even if the tests pass.
+These are what adversarial review and live deployments identified as
+load-bearing. A refactor that breaks one of them is a regression even if the
+tests pass.
 
 1. **Decisions are data.** `decide_*` returns `Action` tuples; nothing in
    `domain/` performs a write. This is why adding escalation alerting and the
@@ -50,6 +51,21 @@ breaks one of them is a regression even if the tests pass.
 5. **Incident comments.** Comments here carry the failure they prevent, often
    with a PR number. They are the densest defence in the codebase. When you move
    code, move its comment verbatim.
+
+## Required review guardrail — currently missing
+
+The SDK reviewer is diff-only: its tool policy does not check out the PR branch
+or run `TEST_CMD`. It therefore cannot independently reproduce the resolve
+agent's reported result. On keifu PR #146, an independently executed review
+exposed a confident PR-body claim about a test failure that did not exist while
+confirming the code itself was correct. The current SDK path does not preserve
+that protection.
+
+Treat independent execution as a required guardrail for review-cost work, not as
+a current capability. Before making review cheaper in a way that relies more on
+the author's summary, either add independent branch execution or build an
+equally independent contradiction check. Do not claim the guardrail is present
+until a behavioral test enforces it (#36).
 
 ## Enforcement: two stacks, one spec
 
