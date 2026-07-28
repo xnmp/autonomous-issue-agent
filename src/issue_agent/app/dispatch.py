@@ -27,7 +27,6 @@ from ..adapters.journal import (
     read_events_tail,
     spend_blocked_keys,
     sum_issue,
-    sum_today,
 )
 from ..domain import review as review_dom, triage as triage_dom
 from ..domain.actions import AgentKind, PostComment, RunAgent
@@ -36,6 +35,7 @@ from ..domain.labels import Label
 from ..domain.lifecycle import issue_escalation, pr_escalation
 from ..domain.outcome import deterministic_death
 from .planners.tasks import FixTaskConfig, JiraTaskConfig, ReviewTaskConfig, TriageTaskConfig
+from .spend_gate import read_daily_cap_breach
 from .workflows.fix import FixWorkflow, FixWorkflowConfig
 from .workflows.jira import JiraSyncWorkflow, JiraSyncWorkflowConfig
 from .workflows.review import ReviewWorkflow, ReviewWorkflowConfig
@@ -95,7 +95,10 @@ class DispatchConfig:
     # HarnessConfig) so a hand-built DispatchConfig — every test, every caller
     # that predates this — keeps exactly its old behavior.
     issue_spend_cap_usd: float = 0.0
+    # Today's spend on `repo` (#32 — the ledger is shared, the knob is per-repo).
     daily_spend_cap_usd: float = 0.0
+    # Today's spend across every repo on this box (config/shared.env).
+    global_daily_spend_cap_usd: float = 0.0
     alert_cmd: str = ""
     # The ceiling this role's decide side reads off the infra-death counter
     # (fix: max_infra_deaths; review: max_unproductive_rounds). Used ONLY to
@@ -317,14 +320,12 @@ class AgentDispatcher:
         (`_spend_block`), so a mechanism that ever regresses degrades to one
         noisy line per poll instead of one alert per poll.
 
-        **Daily (global, all repos)** — deliberately NOT a label change. It is a
-        LEVEL-triggered condition, not an event: the money comes back at midnight
-        UTC, and marking each blocked issue needs-human-review would leave a
-        human to hand-unwind a dozen labels the next morning for a condition that
-        healed itself. Instead the dispatch is skipped loudly, the reaper requeues
-        the issue, and the next tick re-evaluates. The cost is churn — one
-        no-op dispatch attempt per issue per poll until the day rolls over —
-        which is cheap precisely because no agent is ever started.
+        **Daily (this repo, and the whole box)** — deliberately NOT a label
+        change. It is a LEVEL-triggered condition, not an event: the money comes
+        back at midnight UTC, and marking each blocked issue needs-human-review
+        would leave a human to hand-unwind a dozen labels the next morning for a
+        condition that healed itself. Instead the dispatch is skipped loudly, the
+        reaper requeues the issue, and the next tick re-evaluates.
         """
         path = self.cfg.spend_ledger_path
         if not path:
@@ -359,21 +360,21 @@ class AgentDispatcher:
                     else [action for action in actions if not isinstance(action, PostComment)]
                 )
                 return True
-        cap = self.cfg.daily_spend_cap_usd
-        if cap > 0:
-            spent = sum_today(path)
-            if spent >= cap:
-                self._spend_block(
-                    f"TODAY'S GLOBAL SPEND ${spent:.2f} is at or over the "
-                    f"${cap:.2f} DAILY_SPEND_CAP_USD — all dispatch paused until "
-                    "00:00 UTC (no labels changed; work resumes by itself)",
-                    block_key=(
-                        f"daily:{datetime.now(timezone.utc).date().isoformat()}"
-                        f":cap:{cap:g}"
-                    ),
-                    scope="daily", spent=round(spent, 4), cap=cap,
-                )
-                return True
+        breach = read_daily_cap_breach(
+            path,
+            repo=self.cfg.repo,
+            repo_cap=self.cfg.daily_spend_cap_usd,
+            global_cap=self.cfg.global_daily_spend_cap_usd,
+        )
+        if breach is not None:
+            self._spend_block(
+                breach.message,
+                block_key=breach.block_key(
+                    datetime.now(timezone.utc).date().isoformat()
+                ),
+                scope=breach.scope, spent=round(breach.spent, 4), cap=breach.cap,
+            )
+            return True
         return False
 
     def _spend_block(self, message: str, *, block_key: str, **fields) -> bool:
@@ -403,6 +404,13 @@ class AgentDispatcher:
         alert(self.cfg.alert_cmd, event_line("spend_block", block_key=block_key, **fields))
         return True
 
+    def _any_cap_armed(self) -> bool:
+        return any((
+            self.cfg.issue_spend_cap_usd > 0,
+            self.cfg.daily_spend_cap_usd > 0,
+            self.cfg.global_daily_spend_cap_usd > 0,
+        ))
+
     def _warn_if_the_caps_are_blind(self) -> None:
         """One loud line, once per process, when a spend cap is armed but every
         settled run so far cost $0.00 (review P1R-5) — i.e. the ledger both caps
@@ -419,7 +427,7 @@ class AgentDispatcher:
             return
         if not self.cfg.spend_ledger_path:
             return  # caps already inert by construction — DispatchConfig says so
-        if self.cfg.issue_spend_cap_usd <= 0 and self.cfg.daily_spend_cap_usd <= 0:
+        if not self._any_cap_armed():
             self._cost_blindspot_checked = True
             return
         runs = [
@@ -432,7 +440,11 @@ class AgentDispatcher:
         warning = cost_blindspot_warning(
             runs,
             issue_spend_cap_usd=self.cfg.issue_spend_cap_usd,
-            daily_spend_cap_usd=self.cfg.daily_spend_cap_usd,
+            # Either daily cap makes the ledger load-bearing, and a deployment
+            # that only sets the global one is just as blind (#32).
+            daily_spend_cap_usd=(
+                self.cfg.daily_spend_cap_usd or self.cfg.global_daily_spend_cap_usd
+            ),
         )
         if warning is None:
             return

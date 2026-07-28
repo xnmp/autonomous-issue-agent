@@ -526,14 +526,25 @@ def parse_ts(value) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def sum_today(path: str, now_fn=_now) -> float:
+def sum_today(path: str, now_fn=_now, repo: str | None = None) -> float:
     """Total `spend` today (UTC). The daily cap's window resets at midnight UTC
     rather than local midnight so the same number is read by every daemon on the
-    box regardless of the timezone its shell was launched with."""
+    box regardless of the timezone its shell was launched with.
+
+    `repo` scopes the sum to one deployment (#32: the ledger is global, but
+    DAILY_SPEND_CAP_USD is configured per repo, so an unscoped sum let the first
+    deployment to spend starve every other one). None = every repo, which is
+    what a genuinely global cap and the status readout want.
+
+    An entry with no `repo` field — a legacy line, or a truncated write — is
+    counted by the global sum only: unattributable spend is still real money off
+    the box, but charging it to an arbitrary deployment would be a lie.
+    """
     today = _stamp(now_fn)[:10]
     return sum(
         _cost(e) for e in read_events(path)
         if e.get("event") == "spend" and str(e.get("ts", ""))[:10] == today
+        and (repo is None or e.get("repo") == repo)
     )
 
 

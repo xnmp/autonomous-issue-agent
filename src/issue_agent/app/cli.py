@@ -883,22 +883,34 @@ def journal_path(name: str) -> str:
     return journal_paths(name)[0]
 
 
-def daily_cap(name: str) -> float:
-    """DAILY_SPEND_CAP_USD as status should report it: overlay wins over shared,
-    and an unset/garbled value falls back to the HarnessConfig default rather
-    than silently reporting a $0 (which reads as 'disabled')."""
+def _env_cap(name: str, key: str, default: float) -> float:
+    """A cap knob as status should report it: overlay wins over shared, and an
+    unset/garbled value falls back to the HarnessConfig default rather than
+    silently reporting a $0 (which reads as 'disabled')."""
     for path in (os.path.join(REPOS_DIR, f"{name}.env"), SHARED_ENV):
-        raw = read_repo_env_field(path, "DAILY_SPEND_CAP_USD")
+        raw = read_repo_env_field(path, key)
         if raw:
             try:
                 return float(raw)
             except ValueError:
                 return 0.0
-    return 50.0
+    return default
+
+
+def daily_cap(name: str) -> float:
+    """DAILY_SPEND_CAP_USD — today's spend on THIS overlay's repo (#32)."""
+    return _env_cap(name, "DAILY_SPEND_CAP_USD", 50.0)
+
+
+def global_daily_cap(name: str) -> float:
+    """GLOBAL_DAILY_SPEND_CAP_USD — today's spend across every repo. Defaults to
+    0 (off), matching HarnessConfig."""
+    return _env_cap(name, "GLOBAL_DAILY_SPEND_CAP_USD", 0.0)
 
 
 def spend_status_lines(
-    journal_file: str | list[str], ledger_file: str, cap: float = 0.0, now_fn=None
+    journal_file: str | list[str], ledger_file: str, cap: float = 0.0, now_fn=None,
+    repo: str | None = None, global_cap: float = 0.0,
 ) -> list[str]:
     """The spend/health section of `issue-agent status`, as plain lines.
 
@@ -947,8 +959,20 @@ def spend_status_lines(
         return []
 
     lines = ["", _c("36", "── spend & health ──")]
-    budget = f" / ${cap:.2f} cap" if cap > 0 else " (no daily cap)"
-    lines.append(f"  today, all repos: ${spent:.2f}{budget}")
+    # DAILY_SPEND_CAP_USD bounds THIS repo (#32), so pairing it with the
+    # all-repos total read as "you have $640 of headroom" on a box where the
+    # other deployment had spent it all. Cap and number must share a scope.
+    if repo:
+        repo_spent = sum_today(ledger_file, now_fn, repo=repo)
+        budget = f" / ${cap:.2f} cap" if cap > 0 else " (no daily cap)"
+        lines.append(f"  today, {repo}: ${repo_spent:.2f}{budget}")
+        global_budget = (
+            f" / ${global_cap:.2f} cap" if global_cap > 0 else " (no global cap)"
+        )
+        lines.append(f"  today, all repos: ${spent:.2f}{global_budget}")
+    else:
+        budget = f" / ${cap:.2f} cap" if cap > 0 else " (no daily cap)"
+        lines.append(f"  today, all repos: ${spent:.2f}{budget}")
 
     # `agent_run` only, not `agent_run_start` — the latter (wave-A
     # JournalingRuntime pre-await receipt) is the other half of the same
@@ -1024,7 +1048,9 @@ def cmd_status(args) -> int:
         from ..adapters.journal import default_ledger_path
 
         for line in spend_status_lines(
-            journal_paths(name), default_ledger_path(), daily_cap(name)
+            journal_paths(name), default_ledger_path(), daily_cap(name),
+            repo=read_repo_env_field(os.path.join(REPOS_DIR, f"{name}.env"), "REPO"),
+            global_cap=global_daily_cap(name),
         ):
             print(line)
     except Exception as exc:  # noqa: BLE001

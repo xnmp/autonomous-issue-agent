@@ -347,13 +347,18 @@ class HarnessConfig:
     # ── spend circuit breakers ────────────────────────────────────────────────
     # Per-agent budgets (MAX_BUDGET_USD et al) bound ONE session; nothing bounded
     # the aggregate, so a leg that retries forever spent without limit while every
-    # individual run stayed under budget. These two caps close that: lifetime spend
-    # on one issue, and today's spend across EVERY repo and role on this machine
-    # (they share one ledger — see adapters.journal.default_ledger_path). Hitting
-    # the issue cap escalates that issue to a human; hitting the daily cap pauses
-    # all dispatch until 00:00 UTC without touching any label. 0 disables either.
+    # individual run stayed under budget. These caps close that. All three read the
+    # one shared ledger (adapters.journal.default_ledger_path) but differ in scope:
+    #   issue  — lifetime spend on one issue of THIS repo; escalates it to a human.
+    #   daily  — today's spend on THIS repo (per-repo overlay knob, #32).
+    #   global — today's spend across EVERY repo and role on this machine; belongs
+    #            in config/shared.env. Off by default so adding it never silently
+    #            tightens an existing deployment.
+    # Both daily caps pause dispatch until 00:00 UTC without touching any label.
+    # 0 disables any of them.
     issue_spend_cap_usd: float = 25.0
     daily_spend_cap_usd: float = 50.0
+    global_daily_spend_cap_usd: float = 0.0
     # Shell command fed each spend_block / escalation event as JSON on stdin.
     # Blank = no alerting (the events are still journalled).
     alert_cmd: str = ""
@@ -547,6 +552,9 @@ class HarnessConfig:
         _require_non_negative(errors, "CODEX_COST_PER_MTOK_OUT", self.codex_cost_per_mtok_out)
         _require_non_negative(errors, "ISSUE_SPEND_CAP_USD", self.issue_spend_cap_usd)
         _require_non_negative(errors, "DAILY_SPEND_CAP_USD", self.daily_spend_cap_usd)
+        _require_non_negative(
+            errors, "GLOBAL_DAILY_SPEND_CAP_USD", self.global_daily_spend_cap_usd
+        )
         return tuple(errors)
 
     def validate(self) -> None:
@@ -581,7 +589,9 @@ class HarnessConfig:
             f"timeouts: idle={self.agent_idle_timeout:.0f}s "
             f"wall={self.agent_max_runtime:.0f}s",
             f"spend_caps: issue=${self.issue_spend_cap_usd:.2f} "
-            f"daily=${self.daily_spend_cap_usd:.2f} "
+            f"daily/{self.repo or 'repo'}=${self.daily_spend_cap_usd:.2f} "
+            f"daily/global="
+            f"{f'${self.global_daily_spend_cap_usd:.2f}' if self.global_daily_spend_cap_usd > 0 else 'off'} "
             f"alert={'set' if self.alert_cmd else 'none'}",
             f"state={self.state_dir or '(unset)'} target={self.target_dir or '(cwd)'}",
         ])
@@ -1041,6 +1051,10 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         ),
         daily_spend_cap_usd=_coerce_float(
             e, "DAILY_SPEND_CAP_USD", _dc_default("daily_spend_cap_usd"), errors
+        ),
+        global_daily_spend_cap_usd=_coerce_float(
+            e, "GLOBAL_DAILY_SPEND_CAP_USD",
+            _dc_default("global_daily_spend_cap_usd"), errors,
         ),
         alert_cmd=e.get("ALERT_CMD", _dc_default("alert_cmd")),
         parse_errors=tuple(errors),
