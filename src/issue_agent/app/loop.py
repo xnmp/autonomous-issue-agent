@@ -63,6 +63,12 @@ class Daemon:
     # level-triggered halt costs no GraphQL quota and writes no labels (#27).
     # None (the field, or the return) = no gate.
     tick_gate: Callable[[], str | None] | None = None
+    # Optional push wake (adapters.wake.WakeSignal.pending). When set, the
+    # inter-tick sleep is served in ≤1s slices and ends early the moment a
+    # webhook delivery lands, which demotes `poll_seconds` from "how fast the
+    # harness notices" to "the reconciler backstop". None = today's behaviour:
+    # ONE sleep(poll_seconds) call, unsliced.
+    wake_check: Callable[[], bool] | None = None
     _gated_on: str | None = field(default=None, init=False, repr=False)
 
     def _gate_blocks_this_tick(self) -> bool:
@@ -151,7 +157,12 @@ class Daemon:
         where no agent session can be in flight (dispatch is synchronous inside
         tick), so exiting here never kills paid work. True → exit with
         RELOAD_EXIT_CODE for point-at's relaunch loop."""
-        self.log(f"{self.name}: watching (poll {self.poll_seconds}s)")
+        mode = (
+            f"webhook wake + reconcile {self.poll_seconds}s"
+            if self.wake_check is not None
+            else f"poll {self.poll_seconds}s"
+        )
+        self.log(f"{self.name}: watching ({mode})")
         last = now()
         last_logged = last
         ticks = 0
@@ -178,4 +189,33 @@ class Daemon:
                     f"restarting between ticks (no session in flight)"
                 )
                 raise SystemExit(RELOAD_EXIT_CODE)
+            self._sleep_interval(sleep)
+
+    def _sleep_interval(self, sleep: Callable[[int], None]) -> None:
+        """Sleep one poll interval, cut short by a push wake if one is wired.
+
+        Without `wake_check` this is exactly the old `sleep(poll_seconds)` — one
+        call, so a fake sleep still sees the interval it was asked for. With it,
+        the same total is served in ≤1s slices and abandoned on the first
+        delivery. A wake_check that raises is treated as "no wake": losing push
+        latency must never wedge the reconciler."""
+        if self.wake_check is None:
             sleep(self.poll_seconds)
+            return
+        remaining = self.poll_seconds
+        while remaining > 0:
+            step = 1 if remaining > 1 else remaining
+            sleep(step)
+            remaining -= step
+            try:
+                woken = self.wake_check()
+            except Exception as exc:  # noqa: BLE001 - a broken wake ≠ a dead daemon
+                self.log(f"{self.name}: wake check failed (polling on): {exc}")
+                # Serve out the REST of the interval unsliced: returning here
+                # would tick after ~1s, and a persistently-broken check would
+                # turn the slow reconciler into a 1s hot loop against the API.
+                if remaining > 0:
+                    sleep(remaining)
+                return
+            if woken:
+                return

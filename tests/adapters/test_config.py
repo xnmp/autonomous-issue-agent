@@ -501,6 +501,43 @@ def test_poll_seconds_default_is_20_everywhere():
     assert from_env({"REPO": "x"}).poll_seconds == 20
 
 
+def test_webhook_wake_is_off_by_default_and_polls_at_poll_seconds():
+    c = from_env({"REPO": "x"})
+    assert c.webhook_wake is False
+    assert c.reconcile_seconds == 300
+    assert c.tick_interval_seconds == c.poll_seconds == 20
+
+
+def test_webhook_wake_demotes_the_poll_loop_to_the_reconcile_cadence():
+    """The knob's whole observable effect: what a daemon sleeps between ticks.
+    POLL_SECONDS is left alone so turning the knob back off restores it."""
+    c = from_env({"REPO": "x", "WEBHOOK_WAKE": "1", "RECONCILE_SECONDS": "600"})
+    assert c.webhook_wake is True
+    assert c.poll_seconds == 20
+    assert c.tick_interval_seconds == 600
+
+
+def test_reconcile_seconds_must_be_positive():
+    # 0 is not "disabled" here, it is a busy loop — same rule as POLL_SECONDS.
+    errs = from_env({"REPO": "x", "RECONCILE_SECONDS": "0"}).validation_errors()
+    assert any("RECONCILE_SECONDS" in e for e in errs)
+
+
+def test_malformed_reconcile_seconds_falls_back_loudly():
+    c = from_env({"REPO": "x", "RECONCILE_SECONDS": "soon"})
+    assert c.reconcile_seconds == 300
+    assert any("RECONCILE_SECONDS" in e and "soon" in e for e in c.validation_errors())
+
+
+def test_describe_states_which_cadence_is_live():
+    """Push mode changes what the interval MEANS; the boot line must not read
+    like a 300s poll (the silent-default class this project keeps paying for)."""
+    polling = from_env({"REPO": "x"}).describe()
+    assert "poll=20s" in polling and "wake=webhook" not in polling
+    pushed = from_env({"REPO": "x", "WEBHOOK_WAKE": "1"}).describe()
+    assert "wake=webhook" in pushed and "reconcile=300s" in pushed
+
+
 def test_state_dirs_default_per_repo():
     # review M5/D7: default STATE_DIR used to be per-role but not per-repo —
     # two repos' fix daemons shared issue-N.session and one resumed the

@@ -33,6 +33,7 @@ from ..adapters.journal import (
     unsettled_starts,
 )
 from ..adapters.store import Store
+from ..adapters.wake import WakeSignal, wake_path
 from ..adapters.worktree import Worktrees
 from ..domain.fix import (
     FixConfig,
@@ -144,6 +145,16 @@ def _journal(store: Store) -> Journal:
     summed across every role and repo, and POSIX append atomicity makes sharing
     it safe without a lock."""
     return Journal(os.path.join(store.state_dir, "journal.jsonl"))
+
+
+def _wake_check(cfg: HarnessConfig, store: Store):
+    """The role's push wake, or None when WEBHOOK_WAKE is off (poll only).
+
+    Watched beside the role's own state, like the journal: the forwarder touches
+    one wake file per role so a delivery wakes all three independently."""
+    if not cfg.webhook_wake:
+        return None
+    return WakeSignal(wake_path(store.state_dir)).pending
 
 
 def _spend_cfg(cfg: HarnessConfig, role: str, ledger: str) -> dict:
@@ -682,9 +693,10 @@ def build_fix_daemon(
         escalate_on_evidence=cfg.escalate_on_evidence,
         arm_on_open=fix_cfg.arm_on_open,
     ))
-    return Daemon("fix", gateway.build_world, decide, executor, cfg.poll_seconds,
-                  _log("fix"), journal=journal,
-                  tick_gate=_spend_gate(cfg, ledger))
+    return Daemon("fix", gateway.build_world, decide, executor,
+                  cfg.tick_interval_seconds, _log("fix"), journal=journal,
+                  tick_gate=_spend_gate(cfg, ledger),
+                  wake_check=_wake_check(cfg, store))
 
 
 def _review_state(store: Store, world) -> ReviewState:
@@ -784,8 +796,9 @@ def build_review_daemon(
     ))
 
     return Daemon("review", gateway.build_review_world, decide, executor,
-                  cfg.poll_seconds, _log("review"), journal=journal,
-                  tick_gate=_spend_gate(cfg, ledger))
+                  cfg.tick_interval_seconds, _log("review"), journal=journal,
+                  tick_gate=_spend_gate(cfg, ledger),
+                  wake_check=_wake_check(cfg, store))
 
 
 _CODEOWNERS_PATHS = ("CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS")
@@ -944,5 +957,6 @@ def build_steward_daemon(
     # Jira needs closed ai-done issues too (for the final Done transition); triage
     # alone needs just open issues.
     observe = gateway.build_steward_world if jira_on else gateway.build_triage_world
-    return Daemon("steward", observe, decide, executor, cfg.poll_seconds, steward_log,
-                  journal=journal, tick_gate=_spend_gate(cfg, ledger))
+    return Daemon("steward", observe, decide, executor, cfg.tick_interval_seconds,
+                  steward_log, journal=journal, tick_gate=_spend_gate(cfg, ledger),
+                  wake_check=_wake_check(cfg, store))

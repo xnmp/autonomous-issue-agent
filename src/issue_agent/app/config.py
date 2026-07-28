@@ -165,6 +165,15 @@ class HarnessConfig:
     # (60 here, "20" there) — from_env now reads its default off THIS field, so
     # there is exactly one source and 20 (the value that actually shipped) wins.
     poll_seconds: int = 20
+    # Webhook push (#1): `gh webhook forward` runs as a supervised fourth
+    # process and touches each role's wake file on every delivery. Deliveries
+    # are WAKE SIGNALS ONLY — never acted on as payloads — so the stateless
+    # reconcile stays the single source of truth and a missed delivery costs
+    # latency, not correctness. With it on, the poll loop demotes to a slow
+    # backstop at `reconcile_seconds` (GitHub documents delivery as
+    # best-effort, and a dead forwarder must degrade to today's behaviour).
+    webhook_wake: bool = False
+    reconcile_seconds: int = 300
     # Change-probe gate on review/steward world builds (app/world_probe.py):
     # 1 REST point asks "did any issue/PR update?" before paying ~14 GraphQL
     # points for a full build. The fixer is NEVER probed regardless of this
@@ -431,6 +440,12 @@ class HarnessConfig:
     parse_errors: tuple[str, ...] = ()
 
     @property
+    def tick_interval_seconds(self) -> int:
+        """What a daemon actually sleeps between ticks. One source of truth for
+        the poll-vs-reconcile choice, so no role can wire the wrong one."""
+        return self.reconcile_seconds if self.webhook_wake else self.poll_seconds
+
+    @property
     def repository(self) -> RepositoryConfig:
         return RepositoryConfig(
             repo=self.repo,
@@ -542,6 +557,8 @@ class HarnessConfig:
         # behind a range check on the substituted default.
         errors: list[str] = list(self.parse_errors)
         _require_positive(errors, "POLL_SECONDS", self.poll_seconds)
+        # Same rule as POLL_SECONDS: 0 is not "disabled", it is a busy loop.
+        _require_positive(errors, "RECONCILE_SECONDS", self.reconcile_seconds)
         _require_non_negative(errors, "MAX_CI_RETRIES", self.max_ci_retries)
         _require_non_negative(
             errors, "CI_PENDING_MAX_SECONDS", self.ci_pending_max_seconds
@@ -649,12 +666,19 @@ class HarnessConfig:
             )
             fix_budget += f" (NOT ENFORCED on codex — {bound})"
 
+        # Push mode changes what the interval MEANS (notice latency → backstop
+        # cadence), so it prints as a different fact rather than a smaller poll.
+        cadence = (
+            f"wake=webhook reconcile={self.reconcile_seconds}s"
+            if self.webhook_wake else f"poll={self.poll_seconds}s"
+        )
+
         return "\n".join([
             f"repo={self.repo or '(UNSET)'} base={self.base_branch} "
             # getattr, not IdentityMode(...): describe() is the startup diagnostic
             # and must print whatever it was handed rather than raise on it.
             f"identity={getattr(self.identity_mode, 'value', self.identity_mode)} "
-            f"poll={self.poll_seconds}s "
+            f"{cadence} "
             f"probe={f'on/{self.world_probe_ttl_seconds}s' if self.world_probe else 'off'}",
             f"fixer={self.fixer_runtime} fix_model={model(self.fix_model)} "
             f"fix_effort={getattr(self.fix_effort, 'value', None) or '(runtime default)'} "
@@ -1062,6 +1086,10 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         steward_state_dir=e.get("STEWARD_STATE_DIR") or _default_state_dir(repo, "steward-agent"),
         worktree_root=e.get("WORKTREE_ROOT", _dc_default("worktree_root")),
         poll_seconds=_coerce_int(e, "POLL_SECONDS", _dc_default("poll_seconds"), errors),
+        webhook_wake=_b(e, "WEBHOOK_WAKE", _dc_default("webhook_wake"), errors),
+        reconcile_seconds=_coerce_int(
+            e, "RECONCILE_SECONDS", _dc_default("reconcile_seconds"), errors
+        ),
         arm_on_open=e.get("ARM_ON_OPEN", _dc_default("arm_on_open")),
         world_probe=_b(e, "WORLD_PROBE", _dc_default("world_probe"), errors),
         world_probe_ttl_seconds=_coerce_int(
