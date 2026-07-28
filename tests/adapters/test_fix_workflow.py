@@ -1480,3 +1480,104 @@ def test_resolve_persists_its_model_for_later_repair_legs():
     asyncio.run(_workflow(gw, store, runner).resolve(5))
 
     assert store.models[5] == "m"
+
+
+# ── #40: the classify probe is its own leg, not a resolve ────────────────────
+# The router run inherits the RESOLVE dispatch's journal context, so every routed
+# issue used to write two indistinguishable `kind=RESOLVE` lines — one a 4-second
+# ~$0.07 classify, one the real resolve. That inflated the RESOLVE bucket of any
+# `group_by(.kind)` cost mix by one entry per dispatch and was misread as a
+# completed resolve during live babysitting.
+
+
+def _journalled_resolve(tmp_path, runner):
+    """Run a routed resolve through the real JournalingRuntime and return
+    (journalled agent_runs, ledgered spend lines)."""
+    from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
+
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    ledger = str(tmp_path / "spend.jsonl")
+    rt = JournalingRuntime(runner, journal, ledger, "o/r", "fix")
+    rt.set_context("fix", "RESOLVE", 5, 5)
+
+    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
+    asyncio.run(_workflow(
+        gw, FakeStore(), rt, fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    runs = [e for e in read_events(journal.path) if e["event"] == "agent_run"]
+    return runs, read_events(ledger)
+
+
+def test_the_router_leg_journals_as_route_and_the_resolve_as_resolve(tmp_path):
+    runs, _ = _journalled_resolve(tmp_path, SeqRunner([
+        _router_result("standard"),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5", cost_usd=3.0),
+    ]))
+
+    assert [r["kind"] for r in runs] == ["ROUTE", "RESOLVE"], (
+        "the classify probe must not be counted as a resolve"
+    )
+
+
+def test_a_route_leg_is_still_real_spend_and_still_reaches_the_ledger(tmp_path):
+    """Renaming the bucket must not empty it: a router run costs money, and the
+    spend caps read the ledger."""
+    _, spend = _journalled_resolve(tmp_path, SeqRunner([
+        AgentResult(is_error=False, session_id="rt", cost_usd=0.07,
+                    structured={"tier": "standard"}),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5", cost_usd=3.0),
+    ]))
+
+    assert [(s["kind"], s["cost_usd"]) for s in spend] == [
+        ("ROUTE", 0.07), ("RESOLVE", 3.0),
+    ]
+    assert all(s["issue"] == 5 for s in spend), "both legs bill the issue that caused them"
+
+
+def test_the_route_leg_stays_inside_the_dispatch_that_ran_it(tmp_path):
+    """One dispatch, one `dispatch` id — `unsettled_starts` counts one death per
+    dispatch, so a classify probe that minted its own id would charge a daemon
+    restart twice."""
+    runs, _ = _journalled_resolve(tmp_path, SeqRunner([
+        _router_result("standard"),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5", cost_usd=3.0),
+    ]))
+
+    assert len({r["dispatch"] for r in runs}) == 1
+
+
+def test_the_resolve_after_a_dead_router_is_still_journalled_as_resolve(tmp_path):
+    """The kind override must unwind on the failure path too — routing is
+    advisory, and a raised classify must not leave the dispatch renamed."""
+    class DeadRouter:
+        def __init__(self):
+            self.calls = 0
+
+        async def run(self, task):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("router transport died")
+            return AgentResult(is_error=False, status="pr_opened",
+                               session_id="s5", cost_usd=3.0)
+
+    runs, spend = _journalled_resolve(tmp_path, DeadRouter())
+
+    assert [r["kind"] for r in runs] == ["ROUTE", "RESOLVE"]
+    assert [s["kind"] for s in spend] == ["RESOLVE"], "the dead router cost nothing"
+
+
+def test_a_runner_that_cannot_name_its_legs_still_resolves():
+    """An undecorated runner has no `leg_kind`; a journal nicety must never be
+    able to kill a dispatch."""
+    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
+    runner = SeqRunner([
+        _router_result("standard"),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5"),
+    ])
+
+    asyncio.run(_workflow(
+        gw, FakeStore(), runner, fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    assert runner.tasks[1].model == "sonnet"

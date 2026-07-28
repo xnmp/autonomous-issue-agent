@@ -28,13 +28,14 @@ it exactly once — never `write(line)` then `write("\\n")`.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
 import sys
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
 from ..domain.agent_task import AgentTask
@@ -193,6 +194,27 @@ class JournalingRuntime:
             role=role, kind=kind, number=number, issue=issue,
             dispatch_id=uuid.uuid4().hex[:12],
         )
+
+    @contextlib.contextmanager
+    def leg_kind(self, kind: str):
+        """Journal the legs run inside this block under `kind` instead of the
+        dispatch's own (#40).
+
+        The `dispatch_id` is deliberately KEPT: a sub-leg is part of the
+        dispatch that ran it, and minting a new id would make the dispatch look
+        like two — `unsettled_starts` counts one death per dispatch, so a
+        daemon killed during a classify probe would be charged twice.
+
+        Only the NAME changes, so the leg still reaches the spend ledger (a
+        router run is real spend); it just lands in its own bucket instead of
+        inflating the one it precedes.
+        """
+        previous = self.context
+        self.context = replace(previous, kind=kind)
+        try:
+            yield
+        finally:
+            self.context = previous
 
     def __getattr__(self, name: str):
         """Delegate anything this decorator does not define to the wrapped
