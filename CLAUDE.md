@@ -96,6 +96,31 @@ stop. Never self-modify mid-batch.
   single loose-ends list (post-deploy verifications, label surgery the
   classifier reserves, superseded PRs).
 
+### Operational gotchas (stable across 3+ deployments — no longer handover news)
+
+- **Hot reload fires only BETWEEN ticks** (`adapters/reload.py`, watching the
+  main checkout's HEAD + the AGENT_ENV file's mtime). Merging to main or
+  editing the composed env mid-leg is safe; the in-flight leg finishes on old
+  code. Corollary: editing `shared.env` makes every deployment's composed
+  snapshot stale — regenerate each with `bin/compose-env.sh <name>` or doctor
+  blocks the next launch.
+- **Run git merges from the MAIN checkout, never with a worktree as cwd** — a
+  `cd <worktree> && … && git merge && git worktree remove` chain merges
+  nothing and then deletes your own cwd (bitten twice on 2026-07-28).
+- **The daily spend window is per UTC day**; ledger sums and "why did the cap
+  reset" confusion follow UTC, not local midnight.
+- **Codex OAuth binds whatever ChatGPT session the browser has live** — after
+  any login, verify the id_token email claim before trusting the account.
+- **Evidence e2e legs open real app windows on the operator's desktop** —
+  cosmetic, but warn whoever is at the keyboard.
+- **Assistant sessions cannot `gh issue edit --add/remove-label` or
+  `gh issue close`** (permission classifier). Comments and issue/label
+  *creation* work; label surgery belongs to the daemons or the human — file
+  it under the `operator-action` label (exists on the harness and target
+  repos) rather than retrying.
+- **`gh` label/state searches are stale for recently closed objects** —
+  verify with a direct `gh issue view` before acting on a search result.
+
 ## Pointing the harness at a repo
 
 Two equivalent entry points:
