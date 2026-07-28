@@ -65,7 +65,8 @@ anti-vacuity twin.
 just before this one and is what makes a second target safe at all. Verified
 rather than assumed: the fix is real, `doctor.sh` sweeps all `.active*.env`, and
 the still-running tauri daemons remain pinned to the legacy `config/.active.env`
-(all six processes carry it), which no current code path writes.
+(all six of their processes carry it — three daemons, each a `uv run` wrapper
+plus a python child), which no current code path writes.
 
 Residual, unfixed: the tauri launcher predates the fix, so its relaunch loop
 re-sources the legacy path. That file must survive until that deployment is
