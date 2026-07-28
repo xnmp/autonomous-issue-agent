@@ -36,3 +36,6 @@ Rules:
 | per-repo daily cap + `GLOBAL_DAILY_SPEND_CAP_USD` | 21de6ac..e5f5441 2026-07-28 | cap block journals against the right scope; capped daemon idles silently | **pending** — caps armed (700/1500) but never hit |
 | startup preflight for unconfigured repos | 2b87a2e 2026-07-28 | doctor catches stale/missing config before daemons start | VERIFIED 2026-07-28 (seventh): caught 2 stale snapshots after a shared.env edit |
 | pristine-base gate probe | 2b87a2e-era 2026-07-28 | red base blocks launch with the failing TEST_CMD output | MISBEHAVED 2026-07-28 (seventh): false red on green base, /tmp worktree loses node_modules → #49 |
+| #48 failed `gh pr checks` reads UNKNOWN | 37055ac+0acb3da 2026-07-28 | log `gh pr checks failed … checks UNKNOWN this tick` on a fetch failure, with merge/fix-ci gates held (no spurious FIX_CI leg or merge that tick) | **pending** |
+| #1 webhook wake (`WEBHOOK_WAKE=1`) | 40fedbb+0acb3da 2026-07-28 | `webhook-<name>.log` streams deliveries; a push wakes a daemon before its poll interval (wake-file touch) while polling stays as slow reconciler | **pending** — knob unset on both live deployments; needs gh-webhook ext + `admin:repo_hook` |
+| #37 operator dashboard | 2f7a552 2026-07-28 | `issue-agent dashboard` renders every repo's live state from journals alone, mid-batch | **pending** |
