@@ -1,0 +1,48 @@
+name: CI
+
+# The harness had no CI at all until now, which mattered more than usual: the
+# fixer treats a PR with zero checks (CIState.NONE) exactly like a green one, so
+# pointing the harness at its own repo would have auto-merged approved PRs with
+# no verification whatsoever. This workflow is the prerequisite for that
+# self-hosting deployment, and a safety net for hand-merged PRs either way.
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # `make test` shells out to git in temporary repos; the bash suites assert
+      # on commit behaviour, so an unset identity fails them.
+      - name: Configure git identity
+        run: |
+          git config --global user.name "CI"
+          git config --global user.email "ci@example.invalid"
+          git config --global init.defaultBranch main
+
+      # tests/test_point_at.sh runs shellcheck; jq + gh are used by the
+      # orchestration fakes. jq and gh ship on ubuntu-latest.
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The full suite: governor + hooks + orchestration + point-at + domain +
+      # adapters + gate parity + import-linter architecture contracts.
+      - name: make test
+        run: make test
