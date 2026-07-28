@@ -41,7 +41,9 @@ _ISSUE_SUFFIXES = (
     "rebase-retries", "infra-deaths", "review-retries", "phase", "jira",
     "jira-phase", "model",
 )
-_PR_SUFFIXES = ("session", "last-sha", "round", "automerge", "patch-id")
+_PR_SUFFIXES = (
+    "session", "last-sha", "round", "automerge", "patch-id", "ci-rerun-head",
+)
 
 # Closed-unmerged requeue cleanup (review M4/D8, handover §5.7): only the
 # resume-blocking markers are cleared — resolve-retries and infra-deaths are
@@ -275,6 +277,23 @@ class Store:
 
     def set_last_patch_id(self, pr: int, patch_id: str) -> None:
         self._write(self.pr_path(pr, "patch-id"), patch_id)
+
+    # ── free CI re-run marker (#38) ──
+    # The head SHA whose ONE free `gh run rerun --failed` has been spent, so a
+    # second FAILURE on the same commit buys the paid FIX_CI leg instead of
+    # re-running forever. Keyed on the SHA rather than a bare flag: a push is a
+    # new head and gets a fresh allowance with no extra bookkeeping, and a
+    # re-armed marker can never suppress a genuinely new failure. Written by the
+    # executor BEFORE the rerun call (see the RerunFailedChecks arm) — a marker
+    # that is set-but-not-rerun costs one paid leg on the next poll, exactly what
+    # would have happened anyway, whereas rerun-but-not-marked is an unbounded
+    # loop. "" (absent) = never re-run, the sole reading a fresh PR must have.
+    def get_ci_rerun_head(self, pr: int) -> str:
+        return self._read(self.pr_path(pr, "ci-rerun-head"))
+
+    def set_ci_rerun_head(self, pr: int, sha: str) -> None:
+        if sha:
+            self._write(self.pr_path(pr, "ci-rerun-head"), sha)
 
     def get_round(self, pr: int) -> int:
         return self._read_int(self.pr_path(pr, "round"), default=1)

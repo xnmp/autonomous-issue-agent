@@ -205,6 +205,36 @@ def test_automerge_marker():
     assert s.automerge_enabled(100) is True
 
 
+def test_ci_rerun_head_marker_roundtrip():
+    # #38: the head SHA whose ONE free CI re-run has been spent. Absent reads as
+    # "" — a fresh PR must never look like it already used its allowance.
+    s, _ = _store()
+    assert s.get_ci_rerun_head(100) == ""
+    s.set_ci_rerun_head(100, "sha-1")
+    assert s.get_ci_rerun_head(100) == "sha-1"
+    s.set_ci_rerun_head(100, "sha-2")           # a push moves it, never appends
+    assert s.get_ci_rerun_head(100) == "sha-2"
+
+
+def test_ci_rerun_head_ignores_an_empty_sha():
+    # An unknown head cannot key the allowance; writing "" would make the marker
+    # read as "never re-run" anyway, so refuse the write rather than leave a file
+    # that says nothing.
+    s, _ = _store()
+    s.set_ci_rerun_head(100, "sha-1")
+    s.set_ci_rerun_head(100, "")
+    assert s.get_ci_rerun_head(100) == "sha-1"
+
+
+def test_cleanup_pr_merged_clears_the_ci_rerun_marker():
+    # The PR is gone; a stale marker under a recycled number would silently
+    # suppress the next PR's free re-run.
+    s, _ = _store()
+    s.set_ci_rerun_head(100, "sha-1")
+    s.cleanup_pr(100, 9, merged=True)
+    assert s.get_ci_rerun_head(100) == ""
+
+
 def test_triage_at():
     s, _ = _store()
     s.set_triage_at(7, "t_post")

@@ -27,6 +27,7 @@ from .actions import (
     PostComment,
     Relabel,
     RemoveWorktree,
+    RerunFailedChecks,
     RunAgent,
     Target,
 )
@@ -109,6 +110,11 @@ class FixConfig:
     # independently converged on the approach #558 already had. Off = dispatch
     # regardless (the pre-#39 behaviour).
     duplicate_pr_guard: bool = True
+    # Give a red PR ONE free `gh run rerun --failed` per head SHA before paying
+    # for a FIX_CI leg (#38). A flake costs a CI cycle to disprove and $13–29
+    # (plus the review tail its push triggers) to "fix". Off = every FAILURE
+    # dispatches a leg immediately, as before.
+    ci_free_rerun: bool = True
 
 
 @dataclass(frozen=True)
@@ -140,6 +146,12 @@ class FixState:
     # workflow (on a RETURNED infra-death result) — the two are mutually
     # exclusive, so a single death counts once.
     infra_deaths: dict[int, int] = field(default_factory=dict)
+    # PR number → the head SHA whose ONE free CI re-run has been spent (#38).
+    # Keyed on the SHA, not a boolean, so a push resets the allowance for free:
+    # a new head is a genuinely new failure and deserves its own flake test,
+    # while a second FAILURE on the SAME head is evidence the diff is broken and
+    # goes straight to a paid FIX_CI leg. Missing/"" = never re-run.
+    ci_rerun_head: dict[int, str] = field(default_factory=dict)
 
 
 # ── holds (why a ready issue was NOT picked) ─────────────────────────────────
@@ -694,6 +706,53 @@ def ci_pending_stalls(world: WorldState, cfg: FixConfig) -> tuple[CiPendingStall
     )
 
 
+# ── flake-aware CI repair (#38) ──────────────────────────────────────────────
+def free_ci_rerun(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
+    """Whether this PR's ONE free CI re-run is still unspent for its CURRENT
+    head — i.e. a FAILURE here should be re-run rather than repaired.
+
+    An UNKNOWN head ("" — the adapter couldn't resolve headRefOid) returns
+    False: the marker keys on the SHA, so with no SHA the executor could not
+    record that the allowance was spent, and every poll would re-run the same
+    checks forever. Falling through to the paid leg is the old behaviour, which
+    is bounded by the CI retry breaker; an unbounded free re-run loop is not
+    bounded by anything."""
+    if not cfg.ci_free_rerun or not pr.head_ref_oid:
+        return False
+    return state.ci_rerun_head.get(pr.number, "") != pr.head_ref_oid
+
+
+@dataclass(frozen=True)
+class CiFlake:
+    """A PR whose head spent its free re-run and is now GREEN — i.e. the failure
+    that would have bought a FIX_CI leg was a flake, and the leg never happened.
+
+    The confirmation half of #38: the re-run itself is journalled when it fires
+    (`ci_rerun`), but "was it actually a flake?" is only knowable one CI cycle
+    later, from the world. That makes it a derivation over world+state rather
+    than an event any code path can emit at the moment it happens — the same
+    reason `CiPendingStall` exists."""
+
+    pr: int
+    head: str
+
+
+def ci_flakes(
+    world: WorldState, cfg: FixConfig, state: FixState
+) -> tuple[CiFlake, ...]:
+    """Every fixer PR that used its free re-run on its current head and is now
+    settled OK. The measurement behind the metric #38 moves (repair-leg share of
+    spend): each one is a FIX_CI leg — $13–29 plus its review tail — that was
+    not bought. Pure; the wiring journals exactly this, deduped per (PR, head)."""
+    return tuple(
+        CiFlake(pr=pr.number, head=pr.head_ref_oid)
+        for pr in fixer_prs(world, cfg)
+        if pr.head_ref_oid
+        and state.ci_rerun_head.get(pr.number, "") == pr.head_ref_oid
+        and ci_state(pr.checks, cfg.ci_ignore_checks) == CIState.OK
+    )
+
+
 def _escalate_pr(pr: int, reason: str) -> list[Action]:
     """Stop dispatching a stuck PR leg: comment why, then swap ai-pr-open for
     needs-human-review so neither the fixer nor the reviewer re-acts on it."""
@@ -736,6 +795,9 @@ def decide_fix(
       (resolve > resume > address-review > fix-ci, in that priority) →
       auto-merge (lock-free) → cleanup of merged/closed PRs (lock-free).
 
+    A red PR's FIRST failure on a head emits `RerunFailedChecks` INSTEAD of the
+    FIX_CI dispatch (#38) — a free GitHub-side action, so it consumes no fixer
+    either.
 
     Only ONE fixer-consuming action is ever returned per poll (the single-fixer
     invariant). `fixer_busy` reflects the live run-lock and gates the reap step.
@@ -948,6 +1010,30 @@ def decide_fix(
                         pr.number,
                         f"CI fix failed {cfg.max_ci_retries}× without going green.",
                     ))
+                    continue
+                # Flake first (#38): one free `gh run rerun --failed` per head
+                # SHA before any paid repair. Two FIX_CI legs of one deployment
+                # night ($13.15 + $28.88, plus a $8 review tail on the second)
+                # both "fixed" the same pre-existing flaky test that neither
+                # PR's diff had touched — ≈$80 of a $188 batch. A re-run costs
+                # one CI cycle and no tokens.
+                #
+                # AFTER the breakers on purpose: a PR that has already burnt its
+                # CI-fix budget belongs to a human, and delaying that handover by
+                # a CI cycle would move the escalation-latency the wrong way. In
+                # practice the two never meet — the free re-run fires on the
+                # FIRST failure of a head, when the counter is 0.
+                #
+                # Emits no RunAgent, so `consumed` is untouched: this costs no
+                # fixer and another PR may still dispatch a real leg this poll.
+                # The re-run flips the checks to PENDING, and the #49
+                # pending-outranks-failure rule then makes the fixer wait for
+                # them without any special casing here — while #30's pending
+                # deadline stops that wait from becoming the new deadlock.
+                if free_ci_rerun(pr, state, cfg):
+                    actions.append(
+                        RerunFailedChecks(pr.number, pr.head_ref_oid)
+                    )
                     continue
                 actions.append(RunAgent(AgentKind.FIX_CI, pr.number))
                 consumed = True

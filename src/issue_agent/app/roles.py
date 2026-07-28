@@ -24,6 +24,7 @@ from ..adapters.journal import (
     Journal,
     JournalingRuntime,
     default_ledger_path,
+    ci_flake_keys,
     ci_pending_keys,
     duplicate_pr_keys,
     hold_keys,
@@ -37,6 +38,7 @@ from ..domain.fix import (
     FixConfig,
     FixState,
     breaker_key,
+    ci_flakes,
     ci_pending_stalls,
     decide_fix,
     duplicate_pr_guards,
@@ -236,11 +238,15 @@ def _fix_state(store: Store, world) -> FixState:
         infra_deaths.setdefault(
             i.number, store.get_infra_deaths(i.number) + deaths.get(i.number, 0)
         )
+    # #38: the head SHA each PR's ONE free CI re-run was spent on. PR-keyed (not
+    # breaker-keyed) because a re-run is an act on a PR's check runs, and a PR
+    # with no resolvable issue has check runs like any other.
+    ci_rerun_head = {p.number: store.get_ci_rerun_head(p.number) for p in world.prs}
     return FixState(
         sessions=sessions, resumed_at=resumed, automerge_enabled=automerge,
         ci_retries=ci_retries, review_retries=review_retries,
         rebase_retries=rebase_retries, resolve_retries=resolve_retries,
-        infra_deaths=infra_deaths,
+        infra_deaths=infra_deaths, ci_rerun_head=ci_rerun_head,
     )
 
 
@@ -368,6 +374,42 @@ def _duplicate_pr_reporter(journal: Journal | None, repo: str, fix_cfg: FixConfi
     return report
 
 
+def _ci_flake_reporter(journal: Journal | None, repo: str, fix_cfg: FixConfig, log):
+    """Build the per-poll reporter for a CONFIRMED flake (#38).
+
+    `ci_rerun` (written by the Executor) says a free re-run fired; this says it
+    WORKED — the checks that would have bought a $13–29 FIX_CI leg went green on
+    a re-run of the identical commit. That is only observable one CI cycle after
+    the fact, from world state, which is why it is a reporter over
+    `domain.fix.ci_flakes` rather than an event some code path emits inline.
+
+    Counting these against `ci_rerun` gives the flake rate the issue's metric
+    needs (repair-leg share of spend), so the JOURNAL line is deduped per
+    (PR, head) — the derivation stays true for every poll until the PR merges.
+    """
+    seen: set[str] = set()
+
+    def report(world, state) -> None:
+        for flake in ci_flakes(world, fix_cfg, state):
+            log(
+                f"CI FLAKE: PR #{flake.pr} went green on a re-run of the same "
+                f"commit ({flake.head[:7]}) — no CI-fix leg was dispatched"
+            )
+            key = f"ci-flake:{repo}:{flake.pr}:{flake.head}"
+            if key in seen:
+                continue
+            seen.add(key)
+            if journal is None:
+                continue
+            if key in ci_flake_keys(read_events_tail(journal.path)):
+                continue
+            journal.emit(
+                "ci_flake", pr=flake.pr, head=flake.head, block_key=key,
+            )
+
+    return report
+
+
 def _recurrence_reporter(journal: Journal | None, gateway, repo: str, fix_bot: str, log):
     """Build the per-poll reporter for LITERAL reopens (harness #10, kind=reopen).
 
@@ -463,6 +505,7 @@ def build_fix_daemon(
         ci_ignore_checks=cfg.ci_ignore_checks,
         ci_pending_max_seconds=cfg.ci_pending_max_seconds,
         duplicate_pr_guard=cfg.duplicate_pr_guard,
+        ci_free_rerun=cfg.ci_free_rerun,
         close_issue_on_merge=cfg.close_issue_on_merge,
         max_ci_retries=fix_runtime.max_ci_retries,
         max_review_retries=fix_runtime.max_review_retries,
@@ -602,7 +645,8 @@ def build_fix_daemon(
 
     executor = Executor(
         gateway, remove_worktree=worktrees.remove, log=_log("fix"),
-        mark_automerge=store.mark_automerge, clear_issue_state=store.cleanup_pr,
+        mark_automerge=store.mark_automerge, mark_ci_rerun=store.set_ci_rerun_head,
+        clear_issue_state=store.cleanup_pr,
         journal=journal, alert_cmd=cfg.alert_cmd,
     )
     # Wrapped LAST, so the decorator sees whichever runtime actually ran (Claude or
@@ -617,14 +661,20 @@ def build_fix_daemon(
     report_holds = _hold_reporter(journal, cfg.repo, _log("fix"))
     report_ci_stalls = _ci_stall_reporter(journal, cfg.repo, fix_cfg, _log("fix"))
     report_duplicates = _duplicate_pr_reporter(journal, cfg.repo, fix_cfg, _log("fix"))
+    report_ci_flakes = _ci_flake_reporter(journal, cfg.repo, fix_cfg, _log("fix"))
 
     def decide(world):
         # Report BEFORE deciding: if decide_fix raises, the tick still leaves a
         # record of what it was holding, which is the state hardest to diagnose.
+        # ONE FixState per tick, shared with the flake reporter — it is the same
+        # state decide_fix decides on, so the two can never describe different
+        # worlds (and the store reads happen once, not twice).
+        state = _fix_state(store, world)
         report_holds(world)
         report_ci_stalls(world)
         report_duplicates(world)
-        return decide_fix(world, fix_cfg, _fix_state(store, world), fixer_busy())
+        report_ci_flakes(world, state)
+        return decide_fix(world, fix_cfg, state, fixer_busy())
 
     _log("fix")(fix_capability_line(
         auto_merge=fix_cfg.auto_merge,

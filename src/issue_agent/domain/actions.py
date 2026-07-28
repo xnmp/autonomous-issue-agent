@@ -90,6 +90,26 @@ class UpdateBranch:
 
 
 @dataclass(frozen=True)
+class RerunFailedChecks:
+    """Ask GitHub to re-run this PR's FAILED check runs, instead of paying for a
+    FIX_CI leg (#38). The cheap first hypothesis for a red check: the failure is
+    a flake, not the diff.
+
+    Costs one CI cycle and no tokens; a repair leg costs $13–29 plus the review
+    tail its push triggers, and ≈$80 of one $188 batch went to two legs that both
+    "fixed" the same pre-existing flaky test neither PR had touched.
+
+    `head` is the PR head SHA the re-run is spent on. It is carried in the action
+    (not re-read at execution time) so the marker the executor writes keys on the
+    SAME commit the decision was made about — a push landing mid-tick then reads
+    as a NEW head with its own free re-run, rather than silently consuming the
+    new head's."""
+
+    pr: int
+    head: str
+
+
+@dataclass(frozen=True)
 class RunAgent:
     """Dispatch a headless agent. `number` is the issue (RESOLVE/RESUME/TRIAGE)
     or PR (ADDRESS_REVIEW/FIX_CI/REVIEW/RE_REVIEW); STEWARD_DRIVE ignores it."""
@@ -152,6 +172,7 @@ Action = Union[
     EnableAutoMerge,
     UpdateBranch,
     AddDependency,
+    RerunFailedChecks,
     RunAgent,
     RemoveWorktree,
     ClearIssueState,
@@ -167,6 +188,7 @@ __all__ = [
     "EnableAutoMerge",
     "UpdateBranch",
     "AddDependency",
+    "RerunFailedChecks",
     "RunAgent",
     "RemoveWorktree",
     "ClearIssueState",

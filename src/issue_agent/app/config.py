@@ -195,6 +195,11 @@ class HarnessConfig:
     # duplicate resolve of an issue the operator's own open PR had already fixed.
     # Advisory — the operator un-blocks by closing the stale PR.
     duplicate_pr_guard: bool = True
+    # Give a red PR ONE free `gh run rerun --failed` per head SHA before paying
+    # for a CI-fix leg (#38). ≈$80 of one $188 batch went to two repair legs that
+    # both re-fixed the same pre-existing flaky test. Costs one CI cycle on a
+    # genuinely broken PR; a second failure on the same head pays as before.
+    ci_free_rerun: bool = True
     max_ci_retries: int = 3
     # Escalation ceiling for the reviewer: after this many REQUEST_CHANGES verdicts
     # on one PR (counting the reviewer's OWN rejections, NOT author pushes — a
@@ -663,6 +668,7 @@ class HarnessConfig:
             f"ci_pending="
             f"{f'{self.ci_pending_max_seconds}s' if self.ci_pending_max_seconds else 'off'}",
             f"spend_guards: dup_pr_guard={'on' if self.duplicate_pr_guard else 'off'} "
+            f"ci_free_rerun={'on' if self.ci_free_rerun else 'off'}",
             f"timeouts: idle={self.agent_idle_timeout:.0f}s "
             f"wall={self.agent_max_runtime:.0f}s",
             f"spend_caps: issue=${self.issue_spend_cap_usd:.2f} "
@@ -1070,6 +1076,7 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         duplicate_pr_guard=_b(
             e, "DUPLICATE_PR_GUARD", _dc_default("duplicate_pr_guard"), errors
         ),
+        ci_free_rerun=_b(e, "CI_FREE_RERUN", _dc_default("ci_free_rerun"), errors),
         close_issue_on_merge=_b(e, "CLOSE_ISSUE_ON_MERGE", _dc_default("close_issue_on_merge"), errors),
         auto_rebase_conflicts=_b(e, "AUTO_REBASE_CONFLICTS", _dc_default("auto_rebase_conflicts"), errors),
         max_rebase_retries=_coerce_int(e, "MAX_REBASE_RETRIES", _dc_default("max_rebase_retries"), errors),
