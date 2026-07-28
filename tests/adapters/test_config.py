@@ -110,6 +110,46 @@ def test_validate_fails_loud_on_empty_repo():
         from_env({}).validate()
 
 
+def test_a_shell_command_is_logged_quoted_and_whole_when_it_fits():
+    """#35: the boot line used to print the literal word `set` for a present
+    TEST_CMD, which for `TEST_CMD='set -e; cargo test …'` is indistinguishable
+    from a value truncated at the first space. It must show the command."""
+    from issue_agent.app.config import describe_command
+
+    out = describe_command("set -e; cargo test --quiet && cargo fmt --check")
+
+    assert "set -e; cargo test --quiet && cargo fmt --check" in out
+    assert out.startswith("'") or out.startswith('"')   # quoted, so spaces read
+    assert "…" not in out
+
+
+def test_a_long_shell_command_is_truncated_visibly_with_its_true_length():
+    from issue_agent.app.config import describe_command
+
+    out = describe_command("x" * 500, limit=10)
+
+    assert "…" in out                 # the cut is announced, never silent
+    assert "(len=500)" in out         # and the real size is always stated
+    assert len(out) < 60
+
+
+def test_an_unset_shell_command_is_reported_as_empty_not_as_quotes():
+    from issue_agent.app.config import describe_command
+
+    assert describe_command("") == "EMPTY"
+    assert describe_command(None) == "EMPTY"
+    assert describe_command("", empty="none") == "none"
+
+
+def test_describe_shows_the_real_alert_and_edit_check_commands():
+    c = from_env({"REPO": "o/r", "ALERT_CMD": "notify-send 'harness capped'",
+                  "EDIT_CHECK_CMD": "cargo check --quiet"})
+    d = c.describe()
+
+    assert "cargo check --quiet" in d
+    assert "notify-send 'harness capped'" in d or 'notify-send' in d
+
+
 def test_describe_reports_effective_values_and_no_secrets():
     c = from_env({"REPO": "o/r", "MAX_RESOLVE_RETRIES": "2",
                   "FIX_BOT_TOKEN": "sekret-token"})

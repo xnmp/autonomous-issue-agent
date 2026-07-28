@@ -22,7 +22,7 @@ from ..adapters.single_instance import AlreadyRunning, acquire
 from ..adapters.store import Store
 from ..adapters.worktree import Worktrees, build_gate_context
 from ..domain.world import WorldState, fix_probe_safe
-from .config import HarnessConfig, from_env, render_agent_md
+from .config import HarnessConfig, describe_command, from_env, render_agent_md
 from .roles import build_fix_daemon, build_review_daemon, build_steward_daemon
 from .world_probe import WorldProbe
 
@@ -170,7 +170,7 @@ def build_role(role: str, env: dict | None = None):
     for line in cfg.describe().splitlines():
         sys.stderr.write(f"{role}: config: {line}\n")
     sys.stderr.write(
-        f"{role}: config: TEST_CMD={'set' if env.get('TEST_CMD') else 'EMPTY'} "
+        f"{role}: config: TEST_CMD={describe_command(env.get('TEST_CMD'))} "
         f"ALLOW_UNTESTED={env.get('ALLOW_UNTESTED', '0') or '0'}\n"
     )
     sys.stderr.flush()
