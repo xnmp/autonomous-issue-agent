@@ -27,6 +27,7 @@ from issue_agent.adapters.codex_runner import (
     build_codex_argv,
     codex_cost_blindspot_warning,
     codex_cost_usd,
+    rates_for_model,
     parse_codex_envelope,
     parse_codex_usage,
 )
@@ -1319,6 +1320,111 @@ def test_blindspot_warning_still_fires_on_a_half_configured_price_table():
         cost_per_mtok_in=1.25, cost_per_mtok_out=0.0,
         issue_spend_cap_usd=25.0, daily_spend_cap_usd=0.0,
     ) is not None
+
+
+# ── #43: each leg is priced with the model it actually ran ───────────────────
+_LUNA_TERRA = (("gpt-5.6-luna", 1.25, 10.0), ("gpt-5.6-terra", 10.0, 60.0))
+
+
+def test_the_table_prices_a_named_model_instead_of_the_fallback():
+    assert rates_for_model(
+        "gpt-5.6-terra", _LUNA_TERRA, fallback_in=5.0, fallback_out=30.0
+    ) == (10.0, 60.0)
+
+
+def test_a_model_the_table_does_not_name_falls_back_to_the_scalars():
+    assert rates_for_model(
+        "gpt-5.6-sol", _LUNA_TERRA, fallback_in=5.0, fallback_out=30.0
+    ) == (5.0, 30.0)
+
+
+def test_an_empty_table_or_an_unknown_model_falls_back():
+    """Zero behaviour change for a deployment that never sets the knob."""
+    assert rates_for_model("anything", (), fallback_in=5.0, fallback_out=30.0) == (5.0, 30.0)
+    assert rates_for_model(None, _LUNA_TERRA, fallback_in=5.0, fallback_out=30.0) == (5.0, 30.0)
+    assert rates_for_model("  ", _LUNA_TERRA, fallback_in=5.0, fallback_out=30.0) == (5.0, 30.0)
+
+
+def test_model_lookup_is_case_insensitive():
+    assert rates_for_model(
+        "GPT-5.6-Terra", _LUNA_TERRA, fallback_in=5.0, fallback_out=30.0
+    ) == (10.0, 60.0)
+
+
+def test_two_routed_tiers_ledger_different_dollars_for_identical_tokens():
+    """The whole point of #43: routing moves PRICE, and with one flat rate a
+    cheaper tier could only ever show up as fewer tokens. Same stub, same token
+    counts, two models → two costs."""
+    tmp = tempfile.mkdtemp()
+    codex = _costed_codex(tmp)
+
+    def _cost(model):
+        runner = CodexRunner(
+            codex_bin=codex, env={"OPENAI_API_KEY": "k"},
+            cost_per_mtok_in=5.0, cost_per_mtok_out=30.0,
+            cost_per_mtok=_LUNA_TERRA,
+        )
+        return asyncio.run(runner.run(AgentTask(prompt="x", model=model))).cost_usd
+
+    cheap, dear = _cost("gpt-5.6-luna"), _cost("gpt-5.6-terra")
+    assert cheap == pytest.approx(0.10341)   # 48000*1.25 + 4341*10, per MTok
+    assert dear == pytest.approx(0.740460)   # 48000*10   + 4341*60
+    assert cheap < dear
+
+
+def test_an_unpinned_leg_is_priced_with_the_runners_default_model():
+    """A resolve that pins no model still runs on SOMETHING — the runner's
+    default — and must be priced as that, not at the scalar fallback."""
+    tmp = tempfile.mkdtemp()
+    runner = CodexRunner(
+        codex_bin=_costed_codex(tmp), env={"OPENAI_API_KEY": "k"},
+        default_model="gpt-5.6-terra",
+        cost_per_mtok_in=5.0, cost_per_mtok_out=30.0,
+        cost_per_mtok=_LUNA_TERRA,
+    )
+    r = asyncio.run(runner.run(AgentTask(prompt="x")))
+    assert r.cost_usd == pytest.approx(0.740460)
+
+
+def test_a_model_outside_the_table_still_prices_at_the_scalars():
+    """Anti-vacuity twin: the table is an override, not a replacement."""
+    tmp = tempfile.mkdtemp()
+    runner = CodexRunner(
+        codex_bin=_costed_codex(tmp), env={"OPENAI_API_KEY": "k"},
+        cost_per_mtok_in=1.25, cost_per_mtok_out=10.0,
+        cost_per_mtok=(("gpt-5.6-terra", 10.0, 60.0),),
+    )
+    r = asyncio.run(runner.run(AgentTask(prompt="x", model="gpt-5.6-luna")))
+    assert r.cost_usd == pytest.approx(0.10341)
+
+
+def test_the_result_reports_the_model_that_actually_ran():
+    """What the journal needs to split cost by routed tier — an unpinned task
+    carries model=None, so the run has to say what it used."""
+    tmp = tempfile.mkdtemp()
+    runner = CodexRunner(
+        codex_bin=_costed_codex(tmp), env={"OPENAI_API_KEY": "k"},
+        default_model="gpt-5.6-terra",
+    )
+    assert asyncio.run(runner.run(AgentTask(prompt="x"))).model == "gpt-5.6-terra"
+    assert asyncio.run(
+        runner.run(AgentTask(prompt="x", model="gpt-5.6-luna"))
+    ).model == "gpt-5.6-luna"
+
+
+def test_an_aborted_run_still_reports_its_model():
+    """The runs whose cost is ESTIMATED rather than measured are exactly the
+    ones a tier split must not lose."""
+    tmp = tempfile.mkdtemp()
+    codex = _fake_codex(tmp, 'echo "session id: s" >&2\nsleep 30\n')
+    runner = CodexRunner(
+        codex_bin=codex, env={"OPENAI_API_KEY": "k"},
+        default_model="gpt-5.6-terra", idle_timeout=0.5,
+        transport_retries=0, post_hang_drain_timeout=0.5,
+    )
+    r = asyncio.run(runner.run(AgentTask(prompt="x")))
+    assert r.status == "timeout"
+    assert r.model == "gpt-5.6-terra"
 
 
 # ══ review M17a — the "real output" guard must use the real status vocabulary ═

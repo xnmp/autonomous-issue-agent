@@ -492,6 +492,7 @@ def build_fix_daemon(
             max_rate_limit_retries=codex_runtime.max_rate_limit_retries,
             cost_per_mtok_in=codex_runtime.cost_per_mtok_in,
             cost_per_mtok_out=codex_runtime.cost_per_mtok_out,
+            cost_per_mtok=codex_runtime.cost_per_mtok,
             **({"default_model": codex_runtime.model} if codex_runtime.model else {}),
         )
         # Surface a codex misconfig (missing bin/key) at STARTUP, not on the first

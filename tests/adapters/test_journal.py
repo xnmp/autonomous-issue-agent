@@ -668,6 +668,24 @@ def test_a_leg_kind_unwinds_when_the_leg_raises(tmp_path):
     assert rt.context.kind == "RESOLVE", "a dead leg must not leave the dispatch renamed"
 
 
+# ── #43: the journal records the model that RAN ──────────────────────────────
+def test_the_model_the_run_reports_wins_over_the_one_the_task_asked_for(tmp_path):
+    """An unpinned task carries model=None and the runtime supplies its own
+    default; without this the journal recorded nothing for a leg that certainly
+    ran on something, and cost could not be split by routed tier."""
+    rt, journal, _ = _runtime(
+        tmp_path, AgentResult(is_error=False, cost_usd=1.0, model="gpt-5.6-terra")
+    )
+    asyncio.run(rt.run(AgentTask(prompt="p")))
+    assert _settled(journal.path)[0]["model"] == "gpt-5.6-terra"
+
+
+def test_a_runtime_that_reports_no_model_still_falls_back_to_the_task(tmp_path):
+    rt, journal, _ = _runtime(tmp_path, AgentResult(is_error=False, cost_usd=1.0))
+    asyncio.run(rt.run(AgentTask(prompt="p", model="opus")))
+    assert _settled(journal.path)[0]["model"] == "opus"
+
+
 def test_result_is_returned_unchanged_and_inner_still_sees_the_task(tmp_path):
     expected = AgentResult(is_error=False, status="done")
     rt, _, _ = _runtime(tmp_path, expected)
