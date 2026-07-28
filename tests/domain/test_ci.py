@@ -231,3 +231,21 @@ def test_the_deadline_does_not_change_ci_state_precedence():
               Check("e2e", state="IN_PROGRESS", started_at=_T0)]
     assert pending_deadline_breached(checks, _later(10**6), 3600)
     assert ci_state(checks) is CIState.PENDING
+
+
+# ── #48: an unread checks fetch is UNKNOWN, never an answer ───────────────────
+def test_unread_checks_are_unknown_not_none():
+    # checks=() from a FAILED `gh pr checks` is not "no checks configured".
+    assert ci_state([], known=False) is CIState.UNKNOWN
+
+
+def test_unread_outranks_everything_even_green():
+    # Whatever stale tuple rode along, an unread fetch is not an observation.
+    assert ci_state([Check("unit", bucket="pass")], known=False) is CIState.UNKNOWN
+    assert ci_state([Check("unit", bucket="fail")], known=False) is CIState.UNKNOWN
+
+
+def test_honest_empty_read_stays_none():
+    # The no-CI-repo path must not regress: a SUCCESSFUL read of zero checks
+    # is still NONE (mergeable — nothing to wait on).
+    assert ci_state([], known=True) is CIState.NONE

@@ -1712,3 +1712,48 @@ def test_closed_slice_truncation_is_loud_at_its_own_cap(capsys):
 
     GitHubGateway("o/r", runner=runner).build_world()
     assert "TRUNCATED" in capsys.readouterr().err
+
+
+# ── #48: a failed `gh pr checks` is UNKNOWN, not an empty world ──────────────
+from issue_agent.adapters.github import no_checks_answer  # noqa: E402
+
+
+def test_no_checks_answer_classifies_only_the_honest_exit():
+    argv = ["gh", "pr", "checks", "26", "--repo", "o/r"]
+    assert no_checks_answer(argv, "no checks reported on the 'fix/x' branch")
+    # same stderr on a different subcommand is NOT the honest-none answer
+    assert not no_checks_answer(["gh", "pr", "view", "26"], "no checks reported")
+    # any other pr-checks failure is a failed READ, not an answer
+    assert not no_checks_answer(argv, "HTTP 404: Not Found")
+    assert not no_checks_answer(argv, "")
+
+
+def test_runner_maps_honest_no_checks_to_empty_json(monkeypatch, capsys):
+    """gh exits 1 with "no checks reported…" when a PR simply HAS no checks —
+    the one non-zero `pr checks` exit that is an observation. The runner must
+    surface it as the empty JSON list gh would have printed, so get_pr can tell
+    honest NONE from a failed read."""
+    monkeypatch.setattr(
+        _subprocess, "run",
+        _fake_run_factory(1, "no checks reported on the 'fix/5-x' branch"),
+    )
+    out = _subprocess_runner(["gh", "pr", "checks", "26", "--repo", "o/r"], None)
+    assert json.loads(out) == []
+
+
+def test_get_pr_marks_checks_unknown_when_the_read_fails():
+    """The hole (#48): a swallowed non-infra `gh pr checks` failure used to
+    rebuild the PR with checks=() — indistinguishable from a no-CI repo, which
+    decide_fix treats as mergeable. The PR must instead say the checks were
+    never read this tick."""
+    pr_resp = {"number": 100, "headRefName": "fix/5-x", "state": "OPEN", "labels": []}
+    fr = FakeRunner({"pr view 100": pr_resp})  # `pr checks` unmatched → "" (failed)
+    pr = GitHubGateway("o/r", runner=fr).get_pr(100)
+    assert pr.checks == () and pr.checks_known is False
+
+
+def test_get_pr_keeps_honest_empty_checks_known():
+    pr_resp = {"number": 100, "headRefName": "fix/5-x", "state": "OPEN", "labels": []}
+    fr = FakeRunner({"pr view 100": pr_resp, "pr checks 100": []})
+    pr = GitHubGateway("o/r", runner=fr).get_pr(100)
+    assert pr.checks == () and pr.checks_known is True

@@ -27,6 +27,7 @@ class CIState(str, Enum):
     PENDING = "pending"  # at least one non-ignored check queued/in-progress
     FAILURE = "failure"  # settled, at least one non-ignored check failed
     NONE = "none"        # no checks configured (nothing to wait on)
+    UNKNOWN = "unknown"  # the checks read FAILED this tick — not an answer (#48)
 
 
 class ReviewDecision(str, Enum):
@@ -137,6 +138,12 @@ class PRView:
     labels: frozenset[Label] = field(default_factory=frozenset)
     reviews: tuple[Review, ...] = ()
     checks: tuple[Check, ...] = ()
+    # False when the `gh pr checks` read FAILED this tick (non-infra gh error:
+    # rate-limit blip already raises, but a 404/odd answer degrades to ""). Then
+    # `checks=()` means UNREAD, not "no checks configured" — and reading it as
+    # honest NONE armed auto-merge on a PR whose checks were never seen (#48).
+    # `ci_state(..., known=False)` maps it to UNKNOWN, which no gate accepts.
+    checks_known: bool = True
     state: str = "OPEN"            # OPEN | MERGED | CLOSED
     closing_issue: int | None = None  # GitHub closing-reference graph (default-branch only)
     # Files this PR changes (adapter reads `gh pr view --json files`). Feeds the

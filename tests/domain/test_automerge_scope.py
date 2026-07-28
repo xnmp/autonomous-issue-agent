@@ -117,3 +117,37 @@ def test_without_arm_on_open_unreviewed_or_red_prs_stay_unarmed():
     red = PRView(number=5, head_ref_name="fix/9-t", reviews=APPROVED,
                  checks=(Check(name="ci", state="COMPLETED", bucket="fail"),))
     assert should_automerge(red, FixState(), _cfg()) is False
+
+
+# ── #48: a failed checks read must never arm a merge ──────────────────────────
+def test_unread_checks_do_not_automerge():
+    """The hole: a transient `gh pr checks` failure yielded checks=() → NONE →
+    treated like OK, and an approved PR could arm auto-merge on a tick whose
+    checks were never read. UNKNOWN closes the gate; next successful read
+    re-opens it (cost: one poll of latency)."""
+    pr = PRView(number=532, head_ref_name="fix/504-tab-titles",
+                reviews=APPROVED, checks=(), checks_known=False)
+    assert should_automerge(pr, FixState(), _cfg()) is False
+
+
+def test_honest_no_checks_still_automerges():
+    """The no-CI-repo path is deliberate and must not regress: a SUCCESSFUL
+    read of zero checks (honest NONE) stays mergeable."""
+    pr = PRView(number=532, head_ref_name="fix/504-tab-titles",
+                reviews=APPROVED, checks=())
+    assert should_automerge(pr, FixState(), _cfg()) is True
+
+
+def test_unread_checks_do_not_branch_update():
+    pr = PRView(number=532, head_ref_name="fix/504-tab-titles",
+                reviews=APPROVED, checks=(), checks_known=False,
+                mergeable="MERGEABLE", merge_state="BEHIND")
+    assert should_update_branch(pr, _cfg()) is False
+
+
+def test_arm_on_open_is_indifferent_to_unread_checks():
+    """Early arming rests on GitHub's verified server-side gate, which reads
+    the checks itself — the harness's failed read changes nothing."""
+    pr = PRView(number=540, head_ref_name="fix/522-lanes", reviews=(),
+                checks=(), checks_known=False)
+    assert should_automerge(pr, FixState(), _cfg(arm_on_open=True)) is True

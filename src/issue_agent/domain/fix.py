@@ -438,7 +438,12 @@ def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
     review = latest_other_review(pr.reviews, cfg.fix_bot)
     if review is None or review.state != REVIEW_APPROVED:
         return False
-    return ci_state(pr.checks, cfg.ci_ignore_checks) in (CIState.OK, CIState.NONE)
+    # known=False → UNKNOWN, which is deliberately NOT in the allowed pair: an
+    # unread checks fetch must never arm a merge (#48). Honest NONE (a repo with
+    # no CI, successfully read) stays mergeable.
+    return ci_state(
+        pr.checks, cfg.ci_ignore_checks, known=pr.checks_known
+    ) in (CIState.OK, CIState.NONE)
 
 
 def should_update_branch(pr: PRView, cfg: FixConfig) -> bool:
@@ -463,7 +468,9 @@ def should_update_branch(pr: PRView, cfg: FixConfig) -> bool:
     review = latest_other_review(pr.reviews, cfg.fix_bot)
     if review is None or review.state != REVIEW_APPROVED:
         return False
-    return ci_state(pr.checks, cfg.ci_ignore_checks) in (CIState.OK, CIState.NONE)
+    return ci_state(
+        pr.checks, cfg.ci_ignore_checks, known=pr.checks_known
+    ) in (CIState.OK, CIState.NONE)
 
 
 def reap_actions(world: WorldState) -> list[Action]:
@@ -850,7 +857,8 @@ def ci_flakes(
         for pr in fixer_prs(world, cfg)
         if pr.head_ref_oid
         and state.ci_rerun_head.get(pr.number, "") == pr.head_ref_oid
-        and ci_state(pr.checks, cfg.ci_ignore_checks) == CIState.OK
+        and ci_state(pr.checks, cfg.ci_ignore_checks, known=pr.checks_known)
+        == CIState.OK
     )
 
 
@@ -1033,7 +1041,8 @@ def decide_fix(
                 needs_fix = (
                     (cfg.auto_rebase_conflicts and pr.is_conflicting())
                     or (_rev is not None and _rev.state == REVIEW_CHANGES_REQUESTED)
-                    or ci_state(pr.checks, cfg.ci_ignore_checks) == CIState.FAILURE
+                    or ci_state(pr.checks, cfg.ci_ignore_checks, known=pr.checks_known)
+                    == CIState.FAILURE
                 )
                 if needs_fix:
                     actions.extend(_escalate_pr(
@@ -1100,7 +1109,10 @@ def decide_fix(
             # M22/D9: nothing ever adds ai-working to a PR, so it was
             # permanently true. See decide_fix's docstring for what actually
             # enforces single-fixer.)
-            if ci_state(pr.checks, cfg.ci_ignore_checks) == CIState.FAILURE:
+            if (
+                ci_state(pr.checks, cfg.ci_ignore_checks, known=pr.checks_known)
+                == CIState.FAILURE
+            ):
                 if infra_ceiling_hit(state, cfg, bkey):
                     actions.extend(_escalate_pr(
                         pr.number, infra_escalation_reason(cfg.max_infra_deaths)))

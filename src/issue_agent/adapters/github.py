@@ -302,6 +302,19 @@ def classify_gh_failure(detail: str) -> str | None:
     return None
 
 
+def no_checks_answer(argv: list[str], detail: str) -> bool:
+    """True iff a failed `gh` call is `pr checks` reporting the HONEST empty
+    answer: gh exits 1 with "no checks reported on the '<branch>' branch" when a
+    PR simply has no checks — the one non-zero exit that IS an observation, not
+    a failure. Everything else non-zero on `pr checks` means the checks were
+    never read (#48). Pure so the classification is unit-testable without a
+    subprocess, like `classify_gh_failure`."""
+    return (
+        list(argv[1:3]) == ["pr", "checks"]
+        and "no checks reported" in (detail or "").lower()
+    )
+
+
 # ── pure parsers ──────────────────────────────────────────────────────────────
 def _labels(raw: list | None) -> frozenset[Label]:
     """gh returns labels as [{"name": "ai-ready"}, …] (issue/pr view) or as bare
@@ -761,7 +774,13 @@ class GitHubGateway:
         found = self._gh_json(
             ["pr", "checks", str(number), "--repo", self.repo,
              "--json", "name,state,bucket,startedAt"]
-        ) or []
+        )
+        if found is None:
+            # gh failed non-infra (infra raised GhUnavailable inside the runner;
+            # the honest no-checks exit came back as "[]"). The checks were NOT
+            # read this tick — () would parse as honest NONE, which decide_fix
+            # treats like OK and could arm auto-merge unverified (#48).
+            return replace(pr, checks_known=False)
         return replace(pr, checks=_checks(found))  # type: ignore[arg-type]
 
     def _safe_get_pr(
@@ -1373,5 +1392,11 @@ def _subprocess_runner(argv: list[str], token: str | None) -> str:
         kind = classify_gh_failure(detail)
         if kind is not None:
             raise GhUnavailable(kind, detail, argv=argv)
+        # A no-checks PR is the one non-zero `pr checks` exit that IS an answer:
+        # return the empty JSON list gh would have printed, so get_pr can tell
+        # honest NONE (mergeable) from a failed read (UNKNOWN — never mergeable,
+        # #48). Any other swallowed failure stays "" → checks_known=False.
+        if no_checks_answer(argv, detail):
+            return "[]"
         return ""
     return res.stdout
