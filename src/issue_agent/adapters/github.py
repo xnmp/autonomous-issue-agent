@@ -769,7 +769,12 @@ class GitHubGateway:
         )
         pr = parse_pr(d)  # type: ignore[arg-type]
         if not checks:
-            return pr
+            # Never READ ≠ read-as-empty: a PR listed non-OPEN but re-opened
+            # between the list and this view would otherwise arrive
+            # state=OPEN, checks=(), checks_known=True → honest NONE →
+            # mergeable. No consumer reads checks for the non-open PRs this
+            # arm is for, so UNKNOWN costs nothing (#48 review F3).
+            return replace(pr, checks_known=False)
         # checks come from a separate endpoint (bash `pr checks`).
         found = self._gh_json(
             ["pr", "checks", str(number), "--repo", self.repo,
@@ -779,7 +784,15 @@ class GitHubGateway:
             # gh failed non-infra (infra raised GhUnavailable inside the runner;
             # the honest no-checks exit came back as "[]"). The checks were NOT
             # read this tick — () would parse as honest NONE, which decide_fix
-            # treats like OK and could arm auto-merge unverified (#48).
+            # treats like OK and could arm auto-merge unverified (#48). Say so:
+            # the one failure the runner silences (App-token statusCheckRollup)
+            # used to be harmless noise, but UNKNOWN holds the merge gates, and
+            # a silent permanent stall is not diagnosable from the logs.
+            import sys
+            sys.stderr.write(
+                f"gh pr checks failed for PR #{number} — checks UNKNOWN this "
+                "tick; merge gates hold until a successful read\n"
+            )
             return replace(pr, checks_known=False)
         return replace(pr, checks=_checks(found))  # type: ignore[arg-type]
 
@@ -1389,14 +1402,19 @@ def _subprocess_runner(argv: list[str], token: str | None) -> str:
         # kept for the raise path too: some callers legitimately swallow
         # GhUnavailable (update_branch, add_blocked_by), and a swallowed infra
         # failure with no trace on stderr is the very bug this section fixes.
-        kind = classify_gh_failure(detail)
-        if kind is not None:
-            raise GhUnavailable(kind, detail, argv=argv)
         # A no-checks PR is the one non-zero `pr checks` exit that IS an answer:
         # return the empty JSON list gh would have printed, so get_pr can tell
         # honest NONE (mergeable) from a failed read (UNKNOWN — never mergeable,
         # #48). Any other swallowed failure stays "" → checks_known=False.
+        # MUST run before the infra classification: gh's message embeds the
+        # BRANCH NAME ("no checks reported on the 'fix/12-request-timeout'
+        # branch"), and a branch containing "timeout"/"connection reset"/… would
+        # otherwise read as a network outage — GhUnavailable → tick skipped,
+        # every tick, for as long as that PR exists.
         if no_checks_answer(argv, detail):
             return "[]"
+        kind = classify_gh_failure(detail)
+        if kind is not None:
+            raise GhUnavailable(kind, detail, argv=argv)
         return ""
     return res.stdout
