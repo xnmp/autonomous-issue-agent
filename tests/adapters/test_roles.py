@@ -32,7 +32,7 @@ import asyncio
 import json
 import os
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -46,13 +46,14 @@ from issue_agent.app.planners.tasks import (
     ReviewTaskConfig,
 )
 from issue_agent.app.roles import (
+    _ci_stall_reporter,
     _fix_state,
     _hold_reporter,
     _recurrence_reporter,
     _review_state,
 )
 from issue_agent.domain.actions import AgentKind, Relabel, RunAgent, Target
-from issue_agent.domain.fix import FixConfig, breaker_key, decide_fix
+from issue_agent.domain.fix import FixConfig, FixState, breaker_key, decide_fix
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.refs import issue_from_branch
@@ -905,6 +906,100 @@ def test_the_hold_dedup_survives_a_daemon_restart(tmp_path):
     _hold_reporter(journal, "o/r", lambda _m: None)(_held_world())
 
     assert len(_holds_in(journal)) == 1
+
+
+# ── CI pending-deadline reporting (#30) ──────────────────────────────────────
+_STALL_CFG = FixConfig(fix_bot=FIX_BOT, ci_pending_max_seconds=3600)
+_EMPTY_FIX_STATE = FixState()
+
+
+def _stalled_world(head="sha-aaa", elapsed=3601, started="2026-07-28T12:00:00Z"):
+    """One fixer PR with a check wedged IN_PROGRESS past the deadline."""
+    return WorldState(
+        prs=(
+            PRView(144, head_ref_name="fix/9-x", head_ref_oid=head, state="OPEN",
+                   author=FIX_BOT, labels=frozenset({Label.AI_PR_OPEN}),
+                   checks=(Check("Test (windows-latest)", state="IN_PROGRESS",
+                                 started_at=started),)),
+        ),
+        now=(
+            datetime(2026, 7, 28, 12, 0, 0, tzinfo=timezone.utc)
+            + timedelta(seconds=elapsed)
+        ).isoformat(),
+    )
+
+
+def _stalls_in(journal):
+    return [
+        e for e in read_events(journal.path) if e.get("event") == "ci_pending_deadline"
+    ]
+
+
+def test_a_wedged_check_is_journaled_once_and_logged_every_poll(tmp_path):
+    """AC: the deadlock stops being invisible. The journal carries the PR, the
+    head, the elapsed seconds and the pinning check names — enough to compute an
+    escalation rate and to go cancel the job — once per stuck run, while the log
+    keeps answering "why is PR #144 not moving?" on every poll."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    logs = []
+    report = _ci_stall_reporter(journal, "o/r", _STALL_CFG, logs.append)
+
+    for _ in range(3):
+        report(_stalled_world())
+
+    assert _stalls_in(journal) == [
+        {
+            "ts": _stalls_in(journal)[0]["ts"], "event": "ci_pending_deadline",
+            "pr": 144, "head": "sha-aaa", "seconds": 3601,
+            "checks": ["Test (windows-latest)"],
+            "block_key": "ci-pending:o/r:144:sha-aaa",
+        }
+    ]
+    assert len(logs) == 3 and all("#144" in ln for ln in logs)
+
+
+def test_a_healthy_pending_pr_is_neither_logged_nor_journaled(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    logs = []
+    _ci_stall_reporter(journal, "o/r", _STALL_CFG, logs.append)(
+        _stalled_world(elapsed=23 * 60)
+    )
+    assert _stalls_in(journal) == [] and logs == []
+
+
+def test_a_new_head_wedging_again_is_its_own_event(tmp_path):
+    """Anti-vacuity for the dedup: it keys on the head SHA, so a push that
+    produces a fresh check run which ALSO wedges is a genuinely new fact."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    report = _ci_stall_reporter(journal, "o/r", _STALL_CFG, lambda _m: None)
+
+    report(_stalled_world(head="sha-aaa"))
+    report(_stalled_world(head="sha-bbb"))
+
+    assert [e["head"] for e in _stalls_in(journal)] == ["sha-aaa", "sha-bbb"]
+
+
+def test_the_stall_dedup_survives_a_daemon_restart(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    _ci_stall_reporter(journal, "o/r", _STALL_CFG, lambda _m: None)(_stalled_world())
+    _ci_stall_reporter(journal, "o/r", _STALL_CFG, lambda _m: None)(_stalled_world())
+
+    assert len(_stalls_in(journal)) == 1
+
+
+def test_the_journal_agrees_with_the_escalation_it_explains(tmp_path):
+    """The two halves read the SAME derivation, so a journaled stall is always a
+    PR decide_fix escalates in that very poll — never a line about a PR nothing
+    acted on, nor an escalation with no record."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    w = _stalled_world()
+    _ci_stall_reporter(journal, "o/r", _STALL_CFG, lambda _m: None)(w)
+
+    escalated = {
+        a.number for a in decide_fix(w, _STALL_CFG, _EMPTY_FIX_STATE, fixer_busy=False)
+        if isinstance(a, Relabel) and a.add == Label.NEEDS_HUMAN_REVIEW
+    }
+    assert escalated == {e["pr"] for e in _stalls_in(journal)} == {144}
 
 
 def test_hold_reporting_without_a_journal_still_logs(tmp_path):

@@ -50,8 +50,11 @@ def pr(number: int, *label_names: str, **kw) -> PRView:
     return PRView(number=number, **kw)
 
 
-def world(issues=(), prs=()) -> WorldState:
-    return WorldState(issues=tuple(issues), prs=tuple(prs))
+def world(issues=(), prs=(), now: str = "") -> WorldState:
+    # `now` defaults to "" (unstamped): every time-based gate reads that as
+    # "elapsed time unknown" and stays inert, so tests that don't care about
+    # time are unaffected by anything the clock does.
+    return WorldState(issues=tuple(issues), prs=tuple(prs), now=now)
 
 
 __all__ = [

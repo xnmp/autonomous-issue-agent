@@ -22,6 +22,7 @@ from issue_agent.domain.fix import (
     Hold,
     breaker_tripped,
     breaker_key,
+    ci_pending_stalls,
     cleanup_actions,
     decide_fix,
     issue_holds,
@@ -1018,3 +1019,164 @@ def test_cleanup_actions_direct_call_defaults_to_the_ordinary_case():
     acts = cleanup_actions(p, 9, CFG)
     assert RemoveWorktree(9) in acts
     assert Relabel(Target.ISSUE, 9, Label.AI_PR_OPEN, Label.AI_DONE) in acts
+
+
+# ── CI pending deadline (#30) ────────────────────────────────────────────────
+# A check stuck IN_PROGRESS pins ci_state at PENDING forever, and PENDING
+# outranks FAILURE, so no leg ever runs, no counter ever moves, and the PR
+# quietly stops existing. These assert the deadline turns that into a visible
+# escalation without disturbing a healthy long-running pipeline.
+
+_STALL_T0 = "2026-07-28T12:00:00Z"
+
+
+def _stall_now(seconds: int) -> str:
+    from datetime import datetime, timedelta, timezone
+
+    return (
+        datetime(2026, 7, 28, 12, 0, 0, tzinfo=timezone.utc)
+        + timedelta(seconds=seconds)
+    ).isoformat()
+
+
+def _wedged_pr(started_at: str = _STALL_T0, **kw):
+    return pr(
+        100, "ai-pr-open", state="OPEN", head_ref_name="fix/5-x",
+        head_ref_oid="sha-aaa",
+        checks=(
+            Check("unit", bucket="pass", started_at=_STALL_T0),
+            Check("Test (windows-latest)", state="IN_PROGRESS", started_at=started_at),
+        ),
+        **kw,
+    )
+
+
+def _escalated(actions):
+    return [
+        a for a in actions
+        if isinstance(a, Relabel) and a.add == Label.NEEDS_HUMAN_REVIEW
+    ]
+
+
+def test_pending_past_deadline_escalates_the_pr_to_a_human():
+    w = world(prs=[_wedged_pr()], now=_stall_now(3601))
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+    relabels = _escalated(actions)
+    assert [(r.target, r.number, r.remove) for r in relabels] == [
+        (Target.PR, 100, Label.AI_PR_OPEN)
+    ]
+    # …and says why, naming the check, so the operator can go cancel it.
+    comments = [a for a in actions if isinstance(a, PostComment) and a.number == 100]
+    assert comments and "Test (windows-latest)" in comments[0].body
+
+
+def test_pending_under_deadline_leaves_the_pr_exactly_as_before():
+    w = world(prs=[_wedged_pr()], now=_stall_now(1380))
+    assert decide_fix(w, CFG, FixState(), fixer_busy=False) == decide_fix(
+        world(prs=[_wedged_pr()]), CFG, FixState(), fixer_busy=False
+    )
+
+
+def test_a_long_but_healthy_pipeline_is_not_escalated():
+    # The power guardrail: webkit-class suites run ~23 minutes. Escalating those
+    # would trade a deadlock for a worse escalation rate.
+    w = world(prs=[_wedged_pr()], now=_stall_now(23 * 60))
+    assert not _escalated(decide_fix(w, CFG, FixState(), fixer_busy=False))
+
+
+def test_escalation_does_not_repeat_on_the_next_tick():
+    # One-shot: the relabel swaps ai-pr-open for needs-human-review, which is
+    # what takes the PR out of the fixer's set — the same mechanism every other
+    # breaker here relies on. The next tick observes THAT world and does nothing.
+    escalated = _wedged_pr()
+    escalated = pr(
+        100, "needs-human-review", state="OPEN", head_ref_name="fix/5-x",
+        head_ref_oid="sha-aaa", checks=escalated.checks,
+    )
+    w = world(prs=[escalated], now=_stall_now(10**6))
+    assert decide_fix(w, CFG, FixState(), fixer_busy=False) == []
+
+
+def test_a_push_resets_the_clock():
+    # New head ⇒ fresh check runs ⇒ a newer start, inside the window again. No
+    # stored per-SHA state is needed for this; it falls out of measuring from
+    # the newest pending start.
+    fresh = pr(
+        100, "ai-pr-open", state="OPEN", head_ref_name="fix/5-x",
+        head_ref_oid="sha-bbb",
+        checks=(Check("Test (windows-latest)", state="IN_PROGRESS",
+                      started_at=_stall_now(4000)),),
+    )
+    w = world(prs=[fresh], now=_stall_now(4060))
+    assert not _escalated(decide_fix(w, CFG, FixState(), fixer_busy=False))
+
+
+def test_missing_started_at_never_escalates():
+    w = world(prs=[_wedged_pr(started_at="")], now=_stall_now(10**6))
+    assert not _escalated(decide_fix(w, CFG, FixState(), fixer_busy=False))
+
+
+def test_unstamped_world_never_escalates():
+    # A world built by something that does not stamp `now` must not escalate
+    # every wedged-looking PR at once.
+    w = world(prs=[_wedged_pr()])
+    assert not _escalated(decide_fix(w, CFG, FixState(), fixer_busy=False))
+
+
+def test_zero_deadline_disables_the_escalation():
+    cfg = FixConfig(fix_bot="fix-bot", ci_pending_max_seconds=0)
+    w = world(prs=[_wedged_pr()], now=_stall_now(10**6))
+    assert not _escalated(decide_fix(w, cfg, FixState(), fixer_busy=False))
+
+
+def test_ignored_checks_do_not_trigger_the_deadline():
+    cfg = FixConfig(fix_bot="fix-bot", ci_ignore_checks="^Test \\(windows-latest\\)$")
+    w = world(prs=[_wedged_pr()], now=_stall_now(10**6))
+    assert not _escalated(decide_fix(w, cfg, FixState(), fixer_busy=False))
+
+
+def test_a_stalled_pr_is_not_also_dispatched_or_armed_this_tick():
+    # Escalating and acting on the same PR in one poll is incoherent, and a
+    # rebase leg cannot unwedge a stuck runner anyway.
+    p = pr(
+        100, "ai-pr-open", state="OPEN", head_ref_name="fix/5-x",
+        head_ref_oid="sha-aaa", mergeable="CONFLICTING",
+        reviews=(Review("APPROVED", "review-bot", "t1"),),
+        checks=(Check("Test (windows-latest)", state="IN_PROGRESS",
+                      started_at=_STALL_T0),),
+    )
+    actions = decide_fix(world(prs=[p], now=_stall_now(3601)), CFG, FixState(),
+                         fixer_busy=False)
+    assert _escalated(actions)
+    assert not any(isinstance(a, RunAgent) for a in actions)
+    assert not any(isinstance(a, (EnableAutoMerge, UpdateBranch)) for a in actions)
+
+
+def test_the_deadline_is_lock_free():
+    # Same world, both lock states, same escalation — unlike the retry breakers,
+    # this arm dispatches nothing, so it must not depend on `fixer_busy`.
+    w = world(prs=[_wedged_pr()], now=_stall_now(3601))
+    busy = decide_fix(w, CFG, FixState(), fixer_busy=True)
+    idle = decide_fix(w, CFG, FixState(), fixer_busy=False)
+    assert _escalated(busy) == _escalated(idle) != []
+
+
+def test_a_stranger_s_wedged_pr_is_left_alone():
+    # Containment: the fixer only ever labels its OWN PRs.
+    p = _wedged_pr(author="a-human")
+    w = world(prs=[p], now=_stall_now(10**6))
+    assert not _escalated(decide_fix(w, CFG, FixState(), fixer_busy=False))
+
+
+def test_stalls_are_reported_as_the_values_the_escalation_acts_on():
+    w = world(prs=[_wedged_pr()], now=_stall_now(3601))
+    stalls = ci_pending_stalls(w, CFG)
+    assert len(stalls) == 1
+    assert stalls[0].pr == 100
+    assert stalls[0].head == "sha-aaa"
+    assert stalls[0].seconds == 3601
+    assert stalls[0].checks == ("Test (windows-latest)",)
+
+
+def test_no_stalls_reported_when_nothing_is_stalled():
+    assert ci_pending_stalls(world(prs=[_wedged_pr()], now=_stall_now(60)), CFG) == ()

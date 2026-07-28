@@ -14,7 +14,7 @@ Two halves, the usual pure/impure split:
 Field names match what the bash queries (issue: number,title,body,labels,
 comments,updatedAt,author,state; pr: number,title,body,headRefName,headRefOid,
 baseRefName,labels,reviews,state,closingIssuesReferences; checks: name,state,
-bucket) so the mapping is mechanical and auditable.
+bucket,startedAt) so the mapping is mechanical and auditable.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ import re
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 
 from ..domain.labels import Label
 from ..domain.world import (
@@ -344,7 +345,15 @@ def _reviews(raw: list | None) -> tuple[Review, ...]:
 
 def _checks(raw: list | None) -> tuple[Check, ...]:
     return tuple(
-        Check(name=c.get("name", "") or "", state=c.get("state", "") or "", bucket=c.get("bucket", "") or "")
+        Check(
+            name=c.get("name", "") or "",
+            state=c.get("state", "") or "",
+            bucket=c.get("bucket", "") or "",
+            # Absent/null on a gh that predates the field, or on a check that has
+            # not started — "" means unknown, and the pending deadline treats
+            # unknown as "cannot fire" rather than as "infinitely old" (#30).
+            started_at=c.get("startedAt") or c.get("started_at") or "",
+        )
         for c in raw or []
     )
 
@@ -445,10 +454,19 @@ def format_review_comments(raw: object, limit: int = _INLINE_COMMENT_LIMIT) -> s
     return _cap_bytes("\n".join(out), _REVIEW_COMMENTS_TOTAL_BYTES)
 
 
-def parse_world(issues: list[dict], prs: list[dict]) -> WorldState:
+def build_time() -> str:
+    """The stamp every world builder puts in `WorldState.now`. The domain may not
+    read a clock, so this is the one place a poll's notion of "now" is taken —
+    and it is taken once per build, so every time-based gate in a tick judges
+    against the same instant."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def parse_world(issues: list[dict], prs: list[dict], now: str = "") -> WorldState:
     return WorldState(
         issues=tuple(parse_issue(i) for i in issues),
         prs=tuple(parse_pr(p) for p in prs),
+        now=now,
     )
 
 
@@ -678,7 +696,8 @@ class GitHubGateway:
             return pr
         # checks come from a separate endpoint (bash `pr checks`).
         found = self._gh_json(
-            ["pr", "checks", str(number), "--repo", self.repo, "--json", "name,state,bucket"]
+            ["pr", "checks", str(number), "--repo", self.repo,
+             "--json", "name,state,bucket,startedAt"]
         ) or []
         return replace(pr, checks=_checks(found))  # type: ignore[arg-type]
 
@@ -819,7 +838,7 @@ class GitHubGateway:
                 checks=pr_states[n] == "OPEN",
             )) is not None
         )
-        return WorldState(issues=issues, prs=prs)
+        return WorldState(issues=issues, prs=prs, now=build_time())
 
     def build_review_world(self) -> WorldState:
         """The review daemon's slice: ONLY PRs carrying `self.review_pr_label` (open
@@ -853,7 +872,7 @@ class GitHubGateway:
                 n, mergeability=False, checks=pr_states[n] == "OPEN"
             )) is not None
         )
-        return WorldState(issues=(), prs=prs)
+        return WorldState(issues=(), prs=prs, now=build_time())
 
     def build_triage_world(self) -> WorldState:
         """All OPEN issues (the steward triages untriaged ones — those carrying no
@@ -867,7 +886,7 @@ class GitHubGateway:
             i for n in sorted(int(x["number"]) for x in nums)
             if (i := self._safe_get_issue(n)) is not None
         )
-        return WorldState(issues=issues)
+        return WorldState(issues=issues, now=build_time())
 
     def build_steward_world(self) -> WorldState:
         """Triage world (all open issues) PLUS recently-CLOSED ai-done issues, so
@@ -892,7 +911,7 @@ class GitHubGateway:
         issues = tuple(
             i for n in sorted(nums) if (i := self._safe_get_issue(n)) is not None
         )
-        return WorldState(issues=issues)
+        return WorldState(issues=issues, now=build_time())
 
     def pr_for_issue(self, issue: int) -> int | None:
         """Open PR whose head branch matches ^(feat|fix|chore|refactor)/<issue>-.

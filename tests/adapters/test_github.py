@@ -30,7 +30,7 @@ from issue_agent.adapters.github import (
 )
 from issue_agent.domain.labels import Label
 from issue_agent.domain.world import CIState
-from issue_agent.domain.ci import ci_state
+from issue_agent.domain.ci import ci_state, parse_timestamp
 
 
 # ── parsers ────────────────────────────────────────────────────────────────
@@ -1331,3 +1331,34 @@ def test_merged_prs_in_the_world_get_the_cheap_fetch():
     assert view_541 and "mergeable" in view_541[0][-1]       # open PR: full
     assert not any(a[2:4] == ["checks", "540"] for a, _ in fr.calls)
     assert any(a[2:4] == ["checks", "541"] for a, _ in fr.calls)
+
+
+# ── check start times + world timestamp (#30) ────────────────────────────────
+def test_get_pr_carries_check_start_times():
+    # The pending deadline is measured from these; without them a check wedged
+    # for half an hour is indistinguishable from one that started a second ago.
+    pr_resp = {"number": 100, "headRefName": "fix/5-x", "state": "OPEN", "labels": []}
+    checks = [{"name": "unit", "bucket": "pass", "startedAt": "2026-07-28T12:00:00Z"}]
+    fr = FakeRunner({"pr view 100": pr_resp, "pr checks 100": checks})
+    gw = GitHubGateway("o/r", runner=fr)
+    assert gw.get_pr(100).checks[0].started_at == "2026-07-28T12:00:00Z"
+    argv = [a for a, _ in fr.calls if a[1:3] == ["pr", "checks"]][0]
+    assert "startedAt" in argv[argv.index("--json") + 1]
+
+
+def test_check_start_time_absent_or_null_parses_to_unknown():
+    # A gh without the field, or a check that has not started, must read as
+    # unknown ("") — the deadline treats that as "cannot fire", never as epoch.
+    d = {"number": 1, "statusCheckRollup": [
+        {"name": "a"}, {"name": "b", "startedAt": None}]}
+    assert [c.started_at for c in parse_pr(d).checks] == ["", ""]
+
+
+def test_build_world_stamps_the_poll_time():
+    # The domain may not read a clock, so the world it decides on carries one.
+    gw = GitHubGateway("o/r", runner=FakeRunner({"issue list": [], "pr list": []}))
+    assert parse_timestamp(gw.build_world().now) is not None
+
+
+def test_parse_world_is_unstamped_unless_told():
+    assert parse_world([], []).now == ""
