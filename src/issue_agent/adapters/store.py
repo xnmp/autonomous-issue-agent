@@ -66,6 +66,99 @@ _PR_SUFFIXES = (
 _RESUME_STATE_SUFFIXES = ("session", "phase", "resumed-at")
 
 
+def encode_lifecycle_action(action: Action) -> dict[str, object]:
+    """Lossless JSON shape shared by the pending queue and action journal."""
+    if isinstance(action, Relabel):
+        return {
+            "type": "relabel",
+            "target": action.target.name,
+            "number": action.number,
+            "remove": action.remove.value if action.remove else None,
+            "add": action.add.value if action.add else None,
+        }
+    if isinstance(action, PostComment):
+        return {
+            "type": "comment",
+            "target": action.target.name,
+            "number": action.number,
+            "body": action.body,
+        }
+    if isinstance(action, CloseIssue):
+        return {
+            "type": "close",
+            "number": action.number,
+            "reason": action.reason,
+            "comment": action.comment,
+        }
+    if isinstance(action, EscalateCiPending):
+        return {
+            "type": "escalate_ci_pending",
+            "pr": action.pr,
+            "head": action.head,
+            "body": action.body,
+        }
+    raise TypeError(f"action is not a durable lifecycle write: {action!r}")
+
+
+def _required_string(raw: dict, field: str) -> str:
+    value = raw.get(field)
+    if not isinstance(value, str):
+        raise TypeError(f"{field} must be a string")
+    return value
+
+
+def _required_number(raw: dict, field: str) -> int:
+    value = raw.get(field)
+    if type(value) is not int or value <= 0:
+        raise TypeError(f"{field} must be a positive integer")
+    return value
+
+
+def _optional_label(raw: dict, field: str) -> Label | None:
+    value = raw.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"{field} must be a string or null")
+    return Label(value)
+
+
+def decode_lifecycle_action(raw: object) -> Action:
+    """Decode a journal/queue payload without guessing malformed legacy rows."""
+    if not isinstance(raw, dict):
+        raise ValueError("lifecycle action must be an object")
+    kind = raw.get("type")
+    try:
+        if kind == "relabel":
+            return Relabel(
+                Target[_required_string(raw, "target")],
+                _required_number(raw, "number"),
+                _optional_label(raw, "remove"),
+                _optional_label(raw, "add"),
+            )
+        if kind == "comment":
+            return PostComment(
+                Target[_required_string(raw, "target")],
+                _required_number(raw, "number"),
+                _required_string(raw, "body"),
+            )
+        if kind == "close":
+            return CloseIssue(
+                _required_number(raw, "number"),
+                _required_string(raw, "reason"),
+                _required_string(raw, "comment"),
+            )
+        if kind == "escalate_ci_pending":
+            return EscalateCiPending(
+                _required_number(raw, "pr"),
+                _required_string(raw, "head"),
+                _required_string(raw, "body"),
+            )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid lifecycle action: {raw!r}") from exc
+    raise ValueError(f"unknown lifecycle action type: {kind!r}")
+
+
 @dataclass(frozen=True)
 class Store:
     """STATE_DIR-rooted per-issue/PR daemon state. `state_dir` is the bash
@@ -160,71 +253,11 @@ class Store:
     # ── durable terminal lifecycle writes (#64) ──
     @staticmethod
     def _encode_pending_action(action: Action) -> dict[str, object]:
-        if isinstance(action, Relabel):
-            return {
-                "type": "relabel",
-                "target": action.target.name,
-                "number": action.number,
-                "remove": action.remove.value if action.remove else None,
-                "add": action.add.value if action.add else None,
-            }
-        if isinstance(action, PostComment):
-            return {
-                "type": "comment",
-                "target": action.target.name,
-                "number": action.number,
-                "body": action.body,
-            }
-        if isinstance(action, CloseIssue):
-            return {
-                "type": "close",
-                "number": action.number,
-                "reason": action.reason,
-                "comment": action.comment,
-            }
-        if isinstance(action, EscalateCiPending):
-            return {
-                "type": "escalate_ci_pending",
-                "pr": action.pr,
-                "head": action.head,
-                "body": action.body,
-            }
-        raise TypeError(f"action is not a durable lifecycle write: {action!r}")
+        return encode_lifecycle_action(action)
 
     @staticmethod
     def _decode_pending_action(raw: object) -> Action:
-        if not isinstance(raw, dict):
-            raise ValueError("pending lifecycle action must be an object")
-        kind = raw.get("type")
-        try:
-            if kind == "relabel":
-                remove = raw.get("remove")
-                add = raw.get("add")
-                return Relabel(
-                    Target[str(raw["target"])],
-                    int(raw["number"]),
-                    Label(str(remove)) if remove is not None else None,
-                    Label(str(add)) if add is not None else None,
-                )
-            if kind == "comment":
-                return PostComment(
-                    Target[str(raw["target"])],
-                    int(raw["number"]),
-                    str(raw["body"]),
-                )
-            if kind == "close":
-                return CloseIssue(
-                    int(raw["number"]),
-                    str(raw.get("reason") or "completed"),
-                    str(raw.get("comment") or ""),
-                )
-            if kind == "escalate_ci_pending":
-                return EscalateCiPending(
-                    int(raw["pr"]), str(raw["head"]), str(raw["body"])
-                )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise ValueError(f"invalid pending lifecycle action: {raw!r}") from exc
-        raise ValueError(f"unknown pending lifecycle action type: {kind!r}")
+        return decode_lifecycle_action(raw)
 
     def _load_action_queue(
         self, path: str, *, description: str

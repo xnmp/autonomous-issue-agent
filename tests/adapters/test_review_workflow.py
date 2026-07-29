@@ -4,7 +4,9 @@ import asyncio
 
 import pytest
 
+from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
 from issue_agent.app.execute import Executor
+from issue_agent.app.planners.schemas import REVIEW_SCHEMA
 from issue_agent.app.workflows.review import ReviewWorkflow, ReviewWorkflowConfig
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.review import (
@@ -42,6 +44,9 @@ def _workflow(gw, store, runner, journal=None, **cfg_overrides):
         journal=journal,
     )
     cfg_kwargs.update(cfg_overrides)
+    if cfg_kwargs.get("reviewer_runtime") == "codex":
+        cfg_kwargs.setdefault("execution_cwd", "/configured-review-checkout")
+        cfg_kwargs.setdefault("prepare_cwd", lambda _cwd: None)
     cfg = ReviewWorkflowConfig(**cfg_kwargs)
     # The REAL Executor, not a spy: M10's whole point is that escalation must
     # travel the same funnel every other write does (journal event + ALERT_CMD
@@ -125,6 +130,67 @@ def test_external_review_marker_never_becomes_a_resume_session():
     assert store.get_pr_session(100) == "real-session"
 
 
+def test_codex_reviewer_re_reviews_in_a_fresh_read_only_session():
+    """`codex exec resume` has no sandbox flag, so retaining its session id
+    would silently restore danger-full-access on a re-review."""
+    prior = Review("CHANGES_REQUESTED", "review-bot", "t1", body="fix it", commit_id="old")
+    old = PRView(100, head_ref_oid="old", title="t", body="b")
+    gw = FakeGateway(prs={100: old})
+    store = FakeStore()
+    first = FakeRunner(AgentResult(
+        is_error=False, session_id="codex-session",
+        structured={"decision": "REQUEST_CHANGES", "body": "fix it"},
+    ))
+
+    asyncio.run(_workflow(gw, store, first, reviewer_runtime="codex").review(100))
+    assert store.get_pr_session(100) == "codex-review"
+
+    gw._prs[100] = PRView(100, head_ref_oid="new", title="t", body="b", reviews=(prior,))
+    setattr(gw, "pr_diff", lambda _pr: "new diff")
+    second = FakeRunner(AgentResult(
+        is_error=False, session_id="new-codex-session",
+        structured={"decision": "APPROVE", "body": "fixed"},
+    ))
+    asyncio.run(_workflow(gw, store, second, reviewer_runtime="codex").re_review(100))
+
+    assert second.tasks[0].resume is None
+    assert store.get_pr_session(100) == "codex-review"
+
+
+def test_codex_review_installs_its_hook_in_the_explicit_checkout_before_running():
+    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    gw = FakeGateway(prs={100: pr})
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(
+        is_error=False,
+        structured={"decision": "APPROVE", "body": "looks good"},
+    ))
+    prepared: list[str] = []
+
+    asyncio.run(_workflow(
+        gw, store, runner, reviewer_runtime="codex",
+        execution_cwd="/explicit/review-checkout", prepare_cwd=prepared.append,
+    ).review(100))
+
+    assert prepared == ["/explicit/review-checkout"]
+    assert runner.tasks[0].cwd == "/explicit/review-checkout"
+
+
+def test_codex_review_refuses_an_implicit_process_cwd():
+    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    gw = FakeGateway(prs={100: pr})
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(is_error=False))
+    logs: list[str] = []
+
+    asyncio.run(_workflow(
+        gw, store, runner, reviewer_runtime="codex", execution_cwd="", log=logs.append,
+    ).review(100))
+
+    assert runner.tasks == []
+    assert any("set TARGET_DIR" in line for line in logs)
+
+
 def test_single_review_submits_before_persisting_state():
     pr = PRView(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr})
@@ -141,6 +207,42 @@ def test_single_review_submits_before_persisting_state():
     assert store.pr_sessions[100] == "rs"
     assert store.last_sha[100] == "abc"
     assert store.rounds[100] == 1
+
+
+def test_codex_shaped_review_verdict_submits_and_ledgers_attributed_usage(tmp_path):
+    """The Codex runner's schema-normalised result must travel through the
+    ordinary REVIEW_SCHEMA submission seam and leave a queryable review ledger
+    receipt; neither assertion is a constructor-level proxy."""
+    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    gw = FakeGateway(prs={100: pr})
+    store = FakeStore()
+    journal = Journal(str(tmp_path / "review-journal.jsonl"))
+    ledger = str(tmp_path / "spend.jsonl")
+    runner = JournalingRuntime(
+        FakeRunner(AgentResult(
+            is_error=False,
+            session_id="codex-session",
+            model="gpt-5.6-terra",
+            cost_usd=1.25,
+            usage={"input_tokens": 10, "output_tokens": 20},
+            structured={"decision": "APPROVE", "body": "looks good"},
+        )),
+        journal, ledger, "o/r", "review", "codex",
+    )
+    runner.set_context("review", "REVIEW", 100, None)
+
+    asyncio.run(_workflow(gw, store, runner).review(100))
+
+    assert runner.inner.tasks[0].schema == REVIEW_SCHEMA
+    assert any(call[:3] == ("review", 100, "APPROVE") for call in gw.calls)
+    spend = read_events(ledger)[0]
+    assert spend["role"] == "review"
+    assert spend["runtime"] == "codex"
+    assert spend["model"] == "gpt-5.6-terra"
+    assert spend["usage"] == {
+        "input_tokens": 10, "output_tokens": 20,
+        "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+    }
 
 
 def test_successful_submit_logs_verdict():

@@ -84,6 +84,7 @@ class FixRuntimeConfig:
 @dataclass(frozen=True)
 class ReviewRuntimeConfig:
     bot: str
+    runtime: str
     model: str | None
     prompt: str
     mode: ReviewMode
@@ -269,7 +270,9 @@ class HarnessConfig:
     # failed resolve retry, a second-and-later review round. Off pins every leg
     # to the router's verdict no matter what has happened before.
     escalate_on_evidence: bool = True
-    review_model: str | None = None
+    # Codex is the default reviewer runtime, so pin its deployable default here
+    # instead of leaving the task un-attributed to the Codex CLI default.
+    review_model: str | None = "gpt-5.6-terra"
     steward_triage_model: str | None = "sonnet"
     fix_budget_usd: float = 10.0
     review_budget_usd: float = 8.0
@@ -338,9 +341,12 @@ class HarnessConfig:
     # Fixer runtime: "claude" (default, Claude Agent SDK), "codex" (OpenAI Codex
     # CLI, e.g. GPT-5.5), or "glm" (GLM via Z.ai's Anthropic-compatible endpoint —
     # the SAME Claude SDK runner with the profile's env injected). Only the FIXER
-    # leg switches; reviewer/steward stay Claude (a distinct model decorrelates
-    # blind spots). See docs/CODEX-RUNNER.md.
+    # leg switches. See docs/reference/codex-runner.md.
     fixer_runtime: str = "claude"
+    # Reviewer runtime: Codex is the deployment default; set "claude" explicitly
+    # for the recommended mixed-runtime posture that preserves independent
+    # implementer/reviewer failure modes.
+    reviewer_runtime: str = "codex"
     codex_bin: str = "codex"
     codex_model: str = ""              # blank → CodexRunner default (GPT-5.5)
     codex_provider_id: str = "openai-custom"  # NOT "openai": reserved by codex-cli ≥0.142
@@ -518,6 +524,7 @@ class HarnessConfig:
     def review_runtime(self) -> ReviewRuntimeConfig:
         return ReviewRuntimeConfig(
             bot=self.review_bot,
+            runtime=self.reviewer_runtime,
             model=self.review_model,
             prompt=self.review_prompt,
             mode=self.review_mode,
@@ -655,6 +662,13 @@ class HarnessConfig:
             # on Anthropic credentials instead. Existence of the file is a
             # build-time check (roles); emptiness is a config error.
             errors.append("GLM_SETTINGS_FILE is required when FIXER_RUNTIME=glm")
+        if self.reviewer_runtime not in ("claude", "codex"):
+            errors.append("REVIEWER_RUNTIME must be 'claude' or 'codex'")
+        elif self.reviewer_runtime == "codex" and self.review_mode is not ReviewMode.SINGLE:
+            errors.append(
+                "REVIEWER_RUNTIME=codex supports REVIEW_MODE=single only; "
+                "multi/delegated rely on Claude subagents and model aliases"
+            )
         _require_non_negative(errors, "AGENT_IDLE_TIMEOUT_SECONDS", self.agent_idle_timeout)
         _require_non_negative(errors, "AGENT_MAX_RUNTIME_SECONDS", self.agent_max_runtime)
         _require_non_negative(errors, "SDK_MAX_BUFFER_BYTES", self.sdk_max_buffer_bytes)
@@ -741,8 +755,8 @@ class HarnessConfig:
             f"fix_effort={getattr(self.fix_effort, 'value', None) or '(runtime default)'} "
             f"escalate={'on' if self.escalate_on_evidence else 'off'} "
             f"{fix_budget}",
-            f"review_model={model(self.review_model)} mode={self.review_mode.value} "
-            f"review_budget=${self.review_budget_usd:.2f} "
+            f"reviewer={self.reviewer_runtime} review_model={model(self.review_model)} "
+            f"mode={self.review_mode.value} review_budget=${self.review_budget_usd:.2f} "
             f"rejections_cap={self.max_review_rejections}",
             f"retry_caps: resolve={self.max_resolve_retries} ci={self.max_ci_retries} "
             f"review={self.max_review_retries} rebase={self.max_rebase_retries} "
@@ -1123,6 +1137,13 @@ def from_env(env: dict | None = None) -> HarnessConfig:
     # from_env itself must never traceback on operator input (review M2).
     errors: list[str] = []
     repo = e.get("REPO", "")
+    reviewer_runtime = e.get("REVIEWER_RUNTIME", _dc_default("reviewer_runtime"))
+    # The Codex default model cannot be handed to the Claude SDK when an
+    # operator deliberately chooses the diversity posture. An explicit model
+    # always wins; only an omitted REVIEW_MODEL is runtime-specific.
+    review_model = e.get("REVIEW_MODEL") or (
+        "opus" if reviewer_runtime == "claude" else _dc_default("review_model")
+    )
     return HarnessConfig(
         repo=repo,
         base_branch=e.get("BASE_BRANCH", _dc_default("base_branch")),
@@ -1186,7 +1207,7 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         escalate_on_evidence=_b(
             e, "ESCALATE_ON_EVIDENCE", _dc_default("escalate_on_evidence"), errors
         ),
-        review_model=e.get("REVIEW_MODEL") or _dc_default("review_model"),
+        review_model=review_model,
         steward_triage_model=e.get("STEWARD_TRIAGE_MODEL", _dc_default("steward_triage_model"))
         or None,
         fix_budget_usd=_coerce_float(e, "MAX_BUDGET_USD", _dc_default("fix_budget_usd"), errors),
@@ -1240,6 +1261,7 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         jira_mcp_tools=e.get("JIRA_MCP_TOOLS", _dc_default("jira_mcp_tools")),
         jira_budget_usd=_coerce_float(e, "JIRA_SYNC_BUDGET_USD", _dc_default("jira_budget_usd"), errors),
         fixer_runtime=e.get("FIXER_RUNTIME", _dc_default("fixer_runtime")),
+        reviewer_runtime=reviewer_runtime,
         codex_bin=e.get("CODEX_BIN", _dc_default("codex_bin")),
         codex_model=e.get("CODEX_MODEL", _dc_default("codex_model")),
         codex_provider_id=e.get("CODEX_PROVIDER_ID", _dc_default("codex_provider_id")),

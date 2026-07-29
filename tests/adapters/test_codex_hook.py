@@ -49,6 +49,14 @@ def test_gov_script_invokes_the_shared_governor():
     assert "exit 0" in script  # the uv-missing fail-open path
 
 
+def test_review_hook_enables_the_read_only_bash_policy():
+    cwd = tempfile.mkdtemp()
+    write_hook_config(cwd, review_only=True)
+
+    script = open(os.path.join(cwd, ".codex", "hooks", "gov.sh")).read()
+    assert "ISSUE_AGENT_REVIEW_READ_ONLY=1" in script
+
+
 def test_custom_governor_path():
     cwd = tempfile.mkdtemp()
     write_hook_config(cwd, governor_path="/custom/gov.py")

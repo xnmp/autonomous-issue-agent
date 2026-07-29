@@ -11,7 +11,8 @@ passes them here for projection into API payloads.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone, tzinfo
+from datetime import datetime, timedelta, timezone, tzinfo
+import math
 
 from ...domain import dashboard as dash
 
@@ -313,6 +314,87 @@ def waiting_label(event: dict) -> str | None:
     return "waiting on dependency"
 
 
+def _legacy_suspended_seconds(
+    intervals: list[tuple[datetime, datetime, float]],
+) -> float:
+    """Deduplicate corrections written before stable stall identities existed.
+
+    Compatibility for journal rows written before #69. Remove after retained
+    operator journals all postdate the deployment containing #69.
+    """
+    if not intervals:
+        return 0.0
+    ordered = sorted(intervals)
+    _, current_end, current_seconds = ordered[0]
+    total = 0.0
+    for started_at, ended_at, seconds in ordered[1:]:
+        if started_at <= current_end:
+            current_end = max(current_end, ended_at)
+            current_seconds = max(current_seconds, seconds)
+            continue
+        total += current_seconds
+        current_end, current_seconds = ended_at, seconds
+    return total + current_seconds
+
+
+def _identified_suspended_seconds(corrections: list[tuple[float, float]]) -> float:
+    """Take one maximum correction per physical clock-offset cluster."""
+    if not corrections:
+        return 0.0
+    ordered = sorted(corrections)
+    previous_offset, current_seconds = ordered[0]
+    total = 0.0
+    for offset, seconds in ordered[1:]:
+        # Journal wall stamps are integral seconds while monotonic is sampled
+        # just after them. Separate daemons can therefore report the same boot
+        # offset about one second apart.
+        if offset - previous_offset <= 2.0:
+            current_seconds = max(current_seconds, seconds)
+        else:
+            total += current_seconds
+            current_seconds = seconds
+        previous_offset = offset
+    return total + current_seconds
+
+
+def _suspended_seconds(row: dash.IssueRow, max_seconds: float) -> float:
+    """Valid suspension corrections, counted once across role detectors."""
+    intervals: list[tuple[datetime, datetime, float]] = []
+    identified: list[tuple[float, float]] = []
+    for event in row.events:
+        if event.get("event") != "agent_run_stall":
+            continue
+        started_at = dash.parse_ts(event.get("stall_started_at"))
+        if started_at is None:
+            continue
+        try:
+            seconds = float(event.get("suspended_seconds") or 0)
+        except (OverflowError, TypeError, ValueError):
+            continue
+        if (
+            not math.isfinite(seconds)
+            or seconds <= 0
+            or seconds > max(0.0, max_seconds)
+        ):
+            continue
+        try:
+            clock_offset = float(event.get("stall_clock_offset_seconds"))
+        except (OverflowError, TypeError, ValueError):
+            clock_offset = math.nan
+        if math.isfinite(clock_offset):
+            identified.append((clock_offset, seconds))
+            continue
+        try:
+            ended_at = started_at + timedelta(seconds=seconds)
+        except OverflowError:
+            continue
+        intervals.append((started_at, ended_at, seconds))
+    return (
+        _identified_suspended_seconds(identified)
+        + _legacy_suspended_seconds(intervals)
+    )
+
+
 def _flags(row: dash.IssueRow) -> list[str]:
     flags = []
     if row.escalations:
@@ -379,7 +461,10 @@ def mean_wall_clock_s(rows) -> float | None:
             continue
         start, last = _started(row), row.last_ts
         if start and last:
-            spans.append((last - start).total_seconds())
+            wall_seconds = (last - start).total_seconds()
+            spans.append(
+                max(0.0, wall_seconds - _suspended_seconds(row, wall_seconds))
+            )
     return round(sum(spans) / len(spans), 1) if spans else None
 
 
@@ -401,6 +486,7 @@ def issue_card(
     # In flight: the clock is still running, so elapsed is measured to NOW.
     # Done: to the last thing that happened, which is where the clock stopped.
     end = row.last_ts if (row.done and row.last_ts) else now
+    wall_seconds = (end - started).total_seconds() if started else None
     card = {
         "issue": row.issue,
         "title": (gh_issue or {}).get("title"),
@@ -417,7 +503,16 @@ def issue_card(
         "projected_model": projected_model,
         "started_ts": iso(started),
         "last_ts": iso(row.last_ts),
-        "elapsed_s": round((end - started).total_seconds()) if started else None,
+        "elapsed_s": (
+            round(
+                max(
+                    0.0,
+                    wall_seconds - _suspended_seconds(row, wall_seconds),
+                )
+            )
+            if wall_seconds is not None
+            else None
+        ),
         "projected_eta_s": projected_eta_s,
         "models": list(row.models),
         "model_badges": model_badges(row),

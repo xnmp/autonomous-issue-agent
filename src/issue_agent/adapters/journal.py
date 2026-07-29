@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -40,6 +41,12 @@ from datetime import datetime, timedelta, timezone
 
 from ..domain.agent_task import AgentTask
 from ..domain.outcome import AgentResult, ExitReason, deterministic_death
+from .handover import (
+    HandoverScope,
+    retire_delivered_handover,
+    with_previous_handover,
+    write_exhaustion_handover,
+)
 
 # The four SDK usage counters worth keeping. `cost_usd` is the gateway's dollar
 # figure, which is 0.00 on a subscription plan and absent on Codex — tokens are
@@ -172,12 +179,14 @@ class JournalingRuntime:
         ledger_path: str = "",
         repo: str = "",
         role: str = "",
+        runtime: str = "",
     ):
         self.inner = inner
         self.journal = journal
         self.ledger = Journal(ledger_path) if ledger_path else None
         self.repo = repo
         self.role = role
+        self.runtime = runtime
         self.context = RunContext(role=role)
 
     def set_context(self, role: str, kind: str, number: int, issue: int | None) -> None:
@@ -253,10 +262,12 @@ class JournalingRuntime:
         UNCHANGED — the crash isolation the raise buys (`Daemon.tick` catches,
         issue keeps `ai-working`, reaper requeues) must not change.
         """
+        scope = HandoverScope(role=self.context.role, issue=self.context.issue)
+        prepared = with_previous_handover(task, scope)
         self._record_start(task)
         t0 = time.monotonic()
         try:
-            result = await self.inner.run(task)
+            result = await self.inner.run(prepared.task)
         except BaseException as exc:  # noqa: BLE001 — recorded, never handled
             # BaseException, not Exception: a cancellation or Ctrl-C mid-run
             # leaves exactly the same requeue-and-re-dispatch signature, so it
@@ -286,6 +297,22 @@ class JournalingRuntime:
             )
             raise
         self._record(task, result, time.monotonic() - t0)
+        retire_delivered_handover(
+            task, result, scope, prepared.handover_digest
+        )
+        receipt = write_exhaustion_handover(task, result, scope)
+        if receipt is not None:
+            ctx = self.context
+            self.journal.emit(
+                "handover_written",
+                role=ctx.role,
+                kind=ctx.kind,
+                number=ctx.number,
+                issue=ctx.issue,
+                dispatch=ctx.dispatch_id,
+                trigger=receipt.trigger,
+                bytes=receipt.byte_size,
+            )
         return result
 
     def _record_start(self, task: AgentTask) -> None:
@@ -388,6 +415,8 @@ class JournalingRuntime:
             if self.ledger is not None and billed > 0:
                 self.ledger.emit(
                     "spend", repo=self.repo, issue=ctx.issue, kind=ctx.kind,
+                    role=ctx.role, runtime=self.runtime,
+                    model=(getattr(result, "model", "") or task.model or ""),
                     cost_usd=billed, estimated=(cost <= 0) or None, usage=usage,
                 )
         except Exception as exc:  # noqa: BLE001 — never fail a run over its receipt
@@ -634,6 +663,98 @@ def events_within(events, seconds: float, now_fn=_now) -> list[dict]:
         if ts is not None and ts >= cutoff:
             out.append(e)
     return out
+
+
+def stalled_run_annotations(
+    events: list[dict],
+    observed_from: datetime,
+    woke_at: datetime,
+    detected_suspended_seconds: float,
+) -> list[dict]:
+    """Settled agent legs whose wall clock contains detected suspension time.
+
+    The heartbeat only observes the total wall-vs-monotonic gap when control
+    returns to the loop, so ``woke_at - detected_suspended_seconds`` is not the
+    suspension's start when work continued after resume. Each agent leg already
+    records the same two clocks: journal timestamps are wall time while
+    ``duration_s`` is monotonic. Their difference attributes the gap without
+    guessing where inside the observed heartbeat interval it occurred.
+    """
+    starts: dict[str, list[dict]] = {}
+    for event in events:
+        if event.get("event") != "agent_run_start":
+            continue
+        dispatch = str(event.get("dispatch") or "")
+        if dispatch:
+            starts.setdefault(dispatch, []).append(event)
+
+    annotations: list[dict] = []
+    seen: set[tuple] = set()
+    for event in events:
+        if event.get("event") != "agent_run":
+            continue
+        dispatch = str(event.get("dispatch") or "")
+        finished_at = parse_ts(event.get("ts"))
+        if not dispatch or finished_at is None:
+            continue
+        candidates = [
+            start
+            for start in starts.get(dispatch, ())
+            if start.get("kind") == event.get("kind")
+            and start.get("number") == event.get("number")
+            and (parse_ts(start.get("ts")) or finished_at) <= finished_at
+        ]
+        if not candidates:
+            continue
+        start = max(candidates, key=lambda value: parse_ts(value.get("ts")) or finished_at)
+        run_started_at = parse_ts(start.get("ts"))
+        if (
+            run_started_at is None
+            or run_started_at >= woke_at
+            or finished_at <= observed_from
+        ):
+            continue
+        try:
+            active_seconds = float(event.get("duration_s"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(active_seconds) or active_seconds < 0:
+            continue
+        wall_seconds = (finished_at - run_started_at).total_seconds()
+        # Journal stamps have one-second precision and duration_s is rounded to
+        # 0.1s. A healthy leg can therefore show a sub-second positive residue;
+        # it is timestamp quantisation, not a box suspension.
+        leg_suspended_seconds = wall_seconds - active_seconds
+        if leg_suspended_seconds <= 1.1:
+            continue
+        suspended_seconds = min(
+            max(0.0, detected_suspended_seconds),
+            round(leg_suspended_seconds),
+        )
+        if suspended_seconds <= 0:
+            continue
+        identity = (
+            dispatch,
+            event.get("kind"),
+            event.get("number"),
+            event.get("ts"),
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        annotations.append(
+            {
+                "role": event.get("role"),
+                "kind": event.get("kind"),
+                "number": event.get("number"),
+                "issue": event.get("issue"),
+                "dispatch": dispatch,
+                "run_started_at": start.get("ts"),
+                "run_finished_at": event.get("ts"),
+                "suspended_seconds": suspended_seconds,
+            }
+        )
+    return annotations
 
 
 def repeated_dispatch_warning(events, window_s: float, threshold: int) -> str:

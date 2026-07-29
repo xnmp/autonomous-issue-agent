@@ -1329,6 +1329,24 @@ def test_transport_drop_retries_then_succeeds():
     assert "resuming sess-" in joined  # retried with resume, not cold
 
 
+def test_read_only_transport_retry_starts_a_fresh_sandboxed_session():
+    """`codex exec resume` cannot accept --sandbox, so a reviewer retry must
+    never take the fixer recovery path that bypasses sandboxing."""
+    tmp = tempfile.mkdtemp()
+    codex = _flaky_codex(tmp, fail_times=1)
+    logged: list[str] = []
+    runner = CodexRunner(
+        codex_bin=codex, env={"OPENAI_API_KEY": "k"}, log=logged.append,
+        transport_retries=2, backoff_base=0.01, resume_on_retry=False,
+    )
+
+    result = asyncio.run(runner.run(AgentTask(prompt="x")))
+
+    assert result.status == "pr_opened"
+    assert "restarting in" in "\n".join(logged)
+    assert not any("resuming sess-" in line for line in logged)
+
+
 def test_transport_drop_exhausts_to_timeout():
     """Every attempt drops → run() gives up as a retryable timeout, not error."""
     tmp = tempfile.mkdtemp()

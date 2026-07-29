@@ -14,10 +14,12 @@ Phase 4 work; the executor just routes to it.
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime
 import time
 
 from ..adapters.github import GhUnavailable
-from ..adapters.journal import alert, event_line
+from ..adapters.journal import alert, event_line, parse_ts, read_events_tail
+from ..adapters.store import decode_lifecycle_action, encode_lifecycle_action
 from ..domain.actions import (
     Action,
     AddDependency,
@@ -34,12 +36,19 @@ from ..domain.actions import (
     RunAgent,
     Target,
 )
-from ..domain.labels import Label
+from ..domain.labels import ADVISORY_LABELS, Label
 
 # gh subcommand kind per target.
 _KIND = {Target.ISSUE: "issue", Target.PR: "pr"}
 _DURABLE_ACTIONS = (Relabel, PostComment, CloseIssue, EscalateCiPending)
 _DEFAULT_RETRY_DELAYS = (1.0, 3.0, 9.0)
+
+
+def _is_advisory_relabel(action: Relabel) -> bool:
+    return (
+        action.remove in ADVISORY_LABELS
+        or action.add in ADVISORY_LABELS
+    )
 
 
 class LifecycleWriteUnverified(RuntimeError):
@@ -187,6 +196,17 @@ class Executor:
         if isinstance(action, CloseIssue):
             issue_closed = getattr(self.gateway, "is_issue_closed", None)
             return bool(issue_closed and issue_closed(action.number))
+        if isinstance(action, EscalateCiPending):
+            has_comment = getattr(self.gateway, "has_comment", None)
+            has_label = getattr(self.gateway, "has_label", None)
+            return bool(
+                has_comment
+                and has_label
+                and has_comment("pr", action.pr, action.body)
+                and has_label(
+                    "pr", action.pr, Label.NEEDS_HUMAN_REVIEW.value
+                )
+            )
         return False
 
     def _report_recovered_escalation(self, action: Action) -> None:
@@ -196,6 +216,16 @@ class Executor:
             and action.add is Label.NEEDS_HUMAN_REVIEW
         ):
             self._escalated(action)
+        elif isinstance(action, EscalateCiPending):
+            self._mark_ci_pending_escalated(action.pr, action.head)
+            self._escalated(
+                Relabel(
+                    Target.PR,
+                    action.pr,
+                    Label.AI_PR_OPEN,
+                    Label.NEEDS_HUMAN_REVIEW,
+                )
+            )
 
     def _apply_ci_escalation(
         self, action: EscalateCiPending, *, resume: bool
@@ -386,12 +416,87 @@ class Executor:
                 return
             raise
         if self._journal is not None:
+            fields = {
+                "desc": desc,
+                "attempts": attempts,
+                "replayed": replayed,
+            }
+            if isinstance(action, _DURABLE_ACTIONS):
+                fields["action"] = encode_lifecycle_action(action)
             self._journal.emit(
                 "action",
-                desc=desc,
-                attempts=attempts,
-                replayed=replayed,
+                **fields,
             )
+
+    def reconcile_recent_actions(
+        self, started_at: datetime, woke_at: datetime
+    ) -> None:
+        """Verify durable receipts around a stall and repair missing writes.
+
+        The journal is a receipt, not proof that remote state survived an
+        environmental outage. Structured receipts are replayed through the
+        same idempotency probes and bounded queue as #64. Rows without a
+        structured payload are non-durable actions (or legacy receipts) and
+        are ignored; a present but malformed payload remains observable.
+        Relabels are state transitions, so only the latest receipt per target
+        is meaningful. Additive/idempotent actions retain journal order.
+        """
+        path = getattr(self._journal, "path", "")
+        if not path:
+            return
+        actions: list[Action] = []
+        latest_relabels: dict[tuple[Target, int], int] = {}
+        for event in read_events_tail(path):
+            if event.get("event") != "action":
+                continue
+            timestamp = parse_ts(event.get("ts"))
+            if timestamp is None or not (started_at <= timestamp <= woke_at):
+                continue
+            if "action" not in event:
+                continue
+            raw = event.get("action")
+            try:
+                action = decode_lifecycle_action(raw)
+            except ValueError as exc:
+                self._journal.emit(
+                    "action_reconcile_skipped",
+                    desc=str(event.get("desc") or ""),
+                    error=str(exc),
+                )
+                continue
+            actions.append(action)
+            if isinstance(action, Relabel) and not _is_advisory_relabel(action):
+                latest_relabels[(action.target, action.number)] = len(actions) - 1
+
+        for index, action in enumerate(actions):
+            if (
+                isinstance(action, Relabel)
+                and not _is_advisory_relabel(action)
+                and latest_relabels[(action.target, action.number)] != index
+            ):
+                continue
+            desc = self._describe(action)
+            try:
+                already_applied = self._already_applied(action)
+            except Exception:
+                # Route an unreadable verification probe through the durable
+                # executor too. Its second probe may recover; otherwise the
+                # existing #64 failure path journals and queues the action.
+                try:
+                    self.execute(action, replayed=True)
+                except Exception:
+                    pass
+                continue
+            if already_applied:
+                self._journal.emit("action_verified", desc=desc)
+                continue
+            try:
+                self.execute(action, replayed=True)
+            except Exception:
+                # execute() already journalled the failure and persisted every
+                # transient/unverified durable write. Continue so one broken
+                # target does not prevent independent receipts being checked.
+                continue
 
     def replay_pending(self) -> bool:
         """Replay durable writes, quarantining unverifiable entries after the bound."""

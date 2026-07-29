@@ -14,6 +14,33 @@ def test_review_mode_defaults_single():
     assert from_env({"REPO": "x"}).review_scout_model == "sonnet"
 
 
+def test_reviewer_runtime_defaults_to_codex_with_a_mid_tier_model():
+    """The deployment default is visible in the task-producing config, not
+    merely documented in an example overlay."""
+    cfg = from_env({"REPO": "x"})
+
+    assert cfg.reviewer_runtime == "codex"
+    assert cfg.review_model == "gpt-5.6-terra"
+
+
+def test_reviewer_runtime_accepts_an_explicit_claude_diversity_posture():
+    cfg = from_env({"REPO": "x", "REVIEWER_RUNTIME": "claude"})
+
+    assert cfg.reviewer_runtime == "claude"
+    assert cfg.review_model == "opus"
+
+
+@pytest.mark.parametrize("mode", ["multi", "delegated"])
+def test_codex_reviewer_rejects_modes_it_cannot_execute(mode):
+    cfg = from_env({
+        "REPO": "o/r", "FIX_BOT": "fix-bot", "REVIEWER_RUNTIME": "codex",
+        "REVIEW_MODE": mode,
+    })
+
+    with pytest.raises(ValueError, match="REVIEW_MODE=single"):
+        cfg.validate()
+
+
 def test_review_mode_delegated_and_scout_override():
     c = from_env({"REPO": "x", "REVIEW_MODE": "delegated", "REVIEW_SCOUT_MODEL": "haiku"})
     assert c.review_mode is ReviewMode.DELEGATED
