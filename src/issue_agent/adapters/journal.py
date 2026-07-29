@@ -401,7 +401,7 @@ class JournalingRuntime:
                     number=ctx.number,
                     issue=ctx.issue,
                     dispatch=ctx.dispatch_id,
-                    model=(getattr(result, "model", "") or task.model or ""),
+                    model=(task.model or getattr(result, "model", "") or ""),
                     session_id=result.session_id,
                     warning=telemetry_warning,
                 )
@@ -414,7 +414,7 @@ class JournalingRuntime:
                 self.ledger.emit(
                     "spend", repo=self.repo, issue=ctx.issue, kind=ctx.kind,
                     role=ctx.role, runtime=self.runtime,
-                    model=(getattr(result, "model", "") or task.model or ""),
+                    model=(task.model or getattr(result, "model", "") or ""),
                     cost_usd=billed, estimated=(cost <= 0) or None, usage=usage,
                 )
         except Exception as exc:  # noqa: BLE001 — never fail a run over its receipt
