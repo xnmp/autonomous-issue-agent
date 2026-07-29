@@ -275,6 +275,34 @@ def test_backlog_card_survives_a_missing_created_at_and_list_shaped_comments():
 
 
 # ── overview ──────────────────────────────────────────────────────────────────
+def test_health_trend_groups_target_issue_lifecycle_and_recurrence_by_utc_day():
+    issues = [
+        {"number": 1, "createdAt": "2026-07-28T23:30:00-02:00", "closedAt": None},
+        {"number": 2, "createdAt": "2026-07-29T01:00:00Z", "closedAt": "2026-07-30T04:00:00Z"},
+        # A malformed external record must not make the advisory panel disappear.
+        {"number": 3, "createdAt": "not-a-date", "closedAt": "also-not-a-date"},
+    ]
+    recurrences = [
+        {"event": "recurrence", "ts": "2026-07-30T23:30:00-02:00", "issue": 2},
+        {"event": "recurrence", "ts": "2026-07-31T01:00:00Z", "issue": 2},
+    ]
+
+    assert snapshots.health_trend(
+        issues, recurrences, first_class_day="2026-07-29"
+    ) == [
+        {"day": "2026-07-29", "opened": 2, "closed": 0, "net_open": 2,
+         "recurrences": 0, "first_of_class": True},
+        {"day": "2026-07-30", "opened": 0, "closed": 1, "net_open": -1,
+         "recurrences": 0, "first_of_class": False},
+        {"day": "2026-07-31", "opened": 0, "closed": 0, "net_open": 0,
+         "recurrences": 2, "first_of_class": False},
+    ]
+
+
+def test_health_trend_is_empty_without_issue_activity_or_recurrence():
+    assert snapshots.health_trend([], [], first_class_day="2026-07-29") == []
+
+
 def test_cost_mix_splits_spend_into_the_four_leg_families():
     metrics = dash.build_metrics(
         build([RESOLVE, FIX_CI_1,
