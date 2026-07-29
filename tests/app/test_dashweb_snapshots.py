@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from issue_agent.app import dashboard as dash
+from issue_agent.app import cli, dashboard as dash
 from issue_agent.app.dashweb import ghdata, server, snapshots
 
 NOW = datetime(2026, 7, 29, 12, 0, 0, tzinfo=timezone.utc)
@@ -317,7 +317,6 @@ def test_overview_projects_selected_repo_lifecycle_recurrence_and_first_class_da
     monkeypatch.setattr(backend, "snapshot", lambda _name: snapshot)
     monkeypatch.setattr(backend, "names", lambda: ("demo",))
     monkeypatch.setattr(snapshots, "scan_proc_daemons", lambda: ({}, True))
-    monkeypatch.setattr(snapshots, "deployment_class", lambda _snapshot: ("o/r", "codex", "single"))
 
     assert backend.overview("demo")["health_trend"] == [
         {"day": "2026-07-29", "opened": 1, "closed": 0, "net_open": 1,
@@ -338,32 +337,45 @@ def test_overview_warns_when_the_github_history_limit_is_reached(monkeypatch):
     monkeypatch.setattr(backend, "snapshot", lambda _name: snapshot)
     monkeypatch.setattr(backend, "names", lambda: ("demo",))
     monkeypatch.setattr(snapshots, "scan_proc_daemons", lambda: ({}, True))
-    monkeypatch.setattr(snapshots, "deployment_class", lambda _snapshot: ("o/r", "codex", "single"))
 
     assert "may be incomplete" in backend.overview("demo")["warnings"][-1]
 
 
-def test_overview_marks_the_earliest_matching_deployment_class_not_another_class(monkeypatch):
+def _write_active_config(tmp_path, name, runtime, review_mode):
+    config = tmp_path / "config"
+    config.mkdir(exist_ok=True)
+    (config / f".active.{name}.env").write_text(
+        f"FIXER_RUNTIME={runtime}\nREVIEW_MODE={review_mode}\n"
+    )
+
+
+def test_overview_marks_a_runtime_classes_own_first_day_not_another_runtimes(tmp_path, monkeypatch):
     target = snapshots.Snapshot("target", "o/r", "/target", build([]), (NOW,))
-    matching = snapshots.Snapshot("matching", "o/r", "/matching", build([]), (NOW - timedelta(days=2),))
-    unrelated = snapshots.Snapshot("unrelated", "o/r", "/unrelated", build([]), (NOW - timedelta(days=3),))
-    by_name = {"target": target, "matching": matching, "unrelated": unrelated}
+    earlier_runtime = snapshots.Snapshot(
+        "earlier-runtime", "o/r", "/earlier", build([]), (NOW - timedelta(days=2),)
+    )
+    by_name = {"target": target, "earlier-runtime": earlier_runtime}
+    _write_active_config(tmp_path, "target", "codex", "single")
+    _write_active_config(tmp_path, "earlier-runtime", "claude", "single")
+    monkeypatch.setattr(cli, "HARNESS_ROOT", str(tmp_path))
+    monkeypatch.setenv("FIXER_RUNTIME", "ambient-runtime")
+    monkeypatch.setenv("REVIEW_MODE", "ambient-mode")
 
     class Gh:
         def issues(self, _repo):
-            return ([{"createdAt": ts(days=2), "closedAt": None}], "")
+            return ([{"createdAt": ts(), "closedAt": None}], "")
 
     backend = server.Backend(gh=Gh())
     monkeypatch.setattr(backend, "snapshot", by_name.__getitem__)
     monkeypatch.setattr(backend, "names", lambda: tuple(by_name))
     monkeypatch.setattr(snapshots, "scan_proc_daemons", lambda: ({}, True))
-    monkeypatch.setattr(
-        snapshots,
-        "deployment_class",
-        lambda snapshot: ("o/r", "codex", "single") if snapshot.name != "unrelated" else ("o/r", "claude", "single"),
-    )
 
-    assert backend.overview("target")["health_trend"][0]["first_of_class"] is True
+    assert snapshots.deployment_class(target) == ("o/r", "codex", "single")
+    assert snapshots.deployment_class(target) != snapshots.deployment_class(earlier_runtime)
+    assert backend.overview("target")["health_trend"] == [
+        {"day": "2026-07-29", "opened": 1, "closed": 0, "net_open": 1,
+         "recurrences": 0, "first_of_class": True},
+    ]
 
 
 def test_cost_mix_splits_spend_into_the_four_leg_families():
