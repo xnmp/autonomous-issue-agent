@@ -47,9 +47,14 @@ Three findings that are one finding:
    transcript, so when #75's own fixer worked on the budget-test fixtures
    (`_MODERN_USAGE_LINE`), the parser matched the echoed fixture and billed the
    leg **exactly $153.00 — twice, once at 81 seconds**. `budget_exhausted`
-   kills, phantom $306, issue-cap block, `needs-human-review`. Strong
-   suspicion batch 1's infamous "$153 sol leg" (the #29 demo) was the same
-   fixture echo, i.e. **that $153 was never real either**.
+   kills, phantom $306, issue-cap block, `needs-human-review`. CONFIRMED
+   post-batch with the arithmetic: the fixture at
+   `tests/adapters/test_codex_budget_enforcement.py:244` echoes
+   `output=5,100,000`, and 5.1M x sol's $30/MTok = **$153.00 exactly** (its
+   `input=5M/output=100k` sibling prices to the tests' $28.00). Batch 1's
+   "$153 sol leg" (the #29 demo, `tokens_in: 0` in its ledger row) was the
+   same echo — the #29 fixer WROTE these fixtures — i.e. **that $153 was
+   never real either**; all four $153 rows in spend.jsonl are the one bug.
 3. **The unstick that worked**: evidence + fix requirements commented on #75
    (rollout `session_meta` as primary source, footer-anchored fallback only,
    plausibility guard, echo regression test), `CODEX_ENFORCE_BUDGET=0` +
