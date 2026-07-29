@@ -143,7 +143,7 @@ def test_issue_holds_names_the_overlapping_pr():
     open_pr = pr(100, "ai-pr-open", state="OPEN",
                  changed_files=frozenset({"backend/app/services/x.py"}))
     assert issue_holds(world(issues=[iss], prs=[open_pr])) == (
-        Hold(2, HOLD_OVERLAP, "pr#100"),
+        Hold(2, HOLD_OVERLAP, blocker_pr=100),
     )
 
 
@@ -151,7 +151,7 @@ def test_issue_holds_reports_a_dependency_hold_with_no_nameable_blocker():
     # blocked_by_open is a settled boolean, so there is no number to name; the
     # REASON is still the thing the operator needs.
     w = world(issues=[issue(3, "ai-ready", blocked_by_open=True)])
-    assert issue_holds(w) == (Hold(3, HOLD_BLOCKER, ""),)
+    assert issue_holds(w) == (Hold(3, HOLD_BLOCKER),)
 
 
 def test_issue_holds_reports_both_reasons_for_a_doubly_held_issue():
@@ -159,7 +159,7 @@ def test_issue_holds_reports_both_reasons_for_a_doubly_held_issue():
                 declared_paths=frozenset({"a/b.py"}))
     open_pr = pr(7, state="OPEN", changed_files=frozenset({"a/b.py"}))
     assert issue_holds(world(issues=[iss], prs=[open_pr])) == (
-        Hold(4, HOLD_BLOCKER, ""), Hold(4, HOLD_OVERLAP, "pr#7"),
+        Hold(4, HOLD_BLOCKER), Hold(4, HOLD_OVERLAP, blocker_pr=7),
     )
 
 
@@ -204,7 +204,21 @@ def test_holds_do_not_mask_a_pickable_issue():
     open_pr = pr(100, state="OPEN", changed_files=frozenset({"x.py"}))
     w = world(issues=[held, free], prs=[open_pr])
     assert pick_ready_issue(w) == 2
-    assert issue_holds(w) == (Hold(1, HOLD_OVERLAP, "pr#100"),)
+    assert issue_holds(w) == (Hold(1, HOLD_OVERLAP, blocker_pr=100),)
+
+
+def test_dependency_hold_names_the_blocking_issue():
+    w = world(
+        issues=[
+            issue(
+                3,
+                "ai-ready",
+                blocked_by_open=True,
+                open_blocker_numbers=(42,),
+            )
+        ]
+    )
+    assert issue_holds(w) == (Hold(3, HOLD_BLOCKER, blocker_issue=42),)
 
 
 def test_resolve_dispatch_relabels_then_runs():

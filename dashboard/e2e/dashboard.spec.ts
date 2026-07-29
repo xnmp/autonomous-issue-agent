@@ -69,10 +69,14 @@ const issueCard = {
   last_ts: "2026-07-29T08:00:00Z",
   merged_ts: "2026-07-29T08:00:00Z",
   projected_cost_usd: 2,
+  projected_model: "gpt-5.6-terra",
   projected_eta_s: 60,
   rounds: 1,
-  models: ["claude-sonnet-5"],
+  models: ["gpt-5.6-terra"],
+  model_badges: [{ model: "gpt-5.6-terra", effort: "medium" }],
   flags: [],
+  issue_verification: "VERIFIED",
+  pr_verification: "pending",
   steps: [{ kind: "RESOLVE", state: "ok", status: "done", cost_usd: 2 }],
 };
 
@@ -194,14 +198,22 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await page.locator(".rail-past > summary").click();
   await expect(page.getByRole("button", { name: "Start daemons for sleeping" })).toBeVisible();
 
-  const quota = page.locator("details.usage");
-  await expect(quota).not.toHaveAttribute("open", "");
-  await quota.locator("> summary").click();
-  await expect(quota).toHaveAttribute("open", "");
+  const quotaButton = page.getByRole("button", { name: "Quota", exact: true });
+  await expect(quotaButton).toHaveAttribute("aria-expanded", "false");
+  await quotaButton.click();
+  await expect(quotaButton).toHaveAttribute("aria-expanded", "true");
+  await expect(page.getByRole("region", { name: "Quota" })).toBeVisible();
 
   const sidebar = page.locator(".sidebar");
-  await expect(sidebar).toHaveCSS("resize", "horizontal");
   await expect(page.locator(".sidebar-scroll")).toHaveCSS("overflow-y", "auto");
+  await expect(page.getByRole("separator", { name: "Resize sidebar" })).toBeVisible();
+  await page.getByRole("button", { name: "Collapse sidebar" }).click();
+  await expect(sidebar).toHaveClass(/collapsed/);
+  await page.getByRole("button", { name: "Expand sidebar" }).click();
+  await page.screenshot({
+    path: "../evidence/dashboard-issues-table.png",
+    fullPage: true,
+  });
 
   await page.getByRole("row", { name: /Explain completed work.*#50/ }).click();
   await page.getByRole("button", { name: "Open full issue" }).click();
@@ -223,7 +235,7 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   expect(taskDetailBox?.width).toBeGreaterThan(700);
   await expect(taskDetail.getByText("claude-sonnet-5")).toBeVisible();
 
-  await page.getByText("All events for this issue").click();
+  await page.getByRole("tab", { name: /^Events ·/ }).click();
   await expect(page.getByText("by steward")).toBeVisible();
   await expect(page.getByText(/comment issue #50/)).toBeVisible();
 
@@ -263,7 +275,7 @@ test("serves a validated operator workflow through FastAPI and the production bu
   await page.locator(".step-disclosure").click();
   await expect(page.locator(".stepdetail")).toBeVisible();
   expect((await page.locator(".stepdetail").boundingBox())?.width).toBeGreaterThan(700);
-  await page.getByText("All events for this issue").click();
+  await page.getByRole("tab", { name: /^Events ·/ }).click();
   await expect(page.getByText("by steward")).toBeVisible();
   await page.screenshot({
     path: "../evidence/dashboard-issue-tasks.png",

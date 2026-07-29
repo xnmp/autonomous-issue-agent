@@ -18,6 +18,8 @@ from dataclasses import asdict, dataclass
 _STATUS_RE = re.compile(r"\b(MISBEHAVED|VERIFIED|RETIRED|pending)\b", re.IGNORECASE)
 _SEPARATOR_RE = re.compile(r"^\|[\s:|-]+\|$")
 _ID_RE = re.compile(r"#\d+")
+_PR_RE = re.compile(r"\bPR\s+#(\d+)\b", re.IGNORECASE)
+_ISSUE_RE = re.compile(r"(?<!PR )#(\d+)\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -102,3 +104,18 @@ def verification_payload(path: str) -> dict:
     except OSError as exc:
         return {"rows": [], "warnings": [f"field-verification.md unreadable ({exc.strerror or 'error'})"]}
     return {"rows": [asdict(r) for r in parse_verification(text)], "warnings": []}
+
+
+def status_indexes(rows: list[dict]) -> tuple[dict[int, str], dict[int, str]]:
+    """Newest ledger verdict by issue and PR reference."""
+    issues: dict[int, str] = {}
+    prs: dict[int, str] = {}
+    for row in rows:
+        change = str(row.get("change") or "")
+        shipped = str(row.get("shipped") or "")
+        status = str(row.get("status") or "pending")
+        for match in _PR_RE.finditer(f"{change} {shipped}"):
+            prs[int(match.group(1))] = status
+        for match in _ISSUE_RE.finditer(change):
+            issues[int(match.group(1))] = status
+    return issues, prs

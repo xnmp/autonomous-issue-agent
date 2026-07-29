@@ -79,3 +79,12 @@ def test_the_real_ledger_parses_with_verdicts_on_both_sides(tmp_path):
     assert payload["warnings"] == []
     assert {"VERIFIED", "pending"} <= statuses
     assert all(r["change"] for r in payload["rows"])
+
+
+def test_status_indexes_distinguish_issue_and_pr_references():
+    issue_status, pr_status = verification.status_indexes([
+        {"change": "#62 capability ceiling", "shipped": "PR #76", "status": "pending"},
+        {"change": "#62 capability ceiling — verdict", "shipped": None, "status": "VERIFIED"},
+    ])
+    assert issue_status == {62: "VERIFIED"}
+    assert pr_status == {76: "pending"}

@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { IssueTab } from "./IssueTab";
@@ -36,7 +36,8 @@ describe("IssueTab", () => {
     expect(pr).toHaveAttribute("href", "https://github.com/o/r/pull/75");
     expect(screen.queryByText(/issue on GitHub/i)).not.toBeInTheDocument();
     expect(screen.getAllByText("done")).toHaveLength(1);
-    expect(screen.getByText("Tasks", { selector: ".section-title span" })).toBeVisible();
+    expect(screen.getByRole("tab", { name: /Tasks/ })).toBeVisible();
+    expect(screen.getByRole("tab", { name: /Events/ })).toBeVisible();
     expect(screen.queryByText(/one row per leg/i)).not.toBeInTheDocument();
     expect(screen.getByText("no tasks recorded for this issue yet")).toBeVisible();
   });
@@ -94,14 +95,20 @@ describe("IssueTab", () => {
     await userEvent.click(disclosure);
     expect(disclosure).toHaveAttribute("aria-expanded", "true");
 
-    const detail = screen.getByText("Events", { selector: "button" }).closest("td");
-    expect(detail).toHaveAttribute("colspan", "8");
+    const stepDetail = document.querySelector(".stepdetail");
+    expect(stepDetail).toBeInstanceOf(HTMLElement);
+    const detailEventsTab = within(stepDetail as HTMLElement).getByRole("tab", { name: "Events" });
+    const detail = detailEventsTab.closest("td");
+    expect(detail).toHaveAttribute("colspan", "6");
     expect(detail).not.toHaveClass("step-operation");
+    expect(screen.queryByRole("columnheader", { name: /Role/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("columnheader", { name: /Model/ })).not.toBeInTheDocument();
 
-    const eventsTab = screen.getByRole("tab", { name: "Events" });
-    eventsTab.focus();
+    detailEventsTab?.focus();
     await userEvent.keyboard("{ArrowRight}");
     expect(screen.getByRole("tab", { name: "Cost chart" })).toHaveFocus();
-    expect(screen.getByRole("tabpanel")).toHaveAccessibleName("Cost chart");
+    expect(within(stepDetail as HTMLElement).getByRole("tabpanel")).toHaveAccessibleName(
+      "Cost chart",
+    );
   });
 });

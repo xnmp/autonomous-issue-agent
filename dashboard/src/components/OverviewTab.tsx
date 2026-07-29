@@ -12,6 +12,7 @@ import { ago, localTime, num, rate, usd, usdCompact } from "../lib/format";
 import { Chip } from "./ui/Chip";
 import { Meter, StackedBar, StatTile } from "./ui/Charts";
 import { EmptyState, ErrorBanner, Loading, SectionTitle, SkeletonRows, WarningList } from "./ui/Feedback";
+import { ResizableTable } from "./ui/ResizableTable";
 
 const POLL_MS = 10_000;
 
@@ -72,6 +73,7 @@ export function OverviewTab({
         <StatTile
           label="Done"
           value={num(m?.done_issues)}
+          sub={ov.data?.first_observed_day ? `since ${ov.data.first_observed_day}` : "deployment start unknown"}
           tone="ok"
           title="open done issues"
           onClick={() => onOpenIssues("done")}
@@ -199,15 +201,12 @@ export function OverviewTab({
           <EmptyState>no tasks recorded yet</EmptyState>
         ) : (
           <div className="tbl-wrap panel">
-            <table className="tbl">
-              <thead>
-                <tr>
-                  <th>Kind</th>
-                  <th className="r">Tasks</th>
-                  <th className="r">USD</th>
-                  <th className="r">$/task</th>
-                </tr>
-              </thead>
+            <ResizableTable storageKey="overview-spend" columns={[
+              { key: "kind", label: "Kind", width: 220 },
+              { key: "tasks", label: "Tasks", className: "r", width: 90 },
+              { key: "usd", label: "USD", className: "r", width: 100 },
+              { key: "per-task", label: "$/task", className: "r", width: 100 },
+            ]}>
               <tbody>
                 {(m?.by_kind ?? []).map((k) => (
                   <tr key={k.kind}>
@@ -218,7 +217,7 @@ export function OverviewTab({
                   </tr>
                 ))}
               </tbody>
-            </table>
+            </ResizableTable>
           </div>
         )}
       </div>
@@ -237,8 +236,13 @@ function HealthTrend({ rows, loading }: { rows: HealthTrendDay[]; loading: boole
           <EmptyState>no issue activity or recurrences recorded yet</EmptyState>
         ) : (
           <div className="tbl-wrap">
-            <table className="tbl">
-              <thead><tr><th>Local day</th><th className="r">Opened</th><th className="r">Closed</th><th className="r">Net</th><th className="r">Recurrences</th></tr></thead>
+            <ResizableTable storageKey="overview-health-trend" columns={[
+              { key: "day", label: "Local day", width: 160 },
+              { key: "opened", label: "Opened", className: "r", width: 90 },
+              { key: "closed", label: "Closed", className: "r", width: 90 },
+              { key: "net", label: "Net", className: "r", width: 90 },
+              { key: "recurrences", label: "Recurrences", className: "r", width: 120 },
+            ]}>
               <tbody>{rows.map((row) => (
                 <tr key={row.day}>
                   <td className="mono">{row.day}</td>
@@ -247,7 +251,7 @@ function HealthTrend({ rows, loading }: { rows: HealthTrendDay[]; loading: boole
                   <td className={`r num${row.recurrences > 0 ? " tone-fail" : ""}`}>{num(row.recurrences)}</td>
                 </tr>
               ))}</tbody>
-            </table>
+            </ResizableTable>
           </div>
         )}
       </div>
@@ -305,14 +309,11 @@ function UnattributedList({ events, loading }: { events: JournalEvent[]; loading
   if (loading) return <Loading what="events" />;
   if (events.length === 0) return <EmptyState>no deployment-level events</EmptyState>;
   return (
-    <table className="tbl">
-      <thead>
-        <tr>
-          <th style={{ width: 150 }}>When</th>
-          <th style={{ width: 90 }}>Role</th>
-          <th>Event</th>
-        </tr>
-      </thead>
+    <ResizableTable storageKey="overview-unattributed" columns={[
+      { key: "when", label: "When", width: 160 },
+      { key: "role", label: "Role", width: 100 },
+      { key: "event", label: "Event", width: 500 },
+    ]}>
       <tbody>
         {events.map((e, i) => (
           <tr key={i}>
@@ -331,6 +332,6 @@ function UnattributedList({ events, loading }: { events: JournalEvent[]; loading
           </tr>
         ))}
       </tbody>
-    </table>
+    </ResizableTable>
   );
 }

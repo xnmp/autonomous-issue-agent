@@ -1,4 +1,12 @@
-import { Fragment, lazy, Suspense, useMemo, useState, type KeyboardEvent } from "react";
+import {
+  Fragment,
+  lazy,
+  Suspense,
+  useMemo,
+  useState,
+  type KeyboardEvent,
+  type MouseEvent,
+} from "react";
 import { api } from "../api/client";
 import { useClock, type Polled } from "../api/hooks";
 import type {
@@ -10,13 +18,14 @@ import type {
   Priority,
 } from "../api/types";
 import { ISSUES_SUBS, ISSUES_SUB_LABELS, type IssuesSub } from "../routing/hash";
-import { familyVar, flagTone, prStateTone, stateTone } from "../lib/semantics";
-import { ago, duration, durationShort, localTime, num, usd } from "../lib/format";
+import { familyVar, flagTone, modelTone, prStateTone, stateTone, verificationTone } from "../lib/semantics";
+import { ageCompact, ago, duration, durationShort, localTime, num, usd } from "../lib/format";
 import { shortModel } from "../lib/models";
 import { Chip } from "./ui/Chip";
 import { EtaProgress } from "./ui/Charts";
 import { StepBadgeRow } from "./ui/StepBadge";
 import { ColumnMenu, type ColumnChoice } from "./ui/ColumnMenu";
+import { ResizableTable, type TableColumn } from "./ui/ResizableTable";
 import { ConfirmModal } from "./ui/Modal";
 import {
   EmptyState,
@@ -36,6 +45,7 @@ interface IssuesTabProps {
   issues: Polled<IssuesPayload>;
   onSetSub: (sub: IssuesSub) => void;
   onOpenIssue: (issue: number) => void;
+  showProjectedCost?: boolean;
 }
 
 type Visibility = Record<IssuesSub, Record<string, boolean>>;
@@ -48,10 +58,9 @@ const COLUMN_CHOICES: Record<IssuesSub, ColumnChoice[]> = {
     { key: "elapsed", label: "Elapsed" },
     { key: "progress", label: "Progress" },
     { key: "model", label: "Model" },
-    { key: "flags", label: "Flags" },
     { key: "pending-priority", label: "Pending priority" },
     { key: "pending-overlap", label: "Pending overlap" },
-    { key: "pending-hold", label: "Pending hold" },
+    { key: "pending-hold", label: "Pending state" },
     { key: "pending-labels", label: "Pending labels" },
   ],
   done: [
@@ -101,8 +110,10 @@ export function IssuesTab({
   issues,
   onSetSub,
   onOpenIssue,
+  showProjectedCost = true,
 }: IssuesTabProps) {
   const [visibility, setVisibility] = useState<Visibility>(storedVisibility);
+  const [columnMenuAt, setColumnMenuAt] = useState<{ x: number; y: number } | null>(null);
   const data = issues.data;
   const ghOk = data?.gh_ok ?? true;
   const visible = useMemo(
@@ -120,9 +131,17 @@ export function IssuesTab({
       return next;
     });
   };
+  const openColumnMenu = (event: MouseEvent<HTMLDivElement>) => {
+    if (!(event.target instanceof Element) || !event.target.closest("th")) return;
+    event.preventDefault();
+    setColumnMenuAt({
+      x: Math.min(event.clientX, window.innerWidth - 220),
+      y: Math.min(event.clientY, window.innerHeight - 320),
+    });
+  };
 
   return (
-    <div className="tabbody">
+    <div className="tabbody" onContextMenu={openColumnMenu}>
       <div className="row">
         <SubTabs
           value={sub}
@@ -137,12 +156,15 @@ export function IssuesTab({
         />
         <span className="spacer" />
         {!ghOk ? <GhUnavailableChip /> : null}
-        <ColumnMenu
-          columns={COLUMN_CHOICES[sub]}
-          visible={visible}
-          onChange={setColumn}
-        />
+        <span className="faint table-hint">Right-click a header to choose columns</span>
       </div>
+      <ColumnMenu
+        columns={COLUMN_CHOICES[sub]}
+        visible={visible}
+        onChange={setColumn}
+        position={columnMenuAt}
+        onClose={() => setColumnMenuAt(null)}
+      />
 
       {issues.error ? (
         <ErrorBanner message={issues.error} onRetry={issues.refresh} stale={!!data} />
@@ -158,6 +180,7 @@ export function IssuesTab({
             loading={issues.loading}
             visible={visible}
             onOpen={onOpenIssue}
+            showProjectedCost={showProjectedCost}
           />
           <SectionTitle>Pending</SectionTitle>
           <PendingTable
@@ -200,37 +223,32 @@ function InFlightTable({
   loading,
   visible,
   onOpen,
+  showProjectedCost,
 }: {
   cards: IssueCard[];
   anchorMs: number | null;
   loading: boolean;
   visible: ReadonlySet<string>;
   onOpen: (issue: number) => void;
+  showProjectedCost: boolean;
 }) {
   const [expanded, setExpanded] = useState<number | null>(null);
   const now = useClock();
   if (loading) return <SkeletonRows what="in-flight issues" rows={5} />;
   if (cards.length === 0) return <EmptyState>no issues in flight — the fixer is idle</EmptyState>;
   const offset = anchorMs === null ? 0 : Math.max(0, (now - anchorMs) / 1000);
-  const colSpan =
-    1
-    + ["tasks", "cost", "elapsed", "progress", "model", "flags"]
-      .filter((key) => visible.has(key)).length;
+  const columns: TableColumn[] = [
+    { key: "issue", label: "Issue / PR", width: 340 },
+    ...(visible.has("tasks") ? [{ key: "tasks", label: "Tasks", width: 240 }] : []),
+    ...(visible.has("cost") ? [{ key: "cost", label: "Cost", className: "r", width: 150 }] : []),
+    ...(visible.has("elapsed") ? [{ key: "elapsed", label: "Elapsed", className: "r", width: 120 }] : []),
+    ...(visible.has("progress") ? [{ key: "progress", label: "Progress", width: 160 }] : []),
+    ...(visible.has("model") ? [{ key: "model", label: "Model", width: 180 }] : []),
+  ];
 
   return (
     <div className="tbl-wrap panel">
-      <table className="tbl wide issue-list-table">
-        <thead>
-          <tr>
-            <th>Issue / PR</th>
-            {visible.has("tasks") ? <th>Tasks</th> : null}
-            {visible.has("cost") ? <th className="r">Cost</th> : null}
-            {visible.has("elapsed") ? <th className="r">Elapsed</th> : null}
-            {visible.has("progress") ? <th>Progress</th> : null}
-            {visible.has("model") ? <th>Model</th> : null}
-            {visible.has("flags") ? <th>Flags</th> : null}
-          </tr>
-        </thead>
+      <ResizableTable storageKey="issues-inflight" columns={columns} className="wide issue-list-table">
         <tbody>
           {cards.map((card) => {
             const elapsed = card.elapsed_s === null ? null : card.elapsed_s + offset;
@@ -251,8 +269,13 @@ function InFlightTable({
                     <td className="r mono nowrap">
                       {usd(card.cost_usd)}
                       {card.estimated ? <span className="faint" title="synthetic dollars (subscription runtime)"> ~</span> : null}
-                      {card.projected_cost_usd !== null ? (
-                        <span className="faint" title="repo mean $/done issue"> / {usd(card.projected_cost_usd)}</span>
+                      {showProjectedCost && card.projected_cost_usd !== null ? (
+                        <span
+                          className="faint"
+                          title={`mean completed issue cost for ${card.projected_model ?? "this model"}`}
+                        >
+                          {" "}/ {usd(card.projected_cost_usd)}
+                        </span>
                       ) : null}
                     </td>
                   ) : null}
@@ -276,17 +299,16 @@ function InFlightTable({
                       ) : <span className="faint">no projection</span>}
                     </td>
                   ) : null}
-                  {visible.has("model") ? <td><ModelList models={card.models} /></td> : null}
-                  {visible.has("flags") ? <td><FlagList flags={card.flags} /></td> : null}
+                  {visible.has("model") ? <td><ModelList models={card.model_badges ?? card.models.map((model) => ({ model, effort: null }))} /></td> : null}
                 </tr>
                 {open ? (
-                  <TaskDetailRow card={card} colSpan={colSpan} onOpen={() => onOpen(card.issue)} />
+                  <TaskDetailRow card={card} colSpan={columns.length} onOpen={() => onOpen(card.issue)} />
                 ) : null}
               </Fragment>
             );
           })}
         </tbody>
-      </table>
+      </ResizableTable>
     </div>
   );
 }
@@ -325,24 +347,22 @@ function PendingTable({
       setBusyIssue(null);
     }
   };
+  const columns: TableColumn[] = [
+    { key: "issue", label: "Issue", width: 360 },
+    ...(visible.has("pending-priority") ? [{ key: "priority", label: "Priority", width: 220 }] : []),
+    ...(visible.has("pending-overlap") ? [{ key: "overlap", label: "Overlap", width: 110 }] : []),
+    ...(visible.has("pending-hold") ? [{ key: "state", label: "State", width: 220 }] : []),
+    ...(visible.has("pending-labels") ? [{ key: "labels", label: "Labels", width: 260 }] : []),
+  ];
 
   return (
     <>
       {error ? <ErrorBanner message={error} /> : null}
       <div className="tbl-wrap panel">
-        <table className="tbl">
-          <thead>
-            <tr>
-              <th>Issue</th>
-              {visible.has("pending-priority") ? <th>Priority</th> : null}
-              {visible.has("pending-overlap") ? <th>Overlap</th> : null}
-              {visible.has("pending-hold") ? <th>Hold</th> : null}
-              {visible.has("pending-labels") ? <th>Labels</th> : null}
-            </tr>
-          </thead>
+        <ResizableTable storageKey="issues-pending" columns={columns}>
           <tbody>
             {cards.map((card) => (
-              <tr key={card.issue} className={card.held ? "row-alert" : undefined}>
+              <tr key={card.issue}>
                 <td><CompactIssue issue={card.issue} title={card.title} url={card.url} /></td>
                 {visible.has("pending-priority") ? <td>
                   <PrioritySelector
@@ -356,16 +376,16 @@ function PendingTable({
                 ) : null}
                 {visible.has("pending-hold") ? <td>
                   {card.held ? (
-                    <Chip tone="fail" title={card.hold_reason ?? "held"}>
-                      held{card.hold_reason ? `: ${card.hold_reason}` : ""}
+                    <Chip tone="info" title={card.hold_reason ?? "pending"}>
+                      {card.hold_reason ?? "pending"}
                     </Chip>
-                  ) : <span className="faint">—</span>}
+                  ) : <Chip tone="info">pending</Chip>}
                 </td> : null}
                 {visible.has("pending-labels") ? <td><LabelList labels={card.labels} /></td> : null}
               </tr>
             ))}
           </tbody>
-        </table>
+        </ResizableTable>
       </div>
     </>
   );
@@ -420,21 +440,18 @@ function DoneTable({
   const [expanded, setExpanded] = useState<number | null>(null);
   if (loading) return <SkeletonRows what="done issues" rows={5} />;
   if (cards.length === 0) return <EmptyState>nothing merged by the harness in this deployment yet</EmptyState>;
-  const colSpan = 1 + visible.size;
+  const columns: TableColumn[] = [
+    { key: "issue", label: "Issue / PR", width: 380 },
+    ...(visible.has("cost") ? [{ key: "cost", label: "Cost", className: "r", width: 100 }] : []),
+    ...(visible.has("duration") ? [{ key: "duration", label: "Duration", className: "r", width: 110 }] : []),
+    ...(visible.has("model") ? [{ key: "model", label: "Model", width: 190 }] : []),
+    ...(visible.has("rounds") ? [{ key: "rounds", label: "Rounds", className: "r", width: 90 }] : []),
+    ...(visible.has("merged") ? [{ key: "merged", label: "Merged", width: 120 }] : []),
+  ];
 
   return (
     <div className="tbl-wrap panel">
-      <table className="tbl issue-list-table">
-        <thead>
-          <tr>
-            <th>Issue / PR</th>
-            {visible.has("cost") ? <th className="r">Cost</th> : null}
-            {visible.has("duration") ? <th className="r">Duration</th> : null}
-            {visible.has("model") ? <th>Model</th> : null}
-            {visible.has("rounds") ? <th className="r">Rounds</th> : null}
-            {visible.has("merged") ? <th>Merged</th> : null}
-          </tr>
-        </thead>
+      <ResizableTable storageKey="issues-done" columns={columns} className="issue-list-table">
         <tbody>
           {cards.map((card) => {
             const open = expanded === card.issue;
@@ -455,7 +472,7 @@ function DoneTable({
                     </td>
                   ) : null}
                   {visible.has("duration") ? <td className="r mono">{durationShort(card.elapsed_s)}</td> : null}
-                  {visible.has("model") ? <td><ModelList models={card.models} /></td> : null}
+                  {visible.has("model") ? <td><ModelList models={card.model_badges ?? card.models.map((model) => ({ model, effort: null }))} /></td> : null}
                   {visible.has("rounds") ? <td className="r num">{num(card.rounds)}</td> : null}
                   {visible.has("merged") ? (
                     <td className="mono faint" title={card.merged_ts ?? card.last_ts ?? ""}>
@@ -464,13 +481,13 @@ function DoneTable({
                   ) : null}
                 </tr>
                 {open ? (
-                  <TaskDetailRow card={card} colSpan={colSpan} onOpen={() => onOpen(card.issue)} />
+                  <TaskDetailRow card={card} colSpan={columns.length} onOpen={() => onOpen(card.issue)} />
                 ) : null}
               </Fragment>
             );
           })}
         </tbody>
-      </table>
+      </ResizableTable>
     </div>
   );
 }
@@ -498,7 +515,13 @@ function BacklogTable({
   if (cards.length === 0) {
     return <EmptyState>{ghOk ? "no unlabelled open issues — the backlog is clear" : "backlog needs GitHub data, which is unavailable"}</EmptyState>;
   }
-  const colSpan = 1 + visible.size;
+  const columns: TableColumn[] = [
+    { key: "issue", label: "Issue", width: 420 },
+    ...(visible.has("recurrence") ? [{ key: "recurrence", label: "Recurrence", width: 150 }] : []),
+    ...(visible.has("age") ? [{ key: "age", label: "Age", className: "r", width: 90 }] : []),
+    ...(visible.has("comments") ? [{ key: "comments", label: "# comments", className: "r", width: 110 }] : []),
+    ...(visible.has("labels") ? [{ key: "labels", label: "Labels", width: 260 }] : []),
+  ];
 
   const doPromote = async () => {
     if (!promote) return;
@@ -518,16 +541,7 @@ function BacklogTable({
   return (
     <>
       <div className="tbl-wrap panel">
-        <table className="tbl issue-list-table">
-          <thead>
-            <tr>
-              <th>Issue</th>
-              {visible.has("recurrence") ? <th>Recurrence</th> : null}
-              {visible.has("age") ? <th className="r">Age</th> : null}
-              {visible.has("comments") ? <th className="r"># comments</th> : null}
-              {visible.has("labels") ? <th>Labels</th> : null}
-            </tr>
-          </thead>
+        <ResizableTable storageKey="issues-backlog" columns={columns} className="issue-list-table">
           <tbody>
             {cards.map((card) => {
               const open = expanded === card.issue;
@@ -577,13 +591,13 @@ function BacklogTable({
                         ) : <span className="faint">—</span>}
                       </td>
                     ) : null}
-                    {visible.has("age") ? <td className="r num">{card.age_days !== null ? `${card.age_days}d` : "—"}</td> : null}
+                    {visible.has("age") ? <td className="r num">{ageCompact(card.age_s ?? (card.age_days === null ? null : card.age_days * 86400))}</td> : null}
                     {visible.has("comments") ? <td className="r num">{num(card.comments)}</td> : null}
                     {visible.has("labels") ? <td><LabelList labels={card.labels} /></td> : null}
                   </tr>
                   {open ? (
                     <tr className="detail-row">
-                      <td colSpan={colSpan}>
+                      <td colSpan={columns.length}>
                         <div className="row-detail">
                           <div className="row-detail-hd">
                             <strong>Issue context</strong>
@@ -598,7 +612,7 @@ function BacklogTable({
               );
             })}
           </tbody>
-        </table>
+        </ResizableTable>
       </div>
 
       {promote ? (
@@ -674,7 +688,10 @@ function IssueSummary({ card, open }: { card: IssueCard; open: boolean }) {
         </span>
         <div className="row-wrap">
           <IssueNumber issue={card.issue} url={card.url} />
+          <VerificationBadge status={card.issue_verification} />
           <PrLink card={card} />
+          <VerificationBadge status={card.pr_verification} />
+          {card.flags.length > 0 ? <FlagList flags={card.flags} /> : null}
         </div>
       </div>
     </div>
@@ -729,14 +746,30 @@ function PrLink({ card }: { card: IssueCard }) {
   );
 }
 
-function ModelList({ models }: { models: string[] }) {
+function ModelList({ models }: { models: NonNullable<IssueCard["model_badges"]> }) {
   if (models.length === 0) return <span className="faint">—</span>;
   return (
     <span className="model-list">
-      {models.map((model) => (
-        <Chip key={model} tone="link" square title={model}>{shortModel(model)}</Chip>
+      {models.map(({ model, effort }) => (
+        <Chip
+          key={`${model}-${effort ?? ""}`}
+          tone={modelTone(model, effort)}
+          square
+          title={`${model}${effort ? ` · ${effort} effort` : ""}`}
+        >
+          {shortModel(model)}
+        </Chip>
       ))}
     </span>
+  );
+}
+
+function VerificationBadge({ status }: { status: string | null | undefined }) {
+  if (!status) return null;
+  return (
+    <Chip tone={verificationTone(status)} title={`field verification: ${status}`}>
+      {status.toLowerCase()}
+    </Chip>
   );
 }
 

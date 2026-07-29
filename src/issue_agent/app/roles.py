@@ -28,7 +28,6 @@ from ..adapters.journal import (
     ci_flake_keys,
     ci_pending_keys,
     duplicate_pr_keys,
-    hold_keys,
     read_events_tail,
     recurrence_keys,
     unsettled_starts,
@@ -353,7 +352,7 @@ def _fix_state(store: Store, world) -> FixState:
 
 
 def _hold_reporter(journal: Journal | None, repo: str, log):
-    """Build the per-poll reporter that makes a DELIBERATE hold visible.
+    """Report defer begin/clear transitions without steady-state tick noise.
 
     `pick_ready_issue` skips an ai-ready issue whose files overlap an in-flight
     PR, or that has an open GitHub dependency — silently, which is
@@ -361,36 +360,82 @@ def _hold_reporter(journal: Journal | None, repo: str, log):
     #522 cost ~30 minutes of live investigation before anyone could tell which
     it was).
 
-    Same two-channel shape as `AgentDispatcher._spend_block`, for the same
-    reasons: the LOG line fires every poll (local, free, and "why is this issue
-    not moving?" must be answerable from any single poll's log), while the
-    JOURNAL line fires once per (issue, reason, blocker) — a hold is a level,
-    not an event, so an un-deduped emit is one line every 20s for as long as
-    the blocking PR is open. The identity travels IN the event as `block_key`,
-    so the dedup survives the process restarts a hot reload produces; the
-    in-process set is the cache that keeps the steady state free of file reads.
+    The journal is the restart-safe edge memory. A fresh daemon reconstructs
+    active deferrals before comparing the current world, so it neither repeats
+    a begin nor loses the eventual clear.
     """
-    seen: set[str] = set()
+    active: dict[tuple[int, str, int | None, int | None], dict] | None = None
+
+    def key_for(hold) -> tuple[int, str, int | None, int | None]:
+        return (hold.issue, hold.reason, hold.blocker_pr, hold.blocker_issue)
+
+    def fields_for(key):
+        issue, reason, blocker_pr, blocker_issue = key
+        return {
+            "issue": issue,
+            "reason": reason,
+            "blocker_pr": blocker_pr,
+            "blocker_issue": blocker_issue,
+        }
+
+    def waiting_label(key) -> str:
+        issue, _reason, blocker_pr, blocker_issue = key
+        if blocker_pr is not None:
+            return f"issue #{issue} waiting on PR #{blocker_pr}"
+        if blocker_issue is not None:
+            return f"issue #{issue} waiting on #{blocker_issue}"
+        return f"issue #{issue} waiting on an open dependency"
+
+    def event_key(event) -> tuple[int, str, int | None, int | None] | None:
+        try:
+            issue = int(event.get("issue") or 0)
+        except (TypeError, ValueError):
+            return None
+        if issue <= 0:
+            return None
+        blocker_pr = event.get("blocker_pr")
+        blocker_issue = event.get("blocker_issue")
+        legacy_blocker = str(event.get("blocker") or "")
+        if blocker_pr is None and legacy_blocker.lower().startswith("pr#"):
+            try:
+                blocker_pr = int(legacy_blocker[3:])
+            except ValueError:
+                blocker_pr = None
+        return (issue, str(event.get("reason") or ""), blocker_pr, blocker_issue)
 
     def report(world) -> None:
-        for hold in issue_holds(world):
-            waiting_on = f" ({hold.blocker})" if hold.blocker else ""
+        nonlocal active
+        if active is None:
+            active = {}
+            if journal is not None:
+                for event in read_events_tail(journal.path):
+                    if event.get("event") not in {"deferred", "hold"}:
+                        continue
+                    key = event_key(event)
+                    if key is None:
+                        continue
+                    if event.get("state") == "cleared":
+                        active.pop(key, None)
+                    elif event.get("state") == "waiting" or event.get("event") == "hold":
+                        active[key] = event
+
+        current = {key_for(hold): hold for hold in issue_holds(world)}
+        for key in current.keys() - active.keys():
+            message = waiting_label(key)
+            log(f"DEFERRED: {message}; dispatches once that clears")
+            if journal is not None:
+                journal.emit("deferred", state="waiting", **fields_for(key))
+            active[key] = fields_for(key)
+
+        for key in active.keys() - current.keys():
+            message = waiting_label(key)
             log(
-                f"HOLD: issue #{hold.issue} is ai-ready but held — "
-                f"{hold.reason}{waiting_on}; it dispatches once that clears"
+                f"{message.replace(' waiting on ', ' no longer waiting on ')}; "
+                "eligible for dispatch"
             )
-            key = f"hold:{repo}:{hold.issue}:{hold.reason}:{hold.blocker}"
-            if key in seen:
-                continue
-            seen.add(key)
-            if journal is None:
-                continue
-            if key in hold_keys(read_events_tail(journal.path)):
-                continue
-            journal.emit(
-                "hold", issue=hold.issue, reason=hold.reason,
-                blocker=hold.blocker, block_key=key,
-            )
+            if journal is not None:
+                journal.emit("deferred", state="cleared", **fields_for(key))
+            active.pop(key, None)
 
     return report
 

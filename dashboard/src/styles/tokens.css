@@ -59,6 +59,10 @@
   --meta-br: var(--c-magenta-br);
   --link: var(--c-cyan);
   --link-br: var(--c-cyan-br);
+  --tier-luna: var(--c-yellow);
+  --tier-terra: #ffb56b;
+  --tier-sol: #f08a3c;
+  --tier-high: var(--c-red-br);
 
   /* ---- categorical series (cost mix) ----
    * Slot order is FIXED and never cycled. Validated with the dataviz palette

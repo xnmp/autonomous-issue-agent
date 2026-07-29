@@ -225,6 +225,8 @@ export interface components {
         BacklogCard: {
             /** Age Days */
             age_days: number | null;
+            /** Age S */
+            age_s?: number | null;
             /** Body */
             body: string | null;
             /** Comments */
@@ -377,10 +379,17 @@ export interface components {
             flags: string[];
             /** Issue */
             issue: number;
+            /** Issue Verification */
+            issue_verification?: string | null;
             /** Last Ts */
             last_ts: string | null;
             /** Merged Ts */
             merged_ts?: string | null;
+            /**
+             * Model Badges
+             * @default []
+             */
+            model_badges: components["schemas"]["ModelBadge"][];
             /** Models */
             models: string[];
             /** Pr */
@@ -389,10 +398,14 @@ export interface components {
             pr_state: string | null;
             /** Pr Url */
             pr_url: string | null;
+            /** Pr Verification */
+            pr_verification?: string | null;
             /** Projected Cost Usd */
             projected_cost_usd: number | null;
             /** Projected Eta S */
             projected_eta_s: number | null;
+            /** Projected Model */
+            projected_model?: string | null;
             /** Rounds */
             rounds: number | null;
             /** Stage */
@@ -445,6 +458,8 @@ export interface components {
             cost_usd: number | null;
             /** Duration S */
             duration_s: number | null;
+            /** Effort */
+            effort?: string | null;
             /** Estimated */
             estimated: boolean;
             /** Exit Reason */
@@ -532,10 +547,21 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** ModelBadge */
+        ModelBadge: {
+            /** Effort */
+            effort: string | null;
+            /** Model */
+            model: string;
+        } & {
+            [key: string]: unknown;
+        };
         /** OverviewPayload */
         OverviewPayload: {
             caps: components["schemas"]["Caps"] | null;
             cost_mix: components["schemas"]["CostMix"] | null;
+            /** First Observed Day */
+            first_observed_day?: string | null;
             /** Health */
             health: components["schemas"]["RoleHealth"][];
             /** Health Trend */

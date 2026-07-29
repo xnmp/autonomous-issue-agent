@@ -161,6 +161,7 @@ def detailed_steps(row: dash.IssueRow) -> list[dict]:
             "cost_usd": leg.cost_usd,
             "estimated": leg.estimated,
             "model": _model_for_leg(row, leg),
+            "effort": _settled_event(row, leg).get("effort"),
             "session_id": leg.session_id or None,
             "turns": _turns(row, leg),
             "usage": _usage(row, leg),
@@ -181,6 +182,16 @@ def detailed_steps(row: dash.IssueRow) -> list[dict]:
             "cost_usd": 0.0,
             "estimated": False,
             "model": r.model or None,
+            "effort": next(
+                (
+                    event.get("effort")
+                    for event in reversed(row.events)
+                    if event.get("event") == "agent_run_start"
+                    and event.get("kind") == r.kind
+                    and event.get("number") == r.number
+                ),
+                None,
+            ),
             "session_id": None,
             "turns": None,
             "usage": None,
@@ -253,9 +264,53 @@ def _started(row: dash.IssueRow) -> datetime | None:
     return min(stamps) if stamps else None
 
 
-def _hold_event(row: dash.IssueRow) -> dict:
-    holds = [e for e in row.events if e.get("event") == "hold"]
-    return holds[-1] if holds else {}
+def _dispatch_supersedes_legacy_hold(event: dict) -> bool:
+    if event.get("event") == "agent_run_start":
+        return str(event.get("kind") or "").upper() in {"ROUTE", "RESOLVE", "RESUME"}
+    return (
+        event.get("event") == "action"
+        and str(event.get("desc") or "").lower().startswith("dispatch ")
+    )
+
+
+def _deferred_event(row: dash.IssueRow) -> dict:
+    """The newest active structured defer, with a historical-journal fallback."""
+    active: dict[tuple, dict] = {}
+    legacy: dict = {}
+    for event in row.events:
+        if event.get("event") == "deferred":
+            # Transition-aware state supersedes any level-only record emitted
+            # by an older daemon, including after the matching clear.
+            legacy = {}
+            key = (
+                event.get("issue"),
+                event.get("reason"),
+                event.get("blocker_pr"),
+                event.get("blocker_issue"),
+            )
+            if event.get("state") == "cleared":
+                active.pop(key, None)
+            elif event.get("state") == "waiting":
+                active[key] = event
+        elif event.get("event") == "hold":
+            legacy = event
+        elif legacy and _dispatch_supersedes_legacy_hold(event):
+            legacy = {}
+    return list(active.values())[-1] if active else legacy
+
+
+def waiting_label(event: dict) -> str | None:
+    if not event:
+        return None
+    if event.get("blocker_pr") is not None:
+        return f"waiting on PR #{event['blocker_pr']}"
+    if event.get("blocker_issue") is not None:
+        return f"waiting on #{event['blocker_issue']}"
+    if event.get("event") == "hold":
+        blocker = str(event.get("blocker") or "")
+        if blocker.lower().startswith("pr#"):
+            return f"waiting on PR #{blocker[3:]}"
+    return "waiting on dependency"
 
 
 def _flags(row: dash.IssueRow) -> list[str]:
@@ -266,9 +321,53 @@ def _flags(row: dash.IssueRow) -> list[str]:
         flags.append("recurred")
     if row.spend_blocks:
         flags.append("spend-blocked")
-    if _hold_event(row):
-        flags.append("held")
+    if _deferred_event(row):
+        flags.append("waiting")
     return flags
+
+
+def _model_effort(row: dash.IssueRow, model: str) -> str | None:
+    matches = [
+        event
+        for event in row.events
+        if event.get("model") == model and event.get("effort")
+    ]
+    return str(matches[-1]["effort"]) if matches else None
+
+
+def model_badges(row: dash.IssueRow) -> list[dict]:
+    return [
+        {"model": model, "effort": _model_effort(row, model)}
+        for model in row.models
+    ]
+
+
+def projection_model(row: dash.IssueRow) -> str | None:
+    """The resolve model whose historical peers best predict total issue cost."""
+    resolve = [
+        _model_for_leg(row, leg)
+        for leg in row.legs
+        if leg.kind in {"RESOLVE", "RESUME"}
+    ]
+    running = [
+        leg.model for leg in row.running
+        if leg.kind in {"RESOLVE", "RESUME"} and leg.model
+    ]
+    candidates = [model for model in (*resolve, *running) if model]
+    return candidates[-1] if candidates else (row.models[-1] if row.models else None)
+
+
+def projected_cost_by_model(rows) -> dict[str, float]:
+    """Mean completed issue cost grouped by the model that resolved it."""
+    costs: dict[str, list[float]] = {}
+    for row in rows:
+        if not row.done or not (model := projection_model(row)):
+            continue
+        costs.setdefault(model, []).append(row.cost_usd)
+    return {
+        model: round(sum(values) / len(values), 4)
+        for model, values in costs.items()
+    }
 
 
 def mean_wall_clock_s(rows) -> float | None:
@@ -292,6 +391,9 @@ def issue_card(
     gh_prs: dict | None = None,
     projected_cost_usd: float | None = None,
     projected_eta_s: float | None = None,
+    projected_model: str | None = None,
+    issue_verification: str | None = None,
+    pr_verification: str | None = None,
 ) -> dict:
     started = _started(row)
     pr = row.prs[-1] if row.prs else None
@@ -312,13 +414,17 @@ def issue_card(
         "cost_usd": row.cost_usd,
         "estimated": any(leg.estimated for leg in row.legs),
         "projected_cost_usd": projected_cost_usd,
+        "projected_model": projected_model,
         "started_ts": iso(started),
         "last_ts": iso(row.last_ts),
         "elapsed_s": round((end - started).total_seconds()) if started else None,
         "projected_eta_s": projected_eta_s,
         "models": list(row.models),
+        "model_badges": model_badges(row),
         "rounds": row.rounds,
         "flags": _flags(row),
+        "issue_verification": issue_verification,
+        "pr_verification": pr_verification,
     }
     if row.done and gh_pr and gh_pr.get("mergedAt"):
         card["merged_ts"] = gh_pr["mergedAt"]
@@ -336,15 +442,15 @@ def _pr_state(gh_pr: dict | None) -> str | None:
 
 def pending_card(issue: dict, row: dash.IssueRow | None) -> dict:
     labels = labels_of(issue)
-    hold = _hold_event(row) if row else {}
+    defer = _deferred_event(row) if row else {}
     return {
         "issue": int(issue.get("number") or 0),
         "title": issue.get("title"),
         "url": issue.get("url"),
         "priority": priority_of(labels),
         "labels": labels,
-        "held": bool(hold),
-        "hold_reason": (hold.get("reason") or hold.get("desc")) if hold else None,
+        "held": bool(defer),
+        "hold_reason": waiting_label(defer),
         "overlap": None,
     }
 
@@ -365,6 +471,7 @@ def backlog_card(
         "recurrence": recurrence_count > 0,
         "recurrence_count": recurrence_count,
         "age_days": age_days(issue.get("createdAt"), now),
+        "age_s": age_seconds(issue.get("createdAt"), now),
         "comments": _comment_count(issue.get("comments")),
     }
 
@@ -405,6 +512,11 @@ def is_backlog(issue: dict) -> bool:
 def age_days(created_at, now: datetime) -> int | None:
     ts = dash.parse_ts(created_at)
     return max(0, int((now - ts).total_seconds() // 86400)) if ts else None
+
+
+def age_seconds(created_at, now: datetime) -> int | None:
+    ts = dash.parse_ts(created_at)
+    return max(0, int((now - ts).total_seconds())) if ts else None
 
 
 # ── overview ──────────────────────────────────────────────────────────────────

@@ -281,7 +281,67 @@ def test_issue_card_flags_escalation_recurrence_spend_block_and_hold():
         {"ts": ts(hours=1), "event": "hold", "issue": 7, "reason": "overlaps PR #12"},
     ]
     card = snapshots.issue_card(row_for(events, 7), NOW)
-    assert set(card["flags"]) == {"escalated", "recurred", "spend-blocked", "held"}
+    assert set(card["flags"]) == {"escalated", "recurred", "spend-blocked", "waiting"}
+
+
+def test_historical_hold_is_cleared_by_a_later_resolve_dispatch():
+    events = [
+        {"ts": ts(hours=3), "event": "hold", "issue": 7, "reason": "overlap"},
+        {"ts": ts(hours=2), "event": "agent_run_start", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7},
+    ]
+    assert "waiting" not in snapshots.issue_card(row_for(events, 7), NOW)["flags"]
+
+
+def test_structured_defer_stays_active_until_its_clear_transition():
+    waiting = {
+        "ts": ts(hours=3), "event": "deferred", "state": "waiting",
+        "issue": 7, "reason": "overlap", "blocker_pr": 90,
+    }
+    cleared = {**waiting, "ts": ts(hours=1), "state": "cleared"}
+    assert snapshots.pending_card({}, row_for([waiting], 7))["hold_reason"] == "waiting on PR #90"
+    assert snapshots.pending_card({}, row_for([waiting, cleared], 7))["held"] is False
+
+
+def test_structured_clear_supersedes_a_legacy_hold():
+    legacy = {
+        "ts": ts(hours=4), "event": "hold", "issue": 7,
+        "reason": "overlap", "blocker": "pr#90",
+    }
+    waiting = {
+        "ts": ts(hours=3), "event": "deferred", "state": "waiting",
+        "issue": 7, "reason": "overlap", "blocker_pr": 90,
+    }
+    cleared = {**waiting, "ts": ts(hours=1), "state": "cleared"}
+
+    assert snapshots.pending_card(
+        {}, row_for([legacy, waiting, cleared], 7)
+    )["held"] is False
+
+
+def test_ai_ready_issue_with_historical_activity_is_pending_not_in_flight(monkeypatch):
+    snapshot = dash.Snapshot("demo", "o/r", "/target", build([RESOLVE]), (NOW,))
+
+    class Gh:
+        def issues(self, _repo):
+            return ([{
+                "number": 7,
+                "state": "OPEN",
+                "labels": [{"name": "ai-ready"}],
+                "title": "queued again",
+            }], "")
+
+        def prs(self, _repo):
+            return ([], "")
+
+    backend = service.Backend(gh=Gh(), now_fn=lambda: NOW)
+    monkeypatch.setattr(backend, "snapshot", lambda _name: snapshot)
+    monkeypatch.setattr(backend, "verification", lambda: {"rows": []})
+
+    payload = backend.issues("demo")
+
+    assert [card["issue"] for card in payload["pending"]] == [7]
+    assert payload["in_flight"] == []
 
 
 def test_mean_wall_clock_is_none_until_an_issue_is_done():
@@ -299,6 +359,22 @@ def test_mean_wall_clock_measures_done_issues_only():
     assert snapshots.mean_wall_clock_s(build(events).issues) == 7200.0
 
 
+def test_projected_cost_groups_completed_issues_by_resolve_model():
+    events = [
+        {**RESOLVE, "issue": 7, "number": 7, "model": "gpt-5.6-terra", "cost_usd": 2.0},
+        {"ts": ts(hours=2), "event": "action",
+         "desc": "clear state for pr #12, issue #7 (merged)"},
+        {**RESOLVE, "ts": ts(hours=3), "issue": 8, "number": 8,
+         "model": "gpt-5.6-sol", "cost_usd": 9.0},
+        {"ts": ts(hours=2), "event": "action",
+         "desc": "clear state for pr #13, issue #8 (merged)"},
+    ]
+    assert snapshots.projected_cost_by_model(build(events).issues) == {
+        "gpt-5.6-terra": 2.0,
+        "gpt-5.6-sol": 9.0,
+    }
+
+
 def test_pending_card_reads_priority_and_the_newest_hold():
     events = [{"ts": ts(hours=1), "event": "hold", "issue": 9, "reason": "overlap"}]
     row = row_for(events, 9)
@@ -306,7 +382,7 @@ def test_pending_card_reads_priority_and_the_newest_hold():
         {"number": 9, "title": "t", "url": "u",
          "labels": [{"name": "ai-ready"}, {"name": "P2"}]}, row)
     assert card["priority"] == "P2"
-    assert (card["held"], card["hold_reason"]) == (True, "overlap")
+    assert (card["held"], card["hold_reason"]) == (True, "waiting on dependency")
     assert card["overlap"] is None
 
 
@@ -411,7 +487,9 @@ def test_overview_projects_lifecycle_recurrence_and_first_observed_day(monkeypat
     monkeypatch.setattr(backend, "names", lambda: ("demo",))
     monkeypatch.setattr(system, "scan_proc_daemons", lambda: ({}, True))
 
-    assert backend.overview("demo")["health_trend"] == [
+    payload = backend.overview("demo")
+    assert payload["first_observed_day"] == "2026-07-29"
+    assert payload["health_trend"] == [
         {"day": "2026-07-29", "opened": 1, "closed": 0, "net_open": 1,
          "recurrences": 0, "first_observation": True},
         {"day": "2026-07-30", "opened": 0, "closed": 1, "net_open": -1,

@@ -102,6 +102,7 @@ class Backend:
         live, scan_ok = system.scan_proc_daemons()
         snapshot = self.snapshot(name)
         local_tz = _local_timezone(timezone_name)
+        first_observed_day = snapshots.first_observed_day(snapshot, local_tz)
         issues, issue_error = self.gh.issues(snapshot.repo)
         recurrence_events = [
             event
@@ -119,9 +120,10 @@ class Backend:
         payload["health_trend"] = snapshots.health_trend(
             issues,
             recurrence_events,
-            first_observed_day=snapshots.first_observed_day(snapshot, local_tz),
+            first_observed_day=first_observed_day,
             local_tz=local_tz,
         )
+        payload["first_observed_day"] = first_observed_day
         if issue_error:
             payload["warnings"].append(issue_error)
         elif isinstance(issues, list) and len(issues) >= ghdata.ISSUE_HISTORY_LIMIT:
@@ -147,35 +149,53 @@ class Backend:
         now = self.now_fn()
         gh_issues, gh_prs, warnings = self._gh_context(snap.repo)
         rows = snap.deployment.issues
-        metrics = snap.deployment.metrics
-        projected_cost = metrics.cost_per_done_usd if metrics.done_issues else None
+        projected_by_model = snapshots.projected_cost_by_model(rows)
         projected_eta = snapshots.mean_wall_clock_s(rows)
+        verification_payload = self.verification()
+        issue_status, pr_status = verification.status_indexes(
+            verification_payload.get("rows", [])
+        )
 
         def card(row):
+            model = snapshots.projection_model(row)
+            pr = row.prs[-1] if row.prs else None
             return snapshots.issue_card(
                 row,
                 now,
                 gh_issue=gh_issues.get(row.issue),
                 gh_prs=gh_prs,
-                projected_cost_usd=projected_cost,
+                projected_cost_usd=projected_by_model.get(model) if model else None,
                 projected_eta_s=projected_eta,
+                projected_model=model,
+                issue_verification=issue_status.get(row.issue),
+                pr_verification=pr_status.get(pr) if pr is not None else None,
             )
 
         row_by_issue = {row.issue: row for row in rows}
-        in_flight_numbers = {row.issue for row in rows if not row.done}
+        ready_numbers = {
+            number
+            for number, issue in gh_issues.items()
+            if ghdata.is_open(issue) and "ai-ready" in snapshots.labels_of(issue)
+        }
+        in_flight_numbers = {
+            row.issue for row in rows if not row.done and row.issue not in ready_numbers
+        }
         pending, backlog = [], []
         for number, issue in sorted(gh_issues.items()):
             if not ghdata.is_open(issue):
                 continue
             labels = snapshots.labels_of(issue)
-            if "ai-ready" in labels and number not in in_flight_numbers:
+            if "ai-ready" in labels:
                 pending.append(snapshots.pending_card(issue, row_by_issue.get(number)))
             elif snapshots.is_backlog(issue):
                 backlog.append(
                     snapshots.backlog_card(issue, now, row_by_issue.get(number))
                 )
         return {
-            "in_flight": [card(row) for row in rows if not row.done],
+            "in_flight": [
+                card(row) for row in rows
+                if not row.done and row.issue not in ready_numbers
+            ],
             "pending": pending,
             "done": [card(row) for row in rows if row.done],
             "backlog": backlog,
