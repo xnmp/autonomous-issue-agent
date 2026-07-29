@@ -11,7 +11,7 @@ from issue_agent.app.execute import Executor
 from issue_agent.app.workflows.fix import FixWorkflow, FixWorkflowConfig
 from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.app.planners.tasks import FixTaskConfig
-from issue_agent.domain.world import Check, Comment, IssueView, PRView, Review
+from issue_agent.domain.world import Check, Comment, IssueView, PRView, Review, WorldState
 
 from test_dispatch import FakeGateway, FakeRunner, FakeStore, FakeWorktrees, SeqRunner
 from issue_agent.adapters.github import GhUnavailable
@@ -967,6 +967,27 @@ def test_resolve_persists_router_path_predictions_for_later_overlap_checks():
     ).resolve(5))
 
     assert store.predictions == {5: frozenset({"src/action.rs"})}
+
+
+def test_router_defers_the_selected_issue_before_resolve_when_prediction_overlaps():
+    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
+    gw.build_world = lambda: WorldState(prs=(PRView(
+        100, state="OPEN", changed_files=frozenset({"src/action.rs"}),
+    ),))
+    store = PredictionRecordingStore()
+    runner = SeqRunner([
+        AgentResult(is_error=False, session_id="rt", structured={
+            "tier": "standard", "predicted_paths": ["src/action.rs"],
+        }),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5"),
+    ])
+
+    asyncio.run(_workflow(
+        gw, store, runner, fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    assert len(runner.tasks) == 1, "the existing router run must prevent the resolve"
+    assert ("relabel", "issue", 5, "ai-working", "ai-ready") in gw.calls
 
 
 def test_resolve_skips_the_router_when_a_model_is_pinned():
