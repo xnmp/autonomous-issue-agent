@@ -424,17 +424,35 @@ def _last_human_reply_at(issue: IssueView | PRView, fix_bot: str) -> str | None:
 def issues_needing_resume(
     world: WorldState, state: FixState, cfg: FixConfig
 ) -> list[tuple[int, str]]:
-    """ai-blocked issues with a human reply we have NOT yet consumed.
+    """ai-blocked issues with a session AND a human reply we have NOT yet resumed
+    on. Returns (issue_number, reply_at). The resumed-at dedupe is the anti-loop
+    lesson: a single reply must not re-trigger resume every poll."""
+    out: list[tuple[int, str]] = []
+    for issue in world.issues:
+        lifecycle = issue_lifecycle(issue)
+        if not lifecycle.is_blocked or issue.number not in state.sessions:
+            continue
+        last_at = _last_human_reply_at(issue, cfg.fix_bot)
+        if last_at is None:
+            continue
+        if last_at != state.resumed_at.get(issue.number, ""):
+            out.append((issue.number, last_at))
+    return out
 
-    A runtime session is an optional checkpoint, not a lifecycle precondition.
-    If it is absent, the workflow starts a fresh full-context continuation.
-    The resumed-at dedupe remains the anti-loop lesson: one reply must not
-    re-trigger a paid leg every poll.
+
+def issues_needing_fresh_resume(
+    world: WorldState, state: FixState, cfg: FixConfig
+) -> list[tuple[int, str]]:
+    """Blocked issues whose new reply cannot continue a saved runtime session.
+
+    The workflow reconstructs these legs from the issue context, while the
+    durable resumed-at marker gives them the same exactly-once behavior as a
+    true session continuation.
     """
     out: list[tuple[int, str]] = []
     for issue in world.issues:
         lifecycle = issue_lifecycle(issue)
-        if not lifecycle.is_blocked:
+        if not lifecycle.is_blocked or issue.number in state.sessions:
             continue
         last_at = _last_human_reply_at(issue, cfg.fix_bot)
         if last_at is None:
@@ -1193,7 +1211,10 @@ def decide_fix(
 
     # 2) Blocked issue with a NEW answer (first one only).
     if not consumed:
-        needing = issues_needing_resume(world, state, cfg)
+        needing = (
+            issues_needing_resume(world, state, cfg)
+            or issues_needing_fresh_resume(world, state, cfg)
+        )
         if needing:
             n, _at = needing[0]
             if infra_ceiling_hit(state, cfg, n):
