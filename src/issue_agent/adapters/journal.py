@@ -804,6 +804,11 @@ def recurrence_keys(events) -> set[str]:
     return _emitted_block_keys(events, "recurrence")
 
 
+def groomed_keys(events) -> set[str]:
+    """Durable one-shot keys for advisory steward grooming findings."""
+    return _emitted_block_keys(events, "groomed")
+
+
 # How many settled runs must agree before the ledger is declared blind. Small
 # enough to fire within one poll cycle of a fresh daemon, large enough that a
 # single genuinely-free run (a session that died before billing) is not it.
@@ -969,6 +974,7 @@ __all__ = [
     "read_events_tail",
     "recent_runs",
     "recurrence_keys",
+    "groomed_keys",
     "repeated_dispatch_warning",
     "spend_blocked_keys",
     "sum_issue",

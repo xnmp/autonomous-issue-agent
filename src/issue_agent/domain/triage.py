@@ -63,6 +63,16 @@ class TriageState:
     seen_at: dict[int, str] = field(default_factory=dict)
 
 
+def grooming_candidates(world: WorldState, seen_at: Mapping[int, str], enabled: bool) -> list[int]:
+    """Open issues whose content changed since their last advisory grooming scan."""
+    if not enabled:
+        return []
+    return [
+        issue.number for issue in world.open_issues()
+        if issue.updated_at != seen_at.get(issue.number, "")
+    ]
+
+
 @dataclass(frozen=True)
 class TriageVerdict:
     """Structured output of the triage agent (TRIAGE_SCHEMA).
@@ -269,3 +279,40 @@ def recurrence_actions(
         PostComment(Target.ISSUE, issue_number, body),
         Relabel(Target.ISSUE, issue_number, None, Label.RECURRENCE),
     ]
+
+
+def grooming_actions(
+    issue_number: int,
+    *,
+    resolved_by: int | None,
+    stale_reference: str,
+    merged_by_issue: Mapping[int, int],
+) -> list[Action]:
+    """Map a validated grooming finding to advisory GitHub writes.
+
+    The classifier reads issue text, so a claimed resolver is accepted only when
+    it is in the gateway-provided recent-merge whitelist. Neither finding can
+    close, dispatch, or otherwise move an issue through the lifecycle.
+    """
+    actions: list[Action] = []
+    if resolved_by is not None and resolved_by != issue_number and resolved_by in merged_by_issue:
+        pr = merged_by_issue[resolved_by]
+        actions.extend((
+            PostComment(
+                Target.ISSUE, issue_number,
+                "**Possibly resolved by merged work** ✅\n\n"
+                f"Recent work for #{resolved_by} shipped in PR #{pr} and may already "
+                "cover this report. Advisory only — please confirm and close this issue "
+                "if it is resolved, or remove `maybe-resolved` if it is not.",
+            ),
+            Relabel(Target.ISSUE, issue_number, None, Label.MAYBE_RESOLVED),
+        ))
+    ref = stale_reference.strip()
+    if ref:
+        actions.append(PostComment(
+            Target.ISSUE, issue_number,
+            "**Possible stale issue context** 🧹\n\n"
+            f"The referenced artifact `{ref}` no longer appears to exist in the repository. "
+            "Advisory only — please re-scope this issue if the intended behavior still matters.",
+        ))
+    return actions

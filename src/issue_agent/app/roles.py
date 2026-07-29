@@ -55,11 +55,12 @@ from ..domain.review import (
     ReviewState,
     decide_review,
 )
-from .planners.tasks import FixTaskConfig, JiraTaskConfig, ReviewTaskConfig, TriageTaskConfig
+from .planners.tasks import FixTaskConfig, GroomTaskConfig, JiraTaskConfig, ReviewTaskConfig, TriageTaskConfig
 from ..domain.triage import (
     TriageConfig,
     TriageState,
     parse_codeowners_default,
+    grooming_candidates,
     triage_candidates,
 )
 from ..domain.jira import jira_phase, jira_sync_needed
@@ -983,6 +984,10 @@ def build_steward_daemon(
             steward_runtime.bot, steward_runtime.triage_prompt,
             steward_runtime.triage_budget_usd, steward_runtime.triage_model,
         ),
+        groom=GroomTaskConfig(
+            steward_runtime.bot, steward_runtime.triage_budget_usd,
+            steward_runtime.triage_model,
+        ) if cfg.steward_groom else None,
         triage_cfg=tcfg_dom,
         jira=jira_cfg,
         log=steward_log,
@@ -1049,6 +1054,15 @@ def build_steward_daemon(
             for n in triage_candidates(world, tcfg_dom, state)
             if not exhausted(n)
         ]
+        actions.extend(
+            RunAgent(AgentKind.GROOM, n)
+            for n in grooming_candidates(
+                world,
+                {i.number: store.get_groom_at(i.number) for i in world.issues},
+                cfg.steward_groom,
+            )
+            if not exhausted(n)
+        )
         if jira_on:
             for i in world.issues:
                 target = jira_phase(i.labels)

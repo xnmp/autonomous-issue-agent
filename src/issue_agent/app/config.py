@@ -109,6 +109,7 @@ class StewardRuntimeConfig:
     triage_prompt: str
     triage_model: str | None
     triage_budget_usd: float
+    groom_enabled: bool
     max_infra_deaths: int
 
 
@@ -293,6 +294,11 @@ class HarnessConfig:
     review_dimension_budget_usd: float = 0.75
     review_validation_budget_usd: float = 0.20
     steward_triage: bool = True
+    # Advisory grooming is on by default; it never closes or edits issue bodies.
+    steward_groom: bool = True
+    # Reserved explicit opt-in for future body rewrites; current grooming only
+    # comments, regardless of this setting.
+    steward_groom_edit: bool = False
     steward_promote: bool = False
     # Handle triage @-mentions for OWNER-level (technical/architectural) questions —
     # e.g. "add a User to the domain model". Resolution order (roles.py): the target
@@ -538,6 +544,7 @@ class HarnessConfig:
             triage_prompt=self.triage_prompt,
             triage_model=self.steward_triage_model,
             triage_budget_usd=self.triage_budget_usd,
+            groom_enabled=self.steward_groom,
             max_infra_deaths=self.max_infra_deaths,
         )
 
@@ -1215,6 +1222,8 @@ def from_env(env: dict | None = None) -> HarnessConfig:
             e, "REVIEW_VALIDATION_BUDGET_USD", _dc_default("review_validation_budget_usd"), errors
         ),
         steward_triage=_b(e, "STEWARD_TRIAGE", _dc_default("steward_triage"), errors),
+        steward_groom=_b(e, "STEWARD_GROOM", _dc_default("steward_groom"), errors),
+        steward_groom_edit=_b(e, "STEWARD_GROOM_EDIT", _dc_default("steward_groom_edit"), errors),
         steward_promote=_b(e, "STEWARD_PROMOTE", _dc_default("steward_promote"), errors),
         steward_owner=e.get("STEWARD_OWNER", _dc_default("steward_owner")),
         edit_check_cmd=e.get("EDIT_CHECK_CMD", _dc_default("edit_check_cmd")),
