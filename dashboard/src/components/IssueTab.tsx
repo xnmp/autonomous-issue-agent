@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type KeyboardEvent } from "react";
 import { api } from "../api/client";
 import { usePolled, useLiveElapsed } from "../api/hooks";
 import type { IssueStep } from "../api/types";
@@ -37,7 +37,7 @@ export function IssueTab({ repo, issue }: { repo: string; issue: number }) {
       {d ? (
         <>
           <header className="issue-hd panel">
-            <div className="issue-hd-line">
+            <div className="issue-hd-line issue-hd-primary">
               <span className="issue-num mono">#{d.issue}</span>
               <span className="issue-title trunc" title={d.title ?? undefined}>
                 {d.title ?? <span className="faint">title unavailable (GitHub data)</span>}
@@ -50,7 +50,7 @@ export function IssueTab({ repo, issue }: { repo: string; issue: number }) {
               ) : null}
               {d.done ? <Chip tone="ok">done</Chip> : null}
             </div>
-            <div className="issue-hd-line">
+            <div className="issue-hd-line issue-hd-meta">
               {d.pull_requests.map((pr) =>
                 pr.url ? (
                   <a
@@ -152,23 +152,24 @@ function StepRow({
 }) {
   const tone = stateTone(step.state);
   const u = step.usage;
+  const detailId = `task-detail-${issue}-${step.idx}`;
   return (
     <>
-      <tr className={`clickable${open ? " expanded" : ""}`} onClick={onToggle} tabIndex={0}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            onToggle();
-          }
-        }}
-      >
-        <td>
-          <span className={`chev${open ? " open" : ""}`} aria-hidden="true">
-            ▸
-          </span>
-          <Chip tone={tone} square pulse={step.state === "running"} title={step.kind}>
-            {kindLabel(step.kind)}
-          </Chip>
+      <tr className={open ? "expanded" : undefined}>
+        <td className="step-operation">
+          <button
+            className="step-disclosure"
+            aria-expanded={open}
+            aria-controls={detailId}
+            onClick={onToggle}
+          >
+            <span className={`chev${open ? " open" : ""}`} aria-hidden="true">
+              ▸
+            </span>
+            <Chip tone={tone} square pulse={step.state === "running"} title={step.kind}>
+              {kindLabel(step.kind)}
+            </Chip>
+          </button>
         </td>
         <td>
           <Chip tone={step.role === "steward" ? "meta" : "info"} square>
@@ -212,7 +213,7 @@ function StepRow({
       {open ? (
         <tr className="detail-row">
           <td colSpan={8}>
-            <StepDetail repo={repo} issue={issue} step={step} />
+            <StepDetail id={detailId} repo={repo} issue={issue} step={step} />
           </td>
         </tr>
       ) : null}
@@ -222,7 +223,17 @@ function StepRow({
 
 type DetailPane = "events" | "cost" | "raw";
 
-function StepDetail({ repo, issue, step }: { repo: string; issue: number; step: IssueStep }) {
+function StepDetail({
+  id,
+  repo,
+  issue,
+  step,
+}: {
+  id: string;
+  repo: string;
+  issue: number;
+  step: IssueStep;
+}) {
   const [pane, setPane] = useState<DetailPane>("events");
   const events = usePolled(
     pane === "events" ? `stepev:${repo}:${issue}:${step.idx}` : null,
@@ -233,15 +244,19 @@ function StepDetail({ repo, issue, step }: { repo: string; issue: number; step: 
   const chartable = !!step.session_id && step.has_transcript;
 
   return (
-    <div className="stepdetail">
-      <div className="subtabs subtabs-sm" role="tablist">
+    <div className="stepdetail" id={id}>
+      <div className="subtabs stepdetail-tabs" role="tablist" aria-label="Task detail">
         {(["events", "cost", "raw"] as DetailPane[]).map((p) => (
           <button
             key={p}
+            id={`${id}-${p}-tab`}
             role="tab"
             aria-selected={p === pane}
+            aria-controls={`${id}-${p}-panel`}
+            tabIndex={p === pane ? 0 : -1}
             className={`subtab${p === pane ? " active" : ""}`}
             onClick={() => setPane(p)}
+            onKeyDown={(event) => moveTabFocus(event, p, setPane)}
           >
             {p === "events" ? "Events" : p === "cost" ? "Cost chart" : "Raw"}
           </button>
@@ -249,7 +264,11 @@ function StepDetail({ repo, issue, step }: { repo: string; issue: number; step: 
       </div>
 
       {pane === "events" ? (
-        <>
+        <div
+          id={`${id}-events-panel`}
+          role="tabpanel"
+          aria-labelledby={`${id}-events-tab`}
+        >
           {events.error ? (
             <ErrorBanner message={events.error} onRetry={events.refresh} />
           ) : null}
@@ -263,32 +282,67 @@ function StepDetail({ repo, issue, step }: { repo: string; issue: number; step: 
               emptyText="no journal events inside this task's window"
             />
           )}
-        </>
+        </div>
       ) : null}
 
       {pane === "cost" ? (
-        chartable ? (
-          <iframe
-            className="costchart"
-            title={`cost chart for ${step.kind} #${step.idx}`}
-            // The chart is built from transcript text the agent read from
-            // issues, PRs and the web. Sandboxed into an opaque origin so
-            // nothing in it can reach the action endpoints.
-            sandbox=""
-            src={api.costChartUrl(repo, issue, step.session_id as string)}
-          />
-        ) : (
-          <EmptyState>
-            {step.session_id
-              ? "no transcript on disk for this session — the cost chart needs ~/.claude/projects/*/<session_id>.jsonl"
-              : "this task recorded no session id, so there is no transcript to chart"}
-          </EmptyState>
-        )
+        <div
+          id={`${id}-cost-panel`}
+          role="tabpanel"
+          aria-labelledby={`${id}-cost-tab`}
+        >
+          {chartable ? (
+            <iframe
+              className="costchart"
+              title={`cost chart for ${step.kind} #${step.idx}`}
+              // The chart is built from transcript text the agent read from
+              // issues, PRs and the web. Sandboxed into an opaque origin so
+              // nothing in it can reach the action endpoints.
+              sandbox=""
+              src={api.costChartUrl(repo, issue, step.session_id as string)}
+            />
+          ) : (
+            <EmptyState>
+              {step.session_id
+                ? "no transcript on disk for this session — the cost chart needs ~/.claude/projects/*/<session_id>.jsonl"
+                : "this task recorded no session id, so there is no transcript to chart"}
+            </EmptyState>
+          )}
+        </div>
       ) : null}
 
-      {pane === "raw" ? <JsonBlock value={step} /> : null}
+      {pane === "raw" ? (
+        <div
+          id={`${id}-raw-panel`}
+          role="tabpanel"
+          aria-labelledby={`${id}-raw-tab`}
+        >
+          <JsonBlock value={step} />
+        </div>
+      ) : null}
     </div>
   );
+}
+
+function moveTabFocus(
+  event: KeyboardEvent<HTMLButtonElement>,
+  pane: DetailPane,
+  select: (pane: DetailPane) => void,
+) {
+  const panes: DetailPane[] = ["events", "cost", "raw"];
+  const current = panes.indexOf(pane);
+  let next: number | null = null;
+  if (event.key === "ArrowRight") next = (current + 1) % panes.length;
+  if (event.key === "ArrowLeft") next = (current - 1 + panes.length) % panes.length;
+  if (event.key === "Home") next = 0;
+  if (event.key === "End") next = panes.length - 1;
+  if (next === null) return;
+  event.preventDefault();
+  select(panes[next] as DetailPane);
+  const tabs = event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>(
+    '[role="tab"]',
+  );
+  tabs?.[next]?.focus();
 }
 
 function TokenSummary({ usage }: { usage: NonNullable<IssueStep["usage"]> }) {

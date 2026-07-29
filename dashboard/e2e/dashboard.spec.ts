@@ -148,6 +148,18 @@ async function mockApi(page: Page, reposDelayMs = 0) {
     if (path === "/api/usage") return json(route, usage);
     if (path === "/api/repos/self/issues") return json(route, issues);
     if (path === "/api/repos/self/issues/50") return json(route, issue);
+    if (path === "/api/repos/self/issues/50/steps/0/events")
+      return json(route, {
+        events: [{
+          ts: "2026-07-29T07:59:30Z",
+          kind: "RESOLVE",
+          role: "fix",
+          status: "done",
+          model: "claude-sonnet-5",
+          issue: 50,
+        }],
+        warnings: [],
+      });
     if (path === "/api/verification")
       return json(route, {
         rows: [{ id: "V-1", change: "Dashboard", status: "verified", evidence: "E2E", shipped: "yes", raw: "" }],
@@ -204,6 +216,13 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await expect(page.getByText("Resolve", { exact: true })).toBeVisible();
   await expect(page.getByText("Luna", { exact: true })).toHaveCount(0);
 
+  await page.locator(".step-disclosure").click();
+  const taskDetail = page.locator(".stepdetail");
+  await expect(taskDetail).toBeVisible();
+  const taskDetailBox = await taskDetail.boundingBox();
+  expect(taskDetailBox?.width).toBeGreaterThan(700);
+  await expect(taskDetail.getByText("claude-sonnet-5")).toBeVisible();
+
   await page.getByText("All events for this issue").click();
   await expect(page.getByText("by steward")).toBeVisible();
   await expect(page.getByText(/comment issue #50/)).toBeVisible();
@@ -241,6 +260,9 @@ test("serves a validated operator workflow through FastAPI and the production bu
     "href",
     "https://github.com/openai/autonomous-issue-agent/pull/75",
   );
+  await page.locator(".step-disclosure").click();
+  await expect(page.locator(".stepdetail")).toBeVisible();
+  expect((await page.locator(".stepdetail").boundingBox())?.width).toBeGreaterThan(700);
   await page.getByText("All events for this issue").click();
   await expect(page.getByText("by steward")).toBeVisible();
   await page.screenshot({

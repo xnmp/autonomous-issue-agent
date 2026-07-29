@@ -51,6 +51,7 @@ function json(body: unknown): Response {
 describe("App navigation", () => {
   it("remembers each repository's issue subtab and keeps verification out of the tab strip", async () => {
     window.location.hash = "#/repo/demo/issues/done";
+    let overviewCalls = 0;
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL) => {
@@ -59,6 +60,10 @@ describe("App navigation", () => {
         if (path === "/api/usage") return json(usage);
         if (path.endsWith("/issues")) return json(issues);
         if (path === "/api/verification") return json({ rows: [], warnings: [] });
+        overviewCalls += 1;
+        if (overviewCalls > 1) {
+          await new Promise((resolve) => window.setTimeout(resolve, 250));
+        }
         return json({
           metrics: null,
           cost_mix: null,
@@ -96,6 +101,12 @@ describe("App navigation", () => {
       "true",
     );
     await userEvent.click(screen.getByRole("tab", { name: "Overview" }));
+    expect(
+      screen.getByRole("row", {
+        name: /2026-07-29.*3.*1.*\+2/,
+      }),
+    ).toBeVisible();
+    expect(screen.queryByLabelText("Loading overview")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("tab", { name: /Issues/ }));
     expect(screen.getByRole("tab", { name: /Done/ })).toHaveAttribute(
       "aria-selected",

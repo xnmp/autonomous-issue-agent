@@ -1,4 +1,5 @@
 import { render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { IssueTab } from "./IssueTab";
 
@@ -38,5 +39,69 @@ describe("IssueTab", () => {
     expect(screen.getByText("Tasks", { selector: ".section-title span" })).toBeVisible();
     expect(screen.queryByText(/one row per leg/i)).not.toBeInTheDocument();
     expect(screen.getByText("no tasks recorded for this issue yet")).toBeVisible();
+  });
+
+  it("keeps the expanded task detail in its spanning table cell", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation((input: RequestInfo | URL) => {
+        const url = String(input);
+        const body = url.includes("/steps/0/events")
+          ? { events: [], warnings: [] }
+          : {
+              issue: 50,
+              title: "Task detail layout",
+              url: null,
+              stage: "done",
+              done: true,
+              prs: [],
+              pull_requests: [],
+              cost_usd: 2,
+              elapsed_s: 60,
+              steps: [{
+                idx: 0,
+                kind: "RESOLVE",
+                role: "fix",
+                state: "ok",
+                model: "claude-sonnet-5",
+                status: "done",
+                exit_reason: "ok",
+                duration_s: 60,
+                cost_usd: 2,
+                estimated: false,
+                session_id: "session-50",
+                has_transcript: false,
+                turns: 3,
+                usage: null,
+                ts: "2026-07-29T08:00:00Z",
+              }],
+              events: [],
+              warnings: [],
+            };
+        return Promise.resolve(
+          new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        );
+      }),
+    );
+
+    render(<IssueTab repo="demo" issue={50} />);
+
+    const disclosure = await screen.findByRole("button", { name: "Resolve" });
+    expect(disclosure).toHaveAttribute("aria-expanded", "false");
+    await userEvent.click(disclosure);
+    expect(disclosure).toHaveAttribute("aria-expanded", "true");
+
+    const detail = screen.getByText("Events", { selector: "button" }).closest("td");
+    expect(detail).toHaveAttribute("colspan", "8");
+    expect(detail).not.toHaveClass("step-operation");
+
+    const eventsTab = screen.getByRole("tab", { name: "Events" });
+    eventsTab.focus();
+    await userEvent.keyboard("{ArrowRight}");
+    expect(screen.getByRole("tab", { name: "Cost chart" })).toHaveFocus();
+    expect(screen.getByRole("tabpanel")).toHaveAccessibleName("Cost chart");
   });
 });

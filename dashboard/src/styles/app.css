@@ -970,8 +970,10 @@
 .issue-hd {
   display: flex;
   flex-direction: column;
-  gap: var(--s2);
-  padding: var(--s3);
+  gap: var(--s3);
+  padding: var(--s4);
+  background: var(--elevated);
+  border-color: var(--border-strong);
 }
 .issue-hd-line {
   display: flex;
@@ -981,13 +983,22 @@
   flex-wrap: wrap;
 }
 .issue-num {
-  font-size: 16px;
+  font-size: 18px;
   font-weight: 700;
-  color: var(--ink-muted);
+  color: var(--link-br);
 }
 .issue-title {
-  font-size: 15px;
-  font-weight: 600;
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1.3;
+  color: var(--ink);
+}
+.issue-hd-primary {
+  min-height: 32px;
+}
+.issue-hd-meta {
+  padding-top: var(--s3);
+  border-top: 1px solid var(--border);
 }
 .issue-stat {
   font-size: var(--fs-sm);
@@ -996,10 +1007,20 @@
 .steps .tbl th {
   background: var(--panel);
 }
-.steps .tbl td:first-child {
+.steps .tbl .step-operation {
+  padding: 0;
+}
+.step-disclosure {
   display: flex;
   align-items: center;
   gap: var(--s2);
+  width: 100%;
+  min-height: 40px;
+  padding: var(--s2) var(--s3);
+  text-align: left;
+}
+.step-disclosure:hover {
+  background: var(--hover);
 }
 .token-summary {
   display: inline-flex;
@@ -1027,6 +1048,23 @@
   padding: var(--s3);
   border-left: 2px solid var(--info);
   background: var(--bg);
+}
+.stepdetail-tabs {
+  align-self: flex-start;
+  padding: var(--s1);
+  border-color: var(--border-strong);
+  background: var(--elevated);
+}
+.stepdetail-tabs .subtab {
+  min-height: 30px;
+  padding: var(--s2) var(--s3);
+  font-weight: 600;
+  color: var(--ink-muted);
+}
+.stepdetail-tabs .subtab.active {
+  background: color-mix(in srgb, var(--info) 34%, var(--selection));
+  color: var(--ink);
+  box-shadow: inset 0 -2px 0 var(--info-br);
 }
 .costchart {
   width: 100%;
