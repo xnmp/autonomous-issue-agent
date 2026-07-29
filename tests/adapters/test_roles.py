@@ -1573,6 +1573,31 @@ def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
     assert seen["resume_on_retry"] is False
     assert dispatcher.review_workflow.cfg.execution_cwd == str(tmp_path)
     assert callable(dispatcher.review_workflow.cfg.prepare_cwd)
+    # #113: the leg carries its own role, so the governor never has to infer it
+    # from a hook file that a differently-roled leg may also resolve to.
+    assert seen["env"]["ISSUE_AGENT_LEG_ROLE"] == "review"
+
+
+def test_codex_fixer_declares_its_role_so_a_review_hook_cannot_cage_it(tmp_path, monkeypatch):
+    """#113: the reviewer's hook lives at TARGET_DIR and fixer worktrees are
+    nested beneath it, so a fix leg can execute the reviewer's read-only hook.
+    The runner states the role in the leg's environment; the governor gives it
+    precedence over the inherited flag."""
+    from issue_agent.adapters import codex_runner
+
+    seen = {}
+
+    class CapturingCodexRunner:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def preflight(self):
+            return None
+
+    monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
+    _codex_daemon(tmp_path)
+
+    assert seen["env"]["ISSUE_AGENT_LEG_ROLE"] == "fix"
 
 
 def test_codex_reviewer_defers_hook_installation_until_dispatch(tmp_path, monkeypatch):

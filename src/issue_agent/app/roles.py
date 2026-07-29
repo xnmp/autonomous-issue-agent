@@ -200,6 +200,7 @@ def _build_codex_runner(
     sandbox: str,
     inject_system_prompt: bool,
     resume_on_retry: bool,
+    leg_role: str,
     log,
 ):
     """Build either role's Codex adapter from the single runtime config.
@@ -209,6 +210,12 @@ def _build_codex_runner(
     review is read-only. Keeping every transport, rollout-pricing, and budget
     option here prevents a new Codex accounting control reaching one paid role
     while silently skipping the other.
+
+    `leg_role` states which side of that boundary the leg is on, in the leg's own
+    process environment. The governor needs it because read-only-ness is declared
+    by a generated hook script at the reviewer's cwd, and a fixer worktree nested
+    under that cwd resolves to the same script (#113). The dispatching runner is
+    the only place that knows the role for certain, so it says so here.
     """
     from ..adapters.codex_runner import CodexProvider, CodexRunner
 
@@ -224,6 +231,7 @@ def _build_codex_runner(
         ),
         sandbox=sandbox,
         resume_on_retry=resume_on_retry,
+        env={"ISSUE_AGENT_LEG_ROLE": leg_role},
         reasoning_effort=runtime.reasoning_effort,
         inject_system_prompt=inject_system_prompt,
         log=log,
@@ -754,6 +762,7 @@ def build_fix_daemon(
             # AGENT.md reaches Codex through the worktree instructions below.
             inject_system_prompt=False,
             resume_on_retry=True,
+            leg_role="fix",
             log=_log("fix"),
         )
         # Surface a codex misconfig (missing bin/key) at STARTUP, not on the first
@@ -973,6 +982,7 @@ def build_review_daemon(
             sandbox="read-only",
             inject_system_prompt=True,
             resume_on_retry=False,
+            leg_role="review",
             log=_log("review"),
         )
         reason = review_runner.preflight()

@@ -137,7 +137,29 @@ def main() -> None:
     if not command:
         sys.exit(0)
 
-    if os.environ.get("ISSUE_AGENT_REVIEW_READ_ONLY") == "1":
+    # Read-only mode is declared by the REVIEWER's generated hook script, which
+    # `export`s the flag into this process. That declaration is ambient
+    # filesystem state living at the reviewer's cwd, and a FIXER worktree nested
+    # under that cwd resolves to the same hook (#113: the first codex review of a
+    # deployment installed a read-only hook at TARGET_DIR and every subsequent
+    # fixer leg — whose worktrees live at TARGET_DIR/.claude/worktrees/issue-N —
+    # was denied git/tests/commit/push and blocked asking a human why).
+    #
+    # The leg's ROLE is the authority, and only the runner that dispatches the
+    # leg can state it. Unsetting the flag in the fixer's process env cannot
+    # work: the hook re-exports it downstream of that env. So precedence, not
+    # absence, is what settles it.
+    #
+    # Fail direction is deliberate and asymmetric. An ABSENT role reads as "not
+    # a fixer", so read-only still applies — a reviewer whose env failed to
+    # propagate keeps its sandbox (fail CLOSED on the security boundary). A
+    # fixer whose env failed to propagate is merely blocked, which is loud,
+    # costs no correctness, and is the state #113 already describes.
+    review_read_only = (
+        os.environ.get("ISSUE_AGENT_REVIEW_READ_ONLY") == "1"
+        and os.environ.get("ISSUE_AGENT_LEG_ROLE") != "fix"
+    )
+    if review_read_only:
         violation = review_only_violation(command)
         if violation:
             _block(f"Blocked: {violation}")

@@ -468,5 +468,67 @@ def test_xargs_bypasses_the_no_verify_block():
     assert gov.find_violations("xargs git commit --no-verify -m x")
 
 
+# ── #113: read-only mode belongs to the LEG, not to the filesystem ───────────
+# The reviewer's generated hook `export`s ISSUE_AGENT_REVIEW_READ_ONLY=1 at its
+# own cwd. Fixer worktrees are nested under that cwd (TARGET_DIR/.claude/
+# worktrees/issue-N), so a fixer leg resolves to the same hook and inherits the
+# reviewer's sandbox: on 2026-07-29 the first codex review of the deployment
+# blocked the next three fixer legs (#89/#92/#104) and PR #111 on git, tests,
+# commit and push. The dispatching runner states the role; the role decides.
+def _drive_main(monkeypatch, command: str, env: dict) -> int:
+    """Run the hook's main() over one Bash payload; return its exit status."""
+    import io
+    import json as _json
+
+    for key in ("ISSUE_AGENT_REVIEW_READ_ONLY", "ISSUE_AGENT_LEG_ROLE"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    payload = _json.dumps({"tool_input": {"command": command}})
+    monkeypatch.setattr(sys, "stdin", io.StringIO(payload))
+    with pytest.raises(SystemExit) as exc:
+        hook.main()
+    return exc.value.code
+
+
+# `gh pr review --approve` is denied by the review-only surface and is NOT
+# otherwise governed, so it isolates the read-only decision by itself.
+_REVIEW_ONLY_DENIED = "gh pr review 97 --approve"
+
+
+def test_review_leg_keeps_its_read_only_sandbox(monkeypatch):
+    assert _drive_main(
+        monkeypatch, _REVIEW_ONLY_DENIED,
+        {"ISSUE_AGENT_REVIEW_READ_ONLY": "1", "ISSUE_AGENT_LEG_ROLE": "review"},
+    ) == 2
+
+
+def test_read_only_without_a_declared_role_still_blocks(monkeypatch):
+    """Fail CLOSED on the security boundary: a reviewer whose role env did not
+    propagate keeps its sandbox rather than silently gaining a shell."""
+    assert _drive_main(
+        monkeypatch, _REVIEW_ONLY_DENIED, {"ISSUE_AGENT_REVIEW_READ_ONLY": "1"},
+    ) == 2
+
+
+def test_fix_leg_is_not_caged_by_an_inherited_review_hook(monkeypatch):
+    """The #113 regression: the flag is present (a nested fixer worktree ran the
+    reviewer's hook), but this leg is a FIX, so the reviewer's surface must not
+    apply to it."""
+    assert _drive_main(
+        monkeypatch, _REVIEW_ONLY_DENIED,
+        {"ISSUE_AGENT_REVIEW_READ_ONLY": "1", "ISSUE_AGENT_LEG_ROLE": "fix"},
+    ) == 0
+
+
+def test_fix_role_does_not_disarm_the_ordinary_gates(monkeypatch):
+    """Role only settles review-only mode. Everything the governor blocks for a
+    fixer stays blocked — otherwise this fix would be a bypass switch."""
+    assert _drive_main(
+        monkeypatch, "git commit --no-verify -m x",
+        {"ISSUE_AGENT_REVIEW_READ_ONLY": "1", "ISSUE_AGENT_LEG_ROLE": "fix"},
+    ) == 2
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
