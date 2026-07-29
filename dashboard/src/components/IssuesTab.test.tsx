@@ -70,8 +70,12 @@ describe("IssuesTab", () => {
 
     expect(screen.queryByRole("columnheader", { name: "Rounds" })).not.toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: /Verification/ })).toBeVisible();
-    const verification = screen.getByRole("cell", { name: /Issue verified PR pending/ });
+    const verification = screen.getByRole("cell", { name: "pending" });
     expect(verification).toBeVisible();
+    expect(screen.getByText("pending", { exact: true })).toHaveAttribute(
+      "title",
+      "Issue: VERIFIED · PR: pending",
+    );
     const row = screen.getByRole("row", { name: /Explain completed work.*#50.*PR #75/ });
     await userEvent.click(row);
     expect(onOpenIssue).not.toHaveBeenCalled();

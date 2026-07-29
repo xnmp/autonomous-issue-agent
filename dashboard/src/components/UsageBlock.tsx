@@ -47,22 +47,39 @@ export function UsageBlock({
         title="Quota"
         onClick={() => setOpen((current) => !current)}
       >
-        <span className="rail-btn-mark quota-icon" aria-hidden="true">◔</span>
+        <span className="rail-btn-mark quota-icon" aria-hidden="true">
+          <i />
+          <i />
+          <i />
+        </span>
         {!collapsed ? <span>Quota</span> : null}
       </button>
       {open ? <section className={`usage quota-card panel${collapsed ? " compact" : ""}`} id="quota-card" aria-label="Quota">
         {collapsed ? (
           <div className="compact-quota">
-            {compactMeters.map(([label, value, error]) => (
-              <div
-                className="compact-quota-meter"
-                key={label}
-                title={`${label}: ${value === null ? error ?? "unavailable" : pct(value)}`}
-              >
-                <span>{label}</span>
-                <i className={`tone-bg-${utilTone(value)}`} style={{ height: `${Math.max(4, Math.min(100, value ?? 0))}%` }} />
-              </div>
-            ))}
+            {compactMeters.map(([label, value, error]) => {
+              const clamped = value === null
+                ? undefined
+                : Math.max(0, Math.min(100, value));
+              return (
+                <div
+                  className="compact-quota-meter"
+                  key={label}
+                  title={`${label}: ${value === null ? error ?? "unavailable" : pct(value)}`}
+                  role="meter"
+                  aria-label={`${label} quota usage`}
+                  aria-valuemin={0}
+                  aria-valuemax={100}
+                  aria-valuenow={clamped}
+                  aria-valuetext={value === null ? error ?? "unavailable" : pct(value)}
+                >
+                  <span className="compact-quota-label">{label}</span>
+                  <span className={`compact-quota-track tone-bg-${utilTone(value)}`} aria-hidden="true">
+                    <span style={{ width: `${Math.max(4, clamped ?? 0)}%` }} />
+                  </span>
+                </div>
+              );
+            })}
           </div>
         ) : (
         <>

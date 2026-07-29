@@ -18,7 +18,15 @@ import type {
   Priority,
 } from "../api/types";
 import { ISSUES_SUBS, ISSUES_SUB_LABELS, type IssuesSub } from "../routing/hash";
-import { familyVar, flagTone, modelTone, prStateTone, stateTone, verificationTone } from "../lib/semantics";
+import {
+  combinedVerificationStatus,
+  familyVar,
+  flagTone,
+  modelTone,
+  prStateTone,
+  stateTone,
+  verificationTone,
+} from "../lib/semantics";
 import { ageCompact, ago, duration, durationShort, localTime, num, usd } from "../lib/format";
 import { shortModel } from "../lib/models";
 import { Chip } from "./ui/Chip";
@@ -482,7 +490,10 @@ function DoneTable({
     issue: (card) => card.issue,
     cost: (card) => card.cost_usd,
     duration: (card) => card.elapsed_s,
-    verification: (card) => `${card.issue_verification ?? ""} ${card.pr_verification ?? ""}`,
+    verification: (card) => combinedVerificationStatus(
+      card.issue_verification,
+      card.pr_verification,
+    ),
     model: (card) => card.models.join(" "),
     rounds: (card) => card.rounds,
     merged: (card) => card.merged_ts ?? card.last_ts,
@@ -838,27 +849,19 @@ function ModelList({ models }: { models: NonNullable<IssueCard["model_badges"]> 
   );
 }
 
-function VerificationBadge({ status }: { status: string | null | undefined }) {
-  if (!status) return null;
-  return (
-    <Chip tone={verificationTone(status)} title={`field verification: ${status}`}>
-      {status.toLowerCase()}
-    </Chip>
-  );
-}
-
 function VerificationStatus({ card }: { card: IssueCard }) {
+  const status = combinedVerificationStatus(
+    card.issue_verification,
+    card.pr_verification,
+  );
+  if (!status) return <span className="faint">—</span>;
   return (
-    <span className="verification-status">
-      <span>
-        <span className="faint">Issue</span>
-        <VerificationBadge status={card.issue_verification} />
-      </span>
-      <span>
-        <span className="faint">PR</span>
-        <VerificationBadge status={card.pr_verification} />
-      </span>
-    </span>
+    <Chip
+      tone={verificationTone(status)}
+      title={`Issue: ${card.issue_verification ?? "unavailable"} · PR: ${card.pr_verification ?? "unavailable"}`}
+    >
+      {status}
+    </Chip>
   );
 }
 
