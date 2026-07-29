@@ -156,8 +156,11 @@ stop. Never self-modify mid-batch.
 - **Terminal GitHub writes are durable.** A comment/relabel/close that exhausts
   transient retries is stored in the role's `STATE_DIR/pending-actions.json`;
   the daemon drains that queue before its next world read, reaper pass, or paid
-  dispatch. If a role appears idle with GitHub healthy, inspect that file and
-  the journal's `action_failed`/`action_retry` events before re-queuing work.
+  dispatch. A write that remains unverifiable after queued replay is alerted and
+  moved to `quarantined-actions.json` so it cannot halt unrelated issues. If a
+  role appears idle with GitHub healthy, inspect both files and the journal's
+  `action_failed`/`action_retry`/`action_quarantined` events before re-queuing
+  work.
 
 ## Pointing the harness at a repo
 
