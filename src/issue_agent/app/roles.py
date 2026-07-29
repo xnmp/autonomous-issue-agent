@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from dataclasses import replace
 from functools import partial
 
 from ..adapters.agent_runner import AgentRunner
@@ -202,6 +203,76 @@ def _process_deaths(store: Store) -> dict[int, int]:
     from it. Read-side only: nothing new is written on the hot path, and the
     scan is a bounded tail of a file this role already owns."""
     return unsettled_starts(read_events_tail(_journal(store).path))
+
+
+def _inject_predicted_paths(store: Store, world):
+    """Attach persisted router predictions to this tick's GitHub issue views.
+
+    GitHub is the source of truth for labels and PR diffs, while predictions are
+    local, advisory routing state. Joining them here keeps the domain decision
+    pure and makes any unreadable state indistinguishable from no prediction.
+    """
+    get_predictions = getattr(store, "get_predicted_paths", None)
+    if get_predictions is None:
+        return world
+    issues = []
+    changed = False
+    for issue in world.issues:
+        try:
+            predicted = get_predictions(issue.number)
+        except Exception:  # noqa: BLE001 — a hint must never stop a fix tick
+            predicted = frozenset()
+        combined = issue.predicted_paths | frozenset(predicted or ())
+        changed = changed or combined != issue.predicted_paths
+        issues.append(replace(issue, predicted_paths=combined))
+    return replace(world, issues=tuple(issues)) if changed else world
+
+
+def _prediction_outcome_reporter(journal: Journal | None, repo: str, store: Store, log):
+    """Journal each terminal PR's predicted-versus-actual files exactly once.
+
+    This runs before cleanup clears the per-issue prediction state. The event is
+    intentionally raw sets plus their intersection: operators can calculate hit
+    rate and inspect false positives without another GitHub read.
+    """
+    seen: set[str] = set()
+
+    def report(world) -> None:
+        get_predictions = getattr(store, "get_predicted_paths", None)
+        if get_predictions is None:
+            return
+        prior = read_events_tail(journal.path) if journal is not None else ()
+        prior_keys = {
+            event.get("block_key") for event in prior
+            if event.get("event") == "path_prediction"
+        }
+        for pr in world.prs:
+            if pr.state not in ("MERGED", "CLOSED") or pr.closing_issue is None:
+                continue
+            try:
+                predicted = frozenset(get_predictions(pr.closing_issue) or ())
+            except Exception:  # noqa: BLE001 — observability is fail-open
+                continue
+            if not predicted:
+                continue
+            key = f"path-prediction:{repo}:{pr.closing_issue}:{pr.number}"
+            if key in seen or key in prior_keys:
+                continue
+            seen.add(key)
+            matched = predicted & pr.changed_files
+            log(
+                f"PATH PREDICTION: issue #{pr.closing_issue} / PR #{pr.number} — "
+                f"{len(matched)}/{len(predicted)} predicted files changed"
+            )
+            if journal is not None:
+                journal.emit(
+                    "path_prediction", issue=pr.closing_issue, pr=pr.number,
+                    predicted_paths=sorted(predicted),
+                    changed_files=sorted(pr.changed_files),
+                    matched_paths=sorted(matched), block_key=key,
+                )
+
+    return report
 
 
 def _fix_state(store: Store, world) -> FixState:
@@ -697,6 +768,9 @@ def build_fix_daemon(
     executor._run_agent = lambda a: asyncio.run(dispatcher.dispatch(a))  # noqa: SLF001
 
     report_holds = _hold_reporter(journal, cfg.repo, _log("fix"))
+    report_prediction_outcomes = _prediction_outcome_reporter(
+        journal, cfg.repo, store, _log("fix")
+    )
     report_ci_stalls = _ci_stall_reporter(journal, cfg.repo, fix_cfg, _log("fix"))
     report_duplicates = _duplicate_pr_reporter(journal, cfg.repo, fix_cfg, _log("fix"))
     report_ci_flakes = _ci_flake_reporter(journal, cfg.repo, fix_cfg, _log("fix"))
@@ -707,8 +781,10 @@ def build_fix_daemon(
         # ONE FixState per tick, shared with the flake reporter — it is the same
         # state decide_fix decides on, so the two can never describe different
         # worlds (and the store reads happen once, not twice).
+        world = _inject_predicted_paths(store, world)
         state = _fix_state(store, world)
         report_holds(world)
+        report_prediction_outcomes(world)
         report_ci_stalls(world)
         report_duplicates(world)
         report_ci_flakes(world, state)

@@ -5,6 +5,8 @@ body-declared paths overlap an in-flight PR's changed files is held back to avoi
 a guaranteed merge conflict (the #59-vs-#60 collision).
 """
 
+import pytest
+
 from builders import issue, pr, world
 
 from issue_agent.domain.world import (
@@ -12,6 +14,7 @@ from issue_agent.domain.world import (
     PRView,
     extract_declared_paths,
     fix_probe_safe,
+    normalize_predicted_paths,
     paths_overlap_open_prs,
 )
 
@@ -45,6 +48,23 @@ def test_extract_strips_leading_dot_slash():
 def test_extract_empty_body():
     assert extract_declared_paths("") == frozenset()
     assert extract_declared_paths(None) == frozenset()  # tolerant of None
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (["src/action.rs", "./src/help.rs"], frozenset({"src/action.rs", "src/help.rs"})),
+        (["src/action.rs", 7], frozenset()),
+        ([f"src/{n}.py" for n in range(33)], frozenset()),
+        (["/etc/passwd"], frozenset()),
+        (["src\\windows.py"], frozenset()),
+        ([" src/action.rs"], frozenset()),
+        ("src/action.rs", frozenset()),
+        (None, frozenset()),
+    ],
+)
+def test_normalize_predicted_paths_fails_open_for_untrusted_router_output(raw, expected):
+    assert normalize_predicted_paths(raw) == expected
 
 
 # ── paths_overlap_open_prs ────────────────────────────────────────────────────

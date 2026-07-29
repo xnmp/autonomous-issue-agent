@@ -69,7 +69,14 @@ ADJUDICATE_SCHEMA: dict = {
 # agent/lib.sh ROUTER_SCHEMA — difficulty classifier.
 ROUTER_SCHEMA: dict = {
     "type": "object",
-    "properties": {"tier": {"type": "string", "enum": ["trivial", "standard", "complex"]}},
+    "properties": {
+        "tier": {"type": "string", "enum": ["trivial", "standard", "complex"]},
+        "predicted_paths": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Likely repository-relative files touched; [] when uncertain.",
+        },
+    },
     "required": ["tier"],
 }
 

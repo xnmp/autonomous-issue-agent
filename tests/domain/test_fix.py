@@ -107,6 +107,14 @@ def test_pick_ready_skips_issue_overlapping_open_pr_files():
     assert pick_ready_issue(world(issues=[iss], prs=[open_pr])) is None
 
 
+def test_pick_ready_skips_issue_when_router_prediction_overlaps_open_pr_files():
+    """A routed path protects human-written issues that name no paths themselves."""
+    iss = issue(2, "ai-ready", "P2", predicted_paths=frozenset({"src/action.rs"}))
+    open_pr = pr(100, "ai-pr-open", state="OPEN",
+                 changed_files=frozenset({"src/action.rs", "src/help.rs"}))
+    assert pick_ready_issue(world(issues=[iss], prs=[open_pr])) is None
+
+
 def test_pick_ready_allows_issue_with_no_file_overlap():
     iss = issue(2, "ai-ready", "P2", declared_paths=frozenset({"backend/app/routes/y.py"}))
     open_pr = pr(100, "ai-pr-open", state="OPEN",

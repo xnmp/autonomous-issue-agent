@@ -126,6 +126,10 @@ class IssueView:
     # when that PR lands — the #59-vs-#60 collision). Empty = no paths declared →
     # unpredictable → the gate can't apply (fail-open, don't over-block).
     declared_paths: frozenset[str] = field(default_factory=frozenset)
+    # Repository-relative paths predicted by the cheap router. These are
+    # advisory like declared_paths: malformed or absent predictions remain empty
+    # and therefore cannot hold an issue.
+    predicted_paths: frozenset[str] = field(default_factory=frozenset)
 
     def has(self, label: Label) -> bool:
         return label in self.labels
@@ -213,6 +217,32 @@ def extract_declared_paths(body: str) -> frozenset[str]:
         if p:
             out.add(p)
     return frozenset(out)
+
+
+def normalize_predicted_paths(raw: object) -> frozenset[str]:
+    """Return safe, exact repo-relative router predictions, else no signal.
+
+    This input is structured model output, not GitHub ground truth. One malformed
+    value must never turn the overlap serializer into a broad deny gate, so an
+    invalid list fails open as a whole rather than preserving a partial guess.
+    """
+    if not isinstance(raw, (list, tuple, frozenset)) or len(raw) > 32:
+        return frozenset()
+    paths: set[str] = set()
+    for path in raw:
+        if not isinstance(path, str) or not path or path != path.strip():
+            return frozenset()
+        normalized = path.removeprefix("./")
+        parts = normalized.split("/")
+        if (
+            not normalized
+            or normalized.startswith("/")
+            or "\\" in normalized
+            or any(part in ("", ".", "..") for part in parts)
+        ):
+            return frozenset()
+        paths.add(normalized)
+    return frozenset(paths)
 
 
 def paths_overlap_open_prs(
