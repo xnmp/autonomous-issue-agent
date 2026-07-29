@@ -106,6 +106,32 @@ export function verificationTone(status: string | null | undefined): Tone {
   return "neutral";
 }
 
+export function combinedVerificationStatus(
+  issueStatus: string | null | undefined,
+  prStatus: string | null | undefined,
+): string | null {
+  const statuses = [issueStatus, prStatus].filter(
+    (status): status is string => Boolean(status),
+  );
+  if (statuses.length === 0) return null;
+  if (statuses.some((status) => status.toUpperCase().includes("MISBEHAVED"))) {
+    return "misbehaved";
+  }
+  if (statuses.some((status) => status.toUpperCase().includes("PENDING"))) {
+    return "pending";
+  }
+  if (
+    statuses.length === 2
+    && statuses.every((status) => status.toUpperCase().includes("VERIFIED"))
+  ) {
+    return "verified";
+  }
+  if (statuses.some((status) => status.toUpperCase().includes("RETIRED"))) {
+    return "retired";
+  }
+  return "pending";
+}
+
 export function modelTone(model: string, effort?: string | null): Tone {
   const name = model.toLowerCase();
   const stance = (effort ?? "").toLowerCase();

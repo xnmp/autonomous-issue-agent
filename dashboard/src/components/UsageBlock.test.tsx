@@ -49,4 +49,41 @@ describe("UsageBlock", () => {
     expect(trigger).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("Claude 5h")).toBeVisible();
   });
+
+  it("uses horizontal meters in the collapsed sidebar", async () => {
+    const { container } = render(<UsageBlock usage={usage} collapsed />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Quota" }));
+
+    expect(screen.getByRole("meter", { name: "5h quota usage" })).toHaveAttribute(
+      "aria-valuenow",
+      "12",
+    );
+    expect(
+      container.querySelector(".compact-quota-track > span"),
+    ).toHaveStyle({ width: "12%" });
+    expect(container.querySelector(".quota-icon i")).toBeVisible();
+  });
+
+  it("clamps compact meter values while announcing the true utilization", async () => {
+    const overCap: Polled<UsagePayload> = {
+      ...usage,
+      data: {
+        ...usage.data!,
+        harness: {
+          ...usage.data!.harness!,
+          global_daily_cap_usd: 20,
+          today_all_repos_usd: 30,
+        },
+      },
+    };
+    render(<UsageBlock usage={overCap} collapsed />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Quota" }));
+
+    expect(screen.getByRole("meter", { name: "$ quota usage" }))
+      .toHaveAttribute("aria-valuenow", "100");
+    expect(screen.getByRole("meter", { name: "$ quota usage" }))
+      .toHaveAttribute("aria-valuetext", "150%");
+  });
 });

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { kindLabel, modelTone, stageTone } from "./semantics";
+import {
+  combinedVerificationStatus,
+  kindLabel,
+  modelTone,
+  stageTone,
+} from "./semantics";
 
 describe("dashboard semantics", () => {
   it.each([
@@ -14,6 +19,24 @@ describe("dashboard semantics", () => {
   it("treats done as terminal success", () => {
     expect(stageTone("done")).toBe("ok");
   });
+
+  it.each([
+    ["VERIFIED", "VERIFIED", "verified"],
+    ["VERIFIED", "pending", "pending"],
+    ["VERIFIED", null, "pending"],
+    ["MISBEHAVED", "VERIFIED", "misbehaved"],
+    ["RETIRED", "RETIRED", "retired"],
+    ["VERIFIED", "RETIRED", "retired"],
+    ["RETIRED", null, "retired"],
+    ["RETIRED", "pending", "pending"],
+    ["RETIRED", "MISBEHAVED", "misbehaved"],
+    [null, null, null],
+  ])(
+    "combines issue %s and PR %s into one verification state",
+    (issue, pr, expected) => {
+      expect(combinedVerificationStatus(issue, pr)).toBe(expected);
+    },
+  );
 
   it.each([
     ["gpt-5.6-luna", null, "tier-luna"],

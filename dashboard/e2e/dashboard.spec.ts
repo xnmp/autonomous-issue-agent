@@ -198,11 +198,50 @@ async function mockApi(page: Page, reposDelayMs = 0) {
 
 test("operator workflow preserves semantics and navigation", async ({ page }) => {
   await mockApi(page);
+  await page.setViewportSize({ width: 1280, height: 560 });
   await page.goto("/#/repo/self/issues/done");
 
   await expect(page.locator(".chip strong", { hasText: "issue-agent" })).toBeVisible();
   await page.locator(".rail-past > summary").click();
   await expect(page.getByRole("button", { name: "Start daemons for sleeping" })).toBeVisible();
+  const sidebarBounds = await page.locator(".sidebar").boundingBox();
+  const footerBounds = await page.locator(".sidebar-foot").boundingBox();
+  expect(sidebarBounds).not.toBeNull();
+  expect(footerBounds).not.toBeNull();
+  expect(footerBounds!.y + footerBounds!.height).toBeLessThanOrEqual(
+    sidebarBounds!.y + sidebarBounds!.height + 1,
+  );
+  await expect(page.getByRole("button", { name: "Quota", exact: true })).toBeInViewport();
+  await expect(page.getByRole("button", { name: "Settings", exact: true })).toBeInViewport();
+  await expect(page.getByRole("button", { name: "Verification ledger", exact: true })).toBeInViewport();
+  expect(await page.evaluate(() => document.documentElement.scrollHeight)).toBe(560);
+
+  const expectVerticallyContained = async (selector: string) => {
+    const bounds = await page.locator(selector).boundingBox();
+    expect(bounds).not.toBeNull();
+    expect(bounds!.y).toBeGreaterThanOrEqual(0);
+    expect(bounds!.y + bounds!.height).toBeLessThanOrEqual(560);
+  };
+  await page.getByRole("button", { name: "Quota", exact: true }).click();
+  await expectVerticallyContained(".quota-card");
+  await page.screenshot({
+    path: "../evidence/dashboard-sidebar-footer.png",
+    fullPage: true,
+  });
+  await page.getByRole("button", { name: "Quota", exact: true }).click();
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await expectVerticallyContained(".options-popover");
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+
+  await page.getByRole("button", { name: "Collapse sidebar" }).click();
+  await page.getByRole("button", { name: "Quota", exact: true }).click();
+  await expectVerticallyContained(".quota-card");
+  await page.getByRole("button", { name: "Quota", exact: true }).click();
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await expectVerticallyContained(".options-popover");
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByRole("button", { name: "Expand sidebar" }).click();
+  await page.setViewportSize({ width: 1440, height: 900 });
 
   const quotaButton = page.getByRole("button", { name: "Quota", exact: true });
   await expect(quotaButton).toHaveAttribute("aria-expanded", "false");
@@ -219,6 +258,14 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await expect(page.getByRole("button", { name: "Quota" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();
   await expect(page.getByRole("region", { name: "Quota" })).toHaveClass(/compact/);
+  for (const name of ["Quota", "Settings", "Verification ledger"]) {
+    const bounds = await page.getByRole("button", { name, exact: true }).boundingBox();
+    expect(bounds?.width).toBeGreaterThanOrEqual(40);
+    expect(bounds?.height).toBeGreaterThanOrEqual(40);
+  }
+  const compactTrack = page.locator(".compact-quota-track").first();
+  const compactTrackBounds = await compactTrack.boundingBox();
+  expect(compactTrackBounds!.width).toBeGreaterThan(compactTrackBounds!.height);
   await page.screenshot({
     path: "../evidence/dashboard-sidebar-collapsed.png",
     fullPage: true,

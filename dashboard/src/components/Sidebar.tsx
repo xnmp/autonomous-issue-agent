@@ -134,7 +134,7 @@ export function Sidebar({
   return (
     <aside
       className={`sidebar${collapsed ? " collapsed" : ""}`}
-      style={{ width: collapsed ? 44 : width }}
+      style={{ width: collapsed ? 52 : width }}
     >
       <button
         className="sidebar-toggle"
