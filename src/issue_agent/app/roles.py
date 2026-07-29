@@ -200,6 +200,7 @@ def _build_codex_runner(
     default_model: str | None,
     sandbox: str,
     inject_system_prompt: bool,
+    resume_on_retry: bool,
     log,
 ):
     """Build either role's Codex adapter from the single runtime config.
@@ -223,6 +224,7 @@ def _build_codex_runner(
             wire_api=runtime.wire_api,
         ),
         sandbox=sandbox,
+        resume_on_retry=resume_on_retry,
         reasoning_effort=runtime.reasoning_effort,
         inject_system_prompt=inject_system_prompt,
         log=log,
@@ -706,6 +708,7 @@ def build_fix_daemon(
             sandbox=codex_runtime.sandbox,
             # AGENT.md reaches Codex through the worktree instructions below.
             inject_system_prompt=False,
+            resume_on_retry=True,
             log=_log("fix"),
         )
         # Surface a codex misconfig (missing bin/key) at STARTUP, not on the first
@@ -922,6 +925,7 @@ def build_review_daemon(
             default_model=review_runtime.model,
             sandbox="read-only",
             inject_system_prompt=True,
+            resume_on_retry=False,
             log=_log("review"),
         )
         reason = review_runner.preflight()
@@ -949,6 +953,14 @@ def build_review_daemon(
         )
         if budget_notice is not None:
             _log("review")(budget_notice)
+        # Codex ignores AgentTask's SDK-only tool policy. Install the dedicated
+        # read-only Bash allow-list before the first run; it also blocks ambient
+        # `gh` mutations, which a filesystem sandbox cannot contain.
+        from ..adapters.codex_hook import write_hook_config
+
+        write_hook_config(
+            cfg.target_dir or os.getcwd(), review_only=True, log=_log("review")
+        )
 
     # Reviewer has no worktree/issue side; pass a no-op Worktrees-like None usage.
     executor = Executor(

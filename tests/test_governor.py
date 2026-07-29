@@ -34,6 +34,12 @@ def test_shell_hook_reuses_shared_policy_functions():
     assert hook.find_violations is gov.find_violations
 
 
+def test_codex_review_hook_allows_only_the_review_bash_surface():
+    assert hook.review_only_violation("git diff --stat && gh pr view 97") is None
+    assert hook.review_only_violation("gh pr review 97 --approve") is not None
+    assert hook.review_only_violation("curl https://example.test") is not None
+
+
 # ── extract_commands: finds command nodes anywhere in the tree ────────────────
 def test_extract_simple():
     assert gov.extract_commands("git commit -m x") == [["git", "commit", "-m", "x"]]

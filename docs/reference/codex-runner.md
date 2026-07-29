@@ -36,9 +36,12 @@ model and rollout usage, enabling cost-mix analysis by runtime/model.
 Codex review supports `REVIEW_MODE=single` only. `multi` and `delegated` rely
 on Claude aliases and SDK subagents, so configuration rejects those combinations
 instead of silently dropping legs. The reviewer runs in the operator checkout
-under Codex's read-only sandbox. Because Codex's resume grammar cannot carry a
-sandbox setting, every Codex re-review is intentionally a fresh session; it
-receives the prior verdict as context and cannot regain a writable resume mode.
+under Codex's read-only sandbox and a dedicated governor allow-list (`git diff`,
+`gh pr diff/view`, `cat`, `ls`), so filesystem and ambient-GitHub mutation paths
+are both contained. Because Codex's resume grammar cannot carry a sandbox
+setting, every Codex re-review and in-leg transport retry is intentionally a
+fresh session; it receives the prior verdict as context and cannot regain a
+writable resume mode.
 
 This is a **second runtime adapter**, NOT an OpenAI-SDK rewrite. A fixer run is
 `AgentTask → AgentResult`; `AgentRunner` realises that over the Claude SDK, and a

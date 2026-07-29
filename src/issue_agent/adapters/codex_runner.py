@@ -864,6 +864,10 @@ class CodexRunner(AgentRuntime):
     # up to `transport_retries` times with jittered exponential backoff
     # (delay = backoff_base * 2**attempt + U[0, delay/2]). 0 disables the loop.
     transport_retries: int = 4
+    # `codex exec resume` necessarily bypasses the sandbox because its grammar
+    # has no --sandbox form. Fix worktrees opt into recovery-by-resume; the
+    # read-only reviewer deliberately retries as a fresh sandboxed session.
+    resume_on_retry: bool = True
     backoff_base: float = 2.0
     # Rate-limit (HTTP 429) backoff — DISTINCT from the network-drop backoff above.
     # A 429 must wait for the provider's throttle window to renew (Azure GPT-5.5:
@@ -1137,7 +1141,8 @@ class CodexRunner(AgentRuntime):
                 return result  # success, genuine error, or blocked — never retry over output
 
             # Carry the session id forward so the retry RESUMES rather than restarts.
-            resume_id = result.session_id or resume_id
+            if self.resume_on_retry:
+                resume_id = result.session_id or resume_id
 
             if _is_rate_limited(stderr):
                 # Provider pushback (429): wait for the throttle window to renew.

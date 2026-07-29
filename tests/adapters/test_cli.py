@@ -16,14 +16,18 @@ from issue_agent.app import cli
 from issue_agent.app.config import from_env
 
 
-def test_overlay_reviewer_runtime_roundtrips_to_daemon_config(tmp_path):
+def test_overlay_reviewer_runtime_overrides_and_scrubs_ambient_value(tmp_path, monkeypatch):
     overlay = tmp_path / "app.env"
     overlay.write_text('REPO="o/r"\nREVIEWER_RUNTIME="claude"\n')
+    monkeypatch.setenv("REVIEWER_RUNTIME", "codex")
 
     runtime = cli.read_repo_env_field(str(overlay), "REVIEWER_RUNTIME")
 
     assert runtime == "claude"
     assert from_env({"REPO": "o/r", "REVIEWER_RUNTIME": runtime}).reviewer_runtime == "claude"
+
+    overlay.write_text('REPO="o/r"\n')
+    assert cli.read_repo_env_field(str(overlay), "REVIEWER_RUNTIME") == ""
 
 
 # ── parse_remote_url ──────────────────────────────────────────────────────────

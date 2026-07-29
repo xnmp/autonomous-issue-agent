@@ -238,7 +238,10 @@ in-flight usage source because it contains agent-controlled tool/test output.
 Codex review is deliberately narrower than Codex fix: only `REVIEW_MODE=single`
 is supported, it uses the read-only sandbox in the operator checkout, and every
 re-review starts fresh because `codex exec resume` cannot carry a sandbox flag.
-Do not broaden that boundary without an equivalent, tested containment mechanism.
+The dedicated review governor also blocks shell commands outside `git diff`,
+`gh pr diff/view`, `cat`, and `ls`, so ambient GitHub credentials cannot bypass
+the read-only filesystem boundary. Do not broaden that boundary without an
+equivalent, tested containment mechanism.
 
 ## Identities
 
