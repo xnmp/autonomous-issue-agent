@@ -217,9 +217,16 @@ class Store:
         raise ValueError(f"unknown pending lifecycle action type: {kind!r}")
 
     def load_pending_actions(self) -> tuple[Action, ...]:
-        raw = self._read(self.pending_actions_path())
-        if not raw:
+        path = self.pending_actions_path()
+        try:
+            with open(path) as queue:
+                raw = queue.read()
+        except FileNotFoundError:
             return ()
+        except OSError as exc:
+            raise OSError(f"pending lifecycle queue is unreadable: {path}") from exc
+        if not raw.strip():
+            raise ValueError("pending lifecycle queue is empty")
         try:
             values = json.loads(raw)
         except json.JSONDecodeError as exc:

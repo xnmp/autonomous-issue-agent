@@ -7,6 +7,7 @@ from issue_agent.app.loop import Daemon
 from issue_agent.domain.actions import (
     AgentKind,
     CloseIssue,
+    EscalateCiPending,
     PostComment,
     Relabel,
     RunAgent,
@@ -89,8 +90,20 @@ def test_relabel_is_covered_by_the_same_transient_retry_contract():
 
 
 def test_ambiguous_comment_failure_is_verified_before_retrying_the_post():
-    gateway = ScriptedGateway([unavailable()])
-    gateway.comment_visible = True
+    class LostAcknowledgementGateway:
+        def __init__(self):
+            self.comments = []
+            self.visible = False
+
+        def comment(self, kind, number, body):
+            self.comments.append((kind, number, body))
+            self.visible = True
+            raise unavailable()
+
+        def has_comment(self, kind, number, body):
+            return self.visible
+
+    gateway = LostAcknowledgementGateway()
     executor = Executor(
         gateway,
         retry_delays=(0,),
@@ -108,6 +121,7 @@ def test_pending_store_round_trips_every_terminal_lifecycle_action(tmp_path):
         PostComment(Target.ISSUE, 29, "Need clarification"),
         Relabel(Target.PR, 64, Label.AI_WORKING, Label.AI_PR_OPEN),
         CloseIssue(29, "completed", "Done"),
+        EscalateCiPending(64, "head-sha", "CI is stalled"),
     )
 
     store.save_pending_actions(actions)
@@ -202,3 +216,105 @@ def test_malformed_pending_queue_fails_closed_before_observe(tmp_path):
 
     assert daemon.tick() == []
     assert observed == []
+
+
+def test_unreadable_pending_queue_fails_closed_before_observe(tmp_path):
+    store = Store(str(tmp_path))
+    tmp_path.joinpath("pending-actions.json").mkdir()
+    observed = []
+    daemon = Daemon(
+        "fix",
+        lambda: observed.append(True) or WorldState(),
+        lambda _world: [RunAgent(AgentKind.RESOLVE, 29)],
+        Executor(ScriptedGateway([]), pending_actions=store),
+    )
+
+    assert daemon.tick() == []
+    assert observed == []
+
+
+class CompositeGateway:
+    def __init__(self, *, label_visible=False, fail_first_relabel=False):
+        self.comment_visible = False
+        self.label_visible = label_visible
+        self.fail_first_relabel = fail_first_relabel
+        self.calls = []
+
+    def comment(self, kind, number, body):
+        self.calls.append(("comment", kind, number, body))
+        self.comment_visible = True
+
+    def relabel(self, kind, number, remove, add):
+        self.calls.append(("relabel", kind, number, remove, add))
+        if self.fail_first_relabel:
+            self.fail_first_relabel = False
+            raise unavailable("HTTP 503: Service unavailable")
+        self.label_visible = True
+
+    def has_comment(self, kind, number, body):
+        return self.comment_visible
+
+    def has_label(self, kind, number, label):
+        return self.label_visible
+
+
+def test_composite_retry_does_not_repost_an_accepted_comment(tmp_path):
+    gateway = CompositeGateway(fail_first_relabel=True)
+    marked = []
+    executor = Executor(
+        gateway,
+        mark_ci_pending_escalated=lambda pr, head: marked.append((pr, head)),
+        pending_actions=Store(str(tmp_path)),
+        retry_delays=(0,),
+        sleep=lambda _seconds: None,
+    )
+
+    executor.execute(EscalateCiPending(64, "head-sha", "CI is stalled"))
+
+    assert [call[0] for call in gateway.calls] == ["comment", "relabel", "relabel"]
+    assert marked == [(64, "head-sha")]
+
+
+def test_composite_replay_repairs_missing_comment_before_clearing_marker(tmp_path):
+    action = EscalateCiPending(64, "head-sha", "CI is stalled")
+    store = Store(str(tmp_path))
+    store.save_pending_actions((action,))
+    gateway = CompositeGateway(label_visible=True)
+    marked = []
+    executor = Executor(
+        gateway,
+        mark_ci_pending_escalated=lambda pr, head: marked.append((pr, head)),
+        pending_actions=store,
+        retry_delays=(),
+    )
+
+    assert executor.replay_pending() is True
+
+    assert [call[0] for call in gateway.calls] == ["comment"]
+    assert marked == [(64, "head-sha")]
+    assert store.load_pending_actions() == ()
+
+
+def test_unverified_composite_is_failed_and_remains_pending(tmp_path):
+    class NeverVerifiedGateway(CompositeGateway):
+        def has_label(self, kind, number, label):
+            return False
+
+    store = Store(str(tmp_path))
+    journal = RecordingJournal()
+    action = EscalateCiPending(64, "head-sha", "CI is stalled")
+    executor = Executor(
+        NeverVerifiedGateway(),
+        pending_actions=store,
+        journal=journal,
+        retry_delays=(),
+    )
+
+    executor.execute_all([action])
+
+    assert not any(event == "action" for event, _ in journal.events)
+    assert any(
+        event == "action_failed" and fields["pending"] is True
+        for event, fields in journal.events
+    )
+    assert store.load_pending_actions() == (action,)
