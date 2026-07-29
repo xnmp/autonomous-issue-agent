@@ -80,8 +80,18 @@ stop. Never self-modify mid-batch.
   independently before overriding, and file the gap); restore caps and
   regenerate stale env snapshots; populate newly-landed knobs; pick the batch
   (seam inside TEST_CMD coverage, no existing closing PRs, overlap-disjoint —
-  the steward proposes under #15, the manager approves).
-- **During**: detect and restart dead daemons; investigate wedged legs before
+  the steward proposes under #15, the manager approves). Treat the **first
+  launch at a new target as an incident surface, not a checklist step**: the
+  gate probe runs the target's full suite under the deployment env for the
+  first time — watch the process tree while it runs (a runaway is invisible in
+  the launcher's buffered output), and when a harness bug blocks the launch,
+  work around it in the gitignored overlay, file the issue with evidence, and
+  put the real fix in the batch. Never patch harness code to unblock a launch.
+- **During**: poll on a **15-minute cadence** (the default babysitting
+  workflow): each cycle, read the new journal lines from all three role state
+  dirs plus the fix-log tail, report anything notable to the operator, and
+  re-arm — a cycle with no events is itself a report ("no new events"), not
+  silence; detect and restart dead daemons; investigate wedged legs before
   killing; answer `status=blocked` clarification questions (evidence
   unproducible from a worktree/CI → scope it to operator post-verification;
   genuine product ambiguity → escalate to the human, don't guess); tick off
