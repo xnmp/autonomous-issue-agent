@@ -224,8 +224,9 @@ monotonic time to distinguish a machine suspension from an ordinary long agent
 leg. A detected gap journals a `stall`, re-verifies structured durable `action`
 receipts through the #64 pending-action machinery, and appends
 `agent_run_stall` corrections for overlapping settled legs. The journal stays
-append-only; dashboard wall-clock calculations deduplicate those corrections by
-stall start before subtracting suspension time.
+append-only; each leg's correction comes from its wall duration minus monotonic
+runtime, and dashboard wall-clock calculations cluster overlapping role
+estimates before subtracting each suspension once.
 
 On codex, `MAX_BUDGET_USD` and `REVIEW_BUDGET_USD` are enforced in the harness
 rather than by a CLI flag: the runner samples the rollout's cumulative token
