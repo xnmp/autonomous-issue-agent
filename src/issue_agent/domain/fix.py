@@ -124,6 +124,10 @@ class FixState:
 
     sessions: frozenset[int] = frozenset()        # issues with a saved session
     resumed_at: dict[int, str] = field(default_factory=dict)  # issue → last reply ts resumed on
+    # PR → last PR-thread reply timestamp consumed by a PR-stage resume. This
+    # must not share the issue marker: one issue can have a different issue
+    # thread and PR thread, whose timestamps are unrelated.
+    pr_resumed_at: dict[int, str] = field(default_factory=dict)
     automerge_enabled: frozenset[int] = frozenset()  # PRs already auto-merge-enabled (marker)
     # Per-issue retry counters (issue → count). Drive the circuit breakers: an
     # unbounded fix-CI / address-review loop burns budget forever, so at the cap
@@ -354,7 +358,7 @@ def pick_ready_issue(world: WorldState) -> int | None:
     return ready[0].number
 
 
-def last_human_reply(issue: IssueView, fix_bot: str) -> Comment | None:
+def last_human_reply(issue: IssueView | PRView, fix_bot: str) -> Comment | None:
     """Latest answer posted after the harness's unblock prompt, or None.
 
     Public because BOTH sides of the resume dedup must select the SAME comment:
@@ -378,6 +382,7 @@ def last_human_reply(issue: IssueView, fix_bot: str) -> Comment | None:
     prompt_prefixes = (
         "**Agent needs input:**",
         "**Agent still needs input:**",
+        "**Agent needs clarification on review:**",
         "**Author needs input:**",
     )
     prompt_index = next(
@@ -407,7 +412,7 @@ def last_human_reply(issue: IssueView, fix_bot: str) -> Comment | None:
     return humans[-1] if humans else None
 
 
-def _last_human_reply_at(issue: IssueView, fix_bot: str) -> str | None:
+def _last_human_reply_at(issue: IssueView | PRView, fix_bot: str) -> str | None:
     reply = last_human_reply(issue, fix_bot)
     if reply is None:
         return None
@@ -430,6 +435,32 @@ def issues_needing_resume(
             continue
         if last_at != state.resumed_at.get(issue.number, ""):
             out.append((issue.number, last_at))
+    return out
+
+
+def prs_needing_resume(
+    world: WorldState, state: FixState, cfg: FixConfig
+) -> list[tuple[int, int, str]]:
+    """Blocked fixer PRs with a linked issue session and an unconsumed reply.
+
+    PR-stage legs put their clarification prompt and `ai-blocked` label on the
+    PR, not its issue. The reply marker is therefore PR-keyed too: an issue and
+    its PR have independent threads, and their GitHub timestamps cannot safely
+    share a dedupe namespace.
+    """
+    out: list[tuple[int, int, str]] = []
+    for pr in fixer_prs(world, cfg):
+        # `needs-human-review` is also lifecycle-blocked, but it is terminal:
+        # an operator reply must never silently reopen an escalation that
+        # deliberately removed `ai-blocked` at the retry/infra ceiling.
+        if not pr.has(Label.AI_BLOCKED):
+            continue
+        issue = _issue_for_pr(pr)
+        if issue is None or issue not in state.sessions:
+            continue
+        last_at = _last_human_reply_at(pr, cfg.fix_bot)
+        if last_at is not None and last_at != state.pr_resumed_at.get(pr.number, ""):
+            out.append((pr.number, issue, last_at))
     return out
 
 
@@ -903,10 +934,12 @@ def ci_flakes(
     )
 
 
-def _escalate_pr(pr: int, reason: str) -> list[Action]:
+def _escalate_pr(
+    pr: int, reason: str, from_label: Label = Label.AI_PR_OPEN
+) -> list[Action]:
     """Stop dispatching a stuck PR leg: comment why, then swap ai-pr-open for
     needs-human-review so neither the fixer nor the reviewer re-acts on it."""
-    return pr_escalation(pr, reason).actions()
+    return pr_escalation(pr, reason, from_label).actions()
 
 
 def infra_ceiling_hit(state: FixState, cfg: FixConfig, key: int) -> bool:
@@ -942,7 +975,7 @@ def decide_fix(
 
       reap (when idle) → CI pending-deadline escalation (lock-free) →
       duplicate-PR guard (lock-free) → at most ONE fixer-consuming dispatch
-      (resolve > resume > address-review > fix-ci, in that priority) →
+      (PR repairs > issue resume > new resolve) →
       auto-merge (lock-free) → cleanup of merged/closed PRs (lock-free).
 
     A red PR's FIRST failure on a head emits `RerunFailedChecks` INSTEAD of the
@@ -971,6 +1004,10 @@ def decide_fix(
     consumed = fixer_busy
     # Only the fixer's OWN PRs are actionable here — see `fixer_prs`.
     open_prs = list(fixer_prs(world, cfg))
+    pr_resume_replies = {
+        pr: (issue, reply_at)
+        for pr, issue, reply_at in prs_needing_resume(world, state, cfg)
+    }
 
     # 0) CI pending deadline (#30). Lock-free: it dispatches no agent, so unlike
     # every breaker below it does not read `consumed`, and for a given world it
@@ -1007,7 +1044,20 @@ def decide_fix(
     for pr in open_prs:
         lifecycle = pr_lifecycle(pr)
         if lifecycle.is_blocked:
-            continue  # awaiting human clarification — leave alone
+            # PR-stage blockers are answered on the PR, while the saved agent
+            # transcript belongs to its linked issue. A qualifying reply gets a
+            # dedicated PR-keyed dispatch; all other blocked PRs remain quiet.
+            if not consumed and pr.number in pr_resume_replies:
+                bkey = breaker_key(pr)
+                if infra_ceiling_hit(state, cfg, bkey):
+                    actions.extend(_escalate_pr(
+                        pr.number, infra_escalation_reason(cfg.max_infra_deaths),
+                        Label.AI_BLOCKED,
+                    ))
+                    continue
+                actions.append(RunAgent(AgentKind.PR_RESUME, pr.number))
+                consumed = True
+            continue
         if not consumed:
             issue_n = _issue_for_pr(pr)
             bkey = breaker_key(pr)  # retry-counter key (issue N, or -PR when issueless)

@@ -54,8 +54,8 @@ test-point-at:
 	@bash tests/test_point_at.sh
 
 test-domain:
-	@echo "== domain (pytest, pure) =="
-	@uv run --quiet --with pytest pytest tests/domain/
+	@echo "== domain (pytest) =="
+	@uv run --quiet --with pytest --with tree-sitter --with tree-sitter-bash pytest tests/domain/
 
 # Phase 2 adapters exercise real application wiring and the reused tree-sitter
 # bypass core, so declare the SDK and parser dependencies at this tier.

@@ -106,6 +106,7 @@ class FakeStore:
         self.last_patch_id = {}
         self.rounds = {}
         self.resumes = {}
+        self.pr_resumed_at = {}
         self.phases = {}
         self.infra_deaths = {}
         self.models = {}
@@ -156,6 +157,12 @@ class FakeStore:
 
     def get_resumed_at(self, i):
         return getattr(self, "resumed_at", {}).get(i, "")
+
+    def set_pr_resumed_at(self, pr, at):
+        self.pr_resumed_at[pr] = at
+
+    def get_pr_resumed_at(self, pr):
+        return self.pr_resumed_at.get(pr, "")
 
     def get_review_retry(self, i):
         return getattr(self, "review_retries", {}).get(i, ("", 0))

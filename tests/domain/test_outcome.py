@@ -9,8 +9,11 @@ from issue_agent.domain.outcome import (
     deterministic_death,
     infra_death,
     offending_path,
+    pr_resume_actions,
     resolve_followup,
 )
+from issue_agent.domain.actions import Relabel, Target
+from issue_agent.domain.labels import Label
 
 
 def _ok(status="pr_opened", **kw):
@@ -90,6 +93,13 @@ def test_unclassified_result_is_never_an_infra_death():
     # None = a legacy/hand-built result. Every consumer must keep pre-taxonomy
     # behavior, so adopting the field is additive and can't silently change policy.
     assert infra_death(None) is False
+
+
+def test_pr_resume_infra_death_keeps_the_blocked_pr_unchanged():
+    actions = pr_resume_actions(
+        100, AgentResult(is_error=True, exit_reason=ExitReason.TRANSPORT_DEATH)
+    )
+    assert actions == []
     assert AgentResult(is_error=True).exit_reason is None
     assert AgentResult(is_error=True).usage is None
 

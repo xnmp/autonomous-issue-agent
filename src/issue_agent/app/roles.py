@@ -208,6 +208,7 @@ def _fix_state(store: Store, world) -> FixState:
     """Read the per-issue/PR orchestration state the fix decision needs."""
     sessions = frozenset(i.number for i in world.issues if store.has_session(i.number))
     resumed = {i.number: store.get_resumed_at(i.number) for i in world.issues}
+    pr_resumed = {p.number: store.get_pr_resumed_at(p.number) for p in world.prs}
     automerge = frozenset(p.number for p in world.prs if store.automerge_enabled(p.number))
     # Retry counters are keyed by breaker_key(pr): the linked issue number, or the
     # NEGATED PR number when a PR has no resolvable issue (Jira-keyed branch, no
@@ -270,7 +271,8 @@ def _fix_state(store: Store, world) -> FixState:
         if (head := get_ci_pending_head(p.number))
     )
     return FixState(
-        sessions=sessions, resumed_at=resumed, automerge_enabled=automerge,
+        sessions=sessions, resumed_at=resumed, pr_resumed_at=pr_resumed,
+        automerge_enabled=automerge,
         ci_retries=ci_retries, review_retries=review_retries,
         rebase_retries=rebase_retries, resolve_retries=resolve_retries,
         infra_deaths=infra_deaths, ci_rerun_head=ci_rerun_head,

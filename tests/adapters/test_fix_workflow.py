@@ -250,6 +250,25 @@ def test_resume_writes_resumed_at_mark():
     assert "the answer" in runner.tasks[0].prompt
 
 
+def test_pr_resume_uses_pr_reply_and_linked_issue_session_once():
+    prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
+    iss = IssueView(5, title="t", body="b")
+    p = PRView(
+        100, head_ref_name="fix/5-token", closing_issue=5,
+        comments=(Comment("fix-bot", prompt, "t1"), Comment("alice", "Use A.", "t2")),
+    )
+    gw = FakeGateway(issues={5: iss}, prs={100: p})
+    store = FakeStore()
+    store.save_session(5, "prior-session")
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s5"))
+
+    asyncio.run(_workflow(gw, store, runner, fix_bot="fix-bot").resume_pr(100))
+
+    assert store.get_pr_resumed_at(100) == "t2"
+    assert "Use A." in runner.tasks[0].prompt
+    assert ("relabel", "pr", 100, "ai-blocked", "ai-pr-open") in gw.calls
+
+
 def test_resume_without_human_reply_does_not_run():
     # Only fixer/bot comments on the thread → nothing to resume on; no session
     # spend, no resumed-at mark.

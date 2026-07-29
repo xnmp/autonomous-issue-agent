@@ -433,6 +433,7 @@ def parse_pr(d: dict) -> PRView:
         title=d.get("title", "") or "",
         body=d.get("body", "") or "",
         labels=_labels(d.get("labels")),
+        comments=_comments(d.get("comments")),
         reviews=_reviews(d.get("reviews")),
         checks=_checks(d.get("statusCheckRollup") or d.get("checks")),
         state=(d.get("state", "OPEN") or "OPEN").upper(),
@@ -773,7 +774,7 @@ class GitHubGateway:
         enrichment set for days (list_pr_states). Absent checks parse to () →
         ci_state(()) is NONE, which no consumer reads for a non-open PR."""
         base = ("number,title,body,headRefName,headRefOid,baseRefName,labels,"
-                "reviews,state,closingIssuesReferences,files,isDraft,author")
+                "comments,reviews,state,closingIssuesReferences,files,isDraft,author")
         fields = base + (",mergeable,mergeStateStatus" if mergeability else "")
         d = self._gh_json(
             ["pr", "view", str(number), "--repo", self.repo, "--json", fields]

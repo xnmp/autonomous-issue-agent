@@ -34,6 +34,7 @@ from issue_agent.domain.fix import (
     issues_needing_resume,
     orphaned_cleanup_actions,
     pick_ready_issue,
+    prs_needing_resume,
     reap_actions,
     should_automerge,
 )
@@ -374,6 +375,105 @@ def test_resume_dispatch_relabels_blocked_to_working():
     )
     runs = _run_agents(actions)
     assert runs and runs[0].kind == AgentKind.RESUME and runs[0].number == 7
+
+
+def test_blocked_pr_reply_dispatches_pr_resume_for_linked_issue_session():
+    prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
+    blocked = pr(
+        100, "ai-pr-open", "ai-blocked", closing_issue=7,
+        comments=(Comment("fix-bot", prompt, "t1"), Comment("alice", "Use A.", "t2")),
+    )
+    state = FixState(sessions=frozenset({7}))
+    w = world(prs=[blocked])
+
+    assert prs_needing_resume(w, state, CFG) == [(100, 7, "t2")]
+    actions = decide_fix(w, CFG, state, fixer_busy=False)
+
+    assert RunAgent(AgentKind.PR_RESUME, 100) in _run_agents(actions)
+
+
+def test_blocked_pr_review_prompt_ignores_comments_before_the_prompt():
+    review_prompt = (
+        "**Agent needs clarification on review:**\n\n"
+        "Which approach should I take?\n\n_Reply to unblock._"
+    )
+    blocked = pr(
+        100, "ai-pr-open", "ai-blocked", closing_issue=7,
+        comments=(
+            Comment("alice", "Earlier feedback", "t1"),
+            Comment("fix-bot", review_prompt, "t2"),
+        ),
+    )
+    state = FixState(sessions=frozenset({7}))
+
+    assert prs_needing_resume(world(prs=[blocked]), state, CFG) == []
+    assert _run_agents(decide_fix(world(prs=[blocked]), CFG, state, fixer_busy=False)) == []
+
+
+def test_blocked_pr_reply_already_resumed_does_not_dispatch_again():
+    prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
+    blocked = pr(
+        100, "ai-pr-open", "ai-blocked", closing_issue=7,
+        comments=(Comment("fix-bot", prompt, "t1"), Comment("alice", "Use A.", "t2")),
+    )
+    state = FixState(sessions=frozenset({7}), pr_resumed_at={100: "t2"})
+
+    assert prs_needing_resume(world(prs=[blocked]), state, CFG) == []
+    assert _run_agents(decide_fix(world(prs=[blocked]), CFG, state, fixer_busy=False)) == []
+
+
+def test_blocked_pr_newer_reply_after_dedupe_dispatches_once_more():
+    prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
+    blocked = pr(
+        100, "ai-pr-open", "ai-blocked", closing_issue=7,
+        comments=(
+            Comment("fix-bot", prompt, "t1"),
+            Comment("alice", "Use A.", "t2"),
+            Comment("alice", "Actually use B.", "t3"),
+        ),
+    )
+    state = FixState(sessions=frozenset({7}), pr_resumed_at={100: "t2"})
+
+    assert prs_needing_resume(world(prs=[blocked]), state, CFG) == [(100, 7, "t3")]
+    assert RunAgent(AgentKind.PR_RESUME, 100) in _run_agents(
+        decide_fix(world(prs=[blocked]), CFG, state, fixer_busy=False)
+    )
+
+
+def test_blocked_pr_reply_from_operator_who_is_fix_bot_dispatches_resume():
+    prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
+    blocked = pr(
+        100, "ai-pr-open", "ai-blocked", closing_issue=7,
+        comments=(Comment("fix-bot", prompt, "t1"), Comment("fix-bot", "Use A.", "t2")),
+    )
+    state = FixState(sessions=frozenset({7}))
+
+    assert prs_needing_resume(world(prs=[blocked]), state, CFG) == [(100, 7, "t2")]
+
+
+def test_pr_resume_infra_ceiling_replaces_the_blocked_label():
+    prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
+    blocked = pr(
+        100, "ai-pr-open", "ai-blocked", closing_issue=7,
+        comments=(Comment("fix-bot", prompt, "t1"), Comment("alice", "Use A.", "t2")),
+    )
+    state = FixState(sessions=frozenset({7}), infra_deaths={7: 5})
+
+    assert Relabel(Target.PR, 100, Label.AI_BLOCKED, Label.NEEDS_HUMAN_REVIEW) in decide_fix(
+        world(prs=[blocked]), INFRA_CFG, state, fixer_busy=False
+    )
+
+
+def test_needs_human_review_pr_reply_never_reopens_the_escalation():
+    prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
+    escalated = pr(
+        100, "ai-pr-open", "needs-human-review", closing_issue=7,
+        comments=(Comment("fix-bot", prompt, "t1"), Comment("alice", "Use A.", "t2")),
+    )
+    state = FixState(sessions=frozenset({7}))
+
+    assert prs_needing_resume(world(prs=[escalated]), state, CFG) == []
+    assert _run_agents(decide_fix(world(prs=[escalated]), CFG, state, fixer_busy=False)) == []
 
 
 # ── conflict backup plan: auto-rebase a CONFLICTING PR ────────────────────────
