@@ -219,12 +219,16 @@ self-referential `TEST_CMD`/`.harness/test-cmd` (the #63 fork-bomb class) into
 a loud bounded failure instead of an unbounded process tree; gate timeouts
 kill the whole process group, not just the direct child.
 
-On codex, `MAX_BUDGET_USD` is enforced in the harness rather than by a CLI
-flag: the runner samples the rollout's cumulative token counters, subtracts the
-resumed session baseline, and kills the process group when the current leg
-crosses the threshold. This requires `CODEX_ENFORCE_BUDGET=1` and positive input
-and output prices for every fallback/per-model rate; startup logs explicitly
-report any configuration where the dollar bound cannot be enforced. Codex
+On codex, `MAX_BUDGET_USD` and `REVIEW_BUDGET_USD` are enforced in the harness
+rather than by a CLI flag: the runner samples the rollout's cumulative token
+counters, subtracts the resumed session baseline, and kills the process group
+when the current leg crosses the threshold. This requires `CODEX_ENFORCE_BUDGET=1`
+and positive input and output prices for every fallback/per-model rate; startup
+logs explicitly report any configuration where the dollar bound cannot be
+enforced. `REVIEWER_RUNTIME=codex` is the default, but mixed fixer/reviewer
+runtimes remain the recommended self-hosting posture: a shared runtime can hide
+the same failure it creates, while GitHub review identity remains `REVIEW_BOT`
+regardless of runtime. Codex
 0.146.0 no longer prints a session-id header: fresh-run identity comes from the
 post-start rollout `session_meta` matching the worktree, `originator=codex_exec`,
 and `source=exec`. The source filter excludes same-cwd subagent rollouts; resumed
