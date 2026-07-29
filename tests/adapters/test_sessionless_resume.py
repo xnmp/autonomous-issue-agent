@@ -2,8 +2,6 @@
 
 import asyncio
 
-import pytest
-
 from builders import Comment, issue, world
 from test_convergence import Scenario, simulate
 from test_dispatch import FakeGateway, FakeRunner, FakeStore
@@ -78,10 +76,7 @@ def test_sessionless_reply_keeps_world_order_when_saved_session_also_waits():
     ]
 
 
-@pytest.mark.parametrize("author_tests_split", [False, True])
-def test_sessionless_reply_starts_fresh_with_issue_and_reply_context(
-    author_tests_split,
-):
+def test_sessionless_reply_starts_fresh_with_issue_and_reply_context():
     iss = IssueView(
         5,
         title="Choose storage",
@@ -102,7 +97,6 @@ def test_sessionless_reply_starts_fresh_with_issue_and_reply_context(
             FakeStore(),
             runner,
             fix_bot="fix-bot",
-            author_tests_split=author_tests_split,
         ).resume(5)
     )
 
@@ -113,10 +107,7 @@ def test_sessionless_reply_starts_fresh_with_issue_and_reply_context(
     assert "Use PostgreSQL." in task.prompt
 
 
-@pytest.mark.parametrize("author_tests_split", [False, True])
-def test_reply_with_session_continues_the_saved_runtime_handle(
-    author_tests_split,
-):
+def test_reply_with_session_continues_the_saved_runtime_handle():
     iss = IssueView(
         5,
         title="t",
@@ -143,8 +134,82 @@ def test_reply_with_session_continues_the_saved_runtime_handle(
             store,
             runner,
             fix_bot="fix-bot",
-            author_tests_split=author_tests_split,
         ).resume(5)
     )
 
     assert runner.tasks[0].resume == "prior-session"
+
+
+def test_split_author_reply_stays_in_author_phase():
+    iss = IssueView(
+        5,
+        title="Choose storage",
+        body="The service must persist widgets.",
+        comments=(
+            WorldComment("fix-bot", "Which backend?", "t1"),
+            WorldComment("alice", "Use PostgreSQL.", "t2"),
+        ),
+    )
+    gateway = FakeGateway(issues={5: iss}, pr_for_issue={})
+    store = FakeStore()
+    store.save_session(5, "blocked-author-session")
+    runner = FakeRunner(
+        AgentResult(is_error=False, status="blocked", session_id="new-author-session")
+    )
+
+    asyncio.run(
+        _workflow(
+            gateway,
+            store,
+            runner,
+            fix_bot="fix-bot",
+            author_tests_split=True,
+        ).resume(5)
+    )
+
+    task = runner.tasks[0]
+    assert task.resume is None
+    assert "TEST/INTERFACE AUTHOR" in task.prompt
+    assert "Use PostgreSQL." in task.prompt
+    assert "Do NOT write the implementation" in task.prompt
+    assert store.get_phase(5) == ""
+
+
+def test_split_implementer_reply_stays_in_implementer_phase():
+    iss = IssueView(
+        5,
+        title="Choose storage",
+        body="The service must persist widgets.",
+        comments=(
+            WorldComment("fix-bot", "Which backend?", "t1"),
+            WorldComment("alice", "Use PostgreSQL.", "t2"),
+        ),
+    )
+    gateway = FakeGateway(issues={5: iss}, pr_for_issue={})
+    store = FakeStore()
+    store.set_phase(5, "authored")
+    store.save_session(5, "blocked-implementer-session")
+    runner = FakeRunner(
+        AgentResult(
+            is_error=False,
+            status="blocked",
+            session_id="new-implementer-session",
+        )
+    )
+
+    asyncio.run(
+        _workflow(
+            gateway,
+            store,
+            runner,
+            fix_bot="fix-bot",
+            author_tests_split=True,
+        ).resume(5)
+    )
+
+    task = runner.tasks[0]
+    assert task.resume is None
+    assert "You are the IMPLEMENTER" in task.prompt
+    assert "Use PostgreSQL." in task.prompt
+    assert "HARD RULE: do NOT modify" in task.prompt
+    assert store.get_phase(5) == "authored"
