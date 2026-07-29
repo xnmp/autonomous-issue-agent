@@ -124,6 +124,10 @@ class FixState:
 
     sessions: frozenset[int] = frozenset()        # issues with a saved session
     resumed_at: dict[int, str] = field(default_factory=dict)  # issue → last reply ts resumed on
+    # PR → last PR-thread reply timestamp consumed by a PR-stage resume. This
+    # must not share the issue marker: one issue can have a different issue
+    # thread and PR thread, whose timestamps are unrelated.
+    pr_resumed_at: dict[int, str] = field(default_factory=dict)
     automerge_enabled: frozenset[int] = frozenset()  # PRs already auto-merge-enabled (marker)
     # Per-issue retry counters (issue → count). Drive the circuit breakers: an
     # unbounded fix-CI / address-review loop burns budget forever, so at the cap

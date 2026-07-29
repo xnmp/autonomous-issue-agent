@@ -41,6 +41,7 @@ class AgentKind(Enum):
     # 4-second classify indistinguishable from a completed resolve (#40).
     ROUTE = auto()
     RESUME = auto()          # resume-issue.sh
+    PR_RESUME = auto()       # resume a PR-stage block with its issue session
     ADDRESS_REVIEW = auto()  # address-review.sh
     FIX_CI = auto()          # fix-ci.sh
     REBASE = auto()          # wake the fixer to rebase a CONFLICTING PR onto base
@@ -126,7 +127,8 @@ class EscalateCiPending:
 @dataclass(frozen=True)
 class RunAgent:
     """Dispatch a headless agent. `number` is the issue (RESOLVE/RESUME/TRIAGE)
-    or PR (ADDRESS_REVIEW/FIX_CI/REVIEW/RE_REVIEW); STEWARD_DRIVE ignores it."""
+    or PR (PR_RESUME/ADDRESS_REVIEW/FIX_CI/REVIEW/RE_REVIEW); STEWARD_DRIVE
+    ignores it."""
 
     kind: AgentKind
     number: int = 0

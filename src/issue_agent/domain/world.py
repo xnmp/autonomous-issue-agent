@@ -140,6 +140,10 @@ class PRView:
     title: str = ""
     body: str = ""
     labels: frozenset[Label] = field(default_factory=frozenset)
+    # PR-stage repair legs ask for clarification on the PR itself. Keeping that
+    # thread in the world lets the fixer consume a newer operator reply without
+    # requiring an incoherent duplicate issue label.
+    comments: tuple[Comment, ...] = ()
     reviews: tuple[Review, ...] = ()
     checks: tuple[Check, ...] = ()
     # False when the `gh pr checks` read FAILED this tick (non-infra gh error:
