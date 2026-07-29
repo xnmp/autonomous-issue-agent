@@ -904,6 +904,42 @@ def test_router_predictions_are_injected_before_the_overlap_decision(tmp_path):
     assert enriched.issues[0].predicted_paths == frozenset({"backend/app/x.py"})
 
 
+def test_daemon_holds_predicted_overlap_before_every_resolve_dispatch(tmp_path):
+    """Persisted router hints must cross the real daemon decision seam."""
+    from issue_agent.app.config import HarnessConfig
+    from issue_agent.app.roles import build_fix_daemon
+
+    issue = 522
+    world = WorldState(
+        issues=(IssueView(issue, labels=frozenset({Label.AI_READY})),),
+        prs=(PRView(123, state="OPEN", changed_files=frozenset({"backend/app/x.py"})),),
+    )
+
+    class PredictionOverlapGateway(FakeGateway):
+        def build_world(self):
+            return world
+
+    store = Store(str(tmp_path / "state"))
+    store.save_predicted_paths(issue, ["backend/app/x.py"])
+    daemon = build_fix_daemon(
+        HarnessConfig(
+            repo="o/r", fix_bot=FIX_BOT, target_dir=str(tmp_path),
+            state_dir=str(tmp_path / "state"),
+        ),
+        PredictionOverlapGateway(), store, FakeWorktrees(),
+        FakeRunner(AgentResult(is_error=False)),
+    )
+
+    actions = [*daemon.tick(), *daemon.tick()]
+
+    assert not any(
+        isinstance(action, RunAgent)
+        and action.kind is AgentKind.RESOLVE
+        and action.number == issue
+        for action in actions
+    )
+
+
 def test_terminal_pr_journals_router_prediction_against_actual_changed_files(tmp_path):
     store = Store(str(tmp_path))
     store.save_predicted_paths(522, frozenset({"backend/app/x.py", "wrong.py"}))
