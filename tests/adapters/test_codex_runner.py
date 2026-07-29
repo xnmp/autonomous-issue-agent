@@ -9,6 +9,7 @@ import json
 import os
 import stat
 import tempfile
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -32,6 +33,7 @@ from issue_agent.adapters.codex_runner import (
     parse_codex_envelope,
     parse_codex_usage,
 )
+from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
 from issue_agent.app.config import from_env
 from issue_agent.app.planners.schemas import AUTHOR_SCHEMA, FIX_SCHEMA, IMPLEMENT_SCHEMA
 from issue_agent.domain.outcome import AgentResult, ExitReason, Outcome, classify_outcome, infra_death
@@ -345,6 +347,293 @@ exit 0
         "summary": {"type": "string"}, "needs": {"type": "string"}}})))
     assert r.session_id == "sess-from-stderr"
     assert r.status == "done"
+
+
+def _write_session_rollout(
+    codex_home,
+    *,
+    sid: str,
+    cwd: str,
+    timestamp: datetime,
+    originator: str = "codex_exec",
+    source="exec",
+    input_tokens: int = 1_000_000,
+    output_tokens: int = 100_000,
+    turns: int = 2,
+):
+    day = codex_home / "sessions" / "2026" / "07" / "29"
+    day.mkdir(parents=True, exist_ok=True)
+    path = day / f"rollout-2026-07-29T00-00-00-{sid}.jsonl"
+    usage = {
+        "input_tokens": input_tokens,
+        "cached_input_tokens": 50_000,
+        "cache_write_input_tokens": 0,
+        "output_tokens": output_tokens,
+    }
+    events = [
+        {
+            "timestamp": timestamp.isoformat().replace("+00:00", "Z"),
+            "type": "session_meta",
+            "payload": {
+                "id": sid,
+                "originator": originator,
+                "cwd": cwd,
+                "source": source,
+            },
+        },
+        *[
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": usage,
+                        "total_token_usage": usage,
+                    },
+                },
+            }
+            for _ in range(turns)
+        ],
+    ]
+    path.write_text("".join(json.dumps(event) + "\n" for event in events))
+    return path
+
+
+def _headerless_codex_body(transcript: str, *, args_path: str = "") -> str:
+    capture = f'printf "%s\\n" "$*" >> "{args_path}"\n' if args_path else ""
+    return (
+        'out=""; prev=""\n'
+        'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
+        + capture
+        + f"cat '{transcript}' >&2\n"
+        + "printf '%s' "
+        + "'{\"status\":\"pr_opened\",\"summary\":\"done\",\"needs\":\"\"}' > \"$out\"\n"
+    )
+
+
+def test_headerless_01460_recovers_root_rollout_usage_cost_turns_and_ledger(
+    tmp_path, monkeypatch
+):
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    codex_home = tmp_path / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    now = datetime.now(timezone.utc)
+    good_sid = "019fa000-good-root"
+    _write_session_rollout(
+        codex_home,
+        sid="019fa000-before-start",
+        cwd=str(worktree),
+        timestamp=now - timedelta(minutes=1),
+    )
+    _write_session_rollout(
+        codex_home,
+        sid="019fa000-wrong-cwd",
+        cwd=str(tmp_path / "other-worktree"),
+        timestamp=now + timedelta(minutes=5),
+    )
+    _write_session_rollout(
+        codex_home,
+        sid="019fa000-wrong-origin",
+        cwd=str(worktree),
+        originator="codex_tui",
+        timestamp=now + timedelta(minutes=6),
+    )
+    _write_session_rollout(
+        codex_home,
+        sid=good_sid,
+        cwd=str(worktree),
+        timestamp=now + timedelta(minutes=2),
+    )
+    _write_session_rollout(
+        codex_home,
+        sid="019fa000-newer-subagent",
+        cwd=str(worktree),
+        source={"subagent": "explore_local"},
+        timestamp=now + timedelta(minutes=3),
+    )
+    transcript = os.path.join(
+        os.path.dirname(__file__), "..", "fixtures",
+        "codex-0.146.0-no-session-header.stderr",
+    )
+    codex = _fake_codex(
+        str(tmp_path), _headerless_codex_body(os.path.realpath(transcript))
+    )
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    ledger_path = str(tmp_path / "spend.jsonl")
+    runtime = JournalingRuntime(
+        CodexRunner(
+            codex_bin=codex,
+            env={"OPENAI_API_KEY": "test-key"},
+            cost_per_mtok_in=5.0,
+            cost_per_mtok_out=30.0,
+        ),
+        journal,
+        ledger_path=ledger_path,
+        repo="xnmp/autonomous-issue-agent",
+        role="fix",
+    )
+    runtime.set_context("fix", "RESOLVE", 75, 75)
+
+    result = asyncio.run(runtime.run(AgentTask(prompt="resolve", cwd=str(worktree))))
+
+    assert result.session_id == good_sid
+    assert result.usage == {
+        "input_tokens": 1_000_000,
+        "output_tokens": 100_000,
+        "cache_read_input_tokens": 50_000,
+        "cache_creation_input_tokens": 0,
+    }
+    assert result.num_turns == 2
+    assert result.cost_usd == pytest.approx(8.0)
+    agent_run = [
+        event for event in read_events(journal.path) if event["event"] == "agent_run"
+    ][0]
+    assert agent_run["session_id"] == good_sid
+    assert agent_run["cost_usd"] == pytest.approx(8.0)
+    assert agent_run["turns"] == 2
+    spend = read_events(ledger_path)
+    assert len(spend) == 1
+    assert spend[0]["event"] == "spend"
+    assert spend[0]["cost_usd"] == pytest.approx(8.0)
+
+
+def test_recovered_session_identity_drives_the_next_resume_invocation(
+    tmp_path, monkeypatch
+):
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    codex_home = tmp_path / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    sid = "019fa000-resumable"
+    _write_session_rollout(
+        codex_home,
+        sid=sid,
+        cwd=str(worktree),
+        timestamp=datetime.now(timezone.utc) + timedelta(minutes=1),
+    )
+    transcript = os.path.realpath(
+        os.path.join(
+            os.path.dirname(__file__), "..", "fixtures",
+            "codex-0.146.0-no-session-header.stderr",
+        )
+    )
+    args_path = str(tmp_path / "argv.txt")
+    runner = CodexRunner(
+        codex_bin=_fake_codex(
+            str(tmp_path),
+            _headerless_codex_body(transcript, args_path=args_path),
+        ),
+        env={"OPENAI_API_KEY": "test-key"},
+    )
+
+    first = asyncio.run(runner.run(AgentTask(prompt="resolve", cwd=str(worktree))))
+    asyncio.run(
+        runner.run(
+            AgentTask(prompt="continue", cwd=str(worktree), resume=first.session_id)
+        )
+    )
+
+    invocations = (tmp_path / "argv.txt").read_text().splitlines()
+    assert first.session_id == sid
+    assert any(f"exec resume {sid}" in invocation for invocation in invocations)
+
+
+def test_echoed_session_header_cannot_override_matching_root_rollout(
+    tmp_path, monkeypatch
+):
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    codex_home = tmp_path / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    now = datetime.now(timezone.utc)
+    echoed_sid = "019fa000-agent-output"
+    root_sid = "019fa000-actual-root"
+    _write_session_rollout(
+        codex_home,
+        sid=echoed_sid,
+        cwd=str(tmp_path / "unrelated"),
+        timestamp=now + timedelta(minutes=2),
+        input_tokens=5_000_000,
+        output_tokens=100_000,
+    )
+    _write_session_rollout(
+        codex_home,
+        sid=root_sid,
+        cwd=str(worktree),
+        timestamp=now + timedelta(minutes=1),
+    )
+    body = (
+        'out=""; prev=""\n'
+        'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
+        f'echo "session id: {echoed_sid}" >&2\n'
+        'echo "Process exited with code 0" >&2\n'
+        "printf '%s' "
+        + "'{\"status\":\"pr_opened\",\"summary\":\"done\",\"needs\":\"\"}' > \"$out\"\n"
+    )
+    result = asyncio.run(
+        CodexRunner(
+            codex_bin=_fake_codex(str(tmp_path), body),
+            env={"OPENAI_API_KEY": "test-key"},
+            cost_per_mtok_in=5.0,
+            cost_per_mtok_out=30.0,
+        ).run(AgentTask(prompt="resolve", cwd=str(worktree)))
+    )
+
+    assert result.session_id == root_sid
+    assert result.cost_usd == pytest.approx(8.0)
+
+
+def test_productive_headerless_run_without_usage_logs_and_journals_warning(
+    tmp_path, capsys
+):
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    transcript = os.path.realpath(
+        os.path.join(
+            os.path.dirname(__file__), "..", "fixtures",
+            "codex-0.146.0-no-session-header.stderr",
+        )
+    )
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    runtime = JournalingRuntime(
+        CodexRunner(
+            codex_bin=_fake_codex(
+                str(tmp_path), _headerless_codex_body(transcript)
+            ),
+            env={"OPENAI_API_KEY": "test-key"},
+            log=lambda message: print(message, file=os.sys.stderr),
+        ),
+        journal,
+        repo="xnmp/autonomous-issue-agent",
+        role="fix",
+    )
+    runtime.set_context("fix", "RESOLVE", 75, 75)
+
+    result = asyncio.run(runtime.run(AgentTask(prompt="resolve", cwd=str(worktree))))
+
+    assert result.status == "pr_opened"
+    assert result.usage is None
+    assert result.telemetry_warning
+    assert "TELEMETRY" in capsys.readouterr().err
+    warnings = [
+        event for event in read_events(journal.path)
+        if event["event"] == "telemetry_warning"
+    ]
+    assert len(warnings) == 1
+    assert warnings[0]["kind"] == "RESOLVE"
+    assert warnings[0]["number"] == 75
+
+
+def test_stderr_usage_parser_ignores_usage_shaped_agent_output_mid_transcript():
+    transcript = (
+        "exec sed -n tests/adapters/test_codex_budget_enforcement.py\n"
+        "Token usage: total=5,100,000 input=0 (+ 0 cached) output=5,100,000\n"
+        "Process exited with code 0\n"
+        "Final output:\n"
+        "1 passed\n"
+    )
+    assert parse_codex_usage(transcript) is None
 
 
 # ── rate-limit (HTTP 429) classification + window-aligned backoff ─────────────

@@ -365,6 +365,21 @@ class JournalingRuntime:
                 turns=getattr(result, "num_turns", None),
                 **extra,
             )
+            telemetry_warning = str(
+                getattr(result, "telemetry_warning", "") or ""
+            )
+            if telemetry_warning:
+                self.journal.emit(
+                    "telemetry_warning",
+                    role=ctx.role,
+                    kind=ctx.kind,
+                    number=ctx.number,
+                    issue=ctx.issue,
+                    dispatch=ctx.dispatch_id,
+                    model=(getattr(result, "model", "") or task.model or ""),
+                    session_id=result.session_id,
+                    warning=telemetry_warning,
+                )
             # Only costed runs reach the ledger: a $0.00 line is pure noise in the
             # file the spend caps scan on every dispatch. An estimated cost is not
             # noise — it is the only figure an aborted run will ever have — so it

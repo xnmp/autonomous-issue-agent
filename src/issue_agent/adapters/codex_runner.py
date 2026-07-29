@@ -23,6 +23,7 @@ import re
 import tempfile
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from ..domain.agent_task import AgentRuntime, AgentTask, git_identity_env
@@ -241,52 +242,112 @@ def parse_codex_usage(stderr: str) -> dict | None:
     `cache_creation_input_tokens` is always 0 (codex reports no such counter, and
     inventing one would be a fabricated receipt).
 
-    The LAST matching line wins: codex prints its usage line once, at the end,
-    and it is cumulative for the session — so a later line supersedes an earlier
-    one rather than adding to it.
+    Only a terminal footer is trusted. Codex stderr contains the agent's tool
+    output, including source files and test fixtures with usage-shaped text; a
+    whole-transcript scan prices that echoed DATA as this run's spend and can
+    kill the process on a phantom budget overrun. Rollout counters are the
+    primary source, and this compatibility parser accepts only the final
+    nonblank line (or the final adjacent header/count pair) after process exit.
+    It is never used for in-flight enforcement."""
+    lines = [line for line in (stderr or "").splitlines() if line.strip()]
+    if not lines:
+        return None
+    line = lines[-1]
+    m = _TOKEN_SPLIT_RE.search(line)
+    if m:
+        return {
+            "input_tokens": _int_tokens(m.group(1)),
+            "output_tokens": _int_tokens(m.group(3)),
+            "cache_read_input_tokens": _int_tokens(m.group(2)),
+            "cache_creation_input_tokens": 0,
+        }
+    m2 = _TOKEN_TOTAL_RE.search(line)
+    if m2:
+        return {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "total_tokens": _int_tokens(m2.group(1) or m2.group(2)),
+        }
+    if len(lines) < 2 or not _TOKEN_HEADER_RE.match(lines[-2]):
+        return None
+    m3 = _TOKEN_BARE_COUNT_RE.match(line)
+    if not m3:
+        return None
+    return {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "total_tokens": _int_tokens(m3.group(1)),
+    }
 
-    Unlike the retry classifiers (see `_stderr_tail`), this deliberately reads
-    the WHOLE buffer. The two have opposite worst cases: a missed transport
-    signature costs one retry, whereas a missed usage line costs the accounting
-    entirely — back to $0.00 and caps that cannot see codex, which is the very
-    hole M1 describes. Last-match-wins already makes codex's own trailing line
-    beat anything the agent echoed earlier."""
-    found: dict | None = None
-    header_pending = False
-    for line in (stderr or "").splitlines():
-        if header_pending:
-            header_pending = False
-            m3 = _TOKEN_BARE_COUNT_RE.match(line)
-            if m3:
-                found = {
-                    "input_tokens": 0,
-                    "output_tokens": 0,
-                    "cache_read_input_tokens": 0,
-                    "cache_creation_input_tokens": 0,
-                    "total_tokens": _int_tokens(m3.group(1)),
-                }
+
+def _rollout_timestamp(raw: Any) -> float | None:
+    """ISO-8601 rollout timestamp as epoch seconds, or None when malformed."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def discover_rollout_session(
+    cwd: str,
+    started_at: float,
+    codex_home: str | None = None,
+) -> str:
+    """Find this fresh root ``codex exec`` session from its rollout metadata.
+
+    Codex 0.146.0 no longer prints a ``session id:`` header, but persists a
+    machine-readable ``session_meta`` event before doing work. Identity is
+    constrained by originator, exact resolved cwd, and invocation start time.
+    ``source == "exec"`` is also load-bearing: Codex subagents use the same
+    originator and cwd, but carry an object-valued source and commonly create a
+    newer rollout than their parent. A malformed or incomplete candidate is
+    ignored so discovery can retry on the next budget sample.
+    """
+    if not cwd:
+        return ""
+    home = codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    target_cwd = os.path.realpath(cwd)
+    candidates: list[tuple[float, str]] = []
+    try:
+        pattern = os.path.join(home, "sessions", "**", "rollout-*.jsonl")
+        for path in glob.glob(pattern, recursive=True):
+            try:
+                with open(path, encoding="utf-8") as rollout:
+                    for line in rollout:
+                        if '"session_meta"' not in line:
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except (json.JSONDecodeError, ValueError):
+                            continue
+                        if event.get("type") != "session_meta":
+                            continue
+                        payload = event.get("payload") or {}
+                        timestamp = _rollout_timestamp(event.get("timestamp"))
+                        session_id = payload.get("session_id") or payload.get("id")
+                        if (
+                            payload.get("originator") == "codex_exec"
+                            and payload.get("source") == "exec"
+                            and isinstance(payload.get("cwd"), str)
+                            and os.path.realpath(payload["cwd"]) == target_cwd
+                            and timestamp is not None
+                            and timestamp >= started_at
+                            and isinstance(session_id, str)
+                            and session_id
+                        ):
+                            candidates.append((timestamp, session_id))
+                        break
+            except OSError:
                 continue
-        m = _TOKEN_SPLIT_RE.search(line)
-        if m:
-            found = {
-                "input_tokens": _int_tokens(m.group(1)),
-                "output_tokens": _int_tokens(m.group(3)),
-                "cache_read_input_tokens": _int_tokens(m.group(2)),
-                "cache_creation_input_tokens": 0,
-            }
-            continue
-        m2 = _TOKEN_TOTAL_RE.search(line)
-        if m2:
-            found = {
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "cache_creation_input_tokens": 0,
-                "total_tokens": _int_tokens(m2.group(1) or m2.group(2)),
-            }
-            continue
-        header_pending = bool(_TOKEN_HEADER_RE.match(line))
-    return found
+    except Exception:  # noqa: BLE001 — identity recovery must not kill a run
+        return ""
+    return max(candidates)[1] if candidates else ""
 
 
 def read_rollout_usage(session_id: str, codex_home: str | None = None) -> dict | None:
@@ -434,6 +495,43 @@ def codex_cost_usd(
         return (tokens_in * rate_in + tokens_out * rate_out) / 1_000_000.0
     total = int(usage.get("total_tokens", 0) or 0)
     return total * max(rate_in, rate_out) / 1_000_000.0
+
+
+_EARLY_USAGE_WINDOW_SECONDS = 120.0
+_MAX_PLAUSIBLE_EARLY_COST_USD = 100.0
+
+
+def implausible_codex_usage_warning(
+    usage: dict | None,
+    *,
+    elapsed_s: float,
+    has_baseline: bool,
+    cost_per_mtok_in: float,
+    cost_per_mtok_out: float,
+) -> str:
+    """Explain an impossible-looking fresh-session counter, else blank.
+
+    This is a circuit breaker around identity/accounting drift, not a spend
+    estimate. A resumed session legitimately has a large cumulative counter and
+    is protected by its baseline delta. A fresh leg claiming more than $100
+    inside two minutes instead matches the live failure where usage-shaped test
+    output was mistaken for the run's own receipt; acting on it is more
+    dangerous than temporarily declining to price it.
+    """
+    if has_baseline or elapsed_s >= _EARLY_USAGE_WINDOW_SECONDS:
+        return ""
+    cost = codex_cost_usd(
+        usage,
+        cost_per_mtok_in=cost_per_mtok_in,
+        cost_per_mtok_out=cost_per_mtok_out,
+    )
+    if cost <= _MAX_PLAUSIBLE_EARLY_COST_USD:
+        return ""
+    return (
+        f"fresh Codex usage implies ${cost:.2f} after {elapsed_s:.1f}s "
+        f"(>${_MAX_PLAUSIBLE_EARLY_COST_USD:.2f} inside "
+        f"{_EARLY_USAGE_WINDOW_SECONDS:.0f}s)"
+    )
 
 
 def budget_overrun_usd(
@@ -829,8 +927,8 @@ class CodexRunner(AgentRuntime):
         been reported yet (#29).
 
         Deliberately the same arithmetic the end-of-run accounting does, in the
-        same order — rollout file first, stderr second, then the resumed
-        session's already-ledgered baseline subtracted (`usage_delta`). The
+        same order — rollout file, then the resumed session's already-ledgered
+        baseline subtracted (`usage_delta`). The
         number the budget check compares against has to be the number that will
         reach the ledger, or the harness would kill runs on a figure the
         operator can never reconcile with the ledger's.
@@ -840,15 +938,13 @@ class CodexRunner(AgentRuntime):
         address-review / rebase leg would be killed on its resolve's tokens the
         first time it sampled.
 
-        Mid-run there is no envelope yet, so the session id is read from the
-        stderr seen so far — `codex exec` prints its `session id:` header before
-        the first turn, which is what makes an in-flight sample priceable at
-        all."""
+        The caller supplies rollout-discovered identity on headerless Codex
+        versions. Stderr is retained only as compatibility identity input for
+        older versions; usage-shaped stderr is never trusted mid-run because it
+        also contains arbitrary agent/test output."""
         stderr = "\n".join(err_chunks)
         sid = session_id or _session_id_from_lines(stderr)
         usage = read_rollout_usage(sid) if sid else None
-        if usage is None:
-            usage = parse_codex_usage(stderr)
         if usage_baseline is not None and sid == usage_baseline[0]:
             usage = usage_delta(usage, usage_baseline[1])
         return usage
@@ -1117,6 +1213,13 @@ class CodexRunner(AgentRuntime):
             **task.env,
         }
         self._log(f"codex: exec model={model} cwd={task.cwd or '.'}")
+        # Rollout metadata uses wall-clock UTC while the plausibility guard only
+        # needs elapsed process time. Keep the two clocks separate: wall time
+        # identifies post-start files; monotonic time cannot jump and does not
+        # perturb the injectable watchdog clock's call sequence.
+        rollout_started_at = time.time()
+        attempt_started_at = time.monotonic()
+        execution_cwd = task.cwd or os.getcwd()
         # Set cwd on the subprocess too, not only via `-C`: the resume subcommand
         # rejects `-C`, so this is how a resumed run still executes in the worktree
         # (harmless on the exec path — it matches the `-C` we also pass there).
@@ -1169,6 +1272,55 @@ class CodexRunner(AgentRuntime):
         budget_usd = task.max_budget_usd if self.enforce_budget else 0.0
         budget_armed = budget_usd > 0 and rate_in > 0 and rate_out > 0
         last_budget_check = self._wall_clock() if budget_armed else 0.0
+        session_id = task.resume or ""
+        implausible_usage_logged = False
+
+        def _current_session_id(
+            extra_output: str = "", *, allow_legacy_header: bool = False
+        ) -> str:
+            """Cached identity from resume input or matching root rollout.
+
+            A human-readable header is an exit-time compatibility fallback only.
+            Stderr contains arbitrary agent output, so caching a header-shaped
+            line during the run would let echoed data suppress later root-rollout
+            discovery and poison budget enforcement.
+            """
+            nonlocal session_id
+            if session_id:
+                return session_id
+            stderr = "\n".join(err_chunks)
+            session_id = discover_rollout_session(
+                execution_cwd, rollout_started_at
+            )
+            if session_id or not allow_legacy_header:
+                return session_id
+            return (
+                _session_id_from_lines(stderr)
+                or _session_id_from_lines(extra_output)
+            )
+
+        def _trusted_usage(usage: dict | None, sid: str) -> dict | None:
+            """Reject one implausible early sample and make the rejection loud."""
+            nonlocal implausible_usage_logged
+            has_baseline = (
+                usage_baseline is not None and sid == usage_baseline[0]
+            )
+            warning = implausible_codex_usage_warning(
+                usage,
+                elapsed_s=time.monotonic() - attempt_started_at,
+                has_baseline=has_baseline,
+                cost_per_mtok_in=rate_in,
+                cost_per_mtok_out=rate_out,
+            )
+            if not warning:
+                return usage
+            if not implausible_usage_logged:
+                self._log(
+                    "codex: IMPLAUSIBLE USAGE — rejecting counter instead of "
+                    f"pricing or enforcing it: {warning}"
+                )
+                implausible_usage_logged = True
+            return None
 
         def _budget_overrun(now: float) -> float | None:
             """This leg's spend if it has crossed the budget, else None.
@@ -1184,8 +1336,10 @@ class CodexRunner(AgentRuntime):
             if now - last_budget_check < self._pump_slice():
                 return None
             last_budget_check = now
+            sid = _current_session_id()
+            usage = self._usage_so_far(err_chunks, usage_baseline, sid)
             return budget_overrun_usd(
-                self._usage_so_far(err_chunks, usage_baseline),
+                _trusted_usage(usage, sid),
                 cost_per_mtok_in=rate_in,
                 cost_per_mtok_out=rate_out,
                 max_budget_usd=budget_usd,
@@ -1359,10 +1513,11 @@ class CodexRunner(AgentRuntime):
             # when a descendant that survived our killpg still holds the pipe,
             # and reporting that as an idle timeout would bury the real reason
             # this run was stopped.
-            session_id = (
-                _session_id_from_lines(stderr) or _session_id_from_lines(stdout)
+            session_id = _current_session_id(stdout, allow_legacy_header=True)
+            final_usage = _trusted_usage(
+                self._usage_so_far(err_chunks, usage_baseline, session_id),
+                session_id,
             )
-            final_usage = self._usage_so_far(err_chunks, usage_baseline, session_id)
             final_turns = read_rollout_turns(session_id)
             if (
                 final_turns is not None
@@ -1432,9 +1587,10 @@ class CodexRunner(AgentRuntime):
             # codex didn't write -o (e.g. errored early) → fall back to stdout.
             last_message = stdout
 
-        # `codex exec` prints its `session id: <uuid>` header to STDERR (the -o
-        # file holds only the final message). Check stderr first, stdout second.
-        session_id = _session_id_from_lines(stderr) or _session_id_from_lines(stdout)
+        # 0.146.0 removed the human-readable session header. The root rollout's
+        # session_meta is now the primary machine-readable identity source;
+        # legacy stderr/stdout headers and task.resume remain compatible.
+        session_id = _current_session_id(stdout, allow_legacy_header=True)
         rollout_usage = read_rollout_usage(session_id)
         if rollout_usage is None:
             rollout_usage = parse_codex_usage(stderr)
@@ -1444,6 +1600,7 @@ class CodexRunner(AgentRuntime):
         # session has nothing pre-paid in its counter.
         if usage_baseline is not None and session_id == usage_baseline[0]:
             rollout_usage = usage_delta(rollout_usage, usage_baseline[1])
+        rollout_usage = _trusted_usage(rollout_usage, session_id)
         rollout_turns = read_rollout_turns(session_id)
         if (
             rollout_turns is not None
@@ -1505,6 +1662,19 @@ class CodexRunner(AgentRuntime):
         from dataclasses import replace as _replace
 
         result = _replace(result, num_turns=rollout_turns)
+        if (
+            result.status in ("pr_opened", "pushed")
+            and result.usage is None
+            and time.monotonic() > attempt_started_at
+        ):
+            warning = (
+                "productive Codex run settled with "
+                f"status={result.status!r} after "
+                f"{time.monotonic() - attempt_started_at:.1f}s but reported no "
+                "token usage; cost telemetry, spend caps, and resume may be blind"
+            )
+            self._log(f"codex: TELEMETRY WARNING — {warning}")
+            result = _replace(result, telemetry_warning=warning)
         if exit_code < 0 and not hung:
             # A NEGATIVE returncode means terminated by signal -exit_code, and we did
             # not do it (our own killpg paths set `hung` and returned above). So this

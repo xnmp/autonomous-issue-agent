@@ -113,14 +113,24 @@ exit together).
   `status="error_max_budget_usd"`, `exit_reason=BUDGET_EXHAUSTED`, with the spend it
   had burned carried on the result so the ledger and both spend caps still see it.
   Three things this depends on, in order of how badly they bite:
-  1. **Per-leg, not cumulative.** A resumed session's counter includes the previous
+  1. **Machine-readable root identity.** Codex 0.146.0 removed the human-oriented
+     `session id:` header. Fresh runs discover the newest post-start
+     `session_meta` matching `originator=codex_exec`, exact resolved cwd, and
+     `source=exec`; the last constraint excludes newer same-cwd subagent
+     rollouts. Resumed runs use the persisted ID directly because their
+     `session_meta` predates the current leg.
+  2. **Per-leg, not cumulative.** A resumed session's counter includes the previous
      leg's already-ledgered tokens; the check runs on the `usage_delta`, or every
      follow-up leg dies instantly on its resolve's spend.
-  2. **Priced or inert.** Both rates 0 → every run reads as $0.00 and the check is
+  3. **Rollout counters, not arbitrary stderr.** Codex stderr includes
+     agent-controlled tool and test output. Usage-shaped text echoed there must
+     never price or kill an in-flight leg. The legacy stderr parser is used only
+     after exit and accepts a terminal footer.
+  4. **Priced or inert.** Both rates 0 → every run reads as $0.00 and the check is
      deliberately silent (`budget_overrun_usd`), because a dollar threshold cannot
      bound a runtime nobody is pricing. `describe()` and
      `codex_budget_not_enforced_warning` both report that regime as NOT ENFORCED.
-  3. **`CODEX_ENFORCE_BUDGET=0`** returns to wall-cap-only bounding, and is likewise
+  5. **`CODEX_ENFORCE_BUDGET=0`** returns to wall-cap-only bounding, and is likewise
      reported. On a subscription the dollars are synthetic — they are a token meter —
      so an operator whose rates over-state reality can opt out rather than have real
      work cut short.
