@@ -402,6 +402,8 @@ def test_compose_env_emitted_key_set_equals_the_names_the_files_assign(tmp_path)
     expected = set(_ASSIGN_RE.findall(shared)) | set(_ASSIGN_RE.findall(overlay))
     expected -= set(_UNSET_RE.findall(shared)) | set(_UNSET_RE.findall(overlay))
     expected |= {"INDIRECT_FROM_NESTED_SOURCE"}
+    # compose-env appends the #63 scrub manifest naming every emitted knob.
+    expected |= {"HARNESS_DEPLOY_KNOBS"}
     assert set(_emitted(active)) == expected
 
     env = _load_agent_env({"AGENT_ENV": str(active)})
@@ -460,7 +462,9 @@ def test_compose_env_skips_commented_assignments_and_names_unset_after_assignmen
     assert "TIGHT_COMMENT" not in emitted
     assert "INDENTED_COMMENT" not in emitted
     assert "GONE_LATER" not in emitted
-    assert emitted.keys() == {"INDENTED_EXPORT", "REPO"}
+    assert emitted.keys() == {"INDENTED_EXPORT", "REPO", "HARNESS_DEPLOY_KNOBS"}
+    # raw _emitted values keep %q escaping (backslash-space) — unescape first
+    assert set(emitted["HARNESS_DEPLOY_KNOBS"].replace("\\", "").split()) == {"INDENTED_EXPORT", "REPO"}
 
 
 def test_compose_env_scans_a_final_line_with_no_trailing_newline(tmp_path):
@@ -473,7 +477,7 @@ def test_compose_env_scans_a_final_line_with_no_trailing_newline(tmp_path):
         overlay='REPO="acme/widget"',          # deliberately unterminated
         ambient={"A_KNOB": "one", "B_KNOB": "two", "REPO": "acme/widget"},
     )
-    assert set(_emitted(active)) == {"A_KNOB", "B_KNOB", "REPO"}
+    assert set(_emitted(active)) == {"A_KNOB", "B_KNOB", "REPO", "HARNESS_DEPLOY_KNOBS"}
 
 
 def test_compose_env_omits_a_conditional_assignment_that_never_fired(tmp_path):

@@ -1,0 +1,133 @@
+"""Cached read-only `gh` reads: issue titles/labels, PR state, the backlog.
+
+The v1 dashboard is journal-only on purpose (a diagnostic that fails when
+GitHub does is worse than one that is honest about its scope). This module
+keeps that posture while adding what the journal structurally cannot know —
+titles, human-applied labels, whether a PR actually merged — under two rules:
+
+  * **cached** — one `gh` invocation per (repo, query) per TTL, however many
+    clients poll;
+  * **degrading** — a failure returns `(None, error)`, never raises, and the
+    payload it feeds carries `gh_ok: false` plus a warning.
+
+`gh` shells out rather than talking to the API directly so it inherits the
+operator's auth, host config and proxy exactly as every other harness call does.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
+
+DEFAULT_TTL_S = 45.0
+GH_TIMEOUT_S = 30.0
+
+ISSUE_FIELDS = "number,title,url,labels,state,createdAt,comments"
+PR_FIELDS = "number,title,url,state,mergedAt"
+
+
+@dataclass
+class TtlCache:
+    """Tiny monotonic-clock TTL store. Errors are cached alongside successes:
+    the failure mode worth guarding is `gh` being down while three views poll
+    every five seconds."""
+
+    ttl_s: float = DEFAULT_TTL_S
+    clock: Callable[[], float] = time.monotonic
+    _entries: dict = field(default_factory=dict)
+
+    def get(self, key):
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        expires, value = entry
+        if self.clock() >= expires:
+            del self._entries[key]
+            return None
+        return value
+
+    def put(self, key, value):
+        self._entries[key] = (self.clock() + self.ttl_s, value)
+        return value
+
+
+def run_gh(args: list[str]) -> tuple[str, str]:
+    """(stdout, error). Never raises — a missing `gh` is an error string."""
+    try:
+        proc = subprocess.run(
+            ["gh", *args], capture_output=True, text=True, timeout=GH_TIMEOUT_S
+        )
+    except FileNotFoundError:
+        return "", "gh is not installed"
+    except subprocess.TimeoutExpired:
+        return "", f"gh timed out after {GH_TIMEOUT_S:.0f}s"
+    except OSError as exc:
+        return "", f"gh could not run: {exc}"
+    if proc.returncode != 0:
+        return "", (proc.stderr or proc.stdout or "gh failed").strip()[:400]
+    return proc.stdout, ""
+
+
+class GhReader:
+    """Read-only `gh` façade. `run` is injectable so tests never shell out."""
+
+    def __init__(self, run=None, ttl_s: float = DEFAULT_TTL_S, clock=time.monotonic):
+        self._run = run or run_gh
+        self._cache = TtlCache(ttl_s=ttl_s, clock=clock)
+
+    def json(self, repo: str, args: list[str]) -> tuple[object | None, str]:
+        if not repo:
+            return None, "no REPO configured for this deployment"
+        key = (repo, tuple(args))
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        out, error = self._run([*args, "-R", repo])
+        if error:
+            return self._cache.put(key, (None, error))
+        try:
+            payload = json.loads(out or "null")
+        except ValueError:
+            return self._cache.put(key, (None, "gh returned unparseable JSON"))
+        return self._cache.put(key, (payload, ""))
+
+    def issues(self, repo: str, limit: int = 300) -> tuple[object | None, str]:
+        """Open AND closed issues in one call: the done cards need titles for
+        issues that have since been closed, and a second query would double the
+        rate-limit cost to answer the same question."""
+        return self.json(
+            repo,
+            ["issue", "list", "--state", "all", "--limit", str(limit),
+             "--json", ISSUE_FIELDS],
+        )
+
+    def prs(self, repo: str, limit: int = 200) -> tuple[object | None, str]:
+        return self.json(
+            repo,
+            ["pr", "list", "--state", "all", "--limit", str(limit),
+             "--json", PR_FIELDS],
+        )
+
+
+def index_by_number(payload) -> dict[int, dict]:
+    """gh's JSON array → {number: object}. Anything unexpected is dropped, not
+    raised on: a shape change must cost titles, not the whole view."""
+    out: dict[int, dict] = {}
+    if not isinstance(payload, list):
+        return out
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        try:
+            number = int(item.get("number"))
+        except (TypeError, ValueError):
+            continue
+        out[number] = item
+    return out
+
+
+def is_open(issue: dict) -> bool:
+    return str(issue.get("state") or "").upper() == "OPEN"

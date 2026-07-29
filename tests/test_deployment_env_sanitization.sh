@@ -15,10 +15,11 @@ trap 'rm -rf "$scratch"' EXIT
 # this repo already learned (gate parity) that hand-kept twins drift silently.
 py_list="$(cd "$ROOT" && uv run --quiet python -c \
   'from issue_agent.adapters.governor import TARGET_CMD_SCRUB_KNOBS as K; print("\n".join(sorted(K)))')"
-for f in plugin/hooks/checks/_pr_common.sh bin/point-at.sh; do
-  sh_list="$(grep -o '\-u [A-Z_][A-Z_]*' "$ROOT/$f" | sed 's/-u //' | sort -u)"
+for spec in "plugin/hooks/checks/_pr_common.sh:PRC_SCRUB_STATIC" "bin/point-at.sh:RTC_SCRUB_STATIC"; do
+  f="${spec%%:*}"; var="${spec##*:}"
+  sh_list="$(sed -n "s/^\(export \)\?${var}=\"\(.*\)\"$/\2/p" "$ROOT/$f" | tr ' ' '\n' | sort -u | grep .)"
   if [ "$py_list" != "$sh_list" ]; then
-    echo "SCRUB-LIST DRIFT: $f disagrees with governor.TARGET_CMD_SCRUB_KNOBS" >&2
+    echo "SCRUB-LIST DRIFT: $f ($var) disagrees with governor.TARGET_CMD_SCRUB_KNOBS" >&2
     diff <(echo "$py_list") <(echo "$sh_list") >&2 || true
     exit 1
   fi
@@ -32,8 +33,12 @@ env \
   TEST_CMD=true LINT_CMD=true TYPECHECK_CMD=true EDIT_CHECK_CMD=true \
   ALLOW_UNTESTED=1 RED_MUST_FAIL=0 VERIFY_RED_AT_COMMIT=0 \
   BASE_BRANCH=wrong-base GATE_TEST_TIMEOUT_S=1 GATE_GH_RETRY_SLEEP=0 \
-  GH_APP_ID='<your-app-id>' GH_APP_PRIVATE_KEY="$scratch/missing-key" \
-  GH_APP_INSTALLATION_ID=123 TARGET_DIR="$ROOT" AGENT_ENV="$scratch/outer.env" \
+  GH_APP_ID='<your-app-id>' GH_APP_KEY_FILE="$scratch/missing-key" \
+  GH_APP_INSTALL_ID=123 TARGET_DIR="$ROOT" AGENT_ENV="$scratch/outer.env" \
+  STATE_DIR="$scratch/state" REVIEW_STATE_DIR="$scratch/review-state" \
+  STEWARD_STATE_DIR="$scratch/steward-state" \
+  HARNESS_DEPLOY_KNOBS="STATE_DIR REVIEW_STATE_DIR STEWARD_STATE_DIR CUSTOM_DEPLOY_KNOB" \
+  CUSTOM_DEPLOY_KNOB="leaks-unless-manifest-scrubbed" \
   sh -c "cd '$ROOT' && uv run --quiet pytest tests/adapters -q"
 
 env \
@@ -47,10 +52,15 @@ env \
   GATE_TEST_TIMEOUT_S=1 \
   GATE_GH_RETRY_SLEEP=0 \
   GH_APP_ID='<your-app-id>' \
-  GH_APP_PRIVATE_KEY="$scratch/missing-key" \
-  GH_APP_INSTALLATION_ID=123 \
+  GH_APP_KEY_FILE="$scratch/missing-key" \
+  GH_APP_INSTALL_ID=123 \
   TARGET_DIR="$ROOT" \
   AGENT_ENV="$scratch/outer.env" \
+  STATE_DIR="$scratch/state" \
+  REVIEW_STATE_DIR="$scratch/review-state" \
+  STEWARD_STATE_DIR="$scratch/steward-state" \
+  HARNESS_DEPLOY_KNOBS="STATE_DIR REVIEW_STATE_DIR STEWARD_STATE_DIR CUSTOM_DEPLOY_KNOB" \
+  CUSTOM_DEPLOY_KNOB="leaks-unless-manifest-scrubbed" \
   bash "$ROOT/tests/test_hooks.sh"
 
 env \
@@ -64,8 +74,13 @@ env \
   GATE_TEST_TIMEOUT_S=1 \
   GATE_GH_RETRY_SLEEP=0 \
   GH_APP_ID='<your-app-id>' \
-  GH_APP_PRIVATE_KEY="$scratch/missing-key" \
-  GH_APP_INSTALLATION_ID=123 \
+  GH_APP_KEY_FILE="$scratch/missing-key" \
+  GH_APP_INSTALL_ID=123 \
   TARGET_DIR="$ROOT" \
   AGENT_ENV="$scratch/outer.env" \
+  STATE_DIR="$scratch/state" \
+  REVIEW_STATE_DIR="$scratch/review-state" \
+  STEWARD_STATE_DIR="$scratch/steward-state" \
+  HARNESS_DEPLOY_KNOBS="STATE_DIR REVIEW_STATE_DIR STEWARD_STATE_DIR CUSTOM_DEPLOY_KNOB" \
+  CUSTOM_DEPLOY_KNOB="leaks-unless-manifest-scrubbed" \
   bash "$ROOT/tests/test_orchestration.sh"

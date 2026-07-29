@@ -12,7 +12,7 @@ would re-arm the bomb.
 
 import os
 
-from issue_agent.adapters.governor import TARGET_CMD_SCRUB_KNOBS
+from issue_agent.adapters.governor import target_cmd_scrub_set
 
-for _knob in TARGET_CMD_SCRUB_KNOBS:
+for _knob in target_cmd_scrub_set():
     os.environ.pop(_knob, None)

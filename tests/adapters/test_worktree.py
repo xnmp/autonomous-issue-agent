@@ -298,10 +298,10 @@ def test_default_run_tests_scrubs_harness_knobs_from_child_environment(tmp_path,
     invoked by that command resolve and run the outer command again.
     """
     for name in (
-        "TEST_CMD", "LINT_CMD", "TYPECHECK_CMD", "ALLOW_UNTESTED",
-        "RED_MUST_FAIL", "VERIFY_RED_AT_COMMIT", "BASE_BRANCH",
-        "GATE_TEST_TIMEOUT_S", "GATE_GH_RETRY_SLEEP", "GH_APP_ID",
-        "GH_APP_PRIVATE_KEY", "GH_APP_INSTALLATION_ID", "TARGET_DIR",
+        "TEST_CMD", "LINT_CMD", "TYPECHECK_CMD", "EDIT_CHECK_CMD",
+        "ALLOW_UNTESTED", "RED_MUST_FAIL", "VERIFY_RED_AT_COMMIT",
+        "BASE_BRANCH", "GATE_TEST_TIMEOUT_S", "GATE_GH_RETRY_SLEEP",
+        "GH_APP_ID", "GH_APP_KEY_FILE", "GH_APP_INSTALL_ID", "TARGET_DIR",
         "AGENT_ENV",
     ):
         monkeypatch.setenv(name, "outer-value")
@@ -312,6 +312,18 @@ def test_default_run_tests_scrubs_harness_knobs_from_child_environment(tmp_path,
         "test \"$TARGET_TEST_SENTINEL\" = retained && "
         "test -z \"${TEST_CMD:-}\" && test -z \"${GH_APP_ID:-}\" && "
         "test -z \"${TARGET_DIR:-}\" && test -z \"${AGENT_ENV:-}\""
+    ) is True
+
+
+def test_default_run_tests_scrubs_manifest_knobs(tmp_path, monkeypatch):
+    """Knobs named in HARNESS_DEPLOY_KNOBS (the compose-env manifest) are
+    scrubbed even though they appear in no static list — the class fix for the
+    leak-of-the-week pattern (#63)."""
+    monkeypatch.setenv("HARNESS_DEPLOY_KNOBS", "CUSTOM_KNOB")
+    monkeypatch.setenv("CUSTOM_KNOB", "boom")
+    ctx = build_gate_context(str(tmp_path), base_branch="dev", git=_builder_git())
+    assert ctx.run_tests(
+        'test -z "${CUSTOM_KNOB:-}" && test -z "${HARNESS_DEPLOY_KNOBS:-}"'
     ) is True
 
 
