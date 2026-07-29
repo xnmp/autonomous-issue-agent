@@ -162,6 +162,12 @@ def test_router_task_is_cheap_and_schemad():
     assert t.append_system_prompt == ""            # no system prompt for the router
 
 
+def test_router_task_requests_conservative_repository_relative_path_predictions():
+    t = build_router_task("Tidy readme", "typo", model="haiku")
+    assert "repository-relative" in t.prompt
+    assert "[]" in t.prompt
+
+
 # ── fixer deny-list (P3.1) ──
 # The fixer runs bypassPermissions, so settings.json's deny list never applies:
 # disallowed_tools on the task is the ONLY thing standing between an

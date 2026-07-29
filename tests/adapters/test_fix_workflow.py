@@ -926,6 +926,15 @@ def _router_result(tier):
     return AgentResult(is_error=False, session_id="rt", structured={"tier": tier})
 
 
+class PredictionRecordingStore(FakeStore):
+    def __init__(self):
+        super().__init__()
+        self.predictions = {}
+
+    def save_predicted_paths(self, issue, paths):
+        self.predictions[issue] = paths
+
+
 def test_resolve_routes_standard_issue_to_sonnet_when_model_unpinned():
     gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
     runner = SeqRunner([
@@ -941,6 +950,23 @@ def test_resolve_routes_standard_issue_to_sonnet_when_model_unpinned():
     assert router_task.schema is ROUTER_SCHEMA
     assert router_task.cwd is None, "the classifier needs no worktree"
     assert resolve_task.model == "sonnet"
+
+
+def test_resolve_persists_router_path_predictions_for_later_overlap_checks():
+    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
+    store = PredictionRecordingStore()
+    runner = SeqRunner([
+        AgentResult(is_error=False, session_id="rt", structured={
+            "tier": "standard", "predicted_paths": ["src/action.rs"],
+        }),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5"),
+    ])
+
+    asyncio.run(_workflow(
+        gw, store, runner, fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    assert store.predictions == {5: frozenset({"src/action.rs"})}
 
 
 def test_resolve_skips_the_router_when_a_model_is_pinned():
