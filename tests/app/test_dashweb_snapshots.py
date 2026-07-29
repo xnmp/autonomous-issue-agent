@@ -254,6 +254,41 @@ def test_issue_card_stops_the_clock_once_the_issue_is_done():
     assert card["elapsed_s"] == 7200
 
 
+def test_issue_card_and_eta_exclude_annotated_stall_time():
+    events = [
+        {"ts": ts(hours=4), "event": "agent_run_start", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
+        RESOLVE,
+        {"ts": ts(hours=3), "event": "agent_run_stall", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1",
+         "stall_started_at": ts(hours=3.5), "suspended_seconds": 1200},
+        {"ts": ts(hours=2), "event": "action",
+         "desc": "clear state for pr #12, issue #7 (merged)"},
+    ]
+    row = row_for(events, 7)
+
+    assert snapshots.issue_card(row, NOW)["elapsed_s"] == 6000
+    assert snapshots.mean_wall_clock_s([row]) == 6000.0
+
+
+def test_duplicate_leg_annotations_for_one_stall_are_subtracted_once():
+    events = [
+        {"ts": ts(hours=4), "event": "agent_run_start", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
+        RESOLVE,
+        {"ts": ts(hours=3), "event": "agent_run_stall", "issue": 7,
+         "dispatch": "d1", "stall_started_at": ts(hours=3.5),
+         "suspended_seconds": 1200},
+        {"ts": ts(hours=3), "event": "agent_run_stall", "issue": 7,
+         "dispatch": "d2", "stall_started_at": ts(hours=3.5),
+         "suspended_seconds": 1200},
+        {"ts": ts(hours=2), "event": "action",
+         "desc": "clear state for pr #12, issue #7 (merged)"},
+    ]
+
+    assert snapshots.issue_card(row_for(events, 7), NOW)["elapsed_s"] == 6000
+
+
 def test_issue_card_carries_gh_title_pr_state_and_merge_stamp():
     events = [RESOLVE, {"ts": ts(hours=1), "event": "action",
                         "desc": "clear state for pr #12, issue #7 (merged)"}]

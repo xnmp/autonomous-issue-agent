@@ -1,6 +1,9 @@
 """Durable retries for GitHub lifecycle writes."""
 
+from datetime import datetime, timedelta, timezone
+
 from issue_agent.adapters.github import GhUnavailable
+from issue_agent.adapters.journal import Journal, read_events
 from issue_agent.adapters.store import Store
 from issue_agent.app.execute import Executor
 from issue_agent.app.loop import Daemon
@@ -248,6 +251,67 @@ def test_later_tick_replays_then_removes_pending_write_without_reapplying_it(tmp
     assert observed == [True, True]
     assert gateway.comments == [("issue", 29, "Need clarification")]
     assert Store(str(tmp_path)).load_pending_actions() == ()
+
+
+def test_successful_durable_action_is_reconstructable_for_stall_reconciliation(
+    tmp_path,
+):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    gateway = ScriptedGateway([None])
+    action = PostComment(Target.ISSUE, 29, "Need clarification")
+    executor = Executor(
+        gateway,
+        journal=journal,
+        pending_actions=Store(str(tmp_path / "state")),
+        retry_delays=(),
+    )
+    executor.execute(action)
+    accepted_at = datetime.now(timezone.utc)
+
+    gateway.comment_visible = False
+    executor.reconcile_recent_actions(
+        accepted_at - timedelta(minutes=1),
+        accepted_at + timedelta(minutes=1),
+    )
+
+    assert gateway.comments == [
+        ("issue", 29, "Need clarification"),
+        ("issue", 29, "Need clarification"),
+    ]
+    actions = [event for event in read_events(journal.path) if event["event"] == "action"]
+    assert actions[0]["action"] == {
+        "type": "comment",
+        "target": "ISSUE",
+        "number": 29,
+        "body": "Need clarification",
+    }
+    assert actions[-1]["replayed"] is True
+
+
+def test_stall_reconciliation_verifies_accepted_action_without_duplicate(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    gateway = ScriptedGateway([None])
+    action = PostComment(Target.ISSUE, 29, "Need clarification")
+    executor = Executor(
+        gateway,
+        journal=journal,
+        pending_actions=Store(str(tmp_path / "state")),
+        retry_delays=(),
+    )
+    executor.execute(action)
+    accepted_at = datetime.now(timezone.utc)
+
+    executor.reconcile_recent_actions(
+        accepted_at - timedelta(minutes=1),
+        accepted_at + timedelta(minutes=1),
+    )
+
+    assert gateway.comments == [("issue", 29, "Need clarification")]
+    assert any(
+        event["event"] == "action_verified"
+        and event["desc"] == "comment issue #29 (18 chars)"
+        for event in read_events(journal.path)
+    )
 
 
 def test_malformed_pending_queue_fails_closed_before_observe(tmp_path):
