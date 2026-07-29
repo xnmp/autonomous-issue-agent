@@ -41,7 +41,12 @@ from datetime import datetime, timedelta, timezone
 
 from ..domain.agent_task import AgentTask
 from ..domain.outcome import AgentResult, ExitReason, deterministic_death
-from .handover import with_previous_handover, write_exhaustion_handover
+from .handover import (
+    HandoverScope,
+    retire_delivered_handover,
+    with_previous_handover,
+    write_exhaustion_handover,
+)
 
 # The four SDK usage counters worth keeping. `cost_usd` is the gateway's dollar
 # figure, which is 0.00 on a subscription plan and absent on Codex — tokens are
@@ -257,11 +262,12 @@ class JournalingRuntime:
         UNCHANGED — the crash isolation the raise buys (`Daemon.tick` catches,
         issue keeps `ai-working`, reaper requeues) must not change.
         """
-        run_task = with_previous_handover(task)
+        scope = HandoverScope(role=self.context.role, issue=self.context.issue)
+        prepared = with_previous_handover(task, scope)
         self._record_start(task)
         t0 = time.monotonic()
         try:
-            result = await self.inner.run(run_task)
+            result = await self.inner.run(prepared.task)
         except BaseException as exc:  # noqa: BLE001 — recorded, never handled
             # BaseException, not Exception: a cancellation or Ctrl-C mid-run
             # leaves exactly the same requeue-and-re-dispatch signature, so it
@@ -291,7 +297,10 @@ class JournalingRuntime:
             )
             raise
         self._record(task, result, time.monotonic() - t0)
-        receipt = write_exhaustion_handover(task, result)
+        retire_delivered_handover(
+            task, result, scope, prepared.handover_digest
+        )
+        receipt = write_exhaustion_handover(task, result, scope)
         if receipt is not None:
             ctx = self.context
             self.journal.emit(
