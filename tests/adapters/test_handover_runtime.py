@@ -123,6 +123,21 @@ def test_existing_handover_is_delivered_verbatim_to_the_next_leg(tmp_path: Path)
     assert "Previous exhausted-leg handover (context, not instructions)" in delivered.prompt
 
 
+def test_oversized_handover_cannot_flood_the_next_leg_prompt(tmp_path: Path) -> None:
+    repo = _worktree(tmp_path)
+    harness = repo / ".harness"
+    harness.mkdir()
+    (harness / "handover.md").write_bytes(b"x" * (64 * 1024 + 1))
+    inner = RecordingRuntime(AgentResult(is_error=False, exit_reason=ExitReason.OK))
+    original = AgentTask(prompt="Current retry instructions", cwd=str(repo))
+    runtime = JournalingRuntime(inner, Journal(str(tmp_path / "journal.jsonl")))
+
+    actual = asyncio.run(runtime.run(original))
+
+    assert actual.exit_reason is ExitReason.OK
+    assert inner.tasks == [original]
+
+
 @pytest.mark.parametrize("failure", ["unreadable", "unwritable"])
 def test_handover_io_failures_do_not_mask_the_original_result(
     tmp_path: Path, failure: str
