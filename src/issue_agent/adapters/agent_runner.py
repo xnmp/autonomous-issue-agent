@@ -204,6 +204,25 @@ def _declared_status(structured: Any) -> str:
     return ""
 
 
+def reported_model(msg: Any) -> str:
+    """Concrete model named by an SDK init or result message, if any.
+
+    A task may intentionally leave ``model`` unset and let the SDK choose its
+    deployable default. The SDK reports that choice in the init message's data;
+    newer result envelopes may report it directly. Keep this adapter boundary
+    tolerant of either append-only SDK shape.
+    """
+    direct = getattr(msg, "model", None)
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    data = getattr(msg, "data", None)
+    if isinstance(data, dict):
+        nested = data.get("model")
+        if isinstance(nested, str) and nested.strip():
+            return nested.strip()
+    return ""
+
+
 def result_to_agent_result(msg: Any) -> AgentResult:
     """Pure: SDK ResultMessage → domain AgentResult. Duck-typed (reads attrs) so
     a test can pass a stand-in object. Mirrors claude_outcome / save_session:
@@ -239,6 +258,7 @@ def result_to_agent_result(msg: Any) -> AgentResult:
         summary=summary,
         needs=needs,
         cost_usd=float(getattr(msg, "total_cost_usd", 0.0) or 0.0),
+        model=reported_model(msg),
         session_id=getattr(msg, "session_id", "") or "",
         structured=structured if isinstance(structured, dict) else None,
         exit_reason=exit_reason_from_envelope(
@@ -528,6 +548,7 @@ class AgentRunner(AgentRuntime):
         last_kind = "none"
         last_msg: Any = None  # the actual last message object (for drop-path forensics)
         terminal_seen = ""    # any terminal_reason observed across the stream
+        resolved_model = ""   # the SDK init model for an intentionally unpinned task
         # Running token total, so an abort still reports what it spent. Only the
         # final ResultMessage carries dollars, so without this every wall-cap /
         # idle / dropped-result run ledgers $0.00 no matter how long it ran.
@@ -668,6 +689,7 @@ class AgentRunner(AgentRuntime):
                 msg_count += 1
                 last_kind = type(message).__name__
                 last_msg = message
+                resolved_model = reported_model(message) or resolved_model
                 usage_acc = merge_usage(usage_acc, getattr(message, "usage", None))
                 # Capture any terminal_reason the SDK attaches to ANY message — a
                 # background-requested turn end carries it on a non-Result message,
@@ -782,6 +804,8 @@ class AgentRunner(AgentRuntime):
                 stream_usage=usage_acc,
             )
         result = result_to_agent_result(final)
+        if not result.model and resolved_model:
+            result = dataclasses.replace(result, model=resolved_model)
         # Attach the stream sum to the COMPLETED result too: journaled beside the
         # ResultMessage total, each completed run becomes a calibration pair, and
         # the estimator learns its $/token rate in stream units — the only units
