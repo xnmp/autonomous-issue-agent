@@ -763,7 +763,9 @@ def build_fix_daemon(
     )
     # Wrapped LAST, so the decorator sees whichever runtime actually ran (Claude or
     # the Codex swap above) and the ledger is runtime-agnostic.
-    fix_runner = JournalingRuntime(fix_runner, journal, ledger, cfg.repo, "fix")
+    fix_runner = JournalingRuntime(
+        fix_runner, journal, ledger, cfg.repo, "fix", cfg.fixer_runtime
+    )
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, worktrees, fix_runner, executor,
         prepare_cwd=prepare_cwd, journal=journal,
@@ -954,7 +956,9 @@ def build_review_daemon(
     )
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, None,
-        JournalingRuntime(review_runner, journal, ledger, cfg.repo, "review"),
+        JournalingRuntime(
+            review_runner, journal, ledger, cfg.repo, "review", review_runtime.runtime
+        ),
         executor, journal=journal,
     )
     executor._run_agent = lambda a: asyncio.run(dispatcher.dispatch(a))  # noqa: SLF001
@@ -1067,7 +1071,7 @@ def build_steward_daemon(
     )
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, None,
-        JournalingRuntime(runner, journal, ledger, cfg.repo, "steward"),
+        JournalingRuntime(runner, journal, ledger, cfg.repo, "steward", "claude"),
         executor, journal=journal,
     )
     executor._run_agent = lambda a: asyncio.run(dispatcher.dispatch(a))  # noqa: SLF001
