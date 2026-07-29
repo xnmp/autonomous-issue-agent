@@ -577,8 +577,9 @@ def codex_budget_not_enforced_warning(
     flag, so the ONLY thing that can bound a codex run is the harness watching
     the session's own streamed token counters and killing it — which is what
     `CodexRunner.enforce_budget` now does. When that check is live AND the
-    price table is set, MAX_BUDGET_USD is a real ceiling and this warning goes
-    silent; the boot line says `enforced` instead.
+    price table is set, MAX_BUDGET_USD is a real ceiling and this function
+    returns an informational notice distinguishing native CLI support from the
+    active harness enforcement.
 
     It is NOT live in two cases, and each gets named explicitly rather than
     hidden behind one vague sentence:

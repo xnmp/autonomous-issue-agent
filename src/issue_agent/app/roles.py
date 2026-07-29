@@ -634,11 +634,10 @@ def build_fix_daemon(
             _log("fix")(_blindspot)
         # #29: the OTHER half, which used to be reachable only through the line
         # above — and therefore only when pricing was left unconfigured. It now
-        # fires only when the budget check genuinely cannot bound a run
-        # (enforcement off, or a zeroed price table that makes every run read as
-        # $0.00); with both in place MAX_BUDGET_USD is real and the warning is
-        # silent. Either way `describe()` prints the matching verdict, so the
-        # boot log and this line can never disagree.
+        # warns when the budget check cannot bound a run (enforcement off or
+        # incomplete pricing); with both in place it emits an informational
+        # notice that native codex support is absent but harness enforcement is
+        # active. Either way `describe()` prints the matching verdict.
         _unbounded = codex_budget_not_enforced_warning(
             fix_budget_usd=cfg.fix_budget_usd,
             max_runtime=codex_runtime.max_runtime,
