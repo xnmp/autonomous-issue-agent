@@ -235,6 +235,11 @@ and `source=exec`. The source filter excludes same-cwd subagent rollouts; resume
 runs seed identity from their persisted session ID. Arbitrary stderr is never an
 in-flight usage source because it contains agent-controlled tool/test output.
 
+Codex review is deliberately narrower than Codex fix: only `REVIEW_MODE=single`
+is supported, it uses the read-only sandbox in the operator checkout, and every
+re-review starts fresh because `codex exec resume` cannot carry a sandbox flag.
+Do not broaden that boundary without an equivalent, tested containment mechanism.
+
 ## Identities
 
 - **fix** = ambient `gh auth` login. **review + steward** = the GitHub App
