@@ -211,6 +211,20 @@ def test_detailed_step_recovers_model_from_its_matching_start():
     assert snapshots.detailed_steps(row_for([start, settled], 7))[0]["model"] == "claude-opus-4-1"
 
 
+def test_detailed_review_step_uses_the_model_reported_at_settlement():
+    start = {
+        "ts": ts(hours=3), "event": "agent_run_start", "role": "review",
+        "kind": "REVIEW", "number": 12, "issue": 7, "dispatch": "review-1", "model": "",
+    }
+    settled = {
+        "ts": ts(hours=2), "event": "agent_run", "role": "review", "kind": "REVIEW",
+        "number": 12, "issue": 7, "dispatch": "review-1", "status": "APPROVE",
+        "exit_reason": "ok", "model": "claude-opus-4-1",
+    }
+
+    assert snapshots.detailed_steps(row_for([start, settled], 7))[0]["model"] == "claude-opus-4-1"
+
+
 def test_a_leg_that_exited_for_any_reason_but_ok_reads_as_failed():
     leg = dash.Leg(None, "fix", "RESOLVE", 1, 1, "m", "", "budget_exhausted", 0.0, 0.0, False, "")
     assert snapshots.leg_state(leg) == "failed"

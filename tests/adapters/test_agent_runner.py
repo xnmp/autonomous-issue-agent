@@ -433,6 +433,21 @@ def test_run_honours_result_despite_post_result_raise(monkeypatch):
     assert r.is_error is False
 
 
+def test_run_preserves_the_sdk_init_models_resolved_value(monkeypatch):
+    """An unpinned SDK task still has a concrete runtime model to journal."""
+    init = type("InitMessage", (), {
+        "subtype": "init", "data": {"model": "claude-opus-4-1"},
+    })()
+    result = _ResultMessage(
+        is_error=False, structured_output={"decision": "APPROVE"}, session_id="s1",
+    )
+    _install_fake_sdk(monkeypatch, [init, result])
+
+    run = asyncio.run(AgentRunner().run(AgentTask(prompt="review")))
+
+    assert run.model == "claude-opus-4-1"
+
+
 def test_run_skips_task_notification_followup_result(monkeypatch):
     """A background task finishing injects a synthetic follow-up whose ResultMessage
     carries origin={"kind":"task-notification"}. It must NOT be taken as our result —
