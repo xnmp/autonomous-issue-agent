@@ -11,6 +11,10 @@ import subprocess
 from datetime import datetime, timezone
 
 from issue_agent.app import cli
+
+
+def test_overlay_fields_include_reviewer_runtime():
+    assert "REVIEWER_RUNTIME" in cli._OVERLAY_FIELDS
 from issue_agent.app.config import from_env
 
 

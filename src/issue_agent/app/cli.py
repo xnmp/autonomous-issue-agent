@@ -99,7 +99,7 @@ def parse_remote_url(url: str) -> str:
 # elsewhere in this module.
 _OVERLAY_FIELDS = (
     "REPO", "TARGET_DIR", "STATE_DIR", "REVIEW_STATE_DIR", "STEWARD_STATE_DIR",
-    "TEST_CMD", "DAILY_SPEND_CAP_USD", "FIXER_RUNTIME", "REVIEW_MODE",
+    "TEST_CMD", "DAILY_SPEND_CAP_USD", "FIXER_RUNTIME", "REVIEWER_RUNTIME", "REVIEW_MODE",
 )
 
 # M12: a hand-edited overlay's KEY <spaces> = <spaces> VALUE is not valid bash
@@ -1381,7 +1381,8 @@ def cmd_init(args) -> int:
         fields.append(("JIRA_CLOUD_ID", ask("Jira cloud id / host", "")))
     print()
     fields.append(("FIXER_RUNTIME", ask("Fixer runtime (claude|codex)", "claude")))
-    if any(k == "FIXER_RUNTIME" and v == "codex" for k, v in fields):
+    fields.append(("REVIEWER_RUNTIME", ask("Reviewer runtime (codex|claude)", "codex")))
+    if any(k in ("FIXER_RUNTIME", "REVIEWER_RUNTIME") and v == "codex" for k, v in fields):
         fields.append(("OPENAI_BASE_URL", ask("Gateway base URL (OpenAI-compatible)", "https://api.openai.com/v1")))
         print("  (OPENAI_API_KEY is read from the launching shell env — not stored here.)")
 
