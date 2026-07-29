@@ -604,9 +604,16 @@ class FixWorkflow:
         branch = self.gateway.get_pr(pr_existing).head_ref_name if pr_existing else f"fix/{issue}-issue"
         cwd = self._ensure_cwd(issue, branch)
         fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
-        task = task_builders.build_resume_task(
-            reply, cwd, self.store.get_session(issue),
-            self._repair_fix_cfg(issue, "resume", iss=iss), fork=fork
+        session_id = self.store.get_session(issue)
+        fix_cfg = self._repair_fix_cfg(issue, "resume", iss=iss)
+        task = (
+            task_builders.build_resume_task(
+                reply, cwd, session_id, fix_cfg, fork=fork
+            )
+            if session_id
+            else task_builders.build_fresh_reply_task(
+                issue, iss.title, iss.body, reply, cwd, fix_cfg
+            )
         )
         result = await self.runner.run(task)
         self.store.save_session(issue, result.session_id)
