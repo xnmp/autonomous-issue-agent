@@ -422,6 +422,17 @@ def test_blocked_pr_newer_reply_after_dedupe_dispatches_once_more():
     )
 
 
+def test_blocked_pr_reply_from_operator_who_is_fix_bot_dispatches_resume():
+    prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
+    blocked = pr(
+        100, "ai-pr-open", "ai-blocked", closing_issue=7,
+        comments=(Comment("fix-bot", prompt, "t1"), Comment("fix-bot", "Use A.", "t2")),
+    )
+    state = FixState(sessions=frozenset({7}))
+
+    assert prs_needing_resume(world(prs=[blocked]), state, CFG) == [(100, 7, "t2")]
+
+
 def test_pr_resume_infra_ceiling_replaces_the_blocked_label():
     prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
     blocked = pr(

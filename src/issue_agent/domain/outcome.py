@@ -541,7 +541,7 @@ def fix_ci_actions(pr: int, result: AgentResult) -> list[Action]:
         # it thought it needed. The human inherits a mystery.
         needs = result.needs or result.summary or "see logs"
         return [
-            PostComment(Target.PR, pr, f"**Agent needs input:**\n\n{needs}"),
+            PostComment(Target.PR, pr, f"**Agent needs input:**\n\n{needs}{_BLOCKED_FOOTER}"),
             Relabel(Target.PR, pr, None, Label.AI_BLOCKED),
         ]
     return []

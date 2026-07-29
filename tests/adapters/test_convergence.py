@@ -226,6 +226,7 @@ class Scenario:
     # The agent dies pre-result (raises) instead of returning an errored result
     # — the C3 shape, driven by `_RaisingRunner` rather than `_FakeRunner`.
     runner_raises: bool = False
+    runner_result: outcome.AgentResult = ERRORED_RUN
     # Pre-seed the REAL Store before the loop starts — the store-backed
     # equivalent of what used to be a hand-built `FixState(sessions=...)` seed
     # (e.g. "a resolve already ran and saved a session for this issue").
@@ -250,7 +251,11 @@ def simulate(scenario: Scenario, tmp_path, ticks: int = TICKS) -> list[Tick]:
         scenario.seed(store)
     gw = _SimGateway(scenario.world)
     worktrees = _FakeWorktrees()
-    runner = _RaisingRunner() if scenario.runner_raises else _FakeRunner()
+    runner = (
+        _RaisingRunner()
+        if scenario.runner_raises
+        else _FakeRunner(scenario.runner_result)
+    )
     log: Callable[[str], None] = lambda _m: None  # noqa: E731
     executor = Executor(
         gw, remove_worktree=worktrees.remove, log=log,
@@ -293,6 +298,41 @@ def _resume_dedup() -> Scenario:
         expect_dispatches=1,
         expect_kinds=frozenset({AgentKind.RESUME}),
         cap=0,  # not a retry loop: the dedup mark alone must hold it to one
+    )
+
+
+def _pr_resume_dedup() -> Scenario:
+    """#50: one PR-thread reply must buy exactly ONE resume session, even when
+    that session asks another question and leaves the PR blocked."""
+    prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
+    return Scenario(
+        name="pr-resume-dedup",
+        world=world(
+            issues=[issue(7, "ai-pr-open")],
+            prs=[
+                pr(
+                    100,
+                    "ai-pr-open",
+                    "ai-blocked",
+                    closing_issue=7,
+                    author="fix-bot",
+                    comments=(
+                        Comment("fix-bot", prompt, "2026-01-01T00:00:00Z"),
+                        Comment("alice", "Use A.", "2026-01-01T00:01:00Z"),
+                    ),
+                ),
+            ],
+        ),
+        seed=lambda store: store.save_session(7, "prior-session"),
+        runner_result=outcome.AgentResult(
+            is_error=False,
+            status="blocked",
+            needs="Which A variant?",
+            session_id="resumed-session",
+        ),
+        expect_dispatches=1,
+        expect_kinds=frozenset({AgentKind.PR_RESUME}),
+        cap=0,
     )
 
 
@@ -416,6 +456,7 @@ def _pre_result_death_loop() -> Scenario:
 
 SCENARIOS = [
     pytest.param(_resume_dedup(), id="resume-dedup"),
+    pytest.param(_pr_resume_dedup(), id="pr-resume-dedup"),
     pytest.param(_address_review_breaker(), id="address-review-breaker"),
     pytest.param(_address_review_superseded(), id="address-review-superseded"),
     pytest.param(_fix_ci_breaker(), id="fix-ci-breaker"),

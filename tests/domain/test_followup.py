@@ -152,6 +152,8 @@ def test_fix_ci_pushed_writes_no_label():
 def test_fix_ci_blocked_adds_blocked():
     acts = fix_ci_actions(100, _ok("blocked"))
     assert Relabel(Target.PR, 100, None, Label.AI_BLOCKED) in acts
+    prompt = next(a.body for a in acts if isinstance(a, PostComment))
+    assert "_Reply to unblock." in prompt
     # Anti-vacuity twin for the deletion above: blocked still writes, so [] on the
     # other paths is a decision, not a dead function.
     assert acts != []
