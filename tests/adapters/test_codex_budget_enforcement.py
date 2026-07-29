@@ -41,11 +41,12 @@ def _write_rollout(
     *,
     input_tokens: int,
     output_tokens: int,
+    cached_input_tokens: int = 0,
     sid: str = SID,
 ) -> None:
     usage = {
         "input_tokens": input_tokens,
-        "cached_input_tokens": 0,
+        "cached_input_tokens": cached_input_tokens,
         "cache_write_input_tokens": 0,
         "output_tokens": output_tokens,
     }
@@ -324,6 +325,29 @@ def test_under_budget_run_completes_normally(tmp_path, monkeypatch):
 
     assert result.status == "pr_opened"
     assert result.exit_reason is ExitReason.OK
+
+
+def test_cache_heavy_live_budget_sampler_does_not_kill_a_sub_twenty_dollar_leg(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _write_rollout(
+        tmp_path,
+        input_tokens=3_974_000,
+        cached_input_tokens=3_773_000,
+        output_tokens=9_500,
+    )
+
+    result = asyncio.run(
+        _runner(tmp_path, _chatty_body(seconds=1)).run(
+            AgentTask(prompt="x", max_budget_usd=20.0)
+        )
+    )
+
+    assert result.status == "pr_opened"
+    assert result.exit_reason is ExitReason.OK
+    # (201000 * $5 + 3773000 * $0.50 + 9500 * $30) / 1e6.
+    assert result.cost_usd == pytest.approx(3.1765)
 
 
 def test_resumed_leg_uses_its_own_usage_and_turn_delta(tmp_path, monkeypatch):

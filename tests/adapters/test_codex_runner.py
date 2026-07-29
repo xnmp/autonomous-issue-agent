@@ -1560,7 +1560,7 @@ def test_read_rollout_usage_is_none_when_file_or_session_missing(tmp_path):
 
 
 def test_envelope_prefers_caller_supplied_rollout_usage_over_stderr():
-    # The rollout split prices a warm cached session at the input rate; the
+    # The rollout split prices a warm cached session at the cache rate; the
     # stderr total-only shape would price the same tokens at max(rate) and
     # spuriously trip the issue cap.
     r = parse_codex_envelope(
@@ -1575,7 +1575,7 @@ def test_envelope_prefers_caller_supplied_rollout_usage_over_stderr():
         },
     )
     assert r.usage["input_tokens"] == 1_000_000
-    assert r.cost_usd == (1_000_000 * 5.0 + 10_000 * 30.0) / 1_000_000.0
+    assert r.cost_usd == (100_000 * 5.0 + 900_000 * 0.5 + 10_000 * 30.0) / 1_000_000.0
 
 
 def test_usage_delta_subtracts_the_already_ledgered_baseline():
@@ -1615,11 +1615,11 @@ def test_envelope_falls_back_to_stderr_usage_when_no_rollout():
     assert r.cost_usd == 1820 * 30.0 / 1_000_000.0
 
 
-def test_cost_prices_input_and_output_at_their_own_rates():
+def test_cost_defaults_cached_input_to_one_tenth_of_the_input_rate():
     usage = {"input_tokens": 48000, "output_tokens": 4341, "cache_read_input_tokens": 12000}
     cost = codex_cost_usd(usage, cost_per_mtok_in=1.25, cost_per_mtok_out=10.0)
-    # (48000 * 1.25 + 4341 * 10) / 1e6 — cached reads are already inside input.
-    assert cost == pytest.approx(0.10341)
+    # (36000 * 1.25 + 12000 * 0.125 + 4341 * 10) / 1e6.
+    assert cost == pytest.approx(0.08991)
 
 
 def test_cost_is_zero_without_rates():
@@ -1644,7 +1644,8 @@ def test_envelope_carries_cost_and_usage_when_rates_are_set():
         exit_code=0, last_message=msg, stderr=_MODERN_USAGE_LINE,
         cost_per_mtok_in=1.25, cost_per_mtok_out=10.0,
     )
-    assert r.cost_usd == pytest.approx(0.10341)
+    # (36000 * 1.25 + 12000 * 0.125 + 4341 * 10) / 1e6.
+    assert r.cost_usd == pytest.approx(0.08991)
     assert r.usage == {
         "input_tokens": 48000, "output_tokens": 4341,
         "cache_read_input_tokens": 12000, "cache_creation_input_tokens": 0,
