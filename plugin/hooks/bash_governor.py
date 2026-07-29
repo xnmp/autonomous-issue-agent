@@ -96,6 +96,37 @@ def _run_checker(script_rel: str, args: list[str]) -> tuple[int, str]:
     return res.returncode, (res.stdout + res.stderr)
 
 
+_REVIEW_READ_ONLY_COMMANDS = frozenset({"cat", "ls"})
+_REVIEW_READ_ONLY_GIT = frozenset({"diff"})
+_REVIEW_READ_ONLY_GH_PR = frozenset({"diff", "view"})
+
+
+def review_only_violation(command: str) -> str | None:
+    """Reject every reviewer Bash command outside the task's read-only surface.
+
+    Codex does not consume AgentTask.allowed_tools/disallowed_tools. The
+    read-only sandbox protects the checkout, but it does not make a `gh` write
+    command harmless, so this hook also prevents an untrusted PR prompt from
+    using the daemon's ambient credentials as an escape hatch.
+    """
+    for words, _env in extract_commands_with_env(command):
+        if not words:
+            continue
+        if words[0] in _REVIEW_READ_ONLY_COMMANDS:
+            continue
+        if len(words) >= 2 and words[0] == "git" and words[1] in _REVIEW_READ_ONLY_GIT:
+            continue
+        if (
+            len(words) >= 3
+            and words[0] == "gh"
+            and words[1] == "pr"
+            and words[2] in _REVIEW_READ_ONLY_GH_PR
+        ):
+            continue
+        return "Codex review is read-only; only git diff, gh pr diff/view, cat, and ls are allowed"
+    return None
+
+
 def main() -> None:
     raw = sys.stdin.read()
     try:
@@ -105,6 +136,11 @@ def main() -> None:
     command = (payload.get("tool_input") or {}).get("command", "")
     if not command:
         sys.exit(0)
+
+    if os.environ.get("ISSUE_AGENT_REVIEW_READ_ONLY") == "1":
+        violation = review_only_violation(command)
+        if violation:
+            _block(f"Blocked: {violation}")
 
     governed: list[tuple[Governed, list[str]]] = []
     for words, env in extract_commands_with_env(command):

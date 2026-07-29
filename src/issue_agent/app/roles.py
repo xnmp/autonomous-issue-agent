@@ -65,6 +65,7 @@ from ..domain.triage import (
 )
 from ..domain.jira import jira_phase, jira_sync_needed
 from ..domain.actions import AgentKind, RunAgent
+from ..domain.agent_task import AgentRuntime
 from .config import HarnessConfig
 from .dispatch import AgentDispatcher, DispatchConfig
 from .execute import Executor
@@ -190,6 +191,56 @@ def _spend_gate(cfg: HarnessConfig, ledger: str):
         repo=cfg.repo,
         repo_cap=cfg.daily_spend_cap_usd,
         global_cap=cfg.global_daily_spend_cap_usd,
+    )
+
+
+def _build_codex_runner(
+    cfg: HarnessConfig,
+    *,
+    default_model: str | None,
+    sandbox: str,
+    inject_system_prompt: bool,
+    resume_on_retry: bool,
+    log,
+):
+    """Build either role's Codex adapter from the single runtime config.
+
+    Fix and review deliberately differ only in their capability boundary: fixes
+    need the git-capable sandbox plus a worktree-installed governor, while a
+    review is read-only. Keeping every transport, rollout-pricing, and budget
+    option here prevents a new Codex accounting control reaching one paid role
+    while silently skipping the other.
+    """
+    from ..adapters.codex_runner import CodexProvider, CodexRunner
+
+    runtime = cfg.codex_runtime
+    return CodexRunner(
+        codex_bin=runtime.binary,
+        provider=CodexProvider(
+            provider_id=runtime.provider_id,
+            name=runtime.provider_name,
+            base_url=runtime.base_url,
+            env_key=runtime.env_key,
+            wire_api=runtime.wire_api,
+        ),
+        sandbox=sandbox,
+        resume_on_retry=resume_on_retry,
+        reasoning_effort=runtime.reasoning_effort,
+        inject_system_prompt=inject_system_prompt,
+        log=log,
+        debug=os.environ.get("ISSUE_AGENT_DEBUG", "0") not in ("", "0", "false", "False"),
+        idle_timeout=(runtime.idle_timeout if runtime.idle_timeout > 0 else None),
+        max_runtime=(runtime.max_runtime if runtime.max_runtime > 0 else None),
+        transport_retries=runtime.transport_retries,
+        backoff_base=runtime.backoff_base,
+        rate_limit_backoff_base=runtime.rate_limit_backoff_base,
+        max_rate_limit_wait=runtime.max_rate_limit_wait,
+        max_rate_limit_retries=runtime.max_rate_limit_retries,
+        cost_per_mtok_in=runtime.cost_per_mtok_in,
+        cost_per_mtok_out=runtime.cost_per_mtok_out,
+        cost_per_mtok=runtime.cost_per_mtok,
+        enforce_budget=runtime.enforce_budget,
+        **({"default_model": default_model} if default_model else {}),
     )
 
 
@@ -646,45 +697,19 @@ def build_fix_daemon(
     prepare_cwd = None
     if cfg.fixer_runtime == "codex":
         from ..adapters.codex_runner import (
-            CodexRunner,
-            CodexProvider,
             codex_budget_not_enforced_warning,
             codex_cost_blindspot_warning,
         )
         from ..adapters.codex_hook import write_hook_config
 
-        fix_runner = CodexRunner(
-            codex_bin=codex_runtime.binary,
-            provider=CodexProvider(
-                provider_id=codex_runtime.provider_id,
-                name=codex_runtime.provider_name,
-                base_url=codex_runtime.base_url,
-                env_key=codex_runtime.env_key,
-                wire_api=codex_runtime.wire_api,
-            ),
+        fix_runner = _build_codex_runner(
+            cfg,
+            default_model=codex_runtime.model or None,
             sandbox=codex_runtime.sandbox,
-            reasoning_effort=codex_runtime.reasoning_effort,
-            # AGENT.md reaches Codex via worktree AGENTS.override.md (below), so the
-            # task's append_system_prompt must NOT also be prepended to the prompt
-            # (that would duplicate the whole contract). Suppress it for codex.
+            # AGENT.md reaches Codex through the worktree instructions below.
             inject_system_prompt=False,
+            resume_on_retry=True,
             log=_log("fix"),
-            debug=os.environ.get("ISSUE_AGENT_DEBUG", "0") not in ("", "0", "false", "False"),
-            idle_timeout=(codex_runtime.idle_timeout if codex_runtime.idle_timeout > 0 else None),
-            max_runtime=(codex_runtime.max_runtime if codex_runtime.max_runtime > 0 else None),
-            transport_retries=codex_runtime.transport_retries,
-            backoff_base=codex_runtime.backoff_base,
-            rate_limit_backoff_base=codex_runtime.rate_limit_backoff_base,
-            max_rate_limit_wait=codex_runtime.max_rate_limit_wait,
-            max_rate_limit_retries=codex_runtime.max_rate_limit_retries,
-            cost_per_mtok_in=codex_runtime.cost_per_mtok_in,
-            cost_per_mtok_out=codex_runtime.cost_per_mtok_out,
-            cost_per_mtok=codex_runtime.cost_per_mtok,
-            # #29: the only per-run spend bound codex can have — the runner
-            # samples the session's streamed counters and kills on crossing
-            # AgentTask.max_budget_usd. Without it MAX_BUDGET_USD is decoration.
-            enforce_budget=codex_runtime.enforce_budget,
-            **({"default_model": codex_runtime.model} if codex_runtime.model else {}),
         )
         # Surface a codex misconfig (missing bin/key) at STARTUP, not on the first
         # dispatch — a clear one-liner instead of an opaque per-issue exit 1.
@@ -762,7 +787,9 @@ def build_fix_daemon(
     )
     # Wrapped LAST, so the decorator sees whichever runtime actually ran (Claude or
     # the Codex swap above) and the ledger is runtime-agnostic.
-    fix_runner = JournalingRuntime(fix_runner, journal, ledger, cfg.repo, "fix")
+    fix_runner = JournalingRuntime(
+        fix_runner, journal, ledger, cfg.repo, "fix", cfg.fixer_runtime
+    )
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, worktrees, fix_runner, executor,
         prepare_cwd=prepare_cwd, journal=journal,
@@ -840,7 +867,7 @@ def _review_state(store: Store, world) -> ReviewState:
 
 
 def build_review_daemon(
-    cfg: HarnessConfig, gateway: GitHubGateway, store: Store, runner: AgentRunner
+    cfg: HarnessConfig, gateway: GitHubGateway, store: Store, runner: AgentRuntime
 ) -> Daemon:
     repo_cfg = cfg.repository
     review_runtime = cfg.review_runtime
@@ -873,6 +900,7 @@ def build_review_daemon(
         ),
         max_review_rejections=review_runtime.max_rejections,
         review_bot=review_runtime.bot,
+        reviewer_runtime=review_runtime.runtime,
         review_trigger_label=review_runtime.trigger_label,
         review_mode=review_runtime.mode,
         log=_log("review"),
@@ -882,6 +910,74 @@ def build_review_daemon(
         max_infra_deaths=rcfg.max_unproductive_rounds,
         **_spend_cfg(cfg, "review", ledger),
     )
+    review_runner = runner
+    review_execution_cwd = ""
+    review_prepare_cwd = None
+    if review_runtime.runtime == "codex":
+        from ..adapters.codex_runner import (
+            codex_budget_not_enforced_warning,
+            codex_cost_blindspot_warning,
+        )
+
+        # Review is deliberately read-only in the operator's checkout. Codex
+        # cannot apply the sandbox flag to `exec resume`, so the workflow makes
+        # Codex re-reviews fresh rather than carrying a writable resume session.
+        review_runner = _build_codex_runner(
+            cfg,
+            default_model=review_runtime.model,
+            sandbox="read-only",
+            inject_system_prompt=True,
+            resume_on_retry=False,
+            log=_log("review"),
+        )
+        reason = review_runner.preflight()
+        if reason is not None:
+            _log("review")(f"codex: NOT READY at startup — {reason}")
+        else:
+            _log("review")("codex: runtime ready (bin + key present)")
+        blindspot = codex_cost_blindspot_warning(
+            cost_per_mtok_in=cfg.codex_runtime.cost_per_mtok_in,
+            cost_per_mtok_out=cfg.codex_runtime.cost_per_mtok_out,
+            issue_spend_cap_usd=cfg.issue_spend_cap_usd,
+            daily_spend_cap_usd=cfg.daily_spend_cap_usd,
+            max_runtime=cfg.codex_runtime.max_runtime,
+            runtime_name="REVIEWER_RUNTIME",
+        )
+        if blindspot is not None:
+            _log("review")(blindspot)
+        budget_notice = codex_budget_not_enforced_warning(
+            fix_budget_usd=review_runtime.budget_usd,
+            max_runtime=cfg.codex_runtime.max_runtime,
+            enforced=cfg.codex_runtime.enforce_budget,
+            priced=cfg.codex_runtime.budget_priceable,
+            budget_name="REVIEW_BUDGET_USD",
+            runtime_name="REVIEWER_RUNTIME",
+        )
+        if budget_notice is not None:
+            _log("review")(budget_notice)
+        # Codex ignores AgentTask's SDK-only tool policy.  The workflow installs
+        # this dedicated read-only Bash allow-list immediately before each leg,
+        # in the explicit target checkout only.  Builder-time writes would let a
+        # test run corrupt a simultaneously active fixer worktree.
+        from ..adapters.codex_hook import write_hook_config
+
+        review_execution_cwd = cfg.target_dir
+        if review_execution_cwd:
+            review_prepare_cwd = partial(
+                write_hook_config, review_only=True, log=_log("review")
+            )
+        else:
+            _log("review")(
+                "codex: NOT READY at startup — REVIEWER_RUNTIME=codex requires "
+                "TARGET_DIR so its read-only governor has an explicit checkout"
+            )
+
+    dcfg = replace(
+        dcfg,
+        review_execution_cwd=review_execution_cwd,
+        review_prepare_cwd=review_prepare_cwd,
+    )
+
     # Reviewer has no worktree/issue side; pass a no-op Worktrees-like None usage.
     executor = Executor(
         gateway,
@@ -892,7 +988,9 @@ def build_review_daemon(
     )
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, None,
-        JournalingRuntime(runner, journal, ledger, cfg.repo, "review"),
+        JournalingRuntime(
+            review_runner, journal, ledger, cfg.repo, "review", review_runtime.runtime
+        ),
         executor, journal=journal,
     )
     executor._run_agent = lambda a: asyncio.run(dispatcher.dispatch(a))  # noqa: SLF001
@@ -1005,7 +1103,7 @@ def build_steward_daemon(
     )
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, None,
-        JournalingRuntime(runner, journal, ledger, cfg.repo, "steward"),
+        JournalingRuntime(runner, journal, ledger, cfg.repo, "steward", "claude"),
         executor, journal=journal,
     )
     executor._run_agent = lambda a: asyncio.run(dispatcher.dispatch(a))  # noqa: SLF001

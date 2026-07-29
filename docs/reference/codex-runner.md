@@ -1,4 +1,4 @@
-# CodexRunner — a GPT-5.5 fixer alongside the Claude AgentRunner
+# CodexRunner — Codex execution for fixer and reviewer legs
 
 > **STATUS: BUILT (commit 3ad0992).** `adapters/codex_runner.py` +
 > `adapters/codex_hook.py` + the `FIXER_RUNTIME=codex` wiring + 24 tests are in.
@@ -10,10 +10,46 @@
 > the original scope; they match what shipped.
 
 
-**Goal:** run the *fixer* leg (resolve / resume / address-review / fix-ci) on
+**Goal:** run agent legs on
 **GPT-5.5 via the OpenAI Codex CLI** instead of the Claude Agent SDK, to cut cost,
-**without touching the domain model**. The reviewer + steward stay on Claude (a
-distinct model decorrelates blind spots — see the three-identity design).
+**without touching the domain model**. `REVIEWER_RUNTIME=codex` runs review and
+re-review legs through the same runner; the steward remains on Claude.
+
+## Reviewer runtime
+
+`REVIEWER_RUNTIME` defaults to `codex`, with `REVIEW_MODEL=gpt-5.6-terra`.
+`REVIEWER_RUNTIME=claude` is the explicit opt-in for Claude. For self-hosting,
+mixed fixer/reviewer runtimes remain recommended: they preserve the diversity
+guard that prevents one runtime regression from both creating and approving a
+bad change. Runtime is independent of GitHub identity: review submission still
+uses `REVIEW_BOT`'s App/token identity, so the 422 self-approval constraint is
+unchanged.
+
+Codex receives the review task's existing `REVIEW_SCHEMA` through
+`--output-schema`; the normal workflow therefore accepts only its structured
+APPROVE/REQUEST_CHANGES envelope. `REVIEW_BUDGET_USD` is enforced from rollout
+usage using the same in-harness mechanism as `MAX_BUDGET_USD`; pricing remains
+cache-blind pending #89, so operators should treat its dollar figure as a
+conservative token meter. Settled `role=review` journal rows retain task/result
+model and rollout usage, enabling cost-mix analysis by runtime/model.
+
+Codex review supports `REVIEW_MODE=single` only. `multi` and `delegated` rely
+on Claude aliases and SDK subagents, so configuration rejects those combinations
+instead of silently dropping legs. The reviewer runs in the operator checkout
+under Codex's read-only sandbox and a dedicated governor allow-list (`git diff`,
+`gh pr diff/view`, `cat`, `ls`), so filesystem and ambient-GitHub mutation paths
+are both contained. Because Codex's resume grammar cannot carry a sandbox
+setting, every Codex re-review and in-leg transport retry is intentionally a
+fresh session; it receives the prior verdict as context and cannot regain a
+writable resume mode. The governor hook is installed only immediately before a
+review leg in the explicit `TARGET_DIR`; daemon construction never mutates the
+process cwd, and an unset target fails closed instead of using an implicit cwd.
+
+The Codex reviewer has no image-rendering tool in this read-only surface. It
+cannot substantiate `evidence/` screenshots required by visual acceptance
+criteria; use `REVIEWER_RUNTIME=claude` (the recommended mixed-runtime posture)
+when visual evidence needs reviewer judgement. This is a deliberate documented
+limitation, not a signal to rubber-stamp or uniformly reject screenshots.
 
 This is a **second runtime adapter**, NOT an OpenAI-SDK rewrite. A fixer run is
 `AgentTask → AgentResult`; `AgentRunner` realises that over the Claude SDK, and a

@@ -563,6 +563,31 @@ def test_build_role_does_not_reload_env_when_already_provided(monkeypatch):
     assert daemon is not None
 
 
+def test_review_role_runtime_tags_persisted_sessions(monkeypatch, tmp_path):
+    """A Codex upgrade must not resume a legacy Claude review session."""
+    captured = {}
+
+    class RecordingStore:
+        def __init__(self, state_dir, runtime="claude"):
+            captured.update(state_dir=state_dir, runtime=runtime)
+
+    monkeypatch.setattr(main_module, "Store", RecordingStore)
+    monkeypatch.setattr(
+        main_module, "build_review_daemon", lambda _cfg, _gw, store, _runner: store
+    )
+
+    store = main_module.build_role("review", {
+        "REPO": "o/r",
+        "FIX_BOT": "fix-bot",
+        "REVIEWER_RUNTIME": "codex",
+        "REVIEW_STATE_DIR": str(tmp_path),
+        "WORLD_PROBE": "0",
+    })
+
+    assert store is not None
+    assert captured == {"state_dir": str(tmp_path), "runtime": "codex"}
+
+
 def test_build_role_self_loads_env_when_called_standalone_without_one(monkeypatch):
     # Anti-vacuity twin: a standalone caller that does NOT already have a
     # loaded env (env=None, the documented default) must still get AGENT_ENV

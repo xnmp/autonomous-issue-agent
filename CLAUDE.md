@@ -219,12 +219,16 @@ self-referential `TEST_CMD`/`.harness/test-cmd` (the #63 fork-bomb class) into
 a loud bounded failure instead of an unbounded process tree; gate timeouts
 kill the whole process group, not just the direct child.
 
-On codex, `MAX_BUDGET_USD` is enforced in the harness rather than by a CLI
-flag: the runner samples the rollout's cumulative token counters, subtracts the
-resumed session baseline, and kills the process group when the current leg
-crosses the threshold. This requires `CODEX_ENFORCE_BUDGET=1` and positive input
-and output prices for every fallback/per-model rate; startup logs explicitly
-report any configuration where the dollar bound cannot be enforced. Codex
+On codex, `MAX_BUDGET_USD` and `REVIEW_BUDGET_USD` are enforced in the harness
+rather than by a CLI flag: the runner samples the rollout's cumulative token
+counters, subtracts the resumed session baseline, and kills the process group
+when the current leg crosses the threshold. This requires `CODEX_ENFORCE_BUDGET=1`
+and positive input and output prices for every fallback/per-model rate; startup
+logs explicitly report any configuration where the dollar bound cannot be
+enforced. `REVIEWER_RUNTIME=codex` is the default, but mixed fixer/reviewer
+runtimes remain the recommended self-hosting posture: a shared runtime can hide
+the same failure it creates, while GitHub review identity remains `REVIEW_BOT`
+regardless of runtime. Codex
 0.146.0 no longer prints a session-id header: fresh-run identity comes from the
 post-start rollout `session_meta` matching the worktree, `originator=codex_exec`,
 and `source=exec`. The source filter excludes same-cwd subagent rollouts; resumed
@@ -237,6 +241,19 @@ dispatch across both fresh recovery and true runtime resume.
 With `AUTHOR_TESTS_SPLIT=1` before a PR exists, reply recovery instead re-enters
 the stored author/implementer phase with a fresh role-specific task carrying the
 reply. It never collapses the two blind roles into a generic fixer session.
+
+Codex review is deliberately narrower than Codex fix: only `REVIEW_MODE=single`
+is supported, it uses the read-only sandbox in the operator checkout, and every
+re-review starts fresh because `codex exec resume` cannot carry a sandbox flag.
+The dedicated review governor also blocks shell commands outside `git diff`,
+`gh pr diff/view`, `cat`, and `ls`, so ambient GitHub credentials cannot bypass
+the read-only filesystem boundary. Its hook is installed immediately before a
+review leg in the explicit `TARGET_DIR`; no hook is written while a daemon is
+being built, and a missing target refuses the Codex leg rather than falling back
+to the process cwd. Codex's shell-only review surface also cannot render
+`evidence/` screenshots. Use `REVIEWER_RUNTIME=claude` for a PR whose visual
+acceptance criteria need evidence-image judgement. Do not broaden that boundary
+without an equivalent, tested containment mechanism.
 
 ## Identities
 

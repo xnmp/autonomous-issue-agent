@@ -172,12 +172,14 @@ class JournalingRuntime:
         ledger_path: str = "",
         repo: str = "",
         role: str = "",
+        runtime: str = "",
     ):
         self.inner = inner
         self.journal = journal
         self.ledger = Journal(ledger_path) if ledger_path else None
         self.repo = repo
         self.role = role
+        self.runtime = runtime
         self.context = RunContext(role=role)
 
     def set_context(self, role: str, kind: str, number: int, issue: int | None) -> None:
@@ -388,6 +390,8 @@ class JournalingRuntime:
             if self.ledger is not None and billed > 0:
                 self.ledger.emit(
                     "spend", repo=self.repo, issue=ctx.issue, kind=ctx.kind,
+                    role=ctx.role, runtime=self.runtime,
+                    model=(getattr(result, "model", "") or task.model or ""),
                     cost_usd=billed, estimated=(cost <= 0) or None, usage=usage,
                 )
         except Exception as exc:  # noqa: BLE001 — never fail a run over its receipt

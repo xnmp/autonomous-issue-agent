@@ -1240,6 +1240,9 @@ class _BuildableGateway(FakeGateway):
     def build_world(self):  # pragma: no cover - never ticked in these tests
         raise AssertionError("these tests build the daemon, they do not tick it")
 
+    def build_review_world(self):  # pragma: no cover - never ticked in these tests
+        raise AssertionError("these tests build the daemon, they do not tick it")
+
 
 def _glm_profile(tmp_path, settings: str) -> str:
     d = tmp_path / ".cc-glm"
@@ -1512,6 +1515,111 @@ def test_a_codex_fixer_warns_that_the_per_session_budget_is_not_enforced(tmp_pat
     assert "CODEX_COST_PER_MTOK_IN/OUT are 0" not in err, "pricing IS configured"
     assert "NOT ENFORCED on this runtime" in err
     assert "MAX_BUDGET_USD=$20.00" in err
+
+
+def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
+    """A codex review leg must use the same runner seam as fixes while carrying
+    its own per-review cap and model into the task-producing dispatcher."""
+    from issue_agent.adapters import codex_runner
+    from issue_agent.app.config import from_env
+    from issue_agent.app.roles import build_review_daemon
+
+    seen = {}
+
+    class CapturingCodexRunner:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def preflight(self):
+            return None
+
+    monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
+    cfg = from_env({
+        "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEWER_RUNTIME": "codex",
+        "REVIEW_MODEL": "gpt-5.6-terra", "REVIEW_BUDGET_USD": "2.5",
+        "REVIEW_STATE_DIR": str(tmp_path / "review-state"),
+        "TARGET_DIR": str(tmp_path),
+    })
+
+    daemon = build_review_daemon(
+        cfg, _BuildableGateway(), Store(str(tmp_path / "review-state")),
+        FakeRunner(AgentResult(is_error=False)),
+    )
+
+    dispatcher = daemon.executor._run_agent.__closure__[0].cell_contents
+    runtime = dispatcher.runner.inner
+    assert isinstance(runtime, CapturingCodexRunner)
+    assert seen["default_model"] == "gpt-5.6-terra"
+    assert seen["enforce_budget"] is True
+    assert seen["sandbox"] == "read-only"
+    assert seen["resume_on_retry"] is False
+    assert dispatcher.review_workflow.cfg.execution_cwd == str(tmp_path)
+    assert callable(dispatcher.review_workflow.cfg.prepare_cwd)
+
+
+def test_codex_reviewer_defers_hook_installation_until_dispatch(tmp_path, monkeypatch):
+    """Building a daemon must not mutate a fixer worktree's Codex hook."""
+    from issue_agent.adapters import codex_hook, codex_runner
+    from issue_agent.app.config import from_env
+    from issue_agent.app.roles import build_review_daemon
+
+    hook_calls = []
+
+    class CapturingCodexRunner:
+        def __init__(self, **_kwargs):
+            pass
+
+        def preflight(self):
+            return None
+
+    monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
+    monkeypatch.setattr(
+        codex_hook, "write_hook_config", lambda *args, **kwargs: hook_calls.append((args, kwargs))
+    )
+    cfg = from_env({
+        "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEWER_RUNTIME": "codex",
+        "REVIEW_STATE_DIR": str(tmp_path / "review-state"),
+        "TARGET_DIR": str(tmp_path / "target"),
+    })
+
+    build_review_daemon(
+        cfg, _BuildableGateway(), Store(str(tmp_path / "review-state")),
+        FakeRunner(AgentResult(is_error=False)),
+    )
+
+    assert hook_calls == []
+
+
+def test_codex_reviewer_names_its_unpriced_budget_warning(tmp_path, monkeypatch, capsys):
+    """A review deployment must not inherit a fixer-only warning that sends the
+    operator to the wrong knob while REVIEW_BUDGET_USD is unmeasurable."""
+    from issue_agent.adapters import codex_runner
+    from issue_agent.app.config import from_env
+    from issue_agent.app.roles import build_review_daemon
+
+    class CapturingCodexRunner:
+        def __init__(self, **_kwargs):
+            pass
+
+        def preflight(self):
+            return None
+
+    monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
+    cfg = from_env({
+        "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEWER_RUNTIME": "codex",
+        "REVIEW_STATE_DIR": str(tmp_path / "review-state"),
+        "REVIEW_BUDGET_USD": "2.5", "CODEX_COST_PER_MTOK_IN": "0",
+        "CODEX_COST_PER_MTOK_OUT": "0",
+    })
+
+    build_review_daemon(
+        cfg, _BuildableGateway(), Store(str(tmp_path / "review-state")),
+        FakeRunner(AgentResult(is_error=False)),
+    )
+
+    err = capsys.readouterr().err
+    assert "REVIEW_BUDGET_USD=$2.50 is NOT ENFORCED" in err
+    assert "REVIEWER_RUNTIME=codex" in err
 
 
 def test_the_warning_still_fires_with_the_price_table_zeroed(tmp_path, capsys):
