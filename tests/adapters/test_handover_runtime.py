@@ -193,6 +193,33 @@ def test_handover_is_scoped_to_issue_and_absent_after_successful_delivery(
     assert third.tasks[0].prompt == "Issue 82 third"
 
 
+def test_successor_cannot_force_unbounded_cleanup_read(tmp_path: Path) -> None:
+    repo = _worktree(tmp_path)
+    harness = repo / ".harness"
+    harness.mkdir()
+    path = harness / "handover.md"
+    path.write_text(
+        "<!-- issue-agent-handover role=fix issue=82 -->\n"
+        "# Exhausted-leg handover\n",
+        encoding="utf-8",
+    )
+
+    class ReplacingRuntime:
+        async def run(self, task: AgentTask) -> AgentResult:
+            path.write_bytes(b"x" * (64 * 1024 + 1))
+            return AgentResult(is_error=False, exit_reason=ExitReason.OK)
+
+    runtime = JournalingRuntime(
+        ReplacingRuntime(), Journal(str(tmp_path / "journal.jsonl")), role="fix"
+    )
+    runtime.set_context("fix", "RESOLVE", 82, 82)
+
+    actual = asyncio.run(runtime.run(AgentTask(prompt="continue", cwd=str(repo))))
+
+    assert actual.exit_reason is ExitReason.OK
+    assert path.stat().st_size == 64 * 1024 + 1
+
+
 def test_oversized_handover_cannot_flood_the_next_leg_prompt(tmp_path: Path) -> None:
     repo = _worktree(tmp_path)
     harness = repo / ".harness"

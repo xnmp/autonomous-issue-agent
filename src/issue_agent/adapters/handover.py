@@ -160,7 +160,10 @@ def retire_delivered_handover(
     try:
         if path.is_symlink() or not path.is_file():
             return
-        raw = path.read_bytes()
+        with path.open("rb") as handle:
+            raw = handle.read(_MAX_HANDOVER_BYTES + 1)
+        if len(raw) > _MAX_HANDOVER_BYTES:
+            return
         if hashlib.sha256(raw).hexdigest() == delivered_digest:
             path.unlink()
     except Exception as exc:  # noqa: BLE001 — scratch cleanup never masks success
