@@ -57,7 +57,9 @@ assert_exit 0 "ignores non-create switch" -- bash "$CHECKS/check-branch-name.sh"
 
 echo "== check-commit.sh (prefix) =="
 assert_exit 0 "accepts green:"   -- bash "$CHECKS/check-commit.sh" commit -m "green: implement x"
-assert_exit 0 "accepts red:"     -- bash "$CHECKS/check-commit.sh" commit -m "red: failing test"
+# Pin a failing fixture command: otherwise an outer `.harness/test-cmd` (for
+# example self-hosting `make test`) is resolved by this red-phase hook test.
+assert_exit 0 "accepts red:"     -- env TEST_CMD='false' bash "$CHECKS/check-commit.sh" commit -m "red: failing test"
 assert_exit 1 "rejects bad pfx"  -- bash "$CHECKS/check-commit.sh" commit -m "wip: stuff"
 assert_exit 0 "allows -F (file)" -- bash "$CHECKS/check-commit.sh" commit -F /tmp/msg
 assert_exit 0 "handles -m=glued" -- bash "$CHECKS/check-commit.sh" commit "-mgreen: glued"
@@ -69,6 +71,8 @@ out=$(LINT_CMD='true' bash "$CHECKS/check-commit.sh" commit -m "green: x" 2>&1);
 # verify-red-at-commit: a red: commit whose tests PASS is blocked; failing tests pass.
 out=$(TEST_CMD='true'  bash "$CHECKS/check-commit.sh" commit -m "red: t" 2>&1); rc=$?
 [ "$rc" -eq 1 ] && ok "red: with passing tests blocked" || no "red: with passing tests blocked" "rc=$rc"
+# Keep this fixture self-contained even when its caller created .harness/test-cmd
+# for a real target suite (self-hosting writes `make test` there).
 out=$(TEST_CMD='false' bash "$CHECKS/check-commit.sh" commit -m "red: t" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && ok "red: with failing tests allowed" || no "red: with failing tests allowed" "rc=$rc"
 # green: is never subject to the red-check, even if tests pass.
