@@ -1085,7 +1085,7 @@ def test_a_recurrence_label_buys_more_thinking_at_the_routed_tier():
     assert resolve_task.model == "fable", "a recurrence goes directly to the ceiling"
 
 
-def test_two_signals_climb_past_effort_into_the_next_tier():
+def test_a_recurrence_and_prior_failure_still_dispatch_the_ceiling():
     gw = FakeGateway(
         issues={5: _issue(labels=frozenset({Label.RECURRENCE}))}, pr_for_issue={}
     )
@@ -1101,7 +1101,28 @@ def test_two_signals_climb_past_effort_into_the_next_tier():
     ).resolve(5))
 
     assert runner.tasks[1].effort is Effort.HIGH
-    assert runner.tasks[1].model == "fable", "recurrence goes directly to the ceiling"
+    assert runner.tasks[1].model == "fable", "the ceiling remains stable with more evidence"
+
+
+def test_below_the_hard_evidence_threshold_keeps_complex_route_unchanged():
+    """One completed failure buys effort; it must not replace Claude complex's
+    normal Opus route or attach the two-failure history notice."""
+    gw = FakeGateway(issues={5: _issue()}, pr_for_issue={})
+    store = FakeStore()
+    store.set_resolve_retries(5, 1)
+    runner = SeqRunner([
+        _router_result("complex"),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5"),
+    ])
+
+    asyncio.run(_workflow(
+        gw, store, runner, fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    resolve_task = runner.tasks[1]
+    assert resolve_task.model == "opus"
+    assert resolve_task.effort is Effort.HIGH
+    assert "difficult problem" not in resolve_task.append_system_prompt
 
 
 def test_two_completed_failures_add_a_difficult_history_warning():
@@ -1120,9 +1141,9 @@ def test_two_completed_failures_add_a_difficult_history_warning():
     resolve_task = runner.tasks[1]
     assert resolve_task.model == "fable"
     assert resolve_task.effort is Effort.HIGH
-    assert "difficult problem" in resolve_task.prompt
-    assert "failed in the past" in resolve_task.prompt
-    assert "extra care" in resolve_task.prompt
+    assert "difficult problem" in resolve_task.append_system_prompt
+    assert "failed in the past" in resolve_task.append_system_prompt
+    assert "extra care" in resolve_task.append_system_prompt
 
 
 def test_escalation_respects_the_fixer_runtime_family():
@@ -1274,10 +1295,11 @@ def _pr_with_rounds(n, extra=()):
     return PRView(100, head_ref_name="fix/5-x", closing_issue=5, reviews=reviews)
 
 
-def test_repair_legs_think_harder_without_swapping_the_model():
+def test_repair_legs_keep_their_model_while_thinking_harder():
     """A repair leg resumes a live transcript — handing that context to a
     different reasoner is a different bet than asking this one to think harder.
-    Only a fresh resolve re-prices the model."""
+    The hard ceiling is a fresh-resolve routing decision, so it cannot replace a
+    model attached to a resumed transcript."""
     gw = FakeGateway(prs={100: _pr_with_rounds(2)}, issues={5: IssueView(5)})
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s5"))
 
@@ -1406,6 +1428,29 @@ def test_a_repair_legs_event_reports_no_tier_because_it_chose_none():
     assert (fields["from_tier"], fields["to_tier"]) == (None, None)
     assert fields["model"] == "sonnet", "what actually ran"
     assert (fields["from_effort"], fields["to_effort"]) == ("medium", "high")
+
+
+def test_hard_history_on_an_unpinned_repair_preserves_its_stored_model_and_journal():
+    """A Codex Terra session must not silently become Sol, even after two
+    failures: the ceiling selects a fresh resolve model, never a resumed one."""
+    gw = FakeGateway(prs={100: _pr_with_rounds(1)}, issues={5: IssueView(5)})
+    store = FakeStore()
+    store.models[5] = "gpt-5.6-terra"
+    store.set_resolve_retries(5, 2)
+    journal = RecordingJournal()
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s5"))
+
+    asyncio.run(_workflow(
+        gw, store, runner, fixer_runtime="codex", journal=journal,
+        fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).address_review(100))
+
+    assert runner.tasks[0].model == "gpt-5.6-terra"
+    (event, fields), = journal.events
+    assert event == "route_escalation"
+    assert (fields["from_tier"], fields["to_tier"]) == (None, None)
+    assert fields["model"] == "gpt-5.6-terra"
+    assert fields["ceiling"] is False
 
 
 def test_the_kill_switch_costs_no_gateway_read_on_a_repair_leg():

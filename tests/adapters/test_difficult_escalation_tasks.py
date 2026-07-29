@@ -13,7 +13,7 @@ def test_anthropic_ceiling_routes_to_fable():
     assert route_ceiling_model("claude") == "fable"
 
 
-def test_difficult_history_is_visible_in_the_fixer_prompt():
+def test_difficult_history_is_visible_in_the_fixer_system_prompt():
     task = build_resolve_task(
         62,
         "Hard regression",
@@ -29,9 +29,10 @@ def test_difficult_history_is_visible_in_the_fixer_prompt():
         ),
     )
 
-    assert "difficult problem" in task.prompt
-    assert "failed in the past" in task.prompt
-    assert "take extra care" in task.prompt
+    assert "difficult problem" in task.append_system_prompt
+    assert "failed in the past" in task.append_system_prompt
+    assert "take extra care" in task.append_system_prompt
+    assert "difficult problem" not in task.prompt
 
 
 def test_author_implement_split_preserves_the_difficult_history_warning():
