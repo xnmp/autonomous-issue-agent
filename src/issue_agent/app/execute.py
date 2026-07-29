@@ -14,7 +14,9 @@ Phase 4 work; the executor just routes to it.
 from __future__ import annotations
 
 from collections.abc import Callable
+import time
 
+from ..adapters.github import GhUnavailable
 from ..adapters.journal import alert, event_line
 from ..domain.actions import (
     Action,
@@ -36,6 +38,15 @@ from ..domain.labels import Label
 
 # gh subcommand kind per target.
 _KIND = {Target.ISSUE: "issue", Target.PR: "pr"}
+_DURABLE_ACTIONS = (Relabel, PostComment, CloseIssue, EscalateCiPending)
+_DEFAULT_RETRY_DELAYS = (1.0, 3.0, 9.0)
+
+
+class LifecycleWriteUnverified(RuntimeError):
+    """GitHub returned without raising, but the requested state is still absent."""
+
+
+_TRANSIENT_WRITE_ERRORS = (GhUnavailable, LifecycleWriteUnverified)
 
 
 class Executor:
@@ -55,6 +66,9 @@ class Executor:
         clear_issue_state: Callable[[int, int | None, bool], None] | None = None,
         journal=None,
         alert_cmd: str = "",
+        pending_actions=None,
+        retry_delays: tuple[float, ...] = _DEFAULT_RETRY_DELAYS,
+        sleep: Callable[[float], None] = time.sleep,
     ):
         self.gateway = gateway
         self._remove_worktree = remove_worktree or (lambda issue: None)
@@ -90,6 +104,13 @@ class Executor:
         # from a file instead of a human eyeballing rotated stderr. None = off.
         self._journal = journal
         self._alert_cmd = alert_cmd
+        # STATE_DIR-backed queue shared with Daemon.tick. A terminal write that
+        # exhausts its immediate transient retries remains here across process
+        # death/hot reload; the next tick drains it before observing or buying
+        # another session.
+        self._pending_actions = pending_actions
+        self._retry_delays = retry_delays
+        self._sleep = sleep
 
     def _describe(self, action: Action) -> str:
         """Human-readable one-liner for the action being applied."""
@@ -133,12 +154,95 @@ class Executor:
             self._journal.emit("escalation", **fields)
         alert(self._alert_cmd, event_line("escalation", **fields))
 
-    def execute(self, action: Action) -> None:
-        if not isinstance(action, NoOp):
-            desc = self._describe(action)
-            self._log(desc)
-            if self._journal is not None:
-                self._journal.emit("action", desc=desc)
+    def _already_applied(self, action: Action) -> bool:
+        """Best-effort idempotency probe for a retry after an ambiguous reply.
+
+        A timeout can happen after GitHub committed the mutation. Checking the
+        observable state before sending again prevents duplicate comments and
+        makes replay safe across a crash between the API acknowledgement and
+        queue removal. Older test gateways without these read methods simply
+        fall back to the write attempt.
+        """
+        if isinstance(action, Relabel):
+            has_label = getattr(self.gateway, "has_label", None)
+            if has_label is None:
+                return False
+            removed = (
+                action.remove is None
+                or not has_label(
+                    _KIND[action.target], action.number, action.remove.value
+                )
+            )
+            added = (
+                action.add is None
+                or has_label(_KIND[action.target], action.number, action.add.value)
+            )
+            return removed and added
+        if isinstance(action, PostComment):
+            has_comment = getattr(self.gateway, "has_comment", None)
+            return bool(
+                has_comment
+                and has_comment(_KIND[action.target], action.number, action.body)
+            )
+        if isinstance(action, CloseIssue):
+            issue_closed = getattr(self.gateway, "is_issue_closed", None)
+            return bool(issue_closed and issue_closed(action.number))
+        return False
+
+    def _report_recovered_escalation(self, action: Action) -> None:
+        """Preserve the operator signal when a lost acknowledgement is recovered."""
+        if (
+            isinstance(action, Relabel)
+            and action.add is Label.NEEDS_HUMAN_REVIEW
+        ):
+            self._escalated(action)
+
+    def _apply_ci_escalation(
+        self, action: EscalateCiPending, *, resume: bool
+    ) -> None:
+        """Apply the comment+label composite without duplicating a partial write."""
+        has_comment = getattr(self.gateway, "has_comment", None)
+        has_label = getattr(self.gateway, "has_label", None)
+        comment_present = bool(
+            resume
+            and has_comment
+            and has_comment("pr", action.pr, action.body)
+        )
+        label_present = bool(
+            resume
+            and has_label
+            and has_label("pr", action.pr, Label.NEEDS_HUMAN_REVIEW.value)
+        )
+        if not comment_present:
+            self.gateway.comment("pr", action.pr, action.body)
+        if not label_present:
+            self.gateway.relabel(
+                "pr",
+                action.pr,
+                Label.AI_PR_OPEN.value,
+                Label.NEEDS_HUMAN_REVIEW.value,
+            )
+        if has_comment is not None and not has_comment("pr", action.pr, action.body):
+            raise LifecycleWriteUnverified(
+                f"CI stall escalation comment for PR #{action.pr} was not verified"
+            )
+        if has_label is not None and not has_label(
+            "pr", action.pr, Label.NEEDS_HUMAN_REVIEW.value
+        ):
+            raise LifecycleWriteUnverified(
+                f"CI stall escalation label for PR #{action.pr} was not verified"
+            )
+        self._mark_ci_pending_escalated(action.pr, action.head)
+        self._escalated(
+            Relabel(
+                Target.PR,
+                action.pr,
+                Label.AI_PR_OPEN,
+                Label.NEEDS_HUMAN_REVIEW,
+            )
+        )
+
+    def _apply_once(self, action: Action) -> None:
         if isinstance(action, Relabel):
             self.gateway.relabel(
                 _KIND[action.target],
@@ -151,25 +255,7 @@ class Executor:
             if action.add is Label.NEEDS_HUMAN_REVIEW:
                 self._escalated(action)
         elif isinstance(action, EscalateCiPending):
-            self.gateway.comment("pr", action.pr, action.body)
-            self.gateway.relabel(
-                "pr", action.pr, Label.AI_PR_OPEN.value,
-                Label.NEEDS_HUMAN_REVIEW.value,
-            )
-            verifier = getattr(self.gateway, "has_label", None)
-            if verifier is not None and not verifier(
-                "pr", action.pr, Label.NEEDS_HUMAN_REVIEW.value
-            ):
-                self._log(
-                    f"CI stall escalation for PR #{action.pr} was not verified; "
-                    "marker withheld so the next poll retries"
-                )
-                return
-            self._mark_ci_pending_escalated(action.pr, action.head)
-            self._escalated(Relabel(
-                Target.PR, action.pr, Label.AI_PR_OPEN,
-                Label.NEEDS_HUMAN_REVIEW,
-            ))
+            self._apply_ci_escalation(action, resume=False)
         elif isinstance(action, PostComment):
             self.gateway.comment(_KIND[action.target], action.number, action.body)
         elif isinstance(action, CloseIssue):
@@ -204,6 +290,158 @@ class Executor:
             return
         else:  # pragma: no cover - exhaustive ADT guard
             raise TypeError(f"unhandled action: {action!r}")
+
+    def _apply_retry_once(self, action: Action) -> None:
+        if isinstance(action, EscalateCiPending):
+            self._apply_ci_escalation(action, resume=True)
+        else:
+            self._apply_once(action)
+
+    def _apply_with_retry(
+        self, action: Action, desc: str, *, resume_first: bool = False
+    ) -> int:
+        attempts = 1
+        try:
+            if resume_first:
+                self._apply_retry_once(action)
+            else:
+                self._apply_once(action)
+            return attempts
+        except _TRANSIENT_WRITE_ERRORS as exc:
+            last = exc
+        if (
+            isinstance(last, LifecycleWriteUnverified)
+            and self._pending_actions is None
+        ):
+            raise last
+        for delay in self._retry_delays:
+            if self._journal is not None:
+                self._journal.emit(
+                    "action_retry",
+                    desc=desc,
+                    attempt=attempts,
+                    delay_seconds=delay,
+                    error=str(last),
+                )
+            self._log(
+                f"RETRY: {desc} after "
+                f"{getattr(last, 'headline', 'unverified write')}; "
+                f"waiting {delay:g}s"
+            )
+            self._sleep(delay)
+            attempts += 1
+            try:
+                if self._already_applied(action):
+                    self._report_recovered_escalation(action)
+                    return attempts
+                self._apply_retry_once(action)
+                return attempts
+            except _TRANSIENT_WRITE_ERRORS as exc:
+                last = exc
+        raise last
+
+    def _persist_pending(self, action: Action) -> bool:
+        if self._pending_actions is None:
+            return False
+        pending = self._pending_actions.load_pending_actions()
+        if action not in pending:
+            self._pending_actions.save_pending_actions((*pending, action))
+        return True
+
+    def execute(self, action: Action, *, replayed: bool = False) -> None:
+        if isinstance(action, NoOp):
+            return
+        desc = self._describe(action)
+        self._log(desc)
+        attempts = 1
+        try:
+            if isinstance(action, _DURABLE_ACTIONS):
+                if replayed and self._already_applied(action):
+                    attempts = 0
+                    self._report_recovered_escalation(action)
+                else:
+                    attempts = self._apply_with_retry(
+                        action, desc, resume_first=replayed
+                    )
+            else:
+                self._apply_once(action)
+        except Exception as exc:
+            pending = (
+                isinstance(action, _DURABLE_ACTIONS)
+                and isinstance(exc, _TRANSIENT_WRITE_ERRORS)
+                and self._persist_pending(action)
+            )
+            if self._journal is not None:
+                self._journal.emit(
+                    "action_failed",
+                    desc=desc,
+                    error=str(exc),
+                    pending=pending,
+                    attempts=attempts + len(self._retry_delays),
+                )
+            if (
+                isinstance(exc, LifecycleWriteUnverified)
+                and self._pending_actions is None
+            ):
+                return
+            raise
+        if self._journal is not None:
+            self._journal.emit(
+                "action",
+                desc=desc,
+                attempts=attempts,
+                replayed=replayed,
+            )
+
+    def replay_pending(self) -> bool:
+        """Replay durable writes, quarantining unverifiable entries after the bound."""
+        if self._pending_actions is None:
+            return True
+        try:
+            pending = self._pending_actions.load_pending_actions()
+        except (OSError, ValueError) as exc:
+            self._log(f"FAILED: cannot read pending lifecycle actions — {exc}")
+            if self._journal is not None:
+                self._journal.emit(
+                    "action_failed",
+                    desc="load pending lifecycle actions",
+                    error=str(exc),
+                    pending=True,
+                )
+            return False
+        for index, action in enumerate(pending):
+            try:
+                self.execute(action, replayed=True)
+                self._pending_actions.save_pending_actions(pending[index + 1 :])
+            except LifecycleWriteUnverified as exc:
+                # A non-raising GitHub write followed by an unverifiable read is
+                # not evidence of an outage: stale/locked PRs and benign gh read
+                # failures all reach this arm. One immediate retry cycle plus one
+                # queued replay is the bound. Preserve the action for inspection,
+                # alert loudly, and let unrelated issues continue to converge.
+                try:
+                    self._pending_actions.quarantine_pending_action(action)
+                    self._pending_actions.save_pending_actions(
+                        pending[index + 1 :]
+                    )
+                except (OSError, ValueError) as quarantine_exc:
+                    self._log(
+                        f"FAILED: cannot quarantine pending lifecycle action — "
+                        f"{quarantine_exc}"
+                    )
+                    return False
+                desc = self._describe(action)
+                self._log(f"QUARANTINED: {desc} — {exc}")
+                fields = {"desc": desc, "error": str(exc)}
+                if self._journal is not None:
+                    self._journal.emit("action_quarantined", **fields)
+                alert(
+                    self._alert_cmd,
+                    event_line("action_quarantined", **fields),
+                )
+            except Exception:
+                return False
+        return True
 
     def _rerun_failed_checks(self, action: RerunFailedChecks) -> None:
         """The free CI re-run (#38): spend the head's ONE allowance, then ask
@@ -276,5 +514,3 @@ class Executor:
                 desc = self._describe(action)
                 msg = f"FAILED: {desc} — {exc!r}; continuing with remaining actions"
                 self._log(msg)
-                if self._journal is not None:
-                    self._journal.emit("action_failed", desc=desc, error=str(exc))

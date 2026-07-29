@@ -757,6 +757,7 @@ def build_fix_daemon(
         mark_ci_pending_escalated=store.set_ci_pending_escalated_head,
         clear_issue_state=store.cleanup_pr,
         journal=journal, alert_cmd=cfg.alert_cmd,
+        pending_actions=store,
     )
     # Wrapped LAST, so the decorator sees whichever runtime actually ran (Claude or
     # the Codex swap above) and the ledger is runtime-agnostic.
@@ -881,8 +882,13 @@ def build_review_daemon(
         **_spend_cfg(cfg, "review", ledger),
     )
     # Reviewer has no worktree/issue side; pass a no-op Worktrees-like None usage.
-    executor = Executor(gateway, log=_log("review"), journal=journal,
-                        alert_cmd=cfg.alert_cmd)
+    executor = Executor(
+        gateway,
+        log=_log("review"),
+        journal=journal,
+        alert_cmd=cfg.alert_cmd,
+        pending_actions=store,
+    )
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, None,
         JournalingRuntime(runner, journal, ledger, cfg.repo, "review"),
@@ -985,7 +991,13 @@ def build_steward_daemon(
         fix_bot=cfg.fix_runtime.bot,
         **_spend_cfg(cfg, "steward", ledger),
     )
-    executor = Executor(gateway, log=steward_log, journal=journal, alert_cmd=cfg.alert_cmd)
+    executor = Executor(
+        gateway,
+        log=steward_log,
+        journal=journal,
+        alert_cmd=cfg.alert_cmd,
+        pending_actions=store,
+    )
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, None,
         JournalingRuntime(runner, journal, ledger, cfg.repo, "steward"),

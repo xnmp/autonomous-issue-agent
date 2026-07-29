@@ -887,6 +887,17 @@ def test_server_5xx_classification_requires_the_http_token(stderr, kind):
     assert classify_gh_failure(stderr) == kind
 
 
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "HTTP 401: Requires authentication (https://api.github.com/graphql)",
+        "gh: Bad credentials (HTTP 401)",
+    ],
+)
+def test_auth_outages_are_transient_unavailability(stderr):
+    assert classify_gh_failure(stderr) == "auth"
+
+
 def test_runner_raises_network_on_timeout(monkeypatch, capsys):
     """The 120s kill produced NO data; returning "" made a hung `gh pr view` look
     like a successful read of an empty world. `timed_out` marks it as the

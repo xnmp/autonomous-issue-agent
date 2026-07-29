@@ -182,7 +182,7 @@ def _warn_if_list_truncated(query: str, count: int, limit: int = _LIST_LIMIT) ->
 # ── infra-failure detection (V10) ─────────────────────────────────────────────
 class GhUnavailable(RuntimeError):
     """GitHub could not ANSWER — the `gh` call failed for infrastructure reasons
-    (rate limit, network, 5xx), not because the world is empty.
+    (auth outage, rate limit, network, 5xx), not because the world is empty.
 
     The lesson: `_subprocess_runner` used to map every failure to `""`, so a
     rate-limited poll observed an EMPTY world — zero PRs, zero issues — and the
@@ -192,12 +192,14 @@ class GhUnavailable(RuntimeError):
     on a failed read is a lie, so the daemon skips the tick and the poll loop —
     which IS the retry — looks again next interval. No backoff lives here.
 
-    `kind` is one of "rate-limit" | "network" | "server"; `timed_out` marks the
+    `kind` is one of "auth" | "rate-limit" | "network" | "server";
+    `timed_out` marks the
     one sub-case that is per-CALL rather than systemic (the `_GH_TIMEOUT_S` kill
     of a single hung `gh pr view`), which `_safe_get_pr` still isolates per PR.
     """
 
     _HEADLINES = {
+        "auth": "unavailable (authentication)",
         "rate-limit": "rate-limited",
         "network": "unreachable (network)",
         "server": "server error (5xx)",
@@ -245,6 +247,11 @@ _RATE_LIMIT_PATTERNS = (
     "too many requests",
     "retry-after",
 )
+_AUTH_PATTERNS = (
+    "http 401",
+    "requires authentication",
+    "bad credentials",
+)
 # NB: a bare HTTP 403 is NOT infra — "Resource not accessible by integration"
 # (App token missing a scope) is a permanent, benign permission answer that the
 # reviewer already tolerates. Only 403s carrying rate-limit text match above.
@@ -288,11 +295,13 @@ def classify_gh_failure(detail: str) -> str | None:
     ("rate-limit" | "network" | "server"), or None when the failure is an
     ordinary API answer the caller should keep treating as "" (fail-soft).
 
-    Order matters: rate-limit → server → network. "504 Gateway Timeout" contains
+    Order matters: auth → rate-limit → server → network. "504 Gateway Timeout" contains
     "timeout", so the 5xx test must run before the network test or a GitHub
     outage would be misfiled as a local network fault (same tick-skip either way,
     but the operator reads the kind to decide whether to fix their box)."""
     text = (detail or "").lower()
+    if any(p in text for p in _AUTH_PATTERNS):
+        return "auth"
     if any(p in text for p in _RATE_LIMIT_PATTERNS):
         return "rate-limit"
     if _SERVER_RE.search(text) or any(p in text for p in _SERVER_PATTERNS):
@@ -1330,6 +1339,29 @@ class GitHubGateway:
             isinstance(item, dict) and item.get("name") == label
             for item in (data.get("labels") or [])
         )
+
+    def has_comment(self, kind: str, number: int, body: str) -> bool:
+        """Whether GitHub already contains this exact lifecycle comment.
+
+        Used only after an ambiguous failed write/restart. A timeout can arrive
+        after GitHub accepted the POST; probing before replay prevents a second
+        clarification comment while still retrying genuinely absent writes.
+        """
+        data = self._gh_json([
+            kind, "view", str(number), "--repo", self.repo, "--json", "comments",
+        ])
+        if not isinstance(data, dict):
+            return False
+        return any(
+            isinstance(item, dict) and item.get("body") == body
+            for item in (data.get("comments") or [])
+        )
+
+    def is_issue_closed(self, number: int) -> bool:
+        data = self._gh_json([
+            "issue", "view", str(number), "--repo", self.repo, "--json", "state",
+        ])
+        return isinstance(data, dict) and str(data.get("state") or "").upper() == "CLOSED"
 
     def comment(self, kind: str, number: int, body: str) -> None:
         self._gh(build_comment_args(self.repo, kind, number, body))
