@@ -115,6 +115,50 @@ def test_ambiguous_comment_failure_is_verified_before_retrying_the_post():
     assert gateway.comments == [("issue", 29, "Need clarification")]
 
 
+def test_lost_ack_escalation_replay_still_journals_and_alerts(tmp_path, monkeypatch):
+    class LostAcknowledgementGateway:
+        def __init__(self):
+            self.label_visible = False
+
+        def relabel(self, kind, number, remove, add):
+            self.label_visible = True
+            raise unavailable("request timed out after GitHub accepted the label")
+
+        def has_label(self, kind, number, label):
+            return self.label_visible
+
+    store = Store(str(tmp_path))
+    journal = RecordingJournal()
+    alerts = []
+    monkeypatch.setattr(
+        "issue_agent.app.execute.alert",
+        lambda command, line: alerts.append((command, line)),
+    )
+    action = Relabel(
+        Target.PR,
+        64,
+        Label.AI_PR_OPEN,
+        Label.NEEDS_HUMAN_REVIEW,
+    )
+    executor = Executor(
+        LostAcknowledgementGateway(),
+        journal=journal,
+        alert_cmd="notify-operator",
+        pending_actions=store,
+        retry_delays=(),
+    )
+
+    executor.execute_all([action])
+    assert store.load_pending_actions() == (action,)
+
+    assert executor.replay_pending() is True
+
+    assert [event for event, _ in journal.events].count("escalation") == 1
+    assert len(alerts) == 1
+    assert alerts[0][0] == "notify-operator"
+    assert store.load_pending_actions() == ()
+
+
 def test_pending_store_round_trips_every_terminal_lifecycle_action(tmp_path):
     store = Store(str(tmp_path))
     actions = (
@@ -318,3 +362,35 @@ def test_unverified_composite_is_failed_and_remains_pending(tmp_path):
         for event, fields in journal.events
     )
     assert store.load_pending_actions() == (action,)
+
+
+def test_unverifiable_pending_escalation_is_quarantined_and_observe_resumes(
+    tmp_path,
+):
+    class NeverVerifiedGateway(CompositeGateway):
+        def has_label(self, kind, number, label):
+            return False
+
+    store = Store(str(tmp_path))
+    journal = RecordingJournal()
+    action = EscalateCiPending(64, "head-sha", "CI is stalled")
+    store.save_pending_actions((action,))
+    observed = []
+    daemon = Daemon(
+        "fix",
+        lambda: observed.append(True) or WorldState(),
+        lambda _world: [],
+        Executor(
+            NeverVerifiedGateway(),
+            pending_actions=store,
+            journal=journal,
+            retry_delays=(),
+        ),
+    )
+
+    assert daemon.tick() == []
+
+    assert observed == [True]
+    assert store.load_pending_actions() == ()
+    assert store.load_quarantined_actions() == (action,)
+    assert any(event == "action_quarantined" for event, _ in journal.events)
