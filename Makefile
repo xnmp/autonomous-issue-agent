@@ -2,7 +2,7 @@
 SHELL := /bin/bash
 HARNESS_ROOT := $(shell pwd)
 
-.PHONY: help test test-governor test-hooks test-orchestration test-point-at test-domain test-adapters test-parity arch doctor \
+.PHONY: help test test-governor test-hooks test-orchestration test-deployment-env test-point-at test-domain test-adapters test-parity arch doctor \
 	        install bootstrap point-at run-fix run-review run-steward run-fix-sh run-review-sh run-steward-sh demo-gate \
         install-launchd install-systemd \
         uninstall-launchd uninstall-systemd demo-init lint clean
@@ -26,7 +26,7 @@ help:
 	@echo "  make demo-init          create + seed the local demo target repo"
 	@echo "  make clean              remove caches and demo scratch"
 
-test: test-governor test-hooks test-orchestration test-point-at test-domain test-adapters test-parity arch
+test: test-governor test-hooks test-orchestration test-deployment-env test-point-at test-domain test-adapters test-parity arch
 	@echo ""
 	@echo "✓ all suites passed"
 
@@ -41,6 +41,10 @@ test-hooks:
 test-orchestration:
 	@echo "== orchestration (bash, fakes) =="
 	@bash tests/test_orchestration.sh
+
+test-deployment-env:
+	@echo "== deployment environment sanitization =="
+	@bash tests/test_deployment_env_sanitization.sh
 
 test-point-at:
 	@echo "== point-at (gate-probe worktree placement) =="
