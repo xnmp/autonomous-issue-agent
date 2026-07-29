@@ -176,6 +176,12 @@ class Store:
     def set_resumed_at(self, issue: int, at: str) -> None:
         self._write(self.issue_path(issue, "resumed-at"), at)
 
+    def get_pr_resumed_at(self, pr: int) -> str:
+        return self._read(self.pr_path(pr, "resumed-at"))
+
+    def set_pr_resumed_at(self, pr: int, at: str) -> None:
+        self._write(self.pr_path(pr, "resumed-at"), at)
+
     def bump_resumes(self, issue: int) -> int:
         path = self.issue_path(issue, "resumes")
         n = self._read_int(path) + 1

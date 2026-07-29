@@ -576,6 +576,38 @@ class FixWorkflow:
             self._decay_infra_deaths(issue, result)
         self.executor.execute_all(outcome.resume_actions(issue, result, pr))
 
+    async def resume_pr(self, pr: int) -> None:
+        """Resume a PR-stage block using the linked issue's saved transcript."""
+        issue = self.gateway.issue_for_pr(pr)
+        if issue is None:
+            return
+        p = self.gateway.get_pr(pr)
+        reply_comment = fix_domain.last_human_reply(p, self.cfg.fix_bot)
+        if reply_comment is None or not reply_comment.body.strip():
+            if reply_comment is not None:
+                self.store.set_pr_resumed_at(pr, reply_comment.created_at)
+            self.executor.execute_all([
+                Relabel(Target.PR, pr, Label.AI_WORKING, Label.AI_BLOCKED)
+            ])
+            return
+        # Persist before the paid run: an unchanged PR reply must not fire again
+        # after a crash or another blocked result.
+        self.store.set_pr_resumed_at(pr, reply_comment.created_at)
+        iss = self.gateway.get_issue(issue)
+        cwd = self._ensure_cwd(issue, p.head_ref_name)
+        fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
+        task = task_builders.build_resume_task(
+            reply_comment.body, cwd, self.store.get_session(issue),
+            self._repair_fix_cfg(issue, "resume", iss=iss), fork=fork,
+        )
+        result = await self.runner.run(task)
+        self.store.save_session(issue, result.session_id)
+        if outcome.infra_death(result.exit_reason):
+            self.store.bump_infra_deaths(issue)
+        else:
+            self._decay_infra_deaths(issue, result, alt_key=-pr)
+        self.executor.execute_all(outcome.pr_resume_actions(pr, result))
+
     async def address_review(self, pr: int) -> None:
         issue = self.gateway.issue_for_pr(pr)
         if issue is None:

@@ -39,7 +39,7 @@ from issue_agent.domain.actions import (
 )
 from issue_agent.domain.fix import FixConfig, FixState, decide_fix
 from issue_agent.domain.labels import Label
-from issue_agent.domain.world import CIState
+from issue_agent.domain.world import CIState, Comment
 from issue_agent.domain.ci import ci_state, parse_timestamp
 
 
@@ -89,6 +89,14 @@ def test_parse_pr_maps_reviews_and_closing_ref():
     assert pr.reviews[0].state == "APPROVED"
     # GraphQL shape (`gh pr view --json reviews`) nests the commit under commit.oid.
     assert pr.reviews[0].commit_id == "sha-graphql"
+
+
+def test_parse_pr_maps_comments_for_pr_stage_unblock():
+    pr = parse_pr({
+        "number": 100,
+        "comments": [{"author": {"login": "alice"}, "body": "Use A.", "createdAt": "t2"}],
+    })
+    assert pr.comments == (Comment("alice", "Use A.", "t2"),)
 
 
 def test_parse_pr_review_api_user_shape():
@@ -351,6 +359,8 @@ def test_get_pr_merges_checks_endpoint():
     pr = gw.get_pr(100)
     assert pr.number == 100
     assert pr.checks and pr.checks[0].name == "unit"
+    view_call = next(call[0] for call in fr.calls if call[0][1:3] == ["pr", "view"])
+    assert "comments" in view_call[view_call.index("--json") + 1]
 
 
 # ── external-repo reviewer: build_review_world + ai-review parsing ────────────

@@ -456,6 +456,25 @@ def resume_actions(
     return [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED)]
 
 
+def pr_resume_actions(pr: int, result: AgentResult) -> list[Action]:
+    """Return a resumed PR-stage clarification to its PR lifecycle.
+
+    The linked issue already remains `ai-pr-open`; only the PR was blocked, so
+    changing the issue here would manufacture a second lifecycle state to keep
+    coherent. Infra deaths intentionally leave `ai-working` for the existing
+    reaper/infra ceiling path, matching the issue-side resume contract.
+    """
+    if infra_death(result.exit_reason):
+        return []
+    if classify_outcome(result) is Outcome.BLOCKED:
+        needs = result.needs or result.summary or "see logs"
+        return [
+            PostComment(Target.PR, pr, f"**Agent still needs input:**\n\n{needs}{_BLOCKED_FOOTER}"),
+            Relabel(Target.PR, pr, Label.AI_WORKING, Label.AI_BLOCKED),
+        ]
+    return [Relabel(Target.PR, pr, Label.AI_WORKING, Label.AI_PR_OPEN)]
+
+
 @dataclass(frozen=True)
 class AddressReviewOutcome:
     """address-review.sh tail. The retry counter (keyed to the review's

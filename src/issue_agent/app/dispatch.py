@@ -207,7 +207,7 @@ class AgentDispatcher:
     # Kinds keyed by PR number rather than issue number. The per-issue spend cap
     # needs the ISSUE behind the work, so these are resolved through the gateway.
     _PR_KEYED = frozenset({
-        AgentKind.ADDRESS_REVIEW, AgentKind.FIX_CI, AgentKind.REBASE,
+        AgentKind.PR_RESUME, AgentKind.ADDRESS_REVIEW, AgentKind.FIX_CI, AgentKind.REBASE,
         AgentKind.REVIEW, AgentKind.RE_REVIEW,
     })
 
@@ -466,6 +466,7 @@ class AgentDispatcher:
         handler = {
             AgentKind.RESOLVE: self.fix_workflow.resolve,
             AgentKind.RESUME: self.fix_workflow.resume,
+            AgentKind.PR_RESUME: self.fix_workflow.resume_pr,
             AgentKind.ADDRESS_REVIEW: self.fix_workflow.address_review,
             AgentKind.FIX_CI: self.fix_workflow.fix_ci,
             AgentKind.REBASE: self.fix_workflow.rebase,
