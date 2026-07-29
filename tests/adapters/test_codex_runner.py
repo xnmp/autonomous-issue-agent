@@ -378,6 +378,32 @@ exit 0
     assert any("stderr after oversized line" in line for line in logged)
 
 
+def test_run_accepts_a_three_megabyte_line_before_the_stream_limit():
+    """Several-MiB trace records use the normal stream-reader path."""
+    tmp = tempfile.mkdtemp()
+    body = r'''
+out=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then out="$a"; fi
+  prev="$a"
+done
+head -c 3145728 /dev/zero | tr '\0' x >&2
+echo >&2
+printf '%s' '{"status":"done","summary":"ok","needs":""}' > "$out"
+exit 0
+'''
+    logged: list[str] = []
+    result = asyncio.run(CodexRunner(
+        codex_bin=_fake_codex(tmp, body), env={"OPENAI_API_KEY": "test-key"},
+        log=logged.append, debug=True,
+    ).run(AgentTask(prompt="x")))
+
+    assert result.status == "done"
+    assert any("oversized stderr line truncated: 3145729 bytes" in line for line in logged)
+    assert not any("after stream limit" in line for line in logged)
+
+
 def test_run_drains_a_line_beyond_the_stream_limit_without_losing_the_next_line():
     """Fallback draining preserves the stderr record boundary after a huge line."""
     tmp = tempfile.mkdtemp()
@@ -403,6 +429,33 @@ exit 0
     assert result.status == "done"
     assert any("oversized stderr line" in line and "stream limit" in line for line in logged)
     assert any("stderr after fallback drain" in line for line in logged)
+
+
+def test_watchdog_cancellation_preserves_pending_stderr_after_fallback_drain():
+    """A timed read must not discard bytes buffered after a drained giant line."""
+    tmp = tempfile.mkdtemp()
+    body = r'''
+out=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then out="$a"; fi
+  prev="$a"
+done
+head -c 5242880 /dev/zero | tr '\0' x >&2
+printf '\npartial stderr record' >&2
+sleep 0.2
+echo " completed" >&2
+printf '%s' '{"status":"done","summary":"ok","needs":""}' > "$out"
+exit 0
+'''
+    logged: list[str] = []
+    result = asyncio.run(CodexRunner(
+        codex_bin=_fake_codex(tmp, body), env={"OPENAI_API_KEY": "test-key"},
+        idle_timeout=1.0, poll_slice=0.02, log=logged.append, debug=True,
+    ).run(AgentTask(prompt="x")))
+
+    assert result.status == "done"
+    assert any("partial stderr record completed" in line for line in logged)
 
 
 def _write_session_rollout(

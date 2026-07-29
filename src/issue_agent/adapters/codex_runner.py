@@ -1387,14 +1387,15 @@ class CodexRunner(AgentRuntime):
             """
             nonlocal stderr_pending
             assert proc.stderr is not None
-            prefix, stderr_pending = stderr_pending, b""
+            prefix = stderr_pending
             pending_newline = prefix.find(b"\n")
             if pending_newline >= 0:
                 stderr_pending = prefix[pending_newline + 1:]
                 return prefix[:pending_newline + 1]
             try:
-                return prefix + await proc.stderr.readuntil(b"\n")
+                raw = await proc.stderr.readuntil(b"\n")
             except asyncio.IncompleteReadError as exc:
+                stderr_pending = b""
                 return prefix + exc.partial
             except (asyncio.LimitOverrunError, ValueError):
                 retained = bytearray(prefix[:_STDERR_RETAINED_LINE_BYTES])
@@ -1414,6 +1415,12 @@ class CodexRunner(AgentRuntime):
                     b"[oversized stderr line truncated after stream limit] "
                     + bytes(retained)
                 )
+            else:
+                # Keep `prefix` installed until the awaited read completes: a
+                # watchdog cancellation must not discard bytes already consumed
+                # after the previous oversized record's newline.
+                stderr_pending = b""
+                return prefix + raw
 
         async def _pump_stderr() -> None:
             nonlocal hung, wall_tripped
