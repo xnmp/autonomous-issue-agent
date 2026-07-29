@@ -14,6 +14,21 @@ def test_review_mode_defaults_single():
     assert from_env({"REPO": "x"}).review_scout_model == "sonnet"
 
 
+def test_reviewer_runtime_defaults_to_codex_with_a_mid_tier_model():
+    """The deployment default is visible in the task-producing config, not
+    merely documented in an example overlay."""
+    cfg = from_env({"REPO": "x"})
+
+    assert cfg.reviewer_runtime == "codex"
+    assert cfg.review_model == "gpt-5.6-terra"
+
+
+def test_reviewer_runtime_accepts_an_explicit_claude_diversity_posture():
+    cfg = from_env({"REPO": "x", "REVIEWER_RUNTIME": "claude"})
+
+    assert cfg.reviewer_runtime == "claude"
+
+
 def test_review_mode_delegated_and_scout_override():
     c = from_env({"REPO": "x", "REVIEW_MODE": "delegated", "REVIEW_SCOUT_MODEL": "haiku"})
     assert c.review_mode is ReviewMode.DELEGATED
