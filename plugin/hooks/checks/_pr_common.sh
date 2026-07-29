@@ -108,6 +108,19 @@ prc_resolve_base_ref() {
 # check_tests/check_red_fails).
 prc_allow_untested() { [ "${ALLOW_UNTESTED:-0}" = 1 ]; }
 
+# The command is configured by the harness, but is owned by the target. Do not
+# let harness deployment controls flow into it: self-hosted hook tests would
+# resolve TEST_CMD again and recursively re-run the outer suite.
+prc_run_test_cmd() {  # prc_run_test_cmd "<resolved command>"
+  env \
+    -u TEST_CMD -u LINT_CMD -u TYPECHECK_CMD -u ALLOW_UNTESTED \
+    -u RED_MUST_FAIL -u VERIFY_RED_AT_COMMIT -u BASE_BRANCH \
+    -u GATE_TEST_TIMEOUT_S -u GATE_GH_RETRY_SLEEP \
+    -u GH_APP_ID -u GH_APP_PRIVATE_KEY -u GH_APP_INSTALLATION_ID \
+    -u TARGET_DIR -u AGENT_ENV \
+    bash -c "$1"
+}
+
 # §1 — local test suite must pass (CI re-runs authoritatively, when present).
 #
 # With no test command this check AND the red-fail check (§10) have no teeth, so
@@ -120,7 +133,7 @@ prc_allow_untested() { [ "${ALLOW_UNTESTED:-0}" = 1 ]; }
 prc_check_tests() {
   local tcmd; tcmd="$(prc_resolve_test_cmd)"
   if [ -n "$tcmd" ]; then
-    eval "$tcmd" || fail "local test suite failed: $tcmd"
+    prc_run_test_cmd "$tcmd" || fail "local test suite failed: $tcmd"
   elif prc_allow_untested; then
     echo "GATE WARNING: no test command (neither .harness/test-cmd nor TEST_CMD) — the test gate AND the red-fail (anti-tautological-test) check are DISABLED by ALLOW_UNTESTED=1. A test that passes without the change will not be caught." >&2
   else
@@ -263,7 +276,7 @@ prc_check_red_fails() {  # prc_check_red_fails "<changed-file-list>"
   # With the implementation absent, the suite MUST be red. Run the SAME command
   # §1 ran (agent-declared .harness/test-cmd, else $TEST_CMD).
   local passed=0
-  eval "$tcmd" >/dev/null 2>&1 && passed=1
+  prc_run_test_cmd "$tcmd" >/dev/null 2>&1 && passed=1
 
   # Restore now (don't wait for EXIT) so a fail message reflects a clean tree.
   git checkout -q HEAD -- "${impl_all[@]}" 2>/dev/null || true

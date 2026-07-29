@@ -4,6 +4,15 @@
 # from ground truth (GitHub state) + envelope, never prose.
 set -uo pipefail
 
+# Every case creates its own deployment envelope; external deployment controls
+# would otherwise change authentication paths or redirect sandbox worktrees.
+for gate_knob in \
+  TEST_CMD LINT_CMD TYPECHECK_CMD ALLOW_UNTESTED RED_MUST_FAIL \
+  VERIFY_RED_AT_COMMIT BASE_BRANCH GATE_TEST_TIMEOUT_S GATE_GH_RETRY_SLEEP \
+  GH_APP_ID GH_APP_PRIVATE_KEY GH_APP_INSTALLATION_ID TARGET_DIR AGENT_ENV; do
+  unset "$gate_knob"
+done
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FAKES="$ROOT/tests/fakes"
 PASS=0; FAIL=0

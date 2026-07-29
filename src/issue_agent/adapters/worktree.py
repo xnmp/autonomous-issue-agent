@@ -51,6 +51,22 @@ GitRunner = Callable[[list[str], str], GitResult]  # (args, cwd) -> result
 # proxy holding a fetch open — see CLAUDE.md's proxy note).
 _GIT_TIMEOUT_S = 60.0
 
+# Deployment controls decide how the harness runs a gate. They must not leak
+# into the target command the gate launches: a self-hosted `make test` runs
+# hook tests, which otherwise see the outer TEST_CMD and recursively rerun it.
+_GATE_CHILD_ENV_KNOBS = (
+    "TEST_CMD", "LINT_CMD", "TYPECHECK_CMD", "ALLOW_UNTESTED",
+    "RED_MUST_FAIL", "VERIFY_RED_AT_COMMIT", "BASE_BRANCH",
+    "GATE_TEST_TIMEOUT_S", "GATE_GH_RETRY_SLEEP", "GH_APP_ID",
+    "GH_APP_PRIVATE_KEY", "GH_APP_INSTALLATION_ID", "TARGET_DIR",
+    "AGENT_ENV",
+)
+
+
+def _gate_child_env() -> dict[str, str]:
+    """Return the inherited environment safe for a target test command."""
+    return {key: value for key, value in os.environ.items() if key not in _GATE_CHILD_ENV_KNOBS}
+
 
 def _subprocess_git(args: list[str], cwd: str) -> GitResult:
     """Run `git` in `cwd`, bounded by `_GIT_TIMEOUT_S`.
@@ -419,7 +435,9 @@ def build_gate_context(
         shell=True this doesn't newly introduce."""
         timeout = _test_timeout_s()
         try:
-            return subprocess.run(cmd, shell=True, cwd=cwd, timeout=timeout).returncode == 0
+            return subprocess.run(
+                cmd, shell=True, cwd=cwd, env=_gate_child_env(), timeout=timeout,
+            ).returncode == 0
         except subprocess.TimeoutExpired:
             print(
                 f"[gate] TEST_CMD timed out after {timeout:g}s and was killed "

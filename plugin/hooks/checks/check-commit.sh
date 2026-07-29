@@ -118,7 +118,7 @@ if [ "${VERIFY_RED_AT_COMMIT:-1}" != "0" ] && [ "$(commit_phase "$msg")" = "red"
   if declare -f prc_resolve_test_cmd >/dev/null; then
     _tc="$(prc_resolve_test_cmd)"
     if [ -n "$_tc" ]; then
-      if eval "$_tc" >/dev/null 2>&1; then
+      if prc_run_test_cmd "$_tc" >/dev/null 2>&1; then
         echo "'red:' commit but the test suite PASSES ($_tc) — the new test is not"
         echo "actually failing. Write the FAILING test first, before any implementation."
         exit 1

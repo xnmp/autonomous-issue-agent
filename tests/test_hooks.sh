@@ -5,6 +5,15 @@
 # Run: bash tests/test_hooks.sh
 set -uo pipefail
 
+# Test fixtures choose their own gate controls. Never inherit a self-hosted
+# deployment's controls, which can recursively run this suite through TEST_CMD.
+for gate_knob in \
+  TEST_CMD LINT_CMD TYPECHECK_CMD ALLOW_UNTESTED RED_MUST_FAIL \
+  VERIFY_RED_AT_COMMIT BASE_BRANCH GATE_TEST_TIMEOUT_S GATE_GH_RETRY_SLEEP \
+  GH_APP_ID GH_APP_PRIVATE_KEY GH_APP_INSTALLATION_ID TARGET_DIR AGENT_ENV; do
+  unset "$gate_knob"
+done
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CHECKS="$ROOT/plugin/hooks/checks"
 PASS=0
