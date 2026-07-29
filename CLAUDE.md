@@ -226,7 +226,8 @@ receipts through the #64 pending-action machinery, and appends
 `agent_run_stall` corrections for overlapping settled legs. The journal stays
 append-only; each leg's correction comes from its wall duration minus monotonic
 runtime, and dashboard wall-clock calculations cluster overlapping role
-estimates before subtracting each suspension once.
+estimates or match their stable wall-minus-monotonic clock identity before
+subtracting each suspension once.
 
 On codex, `MAX_BUDGET_USD` and `REVIEW_BUDGET_USD` are enforced in the harness
 rather than by a CLI flag: the runner samples the rollout's cumulative token
