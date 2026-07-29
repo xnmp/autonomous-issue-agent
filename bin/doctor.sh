@@ -575,10 +575,10 @@ if [ -n "${TARGET_DIR:-}" ] && [ -d "$TARGET_DIR" ]; then
     _pinfile=""; _pin=""
     if [ -f "$TARGET_DIR/rust-toolchain.toml" ]; then
       _pinfile="rust-toolchain.toml"
-      _pin="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' "$TARGET_DIR/$_pinfile" | head -1)"
+      _pin="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' "$TARGET_DIR/$_pinfile" 2>/dev/null | head -1)"
     elif [ -f "$TARGET_DIR/rust-toolchain" ]; then
       _pinfile="rust-toolchain"
-      _pin="$(tr -d '[:space:]' < "$TARGET_DIR/$_pinfile" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+$')"
+      _pin="$(tr -d '[:space:]' < "$TARGET_DIR/$_pinfile" 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+$')"
     fi
     if [ -z "$_pinfile" ]; then
       warn "Cargo.toml present but no rust-toolchain.toml/rust-toolchain — nothing pins the local rustc to CI's, so they WILL drift over time (the #33 class: a stale local rustc can be clean where CI's is red on identical source)"
@@ -600,12 +600,21 @@ if [ -n "${TARGET_DIR:-}" ] && [ -d "$TARGET_DIR" ]; then
   # or "lts/*" are common and intentionally loose — comparing those would be a
   # guess, so they are left unparsed and silent).
   if [ -f "$TARGET_DIR/package.json" ]; then
+    # Don't stop at the FIRST candidate file found — an unparseable .nvmrc
+    # ("lts/*") must not shadow a parseable .node-version sitting right next
+    # to it. _pinfile still records the first file found (so the "no pin at
+    # all" warning below stays correctly suppressed) even when nothing ends
+    # up parseable.
     _pinfile=""; _pin=""
     for _f in .nvmrc .node-version; do
       if [ -f "$TARGET_DIR/$_f" ]; then
-        _pinfile="$_f"
-        _pin="$(tr -d '[:space:]' < "$TARGET_DIR/$_f" | sed -E 's/^v//' | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+$')"
-        break
+        [ -n "$_pinfile" ] || _pinfile="$_f"
+        _cand="$(tr -d '[:space:]' < "$TARGET_DIR/$_f" 2>/dev/null | sed -E 's/^v//' | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+$')"
+        if [ -n "$_cand" ]; then
+          _pinfile="$_f"
+          _pin="$_cand"
+          break
+        fi
       fi
     done
     if [ -z "$_pinfile" ]; then
@@ -627,7 +636,7 @@ if [ -n "${TARGET_DIR:-}" ] && [ -d "$TARGET_DIR" ]; then
   # Python: .python-version, exact X.Y.Z pins only (same bare-major reasoning).
   if [ -f "$TARGET_DIR/pyproject.toml" ] || [ -f "$TARGET_DIR/requirements.txt" ]; then
     if [ -f "$TARGET_DIR/.python-version" ]; then
-      _pin="$(tr -d '[:space:]' < "$TARGET_DIR/.python-version" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+$')"
+      _pin="$(tr -d '[:space:]' < "$TARGET_DIR/.python-version" 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+$')"
       if [ -n "$_pin" ]; then
         if command -v python3 >/dev/null 2>&1; then
           _local="$(python3 --version 2>&1 | sed -nE 's/^Python ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')"
