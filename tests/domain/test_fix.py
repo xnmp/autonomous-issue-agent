@@ -435,6 +435,18 @@ def test_pr_resume_infra_ceiling_replaces_the_blocked_label():
     )
 
 
+def test_needs_human_review_pr_reply_never_reopens_the_escalation():
+    prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
+    escalated = pr(
+        100, "ai-pr-open", "needs-human-review", closing_issue=7,
+        comments=(Comment("fix-bot", prompt, "t1"), Comment("alice", "Use A.", "t2")),
+    )
+    state = FixState(sessions=frozenset({7}))
+
+    assert prs_needing_resume(world(prs=[escalated]), state, CFG) == []
+    assert _run_agents(decide_fix(world(prs=[escalated]), CFG, state, fixer_busy=False)) == []
+
+
 # ── conflict backup plan: auto-rebase a CONFLICTING PR ────────────────────────
 def test_conflicting_pr_dispatches_rebase():
     p = pr(100, "ai-pr-open", state="OPEN", head_ref_name="fix/5-x", mergeable="CONFLICTING")

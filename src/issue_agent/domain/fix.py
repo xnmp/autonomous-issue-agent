@@ -449,7 +449,10 @@ def prs_needing_resume(
     """
     out: list[tuple[int, int, str]] = []
     for pr in fixer_prs(world, cfg):
-        if not pr_lifecycle(pr).is_blocked:
+        # `needs-human-review` is also lifecycle-blocked, but it is terminal:
+        # an operator reply must never silently reopen an escalation that
+        # deliberately removed `ai-blocked` at the retry/infra ceiling.
+        if not pr.has(Label.AI_BLOCKED):
             continue
         issue = _issue_for_pr(pr)
         if issue is None or issue not in state.sessions:
