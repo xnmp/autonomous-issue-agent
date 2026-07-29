@@ -433,8 +433,10 @@ def test_run_honours_result_despite_post_result_raise(monkeypatch):
     assert r.is_error is False
 
 
-def test_run_preserves_the_sdk_init_models_resolved_value(monkeypatch):
-    """An unpinned SDK task still has a concrete runtime model to journal."""
+def test_unpinned_sdk_review_journals_the_init_models_resolved_value(monkeypatch, tmp_path):
+    """The review dashboard's settled receipt gets the SDK's actual default."""
+    from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
+
     init = type("InitMessage", (), {
         "subtype": "init", "data": {"model": "claude-opus-4-1"},
     })()
@@ -443,9 +445,15 @@ def test_run_preserves_the_sdk_init_models_resolved_value(monkeypatch):
     )
     _install_fake_sdk(monkeypatch, [init, result])
 
-    run = asyncio.run(AgentRunner().run(AgentTask(prompt="review")))
+    journal = Journal(str(tmp_path / "review-journal.jsonl"))
+    runner = JournalingRuntime(AgentRunner(), journal, role="review")
+    runner.set_context("review", "REVIEW", 100, 91)
 
-    assert run.model == "claude-opus-4-1"
+    asyncio.run(runner.run(AgentTask(prompt="review")))
+
+    start, settled = read_events(journal.path)
+    assert start["model"] == ""
+    assert settled["model"] == "claude-opus-4-1"
 
 
 def test_run_skips_task_notification_followup_result(monkeypatch):
