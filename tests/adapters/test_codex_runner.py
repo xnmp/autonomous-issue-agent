@@ -667,17 +667,17 @@ def test_headerless_01460_recovers_root_rollout_usage_cost_turns_and_ledger(
         "cache_creation_input_tokens": 0,
     }
     assert result.num_turns == 2
-    assert result.cost_usd == pytest.approx(8.0)
+    assert result.cost_usd == pytest.approx(7.775)
     agent_run = [
         event for event in read_events(journal.path) if event["event"] == "agent_run"
     ][0]
     assert agent_run["session_id"] == good_sid
-    assert agent_run["cost_usd"] == pytest.approx(8.0)
+    assert agent_run["cost_usd"] == pytest.approx(7.775)
     assert agent_run["turns"] == 2
     spend = read_events(ledger_path)
     assert len(spend) == 1
     assert spend[0]["event"] == "spend"
-    assert spend[0]["cost_usd"] == pytest.approx(8.0)
+    assert spend[0]["cost_usd"] == pytest.approx(7.775)
 
 
 def test_recovered_session_identity_drives_the_next_resume_invocation(
@@ -763,7 +763,7 @@ def test_echoed_session_header_cannot_override_matching_root_rollout(
     )
 
     assert result.session_id == root_sid
-    assert result.cost_usd == pytest.approx(8.0)
+    assert result.cost_usd == pytest.approx(7.775)
 
 
 def test_productive_headerless_run_without_usage_logs_and_journals_warning(
@@ -1560,7 +1560,7 @@ def test_read_rollout_usage_is_none_when_file_or_session_missing(tmp_path):
 
 
 def test_envelope_prefers_caller_supplied_rollout_usage_over_stderr():
-    # The rollout split prices a warm cached session at the input rate; the
+    # The rollout split prices a warm cached session at the cached-input rate; the
     # stderr total-only shape would price the same tokens at max(rate) and
     # spuriously trip the issue cap.
     r = parse_codex_envelope(
@@ -1575,7 +1575,7 @@ def test_envelope_prefers_caller_supplied_rollout_usage_over_stderr():
         },
     )
     assert r.usage["input_tokens"] == 1_000_000
-    assert r.cost_usd == (1_000_000 * 5.0 + 10_000 * 30.0) / 1_000_000.0
+    assert r.cost_usd == pytest.approx(1.25)
 
 
 def test_usage_delta_subtracts_the_already_ledgered_baseline():
@@ -1634,7 +1634,7 @@ def test_cost_prices_the_cache_heavy_issue_71_shape_at_the_cached_rate():
         cost_per_mtok_in=5.0,
         cost_per_mtok_cached_in=0.5,
         cost_per_mtok_out=30.0,
-    ) == pytest.approx(3.1645)
+    ) == pytest.approx(3.1765)
 
 
 @pytest.mark.parametrize("cached", [None, 0])
@@ -1673,7 +1673,7 @@ def test_envelope_carries_cost_and_usage_when_rates_are_set():
         exit_code=0, last_message=msg, stderr=_MODERN_USAGE_LINE,
         cost_per_mtok_in=1.25, cost_per_mtok_out=10.0,
     )
-    assert r.cost_usd == pytest.approx(0.10341)
+    assert r.cost_usd == pytest.approx(0.08991)
     assert r.usage == {
         "input_tokens": 48000, "output_tokens": 4341,
         "cache_read_input_tokens": 12000, "cache_creation_input_tokens": 0,
@@ -1696,7 +1696,7 @@ def test_a_failed_codex_run_still_reports_the_tokens_it_burned():
         cost_per_mtok_in=1.25, cost_per_mtok_out=10.0,
     )
     assert r.is_error is True
-    assert r.cost_usd == pytest.approx(0.10341)
+    assert r.cost_usd == pytest.approx(0.08991)
 
 
 def _costed_codex(tmp) -> str:
@@ -1723,7 +1723,7 @@ def test_run_flows_codex_cost_into_the_result():
     )
     r = asyncio.run(runner.run(AgentTask(prompt="x")))
     assert r.status == "pr_opened"
-    assert r.cost_usd == pytest.approx(0.10341)
+    assert r.cost_usd == pytest.approx(0.08991)
 
 
 def test_run_reports_zero_cost_without_rates():
@@ -1921,8 +1921,8 @@ def test_two_routed_tiers_ledger_different_dollars_for_identical_tokens():
         return asyncio.run(runner.run(AgentTask(prompt="x", model=model))).cost_usd
 
     cheap, dear = _cost("gpt-5.6-luna"), _cost("gpt-5.6-terra")
-    assert cheap == pytest.approx(0.10341)   # 48000*1.25 + 4341*10, per MTok
-    assert dear == pytest.approx(0.740460)   # 48000*10   + 4341*60
+    assert cheap == pytest.approx(0.08991)
+    assert dear == pytest.approx(0.632460)
     assert cheap < dear
 
 
@@ -1937,7 +1937,7 @@ def test_an_unpinned_leg_is_priced_with_the_runners_default_model():
         cost_per_mtok=_LUNA_TERRA,
     )
     r = asyncio.run(runner.run(AgentTask(prompt="x")))
-    assert r.cost_usd == pytest.approx(0.740460)
+    assert r.cost_usd == pytest.approx(0.632460)
 
 
 def test_a_model_outside_the_table_still_prices_at_the_scalars():
@@ -1946,10 +1946,10 @@ def test_a_model_outside_the_table_still_prices_at_the_scalars():
     runner = CodexRunner(
         codex_bin=_costed_codex(tmp), env={"OPENAI_API_KEY": "k"},
         cost_per_mtok_in=1.25, cost_per_mtok_out=10.0,
-        cost_per_mtok=(("gpt-5.6-terra", 10.0, 60.0),),
+        cost_per_mtok=(("gpt-5.6-terra", 10.0, 60.0, 1.0),),
     )
     r = asyncio.run(runner.run(AgentTask(prompt="x", model="gpt-5.6-luna")))
-    assert r.cost_usd == pytest.approx(0.10341)
+    assert r.cost_usd == pytest.approx(0.08991)
 
 
 def test_the_result_reports_the_model_that_actually_ran():

@@ -144,10 +144,10 @@ class CodexRuntimeConfig:
     max_rate_limit_retries: int
     cost_per_mtok_in: float
     cost_per_mtok_out: float
-    # Per-model (model, USD/MTok in, USD/MTok out) overrides; the scalars above
+    # Per-model (model, USD/MTok in, USD/MTok out, USD/MTok cached-in) overrides; the scalars above
     # remain the fallback for any model not named here. See
     # `HarnessConfig.codex_cost_per_mtok`.
-    cost_per_mtok: tuple[tuple[str, float, float], ...] = ()
+    cost_per_mtok: tuple[tuple[str, float, float, float], ...] = ()
     # Kill a run once its priced spend crosses AgentTask.max_budget_usd (#29).
     # See `HarnessConfig.codex_enforce_budget`.
     enforce_budget: bool = True
@@ -158,7 +158,10 @@ class CodexRuntimeConfig:
         return (
             self.cost_per_mtok_in > 0
             and self.cost_per_mtok_out > 0
-            and all(rate_in > 0 and rate_out > 0 for _, rate_in, rate_out in self.cost_per_mtok)
+            and all(
+                rate_in > 0 and rate_out > 0 and rate_cached_in > 0
+                for _, rate_in, rate_out, rate_cached_in in self.cost_per_mtok
+            )
         )
 
 
@@ -434,13 +437,14 @@ class HarnessConfig:
     # which is exactly the axis routing moves. CLAUDE.md's routing guardrail
     # ("split by routed model tier") is unsatisfiable without this.
     #
-    # `CODEX_COST_PER_MTOK='model=IN/OUT,model=IN/OUT'`, USD per MILLION tokens,
-    # e.g. 'gpt-5.6-luna=1.25/10,gpt-5.6-terra=10/60'. Every leg is priced with
+    # `CODEX_COST_PER_MTOK='model=IN/OUT[/CACHED_IN],...'`, USD per MILLION tokens,
+    # e.g. 'gpt-5.6-luna=1.25/10/0.125,gpt-5.6-terra=10/60'. Cached input
+    # defaults to one tenth of the ordinary input rate when omitted. Every leg is priced with
     # the model it ACTUALLY ran (task.model, or the runner's default when the
     # task pinned none). A model absent from the table — and the whole knob
     # when unset — falls back to the scalars above, so an existing deployment
     # prices exactly as it did before.
-    codex_cost_per_mtok: tuple[tuple[str, float, float], ...] = ()
+    codex_cost_per_mtok: tuple[tuple[str, float, float, float], ...] = ()
     # #29: whether MAX_BUDGET_USD actually BOUNDS a codex run. codex has no
     # per-session budget flag, so the harness enforces it by sampling the
     # session's streamed token counters and killing the run once this leg's
@@ -921,8 +925,8 @@ def _coerce_float(env: dict, key: str, default: float, errors: list[str]) -> flo
 
 def _coerce_rate_table(
     env: dict, key: str, errors: list[str]
-) -> tuple[tuple[str, float, float], ...]:
-    """`'model=IN/OUT,model=IN/OUT'` → an ordered (model, in, out) table (#43).
+) -> tuple[tuple[str, float, float, float], ...]:
+    """Parse per-model `IN/OUT[/CACHED_IN]` rates into an ordered table.
 
     Same contract as the other coercions: empty/absent is UNSET (an empty
     table, i.e. "price everything with the scalar fallback"), and anything
@@ -944,29 +948,32 @@ def _coerce_rate_table(
     raw = env.get(key)
     if raw is None or not raw.strip():
         return ()
-    table: list[tuple[str, float, float]] = []
+    table: list[tuple[str, float, float, float]] = []
     seen: set[str] = set()
     for entry in raw.split(","):
         entry = entry.strip()
         if not entry:
             continue
         model, sep, rates = entry.partition("=")
-        rate_in, slash, rate_out = rates.partition("/")
         model = model.strip().casefold()
-        if not (sep and slash and model):
+        components = [component.strip() for component in rates.split("/")]
+        if not (sep and model and len(components) in (2, 3)):
             errors.append(
-                f"{key} entry {entry!r} must look like 'model=IN/OUT' "
+                f"{key} entry {entry!r} must look like 'model=IN/OUT[/CACHED_IN]' "
                 f"(USD per million tokens) — ignoring it"
             )
             continue
         try:
-            parsed = (float(rate_in.strip()), float(rate_out.strip()))
+            rate_in, rate_out = (float(component) for component in components[:2])
+            rate_cached_in = (
+                float(components[2]) if len(components) == 3 else rate_in / 10
+            )
         except ValueError:
             errors.append(
                 f"{key} entry {entry!r} has non-numeric rates — ignoring it"
             )
             continue
-        if not all(math.isfinite(r) and r >= 0 for r in parsed):
+        if not all(math.isfinite(r) and r >= 0 for r in (rate_in, rate_out, rate_cached_in)):
             errors.append(
                 f"{key} entry {entry!r} must have finite, non-negative rates "
                 f"— ignoring it"
@@ -976,7 +983,7 @@ def _coerce_rate_table(
             errors.append(f"{key} names {model!r} more than once — keeping the first")
             continue
         seen.add(model)
-        table.append((model, parsed[0], parsed[1]))
+        table.append((model, rate_in, rate_out, rate_cached_in))
     return tuple(table)
 
 

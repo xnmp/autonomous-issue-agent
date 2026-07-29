@@ -884,6 +884,15 @@ def test_the_rate_table_parses_a_model_per_entry():
     assert c.validation_errors() == ()
 
 
+def test_the_rate_table_accepts_an_explicit_cached_input_rate():
+    c = from_env({
+        "REPO": "x", "FIX_BOT": "fix-bot",
+        "CODEX_COST_PER_MTOK": "gpt-5.6-sol=5/30/0.75",
+    })
+    assert c.codex_cost_per_mtok == (("gpt-5.6-sol", 5.0, 30.0, 0.75),)
+    assert c.validation_errors() == ()
+
+
 def test_an_unset_rate_table_is_empty_and_changes_nothing():
     """The knob is additive: an existing deployment prices exactly as before."""
     c = from_env({"REPO": "x", "FIX_BOT": "fix-bot"})
@@ -913,7 +922,7 @@ def test_a_malformed_rate_entry_is_named_and_fails_validation():
     })
     errors = c.validation_errors()
     assert any("gpt-5.6-luna" in e for e in errors), errors
-    assert c.codex_cost_per_mtok == (("gpt-5.6-terra", 10.0, 60.0),), (
+    assert c.codex_cost_per_mtok == (("gpt-5.6-terra", 10.0, 60.0, 1.0),), (
         "the well-formed entries survive"
     )
 

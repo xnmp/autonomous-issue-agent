@@ -480,7 +480,11 @@ def usage_delta(end: dict | None, start: dict | None) -> dict | None:
 
 
 def codex_cost_usd(
-    usage: dict | None, *, cost_per_mtok_in: float, cost_per_mtok_out: float
+    usage: dict | None,
+    *,
+    cost_per_mtok_in: float,
+    cost_per_mtok_out: float,
+    cost_per_mtok_cached_in: float | None = None,
 ) -> float:
     """Pure: token counters × the configured USD-per-MILLION-token rates.
 
@@ -490,6 +494,12 @@ def codex_cost_usd(
     ships non-zero list-price defaults, so this is an explicit choice, not the
     common path.
 
+    Cache-read tokens are included in `input_tokens`; when the rollout reports
+    their count they are charged at the configured cached-input rate. Omitting
+    that rate uses one tenth of the normal input rate, matching Codex list
+    pricing. A rollout without cache-read tokens continues to charge all input
+    at the normal rate.
+
     An older codex that printed only a TOTAL is priced at the HIGHER of the two
     rates. Caps exist to stop runaway spend, so the only safe rounding direction
     is over-estimation — an under-counted cap is a cap that never fires."""
@@ -497,14 +507,24 @@ def codex_cost_usd(
         return 0.0
     rate_in = max(float(cost_per_mtok_in or 0.0), 0.0)
     rate_out = max(float(cost_per_mtok_out or 0.0), 0.0)
+    rate_cached_in = max(
+        float(rate_in / 10 if cost_per_mtok_cached_in is None else cost_per_mtok_cached_in or 0.0),
+        0.0,
+    )
     if rate_in <= 0 and rate_out <= 0:
         return 0.0
     tokens_in = int(usage.get("input_tokens", 0) or 0)
     tokens_out = int(usage.get("output_tokens", 0) or 0)
     if tokens_in or tokens_out:
         # Cached input reads are already inside `input_tokens` on the codex line
-        # (it prints "input=N (+ M cached)"), so they are NOT added again.
-        return (tokens_in * rate_in + tokens_out * rate_out) / 1_000_000.0
+        # (it prints "input=N (+ M cached)"), so price that contained portion at
+        # the cache tier without adding it a second time. Clamp malformed counters
+        # to the observed input total so telemetry cannot produce negative input.
+        cached_in = min(max(int(usage.get("cache_read_input_tokens", 0) or 0), 0), tokens_in)
+        uncached_in = tokens_in - cached_in
+        return (
+            uncached_in * rate_in + cached_in * rate_cached_in + tokens_out * rate_out
+        ) / 1_000_000.0
     total = int(usage.get("total_tokens", 0) or 0)
     return total * max(rate_in, rate_out) / 1_000_000.0
 
@@ -520,6 +540,7 @@ def implausible_codex_usage_warning(
     has_baseline: bool,
     cost_per_mtok_in: float,
     cost_per_mtok_out: float,
+    cost_per_mtok_cached_in: float | None = None,
 ) -> str:
     """Explain an impossible-looking fresh-session counter, else blank.
 
@@ -536,6 +557,7 @@ def implausible_codex_usage_warning(
         usage,
         cost_per_mtok_in=cost_per_mtok_in,
         cost_per_mtok_out=cost_per_mtok_out,
+        cost_per_mtok_cached_in=cost_per_mtok_cached_in,
     )
     if cost <= _MAX_PLAUSIBLE_EARLY_COST_USD:
         return ""
@@ -551,6 +573,7 @@ def budget_overrun_usd(
     *,
     cost_per_mtok_in: float,
     cost_per_mtok_out: float,
+    cost_per_mtok_cached_in: float | None = None,
     max_budget_usd: float,
 ) -> float | None:
     """Pure: this leg's spend so far IF it has already crossed `max_budget_usd`,
@@ -581,6 +604,7 @@ def budget_overrun_usd(
         usage,
         cost_per_mtok_in=cost_per_mtok_in,
         cost_per_mtok_out=cost_per_mtok_out,
+        cost_per_mtok_cached_in=cost_per_mtok_cached_in,
     )
     if spend <= 0 or spend < max_budget_usd:
         return None
@@ -589,27 +613,19 @@ def budget_overrun_usd(
 
 def rates_for_model(
     model: str | None,
-    table: tuple[tuple[str, float, float], ...] | None,
+    table: tuple[tuple[str, float, float, float], ...] | None,
     *,
     fallback_in: float,
     fallback_out: float,
-) -> tuple[float, float]:
-    """Pure: the (in, out) USD-per-MTok rates to price ONE leg with (#43).
+) -> tuple[float, float, float]:
+    """Pure: the (in, out, cached-in) USD-per-MTok rates for one leg (#43)."""
 
-    `table` is `CODEX_COST_PER_MTOK` — the per-model overrides. A model the
-    table does not name, an empty table, or a leg whose model is unknown all
-    fall back to the scalars, so a deployment that never sets the table prices
-    exactly as it did before this existed.
-
-    Matched casefolded because the table is stored casefolded and a model id is
-    case-insensitive identity; scanned in order so the first entry for a name
-    wins (see `_coerce_rate_table`, which refuses to store a second)."""
     key = (model or "").strip().casefold()
     if key:
-        for name, rate_in, rate_out in table or ():
+        for name, rate_in, rate_out, rate_cached_in in table or ():
             if name == key:
-                return rate_in, rate_out
-    return fallback_in, fallback_out
+                return rate_in, rate_out, rate_cached_in
+    return fallback_in, fallback_out, fallback_in / 10
 
 
 def codex_cost_blindspot_warning(
@@ -751,6 +767,7 @@ def parse_codex_envelope(
     stderr: str = "",
     cost_per_mtok_in: float = 0.0,
     cost_per_mtok_out: float = 0.0,
+    cost_per_mtok_cached_in: float | None = None,
     usage: dict | None = None,
 ) -> AgentResult:
     """Pure: codex exec result → AgentResult. Mirrors result_to_agent_result —
@@ -776,7 +793,10 @@ def parse_codex_envelope(
 
     usage = usage or parse_codex_usage(stderr)
     cost = codex_cost_usd(
-        usage, cost_per_mtok_in=cost_per_mtok_in, cost_per_mtok_out=cost_per_mtok_out
+        usage,
+        cost_per_mtok_in=cost_per_mtok_in,
+        cost_per_mtok_out=cost_per_mtok_out,
+        cost_per_mtok_cached_in=cost_per_mtok_cached_in,
     )
 
     if structured is None:
@@ -892,12 +912,12 @@ class CodexRunner(AgentRuntime):
     # startup. Set them and every codex run becomes visible to both spend caps.
     cost_per_mtok_in: float = 0.0
     cost_per_mtok_out: float = 0.0
-    # PER-MODEL overrides of the two scalars above (#43): (model, in, out), USD
+    # PER-MODEL overrides of the scalar rates above (#43): (model, in, out, cached-in), USD
     # per MILLION tokens. Each leg is priced with the model it actually ran
     # (`task.model or self.default_model`), so a routed deployment's ledger can
     # be split by tier. Empty (the default) → the scalars price everything,
     # unchanged.
-    cost_per_mtok: tuple[tuple[str, float, float], ...] = ()
+    cost_per_mtok: tuple[tuple[str, float, float, float], ...] = ()
     # Per-run spend ceiling (#29). codex has no per-session budget FLAG, so the
     # only way `AgentTask.max_budget_usd` can bound a run is for us to watch the
     # session's own streamed token counters and kill it. With this True (the
@@ -1281,7 +1301,7 @@ class CodexRunner(AgentRuntime):
         # price a sample with the SAME rates the end-of-run accounting will use;
         # two lookups could drift apart and kill a run at a threshold the ledger
         # then disagrees with.
-        rate_in, rate_out = rates_for_model(
+        rate_in, rate_out, rate_cached_in = rates_for_model(
             model, self.cost_per_mtok,
             fallback_in=self.cost_per_mtok_in, fallback_out=self.cost_per_mtok_out,
         )
@@ -1291,7 +1311,9 @@ class CodexRunner(AgentRuntime):
         # that never trips while looking like one that does. Same clock
         # discipline as the wall cap above — no clock read unless armed.
         budget_usd = task.max_budget_usd if self.enforce_budget else 0.0
-        budget_armed = budget_usd > 0 and rate_in > 0 and rate_out > 0
+        budget_armed = (
+            budget_usd > 0 and rate_in > 0 and rate_out > 0 and rate_cached_in > 0
+        )
         last_budget_check = self._wall_clock() if budget_armed else 0.0
         session_id = task.resume or ""
         implausible_usage_logged = False
@@ -1333,6 +1355,7 @@ class CodexRunner(AgentRuntime):
                 has_baseline=has_baseline,
                 cost_per_mtok_in=rate_in,
                 cost_per_mtok_out=rate_out,
+                cost_per_mtok_cached_in=rate_cached_in,
             )
             if not warning:
                 return usage
@@ -1364,6 +1387,7 @@ class CodexRunner(AgentRuntime):
                 _trusted_usage(usage, sid),
                 cost_per_mtok_in=rate_in,
                 cost_per_mtok_out=rate_out,
+                cost_per_mtok_cached_in=rate_cached_in,
                 max_budget_usd=budget_usd,
             )
 
@@ -1628,7 +1652,10 @@ class CodexRunner(AgentRuntime):
             spend = max(
                 budget_spend,
                 codex_cost_usd(
-                    final_usage, cost_per_mtok_in=rate_in, cost_per_mtok_out=rate_out
+                    final_usage,
+                    cost_per_mtok_in=rate_in,
+                    cost_per_mtok_out=rate_out,
+                    cost_per_mtok_cached_in=rate_cached_in,
                 ),
             )
             self._log(
@@ -1712,6 +1739,7 @@ class CodexRunner(AgentRuntime):
                 rollout_usage,
                 cost_per_mtok_in=rate_in,
                 cost_per_mtok_out=rate_out,
+                cost_per_mtok_cached_in=rate_cached_in,
                 max_budget_usd=budget_usd,
             )
             if budget_armed
@@ -1752,6 +1780,7 @@ class CodexRunner(AgentRuntime):
             stderr=stderr,
             cost_per_mtok_in=rate_in,
             cost_per_mtok_out=rate_out,
+            cost_per_mtok_cached_in=rate_cached_in,
             usage=rollout_usage,
         )
         from dataclasses import replace as _replace
