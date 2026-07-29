@@ -345,6 +345,46 @@ def read_rollout_usage(session_id: str, codex_home: str | None = None) -> dict |
         return None
 
 
+def read_rollout_turns(session_id: str, codex_home: str | None = None) -> int | None:
+    """Model turns recorded in codex's session rollout, or None if unavailable.
+
+    Codex writes one cumulative ``token_count`` event after each model response.
+    Counting those events gives the same operator-facing quantity as the SDK's
+    ``num_turns``: paid model invocations, including tool-use continuations.
+    The count is kept separate from token parsing so a malformed usage payload
+    cannot erase otherwise observable turn telemetry.
+    """
+    if not session_id:
+        return None
+    home = codex_home or os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    try:
+        pattern = os.path.join(
+            home, "sessions", "**", f"rollout-*-{session_id}.jsonl"
+        )
+        paths = glob.glob(pattern, recursive=True)
+        if not paths:
+            return None
+        turns = 0
+        with open(max(paths, key=os.path.getmtime)) as f:
+            for line in f:
+                if '"token_count"' not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                payload = event.get("payload") or {}
+                info = payload.get("info") or {}
+                if (
+                    payload.get("type") == "token_count"
+                    and info.get("last_token_usage") is not None
+                ):
+                    turns += 1
+        return turns
+    except Exception:  # noqa: BLE001 — telemetry fallback must never kill a run
+        return None
+
+
 def usage_delta(end: dict | None, start: dict | None) -> dict | None:
     """Pure: end-of-run counters minus a pre-run baseline, floored at zero.
 
@@ -396,6 +436,47 @@ def codex_cost_usd(
     return total * max(rate_in, rate_out) / 1_000_000.0
 
 
+def budget_overrun_usd(
+    usage: dict | None,
+    *,
+    cost_per_mtok_in: float,
+    cost_per_mtok_out: float,
+    max_budget_usd: float,
+) -> float | None:
+    """Pure: this leg's spend so far IF it has already crossed `max_budget_usd`,
+    else None. The decision half of #29's mid-run budget check.
+
+    `usage` must ALREADY be the per-leg delta (see `usage_delta`), not a resumed
+    session's cumulative counter — the budget is a per-run bound, and a fix-ci
+    leg must not be killed on the resolve's tokens that a previous leg already
+    ledgered.
+
+    Two silences, both deliberate:
+
+    - `max_budget_usd <= 0` — no bound was configured, so there is nothing to
+      cross.
+    - the priced spend is 0 — either no usage has been reported yet, or the
+      price table is zeroed. The latter is exactly the blind spot
+      `codex_cost_blindspot_warning` announces: a cap measured in dollars
+      cannot bound a runtime whose every run reads as free. Staying silent
+      keeps that failure mode "unbounded, and loudly warned about at boot"
+      rather than "silently bounded by a number nobody can measure".
+
+    Returns the spend rather than a bool so the caller can report what the run
+    had actually burned when it was stopped — a kill that cannot say how much
+    it cost is not evidence of anything."""
+    if max_budget_usd <= 0:
+        return None
+    spend = codex_cost_usd(
+        usage,
+        cost_per_mtok_in=cost_per_mtok_in,
+        cost_per_mtok_out=cost_per_mtok_out,
+    )
+    if spend <= 0 or spend < max_budget_usd:
+        return None
+    return spend
+
+
 def rates_for_model(
     model: str | None,
     table: tuple[tuple[str, float, float], ...] | None,
@@ -438,9 +519,9 @@ def codex_cost_blindspot_warning(
     Both rates must be >0 to count as configured: pricing only the input side
     still under-counts every run, which is the same blind spot in weaker form.
 
-    The second half is D12's other half: `build_codex_argv` has no analogue of
-    the SDK's per-session budget (`AgentTask.max_budget_usd`), so once dispatch
-    starts, the wall cap is the only thing bounding one run's spend."""
+    Per-run budget enforcement has its own warning below. Keeping these
+    diagnostics separate prevents a zero-price boot from emitting two
+    conflicting explanations of MAX_BUDGET_USD."""
     if cost_per_mtok_in > 0 and cost_per_mtok_out > 0:
         return None
     if issue_spend_cap_usd <= 0 and daily_spend_cap_usd <= 0:
@@ -453,51 +534,99 @@ def codex_cost_blindspot_warning(
         )
         if part
     )
-    bound = (
-        f"the wall cap (CODEX_MAX_RUNTIME_SECONDS={max_runtime:.0f}s)"
-        if max_runtime > 0
-        else "NOTHING (CODEX_MAX_RUNTIME_SECONDS is unset — set it)"
-    )
+    if cost_per_mtok_in <= 0 and cost_per_mtok_out <= 0:
+        consequence = (
+            "every codex run records $0.00 and NEITHER cap can ever fire"
+        )
+    else:
+        consequence = (
+            "one token class is unpriced, so codex spend is undercounted and "
+            "neither cap is a reliable ceiling"
+        )
+    if max_runtime > 0:
+        per_run = (
+            "Codex has no per-session budget flag natively; until pricing is "
+            f"complete, the wall cap (AGENT_MAX_RUNTIME_SECONDS={max_runtime:.0f}s) "
+            "is the only in-run bound"
+        )
+    else:
+        per_run = (
+            "Codex has no per-session budget flag natively and "
+            "AGENT_MAX_RUNTIME_SECONDS is unset; CODEX_MAX_RUNTIME_SECONDS is "
+            "unset because it is not a valid setting"
+        )
     return (
         "codex: WARNING — spend caps are armed "
-        f"({caps}) but CODEX_COST_PER_MTOK_IN/OUT are 0, so every codex run "
-        "records $0.00 and NEITHER cap can ever fire. Set both to your gateway's "
-        "USD-per-million-token prices. Note also that codex has no per-session "
-        f"budget flag (MAX_BUDGET_USD is a Claude-SDK-only bound), so {bound} "
-        "limits a single run. (FIXER_RUNTIME=codex)"
+        f"({caps}) but both CODEX_COST_PER_MTOK_IN/OUT must be positive; "
+        f"{consequence}. Set both to your gateway's USD-per-million-token "
+        f"prices. {per_run}. (FIXER_RUNTIME=codex)"
     )
 
 
 def codex_budget_not_enforced_warning(
-    *, fix_budget_usd: float, max_runtime: float = 0.0
+    *,
+    fix_budget_usd: float,
+    max_runtime: float = 0.0,
+    enforced: bool = False,
+    priced: bool = False,
 ) -> str | None:
     """The half of `codex_cost_blindspot_warning` that has nothing to do with
     pricing, split out so it can actually be seen (#29).
 
-    `build_codex_argv` has no analogue of the SDK's per-session budget
-    (`AgentTask.max_budget_usd`): on codex, MAX_BUDGET_USD bounds NOTHING, and
-    the wall cap is the only per-run limit. That statement used to live inside
-    the blindspot warning, which returns early when the price table is set —
-    so the operators who had configured pricing CORRECTLY were exactly the ones
-    who never saw it (observed: keifu 2026-07-28, a $28.74 resolve against
-    MAX_BUDGET_USD=20, zero grep matches in the logs).
+    `build_codex_argv` still has no analogue of the SDK's per-session budget
+    flag, so the ONLY thing that can bound a codex run is the harness watching
+    the session's own streamed token counters and killing it — which is what
+    `CodexRunner.enforce_budget` now does. When that check is live AND the
+    price table is set, MAX_BUDGET_USD is a real ceiling and this function
+    returns an informational notice distinguishing native CLI support from the
+    active harness enforcement.
+
+    It is NOT live in two cases, and each gets named explicitly rather than
+    hidden behind one vague sentence:
+
+    - `enforced=False` (CODEX_ENFORCE_BUDGET=0) — the operator opted out.
+    - `priced=False` (either input or output pricing is missing) — an unpriced
+      token class can grow without moving the measured spend. Enforcement is
+      armed but cannot provide an honest dollar ceiling.
+
+    The defaults are the pessimistic pair on purpose: a caller that forgets to
+    say enforcement is live gets the loud line, never a false all-clear.
 
     Returns None when no fix budget is configured — there is then no number
     being misreported, and nothing to correct.
+
+    History: this text used to live inside the blindspot warning, which returns
+    early when the price table is set — so the operators who had configured
+    pricing CORRECTLY were exactly the ones who never saw it (observed: keifu
+    2026-07-28, a $28.74 resolve against MAX_BUDGET_USD=20, zero grep matches
+    in the logs).
     """
     if fix_budget_usd <= 0:
         return None
+    if enforced and priced:
+        return (
+            "codex: NOTICE — the native per-session budget flag is NOT ENFORCED "
+            "on this runtime because codex has no such flag; harness enforcement "
+            f"ACTIVE for MAX_BUDGET_USD=${fix_budget_usd:.2f} using streamed "
+            "rollout usage. (FIXER_RUNTIME=codex)"
+        )
     bound = (
-        f"the wall cap (CODEX_MAX_RUNTIME_SECONDS={max_runtime:.0f}s)"
+        f"the wall cap (AGENT_MAX_RUNTIME_SECONDS={max_runtime:.0f}s)"
         if max_runtime > 0
-        else "NOTHING (CODEX_MAX_RUNTIME_SECONDS is unset — set it)"
+        else "NOTHING (AGENT_MAX_RUNTIME_SECONDS is unset — "
+        "CODEX_MAX_RUNTIME_SECONDS is unset because it is not a valid setting)"
+    )
+    why = (
+        "CODEX_ENFORCE_BUDGET=0"
+        if not enforced
+        else "both CODEX_COST_PER_MTOK_IN and CODEX_COST_PER_MTOK_OUT must be "
+        "positive, so the check cannot measure a reliable dollar ceiling"
     )
     return (
-        f"codex: WARNING — MAX_BUDGET_USD=${fix_budget_usd:.2f} is a "
-        "Claude-SDK-only bound and is NOT ENFORCED on this runtime: codex has "
-        f"no per-session budget flag, so {bound} limits a single run, and the "
-        "issue/daily spend caps (checked only BETWEEN legs) are the first real "
-        "ceiling. (FIXER_RUNTIME=codex)"
+        f"codex: WARNING — MAX_BUDGET_USD=${fix_budget_usd:.2f} is NOT ENFORCED "
+        f"on this runtime ({why}): codex has no per-session budget flag, so "
+        f"{bound} limits a single run, and the issue/daily spend caps (checked "
+        "only BETWEEN legs) are the first real ceiling. (FIXER_RUNTIME=codex)"
     )
 
 
@@ -652,6 +781,20 @@ class CodexRunner(AgentRuntime):
     # be split by tier. Empty (the default) → the scalars price everything,
     # unchanged.
     cost_per_mtok: tuple[tuple[str, float, float], ...] = ()
+    # Per-run spend ceiling (#29). codex has no per-session budget FLAG, so the
+    # only way `AgentTask.max_budget_usd` can bound a run is for us to watch the
+    # session's own streamed token counters and kill it. With this True (the
+    # default) the stderr pump samples those counters on the poll-slice cadence
+    # and, once THIS LEG's priced spend crosses the task budget, kills the
+    # process group and returns ExitReason.BUDGET_EXHAUSTED — the same exit the
+    # Claude SDK's `error_max_budget_usd` maps to, so retry/escalation needs no
+    # codex special case. False (CODEX_ENFORCE_BUDGET=0) keeps the old
+    # behaviour where the wall cap is the only per-run bound; the boot line and
+    # `codex_budget_not_enforced_warning` then say so instead of claiming a
+    # guarantee. Also inert when the price table is zeroed — see
+    # `budget_overrun_usd` for why a $0.00-per-run runtime must not be killed
+    # on a dollar threshold.
+    enforce_budget: bool = True
 
     def __post_init__(self) -> None:
         self._log = self.log or (lambda _m: None)
@@ -675,6 +818,40 @@ class CodexRunner(AgentRuntime):
         if self.max_runtime is not None:
             caps.append(self.max_runtime)
         return min(caps)
+
+    def _usage_so_far(
+        self,
+        err_chunks: list[str],
+        usage_baseline: tuple[str, dict, int | None] | None,
+        session_id: str = "",
+    ) -> dict | None:
+        """THIS LEG's token counters as of right now, or None if nothing has
+        been reported yet (#29).
+
+        Deliberately the same arithmetic the end-of-run accounting does, in the
+        same order — rollout file first, stderr second, then the resumed
+        session's already-ledgered baseline subtracted (`usage_delta`). The
+        number the budget check compares against has to be the number that will
+        reach the ledger, or the harness would kill runs on a figure the
+        operator can never reconcile with the ledger's.
+
+        The baseline subtraction is the load-bearing part: a resumed session's
+        `total_token_usage` is CUMULATIVE, so without it every fix-ci /
+        address-review / rebase leg would be killed on its resolve's tokens the
+        first time it sampled.
+
+        Mid-run there is no envelope yet, so the session id is read from the
+        stderr seen so far — `codex exec` prints its `session id:` header before
+        the first turn, which is what makes an in-flight sample priceable at
+        all."""
+        stderr = "\n".join(err_chunks)
+        sid = session_id or _session_id_from_lines(stderr)
+        usage = read_rollout_usage(sid) if sid else None
+        if usage is None:
+            usage = parse_codex_usage(stderr)
+        if usage_baseline is not None and sid == usage_baseline[0]:
+            usage = usage_delta(usage, usage_baseline[1])
+        return usage
 
     def _log_codex_line(self, line: str) -> None:
         """Classify one live stderr line from `codex exec` and log it. Codex is a
@@ -797,6 +974,7 @@ class CodexRunner(AgentRuntime):
         # attempts were never ledgered, so their tokens must stay in the total.
         baseline_sid = task.resume or ""
         baseline_usage = read_rollout_usage(baseline_sid) if baseline_sid else None
+        baseline_turns = read_rollout_turns(baseline_sid) if baseline_sid else None
         net_attempts = 0
         rl_attempts = 0
         while True:
@@ -820,7 +998,10 @@ class CodexRunner(AgentRuntime):
             )
             result, exit_code, stderr, stdout, hung = await self._exec_once(
                 argv, run_task, output_path,
-                usage_baseline=(baseline_sid, baseline_usage) if baseline_usage else None,
+                usage_baseline=(
+                    (baseline_sid, baseline_usage, baseline_turns)
+                    if baseline_usage else None
+                ),
             )
             if hung:
                 # A watchdog fired — surface as a retryable timeout, not a
@@ -840,6 +1021,13 @@ class CodexRunner(AgentRuntime):
                     summary=f"codex idle >{self.idle_timeout:.0f}s (no stderr event); killed",
                 )
 
+            if result.exit_reason is ExitReason.BUDGET_EXHAUSTED:
+                # #29: we stopped this run on purpose, for spending too much.
+                # Returned BEFORE the transport-drop classifier because a killed
+                # process can leave a truncated stream in stderr that looks like
+                # a gateway drop — and retrying would spend the budget again,
+                # which is the exact opposite of the point.
+                return result
             if not _is_transport_drop(exit_code, stderr, result):
                 return result  # success, genuine error, or blocked — never retry over output
 
@@ -911,7 +1099,7 @@ class CodexRunner(AgentRuntime):
 
     async def _exec_once(
         self, argv: list[str], task: AgentTask, output_path: str,
-        usage_baseline: tuple[str, dict] | None = None,
+        usage_baseline: tuple[str, dict, int | None] | None = None,
     ) -> tuple[AgentResult, int, str, str, bool]:
         """One `codex exec` invocation: spawn, stream stderr live, parse the
         envelope. Returns (result, exit_code, stderr, stdout, hung) so run()'s
@@ -958,29 +1146,95 @@ class CodexRunner(AgentRuntime):
         err_chunks: list[str] = []
         hung = False
         wall_tripped = False
+        budget_tripped = False
+        budget_spend = 0.0
         # Wall-cap baseline, read ONLY when the cap is armed (the clock is injectable
         # and a spurious read would shift a test's fake sequence).
         started_at = self._wall_clock() if self.max_runtime is not None else 0.0
+
+        # #43: price THIS leg with the model it ran on, not with one flat rate.
+        # Hoisted above the pump because the mid-run budget check (#29) has to
+        # price a sample with the SAME rates the end-of-run accounting will use;
+        # two lookups could drift apart and kill a run at a threshold the ledger
+        # then disagrees with.
+        rate_in, rate_out = rates_for_model(
+            model, self.cost_per_mtok,
+            fallback_in=self.cost_per_mtok_in, fallback_out=self.cost_per_mtok_out,
+        )
+        # The budget check is armed only when it can actually fire: enforcement
+        # on, a budget set, and a non-zero price. An unpriced runtime reads every
+        # run as $0.00 (see budget_overrun_usd), so arming there would be a cap
+        # that never trips while looking like one that does. Same clock
+        # discipline as the wall cap above — no clock read unless armed.
+        budget_usd = task.max_budget_usd if self.enforce_budget else 0.0
+        budget_armed = budget_usd > 0 and rate_in > 0 and rate_out > 0
+        last_budget_check = self._wall_clock() if budget_armed else 0.0
+
+        def _budget_overrun(now: float) -> float | None:
+            """This leg's spend if it has crossed the budget, else None.
+
+            Sampled at most once per poll slice: each call globs and reads the
+            rollout file, while codex's own counters only advance at turn
+            boundaries — polling per stderr LINE would be thousands of file
+            reads to observe the same handful of updates. `now` is passed in
+            rather than read here so a caller that already took a clock reading
+            for the wall check shares it (one read per pass, which the
+            fake-clock watchdog tests depend on)."""
+            nonlocal last_budget_check
+            if now - last_budget_check < self._pump_slice():
+                return None
+            last_budget_check = now
+            return budget_overrun_usd(
+                self._usage_so_far(err_chunks, usage_baseline),
+                cost_per_mtok_in=rate_in,
+                cost_per_mtok_out=rate_out,
+                max_budget_usd=budget_usd,
+            )
+
+        def _trip_budget(over: float) -> None:
+            """Shared teardown for both sample points: same killpg as the
+            watchdogs (the whole process GROUP, or a leaked TEST_CMD server
+            holds the pipe open forever)."""
+            nonlocal budget_tripped, budget_spend
+            budget_tripped = True
+            budget_spend = over
+            self._log(
+                f"codex: BUDGET — this leg has spent ${over:.2f}, crossing "
+                f"MAX_BUDGET_USD=${budget_usd:.2f}; killing subprocess"
+            )
+            _kill_quietly(proc)
 
         async def _pump_stderr() -> None:
             nonlocal hung, wall_tripped
             assert proc.stderr is not None
             while True:
-                # Between-lines wall check. A chatty run never times out a chunk, so
-                # the in-chunk check alone would leave a runaway session that keeps
-                # printing tool traces unbounded — the spend hole the cap closes.
-                if self.max_runtime is not None:
-                    elapsed = self._wall_clock() - started_at
-                    if elapsed >= self.max_runtime:
-                        hung = True
-                        wall_tripped = True
-                        self._log(
-                            f"codex: WALL — total runtime {elapsed:.0f}s exceeded "
-                            f"max {self.max_runtime:.0f}s; killing subprocess"
-                        )
-                        _kill_quietly(proc)
-                        return
-                if self.idle_timeout is None and self.max_runtime is None:
+                # Between-lines wall/budget checks. A chatty run never times out a
+                # chunk, so the in-chunk checks alone would leave a runaway session
+                # that keeps printing tool traces unbounded — the spend hole these
+                # caps close. ONE clock read, shared by both.
+                if self.max_runtime is not None or budget_armed:
+                    now = self._wall_clock()
+                    if self.max_runtime is not None:
+                        elapsed = now - started_at
+                        if elapsed >= self.max_runtime:
+                            hung = True
+                            wall_tripped = True
+                            self._log(
+                                f"codex: WALL — total runtime {elapsed:.0f}s exceeded "
+                                f"max {self.max_runtime:.0f}s; killing subprocess"
+                            )
+                            _kill_quietly(proc)
+                            return
+                    if budget_armed:
+                        over = _budget_overrun(now)
+                        if over is not None:
+                            _trip_budget(over)
+                            return
+                if (
+                    self.idle_timeout is None
+                    and self.max_runtime is None
+                    and not budget_armed
+                ):
                     raw = await proc.stderr.readline()
                     if not raw:  # EOF
                         return
@@ -1031,6 +1285,15 @@ class CodexRunner(AgentRuntime):
                             )
                             _kill_quietly(proc)
                             return
+                        if budget_armed:
+                            # A silent stream still SPENDS — the model is
+                            # generating, it just isn't printing tool traces —
+                            # so the budget has to be sampled here too, not only
+                            # between lines. Reuses `now`: no extra clock read.
+                            over = _budget_overrun(now)
+                            if over is not None:
+                                _trip_budget(over)
+                                return
                         # chunk elapsed but still inside both windows — keep waiting
                 if not got or not raw:  # EOF
                     return
@@ -1064,7 +1327,7 @@ class CodexRunner(AgentRuntime):
                 stdout_task,
                 timeout=(
                     self.post_hang_drain_timeout
-                    if (self.idle_timeout or self.max_runtime)
+                    if (self.idle_timeout or self.max_runtime or budget_tripped)
                     else None
                 ),
             )
@@ -1090,6 +1353,62 @@ class CodexRunner(AgentRuntime):
             # "stderr 125B" until reproduced by hand — on a nonzero exit the
             # tail IS the reason, so log it.
             self._log(f"codex: stderr tail: {_stderr_tail(stderr, 3)[:500]}")
+
+        if budget_tripped:
+            # Checked BEFORE `hung`: the residual-stdout drain above sets `hung`
+            # when a descendant that survived our killpg still holds the pipe,
+            # and reporting that as an idle timeout would bury the real reason
+            # this run was stopped.
+            session_id = (
+                _session_id_from_lines(stderr) or _session_id_from_lines(stdout)
+            )
+            final_usage = self._usage_so_far(err_chunks, usage_baseline, session_id)
+            final_turns = read_rollout_turns(session_id)
+            if (
+                final_turns is not None
+                and usage_baseline is not None
+                and session_id == usage_baseline[0]
+                and usage_baseline[2] is not None
+            ):
+                final_turns = max(0, final_turns - usage_baseline[2])
+            # Re-price from the FINAL counters: the sampler priced a snapshot,
+            # and the session kept generating until the kill landed. `max` so a
+            # rollout that lost the last turn can never report LESS than what we
+            # already observed and killed on.
+            spend = max(
+                budget_spend,
+                codex_cost_usd(
+                    final_usage, cost_per_mtok_in=rate_in, cost_per_mtok_out=rate_out
+                ),
+            )
+            self._log(
+                f"codex: killed on budget after ${spend:.2f} "
+                f"(MAX_BUDGET_USD=${budget_usd:.2f})"
+            )
+            return (
+                AgentResult(
+                    is_error=True,
+                    # The literal subtype the Claude SDK reports on ITS budget
+                    # abort. Reusing the exact string keeps one greppable value
+                    # in the journal across both runtimes.
+                    status="error_max_budget_usd",
+                    envelope_subtype="error_max_budget_usd",
+                    exit_reason=ExitReason.BUDGET_EXHAUSTED,
+                    summary=(
+                        f"codex spend ${spend:.2f} crossed MAX_BUDGET_USD="
+                        f"${budget_usd:.2f} mid-run; killed"
+                    ),
+                    # The run really burned this — carrying the cost/usage is
+                    # what keeps the money visible to the ledger and to the
+                    # issue/daily caps. A budget kill that reported $0.00 would
+                    # hide precisely the spend it exists to bound.
+                    cost_usd=spend,
+                    usage=final_usage,
+                    num_turns=final_turns,
+                    session_id=session_id,
+                ),
+                exit_code, stderr, stdout, False,
+            )
 
         if hung:
             # Carry WHICH watchdog fired on the result so run() can phrase the
@@ -1117,17 +1436,63 @@ class CodexRunner(AgentRuntime):
         # file holds only the final message). Check stderr first, stdout second.
         session_id = _session_id_from_lines(stderr) or _session_id_from_lines(stdout)
         rollout_usage = read_rollout_usage(session_id)
+        if rollout_usage is None:
+            rollout_usage = parse_codex_usage(stderr)
         # A resumed session's rollout counter is cumulative; subtract what the
         # previous leg already ledgered (see usage_delta). Only when this run
         # really continued THAT session — a resume that fell back to a fresh
         # session has nothing pre-paid in its counter.
         if usage_baseline is not None and session_id == usage_baseline[0]:
             rollout_usage = usage_delta(rollout_usage, usage_baseline[1])
-        # #43: price THIS leg with the model it ran on, not with one flat rate.
-        rate_in, rate_out = rates_for_model(
-            model, self.cost_per_mtok,
-            fallback_in=self.cost_per_mtok_in, fallback_out=self.cost_per_mtok_out,
+        rollout_turns = read_rollout_turns(session_id)
+        if (
+            rollout_turns is not None
+            and usage_baseline is not None
+            and session_id == usage_baseline[0]
+            and usage_baseline[2] is not None
+        ):
+            rollout_turns = max(0, rollout_turns - usage_baseline[2])
+        # A final token_count can land immediately before EOF, inside one poll
+        # slice. Recheck completed counters so clean exit cannot turn an
+        # over-budget leg into status=pr_opened.
+        final_overrun = (
+            budget_overrun_usd(
+                rollout_usage,
+                cost_per_mtok_in=rate_in,
+                cost_per_mtok_out=rate_out,
+                max_budget_usd=budget_usd,
+            )
+            if budget_armed
+            else None
         )
+        if final_overrun is not None:
+            self._log(
+                f"codex: BUDGET — final usage spent ${final_overrun:.2f}, "
+                f"crossing MAX_BUDGET_USD=${budget_usd:.2f}"
+            )
+            return (
+                AgentResult(
+                    is_error=True,
+                    status="error_max_budget_usd",
+                    envelope_subtype="error_max_budget_usd",
+                    exit_reason=ExitReason.BUDGET_EXHAUSTED,
+                    summary=(
+                        f"codex final spend ${final_overrun:.2f} crossed "
+                        f"MAX_BUDGET_USD=${budget_usd:.2f}"
+                    ),
+                    cost_usd=final_overrun,
+                    usage=rollout_usage,
+                    num_turns=rollout_turns,
+                    session_id=session_id,
+                ),
+                exit_code,
+                stderr,
+                stdout,
+                False,
+            )
+        # rate_in/rate_out come from the single rates_for_model lookup hoisted
+        # above the pump, so this leg is priced identically whether it finished
+        # or was killed on budget (#29/#43).
         result = parse_codex_envelope(
             exit_code=exit_code,
             last_message=last_message,
@@ -1137,6 +1502,9 @@ class CodexRunner(AgentRuntime):
             cost_per_mtok_out=rate_out,
             usage=rollout_usage,
         )
+        from dataclasses import replace as _replace
+
+        result = _replace(result, num_turns=rollout_turns)
         if exit_code < 0 and not hung:
             # A NEGATIVE returncode means terminated by signal -exit_code, and we did
             # not do it (our own killpg paths set `hung` and returned above). So this
@@ -1144,8 +1512,6 @@ class CodexRunner(AgentRuntime):
             # Ctrl-C that reached the process group — infra death, not a failed
             # attempt. The domain reads exit_reason to skip the breaker bump and the
             # ai-ready relabel that raced a manual ai-blocked (#65).
-            from dataclasses import replace as _replace
-
             self._log(
                 f"codex: killed by signal {-exit_code} (not by our watchdog) — "
                 "treating as infra death, not an agent attempt"

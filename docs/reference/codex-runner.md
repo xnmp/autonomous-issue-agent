@@ -58,7 +58,7 @@ Map each `AgentTask` field to a `codex exec` flag:
 | `model` | `-m <model>` (default the GPT-5.5 id) |
 | `cwd` | `-C <worktree>` |
 | `resume` | `codex exec resume <session_id>` (resume/address-review/fix-ci legs) |
-| `max_budget_usd` | no native budget cap — enforce out-of-band (token ceiling / wall-clock) |
+| `max_budget_usd` | no native budget FLAG; enforced in-harness (#29) — the stderr pump samples the session's streamed token counters each poll slice and kills the process group once THIS LEG's priced spend crosses it, returning `ExitReason.BUDGET_EXHAUSTED` |
 | `mcp_servers` | `codex mcp add` / config; SonarQube CI-fix only (not wired in Python yet anyway) |
 | `env` | process env when spawning codex |
 | sandbox | `--sandbox danger-full-access` (Codex hardcodes `.git` read-only under workspace-write — no knob; full-access + governor is the SAME posture as the Claude fixer's bypassPermissions+governor) |
@@ -106,9 +106,31 @@ exit together).
 - **PreToolUse doesn't intercept ALL shell yet** (Codex `unified_exec` caveat). Our
   git-push/commit/bypass cases DID trip it (verified), but re-verify after Codex
   upgrades; the gate's value depends on it firing.
-- **No native budget cap.** `max_budget_usd` has no Codex equivalent — enforce via a
-  token/wall-clock ceiling in `run()`, or accept uncapped per-session (the $4-cap
-  surprise on Claude motivated raising it; Codex needs its own guard).
+- **No native budget cap — RESOLVED in-harness (#29).** `max_budget_usd` still has no
+  Codex flag, so `run()` enforces it: the stderr pump samples the session's rollout
+  token counters once per poll slice, prices them with the same `rates_for_model`
+  lookup the ledger uses, and kills the process group on crossing —
+  `status="error_max_budget_usd"`, `exit_reason=BUDGET_EXHAUSTED`, with the spend it
+  had burned carried on the result so the ledger and both spend caps still see it.
+  Three things this depends on, in order of how badly they bite:
+  1. **Per-leg, not cumulative.** A resumed session's counter includes the previous
+     leg's already-ledgered tokens; the check runs on the `usage_delta`, or every
+     follow-up leg dies instantly on its resolve's spend.
+  2. **Priced or inert.** Both rates 0 → every run reads as $0.00 and the check is
+     deliberately silent (`budget_overrun_usd`), because a dollar threshold cannot
+     bound a runtime nobody is pricing. `describe()` and
+     `codex_budget_not_enforced_warning` both report that regime as NOT ENFORCED.
+  3. **`CODEX_ENFORCE_BUDGET=0`** returns to wall-cap-only bounding, and is likewise
+     reported. On a subscription the dollars are synthetic — they are a token meter —
+     so an operator whose rates over-state reality can opt out rather than have real
+     work cut short.
+  History: before this, `AGENT_MAX_RUNTIME_SECONDS` was the only per-run bound and a
+  keifu resolve completed at $28.74 against a configured `MAX_BUDGET_USD=20` with
+  `exit_reason=ok`, while every boot logged `fix_budget=$20.00` as if it applied.
+- **Journal telemetry.** The journaling decorator measures wall duration for
+  every runtime. Codex additionally counts rollout `token_count` events as paid
+  model turns, subtracting a resumed session's baseline, so settled `agent_run`
+  entries carry `duration_s` and `turns` alongside cost and token usage.
 - **AGENT.md parity is the quality lever.** GPT-5.5 followed an inline TDD prompt well
   in the smoke test, but the full fixer contract (markers, adversarial verdict, PR body
   shape) lives in AGENT.md — port it faithfully or fix quality regresses.

@@ -29,8 +29,11 @@ costing $0 while a cap is armed (review P1R-5) — believe the warning, not the
 
 *What actually bounds spend on those plans:* `AGENT_MAX_RUNTIME_SECONDS` (the
 wall cap, per session), the per-leg retry breakers, and `MAX_INFRA_DEATHS` /
-`MAX_UNPRODUCTIVE_REVIEW_ROUNDS`. Set the wall cap deliberately rather than
-inheriting 2700s.
+`MAX_UNPRODUCTIVE_REVIEW_ROUNDS`. A priced codex deployment also enforces
+`MAX_BUDGET_USD` in the harness by killing a leg when its rollout counters cross
+the threshold; zeroing either token price or setting `CODEX_ENFORCE_BUDGET=0`
+disables that dollar bound and emits a startup warning. Set the wall cap
+deliberately rather than inheriting 2700s.
 
 ### 1.2 The governor has an open indirect-execution bypass
 `sh -c '…'`, `bash -c`, `python -c`, `eval` and `xargs` classify as *nothing*,

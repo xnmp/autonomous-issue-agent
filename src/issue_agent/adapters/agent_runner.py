@@ -245,6 +245,11 @@ def result_to_agent_result(msg: Any) -> AgentResult:
             str(getattr(msg, "subtype", "") or ""), is_error
         ),
         usage=usage if isinstance(usage, dict) else None,
+        num_turns=(
+            int(getattr(msg, "num_turns"))
+            if isinstance(getattr(msg, "num_turns", None), int)
+            else None
+        ),
     )
 
 

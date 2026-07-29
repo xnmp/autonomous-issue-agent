@@ -96,6 +96,9 @@ that matters is not "wrong answer" but "loop that bills forever":
 - `MAX_INFRA_DEATHS` / `MAX_UNPRODUCTIVE_REVIEW_ROUNDS` — a *separate, higher*
   ceiling for sessions that die before returning a result, which deliberately do
   not count as attempts
+- `MAX_BUDGET_USD` per-leg spend cap — native on the Claude SDK; on codex the
+  harness prices streamed rollout counters and kills the process group on
+  crossing when `CODEX_ENFORCE_BUDGET=1` and both token prices are positive
 - `AGENT_MAX_RUNTIME_SECONDS` wall cap, checked between events
 - spend caps over the cost ledger — **see
   [../open/residuals.md](../open/residuals.md) §1.1: these are inert on plans
