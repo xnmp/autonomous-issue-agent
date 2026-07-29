@@ -40,6 +40,9 @@ class Label(str, Enum):
     # remove it from any selection set. Nothing is ever auto-reopened or
     # auto-dispatched from it — a false positive costs one label removal.
     RECURRENCE = "recurrence"
+    # Advisory steward marker: recent merged work may already satisfy this open
+    # issue. A human decides whether to close it; it is never lifecycle state.
+    MAYBE_RESOLVED = "maybe-resolved"
 
     # Steward outputs (never auto-promoted; a human disposes).
     AI_TRIAGE = "ai-triage"        # steward has seen it; awaiting author / human promote

@@ -7,6 +7,8 @@ import tempfile
 
 from issue_agent.adapters import store as store_module
 from issue_agent.adapters.store import HarnessMarkers, Store
+from issue_agent.domain.triage import grooming_candidates, grooming_content
+from issue_agent.domain.world import IssueView, WorldState
 
 
 def _store():
@@ -572,3 +574,15 @@ def test_predicted_paths_are_round_tripped_and_malformed_predictions_fail_open()
 
     s.save_predicted_paths(5, ["src/action.rs", "../outside.rs"])
     assert s.get_predicted_paths(5) == frozenset()
+
+
+def test_groom_content_digest_round_trips_and_damps_comment_only_updates():
+    s, _ = _store()
+    for body in ("Steps:\n1. click\n", "Steps:\r\n1. click\r\n"):
+        issue = IssueView(9, title="Login crashes", body=body, updated_at="after-comment")
+        s.set_groom_content(9, grooming_content(issue))
+        assert s.get_groom_content(9) == grooming_content(issue)
+        assert grooming_candidates(
+            WorldState(issues=(issue,)), {9: "before-comment"}, True,
+            {9: s.get_groom_content(9)},
+        ) == []

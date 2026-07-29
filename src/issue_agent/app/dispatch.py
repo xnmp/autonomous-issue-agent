@@ -34,7 +34,7 @@ from ..domain.agent_task import AgentRuntime
 from ..domain.labels import Label
 from ..domain.lifecycle import issue_escalation, pr_escalation
 from ..domain.outcome import deterministic_death
-from .planners.tasks import FixTaskConfig, JiraTaskConfig, ReviewTaskConfig, TriageTaskConfig
+from .planners.tasks import FixTaskConfig, GroomTaskConfig, JiraTaskConfig, ReviewTaskConfig, TriageTaskConfig
 from .spend_gate import read_daily_cap_breach
 from .workflows.fix import FixWorkflow, FixWorkflowConfig
 from .workflows.jira import JiraSyncWorkflow, JiraSyncWorkflowConfig
@@ -48,6 +48,7 @@ class DispatchConfig:
     fix: FixTaskConfig | None = None
     review: ReviewTaskConfig | None = None
     triage: TriageTaskConfig | None = None
+    groom: GroomTaskConfig | None = None
     triage_cfg: triage_dom.TriageConfig | None = None
     jira: JiraTaskConfig | None = None
     fork_threshold: int = 5
@@ -138,6 +139,7 @@ class DispatchConfig:
             triage=self.triage,
             triage_cfg=self.triage_cfg,
             log=self.log,
+            groom=self.groom,
             # The steward reads the FIXER's merged PRs (harness #10): "already
             # shipped by this harness" means shipped by the fix bot, not by the
             # steward's own identity.
@@ -473,6 +475,7 @@ class AgentDispatcher:
             AgentKind.REVIEW: self.review_workflow.review,
             AgentKind.RE_REVIEW: self.review_workflow.re_review,
             AgentKind.TRIAGE: self.steward_workflow.triage,
+            AgentKind.GROOM: self.steward_workflow.groom,
             AgentKind.JIRA_SYNC: self.jira_workflow.sync,
         }.get(action.kind)
         if handler is None:

@@ -484,7 +484,7 @@ class Executor:
                 ok=run_id is not None,
             )
 
-    def execute_all(self, actions) -> None:
+    def execute_all(self, actions) -> bool:
         """Apply every action, even if one raises (review S7): before this, one
         raising action propagated IMMEDIATELY out of the whole call, so sibling
         cleanup after it never ran (a failed relabel could strand a worktree
@@ -507,10 +507,13 @@ class Executor:
         ClearIssueState follow-ups here — decide_fix's own RunAgent actions
         are applied one-at-a-time by Daemon.tick, which already isolates per
         action)."""
+        succeeded = True
         for action in actions:
             try:
                 self.execute(action)
             except Exception as exc:  # noqa: BLE001 - one bad action must not sink its siblings
+                succeeded = False
                 desc = self._describe(action)
                 msg = f"FAILED: {desc} — {exc!r}; continuing with remaining actions"
                 self._log(msg)
+        return succeeded

@@ -10,6 +10,8 @@ from issue_agent.domain.triage import (
     TriageState,
     TriageVerdict,
     actions_for_verdict,
+    grooming_candidates,
+    grooming_actions,
     is_untriaged,
     parse_codeowners_default,
     recurrence_actions,
@@ -59,6 +61,28 @@ def test_no_feedback_loop_after_recording_post_action_updatedat():
     assert triage_candidates(w, CFG, st_correct) == []
     st_buggy = TriageState(seen_at={1: "t1"})
     assert triage_candidates(w, CFG, st_buggy) == [1]  # the old infinite-bounce
+
+
+def test_grooming_candidates_skip_unchanged_and_closed_issues():
+    w = world(issues=[
+        issue(1, updated_at="t1"),
+        issue(2, updated_at="t2", state="closed"),
+    ])
+    assert grooming_candidates(w, {1: "t1"}, True) == []
+
+
+def test_grooming_candidates_include_changed_issue_and_respect_enabled_flag():
+    w = world(issues=[issue(1, updated_at="t2")])
+    assert grooming_candidates(w, {1: "t1"}, True) == [1]
+    assert grooming_candidates(w, {1: "t1"}, False) == []
+
+
+def test_grooming_candidates_damp_comment_only_updates_and_cap_first_pass_spend():
+    issues = [issue(n, title=f"T{n}", body="unchanged", updated_at="new") for n in range(1, 8)]
+    from issue_agent.domain.triage import grooming_content
+    seen_content = {item.number: grooming_content(item) for item in issues}
+    assert grooming_candidates(world(issues=issues), {}, True, seen_content) == []
+    assert grooming_candidates(world(issues=issues), {}, True) == [1, 2, 3, 4, 5]
 
 
 # ── verdict → actions (audience split) ────────────────────────────────────────
@@ -203,6 +227,25 @@ def test_recurrence_never_reopens_dispatches_or_links():
     """AC: advisory only — the actions are exactly one comment + one label add."""
     acts = recurrence_actions(7, TriageVerdict(verdict="ready", recurrence_of=43), MERGED)
     assert [type(a) for a in acts] == [PostComment, Relabel]
+
+
+def test_grooming_names_a_verified_merging_pr_without_closing_the_issue():
+    acts = grooming_actions(7, resolved_by=42, stale_reference="", merged_by_issue=MERGED)
+    body = next(a for a in acts if isinstance(a, PostComment)).body
+    assert "#42" in body and "PR #300" in body
+    assert Relabel(Target.ISSUE, 7, None, Label.MAYBE_RESOLVED) in acts
+    assert [type(a) for a in acts] == [PostComment, Relabel]
+
+
+def test_grooming_stale_reference_is_advisory_and_does_not_label_or_close():
+    acts = grooming_actions(7, resolved_by=None, stale_reference="src/removed.py", merged_by_issue=MERGED)
+    assert len(acts) == 1
+    assert isinstance(acts[0], PostComment)
+    assert "src/removed.py" in acts[0].body
+
+
+def test_grooming_discards_an_unverified_resolving_issue():
+    assert grooming_actions(7, resolved_by=999, stale_reference="", merged_by_issue=MERGED) == []
 
 
 def test_the_verdict_actions_are_untouched_by_a_recurrence():

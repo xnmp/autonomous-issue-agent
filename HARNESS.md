@@ -78,6 +78,16 @@ The overlay is written once and **reused** thereafter (edit by hand, or
 `--base-branch`, `--test-cmd`, `--max-budget`, `--max-ticks` (bound the loop),
 `--no-init` (error instead of auto-init on first run).
 
+### Steward grooming
+
+Set `STEWARD_GROOM=1` to have the steward examine changed open issue bodies for
+advisory `maybe-resolved` and stale-context notices. It never closes or edits an
+issue. The pass is capped at five candidates per changed tick and records the
+title/body it examined, so unrelated bot or discussion comments do not trigger
+another paid classification. This bounds steward spend while keeping body edits
+eligible for a later pass. `STEWARD_GROOM_EDIT=1` is currently inert and logged
+as such; it does not authorize issue-body edits.
+
 > **Why install from the checkout, not `pip install`.** The daemon loads
 > `plugin/AGENT.md`, `plugin/hooks/bash_governor.py`, and `config/mcp/*.json` by
 > walking up from its own file to this checkout — none of those ship in a wheel.

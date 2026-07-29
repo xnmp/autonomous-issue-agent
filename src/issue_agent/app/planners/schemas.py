@@ -185,6 +185,17 @@ TRIAGE_SCHEMA: dict = {
     ],
 }
 
+# Steward grooming is deliberately a narrow advisory classifier. The optional
+# fields keep the default verdict "no finding", avoiding pressure to invent a
+# match from attacker-controlled issue text.
+GROOM_SCHEMA: dict = {
+    "type": "object",
+    "properties": {
+        "resolved_by": {"type": "integer"},
+        "stale_reference": {"type": "string"},
+    },
+}
+
 # JIRA_SYNC_SCHEMA — the steward mirrors a GitHub issue into a Jira ticket.
 # created → a new ticket was made (ticket_key set); transitioned → an existing
 # ticket moved status; nothing → already in the right state; failed → MCP/auth

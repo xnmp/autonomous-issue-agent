@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ...adapters.journal import read_events_tail, recurrence_keys
+from ...adapters.journal import groomed_keys, read_events_tail, recurrence_keys
 from ...domain import triage as triage_dom
 from ...domain.agent_task import AgentRuntime
 from ...domain.triage import TriageConfig
 from ...domain.triage import TriageVerdict
 from ..planners import tasks as task_builders
-from ..planners.tasks import TriageTaskConfig
+from ..planners.tasks import GroomTaskConfig, TriageTaskConfig
 
 
 @dataclass(frozen=True)
@@ -18,6 +18,7 @@ class StewardWorkflowConfig:
     triage: TriageTaskConfig | None
     triage_cfg: TriageConfig | None
     log: object
+    groom: GroomTaskConfig | None = None
     # Fixer login — whose merged PRs form the "already shipped by this harness"
     # reference set the recurrence check matches against (harness #10). Blank →
     # no reference set → the check is inert and triage is unchanged.
@@ -85,6 +86,75 @@ class StewardWorkflow:
             "recurrence", kind="refiled", issue=issue, of_issue=of_issue,
             pr=pr, block_key=key,
         )
+
+    def _journal_groomed(self, issue: int, kind: str, *, ref: str = "", pr: int = 0) -> None:
+        key = f"groomed:{self.cfg.repo}:{issue}:{kind}:{ref or pr}"
+        if key in self._emitted:
+            return
+        self._emitted.add(key)
+        journal = self.cfg.journal
+        if journal is None or key in groomed_keys(read_events_tail(journal.path)):
+            return
+        fields = {"kind": kind, "issue": issue, "block_key": key}
+        if ref:
+            fields["reference"] = ref
+        if pr:
+            fields["pr"] = pr
+        journal.emit("groomed", **fields)
+
+    def _groomed(self, issue: int, kind: str, *, ref: str = "", pr: int = 0) -> bool:
+        key = f"groomed:{self.cfg.repo}:{issue}:{kind}:{ref or pr}"
+        if key in self._emitted:
+            return True
+        journal = self.cfg.journal
+        return journal is not None and key in groomed_keys(read_events_tail(journal.path))
+
+    async def groom(self, issue: int) -> None:
+        """Classify an existing issue for one-shot, advisory queue cleanup."""
+        if self.cfg.groom is None:
+            return
+        iss = self.gateway.get_issue(issue)
+        merged = self._recent_merges()
+        result = await self.runner.run(task_builders.build_groom_task(
+            issue, iss.title, iss.body, self.cfg.groom, _merge_lines(merged)
+        ))
+        if result.is_error or not isinstance(result.structured, dict):
+            self.cfg.log(f"groom #{issue}: {result.status or 'error'} — no finding, will retry")
+            return
+        raw = result.structured
+        resolved_by = raw.get("resolved_by")
+        resolved_by = resolved_by if isinstance(resolved_by, int) and not isinstance(resolved_by, bool) else None
+        stale_reference = raw.get("stale_reference")
+        stale_reference = stale_reference if isinstance(stale_reference, str) else ""
+        merged_by_issue = {m.issue: m.pr for m in merged}
+        if resolved_by is not None and self._groomed(
+            issue, "resolved_by", pr=merged_by_issue.get(resolved_by, 0)
+        ):
+            resolved_by = None
+        if stale_reference.strip() and self._groomed(issue, "stale", ref=stale_reference.strip()):
+            stale_reference = ""
+        # The stale reference must be an exact substring of the issue's data as
+        # well as a result from the rg-directed classifier. That containment
+        # prevents a malformed verdict from inserting an unrelated repo claim.
+        if stale_reference.strip() and stale_reference.strip() not in iss.body:
+            stale_reference = ""
+        actions = triage_dom.grooming_actions(
+            issue, resolved_by=resolved_by, stale_reference=stale_reference,
+            merged_by_issue=merged_by_issue,
+        )
+        if not self.executor.execute_all(actions):
+            self.cfg.log(f"groom #{issue}: advisory write failed, will retry")
+            return
+        if resolved_by is not None and resolved_by in merged_by_issue and resolved_by != issue:
+            self._journal_groomed(issue, "resolved_by", pr=merged_by_issue[resolved_by])
+        if stale_reference.strip():
+            self._journal_groomed(issue, "stale", ref=stale_reference.strip())
+        # Record after writes because comments update GitHub's timestamp. That
+        # makes an unchanged issue one-shot while a later human edit reopens the
+        # advisory scan without relying on process memory.
+        updated = self.gateway.get_issue(issue)
+        self.store.set_groom_at(issue, updated.updated_at)
+        self.store.set_groom_content(issue, triage_dom.grooming_content(updated))
 
     async def triage(self, issue: int) -> None:
         self.cfg.log(f"triage #{issue}: classifying")

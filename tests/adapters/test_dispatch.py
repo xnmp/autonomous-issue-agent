@@ -102,6 +102,8 @@ class FakeStore:
         self.sessions = {}
         self.pr_sessions = {}
         self.triage_at = {}
+        self.groom_at = {}
+        self.groom_content = {}
         self.last_sha = {}
         self.last_patch_id = {}
         self.rounds = {}
@@ -178,6 +180,18 @@ class FakeStore:
 
     def set_triage_at(self, i, at):
         self.triage_at[i] = at
+
+    def set_groom_at(self, i, at):
+        self.groom_at[i] = at
+
+    def get_groom_at(self, i):
+        return self.groom_at.get(i, "")
+
+    def set_groom_content(self, i, content):
+        self.groom_content[i] = content
+
+    def get_groom_content(self, i):
+        return self.groom_content.get(i, "")
 
     def set_ci_retries(self, i, n):
         pass

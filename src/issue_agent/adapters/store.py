@@ -92,6 +92,12 @@ class Store:
     def triage_at_path(self, issue: int) -> str:
         return os.path.join(self.state_dir, f"triage-{issue}.at")
 
+    def groom_at_path(self, issue: int) -> str:
+        return os.path.join(self.state_dir, f"groom-{issue}.at")
+
+    def groom_content_path(self, issue: int) -> str:
+        return os.path.join(self.state_dir, f"groom-{issue}.content")
+
     def pending_actions_path(self) -> str:
         """Role-wide lifecycle queue.
 
@@ -489,6 +495,18 @@ class Store:
 
     def set_triage_at(self, issue: int, at: str) -> None:
         self._write(self.triage_at_path(issue), at)
+
+    def get_groom_at(self, issue: int) -> str:
+        return self._read(self.groom_at_path(issue))
+
+    def set_groom_at(self, issue: int, at: str) -> None:
+        self._write(self.groom_at_path(issue), at)
+
+    def get_groom_content(self, issue: int) -> str:
+        return self._read(self.groom_content_path(issue))
+
+    def set_groom_content(self, issue: int, content: str) -> None:
+        self._write(self.groom_content_path(issue), content)
 
     # ── author/implementer phase (AUTHOR_TESTS_SPLIT) ──
     # "" (no file) = not started / single-pass; "authoring" = author leg ran and is
