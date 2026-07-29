@@ -212,6 +212,10 @@ class AgentResult:
     # run only ever has the stream sum, so the abort-cost estimator must learn
     # its $/token rate against THIS field's totals, never against `usage`'s.
     stream_usage: dict | None = None
+    # Machine-readable warning raised by a runtime when a completed result is
+    # structurally missing telemetry. Journaling persists this as a dedicated
+    # warning event; blank means the runtime observed no telemetry fault.
+    telemetry_warning: str = ""
 
     def field(self, name: str, default: str = "") -> str:
         if isinstance(self.structured, dict):
