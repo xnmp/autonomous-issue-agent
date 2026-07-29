@@ -598,9 +598,6 @@ class FixWorkflow:
         # re-resuming.
         self.store.set_resumed_at(issue, reply_comment.created_at)
         pr_existing = self.gateway.pr_for_issue(issue)
-        if self.cfg.author_tests_split and pr_existing is None:
-            await self.resolve_split(issue)
-            return
         branch = self.gateway.get_pr(pr_existing).head_ref_name if pr_existing else f"fix/{issue}-issue"
         cwd = self._ensure_cwd(issue, branch)
         fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
