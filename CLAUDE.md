@@ -246,6 +246,14 @@ harness never creates them.
 gate, the red-fail (anti-tautological-test) gate, and the reviewer's test run. For
 a monorepo, compose the tiers with `set -e` (e.g.
 `set -e; (cd backend && uv run pytest) && (cd frontend && pnpm exec tsc -b)`).
+The command is launched with harness/deployment controls removed from its child
+environment (`TEST_CMD`, `AGENT_ENV`, gate controls, GitHub App settings, and
+`TARGET_DIR`); target tests must receive their own configuration explicitly.
+Every gate execution also stamps `HARNESS_GATE_DEPTH` into the child env and
+refuses to execute at depth ≥ 2 — the re-entrancy bound that turns a
+self-referential `TEST_CMD`/`.harness/test-cmd` (the #63 fork-bomb class) into
+a loud bounded failure instead of an unbounded process tree; gate timeouts
+kill the whole process group, not just the direct child.
 
 On codex, `MAX_BUDGET_USD` is enforced in the harness rather than by a CLI
 flag: the runner samples the rollout's cumulative token counters, subtracts the

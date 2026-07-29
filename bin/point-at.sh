@@ -51,6 +51,29 @@ red()  { printf '\033[31m%s\033[0m\n' "$1"; }
 grn()  { printf '\033[32m%s\033[0m\n' "$1"; }
 info() { printf '\033[36m▸ %s\033[0m\n' "$1"; }
 
+# A configured TEST_CMD belongs to the target checkout. The deployment knobs
+# that selected it must not be inherited by its descendants; otherwise this
+# project self-hosting `make test` recursively invokes its own gate hooks.
+# HARNESS_GATE_DEPTH is the re-entrancy bound backing that scrub (see
+# plugin/hooks/checks/_pr_common.sh:prc_run_test_cmd for the full rationale):
+# executing at depth ≥ 2 means the command re-entered the gate (#63) — refuse.
+run_target_test_cmd() {  # run_target_test_cmd "<command>"
+  _rtc_depth="${HARNESS_GATE_DEPTH:-0}"
+  case "$_rtc_depth" in ''|*[!0-9]*) _rtc_depth=0 ;; esac
+  if [ "$_rtc_depth" -ge 2 ]; then
+    echo "GATE RECURSION: refusing to run a test command at gate depth $_rtc_depth (see #63): $1" >&2
+    return 1
+  fi
+  env \
+    -u TEST_CMD -u LINT_CMD -u TYPECHECK_CMD -u EDIT_CHECK_CMD -u ALLOW_UNTESTED \
+    -u RED_MUST_FAIL -u VERIFY_RED_AT_COMMIT -u BASE_BRANCH \
+    -u GATE_TEST_TIMEOUT_S -u GATE_GH_RETRY_SLEEP \
+    -u GH_APP_ID -u GH_APP_PRIVATE_KEY -u GH_APP_INSTALLATION_ID \
+    -u TARGET_DIR -u AGENT_ENV \
+    HARNESS_GATE_DEPTH="$((_rtc_depth + 1))" \
+    bash -c "$1"
+}
+
 [ -f "$SHARED" ]   || { red "missing $SHARED";   exit 1; }
 [ -f "$REPO_ENV" ] || { red "missing $REPO_ENV (create config/repos/$NAME.env)"; exit 1; }
 
@@ -165,9 +188,9 @@ if [ "${GATE_PROBE:-1}" = "1" ] && [ -n "${TEST_CMD:-}" ]; then
     # rather than skipping the probe (an unbounded green still answers the
     # question, and Ctrl-C is available).
     if command -v timeout >/dev/null 2>&1; then
-      ( cd "$_probe_dir" && timeout "${GATE_PROBE_TIMEOUT:-900}" bash -c "$TEST_CMD" ) >"$_probe_log" 2>&1 || _probe_rc=$?
+      ( cd "$_probe_dir" && timeout "${GATE_PROBE_TIMEOUT:-900}" bash -c "$(declare -f run_target_test_cmd); run_target_test_cmd \"\$1\"" _ "$TEST_CMD" ) >"$_probe_log" 2>&1 || _probe_rc=$?
     else
-      ( cd "$_probe_dir" && bash -c "$TEST_CMD" ) >"$_probe_log" 2>&1 || _probe_rc=$?
+      ( cd "$_probe_dir" && run_target_test_cmd "$TEST_CMD" ) >"$_probe_log" 2>&1 || _probe_rc=$?
     fi
     git -C "$TARGET_DIR" worktree remove --force "$_probe_dir" 2>/dev/null || true
     if [ "$_probe_rc" -eq 0 ]; then

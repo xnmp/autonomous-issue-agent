@@ -555,18 +555,26 @@ class TestCmdCheck:
 def verify_test_cmd(
     cmd: str, target_dir: str, timeout_s: float = _VERIFY_TIMEOUT_S, run=None
 ) -> TestCmdCheck:
-    """Trial-run `cmd` the way the GATE will run it — `shell=True` in the repo
-    root, bounded by a timeout (mirrors `worktree._default_run_tests`). Anything
-    else would verify a command the gate never issues. `run` is injectable so
-    tests never execute a real suite. Never raises: a verification that blows up
-    must not block `start`."""
+    """Trial-run `cmd` the way the GATE will run it — via
+    `governor.run_target_command` (env scrub + #63 re-entrancy bound +
+    process-group containment), in the repo root, bounded by a timeout.
+    Anything else would verify a command the gate never issues. `run` is
+    injectable so tests never execute a real suite. Never raises: a
+    verification that blows up must not block `start`. A recursion refusal
+    surfaces as exit -1 (failed)."""
     started = time.monotonic()
-    runner = run or (
-        lambda c, cwd, t: subprocess.run(
-            c, shell=True, cwd=cwd, timeout=t,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        ).returncode
-    )
+
+    def _gate_runner(c: str, cwd: str, t: float) -> int:
+        from ..adapters.governor import run_target_command
+
+        rc, _ = run_target_command(c, cwd, t, capture=True)
+        if rc is None:
+            return -1
+        if rc == 124:
+            raise subprocess.TimeoutExpired(c, t)
+        return rc
+
+    runner = run or _gate_runner
     try:
         code = runner(cmd, target_dir, timeout_s)
     except subprocess.TimeoutExpired:

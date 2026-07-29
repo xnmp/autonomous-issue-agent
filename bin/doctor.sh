@@ -658,6 +658,14 @@ fi
 echo "== project commands =="
 if [ -n "${TEST_CMD:-}" ]; then
   ok "TEST_CMD=$TEST_CMD (the gate runs THIS; it wins over the agent's .harness/test-cmd — review P1R-18)"
+  # The #63 fork-bomb bound is an env counter (HARNESS_GATE_DEPTH) stamped into
+  # every gate child. A TEST_CMD that resets its own environment erases it and
+  # re-arms unbounded recursion on a self-hosted target. The gate already
+  # scrubs deployment knobs itself — env -i wrappers are never needed.
+  case "$TEST_CMD" in
+    *"env -i"*|*"HARNESS_GATE_DEPTH"*)
+      warn "TEST_CMD wraps itself in 'env -i' (or touches HARNESS_GATE_DEPTH) — this erases the gate's re-entrancy counter and can re-arm the #63 fork bomb on a self-hosted target. The gate already scrubs deployment knobs from the child env; drop the wrapper." ;;
+  esac
   [ "${RED_MUST_FAIL:-1}" = 0 ] \
     && warn "RED_MUST_FAIL=0 — the anti-tautological-test (red-fail) gate is OFF; a test that passes without the change won't be caught"
 else

@@ -570,9 +570,12 @@ NO_TEST_CMD_HINT = (
 
 
 def check_tests(
-    test_cmd: str, run_tests: Callable[[str], bool], allow_untested: bool = False
+    test_cmd: str, run_tests: Callable[[str], bool | None], allow_untested: bool = False
 ) -> GateResult:
-    """§1: the test suite must pass. `run_tests(cmd) -> passed?`.
+    """§1: the test suite must pass. `run_tests(cmd) -> passed?` — tri-state:
+    None means the adapter REFUSED to run the command because it would re-enter
+    the gate (#63 recursion bound); that is a configuration defect, not a red
+    suite, and gets its own DENY so the agent doesn't chase phantom failures.
 
     NO test command → DENY, not allow. An empty command used to pass silently,
     which made "this repo has no test command" indistinguishable from "the tests
@@ -588,7 +591,14 @@ def check_tests(
             "test gate and the red-fail (anti-tautological-test) check cannot run, so "
             "the gate fails CLOSED instead of passing you silently. " + NO_TEST_CMD_HINT
         )
-    return ALLOW if run_tests(test_cmd) else deny(f"local test suite failed: {test_cmd}")
+    passed = run_tests(test_cmd)
+    if passed is None:
+        return deny(
+            f"GATE RECURSION: the test command re-entered the harness gate and was "
+            f"refused (self-referential TEST_CMD/.harness/test-cmd — see #63); this "
+            f"is a test-command configuration defect, NOT a failing suite: {test_cmd}"
+        )
+    return ALLOW if passed else deny(f"local test suite failed: {test_cmd}")
 
 
 def gate_is_toothless(test_cmd: str) -> bool:
@@ -783,7 +793,7 @@ def check_push_target(targets: tuple[str, ...] | None) -> GateResult:
 
 
 def check_red_is_red(
-    commit_msg: str, test_cmd: str, run_tests: Callable[[str], bool], enabled: bool = True
+    commit_msg: str, test_cmd: str, run_tests: Callable[[str], bool | None], enabled: bool = True
 ) -> GateResult:
     """Verify a `red:` commit is ACTUALLY red — run the test command on the working
     tree at commit time and require it to FAIL. The commit-order gate only checks the
@@ -801,7 +811,15 @@ def check_red_is_red(
         return ALLOW
     if not test_cmd:
         return ALLOW
-    if not run_tests(test_cmd):
+    passed = run_tests(test_cmd)
+    if passed is None:
+        return deny(
+            f"GATE RECURSION: the test command re-entered the harness gate and was "
+            f"refused (see #63) — cannot verify this red: commit is actually red. "
+            f"Fix the test-command configuration (self-referential "
+            f"TEST_CMD/.harness/test-cmd): {test_cmd}"
+        )
+    if not passed:
         return ALLOW  # tests fail → genuinely red → good
     return deny(
         f"'red:' commit but the test suite PASSES ({test_cmd}) — the new test is not "
@@ -841,7 +859,7 @@ def partition_changed(
 
 def check_red_fails(
     inputs: RedFailInputs,
-    revert_and_run: Callable[[tuple[str, ...]], bool],
+    revert_and_run: Callable[[tuple[str, ...]], bool | None],
 ) -> GateResult:
     """§10: with the implementation reverted, the NEW tests MUST fail (real red).
     Catches the tautological / wrong-layer test (#39 class).
@@ -874,6 +892,12 @@ def check_red_fails(
         return ALLOW  # pure-test diff: nothing to revert
 
     passed_with_impl_reverted = revert_and_run(inputs.impl_files)
+    if passed_with_impl_reverted is None:
+        return deny(
+            "GATE RECURSION: the test command re-entered the harness gate and was "
+            "refused (see #63) — the red-fail check cannot run. Fix the "
+            "test-command configuration (self-referential TEST_CMD/.harness/test-cmd)."
+        )
     if passed_with_impl_reverted:
         return deny(
             "the new test(s) still PASS with the implementation reverted — they do "
