@@ -230,12 +230,13 @@ def test_busy_fixer_dispatches_nothing_new():
 
 
 # ── resume dedupe (anti-loop) ──────────────────────────────────────────────────
-def test_resume_needs_session_and_new_reply():
+def test_resume_needs_new_reply_even_when_session_state_is_missing():
     iss = issue(7, "ai-blocked", comments=(Comment("alice", "here you go", "t2"),))
     w = world(issues=[iss])
-    # no session → not eligible
-    assert issues_needing_resume(w, FixState(), CFG) == []
-    # with a session → eligible
+    # A missing runtime handle must fall back to a fresh continuation instead
+    # of leaving the blocked issue with no workflow exit.
+    assert issues_needing_resume(w, FixState(), CFG) == [(7, "t2")]
+    # A saved handle remains eligible for a true runtime resume.
     st = FixState(sessions=frozenset({7}))
     assert issues_needing_resume(w, st, CFG) == [(7, "t2")]
 

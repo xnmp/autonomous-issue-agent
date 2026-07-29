@@ -282,9 +282,8 @@ def simulate(scenario: Scenario, tmp_path, ticks: int = TICKS) -> list[Tick]:
 
 # ── scenarios ────────────────────────────────────────────────────────────────
 def _resume_dedup() -> Scenario:
-    """V1/#13: one unanswered human reply must buy exactly ONE resume session,
-    even though the resume leg keeps failing and the issue keeps returning to
-    ai-blocked with that same reply still last in the thread."""
+    """#71/V1: one reply buys exactly ONE continuation even when the original
+    session handle is missing and the fresh leg returns the issue to blocked."""
     return Scenario(
         name="resume-dedup",
         world=world(issues=[
@@ -292,9 +291,12 @@ def _resume_dedup() -> Scenario:
                 Comment("alice", "here is the missing context", "2026-01-01T00:00:00Z"),
             )),
         ]),
-        # A resolve already ran and saved a session for issue 7 — the
-        # precondition `issues_needing_resume` requires.
-        seed=lambda store: store.save_session(7, "prior-session"),
+        runner_result=outcome.AgentResult(
+            is_error=False,
+            status="blocked",
+            needs="still blocked",
+            session_id="fresh-session",
+        ),
         expect_dispatches=1,
         expect_kinds=frozenset({AgentKind.RESUME}),
         cap=0,  # not a retry loop: the dedup mark alone must hold it to one
@@ -538,7 +540,7 @@ def test_simulator_can_detect_an_unbounded_loop():
     written back. The property above is only meaningful because a `decide_fix`
     that ignored its own state entirely would fail it."""
     scenario = _resume_dedup()
-    frozen_state = FixState(sessions=frozenset({7}))
+    frozen_state = FixState()
     dispatches = 0
     for _ in range(TICKS):
         decided = decide_fix(scenario.world, scenario.cfg, frozen_state, fixer_busy=False)

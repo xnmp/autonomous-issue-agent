@@ -250,6 +250,52 @@ def test_resume_writes_resumed_at_mark():
     assert "the answer" in runner.tasks[0].prompt
 
 
+def test_resume_without_session_starts_fresh_with_issue_and_reply_context():
+    iss = IssueView(
+        5,
+        title="Choose storage",
+        body="The service must persist widgets.",
+        comments=(
+            Comment("fix-bot", "Which backend?", "t1"),
+            Comment("alice", "Use PostgreSQL.", "t2"),
+        ),
+    )
+    gw = FakeGateway(issues={5: iss}, pr_for_issue={})
+    runner = FakeRunner(
+        AgentResult(is_error=False, status="blocked", session_id="new-session")
+    )
+
+    asyncio.run(_workflow(gw, FakeStore(), runner, fix_bot="fix-bot").resume(5))
+
+    task = runner.tasks[0]
+    assert task.resume == ""
+    assert "Choose storage" in task.prompt
+    assert "The service must persist widgets." in task.prompt
+    assert "Use PostgreSQL." in task.prompt
+
+
+def test_resume_with_session_continues_the_saved_runtime_handle():
+    iss = IssueView(
+        5,
+        title="t",
+        body="b",
+        comments=(
+            Comment("fix-bot", "question", "t1"),
+            Comment("alice", "answer", "t2"),
+        ),
+    )
+    gw = FakeGateway(issues={5: iss}, pr_for_issue={})
+    store = FakeStore()
+    store.save_session(5, "prior-session")
+    runner = FakeRunner(
+        AgentResult(is_error=False, status="blocked", session_id="prior-session")
+    )
+
+    asyncio.run(_workflow(gw, store, runner, fix_bot="fix-bot").resume(5))
+
+    assert runner.tasks[0].resume == "prior-session"
+
+
 def test_pr_resume_uses_pr_reply_and_linked_issue_session_once():
     prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
     iss = IssueView(5, title="t", body="b")
