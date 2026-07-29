@@ -120,7 +120,18 @@ class EscalationSignals:
 
     recurrence: bool = False
     resolve_retries: int = 0
+    # A failed CI verification is evidence about the same implementation even
+    # when the resolve leg itself returned a PR successfully.
+    ci_retries: int = 0
     review_rounds: int = 0
+
+    def failure_count(self) -> int:
+        """Completed failed attempts that should make the next leg more careful."""
+        return (
+            max(0, self.resolve_retries)
+            + max(0, self.ci_retries)
+            + max(0, self.review_rounds - 1)
+        )
 
     def notches(self) -> int:
         """How many rungs of evidence exist. One per signal (#16).
@@ -133,8 +144,7 @@ class EscalationSignals:
         """
         return (
             (1 if self.recurrence else 0)
-            + max(0, self.resolve_retries)
-            + max(0, self.review_rounds - 1)
+            + self.failure_count()
         )
 
 
