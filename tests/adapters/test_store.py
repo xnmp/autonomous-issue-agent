@@ -39,6 +39,8 @@ def test_resumed_at_and_resumes_counter():
     s, _ = _store()
     s.set_resumed_at(5, "t2")
     assert s.get_resumed_at(5) == "t2"
+    s.set_pr_resumed_at(100, "t3")
+    assert s.get_pr_resumed_at(100) == "t3"
     assert s.bump_resumes(5) == 1
     assert s.bump_resumes(5) == 2
 

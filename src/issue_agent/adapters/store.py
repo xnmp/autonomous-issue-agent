@@ -43,7 +43,7 @@ _ISSUE_SUFFIXES = (
 )
 _PR_SUFFIXES = (
     "session", "last-sha", "round", "automerge", "patch-id", "ci-rerun-head",
-    "ci-pending-escalated-head",
+    "ci-pending-escalated-head", "resumed-at",
 )
 
 # Closed-unmerged requeue cleanup (review M4/D8, handover §5.7): only the
