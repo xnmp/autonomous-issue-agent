@@ -462,6 +462,19 @@ def issues_needing_fresh_resume(
     return out
 
 
+def issues_needing_any_resume(
+    world: WorldState, state: FixState, cfg: FixConfig
+) -> list[tuple[int, str]]:
+    """Merge saved and fresh continuations without changing issue priority."""
+    by_issue = dict(issues_needing_resume(world, state, cfg))
+    by_issue.update(issues_needing_fresh_resume(world, state, cfg))
+    return [
+        (issue.number, by_issue[issue.number])
+        for issue in world.issues
+        if issue.number in by_issue
+    ]
+
+
 def prs_needing_resume(
     world: WorldState, state: FixState, cfg: FixConfig
 ) -> list[tuple[int, int, str]]:
@@ -1211,10 +1224,7 @@ def decide_fix(
 
     # 2) Blocked issue with a NEW answer (first one only).
     if not consumed:
-        needing = (
-            issues_needing_resume(world, state, cfg)
-            or issues_needing_fresh_resume(world, state, cfg)
-        )
+        needing = issues_needing_any_resume(world, state, cfg)
         if needing:
             n, _at = needing[0]
             if infra_ceiling_hit(state, cfg, n):
