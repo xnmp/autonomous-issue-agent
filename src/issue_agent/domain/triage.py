@@ -18,6 +18,7 @@ themselves bump updatedAt), so only a LATER human reply re-triggers triage.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -64,8 +65,14 @@ class TriageState:
 
 
 def grooming_content(issue: IssueView) -> str:
-    """The user-authored issue fields grooming may act on, excluding comments."""
-    return f"{issue.title}\0{issue.body}"
+    """Stable digest of user-authored fields grooming may act on.
+
+    Store reads trim terminal whitespace and normalize newlines, so persisting
+    raw issue text would make comment-only updates look like body edits. Hex
+    output is immune to both transformations.
+    """
+    source = f"{issue.title}\0{issue.body}".encode("utf-8")
+    return hashlib.sha256(source).hexdigest()
 
 
 def grooming_candidates(

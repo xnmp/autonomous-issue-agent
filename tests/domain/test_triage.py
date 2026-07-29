@@ -79,7 +79,8 @@ def test_grooming_candidates_include_changed_issue_and_respect_enabled_flag():
 
 def test_grooming_candidates_damp_comment_only_updates_and_cap_first_pass_spend():
     issues = [issue(n, title=f"T{n}", body="unchanged", updated_at="new") for n in range(1, 8)]
-    seen_content = {n: f"T{n}\0unchanged" for n in range(1, 8)}
+    from issue_agent.domain.triage import grooming_content
+    seen_content = {item.number: grooming_content(item) for item in issues}
     assert grooming_candidates(world(issues=issues), {}, True, seen_content) == []
     assert grooming_candidates(world(issues=issues), {}, True) == [1, 2, 3, 4, 5]
 
