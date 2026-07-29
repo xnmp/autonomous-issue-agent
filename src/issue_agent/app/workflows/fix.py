@@ -30,7 +30,11 @@ from ...domain.effort import (
 from ...domain.labels import Label
 from ...domain.refs import slugify
 from ...domain.review import count_outstanding_change_requests
-from ...domain.world import REVIEW_CHANGES_REQUESTED, normalize_predicted_paths
+from ...domain.world import (
+    REVIEW_CHANGES_REQUESTED,
+    normalize_predicted_paths,
+    paths_overlap_open_prs,
+)
 from ..mcp import mcp_servers_for_checks
 
 
@@ -340,7 +344,28 @@ class FixWorkflow:
             iss = self._issue_for_signals(issue)
         return self._escalated(cfg, issue, leg, iss=iss, review_rounds=review_rounds)
 
-    async def _routed_fix_cfg(self, issue: int, iss) -> FixTaskConfig:
+    def _prediction_overlaps_open_pr(self, issue: int, paths: frozenset[str]) -> bool:
+        """Whether the router's new hint conflicts with an already-open PR.
+
+        The decision tick selected this issue before the router ran. Re-reading
+        the existing world here is therefore the one chance to turn that
+        already-paid classification into a defer rather than starting a resolve
+        that races a known conflict. A failed read preserves the former
+        fail-open behavior.
+        """
+        if not paths:
+            return False
+        try:
+            world = self.gateway.build_world()
+        except Exception as exc:  # noqa: BLE001 — prediction is advisory
+            self.cfg.log(
+                f"agent #{issue}: route — overlap check unavailable ({exc}); "
+                "dispatching normally"
+            )
+            return False
+        return paths_overlap_open_prs(paths, world.prs)
+
+    async def _routed_fix_cfg(self, issue: int, iss) -> tuple[FixTaskConfig, bool]:
         """Difficulty-routed, evidence-escalated FixTaskConfig for a RESOLVE
         dispatch (P4.1/#8, ladder #16).
 
@@ -360,9 +385,9 @@ class FixWorkflow:
         """
         cfg = self.cfg.fix
         if cfg is None:
-            return cfg
+            return cfg, False
         if cfg.model:
-            return self._escalated(cfg, issue, "resolve", iss=iss)
+            return self._escalated(cfg, issue, "resolve", iss=iss), False
         try:
             result = await self._run_logged(
                 "route", issue,
@@ -372,19 +397,18 @@ class FixWorkflow:
                 kind=AgentKind.ROUTE.name,
             )
             tier = result.field("tier")
+            predicted_paths = normalize_predicted_paths(result.field("predicted_paths"))
             save_prediction = getattr(self.store, "save_predicted_paths", None)
             if save_prediction is not None:
-                save_prediction(
-                    issue, normalize_predicted_paths(result.field("predicted_paths"))
-                )
+                save_prediction(issue, predicted_paths)
         except Exception as exc:  # noqa: BLE001 — routing is advisory, never fatal
             self.cfg.log(f"agent #{issue}: route — failed ({exc}); dispatching unrouted")
-            return self._escalated(cfg, issue, "resolve", iss=iss)
+            return self._escalated(cfg, issue, "resolve", iss=iss), False
         routed = self._escalated(cfg, issue, "resolve", tier=tier or DEFAULT_TIER, iss=iss)
         self.cfg.log(
             f"agent #{issue}: route — tier={tier or 'unknown'} → model={routed.model}"
         )
-        return routed
+        return routed, self._prediction_overlaps_open_pr(issue, predicted_paths)
 
     async def resolve(self, issue: int) -> None:
         if self.cfg.author_tests_split:
@@ -393,7 +417,12 @@ class FixWorkflow:
         iss = self.gateway.get_issue(issue)
         branch = f"fix/{issue}-{slugify(iss.title) or 'issue'}"
         cwd = self._ensure_cwd(issue, branch)
-        fix_cfg = await self._routed_fix_cfg(issue, iss)
+        fix_cfg, deferred_for_overlap = await self._routed_fix_cfg(issue, iss)
+        if deferred_for_overlap:
+            self.executor.execute_all([
+                Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)
+            ])
+            return
         self.store.save_model(issue, fix_cfg.model)
         task = task_builders.build_resolve_task(issue, iss.title, iss.body, cwd, fix_cfg)
         result = await self._run_logged("resolve", issue, task)
@@ -424,7 +453,12 @@ class FixWorkflow:
         branch = f"fix/{issue}-{slugify(iss.title) or 'issue'}"
         cwd = self._ensure_cwd(issue, branch)
 
-        fix_cfg = await self._routed_fix_cfg(issue, iss)
+        fix_cfg, deferred_for_overlap = await self._routed_fix_cfg(issue, iss)
+        if deferred_for_overlap:
+            self.executor.execute_all([
+                Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)
+            ])
+            return
         self.store.save_model(issue, fix_cfg.model)
         if self.store.get_phase(issue) != "authored":
             author = await self.runner.run(
