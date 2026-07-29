@@ -330,7 +330,8 @@ def test_nonoverlapping_role_estimates_for_same_physical_stall_subtract_once():
     assert snapshots.mean_wall_clock_s([row]) == 6000.0
 
 
-def test_nonfinite_stall_correction_is_ignored():
+@pytest.mark.parametrize("malformed_seconds", [float("inf"), 10**400])
+def test_nonfinite_or_oversized_stall_correction_is_ignored(malformed_seconds):
     events = [
         {"ts": ts(hours=4), "event": "agent_run_start", "role": "fix",
          "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
@@ -338,7 +339,7 @@ def test_nonfinite_stall_correction_is_ignored():
         {"ts": ts(hours=3), "event": "agent_run_stall", "role": "fix",
          "issue": 7, "dispatch": "d1", "stall_started_at": ts(hours=3.5),
          "stall_clock_offset_seconds": 1_234_567.0,
-         "suspended_seconds": float("inf")},
+         "suspended_seconds": malformed_seconds},
         {"ts": ts(hours=2), "event": "action",
          "desc": "clear state for pr #12, issue #7 (merged)"},
     ]
