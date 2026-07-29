@@ -142,6 +142,10 @@ class Backend:
         )
         if issue_error:
             payload["warnings"].append(f"GitHub issue history unavailable: {issue_error}")
+        elif isinstance(issues, list) and len(issues) >= ghdata.ISSUE_HISTORY_LIMIT:
+            payload["warnings"].append(
+                "GitHub issue history may be incomplete: reached the 1,000-issue fetch limit"
+            )
         return payload
 
     # ── gh-augmented ──

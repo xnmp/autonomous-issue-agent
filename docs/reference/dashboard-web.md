@@ -164,7 +164,9 @@ provide opened/closed counts for the selected target repository, while journal
 the first journalled day for that repository/fixer-runtime/review-mode tuple;
 it distinguishes expected first-of-class tuition from a repeat-deployment trend.
 If GitHub is unavailable, lifecycle counts are absent and the panel still shows
-journal recurrences with a warning.
+journal recurrences with a warning. The reader paginates up to 1,000 issues;
+reaching that bound emits a warning so a potentially incomplete long-run trend
+is never presented as complete.
 
 ### GET /api/repos/{name}/issues
 
