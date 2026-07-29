@@ -457,6 +457,26 @@ def test_unpinned_sdk_legs_journal_the_init_models_resolved_value(monkeypatch, t
         assert settled["model"] == "claude-opus-4-1"
 
 
+def test_unpinned_sdk_no_result_journals_the_init_models_resolved_value(monkeypatch, tmp_path):
+    """A dropped terminal envelope retains the SDK model in its settled receipt."""
+    from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
+
+    init = type("InitMessage", (), {
+        "subtype": "init", "data": {"model": "claude-opus-4-1"},
+    })()
+    _install_fake_sdk(monkeypatch, [init])
+    journal = Journal(str(tmp_path / "review-journal.jsonl"))
+    runner = JournalingRuntime(AgentRunner(), journal, role="review")
+    runner.set_context("review", "REVIEW", 100, 91)
+
+    asyncio.run(runner.run(AgentTask(prompt="unconfigured SDK leg")))
+
+    start, settled = read_events(journal.path)
+    assert start["model"] == ""
+    assert settled["exit_reason"] == "no_result"
+    assert settled["model"] == "claude-opus-4-1"
+
+
 def test_run_skips_task_notification_followup_result(monkeypatch):
     """A background task finishing injects a synthetic follow-up whose ResultMessage
     carries origin={"kind":"task-notification"}. It must NOT be taken as our result —
