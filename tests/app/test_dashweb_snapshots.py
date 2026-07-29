@@ -8,8 +8,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from issue_agent.app import cli, dashboard as dash
-from issue_agent.app.dashweb import ghdata, server, snapshots
+from issue_agent.adapters.dashweb import ghdata, system
+from issue_agent.app.dashweb import service, snapshots
+from issue_agent.domain import dashboard as dash
 
 NOW = datetime(2026, 7, 29, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -54,9 +55,42 @@ def test_normalise_frecency_on_an_idle_fleet_is_all_zero_not_a_crash():
 
 # ── liveness ──────────────────────────────────────────────────────────────────
 def test_deployment_name_is_read_off_the_composed_env_path():
-    assert snapshots.deployment_of_env("/h/config/.active.my-repo.env") == "my-repo"
-    assert snapshots.deployment_of_env("/h/config/shared.env") == ""
-    assert snapshots.deployment_of_env("") == ""
+    assert system.deployment_of_env("/h/config/.active.my-repo.env") == "my-repo"
+    assert system.deployment_of_env("/h/config/shared.env") == ""
+    assert system.deployment_of_env("") == ""
+
+
+def test_system_adapter_lists_configured_deployments(tmp_path):
+    (tmp_path / "b.env").write_text("REPO=o/b\n")
+    (tmp_path / "a.env").write_text("REPO=o/a\n")
+    (tmp_path / "notes.txt").write_text("ignored\n")
+    assert system.deployment_names(str(tmp_path)) == ("a", "b")
+    assert system.deployment_names(str(tmp_path / "missing")) == ()
+
+
+def test_collected_snapshot_reports_the_deployment_specific_log_paths(tmp_path):
+    journals = []
+    for role in dash.ROLE_NAMES:
+        path = tmp_path / f"{role}.jsonl"
+        path.write_text("")
+        journals.append(str(path))
+    ledger = tmp_path / "ledger.jsonl"
+    ledger.write_text("")
+
+    snapshot = system.collect_snapshot(
+        name="demo",
+        repo="o/r",
+        target_dir="/tmp/demo",
+        journal_paths=journals,
+        log_dir=str(tmp_path / "logs"),
+        ledger_path=str(ledger),
+        now_fn=lambda: NOW,
+        stale_after_s=60,
+    )
+
+    assert [health.log_path for health in snapshot.deployment.health] == [
+        str(tmp_path / "logs" / f"{role}-demo.log") for role in dash.ROLE_NAMES
+    ]
 
 
 def _fake_proc(tmp_path, pids):
@@ -76,7 +110,7 @@ def test_proc_scan_maps_each_deployment_to_its_live_roles(tmp_path):
               ["python", "-m", "issue_agent.app.main", "review"]),
         103: (["PATH=/usr/bin"], ["sleep", "1"]),
     })
-    live, ok = snapshots.scan_proc_daemons(root)
+    live, ok = system.scan_proc_daemons(root)
     assert ok
     assert live == {"demo": {"fix", "review"}}
 
@@ -85,18 +119,18 @@ def test_proc_scan_reports_a_launcher_only_deployment_as_active_with_no_roles(tm
     root = _fake_proc(tmp_path, {
         7: (["AGENT_ENV=/h/config/.active.demo.env"], ["bash", "bin/point-at.sh", "demo"]),
     })
-    live, ok = snapshots.scan_proc_daemons(root)
+    live, ok = system.scan_proc_daemons(root)
     assert ok and live == {"demo": set()}
 
 
 def test_proc_scan_failure_is_reported_not_swallowed(tmp_path):
-    live, ok = snapshots.scan_proc_daemons(str(tmp_path / "nope"))
+    live, ok = system.scan_proc_daemons(str(tmp_path / "nope"))
     assert (live, ok) == ({}, False)
 
 
 def test_repos_payload_falls_back_to_journal_staleness_without_proc():
     dep = build([{"ts": ts(minutes=1), "event": "tick", "role": "fix"}])
-    snap = snapshots.Snapshot("demo", "o/r", "/t", dep, (NOW,))
+    snap = dash.Snapshot("demo", "o/r", "/t", dep, (NOW,))
     payload = snapshots.repos_payload([snap], {}, False, NOW)
     assert payload["liveness"] == "journal-heuristic"
     assert payload["warnings"]
@@ -104,8 +138,8 @@ def test_repos_payload_falls_back_to_journal_staleness_without_proc():
 
 
 def test_repos_payload_is_pre_sorted_by_frecency():
-    quiet = snapshots.Snapshot("quiet", "o/q", "", build([]), (NOW - timedelta(days=20),))
-    busy = snapshots.Snapshot("busy", "o/b", "", build([]), (NOW, NOW))
+    quiet = dash.Snapshot("quiet", "o/q", "", build([]), (NOW - timedelta(days=20),))
+    busy = dash.Snapshot("busy", "o/b", "", build([]), (NOW, NOW))
     payload = snapshots.repos_payload([quiet, busy], {}, True, NOW)
     assert [r["name"] for r in payload["repos"]] == ["busy", "quiet"]
     assert payload["repos"][0]["frecency"] == 1.0
@@ -288,93 +322,79 @@ def test_health_trend_groups_target_issue_lifecycle_and_recurrence_by_utc_day():
     ]
 
     assert snapshots.health_trend(
-        issues, recurrences, first_class_day="2026-07-29"
+        issues, recurrences, first_observed_day="2026-07-29"
     ) == [
         {"day": "2026-07-29", "opened": 2, "closed": 0, "net_open": 2,
-         "recurrences": 0, "first_of_class": True},
+         "recurrences": 0, "first_observation": True},
         {"day": "2026-07-30", "opened": 0, "closed": 1, "net_open": -1,
-         "recurrences": 0, "first_of_class": False},
+         "recurrences": 0, "first_observation": False},
         {"day": "2026-07-31", "opened": 0, "closed": 0, "net_open": 0,
-         "recurrences": 2, "first_of_class": False},
+         "recurrences": 2, "first_observation": False},
     ]
 
 
 def test_health_trend_is_empty_without_issue_activity_or_recurrence():
-    assert snapshots.health_trend([], [], first_class_day="2026-07-29") == []
+    assert snapshots.health_trend([], [], first_observed_day="2026-07-29") == []
 
 
-def test_overview_projects_selected_repo_lifecycle_recurrence_and_first_class_day(monkeypatch):
+def test_overview_projects_lifecycle_recurrence_and_first_observed_day(monkeypatch):
     recurrence = {"ts": "2026-07-30T01:00:00Z", "event": "recurrence", "issue": 7}
     deployment = build([recurrence])
-    snapshot = snapshots.Snapshot("demo", "o/r", "/target", deployment, (NOW,))
+    snapshot = dash.Snapshot("demo", "o/r", "/target", deployment, (NOW,))
 
     class Gh:
         def issues(self, repo):
             assert repo == "o/r"
             return ([{"createdAt": "2026-07-29T01:00:00Z", "closedAt": "2026-07-30T02:00:00Z"}], "")
 
-    backend = server.Backend(gh=Gh())
+    backend = service.Backend(gh=Gh())
     monkeypatch.setattr(backend, "snapshot", lambda _name: snapshot)
     monkeypatch.setattr(backend, "names", lambda: ("demo",))
-    monkeypatch.setattr(snapshots, "scan_proc_daemons", lambda: ({}, True))
+    monkeypatch.setattr(system, "scan_proc_daemons", lambda: ({}, True))
 
     assert backend.overview("demo")["health_trend"] == [
         {"day": "2026-07-29", "opened": 1, "closed": 0, "net_open": 1,
-         "recurrences": 0, "first_of_class": True},
+         "recurrences": 0, "first_observation": True},
         {"day": "2026-07-30", "opened": 0, "closed": 1, "net_open": -1,
-         "recurrences": 1, "first_of_class": False},
+         "recurrences": 1, "first_observation": False},
     ]
 
 
 def test_overview_warns_when_the_github_history_limit_is_reached(monkeypatch):
-    snapshot = snapshots.Snapshot("demo", "o/r", "/target", build([]), ())
+    snapshot = dash.Snapshot("demo", "o/r", "/target", build([]), ())
 
     class Gh:
         def issues(self, _repo):
             return ([{}] * ghdata.ISSUE_HISTORY_LIMIT, "")
 
-    backend = server.Backend(gh=Gh())
+    backend = service.Backend(gh=Gh())
     monkeypatch.setattr(backend, "snapshot", lambda _name: snapshot)
     monkeypatch.setattr(backend, "names", lambda: ("demo",))
-    monkeypatch.setattr(snapshots, "scan_proc_daemons", lambda: ({}, True))
+    monkeypatch.setattr(system, "scan_proc_daemons", lambda: ({}, True))
 
     assert "may be incomplete" in backend.overview("demo")["warnings"][-1]
 
 
-def _write_active_config(tmp_path, name, runtime, review_mode):
-    config = tmp_path / "config"
-    config.mkdir(exist_ok=True)
-    (config / f".active.{name}.env").write_text(
-        f"FIXER_RUNTIME={runtime}\nREVIEW_MODE={review_mode}\n"
+def test_overview_marks_only_the_selected_deployments_first_observed_day(monkeypatch):
+    target = dash.Snapshot(
+        "target",
+        "o/r",
+        "/target",
+        build([]),
+        (NOW - timedelta(days=2), NOW),
     )
-
-
-def test_overview_marks_a_runtime_classes_own_first_day_not_another_runtimes(tmp_path, monkeypatch):
-    target = snapshots.Snapshot("target", "o/r", "/target", build([]), (NOW,))
-    earlier_runtime = snapshots.Snapshot(
-        "earlier-runtime", "o/r", "/earlier", build([]), (NOW - timedelta(days=2),)
-    )
-    by_name = {"target": target, "earlier-runtime": earlier_runtime}
-    _write_active_config(tmp_path, "target", "codex", "single")
-    _write_active_config(tmp_path, "earlier-runtime", "claude", "single")
-    monkeypatch.setattr(cli, "HARNESS_ROOT", str(tmp_path))
-    monkeypatch.setenv("FIXER_RUNTIME", "ambient-runtime")
-    monkeypatch.setenv("REVIEW_MODE", "ambient-mode")
 
     class Gh:
         def issues(self, _repo):
-            return ([{"createdAt": ts(), "closedAt": None}], "")
+            return ([{"createdAt": ts(days=2), "closedAt": None}], "")
 
-    backend = server.Backend(gh=Gh())
-    monkeypatch.setattr(backend, "snapshot", by_name.__getitem__)
-    monkeypatch.setattr(backend, "names", lambda: tuple(by_name))
-    monkeypatch.setattr(snapshots, "scan_proc_daemons", lambda: ({}, True))
+    backend = service.Backend(gh=Gh())
+    monkeypatch.setattr(backend, "snapshot", lambda _name: target)
+    monkeypatch.setattr(system, "scan_proc_daemons", lambda: ({}, True))
 
-    assert snapshots.deployment_class(target) == ("o/r", "codex", "single")
-    assert snapshots.deployment_class(target) != snapshots.deployment_class(earlier_runtime)
     assert backend.overview("target")["health_trend"] == [
-        {"day": "2026-07-29", "opened": 1, "closed": 0, "net_open": 1,
-         "recurrences": 0, "first_of_class": True},
+        {"day": "2026-07-27", "opened": 1, "closed": 0, "net_open": 1,
+         "recurrences": 0, "first_observation": True},
     ]
 
 
@@ -399,7 +419,7 @@ def test_metrics_json_exposes_first_pass_rate_as_none_before_any_verdict():
 @pytest.mark.parametrize("events", [[], [{"garbage": True}], [{"ts": "not-a-date"}]])
 def test_a_deployment_with_no_usable_events_still_produces_a_payload(events):
     dep = build(events)
-    snap = snapshots.Snapshot("demo", "o/r", "/t", dep, ())
+    snap = dash.Snapshot("demo", "o/r", "/t", dep, ())
     payload = snapshots.repos_payload([snap], {}, True, NOW)
     assert payload["repos"][0]["in_flight"] == 0
     assert snapshots.overview_payload(snap, {}, True)["metrics"]["total_cost_usd"] == 0.0

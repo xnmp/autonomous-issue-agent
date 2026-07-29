@@ -67,7 +67,7 @@
 /* ---------- app frame ---------- */
 .app {
   display: grid;
-  grid-template-columns: 264px minmax(0, 1fr);
+  grid-template-columns: auto minmax(0, 1fr);
   height: 100%;
 }
 
@@ -101,6 +101,11 @@
   min-height: 0;
   background: var(--panel);
   border-right: 1px solid var(--border);
+  width: 264px;
+  min-width: 220px;
+  max-width: 480px;
+  resize: horizontal;
+  overflow: hidden;
 }
 .brand {
   display: flex;
@@ -124,7 +129,8 @@
 }
 .sidebar-foot {
   border-top: 1px solid var(--border);
-  padding: var(--s2);
+  margin-top: var(--s3);
+  padding-top: var(--s2);
   display: flex;
   flex-direction: column;
   gap: var(--s2);
@@ -201,12 +207,9 @@
 .repo-start {
   align-self: center;
   margin-right: var(--s1);
-  opacity: 0;
-  transition: opacity var(--t);
-}
-.repo-row:hover .repo-start,
-.repo-start:focus-visible {
   opacity: 1;
+  min-width: 24px;
+  justify-content: center;
 }
 
 .rail-btn {
@@ -238,9 +241,6 @@
 
 /* ---------- usage block ---------- */
 .usage {
-  display: flex;
-  flex-direction: column;
-  gap: var(--s2);
   padding: var(--s2);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -251,6 +251,25 @@
   justify-content: space-between;
   align-items: baseline;
   font-size: var(--fs-xs);
+  cursor: pointer;
+  list-style: none;
+}
+.usage-hd::-webkit-details-marker {
+  display: none;
+}
+.usage-hd::before {
+  content: "▸";
+  color: var(--ink-faint);
+  margin-right: var(--s1);
+}
+.usage[open] .usage-hd::before {
+  content: "▾";
+}
+.usage-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+  margin-top: var(--s2);
 }
 .usage-sep {
   height: 1px;

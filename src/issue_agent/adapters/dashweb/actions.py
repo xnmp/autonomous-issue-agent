@@ -1,4 +1,4 @@
-"""The three POST actions — the only writes the dashboard can perform.
+"""Infrastructure adapter for the dashboard's three POST actions.
 
 Each one shells out exactly as the operator would, so nothing here reimplements
 harness logic: `start` goes through `make point-at` (which composes env, runs

@@ -3,7 +3,7 @@ failure that degrades to `(None, error)` instead of raising."""
 
 import json
 
-from issue_agent.app.dashweb import ghdata
+from issue_agent.adapters.dashweb import ghdata
 
 
 class Clock:

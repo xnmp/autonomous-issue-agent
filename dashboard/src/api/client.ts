@@ -19,6 +19,8 @@ import type {
   UsagePayload,
   VerificationPayload,
 } from "./types";
+import { z } from "zod";
+import { schemas } from "./generated-zod";
 
 export class ApiError extends Error {
   readonly status: number;
@@ -51,6 +53,7 @@ async function decodeError(res: Response): Promise<never> {
 async function request<T>(
   path: string,
   init: RequestInit & { signal?: AbortSignal },
+  schema?: z.ZodTypeAny,
 ): Promise<T> {
   let res: Response;
   try {
@@ -65,16 +68,30 @@ async function request<T>(
     );
   }
   if (!res.ok) await decodeError(res);
-  return (await res.json()) as T;
+  const payload: unknown = await res.json();
+  if (!schema) return payload as T;
+  const parsed = schema.safeParse(payload);
+  if (!parsed.success) {
+    throw new ApiError(
+      `dashboard backend returned an invalid response for ${path}`,
+      res.status,
+    );
+  }
+  return parsed.data as T;
 }
 
-export function getJson<T>(path: string, signal?: AbortSignal): Promise<T> {
-  return request<T>(path, { method: "GET", signal });
+export function getJson<T>(
+  path: string,
+  schema: z.ZodTypeAny,
+  signal?: AbortSignal,
+): Promise<T> {
+  return request<T>(path, { method: "GET", signal }, schema);
 }
 
 export function postJson<T>(
   path: string,
   body: unknown,
+  schema: z.ZodTypeAny,
   signal?: AbortSignal,
 ): Promise<T> {
   return request<T>(path, {
@@ -84,7 +101,7 @@ export function postJson<T>(
     headers: { "Content-Type": "application/json", "X-Issue-Agent-Dashboard": "1" },
     body: JSON.stringify(body ?? {}),
     signal,
-  });
+  }, schema);
 }
 
 const enc = encodeURIComponent;
@@ -92,25 +109,36 @@ const enc = encodeURIComponent;
 /* -------------------------------------------------------------- endpoints */
 
 export const api = {
-  repos: (s?: AbortSignal) => getJson<ReposPayload>("/api/repos", s),
+  repos: (s?: AbortSignal) =>
+    getJson<ReposPayload>("/api/repos", schemas.ReposPayload, s),
 
-  usage: (s?: AbortSignal) => getJson<UsagePayload>("/api/usage", s),
+  usage: (s?: AbortSignal) =>
+    getJson<UsagePayload>("/api/usage", schemas.UsagePayload, s),
 
   verification: (s?: AbortSignal) =>
-    getJson<VerificationPayload>("/api/verification", s),
+    getJson<VerificationPayload>("/api/verification", schemas.VerificationPayload, s),
 
   overview: (name: string, s?: AbortSignal) =>
-    getJson<OverviewPayload>(`/api/repos/${enc(name)}/overview`, s),
+    getJson<OverviewPayload>(
+      `/api/repos/${enc(name)}/overview`,
+      schemas.OverviewPayload,
+      s,
+    ),
 
   issues: (name: string, s?: AbortSignal) =>
-    getJson<IssuesPayload>(`/api/repos/${enc(name)}/issues`, s),
+    getJson<IssuesPayload>(`/api/repos/${enc(name)}/issues`, schemas.IssuesPayload, s),
 
   issue: (name: string, n: number, s?: AbortSignal) =>
-    getJson<IssueDetailPayload>(`/api/repos/${enc(name)}/issues/${n}`, s),
+    getJson<IssueDetailPayload>(
+      `/api/repos/${enc(name)}/issues/${n}`,
+      schemas.IssueDetailPayload,
+      s,
+    ),
 
   stepEvents: (name: string, n: number, idx: number, s?: AbortSignal) =>
     getJson<StepEventsPayload>(
       `/api/repos/${enc(name)}/issues/${n}/steps/${idx}/events`,
+      schemas.StepEventsPayload,
       s,
     ),
 
@@ -119,15 +147,21 @@ export const api = {
     `/api/repos/${enc(name)}/issues/${n}/cost-chart?session_id=${enc(sessionId)}`,
 
   startDaemons: (name: string, s?: AbortSignal) =>
-    postJson<ActionResult>(`/api/repos/${enc(name)}/start`, {}, s),
+    postJson<ActionResult>(`/api/repos/${enc(name)}/start`, {}, schemas.ActionResult, s),
 
   promote: (name: string, n: number, s?: AbortSignal) =>
-    postJson<ActionResult>(`/api/repos/${enc(name)}/issues/${n}/promote`, {}, s),
+    postJson<ActionResult>(
+      `/api/repos/${enc(name)}/issues/${n}/promote`,
+      {},
+      schemas.ActionResult,
+      s,
+    ),
 
   setPriority: (name: string, n: number, priority: Priority, s?: AbortSignal) =>
     postJson<ActionResult>(
       `/api/repos/${enc(name)}/issues/${n}/priority`,
       { priority },
+      schemas.ActionResult,
       s,
     ),
 };

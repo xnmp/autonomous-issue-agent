@@ -24,19 +24,20 @@ export function UsageBlock({ usage }: { usage: Polled<UsagePayload> }) {
   const capPct = today !== null && cap !== null && cap > 0 ? (today / cap) * 100 : null;
 
   return (
-    <div className="usage">
-      <div className="usage-hd">
+    <details className="usage">
+      <summary className="usage-hd">
         <span className="panel-title">Quota</span>
         {usage.error ? null : (
           <span className="faint num">{u?.claude?.source ?? ""}</span>
         )}
-      </div>
+      </summary>
 
-      {usage.error ? (
-        <ErrorBanner message={usage.error} onRetry={usage.refresh} stale={!!u} />
-      ) : null}
+      <div className="usage-body">
+        {usage.error ? (
+          <ErrorBanner message={usage.error} onRetry={usage.refresh} stale={!!u} />
+        ) : null}
 
-      <Meter
+        <Meter
         label="Claude 5h"
         pct={claude?.five_hour_pct ?? null}
         unavailableReason={claude?.error ?? "claude usage unavailable"}
@@ -45,8 +46,8 @@ export function UsageBlock({ usage }: { usage: Polled<UsagePayload> }) {
             ? `resets in ${untilLabel(claude.five_hour_resets_at)}`
             : null
         }
-      />
-      <Meter
+        />
+        <Meter
         label="Claude 7d"
         pct={claude?.seven_day_pct ?? null}
         unavailableReason={claude?.error ?? "claude usage unavailable"}
@@ -55,17 +56,17 @@ export function UsageBlock({ usage }: { usage: Polled<UsagePayload> }) {
             ? `resets in ${untilLabel(claude.seven_day_resets_at)}`
             : null
         }
-      />
-      <Meter
+        />
+        <Meter
         label={`Codex weekly${codex?.plan ? ` (${codex.plan})` : ""}`}
         pct={codex?.weekly_pct ?? null}
         unavailableReason={codex?.error ?? "no codex rollout found"}
         note={codex?.resets_at ? `resets in ${untilLabel(codex.resets_at)}` : null}
-      />
+        />
 
-      <div className="usage-sep" />
+        <div className="usage-sep" />
 
-      {cap !== null ? (
+        {cap !== null ? (
         <Meter
           label="Harness $ today"
           pct={capPct}
@@ -80,9 +81,9 @@ export function UsageBlock({ usage }: { usage: Polled<UsagePayload> }) {
           <span className="muted">Harness $ today</span>
           <span className={`num mono tone-${utilTone(null)}`}>{usd(today)}</span>
         </div>
-      )}
+        )}
 
-      {(harness?.per_repo ?? []).map((r) => {
+        {(harness?.per_repo ?? []).map((r) => {
         const p =
           r.today_usd !== null && r.daily_cap_usd !== null && r.daily_cap_usd > 0
             ? (r.today_usd / r.daily_cap_usd) * 100
@@ -95,7 +96,8 @@ export function UsageBlock({ usage }: { usage: Polled<UsagePayload> }) {
             <span className="faint num">{r.daily_cap_usd !== null ? `/ ${usd(r.daily_cap_usd)}` : "/ no cap"}</span>
           </div>
         );
-      })}
-    </div>
+        })}
+      </div>
+    </details>
   );
 }

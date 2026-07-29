@@ -7,9 +7,10 @@ unchanged and stay journal-only.
 
 Design rules:
 
-- **Journal stays the truth for costs/stages/legs.** All aggregation reuses the
-  pure functions in `app/dashboard.py` (`collect`, `build_deployment`,
-  `stage_for`, …) — dashweb never re-derives what dashboard.py already derives.
+- **Journal stays the truth for costs/stages/legs.** Aggregation and lifecycle
+  decisions live in the pure `domain/dashboard.py`; journal, process, GitHub,
+  usage and command I/O live under `adapters/dashweb/`. The application layer
+  only composes ports and projects domain snapshots into response payloads.
 - **GitHub reads are allowed, cached.** A small `gh`-CLI adapter with a
   per-(repo, query) TTL cache (default 45 s). Every gh call is read-only except
   the three explicit POST actions below. gh failures degrade: the UI renders
@@ -42,17 +43,26 @@ Design rules:
 ## Repo/di­rectory layout
 
 ```
+src/issue_agent/domain/dashboard.py       # pure lifecycle model and aggregation
+src/issue_agent/adapters/dashweb/
+  system.py        # journal, /proc and git-origin readers
+  ghdata.py        # cached read-only gh reads
+  usage.py         # claude/codex usage and harness caps
+  verification.py  # verification ledger parser
+  costchart.py     # transcript chart process adapter
+  actions.py       # daemon and label command adapters
 src/issue_agent/app/dashweb/
-  __init__.py
-  server.py        # FastAPI app factory `create_app()`, static mount, uvicorn runner `serve(port)`
-  snapshots.py     # journal-side collectors (wraps app/dashboard.py) + frecency + daemon liveness
-  ghdata.py        # cached read-only gh reads (issues, PRs, labels)
-  usage.py         # claude OAuth usage, codex rollout rate_limits, harness caps
-  verification.py  # docs/field-verification.md parser
-  costchart.py     # cc-cost transcript location + invocation
-  actions.py       # POST handlers (start daemons, promote, priority)
+  ports.py         # application-facing Protocols
+  contracts.py     # Pydantic HTTP contracts / OpenAPI source
+  service.py       # use-case orchestration and adapter composition
+  snapshots.py     # pure API projections from domain snapshots
+  server.py        # thin FastAPI transport and static SPA delivery
 dashboard/         # Vite + React + TS; `npm run build` → dashboard/dist (gitignored)
 ```
+
+`scripts/export_dashboard_openapi.py` exports the server schema. The frontend
+runs `npm run generate:api` to regenerate TypeScript and Zod contracts; every
+successful response is validated before reaching a component.
 
 CLI: **serving is the default mode** — a bare `issue-agent dashboard` binds
 `127.0.0.1:8321` (`cli.DASHBOARD_PORT`, the same target `dashboard/vite.config.ts`
@@ -137,7 +147,7 @@ pending match anywhere in the row to `status`, and keep the raw row text.
 ### GET /api/repos/{name}/overview
 
 `Metrics` from dashboard.py verbatim, plus today's spend, caps, and cost-mix by
-leg family:
+run family:
 
 ```json
 { "metrics": { "done_issues": 5, "in_flight_issues": 2, "total_cost_usd": ...,
@@ -150,7 +160,7 @@ leg family:
   "caps": { "issue_cap_usd": ..., "daily_cap_usd": ..., "today_usd": ... },
   "health": [ ...same role objects as /api/repos... ],
   "health_trend": [{ "day": "2026-07-29", "opened": 3, "closed": 1,
-                     "net_open": 2, "recurrences": 0, "first_of_class": true }],
+                     "net_open": 2, "recurrences": 0, "first_observation": true }],
   "unattributed": [ last 20 deployment-level events ],
   "warnings": [] }
 ```
@@ -160,9 +170,10 @@ STEWARD_DRIVE + JIRA_SYNC; review = REVIEW + RE_REVIEW; resolve = the rest.
 
 `health_trend` is advisory per UTC day: GitHub issue `createdAt`/`closedAt`
 provide opened/closed counts for the selected target repository, while journal
-`recurrence` events provide the recurrence count. `first_of_class` identifies
-the first journalled day for that repository/fixer-runtime/review-mode tuple;
-it distinguishes expected first-of-class tuition from a repeat-deployment trend.
+`recurrence` events provide the recurrence count. `first_observation` identifies
+the selected deployment's first journalled day. Runtime and review-mode history
+is not journalled, so the dashboard deliberately does not infer historical
+configuration classes from the deployment's current configuration.
 If GitHub is unavailable, lifecycle counts are absent and the panel still shows
 journal recurrences with a warning. The reader paginates up to 1,000 issues;
 reaching that bound emits a warning so a potentially incomplete long-run trend
@@ -224,7 +235,10 @@ ai-blocked/needs-human-review):
 
 ```json
 { "issue": 7, "title": "…", "url": "…", "stage": "…", "done": false,
-  "prs": [12], "cost_usd": ..., "elapsed_s": ...,
+  "prs": [12],
+  "pull_requests": [{ "number": 12, "url": "https://github.com/o/r/pull/12",
+                      "state": "open|merged|closed|null" }],
+  "cost_usd": ..., "elapsed_s": ...,
   "steps": [{
      "idx": 0, "kind": "RESOLVE", "role": "fix", "ts": "…",
      "state": "ok|failed|running", "status": "…", "exit_reason": "…",
@@ -237,10 +251,10 @@ ai-blocked/needs-human-review):
   "warnings": [] }
 ```
 
-Steps here are NOT collapsed — one row per leg (`agent_run` /
-unsettled `agent_run_start`), ts order. Red/green TDD phases are not journalled
-as separate legs (they happen inside a RESOLVE session); the step table is
-leg-granular and says so in the UI copy.
+Runs here are NOT collapsed: each row represents one agent invocation
+(`agent_run` or an unsettled `agent_run_start`) in timestamp order. The wire
+contract retains the established `steps` field for compatibility; the UI calls
+these rows “Runs”.
 
 ### GET /api/repos/{name}/issues/{n}/steps/{idx}/events
 

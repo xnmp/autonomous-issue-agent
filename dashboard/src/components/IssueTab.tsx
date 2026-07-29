@@ -2,23 +2,18 @@ import { useState } from "react";
 import { api } from "../api/client";
 import { usePolled, useLiveElapsed } from "../api/hooks";
 import type { IssueStep } from "../api/types";
-import { kindAbbrev, stateTone, stageTone, statusTone } from "../lib/semantics";
+import { kindLabel, prStateTone, stateTone, stageTone, statusTone } from "../lib/semantics";
 import { duration, durationShort, localTime, num, tokens, usd } from "../lib/format";
+import { shortModel } from "../lib/models";
 import { Chip } from "./ui/Chip";
 import { Collapsible, JsonBlock } from "./ui/Json";
-import { EmptyState, ErrorBanner, Loading, SectionTitle, WarningList } from "./ui/Feedback";
+import { EmptyState, ErrorBanner, Loading, SectionTitle, SkeletonRows, WarningList } from "./ui/Feedback";
 import { EventTimeline } from "./EventTimeline";
-import { shortModel } from "./IssuesTab";
 
 const POLL_MS = 5_000;
 
 /**
- * One issue, leg by leg.
- *
- * Deliberate UI copy: the step table is *leg*-granular. The red/green TDD
- * phases happen inside a single RESOLVE session and are not journalled as
- * separate legs, so an operator looking for them here would otherwise conclude
- * the harness skipped TDD.
+ * One issue, run by run. A run is one agent invocation.
  */
 export function IssueTab({ repo, issue }: { repo: string; issue: number }) {
   const detail = usePolled(
@@ -37,7 +32,7 @@ export function IssueTab({ repo, issue }: { repo: string; issue: number }) {
         <ErrorBanner message={detail.error} onRetry={detail.refresh} stale={!!d} />
       ) : null}
       <WarningList warnings={d?.warnings} />
-      {detail.loading ? <Loading what={`issue #${issue}`} /> : null}
+      {detail.loading ? <SkeletonRows what={`issue #${issue}`} rows={6} /> : null}
 
       {d ? (
         <>
@@ -48,7 +43,7 @@ export function IssueTab({ repo, issue }: { repo: string; issue: number }) {
                 {d.title ?? <span className="faint">title unavailable (GitHub data)</span>}
               </span>
               <span className="spacer" />
-              {d.stage ? (
+              {d.stage && !d.done ? (
                 <Chip tone={stageTone(d.stage)} pulse={!d.done && stageTone(d.stage) === "running"}>
                   {d.stage}
                 </Chip>
@@ -56,16 +51,25 @@ export function IssueTab({ repo, issue }: { repo: string; issue: number }) {
               {d.done ? <Chip tone="ok">done</Chip> : null}
             </div>
             <div className="issue-hd-line">
-              {d.url ? (
-                <a href={d.url} target="_blank" rel="noreferrer">
-                  issue on GitHub ↗
-                </a>
-              ) : null}
-              {d.prs.map((p) => (
-                <Chip key={p} tone="info" square>
-                  PR #{p}
-                </Chip>
-              ))}
+              {d.pull_requests.map((pr) =>
+                pr.url ? (
+                  <a
+                    key={pr.number}
+                    href={pr.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    title={`open PR #${pr.number} on GitHub`}
+                  >
+                    <Chip tone={prStateTone(pr.state)} square>
+                      PR #{pr.number} ↗
+                    </Chip>
+                  </a>
+                ) : (
+                  <Chip key={pr.number} tone={prStateTone(pr.state)} square>
+                    PR #{pr.number}
+                  </Chip>
+                ),
+              )}
               <span className="spacer" />
               <span className="issue-stat">
                 <span className="faint">cost</span>{" "}
@@ -76,25 +80,16 @@ export function IssueTab({ repo, issue }: { repo: string; issue: number }) {
                 <span className="mono">{duration(d.done ? d.elapsed_s : elapsed)}</span>
               </span>
               <span className="issue-stat">
-                <span className="faint">legs</span>{" "}
+                <span className="faint">runs</span>{" "}
                 <span className="mono">{d.steps.length}</span>
               </span>
             </div>
           </header>
 
-          <SectionTitle
-            right={
-              <span className="faint">
-                one row per leg — red/green TDD phases run inside a RESOLVE session and are not
-                journalled separately
-              </span>
-            }
-          >
-            Steps
-          </SectionTitle>
+          <SectionTitle>Runs</SectionTitle>
 
           {d.steps.length === 0 ? (
-            <EmptyState>no legs journalled for this issue yet</EmptyState>
+            <EmptyState>no runs recorded for this issue yet</EmptyState>
           ) : (
             <div className="panel steps">
               <div className="tbl-wrap">
@@ -102,7 +97,7 @@ export function IssueTab({ repo, issue }: { repo: string; issue: number }) {
                   <thead>
                     <tr>
                       <th style={{ width: 34 }} />
-                      <th style={{ width: 64 }}>Leg</th>
+                      <th style={{ width: 90 }}>Operation</th>
                       <th style={{ width: 80 }}>Role</th>
                       <th style={{ width: 140 }}>Model</th>
                       <th style={{ width: 190 }}>Status</th>
@@ -175,7 +170,7 @@ function StepRow({
         </td>
         <td>
           <Chip tone={tone} square pulse={step.state === "running"} title={step.kind}>
-            {kindAbbrev(step.kind)}
+            {kindLabel(step.kind)}
           </Chip>
         </td>
         <td>
@@ -273,7 +268,7 @@ function StepDetail({ repo, issue, step }: { repo: string; issue: number; step: 
             <EventTimeline
               dense
               events={events.data?.events ?? []}
-              emptyText="no journal events inside this leg's window"
+              emptyText="no journal events inside this run's window"
             />
           )}
         </>
@@ -294,7 +289,7 @@ function StepDetail({ repo, issue, step }: { repo: string; issue: number; step: 
           <EmptyState>
             {step.session_id
               ? "no transcript on disk for this session — the cost chart needs ~/.claude/projects/*/<session_id>.jsonl"
-              : "this leg journalled no session id (non-SDK or aborted before the session opened), so there is no transcript to chart"}
+              : "this run recorded no session id, so there is no transcript to chart"}
           </EmptyState>
         )
       ) : null}

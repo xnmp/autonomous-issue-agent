@@ -11,7 +11,7 @@ import {
 import { ago, localTime, num, rate, usd, usdCompact } from "../lib/format";
 import { Chip } from "./ui/Chip";
 import { Meter, StackedBar, StatTile } from "./ui/Charts";
-import { EmptyState, ErrorBanner, Loading, SectionTitle, WarningList } from "./ui/Feedback";
+import { EmptyState, ErrorBanner, Loading, SectionTitle, SkeletonRows, WarningList } from "./ui/Feedback";
 
 const POLL_MS = 10_000;
 
@@ -60,7 +60,7 @@ export function OverviewTab({ repo }: { repo: string }) {
         <ErrorBanner message={ov.error} onRetry={ov.refresh} stale={!!ov.data} />
       ) : null}
       <WarningList warnings={ov.data?.warnings} />
-      {ov.loading ? <Loading what="overview" /> : null}
+      {ov.loading ? <SkeletonRows what="overview" rows={5} /> : null}
 
       <div className="tiles">
         <StatTile label="Done" value={num(m?.done_issues)} tone="ok" />
@@ -113,9 +113,9 @@ export function OverviewTab({ repo }: { repo: string }) {
       <div className="grid-2">
         <section className="panel">
           <div className="panel-hd">
-            <span className="panel-title">Cost mix by leg family</span>
+            <span className="panel-title">Cost mix by run family</span>
             {repairShare !== null ? (
-              <Chip tone={repairShare > 0.25 ? "fail" : "neutral"} title="repair legs are pure overhead; their share should shrink">
+              <Chip tone={repairShare > 0.25 ? "fail" : "neutral"} title="repair runs are pure overhead; their share should shrink">
                 repair {rate(repairShare)}
               </Chip>
             ) : null}
@@ -180,9 +180,9 @@ export function OverviewTab({ repo }: { repo: string }) {
       </section>
 
       <div className="by-kind">
-        <SectionTitle>Spend by leg kind</SectionTitle>
+        <SectionTitle>Spend by run type</SectionTitle>
         {(m?.by_kind ?? []).length === 0 ? (
-          <EmptyState>no legs journalled yet</EmptyState>
+          <EmptyState>no runs recorded yet</EmptyState>
         ) : (
           <div className="tbl-wrap panel">
             <table className="tbl">
@@ -217,7 +217,7 @@ function HealthTrend({ rows, loading }: { rows: HealthTrendDay[]; loading: boole
     <section className="panel">
       <div className="panel-hd">
         <span className="panel-title">Issue health trend</span>
-        <span className="faint">UTC days · first-of-class is expected tuition</span>
+        <span className="faint">UTC days · first observed marks deployment start</span>
       </div>
       <div className="panel-bd flush">
         {rows.length === 0 && !loading ? (
@@ -228,9 +228,9 @@ function HealthTrend({ rows, loading }: { rows: HealthTrendDay[]; loading: boole
               <thead><tr><th>UTC day</th><th className="r">Opened</th><th className="r">Closed</th><th className="r">Net</th><th className="r">Recurrences</th></tr></thead>
               <tbody>{rows.map((row) => (
                 <tr key={row.day}>
-                  <td className="mono">{row.day}{row.first_of_class ? <span className="faint"> · first class</span> : null}</td>
+                  <td className="mono">{row.day}{row.first_observation ? <span className="faint"> · first observed</span> : null}</td>
                   <td className="r num">{num(row.opened)}</td><td className="r num">{num(row.closed)}</td>
-                  <td className={`r num${row.net_open > 0 && !row.first_of_class ? " tone-fail" : ""}`}>{row.net_open > 0 ? `+${row.net_open}` : num(row.net_open)}</td>
+                  <td className={`r num${row.net_open > 0 && !row.first_observation ? " tone-fail" : ""}`}>{row.net_open > 0 ? `+${row.net_open}` : num(row.net_open)}</td>
                   <td className={`r num${row.recurrences > 0 ? " tone-fail" : ""}`}>{num(row.recurrences)}</td>
                 </tr>
               ))}</tbody>

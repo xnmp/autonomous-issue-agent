@@ -11,9 +11,8 @@ import pytest
 
 pytest.importorskip("fastapi")
 
-from fastapi.testclient import TestClient  # noqa: E402
-
 from issue_agent.app.dashweb import server  # noqa: E402
+from asgi_client import ASGITestClient as TestClient  # noqa: E402
 
 
 class StubBackend:
@@ -35,32 +34,80 @@ class StubBackend:
 
     def repos(self):
         self._maybe("repos")
-        return {"repos": [{"name": "demo", "repo": "o/r", "active": True,
-                           "frecency": 1.0, "roles": []}], "warnings": []}
+        return {"repos": [{
+            "name": "demo", "repo": "o/r", "target_dir": "/tmp/demo",
+            "is_self": False, "active": True, "frecency": 1.0, "roles": [],
+            "last_activity_ts": None, "in_flight": 1, "done": 0,
+        }], "warnings": []}
 
     def usage(self):
         self._maybe("usage")
-        return {"claude": {"five_hour_pct": 1.0}, "codex": {"weekly_pct": 2.0},
-                "harness": {"per_repo": []}, "warnings": []}
+        return {
+            "claude": {
+                "five_hour_pct": 1.0, "five_hour_resets_at": None,
+                "seven_day_pct": None, "seven_day_resets_at": None,
+                "source": "oauth", "error": None,
+            },
+            "codex": {
+                "weekly_pct": 2.0, "window_minutes": 10080, "resets_at": None,
+                "plan": None, "source": "rollout", "sampled_at": None,
+                "error": None,
+            },
+            "harness": {
+                "global_daily_cap_usd": None, "today_all_repos_usd": 0.0,
+                "per_repo": [],
+            },
+            "warnings": [],
+        }
 
     def verification(self):
         self._maybe("verification")
-        return {"rows": [{"id": "#1", "status": "pending"}], "warnings": []}
+        return {"rows": [{
+            "id": "#1", "change": "test", "shipped": None, "status": "pending",
+            "evidence": None, "raw": "| #1 | test | pending |",
+        }], "warnings": []}
 
     def overview(self, name):
         self._maybe("overview")
-        return {"metrics": {"done_issues": 1}, "cost_mix": {}, "caps": {},
-                "health": [], "unattributed": [], "warnings": []}
+        return {
+            "metrics": {
+                "done_issues": 1, "in_flight_issues": 0, "total_cost_usd": 1.0,
+                "cost_per_done_usd": 1.0, "first_pass_approvals": 1,
+                "first_pass_changes": 0, "first_pass_rate": 1.0,
+                "rounds_per_pr": 1.0, "escalations": 0, "recurrences": 0,
+                "spend_blocks": 0, "today_usd": 1.0, "by_kind": [],
+            },
+            "cost_mix": {
+                "resolve_usd": 1.0, "review_usd": 0.0, "repair_usd": 0.0,
+                "steward_usd": 0.0,
+            },
+            "caps": {
+                "issue_cap_usd": None, "daily_cap_usd": None, "today_usd": 1.0,
+            },
+            "health": [], "unattributed": [], "health_trend": [], "warnings": [],
+        }
 
     def issues(self, name):
         self._maybe("issues")
-        return {"in_flight": [{"issue": 7}], "pending": [], "done": [],
+        return {"in_flight": [{
+                    "issue": 7, "title": None, "url": None, "pr": None,
+                    "pr_url": None, "pr_state": None, "stage": "queued",
+                    "done": False, "steps": [], "cost_usd": 0.0,
+                    "estimated": False, "projected_cost_usd": None,
+                    "started_ts": None, "last_ts": None, "elapsed_s": None,
+                    "projected_eta_s": None, "models": [], "rounds": 0,
+                    "flags": [],
+                }], "pending": [], "done": [],
                 "backlog": [], "gh_ok": True, "warnings": []}
 
     def issue(self, name, number):
         self._maybe("issue")
-        return None if number == 404 else {"issue": number, "steps": [], "events": [],
-                                           "warnings": []}
+        return None if number == 404 else {
+            "issue": number, "title": None, "url": None, "stage": "queued",
+            "done": False, "prs": [], "pull_requests": [], "cost_usd": 0.0,
+            "elapsed_s": None,
+            "steps": [], "events": [], "warnings": [],
+        }
 
     def step_events(self, name, number, idx):
         self._maybe("step_events")
@@ -175,6 +222,25 @@ def test_a_collector_failure_degrades_to_a_warning_never_a_500(collector, path):
                     headers=WRITE_HEADERS, base_url=BASE_URL).get(path)
     assert r.status_code == 200
     assert r.json()["warnings"]
+
+
+def test_issue_failure_payload_still_satisfies_the_rendering_contract():
+    body = client(StubBackend(explode="issue")).get("/api/repos/demo/issues/7").json()
+
+    assert body == {
+        "issue": 7,
+        "title": None,
+        "url": None,
+        "stage": None,
+        "done": False,
+        "prs": [],
+        "pull_requests": [],
+        "cost_usd": 0.0,
+        "elapsed_s": None,
+        "steps": [],
+        "events": [],
+        "warnings": ["issue detail unavailable (RuntimeError: collector blew up)"],
+    }
 
 
 # ── POST ──────────────────────────────────────────────────────────────────────

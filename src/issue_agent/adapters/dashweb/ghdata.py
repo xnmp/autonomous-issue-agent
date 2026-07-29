@@ -1,4 +1,4 @@
-"""Cached read-only `gh` reads: issue titles/labels, PR state, the backlog.
+"""Infrastructure adapter for cached, read-only ``gh`` queries.
 
 The v1 dashboard is journal-only on purpose (a diagnostic that fails when
 GitHub does is worse than one that is honest about its scope). This module
@@ -131,8 +131,11 @@ def index_by_number(payload) -> dict[int, dict]:
     for item in payload:
         if not isinstance(item, dict):
             continue
+        raw_number = item.get("number")
+        if raw_number is None:
+            continue
         try:
-            number = int(item.get("number"))
+            number = int(raw_number)
         except (TypeError, ValueError):
             continue
         out[number] = item

@@ -21,6 +21,7 @@ const KEY_FIELDS = [
   "message",
   "label",
   "session_id",
+  "desc",
 ];
 
 const NOISE = new Set(["ts", "kind", "event", "role"]);
@@ -86,7 +87,11 @@ export function EventTimeline({
               <Chip tone={toneFor(e)} square>
                 {eventKind(e)}
               </Chip>
-              {e.role ? <span className="faint">{String(e.role)}</span> : null}
+              {e.role ? (
+                <span className="faint">
+                  by <strong>{String(e.role)}</strong>
+                </span>
+              ) : null}
               {summarize(e).map((f) => (
                 <span key={f.k} className="kv">
                   <span className="kv-k faint">{f.k}</span>
