@@ -134,6 +134,9 @@ done < <(env -0)
 # tests without anyone maintaining a denylist.
 _ce_knobs="$(grep -oE '^[A-Za-z_][A-Za-z0-9_]*' "$_CE_ACTIVE" | grep -v '^HARNESS_DEPLOY_KNOBS$' | sort | tr '\n' ' ')"
 printf 'HARNESS_DEPLOY_KNOBS=%q\n' "${_ce_knobs% }" >> "$_CE_ACTIVE"
+# Export into the CURRENT shell too: point-at's gate probe scrubs via this var
+# and does not source the active file it just wrote (the daemons do).
+export HARNESS_DEPLOY_KNOBS="${_ce_knobs% }"
 unset _ce_knobs
 
 unset _CE_PRE _CE_POST _CE_ASSIGNED _ce_kv _ce_v _ce_name _CE_ABORT
