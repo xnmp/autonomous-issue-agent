@@ -477,6 +477,27 @@ def test_unpinned_sdk_no_result_journals_the_init_models_resolved_value(monkeypa
     assert settled["model"] == "claude-opus-4-1"
 
 
+def test_unpinned_sdk_timeout_journals_the_init_models_resolved_value(monkeypatch, tmp_path):
+    """An idle SDK leg keeps its init model when its timeout settles it."""
+    from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
+
+    init = type("InitMessage", (), {
+        "subtype": "init", "data": {"model": "claude-opus-4-1"},
+    })()
+    _install_hanging_sdk(monkeypatch, [init])
+    journal = Journal(str(tmp_path / "review-journal.jsonl"))
+    runner = JournalingRuntime(
+        AgentRunner(idle_timeout=0.05, poll_slice=0.01), journal, role="review"
+    )
+    runner.set_context("review", "REVIEW", 100, 91)
+
+    asyncio.run(runner.run(AgentTask(prompt="unconfigured SDK leg")))
+
+    _, settled = read_events(journal.path)
+    assert settled["exit_reason"] == "idle_timeout"
+    assert settled["model"] == "claude-opus-4-1"
+
+
 def test_run_skips_task_notification_followup_result(monkeypatch):
     """A background task finishing injects a synthetic follow-up whose ResultMessage
     carries origin={"kind":"task-notification"}. It must NOT be taken as our result —

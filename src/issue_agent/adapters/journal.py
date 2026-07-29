@@ -288,6 +288,7 @@ class JournalingRuntime:
                     is_error=True,
                     status="raised",
                     cost_usd=0.0,
+                    model=str(getattr(exc, "harness_resolved_model", "") or ""),
                     exit_reason=ExitReason.TRANSPORT_DEATH,
                 ),
                 time.monotonic() - t0,
