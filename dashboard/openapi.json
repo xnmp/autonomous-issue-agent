@@ -34,6 +34,17 @@
             ],
             "title": "Age Days"
           },
+          "age_s": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Age S"
+          },
           "body": {
             "anyOf": [
               {
@@ -617,6 +628,17 @@
             "title": "Issue",
             "type": "integer"
           },
+          "issue_verification": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Issue Verification"
+          },
           "last_ts": {
             "anyOf": [
               {
@@ -638,6 +660,14 @@
               }
             ],
             "title": "Merged Ts"
+          },
+          "model_badges": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ModelBadge"
+            },
+            "title": "Model Badges",
+            "type": "array"
           },
           "models": {
             "items": {
@@ -679,6 +709,17 @@
             ],
             "title": "Pr Url"
           },
+          "pr_verification": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr Verification"
+          },
           "projected_cost_usd": {
             "anyOf": [
               {
@@ -700,6 +741,17 @@
               }
             ],
             "title": "Projected Eta S"
+          },
+          "projected_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Projected Model"
           },
           "rounds": {
             "anyOf": [
@@ -932,6 +984,17 @@
               }
             ],
             "title": "Duration S"
+          },
+          "effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Effort"
           },
           "estimated": {
             "title": "Estimated",
@@ -1265,6 +1328,32 @@
         "title": "Metrics",
         "type": "object"
       },
+      "ModelBadge": {
+        "additionalProperties": true,
+        "properties": {
+          "effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Effort"
+          },
+          "model": {
+            "title": "Model",
+            "type": "string"
+          }
+        },
+        "required": [
+          "model",
+          "effort"
+        ],
+        "title": "ModelBadge",
+        "type": "object"
+      },
       "OverviewPayload": {
         "additionalProperties": true,
         "properties": {
@@ -1287,6 +1376,17 @@
                 "type": "null"
               }
             ]
+          },
+          "first_observed_day": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Observed Day"
           },
           "health": {
             "items": {

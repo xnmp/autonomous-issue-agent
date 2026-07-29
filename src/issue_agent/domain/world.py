@@ -120,6 +120,10 @@ class IssueView:
     # it would implement against a base branch missing its prerequisite. Default
     # False = no blockers (safe: an issue with no dependency graph is dispatchable).
     blocked_by_open: bool = False
+    # The open dependency numbers behind ``blocked_by_open``. Keeping the
+    # witnesses lets operator surfaces name what will unblock the issue instead
+    # of exposing the gate's internal "held" terminology.
+    open_blocker_numbers: tuple[int, ...] = ()
     # File paths the issue body explicitly names (backticked `pkg/mod.py` etc.),
     # extracted by the adapter. Used to skip dispatching an issue whose files
     # overlap an in-flight PR's changed files (would guarantee a merge conflict

@@ -10,7 +10,9 @@
 
 import type { CostMix, IssueFlag, RoleHealth, StepState } from "../api/types";
 
-export type Tone = "ok" | "running" | "fail" | "info" | "meta" | "link" | "neutral";
+export type Tone =
+  | "ok" | "running" | "fail" | "info" | "meta" | "link" | "neutral"
+  | "tier-luna" | "tier-terra" | "tier-sol" | "tier-high";
 
 /* --------------------------------------------------------- leg kinds */
 
@@ -84,6 +86,7 @@ export function statusTone(status: string | null | undefined): Tone {
 
 /** Every flag is a problem; severity splits red from orange-ish yellow. */
 export function flagTone(flag: IssueFlag): Tone {
+  if (flag === "waiting") return "info";
   return flag === "escalated" || flag === "spend-blocked" ? "fail" : "running";
 }
 
@@ -100,6 +103,19 @@ export function verificationTone(status: string | null | undefined): Tone {
   if (s.includes("VERIFIED")) return "ok";
   if (s.includes("MISBEHAVED")) return "fail";
   if (s.includes("PENDING")) return "running";
+  return "neutral";
+}
+
+export function modelTone(model: string, effort?: string | null): Tone {
+  const name = model.toLowerCase();
+  const stance = (effort ?? "").toLowerCase();
+  const aboveMedium = ["high", "xhigh", "max", "ultra"].includes(stance);
+  if (name.includes("fable") || name.includes("opus") || (name.includes("sol") && aboveMedium)) {
+    return "tier-high";
+  }
+  if (name.includes("sol")) return "tier-sol";
+  if (name.includes("terra") || name.includes("sonnet")) return "tier-terra";
+  if (name.includes("luna") || name.includes("haiku")) return "tier-luna";
   return "neutral";
 }
 

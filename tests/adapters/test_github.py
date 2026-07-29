@@ -583,7 +583,7 @@ def test_has_open_blocker_true_when_a_blocker_is_open():
     def runner(argv, token):
         key = " ".join(argv)
         if "dependencies/blocked_by" in key:      # the list call
-            return json.dumps(["closed", "open"])  # jq already reduced to states
+            return json.dumps([91])  # jq reduced to open issue numbers
         if "issues/57" in key:                     # the summary call
             return "2"
         return ""
@@ -597,7 +597,7 @@ def test_has_open_blocker_false_when_all_blockers_closed():
     def runner(argv, token):
         key = " ".join(argv)
         if "dependencies/blocked_by" in key:
-            return json.dumps(["closed"])
+            return json.dumps([])
         if "issues/57" in key:
             return "1"
         return ""
@@ -630,7 +630,7 @@ def test_build_world_enriches_only_ready_issues_with_blocker_gate():
         if "issue view 6" in key:
             return json.dumps({"number": 6, "state": "OPEN", "labels": [{"name": "ai-working"}]})
         if "issues/5/dependencies/blocked_by" in key:
-            return json.dumps(["open"])
+            return json.dumps([42])
         if "issues/5" in key:
             return "1"
         return ""
@@ -639,6 +639,7 @@ def test_build_world_enriches_only_ready_issues_with_blocker_gate():
     w = gw.build_world()
     by_num = {i.number: i for i in w.issues}
     assert by_num[5].blocked_by_open is True     # ready issue gated + blocked
+    assert by_num[5].open_blocker_numbers == (42,)
     assert by_num[6].blocked_by_open is False    # working issue never gated
 
 

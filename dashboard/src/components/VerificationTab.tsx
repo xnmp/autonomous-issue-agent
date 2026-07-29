@@ -3,6 +3,7 @@ import { usePolled } from "../api/hooks";
 import { verificationTone } from "../lib/semantics";
 import { Chip } from "./ui/Chip";
 import { EmptyState, ErrorBanner, SectionTitle, SkeletonRows, WarningList } from "./ui/Feedback";
+import { ResizableTable } from "./ui/ResizableTable";
 
 const POLL_MS = 60_000; // a markdown ledger the human edits — no need to hammer it
 
@@ -43,16 +44,13 @@ export function VerificationTab() {
 
       {rows.length > 0 ? (
         <div className="tbl-wrap panel">
-          <table className="tbl">
-            <thead>
-              <tr>
-                <th style={{ width: 110 }}>ID</th>
-                <th>Change</th>
-                <th style={{ width: 120 }}>Status</th>
-                <th style={{ width: 110 }}>Shipped</th>
-                <th>Evidence</th>
-              </tr>
-            </thead>
+          <ResizableTable storageKey="verification-ledger" columns={[
+            { key: "id", label: "ID", width: 110 },
+            { key: "change", label: "Change", width: 360 },
+            { key: "status", label: "Status", width: 130 },
+            { key: "shipped", label: "Shipped", width: 130 },
+            { key: "evidence", label: "Evidence", width: 500 },
+          ]}>
             <tbody>
               {rows.map((r, i) => {
                 const tone = verificationTone(r.status);
@@ -73,7 +71,7 @@ export function VerificationTab() {
                 );
               })}
             </tbody>
-          </table>
+          </ResizableTable>
         </div>
       ) : null}
     </div>

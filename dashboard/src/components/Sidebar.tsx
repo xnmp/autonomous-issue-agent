@@ -1,19 +1,19 @@
-import { useState } from "react";
+import { useState, type KeyboardEvent, type PointerEvent } from "react";
 import { api } from "../api/client";
 import type { Polled } from "../api/hooks";
-import type { RepoSummary, ReposPayload, UsagePayload } from "../api/types";
-import { HEALTH_LABEL, HEALTH_TONE, roleHealth } from "../lib/semantics";
-import { ago } from "../lib/format";
+import type { HarnessRepoSpend, RepoSummary, ReposPayload, UsagePayload } from "../api/types";
+import { HEALTH_LABEL, HEALTH_TONE, roleHealth, utilTone } from "../lib/semantics";
+import { ago, pct, usd } from "../lib/format";
 import { Chip, Dot } from "./ui/Chip";
 import { ConfirmModal } from "./ui/Modal";
 import { EmptyState, ErrorBanner, SkeletonRows, WarningList } from "./ui/Feedback";
-import { UsageBlock } from "./UsageBlock";
 
 interface SidebarProps {
   repos: Polled<ReposPayload>;
   usage: Polled<UsagePayload>;
   activeRepo: string | null;
   verificationActive: boolean;
+  showPerRepoQuotas: boolean;
   onSelectRepo: (name: string) => void;
   onOpenVerification: () => void;
 }
@@ -31,6 +31,7 @@ export function Sidebar({
   usage,
   activeRepo,
   verificationActive,
+  showPerRepoQuotas,
   onSelectRepo,
   onOpenVerification,
 }: SidebarProps) {
@@ -38,10 +39,77 @@ export function Sidebar({
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem("issue-agent.dashboard.sidebar-collapsed") === "true";
+    } catch {
+      return false;
+    }
+  });
+  const [width, setWidth] = useState(() => {
+    try {
+      const stored = Number(localStorage.getItem("issue-agent.dashboard.sidebar-width"));
+      return Number.isFinite(stored) && stored >= 220 ? stored : 264;
+    } catch {
+      return 264;
+    }
+  });
 
   const list = repos.data?.repos ?? [];
   const active = list.filter((r) => r.active);
   const past = list.filter((r) => !r.active);
+  const quotaByRepo = new Map(
+    (usage.data?.harness?.per_repo ?? []).map((quota) => [quota.name, quota]),
+  );
+  const toggleCollapsed = () => {
+    setCollapsed((current) => {
+      try {
+        localStorage.setItem("issue-agent.dashboard.sidebar-collapsed", String(!current));
+      } catch {
+        // The control still works for this session.
+      }
+      return !current;
+    });
+  };
+  const beginResize = (event: PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const originX = event.clientX;
+    const originWidth = width;
+    const move = (next: globalThis.PointerEvent) => {
+      const value = Math.min(480, Math.max(220, originWidth + next.clientX - originX));
+      setWidth(value);
+    };
+    const stop = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+      try {
+        localStorage.setItem(
+          "issue-agent.dashboard.sidebar-width",
+          String(document.querySelector(".sidebar")?.getBoundingClientRect().width ?? width),
+        );
+      } catch {
+        // The resized width remains active for this session.
+      }
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", stop, { once: true });
+  };
+  const resizeFromKeyboard = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.preventDefault();
+    setWidth((current) => {
+      const next = Math.min(
+        480,
+        Math.max(220, current + (event.key === "ArrowRight" ? 12 : -12)),
+      );
+      try {
+        localStorage.setItem("issue-agent.dashboard.sidebar-width", String(next));
+      } catch {
+        // The resized width remains active for this session.
+      }
+      return next;
+    });
+  };
 
   const doStart = async () => {
     if (!confirmStart) return;
@@ -60,7 +128,19 @@ export function Sidebar({
   };
 
   return (
-    <aside className="sidebar">
+    <aside
+      className={`sidebar${collapsed ? " collapsed" : ""}`}
+      style={{ width: collapsed ? 44 : width }}
+    >
+      <button
+        className="sidebar-toggle"
+        onClick={toggleCollapsed}
+        aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+        title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+      >
+        {collapsed ? "›" : "‹"}
+      </button>
+      {!collapsed ? (
       <div className="sidebar-scroll">
         {repos.data?.liveness === "journal-heuristic" ? (
           <Chip tone="running" title="/proc scan unavailable — liveness inferred from journal staleness">
@@ -87,6 +167,7 @@ export function Sidebar({
               repo={r}
               selected={r.name === activeRepo}
               onSelect={() => onSelectRepo(r.name)}
+              quota={showPerRepoQuotas ? quotaByRepo.get(r.name) : undefined}
             />
           ))}
         </div>
@@ -103,6 +184,7 @@ export function Sidebar({
                   repo={r}
                   selected={r.name === activeRepo}
                   onSelect={() => onSelectRepo(r.name)}
+                  quota={showPerRepoQuotas ? quotaByRepo.get(r.name) : undefined}
                   onStart={() => {
                     setActionError(null);
                     setConfirmStart(r);
@@ -133,9 +215,23 @@ export function Sidebar({
             </span>
             Verification ledger
           </button>
-          <UsageBlock usage={usage} />
         </div>
       </div>
+      ) : null}
+      {!collapsed ? (
+        <div
+          className="sidebar-resizer"
+          role="separator"
+          aria-label="Resize sidebar"
+          aria-orientation="vertical"
+          aria-valuemin={220}
+          aria-valuemax={480}
+          aria-valuenow={width}
+          tabIndex={0}
+          onPointerDown={beginResize}
+          onKeyDown={resizeFromKeyboard}
+        />
+      ) : null}
 
       {confirmStart ? (
         <ConfirmModal
@@ -176,11 +272,13 @@ function RepoRow({
   selected,
   onSelect,
   onStart,
+  quota,
 }: {
   repo: RepoSummary;
   selected: boolean;
   onSelect: () => void;
   onStart?: () => void;
+  quota?: HarnessRepoSpend;
 }) {
   const cls = [
     "repo-row",
@@ -227,6 +325,7 @@ function RepoRow({
             {ago(repo.last_activity_ts)}
           </span>
         </div>
+        {quota ? <RepoQuota quota={quota} /> : null}
       </button>
       {onStart ? (
         <button
@@ -238,6 +337,22 @@ function RepoRow({
           ▶
         </button>
       ) : null}
+    </div>
+  );
+}
+
+function RepoQuota({ quota }: { quota: HarnessRepoSpend }) {
+  const value =
+    quota.today_usd !== null && quota.daily_cap_usd !== null && quota.daily_cap_usd > 0
+      ? (quota.today_usd / quota.daily_cap_usd) * 100
+      : null;
+  return (
+    <div
+      className="repo-quota"
+      title={`${quota.name}: ${usd(quota.today_usd)} of ${usd(quota.daily_cap_usd)} today`}
+    >
+      <div className={`repo-quota-fill tone-bg-${utilTone(value)}`} style={{ width: `${Math.min(100, value ?? 0)}%` }} />
+      <span>{value === null ? `${usd(quota.today_usd)} · no cap` : `${pct(value)} quota`}</span>
     </div>
   );
 }

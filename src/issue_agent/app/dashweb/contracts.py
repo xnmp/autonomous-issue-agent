@@ -144,6 +144,7 @@ class OverviewPayload(Warned):
     health: list[RoleHealth]
     unattributed: list[dict[str, Any]]
     health_trend: list[HealthTrendDay]
+    first_observed_day: str | None = None
 
 
 class CardStep(Contract):
@@ -151,6 +152,11 @@ class CardStep(Contract):
     state: str
     status: str | None
     cost_usd: float | None
+
+
+class ModelBadge(Contract):
+    model: str
+    effort: str | None
 
 
 class IssueCard(Contract):
@@ -166,13 +172,17 @@ class IssueCard(Contract):
     cost_usd: float | None
     estimated: bool
     projected_cost_usd: float | None
+    projected_model: str | None = None
     started_ts: str | None
     last_ts: str | None
     elapsed_s: float | None
     projected_eta_s: float | None
     models: list[str]
+    model_badges: list[ModelBadge] = []
     rounds: int | None
     flags: list[str]
+    issue_verification: str | None = None
+    pr_verification: str | None = None
     merged_ts: str | None = None
 
 
@@ -196,6 +206,7 @@ class BacklogCard(Contract):
     recurrence: bool
     recurrence_count: int
     age_days: int | None
+    age_s: int | None = None
     comments: int | None
 
 
@@ -226,6 +237,7 @@ class IssueStep(Contract):
     cost_usd: float | None
     estimated: bool
     model: str | None
+    effort: str | None = None
     session_id: str | None
     turns: int | None
     usage: TokenUsage | None

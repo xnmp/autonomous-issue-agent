@@ -32,6 +32,7 @@ const ReposPayload = z
 const BacklogCard = z
   .object({
     age_days: z.union([z.number(), z.null()]),
+    age_s: z.union([z.number(), z.null()]).optional(),
     body: z.union([z.string(), z.null()]),
     comments: z.union([z.number(), z.null()]),
     issue: z.number().int(),
@@ -41,6 +42,9 @@ const BacklogCard = z
     title: z.union([z.string(), z.null()]),
     url: z.union([z.string(), z.null()]),
   })
+  .passthrough();
+const ModelBadge = z
+  .object({ effort: z.union([z.string(), z.null()]), model: z.string() })
   .passthrough();
 const CardStep = z
   .object({
@@ -58,14 +62,18 @@ const IssueCard = z
     estimated: z.boolean(),
     flags: z.array(z.string()),
     issue: z.number().int(),
+    issue_verification: z.union([z.string(), z.null()]).optional(),
     last_ts: z.union([z.string(), z.null()]),
     merged_ts: z.union([z.string(), z.null()]).optional(),
+    model_badges: z.array(ModelBadge).optional().default([]),
     models: z.array(z.string()),
     pr: z.union([z.number(), z.null()]),
     pr_state: z.union([z.string(), z.null()]),
     pr_url: z.union([z.string(), z.null()]),
+    pr_verification: z.union([z.string(), z.null()]).optional(),
     projected_cost_usd: z.union([z.number(), z.null()]),
     projected_eta_s: z.union([z.number(), z.null()]),
+    projected_model: z.union([z.string(), z.null()]).optional(),
     rounds: z.union([z.number(), z.null()]),
     stage: z.union([z.string(), z.null()]),
     started_ts: z.union([z.string(), z.null()]),
@@ -128,6 +136,7 @@ const IssueStep = z
   .object({
     cost_usd: z.union([z.number(), z.null()]),
     duration_s: z.union([z.number(), z.null()]),
+    effort: z.union([z.string(), z.null()]).optional(),
     estimated: z.boolean(),
     exit_reason: z.union([z.string(), z.null()]),
     has_transcript: z.boolean(),
@@ -218,6 +227,7 @@ const OverviewPayload = z
   .object({
     caps: z.union([Caps, z.null()]),
     cost_mix: z.union([CostMix, z.null()]),
+    first_observed_day: z.union([z.string(), z.null()]).optional(),
     health: z.array(RoleHealth),
     health_trend: z.array(HealthTrendDay),
     metrics: z.union([Metrics, z.null()]),
@@ -288,6 +298,7 @@ export const schemas = {
   RepoSummary,
   ReposPayload,
   BacklogCard,
+  ModelBadge,
   CardStep,
   IssueCard,
   PendingCard,
@@ -564,6 +575,7 @@ const endpoints = makeApi([
       .object({
         caps: z.union([Caps, z.null()]),
         cost_mix: z.union([CostMix, z.null()]),
+        first_observed_day: z.union([z.string(), z.null()]).optional(),
         health: z.array(RoleHealth),
         health_trend: z.array(HealthTrendDay),
         metrics: z.union([Metrics, z.null()]),

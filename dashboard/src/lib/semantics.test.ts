@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { kindLabel, stageTone } from "./semantics";
+import { kindLabel, modelTone, stageTone } from "./semantics";
 
 describe("dashboard semantics", () => {
   it.each([
@@ -13,5 +13,17 @@ describe("dashboard semantics", () => {
 
   it("treats done as terminal success", () => {
     expect(stageTone("done")).toBe("ok");
+  });
+
+  it.each([
+    ["gpt-5.6-luna", null, "tier-luna"],
+    ["gpt-5.6-terra", "medium", "tier-terra"],
+    ["gpt-5.6-sol", "medium", "tier-sol"],
+    ["gpt-5.6-sol", "high", "tier-high"],
+    ["gpt-5.6-sol", "xhigh", "tier-high"],
+    ["fable", null, "tier-high"],
+    ["claude-opus-5", null, "tier-high"],
+  ])("colors %s at %s by capability tier", (model, effort, tone) => {
+    expect(modelTone(model, effort)).toBe(tone);
   });
 });

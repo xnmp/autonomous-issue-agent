@@ -41,11 +41,12 @@ describe("UsageBlock", () => {
   it("is collapsed by default and expands on demand", async () => {
     render(<UsageBlock usage={usage} />);
 
-    const summary = screen.getByText("Quota").closest("summary");
-    expect(summary?.parentElement).not.toHaveAttribute("open");
-    expect(screen.getByText("Claude 5h")).not.toBeVisible();
+    const trigger = screen.getByRole("button", { name: /Quota/ });
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByText("Claude 5h")).not.toBeInTheDocument();
 
-    await userEvent.click(screen.getByText("Quota"));
+    await userEvent.click(trigger);
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
     expect(screen.getByText("Claude 5h")).toBeVisible();
   });
 });

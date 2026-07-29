@@ -12,9 +12,21 @@ import { VerificationTab } from "./components/VerificationTab";
 import { EmptyState } from "./components/ui/Feedback";
 import { Chip } from "./components/ui/Chip";
 import { stageTone } from "./lib/semantics";
+import { UsageBlock } from "./components/UsageBlock";
+import { OptionsMenu, type DashboardOptions } from "./components/ui/OptionsMenu";
 
 const TOP_POLL_MS = 10_000;
 const ISSUES_SUB_STORAGE = "issue-agent.dashboard.issue-subtabs";
+const OPTIONS_STORAGE = "issue-agent.dashboard.options";
+
+function storedOptions(): DashboardOptions {
+  const defaults = { showProjectedCost: true, showPerRepoQuotas: true };
+  try {
+    return { ...defaults, ...JSON.parse(localStorage.getItem(OPTIONS_STORAGE) ?? "{}") };
+  } catch {
+    return defaults;
+  }
+}
 
 function storedIssueSubs(): Record<string, IssuesSub> {
   try {
@@ -39,6 +51,15 @@ export default function App() {
 
   const repos = usePolled("repos", (signal) => api.repos(signal), TOP_POLL_MS);
   const usage = usePolled("usage", (signal) => api.usage(signal), TOP_POLL_MS);
+  const [options, setOptions] = useState<DashboardOptions>(storedOptions);
+  const updateOptions = (next: DashboardOptions) => {
+    setOptions(next);
+    try {
+      localStorage.setItem(OPTIONS_STORAGE, JSON.stringify(next));
+    } catch {
+      // The options remain active for this session.
+    }
+  };
 
   const repoList = useMemo(() => repos.data?.repos ?? [], [repos.data]);
   const routedRepo = routeRepo(route);
@@ -175,6 +196,7 @@ export default function App() {
         usage={usage}
         activeRepo={selectedRepo}
         verificationActive={route.view === "verification"}
+        showPerRepoQuotas={options.showPerRepoQuotas}
         onSelectRepo={(name) => navigate({ view: "overview", repo: name })}
         onOpenVerification={() => navigate({ view: "verification" })}
       />
@@ -186,6 +208,7 @@ export default function App() {
             <TabStrip tabs={tabs} />
           )}
           <span className="spacer" />
+          <OptionsMenu options={options} onChange={updateOptions} />
           <RepoCrumb route={route} />
         </div>
         <div className="mainbody">
@@ -197,9 +220,11 @@ export default function App() {
             onOpenIssue={openIssue}
             hasRepos={repoList.length > 0}
             reposLoading={repos.loading}
+            showProjectedCost={options.showProjectedCost}
           />
         </div>
       </main>
+      <UsageBlock usage={usage} />
     </div>
   );
 }
@@ -212,6 +237,7 @@ function Body({
   onOpenIssue,
   hasRepos,
   reposLoading,
+  showProjectedCost,
 }: {
   route: Route;
   selectedRepo: string | null;
@@ -220,6 +246,7 @@ function Body({
   onOpenIssue: (n: number) => void;
   hasRepos: boolean;
   reposLoading: boolean;
+  showProjectedCost: boolean;
 }) {
   if (route.view === "verification") return <VerificationTab />;
   if (route.view === "issue") return <IssueTab repo={route.repo} issue={route.issue} />;
@@ -231,6 +258,7 @@ function Body({
         issues={issues}
         onSetSub={onSetSub}
         onOpenIssue={onOpenIssue}
+        showProjectedCost={showProjectedCost}
       />
     );
   if (selectedRepo) return <OverviewTab repo={selectedRepo} onOpenIssues={onSetSub} />;

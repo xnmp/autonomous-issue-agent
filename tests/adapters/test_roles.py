@@ -858,12 +858,10 @@ def _held_world(pr_state="OPEN"):
 
 
 def _holds_in(journal):
-    return [e for e in read_events(journal.path) if e.get("event") == "hold"]
+    return [e for e in read_events(journal.path) if e.get("event") == "deferred"]
 
 
-def test_a_hold_is_journaled_once_and_logged_every_poll(tmp_path):
-    """AC: the hold appears ONCE in the journal however many polls it survives —
-    while the LOG keeps answering "why is #522 not moving?" on every poll."""
+def test_a_defer_is_journaled_and_logged_only_when_it_begins(tmp_path):
     journal = Journal(str(tmp_path / "journal.jsonl"))
     logs = []
     report = _hold_reporter(journal, "o/r", logs.append)
@@ -871,28 +869,44 @@ def test_a_hold_is_journaled_once_and_logged_every_poll(tmp_path):
     for _ in range(3):
         report(_held_world())
 
-    assert _holds_in(journal) == [
-        {
-            "ts": _holds_in(journal)[0]["ts"], "event": "hold", "issue": 522,
-            "reason": "overlap", "blocker": "pr#123",
-            "block_key": "hold:o/r:522:overlap:pr#123",
-        }
-    ]
-    assert len(logs) == 3 and all("#522" in ln and "overlap" in ln for ln in logs)
+    events = _holds_in(journal)
+    assert events == [{
+        "ts": events[0]["ts"], "event": "deferred", "state": "waiting",
+        "issue": 522, "reason": "overlap", "blocker_pr": 123,
+        "blocker_issue": None,
+    }]
+    assert logs == ["DEFERRED: issue #522 waiting on PR #123; dispatches once that clears"]
 
 
-def test_releasing_a_hold_journals_nothing_extra(tmp_path):
-    """AC: releasing the hold journals nothing extra — the event says a hold
-    STARTED; the absence of further holds (and the PR's own merge line) is the
-    release. Re-holding on the SAME blocker stays deduped too."""
+def test_releasing_a_defer_emits_one_clear_then_allows_a_new_begin(tmp_path):
     journal = Journal(str(tmp_path / "journal.jsonl"))
-    report = _hold_reporter(journal, "o/r", lambda _m: None)
+    logs = []
+    report = _hold_reporter(journal, "o/r", logs.append)
 
     report(_held_world())
     report(_held_world("MERGED"))   # released
     report(_held_world())           # same (issue, reason, blocker) again
 
-    assert len(_holds_in(journal)) == 1
+    assert [event["state"] for event in _holds_in(journal)] == [
+        "waiting", "cleared", "waiting",
+    ]
+    assert logs[1] == "issue #522 no longer waiting on PR #123; eligible for dispatch"
+
+
+def test_restart_clears_a_legacy_hold_that_is_no_longer_active(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    journal.emit(
+        "hold", issue=522, reason="overlap", blocker="pr#123",
+        block_key="hold:o/r:522:overlap:pr#123",
+    )
+    logs = []
+
+    _hold_reporter(journal, "o/r", logs.append)(_held_world("MERGED"))
+
+    assert _holds_in(journal)[-1]["state"] == "cleared"
+    assert logs == [
+        "issue #522 no longer waiting on PR #123; eligible for dispatch"
+    ]
 
 
 def test_router_predictions_are_injected_before_the_overlap_decision(tmp_path):
@@ -974,7 +988,11 @@ def test_a_second_blocker_is_its_own_hold(tmp_path):
     w = _held_world()
     report(replace(w, prs=(replace(w.prs[0], number=124),)))
 
-    assert [e["blocker"] for e in _holds_in(journal)] == ["pr#123", "pr#124"]
+    assert [
+        e.get("blocker_pr")
+        for e in _holds_in(journal)
+        if e["state"] == "waiting"
+    ] == [123, 124]
 
 
 def test_the_hold_dedup_survives_a_daemon_restart(tmp_path):

@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { Polled } from "../api/hooks";
@@ -18,13 +18,20 @@ const doneCard: IssueCard = {
   cost_usd: 2,
   estimated: false,
   projected_cost_usd: 2,
+  projected_model: "gpt-5.6-terra",
   started_ts: "2026-07-29T07:00:00Z",
   last_ts: "2026-07-29T08:00:00Z",
   elapsed_s: 60,
   projected_eta_s: 60,
   models: ["gpt-5.6-terra", "claude-opus-4-1"],
+  model_badges: [
+    { model: "gpt-5.6-terra", effort: "medium" },
+    { model: "claude-opus-4-1", effort: null },
+  ],
   rounds: 2,
   flags: [],
+  issue_verification: "VERIFIED",
+  pr_verification: "pending",
   merged_ts: "2026-07-29T08:00:00Z",
 };
 
@@ -67,9 +74,9 @@ describe("IssuesTab", () => {
     await userEvent.click(screen.getByRole("button", { name: "Open full issue" }));
     expect(onOpenIssue).toHaveBeenCalledWith(50);
 
-    await userEvent.click(screen.getByRole("button", { name: /Columns/ }));
+    fireEvent.contextMenu(screen.getByRole("columnheader", { name: /Issue \/ PR/ }));
     await userEvent.click(screen.getByRole("checkbox", { name: "Rounds" }));
-    expect(screen.getByRole("columnheader", { name: "Rounds" })).toBeVisible();
+    expect(screen.getByRole("columnheader", { name: /Rounds/ })).toBeVisible();
   });
 
   it("expands formatted backlog context and keeps noisy columns disabled by default", async () => {

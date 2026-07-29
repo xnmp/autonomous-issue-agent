@@ -176,17 +176,15 @@ class Hold:
     silent path-overlap hold on #522 cost ~30 minutes of live investigation), so
     every skip `pick_ready_issue` makes silently is also reportable as a value.
 
-    `blocker` NAMES the thing being waited on — `"pr#123"` for an overlap — so
-    the operator can go look at it. It is `""` for a GitHub-native dependency
-    hold: `IssueView.blocked_by_open` is a settled boolean (the adapter resolves
-    the dependency list and the domain only ever sees "at least one is open"),
-    so there is no number to name. If that view ever carries the blocking issue
-    numbers, this is where they go.
+    The blocker stays structured all the way to the journal. Presentation can
+    therefore say ``waiting on PR #123`` or ``waiting on #42`` without parsing
+    prose written by an older process.
     """
 
     issue: int
-    reason: str          # HOLD_BLOCKER | HOLD_OVERLAP
-    blocker: str = ""    # "pr#123" | "" (unknown/unnameable)
+    reason: str
+    blocker_pr: int | None = None
+    blocker_issue: int | None = None
 
 
 def _overlapping_open_pr(
@@ -214,12 +212,20 @@ def _holds(issue: IssueView, world: WorldState) -> tuple[Hold, ...]:
     journal can never disagree with the decision it explains."""
     holds: list[Hold] = []
     if issue.blocked_by_open:
-        holds.append(Hold(issue.number, HOLD_BLOCKER))
+        holds.append(
+            Hold(
+                issue.number,
+                HOLD_BLOCKER,
+                blocker_issue=issue.open_blocker_numbers[0]
+                if issue.open_blocker_numbers
+                else None,
+            )
+        )
     overlap = _overlapping_open_pr(
         issue.declared_paths | issue.predicted_paths, world.prs
     )
     if overlap is not None:
-        holds.append(Hold(issue.number, HOLD_OVERLAP, f"pr#{overlap.number}"))
+        holds.append(Hold(issue.number, HOLD_OVERLAP, blocker_pr=overlap.number))
     return tuple(holds)
 
 

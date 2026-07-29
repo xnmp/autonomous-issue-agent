@@ -79,6 +79,19 @@ export function ago(ts: string | null | undefined, nowMs = Date.now()): string {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
+/** Compact age with calendar-scale units before clock-scale units. */
+export function ageCompact(seconds: number | null | undefined): string {
+  if (seconds === null || seconds === undefined || !Number.isFinite(seconds) || seconds < 0) {
+    return DASH;
+  }
+  if (seconds >= 30 * 86400) return `${Math.floor(seconds / (30 * 86400))}mo`;
+  if (seconds >= 7 * 86400) return `${Math.floor(seconds / (7 * 86400))}w`;
+  if (seconds >= 86400) return `${Math.floor(seconds / 86400)}d`;
+  if (seconds >= 3600) return `${Math.floor(seconds / 3600)}h`;
+  if (seconds >= 60) return `${Math.floor(seconds / 60)}m`;
+  return `${Math.floor(seconds)}s`;
+}
+
 export function untilLabel(ts: string | null | undefined, nowMs = Date.now()): string {
   const ms = parseTs(ts);
   if (ms === null) return DASH;

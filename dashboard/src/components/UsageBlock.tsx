@@ -14,6 +14,7 @@ import { utilTone } from "../lib/semantics";
  * the row, because a silently absent meter reads as "0 %".
  */
 export function UsageBlock({ usage }: { usage: Polled<UsagePayload> }) {
+  const [open, setOpen] = useState(false);
   const u = usage.data;
   const claude = u?.claude ?? null;
   const codex = u?.codex ?? null;
@@ -24,22 +25,23 @@ export function UsageBlock({ usage }: { usage: Polled<UsagePayload> }) {
   const capPct = today !== null && cap !== null && cap > 0 ? (today / cap) * 100 : null;
 
   return (
-    <details className="usage">
-      <summary className="usage-hd">
-        <span className="panel-title">Quota</span>
-        {usage.error ? null : (
-          <span className="faint num">{u?.claude?.source ?? ""}</span>
-        )}
-      </summary>
-
-      <div className="usage-body">
+    <div className="usage-floating">
+      <button
+        className="quota-fab"
+        aria-expanded={open}
+        aria-controls="quota-card"
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span aria-hidden="true">◔</span> Quota
+      </button>
+      {open ? <section className="usage quota-card panel" id="quota-card" aria-label="Quota">
+        <div className="usage-hd">
+          <span className="panel-title">Quota</span>
+          <button className="btn btn-xs btn-ghost" aria-label="Close quota" onClick={() => setOpen(false)}>×</button>
+        </div>
+        <div className="usage-body">
         {usage.error ? (
           <ErrorBanner message={usage.error} onRetry={usage.refresh} stale={!!u} />
-        ) : null}
-        {claude?.error && (claude.five_hour_pct !== null || claude.seven_day_pct !== null) ? (
-          <span className="faint usage-source-note" title={claude.error}>
-            Claude: last successful reading
-          </span>
         ) : null}
 
         <Meter
@@ -88,28 +90,9 @@ export function UsageBlock({ usage }: { usage: Polled<UsagePayload> }) {
           </div>
         )}
 
-        {(harness?.per_repo ?? []).length > 0 ? (
-          <details className="usage-repos">
-            <summary>Per-repo quotas <span className="num">{harness?.per_repo.length}</span></summary>
-            <div className="usage-repos-body">
-              {(harness?.per_repo ?? []).map((r) => {
-                const p =
-                  r.today_usd !== null && r.daily_cap_usd !== null && r.daily_cap_usd > 0
-                    ? (r.today_usd / r.daily_cap_usd) * 100
-                    : null;
-                return (
-                  <div className="usage-line" key={r.name} title={`${r.name} spend today vs its daily cap`}>
-                    <span className="muted trunc">{r.name}</span>
-                    <span className="spacer" />
-                    <span className={`num mono tone-${utilTone(p)}`}>{usd(r.today_usd)}</span>
-                    <span className="faint num">{r.daily_cap_usd !== null ? `/ ${usd(r.daily_cap_usd)}` : "/ no cap"}</span>
-                  </div>
-                );
-              })}
-            </div>
-          </details>
-        ) : null}
-      </div>
-    </details>
+        </div>
+      </section> : null}
+    </div>
   );
 }
+import { useState } from "react";

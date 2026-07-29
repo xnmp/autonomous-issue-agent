@@ -738,8 +738,9 @@ class GitHubGateway:
         ]
         return int(reviews) >= 1 and any(contexts)
 
-    def has_open_blocker(self, number: int) -> bool:
-        """True iff issue `number` has ≥1 OPEN GitHub-native 'blocked by'
+    def open_blockers(self, number: int) -> tuple[int, ...]:
+        """Open GitHub-native ``blocked by`` issue numbers for ``number``.
+
         dependency. Two-step, cheapest-first: the issue object embeds an
         `issue_dependencies_summary` (no extra call) whose `blocked_by` is 0 when
         nothing is declared → return False immediately (the common case). Only if
@@ -753,12 +754,16 @@ class GitHubGateway:
                  "--jq", ".issue_dependencies_summary.blocked_by // 0"]
             )
             if not summary or int(summary) == 0:  # type: ignore[arg-type]
-                return False
+                return ()
             blockers = self._gh_json(
                 ["api", f"repos/{self.repo}/issues/{number}/dependencies/blocked_by",
-                 "--jq", "[.[] | .state]"]
+                 "--jq", "[.[] | select((.state | ascii_downcase) == \"open\") | .number]"]
             ) or []
-            return any(str(s).lower() == "open" for s in blockers)  # type: ignore[union-attr]
+            return tuple(
+                int(value)
+                for value in blockers  # type: ignore[union-attr]
+                if isinstance(value, int) and not isinstance(value, bool)
+            )
         except GhUnavailable:
             # Fail-soft covers a genuine API ANSWER (endpoint absent, 404, odd
             # shape). An infra failure answered nothing, and "False" here is not
@@ -766,7 +771,11 @@ class GitHubGateway:
             # well be blocked. Propagate: skipping the tick is the cheap mistake.
             raise
         except Exception:
-            return False
+            return ()
+
+    def has_open_blocker(self, number: int) -> bool:
+        """Compatibility predicate over the structured blocker query."""
+        return bool(self.open_blockers(number))
 
     def get_pr(self, number: int, *, mergeability: bool = True, checks: bool = True) -> PRView:
         """Fetch one PR. `mergeability=False` DROPS the mergeable/mergeStateStatus
@@ -905,7 +914,12 @@ class GitHubGateway:
         try:
             issue = self.get_issue(number)
             if blocker_gate:
-                issue = replace(issue, blocked_by_open=self.has_open_blocker(number))
+                blockers = self.open_blockers(number)
+                issue = replace(
+                    issue,
+                    blocked_by_open=bool(blockers),
+                    open_blocker_numbers=blockers,
+                )
             return issue
         except GhUnavailable as exc:
             if not exc.timed_out:
