@@ -244,6 +244,16 @@ post-start rollout `session_meta` matching the worktree, `originator=codex_exec`
 and `source=exec`. The source filter excludes same-cwd subagent rollouts; resumed
 runs seed identity from their persisted session ID. Arbitrary stderr is never an
 in-flight usage source because it contains agent-controlled tool/test output.
+Budget and total-runtime deaths write a bounded `.harness/handover.md` snapshot
+after teardown. The shared journaling-runtime boundary records the terminal
+result, captures the preserved git/task/session state, emits `handover_written`,
+and appends that scratch document to the next fixer task for the same issue.
+The handover is byte-bounded, issue-scoped, encoded as untrusted context before
+the current authoritative task, and retired after successful delivery. This is
+deterministic post-mortem synthesis, so it adds no model call or unbounded grace
+spend. It is intentionally shared by the Claude and Codex fixer adapters:
+current `codex exec` is one-shot with stdin closed, while the SDK has no trusted
+live USD meter from which to derive a portable soft threshold.
 If a blocked issue has a new reply but no persisted session ID, the fixer still
 dispatches a `RESUME` leg and starts a fresh full-context task from the issue
 title, body, and reply. The pre-run `resumed-at` marker preserves exactly-once
