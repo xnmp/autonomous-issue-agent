@@ -613,6 +613,7 @@ def codex_cost_blindspot_warning(
     issue_spend_cap_usd: float,
     daily_spend_cap_usd: float,
     max_runtime: float = 0.0,
+    runtime_name: str = "FIXER_RUNTIME",
 ) -> str | None:
     """The ONE startup line D12 requires: with a spend cap armed but no codex
     price table, every codex run costs $0.00 on the ledger and neither cap can
@@ -663,7 +664,7 @@ def codex_cost_blindspot_warning(
         "codex: WARNING — spend caps are armed "
         f"({caps}) but both CODEX_COST_PER_MTOK_IN/OUT must be positive; "
         f"{consequence}. Set both to your gateway's USD-per-million-token "
-        f"prices. {per_run}. (FIXER_RUNTIME=codex)"
+        f"prices. {per_run}. ({runtime_name}=codex)"
     )
 
 
@@ -673,6 +674,8 @@ def codex_budget_not_enforced_warning(
     max_runtime: float = 0.0,
     enforced: bool = False,
     priced: bool = False,
+    budget_name: str = "MAX_BUDGET_USD",
+    runtime_name: str = "FIXER_RUNTIME",
 ) -> str | None:
     """The half of `codex_cost_blindspot_warning` that has nothing to do with
     pricing, split out so it can actually be seen (#29).
@@ -711,8 +714,8 @@ def codex_budget_not_enforced_warning(
         return (
             "codex: NOTICE — the native per-session budget flag is NOT ENFORCED "
             "on this runtime because codex has no such flag; harness enforcement "
-            f"ACTIVE for MAX_BUDGET_USD=${fix_budget_usd:.2f} using streamed "
-            "rollout usage. (FIXER_RUNTIME=codex)"
+            f"ACTIVE for {budget_name}=${fix_budget_usd:.2f} using streamed "
+            f"rollout usage. ({runtime_name}=codex)"
         )
     bound = (
         f"the wall cap (AGENT_MAX_RUNTIME_SECONDS={max_runtime:.0f}s)"
@@ -727,10 +730,10 @@ def codex_budget_not_enforced_warning(
         "positive, so the check cannot measure a reliable dollar ceiling"
     )
     return (
-        f"codex: WARNING — MAX_BUDGET_USD=${fix_budget_usd:.2f} is NOT ENFORCED "
+        f"codex: WARNING — {budget_name}=${fix_budget_usd:.2f} is NOT ENFORCED "
         f"on this runtime ({why}): codex has no per-session budget flag, so "
         f"{bound} limits a single run, and the issue/daily spend caps (checked "
-        "only BETWEEN legs) are the first real ceiling. (FIXER_RUNTIME=codex)"
+        f"only BETWEEN legs) are the first real ceiling. ({runtime_name}=codex)"
     )
 
 

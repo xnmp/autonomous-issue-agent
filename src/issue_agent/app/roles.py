@@ -65,6 +65,7 @@ from ..domain.triage import (
 )
 from ..domain.jira import jira_phase, jira_sync_needed
 from ..domain.actions import AgentKind, RunAgent
+from ..domain.agent_task import AgentRuntime
 from .config import HarnessConfig
 from .dispatch import AgentDispatcher, DispatchConfig
 from .execute import Executor
@@ -840,7 +841,7 @@ def _review_state(store: Store, world) -> ReviewState:
 
 
 def build_review_daemon(
-    cfg: HarnessConfig, gateway: GitHubGateway, store: Store, runner: AgentRunner
+    cfg: HarnessConfig, gateway: GitHubGateway, store: Store, runner: AgentRuntime
 ) -> Daemon:
     repo_cfg = cfg.repository
     review_runtime = cfg.review_runtime
@@ -882,6 +883,67 @@ def build_review_daemon(
         max_infra_deaths=rcfg.max_unproductive_rounds,
         **_spend_cfg(cfg, "review", ledger),
     )
+    review_runner = runner
+    if review_runtime.runtime == "codex":
+        from ..adapters.codex_runner import (
+            CodexProvider,
+            CodexRunner,
+            codex_budget_not_enforced_warning,
+            codex_cost_blindspot_warning,
+        )
+
+        review_runner = CodexRunner(
+            codex_bin=cfg.codex_runtime.binary,
+            provider=CodexProvider(
+                provider_id=cfg.codex_runtime.provider_id,
+                name=cfg.codex_runtime.provider_name,
+                base_url=cfg.codex_runtime.base_url,
+                env_key=cfg.codex_runtime.env_key,
+                wire_api=cfg.codex_runtime.wire_api,
+            ),
+            sandbox=cfg.codex_runtime.sandbox,
+            reasoning_effort=cfg.codex_runtime.reasoning_effort,
+            log=_log("review"),
+            debug=os.environ.get("ISSUE_AGENT_DEBUG", "0") not in ("", "0", "false", "False"),
+            idle_timeout=(cfg.codex_runtime.idle_timeout if cfg.codex_runtime.idle_timeout > 0 else None),
+            max_runtime=(cfg.codex_runtime.max_runtime if cfg.codex_runtime.max_runtime > 0 else None),
+            transport_retries=cfg.codex_runtime.transport_retries,
+            backoff_base=cfg.codex_runtime.backoff_base,
+            rate_limit_backoff_base=cfg.codex_runtime.rate_limit_backoff_base,
+            max_rate_limit_wait=cfg.codex_runtime.max_rate_limit_wait,
+            max_rate_limit_retries=cfg.codex_runtime.max_rate_limit_retries,
+            cost_per_mtok_in=cfg.codex_runtime.cost_per_mtok_in,
+            cost_per_mtok_out=cfg.codex_runtime.cost_per_mtok_out,
+            cost_per_mtok=cfg.codex_runtime.cost_per_mtok,
+            enforce_budget=cfg.codex_runtime.enforce_budget,
+            **({"default_model": review_runtime.model} if review_runtime.model else {}),
+        )
+        reason = review_runner.preflight()
+        if reason is not None:
+            _log("review")(f"codex: NOT READY at startup — {reason}")
+        else:
+            _log("review")("codex: runtime ready (bin + key present)")
+        blindspot = codex_cost_blindspot_warning(
+            cost_per_mtok_in=cfg.codex_runtime.cost_per_mtok_in,
+            cost_per_mtok_out=cfg.codex_runtime.cost_per_mtok_out,
+            issue_spend_cap_usd=cfg.issue_spend_cap_usd,
+            daily_spend_cap_usd=cfg.daily_spend_cap_usd,
+            max_runtime=cfg.codex_runtime.max_runtime,
+            runtime_name="REVIEWER_RUNTIME",
+        )
+        if blindspot is not None:
+            _log("review")(blindspot)
+        budget_notice = codex_budget_not_enforced_warning(
+            fix_budget_usd=review_runtime.budget_usd,
+            max_runtime=cfg.codex_runtime.max_runtime,
+            enforced=cfg.codex_runtime.enforce_budget,
+            priced=cfg.codex_runtime.budget_priceable,
+            budget_name="REVIEW_BUDGET_USD",
+            runtime_name="REVIEWER_RUNTIME",
+        )
+        if budget_notice is not None:
+            _log("review")(budget_notice)
+
     # Reviewer has no worktree/issue side; pass a no-op Worktrees-like None usage.
     executor = Executor(
         gateway,
@@ -892,7 +954,7 @@ def build_review_daemon(
     )
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, None,
-        JournalingRuntime(runner, journal, ledger, cfg.repo, "review"),
+        JournalingRuntime(review_runner, journal, ledger, cfg.repo, "review"),
         executor, journal=journal,
     )
     executor._run_agent = lambda a: asyncio.run(dispatcher.dispatch(a))  # noqa: SLF001

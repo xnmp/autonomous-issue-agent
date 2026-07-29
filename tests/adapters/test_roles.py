@@ -1547,8 +1547,40 @@ def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
 
     runtime = daemon.executor._run_agent.__closure__[0].cell_contents.runner.inner
     assert isinstance(runtime, CapturingCodexRunner)
-    assert runtime.default_model == "gpt-5.6-terra"
+    assert seen["default_model"] == "gpt-5.6-terra"
     assert seen["enforce_budget"] is True
+
+
+def test_codex_reviewer_names_its_unpriced_budget_warning(tmp_path, monkeypatch, capsys):
+    """A review deployment must not inherit a fixer-only warning that sends the
+    operator to the wrong knob while REVIEW_BUDGET_USD is unmeasurable."""
+    from issue_agent.adapters import codex_runner
+    from issue_agent.app.config import from_env
+    from issue_agent.app.roles import build_review_daemon
+
+    class CapturingCodexRunner:
+        def __init__(self, **_kwargs):
+            pass
+
+        def preflight(self):
+            return None
+
+    monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
+    cfg = from_env({
+        "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEWER_RUNTIME": "codex",
+        "REVIEW_STATE_DIR": str(tmp_path / "review-state"),
+        "REVIEW_BUDGET_USD": "2.5", "CODEX_COST_PER_MTOK_IN": "0",
+        "CODEX_COST_PER_MTOK_OUT": "0",
+    })
+
+    build_review_daemon(
+        cfg, _BuildableGateway(), Store(str(tmp_path / "review-state")),
+        FakeRunner(AgentResult(is_error=False)),
+    )
+
+    err = capsys.readouterr().err
+    assert "REVIEW_BUDGET_USD=$2.50 is NOT ENFORCED" in err
+    assert "REVIEWER_RUNTIME=codex" in err
 
 
 def test_the_warning_still_fires_with_the_price_table_zeroed(tmp_path, capsys):

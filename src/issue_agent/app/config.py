@@ -270,7 +270,9 @@ class HarnessConfig:
     # failed resolve retry, a second-and-later review round. Off pins every leg
     # to the router's verdict no matter what has happened before.
     escalate_on_evidence: bool = True
-    review_model: str | None = None
+    # Codex is the default reviewer runtime, so pin its deployable default here
+    # instead of leaving the task un-attributed to the Codex CLI default.
+    review_model: str | None = "gpt-5.6-terra"
     steward_triage_model: str | None = "sonnet"
     fix_budget_usd: float = 10.0
     review_budget_usd: float = 8.0
@@ -339,8 +341,7 @@ class HarnessConfig:
     # Fixer runtime: "claude" (default, Claude Agent SDK), "codex" (OpenAI Codex
     # CLI, e.g. GPT-5.5), or "glm" (GLM via Z.ai's Anthropic-compatible endpoint —
     # the SAME Claude SDK runner with the profile's env injected). Only the FIXER
-    # leg switches; reviewer/steward stay Claude (a distinct model decorrelates
-    # blind spots). See docs/CODEX-RUNNER.md.
+    # leg switches. See docs/reference/codex-runner.md.
     fixer_runtime: str = "claude"
     # Reviewer runtime: Codex is the deployment default; set "claude" explicitly
     # for the recommended mixed-runtime posture that preserves independent
@@ -661,6 +662,8 @@ class HarnessConfig:
             # on Anthropic credentials instead. Existence of the file is a
             # build-time check (roles); emptiness is a config error.
             errors.append("GLM_SETTINGS_FILE is required when FIXER_RUNTIME=glm")
+        if self.reviewer_runtime not in ("claude", "codex"):
+            errors.append("REVIEWER_RUNTIME must be 'claude' or 'codex'")
         _require_non_negative(errors, "AGENT_IDLE_TIMEOUT_SECONDS", self.agent_idle_timeout)
         _require_non_negative(errors, "AGENT_MAX_RUNTIME_SECONDS", self.agent_max_runtime)
         _require_non_negative(errors, "SDK_MAX_BUFFER_BYTES", self.sdk_max_buffer_bytes)
@@ -747,8 +750,8 @@ class HarnessConfig:
             f"fix_effort={getattr(self.fix_effort, 'value', None) or '(runtime default)'} "
             f"escalate={'on' if self.escalate_on_evidence else 'off'} "
             f"{fix_budget}",
-            f"review_model={model(self.review_model)} mode={self.review_mode.value} "
-            f"review_budget=${self.review_budget_usd:.2f} "
+            f"reviewer={self.reviewer_runtime} review_model={model(self.review_model)} "
+            f"mode={self.review_mode.value} review_budget=${self.review_budget_usd:.2f} "
             f"rejections_cap={self.max_review_rejections}",
             f"retry_caps: resolve={self.max_resolve_retries} ci={self.max_ci_retries} "
             f"review={self.max_review_retries} rebase={self.max_rebase_retries} "
