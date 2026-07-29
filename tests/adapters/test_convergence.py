@@ -1,5 +1,5 @@
-"""Loop-convergence property for the pure fix decision (T3), driven end-to-end
-through the REAL orchestration layer (review D13).
+"""Loop-convergence property for fix orchestration (T3), driven end-to-end
+through the REAL application and adapter layers (review D13).
 
 `decide_fix` is edge-triggered: it dispatches a PAID agent session when the world
 looks a certain way, and the ONLY thing that stops it re-dispatching on the next

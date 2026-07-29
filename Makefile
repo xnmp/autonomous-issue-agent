@@ -57,12 +57,11 @@ test-domain:
 	@echo "== domain (pytest, pure) =="
 	@uv run --quiet --with pytest pytest tests/domain/
 
-# Phase 2 adapters. The governor test exercises the reused tree-sitter bypass
-# core, so pull in those deps; the SDK itself is NOT needed (mapping is pure /
-# duck-typed), keeping this fast and offline.
+# Phase 2 adapters exercise real application wiring and the reused tree-sitter
+# bypass core, so declare the SDK and parser dependencies at this tier.
 test-adapters:
 	@echo "== adapters (pytest: AgentRunner mapping + in-process governor) =="
-	@uv run --quiet --with pytest --with tree-sitter --with tree-sitter-bash pytest tests/adapters/
+	@uv run --quiet --extra sdk --with pytest pytest tests/adapters/
 
 # Gate parity (review M6). The harness has TWO gate implementations — the bash
 # checkers (live for codex) and domain/gate.py + adapters/governor.py (live for
