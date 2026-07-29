@@ -47,6 +47,12 @@ DEFAULT_SANDBOX = "danger-full-access"
 # repo with CODEX_REASONING_EFFORT ("" = leave codex's own default alone).
 DEFAULT_REASONING_EFFORT = "medium"
 
+# Codex normally writes short progress records, but agent-controlled tool output
+# can make one stderr record arbitrarily large. Let ordinary multi-MiB records
+# through, while retaining only a bounded diagnostic if a producer goes larger.
+_STDERR_STREAM_LIMIT = 4 * 1024 * 1024
+_STDERR_RETAINED_LINE_BYTES = 16 * 1024
+
 
 @dataclass(frozen=True)
 class CodexProvider:
@@ -1237,6 +1243,7 @@ class CodexRunner(AgentRuntime):
             # that inherited the stdout pipe → _read_stdout()/proc.wait() never
             # returned → the daemon wedged (observed on Myapp #310, tsc-hung e2e).
             start_new_session=True,
+            limit=_STDERR_STREAM_LIMIT,
         )
 
         # Stream stderr LIVE rather than buffering to exit: codex exec emits its
@@ -1274,6 +1281,7 @@ class CodexRunner(AgentRuntime):
         last_budget_check = self._wall_clock() if budget_armed else 0.0
         session_id = task.resume or ""
         implausible_usage_logged = False
+        stderr_pending = b""
 
         def _current_session_id(
             extra_output: str = "", *, allow_legacy_header: bool = False
@@ -1358,6 +1366,62 @@ class CodexRunner(AgentRuntime):
             )
             _kill_quietly(proc)
 
+        def _bounded_stderr_line(raw: bytes) -> str:
+            """Decode one stderr record without letting diagnostics grow forever."""
+            if len(raw) <= _STDERR_RETAINED_LINE_BYTES:
+                return raw.decode("utf-8", "replace").rstrip("\n")
+            prefix = raw[:_STDERR_RETAINED_LINE_BYTES].decode("utf-8", "replace")
+            return (
+                f"[oversized stderr line truncated: {len(raw)} bytes; retained "
+                f"{_STDERR_RETAINED_LINE_BYTES} bytes] {prefix}"
+            )
+
+        async def _read_stderr_line() -> bytes:
+            """Read one logical stderr line, draining an over-limit record safely.
+
+            Read with ``readuntil`` so an over-limit record remains buffered for
+            the bounded drain below. ``readline`` wraps the same condition in a
+            ``ValueError``, so retain that catch for stream implementations that
+            expose the wrapper instead. The next newline remains the boundary for
+            normal milestone classification.
+            """
+            nonlocal stderr_pending
+            assert proc.stderr is not None
+            prefix = stderr_pending
+            pending_newline = prefix.find(b"\n")
+            if pending_newline >= 0:
+                stderr_pending = prefix[pending_newline + 1:]
+                return prefix[:pending_newline + 1]
+            try:
+                raw = await proc.stderr.readuntil(b"\n")
+            except asyncio.IncompleteReadError as exc:
+                stderr_pending = b""
+                return prefix + exc.partial
+            except (asyncio.LimitOverrunError, ValueError):
+                retained = bytearray(prefix[:_STDERR_RETAINED_LINE_BYTES])
+                while True:
+                    chunk = await proc.stderr.read(64 * 1024)
+                    if not chunk:
+                        break
+                    newline = chunk.find(b"\n")
+                    record = chunk if newline < 0 else chunk[:newline]
+                    remaining = _STDERR_RETAINED_LINE_BYTES - len(retained)
+                    if remaining > 0:
+                        retained.extend(record[:remaining])
+                    if newline >= 0:
+                        stderr_pending = chunk[newline + 1:]
+                        break
+                return (
+                    b"[oversized stderr line truncated after stream limit] "
+                    + bytes(retained)
+                )
+            else:
+                # Keep `prefix` installed until the awaited read completes: a
+                # watchdog cancellation must not discard bytes already consumed
+                # after the previous oversized record's newline.
+                stderr_pending = b""
+                return prefix + raw
+
         async def _pump_stderr() -> None:
             nonlocal hung, wall_tripped
             assert proc.stderr is not None
@@ -1389,10 +1453,10 @@ class CodexRunner(AgentRuntime):
                     and self.max_runtime is None
                     and not budget_armed
                 ):
-                    raw = await proc.stderr.readline()
+                    raw = await _read_stderr_line()
                     if not raw:  # EOF
                         return
-                    line = raw.decode("utf-8", "replace").rstrip("\n")
+                    line = _bounded_stderr_line(raw)
                     err_chunks.append(line)
                     self._log_codex_line(line)
                     continue
@@ -1408,7 +1472,7 @@ class CodexRunner(AgentRuntime):
                 while True:
                     try:
                         raw = await asyncio.wait_for(
-                            proc.stderr.readline(), timeout=self._pump_slice()
+                            _read_stderr_line(), timeout=self._pump_slice()
                         )
                         got = True
                         break
@@ -1451,7 +1515,7 @@ class CodexRunner(AgentRuntime):
                         # chunk elapsed but still inside both windows — keep waiting
                 if not got or not raw:  # EOF
                     return
-                line = raw.decode("utf-8", "replace").rstrip("\n")
+                line = _bounded_stderr_line(raw)
                 err_chunks.append(line)
                 self._log_codex_line(line)
 
