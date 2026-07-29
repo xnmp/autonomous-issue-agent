@@ -55,3 +55,10 @@ jobs:
       # adapters + gate parity + import-linter architecture contracts.
       - name: make test
         run: make test
+
+      # Hostile-env re-run of the shell suites (#63 class). Deliberately a CI
+      # step and not part of `make test`: it doubles the bash suites' wall
+      # clock, and `make test` is the self-hosted TEST_CMD paid on every gate
+      # run — CI is the authoritative place for the expensive belt-and-braces.
+      - name: make test-deployment-env
+        run: make test-deployment-env

@@ -5,6 +5,17 @@
 # Run: bash tests/test_hooks.sh
 set -uo pipefail
 
+# Test fixtures choose their own gate controls. Never inherit a self-hosted
+# deployment's controls, which can recursively run this suite through TEST_CMD.
+for gate_knob in \
+  TEST_CMD LINT_CMD TYPECHECK_CMD EDIT_CHECK_CMD ALLOW_UNTESTED RED_MUST_FAIL \
+  VERIFY_RED_AT_COMMIT BASE_BRANCH GATE_TEST_TIMEOUT_S GATE_GH_RETRY_SLEEP \
+  GH_APP_ID GH_APP_PRIVATE_KEY GH_APP_INSTALLATION_ID TARGET_DIR AGENT_ENV; do
+  unset "$gate_knob"
+done
+# NOTE: HARNESS_GATE_DEPTH is deliberately not in the list — it is the #63
+# re-entrancy counter; unsetting it inside a gate-launched run re-arms the bomb.
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CHECKS="$ROOT/plugin/hooks/checks"
 PASS=0
@@ -48,7 +59,9 @@ assert_exit 0 "ignores non-create switch" -- bash "$CHECKS/check-branch-name.sh"
 
 echo "== check-commit.sh (prefix) =="
 assert_exit 0 "accepts green:"   -- bash "$CHECKS/check-commit.sh" commit -m "green: implement x"
-assert_exit 0 "accepts red:"     -- bash "$CHECKS/check-commit.sh" commit -m "red: failing test"
+# Pin a failing fixture command: otherwise an outer `.harness/test-cmd` (for
+# example self-hosting `make test`) is resolved by this red-phase hook test.
+assert_exit 0 "accepts red:"     -- env TEST_CMD='false' bash "$CHECKS/check-commit.sh" commit -m "red: failing test"
 assert_exit 1 "rejects bad pfx"  -- bash "$CHECKS/check-commit.sh" commit -m "wip: stuff"
 assert_exit 0 "allows -F (file)" -- bash "$CHECKS/check-commit.sh" commit -F /tmp/msg
 assert_exit 0 "handles -m=glued" -- bash "$CHECKS/check-commit.sh" commit "-mgreen: glued"
@@ -60,11 +73,36 @@ out=$(LINT_CMD='true' bash "$CHECKS/check-commit.sh" commit -m "green: x" 2>&1);
 # verify-red-at-commit: a red: commit whose tests PASS is blocked; failing tests pass.
 out=$(TEST_CMD='true'  bash "$CHECKS/check-commit.sh" commit -m "red: t" 2>&1); rc=$?
 [ "$rc" -eq 1 ] && ok "red: with passing tests blocked" || no "red: with passing tests blocked" "rc=$rc"
+# Keep this fixture self-contained even when its caller created .harness/test-cmd
+# for a real target suite (self-hosting writes `make test` there).
 out=$(TEST_CMD='false' bash "$CHECKS/check-commit.sh" commit -m "red: t" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && ok "red: with failing tests allowed" || no "red: with failing tests allowed" "rc=$rc"
 # green: is never subject to the red-check, even if tests pass.
 out=$(TEST_CMD='true'  bash "$CHECKS/check-commit.sh" commit -m "green: x" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && ok "green: not red-checked" || no "green: not red-checked" "rc=$rc"
+
+echo "== gate recursion bound (#63) =="
+# The exec wrapper refuses at depth ≥ 2 with rc 213 — the re-entrancy backstop
+# behind the env scrub. Runs the wrapper directly so the refusal is observable.
+out=$(HARNESS_GATE_DEPTH=2 bash -c ". '$CHECKS/_pr_common.sh'; prc_run_test_cmd true" 2>&1); rc=$?
+[ "$rc" -eq 213 ] && case "$out" in *"GATE RECURSION"*) ok "depth 2 exec refused (rc 213)";; *) no "depth 2 exec refused (rc 213)" "out=$out";; esac || no "depth 2 exec refused (rc 213)" "rc=$rc"
+# Depth increments through the wrapper: a child at ambient depth 0 sees 1.
+# (env -u pins ambient depth so this also holds when THIS suite itself runs
+# under a real gate at depth 1 — the self-hosted case.)
+out=$(env -u HARNESS_GATE_DEPTH bash -c ". '$CHECKS/_pr_common.sh'; prc_run_test_cmd 'test \"\$HARNESS_GATE_DEPTH\" = 1'" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "depth stamps child env" || no "depth stamps child env" "rc=$rc out=$out"
+# A refusal fails CLOSED at red-verify, with the real cause named — not as a
+# phantom "suite passed/failed" verdict the agent would chase.
+out=$(HARNESS_GATE_DEPTH=2 TEST_CMD='true' bash "$CHECKS/check-commit.sh" commit -m "red: t" 2>&1); rc=$?
+[ "$rc" -eq 1 ] && case "$out" in *"GATE RECURSION"*) ok "red-verify refusal fails closed, names recursion";; *) no "red-verify refusal fails closed, names recursion" "out=$out";; esac || no "red-verify refusal fails closed, names recursion" "rc=$rc"
+# End-to-end: a SELF-REFERENTIAL .harness/test-cmd (the marker every fixer
+# writes; content re-invokes the red-verify hook) must terminate at the bound —
+# this is the exact 2026-07-29 fork-bomb shape. 124 = timeout = still forking.
+d=$(mktemp -d); mkdir -p "$d/.harness"
+printf 'bash "%s/check-commit.sh" commit -m "red: x"\n' "$CHECKS" > "$d/.harness/test-cmd"
+( cd "$d" && env -u HARNESS_GATE_DEPTH timeout 60 bash "$CHECKS/check-commit.sh" commit -m "red: x" ) >/dev/null 2>&1; rc=$?
+rm -rf "$d"
+[ "$rc" -ne 124 ] && ok "self-referential marker terminates (rc=$rc)" || no "self-referential marker terminates" "timed out — recursion unbounded"
 # opt-out disables it.
 out=$(VERIFY_RED_AT_COMMIT=0 TEST_CMD='true' bash "$CHECKS/check-commit.sh" commit -m "red: t" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && ok "VERIFY_RED_AT_COMMIT=0 disables" || no "VERIFY_RED_AT_COMMIT=0 disables" "rc=$rc"

@@ -24,6 +24,9 @@ from __future__ import annotations
 
 import os
 import re
+import signal
+import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -92,8 +95,8 @@ class GateContext:
     # the agent must not be able to grant itself the exemption.
     allow_untested: bool = False
     exists_at_base: Callable[[str], bool] = lambda f: False
-    run_tests: Callable[[str], bool] = lambda c: True
-    revert_and_run: Callable[[tuple[str, ...]], bool] = lambda impl: False
+    run_tests: Callable[[str], bool | None] = lambda c: True
+    revert_and_run: Callable[[tuple[str, ...]], bool | None] = lambda impl: False
     red_must_fail: bool = True
     verify_red_at_commit: bool = True   # run the suite on a `red:` commit, require failure
     # ── the two rules ported from bash in wave P1-2 (review M6) ───────────────
@@ -158,21 +161,110 @@ def read_adrs(adr_dir: str) -> tuple[gate.Adr, ...]:
 _CHECK_TIMEOUT_S = 120.0
 
 
+# ── Guarded execution of TARGET-OWNED commands (TEST_CMD / LINT_CMD /
+# TYPECHECK_CMD / EDIT_CHECK_CMD) ──────────────────────────────────────────────
+#
+# Every place the harness executes a command it got from configuration or from
+# an agent-written marker MUST go through `run_target_command` (python) or its
+# bash twins (`prc_run_test_cmd` in plugin/hooks/checks/_pr_common.sh,
+# `run_target_test_cmd` in bin/point-at.sh). The 2026-07-29 self-hosting fork
+# bomb (#63) is why: such a command can — via env inheritance or a
+# `.harness/test-cmd` marker — re-enter these very gates and re-run itself
+# without bound. Three defenses, all of which live HERE so no exec site can
+# forget one:
+#
+#   1. env scrub: the child env drops every deployment knob (the target owns
+#      its own configuration);
+#   2. re-entrancy bound: the child env is stamped with HARNESS_GATE_DEPTH and
+#      executing at depth ≥ 2 is refused (None). The counter lives in the env
+#      by design — simple and observable; a command that wraps itself in
+#      `env -i` erases it, which doctor warns about (documented edge, not
+#      hidden machinery);
+#   3. containment: the child runs in its own session and a timeout kills the
+#      whole process group, not just the direct shell.
+
+# Single python source of truth (worktree.py and tests/conftest.py import it).
+# The two bash twins keep hand copies; tests/test_deployment_env_sanitization.sh
+# asserts the three lists are identical so they cannot drift silently.
+TARGET_CMD_SCRUB_KNOBS = (
+    "TEST_CMD", "LINT_CMD", "TYPECHECK_CMD", "EDIT_CHECK_CMD", "ALLOW_UNTESTED",
+    "RED_MUST_FAIL", "VERIFY_RED_AT_COMMIT", "BASE_BRANCH",
+    "GATE_TEST_TIMEOUT_S", "GATE_GH_RETRY_SLEEP", "GH_APP_ID",
+    "GH_APP_PRIVATE_KEY", "GH_APP_INSTALLATION_ID", "TARGET_DIR", "AGENT_ENV",
+)
+
+
+def gate_depth() -> int:
+    """Current re-entrancy depth from the HARNESS_GATE_DEPTH env counter.
+
+    Garbled values read as 0 — fail toward running once, never toward
+    disabling the gate."""
+    raw = os.environ.get("HARNESS_GATE_DEPTH", "0")
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def run_target_command(
+    cmd: str, cwd: str, timeout: float, capture: bool = False
+) -> tuple[int | None, str]:
+    """Execute a target-owned command under the three #63 defenses.
+
+    Returns (exit_code, output). exit_code is None ⇔ the run was REFUSED
+    because it would re-enter the gate — callers must fail CLOSED on None and
+    say why (a refusal is not a red suite; conflating them sends the agent
+    chasing phantom test failures). A timeout kills the process group and
+    reports 124. `output` is "" unless capture=True. Never raises."""
+    depth = gate_depth()
+    if depth >= 2:
+        print(
+            f"[gate] GATE RECURSION: refusing to run a target command at gate "
+            f"depth {depth} — it re-entered the harness gate (self-referential "
+            f"TEST_CMD/.harness/test-cmd, see #63): {cmd}",
+            file=sys.stderr,
+        )
+        return None, ""
+    env = {k: v for k, v in os.environ.items() if k not in TARGET_CMD_SCRUB_KNOBS}
+    env["HARNESS_GATE_DEPTH"] = str(depth + 1)
+    pipe = subprocess.PIPE if capture else None
+    try:
+        proc = subprocess.Popen(
+            ["bash", "-c", cmd], cwd=cwd or None, env=env, start_new_session=True,
+            stdout=pipe, stderr=pipe, text=capture or None,
+        )
+    except OSError as e:
+        return 127, str(e) if capture else ""
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return proc.returncode, ((out or "") + (err or "")) if capture else ""
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            proc.communicate(timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        print(
+            f"[gate] target command timed out after {timeout:g}s; its process "
+            f"group was killed (reported as FAILING, not a pass): {cmd}",
+            file=sys.stderr,
+        )
+        return 124, ""
+
+
 def _run_project_check(cmd: str, cwd: str) -> bool:
     """Run a project lint/typecheck command in `cwd` → did it pass?
 
-    A timeout or a spawn failure reports FALSE (did not pass), matching the
-    bash's `eval "$LINT_CMD" || fail`: a check that cannot complete has not
-    passed. Never raises — `evaluate_command` runs under a broad fail-OPEN
-    except, so an escaping exception would silently ALLOW the commit."""
-    import subprocess
-
-    try:
-        return subprocess.run(
-            cmd, shell=True, cwd=cwd or None, timeout=_CHECK_TIMEOUT_S
-        ).returncode == 0
-    except (OSError, subprocess.SubprocessError):
-        return False
+    A timeout, spawn failure, or gate-recursion refusal reports FALSE (did not
+    pass), matching the bash's `eval "$LINT_CMD" || fail`: a check that cannot
+    complete has not passed. Never raises — `evaluate_command` runs under a
+    broad fail-OPEN except, so an escaping exception would silently ALLOW the
+    commit."""
+    rc, _ = run_target_command(cmd, cwd, _CHECK_TIMEOUT_S)
+    return rc == 0
 
 
 def complete_gate_context(
@@ -502,16 +594,14 @@ def _deny(reason: str) -> dict:
 
 def _run_edit_check(command: str, cwd: str) -> tuple[bool, str]:
     """Run the edit-time check command in `cwd`. Returns (ok, combined_output).
-    Default runner (subprocess); injectable in tests. Never raises — a spawn
-    failure is reported as ok=True (fail-open) by the caller."""
-    import subprocess
-
-    proc = subprocess.run(
-        command, shell=True, cwd=cwd or None,
-        capture_output=True, text=True, timeout=120,
-    )
-    out = (proc.stdout or "") + (proc.stderr or "")
-    return proc.returncode == 0, out
+    Default runner; injectable in tests. Goes through `run_target_command` so
+    EDIT_CHECK_CMD gets the same #63 defenses as TEST_CMD (it is just as
+    target-owned and just as able to re-enter the gate). A recursion refusal
+    reports ok=False with the reason in the output."""
+    rc, out = run_target_command(command, cwd, 120, capture=True)
+    if rc is None:
+        return False, "GATE RECURSION: EDIT_CHECK_CMD re-entered the harness gate (see #63); refused."
+    return rc == 0, out
 
 
 def make_posttooluse_hook(

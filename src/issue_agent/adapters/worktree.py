@@ -24,7 +24,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from ..domain.gate import OpenPrLookup, resolve_test_cmd
-from .governor import GateContext
+from .governor import GateContext, run_target_command
 from .store import HarnessMarkers
 
 
@@ -50,6 +50,10 @@ GitRunner = Callable[[list[str], str], GitResult]  # (args, cwd) -> result
 # a few seconds) yet bounds a pathological one (a stale `index.lock`, a dead
 # proxy holding a fetch open — see CLAUDE.md's proxy note).
 _GIT_TIMEOUT_S = 60.0
+
+# All target-command execution defenses (env scrub, HARNESS_GATE_DEPTH
+# re-entrancy bound, process-group containment — the #63 fork-bomb class) live
+# in governor.run_target_command; this module only wires it into the gate.
 
 
 def _subprocess_git(args: list[str], cwd: str) -> GitResult:
@@ -405,40 +409,32 @@ def build_gate_context(
             return False
         return git(["cat-file", "-e", f"{baseref}:{path}"], cwd).code == 0
 
-    def _default_run_tests(cmd: str) -> bool:
-        """Real shell eval of the test command, bounded by GATE_TEST_TIMEOUT_S
-        (default 600s). A hang must resolve to 'did not pass' (False), never
-        propagate — `evaluate_command` (which calls this via GateContext) runs
-        inside governor.py's make_pretooluse_hook under a broad fail-OPEN
-        except; an uncaught TimeoutExpired there would silently ALLOW the very
-        command the gate exists to block. subprocess.run's own TimeoutExpired
-        handling already kills the direct child (the `sh -c` process spawned by
-        shell=True) before raising, so no explicit process-group cleanup is
-        needed for the common case — a command that further backgrounds its
-        own grandchildren can still outlive us, a pre-existing footgun of
-        shell=True this doesn't newly introduce."""
-        timeout = _test_timeout_s()
-        try:
-            return subprocess.run(cmd, shell=True, cwd=cwd, timeout=timeout).returncode == 0
-        except subprocess.TimeoutExpired:
-            print(
-                f"[gate] TEST_CMD timed out after {timeout:g}s and was killed "
-                f"(reported as a FAILING run, not a pass): {cmd}",
-                file=sys.stderr,
-            )
-            return False
+    def _default_run_tests(cmd: str) -> bool | None:
+        """Run the test command via `governor.run_target_command` (env scrub +
+        re-entrancy bound + process-group kill on timeout — the #63 defenses).
+
+        Tri-state: True = passed, False = failed (incl. timeout), None = the
+        run was REFUSED because it would re-enter the gate. None must flow to
+        the domain unchanged — the rules fail CLOSED on it with a recursion
+        message, which is a different verdict than 'your tests are red'. A
+        hang still resolves to False here, never an exception —
+        `evaluate_command` runs under a broad fail-OPEN except and an escaping
+        TimeoutExpired would silently ALLOW the gated command."""
+        rc, _ = run_target_command(cmd, cwd, _test_timeout_s())
+        if rc is None:
+            return None
+        return rc == 0
 
     rt = run_tests or _default_run_tests
 
-    def revert_and_run(impl_files: tuple[str, ...]) -> bool:
+    def revert_and_run(impl_files: tuple[str, ...]) -> bool | None:
         """§10: drop new impl / revert modified impl to base, run the test cmd,
         restore HEAD. Returns whether the suite PASSED with impl reverted (True
-        ⇒ tautological). Fail-open (return False ⇒ 'genuine red') on any git
-        error, matching prc_check_red_fails. A timed-out run (see
-        `_default_run_tests`) also surfaces as this same False/'did not pass'
-        signal — indistinguishable here from a real fail, which is the
-        existing fail-open contract for §10, not something introduced by the
-        timeout."""
+        ⇒ tautological); None if the run was REFUSED (gate re-entry, #63) —
+        the domain fails CLOSED on None. Fail-open (return False ⇒ 'genuine
+        red') on any git error, matching prc_check_red_fails. A timed-out run
+        (see `_default_run_tests`) also surfaces as this same False/'did not
+        pass' signal — the existing fail-open contract for §10."""
         if not baseref:
             return False
         # Same precedence as every other gate rule — operator TEST_CMD first

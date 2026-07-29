@@ -108,6 +108,42 @@ prc_resolve_base_ref() {
 # check_tests/check_red_fails).
 prc_allow_untested() { [ "${ALLOW_UNTESTED:-0}" = 1 ]; }
 
+# ── Guarded execution of TARGET-OWNED commands ────────────────────────────────
+# The command is configured by the harness (or written by the agent via
+# .harness/test-cmd), but is owned by the target. Every eval of such a command
+# MUST go through prc_run_test_cmd — the bash twin of
+# adapters/governor.py:run_target_command. Two defenses (#63 fork bomb):
+#   1. env scrub — deployment knobs must not flow into the target's tests;
+#   2. re-entrancy bound — HARNESS_GATE_DEPTH is stamped into every child and
+#      executing at depth ≥ 2 is refused with rc 213. Call sites treat 213 as
+#      "configuration defect, fail CLOSED" — a different verdict than a red
+#      suite. Legitimate nesting never executes at depth ≥ 2 (0 = a real
+#      gate/probe run, 1 = a suite fixture's own eval).
+# HARNESS_GATE_DEPTH is deliberately NOT in the -u list and NOT unset by the
+# test-suite sanitizers: clearing it re-arms the bomb. The counter lives in the
+# env, so a TEST_CMD/marker that wraps itself in `env -i`/`env -u
+# HARNESS_GATE_DEPTH` erases it — doctor warns about such configs; that
+# documented edge is the price of keeping this mechanism simple.
+
+PRC_GATE_RECURSION_RC=213
+
+prc_run_test_cmd() {  # prc_run_test_cmd "<resolved command>" → rc, 213 = refused
+  local _depth="${HARNESS_GATE_DEPTH:-0}"
+  case "$_depth" in ''|*[!0-9]*) _depth=0 ;; esac
+  if [ "$_depth" -ge 2 ]; then
+    echo "GATE RECURSION: refusing to run a test command at gate depth $_depth — the resolved command re-entered the harness gate (self-referential TEST_CMD/.harness/test-cmd, see #63): $1" >&2
+    return "$PRC_GATE_RECURSION_RC"
+  fi
+  env \
+    -u TEST_CMD -u LINT_CMD -u TYPECHECK_CMD -u EDIT_CHECK_CMD -u ALLOW_UNTESTED \
+    -u RED_MUST_FAIL -u VERIFY_RED_AT_COMMIT -u BASE_BRANCH \
+    -u GATE_TEST_TIMEOUT_S -u GATE_GH_RETRY_SLEEP \
+    -u GH_APP_ID -u GH_APP_PRIVATE_KEY -u GH_APP_INSTALLATION_ID \
+    -u TARGET_DIR -u AGENT_ENV \
+    HARNESS_GATE_DEPTH="$((_depth + 1))" \
+    bash -c "$1"
+}
+
 # §1 — local test suite must pass (CI re-runs authoritatively, when present).
 #
 # With no test command this check AND the red-fail check (§10) have no teeth, so
@@ -118,9 +154,13 @@ prc_allow_untested() { [ "${ALLOW_UNTESTED:-0}" = 1 ]; }
 # make the operator opt out deliberately with ALLOW_UNTESTED=1 (then we keep the
 # old warn-and-pass, because a genuinely test-less repo does exist).
 prc_check_tests() {
-  local tcmd; tcmd="$(prc_resolve_test_cmd)"
+  local tcmd _trc; tcmd="$(prc_resolve_test_cmd)"
   if [ -n "$tcmd" ]; then
-    eval "$tcmd" || fail "local test suite failed: $tcmd"
+    prc_run_test_cmd "$tcmd"; _trc=$?
+    if [ "$_trc" -eq "$PRC_GATE_RECURSION_RC" ]; then
+      fail "GATE RECURSION: the test command re-entered the harness gate and was refused (self-referential TEST_CMD/.harness/test-cmd — see #63); this is a test-command configuration defect, NOT a failing suite: $tcmd"
+    fi
+    [ "$_trc" -eq 0 ] || fail "local test suite failed: $tcmd"
   elif prc_allow_untested; then
     echo "GATE WARNING: no test command (neither .harness/test-cmd nor TEST_CMD) — the test gate AND the red-fail (anti-tautological-test) check are DISABLED by ALLOW_UNTESTED=1. A test that passes without the change will not be caught." >&2
   else
@@ -261,13 +301,19 @@ prc_check_red_fails() {  # prc_check_red_fails "<changed-file-list>"
   done
 
   # With the implementation absent, the suite MUST be red. Run the SAME command
-  # §1 ran (agent-declared .harness/test-cmd, else $TEST_CMD).
-  local passed=0
-  eval "$tcmd" >/dev/null 2>&1 && passed=1
+  # §1 ran (agent-declared .harness/test-cmd, else $TEST_CMD). A recursion
+  # refusal (213) is neither red nor green — restore and fail CLOSED.
+  local passed=0 _rrc=0
+  prc_run_test_cmd "$tcmd" >/dev/null 2>&1; _rrc=$?
+  [ "$_rrc" -eq 0 ] && passed=1
 
   # Restore now (don't wait for EXIT) so a fail message reflects a clean tree.
   git checkout -q HEAD -- "${impl_all[@]}" 2>/dev/null || true
   trap - EXIT
+
+  if [ "$_rrc" -eq "$PRC_GATE_RECURSION_RC" ]; then
+    fail "GATE RECURSION: the test command re-entered the harness gate and was refused (see #63) — the red-fail check cannot run. Fix the test-command configuration (self-referential TEST_CMD/.harness/test-cmd)."
+  fi
 
   [ "$passed" = 0 ] || fail "the new test(s) still PASS with the implementation reverted — they do not exercise the change (tautological or wrong-layer test). Assert on the observable behaviour the change produces, not on a constant that is always true. New test file(s): ${new_tests[*]}"
   return 0

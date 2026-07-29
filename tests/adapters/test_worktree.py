@@ -2,6 +2,7 @@
 
 import os
 import subprocess
+import time
 
 import pytest
 
@@ -288,6 +289,69 @@ def test_default_run_tests_passes_fast_command_unaffected(tmp_path, monkeypatch)
 
     assert ctx.run_tests("true") is True
     assert ctx.run_tests("false") is False
+
+
+def test_default_run_tests_scrubs_harness_knobs_from_child_environment(tmp_path, monkeypatch):
+    """A target test command must not inherit harness deployment controls.
+
+    In particular, self-hosting with TEST_CMD='make test' must not make a hook
+    invoked by that command resolve and run the outer command again.
+    """
+    for name in (
+        "TEST_CMD", "LINT_CMD", "TYPECHECK_CMD", "ALLOW_UNTESTED",
+        "RED_MUST_FAIL", "VERIFY_RED_AT_COMMIT", "BASE_BRANCH",
+        "GATE_TEST_TIMEOUT_S", "GATE_GH_RETRY_SLEEP", "GH_APP_ID",
+        "GH_APP_PRIVATE_KEY", "GH_APP_INSTALLATION_ID", "TARGET_DIR",
+        "AGENT_ENV",
+    ):
+        monkeypatch.setenv(name, "outer-value")
+    monkeypatch.setenv("TARGET_TEST_SENTINEL", "retained")
+    ctx = build_gate_context(str(tmp_path), base_branch="dev", git=_builder_git())
+
+    assert ctx.run_tests(
+        "test \"$TARGET_TEST_SENTINEL\" = retained && "
+        "test -z \"${TEST_CMD:-}\" && test -z \"${GH_APP_ID:-}\" && "
+        "test -z \"${TARGET_DIR:-}\" && test -z \"${AGENT_ENV:-}\""
+    ) is True
+
+
+def test_default_run_tests_increments_gate_depth_in_child(tmp_path, monkeypatch):
+    """Each gate execution stamps depth+1 into the child env — the re-entrancy
+    counter the whole #63 fork-bomb defense hangs off."""
+    monkeypatch.delenv("HARNESS_GATE_DEPTH", raising=False)
+    ctx = build_gate_context(str(tmp_path), base_branch="dev", git=_builder_git())
+    assert ctx.run_tests('test "$HARNESS_GATE_DEPTH" = 1') is True
+
+
+def test_default_run_tests_refuses_gate_depth_two(tmp_path, monkeypatch):
+    """Executing at depth ≥ 2 IS the recursion — must refuse (None, the
+    tri-state 'could not run' verdict the domain fails CLOSED on), fast,
+    without running the command at all."""
+    monkeypatch.setenv("HARNESS_GATE_DEPTH", "2")
+    marker = tmp_path / "ran"
+    ctx = build_gate_context(str(tmp_path), base_branch="dev", git=_builder_git())
+    assert ctx.run_tests(f"touch {marker}") is None
+    assert not marker.exists()
+
+
+def test_default_run_tests_garbled_depth_reads_as_zero(tmp_path, monkeypatch):
+    """A garbled depth must fail toward running once (depth 0), never toward
+    refusing every gate run."""
+    monkeypatch.setenv("HARNESS_GATE_DEPTH", "not-a-number")
+    ctx = build_gate_context(str(tmp_path), base_branch="dev", git=_builder_git())
+    assert ctx.run_tests('test "$HARNESS_GATE_DEPTH" = 1') is True
+
+
+def test_default_run_tests_timeout_kills_whole_process_group(tmp_path, monkeypatch):
+    """A timed-out TEST_CMD's backgrounded grandchildren must die with it —
+    the 2026-07-29 fork bomb survived direct-child kills via exactly such
+    orphans."""
+    monkeypatch.setenv("GATE_TEST_TIMEOUT_S", "1")
+    marker = tmp_path / "grandchild-survived"
+    ctx = build_gate_context(str(tmp_path), base_branch="dev", git=_builder_git())
+    assert ctx.run_tests(f"(sleep 2; touch {marker}) & sleep 30") is False
+    time.sleep(2.5)
+    assert not marker.exists()
 
 
 def test_default_run_tests_malformed_timeout_env_falls_back_to_default(tmp_path, monkeypatch):

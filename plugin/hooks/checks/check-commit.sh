@@ -100,11 +100,30 @@ if [ "$max_kb" != "0" ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; 
 fi
 
 # Fast gates only. Projects supply these via env (set in AGENT.md / repo CLAUDE.md).
+# All target-owned commands run through prc_run_test_cmd (env scrub + #63
+# re-entrancy bound); rc 213 = the command re-entered the gate — fail with the
+# real cause, not a fake lint failure.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+[ -f "$HERE/_pr_common.sh" ] && . "$HERE/_pr_common.sh"
+_run_fast_gate() {  # _run_fast_gate "<cmd>" "<Label>" "<VAR_NAME>"
+  local rc=0
+  if declare -f prc_run_test_cmd >/dev/null; then
+    prc_run_test_cmd "$1"; rc=$?
+  else
+    eval "$1"; rc=$?
+  fi
+  if [ "$rc" -eq "${PRC_GATE_RECURSION_RC:-213}" ]; then
+    echo "GATE RECURSION: $3 re-entered the harness gate and was refused (see #63) — fix the $3 configuration: $1"
+    exit 1
+  fi
+  [ "$rc" -eq 0 ] || { echo "$2 failed ($3): $1"; exit 1; }
+}
 if [ -n "${LINT_CMD:-}" ]; then
-  eval "$LINT_CMD" || { echo "Lint failed (LINT_CMD): $LINT_CMD"; exit 1; }
+  _run_fast_gate "$LINT_CMD" "Lint" "LINT_CMD"
 fi
 if [ -n "${TYPECHECK_CMD:-}" ]; then
-  eval "$TYPECHECK_CMD" || { echo "Typecheck failed (TYPECHECK_CMD): $TYPECHECK_CMD"; exit 1; }
+  _run_fast_gate "$TYPECHECK_CMD" "Typecheck" "TYPECHECK_CMD"
 fi
 
 # Verify-red-at-commit: a `red:` commit's tests must ACTUALLY fail (run on the
@@ -118,7 +137,14 @@ if [ "${VERIFY_RED_AT_COMMIT:-1}" != "0" ] && [ "$(commit_phase "$msg")" = "red"
   if declare -f prc_resolve_test_cmd >/dev/null; then
     _tc="$(prc_resolve_test_cmd)"
     if [ -n "$_tc" ]; then
-      if eval "$_tc" >/dev/null 2>&1; then
+      prc_run_test_cmd "$_tc" >/dev/null 2>&1; _trc=$?
+      if [ "$_trc" -eq "${PRC_GATE_RECURSION_RC:-213}" ]; then
+        echo "GATE RECURSION: the test command re-entered the harness gate and was"
+        echo "refused (see #63) — cannot verify this red: commit is actually red."
+        echo "Fix the test-command configuration (self-referential TEST_CMD/.harness/test-cmd): $_tc"
+        exit 1
+      fi
+      if [ "$_trc" -eq 0 ]; then
         echo "'red:' commit but the test suite PASSES ($_tc) — the new test is not"
         echo "actually failing. Write the FAILING test first, before any implementation."
         exit 1
