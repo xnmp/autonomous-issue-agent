@@ -187,6 +187,131 @@ def test_final_stderr_usage_crossing_cannot_escape_without_rollout(
     assert result.cost_usd == pytest.approx(28.0)
 
 
+def test_headerless_run_uses_rollout_for_inflight_budget_enforcement(
+    tmp_path, monkeypatch
+):
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    usage = {
+        "input_tokens": 5_000_000,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 100_000,
+    }
+    session_meta = {
+        "timestamp": "2099-07-29T00:00:00Z",
+        "type": "session_meta",
+        "payload": {
+            "id": SID,
+            "originator": "codex_exec",
+            "source": "exec",
+            "cwd": str(worktree),
+        },
+    }
+    token_count = {
+        "payload": {
+            "type": "token_count",
+            "info": {"last_token_usage": usage, "total_token_usage": usage},
+        }
+    }
+    _rollout_path(tmp_path).write_text(
+        json.dumps(session_meta) + "\n" + json.dumps(token_count) + "\n"
+    )
+    body = (
+        'for i in $(seq 1 40); do echo "exec step $i" >&2; sleep 0.05; done\n'
+    )
+
+    result = asyncio.run(
+        _runner(tmp_path, body).run(
+            AgentTask(prompt="x", cwd=str(worktree), max_budget_usd=20.0)
+        )
+    )
+
+    assert result.status == "error_max_budget_usd"
+    assert result.exit_reason is ExitReason.BUDGET_EXHAUSTED
+    assert result.session_id == SID
+    assert result.cost_usd == pytest.approx(28.0)
+    assert result.num_turns == 1
+
+
+def test_echoed_usage_fixture_does_not_price_or_kill_inflight_run(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "empty-codex-home"))
+    body = (
+        "echo 'Token usage: total=5,100,000 input=0 "
+        "(+ 0 cached) output=5,100,000' >&2\n"
+        'for i in $(seq 1 10); do echo "exec step $i" >&2; sleep 0.03; done\n'
+        'out=""; prev=""\n'
+        'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
+        "printf '%s' '{\"status\":\"pr_opened\",\"summary\":\"done\","
+        "\"needs\":\"\"}' > \"$out\"\n"
+    )
+
+    result = asyncio.run(
+        _runner(tmp_path, body, poll_slice=0.01).run(
+            AgentTask(prompt="x", max_budget_usd=20.0)
+        )
+    )
+
+    assert result.status == "pr_opened"
+    assert result.exit_reason is ExitReason.OK
+    assert result.cost_usd == 0.0
+
+
+def test_implausible_early_rollout_usage_is_rejected_not_budget_killed(
+    tmp_path, monkeypatch
+):
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    usage = {
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 5_100_000,
+    }
+    session_meta = {
+        "timestamp": "2099-07-29T00:00:00Z",
+        "type": "session_meta",
+        "payload": {
+            "id": SID,
+            "originator": "codex_exec",
+            "source": "exec",
+            "cwd": str(worktree),
+        },
+    }
+    token_count = {
+        "payload": {
+            "type": "token_count",
+            "info": {"last_token_usage": usage, "total_token_usage": usage},
+        }
+    }
+    _rollout_path(tmp_path).write_text(
+        json.dumps(session_meta) + "\n" + json.dumps(token_count) + "\n"
+    )
+    logs = []
+    body = (
+        'out=""; prev=""\n'
+        'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
+        'echo "exec finished" >&2\n'
+        "printf '%s' '{\"status\":\"pr_opened\",\"summary\":\"done\","
+        "\"needs\":\"\"}' > \"$out\"\n"
+    )
+
+    result = asyncio.run(
+        _runner(tmp_path, body, log=logs.append).run(
+            AgentTask(prompt="x", cwd=str(worktree), max_budget_usd=20.0)
+        )
+    )
+
+    assert result.status == "pr_opened"
+    assert result.exit_reason is ExitReason.OK
+    assert result.cost_usd == 0.0
+    assert any("IMPLAUSIBLE" in line for line in logs)
+
+
 def test_under_budget_run_completes_normally(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     _write_rollout(tmp_path, input_tokens=1_000_000, output_tokens=10_000)
