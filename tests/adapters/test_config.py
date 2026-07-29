@@ -939,6 +939,24 @@ def test_describe_says_not_enforced_when_the_price_table_is_zeroed():
     assert "prices at $0.00" in d
 
 
+@pytest.mark.parametrize(
+    ("rate_name", "rate_value"),
+    [
+        ("CODEX_COST_PER_MTOK_IN", "0"),
+        ("CODEX_COST_PER_MTOK_OUT", "0"),
+    ],
+)
+def test_describe_says_not_enforced_when_either_token_class_is_unpriced(
+    rate_name, rate_value
+):
+    d = from_env({
+        "REPO": "o/r", "FIXER_RUNTIME": "codex", "MAX_BUDGET_USD": "20",
+        "AGENT_MAX_RUNTIME_SECONDS": "3600", rate_name: rate_value,
+    }).describe()
+    assert "NOT ENFORCED on codex" in d
+    assert "both input and output prices" in d
+
+
 def test_describe_says_nothing_bounds_a_codex_run_without_a_wall_cap():
     d = from_env({
         "REPO": "o/r", "FIXER_RUNTIME": "codex", "MAX_BUDGET_USD": "20",

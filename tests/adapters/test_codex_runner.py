@@ -17,6 +17,7 @@ from issue_agent.adapters.codex_runner import (
     DEFAULT_SANDBOX,
     CodexProvider,
     CodexRunner,
+    read_rollout_turns,
     read_rollout_usage,
     usage_delta,
     _extract_retry_after_seconds,
@@ -1365,6 +1366,17 @@ def test_the_budget_warning_names_a_zeroed_price_table_as_the_reason():
     assert "every run prices at $0.00" in w
 
 
+def test_the_budget_warning_treats_half_pricing_as_unmeasurable():
+    """A dollar ceiling is only honest when both token classes are priced.
+    Input-only pricing leaves output growth unbounded, and vice versa."""
+    for priced in (False,):
+        w = codex_budget_not_enforced_warning(
+            fix_budget_usd=20.0, max_runtime=3600.0,
+            enforced=True, priced=priced,
+        )
+        assert w is not None and "NOT ENFORCED" in w
+
+
 def test_the_budget_warning_goes_silent_once_the_budget_is_really_enforced():
     """The #29 fix: with the check live AND a price table to measure against,
     MAX_BUDGET_USD is a real per-run ceiling. Warning about it then would be a
@@ -1501,6 +1513,7 @@ def test_a_run_that_crosses_the_budget_is_killed_with_budget_exhausted(
 
     assert r.exit_reason is ExitReason.BUDGET_EXHAUSTED
     assert r.status == "error_max_budget_usd"
+    assert r.envelope_subtype == "error_max_budget_usd"
     assert r.is_error is True
     assert "MAX_BUDGET_USD=$20.00" in r.summary
     # A budget abort is an ATTEMPT, not an infra death — it must march the
@@ -1526,6 +1539,8 @@ def test_the_killed_run_still_ledgers_what_it_spent(tmp_path, monkeypatch):
     assert r.cost_usd == pytest.approx(28.0)
     assert r.usage["input_tokens"] == 5_000_000
     assert r.session_id == _OVERSPENT_SID
+    assert r.num_turns == 1
+    assert read_rollout_turns(_OVERSPENT_SID) == 1
 
 
 def test_a_run_under_the_budget_is_left_alone(tmp_path, monkeypatch):
@@ -1545,6 +1560,40 @@ def test_a_run_under_the_budget_is_left_alone(tmp_path, monkeypatch):
 
     assert r.exit_reason is ExitReason.OK
     assert r.status == "pr_opened"
+
+
+def test_budget_only_watchdog_samples_during_a_silent_stderr_gap(
+    tmp_path, monkeypatch
+):
+    """With idle and wall caps disabled, budget enforcement must still keep the
+    stderr read bounded. Codex announces its session and can then spend during a
+    long generation without another trace line."""
+    import time as _time
+
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _write_rollout(
+        tmp_path, _OVERSPENT_SID, input_tokens=5_000_000, output_tokens=100_000
+    )
+    tmp = tempfile.mkdtemp()
+    body = (
+        f'echo "session id: {_OVERSPENT_SID}" >&2\n'
+        "sleep 3\n"
+    )
+    runner = CodexRunner(
+        codex_bin=_fake_codex(tmp, body),
+        env={"OPENAI_API_KEY": "k"},
+        cost_per_mtok_in=5.0,
+        cost_per_mtok_out=30.0,
+        idle_timeout=None,
+        max_runtime=None,
+        poll_slice=0.05,
+    )
+
+    start = _time.monotonic()
+    result = asyncio.run(runner.run(AgentTask(prompt="x", max_budget_usd=20.0)))
+
+    assert _time.monotonic() - start < 2
+    assert result.exit_reason is ExitReason.BUDGET_EXHAUSTED
 
 
 def test_enforcement_can_be_switched_off(tmp_path, monkeypatch):
