@@ -1286,17 +1286,16 @@ def test_blindspot_warning_fires_when_caps_are_armed_without_a_price_table():
     assert w is not None
     assert "CODEX_COST_PER_MTOK_IN/OUT" in w
     assert "$0.00" in w and "NEITHER cap can ever fire" in w
-    # D12's second sentence: codex has no per-session budget analogue, so the
-    # wall cap is the only bound on one run.
-    assert "no per-session budget" in w and "2700s" in w
+    assert "MAX_BUDGET_USD" not in w
+    assert "per-session budget" not in w
 
 
-def test_blindspot_warning_names_the_missing_wall_cap_when_it_is_unset():
+def test_blindspot_warning_only_reports_the_cost_ledger_blindspot():
     w = codex_cost_blindspot_warning(
         cost_per_mtok_in=0.0, cost_per_mtok_out=0.0,
         issue_spend_cap_usd=25.0, daily_spend_cap_usd=0.0, max_runtime=0.0,
     )
-    assert w is not None and "CODEX_MAX_RUNTIME_SECONDS is unset" in w
+    assert w is not None and "CODEX_MAX_RUNTIME_SECONDS" not in w
     assert "issue=$25.00" in w and "daily=" not in w  # only the armed cap is named
 
 
