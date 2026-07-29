@@ -551,11 +551,16 @@ def health_trend(issues, recurrence_events, *, first_class_day: str | None) -> l
 
 
 def deployment_class(snapshot: Snapshot) -> tuple[str, str, str]:
-    """The operating configuration whose first observation is expected tuition."""
+    """The operating configuration whose first observation is expected tuition.
+
+    `point-at` writes the merged shared/overlay configuration to this per-name
+    snapshot. Runtime and review mode live in the shared layer, so reading the
+    overlay alone would classify every deployment using absent or ambient values.
+    """
     return (
         snapshot.repo,
-        overlay_field(snapshot.name, "FIXER_RUNTIME"),
-        overlay_field(snapshot.name, "REVIEW_MODE"),
+        cli.read_repo_env_field(cli._active_env_path(snapshot.name), "FIXER_RUNTIME"),
+        cli.read_repo_env_field(cli._active_env_path(snapshot.name), "REVIEW_MODE"),
     )
 
 
