@@ -27,6 +27,7 @@ def test_reviewer_runtime_accepts_an_explicit_claude_diversity_posture():
     cfg = from_env({"REPO": "x", "REVIEWER_RUNTIME": "claude"})
 
     assert cfg.reviewer_runtime == "claude"
+    assert cfg.review_model == "opus"
 
 
 def test_review_mode_delegated_and_scout_override():
