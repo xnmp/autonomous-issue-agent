@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from issue_agent.app import dashboard as dash
-from issue_agent.app.dashweb import snapshots
+from issue_agent.app.dashweb import ghdata, server, snapshots
 
 NOW = datetime(2026, 7, 29, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -301,6 +301,46 @@ def test_health_trend_groups_target_issue_lifecycle_and_recurrence_by_utc_day():
 
 def test_health_trend_is_empty_without_issue_activity_or_recurrence():
     assert snapshots.health_trend([], [], first_class_day="2026-07-29") == []
+
+
+def test_overview_projects_selected_repo_lifecycle_recurrence_and_first_class_day(monkeypatch):
+    recurrence = {"ts": "2026-07-30T01:00:00Z", "event": "recurrence", "issue": 7}
+    deployment = build([recurrence])
+    snapshot = snapshots.Snapshot("demo", "o/r", "/target", deployment, (NOW,))
+
+    class Gh:
+        def issues(self, repo):
+            assert repo == "o/r"
+            return ([{"createdAt": "2026-07-29T01:00:00Z", "closedAt": "2026-07-30T02:00:00Z"}], "")
+
+    backend = server.Backend(gh=Gh())
+    monkeypatch.setattr(backend, "snapshot", lambda _name: snapshot)
+    monkeypatch.setattr(backend, "names", lambda: ("demo",))
+    monkeypatch.setattr(snapshots, "scan_proc_daemons", lambda: ({}, True))
+    monkeypatch.setattr(snapshots, "deployment_class", lambda _snapshot: ("o/r", "codex", "single"))
+
+    assert backend.overview("demo")["health_trend"] == [
+        {"day": "2026-07-29", "opened": 1, "closed": 0, "net_open": 1,
+         "recurrences": 0, "first_of_class": True},
+        {"day": "2026-07-30", "opened": 0, "closed": 1, "net_open": -1,
+         "recurrences": 1, "first_of_class": False},
+    ]
+
+
+def test_overview_warns_when_the_github_history_limit_is_reached(monkeypatch):
+    snapshot = snapshots.Snapshot("demo", "o/r", "/target", build([]), ())
+
+    class Gh:
+        def issues(self, _repo):
+            return ([{}] * ghdata.ISSUE_HISTORY_LIMIT, "")
+
+    backend = server.Backend(gh=Gh())
+    monkeypatch.setattr(backend, "snapshot", lambda _name: snapshot)
+    monkeypatch.setattr(backend, "names", lambda: ("demo",))
+    monkeypatch.setattr(snapshots, "scan_proc_daemons", lambda: ({}, True))
+    monkeypatch.setattr(snapshots, "deployment_class", lambda _snapshot: ("o/r", "codex", "single"))
+
+    assert "may be incomplete" in backend.overview("demo")["warnings"][-1]
 
 
 def test_cost_mix_splits_spend_into_the_four_leg_families():
