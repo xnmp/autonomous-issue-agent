@@ -66,6 +66,7 @@ class DispatchConfig:
     # verdicts on a PR (the rejection ceiling), distinguishing them from any human
     # or other-bot reviews.
     review_bot: str = ""
+    reviewer_runtime: str = "claude"
     fix_mcp_config: str = ""
     harness_root: str = ""
     # PR label removed when a review escalates to needs-human-review. Matches the
@@ -130,6 +131,7 @@ class DispatchConfig:
             review_mode=self.review_mode,
             max_review_rejections=self.max_review_rejections,
             review_bot=self.review_bot,
+            reviewer_runtime=self.reviewer_runtime,
             review_trigger_label=self.review_trigger_label,
             log=self.log,
         )

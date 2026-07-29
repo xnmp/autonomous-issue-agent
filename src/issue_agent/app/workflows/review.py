@@ -20,6 +20,7 @@ from ...domain.lifecycle import pr_escalation
 from ...domain.outcome import AgentResult
 
 _EXTERNAL_REVIEW_SESSION = "github-review"
+_FRESH_REVIEW_SESSION = "codex-review"
 
 
 @dataclass(frozen=True)
@@ -30,6 +31,7 @@ class ReviewWorkflowConfig:
     review_bot: str
     review_trigger_label: str
     log: Callable[[str], None]
+    reviewer_runtime: str = "claude"
     journal: object | None = None
 
 
@@ -155,7 +157,10 @@ class ReviewWorkflow:
         if not self._submit_review(pr, result, 1, prior):
             self._no_progress(p, "review POST failed")
             return
-        self.store.save_pr_session(pr, result.session_id)
+        self.store.save_pr_session(
+            pr,
+            _FRESH_REVIEW_SESSION if self.cfg.reviewer_runtime == "codex" else result.session_id,
+        )
         self.store.set_last_sha(pr, p.head_ref_oid)
         self._record_patch(pr, signature)
         self.store.set_round(pr, 1)
@@ -191,7 +196,7 @@ class ReviewWorkflow:
             )
         else:
             session_id = self.store.get_pr_session(pr)
-            if session_id == _EXTERNAL_REVIEW_SESSION:
+            if session_id in (_EXTERNAL_REVIEW_SESSION, _FRESH_REVIEW_SESSION):
                 prior = review_dom.latest_reviewer_verdict(p, self.cfg.review_bot)
                 task = task_builders.build_fresh_re_review_task(
                     pr, round_number, p.title, p.body, last_sha, p.head_ref_oid,
@@ -220,7 +225,10 @@ class ReviewWorkflow:
             self._no_progress(p, "review POST failed")
             return
         if result.session_id:
-            self.store.save_pr_session(pr, result.session_id)
+            self.store.save_pr_session(
+                pr,
+                _FRESH_REVIEW_SESSION if self.cfg.reviewer_runtime == "codex" else result.session_id,
+            )
         self.store.set_last_sha(pr, p.head_ref_oid)
         self._record_patch(pr, signature)
         self.store.set_round(pr, round_number)

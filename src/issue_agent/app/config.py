@@ -664,6 +664,11 @@ class HarnessConfig:
             errors.append("GLM_SETTINGS_FILE is required when FIXER_RUNTIME=glm")
         if self.reviewer_runtime not in ("claude", "codex"):
             errors.append("REVIEWER_RUNTIME must be 'claude' or 'codex'")
+        elif self.reviewer_runtime == "codex" and self.review_mode is not ReviewMode.SINGLE:
+            errors.append(
+                "REVIEWER_RUNTIME=codex supports REVIEW_MODE=single only; "
+                "multi/delegated rely on Claude subagents and model aliases"
+            )
         _require_non_negative(errors, "AGENT_IDLE_TIMEOUT_SECONDS", self.agent_idle_timeout)
         _require_non_negative(errors, "AGENT_MAX_RUNTIME_SECONDS", self.agent_max_runtime)
         _require_non_negative(errors, "SDK_MAX_BUFFER_BYTES", self.sdk_max_buffer_bytes)

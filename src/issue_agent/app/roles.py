@@ -194,6 +194,54 @@ def _spend_gate(cfg: HarnessConfig, ledger: str):
     )
 
 
+def _build_codex_runner(
+    cfg: HarnessConfig,
+    *,
+    default_model: str | None,
+    sandbox: str,
+    inject_system_prompt: bool,
+    log,
+):
+    """Build either role's Codex adapter from the single runtime config.
+
+    Fix and review deliberately differ only in their capability boundary: fixes
+    need the git-capable sandbox plus a worktree-installed governor, while a
+    review is read-only. Keeping every transport, rollout-pricing, and budget
+    option here prevents a new Codex accounting control reaching one paid role
+    while silently skipping the other.
+    """
+    from ..adapters.codex_runner import CodexProvider, CodexRunner
+
+    runtime = cfg.codex_runtime
+    return CodexRunner(
+        codex_bin=runtime.binary,
+        provider=CodexProvider(
+            provider_id=runtime.provider_id,
+            name=runtime.provider_name,
+            base_url=runtime.base_url,
+            env_key=runtime.env_key,
+            wire_api=runtime.wire_api,
+        ),
+        sandbox=sandbox,
+        reasoning_effort=runtime.reasoning_effort,
+        inject_system_prompt=inject_system_prompt,
+        log=log,
+        debug=os.environ.get("ISSUE_AGENT_DEBUG", "0") not in ("", "0", "false", "False"),
+        idle_timeout=(runtime.idle_timeout if runtime.idle_timeout > 0 else None),
+        max_runtime=(runtime.max_runtime if runtime.max_runtime > 0 else None),
+        transport_retries=runtime.transport_retries,
+        backoff_base=runtime.backoff_base,
+        rate_limit_backoff_base=runtime.rate_limit_backoff_base,
+        max_rate_limit_wait=runtime.max_rate_limit_wait,
+        max_rate_limit_retries=runtime.max_rate_limit_retries,
+        cost_per_mtok_in=runtime.cost_per_mtok_in,
+        cost_per_mtok_out=runtime.cost_per_mtok_out,
+        cost_per_mtok=runtime.cost_per_mtok,
+        enforce_budget=runtime.enforce_budget,
+        **({"default_model": default_model} if default_model else {}),
+    )
+
+
 def _process_deaths(store: Store) -> dict[int, int]:
     """Paid runs this role's journal shows starting and never settling, keyed
     the way the `infra-deaths` counter is (review P0R-4).
@@ -647,45 +695,18 @@ def build_fix_daemon(
     prepare_cwd = None
     if cfg.fixer_runtime == "codex":
         from ..adapters.codex_runner import (
-            CodexRunner,
-            CodexProvider,
             codex_budget_not_enforced_warning,
             codex_cost_blindspot_warning,
         )
         from ..adapters.codex_hook import write_hook_config
 
-        fix_runner = CodexRunner(
-            codex_bin=codex_runtime.binary,
-            provider=CodexProvider(
-                provider_id=codex_runtime.provider_id,
-                name=codex_runtime.provider_name,
-                base_url=codex_runtime.base_url,
-                env_key=codex_runtime.env_key,
-                wire_api=codex_runtime.wire_api,
-            ),
+        fix_runner = _build_codex_runner(
+            cfg,
+            default_model=codex_runtime.model or None,
             sandbox=codex_runtime.sandbox,
-            reasoning_effort=codex_runtime.reasoning_effort,
-            # AGENT.md reaches Codex via worktree AGENTS.override.md (below), so the
-            # task's append_system_prompt must NOT also be prepended to the prompt
-            # (that would duplicate the whole contract). Suppress it for codex.
+            # AGENT.md reaches Codex through the worktree instructions below.
             inject_system_prompt=False,
             log=_log("fix"),
-            debug=os.environ.get("ISSUE_AGENT_DEBUG", "0") not in ("", "0", "false", "False"),
-            idle_timeout=(codex_runtime.idle_timeout if codex_runtime.idle_timeout > 0 else None),
-            max_runtime=(codex_runtime.max_runtime if codex_runtime.max_runtime > 0 else None),
-            transport_retries=codex_runtime.transport_retries,
-            backoff_base=codex_runtime.backoff_base,
-            rate_limit_backoff_base=codex_runtime.rate_limit_backoff_base,
-            max_rate_limit_wait=codex_runtime.max_rate_limit_wait,
-            max_rate_limit_retries=codex_runtime.max_rate_limit_retries,
-            cost_per_mtok_in=codex_runtime.cost_per_mtok_in,
-            cost_per_mtok_out=codex_runtime.cost_per_mtok_out,
-            cost_per_mtok=codex_runtime.cost_per_mtok,
-            # #29: the only per-run spend bound codex can have — the runner
-            # samples the session's streamed counters and kills on crossing
-            # AgentTask.max_budget_usd. Without it MAX_BUDGET_USD is decoration.
-            enforce_budget=codex_runtime.enforce_budget,
-            **({"default_model": codex_runtime.model} if codex_runtime.model else {}),
         )
         # Surface a codex misconfig (missing bin/key) at STARTUP, not on the first
         # dispatch — a clear one-liner instead of an opaque per-issue exit 1.
@@ -876,6 +897,7 @@ def build_review_daemon(
         ),
         max_review_rejections=review_runtime.max_rejections,
         review_bot=review_runtime.bot,
+        reviewer_runtime=review_runtime.runtime,
         review_trigger_label=review_runtime.trigger_label,
         review_mode=review_runtime.mode,
         log=_log("review"),
@@ -888,37 +910,19 @@ def build_review_daemon(
     review_runner = runner
     if review_runtime.runtime == "codex":
         from ..adapters.codex_runner import (
-            CodexProvider,
-            CodexRunner,
             codex_budget_not_enforced_warning,
             codex_cost_blindspot_warning,
         )
 
-        review_runner = CodexRunner(
-            codex_bin=cfg.codex_runtime.binary,
-            provider=CodexProvider(
-                provider_id=cfg.codex_runtime.provider_id,
-                name=cfg.codex_runtime.provider_name,
-                base_url=cfg.codex_runtime.base_url,
-                env_key=cfg.codex_runtime.env_key,
-                wire_api=cfg.codex_runtime.wire_api,
-            ),
-            sandbox=cfg.codex_runtime.sandbox,
-            reasoning_effort=cfg.codex_runtime.reasoning_effort,
+        # Review is deliberately read-only in the operator's checkout. Codex
+        # cannot apply the sandbox flag to `exec resume`, so the workflow makes
+        # Codex re-reviews fresh rather than carrying a writable resume session.
+        review_runner = _build_codex_runner(
+            cfg,
+            default_model=review_runtime.model,
+            sandbox="read-only",
+            inject_system_prompt=True,
             log=_log("review"),
-            debug=os.environ.get("ISSUE_AGENT_DEBUG", "0") not in ("", "0", "false", "False"),
-            idle_timeout=(cfg.codex_runtime.idle_timeout if cfg.codex_runtime.idle_timeout > 0 else None),
-            max_runtime=(cfg.codex_runtime.max_runtime if cfg.codex_runtime.max_runtime > 0 else None),
-            transport_retries=cfg.codex_runtime.transport_retries,
-            backoff_base=cfg.codex_runtime.backoff_base,
-            rate_limit_backoff_base=cfg.codex_runtime.rate_limit_backoff_base,
-            max_rate_limit_wait=cfg.codex_runtime.max_rate_limit_wait,
-            max_rate_limit_retries=cfg.codex_runtime.max_rate_limit_retries,
-            cost_per_mtok_in=cfg.codex_runtime.cost_per_mtok_in,
-            cost_per_mtok_out=cfg.codex_runtime.cost_per_mtok_out,
-            cost_per_mtok=cfg.codex_runtime.cost_per_mtok,
-            enforce_budget=cfg.codex_runtime.enforce_budget,
-            **({"default_model": review_runtime.model} if review_runtime.model else {}),
         )
         reason = review_runner.preflight()
         if reason is not None:

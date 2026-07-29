@@ -127,6 +127,33 @@ def test_external_review_marker_never_becomes_a_resume_session():
     assert store.get_pr_session(100) == "real-session"
 
 
+def test_codex_reviewer_re_reviews_in_a_fresh_read_only_session():
+    """`codex exec resume` has no sandbox flag, so retaining its session id
+    would silently restore danger-full-access on a re-review."""
+    prior = Review("CHANGES_REQUESTED", "review-bot", "t1", body="fix it", commit_id="old")
+    old = PRView(100, head_ref_oid="old", title="t", body="b")
+    gw = FakeGateway(prs={100: old})
+    store = FakeStore()
+    first = FakeRunner(AgentResult(
+        is_error=False, session_id="codex-session",
+        structured={"decision": "REQUEST_CHANGES", "body": "fix it"},
+    ))
+
+    asyncio.run(_workflow(gw, store, first, reviewer_runtime="codex").review(100))
+    assert store.get_pr_session(100) == "codex-review"
+
+    gw._prs[100] = PRView(100, head_ref_oid="new", title="t", body="b", reviews=(prior,))
+    setattr(gw, "pr_diff", lambda _pr: "new diff")
+    second = FakeRunner(AgentResult(
+        is_error=False, session_id="new-codex-session",
+        structured={"decision": "APPROVE", "body": "fixed"},
+    ))
+    asyncio.run(_workflow(gw, store, second, reviewer_runtime="codex").re_review(100))
+
+    assert second.tasks[0].resume is None
+    assert store.get_pr_session(100) == "codex-review"
+
+
 def test_single_review_submits_before_persisting_state():
     pr = PRView(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr})
