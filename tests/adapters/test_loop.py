@@ -1,6 +1,10 @@
 """Daemon loop — tick sequencing, crash isolation, heartbeat."""
 
+import json
+
+from issue_agent.adapters.journal import Journal, read_events
 from issue_agent.adapters.github import GhUnavailable
+from issue_agent.adapters.store import Store
 from issue_agent.app.execute import Executor
 from issue_agent.app.loop import Daemon
 from issue_agent.domain.actions import NoOp, Relabel, Target
@@ -182,6 +186,335 @@ def test_run_forever_warns_on_suspend_stall():
     times = iter([0, 100_000, 100_060])
     d.run_forever(sleep=lambda s: None, now=lambda: next(times), max_ticks=2)
     assert any("suspended/stalled" in m for m in logs)
+
+
+def test_late_heartbeat_journals_reconciles_and_annotates_overlapping_leg(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    rows = [
+        {
+            "ts": "1970-01-01T00:00:10+00:00",
+            "event": "action",
+            "desc": "comment issue #5 (7 chars)",
+            "action": {
+                "type": "comment",
+                "target": "ISSUE",
+                "number": 5,
+                "body": "blocked",
+            },
+        },
+        {
+            "ts": "1970-01-01T00:00:30+00:00",
+            "event": "agent_run_start",
+            "role": "fix",
+            "kind": "RESOLVE",
+            "number": 5,
+            "issue": 5,
+            "dispatch": "dispatch-5",
+        },
+        {
+            "ts": "1970-01-01T00:04:00+00:00",
+            "event": "agent_run",
+            "role": "fix",
+            "kind": "RESOLVE",
+            "number": 5,
+            "issue": 5,
+            "dispatch": "dispatch-5",
+            "duration_s": 30,
+        },
+    ]
+    tmp_path.joinpath("journal.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows)
+    )
+
+    class CommentGateway(FakeGateway):
+        def __init__(self):
+            super().__init__()
+            self.visible = False
+
+        def comment(self, kind, number, body):
+            self.calls.append(("comment", number, body))
+            self.visible = True
+
+        def has_comment(self, kind, number, body):
+            return self.visible
+
+    gateway = CommentGateway()
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _world: [],
+        Executor(
+            gateway,
+            journal=journal,
+            pending_actions=Store(str(tmp_path / "state")),
+            retry_delays=(),
+        ),
+        poll_seconds=60,
+        journal=journal,
+    )
+
+    times = iter([0, 240])
+    active_times = iter([0, 60])
+    daemon.run_forever(
+        sleep=lambda _seconds: None,
+        now=lambda: next(times),
+        active_now=lambda: next(active_times),
+        max_ticks=1,
+    )
+
+    events = read_events(journal.path)
+    stall = [event for event in events if event["event"] == "stall"]
+    assert stall == [
+        {
+            **stall[0],
+            "event": "stall",
+            "started_at": "1970-01-01T00:01:00+00:00",
+            "woke_at": "1970-01-01T00:04:00+00:00",
+            "elapsed_seconds": 240,
+            "suspended_seconds": 180,
+        }
+    ]
+    assert gateway.calls == [("comment", 5, "blocked")]
+    assert any(
+        event["event"] == "action"
+        and event["desc"] == "comment issue #5 (7 chars)"
+        and event.get("replayed") is True
+        for event in events
+    )
+    assert [
+        {
+            key: event[key]
+            for key in (
+                "event",
+                "dispatch",
+                "issue",
+                "stall_started_at",
+                "suspended_seconds",
+            )
+        }
+        for event in events
+        if event["event"] == "agent_run_stall"
+    ] == [
+        {
+            "event": "agent_run_stall",
+            "dispatch": "dispatch-5",
+            "issue": 5,
+            "stall_started_at": "1970-01-01T00:01:00+00:00",
+            "suspended_seconds": 180,
+        }
+    ]
+
+
+def test_heartbeat_below_stall_threshold_does_not_reconcile_or_journal(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    receipt = {
+        "ts": "1970-01-01T00:00:10+00:00",
+        "event": "action",
+        "desc": "relabel issue #5: +ai-blocked",
+        "action": {
+            "type": "relabel",
+            "target": "ISSUE",
+            "number": 5,
+            "remove": None,
+            "add": "ai-blocked",
+        },
+    }
+    tmp_path.joinpath("journal.jsonl").write_text(json.dumps(receipt) + "\n")
+    gateway = FakeGateway()
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _world: [],
+        Executor(gateway, journal=journal),
+        poll_seconds=60,
+        journal=journal,
+    )
+
+    times = iter([0, 239])
+    daemon.run_forever(
+        sleep=lambda _seconds: None,
+        now=lambda: next(times),
+        max_ticks=1,
+    )
+
+    assert read_events(journal.path) == [receipt]
+    assert gateway.calls == []
+
+
+def test_long_active_late_heartbeat_does_not_stall_or_reconcile(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    receipt = {
+        "ts": "1970-01-01T00:00:10+00:00",
+        "event": "action",
+        "desc": "relabel issue #5: +ai-blocked",
+        "action": {
+            "type": "relabel",
+            "target": "ISSUE",
+            "number": 5,
+            "remove": None,
+            "add": "ai-blocked",
+        },
+    }
+    tmp_path.joinpath("journal.jsonl").write_text(json.dumps(receipt) + "\n")
+    gateway = FakeGateway()
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _world: [],
+        Executor(gateway, journal=journal),
+        poll_seconds=60,
+        journal=journal,
+    )
+    wall_times = iter([0, 240])
+    active_times = iter([0, 240])
+
+    daemon.run_forever(
+        sleep=lambda _seconds: None,
+        now=lambda: next(wall_times),
+        active_now=lambda: next(active_times),
+        max_ticks=1,
+    )
+
+    assert gateway.calls == []
+    assert read_events(journal.path) == [receipt]
+
+
+def test_stall_reconciliation_includes_poll_interval_before_estimated_gap(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    receipt = {
+        "ts": "1970-01-01T00:00:30+00:00",
+        "event": "action",
+        "desc": "relabel issue #5: +ai-blocked",
+        "action": {
+            "type": "relabel",
+            "target": "ISSUE",
+            "number": 5,
+            "remove": None,
+            "add": "ai-blocked",
+        },
+    }
+    tmp_path.joinpath("journal.jsonl").write_text(json.dumps(receipt) + "\n")
+    gateway = FakeGateway()
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _world: [],
+        Executor(gateway, journal=journal),
+        poll_seconds=60,
+        journal=journal,
+    )
+    wall_times = iter([50, 300])
+    active_times = iter([0, 10])
+
+    daemon.run_forever(
+        sleep=lambda _seconds: None,
+        now=lambda: next(wall_times),
+        active_now=lambda: next(active_times),
+        max_ticks=1,
+    )
+
+    events = read_events(journal.path)
+    assert gateway.calls == [("relabel", 5, None, "ai-blocked")]
+    assert any(
+        event["event"] == "stall"
+        and event["started_at"] == "1970-01-01T00:01:00+00:00"
+        and event["stall_clock_offset_seconds"] == 290
+        for event in events
+    )
+
+
+def test_stall_annotation_uses_each_legs_clock_gap_not_shifted_start_estimate(
+    tmp_path,
+):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    rows = [
+        {
+            "ts": "1970-01-01T00:00:10+00:00",
+            "event": "agent_run_start",
+            "role": "fix",
+            "kind": "RESOLVE",
+            "number": 5,
+            "issue": 5,
+            "dispatch": "crossed-gap",
+        },
+        {
+            "ts": "1970-01-01T00:01:40+00:00",
+            "event": "agent_run",
+            "role": "fix",
+            "kind": "RESOLVE",
+            "number": 5,
+            "issue": 5,
+            "dispatch": "crossed-gap",
+            "duration_s": 30,
+        },
+        {
+            "ts": "1970-01-01T00:02:40+00:00",
+            "event": "agent_run_start",
+            "role": "fix",
+            "kind": "RESOLVE",
+            "number": 7,
+            "issue": 7,
+            "dispatch": "malformed-duration",
+        },
+        {
+            "ts": "1970-01-01T00:02:50+00:00",
+            "event": "agent_run",
+            "role": "fix",
+            "kind": "RESOLVE",
+            "number": 7,
+            "issue": 7,
+            "dispatch": "malformed-duration",
+            "duration_s": -1,
+        },
+        {
+            "ts": "1970-01-01T00:03:10+00:00",
+            "event": "agent_run_start",
+            "role": "fix",
+            "kind": "RESOLVE",
+            "number": 6,
+            "issue": 6,
+            "dispatch": "after-resume",
+        },
+        {
+            "ts": "1970-01-01T00:03:40+00:00",
+            "event": "agent_run",
+            "role": "fix",
+            "kind": "RESOLVE",
+            "number": 6,
+            "issue": 6,
+            "dispatch": "after-resume",
+            "duration_s": 30,
+        },
+    ]
+    tmp_path.joinpath("journal.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows)
+    )
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _world: [],
+        Executor(FakeGateway(), journal=journal),
+        poll_seconds=60,
+        journal=journal,
+    )
+    wall_times = iter([0, 240])
+    active_times = iter([0, 180])
+
+    daemon.run_forever(
+        sleep=lambda _seconds: None,
+        now=lambda: next(wall_times),
+        active_now=lambda: next(active_times),
+        max_ticks=1,
+    )
+
+    annotations = [
+        event for event in read_events(journal.path)
+        if event["event"] == "agent_run_stall"
+    ]
+    assert [
+        (event["dispatch"], event["suspended_seconds"])
+        for event in annotations
+    ] == [("crossed-gap", 60)]
 
 
 def _waking_daemon(wake_check, poll_seconds=60, logs=None):
