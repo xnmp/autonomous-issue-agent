@@ -26,6 +26,13 @@ def _terminate_process_group(process: subprocess.Popen) -> None:
 
 def run_process(argv: list[str], cwd: Path, timeout: float) -> int:
     process = subprocess.Popen(argv, cwd=cwd, start_new_session=True)
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def terminate_child_group(signum, _frame) -> None:
+        _terminate_process_group(process)
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, terminate_child_group)
     try:
         return process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -34,6 +41,8 @@ def run_process(argv: list[str], cwd: Path, timeout: float) -> int:
     except KeyboardInterrupt:
         _terminate_process_group(process)
         raise
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 def garbage_collect_builds(dashboard: Path) -> None:
@@ -60,12 +69,25 @@ def garbage_collect_builds(dashboard: Path) -> None:
             shutil.rmtree(version)
 
 
+def _acquire_build_lock(lock, deadline: float) -> bool:
+    while True:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.1, remaining))
+
+
 def build_dashboard(harness_root: Path) -> int:
     dashboard = harness_root / "dashboard"
     lock_path = dashboard / ".build.lock"
+    deadline = time.monotonic() + BUILD_TIMEOUT_S
     with lock_path.open("a+b") as lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        deadline = time.monotonic() + BUILD_TIMEOUT_S
+        if not _acquire_build_lock(lock, deadline):
+            return TIMEOUT_EXIT
         install = run_process(
             ["npm", "ci"], dashboard, max(0.001, deadline - time.monotonic())
         )

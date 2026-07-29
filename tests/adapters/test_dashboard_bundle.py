@@ -5,6 +5,8 @@ import os
 import signal
 import subprocess
 
+import pytest
+
 from issue_agent.adapters.dashweb import build as dashboard_build
 from issue_agent.adapters.dashweb import bundle
 
@@ -196,6 +198,50 @@ def test_bundle_snapshot_resolves_the_published_version_only_once(tmp_path, monk
     assert calls == 1
 
 
+def test_bundle_selection_holds_the_build_lock_until_its_lease_is_acquired(
+    tmp_path, monkeypatch
+):
+    dashboard = _dashboard(tmp_path)
+    version = dashboard / "dist" / "builds" / "v1"
+    version.mkdir(parents=True)
+    index = version / "index.html"
+    index.write_text("<html>version one</html>")
+    (dashboard / "dist" / bundle.POINTER_NAME).write_text(
+        json.dumps({"schema": 1, "build": "builds/v1"})
+    )
+    (version / bundle.MANIFEST_NAME).write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "inputs": bundle.source_hashes(tmp_path),
+                "outputs": {
+                    "index.html": hashlib.sha256(index.read_bytes()).hexdigest()
+                },
+            }
+        )
+    )
+    original_lease = bundle._lease_dist
+    writer_was_excluded = False
+
+    def lease_while_probing_writer(root, dist):
+        nonlocal writer_was_excluded
+        with (dashboard / ".build.lock").open("a+b") as writer:
+            try:
+                fcntl.flock(writer.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                writer_was_excluded = True
+        return original_lease(root, dist)
+
+    monkeypatch.setattr(bundle, "_lease_dist", lease_while_probing_writer)
+
+    snapshot = bundle.bundle_snapshot(tmp_path, pin=True)
+
+    assert snapshot.status.ready
+    assert snapshot.lease is not None
+    assert writer_was_excluded
+    snapshot.lease.close()
+
+
 def test_symlinked_output_is_stale(tmp_path):
     dashboard = _dashboard(tmp_path)
     outside = tmp_path / "secret.txt"
@@ -278,3 +324,69 @@ def test_build_timeout_terminates_the_process_group(tmp_path, monkeypatch):
 
     assert result == dashboard_build.TIMEOUT_EXIT
     assert signals == [(process.pid, signal.SIGTERM)]
+
+
+def test_parent_termination_is_forwarded_to_the_nested_process_group(
+    tmp_path, monkeypatch
+):
+    handlers = {}
+
+    class RunningProcess:
+        pid = 9876
+
+        def __init__(self):
+            self.waits = 0
+
+        def wait(self, timeout=None):
+            self.waits += 1
+            if self.waits == 1:
+                handlers[signal.SIGTERM](signal.SIGTERM, None)
+            return -15
+
+    process = RunningProcess()
+    signals = []
+    monkeypatch.setattr(
+        dashboard_build.subprocess,
+        "Popen",
+        lambda argv, cwd, start_new_session: process,
+    )
+    monkeypatch.setattr(
+        dashboard_build.signal,
+        "getsignal",
+        lambda _signal: signal.SIG_DFL,
+    )
+    monkeypatch.setattr(
+        dashboard_build.signal,
+        "signal",
+        lambda signum, handler: handlers.__setitem__(signum, handler),
+    )
+    monkeypatch.setattr(
+        dashboard_build.os,
+        "killpg",
+        lambda pid, sig: signals.append((pid, sig)),
+    )
+
+    with pytest.raises(SystemExit, match="143"):
+        dashboard_build.run_process(["npm", "ci"], tmp_path, 30)
+
+    assert signals == [(process.pid, signal.SIGTERM)]
+
+
+def test_build_lock_wait_is_included_in_the_timeout(tmp_path, monkeypatch):
+    dashboard = tmp_path / "dashboard"
+    dashboard.mkdir()
+    times = iter((0.0, 1.0))
+    monkeypatch.setattr(dashboard_build, "BUILD_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(dashboard_build.time, "monotonic", lambda: next(times))
+    monkeypatch.setattr(
+        dashboard_build.fcntl,
+        "flock",
+        lambda _fd, _flags: (_ for _ in ()).throw(BlockingIOError()),
+    )
+    monkeypatch.setattr(
+        dashboard_build,
+        "run_process",
+        lambda *_args: pytest.fail("build started without acquiring the lock"),
+    )
+
+    assert dashboard_build.build_dashboard(tmp_path) == dashboard_build.TIMEOUT_EXIT

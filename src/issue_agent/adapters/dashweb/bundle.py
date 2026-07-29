@@ -93,6 +93,24 @@ def _lease_dist(harness_root: str | os.PathLike[str], dist: Path) -> BundleLease
     return BundleLease(handle)
 
 
+def _published_snapshot(
+    harness_root: str | os.PathLike[str], *, pin: bool
+) -> tuple[Path, BundleLease | None]:
+    """Select and lease a version while publication/collection is excluded."""
+    dashboard_root = _dashboard_root(harness_root)
+    dashboard_root.mkdir(parents=True, exist_ok=True)
+    with (dashboard_root / ".build.lock").open("a+b") as build_lock:
+        fcntl.flock(build_lock.fileno(), fcntl.LOCK_SH)
+        dist = published_dist(harness_root)
+        fallback_dist = _legacy_dist(harness_root).resolve()
+        lease = (
+            _lease_dist(harness_root, dist)
+            if pin and dist.parent == fallback_dist / "builds"
+            else None
+        )
+        return dist, lease
+
+
 def _input_spec(dashboard_root: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
     raw = json.loads((dashboard_root / INPUT_SPEC_NAME).read_text(encoding="utf-8"))
     if (
@@ -167,12 +185,7 @@ def bundle_snapshot(
 ) -> BundleSnapshot:
     fallback_dist = _legacy_dist(harness_root)
     try:
-        dist = published_dist(harness_root)
-        lease = (
-            _lease_dist(harness_root, dist)
-            if pin and dist.parent == fallback_dist.resolve() / "builds"
-            else None
-        )
+        dist, lease = _published_snapshot(harness_root, pin=pin)
     except (OSError, RuntimeError, ValueError, TypeError, json.JSONDecodeError) as exc:
         return BundleSnapshot(
             BundleStatus("stale", f"dashboard bundle pointer is invalid ({exc})"),
