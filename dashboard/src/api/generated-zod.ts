@@ -61,6 +61,8 @@ const IssueCard = z
     elapsed_s: z.union([z.number(), z.null()]),
     estimated: z.boolean(),
     flags: z.array(z.string()),
+    idle_active: z.boolean(),
+    idle_s: z.union([z.number(), z.null()]),
     issue: z.number().int(),
     issue_verification: z.union([z.string(), z.null()]).optional(),
     last_ts: z.union([z.string(), z.null()]),
@@ -80,6 +82,7 @@ const IssueCard = z
     steps: z.array(CardStep),
     title: z.union([z.string(), z.null()]),
     url: z.union([z.string(), z.null()]),
+    working_s: z.union([z.number(), z.null()]),
   })
   .passthrough();
 const PendingCard = z
@@ -158,6 +161,8 @@ const IssueDetailPayload = z
     done: z.boolean(),
     elapsed_s: z.union([z.number(), z.null()]),
     events: z.array(z.object({}).partial().passthrough()),
+    idle_active: z.boolean(),
+    idle_s: z.union([z.number(), z.null()]),
     issue: z.number().int(),
     prs: z.array(z.number().int()),
     pull_requests: z.array(PullRequestLink),
@@ -166,6 +171,7 @@ const IssueDetailPayload = z
     title: z.union([z.string(), z.null()]),
     url: z.union([z.string(), z.null()]),
     warnings: z.array(z.string()),
+    working_s: z.union([z.number(), z.null()]),
   })
   .passthrough();
 const ActionResult = z
@@ -411,6 +417,8 @@ const endpoints = makeApi([
         done: z.boolean(),
         elapsed_s: z.union([z.number(), z.null()]),
         events: z.array(z.object({}).partial().passthrough()),
+        idle_active: z.boolean(),
+        idle_s: z.union([z.number(), z.null()]),
         issue: z.number().int(),
         prs: z.array(z.number().int()),
         pull_requests: z.array(PullRequestLink),
@@ -419,6 +427,7 @@ const endpoints = makeApi([
         title: z.union([z.string(), z.null()]),
         url: z.union([z.string(), z.null()]),
         warnings: z.array(z.string()),
+        working_s: z.union([z.number(), z.null()]),
       })
       .passthrough(),
     errors: [

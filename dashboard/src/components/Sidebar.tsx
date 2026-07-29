@@ -7,13 +7,16 @@ import { ago, pct, usd } from "../lib/format";
 import { Chip, Dot } from "./ui/Chip";
 import { ConfirmModal } from "./ui/Modal";
 import { EmptyState, ErrorBanner, SkeletonRows, WarningList } from "./ui/Feedback";
+import { UsageBlock } from "./UsageBlock";
+import { OptionsMenu, type DashboardOptions } from "./ui/OptionsMenu";
 
 interface SidebarProps {
   repos: Polled<ReposPayload>;
   usage: Polled<UsagePayload>;
   activeRepo: string | null;
   verificationActive: boolean;
-  showPerRepoQuotas: boolean;
+  options: DashboardOptions;
+  onOptionsChange: (options: DashboardOptions) => void;
   onSelectRepo: (name: string) => void;
   onOpenVerification: () => void;
 }
@@ -31,7 +34,8 @@ export function Sidebar({
   usage,
   activeRepo,
   verificationActive,
-  showPerRepoQuotas,
+  options,
+  onOptionsChange,
   onSelectRepo,
   onOpenVerification,
 }: SidebarProps) {
@@ -167,7 +171,7 @@ export function Sidebar({
               repo={r}
               selected={r.name === activeRepo}
               onSelect={() => onSelectRepo(r.name)}
-              quota={showPerRepoQuotas ? quotaByRepo.get(r.name) : undefined}
+              quota={options.showPerRepoQuotas ? quotaByRepo.get(r.name) : undefined}
             />
           ))}
         </div>
@@ -184,7 +188,7 @@ export function Sidebar({
                   repo={r}
                   selected={r.name === activeRepo}
                   onSelect={() => onSelectRepo(r.name)}
-                  quota={showPerRepoQuotas ? quotaByRepo.get(r.name) : undefined}
+                  quota={options.showPerRepoQuotas ? quotaByRepo.get(r.name) : undefined}
                   onStart={() => {
                     setActionError(null);
                     setConfirmStart(r);
@@ -194,30 +198,35 @@ export function Sidebar({
             </div>
           </details>
         ) : null}
-        <div className="sidebar-foot">
-          {notice ? (
-            <div className="banner banner-ok" role="status">
-              <span className="banner-msg trunc" title={notice}>
-                {notice}
-              </span>
-              <button className="btn btn-xs btn-ghost" onClick={() => setNotice(null)}>
-                ✕
-              </button>
-            </div>
-          ) : null}
-          <div className="rail-heading">Operations</div>
-          <button
-            className={`rail-btn${verificationActive ? " active" : ""}`}
-            onClick={onOpenVerification}
-          >
-            <span className="rail-btn-mark" aria-hidden="true">
-              ✓
-            </span>
-            Verification ledger
-          </button>
-        </div>
       </div>
       ) : null}
+      <div className={`sidebar-foot${collapsed ? " collapsed" : ""}`}>
+        {!collapsed && notice ? (
+          <div className="banner banner-ok" role="status">
+            <span className="banner-msg trunc" title={notice}>
+              {notice}
+            </span>
+            <button className="btn btn-xs btn-ghost" onClick={() => setNotice(null)}>
+              ✕
+            </button>
+          </div>
+        ) : null}
+        <UsageBlock usage={usage} collapsed={collapsed} />
+        <OptionsMenu
+          options={options}
+          onChange={onOptionsChange}
+          collapsed={collapsed}
+        />
+        <button
+          className={`rail-btn${verificationActive ? " active" : ""}${collapsed ? " icon-only" : ""}`}
+          onClick={onOpenVerification}
+          aria-label="Verification ledger"
+          title="Verification ledger"
+        >
+          <span className="rail-btn-mark" aria-hidden="true">✓</span>
+          {!collapsed ? <span>Verification ledger</span> : null}
+        </button>
+      </div>
       {!collapsed ? (
         <div
           className="sidebar-resizer"

@@ -254,6 +254,108 @@ def test_issue_card_stops_the_clock_once_the_issue_is_done():
     assert card["elapsed_s"] == 7200
 
 
+def test_issue_card_partitions_completed_time_into_working_and_idle():
+    events = [
+        {"ts": ts(hours=4), "event": "agent_run_start", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
+        {"ts": ts(hours=3), "event": "deferred", "state": "waiting",
+         "issue": 7, "reason": "overlap", "blocker_pr": 90},
+        {"ts": ts(hours=2), "event": "deferred", "state": "cleared",
+         "issue": 7, "reason": "overlap", "blocker_pr": 90},
+        {"ts": ts(), "event": "action",
+         "desc": "clear state for pr #12, issue #7 (merged)"},
+    ]
+
+    card = snapshots.issue_card(row_for(events, 7), NOW)
+
+    assert card["elapsed_s"] == 14_400
+    assert card["working_s"] == 10_800
+    assert card["idle_s"] == 3_600
+    assert card["idle_active"] is False
+
+
+def test_issue_card_keeps_an_active_hold_ticking_as_idle_not_working():
+    events = [
+        {"ts": ts(hours=2), "event": "agent_run_start", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
+        {"ts": ts(minutes=30), "event": "deferred", "state": "waiting",
+         "issue": 7, "reason": "overlap", "blocker_issue": 8},
+    ]
+
+    card = snapshots.issue_card(row_for(events, 7), NOW)
+
+    assert card["elapsed_s"] == 7_200
+    assert card["working_s"] == 5_400
+    assert card["idle_s"] == 1_800
+    assert card["idle_active"] is True
+
+
+def test_stall_overlapping_a_hold_is_removed_from_idle_not_working_time():
+    events = [
+        {"ts": ts(hours=4), "event": "agent_run_start", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
+        {"ts": ts(hours=2), "event": "deferred", "state": "waiting",
+         "issue": 7, "reason": "overlap", "blocker_pr": 90},
+        {"ts": ts(hours=1), "event": "agent_run_stall", "role": "fix",
+         "issue": 7, "dispatch": "d1", "stall_started_at": ts(hours=1.5),
+         "suspended_seconds": 3600},
+        {"ts": ts(), "event": "action",
+         "desc": "clear state for pr #12, issue #7 (merged)"},
+    ]
+
+    card = snapshots.issue_card(row_for(events, 7), NOW)
+
+    assert card["elapsed_s"] == 10_800
+    assert card["working_s"] == 7_200
+    assert card["idle_s"] == 3_600
+
+
+def test_identified_stall_cluster_keeps_duration_and_idle_from_one_detector():
+    events = [
+        {"ts": ts(hours=4), "event": "agent_run_start", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
+        {"ts": ts(minutes=30), "event": "deferred", "state": "waiting",
+         "issue": 7, "reason": "overlap", "blocker_pr": 90},
+        {"ts": ts(hours=1), "event": "agent_run_stall", "role": "fix",
+         "issue": 7, "stall_started_at": ts(hours=2),
+         "stall_clock_offset_seconds": 1234, "suspended_seconds": 3600},
+        {"ts": ts(), "event": "agent_run_stall", "role": "review",
+         "issue": 7, "stall_started_at": ts(minutes=30),
+         "stall_clock_offset_seconds": 1235, "suspended_seconds": 1800},
+        {"ts": ts(), "event": "action",
+         "desc": "clear state for pr #12, issue #7 (merged)"},
+    ]
+
+    card = snapshots.issue_card(row_for(events, 7), NOW)
+
+    assert card["elapsed_s"] == 10_800
+    assert card["working_s"] == 9_000
+    assert card["idle_s"] == 1_800
+
+
+def test_legacy_stall_cluster_keeps_duration_and_idle_from_one_detector():
+    events = [
+        {"ts": ts(hours=4), "event": "agent_run_start", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
+        {"ts": ts(minutes=30), "event": "deferred", "state": "waiting",
+         "issue": 7, "reason": "overlap", "blocker_pr": 90},
+        {"ts": ts(minutes=15), "event": "agent_run_stall", "role": "fix",
+         "issue": 7, "stall_started_at": ts(hours=1.25),
+         "suspended_seconds": 3600},
+        {"ts": ts(), "event": "agent_run_stall", "role": "review",
+         "issue": 7, "stall_started_at": ts(minutes=30),
+         "suspended_seconds": 1800},
+        {"ts": ts(), "event": "action",
+         "desc": "clear state for pr #12, issue #7 (merged)"},
+    ]
+
+    card = snapshots.issue_card(row_for(events, 7), NOW)
+
+    assert card["elapsed_s"] == 10_800
+    assert card["working_s"] == 9_900
+    assert card["idle_s"] == 900
+
+
 def test_issue_card_and_eta_exclude_annotated_stall_time():
     events = [
         {"ts": ts(hours=4), "event": "agent_run_start", "role": "fix",
@@ -347,6 +449,20 @@ def test_nonfinite_or_oversized_stall_correction_is_ignored(malformed_seconds):
     row = row_for(events, 7)
     assert snapshots.issue_card(row, NOW)["elapsed_s"] == 7200
     assert snapshots.mean_wall_clock_s([row]) == 7200.0
+
+
+def test_issue_detail_uses_the_same_working_idle_partition_as_cards():
+    events = [
+        {"ts": ts(hours=2), "event": "agent_run_start", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
+        {"ts": ts(hours=1), "event": "hold", "issue": 7, "reason": "overlap"},
+    ]
+
+    detail = snapshots.issue_detail(row_for(events, 7), NOW)
+
+    assert detail["working_s"] == 3_600
+    assert detail["idle_s"] == 3_600
+    assert detail["idle_active"] is True
 
 
 def test_issue_card_carries_gh_title_pr_state_and_merge_stamp():

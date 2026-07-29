@@ -12,7 +12,7 @@ import { ago, localTime, num, rate, usd, usdCompact } from "../lib/format";
 import { Chip } from "./ui/Chip";
 import { Meter, StackedBar, StatTile } from "./ui/Charts";
 import { EmptyState, ErrorBanner, Loading, SectionTitle, SkeletonRows, WarningList } from "./ui/Feedback";
-import { ResizableTable } from "./ui/ResizableTable";
+import { ResizableTable, useSortedRows } from "./ui/ResizableTable";
 
 const POLL_MS = 10_000;
 
@@ -39,6 +39,16 @@ export function OverviewTab({
   const m = ov.data?.metrics ?? null;
   const caps = ov.data?.caps ?? null;
   const mix = ov.data?.cost_mix ?? null;
+  const spendRows = useSortedRows(
+    m?.by_kind ?? [],
+    {
+      kind: (row) => row.kind,
+      tasks: (row) => row.runs,
+      usd: (row) => row.usd,
+      "per-task": (row) => row.runs > 0 ? row.usd / row.runs : null,
+    },
+    { key: "usd", direction: "desc" },
+  );
 
   const escalations = m?.escalations ?? 0;
   const recurrences = m?.recurrences ?? 0;
@@ -206,9 +216,9 @@ export function OverviewTab({
               { key: "tasks", label: "Tasks", className: "r", width: 90 },
               { key: "usd", label: "USD", className: "r", width: 100 },
               { key: "per-task", label: "$/task", className: "r", width: 100 },
-            ]}>
+            ]} sort={spendRows.sort} onSort={spendRows.onSort}>
               <tbody>
-                {(m?.by_kind ?? []).map((k) => (
+                {spendRows.rows.map((k) => (
                   <tr key={k.kind}>
                     <td className="mono">{k.kind}</td>
                     <td className="r num">{num(k.runs)}</td>
@@ -226,6 +236,17 @@ export function OverviewTab({
 }
 
 function HealthTrend({ rows, loading }: { rows: HealthTrendDay[]; loading: boolean }) {
+  const sorted = useSortedRows(
+    rows,
+    {
+      day: (row) => row.day,
+      opened: (row) => row.opened,
+      closed: (row) => row.closed,
+      net: (row) => row.net_open,
+      recurrences: (row) => row.recurrences,
+    },
+    { key: "day", direction: "desc" },
+  );
   return (
     <section className="panel">
       <div className="panel-hd">
@@ -242,8 +263,8 @@ function HealthTrend({ rows, loading }: { rows: HealthTrendDay[]; loading: boole
               { key: "closed", label: "Closed", className: "r", width: 90 },
               { key: "net", label: "Net", className: "r", width: 90 },
               { key: "recurrences", label: "Recurrences", className: "r", width: 120 },
-            ]}>
-              <tbody>{rows.map((row) => (
+            ]} sort={sorted.sort} onSort={sorted.onSort}>
+              <tbody>{sorted.rows.map((row) => (
                 <tr key={row.day}>
                   <td className="mono">{row.day}</td>
                   <td className="r num">{num(row.opened)}</td><td className="r num">{num(row.closed)}</td>
@@ -306,6 +327,15 @@ function eventSummary(e: JournalEvent): string {
 }
 
 function UnattributedList({ events, loading }: { events: JournalEvent[]; loading: boolean }) {
+  const sorted = useSortedRows(
+    events,
+    {
+      when: (event) => event.ts,
+      role: (event) => event.role,
+      event: (event) => String(event.kind ?? event.event ?? "event"),
+    },
+    { key: "when", direction: "desc" },
+  );
   if (loading) return <Loading what="events" />;
   if (events.length === 0) return <EmptyState>no deployment-level events</EmptyState>;
   return (
@@ -313,9 +343,9 @@ function UnattributedList({ events, loading }: { events: JournalEvent[]; loading
       { key: "when", label: "When", width: 160 },
       { key: "role", label: "Role", width: 100 },
       { key: "event", label: "Event", width: 500 },
-    ]}>
+    ]} sort={sorted.sort} onSort={sorted.onSort}>
       <tbody>
-        {events.map((e, i) => (
+        {sorted.rows.map((e, i) => (
           <tr key={i}>
             <td className="mono faint" title={e.ts ?? ""}>
               {localTime(e.ts)}

@@ -110,9 +110,11 @@ export function modelTone(model: string, effort?: string | null): Tone {
   const name = model.toLowerCase();
   const stance = (effort ?? "").toLowerCase();
   const aboveMedium = ["high", "xhigh", "max", "ultra"].includes(stance);
-  if (name.includes("fable") || name.includes("opus") || (name.includes("sol") && aboveMedium)) {
+  const premium = name.includes("fable") || name.includes("opus") || name.includes("sol");
+  if (premium && aboveMedium) {
     return "tier-high";
   }
+  if (name.includes("fable") || name.includes("opus")) return "tier-sol";
   if (name.includes("sol")) return "tier-sol";
   if (name.includes("terra") || name.includes("sonnet")) return "tier-terra";
   if (name.includes("luna") || name.includes("haiku")) return "tier-luna";

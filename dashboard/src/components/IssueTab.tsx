@@ -10,7 +10,11 @@ import { JsonBlock } from "./ui/Json";
 import { EmptyState, ErrorBanner, Loading, SkeletonRows, WarningList } from "./ui/Feedback";
 import { EventTimeline } from "./EventTimeline";
 import { ColumnMenu, type ColumnChoice } from "./ui/ColumnMenu";
-import { ResizableTable, type TableColumn } from "./ui/ResizableTable";
+import {
+  ResizableTable,
+  useSortedRows,
+  type TableColumn,
+} from "./ui/ResizableTable";
 
 const POLL_MS = 5_000;
 const ISSUE_COLUMNS_KEY = "issue-agent.dashboard.issue-columns";
@@ -86,7 +90,23 @@ export function IssueTab({ repo, issue }: { repo: string; issue: number }) {
   };
 
   const d = detail.data;
-  const elapsed = useLiveElapsed(d?.done ? d.elapsed_s : (d?.elapsed_s ?? null), detail.updatedAt);
+  const liveWorking = useLiveElapsed(d?.working_s ?? null, detail.updatedAt);
+  const liveIdle = useLiveElapsed(d?.idle_s ?? null, detail.updatedAt);
+  const working = d?.done || d?.idle_active ? (d?.working_s ?? null) : liveWorking;
+  const idle = d?.done || !d?.idle_active ? (d?.idle_s ?? null) : liveIdle;
+  const sortedSteps = useSortedRows(d?.steps ?? [], {
+    operation: (step) => step.kind,
+    role: (step) => step.role,
+    model: (step) => step.model,
+    status: (step) => step.status ?? step.state,
+    duration: (step) => step.duration_s,
+    cost: (step) => step.cost_usd,
+    tokens: (step) => (
+      (step.usage?.input_tokens ?? 0)
+      + (step.usage?.output_tokens ?? 0)
+    ),
+    when: (step) => step.ts,
+  }, { key: "when", direction: "asc" });
 
   return (
     <div className="tabbody" onContextMenu={openColumnMenu}>
@@ -138,8 +158,12 @@ export function IssueTab({ repo, issue }: { repo: string; issue: number }) {
                 <span className="mono">{usd(d.cost_usd)}</span>
               </span>
               <span className="issue-stat">
-                <span className="faint">{d.done ? "duration" : "elapsed"}</span>{" "}
-                <span className="mono">{duration(d.done ? d.elapsed_s : elapsed)}</span>
+                <span className="faint">working</span>{" "}
+                <span className="mono">{duration(working)}</span>
+              </span>
+              <span className="issue-stat">
+                <span className="faint">idle</span>{" "}
+                <span className="mono">{duration(idle)}</span>
               </span>
               <span className="issue-stat">
                 <span className="faint">tasks</span>{" "}
@@ -198,9 +222,15 @@ export function IssueTab({ repo, issue }: { repo: string; issue: number }) {
               aria-labelledby={`issue-${issue}-tasks-tab`}
             >
               <div className="tbl-wrap">
-                <ResizableTable storageKey="issue-tasks" columns={columns} className="wide">
+                <ResizableTable
+                  storageKey="issue-tasks"
+                  columns={columns}
+                  className="wide"
+                  sort={sortedSteps.sort}
+                  onSort={sortedSteps.onSort}
+                >
                   <tbody>
-                    {d.steps.map((s) => (
+                    {sortedSteps.rows.map((s) => (
                       <StepRow
                         key={s.idx}
                         repo={repo}

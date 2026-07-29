@@ -3,7 +3,7 @@ import { usePolled } from "../api/hooks";
 import { verificationTone } from "../lib/semantics";
 import { Chip } from "./ui/Chip";
 import { EmptyState, ErrorBanner, SectionTitle, SkeletonRows, WarningList } from "./ui/Feedback";
-import { ResizableTable } from "./ui/ResizableTable";
+import { ResizableTable, useSortedRows } from "./ui/ResizableTable";
 
 const POLL_MS = 60_000; // a markdown ledger the human edits — no need to hammer it
 
@@ -15,6 +15,17 @@ const POLL_MS = 60_000; // a markdown ledger the human edits — no need to hamm
 export function VerificationTab() {
   const v = usePolled("verification", (signal) => api.verification(signal), POLL_MS);
   const rows = v.data?.rows ?? [];
+  const sorted = useSortedRows(
+    rows,
+    {
+      id: (row) => row.id,
+      change: (row) => row.change,
+      status: (row) => row.status,
+      shipped: (row) => row.shipped,
+      evidence: (row) => row.evidence,
+    },
+    { key: "id", direction: "asc" },
+  );
 
   const counts = rows.reduce<Record<string, number>>((acc, r) => {
     const t = verificationTone(r.status);
@@ -50,9 +61,9 @@ export function VerificationTab() {
             { key: "status", label: "Status", width: 130 },
             { key: "shipped", label: "Shipped", width: 130 },
             { key: "evidence", label: "Evidence", width: 500 },
-          ]}>
+          ]} sort={sorted.sort} onSort={sorted.onSort}>
             <tbody>
-              {rows.map((r, i) => {
+              {sorted.rows.map((r, i) => {
                 const tone = verificationTone(r.status);
                 return (
                   <tr key={i} className={tone === "fail" ? "row-alert" : undefined} title={r.raw}>

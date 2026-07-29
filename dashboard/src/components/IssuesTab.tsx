@@ -25,7 +25,11 @@ import { Chip } from "./ui/Chip";
 import { EtaProgress } from "./ui/Charts";
 import { StepBadgeRow } from "./ui/StepBadge";
 import { ColumnMenu, type ColumnChoice } from "./ui/ColumnMenu";
-import { ResizableTable, type TableColumn } from "./ui/ResizableTable";
+import {
+  ResizableTable,
+  useSortedRows,
+  type TableColumn,
+} from "./ui/ResizableTable";
 import { ConfirmModal } from "./ui/Modal";
 import {
   EmptyState,
@@ -55,7 +59,7 @@ const COLUMN_CHOICES: Record<IssuesSub, ColumnChoice[]> = {
   inflight: [
     { key: "tasks", label: "Tasks" },
     { key: "cost", label: "Cost" },
-    { key: "elapsed", label: "Elapsed" },
+    { key: "elapsed", label: "Duration" },
     { key: "progress", label: "Progress" },
     { key: "model", label: "Model" },
     { key: "pending-priority", label: "Pending priority" },
@@ -66,6 +70,7 @@ const COLUMN_CHOICES: Record<IssuesSub, ColumnChoice[]> = {
   done: [
     { key: "cost", label: "Cost" },
     { key: "duration", label: "Duration" },
+    { key: "verification", label: "Verification" },
     { key: "model", label: "Model" },
     { key: "rounds", label: "Rounds" },
     { key: "merged", label: "Merged" },
@@ -156,7 +161,6 @@ export function IssuesTab({
         />
         <span className="spacer" />
         {!ghOk ? <GhUnavailableChip /> : null}
-        <span className="faint table-hint">Right-click a header to choose columns</span>
       </div>
       <ColumnMenu
         columns={COLUMN_CHOICES[sub]}
@@ -233,6 +237,18 @@ function InFlightTable({
   showProjectedCost: boolean;
 }) {
   const [expanded, setExpanded] = useState<number | null>(null);
+  const sorted = useSortedRows(cards, {
+    issue: (card) => card.issue,
+    tasks: (card) => card.steps.length,
+    cost: (card) => card.cost_usd,
+    elapsed: (card) => card.elapsed_s,
+    progress: (card) => (
+      card.elapsed_s !== null && card.projected_eta_s
+        ? card.elapsed_s / card.projected_eta_s
+        : null
+    ),
+    model: (card) => card.models.join(" "),
+  }, { key: "issue", direction: "asc" });
   const now = useClock();
   if (loading) return <SkeletonRows what="in-flight issues" rows={5} />;
   if (cards.length === 0) return <EmptyState>no issues in flight — the fixer is idle</EmptyState>;
@@ -241,17 +257,29 @@ function InFlightTable({
     { key: "issue", label: "Issue / PR", width: 340 },
     ...(visible.has("tasks") ? [{ key: "tasks", label: "Tasks", width: 240 }] : []),
     ...(visible.has("cost") ? [{ key: "cost", label: "Cost", className: "r", width: 150 }] : []),
-    ...(visible.has("elapsed") ? [{ key: "elapsed", label: "Elapsed", className: "r", width: 120 }] : []),
+    ...(visible.has("elapsed") ? [{ key: "elapsed", label: "Duration", className: "r", width: 180 }] : []),
     ...(visible.has("progress") ? [{ key: "progress", label: "Progress", width: 160 }] : []),
     ...(visible.has("model") ? [{ key: "model", label: "Model", width: 180 }] : []),
   ];
 
   return (
     <div className="tbl-wrap panel">
-      <ResizableTable storageKey="issues-inflight" columns={columns} className="wide issue-list-table">
+      <ResizableTable
+        storageKey="issues-inflight"
+        columns={columns}
+        className="wide issue-list-table"
+        sort={sorted.sort}
+        onSort={sorted.onSort}
+      >
         <tbody>
-          {cards.map((card) => {
+          {sorted.rows.map((card) => {
             const elapsed = card.elapsed_s === null ? null : card.elapsed_s + offset;
+            const working = card.working_s === null
+              ? null
+              : card.working_s + (card.idle_active ? 0 : offset);
+            const idle = card.idle_s === null
+              ? null
+              : card.idle_s + (card.idle_active ? offset : 0);
             const open = expanded === card.issue;
             const alert = card.flags.some((flag) => flag === "escalated" || flag === "spend-blocked");
             return (
@@ -281,7 +309,7 @@ function InFlightTable({
                   ) : null}
                   {visible.has("elapsed") ? (
                     <td className="r mono" title={card.started_ts ? `started ${localTime(card.started_ts)}` : ""}>
-                      {duration(elapsed)}
+                      <DurationBreakdown working={working} idle={idle} />
                     </td>
                   ) : null}
                   {visible.has("progress") ? (
@@ -330,6 +358,13 @@ function PendingTable({
 }) {
   const [busyIssue, setBusyIssue] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const sorted = useSortedRows(cards, {
+    issue: (card) => card.issue,
+    priority: (card) => card.priority,
+    overlap: (card) => card.overlap === null ? null : String(card.overlap),
+    state: (card) => card.hold_reason ?? "pending",
+    labels: (card) => card.labels.join(" "),
+  }, { key: "issue", direction: "asc" });
   if (loading) return <SkeletonRows what="pending issues" rows={3} />;
   if (cards.length === 0) {
     return <EmptyState>{ghOk ? "nothing is pending" : "pending needs GitHub data"}</EmptyState>;
@@ -359,9 +394,14 @@ function PendingTable({
     <>
       {error ? <ErrorBanner message={error} /> : null}
       <div className="tbl-wrap panel">
-        <ResizableTable storageKey="issues-pending" columns={columns}>
+        <ResizableTable
+          storageKey="issues-pending"
+          columns={columns}
+          sort={sorted.sort}
+          onSort={sorted.onSort}
+        >
           <tbody>
-            {cards.map((card) => (
+            {sorted.rows.map((card) => (
               <tr key={card.issue}>
                 <td><CompactIssue issue={card.issue} title={card.title} url={card.url} /></td>
                 {visible.has("pending-priority") ? <td>
@@ -438,12 +478,22 @@ function DoneTable({
   onOpen: (issue: number) => void;
 }) {
   const [expanded, setExpanded] = useState<number | null>(null);
+  const sorted = useSortedRows(cards, {
+    issue: (card) => card.issue,
+    cost: (card) => card.cost_usd,
+    duration: (card) => card.elapsed_s,
+    verification: (card) => `${card.issue_verification ?? ""} ${card.pr_verification ?? ""}`,
+    model: (card) => card.models.join(" "),
+    rounds: (card) => card.rounds,
+    merged: (card) => card.merged_ts ?? card.last_ts,
+  }, { key: "merged", direction: "desc" });
   if (loading) return <SkeletonRows what="done issues" rows={5} />;
   if (cards.length === 0) return <EmptyState>nothing merged by the harness in this deployment yet</EmptyState>;
   const columns: TableColumn[] = [
     { key: "issue", label: "Issue / PR", width: 380 },
     ...(visible.has("cost") ? [{ key: "cost", label: "Cost", className: "r", width: 100 }] : []),
-    ...(visible.has("duration") ? [{ key: "duration", label: "Duration", className: "r", width: 110 }] : []),
+    ...(visible.has("duration") ? [{ key: "duration", label: "Duration", className: "r", width: 180 }] : []),
+    ...(visible.has("verification") ? [{ key: "verification", label: "Verification", width: 190 }] : []),
     ...(visible.has("model") ? [{ key: "model", label: "Model", width: 190 }] : []),
     ...(visible.has("rounds") ? [{ key: "rounds", label: "Rounds", className: "r", width: 90 }] : []),
     ...(visible.has("merged") ? [{ key: "merged", label: "Merged", width: 120 }] : []),
@@ -451,9 +501,15 @@ function DoneTable({
 
   return (
     <div className="tbl-wrap panel">
-      <ResizableTable storageKey="issues-done" columns={columns} className="issue-list-table">
+      <ResizableTable
+        storageKey="issues-done"
+        columns={columns}
+        className="issue-list-table"
+        sort={sorted.sort}
+        onSort={sorted.onSort}
+      >
         <tbody>
-          {cards.map((card) => {
+          {sorted.rows.map((card) => {
             const open = expanded === card.issue;
             return (
               <Fragment key={card.issue}>
@@ -471,7 +527,14 @@ function DoneTable({
                       {card.estimated ? <span className="faint" title="synthetic dollars"> ~</span> : null}
                     </td>
                   ) : null}
-                  {visible.has("duration") ? <td className="r mono">{durationShort(card.elapsed_s)}</td> : null}
+                  {visible.has("duration") ? (
+                    <td className="r mono">
+                      <DurationBreakdown working={card.working_s} idle={card.idle_s} compact />
+                    </td>
+                  ) : null}
+                  {visible.has("verification") ? (
+                    <td><VerificationStatus card={card} /></td>
+                  ) : null}
                   {visible.has("model") ? <td><ModelList models={card.model_badges ?? card.models.map((model) => ({ model, effort: null }))} /></td> : null}
                   {visible.has("rounds") ? <td className="r num">{num(card.rounds)}</td> : null}
                   {visible.has("merged") ? (
@@ -511,6 +574,13 @@ function BacklogTable({
   const [promote, setPromote] = useState<BacklogCard | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const sorted = useSortedRows(cards, {
+    issue: (card) => card.issue,
+    recurrence: (card) => card.recurrence_count,
+    age: (card) => card.age_s ?? (card.age_days === null ? null : card.age_days * 86_400),
+    comments: (card) => card.comments,
+    labels: (card) => card.labels.join(" "),
+  }, { key: "issue", direction: "asc" });
   if (loading) return <SkeletonRows what="backlog" rows={5} />;
   if (cards.length === 0) {
     return <EmptyState>{ghOk ? "no unlabelled open issues — the backlog is clear" : "backlog needs GitHub data, which is unavailable"}</EmptyState>;
@@ -541,9 +611,15 @@ function BacklogTable({
   return (
     <>
       <div className="tbl-wrap panel">
-        <ResizableTable storageKey="issues-backlog" columns={columns} className="issue-list-table">
+        <ResizableTable
+          storageKey="issues-backlog"
+          columns={columns}
+          className="issue-list-table"
+          sort={sorted.sort}
+          onSort={sorted.onSort}
+        >
           <tbody>
-            {cards.map((card) => {
+            {sorted.rows.map((card) => {
               const open = expanded === card.issue;
               return (
                 <Fragment key={card.issue}>
@@ -688,9 +764,7 @@ function IssueSummary({ card, open }: { card: IssueCard; open: boolean }) {
         </span>
         <div className="row-wrap">
           <IssueNumber issue={card.issue} url={card.url} />
-          <VerificationBadge status={card.issue_verification} />
           <PrLink card={card} />
-          <VerificationBadge status={card.pr_verification} />
           {card.flags.length > 0 ? <FlagList flags={card.flags} /> : null}
         </div>
       </div>
@@ -770,6 +844,43 @@ function VerificationBadge({ status }: { status: string | null | undefined }) {
     <Chip tone={verificationTone(status)} title={`field verification: ${status}`}>
       {status.toLowerCase()}
     </Chip>
+  );
+}
+
+function VerificationStatus({ card }: { card: IssueCard }) {
+  return (
+    <span className="verification-status">
+      <span>
+        <span className="faint">Issue</span>
+        <VerificationBadge status={card.issue_verification} />
+      </span>
+      <span>
+        <span className="faint">PR</span>
+        <VerificationBadge status={card.pr_verification} />
+      </span>
+    </span>
+  );
+}
+
+function DurationBreakdown({
+  working,
+  idle,
+  compact = false,
+}: {
+  working: number | null;
+  idle: number | null;
+  compact?: boolean;
+}) {
+  const format = compact ? durationShort : duration;
+  return (
+    <span className="duration-breakdown">
+      <span title="time actively progressing through harness work">
+        <span className="faint">work</span> {format(working)}
+      </span>
+      <span title="time waiting on a dependency or hold">
+        <span className="faint">idle</span> {format(idle)}
+      </span>
+    </span>
   );
 }
 

@@ -21,8 +21,10 @@ describe("dashboard semantics", () => {
     ["gpt-5.6-sol", "medium", "tier-sol"],
     ["gpt-5.6-sol", "high", "tier-high"],
     ["gpt-5.6-sol", "xhigh", "tier-high"],
-    ["fable", null, "tier-high"],
-    ["claude-opus-5", null, "tier-high"],
+    ["fable", null, "tier-sol"],
+    ["claude-opus-5", null, "tier-sol"],
+    ["claude-opus-5", "high", "tier-high"],
+    ["claude-opus-5", "xhigh", "tier-high"],
   ])("colors %s at %s by capability tier", (model, effort, tone) => {
     expect(modelTone(model, effort)).toBe(tone);
   });

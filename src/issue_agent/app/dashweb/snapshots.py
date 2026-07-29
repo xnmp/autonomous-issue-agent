@@ -274,6 +274,15 @@ def _dispatch_supersedes_legacy_hold(event: dict) -> bool:
     )
 
 
+def _defer_key(event: dict) -> tuple:
+    return (
+        event.get("issue"),
+        event.get("reason"),
+        event.get("blocker_pr"),
+        event.get("blocker_issue"),
+    )
+
+
 def _deferred_event(row: dash.IssueRow) -> dict:
     """The newest active structured defer, with a historical-journal fallback."""
     active: dict[tuple, dict] = {}
@@ -283,12 +292,7 @@ def _deferred_event(row: dash.IssueRow) -> dict:
             # Transition-aware state supersedes any level-only record emitted
             # by an older daemon, including after the matching clear.
             legacy = {}
-            key = (
-                event.get("issue"),
-                event.get("reason"),
-                event.get("blocker_pr"),
-                event.get("blocker_issue"),
-            )
+            key = _defer_key(event)
             if event.get("state") == "cleared":
                 active.pop(key, None)
             elif event.get("state") == "waiting":
@@ -314,53 +318,99 @@ def waiting_label(event: dict) -> str | None:
     return "waiting on dependency"
 
 
-def _legacy_suspended_seconds(
-    intervals: list[tuple[datetime, datetime, float]],
+def _overlap_seconds(
+    start: datetime,
+    end: datetime,
+    intervals: list[tuple[datetime, datetime]],
 ) -> float:
+    return sum(
+        max(0.0, (min(end, idle_end) - max(start, idle_start)).total_seconds())
+        for idle_start, idle_end in intervals
+    )
+
+
+def _legacy_suspension_partition(
+    intervals: list[tuple[datetime, datetime, float]],
+    idle_intervals: list[tuple[datetime, datetime]],
+) -> tuple[float, float]:
     """Deduplicate corrections written before stable stall identities existed.
 
     Compatibility for journal rows written before #69. Remove after retained
     operator journals all postdate the deployment containing #69.
     """
     if not intervals:
-        return 0.0
+        return 0.0, 0.0
     ordered = sorted(intervals)
-    _, current_end, current_seconds = ordered[0]
+    current_start, cluster_end, current_seconds = ordered[0]
+    current_idle = _overlap_seconds(
+        current_start,
+        cluster_end,
+        idle_intervals,
+    )
     total = 0.0
+    idle_total = 0.0
     for started_at, ended_at, seconds in ordered[1:]:
-        if started_at <= current_end:
-            current_end = max(current_end, ended_at)
-            current_seconds = max(current_seconds, seconds)
+        overlap = _overlap_seconds(started_at, ended_at, idle_intervals)
+        if started_at <= cluster_end:
+            cluster_end = max(cluster_end, ended_at)
+            if seconds > current_seconds or (
+                seconds == current_seconds and overlap > current_idle
+            ):
+                current_seconds = seconds
+                current_idle = overlap
             continue
         total += current_seconds
-        current_end, current_seconds = ended_at, seconds
-    return total + current_seconds
+        idle_total += current_idle
+        cluster_end = ended_at
+        current_seconds = seconds
+        current_idle = overlap
+    return total + current_seconds, idle_total + current_idle
 
 
-def _identified_suspended_seconds(corrections: list[tuple[float, float]]) -> float:
+def _identified_suspension_partition(
+    corrections: list[tuple[float, float, datetime, datetime]],
+    idle_intervals: list[tuple[datetime, datetime]],
+) -> tuple[float, float]:
     """Take one maximum correction per physical clock-offset cluster."""
     if not corrections:
-        return 0.0
+        return 0.0, 0.0
     ordered = sorted(corrections)
-    previous_offset, current_seconds = ordered[0]
+    previous_offset, current_seconds, start, end = ordered[0]
+    current_idle = min(
+        current_seconds,
+        _overlap_seconds(start, end, idle_intervals),
+    )
     total = 0.0
-    for offset, seconds in ordered[1:]:
+    idle_total = 0.0
+    for offset, seconds, start, end in ordered[1:]:
+        overlap = min(seconds, _overlap_seconds(start, end, idle_intervals))
         # Journal wall stamps are integral seconds while monotonic is sampled
         # just after them. Separate daemons can therefore report the same boot
         # offset about one second apart.
         if offset - previous_offset <= 2.0:
-            current_seconds = max(current_seconds, seconds)
+            if seconds > current_seconds or (
+                seconds == current_seconds and overlap > current_idle
+            ):
+                current_seconds = seconds
+                current_idle = overlap
         else:
             total += current_seconds
+            idle_total += current_idle
             current_seconds = seconds
+            current_idle = overlap
         previous_offset = offset
-    return total + current_seconds
+    return total + current_seconds, idle_total + current_idle
 
 
-def _suspended_seconds(row: dash.IssueRow, max_seconds: float) -> float:
+def _suspension_partition(
+    row: dash.IssueRow,
+    max_seconds: float,
+    idle_intervals: list[tuple[datetime, datetime]] | None = None,
+) -> tuple[float, float]:
     """Valid suspension corrections, counted once across role detectors."""
     intervals: list[tuple[datetime, datetime, float]] = []
-    identified: list[tuple[float, float]] = []
+    identified: list[tuple[float, float, datetime, datetime]] = []
+    idle = idle_intervals or []
     for event in row.events:
         if event.get("event") != "agent_run_stall":
             continue
@@ -381,18 +431,92 @@ def _suspended_seconds(row: dash.IssueRow, max_seconds: float) -> float:
             clock_offset = float(event.get("stall_clock_offset_seconds"))
         except (OverflowError, TypeError, ValueError):
             clock_offset = math.nan
-        if math.isfinite(clock_offset):
-            identified.append((clock_offset, seconds))
-            continue
         try:
             ended_at = started_at + timedelta(seconds=seconds)
         except OverflowError:
             continue
-        intervals.append((started_at, ended_at, seconds))
-    return (
-        _identified_suspended_seconds(identified)
-        + _legacy_suspended_seconds(intervals)
+        if math.isfinite(clock_offset):
+            identified.append((clock_offset, seconds, started_at, ended_at))
+        else:
+            intervals.append((started_at, ended_at, seconds))
+    identified_total, identified_idle = _identified_suspension_partition(
+        identified,
+        idle,
     )
+    legacy_total, legacy_idle = _legacy_suspension_partition(intervals, idle)
+    return (
+        identified_total + legacy_total,
+        identified_idle + legacy_idle,
+    )
+
+
+def _suspended_seconds(row: dash.IssueRow, max_seconds: float) -> float:
+    return _suspension_partition(row, max_seconds)[0]
+
+
+def _idle_intervals(
+    row: dash.IssueRow,
+    end: datetime,
+) -> tuple[list[tuple[datetime, datetime]], bool]:
+    """Union dependency-wait intervals so overlapping blockers count once."""
+    active: set[tuple] = set()
+    legacy = False
+    idle_started: datetime | None = None
+    intervals: list[tuple[datetime, datetime]] = []
+    timed_events = sorted(
+        (
+            (stamp, index, event)
+            for index, event in enumerate(row.events)
+            if (stamp := dash.parse_ts(event.get("ts"))) is not None
+            and stamp <= end
+        ),
+        key=lambda item: (item[0], item[1]),
+    )
+    for stamp, _index, event in timed_events:
+        was_idle = bool(active) or legacy
+        if event.get("event") == "deferred":
+            legacy = False
+            key = _defer_key(event)
+            if event.get("state") == "cleared":
+                active.discard(key)
+            elif event.get("state") == "waiting":
+                active.add(key)
+        elif event.get("event") == "hold":
+            legacy = True
+        elif legacy and _dispatch_supersedes_legacy_hold(event):
+            legacy = False
+        is_idle = bool(active) or legacy
+        if is_idle and not was_idle:
+            idle_started = stamp
+        elif was_idle and not is_idle and idle_started is not None:
+            intervals.append((idle_started, stamp))
+            idle_started = None
+    if idle_started is not None:
+        intervals.append((idle_started, end))
+    return intervals, bool(active) or legacy
+
+
+def _duration_breakdown(
+    row: dash.IssueRow,
+    start: datetime | None,
+    end: datetime,
+) -> tuple[float | None, float | None, float | None, bool]:
+    if start is None:
+        return None, None, None, False
+    wall_seconds = max(0.0, (end - start).total_seconds())
+    idle_intervals, idle_active = _idle_intervals(row, end)
+    suspended, suspended_while_idle = _suspension_partition(
+        row,
+        wall_seconds,
+        idle_intervals,
+    )
+    elapsed = max(0.0, wall_seconds - suspended)
+    raw_idle = sum(
+        max(0.0, (idle_end - idle_start).total_seconds())
+        for idle_start, idle_end in idle_intervals
+    )
+    idle = min(elapsed, max(0.0, raw_idle - suspended_while_idle))
+    return elapsed, elapsed - idle, idle, idle_active and not row.done
 
 
 def _flags(row: dash.IssueRow) -> list[str]:
@@ -486,7 +610,7 @@ def issue_card(
     # In flight: the clock is still running, so elapsed is measured to NOW.
     # Done: to the last thing that happened, which is where the clock stopped.
     end = row.last_ts if (row.done and row.last_ts) else now
-    wall_seconds = (end - started).total_seconds() if started else None
+    elapsed, working, idle, idle_active = _duration_breakdown(row, started, end)
     card = {
         "issue": row.issue,
         "title": (gh_issue or {}).get("title"),
@@ -503,16 +627,10 @@ def issue_card(
         "projected_model": projected_model,
         "started_ts": iso(started),
         "last_ts": iso(row.last_ts),
-        "elapsed_s": (
-            round(
-                max(
-                    0.0,
-                    wall_seconds - _suspended_seconds(row, wall_seconds),
-                )
-            )
-            if wall_seconds is not None
-            else None
-        ),
+        "elapsed_s": round(elapsed) if elapsed is not None else None,
+        "working_s": round(working) if working is not None else None,
+        "idle_s": round(idle) if idle is not None else None,
+        "idle_active": idle_active,
         "projected_eta_s": projected_eta_s,
         "models": list(row.models),
         "model_badges": model_badges(row),
@@ -755,6 +873,7 @@ def issue_detail(
 ) -> dict:
     started = _started(row)
     end = row.last_ts if (row.done and row.last_ts) else now
+    elapsed, working, idle, idle_active = _duration_breakdown(row, started, end)
     return {
         "issue": row.issue,
         "title": (gh_issue or {}).get("title"),
@@ -771,7 +890,10 @@ def issue_detail(
             for number in row.prs
         ],
         "cost_usd": row.cost_usd,
-        "elapsed_s": round((end - started).total_seconds()) if started else None,
+        "elapsed_s": round(elapsed) if elapsed is not None else None,
+        "working_s": round(working) if working is not None else None,
+        "idle_s": round(idle) if idle is not None else None,
+        "idle_active": idle_active,
         "steps": detailed_steps(row),
         "events": list(row.events),
         "warnings": [],

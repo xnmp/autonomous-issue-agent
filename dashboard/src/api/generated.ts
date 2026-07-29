@@ -377,6 +377,10 @@ export interface components {
             estimated: boolean;
             /** Flags */
             flags: string[];
+            /** Idle Active */
+            idle_active: boolean;
+            /** Idle S */
+            idle_s: number | null;
             /** Issue */
             issue: number;
             /** Issue Verification */
@@ -418,6 +422,8 @@ export interface components {
             title: string | null;
             /** Url */
             url: string | null;
+            /** Working S */
+            working_s: number | null;
         } & {
             [key: string]: unknown;
         };
@@ -433,6 +439,10 @@ export interface components {
             events: {
                 [key: string]: unknown;
             }[];
+            /** Idle Active */
+            idle_active: boolean;
+            /** Idle S */
+            idle_s: number | null;
             /** Issue */
             issue: number;
             /** Prs */
@@ -449,6 +459,8 @@ export interface components {
             url: string | null;
             /** Warnings */
             warnings: string[];
+            /** Working S */
+            working_s: number | null;
         } & {
             [key: string]: unknown;
         };

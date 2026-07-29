@@ -12,17 +12,29 @@ import { VerificationTab } from "./components/VerificationTab";
 import { EmptyState } from "./components/ui/Feedback";
 import { Chip } from "./components/ui/Chip";
 import { stageTone } from "./lib/semantics";
-import { UsageBlock } from "./components/UsageBlock";
-import { OptionsMenu, type DashboardOptions } from "./components/ui/OptionsMenu";
+import {
+  DASHBOARD_THEMES,
+  type DashboardOptions,
+} from "./components/ui/OptionsMenu";
 
 const TOP_POLL_MS = 10_000;
 const ISSUES_SUB_STORAGE = "issue-agent.dashboard.issue-subtabs";
 const OPTIONS_STORAGE = "issue-agent.dashboard.options";
 
 function storedOptions(): DashboardOptions {
-  const defaults = { showProjectedCost: true, showPerRepoQuotas: true };
+  const defaults: DashboardOptions = {
+    showProjectedCost: true,
+    showPerRepoQuotas: true,
+    theme: "cosmic-dusk",
+  };
   try {
-    return { ...defaults, ...JSON.parse(localStorage.getItem(OPTIONS_STORAGE) ?? "{}") };
+    const stored = {
+      ...defaults,
+      ...JSON.parse(localStorage.getItem(OPTIONS_STORAGE) ?? "{}"),
+    } as DashboardOptions;
+    return DASHBOARD_THEMES.some(([theme]) => theme === stored.theme)
+      ? stored
+      : defaults;
   } catch {
     return defaults;
   }
@@ -60,6 +72,9 @@ export default function App() {
       // The options remain active for this session.
     }
   };
+  useEffect(() => {
+    document.documentElement.dataset.theme = options.theme;
+  }, [options.theme]);
 
   const repoList = useMemo(() => repos.data?.repos ?? [], [repos.data]);
   const routedRepo = routeRepo(route);
@@ -196,7 +211,8 @@ export default function App() {
         usage={usage}
         activeRepo={selectedRepo}
         verificationActive={route.view === "verification"}
-        showPerRepoQuotas={options.showPerRepoQuotas}
+        options={options}
+        onOptionsChange={updateOptions}
         onSelectRepo={(name) => navigate({ view: "overview", repo: name })}
         onOpenVerification={() => navigate({ view: "verification" })}
       />
@@ -208,7 +224,6 @@ export default function App() {
             <TabStrip tabs={tabs} />
           )}
           <span className="spacer" />
-          <OptionsMenu options={options} onChange={updateOptions} />
           <RepoCrumb route={route} />
         </div>
         <div className="mainbody">
@@ -224,7 +239,6 @@ export default function App() {
           />
         </div>
       </main>
-      <UsageBlock usage={usage} />
     </div>
   );
 }
