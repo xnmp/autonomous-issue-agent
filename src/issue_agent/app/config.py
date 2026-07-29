@@ -84,6 +84,7 @@ class FixRuntimeConfig:
 @dataclass(frozen=True)
 class ReviewRuntimeConfig:
     bot: str
+    runtime: str
     model: str | None
     prompt: str
     mode: ReviewMode
@@ -341,6 +342,10 @@ class HarnessConfig:
     # leg switches; reviewer/steward stay Claude (a distinct model decorrelates
     # blind spots). See docs/CODEX-RUNNER.md.
     fixer_runtime: str = "claude"
+    # Reviewer runtime: Codex is the deployment default; set "claude" explicitly
+    # for the recommended mixed-runtime posture that preserves independent
+    # implementer/reviewer failure modes.
+    reviewer_runtime: str = "codex"
     codex_bin: str = "codex"
     codex_model: str = ""              # blank → CodexRunner default (GPT-5.5)
     codex_provider_id: str = "openai-custom"  # NOT "openai": reserved by codex-cli ≥0.142
@@ -518,6 +523,7 @@ class HarnessConfig:
     def review_runtime(self) -> ReviewRuntimeConfig:
         return ReviewRuntimeConfig(
             bot=self.review_bot,
+            runtime=self.reviewer_runtime,
             model=self.review_model,
             prompt=self.review_prompt,
             mode=self.review_mode,
@@ -1240,6 +1246,7 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         jira_mcp_tools=e.get("JIRA_MCP_TOOLS", _dc_default("jira_mcp_tools")),
         jira_budget_usd=_coerce_float(e, "JIRA_SYNC_BUDGET_USD", _dc_default("jira_budget_usd"), errors),
         fixer_runtime=e.get("FIXER_RUNTIME", _dc_default("fixer_runtime")),
+        reviewer_runtime=e.get("REVIEWER_RUNTIME", _dc_default("reviewer_runtime")),
         codex_bin=e.get("CODEX_BIN", _dc_default("codex_bin")),
         codex_model=e.get("CODEX_MODEL", _dc_default("codex_model")),
         codex_provider_id=e.get("CODEX_PROVIDER_ID", _dc_default("codex_provider_id")),
