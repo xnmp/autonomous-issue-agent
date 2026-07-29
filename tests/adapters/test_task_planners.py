@@ -726,7 +726,7 @@ def test_route_model_maps_tiers_within_the_active_runtime_family():
     assert route_model("complex", "codex") == "gpt-5.6-sol"
     assert route_model("standard", "codex") == "gpt-5.6-terra"
     assert route_model("trivial", "codex") == "gpt-5.6-luna"
-    assert route_model("complex", "claude") == "fable"
+    assert route_model("complex", "claude") == "opus"
     assert route_model("trivial") == "haiku"
 
 
@@ -737,7 +737,7 @@ def test_route_model_is_total_over_garbage_classifier_output():
 
     assert route_model("nonsense", "codex") == "gpt-5.6-terra"
     assert route_model("", "claude") == "sonnet"
-    assert route_model("complex", "gemini???") == "fable"
+    assert route_model("complex", "gemini???") == "opus"
 
 
 def test_route_model_maps_tiers_within_the_glm_family():

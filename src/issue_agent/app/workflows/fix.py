@@ -308,7 +308,10 @@ class FixWorkflow:
         # exactly the case where preserving the prior session's model is wrong.
         tiered = tier is not None or (ceiling and not self.cfg.fix.model)
         model = (
-            task_builders.route_model(stance.tier, self.cfg.fixer_runtime)
+            (
+                task_builders.route_ceiling_model(self.cfg.fixer_runtime)
+                if ceiling else task_builders.route_model(stance.tier, self.cfg.fixer_runtime)
+            )
             if tiered else cfg.model
         )
         # Same rule as the journal: name the tier move only when this leg chose

@@ -156,7 +156,7 @@ def build_resolve_task(
     return AgentTask(
         prompt=prompt,
         schema=FIX_SCHEMA,
-        append_system_prompt=cfg.agent_md,
+        append_system_prompt=_fix_system_prompt(cfg, None),
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
         effort=cfg.effort,
@@ -200,7 +200,7 @@ def build_author_task(
     return AgentTask(
         prompt=prompt,
         schema=AUTHOR_SCHEMA,
-        append_system_prompt=cfg.agent_md,
+        append_system_prompt=_fix_system_prompt(cfg, None),
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
         effort=cfg.effort,
@@ -252,7 +252,7 @@ def build_implement_task(
     return AgentTask(
         prompt=prompt,
         schema=IMPLEMENT_SCHEMA,
-        append_system_prompt=cfg.agent_md,
+        append_system_prompt=_fix_system_prompt(cfg, None),
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
         effort=cfg.effort,
@@ -293,7 +293,7 @@ def build_adjudicate_task(
     return AgentTask(
         prompt=prompt,
         schema=ADJUDICATE_SCHEMA,
-        append_system_prompt=cfg.agent_md,
+        append_system_prompt=_fix_system_prompt(cfg, None),
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
         effort=cfg.effort,
@@ -468,7 +468,7 @@ def build_rebase_task(
 # ORDER (which the escalation ladder walks, #16), this table owns the PRICES.
 # `_TIER_TABLE_COMPLETE` below keeps the two from drifting apart silently.
 MODEL_TIERS: dict[str, dict[str, str]] = {
-    "claude": {"trivial": "haiku", "standard": "sonnet", "complex": "fable"},
+    "claude": {"trivial": "haiku", "standard": "sonnet", "complex": "opus"},
     "codex": {
         "trivial": "gpt-5.6-luna",
         "standard": "gpt-5.6-terra",
@@ -510,6 +510,19 @@ def route_model(tier: str, runtime: str = "claude") -> str:
     inside dispatch."""
     tiers = MODEL_TIERS.get(runtime) or MODEL_TIERS["claude"]
     return tiers.get(tier) or tiers[DEFAULT_TIER]
+
+
+def route_ceiling_model(runtime: str = "claude") -> str:
+    """The explicit expensive fallback reserved for proven-hard work.
+
+    This is intentionally separate from the ordinary ``complex`` route: a
+    first-attempt architectural issue still receives its normal top tier,
+    while recurrence or repeated completed failure is the evidence that pays
+    for the exceptional capability ceiling.
+    """
+    if runtime == "claude":
+        return "fable"
+    return route_model(TIER_LADDER[-1], runtime)
 
 
 def build_router_task(
