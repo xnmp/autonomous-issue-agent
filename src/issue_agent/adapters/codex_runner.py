@@ -1275,18 +1275,29 @@ class CodexRunner(AgentRuntime):
         session_id = task.resume or ""
         implausible_usage_logged = False
 
-        def _current_session_id(extra_output: str = "") -> str:
-            """Cached identity from resume input, legacy header, or rollout."""
+        def _current_session_id(
+            extra_output: str = "", *, allow_legacy_header: bool = False
+        ) -> str:
+            """Cached identity from resume input or matching root rollout.
+
+            A human-readable header is an exit-time compatibility fallback only.
+            Stderr contains arbitrary agent output, so caching a header-shaped
+            line during the run would let echoed data suppress later root-rollout
+            discovery and poison budget enforcement.
+            """
             nonlocal session_id
             if session_id:
                 return session_id
             stderr = "\n".join(err_chunks)
-            session_id = (
+            session_id = discover_rollout_session(
+                execution_cwd, rollout_started_at
+            )
+            if session_id or not allow_legacy_header:
+                return session_id
+            return (
                 _session_id_from_lines(stderr)
                 or _session_id_from_lines(extra_output)
-                or discover_rollout_session(execution_cwd, rollout_started_at)
             )
-            return session_id
 
         def _trusted_usage(usage: dict | None, sid: str) -> dict | None:
             """Reject one implausible early sample and make the rejection loud."""
@@ -1502,7 +1513,7 @@ class CodexRunner(AgentRuntime):
             # when a descendant that survived our killpg still holds the pipe,
             # and reporting that as an idle timeout would bury the real reason
             # this run was stopped.
-            session_id = _current_session_id(stdout)
+            session_id = _current_session_id(stdout, allow_legacy_header=True)
             final_usage = _trusted_usage(
                 self._usage_so_far(err_chunks, usage_baseline, session_id),
                 session_id,
@@ -1579,7 +1590,7 @@ class CodexRunner(AgentRuntime):
         # 0.146.0 removed the human-readable session header. The root rollout's
         # session_meta is now the primary machine-readable identity source;
         # legacy stderr/stdout headers and task.resume remain compatible.
-        session_id = _current_session_id(stdout)
+        session_id = _current_session_id(stdout, allow_legacy_header=True)
         rollout_usage = read_rollout_usage(session_id)
         if rollout_usage is None:
             rollout_usage = parse_codex_usage(stderr)

@@ -539,6 +539,51 @@ def test_recovered_session_identity_drives_the_next_resume_invocation(
     assert any(f"exec resume {sid}" in invocation for invocation in invocations)
 
 
+def test_echoed_session_header_cannot_override_matching_root_rollout(
+    tmp_path, monkeypatch
+):
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    codex_home = tmp_path / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    now = datetime.now(timezone.utc)
+    echoed_sid = "019fa000-agent-output"
+    root_sid = "019fa000-actual-root"
+    _write_session_rollout(
+        codex_home,
+        sid=echoed_sid,
+        cwd=str(tmp_path / "unrelated"),
+        timestamp=now + timedelta(minutes=2),
+        input_tokens=5_000_000,
+        output_tokens=100_000,
+    )
+    _write_session_rollout(
+        codex_home,
+        sid=root_sid,
+        cwd=str(worktree),
+        timestamp=now + timedelta(minutes=1),
+    )
+    body = (
+        'out=""; prev=""\n'
+        'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
+        f'echo "session id: {echoed_sid}" >&2\n'
+        'echo "Process exited with code 0" >&2\n'
+        "printf '%s' "
+        + "'{\"status\":\"pr_opened\",\"summary\":\"done\",\"needs\":\"\"}' > \"$out\"\n"
+    )
+    result = asyncio.run(
+        CodexRunner(
+            codex_bin=_fake_codex(str(tmp_path), body),
+            env={"OPENAI_API_KEY": "test-key"},
+            cost_per_mtok_in=5.0,
+            cost_per_mtok_out=30.0,
+        ).run(AgentTask(prompt="resolve", cwd=str(worktree)))
+    )
+
+    assert result.session_id == root_sid
+    assert result.cost_usd == pytest.approx(8.0)
+
+
 def test_productive_headerless_run_without_usage_logs_and_journals_warning(
     tmp_path, capsys
 ):
