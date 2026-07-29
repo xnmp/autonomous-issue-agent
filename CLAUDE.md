@@ -292,7 +292,12 @@ flag: the runner samples the rollout's cumulative token counters, subtracts the
 resumed session baseline, and kills the process group when the current leg
 crosses the threshold. This requires `CODEX_ENFORCE_BUDGET=1` and positive input
 and output prices for every fallback/per-model rate; startup logs explicitly
-report any configuration where the dollar bound cannot be enforced.
+report any configuration where the dollar bound cannot be enforced. Codex
+0.146.0 no longer prints a session-id header: fresh-run identity comes from the
+post-start rollout `session_meta` matching the worktree, `originator=codex_exec`,
+and `source=exec`. The source filter excludes same-cwd subagent rollouts; resumed
+runs seed identity from their persisted session ID. Arbitrary stderr is never an
+in-flight usage source because it contains agent-controlled tool/test output.
 
 ## Identities
 
