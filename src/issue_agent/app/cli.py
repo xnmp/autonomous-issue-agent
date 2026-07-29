@@ -1072,6 +1072,18 @@ def log_dir() -> str:
     )
 
 
+def _dashweb_ready() -> bool:
+    """Can `--serve` hand over to the interactive dashboard? Both halves must be
+    present — the `dash` extra AND a built SPA — because either alone degrades
+    to a worse experience than the v1 snapshot (an API with no UI, or a UI with
+    no server)."""
+    import importlib.util
+
+    if importlib.util.find_spec("fastapi") is None:
+        return False
+    return os.path.isfile(os.path.join(HARNESS_ROOT, "dashboard", "dist", "index.html"))
+
+
 def cmd_dashboard(args) -> int:
     """Every deployment, every issue, one read-only view (see app/dashboard.py).
 
@@ -1104,6 +1116,17 @@ def cmd_dashboard(args) -> int:
 
     if args.serve:
         url = f"http://127.0.0.1:{args.serve}/"
+        if _dashweb_ready():
+            from .dashweb.server import serve as dashweb_serve
+
+            info(f"serving the interactive dashboard at {url} (Ctrl-C to stop)")
+            try:
+                dashweb_serve(args.serve)
+            except KeyboardInterrupt:
+                print()
+            return 0
+        warn("interactive dashboard unavailable — serving the v1 snapshot instead:")
+        warn("  uv sync --extra dash && make dashboard-ui")
         info(f"serving the dashboard at {url} (Ctrl-C to stop) — regenerated per request")
         try:
             dash.serve(args.serve, lambda: dash.render_html(build()))

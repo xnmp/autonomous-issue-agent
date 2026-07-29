@@ -70,7 +70,8 @@ def scan_proc_daemons(proc_root: str = "/proc") -> tuple[dict[str, set[str]], bo
     staleness heuristic rather than report every daemon dead.
     """
     found: dict[str, set[str]] = {}
-    read_any = False
+    read_foreign = False
+    own_pid = str(os.getpid())
     try:
         pids = [p for p in os.listdir(proc_root) if p.isdigit()]
     except OSError:
@@ -81,7 +82,12 @@ def scan_proc_daemons(proc_root: str = "/proc") -> tuple[dict[str, set[str]], bo
                 blob = fh.read()
         except OSError:
             continue  # another user's process, or it exited mid-scan
-        read_any = True
+        # Our OWN environ is always readable, so counting it would report a
+        # successful scan under hidepid=2 or in a container — where every
+        # daemon would then read as dead and the start guard would wave a
+        # running deployment through.
+        if pid != own_pid:
+            read_foreign = True
         name = deployment_of_env(_environ_agent_env(blob))
         if not name:
             continue
@@ -92,7 +98,7 @@ def scan_proc_daemons(proc_root: str = "/proc") -> tuple[dict[str, set[str]], bo
         except OSError:
             continue
         roles.update(a for a in argv if a in dash.ROLE_NAMES)
-    return found, read_any
+    return found, read_foreign
 
 
 # ── frecency ──────────────────────────────────────────────────────────────────
@@ -167,13 +173,19 @@ def collect_deployment(
     )
 
 
+_harness_repo: dict[str, str] = {}
+
+
 def harness_repo(harness_root: str | None = None) -> str:
     """The harness's own `owner/name`, for the `is_self` sidebar marker. "" when
-    it cannot be read — a missing self-marker is cosmetic."""
+    it cannot be read — a missing self-marker is cosmetic. Memoised: a checkout's
+    origin does not change while the server runs, and this is on a poll path."""
     root = harness_root or cli.HARNESS_ROOT
-    return cli.parse_remote_url(
-        cli._run(["git", "remote", "get-url", "origin"], cwd=root)
-    )
+    if root not in _harness_repo:
+        _harness_repo[root] = cli.parse_remote_url(
+            cli._run(["git", "remote", "get-url", "origin"], cwd=root)
+        )
+    return _harness_repo[root]
 
 
 def health_json(h: dash.DaemonHealth, alive: bool | None) -> dict:

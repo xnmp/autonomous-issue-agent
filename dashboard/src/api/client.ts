@@ -79,7 +79,9 @@ export function postJson<T>(
 ): Promise<T> {
   return request<T>(path, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    // The server rejects writes without this header: a cross-site form cannot
+    // set one, and a cross-site fetch that does gets preflighted and refused.
+    headers: { "Content-Type": "application/json", "X-Issue-Agent-Dashboard": "1" },
     body: JSON.stringify(body ?? {}),
     signal,
   });

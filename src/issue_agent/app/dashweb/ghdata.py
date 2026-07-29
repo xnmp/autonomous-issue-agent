@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -38,19 +39,25 @@ class TtlCache:
     ttl_s: float = DEFAULT_TTL_S
     clock: Callable[[], float] = time.monotonic
     _entries: dict = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def get(self, key):
-        entry = self._entries.get(key)
-        if entry is None:
-            return None
-        expires, value = entry
-        if self.clock() >= expires:
-            del self._entries[key]
-            return None
-        return value
+        # Locked, and `pop` rather than `del`: routes are sync `def`, so they
+        # run concurrently in the threadpool and two of them can expire the
+        # same key at once.
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return None
+            expires, value = entry
+            if self.clock() >= expires:
+                self._entries.pop(key, None)
+                return None
+            return value
 
     def put(self, key, value):
-        self._entries[key] = (self.clock() + self.ttl_s, value)
+        with self._lock:
+            self._entries[key] = (self.clock() + self.ttl_s, value)
         return value
 
 

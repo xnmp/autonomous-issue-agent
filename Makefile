@@ -2,7 +2,7 @@
 SHELL := /bin/bash
 HARNESS_ROOT := $(shell pwd)
 
-.PHONY: help test test-governor test-hooks test-orchestration test-deployment-env test-point-at test-domain test-adapters test-parity arch doctor \
+.PHONY: help test test-governor test-hooks test-orchestration test-deployment-env test-point-at test-domain test-adapters test-app test-parity arch doctor dashboard-ui \
 	        install bootstrap point-at run-fix run-review run-steward run-fix-sh run-review-sh run-steward-sh demo-gate \
         install-launchd install-systemd \
         uninstall-launchd uninstall-systemd demo-init lint clean
@@ -12,6 +12,8 @@ help:
 	@echo "  make test               run the full self-test suite (governor + hooks + orchestration + domain)"
 	@echo "  make test-domain        run the pure Python domain behavioural suite (Phase 0/1 port)"
 	@echo "  make test-adapters      run the Python adapter suite (Phase 2: AgentRunner + governor)"
+	@echo "  make test-app           run the app-layer suite (dashboard web collectors + endpoints)"
+	@echo "  make dashboard-ui       build the interactive dashboard SPA into dashboard/dist"
 	@echo "  make test-parity        run the gate PARITY suite (same case through bash + Python gates)"
 	@echo "  make doctor             preflight: tooling, config, identities, repo access"
 	@echo "  make install            install the 'issue-agent' CLI (uv sync + ~/.local/bin shim)"
@@ -29,7 +31,7 @@ help:
 # test-deployment-env is NOT in this chain: it re-runs the two bash suites
 # under a hostile env, doubling their wall clock — and `make test` is the
 # self-hosted TEST_CMD paid on every gate run. CI runs it as its own step.
-test: test-governor test-hooks test-orchestration test-point-at test-domain test-adapters test-parity arch
+test: test-governor test-hooks test-orchestration test-point-at test-domain test-adapters test-app test-parity arch
 	@echo ""
 	@echo "✓ all suites passed"
 
@@ -62,6 +64,18 @@ test-domain:
 test-adapters:
 	@echo "== adapters (pytest: AgentRunner mapping + in-process governor) =="
 	@uv run --quiet --extra sdk --with pytest pytest tests/adapters/
+
+# The dashboard/CLI app layer. Deliberately NOT installed with `--extra dash`:
+# the endpoint tests importorskip fastapi, so this target is the standing proof
+# that `make test` stays green on a machine that never installed the extra.
+test-app:
+	@echo "== app (pytest: dashboard web collectors + endpoints) =="
+	@uv run --quiet --with pytest pytest tests/app/
+
+# Build the dashboard SPA into dashboard/dist (gitignored). Needed before
+# `issue-agent dashboard --serve` prefers the interactive UI over the v1 page.
+dashboard-ui:
+	@cd dashboard && npm ci && npm run build
 
 # Gate parity (review M6). The harness has TWO gate implementations — the bash
 # checkers (live for codex) and domain/gate.py + adapters/governor.py (live for
