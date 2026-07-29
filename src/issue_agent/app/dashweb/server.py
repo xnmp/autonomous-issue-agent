@@ -125,7 +125,24 @@ class Backend:
 
     def overview(self, name: str) -> dict:
         live, scan_ok = snapshots.scan_proc_daemons()
-        return snapshots.overview_payload(self.snapshot(name), live, scan_ok)
+        snapshot = self.snapshot(name)
+        all_snapshots = [self.snapshot(candidate) for candidate in self.names()]
+        issues, issue_error = self.gh.issues(snapshot.repo)
+        recurrence_events = [
+            event
+            for row in snapshot.deployment.issues
+            for event in row.events
+            if event.get("event") == "recurrence"
+        ]
+        payload = snapshots.overview_payload(snapshot, live, scan_ok)
+        payload["health_trend"] = snapshots.health_trend(
+            issues,
+            recurrence_events,
+            first_class_day=snapshots.first_observed_class_day(snapshot, all_snapshots),
+        )
+        if issue_error:
+            payload["warnings"].append(f"GitHub issue history unavailable: {issue_error}")
+        return payload
 
     # ── gh-augmented ──
     def _gh_context(self, repo: str) -> tuple[dict, dict, list[str]]:
@@ -286,7 +303,7 @@ def create_app(backend: Backend | None = None, harness_root: str | None = None):
         try:
             return backend.overview(name)
         except Exception as exc:  # noqa: BLE001
-            return degraded("overview", exc, metrics=None, cost_mix=None, health=[])
+            return degraded("overview", exc, metrics=None, cost_mix=None, health=[], health_trend=[])
 
     @app.get("/api/repos/{name}/issues")
     def api_issues(name: str):

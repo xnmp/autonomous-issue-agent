@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 DEFAULT_TTL_S = 45.0
 GH_TIMEOUT_S = 30.0
 
-ISSUE_FIELDS = "number,title,url,labels,state,createdAt,comments"
+ISSUE_FIELDS = "number,title,url,labels,state,createdAt,closedAt,comments"
 PR_FIELDS = "number,title,url,state,mergedAt"
 
 

@@ -149,12 +149,22 @@ leg family:
                 "steward_usd": ... },
   "caps": { "issue_cap_usd": ..., "daily_cap_usd": ..., "today_usd": ... },
   "health": [ ...same role objects as /api/repos... ],
+  "health_trend": [{ "day": "2026-07-29", "opened": 3, "closed": 1,
+                     "net_open": 2, "recurrences": 0, "first_of_class": true }],
   "unattributed": [ last 20 deployment-level events ],
   "warnings": [] }
 ```
 
 Repair family = FIX_CI + ADDRESS_REVIEW + REBASE; steward = TRIAGE +
 STEWARD_DRIVE + JIRA_SYNC; review = REVIEW + RE_REVIEW; resolve = the rest.
+
+`health_trend` is advisory per UTC day: GitHub issue `createdAt`/`closedAt`
+provide opened/closed counts for the selected target repository, while journal
+`recurrence` events provide the recurrence count. `first_of_class` identifies
+the first journalled day for that repository/fixer-runtime/review-mode tuple;
+it distinguishes expected first-of-class tuition from a repeat-deployment trend.
+If GitHub is unavailable, lifecycle counts are absent and the panel still shows
+journal recurrences with a warning.
 
 ### GET /api/repos/{name}/issues
 
