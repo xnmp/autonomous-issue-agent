@@ -366,6 +366,7 @@ def test_unverified_composite_is_failed_and_remains_pending(tmp_path):
 
 def test_unverifiable_pending_escalation_is_quarantined_and_observe_resumes(
     tmp_path,
+    monkeypatch,
 ):
     class NeverVerifiedGateway(CompositeGateway):
         def has_label(self, kind, number, label):
@@ -376,6 +377,11 @@ def test_unverifiable_pending_escalation_is_quarantined_and_observe_resumes(
     action = EscalateCiPending(64, "head-sha", "CI is stalled")
     store.save_pending_actions((action,))
     observed = []
+    alerts = []
+    monkeypatch.setattr(
+        "issue_agent.app.execute.alert",
+        lambda command, line: alerts.append((command, line)),
+    )
     daemon = Daemon(
         "fix",
         lambda: observed.append(True) or WorldState(),
@@ -384,6 +390,7 @@ def test_unverifiable_pending_escalation_is_quarantined_and_observe_resumes(
             NeverVerifiedGateway(),
             pending_actions=store,
             journal=journal,
+            alert_cmd="notify-operator",
             retry_delays=(),
         ),
     )
@@ -394,3 +401,5 @@ def test_unverifiable_pending_escalation_is_quarantined_and_observe_resumes(
     assert store.load_pending_actions() == ()
     assert store.load_quarantined_actions() == (action,)
     assert any(event == "action_quarantined" for event, _ in journal.events)
+    assert len(alerts) == 1
+    assert alerts[0][0] == "notify-operator"
