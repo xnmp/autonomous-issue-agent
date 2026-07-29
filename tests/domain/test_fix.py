@@ -392,6 +392,24 @@ def test_blocked_pr_reply_dispatches_pr_resume_for_linked_issue_session():
     assert RunAgent(AgentKind.PR_RESUME, 100) in _run_agents(actions)
 
 
+def test_blocked_pr_review_prompt_ignores_comments_before_the_prompt():
+    review_prompt = (
+        "**Agent needs clarification on review:**\n\n"
+        "Which approach should I take?\n\n_Reply to unblock._"
+    )
+    blocked = pr(
+        100, "ai-pr-open", "ai-blocked", closing_issue=7,
+        comments=(
+            Comment("alice", "Earlier feedback", "t1"),
+            Comment("fix-bot", review_prompt, "t2"),
+        ),
+    )
+    state = FixState(sessions=frozenset({7}))
+
+    assert prs_needing_resume(world(prs=[blocked]), state, CFG) == []
+    assert _run_agents(decide_fix(world(prs=[blocked]), CFG, state, fixer_busy=False)) == []
+
+
 def test_blocked_pr_reply_already_resumed_does_not_dispatch_again():
     prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
     blocked = pr(
