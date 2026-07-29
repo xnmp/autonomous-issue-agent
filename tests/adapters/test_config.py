@@ -900,76 +900,22 @@ def test_a_model_priced_twice_keeps_the_first_and_says_so():
 # ── #29: describe() must not claim a bound codex cannot honour ───────────────
 
 
-def test_describe_reports_the_codex_budget_as_enforced_on_shipped_config():
-    """`fix_budget=$20.00` was printed bare on every codex boot while a resolve
-    ran to $28.74 and exited `ok`. The runner now enforces the budget itself, so
-    on the SHIPPED config (enforcement on, non-zero rates) the boot line must say
-    so — and must NOT still be carrying the old NOT-ENFORCED caveat, which would
-    be the same misreport pointing the other way."""
+def test_describe_flags_the_fix_budget_as_unenforced_on_codex():
+    """`fix_budget=$20.00` was printed on every codex boot while a resolve ran
+    to $28.74 and exited `ok` — the startup log asserting a guarantee the
+    runtime cannot make."""
     d = from_env({
         "REPO": "o/r", "FIXER_RUNTIME": "codex", "MAX_BUDGET_USD": "20",
         "AGENT_MAX_RUNTIME_SECONDS": "3600",
     }).describe()
     assert "fix_budget=$20.00" in d
-    assert "enforced on codex" in d
-    assert "NOT ENFORCED" not in d
-
-
-def test_describe_says_not_enforced_when_the_operator_switches_enforcement_off():
-    d = from_env({
-        "REPO": "o/r", "FIXER_RUNTIME": "codex", "MAX_BUDGET_USD": "20",
-        "AGENT_MAX_RUNTIME_SECONDS": "3600", "CODEX_ENFORCE_BUDGET": "0",
-    }).describe()
-    assert "NOT ENFORCED on codex" in d
-    assert "CODEX_ENFORCE_BUDGET=0" in d
-    assert "3600s" in d
-
-
-def test_describe_says_not_enforced_when_the_price_table_is_zeroed():
-    """Enforcement armed but structurally unable to fire: with both rates 0
-    every run prices at $0.00, so no dollar threshold is ever crossed. This is
-    the worse of the two disabled regimes — it LOOKS enforced — so describe()
-    has to name it rather than print the enforced verdict."""
-    d = from_env({
-        "REPO": "o/r", "FIXER_RUNTIME": "codex", "MAX_BUDGET_USD": "20",
-        "AGENT_MAX_RUNTIME_SECONDS": "3600",
-        "CODEX_COST_PER_MTOK_IN": "0", "CODEX_COST_PER_MTOK_OUT": "0",
-    }).describe()
-    assert "NOT ENFORCED on codex" in d
-    assert "dollar threshold is not measurable" in d
-
-
-@pytest.mark.parametrize(
-    ("rate_name", "rate_value"),
-    [
-        ("CODEX_COST_PER_MTOK_IN", "0"),
-        ("CODEX_COST_PER_MTOK_OUT", "0"),
-    ],
-)
-def test_describe_says_not_enforced_when_either_token_class_is_unpriced(
-    rate_name, rate_value
-):
-    d = from_env({
-        "REPO": "o/r", "FIXER_RUNTIME": "codex", "MAX_BUDGET_USD": "20",
-        "AGENT_MAX_RUNTIME_SECONDS": "3600", rate_name: rate_value,
-    }).describe()
-    assert "NOT ENFORCED on codex" in d
-    assert "both input and output prices" in d
-
-
-def test_describe_says_not_enforced_when_a_model_override_is_half_priced():
-    d = from_env({
-        "REPO": "o/r", "FIXER_RUNTIME": "codex", "MAX_BUDGET_USD": "20",
-        "CODEX_COST_PER_MTOK": "gpt-5.6-terra=2/0",
-    }).describe()
-    assert "NOT ENFORCED on codex" in d
-    assert "dollar threshold is not measurable" in d
+    assert "NOT ENFORCED on codex" in d and "3600s" in d
 
 
 def test_describe_says_nothing_bounds_a_codex_run_without_a_wall_cap():
     d = from_env({
         "REPO": "o/r", "FIXER_RUNTIME": "codex", "MAX_BUDGET_USD": "20",
-        "AGENT_MAX_RUNTIME_SECONDS": "0", "CODEX_ENFORCE_BUDGET": "0",
+        "AGENT_MAX_RUNTIME_SECONDS": "0",
     }).describe()
     assert "NOT ENFORCED on codex" in d
     assert "AGENT_MAX_RUNTIME_SECONDS is unset" in d

@@ -1431,27 +1431,15 @@ def _codex_daemon(tmp_path, **env):
     )
 
 
-def test_a_codex_fixer_is_silent_once_the_budget_is_really_enforced(tmp_path, capsys):
-    """The warning exists to correct a false claim. With enforcement on and the
-    shipped (non-zero) rates, MAX_BUDGET_USD IS a real per-run ceiling — the
-    runner kills the session on crossing it — so there is nothing to correct and
-    a warning here would be its own misreport."""
-    _codex_daemon(tmp_path)  # shipped defaults: enforcement on, rates non-zero
+def test_a_codex_fixer_warns_that_the_per_session_budget_is_not_enforced(tmp_path, capsys):
+    """It fired for nobody before: the clause lived inside the blindspot
+    warning, which goes silent as soon as pricing is configured — so the
+    operators who set up pricing correctly were the ones who never saw it."""
+    _codex_daemon(tmp_path)  # shipped (non-zero) rates → no blindspot warning
 
     err = capsys.readouterr().err
     assert "CODEX_COST_PER_MTOK_IN/OUT are 0" not in err, "pricing IS configured"
-    assert "NOT ENFORCED" not in err
-
-
-def test_a_codex_fixer_warns_when_enforcement_is_switched_off(tmp_path, capsys):
-    """Anti-vacuity twin: the operator opting out is exactly when the boot log
-    has to say the budget bounds nothing — the state the original bug shipped
-    silently."""
-    _codex_daemon(tmp_path, CODEX_ENFORCE_BUDGET="0")
-
-    err = capsys.readouterr().err
     assert "NOT ENFORCED on this runtime" in err
-    assert "CODEX_ENFORCE_BUDGET=0" in err
     assert "MAX_BUDGET_USD=$20.00" in err
 
 

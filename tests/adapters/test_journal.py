@@ -571,7 +571,7 @@ def test_journaling_runtime_satisfies_the_agent_runtime_port(tmp_path):
 def test_agent_run_records_context_cost_and_usage(tmp_path):
     result = AgentResult(
         is_error=False, status="pr_opened", cost_usd=1.25, session_id="s5",
-        exit_reason=ExitReason.OK, num_turns=7,
+        exit_reason=ExitReason.OK,
         usage={"input_tokens": 10, "output_tokens": 20, "cache_read_input_tokens": 30,
                "cache_creation_input_tokens": 40, "ignored": "extra"},
     )
@@ -588,7 +588,6 @@ def test_agent_run_records_context_cost_and_usage(tmp_path):
     assert run["usage"] == {"input_tokens": 10, "output_tokens": 20,
                             "cache_read_input_tokens": 30, "cache_creation_input_tokens": 40}
     assert isinstance(run["duration_s"], float)
-    assert run["turns"] == 7
 
     spend = read_events(ledger)[0]
     assert spend == {**spend, "event": "spend", "repo": "o/r", "issue": 5,

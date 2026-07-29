@@ -543,11 +543,23 @@ def codex_cost_blindspot_warning(
             "one token class is unpriced, so codex spend is undercounted and "
             "neither cap is a reliable ceiling"
         )
+    if max_runtime > 0:
+        per_run = (
+            "Codex has no per-session budget flag natively; until pricing is "
+            f"complete, the wall cap (AGENT_MAX_RUNTIME_SECONDS={max_runtime:.0f}s) "
+            "is the only in-run bound"
+        )
+    else:
+        per_run = (
+            "Codex has no per-session budget flag natively and "
+            "AGENT_MAX_RUNTIME_SECONDS is unset; CODEX_MAX_RUNTIME_SECONDS is "
+            "unset because it is not a valid setting"
+        )
     return (
         "codex: WARNING — spend caps are armed "
         f"({caps}) but both CODEX_COST_PER_MTOK_IN/OUT must be positive; "
         f"{consequence}. Set both to your gateway's USD-per-million-token "
-        "prices. (FIXER_RUNTIME=codex)"
+        f"prices. {per_run}. (FIXER_RUNTIME=codex)"
     )
 
 
@@ -591,11 +603,17 @@ def codex_budget_not_enforced_warning(
     if fix_budget_usd <= 0:
         return None
     if enforced and priced:
-        return None
+        return (
+            "codex: NOTICE — the native per-session budget flag is NOT ENFORCED "
+            "on this runtime because codex has no such flag; harness enforcement "
+            f"ACTIVE for MAX_BUDGET_USD=${fix_budget_usd:.2f} using streamed "
+            "rollout usage. (FIXER_RUNTIME=codex)"
+        )
     bound = (
         f"the wall cap (AGENT_MAX_RUNTIME_SECONDS={max_runtime:.0f}s)"
         if max_runtime > 0
-        else "NOTHING (AGENT_MAX_RUNTIME_SECONDS is unset — set it)"
+        else "NOTHING (AGENT_MAX_RUNTIME_SECONDS is unset — "
+        "CODEX_MAX_RUNTIME_SECONDS is unset because it is not a valid setting)"
     )
     why = (
         "CODEX_ENFORCE_BUDGET=0"
@@ -1417,12 +1435,60 @@ class CodexRunner(AgentRuntime):
         # file holds only the final message). Check stderr first, stdout second.
         session_id = _session_id_from_lines(stderr) or _session_id_from_lines(stdout)
         rollout_usage = read_rollout_usage(session_id)
+        if rollout_usage is None:
+            rollout_usage = parse_codex_usage(stderr)
         # A resumed session's rollout counter is cumulative; subtract what the
         # previous leg already ledgered (see usage_delta). Only when this run
         # really continued THAT session — a resume that fell back to a fresh
         # session has nothing pre-paid in its counter.
         if usage_baseline is not None and session_id == usage_baseline[0]:
             rollout_usage = usage_delta(rollout_usage, usage_baseline[1])
+        rollout_turns = read_rollout_turns(session_id)
+        if (
+            rollout_turns is not None
+            and usage_baseline is not None
+            and session_id == usage_baseline[0]
+            and usage_baseline[2] is not None
+        ):
+            rollout_turns = max(0, rollout_turns - usage_baseline[2])
+        # A final token_count can land immediately before EOF, inside one poll
+        # slice. Recheck completed counters so clean exit cannot turn an
+        # over-budget leg into status=pr_opened.
+        final_overrun = (
+            budget_overrun_usd(
+                rollout_usage,
+                cost_per_mtok_in=rate_in,
+                cost_per_mtok_out=rate_out,
+                max_budget_usd=budget_usd,
+            )
+            if budget_armed
+            else None
+        )
+        if final_overrun is not None:
+            self._log(
+                f"codex: BUDGET — final usage spent ${final_overrun:.2f}, "
+                f"crossing MAX_BUDGET_USD=${budget_usd:.2f}"
+            )
+            return (
+                AgentResult(
+                    is_error=True,
+                    status="error_max_budget_usd",
+                    envelope_subtype="error_max_budget_usd",
+                    exit_reason=ExitReason.BUDGET_EXHAUSTED,
+                    summary=(
+                        f"codex final spend ${final_overrun:.2f} crossed "
+                        f"MAX_BUDGET_USD=${budget_usd:.2f}"
+                    ),
+                    cost_usd=final_overrun,
+                    usage=rollout_usage,
+                    num_turns=rollout_turns,
+                    session_id=session_id,
+                ),
+                exit_code,
+                stderr,
+                stdout,
+                False,
+            )
         # rate_in/rate_out come from the single rates_for_model lookup hoisted
         # above the pump, so this leg is priced identically whether it finished
         # or was killed on budget (#29/#43).
@@ -1435,14 +1501,6 @@ class CodexRunner(AgentRuntime):
             cost_per_mtok_out=rate_out,
             usage=rollout_usage,
         )
-        rollout_turns = read_rollout_turns(session_id)
-        if (
-            rollout_turns is not None
-            and usage_baseline is not None
-            and session_id == usage_baseline[0]
-            and usage_baseline[2] is not None
-        ):
-            rollout_turns = max(0, rollout_turns - usage_baseline[2])
         from dataclasses import replace as _replace
 
         result = _replace(result, num_turns=rollout_turns)

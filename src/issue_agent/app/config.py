@@ -692,7 +692,16 @@ class HarnessConfig:
             # One zero leaves a routed model able to spend outside the meter.
             priced = self.codex_runtime.budget_priceable
             if self.codex_enforce_budget and priced:
-                fix_budget += " (enforced on codex — the run is killed once its streamed usage crosses it)"
+                fallback = (
+                    f"wall cap {self.agent_max_runtime:.0f}s remains the fallback"
+                    if self.agent_max_runtime > 0
+                    else "AGENT_MAX_RUNTIME_SECONDS is unset"
+                )
+                fix_budget += (
+                    " (native flag NOT ENFORCED on codex; harness-enforced on "
+                    "codex — the run is rejected once streamed usage crosses it; "
+                    f"{fallback})"
+                )
             else:
                 why = (
                     "CODEX_ENFORCE_BUDGET=0"
