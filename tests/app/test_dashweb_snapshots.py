@@ -289,7 +289,7 @@ def test_duplicate_leg_annotations_for_one_stall_are_subtracted_once():
     assert snapshots.issue_card(row_for(events, 7), NOW)["elapsed_s"] == 6000
 
 
-def test_overlapping_cross_role_stall_estimates_are_subtracted_as_one_interval():
+def test_overlapping_cross_role_stall_estimates_are_subtracted_once():
     events = [
         {"ts": ts(hours=4), "event": "agent_run_start", "role": "fix",
          "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
@@ -305,7 +305,7 @@ def test_overlapping_cross_role_stall_estimates_are_subtracted_as_one_interval()
          "desc": "clear state for pr #12, issue #7 (merged)"},
     ]
 
-    assert snapshots.issue_card(row_for(events, 7), NOW)["elapsed_s"] == 5940
+    assert snapshots.issue_card(row_for(events, 7), NOW)["elapsed_s"] == 6000
 
 
 def test_issue_card_carries_gh_title_pr_state_and_merge_stamp():

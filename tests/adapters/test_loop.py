@@ -386,6 +386,81 @@ def test_inclusive_late_heartbeat_reconciles_when_active_clock_also_advanced(tmp
     assert not any(event["event"] == "agent_run_stall" for event in events)
 
 
+def test_stall_annotation_uses_each_legs_clock_gap_not_shifted_start_estimate(
+    tmp_path,
+):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    rows = [
+        {
+            "ts": "1970-01-01T00:00:10+00:00",
+            "event": "agent_run_start",
+            "role": "fix",
+            "kind": "RESOLVE",
+            "number": 5,
+            "issue": 5,
+            "dispatch": "crossed-gap",
+        },
+        {
+            "ts": "1970-01-01T00:01:40+00:00",
+            "event": "agent_run",
+            "role": "fix",
+            "kind": "RESOLVE",
+            "number": 5,
+            "issue": 5,
+            "dispatch": "crossed-gap",
+            "duration_s": 30,
+        },
+        {
+            "ts": "1970-01-01T00:03:10+00:00",
+            "event": "agent_run_start",
+            "role": "fix",
+            "kind": "RESOLVE",
+            "number": 6,
+            "issue": 6,
+            "dispatch": "after-resume",
+        },
+        {
+            "ts": "1970-01-01T00:03:40+00:00",
+            "event": "agent_run",
+            "role": "fix",
+            "kind": "RESOLVE",
+            "number": 6,
+            "issue": 6,
+            "dispatch": "after-resume",
+            "duration_s": 30,
+        },
+    ]
+    tmp_path.joinpath("journal.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows)
+    )
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _world: [],
+        Executor(FakeGateway(), journal=journal),
+        poll_seconds=60,
+        journal=journal,
+    )
+    wall_times = iter([0, 240])
+    active_times = iter([0, 180])
+
+    daemon.run_forever(
+        sleep=lambda _seconds: None,
+        now=lambda: next(wall_times),
+        active_now=lambda: next(active_times),
+        max_ticks=1,
+    )
+
+    annotations = [
+        event for event in read_events(journal.path)
+        if event["event"] == "agent_run_stall"
+    ]
+    assert [
+        (event["dispatch"], event["suspended_seconds"])
+        for event in annotations
+    ] == [("crossed-gap", 60)]
+
+
 def _waking_daemon(wake_check, poll_seconds=60, logs=None):
     d, _ = _daemon(lambda w: [], logs=logs)
     d.poll_seconds = poll_seconds
