@@ -23,12 +23,15 @@ ACTION_TIMEOUT_S = 60.0
 
 def start_command(harness_root: str, name: str) -> list[str]:
     """Detached launcher. `setsid` matters: the daemons must outlive the HTTP
-    request that started them, and `make point-at` runs them in the foreground
-    under one trap."""
-    return [
-        "setsid", "env", f"REPO={name}",
-        "make", "-C", harness_root, "point-at", f"REPO={name}",
-    ]
+    request that started them, and `point-at.sh` runs them in the foreground
+    under one trap.
+
+    `bin/point-at.sh` directly, NOT `make point-at`: make expands a command-line
+    variable into the recipe TEXT, which it then hands to /bin/sh, so a `"` in
+    `name` escapes into a shell command. Callers must still validate `name`
+    against the known deployments — this is defence in depth, not the gate.
+    """
+    return ["setsid", os.path.join(harness_root, "bin", "point-at.sh"), name]
 
 
 def start_log_path(log_dir: str, name: str) -> str:

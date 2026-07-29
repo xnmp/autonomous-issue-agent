@@ -14,8 +14,24 @@ Design rules:
   per-(repo, query) TTL cache (default 45 s). Every gh call is read-only except
   the three explicit POST actions below. gh failures degrade: the UI renders
   journal-only data plus a "GitHub data unavailable" chip, never a 500.
-- **Loopback only.** Bind 127.0.0.1. POST actions exist because only the
-  operator's machine can reach them.
+- **Loopback is not an authorization boundary.** Binding 127.0.0.1 stops other
+  hosts from connecting; it does not stop the operator's own browser from being
+  pointed here by a page they visit. Three guards, all in one middleware:
+  the `Host` header must name loopback (DNS-rebinding guard, else 421); an
+  `Origin`, when sent, must be this server (else 403); and every non-GET
+  request must carry `X-Issue-Agent-Dashboard` — a header a cross-site form
+  cannot set and a cross-site fetch cannot send without a preflight that no
+  CORS middleware will approve (else 403).
+- **`name` is validated against `deployment_names()` on every route.** It
+  reaches subprocess argv and filesystem paths. Unknown → 404 on reads, refusal
+  on writes, before any collector runs. `start` invokes `bin/point-at.sh`
+  directly and never `make`: make expands a command-line variable into the
+  recipe text it hands to `/bin/sh`, so a quote in `name` became a shell
+  command (found by adversarial review, verified as RCE, now regression-tested).
+- **The cost-chart iframe is sandboxed** (`sandbox=""` + `Content-Security-
+  Policy: sandbox`). Its HTML is generated from transcript text the agent read
+  from issues, PRs and the web — untrusted input rendered on the dashboard's
+  own origin.
 - **Zero new runtime deps for the core.** fastapi/uvicorn live in a new
   optional extra `dash`. `import issue_agent.app.dashweb` must not be required
   by any daemon path; the import-linter contracts must keep passing.

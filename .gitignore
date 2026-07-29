@@ -17,6 +17,10 @@ config/shared.env
 config/repos/
 config/.active*.env
 
+# Dashboard SPA build output + deps (built by `make dashboard-ui`)
+dashboard/dist/
+dashboard/node_modules/
+
 # Demo scratch
 examples/demo-target/.scratch/
 examples/demo-target/.git/

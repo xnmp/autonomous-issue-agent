@@ -268,18 +268,45 @@ def codex_block(limits: dict | None, sampled_at: str | None) -> dict:
     }
 
 
+TAIL_BYTES = 256 * 1024
+_CODEX_CACHE = TtlCache(ttl_s=60.0)
+
+
+def tail_lines(path: str, tail_bytes: int = TAIL_BYTES) -> list[str]:
+    """The last `tail_bytes` of a file as whole lines.
+
+    Rollouts reach tens of megabytes and the snapshot we want is the last one,
+    so reading the whole file to find it costs a full re-read every poll. The
+    leading partial line is dropped unless the whole file fit.
+    """
+    with open(path, "rb") as fh:
+        size = fh.seek(0, os.SEEK_END)
+        start = max(0, size - tail_bytes)
+        fh.seek(start)
+        chunk = fh.read()
+    text = chunk.decode("utf-8", errors="replace")
+    lines = text.splitlines()
+    return lines[1:] if start and lines else lines
+
+
 def codex_usage(sessions_root: str | None = None) -> dict:
     root = sessions_root or default_codex_sessions_root()
+    cached = _CODEX_CACHE.get(root)
+    if cached is not None:
+        return cached
     path = newest_rollout(root)
     if not path:
-        return _codex_error("no codex rollout files found")
+        return _CODEX_CACHE.put(root, _codex_error("no codex rollout files found"))
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            lines = fh.readlines()
+        lines = tail_lines(path)
         sampled_at = _iso_from_epoch(os.path.getmtime(path))
     except OSError as exc:
-        return _codex_error(f"codex rollout unreadable ({exc.strerror or 'error'})")
-    return codex_block(parse_rollout_rate_limits(lines), sampled_at)
+        return _CODEX_CACHE.put(
+            root, _codex_error(f"codex rollout unreadable ({exc.strerror or 'error'})")
+        )
+    return _CODEX_CACHE.put(
+        root, codex_block(parse_rollout_rate_limits(lines), sampled_at)
+    )
 
 
 # ── harness caps ──────────────────────────────────────────────────────────────
