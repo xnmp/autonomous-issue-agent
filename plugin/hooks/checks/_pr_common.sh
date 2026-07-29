@@ -127,19 +127,25 @@ prc_allow_untested() { [ "${ALLOW_UNTESTED:-0}" = 1 ]; }
 
 PRC_GATE_RECURSION_RC=213
 
+# Static floor of knobs to scrub, mirrored in governor.TARGET_CMD_SCRUB_KNOBS
+# and point-at's RTC_SCRUB_STATIC (drift-checked by
+# tests/test_deployment_env_sanitization.sh). The deployment's FULL knob set
+# arrives dynamically via HARNESS_DEPLOY_KNOBS (written by compose-env.sh), so
+# a newly added knob is scrubbed without touching these lists.
+PRC_SCRUB_STATIC="TEST_CMD LINT_CMD TYPECHECK_CMD EDIT_CHECK_CMD ALLOW_UNTESTED RED_MUST_FAIL VERIFY_RED_AT_COMMIT BASE_BRANCH GATE_TEST_TIMEOUT_S GATE_GH_RETRY_SLEEP GH_APP_ID GH_APP_KEY_FILE GH_APP_INSTALL_ID TARGET_DIR AGENT_ENV"
+
 prc_run_test_cmd() {  # prc_run_test_cmd "<resolved command>" → rc, 213 = refused
-  local _depth="${HARNESS_GATE_DEPTH:-0}"
+  local _depth="${HARNESS_GATE_DEPTH:-0}" _v
   case "$_depth" in ''|*[!0-9]*) _depth=0 ;; esac
   if [ "$_depth" -ge 2 ]; then
     echo "GATE RECURSION: refusing to run a test command at gate depth $_depth — the resolved command re-entered the harness gate (self-referential TEST_CMD/.harness/test-cmd, see #63): $1" >&2
     return "$PRC_GATE_RECURSION_RC"
   fi
-  env \
-    -u TEST_CMD -u LINT_CMD -u TYPECHECK_CMD -u EDIT_CHECK_CMD -u ALLOW_UNTESTED \
-    -u RED_MUST_FAIL -u VERIFY_RED_AT_COMMIT -u BASE_BRANCH \
-    -u GATE_TEST_TIMEOUT_S -u GATE_GH_RETRY_SLEEP \
-    -u GH_APP_ID -u GH_APP_PRIVATE_KEY -u GH_APP_INSTALLATION_ID \
-    -u TARGET_DIR -u AGENT_ENV \
+  local _scrub=()
+  for _v in $PRC_SCRUB_STATIC ${HARNESS_DEPLOY_KNOBS:-} HARNESS_DEPLOY_KNOBS; do
+    case "$_v" in [A-Za-z_]*) _scrub+=(-u "$_v") ;; esac
+  done
+  env "${_scrub[@]}" \
     HARNESS_GATE_DEPTH="$((_depth + 1))" \
     bash -c "$1"
 }

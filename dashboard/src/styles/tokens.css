@@ -1,0 +1,108 @@
+/*
+ * Design tokens — wezterm "Cosmic Dusk", defined exactly once.
+ *
+ * Nothing else in the app may hardcode a hex value. Two layers:
+ *   1. --c-*  raw palette (the terminal theme, verbatim)
+ *   2. semantic aliases (--ok, --running, --fail, --info, --meta, --link)
+ * Components consume ONLY layer 2 plus the surface/ink tokens, so the semantic
+ * mapping (green=ok, yellow=running, red=failed, blue=info, magenta=meta/self,
+ * cyan=links/models) is enforced structurally rather than by convention.
+ */
+:root {
+  color-scheme: dark;
+
+  /* ---- raw palette ---- */
+  --c-bg: #0e1330;
+  --c-panel: #141a3d;
+  --c-elevated: #1a2148;
+  --c-fg: #d8dce8;
+  --c-muted: #8a91b4;
+  --c-selection: #2a3060;
+
+  --c-red: #d4607a;
+  --c-green: #69db7c;
+  --c-yellow: #fbbf24;
+  --c-blue: #6a7acc;
+  --c-magenta: #b09ac0;
+  --c-cyan: #7aadcc;
+
+  --c-red-br: #e87898;
+  --c-green-br: #7eeea0;
+  --c-yellow-br: #ffd43b;
+  --c-blue-br: #7a8ae0;
+  --c-magenta-br: #c4b0d8;
+  --c-cyan-br: #8ac0e0;
+
+  /* ---- surfaces & ink ---- */
+  --bg: var(--c-bg);
+  --panel: var(--c-panel);
+  --elevated: var(--c-elevated);
+  --ink: var(--c-fg);
+  --ink-muted: var(--c-muted);
+  --ink-faint: #656c8f;
+  --selection: var(--c-selection);
+
+  --border: rgba(216, 220, 232, 0.08);
+  --border-strong: rgba(216, 220, 232, 0.16);
+  --hover: rgba(216, 220, 232, 0.045);
+
+  /* ---- semantic ---- */
+  --ok: var(--c-green);
+  --ok-br: var(--c-green-br);
+  --running: var(--c-yellow);
+  --running-br: var(--c-yellow-br);
+  --fail: var(--c-red);
+  --fail-br: var(--c-red-br);
+  --info: var(--c-blue);
+  --info-br: var(--c-blue-br);
+  --meta: var(--c-magenta);
+  --meta-br: var(--c-magenta-br);
+  --link: var(--c-cyan);
+  --link-br: var(--c-cyan-br);
+
+  /* ---- categorical series (cost mix) ----
+   * Slot order is FIXED and never cycled. Validated with the dataviz palette
+   * validator against the --panel surface: CVD separation, normal-vision floor
+   * and contrast all PASS in this order (blue -> bright cyan -> yellow ->
+   * bright magenta). The lightness/chroma-band checks fail by construction —
+   * a desaturated terminal theme cannot satisfy them — so every chart that
+   * uses these also ships a legend + direct labels (secondary encoding).
+   */
+  --series-1: var(--c-blue); /* resolve */
+  --series-2: var(--c-cyan-br); /* review  */
+  --series-3: var(--c-yellow); /* repair  */
+  --series-4: var(--c-magenta-br); /* steward */
+
+  /* ---- meter severity (utilization) ---- */
+  --meter-low: var(--c-green);
+  --meter-mid: var(--c-yellow);
+  --meter-high: var(--c-red);
+  --meter-track: rgba(216, 220, 232, 0.09);
+
+  /* ---- spacing scale (4 / 8 / 12 / 16) ---- */
+  --s1: 4px;
+  --s2: 8px;
+  --s3: 12px;
+  --s4: 16px;
+  --s5: 24px;
+
+  --radius: 8px;
+  --radius-sm: 5px;
+  --radius-pill: 999px;
+
+  --t: 150ms cubic-bezier(0.4, 0, 0.2, 1);
+
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, "Inter", "Segoe UI", Roboto,
+    sans-serif;
+  --font-mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
+  --fs-base: 13px;
+  --fs-sm: 12px;
+  --fs-xs: 11px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --t: 1ms linear;
+  }
+}

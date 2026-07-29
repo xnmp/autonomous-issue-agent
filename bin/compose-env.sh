@@ -128,6 +128,14 @@ done < <(env -0)
   done | sort
 } > "$_CE_ACTIVE"
 
+# Manifest of every knob this deployment sets (#63): the gate wrappers scrub
+# these names — plus a static floor — from every target-command child env, so
+# a knob added to shared.env or an overlay can never leak into a target's
+# tests without anyone maintaining a denylist.
+_ce_knobs="$(grep -oE '^[A-Za-z_][A-Za-z0-9_]*' "$_CE_ACTIVE" | grep -v '^HARNESS_DEPLOY_KNOBS$' | sort | tr '\n' ' ')"
+printf 'HARNESS_DEPLOY_KNOBS=%q\n' "${_ce_knobs% }" >> "$_CE_ACTIVE"
+unset _ce_knobs
+
 unset _CE_PRE _CE_POST _CE_ASSIGNED _ce_kv _ce_v _ce_name _CE_ABORT
 
 export AGENT_ENV="$_CE_ACTIVE"

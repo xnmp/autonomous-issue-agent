@@ -10,7 +10,8 @@ set -uo pipefail
 for gate_knob in \
   TEST_CMD LINT_CMD TYPECHECK_CMD EDIT_CHECK_CMD ALLOW_UNTESTED RED_MUST_FAIL \
   VERIFY_RED_AT_COMMIT BASE_BRANCH GATE_TEST_TIMEOUT_S GATE_GH_RETRY_SLEEP \
-  GH_APP_ID GH_APP_PRIVATE_KEY GH_APP_INSTALLATION_ID TARGET_DIR AGENT_ENV; do
+  GH_APP_ID GH_APP_KEY_FILE GH_APP_INSTALL_ID TARGET_DIR AGENT_ENV \
+  ${HARNESS_DEPLOY_KNOBS:-} HARNESS_DEPLOY_KNOBS; do
   unset "$gate_knob"
 done
 # NOTE: HARNESS_GATE_DEPTH is deliberately not in the list — it is the #63
@@ -91,6 +92,11 @@ out=$(HARNESS_GATE_DEPTH=2 bash -c ". '$CHECKS/_pr_common.sh'; prc_run_test_cmd 
 # under a real gate at depth 1 — the self-hosted case.)
 out=$(env -u HARNESS_GATE_DEPTH bash -c ". '$CHECKS/_pr_common.sh'; prc_run_test_cmd 'test \"\$HARNESS_GATE_DEPTH\" = 1'" 2>&1); rc=$?
 [ "$rc" -eq 0 ] && ok "depth stamps child env" || no "depth stamps child env" "rc=$rc out=$out"
+# The dynamic manifest (HARNESS_DEPLOY_KNOBS, from compose-env) is scrubbed
+# too: a knob named there never reaches the target command, without anyone
+# editing the static lists.
+out=$(HARNESS_DEPLOY_KNOBS='CUSTOM_KNOB' CUSTOM_KNOB='boom' bash -c ". '$CHECKS/_pr_common.sh'; prc_run_test_cmd 'test -z \"\${CUSTOM_KNOB:-}\" && test -z \"\${HARNESS_DEPLOY_KNOBS:-}\"'" 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "manifest knobs scrubbed from child" || no "manifest knobs scrubbed from child" "rc=$rc out=$out"
 # A refusal fails CLOSED at red-verify, with the real cause named — not as a
 # phantom "suite passed/failed" verdict the agent would chase.
 out=$(HARNESS_GATE_DEPTH=2 TEST_CMD='true' bash "$CHECKS/check-commit.sh" commit -m "red: t" 2>&1); rc=$?

@@ -57,6 +57,10 @@ info() { printf '\033[36m▸ %s\033[0m\n' "$1"; }
 # HARNESS_GATE_DEPTH is the re-entrancy bound backing that scrub (see
 # plugin/hooks/checks/_pr_common.sh:prc_run_test_cmd for the full rationale):
 # executing at depth ≥ 2 means the command re-entered the gate (#63) — refuse.
+# Exported: the probe transports run_target_test_cmd into a `timeout bash -c`
+# subshell via `declare -f`, which does NOT carry plain script variables.
+export RTC_SCRUB_STATIC="TEST_CMD LINT_CMD TYPECHECK_CMD EDIT_CHECK_CMD ALLOW_UNTESTED RED_MUST_FAIL VERIFY_RED_AT_COMMIT BASE_BRANCH GATE_TEST_TIMEOUT_S GATE_GH_RETRY_SLEEP GH_APP_ID GH_APP_KEY_FILE GH_APP_INSTALL_ID TARGET_DIR AGENT_ENV"
+
 run_target_test_cmd() {  # run_target_test_cmd "<command>"
   _rtc_depth="${HARNESS_GATE_DEPTH:-0}"
   case "$_rtc_depth" in ''|*[!0-9]*) _rtc_depth=0 ;; esac
@@ -64,12 +68,11 @@ run_target_test_cmd() {  # run_target_test_cmd "<command>"
     echo "GATE RECURSION: refusing to run a test command at gate depth $_rtc_depth (see #63): $1" >&2
     return 1
   fi
-  env \
-    -u TEST_CMD -u LINT_CMD -u TYPECHECK_CMD -u EDIT_CHECK_CMD -u ALLOW_UNTESTED \
-    -u RED_MUST_FAIL -u VERIFY_RED_AT_COMMIT -u BASE_BRANCH \
-    -u GATE_TEST_TIMEOUT_S -u GATE_GH_RETRY_SLEEP \
-    -u GH_APP_ID -u GH_APP_PRIVATE_KEY -u GH_APP_INSTALLATION_ID \
-    -u TARGET_DIR -u AGENT_ENV \
+  _rtc_scrub=()
+  for _rtc_v in $RTC_SCRUB_STATIC ${HARNESS_DEPLOY_KNOBS:-} HARNESS_DEPLOY_KNOBS; do
+    case "$_rtc_v" in [A-Za-z_]*) _rtc_scrub+=(-u "$_rtc_v") ;; esac
+  done
+  env "${_rtc_scrub[@]}" \
     HARNESS_GATE_DEPTH="$((_rtc_depth + 1))" \
     bash -c "$1"
 }

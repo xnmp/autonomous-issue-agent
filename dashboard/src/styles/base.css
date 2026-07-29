@@ -1,0 +1,304 @@
+/* Reset + primitives shared by every component. Component-specific rules live
+ * in app.css; this file is the vocabulary (panels, tables, chips, buttons). */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  font-size: var(--fs-base);
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: var(--selection);
+}
+
+a {
+  color: var(--link);
+  text-decoration: none;
+  transition: color var(--t);
+}
+a:hover {
+  color: var(--link-br);
+  text-decoration: underline;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+/* Numerics align in columns; ids and money read as code. */
+.num {
+  font-variant-numeric: tabular-nums;
+}
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-sm);
+}
+
+.muted {
+  color: var(--ink-muted);
+}
+.faint {
+  color: var(--ink-faint);
+}
+
+/* ---------- scrollbars ---------- */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--selection) transparent;
+}
+*::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--selection);
+  border-radius: var(--radius-pill);
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ---------- panel ---------- */
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.panel-hd {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s2);
+  padding: var(--s2) var(--s3);
+  border-bottom: 1px solid var(--border);
+}
+.panel-title {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-muted);
+}
+.panel-bd {
+  padding: var(--s3);
+}
+.panel-bd.flush {
+  padding: 0;
+}
+
+/* ---------- buttons ---------- */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s1);
+  padding: var(--s1) var(--s2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--elevated);
+  color: var(--ink);
+  font-size: var(--fs-sm);
+  transition:
+    background var(--t),
+    border-color var(--t),
+    color var(--t);
+  white-space: nowrap;
+}
+.btn:hover {
+  background: var(--selection);
+  border-color: var(--border-strong);
+}
+.btn:focus-visible {
+  outline: 2px solid var(--info-br);
+  outline-offset: 1px;
+}
+.btn[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.btn-primary {
+  border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+  color: var(--ok-br);
+}
+.btn-primary:hover {
+  background: color-mix(in srgb, var(--ok) 16%, var(--elevated));
+}
+.btn-danger {
+  border-color: color-mix(in srgb, var(--fail) 45%, transparent);
+  color: var(--fail-br);
+}
+.btn-ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--ink-muted);
+}
+.btn-ghost:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+.btn-xs {
+  padding: 1px var(--s1);
+  font-size: var(--fs-xs);
+}
+
+/* ---------- chips ---------- */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 7px;
+  border-radius: var(--radius-pill);
+  border: 1px solid color-mix(in srgb, var(--chip-c, var(--ink-muted)) 40%, transparent);
+  background: color-mix(in srgb, var(--chip-c, var(--ink-muted)) 13%, transparent);
+  color: var(--chip-c, var(--ink-muted));
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+  line-height: 1.6;
+}
+.chip-sq {
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+}
+.chip-ok {
+  --chip-c: var(--ok);
+}
+.chip-running {
+  --chip-c: var(--running);
+}
+.chip-fail {
+  --chip-c: var(--fail);
+}
+.chip-info {
+  --chip-c: var(--info-br);
+}
+.chip-meta {
+  --chip-c: var(--meta-br);
+}
+.chip-link {
+  --chip-c: var(--link);
+}
+.chip-neutral {
+  --chip-c: var(--ink-muted);
+}
+.chip-warn {
+  --chip-c: var(--running);
+}
+
+/* A running step pulses; reduced motion gets a static, still-distinguishable
+ * treatment (the chip keeps its yellow + a dot). */
+.pulse {
+  animation: pulse 1.6s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pulse {
+    animation: none;
+  }
+}
+
+/* ---------- tables ---------- */
+.tbl {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-sm);
+}
+.tbl th {
+  text-align: left;
+  font-weight: 600;
+  font-size: var(--fs-xs);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  padding: var(--s2) var(--s3);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+  position: sticky;
+  top: 0;
+  background: var(--panel);
+  z-index: 1;
+}
+.tbl td {
+  padding: var(--s2) var(--s3);
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+.tbl tbody tr:last-child td {
+  border-bottom: none;
+}
+.tbl tbody tr.clickable {
+  cursor: pointer;
+  transition: background var(--t);
+}
+.tbl tbody tr.clickable:hover {
+  background: var(--hover);
+}
+.tbl tbody tr.clickable:focus-visible {
+  outline: 2px solid var(--info-br);
+  outline-offset: -2px;
+}
+.tbl .r {
+  text-align: right;
+}
+.tbl .num,
+.tbl .mono {
+  font-variant-numeric: tabular-nums;
+}
+
+.tbl-wrap {
+  overflow-x: auto;
+}
+
+/* ---------- misc ---------- */
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+}
+.row-wrap {
+  display: flex;
+  align-items: center;
+  gap: var(--s1);
+  flex-wrap: wrap;
+}
+.col {
+  display: flex;
+  flex-direction: column;
+}
+.spacer {
+  flex: 1;
+}
+.trunc {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

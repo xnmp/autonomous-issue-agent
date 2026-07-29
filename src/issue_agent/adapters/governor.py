@@ -183,15 +183,27 @@ _CHECK_TIMEOUT_S = 120.0
 #   3. containment: the child runs in its own session and a timeout kills the
 #      whole process group, not just the direct shell.
 
-# Single python source of truth (worktree.py and tests/conftest.py import it).
-# The two bash twins keep hand copies; tests/test_deployment_env_sanitization.sh
-# asserts the three lists are identical so they cannot drift silently.
+# Static floor. Single python source of truth (worktree.py and
+# tests/conftest.py import it); the two bash twins keep hand copies and
+# tests/test_deployment_env_sanitization.sh asserts the three lists are
+# identical so they cannot drift silently. The deployment's FULL knob set
+# additionally arrives at runtime via HARNESS_DEPLOY_KNOBS (a name manifest
+# compose-env.sh appends to the composed env), so a newly added knob is
+# scrubbed without anyone editing these lists.
 TARGET_CMD_SCRUB_KNOBS = (
     "TEST_CMD", "LINT_CMD", "TYPECHECK_CMD", "EDIT_CHECK_CMD", "ALLOW_UNTESTED",
     "RED_MUST_FAIL", "VERIFY_RED_AT_COMMIT", "BASE_BRANCH",
     "GATE_TEST_TIMEOUT_S", "GATE_GH_RETRY_SLEEP", "GH_APP_ID",
-    "GH_APP_PRIVATE_KEY", "GH_APP_INSTALLATION_ID", "TARGET_DIR", "AGENT_ENV",
+    "GH_APP_KEY_FILE", "GH_APP_INSTALL_ID", "TARGET_DIR", "AGENT_ENV",
 )
+
+
+def target_cmd_scrub_set() -> set[str]:
+    """Every env name to drop from a target command's child env: the static
+    floor plus the deployment manifest (HARNESS_DEPLOY_KNOBS) and the manifest
+    var itself."""
+    manifest = os.environ.get("HARNESS_DEPLOY_KNOBS", "").split()
+    return set(TARGET_CMD_SCRUB_KNOBS) | set(manifest) | {"HARNESS_DEPLOY_KNOBS"}
 
 
 def gate_depth() -> int:
@@ -225,7 +237,8 @@ def run_target_command(
             file=sys.stderr,
         )
         return None, ""
-    env = {k: v for k, v in os.environ.items() if k not in TARGET_CMD_SCRUB_KNOBS}
+    scrub = target_cmd_scrub_set()
+    env = {k: v for k, v in os.environ.items() if k not in scrub}
     env["HARNESS_GATE_DEPTH"] = str(depth + 1)
     pipe = subprocess.PIPE if capture else None
     try:
