@@ -41,11 +41,12 @@ def _write_rollout(
     *,
     input_tokens: int,
     output_tokens: int,
+    cached_input_tokens: int = 0,
     sid: str = SID,
 ) -> None:
     usage = {
         "input_tokens": input_tokens,
-        "cached_input_tokens": 0,
+        "cached_input_tokens": cached_input_tokens,
         "cache_write_input_tokens": 0,
         "output_tokens": output_tokens,
     }
@@ -93,6 +94,21 @@ def test_priced_spend_reports_only_when_the_threshold_is_reached():
         cost_per_mtok_in=5.0,
         cost_per_mtok_out=30.0,
         max_budget_usd=100.0,
+    ) is None
+
+
+def test_cache_heavy_usage_stays_under_the_budget_it_previously_crossed():
+    usage = {
+        "input_tokens": 3_974_000,
+        "cache_read_input_tokens": 3_773_000,
+        "output_tokens": 9_500,
+    }
+    assert budget_overrun_usd(
+        usage,
+        cost_per_mtok_in=5.0,
+        cost_per_mtok_cached_in=0.5,
+        cost_per_mtok_out=30.0,
+        max_budget_usd=20.0,
     ) is None
 
 
@@ -315,6 +331,25 @@ def test_implausible_early_rollout_usage_is_rejected_not_budget_killed(
 def test_under_budget_run_completes_normally(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     _write_rollout(tmp_path, input_tokens=1_000_000, output_tokens=10_000)
+
+    result = asyncio.run(
+        _runner(tmp_path, _chatty_body(seconds=1)).run(
+            AgentTask(prompt="x", max_budget_usd=20.0)
+        )
+    )
+
+    assert result.status == "pr_opened"
+    assert result.exit_reason is ExitReason.OK
+
+
+def test_cache_heavy_rollout_completes_under_a_twenty_dollar_budget(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _write_rollout(
+        tmp_path,
+        input_tokens=3_974_000,
+        cached_input_tokens=3_773_000,
+        output_tokens=9_500,
+    )
 
     result = asyncio.run(
         _runner(tmp_path, _chatty_body(seconds=1)).run(

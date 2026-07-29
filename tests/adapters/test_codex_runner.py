@@ -1615,11 +1615,40 @@ def test_envelope_falls_back_to_stderr_usage_when_no_rollout():
     assert r.cost_usd == 1820 * 30.0 / 1_000_000.0
 
 
-def test_cost_prices_input_and_output_at_their_own_rates():
-    usage = {"input_tokens": 48000, "output_tokens": 4341, "cache_read_input_tokens": 12000}
+def test_cost_prices_input_and_output_at_their_own_rates_without_cached_reads():
+    usage = {"input_tokens": 48000, "output_tokens": 4341}
     cost = codex_cost_usd(usage, cost_per_mtok_in=1.25, cost_per_mtok_out=10.0)
-    # (48000 * 1.25 + 4341 * 10) / 1e6 — cached reads are already inside input.
+    # (48000 * 1.25 + 4341 * 10) / 1e6.
     assert cost == pytest.approx(0.10341)
+
+
+def test_cost_prices_the_cache_heavy_issue_71_shape_at_the_cached_rate():
+    usage = {
+        "input_tokens": 3_974_000,
+        "cache_read_input_tokens": 3_773_000,
+        "output_tokens": 9_500,
+    }
+
+    assert codex_cost_usd(
+        usage,
+        cost_per_mtok_in=5.0,
+        cost_per_mtok_cached_in=0.5,
+        cost_per_mtok_out=30.0,
+    ) == pytest.approx(3.1645)
+
+
+@pytest.mark.parametrize("cached", [None, 0])
+def test_cost_without_cached_reads_keeps_the_full_input_rate(cached):
+    usage = {"input_tokens": 48_000, "output_tokens": 4_341}
+    if cached is not None:
+        usage["cache_read_input_tokens"] = cached
+
+    assert codex_cost_usd(
+        usage,
+        cost_per_mtok_in=1.25,
+        cost_per_mtok_cached_in=0.125,
+        cost_per_mtok_out=10.0,
+    ) == pytest.approx(0.10341)
 
 
 def test_cost_is_zero_without_rates():
@@ -1848,32 +1877,32 @@ def test_no_budget_warning_when_no_budget_is_configured():
 
 
 # ── #43: each leg is priced with the model it actually ran ───────────────────
-_LUNA_TERRA = (("gpt-5.6-luna", 1.25, 10.0), ("gpt-5.6-terra", 10.0, 60.0))
+_LUNA_TERRA = (("gpt-5.6-luna", 1.25, 10.0, 0.125), ("gpt-5.6-terra", 10.0, 60.0, 1.0))
 
 
 def test_the_table_prices_a_named_model_instead_of_the_fallback():
     assert rates_for_model(
         "gpt-5.6-terra", _LUNA_TERRA, fallback_in=5.0, fallback_out=30.0
-    ) == (10.0, 60.0)
+    ) == (10.0, 60.0, 1.0)
 
 
 def test_a_model_the_table_does_not_name_falls_back_to_the_scalars():
     assert rates_for_model(
         "gpt-5.6-sol", _LUNA_TERRA, fallback_in=5.0, fallback_out=30.0
-    ) == (5.0, 30.0)
+    ) == (5.0, 30.0, 0.5)
 
 
 def test_an_empty_table_or_an_unknown_model_falls_back():
     """Zero behaviour change for a deployment that never sets the knob."""
-    assert rates_for_model("anything", (), fallback_in=5.0, fallback_out=30.0) == (5.0, 30.0)
-    assert rates_for_model(None, _LUNA_TERRA, fallback_in=5.0, fallback_out=30.0) == (5.0, 30.0)
-    assert rates_for_model("  ", _LUNA_TERRA, fallback_in=5.0, fallback_out=30.0) == (5.0, 30.0)
+    assert rates_for_model("anything", (), fallback_in=5.0, fallback_out=30.0) == (5.0, 30.0, 0.5)
+    assert rates_for_model(None, _LUNA_TERRA, fallback_in=5.0, fallback_out=30.0) == (5.0, 30.0, 0.5)
+    assert rates_for_model("  ", _LUNA_TERRA, fallback_in=5.0, fallback_out=30.0) == (5.0, 30.0, 0.5)
 
 
 def test_model_lookup_is_case_insensitive():
     assert rates_for_model(
         "GPT-5.6-Terra", _LUNA_TERRA, fallback_in=5.0, fallback_out=30.0
-    ) == (10.0, 60.0)
+    ) == (10.0, 60.0, 1.0)
 
 
 def test_two_routed_tiers_ledger_different_dollars_for_identical_tokens():

@@ -878,7 +878,7 @@ def test_the_rate_table_parses_a_model_per_entry():
         "CODEX_COST_PER_MTOK": "gpt-5.6-luna=1.25/10,gpt-5.6-terra=10/60",
     })
     assert c.codex_cost_per_mtok == (
-        ("gpt-5.6-luna", 1.25, 10.0), ("gpt-5.6-terra", 10.0, 60.0),
+        ("gpt-5.6-luna", 1.25, 10.0, 0.125), ("gpt-5.6-terra", 10.0, 60.0, 1.0),
     )
     assert c.codex_runtime.cost_per_mtok == c.codex_cost_per_mtok
     assert c.validation_errors() == ()
@@ -899,7 +899,7 @@ def test_whitespace_and_trailing_separators_in_the_rate_table_are_tolerated():
         "REPO": "x", "FIX_BOT": "fix-bot",
         "CODEX_COST_PER_MTOK": " gpt-5.6-luna = 1.25 / 10 , ,",
     })
-    assert c.codex_cost_per_mtok == (("gpt-5.6-luna", 1.25, 10.0),)
+    assert c.codex_cost_per_mtok == (("gpt-5.6-luna", 1.25, 10.0, 0.125),)
     assert c.validation_errors() == ()
 
 
@@ -937,7 +937,7 @@ def test_a_model_priced_twice_keeps_the_first_and_says_so():
         "REPO": "x", "FIX_BOT": "fix-bot",
         "CODEX_COST_PER_MTOK": "gpt-5.6-luna=1.25/10,GPT-5.6-Luna=99/99",
     })
-    assert c.codex_cost_per_mtok == (("gpt-5.6-luna", 1.25, 10.0),)
+    assert c.codex_cost_per_mtok == (("gpt-5.6-luna", 1.25, 10.0, 0.125),)
     assert any("more than once" in e for e in c.validation_errors())
 
 
