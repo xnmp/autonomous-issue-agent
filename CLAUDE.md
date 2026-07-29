@@ -248,6 +248,9 @@ Budget and total-runtime deaths write a bounded `.harness/handover.md` snapshot
 after teardown. The shared journaling-runtime boundary records the terminal
 result, captures the preserved git/task/session state, emits `handover_written`,
 and appends that scratch document to the next fixer task for the same issue.
+For unpinned Claude SDK tasks, the SDK init/result envelope's resolved model is
+carried into the terminal journal record; starts remain empty until a configured
+task model exists. This keeps default-model attribution append-compatible.
 The handover is byte-bounded, issue-scoped, encoded as untrusted context before
 the current authoritative task, and retired after successful delivery. This is
 deterministic post-mortem synthesis, so it adds no model call or unbounded grace
