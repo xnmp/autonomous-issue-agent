@@ -189,6 +189,14 @@ class Executor:
             return bool(issue_closed and issue_closed(action.number))
         return False
 
+    def _report_recovered_escalation(self, action: Action) -> None:
+        """Preserve the operator signal when a lost acknowledgement is recovered."""
+        if (
+            isinstance(action, Relabel)
+            and action.add is Label.NEEDS_HUMAN_REVIEW
+        ):
+            self._escalated(action)
+
     def _apply_ci_escalation(
         self, action: EscalateCiPending, *, resume: bool
     ) -> None:
@@ -324,6 +332,7 @@ class Executor:
             attempts += 1
             try:
                 if self._already_applied(action):
+                    self._report_recovered_escalation(action)
                     return attempts
                 self._apply_retry_once(action)
                 return attempts
@@ -349,6 +358,7 @@ class Executor:
             if isinstance(action, _DURABLE_ACTIONS):
                 if replayed and self._already_applied(action):
                     attempts = 0
+                    self._report_recovered_escalation(action)
                 else:
                     attempts = self._apply_with_retry(
                         action, desc, resume_first=replayed
@@ -384,7 +394,7 @@ class Executor:
             )
 
     def replay_pending(self) -> bool:
-        """Drain durable writes before a daemon observes or dispatches work."""
+        """Replay durable writes, quarantining unverifiable entries after the bound."""
         if self._pending_actions is None:
             return True
         try:
@@ -403,6 +413,32 @@ class Executor:
             try:
                 self.execute(action, replayed=True)
                 self._pending_actions.save_pending_actions(pending[index + 1 :])
+            except LifecycleWriteUnverified as exc:
+                # A non-raising GitHub write followed by an unverifiable read is
+                # not evidence of an outage: stale/locked PRs and benign gh read
+                # failures all reach this arm. One immediate retry cycle plus one
+                # queued replay is the bound. Preserve the action for inspection,
+                # alert loudly, and let unrelated issues continue to converge.
+                try:
+                    self._pending_actions.quarantine_pending_action(action)
+                    self._pending_actions.save_pending_actions(
+                        pending[index + 1 :]
+                    )
+                except (OSError, ValueError) as quarantine_exc:
+                    self._log(
+                        f"FAILED: cannot quarantine pending lifecycle action — "
+                        f"{quarantine_exc}"
+                    )
+                    return False
+                desc = self._describe(action)
+                self._log(f"QUARANTINED: {desc} — {exc}")
+                fields = {"desc": desc, "error": str(exc)}
+                if self._journal is not None:
+                    self._journal.emit("action_quarantined", **fields)
+                alert(
+                    self._alert_cmd,
+                    event_line("action_quarantined", **fields),
+                )
             except Exception:
                 return False
         return True

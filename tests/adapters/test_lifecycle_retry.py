@@ -125,7 +125,10 @@ def test_lost_ack_escalation_replay_still_journals_and_alerts(tmp_path, monkeypa
             raise unavailable("request timed out after GitHub accepted the label")
 
         def has_label(self, kind, number, label):
-            return self.label_visible
+            return (
+                self.label_visible
+                and label == Label.NEEDS_HUMAN_REVIEW.value
+            )
 
     store = Store(str(tmp_path))
     journal = RecordingJournal()
