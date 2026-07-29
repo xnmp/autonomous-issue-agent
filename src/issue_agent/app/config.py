@@ -144,10 +144,11 @@ class CodexRuntimeConfig:
     max_rate_limit_retries: int
     cost_per_mtok_in: float
     cost_per_mtok_out: float
-    # Per-model (model, USD/MTok in, USD/MTok out, USD/MTok cached-in) overrides; the scalars above
+    # Per-model (model, USD/MTok in, USD/MTok out) overrides; the scalars above
     # remain the fallback for any model not named here. See
     # `HarnessConfig.codex_cost_per_mtok`.
-    cost_per_mtok: tuple[tuple[str, float, float, float], ...] = ()
+    cost_per_mtok: tuple[tuple[str, float, float], ...] = ()
+    cost_per_mtok_cached_in: tuple[tuple[str, float], ...] = ()
     # Kill a run once its priced spend crosses AgentTask.max_budget_usd (#29).
     # See `HarnessConfig.codex_enforce_budget`.
     enforce_budget: bool = True
@@ -158,10 +159,8 @@ class CodexRuntimeConfig:
         return (
             self.cost_per_mtok_in > 0
             and self.cost_per_mtok_out > 0
-            and all(
-                rate_in > 0 and rate_out > 0 and rate_cached_in > 0
-                for _, rate_in, rate_out, rate_cached_in in self.cost_per_mtok
-            )
+            and all(rate_in > 0 and rate_out > 0 for _, rate_in, rate_out in self.cost_per_mtok)
+            and all(rate_cached_in > 0 for _, rate_cached_in in self.cost_per_mtok_cached_in)
         )
 
 
@@ -444,7 +443,8 @@ class HarnessConfig:
     # task pinned none). A model absent from the table — and the whole knob
     # when unset — falls back to the scalars above, so an existing deployment
     # prices exactly as it did before.
-    codex_cost_per_mtok: tuple[tuple[str, float, float, float], ...] = ()
+    codex_cost_per_mtok: tuple[tuple[str, float, float], ...] = ()
+    codex_cost_per_mtok_cached_in: tuple[tuple[str, float], ...] = ()
     # #29: whether MAX_BUDGET_USD actually BOUNDS a codex run. codex has no
     # per-session budget flag, so the harness enforces it by sampling the
     # session's streamed token counters and killing the run once this leg's
@@ -596,6 +596,7 @@ class HarnessConfig:
             cost_per_mtok_in=self.codex_cost_per_mtok_in,
             cost_per_mtok_out=self.codex_cost_per_mtok_out,
             cost_per_mtok=self.codex_cost_per_mtok,
+            cost_per_mtok_cached_in=self.codex_cost_per_mtok_cached_in,
             enforce_budget=self.codex_enforce_budget,
         )
 
@@ -925,7 +926,7 @@ def _coerce_float(env: dict, key: str, default: float, errors: list[str]) -> flo
 
 def _coerce_rate_table(
     env: dict, key: str, errors: list[str]
-) -> tuple[tuple[str, float, float, float], ...]:
+) -> tuple[tuple[str, float, float], ...]:
     """Parse per-model `IN/OUT[/CACHED_IN]` rates into an ordered table.
 
     Same contract as the other coercions: empty/absent is UNSET (an empty
@@ -948,7 +949,7 @@ def _coerce_rate_table(
     raw = env.get(key)
     if raw is None or not raw.strip():
         return ()
-    table: list[tuple[str, float, float, float]] = []
+    table: list[tuple[str, float, float]] = []
     seen: set[str] = set()
     for entry in raw.split(","):
         entry = entry.strip()
@@ -983,8 +984,32 @@ def _coerce_rate_table(
             errors.append(f"{key} names {model!r} more than once — keeping the first")
             continue
         seen.add(model)
-        table.append((model, rate_in, rate_out, rate_cached_in))
+        table.append((model, rate_in, rate_out))
     return tuple(table)
+
+
+def _coerce_cached_rate_table(env: dict) -> tuple[tuple[str, float], ...]:
+    """Derive the cache tier from optional third per-model rate components."""
+    raw = env.get("CODEX_COST_PER_MTOK", "")
+    if not raw or not raw.strip():
+        return ()
+    rates: list[tuple[str, float]] = []
+    seen: set[str] = set()
+    for entry in raw.split(","):
+        model, sep, components_raw = entry.strip().partition("=")
+        components = [part.strip() for part in components_raw.split("/")]
+        if not (sep and model.strip() and len(components) in (2, 3)):
+            continue
+        try:
+            normal = float(components[0])
+            cached = float(components[2]) if len(components) == 3 else normal / 10
+        except ValueError:
+            continue
+        key = model.strip().casefold()
+        if key and key not in seen and math.isfinite(cached) and cached >= 0:
+            seen.add(key)
+            rates.append((key, cached))
+    return tuple(rates)
 
 
 def _coerce_identity_mode(env: dict, errors: list[str]) -> IdentityMode:
@@ -1329,6 +1354,7 @@ def from_env(env: dict | None = None) -> HarnessConfig:
             e, "CODEX_COST_PER_MTOK_OUT", _dc_default("codex_cost_per_mtok_out"), errors
         ),
         codex_cost_per_mtok=_coerce_rate_table(e, "CODEX_COST_PER_MTOK", errors),
+        codex_cost_per_mtok_cached_in=_coerce_cached_rate_table(e),
         codex_enforce_budget=_b(
             e, "CODEX_ENFORCE_BUDGET", _dc_default("codex_enforce_budget"), errors
         ),

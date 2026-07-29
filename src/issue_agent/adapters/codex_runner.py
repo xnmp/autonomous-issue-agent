@@ -508,7 +508,7 @@ def codex_cost_usd(
     rate_in = max(float(cost_per_mtok_in or 0.0), 0.0)
     rate_out = max(float(cost_per_mtok_out or 0.0), 0.0)
     rate_cached_in = max(
-        float(rate_in / 10 if cost_per_mtok_cached_in is None else cost_per_mtok_cached_in or 0.0),
+        float(rate_in if cost_per_mtok_cached_in is None else cost_per_mtok_cached_in or 0.0),
         0.0,
     )
     if rate_in <= 0 and rate_out <= 0:
@@ -613,19 +613,40 @@ def budget_overrun_usd(
 
 def rates_for_model(
     model: str | None,
-    table: tuple[tuple[str, float, float, float], ...] | None,
+    table: tuple[tuple[str, float, float], ...] | None,
+    *,
+    fallback_in: float,
+    fallback_out: float,
+) -> tuple[float, float]:
+    """Pure: the (in, out) USD-per-MTok rates for one leg (#43)."""
+
+    key = (model or "").strip().casefold()
+    if key:
+        for name, rate_in, rate_out in table or ():
+            if name == key:
+                return rate_in, rate_out
+    return fallback_in, fallback_out
+
+
+def rates_with_cache_for_model(
+    model: str | None,
+    table: tuple[tuple[str, float, float], ...] | None,
+    cached_table: tuple[tuple[str, float], ...] | None,
     *,
     fallback_in: float,
     fallback_out: float,
 ) -> tuple[float, float, float]:
-    """Pure: the (in, out, cached-in) USD-per-MTok rates for one leg (#43)."""
-
+    """Resolve cache-aware rates while retaining the legacy two-rate helper."""
+    rate_in, rate_out = rates_for_model(
+        model, table, fallback_in=fallback_in, fallback_out=fallback_out
+    )
     key = (model or "").strip().casefold()
-    if key:
-        for name, rate_in, rate_out, rate_cached_in in table or ():
-            if name == key:
-                return rate_in, rate_out, rate_cached_in
-    return fallback_in, fallback_out, fallback_in / 10
+    if cached_table is None:
+        return rate_in, rate_out, rate_in
+    for name, rate_cached_in in cached_table:
+        if name == key:
+            return rate_in, rate_out, rate_cached_in
+    return rate_in, rate_out, rate_in / 10
 
 
 def codex_cost_blindspot_warning(
@@ -917,7 +938,8 @@ class CodexRunner(AgentRuntime):
     # (`task.model or self.default_model`), so a routed deployment's ledger can
     # be split by tier. Empty (the default) → the scalars price everything,
     # unchanged.
-    cost_per_mtok: tuple[tuple[str, float, float, float], ...] = ()
+    cost_per_mtok: tuple[tuple[str, float, float], ...] = ()
+    cost_per_mtok_cached_in: tuple[tuple[str, float], ...] | None = None
     # Per-run spend ceiling (#29). codex has no per-session budget FLAG, so the
     # only way `AgentTask.max_budget_usd` can bound a run is for us to watch the
     # session's own streamed token counters and kill it. With this True (the
@@ -1301,8 +1323,8 @@ class CodexRunner(AgentRuntime):
         # price a sample with the SAME rates the end-of-run accounting will use;
         # two lookups could drift apart and kill a run at a threshold the ledger
         # then disagrees with.
-        rate_in, rate_out, rate_cached_in = rates_for_model(
-            model, self.cost_per_mtok,
+        rate_in, rate_out, rate_cached_in = rates_with_cache_for_model(
+            model, self.cost_per_mtok, self.cost_per_mtok_cached_in,
             fallback_in=self.cost_per_mtok_in, fallback_out=self.cost_per_mtok_out,
         )
         # The budget check is armed only when it can actually fire: enforcement

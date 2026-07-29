@@ -393,6 +393,7 @@ def _build_codex_runner(
         cost_per_mtok_in=runtime.cost_per_mtok_in,
         cost_per_mtok_out=runtime.cost_per_mtok_out,
         cost_per_mtok=runtime.cost_per_mtok,
+        cost_per_mtok_cached_in=runtime.cost_per_mtok_cached_in,
         enforce_budget=runtime.enforce_budget,
         **({"default_model": default_model} if default_model else {}),
     )
