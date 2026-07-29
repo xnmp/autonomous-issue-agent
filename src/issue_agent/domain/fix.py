@@ -215,7 +215,9 @@ def _holds(issue: IssueView, world: WorldState) -> tuple[Hold, ...]:
     holds: list[Hold] = []
     if issue.blocked_by_open:
         holds.append(Hold(issue.number, HOLD_BLOCKER))
-    overlap = _overlapping_open_pr(issue.declared_paths, world.prs)
+    overlap = _overlapping_open_pr(
+        issue.declared_paths | issue.predicted_paths, world.prs
+    )
     if overlap is not None:
         holds.append(Hold(issue.number, HOLD_OVERLAP, f"pr#{overlap.number}"))
     return tuple(holds)
@@ -338,13 +340,13 @@ def pick_ready_issue(world: WorldState) -> int | None:
     P2 route layer). The blocker resolves via GitHub's dependency graph; when the
     last blocker closes, the issue becomes pickable automatically next poll.
 
-    Also SKIPPED: an issue whose body-declared file paths overlap the changed
-    files of an OPEN PR. Two issues editing the same files in parallel produce a
+    Also SKIPPED: an issue whose declared or router-predicted file paths overlap
+    the changed files of an OPEN PR. Two issues editing the same files in parallel produce a
     guaranteed merge conflict when the second PR tries to land (observed: #59 vs
     #60 both rewired the ConversationService composition root). Holding the second
     issue until the first PR merges serialises the collision away. Fail-open: an
-    issue that declares no paths can't be predicted, so it is NOT held (the gate
-    only fires on a concrete, known overlap).
+    issue with no usable paths remains fail-open (the gate only fires on a
+    concrete, known overlap).
 
     Both skips are delegated to `_holds`, which `issue_holds` also reads, so the
     hold journal explains THIS decision rather than a copy of it."""

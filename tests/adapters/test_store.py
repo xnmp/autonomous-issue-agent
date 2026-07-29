@@ -563,3 +563,12 @@ def test_model_marker_roundtrip_and_runtime_isolation():
     # A model routed for one runtime must not leak into another (#21).
     other = Store(state_dir=d, runtime="codex")
     assert other.get_model(5) == ""
+
+
+def test_predicted_paths_are_round_tripped_and_malformed_predictions_fail_open():
+    s, _ = _store()
+    s.save_predicted_paths(5, ["src/action.rs", "./src/help.rs"])
+    assert s.get_predicted_paths(5) == frozenset({"src/action.rs", "src/help.rs"})
+
+    s.save_predicted_paths(5, ["src/action.rs", "../outside.rs"])
+    assert s.get_predicted_paths(5) == frozenset()

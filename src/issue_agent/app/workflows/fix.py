@@ -30,7 +30,7 @@ from ...domain.effort import (
 from ...domain.labels import Label
 from ...domain.refs import slugify
 from ...domain.review import count_outstanding_change_requests
-from ...domain.world import REVIEW_CHANGES_REQUESTED
+from ...domain.world import REVIEW_CHANGES_REQUESTED, normalize_predicted_paths
 from ..mcp import mcp_servers_for_checks
 
 
@@ -372,6 +372,11 @@ class FixWorkflow:
                 kind=AgentKind.ROUTE.name,
             )
             tier = result.field("tier")
+            save_prediction = getattr(self.store, "save_predicted_paths", None)
+            if save_prediction is not None:
+                save_prediction(
+                    issue, normalize_predicted_paths(result.field("predicted_paths"))
+                )
         except Exception as exc:  # noqa: BLE001 — routing is advisory, never fatal
             self.cfg.log(f"agent #{issue}: route — failed ({exc}); dispatching unrouted")
             return self._escalated(cfg, issue, "resolve", iss=iss)

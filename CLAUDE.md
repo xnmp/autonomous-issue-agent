@@ -39,6 +39,10 @@ and token usage):
 - **Overhead ratios** — probe hit rate (`WorldUnchanged` ticks vs full world
   builds), patch-id re-review skips vs paid re-reviews, router runs staying
   ≤$0.10.
+- **Router path-prediction quality** — `path_prediction` journal events pair
+  the router's advisory paths with a terminal PR's actual changed files. Check
+  their intersection before broadening the one-poll overlap hold; empty or
+  malformed predictions always fail open.
 - **Issue→merge wall clock** — the critical path (post-approval rebases that
   re-trigger CI have dominated it; see #2/#544).
 

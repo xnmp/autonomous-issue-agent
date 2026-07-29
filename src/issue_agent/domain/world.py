@@ -219,6 +219,32 @@ def extract_declared_paths(body: str) -> frozenset[str]:
     return frozenset(out)
 
 
+def normalize_predicted_paths(raw: object) -> frozenset[str]:
+    """Return safe, exact repo-relative router predictions, else no signal.
+
+    This input is structured model output, not GitHub ground truth. One malformed
+    value must never turn the overlap serializer into a broad deny gate, so an
+    invalid list fails open as a whole rather than preserving a partial guess.
+    """
+    if not isinstance(raw, (list, tuple, frozenset)) or len(raw) > 32:
+        return frozenset()
+    paths: set[str] = set()
+    for path in raw:
+        if not isinstance(path, str) or not path or path != path.strip():
+            return frozenset()
+        normalized = path.removeprefix("./")
+        parts = normalized.split("/")
+        if (
+            not normalized
+            or normalized.startswith("/")
+            or "\\" in normalized
+            or any(part in ("", ".", "..") for part in parts)
+        ):
+            return frozenset()
+        paths.add(normalized)
+    return frozenset(paths)
+
+
 def paths_overlap_open_prs(
     declared: frozenset[str], prs: "tuple[PRView, ...]"
 ) -> bool:

@@ -16,8 +16,11 @@ helpers are thin. Mirrors cleanup.sh's state-file set so teardown stays in sync.
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
+
+from ..domain.world import normalize_predicted_paths
 
 # ── suffix universe (review M4/D8) ──────────────────────────────────────────
 # Every accessor below writes `issue-N.<suffix>` or `pr-N.<suffix>` via
@@ -161,6 +164,24 @@ class Store:
     def save_model(self, issue: int, model: str | None) -> None:
         if model:
             self._write(self.issue_path(issue, "model"), f"{self.runtime}:{model}")
+
+    # ── router path predictions ─────────────────────────────────────────────
+    def get_predicted_paths(self, issue: int) -> frozenset[str]:
+        """The router's last usable path prediction, or no signal on bad state."""
+        try:
+            raw = json.loads(self._read(self.issue_path(issue, "predicted-paths")))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return frozenset()
+        return normalize_predicted_paths(raw)
+
+    def save_predicted_paths(self, issue: int, paths: object) -> None:
+        """Persist only validated paths; bad router output clears stale guesses."""
+        normalized = normalize_predicted_paths(paths)
+        path = self.issue_path(issue, "predicted-paths")
+        if normalized:
+            self._write(path, json.dumps(sorted(normalized)))
+        else:
+            self._remove(path)
 
     def get_pr_session(self, pr: int) -> str:
         return self._session_for_runtime(self._read(self.pr_path(pr, "session")))
