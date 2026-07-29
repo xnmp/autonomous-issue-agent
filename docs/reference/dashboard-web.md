@@ -54,10 +54,13 @@ src/issue_agent/app/dashweb/
 dashboard/         # Vite + React + TS; `npm run build` → dashboard/dist (gitignored)
 ```
 
-CLI: `issue-agent dashboard --serve PORT` prefers dashweb when fastapi is
-importable AND `dashboard/dist/index.html` exists; otherwise falls back to the
-v1 single-page server with a one-line hint (`uv sync --extra dash && make
-dashboard-ui`). New `make dashboard-ui` target runs `npm ci && npm run build`
+CLI: **serving is the default mode** — a bare `issue-agent dashboard` binds
+`127.0.0.1:8321` (`cli.DASHBOARD_PORT`, the same target `dashboard/vite.config.ts`
+proxies to). `--serve [PORT]` overrides the port; `--text` and `--html PATH`
+keep the one-shot renders and take precedence over serving. dashweb is preferred
+when fastapi is importable AND `dashboard/dist/index.html` exists; otherwise it
+falls back to the v1 single-page server with a one-line hint (`uv sync --extra
+dash && make dashboard-ui`). `make dashboard-ui` runs `npm ci && npm run build`
 in `dashboard/`.
 
 ## Identifiers

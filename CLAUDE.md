@@ -171,8 +171,9 @@ a loud `THIS REPO HAS NO TESTS` banner if none exists → synthesize/reuse
 reimplementation). `src/issue_agent/app/cli.py` installs editable (`bin/install.sh`)
 because the daemon walks `__file__` to this checkout for `plugin/` + `config/mcp/`
 — a plain wheel omits those. Subcommands: `init`, `start`, `stop`, `status`,
-`doctor`, `ready`, `triage`, `dashboard` (all repos, journal-only; `--html`/
-`--serve` for the drill-down snapshot), `install-service`.
+`doctor`, `ready`, `triage`, `dashboard` (all repos; serves the interactive
+drill-down on 127.0.0.1:8321 by default — `--text`/`--html` for the journal-only
+one-shot renders), `install-service`.
 
 **make (lower level)** — one command aims all three watchers at a target repo:
 

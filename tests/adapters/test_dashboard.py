@@ -13,6 +13,8 @@ import json
 import os
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from issue_agent.app import cli, dashboard as dash
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
@@ -416,7 +418,8 @@ def test_render_html_empty_deployment_list():
 
 # ── CLI wiring ────────────────────────────────────────────────────────────────
 def _args(**kw):
-    base = dict(names=[], html="", serve=0, details=False, stale_minutes=30)
+    base = dict(names=[], html="", serve=cli.DASHBOARD_PORT, text=True,
+                details=False, stale_minutes=30)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -428,6 +431,47 @@ def test_cli_dashboard_parses_its_flags():
     )
     assert args.names == ["a", "b"] and args.html == "/tmp/d.html"
     assert args.stale_minutes == 5 and args.func is cli.cmd_dashboard
+
+
+def test_a_bare_dashboard_invocation_serves_on_the_default_port():
+    """The mode an operator gets by typing the shortest command. Changing this
+    silently back to text mode would strand anyone who bookmarked the port."""
+    args = cli.build_parser().parse_args(["dashboard"])
+    assert args.serve == cli.DASHBOARD_PORT == 8321 and args.text is False
+
+
+def test_serve_takes_an_optional_port_and_keeps_the_default_bare():
+    assert cli.build_parser().parse_args(["dashboard", "--serve", "9000"]).serve == 9000
+    assert cli.build_parser().parse_args(["dashboard", "--serve"]).serve == cli.DASHBOARD_PORT
+
+
+def test_text_wins_over_the_default_serve(tmp_path, monkeypatch, capsys):
+    """--text must not need `--serve 0` to escape the new default: an operator
+    piping the report would otherwise hang on a server."""
+    repos = tmp_path / "repos"
+    repos.mkdir()
+    state = tmp_path / "state"
+    (repos / "depl.env").write_text(f'REPO="o/r"\nSTATE_DIR="{state}/fix"\n')
+    write_jsonl(str(state / "fix" / "journal.jsonl"), run(cost_usd=3.0))
+    monkeypatch.setattr(cli, "REPOS_DIR", str(repos))
+    monkeypatch.setenv("XDG_STATE_HOME", str(state))
+    monkeypatch.setattr(cli, "_dashweb_ready", lambda: pytest.fail("served despite --text"))
+    assert cli.cmd_dashboard(_args(text=True, serve=cli.DASHBOARD_PORT)) == 0
+    assert "o/r" in capsys.readouterr().out
+
+
+def test_html_wins_over_the_default_serve(tmp_path, monkeypatch):
+    repos = tmp_path / "repos"
+    repos.mkdir()
+    state = tmp_path / "state"
+    (repos / "depl.env").write_text(f'REPO="o/r"\nSTATE_DIR="{state}/fix"\n')
+    write_jsonl(str(state / "fix" / "journal.jsonl"), run(cost_usd=3.0))
+    monkeypatch.setattr(cli, "REPOS_DIR", str(repos))
+    monkeypatch.setenv("XDG_STATE_HOME", str(state))
+    monkeypatch.setattr(cli, "_dashweb_ready", lambda: pytest.fail("served despite --html"))
+    out = tmp_path / "dash.html"
+    assert cli.cmd_dashboard(_args(html=str(out), text=False, serve=cli.DASHBOARD_PORT)) == 0
+    assert "o/r" in out.read_text()
 
 
 def test_cli_dashboard_writes_html_snapshot(tmp_path, monkeypatch, capsys):

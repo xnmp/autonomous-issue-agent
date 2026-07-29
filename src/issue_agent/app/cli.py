@@ -34,6 +34,10 @@ HARNESS_ROOT = os.path.dirname(
 )
 REPOS_DIR = os.path.join(HARNESS_ROOT, "config", "repos")
 SHARED_ENV = os.path.join(HARNESS_ROOT, "config", "shared.env")
+# The dashboard's loopback port. Fixed rather than ephemeral so the operator can
+# bookmark it, and so `npm run dev`'s proxy target (dashboard/vite.config.ts)
+# matches the running backend without configuration.
+DASHBOARD_PORT = 8321
 
 
 def _active_env_path(name: str) -> str:
@@ -1089,6 +1093,11 @@ def cmd_dashboard(args) -> int:
 
     Strictly read-only: it reads the journals + the global ledger and writes
     nothing but the optional --html file. No `gh` calls — journal-only truth.
+
+    Serving is the default mode: the bare `issue-agent dashboard` an operator
+    types mid-incident should open the thing they can click through, not print
+    a wall of text. --text and --html keep the one-shot renders (scripts, CI,
+    and `| less` all want those) and take precedence over --serve.
     """
     from ..adapters.journal import default_ledger_path
     from . import dashboard as dash
@@ -1114,34 +1123,36 @@ def cmd_dashboard(args) -> int:
             for name in names
         ]
 
-    if args.serve:
-        url = f"http://127.0.0.1:{args.serve}/"
-        if _dashweb_ready():
-            from .dashweb.server import serve as dashweb_serve
-
-            info(f"serving the interactive dashboard at {url} (Ctrl-C to stop)")
-            try:
-                dashweb_serve(args.serve)
-            except KeyboardInterrupt:
-                print()
-            return 0
-        warn("interactive dashboard unavailable — serving the v1 snapshot instead:")
-        warn("  uv sync --extra dash && make dashboard-ui")
-        info(f"serving the dashboard at {url} (Ctrl-C to stop) — regenerated per request")
-        try:
-            dash.serve(args.serve, lambda: dash.render_html(build()))
-        except KeyboardInterrupt:
-            print()
-        return 0
-    deployments = build()
+    # One-shot modes win over serving: an operator who asked for a file or a
+    # report wants it on stdout, not a server they have to Ctrl-C.
     if args.html:
         path = os.path.abspath(os.path.expanduser(args.html))
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
-            fh.write(dash.render_html(deployments))
+            fh.write(dash.render_html(build()))
         ok(f"wrote {path}")
         return 0
-    print(dash.render_text(deployments, details=args.details))
+    if args.text or not args.serve:
+        print(dash.render_text(build(), details=args.details))
+        return 0
+
+    url = f"http://127.0.0.1:{args.serve}/"
+    if _dashweb_ready():
+        from .dashweb.server import serve as dashweb_serve
+
+        info(f"serving the interactive dashboard at {url} (Ctrl-C to stop)")
+        try:
+            dashweb_serve(args.serve)
+        except KeyboardInterrupt:
+            print()
+        return 0
+    warn("interactive dashboard unavailable — serving the v1 snapshot instead:")
+    warn("  uv sync --extra dash && make dashboard-ui")
+    info(f"serving the dashboard at {url} (Ctrl-C to stop) — regenerated per request")
+    try:
+        dash.serve(args.serve, lambda: dash.render_html(build()))
+    except KeyboardInterrupt:
+        print()
     return 0
 
 
@@ -1383,14 +1394,19 @@ def build_parser() -> argparse.ArgumentParser:
         "view — per-issue stage, spend, legs and drill-down, per-(role,repo) "
         "daemon health, and the efficiency/guardrail metrics. Journal-only "
         "truth: no GitHub calls, so a label or merge applied by a human outside "
-        "the harness is not visible here. Prints text by default; --html writes "
-        "a self-contained snapshot; --serve regenerates it per request.",
+        "the harness is not visible here. Serves the interactive dashboard by "
+        f"default on 127.0.0.1:{DASHBOARD_PORT}; --text prints the one-shot "
+        "report; --html writes a self-contained snapshot.",
     )
     sp.add_argument("--name", dest="names", action="append", default=[],
                     help="restrict to this overlay (repeatable; default: every config/repos/*.env)")
     sp.add_argument("--html", default="", help="write a self-contained HTML snapshot to PATH and exit")
-    sp.add_argument("--serve", type=int, default=0, metavar="PORT",
-                    help="serve the HTML on 127.0.0.1:PORT, regenerated per request")
+    sp.add_argument("--serve", type=int, nargs="?", default=DASHBOARD_PORT, const=DASHBOARD_PORT,
+                    metavar="PORT",
+                    help=f"serve on 127.0.0.1:PORT (default: {DASHBOARD_PORT}; this is the "
+                         "default mode — pass --text for the one-shot text report)")
+    sp.add_argument("--text", action="store_true",
+                    help="print the text report and exit instead of serving")
     sp.add_argument("--details", action="store_true", help="text mode: also dump each issue's raw journal events")
     sp.add_argument("--stale-minutes", type=int, default=30,
                     help="flag a daemon STALE after this long with no journal event (default: 30)")
