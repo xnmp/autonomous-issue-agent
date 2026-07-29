@@ -7,7 +7,8 @@ from test_convergence import Scenario, simulate
 from test_dispatch import FakeGateway, FakeRunner, FakeStore
 from test_fix_workflow import _workflow
 
-from issue_agent.domain.actions import AgentKind
+from issue_agent.domain.actions import AgentKind, RunAgent
+from issue_agent.domain.fix import FixConfig, FixState, decide_fix
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.world import Comment as WorldComment
 from issue_agent.domain.world import IssueView
@@ -43,6 +44,36 @@ def test_sessionless_blocked_reply_dispatches_once_as_resume(tmp_path):
     dispatches = [run for tick in trace for run in tick.dispatches]
 
     assert [run.kind for run in dispatches] == [AgentKind.RESUME]
+
+
+def test_sessionless_reply_keeps_world_order_when_saved_session_also_waits():
+    blocked = world(
+        issues=[
+            issue(
+                7,
+                "ai-blocked",
+                comments=(Comment("alice", "first reply", "t1"),),
+            ),
+            issue(
+                8,
+                "ai-blocked",
+                comments=(Comment("bob", "second reply", "t2"),),
+            ),
+        ]
+    )
+    state = FixState(sessions=frozenset({8}))
+
+    actions = decide_fix(
+        blocked,
+        FixConfig(fix_bot="fix-bot"),
+        state,
+        fixer_busy=False,
+    )
+    dispatches = [action for action in actions if isinstance(action, RunAgent)]
+
+    assert [(run.kind, run.number) for run in dispatches] == [
+        (AgentKind.RESUME, 7)
+    ]
 
 
 def test_sessionless_reply_starts_fresh_with_issue_and_reply_context():
