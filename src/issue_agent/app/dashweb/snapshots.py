@@ -513,6 +513,72 @@ def cost_mix(metrics: dash.Metrics) -> dict:
     }
 
 
+def health_trend(issues, recurrence_events, *, first_class_day: str | None) -> list[dict]:
+    """Daily target-repository issue health, using GitHub dates and journal recurrences.
+
+    Creation and confirmed closure timestamps are GitHub facts; recurrences are
+    journal facts. Keeping those sources explicit lets a failed GitHub read
+    degrade to the recurrence signal instead of manufacturing lifecycle data.
+    """
+    days: dict[str, dict] = {}
+
+    def row_for(value) -> dict | None:
+        stamp = parse_ts(value)
+        if stamp is None:
+            return None
+        day = stamp.astimezone(timezone.utc).date().isoformat()
+        return days.setdefault(
+            day,
+            {"day": day, "opened": 0, "closed": 0, "net_open": 0,
+             "recurrences": 0, "first_of_class": False},
+        )
+
+    for issue in issues if isinstance(issues, list) else ():
+        if not isinstance(issue, dict):
+            continue
+        if row := row_for(issue.get("createdAt")):
+            row["opened"] += 1
+        if row := row_for(issue.get("closedAt")):
+            row["closed"] += 1
+    for event in recurrence_events:
+        if isinstance(event, dict) and event.get("event") == "recurrence":
+            if row := row_for(event.get("ts")):
+                row["recurrences"] += 1
+    for row in days.values():
+        row["net_open"] = row["opened"] - row["closed"]
+        row["first_of_class"] = row["day"] == first_class_day
+    return [days[day] for day in sorted(days)]
+
+
+def deployment_class(snapshot: Snapshot) -> tuple[str, str, str]:
+    """The operating configuration whose first observation is expected tuition.
+
+    `point-at` writes the merged shared/overlay configuration to this per-name
+    snapshot. Runtime and review mode live in the shared layer, so reading the
+    overlay alone would classify every deployment using absent or ambient values.
+    """
+    return (
+        snapshot.repo,
+        cli.read_repo_env_field(cli._active_env_path(snapshot.name), "FIXER_RUNTIME"),
+        cli.read_repo_env_field(cli._active_env_path(snapshot.name), "REVIEW_MODE"),
+    )
+
+
+def first_observed_class_day(snapshot: Snapshot, snapshots) -> str | None:
+    """UTC day the selected repository/runtime/review-mode first journalled."""
+    target_class = deployment_class(snapshot)
+    timestamps = [
+        stamp
+        for candidate in snapshots
+        if deployment_class(candidate) == target_class
+        for stamp in candidate.timestamps
+        if stamp is not None
+    ]
+    if not timestamps:
+        return None
+    return min(timestamps).astimezone(timezone.utc).date().isoformat()
+
+
 def metrics_json(metrics: dash.Metrics) -> dict:
     return {
         "done_issues": metrics.done_issues,

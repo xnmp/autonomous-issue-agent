@@ -1,6 +1,6 @@
 import { api } from "../api/client";
 import { usePolled, useClock } from "../api/hooks";
-import type { JournalEvent, RoleHealth } from "../api/types";
+import type { HealthTrendDay, JournalEvent, RoleHealth } from "../api/types";
 import {
   HEALTH_LABEL,
   HEALTH_TONE,
@@ -157,6 +157,8 @@ export function OverviewTab({ repo }: { repo: string }) {
         </section>
       </div>
 
+      <HealthTrend rows={ov.data?.health_trend ?? []} loading={ov.loading} />
+
       <SectionTitle>Daemon health</SectionTitle>
       <div className="health-cards">
         {(ov.data?.health ?? []).length === 0 && !ov.loading ? (
@@ -207,6 +209,36 @@ export function OverviewTab({ repo }: { repo: string }) {
         )}
       </div>
     </div>
+  );
+}
+
+function HealthTrend({ rows, loading }: { rows: HealthTrendDay[]; loading: boolean }) {
+  return (
+    <section className="panel">
+      <div className="panel-hd">
+        <span className="panel-title">Issue health trend</span>
+        <span className="faint">UTC days · first-of-class is expected tuition</span>
+      </div>
+      <div className="panel-bd flush">
+        {rows.length === 0 && !loading ? (
+          <EmptyState>no issue activity or recurrences recorded yet</EmptyState>
+        ) : (
+          <div className="tbl-wrap">
+            <table className="tbl">
+              <thead><tr><th>UTC day</th><th className="r">Opened</th><th className="r">Closed</th><th className="r">Net</th><th className="r">Recurrences</th></tr></thead>
+              <tbody>{rows.map((row) => (
+                <tr key={row.day}>
+                  <td className="mono">{row.day}{row.first_of_class ? <span className="faint"> · first class</span> : null}</td>
+                  <td className="r num">{num(row.opened)}</td><td className="r num">{num(row.closed)}</td>
+                  <td className={`r num${row.net_open > 0 && !row.first_of_class ? " tone-fail" : ""}`}>{row.net_open > 0 ? `+${row.net_open}` : num(row.net_open)}</td>
+                  <td className={`r num${row.recurrences > 0 ? " tone-fail" : ""}`}>{num(row.recurrences)}</td>
+                </tr>
+              ))}</tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </section>
   );
 }
 

@@ -145,6 +145,15 @@ export interface Caps {
   today_usd: Nullable<number>;
 }
 
+export interface HealthTrendDay {
+  day: string;
+  opened: number;
+  closed: number;
+  net_open: number;
+  recurrences: number;
+  first_of_class: boolean;
+}
+
 /** Journal events are open-shaped; `kind`/`ts` are the two we rely on. */
 export interface JournalEvent {
   ts?: string;
@@ -162,6 +171,7 @@ export interface OverviewPayload extends Warned {
   caps: Nullable<Caps>;
   health: RoleHealth[];
   unattributed: JournalEvent[];
+  health_trend: HealthTrendDay[];
 }
 
 /* ----------------------------------------------------------------- issues */

@@ -26,7 +26,10 @@ from dataclasses import dataclass, field
 DEFAULT_TTL_S = 45.0
 GH_TIMEOUT_S = 30.0
 
-ISSUE_FIELDS = "number,title,url,labels,state,createdAt,comments"
+ISSUE_FIELDS = "number,title,url,labels,state,createdAt,closedAt,comments"
+# `gh issue list` paginates to this bound. Reaching it is surfaced to callers:
+# a long-run trend that quietly omitted history would be worse than no trend.
+ISSUE_HISTORY_LIMIT = 1000
 PR_FIELDS = "number,title,url,state,mergedAt"
 
 
@@ -101,7 +104,7 @@ class GhReader:
             return self._cache.put(key, (None, "gh returned unparseable JSON"))
         return self._cache.put(key, (payload, ""))
 
-    def issues(self, repo: str, limit: int = 300) -> tuple[object | None, str]:
+    def issues(self, repo: str, limit: int = ISSUE_HISTORY_LIMIT) -> tuple[object | None, str]:
         """Open AND closed issues in one call: the done cards need titles for
         issues that have since been closed, and a second query would double the
         rate-limit cost to answer the same question."""

@@ -32,6 +32,14 @@ def test_repeated_reads_inside_the_ttl_shell_out_once():
     assert error == "" and payload == [{"number": 1}]
 
 
+def test_issue_history_requests_closed_dates_and_warnable_long_history_limit():
+    gh, calls = reader([("[]", "")])
+    gh.issues("o/r")
+    argv = calls[0]
+    assert "closedAt" in argv[argv.index("--json") + 1]
+    assert argv[argv.index("--limit") + 1] == str(ghdata.ISSUE_HISTORY_LIMIT)
+
+
 def test_the_cache_expires_after_the_ttl():
     clock = Clock()
     gh, calls = reader([('[]', ""), ('[]', "")], clock=clock, ttl_s=45.0)

@@ -88,7 +88,7 @@ def parse_remote_url(url: str) -> str:
     return ""
 
 
-# M12: fields the CLI ever reads out of a per-repo overlay via
+# M12: fields read from a deployment configuration via
 # read_repo_env_field/_source_env_file. Cleared from the sourcing subprocess's
 # BASE environment (see _source_env_file) so a same-named var already present
 # in the CLI's own process (e.g. an operator's shell that `source`d an overlay
@@ -97,7 +97,7 @@ def parse_remote_url(url: str) -> str:
 # elsewhere in this module.
 _OVERLAY_FIELDS = (
     "REPO", "TARGET_DIR", "STATE_DIR", "REVIEW_STATE_DIR", "STEWARD_STATE_DIR",
-    "TEST_CMD", "DAILY_SPEND_CAP_USD",
+    "TEST_CMD", "DAILY_SPEND_CAP_USD", "FIXER_RUNTIME", "REVIEW_MODE",
 )
 
 # M12: a hand-edited overlay's KEY <spaces> = <spaces> VALUE is not valid bash
