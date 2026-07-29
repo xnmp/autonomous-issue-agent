@@ -484,6 +484,67 @@ def test_stall_reconciliation_converges_to_latest_relabel_without_redundant_writ
     )
 
 
+def test_stall_reconciliation_keeps_advisory_relabel_independent(tmp_path):
+    class LabelGateway:
+        def __init__(self):
+            self.labels = {
+                Label.AI_READY.value,
+                Label.RECURRENCE.value,
+            }
+            self.relabels = []
+
+        def relabel(self, kind, number, remove, add):
+            self.relabels.append((kind, number, remove, add))
+            if remove:
+                self.labels.discard(remove)
+            if add:
+                self.labels.add(add)
+
+        def has_label(self, kind, number, label):
+            return label in self.labels
+
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    lifecycle = Relabel(
+        Target.ISSUE,
+        29,
+        Label.AI_READY,
+        Label.AI_WORKING,
+    )
+    advisory = Relabel(
+        Target.ISSUE,
+        29,
+        None,
+        Label.RECURRENCE,
+    )
+    for action in (lifecycle, advisory):
+        journal.emit(
+            "action",
+            desc="accepted relabel",
+            action=encode_lifecycle_action(action),
+        )
+    gateway = LabelGateway()
+    executor = Executor(gateway, journal=journal, retry_delays=())
+    now = datetime.now(timezone.utc)
+
+    executor.reconcile_recent_actions(
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+    )
+
+    assert gateway.labels == {
+        Label.AI_WORKING.value,
+        Label.RECURRENCE.value,
+    }
+    assert gateway.relabels == [
+        (
+            "issue",
+            29,
+            Label.AI_READY.value,
+            Label.AI_WORKING.value,
+        )
+    ]
+
+
 @pytest.mark.parametrize(
     "payload",
     [
