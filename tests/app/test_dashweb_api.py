@@ -7,10 +7,14 @@ dashboard that fails during an incident is a dashboard that is not there
 during incidents.
 """
 
+import json
+
 import pytest
 
 pytest.importorskip("fastapi")
 
+from issue_agent.adapters.dashweb import build as dashboard_build  # noqa: E402
+from issue_agent.adapters.dashweb import bundle  # noqa: E402
 from issue_agent.app.dashweb import server  # noqa: E402
 from asgi_client import ASGITestClient as TestClient  # noqa: E402
 
@@ -288,6 +292,28 @@ def test_an_unknown_priority_is_a_400_and_never_reaches_the_backend():
 
 
 # ── static ────────────────────────────────────────────────────────────────────
+def _write_fresh_spa(tmp_path):
+    dashboard = tmp_path / "dashboard"
+    dist = dashboard / "dist"
+    dist.mkdir(parents=True)
+    (dashboard / "build-inputs.json").write_text(
+        '{"schema":1,"files":["build-inputs.json"],"directories":[]}'
+    )
+    (dist / "index.html").write_text("<html>app</html>")
+    (dist / "assets").mkdir()
+    (dist / "assets" / "app.js").write_text("console.log(1)")
+    (dist / bundle.MANIFEST_NAME).write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "inputs": bundle.source_hashes(tmp_path),
+                "outputs": bundle.output_hashes(tmp_path),
+            }
+        )
+    )
+    return dist
+
+
 def test_without_a_built_spa_the_root_explains_how_to_build_it(tmp_path):
     c = TestClient(server.create_app(backend=StubBackend(), harness_root=str(tmp_path)),
                    base_url=BASE_URL)
@@ -296,15 +322,81 @@ def test_without_a_built_spa_the_root_explains_how_to_build_it(tmp_path):
 
 
 def test_a_built_spa_is_served_with_a_fallback_for_client_routes(tmp_path):
-    dist = tmp_path / "dashboard" / "dist"
-    (dist / "assets").mkdir(parents=True)
-    (dist / "index.html").write_text("<html>app</html>")
-    (dist / "assets" / "app.js").write_text("console.log(1)")
+    dist = _write_fresh_spa(tmp_path)
     c = TestClient(server.create_app(backend=StubBackend(), harness_root=str(tmp_path)),
                    base_url=BASE_URL)
     assert "app</html>" in c.get("/").text
     assert "console.log(1)" in c.get("/assets/app.js").text
     assert "app</html>" in c.get("/repo/demo/issue/7").text
+
+
+def test_a_stale_spa_is_not_served_even_when_index_exists(tmp_path):
+    _write_fresh_spa(tmp_path)
+    (tmp_path / "dashboard" / "build-inputs.json").write_text(
+        '{"schema":1,"files":["build-inputs.json"],"directories":["src"]}'
+    )
+    c = TestClient(
+        server.create_app(backend=StubBackend(), harness_root=str(tmp_path)),
+        base_url=BASE_URL,
+    )
+
+    assert "make dashboard-ui" in c.get("/").text
+    assert "app</html>" not in c.get("/").text
+
+
+def test_a_running_server_keeps_its_immutable_version_after_new_publication(tmp_path):
+    dashboard = tmp_path / "dashboard"
+    dist_root = dashboard / "dist"
+    (dashboard / "build-inputs.json").parent.mkdir(parents=True)
+    (dashboard / "build-inputs.json").write_text(
+        '{"schema":1,"files":["build-inputs.json"],"directories":[]}'
+    )
+
+    def publish(build_id, content):
+        version = dist_root / "builds" / build_id
+        version.mkdir(parents=True)
+        (version / "index.html").write_text(content)
+        (dist_root / bundle.POINTER_NAME).write_text(
+            json.dumps({"schema": 1, "build": f"builds/{build_id}"})
+        )
+        (version / bundle.MANIFEST_NAME).write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "inputs": bundle.source_hashes(tmp_path),
+                    "outputs": bundle.output_hashes(tmp_path),
+                }
+            )
+        )
+
+    publish("v1", "<html>version one</html>")
+    first = TestClient(
+        server.create_app(backend=StubBackend(), harness_root=str(tmp_path)),
+        base_url=BASE_URL,
+    )
+    publish("v2", "<html>version two</html>")
+    dashboard_build.garbage_collect_builds(dashboard)
+    second = TestClient(
+        server.create_app(backend=StubBackend(), harness_root=str(tmp_path)),
+        base_url=BASE_URL,
+    )
+
+    assert "version one" in first.get("/").text
+    assert "version two" in second.get("/").text
+
+
+def test_an_invalid_version_pointer_degrades_to_build_instructions(tmp_path):
+    dist = tmp_path / "dashboard" / "dist"
+    dist.mkdir(parents=True)
+    (dist / bundle.POINTER_NAME).write_text("{")
+
+    client = TestClient(
+        server.create_app(backend=StubBackend(), harness_root=str(tmp_path)),
+        base_url=BASE_URL,
+    )
+
+    assert "dashboard UI unavailable" in client.get("/").text
+    assert "make dashboard-ui" in client.get("/").text
 
 
 def test_an_unknown_api_path_is_a_404_not_the_spa(tmp_path):
@@ -325,6 +417,16 @@ def test_a_traversal_path_cannot_escape_the_build_directory(tmp_path):
                    base_url=BASE_URL)
     assert "SECRET" not in c.get("/../secret.txt").text
     assert server._safe_asset(str(dist), "../secret.txt") == ""
+
+
+def test_a_symlinked_asset_cannot_escape_the_build_directory(tmp_path):
+    dist = tmp_path / "dashboard" / "dist"
+    dist.mkdir(parents=True)
+    outside = tmp_path / "secret.txt"
+    outside.write_text("SECRET")
+    (dist / "leak.txt").symlink_to(outside)
+
+    assert server._safe_asset(str(dist), "leak.txt") == ""
 
 
 # ── request guard (the RCE chain this closes) ─────────────────────────────────

@@ -5,10 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "node scripts/build-dashboard.mjs",
     "typecheck": "tsc --noEmit",
     "generate:api": "cd .. && UV_NO_CACHE=1 uv run --offline python scripts/export_dashboard_openapi.py && cd dashboard && openapi-typescript openapi.json -o src/api/generated.ts && openapi-zod-client openapi.json -o src/api/generated-zod.ts --export-schemas",
-    "test": "vitest run",
+    "test": "vitest run && node scripts/build-dashboard.test.mjs",
     "test:e2e": "npm run build && playwright test",
     "preview": "vite preview"
   },

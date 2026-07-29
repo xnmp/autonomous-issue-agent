@@ -21,6 +21,7 @@ import mimetypes
 import os
 
 from ...adapters.dashweb import actions, costchart
+from ...adapters.dashweb.bundle import bundle_snapshot, published_dist
 from .. import cli
 from . import contracts
 from .ports import DashboardBackend
@@ -55,11 +56,11 @@ def same_origin(origin: str, host_header: str) -> bool:
 
 
 def dist_dir(harness_root: str | None = None) -> str:
-    return os.path.join(harness_root or cli.HARNESS_ROOT, "dashboard", "dist")
+    return str(published_dist(harness_root or cli.HARNESS_ROOT))
 
 
 def dist_ready(harness_root: str | None = None) -> bool:
-    return os.path.isfile(os.path.join(dist_dir(harness_root), "index.html"))
+    return bundle_snapshot(harness_root or cli.HARNESS_ROOT).status.ready
 
 
 # ── HTTP ──────────────────────────────────────────────────────────────────────
@@ -75,8 +76,14 @@ def create_app(
     backend = backend or Backend(harness_root=harness_root)
     should_offload = isinstance(backend, Backend) if offload_backend is None else offload_backend
     root = harness_root or getattr(backend, "harness_root", cli.HARNESS_ROOT)
-    dist = dist_dir(root)
+    assets = bundle_snapshot(root, pin=True)
+    assets_ready = assets.status.ready
+    dist = str(assets.dist) if assets_ready else os.path.join(root, "dashboard", "dist")
     app = FastAPI(title="issue-agent dashboard", docs_url=None, redoc_url=None)
+    if assets_ready:
+        app.state.dashboard_bundle_snapshot = assets
+    elif assets.lease is not None:
+        assets.lease.close()
 
     def degraded(kind: str, exc: Exception, **empty) -> dict:
         return {
@@ -247,8 +254,8 @@ def create_app(
         if full_path.startswith("api/"):
             raise HTTPException(404, "no such endpoint")
         index = os.path.join(dist, "index.html")
-        if not os.path.isfile(index):
-            return HTMLResponse(instructions_page())
+        if not assets_ready:
+            return HTMLResponse(instructions_page(root))
         asset = _safe_asset(dist, full_path)
         path = asset or index
         with open(path, "rb") as handle:
@@ -264,23 +271,23 @@ def _safe_asset(dist: str, relative: str) -> str:
     escapes the build directory."""
     if not relative:
         return ""
-    candidate = os.path.normpath(os.path.join(dist, relative))
-    base = os.path.normpath(dist)
+    candidate = os.path.realpath(os.path.join(dist, relative))
+    base = os.path.realpath(dist)
     if candidate != base and not candidate.startswith(base + os.sep):
         return ""
     return candidate if os.path.isfile(candidate) else ""
 
 
-def instructions_page() -> str:
+def instructions_page(harness_root: str | None = None) -> str:
     return (
         "<!doctype html><meta charset='utf-8'>"
         "<title>issue-agent dashboard</title>"
         "<style>body{font:14px/1.6 ui-monospace,monospace;margin:3rem auto;"
         "max-width:44rem;padding:0 1rem;background:#0e1330;color:#d8dce8}"
         "code{background:#141a3d;padding:.15rem .35rem;border-radius:3px}</style>"
-        "<h1>dashboard UI not built</h1>"
-        "<p>The API is live; the single-page app has not been built yet:</p>"
-        f"<pre><code>{html.escape('uv sync --extra dash && make dashboard-ui')}</code></pre>"
+        "<h1>dashboard UI unavailable</h1>"
+        "<p>The API is live; the single-page app is missing, stale, or invalid:</p>"
+        f"<pre><code>{html.escape(cli.dashboard_build_command(harness_root))}</code></pre>"
         "<p>Then reload this page. The JSON API is available under "
         "<code>/api/</code> in the meantime.</p>"
     )

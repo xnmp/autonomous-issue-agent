@@ -20,6 +20,7 @@ config/.active*.env
 # Dashboard SPA build output + deps (built by `make dashboard-ui`)
 dashboard/dist/
 dashboard/node_modules/
+dashboard/.build.lock
 dashboard/test-results/
 dashboard/playwright-report/
 

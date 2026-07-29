@@ -15,6 +15,157 @@ from issue_agent.app.config import from_env
 
 
 # ── parse_remote_url ──────────────────────────────────────────────────────────
+def test_dashboard_reports_a_stale_frontend_bundle_before_falling_back(
+    monkeypatch, capsys
+):
+    from issue_agent.app import dashboard
+
+    args = type(
+        "Args",
+        (),
+        {
+            "names": ["demo"],
+            "html": None,
+            "text": False,
+            "serve": 8321,
+            "details": False,
+            "stale_minutes": 5.0,
+        },
+    )()
+    monkeypatch.setattr(
+        cli,
+        "_prepare_dashweb",
+        lambda: cli.DashwebPreparation(
+            False, "automatic dashboard rebuild failed with exit 2", True
+        ),
+    )
+    monkeypatch.setattr(
+        dashboard,
+        "serve",
+        lambda _port, _render: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+
+    assert cli.cmd_dashboard(args) == 0
+    output = capsys.readouterr()
+    combined = output.out + output.err
+    assert "automatic dashboard rebuild failed with exit 2" in combined
+    assert "make dashboard-ui" in combined
+
+
+def test_prepare_dashboard_rebuilds_from_harness_root_and_revalidates(
+    tmp_path, monkeypatch
+):
+    from issue_agent.adapters.dashweb import bundle
+
+    harness = str(tmp_path / "harness with spaces")
+    target = tmp_path / "target-repo"
+    target.mkdir()
+    states = iter(
+        (
+            bundle.BundleStatus("stale", "src/App.tsx changed"),
+            bundle.BundleStatus("ready", "validated"),
+        )
+    )
+    monkeypatch.chdir(target)
+    monkeypatch.setattr(cli, "HARNESS_ROOT", harness)
+    monkeypatch.setattr("importlib.util.find_spec", lambda _name: object())
+    monkeypatch.setattr(bundle, "bundle_status", lambda _root: next(states))
+    calls = []
+    monkeypatch.setattr(cli, "_run_dashboard_build", lambda: calls.append(True) or 0)
+
+    result = cli._prepare_dashweb()
+
+    assert result.ready
+    assert result.rebuild_attempted
+    assert calls == [True]
+
+
+def test_prepare_dashboard_falls_back_when_rebuild_does_not_validate(
+    tmp_path, monkeypatch
+):
+    from issue_agent.adapters.dashweb import bundle
+
+    states = iter(
+        (
+            bundle.BundleStatus("stale", "src/App.tsx changed"),
+            bundle.BundleStatus("stale", "assets/app.js missing"),
+        )
+    )
+    monkeypatch.setattr(cli, "HARNESS_ROOT", str(tmp_path))
+    monkeypatch.setattr("importlib.util.find_spec", lambda _name: object())
+    monkeypatch.setattr(bundle, "bundle_status", lambda _root: next(states))
+    monkeypatch.setattr(cli, "_run_dashboard_build", lambda: 0)
+
+    result = cli._prepare_dashweb()
+
+    assert not result.ready
+    assert result.rebuild_attempted
+    assert "produced an invalid bundle" in result.detail
+    assert "assets/app.js missing" in result.detail
+
+
+def test_prepare_dashboard_falls_back_when_rebuild_times_out(tmp_path, monkeypatch):
+    from issue_agent.adapters.dashweb import bundle
+
+    states = iter(
+        (
+            bundle.BundleStatus("stale", "src/App.tsx changed"),
+            bundle.BundleStatus("stale", "still stale"),
+        )
+    )
+    monkeypatch.setattr(cli, "HARNESS_ROOT", str(tmp_path))
+    monkeypatch.setattr("importlib.util.find_spec", lambda _name: object())
+    monkeypatch.setattr(bundle, "bundle_status", lambda _root: next(states))
+    monkeypatch.setattr(cli, "_run_dashboard_build", lambda: 124)
+
+    result = cli._prepare_dashweb()
+
+    assert not result.ready
+    assert result.rebuild_attempted
+    assert result.detail == "automatic dashboard rebuild timed out"
+
+
+def test_dashboard_rebuild_timeout_terminates_the_process_group(monkeypatch):
+    class HungBuild:
+        pid = 4321
+
+        def __init__(self):
+            self.waits = 0
+
+        def wait(self, timeout=None):
+            self.waits += 1
+            if self.waits == 1:
+                raise subprocess.TimeoutExpired("make", timeout)
+            return -15
+
+        def poll(self):
+            return None
+
+    process = HungBuild()
+    popen_calls = []
+    signals = []
+    monkeypatch.setattr(
+        cli.subprocess,
+        "Popen",
+        lambda argv, start_new_session: popen_calls.append((argv, start_new_session))
+        or process,
+    )
+    monkeypatch.setattr(cli.os, "killpg", lambda pid, sig: signals.append((pid, sig)))
+
+    assert cli._run_dashboard_build() == 124
+    assert popen_calls == [
+        (["make", "-C", cli.HARNESS_ROOT, "dashboard-ui"], True)
+    ]
+    assert signals == [(process.pid, cli.signal.SIGTERM)]
+
+
+def test_dashboard_recovery_command_is_absolute_and_shell_safe():
+    assert cli.dashboard_build_command("/tmp/harness with spaces") == (
+        "cd '/tmp/harness with spaces' && uv sync --extra sdk --extra dash && "
+        "make dashboard-ui"
+    )
+
+
 def test_parse_remote_url_ssh():
     assert cli.parse_remote_url("git@github.com:acme/MyApp.git") == "acme/MyApp"
 

@@ -594,7 +594,7 @@ def test_text_wins_over_the_default_serve(tmp_path, monkeypatch, capsys):
     write_jsonl(str(state / "fix" / "journal.jsonl"), run(cost_usd=3.0))
     monkeypatch.setattr(cli, "REPOS_DIR", str(repos))
     monkeypatch.setenv("XDG_STATE_HOME", str(state))
-    monkeypatch.setattr(cli, "_dashweb_ready", lambda: pytest.fail("served despite --text"))
+    monkeypatch.setattr(cli, "_prepare_dashweb", lambda: pytest.fail("served despite --text"))
     assert cli.cmd_dashboard(_args(text=True, serve=cli.DASHBOARD_PORT)) == 0
     assert "o/r" in capsys.readouterr().out
 
@@ -607,7 +607,7 @@ def test_html_wins_over_the_default_serve(tmp_path, monkeypatch):
     write_jsonl(str(state / "fix" / "journal.jsonl"), run(cost_usd=3.0))
     monkeypatch.setattr(cli, "REPOS_DIR", str(repos))
     monkeypatch.setenv("XDG_STATE_HOME", str(state))
-    monkeypatch.setattr(cli, "_dashweb_ready", lambda: pytest.fail("served despite --html"))
+    monkeypatch.setattr(cli, "_prepare_dashweb", lambda: pytest.fail("served despite --html"))
     out = tmp_path / "dash.html"
     assert cli.cmd_dashboard(_args(html=str(out), text=False, serve=cli.DASHBOARD_PORT)) == 0
     assert "o/r" in out.read_text()
