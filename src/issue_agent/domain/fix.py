@@ -421,45 +421,35 @@ def _last_human_reply_at(issue: IssueView | PRView, fix_bot: str) -> str | None:
     return reply.created_at or None
 
 
+def _issues_needing_resume(
+    world: WorldState,
+    state: FixState,
+    cfg: FixConfig,
+    require_session: bool,
+) -> list[tuple[int, str]]:
+    out: list[tuple[int, str]] = []
+    for issue in world.issues:
+        lifecycle = issue_lifecycle(issue)
+        has_session = issue.number in state.sessions
+        if not lifecycle.is_blocked or has_session != require_session:
+            continue
+        last_at = _last_human_reply_at(issue, cfg.fix_bot)
+        if last_at is None:
+            continue
+        if last_at != state.resumed_at.get(issue.number, ""):
+            out.append((issue.number, last_at))
+    return out
+
+
 def issues_needing_resume(
     world: WorldState, state: FixState, cfg: FixConfig
 ) -> list[tuple[int, str]]:
-    """ai-blocked issues with a session AND a human reply we have NOT yet resumed
-    on. Returns (issue_number, reply_at). The resumed-at dedupe is the anti-loop
-    lesson: a single reply must not re-trigger resume every poll."""
-    out: list[tuple[int, str]] = []
-    for issue in world.issues:
-        lifecycle = issue_lifecycle(issue)
-        if not lifecycle.is_blocked or issue.number not in state.sessions:
-            continue
-        last_at = _last_human_reply_at(issue, cfg.fix_bot)
-        if last_at is None:
-            continue
-        if last_at != state.resumed_at.get(issue.number, ""):
-            out.append((issue.number, last_at))
-    return out
+    """Blocked issues with a session and an unconsumed human reply.
 
-
-def issues_needing_fresh_resume(
-    world: WorldState, state: FixState, cfg: FixConfig
-) -> list[tuple[int, str]]:
-    """Blocked issues whose new reply cannot continue a saved runtime session.
-
-    The workflow reconstructs these legs from the issue context, while the
-    durable resumed-at marker gives them the same exactly-once behavior as a
-    true session continuation.
+    Kept as the saved-session selector for callers that specifically need a
+    runtime continuation. The daemon combines it with sessionless recovery.
     """
-    out: list[tuple[int, str]] = []
-    for issue in world.issues:
-        lifecycle = issue_lifecycle(issue)
-        if not lifecycle.is_blocked or issue.number in state.sessions:
-            continue
-        last_at = _last_human_reply_at(issue, cfg.fix_bot)
-        if last_at is None:
-            continue
-        if last_at != state.resumed_at.get(issue.number, ""):
-            out.append((issue.number, last_at))
-    return out
+    return _issues_needing_resume(world, state, cfg, require_session=True)
 
 
 def issues_needing_any_resume(
@@ -467,7 +457,9 @@ def issues_needing_any_resume(
 ) -> list[tuple[int, str]]:
     """Merge saved and fresh continuations without changing issue priority."""
     by_issue = dict(issues_needing_resume(world, state, cfg))
-    by_issue.update(issues_needing_fresh_resume(world, state, cfg))
+    by_issue.update(
+        _issues_needing_resume(world, state, cfg, require_session=False)
+    )
     return [
         (issue.number, by_issue[issue.number])
         for issue in world.issues

@@ -477,7 +477,7 @@ class FixWorkflow:
             issue_closed_without_pr=closed_without_pr,
         )
 
-    async def resolve_split(self, issue: int) -> None:
+    async def resolve_split(self, issue: int, human_reply: str = "") -> None:
         iss = self.gateway.get_issue(issue)
         branch = f"fix/{issue}-{slugify(iss.title) or 'issue'}"
         cwd = self._ensure_cwd(issue, branch)
@@ -491,7 +491,14 @@ class FixWorkflow:
         self.store.save_model(issue, fix_cfg.model)
         if self.store.get_phase(issue) != "authored":
             author = await self.runner.run(
-                task_builders.build_author_task(issue, iss.title, iss.body, cwd, fix_cfg)
+                task_builders.build_author_task(
+                    issue,
+                    iss.title,
+                    iss.body,
+                    cwd,
+                    fix_cfg,
+                    human_reply=human_reply,
+                )
             )
             self.store.save_session(issue, author.session_id)
             self._decay_infra_deaths(issue, author)
@@ -503,9 +510,22 @@ class FixWorkflow:
                 return
             self.store.set_phase(issue, "authored")
 
-        await self._implement_loop(issue, iss, cwd, fix_cfg)
+        await self._implement_loop(
+            issue,
+            iss,
+            cwd,
+            fix_cfg,
+            human_reply=human_reply,
+        )
 
-    async def _implement_loop(self, issue: int, iss, cwd: str, fix_cfg=None) -> None:
+    async def _implement_loop(
+        self,
+        issue: int,
+        iss,
+        cwd: str,
+        fix_cfg=None,
+        human_reply: str = "",
+    ) -> None:
         fix_cfg = fix_cfg if fix_cfg is not None else self.cfg.fix
         uphold_note = ""
         trail: list[str] = []
@@ -513,7 +533,13 @@ class FixWorkflow:
         while True:
             impl = await self.runner.run(
                 task_builders.build_implement_task(
-                    issue, iss.title, iss.body, cwd, fix_cfg, uphold_note=uphold_note
+                    issue,
+                    iss.title,
+                    iss.body,
+                    cwd,
+                    fix_cfg,
+                    uphold_note=uphold_note,
+                    human_reply=human_reply,
                 )
             )
             self.store.save_session(issue, impl.session_id)
@@ -598,6 +624,9 @@ class FixWorkflow:
         # re-resuming.
         self.store.set_resumed_at(issue, reply_comment.created_at)
         pr_existing = self.gateway.pr_for_issue(issue)
+        if self.cfg.author_tests_split and pr_existing is None:
+            await self.resolve_split(issue, human_reply=reply)
+            return
         branch = self.gateway.get_pr(pr_existing).head_ref_name if pr_existing else f"fix/{issue}-issue"
         cwd = self._ensure_cwd(issue, branch)
         fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
