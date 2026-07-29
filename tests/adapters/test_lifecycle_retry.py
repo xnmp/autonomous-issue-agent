@@ -2,9 +2,11 @@
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from issue_agent.adapters.github import GhUnavailable
 from issue_agent.adapters.journal import Journal, read_events
-from issue_agent.adapters.store import Store
+from issue_agent.adapters.store import Store, decode_lifecycle_action
 from issue_agent.app.execute import Executor
 from issue_agent.app.loop import Daemon
 from issue_agent.domain.actions import (
@@ -310,6 +312,161 @@ def test_stall_reconciliation_verifies_accepted_action_without_duplicate(tmp_pat
     assert any(
         event["event"] == "action_verified"
         and event["desc"] == "comment issue #29 (18 chars)"
+        for event in read_events(journal.path)
+    )
+
+
+def test_stall_reconciliation_persists_action_when_verification_is_unavailable(
+    tmp_path,
+):
+    class VerificationUnavailableGateway(ScriptedGateway):
+        verification_unavailable = False
+
+        def has_comment(self, kind, number, body):
+            if self.verification_unavailable:
+                raise unavailable()
+            return super().has_comment(kind, number, body)
+
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    store = Store(str(tmp_path / "state"))
+    gateway = VerificationUnavailableGateway([None])
+    action = PostComment(Target.ISSUE, 29, "Need clarification")
+    executor = Executor(
+        gateway,
+        journal=journal,
+        pending_actions=store,
+        retry_delays=(),
+    )
+    executor.execute(action)
+    accepted_at = datetime.now(timezone.utc)
+
+    gateway.verification_unavailable = True
+    executor.reconcile_recent_actions(
+        accepted_at - timedelta(minutes=1),
+        accepted_at + timedelta(minutes=1),
+    )
+
+    assert store.load_pending_actions() == (action,)
+    assert any(
+        event["event"] == "action_failed"
+        and event["pending"] is True
+        and "authentication" in event["error"]
+        for event in read_events(journal.path)
+    )
+
+
+def test_stall_reconciliation_keeps_exhausted_missing_action_pending(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    store = Store(str(tmp_path / "state"))
+    gateway = ScriptedGateway([None, unavailable()])
+    action = PostComment(Target.ISSUE, 29, "Need clarification")
+    executor = Executor(
+        gateway,
+        journal=journal,
+        pending_actions=store,
+        retry_delays=(),
+    )
+    executor.execute(action)
+    accepted_at = datetime.now(timezone.utc)
+
+    gateway.comment_visible = False
+    executor.reconcile_recent_actions(
+        accepted_at - timedelta(minutes=1),
+        accepted_at + timedelta(minutes=1),
+    )
+
+    assert store.load_pending_actions() == (action,)
+    assert any(
+        event["event"] == "action_failed" and event["pending"] is True
+        for event in read_events(journal.path)
+    )
+
+
+def test_stall_reconciliation_verifies_relabel_without_duplicate(tmp_path):
+    class LabelGateway:
+        def __init__(self):
+            self.labels = {Label.AI_WORKING.value}
+            self.relabels = []
+
+        def relabel(self, kind, number, remove, add):
+            self.relabels.append((kind, number, remove, add))
+            if remove:
+                self.labels.discard(remove)
+            if add:
+                self.labels.add(add)
+
+        def has_label(self, kind, number, label):
+            return label in self.labels
+
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    gateway = LabelGateway()
+    action = Relabel(
+        Target.ISSUE,
+        29,
+        Label.AI_WORKING,
+        Label.AI_BLOCKED,
+    )
+    executor = Executor(gateway, journal=journal, retry_delays=())
+    executor.execute(action)
+    accepted_at = datetime.now(timezone.utc)
+
+    executor.reconcile_recent_actions(
+        accepted_at - timedelta(minutes=1),
+        accepted_at + timedelta(minutes=1),
+    )
+
+    assert gateway.relabels == [
+        ("issue", 29, Label.AI_WORKING.value, Label.AI_BLOCKED.value)
+    ]
+    assert any(
+        event["event"] == "action_verified"
+        and event["desc"] == "relabel issue #29: -ai-working +ai-blocked"
+        for event in read_events(journal.path)
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"type": "comment", "target": "ISSUE", "number": 29, "body": None},
+        {
+            "type": "escalate_ci_pending",
+            "pr": 64,
+            "head": None,
+            "body": "CI is stalled",
+        },
+        {"type": "close", "number": "29", "reason": "completed", "comment": ""},
+    ],
+)
+def test_structured_lifecycle_receipts_reject_malformed_fields(payload):
+    with pytest.raises(ValueError, match="invalid lifecycle action"):
+        decode_lifecycle_action(payload)
+
+
+def test_stall_reconciliation_skips_malformed_receipt_without_github_write(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    journal.emit(
+        "action",
+        desc="comment issue #29",
+        action={
+            "type": "comment",
+            "target": "ISSUE",
+            "number": 29,
+            "body": None,
+        },
+    )
+    gateway = ScriptedGateway([])
+    executor = Executor(gateway, journal=journal, retry_delays=())
+    now = datetime.now(timezone.utc)
+
+    executor.reconcile_recent_actions(
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+    )
+
+    assert gateway.comments == []
+    assert any(
+        event["event"] == "action_reconcile_skipped"
         for event in read_events(journal.path)
     )
 

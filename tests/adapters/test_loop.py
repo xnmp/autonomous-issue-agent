@@ -307,6 +307,19 @@ def test_late_heartbeat_journals_reconciles_and_annotates_overlapping_leg(tmp_pa
 
 def test_heartbeat_below_stall_threshold_does_not_reconcile_or_journal(tmp_path):
     journal = Journal(str(tmp_path / "journal.jsonl"))
+    receipt = {
+        "ts": "1970-01-01T00:00:10+00:00",
+        "event": "action",
+        "desc": "relabel issue #5: +ai-blocked",
+        "action": {
+            "type": "relabel",
+            "target": "ISSUE",
+            "number": 5,
+            "remove": None,
+            "add": "ai-blocked",
+        },
+    }
+    tmp_path.joinpath("journal.jsonl").write_text(json.dumps(receipt) + "\n")
     gateway = FakeGateway()
     daemon = Daemon(
         "fix",
@@ -324,22 +337,36 @@ def test_heartbeat_below_stall_threshold_does_not_reconcile_or_journal(tmp_path)
         max_ticks=1,
     )
 
-    assert read_events(journal.path) == []
+    assert read_events(journal.path) == [receipt]
     assert gateway.calls == []
 
 
-def test_long_active_agent_leg_is_not_mislabeled_as_a_suspension(tmp_path):
+def test_inclusive_late_heartbeat_reconciles_when_active_clock_also_advanced(tmp_path):
     journal = Journal(str(tmp_path / "journal.jsonl"))
+    receipt = {
+        "ts": "1970-01-01T00:00:10+00:00",
+        "event": "action",
+        "desc": "relabel issue #5: +ai-blocked",
+        "action": {
+            "type": "relabel",
+            "target": "ISSUE",
+            "number": 5,
+            "remove": None,
+            "add": "ai-blocked",
+        },
+    }
+    tmp_path.joinpath("journal.jsonl").write_text(json.dumps(receipt) + "\n")
+    gateway = FakeGateway()
     daemon = Daemon(
         "fix",
         lambda: WorldState(),
         lambda _world: [],
-        Executor(FakeGateway(), journal=journal),
+        Executor(gateway, journal=journal),
         poll_seconds=60,
         journal=journal,
     )
-    wall_times = iter([0, 900])
-    active_times = iter([0, 900])
+    wall_times = iter([0, 240])
+    active_times = iter([0, 240])
 
     daemon.run_forever(
         sleep=lambda _seconds: None,
@@ -348,7 +375,15 @@ def test_long_active_agent_leg_is_not_mislabeled_as_a_suspension(tmp_path):
         max_ticks=1,
     )
 
-    assert read_events(journal.path) == []
+    events = read_events(journal.path)
+    assert gateway.calls == [("relabel", 5, None, "ai-blocked")]
+    assert any(
+        event["event"] == "stall"
+        and event["elapsed_seconds"] == 240
+        and event["suspended_seconds"] == 0
+        for event in events
+    )
+    assert not any(event["event"] == "agent_run_stall" for event in events)
 
 
 def _waking_daemon(wake_check, poll_seconds=60, logs=None):

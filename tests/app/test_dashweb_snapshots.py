@@ -289,6 +289,25 @@ def test_duplicate_leg_annotations_for_one_stall_are_subtracted_once():
     assert snapshots.issue_card(row_for(events, 7), NOW)["elapsed_s"] == 6000
 
 
+def test_overlapping_cross_role_stall_estimates_are_subtracted_as_one_interval():
+    events = [
+        {"ts": ts(hours=4), "event": "agent_run_start", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
+        RESOLVE,
+        {"ts": ts(hours=3), "event": "agent_run_stall", "role": "fix",
+         "issue": 7, "dispatch": "d1", "stall_started_at": ts(hours=3.5),
+         "suspended_seconds": 1200},
+        {"ts": ts(hours=3), "event": "agent_run_stall", "role": "review",
+         "issue": 7, "dispatch": "d2",
+         "stall_started_at": ts(hours=3, minutes=29),
+         "suspended_seconds": 1200},
+        {"ts": ts(hours=2), "event": "action",
+         "desc": "clear state for pr #12, issue #7 (merged)"},
+    ]
+
+    assert snapshots.issue_card(row_for(events, 7), NOW)["elapsed_s"] == 5940
+
+
 def test_issue_card_carries_gh_title_pr_state_and_merge_stamp():
     events = [RESOLVE, {"ts": ts(hours=1), "event": "action",
                         "desc": "clear state for pr #12, issue #7 (merged)"}]
