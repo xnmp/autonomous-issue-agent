@@ -6,7 +6,11 @@ import pytest
 
 from issue_agent.adapters.github import GhUnavailable
 from issue_agent.adapters.journal import Journal, read_events
-from issue_agent.adapters.store import Store, decode_lifecycle_action
+from issue_agent.adapters.store import (
+    Store,
+    decode_lifecycle_action,
+    encode_lifecycle_action,
+)
 from issue_agent.app.execute import Executor
 from issue_agent.app.loop import Daemon
 from issue_agent.domain.actions import (
@@ -423,6 +427,67 @@ def test_stall_reconciliation_verifies_relabel_without_duplicate(tmp_path):
         and event["desc"] == "relabel issue #29: -ai-working +ai-blocked"
         for event in read_events(journal.path)
     )
+
+
+def test_stall_reconciliation_preserves_repeated_transition_order(tmp_path):
+    class LabelGateway:
+        def __init__(self):
+            self.labels = {Label.AI_WORKING.value}
+            self.relabels = []
+
+        def relabel(self, kind, number, remove, add):
+            self.relabels.append((kind, number, remove, add))
+            if remove:
+                self.labels.discard(remove)
+            if add:
+                self.labels.add(add)
+
+        def has_label(self, kind, number, label):
+            return label in self.labels
+
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    working = Relabel(
+        Target.ISSUE,
+        29,
+        Label.AI_BLOCKED,
+        Label.AI_WORKING,
+    )
+    blocked = Relabel(
+        Target.ISSUE,
+        29,
+        Label.AI_WORKING,
+        Label.AI_BLOCKED,
+    )
+    for action in (working, blocked, working):
+        journal.emit(
+            "action",
+            desc="accepted lifecycle transition",
+            action=encode_lifecycle_action(action),
+        )
+    gateway = LabelGateway()
+    executor = Executor(gateway, journal=journal, retry_delays=())
+    now = datetime.now(timezone.utc)
+
+    executor.reconcile_recent_actions(
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+    )
+
+    assert gateway.labels == {Label.AI_WORKING.value}
+    assert gateway.relabels == [
+        (
+            "issue",
+            29,
+            Label.AI_WORKING.value,
+            Label.AI_BLOCKED.value,
+        ),
+        (
+            "issue",
+            29,
+            Label.AI_BLOCKED.value,
+            Label.AI_WORKING.value,
+        ),
+    ]
 
 
 @pytest.mark.parametrize(
