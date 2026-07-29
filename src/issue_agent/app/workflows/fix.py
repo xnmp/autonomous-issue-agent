@@ -221,22 +221,20 @@ class FixWorkflow:
 
     def _journal_escalation(self, issue: int, leg: str, before: Stance, after: Stance,
                             signals: EscalationSignals, model: str | None,
-                            tiered: bool) -> None:
+                            tiered: bool, ceiling: bool) -> None:
         """Record the rung this leg climbed, and why. ONE event per escalated
         leg — `leg` distinguishes them, so "how many legs ran escalated" is a
         group-by, not an inference.
 
         The event may only report what actually reached the dispatch. A repair
-        leg has NO tier (it keeps the resumed session's model), so `tiered` is
-        False there and both tier fields are null rather than the DEFAULT_TIER
-        placeholder `_escalated` needs internally to have something to climb
-        from. Reporting that placeholder would attribute a sonnet repair leg to
-        `complex` in exactly the `group_by(.to_tier)` that CLAUDE.md makes the
-        load-bearing routing guardrail — the metric this event exists to keep
-        honest. `model` is the model that ran — None when the leg named none and
-        the runtime picked its own, matching how the tier fields encode "not
-        applicable" — so the split is derivable from what happened rather than
-        from a hypothetical stance.
+        leg has NO tier: it keeps the resumed session's model, even when its
+        evidence would qualify a fresh resolve for the capability ceiling. Its
+        tier fields are therefore null rather than the DEFAULT_TIER placeholder
+        `_escalated` needs internally. `ceiling` is true only when a fresh
+        resolve actually selected the capability-ceiling model, separating
+        Fable/Sol from normal `complex` routing in the load-bearing tier split.
+        `model` is the model that ran — None when the leg named none and the
+        runtime picked its own — so the split is derived from dispatch facts.
 
         Named `route_escalation`, NOT `escalation`: that event name already means
         "handed to a human" (`app.execute` emits it on a needs-human-review move,
@@ -253,6 +251,7 @@ class FixWorkflow:
                 notches=signals.notches(),
                 from_tier=before.tier if tiered else None,
                 to_tier=after.tier if tiered else None,
+                ceiling=ceiling,
                 from_effort=before.effort.value, to_effort=after.effort.value,
                 # `None`, not "" — the same "not applicable" encoding the tier
                 # fields use, so an unrouted leg (router died, no FIX_MODEL: the
@@ -272,12 +271,12 @@ class FixWorkflow:
     ) -> FixTaskConfig:
         """Apply the escalation ladder to `cfg` for one leg (#16).
 
-        `tier` is the router's verdict when this leg chose one; None means the
-        leg inherited a model (a pinned FIX_MODEL, or a resumed session's) and
-        only the EFFORT half of the ladder applies — a repair leg resumes work
-        that already has shape, and swapping the model under a live transcript
-        buys a different reasoner an unfamiliar context. So a repair leg thinks
-        harder; only a fresh resolve re-prices the model.
+        `tier` is the router's verdict when this leg chose one. None means the
+        leg inherited a model (a pinned FIX_MODEL or resumed session), so only
+        the effort half of the ladder applies. The capability ceiling is a
+        fresh-resolve routing decision: repair legs keep the model that built
+        their transcript, including a Codex Terra session after Sol becomes the
+        current ceiling, while still receiving HIGH effort for hard evidence.
 
         Returns `cfg` untouched when there is no evidence, so the common path
         emits no effort at all and each runtime keeps its own default.
@@ -298,27 +297,31 @@ class FixWorkflow:
             return cfg if tier is None else dataclasses.replace(
                 cfg, model=task_builders.route_model(tier, self.cfg.fixer_runtime)
             )
-        ceiling = signals.requires_ceiling()
+        operator_pinned = bool(self.cfg.fix and self.cfg.fix.model)
+        ceiling = leg == "resolve" and signals.requires_ceiling() and not operator_pinned
         stance = (
             Stance(TIER_LADDER[-1], Effort.HIGH)
-            if ceiling else escalate(base, notches)
+            if signals.requires_ceiling() else escalate(base, notches)
         )
-        # A configured model is an explicit operator choice. Otherwise the hard
-        # ceiling may re-price repair legs too: repeated failed verification is
-        # exactly the case where preserving the prior session's model is wrong.
-        tiered = tier is not None or (ceiling and not self.cfg.fix.model)
+        # A configured model is an explicit operator choice. Only a fresh
+        # resolve has a router tier and may replace its normal route at the
+        # hard-evidence ceiling; resumed repair legs preserve their transcript.
+        tiered = tier is not None
         model = (
             (
                 task_builders.route_ceiling_model(self.cfg.fixer_runtime)
                 if ceiling else task_builders.route_model(stance.tier, self.cfg.fixer_runtime)
             )
-            if tiered else cfg.model
+            if tiered or ceiling else cfg.model
         )
         # Same rule as the journal: name the tier move only when this leg chose
         # a tier, so the log cannot claim a climb the dispatch did not make.
         move = (
             f"tier {base.tier}→{stance.tier}, " if tier is not None
-            else f"model {model or '(runtime default)'} kept, "
+            else (
+                f"model {cfg.model or '(runtime default)'}→{model}, "
+                if ceiling else f"model {cfg.model or '(runtime default)'} kept, "
+            )
         )
         self.cfg.log(
             f"agent #{issue}: {leg} — escalating {notches} notch(es) "
@@ -328,7 +331,7 @@ class FixWorkflow:
             f"{move}effort {base.effort.value}→{stance.effort.value}"
         )
         self._journal_escalation(
-            issue, leg, base, stance, signals, model, tiered=tiered
+            issue, leg, base, stance, signals, model, tiered=tiered, ceiling=ceiling
         )
         notice = (
             "This is a difficult problem that has failed in the past. "
@@ -344,9 +347,10 @@ class FixWorkflow:
         self, issue: int, leg: str, *, iss=None, review_rounds: int = 0
     ) -> FixTaskConfig | None:
         """Effort-escalated config for a leg that resumes an existing session
-        (address-review / fix-CI / rebase / resume). Model untouched — see
-        `_escalated`. `iss` is fetched when the caller does not already hold it,
-        so the recurrence signal is not resolve-only."""
+        (address-review / fix-CI / rebase / resume). Its model stays attached to
+        the resumed transcript; only fresh resolve routing can select the
+        capability ceiling — see `_escalated`. `iss` is fetched when the caller
+        does not already hold it, so the recurrence signal is not resolve-only."""
         cfg = self.cfg.fix
         if cfg is None:
             return cfg

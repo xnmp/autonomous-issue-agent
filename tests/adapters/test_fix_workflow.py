@@ -1210,9 +1210,9 @@ def test_escalation_survives_a_router_that_died():
     assert runner.tasks[1].effort is Effort.HIGH
 
 
-def test_an_unrouted_escalation_records_a_null_model_not_an_empty_one():
-    """"Not applicable" has one encoding across the event: an unrouted leg lets
-    the runtime pick, and must not open a "" bucket in `group_by(.model)`."""
+def test_a_router_failure_still_records_the_ceiling_model():
+    """Hard evidence is enough to select the fresh-resolve ceiling even when
+    the advisory router is unavailable, so telemetry records the model run."""
     gw = FakeGateway(
         issues={5: _issue(labels=frozenset({Label.RECURRENCE}))}, pr_for_issue={}
     )
@@ -1404,6 +1404,7 @@ def test_escalations_are_journalled_so_the_tier_split_stays_measurable():
     assert (fields["from_effort"], fields["to_effort"]) == ("medium", "high")
     assert (fields["from_tier"], fields["to_tier"]) == ("standard", "complex")
     assert fields["model"] == "fable", "the split must be derivable from what RAN"
+    assert fields["ceiling"] is True
     assert fields["recurrence"] is True
 
 
