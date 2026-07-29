@@ -63,6 +63,24 @@ the next deployment day before stacking further changes:
 State the pair explicitly in any efficiency PR: the metric it moves, the
 guardrail it must not move, and the measurement that will decide it.
 
+**Making the issue count fall long-run** (2026-07-29, after the #63 incident):
+
+- **Every incident leaves a test.** An issue filed from a live incident names
+  the regression test its fix must add; a fix PR for an incident-born issue
+  without one is unreviewable. Incident knowledge that lives only in handover
+  docs recurs.
+- **Class fix over instance fix.** Before fixing, name the *generator* (the
+  open set the bug came from) and close it by construction — a manifest
+  derived from the source of truth, one shared executor instead of N call
+  sites, twins pinned by a drift test. Three same-class leaks in one day
+  (#63) is what instance-fixing costs.
+- **A workaround names its executioner.** Any overlay/config workaround
+  carries the issue number that retires it; the manager removes it the
+  deployment after that issue merges.
+- **First-of-class deployments spike discovery** (first codex, first
+  concurrent, first self-host) — that is tuition, not regression. The alarm
+  is net-open rising across *repeat* deployments of the same class.
+
 ## The manager role (babysitting a deployment)
 
 Whoever babysits a deployment — today an interactive session, eventually the
@@ -98,8 +116,9 @@ stop. Never self-modify mid-batch.
   the watch-list as its evidence arrives in the journals; flag anomalies with
   restraint — an expensive-but-in-cap leg is data, not an incident.
 - **After**: file surfaced issues with evidence; produce the batch readout
-  ($/merge, first-pass rate, cost mix by leg, guardrail deltas — the numbers
-  the Direction section requires before stacking changes); give every
+  ($/merge, first-pass rate, cost mix by leg, guardrail deltas, **net open
+  issues (opened − closed) and recurrence count** — the numbers the Direction
+  section requires before stacking changes); give every
   watch-list entry a verdict in the ledger — **VERIFIED** (cite the journal
   event), **MISBEHAVED** (file it), or leave it **pending** (a change nothing
   fired is untested, not fine); hand the operator a
