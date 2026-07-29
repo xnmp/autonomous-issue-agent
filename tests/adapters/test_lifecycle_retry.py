@@ -429,7 +429,9 @@ def test_stall_reconciliation_verifies_relabel_without_duplicate(tmp_path):
     )
 
 
-def test_stall_reconciliation_preserves_repeated_transition_order(tmp_path):
+def test_stall_reconciliation_converges_to_latest_relabel_without_redundant_writes(
+    tmp_path,
+):
     class LabelGateway:
         def __init__(self):
             self.labels = {Label.AI_WORKING.value}
@@ -474,20 +476,12 @@ def test_stall_reconciliation_preserves_repeated_transition_order(tmp_path):
     )
 
     assert gateway.labels == {Label.AI_WORKING.value}
-    assert gateway.relabels == [
-        (
-            "issue",
-            29,
-            Label.AI_WORKING.value,
-            Label.AI_BLOCKED.value,
-        ),
-        (
-            "issue",
-            29,
-            Label.AI_BLOCKED.value,
-            Label.AI_WORKING.value,
-        ),
-    ]
+    assert gateway.relabels == []
+    assert any(
+        event["event"] == "action_verified"
+        and event["desc"] == "relabel issue #29: -ai-blocked +ai-working"
+        for event in read_events(journal.path)
+    )
 
 
 @pytest.mark.parametrize(
@@ -534,6 +528,24 @@ def test_stall_reconciliation_skips_malformed_receipt_without_github_write(tmp_p
         event["event"] == "action_reconcile_skipped"
         for event in read_events(journal.path)
     )
+
+
+def test_stall_reconciliation_silently_ignores_non_durable_action_rows(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    journal.emit("action", desc="dispatch RESOLVE #29", attempts=1)
+    gateway = ScriptedGateway([])
+    executor = Executor(gateway, journal=journal, retry_delays=())
+    now = datetime.now(timezone.utc)
+
+    executor.reconcile_recent_actions(
+        now - timedelta(minutes=1),
+        now + timedelta(minutes=1),
+    )
+
+    assert gateway.comments == []
+    assert [
+        event["event"] for event in read_events(journal.path)
+    ] == ["action"]
 
 
 def test_malformed_pending_queue_fails_closed_before_observe(tmp_path):

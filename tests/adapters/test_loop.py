@@ -341,7 +341,7 @@ def test_heartbeat_below_stall_threshold_does_not_reconcile_or_journal(tmp_path)
     assert gateway.calls == []
 
 
-def test_inclusive_late_heartbeat_reconciles_when_active_clock_also_advanced(tmp_path):
+def test_long_active_late_heartbeat_does_not_stall_or_reconcile(tmp_path):
     journal = Journal(str(tmp_path / "journal.jsonl"))
     receipt = {
         "ts": "1970-01-01T00:00:10+00:00",
@@ -375,15 +375,8 @@ def test_inclusive_late_heartbeat_reconciles_when_active_clock_also_advanced(tmp
         max_ticks=1,
     )
 
-    events = read_events(journal.path)
-    assert gateway.calls == [("relabel", 5, None, "ai-blocked")]
-    assert any(
-        event["event"] == "stall"
-        and event["elapsed_seconds"] == 240
-        and event["suspended_seconds"] == 0
-        for event in events
-    )
-    assert not any(event["event"] == "agent_run_stall" for event in events)
+    assert gateway.calls == []
+    assert read_events(journal.path) == [receipt]
 
 
 def test_stall_reconciliation_includes_poll_interval_before_estimated_gap(tmp_path):
