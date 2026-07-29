@@ -69,6 +69,7 @@ export function StatTile({
   tone = "neutral",
   alert,
   title,
+  onClick,
 }: {
   label: string;
   value: ReactNode;
@@ -76,14 +77,27 @@ export function StatTile({
   tone?: Tone;
   alert?: boolean;
   title?: string;
+  onClick?: () => void;
 }) {
-  return (
-    <div className={`tile${alert ? " tile-alert" : ""}`} title={title}>
+  const content = (
+    <>
       <div className="tile-label">{label}</div>
       <div className={`tile-value tone-${alert ? "fail" : tone}`}>{value}</div>
       {sub ? <div className="tile-sub faint">{sub}</div> : null}
-    </div>
+    </>
   );
+  if (onClick) {
+    return (
+      <button
+        className={`tile tile-action${alert ? " tile-alert" : ""}`}
+        title={title}
+        onClick={onClick}
+      >
+        {content}
+      </button>
+    );
+  }
+  return <div className={`tile${alert ? " tile-alert" : ""}`} title={title}>{content}</div>;
 }
 
 /* --------------------------------------------------------- Stacked bar ---

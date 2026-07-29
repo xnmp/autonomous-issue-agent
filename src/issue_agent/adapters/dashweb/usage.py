@@ -158,26 +158,68 @@ def http_fetch(token: str) -> dict:
 
 
 _claude_cache = TtlCache(ttl_s=CLAUDE_TTL_S)
+_claude_last_good: dict[str, dict] = {}
 
 
-def claude_usage(fetch=None, credentials_path: str | None = None, cache=None) -> dict:
+def claude_usage(
+    fetch=None,
+    credentials_path: str | None = None,
+    cache=None,
+    last_good: dict[str, dict] | None = None,
+) -> dict:
     """Claude subscription headroom. `fetch(token) -> dict` is injectable so no
     test ever touches the network."""
-    cache = _claude_cache if cache is None else cache
+    using_default_cache = cache is None
+    cache = _claude_cache if using_default_cache else cache
+    if last_good is None:
+        last_good = _claude_last_good if using_default_cache else {}
     cached = cache.get("claude")
     if cached is not None:
         return cached
     token = read_oauth_token(credentials_path or default_credentials_path())
     if not token:
-        return cache.put("claude", _claude_error("no Claude OAuth credentials on this machine"))
+        return cache.put(
+            "claude",
+            _claude_fallback(
+                "no Claude OAuth credentials on this machine", last_good
+            ),
+        )
     try:
         payload = (fetch or http_fetch)(token)
     except urllib.error.HTTPError as exc:
-        return cache.put("claude", _claude_error(f"usage endpoint returned HTTP {exc.code}"))
+        return cache.put(
+            "claude",
+            _claude_fallback(
+                f"usage endpoint returned HTTP {exc.code}", last_good
+            ),
+        )
     except Exception as exc:  # noqa: BLE001 — a meter must never break the page
         # The token is never interpolated into this message.
-        return cache.put("claude", _claude_error(f"usage endpoint unreachable ({type(exc).__name__})"))
-    return cache.put("claude", parse_claude_usage(payload))
+        return cache.put(
+            "claude",
+            _claude_fallback(
+                f"usage endpoint unreachable ({type(exc).__name__})", last_good
+            ),
+        )
+    parsed = parse_claude_usage(payload)
+    if parsed["error"] is not None:
+        return cache.put(
+            "claude",
+            _claude_fallback(str(parsed["error"]), last_good),
+        )
+    last_good["claude"] = parsed
+    return cache.put("claude", parsed)
+
+
+def _claude_fallback(message: str, last_good: dict[str, dict]) -> dict:
+    previous = last_good.get("claude")
+    if previous is None:
+        return _claude_error(message)
+    return {
+        **previous,
+        "source": "oauth · cached",
+        "error": f"{message}; showing the last successful reading",
+    }
 
 
 # ── codex ─────────────────────────────────────────────────────────────────────

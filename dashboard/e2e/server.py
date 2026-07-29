@@ -94,7 +94,7 @@ class FixtureBackend:
             "warnings": [],
         }
 
-    def overview(self, _name: str) -> dict:
+    def overview(self, _name: str, _timezone_name: str | None = None) -> dict:
         return {
             "metrics": None,
             "cost_mix": None,

@@ -37,6 +37,7 @@ def test_issue_history_requests_closed_dates_and_warnable_long_history_limit():
     gh.issues("o/r")
     argv = calls[0]
     assert "closedAt" in argv[argv.index("--json") + 1]
+    assert "body" in argv[argv.index("--json") + 1]
     assert argv[argv.index("--limit") + 1] == str(ghdata.ISSUE_HISTORY_LIMIT)
 
 

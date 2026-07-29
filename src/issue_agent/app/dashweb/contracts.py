@@ -191,8 +191,10 @@ class BacklogCard(Contract):
     issue: int
     title: str | None
     url: str | None
+    body: str | None
     labels: list[str]
     recurrence: bool
+    recurrence_count: int
     age_days: int | None
     comments: int | None
 

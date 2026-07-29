@@ -447,11 +447,16 @@ def _issue_row(issue: int, events: list[dict], running: tuple[RunningLeg, ...]) 
         recurrences=sum(1 for e in events if e.get("event") == "recurrence"),
         spend_blocks=sum(1 for e in events if e.get("event") == "spend_block"),
         prs=prs,
-        # ROUTE chooses the execution model; its own classifier model is
-        # infrastructure provenance, not a model that worked on the issue.
+        # Starts carry the configured model before a task settles. Reading both
+        # event shapes keeps live tasks visible and recovers reviewer models
+        # from older settlements that omitted the model field.
         models=tuple(
             dict.fromkeys(
-                leg.model for leg in legs if leg.model and leg.kind != "ROUTE"
+                str(event.get("model"))
+                for event in events
+                if event.get("event") in ("agent_run_start", "agent_run")
+                and event.get("kind") != "ROUTE"
+                and event.get("model")
             )
         ),
         last_ts=max(timestamps) if timestamps else None,

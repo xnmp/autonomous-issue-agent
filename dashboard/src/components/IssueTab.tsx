@@ -13,7 +13,7 @@ import { EventTimeline } from "./EventTimeline";
 const POLL_MS = 5_000;
 
 /**
- * One issue, run by run. A run is one agent invocation.
+ * One issue, task by task. A task is one agent invocation.
  */
 export function IssueTab({ repo, issue }: { repo: string; issue: number }) {
   const detail = usePolled(
@@ -80,23 +80,22 @@ export function IssueTab({ repo, issue }: { repo: string; issue: number }) {
                 <span className="mono">{duration(d.done ? d.elapsed_s : elapsed)}</span>
               </span>
               <span className="issue-stat">
-                <span className="faint">runs</span>{" "}
+                <span className="faint">tasks</span>{" "}
                 <span className="mono">{d.steps.length}</span>
               </span>
             </div>
           </header>
 
-          <SectionTitle>Runs</SectionTitle>
+          <SectionTitle>Tasks</SectionTitle>
 
           {d.steps.length === 0 ? (
-            <EmptyState>no runs recorded for this issue yet</EmptyState>
+            <EmptyState>no tasks recorded for this issue yet</EmptyState>
           ) : (
             <div className="panel steps">
               <div className="tbl-wrap">
                 <table className="tbl wide">
                   <thead>
                     <tr>
-                      <th style={{ width: 34 }} />
                       <th style={{ width: 90 }}>Operation</th>
                       <th style={{ width: 80 }}>Role</th>
                       <th style={{ width: 140 }}>Model</th>
@@ -163,12 +162,10 @@ function StepRow({
           }
         }}
       >
-        <td className="faint">
+        <td>
           <span className={`chev${open ? " open" : ""}`} aria-hidden="true">
             ▸
           </span>
-        </td>
-        <td>
           <Chip tone={tone} square pulse={step.state === "running"} title={step.kind}>
             {kindLabel(step.kind)}
           </Chip>
@@ -189,7 +186,9 @@ function StepRow({
         </td>
         <td className="row-wrap">
           <Chip tone={step.state === "running" ? "running" : statusTone(step.status)}>
-            {step.status ?? step.state}
+            {step.status === "ok" || (!step.status && step.state === "ok")
+              ? "done"
+              : (step.status ?? step.state)}
           </Chip>
           {step.exit_reason ? (
             <span className="faint mono trunc" title={step.exit_reason}>
@@ -203,14 +202,7 @@ function StepRow({
           {step.estimated ? <span className="faint" title="synthetic dollars"> ~</span> : null}
         </td>
         <td className="mono faint nowrap">
-          {u ? (
-            <span title={JSON.stringify(u, null, 2)}>
-              in {tokens(u.input_tokens)} · out {tokens(u.output_tokens)} · cache r{" "}
-              {tokens(u.cache_read_input_tokens)} / w {tokens(u.cache_creation_input_tokens)}
-            </span>
-          ) : (
-            "—"
-          )}
+          {u ? <TokenSummary usage={u} /> : "—"}
           {step.turns !== null ? <span className="faint"> · {num(step.turns)} turns</span> : null}
         </td>
         <td className="mono faint" title={step.ts ?? ""}>
@@ -219,7 +211,7 @@ function StepRow({
       </tr>
       {open ? (
         <tr className="detail-row">
-          <td colSpan={9}>
+          <td colSpan={8}>
             <StepDetail repo={repo} issue={issue} step={step} />
           </td>
         </tr>
@@ -263,12 +255,12 @@ function StepDetail({ repo, issue, step }: { repo: string; issue: number; step: 
           ) : null}
           <WarningList warnings={events.data?.warnings} />
           {events.loading ? (
-            <Loading what="step events" />
+            <Loading what="task events" />
           ) : (
             <EventTimeline
               dense
               events={events.data?.events ?? []}
-              emptyText="no journal events inside this run's window"
+              emptyText="no journal events inside this task's window"
             />
           )}
         </>
@@ -289,12 +281,28 @@ function StepDetail({ repo, issue, step }: { repo: string; issue: number; step: 
           <EmptyState>
             {step.session_id
               ? "no transcript on disk for this session — the cost chart needs ~/.claude/projects/*/<session_id>.jsonl"
-              : "this run recorded no session id, so there is no transcript to chart"}
+              : "this task recorded no session id, so there is no transcript to chart"}
           </EmptyState>
         )
       ) : null}
 
       {pane === "raw" ? <JsonBlock value={step} /> : null}
     </div>
+  );
+}
+
+function TokenSummary({ usage }: { usage: NonNullable<IssueStep["usage"]> }) {
+  return (
+    <span className="token-summary" aria-label="Token usage">
+      <span className="token-in" title="Input tokens">
+        <span aria-hidden="true">↓</span> {tokens(usage.input_tokens)}
+      </span>
+      <span className="token-out" title="Output tokens">
+        <span aria-hidden="true">↑</span> {tokens(usage.output_tokens)}
+      </span>
+      <span className="token-cache" title="Cache read tokens">
+        <span aria-hidden="true">◇</span> {tokens(usage.cache_read_input_tokens)}
+      </span>
+    </span>
   );
 }

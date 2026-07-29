@@ -87,9 +87,15 @@ describe("App navigation", () => {
     await userEvent.click(screen.getByRole("tab", { name: "Overview" }));
     expect(
       await screen.findByRole("row", {
-        name: /2026-07-29.*first observed.*3.*1.*\+2/,
+        name: /2026-07-29.*3.*1.*\+2/,
       }),
     ).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: /Done/ }));
+    expect(screen.getByRole("tab", { name: /Done/ })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    await userEvent.click(screen.getByRole("tab", { name: "Overview" }));
     await userEvent.click(screen.getByRole("tab", { name: /Issues/ }));
     expect(screen.getByRole("tab", { name: /Done/ })).toHaveAttribute(
       "aria-selected",
@@ -98,6 +104,8 @@ describe("App navigation", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Verification ledger" }));
     expect(screen.queryByRole("tab", { name: "Verification" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "Overview" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: /Issues/ })).not.toBeInTheDocument();
     expect(await screen.findByText("Verification ledger", { selector: ".section-title span" })).toBeVisible();
   });
 });

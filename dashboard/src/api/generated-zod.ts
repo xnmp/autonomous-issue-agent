@@ -32,10 +32,12 @@ const ReposPayload = z
 const BacklogCard = z
   .object({
     age_days: z.union([z.number(), z.null()]),
+    body: z.union([z.string(), z.null()]),
     comments: z.union([z.number(), z.null()]),
     issue: z.number().int(),
     labels: z.array(z.string()),
     recurrence: z.boolean(),
+    recurrence_count: z.number().int(),
     title: z.union([z.string(), z.null()]),
     url: z.union([z.string(), z.null()]),
   })
@@ -166,6 +168,7 @@ const StepEventsPayload = z
     warnings: z.array(z.string()),
   })
   .passthrough();
+const timezone = z.union([z.string(), z.null()]).optional();
 const Caps = z
   .object({
     daily_cap_usd: z.union([z.number(), z.null()]),
@@ -297,6 +300,7 @@ export const schemas = {
   IssueDetailPayload,
   ActionResult,
   StepEventsPayload,
+  timezone,
   Caps,
   CostMix,
   HealthTrendDay,
@@ -549,6 +553,11 @@ const endpoints = makeApi([
         name: "name",
         type: "Path",
         schema: z.string(),
+      },
+      {
+        name: "timezone",
+        type: "Query",
+        schema: timezone,
       },
     ],
     response: z

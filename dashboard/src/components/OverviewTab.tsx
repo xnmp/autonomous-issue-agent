@@ -22,7 +22,13 @@ const POLL_MS = 10_000;
  * anything dead* — with red accents on escalations, recurrences, stale daemons
  * and near-limit caps so trouble is visible without reading a number.
  */
-export function OverviewTab({ repo }: { repo: string }) {
+export function OverviewTab({
+  repo,
+  onOpenIssues,
+}: {
+  repo: string;
+  onOpenIssues: (sub: "inflight" | "done") => void;
+}) {
   const ov = usePolled(
     `overview:${repo}`,
     (signal) => api.overview(repo, signal),
@@ -63,11 +69,19 @@ export function OverviewTab({ repo }: { repo: string }) {
       {ov.loading ? <SkeletonRows what="overview" rows={5} /> : null}
 
       <div className="tiles">
-        <StatTile label="Done" value={num(m?.done_issues)} tone="ok" />
+        <StatTile
+          label="Done"
+          value={num(m?.done_issues)}
+          tone="ok"
+          title="open done issues"
+          onClick={() => onOpenIssues("done")}
+        />
         <StatTile
           label="In flight"
           value={num(m?.in_flight_issues)}
           tone={(m?.in_flight_issues ?? 0) > 0 ? "running" : "neutral"}
+          title="open in-flight and pending issues"
+          onClick={() => onOpenIssues("inflight")}
         />
         <StatTile
           label="$ per done"
@@ -113,9 +127,9 @@ export function OverviewTab({ repo }: { repo: string }) {
       <div className="grid-2">
         <section className="panel">
           <div className="panel-hd">
-            <span className="panel-title">Cost mix by run family</span>
+            <span className="panel-title">Cost mix by task family</span>
             {repairShare !== null ? (
-              <Chip tone={repairShare > 0.25 ? "fail" : "neutral"} title="repair runs are pure overhead; their share should shrink">
+              <Chip tone={repairShare > 0.25 ? "fail" : "neutral"} title="repair tasks are pure overhead; their share should shrink">
                 repair {rate(repairShare)}
               </Chip>
             ) : null}
@@ -180,18 +194,18 @@ export function OverviewTab({ repo }: { repo: string }) {
       </section>
 
       <div className="by-kind">
-        <SectionTitle>Spend by run type</SectionTitle>
+        <SectionTitle>Spend by task type</SectionTitle>
         {(m?.by_kind ?? []).length === 0 ? (
-          <EmptyState>no runs recorded yet</EmptyState>
+          <EmptyState>no tasks recorded yet</EmptyState>
         ) : (
           <div className="tbl-wrap panel">
             <table className="tbl">
               <thead>
                 <tr>
                   <th>Kind</th>
-                  <th className="r">Runs</th>
+                  <th className="r">Tasks</th>
                   <th className="r">USD</th>
-                  <th className="r">$/run</th>
+                  <th className="r">$/task</th>
                 </tr>
               </thead>
               <tbody>
@@ -217,7 +231,6 @@ function HealthTrend({ rows, loading }: { rows: HealthTrendDay[]; loading: boole
     <section className="panel">
       <div className="panel-hd">
         <span className="panel-title">Issue health trend</span>
-        <span className="faint">UTC days · first observed marks deployment start</span>
       </div>
       <div className="panel-bd flush">
         {rows.length === 0 && !loading ? (
@@ -225,10 +238,10 @@ function HealthTrend({ rows, loading }: { rows: HealthTrendDay[]; loading: boole
         ) : (
           <div className="tbl-wrap">
             <table className="tbl">
-              <thead><tr><th>UTC day</th><th className="r">Opened</th><th className="r">Closed</th><th className="r">Net</th><th className="r">Recurrences</th></tr></thead>
+              <thead><tr><th>Local day</th><th className="r">Opened</th><th className="r">Closed</th><th className="r">Net</th><th className="r">Recurrences</th></tr></thead>
               <tbody>{rows.map((row) => (
                 <tr key={row.day}>
-                  <td className="mono">{row.day}{row.first_observation ? <span className="faint"> · first observed</span> : null}</td>
+                  <td className="mono">{row.day}</td>
                   <td className="r num">{num(row.opened)}</td><td className="r num">{num(row.closed)}</td>
                   <td className={`r num${row.net_open > 0 && !row.first_observation ? " tone-fail" : ""}`}>{row.net_open > 0 ? `+${row.net_open}` : num(row.net_open)}</td>
                   <td className={`r num${row.recurrences > 0 ? " tone-fail" : ""}`}>{num(row.recurrences)}</td>

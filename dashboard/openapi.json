@@ -34,6 +34,17 @@
             ],
             "title": "Age Days"
           },
+          "body": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Body"
+          },
           "comments": {
             "anyOf": [
               {
@@ -59,6 +70,10 @@
           "recurrence": {
             "title": "Recurrence",
             "type": "boolean"
+          },
+          "recurrence_count": {
+            "title": "Recurrence Count",
+            "type": "integer"
           },
           "title": {
             "anyOf": [
@@ -87,8 +102,10 @@
           "issue",
           "title",
           "url",
+          "body",
           "labels",
           "recurrence",
+          "recurrence_count",
           "age_days",
           "comments"
         ],
@@ -2241,6 +2258,23 @@
             "schema": {
               "title": "Name",
               "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "timezone",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 100,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Timezone"
             }
           }
         ],

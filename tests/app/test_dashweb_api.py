@@ -67,8 +67,9 @@ class StubBackend:
             "evidence": None, "raw": "| #1 | test | pending |",
         }], "warnings": []}
 
-    def overview(self, name):
+    def overview(self, name, timezone_name=None):
         self._maybe("overview")
+        self.overview_timezone = timezone_name
         return {
             "metrics": {
                 "done_issues": 1, "in_flight_issues": 0, "total_cost_usd": 1.0,
@@ -164,6 +165,15 @@ def test_verification_returns_rows():
 def test_overview_carries_metrics_cost_mix_caps_and_health():
     body = client().get("/api/repos/demo/overview").json()
     assert set(body) >= {"metrics", "cost_mix", "caps", "health", "unattributed"}
+
+
+def test_overview_forwards_the_browser_timezone():
+    backend = StubBackend()
+    response = client(backend).get(
+        "/api/repos/demo/overview?timezone=Australia%2FSydney"
+    )
+    assert response.status_code == 200
+    assert backend.overview_timezone == "Australia/Sydney"
 
 
 def test_issues_returns_all_four_buckets_in_one_call():

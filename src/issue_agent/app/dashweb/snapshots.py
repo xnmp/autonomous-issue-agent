@@ -11,7 +11,7 @@ passes them here for projection into API payloads.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
 
 from ...domain import dashboard as dash
 
@@ -160,7 +160,7 @@ def detailed_steps(row: dash.IssueRow) -> list[dict]:
             "duration_s": leg.duration_s,
             "cost_usd": leg.cost_usd,
             "estimated": leg.estimated,
-            "model": leg.model or None,
+            "model": _model_for_leg(row, leg),
             "session_id": leg.session_id or None,
             "turns": _turns(row, leg),
             "usage": _usage(row, leg),
@@ -211,6 +211,40 @@ def _turns(row: dash.IssueRow, leg: dash.Leg):
 def _usage(row: dash.IssueRow, leg: dash.Leg):
     usage = _settled_event(row, leg).get("usage")
     return usage if isinstance(usage, dict) else None
+
+
+def _model_for_leg(row: dash.IssueRow, leg: dash.Leg) -> str | None:
+    """Configured model for a settled task, including old journal shapes.
+
+    Some runtimes recorded the model on ``agent_run_start`` but not on the
+    matching settlement. Dispatch identity is authoritative; the kind/number
+    fallback covers pre-dispatch journals without borrowing a later task's
+    model.
+    """
+    settled = _settled_event(row, leg)
+    if settled.get("model"):
+        return str(settled["model"])
+    dispatch = str(settled.get("dispatch") or "")
+    starts = [
+        event
+        for event in row.events
+        if event.get("event") == "agent_run_start"
+        and (
+            (dispatch and str(event.get("dispatch") or "") == dispatch)
+            or (
+                not dispatch
+                and event.get("kind") == leg.kind
+                and event.get("number") == leg.number
+                and (
+                    leg.ts is None
+                    or (stamp := dash.parse_ts(event.get("ts"))) is None
+                    or stamp <= leg.ts
+                )
+            )
+        )
+        and event.get("model")
+    ]
+    return str(starts[-1]["model"]) if starts else None
 
 
 # ── issue cards ───────────────────────────────────────────────────────────────
@@ -315,14 +349,21 @@ def pending_card(issue: dict, row: dash.IssueRow | None) -> dict:
     }
 
 
-def backlog_card(issue: dict, now: datetime) -> dict:
+def backlog_card(
+    issue: dict,
+    now: datetime,
+    row: dash.IssueRow | None = None,
+) -> dict:
     labels = labels_of(issue)
+    recurrence_count = max(row.recurrences if row else 0, int("recurrence" in labels))
     return {
         "issue": int(issue.get("number") or 0),
         "title": issue.get("title"),
         "url": issue.get("url"),
+        "body": issue.get("body"),
         "labels": labels,
-        "recurrence": "recurrence" in labels,
+        "recurrence": recurrence_count > 0,
+        "recurrence_count": recurrence_count,
         "age_days": age_days(issue.get("createdAt"), now),
         "comments": _comment_count(issue.get("comments")),
     }
@@ -390,6 +431,7 @@ def health_trend(
     recurrence_events,
     *,
     first_observed_day: str | None,
+    local_tz: tzinfo | None = None,
 ) -> list[dict]:
     """Daily target-repository issue health, using GitHub dates and journal recurrences.
 
@@ -403,7 +445,7 @@ def health_trend(
         stamp = dash.parse_ts(value)
         if stamp is None:
             return None
-        day = stamp.astimezone(timezone.utc).date().isoformat()
+        day = stamp.astimezone(local_tz or timezone.utc).date().isoformat()
         return days.setdefault(
             day,
             {"day": day, "opened": 0, "closed": 0, "net_open": 0,
@@ -427,8 +469,11 @@ def health_trend(
     return [days[day] for day in sorted(days)]
 
 
-def first_observed_day(snapshot: dash.Snapshot) -> str | None:
-    """UTC day this deployment first journalled.
+def first_observed_day(
+    snapshot: dash.Snapshot,
+    local_tz: tzinfo | None = None,
+) -> str | None:
+    """Native local day this deployment first journalled.
 
     Runtime and review-mode history is not journalled, so classifying historical
     timestamps with today's configuration would manufacture provenance.
@@ -436,7 +481,7 @@ def first_observed_day(snapshot: dash.Snapshot) -> str | None:
     timestamps = [stamp for stamp in snapshot.timestamps if stamp is not None]
     if not timestamps:
         return None
-    return min(timestamps).astimezone(timezone.utc).date().isoformat()
+    return min(timestamps).astimezone(local_tz or timezone.utc).date().isoformat()
 
 
 def metrics_json(metrics: dash.Metrics) -> dict:

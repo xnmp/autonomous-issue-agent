@@ -68,7 +68,7 @@ def create_app(
     harness_root: str | None = None,
     offload_backend: bool | None = None,
 ):
-    from fastapi import Body, FastAPI, HTTPException
+    from fastapi import Body, FastAPI, HTTPException, Query
     from fastapi.responses import HTMLResponse, JSONResponse, Response
     from starlette.concurrency import run_in_threadpool
 
@@ -128,10 +128,13 @@ def create_app(
             return degraded("verification ledger", exc, rows=[])
 
     @app.get("/api/repos/{name}/overview", response_model=contracts.OverviewPayload)
-    async def api_overview(name: str):
+    async def api_overview(
+        name: str,
+        timezone_name: str | None = Query(default=None, alias="timezone", max_length=100),
+    ):
         await require_known(name)
         try:
-            return await invoke(backend.overview, name)
+            return await invoke(backend.overview, name, timezone_name)
         except Exception as exc:  # noqa: BLE001
             return degraded(
                 "overview",

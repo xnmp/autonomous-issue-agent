@@ -61,19 +61,12 @@ export function Sidebar({
 
   return (
     <aside className="sidebar">
-      <div className="brand">
-        <span className="brand-mark" aria-hidden="true">
-          ◆
-        </span>
-        <span className="brand-name">issue-agent</span>
+      <div className="sidebar-scroll">
         {repos.data?.liveness === "journal-heuristic" ? (
           <Chip tone="running" title="/proc scan unavailable — liveness inferred from journal staleness">
-            heuristic
+            heuristic liveness
           </Chip>
         ) : null}
-      </div>
-
-      <div className="sidebar-scroll">
         {repos.error ? (
           <ErrorBanner message={repos.error} onRetry={repos.refresh} stale={!!repos.data} />
         ) : null}
@@ -99,23 +92,25 @@ export function Sidebar({
         </div>
 
         {past.length > 0 ? (
-          <div className="rail-group">
-            <div className="rail-heading">
-              Past <span className="faint num">{past.length}</span>
+          <details className="rail-group rail-past">
+            <summary className="rail-heading">
+              Past <span className="num">{past.length}</span>
+            </summary>
+            <div className="rail-group-body">
+              {past.map((r) => (
+                <RepoRow
+                  key={r.name}
+                  repo={r}
+                  selected={r.name === activeRepo}
+                  onSelect={() => onSelectRepo(r.name)}
+                  onStart={() => {
+                    setActionError(null);
+                    setConfirmStart(r);
+                  }}
+                />
+              ))}
             </div>
-            {past.map((r) => (
-              <RepoRow
-                key={r.name}
-                repo={r}
-                selected={r.name === activeRepo}
-                onSelect={() => onSelectRepo(r.name)}
-                onStart={() => {
-                  setActionError(null);
-                  setConfirmStart(r);
-                }}
-              />
-            ))}
-          </div>
+          </details>
         ) : null}
         <div className="sidebar-foot">
           {notice ? (
@@ -203,7 +198,7 @@ function RepoRow({
           <span className="repo-name trunc">{repo.name}</span>
           {repo.is_self ? (
             <Chip tone="meta" title="the harness's own repository">
-              ⟳ <strong>self</strong>
+              <strong>issue-agent</strong>
             </Chip>
           ) : null}
         </div>
