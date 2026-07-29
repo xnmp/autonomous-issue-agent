@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from issue_agent.app import cli, dashboard as dash
+from issue_agent.domain import dashboard as dashboard_domain
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
 
@@ -118,8 +119,114 @@ def test_escalation_target_decides_issue_vs_pr():
 # ── stage inference (the heuristic table) ─────────────────────────────────────
 def test_stage_running_leg_beats_history():
     events = [run(kind="RESOLVE"), action("relabel issue #7: +ai-working")]
-    running = (dash._running_leg(start(kind="FIX_CI", number=90)),)
+    running = (dashboard_domain._running_leg(start(kind="FIX_CI", number=90)),)
     assert dash.stage_for(events, running) == "fixing CI"
+
+
+def test_done_issue_cannot_also_be_running():
+    events = [
+        start(kind="RESOLVE"),
+        action("relabel issue #7: +ai-done", ts_min=1),
+    ]
+
+    row = dash.build_deployment(
+        "demo",
+        "o/r",
+        (("fix", "/j", "/l", events),),
+        now_fn=lambda: NOW,
+    ).issues[0]
+
+    assert row.done is True
+    assert row.stage == "done"
+    assert row.running == ()
+
+
+def test_recurrence_after_done_reopens_the_issue():
+    dep = dashboard_domain.build_deployment(
+        "demo",
+        "o/r",
+        feeds(
+            fix=[
+                action("relabel issue #7: +ai-done", ts_min=2),
+                {"ts": at(1), "event": "recurrence", "kind": "reopen", "issue": 7},
+            ]
+        ),
+        now_fn=_now,
+    )
+    row = next(row for row in dep.issues if row.issue == 7)
+    assert row.done is False
+    assert row.stage != "done"
+
+
+def test_done_marker_after_a_torn_start_remains_terminal():
+    dep = dashboard_domain.build_deployment(
+        "demo",
+        "o/r",
+        feeds(
+            fix=[
+                start(kind="RESOLVE", issue=7, number=7, ts=at(2)),
+                action("relabel issue #7: +ai-done", ts_min=1),
+            ]
+        ),
+        now_fn=_now,
+    )
+    row = next(row for row in dep.issues if row.issue == 7)
+    assert row.done is True
+    assert row.running == ()
+
+
+def test_post_merge_jira_sync_does_not_reopen_a_done_issue():
+    dep = dashboard_domain.build_deployment(
+        "demo",
+        "o/r",
+        feeds(
+            fix=[action("relabel issue #7: +ai-done", ts_min=2)],
+            steward=[
+                run(
+                    ts=at(1),
+                    role="steward",
+                    kind="JIRA_SYNC",
+                    issue=7,
+                    number=7,
+                )
+            ],
+        ),
+        now_fn=_now,
+    )
+    row = next(row for row in dep.issues if row.issue == 7)
+    assert row.done is True
+    assert row.stage == "done"
+    assert dep.metrics.done_issues == 1
+    assert dep.metrics.in_flight_issues == 0
+
+
+def test_router_model_is_not_reported_as_an_issue_execution_model():
+    events = [
+        run(kind="ROUTE", model="luna"),
+        run(kind="RESOLVE", model="claude-sonnet-5"),
+    ]
+
+    row = dash.build_deployment(
+        "demo",
+        "o/r",
+        (("fix", "/j", "/l", events),),
+        now_fn=lambda: NOW,
+    ).issues[0]
+
+    assert row.models == ("claude-sonnet-5",)
+
+
+def test_feed_role_is_attached_to_open_shaped_action_events():
+    events = [action("comment issue #7: progress")]
+
+    row = dash.build_deployment(
+        "demo",
+        "o/r",
+        (("steward", "/j", "/l", events),),
+        now_fn=lambda: NOW,
+    ).issues[0]
+
+    assert row.events[0]["role"] == "steward"
 
 
 def test_stage_table():

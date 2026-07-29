@@ -10,8 +10,8 @@ import json
 
 import pytest
 
-from issue_agent.app.dashweb import usage
-from issue_agent.app.dashweb.ghdata import TtlCache
+from issue_agent.adapters.dashweb import usage
+from issue_agent.adapters.dashweb.ghdata import TtlCache
 
 
 def fresh_cache():
@@ -188,7 +188,11 @@ def test_harness_usage_sums_today_globally_and_per_repo(tmp_path, monkeypatch):
         '{"ts": "2026-07-28T02:00:00+00:00", "event": "spend", "repo": "o/r", "cost_usd": 9.0}\n'
     )
     now = lambda: datetime(2026, 7, 29, 12, tzinfo=timezone.utc)  # noqa: E731
-    result = usage.harness_usage(["demo"], str(ledger), now_fn=now)
+    def config_for(name):
+        path = tmp_path / "repos" / f"{name}.env"
+        return cli.read_repo_env_field(str(path), "REPO"), cli.daily_cap(name), 0.0
+
+    result = usage.harness_usage(["demo"], config_for, str(ledger), now_fn=now)
     assert result["today_all_repos_usd"] == 3.5
     assert result["per_repo"][0]["today_usd"] == 1.5
     assert result["per_repo"][0]["daily_cap_usd"] == 20.0

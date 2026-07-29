@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { api } from "../api/client";
-import { useClock, usePolled } from "../api/hooks";
+import { useClock } from "../api/hooks";
 import type {
   BacklogCard,
   IssueCard,
@@ -12,6 +12,7 @@ import type { Polled } from "../api/hooks";
 import { ISSUES_SUBS, ISSUES_SUB_LABELS, type IssuesSub } from "../routing/hash";
 import { familyVar, flagTone, prStateTone, stageTone } from "../lib/semantics";
 import { ago, duration, durationShort, localTime, num, usd } from "../lib/format";
+import { shortModel } from "../lib/models";
 import { Chip } from "./ui/Chip";
 import { EtaProgress } from "./ui/Charts";
 import { StepBadgeRow } from "./ui/StepBadge";
@@ -20,26 +21,11 @@ import {
   EmptyState,
   ErrorBanner,
   GhUnavailableChip,
-  Loading,
+  SkeletonRows,
   SectionTitle,
   WarningList,
 } from "./ui/Feedback";
 import { SubTabs } from "./TabStrip";
-
-const POLL_MS = 5_000;
-
-/**
- * Hoisted to App: the Issues tab renders it, and the tab strip needs the same
- * data for live stage badges on open issue tabs. One poller, two consumers —
- * the contract's "a single poller per mounted view".
- */
-export function useIssues(repo: string | null): Polled<IssuesPayload> {
-  return usePolled(
-    repo === null ? null : `issues:${repo}`,
-    (signal) => api.issues(repo as string, signal),
-    POLL_MS,
-  );
-}
 
 interface IssuesTabProps {
   repo: string;
@@ -75,7 +61,6 @@ export function IssuesTab({ repo, sub, issues, onSetSub, onOpenIssue }: IssuesTa
         <ErrorBanner message={issues.error} onRetry={issues.refresh} stale={!!d} />
       ) : null}
       <WarningList warnings={d?.warnings} />
-      {issues.loading ? <Loading what="issues" /> : null}
 
       {sub === "inflight" ? (
         <>
@@ -128,7 +113,7 @@ function InFlightTable({
   onOpen: (n: number) => void;
 }) {
   const now = useClock();
-  if (loading) return <Loading what="in-flight issues" />;
+  if (loading) return <SkeletonRows what="in-flight issues" rows={5} />;
   if (cards.length === 0)
     return <EmptyState>no issues in flight — the fixer is idle</EmptyState>;
 
@@ -145,7 +130,7 @@ function InFlightTable({
             <th>Title</th>
             <th style={{ width: 70 }}>PR</th>
             <th style={{ width: 110 }}>Stage</th>
-            <th>Steps</th>
+            <th>Operations</th>
             <th className="r" style={{ width: 110 }}>Cost</th>
             <th className="r" style={{ width: 96 }}>Elapsed</th>
             <th style={{ width: 130 }}>Progress</th>
@@ -263,7 +248,7 @@ function PendingTable({
   const [busyIssue, setBusyIssue] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  if (loading) return <Loading what="pending issues" />;
+  if (loading) return <SkeletonRows what="pending issues" rows={3} />;
   if (cards.length === 0)
     return (
       <EmptyState>
@@ -404,7 +389,7 @@ function DoneTable({
   loading: boolean;
   onOpen: (n: number) => void;
 }) {
-  if (loading) return <Loading what="done issues" />;
+  if (loading) return <SkeletonRows what="done issues" rows={5} />;
   if (cards.length === 0)
     return <EmptyState>nothing merged by the harness in this deployment yet</EmptyState>;
   return (
@@ -488,7 +473,7 @@ function BacklogTable({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  if (loading) return <Loading what="backlog" />;
+  if (loading) return <SkeletonRows what="backlog" rows={5} />;
   if (cards.length === 0)
     return (
       <EmptyState>
@@ -640,9 +625,4 @@ function PrLink({ card }: { card: IssueCard }) {
       {inner}
     </a>
   );
-}
-
-/** `claude-sonnet-5` → `sonnet-5`; keeps the chip narrow, full id in the title. */
-export function shortModel(m: string): string {
-  return m.replace(/^(claude|openai|anthropic)[-/]/, "").replace(/\[1m\]$/, "");
 }

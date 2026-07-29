@@ -17,12 +17,14 @@ deployment or issue that does not exist, a chart that cannot be generated) and
 from __future__ import annotations
 
 import html
+import mimetypes
 import os
-from datetime import datetime, timezone
 
+from ...adapters.dashweb import actions, costchart
 from .. import cli
-from .. import dashboard as dash
-from . import actions, costchart, ghdata, snapshots, usage, verification
+from . import contracts
+from .ports import DashboardBackend
+from .service import Backend
 
 HOST = "127.0.0.1"
 # A cross-site form POST cannot set a custom header, and a cross-site fetch that
@@ -31,10 +33,6 @@ HOST = "127.0.0.1"
 # VISITS from launching daemons or relabelling issues.
 CSRF_HEADER = "x-issue-agent-dashboard"
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]", "::1")
-
-
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 def loopback_host(host_header: str) -> bool:
@@ -64,204 +62,27 @@ def dist_ready(harness_root: str | None = None) -> bool:
     return os.path.isfile(os.path.join(dist_dir(harness_root), "index.html"))
 
 
-class Backend:
-    """Every collector the API exposes, over one cached `gh` reader."""
-
-    def __init__(
-        self,
-        harness_root: str | None = None,
-        gh: ghdata.GhReader | None = None,
-        now_fn=None,
-        stale_after_s: float = dash.STALE_AFTER_S,
-        snapshot_ttl_s: float = 3.0,
-    ):
-        self.harness_root = harness_root or cli.HARNESS_ROOT
-        self.gh = gh or ghdata.GhReader()
-        self.now_fn = now_fn or _utcnow
-        self.stale_after_s = stale_after_s
-        # Building one snapshot re-reads three journals AND sources the overlay
-        # through bash (the CLI's shell-semantics read). At the UI's 5s poll,
-        # across three deployments and two views, that is a lot of forks for
-        # data that cannot have changed. A few seconds of staleness is free —
-        # the daemons themselves tick every 20s.
-        self._snapshots = ghdata.TtlCache(ttl_s=snapshot_ttl_s)
-
-    # ── journal side ──
-    def names(self) -> tuple[str, ...]:
-        return snapshots.deployment_names()
-
-    def known(self, name: str) -> bool:
-        """A deployment the operator actually configured.
-
-        Every route gates on this. `name` reaches a subprocess argv and several
-        filesystem paths, so an unvalidated one is both an injection surface and
-        an unbounded-work surface (each miss forks bash to source an overlay
-        that does not exist, and pins a cache entry)."""
-        return name in self.names()
-
-    def snapshot(self, name: str) -> snapshots.Snapshot:
-        cached = self._snapshots.get(name)
-        if cached is not None:
-            return cached
-        return self._snapshots.put(
-            name,
-            snapshots.collect_deployment(
-                name, now_fn=self.now_fn, stale_after_s=self.stale_after_s
-            ),
-        )
-
-    def repos(self) -> dict:
-        live, scan_ok = snapshots.scan_proc_daemons()
-        snaps = [self.snapshot(name) for name in self.names()]
-        return snapshots.repos_payload(snaps, live, scan_ok, self.now_fn())
-
-    def usage(self) -> dict:
-        return usage.usage_payload(self.names())
-
-    def verification(self) -> dict:
-        return verification.verification_payload(
-            verification.default_path(self.harness_root)
-        )
-
-    def overview(self, name: str) -> dict:
-        live, scan_ok = snapshots.scan_proc_daemons()
-        snapshot = self.snapshot(name)
-        all_snapshots = [self.snapshot(candidate) for candidate in self.names()]
-        issues, issue_error = self.gh.issues(snapshot.repo)
-        recurrence_events = [
-            event
-            for row in snapshot.deployment.issues
-            for event in row.events
-            if event.get("event") == "recurrence"
-        ]
-        payload = snapshots.overview_payload(snapshot, live, scan_ok)
-        payload["health_trend"] = snapshots.health_trend(
-            issues,
-            recurrence_events,
-            first_class_day=snapshots.first_observed_class_day(snapshot, all_snapshots),
-        )
-        if issue_error:
-            payload["warnings"].append(f"GitHub issue history unavailable: {issue_error}")
-        elif isinstance(issues, list) and len(issues) >= ghdata.ISSUE_HISTORY_LIMIT:
-            payload["warnings"].append(
-                "GitHub issue history may be incomplete: reached the 1,000-issue fetch limit"
-            )
-        return payload
-
-    # ── gh-augmented ──
-    def _gh_context(self, repo: str) -> tuple[dict, dict, list[str]]:
-        issues_payload, issues_error = self.gh.issues(repo)
-        prs_payload, prs_error = self.gh.prs(repo)
-        warnings = [m for m in (issues_error, prs_error) if m]
-        return (
-            ghdata.index_by_number(issues_payload),
-            ghdata.index_by_number(prs_payload),
-            warnings,
-        )
-
-    def issues(self, name: str) -> dict:
-        snap = self.snapshot(name)
-        now = self.now_fn()
-        gh_issues, gh_prs, warnings = self._gh_context(snap.repo)
-        rows = snap.deployment.issues
-        metrics = snap.deployment.metrics
-        projected_cost = metrics.cost_per_done_usd if metrics.done_issues else None
-        projected_eta = snapshots.mean_wall_clock_s(rows)
-
-        def card(row):
-            return snapshots.issue_card(
-                row,
-                now,
-                gh_issue=gh_issues.get(row.issue),
-                gh_prs=gh_prs,
-                projected_cost_usd=projected_cost,
-                projected_eta_s=projected_eta,
-            )
-
-        row_by_issue = {row.issue: row for row in rows}
-        in_flight_numbers = {row.issue for row in rows if not row.done}
-        pending, backlog = [], []
-        for number, issue in sorted(gh_issues.items()):
-            if not ghdata.is_open(issue):
-                continue
-            labels = snapshots.labels_of(issue)
-            if "ai-ready" in labels and number not in in_flight_numbers:
-                pending.append(snapshots.pending_card(issue, row_by_issue.get(number)))
-            elif snapshots.is_backlog(issue):
-                backlog.append(snapshots.backlog_card(issue, now))
-        return {
-            "in_flight": [card(row) for row in rows if not row.done],
-            "pending": pending,
-            "done": [card(row) for row in rows if row.done],
-            "backlog": backlog,
-            "gh_ok": not warnings,
-            "warnings": warnings,
-        }
-
-    def issue(self, name: str, number: int) -> dict | None:
-        snap = self.snapshot(name)
-        row = snapshots.find_row(snap, number)
-        if row is None:
-            return None
-        gh_issues, _prs, warnings = self._gh_context(snap.repo)
-        detail = snapshots.issue_detail(row, self.now_fn(), gh_issues.get(number))
-        detail["warnings"] = warnings
-        return detail
-
-    def step_events(self, name: str, number: int, idx: int) -> dict | None:
-        row = snapshots.find_row(self.snapshot(name), number)
-        if row is None:
-            return None
-        return {"events": snapshots.step_window_events(row, idx), "warnings": []}
-
-    def cost_chart(self, session_id: str) -> tuple[str, str]:
-        return costchart.render_cost_chart(session_id)
-
-    # ── actions ──
-    def start(self, name: str) -> tuple[bool, str]:
-        if not self.known(name):
-            return False, f"unknown deployment '{name}'"
-        live, scan_ok = snapshots.scan_proc_daemons()
-        if scan_ok and name in live:
-            return False, f"deployment '{name}' already has live daemons"
-        log_path = actions.start_log_path(cli.log_dir(), name)
-        return actions.launch_detached(
-            actions.start_command(self.harness_root, name), log_path
-        )
-
-    def promote(self, name: str, number: int) -> tuple[bool, str]:
-        if not self.known(name):
-            return False, f"unknown deployment '{name}'"
-        repo = snapshots.overlay_field(name, "REPO")
-        if not repo:
-            return False, f"no REPO configured for deployment '{name}'"
-        return actions.run_label_commands([actions.promote_command(repo, number)])
-
-    def priority(self, name: str, number: int, priority: str | None) -> tuple[bool, str]:
-        if not self.known(name):
-            return False, f"unknown deployment '{name}'"
-        repo = snapshots.overlay_field(name, "REPO")
-        if not repo:
-            return False, f"no REPO configured for deployment '{name}'"
-        return actions.run_label_commands(
-            actions.priority_commands(repo, number, priority)
-        )
-
-
 # ── HTTP ──────────────────────────────────────────────────────────────────────
-def create_app(backend: Backend | None = None, harness_root: str | None = None):
+def create_app(
+    backend: DashboardBackend | None = None,
+    harness_root: str | None = None,
+    offload_backend: bool | None = None,
+):
     from fastapi import Body, FastAPI, HTTPException
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, Response
+    from starlette.concurrency import run_in_threadpool
 
     backend = backend or Backend(harness_root=harness_root)
+    should_offload = isinstance(backend, Backend) if offload_backend is None else offload_backend
     root = harness_root or getattr(backend, "harness_root", cli.HARNESS_ROOT)
     dist = dist_dir(root)
     app = FastAPI(title="issue-agent dashboard", docs_url=None, redoc_url=None)
 
-    def degraded(kind: str, exc: Exception, **empty) -> JSONResponse:
-        return JSONResponse(
-            {**empty, "warnings": [f"{kind} unavailable ({type(exc).__name__}: {exc})"]}
-        )
+    def degraded(kind: str, exc: Exception, **empty) -> dict:
+        return {
+            **empty,
+            "warnings": [f"{kind} unavailable ({type(exc).__name__}: {exc})"],
+        }
 
     @app.middleware("http")
     async def guard(request, call_next):
@@ -276,65 +97,99 @@ def create_app(backend: Backend | None = None, harness_root: str | None = None):
             )
         return await call_next(request)
 
-    def require_known(name: str) -> None:
-        if not backend.known(name):
+    async def invoke(call, *args):
+        if should_offload:
+            return await run_in_threadpool(call, *args)
+        return call(*args)
+
+    async def require_known(name: str) -> None:
+        if not await invoke(backend.known, name):
             raise HTTPException(404, f"no such deployment: '{name}'")
 
-    @app.get("/api/repos")
-    def api_repos():
+    @app.get("/api/repos", response_model=contracts.ReposPayload)
+    async def api_repos():
         try:
-            return backend.repos()
+            return await invoke(backend.repos)
         except Exception as exc:  # noqa: BLE001
             return degraded("deployment scan", exc, repos=[])
 
-    @app.get("/api/usage")
-    def api_usage():
+    @app.get("/api/usage", response_model=contracts.UsagePayload)
+    async def api_usage():
         try:
-            return backend.usage()
+            return await invoke(backend.usage)
         except Exception as exc:  # noqa: BLE001
             return degraded("usage meters", exc, claude=None, codex=None, harness=None)
 
-    @app.get("/api/verification")
-    def api_verification():
+    @app.get("/api/verification", response_model=contracts.VerificationPayload)
+    async def api_verification():
         try:
-            return backend.verification()
+            return await invoke(backend.verification)
         except Exception as exc:  # noqa: BLE001
             return degraded("verification ledger", exc, rows=[])
 
-    @app.get("/api/repos/{name}/overview")
-    def api_overview(name: str):
-        require_known(name)
+    @app.get("/api/repos/{name}/overview", response_model=contracts.OverviewPayload)
+    async def api_overview(name: str):
+        await require_known(name)
         try:
-            return backend.overview(name)
+            return await invoke(backend.overview, name)
         except Exception as exc:  # noqa: BLE001
-            return degraded("overview", exc, metrics=None, cost_mix=None, health=[], health_trend=[])
+            return degraded(
+                "overview",
+                exc,
+                metrics=None,
+                cost_mix=None,
+                caps=None,
+                health=[],
+                unattributed=[],
+                health_trend=[],
+            )
 
-    @app.get("/api/repos/{name}/issues")
-    def api_issues(name: str):
-        require_known(name)
+    @app.get("/api/repos/{name}/issues", response_model=contracts.IssuesPayload)
+    async def api_issues(name: str):
+        await require_known(name)
         try:
-            return backend.issues(name)
+            return await invoke(backend.issues, name)
         except Exception as exc:  # noqa: BLE001
             return degraded(
                 "issues", exc, in_flight=[], pending=[], done=[], backlog=[], gh_ok=False
             )
 
-    @app.get("/api/repos/{name}/issues/{number}")
-    def api_issue(name: str, number: int):
-        require_known(name)
+    @app.get(
+        "/api/repos/{name}/issues/{number}",
+        response_model=contracts.IssueDetailPayload,
+    )
+    async def api_issue(name: str, number: int):
+        await require_known(name)
         try:
-            detail = backend.issue(name, number)
+            detail = await invoke(backend.issue, name, number)
         except Exception as exc:  # noqa: BLE001
-            return degraded("issue detail", exc, issue=number, steps=[], events=[])
+            return degraded(
+                "issue detail",
+                exc,
+                issue=number,
+                title=None,
+                url=None,
+                stage=None,
+                done=False,
+                prs=[],
+                pull_requests=[],
+                cost_usd=0.0,
+                elapsed_s=None,
+                steps=[],
+                events=[],
+            )
         if detail is None:
             raise HTTPException(404, f"issue #{number} has no journal history in '{name}'")
         return detail
 
-    @app.get("/api/repos/{name}/issues/{number}/steps/{idx}/events")
-    def api_step_events(name: str, number: int, idx: int):
-        require_known(name)
+    @app.get(
+        "/api/repos/{name}/issues/{number}/steps/{idx}/events",
+        response_model=contracts.StepEventsPayload,
+    )
+    async def api_step_events(name: str, number: int, idx: int):
+        await require_known(name)
         try:
-            payload = backend.step_events(name, number, idx)
+            payload = await invoke(backend.step_events, name, number, idx)
         except Exception as exc:  # noqa: BLE001
             return degraded("step events", exc, events=[])
         if payload is None:
@@ -342,11 +197,11 @@ def create_app(backend: Backend | None = None, harness_root: str | None = None):
         return payload
 
     @app.get("/api/repos/{name}/issues/{number}/cost-chart")
-    def api_cost_chart(name: str, number: int, session_id: str = ""):
-        require_known(name)
+    async def api_cost_chart(name: str, number: int, session_id: str = ""):
+        await require_known(name)
         if not costchart.valid_session_id(session_id):
             raise HTTPException(400, "session_id must match ^[A-Za-z0-9_-]+$")
-        chart, error = backend.cost_chart(session_id)
+        chart, error = await invoke(backend.cost_chart, session_id)
         if error:
             raise HTTPException(404, error)
         # The chart is generated from a transcript containing untrusted text
@@ -356,37 +211,47 @@ def create_app(backend: Backend | None = None, harness_root: str | None = None):
             chart, headers={"Content-Security-Policy": "sandbox; default-src 'none'"}
         )
 
-    @app.post("/api/repos/{name}/start")
-    def api_start(name: str):
-        ok, detail = backend.start(name)
+    @app.post("/api/repos/{name}/start", response_model=contracts.ActionResult)
+    async def api_start(name: str):
+        ok, detail = await invoke(backend.start, name)
         return JSONResponse({"ok": ok, "detail": detail}, status_code=200 if ok else 400)
 
-    @app.post("/api/repos/{name}/issues/{number}/promote")
-    def api_promote(name: str, number: int):
+    @app.post(
+        "/api/repos/{name}/issues/{number}/promote",
+        response_model=contracts.ActionResult,
+    )
+    async def api_promote(name: str, number: int):
         if number < 1:
             raise HTTPException(400, "issue number must be positive")
-        ok, detail = backend.promote(name, number)
+        ok, detail = await invoke(backend.promote, name, number)
         return JSONResponse({"ok": ok, "detail": detail}, status_code=200 if ok else 400)
 
-    @app.post("/api/repos/{name}/issues/{number}/priority")
-    def api_priority(name: str, number: int, body: dict = Body(default={})):
+    @app.post(
+        "/api/repos/{name}/issues/{number}/priority",
+        response_model=contracts.ActionResult,
+    )
+    async def api_priority(name: str, number: int, body: dict = Body(default={})):
         if number < 1:
             raise HTTPException(400, "issue number must be positive")
         priority = body.get("priority") if isinstance(body, dict) else None
         if priority is not None and priority not in actions.PRIORITY_LABELS:
             raise HTTPException(400, "priority must be P1, P2, P3 or null")
-        ok, detail = backend.priority(name, number, priority)
+        ok, detail = await invoke(backend.priority, name, number, priority)
         return JSONResponse({"ok": ok, "detail": detail}, status_code=200 if ok else 400)
 
     @app.get("/{full_path:path}")
-    def spa(full_path: str):
+    async def spa(full_path: str):
         if full_path.startswith("api/"):
             raise HTTPException(404, "no such endpoint")
         index = os.path.join(dist, "index.html")
         if not os.path.isfile(index):
             return HTMLResponse(instructions_page())
         asset = _safe_asset(dist, full_path)
-        return FileResponse(asset or index)
+        path = asset or index
+        with open(path, "rb") as handle:
+            content = handle.read()
+        media_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        return Response(content, media_type=media_type)
 
     return app
 
@@ -418,7 +283,9 @@ def instructions_page() -> str:
     )
 
 
-def serve(port: int, host: str = HOST, backend: Backend | None = None) -> None:
+def serve(
+    port: int, host: str = HOST, backend: DashboardBackend | None = None
+) -> None:
     """Run the dashboard on loopback. Loopback is not a default but a
     constraint: the POST actions launch daemons and relabel issues."""
     import uvicorn

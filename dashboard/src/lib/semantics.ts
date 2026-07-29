@@ -14,31 +14,22 @@ export type Tone = "ok" | "running" | "fail" | "info" | "meta" | "link" | "neutr
 
 /* --------------------------------------------------------- leg kinds */
 
-/** Contract abbreviations, extended for the kinds dashboard.py also emits. */
-const KIND_ABBREV: Record<string, string> = {
-  RESOLVE: "RES",
-  RESUME: "RSM",
-  ROUTE: "RTE",
-  REVIEW: "REV",
-  RE_REVIEW: "RRV",
-  FIX_CI: "CI",
-  ADDRESS_REVIEW: "ADR",
-  REBASE: "REB",
-  TRIAGE: "TRI",
-  STEWARD_DRIVE: "STW",
-  JIRA_SYNC: "JIR",
+const KIND_LABEL: Record<string, string> = {
+  RESOLVE: "Resolve",
+  RESUME: "Resume",
+  ROUTE: "Route",
+  REVIEW: "Review",
+  RE_REVIEW: "Re-review",
+  FIX_CI: "Fix CI",
+  ADDRESS_REVIEW: "Address review",
+  REBASE: "Rebase",
+  TRIAGE: "Triage",
+  STEWARD_DRIVE: "Steward",
+  JIRA_SYNC: "Jira sync",
 };
 
-export function kindAbbrev(kind: string): string {
-  const known = KIND_ABBREV[kind];
-  if (known) return known;
-  // Unknown kind: initials of the underscore-separated words, capped at 3.
-  return kind
-    .split("_")
-    .map((w) => w.charAt(0))
-    .join("")
-    .slice(0, 3)
-    .toUpperCase();
+export function kindLabel(kind: string): string {
+  return KIND_LABEL[kind] ?? kind.replaceAll("_", " ").toLowerCase();
 }
 
 export const RESOLVE_KINDS = new Set(["RESOLVE", "RESUME", "ROUTE"]);

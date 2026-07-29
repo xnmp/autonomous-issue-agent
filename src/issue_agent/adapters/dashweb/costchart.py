@@ -1,4 +1,4 @@
-"""cc-cost bridge: one leg's session id → the per-turn cost chart, as HTML.
+"""Infrastructure adapter for rendering one leg's cost chart.
 
 The chart generator is the operator's own script (`~/.claude/scripts/session_cost.py`),
 which writes `$TMPDIR/session_cost.html`. So this module locates the transcript,

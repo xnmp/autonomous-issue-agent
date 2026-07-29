@@ -5,7 +5,8 @@ import { hashFor, routeRepo, useRoute, type IssuesSub, type Route } from "./rout
 import { Sidebar } from "./components/Sidebar";
 import { TabStrip, type TabDef } from "./components/TabStrip";
 import { OverviewTab } from "./components/OverviewTab";
-import { IssuesTab, useIssues } from "./components/IssuesTab";
+import { IssuesTab } from "./components/IssuesTab";
+import { useIssues } from "./features/issues/useIssues";
 import { IssueTab } from "./components/IssueTab";
 import { VerificationTab } from "./components/VerificationTab";
 import { EmptyState } from "./components/ui/Feedback";
@@ -13,15 +14,23 @@ import { Chip } from "./components/ui/Chip";
 import { stageTone } from "./lib/semantics";
 
 const TOP_POLL_MS = 10_000;
+const ISSUES_SUB_STORAGE = "issue-agent.dashboard.issue-subtabs";
+
+function storedIssueSubs(): Record<string, IssuesSub> {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(ISSUES_SUB_STORAGE) ?? "{}");
+    return value && typeof value === "object" ? (value as Record<string, IssuesSub>) : {};
+  } catch {
+    return {};
+  }
+}
 
 /**
  * App shell: sidebar + tab strip + one mounted view.
  *
  * Two pieces of state, kept apart on purpose:
  *   - the ROUTE (URL hash) says what is on screen, so reload restores it;
- *   - `openIssues` / `verificationOpen` say what tabs EXIST, because a
- *     closeable tab must survive navigating away from it and cannot live in a
- *     single-valued hash.
+ *   - `openIssues` says which closeable issue tabs exist across navigation.
  * Visiting an issue route always adds that issue to the open set, so a pasted
  * `#/repo/x/issue/7` link materialises its tab.
  */
@@ -45,7 +54,9 @@ export default function App() {
   const selectedRepo = routedRepo ?? repoList[0]?.name ?? null;
 
   const [openIssues, setOpenIssues] = useState<Record<string, number[]>>({});
-  const [verificationOpen, setVerificationOpen] = useState(false);
+  const [issueSubs, setIssueSubs] = useState<Record<string, IssuesSub>>(storedIssueSubs);
+  const routedIssuesRepo = route.view === "issues" ? route.repo : null;
+  const routedIssuesSub = route.view === "issues" ? route.sub : null;
 
   useEffect(() => {
     if (route.view === "issue") {
@@ -55,8 +66,21 @@ export default function App() {
         return list.includes(issue) ? cur : { ...cur, [repo]: [...list, issue] };
       });
     }
-    if (route.view === "verification") setVerificationOpen(true);
   }, [route]);
+
+  useEffect(() => {
+    if (routedIssuesRepo === null || routedIssuesSub === null) return;
+    setIssueSubs((current) => {
+      if (current[routedIssuesRepo] === routedIssuesSub) return current;
+      const next = { ...current, [routedIssuesRepo]: routedIssuesSub };
+      try {
+        localStorage.setItem(ISSUES_SUB_STORAGE, JSON.stringify(next));
+      } catch {
+        // Storage can be disabled; URL state still remains authoritative.
+      }
+      return next;
+    });
+  }, [routedIssuesRepo, routedIssuesSub]);
 
   const issues = useIssues(selectedRepo);
 
@@ -77,13 +101,6 @@ export default function App() {
     },
     [navigate, route],
   );
-
-  const closeVerification = useCallback(() => {
-    setVerificationOpen(false);
-    if (route.view === "verification") {
-      navigate(selectedRepo ? { view: "overview", repo: selectedRepo } : { view: "home" }, true);
-    }
-  }, [navigate, route, selectedRepo]);
 
   /* --------------------------------------------------------- tab strip */
 
@@ -111,7 +128,8 @@ export default function App() {
         </>
       ),
       active: route.view === "issues",
-      onSelect: () => navigate({ view: "issues", repo, sub: "inflight" }),
+      onSelect: () =>
+        navigate({ view: "issues", repo, sub: issueSubs[repo] ?? "inflight" }),
     });
 
     for (const n of openIssues[repo] ?? []) {
@@ -141,20 +159,11 @@ export default function App() {
       });
     }
   }
-  if (verificationOpen) {
-    tabs.push({
-      key: "verification",
-      title: "Verification",
-      label: "Verification",
-      active: route.view === "verification",
-      onSelect: () => navigate({ view: "verification" }),
-      onClose: closeVerification,
-    });
-  }
-
   const setSub = useCallback(
     (sub: IssuesSub) => {
-      if (selectedRepo) navigate({ view: "issues", repo: selectedRepo, sub }, true);
+      if (!selectedRepo) return;
+      setIssueSubs((current) => ({ ...current, [selectedRepo]: sub }));
+      navigate({ view: "issues", repo: selectedRepo, sub }, true);
     },
     [navigate, selectedRepo],
   );
@@ -167,10 +176,7 @@ export default function App() {
         activeRepo={selectedRepo}
         verificationActive={route.view === "verification"}
         onSelectRepo={(name) => navigate({ view: "overview", repo: name })}
-        onOpenVerification={() => {
-          setVerificationOpen(true);
-          navigate({ view: "verification" });
-        }}
+        onOpenVerification={() => navigate({ view: "verification" })}
       />
       <main className="main">
         <div className="mainbar">

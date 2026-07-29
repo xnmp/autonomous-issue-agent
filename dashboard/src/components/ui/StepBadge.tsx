@@ -1,12 +1,11 @@
 import type { CardStep } from "../../api/types";
-import { kindAbbrev, stateTone } from "../../lib/semantics";
+import { kindLabel, stateTone } from "../../lib/semantics";
 import { usd } from "../../lib/format";
 import { Chip } from "./Chip";
 
 /**
- * A leg, as one badge: the kind abbreviation (RES/REV/CI/ADR/REB/TRI) coloured
- * by the leg's state — green ok, yellow running (pulsing), red failed. The
- * abbreviation is the non-colour channel, so state is never colour-alone.
+ * A leg badge uses the explicit operation name: operators should not need to
+ * decode RES/RTE/ADR while diagnosing an incident.
  */
 export function StepBadge({ step }: { step: CardStep }) {
   const tone = stateTone(step.state);
@@ -15,7 +14,7 @@ export function StepBadge({ step }: { step: CardStep }) {
     .join(" · ");
   return (
     <Chip tone={tone} square pulse={step.state === "running"} title={bits}>
-      {kindAbbrev(step.kind)}
+      {kindLabel(step.kind)}
     </Chip>
   );
 }

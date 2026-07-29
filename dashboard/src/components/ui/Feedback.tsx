@@ -65,6 +65,26 @@ export function Loading({ what }: { what: string }) {
   return <div className="empty">loading {what}…</div>;
 }
 
+export function SkeletonRows({
+  what,
+  rows = 4,
+}: {
+  what: string;
+  rows?: number;
+}) {
+  return (
+    <div className="skeleton-list" role="status" aria-label={`Loading ${what}`}>
+      {Array.from({ length: rows }, (_, index) => (
+        <div className="skeleton-row" key={index}>
+          <span className="skeleton skeleton-short" />
+          <span className="skeleton skeleton-grow" />
+          <span className="skeleton skeleton-medium" />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function GhUnavailableChip() {
   return (
     <Chip tone="fail" title="gh reads failed — journal-derived data only (titles, PR state and backlog may be missing)">

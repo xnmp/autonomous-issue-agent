@@ -1,4 +1,4 @@
-"""Runtime budget headroom: Claude OAuth usage, codex rate limits, harness caps.
+"""Infrastructure adapter for runtime budget headroom.
 
 Three different meters answering one operator question — "can I start another
 batch right now?". None of them is the harness's own data, so all three parse
@@ -19,8 +19,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-from ...adapters.journal import default_ledger_path, sum_today
-from .. import cli
+from ..journal import default_ledger_path, sum_today
 from .ghdata import TtlCache
 
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -310,7 +309,7 @@ def codex_usage(sessions_root: str | None = None) -> dict:
 
 
 # ── harness caps ──────────────────────────────────────────────────────────────
-def harness_usage(names, ledger_path: str | None = None, now_fn=None) -> dict:
+def harness_usage(names, config_for, ledger_path: str | None = None, now_fn=None) -> dict:
     """Today's ledgered spend against the configured caps, per deployment and
     in total. Reuses the CLI's cap resolution (overlay wins over shared) so the
     dashboard and `issue-agent status` cannot report different caps."""
@@ -319,18 +318,16 @@ def harness_usage(names, ledger_path: str | None = None, now_fn=None) -> dict:
     per_repo = []
     global_cap = 0.0
     for name in names:
-        repo = cli.read_repo_env_field(
-            os.path.join(cli.REPOS_DIR, f"{name}.env"), "REPO"
-        )
+        repo, daily_cap, configured_global_cap = config_for(name)
         per_repo.append(
             {
                 "name": name,
                 "repo": repo,
                 "today_usd": round(sum_today(ledger, now_fn, repo=repo or None), 4),
-                "daily_cap_usd": cli.daily_cap(name) or None,
+                "daily_cap_usd": daily_cap or None,
             }
         )
-        global_cap = max(global_cap, cli.global_daily_cap(name))
+        global_cap = max(global_cap, configured_global_cap)
     return {
         "global_daily_cap_usd": global_cap or None,
         "today_all_repos_usd": round(sum_today(ledger, now_fn), 4),
@@ -338,13 +335,13 @@ def harness_usage(names, ledger_path: str | None = None, now_fn=None) -> dict:
     }
 
 
-def usage_payload(names, fetch=None) -> dict:
+def usage_payload(names, config_for, fetch=None) -> dict:
     """`GET /api/usage`. Each meter's own error is carried on its block; the
     top-level `warnings` list summarises them for the UI chip."""
     claude = claude_usage(fetch=fetch)
     codex = codex_usage()
     try:
-        harness = harness_usage(names)
+        harness = harness_usage(names, config_for)
         harness_error = ""
     except Exception as exc:  # noqa: BLE001
         harness = {"global_daily_cap_usd": None, "today_all_repos_usd": 0.0, "per_repo": []}

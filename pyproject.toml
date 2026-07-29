@@ -90,3 +90,8 @@ forbidden_modules = [
     "claude_agent_sdk",
     "openai",
 ]
+
+[dependency-groups]
+dev = [
+    "pyrefly>=1.1.1",
+]

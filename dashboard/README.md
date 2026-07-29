@@ -2,8 +2,9 @@
 
 Vite + React 18 + TypeScript SPA for the harness dashboard. It is a pure
 frontend: every byte of data comes from the FastAPI backend documented in
-[`docs/reference/dashboard-web.md`](../docs/reference/dashboard-web.md), which
-is the binding contract for every endpoint shape in `src/api/types.ts`.
+[`docs/reference/dashboard-web.md`](../docs/reference/dashboard-web.md). The
+backend's Pydantic/OpenAPI schema generates `src/api/generated.ts` plus runtime
+Zod validators; `src/api/types.ts` contains only semantic aliases.
 
 No UI framework, no CSS framework, no state library — hand-rolled components
 over CSS custom properties, React context-free (plain hooks +
@@ -15,6 +16,9 @@ over CSS custom properties, React context-free (plain hooks +
 npm ci            # or: npm install
 npm run build     # tsc --noEmit && vite build  ->  dashboard/dist
 npm run typecheck # tsc --noEmit on its own
+npm test          # Vitest component, contract and navigation tests
+npm run test:e2e  # Playwright browser workflow with API fixtures
+npm run generate:api # refresh OpenAPI-derived TS and runtime validators
 npm run dev       # vite dev server on http://localhost:5173
 ```
 
@@ -49,21 +53,25 @@ src/
   main.tsx                 entry; mounts <App/> and imports the three stylesheets
   App.tsx                  shell: sidebar + tab strip + one mounted view
   api/
-    types.ts               TS mirror of the contract — one interface per payload
-    client.ts              the ONLY fetch wrapper: ApiError, abort, one fn per endpoint
+    generated.ts           OpenAPI-generated compile-time contracts
+    generated-zod.ts       OpenAPI-generated runtime validators
+    types.ts               semantic aliases over generated contracts
+    client.ts              fetch wrapper: response validation, ApiError, abort
     hooks.ts               usePolled (abort + document.hidden pause), useClock, useLiveElapsed
   routing/
     hash.ts                Route union, parse/serialize, useRoute()
   lib/
     format.ts              null-tolerant $ / % / duration / relative-time formatters
-    semantics.ts           domain value -> Tone; leg families; kind abbreviations
+    semantics.ts           domain value -> Tone; leg families; explicit kind labels
+  features/issues/
+    useIssues.ts           issues polling seam, independent of presentation
   components/
     Sidebar.tsx            repo rail (active/past), self-repo treatment, start-daemons modal
     UsageBlock.tsx         claude 5h/7d + codex weekly meters + harness $ vs caps
     TabStrip.tsx           tab strip + sub-tab pills
     OverviewTab.tsx        stat tiles, cost mix, caps, daemon health, unattributed events
     IssuesTab.tsx          in-flight / pending / done / backlog tables + actions
-    IssueTab.tsx           per-issue header, leg table, per-step detail panes
+    IssueTab.tsx           per-issue header, run table, per-run detail panes
     EventTimeline.tsx      journal events as a readable timeline with raw JSON
     VerificationTab.tsx    docs/field-verification.md ledger
     ui/                    Chip, Modal, Feedback (banners/empty), Charts (meter,
@@ -110,9 +118,7 @@ or spend-triggering action (start daemons, promote) goes through the in-app
 **Motion.** Running legs pulse; `prefers-reduced-motion: reduce` disables the
 animation and collapses transitions to 1 ms (`--t` in tokens.css).
 
-## Known gaps
+## Known gap
 
 - `PendingCard.overlap` is reserved by the contract and always `null`; the
   column renders a dimmed `n/a` with an explanatory tooltip.
-- No JS test runner in v1 (contract): `npm run build` + `tsc --noEmit` are the
-  gate. Vitest can come later.

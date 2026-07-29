@@ -8,7 +8,7 @@ edit so a half-applied change cannot leave an issue with no priority at all.
 
 import pytest
 
-from issue_agent.app.dashweb import actions, costchart
+from issue_agent.adapters.dashweb import actions, costchart
 
 
 # ── start ─────────────────────────────────────────────────────────────────────

@@ -2,7 +2,7 @@ import { api } from "../api/client";
 import { usePolled } from "../api/hooks";
 import { verificationTone } from "../lib/semantics";
 import { Chip } from "./ui/Chip";
-import { EmptyState, ErrorBanner, Loading, WarningList } from "./ui/Feedback";
+import { EmptyState, ErrorBanner, SectionTitle, SkeletonRows, WarningList } from "./ui/Feedback";
 
 const POLL_MS = 60_000; // a markdown ledger the human edits — no need to hammer it
 
@@ -23,6 +23,7 @@ export function VerificationTab() {
 
   return (
     <div className="tabbody">
+      <SectionTitle>Verification ledger</SectionTitle>
       {v.error ? <ErrorBanner message={v.error} onRetry={v.refresh} stale={!!v.data} /> : null}
       <WarningList warnings={v.data?.warnings} />
 
@@ -34,7 +35,7 @@ export function VerificationTab() {
         <span className="faint">docs/field-verification.md</span>
       </div>
 
-      {v.loading ? <Loading what="the verification ledger" /> : null}
+      {v.loading ? <SkeletonRows what="the verification ledger" rows={6} /> : null}
 
       {!v.loading && rows.length === 0 ? (
         <EmptyState>no rows parsed from docs/field-verification.md</EmptyState>

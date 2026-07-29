@@ -1,4 +1,4 @@
-"""`docs/field-verification.md` → rows the dashboard can render.
+"""Infrastructure adapter for the field-verification ledger.
 
 The ledger is prose in a markdown table, hand-edited every deployment, and its
 columns have already changed shape once. So this parser commits to almost

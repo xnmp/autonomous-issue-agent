@@ -6,7 +6,7 @@ import { HEALTH_LABEL, HEALTH_TONE, roleHealth } from "../lib/semantics";
 import { ago } from "../lib/format";
 import { Chip, Dot } from "./ui/Chip";
 import { ConfirmModal } from "./ui/Modal";
-import { EmptyState, ErrorBanner, Loading, WarningList } from "./ui/Feedback";
+import { EmptyState, ErrorBanner, SkeletonRows, WarningList } from "./ui/Feedback";
 import { UsageBlock } from "./UsageBlock";
 
 interface SidebarProps {
@@ -79,7 +79,7 @@ export function Sidebar({
         ) : null}
         <WarningList warnings={repos.data?.warnings} />
 
-        {repos.loading ? <Loading what="deployments" /> : null}
+        {repos.loading ? <SkeletonRows what="deployments" rows={4} /> : null}
 
         <div className="rail-group">
           <div className="rail-heading">
@@ -117,29 +117,29 @@ export function Sidebar({
             ))}
           </div>
         ) : null}
-      </div>
-
-      <div className="sidebar-foot">
-        {notice ? (
-          <div className="banner banner-ok" role="status">
-            <span className="banner-msg trunc" title={notice}>
-              {notice}
+        <div className="sidebar-foot">
+          {notice ? (
+            <div className="banner banner-ok" role="status">
+              <span className="banner-msg trunc" title={notice}>
+                {notice}
+              </span>
+              <button className="btn btn-xs btn-ghost" onClick={() => setNotice(null)}>
+                ✕
+              </button>
+            </div>
+          ) : null}
+          <div className="rail-heading">Operations</div>
+          <button
+            className={`rail-btn${verificationActive ? " active" : ""}`}
+            onClick={onOpenVerification}
+          >
+            <span className="rail-btn-mark" aria-hidden="true">
+              ✓
             </span>
-            <button className="btn btn-xs btn-ghost" onClick={() => setNotice(null)}>
-              ✕
-            </button>
-          </div>
-        ) : null}
-        <button
-          className={`rail-btn${verificationActive ? " active" : ""}`}
-          onClick={onOpenVerification}
-        >
-          <span className="rail-btn-mark" aria-hidden="true">
-            ✓
-          </span>
-          Verification ledger
-        </button>
-        <UsageBlock usage={usage} />
+            Verification ledger
+          </button>
+          <UsageBlock usage={usage} />
+        </div>
       </div>
 
       {confirmStart ? (
@@ -203,7 +203,7 @@ function RepoRow({
           <span className="repo-name trunc">{repo.name}</span>
           {repo.is_self ? (
             <Chip tone="meta" title="the harness's own repository">
-              ⟳ self
+              ⟳ <strong>self</strong>
             </Chip>
           ) : null}
         </div>
@@ -234,8 +234,13 @@ function RepoRow({
         </div>
       </button>
       {onStart ? (
-        <button className="btn btn-xs repo-start" onClick={onStart} title="run make point-at">
-          Start daemons
+        <button
+          className="btn btn-xs repo-start"
+          onClick={onStart}
+          title="start daemons"
+          aria-label={`Start daemons for ${repo.name}`}
+        >
+          ▶
         </button>
       ) : null}
     </div>

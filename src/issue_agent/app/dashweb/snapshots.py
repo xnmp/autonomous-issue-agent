@@ -5,19 +5,15 @@ Every number here comes out of `app/dashboard.py` — `collect` reads the files,
 JSON the contract names. Nothing is re-derived: a stage, a cost or a leg that
 disagreed with `issue-agent dashboard` would be a second truth.
 
-The pure half (frecency, card assembly, step collapsing) takes parsed rows; the
-impure half (`collect_deployment`, `scan_proc_daemons`) takes paths.
+This module is pure: adapters collect snapshots and the application service
+passes them here for projection into API payloads.
 """
 
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from ...adapters.journal import default_ledger_path, parse_ts
-from .. import cli
-from .. import dashboard as dash
+from ...domain import dashboard as dash
 
 # Frecency windows: (seconds, weight). An event inside 24h counts in all three,
 # which is the intended pile-up — a repo that moved this morning must outrank a
@@ -40,67 +36,6 @@ def iso(ts: datetime | None) -> str | None:
     return ts.replace(microsecond=0).isoformat() if ts else None
 
 
-# ── liveness ──────────────────────────────────────────────────────────────────
-def _environ_agent_env(blob: bytes) -> str:
-    for item in blob.split(b"\0"):
-        if item.startswith(b"AGENT_ENV="):
-            return item[len("AGENT_ENV="):].decode(errors="replace")
-    return ""
-
-
-def deployment_of_env(agent_env: str) -> str:
-    """`…/config/.active.<name>.env` → `<name>`; "" for anything else."""
-    base = os.path.basename(agent_env or "")
-    if base.startswith(".active.") and base.endswith(".env"):
-        return base[len(".active."):-len(".env")]
-    return ""
-
-
-def scan_proc_daemons(proc_root: str = "/proc") -> tuple[dict[str, set[str]], bool]:
-    """(deployment name → the roles with a live process, scan succeeded).
-
-    Linux-only by construction: a daemon's argv (`… issue_agent.app.main fix`)
-    carries no deployment marker, and its composed `AGENT_ENV` carries no role,
-    so only the pair identifies "the fix daemon of deployment X". A name maps to
-    an empty role set when only its launcher (`point-at.sh`) is up — still
-    active, no role attributable yet.
-
-    `False` for the second element means the scan itself did not work (no
-    /proc, or nothing readable): callers must then fall back to the journal
-    staleness heuristic rather than report every daemon dead.
-    """
-    found: dict[str, set[str]] = {}
-    read_foreign = False
-    own_pid = str(os.getpid())
-    try:
-        pids = [p for p in os.listdir(proc_root) if p.isdigit()]
-    except OSError:
-        return {}, False
-    for pid in pids:
-        try:
-            with open(os.path.join(proc_root, pid, "environ"), "rb") as fh:
-                blob = fh.read()
-        except OSError:
-            continue  # another user's process, or it exited mid-scan
-        # Our OWN environ is always readable, so counting it would report a
-        # successful scan under hidepid=2 or in a container — where every
-        # daemon would then read as dead and the start guard would wave a
-        # running deployment through.
-        if pid != own_pid:
-            read_foreign = True
-        name = deployment_of_env(_environ_agent_env(blob))
-        if not name:
-            continue
-        roles = found.setdefault(name, set())
-        try:
-            with open(os.path.join(proc_root, pid, "cmdline"), "rb") as fh:
-                argv = fh.read().decode(errors="replace").split("\0")
-        except OSError:
-            continue
-        roles.update(a for a in argv if a in dash.ROLE_NAMES)
-    return found, read_foreign
-
-
 # ── frecency ──────────────────────────────────────────────────────────────────
 def frecency_score(timestamps, now: datetime) -> float:
     """Recency-weighted event count. Pure over already-parsed timestamps."""
@@ -120,74 +55,6 @@ def normalise_frecency(scores: dict[str, float]) -> dict[str, float]:
     return {name: round(score / top, 4) for name, score in scores.items()}
 
 
-# ── deployment collection ─────────────────────────────────────────────────────
-@dataclass(frozen=True)
-class Snapshot:
-    """One deployment's journal truth plus the config context the API needs."""
-
-    name: str
-    repo: str
-    target_dir: str
-    deployment: dash.Deployment
-    timestamps: tuple[datetime | None, ...]
-
-    @property
-    def last_activity(self) -> datetime | None:
-        stamps = [ts for ts in self.timestamps if ts]
-        return max(stamps) if stamps else None
-
-
-def overlay_field(name: str, field: str) -> str:
-    return cli.read_repo_env_field(os.path.join(cli.REPOS_DIR, f"{name}.env"), field)
-
-
-def deployment_names(repos_dir: str | None = None) -> tuple[str, ...]:
-    return dash.deployment_names(repos_dir if repos_dir is not None else cli.REPOS_DIR)
-
-
-def collect_deployment(
-    name: str, now_fn=None, stale_after_s: float = dash.STALE_AFTER_S
-) -> Snapshot:
-    """Read one deployment's journals + the global ledger (the only I/O here)."""
-    repo = overlay_field(name, "REPO")
-    deployment = dash.collect(
-        name,
-        repo,
-        cli.journal_paths(name),
-        cli.log_dir(),
-        default_ledger_path(),
-        now_fn=now_fn,
-        stale_after_s=stale_after_s,
-    )
-    stamps = tuple(
-        parse_ts(e.get("ts"))
-        for row in deployment.issues
-        for e in row.events
-    ) + tuple(parse_ts(e.get("ts")) for e in deployment.unattributed)
-    return Snapshot(
-        name=name,
-        repo=repo,
-        target_dir=overlay_field(name, "TARGET_DIR"),
-        deployment=deployment,
-        timestamps=stamps,
-    )
-
-
-_harness_repo: dict[str, str] = {}
-
-
-def harness_repo(harness_root: str | None = None) -> str:
-    """The harness's own `owner/name`, for the `is_self` sidebar marker. "" when
-    it cannot be read — a missing self-marker is cosmetic. Memoised: a checkout's
-    origin does not change while the server runs, and this is on a poll path."""
-    root = harness_root or cli.HARNESS_ROOT
-    if root not in _harness_repo:
-        _harness_repo[root] = cli.parse_remote_url(
-            cli._run(["git", "remote", "get-url", "origin"], cwd=root)
-        )
-    return _harness_repo[root]
-
-
 def health_json(h: dash.DaemonHealth, alive: bool | None) -> dict:
     return {
         "role": h.role,
@@ -201,9 +68,14 @@ def health_json(h: dash.DaemonHealth, alive: bool | None) -> dict:
     }
 
 
-def repos_payload(snapshots, live: dict[str, set[str]], scan_ok: bool, now: datetime) -> dict:
+def repos_payload(
+    snapshots,
+    live: dict[str, set[str]],
+    scan_ok: bool,
+    now: datetime,
+    self_repo: str = "",
+) -> dict:
     """`GET /api/repos`, pre-sorted by frecency then last activity."""
-    self_repo = harness_repo()
     raw = {s.name: frecency_score(s.timestamps, now) for s in snapshots}
     scores = normalise_frecency(raw)
     rows = []
@@ -325,7 +197,7 @@ def _settled_event(row: dash.IssueRow, leg: dash.Leg) -> dict:
     for e in row.events:
         if (
             e.get("event") == "agent_run"
-            and parse_ts(e.get("ts")) == leg.ts
+                and dash.parse_ts(e.get("ts")) == leg.ts
             and str(e.get("kind") or "?") == leg.kind
         ):
             return e
@@ -343,7 +215,7 @@ def _usage(row: dash.IssueRow, leg: dash.Leg):
 
 # ── issue cards ───────────────────────────────────────────────────────────────
 def _started(row: dash.IssueRow) -> datetime | None:
-    stamps = [ts for ts in (parse_ts(e.get("ts")) for e in row.events) if ts]
+    stamps = [ts for ts in (dash.parse_ts(e.get("ts")) for e in row.events) if ts]
     return min(stamps) if stamps else None
 
 
@@ -490,7 +362,7 @@ def is_backlog(issue: dict) -> bool:
 
 
 def age_days(created_at, now: datetime) -> int | None:
-    ts = parse_ts(created_at)
+    ts = dash.parse_ts(created_at)
     return max(0, int((now - ts).total_seconds() // 86400)) if ts else None
 
 
@@ -513,7 +385,12 @@ def cost_mix(metrics: dash.Metrics) -> dict:
     }
 
 
-def health_trend(issues, recurrence_events, *, first_class_day: str | None) -> list[dict]:
+def health_trend(
+    issues,
+    recurrence_events,
+    *,
+    first_observed_day: str | None,
+) -> list[dict]:
     """Daily target-repository issue health, using GitHub dates and journal recurrences.
 
     Creation and confirmed closure timestamps are GitHub facts; recurrences are
@@ -523,14 +400,14 @@ def health_trend(issues, recurrence_events, *, first_class_day: str | None) -> l
     days: dict[str, dict] = {}
 
     def row_for(value) -> dict | None:
-        stamp = parse_ts(value)
+        stamp = dash.parse_ts(value)
         if stamp is None:
             return None
         day = stamp.astimezone(timezone.utc).date().isoformat()
         return days.setdefault(
             day,
             {"day": day, "opened": 0, "closed": 0, "net_open": 0,
-             "recurrences": 0, "first_of_class": False},
+             "recurrences": 0, "first_observation": False},
         )
 
     for issue in issues if isinstance(issues, list) else ():
@@ -546,34 +423,17 @@ def health_trend(issues, recurrence_events, *, first_class_day: str | None) -> l
                 row["recurrences"] += 1
     for row in days.values():
         row["net_open"] = row["opened"] - row["closed"]
-        row["first_of_class"] = row["day"] == first_class_day
+        row["first_observation"] = row["day"] == first_observed_day
     return [days[day] for day in sorted(days)]
 
 
-def deployment_class(snapshot: Snapshot) -> tuple[str, str, str]:
-    """The operating configuration whose first observation is expected tuition.
+def first_observed_day(snapshot: dash.Snapshot) -> str | None:
+    """UTC day this deployment first journalled.
 
-    `point-at` writes the merged shared/overlay configuration to this per-name
-    snapshot. Runtime and review mode live in the shared layer, so reading the
-    overlay alone would classify every deployment using absent or ambient values.
+    Runtime and review-mode history is not journalled, so classifying historical
+    timestamps with today's configuration would manufacture provenance.
     """
-    return (
-        snapshot.repo,
-        cli.read_repo_env_field(cli._active_env_path(snapshot.name), "FIXER_RUNTIME"),
-        cli.read_repo_env_field(cli._active_env_path(snapshot.name), "REVIEW_MODE"),
-    )
-
-
-def first_observed_class_day(snapshot: Snapshot, snapshots) -> str | None:
-    """UTC day the selected repository/runtime/review-mode first journalled."""
-    target_class = deployment_class(snapshot)
-    timestamps = [
-        stamp
-        for candidate in snapshots
-        if deployment_class(candidate) == target_class
-        for stamp in candidate.timestamps
-        if stamp is not None
-    ]
+    timestamps = [stamp for stamp in snapshot.timestamps if stamp is not None]
     if not timestamps:
         return None
     return min(timestamps).astimezone(timezone.utc).date().isoformat()
@@ -601,7 +461,11 @@ def metrics_json(metrics: dash.Metrics) -> dict:
 
 
 def overview_payload(
-    snapshot: Snapshot, live: dict[str, set[str]], scan_ok: bool
+    snapshot: dash.Snapshot,
+    live: dict[str, set[str]],
+    scan_ok: bool,
+    issue_cap_usd: float | None = None,
+    daily_cap_usd: float | None = None,
 ) -> dict:
     dep = snapshot.deployment
     if scan_ok:
@@ -613,8 +477,8 @@ def overview_payload(
         "metrics": metrics_json(dep.metrics),
         "cost_mix": cost_mix(dep.metrics),
         "caps": {
-            "issue_cap_usd": cli._env_cap(snapshot.name, "ISSUE_SPEND_CAP_USD", 0.0) or None,
-            "daily_cap_usd": cli.daily_cap(snapshot.name) or None,
+            "issue_cap_usd": issue_cap_usd,
+            "daily_cap_usd": daily_cap_usd,
             "today_usd": dep.metrics.today_usd,
         },
         "health": [health_json(h, alive[h.role]) for h in dep.health],
@@ -624,14 +488,19 @@ def overview_payload(
 
 
 # ── issue lookup ──────────────────────────────────────────────────────────────
-def find_row(snapshot: Snapshot, issue: int) -> dash.IssueRow | None:
+def find_row(snapshot: dash.Snapshot, issue: int) -> dash.IssueRow | None:
     for row in snapshot.deployment.issues:
         if row.issue == issue:
             return row
     return None
 
 
-def issue_detail(row: dash.IssueRow, now: datetime, gh_issue: dict | None = None) -> dict:
+def issue_detail(
+    row: dash.IssueRow,
+    now: datetime,
+    gh_issue: dict | None = None,
+    gh_prs: dict[int, dict] | None = None,
+) -> dict:
     started = _started(row)
     end = row.last_ts if (row.done and row.last_ts) else now
     return {
@@ -641,6 +510,14 @@ def issue_detail(row: dash.IssueRow, now: datetime, gh_issue: dict | None = None
         "stage": row.stage,
         "done": row.done,
         "prs": list(row.prs),
+        "pull_requests": [
+            {
+                "number": number,
+                "url": (gh_prs or {}).get(number, {}).get("url"),
+                "state": _pr_state((gh_prs or {}).get(number)),
+            }
+            for number in row.prs
+        ],
         "cost_usd": row.cost_usd,
         "elapsed_s": round((end - started).total_seconds()) if started else None,
         "steps": detailed_steps(row),
@@ -660,14 +537,14 @@ def step_window_events(row: dash.IssueRow, idx: int) -> list[dict]:
     steps = detailed_steps(row)
     if idx < 0 or idx >= len(steps):
         return []
-    settled = parse_ts(steps[idx]["ts"])
+    settled = dash.parse_ts(steps[idx]["ts"])
     if settled is None:
         return []
     running = steps[idx]["state"] == "running"
     dispatches = [
         ts
         for ts in (
-            parse_ts(e.get("ts"))
+            dash.parse_ts(e.get("ts"))
             for e in row.events
             if e.get("event") == "agent_run_start"
         )
@@ -681,7 +558,7 @@ def step_window_events(row: dash.IssueRow, idx: int) -> list[dict]:
     return [
         e
         for e in row.events
-        if (ts := parse_ts(e.get("ts"))) is not None
+        if (ts := dash.parse_ts(e.get("ts"))) is not None
         and opened <= ts
         and (running or ts <= settled)
     ]

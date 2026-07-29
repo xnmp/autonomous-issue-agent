@@ -6,7 +6,7 @@ changed once, so these tests pin the tolerance, not the current column order.
 
 import os
 
-from issue_agent.app.dashweb import verification
+from issue_agent.adapters.dashweb import verification
 
 HARNESS_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
