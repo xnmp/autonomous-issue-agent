@@ -44,6 +44,9 @@ def _workflow(gw, store, runner, journal=None, **cfg_overrides):
         journal=journal,
     )
     cfg_kwargs.update(cfg_overrides)
+    if cfg_kwargs.get("reviewer_runtime") == "codex":
+        cfg_kwargs.setdefault("execution_cwd", "/configured-review-checkout")
+        cfg_kwargs.setdefault("prepare_cwd", lambda _cwd: None)
     cfg = ReviewWorkflowConfig(**cfg_kwargs)
     # The REAL Executor, not a spy: M10's whole point is that escalation must
     # travel the same funnel every other write does (journal event + ALERT_CMD
@@ -152,6 +155,40 @@ def test_codex_reviewer_re_reviews_in_a_fresh_read_only_session():
 
     assert second.tasks[0].resume is None
     assert store.get_pr_session(100) == "codex-review"
+
+
+def test_codex_review_installs_its_hook_in_the_explicit_checkout_before_running():
+    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    gw = FakeGateway(prs={100: pr})
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(
+        is_error=False,
+        structured={"decision": "APPROVE", "body": "looks good"},
+    ))
+    prepared: list[str] = []
+
+    asyncio.run(_workflow(
+        gw, store, runner, reviewer_runtime="codex",
+        execution_cwd="/explicit/review-checkout", prepare_cwd=prepared.append,
+    ).review(100))
+
+    assert prepared == ["/explicit/review-checkout"]
+    assert runner.tasks[0].cwd == "/explicit/review-checkout"
+
+
+def test_codex_review_refuses_an_implicit_process_cwd():
+    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    gw = FakeGateway(prs={100: pr})
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(is_error=False))
+    logs: list[str] = []
+
+    asyncio.run(_workflow(
+        gw, store, runner, reviewer_runtime="codex", execution_cwd="", log=logs.append,
+    ).review(100))
+
+    assert runner.tasks == []
+    assert any("set TARGET_DIR" in line for line in logs)
 
 
 def test_single_review_submits_before_persisting_state():

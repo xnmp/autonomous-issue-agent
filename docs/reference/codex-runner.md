@@ -41,7 +41,15 @@ under Codex's read-only sandbox and a dedicated governor allow-list (`git diff`,
 are both contained. Because Codex's resume grammar cannot carry a sandbox
 setting, every Codex re-review and in-leg transport retry is intentionally a
 fresh session; it receives the prior verdict as context and cannot regain a
-writable resume mode.
+writable resume mode. The governor hook is installed only immediately before a
+review leg in the explicit `TARGET_DIR`; daemon construction never mutates the
+process cwd, and an unset target fails closed instead of using an implicit cwd.
+
+The Codex reviewer has no image-rendering tool in this read-only surface. It
+cannot substantiate `evidence/` screenshots required by visual acceptance
+criteria; use `REVIEWER_RUNTIME=claude` (the recommended mixed-runtime posture)
+when visual evidence needs reviewer judgement. This is a deliberate documented
+limitation, not a signal to rubber-stamp or uniformly reject screenshots.
 
 This is a **second runtime adapter**, NOT an OpenAI-SDK rewrite. A fixer run is
 `AgentTask → AgentResult`; `AgentRunner` realises that over the Claude SDK, and a

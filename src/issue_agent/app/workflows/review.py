@@ -32,6 +32,11 @@ class ReviewWorkflowConfig:
     review_trigger_label: str
     log: Callable[[str], None]
     reviewer_runtime: str = "claude"
+    # Codex ignores AgentTask's SDK-only tool policy, so it must run only after
+    # its read-only governor is installed in this explicit checkout.  An empty
+    # cwd is a containment failure, never permission to fall back to os.getcwd().
+    execution_cwd: str = ""
+    prepare_cwd: Callable[[str], None] | None = None
     journal: object | None = None
 
 
@@ -109,6 +114,13 @@ class ReviewWorkflow:
         )
 
     async def _run_logged(self, label: str, pr: int, task):
+        task = self._prepare_task(task)
+        if task is None:
+            return AgentResult(
+                is_error=True,
+                status="containment_unavailable",
+                summary="Codex review needs an explicit TARGET_DIR for its governor hook",
+            )
         if self.log_run is not None:
             return await self.log_run(label, pr, task)
         self.cfg.log(f"agent #{pr}: {label} — running")
@@ -119,6 +131,32 @@ class ReviewWorkflow:
             f"{f', ${result.cost_usd:.2f}' if result.cost_usd else ''})"
         )
         return result
+
+    def _prepare_task(self, task):
+        """Install Codex's review governor immediately before each agent leg.
+
+        A builder-time write can mutate whichever checkout happens to run a
+        test, including an in-flight fixer worktree.  Review has no worktree of
+        its own, so the configured target checkout is the sole permitted hook
+        destination and is also made the task's execution cwd.
+        """
+        if self.cfg.reviewer_runtime != "codex":
+            return task
+        if not self.cfg.execution_cwd or self.cfg.prepare_cwd is None:
+            self.cfg.log(
+                "review: Codex containment unavailable — set TARGET_DIR to the "
+                "review checkout; refusing to run without a governor hook"
+            )
+            return None
+        try:
+            self.cfg.prepare_cwd(self.cfg.execution_cwd)
+        except OSError as exc:
+            self.cfg.log(
+                f"review: Codex containment setup failed in {self.cfg.execution_cwd}: {exc}; "
+                "refusing to run"
+            )
+            return None
+        return replace(task, cwd=self.cfg.execution_cwd)
 
     async def review(self, pr: int) -> None:
         p = self.gateway.get_pr(pr)
@@ -139,7 +177,7 @@ class ReviewWorkflow:
             task = task_builders.build_review_task(
                 pr, p.title, p.body, diff, self.cfg.review
             )
-        result = await self.runner.run(task)
+        result = await self._run_logged("review", pr, task)
         if result.is_error:
             self.cfg.log(
                 f"review #{pr}: agent errored (status={result.status or 'error'}, "
@@ -207,7 +245,7 @@ class ReviewWorkflow:
                     pr, round_number, last_sha, p.head_ref_oid, diff,
                     session_id, self.cfg.review,
                 )
-        result = await self.runner.run(task)
+        result = await self._run_logged("re-review", pr, task)
         if result.is_error:
             # do NOT advance sha/round — retry same diff next poll. Log cost so a
             # budget-cap abort (delegated review + scout subagents share one budget)

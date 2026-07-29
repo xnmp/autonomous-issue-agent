@@ -1538,6 +1538,7 @@ def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
         "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEWER_RUNTIME": "codex",
         "REVIEW_MODEL": "gpt-5.6-terra", "REVIEW_BUDGET_USD": "2.5",
         "REVIEW_STATE_DIR": str(tmp_path / "review-state"),
+        "TARGET_DIR": str(tmp_path),
     })
 
     daemon = build_review_daemon(
@@ -1545,12 +1546,15 @@ def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
         FakeRunner(AgentResult(is_error=False)),
     )
 
-    runtime = daemon.executor._run_agent.__closure__[0].cell_contents.runner.inner
+    dispatcher = daemon.executor._run_agent.__closure__[0].cell_contents
+    runtime = dispatcher.runner.inner
     assert isinstance(runtime, CapturingCodexRunner)
     assert seen["default_model"] == "gpt-5.6-terra"
     assert seen["enforce_budget"] is True
     assert seen["sandbox"] == "read-only"
     assert seen["resume_on_retry"] is False
+    assert dispatcher.review_workflow.cfg.execution_cwd == str(tmp_path)
+    assert callable(dispatcher.review_workflow.cfg.prepare_cwd)
 
 
 def test_codex_reviewer_defers_hook_installation_until_dispatch(tmp_path, monkeypatch):

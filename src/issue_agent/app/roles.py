@@ -911,6 +911,8 @@ def build_review_daemon(
         **_spend_cfg(cfg, "review", ledger),
     )
     review_runner = runner
+    review_execution_cwd = ""
+    review_prepare_cwd = None
     if review_runtime.runtime == "codex":
         from ..adapters.codex_runner import (
             codex_budget_not_enforced_warning,
@@ -953,14 +955,28 @@ def build_review_daemon(
         )
         if budget_notice is not None:
             _log("review")(budget_notice)
-        # Codex ignores AgentTask's SDK-only tool policy. Install the dedicated
-        # read-only Bash allow-list before the first run; it also blocks ambient
-        # `gh` mutations, which a filesystem sandbox cannot contain.
+        # Codex ignores AgentTask's SDK-only tool policy.  The workflow installs
+        # this dedicated read-only Bash allow-list immediately before each leg,
+        # in the explicit target checkout only.  Builder-time writes would let a
+        # test run corrupt a simultaneously active fixer worktree.
         from ..adapters.codex_hook import write_hook_config
 
-        write_hook_config(
-            cfg.target_dir or os.getcwd(), review_only=True, log=_log("review")
-        )
+        review_execution_cwd = cfg.target_dir
+        if review_execution_cwd:
+            review_prepare_cwd = partial(
+                write_hook_config, review_only=True, log=_log("review")
+            )
+        else:
+            _log("review")(
+                "codex: NOT READY at startup — REVIEWER_RUNTIME=codex requires "
+                "TARGET_DIR so its read-only governor has an explicit checkout"
+            )
+
+    dcfg = replace(
+        dcfg,
+        review_execution_cwd=review_execution_cwd,
+        review_prepare_cwd=review_prepare_cwd,
+    )
 
     # Reviewer has no worktree/issue side; pass a no-op Worktrees-like None usage.
     executor = Executor(

@@ -240,8 +240,13 @@ is supported, it uses the read-only sandbox in the operator checkout, and every
 re-review starts fresh because `codex exec resume` cannot carry a sandbox flag.
 The dedicated review governor also blocks shell commands outside `git diff`,
 `gh pr diff/view`, `cat`, and `ls`, so ambient GitHub credentials cannot bypass
-the read-only filesystem boundary. Do not broaden that boundary without an
-equivalent, tested containment mechanism.
+the read-only filesystem boundary. Its hook is installed immediately before a
+review leg in the explicit `TARGET_DIR`; no hook is written while a daemon is
+being built, and a missing target refuses the Codex leg rather than falling back
+to the process cwd. Codex's shell-only review surface also cannot render
+`evidence/` screenshots. Use `REVIEWER_RUNTIME=claude` for a PR whose visual
+acceptance criteria need evidence-image judgement. Do not broaden that boundary
+without an equivalent, tested containment mechanism.
 
 ## Identities
 
