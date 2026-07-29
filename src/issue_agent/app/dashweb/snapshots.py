@@ -305,7 +305,7 @@ def _suspended_seconds(row: dash.IssueRow, max_seconds: float) -> float:
             continue
         try:
             seconds = float(event.get("suspended_seconds") or 0)
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
             continue
         if (
             not math.isfinite(seconds)
@@ -315,7 +315,7 @@ def _suspended_seconds(row: dash.IssueRow, max_seconds: float) -> float:
             continue
         try:
             clock_offset = float(event.get("stall_clock_offset_seconds"))
-        except (TypeError, ValueError):
+        except (OverflowError, TypeError, ValueError):
             clock_offset = math.nan
         if math.isfinite(clock_offset):
             identified.append((clock_offset, seconds))
