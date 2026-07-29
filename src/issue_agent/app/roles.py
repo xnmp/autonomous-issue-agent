@@ -606,6 +606,10 @@ def build_fix_daemon(
             cost_per_mtok_in=codex_runtime.cost_per_mtok_in,
             cost_per_mtok_out=codex_runtime.cost_per_mtok_out,
             cost_per_mtok=codex_runtime.cost_per_mtok,
+            # #29: the only per-run spend bound codex can have — the runner
+            # samples the session's streamed counters and kills on crossing
+            # AgentTask.max_budget_usd. Without it MAX_BUDGET_USD is decoration.
+            enforce_budget=codex_runtime.enforce_budget,
             **({"default_model": codex_runtime.model} if codex_runtime.model else {}),
         )
         # Surface a codex misconfig (missing bin/key) at STARTUP, not on the first
@@ -629,13 +633,16 @@ def build_fix_daemon(
         if _blindspot is not None:
             _log("fix")(_blindspot)
         # #29: the OTHER half, which used to be reachable only through the line
-        # above — and therefore only when pricing was left unconfigured. The
-        # per-session budget is unenforceable on codex whatever the price table
-        # says, and `describe()` prints `fix_budget=$N` on every boot, so this
-        # correction has to be independent of it.
+        # above — and therefore only when pricing was left unconfigured. It now
+        # warns when the budget check cannot bound a run (enforcement off or
+        # incomplete pricing); with both in place it emits an informational
+        # notice that native codex support is absent but harness enforcement is
+        # active. Either way `describe()` prints the matching verdict.
         _unbounded = codex_budget_not_enforced_warning(
             fix_budget_usd=cfg.fix_budget_usd,
             max_runtime=codex_runtime.max_runtime,
+            enforced=codex_runtime.enforce_budget,
+            priced=codex_runtime.budget_priceable,
         )
         if _unbounded is not None:
             _log("fix")(_unbounded)

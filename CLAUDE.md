@@ -237,6 +237,13 @@ gate, the red-fail (anti-tautological-test) gate, and the reviewer's test run. F
 a monorepo, compose the tiers with `set -e` (e.g.
 `set -e; (cd backend && uv run pytest) && (cd frontend && pnpm exec tsc -b)`).
 
+On codex, `MAX_BUDGET_USD` is enforced in the harness rather than by a CLI
+flag: the runner samples the rollout's cumulative token counters, subtracts the
+resumed session baseline, and kills the process group when the current leg
+crosses the threshold. This requires `CODEX_ENFORCE_BUDGET=1` and positive input
+and output prices for every fallback/per-model rate; startup logs explicitly
+report any configuration where the dollar bound cannot be enforced.
+
 ## Identities
 
 - **fix** = ambient `gh auth` login. **review + steward** = the GitHub App
