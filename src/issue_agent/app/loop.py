@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import time
 
 from ..adapters.github import GhUnavailable
@@ -199,20 +199,30 @@ class Daemon:
                     cur - suspended, tz=timezone.utc
                 )
                 woke_at = datetime.fromtimestamp(cur, tz=timezone.utc)
+                # wall-minus-monotonic is stable across processes on one boot
+                # and advances by the suspension amount. Unlike a wall-time
+                # start estimate, it is not shifted by work after resume, so
+                # dashboard readers can identify one box stall across roles.
+                stall_clock_offset = round(cur - cur_active, 3)
                 self.log(
                     f"{self.name}: ♥ woke after {elapsed}s (expected ~{self.poll_seconds}s) "
                     "— likely suspended/stalled; catching up"
                 )
+                observed_from = datetime.fromtimestamp(
+                    previous, tz=timezone.utc
+                )
+                reconcile_from = min(
+                    observed_from,
+                    stall_started - timedelta(seconds=self.poll_seconds),
+                )
                 if self.journal is not None:
-                    observed_from = datetime.fromtimestamp(
-                        previous, tz=timezone.utc
-                    )
                     self.journal.emit(
                         "stall",
                         started_at=stall_started.isoformat(),
                         woke_at=woke_at.isoformat(),
                         elapsed_seconds=elapsed,
                         suspended_seconds=suspended,
+                        stall_clock_offset_seconds=stall_clock_offset,
                     )
                     path = getattr(self.journal, "path", "")
                     if path and suspended > 0:
@@ -226,12 +236,13 @@ class Daemon:
                                 "agent_run_stall",
                                 **annotation,
                                 stall_started_at=stall_started.isoformat(),
+                                stall_clock_offset_seconds=stall_clock_offset,
                                 observed_from=observed_from.isoformat(),
                                 woke_at=woke_at.isoformat(),
                                 detected_suspended_seconds=suspended,
                             )
                 self.executor.reconcile_recent_actions(
-                    datetime.fromtimestamp(previous, tz=timezone.utc),
+                    reconcile_from,
                     woke_at,
                 )
                 last_logged = cur
