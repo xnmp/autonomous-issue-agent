@@ -526,6 +526,39 @@ class CompositeGateway:
         return self.label_visible
 
 
+def test_stall_reconciliation_verifies_composite_without_duplicate_escalation(
+    tmp_path,
+):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    gateway = CompositeGateway()
+    marked = []
+    action = EscalateCiPending(64, "head-sha", "CI is stalled")
+    executor = Executor(
+        gateway,
+        journal=journal,
+        mark_ci_pending_escalated=lambda pr, head: marked.append((pr, head)),
+        pending_actions=Store(str(tmp_path / "state")),
+        retry_delays=(),
+    )
+    executor.execute(action)
+    accepted_at = datetime.now(timezone.utc)
+
+    executor.reconcile_recent_actions(
+        accepted_at - timedelta(minutes=1),
+        accepted_at + timedelta(minutes=1),
+    )
+
+    events = read_events(journal.path)
+    assert [call[0] for call in gateway.calls] == ["comment", "relabel"]
+    assert marked == [(64, "head-sha")]
+    assert len([event for event in events if event["event"] == "escalation"]) == 1
+    assert any(
+        event["event"] == "action_verified"
+        and event["desc"] == "escalate stalled CI PR #64 (head-sh)"
+        for event in events
+    )
+
+
 def test_composite_retry_does_not_repost_an_accepted_comment(tmp_path):
     gateway = CompositeGateway(fail_first_relabel=True)
     marked = []
