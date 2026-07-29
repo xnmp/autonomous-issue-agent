@@ -178,19 +178,21 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await mockApi(page);
   await page.goto("/#/repo/self/issues/done");
 
-  await expect(page.locator(".chip strong", { hasText: "self" })).toBeVisible();
+  await expect(page.locator(".chip strong", { hasText: "issue-agent" })).toBeVisible();
+  await page.locator(".rail-past > summary").click();
   await expect(page.getByRole("button", { name: "Start daemons for sleeping" })).toBeVisible();
 
   const quota = page.locator("details.usage");
   await expect(quota).not.toHaveAttribute("open", "");
-  await quota.locator("summary").click();
+  await quota.locator("> summary").click();
   await expect(quota).toHaveAttribute("open", "");
 
   const sidebar = page.locator(".sidebar");
   await expect(sidebar).toHaveCSS("resize", "horizontal");
   await expect(page.locator(".sidebar-scroll")).toHaveCSS("overflow-y", "auto");
 
-  await page.getByRole("row", { name: /#50 Explain completed work/ }).click();
+  await page.getByRole("row", { name: /Explain completed work.*#50/ }).click();
+  await page.getByRole("button", { name: "Open full issue" }).click();
   await expect(page).toHaveURL(/#\/repo\/self\/issue\/50$/);
   await expect(page.locator(".issue-hd .chip", { hasText: "done" })).toHaveCount(1);
   await expect(page.locator(".issue-hd .chip", { hasText: "resolving" })).toHaveCount(0);
@@ -207,13 +209,14 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await expect(page.getByText(/comment issue #50/)).toBeVisible();
 
   await page.getByRole("tab", { name: "Overview" }).click();
-  await expect(page.getByRole("row", { name: /2026-07-29.*first observed.*3.*1.*\+2/ })).toBeVisible();
+  await expect(page.getByRole("row", { name: /2026-07-29.*3.*1.*\+2/ })).toBeVisible();
   await page.getByRole("tab", { name: /Issues/ }).click();
   await expect(page.getByRole("tab", { name: /Done/ })).toHaveAttribute("aria-selected", "true");
 
   await page.getByRole("button", { name: "Verification ledger" }).click();
   await expect(page.getByText("Verification ledger", { selector: ".section-title span" })).toBeVisible();
   await expect(page.getByRole("tab", { name: "Verification" })).toHaveCount(0);
+  await expect(page.getByRole("tab", { name: "Overview" })).toHaveCount(0);
 });
 
 test("shows a skeleton before the deployment request resolves", async ({ page }) => {
@@ -229,10 +232,11 @@ test("serves a validated operator workflow through FastAPI and the production bu
   await page.goto("http://127.0.0.1:4174/#/repo/self/issues/done");
   await page.getByRole("tab", { name: "Overview" }).click();
   await expect(
-    page.getByRole("row", { name: /2026-07-29.*first observed.*3.*1.*\+2/ }),
+    page.getByRole("row", { name: /2026-07-29.*3.*1.*\+2/ }),
   ).toBeVisible();
   await page.getByRole("tab", { name: /Issues/ }).click();
-  await page.getByRole("row", { name: /#50 Explain completed work/ }).click();
+  await page.getByRole("row", { name: /Explain completed work.*#50/ }).click();
+  await page.getByRole("button", { name: "Open full issue" }).click();
   await expect(page.getByRole("link", { name: /PR #75/ })).toHaveAttribute(
     "href",
     "https://github.com/openai/autonomous-issue-agent/pull/75",
@@ -240,7 +244,7 @@ test("serves a validated operator workflow through FastAPI and the production bu
   await page.getByText("All events for this issue").click();
   await expect(page.getByText("by steward")).toBeVisible();
   await page.screenshot({
-    path: "../evidence/dashboard-issue-runs.png",
+    path: "../evidence/dashboard-issue-tasks.png",
     fullPage: true,
   });
 });

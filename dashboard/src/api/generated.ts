@@ -225,6 +225,8 @@ export interface components {
         BacklogCard: {
             /** Age Days */
             age_days: number | null;
+            /** Body */
+            body: string | null;
             /** Comments */
             comments: number | null;
             /** Issue */
@@ -233,6 +235,8 @@ export interface components {
             labels: string[];
             /** Recurrence */
             recurrence: boolean;
+            /** Recurrence Count */
+            recurrence_count: number;
             /** Title */
             title: string | null;
             /** Url */
@@ -935,7 +939,9 @@ export interface operations {
     };
     api_overview_api_repos__name__overview_get: {
         parameters: {
-            query?: never;
+            query?: {
+                timezone?: string | null;
+            };
             header?: never;
             path: {
                 name: string;

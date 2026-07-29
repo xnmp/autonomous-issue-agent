@@ -216,6 +216,38 @@ def test_router_model_is_not_reported_as_an_issue_execution_model():
     assert row.models == ("claude-sonnet-5",)
 
 
+def test_models_include_live_and_start_only_reviewer_models():
+    events = [
+        start(kind="RESOLVE", model="gpt-5.6-terra", dispatch="resolve"),
+        run(kind="RESOLVE", model="", dispatch="resolve"),
+        start(
+            role="review",
+            kind="REVIEW",
+            number=90,
+            issue=7,
+            model="claude-opus-4-1",
+            dispatch="review",
+        ),
+        run(
+            role="review",
+            kind="REVIEW",
+            number=90,
+            issue=7,
+            model="",
+            dispatch="review",
+        ),
+    ]
+
+    row = dash.build_deployment(
+        "demo",
+        "o/r",
+        (("fix", "/j", "/l", events),),
+        now_fn=lambda: NOW,
+    ).issues[0]
+
+    assert row.models == ("gpt-5.6-terra", "claude-opus-4-1")
+
+
 def test_feed_role_is_attached_to_open_shaped_action_events():
     events = [action("comment issue #7: progress")]
 

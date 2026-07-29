@@ -185,6 +185,32 @@ def test_detailed_steps_keep_every_retry_and_carry_the_drill_down_fields():
     assert steps[1]["has_transcript"] is False
 
 
+def test_detailed_step_recovers_model_from_its_matching_start():
+    start = {
+        "ts": ts(hours=3),
+        "event": "agent_run_start",
+        "role": "review",
+        "kind": "REVIEW",
+        "number": 12,
+        "issue": 7,
+        "dispatch": "review-1",
+        "model": "claude-opus-4-1",
+    }
+    settled = {
+        "ts": ts(hours=2),
+        "event": "agent_run",
+        "role": "review",
+        "kind": "REVIEW",
+        "number": 12,
+        "issue": 7,
+        "dispatch": "review-1",
+        "status": "APPROVE",
+        "exit_reason": "ok",
+    }
+
+    assert snapshots.detailed_steps(row_for([start, settled], 7))[0]["model"] == "claude-opus-4-1"
+
+
 def test_a_leg_that_exited_for_any_reason_but_ok_reads_as_failed():
     leg = dash.Leg(None, "fix", "RESOLVE", 1, 1, "m", "", "budget_exhausted", 0.0, 0.0, False, "")
     assert snapshots.leg_state(leg) == "failed"
@@ -296,11 +322,23 @@ def test_backlog_excludes_any_issue_the_harness_lifecycle_already_owns():
 
 def test_backlog_card_ages_the_issue_and_marks_recurrences():
     card = snapshots.backlog_card(
-        {"number": 3, "title": "t", "url": "u", "createdAt": ts(days=12),
+        {"number": 3, "title": "t", "url": "u", "body": "context", "createdAt": ts(days=12),
          "labels": [{"name": "recurrence"}], "comments": 4},
         NOW,
     )
     assert (card["age_days"], card["recurrence"], card["comments"]) == (12, True, 4)
+    assert card["body"] == "context" and card["recurrence_count"] == 1
+
+
+def test_backlog_card_uses_journal_recurrence_count_when_available():
+    recurrence = {"ts": ts(hours=1), "event": "recurrence", "issue": 3}
+    row = row_for([recurrence, {**recurrence, "ts": ts(hours=2)}], 3)
+    card = snapshots.backlog_card(
+        {"number": 3, "labels": [{"name": "recurrence"}]},
+        NOW,
+        row,
+    )
+    assert card["recurrence_count"] == 2
 
 
 def test_backlog_card_survives_a_missing_created_at_and_list_shaped_comments():
@@ -309,7 +347,7 @@ def test_backlog_card_survives_a_missing_created_at_and_list_shaped_comments():
 
 
 # ── overview ──────────────────────────────────────────────────────────────────
-def test_health_trend_groups_target_issue_lifecycle_and_recurrence_by_utc_day():
+def test_health_trend_groups_target_issue_lifecycle_and_recurrence_by_native_day():
     issues = [
         {"number": 1, "createdAt": "2026-07-28T23:30:00-02:00", "closedAt": None},
         {"number": 2, "createdAt": "2026-07-29T01:00:00Z", "closedAt": "2026-07-30T04:00:00Z"},
@@ -322,7 +360,10 @@ def test_health_trend_groups_target_issue_lifecycle_and_recurrence_by_utc_day():
     ]
 
     assert snapshots.health_trend(
-        issues, recurrences, first_observed_day="2026-07-29"
+        issues,
+        recurrences,
+        first_observed_day="2026-07-29",
+        local_tz=timezone.utc,
     ) == [
         {"day": "2026-07-29", "opened": 2, "closed": 0, "net_open": 2,
          "recurrences": 0, "first_observation": True},
@@ -335,6 +376,24 @@ def test_health_trend_groups_target_issue_lifecycle_and_recurrence_by_utc_day():
 
 def test_health_trend_is_empty_without_issue_activity_or_recurrence():
     assert snapshots.health_trend([], [], first_observed_day="2026-07-29") == []
+
+
+def test_health_trend_uses_the_native_timezone_day_boundary():
+    local = timezone(timedelta(hours=10))
+    rows = snapshots.health_trend(
+        [{"createdAt": "2026-07-29T16:00:00Z", "closedAt": None}],
+        [],
+        first_observed_day="2026-07-30",
+        local_tz=local,
+    )
+    assert rows == [{
+        "day": "2026-07-30",
+        "opened": 1,
+        "closed": 0,
+        "net_open": 1,
+        "recurrences": 0,
+        "first_observation": True,
+    }]
 
 
 def test_overview_projects_lifecycle_recurrence_and_first_observed_day(monkeypatch):

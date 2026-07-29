@@ -105,7 +105,7 @@ export default function App() {
   /* --------------------------------------------------------- tab strip */
 
   const tabs: TabDef[] = [];
-  if (selectedRepo) {
+  if (selectedRepo && route.view !== "verification") {
     const repo = selectedRepo;
     tabs.push({
       key: "overview",
@@ -180,7 +180,11 @@ export default function App() {
       />
       <main className="main">
         <div className="mainbar">
-          <TabStrip tabs={tabs} />
+          {route.view === "verification" ? (
+            <span className="global-view-title">Verification ledger</span>
+          ) : (
+            <TabStrip tabs={tabs} />
+          )}
           <span className="spacer" />
           <RepoCrumb route={route} />
         </div>
@@ -229,7 +233,7 @@ function Body({
         onOpenIssue={onOpenIssue}
       />
     );
-  if (selectedRepo) return <OverviewTab repo={selectedRepo} />;
+  if (selectedRepo) return <OverviewTab repo={selectedRepo} onOpenIssues={onSetSub} />;
   return (
     <div className="tabbody">
       <EmptyState>

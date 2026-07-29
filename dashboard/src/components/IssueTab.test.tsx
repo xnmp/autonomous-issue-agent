@@ -35,8 +35,8 @@ describe("IssueTab", () => {
     expect(pr).toHaveAttribute("href", "https://github.com/o/r/pull/75");
     expect(screen.queryByText(/issue on GitHub/i)).not.toBeInTheDocument();
     expect(screen.getAllByText("done")).toHaveLength(1);
-    expect(screen.getByText("Runs", { selector: ".section-title span" })).toBeVisible();
+    expect(screen.getByText("Tasks", { selector: ".section-title span" })).toBeVisible();
     expect(screen.queryByText(/one row per leg/i)).not.toBeInTheDocument();
-    expect(screen.getByText("no runs recorded for this issue yet")).toBeVisible();
+    expect(screen.getByText("no tasks recorded for this issue yet")).toBeVisible();
   });
 });

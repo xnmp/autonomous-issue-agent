@@ -168,7 +168,8 @@ run family:
 Repair family = FIX_CI + ADDRESS_REVIEW + REBASE; steward = TRIAGE +
 STEWARD_DRIVE + JIRA_SYNC; review = REVIEW + RE_REVIEW; resolve = the rest.
 
-`health_trend` is advisory per UTC day: GitHub issue `createdAt`/`closedAt`
+`health_trend` is advisory per browser-native local day: the SPA sends its IANA
+timezone on the overview request, then GitHub issue `createdAt`/`closedAt`
 provide opened/closed counts for the selected target repository, while journal
 `recurrence` events provide the recurrence count. `first_observation` identifies
 the selected deployment's first journalled day. Runtime and review-mode history
@@ -208,7 +209,9 @@ One call returns all four buckets (the UI splits sub-tabs client-side):
 
 `steps` = the issue's settled legs in ts order collapsed by kind (latest state
 per kind wins) plus any running leg last. Title/urls come from gh; when gh is
-down they are null and the UI shows the number only.
+down they are null and the UI shows the number only. `models` reads both start
+and settlement receipts, excluding the routing classifier, so configured models
+remain visible while a task is live and when an older settlement omitted them.
 
 `PendingCard` (gh: open issues labeled `ai-ready`, minus in-flight ones):
 
@@ -224,8 +227,8 @@ down they are null and the UI shows the number only.
 ai-blocked/needs-human-review):
 
 ```json
-{ "issue": 3, "title": "…", "url": "…", "labels": [...],
-  "recurrence": false,      // has `recurrence` label
+{ "issue": 3, "title": "…", "url": "…", "body": "…", "labels": [...],
+  "recurrence": false, "recurrence_count": 0,
   "age_days": 12, "comments": 4 }
 ```
 
@@ -251,10 +254,10 @@ ai-blocked/needs-human-review):
   "warnings": [] }
 ```
 
-Runs here are NOT collapsed: each row represents one agent invocation
+Tasks here are NOT collapsed: each row represents one agent invocation
 (`agent_run` or an unsettled `agent_run_start`) in timestamp order. The wire
 contract retains the established `steps` field for compatibility; the UI calls
-these rows “Runs”.
+these rows “Tasks”.
 
 ### GET /api/repos/{name}/issues/{n}/steps/{idx}/events
 
@@ -319,7 +322,8 @@ index.html). If dist is missing, `/` returns a plain-HTML instruction page.
 - Semantic color mapping (keep consistent everywhere): green = ok/done/approve,
   yellow = running/pending/attention, red = failed/escalated/blocked,
   blue = informational/queued, magenta = steward/meta, cyan = links/models.
-  The self-repo sidebar entry gets a magenta left border + ⟳ "self" chip.
+  The self-repo sidebar entry gets a magenta left border + prominent
+  `issue-agent` chip.
 - Every list renders an explicit empty state ("no issues in flight") — never a
   blank pane. Every gh-degraded view shows the "GitHub data unavailable" chip.
 - Status badges for steps: kind abbreviation (RES, REV, CI, ADR, REB, TRI) in

@@ -120,7 +120,9 @@ export const api = {
 
   overview: (name: string, s?: AbortSignal) =>
     getJson<OverviewPayload>(
-      `/api/repos/${enc(name)}/overview`,
+      `/api/repos/${enc(name)}/overview?timezone=${enc(
+        Intl.DateTimeFormat().resolvedOptions().timeZone,
+      )}`,
       schemas.OverviewPayload,
       s,
     ),

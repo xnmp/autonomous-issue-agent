@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ...adapters.dashweb import actions, costchart, ghdata, system, usage, verification
 from ...adapters.journal import default_ledger_path
@@ -97,9 +98,10 @@ class Backend:
             verification.default_path(self.harness_root)
         )
 
-    def overview(self, name: str) -> dict:
+    def overview(self, name: str, timezone_name: str | None = None) -> dict:
         live, scan_ok = system.scan_proc_daemons()
         snapshot = self.snapshot(name)
+        local_tz = _local_timezone(timezone_name)
         issues, issue_error = self.gh.issues(snapshot.repo)
         recurrence_events = [
             event
@@ -117,7 +119,8 @@ class Backend:
         payload["health_trend"] = snapshots.health_trend(
             issues,
             recurrence_events,
-            first_observed_day=snapshots.first_observed_day(snapshot),
+            first_observed_day=snapshots.first_observed_day(snapshot, local_tz),
+            local_tz=local_tz,
         )
         if issue_error:
             payload["warnings"].append(issue_error)
@@ -168,7 +171,9 @@ class Backend:
             if "ai-ready" in labels and number not in in_flight_numbers:
                 pending.append(snapshots.pending_card(issue, row_by_issue.get(number)))
             elif snapshots.is_backlog(issue):
-                backlog.append(snapshots.backlog_card(issue, now))
+                backlog.append(
+                    snapshots.backlog_card(issue, now, row_by_issue.get(number))
+                )
         return {
             "in_flight": [card(row) for row in rows if not row.done],
             "pending": pending,
@@ -228,3 +233,12 @@ class Backend:
         return actions.run_label_commands(
             actions.priority_commands(repo, number, priority)
         )
+
+
+def _local_timezone(name: str | None):
+    if name and len(name) <= 100:
+        try:
+            return ZoneInfo(name)
+        except (ValueError, ZoneInfoNotFoundError):
+            pass
+    return datetime.now().astimezone().tzinfo or timezone.utc
