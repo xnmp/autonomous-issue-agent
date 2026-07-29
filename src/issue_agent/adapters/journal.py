@@ -370,13 +370,10 @@ class JournalingRuntime:
                 number=ctx.number,
                 issue=ctx.issue,
                 dispatch=ctx.dispatch_id,
-                # The model the RUN reports beats the one the task asked for:
-                # an unpinned task carries None and the runtime supplied its own
-                # default, so `task.model` recorded nothing for a leg that
-                # certainly ran on something — and "split cost by routed model
-                # tier" had no field to split on (#43). A runtime that reports
-                # nothing falls back to the task, as before.
-                model=(getattr(result, "model", "") or task.model or ""),
+                # A configured task model is the operator-selected journal
+                # attribution and must match the start receipt. Only an unpinned
+                # task needs the runtime's resolved default to identify its leg.
+                model=(task.model or getattr(result, "model", "") or ""),
                 duration_s=round(duration_s, 1),
                 cost_usd=cost,
                 cost_estimated_usd=(estimated or None),
