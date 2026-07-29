@@ -36,6 +36,7 @@ from issue_agent.adapters.codex_runner import (
 )
 from issue_agent.app.config import from_env
 from issue_agent.app.planners.schemas import AUTHOR_SCHEMA, FIX_SCHEMA, IMPLEMENT_SCHEMA
+from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
 from issue_agent.domain.outcome import AgentResult, ExitReason, Outcome, classify_outcome, infra_death
 from issue_agent.domain.agent_task import AgentTask
 from issue_agent.domain.effort import Effort
@@ -1362,18 +1363,17 @@ def test_the_budget_warning_names_a_zeroed_price_table_as_the_reason():
         fix_budget_usd=20.0, max_runtime=3600.0, enforced=True, priced=False
     )
     assert w is not None and "NOT ENFORCED" in w
-    assert "every run prices at $0.00" in w
+    assert "cannot measure a reliable dollar ceiling" in w
 
 
 def test_the_budget_warning_treats_half_pricing_as_unmeasurable():
     """A dollar ceiling is only honest when both token classes are priced.
     Input-only pricing leaves output growth unbounded, and vice versa."""
-    for priced in (False,):
-        w = codex_budget_not_enforced_warning(
-            fix_budget_usd=20.0, max_runtime=3600.0,
-            enforced=True, priced=priced,
-        )
-        assert w is not None and "NOT ENFORCED" in w
+    w = codex_budget_not_enforced_warning(
+        fix_budget_usd=20.0, max_runtime=3600.0,
+        enforced=True, priced=False,
+    )
+    assert w is not None and "NOT ENFORCED" in w
 
 
 def test_the_budget_warning_goes_silent_once_the_budget_is_really_enforced():
@@ -1458,6 +1458,9 @@ def _write_rollout(codex_home, sid, *, input_tokens, output_tokens):
     day.mkdir(parents=True, exist_ok=True)
     (day / f"rollout-2026-07-28T00-00-00-{sid}.jsonl").write_text(
         json.dumps({"payload": {"type": "token_count", "info": {
+            "last_token_usage": {
+                "input_tokens": input_tokens, "output_tokens": output_tokens,
+            },
             "total_token_usage": {
                 "input_tokens": input_tokens, "cached_input_tokens": 0,
                 "cache_write_input_tokens": 0, "output_tokens": output_tokens,
@@ -1540,6 +1543,33 @@ def test_the_killed_run_still_ledgers_what_it_spent(tmp_path, monkeypatch):
     assert r.session_id == _OVERSPENT_SID
     assert r.num_turns == 1
     assert read_rollout_turns(_OVERSPENT_SID) == 1
+
+
+def test_budget_kill_reaches_the_settled_agent_run_receipt(tmp_path, monkeypatch):
+    """The journal is the operator seam: the raw runner result is insufficient
+    if the settled receipt drops the measured spend or budget classification."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _write_rollout(
+        tmp_path, _OVERSPENT_SID, input_tokens=5_000_000, output_tokens=100_000
+    )
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    runtime = JournalingRuntime(
+        _budget_runner(tempfile.mkdtemp(), _OVERSPENT_SID),
+        journal,
+        repo="o/r",
+        role="fix",
+    )
+    runtime.set_context("fix", "RESOLVE", 29, 29)
+
+    asyncio.run(runtime.run(AgentTask(prompt="x", max_budget_usd=20.0)))
+
+    event = [e for e in read_events(journal.path) if e["event"] == "agent_run"][0]
+    assert event["cost_usd"] == pytest.approx(28.0)
+    assert event["usage"]["input_tokens"] == 5_000_000
+    assert event["exit_reason"] == "budget_exhausted"
+    assert event["envelope_subtype"] == "error_max_budget_usd"
+    assert event["turns"] == 1
+    assert event["duration_s"] > 0
 
 
 def test_a_run_under_the_budget_is_left_alone(tmp_path, monkeypatch):

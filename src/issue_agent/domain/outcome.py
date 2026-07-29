@@ -202,6 +202,9 @@ class AgentResult:
     # so capture them verbatim now to feed the cost ledger rather than re-deriving
     # them later from a log.
     usage: dict | None = None
+    # Runtime-reported model turns for this leg. None means the runtime did not
+    # expose a count; zero is a valid count for a run stopped before generation.
+    num_turns: int | None = None
     # The stream-summed accumulator for the SAME run (merge_usage over every
     # stream message). NOT the same quantity as `usage`: per-message blocks
     # re-report cache counters, so the stream sum runs ~3.5x the ResultMessage

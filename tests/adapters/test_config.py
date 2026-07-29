@@ -936,7 +936,7 @@ def test_describe_says_not_enforced_when_the_price_table_is_zeroed():
         "CODEX_COST_PER_MTOK_IN": "0", "CODEX_COST_PER_MTOK_OUT": "0",
     }).describe()
     assert "NOT ENFORCED on codex" in d
-    assert "prices at $0.00" in d
+    assert "dollar threshold is not measurable" in d
 
 
 @pytest.mark.parametrize(
@@ -955,6 +955,15 @@ def test_describe_says_not_enforced_when_either_token_class_is_unpriced(
     }).describe()
     assert "NOT ENFORCED on codex" in d
     assert "both input and output prices" in d
+
+
+def test_describe_says_not_enforced_when_a_model_override_is_half_priced():
+    d = from_env({
+        "REPO": "o/r", "FIXER_RUNTIME": "codex", "MAX_BUDGET_USD": "20",
+        "CODEX_COST_PER_MTOK": "gpt-5.6-terra=2/0",
+    }).describe()
+    assert "NOT ENFORCED on codex" in d
+    assert "dollar threshold is not measurable" in d
 
 
 def test_describe_says_nothing_bounds_a_codex_run_without_a_wall_cap():

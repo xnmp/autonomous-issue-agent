@@ -146,6 +146,18 @@ class CodexRuntimeConfig:
     # remain the fallback for any model not named here. See
     # `HarnessConfig.codex_cost_per_mtok`.
     cost_per_mtok: tuple[tuple[str, float, float], ...] = ()
+    # Kill a run once its priced spend crosses AgentTask.max_budget_usd (#29).
+    # See `HarnessConfig.codex_enforce_budget`.
+    enforce_budget: bool = True
+
+    @property
+    def budget_priceable(self) -> bool:
+        """Whether every configured model path has complete dollar pricing."""
+        return (
+            self.cost_per_mtok_in > 0
+            and self.cost_per_mtok_out > 0
+            and all(rate_in > 0 and rate_out > 0 for _, rate_in, rate_out in self.cost_per_mtok)
+        )
 
 
 @dataclass(frozen=True)
@@ -413,6 +425,20 @@ class HarnessConfig:
     # when unset — falls back to the scalars above, so an existing deployment
     # prices exactly as it did before.
     codex_cost_per_mtok: tuple[tuple[str, float, float], ...] = ()
+    # #29: whether MAX_BUDGET_USD actually BOUNDS a codex run. codex has no
+    # per-session budget flag, so the harness enforces it by sampling the
+    # session's streamed token counters and killing the run once this leg's
+    # priced spend crosses the budget (ExitReason.BUDGET_EXHAUSTED, the same
+    # exit the SDK's own `error_max_budget_usd` maps to). On by default: the
+    # alternative shipped a startup line asserting a $20 ceiling while a resolve
+    # ran to $28.74 and exited `ok`.
+    #
+    # Set CODEX_ENFORCE_BUDGET=0 to go back to wall-cap-only bounding — worth it
+    # if your rates are synthetic enough that a threshold kill would cut real
+    # work short. Doing so is REPORTED (describe() and the startup warning both
+    # say NOT ENFORCED and why), which is the half of #29 that was broken:
+    # the operator has to be able to tell which regime they are in.
+    codex_enforce_budget: bool = True
     # ── spend circuit breakers ────────────────────────────────────────────────
     # Per-agent budgets (MAX_BUDGET_USD et al) bound ONE session; nothing bounded
     # the aggregate, so a leg that retries forever spent without limit while every
@@ -548,6 +574,7 @@ class HarnessConfig:
             cost_per_mtok_in=self.codex_cost_per_mtok_in,
             cost_per_mtok_out=self.codex_cost_per_mtok_out,
             cost_per_mtok=self.codex_cost_per_mtok,
+            enforce_budget=self.codex_enforce_budget,
         )
 
     def validation_errors(self) -> tuple[str, ...]:
@@ -652,19 +679,33 @@ class HarnessConfig:
             return m or "(sdk default)"
 
         # #29: MAX_BUDGET_USD is the SDK's per-session bound and codex has no
-        # analogue, so on that runtime this number bounds NOTHING — a keifu
-        # resolve ran to $28.74 against a configured $20 and exited `ok`. The
-        # figure still belongs in the summary (it is the configured value, and
-        # a claude/glm daemon does enforce it), but printing it bare on codex
-        # is the startup log asserting a guarantee the runtime cannot make.
+        # analogue FLAG, so this number used to bound nothing on that runtime —
+        # a keifu resolve ran to $28.74 against a configured $20 and exited
+        # `ok`. The harness now enforces it itself (CodexRunner.enforce_budget:
+        # sample the streamed counters, kill on crossing), so the honest report
+        # depends on whether that check can actually fire. Printing one fixed
+        # verdict either way is the startup log asserting something it hasn't
+        # checked — which is the bug this line is here to not repeat.
         fix_budget = f"fix_budget=${self.fix_budget_usd:.2f}"
-        if self.fixer_runtime == "codex":
-            bound = (
-                f"wall cap {self.agent_max_runtime:.0f}s is the only per-run bound"
-                if self.agent_max_runtime > 0
-                else "NOTHING bounds a run — AGENT_MAX_RUNTIME_SECONDS is unset"
-            )
-            fix_budget += f" (NOT ENFORCED on codex — {bound})"
+        if self.fixer_runtime == "codex" and self.fix_budget_usd > 0:
+            # Every fallback and per-model rate needs both token classes priced.
+            # One zero leaves a routed model able to spend outside the meter.
+            priced = self.codex_runtime.budget_priceable
+            if self.codex_enforce_budget and priced:
+                fix_budget += " (enforced on codex — the run is killed once its streamed usage crosses it)"
+            else:
+                why = (
+                    "CODEX_ENFORCE_BUDGET=0"
+                    if not self.codex_enforce_budget
+                    else "both input and output prices must be set, so the "
+                    "dollar threshold is not measurable"
+                )
+                bound = (
+                    f"wall cap {self.agent_max_runtime:.0f}s is the only per-run bound"
+                    if self.agent_max_runtime > 0
+                    else "NOTHING bounds a run — AGENT_MAX_RUNTIME_SECONDS is unset"
+                )
+                fix_budget += f" (NOT ENFORCED on codex, {why} — {bound})"
 
         # Push mode changes what the interval MEANS (notice latency → backstop
         # cadence), so it prints as a different fact rather than a smaller poll.
@@ -1227,6 +1268,9 @@ def from_env(env: dict | None = None) -> HarnessConfig:
             e, "CODEX_COST_PER_MTOK_OUT", _dc_default("codex_cost_per_mtok_out"), errors
         ),
         codex_cost_per_mtok=_coerce_rate_table(e, "CODEX_COST_PER_MTOK", errors),
+        codex_enforce_budget=_b(
+            e, "CODEX_ENFORCE_BUDGET", _dc_default("codex_enforce_budget"), errors
+        ),
         issue_spend_cap_usd=_coerce_float(
             e, "ISSUE_SPEND_CAP_USD", _dc_default("issue_spend_cap_usd"), errors
         ),

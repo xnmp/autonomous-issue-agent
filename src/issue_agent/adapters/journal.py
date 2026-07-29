@@ -362,6 +362,7 @@ class JournalingRuntime:
                 session_id=result.session_id,
                 usage=usage,
                 usage_stream=stream,
+                turns=getattr(result, "num_turns", None),
                 **extra,
             )
             # Only costed runs reach the ledger: a $0.00 line is pure noise in the
