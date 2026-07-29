@@ -51,6 +51,8 @@ from issue_agent.app.roles import (
     _duplicate_pr_reporter,
     _fix_state,
     _hold_reporter,
+    _inject_predicted_paths,
+    _prediction_outcome_reporter,
     _recurrence_reporter,
     _review_state,
 )
@@ -891,6 +893,39 @@ def test_releasing_a_hold_journals_nothing_extra(tmp_path):
     report(_held_world())           # same (issue, reason, blocker) again
 
     assert len(_holds_in(journal)) == 1
+
+
+def test_router_predictions_are_injected_before_the_overlap_decision(tmp_path):
+    store = Store(str(tmp_path))
+    store.save_predicted_paths(522, frozenset({"backend/app/x.py"}))
+
+    enriched = _inject_predicted_paths(store, _held_world())
+
+    assert enriched.issues[0].predicted_paths == frozenset({"backend/app/x.py"})
+
+
+def test_terminal_pr_journals_router_prediction_against_actual_changed_files(tmp_path):
+    store = Store(str(tmp_path))
+    store.save_predicted_paths(522, frozenset({"backend/app/x.py", "wrong.py"}))
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    terminal = WorldState(
+        issues=(IssueView(522, labels=frozenset({Label.AI_PR_OPEN})),),
+        prs=(PRView(123, state="MERGED", closing_issue=522,
+                    changed_files=frozenset({"backend/app/x.py", "actual.py"})),),
+    )
+
+    report = _prediction_outcome_reporter(journal, "o/r", store, lambda _m: None)
+    report(terminal)
+    report(terminal)
+
+    events = [e for e in read_events(journal.path) if e.get("event") == "path_prediction"]
+    assert events == [{
+        "ts": events[0]["ts"], "event": "path_prediction", "issue": 522,
+        "pr": 123, "predicted_paths": ["backend/app/x.py", "wrong.py"],
+        "changed_files": ["actual.py", "backend/app/x.py"],
+        "matched_paths": ["backend/app/x.py"],
+        "block_key": "path-prediction:o/r:522:123",
+    }]
 
 
 def test_a_second_blocker_is_its_own_hold(tmp_path):
