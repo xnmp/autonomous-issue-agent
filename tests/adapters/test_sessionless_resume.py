@@ -2,12 +2,13 @@
 
 import asyncio
 
-from builders import Comment, issue, world
+from builders import Comment, issue, pr, world
 from test_convergence import Scenario, simulate
-from test_dispatch import FakeGateway, FakeRunner, FakeStore
+from test_dispatch import FakeGateway, FakeRunner, FakeStore, SeqRunner
 from test_fix_workflow import _workflow
 
 from issue_agent.domain.actions import AgentKind, RunAgent
+from issue_agent.app.planners.tasks import FixTaskConfig
 from issue_agent.domain.fix import FixConfig, FixState, decide_fix
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.world import Comment as WorldComment
@@ -213,3 +214,100 @@ def test_split_implementer_reply_stays_in_implementer_phase():
     assert "Use PostgreSQL." in task.prompt
     assert "HARD RULE: do NOT modify" in task.prompt
     assert store.get_phase(5) == "authored"
+
+
+def test_split_reply_recovery_does_not_rerun_overlap_routing():
+    iss = IssueView(
+        5,
+        title="Choose storage",
+        body="The service must persist widgets.",
+        comments=(
+            WorldComment("fix-bot", "Which backend?", "t1"),
+            WorldComment("alice", "Use PostgreSQL.", "t2"),
+        ),
+    )
+    gateway = FakeGateway(issues={5: iss}, pr_for_issue={})
+    gateway.build_world = lambda: world(
+        prs=[
+            pr(
+                100,
+                changed_files=frozenset({"src/action.rs"}),
+            )
+        ]
+    )
+    runner = FakeRunner(
+        AgentResult(
+            is_error=False,
+            status="blocked",
+            session_id="author-session",
+            structured={
+                "tier": "standard",
+                "predicted_paths": ["src/action.rs"],
+            },
+        )
+    )
+
+    asyncio.run(
+        _workflow(
+            gateway,
+            FakeStore(),
+            runner,
+            fix_bot="fix-bot",
+            author_tests_split=True,
+            fix=FixTaskConfig("o/r", agent_md="AM"),
+        ).resume(5)
+    )
+
+    task = runner.tasks[0]
+    assert "TEST/INTERFACE AUTHOR" in task.prompt
+    assert "Use PostgreSQL." in task.prompt
+    assert not any(call[-1] == "ai-ready" for call in gateway.calls)
+
+
+def test_split_reply_reaches_contract_adjudicator():
+    iss = IssueView(
+        5,
+        title="Choose storage",
+        body="The service must persist widgets.",
+        comments=(
+            WorldComment("fix-bot", "Which backend?", "t1"),
+            WorldComment("alice", "Use PostgreSQL.", "t2"),
+        ),
+    )
+    gateway = FakeGateway(issues={5: iss}, pr_for_issue={})
+    store = FakeStore()
+    store.set_phase(5, "authored")
+    runner = SeqRunner(
+        [
+            AgentResult(
+                is_error=False,
+                status="contract_change",
+                needs="The reply changes the contract.",
+                session_id="implementer-session",
+            ),
+            AgentResult(
+                is_error=False,
+                session_id="adjudicator-session",
+                structured={"verdict": "upheld", "rationale": "The reply is clear."},
+            ),
+            AgentResult(
+                is_error=False,
+                status="blocked",
+                session_id="second-implementer-session",
+            ),
+        ]
+    )
+
+    asyncio.run(
+        _workflow(
+            gateway,
+            store,
+            runner,
+            fix_bot="fix-bot",
+            author_tests_split=True,
+        ).resume(5)
+    )
+
+    assert "adjudicating a contract dispute" in runner.tasks[1].prompt
+    assert "Use PostgreSQL." in runner.tasks[1].prompt
+    assert "Use PostgreSQL." in runner.tasks[2].prompt
