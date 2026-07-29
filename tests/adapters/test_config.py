@@ -30,6 +30,17 @@ def test_reviewer_runtime_accepts_an_explicit_claude_diversity_posture():
     assert cfg.review_model == "opus"
 
 
+@pytest.mark.parametrize("mode", ["multi", "delegated"])
+def test_codex_reviewer_rejects_modes_it_cannot_execute(mode):
+    cfg = from_env({
+        "REPO": "o/r", "FIX_BOT": "fix-bot", "REVIEWER_RUNTIME": "codex",
+        "REVIEW_MODE": mode,
+    })
+
+    with pytest.raises(ValueError, match="REVIEW_MODE=single"):
+        cfg.validate()
+
+
 def test_review_mode_delegated_and_scout_override():
     c = from_env({"REPO": "x", "REVIEW_MODE": "delegated", "REVIEW_SCOUT_MODEL": "haiku"})
     assert c.review_mode is ReviewMode.DELEGATED

@@ -1549,6 +1549,7 @@ def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
     assert isinstance(runtime, CapturingCodexRunner)
     assert seen["default_model"] == "gpt-5.6-terra"
     assert seen["enforce_budget"] is True
+    assert seen["sandbox"] == "read-only"
 
 
 def test_codex_reviewer_names_its_unpriced_budget_warning(tmp_path, monkeypatch, capsys):
