@@ -189,15 +189,12 @@ class Daemon:
             previous = last
             last = cur
             last_active = cur_active
-            # Wall time advances while the machine is suspended; monotonic
-            # active time on the deployment platform does not. Comparing both
-            # prevents an ordinary long paid leg from being mislabeled as a
-            # suspension merely because run_forever cannot heartbeat mid-tick.
+            # The wall threshold is the existing late-heartbeat detector and
+            # remains the reconciliation trigger. Wall minus monotonic active
+            # time estimates only the suspension share, so a long active block
+            # is inspected without being charged as suspended runtime.
             suspended = max(0, round(elapsed - active_elapsed))
-            if (
-                elapsed >= self.poll_seconds * 4
-                and suspended >= self.poll_seconds
-            ):
+            if elapsed >= self.poll_seconds * 4:
                 stall_started = datetime.fromtimestamp(
                     cur - suspended, tz=timezone.utc
                 )
@@ -207,6 +204,9 @@ class Daemon:
                     "— likely suspended/stalled; catching up"
                 )
                 if self.journal is not None:
+                    observed_from = datetime.fromtimestamp(
+                        previous, tz=timezone.utc
+                    )
                     self.journal.emit(
                         "stall",
                         started_at=stall_started.isoformat(),
@@ -215,16 +215,20 @@ class Daemon:
                         suspended_seconds=suspended,
                     )
                     path = getattr(self.journal, "path", "")
-                    if path:
+                    if path and suspended > 0:
                         for annotation in stalled_run_annotations(
-                            read_events_tail(path), stall_started, woke_at
+                            read_events_tail(path),
+                            observed_from,
+                            woke_at,
+                            suspended,
                         ):
                             self.journal.emit(
                                 "agent_run_stall",
                                 **annotation,
                                 stall_started_at=stall_started.isoformat(),
+                                observed_from=observed_from.isoformat(),
                                 woke_at=woke_at.isoformat(),
-                                suspended_seconds=suspended,
+                                detected_suspended_seconds=suspended,
                             )
                 self.executor.reconcile_recent_actions(
                     datetime.fromtimestamp(previous, tz=timezone.utc),

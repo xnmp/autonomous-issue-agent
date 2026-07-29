@@ -11,7 +11,7 @@ passes them here for projection into API payloads.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone, tzinfo
+from datetime import datetime, timedelta, timezone, tzinfo
 
 from ...domain import dashboard as dash
 
@@ -254,20 +254,40 @@ def _started(row: dash.IssueRow) -> datetime | None:
 
 
 def _suspended_seconds(row: dash.IssueRow) -> float:
-    """Unique suspension corrections attributed to this issue's agent legs."""
-    stalls: dict[str, float] = {}
+    """Suspension corrections, deduplicated across overlapping role detectors."""
+    intervals: list[tuple[datetime, datetime, float]] = []
     for event in row.events:
         if event.get("event") != "agent_run_stall":
             continue
-        key = str(event.get("stall_started_at") or "")
-        if not key:
+        started_at = dash.parse_ts(event.get("stall_started_at"))
+        if started_at is None:
             continue
         try:
             seconds = max(0.0, float(event.get("suspended_seconds") or 0))
         except (TypeError, ValueError):
             continue
-        stalls[key] = max(stalls.get(key, 0.0), seconds)
-    return sum(stalls.values())
+        if seconds > 0:
+            intervals.append(
+                (
+                    started_at,
+                    started_at + timedelta(seconds=seconds),
+                    seconds,
+                )
+            )
+    if not intervals:
+        return 0.0
+
+    ordered = sorted(intervals)
+    _, current_end, current_seconds = ordered[0]
+    total = 0.0
+    for started_at, ended_at, seconds in ordered[1:]:
+        if started_at <= current_end:
+            current_end = max(current_end, ended_at)
+            current_seconds = max(current_seconds, seconds)
+            continue
+        total += current_seconds
+        current_end, current_seconds = ended_at, seconds
+    return total + current_seconds
 
 
 def _hold_event(row: dash.IssueRow) -> dict:

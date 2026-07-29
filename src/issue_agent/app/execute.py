@@ -189,6 +189,17 @@ class Executor:
         if isinstance(action, CloseIssue):
             issue_closed = getattr(self.gateway, "is_issue_closed", None)
             return bool(issue_closed and issue_closed(action.number))
+        if isinstance(action, EscalateCiPending):
+            has_comment = getattr(self.gateway, "has_comment", None)
+            has_label = getattr(self.gateway, "has_label", None)
+            return bool(
+                has_comment
+                and has_label
+                and has_comment("pr", action.pr, action.body)
+                and has_label(
+                    "pr", action.pr, Label.NEEDS_HUMAN_REVIEW.value
+                )
+            )
         return False
 
     def _report_recovered_escalation(self, action: Action) -> None:
@@ -198,6 +209,16 @@ class Executor:
             and action.add is Label.NEEDS_HUMAN_REVIEW
         ):
             self._escalated(action)
+        elif isinstance(action, EscalateCiPending):
+            self._mark_ci_pending_escalated(action.pr, action.head)
+            self._escalated(
+                Relabel(
+                    Target.PR,
+                    action.pr,
+                    Label.AI_PR_OPEN,
+                    Label.NEEDS_HUMAN_REVIEW,
+                )
+            )
 
     def _apply_ci_escalation(
         self, action: EscalateCiPending, *, resume: bool
@@ -414,7 +435,6 @@ class Executor:
         path = getattr(self._journal, "path", "")
         if not path:
             return
-        seen: set[Action] = set()
         for event in read_events_tail(path):
             if event.get("event") != "action":
                 continue
@@ -431,14 +451,22 @@ class Executor:
                     error=str(exc),
                 )
                 continue
-            if action in seen:
-                continue
-            seen.add(action)
             desc = self._describe(action)
             try:
-                if self._already_applied(action):
-                    self._journal.emit("action_verified", desc=desc)
-                    continue
+                already_applied = self._already_applied(action)
+            except Exception:
+                # Route an unreadable verification probe through the durable
+                # executor too. Its second probe may recover; otherwise the
+                # existing #64 failure path journals and queues the action.
+                try:
+                    self.execute(action, replayed=True)
+                except Exception:
+                    pass
+                continue
+            if already_applied:
+                self._journal.emit("action_verified", desc=desc)
+                continue
+            try:
                 self.execute(action, replayed=True)
             except Exception:
                 # execute() already journalled the failure and persisted every

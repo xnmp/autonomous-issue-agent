@@ -100,40 +100,63 @@ def encode_lifecycle_action(action: Action) -> dict[str, object]:
     raise TypeError(f"action is not a durable lifecycle write: {action!r}")
 
 
+def _required_string(raw: dict, field: str) -> str:
+    value = raw.get(field)
+    if not isinstance(value, str):
+        raise TypeError(f"{field} must be a string")
+    return value
+
+
+def _required_number(raw: dict, field: str) -> int:
+    value = raw.get(field)
+    if type(value) is not int or value <= 0:
+        raise TypeError(f"{field} must be a positive integer")
+    return value
+
+
+def _optional_label(raw: dict, field: str) -> Label | None:
+    value = raw.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"{field} must be a string or null")
+    return Label(value)
+
+
 def decode_lifecycle_action(raw: object) -> Action:
     """Decode a journal/queue payload without guessing malformed legacy rows."""
     if not isinstance(raw, dict):
-        raise ValueError("pending lifecycle action must be an object")
+        raise ValueError("lifecycle action must be an object")
     kind = raw.get("type")
     try:
         if kind == "relabel":
-            remove = raw.get("remove")
-            add = raw.get("add")
             return Relabel(
-                Target[str(raw["target"])],
-                int(raw["number"]),
-                Label(str(remove)) if remove is not None else None,
-                Label(str(add)) if add is not None else None,
+                Target[_required_string(raw, "target")],
+                _required_number(raw, "number"),
+                _optional_label(raw, "remove"),
+                _optional_label(raw, "add"),
             )
         if kind == "comment":
             return PostComment(
-                Target[str(raw["target"])],
-                int(raw["number"]),
-                str(raw["body"]),
+                Target[_required_string(raw, "target")],
+                _required_number(raw, "number"),
+                _required_string(raw, "body"),
             )
         if kind == "close":
             return CloseIssue(
-                int(raw["number"]),
-                str(raw.get("reason") or "completed"),
-                str(raw.get("comment") or ""),
+                _required_number(raw, "number"),
+                _required_string(raw, "reason"),
+                _required_string(raw, "comment"),
             )
         if kind == "escalate_ci_pending":
             return EscalateCiPending(
-                int(raw["pr"]), str(raw["head"]), str(raw["body"])
+                _required_number(raw, "pr"),
+                _required_string(raw, "head"),
+                _required_string(raw, "body"),
             )
     except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(f"invalid pending lifecycle action: {raw!r}") from exc
-    raise ValueError(f"unknown pending lifecycle action type: {kind!r}")
+        raise ValueError(f"invalid lifecycle action: {raw!r}") from exc
+    raise ValueError(f"unknown lifecycle action type: {kind!r}")
 
 
 @dataclass(frozen=True)

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -641,9 +642,20 @@ def events_within(events, seconds: float, now_fn=_now) -> list[dict]:
 
 
 def stalled_run_annotations(
-    events: list[dict], started_at: datetime, woke_at: datetime
+    events: list[dict],
+    observed_from: datetime,
+    woke_at: datetime,
+    detected_suspended_seconds: float,
 ) -> list[dict]:
-    """Settled agent legs whose journal interval overlaps a suspension."""
+    """Settled agent legs whose wall clock contains detected suspension time.
+
+    The heartbeat only observes the total wall-vs-monotonic gap when control
+    returns to the loop, so ``woke_at - detected_suspended_seconds`` is not the
+    suspension's start when work continued after resume. Each agent leg already
+    records the same two clocks: journal timestamps are wall time while
+    ``duration_s`` is monotonic. Their difference attributes the gap without
+    guessing where inside the observed heartbeat interval it occurred.
+    """
     starts: dict[str, list[dict]] = {}
     for event in events:
         if event.get("event") != "agent_run_start":
@@ -674,9 +686,28 @@ def stalled_run_annotations(
         run_started_at = parse_ts(start.get("ts"))
         if (
             run_started_at is None
-            or run_started_at > woke_at
-            or finished_at < started_at
+            or run_started_at >= woke_at
+            or finished_at <= observed_from
         ):
+            continue
+        try:
+            active_seconds = float(event.get("duration_s"))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(active_seconds) or active_seconds < 0:
+            continue
+        wall_seconds = (finished_at - run_started_at).total_seconds()
+        # Journal stamps have one-second precision and duration_s is rounded to
+        # 0.1s. A healthy leg can therefore show a sub-second positive residue;
+        # it is timestamp quantisation, not a box suspension.
+        leg_suspended_seconds = wall_seconds - active_seconds
+        if leg_suspended_seconds <= 1.1:
+            continue
+        suspended_seconds = min(
+            max(0.0, detected_suspended_seconds),
+            round(leg_suspended_seconds),
+        )
+        if suspended_seconds <= 0:
             continue
         identity = (
             dispatch,
@@ -696,6 +727,7 @@ def stalled_run_annotations(
                 "dispatch": dispatch,
                 "run_started_at": start.get("ts"),
                 "run_finished_at": event.get("ts"),
+                "suspended_seconds": suspended_seconds,
             }
         )
     return annotations
