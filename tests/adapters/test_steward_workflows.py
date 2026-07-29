@@ -292,7 +292,7 @@ def test_grooming_flags_a_resolved_open_issue_once_and_never_closes_it(tmp_path)
 
 def test_grooming_stale_artifact_posts_a_rescope_comment_and_journals(tmp_path):
     journal = Journal(str(tmp_path / "journal.jsonl"))
-    gw = RecurrenceGateway({9: IssueView(9, title="Old flag", body="b", author="alice")})
+    gw = RecurrenceGateway({9: IssueView(9, title="Old flag", body="mentions src/removed.py", author="alice")})
     cfg = StewardWorkflowConfig(
         triage=TriageTaskConfig("steward-bot"), triage_cfg=TriageConfig("steward-bot"),
         groom=GroomTaskConfig("steward-bot"), log=lambda _m: None, repo="o/r", journal=journal,

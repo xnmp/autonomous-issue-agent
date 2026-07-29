@@ -133,11 +133,18 @@ class StewardWorkflow:
             resolved_by = None
         if stale_reference.strip() and self._groomed(issue, "stale", ref=stale_reference.strip()):
             stale_reference = ""
+        # The stale reference must be an exact substring of the issue's data as
+        # well as a result from the rg-directed classifier. That containment
+        # prevents a malformed verdict from inserting an unrelated repo claim.
+        if stale_reference.strip() and stale_reference.strip() not in iss.body:
+            stale_reference = ""
         actions = triage_dom.grooming_actions(
             issue, resolved_by=resolved_by, stale_reference=stale_reference,
             merged_by_issue=merged_by_issue,
         )
-        self.executor.execute_all(actions)
+        if not self.executor.execute_all(actions):
+            self.cfg.log(f"groom #{issue}: advisory write failed, will retry")
+            return
         if resolved_by is not None and resolved_by in merged_by_issue and resolved_by != issue:
             self._journal_groomed(issue, "resolved_by", pr=merged_by_issue[resolved_by])
         if stale_reference.strip():
