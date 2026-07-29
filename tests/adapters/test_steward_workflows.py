@@ -8,7 +8,7 @@ from issue_agent.app.workflows.jira import JiraSyncWorkflow, JiraSyncWorkflowCon
 from issue_agent.app.workflows.steward import StewardWorkflow, StewardWorkflowConfig
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
-from issue_agent.app.planners.tasks import JiraTaskConfig, TriageTaskConfig
+from issue_agent.app.planners.tasks import GroomTaskConfig, JiraTaskConfig, TriageTaskConfig
 from issue_agent.domain.triage import TriageConfig
 from issue_agent.domain.world import Comment, IssueView
 
@@ -265,6 +265,46 @@ def test_a_gateway_without_the_merged_read_triages_unchanged():
 
     assert ("relabel", "issue", 9, None, "ai-triage") in gw.calls
     assert not any(c[0] == "relabel" and c[4] == "recurrence" for c in gw.calls)
+
+
+def test_grooming_flags_a_resolved_open_issue_once_and_never_closes_it(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    gw = RecurrenceGateway({9: IssueView(9, title="Old crash", body="b", author="alice")},
+                           merged=(_Merged(42, 300),))
+    cfg = StewardWorkflowConfig(
+        triage=TriageTaskConfig("steward-bot"), triage_cfg=TriageConfig("steward-bot"),
+        groom=GroomTaskConfig("steward-bot"), log=lambda _m: None,
+        fix_bot="fix-bot", repo="o/r", journal=journal,
+    )
+    runner = FakeRunner(AgentResult(is_error=False, structured={"resolved_by": 42, "stale_reference": ""}))
+    workflow = StewardWorkflow(cfg, gw, FakeStore(), runner,
+                               Executor(gw, remove_worktree=FakeWorktrees().remove))
+
+    asyncio.run(workflow.groom(9))
+    asyncio.run(workflow.groom(9))
+
+    assert ("relabel", "issue", 9, None, "maybe-resolved") in gw.calls
+    assert not any(call[0] == "close" for call in gw.calls)
+    groomed = [e for e in read_events(journal.path) if e.get("event") == "groomed"]
+    assert len(groomed) == 1
+    assert groomed[0]["kind"] == "resolved_by"
+
+
+def test_grooming_stale_artifact_posts_a_rescope_comment_and_journals(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    gw = RecurrenceGateway({9: IssueView(9, title="Old flag", body="b", author="alice")})
+    cfg = StewardWorkflowConfig(
+        triage=TriageTaskConfig("steward-bot"), triage_cfg=TriageConfig("steward-bot"),
+        groom=GroomTaskConfig("steward-bot"), log=lambda _m: None, repo="o/r", journal=journal,
+    )
+    runner = FakeRunner(AgentResult(is_error=False, structured={"stale_reference": "src/removed.py"}))
+    workflow = StewardWorkflow(cfg, gw, FakeStore(), runner,
+                               Executor(gw, remove_worktree=FakeWorktrees().remove))
+
+    asyncio.run(workflow.groom(9))
+
+    assert any(call[0] == "comment" and "src/removed.py" in call[3] for call in gw.calls)
+    assert [e["kind"] for e in read_events(journal.path) if e.get("event") == "groomed"] == ["stale"]
 
 
 def test_jira_sync_creates_ticket_and_records_phase():
