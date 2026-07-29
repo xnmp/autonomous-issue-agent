@@ -20,6 +20,15 @@ import json
 import os
 from dataclasses import dataclass
 
+from ..domain.actions import (
+    Action,
+    CloseIssue,
+    EscalateCiPending,
+    PostComment,
+    Relabel,
+    Target,
+)
+from ..domain.labels import Label
 from ..domain.world import normalize_predicted_paths
 
 # ── suffix universe (review M4/D8) ──────────────────────────────────────────
@@ -83,6 +92,14 @@ class Store:
     def triage_at_path(self, issue: int) -> str:
         return os.path.join(self.state_dir, f"triage-{issue}.at")
 
+    def pending_actions_path(self) -> str:
+        """Role-wide lifecycle queue.
+
+        This is deliberately not an issue/PR suffix: one daemon owns the queue,
+        and issue cleanup must never erase an unacknowledged GitHub write.
+        """
+        return os.path.join(self.state_dir, "pending-actions.json")
+
     # ── generic thin IO ──
     def _read(self, path: str) -> str:
         try:
@@ -129,6 +146,95 @@ class Store:
             return int(raw)
         except ValueError:
             return default
+
+    # ── durable terminal lifecycle writes (#64) ──
+    @staticmethod
+    def _encode_pending_action(action: Action) -> dict[str, object]:
+        if isinstance(action, Relabel):
+            return {
+                "type": "relabel",
+                "target": action.target.name,
+                "number": action.number,
+                "remove": action.remove.value if action.remove else None,
+                "add": action.add.value if action.add else None,
+            }
+        if isinstance(action, PostComment):
+            return {
+                "type": "comment",
+                "target": action.target.name,
+                "number": action.number,
+                "body": action.body,
+            }
+        if isinstance(action, CloseIssue):
+            return {
+                "type": "close",
+                "number": action.number,
+                "reason": action.reason,
+                "comment": action.comment,
+            }
+        if isinstance(action, EscalateCiPending):
+            return {
+                "type": "escalate_ci_pending",
+                "pr": action.pr,
+                "head": action.head,
+                "body": action.body,
+            }
+        raise TypeError(f"action is not a durable lifecycle write: {action!r}")
+
+    @staticmethod
+    def _decode_pending_action(raw: object) -> Action:
+        if not isinstance(raw, dict):
+            raise ValueError("pending lifecycle action must be an object")
+        kind = raw.get("type")
+        try:
+            if kind == "relabel":
+                remove = raw.get("remove")
+                add = raw.get("add")
+                return Relabel(
+                    Target[str(raw["target"])],
+                    int(raw["number"]),
+                    Label(str(remove)) if remove is not None else None,
+                    Label(str(add)) if add is not None else None,
+                )
+            if kind == "comment":
+                return PostComment(
+                    Target[str(raw["target"])],
+                    int(raw["number"]),
+                    str(raw["body"]),
+                )
+            if kind == "close":
+                return CloseIssue(
+                    int(raw["number"]),
+                    str(raw.get("reason") or "completed"),
+                    str(raw.get("comment") or ""),
+                )
+            if kind == "escalate_ci_pending":
+                return EscalateCiPending(
+                    int(raw["pr"]), str(raw["head"]), str(raw["body"])
+                )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"invalid pending lifecycle action: {raw!r}") from exc
+        raise ValueError(f"unknown pending lifecycle action type: {kind!r}")
+
+    def load_pending_actions(self) -> tuple[Action, ...]:
+        raw = self._read(self.pending_actions_path())
+        if not raw:
+            return ()
+        try:
+            values = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError("pending lifecycle queue is malformed") from exc
+        if not isinstance(values, list):
+            raise ValueError("pending lifecycle queue must be a JSON list")
+        return tuple(self._decode_pending_action(value) for value in values)
+
+    def save_pending_actions(self, actions: tuple[Action, ...]) -> None:
+        path = self.pending_actions_path()
+        if not actions:
+            self._remove(path)
+            return
+        encoded = [self._encode_pending_action(action) for action in actions]
+        self._write(path, json.dumps(encoded, separators=(",", ":"), sort_keys=True))
 
     # ── sessions (issue: resolve/resume/address-review; pr: review) ──
     def _session_for_runtime(self, raw: str) -> str:

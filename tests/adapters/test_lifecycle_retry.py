@@ -28,12 +28,17 @@ class ScriptedGateway:
     def __init__(self, outcomes):
         self.outcomes = list(outcomes)
         self.comments = []
+        self.comment_visible = False
 
     def comment(self, kind, number, body):
         self.comments.append((kind, number, body))
         outcome = self.outcomes.pop(0) if self.outcomes else None
         if outcome is not None:
             raise outcome
+        self.comment_visible = True
+
+    def has_comment(self, kind, number, body):
+        return self.comment_visible
 
     def relabel(self, kind, number, remove, add):
         outcome = self.outcomes.pop(0) if self.outcomes else None
@@ -81,6 +86,20 @@ def test_relabel_is_covered_by_the_same_transient_retry_contract():
     )
 
     assert gateway.outcomes == []
+
+
+def test_ambiguous_comment_failure_is_verified_before_retrying_the_post():
+    gateway = ScriptedGateway([unavailable()])
+    gateway.comment_visible = True
+    executor = Executor(
+        gateway,
+        retry_delays=(0,),
+        sleep=lambda _seconds: None,
+    )
+
+    executor.execute(PostComment(Target.ISSUE, 29, "Need clarification"))
+
+    assert gateway.comments == [("issue", 29, "Need clarification")]
 
 
 def test_pending_store_round_trips_every_terminal_lifecycle_action(tmp_path):
@@ -168,3 +187,18 @@ def test_later_tick_replays_then_removes_pending_write_without_reapplying_it(tmp
     assert observed == [True, True]
     assert gateway.comments == [("issue", 29, "Need clarification")]
     assert Store(str(tmp_path)).load_pending_actions() == ()
+
+
+def test_malformed_pending_queue_fails_closed_before_observe(tmp_path):
+    store = Store(str(tmp_path))
+    tmp_path.joinpath("pending-actions.json").write_text("null")
+    observed = []
+    daemon = Daemon(
+        "fix",
+        lambda: observed.append(True) or WorldState(),
+        lambda _world: [RunAgent(AgentKind.RESOLVE, 29)],
+        Executor(ScriptedGateway([]), pending_actions=store),
+    )
+
+    assert daemon.tick() == []
+    assert observed == []

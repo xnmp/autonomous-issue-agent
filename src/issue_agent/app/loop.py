@@ -108,6 +108,15 @@ class Daemon:
         execute NOTHING, say so in one loud line. There is deliberately no retry
         or backoff here: the poll loop IS the retry, and a rate limit that
         outlives one interval will simply announce itself again."""
+        # Lifecycle writes are the state machine's acknowledgements. Drain them
+        # before a world read, a reaper decision, or a fresh paid dispatch; a
+        # spend gate must not strand the write that explains already-spent work.
+        if not self.executor.replay_pending():
+            self.log(
+                f"{self.name}: pending lifecycle actions remain — "
+                "skipping observe/dispatch this tick"
+            )
+            return []
         if self._gate_blocks_this_tick():
             return []
         try:
