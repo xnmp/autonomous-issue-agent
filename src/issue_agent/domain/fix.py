@@ -382,6 +382,7 @@ def last_human_reply(issue: IssueView | PRView, fix_bot: str) -> Comment | None:
     prompt_prefixes = (
         "**Agent needs input:**",
         "**Agent still needs input:**",
+        "**Agent needs clarification on review:**",
         "**Author needs input:**",
     )
     prompt_index = next(
