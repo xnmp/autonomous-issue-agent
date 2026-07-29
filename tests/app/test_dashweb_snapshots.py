@@ -308,6 +308,46 @@ def test_overlapping_cross_role_stall_estimates_are_subtracted_once():
     assert snapshots.issue_card(row_for(events, 7), NOW)["elapsed_s"] == 6000
 
 
+def test_nonoverlapping_role_estimates_for_same_physical_stall_subtract_once():
+    events = [
+        {"ts": ts(hours=4), "event": "agent_run_start", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
+        RESOLVE,
+        {"ts": ts(hours=3), "event": "agent_run_stall", "role": "fix",
+         "issue": 7, "dispatch": "d1", "stall_started_at": ts(hours=3.5),
+         "stall_clock_offset_seconds": 1_234_567.0,
+         "suspended_seconds": 1200},
+        {"ts": ts(hours=3), "event": "agent_run_stall", "role": "review",
+         "issue": 7, "dispatch": "d2", "stall_started_at": ts(hours=2.5),
+         "stall_clock_offset_seconds": 1_234_567.8,
+         "suspended_seconds": 1200},
+        {"ts": ts(hours=2), "event": "action",
+         "desc": "clear state for pr #12, issue #7 (merged)"},
+    ]
+
+    row = row_for(events, 7)
+    assert snapshots.issue_card(row, NOW)["elapsed_s"] == 6000
+    assert snapshots.mean_wall_clock_s([row]) == 6000.0
+
+
+def test_nonfinite_stall_correction_is_ignored():
+    events = [
+        {"ts": ts(hours=4), "event": "agent_run_start", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
+        RESOLVE,
+        {"ts": ts(hours=3), "event": "agent_run_stall", "role": "fix",
+         "issue": 7, "dispatch": "d1", "stall_started_at": ts(hours=3.5),
+         "stall_clock_offset_seconds": 1_234_567.0,
+         "suspended_seconds": float("inf")},
+        {"ts": ts(hours=2), "event": "action",
+         "desc": "clear state for pr #12, issue #7 (merged)"},
+    ]
+
+    row = row_for(events, 7)
+    assert snapshots.issue_card(row, NOW)["elapsed_s"] == 7200
+    assert snapshots.mean_wall_clock_s([row]) == 7200.0
+
+
 def test_issue_card_carries_gh_title_pr_state_and_merge_stamp():
     events = [RESOLVE, {"ts": ts(hours=1), "event": "action",
                         "desc": "clear state for pr #12, issue #7 (merged)"}]

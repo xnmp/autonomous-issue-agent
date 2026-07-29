@@ -386,6 +386,50 @@ def test_inclusive_late_heartbeat_reconciles_when_active_clock_also_advanced(tmp
     assert not any(event["event"] == "agent_run_stall" for event in events)
 
 
+def test_stall_reconciliation_includes_poll_interval_before_estimated_gap(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    receipt = {
+        "ts": "1970-01-01T00:00:30+00:00",
+        "event": "action",
+        "desc": "relabel issue #5: +ai-blocked",
+        "action": {
+            "type": "relabel",
+            "target": "ISSUE",
+            "number": 5,
+            "remove": None,
+            "add": "ai-blocked",
+        },
+    }
+    tmp_path.joinpath("journal.jsonl").write_text(json.dumps(receipt) + "\n")
+    gateway = FakeGateway()
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _world: [],
+        Executor(gateway, journal=journal),
+        poll_seconds=60,
+        journal=journal,
+    )
+    wall_times = iter([50, 300])
+    active_times = iter([0, 10])
+
+    daemon.run_forever(
+        sleep=lambda _seconds: None,
+        now=lambda: next(wall_times),
+        active_now=lambda: next(active_times),
+        max_ticks=1,
+    )
+
+    events = read_events(journal.path)
+    assert gateway.calls == [("relabel", 5, None, "ai-blocked")]
+    assert any(
+        event["event"] == "stall"
+        and event["started_at"] == "1970-01-01T00:01:00+00:00"
+        and event["stall_clock_offset_seconds"] == 290
+        for event in events
+    )
+
+
 def test_stall_annotation_uses_each_legs_clock_gap_not_shifted_start_estimate(
     tmp_path,
 ):
