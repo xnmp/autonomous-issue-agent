@@ -1068,3 +1068,18 @@ def test_doctor_silent_on_toolchain_checks_when_no_ecosystem_marker_present(tmp_
     assert "rust-toolchain" not in result.stdout
     assert ".nvmrc" not in result.stdout
     assert ".python-version" not in result.stdout
+
+
+def test_doctor_falls_back_to_node_version_when_nvmrc_is_unparseable(tmp_path):
+    """A loose .nvmrc ("lts/*") must not shadow a parseable .node-version
+    sitting right next to it — the check should still find something to
+    compare against instead of going silent just because the FIRST candidate
+    file it looked at happened to be unparseable."""
+    result = _toolchain_doctor(
+        tmp_path,
+        {"package.json": "{}\n", ".nvmrc": "lts/*\n", ".node-version": "20.11.1\n"},
+        node="18.17.0",
+    )
+    assert "node drift" in result.stdout
+    assert "20.11.1" in result.stdout
+    assert "18.17.0" in result.stdout
