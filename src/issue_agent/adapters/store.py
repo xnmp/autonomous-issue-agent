@@ -39,7 +39,7 @@ from dataclasses import dataclass
 _ISSUE_SUFFIXES = (
     "session", "resumed-at", "resumes", "ci-retries", "resolve-retries",
     "rebase-retries", "infra-deaths", "review-retries", "phase", "jira",
-    "jira-phase", "model",
+    "jira-phase", "model", "predicted-paths",
 )
 _PR_SUFFIXES = (
     "session", "last-sha", "round", "automerge", "patch-id", "ci-rerun-head",

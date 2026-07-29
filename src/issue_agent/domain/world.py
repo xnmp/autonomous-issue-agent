@@ -126,6 +126,10 @@ class IssueView:
     # when that PR lands — the #59-vs-#60 collision). Empty = no paths declared →
     # unpredictable → the gate can't apply (fail-open, don't over-block).
     declared_paths: frozenset[str] = field(default_factory=frozenset)
+    # Repository-relative paths predicted by the cheap router. These are
+    # advisory like declared_paths: malformed or absent predictions remain empty
+    # and therefore cannot hold an issue.
+    predicted_paths: frozenset[str] = field(default_factory=frozenset)
 
     def has(self, label: Label) -> bool:
         return label in self.labels
