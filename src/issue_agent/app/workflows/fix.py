@@ -482,7 +482,14 @@ class FixWorkflow:
         branch = f"fix/{issue}-{slugify(iss.title) or 'issue'}"
         cwd = self._ensure_cwd(issue, branch)
 
-        fix_cfg, deferred_for_overlap = await self._routed_fix_cfg(issue, iss)
+        if human_reply:
+            # A reply-driven RESUME has already consumed this clarification.
+            # Re-running fresh-resolve routing could overlap-defer to ai-ready
+            # without delivering it to either split role.
+            fix_cfg = self._repair_fix_cfg(issue, "resume", iss=iss)
+            deferred_for_overlap = False
+        else:
+            fix_cfg, deferred_for_overlap = await self._routed_fix_cfg(issue, iss)
         if deferred_for_overlap:
             self.executor.execute_all([
                 Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)
@@ -567,7 +574,13 @@ class FixWorkflow:
                 # weaker than the leg it is arbitrating decides the wrong way
                 # exactly when the issue is hard enough to have escalated.
                 task_builders.build_adjudicate_task(
-                    issue, iss.title, iss.body, objection, cwd, fix_cfg
+                    issue,
+                    iss.title,
+                    iss.body,
+                    objection,
+                    cwd,
+                    fix_cfg,
+                    human_reply=human_reply,
                 )
             )
             self.store.save_session(issue, adj.session_id)
