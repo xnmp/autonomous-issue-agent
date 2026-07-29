@@ -288,7 +288,10 @@ def build_role(role: str, env: dict | None = None):
         gw = GitHubGateway(cfg.repo, _app_identity(env, warn=_commit_log),
                            review_pr_label=cfg.review_trigger_label,
                            review_adopt_unlabeled=cfg.review_adopt_unlabeled)
-        store = Store(cfg.review_state_dir)
+        # A runtime flip must cold-start review legs too.  In particular, Codex
+        # resume cannot preserve its read-only sandbox, and legacy Claude
+        # session ids must never reach `codex exec resume`.
+        store = Store(cfg.review_state_dir, runtime=cfg.reviewer_runtime)
         return _probed(build_review_daemon(cfg, gw, store, runner), gw)
     if role == "steward":
         gw = GitHubGateway(cfg.repo, _app_identity(env, warn=_commit_log))
