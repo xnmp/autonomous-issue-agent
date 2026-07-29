@@ -24,6 +24,7 @@ from issue_agent.adapters.codex_runner import (
     _is_transport_drop,
     _session_id_from_lines,
     _strict_schema,
+    budget_overrun_usd,
     build_codex_argv,
     codex_budget_not_enforced_warning,
     codex_cost_blindspot_warning,
@@ -1331,9 +1332,14 @@ def test_blindspot_warning_still_fires_on_a_half_configured_price_table():
 
 
 def test_the_budget_warning_fires_even_when_pricing_is_fully_configured():
-    w = codex_budget_not_enforced_warning(fix_budget_usd=20.0, max_runtime=3600.0)
+    # Pricing configured but enforcement off: the operator has a price table and
+    # NO ceiling, which is precisely the regime the original bug hid.
+    w = codex_budget_not_enforced_warning(
+        fix_budget_usd=20.0, max_runtime=3600.0, enforced=False, priced=True
+    )
     assert w is not None
     assert "MAX_BUDGET_USD=$20.00" in w and "NOT ENFORCED" in w
+    assert "CODEX_ENFORCE_BUDGET=0" in w
     assert "3600s" in w
 
 
@@ -1344,18 +1350,246 @@ def test_the_budget_warning_is_independent_of_the_price_table():
                   issue_spend_cap_usd=25.0, daily_spend_cap_usd=50.0)
     assert codex_cost_blindspot_warning(**priced) is None
     assert codex_budget_not_enforced_warning(
-        fix_budget_usd=20.0, max_runtime=3600.0
+        fix_budget_usd=20.0, max_runtime=3600.0, enforced=False, priced=True
     ) is not None
 
 
+def test_the_budget_warning_names_a_zeroed_price_table_as_the_reason():
+    """Enforcement armed but unable to fire: every run prices at $0.00, so no
+    threshold is ever crossed. It LOOKS enforced, which is why the reason has to
+    be named rather than the warning merely appearing."""
+    w = codex_budget_not_enforced_warning(
+        fix_budget_usd=20.0, max_runtime=3600.0, enforced=True, priced=False
+    )
+    assert w is not None and "NOT ENFORCED" in w
+    assert "every run prices at $0.00" in w
+
+
+def test_the_budget_warning_goes_silent_once_the_budget_is_really_enforced():
+    """The #29 fix: with the check live AND a price table to measure against,
+    MAX_BUDGET_USD is a real per-run ceiling. Warning about it then would be a
+    misreport in the opposite direction."""
+    assert codex_budget_not_enforced_warning(
+        fix_budget_usd=20.0, max_runtime=3600.0, enforced=True, priced=True
+    ) is None
+
+
 def test_the_budget_warning_names_the_missing_wall_cap():
-    w = codex_budget_not_enforced_warning(fix_budget_usd=20.0, max_runtime=0.0)
-    assert w is not None and "CODEX_MAX_RUNTIME_SECONDS is unset" in w
+    # AGENT_MAX_RUNTIME_SECONDS, not CODEX_: the value handed in is
+    # `codex_runtime.max_runtime`, whose env knob is the AGENT_ one. Naming a
+    # variable that does not exist is the same class of operator misreport #29
+    # is about, so the text was corrected with the rest of it.
+    w = codex_budget_not_enforced_warning(
+        fix_budget_usd=20.0, max_runtime=0.0, enforced=False, priced=True
+    )
+    assert w is not None and "AGENT_MAX_RUNTIME_SECONDS is unset" in w
 
 
 def test_no_budget_warning_when_no_budget_is_configured():
     # Anti-vacuity: with no budget set there is no number being misreported.
-    assert codex_budget_not_enforced_warning(fix_budget_usd=0.0, max_runtime=3600.0) is None
+    assert codex_budget_not_enforced_warning(
+        fix_budget_usd=0.0, max_runtime=3600.0, enforced=False, priced=False
+    ) is None
+
+
+# ── #29 (enforcement half): MAX_BUDGET_USD actually bounds a codex run ────────
+# codex has no per-session budget FLAG, so the only possible bound is the
+# harness watching the session's streamed counters and killing it. Before this,
+# `AGENT_MAX_RUNTIME_SECONDS` was the sole per-run limit and issue #128's
+# resolve completed at $28.74 against a configured $20 with exit_reason=ok.
+
+
+def test_budget_overrun_reports_the_spend_that_crossed_the_line():
+    # 5M in @ $5 + 100k out @ $30 = $28.00 — the shape of the live overspend.
+    over = budget_overrun_usd(
+        {"input_tokens": 5_000_000, "output_tokens": 100_000},
+        cost_per_mtok_in=5.0, cost_per_mtok_out=30.0, max_budget_usd=20.0,
+    )
+    assert over == pytest.approx(28.0)
+
+
+def test_budget_overrun_is_none_below_the_line():
+    assert budget_overrun_usd(
+        {"input_tokens": 1_000_000, "output_tokens": 10_000},
+        cost_per_mtok_in=5.0, cost_per_mtok_out=30.0, max_budget_usd=20.0,
+    ) is None
+
+
+def test_budget_overrun_is_none_when_the_runtime_is_unpriced():
+    """A zeroed price table makes every run read as free. Killing on a dollar
+    threshold nobody can measure would be worse than not killing: the failure
+    mode stays 'unbounded, and loudly warned about at boot'."""
+    assert budget_overrun_usd(
+        {"input_tokens": 500_000_000, "output_tokens": 9_000_000},
+        cost_per_mtok_in=0.0, cost_per_mtok_out=0.0, max_budget_usd=20.0,
+    ) is None
+
+
+def test_budget_overrun_is_none_without_a_budget_or_usage():
+    # No bound configured → nothing to cross. No usage reported yet → nothing
+    # measured, so no fabricated verdict either.
+    assert budget_overrun_usd(
+        {"input_tokens": 5_000_000, "output_tokens": 100_000},
+        cost_per_mtok_in=5.0, cost_per_mtok_out=30.0, max_budget_usd=0.0,
+    ) is None
+    assert budget_overrun_usd(
+        None, cost_per_mtok_in=5.0, cost_per_mtok_out=30.0, max_budget_usd=20.0
+    ) is None
+
+
+_OVERSPENT_SID = "019fa244-0000-7de0-8e18-e56f423bbbcc"
+
+
+def _write_rollout(codex_home, sid, *, input_tokens, output_tokens):
+    """A codex session rollout whose cumulative counters price above $20 at the
+    shipped rates: 5M in @ $5 + 100k out @ $30 = $28.00."""
+    day = codex_home / "sessions" / "2026" / "07" / "28"
+    day.mkdir(parents=True, exist_ok=True)
+    (day / f"rollout-2026-07-28T00-00-00-{sid}.jsonl").write_text(
+        json.dumps({"payload": {"type": "token_count", "info": {
+            "total_token_usage": {
+                "input_tokens": input_tokens, "cached_input_tokens": 0,
+                "cache_write_input_tokens": 0, "output_tokens": output_tokens,
+            }}}}) + "\n"
+    )
+
+
+def _spendy_codex(tmp, sid):
+    """A stub that announces `sid` and then keeps working (chatty stderr, ~2s).
+    Chatty on purpose: a run that keeps printing tool traces never trips the
+    IDLE watchdog, which is exactly the runaway the budget check has to stop."""
+    body = (
+        'out=""; prev=""\n'
+        'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
+        f'echo "session id: {sid}" >&2\n'
+        'for i in $(seq 1 40); do echo "exec step $i" >&2; sleep 0.05; done\n'
+        'printf \'%s\' \'{"status":"pr_opened","summary":"done","needs":""}\' > "$out"\n'
+        'exit 0\n'
+    )
+    return _fake_codex(tmp, body)
+
+
+def _budget_runner(tmp, sid, **kw):
+    return CodexRunner(
+        codex_bin=_spendy_codex(tmp, sid), env={"OPENAI_API_KEY": "k"},
+        cost_per_mtok_in=5.0, cost_per_mtok_out=30.0,
+        # Sample promptly so the test observes the kill rather than the stub
+        # finishing on its own.
+        poll_slice=0.05,
+        **kw,
+    )
+
+
+def test_a_run_that_crosses_the_budget_is_killed_with_budget_exhausted(
+    tmp_path, monkeypatch
+):
+    """The headline #29 observable. The same run today finishes and reports
+    exit_reason=ok at 44% over budget; it must instead be stopped and report the
+    SDK's own budget verdict, so the existing retry/escalation handling (which
+    keys off BUDGET_EXHAUSTED, and treats it as a real attempt rather than an
+    infra death) needs no codex special case."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _write_rollout(tmp_path, _OVERSPENT_SID, input_tokens=5_000_000,
+                   output_tokens=100_000)
+    tmp = tempfile.mkdtemp()
+
+    r = asyncio.run(
+        _budget_runner(tmp, _OVERSPENT_SID).run(
+            AgentTask(prompt="x", max_budget_usd=20.0)
+        )
+    )
+
+    assert r.exit_reason is ExitReason.BUDGET_EXHAUSTED
+    assert r.status == "error_max_budget_usd"
+    assert r.is_error is True
+    assert "MAX_BUDGET_USD=$20.00" in r.summary
+    # A budget abort is an ATTEMPT, not an infra death — it must march the
+    # breakers forward exactly like the SDK path's `error_max_budget_usd`.
+    assert infra_death(r.exit_reason) is False
+
+
+def test_the_killed_run_still_ledgers_what_it_spent(tmp_path, monkeypatch):
+    """A kill that reported $0.00 would hide precisely the money it exists to
+    bound — the issue/daily caps read the ledger, and the ledger only records a
+    leg when cost > 0."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _write_rollout(tmp_path, _OVERSPENT_SID, input_tokens=5_000_000,
+                   output_tokens=100_000)
+    tmp = tempfile.mkdtemp()
+
+    r = asyncio.run(
+        _budget_runner(tmp, _OVERSPENT_SID).run(
+            AgentTask(prompt="x", max_budget_usd=20.0)
+        )
+    )
+
+    assert r.cost_usd == pytest.approx(28.0)
+    assert r.usage["input_tokens"] == 5_000_000
+    assert r.session_id == _OVERSPENT_SID
+
+
+def test_a_run_under_the_budget_is_left_alone(tmp_path, monkeypatch):
+    """Anti-vacuity twin: identical stub and identical spend, a budget above it
+    → the run completes normally. Without this the kill test would pass just as
+    well against a runner that killed everything."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _write_rollout(tmp_path, _OVERSPENT_SID, input_tokens=5_000_000,
+                   output_tokens=100_000)
+    tmp = tempfile.mkdtemp()
+
+    r = asyncio.run(
+        _budget_runner(tmp, _OVERSPENT_SID).run(
+            AgentTask(prompt="x", max_budget_usd=100.0)
+        )
+    )
+
+    assert r.exit_reason is ExitReason.OK
+    assert r.status == "pr_opened"
+
+
+def test_enforcement_can_be_switched_off(tmp_path, monkeypatch):
+    """CODEX_ENFORCE_BUDGET=0 → the old wall-cap-only regime. Same over-budget
+    session as the kill test, so this pins the KNOB rather than the threshold."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _write_rollout(tmp_path, _OVERSPENT_SID, input_tokens=5_000_000,
+                   output_tokens=100_000)
+    tmp = tempfile.mkdtemp()
+
+    r = asyncio.run(
+        _budget_runner(tmp, _OVERSPENT_SID, enforce_budget=False).run(
+            AgentTask(prompt="x", max_budget_usd=20.0)
+        )
+    )
+
+    assert r.exit_reason is ExitReason.OK
+    assert r.status == "pr_opened"
+
+
+def test_a_resumed_leg_is_judged_on_its_own_spend_not_the_session_total(
+    tmp_path, monkeypatch
+):
+    """The load-bearing detail. A fix-ci / address-review / rebase leg RESUMES
+    the resolve's codex session, whose rollout counter is cumulative and already
+    ledgered by the previous leg. Comparing the raw counter against the budget
+    would kill every follow-up leg on its predecessor's tokens the first time it
+    sampled — so the check runs on the same per-leg delta the ledger uses
+    (usage_delta). Here the session has burned $28 against a $20 budget and this
+    leg has burned nothing: it must run to completion."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _write_rollout(tmp_path, _OVERSPENT_SID, input_tokens=5_000_000,
+                   output_tokens=100_000)
+    tmp = tempfile.mkdtemp()
+
+    r = asyncio.run(
+        _budget_runner(tmp, _OVERSPENT_SID).run(
+            AgentTask(prompt="x", max_budget_usd=20.0, resume=_OVERSPENT_SID)
+        )
+    )
+
+    assert r.exit_reason is ExitReason.OK
+    assert r.status == "pr_opened"
+    # …and the leg is ledgered at its own (zero) delta, not the session's $28.
+    assert r.cost_usd == pytest.approx(0.0)
 
 
 # ── #43: each leg is priced with the model it actually ran ───────────────────
