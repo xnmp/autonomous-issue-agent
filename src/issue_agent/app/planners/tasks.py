@@ -54,6 +54,9 @@ class FixTaskConfig:
     # existed; `app.workflows.fix` replaces it with a stronger value when the
     # evidence says the previous attempt under-delivered.
     effort: Effort | None = None
+    # A concise, evidence-derived warning for legs with at least two completed
+    # resolve/CI failures. It belongs in the appended system prompt, not issue data.
+    difficulty_notice: str = ""
 
 
 # ── fixer tool policy ─────────────────────────────────────────────────────────
@@ -129,7 +132,12 @@ def _fix_system_prompt(cfg: FixTaskConfig, session_id: str | None) -> str:
     """The appended system prompt for a fixer leg: the full AGENT.md on a fresh
     session, the short reminder when a session id is carried (resumed OR forked —
     both inherit the server-side transcript that already contains AGENT.md)."""
-    return _RESUME_REMINDER if (session_id or "").strip() else cfg.agent_md
+    base = _RESUME_REMINDER if (session_id or "").strip() else cfg.agent_md
+    return base + _difficulty_notice(cfg)
+
+
+def _difficulty_notice(cfg: FixTaskConfig) -> str:
+    return f"\n\n{cfg.difficulty_notice}" if cfg.difficulty_notice else ""
 
 
 # ── fix side ──────────────────────────────────────────────────────────────────
@@ -147,7 +155,7 @@ def build_resolve_task(
     return AgentTask(
         prompt=prompt,
         schema=FIX_SCHEMA,
-        append_system_prompt=cfg.agent_md,
+        append_system_prompt=_fix_system_prompt(cfg, None),
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
         effort=cfg.effort,
@@ -191,7 +199,7 @@ def build_author_task(
     return AgentTask(
         prompt=prompt,
         schema=AUTHOR_SCHEMA,
-        append_system_prompt=cfg.agent_md,
+        append_system_prompt=_fix_system_prompt(cfg, None),
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
         effort=cfg.effort,
@@ -243,7 +251,7 @@ def build_implement_task(
     return AgentTask(
         prompt=prompt,
         schema=IMPLEMENT_SCHEMA,
-        append_system_prompt=cfg.agent_md,
+        append_system_prompt=_fix_system_prompt(cfg, None),
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
         effort=cfg.effort,
@@ -284,7 +292,7 @@ def build_adjudicate_task(
     return AgentTask(
         prompt=prompt,
         schema=ADJUDICATE_SCHEMA,
-        append_system_prompt=cfg.agent_md,
+        append_system_prompt=_fix_system_prompt(cfg, None),
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
         effort=cfg.effort,
@@ -501,6 +509,19 @@ def route_model(tier: str, runtime: str = "claude") -> str:
     inside dispatch."""
     tiers = MODEL_TIERS.get(runtime) or MODEL_TIERS["claude"]
     return tiers.get(tier) or tiers[DEFAULT_TIER]
+
+
+def route_ceiling_model(runtime: str = "claude") -> str:
+    """The explicit expensive fallback reserved for proven-hard work.
+
+    This is intentionally separate from the ordinary ``complex`` route: a
+    first-attempt architectural issue still receives its normal top tier,
+    while recurrence or repeated completed failure is the evidence that pays
+    for the exceptional capability ceiling.
+    """
+    if runtime == "claude":
+        return "fable"
+    return route_model(TIER_LADDER[-1], runtime)
 
 
 def build_router_task(

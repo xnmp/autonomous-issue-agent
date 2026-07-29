@@ -1114,7 +1114,7 @@ def test_no_evidence_emits_no_effort_at_all():
     assert runner.tasks[1].model == "sonnet"
 
 
-def test_a_recurrence_label_buys_more_thinking_at_the_routed_tier():
+def test_a_recurrence_label_dispatches_the_capability_ceiling():
     gw = FakeGateway(
         issues={5: _issue(labels=frozenset({Label.RECURRENCE}))}, pr_for_issue={}
     )
@@ -1128,11 +1128,11 @@ def test_a_recurrence_label_buys_more_thinking_at_the_routed_tier():
     ).resolve(5))
 
     resolve_task = runner.tasks[1]
-    assert resolve_task.effort is Effort.HIGH, "one notch buys the cheap lever"
-    assert resolve_task.model == "sonnet", "…and NOT the pricier tier yet"
+    assert resolve_task.effort is Effort.HIGH
+    assert resolve_task.model == "fable", "a recurrence goes directly to the ceiling"
 
 
-def test_two_signals_climb_past_effort_into_the_next_tier():
+def test_a_recurrence_and_prior_failure_still_dispatch_the_ceiling():
     gw = FakeGateway(
         issues={5: _issue(labels=frozenset({Label.RECURRENCE}))}, pr_for_issue={}
     )
@@ -1148,7 +1148,49 @@ def test_two_signals_climb_past_effort_into_the_next_tier():
     ).resolve(5))
 
     assert runner.tasks[1].effort is Effort.HIGH
-    assert runner.tasks[1].model == "opus", "evidence past HIGH effort re-prices the tier"
+    assert runner.tasks[1].model == "fable", "the ceiling remains stable with more evidence"
+
+
+def test_below_the_hard_evidence_threshold_keeps_complex_route_unchanged():
+    """One completed failure buys effort; it must not replace Claude complex's
+    normal Opus route or attach the two-failure history notice."""
+    gw = FakeGateway(issues={5: _issue()}, pr_for_issue={})
+    store = FakeStore()
+    store.set_resolve_retries(5, 1)
+    runner = SeqRunner([
+        _router_result("complex"),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5"),
+    ])
+
+    asyncio.run(_workflow(
+        gw, store, runner, fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    resolve_task = runner.tasks[1]
+    assert resolve_task.model == "opus"
+    assert resolve_task.effort is Effort.HIGH
+    assert "difficult problem" not in resolve_task.append_system_prompt
+
+
+def test_two_completed_failures_add_a_difficult_history_warning():
+    gw = FakeGateway(issues={5: _issue()}, pr_for_issue={})
+    store = FakeStore()
+    store.set_resolve_retries(5, 2)
+    runner = SeqRunner([
+        _router_result("standard"),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5"),
+    ])
+
+    asyncio.run(_workflow(
+        gw, store, runner, fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    resolve_task = runner.tasks[1]
+    assert resolve_task.model == "fable"
+    assert resolve_task.effort is Effort.HIGH
+    assert "difficult problem" in resolve_task.append_system_prompt
+    assert "failed in the past" in resolve_task.append_system_prompt
+    assert "extra care" in resolve_task.append_system_prompt
 
 
 def test_escalation_respects_the_fixer_runtime_family():
@@ -1211,13 +1253,13 @@ def test_escalation_survives_a_router_that_died():
         gw, FakeStore(), runner, fix=FixTaskConfig("o/r", agent_md="AM"),
     ).resolve(5))
 
-    assert runner.tasks[1].model is None, "unrouted, as before"
+    assert runner.tasks[1].model == "fable", "evidence must survive router failure"
     assert runner.tasks[1].effort is Effort.HIGH
 
 
-def test_an_unrouted_escalation_records_a_null_model_not_an_empty_one():
-    """"Not applicable" has one encoding across the event: an unrouted leg lets
-    the runtime pick, and must not open a "" bucket in `group_by(.model)`."""
+def test_a_router_failure_still_records_the_ceiling_model():
+    """Hard evidence is enough to select the fresh-resolve ceiling even when
+    the advisory router is unavailable, so telemetry records the model run."""
     gw = FakeGateway(
         issues={5: _issue(labels=frozenset({Label.RECURRENCE}))}, pr_for_issue={}
     )
@@ -1240,8 +1282,8 @@ def test_an_unrouted_escalation_records_a_null_model_not_an_empty_one():
     ).resolve(5))
 
     (_event, fields), = journal.events
-    assert fields["model"] is None
-    assert runner.tasks[1].model is None
+    assert fields["model"] == "fable"
+    assert runner.tasks[1].model == "fable"
 
 
 def test_the_kill_switch_restores_the_pre_ladder_dispatch():
@@ -1300,10 +1342,11 @@ def _pr_with_rounds(n, extra=()):
     return PRView(100, head_ref_name="fix/5-x", closing_issue=5, reviews=reviews)
 
 
-def test_repair_legs_think_harder_without_swapping_the_model():
+def test_repair_legs_keep_their_model_while_thinking_harder():
     """A repair leg resumes a live transcript — handing that context to a
     different reasoner is a different bet than asking this one to think harder.
-    Only a fresh resolve re-prices the model."""
+    The hard ceiling is a fresh-resolve routing decision, so it cannot replace a
+    model attached to a resumed transcript."""
     gw = FakeGateway(prs={100: _pr_with_rounds(2)}, issues={5: IssueView(5)})
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s5"))
 
@@ -1406,8 +1449,9 @@ def test_escalations_are_journalled_so_the_tier_split_stays_measurable():
     )
     assert fields["issue"] == 5
     assert (fields["from_effort"], fields["to_effort"]) == ("medium", "high")
-    assert (fields["from_tier"], fields["to_tier"]) == ("standard", "standard")
-    assert fields["model"] == "sonnet", "the split must be derivable from what RAN"
+    assert (fields["from_tier"], fields["to_tier"]) == ("standard", "complex")
+    assert fields["model"] == "fable", "the split must be derivable from what RAN"
+    assert fields["ceiling"] is True
     assert fields["recurrence"] is True
 
 
@@ -1432,6 +1476,29 @@ def test_a_repair_legs_event_reports_no_tier_because_it_chose_none():
     assert (fields["from_tier"], fields["to_tier"]) == (None, None)
     assert fields["model"] == "sonnet", "what actually ran"
     assert (fields["from_effort"], fields["to_effort"]) == ("medium", "high")
+
+
+def test_hard_history_on_an_unpinned_repair_preserves_its_stored_model_and_journal():
+    """A Codex Terra session must not silently become Sol, even after two
+    failures: the ceiling selects a fresh resolve model, never a resumed one."""
+    gw = FakeGateway(prs={100: _pr_with_rounds(1)}, issues={5: IssueView(5)})
+    store = FakeStore()
+    store.models[5] = "gpt-5.6-terra"
+    store.set_resolve_retries(5, 2)
+    journal = RecordingJournal()
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s5"))
+
+    asyncio.run(_workflow(
+        gw, store, runner, fixer_runtime="codex", journal=journal,
+        fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).address_review(100))
+
+    assert runner.tasks[0].model == "gpt-5.6-terra"
+    (event, fields), = journal.events
+    assert event == "route_escalation"
+    assert (fields["from_tier"], fields["to_tier"]) == (None, None)
+    assert fields["model"] == "gpt-5.6-terra"
+    assert fields["ceiling"] is False
 
 
 def test_the_kill_switch_costs_no_gateway_read_on_a_repair_leg():

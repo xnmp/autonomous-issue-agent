@@ -20,6 +20,7 @@ Rules:
 | change | landed | evidence spec | status |
 |---|---|---|---|
 | #16 escalation ladder (`route_escalation`) | be49b1d 2026-07-27 | `route_escalation` journal event on a repair leg after RC/recurrence signals | **pending** — 7 deployments, 3 near-triggers all correctly suppressed (see #41) |
+| #62 difficult-end capability ceiling | PR #76 2026-07-29 | recurrence or two completed resolve/CI failures emit `route_escalation` with `ceiling=true`, `model=fable`/`gpt-5.6-sol`, `to_effort=high`; two failures also add the difficult-history task warning | **pending** — metric: $/merged PR by routed tier; guardrail: first-pass approval rate and escalation rate must not regress; measure on the next deployment day from journal `agent_run` + `route_escalation` events |
 | codex per-leg usage deltas | 27565d9 2026-07-27 | repair legs ledger single-digit deltas, never resolve magnitude | VERIFIED 2026-07-27 (fifth): address legs $6–33 |
 | evidence-image commit gate | 2bcb99d 2026-07-27 | blocked commit + self-service downscale in a fixer transcript | **pending** — never fired |
 | #20 repair legs skip evidence recapture | PR #26 2026-07-27 | no $100+ ADDRESS_REVIEW; address legs cite existing evidence | VERIFIED 2026-07-28 (sixth): address legs $6–33, no repeat of the $146 leg |
