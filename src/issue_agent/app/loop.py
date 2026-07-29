@@ -189,12 +189,12 @@ class Daemon:
             previous = last
             last = cur
             last_active = cur_active
-            # The wall threshold is the existing late-heartbeat detector and
-            # remains the reconciliation trigger. Wall minus monotonic active
-            # time estimates only the suspension share, so a long active block
-            # is inspected without being charged as suspended runtime.
+            # A late wall heartbeat is a stall only when wall time advanced
+            # beyond monotonic active time. Synchronous paid legs routinely
+            # exceed the wall threshold and must not generate incident records
+            # or replay lifecycle state merely because they were productive.
             suspended = max(0, round(elapsed - active_elapsed))
-            if elapsed >= self.poll_seconds * 4:
+            if elapsed >= self.poll_seconds * 4 and suspended > 0:
                 stall_started = datetime.fromtimestamp(
                     cur - suspended, tz=timezone.utc
                 )

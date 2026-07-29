@@ -58,6 +58,16 @@ class Label(str, Enum):
     P3 = "P3"
 
 
+# Observations that coexist with pipeline state. A durable receipt for one of
+# these must never supersede a lifecycle relabel on the same GitHub target.
+ADVISORY_LABELS: frozenset[Label] = frozenset(
+    {
+        Label.RECURRENCE,
+        Label.MAYBE_RESOLVED,
+    }
+)
+
+
 # The labels that mean "this issue is already somewhere in the pipeline". The
 # steward's triage candidate set is exactly the OPEN issues carrying NONE of
 # these (ai-triage included — see triage.py for why it's allowed back in).

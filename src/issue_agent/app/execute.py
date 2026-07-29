@@ -36,12 +36,19 @@ from ..domain.actions import (
     RunAgent,
     Target,
 )
-from ..domain.labels import Label
+from ..domain.labels import ADVISORY_LABELS, Label
 
 # gh subcommand kind per target.
 _KIND = {Target.ISSUE: "issue", Target.PR: "pr"}
 _DURABLE_ACTIONS = (Relabel, PostComment, CloseIssue, EscalateCiPending)
 _DEFAULT_RETRY_DELAYS = (1.0, 3.0, 9.0)
+
+
+def _is_advisory_relabel(action: Relabel) -> bool:
+    return (
+        action.remove in ADVISORY_LABELS
+        or action.add in ADVISORY_LABELS
+    )
 
 
 class LifecycleWriteUnverified(RuntimeError):
@@ -428,18 +435,24 @@ class Executor:
 
         The journal is a receipt, not proof that remote state survived an
         environmental outage. Structured receipts are replayed through the
-        same idempotency probes and bounded queue as #64. Legacy description-
-        only rows are explicitly skipped because comment bodies cannot be
-        reconstructed safely from a character count.
+        same idempotency probes and bounded queue as #64. Rows without a
+        structured payload are non-durable actions (or legacy receipts) and
+        are ignored; a present but malformed payload remains observable.
+        Relabels are state transitions, so only the latest receipt per target
+        is meaningful. Additive/idempotent actions retain journal order.
         """
         path = getattr(self._journal, "path", "")
         if not path:
             return
+        actions: list[Action] = []
+        latest_relabels: dict[tuple[Target, int], int] = {}
         for event in read_events_tail(path):
             if event.get("event") != "action":
                 continue
             timestamp = parse_ts(event.get("ts"))
             if timestamp is None or not (started_at <= timestamp <= woke_at):
+                continue
+            if "action" not in event:
                 continue
             raw = event.get("action")
             try:
@@ -450,6 +463,17 @@ class Executor:
                     desc=str(event.get("desc") or ""),
                     error=str(exc),
                 )
+                continue
+            actions.append(action)
+            if isinstance(action, Relabel) and not _is_advisory_relabel(action):
+                latest_relabels[(action.target, action.number)] = len(actions) - 1
+
+        for index, action in enumerate(actions):
+            if (
+                isinstance(action, Relabel)
+                and not _is_advisory_relabel(action)
+                and latest_relabels[(action.target, action.number)] != index
+            ):
                 continue
             desc = self._describe(action)
             try:

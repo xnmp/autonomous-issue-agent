@@ -257,7 +257,11 @@ def _started(row: dash.IssueRow) -> datetime | None:
 def _legacy_suspended_seconds(
     intervals: list[tuple[datetime, datetime, float]],
 ) -> float:
-    """Deduplicate corrections written before stable stall identities existed."""
+    """Deduplicate corrections written before stable stall identities existed.
+
+    Compatibility for journal rows written before #69. Remove after retained
+    operator journals all postdate the deployment containing #69.
+    """
     if not intervals:
         return 0.0
     ordered = sorted(intervals)
