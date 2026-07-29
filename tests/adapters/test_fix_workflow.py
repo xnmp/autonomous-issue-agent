@@ -1067,7 +1067,7 @@ def test_no_evidence_emits_no_effort_at_all():
     assert runner.tasks[1].model == "sonnet"
 
 
-def test_a_recurrence_label_buys_more_thinking_at_the_routed_tier():
+def test_a_recurrence_label_dispatches_the_capability_ceiling():
     gw = FakeGateway(
         issues={5: _issue(labels=frozenset({Label.RECURRENCE}))}, pr_for_issue={}
     )
