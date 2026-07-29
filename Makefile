@@ -75,7 +75,7 @@ test-app:
 # Build the dashboard SPA into dashboard/dist (gitignored). Needed before
 # `issue-agent dashboard --serve` prefers the interactive UI over the v1 page.
 dashboard-ui:
-	@cd dashboard && npm ci && npm run build
+	@PYTHONPATH=src uv run --offline --no-sync python scripts/build_dashboard.py
 
 # Gate parity (review M6). The harness has TWO gate implementations — the bash
 # checkers (live for codex) and domain/gate.py + adapters/governor.py (live for

@@ -42,10 +42,23 @@ jobs:
         with:
           python-version: "3.12"
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
       # The full suite: governor + hooks + orchestration + point-at + domain +
       # adapters + gate parity + import-linter architecture contracts.
       - name: make test
         run: make test
+
+      # Production compilation exercises the pre/post input snapshot and
+      # immutable output-manifest publisher; npm test pins its race guard.
+      - name: dashboard build and tests
+        run: |
+          make dashboard-ui
+          cd dashboard && npm test
 
       # Hostile-env re-run of the shell suites (#63 class). Deliberately a CI
       # step and not part of `make test`: it doubles the bash suites' wall

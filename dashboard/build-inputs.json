@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "files": [
+    "build-inputs.json",
+    "index.html",
+    "package-lock.json",
+    "package.json",
+    "scripts/build-dashboard.mjs",
+    "tsconfig.json",
+    "vite.config.ts"
+  ],
+  "directories": [
+    "public",
+    "src"
+  ]
+}

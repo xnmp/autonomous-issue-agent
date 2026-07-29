@@ -23,8 +23,20 @@ npm run dev       # vite dev server on http://localhost:5173
 ```
 
 `npm run build` emits `dashboard/dist`, which the backend mounts as static
-files (`/` and any non-`/api` path, SPA fallback to `index.html`). The
-harness-level target is `make dashboard-ui`.
+files (`/` and any non-`/api` path, SPA fallback to `index.html`). It also
+snapshots every source/config input before compilation, verifies that snapshot
+after compilation, and records both input and emitted-asset hashes in an
+immutable version directory under `dist/builds/`. A locked build atomically
+publishes the validated version through `dist/current.json`, so rebuilding
+cannot mutate files beneath an existing server. `issue-agent dashboard`
+refuses to serve a bundle whose manifest is missing, malformed, or no longer
+matches the checkout. When the optional dashboard server is installed, startup
+automatically rebuilds and revalidates missing or stale assets; a failed
+rebuild falls back to the lightweight dashboard and prints a cwd-independent
+recovery command. Rebuilds are time-bounded, and each running server holds a
+shared lease on its immutable version so later builds can safely collect unused
+and interrupted versions without breaking live sessions. The harness-level
+target is `make dashboard-ui`.
 
 ### Dev against a running backend
 

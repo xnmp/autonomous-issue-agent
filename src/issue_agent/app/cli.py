@@ -21,6 +21,8 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -1076,16 +1078,85 @@ def log_dir() -> str:
     )
 
 
-def _dashweb_ready() -> bool:
-    """Can `--serve` hand over to the interactive dashboard? Both halves must be
-    present — the `dash` extra AND a built SPA — because either alone degrades
-    to a worse experience than the v1 snapshot (an API with no UI, or a UI with
-    no server)."""
+@dataclass(frozen=True)
+class DashwebPreparation:
+    ready: bool
+    detail: str
+    rebuild_attempted: bool = False
+
+
+DASHBOARD_REBUILD_TIMEOUT_S = 330.0
+
+
+def _run_dashboard_build() -> int:
+    process = subprocess.Popen(
+        ["make", "-C", HARNESS_ROOT, "dashboard-ui"],
+        start_new_session=True,
+    )
+    try:
+        return process.wait(timeout=DASHBOARD_REBUILD_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        _terminate_dashboard_build(process)
+        return 124
+    except KeyboardInterrupt:
+        _terminate_dashboard_build(process)
+        raise
+
+
+def _terminate_dashboard_build(process) -> None:
+    if process.poll() is not None:
+        return
+    os.killpg(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+
+
+def dashboard_build_command(harness_root: str | None = None) -> str:
+    """A shell-safe recovery command that works from any target checkout."""
+    root = shlex.quote(harness_root or HARNESS_ROOT)
+    return f"cd {root} && uv sync --extra sdk --extra dash && make dashboard-ui"
+
+
+def _prepare_dashweb() -> DashwebPreparation:
+    """Ensure the interactive dashboard can serve the current checkout.
+
+    A missing optional server dependency remains an explicit install step. Once
+    FastAPI is present, missing/stale generated assets are rebuilt in the
+    harness checkout and revalidated before they can be served.
+    """
     import importlib.util
 
     if importlib.util.find_spec("fastapi") is None:
-        return False
-    return os.path.isfile(os.path.join(HARNESS_ROOT, "dashboard", "dist", "index.html"))
+        return DashwebPreparation(False, "the optional dashboard server is not installed")
+    from ..adapters.dashweb.bundle import bundle_status
+
+    before = bundle_status(HARNESS_ROOT)
+    if before.ready:
+        return DashwebPreparation(True, before.detail)
+
+    info(f"dashboard frontend is {before.state} ({before.detail}); rebuilding…")
+    try:
+        returncode = _run_dashboard_build()
+    except OSError as exc:
+        return DashwebPreparation(
+            False,
+            f"automatic dashboard rebuild could not start ({exc})",
+            rebuild_attempted=True,
+        )
+
+    after = bundle_status(HARNESS_ROOT)
+    if returncode == 0 and after.ready:
+        return DashwebPreparation(True, "dashboard frontend rebuilt and validated", True)
+    if returncode == 124:
+        detail = "automatic dashboard rebuild timed out"
+    elif returncode != 0:
+        detail = f"automatic dashboard rebuild failed with exit {returncode}"
+    else:
+        detail = f"automatic dashboard rebuild produced an invalid bundle ({after.detail})"
+    return DashwebPreparation(False, detail, rebuild_attempted=True)
 
 
 def cmd_dashboard(args) -> int:
@@ -1137,7 +1208,8 @@ def cmd_dashboard(args) -> int:
         return 0
 
     url = f"http://127.0.0.1:{args.serve}/"
-    if _dashweb_ready():
+    preparation = _prepare_dashweb()
+    if preparation.ready:
         from .dashweb.server import serve as dashweb_serve
 
         info(f"serving the interactive dashboard at {url} (Ctrl-C to stop)")
@@ -1147,7 +1219,8 @@ def cmd_dashboard(args) -> int:
             print()
         return 0
     warn("interactive dashboard unavailable — serving the v1 snapshot instead:")
-    warn("  uv sync --extra dash && make dashboard-ui")
+    warn(f"  {preparation.detail}")
+    warn(f"  {dashboard_build_command()}")
     info(f"serving the dashboard at {url} (Ctrl-C to stop) — regenerated per request")
     try:
         dash.serve(args.serve, lambda: dash.render_html(build()))
