@@ -119,4 +119,31 @@ describe("App navigation", () => {
     expect(screen.queryByRole("tab", { name: /Issues/ })).not.toBeInTheDocument();
     expect(await screen.findByText("Verification ledger", { selector: ".section-title span" })).toBeVisible();
   });
+
+  it("keeps quota and theme settings in the sidebar when collapsed", async () => {
+    window.location.hash = "#/repo/demo/issues/done";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input);
+        if (path === "/api/repos") return json(repos);
+        if (path === "/api/usage") return json(usage);
+        if (path.endsWith("/issues")) return json(issues);
+        return json({ rows: [], warnings: [] });
+      }),
+    );
+
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Settings" });
+    expect(screen.queryByText("Operations")).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    await userEvent.click(screen.getByRole("button", { name: "Quota" }));
+    expect(screen.getByRole("region", { name: "Quota" })).toHaveClass("compact");
+    expect(screen.queryByText("Quota", { selector: ".panel-title" })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Settings" }));
+    await userEvent.selectOptions(screen.getByLabelText("Theme"), "nord");
+    expect(document.documentElement).toHaveAttribute("data-theme", "nord");
+  });
 });

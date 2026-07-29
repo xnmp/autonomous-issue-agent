@@ -185,6 +185,9 @@ def create_app(
                 pull_requests=[],
                 cost_usd=0.0,
                 elapsed_s=None,
+                working_s=None,
+                idle_s=None,
+                idle_active=False,
                 steps=[],
                 events=[],
             )

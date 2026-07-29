@@ -22,6 +22,9 @@ const doneCard: IssueCard = {
   started_ts: "2026-07-29T07:00:00Z",
   last_ts: "2026-07-29T08:00:00Z",
   elapsed_s: 60,
+  working_s: 45,
+  idle_s: 15,
+  idle_active: false,
   projected_eta_s: 60,
   models: ["gpt-5.6-terra", "claude-opus-4-1"],
   model_badges: [
@@ -66,6 +69,9 @@ describe("IssuesTab", () => {
     );
 
     expect(screen.queryByRole("columnheader", { name: "Rounds" })).not.toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: /Verification/ })).toBeVisible();
+    const verification = screen.getByRole("cell", { name: /Issue verified PR pending/ });
+    expect(verification).toBeVisible();
     const row = screen.getByRole("row", { name: /Explain completed work.*#50.*PR #75/ });
     await userEvent.click(row);
     expect(onOpenIssue).not.toHaveBeenCalled();

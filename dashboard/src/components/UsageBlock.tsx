@@ -1,8 +1,9 @@
+import { useState } from "react";
 import type { Polled } from "../api/hooks";
 import type { UsagePayload } from "../api/types";
 import { Meter } from "./ui/Charts";
 import { ErrorBanner } from "./ui/Feedback";
-import { untilLabel, usd } from "../lib/format";
+import { pct, untilLabel, usd } from "../lib/format";
 import { utilTone } from "../lib/semantics";
 
 /**
@@ -13,7 +14,13 @@ import { utilTone } from "../lib/semantics";
  * renders "n/a" with the backend's error string as the tooltip; it never hides
  * the row, because a silently absent meter reads as "0 %".
  */
-export function UsageBlock({ usage }: { usage: Polled<UsagePayload> }) {
+export function UsageBlock({
+  usage,
+  collapsed = false,
+}: {
+  usage: Polled<UsagePayload>;
+  collapsed?: boolean;
+}) {
   const [open, setOpen] = useState(false);
   const u = usage.data;
   const claude = u?.claude ?? null;
@@ -23,20 +30,43 @@ export function UsageBlock({ usage }: { usage: Polled<UsagePayload> }) {
   const today = harness?.today_all_repos_usd ?? null;
   const cap = harness?.global_daily_cap_usd ?? null;
   const capPct = today !== null && cap !== null && cap > 0 ? (today / cap) * 100 : null;
+  const compactMeters = [
+    ["5h", claude?.five_hour_pct ?? null, claude?.error],
+    ["7d", claude?.seven_day_pct ?? null, claude?.error],
+    ["Cx", codex?.weekly_pct ?? null, codex?.error],
+    ["$", capPct, null],
+  ] as const;
 
   return (
-    <div className="usage-floating">
+    <div className={`usage-inline${collapsed ? " collapsed" : ""}`}>
       <button
-        className="quota-fab"
+        className={`rail-btn quota-trigger${collapsed ? " icon-only" : ""}`}
         aria-expanded={open}
         aria-controls="quota-card"
+        aria-label="Quota"
+        title="Quota"
         onClick={() => setOpen((current) => !current)}
       >
-        <span aria-hidden="true">◔</span> Quota
+        <span className="rail-btn-mark quota-icon" aria-hidden="true">◔</span>
+        {!collapsed ? <span>Quota</span> : null}
       </button>
-      {open ? <section className="usage quota-card panel" id="quota-card" aria-label="Quota">
+      {open ? <section className={`usage quota-card panel${collapsed ? " compact" : ""}`} id="quota-card" aria-label="Quota">
+        {collapsed ? (
+          <div className="compact-quota">
+            {compactMeters.map(([label, value, error]) => (
+              <div
+                className="compact-quota-meter"
+                key={label}
+                title={`${label}: ${value === null ? error ?? "unavailable" : pct(value)}`}
+              >
+                <span>{label}</span>
+                <i className={`tone-bg-${utilTone(value)}`} style={{ height: `${Math.max(4, Math.min(100, value ?? 0))}%` }} />
+              </div>
+            ))}
+          </div>
+        ) : (
+        <>
         <div className="usage-hd">
-          <span className="panel-title">Quota</span>
           <button className="btn btn-xs btn-ghost" aria-label="Close quota" onClick={() => setOpen(false)}>×</button>
         </div>
         <div className="usage-body">
@@ -91,8 +121,9 @@ export function UsageBlock({ usage }: { usage: Polled<UsagePayload> }) {
         )}
 
         </div>
+        </>
+        )}
       </section> : null}
     </div>
   );
 }
-import { useState } from "react";

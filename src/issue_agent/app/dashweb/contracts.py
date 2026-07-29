@@ -176,6 +176,9 @@ class IssueCard(Contract):
     started_ts: str | None
     last_ts: str | None
     elapsed_s: float | None
+    working_s: float | None
+    idle_s: float | None
+    idle_active: bool
     projected_eta_s: float | None
     models: list[str]
     model_badges: list[ModelBadge] = []
@@ -260,6 +263,9 @@ class IssueDetailPayload(Warned):
     pull_requests: list[PullRequestLink]
     cost_usd: float | None
     elapsed_s: float | None
+    working_s: float | None
+    idle_s: float | None
+    idle_active: bool
     steps: list[IssueStep]
     events: list[dict[str, Any]]
 

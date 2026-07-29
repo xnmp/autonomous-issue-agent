@@ -100,6 +100,7 @@ class StubBackend:
                     "done": False, "steps": [], "cost_usd": 0.0,
                     "estimated": False, "projected_cost_usd": None,
                     "started_ts": None, "last_ts": None, "elapsed_s": None,
+                    "working_s": None, "idle_s": None, "idle_active": False,
                     "projected_eta_s": None, "models": [], "rounds": 0,
                     "flags": [],
                 }], "pending": [], "done": [],
@@ -111,6 +112,9 @@ class StubBackend:
             "issue": number, "title": None, "url": None, "stage": "queued",
             "done": False, "prs": [], "pull_requests": [], "cost_usd": 0.0,
             "elapsed_s": None,
+            "working_s": None,
+            "idle_s": None,
+            "idle_active": False,
             "steps": [], "events": [], "warnings": [],
         }
 
@@ -251,6 +255,9 @@ def test_issue_failure_payload_still_satisfies_the_rendering_contract():
         "pull_requests": [],
         "cost_usd": 0.0,
         "elapsed_s": None,
+        "working_s": None,
+        "idle_s": None,
+        "idle_active": False,
         "steps": [],
         "events": [],
         "warnings": ["issue detail unavailable (RuntimeError: collector blew up)"],

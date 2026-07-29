@@ -624,6 +624,21 @@
             "title": "Flags",
             "type": "array"
           },
+          "idle_active": {
+            "title": "Idle Active",
+            "type": "boolean"
+          },
+          "idle_s": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idle S"
+          },
           "issue": {
             "title": "Issue",
             "type": "integer"
@@ -814,6 +829,17 @@
               }
             ],
             "title": "Url"
+          },
+          "working_s": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Working S"
           }
         },
         "required": [
@@ -832,6 +858,9 @@
           "started_ts",
           "last_ts",
           "elapsed_s",
+          "working_s",
+          "idle_s",
+          "idle_active",
           "projected_eta_s",
           "models",
           "rounds",
@@ -876,6 +905,21 @@
             },
             "title": "Events",
             "type": "array"
+          },
+          "idle_active": {
+            "title": "Idle Active",
+            "type": "boolean"
+          },
+          "idle_s": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idle S"
           },
           "issue": {
             "title": "Issue",
@@ -941,6 +985,17 @@
             },
             "title": "Warnings",
             "type": "array"
+          },
+          "working_s": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Working S"
           }
         },
         "required": [
@@ -954,6 +1009,9 @@
           "pull_requests",
           "cost_usd",
           "elapsed_s",
+          "working_s",
+          "idle_s",
+          "idle_active",
           "steps",
           "events"
         ],

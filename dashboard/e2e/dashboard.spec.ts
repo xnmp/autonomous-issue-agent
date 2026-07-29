@@ -65,6 +65,9 @@ const issueCard = {
   cost_usd: 2,
   estimated: false,
   elapsed_s: 60,
+  working_s: 45,
+  idle_s: 15,
+  idle_active: false,
   started_ts: "2026-07-29T07:00:00Z",
   last_ts: "2026-07-29T08:00:00Z",
   merged_ts: "2026-07-29T08:00:00Z",
@@ -105,6 +108,9 @@ const issue = {
   ],
   cost_usd: 2,
   elapsed_s: 60,
+  working_s: 45,
+  idle_s: 15,
+  idle_active: false,
   steps: [
     {
       idx: 0,
@@ -203,17 +209,59 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await quotaButton.click();
   await expect(quotaButton).toHaveAttribute("aria-expanded", "true");
   await expect(page.getByRole("region", { name: "Quota" })).toBeVisible();
+  await expect(page.getByText("Quota", { exact: true })).toHaveCount(1);
 
   const sidebar = page.locator(".sidebar");
   await expect(page.locator(".sidebar-scroll")).toHaveCSS("overflow-y", "auto");
   await expect(page.getByRole("separator", { name: "Resize sidebar" })).toBeVisible();
   await page.getByRole("button", { name: "Collapse sidebar" }).click();
   await expect(sidebar).toHaveClass(/collapsed/);
+  await expect(page.getByRole("button", { name: "Quota" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Quota" })).toHaveClass(/compact/);
+  await page.screenshot({
+    path: "../evidence/dashboard-sidebar-collapsed.png",
+    fullPage: true,
+  });
+  await page.getByRole("button", { name: "Quota", exact: true }).click();
   await page.getByRole("button", { name: "Expand sidebar" }).click();
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByLabel("Theme").selectOption("nord");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "nord");
+  await page.screenshot({
+    path: "../evidence/dashboard-theme-settings.png",
+    fullPage: true,
+  });
+  await page.getByLabel("Theme").selectOption("cosmic-dusk");
+  await page.getByRole("button", { name: "Settings" }).click();
+  await page.getByRole("button", { name: "Quota", exact: true }).click();
   await page.screenshot({
     path: "../evidence/dashboard-issues-table.png",
     fullPage: true,
   });
+
+  const durationHeader = page.locator('th[data-column-key="duration"]');
+  const durationBefore = await durationHeader.boundingBox();
+  const durationHandle = page.getByRole("separator", { name: "Resize Duration column" });
+  const handleBox = await durationHandle.boundingBox();
+  expect(durationBefore).not.toBeNull();
+  expect(handleBox).not.toBeNull();
+  const handleX = handleBox!.x + 1;
+  const handleY = handleBox!.y + handleBox!.height / 2;
+  await page.mouse.move(handleX, handleY);
+  await page.mouse.down();
+  await page.mouse.move(handleX - 36, handleY);
+  await page.mouse.up();
+  const durationAfter = await durationHeader.boundingBox();
+  expect(durationAfter!.width).toBeLessThan(durationBefore!.width);
+  expect(durationAfter!.width).toBeGreaterThanOrEqual(112);
+
+  const issueHeader = page.locator('th[data-column-key="issue"]');
+  await expect(issueHeader).toHaveAttribute("aria-sort", "none");
+  await page.getByRole("button", { name: "Sort by Issue" }).click();
+  await expect(issueHeader).toHaveAttribute("aria-sort", "ascending");
+  await page.getByRole("button", { name: "Sort by Issue" }).click();
+  await expect(issueHeader).toHaveAttribute("aria-sort", "descending");
 
   await page.getByRole("row", { name: /Explain completed work.*#50/ }).click();
   await page.getByRole("button", { name: "Open full issue" }).click();
