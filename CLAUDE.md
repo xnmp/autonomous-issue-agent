@@ -236,6 +236,9 @@ harness never creates them.
 gate, the red-fail (anti-tautological-test) gate, and the reviewer's test run. For
 a monorepo, compose the tiers with `set -e` (e.g.
 `set -e; (cd backend && uv run pytest) && (cd frontend && pnpm exec tsc -b)`).
+The command is launched with harness/deployment controls removed from its child
+environment (`TEST_CMD`, `AGENT_ENV`, gate controls, GitHub App settings, and
+`TARGET_DIR`); target tests must receive their own configuration explicitly.
 
 On codex, `MAX_BUDGET_USD` is enforced in the harness rather than by a CLI
 flag: the runner samples the rollout's cumulative token counters, subtracts the
