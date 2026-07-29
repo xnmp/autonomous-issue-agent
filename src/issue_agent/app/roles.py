@@ -109,7 +109,7 @@ def review_capability_line(*, can_approve: bool, adopt_unlabeled: bool) -> str:
 
 
 def steward_capability_line(*, triage: bool, promote: bool, jira_sync: bool,
-                            recurrence: bool) -> str:
+                            recurrence: bool, groom: bool = False) -> str:
     """One boot line for the steward — the role that can be configured into
     doing literally nothing (#46).
 
@@ -127,15 +127,15 @@ def steward_capability_line(*, triage: bool, promote: bool, jira_sync: bool,
     recurrence_note = (
         "recurrence=watch" if recurrence else "recurrence=inert (FIX_BOT unset)"
     )
-    if triage or promote or jira_sync:
+    if triage or groom or promote or jira_sync:
         return (
             "steward: capabilities: "
-            f"triage={_onoff(triage)} promote={_onoff(promote)} "
+            f"triage={_onoff(triage)} groom={_onoff(groom)} promote={_onoff(promote)} "
             f"jira_sync={_onoff(jira_sync)} {recurrence_note}"
         )
     return (
         "steward: capabilities: NONE — this daemon will poll but has no work it "
-        "can do (STEWARD_TRIAGE=0 STEWARD_PROMOTE=0 JIRA_SYNC=0)"
+        "can do (STEWARD_TRIAGE=0 STEWARD_GROOM=0 STEWARD_PROMOTE=0 JIRA_SYNC=0)"
         f" — {recurrence_note}"
     )
 
@@ -1031,11 +1031,14 @@ def build_steward_daemon(
     # and recurrence watching needs a FIX_BOT to attribute merged PRs to.
     steward_log(steward_capability_line(
         triage=tcfg_dom.enabled,
+        groom=cfg.steward_groom,
         promote=tcfg_dom.promote,
         jira_sync=jira_on,
         recurrence=bool(cfg.fix_runtime.bot)
         and getattr(gateway, "issue_state_reason", None) is not None,
     ))
+    if cfg.steward_groom_edit:
+        steward_log("STEWARD_GROOM_EDIT=1 is inert: grooming currently comments only; issue bodies are never edited")
 
     def decide(world):
         # Before the pure decide, as in the fixer: if the decision raises, the
@@ -1060,6 +1063,7 @@ def build_steward_daemon(
                 world,
                 {i.number: store.get_groom_at(i.number) for i in world.issues},
                 cfg.steward_groom,
+                {i.number: store.get_groom_content(i.number) for i in world.issues},
             )
             if not exhausted(n)
         )

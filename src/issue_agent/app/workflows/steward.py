@@ -152,9 +152,9 @@ class StewardWorkflow:
         # Record after writes because comments update GitHub's timestamp. That
         # makes an unchanged issue one-shot while a later human edit reopens the
         # advisory scan without relying on process memory.
-        record = getattr(self.store, "set_groom_at", None)
-        if record is not None:
-            record(issue, self.gateway.get_issue(issue).updated_at)
+        updated = self.gateway.get_issue(issue)
+        self.store.set_groom_at(issue, updated.updated_at)
+        self.store.set_groom_content(issue, triage_dom.grooming_content(updated))
 
     async def triage(self, issue: int) -> None:
         self.cfg.log(f"triage #{issue}: classifying")

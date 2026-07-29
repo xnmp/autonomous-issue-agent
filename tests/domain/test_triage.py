@@ -10,6 +10,7 @@ from issue_agent.domain.triage import (
     TriageState,
     TriageVerdict,
     actions_for_verdict,
+    grooming_candidates,
     grooming_actions,
     is_untriaged,
     parse_codeowners_default,
@@ -60,6 +61,27 @@ def test_no_feedback_loop_after_recording_post_action_updatedat():
     assert triage_candidates(w, CFG, st_correct) == []
     st_buggy = TriageState(seen_at={1: "t1"})
     assert triage_candidates(w, CFG, st_buggy) == [1]  # the old infinite-bounce
+
+
+def test_grooming_candidates_skip_unchanged_and_closed_issues():
+    w = world(issues=[
+        issue(1, updated_at="t1"),
+        issue(2, updated_at="t2", state="closed"),
+    ])
+    assert grooming_candidates(w, {1: "t1"}, True) == []
+
+
+def test_grooming_candidates_include_changed_issue_and_respect_enabled_flag():
+    w = world(issues=[issue(1, updated_at="t2")])
+    assert grooming_candidates(w, {1: "t1"}, True) == [1]
+    assert grooming_candidates(w, {1: "t1"}, False) == []
+
+
+def test_grooming_candidates_damp_comment_only_updates_and_cap_first_pass_spend():
+    issues = [issue(n, title=f"T{n}", body="unchanged", updated_at="new") for n in range(1, 8)]
+    seen_content = {n: f"T{n}\0unchanged" for n in range(1, 8)}
+    assert grooming_candidates(world(issues=issues), {}, True, seen_content) == []
+    assert grooming_candidates(world(issues=issues), {}, True) == [1, 2, 3, 4, 5]
 
 
 # ── verdict → actions (audience split) ────────────────────────────────────────

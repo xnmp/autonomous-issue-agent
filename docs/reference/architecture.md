@@ -26,6 +26,12 @@ in `make test`): `domain/` is pure — no I/O, no env, no clock — `adapters/` 
 I/O, `app/` is wiring. New pure logic goes in `domain/`; new I/O goes behind an
 existing adapter or an injected callable.
 
+The steward optionally grooms open issue bodies (`STEWARD_GROOM=1`): it emits
+advisory comments and the orthogonal `maybe-resolved` label for verified recent
+merge matches or stale references, never a close action. Grooming is capped at
+five candidates per changed tick and persists a title/body signature after a
+successful delivery, preventing harness comments from self-amplifying spend.
+
 ## The five properties worth preserving
 
 These are what adversarial review and live deployments identified as

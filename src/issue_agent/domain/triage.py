@@ -63,14 +63,31 @@ class TriageState:
     seen_at: dict[int, str] = field(default_factory=dict)
 
 
-def grooming_candidates(world: WorldState, seen_at: Mapping[int, str], enabled: bool) -> list[int]:
-    """Open issues whose content changed since their last advisory grooming scan."""
+def grooming_content(issue: IssueView) -> str:
+    """The user-authored issue fields grooming may act on, excluding comments."""
+    return f"{issue.title}\0{issue.body}"
+
+
+def grooming_candidates(
+    world: WorldState, seen_at: Mapping[int, str], enabled: bool,
+    seen_content: Mapping[int, str] | None = None, limit: int = 5,
+) -> list[int]:
+    """Bounded open-issue grooming candidates.
+
+    Comments (including the harness's own triage/recurrence notices) change
+    ``updated_at`` but do not alter the issue report. Once a content signature
+    has been recorded, those unrelated updates must not buy another classifier
+    run. The cap bounds first-enable spend; remaining unscanned issues retain an
+    empty signature and are picked on later changed ticks.
+    """
     if not enabled:
         return []
+    content = seen_content or {}
     return [
         issue.number for issue in world.open_issues()
         if issue.updated_at != seen_at.get(issue.number, "")
-    ]
+        and (not content.get(issue.number) or content[issue.number] != grooming_content(issue))
+    ][:max(0, limit)]
 
 
 @dataclass(frozen=True)

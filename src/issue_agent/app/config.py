@@ -294,7 +294,7 @@ class HarnessConfig:
     review_dimension_budget_usd: float = 0.75
     review_validation_budget_usd: float = 0.20
     steward_triage: bool = True
-    # Advisory grooming is on by default; it never closes or edits issue bodies.
+    # Advisory grooming is opt-in; it never closes or edits issue bodies.
     steward_groom: bool = False
     # Reserved explicit opt-in for future body rewrites; current grooming only
     # comments, regardless of this setting.
