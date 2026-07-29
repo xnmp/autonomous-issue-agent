@@ -930,10 +930,12 @@ def ci_flakes(
     )
 
 
-def _escalate_pr(pr: int, reason: str) -> list[Action]:
+def _escalate_pr(
+    pr: int, reason: str, from_label: Label = Label.AI_PR_OPEN
+) -> list[Action]:
     """Stop dispatching a stuck PR leg: comment why, then swap ai-pr-open for
     needs-human-review so neither the fixer nor the reviewer re-acts on it."""
-    return pr_escalation(pr, reason).actions()
+    return pr_escalation(pr, reason, from_label).actions()
 
 
 def infra_ceiling_hit(state: FixState, cfg: FixConfig, key: int) -> bool:
@@ -1045,12 +1047,10 @@ def decide_fix(
                 bkey = breaker_key(pr)
                 if infra_ceiling_hit(state, cfg, bkey):
                     actions.extend(_escalate_pr(
-                        pr.number, infra_escalation_reason(cfg.max_infra_deaths)
+                        pr.number, infra_escalation_reason(cfg.max_infra_deaths),
+                        Label.AI_BLOCKED,
                     ))
                     continue
-                actions.append(
-                    Relabel(Target.PR, pr.number, Label.AI_BLOCKED, Label.AI_WORKING)
-                )
                 actions.append(RunAgent(AgentKind.PR_RESUME, pr.number))
                 consumed = True
             continue

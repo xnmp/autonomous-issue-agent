@@ -95,11 +95,11 @@ def test_unclassified_result_is_never_an_infra_death():
     assert infra_death(None) is False
 
 
-def test_pr_resume_infra_death_restores_the_blocked_pr():
+def test_pr_resume_infra_death_keeps_the_blocked_pr_unchanged():
     actions = pr_resume_actions(
         100, AgentResult(is_error=True, exit_reason=ExitReason.TRANSPORT_DEATH)
     )
-    assert actions == [Relabel(Target.PR, 100, Label.AI_WORKING, Label.AI_BLOCKED)]
+    assert actions == []
     assert AgentResult(is_error=True).exit_reason is None
     assert AgentResult(is_error=True).usage is None
 

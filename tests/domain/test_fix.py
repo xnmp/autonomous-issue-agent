@@ -389,7 +389,6 @@ def test_blocked_pr_reply_dispatches_pr_resume_for_linked_issue_session():
     assert prs_needing_resume(w, state, CFG) == [(100, 7, "t2")]
     actions = decide_fix(w, CFG, state, fixer_busy=False)
 
-    assert Relabel(Target.PR, 100, Label.AI_BLOCKED, Label.AI_WORKING) in actions
     assert RunAgent(AgentKind.PR_RESUME, 100) in _run_agents(actions)
 
 
@@ -403,6 +402,37 @@ def test_blocked_pr_reply_already_resumed_does_not_dispatch_again():
 
     assert prs_needing_resume(world(prs=[blocked]), state, CFG) == []
     assert _run_agents(decide_fix(world(prs=[blocked]), CFG, state, fixer_busy=False)) == []
+
+
+def test_blocked_pr_newer_reply_after_dedupe_dispatches_once_more():
+    prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
+    blocked = pr(
+        100, "ai-pr-open", "ai-blocked", closing_issue=7,
+        comments=(
+            Comment("fix-bot", prompt, "t1"),
+            Comment("alice", "Use A.", "t2"),
+            Comment("alice", "Actually use B.", "t3"),
+        ),
+    )
+    state = FixState(sessions=frozenset({7}), pr_resumed_at={100: "t2"})
+
+    assert prs_needing_resume(world(prs=[blocked]), state, CFG) == [(100, 7, "t3")]
+    assert RunAgent(AgentKind.PR_RESUME, 100) in _run_agents(
+        decide_fix(world(prs=[blocked]), CFG, state, fixer_busy=False)
+    )
+
+
+def test_pr_resume_infra_ceiling_replaces_the_blocked_label():
+    prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
+    blocked = pr(
+        100, "ai-pr-open", "ai-blocked", closing_issue=7,
+        comments=(Comment("fix-bot", prompt, "t1"), Comment("alice", "Use A.", "t2")),
+    )
+    state = FixState(sessions=frozenset({7}), infra_deaths={7: 5})
+
+    assert Relabel(Target.PR, 100, Label.AI_BLOCKED, Label.NEEDS_HUMAN_REVIEW) in decide_fix(
+        world(prs=[blocked]), INFRA_CFG, state, fixer_busy=False
+    )
 
 
 # ── conflict backup plan: auto-rebase a CONFLICTING PR ────────────────────────

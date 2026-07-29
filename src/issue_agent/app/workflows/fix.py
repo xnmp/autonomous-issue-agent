@@ -586,9 +586,6 @@ class FixWorkflow:
         if reply_comment is None or not reply_comment.body.strip():
             if reply_comment is not None:
                 self.store.set_pr_resumed_at(pr, reply_comment.created_at)
-            self.executor.execute_all([
-                Relabel(Target.PR, pr, Label.AI_WORKING, Label.AI_BLOCKED)
-            ])
             return
         # Persist before the paid run: an unchanged PR reply must not fire again
         # after a crash or another blocked result.

@@ -461,19 +461,17 @@ def pr_resume_actions(pr: int, result: AgentResult) -> list[Action]:
 
     The linked issue already remains `ai-pr-open`; only the PR was blocked, so
     changing the issue here would manufacture a second lifecycle state to keep
-    coherent. An infra death restores the PR's blocked state: its reply mark
-    prevents a loop on the same comment, while a later reply can still advance
-    the shared infra-death ceiling.
+    coherent. The PR stays blocked while the one-at-a-time dispatcher runs, so
+    a raised runner exception cannot strand an invented `ai-working` marker.
     """
     if infra_death(result.exit_reason):
-        return [Relabel(Target.PR, pr, Label.AI_WORKING, Label.AI_BLOCKED)]
+        return []
     if classify_outcome(result) is Outcome.BLOCKED:
         needs = result.needs or result.summary or "see logs"
         return [
             PostComment(Target.PR, pr, f"**Agent still needs input:**\n\n{needs}{_BLOCKED_FOOTER}"),
-            Relabel(Target.PR, pr, Label.AI_WORKING, Label.AI_BLOCKED),
         ]
-    return [Relabel(Target.PR, pr, Label.AI_WORKING, Label.AI_PR_OPEN)]
+    return [Relabel(Target.PR, pr, Label.AI_BLOCKED, Label.AI_PR_OPEN)]
 
 
 @dataclass(frozen=True)

@@ -266,7 +266,7 @@ def test_pr_resume_uses_pr_reply_and_linked_issue_session_once():
 
     assert store.get_pr_resumed_at(100) == "t2"
     assert "Use A." in runner.tasks[0].prompt
-    assert ("relabel", "pr", 100, "ai-working", "ai-pr-open") in gw.calls
+    assert ("relabel", "pr", 100, "ai-blocked", "ai-pr-open") in gw.calls
 
 
 def test_resume_without_human_reply_does_not_run():
