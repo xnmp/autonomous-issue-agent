@@ -2,6 +2,8 @@
 
 import asyncio
 
+import pytest
+
 from builders import Comment, issue, world
 from test_convergence import Scenario, simulate
 from test_dispatch import FakeGateway, FakeRunner, FakeStore
@@ -76,7 +78,10 @@ def test_sessionless_reply_keeps_world_order_when_saved_session_also_waits():
     ]
 
 
-def test_sessionless_reply_starts_fresh_with_issue_and_reply_context():
+@pytest.mark.parametrize("author_tests_split", [False, True])
+def test_sessionless_reply_starts_fresh_with_issue_and_reply_context(
+    author_tests_split,
+):
     iss = IssueView(
         5,
         title="Choose storage",
@@ -92,7 +97,13 @@ def test_sessionless_reply_starts_fresh_with_issue_and_reply_context():
     )
 
     asyncio.run(
-        _workflow(gateway, FakeStore(), runner, fix_bot="fix-bot").resume(5)
+        _workflow(
+            gateway,
+            FakeStore(),
+            runner,
+            fix_bot="fix-bot",
+            author_tests_split=author_tests_split,
+        ).resume(5)
     )
 
     task = runner.tasks[0]
@@ -102,7 +113,10 @@ def test_sessionless_reply_starts_fresh_with_issue_and_reply_context():
     assert "Use PostgreSQL." in task.prompt
 
 
-def test_reply_with_session_continues_the_saved_runtime_handle():
+@pytest.mark.parametrize("author_tests_split", [False, True])
+def test_reply_with_session_continues_the_saved_runtime_handle(
+    author_tests_split,
+):
     iss = IssueView(
         5,
         title="t",
@@ -123,6 +137,14 @@ def test_reply_with_session_continues_the_saved_runtime_handle():
         )
     )
 
-    asyncio.run(_workflow(gateway, store, runner, fix_bot="fix-bot").resume(5))
+    asyncio.run(
+        _workflow(
+            gateway,
+            store,
+            runner,
+            fix_bot="fix-bot",
+            author_tests_split=author_tests_split,
+        ).resume(5)
+    )
 
     assert runner.tasks[0].resume == "prior-session"
