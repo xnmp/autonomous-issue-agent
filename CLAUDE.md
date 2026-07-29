@@ -219,10 +219,10 @@ self-referential `TEST_CMD`/`.harness/test-cmd` (the #63 fork-bomb class) into
 a loud bounded failure instead of an unbounded process tree; gate timeouts
 kill the whole process group, not just the direct child.
 
-Late-heartbeat reconciliation uses the difference between wall time and active
-monotonic time to distinguish a machine suspension from an ordinary long agent
-leg. A detected gap journals a `stall`, re-verifies structured durable `action`
-receipts through the #64 pending-action machinery, and appends
+Late-heartbeat reconciliation requires both the wall threshold and a positive
+wall-minus-active-monotonic gap, distinguishing a machine suspension from an
+ordinary long agent leg. A detected gap journals a `stall`, re-verifies durable
+`action` receipts through the #64 pending-action machinery, and appends
 `agent_run_stall` corrections for overlapping settled legs. The journal stays
 append-only; each leg's correction comes from its wall duration minus monotonic
 runtime, and dashboard wall-clock calculations cluster overlapping role
