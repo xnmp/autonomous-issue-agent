@@ -1132,6 +1132,13 @@ def from_env(env: dict | None = None) -> HarnessConfig:
     # from_env itself must never traceback on operator input (review M2).
     errors: list[str] = []
     repo = e.get("REPO", "")
+    reviewer_runtime = e.get("REVIEWER_RUNTIME", _dc_default("reviewer_runtime"))
+    # The Codex default model cannot be handed to the Claude SDK when an
+    # operator deliberately chooses the diversity posture. An explicit model
+    # always wins; only an omitted REVIEW_MODEL is runtime-specific.
+    review_model = e.get("REVIEW_MODEL") or (
+        "opus" if reviewer_runtime == "claude" else _dc_default("review_model")
+    )
     return HarnessConfig(
         repo=repo,
         base_branch=e.get("BASE_BRANCH", _dc_default("base_branch")),
@@ -1195,7 +1202,7 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         escalate_on_evidence=_b(
             e, "ESCALATE_ON_EVIDENCE", _dc_default("escalate_on_evidence"), errors
         ),
-        review_model=e.get("REVIEW_MODEL") or _dc_default("review_model"),
+        review_model=review_model,
         steward_triage_model=e.get("STEWARD_TRIAGE_MODEL", _dc_default("steward_triage_model"))
         or None,
         fix_budget_usd=_coerce_float(e, "MAX_BUDGET_USD", _dc_default("fix_budget_usd"), errors),
@@ -1249,7 +1256,7 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         jira_mcp_tools=e.get("JIRA_MCP_TOOLS", _dc_default("jira_mcp_tools")),
         jira_budget_usd=_coerce_float(e, "JIRA_SYNC_BUDGET_USD", _dc_default("jira_budget_usd"), errors),
         fixer_runtime=e.get("FIXER_RUNTIME", _dc_default("fixer_runtime")),
-        reviewer_runtime=e.get("REVIEWER_RUNTIME", _dc_default("reviewer_runtime")),
+        reviewer_runtime=reviewer_runtime,
         codex_bin=e.get("CODEX_BIN", _dc_default("codex_bin")),
         codex_model=e.get("CODEX_MODEL", _dc_default("codex_model")),
         codex_provider_id=e.get("CODEX_PROVIDER_ID", _dc_default("codex_provider_id")),
