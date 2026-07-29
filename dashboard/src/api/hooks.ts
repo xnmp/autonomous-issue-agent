@@ -14,6 +14,37 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { isAbort } from "./client";
 
+interface CachedPoll {
+  data: unknown;
+  updatedAt: number;
+}
+
+interface PollState<T> {
+  key: string | null;
+  data: T | null;
+  error: string | null;
+  updatedAt: number | null;
+}
+
+const successfulPolls = new Map<string, CachedPoll>();
+const MAX_CACHED_POLLS = 64;
+
+function cachedPoll<T>(key: string | null): { data: T | null; updatedAt: number | null } {
+  if (key === null) return { data: null, updatedAt: null };
+  const cached = successfulPolls.get(key);
+  return cached
+    ? { data: cached.data as T, updatedAt: cached.updatedAt }
+    : { data: null, updatedAt: null };
+}
+
+function rememberSuccessfulPoll(key: string, value: CachedPoll): void {
+  successfulPolls.delete(key);
+  successfulPolls.set(key, value);
+  if (successfulPolls.size <= MAX_CACHED_POLLS) return;
+  const oldest = successfulPolls.keys().next().value;
+  if (oldest !== undefined) successfulPolls.delete(oldest);
+}
+
 /* --------------------------------------------------- document visibility */
 
 function subscribeVisibility(cb: () => void): () => void {
@@ -46,21 +77,28 @@ export function usePolled<T>(
   fetcher: (signal: AbortSignal) => Promise<T>,
   intervalMs: number,
 ): Polled<T> {
-  const [data, setData] = useState<T | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [updatedAt, setUpdatedAt] = useState<number | null>(null);
+  const initial = cachedPoll<T>(key);
+  const [state, setState] = useState<PollState<T>>({
+    key,
+    data: initial.data,
+    error: null,
+    updatedAt: initial.updatedAt,
+  });
   const [nonce, setNonce] = useState(0);
   const visible = useDocumentVisible();
+  const current = state.key === key
+    ? state
+    : { key, ...cachedPoll<T>(key), error: null };
 
   const fetcherRef = useRef(fetcher);
   fetcherRef.current = fetcher;
 
-  // A key change means a different resource: drop the previous resource's data
-  // so a stale repo's numbers never appear under a new repo's heading.
+  // A key change may restore only that exact resource's last successful value.
+  // This keeps tab navigation instant without ever showing one repo's data
+  // under another repo's heading; the effect below still refreshes immediately.
   useEffect(() => {
-    setData(null);
-    setError(null);
-    setUpdatedAt(null);
+    const cached = cachedPoll<T>(key);
+    setState({ key, data: cached.data, error: null, updatedAt: cached.updatedAt });
   }, [key]);
 
   useEffect(() => {
@@ -72,12 +110,18 @@ export function usePolled<T>(
       try {
         const value = await fetcherRef.current(ac.signal);
         if (cancelled) return;
-        setData(value);
-        setError(null);
-        setUpdatedAt(Date.now());
+        const completedAt = Date.now();
+        rememberSuccessfulPoll(key, { data: value, updatedAt: completedAt });
+        setState({ key, data: value, error: null, updatedAt: completedAt });
       } catch (e) {
         if (cancelled || isAbort(e)) return;
-        setError(e instanceof Error ? e.message : String(e));
+        const cached = cachedPoll<T>(key);
+        setState((previous) => ({
+          key,
+          data: previous.key === key ? previous.data : cached.data,
+          error: e instanceof Error ? e.message : String(e),
+          updatedAt: previous.key === key ? previous.updatedAt : cached.updatedAt,
+        }));
       }
     };
 
@@ -97,7 +141,13 @@ export function usePolled<T>(
   }, [key, intervalMs, visible, nonce]);
 
   const refresh = useCallback(() => setNonce((n) => n + 1), []);
-  return { data, error, loading: data === null && error === null, updatedAt, refresh };
+  return {
+    data: current.data,
+    error: current.error,
+    loading: current.data === null && current.error === null,
+    updatedAt: current.updatedAt,
+    refresh,
+  };
 }
 
 /* ------------------------------------------------------- live 1 s ticker */
