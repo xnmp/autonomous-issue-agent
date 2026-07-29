@@ -457,6 +457,28 @@ def test_unpinned_sdk_legs_journal_the_init_models_resolved_value(monkeypatch, t
         assert settled["model"] == "claude-opus-4-1"
 
 
+def test_pinned_sdk_review_journal_keeps_the_configured_model(monkeypatch, tmp_path):
+    """Configured aliases remain the journal's model across the SDK session."""
+    from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
+
+    init = type("InitMessage", (), {
+        "subtype": "init", "data": {"model": "claude-opus-4-1"},
+    })()
+    result = _ResultMessage(
+        is_error=False, structured_output={"decision": "APPROVE"}, session_id="s1",
+    )
+    _install_fake_sdk(monkeypatch, [init, result])
+    journal = Journal(str(tmp_path / "review-journal.jsonl"))
+    runner = JournalingRuntime(AgentRunner(), journal, role="review")
+    runner.set_context("review", "REVIEW", 100, 91)
+
+    asyncio.run(runner.run(AgentTask(prompt="configured SDK leg", model="opus")))
+
+    start, settled = read_events(journal.path)
+    assert start["model"] == "opus"
+    assert settled["model"] == "opus"
+
+
 def test_unpinned_sdk_no_result_journals_the_init_models_resolved_value(monkeypatch, tmp_path):
     """A dropped terminal envelope retains the SDK model in its settled receipt."""
     from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
