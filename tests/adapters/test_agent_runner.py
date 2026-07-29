@@ -433,27 +433,28 @@ def test_run_honours_result_despite_post_result_raise(monkeypatch):
     assert r.is_error is False
 
 
-def test_unpinned_sdk_review_journals_the_init_models_resolved_value(monkeypatch, tmp_path):
-    """The review dashboard's settled receipt gets the SDK's actual default."""
+def test_unpinned_sdk_legs_journal_the_init_models_resolved_value(monkeypatch, tmp_path):
+    """Default-model review and steward receipts name the concrete SDK model."""
     from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
 
-    init = type("InitMessage", (), {
-        "subtype": "init", "data": {"model": "claude-opus-4-1"},
-    })()
-    result = _ResultMessage(
-        is_error=False, structured_output={"decision": "APPROVE"}, session_id="s1",
-    )
-    _install_fake_sdk(monkeypatch, [init, result])
+    for role, kind in (("review", "REVIEW"), ("steward", "TRIAGE"), ("steward", "GROOM")):
+        init = type("InitMessage", (), {
+            "subtype": "init", "data": {"model": "claude-opus-4-1"},
+        })()
+        result = _ResultMessage(
+            is_error=False, structured_output={"decision": "APPROVE"}, session_id="s1",
+        )
+        _install_fake_sdk(monkeypatch, [init, result])
 
-    journal = Journal(str(tmp_path / "review-journal.jsonl"))
-    runner = JournalingRuntime(AgentRunner(), journal, role="review")
-    runner.set_context("review", "REVIEW", 100, 91)
+        journal = Journal(str(tmp_path / f"{role}-{kind}.jsonl"))
+        runner = JournalingRuntime(AgentRunner(), journal, role=role)
+        runner.set_context(role, kind, 100, 91)
 
-    asyncio.run(runner.run(AgentTask(prompt="review")))
+        asyncio.run(runner.run(AgentTask(prompt="unconfigured SDK leg")))
 
-    start, settled = read_events(journal.path)
-    assert start["model"] == ""
-    assert settled["model"] == "claude-opus-4-1"
+        start, settled = read_events(journal.path)
+        assert start["model"] == ""
+        assert settled["model"] == "claude-opus-4-1"
 
 
 def test_run_skips_task_notification_followup_result(monkeypatch):

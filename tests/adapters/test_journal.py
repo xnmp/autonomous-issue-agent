@@ -780,6 +780,18 @@ def test_a_run_that_raises_is_settled_as_a_transport_death_and_re_raises(tmp_pat
     assert read_events(ledger) == []
 
 
+def test_review_with_a_configured_model_journals_it_at_start_and_settlement(tmp_path):
+    """A configured REVIEW_MODEL is visible before and after the SDK session."""
+    rt, journal, _ = _runtime(tmp_path, AgentResult(is_error=False))
+    rt.set_context("review", "REVIEW", 100, 91)
+
+    asyncio.run(rt.run(AgentTask(prompt="review", model="claude-opus-4-1")))
+
+    start, settled = read_events(journal.path)
+    assert start["model"] == "claude-opus-4-1"
+    assert settled["model"] == "claude-opus-4-1"
+
+
 def test_a_deterministic_death_is_journaled_distinctly_with_the_offending_path(tmp_path):
     # #13: `transport_death` alone cannot distinguish a loop that will never
     # converge from one a retry rescues, and the operator's first question is
