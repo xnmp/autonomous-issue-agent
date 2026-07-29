@@ -254,9 +254,11 @@ def test_late_heartbeat_journals_reconciles_and_annotates_overlapping_leg(tmp_pa
     )
 
     times = iter([0, 240])
+    active_times = iter([0, 60])
     daemon.run_forever(
         sleep=lambda _seconds: None,
         now=lambda: next(times),
+        active_now=lambda: next(active_times),
         max_ticks=1,
     )
 
@@ -276,7 +278,7 @@ def test_late_heartbeat_journals_reconciles_and_annotates_overlapping_leg(tmp_pa
     assert any(
         event["event"] == "action"
         and event["desc"] == "comment issue #5 (7 chars)"
-        and event["replayed"] is True
+        and event.get("replayed") is True
         for event in events
     )
     assert [
@@ -324,6 +326,29 @@ def test_heartbeat_below_stall_threshold_does_not_reconcile_or_journal(tmp_path)
 
     assert read_events(journal.path) == []
     assert gateway.calls == []
+
+
+def test_long_active_agent_leg_is_not_mislabeled_as_a_suspension(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _world: [],
+        Executor(FakeGateway(), journal=journal),
+        poll_seconds=60,
+        journal=journal,
+    )
+    wall_times = iter([0, 900])
+    active_times = iter([0, 900])
+
+    daemon.run_forever(
+        sleep=lambda _seconds: None,
+        now=lambda: next(wall_times),
+        active_now=lambda: next(active_times),
+        max_ticks=1,
+    )
+
+    assert read_events(journal.path) == []
 
 
 def _waking_daemon(wake_check, poll_seconds=60, logs=None):

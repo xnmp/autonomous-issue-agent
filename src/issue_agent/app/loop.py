@@ -17,8 +17,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+import time
 
 from ..adapters.github import GhUnavailable
+from ..adapters.journal import read_events_tail, stalled_run_annotations
 from ..domain.actions import Action, RunAgent
 from ..domain.world import WorldState
 from .execute import Executor
@@ -159,6 +162,7 @@ class Daemon:
         heartbeat_seconds: int = 900,
         max_ticks: int | None = None,
         reload_check: Callable[[], bool] | None = None,
+        active_now: Callable[[], float] = time.monotonic,
     ) -> None:
         """Loop tick→sleep with a heartbeat. `now`/`sleep` injected (testable).
         `max_ticks` bounds the loop for tests; None = forever.
@@ -174,16 +178,57 @@ class Daemon:
         )
         self.log(f"{self.name}: watching ({mode})")
         last = now()
+        last_active = active_now()
         last_logged = last
         ticks = 0
         while max_ticks is None or ticks < max_ticks:
             cur = now()
+            cur_active = active_now()
             elapsed = cur - last
+            active_elapsed = cur_active - last_active
+            previous = last
             last = cur
-            if elapsed > self.poll_seconds * 4:
+            last_active = cur_active
+            # Wall time advances while the machine is suspended; monotonic
+            # active time on the deployment platform does not. Comparing both
+            # prevents an ordinary long paid leg from being mislabeled as a
+            # suspension merely because run_forever cannot heartbeat mid-tick.
+            suspended = max(0, round(elapsed - active_elapsed))
+            if (
+                elapsed >= self.poll_seconds * 4
+                and suspended >= self.poll_seconds
+            ):
+                stall_started = datetime.fromtimestamp(
+                    cur - suspended, tz=timezone.utc
+                )
+                woke_at = datetime.fromtimestamp(cur, tz=timezone.utc)
                 self.log(
                     f"{self.name}: ♥ woke after {elapsed}s (expected ~{self.poll_seconds}s) "
                     "— likely suspended/stalled; catching up"
+                )
+                if self.journal is not None:
+                    self.journal.emit(
+                        "stall",
+                        started_at=stall_started.isoformat(),
+                        woke_at=woke_at.isoformat(),
+                        elapsed_seconds=elapsed,
+                        suspended_seconds=suspended,
+                    )
+                    path = getattr(self.journal, "path", "")
+                    if path:
+                        for annotation in stalled_run_annotations(
+                            read_events_tail(path), stall_started, woke_at
+                        ):
+                            self.journal.emit(
+                                "agent_run_stall",
+                                **annotation,
+                                stall_started_at=stall_started.isoformat(),
+                                woke_at=woke_at.isoformat(),
+                                suspended_seconds=suspended,
+                            )
+                self.executor.reconcile_recent_actions(
+                    datetime.fromtimestamp(previous, tz=timezone.utc),
+                    woke_at,
                 )
                 last_logged = cur
             elif cur - last_logged >= heartbeat_seconds:

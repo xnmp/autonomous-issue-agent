@@ -253,6 +253,23 @@ def _started(row: dash.IssueRow) -> datetime | None:
     return min(stamps) if stamps else None
 
 
+def _suspended_seconds(row: dash.IssueRow) -> float:
+    """Unique suspension corrections attributed to this issue's agent legs."""
+    stalls: dict[str, float] = {}
+    for event in row.events:
+        if event.get("event") != "agent_run_stall":
+            continue
+        key = str(event.get("stall_started_at") or "")
+        if not key:
+            continue
+        try:
+            seconds = max(0.0, float(event.get("suspended_seconds") or 0))
+        except (TypeError, ValueError):
+            continue
+        stalls[key] = max(stalls.get(key, 0.0), seconds)
+    return sum(stalls.values())
+
+
 def _hold_event(row: dash.IssueRow) -> dict:
     holds = [e for e in row.events if e.get("event") == "hold"]
     return holds[-1] if holds else {}
@@ -280,7 +297,9 @@ def mean_wall_clock_s(rows) -> float | None:
             continue
         start, last = _started(row), row.last_ts
         if start and last:
-            spans.append((last - start).total_seconds())
+            spans.append(
+                max(0.0, (last - start).total_seconds() - _suspended_seconds(row))
+            )
     return round(sum(spans) / len(spans), 1) if spans else None
 
 
@@ -314,7 +333,11 @@ def issue_card(
         "projected_cost_usd": projected_cost_usd,
         "started_ts": iso(started),
         "last_ts": iso(row.last_ts),
-        "elapsed_s": round((end - started).total_seconds()) if started else None,
+        "elapsed_s": (
+            round(max(0.0, (end - started).total_seconds() - _suspended_seconds(row)))
+            if started
+            else None
+        ),
         "projected_eta_s": projected_eta_s,
         "models": list(row.models),
         "rounds": row.rounds,

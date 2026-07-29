@@ -14,10 +14,12 @@ Phase 4 work; the executor just routes to it.
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime
 import time
 
 from ..adapters.github import GhUnavailable
-from ..adapters.journal import alert, event_line
+from ..adapters.journal import alert, event_line, parse_ts, read_events_tail
+from ..adapters.store import decode_lifecycle_action, encode_lifecycle_action
 from ..domain.actions import (
     Action,
     AddDependency,
@@ -386,12 +388,63 @@ class Executor:
                 return
             raise
         if self._journal is not None:
+            fields = {
+                "desc": desc,
+                "attempts": attempts,
+                "replayed": replayed,
+            }
+            if isinstance(action, _DURABLE_ACTIONS):
+                fields["action"] = encode_lifecycle_action(action)
             self._journal.emit(
                 "action",
-                desc=desc,
-                attempts=attempts,
-                replayed=replayed,
+                **fields,
             )
+
+    def reconcile_recent_actions(
+        self, started_at: datetime, woke_at: datetime
+    ) -> None:
+        """Verify durable receipts around a stall and repair missing writes.
+
+        The journal is a receipt, not proof that remote state survived an
+        environmental outage. Structured receipts are replayed through the
+        same idempotency probes and bounded queue as #64. Legacy description-
+        only rows are explicitly skipped because comment bodies cannot be
+        reconstructed safely from a character count.
+        """
+        path = getattr(self._journal, "path", "")
+        if not path:
+            return
+        seen: set[Action] = set()
+        for event in read_events_tail(path):
+            if event.get("event") != "action":
+                continue
+            timestamp = parse_ts(event.get("ts"))
+            if timestamp is None or not (started_at <= timestamp <= woke_at):
+                continue
+            raw = event.get("action")
+            try:
+                action = decode_lifecycle_action(raw)
+            except ValueError as exc:
+                self._journal.emit(
+                    "action_reconcile_skipped",
+                    desc=str(event.get("desc") or ""),
+                    error=str(exc),
+                )
+                continue
+            if action in seen:
+                continue
+            seen.add(action)
+            desc = self._describe(action)
+            try:
+                if self._already_applied(action):
+                    self._journal.emit("action_verified", desc=desc)
+                    continue
+                self.execute(action, replayed=True)
+            except Exception:
+                # execute() already journalled the failure and persisted every
+                # transient/unverified durable write. Continue so one broken
+                # target does not prevent independent receipts being checked.
+                continue
 
     def replay_pending(self) -> bool:
         """Replay durable writes, quarantining unverifiable entries after the bound."""

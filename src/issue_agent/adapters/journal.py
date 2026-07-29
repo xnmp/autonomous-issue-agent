@@ -640,6 +640,67 @@ def events_within(events, seconds: float, now_fn=_now) -> list[dict]:
     return out
 
 
+def stalled_run_annotations(
+    events: list[dict], started_at: datetime, woke_at: datetime
+) -> list[dict]:
+    """Settled agent legs whose journal interval overlaps a suspension."""
+    starts: dict[str, list[dict]] = {}
+    for event in events:
+        if event.get("event") != "agent_run_start":
+            continue
+        dispatch = str(event.get("dispatch") or "")
+        if dispatch:
+            starts.setdefault(dispatch, []).append(event)
+
+    annotations: list[dict] = []
+    seen: set[tuple] = set()
+    for event in events:
+        if event.get("event") != "agent_run":
+            continue
+        dispatch = str(event.get("dispatch") or "")
+        finished_at = parse_ts(event.get("ts"))
+        if not dispatch or finished_at is None:
+            continue
+        candidates = [
+            start
+            for start in starts.get(dispatch, ())
+            if start.get("kind") == event.get("kind")
+            and start.get("number") == event.get("number")
+            and (parse_ts(start.get("ts")) or finished_at) <= finished_at
+        ]
+        if not candidates:
+            continue
+        start = max(candidates, key=lambda value: parse_ts(value.get("ts")) or finished_at)
+        run_started_at = parse_ts(start.get("ts"))
+        if (
+            run_started_at is None
+            or run_started_at > woke_at
+            or finished_at < started_at
+        ):
+            continue
+        identity = (
+            dispatch,
+            event.get("kind"),
+            event.get("number"),
+            event.get("ts"),
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        annotations.append(
+            {
+                "role": event.get("role"),
+                "kind": event.get("kind"),
+                "number": event.get("number"),
+                "issue": event.get("issue"),
+                "dispatch": dispatch,
+                "run_started_at": start.get("ts"),
+                "run_finished_at": event.get("ts"),
+            }
+        )
+    return annotations
+
+
 def repeated_dispatch_warning(events, window_s: float, threshold: int) -> str:
     """Warn when the same (kind, number) was DISPATCHED `threshold`+ times inside
     any `window_s` span. Returns "" when nothing is looping.
