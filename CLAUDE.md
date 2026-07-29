@@ -230,6 +230,13 @@ post-start rollout `session_meta` matching the worktree, `originator=codex_exec`
 and `source=exec`. The source filter excludes same-cwd subagent rollouts; resumed
 runs seed identity from their persisted session ID. Arbitrary stderr is never an
 in-flight usage source because it contains agent-controlled tool/test output.
+If a blocked issue has a new reply but no persisted session ID, the fixer still
+dispatches a `RESUME` leg and starts a fresh full-context task from the issue
+title, body, and reply. The pre-run `resumed-at` marker preserves exactly-once
+dispatch across both fresh recovery and true runtime resume.
+With `AUTHOR_TESTS_SPLIT=1` before a PR exists, reply recovery instead re-enters
+the stored author/implementer phase with a fresh role-specific task carrying the
+reply. It never collapses the two blind roles into a generic fixer session.
 
 ## Identities
 

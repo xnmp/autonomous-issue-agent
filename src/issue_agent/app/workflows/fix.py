@@ -477,12 +477,19 @@ class FixWorkflow:
             issue_closed_without_pr=closed_without_pr,
         )
 
-    async def resolve_split(self, issue: int) -> None:
+    async def resolve_split(self, issue: int, human_reply: str = "") -> None:
         iss = self.gateway.get_issue(issue)
         branch = f"fix/{issue}-{slugify(iss.title) or 'issue'}"
         cwd = self._ensure_cwd(issue, branch)
 
-        fix_cfg, deferred_for_overlap = await self._routed_fix_cfg(issue, iss)
+        if human_reply:
+            # A reply-driven RESUME has already consumed this clarification.
+            # Re-running fresh-resolve routing could overlap-defer to ai-ready
+            # without delivering it to either split role.
+            fix_cfg = self._repair_fix_cfg(issue, "resume", iss=iss)
+            deferred_for_overlap = False
+        else:
+            fix_cfg, deferred_for_overlap = await self._routed_fix_cfg(issue, iss)
         if deferred_for_overlap:
             self.executor.execute_all([
                 Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)
@@ -491,7 +498,14 @@ class FixWorkflow:
         self.store.save_model(issue, fix_cfg.model)
         if self.store.get_phase(issue) != "authored":
             author = await self.runner.run(
-                task_builders.build_author_task(issue, iss.title, iss.body, cwd, fix_cfg)
+                task_builders.build_author_task(
+                    issue,
+                    iss.title,
+                    iss.body,
+                    cwd,
+                    fix_cfg,
+                    human_reply=human_reply,
+                )
             )
             self.store.save_session(issue, author.session_id)
             self._decay_infra_deaths(issue, author)
@@ -503,9 +517,22 @@ class FixWorkflow:
                 return
             self.store.set_phase(issue, "authored")
 
-        await self._implement_loop(issue, iss, cwd, fix_cfg)
+        await self._implement_loop(
+            issue,
+            iss,
+            cwd,
+            fix_cfg,
+            human_reply=human_reply,
+        )
 
-    async def _implement_loop(self, issue: int, iss, cwd: str, fix_cfg=None) -> None:
+    async def _implement_loop(
+        self,
+        issue: int,
+        iss,
+        cwd: str,
+        fix_cfg=None,
+        human_reply: str = "",
+    ) -> None:
         fix_cfg = fix_cfg if fix_cfg is not None else self.cfg.fix
         uphold_note = ""
         trail: list[str] = []
@@ -513,7 +540,13 @@ class FixWorkflow:
         while True:
             impl = await self.runner.run(
                 task_builders.build_implement_task(
-                    issue, iss.title, iss.body, cwd, fix_cfg, uphold_note=uphold_note
+                    issue,
+                    iss.title,
+                    iss.body,
+                    cwd,
+                    fix_cfg,
+                    uphold_note=uphold_note,
+                    human_reply=human_reply,
                 )
             )
             self.store.save_session(issue, impl.session_id)
@@ -541,7 +574,13 @@ class FixWorkflow:
                 # weaker than the leg it is arbitrating decides the wrong way
                 # exactly when the issue is hard enough to have escalated.
                 task_builders.build_adjudicate_task(
-                    issue, iss.title, iss.body, objection, cwd, fix_cfg
+                    issue,
+                    iss.title,
+                    iss.body,
+                    objection,
+                    cwd,
+                    fix_cfg,
+                    human_reply=human_reply,
                 )
             )
             self.store.save_session(issue, adj.session_id)
@@ -599,14 +638,21 @@ class FixWorkflow:
         self.store.set_resumed_at(issue, reply_comment.created_at)
         pr_existing = self.gateway.pr_for_issue(issue)
         if self.cfg.author_tests_split and pr_existing is None:
-            await self.resolve_split(issue)
+            await self.resolve_split(issue, human_reply=reply)
             return
         branch = self.gateway.get_pr(pr_existing).head_ref_name if pr_existing else f"fix/{issue}-issue"
         cwd = self._ensure_cwd(issue, branch)
         fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
-        task = task_builders.build_resume_task(
-            reply, cwd, self.store.get_session(issue),
-            self._repair_fix_cfg(issue, "resume", iss=iss), fork=fork
+        session_id = self.store.get_session(issue)
+        fix_cfg = self._repair_fix_cfg(issue, "resume", iss=iss)
+        task = (
+            task_builders.build_resume_task(
+                reply, cwd, session_id, fix_cfg, fork=fork
+            )
+            if session_id
+            else task_builders.build_fresh_reply_task(
+                issue, iss.title, iss.body, reply, cwd, fix_cfg
+            )
         )
         result = await self.runner.run(task)
         self.store.save_session(issue, result.session_id)
