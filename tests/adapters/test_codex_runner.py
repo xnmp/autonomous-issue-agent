@@ -349,6 +349,35 @@ exit 0
     assert r.status == "done"
 
 
+def test_run_completes_after_a_megabyte_stderr_line_and_logs_it_truncated():
+    """One unbounded Codex trace line must not terminate an otherwise healthy leg."""
+    tmp = tempfile.mkdtemp()
+    body = r'''
+out=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then out="$a"; fi
+  prev="$a"
+done
+head -c 1048576 /dev/zero | tr '\0' x >&2
+echo >&2
+echo "stderr after oversized line" >&2
+printf '%s' '{"status":"done","summary":"ok","needs":""}' > "$out"
+exit 0
+'''
+    logged: list[str] = []
+    runner = CodexRunner(
+        codex_bin=_fake_codex(tmp, body), env={"OPENAI_API_KEY": "test-key"},
+        log=logged.append, debug=True,
+    )
+
+    result = asyncio.run(runner.run(AgentTask(prompt="x")))
+
+    assert result.status == "done"
+    assert any("oversized stderr line" in line and "truncated" in line for line in logged)
+    assert any("stderr after oversized line" in line for line in logged)
+
+
 def _write_session_rollout(
     codex_home,
     *,
