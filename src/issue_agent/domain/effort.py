@@ -126,12 +126,20 @@ class EscalationSignals:
     review_rounds: int = 0
 
     def failure_count(self) -> int:
-        """Completed failed attempts that should make the next leg more careful."""
+        """Completed resolve/CI failures that make the next leg more careful.
+
+        Review requests still buy a ladder notch, but they are reviewer feedback,
+        not failed execution or verification runs. Keeping them out of this
+        count avoids treating normal review iteration as a historical failure.
+        """
         return (
             max(0, self.resolve_retries)
             + max(0, self.ci_retries)
-            + max(0, self.review_rounds - 1)
         )
+
+    def requires_ceiling(self) -> bool:
+        """Whether history warrants the strongest available fixer stance."""
+        return self.recurrence or self.failure_count() >= 2
 
     def notches(self) -> int:
         """How many rungs of evidence exist. One per signal (#16).
@@ -145,6 +153,7 @@ class EscalationSignals:
         return (
             (1 if self.recurrence else 0)
             + self.failure_count()
+            + max(0, self.review_rounds - 1)
         )
 
 

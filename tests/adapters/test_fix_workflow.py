@@ -1081,8 +1081,8 @@ def test_a_recurrence_label_buys_more_thinking_at_the_routed_tier():
     ).resolve(5))
 
     resolve_task = runner.tasks[1]
-    assert resolve_task.effort is Effort.HIGH, "one notch buys the cheap lever"
-    assert resolve_task.model == "sonnet", "…and NOT the pricier tier yet"
+    assert resolve_task.effort is Effort.HIGH
+    assert resolve_task.model == "fable", "a recurrence goes directly to the ceiling"
 
 
 def test_two_signals_climb_past_effort_into_the_next_tier():
@@ -1101,7 +1101,28 @@ def test_two_signals_climb_past_effort_into_the_next_tier():
     ).resolve(5))
 
     assert runner.tasks[1].effort is Effort.HIGH
-    assert runner.tasks[1].model == "opus", "evidence past HIGH effort re-prices the tier"
+    assert runner.tasks[1].model == "fable", "recurrence goes directly to the ceiling"
+
+
+def test_two_completed_failures_add_a_difficult_history_warning():
+    gw = FakeGateway(issues={5: _issue()}, pr_for_issue={})
+    store = FakeStore()
+    store.set_resolve_retries(5, 2)
+    runner = SeqRunner([
+        _router_result("standard"),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5"),
+    ])
+
+    asyncio.run(_workflow(
+        gw, store, runner, fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    resolve_task = runner.tasks[1]
+    assert resolve_task.model == "fable"
+    assert resolve_task.effort is Effort.HIGH
+    assert "difficult problem" in resolve_task.prompt
+    assert "failed in the past" in resolve_task.prompt
+    assert "extra care" in resolve_task.prompt
 
 
 def test_escalation_respects_the_fixer_runtime_family():
@@ -1164,7 +1185,7 @@ def test_escalation_survives_a_router_that_died():
         gw, FakeStore(), runner, fix=FixTaskConfig("o/r", agent_md="AM"),
     ).resolve(5))
 
-    assert runner.tasks[1].model is None, "unrouted, as before"
+    assert runner.tasks[1].model == "fable", "evidence must survive router failure"
     assert runner.tasks[1].effort is Effort.HIGH
 
 
@@ -1193,8 +1214,8 @@ def test_an_unrouted_escalation_records_a_null_model_not_an_empty_one():
     ).resolve(5))
 
     (_event, fields), = journal.events
-    assert fields["model"] is None
-    assert runner.tasks[1].model is None
+    assert fields["model"] == "fable"
+    assert runner.tasks[1].model == "fable"
 
 
 def test_the_kill_switch_restores_the_pre_ladder_dispatch():
@@ -1359,8 +1380,8 @@ def test_escalations_are_journalled_so_the_tier_split_stays_measurable():
     )
     assert fields["issue"] == 5
     assert (fields["from_effort"], fields["to_effort"]) == ("medium", "high")
-    assert (fields["from_tier"], fields["to_tier"]) == ("standard", "standard")
-    assert fields["model"] == "sonnet", "the split must be derivable from what RAN"
+    assert (fields["from_tier"], fields["to_tier"]) == ("standard", "complex")
+    assert fields["model"] == "fable", "the split must be derivable from what RAN"
     assert fields["recurrence"] is True
 
 

@@ -23,8 +23,10 @@ from ...domain.ci import latest_other_review
 from ...domain.effort import (
     DEFAULT_EFFORT,
     DEFAULT_TIER,
+    Effort,
     EscalationSignals,
     Stance,
+    TIER_LADDER,
     escalate,
 )
 from ...domain.labels import Label
@@ -193,6 +195,9 @@ class FixWorkflow:
             resolve_retries=int(
                 self._try(lambda: self.store.get_resolve_retries(issue), 0) or 0
             ),
+            ci_retries=int(
+                self._try(lambda: self.store.get_ci_retries(issue), 0) or 0
+            ),
             review_rounds=max(0, int(review_rounds or 0)),
         )
 
@@ -255,6 +260,7 @@ class FixWorkflow:
                 model=model,
                 recurrence=signals.recurrence,
                 resolve_retries=signals.resolve_retries,
+                ci_retries=signals.ci_retries,
                 review_rounds=signals.review_rounds,
             )
         except Exception as exc:  # noqa: BLE001 — telemetry never fails a dispatch
@@ -292,11 +298,18 @@ class FixWorkflow:
             return cfg if tier is None else dataclasses.replace(
                 cfg, model=task_builders.route_model(tier, self.cfg.fixer_runtime)
             )
-        stance = escalate(base, notches)
-        # Tier is only re-priced when this leg picked one; effort always applies.
+        ceiling = signals.requires_ceiling()
+        stance = (
+            Stance(TIER_LADDER[-1], Effort.HIGH)
+            if ceiling else escalate(base, notches)
+        )
+        # A configured model is an explicit operator choice. Otherwise the hard
+        # ceiling may re-price repair legs too: repeated failed verification is
+        # exactly the case where preserving the prior session's model is wrong.
+        tiered = tier is not None or (ceiling and not self.cfg.fix.model)
         model = (
             task_builders.route_model(stance.tier, self.cfg.fixer_runtime)
-            if tier is not None else cfg.model
+            if tiered else cfg.model
         )
         # Same rule as the journal: name the tier move only when this leg chose
         # a tier, so the log cannot claim a climb the dispatch did not make.
@@ -307,13 +320,22 @@ class FixWorkflow:
         self.cfg.log(
             f"agent #{issue}: {leg} — escalating {notches} notch(es) "
             f"(recurrence={signals.recurrence}, resolve_retries={signals.resolve_retries}, "
+            f"ci_retries={signals.ci_retries}, "
             f"review_rounds={signals.review_rounds}): "
             f"{move}effort {base.effort.value}→{stance.effort.value}"
         )
         self._journal_escalation(
-            issue, leg, base, stance, signals, model, tiered=tier is not None
+            issue, leg, base, stance, signals, model, tiered=tiered
         )
-        return dataclasses.replace(cfg, model=model, effort=stance.effort)
+        notice = (
+            "This is a difficult problem that has failed in the past. "
+            "Take extra care: validate the root cause and the observable result "
+            "before declaring it complete."
+            if signals.failure_count() >= 2 else cfg.difficulty_notice
+        )
+        return dataclasses.replace(
+            cfg, model=model, effort=stance.effort, difficulty_notice=notice
+        )
 
     def _repair_fix_cfg(
         self, issue: int, leg: str, *, iss=None, review_rounds: int = 0
