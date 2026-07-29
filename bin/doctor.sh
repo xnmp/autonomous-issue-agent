@@ -546,6 +546,115 @@ if [ -n "${TARGET_DIR:-}" ] && [ -d "$_WF_DIR" ]; then
   fi
 fi
 
+# ── G. Toolchain pinned, and does the local default match it? (#33) ─────────
+# The A/D/F checks above narrow the CI/TEST_CMD gap from the CI side; this is
+# the complementary LOCAL-side gap. TEST_CMD runs on the OPERATOR's toolchain,
+# CI resolves its own, and nothing compares them — so "green locally" can be
+# systematically weaker than "green in CI". Observed hard on the xnmp/keifu
+# preflight (2026-07-28): the operator's rustc was six months stale (1.93.0)
+# while CI's dtolnay/rust-toolchain@stable resolved 1.97.1; four clippy lints
+# CI's `-D warnings` caught (2x unnecessary_sort_by, while_let_loop, a
+# byte-string literal) did not exist in the stale local toolchain, so
+# `cargo clippy --all-targets -- -D warnings` was clean locally and red in CI
+# on identical source — and the gate probe (step 3b) passed for the same
+# reason: it runs this same stale toolchain.
+#
+# Entirely local, no network: read a pin file if the repo has one and compare
+# it to the tool actually on PATH. Warn when the ecosystem is in use but has NO
+# pin at all — that alone guarantees drift over time, independent of any
+# specific mismatch caught today (the third possible approach from the issue).
+# Deliberately a WARNING throughout, like F: a version mismatch does not always
+# break the build, and an unparseable pin (`channel = "stable"`, a bare major
+# in `.nvmrc`) is left silent rather than guessed at — guessing wrong here
+# would train operators to ignore the line.
+if [ -n "${TARGET_DIR:-}" ] && [ -d "$TARGET_DIR" ]; then
+  echo "== toolchain pin (drift vs CI) =="
+
+  # Rust: rust-toolchain.toml `channel = "X.Y.Z"`, or plain-text rust-toolchain.
+  if [ -f "$TARGET_DIR/Cargo.toml" ]; then
+    _pinfile=""; _pin=""
+    if [ -f "$TARGET_DIR/rust-toolchain.toml" ]; then
+      _pinfile="rust-toolchain.toml"
+      _pin="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' "$TARGET_DIR/$_pinfile" 2>/dev/null | head -1)"
+    elif [ -f "$TARGET_DIR/rust-toolchain" ]; then
+      _pinfile="rust-toolchain"
+      _pin="$(tr -d '[:space:]' < "$TARGET_DIR/$_pinfile" 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+$')"
+    fi
+    if [ -z "$_pinfile" ]; then
+      warn "Cargo.toml present but no rust-toolchain.toml/rust-toolchain — nothing pins the local rustc to CI's, so they WILL drift over time (the #33 class: a stale local rustc can be clean where CI's is red on identical source)"
+    elif [ -n "$_pin" ]; then
+      if command -v rustc >/dev/null 2>&1; then
+        _local="$(rustc --version 2>/dev/null | sed -nE 's/^rustc ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')"
+        if [ -n "$_local" ] && [ "$_local" != "$_pin" ]; then
+          warn "rustc drift: $_pinfile pins $_pin but local rustc is $_local — TEST_CMD/clippy run on THIS version, CI resolves the pin; a locally-green gate can be systematically weaker than CI's (this is the exact keifu incident: a stale local rustc missed clippy lints CI's -D warnings caught)"
+        elif [ -n "$_local" ]; then
+          ok "rustc matches $_pinfile ($_pin)"
+        fi
+      else
+        warn "$_pinfile pins $_pin but rustc is not on PATH here — cannot verify the local toolchain matches what CI will resolve"
+      fi
+    fi
+  fi
+
+  # Node: .nvmrc or .node-version, exact X.Y.Z pins only (bare majors like "18"
+  # or "lts/*" are common and intentionally loose — comparing those would be a
+  # guess, so they are left unparsed and silent).
+  if [ -f "$TARGET_DIR/package.json" ]; then
+    # Don't stop at the FIRST candidate file found — an unparseable .nvmrc
+    # ("lts/*") must not shadow a parseable .node-version sitting right next
+    # to it. _pinfile still records the first file found (so the "no pin at
+    # all" warning below stays correctly suppressed) even when nothing ends
+    # up parseable.
+    _pinfile=""; _pin=""
+    for _f in .nvmrc .node-version; do
+      if [ -f "$TARGET_DIR/$_f" ]; then
+        [ -n "$_pinfile" ] || _pinfile="$_f"
+        _cand="$(tr -d '[:space:]' < "$TARGET_DIR/$_f" 2>/dev/null | sed -E 's/^v//' | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+$')"
+        if [ -n "$_cand" ]; then
+          _pinfile="$_f"
+          _pin="$_cand"
+          break
+        fi
+      fi
+    done
+    if [ -z "$_pinfile" ]; then
+      warn "package.json present but no .nvmrc/.node-version — nothing pins the local node to CI's, so they WILL drift over time (the #33 class)"
+    elif [ -n "$_pin" ]; then
+      if command -v node >/dev/null 2>&1; then
+        _local="$(node --version 2>/dev/null | sed -E 's/^v//')"
+        if [ -n "$_local" ] && [ "$_local" != "$_pin" ]; then
+          warn "node drift: $_pinfile pins $_pin but local node is $_local — TEST_CMD runs on THIS version, CI resolves the pin; a locally-green gate can be systematically weaker than CI's"
+        elif [ -n "$_local" ]; then
+          ok "node matches $_pinfile ($_pin)"
+        fi
+      else
+        warn "$_pinfile pins $_pin but node is not on PATH here — cannot verify the local toolchain matches what CI will resolve"
+      fi
+    fi
+  fi
+
+  # Python: .python-version, exact X.Y.Z pins only (same bare-major reasoning).
+  if [ -f "$TARGET_DIR/pyproject.toml" ] || [ -f "$TARGET_DIR/requirements.txt" ]; then
+    if [ -f "$TARGET_DIR/.python-version" ]; then
+      _pin="$(tr -d '[:space:]' < "$TARGET_DIR/.python-version" 2>/dev/null | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+$')"
+      if [ -n "$_pin" ]; then
+        if command -v python3 >/dev/null 2>&1; then
+          _local="$(python3 --version 2>&1 | sed -nE 's/^Python ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')"
+          if [ -n "$_local" ] && [ "$_local" != "$_pin" ]; then
+            warn "python drift: .python-version pins $_pin but local python3 is $_local — TEST_CMD runs on THIS version, CI resolves the pin; a locally-green gate can be systematically weaker than CI's"
+          elif [ -n "$_local" ]; then
+            ok "python3 matches .python-version ($_pin)"
+          fi
+        else
+          warn ".python-version pins $_pin but python3 is not on PATH here — cannot verify the local toolchain matches what CI will resolve"
+        fi
+      fi
+    else
+      warn "pyproject.toml/requirements.txt present but no .python-version — nothing pins the local python3 to CI's, so they WILL drift over time (the #33 class)"
+    fi
+  fi
+fi
+
 echo "== project commands =="
 if [ -n "${TEST_CMD:-}" ]; then
   ok "TEST_CMD=$TEST_CMD (the gate runs THIS; it wins over the agent's .harness/test-cmd — review P1R-18)"
