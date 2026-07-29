@@ -104,7 +104,7 @@ that matters is not "wrong answer" but "loop that bills forever":
 Counters decay on any leg that returns a result, so the ceilings bound
 *consecutive* failure rather than accumulating over a healthy issue's lifetime.
 
-`tests/domain/test_convergence.py` is the regression guard for this whole class:
+`tests/adapters/test_convergence.py` is the regression guard for this whole class:
 each scenario drives a real `Daemon` tick loop over the real workflow, dispatcher,
 executor and store, and asserts a frozen world reaches a steady state without
 buying sessions. **Any new dispatch leg or retry counter needs a row there.**
