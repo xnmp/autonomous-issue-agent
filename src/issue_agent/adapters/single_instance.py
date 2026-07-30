@@ -1,11 +1,13 @@
-"""Single-instance guard — one daemon per deployment checkout and role.
+"""Single-instance guard — one daemon per repository checkout and role.
 
 Two fix daemons polling the same repo both grab `ai-ready` and dispatch in
 parallel, breaking the single-fixer invariant (observed: #54/#58 dispatched
 concurrently after an accidental double `point-at` launch). This is a
 process-level lock, not a domain concern, so it lives in adapters.
 
-Mechanism: an advisory `flock(LOCK_EX | LOCK_NB)` on a per-deployment file.
+Mechanism: an advisory `flock(LOCK_EX | LOCK_NB)` in a private per-user runtime
+directory. The directory is deliberately independent of configured state roots:
+two overlays aimed at the same checkout must contend on the same lock.
 flock is held by the OPEN FILE DESCRIPTION and released by the kernel when the
 process exits — crash, kill -9, or clean shutdown alike. So unlike a pidfile
 holding a written PID, there is no stale-lock problem: a dead daemon's lock is
@@ -65,12 +67,30 @@ def _lock_path(
     checkout = os.path.realpath(target_dir) if target_dir else ""
     key = hashlib.sha256(f"{role}\0{repo}\0{checkout}".encode()).hexdigest()[:20]
     safe_role = "".join(c if c.isalnum() else "-" for c in role)
-    parent = (
-        os.path.join(os.path.abspath(state_dir), "locks")
-        if state_dir
-        else tempfile.gettempdir()
+    del state_dir
+    parent = os.path.join(
+        tempfile.gettempdir(),
+        f"issue-agent-{os.getuid()}-locks",
     )
     return os.path.join(parent, f"issue-agent-{safe_role}-{key}.lock")
+
+
+def _ensure_lock_parent(path: str) -> None:
+    parent = os.path.dirname(path)
+    try:
+        os.mkdir(parent, 0o700)
+    except FileExistsError:
+        pass
+    metadata = os.lstat(parent)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or stat.S_IMODE(metadata.st_mode) & 0o077
+    ):
+        raise UnsafeLockFile(
+            f"daemon lock directory must be private and owned by this user: "
+            f"{parent}"
+        )
 
 
 def acquire(
@@ -82,7 +102,7 @@ def acquire(
 ) -> InstanceLock:
     """Take the deployment lock or fail without following a foreign symlink."""
     path = _lock_path(role, repo, target_dir, state_dir)
-    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    _ensure_lock_parent(path)
     flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     try:

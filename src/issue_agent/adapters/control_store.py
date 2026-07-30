@@ -7,6 +7,7 @@ no network, model, or subprocess work is accepted by this adapter.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -587,18 +588,46 @@ class SQLiteControlStore:
         parent = os.path.dirname(self.path)
         os.makedirs(parent, mode=0o700, exist_ok=True)
         os.chmod(parent, stat.S_IRWXU)
-        if os.path.exists(self.path) and os.path.getsize(self.path):
+        with self._initialization_lock():
+            if os.path.exists(self.path) and os.path.getsize(self.path):
+                self.integrity_check()
+            with self._connect() as db:
+                applied = self._migration_history(db)
+            self._validate_migration_history(applied)
+            for migration in _SCHEMA_MIGRATIONS:
+                self._apply_schema_migration(migration)
+            with self._connect() as db:
+                final_history = self._migration_history(db)
+            self._validate_migration_history(
+                final_history, require_current=True
+            )
+            os.chmod(self.path, stat.S_IRUSR | stat.S_IWUSR)
             self.integrity_check()
-        with self._connect() as db:
-            applied = self._migration_history(db)
-        self._validate_migration_history(applied)
-        for migration in _SCHEMA_MIGRATIONS:
-            self._apply_schema_migration(migration)
-        with self._connect() as db:
-            final_history = self._migration_history(db)
-        self._validate_migration_history(final_history, require_current=True)
-        os.chmod(self.path, stat.S_IRUSR | stat.S_IWUSR)
-        self.integrity_check()
+
+    @contextmanager
+    def _initialization_lock(self) -> Iterator[None]:
+        """Serialize WAL selection and schema migration across role processes."""
+
+        path = f"{self.path}.initialize.lock"
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags, stat.S_IRUSR | stat.S_IWUSR)
+        try:
+            metadata = os.fstat(fd)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+            ):
+                raise ControlStoreError(
+                    f"unsafe control-store initialization lock: {path}"
+                )
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
     def _validate_migration_history(
         self,
@@ -1032,7 +1061,13 @@ class SQLiteControlStore:
         owner_id: str | Callable[[int, int], bool],
         is_alive: Callable[[int, int], bool] | None = None,
     ) -> tuple[RunId, ...]:
-        """Atomically abandon runs whose durable owner process is gone."""
+        """Abandon leases whose snapshotted durable owner process is gone.
+
+        Process inspection may invoke ``ps`` on macOS, so all liveness probes
+        run before the short write transaction. The transaction revalidates the
+        complete lease identity before changing state to avoid reclaiming a
+        lease that was replaced while the probe ran.
+        """
 
         if callable(owner_id):
             alive = owner_id
@@ -1042,11 +1077,11 @@ class SQLiteControlStore:
                 raise ValueError("liveness probe is required")
             alive = is_alive
             scoped_owner = owner_id
-        reclaimed: list[RunId] = []
-        with self.transaction() as db:
+        with self._connect() as db:
             rows = (
                 db.execute(
-                    "SELECT l.run_id, l.pid, l.process_start_ticks "
+                    "SELECT l.run_id, l.dispatch_id, l.owner_id, l.pid, "
+                    "l.pgid, l.process_start_ticks, l.started_at "
                     "FROM leases l JOIN runs r "
                     "ON r.run_id=l.run_id WHERE r.owner_id=? "
                     "ORDER BY l.started_at",
@@ -1054,21 +1089,56 @@ class SQLiteControlStore:
                 ).fetchall()
                 if scoped_owner is not None
                 else db.execute(
-                    "SELECT run_id, pid, process_start_ticks "
+                    "SELECT run_id, dispatch_id, owner_id, pid, pgid, "
+                    "process_start_ticks, started_at "
                     "FROM leases ORDER BY started_at"
                 ).fetchall()
             )
-            for row in rows:
-                if alive(int(row["pid"]), int(row["process_start_ticks"])):
+        dead = tuple(
+            (
+                str(row["run_id"]),
+                str(row["dispatch_id"]),
+                str(row["owner_id"]),
+                int(row["pid"]),
+                int(row["pgid"]),
+                int(row["process_start_ticks"]),
+                str(row["started_at"]),
+            )
+            for row in rows
+            if not alive(int(row["pid"]), int(row["process_start_ticks"]))
+        )
+        reclaimed: list[RunId] = []
+        with self.transaction() as db:
+            for identity in dead:
+                run_id = RunId(identity[0])
+                current = db.execute(
+                    "SELECT run_id, dispatch_id, owner_id, pid, pgid, "
+                    "process_start_ticks, started_at FROM leases "
+                    "WHERE run_id=?",
+                    (str(run_id),),
+                ).fetchone()
+                if current is None:
                     continue
-                run_id = RunId(row["run_id"])
+                current_identity = (
+                    str(current["run_id"]),
+                    str(current["dispatch_id"]),
+                    str(current["owner_id"]),
+                    int(current["pid"]),
+                    int(current["pgid"]),
+                    int(current["process_start_ticks"]),
+                    str(current["started_at"]),
+                )
+                if current_identity != identity:
+                    continue
                 db.execute("DELETE FROM leases WHERE run_id=?", (str(run_id),))
-                db.execute(
+                updated = db.execute(
                     "UPDATE runs SET state='abandoned', outcome='dead_lease', "
                     "completed_at=? WHERE run_id=? AND state NOT IN "
                     "('completed','cancelled','abandoned')",
                     (_stamp(self._now()), str(run_id)),
-                )
+                ).rowcount
+                if not updated:
+                    continue
                 self._transition(
                     db,
                     "run",

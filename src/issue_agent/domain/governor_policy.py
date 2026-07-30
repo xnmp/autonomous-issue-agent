@@ -307,6 +307,40 @@ def resolve(command: str) -> Resolution:
         inner, _extra_env = _strip_env_wrapper(words)
         if not inner:
             continue
+        outer_base = _basename(words[0])
+        inner_base = _basename(inner[0])
+        if (
+            outer_base in {*_PASSTHROUGH_WRAPPERS, "env"}
+            and inner_base
+            not in {
+                *_DYNAMIC_INTERPRETERS,
+                *_GOVERNED_BINARIES,
+                "issue-agent-publish",
+            }
+        ):
+            # Some wrappers take option operands (`sudo -u root`,
+            # `stdbuf -o L`) that the generic transparent-wrapper parser cannot
+            # distinguish from the command. If a later token still exposes a
+            # dynamic interpreter or governed mutation, ambiguity must deny.
+            for index, token in enumerate(words[1:], start=1):
+                candidate = _basename(token)
+                if (
+                    candidate in _DYNAMIC_INTERPRETERS
+                    and "-c" in words[index + 1 :]
+                ):
+                    return Unresolvable(
+                        f"{outer_base} options obscure a dynamic interpreter"
+                    )
+                if candidate in _GOVERNED_BINARIES and classify(
+                    words[index:]
+                ) is not None:
+                    return Unresolvable(
+                        f"{outer_base} options obscure a governed command"
+                    )
+                if candidate == "issue-agent-publish":
+                    return Unresolvable(
+                        f"{outer_base} options obscure durable publication"
+                    )
         name = inner[0]
         base = _basename(name)
         if "$" in name or name.startswith(("`", "${")):

@@ -321,6 +321,81 @@ def test_subscription_usage_is_synthetically_priced_and_consumes_cap(
     assert tuple(charge) == (8_000_000, "synthetic", "test")
 
 
+def test_armed_subscription_cap_prices_stream_usage_when_final_usage_is_missing(
+    tmp_path,
+) -> None:
+    runtime = Runtime(
+        AgentResult(
+            False,
+            status="no-final-usage",
+            cost_usd=0,
+            session_id="stream-observed",
+            usage=None,
+            stream_usage={
+                "input_tokens": 1_100_000,
+                "output_tokens": 0,
+            },
+        )
+    )
+    wrapper, store = _wrapper(
+        tmp_path,
+        runtime,
+        cap=2_000_000,
+        runtime_name="claude",
+    )
+
+    first = asyncio.run(
+        wrapper.run(
+            RuntimePlan("work", model="gpt-test", max_budget_usd=2)
+        )
+    )
+    second = asyncio.run(
+        wrapper.run(
+            RuntimePlan("more", model="gpt-test", max_budget_usd=2)
+        )
+    )
+
+    assert first.status == "no-final-usage"
+    assert second.exit_reason is ExitReason.BUDGET_EXHAUSTED
+    assert runtime.calls == 1
+    with store._connect() as db:
+        amount, basis, usage_json = db.execute(
+            "SELECT amount_micros, basis, usage_json FROM charges"
+        ).fetchone()
+    assert amount == 5_500_000
+    assert basis == "synthetic"
+    assert json.loads(usage_json)["input_tokens"] == 1_100_000
+
+
+def test_armed_non_codex_run_without_any_usage_retains_reservation(
+    tmp_path,
+) -> None:
+    wrapper, store = _wrapper(
+        tmp_path,
+        Runtime(
+            AgentResult(
+                False,
+                status="usage-blind",
+                cost_usd=0,
+                usage=None,
+                stream_usage=None,
+            )
+        ),
+        runtime_name="claude",
+    )
+
+    result = asyncio.run(
+        wrapper.run(
+            RuntimePlan("work", model="gpt-test", max_budget_usd=2)
+        )
+    )
+
+    assert result.status == "usage-blind"
+    assert len(store.active_reservation_runs()) == 1
+    with store._connect() as db:
+        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
+
+
 def test_codex_runtime_exception_releases_after_completed_teardown(
     tmp_path,
 ) -> None:
@@ -344,7 +419,9 @@ def test_codex_runtime_exception_releases_after_completed_teardown(
     )
 
 
-def test_codex_result_normalization_failure_releases_reservation(tmp_path) -> None:
+def test_result_normalization_failure_retains_reservation_fail_closed(
+    tmp_path,
+) -> None:
     wrapper, store = _wrapper(
         tmp_path,
         Runtime(
@@ -359,7 +436,7 @@ def test_codex_result_normalization_failure_releases_reservation(tmp_path) -> No
     with pytest.raises(ValueError):
         asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
 
-    assert store.active_reservation_runs() == ()
+    assert len(store.active_reservation_runs()) == 1
 
 
 def test_forced_codex_shutdown_intent_preserves_reservation_for_recovery(

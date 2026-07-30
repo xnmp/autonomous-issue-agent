@@ -22,6 +22,7 @@
   <key>EnvironmentVariables</key>
   <dict>
 	    <key>AGENT_ENV</key><string>@CONFIG@</string>
+	    <key>ISSUE_AGENT_DEPLOYMENT_ID</key><string>@DEPLOYMENT_ID@</string>
 	    <key>TARGET_DIR</key><string>@TARGET_DIR@</string>
 	    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
 	  </dict>

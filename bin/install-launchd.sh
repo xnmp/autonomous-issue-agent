@@ -45,6 +45,7 @@ TARGET_DIR="$(set -a; . "$CONFIG"; set +a; printf '%s' "${TARGET_DIR:-}")"
 CONFIG_REPO="$(set -a; . "$CONFIG"; set +a; printf '%s' "${REPO:-}")"
 [ -n "$TARGET_DIR" ] || echo "⚠ TARGET_DIR not set in $CONFIG — watchers will run from the harness dir and create worktrees in the wrong repo. Set TARGET_DIR."
 deployment_id="$(printf '%s' "$CONFIG|$TARGET_DIR" | cksum | awk '{print $1}')"
+DEPLOYMENT_NAME="${ISSUE_AGENT_DEPLOYMENT_ID:-$deployment_id}"
 LOG_DIR="$HOME/Library/Logs/issue-agent/$deployment_id"
 mkdir -p "$LOG_DIR"
 SNAP_DIR="$HOME/Library/Application Support/issue-agent"
@@ -72,6 +73,7 @@ for index in "${!units[@]}"; do
   candidate="$STAGE/$label.plist"
   sed -e "s#@HARNESS_ROOT@#$HARNESS_ROOT#g" \
       -e "s#@CONFIG@#$SNAP_CONFIG#g" \
+      -e "s#@DEPLOYMENT_ID@#$DEPLOYMENT_NAME#g" \
       -e "s#@TARGET_DIR@#${TARGET_DIR:-/}#g" \
       -e "s#@LABEL@#$label#g" \
       -e "s#@LOG_DIR@#$LOG_DIR#g" \
@@ -95,6 +97,20 @@ for index in "${!units[@]}"; do
   launchctl list "$label" >/dev/null 2>&1 \
     && touch "$STAGE/$index.loaded" || true
 done
+for index in "${!units[@]}"; do
+  u="${units[$index]}"
+  legacy_label="dev.issue-agent.$u"
+  legacy_dst="$LA/$legacy_label.plist"
+  if launchctl list "$legacy_label" >/dev/null 2>&1; then
+    if [ ! -f "$legacy_dst" ]; then
+      echo "REFUSING cutover: loaded legacy job $legacy_label has no recoverable plist at $legacy_dst" >&2
+      exit 2
+    fi
+    touch "$STAGE/$index.legacy.loaded"
+  fi
+  [ ! -f "$legacy_dst" ] \
+    || cp "$legacy_dst" "$STAGE/$index.legacy.previous"
+done
 
 rollback() {
   status=$?
@@ -116,13 +132,52 @@ rollback() {
     else
       rm -f -- "$dst"
     fi
+  done
+  for index in "${!units[@]}"; do
+    u="${units[$index]}"
+    legacy_label="dev.issue-agent.$u"
+    legacy_dst="$LA/$legacy_label.plist"
+    launchctl unload "$legacy_dst" >/dev/null 2>&1
+    if [ -f "$STAGE/$index.legacy.previous" ]; then
+      mv "$STAGE/$index.legacy.previous" "$legacy_dst"
+    else
+      rm -f -- "$legacy_dst"
+    fi
+  done
+  for index in "${!units[@]}"; do
+    u="${units[$index]}"
+    label="dev.issue-agent.$u.$deployment_id"
+    dst="$LA/$label.plist"
     [ ! -f "$STAGE/$index.loaded" ] \
       || launchctl load "$dst" >/dev/null 2>&1
+  done
+  for index in "${!units[@]}"; do
+    u="${units[$index]}"
+    legacy_label="dev.issue-agent.$u"
+    legacy_dst="$LA/$legacy_label.plist"
+    [ ! -f "$STAGE/$index.legacy.loaded" ] \
+      || launchctl load "$legacy_dst" >/dev/null 2>&1
   done
   echo "installation failed; restored previous known-good plists and config" >&2
   exit "$status"
 }
 trap rollback ERR INT TERM
+
+# Unsuffixed jobs predate deployment-scoped labels. Stop the complete writer
+# set before replacing config or loading any role, and retain their files in
+# STAGE so a later load failure can restore the old deployment atomically.
+for index in "${!units[@]}"; do
+  u="${units[$index]}"
+  legacy_label="dev.issue-agent.$u"
+  legacy_dst="$LA/$legacy_label.plist"
+  if [ -f "$legacy_dst" ] && [ -f "$STAGE/$index.legacy.loaded" ]; then
+    launchctl unload "$legacy_dst"
+  elif [ -f "$legacy_dst" ]; then
+    launchctl unload "$legacy_dst" 2>/dev/null || true
+  fi
+  launchctl remove "$legacy_label" 2>/dev/null || true
+  rm -f -- "$legacy_dst"
+done
 
 install -m 600 "$CONFIG" "$STAGE/config.next"
 mv "$STAGE/config.next" "$SNAP_CONFIG"

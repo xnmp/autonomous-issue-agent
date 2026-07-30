@@ -34,6 +34,11 @@ def _environment(
             fake_bin / "systemctl",
             """
 [ "${1:-}" != "--user" ] || shift
+printf '%s\n' "$*" >> "$SERVICE_LOG"
+if [ "${1:-}" = "is-active" ] || [ "${1:-}" = "is-enabled" ]; then
+  [ -f "$HOME/.config/systemd/user/${3:-${2:-}}" ]
+  exit $?
+fi
 if [ "${1:-}" = "restart" ] && [ -n "${FAIL_PATTERN:-}" ]; then
   case "${2:-}" in
     *"$FAIL_PATTERN"*)
@@ -52,6 +57,11 @@ exit 0
         _executable(
             fake_bin / "launchctl",
             """
+printf '%s\n' "$*" >> "$SERVICE_LOG"
+if [ "${1:-}" = "list" ]; then
+  [ -f "$HOME/Library/LaunchAgents/${2:-}.plist" ]
+  exit $?
+fi
 if [ "${1:-}" = "load" ] && [ -n "${FAIL_PATTERN:-}" ]; then
   case "${2:-}" in
     *"$FAIL_PATTERN"*)
@@ -72,6 +82,7 @@ exit 0
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "FAIL_PATTERN": fail_pattern,
         "FAIL_ONCE_FILE": str(tmp_path / "failed-once"),
+        "SERVICE_LOG": str(tmp_path / "service.log"),
     }
     return env, home, fake_bin / "uv"
 
@@ -90,6 +101,47 @@ def test_systemd_installer_renders_validated_units_with_absolute_uv(tmp_path):
     units = sorted((home / ".config/systemd/user").glob("*.service"))
     assert len(units) == 3
     assert all(f"ExecStart={uv} " in unit.read_text() for unit in units)
+    assert all(
+        "Environment=ISSUE_AGENT_DEPLOYMENT_ID=target-repo"
+        in unit.read_text()
+        for unit in units
+    )
+
+
+def test_systemd_upgrade_stops_and_removes_every_legacy_unit_name(
+    tmp_path,
+):
+    env, home, _uv = _environment(tmp_path, systemd=True)
+    env["ISSUE_AGENT_DEPLOYMENT_ID"] = "stable-name"
+    unit_dir = home / ".config/systemd/user"
+    unit_dir.mkdir(parents=True)
+    services = (
+        "issue-agent-fix-watcher",
+        "issue-agent-review-watcher",
+        "issue-agent-steward",
+    )
+    for service in services:
+        (unit_dir / f"{service}.service").write_text("legacy-unsuffixed")
+        (unit_dir / f"{service}-target-repo.service").write_text(
+            "legacy-target-name"
+        )
+
+    result = subprocess.run(
+        ["bash", str(ROOT / "bin/install-systemd.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert sorted(path.name for path in unit_dir.glob("*.service")) == [
+        f"{service}-stable-name.service" for service in services
+    ]
+    calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
+    for service in services:
+        assert f"stop {service}.service" in calls
+        assert f"stop {service}-target-repo.service" in calls
+        assert f"stop {service}-stable-name.service" in calls
 
 
 def test_systemd_deployment_ids_do_not_collide_and_reject_repointing(
@@ -184,6 +236,39 @@ def test_systemd_failed_activation_rolls_back_units_and_config(tmp_path):
     assert snapshot.read_text() == "KNOWN_GOOD=1\n"
 
 
+def test_systemd_failed_cutover_restores_legacy_units(tmp_path):
+    env, home, _uv = _environment(
+        tmp_path, systemd=True, fail_pattern="review-watcher"
+    )
+    env["ISSUE_AGENT_DEPLOYMENT_ID"] = "stable-name"
+    unit_dir = home / ".config/systemd/user"
+    unit_dir.mkdir(parents=True)
+    services = (
+        "issue-agent-fix-watcher",
+        "issue-agent-review-watcher",
+        "issue-agent-steward",
+    )
+    for service in services:
+        (unit_dir / f"{service}-target-repo.service").write_text(
+            f"legacy-{service}"
+        )
+
+    result = subprocess.run(
+        ["bash", str(ROOT / "bin/install-systemd.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert all(
+        (unit_dir / f"{service}-target-repo.service").read_text()
+        == f"legacy-{service}"
+        for service in services
+    )
+    assert not any(unit_dir.glob("*-stable-name.service"))
+
+
 def test_launchd_installer_renders_validated_plists_with_absolute_uv(tmp_path):
     env, home, uv = _environment(tmp_path, systemd=False)
 
@@ -201,6 +286,45 @@ def test_launchd_installer_renders_validated_plists_with_absolute_uv(tmp_path):
         plistlib.loads(plist.read_bytes())["ProgramArguments"][0] == str(uv)
         for plist in plists
     )
+    assert all(
+        plistlib.loads(plist.read_bytes())["EnvironmentVariables"][
+            "ISSUE_AGENT_DEPLOYMENT_ID"
+        ]
+        for plist in plists
+    )
+
+
+def test_launchd_upgrade_unloads_and_removes_unsuffixed_legacy_jobs(
+    tmp_path,
+):
+    env, home, _uv = _environment(tmp_path, systemd=False)
+    env["ISSUE_AGENT_DEPLOYMENT_ID"] = "stable-name"
+    launch_agents = home / "Library/LaunchAgents"
+    launch_agents.mkdir(parents=True)
+    labels = (
+        "dev.issue-agent.fix-watcher",
+        "dev.issue-agent.review-watcher",
+        "dev.issue-agent.steward",
+    )
+    for label in labels:
+        (launch_agents / f"{label}.plist").write_text("legacy")
+
+    result = subprocess.run(
+        ["bash", str(ROOT / "bin/install-launchd.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not any(
+        (launch_agents / f"{label}.plist").exists() for label in labels
+    )
+    calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
+    for label in labels:
+        legacy = launch_agents / f"{label}.plist"
+        assert f"unload {legacy}" in calls
+        assert f"remove {label}" in calls
 
 
 @pytest.mark.parametrize("selector", ("--fix", "--review", "--steward"))
@@ -241,6 +365,7 @@ def test_launchd_failed_load_restores_every_known_good_plist(tmp_path):
     )
     for label in labels:
         (launch_agents / f"{label}.{checksum}.plist").write_text("known-good")
+        (launch_agents / f"{label}.plist").write_text("legacy-known-good")
     snapshot = (
         home
         / "Library/Application Support/issue-agent"
@@ -262,6 +387,11 @@ def test_launchd_failed_load_restores_every_known_good_plist(tmp_path):
     assert all(
         (launch_agents / f"{label}.{checksum}.plist").read_text()
         == "known-good"
+        for label in labels
+    )
+    assert all(
+        (launch_agents / f"{label}.plist").read_text()
+        == "legacy-known-good"
         for label in labels
     )
     assert "KNOWN_GOOD=1" in snapshot.read_text()

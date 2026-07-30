@@ -75,6 +75,12 @@ fi
 [ -n "$_raw_name" ] || _raw_name="$(basename "${TARGET_DIR:-target}")"
 NAME="$(printf '%s' "$_raw_name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]/-/g; s/^-+//; s/-+$//')"
 NAME="${NAME:-target}"
+DEPLOYMENT_NAME="${ISSUE_AGENT_DEPLOYMENT_ID:-$NAME}"
+_legacy_target_raw="$(basename "${TARGET_DIR:-target}")"
+LEGACY_TARGET_NAME="$(printf '%s' "$_legacy_target_raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]/-/g; s/^-+//; s/-+$//')"
+LEGACY_TARGET_NAME="${LEGACY_TARGET_NAME:-target}"
+_legacy_repo_raw="${CONFIG_REPO//\//-}"
+LEGACY_REPO_NAME="$(printf '%s' "$_legacy_repo_raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]/-/g; s/^-+//; s/-+$//')"
 
 SNAP_DIR="$HOME/.config/issue-agent"
 mkdir -p "$SNAP_DIR"; chmod 700 "$SNAP_DIR"
@@ -99,6 +105,7 @@ for index in "${!services[@]}"; do
   candidate="$STAGE/$s-$NAME.service"
   sed -e "s#@HARNESS_ROOT@#$HARNESS_ROOT#g" -e "s#@CONFIG@#$SNAP_CONFIG#g" \
       -e "s#@TARGET_DIR@#${TARGET_DIR:-/}#g" -e "s#@NAME@#$NAME#g" \
+      -e "s#@DEPLOYMENT_ID@#$DEPLOYMENT_NAME#g" \
       -e "s#@UV_BIN@#$UV_BIN#g" "$src" > "$candidate"
   "$SYSTEMD_ANALYZE" --user verify "$candidate"
 done
@@ -114,6 +121,20 @@ if [ -f "$SNAP_CONFIG" ]; then
   cp "$SNAP_CONFIG" "$STAGE/config.previous"
 fi
 
+legacy_units=()
+legacy_unit_names=()
+append_legacy_unit() {
+  candidate="$1"
+  current="$2"
+  [ "$candidate" != "$current" ] || return 0
+  candidate_name="$(basename "$candidate")"
+  for existing in "${legacy_unit_names[@]}"; do
+    [ "$existing" != "$candidate_name" ] || return 0
+  done
+  legacy_unit_names+=("$candidate_name")
+  [ ! -f "$candidate" ] || legacy_units+=("$candidate")
+}
+
 for index in "${!services[@]}"; do
   s="${services[$index]}"
   dst="$UD/$s-$NAME.service"
@@ -122,6 +143,20 @@ for index in "${!services[@]}"; do
     && touch "$STAGE/$index.active" || true
   systemctl --user is-enabled --quiet "$s-$NAME.service" \
     && touch "$STAGE/$index.enabled" || true
+  append_legacy_unit "$UD/$s.service" "$dst"
+  append_legacy_unit "$UD/$s-$LEGACY_TARGET_NAME.service" "$dst"
+  if [ -n "$LEGACY_REPO_NAME" ]; then
+    append_legacy_unit "$UD/$s-$LEGACY_REPO_NAME.service" "$dst"
+  fi
+done
+for index in "${!legacy_units[@]}"; do
+  legacy="${legacy_units[$index]}"
+  unit="$(basename "$legacy")"
+  cp "$legacy" "$STAGE/legacy.$index.previous"
+  systemctl --user is-active --quiet "$unit" \
+    && touch "$STAGE/legacy.$index.active" || true
+  systemctl --user is-enabled --quiet "$unit" \
+    && touch "$STAGE/legacy.$index.enabled" || true
 done
 
 rollback() {
@@ -144,6 +179,12 @@ rollback() {
       rm -f -- "$dst"
     fi
   done
+  for index in "${!legacy_units[@]}"; do
+    legacy="${legacy_units[$index]}"
+    if [ -f "$STAGE/legacy.$index.previous" ]; then
+      mv "$STAGE/legacy.$index.previous" "$legacy"
+    fi
+  done
   systemctl --user daemon-reload >/dev/null 2>&1
   for index in "${!services[@]}"; do
     s="${services[$index]}"
@@ -152,10 +193,43 @@ rollback() {
     [ ! -f "$STAGE/$index.active" ] \
       || systemctl --user restart "$s-$NAME.service" >/dev/null 2>&1
   done
+  for index in "${!legacy_units[@]}"; do
+    legacy="${legacy_units[$index]}"
+    unit="$(basename "$legacy")"
+    [ ! -f "$STAGE/legacy.$index.enabled" ] \
+      || systemctl --user enable "$unit" >/dev/null 2>&1
+    [ ! -f "$STAGE/legacy.$index.active" ] \
+      || systemctl --user restart "$unit" >/dev/null 2>&1
+  done
   echo "installation failed; restored previous known-good units" >&2
   exit "$status"
 }
 trap rollback ERR INT TERM
+
+stop_unit() {
+  unit="$1"
+  if ! systemctl --user stop "$unit"; then
+    if systemctl --user is-active --quiet "$unit"; then
+      echo "failed to stop active legacy writer $unit" >&2
+      return 1
+    fi
+  fi
+}
+
+# Stop all currently named roles plus the unsuffixed, target-basename, and
+# repository-derived predecessors before any replacement role may import the
+# shared ledger. Every removed predecessor is restored by rollback above.
+for s in "${services[@]}"; do
+  stop_unit "$s-$NAME.service"
+done
+for unit in "${legacy_unit_names[@]}"; do
+  stop_unit "$unit"
+done
+for legacy in "${legacy_units[@]}"; do
+  unit="$(basename "$legacy")"
+  systemctl --user disable "$unit" 2>/dev/null || true
+  rm -f -- "$legacy"
+done
 
 install -m 600 "$CONFIG" "$STAGE/config.next"
 mv "$STAGE/config.next" "$SNAP_CONFIG"
@@ -164,12 +238,6 @@ for index in "${!services[@]}"; do
   mv "$STAGE/$s-$NAME.service" "$UD/$s-$NAME.service"
 done
 systemctl --user daemon-reload
-# Stop the complete legacy writer set before any new role imports the shared
-# spend ledger. Sequential restart would let the first new role admit against a
-# snapshot while an old review/steward process could still append a late charge.
-for s in "${services[@]}"; do
-  systemctl --user stop "$s-$NAME.service"
-done
 for s in "${services[@]}"; do
   systemctl --user enable "$s-$NAME.service"
   systemctl --user restart "$s-$NAME.service"

@@ -16,6 +16,7 @@ NotifyAccess=main
 ExecStart=@UV_BIN@ run --extra sdk --with tree-sitter --with tree-sitter-bash python -m issue_agent.app.main fix
 WorkingDirectory=@HARNESS_ROOT@
 Environment=AGENT_ENV=@CONFIG@
+Environment=ISSUE_AGENT_DEPLOYMENT_ID=@DEPLOYMENT_ID@
 Environment=TARGET_DIR=@TARGET_DIR@
 Restart=on-failure
 RestartSec=30

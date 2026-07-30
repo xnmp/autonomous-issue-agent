@@ -191,32 +191,83 @@ class AccountingRuntime(AgentRuntime):
         )
         try:
             result = await self.inner.run(runtime_task)
-            return self._settle_result(
-                run_id, task.model or result.model, result
-            )
         except BaseException:
             self._recover_or_release(run_id)
             raise
+        # Settlement/normalization failures retain the reservation. Releasing
+        # here would turn an unavailable accounting authority into new budget
+        # headroom even though the paid runtime already completed.
+        return self._settle_result(
+            run_id, task.model or result.model, result
+        )
 
     def _settle_result(
         self, run_id: RunId, model: str | None, result: AgentResult
     ) -> AgentResult:
         usage = _token_usage(result.usage, self.runtime_name)
         provider_amount = Money.from_major("USD", result.cost_usd)
+        used_stream_fallback = False
         if (
-            self.runtime_name == "codex"
-            and usage is None
+            (usage is None or usage.total_tokens == 0)
             and provider_amount.micros <= 0
+            and any(
+                cap is not None
+                for cap in (
+                    self.repository_cap,
+                    self.global_cap,
+                    self.issue_cap,
+                )
+            )
         ):
-            if self.spend_evidence_dir:
+            # A dropped final provider envelope is not evidence of a free run.
+            # The stream accumulator can over-count repeated cache counters, but
+            # it is observed adapter telemetry and therefore a conservative
+            # fail-closed fallback while a monetary cap is armed.
+            stream_usage = _token_usage(
+                result.stream_usage, self.runtime_name
+            )
+            if stream_usage is not None and stream_usage.total_tokens > 0:
+                usage = stream_usage
+                used_stream_fallback = True
+        if (
+            usage is None
+            and provider_amount.micros <= 0
+            and any(
+                cap is not None
+                for cap in (
+                    self.repository_cap,
+                    self.global_cap,
+                    self.issue_cap,
+                )
+            )
+        ):
+            if self.runtime_name == "codex" and self.spend_evidence_dir:
                 from .spend_recovery import CodexSpendReconciler
 
                 CodexSpendReconciler(
                     self.store, (self.spend_evidence_dir,)
                 ).reconcile(run_id)
-            # Missing Codex usage is not evidence of a free run. Retain the
-            # full reservation when the rollout cannot yet be reconciled; boot
-            # recovery will settle it or release it with visible unknown spend.
+            # Retain the full reservation when an armed rollout has neither a
+            # provider charge nor trusted usage. Recovery can reconcile Codex
+            # evidence; every other runtime stays visibly fail-closed instead
+            # of silently admitting unlimited zero-dollar work.
+            return result
+        if (
+            usage is not None
+            and usage.total_tokens > 0
+            and provider_amount.micros <= 0
+            and any(
+                cap is not None
+                for cap in (
+                    self.repository_cap,
+                    self.global_cap,
+                    self.issue_cap,
+                )
+            )
+            and (self.rate_table is None or not model)
+        ):
+            # Observed work with no usable pricing authority cannot safely
+            # become a zero-dollar charge. Keep the maximum reservation.
             return result
         priced_by_rate_card = (
             self.rate_table is not None
@@ -240,6 +291,8 @@ class AccountingRuntime(AgentRuntime):
                 if self.runtime_name == "codex"
                 else PricingBasis.SYNTHETIC
             )
+            if used_stream_fallback and self.runtime_name == "codex":
+                basis = PricingBasis.CONFIGURED_RATE_CARD
         elif (
             self.runtime_name == "codex"
             and self.rate_table is not None
@@ -409,6 +462,15 @@ def _breaker_key(kind: str, number: int, issue: int | None) -> int:
 
 def _token_usage(raw: object, runtime: str) -> TokenUsage | None:
     if not isinstance(raw, dict):
+        return None
+    usage_keys = {
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "total_tokens",
+    }
+    if not usage_keys.intersection(raw):
         return None
     input_total = int(raw.get("input_tokens", 0) or 0)
     cache_read = int(raw.get("cache_read_input_tokens", 0) or 0)

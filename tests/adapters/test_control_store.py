@@ -723,6 +723,40 @@ def test_pid_reuse_does_not_keep_a_dead_lease(tmp_path):
     ) == (request.run_id,)
 
 
+def test_dead_lease_liveness_probe_does_not_hold_sqlite_write_lock(
+    tmp_path,
+):
+    store = _store(tmp_path)
+    request = dataclasses.replace(_request(1), owner_id="owner")
+    lease = Lease(
+        request.run_id,
+        request.dispatch_id,
+        "owner",
+        123,
+        123,
+        NOW,
+        10,
+    )
+    assert store.reserve(request, lease=lease).admitted
+    competing = SQLiteControlStore(store.path, busy_timeout_ms=50)
+    probe_wrote = False
+
+    def alive(_pid, _start):
+        nonlocal probe_wrote
+        competing.start_run(
+            RunId("probe-write"),
+            "probe-dispatch",
+            "RESOLVE",
+            "other-owner",
+            "cfg",
+        )
+        probe_wrote = True
+        return True
+
+    assert store.reclaim_dead_leases("owner", alive) == ()
+    assert probe_wrote
+
+
 def test_one_transaction_enforces_shared_global_limit_across_repositories(tmp_path):
     store = _store(tmp_path)
     global_scope = BudgetScope(

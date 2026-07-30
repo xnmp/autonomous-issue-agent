@@ -428,6 +428,10 @@ def test_bash_c_is_unresolvable_and_blocked():
         "env bash -c 'git commit --no-verify -m x'",
         "timeout 5 bash -c 'git commit --no-verify -m x'",
         "sudo sh -c 'git commit --no-verify -m x'",
+        "sudo -u root sh -c 'git commit --no-verify -m x'",
+        "nice -n 5 bash -c 'git commit --no-verify -m x'",
+        "stdbuf -o L git push --force origin main",
+        "sudo --user root git push --force origin main",
     ),
 )
 def test_wrapped_dynamic_interpreters_are_unresolvable(command):

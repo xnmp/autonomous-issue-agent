@@ -10,6 +10,7 @@ import os
 
 import pytest
 
+from issue_agent.adapters import single_instance
 from issue_agent.adapters.single_instance import (
     AlreadyRunning,
     InstanceLock,
@@ -80,10 +81,27 @@ def test_same_repo_different_checkouts_do_not_collide(tmp_path):
         b.release()
 
 
-def test_lock_lives_under_state_dir(tmp_path):
-    lock = acquire("fix", "owner/repo-H", state_dir=str(tmp_path))
+def test_state_root_does_not_change_singleton_identity(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        single_instance.tempfile, "gettempdir", lambda: str(tmp_path)
+    )
+    lock = acquire(
+        "fix",
+        "owner/repo-H",
+        target_dir="/srv/repo-H",
+        state_dir=str(tmp_path / "state-a"),
+    )
     try:
-        assert os.path.dirname(lock.path) == str(tmp_path / "locks")
+        with pytest.raises(AlreadyRunning):
+            acquire(
+                "fix",
+                "owner/repo-H",
+                target_dir="/srv/repo-H",
+                state_dir=str(tmp_path / "state-b"),
+            )
+        assert os.path.dirname(lock.path) == str(
+            tmp_path / f"issue-agent-{os.getuid()}-locks"
+        )
     finally:
         lock.release()
 
@@ -93,7 +111,10 @@ def test_empty_repo_is_rejected():
         acquire("fix", "")
 
 
-def test_foreign_symlink_lock_is_rejected(tmp_path):
+def test_foreign_symlink_lock_is_rejected(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        single_instance.tempfile, "gettempdir", lambda: str(tmp_path)
+    )
     path = _lock_path("fix", "owner/repo-I", state_dir=str(tmp_path))
     os.makedirs(os.path.dirname(path), exist_ok=True)
     os.symlink(tmp_path / "somewhere-else", path)

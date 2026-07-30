@@ -660,13 +660,60 @@ def _launcher_pids(name: str) -> list[int]:
     return _pgrep(f"point-at.sh {name}")
 
 
+def _pid_deployment_name(pid: int) -> str:
+    """Deployment identity exported by foreground and installed daemons."""
+
+    variables: dict[str, str] = {}
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as handle:
+            items = handle.read().split(b"\0")
+        variables = {
+            key.decode(errors="replace"): value.decode(errors="replace")
+            for item in items
+            if b"=" in item
+            for key, value in (item.split(b"=", 1),)
+        }
+    except OSError:
+        if sys.platform != "darwin":
+            return ""
+        completed = subprocess.run(
+            ("ps", "eww", "-p", str(pid), "-o", "command="),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if completed.returncode != 0:
+            return ""
+        for variable in ("ISSUE_AGENT_DEPLOYMENT_ID", "AGENT_ENV"):
+            match = re.search(
+                rf"(?:^|\s){variable}=([^\s]+)(?:\s|$)",
+                completed.stdout,
+            )
+            if match:
+                variables[variable] = match.group(1)
+    explicit = variables.get("ISSUE_AGENT_DEPLOYMENT_ID", "")
+    if explicit:
+        return explicit
+    active = os.path.basename(variables.get("AGENT_ENV", ""))
+    if active.startswith(".active.") and active.endswith(".env"):
+        return active[len(".active.") : -len(".env")]
+    return ""
+
+
 def _role_pids(name: str) -> dict[str, list[int]]:
-    """Map each role → daemon pids. The daemon argv is `… issue_agent.app.main
-    <role>`, which carries no repo/name marker, so this matches by role only. That
-    is exact under the single-launcher-per-repo invariant point-at.sh enforces
-    (it refuses to start a second launcher for a name); with multiple deployments
-    on one host the launcher-pid check in stop/status is the repo-scoped signal."""
-    return {role: _pgrep(f"issue_agent.app.main {role}") for role in ROLES}
+    """Map each role to PIDs owned by exactly one deployment."""
+
+    return {
+        role: [
+            pid
+            for pid in sorted(
+                set(_pgrep(f"issue_agent.app.main {role}"))
+                | set(_pgrep(f"issue_agent.app.launchd_main {role}"))
+            )
+            if _pid_deployment_name(pid) == name
+        ]
+        for role in ROLES
+    }
 
 
 # ── subcommand implementations ────────────────────────────────────────────────

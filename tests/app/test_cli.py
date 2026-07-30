@@ -803,6 +803,66 @@ def test_cmd_stop_refuses_wrong_repo_overlay(tmp_path, monkeypatch, capsys):
     assert "other/app" in captured.err
 
 
+def test_role_pid_discovery_is_scoped_to_requested_deployment(
+    monkeypatch,
+) -> None:
+    by_pattern = {
+        "issue_agent.app.main fix": [101, 102],
+        "issue_agent.app.launchd_main fix": [],
+        "issue_agent.app.main review": [201, 202],
+        "issue_agent.app.launchd_main review": [],
+        "issue_agent.app.main steward": [301],
+        "issue_agent.app.launchd_main steward": [],
+    }
+    owners = {
+        101: "deployment-a",
+        102: "deployment-b",
+        201: "deployment-a",
+        202: "deployment-b",
+        301: "deployment-b",
+    }
+    monkeypatch.setattr(cli, "_pgrep", lambda pattern: by_pattern[pattern])
+    monkeypatch.setattr(
+        cli, "_pid_deployment_name", lambda pid: owners[pid]
+    )
+
+    assert cli._role_pids("deployment-a") == {
+        "fix": [101],
+        "review": [201],
+        "steward": [],
+    }
+    assert cli._role_pids("deployment-b") == {
+        "fix": [102],
+        "review": [202],
+        "steward": [301],
+    }
+
+
+def test_linux_pid_deployment_identity_comes_from_process_environment():
+    if not os.path.isdir("/proc"):
+        return
+    process = subprocess.Popen(
+        [
+            cli.sys.executable,
+            "-c",
+            "import time; print('ready', flush=True); time.sleep(5)",
+        ],
+        env={
+            **os.environ,
+            "ISSUE_AGENT_DEPLOYMENT_ID": "deployment-a",
+        },
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == "ready"
+        assert cli._pid_deployment_name(process.pid) == "deployment-a"
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+
+
 def test_cmd_doctor_refuses_wrong_repo_overlay(tmp_path, monkeypatch, capsys):
     """FATAL: doctor would compose env for and preflight-check the WRONG
     repo, reporting a false all-clear right before an operator runs `start`."""
