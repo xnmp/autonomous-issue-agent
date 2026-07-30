@@ -231,9 +231,9 @@ exception replaces its contents with declarations for that issue only.
 Open-PR push revalidation derives its checks from checkout `HEAD`, so every
 explicit source ref must resolve to that same commit. To push another commit,
 check it out first or use `HEAD:<destination>`; the gate fails closed rather
-than applying `HEAD` evidence to different content. Bulk `--all` / `--mirror`
-pushes are rejected because they cannot bind every updated branch to that
-evidence; push explicit refspecs instead. Refs supplied by
+than applying `HEAD` evidence to different content. Bulk `--all`, `--branches`,
+and `--mirror` pushes are rejected because they cannot bind every updated
+branch to that evidence; push explicit refspecs instead. Refs supplied by
 `remote.<name>.push` are parsed and checked by the same source/destination
 rules. Unsafe refspec-less modes, config-query failures, wildcards, matching
 refspecs, mirrors, and command-local push overrides fail closed and require an
