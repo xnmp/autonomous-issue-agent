@@ -751,6 +751,7 @@ def journal_notifications(rows, limit: int = 100) -> list[dict]:
             ordinal += 1
     candidates.sort(key=lambda item: (item[0], item[1]))
     notifications = []
+    notification_ids = set()
     for stamp, _ordinal, issue, event in candidates:
         projected = _journal_notification(event, issue)
         if projected is None:
@@ -763,6 +764,9 @@ def journal_notifications(rows, limit: int = 100) -> list[dict]:
                 default=str,
             ).encode("utf-8")
         ).hexdigest()
+        if identity in notification_ids:
+            continue
+        notification_ids.add(identity)
         notifications.append({
             "id": identity,
             "ts": iso(stamp),
@@ -799,7 +803,20 @@ def _journal_notification(event: dict, issue: int) -> dict | None:
         }
     if name == "agent_run_start":
         kind = str(event.get("kind") or "")
+        role = event.get("role")
+        dispatch = event.get("dispatch")
         number = _event_number(event.get("number"))
+        known_kinds = (
+            dash.ISSUE_NUMBERED | dash.REVIEW_KINDS | dash.REPAIR_KINDS
+        )
+        if (
+            kind not in known_kinds
+            or role not in dash.ROLE_NAMES
+            or number is None
+            or not isinstance(dispatch, str)
+            or not dispatch.strip()
+        ):
+            return None
         pr = number if kind in dash.REVIEW_KINDS | dash.REPAIR_KINDS else None
         target = f" for PR #{pr}" if pr is not None else ""
         return {

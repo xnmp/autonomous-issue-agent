@@ -162,7 +162,9 @@ def test_malformed_dispatch_receipts_fail_open():
         "dispatch": "resolve-7",
     }
     malformed = []
-    for field in ("role", "kind", "number", "dispatch"):
+    # The deployment builder restores an absent role from its source feed;
+    # fields with no authoritative envelope fallback must still fail open.
+    for field in ("kind", "number", "dispatch"):
         event = {**valid, "ts": ts(len(malformed) + 2)}
         event.pop(field)
         malformed.append(event)

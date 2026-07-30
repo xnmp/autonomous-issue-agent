@@ -72,7 +72,11 @@ function promotionConfirmed(
   const active = issues.in_flight.some((card) => card.issue === issue)
     || issues.pending.some((card) => card.issue === issue);
   const stillBacklogged = issues.backlog.some((card) => card.issue === issue);
-  return active || (promotion.requestSucceeded && !stillBacklogged);
+  return active || (
+    promotion.requestSucceeded
+    && issues.gh_ok
+    && !stillBacklogged
+  );
 }
 
 function storedOptions(): DashboardOptions {

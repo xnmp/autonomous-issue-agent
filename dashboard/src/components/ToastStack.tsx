@@ -42,9 +42,13 @@ export function ToastStack({
       journalReady.current = true;
       return;
     }
-    const fresh = notifications.filter((notification) => !seen.current.has(notification.id));
+    const fresh: ToastNotification[] = [];
+    for (const notification of notifications) {
+      if (seen.current.has(notification.id)) continue;
+      seen.current.add(notification.id);
+      fresh.push(notification);
+    }
     if (fresh.length === 0) return;
-    for (const notification of fresh) seen.current.add(notification.id);
     setToasts((current) => [
       ...current,
       ...fresh.map(activeToast),
