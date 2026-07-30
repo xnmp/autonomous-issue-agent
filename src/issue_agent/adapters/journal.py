@@ -163,6 +163,22 @@ class RunContext:
     dispatch_id: str = ""
 
 
+@dataclass
+class _DeferredRouteReceipt:
+    """A completed router receipt, held until its dispatch decision is known."""
+
+    task: AgentTask | None = None
+    result: AgentResult | None = None
+    duration_s: float = 0.0
+    model: str = ""
+    effort: str | None = None
+    context: RunContext | None = None
+
+    def decide(self, model: str | None, effort: object | None) -> None:
+        self.model = model or ""
+        self.effort = getattr(effort, "value", effort) or None
+
+
 class JournalingRuntime:
     """An `AgentRuntime` that wraps another and records what each run cost.
 
@@ -188,6 +204,7 @@ class JournalingRuntime:
         self.role = role
         self.runtime = runtime
         self.context = RunContext(role=role)
+        self._deferred_route_receipt: _DeferredRouteReceipt | None = None
 
     def set_context(self, role: str, kind: str, number: int, issue: int | None) -> None:
         """Called by the dispatcher immediately before it hands off to a handler.
@@ -224,6 +241,32 @@ class JournalingRuntime:
             yield
         finally:
             self.context = previous
+
+    @contextlib.contextmanager
+    def route_receipt(self):
+        """Delay one ROUTE settlement until its selected resolve stance is known.
+
+        A probe yields a difficulty tier, while the workflow selects the actual
+        resolve model and effort after applying its escalation policy. The start
+        receipt remains immediate; this only delays the successful settlement.
+        """
+        previous = self._deferred_route_receipt
+        receipt = _DeferredRouteReceipt()
+        self._deferred_route_receipt = receipt
+        try:
+            yield receipt.decide
+        finally:
+            self._deferred_route_receipt = previous
+            if receipt.result is not None and receipt.task is not None:
+                previous_context = self.context
+                try:
+                    self.context = receipt.context or previous_context
+                    self._record(
+                        receipt.task, receipt.result, receipt.duration_s,
+                        route_decision=receipt,
+                    )
+                finally:
+                    self.context = previous_context
 
     def __getattr__(self, name: str):
         """Delegate anything this decorator does not define to the wrapped
@@ -297,7 +340,15 @@ class JournalingRuntime:
                 detail=((det.path or None) if det else None),
             )
             raise
-        self._record(task, result, time.monotonic() - t0)
+        duration_s = time.monotonic() - t0
+        deferred = self._deferred_route_receipt
+        if deferred is None:
+            self._record(task, result, duration_s)
+        else:
+            deferred.task = task
+            deferred.result = result
+            deferred.duration_s = duration_s
+            deferred.context = self.context
         retire_delivered_handover(
             task, result, scope, prepared.handover_digest
         )
@@ -334,7 +385,8 @@ class JournalingRuntime:
             sys.stderr.write(f"journal: could not record agent_run_start ({exc})\n")
 
     def _record(
-        self, task: AgentTask, result: AgentResult, duration_s: float, **extra
+        self, task: AgentTask, result: AgentResult, duration_s: float,
+        route_decision: _DeferredRouteReceipt | None = None, **extra,
     ) -> None:
         try:
             ctx = self.context
@@ -346,6 +398,17 @@ class JournalingRuntime:
             # pair, and estimates below are priced in stream units against a rate
             # learned in stream units.
             stream = _usage(getattr(result, "stream_usage", None))
+            probe_model = task.model or getattr(result, "model", "") or ""
+            route_fields = (
+                {
+                    # ROUTE is a routing-decision event. Keep the probe model
+                    # explicit so its small spend remains attributable too.
+                    "model": route_decision.model,
+                    "effort": route_decision.effort,
+                    "probe_model": probe_model,
+                }
+                if route_decision is not None else {"model": probe_model}
+            )
             # An ABORTED run (wall cap, idle, dropped result) never receives the
             # ResultMessage that carries dollars, so `cost` is 0.0 however long it
             # ran. Observed on the first real deployment: 906s and four commits
@@ -370,10 +433,7 @@ class JournalingRuntime:
                 number=ctx.number,
                 issue=ctx.issue,
                 dispatch=ctx.dispatch_id,
-                # A configured task model is the operator-selected journal
-                # attribution and must match the start receipt. Only an unpinned
-                # task needs the runtime's resolved default to identify its leg.
-                model=(task.model or getattr(result, "model", "") or ""),
+                **route_fields,
                 duration_s=round(duration_s, 1),
                 cost_usd=cost,
                 cost_estimated_usd=(estimated or None),
