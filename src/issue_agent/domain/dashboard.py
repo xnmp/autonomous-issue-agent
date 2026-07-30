@@ -289,9 +289,11 @@ def stage_for(events, running: tuple[RunningLeg, ...] = ()) -> str:
 
     Rules, in priority order:
 
-      1. a leg is running now → that leg's stage ("resolving", "reviewing",
-         "fixing CI", …). What the harness is doing beats what it last did.
-      2. otherwise the newest event that matches one of:
+      1. an active human-attention lifecycle state → "blocked" / "escalated".
+         Human attention outranks process activity, which remains in drill-down.
+      2. a leg is running now → that leg's stage ("resolving", "reviewing",
+         "fixing CI", …).
+      3. otherwise the newest event that matches one of:
          `+ai-done` / a merged `clear state`   → "done"
          `escalation` / `+needs-human-review`  → "escalated"
          `recurrence`                          → "recurred"
@@ -305,8 +307,11 @@ def stage_for(events, running: tuple[RunningLeg, ...] = ()) -> str:
          resolve/repair run settled            → "awaiting review"
          `+ai-working` / `+ai-pr-open`         → "working" / "pr open"
          `+ai-ready`                           → "queued"
-      3. nothing matched → "unknown".
+      4. nothing matched → "unknown".
     """
+    attention = _human_attention_stage(events)
+    if attention:
+        return attention
     if running:
         kind = running[-1].kind
         return _STAGE_RUNNING.get(kind, f"running {kind or 'agent'}".strip())
@@ -315,6 +320,31 @@ def stage_for(events, running: tuple[RunningLeg, ...] = ()) -> str:
         if stage:
             return stage
     return "unknown"
+
+
+def _human_attention_stage(events) -> str:
+    """Current attention state from its newest explicit transition."""
+    for event in reversed(list(events)):
+        if event.get("event") == "action":
+            fact = parse_action(str(event.get("desc") or ""))
+            if fact is None:
+                continue
+            if fact.verb == "clear":
+                return ""
+            if fact.verb != "relabel":
+                continue
+            if "needs-human-review" in fact.added:
+                return "escalated"
+            if "ai-blocked" in fact.added:
+                return "blocked"
+            if (
+                "needs-human-review" in fact.removed
+                or "ai-blocked" in fact.removed
+            ):
+                return ""
+        elif event.get("event") == "escalation":
+            return "escalated"
+    return ""
 
 
 def _stage_of_event(e: dict) -> str:

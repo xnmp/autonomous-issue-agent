@@ -1186,6 +1186,11 @@
   box-shadow: inset 2px 0 0 var(--fail);
   background: color-mix(in srgb, var(--fail) 6%, transparent);
 }
+.attention-stage {
+  color: var(--fail);
+  font-weight: 650;
+  letter-spacing: .01em;
+}
 .tbl tbody tr.expanded {
   background: var(--hover);
 }

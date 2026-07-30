@@ -286,8 +286,12 @@ function InFlightTable({
               ? null
               : card.idle_s + (card.idle_active ? offset : 0);
             const open = expanded === card.issue;
-            const alert = card.flags.some(
-              (flag) => flag === "escalated" || flag === "spend-blocked" || flag === "blocked",
+            const alert = (
+              card.stage === "blocked"
+              || card.stage === "escalated"
+              || card.flags.some(
+                (flag) => flag === "escalated" || flag === "spend-blocked" || flag === "blocked",
+              )
             );
             return (
               <Fragment key={card.issue}>
@@ -810,6 +814,9 @@ function IssueSummary({ card, open }: { card: IssueCard; open: boolean }) {
         <div className="row-wrap">
           <IssueNumber issue={card.issue} url={card.url} />
           <PrLink card={card} />
+          {card.stage === "blocked" || card.stage === "escalated" ? (
+            <span className="attention-stage">{card.stage}</span>
+          ) : null}
           {card.human_action ? (
             <span className={`human-action human-action-${card.human_action}`}>
               {card.human_action.replace("-", " ")}
