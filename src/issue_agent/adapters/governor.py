@@ -86,6 +86,7 @@ class GateContext:
     ac_posted: bool = False
     test_plan_posted: bool = False
     adversarial_verdict: str = ""
+    test_immutability_exceptions: str = ""
     visual_ac: bool = False                  # agent declared a visual criterion
     screenshots_read: tuple[str, ...] = ()   # evidence images the agent actually read
     harness_test_cmd: str | None = None
@@ -95,6 +96,7 @@ class GateContext:
     # the agent must not be able to grant itself the exemption.
     allow_untested: bool = False
     exists_at_base: Callable[[str], bool] = lambda f: False
+    exists_now: Callable[[str], bool] = lambda f: True
     run_tests: Callable[[str], bool | None] = lambda c: True
     revert_and_run: Callable[[tuple[str, ...]], bool | None] = lambda impl: False
     red_must_fail: bool = True
@@ -397,7 +399,13 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
         lambda: gate.check_required_test(ctx.branch, ctx.changed_files),
         lambda: gate.check_commit_log(ctx.branch_subjects),
         lambda: gate.check_no_evidence(ctx.changed_files),
-        lambda: gate.check_tests_immutable(ctx.changed_files, ctx.exists_at_base),
+        lambda: gate.check_tests_immutable(
+            ctx.changed_files,
+            ctx.exists_at_base,
+            exists_now=ctx.exists_now,
+            issue_number=gate.branch_issue_number(ctx.branch),
+            exception_manifest=ctx.test_immutability_exceptions,
+        ),
         lambda: gate.check_adversarial_verdict(ctx.adversarial_verdict),
         # §9 — ported from bash in wave P1-2 (review M6). Cheap only in the sense
         # that matters here (no test run), but it does touch the filesystem, so
@@ -478,7 +486,13 @@ def _push_gate_for_branch(branch: str, ctx: GateContext) -> list[str]:
     cheap_checks: tuple[Callable[[], gate.GateResult], ...] = (
         lambda: gate.check_commit_log(ctx.branch_subjects),
         lambda: gate.check_no_evidence(ctx.changed_files),
-        lambda: gate.check_tests_immutable(ctx.changed_files, ctx.exists_at_base),
+        lambda: gate.check_tests_immutable(
+            ctx.changed_files,
+            ctx.exists_at_base,
+            exists_now=ctx.exists_now,
+            issue_number=gate.branch_issue_number(ctx.branch),
+            exception_manifest=ctx.test_immutability_exceptions,
+        ),
     )
     for check in cheap_checks:
         result = check()

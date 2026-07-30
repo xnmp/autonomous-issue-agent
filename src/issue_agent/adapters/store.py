@@ -671,6 +671,10 @@ class HarnessMarkers:
     def adversarial_verdict(self) -> str:
         return self._read("adversarial-verdict").strip()
 
+    def test_immutability_exceptions(self) -> str:
+        """The tracked, issue-scoped declaration authorizing existing-test edits."""
+        return self._read("test-immutability-exceptions")
+
     def visual_ac(self) -> bool:
         """The agent declared a visual acceptance criterion (touched .harness/visual-ac),
         so the PR gate requires a committed + read screenshot."""

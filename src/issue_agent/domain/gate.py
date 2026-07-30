@@ -25,6 +25,8 @@ from enum import Enum
 
 from .refs import is_governed_branch
 
+TEST_IMMUTABILITY_EXCEPTIONS = ".harness/test-immutability-exceptions"
+
 
 # ── result type ──────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
@@ -183,6 +185,13 @@ def check_branch_name(name: str) -> GateResult:
             "type is feat|fix|chore|refactor, e.g. fix/42-null-token."
         )
     return ALLOW
+
+
+def branch_issue_number(name: str) -> int | None:
+    match = _BRANCH_NAME_RE.match(name)
+    if not match:
+        return None
+    return int(name.split("/", 1)[1].split("-", 1)[0])
 
 
 # ── commit message prefix (check-commit.sh) ───────────────────────────────────
@@ -392,16 +401,118 @@ def check_visual_evidence(
     return ALLOW
 
 
+@dataclass(frozen=True)
+class TestImmutabilityException:
+    issue_number: int
+    path: str
+    reason: str
+    replacement: str = ""
+
+
+def _valid_repo_test_path(path: str) -> bool:
+    parts = path.split("/")
+    return bool(
+        path
+        and not path.startswith("/")
+        and "\\" not in path
+        and all(part not in ("", ".", "..") for part in parts)
+        and looks_like_test(path)
+    )
+
+
+def parse_test_immutability_exceptions(
+    manifest: str,
+) -> tuple[tuple[TestImmutabilityException, ...], str]:
+    """Parse the deliberately tiny, Bash-portable manifest grammar.
+
+    One exception per line: ``issue | file | reason | replacement``.  The final
+    field is empty for a rewrite and names a new test file for a deletion.
+    """
+    if not manifest:
+        return (), ""
+    declarations: list[TestImmutabilityException] = []
+    seen: set[str] = set()
+    for number, line in enumerate(manifest.splitlines(), start=1):
+        fields = tuple(field.strip() for field in line.split("|"))
+        if len(fields) != 4:
+            return (), f"malformed test-immutability exception on line {number}"
+        issue, path, reason, replacement = fields
+        if not issue.isdigit() or int(issue) <= 0:
+            return (), f"malformed test-immutability exception on line {number}: invalid issue"
+        if not _valid_repo_test_path(path):
+            return (), f"malformed test-immutability exception on line {number}: invalid test file"
+        if not reason:
+            return (), f"malformed test-immutability exception on line {number}: reason is required"
+        if replacement and (
+            not _valid_repo_test_path(replacement) or replacement == path
+        ):
+            return (), (
+                f"malformed test-immutability exception on line {number}: "
+                "invalid replacement test"
+            )
+        if path in seen:
+            return (), f"malformed test-immutability exception: duplicate file '{path}'"
+        seen.add(path)
+        declarations.append(
+            TestImmutabilityException(int(issue), path, reason, replacement)
+        )
+    return tuple(declarations), ""
+
+
 def check_tests_immutable(
-    changed: Iterable[str], exists_at_base: Callable[[str], bool]
+    changed: Iterable[str],
+    exists_at_base: Callable[[str], bool],
+    *,
+    exists_now: Callable[[str], bool] = lambda _path: True,
+    issue_number: int | None = None,
+    exception_manifest: str = "",
 ) -> GateResult:
-    """Existing test files must not be modified/deleted; only NEW tests added.
-    `exists_at_base(path)` reports whether the file existed at the base ref."""
-    for f in changed:
-        if looks_like_test(f) and exists_at_base(f):
+    """Deny existing-test changes unless a narrow, auditable exception matches."""
+    changed_files = tuple(changed)
+    declarations, parse_error = parse_test_immutability_exceptions(exception_manifest)
+    if parse_error:
+        return deny(parse_error)
+    by_path = {declaration.path: declaration for declaration in declarations}
+    existing_tests = {
+        path for path in changed_files if looks_like_test(path) and exists_at_base(path)
+    }
+    for declaration in declarations:
+        if declaration.issue_number != issue_number:
             return deny(
-                f"existing test file '{f}' was modified/deleted — add NEW tests "
+                f"test-immutability exception for '{declaration.path}' names issue "
+                f"#{declaration.issue_number}, not current issue #{issue_number}"
+            )
+        if declaration.path not in existing_tests:
+            return deny(
+                f"test-immutability exception names unchanged or new file "
+                f"'{declaration.path}'"
+            )
+
+    for path in changed_files:
+        if path not in existing_tests:
+            continue
+        declaration = by_path.get(path)
+        if declaration is None:
+            return deny(
+                f"existing test file '{path}' was modified/deleted — add NEW tests "
                 "instead of changing existing ones"
+            )
+        if exists_now(path):
+            continue
+        replacement = declaration.replacement
+        if not replacement:
+            return deny(
+                f"existing test file '{path}' was deleted — its exception must name "
+                "a replacement test"
+            )
+        if (
+            replacement not in changed_files
+            or exists_at_base(replacement)
+            or not exists_now(replacement)
+        ):
+            return deny(
+                f"replacement test '{replacement}' for deleted '{path}' must be a "
+                "new test file in this change"
             )
     return ALLOW
 

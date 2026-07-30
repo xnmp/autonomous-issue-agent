@@ -222,14 +222,91 @@ prc_check_no_generated_instructions() {  # "<changed-file-list>"
   done
 }
 
-# §7b — existing test files must not be modified/deleted; only NEW tests added.
+# §7b — existing test files are immutable by default. A tracked, issue-scoped
+# declaration may authorize a correction; deletions additionally require a new
+# replacement test in the same change.
+prc_trim() {
+  printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
+prc_valid_test_path() {
+  local path="$1"
+  [ -n "$path" ] || return 1
+  case "$path" in
+    /*|*\\*|../*|*/../*|*/..|./*|*/./*|*/.) return 1 ;;
+  esac
+  printf '%s' "$path" | grep -qE "$PR_TEST_FILE_RE"
+}
+
 prc_check_tests_immutable() {  # prc_check_tests_immutable "<changed-file-list>"
-  local f
+  local f manifest line pipes decl_issue decl_file decl_reason decl_replacement
+  local extra issue_number seen matched replacement
+  manifest=$(cat .harness/test-immutability-exceptions 2>/dev/null || true)
+  issue_number=$(printf '%s' "$branch" | sed -nE 's#^(feat|fix|chore|refactor)/([0-9]+)-.*#\2#p')
+  seen=""
+
+  if [ -n "$manifest" ]; then
+    while IFS= read -r line; do
+      pipes=$(printf '%s' "$line" | tr -cd '|' | wc -c | tr -d ' ')
+      [ "$pipes" = "3" ] \
+        || fail "malformed test-immutability exception"
+      IFS='|' read -r decl_issue decl_file decl_reason decl_replacement extra <<< "$line"
+      decl_issue=$(prc_trim "$decl_issue")
+      decl_file=$(prc_trim "$decl_file")
+      decl_reason=$(prc_trim "$decl_reason")
+      decl_replacement=$(prc_trim "$decl_replacement")
+      printf '%s' "$decl_issue" | grep -qE '^[1-9][0-9]*$' \
+        || fail "malformed test-immutability exception: invalid issue"
+      prc_valid_test_path "$decl_file" \
+        || fail "malformed test-immutability exception: invalid test file"
+      [ -n "$decl_reason" ] \
+        || fail "malformed test-immutability exception: reason is required"
+      if [ -n "$decl_replacement" ]; then
+        prc_valid_test_path "$decl_replacement" \
+          || fail "malformed test-immutability exception: invalid replacement test"
+        [ "$decl_replacement" != "$decl_file" ] \
+          || fail "malformed test-immutability exception: invalid replacement test"
+      fi
+      [ "$decl_issue" = "$issue_number" ] \
+        || fail "test-immutability exception for '$decl_file' names issue #$decl_issue, not current issue #${issue_number:-unknown}"
+      printf '%s\n' "$seen" | grep -qxF "$decl_file" \
+        && fail "malformed test-immutability exception: duplicate file '$decl_file'"
+      seen="${seen}${seen:+
+}${decl_file}"
+      printf '%s\n' "$1" | grep -qxF "$decl_file" \
+        || fail "test-immutability exception names unchanged or new file '$decl_file'"
+      if ! git cat-file -e "origin/$base:$decl_file" 2>/dev/null \
+          && ! git cat-file -e "$base:$decl_file" 2>/dev/null; then
+        fail "test-immutability exception names unchanged or new file '$decl_file'"
+      fi
+    done <<< "$manifest"
+  fi
+
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     printf '%s' "$f" | grep -qE "$PR_TEST_FILE_RE" || continue
     if git cat-file -e "origin/$base:$f" 2>/dev/null || git cat-file -e "$base:$f" 2>/dev/null; then
-      fail "existing test file '$f' was modified/deleted — add NEW tests instead of changing existing ones"
+      matched=""
+      replacement=""
+      while IFS= read -r line; do
+        IFS='|' read -r decl_issue decl_file decl_reason decl_replacement extra <<< "$line"
+        decl_file=$(prc_trim "$decl_file")
+        [ "$decl_file" = "$f" ] || continue
+        matched=1
+        replacement=$(prc_trim "$decl_replacement")
+      done <<< "$manifest"
+      [ -n "$matched" ] \
+        || fail "existing test file '$f' was modified/deleted — add NEW tests instead of changing existing ones"
+      [ -e "$f" ] && continue
+      [ -n "$replacement" ] \
+        || fail "existing test file '$f' was deleted — its exception must name a replacement test"
+      printf '%s\n' "$1" | grep -qxF "$replacement" \
+        || fail "replacement test '$replacement' for deleted '$f' must be a new test file in this change"
+      if git cat-file -e "origin/$base:$replacement" 2>/dev/null \
+          || git cat-file -e "$base:$replacement" 2>/dev/null \
+          || [ ! -e "$replacement" ]; then
+        fail "replacement test '$replacement' for deleted '$f' must be a new test file in this change"
+      fi
     fi
   done <<< "$1"
 }

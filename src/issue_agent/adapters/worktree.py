@@ -443,6 +443,9 @@ def build_gate_context(
             return False
         return git(["cat-file", "-e", f"{baseref}:{path}"], cwd).code == 0
 
+    def exists_now(path: str) -> bool:
+        return os.path.exists(os.path.join(cwd, path))
+
     def _default_run_tests(cmd: str) -> bool | None:
         """Run the test command via `governor.run_target_command` (env scrub +
         re-entrancy bound + process-group kill on timeout — the #63 defenses).
@@ -505,11 +508,13 @@ def build_gate_context(
         ac_posted=markers.ac_posted(),
         test_plan_posted=markers.test_plan_posted(),
         adversarial_verdict=markers.adversarial_verdict(),
+        test_immutability_exceptions=markers.test_immutability_exceptions(),
         visual_ac=markers.visual_ac(),
         screenshots_read=markers.screenshots_read(),
         harness_test_cmd=markers.test_cmd(),
         env_test_cmd=env_test_cmd,
         exists_at_base=exists_at_base,
+        exists_now=exists_now,
         run_tests=rt,
         revert_and_run=revert_and_run,
         red_must_fail=red_must_fail,

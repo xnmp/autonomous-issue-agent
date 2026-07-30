@@ -27,6 +27,10 @@ from dataclasses import dataclass
 from ...domain.agent_task import AgentTask, McpServer, SubagentDef
 from ...domain.effort import DEFAULT_TIER, Effort, TIER_LADDER
 from ...domain.jira import JiraPhase
+from ...domain.gate import (
+    TEST_IMMUTABILITY_EXCEPTIONS,
+    parse_test_immutability_exceptions,
+)
 from .schemas import (
     ADJUDICATE_SCHEMA,
     AUTHOR_SCHEMA,
@@ -702,7 +706,41 @@ def _fenced(label: str, content: str) -> str:
 
 
 def _fenced_diff(diff: str) -> str:
-    return _fenced("diff", diff)
+    notice = _test_immutability_exception_notice(diff)
+    return f"{notice}\n\n{_fenced('diff', diff)}" if notice else _fenced("diff", diff)
+
+
+def _test_immutability_exception_notice(diff: str) -> str:
+    """Elevate the tracked exception manifest already present in reviewer diffs."""
+    marker = f"diff --git a/{TEST_IMMUTABILITY_EXCEPTIONS} b/{TEST_IMMUTABILITY_EXCEPTIONS}"
+    lines: list[str] = []
+    in_manifest = False
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            in_manifest = line == marker
+            continue
+        if in_manifest and line.startswith("+") and not line.startswith("+++"):
+            lines.append(line[1:])
+    raw = "\n".join(lines)
+    declarations, error = parse_test_immutability_exceptions(raw)
+    if not declarations:
+        if not error:
+            return ""
+        return (
+            "🚨 TEST IMMUTABILITY EXCEPTION manifest is malformed. "
+            "REQUEST_CHANGES unless the gate rejects it.\n"
+            f"{_fenced('test immutability exception', raw)}"
+        )
+    details = "\n".join(
+        f"- issue #{item.issue_number}; file `{item.path}`; reason: {item.reason}; "
+        f"replacement: `{item.replacement or '(none; expectation rewrite)'}`"
+        for item in declarations
+    )
+    return (
+        "🚨 TEST IMMUTABILITY EXCEPTION DECLARED. Judge each justification and "
+        "REQUEST_CHANGES if it weakens coverage or its replacement is inadequate:\n"
+        f"{details}"
+    )
 
 
 # ── diff scoping (P4.2) ──────────────────────────────────────────────────────

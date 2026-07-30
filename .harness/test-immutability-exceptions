@@ -1,2 +1,3 @@
 124 | tests/domain/test_gate.py | issue 124 requires regression coverage for the new narrow exception contract |
 124 | tests/adapters/test_task_planners.py | issue 124 requires proof that reviewers see every declared exception |
+124 | tests/test_gate_parity.py | issue 124 requires both live gate stacks to allow and deny the same declarations |
