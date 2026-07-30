@@ -4,6 +4,7 @@ Every assertion is on what the API promises a client — a sort order, a flag, a
 step's state — never on how the aggregation stores it.
 """
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -495,6 +496,164 @@ def test_issue_card_carries_gh_title_pr_state_and_merge_stamp():
 def test_issue_card_without_gh_shows_numbers_only_never_a_stale_title():
     card = snapshots.issue_card(row_for([RESOLVE], 7), NOW)
     assert card["title"] is None and card["url"] is None and card["pr_state"] is None
+
+
+def _pr_row():
+    return row_for([
+        RESOLVE,
+        {"ts": ts(hours=1), "event": "agent_run", "role": "review",
+         "kind": "REVIEW", "issue": 7, "number": 90, "status": "APPROVE"},
+    ], 7)
+
+
+def test_approved_green_open_pr_without_automerge_is_merge_ready():
+    card = snapshots.issue_card(
+        _pr_row(),
+        NOW,
+        gh_prs={90: {
+            "state": "OPEN",
+            "reviewDecision": "APPROVED",
+            "autoMergeRequest": None,
+            "statusCheckRollup": [{
+                "conclusion": "SUCCESS",
+                "completedAt": ts(minutes=20),
+            }],
+            "latestReviews": [{
+                "state": "APPROVED",
+                "submittedAt": ts(minutes=30),
+            }],
+        }},
+    )
+
+    assert card["human_action"] == "merge-ready"
+    assert card["human_wait_s"] == 1_200
+    assert "merge-ready" in card["flags"]
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"statusCheckRollup": [{"conclusion": "FAILURE"}]},
+        {"autoMergeRequest": {"enabledAt": "now"}},
+        {"state": "MERGED", "mergedAt": ts()},
+    ],
+)
+def test_pr_that_still_has_harness_work_is_not_merge_ready(override):
+    pr = {
+        "state": "OPEN",
+        "reviewDecision": "APPROVED",
+        "autoMergeRequest": None,
+        "statusCheckRollup": [{"conclusion": "SUCCESS"}],
+        **override,
+    }
+
+    assert snapshots.issue_card(
+        _pr_row(), NOW, gh_prs={90: pr}
+    )["human_action"] is None
+
+
+def test_ai_blocked_question_is_awaiting_reply_until_a_later_comment():
+    question = {
+        "createdAt": ts(minutes=40),
+        "body": "**Agent needs input:** choose A or B\n\n_Reply to unblock._",
+        "author": {"login": "agent-bot"},
+    }
+    issue = {
+        "labels": [{"name": "ai-blocked"}],
+        "comments": [question],
+    }
+
+    card = snapshots.issue_card(row_for([RESOLVE], 7), NOW, gh_issue=issue)
+    assert card["human_action"] == "awaiting-reply"
+    assert card["human_wait_s"] == 2_400
+
+    issue["comments"].append({
+        "createdAt": ts(minutes=20),
+        "body": "Automated progress update.",
+        "author": {"login": "other-app[bot]"},
+    })
+    still_waiting = snapshots.issue_card(row_for([RESOLVE], 7), NOW, gh_issue=issue)
+    assert still_waiting["human_action"] == "awaiting-reply"
+
+    issue["comments"].append({
+        "createdAt": ts(minutes=10),
+        "body": "Choose A.",
+        "author": {"login": "operator"},
+    })
+    resumed = snapshots.issue_card(row_for([RESOLVE], 7), NOW, gh_issue=issue)
+    assert resumed["human_action"] is None
+
+
+def test_pr_thread_ai_blocked_question_is_awaiting_reply():
+    card = snapshots.issue_card(
+        _pr_row(),
+        NOW,
+        gh_prs={90: {
+            "state": "OPEN",
+            "labels": [{"name": "ai-blocked"}],
+            "comments": [{
+                "createdAt": ts(minutes=25),
+                "body": (
+                    "**Agent needs clarification on review:** choose a path\n\n"
+                    "_Reply to unblock._"
+                ),
+                "author": {"login": "agent-bot"},
+            }],
+        }},
+    )
+
+    assert card["human_action"] == "awaiting-reply"
+    assert card["human_wait_s"] == 1_500
+
+
+def test_past_escalation_is_not_a_current_human_action_after_resume():
+    row = row_for([
+        RESOLVE,
+        {"ts": ts(hours=2), "event": "escalation", "issue": 7},
+        {"ts": ts(hours=1), "event": "action",
+         "desc": "relabel issue #7: -needs-human-review +ai-working"},
+    ], 7)
+
+    card = snapshots.issue_card(
+        row,
+        NOW,
+        gh_issue={"labels": [{"name": "ai-working"}]},
+    )
+    assert card["human_action"] is None
+
+    done = snapshots.issue_card(
+        replace(row, done=True),
+        NOW,
+        gh_issue={"labels": [{"name": "needs-human-review"}]},
+    )
+    assert done["human_action"] is None
+
+
+def test_malformed_check_rollup_is_not_merge_ready():
+    pr = {
+        "state": "OPEN",
+        "reviewDecision": "APPROVED",
+        "autoMergeRequest": None,
+        "statusCheckRollup": ["invalid"],
+    }
+
+    assert snapshots.issue_card(
+        _pr_row(), NOW, gh_prs={90: pr}
+    )["human_action"] is None
+
+
+def test_malformed_comment_author_does_not_break_human_action_projection():
+    issue = {
+        "labels": [{"name": "ai-blocked"}],
+        "comments": [{
+            "createdAt": ts(minutes=10),
+            "body": "**Agent needs input:** choose A\n\n_Reply to unblock._",
+            "author": ["invalid"],
+        }],
+    }
+
+    card = snapshots.issue_card(row_for([RESOLVE], 7), NOW, gh_issue=issue)
+    assert card["human_action"] == "awaiting-reply"
 
 
 def test_issue_card_flags_escalation_recurrence_spend_block_and_hold():

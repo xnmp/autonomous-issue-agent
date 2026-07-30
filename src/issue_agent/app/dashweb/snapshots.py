@@ -18,6 +18,7 @@ import math
 
 from ...domain import dashboard as dash
 from ...domain.actions import AgentKind
+from ...domain.identity import is_bot_login, login_eq
 
 # Frecency windows: (seconds, weight). An event inside 24h counts in all three,
 # which is the intended pile-up — a repo that moved this morning must outrank a
@@ -525,7 +526,7 @@ def _duration_breakdown(
     return elapsed, elapsed - idle, idle, idle_active and not row.done
 
 
-def _flags(row: dash.IssueRow) -> list[str]:
+def _flags(row: dash.IssueRow, human_action: str | None = None) -> list[str]:
     flags = []
     if row.escalations:
         flags.append("escalated")
@@ -535,7 +536,131 @@ def _flags(row: dash.IssueRow) -> list[str]:
         flags.append("spend-blocked")
     if _deferred_event(row):
         flags.append("waiting")
+    if human_action:
+        flags.append(human_action)
     return flags
+
+
+def _labels_set(issue: dict | None) -> set[str]:
+    return set(labels_of(issue or {}))
+
+
+def _unanswered_prompt_at(issue: dict | None) -> datetime | None:
+    comments = sorted(
+        (
+            (
+                stamp,
+                str(comment.get("body") or ""),
+                str(
+                    (
+                        comment.get("author", {}).get("login")
+                        if isinstance(comment.get("author"), dict)
+                        else ""
+                    )
+                    or ""
+                ),
+            )
+            for comment in (issue or {}).get("comments") or []
+            if isinstance(comment, dict)
+            and (stamp := dash.parse_ts(comment.get("createdAt"))) is not None
+        ),
+        key=lambda item: item[0],
+    )
+    prompt_at: datetime | None = None
+    prompt_author = ""
+    for stamp, body, author in comments:
+        if (
+            any(
+                body.startswith(marker)
+                for marker in (
+                    "**Agent needs input:**",
+                    "**Agent still needs input:**",
+                    "**Agent needs clarification on review:**",
+                    "**Author needs input:**",
+                )
+            )
+            and "_Reply to unblock" in body
+        ):
+            prompt_at = stamp
+            prompt_author = author
+        elif (
+            prompt_at is not None
+            and body.strip()
+            and (
+                login_eq(author, prompt_author)
+                or not is_bot_login(author)
+                or body.lstrip().startswith("/unblock")
+            )
+        ):
+            prompt_at = None
+            prompt_author = ""
+    return prompt_at
+
+
+def _checks_green(checks) -> bool:
+    if not isinstance(checks, list):
+        return False
+    success = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+    return all(
+        isinstance(check, dict)
+        and str(check.get("conclusion") or check.get("state") or "").upper() in success
+        for check in checks
+    )
+
+
+def _merge_ready_since(pr: dict) -> datetime | None:
+    stamps = [
+        stamp
+        for review in pr.get("latestReviews") or []
+        if isinstance(review, dict)
+        and str(review.get("state") or "").upper() == "APPROVED"
+        and (stamp := dash.parse_ts(review.get("submittedAt"))) is not None
+    ]
+    stamps.extend(
+        stamp
+        for check in pr.get("statusCheckRollup") or []
+        if isinstance(check, dict)
+        and (stamp := dash.parse_ts(check.get("completedAt"))) is not None
+    )
+    return max(stamps, default=dash.parse_ts(pr.get("updatedAt")))
+
+
+def _human_action(
+    row: dash.IssueRow,
+    gh_issue: dict | None,
+    gh_pr: dict | None,
+) -> tuple[str | None, datetime | None]:
+    if row.done:
+        return None, None
+    issue_labels = _labels_set(gh_issue)
+    pr_labels = _labels_set(gh_pr)
+    if "needs-human-review" in issue_labels | pr_labels:
+        event = next(
+            (e for e in reversed(row.events) if e.get("event") == "escalation"),
+            None,
+        )
+        return "escalated", dash.parse_ts((event or {}).get("ts")) or row.last_ts
+    prompt_times = [
+        prompt_at
+        for item, labels in (
+            (gh_issue, issue_labels),
+            (gh_pr, pr_labels),
+        )
+        if "ai-blocked" in labels
+        and (prompt_at := _unanswered_prompt_at(item)) is not None
+    ]
+    if prompt_times:
+        return "awaiting-reply", max(prompt_times)
+    if (
+        gh_pr
+        and str(gh_pr.get("state") or "").upper() == "OPEN"
+        and not gh_pr.get("mergedAt")
+        and str(gh_pr.get("reviewDecision") or "").upper() == "APPROVED"
+        and _checks_green(gh_pr.get("statusCheckRollup"))
+        and not gh_pr.get("autoMergeRequest")
+    ):
+        return "merge-ready", _merge_ready_since(gh_pr)
+    return None, None
 
 
 def _model_effort(row: dash.IssueRow, model: str) -> str | None:
@@ -639,6 +764,12 @@ def issue_card(
     end = row.last_ts if (row.done and row.last_ts) else now
     elapsed, working, idle, idle_active = _duration_breakdown(row, started, end)
     displayed_models = list(row.models) if row.done else active_card_models(row)
+    human_action, human_wait_since = _human_action(row, gh_issue, gh_pr)
+    human_wait_s = (
+        max(0.0, (now - human_wait_since).total_seconds())
+        if human_wait_since is not None
+        else None
+    )
     card = {
         "issue": row.issue,
         "title": (gh_issue or {}).get("title"),
@@ -659,11 +790,14 @@ def issue_card(
         "working_s": round(working) if working is not None else None,
         "idle_s": round(idle) if idle is not None else None,
         "idle_active": idle_active,
+        "human_action": human_action,
+        "human_wait_since_ts": iso(human_wait_since),
+        "human_wait_s": round(human_wait_s) if human_wait_s is not None else None,
         "projected_eta_s": projected_eta_s,
         "models": displayed_models,
         "model_badges": model_badges(row, displayed_models),
         "rounds": row.rounds,
-        "flags": _flags(row),
+        "flags": _flags(row, human_action),
         "issue_verification": issue_verification,
         "pr_verification": pr_verification,
     }

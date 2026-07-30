@@ -1048,6 +1048,17 @@
   font-weight: 600;
   overflow-wrap: anywhere;
 }
+.human-action {
+  font-size: var(--text-xs);
+  font-weight: 700;
+}
+.human-action-merge-ready {
+  color: var(--ok);
+}
+.human-action-awaiting-reply,
+.human-action-escalated {
+  color: var(--fail);
+}
 .compact-issue {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);

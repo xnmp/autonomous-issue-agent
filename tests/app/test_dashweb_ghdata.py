@@ -69,6 +69,23 @@ def test_a_gh_failure_degrades_to_an_error_string():
     assert payload is None and error == "gh: not authenticated"
 
 
+def test_pr_query_collects_human_action_inputs():
+    gh, calls = reader([("[]", "")])
+
+    gh.prs("o/r")
+
+    fields = calls[0][calls[0].index("--json") + 1]
+    for field in (
+        "reviewDecision",
+        "statusCheckRollup",
+        "autoMergeRequest",
+        "latestReviews",
+        "labels",
+        "comments",
+    ):
+        assert field in fields
+
+
 def test_a_failure_is_cached_too_so_a_down_gh_is_not_hammered():
     gh, calls = reader([("", "gh down"), ("[]", "")])
     gh.issues("o/r")

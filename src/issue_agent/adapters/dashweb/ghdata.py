@@ -30,7 +30,10 @@ ISSUE_FIELDS = "number,title,url,body,labels,state,createdAt,closedAt,comments"
 # `gh issue list` paginates to this bound. Reaching it is surfaced to callers:
 # a long-run trend that quietly omitted history would be worse than no trend.
 ISSUE_HISTORY_LIMIT = 1000
-PR_FIELDS = "number,title,url,state,mergedAt"
+PR_FIELDS = (
+    "number,title,url,state,mergedAt,updatedAt,reviewDecision,"
+    "statusCheckRollup,autoMergeRequest,latestReviews,labels,comments"
+)
 
 
 @dataclass
