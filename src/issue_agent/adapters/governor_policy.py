@@ -274,8 +274,20 @@ def _has_clustered_n(full_words: list[str]) -> bool:
 # always a mistake or an escape.
 PROTECTED_BRANCHES = ("main", "master", "dev")
 
-_FORCE_PUSH_FLAGS = ("--force", "-f", "--force-with-lease", "--force-if-includes")
-_PUSH_VALUE_OPTIONS = ("-o", "--push-option", "--receive-pack", "--exec")
+_PUSH_LONG_OPTIONS = (
+    ("--push-option", "--pu", "value"),
+    ("--receive-pack", "--rece", "value"),
+    ("--exec", "--e", "value"),
+    ("--recurse-submodules", "--recu", "value"),
+    ("--repo", "--rep", "remote"),
+    ("--delete", "--de", "delete"),
+    ("--force", "--force", "force"),
+    ("--force-with-lease", "--force-w", "force"),
+    ("--force-if-includes", "--force-i", "force"),
+    ("--all", "--al", "bulk"),
+    ("--branches", "--b", "bulk"),
+    ("--mirror", "--m", "bulk"),
+)
 
 
 @dataclass(frozen=True)
@@ -319,21 +331,32 @@ def parse_push_args(push_words: list[str]) -> PushArgs:
                 remote_from_option = w
             consume_as = ""
             continue
-        if w in _PUSH_VALUE_OPTIONS:
+        if w == "-o":
             consume_as = "value"
             continue
-        if w == "--repo":
-            consume_as = "remote"
-            continue
-        if w.startswith("--repo="):
-            remote_from_option = w.partition("=")[2]
-            continue
-        if (
-            w.startswith("--push-option=")
-            or w.startswith("--receive-pack=")
-            or w.startswith("--exec=")
-        ):
-            continue
+        if w.startswith("--"):
+            option_name, separator, option_value = w.partition("=")
+            matched_long_option = False
+            for full_name, minimum_name, option_kind in _PUSH_LONG_OPTIONS:
+                if (
+                    len(option_name) >= len(minimum_name)
+                    and full_name.startswith(option_name)
+                ):
+                    matched_long_option = True
+                    if separator:
+                        if option_kind == "remote":
+                            remote_from_option = option_value
+                    elif option_kind in ("value", "remote"):
+                        consume_as = option_kind
+                    if option_kind == "delete":
+                        is_delete = True
+                    elif option_kind == "force":
+                        has_force = True
+                    elif option_kind == "bulk":
+                        is_bulk = True
+                    break
+            if matched_long_option:
+                continue
         if w.startswith("-") and not w.startswith("--") and "o" in w[1:]:
             option_flags, _, option_value = w[1:].partition("o")
             has_force = has_force or "f" in option_flags
@@ -341,14 +364,11 @@ def parse_push_args(push_words: list[str]) -> PushArgs:
             if not option_value:
                 consume_as = "value"
             continue
-        if w in _FORCE_PUSH_FLAGS:
+        if w == "-f":
             has_force = True
             continue
-        if w in ("--delete", "-d"):
+        if w == "-d":
             is_delete = True
-            continue
-        if w in ("--all", "--mirror"):
-            is_bulk = True
             continue
         if w.startswith("--"):
             continue  # other long flag (e.g. --tags, --set-upstream)

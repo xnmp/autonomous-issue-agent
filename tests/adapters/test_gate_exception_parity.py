@@ -1,9 +1,13 @@
 """Cross-stack parity for the audited existing-test exception path."""
 
+import json
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
+from issue_agent.adapters.governor import GateContext, evaluate_command
 from test_gate_parity import Case, _git, _pr_argv, _run_case, fresh_repo
 
 
@@ -216,6 +220,14 @@ CASES = (
          _bulk_push_with_unvalidated_branch, ["push", "--mirror", "origin"],
          False, env={"TEST_CMD": "test -f impl.py"}, open_pr="13",
          reason_contains="bulk push"),
+    Case("push_branches_cannot_hide_an_unvalidated_branch", "push",
+         _bulk_push_with_unvalidated_branch, ["push", "--branches", "origin"],
+         False, env={"TEST_CMD": "test -f impl.py"}, open_pr="13",
+         reason_contains="bulk push"),
+    Case("abbreviated_push_mirror_cannot_hide_an_unvalidated_branch", "push",
+         _bulk_push_with_unvalidated_branch, ["push", "--mir", "origin"],
+         False, env={"TEST_CMD": "test -f impl.py"}, open_pr="13",
+         reason_contains="bulk push"),
     Case("configured_push_refspec_cannot_hide_non_head_source", "push",
          _configured_non_head_source, ["push", "origin"],
          False, env={"TEST_CMD": "test -f impl.py"}, open_pr="13",
@@ -230,6 +242,21 @@ CASES = (
          reason_contains="existing test file"),
     Case("clustered_push_option_preserves_refspec_less_destination", "push",
          _base_repo, ["push", "-vo", "audit", "origin"],
+         False, env={"TEST_CMD": "true"}, open_pr="13",
+         reason_contains="existing test file"),
+    Case("bulk_named_push_option_value_is_not_a_bulk_push", "push",
+         _valid, ["push", "-o", "--mirror", "origin"],
+         True, env={"TEST_CMD": "test -f impl.py"}, open_pr="13"),
+    Case("long_value_option_preserves_refspec_less_destination", "push",
+         _base_repo, ["push", "--recurse-submodules", "check", "origin"],
+         False, env={"TEST_CMD": "true"}, open_pr="13",
+         reason_contains="existing test file"),
+    Case("abbreviated_value_option_preserves_refspec_less_destination", "push",
+         _base_repo, ["push", "--push-opt", "audit", "origin"],
+         False, env={"TEST_CMD": "true"}, open_pr="13",
+         reason_contains="existing test file"),
+    Case("empty_repo_option_preserves_positional_remote", "push",
+         _base_repo, ["push", "--repo=", "origin"],
          False, env={"TEST_CMD": "true"}, open_pr="13",
          reason_contains="existing test file"),
     Case("command_local_config_cannot_hide_non_head_source", "push",
@@ -252,3 +279,33 @@ def test_exception_gate_parity(case: Case, tmp_path: Path):
     if case.reason_contains:
         assert case.reason_contains in bash.output
         assert case.reason_contains in python.output
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "git push --dele origin dev",
+        "git push --force-w origin HEAD:main",
+        "git push --force-i origin HEAD:main",
+    ),
+)
+def test_abbreviated_destructive_push_is_blocked_cross_stack(
+    command: str, tmp_path: Path
+) -> None:
+    repo = _base_repo(tmp_path)
+    hook = Path(__file__).parents[2] / "plugin/hooks/bash_governor.py"
+    payload = json.dumps({"tool_input": {"command": command}})
+    bash = subprocess.run(
+        [sys.executable, str(hook)],
+        cwd=repo,
+        input=payload,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    python = evaluate_command(command, GateContext())
+
+    assert bash.returncode == 2
+    assert not python.allowed
+    assert "protected branch" in bash.stderr
+    assert "protected branch" in python.reason

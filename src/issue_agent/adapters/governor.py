@@ -558,8 +558,9 @@ def _push_gate(push_argv: list[str], ctx: GateContext) -> list[str]:
     parsed = governor_policy.parse_push_args(push_argv)
     if parsed.is_bulk:
         return [
-            "bulk push modes (--all/--mirror) cannot be validated against one "
-            "checkout HEAD; push explicit HEAD:<destination> refspecs instead"
+            "bulk push modes (--all/--branches/--mirror) cannot be validated "
+            "against one checkout HEAD; push explicit HEAD:<destination> "
+            "refspecs instead"
         ]
     if any("*" in refspec for refspec in parsed.candidate_refspecs):
         return [

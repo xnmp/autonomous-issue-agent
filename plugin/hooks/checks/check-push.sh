@@ -15,10 +15,24 @@ fail() { echo "Push blocked: $1"; exit 1; }
 
 base="${BASE_BRANCH:-dev}"
 
+consume_push_value=""
 for arg in "$@"; do
+  if [ -n "$consume_push_value" ]; then
+    consume_push_value=""
+    continue
+  fi
   case "$arg" in
-    --all|--mirror)
-      fail "bulk push modes (--all/--mirror) cannot be validated against one checkout HEAD; push explicit HEAD:<destination> refspecs instead"
+    --pu*=*|--rece*=*|--e*=*|--recu*=*|--rep*=*) continue ;;
+    -o|--pu*|--rece*|--e*|--recu*|--rep*)
+      consume_push_value=1
+      continue
+      ;;
+    -[^-]*o*)
+      case "$arg" in *o) consume_push_value=1 ;; esac
+      continue
+      ;;
+    --al*|--b*|--m*)
+      fail "bulk push modes (--all/--branches/--mirror) cannot be validated against one checkout HEAD; push explicit HEAD:<destination> refspecs instead"
       ;;
   esac
 done
@@ -125,7 +139,8 @@ for arg in "$@"; do
     continue
   fi
   case "$arg" in
-    -o|--push-option|--receive-pack|--exec|--repo)
+    --pu*=*|--rece*=*|--e*=*|--recu*=*|--rep*=*) continue ;;
+    -o|--pu*|--rece*|--e*|--recu*|--rep*)
       consume_push_value=1
       continue
       ;;
@@ -135,8 +150,7 @@ for arg in "$@"; do
       case "$arg" in *o) consume_push_value=1 ;; esac
       continue
       ;;
-    --push-option=*|--receive-pack=*|--exec=*|--repo=*) continue ;;
-    --delete|-d|-[^-]*d*) delete_mode=1 ;;
+    --de*|-d|-[^-]*d*) delete_mode=1 ;;
   esac
 done
 consume_push_value=""
@@ -144,31 +158,31 @@ for arg in "$@"; do
   if [ -n "$consume_push_value" ]; then
     if [ "$consume_push_value" = "remote" ]; then
       remote_name="$arg"
-      remote_seen=1
+      if [ -n "$remote_name" ]; then remote_seen=1; else remote_seen=""; fi
     fi
     consume_push_value=""
     continue
   fi
   [ "$arg" = "push" ] && continue
   case "$arg" in
-    -o|--push-option|--receive-pack|--exec)
+    --pu*=*|--rece*=*|--e*=*|--recu*=*) continue ;;
+    -o|--pu*|--rece*|--e*|--recu*)
       consume_push_value="value"
       continue
       ;;
-    --repo)
-      consume_push_value="remote"
+    --rep*=*)
+      remote_name="${arg#*=}"
+      if [ -n "$remote_name" ]; then remote_seen=1; else remote_seen=""; fi
       continue
       ;;
-    --repo=*)
-      remote_name="${arg#--repo=}"
-      remote_seen=1
+    --rep*)
+      consume_push_value="remote"
       continue
       ;;
     -[^-]*o*)
       case "$arg" in *o) consume_push_value="value" ;; esac
       continue
       ;;
-    --push-option=*|--receive-pack=*|--exec=*) continue ;;
     -*) continue ;;
   esac
   if [ -z "$remote_seen" ]; then
