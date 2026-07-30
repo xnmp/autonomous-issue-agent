@@ -300,6 +300,18 @@ def resolve(command: str) -> Resolution:
     tree = PARSER.parse(command.encode())
     if tree.root_node.has_error:
         return Unresolvable("shell parse contains an ERROR node")
+    pending = [tree.root_node]
+    while pending:
+        node = pending.pop()
+        if node.type == "function_definition":
+            # A function can forward "$@" or rewrite its arguments before a
+            # later invocation. Shell expansion semantics are runtime state,
+            # so a static command governor must deny the definition rather than
+            # classify the function call as an unrelated executable.
+            return Unresolvable(
+                "shell function definitions defer command resolution"
+            )
+        pending.extend(node.children)
     governed: list[Governed] = []
     for words, _env in extract_commands_with_env(command):
         if not words:
@@ -347,6 +359,10 @@ def resolve(command: str) -> Resolution:
             return Unresolvable("dynamic value in command position")
         if base == "eval":
             return Unresolvable("eval defers command resolution")
+        if base in {"alias", "source", "."}:
+            return Unresolvable(
+                f"{base} changes command resolution at runtime"
+            )
         if base in _DYNAMIC_INTERPRETERS and "-c" in inner[1:]:
             return Unresolvable(
                 f"{base} -c defers command resolution beyond the governor"

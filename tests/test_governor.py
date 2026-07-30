@@ -369,45 +369,9 @@ def test_passthrough_does_not_overmatch():
     assert gov.find_violations("time git status") == []
 
 
-# ── KNOWN OPEN HOLE: indirect-execution bypass (M9 / R3-F8) ───────────────────
-# `classify()` only recognises a governed command when the FIRST word of a
-# `command` AST node (after `env`/passthrough-wrapper unwrapping, see
-# `_strip_env_wrapper`) is `git` or `gh`. `sh -c '<payload>'`, `bash -c
-# '<payload>'`, `python -c '<payload>'`, `eval '<payload>'`, and `xargs <cmd>
-# <args>` all put the real command's name in a position `classify` never
-# looks: as the second word of the outer node (`sh`/`bash`/`eval`/`xargs`), or
-# buried inside an opaque interpreter-language string that tree-sitter-bash
-# parses as a single string/raw_string leaf, never as a nested `command` node
-# with its own child commands. `extract_commands_with_env` therefore reports
-# `kinds=[]` for the whole line and `find_violations` returns `[]` — the gate
-# is not merely weak against these, it is never consulted at all.
-#
-# This is NOT a parser bug: `governor_policy.py` is the exact same module the
-# shell hook (`bash_governor.py`, see `test_shell_hook_reuses_shared_policy_
-# functions` above) and the in-process SDK/Codex adapter both import — the
-# AST parsing and bypass-string detection that this file spends 300+ lines
-# testing are sound. The hole is structural: an indirection layer (a shell
-# invoked with `-c`, an `eval`, a language interpreter, an argument-forwarder
-# like `xargs`) that classify()'s single-first-word heuristic was never
-# designed to see through. Closing it (backlog P3.2) requires either
-# recursively re-parsing `-c`/`eval` string payloads as bash and unwrapping
-# `xargs`'s leading non-flag argument as the real command name, or an
-# allow-list stance (govern-by-default, not bypass-by-default).
-#
-# Blast radius: the fixer runs the SDK agent with `permission_mode=
-# bypassPermissions` (see adapters/governor.py + app/main.py), where this
-# governor hook plus `disallowed_tools` are the ONLY two policy layers left —
-# there is no allow-list to fall back on. Any of these five vectors lets a
-# fixer session commit with `--no-verify`, push straight past the push gate,
-# or write `core.hooksPath`, with the governor never even entering the
-# decision (not "misclassifies" — never called).
-#
-# Each bypass below is paired with a PASSING test proving the governor DOES
-# block the exact same payload in its direct form — the anti-vacuity check
-# that rules out an xfail merely encoding a typo'd payload nothing would ever
-# catch. `strict=True` means the day someone closes this hole, the xfail
-# flips to a hard failure here, forcing this record to be updated rather than
-# silently going stale.
+# ── indirect-execution regressions (M9 / R3-F8) ───────────────────────────────
+# Runtime indirection is unresolvable by the static governor and must deny.
+# Direct forms remain as anti-vacuity baselines for the smuggled payloads.
 def test_direct_no_verify_is_blocked_anti_vacuity_baseline():
     # Baseline for every xfail below: the DIRECT form of the exact payload
     # each bypass smuggles through IS blocked today.
@@ -466,6 +430,29 @@ def test_eval_is_unresolvable_and_blocked():
 
 def test_xargs_before_git_is_unresolvable_and_blocked():
     assert gov.find_violations("xargs git commit --no-verify -m x")
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        'g() { git "$@"; }; g push origin main',
+        'function g { command git "$@"; }; g commit --no-verify -m x',
+        "alias g=git; g push origin main",
+        "source ./helpers.sh; g push origin main",
+        ". ./helpers.sh; g push origin main",
+    ),
+)
+def test_runtime_command_indirection_is_unresolvable_and_blocked(command):
+    resolution = gov.resolve(command)
+    assert isinstance(resolution, gov.Unresolvable)
+    assert gov.find_violations(command)
+
+
+def test_even_benign_function_definition_is_not_misclassified_as_static():
+    assert isinstance(
+        gov.resolve("f() { echo ok; }; f"),
+        gov.Unresolvable,
+    )
 
 
 # ── #113: read-only mode belongs to the LEG, not to the filesystem ───────────
