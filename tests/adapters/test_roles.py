@@ -1608,6 +1608,44 @@ def test_codex_reviewer_defers_hook_installation_until_dispatch(tmp_path, monkey
     assert hook_calls == []
 
 
+def test_codex_review_dispatch_cannot_persist_mode_into_nested_fixer(tmp_path, monkeypatch):
+    """The actual review-role setup must not cage its nested fixer worktrees."""
+    from issue_agent.adapters import codex_runner
+    from issue_agent.adapters.codex_hook import write_hook_config
+    from issue_agent.app.config import from_env
+    from issue_agent.app.roles import build_review_daemon
+
+    class CapturingCodexRunner:
+        def __init__(self, **_kwargs):
+            pass
+
+        def preflight(self):
+            return None
+
+    monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
+    target = tmp_path / "target"
+    cfg = from_env({
+        "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEWER_RUNTIME": "codex",
+        "REVIEW_STATE_DIR": str(tmp_path / "review-state"),
+        "TARGET_DIR": str(target),
+    })
+    daemon = build_review_daemon(
+        cfg, _BuildableGateway(), Store(str(tmp_path / "review-state")),
+        FakeRunner(AgentResult(is_error=False)),
+    )
+    dispatcher = daemon.executor._run_agent.__closure__[0].cell_contents
+    dispatcher.review_workflow.cfg.prepare_cwd(str(target))
+
+    fixer = target / ".claude" / "worktrees" / "issue-113"
+    fixer.mkdir(parents=True)
+    write_hook_config(str(fixer))
+
+    review_hook = (target / ".codex" / "hooks" / "gov.sh").read_text()
+    fixer_hook = (fixer / ".codex" / "hooks" / "gov.sh").read_text()
+    assert "ISSUE_AGENT_REVIEW_READ_ONLY" not in review_hook
+    assert "ISSUE_AGENT_REVIEW_READ_ONLY" not in fixer_hook
+
+
 def test_codex_reviewer_names_its_unpriced_budget_warning(tmp_path, monkeypatch, capsys):
     """A review deployment must not inherit a fixer-only warning that sends the
     operator to the wrong knob while REVIEW_BUDGET_USD is unmeasurable."""
