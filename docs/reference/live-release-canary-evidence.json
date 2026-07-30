@@ -240,5 +240,71 @@
       },
       "operator_warning": "The repository rejected automatic enablement of allow_auto_merge; the canary continued with the documented manual repository-setting warning."
     }
+  },
+  "adversarial_blocker_follow_up": {
+    "observed_at": "2026-07-30T20:49:38Z",
+    "commit": "e399771daf7c7db280127e58b060bd5199f8f17e",
+    "code_tree": "9b9a694181ac232a9570623ef97eadfa1f84284c",
+    "closed_findings": [
+      "Concurrent review validators use independent reservations under one durable top-level dispatch claim.",
+      "Legacy role owners atomically adopt active runs, leases, and nonterminal effects at the deployment-identity cutover.",
+      "All production lifecycle mutations capture a PR head or issue updatedAt revision and reconcile before mutation.",
+      "Publication ancestor authority works on Linux and macOS and pins the configured GitHub host independently of child GH_HOST.",
+      "Transparent wrappers cannot hide dynamic interpreters from governor resolution.",
+      "Claude visual receipts are daemon-signed and bound to HEAD plus image digest; Codex cannot mint trusted receipts.",
+      "launchd stages and rolls back the private config snapshot with its plists.",
+      "Process liveness probes run before, never inside, the SQLite dispatch-claim write transaction."
+    ],
+    "full_suite": {
+      "command": "make test",
+      "result": "passed",
+      "shell_hooks": 90,
+      "point_at": 7,
+      "domain_pytest": 646,
+      "adapter_pytest": 691,
+      "application_pytest": 1285,
+      "gate_parity": 48,
+      "import_contracts": 4,
+      "pyrefly_errors": 0
+    },
+    "live_command": "ISSUE_AGENT_MAX_TICKS=0 bash bin/point-at.sh self",
+    "live_result": {
+      "exit_code": 0,
+      "doctor_errors": 0,
+      "doctor_warnings": 3,
+      "clean_target_test": "passed",
+      "roles": {
+        "fix": {
+          "pid": 2954690,
+          "heartbeat_state": "stopped",
+          "in_flight": []
+        },
+        "review": {
+          "pid": 2954691,
+          "heartbeat_state": "stopped",
+          "in_flight": []
+        },
+        "steward": {
+          "pid": 2954692,
+          "heartbeat_state": "stopped",
+          "in_flight": []
+        }
+      },
+      "control_store": {
+        "integrity": "ok",
+        "schema_migrations": [
+          9,
+          10,
+          11,
+          12
+        ],
+        "nonterminal_runs": 0,
+        "active_reservations": 0,
+        "leases": 0,
+        "dispatch_claims": 0,
+        "pending_commands": 0
+      },
+      "operator_warning": "The repository rejected automatic enablement of allow_auto_merge; the canary continued with the documented manual repository-setting warning."
+    }
   }
 }

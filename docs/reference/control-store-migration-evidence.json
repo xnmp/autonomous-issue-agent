@@ -61,31 +61,34 @@
   },
   "status": "passed",
   "schema_follow_up": {
-    "observed_at": "2026-07-30T20:13:40Z",
-    "commit": "3f79725563de6c452d0f18d993254cc55e067c50",
-    "code_tree": "8b804c422b28306115aea74c8884016d69983313",
-    "current_schema_version": 11,
+    "observed_at": "2026-07-30T20:49:38Z",
+    "commit": "e399771daf7c7db280127e58b060bd5199f8f17e",
+    "code_tree": "9b9a694181ac232a9570623ef97eadfa1f84284c",
+    "current_schema_version": 12,
     "supported_upgrade_histories": [
       [
         8,
         9,
         10,
-        11
+        11,
+        12
       ],
       [
         9,
         10,
-        11
+        11,
+        12
       ]
     ],
     "concurrency_contract": "Three spawned role processes concurrently initialize fresh, v8, and v9 databases; every process succeeds and the final history is contiguous and digest-valid.",
-    "restart_contract": "Each v9, v10, and v11 migration is interrupted before commit and immediately after commit, then reopened and integrity-checked.",
-    "full_suite": "make test passed with 671 adapter tests, including schema concurrency/restart cases.",
+    "restart_contract": "Each v9, v10, v11, and v12 migration is interrupted before commit and immediately after commit, then reopened and integrity-checked.",
+    "full_suite": "make test passed with 691 adapter tests, including schema concurrency/restart cases.",
     "live_primary": {
       "schema_migrations": [
         9,
         10,
-        11
+        11,
+        12
       ],
       "database_integrity": "ok",
       "nonterminal_runs": 0,
