@@ -207,6 +207,7 @@ exit 0
 def write_hook_config(
     cwd: str, governor_path: str = GOVERNOR_PATH, agents_md: str = "",
     edit_check_cmd: str = "",
+    review_only: bool = False,
     log: Callable[[str], None] | None = None,
 ) -> str:
     """Emit `<cwd>/.codex/config.toml` + `.codex/hooks/gov.sh` so a `codex exec`
@@ -217,7 +218,9 @@ def write_hook_config(
     text via the SDK system-prompt preset). Returns the config path. Idempotent.
 
     NOTE: AGENTS.override.md lands inside the worktree and is locally excluded;
-    a target's tracked AGENTS.md remains byte-for-byte untouched."""
+    a target's tracked AGENTS.md remains byte-for-byte untouched. `review_only`
+    remains a compatibility argument for callers from before review policy was
+    made per-leg; it deliberately does not alter persistent hook contents."""
     codex_dir = os.path.join(cwd, ".codex")
     hooks_dir = os.path.join(codex_dir, "hooks")
     os.makedirs(hooks_dir, exist_ok=True)
