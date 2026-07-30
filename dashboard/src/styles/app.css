@@ -1057,6 +1057,17 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.human-action {
+  font-size: var(--text-xs);
+  font-weight: 700;
+}
+.human-action-merge-ready {
+  color: var(--ok);
+}
+.human-action-awaiting-reply,
+.human-action-escalated {
+  color: var(--fail);
+}
 .compact-issue {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);

@@ -459,6 +459,46 @@ def test_the_real_runtime_stamps_one_dispatch_id_across_every_leg(tmp_path):
     assert len({e["dispatch"] for e in read_events(journal.path)}) == 2
 
 
+def test_concurrent_dispatches_keep_task_local_journal_attribution(tmp_path):
+    class YieldingRuntime:
+        async def run(self, _task):
+            await asyncio.sleep(0)
+            return AgentResult(is_error=False, status="done")
+
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    runtime = JournalingRuntime(YieldingRuntime(), journal, "", "o/r", "fix")
+
+    async def dispatch(kind, number):
+        runtime.set_context("fix", kind, number, number)
+        await runtime.run(AgentTask(prompt=kind))
+
+    async def run_both():
+        await asyncio.gather(
+            dispatch("RESOLVE", 5),
+            dispatch("RESUME", 7),
+        )
+
+    asyncio.run(run_both())
+
+    events = read_events(journal.path)
+    by_number = {
+        number: [event for event in events if event["number"] == number]
+        for number in (5, 7)
+    }
+    assert {
+        number: {(event["kind"], event["issue"]) for event in rows}
+        for number, rows in by_number.items()
+    } == {
+        5: {("RESOLVE", 5)},
+        7: {("RESUME", 7)},
+    }
+    assert all(
+        len({event["dispatch"] for event in rows}) == 1
+        for rows in by_number.values()
+    )
+    assert by_number[5][0]["dispatch"] != by_number[7][0]["dispatch"]
+
+
 def test_a_journal_written_before_dispatch_ids_still_counts_deaths():
     """Backward compatibility: an upgrade must not silently zero the counter for
     every run already on disk. With no `dispatch` field the rule falls back to

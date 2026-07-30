@@ -1553,29 +1553,46 @@ class CodexRunner(AgentRuntime):
         #     that survived the killpg and still holds the pipe could block the read
         #     forever and wedge the poll loop. The 30s cap bounds that leaked-fd case.
         stdout_task = asyncio.ensure_future(_read_stdout())
-        await _pump_stderr()  # self-bounded by the idle watchdog; no outer cap
         try:
-            stdout = await asyncio.wait_for(
-                stdout_task,
-                timeout=(
-                    self.post_hang_drain_timeout
-                    if (self.idle_timeout or self.max_runtime or budget_tripped)
-                    else None
-                ),
-            )
-        except asyncio.TimeoutError:
-            hung = True
+            await _pump_stderr()  # self-bounded by the idle watchdog
+            try:
+                stdout = await asyncio.wait_for(
+                    stdout_task,
+                    timeout=(
+                        self.post_hang_drain_timeout
+                        if (self.idle_timeout or self.max_runtime or budget_tripped)
+                        else None
+                    ),
+                )
+            except asyncio.TimeoutError:
+                hung = True
+                _kill_quietly(proc)
+                stdout_task.cancel()
+                try:
+                    await stdout_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+                stdout = ""
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                pass  # reaped best-effort; the group was killed
+        except asyncio.CancelledError:
+            # Cancellation may land during stderr pumping, residual stdout
+            # draining, or process reaping. All are post-spawn ownership:
+            # terminate the session and drain local tasks before releasing the
+            # dispatch lease, or an orphan can keep editing after restart.
             _kill_quietly(proc)
             stdout_task.cancel()
             try:
                 await stdout_task
             except (asyncio.CancelledError, Exception):
                 pass
-            stdout = ""
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=10)
-        except asyncio.TimeoutError:
-            pass  # reaped best-effort; the group was killed
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                pass
+            raise
         exit_code = proc.returncode or 0
         stderr = "\n".join(err_chunks)
         self._log(f"codex: exit {exit_code} (stderr {len(stderr)}B, out {len(stdout)}B)")

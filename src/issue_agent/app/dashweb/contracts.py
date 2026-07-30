@@ -180,6 +180,9 @@ class IssueCard(Contract):
     working_s: float | None
     idle_s: float | None
     idle_active: bool
+    human_action: Literal["merge-ready", "awaiting-reply", "escalated"] | None = None
+    human_wait_since_ts: str | None = None
+    human_wait_s: float | None = None
     projected_eta_s: float | None
     models: list[str]
     model_badges: list[ModelBadge] = []

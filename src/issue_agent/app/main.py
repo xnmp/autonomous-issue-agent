@@ -255,7 +255,11 @@ def build_role(role: str, env: dict | None = None):
             float(cfg.world_probe_ttl_seconds),
             probe_when=probe_when,
         )
-        return dataclasses.replace(daemon, observe=probe.gate(daemon.observe))
+        # Daemon owns live pool state. The fix role's decision closure also
+        # retains this exact instance to read capacity and in-flight paths, so
+        # cloning it here would split observation from dispatch accounting.
+        daemon.observe = probe.gate(daemon.observe)
+        return daemon
 
     if role == "fix":
         gw = GitHubGateway(cfg.repo, Identity(static_token=env.get("FIX_BOT_TOKEN") or None))
@@ -353,8 +357,9 @@ def main(argv: list[str] | None = None) -> None:
     max_ticks = int(raw) if raw else None
     # Hot reload (HOT_RELOAD=0 disables): a change to the harness's HEAD
     # commit (never a mid-edit save — commit-gated so partial changes cannot
-    # load) or to the composed env file restarts this daemon at the next
-    # between-ticks point via point-at's relaunch loop.
+    # load) or to the composed env file restarts this daemon through point-at's
+    # relaunch loop. The concurrent fixer stops admitting work, keeps observing,
+    # and restarts after its paid dispatches drain.
     reload_check = None
     if os.environ.get("HOT_RELOAD", "1") != "0":
         from ..adapters.reload import ReloadWatch

@@ -990,6 +990,30 @@ def test_router_defers_the_selected_issue_before_resolve_when_prediction_overlap
     assert ("relabel", "issue", 5, "ai-working", "ai-ready") in gw.calls
 
 
+def test_router_defers_when_atomic_active_reservation_rejects_expanded_paths():
+    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
+    store = PredictionRecordingStore()
+    runner = SeqRunner([
+        AgentResult(is_error=False, session_id="rt", structured={
+            "tier": "standard", "predicted_paths": ["src/shared.py"],
+        }),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5"),
+    ])
+    workflow = _workflow(
+        gw, store, runner, fix=FixTaskConfig("o/r", agent_md="AM"),
+    )
+    observed = []
+    workflow.reserve_paths = (
+        lambda issue, paths: observed.append((issue, paths)) or False
+    )
+
+    asyncio.run(workflow.resolve(5))
+
+    assert observed == [(5, frozenset({"src/shared.py"}))]
+    assert len(runner.tasks) == 1
+    assert ("relabel", "issue", 5, "ai-working", "ai-ready") in gw.calls
+
+
 def test_resolve_skips_the_router_when_a_model_is_pinned():
     gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
     runner = FakeRunner(AgentResult(is_error=False, status="pr_opened", session_id="s5"))
