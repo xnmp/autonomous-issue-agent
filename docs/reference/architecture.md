@@ -259,7 +259,9 @@ have no authority. Codex PostToolUse hooks execute inside the untrusted child,
 so Codex cannot mint a trusted receipt and visual-acceptance publication fails
 closed on that runtime. Service upgrades likewise stage complete
 unit/plist-plus-private-config pairs; both systemd and launchd restore the
-previous pair if activation fails.
+previous pair if activation fails. Partial-role service upgrades are rejected:
+all legacy writers must stop before any role imports or admits against the
+SQLite authority.
 
 ## Module manifest
 

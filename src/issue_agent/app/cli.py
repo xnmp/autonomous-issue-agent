@@ -1390,6 +1390,12 @@ def cmd_install_service(args) -> int:
         err("This would install a PERSISTENT service running against a DIFFERENT "
             "repo. Pass --name <other> for the overlay that matches this checkout.")
         return 2
+    if args.roles:
+        err(
+            "partial service upgrades are unsafe — install all roles so every "
+            "legacy writer stops before SQLite migration"
+        )
+        return 2
     # A4 fold-in: this used to run with check=False and never look at the
     # return code — a compose failure (bad overlay syntax, missing file
     # between check above and here, etc.) fell through silently, and the
@@ -1408,9 +1414,6 @@ def cmd_install_service(args) -> int:
     )
     script = "install-launchd.sh" if sys.platform == "darwin" else "install-systemd.sh"
     cmd = ["/bin/bash", _bin(script)]
-    # Pass a single-role selector through (launchd installer supports --fix/etc).
-    if args.roles and len(args.roles) == 1 and sys.platform == "darwin":
-        cmd.append(f"--{args.roles[0]}")
     return subprocess.run(cmd, env=env).returncode
 
 
@@ -1593,7 +1596,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("install-service", help="install the OS service units (launchd/systemd)")
     add_context_flags(sp)
-    sp.add_argument("--roles", nargs="+", choices=ROLES, help="single role → install just that unit (launchd)")
+    sp.add_argument(
+        "--roles",
+        nargs="+",
+        choices=ROLES,
+        help="deprecated: partial service upgrades are rejected for migration safety",
+    )
     sp.set_defaults(func=cmd_install_service)
 
     sp = sub.add_parser("uninstall-service", help="remove the OS service units")

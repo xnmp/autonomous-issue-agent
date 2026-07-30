@@ -3,7 +3,6 @@
 # the plist templates, copies them to ~/Library/LaunchAgents, and loads them.
 #
 #   bin/install-launchd.sh           # install + load all three
-#   bin/install-launchd.sh --fix     # only the fix watcher
 #   bin/install-launchd.sh uninstall # unload + remove all
 set -euo pipefail
 HARNESS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -14,9 +13,12 @@ mkdir -p "$LA"
 units=(fix-watcher review-watcher steward)
 DRY_RUN=0
 [ "${1:-}" != "--dry-run" ] || DRY_RUN=1
-[ "${1:-}" = "--fix" ]    && units=(fix-watcher)
-[ "${1:-}" = "--review" ] && units=(review-watcher)
-[ "${1:-}" = "--steward" ] && units=(steward)
+case "${1:-}" in
+  --fix|--review|--steward)
+    echo "partial launchd upgrades are unsafe: install all roles so every legacy writer stops before SQLite migration" >&2
+    exit 2
+    ;;
+esac
 
 if [ "${1:-}" = "uninstall" ]; then
   for plist in "$LA"/dev.issue-agent.fix-watcher*.plist \

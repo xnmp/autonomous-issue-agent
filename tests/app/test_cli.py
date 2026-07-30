@@ -939,6 +939,23 @@ def test_install_service_proceeds_on_compose_success(tmp_path, monkeypatch):
     assert install_call["env"]["ISSUE_AGENT_DEPLOYMENT_ID"] == "myapp"
 
 
+def test_install_service_rejects_partial_role_cutover(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
+    (tmp_path / "myapp.env").write_text('REPO="o/r"\n')
+    shared = tmp_path / "shared.env"
+    shared.write_text("")
+    monkeypatch.setattr(cli, "SHARED_ENV", str(shared))
+    args = _install_args(tmp_path)
+    args.roles = ["fix"]
+
+    assert cli.cmd_install_service(args) == 2
+    assert "every legacy writer stops" in capsys.readouterr().err
+
+
 # ── TEST_CMD verification (a wrong command wedges the whole gate) ──────────────
 def test_verify_reports_a_passing_suite():
     check = cli.verify_test_cmd("true", "/tmp", run=lambda c, cwd, t: 0)

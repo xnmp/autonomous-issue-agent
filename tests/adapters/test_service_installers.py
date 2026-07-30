@@ -5,6 +5,8 @@ import plistlib
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -199,6 +201,22 @@ def test_launchd_installer_renders_validated_plists_with_absolute_uv(tmp_path):
         plistlib.loads(plist.read_bytes())["ProgramArguments"][0] == str(uv)
         for plist in plists
     )
+
+
+@pytest.mark.parametrize("selector", ("--fix", "--review", "--steward"))
+def test_launchd_refuses_partial_migration_cutover(tmp_path, selector):
+    env, home, _uv = _environment(tmp_path, systemd=False)
+
+    result = subprocess.run(
+        ["bash", str(ROOT / "bin/install-launchd.sh"), selector],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "every legacy writer stops" in result.stderr
+    assert tuple((home / "Library/LaunchAgents").glob("*.plist")) == ()
 
 
 def test_launchd_failed_load_restores_every_known_good_plist(tmp_path):
