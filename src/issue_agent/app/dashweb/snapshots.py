@@ -539,7 +539,7 @@ def _flags(row: dash.IssueRow, human_action: str | None = None) -> list[str]:
     newest_leg_blocked = (
         bool(row.legs)
         and row.legs[-1].status.lower() == "blocked"
-        and row.stage in {"awaiting review", "reviewed"}
+        and row.stage in {"awaiting review", "reviewed", "awaiting human reply"}
     )
     if row.stage == "blocked" or newest_leg_blocked:
         flags.append("blocked")
