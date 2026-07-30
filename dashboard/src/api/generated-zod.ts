@@ -35,7 +35,10 @@ const BacklogCard = z
     age_s: z.union([z.number(), z.null()]).optional(),
     body: z.union([z.string(), z.null()]),
     comments: z.union([z.number(), z.null()]),
+    difficulty: z.union([z.string(), z.null()]).optional(),
+    impact: z.union([z.string(), z.null()]).optional(),
     issue: z.number().int(),
+    issue_type: z.union([z.string(), z.null()]).optional(),
     labels: z.array(z.string()),
     recurrence: z.boolean(),
     recurrence_count: z.number().int(),
@@ -85,6 +88,17 @@ const IssueCard = z
     working_s: z.union([z.number(), z.null()]),
   })
   .passthrough();
+const ToastNotification = z
+  .object({
+    detail: z.union([z.string(), z.null()]).optional(),
+    id: z.string(),
+    issue: z.union([z.number(), z.null()]).optional(),
+    pr: z.union([z.number(), z.null()]).optional(),
+    severity: z.enum(["info", "attention"]),
+    title: z.string(),
+    ts: z.string(),
+  })
+  .passthrough();
 const PendingCard = z
   .object({
     held: z.boolean(),
@@ -103,6 +117,7 @@ const IssuesPayload = z
     done: z.array(IssueCard),
     gh_ok: z.boolean(),
     in_flight: z.array(IssueCard),
+    notifications: z.array(ToastNotification).optional().default([]),
     pending: z.array(PendingCard),
     warnings: z.array(z.string()),
   })
@@ -307,6 +322,7 @@ export const schemas = {
   ModelBadge,
   CardStep,
   IssueCard,
+  ToastNotification,
   PendingCard,
   IssuesPayload,
   ValidationError,
@@ -382,6 +398,7 @@ const endpoints = makeApi([
         done: z.array(IssueCard),
         gh_ok: z.boolean(),
         in_flight: z.array(IssueCard),
+        notifications: z.array(ToastNotification).optional().default([]),
         pending: z.array(PendingCard),
         warnings: z.array(z.string()),
       })

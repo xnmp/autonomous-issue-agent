@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { IssueTab } from "./IssueTab";
@@ -116,5 +116,64 @@ describe("IssueTab", () => {
     expect(within(stepDetail as HTMLElement).getByRole("tabpanel")).toHaveAccessibleName(
       "Cost chart",
     );
+  });
+
+  it("gives compact task columns their own resize floors", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({
+          issue: 50,
+          title: "Compact columns",
+          url: null,
+          stage: "done",
+          done: true,
+          prs: [],
+          pull_requests: [],
+          cost_usd: 2,
+          elapsed_s: 4_638,
+          working_s: 4_638,
+          idle_s: 0,
+          idle_active: false,
+          steps: [{
+            idx: 0,
+            kind: "RESOLVE",
+            role: "fix",
+            state: "ok",
+            model: "claude-sonnet-5",
+            status: "done",
+            exit_reason: "ok",
+            duration_s: 4_638,
+            cost_usd: 2,
+            estimated: false,
+            session_id: null,
+            has_transcript: false,
+            turns: 3,
+            usage: null,
+            ts: "2026-07-29T08:00:00Z",
+          }],
+          events: [],
+          warnings: [],
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+
+    render(<IssueTab repo="demo" issue={50} showDurationSeconds={false} />);
+    const operation = await screen.findByRole("columnheader", { name: /Operation/ });
+    fireEvent.contextMenu(operation);
+    await userEvent.click(screen.getByRole("checkbox", { name: "Model" }));
+
+    expect(screen.getByRole("separator", { name: "Resize Model column" }))
+      .toHaveAttribute("aria-valuemin", "100");
+    expect(screen.getByRole("separator", { name: "Resize Status column" }))
+      .toHaveAttribute("aria-valuemin", "96");
+    expect(screen.getByRole("separator", { name: "Resize Duration column" }))
+      .toHaveAttribute("aria-valuemin", "84");
+    expect(screen.getByRole("separator", { name: "Resize Cost column" }))
+      .toHaveAttribute("aria-valuemin", "76");
+    expect(screen.getAllByText("1:17")).toHaveLength(2);
   });
 });

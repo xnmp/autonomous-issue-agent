@@ -92,9 +92,7 @@
   flex: 1;
   overflow: auto;
   min-height: 0;
-}
-.crumb {
-  margin-bottom: var(--s2);
+  overscroll-behavior: contain;
 }
 .global-view-title {
   align-self: center;
@@ -894,6 +892,15 @@
 .resizable-table th {
   position: sticky;
   overflow: visible;
+  cursor: grab;
+}
+.resizable-table th[data-dragging] {
+  opacity: 0.55;
+  cursor: grabbing;
+}
+.resizable-table th:focus-visible {
+  outline: 2px solid var(--info-br);
+  outline-offset: -2px;
 }
 .column-heading {
   display: block;
@@ -910,6 +917,7 @@
   letter-spacing: inherit;
   text-transform: inherit;
   text-align: inherit;
+  cursor: pointer;
 }
 .column-sort:hover,
 .column-sort:focus-visible {
@@ -1021,7 +1029,7 @@
 .quota-icon i:nth-child(3) {
   width: 8px;
 }
-.issue-list-table th:first-child {
+.issue-list-table th[data-column-key="issue"] {
   min-width: 320px;
 }
 .issue-summary {
@@ -1049,8 +1057,8 @@
 .model-list {
   display: inline-flex;
   gap: var(--s1);
-  flex-wrap: nowrap;
-  white-space: nowrap;
+  flex-wrap: wrap;
+  white-space: normal;
 }
 .duration-breakdown {
   display: inline-grid;
@@ -1515,6 +1523,89 @@
   display: flex;
   flex-direction: column;
   gap: var(--s2);
+}
+
+.toast-stack {
+  position: fixed;
+  z-index: 80;
+  right: var(--s4);
+  bottom: var(--s4);
+  display: flex;
+  width: min(380px, calc(100vw - 2 * var(--s4)));
+  flex-direction: column;
+  gap: var(--s2);
+  pointer-events: none;
+}
+.toast {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr) 28px;
+  gap: var(--s2);
+  align-items: start;
+  padding: var(--s3);
+  border: 1px solid var(--border-strong);
+  border-left: 3px solid var(--info-br);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--panel) 96%, transparent);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.34);
+  pointer-events: auto;
+}
+.toast-attention {
+  border-left-color: var(--fail-br);
+}
+.toast-mark {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--info-br) 18%, transparent);
+  color: var(--info-br);
+  font-family: var(--font-mono);
+  font-weight: 800;
+}
+.toast-attention .toast-mark {
+  background: color-mix(in srgb, var(--fail-br) 18%, transparent);
+  color: var(--fail-br);
+}
+.toast-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+.toast-copy strong {
+  color: var(--ink);
+  font-size: var(--fs-sm);
+}
+.toast-copy span {
+  color: var(--ink-muted);
+  font-size: var(--fs-xs);
+}
+.toast-dismiss {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border-radius: var(--radius-sm);
+  color: var(--ink-muted);
+  font-size: 20px;
+  line-height: 1;
+}
+.toast-dismiss:hover,
+.toast-dismiss:focus-visible {
+  background: var(--hover);
+  color: var(--ink);
+}
+.toast-overflow {
+  align-self: end;
+  padding: var(--s1) var(--s2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--panel);
+  color: var(--ink-muted);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.28);
 }
 
 @media (max-width: 900px) {

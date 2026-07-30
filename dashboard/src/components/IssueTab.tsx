@@ -3,7 +3,7 @@ import { api } from "../api/client";
 import { usePolled, useLiveElapsed } from "../api/hooks";
 import type { IssueStep } from "../api/types";
 import { kindLabel, modelTone, prStateTone, stateTone, stageTone, statusTone } from "../lib/semantics";
-import { duration, durationShort, localTime, num, tokens, usd } from "../lib/format";
+import { duration, localTime, num, tokens, usd } from "../lib/format";
 import { shortModel } from "../lib/models";
 import { Chip } from "./ui/Chip";
 import { JsonBlock } from "./ui/Json";
@@ -45,7 +45,15 @@ function storedIssueColumns(): Record<string, boolean> {
 /**
  * One issue, task by task. A task is one agent invocation.
  */
-export function IssueTab({ repo, issue }: { repo: string; issue: number }) {
+export function IssueTab({
+  repo,
+  issue,
+  showDurationSeconds = true,
+}: {
+  repo: string;
+  issue: number;
+  showDurationSeconds?: boolean;
+}) {
   const detail = usePolled(
     `issue:${repo}:${issue}`,
     (signal) => api.issue(repo, issue, signal),
@@ -62,10 +70,10 @@ export function IssueTab({ repo, issue }: { repo: string; issue: number }) {
   const columns: TableColumn[] = [
     { key: "operation", label: "Operation", width: 130 },
     ...(visible.has("role") ? [{ key: "role", label: "Role", width: 90 }] : []),
-    ...(visible.has("model") ? [{ key: "model", label: "Model", width: 160 }] : []),
-    ...(visible.has("status") ? [{ key: "status", label: "Status", width: 190 }] : []),
-    ...(visible.has("duration") ? [{ key: "duration", label: "Duration", className: "r", width: 100 }] : []),
-    ...(visible.has("cost") ? [{ key: "cost", label: "Cost", className: "r", width: 90 }] : []),
+    ...(visible.has("model") ? [{ key: "model", label: "Model", width: 160, minWidth: 100 }] : []),
+    ...(visible.has("status") ? [{ key: "status", label: "Status", width: 190, minWidth: 96 }] : []),
+    ...(visible.has("duration") ? [{ key: "duration", label: "Duration", className: "r", width: 100, minWidth: 84 }] : []),
+    ...(visible.has("cost") ? [{ key: "cost", label: "Cost", className: "r", width: 90, minWidth: 76 }] : []),
     ...(visible.has("tokens") ? [{ key: "tokens", label: "Tokens", width: 260 }] : []),
     ...(visible.has("when") ? [{ key: "when", label: "When", width: 150 }] : []),
   ];
@@ -159,11 +167,11 @@ export function IssueTab({ repo, issue }: { repo: string; issue: number }) {
               </span>
               <span className="issue-stat">
                 <span className="faint">working</span>{" "}
-                <span className="mono">{duration(working)}</span>
+                <span className="mono">{duration(working, showDurationSeconds)}</span>
               </span>
               <span className="issue-stat">
                 <span className="faint">idle</span>{" "}
-                <span className="mono">{duration(idle)}</span>
+                <span className="mono">{duration(idle, showDurationSeconds)}</span>
               </span>
               <span className="issue-stat">
                 <span className="faint">tasks</span>{" "}
@@ -225,7 +233,6 @@ export function IssueTab({ repo, issue }: { repo: string; issue: number }) {
                 <ResizableTable
                   storageKey="issue-tasks"
                   columns={columns}
-                  className="wide"
                   sort={sortedSteps.sort}
                   onSort={sortedSteps.onSort}
                 >
@@ -240,6 +247,7 @@ export function IssueTab({ repo, issue }: { repo: string; issue: number }) {
                         onToggle={() => setOpenStep((cur) => (cur === s.idx ? null : s.idx))}
                         visible={visible}
                         colSpan={columns.length}
+                        showDurationSeconds={showDurationSeconds}
                       />
                     ))}
                   </tbody>
@@ -272,6 +280,7 @@ function StepRow({
   onToggle,
   visible,
   colSpan,
+  showDurationSeconds,
 }: {
   repo: string;
   issue: number;
@@ -280,6 +289,7 @@ function StepRow({
   onToggle: () => void;
   visible: ReadonlySet<string>;
   colSpan: number;
+  showDurationSeconds: boolean;
 }) {
   const tone = stateTone(step.state);
   const u = step.usage;
@@ -332,7 +342,9 @@ function StepRow({
             </span>
           ) : null}
         </td> : null}
-        {visible.has("duration") ? <td className="r mono">{durationShort(step.duration_s)}</td> : null}
+        {visible.has("duration") ? (
+          <td className="r mono">{duration(step.duration_s, showDurationSeconds)}</td>
+        ) : null}
         {visible.has("cost") ? <td className="r mono">
           {usd(step.cost_usd)}
           {step.estimated ? <span className="faint" title="synthetic dollars"> ~</span> : null}

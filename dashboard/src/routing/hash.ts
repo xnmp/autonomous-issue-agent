@@ -14,7 +14,7 @@ export type IssuesSub = "inflight" | "done" | "backlog";
 export const ISSUES_SUBS: IssuesSub[] = ["inflight", "done", "backlog"];
 
 export const ISSUES_SUB_LABELS: Record<IssuesSub, string> = {
-  inflight: "In flight & pending",
+  inflight: "In flight",
   done: "Done",
   backlog: "Backlog",
 };

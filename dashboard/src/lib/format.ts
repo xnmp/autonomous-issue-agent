@@ -41,24 +41,24 @@ export function tokens(v: number | null | undefined): string {
   return String(v);
 }
 
-/** Seconds → `1h 04m 12s` / `4m 12s` / `12s`. Live timers use this. */
-export function duration(s: number | null | undefined): string {
+/** Seconds → `1:04:12` / `4:12`; minute precision omits seconds entirely. */
+export function duration(
+  s: number | null | undefined,
+  showSeconds = true,
+): string {
   if (s === null || s === undefined || !Number.isFinite(s) || s < 0) return DASH;
   const total = Math.floor(s);
   const h = Math.floor(total / 3600);
   const m = Math.floor((total % 3600) / 60);
   const sec = total % 60;
-  if (h > 0) return `${h}h ${String(m).padStart(2, "0")}m ${String(sec).padStart(2, "0")}s`;
-  if (m > 0) return `${m}m ${String(sec).padStart(2, "0")}s`;
-  return `${sec}s`;
-}
-
-/** Coarser form for settled durations in dense tables. */
-export function durationShort(s: number | null | undefined): string {
-  if (s === null || s === undefined || !Number.isFinite(s) || s < 0) return DASH;
-  if (s < 60) return `${s.toFixed(0)}s`;
-  if (s < 3600) return `${(s / 60).toFixed(1)}m`;
-  return `${(s / 3600).toFixed(1)}h`;
+  if (!showSeconds) {
+    if (h > 0) return `${h}:${String(m).padStart(2, "0")}`;
+    return m > 0 ? `${m}m` : "<1m";
+  }
+  if (h > 0) {
+    return `${h}:${String(m).padStart(2, "0")}:${String(sec).padStart(2, "0")}`;
+  }
+  return `${m}:${String(sec).padStart(2, "0")}`;
 }
 
 export function parseTs(ts: string | null | undefined): number | null {
@@ -112,6 +112,16 @@ export function localTime(ts: string | null | undefined): string {
     minute: "2-digit",
     second: "2-digit",
     hour12: false,
+  });
+}
+
+export function localDate(ts: string | null | undefined): string {
+  const ms = parseTs(ts);
+  if (ms === null) return DASH;
+  return new Date(ms).toLocaleDateString(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "2-digit",
   });
 }
 

@@ -200,6 +200,7 @@ class Backend:
             "done": [card(row) for row in rows if row.done],
             "backlog": backlog,
             "gh_ok": not warnings,
+            "notifications": snapshots.journal_notifications(rows),
             "warnings": warnings,
         }
 

@@ -1,7 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api } from "./api/client";
 import { usePolled } from "./api/hooks";
-import { hashFor, routeRepo, useRoute, type IssuesSub, type Route } from "./routing/hash";
+import {
+  ISSUES_SUB_LABELS,
+  ISSUES_SUBS,
+  routeRepo,
+  useRoute,
+  type IssuesSub,
+  type Route,
+} from "./routing/hash";
 import { Sidebar } from "./components/Sidebar";
 import { TabStrip, type TabDef } from "./components/TabStrip";
 import { OverviewTab } from "./components/OverviewTab";
@@ -16,15 +23,16 @@ import {
   DASHBOARD_THEMES,
   type DashboardOptions,
 } from "./components/ui/OptionsMenu";
+import { ToastStack } from "./components/ToastStack";
 
 const TOP_POLL_MS = 10_000;
-const ISSUES_SUB_STORAGE = "issue-agent.dashboard.issue-subtabs";
 const OPTIONS_STORAGE = "issue-agent.dashboard.options";
 
 function storedOptions(): DashboardOptions {
   const defaults: DashboardOptions = {
     showProjectedCost: true,
     showPerRepoQuotas: true,
+    showDurationSeconds: true,
     theme: "cosmic-dusk",
   };
   try {
@@ -37,15 +45,6 @@ function storedOptions(): DashboardOptions {
       : defaults;
   } catch {
     return defaults;
-  }
-}
-
-function storedIssueSubs(): Record<string, IssuesSub> {
-  try {
-    const value: unknown = JSON.parse(localStorage.getItem(ISSUES_SUB_STORAGE) ?? "{}");
-    return value && typeof value === "object" ? (value as Record<string, IssuesSub>) : {};
-  } catch {
-    return {};
   }
 }
 
@@ -88,11 +87,9 @@ export default function App() {
   }, [route.view, repoList, navigate]);
 
   const selectedRepo = routedRepo ?? repoList[0]?.name ?? null;
+  const selectedRepoSummary = repoList.find((repo) => repo.name === selectedRepo);
 
   const [openIssues, setOpenIssues] = useState<Record<string, number[]>>({});
-  const [issueSubs, setIssueSubs] = useState<Record<string, IssuesSub>>(storedIssueSubs);
-  const routedIssuesRepo = route.view === "issues" ? route.repo : null;
-  const routedIssuesSub = route.view === "issues" ? route.sub : null;
 
   useEffect(() => {
     if (route.view === "issue") {
@@ -104,21 +101,39 @@ export default function App() {
     }
   }, [route]);
 
-  useEffect(() => {
-    if (routedIssuesRepo === null || routedIssuesSub === null) return;
-    setIssueSubs((current) => {
-      if (current[routedIssuesRepo] === routedIssuesSub) return current;
-      const next = { ...current, [routedIssuesRepo]: routedIssuesSub };
-      try {
-        localStorage.setItem(ISSUES_SUB_STORAGE, JSON.stringify(next));
-      } catch {
-        // Storage can be disabled; URL state still remains authoritative.
-      }
-      return next;
-    });
-  }, [routedIssuesRepo, routedIssuesSub]);
-
   const issues = useIssues(selectedRepo);
+  const [promotedBacklog, setPromotedBacklog] = useState<Record<string, number[]>>({});
+  const hiddenBacklog = selectedRepo ? (promotedBacklog[selectedRepo] ?? []) : [];
+  const displayedIssues = {
+    ...issues,
+    data: issues.data
+      ? {
+          ...issues.data,
+          backlog: issues.data.backlog.filter((card) => !hiddenBacklog.includes(card.issue)),
+        }
+      : null,
+  };
+  useEffect(() => {
+    if (!selectedRepo || !issues.data) return;
+    setPromotedBacklog((current) => {
+      const hidden = current[selectedRepo] ?? [];
+      const stillPending = hidden.filter((issue) => (
+        issues.data?.backlog.some((card) => card.issue === issue)
+      ));
+      if (stillPending.length === hidden.length) return current;
+      return { ...current, [selectedRepo]: stillPending };
+    });
+  }, [issues.data, selectedRepo]);
+  const setBacklogPromotion = useCallback((issue: number, pending: boolean) => {
+    if (!selectedRepo) return;
+    setPromotedBacklog((current) => {
+      const existing = current[selectedRepo] ?? [];
+      const next = pending
+        ? Array.from(new Set([...existing, issue]))
+        : existing.filter((candidate) => candidate !== issue);
+      return { ...current, [selectedRepo]: next };
+    });
+  }, [selectedRepo]);
 
   const openIssue = useCallback(
     (n: number) => {
@@ -150,28 +165,30 @@ export default function App() {
       active: route.view === "overview",
       onSelect: () => navigate({ view: "overview", repo }),
     });
-    tabs.push({
-      key: "issues",
-      title: "Issues",
-      label: (
-        <>
-          Issues
-          {issues.data ? (
-            <span className="tab-count num">
-              {issues.data.in_flight.length + issues.data.pending.length}
-            </span>
-          ) : null}
-        </>
-      ),
-      active: route.view === "issues",
-      onSelect: () =>
-        navigate({ view: "issues", repo, sub: issueSubs[repo] ?? "inflight" }),
-    });
+    for (const sub of ISSUES_SUBS) {
+      const count = displayedIssues.data
+        ? sub === "inflight"
+          ? displayedIssues.data.in_flight.length + displayedIssues.data.pending.length
+          : displayedIssues.data[sub].length
+        : null;
+      tabs.push({
+        key: sub,
+        title: ISSUES_SUB_LABELS[sub],
+        label: (
+          <>
+            {ISSUES_SUB_LABELS[sub]}
+            {count !== null ? <span className="tab-count num">{count}</span> : null}
+          </>
+        ),
+        active: route.view === "issues" && route.sub === sub,
+        onSelect: () => navigate({ view: "issues", repo, sub }),
+      });
+    }
 
     for (const n of openIssues[repo] ?? []) {
       const card =
-        issues.data?.in_flight.find((c) => c.issue === n) ??
-        issues.data?.done.find((c) => c.issue === n) ??
+        displayedIssues.data?.in_flight.find((c) => c.issue === n) ??
+        displayedIssues.data?.done.find((c) => c.issue === n) ??
         null;
       tabs.push({
         key: `issue-${n}`,
@@ -198,7 +215,6 @@ export default function App() {
   const setSub = useCallback(
     (sub: IssuesSub) => {
       if (!selectedRepo) return;
-      setIssueSubs((current) => ({ ...current, [selectedRepo]: sub }));
       navigate({ view: "issues", repo: selectedRepo, sub }, true);
     },
     [navigate, selectedRepo],
@@ -223,22 +239,28 @@ export default function App() {
           ) : (
             <TabStrip tabs={tabs} />
           )}
-          <span className="spacer" />
-          <RepoCrumb route={route} />
         </div>
         <div className="mainbody">
           <Body
             route={route}
             selectedRepo={selectedRepo}
-            issues={issues}
+            issues={displayedIssues}
             onSetSub={setSub}
             onOpenIssue={openIssue}
+            onBacklogPromotion={setBacklogPromotion}
             hasRepos={repoList.length > 0}
             reposLoading={repos.loading}
             showProjectedCost={options.showProjectedCost}
+            showDurationSeconds={options.showDurationSeconds}
           />
         </div>
       </main>
+      <ToastStack
+        key={selectedRepo ?? "no-repo"}
+        repo={selectedRepo}
+        notifications={displayedIssues.data?.notifications ?? null}
+        roles={selectedRepoSummary?.roles ?? []}
+      />
     </div>
   );
 }
@@ -249,30 +271,43 @@ function Body({
   issues,
   onSetSub,
   onOpenIssue,
+  onBacklogPromotion,
   hasRepos,
   reposLoading,
   showProjectedCost,
+  showDurationSeconds,
 }: {
   route: Route;
   selectedRepo: string | null;
   issues: ReturnType<typeof useIssues>;
   onSetSub: (s: IssuesSub) => void;
   onOpenIssue: (n: number) => void;
+  onBacklogPromotion: (issue: number, pending: boolean) => void;
   hasRepos: boolean;
   reposLoading: boolean;
   showProjectedCost: boolean;
+  showDurationSeconds: boolean;
 }) {
   if (route.view === "verification") return <VerificationTab />;
-  if (route.view === "issue") return <IssueTab repo={route.repo} issue={route.issue} />;
+  if (route.view === "issue") {
+    return (
+      <IssueTab
+        repo={route.repo}
+        issue={route.issue}
+        showDurationSeconds={showDurationSeconds}
+      />
+    );
+  }
   if (route.view === "issues" && selectedRepo)
     return (
       <IssuesTab
         repo={selectedRepo}
         sub={route.sub}
         issues={issues}
-        onSetSub={onSetSub}
         onOpenIssue={onOpenIssue}
+        onBacklogPromotion={onBacklogPromotion}
         showProjectedCost={showProjectedCost}
+        showDurationSeconds={showDurationSeconds}
       />
     );
   if (selectedRepo) return <OverviewTab repo={selectedRepo} onOpenIssues={onSetSub} />;
@@ -286,30 +321,5 @@ function Body({
             : "no deployments found — point the harness at a repo with `make point-at REPO=<name>`"}
       </EmptyState>
     </div>
-  );
-}
-
-/** A copyable deep link for the current view — handy for handover notes. */
-function RepoCrumb({ route }: { route: Route }) {
-  const [copied, setCopied] = useState(false);
-  const hash = hashFor(route);
-  return (
-    <button
-      className="btn btn-xs btn-ghost crumb"
-      title="copy a deep link to this view"
-      onClick={() => {
-        const url = `${window.location.origin}${window.location.pathname}${hash}`;
-        void navigator.clipboard?.writeText(url).then(
-          () => {
-            setCopied(true);
-            window.setTimeout(() => setCopied(false), 1500);
-          },
-          () => setCopied(false),
-        );
-      }}
-    >
-      <span className="mono faint">{hash}</span>
-      {copied ? <span className="tone-ok"> copied</span> : null}
-    </button>
   );
 }

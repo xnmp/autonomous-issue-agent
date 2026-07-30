@@ -1,9 +1,14 @@
 import {
+  Children,
+  cloneElement,
+  isValidElement,
   useCallback,
   useMemo,
+  useRef,
   useState,
   type KeyboardEvent,
   type PointerEvent,
+  type ReactElement,
   type ReactNode,
 } from "react";
 
@@ -12,6 +17,7 @@ export interface TableColumn {
   label: ReactNode;
   className?: string;
   width?: number;
+  minWidth?: number;
 }
 
 export type SortDirection = "asc" | "desc";
@@ -22,6 +28,7 @@ export interface TableSort {
 }
 
 const STORAGE_KEY = "issue-agent.dashboard.column-widths";
+const ORDER_STORAGE_KEY = "issue-agent.dashboard.column-order";
 export const MIN_COLUMN_WIDTH = 112;
 
 function storedWidths(key: string): Record<string, number> {
@@ -40,6 +47,54 @@ function persistWidths(key: string, widths: Record<string, number>) {
   } catch {
     // Resizing remains available for this session when storage is disabled.
   }
+}
+
+function storedOrder(key: string): string[] {
+  try {
+    const all = JSON.parse(localStorage.getItem(ORDER_STORAGE_KEY) ?? "{}") as Record<string, string[]>;
+    return Array.isArray(all[key]) ? all[key] : [];
+  } catch {
+    return [];
+  }
+}
+
+function persistOrder(key: string, order: string[]) {
+  try {
+    const all = JSON.parse(localStorage.getItem(ORDER_STORAGE_KEY) ?? "{}") as Record<string, string[]>;
+    localStorage.setItem(ORDER_STORAGE_KEY, JSON.stringify({ ...all, [key]: order }));
+  } catch {
+    // Reordering remains available for this session when storage is disabled.
+  }
+}
+
+function reconcileOrder(saved: readonly string[], active: readonly string[]): string[] {
+  const activeKeys = new Set(active);
+  const known = saved.filter((key, index) => activeKeys.has(key) && saved.indexOf(key) === index);
+  const knownKeys = new Set(known);
+  return [...known, ...active.filter((key) => !knownKeys.has(key))];
+}
+
+function reorderRowCells(
+  children: ReactNode,
+  sourceKeys: readonly string[],
+  orderedKeys: readonly string[],
+): ReactNode {
+  return Children.map(children, (child) => {
+    if (!isValidElement(child)) return child;
+    const element = child as ReactElement<{ children?: ReactNode }>;
+    if (element.type === "tr") {
+      const cells = Children.toArray(element.props.children);
+      if (cells.length !== sourceKeys.length) return element;
+      const cellsByKey = new Map(sourceKeys.map((key, index) => [key, cells[index]]));
+      return cloneElement(element, undefined, orderedKeys.map((key) => cellsByKey.get(key)));
+    }
+    if (element.props.children === undefined) return element;
+    return cloneElement(
+      element,
+      undefined,
+      reorderRowCells(element.props.children, sourceKeys, orderedKeys),
+    );
+  });
 }
 
 type SortValue = string | number | boolean | null | undefined;
@@ -97,23 +152,45 @@ export function ResizableTable({
   onSort?: (key: string) => void;
 }) {
   const [widths, setWidths] = useState<Record<string, number>>(() => storedWidths(storageKey));
-  const activeColumns = useMemo(() => columns.map((column) => column.key), [columns]);
+  const [order, setOrder] = useState<string[]>(() => storedOrder(storageKey));
+  const [dragging, setDragging] = useState<string | null>(null);
+  const draggedColumn = useRef<string | null>(null);
+  const sourceKeys = useMemo(() => columns.map((column) => column.key), [columns]);
+  const orderedKeys = useMemo(() => reconcileOrder(order, sourceKeys), [order, sourceKeys]);
+  const columnsByKey = useMemo(
+    () => new Map(columns.map((column) => [column.key, column])),
+    [columns],
+  );
+  const orderedColumns = useMemo(
+    () => orderedKeys.flatMap((key) => {
+      const column = columnsByKey.get(key);
+      return column ? [column] : [];
+    }),
+    [columnsByKey, orderedKeys],
+  );
+  const minWidthFor = useCallback(
+    (column: TableColumn) => column.minWidth ?? MIN_COLUMN_WIDTH,
+    [],
+  );
   const widthFor = useCallback(
     (column: TableColumn) => Math.max(
-      MIN_COLUMN_WIDTH,
+      minWidthFor(column),
       widths[column.key] ?? column.width ?? MIN_COLUMN_WIDTH,
     ),
-    [widths],
+    [minWidthFor, widths],
   );
-  const tableWidth = columns.reduce((total, column) => total + widthFor(column), 0);
+  const tableWidth = orderedColumns.reduce((total, column) => total + widthFor(column), 0);
 
-  const setWidth = useCallback((column: string, width: number) => {
+  const setWidth = useCallback((column: TableColumn, width: number) => {
     setWidths((current) => {
-      const next = { ...current, [column]: Math.max(MIN_COLUMN_WIDTH, Math.round(width)) };
+      const next = {
+        ...current,
+        [column.key]: Math.max(minWidthFor(column), Math.round(width)),
+      };
       persistWidths(storageKey, next);
       return next;
     });
-  }, [storageKey]);
+  }, [minWidthFor, storageKey]);
 
   const beginResize = (event: PointerEvent<HTMLSpanElement>, column: TableColumn) => {
     event.preventDefault();
@@ -121,7 +198,7 @@ export function ResizableTable({
     const originX = event.clientX;
     const originWidth = widthFor(column);
     const move = (next: globalThis.PointerEvent) => setWidth(
-      column.key,
+      column,
       originWidth + next.clientX - originX,
     );
     const stop = () => {
@@ -141,11 +218,47 @@ export function ResizableTable({
     column: TableColumn,
   ) => {
     if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+    event.stopPropagation();
+    if (event.altKey) return;
     event.preventDefault();
     setWidth(
-      column.key,
+      column,
       widthFor(column) + (event.key === "ArrowRight" ? 12 : -12),
     );
+  };
+
+  const moveColumn = useCallback((from: string, to: string) => {
+    if (from === to) return;
+    setOrder((current) => {
+      const activeKeys = new Set(sourceKeys);
+      const base = [
+        ...current.filter((key, index) => current.indexOf(key) === index),
+        ...sourceKeys.filter((key) => !current.includes(key)),
+      ];
+      const activeOrder = base.filter((key) => activeKeys.has(key));
+      const fromIndex = activeOrder.indexOf(from);
+      const toIndex = activeOrder.indexOf(to);
+      if (fromIndex < 0 || toIndex < 0) return current;
+      activeOrder.splice(fromIndex, 1);
+      activeOrder.splice(toIndex, 0, from);
+      let activeIndex = 0;
+      const next = base.map((key) => (
+        activeKeys.has(key) ? activeOrder[activeIndex++]! : key
+      ));
+      persistOrder(storageKey, next);
+      return next;
+    });
+  }, [sourceKeys, storageKey]);
+
+  const moveColumnFromKeyboard = (
+    event: KeyboardEvent<HTMLTableCellElement>,
+    column: TableColumn,
+  ) => {
+    if (!event.altKey || (event.key !== "ArrowLeft" && event.key !== "ArrowRight")) return;
+    event.preventDefault();
+    const index = orderedKeys.indexOf(column.key);
+    const target = orderedKeys[index + (event.key === "ArrowLeft" ? -1 : 1)];
+    if (target) moveColumn(column.key, target);
   };
 
   return (
@@ -154,11 +267,12 @@ export function ResizableTable({
       style={{ width: tableWidth }}
     >
       <caption className="sr-only">
-        Columns are resizable. Use the separator handles or arrow keys.
-        {activeColumns.length > 0 ? ` Columns: ${activeColumns.join(", ")}.` : ""}
+        Columns are resizable and rearrangeable. Drag a column header to move it,
+        or focus it and use Alt plus the left or right arrow key.
+        {orderedKeys.length > 0 ? ` Columns: ${orderedKeys.join(", ")}.` : ""}
       </caption>
       <colgroup>
-        {columns.map((column) => (
+        {orderedColumns.map((column) => (
           <col
             key={column.key}
             style={{ width: widthFor(column) }}
@@ -167,11 +281,29 @@ export function ResizableTable({
       </colgroup>
       <thead>
         <tr>
-          {columns.map((column) => (
+          {orderedColumns.map((column) => (
             <th
               key={column.key}
               className={column.className}
               data-column-key={column.key}
+              data-dragging={dragging === column.key || undefined}
+              draggable
+              tabIndex={0}
+              title="Drag to rearrange column"
+              onDragStart={() => {
+                draggedColumn.current = column.key;
+                setDragging(column.key);
+              }}
+              onDragOver={(event) => event.preventDefault()}
+              onDrop={(event) => {
+                event.preventDefault();
+                if (draggedColumn.current) moveColumn(draggedColumn.current, column.key);
+              }}
+              onDragEnd={() => {
+                draggedColumn.current = null;
+                setDragging(null);
+              }}
+              onKeyDown={(event) => moveColumnFromKeyboard(event, column)}
               aria-sort={
                 onSort
                   ? sort?.key === column.key
@@ -200,7 +332,7 @@ export function ResizableTable({
                 role="separator"
                 aria-label={`Resize ${typeof column.label === "string" ? column.label : column.key} column`}
                 aria-orientation="vertical"
-                aria-valuemin={MIN_COLUMN_WIDTH}
+                aria-valuemin={minWidthFor(column)}
                 aria-valuenow={widthFor(column)}
                 tabIndex={0}
                 onPointerDown={(event) => beginResize(event, column)}
@@ -210,7 +342,7 @@ export function ResizableTable({
           ))}
         </tr>
       </thead>
-      {children}
+      {reorderRowCells(children, sourceKeys, orderedKeys)}
     </table>
   );
 }

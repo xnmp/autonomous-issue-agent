@@ -211,6 +211,19 @@ class BacklogCard(Contract):
     age_days: int | None
     age_s: int | None = None
     comments: int | None
+    issue_type: str | None = None
+    difficulty: str | None = None
+    impact: str | None = None
+
+
+class ToastNotification(Contract):
+    id: str
+    ts: str
+    severity: Literal["info", "attention"]
+    title: str
+    detail: str | None = None
+    issue: int | None = None
+    pr: int | None = None
 
 
 class IssuesPayload(Warned):
@@ -219,6 +232,7 @@ class IssuesPayload(Warned):
     done: list[IssueCard]
     backlog: list[BacklogCard]
     gh_ok: bool
+    notifications: list[ToastNotification] = []
 
 
 class TokenUsage(Contract):

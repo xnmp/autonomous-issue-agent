@@ -231,8 +231,14 @@ export interface components {
             body: string | null;
             /** Comments */
             comments: number | null;
+            /** Difficulty */
+            difficulty?: string | null;
+            /** Impact */
+            impact?: string | null;
             /** Issue */
             issue: number;
+            /** Issue Type */
+            issue_type?: string | null;
             /** Labels */
             labels: string[];
             /** Recurrence */
@@ -510,6 +516,11 @@ export interface components {
             gh_ok: boolean;
             /** In Flight */
             in_flight: components["schemas"]["IssueCard"][];
+            /**
+             * Notifications
+             * @default []
+             */
+            notifications: components["schemas"]["ToastNotification"][];
             /** Pending */
             pending: components["schemas"]["PendingCard"][];
             /** Warnings */
@@ -681,6 +692,28 @@ export interface components {
             }[];
             /** Warnings */
             warnings: string[];
+        } & {
+            [key: string]: unknown;
+        };
+        /** ToastNotification */
+        ToastNotification: {
+            /** Detail */
+            detail?: string | null;
+            /** Id */
+            id: string;
+            /** Issue */
+            issue?: number | null;
+            /** Pr */
+            pr?: number | null;
+            /**
+             * Severity
+             * @enum {string}
+             */
+            severity: "info" | "attention";
+            /** Title */
+            title: string;
+            /** Ts */
+            ts: string;
         } & {
             [key: string]: unknown;
         };

@@ -17,7 +17,7 @@ import type {
   PendingCard,
   Priority,
 } from "../api/types";
-import { ISSUES_SUBS, ISSUES_SUB_LABELS, type IssuesSub } from "../routing/hash";
+import type { IssuesSub } from "../routing/hash";
 import {
   combinedVerificationStatus,
   familyVar,
@@ -27,7 +27,7 @@ import {
   stateTone,
   verificationTone,
 } from "../lib/semantics";
-import { ageCompact, ago, duration, durationShort, localTime, num, usd } from "../lib/format";
+import { ageCompact, duration, localDate, localTime, num, usd } from "../lib/format";
 import { shortModel } from "../lib/models";
 import { Chip } from "./ui/Chip";
 import { EtaProgress } from "./ui/Charts";
@@ -47,7 +47,6 @@ import {
   SectionTitle,
   WarningList,
 } from "./ui/Feedback";
-import { SubTabs } from "./TabStrip";
 
 const MarkdownBody = lazy(() => import("./ui/MarkdownBody"));
 
@@ -55,9 +54,10 @@ interface IssuesTabProps {
   repo: string;
   sub: IssuesSub;
   issues: Polled<IssuesPayload>;
-  onSetSub: (sub: IssuesSub) => void;
   onOpenIssue: (issue: number) => void;
+  onBacklogPromotion?: (issue: number, pending: boolean) => void;
   showProjectedCost?: boolean;
+  showDurationSeconds?: boolean;
 }
 
 type Visibility = Record<IssuesSub, Record<string, boolean>>;
@@ -81,9 +81,12 @@ const COLUMN_CHOICES: Record<IssuesSub, ColumnChoice[]> = {
     { key: "verification", label: "Verification" },
     { key: "model", label: "Model" },
     { key: "rounds", label: "Rounds" },
-    { key: "merged", label: "Merged" },
+    { key: "merged", label: "Date" },
   ],
   backlog: [
+    { key: "type", label: "Type" },
+    { key: "difficulty", label: "Difficulty" },
+    { key: "impact", label: "Impact" },
     { key: "recurrence", label: "Recurrence" },
     { key: "age", label: "Age" },
     { key: "comments", label: "# comments" },
@@ -99,7 +102,7 @@ const DEFAULT_VISIBILITY: Visibility = {
   backlog: Object.fromEntries(
     COLUMN_CHOICES.backlog.map(({ key }) => [
       key,
-      key !== "recurrence" && key !== "comments",
+      key !== "recurrence" && key !== "comments" && key !== "labels",
     ]),
   ),
 };
@@ -121,9 +124,10 @@ export function IssuesTab({
   repo,
   sub,
   issues,
-  onSetSub,
   onOpenIssue,
+  onBacklogPromotion = () => {},
   showProjectedCost = true,
+  showDurationSeconds = true,
 }: IssuesTabProps) {
   const [visibility, setVisibility] = useState<Visibility>(storedVisibility);
   const [columnMenuAt, setColumnMenuAt] = useState<{ x: number; y: number } | null>(null);
@@ -155,21 +159,7 @@ export function IssuesTab({
 
   return (
     <div className="tabbody" onContextMenu={openColumnMenu}>
-      <div className="row">
-        <SubTabs
-          value={sub}
-          options={ISSUES_SUBS}
-          labels={ISSUES_SUB_LABELS}
-          counts={{
-            inflight: (data?.in_flight.length ?? 0) + (data?.pending.length ?? 0),
-            done: data?.done.length ?? 0,
-            backlog: data?.backlog.length ?? 0,
-          }}
-          onChange={onSetSub}
-        />
-        <span className="spacer" />
-        {!ghOk ? <GhUnavailableChip /> : null}
-      </div>
+      {!ghOk ? <div className="row"><span className="spacer" /><GhUnavailableChip /></div> : null}
       <ColumnMenu
         columns={COLUMN_CHOICES[sub]}
         visible={visible}
@@ -193,6 +183,7 @@ export function IssuesTab({
             visible={visible}
             onOpen={onOpenIssue}
             showProjectedCost={showProjectedCost}
+            showDurationSeconds={showDurationSeconds}
           />
           <SectionTitle>Pending</SectionTitle>
           <PendingTable
@@ -212,6 +203,7 @@ export function IssuesTab({
           loading={issues.loading}
           visible={visible}
           onOpen={onOpenIssue}
+          showDurationSeconds={showDurationSeconds}
         />
       ) : null}
 
@@ -223,6 +215,7 @@ export function IssuesTab({
           ghOk={ghOk}
           visible={visible}
           onRefresh={issues.refresh}
+          onPromotion={onBacklogPromotion}
         />
       ) : null}
     </div>
@@ -236,6 +229,7 @@ function InFlightTable({
   visible,
   onOpen,
   showProjectedCost,
+  showDurationSeconds,
 }: {
   cards: IssueCard[];
   anchorMs: number | null;
@@ -243,6 +237,7 @@ function InFlightTable({
   visible: ReadonlySet<string>;
   onOpen: (issue: number) => void;
   showProjectedCost: boolean;
+  showDurationSeconds: boolean;
 }) {
   const [expanded, setExpanded] = useState<number | null>(null);
   const sorted = useSortedRows(cards, {
@@ -262,11 +257,11 @@ function InFlightTable({
   if (cards.length === 0) return <EmptyState>no issues in flight — the fixer is idle</EmptyState>;
   const offset = anchorMs === null ? 0 : Math.max(0, (now - anchorMs) / 1000);
   const columns: TableColumn[] = [
-    { key: "issue", label: "Issue / PR", width: 340 },
-    ...(visible.has("tasks") ? [{ key: "tasks", label: "Tasks", width: 240 }] : []),
-    ...(visible.has("cost") ? [{ key: "cost", label: "Cost", className: "r", width: 150 }] : []),
-    ...(visible.has("elapsed") ? [{ key: "elapsed", label: "Duration", className: "r", width: 180 }] : []),
-    ...(visible.has("progress") ? [{ key: "progress", label: "Progress", width: 160 }] : []),
+    { key: "issue", label: "Issue / PR", width: 320 },
+    ...(visible.has("tasks") ? [{ key: "tasks", label: "Tasks", width: 190 }] : []),
+    ...(visible.has("cost") ? [{ key: "cost", label: "Cost", className: "r", width: 120 }] : []),
+    ...(visible.has("elapsed") ? [{ key: "elapsed", label: "Duration", className: "r", width: 150 }] : []),
+    ...(visible.has("progress") ? [{ key: "progress", label: "Progress", width: 150 }] : []),
     ...(visible.has("model") ? [{ key: "model", label: "Model", width: 180 }] : []),
   ];
 
@@ -275,7 +270,7 @@ function InFlightTable({
       <ResizableTable
         storageKey="issues-inflight"
         columns={columns}
-        className="wide issue-list-table"
+        className="issue-list-table"
         sort={sorted.sort}
         onSort={sorted.onSort}
       >
@@ -317,7 +312,11 @@ function InFlightTable({
                   ) : null}
                   {visible.has("elapsed") ? (
                     <td className="r mono" title={card.started_ts ? `started ${localTime(card.started_ts)}` : ""}>
-                      <DurationBreakdown working={working} idle={idle} />
+                      <DurationBreakdown
+                        working={working}
+                        idle={idle}
+                        showSeconds={showDurationSeconds}
+                      />
                     </td>
                   ) : null}
                   {visible.has("progress") ? (
@@ -479,11 +478,13 @@ function DoneTable({
   loading,
   visible,
   onOpen,
+  showDurationSeconds,
 }: {
   cards: IssueCard[];
   loading: boolean;
   visible: ReadonlySet<string>;
   onOpen: (issue: number) => void;
+  showDurationSeconds: boolean;
 }) {
   const [expanded, setExpanded] = useState<number | null>(null);
   const sorted = useSortedRows(cards, {
@@ -501,13 +502,13 @@ function DoneTable({
   if (loading) return <SkeletonRows what="done issues" rows={5} />;
   if (cards.length === 0) return <EmptyState>nothing merged by the harness in this deployment yet</EmptyState>;
   const columns: TableColumn[] = [
-    { key: "issue", label: "Issue / PR", width: 380 },
+    { key: "issue", label: "Issue / PR", width: 340 },
     ...(visible.has("cost") ? [{ key: "cost", label: "Cost", className: "r", width: 100 }] : []),
-    ...(visible.has("duration") ? [{ key: "duration", label: "Duration", className: "r", width: 180 }] : []),
-    ...(visible.has("verification") ? [{ key: "verification", label: "Verification", width: 190 }] : []),
-    ...(visible.has("model") ? [{ key: "model", label: "Model", width: 190 }] : []),
+    ...(visible.has("duration") ? [{ key: "duration", label: "Duration", className: "r", width: 150 }] : []),
+    ...(visible.has("verification") ? [{ key: "verification", label: "Verification", width: 160 }] : []),
+    ...(visible.has("model") ? [{ key: "model", label: "Model", width: 170 }] : []),
     ...(visible.has("rounds") ? [{ key: "rounds", label: "Rounds", className: "r", width: 90 }] : []),
-    ...(visible.has("merged") ? [{ key: "merged", label: "Merged", width: 120 }] : []),
+    ...(visible.has("merged") ? [{ key: "merged", label: "Date", width: 140 }] : []),
   ];
 
   return (
@@ -540,7 +541,11 @@ function DoneTable({
                   ) : null}
                   {visible.has("duration") ? (
                     <td className="r mono">
-                      <DurationBreakdown working={card.working_s} idle={card.idle_s} compact />
+                      <DurationBreakdown
+                        working={card.working_s}
+                        idle={card.idle_s}
+                        showSeconds={showDurationSeconds}
+                      />
                     </td>
                   ) : null}
                   {visible.has("verification") ? (
@@ -550,7 +555,7 @@ function DoneTable({
                   {visible.has("rounds") ? <td className="r num">{num(card.rounds)}</td> : null}
                   {visible.has("merged") ? (
                     <td className="mono faint" title={card.merged_ts ?? card.last_ts ?? ""}>
-                      {card.merged_ts ? ago(card.merged_ts) : ago(card.last_ts)}
+                      {localDate(card.merged_ts ?? card.last_ts)}
                     </td>
                   ) : null}
                 </tr>
@@ -573,6 +578,7 @@ function BacklogTable({
   ghOk,
   visible,
   onRefresh,
+  onPromotion,
 }: {
   repo: string;
   cards: BacklogCard[];
@@ -580,13 +586,16 @@ function BacklogTable({
   ghOk: boolean;
   visible: ReadonlySet<string>;
   onRefresh: () => void;
+  onPromotion: (issue: number, pending: boolean) => void;
 }) {
   const [expanded, setExpanded] = useState<number | null>(null);
   const [promote, setPromote] = useState<BacklogCard | null>(null);
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const sorted = useSortedRows(cards, {
     issue: (card) => card.issue,
+    type: (card) => card.issue_type,
+    difficulty: (card) => card.difficulty,
+    impact: (card) => card.impact,
     recurrence: (card) => card.recurrence_count,
     age: (card) => card.age_s ?? (card.age_days === null ? null : card.age_days * 86_400),
     comments: (card) => card.comments,
@@ -597,7 +606,10 @@ function BacklogTable({
     return <EmptyState>{ghOk ? "no unlabelled open issues — the backlog is clear" : "backlog needs GitHub data, which is unavailable"}</EmptyState>;
   }
   const columns: TableColumn[] = [
-    { key: "issue", label: "Issue", width: 420 },
+    { key: "issue", label: "Issue", width: 350 },
+    ...(visible.has("type") ? [{ key: "type", label: "Type", width: 100 }] : []),
+    ...(visible.has("difficulty") ? [{ key: "difficulty", label: "Difficulty", width: 120 }] : []),
+    ...(visible.has("impact") ? [{ key: "impact", label: "Impact", width: 100 }] : []),
     ...(visible.has("recurrence") ? [{ key: "recurrence", label: "Recurrence", width: 150 }] : []),
     ...(visible.has("age") ? [{ key: "age", label: "Age", className: "r", width: 90 }] : []),
     ...(visible.has("comments") ? [{ key: "comments", label: "# comments", className: "r", width: 110 }] : []),
@@ -606,21 +618,22 @@ function BacklogTable({
 
   const doPromote = async () => {
     if (!promote) return;
-    setBusy(true);
+    const card = promote;
     setError(null);
+    setPromote(null);
+    onPromotion(card.issue, true);
     try {
-      await api.promote(repo, promote.issue);
-      setPromote(null);
+      await api.promote(repo, card.issue);
       onRefresh();
     } catch (caught) {
+      onPromotion(card.issue, false);
       setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setBusy(false);
     }
   };
 
   return (
     <>
+      {error ? <ErrorBanner message={error} /> : null}
       <div className="tbl-wrap panel">
         <ResizableTable
           storageKey="issues-backlog"
@@ -669,6 +682,9 @@ function BacklogTable({
                         </div>
                       </div>
                     </td>
+                    {visible.has("type") ? <td className="mono">{card.issue_type ?? <span className="faint">—</span>}</td> : null}
+                    {visible.has("difficulty") ? <td className="mono">{card.difficulty ?? <span className="faint">—</span>}</td> : null}
+                    {visible.has("impact") ? <td className="mono">{card.impact ?? <span className="faint">—</span>}</td> : null}
                     {visible.has("recurrence") ? (
                       <td>
                         {card.recurrence_count > 0 ? (
@@ -706,8 +722,7 @@ function BacklogTable({
         <ConfirmModal
           title="Promote to ai-ready"
           confirmLabel={`Promote #${promote.issue}`}
-          busy={busy}
-          error={error}
+          busy={false}
           onConfirm={() => void doPromote()}
           onCancel={() => setPromote(null)}
           body={
@@ -868,20 +883,19 @@ function VerificationStatus({ card }: { card: IssueCard }) {
 function DurationBreakdown({
   working,
   idle,
-  compact = false,
+  showSeconds,
 }: {
   working: number | null;
   idle: number | null;
-  compact?: boolean;
+  showSeconds: boolean;
 }) {
-  const format = compact ? durationShort : duration;
   return (
     <span className="duration-breakdown">
       <span title="time actively progressing through harness work">
-        <span className="faint">work</span> {format(working)}
+        <span className="faint">work</span> {duration(working, showSeconds)}
       </span>
       <span title="time waiting on a dependency or hold">
-        <span className="faint">idle</span> {format(idle)}
+        <span className="faint">idle</span> {duration(idle, showSeconds)}
       </span>
     </span>
   );

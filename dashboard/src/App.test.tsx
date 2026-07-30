@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import App from "./App";
@@ -38,6 +38,7 @@ const issues = {
   done: [],
   backlog: [],
   gh_ok: true,
+  notifications: [],
   warnings: [],
 };
 
@@ -49,7 +50,7 @@ function json(body: unknown): Response {
 }
 
 describe("App navigation", () => {
-  it("remembers each repository's issue subtab and keeps verification out of the tab strip", async () => {
+  it("uses top-level issue-state tabs and keeps verification out of the tab strip", async () => {
     window.location.hash = "#/repo/demo/issues/done";
     let overviewCalls = 0;
     vi.stubGlobal(
@@ -95,7 +96,7 @@ describe("App navigation", () => {
         name: /2026-07-29.*3.*1.*\+2/,
       }),
     ).toBeVisible();
-    await userEvent.click(screen.getByRole("button", { name: /Done/ }));
+    await userEvent.click(screen.getByRole("tab", { name: /Done/ }));
     expect(screen.getByRole("tab", { name: /Done/ })).toHaveAttribute(
       "aria-selected",
       "true",
@@ -107,16 +108,19 @@ describe("App navigation", () => {
       }),
     ).toBeVisible();
     expect(screen.queryByLabelText("Loading overview")).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole("tab", { name: /Issues/ }));
+    await userEvent.click(screen.getByRole("tab", { name: /Done/ }));
     expect(screen.getByRole("tab", { name: /Done/ })).toHaveAttribute(
       "aria-selected",
       "true",
     );
+    expect(screen.getByRole("tab", { name: /In flight/ })).toBeVisible();
+    expect(screen.getByRole("tab", { name: /Backlog/ })).toBeVisible();
+    expect(screen.queryByText("#/repo/demo/issues/done")).not.toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "Verification ledger" }));
     expect(screen.queryByRole("tab", { name: "Verification" })).not.toBeInTheDocument();
     expect(screen.queryByRole("tab", { name: "Overview" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("tab", { name: /Issues/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: /In flight/ })).not.toBeInTheDocument();
     expect(await screen.findByText("Verification ledger", { selector: ".section-title span" })).toBeVisible();
   });
 
@@ -144,6 +148,57 @@ describe("App navigation", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Settings" }));
     await userEvent.selectOptions(screen.getByLabelText("Theme"), "nord");
+    const seconds = screen.getByRole("checkbox", { name: "Show seconds in durations" });
+    await userEvent.click(seconds);
     expect(document.documentElement).toHaveAttribute("data-theme", "nord");
+    expect(seconds).not.toBeChecked();
+  });
+
+  it("optimistically removes a promoted backlog issue and updates its tab count", async () => {
+    window.location.hash = "#/repo/demo/issues/backlog";
+    let finishPromotion: (response: Response) => void = () => {};
+    const promotion = new Promise<Response>((resolve) => {
+      finishPromotion = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input);
+        if (path === "/api/repos") return json(repos);
+        if (path === "/api/usage") return json(usage);
+        if (path.endsWith("/promote")) return promotion;
+        if (path.endsWith("/issues")) {
+          return json({
+            ...issues,
+            backlog: [{
+              issue: 120,
+              title: "Toast notifications",
+              url: "https://github.com/o/r/issues/120",
+              body: "Important state changes",
+              labels: ["feature"],
+              recurrence: false,
+              recurrence_count: 0,
+              age_days: 0,
+              comments: 0,
+              issue_type: "feature",
+              difficulty: null,
+              impact: null,
+            }],
+          });
+        }
+        return json({ rows: [], warnings: [] });
+      }),
+    );
+
+    render(<App />);
+
+    await screen.findByText("Toast notifications");
+    expect(screen.getByRole("tab", { name: /Backlog/ })).toHaveTextContent("1");
+    await userEvent.click(screen.getByRole("button", { name: "Promote #120 to ai-ready" }));
+    await userEvent.click(screen.getByRole("button", { name: "Promote #120" }));
+
+    await waitFor(() => expect(screen.queryByText("Toast notifications")).not.toBeInTheDocument());
+    expect(screen.getByRole("tab", { name: /Backlog/ })).toHaveTextContent("0");
+    finishPromotion(json({ ok: true, detail: "promoted" }));
   });
 });

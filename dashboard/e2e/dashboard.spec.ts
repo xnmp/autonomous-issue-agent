@@ -64,9 +64,9 @@ const issueCard = {
   done: true,
   cost_usd: 2,
   estimated: false,
-  elapsed_s: 60,
-  working_s: 45,
-  idle_s: 15,
+  elapsed_s: 4700,
+  working_s: 4638,
+  idle_s: 62,
   idle_active: false,
   started_ts: "2026-07-29T07:00:00Z",
   last_ts: "2026-07-29T08:00:00Z",
@@ -84,11 +84,53 @@ const issueCard = {
 };
 
 const issues = {
-  in_flight: [],
+  in_flight: [{
+    ...issueCard,
+    issue: 49,
+    title: "Exercise model wrapping",
+    url: "https://github.com/openai/autonomous-issue-agent/issues/49",
+    pr: 74,
+    pr_url: "https://github.com/openai/autonomous-issue-agent/pull/74",
+    pr_state: "open",
+    stage: "reviewing",
+    done: false,
+    merged_ts: null,
+    models: ["gpt-5.6-terra", "gpt-5.6-fable", "gpt-5.6-luna"],
+    model_badges: [
+      { model: "gpt-5.6-terra", effort: "medium" },
+      { model: "gpt-5.6-fable", effort: "high" },
+      { model: "gpt-5.6-luna", effort: "medium" },
+    ],
+  }],
   pending: [],
-  done: [issueCard],
-  backlog: [],
+  done: [
+    issueCard,
+    ...Array.from({ length: 18 }, (_, index) => ({
+      ...issueCard,
+      issue: 51 + index,
+      title: `Completed issue ${51 + index}`,
+      url: `https://github.com/openai/autonomous-issue-agent/issues/${51 + index}`,
+      pr: 76 + index,
+      pr_url: `https://github.com/openai/autonomous-issue-agent/pull/${76 + index}`,
+    })),
+  ],
+  backlog: [{
+    issue: 120,
+    title: "Toast notifications for state transitions",
+    url: "https://github.com/openai/autonomous-issue-agent/issues/120",
+    body: "## Problem\n\nImportant state changes arrive silently.",
+    labels: ["feature", "effort:medium", "impact:high"],
+    recurrence: false,
+    recurrence_count: 0,
+    age_days: 0,
+    age_s: 1800,
+    comments: 2,
+    issue_type: "feature",
+    difficulty: "medium",
+    impact: "high",
+  }],
   gh_ok: true,
+  notifications: [],
   warnings: [],
 };
 
@@ -107,9 +149,9 @@ const issue = {
     },
   ],
   cost_usd: 2,
-  elapsed_s: 60,
-  working_s: 45,
-  idle_s: 15,
+  elapsed_s: 4700,
+  working_s: 4638,
+  idle_s: 62,
   idle_active: false,
   steps: [
     {
@@ -120,7 +162,7 @@ const issue = {
       model: "claude-sonnet-5",
       status: "done",
       exit_reason: "ok",
-      duration_s: 60,
+      duration_s: 4638,
       cost_usd: 2,
       estimated: false,
       session_id: "session-50",
@@ -151,12 +193,27 @@ async function json(route: Route, body: unknown, delayMs = 0) {
 }
 
 async function mockApi(page: Page, reposDelayMs = 0) {
+  let issuePolls = 0;
   await page.route("**/*", async (route) => {
     const path = new URL(route.request().url()).pathname;
     if (!path.startsWith("/api/")) return route.continue();
     if (path === "/api/repos") return json(route, repos, reposDelayMs);
     if (path === "/api/usage") return json(route, usage);
-    if (path === "/api/repos/self/issues") return json(route, issues);
+    if (path === "/api/repos/self/issues") {
+      issuePolls += 1;
+      return json(route, {
+        ...issues,
+        notifications: issuePolls <= 2 ? [] : [{
+          id: "merge-50",
+          ts: "2026-07-29T08:00:00Z",
+          severity: "info",
+          title: "Issue #50 completed",
+          detail: "PR #75 merged",
+          issue: 50,
+          pr: 75,
+        }],
+      });
+    }
     if (path === "/api/repos/self/issues/50") return json(route, issue);
     if (path === "/api/repos/self/issues/50/steps/0/events")
       return json(route, {
@@ -181,7 +238,12 @@ async function mockApi(page: Page, reposDelayMs = 0) {
         cost_mix: null,
         caps: { issue_cap_usd: 5, daily_cap_usd: 10, today_usd: 2 },
         health: [],
-        unattributed: [],
+        unattributed: Array.from({ length: 30 }, (_, index) => ({
+          ts: `2026-07-29T07:${String(index).padStart(2, "0")}:00Z`,
+          event: "tick",
+          kind: `background-${index}`,
+          role: index % 2 === 0 ? "fix" : "review",
+        })),
         health_trend: [{
           day: "2026-07-29",
           opened: 3,
@@ -242,6 +304,31 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   await page.getByRole("button", { name: "Expand sidebar" }).click();
   await page.setViewportSize({ width: 1440, height: 900 });
+  await expect(page.getByRole("tab", { name: /In flight/ })).toBeVisible();
+  await expect(page.getByRole("tab", { name: /Backlog/ })).toBeVisible();
+  await expect(page.getByText("#/repo/self/issues/done")).toHaveCount(0);
+  await expect(page.getByRole("columnheader", { name: /Date/ })).toBeVisible();
+  await expect(page.locator(".duration-breakdown").first()).toContainText("1:17:18");
+
+  const mainbody = page.locator(".mainbody");
+  await mainbody.evaluate((element) => {
+    element.scrollTop = 420;
+  });
+  const mainbodyBounds = await mainbody.boundingBox();
+  await expect(page.getByRole("tab", { name: /Done/ })).toBeInViewport();
+  const doneTabBounds = await page.getByRole("tab", { name: /Done/ }).boundingBox();
+  expect(doneTabBounds!.y + doneTabBounds!.height).toBeLessThanOrEqual(mainbodyBounds!.y);
+  await mainbody.evaluate((element) => {
+    element.scrollTop = 0;
+  });
+
+  await expect(page.getByRole("status").filter({ hasText: "Issue #50 completed" }))
+    .toBeVisible({ timeout: 7_000 });
+  await page.screenshot({
+    path: "../evidence/dashboard-toasts.png",
+    fullPage: true,
+  });
+  await page.getByRole("button", { name: "Dismiss Issue #50 completed" }).click();
 
   const quotaButton = page.getByRole("button", { name: "Quota", exact: true });
   await expect(quotaButton).toHaveAttribute("aria-expanded", "false");
@@ -274,6 +361,7 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await page.getByRole("button", { name: "Expand sidebar" }).click();
   await page.getByRole("button", { name: "Settings" }).click();
   await page.getByLabel("Theme").selectOption("nord");
+  await page.getByRole("checkbox", { name: "Show seconds in durations" }).uncheck();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "nord");
   await page.screenshot({
     path: "../evidence/dashboard-theme-settings.png",
@@ -281,11 +369,24 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   });
   await page.getByLabel("Theme").selectOption("cosmic-dusk");
   await page.getByRole("button", { name: "Settings" }).click();
+  await expect(page.locator(".duration-breakdown").first()).toContainText("1:17");
   await page.getByRole("button", { name: "Quota", exact: true }).click();
   await page.screenshot({
     path: "../evidence/dashboard-issues-table.png",
     fullPage: true,
   });
+
+  const costHeader = page.locator('th[data-column-key="cost"]');
+  await costHeader.focus();
+  await page.keyboard.press("Alt+ArrowLeft");
+  await expect(page.locator(".issue-list-table th").first()).toHaveAttribute("data-column-key", "cost");
+  await expect(page.locator(".issue-list-table tbody tr").first().locator("td").first())
+    .toHaveText("$2.00");
+  expect((await costHeader.boundingBox())!.width).toBeLessThan(320);
+  expect((await page.locator('th[data-column-key="issue"]').boundingBox())!.width)
+    .toBeGreaterThanOrEqual(320);
+  await page.keyboard.press("Alt+ArrowRight");
+  await expect(page.locator(".issue-list-table th").first()).toHaveAttribute("data-column-key", "issue");
 
   const durationHeader = page.locator('th[data-column-key="duration"]');
   const durationBefore = await durationHeader.boundingBox();
@@ -310,6 +411,34 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await page.getByRole("button", { name: "Sort by Issue" }).click();
   await expect(issueHeader).toHaveAttribute("aria-sort", "descending");
 
+  await page.getByRole("tab", { name: /Backlog/ }).click();
+  await expect(page.getByRole("columnheader", { name: /Type/ })).toBeVisible();
+  await expect(page.getByRole("columnheader", { name: /Difficulty/ })).toBeVisible();
+  await expect(page.getByRole("columnheader", { name: /Impact/ })).toBeVisible();
+  await expect(page.getByRole("row", { name: /Toast notifications.*feature.*medium.*high/ }))
+    .toBeVisible();
+  await page.screenshot({
+    path: "../evidence/dashboard-backlog-columns.png",
+    fullPage: true,
+  });
+  await page.getByRole("button", { name: "Promote #120 to ai-ready" }).click();
+  await page.getByRole("button", { name: "Promote #120", exact: true }).click();
+  await expect(page.getByText("Toast notifications for state transitions")).toHaveCount(0);
+  await expect(page.getByRole("tab", { name: /Backlog/ })).toContainText("0");
+
+  await page.getByRole("tab", { name: /In flight/ }).click();
+  const modelList = page.locator(".model-list").first();
+  await expect(modelList.locator(".chip")).toHaveCount(3);
+  await expect(modelList).toHaveCSS("flex-wrap", "wrap");
+  const modelListBounds = await modelList.boundingBox();
+  const modelChipBounds = await modelList.locator(".chip").first().boundingBox();
+  expect(modelListBounds!.height).toBeGreaterThan(modelChipBounds!.height);
+  await page.screenshot({
+    path: "../evidence/dashboard-inflight-models.png",
+    fullPage: true,
+  });
+  await page.getByRole("tab", { name: /Done/ }).click();
+
   await page.getByRole("row", { name: /Explain completed work.*#50/ }).click();
   await page.getByRole("button", { name: "Open full issue" }).click();
   await expect(page).toHaveURL(/#\/repo\/self\/issue\/50$/);
@@ -322,6 +451,28 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await expect(page.getByText(/issue on GitHub/i)).toHaveCount(0);
   await expect(page.getByText("Resolve", { exact: true })).toBeVisible();
   await expect(page.getByText("Luna", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("1:17", { exact: true })).toHaveCount(2);
+
+  await page.locator('th[data-column-key="operation"]').click({ button: "right" });
+  await page.getByRole("checkbox", { name: "Model" }).check();
+  await page.keyboard.press("Escape");
+  for (const [name, minimum] of [
+    ["Model", 100],
+    ["Status", 96],
+    ["Duration", 84],
+    ["Cost", 76],
+  ] as const) {
+    const separator = page.getByRole("separator", { name: `Resize ${name} column` });
+    await separator.focus();
+    for (let index = 0; index < 12; index += 1) await page.keyboard.press("ArrowLeft");
+    await expect(separator).toHaveAttribute("aria-valuenow", String(minimum));
+    const header = page.locator(`th[data-column-key="${name.toLowerCase()}"]`);
+    expect((await header.boundingBox())!.width).toBeLessThanOrEqual(minimum + 1);
+  }
+  await page.screenshot({
+    path: "../evidence/dashboard-issue-columns.png",
+    fullPage: true,
+  });
 
   await page.locator(".step-disclosure").click();
   const taskDetail = page.locator(".stepdetail");
@@ -336,7 +487,17 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
 
   await page.getByRole("tab", { name: "Overview" }).click();
   await expect(page.getByRole("row", { name: /2026-07-29.*3.*1.*\+2/ })).toBeVisible();
-  await page.getByRole("tab", { name: /Issues/ }).click();
+  await mainbody.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+  const overviewScroll = await mainbody.evaluate((element) => ({
+    top: element.scrollTop,
+    max: element.scrollHeight - element.clientHeight,
+  }));
+  expect(overviewScroll.top).toBe(overviewScroll.max);
+  expect(await page.evaluate(() => document.documentElement.scrollHeight)).toBe(900);
+  await expect(page.locator(".sidebar-foot")).toBeInViewport();
+  await page.getByRole("tab", { name: /Done/ }).click();
   await expect(page.getByRole("tab", { name: /Done/ })).toHaveAttribute("aria-selected", "true");
 
   await page.getByRole("button", { name: "Verification ledger" }).click();
@@ -360,7 +521,7 @@ test("serves a validated operator workflow through FastAPI and the production bu
   await expect(
     page.getByRole("row", { name: /2026-07-29.*3.*1.*\+2/ }),
   ).toBeVisible();
-  await page.getByRole("tab", { name: /Issues/ }).click();
+  await page.getByRole("tab", { name: /Done/ }).click();
   await page.getByRole("row", { name: /Explain completed work.*#50/ }).click();
   await page.getByRole("button", { name: "Open full issue" }).click();
   await expect(page.getByRole("link", { name: /PR #75/ })).toHaveAttribute(
