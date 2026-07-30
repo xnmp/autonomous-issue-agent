@@ -74,6 +74,25 @@ from .actions import (  # noqa: F401
 from .labels import Label
 
 
+_DECLARED_STATUS_KEYS = ("status", "decision")
+
+
+def declared_status(structured: object) -> str:
+    """Return an agent's terminal claim from any supported output schema.
+
+    Review schemas name the same terminal value ``decision`` while the other
+    task schemas use ``status``. Keeping that translation at the runtime
+    contract boundary prevents consumers from needing runtime-specific grammar.
+    """
+    if not isinstance(structured, dict):
+        return ""
+    for key in _DECLARED_STATUS_KEYS:
+        value = structured.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
 class Outcome(str, Enum):
     OK = "ok"
     BLOCKED = "blocked"
