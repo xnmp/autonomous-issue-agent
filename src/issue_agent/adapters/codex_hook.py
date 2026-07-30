@@ -79,6 +79,9 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 2
 fi
 {('export ISSUE_AGENT_REVIEW_READ_ONLY=1' if review_only else '')}
+# Codex PostToolUse executes inside the paid child and cannot mint trusted
+# visual evidence. Remove an ambient/exported path on every governed command.
+unset HARNESS_SCREENSHOTS_READ
 exec uv run --quiet "{governor_path}"
 """
 
@@ -190,6 +193,11 @@ def write_hook_config(
         gov_script_path,
         os.stat(gov_script_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH,
     )
+    stale_read_hook = os.path.join(hooks_dir, "read_record.sh")
+    try:
+        os.unlink(stale_read_hook)
+    except FileNotFoundError:
+        pass
 
     edit_check_script_path = ""
     if edit_check_cmd:

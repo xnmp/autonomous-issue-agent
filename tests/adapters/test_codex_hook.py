@@ -65,12 +65,17 @@ def test_codex_cannot_mint_trusted_screenshot_receipts(tmp_path) -> None:
     worktree.mkdir()
     config = write_hook_config(str(worktree), state_dir=str(state))
     hooks = os.path.join(os.path.dirname(config), "hooks")
+    stale = os.path.join(hooks, "read_record.sh")
+    with open(stale, "w") as stream:
+        stream.write("forged")
+    config = write_hook_config(str(worktree), state_dir=str(state))
     governor = open(os.path.join(hooks, "gov.sh")).read()
     rendered = open(config).read()
 
     assert not os.path.exists(os.path.join(hooks, "read_record.sh"))
     assert "PostToolUse" not in rendered
-    assert "HARNESS_SCREENSHOTS_READ" not in governor
+    assert "unset HARNESS_SCREENSHOTS_READ" in governor
+    assert "export HARNESS_SCREENSHOTS_READ" not in governor
     assert str(state / "evidence") not in governor
 
 
