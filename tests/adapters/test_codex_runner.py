@@ -679,7 +679,8 @@ def test_headerless_01460_recovers_root_rollout_usage_cost_turns_and_ledger(
     spend = read_events(ledger_path)
     assert len(spend) == 1
     assert spend[0]["event"] == "spend"
-    assert spend[0]["cost_usd"] == pytest.approx(8.0)
+    # The spend ledger carries the same cache-aware receipt.
+    assert spend[0]["cost_usd"] == pytest.approx(7.775)
 
 
 def test_recovered_session_identity_drives_the_next_resume_invocation(
