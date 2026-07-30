@@ -291,14 +291,16 @@ def test_resume_recreates_removed_worktree_on_original_branch_with_blocked_commi
     blocked_commit = git("rev-parse", "HEAD", cwd=original_cwd)
     git("worktree", "remove", str(original_cwd), "--force")
 
-    iss = IssueView(issue, title=title, body="body", comments=(
+    iss = IssueView(issue, title="Retitled after blocked work", body="body", comments=(
         Comment("fix-bot", "asking", "t1"),
         Comment("alice", "continue", "t2"),
     ))
     gw = FakeGateway(issues={issue: iss}, pr_for_issue={})
     runner = FakeRunner(AgentResult(is_error=False, status="blocked", session_id="s5"))
+    store = Store(str(tmp_path / "state"))
+    store.save_branch(issue, original_branch)
 
-    asyncio.run(_workflow(gw, FakeStore(), runner, worktrees, fix_bot="fix-bot").resume(issue))
+    asyncio.run(_workflow(gw, store, runner, worktrees, fix_bot="fix-bot").resume(issue))
 
     recovered_cwd = Path(runner.tasks[0].cwd)
     assert git("branch", "--show-current", cwd=recovered_cwd) == original_branch

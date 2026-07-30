@@ -82,6 +82,18 @@ def test_ensure_creates_from_base_when_no_branch():
     assert add and "-b" in add[0][0] and "origin/dev" in add[0][0]
 
 
+def test_branch_for_issue_recovers_a_unique_retained_branch():
+    fg = FakeGit({
+        "for-each-ref": GitResult(0, "\n".join([
+            "dev",
+            "fix/5-original-title",
+            "fix/50-other-issue",
+        ])),
+    })
+
+    assert Worktrees("/repo", run=fg).branch_for_issue(5) == "fix/5-original-title"
+
+
 # ── M20: `ensure` must be HONEST about readiness ──────────────────────────────
 def test_ensure_raises_when_every_worktree_add_attempt_fails():
     """Before this, `ensure` returned the path regardless of whether any

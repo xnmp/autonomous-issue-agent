@@ -167,6 +167,22 @@ class Worktrees:
     def path(self, issue: int) -> str:
         return os.path.join(self.worktree_root, f"issue-{issue}")
 
+    def branch_for_issue(self, issue: int) -> str:
+        """Return the sole retained harness branch for an older issue leg.
+
+        New legs persist their branch in Store. This local-ref lookup recovers
+        pre-persistence blocked legs after their worktree was reaped, without
+        guessing from a possibly retitled issue.
+        """
+        refs = self._git(
+            ["for-each-ref", "--format=%(refname:short)", "refs/heads"], self.repo_dir
+        )
+        matches = [
+            ref for ref in refs.out.splitlines()
+            if re.fullmatch(rf"(?:fix|feat|chore|refactor)/{issue}-.+", ref)
+        ]
+        return matches[0] if len(matches) == 1 else ""
+
     def ensure(self, issue: int, branch: str) -> str:
         """Ensure a worktree for the issue exists on `branch`; return its abs
         path. Port of ensure_worktree: reuse existing, else create from the
