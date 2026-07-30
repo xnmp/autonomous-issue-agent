@@ -17,7 +17,9 @@ base="${BASE_BRANCH:-dev}"
 
 prc_check_push_destination() {
   local branch="$1"
+  local source="$2"
   local pr="" pr_rc=1 baseref diff_range log_range changed
+  local source_commit head_commit
 
   # Only governed-shape branches carry harness work; anything else is not this
   # gate's business, but later destinations in the same push still are.
@@ -38,6 +40,13 @@ prc_check_push_destination() {
     || fail "could not verify PR state for branch '$branch' — 'gh pr list' failed twice (gh/network/auth error). The push gate needs to know whether an open PR exists, so it fails CLOSED rather than letting an unverified push through. Check connectivity and 'gh auth status', then retry the push shortly."
   [ -n "$pr" ] || return 0
 
+  source_commit=$(git rev-parse --verify --quiet "${source}^{commit}" 2>/dev/null) \
+    || fail "source ref '${source:-"(empty)"}' does not resolve to checked-out HEAD — check out that source or push HEAD:$branch"
+  head_commit=$(git rev-parse --verify --quiet "HEAD^{commit}" 2>/dev/null) \
+    || fail "source ref '${source:-"(empty)"}' does not resolve to checked-out HEAD — check out that source or push HEAD:$branch"
+  [ "$source_commit" = "$head_commit" ] \
+    || fail "source ref '${source:-"(empty)"}' does not resolve to checked-out HEAD — check out that source or push HEAD:$branch"
+
   # Resolve the base once per governed destination. The working-tree state is
   # shared, while the issue identity and open-PR lookup belong to the ref being
   # written.
@@ -54,37 +63,53 @@ prc_check_push_destination() {
   prc_check_tests
 }
 
-prc_normalize_push_destination() {
-  local destination="${1#+}"
-  case "$destination" in *:*) destination="${destination#*:}" ;; esac
+prc_add_push_refspec() {
+  local body="${1#+}" source destination
+  if printf '%s' "$body" | grep -q ':'; then
+    source="${body%%:*}"
+    destination="${body#*:}"
+  else
+    source="$body"
+    destination="$body"
+  fi
+  [ -z "$delete_mode" ] || source=""
   destination="${destination#refs/heads/}"
   case "$destination" in
-    HEAD|@) printf '%s' "$checked_out_branch" ;;
-    *) printf '%s' "$destination" ;;
+    HEAD|@) destination="$checked_out_branch" ;;
   esac
+  sources+=("$source")
+  destinations+=("$destination")
 }
 
 checked_out_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+sources=()
 destinations=()
 remote_seen=""
+delete_mode=""
+for arg in "$@"; do
+  case "$arg" in
+    --delete|-d|-[^-]*d*) delete_mode=1 ;;
+  esac
+done
 for arg in "$@"; do
   [ "$arg" = "push" ] && continue
   case "$arg" in -*) continue ;; esac
   if [ -z "$remote_seen" ]; then
     remote_seen=1
     case "$arg" in
-      +*|*:*) destinations+=("$(prc_normalize_push_destination "$arg")") ;;
+      +*|*:*) prc_add_push_refspec "$arg" ;;
     esac
     continue
   fi
-  destinations+=("$(prc_normalize_push_destination "$arg")")
+  prc_add_push_refspec "$arg"
 done
 
 if [ "${#destinations[@]}" -eq 0 ]; then
+  sources=("HEAD")
   destinations=("$checked_out_branch")
 fi
-for branch in "${destinations[@]}"; do
-  prc_check_push_destination "$branch"
+for index in "${!destinations[@]}"; do
+  prc_check_push_destination "${destinations[$index]}" "${sources[$index]}"
 done
 
 exit 0

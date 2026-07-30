@@ -97,6 +97,10 @@ class GateContext:
     allow_untested: bool = False
     exists_at_base: Callable[[str], bool] = lambda f: False
     exists_at_head: Callable[[str], bool] = lambda f: True
+    # Production always replaces this with the lazy git-backed resolver in
+    # build_gate_context. The permissive constructor default keeps isolated
+    # policy tests independent of repository I/O, like the other callbacks.
+    push_source_matches_head: Callable[[str], bool] = lambda _source: True
     run_tests: Callable[[str], bool | None] = lambda c: True
     revert_and_run: Callable[[tuple[str, ...]], bool | None] = lambda impl: False
     red_must_fail: bool = True
@@ -450,7 +454,9 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
     return []
 
 
-def _push_gate_for_branch(branch: str, ctx: GateContext) -> list[str]:
+def _push_gate_for_branch(
+    branch: str, source: str, ctx: GateContext
+) -> list[str]:
     """The push gate (check-push.sh) for ONE destination branch.
 
     The open-PR lookup is resolved HERE — this is the only place that pays for
@@ -482,6 +488,14 @@ def _push_gate_for_branch(branch: str, ctx: GateContext) -> list[str]:
     )
     if not precondition.ok:
         return [precondition.reason]
+    source_is_head = source in ("HEAD", "@", ctx.branch)
+    if not source_is_head and not ctx.push_source_matches_head(source):
+        reason = (
+            f"push source ref '{source or '(empty)'}' does not resolve to "
+            "checked-out HEAD — check out that source or push HEAD:"
+            f"{branch}"
+        )
+        return [_annotate(reason, branch, mode)]
     if not ctx.base_resolvable:
         return []
 
@@ -538,15 +552,25 @@ def _push_gate(push_argv: list[str], ctx: GateContext) -> list[str]:
     built once from the hook's cwd. The destination is now right; the state it is
     checked against can still be the wrong worktree's. Likewise `sh -c 'git push
     …'` classifies as nothing and never reaches this gate at all (M9/R3-F8)."""
-    targets = gate.resolve_push_targets(
-        governor_policy.push_destination_refs(push_argv), ctx.branch
-    )
-    known = gate.check_push_target(targets)
-    if not known.ok:
-        return [known.reason]
-    assert targets is not None  # check_push_target denies exactly the None case
-    for branch in targets:
-        reasons = _push_gate_for_branch(branch, ctx)
+    explicit = governor_policy.push_refspecs(push_argv)
+    explicit_destinations = governor_policy.push_destination_refs(push_argv)
+    source_by_destination = {
+        item.destination: item.source for item in reversed(explicit)
+    }
+    updates: list[tuple[str, str]] = []
+    candidates = explicit_destinations or ("",)
+    for destination in candidates:
+        destinations = (destination,) if explicit_destinations else ()
+        targets = gate.resolve_push_targets(destinations, ctx.branch)
+        known = gate.check_push_target(targets)
+        if not known.ok:
+            return [known.reason]
+        assert targets is not None
+        source = source_by_destination.get(destination, "HEAD")
+        updates.append((source, targets[0]))
+
+    for source, branch in updates:
+        reasons = _push_gate_for_branch(branch, source, ctx)
         if reasons:
             return reasons
     return []

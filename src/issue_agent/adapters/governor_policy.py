@@ -293,6 +293,12 @@ class PushArgs:
     candidate_refspecs: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class PushRefspec:
+    source: str
+    destination: str
+
+
 def parse_push_args(push_words: list[str]) -> PushArgs:
     """Tokenised `git push …` args → `PushArgs`. `push_words[0]` may be the
     `push` subcommand itself (the slice `_git_subcommand` hands back)."""
@@ -330,6 +336,21 @@ def parse_push_args(push_words: list[str]) -> PushArgs:
     return PushArgs(has_force=has_force, is_delete=is_delete, candidate_refspecs=candidates)
 
 
+def _parse_refspec(refspec: str, *, is_delete: bool = False) -> tuple[PushRefspec, bool]:
+    forced = refspec.startswith("+")
+    body = refspec[1:] if forced else refspec
+    if ":" in body:
+        source, destination = body.split(":", 1)
+    else:
+        source = destination = body
+    if is_delete:
+        source = ""
+    return (
+        PushRefspec(source, destination.removeprefix("refs/heads/")),
+        forced,
+    )
+
+
 def _refspec_destination(refspec: str) -> tuple[str, bool]:
     """(destination ref, is_plus_forced) for a refspec, WITHOUT truncating the
     ref: `+a:b`→(b,True); `+a`→(a,True); `a:b`→(b,False); `a`→(a,False), and a
@@ -337,10 +358,17 @@ def _refspec_destination(refspec: str) -> tuple[str, bool]:
 
     Keeping the whole name matters for the push gate — `is_governed_branch`
     needs `fix/42-x`, not the trailing path component `42-x`."""
-    forced = refspec.startswith("+")
-    body = refspec[1:] if forced else refspec
-    dst = body.split(":", 1)[1] if ":" in body else body
-    return dst.removeprefix("refs/heads/"), forced
+    parsed, forced = _parse_refspec(refspec)
+    return parsed.destination, forced
+
+
+def push_refspecs(push_words: list[str]) -> tuple[PushRefspec, ...]:
+    """Explicit push updates as aligned source/destination refs."""
+    parsed = parse_push_args(push_words)
+    return tuple(
+        _parse_refspec(refspec, is_delete=parsed.is_delete)[0]
+        for refspec in parsed.candidate_refspecs
+    )
 
 
 def push_destination_refs(push_words: list[str]) -> tuple[str, ...]:
@@ -358,10 +386,7 @@ def push_destination_refs(push_words: list[str]) -> tuple[str, ...]:
     fix/42-x` and `git push -u origin fix/42-x` are seen identically by both.
     A bare `HEAD`/`@` destination is returned verbatim; resolving it against the
     checked-out branch is policy, and policy lives in the domain."""
-    return tuple(dict.fromkeys(
-        _refspec_destination(r)[0]
-        for r in parse_push_args(push_words).candidate_refspecs
-    ))
+    return tuple(dict.fromkeys(item.destination for item in push_refspecs(push_words)))
 
 
 def _push_destructive_target(push_words: list[str]) -> str | None:

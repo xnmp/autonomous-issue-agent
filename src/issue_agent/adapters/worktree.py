@@ -453,6 +453,21 @@ def build_gate_context(
     def exists_at_head(path: str) -> bool:
         return git(["cat-file", "-e", f"HEAD:{path}"], cwd).code == 0
 
+    def push_source_matches_head(source: str) -> bool:
+        if not source:
+            return False
+        source_commit = git(
+            ["rev-parse", "--verify", "--quiet", f"{source}^{{commit}}"], cwd
+        )
+        head_commit = git(
+            ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], cwd
+        )
+        return (
+            source_commit.code == 0
+            and head_commit.code == 0
+            and source_commit.out.strip() == head_commit.out.strip()
+        )
+
     def _default_run_tests(cmd: str) -> bool | None:
         """Run the test command via `governor.run_target_command` (env scrub +
         re-entrancy bound + process-group kill on timeout — the #63 defenses).
@@ -524,6 +539,7 @@ def build_gate_context(
         env_test_cmd=env_test_cmd,
         exists_at_base=exists_at_base,
         exists_at_head=exists_at_head,
+        push_source_matches_head=push_source_matches_head,
         run_tests=rt,
         revert_and_run=revert_and_run,
         red_must_fail=red_must_fail,
