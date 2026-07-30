@@ -288,6 +288,7 @@ class JournalingRuntime:
                     is_error=True,
                     status="raised",
                     cost_usd=0.0,
+                    model=str(getattr(exc, "harness_resolved_model", "") or ""),
                     exit_reason=ExitReason.TRANSPORT_DEATH,
                 ),
                 time.monotonic() - t0,
@@ -369,13 +370,10 @@ class JournalingRuntime:
                 number=ctx.number,
                 issue=ctx.issue,
                 dispatch=ctx.dispatch_id,
-                # The model the RUN reports beats the one the task asked for:
-                # an unpinned task carries None and the runtime supplied its own
-                # default, so `task.model` recorded nothing for a leg that
-                # certainly ran on something — and "split cost by routed model
-                # tier" had no field to split on (#43). A runtime that reports
-                # nothing falls back to the task, as before.
-                model=(getattr(result, "model", "") or task.model or ""),
+                # A configured task model is the operator-selected journal
+                # attribution and must match the start receipt. Only an unpinned
+                # task needs the runtime's resolved default to identify its leg.
+                model=(task.model or getattr(result, "model", "") or ""),
                 duration_s=round(duration_s, 1),
                 cost_usd=cost,
                 cost_estimated_usd=(estimated or None),
@@ -403,7 +401,7 @@ class JournalingRuntime:
                     number=ctx.number,
                     issue=ctx.issue,
                     dispatch=ctx.dispatch_id,
-                    model=(getattr(result, "model", "") or task.model or ""),
+                    model=(task.model or getattr(result, "model", "") or ""),
                     session_id=result.session_id,
                     warning=telemetry_warning,
                 )
@@ -416,7 +414,7 @@ class JournalingRuntime:
                 self.ledger.emit(
                     "spend", repo=self.repo, issue=ctx.issue, kind=ctx.kind,
                     role=ctx.role, runtime=self.runtime,
-                    model=(getattr(result, "model", "") or task.model or ""),
+                    model=(task.model or getattr(result, "model", "") or ""),
                     cost_usd=billed, estimated=(cost <= 0) or None, usage=usage,
                 )
         except Exception as exc:  # noqa: BLE001 — never fail a run over its receipt

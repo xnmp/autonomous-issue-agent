@@ -686,6 +686,31 @@ def test_a_runtime_that_reports_no_model_still_falls_back_to_the_task(tmp_path):
     assert _settled(journal.path)[0]["model"] == "opus"
 
 
+def test_configured_model_precedes_runtime_model_in_every_journal_receipt(tmp_path):
+    """Configured model attribution stays consistent across journal and spend records."""
+    rt, journal, ledger = _runtime(
+        tmp_path,
+        AgentResult(
+            is_error=False,
+            cost_usd=1.0,
+            model="claude-opus-4-1",
+            telemetry_warning="missing usage",
+        ),
+    )
+
+    asyncio.run(rt.run(AgentTask(prompt="p", model="opus")))
+
+    assert {
+        event["event"]: event["model"]
+        for event in read_events(journal.path)
+    } == {
+        "agent_run_start": "opus",
+        "agent_run": "opus",
+        "telemetry_warning": "opus",
+    }
+    assert read_events(ledger)[0]["model"] == "opus"
+
+
 def test_result_is_returned_unchanged_and_inner_still_sees_the_task(tmp_path):
     expected = AgentResult(is_error=False, status="done")
     rt, _, _ = _runtime(tmp_path, expected)
@@ -778,6 +803,18 @@ def test_a_run_that_raises_is_settled_as_a_transport_death_and_re_raises(tmp_pat
     assert "RuntimeError" in settled["error"] and "Stream closed" in settled["error"]
     # A session that never delivered a result costs nothing to attribute.
     assert read_events(ledger) == []
+
+
+def test_review_with_a_configured_model_journals_it_at_start_and_settlement(tmp_path):
+    """A configured REVIEW_MODEL is visible before and after the SDK session."""
+    rt, journal, _ = _runtime(tmp_path, AgentResult(is_error=False))
+    rt.set_context("review", "REVIEW", 100, 91)
+
+    asyncio.run(rt.run(AgentTask(prompt="review", model="claude-opus-4-1")))
+
+    start, settled = read_events(journal.path)
+    assert start["model"] == "claude-opus-4-1"
+    assert settled["model"] == "claude-opus-4-1"
 
 
 def test_a_deterministic_death_is_journaled_distinctly_with_the_offending_path(tmp_path):
