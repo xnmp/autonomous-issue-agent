@@ -165,6 +165,9 @@ class ImmediateGitHubEffectExecutor:
     def reconcile(self, action: Action) -> bool | None:
         return GitHubEffectExecutor._reconcile(self, action)
 
+    def drain_pending_commands(self) -> int:
+        return 0
+
 
 class GitHubEffectExecutor:
     """Execute only commands first committed to the control store."""

@@ -21,7 +21,6 @@ import time
 
 from ..adapters.github import GhUnavailable
 from ..adapters.journal import alert
-from ..adapters.store import encode_lifecycle_action
 from ..domain.actions import (
     Action,
     AddDependency,
@@ -87,15 +86,35 @@ def _is_advisory_relabel(action: Relabel) -> bool:
 def _action_spec(action: Action) -> tuple[str, str, int | None, dict]:
     """Return one structured telemetry shape for every action verb."""
 
-    if isinstance(action, _DURABLE_ACTIONS):
-        raw = encode_lifecycle_action(action)
-        target = str(raw.get("target") or (
-            "PR" if isinstance(action, EscalateCiPending) else "ISSUE"
-        )).lower()
-        number = (
-            action.pr if isinstance(action, EscalateCiPending) else action.number
-        )
-        return str(raw["type"]), target, number, raw
+    if isinstance(action, Relabel):
+        return "relabel", action.target.name.lower(), action.number, {
+            "type": "relabel",
+            "target": action.target.name,
+            "number": action.number,
+            "remove": action.remove.value if action.remove else None,
+            "add": action.add.value if action.add else None,
+        }
+    if isinstance(action, PostComment):
+        return "comment", action.target.name.lower(), action.number, {
+            "type": "comment",
+            "target": action.target.name,
+            "number": action.number,
+            "body": action.body,
+        }
+    if isinstance(action, CloseIssue):
+        return "close", "issue", action.number, {
+            "type": "close",
+            "number": action.number,
+            "reason": action.reason,
+            "comment": action.comment,
+        }
+    if isinstance(action, EscalateCiPending):
+        return "escalate_ci_pending", "pr", action.pr, {
+            "type": "escalate_ci_pending",
+            "pr": action.pr,
+            "head": action.head,
+            "body": action.body,
+        }
     if isinstance(action, EnableAutoMerge):
         return "enable_auto_merge", "pr", action.pr, {
             "type": "enable_auto_merge", "pr": action.pr, "method": action.method,
@@ -195,6 +214,9 @@ class MissingEffectExecutor:
     def reconcile(self, _action: Action) -> bool | None:
         raise RuntimeError("durable effect executor is not configured")
 
+    def drain_pending_commands(self) -> int:
+        raise RuntimeError("durable effect executor is not configured")
+
 
 class Executor:
     """Applies Actions. `gateway` is a GitHubGateway (or fake). `remove_worktree`
@@ -213,7 +235,6 @@ class Executor:
         clear_issue_state: Callable[[int, int | None, bool], None] | None = None,
         journal=None,
         alert_cmd: str = "",
-        pending_actions=None,
         retry_delays: tuple[float, ...] = _DEFAULT_RETRY_DELAYS,
         sleep: Callable[[float], None] = time.sleep,
         effect_executor=None,
@@ -257,11 +278,6 @@ class Executor:
         # from a file instead of a human eyeballing rotated stderr. None = off.
         self._journal = journal
         self._alert_cmd = alert_cmd
-        # STATE_DIR-backed queue shared with Daemon.tick. A terminal write that
-        # exhausts its immediate transient retries remains here across process
-        # death/hot reload; the next tick drains it before observing or buying
-        # another session.
-        self._pending_actions = pending_actions
         self._retry_delays = retry_delays
         self._sleep = sleep
         self._effect_executor = effect_executor or MissingEffectExecutor()
@@ -487,11 +503,6 @@ class Executor:
             return attempts
         except _TRANSIENT_WRITE_ERRORS as exc:
             last = exc
-        if (
-            isinstance(last, LifecycleWriteUnverified)
-            and self._pending_actions is None
-        ):
-            raise last
         for delay in self._retry_delays:
             if self._journal is not None:
                 self._journal.emit(
@@ -523,14 +534,6 @@ class Executor:
                 last = exc
         raise last
 
-    def _persist_pending(self, action: Action) -> bool:
-        if self._pending_actions is None:
-            return False
-        pending = self._pending_actions.load_pending_actions()
-        if action not in pending:
-            self._pending_actions.save_pending_actions((*pending, action))
-        return True
-
     def execute(self, action: Action, *, replayed: bool = False) -> None:
         if isinstance(action, RunAgent):
             self._execute(action, replayed=replayed)
@@ -556,10 +559,9 @@ class Executor:
             else:
                 self._apply_once(action)
         except Exception as exc:
-            pending = (
+            retryable = (
                 isinstance(action, _DURABLE_ACTIONS)
                 and isinstance(exc, _TRANSIENT_WRITE_ERRORS)
-                and self._persist_pending(action)
             )
             if self._journal is not None:
                 self._journal.emit(
@@ -569,7 +571,7 @@ class Executor:
                             desc,
                             (
                                 "retryable_failure"
-                                if pending
+                                if retryable
                                 else "permanent_failure"
                             ),
                             str(exc),
@@ -578,10 +580,7 @@ class Executor:
                         _action_correlation(action),
                     )
                 )
-            if (
-                isinstance(exc, LifecycleWriteUnverified)
-                and self._pending_actions is None
-            ):
+            if isinstance(exc, LifecycleWriteUnverified):
                 return
             raise
         if self._journal is not None:
@@ -606,70 +605,24 @@ class Executor:
             return self._replay_pending()
 
     def _replay_pending(self) -> bool:
-        """Replay durable writes, quarantining unverifiable entries after the bound."""
-        if self._pending_actions is None:
-            return True
+        """Drain the SQLite lifecycle-command authority before new decisions."""
         try:
-            pending = self._pending_actions.load_pending_actions()
-        except (OSError, ValueError) as exc:
-            self._log(f"FAILED: cannot read pending lifecycle actions — {exc}")
+            self._effect_executor.drain_pending_commands()
+            return True
+        except Exception as exc:
+            self._log(f"FAILED: cannot drain lifecycle commands — {exc}")
             if self._journal is not None:
                 self._journal.emit(
                     TelemetryEvent(
                         ActionFailed(
                             None,
-                            "load pending lifecycle actions",
+                            "drain lifecycle commands",
                             "retryable_failure",
                             str(exc),
                         )
                     )
                 )
             return False
-        for index, action in enumerate(pending):
-            try:
-                self.execute(action, replayed=True)
-                self._pending_actions.save_pending_actions(pending[index + 1 :])
-            except LifecycleWriteUnverified as exc:
-                # A non-raising GitHub write followed by an unverifiable read is
-                # not evidence of an outage: stale/locked PRs and benign gh read
-                # failures all reach this arm. One immediate retry cycle plus one
-                # queued replay is the bound. Preserve the action for inspection,
-                # alert loudly, and let unrelated issues continue to converge.
-                try:
-                    self._pending_actions.quarantine_pending_action(action)
-                    self._pending_actions.save_pending_actions(
-                        pending[index + 1 :]
-                    )
-                except (OSError, ValueError) as quarantine_exc:
-                    self._log(
-                        f"FAILED: cannot quarantine pending lifecycle action — "
-                        f"{quarantine_exc}"
-                    )
-                    return False
-                desc = self._describe(action)
-                self._log(f"QUARANTINED: {desc} — {exc}")
-                fields = {"desc": desc, "error": str(exc)}
-                if self._journal is not None:
-                    self._journal.emit(
-                        TelemetryEvent(
-                            TelemetryWarning(
-                                "action_quarantined",
-                                str(exc),
-                                fields,
-                            ),
-                            _action_correlation(action),
-                        )
-                    )
-                alert(
-                    self._alert_cmd,
-                    json.dumps(
-                        {"event": "action_quarantined", **fields},
-                        sort_keys=True,
-                    ),
-                )
-            except Exception:
-                return False
-        return True
 
     def execute_all(self, actions) -> bool:
         """Apply every action, even if one raises (review S7): before this, one

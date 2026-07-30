@@ -113,7 +113,8 @@ admission; malformed or unattributed rows require operator repair.
 The 2026-07-31 migration rehearsal replayed 303 real historical rows twice,
 matched source digest/count/amount/window, passed SQLite integrity, and
 completed an admitted-and-settled primary-store canary without changing the
-legacy source. Machine-readable evidence is in
+legacy source. The canary was executed against the pre-existing live primary
+database, not a temporary rehearsal store. Machine-readable evidence is in
 `control-store-migration-evidence.json`.
 JSONL is bounded
 schema-v2 telemetry and a projection feed; losing it cannot authorize a write,
@@ -126,8 +127,9 @@ The dashboard is a read-only projection consumer. Its canonical operational
 model is rebuilt by the pure `domain/projection.py::fold` over schema-v2
 events; GitHub reads may enrich titles and URLs but never infer lifecycle
 success or turn an unavailable observation into an empty world.
-Per-role scheduler heartbeats supply liveness freshness when an unchanged world
-correctly emits no new observation event.
+Per-role scheduler heartbeats supply scheduler-health freshness when an
+unchanged world correctly emits no new observation event; they do not infer
+process liveness.
 If process discovery is unavailable, dashboard liveness is `unknown`; recent
 activity is never promoted into proof that a role is alive or dead.
 Event streams retain eight rotated files plus the current file. Rotation writes
@@ -149,6 +151,11 @@ that matters is not "wrong answer" but "loop that bills forever":
 - repository/global/issue caps over atomic SQLite reservations; an armed cap
   blocks admission if accounting is unavailable or the runtime is unpriceable
 
+Provider-billed runtimes settle their reported cost. Subscription runtimes
+whose provider reports zero use the configured versioned rate card as an
+explicit synthetic token meter, so sequential Claude/GLM work cannot release
+its reservation back to a nominally armed cap at zero.
+
 Counters decay on any leg that returns a result, so the ceilings bound
 *consecutive* failure rather than accumulating over a healthy issue's lifetime.
 
@@ -158,6 +165,12 @@ executor and store, and asserts a frozen world reaches a steady state without
 buying sessions. **Any new dispatch leg or retry counter needs a row there.**
 
 ## Process supervision
+
+The accounting run ID is also the process-supervision ID. Before an agent
+command executes, its child wrapper verifies the launcher's PID/start identity,
+persists PID/PGID/start-ticks in the SQLite `leases` table, and verifies the
+launcher again. A launcher death before registration refuses `exec`; a death
+after registration is recoverable through the same authoritative run record.
 
 Each deployment has a role/repository/checkout-scoped lock and a stable
 deployment identity. Startup validates configuration, lock ownership, the

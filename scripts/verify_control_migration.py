@@ -6,7 +6,6 @@ import argparse
 import hashlib
 import json
 import sqlite3
-import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -131,6 +130,7 @@ def verify(
             "legacy replay window is "
             f"{summary.representative_hours}h; require {minimum_hours}h"
         )
+    database_preexisting = database.is_file() and database.stat().st_size > 0
     store = SQLiteControlStore(str(database))
     store.initialize()
     imported = store.import_legacy_spend(str(source))
@@ -211,12 +211,17 @@ def verify(
         "shadow": {
             "rows_match": True,
             "totals_match": True,
+            "rejected_rows_match": imported.rejected == summary.rejected,
             "idempotent_replay": True,
+            "representative_hours": summary.representative_hours,
         },
         "primary_canary": {
             "repository": canary_repository,
+            "database": str(database.resolve()),
+            "database_preexisting": database_preexisting,
             "admitted": True,
             "settled": True,
+            "amount_micros": 1,
             "legacy_export_unchanged": True,
         },
         "database_integrity": "ok",
@@ -226,29 +231,22 @@ def verify(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("ledger", type=Path)
-    parser.add_argument("--database", type=Path)
+    parser.add_argument("--database", type=Path, required=True)
     parser.add_argument("--canary-repository", required=True)
     parser.add_argument("--minimum-hours", type=float, default=24)
     args = parser.parse_args()
     if args.minimum_hours < 0:
         raise SystemExit("--minimum-hours cannot be negative")
-    if args.database is not None:
-        report = verify(
-            args.ledger,
-            args.database,
-            canary_repository=args.canary_repository,
-            minimum_hours=args.minimum_hours,
+    if not args.database.is_file() or args.database.stat().st_size <= 0:
+        raise SystemExit(
+            "--database must name an existing primary control store"
         )
-    else:
-        with tempfile.TemporaryDirectory(
-            prefix="issue-agent-migration-"
-        ) as raw:
-            report = verify(
-                args.ledger,
-                Path(raw) / "control.db",
-                canary_repository=args.canary_repository,
-                minimum_hours=args.minimum_hours,
-            )
+    report = verify(
+        args.ledger,
+        args.database,
+        canary_repository=args.canary_repository,
+        minimum_hours=args.minimum_hours,
+    )
     print(json.dumps(report, indent=2, sort_keys=True))
 
 

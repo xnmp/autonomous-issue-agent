@@ -6,10 +6,22 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from issue_agent.adapters.child_env import CHILD_ENV_MANIFEST
+from issue_agent.adapters.control_store import (
+    ReservationRequest,
+    SQLiteControlStore,
+)
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
-from issue_agent.domain.contracts import RunId
+from issue_agent.domain.contracts import (
+    BudgetScope,
+    Money,
+    PriceQuote,
+    ReservationId,
+    RunId,
+)
 
 
 def _wait_dead(process: subprocess.Popen[bytes]) -> None:
@@ -17,6 +29,35 @@ def _wait_dead(process: subprocess.Popen[bytes]) -> None:
     while process.poll() is None and time.monotonic() < deadline:
         time.sleep(0.02)
     assert process.poll() is not None
+
+
+def _reserve_paid_run(
+    store: SQLiteControlStore,
+    run_id: RunId,
+) -> ReservationRequest:
+    now = datetime.now(timezone.utc)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    request = ReservationRequest(
+        ReservationId(f"reservation-{run_id}"),
+        run_id,
+        f"dispatch-{run_id}",
+        BudgetScope(
+            "o/r",
+            "repository",
+            "USD",
+            now.date().isoformat(),
+            start,
+            start + timedelta(days=1),
+            ZoneInfo("UTC"),
+        ),
+        PriceQuote("model", "test", "1", now, Money("USD", 1)),
+        Money("USD", 10),
+        "cfg",
+        kind="RESOLVE",
+        owner_id="o/r:fix",
+    )
+    assert store.reserve(request).admitted
+    return request
 
 
 def test_registered_process_group_is_killed_and_receipt_removed(tmp_path) -> None:
@@ -166,6 +207,85 @@ def test_supervised_command_registers_before_work_executes(tmp_path) -> None:
 
     supervisor.kill_tree(run_id)
     _wait_dead(process)
+
+
+def test_supervised_paid_command_registers_the_sqlite_run_lease(tmp_path) -> None:
+    state_dir = tmp_path / "state"
+    supervisor = ProcessSupervisor(str(state_dir), grace_seconds=0.05)
+    store = SQLiteControlStore(str(tmp_path / "control.db"))
+    store.initialize()
+    run_id = RunId("paid-run")
+    request = _reserve_paid_run(store, run_id)
+    command = supervisor.supervised_command(
+        run_id,
+        (sys.executable, "-c", "import time; time.sleep(30)"),
+    )
+
+    process = subprocess.Popen(
+        command,
+        start_new_session=True,
+        env={
+            **os.environ,
+            **supervisor.launch_guard_env(),
+            "ISSUE_AGENT_CONTROL_DB": store.path,
+            "ISSUE_AGENT_RUN_ID": str(run_id),
+        },
+    )
+    deadline = time.monotonic() + 3
+    while not store.leases() and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    lease = store.leases()[0]
+    assert lease.run_id == run_id
+    assert lease.dispatch_id == request.dispatch_id
+    assert lease.owner_id == request.owner_id
+    assert lease.pid == process.pid
+    assert lease.pgid == process.pid
+    assert lease.process_start_ticks > 0
+
+    supervisor.kill_tree(run_id)
+    _wait_dead(process)
+    store.release(run_id, "test complete")
+    assert store.leases() == ()
+
+
+def test_supervised_paid_command_refuses_exec_after_launcher_death(
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    supervisor = ProcessSupervisor(str(state_dir), grace_seconds=0.05)
+    store = SQLiteControlStore(str(tmp_path / "control.db"))
+    store.initialize()
+    run_id = RunId("orphaned-launch")
+    _reserve_paid_run(store, run_id)
+    marker = tmp_path / "paid-command-started"
+    command = supervisor.supervised_command(
+        run_id,
+        (
+            sys.executable,
+            "-c",
+            f"from pathlib import Path; Path({str(marker)!r}).write_text('bad')",
+        ),
+    )
+
+    completed = subprocess.run(
+        command,
+        start_new_session=True,
+        env={
+            **os.environ,
+            "ISSUE_AGENT_CONTROL_DB": store.path,
+            "ISSUE_AGENT_RUN_ID": str(run_id),
+            "ISSUE_AGENT_SUPERVISOR_PARENT_PID": "99999999",
+            "ISSUE_AGENT_SUPERVISOR_PARENT_START_TICKS": "1",
+        },
+        check=False,
+        capture_output=True,
+    )
+
+    assert completed.returncode != 0
+    assert not marker.exists()
+    assert store.leases() == ()
+    assert supervisor.registrations() == ()
 
 
 def test_supervised_sdk_cli_registers_session_before_target_executes(

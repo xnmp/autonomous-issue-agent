@@ -484,7 +484,8 @@ class AgentRunner(AgentRuntime):
         import claude_agent_sdk
         from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
-        supervised_run_id = RunId(uuid.uuid4().hex)
+        accounting_run_id = task.env.get("ISSUE_AGENT_RUN_ID", "")
+        supervised_run_id = RunId(accounting_run_id or uuid.uuid4().hex)
         kwargs = build_option_kwargs(
             task, self.permission_mode, self.hooks, self._max_buffer_size
         )

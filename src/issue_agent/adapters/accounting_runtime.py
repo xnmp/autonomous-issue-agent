@@ -196,11 +196,24 @@ class AccountingRuntime(AgentRuntime):
         self, run_id: RunId, model: str | None, result: AgentResult
     ) -> AgentResult:
         usage = _token_usage(result.usage, self.runtime_name)
-        if (
+        provider_amount = Money(
+            "USD",
+            int(
+                (Decimal(str(result.cost_usd)) * 1_000_000).quantize(
+                    Decimal("1"), rounding=ROUND_HALF_UP
+                )
+            ),
+        )
+        priced_by_rate_card = (
             self.rate_table is not None
             and usage is not None
             and usage.trusted_for_accounting
-        ):
+            and not (
+                self.runtime_name != "codex"
+                and provider_amount.micros > 0
+            )
+        )
+        if priced_by_rate_card:
             if not model:
                 raise RuntimeError("configured-rate settlement needs a model")
             amount = price(
@@ -208,19 +221,16 @@ class AccountingRuntime(AgentRuntime):
                 self.rate_table.rates_for(model),
                 self.rate_table.currency,
             )
-            basis = PricingBasis.CONFIGURED_RATE_CARD
-        else:
-            amount = Money(
-                "USD",
-                int(
-                    (Decimal(str(result.cost_usd)) * 1_000_000).quantize(
-                        Decimal("1"), rounding=ROUND_HALF_UP
-                    )
-                ),
+            basis = (
+                PricingBasis.CONFIGURED_RATE_CARD
+                if self.runtime_name == "codex"
+                else PricingBasis.SYNTHETIC
             )
+        else:
+            amount = provider_amount
             basis = (
                 PricingBasis.SYNTHETIC
-                if result.cost_usd <= 0
+                if provider_amount.micros <= 0
                 else PricingBasis.PROVIDER_REPORTED
             )
         settlement = self.store.settle(
@@ -230,18 +240,12 @@ class AccountingRuntime(AgentRuntime):
                 basis,
                 result.session_id or f"run:{run_id}",
                 usage,
-                (
-                    self.rate_table.rate_card_id
-                    if basis is PricingBasis.CONFIGURED_RATE_CARD
-                    and self.rate_table is not None
-                    else None
-                ),
-                (
-                    self.rate_table.version
-                    if basis is PricingBasis.CONFIGURED_RATE_CARD
-                    and self.rate_table is not None
-                    else None
-                ),
+                self.rate_table.rate_card_id
+                if priced_by_rate_card and self.rate_table is not None
+                else None,
+                self.rate_table.version
+                if priced_by_rate_card and self.rate_table is not None
+                else None,
             )
         )
         if settlement.disposition is not AccountingDisposition.AVAILABLE:

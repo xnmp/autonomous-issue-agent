@@ -650,7 +650,6 @@ def test_suspend_recovery_never_replays_actions_from_telemetry(tmp_path):
         Executor(
             gateway,
             journal=journal,
-            pending_actions=Store(str(tmp_path / "state")),
             retry_delays=(),
         ),
         poll_seconds=60,

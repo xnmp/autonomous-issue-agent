@@ -86,10 +86,9 @@ stop. Never self-modify mid-batch.
 - **`gh` label/state searches are stale for recently closed objects** —
   verify with a direct `gh issue view` before acting on a search result.
 - **Terminal GitHub writes are durable.** A comment/relabel/close that exhausts
-  transient retries is stored in the role's `STATE_DIR/pending-actions.json`;
-  the daemon drains that queue before its next world read, reaper pass, or paid
-  dispatch. A write that remains unverifiable after queued replay is alerted and
-  moved to `quarantined-actions.json` so it cannot halt unrelated issues. If a
-  role appears idle with GitHub healthy, inspect both files and the journal's
-  `action_failed`/`action_retry`/`action_quarantined` events before re-queuing
-  work.
+  transient retries remains a `lifecycle_commands` row in the SQLite control
+  store. The daemon drains that authority before its next world read, reaper
+  pass, or paid dispatch; ambiguous outcomes are reconciled against GitHub
+  before another occurrence is issued. If a role appears idle with GitHub
+  healthy, inspect nonterminal lifecycle commands and the typed
+  `action_failed`/`action_retry` events before re-queuing work.

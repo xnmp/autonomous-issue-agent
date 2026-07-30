@@ -272,8 +272,6 @@ def _budget_policy(cfg: HarnessConfig) -> BudgetPolicy:
 def _rate_table(
     cfg: HarnessConfig, runtime_name: str
 ) -> RateTable | None:
-    if runtime_name != RuntimeName.CODEX.value:
-        return None
     try:
         fallback = ModelRates(
             usd_per_million_to_micros(cfg.codex_cost_per_mtok_in),
@@ -296,7 +294,11 @@ def _rate_table(
     except ValueError:
         return None
     return RateTable(
-        "codex-config",
+        (
+            "codex-config"
+            if runtime_name == RuntimeName.CODEX.value
+            else f"{runtime_name}-synthetic-config"
+        ),
         cfg.config_version,
         "USD",
         rates,
@@ -1571,7 +1573,6 @@ def build_fix_daemon(
         mark_ci_pending_escalated=store.set_ci_pending_escalated_head,
         clear_issue_state=store.cleanup_pr,
         journal=journal, alert_cmd=cfg.alert_cmd,
-        pending_actions=store,
         effect_executor=effect_executor.actions,
     )
     # Wrapped LAST, so the decorator sees whichever runtime actually ran (Claude or
@@ -1868,7 +1869,6 @@ def build_review_daemon(
         log=_log("review"),
         journal=journal,
         alert_cmd=cfg.alert_cmd,
-        pending_actions=store,
         effect_executor=effect_executor.actions,
     )
     dispatcher = AgentDispatcher(
@@ -2029,7 +2029,6 @@ def build_steward_daemon(
         log=steward_log,
         journal=journal,
         alert_cmd=cfg.alert_cmd,
-        pending_actions=store,
         effect_executor=effect_executor.actions,
     )
     dispatcher = AgentDispatcher(

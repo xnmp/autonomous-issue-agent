@@ -20,15 +20,6 @@ import json
 import os
 from dataclasses import dataclass
 
-from ..domain.actions import (
-    Action,
-    CloseIssue,
-    EscalateCiPending,
-    PostComment,
-    Relabel,
-    Target,
-)
-from ..domain.labels import Label
 from ..domain.world import normalize_predicted_paths
 
 # ── suffix universe (review M4/D8) ──────────────────────────────────────────
@@ -66,99 +57,6 @@ _PR_SUFFIXES = (
 _RESUME_STATE_SUFFIXES = ("session", "phase", "resumed-at")
 
 
-def encode_lifecycle_action(action: Action) -> dict[str, object]:
-    """Lossless JSON shape shared by the pending queue and action journal."""
-    if isinstance(action, Relabel):
-        return {
-            "type": "relabel",
-            "target": action.target.name,
-            "number": action.number,
-            "remove": action.remove.value if action.remove else None,
-            "add": action.add.value if action.add else None,
-        }
-    if isinstance(action, PostComment):
-        return {
-            "type": "comment",
-            "target": action.target.name,
-            "number": action.number,
-            "body": action.body,
-        }
-    if isinstance(action, CloseIssue):
-        return {
-            "type": "close",
-            "number": action.number,
-            "reason": action.reason,
-            "comment": action.comment,
-        }
-    if isinstance(action, EscalateCiPending):
-        return {
-            "type": "escalate_ci_pending",
-            "pr": action.pr,
-            "head": action.head,
-            "body": action.body,
-        }
-    raise TypeError(f"action is not a durable lifecycle write: {action!r}")
-
-
-def _required_string(raw: dict, field: str) -> str:
-    value = raw.get(field)
-    if not isinstance(value, str):
-        raise TypeError(f"{field} must be a string")
-    return value
-
-
-def _required_number(raw: dict, field: str) -> int:
-    value = raw.get(field)
-    if type(value) is not int or value <= 0:
-        raise TypeError(f"{field} must be a positive integer")
-    return value
-
-
-def _optional_label(raw: dict, field: str) -> Label | None:
-    value = raw.get(field)
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        raise TypeError(f"{field} must be a string or null")
-    return Label(value)
-
-
-def decode_lifecycle_action(raw: object) -> Action:
-    """Decode a journal/queue payload without guessing malformed legacy rows."""
-    if not isinstance(raw, dict):
-        raise ValueError("lifecycle action must be an object")
-    kind = raw.get("type")
-    try:
-        if kind == "relabel":
-            return Relabel(
-                Target[_required_string(raw, "target")],
-                _required_number(raw, "number"),
-                _optional_label(raw, "remove"),
-                _optional_label(raw, "add"),
-            )
-        if kind == "comment":
-            return PostComment(
-                Target[_required_string(raw, "target")],
-                _required_number(raw, "number"),
-                _required_string(raw, "body"),
-            )
-        if kind == "close":
-            return CloseIssue(
-                _required_number(raw, "number"),
-                _required_string(raw, "reason"),
-                _required_string(raw, "comment"),
-            )
-        if kind == "escalate_ci_pending":
-            return EscalateCiPending(
-                _required_number(raw, "pr"),
-                _required_string(raw, "head"),
-                _required_string(raw, "body"),
-            )
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(f"invalid lifecycle action: {raw!r}") from exc
-    raise ValueError(f"unknown lifecycle action type: {kind!r}")
-
-
 @dataclass(frozen=True)
 class Store:
     """STATE_DIR-rooted per-issue/PR daemon state. `state_dir` is the bash
@@ -190,18 +88,6 @@ class Store:
 
     def groom_content_path(self, issue: int) -> str:
         return os.path.join(self.state_dir, f"groom-{issue}.content")
-
-    def pending_actions_path(self) -> str:
-        """Role-wide lifecycle queue.
-
-        This is deliberately not an issue/PR suffix: one daemon owns the queue,
-        and issue cleanup must never erase an unacknowledged GitHub write.
-        """
-        return os.path.join(self.state_dir, "pending-actions.json")
-
-    def quarantined_actions_path(self) -> str:
-        """Lifecycle writes that remained unverifiable after queued replay."""
-        return os.path.join(self.state_dir, "quarantined-actions.json")
 
     # ── generic thin IO ──
     def _read(self, path: str) -> str:
@@ -255,65 +141,6 @@ class Store:
 
     def save_branch(self, issue: int, branch: str) -> None:
         self._write(self.issue_path(issue, "branch"), branch)
-
-    # ── durable terminal lifecycle writes (#64) ──
-    @staticmethod
-    def _encode_pending_action(action: Action) -> dict[str, object]:
-        return encode_lifecycle_action(action)
-
-    @staticmethod
-    def _decode_pending_action(raw: object) -> Action:
-        return decode_lifecycle_action(raw)
-
-    def _load_action_queue(
-        self, path: str, *, description: str
-    ) -> tuple[Action, ...]:
-        try:
-            with open(path) as queue:
-                raw = queue.read()
-        except FileNotFoundError:
-            return ()
-        except OSError as exc:
-            raise OSError(f"{description} is unreadable: {path}") from exc
-        if not raw.strip():
-            raise ValueError(f"{description} is empty")
-        try:
-            values = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"{description} is malformed") from exc
-        if not isinstance(values, list):
-            raise ValueError(f"{description} must be a JSON list")
-        return tuple(self._decode_pending_action(value) for value in values)
-
-    def _save_action_queue(self, path: str, actions: tuple[Action, ...]) -> None:
-        if not actions:
-            self._remove(path)
-            return
-        encoded = [self._encode_pending_action(action) for action in actions]
-        self._write(path, json.dumps(encoded, separators=(",", ":"), sort_keys=True))
-
-    def load_pending_actions(self) -> tuple[Action, ...]:
-        return self._load_action_queue(
-            self.pending_actions_path(),
-            description="pending lifecycle queue",
-        )
-
-    def save_pending_actions(self, actions: tuple[Action, ...]) -> None:
-        self._save_action_queue(self.pending_actions_path(), actions)
-
-    def load_quarantined_actions(self) -> tuple[Action, ...]:
-        return self._load_action_queue(
-            self.quarantined_actions_path(),
-            description="quarantined lifecycle queue",
-        )
-
-    def quarantine_pending_action(self, action: Action) -> None:
-        quarantined = self.load_quarantined_actions()
-        if action not in quarantined:
-            self._save_action_queue(
-                self.quarantined_actions_path(),
-                (*quarantined, action),
-            )
 
     # ── sessions (issue: resolve/resume/address-review; pr: review) ──
     def _session_for_runtime(self, raw: str) -> str:

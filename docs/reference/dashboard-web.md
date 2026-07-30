@@ -88,7 +88,7 @@ in `dashboard/`.
 { "repos": [{
     "name": "xnmp-keifu", "repo": "xnmp/keifu", "target_dir": "/path",
     "is_self": false,            // REPO matches the harness's own origin repo
-    "active": true,              // any role daemon process alive (see liveness)
+    "active": true,              // bool from process scan; null when unavailable
     "roles": [{ "role": "fix", "alive": true, "stale": false,
                 "last_event_ts": "...", "last_event": "agent_run",
                 "events": 123, "log_path": "..." }],
@@ -100,8 +100,10 @@ in `dashboard/`.
 ```
 
 Liveness: scan `/proc/*/environ` for `AGENT_ENV=` ending in
-`.active.<name>.env` (Linux-only; on scan failure fall back to the journal
-staleness heuristic and set `"liveness": "journal-heuristic"` in the payload).
+`.active.<name>.env` (Linux-only). If the scan is unavailable, return
+`active: null`, `roles[].alive: null`, and `"liveness": "unknown"`; event and
+heartbeat freshness remain activity/health signals and are never promoted to
+process-liveness authority.
 Frecency = recency-weighted event count over role journals: score
 `Σ events_in_window / age_weight` — implement as
 `3*events(24h) + events(7d) + 0.25*events(30d)`, normalised to the max; ties

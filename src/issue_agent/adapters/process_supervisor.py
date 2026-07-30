@@ -64,6 +64,19 @@ class ProcessSupervisor:
             *argv,
         )
 
+    def launch_guard_env(self) -> dict[str, str]:
+        """Identify the daemon that must remain alive through child registration."""
+
+        identity = self.process_identity(os.getpid())
+        if identity is None:
+            raise ProcessLookupError("launcher process identity is unavailable")
+        return {
+            "ISSUE_AGENT_SUPERVISOR_PARENT_PID": str(identity.pid),
+            "ISSUE_AGENT_SUPERVISOR_PARENT_START_TICKS": str(
+                identity.start_ticks
+            ),
+        }
+
     def supervised_cli(
         self, run_id: RunId, executable: str
     ) -> tuple[str, dict[str, str]]:
@@ -101,11 +114,12 @@ class ProcessSupervisor:
             "ISSUE_AGENT_SUPERVISOR_STATE_DIR": str(self.state_dir),
             "ISSUE_AGENT_SUPERVISOR_RUN_ID": str(run_id),
             "ISSUE_AGENT_SUPERVISED_TARGET": target,
+            **self.launch_guard_env(),
         }
 
     def register(
         self, run_id: RunId, pgid: int, *, leader_pid: int | None = None
-    ) -> None:
+    ) -> ProcessRegistration:
         if not str(run_id) or pgid <= 0:
             raise ValueError("run id and positive pgid are required")
         leader = self._identity_for_pid(pgid if leader_pid is None else leader_pid)
@@ -133,6 +147,7 @@ class ProcessSupervisor:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, target)
+            return ProcessRegistration(run_id, pgid, leader)
         except BaseException:
             try:
                 os.unlink(temporary)

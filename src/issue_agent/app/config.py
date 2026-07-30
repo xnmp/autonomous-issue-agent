@@ -469,11 +469,11 @@ class HarnessConfig:
     codex_rate_limit_backoff_base: float = 60.0
     codex_max_rate_limit_wait: float = 180.0
     codex_max_rate_limit_retries: int = 5
-    # Codex spend accounting (review M1/D12): roles.py prices the envelope's
-    # token usage against these USD-per-million-token rates so codex runs reach
-    # the ledger and both spend caps can see them. USD per MILLION tokens,
-    # matching provider pricing tables (not per-token, which would need too many
-    # decimal places).
+    # Runtime spend accounting (review M1/D12): roles.py prices trusted token
+    # usage against these USD-per-million-token rates whenever a provider does
+    # not report a billed cost. The legacy CODEX_* names remain configuration
+    # compatibility aliases, but the synthetic fallback also keeps Claude/GLM
+    # subscription runs visible to issue/repository/global caps.
     #
     # The defaults are gpt-5.6-sol's LIST price ($5 in / $30 out per MTok). On a
     # ChatGPT subscription the real bill is $0 — these dollars are SYNTHETIC.
@@ -764,16 +764,9 @@ class HarnessConfig:
                 self.global_daily_spend_cap_usd,
             )
         )
-        if (
-            caps_armed
-            and (
-                self.fixer_runtime is RuntimeName.CODEX
-                or self.reviewer_runtime is RuntimeName.CODEX
-            )
-            and not self.codex_budget_priceable
-        ):
+        if caps_armed and not self.codex_budget_priceable:
             errors.append(
-                "armed spend caps require positive Codex input/output pricing; "
+                "armed spend caps require positive input/output pricing; "
                 "set CODEX_COST_PER_MTOK_IN/OUT or disable every spend cap"
             )
         return tuple(errors)

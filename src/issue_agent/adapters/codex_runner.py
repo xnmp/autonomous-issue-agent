@@ -30,7 +30,7 @@ from typing import Any
 
 from .child_env import child_process_env
 from .runtime_plan import AgentRuntime, RuntimePlan, git_identity_env
-from ..domain.contracts import Money, TokenUsage, UsageSource
+from ..domain.contracts import Money, RunId, TokenUsage, UsageSource
 from ..domain.pricing import (
     BudgetSentinel,
     ModelRates,
@@ -1442,7 +1442,9 @@ class CodexRunner(AgentRuntime):
         write_spend_evidence(
             self.spend_evidence_dir, accounting_run_id, evidence
         )
-        supervision_run_id = f"codex-{uuid.uuid4().hex}"
+        supervision_run_id = RunId(
+            accounting_run_id or f"codex-{uuid.uuid4().hex}"
+        )
         spawn_argv = (
             self.process_supervisor.supervised_command(
                 supervision_run_id, argv
@@ -1450,6 +1452,8 @@ class CodexRunner(AgentRuntime):
             if self.process_supervisor is not None
             else tuple(argv)
         )
+        if self.process_supervisor is not None:
+            proc_env.update(self.process_supervisor.launch_guard_env())
         # Set cwd on the subprocess too, not only via `-C`: the resume subcommand
         # rejects `-C`, so this is how a resumed run still executes in the worktree
         # (harmless on the exec path — it matches the `-C` we also pass there).

@@ -1,7 +1,7 @@
 {
-  "command": "uv run python scripts/verify_control_migration.py /home/chong/.local/state/issue-agent/spend.jsonl --canary-repository xnmp/autonomous-issue-agent --minimum-hours 24",
+  "command": "uv run python scripts/verify_control_migration.py /home/chong/.local/state/issue-agent/spend.jsonl --database /home/chong/.local/state/issue-agent-control/control.db --canary-repository xnmp/autonomous-issue-agent --minimum-hours 24",
   "database_integrity": "ok",
-  "executed_at": "2026-07-30T15:31:17Z",
+  "executed_at": "2026-07-30T16:33:05Z",
   "legacy": {
     "accepted": 303,
     "amount_micros": 3013659291,
@@ -15,12 +15,17 @@
   "migration_version": 1,
   "primary_canary": {
     "admitted": true,
+    "amount_micros": 1,
+    "database": "/home/chong/.local/state/issue-agent-control/control.db",
+    "database_preexisting": true,
     "legacy_export_unchanged": true,
     "repository": "xnmp/autonomous-issue-agent",
     "settled": true
   },
   "shadow": {
     "idempotent_replay": true,
+    "rejected_rows_match": true,
+    "representative_hours": 98.531,
     "rows_match": true,
     "totals_match": true
   },

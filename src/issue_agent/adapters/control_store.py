@@ -770,6 +770,102 @@ class SQLiteControlStore:
                 ),
             )
 
+    def register_process_lease(
+        self,
+        run_id: RunId,
+        *,
+        pid: int,
+        pgid: int,
+        process_start_ticks: int,
+    ) -> Lease:
+        """Bind a spawned process to its reserved run before paid work executes."""
+
+        if pid <= 0 or pgid <= 0 or process_start_ticks <= 0:
+            raise ValueError("live process identity is required")
+        with self.transaction() as db:
+            run = db.execute(
+                "SELECT dispatch_id, owner_id, state FROM runs WHERE run_id=?",
+                (str(run_id),),
+            ).fetchone()
+            if run is None:
+                raise ControlStoreError(
+                    f"process lease has no reserved run: {run_id}"
+                )
+            if run["state"] in {"completed", "cancelled", "abandoned"}:
+                raise ControlStoreError(
+                    f"process lease cannot attach to terminal run: {run_id}"
+                )
+            existing = db.execute(
+                "SELECT dispatch_id, owner_id, pid, pgid, process_start_ticks, "
+                "started_at FROM leases WHERE run_id=?",
+                (str(run_id),),
+            ).fetchone()
+            if existing is not None:
+                identical = (
+                    int(existing["pid"]) == pid
+                    and int(existing["pgid"]) == pgid
+                    and int(existing["process_start_ticks"]) == process_start_ticks
+                )
+                if not identical:
+                    raise ControlStoreError(
+                        f"conflicting live process lease for run: {run_id}"
+                    )
+                return Lease(
+                    run_id,
+                    existing["dispatch_id"],
+                    existing["owner_id"],
+                    pid,
+                    pgid,
+                    _parse_stamp(existing["started_at"]),
+                    process_start_ticks,
+                )
+            started_at = self._now()
+            lease = Lease(
+                run_id,
+                run["dispatch_id"],
+                run["owner_id"],
+                pid,
+                pgid,
+                started_at,
+                process_start_ticks,
+            )
+            db.execute(
+                "INSERT INTO leases(run_id, dispatch_id, owner_id, pid, pgid, "
+                "process_start_ticks, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(lease.run_id),
+                    lease.dispatch_id,
+                    lease.owner_id,
+                    lease.pid,
+                    lease.pgid,
+                    lease.process_start_ticks,
+                    _stamp(lease.started_at),
+                ),
+            )
+            db.execute(
+                "UPDATE runs SET state='running', "
+                "started_at=COALESCE(started_at, ?) WHERE run_id=?",
+                (_stamp(started_at), str(run_id)),
+            )
+            self._transition(
+                db,
+                "lease",
+                str(run_id),
+                "active",
+                {
+                    "dispatch_id": lease.dispatch_id,
+                    "owner_id": lease.owner_id,
+                    "pid": pid,
+                    "pgid": pgid,
+                    "process_start_ticks": process_start_ticks,
+                },
+                correlation=Correlation(
+                    dispatch_id=lease.dispatch_id,
+                    run_id=str(run_id),
+                ),
+            )
+            return lease
+
     def release_lease(self, run_id: RunId) -> None:
         with self.transaction() as db:
             db.execute("DELETE FROM leases WHERE run_id=?", (str(run_id),))

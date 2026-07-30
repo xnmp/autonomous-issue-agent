@@ -916,6 +916,23 @@ def test_codex_pricing_can_be_switched_off_explicitly():
     assert c.validation_errors() == ()
 
 
+def test_armed_caps_require_pricing_for_subscription_runtimes_too():
+    c = from_env({
+        "REPO": "x",
+        "FIX_BOT": "fix-bot",
+        "FIXER_RUNTIME": "claude",
+        "REVIEWER_RUNTIME": "claude",
+        "CODEX_COST_PER_MTOK_IN": "0",
+        "CODEX_COST_PER_MTOK_OUT": "0",
+        "ISSUE_SPEND_CAP_USD": "5",
+    })
+
+    assert any(
+        "armed spend caps require positive input/output pricing" in error
+        for error in c.validation_errors()
+    )
+
+
 # ── #43: a PER-MODEL codex rate table ────────────────────────────────────────
 # Routing moves price, not just token count, so a single flat rate makes the
 # routed tiers indistinguishable in the ledger — which is exactly the split

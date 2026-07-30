@@ -15,6 +15,7 @@ import pytest
 from issue_agent.adapters.control_store import (
     AccountingDisposition,
     BudgetLimit,
+    ControlStoreError,
     CorruptControlStore,
     Lease,
     ReservationRequest,
@@ -238,6 +239,42 @@ def test_reservation_and_owner_lease_commit_atomically(tmp_path):
 
     assert store.leases() == (lease,)
     assert store.active_reservation_runs() == (request.run_id,)
+
+
+def test_spawned_process_lease_binds_to_reserved_run_identity(tmp_path):
+    store = _store(tmp_path)
+    request = dataclasses.replace(_request(1), owner_id="owner")
+    assert store.reserve(request).admitted
+
+    lease = store.register_process_lease(
+        request.run_id,
+        pid=123,
+        pgid=124,
+        process_start_ticks=99,
+    )
+
+    assert lease == Lease(
+        request.run_id,
+        request.dispatch_id,
+        "owner",
+        123,
+        124,
+        NOW,
+        99,
+    )
+    assert store.register_process_lease(
+        request.run_id,
+        pid=123,
+        pgid=124,
+        process_start_ticks=99,
+    ) == lease
+    with pytest.raises(ControlStoreError, match="conflicting"):
+        store.register_process_lease(
+            request.run_id,
+            pid=125,
+            pgid=125,
+            process_start_ticks=100,
+        )
 
 
 def test_pid_reuse_does_not_keep_a_dead_lease(tmp_path):

@@ -47,8 +47,11 @@ def test_shadow_replay_and_primary_canary_are_independently_verified(tmp_path):
     assert report["shadow"] == {
         "rows_match": True,
         "totals_match": True,
+        "rejected_rows_match": True,
         "idempotent_replay": True,
+        "representative_hours": 48.0,
     }
+    assert report["primary_canary"]["database_preexisting"] is False
     assert report["primary_canary"]["legacy_export_unchanged"] is True
 
 

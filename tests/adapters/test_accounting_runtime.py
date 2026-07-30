@@ -131,6 +131,58 @@ def test_disabled_caps_still_reserve_and_settle_subscription_run(tmp_path) -> No
     assert store.active_reservation_runs() == ()
 
 
+def test_subscription_usage_is_synthetically_priced_and_consumes_cap(
+    tmp_path,
+) -> None:
+    class SubscriptionRuntime:
+        def __init__(self):
+            self.calls = 0
+
+        async def run(self, _task):
+            self.calls += 1
+            return AgentResult(
+                False,
+                status="ok",
+                cost_usd=0,
+                session_id=f"subscription-{self.calls}",
+                usage={"input_tokens": 1_000_000, "output_tokens": 100_000},
+            )
+
+    runtime = SubscriptionRuntime()
+    store = SQLiteControlStore(str(tmp_path / "control.db"))
+    store.initialize()
+    wrapper = AccountingRuntime(
+        runtime,
+        store,
+        "o/r",
+        "fix",
+        Money("USD", 5_000_000),
+        None,
+        None,
+        "cfg",
+        "claude",
+        _policy(),
+        _rates(),
+    )
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
+
+    first = asyncio.run(
+        wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2))
+    )
+    second = asyncio.run(
+        wrapper.run(RuntimePlan("more", model="gpt-test", max_budget_usd=2))
+    )
+
+    assert first.status == "ok"
+    assert second.exit_reason is ExitReason.BUDGET_EXHAUSTED
+    assert runtime.calls == 1
+    with store._connect() as db:
+        charge = db.execute(
+            "SELECT amount_micros, basis, rate_card_id FROM charges"
+        ).fetchone()
+    assert tuple(charge) == (8_000_000, "synthetic", "test")
+
+
 def test_runtime_exception_releases_reservation_without_daemon_restart(
     tmp_path,
 ) -> None:

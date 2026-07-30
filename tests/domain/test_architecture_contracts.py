@@ -226,6 +226,17 @@ def test_legacy_jsonl_compatibility_is_read_only() -> None:
     )
 
 
+def test_legacy_json_lifecycle_queue_is_removed() -> None:
+    forbidden = ("pending-actions.json", "quarantined-actions.json")
+    violations = [
+        f"{path.relative_to(ROOT)}: {marker}"
+        for path in _python_files(ROOT / "src")
+        for marker in forbidden
+        if marker in path.read_text()
+    ]
+    assert violations == []
+
+
 def test_self_authored_markers_are_not_gate_evidence() -> None:
     forbidden = ("ac-posted", "test-plan-posted", "adversarial-verdict")
     checked = (

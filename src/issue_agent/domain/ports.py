@@ -85,14 +85,6 @@ class GitHubEffects(Protocol):
     def reconcile_command(self, command_id: CommandId) -> EffectReceipt | None: ...
 
 
-class IssueStore(Protocol):
-    """Durable issue/workflow state. Missing values return ``None``."""
-
-    def pending_actions(self) -> tuple[Action, ...]: ...
-    def enqueue_action(self, action: Action) -> None: ...
-    def remove_pending_action(self, action: Action) -> None: ...
-
-
 class WorkflowState(Protocol):
     """Durable workflow state.
 
