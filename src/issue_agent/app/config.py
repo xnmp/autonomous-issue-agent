@@ -154,14 +154,30 @@ class CodexRuntimeConfig:
     enforce_budget: bool = True
 
     @property
+    def budget_pricing_gap(self) -> str:
+        """Which price knob leaves the dollar budget unenforceable, else "".
+
+        Named rather than boolean so the startup warning can point at the rate
+        that is actually missing: a zeroed CACHED_IN used to be reported as a
+        CODEX_COST_PER_MTOK_IN/OUT problem, sending the operator to two knobs
+        that were already correct."""
+        if self.cost_per_mtok_in <= 0 or self.cost_per_mtok_out <= 0:
+            return "both CODEX_COST_PER_MTOK_IN and CODEX_COST_PER_MTOK_OUT"
+        if any(rate_in <= 0 or rate_out <= 0 for _, rate_in, rate_out in self.cost_per_mtok):
+            return "every per-model IN/OUT rate in CODEX_COST_PER_MTOK"
+        if any(rate <= 0 for _, rate in self.cost_per_mtok_cached_in):
+            return "every per-model CACHED_IN rate in CODEX_COST_PER_MTOK"
+        return ""
+
+    @property
     def budget_priceable(self) -> bool:
         """Whether every configured model path has complete dollar pricing."""
-        return (
-            self.cost_per_mtok_in > 0
-            and self.cost_per_mtok_out > 0
-            and all(rate_in > 0 and rate_out > 0 for _, rate_in, rate_out in self.cost_per_mtok)
-            and all(rate_cached_in > 0 for _, rate_cached_in in self.cost_per_mtok_cached_in)
-        )
+        return not self.budget_pricing_gap
+
+    @property
+    def unpriced_cached_models(self) -> tuple[str, ...]:
+        """Models whose cache tier prices at $0 — cached spend is invisible."""
+        return tuple(model for model, rate in self.cost_per_mtok_cached_in if rate <= 0)
 
 
 @dataclass(frozen=True)
@@ -438,7 +454,9 @@ class HarnessConfig:
     #
     # `CODEX_COST_PER_MTOK='model=IN/OUT[/CACHED_IN],...'`, USD per MILLION tokens,
     # e.g. 'gpt-5.6-luna=1.25/10/0.125,gpt-5.6-terra=10/60'. Cached input
-    # defaults to one tenth of the ordinary input rate when omitted. Every leg is priced with
+    # defaults to one tenth of the ordinary input rate when omitted, and must be
+    # positive when given (a $0 cache tier under-counts a cache-heavy leg by
+    # ~7x — #89). Every leg is priced with
     # the model it ACTUALLY ran (task.model, or the runner's default when the
     # task pinned none). A model absent from the table — and the whole knob
     # when unset — falls back to the scalars above, so an existing deployment
@@ -980,6 +998,16 @@ def _coerce_rate_table(
                 f"— ignoring it"
             )
             continue
+        # An EXPLICIT cache rate of 0 (or below) is rejected rather than stored:
+        # it would price every cache read free, and a cache-heavy leg reads as a
+        # fraction of its real cost, so MAX_BUDGET_USD stops bounding the run.
+        # Omit the component to take the list-price default instead.
+        if len(components) == 3 and rate_cached_in <= 0:
+            errors.append(
+                f"{key} entry {entry!r} must have a positive CACHED_IN rate "
+                f"(omit it for the list-price default) — ignoring it"
+            )
+            continue
         if model in seen:
             errors.append(f"{key} names {model!r} more than once — keeping the first")
             continue
@@ -1001,12 +1029,16 @@ def _coerce_cached_rate_table(env: dict) -> tuple[tuple[str, float], ...]:
         if not (sep and model.strip() and len(components) in (2, 3)):
             continue
         try:
-            normal = float(components[0])
+            normal, out = (float(component) for component in components[:2])
             cached = float(components[2]) if len(components) == 3 else normal / 10
         except ValueError:
             continue
+        # Mirror `_coerce_rate_table`'s rejections so the two tables cannot
+        # disagree about which entries exist.
+        if not all(math.isfinite(r) and r >= 0 for r in (normal, out, cached)):
+            continue
         key = model.strip().casefold()
-        if key and key not in seen and math.isfinite(cached) and cached >= 0:
+        if key and key not in seen and cached > 0:
             seen.add(key)
             rates.append((key, cached))
     return tuple(rates)

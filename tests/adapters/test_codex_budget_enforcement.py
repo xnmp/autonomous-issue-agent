@@ -365,6 +365,45 @@ def test_resumed_leg_uses_its_own_usage_and_turn_delta(tmp_path, monkeypatch):
     assert result.num_turns == 0
 
 
+def test_a_resumed_leg_subtracts_the_baselines_cached_tokens_too(tmp_path, monkeypatch):
+    """The cached counter is cumulative like the others: pricing the raw total
+    would re-ledger the previous leg's cache reads, and a cached count larger
+    than the leg's own input delta reads as distrusted telemetry (full rate)."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _write_rollout(
+        tmp_path, input_tokens=1_000_000, cached_input_tokens=800_000, output_tokens=10_000
+    )
+    grown = json.dumps({
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "last_token_usage": {"input_tokens": 1},
+                "total_token_usage": {
+                    "input_tokens": 2_000_000,
+                    "cached_input_tokens": 1_700_000,
+                    "cache_write_input_tokens": 0,
+                    "output_tokens": 20_000,
+                },
+            },
+        }
+    })
+    body = _chatty_body(seconds=1).replace(
+        "printf '%s'",
+        f"printf '%s\\n' '{grown}' >> '{_rollout_path(tmp_path)}'\nprintf '%s'",
+    )
+
+    result = asyncio.run(
+        _runner(tmp_path, body).run(
+            AgentTask(prompt="x", max_budget_usd=20.0, resume=SID)
+        )
+    )
+
+    assert result.exit_reason is ExitReason.OK
+    # delta: 1_000_000 in of which 900_000 cached, 10_000 out.
+    # (100000 * $5 + 900000 * $0.50 + 10000 * $30) / 1e6.
+    assert result.cost_usd == pytest.approx(1.25)
+
+
 def test_budget_only_watchdog_samples_a_silent_generation(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     _write_rollout(tmp_path, input_tokens=5_000_000, output_tokens=100_000)

@@ -944,6 +944,7 @@ def build_fix_daemon(
             issue_spend_cap_usd=cfg.issue_spend_cap_usd,
             daily_spend_cap_usd=cfg.daily_spend_cap_usd,
             max_runtime=codex_runtime.max_runtime,
+            unpriced_cached_models=codex_runtime.unpriced_cached_models,
         )
         if _blindspot is not None:
             _log("fix")(_blindspot)
@@ -958,6 +959,7 @@ def build_fix_daemon(
             max_runtime=codex_runtime.max_runtime,
             enforced=codex_runtime.enforce_budget,
             priced=codex_runtime.budget_priceable,
+            pricing_gap=codex_runtime.budget_pricing_gap,
         )
         if _unbounded is not None:
             _log("fix")(_unbounded)
@@ -1258,6 +1260,7 @@ def build_review_daemon(
             daily_spend_cap_usd=cfg.daily_spend_cap_usd,
             max_runtime=cfg.codex_runtime.max_runtime,
             runtime_name="REVIEWER_RUNTIME",
+            unpriced_cached_models=cfg.codex_runtime.unpriced_cached_models,
         )
         if blindspot is not None:
             _log("review")(blindspot)
@@ -1266,6 +1269,7 @@ def build_review_daemon(
             max_runtime=cfg.codex_runtime.max_runtime,
             enforced=cfg.codex_runtime.enforce_budget,
             priced=cfg.codex_runtime.budget_priceable,
+            pricing_gap=cfg.codex_runtime.budget_pricing_gap,
             budget_name="REVIEW_BUDGET_USD",
             runtime_name="REVIEWER_RUNTIME",
         )

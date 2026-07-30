@@ -507,10 +507,15 @@ def codex_cost_usd(
         return 0.0
     rate_in = max(float(cost_per_mtok_in or 0.0), 0.0)
     rate_out = max(float(cost_per_mtok_out or 0.0), 0.0)
-    rate_cached_in = max(
-        float(rate_in / 10 if cost_per_mtok_cached_in is None else cost_per_mtok_cached_in or 0.0),
-        0.0,
+    rate_cached_in = (
+        rate_in / 10 if cost_per_mtok_cached_in is None else float(cost_per_mtok_cached_in)
     )
+    # A zero, negative or NaN cache rate would price cache reads FREE, which
+    # under-counts the leg — charge them at the full input rate instead. The
+    # configuration is rejected at parse time; this keeps a programmatic caller
+    # erring in the over-estimating direction too.
+    if not rate_cached_in > 0:
+        rate_cached_in = rate_in
     if rate_in <= 0 and rate_out <= 0:
         return 0.0
     tokens_in = int(usage.get("input_tokens", 0) or 0)
@@ -518,9 +523,13 @@ def codex_cost_usd(
     if tokens_in or tokens_out:
         # Cached input reads are already inside `input_tokens` on the codex line
         # (it prints "input=N (+ M cached)"), so price that contained portion at
-        # the cache tier without adding it a second time. Clamp malformed counters
-        # to the observed input total so telemetry cannot produce negative input.
-        cached_in = min(max(int(usage.get("cache_read_input_tokens", 0) or 0), 0), tokens_in)
+        # the cache tier without adding it a second time. A counter that is
+        # negative, or larger than the input total that must contain it, is
+        # telemetry we cannot trust: distrust it entirely and charge ALL input at
+        # the full rate rather than discount input the run may never have cached.
+        cached_in = int(usage.get("cache_read_input_tokens", 0) or 0)
+        if cached_in < 0 or cached_in > tokens_in:
+            cached_in = 0
         uncached_in = tokens_in - cached_in
         return (
             uncached_in * rate_in + cached_in * rate_cached_in + tokens_out * rate_out
@@ -636,16 +645,19 @@ def rates_with_cache_for_model(
     fallback_in: float,
     fallback_out: float,
 ) -> tuple[float, float, float]:
-    """Resolve cache-aware rates while retaining the legacy two-rate helper."""
+    """Resolve cache-aware rates while retaining the legacy two-rate helper.
+
+    A table entry that prices cache reads at $0 or below is treated as absent
+    and charged at the full input rate: config rejects that entry at parse time,
+    and the budget check must stay armed on a rate that over-estimates rather
+    than disarm on one that reads as free."""
     rate_in, rate_out = rates_for_model(
         model, table, fallback_in=fallback_in, fallback_out=fallback_out
     )
     key = (model or "").strip().casefold()
-    if cached_table is None:
-        return rate_in, rate_out, rate_in / 10
-    for name, rate_cached_in in cached_table:
+    for name, rate_cached_in in cached_table or ():
         if name == key:
-            return rate_in, rate_out, rate_cached_in
+            return rate_in, rate_out, rate_cached_in if rate_cached_in > 0 else rate_in
     return rate_in, rate_out, rate_in / 10
 
 
@@ -657,6 +669,7 @@ def codex_cost_blindspot_warning(
     daily_spend_cap_usd: float,
     max_runtime: float = 0.0,
     runtime_name: str = "FIXER_RUNTIME",
+    unpriced_cached_models: tuple[str, ...] = (),
 ) -> str | None:
     """The ONE startup line D12 requires: with a spend cap armed but no codex
     price table, every codex run costs $0.00 on the ledger and neither cap can
@@ -664,13 +677,15 @@ def codex_cost_blindspot_warning(
     cap is armed — there is nothing to mislead the operator about. The shipped
     defaults are non-zero, so reaching this warning means someone zeroed them.
 
-    Both rates must be >0 to count as configured: pricing only the input side
-    still under-counts every run, which is the same blind spot in weaker form.
+    All three rates must be >0 to count as configured: pricing only the input
+    side, or leaving a model's cache tier at $0 (#89 — cache reads are the bulk
+    of a long leg's input), still under-counts every run, which is the same
+    blind spot in weaker form.
 
     Per-run budget enforcement has its own warning below. Keeping these
     diagnostics separate prevents a zero-price boot from emitting two
     conflicting explanations of MAX_BUDGET_USD."""
-    if cost_per_mtok_in > 0 and cost_per_mtok_out > 0:
+    if cost_per_mtok_in > 0 and cost_per_mtok_out > 0 and not unpriced_cached_models:
         return None
     if issue_spend_cap_usd <= 0 and daily_spend_cap_usd <= 0:
         return None
@@ -682,13 +697,28 @@ def codex_cost_blindspot_warning(
         )
         if part
     )
-    if cost_per_mtok_in <= 0 and cost_per_mtok_out <= 0:
+    # The scalars come first when either is wrong: a zeroed cache tier on top of
+    # them is a symptom, and naming three knobs at once names none of them.
+    if cost_per_mtok_in <= 0 or cost_per_mtok_out <= 0:
+        knob = "both CODEX_COST_PER_MTOK_IN/OUT must be positive"
+        remedy = "Set both to your gateway's USD-per-million-token prices."
         consequence = (
             "every codex run records $0.00 and NEITHER cap can ever fire"
+            if cost_per_mtok_in <= 0 and cost_per_mtok_out <= 0
+            else "one token class is unpriced, so codex spend is undercounted "
+            "and neither cap is a reliable ceiling"
         )
     else:
+        knob = (
+            "the CACHED_IN rate in CODEX_COST_PER_MTOK must be positive for "
+            + ", ".join(unpriced_cached_models)
+        )
+        remedy = (
+            "Set it to your gateway's cached-input price, or omit the component "
+            "for the list-price default."
+        )
         consequence = (
-            "one token class is unpriced, so codex spend is undercounted and "
+            "cache reads price at $0.00, so codex spend is undercounted and "
             "neither cap is a reliable ceiling"
         )
     if max_runtime > 0:
@@ -705,9 +735,8 @@ def codex_cost_blindspot_warning(
         )
     return (
         "codex: WARNING — spend caps are armed "
-        f"({caps}) but both CODEX_COST_PER_MTOK_IN/OUT must be positive; "
-        f"{consequence}. Set both to your gateway's USD-per-million-token "
-        f"prices. {per_run}. ({runtime_name}=codex)"
+        f"({caps}) but {knob}; "
+        f"{consequence}. {remedy} {per_run}. ({runtime_name}=codex)"
     )
 
 
@@ -717,6 +746,7 @@ def codex_budget_not_enforced_warning(
     max_runtime: float = 0.0,
     enforced: bool = False,
     priced: bool = False,
+    pricing_gap: str = "",
     budget_name: str = "MAX_BUDGET_USD",
     runtime_name: str = "FIXER_RUNTIME",
 ) -> str | None:
@@ -735,9 +765,12 @@ def codex_budget_not_enforced_warning(
     hidden behind one vague sentence:
 
     - `enforced=False` (CODEX_ENFORCE_BUDGET=0) — the operator opted out.
-    - `priced=False` (either input or output pricing is missing) — an unpriced
-      token class can grow without moving the measured spend. Enforcement is
-      armed but cannot provide an honest dollar ceiling.
+    - `priced=False` (an input, output or cached-input rate is missing) — an
+      unpriced token class can grow without moving the measured spend.
+      Enforcement is armed but cannot provide an honest dollar ceiling.
+      `pricing_gap` names the rate that is actually missing (default: the
+      IN/OUT scalars), so the line does not send an operator to knobs that are
+      already correct.
 
     The defaults are the pessimistic pair on purpose: a caller that forgets to
     say enforcement is live gets the loud line, never a false all-clear.
@@ -769,8 +802,8 @@ def codex_budget_not_enforced_warning(
     why = (
         "CODEX_ENFORCE_BUDGET=0"
         if not enforced
-        else "both CODEX_COST_PER_MTOK_IN and CODEX_COST_PER_MTOK_OUT must be "
-        "positive, so the check cannot measure a reliable dollar ceiling"
+        else f"{pricing_gap or 'both CODEX_COST_PER_MTOK_IN and CODEX_COST_PER_MTOK_OUT'}"
+        " must be positive, so the check cannot measure a reliable dollar ceiling"
     )
     return (
         f"codex: WARNING — {budget_name}=${fix_budget_usd:.2f} is NOT ENFORCED "
