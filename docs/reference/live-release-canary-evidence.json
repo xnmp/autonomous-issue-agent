@@ -242,9 +242,9 @@
     }
   },
   "adversarial_blocker_follow_up": {
-    "observed_at": "2026-07-30T20:57:15Z",
-    "commit": "c8b2c5dc52c55c8489f4e5a76a675e7b2da7274b",
-    "code_tree": "d78c8a8ab39aa7cef3d0b8502b20e7f40a834cdc",
+    "observed_at": "2026-07-30T21:05:11Z",
+    "commit": "5792bea16b3ecf28145bfa2889891fde87456dca",
+    "code_tree": "9ee9d723676d6aaa0990bd7f5b67d5879ed48b23",
     "closed_findings": [
       "Concurrent review validators use independent reservations under one durable top-level dispatch claim.",
       "Legacy role owners atomically adopt active runs, leases, and nonterminal effects at the deployment-identity cutover.",
@@ -253,6 +253,7 @@
       "Transparent wrappers cannot hide dynamic interpreters from governor resolution.",
       "Claude visual receipts are daemon-signed and bound to HEAD plus image digest; Codex cannot mint trusted receipts.",
       "launchd stages and rolls back the private config snapshot with its plists.",
+      "Partial-role service upgrades are rejected so every legacy writer stops before SQLite migration.",
       "Process liveness probes run before, never inside, the SQLite dispatch-claim write transaction."
     ],
     "full_suite": {
@@ -261,8 +262,8 @@
       "shell_hooks": 90,
       "point_at": 7,
       "domain_pytest": 646,
-      "adapter_pytest": 691,
-      "application_pytest": 1285,
+      "adapter_pytest": 694,
+      "application_pytest": 1286,
       "gate_parity": 48,
       "import_contracts": 4,
       "pyrefly_errors": 0
@@ -275,17 +276,17 @@
       "clean_target_test": "passed",
       "roles": {
         "fix": {
-          "pid": 2998287,
+          "pid": 3030475,
           "heartbeat_state": "stopped",
           "in_flight": []
         },
         "review": {
-          "pid": 2998288,
+          "pid": 3030476,
           "heartbeat_state": "stopped",
           "in_flight": []
         },
         "steward": {
-          "pid": 2998289,
+          "pid": 3030477,
           "heartbeat_state": "stopped",
           "in_flight": []
         }
