@@ -85,3 +85,23 @@ def test_unreadable_blocked_issue_does_not_create_a_false_clear(tmp_path):
         if event.get("reason") == "human"
     ]
     assert [event["state"] for event in human_events] == ["waiting"]
+
+
+def test_live_reporter_observes_executor_wait_written_between_polls(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    report = _hold_reporter(journal, "o/r", lambda _message: None)
+    report(WorldState())
+
+    Executor(FakeGateway(), journal=journal).execute(
+        Relabel(Target.ISSUE, 5, Label.AI_WORKING, Label.AI_BLOCKED)
+    )
+    report(WorldState(issues=(
+        IssueView(5, labels=frozenset({Label.AI_READY})),
+    )))
+
+    human_events = [
+        event
+        for event in _holds_in(journal)
+        if event.get("reason") == "human"
+    ]
+    assert [event["state"] for event in human_events] == ["waiting", "cleared"]

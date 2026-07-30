@@ -474,17 +474,21 @@ def _hold_reporter(journal: Journal | None, repo: str, log):
         nonlocal active
         if active is None:
             active = {}
-            if journal is not None:
-                for event in read_events_tail(journal.path):
-                    if event.get("event") not in {"deferred", "hold"}:
-                        continue
-                    key = event_key(event)
-                    if key is None:
-                        continue
-                    if event.get("state") == "cleared":
-                        active.pop(key, None)
-                    elif event.get("state") == "waiting" or event.get("event") == "hold":
-                        active[key] = event
+        if journal is not None:
+            # Executor-owned human edges can land between polls. Replaying the
+            # durable edge log keeps this reporter synchronized across both
+            # daemon restarts and in-process writers.
+            active = {}
+            for event in read_events_tail(journal.path):
+                if event.get("event") not in {"deferred", "hold"}:
+                    continue
+                key = event_key(event)
+                if key is None:
+                    continue
+                if event.get("state") == "cleared":
+                    active.pop(key, None)
+                elif event.get("state") == "waiting" or event.get("event") == "hold":
+                    active[key] = event
 
         current = {key_for(hold): hold for hold in issue_holds(world)}
         current.update({
