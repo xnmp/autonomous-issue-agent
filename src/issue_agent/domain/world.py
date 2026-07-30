@@ -61,6 +61,10 @@ class Check:
     # GitHub's machine-readable representation of `continue-on-error: true`.
     # Such a job is visible diagnostic output, not a merge-gating failure (#31).
     advisory: bool = False
+    # Immutable GitHub Actions workflow-run identity derived from details_url.
+    # None identifies external commit statuses and malformed/unknown evidence;
+    # those failures cannot be safely rerun by a mutable branch lookup.
+    run_id: int | None = None
 
 
 @dataclass(frozen=True)

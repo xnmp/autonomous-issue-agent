@@ -96,7 +96,8 @@ def test_ci_pending_escalation_withholds_marker_when_relabel_is_not_verified():
         (pr, head)
     ))
 
-    ex.execute(EscalateCiPending(100, "sha-1", "stalled"))
+    with pytest.raises(RuntimeError, match="not verified"):
+        ex.execute(EscalateCiPending(100, "sha-1", "stalled"))
 
     assert marked == []
 
@@ -167,35 +168,34 @@ def test_rerun_marks_the_head_before_asking_github():
     gw = FakeGateway()
     marked = []
     ex = Executor(gw, mark_ci_rerun=lambda pr, head: marked.append((pr, head)))
-    ex.execute(RerunFailedChecks(100, "sha-1"))
+    ex.execute(RerunFailedChecks(100, "sha-1", (4242,)))
     assert marked == [(100, "sha-1")]
-    assert gw.calls == [("rerun", 100)]
+    assert gw.calls == [("rerun", "sha-1", (4242,))]
 
 
 def test_rerun_journals_the_run_it_triggered():
     gw = FakeGateway()
     j = _Journal()
     ex = Executor(gw, mark_ci_rerun=lambda pr, head: None, journal=j)
-    ex.execute(RerunFailedChecks(100, "sha-1"))
+    ex.execute(RerunFailedChecks(100, "sha-1", (4242,)))
     kind, fields = next(e for e in j.events if e[0] == "ci_rerun")
     assert (fields["pr"], fields["head"], fields["run_id"], fields["ok"]) == (
         100, "sha-1", 4242, True
     )
 
 
-def test_rerun_that_finds_no_run_still_keeps_the_marker_and_says_so():
-    # External status contexts (or a gh refusal) leave nothing to re-run. Soft
-    # by design: the marker is already spent, so the next poll buys the paid leg
-    # instead of retrying this forever.
+def test_rejected_exact_rerun_still_keeps_the_marker_and_says_so():
+    # A compatibility executor may receive a refusal after the marker is spent;
+    # the next poll buys the bounded repair leg instead of retrying forever.
     gw = FakeGateway()
     gw.rerun_run_id = None
     marked, logged = [], []
     j = _Journal()
     ex = Executor(gw, mark_ci_rerun=lambda pr, head: marked.append((pr, head)),
                   journal=j, log=logged.append)
-    ex.execute(RerunFailedChecks(100, "sha-1"))
+    ex.execute(RerunFailedChecks(100, "sha-1", (4242,)))
     assert marked == [(100, "sha-1")]
-    assert any("no failed Actions run" in line for line in logged)
+    assert any("not executable" in line for line in logged)
     assert next(f for e, f in j.events if e == "ci_rerun")["ok"] is False
 
 
@@ -205,7 +205,7 @@ def test_rerun_without_a_marker_writer_does_not_touch_github():
     gw = FakeGateway()
     logged = []
     ex = Executor(gw, log=logged.append)
-    ex.execute(RerunFailedChecks(100, "sha-1"))
+    ex.execute(RerunFailedChecks(100, "sha-1", (4242,)))
     assert gw.calls == []
     assert any("no marker writer" in line for line in logged)
 

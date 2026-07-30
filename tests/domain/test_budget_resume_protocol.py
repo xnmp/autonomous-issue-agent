@@ -25,5 +25,7 @@ def test_fix_bot_reply_after_budget_prompt_dispatches_resume():
         fixer_busy=False,
     )
 
-    assert Relabel(Target.ISSUE, 7, Label.AI_BLOCKED, Label.AI_WORKING) in actions
+    assert Relabel(
+        Target.ISSUE, 7, Label.AI_BLOCKED, Label.AI_WORKING, ""
+    ) in actions
     assert RunAgent(AgentKind.RESUME, 7) in actions

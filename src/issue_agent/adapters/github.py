@@ -395,6 +395,7 @@ def _checks(raw: list | None) -> tuple[Check, ...]:
             # unknown as "cannot fire" rather than as "infinitely old" (#30).
             started_at=c.get("startedAt") or c.get("started_at") or "",
             advisory=bool(c.get("advisory", False)),
+            run_id=_workflow_run_id(c),
         )
         for c in raw or []
     )
@@ -1401,28 +1402,55 @@ class GitHubGateway:
         run_id = runs[0].get("databaseId") if runs else None  # type: ignore[union-attr]
         return int(run_id) if run_id else None
 
-    def rerun_failed_checks(self, pr: int, *, branch: str = "") -> int | None:
-        """`gh run rerun <id> --failed` on this PR's newest failed run (#38).
-        Returns the run id re-run, or None if there was nothing to re-run or the
-        call failed.
+    def workflow_run_attempts(
+        self, head: str, run_ids: tuple[int, ...]
+    ) -> dict[int, int] | None:
+        """Attempt counters for exact workflow runs, after SHA verification."""
 
-        Fails SOFT by contract, and the caller (the `RerunFailedChecks` arm of
-        the Executor) marks the head's allowance as spent BEFORE getting here —
-        so "no Actions run found" (external status contexts, a status with no
-        run behind it) and "gh refused" both degrade to the paid FIX_CI leg on
-        the next poll, which is exactly the pre-#38 behaviour. The failure a
-        soft return must NOT become is a retry loop, and it cannot: the marker
-        is already written."""
-        try:
-            run_id = self.failed_run_id(pr, branch=branch)
-            if run_id is None:
-                return None
-            self._gh(["run", "rerun", str(run_id), "--repo", self.repo, "--failed"])
-            return run_id
-        except MissingListLimit:
-            raise
-        except Exception:  # noqa: BLE001 — see the docstring
+        if not head or not run_ids or any(run_id <= 0 for run_id in run_ids):
             return None
+        attempts: dict[int, int] = {}
+        for run_id in dict.fromkeys(run_ids):
+            raw = self._gh_json(
+                ["api", f"repos/{self.repo}/actions/runs/{run_id}"]
+            )
+            if (
+                not isinstance(raw, dict)
+                or int(raw.get("id") or 0) != run_id
+                or str(raw.get("head_sha") or "") != head
+            ):
+                return None
+            attempt = raw.get("run_attempt")
+            if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+                return None
+            attempts[run_id] = attempt
+        return attempts
+
+    def rerun_failed_checks(
+        self,
+        head: str,
+        run_ids: tuple[int, ...],
+        expected_attempts: dict[int, int] | None = None,
+    ) -> tuple[int, ...] | None:
+        """Rerun the exact revision-bound workflow runs captured by observation."""
+
+        current = self.workflow_run_attempts(head, run_ids)
+        if current is None or (
+            expected_attempts is not None and current != expected_attempts
+        ):
+            return None
+        completed: list[int] = []
+        for run_id in dict.fromkeys(run_ids):
+            self._gh(
+                [
+                    "api",
+                    f"repos/{self.repo}/actions/runs/{run_id}/rerun-failed-jobs",
+                    "--method",
+                    "POST",
+                ]
+            )
+            completed.append(run_id)
+        return tuple(completed)
 
     def failed_run_log(
         self, pr: int, *, branch: str = "", lines: int = _FAILED_LOG_LINES
@@ -1709,24 +1737,6 @@ class GitHubGateway:
             and str(data.get("mergeStateStatus") or "").upper() != "BEHIND"
             and self.disable_auto_merge(pr, current_head)
         )
-
-    def max_run_attempt(self, head: str) -> int | None:
-        data = self._gh_json(
-            [
-                "api",
-                f"repos/{self.repo}/actions/runs?head_sha={head}&per_page=100",
-            ]
-        )
-        if not isinstance(data, dict) or not isinstance(
-            data.get("workflow_runs"), list
-        ):
-            return None
-        attempts = [
-            int(item.get("run_attempt") or 0)
-            for item in data["workflow_runs"]
-            if isinstance(item, dict)
-        ]
-        return max(attempts, default=0)
 
     def has_blocked_by(self, issue: int, blocker: int) -> bool:
         data = self._gh_json(

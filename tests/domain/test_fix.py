@@ -226,10 +226,19 @@ def test_dependency_hold_names_the_blocking_issue():
 
 
 def test_resolve_dispatch_relabels_then_runs():
-    w = world(issues=[issue(5, "ai-ready")])
+    w = world(issues=[issue(5, "ai-ready", updated_at="issue-rev-5")])
     actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
-    assert Relabel(Target.ISSUE, 5, Label.AI_READY, Label.AI_WORKING) in actions
-    assert RunAgent(AgentKind.RESOLVE, 5) in actions
+    claim = Relabel(
+        Target.ISSUE,
+        5,
+        Label.AI_READY,
+        Label.AI_WORKING,
+        "issue-rev-5",
+    )
+    assert claim in actions
+    dispatch = next(action for action in actions if isinstance(action, RunAgent))
+    assert dispatch == RunAgent(AgentKind.RESOLVE, 5)
+    assert dispatch.requires == claim
 
 
 # ── single-fixer invariant ─────────────────────────────────────────────────────
@@ -1432,7 +1441,9 @@ def test_cleanup_does_not_stomp_a_fresh_dispatch_in_the_same_poll():
     actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
 
     # the fresh dispatch happened
-    assert Relabel(Target.ISSUE, 8, Label.AI_READY, Label.AI_WORKING) in actions
+    assert Relabel(
+        Target.ISSUE, 8, Label.AI_READY, Label.AI_WORKING, ""
+    ) in actions
     assert RunAgent(AgentKind.RESOLVE, 8) in actions
 
     # …and cleanup's ISSUE-side arm must NOT fire on top of it
@@ -1924,7 +1935,7 @@ def test_guarded_issue_does_not_consume_the_polls_other_work():
 # same pre-existing flaky test, unrelated to either PR's diff.
 def _red_pr(head="sha-1"):
     return pr(100, "ai-pr-open", head_ref_oid=head,
-              checks=(Check("unit", bucket="fail"),))
+              checks=(Check("unit", bucket="fail", run_id=9001),))
 
 
 def _reruns(actions):
@@ -1934,8 +1945,44 @@ def _reruns(actions):
 def test_first_failure_on_a_head_re_runs_instead_of_paying_for_a_leg():
     w = world(prs=[_red_pr()])
     actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
-    assert _reruns(actions) == [RerunFailedChecks(100, "sha-1")]
+    assert _reruns(actions) == [RerunFailedChecks(100, "sha-1", (9001,))]
     assert _run_agents(actions) == []                # the $13–29 never happens
+
+
+def test_free_rerun_requires_ids_for_every_failed_gate():
+    external = pr(
+        100,
+        "ai-pr-open",
+        head_ref_oid="sha-1",
+        checks=(
+            Check("actions", bucket="fail", run_id=9001),
+            Check("external", bucket="fail"),
+        ),
+    )
+
+    actions = decide_fix(world(prs=[external]), CFG, FixState(), fixer_busy=False)
+
+    assert _reruns(actions) == []
+    assert RunAgent(AgentKind.FIX_CI, 100) in _run_agents(actions)
+
+
+def test_free_rerun_captures_all_unique_failed_workflow_runs():
+    red = pr(
+        100,
+        "ai-pr-open",
+        head_ref_oid="sha-1",
+        checks=(
+            Check("unit", bucket="fail", run_id=9001),
+            Check("integration", bucket="fail", run_id=9002),
+            Check("unit shard", bucket="fail", run_id=9001),
+        ),
+    )
+
+    actions = decide_fix(world(prs=[red]), CFG, FixState(), fixer_busy=False)
+
+    assert _reruns(actions) == [
+        RerunFailedChecks(100, "sha-1", (9001, 9002))
+    ]
 
 
 def test_second_failure_on_the_same_head_pays_for_the_leg():
@@ -1954,7 +2001,7 @@ def test_a_new_head_gets_a_fresh_free_re_run():
     w = world(prs=[_red_pr(head="sha-2")])
     state = FixState(ci_rerun_head={100: "sha-1"})
     assert _reruns(decide_fix(w, CFG, state, fixer_busy=False)) == [
-        RerunFailedChecks(100, "sha-2")
+        RerunFailedChecks(100, "sha-2", (9001,))
     ]
 
 
@@ -1985,7 +2032,7 @@ def test_the_re_run_consumes_no_fixer_so_another_pr_can_still_dispatch():
                checks=(Check("unit", bucket="fail"),))
     state = FixState(ci_rerun_head={101: "sha-9"})    # #101's re-run is spent
     actions = decide_fix(world(prs=[red, other]), CFG, state, fixer_busy=False)
-    assert _reruns(actions) == [RerunFailedChecks(100, "sha-1")]
+    assert _reruns(actions) == [RerunFailedChecks(100, "sha-1", (9001,))]
     assert RunAgent(AgentKind.FIX_CI, 101) in _run_agents(actions)
 
 

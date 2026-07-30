@@ -80,22 +80,13 @@ def order_for_execution(actions: list[Action]) -> list[Action]:
     return [*cheap, *dispatches]
 
 
-def dispatch_claim_ids(actions: list[Action]) -> frozenset[int]:
-    """Identity set of relabels whose only purpose is claiming a paid dispatch.
-
-    Decision functions emit these as an adjacent ``Relabel, RunAgent`` pair.
-    When accounting blocks admission, independent free lifecycle work still
-    executes, but the paired claim must not orphan the target in an in-flight
-    label with no process behind it.
-    """
+def dispatch_claims(actions: list[Action]) -> frozenset[Relabel]:
+    """Claims that exist solely to authorize a paired paid dispatch."""
 
     return frozenset(
-        id(actions[index - 1])
-        for index, action in enumerate(actions)
-        if index > 0
-        and isinstance(action, RunAgent)
-        and isinstance(actions[index - 1], Relabel)
-        and actions[index - 1].number == action.number
+        action.requires
+        for action in actions
+        if isinstance(action, RunAgent) and action.requires is not None
     )
 
 
@@ -567,14 +558,25 @@ class Daemon:
         except Exception as exc:  # noqa: BLE001 - crash-isolate a poll
             self.log(f"{self.name}: poll pass failed (continuing): {exc}")
             return []
-        blocked_claims = dispatch_claim_ids(actions) if paid_blocked else frozenset()
+        blocked_claims = dispatch_claims(actions) if paid_blocked else frozenset()
         ordered = order_for_execution(actions)
         taken: list[Action] = []
+        completed_claims: set[Relabel] = set()
         for action in ordered:
             try:
-                if id(action) in blocked_claims:
+                if isinstance(action, Relabel) and action in blocked_claims:
                     continue
                 if isinstance(action, RunAgent):
+                    if (
+                        action.requires is not None
+                        and action.requires not in completed_claims
+                    ):
+                        self._release_rejected_dispatch(action)
+                        self.log(
+                            f"{self.name}: dispatch {action.kind.name} "
+                            f"#{action.number} withheld — claim did not complete"
+                        )
+                        continue
                     if paid_blocked:
                         self._release_rejected_dispatch(action)
                         self.log(
@@ -601,6 +603,8 @@ class Daemon:
                 else:
                     taken.append(action)
                     self.executor.execute(action)
+                    if isinstance(action, Relabel):
+                        completed_claims.add(action)
             except Exception as exc:  # noqa: BLE001 - one bad action ≠ dead daemon
                 if isinstance(action, RunAgent) and self._dispatch_pool is not None:
                     # Includes pool.submit failures: the runtime never acquired

@@ -401,8 +401,15 @@ def decide_review(
         # happens on the tick BEFORE any dispatch can fail) it escalates through
         # the labelled arm like any other.
         if should_adopt(pr, cfg) and not unproductive_ceiling_hit(state, cfg, pr.number):
-            actions.append(Relabel(Target.PR, pr.number, None, cfg.trigger_label))
-            actions.append(RunAgent(AgentKind.REVIEW, pr.number))
+            claim = Relabel(
+                Target.PR,
+                pr.number,
+                None,
+                cfg.trigger_label,
+                pr.head_ref_oid,
+            )
+            actions.append(claim)
+            actions.append(RunAgent(AgentKind.REVIEW, pr.number, claim))
     return actions
 
 

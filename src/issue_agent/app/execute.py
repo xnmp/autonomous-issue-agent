@@ -128,7 +128,10 @@ def _action_spec(action: Action) -> tuple[str, str, int | None, dict]:
         }
     if isinstance(action, RerunFailedChecks):
         return "rerun_failed_checks", "pr", action.pr, {
-            "type": "rerun_failed_checks", "pr": action.pr, "head": action.head,
+            "type": "rerun_failed_checks",
+            "pr": action.pr,
+            "head": action.head,
+            "run_ids": list(action.run_ids),
         }
     if isinstance(action, AddDependency):
         return "add_dependency", "issue", action.issue, {
@@ -149,11 +152,14 @@ def _action_spec(action: Action) -> tuple[str, str, int | None, dict]:
             "merged": action.merged,
         }
     if isinstance(action, RunAgent):
-        return "run_agent", action.kind.name.lower(), action.number or None, {
+        payload: dict[str, object] = {
             "type": "run_agent",
             "kind": action.kind.name,
             "number": action.number,
         }
+        if action.requires is not None:
+            payload["requires"] = _action_id(action.requires)
+        return "run_agent", action.kind.name.lower(), action.number or None, payload
     if isinstance(action, NoOp):
         return "noop", "local", None, {
             "type": "noop", "reason": action.reason,
@@ -328,7 +334,11 @@ class Executor:
         if isinstance(action, UpdateBranch):
             return f"update branch PR #{action.pr} (BEHIND → up-to-date)"
         if isinstance(action, RerunFailedChecks):
-            return f"re-run failed checks PR #{action.pr} ({action.head[:7]})"
+            runs = ",".join(str(run_id) for run_id in action.run_ids)
+            return (
+                f"re-run failed checks PR #{action.pr} "
+                f"({action.head[:7]}; runs {runs or '?'})"
+            )
         if isinstance(action, EscalateCiPending):
             return f"escalate stalled CI PR #{action.pr} ({action.head[:7]})"
         if isinstance(action, AddDependency):
@@ -447,10 +457,11 @@ class Executor:
             elif isinstance(action, RerunFailedChecks):
                 if outcome is None:
                     self._log(
-                        f"CI re-run PR #{action.pr}: no failed Actions run found "
-                        "(or gh refused) — the paid CI-fix leg dispatches next poll"
+                        f"CI re-run PR #{action.pr}: captured workflow runs were "
+                        "not executable — the paid CI-fix leg dispatches next poll"
                     )
                 if self._journal is not None:
+                    rerun_ids = tuple(outcome or ())
                     self._journal.emit(
                         TelemetryEvent(
                             TelemetryWarning(
@@ -458,7 +469,8 @@ class Executor:
                                 "free CI rerun attempted",
                                 {
                                     "head": action.head,
-                                    "run_id": outcome or 0,
+                                    "run_id": rerun_ids[0] if rerun_ids else 0,
+                                    "run_ids": list(rerun_ids),
                                     "ok": outcome is not None,
                                 },
                             ),
@@ -589,8 +601,6 @@ class Executor:
                         _action_correlation(action),
                     )
                 )
-            if isinstance(exc, LifecycleWriteUnverified):
-                return
             raise
         if self._journal is not None:
             kind, target, number, structured = _action_spec(action)

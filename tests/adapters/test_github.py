@@ -654,6 +654,7 @@ def test_get_pr_keeps_failed_job_real_when_owning_run_is_not_successful():
     pr = GitHubGateway("o/r", runner=fr).get_pr(815)
 
     assert pr.checks[0].advisory is False
+    assert pr.checks[0].run_id == 4242
     assert ci_state(pr.checks) is CIState.FAILURE
 
 
@@ -684,6 +685,7 @@ def test_get_pr_keeps_failed_job_when_optional_run_lookup_raises():
     pr = GitHubGateway("o/r", runner=runner).get_pr(815)
 
     assert pr.checks[0].advisory is False
+    assert pr.checks[0].run_id == 4242
     assert ci_state(pr.checks) is CIState.FAILURE
 
 
@@ -950,26 +952,51 @@ def test_open_closing_refs_fails_soft_to_empty():
 
 
 # ── free CI re-run (#38) ─────────────────────────────────────────────────────
-def test_rerun_failed_checks_reruns_the_newest_failed_run():
-    fr = FakeRunner({"run list": [{"databaseId": 4242}]})
+def test_rerun_failed_checks_targets_exact_revision_bound_runs():
+    fr = FakeRunner({
+        "api repos/o/r/actions/runs/4242": {
+            "id": 4242,
+            "head_sha": "head-1",
+            "run_attempt": 3,
+        },
+        "api repos/o/r/actions/runs/4343": {
+            "id": 4343,
+            "head_sha": "head-1",
+            "run_attempt": 1,
+        },
+    })
     gw = GitHubGateway("o/r", runner=fr)
-    assert gw.rerun_failed_checks(100, branch="fix/5-x") == 4242
-    rerun = [c[0] for c in fr.calls if c[0][1:3] == ["run", "rerun"]][0]
-    assert rerun[1:4] == ["run", "rerun", "4242"] and "--failed" in rerun
+    assert gw.rerun_failed_checks("head-1", (4242, 4343)) == (4242, 4343)
+    reruns = [
+        call[0][2]
+        for call in fr.calls
+        if call[0][1] == "api" and call[0][2].endswith("/rerun-failed-jobs")
+    ]
+    assert reruns == [
+        "repos/o/r/actions/runs/4242/rerun-failed-jobs",
+        "repos/o/r/actions/runs/4343/rerun-failed-jobs",
+    ]
 
 
-def test_rerun_failed_checks_is_none_when_no_actions_run_failed():
-    # A red PR whose only red mark is an external status context: nothing to
-    # re-run, so the caller falls through to the paid leg.
-    fr = FakeRunner({"run list": []})
+def test_rerun_failed_checks_rejects_a_run_from_another_head_before_writing():
+    fr = FakeRunner({
+        "api repos/o/r/actions/runs/4242": {
+            "id": 4242,
+            "head_sha": "newer-head",
+            "run_attempt": 1,
+        },
+    })
     gw = GitHubGateway("o/r", runner=fr)
-    assert gw.rerun_failed_checks(100, branch="b") is None
-    assert not any(c[0][1:3] == ["run", "rerun"] for c in fr.calls)
+    assert gw.rerun_failed_checks("observed-head", (4242,)) is None
+    assert not any(
+        call[0][2].endswith("/rerun-failed-jobs") for call in fr.calls
+    )
 
 
-def test_rerun_failed_checks_fails_soft_when_gh_dies():
+def test_rerun_failed_checks_preserves_transport_failure_for_durable_recovery():
     gw = GitHubGateway("o/r", runner=_raising_runner(GhUnavailable("server", "HTTP 503")))
-    assert gw.rerun_failed_checks(100, branch="b") is None
+    with pytest.raises(GhUnavailable):
+        gw.rerun_failed_checks("head-1", (4242,))
 
 
 def test_failed_run_id_and_failed_run_log_agree_on_the_run():

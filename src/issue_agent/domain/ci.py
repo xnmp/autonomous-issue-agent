@@ -64,6 +64,14 @@ def pending_checks(checks: Iterable[Check], ignore_regex: str = "") -> tuple[Che
     return tuple(c for c in _kept(checks, ignore_regex) if _is_pending(c))
 
 
+def failed_checks(
+    checks: Iterable[Check], ignore_regex: str = ""
+) -> tuple[Check, ...]:
+    """Settled, non-advisory failures covered by the configured CI policy."""
+
+    return tuple(c for c in _kept(checks, ignore_regex) if c.bucket == "fail")
+
+
 def pending_age_seconds(
     checks: Iterable[Check], now: str, ignore_regex: str = ""
 ) -> float | None:

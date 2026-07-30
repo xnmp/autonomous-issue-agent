@@ -131,7 +131,7 @@ def test_adopts_unlabeled_open_pr():
     # so a comment lands on the first tick (not a poll later).
     p = pr(200, head_ref_oid="abc", author="human")
     acts = decide_review(world(prs=[p]), ADOPT, ReviewState())
-    assert Relabel(Target.PR, 200, None, Label.AI_PR_OPEN) in acts
+    assert Relabel(Target.PR, 200, None, Label.AI_PR_OPEN, "abc") in acts
     assert RunAgent(AgentKind.REVIEW, 200) in acts
 
 
@@ -176,7 +176,7 @@ def test_c1_suffix_tolerance_still_adopts_a_strangers_pr():
     cfg = ReviewConfig(review_bot="review-bot[bot]", adopt_unlabeled=True)
     p = pr(200, head_ref_oid="abc", author="some-human")
     acts = decide_review(world(prs=[p]), cfg, ReviewState())
-    assert Relabel(Target.PR, 200, None, Label.AI_PR_OPEN) in acts
+    assert Relabel(Target.PR, 200, None, Label.AI_PR_OPEN, "abc") in acts
     assert RunAgent(AgentKind.REVIEW, 200) in acts
 
 
@@ -296,7 +296,7 @@ def test_adoption_is_a_second_entrance_and_is_bounded_too():
     # anti-vacuity: below the cap the rogue PR is still adopted and reviewed.
     acts = decide_review(world(prs=[p]), replace(ADOPT, max_unproductive_rounds=3),
                          _state(200, 2))
-    assert Relabel(Target.PR, 200, None, Label.AI_PR_OPEN) in acts
+    assert Relabel(Target.PR, 200, None, Label.AI_PR_OPEN, "abc") in acts
     assert RunAgent(AgentKind.REVIEW, 200) in acts
 
 

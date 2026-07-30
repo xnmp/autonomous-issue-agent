@@ -28,7 +28,14 @@ def _runs(actions, kind: AgentKind, number: int) -> bool:
 
 
 def _relabels(actions, target: Target, number: int, remove, add) -> bool:
-    return Relabel(target, number, remove, add) in actions
+    return any(
+        isinstance(action, Relabel)
+        and action.target is target
+        and action.number == number
+        and action.remove is remove
+        and action.add is add
+        for action in actions
+    )
 
 
 def _closes_issue(actions, number: int) -> bool:

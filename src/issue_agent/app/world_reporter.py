@@ -128,6 +128,7 @@ class WorldReporter:
                     "bucket": check.bucket[:_MAX_CHECK_TEXT_CHARS],
                     "started_at": check.started_at,
                     "advisory": check.advisory,
+                    "run_id": check.run_id,
                 }
                 for check in pr.checks[:_MAX_CHECKS]
             ]

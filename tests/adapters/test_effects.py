@@ -57,14 +57,15 @@ class Gateway:
         del issue
         return SimpleNamespace(updated_at=self.issue_revision)
 
-    def rerun_failed_checks(self, pr):
-        self.calls.append(("rerun", pr))
+    def rerun_failed_checks(self, head, run_ids, expected_attempts=None):
+        assert expected_attempts in (None, {run_id: self.run_attempt for run_id in run_ids})
+        self.calls.append(("rerun", head, run_ids))
         self.run_attempt += 1
-        return 42
+        return run_ids
 
-    def max_run_attempt(self, head):
+    def workflow_run_attempts(self, head, run_ids):
         del head
-        return self.run_attempt
+        return {run_id: self.run_attempt for run_id in run_ids}
 
     def enable_auto_merge(self, pr, method, expected_head):
         if self.advance_before_auto_merge:
@@ -241,7 +242,7 @@ def test_expected_revision_blocks_stale_effect(tmp_path) -> None:
     executor, gateway, store = _executor(tmp_path)
     gateway.head = "new-head"
 
-    assert executor.execute(RerunFailedChecks(7, "old-head")) is False
+    assert executor.execute(RerunFailedChecks(7, "old-head", (42,))) is False
 
     assert gateway.calls == []
     assert store.pending_commands() == ()
@@ -279,6 +280,23 @@ def test_issue_revision_change_blocks_stale_comment(tmp_path) -> None:
         )
     )
     gateway.issue_revision = "issue-rev-2"
+
+    assert executor.execute(action) is False
+    assert gateway.calls == []
+    assert store.pending_commands() == ()
+
+
+def test_stale_claim_cannot_reconcile_from_newer_matching_labels(tmp_path) -> None:
+    executor, gateway, store = _executor(tmp_path)
+    gateway.labels.add(("issue", 7, "ai-working"))
+    gateway.issue_revision = "issue-rev-2"
+    action = Relabel(
+        Target.ISSUE,
+        7,
+        Label.AI_READY,
+        Label.AI_WORKING,
+        "issue-rev-1",
+    )
 
     assert executor.execute(action) is False
     assert gateway.calls == []
@@ -354,7 +372,7 @@ def test_ambiguous_branch_update_uses_original_revision_to_reconcile(
 
 def test_ambiguous_check_rerun_is_reconciled_by_attempt_number(tmp_path) -> None:
     executor, gateway, store = _executor(tmp_path)
-    action = RerunFailedChecks(7, "head-1")
+    action = RerunFailedChecks(7, "head-1", (42,))
     original = gateway.rerun_failed_checks
 
     def committed_then_lost(*args):
@@ -369,22 +387,55 @@ def test_ambiguous_check_rerun_is_reconciled_by_attempt_number(tmp_path) -> None
     gateway.rerun_failed_checks = original
 
     assert executor.execute(action)
-    assert gateway.calls == [("rerun", 7)]
+    assert gateway.calls == [("rerun", "head-1", (42,))]
     assert store.pending_commands() == ()
+
+
+def test_partially_applied_multi_run_rerun_is_never_blindly_retried(
+    tmp_path,
+) -> None:
+    executor, gateway, store = _executor(tmp_path)
+    action = RerunFailedChecks(7, "head-1", (42, 43))
+    advanced = False
+
+    def attempts(_head, run_ids):
+        return {
+            run_id: (1 if advanced and run_id == 42 else 0)
+            for run_id in run_ids
+        }
+
+    def partial(_head, _run_ids, _expected_attempts):
+        nonlocal advanced
+        advanced = True
+        gateway.calls.append(("rerun", "head-1", (42,)))
+        raise RuntimeError("reply lost after first run")
+
+    gateway.workflow_run_attempts = attempts
+    gateway.rerun_failed_checks = partial
+
+    with pytest.raises(RuntimeError, match="reply lost"):
+        executor.execute(action)
+    with pytest.raises(RuntimeError, match="outcome remains unknown"):
+        executor.execute(action)
+
+    assert gateway.calls == [("rerun", "head-1", (42,))]
+    assert store.pending_commands()[0].state == "unknown_outcome"
 
 
 def test_unconfirmed_check_rerun_stays_retryable(tmp_path) -> None:
     executor, gateway, store = _executor(tmp_path)
-    action = RerunFailedChecks(7, "head-1")
+    action = RerunFailedChecks(7, "head-1", (42,))
     original = gateway.rerun_failed_checks
-    gateway.rerun_failed_checks = lambda _pr: None
+    gateway.rerun_failed_checks = (
+        lambda _head, _run_ids, _expected_attempts: None
+    )
 
     assert executor.execute(action) is False
     assert store.pending_commands()[0].state == "retryable_failure"
 
     gateway.rerun_failed_checks = original
     assert executor.execute(action) is True
-    assert gateway.calls == [("rerun", 7)]
+    assert gateway.calls == [("rerun", "head-1", (42,))]
     assert store.pending_commands() == ()
 
 
@@ -417,7 +468,7 @@ def test_revision_outage_remains_pending_instead_of_permanently_failing(
     gateway.get_pr = unavailable
 
     with pytest.raises(RuntimeError, match="unavailable"):
-        executor.execute(RerunFailedChecks(7, "head-1"))
+        executor.execute(RerunFailedChecks(7, "head-1", (42,)))
 
     pending = store.pending_commands()
     assert len(pending) == 1

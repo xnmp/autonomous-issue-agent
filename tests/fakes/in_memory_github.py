@@ -117,8 +117,11 @@ class InMemoryGitHub:
             and not current.is_behind()
         )
 
-    def max_run_attempt(self, head: str) -> int | None:
-        return self.run_attempts.get(head, 0)
+    def workflow_run_attempts(
+        self, head: str, run_ids: tuple[int, ...]
+    ) -> dict[int, int] | None:
+        current = self.run_attempts.get(head, 0)
+        return {run_id: current for run_id in run_ids}
 
     def has_blocked_by(self, issue: int, blocker: int) -> bool:
         return (issue, blocker) in self.dependencies
@@ -196,14 +199,22 @@ class InMemoryGitHub:
             return True
         return False
 
-    def rerun_failed_checks(self, pr: int) -> int:
+    def rerun_failed_checks(
+        self,
+        head: str,
+        run_ids: tuple[int, ...],
+        expected_attempts: dict[int, int] | None = None,
+    ) -> tuple[int, ...] | None:
         self._maybe_fail("rerun_failed_checks")
-        self.calls.append(("rerun", pr))
-        current = self.prs.get(pr)
-        if current is not None:
-            head = current.head_ref_oid
-            self.run_attempts[head] = self.run_attempts.get(head, 0) + 1
-        return self.rerun_run_id
+        if expected_attempts is not None and expected_attempts != (
+            self.workflow_run_attempts(head, run_ids)
+        ):
+            return None
+        self.calls.append(("rerun", head, run_ids))
+        self.run_attempts[head] = self.run_attempts.get(head, 0) + 1
+        if self.rerun_run_id is None:
+            return None
+        return run_ids
 
     def submit_review(
         self, pr: int, event: str, body: str, expected_head: str

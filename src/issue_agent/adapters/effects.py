@@ -66,7 +66,9 @@ class BranchUpdateVerifier(Protocol):
 
 @runtime_checkable
 class ChecksRerunVerifier(Protocol):
-    def max_run_attempt(self, head: str) -> int | None: ...
+    def workflow_run_attempts(
+        self, head: str, run_ids: tuple[int, ...]
+    ) -> dict[int, int] | None: ...
 
 
 @runtime_checkable
@@ -147,7 +149,7 @@ class ImmediateGitHubEffectExecutor:
                 )
             return bool(self.gateway.update_branch(action.pr, action.head))
         if isinstance(action, RerunFailedChecks):
-            return self.gateway.rerun_failed_checks(action.pr)
+            return self.gateway.rerun_failed_checks(action.head, action.run_ids)
         if isinstance(action, EscalateCiPending):
             if (
                 not isinstance(self.gateway, CommentVerifier)
@@ -251,6 +253,20 @@ class GitHubEffectExecutor:
             command = pending.command
         if pending.state == EffectStatus.PERMANENT_FAILURE.value:
             return False
+        if pending.state == "pending" and not self._revision_matches(command):
+            now = datetime.now(timezone.utc)
+            self.store.begin_command(command.command_id)
+            self.store.record_effect(
+                EffectReceipt(
+                    command.command_id,
+                    self.identity,
+                    now,
+                    now,
+                    EffectStatus.PERMANENT_FAILURE,
+                    error="expected revision no longer matches remote target",
+                )
+            )
+            return False
         if pending.state in {
             "executing",
             EffectStatus.UNKNOWN_OUTCOME.value,
@@ -276,7 +292,7 @@ class GitHubEffectExecutor:
                     self._receipt(command, EffectStatus.SUCCEEDED)
                 )
                 return True
-        if not self._revision_matches(command):
+        if pending.state != "pending" and not self._revision_matches(command):
             now = datetime.now(timezone.utc)
             self.store.begin_command(command.command_id)
             self.store.record_effect(
@@ -524,7 +540,18 @@ class GitHubEffectExecutor:
                 )
             )
         elif isinstance(action, RerunFailedChecks):
-            return self.gateway.rerun_failed_checks(action.pr)
+            if command is None:
+                raise UnknownEffectOutcome(
+                    f"pr:{action.pr}: rerun command evidence is unavailable"
+                )
+            baseline = _run_attempt_baseline(command, action.run_ids)
+            if baseline is None:
+                raise UnknownEffectOutcome(
+                    f"pr:{action.pr}: rerun attempt baseline is unavailable"
+                )
+            return self.gateway.rerun_failed_checks(
+                action.head, action.run_ids, baseline
+            )
         elif isinstance(action, EscalateCiPending):
             if not isinstance(self.gateway, CommentVerifier) or not self.gateway.has_comment(
                 "pr", action.pr, action.body
@@ -608,11 +635,28 @@ class GitHubEffectExecutor:
                 or not isinstance(self.gateway, ChecksRerunVerifier)
             ):
                 return None
-            baseline = command.payload.get("prior_run_attempt")
-            current = self.gateway.max_run_attempt(action.head)
-            if not isinstance(baseline, int) or current is None:
+            baseline = _run_attempt_baseline(command, action.run_ids)
+            current = self.gateway.workflow_run_attempts(
+                action.head, action.run_ids
+            )
+            if baseline is None or current is None:
                 return None
-            return current > baseline
+            advanced: list[bool] = []
+            for run_id in action.run_ids:
+                prior = baseline.get(run_id)
+                attempt = current.get(run_id)
+                if (
+                    not isinstance(prior, int)
+                    or isinstance(prior, bool)
+                    or not isinstance(attempt, int)
+                ):
+                    return None
+                advanced.append(attempt > prior)
+            if all(advanced):
+                return True
+            if any(advanced):
+                return None
+            return False
         if isinstance(action, AddDependency):
             if not isinstance(self.gateway, DependencyVerifier):
                 return None
@@ -642,12 +686,27 @@ class GitHubEffectExecutor:
                 raise UnknownEffectOutcome(
                     f"{target}: expected revision is unavailable"
                 )
-        if isinstance(action, RerunFailedChecks) and isinstance(
-            self.gateway, ChecksRerunVerifier
-        ):
-            attempt = self.gateway.max_run_attempt(action.head)
-            if attempt is not None:
-                extra["prior_run_attempt"] = attempt
+        if isinstance(action, RerunFailedChecks):
+            if not action.run_ids:
+                raise UnknownEffectOutcome(
+                    f"pr:{action.pr}: exact failed workflow runs are unavailable"
+                )
+            if not isinstance(self.gateway, ChecksRerunVerifier):
+                raise UnknownEffectOutcome(
+                    f"pr:{action.pr}: workflow-run verification is unavailable"
+                )
+            attempts = self.gateway.workflow_run_attempts(
+                action.head, action.run_ids
+            )
+            if attempts is None:
+                raise UnknownEffectOutcome(
+                    f"pr:{action.pr}: failed workflow runs do not match "
+                    "the observed head"
+                )
+            extra["prior_run_attempts"] = {
+                str(run_id): attempt
+                for run_id, attempt in attempts.items()
+            }
         return command_for_action(
             action,
             self.config_version,
@@ -757,6 +816,15 @@ def action_from_command(command: LifecycleCommand) -> Action:
             int(payload["number"]),
             Label(str(payload["remove"])) if payload.get("remove") else None,
             Label(str(payload["add"])) if payload.get("add") else None,
+            (
+                (
+                    str(payload["expected_revision"])
+                    if payload["expected_revision"] is not None
+                    else None
+                )
+                if "expected_revision" in payload
+                else command.expected_revision
+            ),
         )
     if command.kind is CommandKind.POST_COMMENT:
         return PostComment(
@@ -790,7 +858,11 @@ def action_from_command(command: LifecycleCommand) -> Action:
             ),
         )
     if command.kind is CommandKind.RERUN_CHECKS:
-        return RerunFailedChecks(int(payload["pr"]), str(payload["head"]))
+        return RerunFailedChecks(
+            int(payload["pr"]),
+            str(payload["head"]),
+            tuple(int(run_id) for run_id in payload.get("run_ids", ())),
+        )
     if command.kind is CommandKind.ADD_DEPENDENCY:
         return AddDependency(int(payload["issue"]), int(payload["blocker"]))
     raise ValueError(f"command kind cannot be reconstructed as Action: {command.kind}")
@@ -817,6 +889,8 @@ def _command_identity(action: Action) -> tuple[CommandKind, str]:
 
 
 def _expected_revision(action: Action) -> str | None:
+    if isinstance(action, Relabel):
+        return action.expected_revision
     return (
         action.head
         if isinstance(
@@ -830,6 +904,25 @@ def _expected_revision(action: Action) -> str | None:
         )
         else None
     )
+
+
+def _run_attempt_baseline(
+    command: LifecycleCommand, run_ids: tuple[int, ...]
+) -> dict[int, int] | None:
+    raw = command.payload.get("prior_run_attempts")
+    if not isinstance(raw, dict):
+        return None
+    baseline: dict[int, int] = {}
+    for run_id in run_ids:
+        attempt = raw.get(str(run_id), raw.get(run_id))
+        if (
+            not isinstance(attempt, int)
+            or isinstance(attempt, bool)
+            or attempt < 0
+        ):
+            return None
+        baseline[run_id] = attempt
+    return baseline
 
 
 def _jsonable(value: object) -> Any:

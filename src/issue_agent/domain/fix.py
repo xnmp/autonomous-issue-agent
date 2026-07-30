@@ -34,6 +34,7 @@ from .actions import (
 )
 from .ci import (
     ci_state,
+    failed_checks,
     latest_other_review,
     pending_age_seconds,
     pending_checks,
@@ -986,9 +987,27 @@ def free_ci_rerun(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
     checks forever. Falling through to the paid leg is the old behaviour, which
     is bounded by the CI retry breaker; an unbounded free re-run loop is not
     bounded by anything."""
-    if not cfg.ci_free_rerun or not pr.head_ref_oid:
+    if (
+        not cfg.ci_free_rerun
+        or not pr.head_ref_oid
+        or not ci_rerun_run_ids(pr, cfg)
+    ):
         return False
     return state.ci_rerun_head.get(pr.number, "") != pr.head_ref_oid
+
+
+def ci_rerun_run_ids(pr: PRView, cfg: FixConfig) -> tuple[int, ...]:
+    """Exact workflow runs covering every failure, or empty when unsafe.
+
+    A failed external status or malformed Actions observation has no immutable
+    workflow-run identity. Mixing it with identified runs must fall through to
+    the bounded repair leg; rerunning only a subset could hide the real gate.
+    """
+
+    failures = failed_checks(pr.checks, cfg.ci_ignore_checks)
+    if not failures or any(check.run_id is None for check in failures):
+        return ()
+    return tuple(sorted({check.run_id for check in failures if check.run_id is not None}))
 
 
 @dataclass(frozen=True)
@@ -1310,7 +1329,11 @@ def decide_fix(
                 # deadline stops that wait from becoming the new deadlock.
                 if free_ci_rerun(pr, state, cfg):
                     actions.append(
-                        RerunFailedChecks(pr.number, pr.head_ref_oid)
+                        RerunFailedChecks(
+                            pr.number,
+                            pr.head_ref_oid,
+                            ci_rerun_run_ids(pr, cfg),
+                        )
                     )
                     continue
                 actions.append(RunAgent(AgentKind.FIX_CI, pr.number))
@@ -1331,10 +1354,16 @@ def decide_fix(
                     n, infra_escalation_reason(cfg.max_infra_deaths), Label.AI_BLOCKED,
                 ).actions())
             else:
-                actions.append(
-                    Relabel(Target.ISSUE, n, Label.AI_BLOCKED, Label.AI_WORKING)
+                issue = issues_by_number[n]
+                claim_action = Relabel(
+                    Target.ISSUE,
+                    n,
+                    Label.AI_BLOCKED,
+                    Label.AI_WORKING,
+                    issue.updated_at,
                 )
-                actions.append(RunAgent(AgentKind.RESUME, n))
+                actions.append(claim_action)
+                actions.append(RunAgent(AgentKind.RESUME, n, claim_action))
                 claim(n, paths)
 
     # 3) New ai-ready issues, only after repair work and only while slots remain.
@@ -1361,10 +1390,16 @@ def decide_fix(
                 ).actions())
                 break
             else:
-                actions.append(
-                    Relabel(Target.ISSUE, n, Label.AI_READY, Label.AI_WORKING)
+                issue = issues_by_number[n]
+                claim_action = Relabel(
+                    Target.ISSUE,
+                    n,
+                    Label.AI_READY,
+                    Label.AI_WORKING,
+                    issue.updated_at,
                 )
-                actions.append(RunAgent(AgentKind.RESOLVE, n))
+                actions.append(claim_action)
+                actions.append(RunAgent(AgentKind.RESOLVE, n, claim_action))
                 claim(n, issue_paths(n))
         else:
             break

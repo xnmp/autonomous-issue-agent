@@ -1256,8 +1256,12 @@ def test_a_gated_tick_blocks_paid_dispatch_after_free_work() -> None:
         "fix",
         lambda: WorldState(),
         lambda _world: [
-            Relabel(Target.ISSUE, 1, Label.AI_READY, Label.AI_WORKING),
-            RunAgent(AgentKind.RESOLVE, 1),
+            (
+                claim := Relabel(
+                    Target.ISSUE, 1, Label.AI_READY, Label.AI_WORKING
+                )
+            ),
+            RunAgent(AgentKind.RESOLVE, 1, claim),
         ],
         Executor(gateway, run_agent=calls.append),
         tick_gate=lambda: "accounting unavailable",
@@ -1266,6 +1270,39 @@ def test_a_gated_tick_blocks_paid_dispatch_after_free_work() -> None:
     assert taken == []
     assert gateway.calls == []
     assert calls == []
+
+
+def test_failed_claim_relabel_withholds_paired_paid_dispatch() -> None:
+    from issue_agent.domain.actions import AgentKind, RunAgent
+
+    calls = []
+    rejected = []
+    logs: list[str] = []
+    gateway = FakeGateway()
+    gateway.has_label = lambda _kind, _number, _label: False
+    claim = Relabel(
+        Target.ISSUE,
+        1,
+        Label.AI_READY,
+        Label.AI_WORKING,
+        "observed-revision",
+    )
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _world: [
+            claim,
+            RunAgent(AgentKind.RESOLVE, 1, claim),
+        ],
+        Executor(gateway, run_agent=calls.append),
+        dispatch_rejected=rejected.append,
+        log=logs.append,
+    )
+
+    assert daemon.tick() == [claim]
+    assert calls == []
+    assert rejected == [RunAgent(AgentKind.RESOLVE, 1, claim)]
+    assert any("claim did not complete" in message for message in logs)
 
 
 def test_a_gated_tick_is_journalled_once_per_trip():

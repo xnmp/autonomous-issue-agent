@@ -15,7 +15,7 @@ in the executor. `Relabel`/`PostComment`/`CloseIssue` are leaf side-effects;
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Union
 
@@ -59,6 +59,9 @@ class Relabel:
     number: int
     remove: Label | None
     add: Label | None
+    # None lets compatibility actions bind at command creation. An explicit
+    # empty string means the observation lacked a revision and must fail closed.
+    expected_revision: str | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +114,7 @@ class RerunFailedChecks:
 
     pr: int
     head: str
+    run_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -135,6 +139,7 @@ class RunAgent:
 
     kind: AgentKind
     number: int = 0
+    requires: Relabel | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
