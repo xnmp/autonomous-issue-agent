@@ -59,5 +59,40 @@
     "scope_balance_fingerprint_match": true,
     "totals_match": true
   },
-  "status": "passed"
+  "status": "passed",
+  "schema_follow_up": {
+    "observed_at": "2026-07-30T20:13:40Z",
+    "commit": "3f79725563de6c452d0f18d993254cc55e067c50",
+    "code_tree": "8b804c422b28306115aea74c8884016d69983313",
+    "current_schema_version": 11,
+    "supported_upgrade_histories": [
+      [
+        8,
+        9,
+        10,
+        11
+      ],
+      [
+        9,
+        10,
+        11
+      ]
+    ],
+    "concurrency_contract": "Three spawned role processes concurrently initialize fresh, v8, and v9 databases; every process succeeds and the final history is contiguous and digest-valid.",
+    "restart_contract": "Each v9, v10, and v11 migration is interrupted before commit and immediately after commit, then reopened and integrity-checked.",
+    "full_suite": "make test passed with 671 adapter tests, including schema concurrency/restart cases.",
+    "live_primary": {
+      "schema_migrations": [
+        9,
+        10,
+        11
+      ],
+      "database_integrity": "ok",
+      "nonterminal_runs": 0,
+      "active_reservations": 0,
+      "leases": 0,
+      "dispatch_claims": 0,
+      "pending_commands": 0
+    }
+  }
 }
