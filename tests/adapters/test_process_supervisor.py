@@ -270,6 +270,101 @@ def test_supervised_command_registers_before_work_executes(tmp_path) -> None:
     _wait_dead(process)
 
 
+def test_cancellation_before_wrapper_registration_prevents_paid_exec(
+    tmp_path,
+) -> None:
+    supervisor = ProcessSupervisor(str(tmp_path), grace_seconds=0.05)
+    run_id = RunId("cancel-before-register")
+    marker = tmp_path / "paid-target-started"
+    command = supervisor.supervised_command(
+        run_id,
+        (
+            sys.executable,
+            "-c",
+            f"from pathlib import Path; Path({str(marker)!r}).write_text('bad')",
+        ),
+    )
+    environment = {
+        **os.environ,
+        **supervisor.launch_guard_env(),
+    }
+
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.setsid()
+            os.kill(os.getpid(), signal.SIGSTOP)
+            os.execvpe(command[0], command, environment)
+        finally:
+            os._exit(127)
+    try:
+        stopped_pid, status = os.waitpid(pid, os.WUNTRACED)
+        assert stopped_pid == pid
+        assert os.WIFSTOPPED(status)
+
+        supervisor.kill_tree(run_id)
+        os.kill(pid, signal.SIGCONT)
+        exited_pid, status = os.waitpid(pid, 0)
+
+        assert exited_pid == pid
+        assert os.WIFEXITED(status)
+        assert os.WEXITSTATUS(status) != 0
+        assert not marker.exists()
+        assert supervisor.registrations() == ()
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def test_superseded_launch_token_cannot_register_against_a_retry(
+    tmp_path,
+) -> None:
+    supervisor = ProcessSupervisor(str(tmp_path), grace_seconds=0.05)
+    run_id = RunId("superseded-launch")
+    stale_marker = tmp_path / "stale-started"
+    stale = supervisor.supervised_command(
+        run_id,
+        (
+            sys.executable,
+            "-c",
+            f"from pathlib import Path; Path({str(stale_marker)!r}).touch()",
+        ),
+    )
+    supervisor.kill_tree(run_id)
+    current = supervisor.supervised_command(
+        run_id,
+        (sys.executable, "-c", "import time; time.sleep(30)"),
+    )
+
+    stale_result = subprocess.run(
+        stale,
+        start_new_session=True,
+        env={**os.environ, **supervisor.launch_guard_env()},
+        check=False,
+        capture_output=True,
+    )
+    process = subprocess.Popen(
+        current,
+        start_new_session=True,
+        env={**os.environ, **supervisor.launch_guard_env()},
+    )
+    try:
+        deadline = time.monotonic() + 3
+        while (
+            not supervisor.registrations()
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+        assert stale_result.returncode != 0
+        assert not stale_marker.exists()
+        assert supervisor.registrations()[0].leader.pid == process.pid
+    finally:
+        supervisor.kill_tree(run_id)
+        _wait_dead(process)
+
+
 def test_supervised_paid_command_registers_the_sqlite_run_lease(tmp_path) -> None:
     state_dir = tmp_path / "state"
     supervisor = ProcessSupervisor(str(state_dir), grace_seconds=0.05)

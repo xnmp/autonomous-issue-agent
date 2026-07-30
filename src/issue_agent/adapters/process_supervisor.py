@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import signal
@@ -9,8 +10,11 @@ import subprocess
 import sys
 import tempfile
 import time
-from hashlib import sha256
+import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 
 from ..domain.contracts import RunId
@@ -29,6 +33,14 @@ class ProcessIdentity:
     start_ticks: int
 
 
+@dataclass(frozen=True)
+class LaunchIntent:
+    run_id: RunId
+    token: str
+    state: str
+    launcher: ProcessIdentity
+
+
 class ProcessSupervisor:
     """Persist process groups before work proceeds and reap them idempotently.
 
@@ -45,6 +57,7 @@ class ProcessSupervisor:
         self.state_dir = Path(state_dir).resolve()
         self.directory = self.state_dir / "process-groups"
         self.tree_directory = self.state_dir / "process-trees"
+        self.intent_directory = self.state_dir / "launch-intents"
         self.grace_seconds = grace_seconds
 
     def supervised_command(
@@ -54,13 +67,14 @@ class ProcessSupervisor:
 
         if not argv:
             raise ValueError("supervised command cannot be empty")
-        self._path(run_id)
+        token = self.prepare_launch(run_id)
         return (
             sys.executable,
             "-m",
             "issue_agent.adapters.supervised_exec",
             str(self.state_dir),
             str(run_id),
+            token,
             *argv,
         )
 
@@ -82,7 +96,7 @@ class ProcessSupervisor:
     ) -> tuple[str, dict[str, str]]:
         """Return an SDK-compatible CLI path that registers before exec."""
 
-        self._path(run_id)
+        token = self.prepare_launch(run_id)
         target = os.path.realpath(executable)
         if not os.path.isfile(target) or not os.access(target, os.X_OK):
             raise ValueError(f"supervised CLI is not executable: {target}")
@@ -113,9 +127,73 @@ class ProcessSupervisor:
         return str(wrapper), {
             "ISSUE_AGENT_SUPERVISOR_STATE_DIR": str(self.state_dir),
             "ISSUE_AGENT_SUPERVISOR_RUN_ID": str(run_id),
+            "ISSUE_AGENT_SUPERVISOR_LAUNCH_TOKEN": token,
             "ISSUE_AGENT_SUPERVISED_TARGET": target,
             **self.launch_guard_env(),
         }
+
+    def prepare_launch(self, run_id: RunId) -> str:
+        """Persist a generation-token intent before a provider can be spawned."""
+
+        identity = self.process_identity(os.getpid())
+        if identity is None:
+            raise ProcessLookupError("launcher process identity is unavailable")
+        token = uuid.uuid4().hex
+        with self._intent_lock():
+            registration_path = self._path(run_id)
+            if registration_path.exists():
+                raise RuntimeError(
+                    f"run {run_id} still has a process registration"
+                )
+            self._write_intent(
+                LaunchIntent(run_id, token, "pending", identity)
+            )
+        return token
+
+    def register_prepared_launch(
+        self,
+        run_id: RunId,
+        token: str,
+        pgid: int,
+        *,
+        leader_pid: int | None = None,
+    ) -> ProcessRegistration:
+        """Register only if cancellation has not tombstoned this generation."""
+
+        if not token:
+            raise ValueError("supervised launch token is required")
+        with self._intent_lock():
+            intent = self._read_intent(self._intent_path(run_id))
+            if (
+                intent is None
+                or intent.token != token
+                or intent.state != "pending"
+            ):
+                raise RuntimeError(
+                    "supervised launch was cancelled or superseded"
+                )
+            registration = self.register(
+                run_id, pgid, leader_pid=leader_pid
+            )
+            self._write_intent(
+                LaunchIntent(run_id, token, "registered", intent.launcher)
+            )
+            return registration
+
+    def require_registered_launch(self, run_id: RunId, token: str) -> None:
+        """Final pre-exec check; later cancellation sees the registration."""
+
+        with self._intent_lock():
+            intent = self._read_intent(self._intent_path(run_id))
+            if (
+                intent is None
+                or intent.token != token
+                or intent.state != "registered"
+                or self._read(self._path(run_id)) is None
+            ):
+                raise RuntimeError(
+                    "supervised launch is no longer authorized"
+                )
 
     def register(
         self, run_id: RunId, pgid: int, *, leader_pid: int | None = None
@@ -162,19 +240,54 @@ class ProcessSupervisor:
             pass
 
     def kill_tree(self, run_id: RunId, grace_seconds: float | None = None) -> None:
-        registration = self._read(self._path(run_id))
+        with self._intent_lock():
+            intent_path = self._intent_path(run_id)
+            intent = self._read_intent(intent_path)
+            if intent is None:
+                identity = self.process_identity(os.getpid())
+                if identity is None:
+                    raise ProcessLookupError(
+                        "cancelling process identity is unavailable"
+                    )
+                intent = LaunchIntent(
+                    run_id,
+                    f"cancelled-{uuid.uuid4().hex}",
+                    "cancelled",
+                    identity,
+                )
+            else:
+                intent = LaunchIntent(
+                    run_id,
+                    intent.token,
+                    "cancelled",
+                    intent.launcher,
+                )
+            self._write_intent(intent)
+            registration = self._read(self._path(run_id))
         if registration is None:
             return
         grace = self.grace_seconds if grace_seconds is None else grace_seconds
         self._terminate(registration, grace)
-        self.unregister(run_id)
+        with self._intent_lock():
+            current = self._read(self._path(run_id))
+            if current == registration:
+                self.unregister(run_id)
+            current_intent = self._read_intent(self._intent_path(run_id))
+            if (
+                current_intent is not None
+                and current_intent.token == intent.token
+                and current_intent.state == "cancelled"
+            ):
+                self._remove_intent(run_id)
 
     def recover_orphans(self) -> tuple[RunId, ...]:
+        self._discard_dead_launcher_intents()
         return self._reap_registered(self.grace_seconds)
 
     def force_kill_all(self) -> tuple[RunId, ...]:
         """Reap every owned process immediately at the application deadline."""
 
+        self._cancel_all_intents()
         return self._reap_registered(0.0)
 
     def _reap_registered(self, grace_seconds: float) -> tuple[RunId, ...]:
@@ -190,12 +303,8 @@ class ProcessSupervisor:
                 # Quarantine it instead of guessing a process id.
                 path.rename(path.with_suffix(".invalid"))
                 continue
-            self._terminate(registration, grace_seconds)
+            self.kill_tree(registration.run_id, grace_seconds)
             recovered.append(registration.run_id)
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
         for path in (
             sorted(self.tree_directory.glob("*.json"))
             if self.tree_directory.exists()
@@ -313,6 +422,131 @@ class ProcessSupervisor:
         if not safe or safe in {".", ".."} or "/" in safe or "\0" in safe:
             raise ValueError("run id is not safe for a registry filename")
         return self.tree_directory / f"{safe}.json"
+
+    def _intent_path(self, run_id: RunId) -> Path:
+        safe = str(run_id)
+        if not safe or safe in {".", ".."} or "/" in safe or "\0" in safe:
+            raise ValueError("run id is not safe for an intent filename")
+        return self.intent_directory / f"{safe}.json"
+
+    @contextmanager
+    def _intent_lock(self) -> Iterator[None]:
+        self.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path = self.state_dir / ".launch-intents.lock"
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def _write_intent(self, intent: LaunchIntent) -> None:
+        self.intent_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        target = self._intent_path(intent.run_id)
+        fd, temporary = tempfile.mkstemp(
+            dir=self.intent_directory, prefix=f".{target.name}.", text=True
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(
+                    {
+                        "run_id": str(intent.run_id),
+                        "token": intent.token,
+                        "state": intent.state,
+                        "launcher": {
+                            "pid": intent.launcher.pid,
+                            "start_ticks": intent.launcher.start_ticks,
+                        },
+                    },
+                    stream,
+                )
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise
+
+    @staticmethod
+    def _read_intent(path: Path) -> LaunchIntent | None:
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            intent = LaunchIntent(
+                RunId(str(raw["run_id"])),
+                str(raw["token"]),
+                str(raw["state"]),
+                ProcessIdentity(
+                    int(raw["launcher"]["pid"]),
+                    int(raw["launcher"]["start_ticks"]),
+                ),
+            )
+            if (
+                not str(intent.run_id)
+                or not intent.token
+                or intent.state not in {"pending", "registered", "cancelled"}
+                or intent.launcher.pid <= 0
+                or intent.launcher.start_ticks <= 0
+            ):
+                return None
+            return intent
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            return None
+
+    def _remove_intent(self, run_id: RunId) -> None:
+        try:
+            self._intent_path(run_id).unlink()
+        except FileNotFoundError:
+            pass
+
+    def _cancel_all_intents(self) -> None:
+        with self._intent_lock():
+            paths = (
+                sorted(self.intent_directory.glob("*.json"))
+                if self.intent_directory.exists()
+                else ()
+            )
+            for path in paths:
+                intent = self._read_intent(path)
+                if intent is None:
+                    path.rename(path.with_suffix(".invalid"))
+                    continue
+                self._write_intent(
+                    LaunchIntent(
+                        intent.run_id,
+                        intent.token,
+                        "cancelled",
+                        intent.launcher,
+                    )
+                )
+
+    def _discard_dead_launcher_intents(self) -> None:
+        with self._intent_lock():
+            paths = (
+                sorted(self.intent_directory.glob("*.json"))
+                if self.intent_directory.exists()
+                else ()
+            )
+            for path in paths:
+                intent = self._read_intent(path)
+                if intent is None:
+                    path.rename(path.with_suffix(".invalid"))
+                    continue
+                if not self.matches_identity(
+                    intent.launcher.pid, intent.launcher.start_ticks
+                ):
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
 
     @staticmethod
     def _read(path: Path) -> ProcessRegistration | None:

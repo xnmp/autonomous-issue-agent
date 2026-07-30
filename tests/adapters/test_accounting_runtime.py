@@ -269,6 +269,93 @@ def test_disabled_caps_still_reserve_and_settle_subscription_run(tmp_path) -> No
     assert store.active_reservation_runs() == ()
 
 
+def test_disabled_caps_still_price_observed_subscription_stream_usage(
+    tmp_path,
+) -> None:
+    runtime = Runtime(
+        AgentResult(
+            False,
+            status="stream-only",
+            cost_usd=0,
+            usage=None,
+            stream_usage={
+                "input_tokens": 1_000_000,
+                "output_tokens": 100_000,
+            },
+        )
+    )
+    store = SQLiteControlStore(str(tmp_path / "control.db"))
+    store.initialize()
+    wrapper = AccountingRuntime(
+        runtime,
+        store,
+        "o/r",
+        "fix",
+        None,
+        None,
+        None,
+        "cfg",
+        "claude",
+        _policy(),
+        _rates(),
+    )
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
+
+    result = asyncio.run(
+        wrapper.run(
+            RuntimePlan("work", model="gpt-test", max_budget_usd=2)
+        )
+    )
+
+    assert result.status == "stream-only"
+    with store._connect() as db:
+        amount, basis, usage_json, rate_card = db.execute(
+            "SELECT amount_micros, basis, usage_json, rate_card_id "
+            "FROM charges"
+        ).fetchone()
+    assert amount == 8_000_000
+    assert basis == "synthetic"
+    assert json.loads(usage_json)["input_tokens"] == 1_000_000
+    assert rate_card == "test"
+
+
+def test_disabled_caps_honor_explicit_unpriced_codex_opt_out(
+    tmp_path,
+) -> None:
+    runtime = Runtime(
+        AgentResult(False, status="untracked", cost_usd=0, usage=None)
+    )
+    store = SQLiteControlStore(str(tmp_path / "control.db"))
+    store.initialize()
+    wrapper = AccountingRuntime(
+        runtime,
+        store,
+        "o/r",
+        "fix",
+        None,
+        None,
+        None,
+        "cfg",
+        "codex",
+        _policy(),
+        None,
+    )
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
+
+    result = asyncio.run(
+        wrapper.run(RuntimePlan("work", max_budget_usd=2))
+    )
+
+    assert result.status == "untracked"
+    assert runtime.calls == 1
+    assert store.active_reservation_runs() == ()
+    with store._connect() as db:
+        amount, basis = db.execute(
+            "SELECT amount_micros, basis FROM charges"
+        ).fetchone()
+    assert (amount, basis) == (0, "synthetic")
+
+
 def test_subscription_usage_is_synthetically_priced_and_consumes_cap(
     tmp_path,
 ) -> None:

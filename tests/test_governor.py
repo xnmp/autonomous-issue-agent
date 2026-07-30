@@ -448,6 +448,49 @@ def test_runtime_command_indirection_is_unresolvable_and_blocked(command):
     assert gov.find_violations(command)
 
 
+@pytest.mark.parametrize(
+    "command",
+    (
+        "FOO=push git --config-env=alias.x=FOO x origin main",
+        "FOO='!git push origin main' git --config-env=alias.x=FOO x",
+        "FOO=push git --config-env alias.x=FOO x origin main",
+    ),
+)
+def test_git_config_env_alias_is_unresolvable_and_blocked(command):
+    resolution = gov.resolve(command)
+    assert isinstance(resolution, gov.Unresolvable)
+    assert gov.find_violations(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.x "
+        "GIT_CONFIG_VALUE_0=push git x origin main",
+        """GIT_CONFIG_PARAMETERS="'alias.x=push'" git x origin main""",
+        "git -c include.path=/tmp/aliases x origin main",
+        "GIT_CONFIG_GLOBAL=/tmp/aliases git x origin main",
+    ),
+)
+def test_unknown_git_subcommand_cannot_resolve_through_runtime_alias(command):
+    resolution = gov.resolve(command)
+    assert isinstance(resolution, gov.Unresolvable)
+    assert gov.find_violations(command)
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "git status --short",
+        "git diff --stat",
+        "git add src/app.py",
+        "git config user.name alice",
+    ),
+)
+def test_known_git_builtins_remain_resolvable(command):
+    assert not isinstance(gov.resolve(command), gov.Unresolvable)
+
+
 def test_even_benign_function_definition_is_not_misclassified_as_static():
     assert isinstance(
         gov.resolve("f() { echo ok; }; f"),

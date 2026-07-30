@@ -285,6 +285,70 @@ _LITERAL_CONSUMERS = frozenset(
     {"grep", "rg", "printf", "echo", "cat", "sed", "awk"}
 )
 _GOVERNED_BINARIES = frozenset({"git", "gh"})
+_GIT_BUILTIN_SUBCOMMANDS = frozenset(
+    {
+        "add",
+        "am",
+        "apply",
+        "archive",
+        "bisect",
+        "blame",
+        "branch",
+        "cat-file",
+        "check-ignore",
+        "check-ref-format",
+        "checkout",
+        "cherry-pick",
+        "clean",
+        "clone",
+        "commit",
+        "config",
+        "describe",
+        "diff",
+        "diff-index",
+        "diff-tree",
+        "fetch",
+        "for-each-ref",
+        "format-patch",
+        "grep",
+        "hash-object",
+        "help",
+        "init",
+        "log",
+        "ls-files",
+        "ls-remote",
+        "ls-tree",
+        "merge",
+        "merge-base",
+        "merge-tree",
+        "mv",
+        "name-rev",
+        "notes",
+        "pull",
+        "push",
+        "range-diff",
+        "rebase",
+        "reflog",
+        "remote",
+        "reset",
+        "restore",
+        "rev-list",
+        "rev-parse",
+        "revert",
+        "rm",
+        "show",
+        "show-ref",
+        "sparse-checkout",
+        "stash",
+        "status",
+        "submodule",
+        "switch",
+        "symbolic-ref",
+        "tag",
+        "update-index",
+        "worktree",
+    }
+)
 _GH_READS = {
     "issue": frozenset({"view", "list", "status"}),
     "pr": frozenset({"view", "list", "diff", "checks", "status"}),
@@ -375,6 +439,27 @@ def resolve(command: str) -> Resolution:
                     and inner[index + 1].lower().startswith("alias.")
                 ):
                     return Unresolvable("git -c alias.* defers subcommand resolution")
+                if word.lower().startswith("--config-env=alias."):
+                    return Unresolvable(
+                        "git --config-env=alias.* defers subcommand resolution"
+                    )
+                if (
+                    word == "--config-env"
+                    and index + 1 < len(inner)
+                    and inner[index + 1].lower().startswith("alias.")
+                ):
+                    return Unresolvable(
+                        "git --config-env alias.* defers subcommand resolution"
+                    )
+            subcommand = _git_subcommand(inner)
+            if (
+                subcommand is not None
+                and subcommand[0] not in _GIT_BUILTIN_SUBCOMMANDS
+            ):
+                return Unresolvable(
+                    f"unknown git subcommand {subcommand[0]!r} may be a "
+                    "runtime-configured alias"
+                )
         if base == "gh" and classify(words) is None:
             allowed = (
                 len(inner) >= 3

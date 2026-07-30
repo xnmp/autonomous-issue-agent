@@ -59,6 +59,9 @@ exit 0
             """
 printf '%s\n' "$*" >> "$SERVICE_LOG"
 if [ "${1:-}" = "list" ]; then
+  case " ${LOADED_LABELS:-} " in
+    *" ${2:-} "*) exit 0 ;;
+  esac
   [ -f "$HOME/Library/LaunchAgents/${2:-}.plist" ]
   exit $?
 fi
@@ -83,6 +86,7 @@ exit 0
         "FAIL_PATTERN": fail_pattern,
         "FAIL_ONCE_FILE": str(tmp_path / "failed-once"),
         "SERVICE_LOG": str(tmp_path / "service.log"),
+        "LOADED_LABELS": "",
     }
     return env, home, fake_bin / "uv"
 
@@ -106,6 +110,34 @@ def test_systemd_installer_renders_validated_units_with_absolute_uv(tmp_path):
         in unit.read_text()
         for unit in units
     )
+
+
+def test_systemd_scoped_uninstall_preserves_other_deployments(tmp_path):
+    env, home, _uv = _environment(tmp_path, systemd=True)
+    unit_dir = home / ".config/systemd/user"
+    unit_dir.mkdir(parents=True)
+    for deployment in ("my-app", "other-app"):
+        for role in ("fix-watcher", "review-watcher", "steward"):
+            (unit_dir / f"issue-agent-{role}-{deployment}.service").write_text(
+                deployment
+            )
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "bin/install-systemd.sh"),
+            "uninstall",
+            "My App",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    remaining = tuple(unit_dir.glob("*.service"))
+    assert len(remaining) == 3
+    assert all(path.name.endswith("-other-app.service") for path in remaining)
 
 
 def test_systemd_upgrade_stops_and_removes_every_legacy_unit_name(
@@ -294,6 +326,45 @@ def test_launchd_installer_renders_validated_plists_with_absolute_uv(tmp_path):
     )
 
 
+def test_launchd_scoped_uninstall_preserves_other_deployments(tmp_path):
+    env, home, _uv = _environment(tmp_path, systemd=False)
+    config = Path(env["AGENT_ENV"])
+    target = tmp_path / "target-repo"
+    checksum = subprocess.run(
+        ["cksum"],
+        input=f"{config}|{target}",
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()[0]
+    launch_agents = home / "Library/LaunchAgents"
+    launch_agents.mkdir(parents=True)
+    for role in ("fix-watcher", "review-watcher", "steward"):
+        (launch_agents / f"dev.issue-agent.{role}.{checksum}.plist").write_text(
+            "current"
+        )
+        (launch_agents / f"dev.issue-agent.{role}.999999.plist").write_text(
+            "other"
+        )
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "bin/install-launchd.sh"),
+            "uninstall",
+            "target-repo",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    remaining = tuple(launch_agents.glob("*.plist"))
+    assert len(remaining) == 3
+    assert all(path.name.endswith(".999999.plist") for path in remaining)
+
+
 def test_launchd_upgrade_unloads_and_removes_unsuffixed_legacy_jobs(
     tmp_path,
 ):
@@ -325,6 +396,41 @@ def test_launchd_upgrade_unloads_and_removes_unsuffixed_legacy_jobs(
         legacy = launch_agents / f"{label}.plist"
         assert f"unload {legacy}" in calls
         assert f"remove {label}" in calls
+
+
+def test_launchd_refuses_loaded_current_job_without_rollback_plist(
+    tmp_path,
+):
+    env, home, _uv = _environment(tmp_path, systemd=False)
+    config = Path(env["AGENT_ENV"])
+    target = tmp_path / "target-repo"
+    checksum = subprocess.run(
+        ["cksum"],
+        input=f"{config}|{target}",
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()[0]
+    label = f"dev.issue-agent.fix-watcher.{checksum}"
+    env["LOADED_LABELS"] = label
+
+    result = subprocess.run(
+        ["bash", str(ROOT / "bin/install-launchd.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "loaded current job" in result.stderr
+    assert "no recoverable plist" in result.stderr
+    calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
+    assert not any(call.startswith(("unload ", "remove ", "load ")) for call in calls)
+    assert not tuple(
+        (
+            home / "Library/Application Support/issue-agent"
+        ).glob("*.env")
+    )
 
 
 @pytest.mark.parametrize("selector", ("--fix", "--review", "--steward"))

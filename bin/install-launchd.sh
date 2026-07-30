@@ -3,7 +3,8 @@
 # the plist templates, copies them to ~/Library/LaunchAgents, and loads them.
 #
 #   bin/install-launchd.sh           # install + load all three
-#   bin/install-launchd.sh uninstall # unload + remove all
+#   bin/install-launchd.sh uninstall        # unload + remove all
+#   bin/install-launchd.sh uninstall <name> # unload + remove AGENT_ENV deployment
 set -euo pipefail
 HARNESS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIG="${AGENT_ENV:-$HARNESS_ROOT/config/agent.env}"
@@ -21,9 +22,26 @@ case "${1:-}" in
 esac
 
 if [ "${1:-}" = "uninstall" ]; then
-  for plist in "$LA"/dev.issue-agent.fix-watcher*.plist \
-               "$LA"/dev.issue-agent.review-watcher*.plist \
-               "$LA"/dev.issue-agent.steward*.plist; do
+  if [ -n "${2:-}" ]; then
+    [ -f "$CONFIG" ] || {
+      echo "config not found: $CONFIG; refusing scoped uninstall" >&2
+      exit 1
+    }
+    TARGET_DIR="$(set -a; . "$CONFIG"; set +a; printf '%s' "${TARGET_DIR:-}")"
+    deployment_id="$(printf '%s' "$CONFIG|$TARGET_DIR" | cksum | awk '{print $1}')"
+    patterns=(
+      "$LA/dev.issue-agent.fix-watcher.$deployment_id.plist"
+      "$LA/dev.issue-agent.review-watcher.$deployment_id.plist"
+      "$LA/dev.issue-agent.steward.$deployment_id.plist"
+    )
+  else
+    patterns=(
+      "$LA"/dev.issue-agent.fix-watcher*.plist
+      "$LA"/dev.issue-agent.review-watcher*.plist
+      "$LA"/dev.issue-agent.steward*.plist
+    )
+  fi
+  for plist in "${patterns[@]}"; do
     [ -e "$plist" ] || continue
     launchctl unload "$plist" 2>/dev/null || true
     rm -f "$plist"
@@ -94,8 +112,13 @@ for index in "${!units[@]}"; do
   label="dev.issue-agent.$u.$deployment_id"
   dst="$LA/$label.plist"
   [ ! -f "$dst" ] || cp "$dst" "$STAGE/$index.previous"
-  launchctl list "$label" >/dev/null 2>&1 \
-    && touch "$STAGE/$index.loaded" || true
+  if launchctl list "$label" >/dev/null 2>&1; then
+    if [ ! -f "$dst" ]; then
+      echo "REFUSING cutover: loaded current job $label has no recoverable plist at $dst" >&2
+      exit 2
+    fi
+    touch "$STAGE/$index.loaded"
+  fi
 done
 for index in "${!units[@]}"; do
   u="${units[$index]}"

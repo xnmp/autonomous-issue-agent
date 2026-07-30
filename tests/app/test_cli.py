@@ -9,6 +9,7 @@ import json
 import os
 import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 
 from issue_agent.app import cli
 
@@ -374,14 +375,17 @@ def test_resolve_name_target_dir_realpath_normalized(tmp_path):
     assert cli.resolve_name(repo, repos_dir=str(tmp_path), target_dir="/repos/./app") == "app"
 
 
-def test_resolve_name_falls_back_to_repo_only_when_no_target_match(tmp_path):
-    """target_dir given but no overlay's TARGET_DIR matches → existing REPO-first
-    (alpha) behavior, preserving back-compat."""
+def test_resolve_name_does_not_reuse_same_repo_from_another_checkout(
+    tmp_path, capsys
+):
+    """A known checkout is a deployment identity axis, not a hint."""
     repo = "acme/App-combined-agent"
     (tmp_path / "app-wt.env").write_text(f'REPO="{repo}"\nTARGET_DIR="/repos/app-harness"\n')
     (tmp_path / "app.env").write_text(f'REPO="{repo}"\nTARGET_DIR="/repos/app"\n')
-    # Detected dir matches neither overlay → first alpha REPO match (app-wt).
-    assert cli.resolve_name(repo, repos_dir=str(tmp_path), target_dir="/somewhere/else") == "app-wt"
+    assert cli.resolve_name(
+        repo, repos_dir=str(tmp_path), target_dir="/somewhere/else"
+    ) == cli.derive_name(repo)
+    assert "different working copy" in capsys.readouterr().err
 
 
 # ── synth_repo_env round-trips through the daemon's reader ─────────────────────
@@ -706,19 +710,17 @@ def test_check_overlay_mismatch_no_file_is_not_a_mismatch(tmp_path):
     assert cli.check_overlay_mismatch("app", "other/app", "/srv/other-app", repos_dir=str(tmp_path)) == ""
 
 
-def test_check_overlay_mismatch_same_repo_different_target_dir_is_not_fatal(tmp_path):
-    """resolve_name's Tier-3 fallback (same REPO, no TARGET_DIR-matching
-    overlay — e.g. two checkouts of one repo, or the checkout moved) is
-    legitimate, tested, back-compat behavior. A REPO-agreeing overlay whose
-    TARGET_DIR differs from the detected one must NOT be flagged — only a
-    REPO mismatch (or, absent any REPO field, a TARGET_DIR mismatch) is."""
+def test_check_overlay_mismatch_same_repo_different_target_dir_is_fatal(tmp_path):
+    """A sibling checkout must not start or stop this deployment."""
     (tmp_path / "app-wt.env").write_text(
         'REPO="acme/app"\nTARGET_DIR="/srv/app-harness"\n'
     )
     msg = cli.check_overlay_mismatch(
         "app-wt", "acme/app", "/srv/somewhere-else", repos_dir=str(tmp_path)
     )
-    assert msg == ""
+    assert msg
+    assert "/srv/app-harness" in msg
+    assert "/srv/somewhere-else" in msg
 
 
 def test_check_overlay_mismatch_target_dir_fallback_when_no_repo_recorded(tmp_path):
@@ -838,6 +840,21 @@ def test_role_pid_discovery_is_scoped_to_requested_deployment(
     }
 
 
+def test_launcher_pid_discovery_uses_exact_deployment_argv_token(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(cli, "_pgrep", lambda _pattern: [101, 102, 103])
+    argv = {
+        101: ("/bin/bash", "/opt/harness/bin/point-at.sh", "app"),
+        102: ("/bin/bash", "/opt/harness/bin/point-at.sh", "app2"),
+        103: ("/bin/bash", "/tmp/not-point-at.sh", "app"),
+    }
+    monkeypatch.setattr(cli, "_pid_argv", lambda pid: argv[pid])
+
+    assert cli._launcher_pids("app") == [101]
+    assert cli._launcher_pids("app2") == [102]
+
+
 def test_linux_pid_deployment_identity_comes_from_process_environment():
     if not os.path.isdir("/proc"):
         return
@@ -933,7 +950,9 @@ def test_install_service_aborts_on_compose_failure(tmp_path, monkeypatch):
     return code was never inspected — a compose failure proceeded straight to
     installing the service against a stale/missing config/.active.env."""
     monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
-    (tmp_path / "myapp.env").write_text('REPO="o/r"\n')
+    (tmp_path / "myapp.env").write_text(
+        f'REPO="o/r"\nTARGET_DIR="{tmp_path}"\n'
+    )
     shared = tmp_path / "shared.env"
     shared.write_text("")
     monkeypatch.setattr(cli, "SHARED_ENV", str(shared))
@@ -964,7 +983,9 @@ def test_install_service_aborts_on_compose_failure(tmp_path, monkeypatch):
 def test_install_service_proceeds_on_compose_success(tmp_path, monkeypatch):
     """Anti-vacuity twin: a successful compose still installs the service."""
     monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
-    (tmp_path / "myapp.env").write_text('REPO="o/r"\n')
+    (tmp_path / "myapp.env").write_text(
+        f'REPO="o/r"\nTARGET_DIR="{tmp_path}"\n'
+    )
     shared = tmp_path / "shared.env"
     shared.write_text("")
     monkeypatch.setattr(cli, "SHARED_ENV", str(shared))
@@ -1005,7 +1026,9 @@ def test_install_service_rejects_partial_role_cutover(
     capsys,
 ) -> None:
     monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
-    (tmp_path / "myapp.env").write_text('REPO="o/r"\n')
+    (tmp_path / "myapp.env").write_text(
+        f'REPO="o/r"\nTARGET_DIR="{tmp_path}"\n'
+    )
     shared = tmp_path / "shared.env"
     shared.write_text("")
     monkeypatch.setattr(cli, "SHARED_ENV", str(shared))
@@ -1014,6 +1037,74 @@ def test_install_service_rejects_partial_role_cutover(
 
     assert cli.cmd_install_service(args) == 2
     assert "every legacy writer stops" in capsys.readouterr().err
+
+
+def test_uninstall_service_defaults_to_current_deployment(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
+    monkeypatch.setattr(cli, "SHARED_ENV", str(tmp_path / "shared.env"))
+    Path(cli.SHARED_ENV).write_text("")
+    (tmp_path / "myapp.env").write_text(
+        f'REPO="o/r"\nTARGET_DIR="{tmp_path}"\n'
+    )
+    calls: list[tuple[list[str], dict]] = []
+    real_run = cli.subprocess.run
+
+    class _Result:
+        returncode = 0
+
+    def fake_run(command, **kwargs):
+        if command[:2] == ["bash", "-c"]:
+            return real_run(command, **kwargs)
+        calls.append((command, kwargs))
+        return _Result()
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+    args = argparse.Namespace(
+        repo="o/r",
+        target_dir=str(tmp_path),
+        name="myapp",
+        all=False,
+    )
+
+    assert cli.cmd_uninstall_service(args) == 0
+    uninstall, kwargs = calls[-1]
+    assert uninstall[-2:] == ["uninstall", "myapp"]
+    assert kwargs["env"]["ISSUE_AGENT_DEPLOYMENT_ID"] == "myapp"
+    assert kwargs["env"]["AGENT_ENV"].endswith(".active.myapp.env")
+
+
+def test_uninstall_service_all_is_explicit_and_unscoped(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    class _Result:
+        returncode = 0
+
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda command, **_kwargs: calls.append(command) or _Result(),
+    )
+    args = argparse.Namespace(
+        repo="",
+        target_dir="",
+        name="",
+        all=True,
+    )
+
+    assert cli.cmd_uninstall_service(args) == 0
+    assert calls == [
+        [
+            "/bin/bash",
+            cli._bin(
+                "install-launchd.sh"
+                if cli.sys.platform == "darwin"
+                else "install-systemd.sh"
+            ),
+            "uninstall",
+        ]
+    ]
 
 
 # ── TEST_CMD verification (a wrong command wedges the whole gate) ──────────────

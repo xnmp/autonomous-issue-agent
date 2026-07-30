@@ -31,7 +31,9 @@ DRY_RUN=0
 
 if [ "${1:-}" = "uninstall" ]; then
   if [ -n "${2:-}" ]; then
-    pattern="issue-agent-*-$2.service"
+    uninstall_name="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]/-/g; s/^-+//; s/-+$//')"
+    uninstall_name="${uninstall_name:-target}"
+    pattern="issue-agent-*-$uninstall_name.service"
   else
     pattern="issue-agent-*.service"
   fi

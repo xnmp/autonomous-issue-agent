@@ -13,6 +13,7 @@ from .process_supervisor import ProcessSupervisor
 
 _STATE_ENV = "ISSUE_AGENT_SUPERVISOR_STATE_DIR"
 _RUN_ENV = "ISSUE_AGENT_SUPERVISOR_RUN_ID"
+_TOKEN_ENV = "ISSUE_AGENT_SUPERVISOR_LAUNCH_TOKEN"
 _TARGET_ENV = "ISSUE_AGENT_SUPERVISED_TARGET"
 _PARENT_PID_ENV = "ISSUE_AGENT_SUPERVISOR_PARENT_PID"
 _PARENT_START_ENV = "ISSUE_AGENT_SUPERVISOR_PARENT_START_TICKS"
@@ -39,13 +40,13 @@ def _require_live_launcher(environment: Mapping[str, str]) -> None:
 def _register(
     state_dir: str,
     run_id: RunId,
+    token: str,
     environment: Mapping[str, str],
 ) -> None:
     _require_live_launcher(environment)
-    registration = ProcessSupervisor(state_dir).register(
-        run_id,
-        os.getpgrp(),
-        leader_pid=os.getpid(),
+    supervisor = ProcessSupervisor(state_dir)
+    registration = supervisor.register_prepared_launch(
+        run_id, token, os.getpgrp(), leader_pid=os.getpid()
     )
     control_db = environment.get("ISSUE_AGENT_CONTROL_DB", "")
     accounting_run_id = environment.get("ISSUE_AGENT_RUN_ID", "")
@@ -62,17 +63,18 @@ def _register(
         process_start_ticks=registration.leader.start_ticks,
     )
     _require_live_launcher(environment)
+    supervisor.require_registered_launch(run_id, token)
 
 
 def main(argv: list[str] | None = None) -> None:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if len(arguments) < 3:
+    if len(arguments) < 4:
         raise SystemExit(
-            "usage: supervised_exec STATE_DIR RUN_ID COMMAND [ARG ...]"
+            "usage: supervised_exec STATE_DIR RUN_ID TOKEN COMMAND [ARG ...]"
         )
-    state_dir, raw_run_id, *command = arguments
+    state_dir, raw_run_id, token, *command = arguments
     environment = dict(os.environ)
-    _register(state_dir, RunId(raw_run_id), environment)
+    _register(state_dir, RunId(raw_run_id), token, environment)
     environment.pop(_PARENT_PID_ENV, None)
     environment.pop(_PARENT_START_ENV, None)
     os.execvpe(command[0], command, environment)
@@ -86,6 +88,7 @@ def supervised_cli_main() -> None:
     try:
         state_dir = environment.pop(_STATE_ENV)
         raw_run_id = environment.pop(_RUN_ENV)
+        token = environment.pop(_TOKEN_ENV)
         target = environment.pop(_TARGET_ENV)
     except KeyError as exc:
         raise SystemExit(f"missing supervised CLI environment: {exc}") from exc
@@ -97,7 +100,12 @@ def supervised_cli_main() -> None:
         additional_keys=explicit_keys,
     )
     os.setsid()
-    _register(state_dir, RunId(raw_run_id), registration_environment)
+    _register(
+        state_dir,
+        RunId(raw_run_id),
+        token,
+        registration_environment,
+    )
     os.execvpe(target, [target, *sys.argv[1:]], environment)
 
 

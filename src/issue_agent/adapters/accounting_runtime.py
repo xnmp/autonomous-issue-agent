@@ -85,7 +85,11 @@ class AccountingRuntime(AgentRuntime):
     async def run(self, task: RuntimePlan) -> AgentResult:
         now = datetime.now(timezone.utc)
         issue, kind, number = self._context.get()
-        if self.runtime_name == "codex" and self.rate_table is None:
+        if (
+            self.runtime_name == "codex"
+            and self.rate_table is None
+            and self._caps_armed()
+        ):
             return _blocked("codex pricing is unavailable")
         if self.issue_cap is not None and issue is None:
             return _blocked("issue spend scope is unavailable")
@@ -210,14 +214,6 @@ class AccountingRuntime(AgentRuntime):
         if (
             (usage is None or usage.total_tokens == 0)
             and provider_amount.micros <= 0
-            and any(
-                cap is not None
-                for cap in (
-                    self.repository_cap,
-                    self.global_cap,
-                    self.issue_cap,
-                )
-            )
         ):
             # A dropped final provider envelope is not evidence of a free run.
             # The stream accumulator can over-count repeated cache counters, but
@@ -232,14 +228,7 @@ class AccountingRuntime(AgentRuntime):
         if (
             usage is None
             and provider_amount.micros <= 0
-            and any(
-                cap is not None
-                for cap in (
-                    self.repository_cap,
-                    self.global_cap,
-                    self.issue_cap,
-                )
-            )
+            and self._caps_armed()
         ):
             if self.runtime_name == "codex" and self.spend_evidence_dir:
                 from .spend_recovery import CodexSpendReconciler
@@ -256,14 +245,7 @@ class AccountingRuntime(AgentRuntime):
             usage is not None
             and usage.total_tokens > 0
             and provider_amount.micros <= 0
-            and any(
-                cap is not None
-                for cap in (
-                    self.repository_cap,
-                    self.global_cap,
-                    self.issue_cap,
-                )
-            )
+            and self._caps_armed()
             and (self.rate_table is None or not model)
         ):
             # Observed work with no usable pricing authority cannot safely
@@ -347,6 +329,16 @@ class AccountingRuntime(AgentRuntime):
 
             remove_spend_evidence(self.spend_evidence_dir, run_id)
         return result
+
+    def _caps_armed(self) -> bool:
+        return any(
+            cap is not None
+            for cap in (
+                self.repository_cap,
+                self.global_cap,
+                self.issue_cap,
+            )
+        )
 
     def _recover_or_release(self, run_id: RunId) -> None:
         """Give every returned failure path a terminal accounting outcome."""

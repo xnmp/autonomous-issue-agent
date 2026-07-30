@@ -181,8 +181,9 @@ def resolve_name(
        worktree `myapp-wt.env`, both my-org/example-agent), this picks the
        one for the working copy you actually launched from, instead of the
        alphabetically-first REPO match (which silently ran against the wrong dir).
-    3. An overlay whose REPO==repo (first alpha) — back-compat fallback when
-       target_dir is unknown or no overlay's TARGET_DIR matches it.
+    3. An overlay whose REPO==repo (first alpha), but only when target_dir is
+       unknown. A known checkout is part of deployment identity and must never
+       silently inherit another checkout's overlay.
     4. Derived from the repo basename.
 
     M12: if none of the above match by REPO, but some OTHER overlay's
@@ -210,9 +211,19 @@ def resolve_name(
                 td = read_repo_env_field(os.path.join(repos_dir, fn), "TARGET_DIR")
                 if td and os.path.realpath(td) == want:
                     return fn[: -len(".env")]
-        # Tier 3: any REPO match (first alpha) — back-compat.
-        if repo_matches:
+        # Tier 3 is only safe when the caller genuinely has no checkout
+        # context. Mutating commands always detect a target and must either
+        # find its exact overlay or synthesize/select one explicitly.
+        if repo_matches and not want:
             return repo_matches[0][: -len(".env")]
+        if repo_matches and want:
+            names = ", ".join(fn[: -len(".env")] for fn in repo_matches)
+            warn(
+                f"existing overlay(s) for {repo!r} ({names}) target a different "
+                f"working copy than {target_dir!r}; refusing implicit reuse. "
+                "Pass --name for a checkout-specific overlay (and "
+                "--write-config only when intentionally repointing it)."
+            )
         # M12: about to fall through to derive_name (4) — last chance to catch
         # a same-checkout duplicate that REPO-matching couldn't see.
         if want:
@@ -234,38 +245,39 @@ def _overlay_context_mismatch(overlay: str, repo: str, target_dir: str) -> str:
     pair — or the overlay doesn't record enough to compare — else a
     human-readable description naming both sides (P0R-2).
 
-    REPO is the primary identity check: a same-basename collision across
-    owners (`derive_name`'s fallback, or a hand-picked `--name`) can point
-    `resolve_name`'s caller at an overlay for a COMPLETELY DIFFERENT repo —
-    reusing it launches all three daemons against that other repo/checkout:
-    it will label issues, open PRs, and merge there.
-
-    TARGET_DIR is consulted ONLY as a fallback identity signal when the
-    overlay records NO REPO at all — never as an independent axis once REPO
-    already agrees. `resolve_name`'s Tier-3 fallback (same REPO, but no
-    overlay's TARGET_DIR matches the detected one — e.g. two checkouts of one
-    repo, or the checkout moved) is legitimate, tested, back-compat behavior;
-    treating a REPO-agreeing, TARGET_DIR-differing overlay as a mismatch here
-    would refuse that supported case, not the wrong-repo danger this guard
-    targets.
+    Repository and checkout are independent parts of deployment identity.
+    Matching REPO alone is insufficient: two checkouts of one repository may
+    have different branches, state roots, and live daemons.
     """
     repo = (repo or "").strip()
     target_dir = (target_dir or "").strip()
     name = os.path.basename(overlay)
     overlay_repo = read_repo_env_field(overlay, "REPO").strip()
-    if overlay_repo:
-        if repo and overlay_repo != repo:
-            return (
-                f"config/repos/{name} is REPO={overlay_repo!r}; this checkout/flags "
-                f"detected REPO={repo!r}"
-            )
-        return ""
     overlay_target = read_repo_env_field(overlay, "TARGET_DIR").strip()
+    if repo and not overlay_repo:
+        target_detail = (
+            f" (TARGET_DIR={overlay_target!r})" if overlay_target else ""
+        )
+        return (
+            f"config/repos/{name} does not record REPO{target_detail}; "
+            f"this checkout/flags detected REPO={repo!r}"
+            + (f" at TARGET_DIR={target_dir!r}" if target_dir else "")
+        )
+    if overlay_repo and repo and overlay_repo != repo:
+        return (
+            f"config/repos/{name} is REPO={overlay_repo!r}; this checkout/flags "
+            f"detected REPO={repo!r}"
+        )
+    if target_dir and not overlay_target:
+        return (
+            f"config/repos/{name} does not record TARGET_DIR; this checkout is "
+            f"{target_dir!r}"
+        )
     if overlay_target and target_dir and (
         os.path.realpath(overlay_target) != os.path.realpath(target_dir)
     ):
         return (
-            f"config/repos/{name} is TARGET_DIR={overlay_target!r} (no REPO recorded); "
+            f"config/repos/{name} is TARGET_DIR={overlay_target!r}; "
             f"this checkout is {target_dir!r}"
         )
     return ""
@@ -656,8 +668,43 @@ def _pgrep(pattern: str) -> list[int]:
     return [int(p) for p in out.split() if p.isdigit()]
 
 
+def _pid_argv(pid: int) -> tuple[str, ...]:
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as handle:
+            return tuple(
+                item.decode(errors="replace")
+                for item in handle.read().split(b"\0")
+                if item
+            )
+    except OSError:
+        if sys.platform != "darwin":
+            return ()
+        completed = subprocess.run(
+            ("ps", "-p", str(pid), "-o", "command="),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if completed.returncode != 0:
+            return ()
+        try:
+            return tuple(shlex.split(completed.stdout))
+        except ValueError:
+            return ()
+
+
 def _launcher_pids(name: str) -> list[int]:
-    return _pgrep(f"point-at.sh {name}")
+    result: list[int] = []
+    for pid in _pgrep("point-at.sh"):
+        argv = _pid_argv(pid)
+        if any(
+            os.path.basename(argument) == "point-at.sh"
+            and index + 1 < len(argv)
+            and argv[index + 1] == name
+            for index, argument in enumerate(argv)
+        ):
+            result.append(pid)
+    return result
 
 
 def _pid_deployment_name(pid: int) -> str:
@@ -1466,7 +1513,41 @@ def cmd_install_service(args) -> int:
 
 def cmd_uninstall_service(args) -> int:
     script = "install-launchd.sh" if sys.platform == "darwin" else "install-systemd.sh"
-    return subprocess.run(["/bin/bash", _bin(script), "uninstall"]).returncode
+    if args.all:
+        return subprocess.run(["/bin/bash", _bin(script), "uninstall"]).returncode
+
+    repo, target_dir, name = _resolve_context(args)
+    mismatch = check_overlay_mismatch(name, repo, target_dir)
+    if mismatch:
+        err(f"REFUSING to uninstall the service for '{name}' — wrong repo/checkout:")
+        err(f"  {mismatch}")
+        err("This could remove another deployment's persistent services. Pass "
+            "--name for the overlay matching this checkout, or --all to "
+            "explicitly remove every deployment.")
+        return 2
+    overlay = os.path.join(REPOS_DIR, f"{name}.env")
+    if not (os.path.isfile(SHARED_ENV) and os.path.isfile(overlay)):
+        err(
+            f"need config/shared.env + config/repos/{name}.env to identify the "
+            "deployment; use --all only when removing every deployment"
+        )
+        return 2
+    composed = subprocess.run(["/bin/bash", _bin("compose-env.sh"), name])
+    if composed.returncode != 0:
+        err(
+            f"compose-env.sh failed (exit {composed.returncode}) — refusing "
+            "an uninstall with unresolved deployment identity."
+        )
+        return composed.returncode
+    env = dict(
+        os.environ,
+        AGENT_ENV=_active_env_path(name),
+        ISSUE_AGENT_DEPLOYMENT_ID=name,
+    )
+    return subprocess.run(
+        ["/bin/bash", _bin(script), "uninstall", name],
+        env=env,
+    ).returncode
 
 
 def cmd_init(args) -> int:
@@ -1652,6 +1733,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_install_service)
 
     sp = sub.add_parser("uninstall-service", help="remove the OS service units")
+    add_context_flags(sp)
+    sp.add_argument(
+        "--all",
+        action="store_true",
+        help="remove every issue-agent deployment (default: current deployment only)",
+    )
     sp.set_defaults(func=cmd_uninstall_service)
 
     return p
