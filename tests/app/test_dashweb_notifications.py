@@ -132,6 +132,51 @@ def test_agent_run_start_announces_each_new_dispatch():
     assert len({item["id"] for item in notifications}) == 2
 
 
+def test_duplicate_dispatch_receipts_emit_one_notification():
+    dispatch = {
+        "ts": ts(1),
+        "event": "agent_run_start",
+        "role": "fix",
+        "kind": "RESOLVE",
+        "number": 7,
+        "issue": 7,
+        "dispatch": "resolve-7",
+    }
+
+    notifications = snapshots.journal_notifications(rows_for([
+        dispatch,
+        dict(dispatch),
+    ]))
+
+    assert [item["title"] for item in notifications] == ["Issue #7 dispatched"]
+
+
+def test_malformed_dispatch_receipts_fail_open():
+    valid = {
+        "ts": ts(1),
+        "event": "agent_run_start",
+        "role": "fix",
+        "kind": "RESOLVE",
+        "number": 7,
+        "issue": 7,
+        "dispatch": "resolve-7",
+    }
+    malformed = []
+    for field in ("role", "kind", "number", "dispatch"):
+        event = {**valid, "ts": ts(len(malformed) + 2)}
+        event.pop(field)
+        malformed.append(event)
+    malformed.extend([
+        {**valid, "ts": ts(6), "kind": "UNKNOWN"},
+        {**valid, "ts": ts(7), "role": "future-role"},
+        {**valid, "ts": ts(8), "number": "not-a-number"},
+    ])
+
+    notifications = snapshots.journal_notifications(rows_for(malformed))
+
+    assert notifications == []
+
+
 def test_unknown_and_malformed_events_fail_open_and_history_is_bounded():
     events = [
         {"ts": "not-a-time", "event": "agent_run", "issue": 7, "status": "blocked"},

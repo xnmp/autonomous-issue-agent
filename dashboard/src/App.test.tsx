@@ -333,4 +333,43 @@ describe("App navigation", () => {
     expect(screen.getByRole("tab", { name: /Done/ })).toHaveTextContent("1");
     expect(screen.getByRole("tab", { name: /Backlog/ })).toHaveTextContent("0");
   });
+
+  it("keeps optimistic promotion state while GitHub data is unavailable", async () => {
+    window.location.hash = "#/repo/demo/issues/backlog";
+    let finishPromotion: (response: Response) => void = () => {};
+    let githubUnavailable = false;
+    const promotion = new Promise<Response>((resolve) => {
+      finishPromotion = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input);
+        if (path === "/api/repos") return json(repos);
+        if (path === "/api/usage") return json(usage);
+        if (path.endsWith("/promote")) return promotion;
+        if (path.endsWith("/issues")) {
+          return githubUnavailable
+            ? json({ ...issues, gh_ok: false })
+            : json({ ...issues, backlog: [backlogIssue] });
+        }
+        return json({ rows: [], warnings: [] });
+      }),
+    );
+
+    render(<App />);
+
+    await screen.findByText("Toast notifications");
+    await userEvent.click(screen.getByRole("button", { name: "Promote #120 to ai-ready" }));
+    await userEvent.click(screen.getByRole("button", { name: "Promote #120" }));
+
+    githubUnavailable = true;
+    finishPromotion(json({ ok: true, detail: "promoted" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("tab", { name: /In flight/ })).toHaveTextContent("1");
+    });
+    await userEvent.click(screen.getByRole("tab", { name: /In flight/ }));
+    expect(screen.getByText("Toast notifications")).toBeVisible();
+  });
 });

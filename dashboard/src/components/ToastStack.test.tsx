@@ -53,6 +53,23 @@ describe("ToastStack", () => {
     expect(screen.getByText("+2 more")).toBeVisible();
   });
 
+  it("deduplicates repeated notification IDs within one payload", () => {
+    const repeated = toast("1", "Issue #7 dispatched");
+    const { rerender } = render(
+      <ToastStack repo="demo" notifications={[toast("0")]} roles={[]} />,
+    );
+
+    rerender(
+      <ToastStack
+        repo="demo"
+        notifications={[toast("0"), repeated, repeated]}
+        roles={[]}
+      />,
+    );
+
+    expect(screen.getAllByText("Issue #7 dispatched")).toHaveLength(1);
+  });
+
   it("announces daemon health transitions without replaying the initial state", () => {
     const role = {
       role: "fix",
