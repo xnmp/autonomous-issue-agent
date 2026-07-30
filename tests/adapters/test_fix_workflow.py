@@ -7,7 +7,6 @@ shrinking into a router without losing behavior coverage.
 import asyncio
 
 from issue_agent.adapters.store import Store
-from issue_agent.adapters.worktree import GitResult, Worktrees, _subprocess_git
 from issue_agent.app.execute import Executor
 from issue_agent.app.workflows.fix import FixWorkflow, FixWorkflowConfig
 from issue_agent.domain.outcome import AgentResult, ExitReason
