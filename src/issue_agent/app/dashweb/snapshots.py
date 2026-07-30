@@ -17,6 +17,7 @@ import json
 import math
 
 from ...domain import dashboard as dash
+from ...domain.actions import AgentKind
 
 # Frecency windows: (seconds, weight). An event inside 24h counts in all three,
 # which is the intended pile-up — a repo that moved this morning must outrank a
@@ -29,6 +30,9 @@ LIFECYCLE_LABELS = frozenset(
     {"ai-ready", "ai-working", "ai-done", "ai-blocked", "needs-human-review"}
 )
 PRIORITY_LABELS = ("P1", "P2", "P3")
+_AGENT_KINDS = frozenset(kind.name for kind in AgentKind)
+_DISPATCH_AGENT_KINDS = _AGENT_KINDS - {"ROUTE"}
+_PR_AGENT_KINDS = dash.REVIEW_KINDS | dash.REPAIR_KINDS | {"PR_RESUME"}
 
 
 def _utcnow() -> datetime:
@@ -751,18 +755,27 @@ def journal_notifications(rows, limit: int = 100) -> list[dict]:
             ordinal += 1
     candidates.sort(key=lambda item: (item[0], item[1]))
     notifications = []
+    notification_ids = set()
     for stamp, _ordinal, issue, event in candidates:
         projected = _journal_notification(event, issue)
         if projected is None:
             continue
+        identity_source = (
+            {"issue": issue, "dispatch": event["dispatch"]}
+            if event.get("event") == "agent_run_start"
+            else {"issue": issue, "event": event}
+        )
         identity = hashlib.sha256(
             json.dumps(
-                {"issue": issue, "event": event},
+                identity_source,
                 sort_keys=True,
                 separators=(",", ":"),
                 default=str,
             ).encode("utf-8")
         ).hexdigest()
+        if identity in notification_ids:
+            continue
+        notification_ids.add(identity)
         notifications.append({
             "id": identity,
             "ts": iso(stamp),
@@ -796,6 +809,28 @@ def _journal_notification(event: dict, issue: int) -> dict | None:
             "detail": "Human review is required",
             "issue": issue,
             "pr": number if event.get("target") == "pr" else None,
+        }
+    if name == "agent_run_start":
+        kind = str(event.get("kind") or "")
+        role = event.get("role")
+        dispatch = event.get("dispatch")
+        number = _event_number(event.get("number"))
+        if (
+            kind not in _DISPATCH_AGENT_KINDS
+            or role not in dash.ROLE_NAMES
+            or number is None
+            or not isinstance(dispatch, str)
+            or not dispatch.strip()
+        ):
+            return None
+        pr = number if kind in _PR_AGENT_KINDS else None
+        target = f" for PR #{pr}" if pr is not None else ""
+        return {
+            "severity": "info",
+            "title": f"Issue #{issue} dispatched",
+            "detail": f"{kind or 'Agent run'}{target} started",
+            "issue": issue,
+            "pr": pr,
         }
     if name != "agent_run":
         return None
