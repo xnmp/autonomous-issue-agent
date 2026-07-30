@@ -27,7 +27,13 @@ from datetime import datetime
 from typing import Any
 
 from ..domain.agent_task import AgentRuntime, AgentTask, git_identity_env
-from ..domain.outcome import AgentResult, ExitReason, Outcome, classify_outcome
+from ..domain.outcome import (
+    AgentResult,
+    ExitReason,
+    Outcome,
+    classify_outcome,
+    declared_status,
+)
 
 
 # Model the CodexRunner defaults to when neither CODEX_MODEL nor a task's `model`
@@ -791,7 +797,7 @@ def parse_codex_envelope(
             exit_reason=ExitReason.OK,
         )
 
-    status = str(structured.get("status", "") or "")
+    status = declared_status(structured)
     summary = str(structured.get("summary", "") or "")
     needs = str(structured.get("needs", "") or "")
     is_error = status == "error"

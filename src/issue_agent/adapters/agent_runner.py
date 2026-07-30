@@ -20,7 +20,7 @@ from collections.abc import Callable
 from typing import Any
 
 from ..domain.agent_task import AgentRuntime, AgentTask, git_identity_env
-from ..domain.outcome import AgentResult, ExitReason
+from ..domain.outcome import AgentResult, ExitReason, declared_status
 
 # Longest single slice we block waiting for the next stream event before we come
 # up for air to re-check the WALL clock. Small enough that a sleep-spanning gap is
@@ -179,31 +179,6 @@ def exit_reason_from_envelope(subtype: str, is_error: bool) -> ExitReason:
     return ExitReason.OK
 
 
-# Which structured-output keys carry the agent's own TERMINAL claim, in
-# precedence order. Every schema names it `status` except the reviewer's, which
-# names it `decision` (APPROVE|REQUEST_CHANGES|ESCALATE) — so every clean review
-# run journalled status="" and the verdict existed only on the PR, unqueryable
-# from the journal. Reading `decision` as a fallback lands the verdict in the
-# same field every other role already fills, so verdict analytics are one jq.
-# Deliberately NOT extended to `verdict`: the validator schema's `verdict` is
-# free prose ("why it stands, or why it was refuted"), not a terminal.
-_STATUS_KEYS = ("status", "decision")
-
-
-def _declared_status(structured: Any) -> str:
-    """The agent's own terminal claim from its structured output, else "".
-    Non-string values (a malformed envelope) are ignored rather than propagated:
-    `status` is typed `str` on AgentResult and every consumer compares it to
-    string literals."""
-    if not isinstance(structured, dict):
-        return ""
-    for key in _STATUS_KEYS:
-        value = structured.get(key)
-        if isinstance(value, str) and value:
-            return value
-    return ""
-
-
 def reported_model(msg: Any) -> str:
     """Concrete model named by an SDK init or result message, if any.
 
@@ -228,7 +203,7 @@ def result_to_agent_result(msg: Any) -> AgentResult:
     a test can pass a stand-in object. Mirrors claude_outcome / save_session:
     is_error from the envelope, status/summary/needs from structured_output."""
     structured = getattr(msg, "structured_output", None) or {}
-    status = _declared_status(structured)
+    status = declared_status(structured)
     # On an errored envelope with no structured status, surface the SDK's own error
     # kind (subtype, e.g. "error_max_turns" / "error_during_execution") as the
     # status so the daemon log distinguishes a turn-limit abort from a budget abort
