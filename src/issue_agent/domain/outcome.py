@@ -316,15 +316,23 @@ def resolve_followup(result: AgentResult, pr_opened: bool) -> ResolveFollowup:
 _BLOCKED_FOOTER = "\n\n---\n_Reply to unblock. Any team member can answer._"
 
 
+def unblock_prompt(heading: str, message: str) -> str:
+    """Build a blocked-thread prompt that `last_human_reply` can resume from."""
+    return f"{heading}\n\n{message}{_BLOCKED_FOOTER}"
+
+
 def budget_actions(issue: int) -> list[Action]:
     """Stop a budget-capped resolve-family leg for an operator cap review."""
     return [
         PostComment(
             Target.ISSUE,
             issue,
-            "**Budget review needed:** the resolve leg reached its configured "
-            "spend cap before finishing. Review the cap and resume when ready; "
-            "the saved handover will be provided to the next fixer leg.",
+            unblock_prompt(
+                "**Agent needs input:**",
+                "**Budget review needed:** the resolve leg reached its configured "
+                "spend cap before finishing. Review the cap and resume when ready; "
+                "the saved handover will be provided to the next fixer leg.",
+            ),
         ),
         Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED),
         Relabel(Target.ISSUE, issue, None, Label.NEEDS_BUDGET_REVIEW),
@@ -366,7 +374,7 @@ def resolve_actions(
     if fu is ResolveFollowup.BLOCKED:
         needs = result.needs or result.summary or "see logs"
         return [
-            PostComment(Target.ISSUE, issue, f"**Agent needs input:**\n\n{needs}{_BLOCKED_FOOTER}"),
+            PostComment(Target.ISSUE, issue, unblock_prompt("**Agent needs input:**", needs)),
             Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED),
         ]
     return [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)]
@@ -414,7 +422,7 @@ def author_actions(issue: int, result: AgentResult) -> list[Action]:
     if fu is AuthorFollowup.BLOCKED:
         needs = result.needs or result.summary or "see logs"
         return [
-            PostComment(Target.ISSUE, issue, f"**Author needs input:**\n\n{needs}{_BLOCKED_FOOTER}"),
+            PostComment(Target.ISSUE, issue, unblock_prompt("**Author needs input:**", needs)),
             Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED),
         ]
     return [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)]
@@ -491,7 +499,7 @@ def resume_actions(
     if classify_outcome(result) == Outcome.BLOCKED:
         needs = result.needs or result.summary or "see logs"
         return [
-            PostComment(Target.ISSUE, issue, f"**Agent still needs input:**\n\n{needs}{_BLOCKED_FOOTER}"),
+            PostComment(Target.ISSUE, issue, unblock_prompt("**Agent still needs input:**", needs)),
             Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED),
         ]
     return [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED)]
@@ -510,7 +518,7 @@ def pr_resume_actions(pr: int, result: AgentResult) -> list[Action]:
     if classify_outcome(result) is Outcome.BLOCKED:
         needs = result.needs or result.summary or "see logs"
         return [
-            PostComment(Target.PR, pr, f"**Agent still needs input:**\n\n{needs}{_BLOCKED_FOOTER}"),
+            PostComment(Target.PR, pr, unblock_prompt("**Agent still needs input:**", needs)),
         ]
     return [Relabel(Target.PR, pr, Label.AI_BLOCKED, Label.AI_PR_OPEN)]
 
@@ -582,7 +590,7 @@ def fix_ci_actions(pr: int, result: AgentResult) -> list[Action]:
         # it thought it needed. The human inherits a mystery.
         needs = result.needs or result.summary or "see logs"
         return [
-            PostComment(Target.PR, pr, f"**Agent needs input:**\n\n{needs}{_BLOCKED_FOOTER}"),
+            PostComment(Target.PR, pr, unblock_prompt("**Agent needs input:**", needs)),
             Relabel(Target.PR, pr, None, Label.AI_BLOCKED),
         ]
     return []
