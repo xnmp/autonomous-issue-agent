@@ -881,6 +881,7 @@ def _bind_codex_fix_runtime(
         edit_check_cmd=cfg.edit_check_cmd,
         log=log,
         state_dir=cfg.state_dir,
+        auth_file=runner.oauth_auth_file(),
     )
     return _FixRuntimeBinding(
         HookPreparingRuntime(runner, prepare_cwd),
@@ -1016,6 +1017,7 @@ def _bind_codex_review_runtime(
         review_only=True,
         log=log,
         state_dir=cfg.review_state_dir,
+        auth_file=runner.oauth_auth_file(),
     )
     return _ReviewRuntimeBinding(
         HookPreparingRuntime(runner, prepare_cwd),

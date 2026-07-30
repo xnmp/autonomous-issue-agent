@@ -691,22 +691,19 @@ fi
   && ok "TYPECHECK_CMD=$TYPECHECK_CMD (blocks a commit on failure)" \
   || warn "TYPECHECK_CMD unset (commit gate won't typecheck)"
 
-# Codex inlines the harness contract + the target's AGENTS.md + every tracked
-# CLAUDE.md into one 32KiB instruction file (adapters/codex_hook.py). Overflow
-# cuts the tail of the repo's CLAUDE.md content on EVERY leg (the runtime leaves
-# an in-prompt pointer, but the guidance is out of the prompt). Sizes here are
-# approximate — the contract is a template rendered per leg — hence warn, not bad.
+# Codex receives the harness contract as developer authority and target-owned
+# AGENTS/CLAUDE guidance as separately encoded, untrusted user-task data. The
+# latter has its own 32KiB encoded ceiling and never leaves a raw-read pointer.
+# Raw sizes only approximate JSON encoding, so crossing the ceiling is a warning.
 if [ "${FIXER_RUNTIME:-claude}" = "codex" ] && [ -d "${TARGET_DIR:-/nonexistent}" ]; then
   _doc_bytes=0
   while IFS= read -r -d '' _f; do
     _sz=$(wc -c < "$TARGET_DIR/$_f" 2>/dev/null) && _doc_bytes=$((_doc_bytes + _sz))
   done < <(git -C "$TARGET_DIR" ls-files -z -- CLAUDE.md '**/CLAUDE.md' AGENTS.md 2>/dev/null)
-  _contract_bytes=$(wc -c < "$HARNESS_ROOT/plugin/AGENT.md" 2>/dev/null || echo 0)
-  _instr_total=$((_doc_bytes + _contract_bytes))
-  if [ "$_instr_total" -gt 32768 ]; then
-    warn "codex instruction stack ≈${_instr_total}B (repo CLAUDE.md/AGENTS.md ${_doc_bytes}B + harness contract ≈${_contract_bytes}B) exceeds the 32768B budget — the tail of the repo's CLAUDE.md is cut from every leg's prompt (a pointer tells the agent to read the file on demand). Trim or split the target's CLAUDE.md."
+  if [ "$_doc_bytes" -gt 32768 ]; then
+    warn "target repository guidance is ${_doc_bytes} raw bytes and may exceed its independent 32768-byte encoded untrusted-data ceiling; excess guidance is bounded or omitted without a raw-read pointer. Trim or split target AGENTS.md/CLAUDE.md files."
   else
-    ok "codex instruction stack ≈${_instr_total}B fits the 32768B budget"
+    ok "target repository guidance is ${_doc_bytes} raw bytes, below its independent 32768-byte untrusted-data ceiling (the harness contract is separate developer authority)"
   fi
 fi
 

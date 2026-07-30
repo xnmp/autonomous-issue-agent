@@ -190,3 +190,33 @@ def test_runtime_sets_codex_home_to_external_config(tmp_path) -> None:
 
     assert inner.task is not None
     assert inner.task.env["CODEX_HOME"].startswith(str(state))
+
+
+def test_external_codex_home_links_login_without_copying_it_into_worktree(
+    tmp_path,
+) -> None:
+    worktree = tmp_path / "worktree"
+    state = tmp_path / "state"
+    profile = tmp_path / "profile"
+    worktree.mkdir()
+    profile.mkdir()
+    auth = profile / "auth.json"
+    auth.write_text("rotating-login")
+    auth.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+    config = write_hook_config(
+        str(worktree),
+        state_dir=str(state),
+        auth_file=str(auth),
+    )
+
+    linked = os.path.join(os.path.dirname(config), "auth.json")
+    assert os.path.islink(linked)
+    assert os.path.realpath(linked) == str(auth)
+    assert open(linked).read() == "rotating-login"
+    assert not (worktree / "auth.json").exists()
+    assert not (worktree / ".codex").exists()
+    assert stat.S_IMODE(os.stat(os.path.dirname(config)).st_mode) == stat.S_IRWXU
+
+    auth.write_text("rotated")
+    assert open(linked).read() == "rotated"

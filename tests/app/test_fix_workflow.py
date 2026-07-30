@@ -949,7 +949,7 @@ def test_resolve_routes_standard_issue_to_sonnet_when_model_unpinned():
 
     router_task, resolve_task = runner.tasks
     assert router_task.schema is ROUTER_SCHEMA
-    assert router_task.cwd is None, "the classifier needs no worktree"
+    assert router_task.cwd == "/wt/issue-5"
     assert resolve_task.model == "sonnet"
 
 

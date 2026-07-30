@@ -1284,6 +1284,22 @@ def test_oauth_mode_preflight_accepts_codex_login_credentials(monkeypatch):
     with open(os.path.join(home, ".codex", "auth.json"), "w") as fh:
         fh.write("{}")
     assert r.preflight() is None
+    assert r.oauth_auth_file() == os.path.join(home, ".codex", "auth.json")
+
+
+def test_oauth_auth_file_honors_explicit_codex_home(monkeypatch, tmp_path):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    codex_home = tmp_path / "codex-home"
+    codex_home.mkdir()
+    auth = codex_home / "auth.json"
+    auth.write_text("{}")
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    codex = _fake_codex(str(tmp_path), "exit 0\n")
+
+    runner = CodexRunner(codex_bin=codex)
+
+    assert runner.preflight() is None
+    assert runner.oauth_auth_file() == str(auth)
 
 
 def test_preflight_ok_when_bin_and_key_present():

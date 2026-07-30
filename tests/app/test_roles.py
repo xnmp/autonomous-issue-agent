@@ -1480,6 +1480,9 @@ def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
         def preflight(self):
             return None
 
+        def oauth_auth_file(self):
+            return ""
+
     monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
     cfg = from_env({
         "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEWER_RUNTIME": "codex",
@@ -1526,6 +1529,9 @@ def test_codex_fixer_declares_its_role_so_a_review_hook_cannot_cage_it(tmp_path,
         def preflight(self):
             return None
 
+        def oauth_auth_file(self):
+            return ""
+
     monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
     _codex_daemon(tmp_path)
 
@@ -1546,6 +1552,9 @@ def test_codex_reviewer_defers_hook_installation_until_dispatch(tmp_path, monkey
 
         def preflight(self):
             return None
+
+        def oauth_auth_file(self):
+            return ""
 
     monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
     monkeypatch.setattr(

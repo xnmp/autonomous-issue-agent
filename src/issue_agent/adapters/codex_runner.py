@@ -1189,9 +1189,13 @@ class CodexRunner(AgentRuntime):
             # OAuth mode (no custom gateway): codex authenticates from the
             # credentials `codex login` stored. An env key ALSO satisfies it
             # (codex accepts either), so only the absence of both is fatal.
-            auth_file = os.path.join(os.path.expanduser("~"), ".codex", "auth.json")
-            if configured_key or inherited_key or os.path.exists(auth_file):
+            auth_file = self.oauth_auth_file()
+            if configured_key or inherited_key or auth_file:
                 return None
+            auth_file = os.path.join(
+                os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"),
+                "auth.json",
+            )
             return (
                 f"codex has no credentials — no {auth_file} (run `codex login`) "
                 f"and {key_var} is unset. (FIXER_RUNTIME=codex, default provider)"
@@ -1203,6 +1207,22 @@ class CodexRunner(AgentRuntime):
                 "which shared.env aliases) in the launching shell. (FIXER_RUNTIME=codex)"
             )
         return None
+
+    def oauth_auth_file(self) -> str:
+        """Existing Codex-login file used by the isolated hook CODEX_HOME."""
+
+        if self.provider.base_url:
+            return ""
+        key_var = self.provider.env_key
+        if self.env.get(key_var) or os.environ.get(key_var):
+            return ""
+        codex_home = (
+            self.env.get("CODEX_HOME")
+            or os.environ.get("CODEX_HOME")
+            or os.path.expanduser("~/.codex")
+        )
+        auth_file = os.path.join(codex_home, "auth.json")
+        return auth_file if os.path.isfile(auth_file) else ""
 
     async def run(self, task: RuntimePlan) -> AgentResult:
         # Fail LOUD, not opaque: if the runtime isn't set up, surface the exact

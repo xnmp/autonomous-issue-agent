@@ -465,7 +465,9 @@ class FixWorkflow:
             return False
         return paths_overlap_open_prs(paths, world.prs)
 
-    async def _routed_fix_cfg(self, issue: int, iss) -> tuple[FixTaskConfig, bool]:
+    async def _routed_fix_cfg(
+        self, issue: int, iss, cwd: str
+    ) -> tuple[FixTaskConfig, bool]:
         """Difficulty-routed, evidence-escalated FixTaskConfig for a RESOLVE
         dispatch (P4.1/#8, ladder #16).
 
@@ -497,6 +499,7 @@ class FixWorkflow:
                         as_untrusted(iss.body),
                         runtime=self.cfg.fixer_runtime,
                         max_budget_usd=cfg.router_budget_usd,
+                        cwd=cwd,
                     ),
                     kind=AgentKind.ROUTE.name,
                 )
@@ -530,7 +533,7 @@ class FixWorkflow:
         iss = self.gateway.get_issue(issue)
         branch = f"fix/{issue}-{slugify(iss.title) or 'issue'}"
         cwd = self._ensure_cwd(issue, branch)
-        fix_cfg, deferred_for_overlap = await self._routed_fix_cfg(issue, iss)
+        fix_cfg, deferred_for_overlap = await self._routed_fix_cfg(issue, iss, cwd)
         if deferred_for_overlap:
             self.executor.execute_all([
                 Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)
@@ -580,7 +583,7 @@ class FixWorkflow:
             fix_cfg = self._repair_fix_cfg(issue, "resume", iss=iss)
             deferred_for_overlap = False
         else:
-            fix_cfg, deferred_for_overlap = await self._routed_fix_cfg(issue, iss)
+            fix_cfg, deferred_for_overlap = await self._routed_fix_cfg(issue, iss, cwd)
         if deferred_for_overlap:
             self.executor.execute_all([
                 Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)

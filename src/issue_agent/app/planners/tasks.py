@@ -617,6 +617,7 @@ def build_router_task(
     model: str = "",
     runtime: str = "claude",
     max_budget_usd: float = 0.10,
+    cwd: str | None = None,
 ) -> PlannedRun:
     """route_model: cheap difficulty classifier (no system prompt, no tools).
     Runs on the active runtime's own cheapest tier unless `model` overrides.
@@ -638,7 +639,7 @@ def build_router_task(
     return PlannedRun(
         prompt=prompt, schema=ROUTER_SCHEMA, disallowed_tools=FIXER_DENY,
         model=model or route_model("trivial", runtime),
-        max_budget_usd=max_budget_usd,
+        max_budget_usd=max_budget_usd, cwd=cwd,
     )
 
 

@@ -5,8 +5,8 @@ is field-identical to Claude Code's (`tool_name`, `tool_input.command`, `cwd`),
 so `bash_governor.py` runs UNMODIFIED — exit 2 = block, with stderr fed back to
 the model. This module just writes the declaration Codex reads:
 
-    <cwd>/.codex/config.toml      [[hooks.PreToolUse]] → gov.sh
-    <cwd>/.codex/hooks/gov.sh     pipes stdin into `uv run … bash_governor.py`
+    <state>/codex-hooks/<key>/config.toml  [[hooks.PreToolUse]] → gov.sh
+    <state>/codex-hooks/<key>/hooks/gov.sh pipes stdin into the governor
 
 Called once per worktree (alongside Worktrees.ensure), before CodexRunner.run.
 The governor itself lives in the harness (plugin/hooks/bash_governor.py); we
@@ -19,6 +19,7 @@ import os
 import stat
 import json
 import hashlib
+import secrets
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -169,22 +170,50 @@ exec {json.dumps(EDIT_CHECK_PATH)}
 """
 
 
+def _link_codex_auth(codex_dir: str, auth_file: str) -> None:
+    """Expose one trusted Codex login to the isolated external CODEX_HOME.
+
+    The link lives in harness state, never in the target checkout. A link keeps
+    credential rotation authoritative at the operator's normal Codex profile
+    and avoids accumulating state-owned copies of a bearer credential.
+    """
+
+    if not auth_file:
+        return
+    source = os.path.abspath(auth_file)
+    if not os.path.isfile(source):
+        return
+    destination = os.path.join(codex_dir, "auth.json")
+    if os.path.realpath(source) == os.path.realpath(destination):
+        return
+    temporary = os.path.join(
+        codex_dir,
+        f".auth.json.{os.getpid()}.{secrets.token_hex(6)}.tmp",
+    )
+    try:
+        os.symlink(source, temporary)
+        os.replace(temporary, destination)
+    finally:
+        if os.path.lexists(temporary):
+            os.unlink(temporary)
+
+
 def write_hook_config(
     cwd: str, governor_path: str = GOVERNOR_PATH, agents_md: str = "",
     edit_check_cmd: str = "",
     review_only: bool = False,
     log: Callable[[str], None] | None = None,
     state_dir: str = "",
+    auth_file: str = "",
 ) -> str:
-    """Emit `<cwd>/.codex/config.toml` + `.codex/hooks/gov.sh` so a `codex exec`
-    run in `cwd` enforces the governor on every Bash call. When `agents_md` is
-    given, also write it to `<cwd>/AGENTS.override.md` — Codex's native override
-    instructions file (verified auto-loaded by `codex exec`), which is how the
-    fixer's DDD+TDD contract reaches GPT-5.5 (the Claude path injects the same
-    text via the SDK system-prompt preset). Returns the config path. Idempotent.
+    """Emit an external CODEX_HOME containing the governor and trusted contract.
 
-    NOTE: AGENTS.override.md lands inside the worktree and is locally excluded;
-    a target's tracked AGENTS.md remains byte-for-byte untouched."""
+    Target-owned instruction files remain untouched and are not loaded through
+    Codex's developer-authority project-document channel. ``auth_file``, when
+    present, is linked into the state-owned CODEX_HOME so an isolated OAuth run
+    uses the operator's existing login without copying it into the checkout.
+    Returns the config path. Idempotent.
+    """
     if not state_dir:
         raise OSError("STATE_DIR is required for Codex hook containment")
     key = _hook_key(cwd)
@@ -192,6 +221,8 @@ def write_hook_config(
     codex_dir = os.path.join(state_dir, "codex-hooks", key)
     hooks_dir = os.path.join(codex_dir, "hooks")
     os.makedirs(hooks_dir, exist_ok=True)
+    os.chmod(codex_dir, stat.S_IRWXU)
+    _link_codex_auth(codex_dir, auth_file)
 
     gov_script_path = os.path.join(hooks_dir, "gov.sh")
     with open(gov_script_path, "w") as f:
