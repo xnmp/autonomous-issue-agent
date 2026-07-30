@@ -515,6 +515,22 @@ def test_normal_shutdown_flushes_the_finalizer_once():
     assert finalized == ["flushed"]
 
 
+def test_normal_shutdown_persists_stopped_heartbeat(tmp_path):
+    heartbeat = tmp_path / "heartbeat.json"
+    d, _ = _daemon(lambda _world: [])
+    d.heartbeat_path = str(heartbeat)
+
+    d.run_forever(
+        sleep=lambda _seconds: None,
+        now=lambda: 0,
+        max_ticks=1,
+    )
+
+    payload = json.loads(heartbeat.read_text())
+    assert payload["state"] == "stopped"
+    assert payload["in_flight"] == []
+
+
 def test_failed_shutdown_finalizer_forces_transient_exit():
     from issue_agent.domain.supervision import ExitCode
 

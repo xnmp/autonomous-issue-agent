@@ -584,6 +584,7 @@ class Daemon:
             clean = self.shutdown_dispatches(cancel=False)
             clean = self._finalize() and clean
             self._transition(DaemonState.STOPPED)
+            self._write_heartbeat()
             if not clean:
                 raise SystemExit(ExitCode.TRANSIENT)
         except BaseException as exc:

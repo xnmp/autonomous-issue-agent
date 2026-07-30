@@ -10,13 +10,15 @@ ledger rows, journal↔ledger totals reconciled exactly at $1512.55). The two
 sharpest codex-only claims were independently re-verified in code (X1, X3
 below).
 
-**Status: IMPLEMENTED 2026-07-30.** Phases 0–7 are present on the working
-tree, with the deliberately trigger-gated credential-free publisher in 5.7
-remaining gated exactly as this plan specifies. The live authorities are
-SQLite control state, durable lifecycle commands/receipts, schema-v2 events,
-and the single projection fold; the bash watchers and their suite are deleted.
-Verification is `make test`, `make typecheck`, and the live probes documented
-in `HARNESS.md`/`docs/reference/capacity.md`.
+**Status: IMPLEMENTED AND VERIFIED 2026-07-31.** Phases 0–7 are present on
+the working tree, with the deliberately trigger-gated credential-free
+publisher in 5.7 remaining gated exactly as this plan specifies. The live
+authorities are SQLite control state, durable lifecycle commands/receipts,
+schema-v2 events, and the single projection fold; the bash watchers and their
+suite are deleted.
+Verification includes `make test`, dashboard unit/type/build/E2E checks, a
+bounded live steward tick against `xnmp/autonomous-issue-agent`, and the live
+probes documented in `HARNESS.md`/`docs/reference/capacity.md`.
 
 This document remains the **record** for the maintainability refactor: it owns
 sequencing, scope, and the adjudicated design decisions. The codex plan remains
