@@ -114,6 +114,7 @@ from ..domain.ports import (
     LevelState,
     PredictionReader,
     RecentMergesReads,
+    SpendReconciler,
 )
 from .config import CodexRuntimeConfig, HarnessConfig, ReviewRuntimeConfig
 from .dispatch import AgentDispatcher, DispatchConfig
@@ -391,19 +392,22 @@ def _shutdown_finalize(
 
 def _shutdown_terminalize(
     control: SQLiteControlStore,
+    spend: SpendReconciler,
     *,
     owner_id: str,
     state_dir: str,
     role: str,
 ) -> Callable[[], object]:
-    """Make the hard-deadline path durably terminal before `os._exit`."""
+    """Reconcile killed paid work and persist any unresolved handovers."""
 
     from ..adapters.handover import write_shutdown_handover
 
     reason = "shutdown_deadline_spend_unknown"
 
     def terminalize() -> object:
-        control.terminalize_owned_runs(owner_id, reason)
+        intents = control.record_owned_cancellation_intents(owner_id, reason)
+        for intent in intents:
+            spend.reconcile(intent.run_id)
         written = 0
         for intent in control.pending_cancellation_intents(owner_id):
             receipt = write_shutdown_handover(
@@ -1817,6 +1821,7 @@ def build_fix_daemon(
         finalize=_shutdown_finalize(control, effect_executor),
         terminalize=_shutdown_terminalize(
             control,
+            CodexSpendReconciler(control, _spend_evidence_dirs(cfg)),
             owner_id=f"{cfg.repo}:fix",
             state_dir=cfg.state_dir,
             role="fix",
@@ -1995,6 +2000,9 @@ def build_review_daemon(
                   finalize=_shutdown_finalize(control, effect_executor),
                   terminalize=_shutdown_terminalize(
                       control,
+                      CodexSpendReconciler(
+                          control, _spend_evidence_dirs(cfg)
+                      ),
                       owner_id=f"{cfg.repo}:review",
                       state_dir=cfg.review_state_dir,
                       role="review",
@@ -2222,6 +2230,9 @@ def build_steward_daemon(
                   finalize=_shutdown_finalize(control, effect_executor),
                   terminalize=_shutdown_terminalize(
                       control,
+                      CodexSpendReconciler(
+                          control, _spend_evidence_dirs(cfg)
+                      ),
                       owner_id=f"{cfg.repo}:steward",
                       state_dir=cfg.steward_state_dir,
                       role="steward",

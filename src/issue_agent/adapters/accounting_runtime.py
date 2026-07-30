@@ -271,10 +271,12 @@ class AccountingRuntime(AgentRuntime):
                 reconciled = CodexSpendReconciler(
                     self.store, (self.spend_evidence_dir,)
                 ).reconcile(run_id)
-            if not reconciled:
+            if not reconciled and self.runtime_name != "codex":
                 # The inner runtime has completed supervised teardown before this
-                # path. Hard daemon death cannot enter here and still leaves the
-                # active reservation for boot recovery.
+                # path. Codex is different: rollout evidence can become readable
+                # only after the killed CLI process is reaped, so an inconclusive
+                # attempt must leave its reservation active for shutdown or boot
+                # recovery.
                 self.store.release(
                     run_id, "runtime_exception_spend_unknown"
                 )

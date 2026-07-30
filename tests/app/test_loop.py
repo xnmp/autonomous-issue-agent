@@ -373,11 +373,19 @@ def test_shutdown_deadline_forces_process_teardown_and_exits_transient():
     daemon.wait_for_dispatches()
 
 
-def test_shutdown_reconciles_before_force_killing_remaining_processes():
+def test_shutdown_reaps_killed_worker_before_final_spend_reconciliation():
     from issue_agent.domain.actions import AgentKind, RunAgent
 
     release = threading.Event()
     order = []
+
+    def run_agent(_action):
+        assert release.wait(timeout=5)
+        order.append("worker_accounted")
+
+    def kill():
+        order.append("kill")
+        release.set()
 
     daemon = Daemon(
         "fix",
@@ -385,29 +393,27 @@ def test_shutdown_reconciles_before_force_killing_remaining_processes():
         lambda _world: [RunAgent(AgentKind.RESOLVE, 7)],
         Executor(
             FakeGateway(),
-            run_agent=lambda _action: release.wait(timeout=5),
+            run_agent=run_agent,
         ),
         poll_seconds=1,
         dispatch_capacity=1,
         shutdown_timeout_seconds=0.1,
-        finalize=lambda: order.append("reconcile"),
-        force_kill_dispatches=lambda: order.append("kill"),
+        finalize=lambda: order.append("persist"),
+        force_kill_dispatches=kill,
         terminalize=lambda: order.append("terminalize"),
     )
 
-    with pytest.raises(SystemExit):
-        daemon.run_forever(
-            sleep=lambda _seconds: None,
-            now=lambda: 0,
-            max_ticks=1,
-        )
+    daemon.run_forever(
+        sleep=lambda _seconds: None,
+        now=lambda: 0,
+        max_ticks=1,
+    )
 
-    assert order == ["reconcile", "kill", "terminalize"]
-    release.set()
+    assert order == ["persist", "kill", "worker_accounted", "terminalize"]
     daemon.wait_for_dispatches()
 
 
-def test_shutdown_deadline_commits_terminal_control_state_before_hard_exit(
+def test_shutdown_deadline_preserves_indeterminate_spend_for_boot_recovery(
     tmp_path,
 ):
     from datetime import datetime, timezone
@@ -477,7 +483,7 @@ def test_shutdown_deadline_commits_terminal_control_state_before_hard_exit(
         dispatch_capacity=1,
         shutdown_timeout_seconds=0.1,
         force_kill_dispatches=lambda: None,
-        terminalize=lambda: control.terminalize_owned_runs(
+        terminalize=lambda: control.record_owned_cancellation_intents(
             "o/r:fix",
             "shutdown_deadline_spend_unknown",
         ),
@@ -491,8 +497,10 @@ def test_shutdown_deadline_commits_terminal_control_state_before_hard_exit(
         )
 
     assert started.is_set()
-    assert control.active_reservation_runs("o/r:fix") == ()
-    assert control.leases("o/r:fix") == ()
+    assert control.active_reservation_runs("o/r:fix") == (run_id,)
+    assert tuple(
+        lease.run_id for lease in control.leases("o/r:fix")
+    ) == (run_id,)
     assert control.pending_cancellation_intents("o/r:fix")[0].run_id == run_id
     release.set()
     daemon.wait_for_dispatches()

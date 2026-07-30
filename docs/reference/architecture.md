@@ -116,10 +116,12 @@ The 2026-07-31 migration rehearsal replayed a 98.531-hour, 303-row historical
 window twice; matched source digest, per-scope balances, count, amount, and
 failure decisions; and exercised ordinary, exhausted, duplicate, and
 conflicting-receipt admissions on the pre-existing live primary database.
-The v9 adoption baseline and every later migration are immutable,
-digest-validated, and individually transactional; restart tests interrupt
-both sides of every migration commit boundary. Machine-readable evidence is in
-`control-store-migration-evidence.json`.
+Fresh databases use the v9 adoption baseline. The exact digest emitted by the
+previously shipped v8 initializer remains an accepted immutable predecessor,
+so deployed v8 databases upgrade through v9/v10 without rewritten history.
+Every migration is digest-validated and individually transactional; restart
+tests interrupt both sides of every migration commit boundary. Machine-readable
+evidence is in `control-store-migration-evidence.json`.
 The bounded production-shaped boot, active SIGTERM shutdown, isolated Codex
 accounting run, cleanup receipt, and post-canary invariants are captured in
 `live-release-canary-evidence.json`.

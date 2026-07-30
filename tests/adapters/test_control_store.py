@@ -18,6 +18,7 @@ from issue_agent.adapters.control_store import (
     ControlStoreError,
     CorruptControlStore,
     IncompatibleSchema,
+    LEGACY_V8_SCHEMA_DIGEST,
     Lease,
     ReservationRequest,
     SQLiteControlStore,
@@ -100,6 +101,46 @@ def test_control_store_initializes_with_restrictive_permissions_and_integrity(tm
             "ORDER BY version"
         ).fetchall()
     assert history == [(9, 64), (10, 64)]
+
+
+def test_shipped_v8_database_upgrades_without_rewriting_history_or_data(
+    tmp_path,
+):
+    store = _store(tmp_path)
+    request = _request(1)
+    assert store.reserve(request).admitted
+    with sqlite3.connect(store.path) as db:
+        db.execute("DROP TABLE run_cancellation_intents")
+        db.execute("DROP TABLE level_state")
+        db.execute("DELETE FROM schema_migrations")
+        db.execute(
+            "INSERT INTO schema_migrations("
+            "version, applied_at, source_digest) VALUES (8, ?, ?)",
+            (NOW.isoformat(), LEGACY_V8_SCHEMA_DIGEST),
+        )
+        db.commit()
+
+    SQLiteControlStore(store.path).initialize()
+
+    with sqlite3.connect(store.path) as db:
+        history = db.execute(
+            "SELECT version, source_digest FROM schema_migrations "
+            "ORDER BY version"
+        ).fetchall()
+        reserved = db.execute(
+            "SELECT state FROM budget_reservations WHERE run_id=?",
+            (str(request.run_id),),
+        ).fetchone()
+        level_state = db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='level_state'"
+        ).fetchone()
+    assert [version for version, _digest in history] == [8, 9, 10]
+    assert history[0][1] == (
+        "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
+    )
+    assert reserved == ("active",)
+    assert level_state == ("level_state",)
 
 
 @pytest.mark.parametrize("version", (9, 10))
@@ -225,7 +266,7 @@ def test_abandoned_run_counts_come_from_control_state_not_telemetry(tmp_path):
     assert store.abandoned_dispatch_counts("o/r:fix") == {42: 1}
 
 
-def test_shutdown_terminalization_is_one_atomic_durable_outcome(tmp_path):
+def test_shutdown_intent_preserves_active_spend_for_recovery(tmp_path):
     store = _store(tmp_path)
     request = dataclasses.replace(
         _request(1),
@@ -248,15 +289,17 @@ def test_shutdown_terminalization_is_one_atomic_durable_outcome(tmp_path):
         process_start_ticks=99,
     )
 
-    intents = store.terminalize_owned_runs(
+    intents = store.record_owned_cancellation_intents(
         "o/r:fix",
         "shutdown_deadline_spend_unknown",
     )
 
     assert len(intents) == 1
     assert intents[0].issue_number == 42
-    assert store.active_reservation_runs("o/r:fix") == ()
-    assert store.leases("o/r:fix") == ()
+    assert store.active_reservation_runs("o/r:fix") == (request.run_id,)
+    assert tuple(lease.run_id for lease in store.leases("o/r:fix")) == (
+        request.run_id,
+    )
     assert store.pending_cancellation_intents("o/r:fix") == intents
     with sqlite3.connect(store.path) as db:
         run = db.execute(
@@ -268,11 +311,8 @@ def test_shutdown_terminalization_is_one_atomic_durable_outcome(tmp_path):
             "WHERE run_id=?",
             (str(request.run_id),),
         ).fetchone()
-    assert run == ("cancelled", "shutdown_deadline_spend_unknown")
-    assert reservation == (
-        "released",
-        "shutdown_deadline_spend_unknown",
-    )
+    assert run == ("running", None)
+    assert reservation == ("active", None)
 
     store.mark_cancellation_handover_written(request.run_id)
     assert store.pending_cancellation_intents("o/r:fix") == ()

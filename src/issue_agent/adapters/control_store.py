@@ -53,6 +53,9 @@ from ..domain.events import (
 
 SCHEMA_VERSION = 10
 SCHEMA_BASELINE_VERSION = 9
+LEGACY_V8_SCHEMA_DIGEST = (
+    "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
+)
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 
 
@@ -440,6 +443,14 @@ if tuple(migration.version for migration in _SCHEMA_MIGRATIONS) != tuple(
 ):
     raise RuntimeError("control-store migrations must be contiguous")
 
+_KNOWN_SCHEMA_DIGESTS = {
+    8: LEGACY_V8_SCHEMA_DIGEST,
+    **{
+        migration.version: migration.digest
+        for migration in _SCHEMA_MIGRATIONS
+    },
+}
+
 
 class SQLiteControlStore:
     """One SQLite database, safe for threads and cooperating daemon processes."""
@@ -584,21 +595,18 @@ class SQLiteControlStore:
         *,
         require_current: bool = False,
     ) -> None:
-        expected = {
-            migration.version: migration.digest
-            for migration in _SCHEMA_MIGRATIONS
-        }
         if not history:
             if require_current:
                 raise IncompatibleSchema("control-store migration history is empty")
             return
         versions = tuple(version for version, _digest in history)
-        if versions[0] != SCHEMA_BASELINE_VERSION or versions != tuple(
+        if versions[0] not in {8, SCHEMA_BASELINE_VERSION} or versions != tuple(
             range(versions[0], versions[-1] + 1)
         ):
             raise IncompatibleSchema(
                 "control-store migration history is not contiguous from "
-                f"baseline {SCHEMA_BASELINE_VERSION}: {versions}"
+                f"a supported baseline (8 or {SCHEMA_BASELINE_VERSION}): "
+                f"{versions}"
             )
         if versions[-1] > SCHEMA_VERSION:
             raise IncompatibleSchema(
@@ -606,7 +614,7 @@ class SQLiteControlStore:
                 f"{SCHEMA_VERSION}"
             )
         for version, digest in history:
-            if expected.get(version) != digest:
+            if _KNOWN_SCHEMA_DIGESTS.get(version) != digest:
                 raise IncompatibleSchema(
                     f"control-store migration {version} digest mismatch"
                 )
@@ -990,17 +998,16 @@ class SQLiteControlStore:
             )
         return tuple(RunId(row["run_id"]) for row in rows)
 
-    def terminalize_owned_runs(
+    def record_owned_cancellation_intents(
         self,
         owner_id: str,
         reason: str,
     ) -> tuple[RunCancellationIntent, ...]:
-        """Atomically cancel every owned active reservation after forced kill.
+        """Persist hard-shutdown handovers without discarding spend authority.
 
-        The cancellation intent is committed in the same transaction as the
-        reservation release, terminal run state, and lease removal. A bounded
-        teardown can therefore hard-exit without leaving boot recovery to
-        discover what shutdown already knew.
+        A killed provider process can leave rollout usage that becomes readable
+        only after process reap. The active reservation and lease therefore stay
+        intact until post-kill or boot recovery settles that evidence.
         """
 
         if not owner_id or not reason:
@@ -1008,7 +1015,7 @@ class SQLiteControlStore:
         intents: list[RunCancellationIntent] = []
         with self.transaction() as db:
             rows = db.execute(
-                "SELECT r.run_id, r.dispatch_id, r.kind FROM runs r "
+                "SELECT r.run_id, r.dispatch_id, r.kind, r.state FROM runs r "
                 "JOIN budget_reservations b ON b.run_id=r.run_id "
                 "WHERE r.owner_id=? AND b.state='active' "
                 "AND r.state NOT IN ('completed','cancelled','abandoned') "
@@ -1018,75 +1025,47 @@ class SQLiteControlStore:
             now = _stamp(self._now())
             for row in rows:
                 run_id = RunId(row["run_id"])
-                issue_number = _dispatch_issue(row["dispatch_id"])
-                intent = RunCancellationIntent(
-                    run_id,
-                    row["dispatch_id"],
-                    row["kind"],
-                    issue_number,
-                    reason,
-                )
                 db.execute(
-                    "INSERT INTO run_cancellation_intents("
+                    "INSERT OR IGNORE INTO run_cancellation_intents("
                     "run_id, dispatch_id, kind, issue_number, reason, created_at"
                     ") VALUES (?, ?, ?, ?, ?, ?)",
                     (
                         str(run_id),
-                        intent.dispatch_id,
-                        intent.kind,
-                        intent.issue_number,
+                        row["dispatch_id"],
+                        row["kind"],
+                        _dispatch_issue(row["dispatch_id"]),
                         reason,
                         now,
                     ),
                 )
-                db.execute(
-                    "UPDATE budget_reservations SET state='released', "
-                    "release_reason=?, updated_at=? WHERE run_id=?",
-                    (reason, now, str(run_id)),
-                )
-                db.execute(
-                    "UPDATE runs SET state='cancelled', outcome=?, "
-                    "completed_at=? WHERE run_id=?",
-                    (reason, now, str(run_id)),
-                )
-                lease = db.execute(
-                    "SELECT 1 FROM leases WHERE run_id=?",
+                stored = db.execute(
+                    "SELECT dispatch_id, kind, issue_number, reason "
+                    "FROM run_cancellation_intents WHERE run_id=?",
                     (str(run_id),),
                 ).fetchone()
-                db.execute(
-                    "DELETE FROM leases WHERE run_id=?",
-                    (str(run_id),),
-                )
-                correlation = _run_correlation(
-                    run_id,
-                    intent.dispatch_id,
-                )
-                self._transition(
-                    db,
-                    "reservation",
-                    str(run_id),
-                    "released",
-                    {"reason": reason, "spend_provenance": "unknown"},
-                    correlation=correlation,
-                )
-                if lease is not None:
-                    self._transition(
-                        db,
-                        "lease",
-                        str(run_id),
-                        "released",
-                        {"reason": reason},
-                        correlation=correlation,
+                intents.append(
+                    RunCancellationIntent(
+                        run_id,
+                        stored["dispatch_id"],
+                        stored["kind"],
+                        (
+                            int(stored["issue_number"])
+                            if stored["issue_number"] is not None
+                            else None
+                        ),
+                        stored["reason"],
                     )
+                )
                 self._transition(
                     db,
                     "run",
                     str(run_id),
-                    "cancelled",
-                    {"outcome": reason, "handover_intent": True},
-                    correlation=correlation,
+                    row["state"],
+                    {"reason": reason, "spend_recovery_pending": True},
+                    correlation=_run_correlation(
+                        run_id, row["dispatch_id"]
+                    ),
                 )
-                intents.append(intent)
         return tuple(intents)
 
     def pending_cancellation_intents(

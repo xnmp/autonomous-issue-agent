@@ -47,7 +47,13 @@ class Runtime:
         return self.result
 
 
-def _wrapper(tmp_path, runtime, cap=5_000_000, evidence_dir=""):
+def _wrapper(
+    tmp_path,
+    runtime,
+    cap=5_000_000,
+    evidence_dir="",
+    runtime_name="codex",
+):
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
     wrapper = AccountingRuntime(
@@ -59,7 +65,7 @@ def _wrapper(tmp_path, runtime, cap=5_000_000, evidence_dir=""):
         None,
         None,
         "cfg",
-        "codex",
+        runtime_name,
         _policy(),
         _rates(),
         spend_evidence_dir=evidence_dir,
@@ -221,7 +227,7 @@ def test_subscription_usage_is_synthetically_priced_and_consumes_cap(
     assert tuple(charge) == (8_000_000, "synthetic", "test")
 
 
-def test_runtime_exception_releases_reservation_without_daemon_restart(
+def test_codex_runtime_exception_preserves_reservation_for_rollout_recovery(
     tmp_path,
 ) -> None:
     class Death:
@@ -233,18 +239,15 @@ def test_runtime_exception_releases_reservation_without_daemon_restart(
         asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
     except RuntimeError:
         pass
-    assert store.active_reservation_runs() == ()
+    assert len(store.active_reservation_runs()) == 1
     with store._connect() as db:
         state, reason = db.execute(
             "SELECT state, release_reason FROM budget_reservations"
         ).fetchone()
-    assert (state, reason) == (
-        "released",
-        "runtime_exception_spend_unknown",
-    )
+    assert (state, reason) == ("active", None)
 
 
-def test_result_normalization_failure_releases_reservation(tmp_path) -> None:
+def test_codex_result_normalization_failure_preserves_reservation(tmp_path) -> None:
     wrapper, store = _wrapper(
         tmp_path,
         Runtime(
@@ -259,7 +262,30 @@ def test_result_normalization_failure_releases_reservation(tmp_path) -> None:
     with pytest.raises(ValueError):
         asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
 
+    assert len(store.active_reservation_runs()) == 1
+
+
+def test_non_codex_runtime_exception_releases_after_completed_teardown(
+    tmp_path,
+) -> None:
+    class Death:
+        async def run(self, _task):
+            raise RuntimeError("transport died")
+
+    wrapper, store = _wrapper(tmp_path, Death(), runtime_name="claude")
+
+    with pytest.raises(RuntimeError, match="transport died"):
+        asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
+
     assert store.active_reservation_runs() == ()
+    with store._connect() as db:
+        state, reason = db.execute(
+            "SELECT state, release_reason FROM budget_reservations"
+        ).fetchone()
+    assert (state, reason) == (
+        "released",
+        "runtime_exception_spend_unknown",
+    )
 
 
 def test_journal_supplied_run_identity_is_the_reservation_identity(tmp_path) -> None:

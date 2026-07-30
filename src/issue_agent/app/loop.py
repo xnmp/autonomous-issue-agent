@@ -382,15 +382,26 @@ class Daemon:
                         - terminalize_reserve,
                     ),
                 )
-                terminalized = (
-                    self._terminalize()
-                    if killed
-                    else False
-                )
-                _done, unfinished = wait(
-                    unfinished,
-                    timeout=self._remaining_shutdown_time(),
-                )
+                if killed:
+                    # A killed provider flushes its final rollout evidence while
+                    # the worker unwinds. Let that worker settle first, then run
+                    # the durable reconciliation backstop before any hard exit.
+                    _done, unfinished = wait(
+                        unfinished,
+                        timeout=max(
+                            0.0,
+                            self._remaining_shutdown_time()
+                            - terminalize_reserve,
+                        ),
+                    )
+                    terminalized = self._terminalize()
+                    if unfinished:
+                        _done, unfinished = wait(
+                            unfinished,
+                            timeout=self._remaining_shutdown_time(),
+                        )
+                else:
+                    terminalized = False
             else:
                 terminalized = False
         else:

@@ -34,12 +34,18 @@ import os
 import threading
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from tests.fakes.legacy_journal import Journal
 from issue_agent.adapters.journal import JournalingRuntime, read_events
-from issue_agent.adapters.control_store import SQLiteControlStore
+from issue_agent.adapters.control_store import (
+    AccountingDisposition,
+    ReservationRequest,
+    SQLiteControlStore,
+    SettlementRequest,
+)
 from issue_agent.adapters.store import Store
 from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
 from tests.fakes.executor import ImmediateExecutor as Executor
@@ -62,6 +68,7 @@ from issue_agent.app.roles import (
     _prediction_outcome_reporter,
     _recurrence_reporter,
     _review_state,
+    _shutdown_terminalize,
 )
 from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.actions import (
@@ -80,7 +87,14 @@ from issue_agent.domain.fix import (
 )
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
-from issue_agent.domain.contracts import RunId
+from issue_agent.domain.contracts import (
+    BudgetScope,
+    Money,
+    PriceQuote,
+    PricingBasis,
+    ReservationId,
+    RunId,
+)
 from issue_agent.domain.refs import issue_from_branch
 from issue_agent.domain.review import ReviewConfig, ReviewMode, decide_review
 from issue_agent.domain.world import (
@@ -100,6 +114,80 @@ def test_runtime_wiring_registries_cover_every_supported_runtime():
         RuntimeName.CLAUDE,
         RuntimeName.CODEX,
     }
+
+
+def test_hard_shutdown_reconciles_killed_rollout_before_releasing_capacity(
+    tmp_path,
+):
+    now = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
+    control = SQLiteControlStore(
+        str(tmp_path / "control.db"), now=lambda: now
+    )
+    control.initialize()
+    scope = BudgetScope(
+        "o/r",
+        "repository",
+        "USD",
+        "2026-07-30",
+        now.replace(hour=0),
+        now.replace(hour=0) + timedelta(days=1),
+        ZoneInfo("UTC"),
+    )
+    run_id = RunId("shutdown-reconcile")
+    assert control.reserve(
+        ReservationRequest(
+            ReservationId("shutdown-reservation"),
+            run_id,
+            json.dumps({"kind": "RESOLVE", "issue": 42}),
+            scope,
+            PriceQuote(
+                "model",
+                "card",
+                "v1",
+                now,
+                Money("USD", 1_000),
+            ),
+            Money("USD", 2_000),
+            "config-v1",
+            kind="RESOLVE",
+            owner_id="o/r:fix",
+        )
+    ).admitted
+    control.register_process_lease(
+        run_id,
+        pid=123,
+        pgid=123,
+        process_start_ticks=99,
+    )
+
+    class Spend:
+        def reconcile(self, candidate):
+            result = control.settle(
+                SettlementRequest(
+                    candidate,
+                    Money("USD", 250),
+                    PricingBasis.RECONCILED,
+                    "recovered-rollout",
+                    None,
+                    None,
+                    None,
+                )
+            )
+            return result.disposition is AccountingDisposition.AVAILABLE
+
+    _shutdown_terminalize(
+        control,
+        Spend(),
+        owner_id="o/r:fix",
+        state_dir=str(tmp_path / "state"),
+        role="fix",
+    )()
+
+    assert control.active_reservation_runs("o/r:fix") == ()
+    assert control.leases("o/r:fix") == ()
+    assert control.snapshot(scope).settled == Money("USD", 250)
+    assert control.pending_cancellation_intents("o/r:fix") == ()
+    assert (tmp_path / "state" / "handovers" / "issue-42.md").exists()
 
 
 def test_effect_recovery_drains_remote_actions_and_agent_publications():
