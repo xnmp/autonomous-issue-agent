@@ -55,7 +55,7 @@ def test_review_hook_cannot_leave_read_only_state_for_nested_fixers(tmp_path):
     fixer = reviewer / ".claude" / "worktrees" / "issue-113"
     fixer.mkdir(parents=True)
 
-    write_hook_config(str(reviewer), review_only=True)
+    write_hook_config(str(reviewer))
     write_hook_config(str(fixer))
 
     review_hook = (reviewer / ".codex" / "hooks" / "gov.sh").read_text()

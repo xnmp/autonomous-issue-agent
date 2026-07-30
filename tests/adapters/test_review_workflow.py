@@ -9,6 +9,7 @@ from issue_agent.app.execute import Executor
 from issue_agent.app.planners.schemas import REVIEW_SCHEMA
 from issue_agent.app.workflows.review import ReviewWorkflow, ReviewWorkflowConfig
 from issue_agent.domain.outcome import AgentResult
+from issue_agent.domain.agent_task import AgentTask
 from issue_agent.domain.review import (
     ReviewMode,
     ReviewState,
@@ -174,7 +175,17 @@ def test_codex_review_installs_its_hook_in_the_explicit_checkout_before_running(
 
     assert prepared == ["/explicit/review-checkout"]
     assert runner.tasks[0].cwd == "/explicit/review-checkout"
-    assert runner.tasks[0].env["ISSUE_AGENT_REVIEW_READ_ONLY"] == "1"
+
+
+def test_codex_review_sets_read_only_mode_on_its_child_task():
+    prepared = _workflow(
+        FakeGateway(), FakeStore(), FakeRunner(AgentResult(is_error=False)),
+        reviewer_runtime="codex", execution_cwd="/explicit/review-checkout",
+        prepare_cwd=lambda _cwd: None,
+    )._prepare_task(AgentTask(prompt="review"))
+
+    assert prepared is not None
+    assert prepared.env == {"ISSUE_AGENT_REVIEW_READ_ONLY": "1"}
 
 
 def test_codex_review_refuses_an_implicit_process_cwd():

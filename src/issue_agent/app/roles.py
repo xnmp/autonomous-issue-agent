@@ -1000,16 +1000,17 @@ def build_review_daemon(
         )
         if budget_notice is not None:
             _log("review")(budget_notice)
-        # Codex ignores AgentTask's SDK-only tool policy.  The workflow installs
-        # this dedicated read-only Bash allow-list immediately before each leg,
-        # in the explicit target checkout only.  Builder-time writes would let a
-        # test run corrupt a simultaneously active fixer worktree.
+        # Codex ignores AgentTask's SDK-only tool policy. The workflow installs
+        # its governor immediately before each leg in the explicit target
+        # checkout, then passes review-only mode in that leg's child environment.
+        # Builder-time writes would let a test run corrupt a simultaneously
+        # active fixer worktree.
         from ..adapters.codex_hook import write_hook_config
 
         review_execution_cwd = cfg.target_dir
         if review_execution_cwd:
             review_prepare_cwd = partial(
-                write_hook_config, review_only=True, log=_log("review")
+                write_hook_config, log=_log("review")
             )
         else:
             _log("review")(

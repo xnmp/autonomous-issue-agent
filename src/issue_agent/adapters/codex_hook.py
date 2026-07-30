@@ -105,7 +105,7 @@ def _without_generated_instructions(content: str) -> str:
     return content[:start] + suffix.removeprefix("\n")
 
 
-def _gov_script(governor_path: str, review_only: bool = False) -> str:
+def _gov_script(governor_path: str) -> str:
     # Mirrors plugin/hooks/dispatch.sh: fail OPEN if uv is missing (the PR gate +
     # CI + reviewer are the real boundary), else pipe stdin into the governor.
     return f"""#!/usr/bin/env bash
@@ -114,7 +114,6 @@ if ! command -v uv >/dev/null 2>&1; then
   echo "bash_governor: uv not found; allowing (gate degraded)" >&2
   exit 0
 fi
-{('export ISSUE_AGENT_REVIEW_READ_ONLY=1' if review_only else '')}
 exec uv run --quiet "{governor_path}"
 """
 
@@ -208,7 +207,6 @@ exit 0
 def write_hook_config(
     cwd: str, governor_path: str = GOVERNOR_PATH, agents_md: str = "",
     edit_check_cmd: str = "",
-    review_only: bool = False,
     log: Callable[[str], None] | None = None,
 ) -> str:
     """Emit `<cwd>/.codex/config.toml` + `.codex/hooks/gov.sh` so a `codex exec`
@@ -226,7 +224,7 @@ def write_hook_config(
 
     gov_script_path = os.path.join(hooks_dir, "gov.sh")
     with open(gov_script_path, "w") as f:
-        f.write(_gov_script(governor_path, review_only))
+        f.write(_gov_script(governor_path))
     os.chmod(
         gov_script_path,
         os.stat(gov_script_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH,
