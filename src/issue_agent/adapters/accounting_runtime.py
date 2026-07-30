@@ -226,6 +226,18 @@ class AccountingRuntime(AgentRuntime):
                 if self.runtime_name == "codex"
                 else PricingBasis.SYNTHETIC
             )
+        elif (
+            self.runtime_name == "codex"
+            and self.rate_table is not None
+            and provider_amount.micros > 0
+        ):
+            # Older Codex stderr exposes only ``total_tokens``. CodexRunner has
+            # already conservatively priced that total at the configured higher
+            # rate, but TokenUsage cannot represent an unsplit total. Preserve
+            # the configured-price receipt instead of converting an observable
+            # non-zero run into a zero charge.
+            amount = provider_amount
+            basis = PricingBasis.CONFIGURED_RATE_CARD
         else:
             amount = provider_amount
             basis = (
@@ -241,10 +253,18 @@ class AccountingRuntime(AgentRuntime):
                 result.session_id or f"run:{run_id}",
                 usage,
                 self.rate_table.rate_card_id
-                if priced_by_rate_card and self.rate_table is not None
+                if (
+                    priced_by_rate_card
+                    or basis is PricingBasis.CONFIGURED_RATE_CARD
+                )
+                and self.rate_table is not None
                 else None,
                 self.rate_table.version
-                if priced_by_rate_card and self.rate_table is not None
+                if (
+                    priced_by_rate_card
+                    or basis is PricingBasis.CONFIGURED_RATE_CARD
+                )
+                and self.rate_table is not None
                 else None,
             )
         )
@@ -372,6 +392,16 @@ def _token_usage(raw: object, runtime: str) -> TokenUsage | None:
     cache_read = int(raw.get("cache_read_input_tokens", 0) or 0)
     cache_write = int(raw.get("cache_creation_input_tokens", 0) or 0)
     if min(input_total, cache_read, cache_write) < 0:
+        return None
+    total_only = int(raw.get("total_tokens", 0) or 0)
+    if total_only > 0 and not any(
+        (
+            input_total,
+            int(raw.get("output_tokens", 0) or 0),
+            cache_read,
+            cache_write,
+        )
+    ):
         return None
     # Codex reports cached input as a subset of input.  Normalize to disjoint
     # counters exactly once at this adapter boundary.

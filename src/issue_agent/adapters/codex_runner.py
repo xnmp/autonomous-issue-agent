@@ -1118,6 +1118,7 @@ class CodexRunner(AgentRuntime):
         err_chunks: list[str],
         usage_baseline: tuple[str, dict, int | None] | None,
         session_id: str = "",
+        codex_home: str | None = None,
     ) -> dict | None:
         """THIS LEG's token counters as of right now, or None if nothing has
         been reported yet (#29).
@@ -1140,7 +1141,11 @@ class CodexRunner(AgentRuntime):
         also contains arbitrary agent/test output."""
         stderr = "\n".join(err_chunks)
         sid = session_id or _session_id_from_lines(stderr)
-        usage = read_rollout_usage(sid) if sid else None
+        usage = (
+            read_rollout_usage(sid, codex_home=codex_home)
+            if sid
+            else None
+        )
         if usage_baseline is not None and sid == usage_baseline[0]:
             usage = usage_delta(usage, usage_baseline[1])
         return usage
@@ -1286,8 +1291,17 @@ class CodexRunner(AgentRuntime):
         # Captured once — retries inside this run resume a session whose earlier
         # attempts were never ledgered, so their tokens must stay in the total.
         baseline_sid = task.resume or ""
-        baseline_usage = read_rollout_usage(baseline_sid) if baseline_sid else None
-        baseline_turns = read_rollout_turns(baseline_sid) if baseline_sid else None
+        codex_home = task.env.get("CODEX_HOME") or None
+        baseline_usage = (
+            read_rollout_usage(baseline_sid, codex_home=codex_home)
+            if baseline_sid
+            else None
+        )
+        baseline_turns = (
+            read_rollout_turns(baseline_sid, codex_home=codex_home)
+            if baseline_sid
+            else None
+        )
         net_attempts = 0
         rl_attempts = 0
         while True:
@@ -1433,6 +1447,7 @@ class CodexRunner(AgentRuntime):
             },
             additional_keys=(self.provider.env_key,),
         )
+        codex_home = proc_env.get("CODEX_HOME") or None
         self._log(f"codex: exec model={model} cwd={task.cwd or '.'}")
         # Rollout metadata uses wall-clock UTC while the plausibility guard only
         # needs elapsed process time. Keep the two clocks separate: wall time
@@ -1544,7 +1559,9 @@ class CodexRunner(AgentRuntime):
                 return session_id
             stderr = "\n".join(err_chunks)
             session_id = discover_rollout_session(
-                execution_cwd, rollout_started_at
+                execution_cwd,
+                rollout_started_at,
+                codex_home=codex_home,
             )
             if session_id and session_id != evidence_session_id:
                 evidence_session_id = session_id
@@ -1607,7 +1624,12 @@ class CodexRunner(AgentRuntime):
                 return None
             last_budget_check = now
             sid = _current_session_id()
-            usage = self._usage_so_far(err_chunks, usage_baseline, sid)
+            usage = self._usage_so_far(
+                err_chunks,
+                usage_baseline,
+                sid,
+                codex_home,
+            )
             return budget_overrun_usd(
                 _trusted_usage(usage, sid),
                 cost_per_mtok_in=rate_in,
@@ -1884,10 +1906,17 @@ class CodexRunner(AgentRuntime):
             # this run was stopped.
             session_id = _current_session_id(stdout, allow_legacy_header=True)
             final_usage = _trusted_usage(
-                self._usage_so_far(err_chunks, usage_baseline, session_id),
+                self._usage_so_far(
+                    err_chunks,
+                    usage_baseline,
+                    session_id,
+                    codex_home,
+                ),
                 session_id,
             )
-            final_turns = read_rollout_turns(session_id)
+            final_turns = read_rollout_turns(
+                session_id, codex_home=codex_home
+            )
             if (
                 final_turns is not None
                 and usage_baseline is not None
@@ -1963,7 +1992,9 @@ class CodexRunner(AgentRuntime):
         # session_meta is now the primary machine-readable identity source;
         # legacy stderr/stdout headers and task.resume remain compatible.
         session_id = _current_session_id(stdout, allow_legacy_header=True)
-        rollout_usage = read_rollout_usage(session_id)
+        rollout_usage = read_rollout_usage(
+            session_id, codex_home=codex_home
+        )
         if rollout_usage is None:
             rollout_usage = parse_codex_usage(stderr)
         # A resumed session's rollout counter is cumulative; subtract what the
@@ -1973,7 +2004,9 @@ class CodexRunner(AgentRuntime):
         if usage_baseline is not None and session_id == usage_baseline[0]:
             rollout_usage = usage_delta(rollout_usage, usage_baseline[1])
         rollout_usage = _trusted_usage(rollout_usage, session_id)
-        rollout_turns = read_rollout_turns(session_id)
+        rollout_turns = read_rollout_turns(
+            session_id, codex_home=codex_home
+        )
         if (
             rollout_turns is not None
             and usage_baseline is not None

@@ -94,6 +94,44 @@ def test_paid_run_has_reservation_before_runtime_and_settles(tmp_path) -> None:
     assert runtime.calls == 1
 
 
+def test_total_only_codex_usage_cannot_turn_nonzero_spend_into_zero(
+    tmp_path,
+) -> None:
+    runtime = Runtime(
+        AgentResult(
+            False,
+            status="ok",
+            cost_usd=1.25,
+            session_id="total-only-receipt",
+            usage={
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "total_tokens": 125_000,
+            },
+        )
+    )
+    wrapper, store = _wrapper(tmp_path, runtime)
+
+    asyncio.run(
+        wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2))
+    )
+
+    with store._connect() as db:
+        charge = db.execute(
+            "SELECT amount_micros, basis, usage_json, rate_card_id, "
+            "rate_card_version FROM charges"
+        ).fetchone()
+    assert tuple(charge) == (
+        1_250_000,
+        "configured_rate_card",
+        None,
+        "test",
+        "v1",
+    )
+
+
 def test_exhausted_cap_blocks_before_runtime(tmp_path) -> None:
     runtime = Runtime(AgentResult(False, status="ok"))
     wrapper, _store = _wrapper(tmp_path, runtime, cap=1_000_000)

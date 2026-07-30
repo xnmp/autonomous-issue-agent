@@ -800,7 +800,10 @@ def _usage(raw) -> dict | None:
     (Codex reports none) → None, so 'no usage' and 'zero tokens' stay distinct."""
     if not isinstance(raw, dict):
         return None
-    return {k: raw.get(k, 0) for k in _USAGE_KEYS}
+    normalized = {k: raw.get(k, 0) for k in _USAGE_KEYS}
+    if "total_tokens" in raw:
+        normalized["total_tokens"] = raw.get("total_tokens", 0)
+    return normalized
 
 
 # ── readers (pure over the file's bytes; tolerate a truncated tail) ───────────

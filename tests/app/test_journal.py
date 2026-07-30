@@ -654,6 +654,26 @@ def test_agent_run_records_context_cost_and_usage(tmp_path):
     assert read_events(ledger) == [], "legacy spend JSONL is read-only"
 
 
+def test_agent_run_preserves_codex_total_only_usage(tmp_path):
+    result = AgentResult(
+        is_error=False,
+        status="pr_opened",
+        cost_usd=0.5,
+        usage={"total_tokens": 50_000},
+    )
+    rt, journal, _ledger = _runtime(tmp_path, result)
+
+    asyncio.run(rt.run(RuntimePlan(prompt="p")))
+
+    assert _settled(journal.path)[0]["usage"] == {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "total_tokens": 50_000,
+    }
+
+
 def test_missing_usage_stays_distinct_from_zero_tokens(tmp_path):
     rt, journal, _ = _runtime(tmp_path, AgentResult(is_error=False, usage=None))
     asyncio.run(rt.run(RuntimePlan(prompt="p")))

@@ -649,7 +649,10 @@ def test_headerless_01460_recovers_root_rollout_usage_cost_turns_and_ledger(
     worktree = tmp_path / "worktree"
     worktree.mkdir()
     codex_home = tmp_path / "codex-home"
-    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    # HookPreparingRuntime sets CODEX_HOME on the task, not on the daemon.
+    # The runner must read the same isolated profile its child writes even when
+    # the ambient operator profile points elsewhere.
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "wrong-ambient-home"))
     now = datetime.now(timezone.utc)
     good_sid = "019fa000-good-root"
     _write_session_rollout(
@@ -713,6 +716,7 @@ def test_headerless_01460_recovers_root_rollout_usage_cost_turns_and_ledger(
         env={
             "ISSUE_AGENT_RUN_ID": "reserved-run",
             "ISSUE_AGENT_CONFIG_VERSION": "cfg",
+            "CODEX_HOME": str(codex_home),
         },
     )))
 
