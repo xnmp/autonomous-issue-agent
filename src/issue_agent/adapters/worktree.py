@@ -144,6 +144,15 @@ class WorktreeUnavailable(RuntimeError):
     existing handler."""
 
 
+class WorktreeBranchAmbiguous(RuntimeError):
+    """Recovery found several non-synthetic branches for the same issue.
+
+    A recovery that guesses here can create a fresh worktree on the wrong
+    branch and strand the blocked work. Callers must surface the ambiguity
+    rather than silently falling back to a title-derived branch name.
+    """
+
+
 class Worktrees:
     """Create/remove per-issue worktrees under WORKTREE_ROOT, relative to the
     target repo (`repo_dir`). Branch shape is the harness's
@@ -166,6 +175,31 @@ class Worktrees:
 
     def path(self, issue: int) -> str:
         return os.path.join(self.worktree_root, f"issue-{issue}")
+
+    def branch_for_issue(self, issue: int, fallback: str) -> str:
+        """Return a retained harness branch for an older issue leg.
+
+        New legs persist their branch in Store. This local-ref lookup recovers
+        pre-persistence blocked legs after their worktree was reaped. A sole
+        non-synthetic branch wins over any stale fallback. An absent branch
+        returns ""; genuine ambiguity raises rather than guessing.
+        """
+        refs = self._git(
+            ["for-each-ref", "--format=%(refname:short)", "refs/heads"], self.repo_dir
+        )
+        matches = [
+            ref for ref in refs.out.splitlines()
+            if re.fullmatch(rf"(?:fix|feat|chore|refactor)/{issue}-.+", ref)
+        ]
+        if len(matches) <= 1:
+            return matches[0] if matches else ""
+        synthetic = {fallback, f"fix/{issue}-issue"}
+        retained = [ref for ref in matches if ref not in synthetic]
+        if len(retained) == 1:
+            return retained[0]
+        raise WorktreeBranchAmbiguous(
+            f"cannot recover issue #{issue}: multiple retained branches {matches!r}"
+        )
 
     def ensure(self, issue: int, branch: str) -> str:
         """Ensure a worktree for the issue exists on `branch`; return its abs

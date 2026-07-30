@@ -81,10 +81,27 @@ class FixWorkflow:
 
     def _ensure_cwd(self, issue: int, branch: str) -> str:
         cwd = self.worktrees.ensure(issue, branch)
+        save_branch = getattr(self.store, "save_branch", None)
+        if save_branch is not None:
+            save_branch(issue, branch)
         if self.prepare_cwd is not None:
             self.prepare_cwd(cwd)
         self.cfg.log(f"worktree #{issue}: ready on '{branch}' → {cwd}")
         return cwd
+
+    def _resume_branch(self, issue: int, title: str) -> str:
+        fallback = f"fix/{issue}-{slugify(title) or 'issue'}"
+        get_branch = getattr(self.store, "get_branch", None)
+        if get_branch is not None:
+            remembered = get_branch(issue)
+            if remembered:
+                return remembered
+        branch_for_issue = getattr(self.worktrees, "branch_for_issue", None)
+        if branch_for_issue is not None:
+            remembered = branch_for_issue(issue, fallback)
+            if remembered:
+                return remembered
+        return fallback
 
     def _prompt_input(self, method: str, *args, **kwargs) -> str:
         """Best-effort fetch of a prompt INPUT (review M13/D6).
@@ -640,7 +657,7 @@ class FixWorkflow:
         if self.cfg.author_tests_split and pr_existing is None:
             await self.resolve_split(issue, human_reply=reply)
             return
-        branch = self.gateway.get_pr(pr_existing).head_ref_name if pr_existing else f"fix/{issue}-issue"
+        branch = self.gateway.get_pr(pr_existing).head_ref_name if pr_existing else self._resume_branch(issue, iss.title)
         cwd = self._ensure_cwd(issue, branch)
         fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
         session_id = self.store.get_session(issue)

@@ -51,7 +51,7 @@ from ..domain.world import normalize_predicted_paths
 _ISSUE_SUFFIXES = (
     "session", "resumed-at", "resumes", "ci-retries", "resolve-retries",
     "rebase-retries", "infra-deaths", "review-retries", "phase", "jira",
-    "jira-phase", "model", "predicted-paths",
+    "jira-phase", "model", "predicted-paths", "branch",
 )
 _PR_SUFFIXES = (
     "session", "last-sha", "round", "automerge", "patch-id", "ci-rerun-head",
@@ -249,6 +249,12 @@ class Store:
             return int(raw)
         except ValueError:
             return default
+
+    def get_branch(self, issue: int) -> str:
+        return self._read(self.issue_path(issue, "branch"))
+
+    def save_branch(self, issue: int, branch: str) -> None:
+        self._write(self.issue_path(issue, "branch"), branch)
 
     # ── durable terminal lifecycle writes (#64) ──
     @staticmethod
