@@ -430,6 +430,12 @@ def _hold_reporter(journal: Journal | None, repo: str, log):
 
     def fields_for(key):
         issue, reason, blocker_pr, blocker_issue = key
+        if reason == "human":
+            return {
+                "issue": issue,
+                "reason": reason,
+                "blocker": "human",
+            }
         return {
             "issue": issue,
             "reason": reason,
@@ -438,7 +444,9 @@ def _hold_reporter(journal: Journal | None, repo: str, log):
         }
 
     def waiting_label(key) -> str:
-        issue, _reason, blocker_pr, blocker_issue = key
+        issue, reason, blocker_pr, blocker_issue = key
+        if reason == "human":
+            return f"issue #{issue} waiting on human input"
         if blocker_pr is not None:
             return f"issue #{issue} waiting on PR #{blocker_pr}"
         if blocker_issue is not None:
@@ -470,8 +478,6 @@ def _hold_reporter(journal: Journal | None, repo: str, log):
                 for event in read_events_tail(journal.path):
                     if event.get("event") not in {"deferred", "hold"}:
                         continue
-                    if event.get("reason") == "human":
-                        continue
                     key = event_key(event)
                     if key is None:
                         continue
@@ -481,6 +487,11 @@ def _hold_reporter(journal: Journal | None, repo: str, log):
                         active[key] = event
 
         current = {key_for(hold): hold for hold in issue_holds(world)}
+        current.update({
+            (issue.number, "human", None, None): issue
+            for issue in world.open_issues()
+            if issue.has(Label.AI_BLOCKED)
+        })
         for key in current.keys() - active.keys():
             message = waiting_label(key)
             log(f"DEFERRED: {message}; dispatches once that clears")

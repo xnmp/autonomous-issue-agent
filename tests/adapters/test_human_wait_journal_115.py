@@ -4,7 +4,7 @@ from issue_agent.app.execute import Executor
 from issue_agent.app.roles import _hold_reporter
 from issue_agent.domain.actions import Relabel, Target
 from issue_agent.domain.labels import Label
-from issue_agent.domain.world import WorldState
+from issue_agent.domain.world import IssueView, WorldState
 
 from test_journal import FakeGateway
 from test_roles import _holds_in
@@ -34,7 +34,7 @@ def test_pr_block_does_not_create_an_issue_human_wait(tmp_path):
     assert [event for event in read_events(journal.path) if event["event"] == "deferred"] == []
 
 
-def test_hold_reporter_does_not_clear_executor_owned_human_wait(tmp_path):
+def test_restart_reconciles_human_wait_after_manual_unblock(tmp_path):
     journal = Journal(str(tmp_path / "journal.jsonl"))
     journal.emit(
         "deferred",
@@ -44,11 +44,19 @@ def test_hold_reporter_does_not_clear_executor_owned_human_wait(tmp_path):
         blocker="human",
     )
 
-    _hold_reporter(journal, "o/r", lambda _message: None)(WorldState())
+    blocked = WorldState(issues=(
+        IssueView(5, labels=frozenset({Label.AI_BLOCKED})),
+    ))
+    ready = WorldState(issues=(
+        IssueView(5, labels=frozenset({Label.AI_READY})),
+    ))
+    _hold_reporter(journal, "o/r", lambda _message: None)(blocked)
+    _hold_reporter(journal, "o/r", lambda _message: None)(ready)
 
     human_events = [
         event
         for event in _holds_in(journal)
         if event.get("reason") == "human"
     ]
-    assert [event["state"] for event in human_events] == ["waiting"]
+    assert [event["state"] for event in human_events] == ["waiting", "cleared"]
+    assert human_events[-1]["blocker"] == "human"
