@@ -72,6 +72,7 @@ def test_parse_pr_maps_reviews_and_closing_ref():
         "headRefName": "fix/5-null-token",
         "headRefOid": "abc123",
         "baseRefName": "dev",
+        "baseRefOid": "base123",
         "labels": [{"name": "ai-pr-open"}],
         "reviews": [{
             "author": {"login": "review-bot"}, "state": "APPROVED", "submittedAt": "t2",
@@ -83,6 +84,7 @@ def test_parse_pr_maps_reviews_and_closing_ref():
     pr = parse_pr(d)
     assert pr.number == 100
     assert pr.head_ref_name == "fix/5-null-token"
+    assert pr.base_ref_oid == "base123"
     assert pr.head_ref_oid == "abc123"
     assert pr.closing_issue == 5
     assert pr.reviews[0].author == "review-bot"
@@ -200,14 +202,49 @@ class FakeRunner:
     def __init__(self, responses=None):
         self.calls = []          # list of (argv, token)
         self.responses = responses or {}
+        self.last_pr_number = ""
 
     def __call__(self, argv, token):
         self.calls.append((argv, token))
+        if argv[1:3] == ["pr", "view"]:
+            self.last_pr_number = str(argv[3])
         # key responses by the subcommand pair (argv[1], argv[2])
         key = " ".join(argv[1:4])
         for k, v in self.responses.items():
             if key.startswith(k):
+                if (
+                    argv[1:3] == ["pr", "view"]
+                    and isinstance(v, dict)
+                    and not v.get("headRefOid")
+                ):
+                    v = {**v, "headRefOid": f"head-{argv[3]}"}
                 return v if isinstance(v, str) else json.dumps(v)
+        legacy = self.responses.get(f"pr checks {self.last_pr_number}")
+        if "/check-runs?filter=latest&per_page=100" in " ".join(argv):
+            if legacy is None:
+                return ""
+            runs = [
+                {
+                    "name": item.get("name", ""),
+                    "status": (
+                        "queued"
+                        if item.get("bucket") == "pending"
+                        or item.get("state") in {"QUEUED", "IN_PROGRESS"}
+                        else "completed"
+                    ),
+                    "conclusion": (
+                        "failure"
+                        if item.get("bucket") == "fail"
+                        else "success"
+                    ),
+                    "started_at": item.get("startedAt"),
+                    "details_url": item.get("link"),
+                }
+                for item in legacy
+            ]
+            return json.dumps([{"check_runs": runs}])
+        if "statuses?per_page=100" in " ".join(argv):
+            return json.dumps([[]]) if legacy is not None else ""
         return ""
 
 
@@ -236,7 +273,7 @@ def test_write_command_builders_are_pure_contracts():
     assert build_enable_auto_merge_args(
         "o/r", 100, "squash", "head"
     ) == [
-        "pr", "merge", "100", "--repo", "o/r", "--auto", "--squash", "--delete-branch",
+        "pr", "merge", "100", "--repo", "o/r", "--squash", "--delete-branch",
         "--match-head-commit", "head",
     ]
     assert build_blocker_id_args("o/r", 42) == ["api", "repos/o/r/issues/42", "--jq", ".id"]
@@ -275,31 +312,25 @@ def test_close_issue_argv():
 
 
 def test_enable_auto_merge_argv():
-    fr = FakeRunner()
-    gw = GitHubGateway("o/r", runner=fr)
-    gw.enable_auto_merge(100, "squash", "head")
-    argv, _ = fr.calls[0]
-    assert argv[1:4] == ["pr", "merge", "100"]
-    assert "--auto" in argv and "--squash" in argv and "--delete-branch" in argv
-
-
-def test_enable_auto_merge_verifies_armed_on_github():
-    # Success is a follow-up READ, not the merge call's stdout (empty either
-    # way): armed (autoMergeRequest set) or already landed (state MERGED) →
-    # True; anything else — including the GraphQL refusal on a base branch
-    # with no required-check protection — → False, so the caller never latches
-    # the don't-re-arm marker on an arm GitHub rejected (the #537 wedge).
-    armed = FakeRunner({"pr view 100": {
-        "autoMergeRequest": {"enabledAt": "x"},
-        "state": "OPEN",
+    fr = FakeRunner({"pr view 100": {
+        "autoMergeRequest": None,
+        "state": "MERGED",
         "headRefOid": "head",
     }})
-    assert GitHubGateway("o/r", runner=armed).enable_auto_merge(
-        100, "squash", "head"
-    ) is True
+    gw = GitHubGateway("o/r", runner=fr)
+    gw.enable_auto_merge(100, "squash", "head")
+    argv, _ = next(
+        call for call in fr.calls
+        if call[0][1:4] == ["pr", "merge", "100"]
+    )
+    assert argv[1:4] == ["pr", "merge", "100"]
+    assert "--auto" not in argv
+    assert "--squash" in argv and "--delete-branch" in argv
+    assert argv[argv.index("--match-head-commit") + 1] == "head"
 
+
+def test_enable_auto_merge_verifies_exact_head_was_merged():
     landed = FakeRunner({"pr view 100": {
-        "autoMergeRequest": None,
         "state": "MERGED",
         "headRefOid": "head",
     }})
@@ -308,7 +339,6 @@ def test_enable_auto_merge_verifies_armed_on_github():
     ) is True
 
     refused = FakeRunner({"pr view 100": {
-        "autoMergeRequest": None,
         "state": "OPEN",
         "headRefOid": "head",
     }})
@@ -321,14 +351,58 @@ def test_enable_auto_merge_verifies_armed_on_github():
         100, "squash", "head"
     ) is False
 
+    stale = FakeRunner({"pr view 100": {
+        "state": "MERGED",
+        "headRefOid": "different-head",
+    }})
+    assert GitHubGateway("o/r", runner=stale).enable_auto_merge(
+        100, "squash", "head"
+    ) is False
+
 
 def test_update_branch_argv():
-    fr = FakeRunner()
+    class UpdateRunner(FakeRunner):
+        def __init__(self):
+            super().__init__()
+            self.head = "head"
+
+        def __call__(self, argv, token):
+            self.calls.append((argv, token))
+            if argv[1:4] == ["pr", "view", "100"]:
+                return json.dumps(
+                    {
+                        "autoMergeRequest": None,
+                        "headRefOid": self.head,
+                        "mergeStateStatus": "CLEAN",
+                    }
+                )
+            if argv[1:3] == [
+                "api",
+                "repos/o/r/pulls/100/update-branch",
+            ]:
+                self.head = "updated-head"
+                return "ok"
+            return ""
+
+    fr = UpdateRunner()
     gw = GitHubGateway("o/r", runner=fr)
-    gw.update_branch(100, "head")
-    argv, _ = fr.calls[0]
+    assert gw.update_branch(100, "head") is True
+    argv, _ = fr.calls[1]
     assert argv[1:3] == ["api", "repos/o/r/pulls/100/update-branch"]
     assert "expected_head_sha=head" in argv
+
+
+def test_update_branch_refuses_to_advance_when_legacy_arm_cannot_be_revoked():
+    fr = FakeRunner({"pr view 100": {
+        "autoMergeRequest": {"enabledAt": "now"},
+        "headRefOid": "head",
+    }})
+    gw = GitHubGateway("o/r", runner=fr)
+
+    assert gw.update_branch(100, "head") is False
+
+    assert any("--disable-auto" in argv for argv, _ in fr.calls)
+    assert not any(argv[1] == "api" for argv, _ in fr.calls)
 
 
 def test_add_blocked_by_resolves_id_then_posts():
@@ -366,6 +440,27 @@ def test_submit_review_returns_false_on_failure():
     fr = FakeRunner()  # no canned response → "" for every call
     gw = GitHubGateway("o/r", runner=fr)
     assert gw.submit_review(100, "APPROVE", "lgtm", "head") is False
+
+
+def test_pr_diff_is_fetched_for_exact_observed_revisions():
+    fr = FakeRunner(
+        {"api -H Accept: application/vnd.github.v3.diff": "diff text"}
+    )
+    gw = GitHubGateway("o/r", runner=fr)
+
+    evidence = gw.pr_diff(100, "base-sha", "head-sha")
+
+    assert evidence.base_oid == "base-sha"
+    assert evidence.head_oid == "head-sha"
+    argv, _ = fr.calls[0]
+    assert "repos/o/r/compare/base-sha...head-sha" in argv
+
+
+def test_pr_diff_empty_read_is_unavailable_not_approvable():
+    gw = GitHubGateway("o/r", runner=FakeRunner())
+
+    with pytest.raises(RuntimeError, match="diff is unavailable"):
+        gw.pr_diff(100, "base-sha", "head-sha")
 
 
 def test_has_review_flattens_all_paginated_api_pages():
@@ -415,6 +510,70 @@ def test_get_pr_merges_checks_endpoint():
     assert pr.checks and pr.checks[0].name == "unit"
     view_call = next(call[0] for call in fr.calls if call[0][1:3] == ["pr", "view"])
     assert "comments" in view_call[view_call.index("--json") + 1]
+
+
+def test_get_pr_checks_are_head_bound_and_keep_only_latest_attempt():
+    calls = []
+
+    def runner(argv, token):
+        del token
+        calls.append(argv)
+        command = " ".join(argv)
+        if "pr view 100" in command:
+            return json.dumps(
+                {
+                    "number": 100,
+                    "headRefOid": "h1",
+                    "state": "OPEN",
+                }
+            )
+        if "/commits/h1/check-runs" in command:
+            return json.dumps(
+                [
+                    {
+                        "check_runs": [
+                            {
+                                "id": 1,
+                                "name": "unit",
+                                "app": {"id": 7},
+                                "status": "completed",
+                                "conclusion": "failure",
+                                "started_at": "2026-01-01T00:00:00Z",
+                            },
+                            {
+                                "id": 2,
+                                "name": "unit",
+                                "app": {"id": 7},
+                                "status": "completed",
+                                "conclusion": "success",
+                                "started_at": "2026-01-01T01:00:00Z",
+                            },
+                        ]
+                    }
+                ]
+            )
+        if "/commits/h1/statuses" in command:
+            return json.dumps(
+                [
+                    [
+                        {"context": "legacy", "state": "success"},
+                        {"context": "legacy", "state": "failure"},
+                    ]
+                ]
+            )
+        if "/commits/h2/" in command:
+            raise AssertionError("moving current head must not select CI")
+        return ""
+
+    pr = GitHubGateway("o/r", runner=runner).get_pr(100)
+
+    assert ci_state(pr.checks, known=pr.checks_known) is CIState.OK
+    assert [check.name for check in pr.checks] == ["unit", "legacy"]
+    assert all(
+        "/commits/h1/" in " ".join(call)
+        for call in calls
+        if "/commits/" in " ".join(call)
+    )
 
 
 # ── external-repo reviewer: build_review_world + ai-review parsing ────────────
@@ -502,13 +661,22 @@ def test_get_pr_keeps_failed_job_when_optional_run_lookup_raises():
     def runner(argv, token):
         key = " ".join(argv)
         if "pr view 815" in key:
-            return json.dumps({"number": 815, "state": "OPEN"})
-        if "pr checks 815" in key:
-            return json.dumps([{
+            return json.dumps({
+                "number": 815,
+                "state": "OPEN",
+                "headRefOid": "head-815",
+            })
+        if "/commits/head-815/check-runs" in key:
+            return json.dumps([{"check_runs": [{
                 "name": "Unit",
-                "bucket": "fail",
-                "link": "https://github.com/o/r/actions/runs/4242/job/99",
-            }])
+                "status": "completed",
+                "conclusion": "failure",
+                "details_url": (
+                    "https://github.com/o/r/actions/runs/4242/job/99"
+                ),
+            }]}])
+        if "/commits/head-815/statuses" in key:
+            return json.dumps([[]])
         if "actions/runs/4242" in key:
             raise RuntimeError("optional endpoint unavailable")
         return ""
@@ -1476,13 +1644,26 @@ def test_merge_gate_protection_demands_both_reviews_and_checks():
     ambiguity (404, 403, garbage) — must read False, because early arming
     without the server-side gate merges unreviewed work."""
     full = {"required_pull_request_reviews": {"required_approving_review_count": 1},
-            "required_status_checks": {"contexts": ["frontend", "rust"]}}
+            "required_status_checks": {
+                "contexts": ["frontend", "rust"], "strict": True}}
     checks_only = {"required_status_checks": {"contexts": ["frontend"]}}
     reviews_only = {"required_pull_request_reviews": {"required_approving_review_count": 2}}
     zero_reviews = {"required_pull_request_reviews": {"required_approving_review_count": 0},
                     "required_status_checks": {"contexts": ["frontend"]}}
     new_shape = {"required_pull_request_reviews": {"required_approving_review_count": 1},
-                 "required_status_checks": {"checks": [{"context": "rust", "app_id": 15368}]}}
+                 "required_status_checks": {
+                     "checks": [{"context": "rust", "app_id": 15368}],
+                     "strict": True,
+                 }}
+    non_strict = {
+        "required_pull_request_reviews": {
+            "required_approving_review_count": 1
+        },
+        "required_status_checks": {
+            "contexts": ["frontend"],
+            "strict": False,
+        },
+    }
 
     def gw(payload):
         fr = FakeRunner({"api repos/o/r/branches/dev/protection": payload})
@@ -1493,6 +1674,7 @@ def test_merge_gate_protection_demands_both_reviews_and_checks():
     assert gw(checks_only).merge_gate_protection("dev") is False
     assert gw(reviews_only).merge_gate_protection("dev") is False
     assert gw(zero_reviews).merge_gate_protection("dev") is False
+    assert gw(non_strict).merge_gate_protection("dev") is False
     assert gw("").merge_gate_protection("dev") is False        # 404/403 → fail-soft ""
     assert gw("not json").merge_gate_protection("dev") is False
 
@@ -1587,8 +1769,14 @@ def test_merged_prs_in_the_world_get_the_cheap_fetch():
     view_541 = [a for a, _ in fr.calls if a[2:4] == ["view", "541"]]
     assert view_540 and "mergeable" not in view_540[0][-1]   # cheap fields only
     assert view_541 and "mergeable" in view_541[0][-1]       # open PR: full
-    assert not any(a[2:4] == ["checks", "540"] for a, _ in fr.calls)
-    assert any(a[2:4] == ["checks", "541"] for a, _ in fr.calls)
+    assert not any(
+        "/commits/head-540/check-runs" in " ".join(a)
+        for a, _ in fr.calls
+    )
+    assert any(
+        "/commits/head-541/check-runs" in " ".join(a)
+        for a, _ in fr.calls
+    )
 
 
 # ── check start times + world timestamp (#30) ────────────────────────────────
@@ -1600,8 +1788,12 @@ def test_get_pr_carries_check_start_times():
     fr = FakeRunner({"pr view 100": pr_resp, "pr checks 100": checks})
     gw = GitHubGateway("o/r", runner=fr)
     assert gw.get_pr(100).checks[0].started_at == "2026-07-28T12:00:00Z"
-    argv = [a for a, _ in fr.calls if a[1:3] == ["pr", "checks"]][0]
-    assert "startedAt" in argv[argv.index("--json") + 1]
+    argv = [
+        a
+        for a, _ in fr.calls
+        if "/check-runs?filter=latest&per_page=100" in " ".join(a)
+    ][0]
+    assert "head-100" in " ".join(argv)
 
 
 def test_check_start_time_absent_or_null_parses_to_unknown():

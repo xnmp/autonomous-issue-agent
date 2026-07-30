@@ -78,7 +78,8 @@ class CloseIssue:
 @dataclass(frozen=True)
 class EnableAutoMerge:
     pr: int
-    method: str = "squash"
+    method: str
+    head: str
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,7 @@ class UpdateBranch:
     agent path instead."""
 
     pr: int
+    head: str
 
 
 @dataclass(frozen=True)

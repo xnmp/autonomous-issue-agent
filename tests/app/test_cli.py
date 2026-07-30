@@ -843,11 +843,20 @@ def test_role_pid_discovery_is_scoped_to_requested_deployment(
 def test_launcher_pid_discovery_uses_exact_deployment_argv_token(
     monkeypatch,
 ) -> None:
-    monkeypatch.setattr(cli, "_pgrep", lambda _pattern: [101, 102, 103])
+    monkeypatch.setattr(
+        cli, "_pgrep", lambda _pattern: [101, 102, 103, 104]
+    )
     argv = {
         101: ("/bin/bash", "/opt/harness/bin/point-at.sh", "app"),
         102: ("/bin/bash", "/opt/harness/bin/point-at.sh", "app2"),
         103: ("/bin/bash", "/tmp/not-point-at.sh", "app"),
+        104: (
+            "python",
+            "-c",
+            "import time; time.sleep(60)",
+            "/tmp/point-at.sh",
+            "app",
+        ),
     }
     monkeypatch.setattr(cli, "_pid_argv", lambda pid: argv[pid])
 

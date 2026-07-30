@@ -200,7 +200,10 @@ class ReviewWorkflow:
             return
         # SINGLE and DELEGATED share the submit-before-persist contract; they differ
         # only in the task builder (delegated attaches a code-scout subagent).
-        diff = self.gateway.pr_diff(pr)
+        diff = self._revision_bound_diff(p)
+        if diff is None:
+            self._no_progress(p, "revision-bound diff unavailable")
+            return
         signature = review_dom.patch_signature(diff)
         if self.cfg.review_mode is review_dom.ReviewMode.DELEGATED:
             task = task_builders.build_delegated_review_task(
@@ -233,7 +236,9 @@ class ReviewWorkflow:
         # sha — otherwise the PR looks reviewed-once and never gets retried, with no
         # review on it. State advances only on a confirmed submit.
         prior = review_dom.count_prior_rejections(p.reviews, self.cfg.review_bot)
-        if not self._submit_review(pr, result, 1, prior):
+        if not self._submit_review(
+            pr, p.head_ref_oid, result, 1, prior
+        ):
             self._no_progress(p, "review POST failed")
             return
         self.store.save_pr_session(
@@ -257,7 +262,10 @@ class ReviewWorkflow:
         p = self.gateway.get_pr(pr)
         if self._already_reviewed(p):
             return
-        diff = self.gateway.pr_diff(pr)
+        diff = self._revision_bound_diff(p)
+        if diff is None:
+            self._no_progress(p, "revision-bound diff unavailable")
+            return
         signature = review_dom.patch_signature(diff)
         if self._patch_unchanged(p, signature):
             return
@@ -320,7 +328,9 @@ class ReviewWorkflow:
             return
         # Submit first; advance sha/round only on a confirmed submit (see _review).
         prior = review_dom.count_prior_rejections(p.reviews, self.cfg.review_bot)
-        if not self._submit_review(pr, result, round_number, prior):
+        if not self._submit_review(
+            pr, p.head_ref_oid, result, round_number, prior
+        ):
             self._no_progress(p, "review POST failed")
             return
         if result.session_id:
@@ -372,6 +382,29 @@ class ReviewWorkflow:
         except Exception as exc:  # noqa: BLE001 — a cache write must never fail a review
             self.cfg.log(f"review #{pr}: reviewed-patch id not persisted ({exc})")
 
+    def _revision_bound_diff(self, p) -> str | None:
+        if not p.base_ref_oid or not p.head_ref_oid:
+            return None
+        try:
+            evidence = self.gateway.pr_diff(
+                p.number, p.base_ref_oid, p.head_ref_oid
+            )
+        except Exception as exc:  # noqa: BLE001 — unreadable evidence cannot approve
+            self.cfg.log(
+                f"review #{p.number}: immutable diff unavailable ({exc})"
+            )
+            return None
+        if (
+            evidence.base_oid != p.base_ref_oid
+            or evidence.head_oid != p.head_ref_oid
+            or not evidence.text.strip()
+        ):
+            self.cfg.log(
+                f"review #{p.number}: immutable diff revision mismatch"
+            )
+            return None
+        return evidence.text
+
     def _patch_unchanged(self, p, signature: str) -> bool:
         """True — and the skip is already committed — when the head SHA advanced
         but the PATCH did not: a rebase/amend whose diff against the base is
@@ -400,17 +433,51 @@ class ReviewWorkflow:
         if not stored or stored != signature:
             return False
         try:
+            prior_sha = self.store.get_last_sha(p.number)
+        except Exception as exc:  # noqa: BLE001 — an unreadable cache means "review it"
+            self.cfg.log(
+                f"re-review #{p.number}: reviewed revision unreadable ({exc})"
+            )
+            return False
+        prior = review_dom.latest_reviewer_verdict(
+            p, self.cfg.review_bot
+        )
+        if (
+            prior is None
+            or not p.head_ref_oid
+            or not prior_sha
+            or prior.commit_id != prior_sha
+        ):
+            return False
+        event = {
+            "APPROVED": "APPROVE",
+            "CHANGES_REQUESTED": "REQUEST_CHANGES",
+        }.get(prior.state, "COMMENT")
+        body = (
+            prior.body.strip()
+            or "Mechanical rebase: patch is unchanged from the reviewed revision."
+        )
+        if not self.executor.submit_review(
+            p.number, event, body, p.head_ref_oid
+        ):
+            self.cfg.log(
+                f"re-review #{p.number}: unchanged patch verdict could not be "
+                "bound to the new head — reviewing normally"
+            )
+            return False
+        try:
             self.store.set_last_sha(p.number, p.head_ref_oid)
         except Exception as exc:  # noqa: BLE001 — without this write the skip would repeat
             self.cfg.log(
-                f"re-review #{p.number}: unchanged patch, but last-sha could not be "
-                f"advanced ({exc}) — reviewing normally rather than skipping every poll"
+                f"re-review #{p.number}: unchanged-patch verdict landed on the "
+                f"new head, but last-sha could not be advanced ({exc}) — "
+                "GitHub reconciliation will settle it next poll"
             )
-            return False
+            return True
         self.cfg.log(
             f"re-review #{p.number}: head moved to {p.head_ref_oid[:8] or '?'} but the "
-            "patch is unchanged (mechanical rebase) — carrying the existing review "
-            "forward, no review agent run"
+            "patch is unchanged (mechanical rebase) — copied the existing verdict "
+            "to the new head, no review agent run"
         )
         return True
 
@@ -450,7 +517,11 @@ class ReviewWorkflow:
         `gh pr view`/`gh pr diff`; omitted (the initial-review path) they are
         fetched here as before."""
         p = self.gateway.get_pr(pr) if p is None else p
-        diff = self.gateway.pr_diff(pr) if diff is None else diff
+        if diff is None:
+            diff = self._revision_bound_diff(p)
+            if diff is None:
+                self._no_progress(p, "revision-bound diff unavailable")
+                return
         signature = review_dom.patch_signature(diff)
         rcfg = self.cfg.review
         # Escalation counts the reviewer's OWN prior rejections, not pushes (a
@@ -482,7 +553,9 @@ class ReviewWorkflow:
             self.cfg.log(f"review #{pr}: gate says non-reviewable "
                          f"({gate.field('reason') or 'no behavioural change'}) → APPROVE")
             sub = review_dom.gate_submission(prior, self.cfg.max_review_rejections)
-            if self.executor.submit_review(pr, sub.event, sub.body):
+            if self.executor.submit_review(
+                pr, sub.event, sub.body, p.head_ref_oid
+            ):
                 self._persist_review_state(pr, p.head_ref_oid, round_number, signature)
                 self._progress(p)
             else:
@@ -564,7 +637,9 @@ class ReviewWorkflow:
             # result, never touching the dispatcher's raise-path counter.
             self._no_progress(p, "incomplete fan-out, no verdict to submit")
             return
-        if not self.executor.submit_review(pr, sub.event, sub.body):
+        if not self.executor.submit_review(
+            pr, sub.event, sub.body, p.head_ref_oid
+        ):
             self._no_progress(p, "review POST failed")
             return  # failed POST → leave state untouched (retried next poll)
         if sub.escalate:
@@ -611,7 +686,12 @@ class ReviewWorkflow:
         self.store.set_round(pr, round_number)
 
     def _submit_review(
-        self, pr: int, result, round_number: int, prior_rejections: int
+        self,
+        pr: int,
+        expected_head: str,
+        result,
+        round_number: int,
+        prior_rejections: int,
     ) -> bool:
         """Submit the verdict; return True iff the gh POST succeeded. On a failed
         submit, return False WITHOUT escalating/relabelling — the caller leaves state
@@ -623,7 +703,9 @@ class ReviewWorkflow:
             result.field("decision"), result.field("body"),
             prior_rejections, self.cfg.max_review_rejections,
         )
-        if not self.executor.submit_review(pr, sub.event, sub.body):
+        if not self.executor.submit_review(
+            pr, sub.event, sub.body, expected_head
+        ):
             return False
         # Log the OUTCOME of a successful submit — always on (not DEBUG-gated). Without
         # this, a clean review was invisible on stdout: `dispatch` then silence until

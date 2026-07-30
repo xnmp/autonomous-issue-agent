@@ -20,7 +20,7 @@ from issue_agent.domain.fix import FixConfig, FixState, decide_fix
 from issue_agent.domain.labels import Label
 
 
-CFG = FixConfig(fix_bot="fix-bot")
+CFG = FixConfig(fix_bot="fix-bot", arm_on_open=True)
 
 
 def _runs(actions, kind: AgentKind, number: int) -> bool:
@@ -102,6 +102,7 @@ def test_open_pr_prioritizes_review_changes_before_ci_fix():
                 pr(
                     101,
                     "ai-pr-open",
+                    head_ref_oid="head-101",
                     closing_issue=9,
                     reviews=(Review("CHANGES_REQUESTED", "review-bot", "t1"),),
                     checks=(Check("unit", bucket="fail"),),
@@ -124,7 +125,15 @@ def test_green_approved_pr_enables_automerge_without_consuming_fixer():
                 pr(
                     101,
                     "ai-pr-open",
-                    reviews=(Review("APPROVED", "review-bot", "t1"),),
+                    head_ref_oid="head-101",
+                    reviews=(
+                        Review(
+                            "APPROVED",
+                            "review-bot",
+                            "t1",
+                            commit_id="head-101",
+                        ),
+                    ),
                     checks=(Check("unit", bucket="ok"),),
                 )
             ]
@@ -134,7 +143,7 @@ def test_green_approved_pr_enables_automerge_without_consuming_fixer():
         fixer_busy=False,
     )
 
-    assert EnableAutoMerge(101, "squash") in actions
+    assert EnableAutoMerge(101, "squash", "head-101") in actions
     assert not any(isinstance(action, RunAgent) for action in actions)
 
 
@@ -163,7 +172,15 @@ def test_fixer_busy_still_allows_lock_free_cleanup_and_automerge():
                 pr(
                     101,
                     "ai-pr-open",
-                    reviews=(Review("APPROVED", "review-bot", "t1"),),
+                    head_ref_oid="head-101",
+                    reviews=(
+                        Review(
+                            "APPROVED",
+                            "review-bot",
+                            "t1",
+                            commit_id="head-101",
+                        ),
+                    ),
                     checks=(Check("unit", bucket="ok"),),
                 ),
                 pr(102, "ai-pr-open", state="MERGED", closing_issue=9),
@@ -175,5 +192,5 @@ def test_fixer_busy_still_allows_lock_free_cleanup_and_automerge():
     )
 
     assert not any(isinstance(action, RunAgent) for action in actions)
-    assert EnableAutoMerge(101, "squash") in actions
+    assert EnableAutoMerge(101, "squash", "head-101") in actions
     assert RemoveWorktree(9) in actions

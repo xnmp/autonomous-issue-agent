@@ -36,6 +36,12 @@ def _environment(
 [ "${1:-}" != "--user" ] || shift
 printf '%s\n' "$*" >> "$SERVICE_LOG"
 if [ "${1:-}" = "is-active" ] || [ "${1:-}" = "is-enabled" ]; then
+  selector="ACTIVE_UNITS"
+  [ "${1:-}" != "is-enabled" ] || selector="ENABLED_UNITS"
+  eval "selected=\\${$selector:-}"
+  case " $selected " in
+    *" ${3:-${2:-}} "*) exit 0 ;;
+  esac
   [ -f "$HOME/.config/systemd/user/${3:-${2:-}}" ]
   exit $?
 fi
@@ -87,6 +93,8 @@ exit 0
         "FAIL_ONCE_FILE": str(tmp_path / "failed-once"),
         "SERVICE_LOG": str(tmp_path / "service.log"),
         "LOADED_LABELS": "",
+        "ACTIVE_UNITS": "",
+        "ENABLED_UNITS": "",
     }
     return env, home, fake_bin / "uv"
 
@@ -138,6 +146,61 @@ def test_systemd_scoped_uninstall_preserves_other_deployments(tmp_path):
     remaining = tuple(unit_dir.glob("*.service"))
     assert len(remaining) == 3
     assert all(path.name.endswith("-other-app.service") for path in remaining)
+
+
+@pytest.mark.parametrize("state_var", ("ACTIVE_UNITS", "ENABLED_UNITS"))
+def test_systemd_refuses_live_current_unit_without_rollback_definition(
+    tmp_path, state_var
+):
+    env, home, _uv = _environment(tmp_path, systemd=True)
+    unit = "issue-agent-fix-watcher-target-repo.service"
+    env[state_var] = unit
+
+    result = subprocess.run(
+        ["bash", str(ROOT / "bin/install-systemd.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "active/enabled current unit" in result.stderr
+    assert "no recoverable definition" in result.stderr
+    calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
+    assert not any(
+        call.startswith(("stop ", "disable ", "restart ", "enable "))
+        for call in calls
+    )
+    assert not tuple(
+        (home / ".config/issue-agent").glob("*.env")
+    )
+
+
+@pytest.mark.parametrize("state_var", ("ACTIVE_UNITS", "ENABLED_UNITS"))
+def test_systemd_refuses_live_legacy_unit_without_rollback_definition(
+    tmp_path, state_var
+):
+    env, home, _uv = _environment(tmp_path, systemd=True)
+    env[state_var] = "issue-agent-fix-watcher.service"
+
+    result = subprocess.run(
+        ["bash", str(ROOT / "bin/install-systemd.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "active/enabled legacy unit" in result.stderr
+    assert "no recoverable definition" in result.stderr
+    calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
+    assert not any(
+        call.startswith(("stop ", "disable ", "restart ", "enable "))
+        for call in calls
+    )
+    assert not tuple(
+        (home / ".config/issue-agent").glob("*.env")
+    )
 
 
 def test_systemd_upgrade_stops_and_removes_every_legacy_unit_name(
@@ -233,6 +296,52 @@ def test_systemd_deployment_ids_do_not_collide_and_reject_repointing(
     assert "REFUSING deployment 'acme-app'" in collision.stderr
     snapshot = home / ".config/issue-agent/acme-app.env"
     assert 'REPO="acme/app"' in snapshot.read_text()
+
+
+def test_systemd_second_checkout_preserves_same_repo_deployment(
+    tmp_path,
+):
+    env, home, _uv = _environment(tmp_path, systemd=True)
+    config = Path(env["AGENT_ENV"])
+    first_target = tmp_path / "checkout-primary"
+    second_target = tmp_path / "checkout-secondary"
+    first_target.mkdir()
+    second_target.mkdir()
+    config.write_text(
+        f'REPO="acme/app"\nTARGET_DIR="{first_target}"\n'
+    )
+
+    first = subprocess.run(
+        ["bash", str(ROOT / "bin/install-systemd.sh")],
+        env={**env, "ISSUE_AGENT_DEPLOYMENT_ID": "acme-app"},
+        capture_output=True,
+        text=True,
+    )
+    assert first.returncode == 0, first.stderr
+
+    config.write_text(
+        f'REPO="acme/app"\nTARGET_DIR="{second_target}"\n'
+    )
+    second = subprocess.run(
+        ["bash", str(ROOT / "bin/install-systemd.sh")],
+        env={**env, "ISSUE_AGENT_DEPLOYMENT_ID": "acme-app-wt"},
+        capture_output=True,
+        text=True,
+    )
+
+    assert second.returncode == 0, second.stderr
+    units = tuple((home / ".config/systemd/user").glob("*.service"))
+    assert len(units) == 6
+    assert sum(path.name.endswith("-acme-app.service") for path in units) == 3
+    assert sum(
+        path.name.endswith("-acme-app-wt.service") for path in units
+    ) == 3
+    calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
+    assert not any(
+        call == f"stop issue-agent-{role}-acme-app.service"
+        for call in calls[len(calls) // 2 :]
+        for role in ("fix-watcher", "review-watcher", "steward")
+    )
 
 
 def test_systemd_failed_activation_rolls_back_units_and_config(tmp_path):

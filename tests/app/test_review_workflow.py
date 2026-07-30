@@ -22,7 +22,7 @@ from issue_agent.domain.review import (
 )
 from issue_agent.app.planners.tasks import ReviewTaskConfig
 from issue_agent.app.planners.tasks import REVIEW_DIMENSIONS
-from issue_agent.domain.world import PRView, Review
+from issue_agent.domain.world import PRView, PullRequestDiff, Review
 
 from test_dispatch import FakeGateway, FakeRunner, FakeStore, SchemaRunner, _dim, _gate, _val
 
@@ -153,7 +153,13 @@ def test_codex_reviewer_re_reviews_in_a_fresh_read_only_session():
     assert store.get_pr_session(100) == "codex-review"
 
     gw._prs[100] = PRView(100, head_ref_oid="new", title="t", body="b", reviews=(prior,))
-    setattr(gw, "pr_diff", lambda _pr: "new diff")
+    setattr(
+        gw,
+        "pr_diff",
+        lambda _pr, base, head: PullRequestDiff(
+            base, head, "new diff"
+        ),
+    )
     second = FakeRunner(AgentResult(
         is_error=False, session_id="new-codex-session",
         structured={"decision": "APPROVE", "body": "fixed"},
@@ -291,6 +297,38 @@ def test_single_review_failed_submit_does_not_persist_state():
     assert any(c[0] == "review" for c in gw.calls)
     assert 100 not in store.pr_sessions
     assert 100 not in store.last_sha
+
+
+def test_single_review_never_submits_stale_verdict_to_new_head():
+    original = PRView(100, head_ref_oid="head-1", title="t", body="b")
+    gw = FakeGateway(prs={100: original})
+    store = FakeStore()
+
+    class AdvancingRunner(FakeRunner):
+        async def run(self, task):
+            self.tasks.append(task)
+            gw._prs[100] = PRView(
+                100, head_ref_oid="head-2", title="t", body="b"
+            )
+            return self.result
+
+    runner = AdvancingRunner(
+        AgentResult(
+            is_error=False,
+            session_id="stale-session",
+            structured={
+                "decision": "APPROVE",
+                "body": "verdict for head-1",
+            },
+        )
+    )
+
+    asyncio.run(_workflow(gw, store, runner).review(100))
+
+    assert not any(call[0] == "review" for call in gw.calls)
+    assert 100 not in store.pr_sessions
+    assert 100 not in store.last_sha
+    assert 100 not in store.rounds
 
 
 def test_single_review_error_submits_nothing():
@@ -947,9 +985,9 @@ class DiffGateway(FakeGateway):
         self.diff = diff
         self.diffs_fetched = 0
 
-    def pr_diff(self, pr):
+    def pr_diff(self, pr, base_oid, head_oid):
         self.diffs_fetched += 1
-        return self.diff
+        return PullRequestDiff(base_oid, head_oid, self.diff)
 
 
 _REVIEWED = (
@@ -992,18 +1030,65 @@ def _reviewed_pr(store, diff, head="old-sha"):
     store.set_last_patch_id(100, patch_signature(diff))
 
 
+def _rebased_pr(head: str = "new-sha", prior_head: str = "old-sha"):
+    return PRView(
+        100,
+        head_ref_oid=head,
+        base_ref_oid="base-sha",
+        reviews=(
+            Review(
+                "APPROVED",
+                "review-bot",
+                "t1",
+                body="lgtm",
+                commit_id=prior_head,
+            ),
+        ),
+    )
+
+
 def test_a_rebase_that_does_not_change_the_patch_runs_no_review_agent():
     """THE acceptance criterion: a force-push whose diff is semantically
     identical must dispatch no paid review run at all."""
     store = PatchStore()
     _reviewed_pr(store, _REVIEWED)
-    gw = DiffGateway(_REBASED, prs={100: PRView(100, head_ref_oid="new-sha")})
+    gw = DiffGateway(_REBASED, prs={100: _rebased_pr()})
     runner = FakeRunner(_approved())
 
     asyncio.run(_workflow(gw, store, runner).re_review(100))
 
     assert runner.tasks == [], "no review agent may run for an unchanged patch"
-    assert gw.calls == [], "and no review is submitted — the old one still stands"
+    assert any(
+        call[0] == "review" for call in gw.calls
+    ), "the prior verdict is rebound to the new head"
+
+
+def test_revision_mismatched_diff_never_runs_or_submits_review():
+    class MovingDiffGateway(DiffGateway):
+        def pr_diff(self, pr, base_oid, head_oid):
+            self.diffs_fetched += 1
+            # Models the h1→h2→h1 ABA: a PR-number read observed h2 even
+            # though the workflow snapshot and later POST both see h1.
+            return PullRequestDiff(base_oid, "h2", _REVISED)
+
+    store = PatchStore()
+    gw = MovingDiffGateway(
+        _REVIEWED,
+        prs={
+            100: PRView(
+                100,
+                head_ref_oid="h1",
+                base_ref_oid="base-sha",
+            )
+        },
+    )
+    runner = FakeRunner(_approved())
+
+    asyncio.run(_workflow(gw, store, runner).review(100))
+
+    assert runner.tasks == []
+    assert not any(call[0] == "review" for call in gw.calls)
+    assert store.get_last_sha(100) == ""
 
 
 def test_the_carried_forward_skip_happens_once_not_every_poll():
@@ -1012,7 +1097,7 @@ def test_the_carried_forward_skip_happens_once_not_every_poll():
     this write the daemon would re-enter the skip on every single poll forever."""
     store = PatchStore()
     _reviewed_pr(store, _REVIEWED)
-    gw = DiffGateway(_REBASED, prs={100: PRView(100, head_ref_oid="new-sha")})
+    gw = DiffGateway(_REBASED, prs={100: _rebased_pr()})
 
     asyncio.run(_workflow(gw, store, FakeRunner(_approved())).re_review(100))
 
@@ -1028,7 +1113,7 @@ def test_the_skip_does_not_consume_a_review_round():
     # next real re-review is given) must be untouched.
     store = PatchStore()
     _reviewed_pr(store, _REVIEWED)
-    gw = DiffGateway(_REBASED, prs={100: PRView(100, head_ref_oid="new-sha")})
+    gw = DiffGateway(_REBASED, prs={100: _rebased_pr()})
 
     asyncio.run(_workflow(gw, store, FakeRunner(_approved())).re_review(100))
 
@@ -1050,6 +1135,20 @@ def test_a_rebase_that_changes_the_patch_still_runs_the_review_agent():
     assert store.get_round(100) == 2
     assert store.get_last_patch_id(100) == patch_signature(_REVISED), \
         "the newly reviewed patch becomes the baseline for the NEXT rebase"
+
+
+def test_unchanged_patch_does_not_copy_verdict_from_unrelated_revision():
+    store = PatchStore()
+    _reviewed_pr(store, _REVIEWED, head="reviewed-sha")
+    gw = DiffGateway(
+        _REBASED,
+        prs={100: _rebased_pr("current-sha", "unrelated-sha")},
+    )
+    runner = FakeRunner(_approved())
+
+    asyncio.run(_workflow(gw, store, runner).re_review(100))
+
+    assert len(runner.tasks) == 1
 
 
 def test_a_pr_with_no_recorded_patch_is_always_reviewed():
@@ -1079,7 +1178,10 @@ def test_an_initial_review_records_the_patch_it_reviewed():
     assert store.get_last_patch_id(100) == patch_signature(_REVIEWED)
 
     # …and the rebase that follows costs nothing.
-    gw2 = DiffGateway(_REBASED, prs={100: PRView(100, head_ref_oid="sha2")})
+    gw2 = DiffGateway(
+        _REBASED,
+        prs={100: _rebased_pr("sha2", "sha1")},
+    )
     runner2 = FakeRunner(_approved())
     asyncio.run(_workflow(gw2, store, runner2).re_review(100))
     assert runner2.tasks == []
@@ -1103,14 +1205,14 @@ def test_a_multi_agent_re_review_also_skips_an_unchanged_patch():
     store = PatchStore()
     _reviewed_pr(store, _REVIEWED)
     store.save_pr_session(100, "multi")
-    gw = DiffGateway(_REBASED, prs={100: PRView(100, head_ref_oid="new-sha")})
+    gw = DiffGateway(_REBASED, prs={100: _rebased_pr()})
     runner = SchemaRunner(gate=_gate(), dimension=lambda t: _dim([]),
                           validation=lambda t: _val(True))
 
     asyncio.run(_workflow(gw, store, runner, review_mode=ReviewMode.MULTI).re_review(100))
 
     assert runner.tasks == []
-    assert gw.calls == []
+    assert any(call[0] == "review" for call in gw.calls)
     assert store.get_last_sha(100) == "new-sha"
 
 
@@ -1128,7 +1230,7 @@ def test_a_multi_agent_review_records_the_patch_it_reviewed():
 def test_a_delegated_re_review_also_skips_an_unchanged_patch():
     store = PatchStore()
     _reviewed_pr(store, _REVIEWED)
-    gw = DiffGateway(_REBASED, prs={100: PRView(100, head_ref_oid="new-sha")})
+    gw = DiffGateway(_REBASED, prs={100: _rebased_pr()})
     runner = FakeRunner(_approved())
 
     asyncio.run(_workflow(gw, store, runner,
@@ -1142,7 +1244,7 @@ def test_the_skip_costs_exactly_one_diff_fetch_no_matter_the_mode():
     # replaces a paid round, and delegating to MULTI must not re-fetch it.
     store = PatchStore()
     _reviewed_pr(store, _REVISED)  # baseline differs → the fan-out DOES run
-    gw = DiffGateway(_REBASED, prs={100: PRView(100, head_ref_oid="new-sha")})
+    gw = DiffGateway(_REBASED, prs={100: _rebased_pr()})
     runner = SchemaRunner(gate=_gate(), dimension=lambda t: _dim([]),
                           validation=lambda t: _val(True))
 
@@ -1168,11 +1270,9 @@ def test_an_unreadable_patch_baseline_reviews_rather_than_skips():
     assert len(runner.tasks) == 1
 
 
-def test_a_skip_that_cannot_advance_last_sha_reviews_instead_of_looping():
-    """If the skip cannot be recorded it would repeat every poll — and a
-    forever-skipping PR is worse than one paid round. (The same broken store
-    then fails the post-review write too; what matters is that the reviewer
-    did NOT take the silent shortcut.)"""
+def test_rebound_verdict_prevents_paid_review_when_cache_write_fails():
+    """Once GitHub has the new-head verdict, a cache failure must not buy a
+    duplicate paid review; the next poll reconciles the remote review."""
     class UnwritableSha(PatchStore):
         def set_last_sha(self, pr, sha):
             raise OSError("read-only state dir")
@@ -1181,10 +1281,11 @@ def test_a_skip_that_cannot_advance_last_sha_reviews_instead_of_looping():
     store.patch_ids[100] = patch_signature(_REVIEWED)
     store.pr_sessions[100] = "rs"
     store.rounds[100] = 1
-    gw = DiffGateway(_REBASED, prs={100: PRView(100, head_ref_oid="new-sha")})
+    store.last_sha[100] = "old-sha"
+    gw = DiffGateway(_REBASED, prs={100: _rebased_pr()})
     runner = FakeRunner(_approved())
 
-    with pytest.raises(OSError):
-        asyncio.run(_workflow(gw, store, runner).re_review(100))
+    asyncio.run(_workflow(gw, store, runner).re_review(100))
 
-    assert len(runner.tasks) == 1, "the reviewer ran instead of skipping"
+    assert runner.tasks == []
+    assert any(call[0] == "review" for call in gw.calls)

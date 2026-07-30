@@ -1,5 +1,7 @@
 """Fix-watcher decision behaviour — the poll_once control flow + invariants."""
 
+from dataclasses import replace
+
 from tests.domain.builders import Check, Comment, Review, closing_ref, issue, pr, world
 
 from issue_agent.domain.actions import (
@@ -38,10 +40,11 @@ from issue_agent.domain.fix import (
     prs_needing_resume,
     reap_actions,
     should_automerge,
+    should_update_branch,
 )
 from issue_agent.domain.labels import Label
 
-CFG = FixConfig(fix_bot="fix-bot")
+CFG = FixConfig(fix_bot="fix-bot", arm_on_open=True)
 
 
 def _run_agents(actions):
@@ -653,7 +656,12 @@ def test_issueless_pr_breaker_key_is_negative_pr():
 def _approved_green_pr():
     return pr(
         100, "ai-pr-open",
-        reviews=(Review("APPROVED", "review-bot", "t1"),),
+        head_ref_oid="head-100",
+        reviews=(
+            Review(
+                "APPROVED", "review-bot", "t1", commit_id="head-100"
+            ),
+        ),
         checks=(Check("build", bucket="pass"),),
     )
 
@@ -679,22 +687,70 @@ def test_no_automerge_when_ci_pending():
     assert should_automerge(p, FixState(), CFG) is False
 
 
-def test_automerge_marker_is_idempotent():
+def test_automerge_marker_never_suppresses_remote_reconciliation():
     st = FixState(automerge_enabled=frozenset({100}))
-    assert should_automerge(_approved_green_pr(), st, CFG) is False
+    assert should_automerge(_approved_green_pr(), st, CFG) is True
+
+
+def test_stale_or_unattributed_approval_never_authorizes_current_head():
+    stale = pr(
+        100,
+        "ai-pr-open",
+        head_ref_oid="head-2",
+        reviews=(
+            Review(
+                "APPROVED",
+                "review-bot",
+                "t1",
+                commit_id="head-1",
+            ),
+        ),
+        checks=(Check("build", bucket="pass"),),
+    )
+    unknown = pr(
+        101,
+        "ai-pr-open",
+        head_ref_oid="head-2",
+        reviews=(Review("APPROVED", "review-bot", "t1"),),
+        checks=(Check("build", bucket="pass"),),
+    )
+
+    for candidate in (stale, unknown):
+        assert not should_automerge(candidate, FixState(), CFG)
+        assert not should_update_branch(
+            replace(candidate, mergeable="MERGEABLE", merge_state="BEHIND"),
+            CFG,
+        )
+
+
+def test_arm_on_open_never_bypasses_current_head_review():
+    cfg = replace(CFG, arm_on_open=True)
+    candidate = pr(
+        100,
+        "ai-pr-open",
+        head_ref_oid="head-1",
+        checks=(Check("build", bucket="pass"),),
+    )
+
+    assert not should_automerge(candidate, FixState(), cfg)
 
 
 def test_decide_emits_enable_automerge():
     w = world(prs=[_approved_green_pr()])
     actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
-    assert EnableAutoMerge(100, "squash") in actions
+    assert EnableAutoMerge(100, "squash", "head-100") in actions
 
 
 # ── BEHIND (clean-but-stale) branch → update-branch so armed auto-merge lands ──
 def _approved_green_behind_pr():
     return pr(
         100, "ai-pr-open",
-        reviews=(Review("APPROVED", "review-bot", "t1"),),
+        head_ref_oid="head-100",
+        reviews=(
+            Review(
+                "APPROVED", "review-bot", "t1", commit_id="head-100"
+            ),
+        ),
         checks=(Check("build", bucket="pass"),),
         mergeable="MERGEABLE", merge_state="BEHIND",
     )
@@ -703,18 +759,17 @@ def _approved_green_behind_pr():
 def test_behind_pr_emits_update_branch_with_automerge():
     w = world(prs=[_approved_green_behind_pr()])
     actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
-    assert EnableAutoMerge(100, "squash") in actions
-    assert UpdateBranch(100) in actions
+    assert EnableAutoMerge(100, "squash", "head-100") not in actions
+    assert UpdateBranch(100, "head-100") in actions
 
 
 def test_already_armed_behind_pr_still_updates_branch():
-    # The real gap: a PR armed on an EARLIER poll (marker set) that is now BEHIND.
-    # should_automerge is marker-guarded → no re-arm, but the branch update MUST
-    # still fire, else it stays armed-but-behind forever (Myapp #348/#340).
+    # A local marker is stale evidence: GitHub can cancel auto-merge remotely.
+    # The durable effect executor reconciles the actual remote request.
     st = FixState(automerge_enabled=frozenset({100}))
     actions = decide_fix(world(prs=[_approved_green_behind_pr()]), CFG, st, fixer_busy=False)
-    assert not any(isinstance(a, EnableAutoMerge) for a in actions)  # already armed
-    assert UpdateBranch(100) in actions                              # but still updated
+    assert EnableAutoMerge(100, "squash", "head-100") not in actions
+    assert UpdateBranch(100, "head-100") in actions
 
 
 def test_clean_pr_does_not_update_branch():
@@ -751,7 +806,15 @@ def test_conflicting_takes_rebase_not_update_branch():
 # unrelated lock. These pin the invariant: for one world, both lock states agree.
 def _issueless_approved_green_pr(**kw):
     return pr(113, "ai-pr-open", head_ref_name="feat/ACME-9-x",
-              reviews=(Review("APPROVED", "review-bot", "t1"),),
+              head_ref_oid="head-113",
+              reviews=(
+                  Review(
+                      "APPROVED",
+                      "review-bot",
+                      "t1",
+                      commit_id="head-113",
+                  ),
+              ),
               checks=(Check("build", bucket="pass"),), **kw)
 
 
@@ -759,16 +822,17 @@ def test_issueless_approved_green_pr_arms_automerge_idle_and_busy():
     w = world(prs=[_issueless_approved_green_pr()])
     idle = decide_fix(w, CFG, FixState(), fixer_busy=False)
     busy = decide_fix(w, CFG, FixState(), fixer_busy=True)
-    assert EnableAutoMerge(113, "squash") in idle   # this was the missing half
-    assert EnableAutoMerge(113, "squash") in busy
+    assert EnableAutoMerge(113, "squash", "head-113") in idle
+    assert EnableAutoMerge(113, "squash", "head-113") in busy
 
 
 def test_issueless_behind_pr_updates_branch_idle_and_busy():
     # Same divergence on the other 3c arm: an armed-but-BEHIND branch stayed
     # behind forever on idle polls, so the armed auto-merge never landed.
     w = world(prs=[_issueless_approved_green_pr(mergeable="MERGEABLE", merge_state="BEHIND")])
-    assert UpdateBranch(113) in decide_fix(w, CFG, FixState(), fixer_busy=False)
-    assert UpdateBranch(113) in decide_fix(w, CFG, FixState(), fixer_busy=True)
+    expected = UpdateBranch(113, "head-113")
+    assert expected in decide_fix(w, CFG, FixState(), fixer_busy=False)
+    assert expected in decide_fix(w, CFG, FixState(), fixer_busy=True)
 
 
 def test_dispatching_on_a_pr_no_longer_skips_its_automerge_evaluation():
@@ -791,15 +855,23 @@ def test_dispatching_on_a_pr_no_longer_skips_its_automerge_evaluation():
     busy = decide_fix(world(prs=[p]), CFG, FixState(), fixer_busy=True)
     assert RunAgent(AgentKind.REBASE, 100) in _run_agents(idle)
     assert _run_agents(busy) == []                        # the lock still bounds dispatch
-    assert EnableAutoMerge(100, "squash") not in idle     # conflicted: rebase owns it
-    assert EnableAutoMerge(100, "squash") not in busy
+    assert not any(isinstance(action, EnableAutoMerge) for action in idle)
+    assert not any(isinstance(action, EnableAutoMerge) for action in busy)
 
     clean = pr(100, "ai-pr-open", mergeable="MERGEABLE",
-               reviews=(Review("APPROVED", "review-bot", "t1"),),
+               head_ref_oid="head-100",
+               reviews=(
+                   Review(
+                       "APPROVED",
+                       "review-bot",
+                       "t1",
+                       commit_id="head-100",
+                   ),
+               ),
                checks=(Check("build", bucket="pass"),))
     for busy_flag in (False, True):
         actions = decide_fix(world(prs=[clean]), CFG, FixState(), fixer_busy=busy_flag)
-        assert EnableAutoMerge(100, "squash") in actions  # arming is lock-independent
+        assert EnableAutoMerge(100, "squash", "head-100") in actions
 
 
 def test_blocked_pr_is_never_armed_in_either_lock_state():
@@ -813,8 +885,11 @@ def test_blocked_pr_is_never_armed_in_either_lock_state():
     )])
     for busy in (False, True):
         actions = decide_fix(w, CFG, FixState(), fixer_busy=busy)
-        assert EnableAutoMerge(113, "squash") in actions          # the unblocked one arms
-        assert EnableAutoMerge(114, "squash") not in actions      # the blocked one does not
+        assert EnableAutoMerge(113, "squash", "head-113") in actions
+        assert not any(
+            isinstance(action, EnableAutoMerge) and action.pr == 114
+            for action in actions
+        )
 
 
 # ── changes-requested → address-review; failure → fix-ci ───────────────────────
@@ -883,7 +958,7 @@ def test_unset_fix_bot_claims_no_pr_at_all():
 # but gh reports the PR author bare as `fix-bot`. Under a raw `==` the authorship
 # filter above matched NOTHING, so address-review / fix-ci / rebase / auto-merge
 # never dispatched — forever, with no error.
-SUFFIXED_CFG = FixConfig(fix_bot="fix-bot[bot]")
+SUFFIXED_CFG = FixConfig(fix_bot="fix-bot[bot]", arm_on_open=True)
 
 
 def test_c1_suffixed_fix_bot_still_addresses_review_on_its_own_pr():
@@ -932,7 +1007,15 @@ def test_c1_suffixed_fix_bot_does_not_treat_its_own_approval_as_independent():
     assert not should_automerge(p, FixState(), SUFFIXED_CFG)
     # Anti-vacuity twin: a genuinely distinct approver still arms auto-merge.
     q = pr(101, "ai-pr-open", author="fix-bot",
-           reviews=(Review("APPROVED", "review-bot", "t1"),),
+           head_ref_oid="head-101",
+           reviews=(
+               Review(
+                   "APPROVED",
+                   "review-bot",
+                   "t1",
+                   commit_id="head-101",
+               ),
+           ),
            checks=(Check("build", bucket="pass"),))
     assert should_automerge(q, FixState(), SUFFIXED_CFG)
 

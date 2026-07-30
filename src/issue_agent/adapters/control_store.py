@@ -205,6 +205,11 @@ class PublicationAuthority:
     run_id: RunId
     repository: str
     owner_id: str
+    role: str
+    kind: str
+    issue: int | None
+    cwd: str
+    branch: str
     pgid: int
     process_start_ticks: int
 
@@ -1037,7 +1042,7 @@ class SQLiteControlStore:
 
         with self._connect() as db:
             row = db.execute(
-                "SELECT b.repository, r.owner_id, l.pgid, "
+                "SELECT b.repository, r.owner_id, r.dispatch_id, l.pgid, "
                 "l.process_start_ticks FROM runs r "
                 "JOIN budget_reservations b ON b.run_id=r.run_id "
                 "JOIN leases l ON l.run_id=r.run_id "
@@ -1048,10 +1053,34 @@ class SQLiteControlStore:
             ).fetchone()
         if row is None:
             return None
+        try:
+            dispatch = json.loads(str(row["dispatch_id"]))
+            role = str(dispatch["role"])
+            kind = str(dispatch["kind"])
+            raw_issue = dispatch.get("issue")
+            issue = int(raw_issue) if raw_issue is not None else None
+            cwd = str(dispatch["cwd"])
+            branch = str(dispatch["publication_branch"])
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if (
+            role != "fix"
+            or (issue is not None and issue <= 0)
+            or not kind
+            or not cwd
+            or not branch
+            or not Path(cwd).is_absolute()
+        ):
+            return None
         return PublicationAuthority(
             run_id,
             str(row["repository"]),
             str(row["owner_id"]),
+            role,
+            kind,
+            issue,
+            cwd,
+            branch,
             int(row["pgid"]),
             int(row["process_start_ticks"]),
         )

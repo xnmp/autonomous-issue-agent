@@ -407,6 +407,7 @@ def test_wrapped_dynamic_interpreters_are_unresolvable(command):
     (
         "GH_HOST=attacker.example",
         "ISSUE_AGENT_GITHUB_HOST=attacker.example",
+        "ISSUE_AGENT_BASE_BRANCH=main",
         "ISSUE_AGENT_AUTHORITY_BUNDLE=forged",
     ),
 )
@@ -416,6 +417,16 @@ def test_durable_publication_host_authority_cannot_be_overridden(assignment):
         "gh pr create --title x --body y"
     )
     assert gov.find_violations(command)
+
+
+def test_governor_protects_every_broker_authority_field():
+    from issue_agent.adapters.agent_publish import (
+        _AUTHORITY_BUNDLE,
+        _AUTHORITY_ENV_KEYS,
+    )
+
+    protected = gov._PUBLICATION_AUTHORITY_ENV
+    assert set(_AUTHORITY_ENV_KEYS) | {_AUTHORITY_BUNDLE} <= protected
 
 
 def test_python_c_is_unresolvable_and_blocked():

@@ -32,6 +32,7 @@ from ..domain.contracts import (
 from .control_store import PendingCommand, SQLiteControlStore
 from .event_log import EventLog
 from ..domain.events import Producer
+from ..domain.refs import is_governed_branch, issue_from_branch
 
 
 @dataclass(frozen=True)
@@ -50,11 +51,24 @@ _AUTHORITY_ENV_KEYS = (
     "ISSUE_AGENT_RUN_ID",
     "ISSUE_AGENT_CONFIG_VERSION",
     "ISSUE_AGENT_GITHUB_HOST",
+    "ISSUE_AGENT_BASE_BRANCH",
+    "ISSUE_AGENT_PUBLICATION_CWD",
+    "ISSUE_AGENT_PUBLICATION_BRANCH",
+    "ISSUE_AGENT_PUBLICATION_ISSUE",
+    "ISSUE_AGENT_PUBLICATION_KIND",
+    "ISSUE_AGENT_GIT_BIN",
+    "ISSUE_AGENT_GH_BIN",
+    "ISSUE_AGENT_EXEC_PATH",
 )
 _AUTHORITY_BUNDLE = "ISSUE_AGENT_AUTHORITY_BUNDLE"
 
 
-def _run_command(argv: tuple[str, ...], cwd: str) -> CommandResult:
+def _run_command(
+    argv: tuple[str, ...],
+    cwd: str,
+    *,
+    environment: dict[str, str] | None = None,
+) -> CommandResult:
     try:
         completed = subprocess.run(
             argv,
@@ -62,12 +76,43 @@ def _run_command(argv: tuple[str, ...], cwd: str) -> CommandResult:
             text=True,
             capture_output=True,
             timeout=300,
+            env=environment,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return CommandResult(125, "", f"{type(exc).__name__}: {exc}")
     return CommandResult(
         completed.returncode, completed.stdout, completed.stderr
     )
+
+
+def _publication_environment(
+    trusted_path: str, *, host: str
+) -> dict[str, str]:
+    environment = dict(os.environ)
+    dangerous = {
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GH_CONFIG_DIR",
+    }
+    for key in tuple(environment):
+        if (
+            key in dangerous
+            or key.startswith("GIT_CONFIG_KEY_")
+            or key.startswith("GIT_CONFIG_VALUE_")
+        ):
+            environment.pop(key, None)
+    environment["PATH"] = trusted_path
+    environment["GH_HOST"] = host
+    environment["GIT_CONFIG_NOSYSTEM"] = "1"
+    environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    return environment
 
 
 class AgentPublicationBroker:
@@ -78,23 +123,70 @@ class AgentPublicationBroker:
         store: SQLiteControlStore,
         *,
         repository: str,
+        base_branch: str,
         host: str = "github.com",
         config_version: str = "",
         identity: str = "agent-publication-broker",
         owner: str = "",
+        authorized_cwd: str = "",
+        authorized_branch: str = "",
+        expected_issue: int | None = None,
+        git_binary: str = "git",
+        gh_binary: str = "gh",
+        trusted_path: str = "",
         run: RunCommand = _run_command,
     ):
-        if not repository or not owner or not host or any(char.isspace() for char in host):
+        if (
+            not repository
+            or not owner
+            or not host
+            or not base_branch
+            or base_branch.startswith("-")
+            or any(char.isspace() for char in host + base_branch)
+        ):
             raise ValueError(
-                "publication repository, host, and executor owner are required"
+                "publication repository, base branch, host, and executor "
+                "owner are required"
             )
         self.store = store
         self.repository = repository
         self.host = host.lower()
+        self.base_branch = base_branch
         self.config_version = config_version
         self.identity = identity
         self.owner = owner
-        self.run = run
+        self.authorized_cwd = (
+            str(Path(authorized_cwd).resolve()) if authorized_cwd else ""
+        )
+        self.expected_issue = expected_issue
+        self.authorized_branch = authorized_branch
+        self.git_binary = git_binary
+        self.gh_binary = gh_binary
+        self.trusted_path = trusted_path
+        if (
+            authorized_cwd
+            and (
+                (expected_issue is not None and expected_issue < 0)
+                or not authorized_branch
+                or not Path(git_binary).is_absolute()
+                or not Path(gh_binary).is_absolute()
+                or not trusted_path
+            )
+        ):
+            raise ValueError("publication execution authority is incomplete")
+        self.run = (
+            (
+                lambda argv, cwd: _run_command(
+                    argv,
+                    cwd,
+                    environment=_publication_environment(
+                        trusted_path, host=self.host
+                    ),
+                )
+            )
+            if run is _run_command and trusted_path
+            else run
+        )
 
     def publish(self, argv: tuple[str, ...], cwd: str) -> CommandResult:
         command = self._command(argv, cwd)
@@ -119,6 +211,19 @@ class AgentPublicationBroker:
             if result.code == 0:
                 completed += 1
         return completed
+
+    def _execute(
+        self, argv: tuple[str, ...], cwd: str
+    ) -> CommandResult:
+        if not argv:
+            raise ValueError("publication command is empty")
+        executable = {
+            "git": self.git_binary,
+            "gh": self.gh_binary,
+        }.get(argv[0])
+        if executable is None:
+            raise ValueError("publication command executable is unsupported")
+        return self.run((executable, *argv[1:]), cwd)
 
     def _run_pending(self, pending: PendingCommand) -> CommandResult:
         command = pending.command
@@ -166,11 +271,115 @@ class AgentPublicationBroker:
         payload = command.payload
         argv = tuple(str(item) for item in payload["argv"])
         cwd = str(payload["cwd"])
-        result = self.run(argv, cwd)
+        if command.kind is CommandKind.OPEN_PULL_REQUEST:
+            current_head = self._required_output(
+                ("git", "rev-parse", "HEAD"), cwd, "local HEAD"
+            )
+            current_branch = self._required_output(
+                ("git", "branch", "--show-current"),
+                cwd,
+                "current branch",
+            )
+            if (
+                current_head != command.expected_revision
+                or current_branch != str(payload["branch"])
+            ):
+                now = datetime.now(timezone.utc)
+                self.store.begin_command(command.command_id)
+                self.store.record_effect(
+                    EffectReceipt(
+                        command.command_id,
+                        self.identity,
+                        now,
+                        now,
+                        EffectStatus.PERMANENT_FAILURE,
+                        error=(
+                            "local branch revision changed before pull-request "
+                            "creation"
+                        ),
+                    )
+                )
+                return CommandResult(
+                    75,
+                    stderr=(
+                        "local branch revision changed; refusing stale "
+                        "pull-request creation"
+                    ),
+                )
+            remote_head = self._remote_branch(
+                "origin", str(payload["branch"]), cwd
+            )
+            if remote_head != command.expected_revision:
+                now = datetime.now(timezone.utc)
+                self.store.begin_command(command.command_id)
+                self.store.record_effect(
+                    EffectReceipt(
+                        command.command_id,
+                        self.identity,
+                        now,
+                        now,
+                        EffectStatus.PERMANENT_FAILURE,
+                        error=(
+                            "remote branch revision changed before "
+                            "pull-request creation"
+                        ),
+                    )
+                )
+                return CommandResult(
+                    75,
+                    stderr=(
+                        "remote branch revision changed; refusing stale "
+                        "pull-request creation"
+                    ),
+                )
+        if (
+            command.kind is CommandKind.PUBLISH_BRANCH
+            and not self._disable_auto_merge_before_push(
+                str(payload["branch"]), cwd
+            )
+        ):
+            now = datetime.now(timezone.utc)
+            self.store.record_effect(
+                EffectReceipt(
+                    command.command_id,
+                    self.identity,
+                    started,
+                    now,
+                    EffectStatus.RETRYABLE_FAILURE,
+                    error=(
+                        "could not verify auto-merge was disabled before "
+                        "updating the pull-request branch"
+                    ),
+                )
+            )
+            return CommandResult(
+                75,
+                stderr=(
+                    "could not verify auto-merge was disabled; refusing "
+                    "branch publication"
+                ),
+            )
+        result = self._execute(argv, cwd)
         reconciled = self._reconcile(command)
+        compensated = False
+        if (
+            command.kind is CommandKind.OPEN_PULL_REQUEST
+            and reconciled is False
+            and result.code == 0
+        ):
+            compensated = self._close_mismatched_pull_request(
+                command, result
+            )
+            reconciled = self._reconcile(command)
         if reconciled is True:
             status = EffectStatus.SUCCEEDED
             error = None
+        elif compensated and reconciled is False:
+            status = EffectStatus.PERMANENT_FAILURE
+            error = (
+                "pull request was created from a different head and was "
+                "closed; refusing stale publication"
+            )
         elif reconciled is False:
             status = EffectStatus.RETRYABLE_FAILURE
             error = (
@@ -212,6 +421,13 @@ class AgentPublicationBroker:
 
     def _command(self, argv: tuple[str, ...], cwd: str) -> LifecycleCommand:
         resolved_cwd = str(Path(cwd).resolve())
+        if (
+            self.authorized_cwd
+            and resolved_cwd != self.authorized_cwd
+        ):
+            raise ValueError(
+                "publication cwd does not match the supervised paid run"
+            )
         head = self._required_output(
             ("git", "rev-parse", "HEAD"), resolved_cwd, "local HEAD"
         )
@@ -220,6 +436,22 @@ class AgentPublicationBroker:
             resolved_cwd,
             "current branch",
         )
+        if not is_governed_branch(branch):
+            raise ValueError(
+                "durable publisher requires a governed current branch"
+            )
+        if self.authorized_branch and branch != self.authorized_branch:
+            raise ValueError(
+                "publication branch does not match the supervised paid run"
+            )
+        if (
+            self.expected_issue is not None
+            and self.expected_issue > 0
+            and issue_from_branch(branch) != self.expected_issue
+        ):
+            raise ValueError(
+                "publication branch does not match the supervised issue"
+            )
         if argv[:2] == ("git", "push"):
             flags, destination = _push_spec(argv[2:], branch)
             remote = "origin"
@@ -260,10 +492,34 @@ class AgentPublicationBroker:
                 repository=self.repository,
                 host=self.host,
                 branch=branch,
+                base_branch=self.base_branch,
             )
-            prior = self._pull_request(branch, head, resolved_cwd)
-            if prior is None:
+            remote_head = self._remote_branch(
+                "origin", branch, resolved_cwd
+            )
+            if remote_head is None:
+                raise RuntimeError(
+                    "cannot verify remote branch before pull-request creation"
+                )
+            if remote_head != head:
+                raise ValueError(
+                    "remote branch does not match the captured local HEAD"
+                )
+            rows = self._open_pull_requests(branch, resolved_cwd)
+            if rows is None:
                 raise RuntimeError("cannot verify pull-request state before create")
+            if any(
+                str(row.get("headRefOid") or "") != head
+                or str(row.get("baseRefName") or "") != self.base_branch
+                for row in rows
+            ):
+                raise ValueError(
+                    "an open pull request already exists for this branch with "
+                    "a different revision or base"
+                )
+            prior = self._matching_pull_request(
+                rows, head, self.base_branch
+            )
             if prior:
                 return self._command_for_existing_pr(
                     normalized, resolved_cwd, branch, head, prior
@@ -274,6 +530,7 @@ class AgentPublicationBroker:
                 "argv": list(normalized),
                 "cwd": resolved_cwd,
                 "branch": branch,
+                "base_branch": self.base_branch,
                 "prior_remote_object": "",
                 "owner": self.owner,
             }
@@ -303,6 +560,7 @@ class AgentPublicationBroker:
             "argv": list(argv),
             "cwd": cwd,
             "branch": branch,
+            "base_branch": self.base_branch,
             "prior_remote_object": remote_object,
             "owner": self.owner,
         }
@@ -326,7 +584,9 @@ class AgentPublicationBroker:
             if current is None:
                 return None
             if current == command.expected_revision:
-                return True
+                return self._disable_auto_merge_before_push(
+                    str(payload["branch"]), cwd
+                )
             if current == str(payload["prior_remote_revision"]):
                 return False
             return None
@@ -348,7 +608,7 @@ class AgentPublicationBroker:
     def _remote_branch(
         self, remote: str, branch: str, cwd: str
     ) -> str | None:
-        result = self.run(
+        result = self._execute(
             ("git", "ls-remote", "--heads", remote, f"refs/heads/{branch}"),
             cwd,
         )
@@ -360,7 +620,15 @@ class AgentPublicationBroker:
     def _pull_request(
         self, branch: str, head: str, cwd: str
     ) -> str | None:
-        result = self.run(
+        rows = self._open_pull_requests(branch, cwd)
+        if rows is None:
+            return None
+        return self._matching_pull_request(rows, head, self.base_branch)
+
+    def _open_pull_requests(
+        self, branch: str, cwd: str
+    ) -> list[dict[str, object]] | None:
+        result = self._execute(
             (
                 "gh",
                 "pr",
@@ -372,7 +640,7 @@ class AgentPublicationBroker:
                 "--state",
                 "open",
                 "--json",
-                "number,headRefOid,state,url",
+                "number,headRefOid,baseRefName,state,url,autoMergeRequest",
             ),
             cwd,
         )
@@ -380,28 +648,123 @@ class AgentPublicationBroker:
             return None
         try:
             rows = json.loads(result.stdout or "[]")
-            if not isinstance(rows, list):
+            if not isinstance(rows, list) or any(
+                not isinstance(row, dict) for row in rows
+            ):
                 return None
-            matching = [
+            return [
                 row
                 for row in rows
-                if (
-                    isinstance(row, dict)
-                    and row.get("headRefOid") == head
-                    and str(row.get("state") or "").upper() == "OPEN"
-                )
+                if str(row.get("state") or "").upper() == "OPEN"
             ]
-            if not matching:
-                return ""
-            row = matching[0]
-            return str(row.get("url") or row.get("number") or "")
         except (TypeError, ValueError, json.JSONDecodeError):
             return None
+
+    @staticmethod
+    def _matching_pull_request(
+        rows: list[dict[str, object]], head: str, base: str
+    ) -> str:
+        matching = [
+            row
+            for row in rows
+            if str(row.get("headRefOid") or "") == head
+            and str(row.get("baseRefName") or "") == base
+        ]
+        if not matching:
+            return ""
+        row = matching[0]
+        return str(row.get("url") or row.get("number") or "")
+
+    def _disable_auto_merge_before_push(
+        self, branch: str, cwd: str
+    ) -> bool:
+        """A write-capable push must not inherit a merge armed for an old SHA."""
+
+        rows = self._open_pull_requests(branch, cwd)
+        if rows is None:
+            return False
+        armed = [
+            row
+            for row in rows
+            if row.get("autoMergeRequest") is not None
+        ]
+        for row in armed:
+            number = row.get("number")
+            if not isinstance(number, int) or number <= 0:
+                return False
+            disabled = self._execute(
+                (
+                    "gh",
+                    "pr",
+                    "merge",
+                    str(number),
+                    "--repo",
+                    f"{self.host}/{self.repository}",
+                    "--disable-auto",
+                ),
+                cwd,
+            )
+            if disabled.code != 0:
+                return False
+        verified = self._open_pull_requests(branch, cwd)
+        if verified is None:
+            return False
+        return not any(
+            row.get("autoMergeRequest") is not None
+            for row in verified
+        )
+
+    def _close_mismatched_pull_request(
+        self, command: LifecycleCommand, result: CommandResult
+    ) -> bool:
+        branch = str(command.payload["branch"])
+        cwd = str(command.payload["cwd"])
+        rows = self._open_pull_requests(branch, cwd)
+        if rows is None:
+            return False
+        match = re.search(r"(?:/|^)([1-9][0-9]*)/?$", result.stdout.strip())
+        if match is None:
+            return False
+        created_number = int(match.group(1))
+        mismatched = [
+            row
+            for row in rows
+            if row.get("number") == created_number
+            and str(row.get("headRefOid") or "")
+            != command.expected_revision
+            and str(row.get("baseRefName") or "")
+            == str(command.payload["base_branch"])
+        ]
+        if len(mismatched) != 1:
+            return False
+        close = self._execute(
+            (
+                "gh",
+                "pr",
+                "close",
+                str(created_number),
+                "--repo",
+                f"{self.host}/{self.repository}",
+                "--comment",
+                (
+                    "Closed automatically: the branch head changed during "
+                    "durable pull-request creation."
+                ),
+            ),
+            cwd,
+        )
+        if close.code != 0:
+            return False
+        remaining = self._open_pull_requests(branch, cwd)
+        return remaining is not None and not any(
+            row.get("number") == created_number
+            for row in remaining
+        )
 
     def _required_output(
         self, argv: tuple[str, ...], cwd: str, description: str
     ) -> str:
-        result = self.run(argv, cwd)
+        result = self._execute(argv, cwd)
         value = result.stdout.strip()
         if result.code != 0 or not value:
             raise RuntimeError(f"cannot resolve {description}")
@@ -537,12 +900,12 @@ def _push_spec(
     if destination in {"HEAD", ""}:
         destination = current_branch
     destination = destination.removeprefix("refs/heads/")
-    if (
-        not destination
-        or destination.startswith("-")
-        or destination in {"main", "master", "dev"}
-    ):
-        raise ValueError("push destination branch is unavailable")
+    if not is_governed_branch(current_branch):
+        raise ValueError("push source branch is not governed")
+    if destination != current_branch:
+        raise ValueError(
+            "push destination must be the captured current branch"
+        )
     return flags, destination
 
 
@@ -606,10 +969,15 @@ def _normalized_pr_create(
     repository: str,
     host: str,
     branch: str,
+    base_branch: str,
 ) -> tuple[str, ...]:
-    snapshotted = _snapshot_body_file(argv, cwd)
+    del cwd
+    snapshotted = _validated_pr_arguments(argv)
     forbidden = {"--repo", "-R", "--head", "-H"}
-    for index, arg in enumerate(snapshotted[3:], start=3):
+    normalized: list[str] = list(snapshotted[:3])
+    index = 3
+    while index < len(snapshotted):
+        arg = snapshotted[index]
         if (
             arg in forbidden
             or arg.startswith("--repo=")
@@ -620,44 +988,130 @@ def _normalized_pr_create(
             raise ValueError(
                 "pull-request repository and head are fixed by the durable command"
             )
+        if arg in {"--base", "-B"}:
+            if index + 1 >= len(snapshotted):
+                raise ValueError("pull-request base option requires a value")
+            index += 2
+            continue
+        if arg.startswith("--base=") or (
+            arg.startswith("-B") and arg != "-B"
+        ):
+            index += 1
+            continue
         if index > 3 and snapshotted[index - 1] in forbidden:
             raise ValueError(
                 "pull-request repository and head are fixed by the durable command"
             )
+        normalized.append(arg)
+        index += 1
     return (
-        *snapshotted,
+        *normalized,
         "--repo",
         f"{host}/{repository}",
         "--head",
         branch,
+        "--base",
+        base_branch,
     )
 
 
-def _snapshot_body_file(
-    argv: tuple[str, ...], cwd: str
+def _validated_pr_arguments(
+    argv: tuple[str, ...],
 ) -> tuple[str, ...]:
-    normalized: list[str] = []
-    index = 0
+    max_body_bytes = 60_000
+    max_title_bytes = 512
+    title_seen = False
+    body_seen = False
+    index = 3
     while index < len(argv):
         arg = argv[index]
-        if arg == "--body-file":
-            if index + 1 >= len(argv) or argv[index + 1] == "-":
-                raise ValueError("--body-file requires a stable file path")
-            body = (Path(cwd) / argv[index + 1]).read_text(encoding="utf-8")
-            normalized.extend(("--body", body))
+        if arg in {
+            "--body-file",
+            "--template",
+            "-T",
+            "-F",
+            "--editor",
+            "--web",
+        } or arg.startswith(
+            ("--body-file=", "--template=", "-T", "-F")
+        ):
+            raise ValueError(
+                "durable pull-request creation accepts literal --body only; "
+                "file-reading options are forbidden"
+            )
+        if arg in {"--title", "-t"}:
+            if index + 1 >= len(argv):
+                raise ValueError("--title requires a literal value")
+            if len(argv[index + 1].encode()) > max_title_bytes:
+                raise ValueError("pull-request title exceeds the durable limit")
+            title_seen = True
             index += 2
             continue
-        if arg.startswith("--body-file="):
-            path = arg.split("=", 1)[1]
-            if path == "-":
-                raise ValueError("--body-file requires a stable file path")
-            body = (Path(cwd) / path).read_text(encoding="utf-8")
-            normalized.extend(("--body", body))
+        if arg.startswith("--title=") or (
+            arg.startswith("-t") and arg != "-t"
+        ):
+            value = (
+                arg.split("=", 1)[1]
+                if "=" in arg
+                else arg[2:]
+            )
+            if len(value.encode()) > max_title_bytes:
+                raise ValueError("pull-request title exceeds the durable limit")
+            title_seen = True
             index += 1
             continue
-        normalized.append(arg)
-        index += 1
-    return tuple(normalized)
+        if arg in {"--body", "-b"}:
+            if index + 1 >= len(argv):
+                raise ValueError("--body requires a literal value")
+            if len(argv[index + 1].encode()) > max_body_bytes:
+                raise ValueError("pull-request body exceeds the durable limit")
+            body_seen = True
+            index += 2
+            continue
+        if arg.startswith("--body=") or (
+            arg.startswith("-b") and arg != "-b"
+        ):
+            value = (
+                arg.split("=", 1)[1]
+                if "=" in arg
+                else arg[2:]
+            )
+            if len(value.encode()) > max_body_bytes:
+                raise ValueError("pull-request body exceeds the durable limit")
+            body_seen = True
+            index += 1
+            continue
+        if arg in {"--base", "-B"}:
+            if index + 1 >= len(argv):
+                raise ValueError("--base requires a value")
+            index += 2
+            continue
+        if arg.startswith("--base=") or (
+            arg.startswith("-B") and arg != "-B"
+        ):
+            index += 1
+            continue
+        if arg == "--draft":
+            index += 1
+            continue
+        if arg in {"--repo", "-R", "--head", "-H"}:
+            if index + 1 >= len(argv):
+                raise ValueError(f"{arg} requires a value")
+            index += 2
+            continue
+        if arg.startswith(("--repo=", "--head=")) or (
+            arg.startswith(("-R", "-H")) and arg not in {"-R", "-H"}
+        ):
+            index += 1
+            continue
+        raise ValueError(
+            f"unsupported pull-request creation option: {arg}"
+        )
+    if not title_seen or not body_seen:
+        raise ValueError(
+            "durable pull-request creation requires literal title and body"
+        )
+    return argv
 
 
 def _process_environment(pid: int) -> dict[str, str]:
@@ -770,6 +1224,17 @@ def _trusted_publication_environment() -> dict[str, str]:
             != candidate["ISSUE_AGENT_REPOSITORY"]
             or authority.owner_id
             != candidate["ISSUE_AGENT_PUBLICATION_OWNER"]
+            or authority.role != "fix"
+            or authority.kind
+            != candidate["ISSUE_AGENT_PUBLICATION_KIND"]
+            or str(authority.issue or 0)
+            != candidate["ISSUE_AGENT_PUBLICATION_ISSUE"]
+            or authority.cwd
+            != str(Path(candidate["ISSUE_AGENT_PUBLICATION_CWD"]).resolve())
+            or authority.branch
+            != candidate["ISSUE_AGENT_PUBLICATION_BRANCH"]
+            or not Path(candidate["ISSUE_AGENT_GIT_BIN"]).is_absolute()
+            or not Path(candidate["ISSUE_AGENT_GH_BIN"]).is_absolute()
             or candidate_pgid != authority.pgid
             or not ProcessSupervisor.matches_identity(
                 authority.pgid, authority.process_start_ticks
@@ -822,10 +1287,19 @@ def main(argv: list[str] | None = None) -> None:
     broker = AgentPublicationBroker(
         store,
         repository=repository,
+        base_branch=authority_env["ISSUE_AGENT_BASE_BRANCH"],
         host=authority_env["ISSUE_AGENT_GITHUB_HOST"],
         config_version=authority_env["ISSUE_AGENT_CONFIG_VERSION"],
         identity=f"agent-publication:{os.getpid()}",
         owner=authority_env["ISSUE_AGENT_PUBLICATION_OWNER"],
+        authorized_cwd=authority_env["ISSUE_AGENT_PUBLICATION_CWD"],
+        authorized_branch=authority_env["ISSUE_AGENT_PUBLICATION_BRANCH"],
+        expected_issue=(
+            int(authority_env["ISSUE_AGENT_PUBLICATION_ISSUE"]) or None
+        ),
+        git_binary=authority_env["ISSUE_AGENT_GIT_BIN"],
+        gh_binary=authority_env["ISSUE_AGENT_GH_BIN"],
+        trusted_path=authority_env["ISSUE_AGENT_EXEC_PATH"],
     )
     try:
         result = broker.publish(args, os.getcwd())

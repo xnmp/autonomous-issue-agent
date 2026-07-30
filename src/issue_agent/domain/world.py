@@ -183,6 +183,9 @@ class PRView:
     # rogue (unlabeled) PRs into the review pipeline.
     is_draft: bool = False
     author: str = ""
+    # Appended to preserve the positional compatibility of the historical
+    # PRView fields while binding review evidence to an immutable base.
+    base_ref_oid: str = ""
 
     def has(self, label: Label) -> bool:
         return label in self.labels
@@ -194,6 +197,15 @@ class PRView:
         """Clean but stale: mergeable (no conflict) yet the base advanced. Needs an
         update-branch before an armed auto-merge can land it."""
         return self.merge_state.upper() == "BEHIND" and not self.is_conflicting()
+
+
+@dataclass(frozen=True)
+class PullRequestDiff:
+    """Immutable review evidence for one exact base/head pair."""
+
+    base_oid: str
+    head_oid: str
+    text: str
 
 
 import re

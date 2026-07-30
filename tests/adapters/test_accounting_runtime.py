@@ -3,9 +3,11 @@ import base64
 import dataclasses
 import json
 import os
+from pathlib import Path
 
 import pytest
 
+from issue_agent.adapters import accounting_runtime
 from issue_agent.adapters.accounting_runtime import AccountingRuntime
 from issue_agent.adapters.codex_runner import (
     spend_evidence_path,
@@ -37,6 +39,26 @@ def _rates():
         {},
         UnknownModelPolicy.USE_FALLBACK,
         ModelRates(5_000_000, 30_000_000, 500_000, 5_000_000),
+)
+
+
+@pytest.fixture(autouse=True)
+def _publication_context_for_accounting_tests(
+    monkeypatch, tmp_path
+) -> None:
+    def context(role, cwd):
+        if role != "fix":
+            return None
+        return accounting_runtime._FixPublicationContext(
+            str(Path(cwd or tmp_path).resolve()),
+            "fix/1-test",
+            "/usr/bin/git",
+            "/usr/bin/gh",
+            "/usr/bin:/bin",
+        )
+
+    monkeypatch.setattr(
+        accounting_runtime, "_fix_publication_context", context
     )
 
 
@@ -103,7 +125,9 @@ def test_paid_run_has_reservation_before_runtime_and_settles(tmp_path) -> None:
     assert runtime.calls == 1
 
 
-def test_paid_run_carries_portable_ancestor_authority_bundle(tmp_path) -> None:
+def test_paid_run_carries_portable_ancestor_authority_bundle(
+    tmp_path, monkeypatch
+) -> None:
     class CapturingRuntime(Runtime):
         async def run(self, task):
             self.task = task
@@ -121,17 +145,104 @@ def test_paid_run_carries_portable_ancestor_authority_bundle(tmp_path) -> None:
     wrapper, _ = _wrapper(tmp_path, runtime)
     wrapper = dataclasses.replace(wrapper, github_host="github.example")
     wrapper.set_context("fix", "RESOLVE", 1, 1)
+    monkeypatch.setattr(
+        accounting_runtime,
+        "_fix_publication_context",
+        lambda _role, _cwd: accounting_runtime._FixPublicationContext(
+            str(tmp_path),
+            "fix/1-test",
+            "/usr/bin/git",
+            "/usr/bin/gh",
+            "/usr/bin:/bin",
+        ),
+    )
 
     asyncio.run(
-        wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2))
+        wrapper.run(
+            RuntimePlan(
+                "work",
+                model="gpt-test",
+                max_budget_usd=2,
+                cwd=str(tmp_path),
+            )
+        )
     )
 
     encoded = runtime.task.env["ISSUE_AGENT_AUTHORITY_BUNDLE"]
     authority = json.loads(base64.urlsafe_b64decode(encoded).decode())
     assert authority["ISSUE_AGENT_GITHUB_HOST"] == "github.example"
+    assert authority["ISSUE_AGENT_BASE_BRANCH"] == "dev"
     assert authority["ISSUE_AGENT_REPOSITORY"] == "o/r"
     assert authority["ISSUE_AGENT_CONTROL_DB"].endswith("control.db")
     assert authority["ISSUE_AGENT_RUN_ID"]
+    assert authority["ISSUE_AGENT_PUBLICATION_CWD"] == str(tmp_path)
+    assert authority["ISSUE_AGENT_PUBLICATION_BRANCH"] == "fix/1-test"
+    assert authority["ISSUE_AGENT_PUBLICATION_ISSUE"] == "1"
+    assert Path(authority["ISSUE_AGENT_GIT_BIN"]).is_absolute()
+    assert Path(authority["ISSUE_AGENT_GH_BIN"]).is_absolute()
+
+
+def test_fix_publication_kind_blocks_before_paid_run_without_authority(
+    tmp_path, monkeypatch
+) -> None:
+    runtime = Runtime(AgentResult(False, status="should-not-run"))
+    wrapper, store = _wrapper(tmp_path, runtime)
+    monkeypatch.setattr(
+        accounting_runtime,
+        "_fix_publication_context",
+        lambda _role, _cwd: None,
+    )
+
+    result = asyncio.run(
+        wrapper.run(RuntimePlan("work", max_budget_usd=2))
+    )
+
+    assert result.status == "publication_authority_unavailable"
+    assert result.exit_reason is ExitReason.AGENT_ERROR
+    assert "publication authority" in result.summary
+    assert runtime.calls == 0
+    assert store.active_reservation_runs() == ()
+
+
+def test_issue_less_pr_repair_keeps_branch_bound_publication_authority(
+    tmp_path,
+) -> None:
+    class CapturingRuntime(Runtime):
+        async def run(self, task):
+            self.task = task
+            return await super().run(task)
+
+    runtime = CapturingRuntime(
+        AgentResult(
+            False,
+            status="ok",
+            usage={"input_tokens": 1, "output_tokens": 1},
+        )
+    )
+    wrapper, _store = _wrapper(tmp_path, runtime)
+    wrapper = dataclasses.replace(
+        wrapper,
+        issue_cap=None,
+        budget_policy=BudgetPolicy(
+            {("fix", "FIX_CI"): Money("USD", 2_000_000)}
+        ),
+    )
+    wrapper.set_context("fix", "FIX_CI", 100, None)
+
+    result = asyncio.run(
+        wrapper.run(
+            RuntimePlan("repair", max_budget_usd=2, cwd=str(tmp_path))
+        )
+    )
+
+    assert result.status == "ok"
+    authority = json.loads(
+        base64.urlsafe_b64decode(
+            runtime.task.env["ISSUE_AGENT_AUTHORITY_BUNDLE"]
+        ).decode()
+    )
+    assert authority["ISSUE_AGENT_PUBLICATION_ISSUE"] == "0"
+    assert authority["ISSUE_AGENT_PUBLICATION_BRANCH"] == "fix/1-test"
 
 
 def test_resumed_session_uses_distinct_per_leg_settlement_receipts(

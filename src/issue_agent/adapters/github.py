@@ -33,6 +33,7 @@ from ..domain.world import (
     Comment,
     IssueView,
     PRView,
+    PullRequestDiff,
     Review,
     WorldState,
     extract_declared_paths,
@@ -399,6 +400,45 @@ def _checks(raw: list | None) -> tuple[Check, ...]:
     )
 
 
+def _check_run_observation(raw: dict) -> dict[str, object]:
+    status = str(raw.get("status") or "").lower()
+    conclusion = str(raw.get("conclusion") or "").lower()
+    if status != "completed":
+        bucket = "pending"
+    elif conclusion in {"success", "neutral", "skipped"}:
+        bucket = "pass"
+    else:
+        bucket = "fail"
+    return {
+        "name": str(raw.get("name") or ""),
+        "state": status.upper(),
+        "bucket": bucket,
+        "startedAt": str(
+            raw.get("started_at") or raw.get("created_at") or ""
+        ),
+        "link": str(raw.get("details_url") or ""),
+    }
+
+
+def _commit_status_observation(raw: dict) -> dict[str, object]:
+    state = str(raw.get("state") or "").lower()
+    return {
+        "name": str(raw.get("context") or ""),
+        "state": state.upper(),
+        "bucket": (
+            "pending"
+            if state == "pending"
+            else "pass"
+            if state == "success"
+            else "fail"
+        ),
+        "startedAt": str(
+            raw.get("created_at") or raw.get("updated_at") or ""
+        ),
+        "link": str(raw.get("target_url") or ""),
+    }
+
+
 _ACTIONS_RUN_RE = re.compile(r"/actions/runs/(\d+)(?:/|$)")
 
 
@@ -441,6 +481,7 @@ def parse_pr(d: dict) -> PRView:
         head_ref_name=d.get("headRefName", "") or "",
         head_ref_oid=d.get("headRefOid", "") or "",
         base_ref_name=d.get("baseRefName", "") or "",
+        base_ref_oid=d.get("baseRefOid", "") or "",
         title=d.get("title", "") or "",
         body=d.get("body", "") or "",
         labels=_labels(d.get("labels")),
@@ -616,7 +657,6 @@ def build_enable_auto_merge_args(
         str(pr),
         "--repo",
         repo,
-        "--auto",
         f"--{method}",
         "--delete-branch",
         "--match-head-commit",
@@ -770,7 +810,11 @@ class GitHubGateway:
         contexts = rsc.get("contexts") or [
             c.get("context") for c in (rsc.get("checks") or []) if isinstance(c, dict)
         ]
-        return int(reviews) >= 1 and any(contexts)
+        return (
+            int(reviews) >= 1
+            and any(contexts)
+            and rsc.get("strict") is True
+        )
 
     def open_blockers(self, number: int) -> tuple[int, ...]:
         """Open GitHub-native ``blocked by`` issue numbers for ``number``.
@@ -825,7 +869,7 @@ class GitHubGateway:
         happened), and the stale `--state all` label list keeps merged PRs in the
         enrichment set for days (list_pr_states). Absent checks parse to () →
         ci_state(()) is NONE, which no consumer reads for a non-open PR."""
-        base = ("number,title,body,headRefName,headRefOid,baseRefName,labels,"
+        base = ("number,title,body,headRefName,headRefOid,baseRefName,baseRefOid,labels,"
                 "comments,reviews,state,closingIssuesReferences,files,isDraft,author")
         fields = base + (",mergeable,mergeStateStatus" if mergeability else "")
         d = self._gh_json(
@@ -839,26 +883,16 @@ class GitHubGateway:
             # mergeable. No consumer reads checks for the non-open PRs this
             # arm is for, so UNKNOWN costs nothing (#48 review F3).
             return replace(pr, checks_known=False)
-        # checks come from a separate endpoint (bash `pr checks`).
-        found = self._gh_json(
-            ["pr", "checks", str(number), "--repo", self.repo,
-             "--json", "name,state,bucket,startedAt,link"]
-        )
-        if found is None:
-            # gh failed non-infra (infra raised GhUnavailable inside the runner;
-            # the honest no-checks exit came back as "[]"). The checks were NOT
-            # read this tick — () would parse as honest NONE, which decide_fix
-            # treats like OK and could arm auto-merge unverified (#48). Say so:
-            # the one failure the runner silences (App-token statusCheckRollup)
-            # used to be harmless noise, but UNKNOWN holds the merge gates, and
-            # a silent permanent stall is not diagnosable from the logs.
+        raw_checks = self._checks_for_head(pr.head_ref_oid)
+        if raw_checks is None:
             import sys
+
             sys.stderr.write(
-                f"gh pr checks failed for PR #{number} — checks UNKNOWN this "
-                "tick; merge gates hold until a successful read\n"
+                f"commit checks failed for PR #{number} head "
+                f"{pr.head_ref_oid[:12] or '?'} — checks UNKNOWN this tick; "
+                "merge gates hold until a successful revision-bound read\n"
             )
             return replace(pr, checks_known=False)
-        raw_checks = found if isinstance(found, list) else []
         run_conclusions: dict[int, str] = {}
         for check in raw_checks:
             if not isinstance(check, dict) or check.get("bucket") != "fail":
@@ -896,6 +930,92 @@ class GitHubGateway:
                 f"{', '.join(advisory_names)}\n"
             )
         return replace(pr, checks=_checks(enriched))
+
+    def _checks_for_head(
+        self, head_oid: str
+    ) -> list[dict[str, object]] | None:
+        """Read all check-runs and commit statuses for one immutable SHA."""
+
+        if not head_oid:
+            return None
+        check_pages = self._gh_json(
+            [
+                "api",
+                "--paginate",
+                "--slurp",
+                "-H",
+                "Accept: application/vnd.github+json",
+                f"repos/{self.repo}/commits/{head_oid}/check-runs"
+                "?filter=latest&per_page=100",
+            ]
+        )
+        status_pages = self._gh_json(
+            [
+                "api",
+                "--paginate",
+                "--slurp",
+                f"repos/{self.repo}/commits/{head_oid}/statuses?per_page=100",
+            ]
+        )
+        if not isinstance(check_pages, list) or not isinstance(
+            status_pages, list
+        ):
+            return None
+        runs: list[dict] = []
+        for page in check_pages:
+            if not isinstance(page, dict) or not isinstance(
+                page.get("check_runs"), list
+            ):
+                return None
+            if any(not isinstance(item, dict) for item in page["check_runs"]):
+                return None
+            runs.extend(page["check_runs"])
+        statuses: list[dict] = []
+        for page in status_pages:
+            if not isinstance(page, list) or any(
+                not isinstance(item, dict) for item in page
+            ):
+                return None
+            statuses.extend(page)
+        latest_runs: dict[tuple[str, str], dict] = {}
+        for item in runs:
+            app = item.get("app")
+            app_identity = (
+                str(app.get("id") or app.get("slug") or "")
+                if isinstance(app, dict)
+                else ""
+            )
+            key = (app_identity, str(item.get("name") or ""))
+            current = latest_runs.get(key)
+            score = (
+                int(item.get("id") or 0),
+                str(item.get("started_at") or item.get("created_at") or ""),
+            )
+            current_score = (
+                int(current.get("id") or 0),
+                str(
+                    current.get("started_at")
+                    or current.get("created_at")
+                    or ""
+                ),
+            ) if current is not None else (-1, "")
+            if current is None or score > current_score:
+                latest_runs[key] = item
+        latest_statuses: dict[str, dict] = {}
+        for item in statuses:
+            context = str(item.get("context") or "")
+            if context not in latest_statuses:
+                latest_statuses[context] = item
+        return [
+            *(
+                _check_run_observation(item)
+                for item in latest_runs.values()
+            ),
+            *(
+                _commit_status_observation(item)
+                for item in latest_statuses.values()
+            ),
+        ]
 
     def _safe_get_pr(
         self, number: int, *, mergeability: bool = True, checks: bool = True
@@ -1237,8 +1357,22 @@ class GitHubGateway:
 
         return issue_from_branch(p.head_ref_name)
 
-    def pr_diff(self, pr: int) -> str:
-        return self._gh(["pr", "diff", str(pr), "--repo", self.repo])
+    def pr_diff(
+        self, pr: int, base_oid: str, head_oid: str
+    ) -> PullRequestDiff:
+        if not base_oid or not head_oid:
+            raise ValueError("pull-request diff revisions are required")
+        text = self._gh(
+            [
+                "api",
+                "-H",
+                "Accept: application/vnd.github.v3.diff",
+                f"repos/{self.repo}/compare/{base_oid}...{head_oid}",
+            ]
+        )
+        if not text.strip():
+            raise RuntimeError("immutable pull-request diff is unavailable")
+        return PullRequestDiff(base_oid, head_oid, text)
 
     # ── prompt inputs for the two repair legs (review M13 / D6) ──
     # Both of these feed a prompt and nothing else, so both fail SOFT to "": the
@@ -1484,7 +1618,7 @@ class GitHubGateway:
             for item in reviews
         )
 
-    def is_auto_merge_enabled_or_merged(
+    def is_expected_head_merged(
         self, pr: int, expected_head: str
     ) -> bool:
         data = self._gh_json(
@@ -1495,16 +1629,63 @@ class GitHubGateway:
                 "--repo",
                 self.repo,
                 "--json",
-                "autoMergeRequest,state,headRefOid",
+                "state,headRefOid",
             ]
         )
         return (
             isinstance(data, dict)
             and data.get("headRefOid") == expected_head
-            and (
-                data.get("autoMergeRequest") is not None
-                or str(data.get("state") or "").upper() == "MERGED"
-            )
+            and str(data.get("state") or "").upper() == "MERGED"
+        )
+
+    def disable_auto_merge(
+        self, pr: int, expected_head: str
+    ) -> bool:
+        """Revoke any legacy arm before a write that can advance the PR head."""
+
+        data = self._gh_json(
+            [
+                "pr",
+                "view",
+                str(pr),
+                "--repo",
+                self.repo,
+                "--json",
+                "autoMergeRequest,headRefOid",
+            ]
+        )
+        if (
+            not isinstance(data, dict)
+            or data.get("headRefOid") != expected_head
+        ):
+            return False
+        if data.get("autoMergeRequest") is None:
+            return True
+        self._gh(
+            [
+                "pr",
+                "merge",
+                str(pr),
+                "--repo",
+                self.repo,
+                "--disable-auto",
+            ]
+        )
+        verified = self._gh_json(
+            [
+                "pr",
+                "view",
+                str(pr),
+                "--repo",
+                self.repo,
+                "--json",
+                "autoMergeRequest,headRefOid",
+            ]
+        )
+        return (
+            isinstance(verified, dict)
+            and verified.get("headRefOid") == expected_head
+            and verified.get("autoMergeRequest") is None
         )
 
     def is_branch_updated(self, pr: int, prior_head: str) -> bool:
@@ -1521,10 +1702,12 @@ class GitHubGateway:
         )
         if not isinstance(data, dict):
             return False
+        current_head = str(data.get("headRefOid") or "")
         return (
-            bool(data.get("headRefOid"))
-            and data.get("headRefOid") != prior_head
+            bool(current_head)
+            and current_head != prior_head
             and str(data.get("mergeStateStatus") or "").upper() != "BEHIND"
+            and self.disable_auto_merge(pr, current_head)
         )
 
     def max_run_attempt(self, head: str) -> int | None:
@@ -1565,24 +1748,21 @@ class GitHubGateway:
     def enable_auto_merge(
         self, pr: int, method: str, expected_head: str
     ) -> bool:
-        """`gh pr merge --auto`. Returns True iff GitHub actually armed
-        auto-merge — or merged the PR outright (gh merges immediately when the
-        PR is already CLEAN). Success is VERIFIED with a follow-up read, not
-        inferred from stdout: this command prints nothing useful on either
-        outcome, and on a base branch with no required-check protection the
-        enablePullRequestAutoMerge mutation fails (GraphQL: "Branch does not
-        have required protected branch rules") while an already-green PR merges
-        fine. Observed 2026-07-26: the arm failed on a just-pushed PR (checks
-        NONE), the marker was written anyway, and #537 sat APPROVED+green+CLEAN
-        but unmergeable-by-harness forever — armed-in-state, never
-        armed-on-GitHub. The caller must key the marker on this return."""
+        """Merge only the observed, review-and-CI-qualified head.
+
+        The historical port name remains for command-schema compatibility.
+        Persistent GitHub auto-merge is deliberately not armed: its approval
+        survives later pushes on repositories without last-push protection.
+        """
+        if not self.disable_auto_merge(pr, expected_head):
+            return False
         self._gh(
             build_enable_auto_merge_args(
                 self.repo, pr, method, expected_head
             )
         )
         try:
-            return self.is_auto_merge_enabled_or_merged(pr, expected_head)
+            return self.is_expected_head_merged(pr, expected_head)
         except Exception:  # noqa: BLE001 — unreadable is not confirmed
             return False
 
@@ -1591,13 +1771,16 @@ class GitHubGateway:
         an armed auto-merge can land it. Fail-soft: a transient 'already up to date'
         / merge-conflict race must not abort the poll — it's re-evaluated next tick."""
         try:
-            return bool(
+            if not self.disable_auto_merge(pr, expected_head):
+                return False
+            updated = bool(
                 self._gh(
                     build_update_branch_args(
                         self.repo, pr, expected_head
                     )
                 ).strip()
             )
+            return updated and self.is_branch_updated(pr, expected_head)
         except Exception:
             return False
 

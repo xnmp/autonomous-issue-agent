@@ -129,6 +129,16 @@ append_legacy_unit() {
   candidate="$1"
   current="$2"
   [ "$candidate" != "$current" ] || return 0
+  if [ -f "$candidate" ]; then
+    embedded_deployment="$(sed -n 's/^Environment=ISSUE_AGENT_DEPLOYMENT_ID=//p' "$candidate" | tail -n 1)"
+    embedded_target="$(sed -n 's/^Environment=TARGET_DIR=//p' "$candidate" | tail -n 1)"
+    if { [ -n "$embedded_deployment" ] \
+         && [ "$embedded_deployment" != "$DEPLOYMENT_NAME" ]; } \
+       || { [ -n "$embedded_target" ] \
+            && [ "$embedded_target" != "$TARGET_DIR" ]; }; then
+      return 0
+    fi
+  fi
   candidate_name="$(basename "$candidate")"
   for existing in "${legacy_unit_names[@]}"; do
     [ "$existing" != "$candidate_name" ] || return 0
@@ -141,14 +151,37 @@ for index in "${!services[@]}"; do
   s="${services[$index]}"
   dst="$UD/$s-$NAME.service"
   [ ! -f "$dst" ] || cp "$dst" "$STAGE/$index.previous"
+  current_active=0
+  current_enabled=0
   systemctl --user is-active --quiet "$s-$NAME.service" \
-    && touch "$STAGE/$index.active" || true
+    && current_active=1 || true
   systemctl --user is-enabled --quiet "$s-$NAME.service" \
-    && touch "$STAGE/$index.enabled" || true
+    && current_enabled=1 || true
+  if [ ! -f "$dst" ] \
+     && { [ "$current_active" -eq 1 ] || [ "$current_enabled" -eq 1 ]; }; then
+    echo "REFUSING cutover: active/enabled current unit $s-$NAME.service has no recoverable definition at $dst" >&2
+    exit 2
+  fi
+  [ "$current_active" -ne 1 ] || touch "$STAGE/$index.active"
+  [ "$current_enabled" -ne 1 ] || touch "$STAGE/$index.enabled"
   append_legacy_unit "$UD/$s.service" "$dst"
   append_legacy_unit "$UD/$s-$LEGACY_TARGET_NAME.service" "$dst"
   if [ -n "$LEGACY_REPO_NAME" ]; then
     append_legacy_unit "$UD/$s-$LEGACY_REPO_NAME.service" "$dst"
+  fi
+done
+for unit in "${legacy_unit_names[@]}"; do
+  legacy_path="$UD/$unit"
+  legacy_active=0
+  legacy_enabled=0
+  systemctl --user is-active --quiet "$unit" \
+    && legacy_active=1 || true
+  systemctl --user is-enabled --quiet "$unit" \
+    && legacy_enabled=1 || true
+  if [ ! -f "$legacy_path" ] \
+     && { [ "$legacy_active" -eq 1 ] || [ "$legacy_enabled" -eq 1 ]; }; then
+    echo "REFUSING cutover: active/enabled legacy unit $unit has no recoverable definition at $legacy_path" >&2
+    exit 2
   fi
 done
 for index in "${!legacy_units[@]}"; do

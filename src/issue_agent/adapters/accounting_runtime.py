@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import base64
+import os
+from pathlib import Path
+import shutil
+import subprocess
 import uuid
 import contextvars
 import json
@@ -24,6 +28,7 @@ from ..domain.contracts import (
 )
 from ..domain.outcome import AgentResult, ExitReason, MAX_BUDGET_STATUS
 from ..domain.pricing import BudgetPolicy, RateTable, price
+from ..domain.refs import is_governed_branch
 from .control_store import (
     AccountingDisposition,
     BudgetLimit,
@@ -33,6 +38,18 @@ from .control_store import (
 )
 
 _UNLIMITED_ACCOUNTING_MICROS = 9_000_000_000_000_000_000
+_FIX_PUBLICATION_KINDS = frozenset(
+    {
+        "RESOLVE",
+        "RESUME",
+        "PR_RESUME",
+        "ADDRESS_REVIEW",
+        "FIX_CI",
+        "REBASE",
+        "AUTHOR",
+        "IMPLEMENT",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -55,6 +72,7 @@ class AccountingRuntime(AgentRuntime):
     event_line_limit: int = 0
     owner_id: str = ""
     github_host: str = "github.com"
+    approved_base_branch: str = "dev"
     _context: contextvars.ContextVar[tuple[int | None, str, int]] = field(
         default_factory=lambda: contextvars.ContextVar(
             f"accounting_context_{uuid.uuid4().hex}", default=(None, "", 0)
@@ -109,6 +127,22 @@ class AccountingRuntime(AgentRuntime):
             )
         correlated_run_id, _leg_id = self._identity.get()
         run_id = RunId(correlated_run_id or uuid.uuid4().hex)
+        publication = _fix_publication_context(self.role, task.cwd)
+        if (
+            self.role == "fix"
+            and kind in _FIX_PUBLICATION_KINDS
+            and publication is None
+        ):
+            return AgentResult(
+                is_error=True,
+                status="publication_authority_unavailable",
+                envelope_subtype="publication_authority_unavailable",
+                summary=(
+                    "durable publication authority is unavailable for the "
+                    "fix worktree"
+                ),
+                exit_reason=ExitReason.AGENT_ERROR,
+            )
         dispatch_id = json.dumps(
             {
                 "repository": self.repository,
@@ -117,6 +151,14 @@ class AccountingRuntime(AgentRuntime):
                 "number": number,
                 "issue": issue,
                 "breaker_key": _breaker_key(kind, number, issue),
+                "cwd": (
+                    str(Path(task.cwd).resolve())
+                    if task.cwd is not None
+                    else ""
+                ),
+                "publication_branch": (
+                    publication.branch if publication is not None else ""
+                ),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -162,8 +204,6 @@ class AccountingRuntime(AgentRuntime):
             "ISSUE_AGENT_CONFIG_VERSION": self.config_version,
             "ISSUE_AGENT_CONTROL_DB": self.store.path,
             "ISSUE_AGENT_REPOSITORY": self.repository,
-            "ISSUE_AGENT_PUBLICATION_OWNER": publication_owner,
-            "ISSUE_AGENT_GITHUB_HOST": self.github_host,
             **(
                 {
                     "ISSUE_AGENT_EVENT_LOG": self.event_log_path,
@@ -177,20 +217,45 @@ class AccountingRuntime(AgentRuntime):
                 else {}
             ),
         }
-        authority_bundle = base64.urlsafe_b64encode(
-            json.dumps(
-                authority,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-        ).decode()
+        publication_authority: dict[str, str] = {}
+        if publication is not None:
+            publication_authority = {
+                    "ISSUE_AGENT_PUBLICATION_OWNER": publication_owner,
+                    "ISSUE_AGENT_GITHUB_HOST": self.github_host,
+                    "ISSUE_AGENT_BASE_BRANCH": self.approved_base_branch,
+                    "ISSUE_AGENT_PUBLICATION_CWD": publication.cwd,
+                    "ISSUE_AGENT_PUBLICATION_BRANCH": publication.branch,
+                    "ISSUE_AGENT_PUBLICATION_ISSUE": str(issue or 0),
+                    "ISSUE_AGENT_PUBLICATION_KIND": kind,
+                    "ISSUE_AGENT_GIT_BIN": publication.git_binary,
+                    "ISSUE_AGENT_GH_BIN": publication.gh_binary,
+                    "ISSUE_AGENT_EXEC_PATH": publication.executable_path,
+                }
+        authority = {**authority, **publication_authority}
+        authority_bundle = (
+            base64.urlsafe_b64encode(
+                json.dumps(
+                    authority,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode()
+            ).decode()
+            if publication_authority
+            else ""
+        )
         runtime_task = replace(
             task,
             env={
                 **task.env,
                 **authority,
-                "ISSUE_AGENT_DURABLE_PUBLISH": "1",
-                "ISSUE_AGENT_AUTHORITY_BUNDLE": authority_bundle,
+                **(
+                    {
+                        "ISSUE_AGENT_DURABLE_PUBLISH": "1",
+                        "ISSUE_AGENT_AUTHORITY_BUNDLE": authority_bundle,
+                    }
+                    if publication_authority
+                    else {}
+                ),
             },
         )
         try:
@@ -406,6 +471,65 @@ class AccountingRuntime(AgentRuntime):
                 )
             )
         return tuple(limits)
+
+
+@dataclass(frozen=True)
+class _FixPublicationContext:
+    cwd: str
+    branch: str
+    git_binary: str
+    gh_binary: str
+    executable_path: str
+
+
+def _fix_publication_context(
+    role: str, cwd: str | None
+) -> _FixPublicationContext | None:
+    if role != "fix" or cwd is None:
+        return None
+    git_binary = shutil.which("git")
+    gh_binary = shutil.which("gh")
+    resolved_cwd = str(Path(cwd).resolve())
+    if not git_binary or not gh_binary:
+        return None
+    try:
+        result = subprocess.run(
+            (
+                str(Path(git_binary).resolve()),
+                "-C",
+                resolved_cwd,
+                "branch",
+                "--show-current",
+            ),
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    branch = result.stdout.strip()
+    if result.returncode != 0 or not is_governed_branch(branch):
+        return None
+    resolved_git = str(Path(git_binary).resolve())
+    resolved_gh = str(Path(gh_binary).resolve())
+    executable_path = os.pathsep.join(
+        dict.fromkeys(
+            (
+                str(Path(resolved_git).parent),
+                str(Path(resolved_gh).parent),
+                "/usr/bin",
+                "/bin",
+            )
+        )
+    )
+    return _FixPublicationContext(
+        resolved_cwd,
+        branch,
+        resolved_git,
+        resolved_gh,
+        executable_path,
+    )
 
 
 def _daily_scope(

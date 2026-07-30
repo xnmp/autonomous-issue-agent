@@ -697,12 +697,18 @@ def _launcher_pids(name: str) -> list[int]:
     result: list[int] = []
     for pid in _pgrep("point-at.sh"):
         argv = _pid_argv(pid)
-        if any(
-            os.path.basename(argument) == "point-at.sh"
-            and index + 1 < len(argv)
-            and argv[index + 1] == name
-            for index, argument in enumerate(argv)
-        ):
+        direct = (
+            len(argv) >= 2
+            and os.path.basename(argv[0]) == "point-at.sh"
+            and argv[1] == name
+        )
+        interpreted = (
+            len(argv) >= 3
+            and os.path.basename(argv[0]) in {"bash", "sh"}
+            and os.path.basename(argv[1]) == "point-at.sh"
+            and argv[2] == name
+        )
+        if direct or interpreted:
             result.append(pid)
     return result
 

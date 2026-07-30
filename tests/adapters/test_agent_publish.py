@@ -23,15 +23,18 @@ from issue_agent.domain.events import (
 class Remote:
     def __init__(self):
         self.head = "abc123"
-        self.branch = "issue-42"
+        self.branch = "fix/42-issue"
         self.remote = ""
         self.pr = ""
         self.pr_state = ""
         self.pr_head = ""
+        self.pr_base = ""
+        self.pr_auto_merge = False
         self.effects = []
         self.crash_after_push = False
         self.intervene_before_push = ""
         self.create_pr_head = ""
+        self.arm_after_push = False
 
     def run(self, argv, _cwd):
         if argv == ("git", "rev-parse", "HEAD"):
@@ -58,13 +61,18 @@ class Remote:
             if self.remote != expected:
                 return CommandResult(1, "", "stale remote lease")
             self.remote = argv[-1].split(":", 1)[0]
+            if self.arm_after_push:
+                self.pr_auto_merge = True
             if self.crash_after_push:
                 raise KeyboardInterrupt
             return CommandResult(0, "pushed\n")
         if argv[:3] == ("gh", "pr", "list"):
             output = (
                 f'[{{"number":42,"headRefOid":"{self.pr_head or self.head}",'
-                f'"state":"{self.pr_state}","url":"{self.pr}"}}]'
+                f'"baseRefName":"{self.pr_base or "dev"}",'
+                f'"state":"{self.pr_state}","url":"{self.pr}",'
+                f'"autoMergeRequest":'
+                f'{"{}" if self.pr_auto_merge else "null"}}}]'
                 if self.pr and self.pr_state == "OPEN"
                 else "[]"
             )
@@ -74,7 +82,16 @@ class Remote:
             self.pr = "https://example.test/pull/42"
             self.pr_state = "OPEN"
             self.pr_head = self.create_pr_head or self.head
+            self.pr_base = argv[argv.index("--base") + 1]
             return CommandResult(0, self.pr + "\n")
+        if argv[:3] == ("gh", "pr", "close"):
+            self.effects.append(argv)
+            self.pr_state = "CLOSED"
+            return CommandResult(0, "closed\n")
+        if argv[:3] == ("gh", "pr", "merge") and "--disable-auto" in argv:
+            self.effects.append(argv)
+            self.pr_auto_merge = False
+            return CommandResult(0, "disabled\n")
         raise AssertionError(argv)
 
 
@@ -88,6 +105,7 @@ def broker(tmp_path: Path, remote: Remote) -> AgentPublicationBroker:
     return AgentPublicationBroker(
         store(tmp_path),
         repository="o/r",
+        base_branch="dev",
         owner="o/r:fix",
         run=remote.run,
     )
@@ -108,12 +126,13 @@ def test_push_is_committed_then_receipted(tmp_path):
     publisher = AgentPublicationBroker(
         control,
         repository="o/r",
+        base_branch="dev",
         owner="o/r:fix",
         run=remote.run,
     )
 
     result = publisher.publish(
-        ("git", "push", "origin", "HEAD:issue-42"),
+        ("git", "push", "origin", "HEAD:fix/42-issue"),
         str(tmp_path),
     )
 
@@ -122,9 +141,9 @@ def test_push_is_committed_then_receipted(tmp_path):
     assert remote.effects[0] == (
         "git",
         "push",
-        "--force-with-lease=refs/heads/issue-42:",
+        "--force-with-lease=refs/heads/fix/42-issue:",
         "origin",
-        "abc123:refs/heads/issue-42",
+        "abc123:refs/heads/fix/42-issue",
     )
     assert control.pending_commands() == ()
     with control._connect() as db:
@@ -152,6 +171,69 @@ def test_push_is_committed_then_receipted(tmp_path):
     ] == ["pending", "executing", "succeeded"]
 
 
+def test_push_disables_and_verifies_existing_auto_merge_first(tmp_path):
+    remote = Remote()
+    remote.remote = "prior"
+    remote.pr = "https://example.test/pull/42"
+    remote.pr_state = "OPEN"
+    remote.pr_head = "prior"
+    remote.pr_auto_merge = True
+    publisher = broker(tmp_path, remote)
+
+    result = publisher.publish(
+        ("git", "push", "origin", "HEAD:fix/42-issue"),
+        str(tmp_path),
+    )
+
+    assert result.code == 0
+    assert remote.pr_auto_merge is False
+    assert remote.effects[0][:3] == ("gh", "pr", "merge")
+    assert "--disable-auto" in remote.effects[0]
+    assert remote.effects[1][:2] == ("git", "push")
+
+
+def test_push_postcondition_revokes_arm_that_appears_during_update(tmp_path):
+    remote = Remote()
+    remote.remote = "prior"
+    remote.pr = "https://example.test/pull/42"
+    remote.pr_state = "OPEN"
+    remote.pr_head = "prior"
+    remote.arm_after_push = True
+    publisher = broker(tmp_path, remote)
+
+    result = publisher.publish(
+        ("git", "push", "origin", "HEAD:fix/42-issue"),
+        str(tmp_path),
+    )
+
+    assert result.code == 0
+    assert remote.pr_auto_merge is False
+    assert any("--disable-auto" in effect for effect in remote.effects)
+
+
+def test_crash_recovery_revokes_arm_before_receipting_push(tmp_path):
+    remote = Remote()
+    remote.remote = "prior"
+    remote.pr = "https://example.test/pull/42"
+    remote.pr_state = "OPEN"
+    remote.pr_head = "prior"
+    remote.arm_after_push = True
+    remote.crash_after_push = True
+    publisher = broker(tmp_path, remote)
+
+    with pytest.raises(KeyboardInterrupt):
+        publisher.publish(
+            ("git", "push", "origin", "HEAD:fix/42-issue"),
+            str(tmp_path),
+        )
+
+    remote.crash_after_push = False
+    remote.arm_after_push = False
+    assert publisher.drain_pending_commands() == 1
+    assert remote.pr_auto_merge is False
+    assert any("--disable-auto" in effect for effect in remote.effects)
+
+
 def test_crash_after_push_is_reconciled_without_duplicate_effect(tmp_path):
     remote = Remote()
     remote.crash_after_push = True
@@ -159,13 +241,14 @@ def test_crash_after_push_is_reconciled_without_duplicate_effect(tmp_path):
     publisher = AgentPublicationBroker(
         control,
         repository="o/r",
+        base_branch="dev",
         owner="o/r:fix",
         run=remote.run,
     )
 
     with pytest.raises(KeyboardInterrupt):
         publisher.publish(
-            ("git", "push", "origin", "HEAD:issue-42"), str(tmp_path)
+            ("git", "push", "origin", "HEAD:fix/42-issue"), str(tmp_path)
         )
     assert len(remote.effects) == 1
     assert control.pending_commands()[0].state == "executing"
@@ -183,11 +266,12 @@ def test_pending_push_refuses_an_intervening_remote_revision(tmp_path):
     publisher = AgentPublicationBroker(
         control,
         repository="o/r",
+        base_branch="dev",
         owner="o/r:fix",
         run=remote.run,
     )
     command = publisher._command(
-        ("git", "push", "origin", "HEAD:issue-42"),
+        ("git", "push", "origin", "HEAD:fix/42-issue"),
         str(tmp_path),
     )
     pending = control.enqueue_command(command)
@@ -206,11 +290,12 @@ def test_replayed_push_uses_captured_sha_after_local_head_moves(tmp_path):
     publisher = AgentPublicationBroker(
         control,
         repository="o/r",
+        base_branch="dev",
         owner="o/r:fix",
         run=remote.run,
     )
     command = publisher._command(
-        ("git", "push", "origin", "HEAD:issue-42"),
+        ("git", "push", "origin", "HEAD:fix/42-issue"),
         str(tmp_path),
     )
     pending = control.enqueue_command(command)
@@ -220,7 +305,7 @@ def test_replayed_push_uses_captured_sha_after_local_head_moves(tmp_path):
 
     assert result.code == 0
     assert remote.remote == "abc123"
-    assert remote.effects[0][-1] == "abc123:refs/heads/issue-42"
+    assert remote.effects[0][-1] == "abc123:refs/heads/fix/42-issue"
 
 
 def test_push_exact_lease_preserves_concurrent_remote_update(tmp_path):
@@ -230,7 +315,7 @@ def test_push_exact_lease_preserves_concurrent_remote_update(tmp_path):
     publisher = broker(tmp_path, remote)
 
     result = publisher.publish(
-        ("git", "push", "origin", "HEAD:issue-42"),
+        ("git", "push", "origin", "HEAD:fix/42-issue"),
         str(tmp_path),
     )
 
@@ -242,10 +327,9 @@ def test_push_exact_lease_preserves_concurrent_remote_update(tmp_path):
         ).fetchone()[0] == "unknown_outcome"
 
 
-def test_pr_body_file_is_snapshotted_before_command_commit(tmp_path):
+def test_pr_literal_body_is_snapshotted_before_command_commit(tmp_path):
     remote = Remote()
-    body = tmp_path / "body.md"
-    body.write_text("Fixes #42\n")
+    remote.remote = remote.head
     publisher = broker(tmp_path, remote)
 
     result = publisher.publish(
@@ -257,24 +341,91 @@ def test_pr_body_file_is_snapshotted_before_command_commit(tmp_path):
             "dev",
             "--title",
             "Fix",
-            "--body-file",
-            "body.md",
+            "--body",
+            "Fixes #42\n",
         ),
         str(tmp_path),
     )
 
     assert result.code == 0
     effect = remote.effects[0]
-    assert "--body-file" not in effect
     assert effect[effect.index("--body") + 1] == "Fixes #42\n"
     assert effect[effect.index("--repo") + 1] == "github.com/o/r"
-    assert effect[effect.index("--head") + 1] == "issue-42"
+    assert effect[effect.index("--head") + 1] == "fix/42-issue"
+    assert effect[effect.index("--base") + 1] == "dev"
+
+
+@pytest.mark.parametrize(
+    "file_args",
+    (
+        ("--body-file", "/proc/1/environ"),
+        ("--body-file=../secret",),
+        ("--template", "/tmp/secret.md"),
+        ("--template=../secret.md",),
+        ("-T/tmp/secret.md",),
+        ("-F", "/proc/1/environ"),
+        ("-F../secret",),
+        ("--editor",),
+        ("--web",),
+    ),
+)
+def test_pr_create_rejects_all_file_reading_options(
+    tmp_path, file_args
+) -> None:
+    remote = Remote()
+    remote.remote = remote.head
+    publisher = broker(tmp_path, remote)
+
+    with pytest.raises(ValueError, match="file-reading options"):
+        publisher.publish(
+            (
+                "gh",
+                "pr",
+                "create",
+                "--title",
+                "Fix",
+                *file_args,
+            ),
+            str(tmp_path),
+        )
+
+    assert remote.effects == []
+
+
+def test_pr_create_replaces_child_selected_base_with_approved_base(
+    tmp_path,
+) -> None:
+    remote = Remote()
+    remote.remote = remote.head
+    publisher = broker(tmp_path, remote)
+
+    result = publisher.publish(
+        (
+            "gh",
+            "pr",
+            "create",
+            "--base",
+            "main",
+            "--title",
+            "Fix",
+            "--body",
+            "Fixes #42",
+        ),
+        str(tmp_path),
+    )
+
+    assert result.code == 0
+    effect = remote.effects[0]
+    assert effect.count("--base") == 1
+    assert effect[effect.index("--base") + 1] == "dev"
+    assert "main" not in effect
 
 
 def test_closed_pr_with_same_head_does_not_satisfy_open_pr_publication(
     tmp_path,
 ) -> None:
     remote = Remote()
+    remote.remote = remote.head
     remote.pr = "https://example.test/pull/41"
     remote.pr_state = "CLOSED"
     publisher = broker(tmp_path, remote)
@@ -302,6 +453,7 @@ def test_closed_pr_with_same_head_does_not_satisfy_open_pr_publication(
 
 def test_pr_create_exit_zero_requires_matching_remote_head(tmp_path):
     remote = Remote()
+    remote.remote = remote.head
     remote.create_pr_head = "different-head"
     publisher = broker(tmp_path, remote)
 
@@ -322,6 +474,8 @@ def test_pr_create_exit_zero_requires_matching_remote_head(tmp_path):
 
     assert result.code != 0
     assert remote.pr_head == "different-head"
+    assert remote.pr_state == "CLOSED"
+    assert any(effect[:3] == ("gh", "pr", "close") for effect in remote.effects)
     with publisher.store._connect() as db:
         command_state = db.execute(
             "SELECT state FROM lifecycle_commands"
@@ -330,20 +484,47 @@ def test_pr_create_exit_zero_requires_matching_remote_head(tmp_path):
             "SELECT status FROM effect_receipts"
         ).fetchone()[0]
     assert (command_state, receipt_state) == (
-        "retryable_failure",
-        "retryable_failure",
+        "permanent_failure",
+        "permanent_failure",
     )
+
+
+def test_existing_same_head_pr_on_wrong_base_is_not_adopted(tmp_path):
+    remote = Remote()
+    remote.remote = remote.head
+    remote.pr = "https://example.test/pull/42"
+    remote.pr_state = "OPEN"
+    remote.pr_head = remote.head
+    remote.pr_base = "main"
+    publisher = broker(tmp_path, remote)
+
+    with pytest.raises(ValueError, match="different revision or base"):
+        publisher.publish(
+            (
+                "gh",
+                "pr",
+                "create",
+                "--title",
+                "Fix",
+                "--body",
+                "Fixes #42",
+            ),
+            str(tmp_path),
+        )
+
+    assert remote.effects == []
 
 
 @pytest.mark.parametrize(
     "args",
     (
-        ("git", "push", "--dry-run", "origin", "HEAD:issue-42"),
+        ("git", "push", "--dry-run", "origin", "HEAD:fix/42-issue"),
         ("git", "push", "--force", "origin", "HEAD:main"),
-        ("git", "push", "--force-with-lease", "origin", "HEAD:issue-42"),
+        ("git", "push", "--force-with-lease", "origin", "HEAD:fix/42-issue"),
         ("git", "push", "--tags", "origin"),
-        ("git", "push", "upstream", "HEAD:issue-42"),
-        ("git", "push", "origin", "other:issue-42"),
+        ("git", "push", "upstream", "HEAD:fix/42-issue"),
+        ("git", "push", "origin", "other:fix/42-issue"),
+        ("git", "push", "origin", "HEAD:fix/99-other"),
     ),
 )
 def test_broker_rejects_non_effects_and_broad_or_protected_pushes(
@@ -356,31 +537,37 @@ def test_broker_rejects_non_effects_and_broad_or_protected_pushes(
 @pytest.mark.parametrize(
     "args",
     (
+            (
+                "gh",
+                "pr",
+                "create",
+                "--repo",
+                "attacker/other",
+                "--title",
+                "Fix",
+                "--body",
+                "Fixes #42",
+            ),
         (
             "gh",
             "pr",
             "create",
-            "--repo",
-            "attacker/other",
-            "--title",
-            "Fix",
-        ),
+                "--head=attacker:branch",
+                "--title",
+                "Fix",
+                "--body",
+                "Fixes #42",
+            ),
         (
             "gh",
             "pr",
             "create",
-            "--head=attacker:branch",
-            "--title",
-            "Fix",
-        ),
-        (
-            "gh",
-            "pr",
-            "create",
-            "-Rattacker/other",
-            "--title",
-            "Fix",
-        ),
+                "-Rattacker/other",
+                "--title",
+                "Fix",
+                "--body",
+                "Fixes #42",
+            ),
     ),
 )
 def test_broker_rejects_cross_repository_pull_request_scope(tmp_path, args):
@@ -399,13 +586,14 @@ def test_broker_rejects_origin_for_a_different_repository(tmp_path):
     publisher = AgentPublicationBroker(
         store(tmp_path),
         repository="o/r",
+        base_branch="dev",
         owner="o/r:fix",
         run=run,
     )
 
     with pytest.raises(ValueError, match="configured repository"):
         publisher.publish(
-            ("git", "push", "origin", "HEAD:issue-42"),
+            ("git", "push", "origin", "HEAD:fix/42-issue"),
             str(tmp_path),
         )
 
@@ -419,13 +607,14 @@ def test_broker_uses_configured_host_not_child_gh_host(
     publisher = AgentPublicationBroker(
         store(tmp_path),
         repository="o/r",
+        base_branch="dev",
         host="github.com",
         owner="o/r:fix",
         run=remote.run,
     )
 
     assert publisher.publish(
-        ("git", "push", "origin", "HEAD:issue-42"),
+        ("git", "push", "origin", "HEAD:fix/42-issue"),
         str(tmp_path),
     ).code == 0
 
@@ -445,6 +634,7 @@ def test_broker_rejects_child_selected_remote_host(
     publisher = AgentPublicationBroker(
         store(tmp_path),
         repository="o/r",
+        base_branch="dev",
         host="github.com",
         owner="o/r:fix",
         run=run,
@@ -452,7 +642,7 @@ def test_broker_rejects_child_selected_remote_host(
 
     with pytest.raises(ValueError, match="configured repository"):
         publisher.publish(
-            ("git", "push", "origin", "HEAD:issue-42"),
+            ("git", "push", "origin", "HEAD:fix/42-issue"),
             str(tmp_path),
         )
 
@@ -467,6 +657,14 @@ def test_macos_process_environment_reads_compact_authority_bundle(
         "ISSUE_AGENT_RUN_ID": "run",
         "ISSUE_AGENT_CONFIG_VERSION": "cfg",
         "ISSUE_AGENT_GITHUB_HOST": "github.example",
+        "ISSUE_AGENT_BASE_BRANCH": "dev",
+        "ISSUE_AGENT_PUBLICATION_CWD": "/work/issue-42",
+        "ISSUE_AGENT_PUBLICATION_BRANCH": "fix/42-issue",
+        "ISSUE_AGENT_PUBLICATION_ISSUE": "42",
+        "ISSUE_AGENT_PUBLICATION_KIND": "RESOLVE",
+        "ISSUE_AGENT_GIT_BIN": "/usr/bin/git",
+        "ISSUE_AGENT_GH_BIN": "/usr/bin/gh",
+        "ISSUE_AGENT_EXEC_PATH": "/usr/bin:/bin",
     }
     encoded = base64.urlsafe_b64encode(
         json.dumps(authority, separators=(",", ":")).encode()
@@ -519,6 +717,14 @@ def test_cli_uses_supervised_ancestor_authority_not_child_environment(
         "ISSUE_AGENT_RUN_ID": "run-1",
         "ISSUE_AGENT_CONFIG_VERSION": "cfg-1",
         "ISSUE_AGENT_GITHUB_HOST": "github.com",
+        "ISSUE_AGENT_BASE_BRANCH": "dev",
+        "ISSUE_AGENT_PUBLICATION_CWD": str(tmp_path),
+        "ISSUE_AGENT_PUBLICATION_BRANCH": "fix/42-issue",
+        "ISSUE_AGENT_PUBLICATION_ISSUE": "42",
+        "ISSUE_AGENT_PUBLICATION_KIND": "RESOLVE",
+        "ISSUE_AGENT_GIT_BIN": "/usr/bin/git",
+        "ISSUE_AGENT_GH_BIN": "/usr/bin/gh",
+        "ISSUE_AGENT_EXEC_PATH": "/usr/bin:/bin",
     }
 
     class TrustedStore:
@@ -548,11 +754,16 @@ def test_cli_uses_supervised_ancestor_authority_not_child_environment(
     monkeypatch.setattr(agent_publish, "AgentPublicationBroker", Publisher)
 
     with pytest.raises(SystemExit) as stopped:
-        agent_publish.main(["git", "push", "origin", "HEAD:issue-42"])
+        agent_publish.main(["git", "push", "origin", "HEAD:fix/42-issue"])
 
     assert stopped.value.code == 0
     assert captured["path"] == trusted["ISSUE_AGENT_CONTROL_DB"]
     assert captured["repository"] == "o/r"
     assert captured["host"] == "github.com"
+    assert captured["base_branch"] == "dev"
     assert captured["owner"] == "o/r:fix:deployment"
     assert captured["config_version"] == "cfg-1"
+    assert captured["authorized_cwd"] == str(tmp_path)
+    assert captured["authorized_branch"] == "fix/42-issue"
+    assert captured["expected_issue"] == 42
+    assert captured["git_binary"] == "/usr/bin/git"

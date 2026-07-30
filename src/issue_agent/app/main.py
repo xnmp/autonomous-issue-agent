@@ -315,9 +315,8 @@ def build_role(role: str, env: dict | None = None):
         # runtime-tagged sessions: a FIXER_RUNTIME flip must cold-start resume
         # legs, not feed the new runtime the old runtime's session ids.
         store = Store(cfg.state_dir, runtime=cfg.fixer_runtime)
-        # Arm-at-creation probe (once per boot): only a POSITIVELY verified
-        # review+checks gate on the base branch activates early arming — see
-        # FixConfig.arm_on_open for why no knob can force this on. Probed here
+        # Server merge-gate probe (once per boot): only a positively verified
+        # strict review+checks gate permits automated merging. Probed here
         # (not in from_env) because it needs the gateway; a flip of the repo's
         # protection therefore takes effect at the next daemon restart.
         if cfg.arm_on_open != "0":
@@ -327,18 +326,17 @@ def build_role(role: str, env: dict | None = None):
                 active = False
                 sys.stderr.write(
                     f"{role}: arm-on-open inactive — branch protection could "
-                    f"not be verified ({exc}); auto-merge will wait for "
-                    "APPROVE + green CI\n"
+                    f"not be verified ({exc}); automated merge is disabled\n"
                 )
             cfg = dataclasses.replace(cfg, arm_on_open_active=active)
             sys.stderr.write(
                 f"{role}: arm-on-open "
                 + (
                     f"ACTIVE — {cfg.base_branch} protection verifiably requires "
-                    "review + status checks; auto-merge arms at PR creation\n"
+                    "review + status checks + an up-to-date head\n"
                     if active else
                     f"inactive — {cfg.base_branch} protection does not gate "
-                    "merging; auto-merge arms after APPROVE + green CI\n"
+                    "review, checks, and base freshness; automated merge disabled\n"
                 )
             )
         return _probed(

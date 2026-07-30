@@ -246,6 +246,7 @@ def _with_accounting(
         journal.events.line_limit,
         owner_id=_owner_identity(cfg, role),
         github_host=os.environ.get("GH_HOST", "github.com"),
+        approved_base_branch=cfg.base_branch,
     )
 
 
@@ -341,6 +342,7 @@ def _effects(
     repository: str,
     identity: str,
     config_version: str,
+    base_branch: str,
 ) -> EffectRecovery:
     executor = GitHubEffectExecutor(
         gateway,
@@ -352,6 +354,7 @@ def _effects(
     publications = AgentPublicationBroker(
         control,
         repository=repository,
+        base_branch=base_branch,
         host=os.environ.get("GH_HOST", "github.com"),
         config_version=config_version,
         identity=f"{identity}:publication",
@@ -1712,6 +1715,7 @@ def build_fix_daemon(
         repository=cfg.repo,
         identity=owner_id,
         config_version=cfg.config_version,
+        base_branch=cfg.base_branch,
     )
     executor = Executor(
         gateway, remove_worktree=worktrees.remove, log=_log("fix"),
@@ -2031,6 +2035,7 @@ def build_review_daemon(
         repository=cfg.repo,
         identity=owner_id,
         config_version=cfg.config_version,
+        base_branch=cfg.base_branch,
     )
     executor = Executor(
         gateway,
@@ -2256,6 +2261,7 @@ def build_steward_daemon(
         repository=cfg.repo,
         identity=owner_id,
         config_version=cfg.config_version,
+        base_branch=cfg.base_branch,
     )
     executor = Executor(
         gateway,

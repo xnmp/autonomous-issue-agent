@@ -384,6 +384,18 @@ def test_publication_authority_requires_active_reservation_and_live_lease(
     request = dataclasses.replace(
         _request(1),
         owner_id="o/r:fix:deployment",
+        dispatch_id=json.dumps(
+            {
+                "repository": "o/r",
+                "role": "fix",
+                "kind": "RESOLVE",
+                "number": 1,
+                "issue": 1,
+                "cwd": "/work/issue-1",
+                "publication_branch": "fix/1-test",
+            },
+            sort_keys=True,
+        ),
     )
     assert store.reserve(request).admitted
     assert store.publication_authority(request.run_id) is None
@@ -402,6 +414,7 @@ def test_publication_authority_requires_active_reservation_and_live_lease(
     assert authority is not None
     assert authority.repository == "o/r"
     assert authority.owner_id == "o/r:fix:deployment"
+    assert authority.branch == "fix/1-test"
     assert authority.pgid == pgid
 
 

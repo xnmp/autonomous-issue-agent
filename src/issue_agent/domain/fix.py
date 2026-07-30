@@ -79,14 +79,10 @@ class FixConfig:
     auto_rebase_conflicts: bool = True
     max_rebase_retries: int = 3
     max_resolve_retries: int = 3
-    # Arm auto-merge at PR CREATION instead of after APPROVE+CI. Only ever set
-    # True after the adapter has POSITIVELY verified that the base branch's
-    # protection requires ≥1 approving review AND ≥1 status check (see
-    # GitHubGateway.merge_gate_protection) — with the gate held server-side,
-    # arming early just delegates the same ordering to GitHub, which then merges
-    # the instant review+checks land, with no daemon on the critical path. On an
-    # unprotected base this flag would mean merging unreviewed work, which is
-    # why no env knob can force it True without the probe.
+    # Historical name for the boot-verified server merge gate. True only when
+    # branch protection requires review, status checks, and an up-to-date head.
+    # The strict server check closes the base-advance race that an expected-head
+    # merge alone cannot bind.
     arm_on_open: bool = False
     # SEPARATE, HIGHER ceiling for sessions that die BEFORE returning a result
     # (review C3/D2c). "Infra deaths are not attempts" stays true for every
@@ -540,11 +536,12 @@ def prs_needing_resume(
 
 def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
     """Port of watcher-lib.sh:maybe_automerge gating. Requires: AUTO_MERGE on, a
-    branch the harness itself authored, no existing marker, three-identity mode
-    (solo has no independent approver → 422 on self-merge), and then EITHER
-    arm_on_open (verified branch protection holds the review+CI gate server-side)
-    OR an APPROVED review by a DISTINCT actor with CI ok|none."""
-    if not cfg.auto_merge:
+    branch the harness itself authored, a boot-verified strict server merge
+    gate, three-identity mode, an exact-head approval by a distinct actor, and
+    exact-head CI ok|none."""
+    if not cfg.auto_merge or not cfg.arm_on_open:
+        return False
+    if not pr.head_ref_oid:
         return False
     # Merge ONLY our own work. The reviewer deliberately adopts unlabelled PRs
     # (REVIEW_ADOPT_UNLABELED, on by default) so one that bypassed the pipeline is
@@ -560,8 +557,6 @@ def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
     # "Fixes #N" in its body. The branch name is the thing only the fixer creates.
     if not is_governed_branch(pr.head_ref_name):
         return False
-    if pr.number in state.automerge_enabled:
-        return False
     if cfg.identity_mode != IdentityMode.THREE:
         return False
     # A CONFLICTING PR cannot merge no matter what gh is told — arming it just
@@ -572,6 +567,8 @@ def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
     # first poll after the branch is mergeable again.
     if pr.is_conflicting():
         return False
+    if pr.merge_state.upper() != "CLEAN":
+        return False
     # arm_on_open: branch protection (verified at boot) already refuses the
     # merge until a review approves and the required checks pass, so waiting
     # for them HERE only adds daemon latency — a busy fixer (one synchronous
@@ -579,10 +576,13 @@ def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
     # of an unrelated resolve (2026-07-27). Arm immediately; GitHub holds the
     # gate. The review/CI preconditions below remain the whole gate when the
     # base is unprotected.
-    if cfg.arm_on_open:
-        return True
     review = latest_other_review(pr.reviews, cfg.fix_bot)
-    if review is None or review.state != REVIEW_APPROVED:
+    if (
+        review is None
+        or review.state != REVIEW_APPROVED
+        or not review.commit_id
+        or review.commit_id != pr.head_ref_oid
+    ):
         return False
     # known=False → UNKNOWN, which is deliberately NOT in the allowed pair: an
     # unread checks fetch must never arm a merge (#48). Honest NONE (a repo with
@@ -605,6 +605,8 @@ def should_update_branch(pr: PRView, cfg: FixConfig) -> bool:
     does not re-fire every poll."""
     if not cfg.auto_merge or cfg.identity_mode != IdentityMode.THREE:
         return False
+    if not pr.head_ref_oid:
+        return False
     # Same containment as should_automerge: this PUSHES to the PR's branch, which
     # is not something to do to a PR the harness did not author.
     if not is_governed_branch(pr.head_ref_name):
@@ -612,7 +614,12 @@ def should_update_branch(pr: PRView, cfg: FixConfig) -> bool:
     if not pr.is_behind():
         return False
     review = latest_other_review(pr.reviews, cfg.fix_bot)
-    if review is None or review.state != REVIEW_APPROVED:
+    if (
+        review is None
+        or review.state != REVIEW_APPROVED
+        or not review.commit_id
+        or review.commit_id != pr.head_ref_oid
+    ):
         return False
     return ci_state(
         pr.checks, cfg.ci_ignore_checks, known=pr.checks_known
@@ -1385,9 +1392,13 @@ def decide_fix(
         if pr_lifecycle(pr).is_blocked:
             continue  # a human owns the next move — don't arm anything
         if should_automerge(pr, state, cfg):
-            actions.append(EnableAutoMerge(pr.number, cfg.merge_method))
+            actions.append(
+                EnableAutoMerge(
+                    pr.number, cfg.merge_method, pr.head_ref_oid
+                )
+            )
         if should_update_branch(pr, cfg):
-            actions.append(UpdateBranch(pr.number))
+            actions.append(UpdateBranch(pr.number, pr.head_ref_oid))
 
     # 4) Merged/closed PRs → cleanup (lock-free).
     for pr in world.prs:

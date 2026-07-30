@@ -117,11 +117,14 @@ def _action_spec(action: Action) -> tuple[str, str, int | None, dict]:
         }
     if isinstance(action, EnableAutoMerge):
         return "enable_auto_merge", "pr", action.pr, {
-            "type": "enable_auto_merge", "pr": action.pr, "method": action.method,
+            "type": "enable_auto_merge",
+            "pr": action.pr,
+            "method": action.method,
+            "head": action.head,
         }
     if isinstance(action, UpdateBranch):
         return "update_branch", "pr", action.pr, {
-            "type": "update_branch", "pr": action.pr,
+            "type": "update_branch", "pr": action.pr, "head": action.head,
         }
     if isinstance(action, RerunFailedChecks):
         return "rerun_failed_checks", "pr", action.pr, {
@@ -208,7 +211,9 @@ class MissingEffectExecutor:
     def execute(self, _action: Action) -> bool:
         raise RuntimeError("durable effect executor is not configured")
 
-    def submit_review(self, _pr: int, _event: str, _body: str) -> bool:
+    def submit_review(
+        self, _pr: int, _event: str, _body: str, _expected_head: str
+    ) -> bool:
         raise RuntimeError("durable effect executor is not configured")
 
     def reconcile(self, _action: Action) -> bool | None:
@@ -297,10 +302,14 @@ class Executor:
             raise RuntimeError("dispatch handler is already bound")
         self._run_agent = run_agent
 
-    def submit_review(self, pr: int, event: str, body: str) -> bool:
+    def submit_review(
+        self, pr: int, event: str, body: str, expected_head: str
+    ) -> bool:
         if self._effect_executor is None:
             raise RuntimeError("review effect executor is not configured")
-        return self._effect_executor.submit_review(pr, event, body)
+        return self._effect_executor.submit_review(
+            pr, event, body, expected_head
+        )
 
     def _describe(self, action: Action) -> str:
         """Human-readable one-liner for the action being applied."""

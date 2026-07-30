@@ -48,6 +48,7 @@ def pr(number: int, *label_names: str, **kw) -> PRView:
     # fixer's "only drive my own PRs" gate treats a builder PR as ours unless a test
     # overrides author= to exercise the human-PR path.
     kw.setdefault("author", "fix-bot")
+    kw.setdefault("merge_state", "CLEAN")
     return PRView(number=number, **kw)
 
 

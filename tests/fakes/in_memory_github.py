@@ -5,7 +5,7 @@ from dataclasses import replace
 from issue_agent.adapters.github import GhUnavailable
 from issue_agent.domain.labels import Label
 from issue_agent.domain.refs import issue_from_branch
-from issue_agent.domain.world import IssueView, PRView
+from issue_agent.domain.world import IssueView, PRView, PullRequestDiff
 
 
 class InMemoryGitHub:
@@ -54,7 +54,12 @@ class InMemoryGitHub:
     ) -> PRView:
         del mergeability, checks
         self._maybe_fail("get_pr")
-        return self.prs[number]
+        pr = self.prs[number]
+        return replace(
+            pr,
+            head_ref_oid=pr.head_ref_oid or "head-sha",
+            base_ref_oid=pr.base_ref_oid or "base-sha",
+        )
 
     def pr_for_issue(self, issue: int) -> int | None:
         self._maybe_fail("pr_for_issue")
@@ -69,9 +74,11 @@ class InMemoryGitHub:
             return None
         return view.closing_issue or issue_from_branch(view.head_ref_name)
 
-    def pr_diff(self, pr: int) -> str:
+    def pr_diff(
+        self, pr: int, base_oid: str, head_oid: str
+    ) -> PullRequestDiff:
         self._maybe_fail("pr_diff")
-        return "diff text"
+        return PullRequestDiff(base_oid, head_oid, "diff text")
 
     def has_label(self, kind: str, number: int, label: str) -> bool:
         views = self.issues if kind == "issue" else self.prs
@@ -93,7 +100,7 @@ class InMemoryGitHub:
     def has_review(self, pr: int, event: str, body: str, head: str) -> bool:
         return (pr, event, body, head) in self.submitted_reviews
 
-    def is_auto_merge_enabled_or_merged(
+    def is_expected_head_merged(
         self, pr: int, expected_head: str
     ) -> bool:
         current = self.prs.get(pr)

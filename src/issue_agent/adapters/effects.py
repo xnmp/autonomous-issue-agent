@@ -53,8 +53,8 @@ class IssueStateVerifier(Protocol):
 
 
 @runtime_checkable
-class AutoMergeVerifier(Protocol):
-    def is_auto_merge_enabled_or_merged(
+class PullRequestMergeVerifier(Protocol):
+    def is_expected_head_merged(
         self, pr: int, expected_head: str
     ) -> bool: ...
 
@@ -131,27 +131,21 @@ class ImmediateGitHubEffectExecutor:
                 _TARGET[action.target], action.number, action.body
             )
         if isinstance(action, EnableAutoMerge):
-            head = self.gateway.get_pr(
-                action.pr, mergeability=False, checks=False
-            ).head_ref_oid
-            if not head:
+            if not action.head:
                 raise UnknownEffectOutcome(
                     f"pr:{action.pr}: expected revision is unavailable"
                 )
             return bool(
                 self.gateway.enable_auto_merge(
-                    action.pr, action.method, head
+                    action.pr, action.method, action.head
                 )
             )
         if isinstance(action, UpdateBranch):
-            head = self.gateway.get_pr(
-                action.pr, mergeability=False, checks=False
-            ).head_ref_oid
-            if not head:
+            if not action.head:
                 raise UnknownEffectOutcome(
                     f"pr:{action.pr}: expected revision is unavailable"
                 )
-            return bool(self.gateway.update_branch(action.pr, head))
+            return bool(self.gateway.update_branch(action.pr, action.head))
         if isinstance(action, RerunFailedChecks):
             return self.gateway.rerun_failed_checks(action.pr)
         if isinstance(action, EscalateCiPending):
@@ -181,13 +175,19 @@ class ImmediateGitHubEffectExecutor:
             )
         return GitHubEffectExecutor._apply(self, action)
 
-    def submit_review(self, pr: int, event: str, body: str) -> bool:
-        head = self.gateway.get_pr(
+    def submit_review(
+        self, pr: int, event: str, body: str, expected_head: str
+    ) -> bool:
+        if not expected_head:
+            raise UnknownEffectOutcome(f"pr:{pr}: review head is unavailable")
+        current = self.gateway.get_pr(
             pr, mergeability=False, checks=False
         ).head_ref_oid
-        if not head:
-            raise UnknownEffectOutcome(f"pr:{pr}: review head is unavailable")
-        return bool(self.gateway.submit_review(pr, event, body, head))
+        if current != expected_head:
+            return False
+        return bool(
+            self.gateway.submit_review(pr, event, body, expected_head)
+        )
 
     def reconcile(self, action: Action) -> bool | None:
         return GitHubEffectExecutor._reconcile(self, action)
@@ -335,13 +335,17 @@ class GitHubEffectExecutor:
         )
         return outcome
 
-    def submit_review(self, pr: int, event: str, body: str) -> bool:
-        head = self.gateway.get_pr(
-            pr, mergeability=False, checks=False
-        ).head_ref_oid
-        if not head:
+    def submit_review(
+        self, pr: int, event: str, body: str, expected_head: str
+    ) -> bool:
+        if not expected_head:
             raise UnknownEffectOutcome(f"pr:{pr}: review head is unavailable")
-        payload = {"pr": pr, "event": event, "body": body, "head": head}
+        payload = {
+            "pr": pr,
+            "event": event,
+            "body": body,
+            "head": expected_head,
+        }
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         digest = hashlib.sha256(f"submit-review:{encoded}".encode()).hexdigest()
         command = LifecycleCommand(
@@ -349,7 +353,7 @@ class GitHubEffectExecutor:
             f"github:{digest}",
             CommandKind.SUBMIT_REVIEW,
             f"pr:{pr}",
-            head,
+            expected_head,
             payload,
             self.config_version,
             self.repository,
@@ -582,10 +586,10 @@ class GitHubEffectExecutor:
             if (
                 command is None
                 or not command.expected_revision
-                or not isinstance(self.gateway, AutoMergeVerifier)
+                or not isinstance(self.gateway, PullRequestMergeVerifier)
             ):
                 return None
-            return self.gateway.is_auto_merge_enabled_or_merged(
+            return self.gateway.is_expected_head_merged(
                 action.pr, command.expected_revision
             )
         if isinstance(action, UpdateBranch):
@@ -767,9 +771,24 @@ def action_from_command(command: LifecycleCommand) -> Action:
             str(payload.get("comment", "")),
         )
     if command.kind is CommandKind.ENABLE_AUTO_MERGE:
-        return EnableAutoMerge(int(payload["pr"]), str(payload["method"]))
+        return EnableAutoMerge(
+            int(payload["pr"]),
+            str(payload["method"]),
+            str(
+                payload.get("head")
+                or command.expected_revision
+                or ""
+            ),
+        )
     if command.kind is CommandKind.UPDATE_BRANCH:
-        return UpdateBranch(int(payload["pr"]))
+        return UpdateBranch(
+            int(payload["pr"]),
+            str(
+                payload.get("head")
+                or command.expected_revision
+                or ""
+            ),
+        )
     if command.kind is CommandKind.RERUN_CHECKS:
         return RerunFailedChecks(int(payload["pr"]), str(payload["head"]))
     if command.kind is CommandKind.ADD_DEPENDENCY:
@@ -798,7 +817,19 @@ def _command_identity(action: Action) -> tuple[CommandKind, str]:
 
 
 def _expected_revision(action: Action) -> str | None:
-    return action.head if isinstance(action, (RerunFailedChecks, EscalateCiPending)) else None
+    return (
+        action.head
+        if isinstance(
+            action,
+            (
+                EnableAutoMerge,
+                UpdateBranch,
+                RerunFailedChecks,
+                EscalateCiPending,
+            ),
+        )
+        else None
+    )
 
 
 def _jsonable(value: object) -> Any:

@@ -109,7 +109,7 @@ def test_close_issue():
 
 def test_enable_auto_merge():
     ex, gw, _, _ = _exec()
-    ex.execute(EnableAutoMerge(100, "squash"))
+    ex.execute(EnableAutoMerge(100, "squash", "head-100"))
     assert gw.calls == [("automerge", 100, "squash")]
 
 
@@ -122,7 +122,7 @@ def test_enable_auto_merge_persists_the_armed_marker():
     )
     marked = []
     ex = Executor(gw, mark_automerge=marked.append)
-    ex.execute(EnableAutoMerge(100, "squash"))
+    ex.execute(EnableAutoMerge(100, "squash", "head-100"))
     assert marked == [100]
 
 
@@ -138,14 +138,14 @@ def test_enable_auto_merge_failure_withholds_the_marker():
     gw.automerge_ok = False
     marked = []
     ex = Executor(gw, mark_automerge=marked.append)
-    ex.execute(EnableAutoMerge(100, "squash"))
+    ex.execute(EnableAutoMerge(100, "squash", "head-100"))
     assert gw.calls == [("automerge", 100, "squash")]
     assert marked == []
 
 
 def test_update_branch():
     ex, gw, _, _ = _exec()
-    ex.execute(UpdateBranch(100))
+    ex.execute(UpdateBranch(100, "head-100"))
     assert gw.calls == [("update_branch", 100)]
 
 

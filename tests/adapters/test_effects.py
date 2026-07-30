@@ -1,8 +1,9 @@
-from issue_agent.adapters.control_store import SQLiteControlStore
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
+from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.effects import GitHubEffectExecutor, command_for_action
 from issue_agent.domain.actions import (
     AddDependency,
@@ -74,7 +75,7 @@ class Gateway:
         self.auto_merge.add(pr)
         return True
 
-    def is_auto_merge_enabled_or_merged(self, pr, expected_head):
+    def is_expected_head_merged(self, pr, expected_head):
         return pr in self.auto_merge and self.head == expected_head
 
     def update_branch(self, pr, expected_head):
@@ -217,7 +218,7 @@ def test_new_review_identity_reconciles_matching_legacy_review_before_submit(
         identity="o/r:review:deployment-2",
     )
 
-    assert adopted.submit_review(7, "APPROVE", "looks good")
+    assert adopted.submit_review(7, "APPROVE", "looks good", "head-1")
     assert gateway.calls == []
     assert store.pending_commands() == ()
 
@@ -309,7 +310,7 @@ def test_pr_relabel_captures_and_enforces_head_revision(tmp_path) -> None:
 
 def test_ambiguous_auto_merge_is_reconciled_without_duplicate(tmp_path) -> None:
     executor, gateway, store = _executor(tmp_path)
-    action = EnableAutoMerge(7, "squash")
+    action = EnableAutoMerge(7, "squash", "head-1")
     original = gateway.enable_auto_merge
 
     def committed_then_lost(*args):
@@ -332,7 +333,7 @@ def test_ambiguous_branch_update_uses_original_revision_to_reconcile(
     tmp_path,
 ) -> None:
     executor, gateway, store = _executor(tmp_path)
-    action = UpdateBranch(7)
+    action = UpdateBranch(7, "head-1")
     original = gateway.update_branch
 
     def committed_then_lost(*args):
@@ -474,14 +475,14 @@ def test_ambiguous_review_and_same_body_on_new_head_are_distinct(
 
     gateway.submit_review = committed_then_lost
     try:
-        executor.submit_review(7, "APPROVE", "looks good")
+        executor.submit_review(7, "APPROVE", "looks good", "head-1")
     except RuntimeError:
         pass
     gateway.submit_review = original
 
-    assert executor.submit_review(7, "APPROVE", "looks good")
+    assert executor.submit_review(7, "APPROVE", "looks good", "head-1")
     gateway.head = "head-2"
-    assert executor.submit_review(7, "APPROVE", "looks good")
+    assert executor.submit_review(7, "APPROVE", "looks good", "head-2")
 
     assert gateway.calls == [
         ("review", 7, "APPROVE", "looks good", "head-1"),
@@ -493,8 +494,11 @@ def test_ambiguous_review_and_same_body_on_new_head_are_distinct(
 @pytest.mark.parametrize(
     ("action", "race_attribute"),
     (
-        (EnableAutoMerge(7, "squash"), "advance_before_auto_merge"),
-        (UpdateBranch(7), "advance_before_update"),
+        (
+            EnableAutoMerge(7, "squash", "head-1"),
+            "advance_before_auto_merge",
+        ),
+        (UpdateBranch(7, "head-1"), "advance_before_update"),
     ),
 )
 def test_pr_mutation_server_guard_rejects_check_to_write_head_race(
@@ -522,7 +526,9 @@ def test_review_server_guard_rejects_check_to_write_head_race(
     executor, gateway, store = _executor(tmp_path)
     gateway.advance_before_review = "head-2"
 
-    assert executor.submit_review(7, "APPROVE", "looks good") is False
+    assert executor.submit_review(
+        7, "APPROVE", "looks good", "head-1"
+    ) is False
 
     assert gateway.calls == []
     with store._connect() as db:
@@ -545,6 +551,35 @@ def test_boot_drain_executes_committed_pending_command(tmp_path) -> None:
     assert executor.drain_pending_commands() == 1
 
     assert gateway.calls == [("comment", "issue", 4, "recover me")]
+    assert store.pending_commands() == ()
+
+
+@pytest.mark.parametrize(
+    "action",
+    (
+        EnableAutoMerge(7, "squash", "head-1"),
+        UpdateBranch(7, "head-1"),
+    ),
+)
+def test_boot_drain_rehydrates_legacy_pr_command_head(
+    tmp_path, action
+) -> None:
+    executor, gateway, store = _executor(tmp_path)
+    command = command_for_action(
+        action,
+        repository="o/r",
+        executor_identity="o/r:fix",
+    )
+    legacy_payload = {
+        key: value
+        for key, value in command.payload.items()
+        if key != "head"
+    }
+    store.enqueue_command(replace(command, payload=legacy_payload))
+
+    assert executor.drain_pending_commands() == 1
+    assert gateway.calls
+    assert gateway.calls[0][-1] == "head-1"
     assert store.pending_commands() == ()
 
 

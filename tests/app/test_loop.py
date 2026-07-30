@@ -81,7 +81,7 @@ def test_tick_executes_cheap_actions_before_agent_dispatches():
         lambda w: [
             Relabel(Target.ISSUE, 500, Label.AI_READY, Label.AI_WORKING),
             RunAgent(AgentKind.RESOLVE, 500),
-            EnableAutoMerge(537, "squash"),
+            EnableAutoMerge(537, "squash", "head-537"),
             RunAgent(AgentKind.REBASE, 534),
         ],
         ex,
@@ -126,7 +126,7 @@ def test_observation_and_lifecycle_continue_while_the_only_dispatch_slot_is_busy
         "fix",
         lambda: observations.append(len(observations) + 1) or WorldState(),
         lambda _world: [
-            EnableAutoMerge(24, "squash"),
+            EnableAutoMerge(24, "squash", "head-24"),
             RunAgent(AgentKind.RESOLVE, 7),
         ],
         executor,
