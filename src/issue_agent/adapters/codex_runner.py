@@ -508,7 +508,7 @@ def codex_cost_usd(
     rate_in = max(float(cost_per_mtok_in or 0.0), 0.0)
     rate_out = max(float(cost_per_mtok_out or 0.0), 0.0)
     rate_cached_in = max(
-        float(rate_in if cost_per_mtok_cached_in is None else cost_per_mtok_cached_in or 0.0),
+        float(rate_in / 10 if cost_per_mtok_cached_in is None else cost_per_mtok_cached_in or 0.0),
         0.0,
     )
     if rate_in <= 0 and rate_out <= 0:
@@ -642,7 +642,7 @@ def rates_with_cache_for_model(
     )
     key = (model or "").strip().casefold()
     if cached_table is None:
-        return rate_in, rate_out, rate_in
+        return rate_in, rate_out, rate_in / 10
     for name, rate_cached_in in cached_table:
         if name == key:
             return rate_in, rate_out, rate_cached_in
