@@ -231,7 +231,9 @@ exception replaces its contents with declarations for that issue only.
 Open-PR push revalidation derives its checks from checkout `HEAD`, so every
 explicit source ref must resolve to that same commit. To push another commit,
 check it out first or use `HEAD:<destination>`; the gate fails closed rather
-than applying `HEAD` evidence to different content.
+than applying `HEAD` evidence to different content. Bulk `--all` / `--mirror`
+pushes are rejected because they cannot bind every updated branch to that
+evidence; push explicit refspecs instead.
 
 Late-heartbeat reconciliation requires both the wall threshold and a positive
 wall-minus-active-monotonic gap, distinguishing a machine suspension from an
