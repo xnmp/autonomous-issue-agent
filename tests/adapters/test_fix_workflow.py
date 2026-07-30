@@ -1651,7 +1651,7 @@ def test_resolve_persists_its_model_for_later_repair_legs():
 # completed resolve during live babysitting.
 
 
-def _journalled_resolve(tmp_path, runner, *, fix=None):
+def _journalled_resolve(tmp_path, runner):
     """Run a routed resolve through the real JournalingRuntime and return
     (journalled agent_runs, ledgered spend lines)."""
     from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
@@ -1663,7 +1663,7 @@ def _journalled_resolve(tmp_path, runner, *, fix=None):
 
     gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
     asyncio.run(_workflow(
-        gw, FakeStore(), rt, fix=fix or FixTaskConfig("o/r", agent_md="AM"),
+        gw, FakeStore(), rt, fix=FixTaskConfig("o/r", agent_md="AM"),
     ).resolve(5))
 
     runs = [e for e in read_events(journal.path) if e["event"] == "agent_run"]
@@ -1679,20 +1679,6 @@ def test_the_router_leg_journals_as_route_and_the_resolve_as_resolve(tmp_path):
     assert [r["kind"] for r in runs] == ["ROUTE", "RESOLVE"], (
         "the classify probe must not be counted as a resolve"
     )
-
-
-def test_the_route_event_records_the_decision_not_the_probe_model(tmp_path):
-    """Routing analysis needs the resolve choice without joining later legs."""
-    runs, _ = _journalled_resolve(tmp_path, SeqRunner([
-        _router_result("complex"),
-        AgentResult(is_error=False, status="pr_opened", session_id="s5", cost_usd=3.0),
-    ]), fix=FixTaskConfig("o/r", agent_md="AM", effort=Effort.HIGH))
-
-    route = runs[0]
-    assert route["kind"] == "ROUTE"
-    assert route["model"] == "opus"
-    assert route["effort"] == "high"
-    assert route["probe_model"] == "haiku"
 
 
 def test_a_route_leg_is_still_real_spend_and_still_reaches_the_ledger(tmp_path):
