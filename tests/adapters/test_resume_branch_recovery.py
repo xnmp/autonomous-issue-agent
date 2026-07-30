@@ -53,8 +53,10 @@ def test_resume_recreates_removed_worktree_on_original_branch_with_blocked_commi
     ))
     gw = FakeGateway(issues={issue: iss}, pr_for_issue={})
     runner = FakeRunner(AgentResult(is_error=False, status="blocked", session_id="s5"))
+    # This represents a blocked leg created before branch persistence shipped.
+    # Recovery must discover the retained branch rather than fall back to the
+    # title-derived name, which is now different after the issue was retitled.
     store = Store(str(tmp_path / "state"))
-    store.save_branch(issue, original_branch)
 
     asyncio.run(_workflow(gw, store, runner, worktrees, fix_bot="fix-bot").resume(issue))
 
@@ -64,6 +66,18 @@ def test_resume_recreates_removed_worktree_on_original_branch_with_blocked_commi
     assert subprocess.run(
         ["git", "show-ref", "--verify", "--quiet", "refs/heads/fix/5-issue"], cwd=repo,
     ).returncode == 1
+
+
+def test_resolve_persists_branch_for_future_reply_recovery(tmp_path):
+    issue = 5
+    title = "Preserve blocked work"
+    gw = FakeGateway(issues={issue: IssueView(issue, title=title, body="body")}, pr_for_issue={})
+    store = Store(str(tmp_path / "state"))
+    runner = FakeRunner(AgentResult(is_error=False, status="blocked", session_id="s5"))
+
+    asyncio.run(_workflow(gw, store, runner).resolve(issue))
+
+    assert store.get_branch(issue) == "fix/5-preserve-blocked-work"
 
 
 def test_branch_for_issue_recovers_a_unique_retained_branch():
