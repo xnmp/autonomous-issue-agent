@@ -640,7 +640,11 @@ class FixWorkflow:
         if self.cfg.author_tests_split and pr_existing is None:
             await self.resolve_split(issue, human_reply=reply)
             return
-        branch = self.gateway.get_pr(pr_existing).head_ref_name if pr_existing else f"fix/{issue}-issue"
+        branch = (
+            self.gateway.get_pr(pr_existing).head_ref_name
+            if pr_existing
+            else f"fix/{issue}-{slugify(iss.title) or 'issue'}"
+        )
         cwd = self._ensure_cwd(issue, branch)
         fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
         session_id = self.store.get_session(issue)

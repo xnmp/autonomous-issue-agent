@@ -287,7 +287,8 @@ def test_resume_recreates_removed_worktree_on_original_branch_with_blocked_commi
     original_cwd = Path(worktrees.ensure(issue, original_branch))
     (original_cwd / "blocked.txt").write_text("blocked work\n")
     git("add", "blocked.txt", cwd=original_cwd)
-    blocked_commit = git("commit", "-qm", "blocked work", cwd=original_cwd)
+    git("commit", "-qm", "blocked work", cwd=original_cwd)
+    blocked_commit = git("rev-parse", "HEAD", cwd=original_cwd)
     git("worktree", "remove", str(original_cwd), "--force")
 
     iss = IssueView(issue, title=title, body="body", comments=(
