@@ -162,6 +162,12 @@ def _configured_non_head_source(tmp_path: Path) -> Path:
     return repo
 
 
+def _configured_matching_refs(tmp_path: Path) -> Path:
+    repo = _bulk_push_with_unvalidated_branch(tmp_path)
+    _git(repo, "config", "remote.origin.push", ":")
+    return repo
+
+
 CASES = (
     Case("declared", "pr", _valid, _pr_argv(), True,
          env={"TEST_CMD": "test -f impl.py"}),
@@ -214,6 +220,10 @@ CASES = (
          _configured_non_head_source, ["push", "origin"],
          False, env={"TEST_CMD": "test -f impl.py"}, open_pr="13",
          reason_contains="source ref"),
+    Case("configured_matching_refspec_cannot_hide_unvalidated_branches", "push",
+         _configured_matching_refs, ["push", "origin"],
+         False, env={"TEST_CMD": "test -f impl.py"}, open_pr="13",
+         reason_contains="matching push"),
     Case("command_local_config_cannot_hide_non_head_source", "push",
          _non_head_source,
          [

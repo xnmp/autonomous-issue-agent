@@ -566,6 +566,14 @@ def _push_gate(push_argv: list[str], ctx: GateContext) -> list[str]:
             "wildcard push refspecs cannot be validated against one checkout "
             "HEAD; push explicit HEAD:<destination> refspecs instead"
         ]
+    if any(
+        refspec.removeprefix("+") == ":"
+        for refspec in parsed.candidate_refspecs
+    ):
+        return [
+            "matching push refspecs cannot be validated against one checkout "
+            "HEAD; push explicit HEAD:<destination> refspecs instead"
+        ]
 
     argv_refspecs = governor_policy.push_refspecs(push_argv)
     argv_destinations = governor_policy.push_destination_refs(push_argv)
@@ -580,6 +588,11 @@ def _push_gate(push_argv: list[str], ctx: GateContext) -> list[str]:
     if any("*" in refspec for refspec in configured_values):
         return [
             "wildcard push refspecs cannot be validated against one checkout "
+            "HEAD; push explicit HEAD:<destination> refspecs instead"
+        ]
+    if any(refspec.removeprefix("+") == ":" for refspec in configured_values):
+        return [
+            "matching push refspecs cannot be validated against one checkout "
             "HEAD; push explicit HEAD:<destination> refspecs instead"
         ]
     configured = governor_policy.configured_push_refspecs(configured_values)

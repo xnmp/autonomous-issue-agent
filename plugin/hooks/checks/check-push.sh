@@ -91,6 +91,8 @@ prc_check_push_destination() {
 
 prc_add_push_refspec() {
   local body="${1#+}" source destination
+  [ "$body" != ":" ] \
+    || fail "matching push refspecs cannot be validated against one checkout HEAD; push explicit HEAD:<destination> refspecs instead"
   case "$body" in
     *'*'*) fail "wildcard push refspecs cannot be validated against one checkout HEAD; push explicit HEAD:<destination> refspecs instead" ;;
   esac
