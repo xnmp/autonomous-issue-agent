@@ -100,6 +100,38 @@ def test_budget_timeout_and_escalation_demand_attention():
     assert {item["severity"] for item in notifications} == {"attention"}
 
 
+def test_agent_run_start_announces_each_new_dispatch():
+    events = [
+        {
+            "ts": ts(1),
+            "event": "agent_run_start",
+            "role": "fix",
+            "kind": "RESOLVE",
+            "number": 7,
+            "issue": 7,
+            "dispatch": "resolve-7",
+        },
+        {
+            "ts": ts(2),
+            "event": "agent_run_start",
+            "role": "review",
+            "kind": "REVIEW",
+            "number": 12,
+            "issue": 7,
+            "dispatch": "review-12",
+        },
+    ]
+
+    notifications = snapshots.journal_notifications(rows_for(events))
+
+    assert [(item["title"], item["detail"]) for item in notifications] == [
+        ("Issue #7 dispatched", "RESOLVE started"),
+        ("Issue #7 dispatched", "REVIEW for PR #12 started"),
+    ]
+    assert all(item["severity"] == "info" for item in notifications)
+    assert len({item["id"] for item in notifications}) == 2
+
+
 def test_unknown_and_malformed_events_fail_open_and_history_is_bounded():
     events = [
         {"ts": "not-a-time", "event": "agent_run", "issue": 7, "status": "blocked"},
