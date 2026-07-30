@@ -156,7 +156,15 @@ class ReviewWorkflow:
                 "refusing to run"
             )
             return None
-        return replace(task, cwd=self.cfg.execution_cwd)
+        # The generated hook is shared filesystem configuration, so embedding a
+        # review mode in it would let a completed review constrain a later leg.
+        # CodexRunner applies task.env only to this child process, which keeps
+        # the reviewer boundary strong without making it ambient state.
+        return replace(
+            task,
+            cwd=self.cfg.execution_cwd,
+            env={**task.env, "ISSUE_AGENT_REVIEW_READ_ONLY": "1"},
+        )
 
     async def review(self, pr: int) -> None:
         p = self.gateway.get_pr(pr)
