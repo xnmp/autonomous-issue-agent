@@ -215,12 +215,13 @@ def test_malformed_comment_author_does_not_break_human_action_projection():
     )["human_action"] == "awaiting-reply"
 
 
-def test_cleanly_blocked_leg_flags_the_row_and_is_not_a_successful_step():
+@pytest.mark.parametrize("kind", ["ADDRESS_REVIEW", "REVIEW"])
+def test_cleanly_blocked_leg_flags_the_row_and_is_not_a_successful_step(kind):
     blocked = {
         "ts": ts(minutes=20),
         "event": "agent_run",
         "role": "fix",
-        "kind": "ADDRESS_REVIEW",
+        "kind": kind,
         "number": 90,
         "issue": 7,
         "status": "blocked",
