@@ -13,6 +13,7 @@ from types import SimpleNamespace
 
 from issue_agent.adapters.agent_runner import result_to_agent_result
 from issue_agent.adapters.codex_runner import parse_codex_envelope
+from issue_agent.domain.dashboard import build_issue_rows, first_pass_verdicts, stage_for
 from issue_agent.domain.agent_task import AgentRuntime, AgentTask, McpServer, SubagentDef
 from issue_agent.domain.outcome import AgentResult, Outcome, classify_outcome
 
@@ -106,6 +107,38 @@ def test_structured_error_status_is_error_for_all_runtimes():
         assert result.status == "error"
         assert result.summary == "tool crashed"
         assert classify_outcome(result) is Outcome.ERROR
+
+
+def test_review_verdict_contract_is_shared_and_drives_dashboard_guardrails():
+    """Both runtime envelopes must expose review decisions as the common status.
+
+    The dashboard's review stages and first-pass approval guardrail consume
+    terminal journal status, not a runtime-specific structured field.
+    """
+    claude = _claude_result(
+        structured={"decision": "APPROVE", "body": "looks good"},
+    )
+    codex = _codex_result(
+        structured={"decision": "REQUEST_CHANGES", "body": "please fix this"},
+    )
+
+    assert claude.status == "APPROVE"
+    assert codex.status == "REQUEST_CHANGES"
+
+    codex_event = {
+        "event": "agent_run", "role": "review", "kind": "REVIEW",
+        "number": 125, "issue": 125, "status": codex.status,
+        "model": "gpt-5.6-sol",
+    }
+    claude_event = {
+        "event": "agent_run", "role": "review", "kind": "REVIEW",
+        "number": 126, "issue": 126, "status": claude.status,
+        "model": "claude-opus-5",
+    }
+
+    assert stage_for([codex_event]) == "changes requested"
+    assert stage_for([claude_event]) == "awaiting merge"
+    assert first_pass_verdicts(build_issue_rows([codex_event, claude_event], [])) == (1, 1)
 
 
 def test_transport_failure_without_envelope_is_error():
