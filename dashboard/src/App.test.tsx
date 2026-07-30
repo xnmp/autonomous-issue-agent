@@ -42,6 +42,21 @@ const issues = {
   warnings: [],
 };
 
+const backlogIssue = {
+  issue: 120,
+  title: "Toast notifications",
+  url: "https://github.com/o/r/issues/120",
+  body: "Important state changes",
+  labels: ["feature"],
+  recurrence: false,
+  recurrence_count: 0,
+  age_days: 0,
+  comments: 0,
+  issue_type: "feature",
+  difficulty: null,
+  impact: null,
+};
+
 function json(body: unknown): Response {
   return new Response(JSON.stringify(body), {
     status: 200,
@@ -154,9 +169,10 @@ describe("App navigation", () => {
     expect(seconds).not.toBeChecked();
   });
 
-  it("optimistically removes a promoted backlog issue and updates its tab count", async () => {
+  it("optimistically moves a promoted backlog issue into the in-flight tab", async () => {
     window.location.hash = "#/repo/demo/issues/backlog";
     let finishPromotion: (response: Response) => void = () => {};
+    let serverPromoted = false;
     const promotion = new Promise<Response>((resolve) => {
       finishPromotion = resolve;
     });
@@ -168,22 +184,24 @@ describe("App navigation", () => {
         if (path === "/api/usage") return json(usage);
         if (path.endsWith("/promote")) return promotion;
         if (path.endsWith("/issues")) {
+          if (serverPromoted) {
+            return json({
+              ...issues,
+              pending: [{
+                issue: 120,
+                title: "Toast notifications",
+                url: "https://github.com/o/r/issues/120",
+                priority: "P1",
+                labels: ["feature", "ai-ready"],
+                held: false,
+                hold_reason: null,
+                overlap: null,
+              }],
+            });
+          }
           return json({
             ...issues,
-            backlog: [{
-              issue: 120,
-              title: "Toast notifications",
-              url: "https://github.com/o/r/issues/120",
-              body: "Important state changes",
-              labels: ["feature"],
-              recurrence: false,
-              recurrence_count: 0,
-              age_days: 0,
-              comments: 0,
-              issue_type: "feature",
-              difficulty: null,
-              impact: null,
-            }],
+            backlog: [backlogIssue],
           });
         }
         return json({ rows: [], warnings: [] });
@@ -199,6 +217,49 @@ describe("App navigation", () => {
 
     await waitFor(() => expect(screen.queryByText("Toast notifications")).not.toBeInTheDocument());
     expect(screen.getByRole("tab", { name: /Backlog/ })).toHaveTextContent("0");
+    expect(screen.getByRole("tab", { name: /In flight/ })).toHaveTextContent("1");
+
+    await userEvent.click(screen.getByRole("tab", { name: /In flight/ }));
+    expect(await screen.findByText("Toast notifications")).toBeVisible();
+    expect(screen.getByText("pending")).toBeVisible();
+
+    serverPromoted = true;
     finishPromotion(json({ ok: true, detail: "promoted" }));
+    expect(await screen.findByText("P1")).toBeVisible();
+    expect(screen.getAllByText("Toast notifications")).toHaveLength(1);
+  });
+
+  it("rolls both tabs back when backlog promotion fails", async () => {
+    window.location.hash = "#/repo/demo/issues/backlog";
+    let finishPromotion: (response: Response) => void = () => {};
+    const promotion = new Promise<Response>((resolve) => {
+      finishPromotion = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input);
+        if (path === "/api/repos") return json(repos);
+        if (path === "/api/usage") return json(usage);
+        if (path.endsWith("/promote")) return promotion;
+        if (path.endsWith("/issues")) {
+          return json({ ...issues, backlog: [backlogIssue] });
+        }
+        return json({ rows: [], warnings: [] });
+      }),
+    );
+
+    render(<App />);
+
+    await screen.findByText("Toast notifications");
+    await userEvent.click(screen.getByRole("button", { name: "Promote #120 to ai-ready" }));
+    await userEvent.click(screen.getByRole("button", { name: "Promote #120" }));
+    expect(screen.getByRole("tab", { name: /In flight/ })).toHaveTextContent("1");
+
+    finishPromotion(new Response("promotion failed", { status: 500 }));
+
+    expect(await screen.findByText("Toast notifications")).toBeVisible();
+    expect(screen.getByRole("tab", { name: /Backlog/ })).toHaveTextContent("1");
+    expect(screen.getByRole("tab", { name: /In flight/ })).toHaveTextContent("0");
   });
 });

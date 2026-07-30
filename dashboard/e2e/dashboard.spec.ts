@@ -425,8 +425,12 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await page.getByRole("button", { name: "Promote #120", exact: true }).click();
   await expect(page.getByText("Toast notifications for state transitions")).toHaveCount(0);
   await expect(page.getByRole("tab", { name: /Backlog/ })).toContainText("0");
+  await expect(page.getByRole("tab", { name: /In flight/ })).toContainText("2");
 
   await page.getByRole("tab", { name: /In flight/ }).click();
+  await expect(page.getByText("Toast notifications for state transitions")).toBeVisible();
+  await expect(page.getByRole("row", { name: /#120.*pending.*feature.*ai-ready/ }))
+    .toBeVisible();
   const modelList = page.locator(".model-list").first();
   await expect(modelList.locator(".chip")).toHaveCount(3);
   await expect(modelList).toHaveCSS("flex-wrap", "wrap");
