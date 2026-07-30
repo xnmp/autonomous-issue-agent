@@ -23,6 +23,24 @@ for arg in "$@"; do
   esac
 done
 
+previous_arg=""
+for arg in "$@"; do
+  config_override=""
+  if [ "$previous_arg" = "-c" ]; then
+    config_override="$arg"
+  fi
+  case "$arg" in
+    -cremote.*.push=*) config_override="${arg#-c}" ;;
+    --config-env=remote.*.push=*) config_override="${arg#--config-env=}" ;;
+  esac
+  case "$config_override" in
+    remote.*.push=*)
+      fail "command-local remote.*.push overrides cannot be validated; use an explicit HEAD:<destination> refspec"
+      ;;
+  esac
+  previous_arg="$arg"
+done
+
 prc_check_push_destination() {
   local branch="$1"
   local source="$2"
@@ -73,6 +91,9 @@ prc_check_push_destination() {
 
 prc_add_push_refspec() {
   local body="${1#+}" source destination
+  case "$body" in
+    *'*'*) fail "wildcard push refspecs cannot be validated against one checkout HEAD; push explicit HEAD:<destination> refspecs instead" ;;
+  esac
   if printf '%s' "$body" | grep -q ':'; then
     source="${body%%:*}"
     destination="${body#*:}"
@@ -93,6 +114,7 @@ checked_out_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 sources=()
 destinations=()
 remote_seen=""
+remote_name=""
 delete_mode=""
 for arg in "$@"; do
   case "$arg" in
@@ -106,12 +128,55 @@ for arg in "$@"; do
     remote_seen=1
     case "$arg" in
       +*|*:*) prc_add_push_refspec "$arg" ;;
+      *) remote_name="$arg" ;;
     esac
     continue
   fi
   prc_add_push_refspec "$arg"
 done
 
+if [ "${#destinations[@]}" -eq 0 ]; then
+  if [ -z "$remote_name" ]; then
+    for key in \
+      "branch.${checked_out_branch}.pushRemote" \
+      "remote.pushDefault" \
+      "branch.${checked_out_branch}.remote"; do
+      remote_name=$(git config --get "$key" 2>/dev/null)
+      config_rc=$?
+      [ "$config_rc" -le 1 ] \
+        || fail "refspec-less push configuration cannot be validated; push explicit HEAD:<destination> refspecs instead"
+      [ -z "$remote_name" ] || break
+    done
+  fi
+  remote_name="${remote_name:-origin}"
+
+  mirror=$(git config --bool --get "remote.${remote_name}.mirror" 2>/dev/null)
+  config_rc=$?
+  [ "$config_rc" -le 1 ] \
+    || fail "refspec-less push configuration cannot be validated; push explicit HEAD:<destination> refspecs instead"
+  [ "$mirror" != "true" ] \
+    || fail "refspec-less push configuration cannot be validated; push explicit HEAD:<destination> refspecs instead"
+
+  configured=$(git config --get-all "remote.${remote_name}.push" 2>/dev/null)
+  config_rc=$?
+  [ "$config_rc" -le 1 ] \
+    || fail "refspec-less push configuration cannot be validated; push explicit HEAD:<destination> refspecs instead"
+  if [ "$config_rc" -eq 0 ]; then
+    while IFS= read -r configured_refspec; do
+      [ -z "$configured_refspec" ] || prc_add_push_refspec "$configured_refspec"
+    done <<< "$configured"
+  else
+    push_default=$(git config --get "push.default" 2>/dev/null)
+    config_rc=$?
+    [ "$config_rc" -le 1 ] \
+      || fail "refspec-less push configuration cannot be validated; push explicit HEAD:<destination> refspecs instead"
+    push_default="${push_default:-simple}"
+    case "$push_default" in
+      current|simple) : ;;
+      *) fail "refspec-less push configuration cannot be validated; push explicit HEAD:<destination> refspecs instead" ;;
+    esac
+  fi
+fi
 if [ "${#destinations[@]}" -eq 0 ]; then
   sources=("HEAD")
   destinations=("$checked_out_branch")

@@ -101,6 +101,9 @@ class GateContext:
     # build_gate_context. The permissive constructor default keeps isolated
     # policy tests independent of repository I/O, like the other callbacks.
     push_source_matches_head: Callable[[str], bool] = lambda _source: True
+    configured_push_refspecs: Callable[
+        [str], tuple[str, ...] | None
+    ] = lambda _remote: ()
     run_tests: Callable[[str], bool | None] = lambda c: True
     revert_and_run: Callable[[tuple[str, ...]], bool | None] = lambda impl: False
     red_must_fail: bool = True
@@ -558,9 +561,34 @@ def _push_gate(push_argv: list[str], ctx: GateContext) -> list[str]:
             "bulk push modes (--all/--mirror) cannot be validated against one "
             "checkout HEAD; push explicit HEAD:<destination> refspecs instead"
         ]
+    if any("*" in refspec for refspec in parsed.candidate_refspecs):
+        return [
+            "wildcard push refspecs cannot be validated against one checkout "
+            "HEAD; push explicit HEAD:<destination> refspecs instead"
+        ]
 
-    explicit = governor_policy.push_refspecs(push_argv)
-    explicit_destinations = governor_policy.push_destination_refs(push_argv)
+    argv_refspecs = governor_policy.push_refspecs(push_argv)
+    argv_destinations = governor_policy.push_destination_refs(push_argv)
+    configured_values = (
+        ctx.configured_push_refspecs(parsed.remote) if not argv_refspecs else ()
+    )
+    if configured_values is None:
+        return [
+            "refspec-less push configuration cannot be validated against one "
+            "checkout HEAD; push explicit HEAD:<destination> refspecs instead"
+        ]
+    if any("*" in refspec for refspec in configured_values):
+        return [
+            "wildcard push refspecs cannot be validated against one checkout "
+            "HEAD; push explicit HEAD:<destination> refspecs instead"
+        ]
+    configured = governor_policy.configured_push_refspecs(configured_values)
+    explicit = argv_refspecs if argv_destinations else configured
+    explicit_destinations = (
+        argv_destinations
+        if argv_destinations
+        else tuple(dict.fromkeys(item.destination for item in configured))
+    )
     source_by_destination = {
         item.destination: item.source for item in reversed(explicit)
     }

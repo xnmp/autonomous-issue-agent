@@ -468,6 +468,46 @@ def build_gate_context(
             and source_commit.out.strip() == head_commit.out.strip()
         )
 
+    def configured_push_refspecs(
+        explicit_remote: str,
+    ) -> tuple[str, ...] | None:
+        remote = explicit_remote
+        if not remote:
+            remote_keys = (
+                f"branch.{branch}.pushRemote",
+                "remote.pushDefault",
+                f"branch.{branch}.remote",
+            )
+            for key in remote_keys:
+                result = git(["config", "--get", key], cwd)
+                if result.code not in (0, 1):
+                    return None
+                if result.code == 0 and result.out.strip():
+                    remote = result.out.strip()
+                    break
+        if not remote:
+            remote = "origin"
+
+        mirror = git(["config", "--bool", "--get", f"remote.{remote}.mirror"], cwd)
+        if mirror.code not in (0, 1):
+            return None
+        if mirror.code == 0 and mirror.out.strip().lower() == "true":
+            return None
+
+        configured = git(
+            ["config", "--get-all", f"remote.{remote}.push"], cwd
+        )
+        if configured.code not in (0, 1):
+            return None
+        if configured.code == 0:
+            return tuple(line for line in configured.out.splitlines() if line)
+
+        push_default = git(["config", "--get", "push.default"], cwd)
+        if push_default.code not in (0, 1):
+            return None
+        mode = push_default.out.strip() if push_default.code == 0 else "simple"
+        return () if mode in ("current", "simple") else None
+
     def _default_run_tests(cmd: str) -> bool | None:
         """Run the test command via `governor.run_target_command` (env scrub +
         re-entrancy bound + process-group kill on timeout — the #63 defenses).
@@ -540,6 +580,7 @@ def build_gate_context(
         exists_at_base=exists_at_base,
         exists_at_head=exists_at_head,
         push_source_matches_head=push_source_matches_head,
+        configured_push_refspecs=configured_push_refspecs,
         run_tests=rt,
         revert_and_run=revert_and_run,
         red_must_fail=red_must_fail,

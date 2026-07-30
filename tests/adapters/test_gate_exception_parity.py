@@ -214,6 +214,16 @@ CASES = (
          _configured_non_head_source, ["push", "origin"],
          False, env={"TEST_CMD": "test -f impl.py"}, open_pr="13",
          reason_contains="source ref"),
+    Case("command_local_config_cannot_hide_non_head_source", "push",
+         _non_head_source,
+         [
+             "-c",
+             "remote.origin.push=bad-local-ref:refs/heads/fix/13-open-pr",
+             "push",
+             "origin",
+         ],
+         False, env={"TEST_CMD": "test -f impl.py"}, open_pr="13",
+         reason_contains="command-local remote"),
 )
 
 
