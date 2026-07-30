@@ -802,7 +802,7 @@ function IssueSummary({ card, open }: { card: IssueCard; open: boolean }) {
           {card.human_action ? (
             <span className={`human-action human-action-${card.human_action}`}>
               {card.human_action.replace("-", " ")}
-              {humanWait !== null ? ` · ${durationShort(humanWait)}` : ""}
+              {humanWait !== null ? ` · ${duration(humanWait, false)}` : ""}
             </span>
           ) : null}
           {secondaryFlags.length > 0 ? <FlagList flags={secondaryFlags} /> : null}

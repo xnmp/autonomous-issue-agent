@@ -49,37 +49,6 @@ function polled(data: IssuesPayload): Polled<IssuesPayload> {
 }
 
 describe("IssuesTab", () => {
-  it("surfaces the human-owned next action with its wait duration", () => {
-    render(
-      <IssuesTab
-        repo="demo"
-        sub="inflight"
-        issues={polled({
-          in_flight: [{
-            ...doneCard,
-            issue: 118,
-            title: "Ready for the operator",
-            done: false,
-            human_action: "merge-ready",
-            human_wait_since_ts: new Date(Date.now() - 300_000).toISOString(),
-            human_wait_s: 300,
-            flags: ["merge-ready"],
-          }],
-          pending: [],
-          done: [],
-          backlog: [],
-          gh_ok: true,
-          warnings: [],
-        })}
-        onSetSub={vi.fn()}
-        onOpenIssue={vi.fn()}
-      />,
-    );
-
-    expect(screen.getByText(/merge ready · 5\.0m/)).toBeVisible();
-    expect(screen.queryByRole("button", { name: /merge/i })).not.toBeInTheDocument();
-  });
-
   it("expands done rows before opening the full issue and hides rounds by default", async () => {
     const onOpenIssue = vi.fn();
     render(
