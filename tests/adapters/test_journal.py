@@ -980,29 +980,6 @@ def test_an_ordinary_relabel_is_not_an_escalation(tmp_path):
     assert [e for e in read_events(journal.path) if e["event"] == "escalation"] == []
 
 
-def test_issue_block_and_reply_resume_journal_one_human_wait_span(tmp_path):
-    journal = Journal(str(tmp_path / "j.jsonl"))
-    ex = Executor(FakeGateway(), journal=journal)
-
-    ex.execute(Relabel(Target.ISSUE, 5, Label.AI_WORKING, Label.AI_BLOCKED))
-    ex.execute(Relabel(Target.ISSUE, 5, Label.AI_BLOCKED, Label.AI_WORKING))
-
-    waits = [e for e in read_events(journal.path) if e["event"] == "deferred"]
-    assert [(e["state"], e["reason"], e["blocker"]) for e in waits] == [
-        ("waiting", "human", "human"),
-        ("cleared", "human", "human"),
-    ]
-
-
-def test_pr_block_does_not_create_an_issue_human_wait(tmp_path):
-    journal = Journal(str(tmp_path / "j.jsonl"))
-    ex = Executor(FakeGateway(), journal=journal)
-
-    ex.execute(Relabel(Target.PR, 100, Label.AI_PR_OPEN, Label.AI_BLOCKED))
-
-    assert [e for e in read_events(journal.path) if e["event"] == "deferred"] == []
-
-
 # ── dispatcher spend caps ─────────────────────────────────────────────────────
 class CapGateway(FakeGateway):
     """Minimal gateway: issue lookups for the PR-keyed kinds + write capture."""

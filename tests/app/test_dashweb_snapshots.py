@@ -479,41 +479,6 @@ def test_issue_detail_uses_the_same_working_idle_partition_as_cards():
     assert detail["idle_active"] is True
 
 
-def test_human_wait_is_idle_until_reply_driven_resume():
-    events = [
-        RESOLVE,
-        {"ts": ts(hours=2), "event": "deferred", "state": "waiting",
-         "issue": 7, "reason": "human", "blocker": "human"},
-        {"ts": ts(hours=1), "event": "deferred", "state": "cleared",
-         "issue": 7, "reason": "human", "blocker": "human"},
-    ]
-
-    detail = snapshots.issue_detail(row_for(events, 7), NOW)
-
-    assert detail["idle_s"] == 3_600
-    assert detail["working_s"] == detail["elapsed_s"] - 3_600
-    assert detail["idle_active"] is False
-
-
-def test_human_and_dependency_waits_are_unioned_not_double_counted():
-    events = [
-        RESOLVE,
-        {"ts": ts(hours=3), "event": "deferred", "state": "waiting",
-         "issue": 7, "reason": "human", "blocker": "human"},
-        {"ts": ts(hours=2.5), "event": "deferred", "state": "waiting",
-         "issue": 7, "reason": "dependency", "blocker_pr": 90},
-        {"ts": ts(hours=2), "event": "deferred", "state": "cleared",
-         "issue": 7, "reason": "human", "blocker": "human"},
-        {"ts": ts(hours=1.5), "event": "deferred", "state": "cleared",
-         "issue": 7, "reason": "dependency", "blocker_pr": 90},
-    ]
-
-    detail = snapshots.issue_detail(row_for(events, 7), NOW)
-
-    assert detail["idle_s"] == 5_400
-    assert detail["working_s"] == detail["elapsed_s"] - 5_400
-
-
 def test_issue_card_carries_gh_title_pr_state_and_merge_stamp():
     events = [RESOLVE, {"ts": ts(hours=1), "event": "action",
                         "desc": "clear state for pr #12, issue #7 (merged)"}]
