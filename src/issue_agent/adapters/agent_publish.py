@@ -339,9 +339,9 @@ class AgentPublicationBroker:
                 "--head",
                 branch,
                 "--state",
-                "all",
+                "open",
                 "--json",
-                "number,headRefOid,url",
+                "number,headRefOid,state,url",
             ),
             cwd,
         )
@@ -354,7 +354,11 @@ class AgentPublicationBroker:
             matching = [
                 row
                 for row in rows
-                if isinstance(row, dict) and row.get("headRefOid") == head
+                if (
+                    isinstance(row, dict)
+                    and row.get("headRefOid") == head
+                    and str(row.get("state") or "").upper() == "OPEN"
+                )
             ]
             if not matching:
                 return ""

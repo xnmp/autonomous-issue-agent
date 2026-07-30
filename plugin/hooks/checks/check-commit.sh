@@ -144,6 +144,13 @@ if [ "${VERIFY_RED_AT_COMMIT:-1}" != "0" ] && [ "$(commit_phase "$msg")" = "red"
         echo "Fix the test-command configuration (self-referential TEST_CMD/.harness/test-cmd): $_tc"
         exit 1
       fi
+      if [ "$_trc" -ne 0 ] \
+         && ! prc_is_confirmed_test_failure_rc "$_trc"; then
+        echo "Cannot verify red: test command exited $_trc, which is infrastructure/"
+        echo "cancellation rather than a confirmed test-failure code."
+        echo "Only GATE_TEST_FAILURE_EXIT_CODES='${GATE_TEST_FAILURE_EXIT_CODES:-1}' may provide red evidence."
+        exit 1
+      fi
       if [ "$_trc" -eq 0 ]; then
         echo "'red:' commit but the test suite PASSES ($_tc) — the new test is not"
         echo "actually failing. Write the FAILING test first, before any implementation."

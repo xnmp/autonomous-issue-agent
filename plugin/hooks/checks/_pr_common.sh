@@ -133,7 +133,7 @@ PRC_TEST_TIMEOUT_RC=124
 # tests/test_deployment_env_sanitization.sh). The deployment's FULL knob set
 # arrives dynamically via HARNESS_DEPLOY_KNOBS (written by compose-env.sh), so
 # a newly added knob is scrubbed without touching these lists.
-PRC_SCRUB_STATIC="TEST_CMD LINT_CMD TYPECHECK_CMD EDIT_CHECK_CMD ALLOW_UNTESTED RED_MUST_FAIL VERIFY_RED_AT_COMMIT BASE_BRANCH GATE_TEST_TIMEOUT_S GATE_GH_RETRY_SLEEP HARNESS_SCREENSHOTS_READ GH_APP_ID GH_APP_KEY_FILE GH_APP_INSTALL_ID TARGET_DIR AGENT_ENV"
+PRC_SCRUB_STATIC="TEST_CMD LINT_CMD TYPECHECK_CMD EDIT_CHECK_CMD ALLOW_UNTESTED RED_MUST_FAIL VERIFY_RED_AT_COMMIT BASE_BRANCH GATE_TEST_TIMEOUT_S GATE_TEST_FAILURE_EXIT_CODES GATE_GH_RETRY_SLEEP HARNESS_SCREENSHOTS_READ GH_APP_ID GH_APP_KEY_FILE GH_APP_INSTALL_ID TARGET_DIR AGENT_ENV"
 
 prc_run_test_cmd() {  # → rc; 213=recursion, 124=timeout
   local _depth="${HARNESS_GATE_DEPTH:-0}" _v _timeout="${GATE_TEST_TIMEOUT_S:-300}"
@@ -159,6 +159,21 @@ prc_run_test_cmd() {  # → rc; 213=recursion, 124=timeout
     echo "red-check: timeout command unavailable; refusing target command" >&2
     return "$PRC_TEST_TIMEOUT_RC"
   fi
+}
+
+# Does this process status mean the configured test runner observed an
+# assertion failure? The operator owns this contract; the target command never
+# inherits the knob. Invalid declarations fail closed. Timeout/spawn/signal
+# statuses are reserved and can never be opted into as red evidence.
+prc_is_confirmed_test_failure_rc() {
+  local wanted="$1" token raw="${GATE_TEST_FAILURE_EXIT_CODES:-1}" found=1
+  raw="${raw//,/ }"
+  for token in $raw; do
+    case "$token" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$token" -gt 0 ] && [ "$token" -lt 124 ] || return 1
+    [ "$token" -eq "$wanted" ] && found=0
+  done
+  return "$found"
 }
 
 # §1 — local test suite must pass (CI re-runs authoritatively, when present).
@@ -336,5 +351,7 @@ prc_check_red_fails() {  # prc_check_red_fails "<changed-file-list>"
   fi
 
   [ "$passed" = 0 ] || fail "the new test(s) still PASS with the implementation reverted — they do not exercise the change (tautological or wrong-layer test). Assert on the observable behaviour the change produces, not on a constant that is always true. New test file(s): ${new_tests[*]}"
+  prc_is_confirmed_test_failure_rc "$_rrc" \
+    || fail "red-test verification exited $_rrc, which is infrastructure/cancellation rather than a confirmed test-failure code. Only GATE_TEST_FAILURE_EXIT_CODES='${GATE_TEST_FAILURE_EXIT_CODES:-1}' may provide red evidence; fix the runner or its trusted exit-code contract."
   return 0
 }

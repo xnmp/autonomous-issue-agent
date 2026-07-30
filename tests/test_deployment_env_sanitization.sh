@@ -32,7 +32,8 @@ echo "scrub lists in sync (python + 2 bash copies)"
 env \
   TEST_CMD=true LINT_CMD=true TYPECHECK_CMD=true EDIT_CHECK_CMD=true \
   ALLOW_UNTESTED=1 RED_MUST_FAIL=0 VERIFY_RED_AT_COMMIT=0 \
-  BASE_BRANCH=wrong-base GATE_TEST_TIMEOUT_S=1 GATE_GH_RETRY_SLEEP=0 \
+  BASE_BRANCH=wrong-base GATE_TEST_TIMEOUT_S=1 \
+  GATE_TEST_FAILURE_EXIT_CODES=1 GATE_GH_RETRY_SLEEP=0 \
   GH_APP_ID='<your-app-id>' GH_APP_KEY_FILE="$scratch/missing-key" \
   GH_APP_INSTALL_ID=123 TARGET_DIR="$ROOT" AGENT_ENV="$scratch/outer.env" \
   STATE_DIR="$scratch/state" REVIEW_STATE_DIR="$scratch/review-state" \
@@ -50,6 +51,7 @@ env \
   VERIFY_RED_AT_COMMIT=0 \
   BASE_BRANCH=wrong-base \
   GATE_TEST_TIMEOUT_S=1 \
+  GATE_TEST_FAILURE_EXIT_CODES=1 \
   GATE_GH_RETRY_SLEEP=0 \
   GH_APP_ID='<your-app-id>' \
   GH_APP_KEY_FILE="$scratch/missing-key" \

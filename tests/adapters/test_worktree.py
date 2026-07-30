@@ -18,6 +18,7 @@ from issue_agent.adapters.worktree import (
     worktree_list_contains_issue,
 )
 from issue_agent.domain.gate import OpenPrLookup
+from issue_agent.domain.contracts import TestExecutionStatus as ExecutionStatus
 
 
 class FakeGit:
@@ -411,6 +412,48 @@ def test_default_run_tests_malformed_timeout_env_falls_back_to_default(tmp_path,
     monkeypatch.setenv("GATE_TEST_TIMEOUT_S", "-5")
     ctx = build_gate_context(str(tmp_path), base_branch="dev", git=_builder_git())
     assert ctx.run_tests("true") is True
+
+
+@pytest.mark.parametrize(
+    ("command", "status"),
+    (
+        ("exit 1", ExecutionStatus.TEST_FAILED),
+        ("exit 2", ExecutionStatus.INFRA_ERROR),
+        ("missing-red-test-command", ExecutionStatus.INFRA_ERROR),
+        ("kill -TERM $$", ExecutionStatus.CANCELLED),
+    ),
+)
+def test_red_test_receipt_separates_assertion_failure_from_infrastructure(
+    tmp_path, monkeypatch, command, status
+):
+    monkeypatch.delenv("GATE_TEST_FAILURE_EXIT_CODES", raising=False)
+    ctx = build_gate_context(
+        str(tmp_path),
+        base_branch="dev",
+        git=_builder_git(),
+        env_test_cmd=command,
+    )
+
+    execution = ctx.revert_and_run(("src/x.py",))
+
+    assert execution.status is status
+
+
+def test_red_test_receipt_honours_trusted_runner_failure_code_contract(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("GATE_TEST_FAILURE_EXIT_CODES", "1,2")
+    ctx = build_gate_context(
+        str(tmp_path),
+        base_branch="dev",
+        git=_builder_git(),
+        env_test_cmd="exit 2",
+    )
+
+    assert (
+        ctx.revert_and_run(("src/x.py",)).status
+        is ExecutionStatus.TEST_FAILED
+    )
 
 
 # ── open-PR probe: the push gate's precondition (review known-gap-2) ──────────

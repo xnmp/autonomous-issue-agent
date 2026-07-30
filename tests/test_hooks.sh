@@ -9,7 +9,8 @@ set -uo pipefail
 # deployment's controls, which can recursively run this suite through TEST_CMD.
 for gate_knob in \
   TEST_CMD LINT_CMD TYPECHECK_CMD EDIT_CHECK_CMD ALLOW_UNTESTED RED_MUST_FAIL \
-  VERIFY_RED_AT_COMMIT BASE_BRANCH GATE_TEST_TIMEOUT_S GATE_GH_RETRY_SLEEP \
+  VERIFY_RED_AT_COMMIT BASE_BRANCH GATE_TEST_TIMEOUT_S \
+  GATE_TEST_FAILURE_EXIT_CODES GATE_GH_RETRY_SLEEP \
   GH_APP_ID GH_APP_KEY_FILE GH_APP_INSTALL_ID TARGET_DIR AGENT_ENV \
   HARNESS_SCREENSHOTS_READ ${HARNESS_DEPLOY_KNOBS:-} HARNESS_DEPLOY_KNOBS; do
   unset "$gate_knob"
@@ -462,6 +463,34 @@ out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='test -f add.py' bash "$CHECKS/check-
 [ "$rc" -eq 0 ] && ok "genuine red test passes the gate" || no "genuine red test passes the gate" "rc=$rc out=${out:0:200}"
 # and the worktree was restored (impl back at HEAD)
 [ -f "$d/add.py" ] && ok "impl restored after red-check" || no "impl restored after red-check" "add.py missing"
+rm -rf "$d"
+
+# Non-assertion exits must not become trusted red evidence. The first test run
+# sees add.py and passes; only the revert simulation emits the selected
+# infrastructure/cancellation code.
+for spec in "2:runner failure" "127:command not found" "137:killed or OOM"; do
+  bad_rc="${spec%%:*}"; label="${spec#*:}"
+  d=$(setup_redfail_repo feat/20-add)
+  out=$( cd "$d" && BASE_BRANCH=dev \
+    TEST_CMD="if [ -f add.py ]; then exit 0; else exit $bad_rc; fi" \
+    bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$RF_BODY" \
+    2>&1 ); rc=$?
+  { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "infrastructure/cancellation"; } \
+    && ok "$label is not accepted as red-test evidence" \
+    || no "$label red-test classification" "rc=$rc out=${out:0:200}"
+  rm -rf "$d"
+done
+
+# A nonstandard test runner may declare its documented assertion-failure code,
+# but only through the trusted deployment environment.
+d=$(setup_redfail_repo feat/20-add)
+out=$( cd "$d" && BASE_BRANCH=dev GATE_TEST_FAILURE_EXIT_CODES='1 2' \
+  TEST_CMD='if [ -f add.py ]; then exit 0; else exit 2; fi' \
+  bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$RF_BODY" \
+  2>&1 ); rc=$?
+[ "$rc" -eq 0 ] \
+  && ok "trusted runner failure-code contract is honoured" \
+  || no "trusted runner failure-code contract" "rc=$rc out=${out:0:200}"
 rm -rf "$d"
 
 # (g) tautology: TEST_CMD always passes (even with impl reverted) → block.

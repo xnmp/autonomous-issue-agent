@@ -200,6 +200,32 @@ class TestExecutionStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+def classify_test_exit_code(
+    exit_code: int | None,
+    confirmed_failure_codes: frozenset[int] = frozenset({1}),
+) -> TestExecutionStatus:
+    """Classify a test process exit without treating every failure as evidence.
+
+    Shell infrastructure has reserved meanings that must never satisfy a
+    red-test gate: 124 is the bounded-run timeout, 125-127 are executor/spawn
+    failures, and signal exits are negative or 128+. Other non-zero codes count
+    as assertion failure only when the trusted deployment declares that code
+    as part of its test runner's contract.
+    """
+
+    if exit_code == 0:
+        return TestExecutionStatus.PASSED
+    if exit_code is None:
+        return TestExecutionStatus.INFRA_ERROR
+    if exit_code == 124:
+        return TestExecutionStatus.TIMED_OUT
+    if exit_code < 0 or exit_code >= 128:
+        return TestExecutionStatus.CANCELLED
+    if exit_code in confirmed_failure_codes and 0 < exit_code < 124:
+        return TestExecutionStatus.TEST_FAILED
+    return TestExecutionStatus.INFRA_ERROR
+
+
 @dataclass(frozen=True)
 class TestExecution:
     status: TestExecutionStatus

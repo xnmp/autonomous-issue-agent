@@ -214,8 +214,12 @@ class GitHubEffectExecutor:
             action = action_from_command(command)
         if pending.state == EffectStatus.SUCCEEDED.value:
             current = self._reconcile(action, command)
-            if current is not False:
+            if current is True:
                 return True
+            if current is None:
+                raise UnknownEffectOutcome(
+                    f"{command.command_id}: succeeded effect cannot be verified"
+                )
             pending = self.store.enqueue_command_occurrence(command)
             command = pending.command
         if pending.state == EffectStatus.PERMANENT_FAILURE.value:
@@ -252,7 +256,12 @@ class GitHubEffectExecutor:
         self.store.begin_command(command.command_id)
         started = datetime.now(timezone.utc)
         try:
-            outcome = self._apply(action)
+            self._apply(action)
+            outcome = self._reconcile(action, command)
+            if outcome is None:
+                raise UnknownEffectOutcome(
+                    f"{command.command_id}: remote postcondition is unavailable"
+                )
         except BaseException as exc:
             completed = datetime.now(timezone.utc)
             receipt = EffectReceipt(
@@ -265,9 +274,7 @@ class GitHubEffectExecutor:
             )
             self.store.record_effect(receipt)
             raise
-        retryable = isinstance(
-            action, (EnableAutoMerge, RerunFailedChecks)
-        ) and not outcome
+        retryable = not outcome
         self.store.record_effect(
             EffectReceipt(
                 command.command_id,
@@ -279,7 +286,11 @@ class GitHubEffectExecutor:
                     if retryable
                     else EffectStatus.SUCCEEDED
                 ),
-                error="GitHub did not confirm auto-merge" if retryable else None,
+                error=(
+                    "GitHub did not confirm the requested remote state"
+                    if retryable
+                    else None
+                ),
             )
         )
         return outcome
@@ -561,11 +572,12 @@ class GitHubEffectExecutor:
             return True
         if not command.target.startswith("pr:"):
             return False
-        try:
-            pr = int(command.target.split(":", 1)[1])
-            current = self.gateway.get_pr(pr).head_ref_oid
-        except Exception:
-            return False
+        pr = int(command.target.split(":", 1)[1])
+        current = self.gateway.get_pr(pr).head_ref_oid
+        if not current:
+            raise UnknownEffectOutcome(
+                f"{command.command_id}: current revision is unavailable"
+            )
         return current == command.expected_revision
 
     def _receipt(

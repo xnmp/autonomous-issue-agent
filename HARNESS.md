@@ -56,6 +56,9 @@ Important fields:
 - `FIX_BOT` must differ from `REVIEW_BOT` in three-identity mode.
 - `TEST_CMD` must terminate. The trusted executor bounds it, scrubs deployment
   controls, stamps recursion depth, and kills the full process group on timeout.
+- `GATE_TEST_FAILURE_EXIT_CODES` defaults to `1`. Add a code only when the
+  trusted test runner documents it as assertion failure; timeout, spawn, and
+  signal exits can never satisfy the red-test gate.
 - `FIXER_RUNTIME=claude|codex|glm`;
   `REVIEWER_RUNTIME=claude|codex` (Codex review supports single mode only).
 - `MAX_BUDGET_USD` / `REVIEW_BUDGET_USD` bound a leg.

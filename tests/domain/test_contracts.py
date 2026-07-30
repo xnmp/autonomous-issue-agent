@@ -16,6 +16,7 @@ from issue_agent.domain.contracts import (
     TestExecutionStatus as ExecutionStatus,
     TokenUsage,
     UsageSource,
+    classify_test_exit_code,
     daily_budget_scope,
 )
 
@@ -46,6 +47,36 @@ def test_money_major_units_use_decimal_half_up(amount, micros):
 def test_money_major_units_reject_ambiguous_values(amount):
     with pytest.raises(ValueError):
         Money.from_major("USD", amount)
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "status"),
+    (
+        (0, ExecutionStatus.PASSED),
+        (1, ExecutionStatus.TEST_FAILED),
+        (2, ExecutionStatus.INFRA_ERROR),
+        (124, ExecutionStatus.TIMED_OUT),
+        (125, ExecutionStatus.INFRA_ERROR),
+        (126, ExecutionStatus.INFRA_ERROR),
+        (127, ExecutionStatus.INFRA_ERROR),
+        (-9, ExecutionStatus.CANCELLED),
+        (137, ExecutionStatus.CANCELLED),
+        (None, ExecutionStatus.INFRA_ERROR),
+    ),
+)
+def test_test_exit_classification_requires_confirmed_failure_code(
+    exit_code, status
+):
+    assert classify_test_exit_code(exit_code) is status
+
+
+def test_trusted_runner_can_declare_a_nonstandard_failure_exit_code() -> None:
+    assert classify_test_exit_code(
+        2, frozenset({1, 2})
+    ) is ExecutionStatus.TEST_FAILED
+    assert classify_test_exit_code(
+        127, frozenset({127})
+    ) is ExecutionStatus.INFRA_ERROR
 
 
 def test_token_usage_is_disjoint_and_stderr_is_not_accounting_evidence():

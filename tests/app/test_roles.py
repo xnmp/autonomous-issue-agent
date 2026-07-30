@@ -1304,13 +1304,21 @@ def _glm_profile(tmp_path, settings: str) -> str:
     return str(d / "settings.json")
 
 
+def _role_state_env(tmp_path) -> dict[str, str]:
+    return {
+        "STATE_DIR": str(tmp_path / "state"),
+        "REVIEW_STATE_DIR": str(tmp_path / "review-state"),
+        "STEWARD_STATE_DIR": str(tmp_path / "steward-state"),
+    }
+
+
 def _glm_daemon(tmp_path, settings_file: str):
     from issue_agent.app.config import from_env
     from issue_agent.app.roles import build_fix_daemon
 
     cfg = from_env({
         "REPO": "o/r", "FIX_BOT": FIX_BOT, "FIXER_RUNTIME": "glm",
-        "GLM_SETTINGS_FILE": settings_file, "STATE_DIR": str(tmp_path / "state"),
+        "GLM_SETTINGS_FILE": settings_file, **_role_state_env(tmp_path),
     })
     return build_fix_daemon(
         cfg, _BuildableGateway(), Store(str(tmp_path / "state")), FakeWorktrees(),
@@ -1443,7 +1451,7 @@ def _codex_daemon(tmp_path, **env):
 
     cfg = from_env({
         "REPO": "o/r", "FIX_BOT": FIX_BOT, "FIXER_RUNTIME": "codex",
-        "STATE_DIR": str(tmp_path / "state"), "MAX_BUDGET_USD": "20",
+        **_role_state_env(tmp_path), "MAX_BUDGET_USD": "20",
         "AGENT_MAX_RUNTIME_SECONDS": "3600", **env,
     })
     return build_fix_daemon(
@@ -1487,7 +1495,7 @@ def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
     cfg = from_env({
         "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEWER_RUNTIME": "codex",
         "REVIEW_MODEL": "gpt-5.6-terra", "REVIEW_BUDGET_USD": "2.5",
-        "REVIEW_STATE_DIR": str(tmp_path / "review-state"),
+        **_role_state_env(tmp_path),
         "TARGET_DIR": str(tmp_path),
     })
 
@@ -1562,7 +1570,7 @@ def test_codex_reviewer_defers_hook_installation_until_dispatch(tmp_path, monkey
     )
     cfg = from_env({
         "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEWER_RUNTIME": "codex",
-        "REVIEW_STATE_DIR": str(tmp_path / "review-state"),
+        **_role_state_env(tmp_path),
         "TARGET_DIR": str(tmp_path / "target"),
     })
 
@@ -1591,7 +1599,7 @@ def test_codex_reviewer_names_its_unpriced_budget_warning(tmp_path, monkeypatch,
     monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
     cfg = from_env({
         "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEWER_RUNTIME": "codex",
-        "REVIEW_STATE_DIR": str(tmp_path / "review-state"),
+        **_role_state_env(tmp_path),
         "REVIEW_BUDGET_USD": "2.5", "CODEX_COST_PER_MTOK_IN": "0",
         "CODEX_COST_PER_MTOK_OUT": "0",
     })

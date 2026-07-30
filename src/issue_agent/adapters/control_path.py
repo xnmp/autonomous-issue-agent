@@ -18,8 +18,14 @@ def control_store_path(
         for path in state_dirs
         if path
     )
-    common = os.path.commonpath(configured) if configured else ""
-    if not common or common == os.path.sep:
+    if configured:
+        common = os.path.commonpath(configured)
+        if common == os.path.sep:
+            raise ValueError(
+                "deployment state directories must share a non-root parent "
+                "so every role opens the same control database"
+            )
+    else:
         common = (
             os.path.dirname(os.path.abspath(fallback_state_dir))
             if fallback_state_dir

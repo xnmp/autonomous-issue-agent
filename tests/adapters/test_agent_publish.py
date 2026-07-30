@@ -22,6 +22,7 @@ class Remote:
         self.branch = "issue-42"
         self.remote = ""
         self.pr = ""
+        self.pr_state = ""
         self.effects = []
         self.crash_after_push = False
 
@@ -48,14 +49,15 @@ class Remote:
         if argv[:3] == ("gh", "pr", "list"):
             output = (
                 f'[{{"number":42,"headRefOid":"{self.head}",'
-                f'"url":"{self.pr}"}}]'
-                if self.pr
+                f'"state":"{self.pr_state}","url":"{self.pr}"}}]'
+                if self.pr and self.pr_state == "OPEN"
                 else "[]"
             )
             return CommandResult(0, output)
         if argv[:3] == ("gh", "pr", "create"):
             self.effects.append(argv)
             self.pr = "https://example.test/pull/42"
+            self.pr_state = "OPEN"
             return CommandResult(0, self.pr + "\n")
         raise AssertionError(argv)
 
@@ -209,6 +211,35 @@ def test_pr_body_file_is_snapshotted_before_command_commit(tmp_path):
     assert effect[effect.index("--body") + 1] == "Fixes #42\n"
     assert effect[effect.index("--repo") + 1] == "o/r"
     assert effect[effect.index("--head") + 1] == "issue-42"
+
+
+def test_closed_pr_with_same_head_does_not_satisfy_open_pr_publication(
+    tmp_path,
+) -> None:
+    remote = Remote()
+    remote.pr = "https://example.test/pull/41"
+    remote.pr_state = "CLOSED"
+    publisher = broker(tmp_path, remote)
+
+    result = publisher.publish(
+        (
+            "gh",
+            "pr",
+            "create",
+            "--base",
+            "dev",
+            "--title",
+            "Replacement",
+            "--body",
+            "Fixes #42",
+        ),
+        str(tmp_path),
+    )
+
+    assert result.code == 0
+    assert len(remote.effects) == 1
+    assert remote.effects[0][:3] == ("gh", "pr", "create")
+    assert remote.pr_state == "OPEN"
 
 
 @pytest.mark.parametrize(

@@ -81,6 +81,8 @@ Configuration layers:
 
 `TEST_CMD` must terminate. Trusted execution scrubs harness controls, bounds
 recursion and time, and kills the process group on timeout.
+`GATE_TEST_FAILURE_EXIT_CODES` defaults to `1`; only operator-declared
+assertion-failure codes count as trusted red-test evidence.
 
 ## Operational model
 

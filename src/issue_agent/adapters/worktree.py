@@ -25,7 +25,11 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from ..domain.contracts import TestExecution, TestExecutionStatus
+from ..domain.contracts import (
+    TestExecution,
+    TestExecutionStatus,
+    classify_test_exit_code,
+)
 from ..domain.gate import OpenPrLookup, resolve_test_cmd
 from .governor import GateContext, run_target_command
 from .store import HarnessMarkers
@@ -305,6 +309,26 @@ class Worktrees:
 _DEFAULT_TEST_TIMEOUT_S = 600.0
 
 
+def _test_failure_exit_codes() -> frozenset[int]:
+    """Trusted runner exit codes that mean an asserted test failed.
+
+    One is the portable default used by pytest, unittest, npm, and simple shell
+    predicates. A deployment whose runner has a different documented contract
+    can declare space/comma-separated codes. Malformed or infrastructure codes
+    fail closed to no accepted failure codes.
+    """
+
+    raw = os.environ.get("GATE_TEST_FAILURE_EXIT_CODES", "1")
+    tokens = tuple(token for token in re.split(r"[\s,]+", raw.strip()) if token)
+    try:
+        codes = frozenset(int(token) for token in tokens)
+    except ValueError:
+        return frozenset()
+    if any(code <= 0 or code >= 124 for code in codes):
+        return frozenset()
+    return codes
+
+
 def _test_timeout_s() -> float:
     """GATE_TEST_TIMEOUT_S in seconds, read fresh on every call (not cached at
     import/build time) so a test can override it per-case and an operator's env
@@ -523,12 +547,10 @@ def build_gate_context(
 
     def revert_and_run(impl_files: tuple[str, ...]) -> TestExecution:
         """§10: drop new impl / revert modified impl to base, run the test cmd,
-        restore HEAD. Returns whether the suite PASSED with impl reverted (True
-        ⇒ tautological); None if the run was REFUSED (gate re-entry, #63) —
-        the domain fails CLOSED on None. Fail-open (return False ⇒ 'genuine
-        red') on any git error, matching prc_check_red_fails. A timed-out run
-        (see `_default_run_tests`) also surfaces as this same False/'did not
-        pass' signal — the existing fail-open contract for §10."""
+        restore HEAD, and return a typed trusted-execution receipt. Only an exit
+        code declared by the operator as an assertion-failure code becomes
+        TEST_FAILED; timeouts, signals, command-not-found, and runner failures
+        remain non-authorizing infrastructure evidence."""
         # Same precedence as every other gate rule — operator TEST_CMD first
         # (P1R-18). This site used to inline its own `markers.test_cmd() or
         # env_test_cmd` order, so §10 would have kept running the agent-written
@@ -592,26 +614,19 @@ def build_gate_context(
             rc, output = run_target_command(
                 test_cmd, cwd, _test_timeout_s(), capture=True
             )
-            if rc is None:
-                return receipt(
-                    TestExecutionStatus.INFRA_ERROR,
-                    code=127,
-                    output=output,
-                    started=started,
-                )
-            if rc == 124:
-                return receipt(
-                    TestExecutionStatus.TIMED_OUT,
-                    output=output,
-                    started=started,
-                )
+            status = classify_test_exit_code(
+                rc, _test_failure_exit_codes()
+            )
             return receipt(
-                (
-                    TestExecutionStatus.PASSED
-                    if rc == 0
-                    else TestExecutionStatus.TEST_FAILED
+                status,
+                code=(
+                    None
+                    if status in {
+                        TestExecutionStatus.TIMED_OUT,
+                        TestExecutionStatus.CANCELLED,
+                    }
+                    else 127 if rc is None else rc
                 ),
-                code=rc,
                 output=output,
                 started=started,
             )

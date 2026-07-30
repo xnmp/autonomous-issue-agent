@@ -1,6 +1,8 @@
 from issue_agent.adapters.control_store import SQLiteControlStore
 from types import SimpleNamespace
 
+import pytest
+
 from issue_agent.adapters.effects import GitHubEffectExecutor, command_for_action
 from issue_agent.domain.actions import (
     AddDependency,
@@ -249,13 +251,66 @@ def test_unconfirmed_check_rerun_stays_retryable(tmp_path) -> None:
     original = gateway.rerun_failed_checks
     gateway.rerun_failed_checks = lambda _pr: None
 
-    assert executor.execute(action) is None
+    assert executor.execute(action) is False
     assert store.pending_commands()[0].state == "retryable_failure"
 
     gateway.rerun_failed_checks = original
-    assert executor.execute(action) == 42
+    assert executor.execute(action) is True
     assert gateway.calls == [("rerun", 7)]
     assert store.pending_commands() == ()
+
+
+def test_rejected_mutation_does_not_receive_a_success_receipt(tmp_path) -> None:
+    executor, gateway, store = _executor(tmp_path)
+    action = Relabel(Target.ISSUE, 4, Label.AI_READY, Label.AI_WORKING)
+
+    def rejected(kind, number, remove, add):
+        gateway.calls.append(("relabel", kind, number, remove, add))
+
+    gateway.relabel = rejected
+
+    assert executor.execute(action) is False
+    assert store.pending_commands()[0].state == "retryable_failure"
+    with store._connect() as db:
+        status = db.execute(
+            "SELECT status FROM effect_receipts"
+        ).fetchone()[0]
+    assert status == "retryable_failure"
+
+
+def test_revision_outage_remains_pending_instead_of_permanently_failing(
+    tmp_path,
+) -> None:
+    executor, gateway, store = _executor(tmp_path)
+
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError("GitHub unavailable")
+
+    gateway.get_pr = unavailable
+
+    with pytest.raises(RuntimeError, match="unavailable"):
+        executor.execute(RerunFailedChecks(7, "head-1"))
+
+    pending = store.pending_commands()
+    assert len(pending) == 1
+    assert pending[0].state == "pending"
+
+
+def test_post_write_verification_outage_records_unknown_outcome(
+    tmp_path,
+) -> None:
+    executor, gateway, store = _executor(tmp_path)
+    action = Relabel(Target.ISSUE, 4, Label.AI_READY, Label.AI_WORKING)
+
+    def unavailable(*_args):
+        raise RuntimeError("readback unavailable")
+
+    gateway.has_label = unavailable
+
+    with pytest.raises(RuntimeError, match="readback unavailable"):
+        executor.execute(action)
+
+    assert store.pending_commands()[0].state == "unknown_outcome"
 
 
 def test_ambiguous_dependency_is_reconciled_without_duplicate(tmp_path) -> None:
