@@ -15,6 +15,14 @@ fail() { echo "Push blocked: $1"; exit 1; }
 
 base="${BASE_BRANCH:-dev}"
 
+for arg in "$@"; do
+  case "$arg" in
+    --all|--mirror)
+      fail "bulk push modes (--all/--mirror) cannot be validated against one checkout HEAD; push explicit HEAD:<destination> refspecs instead"
+      ;;
+  esac
+done
+
 prc_check_push_destination() {
   local branch="$1"
   local source="$2"

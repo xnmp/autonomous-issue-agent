@@ -552,6 +552,13 @@ def _push_gate(push_argv: list[str], ctx: GateContext) -> list[str]:
     built once from the hook's cwd. The destination is now right; the state it is
     checked against can still be the wrong worktree's. Likewise `sh -c 'git push
     …'` classifies as nothing and never reaches this gate at all (M9/R3-F8)."""
+    parsed = governor_policy.parse_push_args(push_argv)
+    if parsed.is_bulk:
+        return [
+            "bulk push modes (--all/--mirror) cannot be validated against one "
+            "checkout HEAD; push explicit HEAD:<destination> refspecs instead"
+        ]
+
     explicit = governor_policy.push_refspecs(push_argv)
     explicit_destinations = governor_policy.push_destination_refs(push_argv)
     source_by_destination = {

@@ -290,6 +290,7 @@ class PushArgs:
 
     has_force: bool
     is_delete: bool
+    is_bulk: bool
     candidate_refspecs: tuple[str, ...]
 
 
@@ -305,6 +306,7 @@ def parse_push_args(push_words: list[str]) -> PushArgs:
     args = push_words[1:] if push_words and push_words[0] == "push" else push_words
     has_force = False
     is_delete = False
+    is_bulk = False
     refspecs: list[str] = []
     for w in args:
         if w in _FORCE_PUSH_FLAGS:
@@ -312,6 +314,9 @@ def parse_push_args(push_words: list[str]) -> PushArgs:
             continue
         if w in ("--delete", "-d"):
             is_delete = True
+            continue
+        if w in ("--all", "--mirror"):
+            is_bulk = True
             continue
         if w.startswith("--"):
             continue  # other long flag (e.g. --tags, --set-upstream)
@@ -333,7 +338,12 @@ def parse_push_args(push_words: list[str]) -> PushArgs:
         r for i, r in enumerate(refspecs)
         if i != 0 or r.startswith("+") or ":" in r
     )
-    return PushArgs(has_force=has_force, is_delete=is_delete, candidate_refspecs=candidates)
+    return PushArgs(
+        has_force=has_force,
+        is_delete=is_delete,
+        is_bulk=is_bulk,
+        candidate_refspecs=candidates,
+    )
 
 
 def _parse_refspec(refspec: str, *, is_delete: bool = False) -> tuple[PushRefspec, bool]:
