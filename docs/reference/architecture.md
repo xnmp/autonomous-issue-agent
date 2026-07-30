@@ -35,7 +35,7 @@ successful delivery, preventing harness comments from self-amplifying spend.
 It also performs a free reconciliation over open PR metadata and posts one
 advisory flag when a changed path is governed by an ADR that the PR description
 does not cite. The shell governor is advisory defense-in-depth; durable
-commands, server-side revision guards, SQLite ownership, and trusted readback
+commands, captured-revision guards, SQLite ownership, and trusted readback
 are the publication authority.
 
 ## The five properties worth preserving
@@ -120,11 +120,18 @@ failure decisions; and exercised ordinary, exhausted, duplicate, and
 conflicting-receipt admissions on the pre-existing live primary database.
 Fresh databases use the v9 adoption baseline. The exact digest emitted by the
 previously shipped v8 initializer remains an accepted immutable predecessor,
-so deployed v8 databases upgrade through v9/v10/v11 without rewritten history.
+so deployed v8 databases upgrade through v9/v10/v11/v12 without rewritten
+history.
 Every migration is digest-validated and individually transactional; restart
 and concurrent-role tests interrupt both sides of every migration commit
 boundary and serialize fresh/v8/v9 boot. Machine-readable
 evidence is in `control-store-migration-evidence.json`.
+V12 removes the run-level active-dispatch uniqueness constraint: one review
+workflow may legitimately run several validator sublegs concurrently. The
+coarser paid-dispatch authority is instead the durable target/path claim made
+before the workflow starts and released on every completion, rejection, or
+cancellation path. Process liveness is snapshotted before the claim
+transaction, so OS inspection never holds SQLite's cross-process write lock.
 The bounded production-shaped boot, active SIGTERM shutdown, isolated Codex
 accounting run, cleanup receipt, and post-canary invariants are captured in
 `live-release-canary-evidence.json`.
@@ -137,6 +144,10 @@ claims remain repository/role-global, so two intentionally allowed checkouts
 cannot both admit the same target or overlapping path set. A daemon queries
 only its exact ownership scope, so sibling deployments and roles cannot cancel,
 recover, or receipt each other's work.
+At the deployment-identity cutover, the first role deployment atomically adopts
+the former `<repository>:<role>` run, lease, and nonterminal command scope.
+Reconcile-before-write then prevents a changed owner identity from duplicating
+an ambiguous legacy effect.
 
 The dashboard is a read-only projection consumer. Its canonical operational
 model is rebuilt by the pure `domain/projection.py::fold` over schema-v2
@@ -232,11 +243,23 @@ Child agent processes receive an explicit environment allowlist plus the
 selected provider credential. Supported branch/PR publication goes through the
 durable broker, whose authority is recovered from the immutable supervised
 ancestor and matched to the live SQLite run/lease instead of trusted from
-child-controlled assignments. Publication credentials are nevertheless still
+child-controlled assignments. The authority is carried as a compact bundle so
+the same ancestor check works through `/proc` on Linux and `ps` on macOS; its
+GitHub host is captured by the daemon, and both push remotes and `gh --repo`
+scope are pinned to that host rather than child-controlled `GH_HOST`.
+Publication credentials are nevertheless still
 recoverable in the child process/filesystem topology; the governor and broker
 do not constitute credential isolation. All runtimes therefore remain
 trusted-inbound-only until the trigger-gated separately privileged artifact
 publisher is deployed.
+
+Visual evidence read by the Claude SDK is recorded as a daemon-signed receipt
+bound to the exact Git HEAD and image digest. Agent-written or stale records
+have no authority. Codex PostToolUse hooks execute inside the untrusted child,
+so Codex cannot mint a trusted receipt and visual-acceptance publication fails
+closed on that runtime. Service upgrades likewise stage complete
+unit/plist-plus-private-config pairs; both systemd and launchd restore the
+previous pair if activation fails.
 
 ## Module manifest
 

@@ -887,7 +887,18 @@ def _steward_decide(
     gw = FakeGateway()
     gw.build_triage_world = lambda: WorldState()   # observe is never called here
     daemon = roles.build_steward_daemon(cfg, gw, store, FakeRunner(AgentResult(is_error=False)))
-    return daemon.decide, store
+
+    def decide(world):
+        actions = daemon.decide(world)
+        for action in actions:
+            if (
+                isinstance(action, RunAgent)
+                and daemon.dispatch_rejected is not None
+            ):
+                daemon.dispatch_rejected(action)
+        return actions
+
+    return decide, store
 
 
 def _triaged(number=30):

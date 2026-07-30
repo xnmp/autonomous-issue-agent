@@ -1,4 +1,7 @@
 import asyncio
+import base64
+import dataclasses
+import json
 import os
 
 import pytest
@@ -98,6 +101,37 @@ def test_paid_run_has_reservation_before_runtime_and_settles(tmp_path) -> None:
     blocked = asyncio.run(wrapper.run(RuntimePlan("more", max_budget_usd=4)))
     assert blocked.exit_reason is ExitReason.BUDGET_EXHAUSTED
     assert runtime.calls == 1
+
+
+def test_paid_run_carries_portable_ancestor_authority_bundle(tmp_path) -> None:
+    class CapturingRuntime(Runtime):
+        async def run(self, task):
+            self.task = task
+            return await super().run(task)
+
+    runtime = CapturingRuntime(
+        AgentResult(
+            False,
+            status="ok",
+            cost_usd=1,
+            session_id="receipt",
+            usage={"input_tokens": 100, "output_tokens": 10},
+        )
+    )
+    wrapper, _ = _wrapper(tmp_path, runtime)
+    wrapper = dataclasses.replace(wrapper, github_host="github.example")
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
+
+    asyncio.run(
+        wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2))
+    )
+
+    encoded = runtime.task.env["ISSUE_AGENT_AUTHORITY_BUNDLE"]
+    authority = json.loads(base64.urlsafe_b64decode(encoded).decode())
+    assert authority["ISSUE_AGENT_GITHUB_HOST"] == "github.example"
+    assert authority["ISSUE_AGENT_REPOSITORY"] == "o/r"
+    assert authority["ISSUE_AGENT_CONTROL_DB"].endswith("control.db")
+    assert authority["ISSUE_AGENT_RUN_ID"]
 
 
 def test_resumed_session_uses_distinct_per_leg_settlement_receipts(
@@ -418,3 +452,68 @@ def test_successful_settlement_removes_crash_recovery_evidence(tmp_path) -> None
     asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
 
     assert not os.path.exists(spend_evidence_path(evidence_dir, "known-run"))
+
+
+def test_concurrent_review_validators_share_context_without_false_dedup(
+    tmp_path,
+) -> None:
+    class ConcurrentRuntime:
+        def __init__(self):
+            self.calls = 0
+            self.ready = asyncio.Event()
+
+        async def run(self, _task):
+            self.calls += 1
+            call = self.calls
+            if call == 2:
+                self.ready.set()
+            await asyncio.wait_for(self.ready.wait(), timeout=1)
+            return AgentResult(
+                False,
+                status="ok",
+                cost_usd=1,
+                session_id=f"validator-{call}",
+            )
+
+    runtime = ConcurrentRuntime()
+    store = SQLiteControlStore(str(tmp_path / "control.db"))
+    store.initialize()
+
+    def validator(run_id: str, leg_id: str) -> AccountingRuntime:
+        wrapper = AccountingRuntime(
+            runtime,
+            store,
+            "o/r",
+            "review",
+            Money("USD", 5_000_000),
+            None,
+            None,
+            "cfg",
+            "claude",
+            BudgetPolicy(
+                {
+                    ("review", "VALIDATE_SECURITY"): Money(
+                        "USD", 2_000_000
+                    )
+                }
+            ),
+        )
+        wrapper.set_context("review", "VALIDATE_SECURITY", 7, 1)
+        wrapper.set_run_identity(run_id, leg_id)
+        return wrapper
+
+    async def run_both():
+        return await asyncio.gather(
+            validator("run-a", "finding-a").run(
+                RuntimePlan("a", max_budget_usd=2)
+            ),
+            validator("run-b", "finding-b").run(
+                RuntimePlan("b", max_budget_usd=2)
+            ),
+        )
+
+    results = asyncio.run(run_both())
+
+    assert runtime.calls == 2
+    assert [result.status for result in results] == ["ok", "ok"]
+    assert store.active_reservation_runs() == ()

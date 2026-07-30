@@ -51,7 +51,7 @@ from ..domain.events import (
     encode_event_line,
 )
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 SCHEMA_BASELINE_VERSION = 9
 LEGACY_V8_SCHEMA_DIGEST = (
     "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
@@ -458,6 +458,10 @@ ON runs(dispatch_id)
 WHERE state IN ('reserved', 'starting', 'running');
 """
 
+_MIGRATION_V12 = """
+DROP INDEX IF EXISTS runs_active_dispatch_unique;
+"""
+
 _SCHEMA_MIGRATIONS = (
     # Version 9 is the immutable adoption baseline shipped by the architectural
     # hardening cutover. Its exact source digest already exists in deployed
@@ -465,6 +469,7 @@ _SCHEMA_MIGRATIONS = (
     SchemaMigration(SCHEMA_BASELINE_VERSION, _DDL),
     SchemaMigration(10, _MIGRATION_V10),
     SchemaMigration(11, _MIGRATION_V11),
+    SchemaMigration(12, _MIGRATION_V12),
 )
 
 if tuple(migration.version for migration in _SCHEMA_MIGRATIONS) != tuple(
@@ -693,6 +698,43 @@ class SQLiteControlStore:
             raise CorruptControlStore(f"control-store integrity check failed: {exc}") from exc
         if result != "ok":
             raise CorruptControlStore(f"control-store integrity check failed: {result}")
+
+    def adopt_legacy_owner(
+        self,
+        repository: str,
+        role: str,
+        owner_id: str,
+    ) -> tuple[int, int]:
+        """Atomically move pre-deployment ownership into the first upgrader.
+
+        Older schemas scoped all same-repository role daemons as
+        ``<repository>:<role>``. The first deployment to boot after the
+        deployment-identity cutover adopts that legacy scope, preserving active
+        run recovery and reconcile-before-retry effect semantics.
+        """
+
+        legacy = f"{repository}:{role}"
+        if not repository or not role or not owner_id:
+            raise ValueError("legacy owner adoption identity is incomplete")
+        if owner_id == legacy:
+            return (0, 0)
+        with self.transaction() as db:
+            runs = db.execute(
+                "UPDATE runs SET owner_id=? WHERE owner_id=?",
+                (owner_id, legacy),
+            ).rowcount
+            db.execute(
+                "UPDATE leases SET owner_id=? WHERE owner_id=?",
+                (owner_id, legacy),
+            )
+            commands = db.execute(
+                "UPDATE lifecycle_commands SET executor_identity=? "
+                "WHERE repository=? AND executor_identity=? "
+                "AND state IN ('pending','executing','retryable_failure',"
+                "'unknown_outcome')",
+                (owner_id, repository, legacy),
+            ).rowcount
+            return (runs, commands)
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -1270,6 +1312,23 @@ class SQLiteControlStore:
             raise ProcessLookupError("dispatch owner identity is unavailable")
         target = _dispatch_claim_target(issue)
         encoded_paths = _json(sorted(paths))
+        with self._connect() as db:
+            observed = db.execute(
+                "SELECT target, owner_pid, owner_start_ticks "
+                "FROM dispatch_claims WHERE repository=? AND role=?",
+                (repository, role),
+            ).fetchall()
+        liveness = {
+            (
+                str(row["target"]),
+                int(row["owner_pid"]),
+                int(row["owner_start_ticks"]),
+            ): ProcessSupervisor.matches_identity(
+                int(row["owner_pid"]),
+                int(row["owner_start_ticks"]),
+            )
+            for row in observed
+        }
         with self.transaction() as db:
             rows = db.execute(
                 "SELECT target, owner_id, owner_pid, owner_start_ticks, "
@@ -1279,16 +1338,28 @@ class SQLiteControlStore:
             ).fetchall()
             live = []
             for row in rows:
-                if ProcessSupervisor.matches_identity(
+                claim_identity = (
+                    str(row["target"]),
                     int(row["owner_pid"]),
                     int(row["owner_start_ticks"]),
-                ):
+                )
+                # A claim created or replaced after the read-only snapshot is
+                # conservatively live. Process inspection must never run while
+                # SQLite's cross-process write lock is held.
+                if liveness.get(claim_identity, True):
                     live.append(row)
                     continue
                 db.execute(
                     "DELETE FROM dispatch_claims "
-                    "WHERE repository=? AND role=? AND target=?",
-                    (repository, role, row["target"]),
+                    "WHERE repository=? AND role=? AND target=? "
+                    "AND owner_pid=? AND owner_start_ticks=?",
+                    (
+                        repository,
+                        role,
+                        row["target"],
+                        row["owner_pid"],
+                        row["owner_start_ticks"],
+                    ),
                 )
             for row in live:
                 try:
@@ -1595,24 +1666,6 @@ class SQLiteControlStore:
                         requested,
                         request.cap,
                         "idempotent reservation" if identical else "conflicting reservation",
-                    )
-                active_dispatch = db.execute(
-                    "SELECT run_id FROM runs WHERE dispatch_id=? "
-                    "AND state IN ('reserved', 'starting', 'running')",
-                    (request.dispatch_id,),
-                ).fetchone()
-                if active_dispatch is not None:
-                    settled, reserved = self._balance(db, request.scope)
-                    return ReservationResult(
-                        AccountingDisposition.CONFLICT,
-                        None,
-                        Money(
-                            request.scope.currency,
-                            settled + reserved,
-                        ),
-                        requested,
-                        request.cap,
-                        "an active run already owns this dispatch",
                     )
                 committed = Money.zero(request.scope.currency)
                 for limit in limits:

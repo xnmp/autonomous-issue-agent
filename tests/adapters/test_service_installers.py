@@ -223,6 +223,15 @@ def test_launchd_failed_load_restores_every_known_good_plist(tmp_path):
     )
     for label in labels:
         (launch_agents / f"{label}.{checksum}.plist").write_text("known-good")
+    snapshot = (
+        home
+        / "Library/Application Support/issue-agent"
+        / f"{checksum}.env"
+    )
+    snapshot.parent.mkdir(parents=True)
+    snapshot.write_text(
+        f'REPO=""\nTARGET_DIR="{target}"\nKNOWN_GOOD=1\n'
+    )
 
     result = subprocess.run(
         ["bash", str(ROOT / "bin/install-launchd.sh")],
@@ -237,3 +246,36 @@ def test_launchd_failed_load_restores_every_known_good_plist(tmp_path):
         == "known-good"
         for label in labels
     )
+    assert "KNOWN_GOOD=1" in snapshot.read_text()
+
+
+def test_launchd_success_uses_stable_private_config_snapshot(tmp_path):
+    env, home, _uv = _environment(tmp_path, systemd=False)
+    config = Path(env["AGENT_ENV"])
+    config.write_text(
+        f'REPO="o/r"\nTARGET_DIR="{tmp_path / "target-repo"}"\n'
+        "TOKEN=secret\n"
+    )
+
+    result = subprocess.run(
+        ["bash", str(ROOT / "bin/install-launchd.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    snapshots = tuple(
+        (
+            home / "Library/Application Support/issue-agent"
+        ).glob("*.env")
+    )
+    assert len(snapshots) == 1
+    assert snapshots[0].read_text() == config.read_text()
+    assert snapshots[0].stat().st_mode & 0o777 == 0o600
+    for plist in (home / "Library/LaunchAgents").glob("*.plist"):
+        rendered = plistlib.loads(plist.read_bytes())
+        assert (
+            rendered["EnvironmentVariables"]["AGENT_ENV"]
+            == str(snapshots[0])
+        )

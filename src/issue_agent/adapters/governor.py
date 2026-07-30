@@ -22,6 +22,9 @@ The bypass core is REUSED, never re-transcribed, so the (subtle, well-tested)
 
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import os
 import re
 import signal
@@ -727,15 +730,71 @@ def make_posttooluse_hook(
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
 
-def _record_screenshot_read(state_dir: str, cwd: str, name: str) -> None:
-    """Append to the harness-owned receipt for this exact worktree."""
+def _record_screenshot_read(
+    state_dir: str,
+    cwd: str,
+    image_path: str,
+    signing_key: bytes,
+) -> None:
+    """Append a revision/content-bound receipt signed by the daemon."""
 
     from .codex_hook import evidence_receipt_path
 
+    resolved_cwd = os.path.realpath(cwd)
+    resolved_image = os.path.realpath(
+        image_path
+        if os.path.isabs(image_path)
+        else os.path.join(resolved_cwd, image_path)
+    )
+    evidence_root = os.path.join(resolved_cwd, "evidence")
+    if (
+        not signing_key
+        or os.path.commonpath((resolved_image, evidence_root))
+        != evidence_root
+    ):
+        return
+    relative_path = os.path.relpath(resolved_image, resolved_cwd)
+    head = subprocess.run(
+        ("git", "rev-parse", "HEAD"),
+        cwd=resolved_cwd,
+        text=True,
+        capture_output=True,
+        timeout=5,
+    )
+    if head.returncode != 0 or not head.stdout.strip():
+        return
+    with open(resolved_image, "rb") as image:
+        digest = hashlib.sha256(image.read()).hexdigest()
+    payload = {
+        "v": 1,
+        "head": head.stdout.strip(),
+        "path": relative_path,
+        "digest": digest,
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    record = {
+        **payload,
+        "signature": hmac.new(
+            signing_key,
+            encoded.encode(),
+            hashlib.sha256,
+        ).hexdigest(),
+    }
     path = evidence_receipt_path(state_dir, cwd)
     os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
     with open(path, "a") as f:
-        f.write(name + "\n")
+        f.write(
+            json.dumps(
+                record,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
     os.chmod(path, 0o600)
 
 
@@ -756,7 +815,7 @@ def make_read_record_hook(
             # Only evidence images count as screenshot-verification.
             if "evidence/" in low.replace(os.sep, "/") and low.endswith(_IMAGE_EXTS):
                 cwd = input_data.get("cwd", "") or os.getcwd()
-                record(cwd, os.path.basename(path))
+                record(cwd, path)
         except Exception:
             return {}  # observe-only, never wedge the agent
         return {}
@@ -887,6 +946,7 @@ def build_hooks(
     log: Callable[[str], None] = lambda _m: None,
     debug: bool = False,
     trusted_state_dir: str = "",
+    screenshot_receipt_key: bytes = b"",
 ) -> dict:
     """Convenience: the hooks dict AgentRunner wants. Always registers the
     PreToolUse(Bash) governor and a PostToolUse(Read) screenshot-read recorder;
@@ -899,10 +959,13 @@ def build_hooks(
     record = (
         (
             lambda cwd, name: _record_screenshot_read(
-                trusted_state_dir, cwd, name
+                trusted_state_dir,
+                cwd,
+                name,
+                screenshot_receipt_key,
             )
         )
-        if trusted_state_dir
+        if trusted_state_dir and screenshot_receipt_key
         else (lambda _cwd, _name: None)
     )
     post: list = [HookMatcher(

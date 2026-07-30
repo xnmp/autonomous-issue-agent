@@ -15,6 +15,7 @@ _pr_common.sh:prc_check_red_fails (revert impl to base, run tests, restore HEAD)
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -519,6 +520,7 @@ def build_gate_context(
     run_tests: Callable[[str], bool] | None = None,
     retry_sleep: Callable[[], None] = _sleep_between_probes,
     screenshots_read_path: str = "",
+    screenshots_receipt_key: bytes | None = None,
     durable_publish: bool = False,
 ) -> GateContext:
     """Gather the worktree facts the governor's gate rules need. Pure-ish: all
@@ -547,12 +549,78 @@ def build_gate_context(
     if screenshots_read_path:
         try:
             with open(screenshots_read_path, encoding="utf-8") as receipt:
+                lines = tuple(receipt.read(64 * 1024).splitlines())
+            if screenshots_receipt_key is None:
+                # Explicit compatibility surface for the shell parity harness.
+                # Production callers always supply the daemon-held signing key.
                 screenshots_read = tuple(
-                    line.strip()
-                    for line in receipt.read(64 * 1024).splitlines()
-                    if line.strip()
+                    line.strip() for line in lines if line.strip()
                 )
-            screenshots_receipt_available = True
+                screenshots_receipt_available = True
+            else:
+                head_result = git(["rev-parse", "HEAD"], cwd)
+                if head_result.code == 0 and head_result.out.strip():
+                    current_head = head_result.out.strip()
+                    verified: list[str] = []
+                    for line in lines:
+                        try:
+                            record = json.loads(line)
+                            payload = {
+                                "v": record["v"],
+                                "head": record["head"],
+                                "path": record["path"],
+                                "digest": record["digest"],
+                            }
+                            encoded = json.dumps(
+                                payload,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            )
+                            valid_signature = hmac.compare_digest(
+                                str(record["signature"]),
+                                hmac.new(
+                                    screenshots_receipt_key,
+                                    encoded.encode(),
+                                    hashlib.sha256,
+                                ).hexdigest(),
+                            )
+                            relative = str(record["path"])
+                            image_path = os.path.realpath(
+                                os.path.join(cwd, relative)
+                            )
+                            evidence_root = os.path.realpath(
+                                os.path.join(cwd, "evidence")
+                            )
+                            valid_path = (
+                                os.path.commonpath(
+                                    (image_path, evidence_root)
+                                )
+                                == evidence_root
+                            )
+                            if (
+                                not valid_signature
+                                or record["v"] != 1
+                                or record["head"] != current_head
+                                or not valid_path
+                            ):
+                                continue
+                            with open(image_path, "rb") as image:
+                                digest = hashlib.sha256(
+                                    image.read()
+                                ).hexdigest()
+                            if digest != record["digest"]:
+                                continue
+                            verified.append(os.path.basename(relative))
+                        except (
+                            KeyError,
+                            OSError,
+                            TypeError,
+                            ValueError,
+                            json.JSONDecodeError,
+                        ):
+                            continue
+                    screenshots_read = tuple(verified)
+                    screenshots_receipt_available = True
         except OSError:
             screenshots_read = ()
 

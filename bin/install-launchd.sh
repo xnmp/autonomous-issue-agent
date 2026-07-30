@@ -40,10 +40,22 @@ PLUTIL="$(command -v plutil || true)"
 # repo (cwd-relative git/worktree ops). launchd has no working dir by default, so
 # inject it into the plist. (lib.sh also cd's to TARGET_DIR as a backstop.)
 TARGET_DIR="$(set -a; . "$CONFIG"; set +a; printf '%s' "${TARGET_DIR:-}")"
+CONFIG_REPO="$(set -a; . "$CONFIG"; set +a; printf '%s' "${REPO:-}")"
 [ -n "$TARGET_DIR" ] || echo "⚠ TARGET_DIR not set in $CONFIG — watchers will run from the harness dir and create worktrees in the wrong repo. Set TARGET_DIR."
 deployment_id="$(printf '%s' "$CONFIG|$TARGET_DIR" | cksum | awk '{print $1}')"
 LOG_DIR="$HOME/Library/Logs/issue-agent/$deployment_id"
 mkdir -p "$LOG_DIR"
+SNAP_DIR="$HOME/Library/Application Support/issue-agent"
+mkdir -p "$SNAP_DIR"; chmod 700 "$SNAP_DIR"
+SNAP_CONFIG="$SNAP_DIR/$deployment_id.env"
+if [ -f "$SNAP_CONFIG" ]; then
+  SNAP_REPO="$(set -a; . "$SNAP_CONFIG"; set +a; printf '%s' "${REPO:-}")"
+  SNAP_TARGET="$(set -a; . "$SNAP_CONFIG"; set +a; printf '%s' "${TARGET_DIR:-}")"
+  if [ "$SNAP_REPO" != "$CONFIG_REPO" ] || [ "$SNAP_TARGET" != "$TARGET_DIR" ]; then
+    echo "REFUSING deployment '$deployment_id': existing snapshot belongs to REPO='$SNAP_REPO' TARGET_DIR='$SNAP_TARGET', requested REPO='$CONFIG_REPO' TARGET_DIR='$TARGET_DIR'" >&2
+    exit 2
+  fi
+fi
 STAGE="$(mktemp -d "$LA/.issue-agent-install.XXXXXX")"
 cleanup() {
   rm -rf -- "$STAGE"
@@ -57,7 +69,7 @@ for index in "${!units[@]}"; do
   src="$HARNESS_ROOT/ops/launchd/$template_label.plist"
   candidate="$STAGE/$label.plist"
   sed -e "s#@HARNESS_ROOT@#$HARNESS_ROOT#g" \
-      -e "s#@CONFIG@#$CONFIG#g" \
+      -e "s#@CONFIG@#$SNAP_CONFIG#g" \
       -e "s#@TARGET_DIR@#${TARGET_DIR:-/}#g" \
       -e "s#@LABEL@#$label#g" \
       -e "s#@LOG_DIR@#$LOG_DIR#g" \
@@ -68,10 +80,11 @@ done
 if [ "$DRY_RUN" -eq 1 ]; then
   echo "validated ${#units[@]} plist(s) for deployment '$deployment_id'"
   echo "executable: $UV_BIN"
-  echo "config: $CONFIG"
+  echo "config snapshot: $SNAP_CONFIG"
   exit 0
 fi
 
+[ ! -f "$SNAP_CONFIG" ] || cp "$SNAP_CONFIG" "$STAGE/config.previous"
 for index in "${!units[@]}"; do
   u="${units[$index]}"
   label="dev.issue-agent.$u.$deployment_id"
@@ -86,6 +99,11 @@ rollback() {
   [ "$status" -ne 0 ] || status=1
   trap - ERR INT TERM
   set +e
+  if [ -f "$STAGE/config.previous" ]; then
+    mv "$STAGE/config.previous" "$SNAP_CONFIG"
+  else
+    rm -f -- "$SNAP_CONFIG"
+  fi
   for index in "${!units[@]}"; do
     u="${units[$index]}"
     label="dev.issue-agent.$u.$deployment_id"
@@ -99,11 +117,13 @@ rollback() {
     [ ! -f "$STAGE/$index.loaded" ] \
       || launchctl load "$dst" >/dev/null 2>&1
   done
-  echo "installation failed; restored previous known-good plists" >&2
+  echo "installation failed; restored previous known-good plists and config" >&2
   exit "$status"
 }
 trap rollback ERR INT TERM
 
+install -m 600 "$CONFIG" "$STAGE/config.next"
+mv "$STAGE/config.next" "$SNAP_CONFIG"
 for index in "${!units[@]}"; do
   u="${units[$index]}"
   label="dev.issue-agent.$u.$deployment_id"

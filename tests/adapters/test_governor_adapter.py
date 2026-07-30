@@ -774,7 +774,7 @@ def test_read_record_logs_evidence_image():
         {"tool_input": {"file_path": "/wt/issue-5/evidence/tab.png"}, "cwd": "/wt/issue-5"}, "id", None
     ))
     assert out == {}                       # observe-only
-    assert recorded == [("/wt/issue-5", "tab.png")]   # basename recorded
+    assert recorded == [("/wt/issue-5", "/wt/issue-5/evidence/tab.png")]
 
 
 def test_read_record_ignores_non_image():

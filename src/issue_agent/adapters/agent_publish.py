@@ -7,9 +7,11 @@ reconciled against the remote before any retry.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import uuid
@@ -47,7 +49,9 @@ _AUTHORITY_ENV_KEYS = (
     "ISSUE_AGENT_PUBLICATION_OWNER",
     "ISSUE_AGENT_RUN_ID",
     "ISSUE_AGENT_CONFIG_VERSION",
+    "ISSUE_AGENT_GITHUB_HOST",
 )
+_AUTHORITY_BUNDLE = "ISSUE_AGENT_AUTHORITY_BUNDLE"
 
 
 def _run_command(argv: tuple[str, ...], cwd: str) -> CommandResult:
@@ -74,17 +78,19 @@ class AgentPublicationBroker:
         store: SQLiteControlStore,
         *,
         repository: str,
+        host: str = "github.com",
         config_version: str = "",
         identity: str = "agent-publication-broker",
         owner: str = "",
         run: RunCommand = _run_command,
     ):
-        if not repository or not owner:
+        if not repository or not owner or not host or any(char.isspace() for char in host):
             raise ValueError(
-                "publication repository and executor owner are required"
+                "publication repository, host, and executor owner are required"
             )
         self.store = store
         self.repository = repository
+        self.host = host.lower()
         self.config_version = config_version
         self.identity = identity
         self.owner = owner
@@ -222,7 +228,11 @@ class AgentPublicationBroker:
                 resolved_cwd,
                 "origin push URL",
             )
-            _require_repository_remote(remote_url, self.repository)
+            _require_repository_remote(
+                remote_url,
+                self.repository,
+                self.host,
+            )
             prior = self._remote_branch(remote, destination, resolved_cwd)
             if prior is None:
                 raise RuntimeError("cannot verify remote branch before push")
@@ -248,6 +258,7 @@ class AgentPublicationBroker:
                 argv,
                 resolved_cwd,
                 repository=self.repository,
+                host=self.host,
                 branch=branch,
             )
             prior = self._pull_request(branch, head, resolved_cwd)
@@ -355,7 +366,7 @@ class AgentPublicationBroker:
                 "pr",
                 "list",
                 "--repo",
-                self.repository,
+                f"{self.host}/{self.repository}",
                 "--head",
                 branch,
                 "--state",
@@ -553,13 +564,16 @@ def _captured_push(
     )
 
 
-def _require_repository_remote(remote_url: str, repository: str) -> None:
+def _require_repository_remote(
+    remote_url: str,
+    repository: str,
+    approved_host: str,
+) -> None:
     """Reject a same-command push whose remote is outside configured authority."""
 
     host, resolved_repository = _remote_identity(remote_url)
-    approved_host = os.environ.get("GH_HOST", "github.com").lower()
     if (
-        host.lower() != approved_host
+        host.lower() != approved_host.lower()
         or resolved_repository.lower() != repository.lower()
     ):
         raise ValueError(
@@ -590,6 +604,7 @@ def _normalized_pr_create(
     cwd: str,
     *,
     repository: str,
+    host: str,
     branch: str,
 ) -> tuple[str, ...]:
     snapshotted = _snapshot_body_file(argv, cwd)
@@ -612,7 +627,7 @@ def _normalized_pr_create(
     return (
         *snapshotted,
         "--repo",
-        repository,
+        f"{host}/{repository}",
         "--head",
         branch,
     )
@@ -646,7 +661,26 @@ def _snapshot_body_file(
 
 
 def _process_environment(pid: int) -> dict[str, str]:
-    raw = Path(f"/proc/{pid}/environ").read_bytes()
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except FileNotFoundError:
+        if sys.platform != "darwin":
+            raise
+        completed = subprocess.run(
+            ("ps", "eww", "-p", str(pid), "-o", "command="),
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        if completed.returncode != 0:
+            raise ProcessLookupError(pid)
+        match = re.search(
+            rf"(?:^|\s){_AUTHORITY_BUNDLE}=([A-Za-z0-9_=-]+)(?:\s|$)",
+            completed.stdout,
+        )
+        if match is None:
+            return {}
+        return _decode_authority_bundle(match.group(1))
     result: dict[str, str] = {}
     for item in raw.split(b"\0"):
         if not item or b"=" not in item:
@@ -655,11 +689,42 @@ def _process_environment(pid: int) -> dict[str, str]:
         result[name.decode("utf-8", "replace")] = value.decode(
             "utf-8", "replace"
         )
+    bundle = result.get(_AUTHORITY_BUNDLE)
+    if bundle:
+        return _decode_authority_bundle(bundle)
     return result
 
 
+def _decode_authority_bundle(encoded: str) -> dict[str, str]:
+    try:
+        decoded = json.loads(
+            base64.urlsafe_b64decode(encoded.encode()).decode()
+        )
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("publication authority bundle is malformed") from exc
+    if not isinstance(decoded, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in decoded.items()
+    ):
+        raise ValueError("publication authority bundle has invalid values")
+    return decoded
+
+
 def _process_parent(pid: int) -> int:
-    raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        if sys.platform != "darwin":
+            raise
+        completed = subprocess.run(
+            ("ps", "-p", str(pid), "-o", "ppid="),
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        if completed.returncode != 0 or not completed.stdout.strip():
+            raise ProcessLookupError(pid)
+        return int(completed.stdout.strip())
     close = raw.rfind(")")
     fields = raw[close + 1 :].split()
     if close < 0 or len(fields) < 3:
@@ -757,6 +822,7 @@ def main(argv: list[str] | None = None) -> None:
     broker = AgentPublicationBroker(
         store,
         repository=repository,
+        host=authority_env["ISSUE_AGENT_GITHUB_HOST"],
         config_version=authority_env["ISSUE_AGENT_CONFIG_VERSION"],
         identity=f"agent-publication:{os.getpid()}",
         owner=authority_env["ISSUE_AGENT_PUBLICATION_OWNER"],

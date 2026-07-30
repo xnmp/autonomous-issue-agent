@@ -1,4 +1,7 @@
+import base64
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -264,7 +267,7 @@ def test_pr_body_file_is_snapshotted_before_command_commit(tmp_path):
     effect = remote.effects[0]
     assert "--body-file" not in effect
     assert effect[effect.index("--body") + 1] == "Fixes #42\n"
-    assert effect[effect.index("--repo") + 1] == "o/r"
+    assert effect[effect.index("--repo") + 1] == "github.com/o/r"
     assert effect[effect.index("--head") + 1] == "issue-42"
 
 
@@ -407,6 +410,103 @@ def test_broker_rejects_origin_for_a_different_repository(tmp_path):
         )
 
 
+def test_broker_uses_configured_host_not_child_gh_host(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    remote = Remote()
+    monkeypatch.setenv("GH_HOST", "attacker.example")
+    publisher = AgentPublicationBroker(
+        store(tmp_path),
+        repository="o/r",
+        host="github.com",
+        owner="o/r:fix",
+        run=remote.run,
+    )
+
+    assert publisher.publish(
+        ("git", "push", "origin", "HEAD:issue-42"),
+        str(tmp_path),
+    ).code == 0
+
+
+def test_broker_rejects_child_selected_remote_host(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    remote = Remote()
+    monkeypatch.setenv("GH_HOST", "attacker.example")
+
+    def run(argv, cwd):
+        if argv == ("git", "remote", "get-url", "--push", "origin"):
+            return CommandResult(0, "git@attacker.example:o/r.git\n")
+        return remote.run(argv, cwd)
+
+    publisher = AgentPublicationBroker(
+        store(tmp_path),
+        repository="o/r",
+        host="github.com",
+        owner="o/r:fix",
+        run=run,
+    )
+
+    with pytest.raises(ValueError, match="configured repository"):
+        publisher.publish(
+            ("git", "push", "origin", "HEAD:issue-42"),
+            str(tmp_path),
+        )
+
+
+def test_macos_process_environment_reads_compact_authority_bundle(
+    monkeypatch,
+) -> None:
+    authority = {
+        "ISSUE_AGENT_CONTROL_DB": "/state/control.db",
+        "ISSUE_AGENT_REPOSITORY": "o/r",
+        "ISSUE_AGENT_PUBLICATION_OWNER": "owner",
+        "ISSUE_AGENT_RUN_ID": "run",
+        "ISSUE_AGENT_CONFIG_VERSION": "cfg",
+        "ISSUE_AGENT_GITHUB_HOST": "github.example",
+    }
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(authority, separators=(",", ":")).encode()
+    ).decode()
+
+    def no_proc(_self):
+        raise FileNotFoundError
+
+    monkeypatch.setattr(agent_publish.sys, "platform", "darwin")
+    monkeypatch.setattr(agent_publish.Path, "read_bytes", no_proc)
+    monkeypatch.setattr(
+        agent_publish.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=f"agent --flag ISSUE_AGENT_AUTHORITY_BUNDLE={encoded}\n",
+        ),
+    )
+
+    assert agent_publish._process_environment(123) == authority
+
+
+def test_macos_process_parent_uses_ps_without_proc(monkeypatch) -> None:
+    def no_proc(_self, **_kwargs):
+        raise FileNotFoundError
+
+    monkeypatch.setattr(agent_publish.sys, "platform", "darwin")
+    monkeypatch.setattr(agent_publish.Path, "read_text", no_proc)
+    monkeypatch.setattr(
+        agent_publish.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="42\n",
+        ),
+    )
+
+    assert agent_publish._process_parent(123) == 42
+
+
 def test_cli_uses_supervised_ancestor_authority_not_child_environment(
     monkeypatch,
     tmp_path,
@@ -418,6 +518,7 @@ def test_cli_uses_supervised_ancestor_authority_not_child_environment(
         "ISSUE_AGENT_PUBLICATION_OWNER": "o/r:fix:deployment",
         "ISSUE_AGENT_RUN_ID": "run-1",
         "ISSUE_AGENT_CONFIG_VERSION": "cfg-1",
+        "ISSUE_AGENT_GITHUB_HOST": "github.com",
     }
 
     class TrustedStore:
@@ -452,5 +553,6 @@ def test_cli_uses_supervised_ancestor_authority_not_child_environment(
     assert stopped.value.code == 0
     assert captured["path"] == trusted["ISSUE_AGENT_CONTROL_DB"]
     assert captured["repository"] == "o/r"
+    assert captured["host"] == "github.com"
     assert captured["owner"] == "o/r:fix:deployment"
     assert captured["config_version"] == "cfg-1"

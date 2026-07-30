@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import secrets
 import signal
 import sys
 import time
@@ -224,6 +225,8 @@ def build_role(role: str, env: dict | None = None):
     sys.stderr.flush()
 
     # The governor hook needs a GateContext built from the agent's worktree cwd.
+    screenshot_receipt_key = secrets.token_bytes(32)
+
     def build_ctx(cwd: str):
         return build_gate_context(
             cwd, base_branch=cfg.base_branch,
@@ -242,6 +245,7 @@ def build_role(role: str, env: dict | None = None):
             screenshots_read_path=evidence_receipt_path(
                 runner_state_dir, cwd
             ),
+            screenshots_receipt_key=screenshot_receipt_key,
             durable_publish=True,
         )
 
@@ -262,6 +266,7 @@ def build_role(role: str, env: dict | None = None):
         log=_commit_log,
         debug=debug,
         trusted_state_dir=runner_state_dir,
+        screenshot_receipt_key=screenshot_receipt_key,
     )
     _idle = cfg.agent_idle_timeout if cfg.agent_idle_timeout > 0 else None
     # Two independent caps: silence (idle) and total elapsed (wall). The wall cap is

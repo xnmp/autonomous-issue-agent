@@ -22,6 +22,7 @@ class Gateway:
         self.comments = set()
         self.calls = []
         self.head = "head-1"
+        self.issue_revision = "issue-rev-1"
         self.auto_merge = set()
         self.run_attempt = 0
         self.dependencies = set()
@@ -50,6 +51,10 @@ class Gateway:
     def get_pr(self, pr, *, mergeability=True, checks=True):
         del mergeability, checks
         return SimpleNamespace(head_ref_oid=self.head)
+
+    def get_issue(self, issue):
+        del issue
+        return SimpleNamespace(updated_at=self.issue_revision)
 
     def rerun_failed_checks(self, pr):
         self.calls.append(("rerun", pr))
@@ -172,6 +177,51 @@ def test_ambiguous_comment_is_reconciled_before_any_retry(tmp_path) -> None:
     assert store.pending_commands() == ()
 
 
+def test_legacy_unknown_comment_is_adopted_and_reconciled_without_duplicate(
+    tmp_path,
+) -> None:
+    executor, gateway, store = _executor(tmp_path)
+    action = PostComment(Target.ISSUE, 4, "done")
+    original = gateway.comment
+
+    def committed_then_lost(*args):
+        original(*args)
+        raise RuntimeError("reply lost")
+
+    gateway.comment = committed_then_lost
+    with pytest.raises(RuntimeError, match="reply lost"):
+        executor.execute(action)
+    store.adopt_legacy_owner("o/r", "fix", "o/r:fix:deployment-2")
+    gateway.comment = original
+    adopted = GitHubEffectExecutor(
+        gateway,
+        store,
+        repository="o/r",
+        identity="o/r:fix:deployment-2",
+    )
+
+    assert adopted.drain_pending_commands() == 1
+    assert gateway.calls == [("comment", "issue", 4, "done")]
+    assert store.pending_commands() == ()
+
+
+def test_new_review_identity_reconciles_matching_legacy_review_before_submit(
+    tmp_path,
+) -> None:
+    _, gateway, store = _executor(tmp_path)
+    gateway.reviews.add((7, "APPROVE", "looks good", "head-1"))
+    adopted = GitHubEffectExecutor(
+        gateway,
+        store,
+        repository="o/r",
+        identity="o/r:review:deployment-2",
+    )
+
+    assert adopted.submit_review(7, "APPROVE", "looks good")
+    assert gateway.calls == []
+    assert store.pending_commands() == ()
+
+
 def test_command_identity_includes_expected_revision() -> None:
     first = command_for_action(
         Relabel(Target.PR, 2, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW),
@@ -192,6 +242,67 @@ def test_expected_revision_blocks_stale_effect(tmp_path) -> None:
 
     assert executor.execute(RerunFailedChecks(7, "old-head")) is False
 
+    assert gateway.calls == []
+    assert store.pending_commands() == ()
+
+
+@pytest.mark.parametrize(
+    "action",
+    (
+        Relabel(Target.ISSUE, 7, Label.AI_READY, Label.AI_WORKING),
+        PostComment(Target.ISSUE, 7, "work complete"),
+        AddDependency(7, 8),
+    ),
+)
+def test_issue_lifecycle_mutations_capture_expected_revision(
+    tmp_path,
+    action,
+) -> None:
+    executor, _, store = _executor(tmp_path)
+    command = executor._command(action)
+
+    assert command.target == "issue:7"
+    assert command.expected_revision == "issue-rev-1"
+    assert store.pending_commands() == ()
+
+
+def test_issue_revision_change_blocks_stale_comment(tmp_path) -> None:
+    executor, gateway, store = _executor(tmp_path)
+    action = PostComment(Target.ISSUE, 7, "stale")
+    store.enqueue_command(
+        command_for_action(
+            action,
+            expected_revision="issue-rev-1",
+            repository="o/r",
+            executor_identity="o/r:fix",
+        )
+    )
+    gateway.issue_revision = "issue-rev-2"
+
+    assert executor.execute(action) is False
+    assert gateway.calls == []
+    assert store.pending_commands() == ()
+
+
+def test_pr_relabel_captures_and_enforces_head_revision(tmp_path) -> None:
+    executor, gateway, store = _executor(tmp_path)
+    action = Relabel(
+        Target.PR,
+        7,
+        Label.AI_PR_OPEN,
+        Label.NEEDS_HUMAN_REVIEW,
+    )
+    store.enqueue_command(
+        command_for_action(
+            action,
+            expected_revision="head-1",
+            repository="o/r",
+            executor_identity="o/r:fix",
+        )
+    )
+    gateway.head = "head-2"
+
+    assert executor.execute(action) is False
     assert gateway.calls == []
     assert store.pending_commands() == ()
 
@@ -312,7 +423,7 @@ def test_revision_outage_remains_pending_instead_of_permanently_failing(
     assert pending[0].state == "pending"
 
 
-def test_post_write_verification_outage_records_unknown_outcome(
+def test_reconcile_outage_blocks_write_and_leaves_command_pending(
     tmp_path,
 ) -> None:
     executor, gateway, store = _executor(tmp_path)
@@ -326,7 +437,8 @@ def test_post_write_verification_outage_records_unknown_outcome(
     with pytest.raises(RuntimeError, match="readback unavailable"):
         executor.execute(action)
 
-    assert store.pending_commands()[0].state == "unknown_outcome"
+    assert store.pending_commands()[0].state == "pending"
+    assert gateway.calls == []
 
 
 def test_ambiguous_dependency_is_reconciled_without_duplicate(tmp_path) -> None:

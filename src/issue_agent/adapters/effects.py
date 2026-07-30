@@ -266,6 +266,16 @@ class GitHubEffectExecutor:
                     f"{command.command_id}: remote outcome remains unknown"
                 )
             self.store.retry_reconciled_command(command.command_id)
+        else:
+            reconciled = self._reconcile(action, command)
+            if reconciled is True:
+                # A deployment cutover or target revision change can produce a
+                # new command identity for an effect that already landed.
+                self.store.begin_command(command.command_id)
+                self.store.record_effect(
+                    self._receipt(command, EffectStatus.SUCCEEDED)
+                )
+                return True
         if not self._revision_matches(command):
             now = datetime.now(timezone.utc)
             self.store.begin_command(command.command_id)
@@ -377,6 +387,17 @@ class GitHubEffectExecutor:
                 )
                 return True
             self.store.retry_reconciled_command(command.command_id)
+        elif isinstance(self.gateway, ReviewVerifier) and self.gateway.has_review(
+            pr, event, body, head
+        ):
+            # Deployment-scoped identities change the command digest. Reconcile
+            # a matching pre-cutover review before the new identity can submit
+            # the same GitHub review again.
+            self.store.begin_command(command.command_id)
+            self.store.record_effect(
+                self._receipt(command, EffectStatus.SUCCEEDED)
+            )
+            return True
         if not self._revision_matches(command):
             now = datetime.now(timezone.utc)
             self.store.begin_command(command.command_id)
@@ -600,13 +621,22 @@ class GitHubEffectExecutor:
     def _command(self, action: Action) -> LifecycleCommand:
         expected = _expected_revision(action)
         extra: dict[str, object] = {}
-        if isinstance(action, (EnableAutoMerge, UpdateBranch)):
+        _kind, target = _command_identity(action)
+        if expected is None and target.startswith("pr:"):
+            number = int(target.split(":", 1)[1])
             expected = self.gateway.get_pr(
-                action.pr, mergeability=False, checks=False
+                number, mergeability=False, checks=False
             ).head_ref_oid
             if not expected:
                 raise UnknownEffectOutcome(
-                    f"pr:{action.pr}: expected revision is unavailable"
+                    f"{target}: expected revision is unavailable"
+                )
+        elif expected is None and target.startswith("issue:"):
+            number = int(target.split(":", 1)[1])
+            expected = self.gateway.get_issue(number).updated_at
+            if not expected:
+                raise UnknownEffectOutcome(
+                    f"{target}: expected revision is unavailable"
                 )
         if isinstance(action, RerunFailedChecks) and isinstance(
             self.gateway, ChecksRerunVerifier
@@ -642,10 +672,15 @@ class GitHubEffectExecutor:
     def _revision_matches(self, command: LifecycleCommand) -> bool:
         if command.expected_revision is None:
             return True
-        if not command.target.startswith("pr:"):
+        number = int(command.target.split(":", 1)[1])
+        if command.target.startswith("pr:"):
+            current = self.gateway.get_pr(
+                number, mergeability=False, checks=False
+            ).head_ref_oid
+        elif command.target.startswith("issue:"):
+            current = self.gateway.get_issue(number).updated_at
+        else:
             return False
-        pr = int(command.target.split(":", 1)[1])
-        current = self.gateway.get_pr(pr).head_ref_oid
         if not current:
             raise UnknownEffectOutcome(
                 f"{command.command_id}: current revision is unavailable"

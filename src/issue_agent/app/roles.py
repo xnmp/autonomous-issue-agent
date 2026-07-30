@@ -168,6 +168,12 @@ def _control_store(
 
     control = SQLiteControlStore(_control_store_path(cfg, state_dir))
     control.initialize()
+    role = journal.events.producer.role
+    control.adopt_legacy_owner(
+        cfg.repo,
+        role,
+        _owner_identity(cfg, role),
+    )
     control.bind_event_outbox(
         journal.events.prepare,
         journal.events.append_committed,
@@ -239,6 +245,7 @@ def _with_accounting(
         journal.events.producer.role,
         journal.events.line_limit,
         owner_id=_owner_identity(cfg, role),
+        github_host=os.environ.get("GH_HOST", "github.com"),
     )
 
 
@@ -345,6 +352,7 @@ def _effects(
     publications = AgentPublicationBroker(
         control,
         repository=repository,
+        host=os.environ.get("GH_HOST", "github.com"),
         config_version=config_version,
         identity=f"{identity}:publication",
         owner=identity,
@@ -2031,6 +2039,12 @@ def build_review_daemon(
         alert_cmd=cfg.alert_cmd,
         effect_executor=effect_executor.actions,
     )
+    reservations = DispatchPathReservations(
+        control,
+        repository=cfg.repo,
+        role="review",
+        owner_id=owner_id,
+    )
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, None,
         JournalingRuntime(
@@ -2050,11 +2064,14 @@ def build_review_daemon(
         ),
         executor, journal=journal, dedupe=control,
     )
-    dispatch_runtime = CancellableAsyncDispatch(dispatcher.dispatch)
+    dispatch_runtime = CancellableAsyncDispatch(
+        dispatcher.dispatch,
+        finished=reservations.finish,
+    )
     executor.bind_dispatch(dispatch_runtime)
 
     def decide(world):
-        return decide_review(
+        actions = decide_review(
             world,
             rcfg,
             _review_state(
@@ -2063,6 +2080,36 @@ def build_review_daemon(
                 control.abandoned_dispatch_counts(owner_id),
             ),
         )
+        rejected_prs: set[int] = set()
+        for action in actions:
+            if not isinstance(action, RunAgent):
+                continue
+            if reservations.reserve(
+                action,
+                -action.number,
+                frozenset({f"pr:{action.number}"}),
+            ):
+                continue
+            rejected_prs.add(action.number)
+            _log("review")(
+                f"dispatch {action.kind.name} PR #{action.number}: "
+                "deferred — another deployment owns the target"
+            )
+        if not rejected_prs:
+            return actions
+        return [
+            action
+            for action in actions
+            if not (
+                isinstance(action, RunAgent)
+                and action.number in rejected_prs
+            )
+            and not (
+                isinstance(action, Relabel)
+                and action.target is Target.PR
+                and action.number in rejected_prs
+            )
+        ]
 
     _log("review")(review_capability_line(
         can_approve=rcfg.identity_mode == IdentityMode.THREE,
@@ -2085,7 +2132,9 @@ def build_review_daemon(
                   tick_gate=_control_spend_gate(cfg, control),
                   wake_check=_wake_check(cfg, store),
                   dispatch_capacity=1,
+                  dispatch_key=lambda action: ("pr", action.number),
                   cancel_active_dispatches=dispatch_runtime.cancel_all,
+                  dispatch_rejected=reservations.finish,
                   force_kill_dispatches=_force_kill(
                       cfg.review_state_dir or store.state_dir
                   ),
@@ -2215,6 +2264,12 @@ def build_steward_daemon(
         alert_cmd=cfg.alert_cmd,
         effect_executor=effect_executor.actions,
     )
+    reservations = DispatchPathReservations(
+        control,
+        repository=cfg.repo,
+        role="steward",
+        owner_id=owner_id,
+    )
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, None,
         JournalingRuntime(
@@ -2229,7 +2284,10 @@ def build_steward_daemon(
         ),
         executor, journal=journal, dedupe=control,
     )
-    dispatch_runtime = CancellableAsyncDispatch(dispatcher.dispatch)
+    dispatch_runtime = CancellableAsyncDispatch(
+        dispatcher.dispatch,
+        finished=reservations.finish,
+    )
     executor.bind_dispatch(dispatch_runtime)
 
     # Same ceiling shape as the reviewer's (review P0R-3), for the same reason:
@@ -2309,7 +2367,26 @@ def build_steward_daemon(
                 )
             suppressed_last.clear()
             suppressed_last.update(suppressed)
-        return actions
+        rejected: set[RunAgent] = set()
+        for action in actions:
+            if not isinstance(action, RunAgent):
+                continue
+            if reservations.reserve(
+                action,
+                action.number,
+                frozenset({f"issue:{action.number}"}),
+            ):
+                continue
+            rejected.add(action)
+            steward_log(
+                f"dispatch {action.kind.name} #{action.number}: deferred — "
+                "another deployment owns the target"
+            )
+        return [
+            action
+            for action in actions
+            if action not in rejected
+        ]
 
     # Jira needs closed ai-done issues too (for the final Done transition); triage
     # alone needs just open issues.
@@ -2329,7 +2406,9 @@ def build_steward_daemon(
                   tick_gate=_control_spend_gate(cfg, control),
                   wake_check=_wake_check(cfg, store),
                   dispatch_capacity=1,
+                  dispatch_key=lambda action: ("issue", action.number),
                   cancel_active_dispatches=dispatch_runtime.cancel_all,
+                  dispatch_rejected=reservations.finish,
                   force_kill_dispatches=_force_kill(
                       cfg.steward_state_dir or store.state_dir
                   ),

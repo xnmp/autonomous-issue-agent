@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import uuid
 import contextvars
 import json
@@ -53,6 +54,7 @@ class AccountingRuntime(AgentRuntime):
     event_role: str = ""
     event_line_limit: int = 0
     owner_id: str = ""
+    github_host: str = "github.com"
     _context: contextvars.ContextVar[tuple[int | None, str, int]] = field(
         default_factory=lambda: contextvars.ContextVar(
             f"accounting_context_{uuid.uuid4().hex}", default=(None, "", 0)
@@ -148,30 +150,43 @@ class AccountingRuntime(AgentRuntime):
                 ),
                 exit_reason=ExitReason.BUDGET_EXHAUSTED,
             )
+        publication_owner = (
+            self.owner_id or f"{self.repository}:{self.role}"
+        )
+        authority = {
+            "ISSUE_AGENT_RUN_ID": str(run_id),
+            "ISSUE_AGENT_CONFIG_VERSION": self.config_version,
+            "ISSUE_AGENT_CONTROL_DB": self.store.path,
+            "ISSUE_AGENT_REPOSITORY": self.repository,
+            "ISSUE_AGENT_PUBLICATION_OWNER": publication_owner,
+            "ISSUE_AGENT_GITHUB_HOST": self.github_host,
+            **(
+                {
+                    "ISSUE_AGENT_EVENT_LOG": self.event_log_path,
+                    "ISSUE_AGENT_EVENT_DEPLOYMENT": self.event_deployment,
+                    "ISSUE_AGENT_EVENT_ROLE": self.event_role,
+                    "ISSUE_AGENT_EVENT_LINE_LIMIT": str(
+                        self.event_line_limit
+                    ),
+                }
+                if self.event_log_path
+                else {}
+            ),
+        }
+        authority_bundle = base64.urlsafe_b64encode(
+            json.dumps(
+                authority,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).decode()
         runtime_task = replace(
             task,
             env={
                 **task.env,
-                "ISSUE_AGENT_RUN_ID": str(run_id),
-                "ISSUE_AGENT_CONFIG_VERSION": self.config_version,
-                "ISSUE_AGENT_CONTROL_DB": self.store.path,
-                "ISSUE_AGENT_REPOSITORY": self.repository,
+                **authority,
                 "ISSUE_AGENT_DURABLE_PUBLISH": "1",
-                "ISSUE_AGENT_PUBLICATION_OWNER": (
-                    self.owner_id or f"{self.repository}:{self.role}"
-                ),
-                **(
-                    {
-                        "ISSUE_AGENT_EVENT_LOG": self.event_log_path,
-                        "ISSUE_AGENT_EVENT_DEPLOYMENT": self.event_deployment,
-                        "ISSUE_AGENT_EVENT_ROLE": self.event_role,
-                        "ISSUE_AGENT_EVENT_LINE_LIMIT": str(
-                            self.event_line_limit
-                        ),
-                    }
-                    if self.event_log_path
-                    else {}
-                ),
+                "ISSUE_AGENT_AUTHORITY_BUNDLE": authority_bundle,
             },
         )
         try:

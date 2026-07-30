@@ -59,15 +59,19 @@ def test_edit_check_delegates_to_the_shared_guarded_wrapper(tmp_path) -> None:
     assert "out=$(" not in text
 
 
-def test_screenshot_marker_is_state_owned(tmp_path) -> None:
+def test_codex_cannot_mint_trusted_screenshot_receipts(tmp_path) -> None:
     worktree = tmp_path / "worktree"
     state = tmp_path / "state"
     worktree.mkdir()
     config = write_hook_config(str(worktree), state_dir=str(state))
-    script = os.path.join(os.path.dirname(config), "hooks", "read_record.sh")
-    text = open(script).read()
-    assert str(state / "evidence") in text
-    assert '.harness/screenshots-read' not in text
+    hooks = os.path.join(os.path.dirname(config), "hooks")
+    governor = open(os.path.join(hooks, "gov.sh")).read()
+    rendered = open(config).read()
+
+    assert not os.path.exists(os.path.join(hooks, "read_record.sh"))
+    assert "PostToolUse" not in rendered
+    assert "HARNESS_SCREENSHOTS_READ" not in governor
+    assert str(state / "evidence") not in governor
 
 
 def test_repository_instructions_are_not_developer_instructions(tmp_path) -> None:

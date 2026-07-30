@@ -112,7 +112,7 @@ def test_control_store_initializes_with_restrictive_permissions_and_integrity(tm
             "SELECT version, length(source_digest) FROM schema_migrations "
             "ORDER BY version"
         ).fetchall()
-    assert history == [(9, 64), (10, 64), (11, 64)]
+    assert history == [(9, 64), (10, 64), (11, 64), (12, 64)]
 
 
 def test_shipped_v8_database_upgrades_without_rewriting_history_or_data(
@@ -125,7 +125,6 @@ def test_shipped_v8_database_upgrades_without_rewriting_history_or_data(
         db.execute("DROP TABLE run_cancellation_intents")
         db.execute("DROP TABLE level_state")
         db.execute("DROP TABLE dispatch_claims")
-        db.execute("DROP INDEX runs_active_dispatch_unique")
         db.execute("DELETE FROM schema_migrations")
         db.execute(
             "INSERT INTO schema_migrations("
@@ -149,7 +148,13 @@ def test_shipped_v8_database_upgrades_without_rewriting_history_or_data(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name='level_state'"
         ).fetchone()
-    assert [version for version, _digest in history] == [8, 9, 10, 11]
+    assert [version for version, _digest in history] == [
+        8,
+        9,
+        10,
+        11,
+        12,
+    ]
     assert history[0][1] == (
         "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
     )
@@ -166,8 +171,8 @@ def test_concurrent_role_boot_serializes_schema_migrations(
     if starting_version != "fresh":
         SQLiteControlStore(str(path)).initialize()
         with sqlite3.connect(path) as db:
+            db.execute("DELETE FROM schema_migrations WHERE version=12")
             db.execute("DROP TABLE dispatch_claims")
-            db.execute("DROP INDEX runs_active_dispatch_unique")
             db.execute("DELETE FROM schema_migrations WHERE version=11")
             db.execute("DROP TABLE run_cancellation_intents")
             db.execute("DELETE FROM schema_migrations WHERE version=10")
@@ -206,9 +211,9 @@ def test_concurrent_role_boot_serializes_schema_migrations(
                 "SELECT version FROM schema_migrations ORDER BY version"
             )
         ) == (
-            (8, 9, 10, 11)
+            (8, 9, 10, 11, 12)
             if starting_version == "v8"
-            else (9, 10, 11)
+            else (9, 10, 11, 12)
         )
 
 
@@ -266,21 +271,110 @@ def test_dispatch_claims_serialize_targets_and_overlapping_paths(
     )
 
 
-def test_active_dispatch_id_is_cross_process_admission_authority(
+def test_dispatch_claim_process_probe_runs_outside_write_transaction(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = _store(tmp_path)
+    assert store.claim_dispatch(
+        "o/r", "fix", 1, "RESOLVE", "owner-a", frozenset({"a.py"})
+    )
+    transaction_open = False
+    original_transaction = store.transaction
+    original_matches = ProcessSupervisor.matches_identity
+
+    @contextmanager
+    def observed_transaction():
+        nonlocal transaction_open
+        with original_transaction() as db:
+            transaction_open = True
+            try:
+                yield db
+            finally:
+                transaction_open = False
+
+    def observed_matches(pid: int, start_ticks: int) -> bool:
+        assert not transaction_open
+        return original_matches(pid, start_ticks)
+
+    monkeypatch.setattr(store, "transaction", observed_transaction)
+    monkeypatch.setattr(
+        ProcessSupervisor,
+        "matches_identity",
+        staticmethod(observed_matches),
+    )
+
+    assert store.claim_dispatch(
+        "o/r", "fix", 2, "RESOLVE", "owner-b", frozenset({"b.py"})
+    )
+
+
+def test_legacy_owner_adoption_preserves_active_runs_leases_and_commands(
     tmp_path,
 ) -> None:
     store = _store(tmp_path)
-    first = _request(1)
+    legacy = "o/r:fix"
+    current = "o/r:fix:deployment-2"
+    request = dataclasses.replace(_request(1), owner_id=legacy)
+    assert store.reserve(request).disposition is AccountingDisposition.AVAILABLE
+    identity = ProcessSupervisor.process_identity(os.getpid())
+    assert identity is not None
+    store.register_lease(
+        Lease(
+            request.run_id,
+            request.dispatch_id,
+            legacy,
+            identity.pid,
+            os.getpgid(identity.pid),
+            NOW,
+            identity.start_ticks,
+        )
+    )
+    command = LifecycleCommand(
+        CommandId("legacy-command"),
+        "github:legacy-command",
+        CommandKind.POST_COMMENT,
+        "issue:7",
+        None,
+        {"target": "issue", "number": 7, "body": "done"},
+        "cfg",
+        "o/r",
+        legacy,
+    )
+    store.enqueue_command(command)
+
+    assert store.adopt_legacy_owner("o/r", "fix", current) == (1, 1)
+
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT owner_id FROM runs WHERE run_id=?",
+            (request.run_id,),
+        ).fetchone()[0] == current
+        assert db.execute(
+            "SELECT owner_id FROM leases WHERE run_id=?",
+            (request.run_id,),
+        ).fetchone()[0] == current
+    assert (
+        store.pending_commands(
+            repository="o/r",
+            executor_identity=current,
+        )[0].command.command_id
+        == command.command_id
+    )
+
+
+def test_concurrent_sublegs_may_share_a_dispatch_context(
+    tmp_path,
+) -> None:
+    store = _store(tmp_path)
+    first = _request(1, maximum=40, cap=100)
     second = dataclasses.replace(
-        _request(2),
+        _request(2, maximum=40, cap=100),
         dispatch_id=first.dispatch_id,
     )
 
     assert store.reserve(first).disposition is AccountingDisposition.AVAILABLE
-    duplicate = store.reserve(second)
-
-    assert duplicate.disposition is AccountingDisposition.CONFLICT
-    assert duplicate.detail == "an active run already owns this dispatch"
+    assert store.reserve(second).disposition is AccountingDisposition.AVAILABLE
 
 
 def test_publication_authority_requires_active_reservation_and_live_lease(
@@ -311,7 +405,7 @@ def test_publication_authority_requires_active_reservation_and_live_lease(
     assert authority.pgid == pgid
 
 
-@pytest.mark.parametrize("version", (9, 10, 11))
+@pytest.mark.parametrize("version", (9, 10, 11, 12))
 @pytest.mark.parametrize("stage", ("before_commit", "committed"))
 def test_schema_migration_restart_is_atomic_at_every_boundary(
     tmp_path,
@@ -351,7 +445,7 @@ def test_schema_migration_restart_is_atomic_at_every_boundary(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name='run_cancellation_intents'"
         ).fetchone()
-    assert versions == (9, 10, 11)
+    assert versions == (9, 10, 11, 12)
     assert cancellation_table == ("run_cancellation_intents",)
 
 

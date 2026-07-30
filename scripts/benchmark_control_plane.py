@@ -74,6 +74,13 @@ def _store_bytes(path: Path) -> int:
     )
 
 
+def _checkpoint(store: SQLiteControlStore) -> None:
+    """Normalize WAL state before comparing persistent storage footprints."""
+
+    with store._connect() as db:
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+
 class _NoOpExecutor:
     def replay_pending(self) -> bool:
         return True
@@ -144,6 +151,7 @@ def run(iterations: int) -> dict[str, float | int]:
             event_log.prepare,
             publish,
         )
+        _checkpoint(store)
         initial_control_bytes = _store_bytes(control_path)
         scope = BudgetScope(
             "local/benchmark",
@@ -233,6 +241,7 @@ def run(iterations: int) -> dict[str, float | int]:
         unavailable_ticks = _tick_latencies(
             iterations, "ACCOUNTING UNAVAILABLE — benchmark"
         )
+        _checkpoint(store)
         final_control_bytes = _store_bytes(control_path)
         transitions = iterations * 2
         return {

@@ -422,6 +422,34 @@ def test_bash_c_is_unresolvable_and_blocked():
     assert gov.find_violations("bash -c 'git commit --no-verify -m x'")
 
 
+@pytest.mark.parametrize(
+    "command",
+    (
+        "env bash -c 'git commit --no-verify -m x'",
+        "timeout 5 bash -c 'git commit --no-verify -m x'",
+        "sudo sh -c 'git commit --no-verify -m x'",
+    ),
+)
+def test_wrapped_dynamic_interpreters_are_unresolvable(command):
+    assert gov.find_violations(command)
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    (
+        "GH_HOST=attacker.example",
+        "ISSUE_AGENT_GITHUB_HOST=attacker.example",
+        "ISSUE_AGENT_AUTHORITY_BUNDLE=forged",
+    ),
+)
+def test_durable_publication_host_authority_cannot_be_overridden(assignment):
+    command = (
+        f"env {assignment} issue-agent-publish "
+        "gh pr create --title x --body y"
+    )
+    assert gov.find_violations(command)
+
+
 def test_python_c_is_unresolvable_and_blocked():
     assert gov.find_violations(
         "python -c \"import os; os.system('git commit --no-verify -m x')\""

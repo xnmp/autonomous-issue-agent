@@ -70,7 +70,6 @@ def _without_generated_instructions(content: str) -> str:
 
 def _gov_script(
     governor_path: str,
-    screenshots_receipt: str,
     review_only: bool = False,
 ) -> str:
     return f"""#!/usr/bin/env bash
@@ -80,14 +79,12 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 2
 fi
 {('export ISSUE_AGENT_REVIEW_READ_ONLY=1' if review_only else '')}
-export HARNESS_SCREENSHOTS_READ={json.dumps(screenshots_receipt)}
 exec uv run --quiet "{governor_path}"
 """
 
 
 def _config_toml(
     gov_script_path: str,
-    read_record_script_path: str,
     edit_check_script_path: str = "",
     developer_instructions: str = "",
 ) -> str:
@@ -109,14 +106,6 @@ matcher = "^Bash$"
 type = "command"
 command = "{gov_script_path}"
 timeout = 30
-
-[[hooks.PostToolUse]]
-matcher = "^(Read|view_image)$"
-
-[[hooks.PostToolUse.hooks]]
-type = "command"
-command = "{read_record_script_path}"
-timeout = 15
 """
     if edit_check_script_path:
         # PostToolUse edit-time check. Codex edits via apply_patch; Claude via
@@ -131,35 +120,6 @@ command = "{edit_check_script_path}"
 timeout = 120
 """
     return toml
-
-
-def _read_record_script(marker_path: str) -> str:
-    return r"""#!/usr/bin/env bash
-# Codex PostToolUse(Read) hook → record evidence screenshots the agent looked at.
-# Observe-only: always exit 0.
-set -uo pipefail
-payload=$(cat)
-read -r fp cwd < <(printf '%s' "$payload" | python3 -c '
-import json, sys
-try:
-    d = json.load(sys.stdin)
-    fp = (d.get("tool_input") or {}).get("file_path", "") or ""
-    cwd = d.get("cwd", "") or "."
-    print(fp, cwd)
-except Exception:
-    print("", ".")
-' 2>/dev/null) || exit 0
-[ -n "$fp" ] || exit 0
-low=$(printf '%s' "$fp" | tr '[:upper:]' '[:lower:]')
-case "$low" in
-  *evidence/*.png|*evidence/*.jpg|*evidence/*.jpeg|*evidence/*.gif|*evidence/*.webp) ;;
-  *) exit 0 ;;
-esac
-marker=""" + json.dumps(marker_path) + r"""
-mkdir -p "$(dirname "$marker")" 2>/dev/null || exit 0
-printf '%s\n' "$(basename "$fp")" >> "$marker" 2>/dev/null || exit 0
-exit 0
-"""
 
 
 def _edit_check_script(edit_check_cmd: str) -> str:
@@ -217,7 +177,6 @@ def write_hook_config(
     if not state_dir:
         raise OSError("STATE_DIR is required for Codex hook containment")
     key = _hook_key(cwd)
-    screenshots_receipt = evidence_receipt_path(state_dir, cwd)
     codex_dir = os.path.join(state_dir, "codex-hooks", key)
     hooks_dir = os.path.join(codex_dir, "hooks")
     os.makedirs(hooks_dir, exist_ok=True)
@@ -226,22 +185,10 @@ def write_hook_config(
 
     gov_script_path = os.path.join(hooks_dir, "gov.sh")
     with open(gov_script_path, "w") as f:
-        f.write(_gov_script(governor_path, screenshots_receipt, review_only))
+        f.write(_gov_script(governor_path, review_only))
     os.chmod(
         gov_script_path,
         os.stat(gov_script_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH,
-    )
-
-    read_record_script_path = os.path.join(hooks_dir, "read_record.sh")
-    with open(read_record_script_path, "w") as f:
-        f.write(
-            _read_record_script(
-                screenshots_receipt
-            )
-        )
-    os.chmod(
-        read_record_script_path,
-        os.stat(read_record_script_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH,
     )
 
     edit_check_script_path = ""
@@ -258,7 +205,6 @@ def write_hook_config(
     with open(config_path, "w") as f:
         f.write(_config_toml(
             gov_script_path,
-            read_record_script_path,
             edit_check_script_path,
             agents_md,
         ))

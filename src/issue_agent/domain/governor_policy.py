@@ -304,37 +304,40 @@ def resolve(command: str) -> Resolution:
     for words, _env in extract_commands_with_env(command):
         if not words:
             continue
-        name = words[0]
+        inner, _extra_env = _strip_env_wrapper(words)
+        if not inner:
+            continue
+        name = inner[0]
         base = _basename(name)
         if "$" in name or name.startswith(("`", "${")):
             return Unresolvable("dynamic value in command position")
         if base == "eval":
             return Unresolvable("eval defers command resolution")
-        if base in _DYNAMIC_INTERPRETERS and "-c" in words[1:]:
+        if base in _DYNAMIC_INTERPRETERS and "-c" in inner[1:]:
             return Unresolvable(
                 f"{base} -c defers command resolution beyond the governor"
             )
         if base == "git":
-            for index, word in enumerate(words[1:], start=1):
+            for index, word in enumerate(inner[1:], start=1):
                 if (
                     word == "-c"
-                    and index + 1 < len(words)
-                    and words[index + 1].lower().startswith("alias.")
+                    and index + 1 < len(inner)
+                    and inner[index + 1].lower().startswith("alias.")
                 ):
                     return Unresolvable("git -c alias.* defers subcommand resolution")
         if base == "gh" and classify(words) is None:
             allowed = (
-                len(words) >= 3
-                and words[1] in _GH_READS
-                and words[2] in _GH_READS[words[1]]
+                len(inner) >= 3
+                and inner[1] in _GH_READS
+                and inner[2] in _GH_READS[inner[1]]
             )
             api_read = (
-                len(words) >= 2
-                and words[1] == "api"
+                len(inner) >= 2
+                and inner[1] == "api"
                 and not any(
                     word in {"-X", "--method", "-f", "--raw-field", "-F", "--field"}
                     or word.startswith(("-X", "--method="))
-                    for word in words[2:]
+                    for word in inner[2:]
                 )
             )
             if not allowed and not api_read:
@@ -343,11 +346,11 @@ def resolve(command: str) -> Resolution:
                 )
         if base == "issue-agent-publish":
             supported = (
-                len(words) >= 3
-                and words[1:3] == ["git", "push"]
+                len(inner) >= 3
+                and inner[1:3] == ["git", "push"]
             ) or (
-                len(words) >= 4
-                and words[1:4] == ["gh", "pr", "create"]
+                len(inner) >= 4
+                and inner[1:4] == ["gh", "pr", "create"]
             )
             if not supported:
                 return Unresolvable(
@@ -361,7 +364,7 @@ def resolve(command: str) -> Resolution:
             base not in _LITERAL_CONSUMERS
             and base not in _PASSTHROUGH_WRAPPERS
             and base != "env"
-            and any(_basename(word) in _GOVERNED_BINARIES for word in words[1:])
+            and any(_basename(word) in _GOVERNED_BINARIES for word in inner[1:])
         ):
             return Unresolvable(
                 f"unrecognized wrapper {base!r} precedes a governed binary"
@@ -396,6 +399,10 @@ _PUBLICATION_AUTHORITY_ENV = frozenset(
         "ISSUE_AGENT_PUBLICATION_OWNER",
         "ISSUE_AGENT_RUN_ID",
         "ISSUE_AGENT_CONFIG_VERSION",
+        "ISSUE_AGENT_GITHUB_HOST",
+        "ISSUE_AGENT_AUTHORITY_BUNDLE",
+        "GH_HOST",
+        "HARNESS_SCREENSHOTS_READ",
     }
 )
 

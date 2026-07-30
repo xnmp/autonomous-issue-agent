@@ -1,5 +1,8 @@
 """Worktree management + GateContext builder, driven by a fake git runner."""
 
+import hashlib
+import hmac
+import json
 import os
 import subprocess
 import threading
@@ -323,6 +326,100 @@ def test_build_gate_context_wires_run_tests():
                              run_tests=lambda cmd: cmd == "pytest")
     assert ctx.run_tests("pytest") is True
     assert ctx.run_tests("false") is False
+
+
+def _signed_screenshot_receipt(
+    path,
+    *,
+    key: bytes,
+    head: str,
+    image_path: str,
+    digest: str,
+) -> None:
+    payload = {
+        "v": 1,
+        "head": head,
+        "path": image_path,
+        "digest": digest,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    path.write_text(
+        json.dumps(
+            {
+                **payload,
+                "signature": hmac.new(
+                    key,
+                    encoded.encode(),
+                    hashlib.sha256,
+                ).hexdigest(),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+
+
+def test_signed_screenshot_receipt_binds_head_and_image_content(tmp_path) -> None:
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    image = evidence / "ac.png"
+    image.write_bytes(b"pixels-v1")
+    receipt = tmp_path / "receipt"
+    key = b"k" * 32
+    _signed_screenshot_receipt(
+        receipt,
+        key=key,
+        head="head-1",
+        image_path="evidence/ac.png",
+        digest=hashlib.sha256(b"pixels-v1").hexdigest(),
+    )
+    git = _builder_git(changed="evidence/ac.png")
+    git.table["rev-parse HEAD"] = GitResult(0, "head-1\n")
+
+    context = build_gate_context(
+        str(tmp_path),
+        base_branch="dev",
+        git=git,
+        screenshots_read_path=str(receipt),
+        screenshots_receipt_key=key,
+    )
+    assert context.screenshots_read == ("ac.png",)
+    assert context.screenshots_receipt_available is True
+
+    image.write_bytes(b"pixels-v2")
+    changed = build_gate_context(
+        str(tmp_path),
+        base_branch="dev",
+        git=git,
+        screenshots_read_path=str(receipt),
+        screenshots_receipt_key=key,
+    )
+    assert changed.screenshots_read == ()
+
+
+def test_agent_forged_screenshot_receipt_has_no_authority(tmp_path) -> None:
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    (evidence / "ac.png").write_bytes(b"pixels")
+    receipt = tmp_path / "receipt"
+    receipt.write_text(
+        '{"v":1,"head":"head-1","path":"evidence/ac.png",'
+        '"digest":"forged","signature":"forged"}\n'
+    )
+    git = _builder_git(changed="evidence/ac.png")
+    git.table["rev-parse HEAD"] = GitResult(0, "head-1\n")
+
+    context = build_gate_context(
+        str(tmp_path),
+        base_branch="dev",
+        git=git,
+        screenshots_read_path=str(receipt),
+        screenshots_receipt_key=b"k" * 32,
+    )
+
+    assert context.screenshots_read == ()
+    assert context.screenshots_receipt_available is True
 
 
 # ── default run_tests: timeout (P0.5 — a hung TEST_CMD must not wedge the gate) ──
