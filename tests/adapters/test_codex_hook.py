@@ -49,12 +49,19 @@ def test_gov_script_invokes_the_shared_governor():
     assert "exit 0" in script  # the uv-missing fail-open path
 
 
-def test_review_hook_enables_the_read_only_bash_policy():
-    cwd = tempfile.mkdtemp()
-    write_hook_config(cwd, review_only=True)
+def test_review_hook_cannot_leave_read_only_state_for_nested_fixers(tmp_path):
+    """Read-only policy belongs to a dispatched leg, never its hook artifact."""
+    reviewer = tmp_path / "target"
+    fixer = reviewer / ".claude" / "worktrees" / "issue-113"
+    fixer.mkdir(parents=True)
 
-    script = open(os.path.join(cwd, ".codex", "hooks", "gov.sh")).read()
-    assert "ISSUE_AGENT_REVIEW_READ_ONLY=1" in script
+    write_hook_config(str(reviewer), review_only=True)
+    write_hook_config(str(fixer))
+
+    review_hook = (reviewer / ".codex" / "hooks" / "gov.sh").read_text()
+    fixer_hook = (fixer / ".codex" / "hooks" / "gov.sh").read_text()
+    assert "ISSUE_AGENT_REVIEW_READ_ONLY" not in review_hook
+    assert "ISSUE_AGENT_REVIEW_READ_ONLY" not in fixer_hook
 
 
 def test_custom_governor_path():

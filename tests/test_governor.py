@@ -11,6 +11,8 @@ or:  uv run tests/test_governor.py   (pytest is in the inline deps)
 import os
 import sys
 import importlib.util
+import io
+import json
 
 import pytest
 
@@ -38,6 +40,21 @@ def test_codex_review_hook_allows_only_the_review_bash_surface():
     assert hook.review_only_violation("git diff --stat && gh pr view 97") is None
     assert hook.review_only_violation("gh pr review 97 --approve") is not None
     assert hook.review_only_violation("curl https://example.test") is not None
+
+
+def test_codex_review_environment_blocks_mutating_commands(monkeypatch):
+    """The reviewer boundary remains enforced when the runner sets its env."""
+    monkeypatch.setenv("ISSUE_AGENT_REVIEW_READ_ONLY", "1")
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        io.StringIO(json.dumps({"tool_input": {"command": "git commit -m x"}})),
+    )
+
+    with pytest.raises(SystemExit) as exit_code:
+        hook.main()
+
+    assert exit_code.value.code == 2
 
 
 # ── extract_commands: finds command nodes anywhere in the tree ────────────────

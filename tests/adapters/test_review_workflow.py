@@ -174,6 +174,7 @@ def test_codex_review_installs_its_hook_in_the_explicit_checkout_before_running(
 
     assert prepared == ["/explicit/review-checkout"]
     assert runner.tasks[0].cwd == "/explicit/review-checkout"
+    assert runner.tasks[0].env["ISSUE_AGENT_REVIEW_READ_ONLY"] == "1"
 
 
 def test_codex_review_refuses_an_implicit_process_cwd():
