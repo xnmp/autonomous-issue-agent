@@ -458,8 +458,7 @@ class FixWorkflow:
         self.store.save_session(issue, result.session_id)
         self._decay_infra_deaths(issue, result)
         pr = self.gateway.pr_for_issue(issue)
-        if pr is None and outcome.budget_exhausted(result.exit_reason):
-            self._journal_budget_path(issue, "resolve", result.exit_reason)
+        self._journal_budget_path(issue, "resolve", result.exit_reason, pr)
         if outcome.resolve_followup(result, pr is not None) is outcome.ResolveFollowup.RETRY:
             self._bump_resolve_retry(issue, result)
         self.executor.execute_all(self._resolve_actions(issue, result, pr))
@@ -513,9 +512,14 @@ class FixWorkflow:
             self._decay_infra_deaths(issue, author)
             fu_author = outcome.author_followup(author)
             if fu_author is not outcome.AuthorFollowup.AUTHORED:
+                pr = self.gateway.pr_for_issue(issue)
+                self._journal_budget_path(issue, "author", author.exit_reason, pr)
                 if fu_author is outcome.AuthorFollowup.RETRY:
                     self._bump_resolve_retry(issue, author)
-                self.executor.execute_all(outcome.author_actions(issue, author))
+                self.executor.execute_all(
+                    self._resolve_actions(issue, author, pr)
+                    if pr is not None else outcome.author_actions(issue, author)
+                )
                 return
             self.store.set_phase(issue, "authored")
 
@@ -556,6 +560,7 @@ class FixWorkflow:
             pr = self.gateway.pr_for_issue(issue)
             fu = outcome.implement_followup(impl, pr is not None)
             if fu is not outcome.ImplementFollowup.CONTRACT_CHANGE:
+                self._journal_budget_path(issue, "implement", impl.exit_reason, pr)
                 if fu is outcome.ImplementFollowup.RETRY:
                     self._bump_resolve_retry(issue, impl)
                 self.executor.execute_all(self._resolve_actions(issue, impl, pr))
@@ -615,8 +620,10 @@ class FixWorkflow:
             return
         self.store.set_resolve_retries(issue, self.store.get_resolve_retries(issue) + 1)
 
-    def _journal_budget_path(self, issue: int, leg: str, reason) -> None:
+    def _journal_budget_path(self, issue: int, leg: str, reason, pr: int | None) -> None:
         """Record the operator-cap path separately from capability escalation."""
+        if pr is not None or not outcome.budget_exhausted(reason):
+            return
         journal = self.cfg.journal
         if journal is None:
             return

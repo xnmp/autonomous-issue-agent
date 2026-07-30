@@ -316,6 +316,21 @@ def resolve_followup(result: AgentResult, pr_opened: bool) -> ResolveFollowup:
 _BLOCKED_FOOTER = "\n\n---\n_Reply to unblock. Any team member can answer._"
 
 
+def budget_actions(issue: int) -> list[Action]:
+    """Stop a budget-capped resolve-family leg for an operator cap review."""
+    return [
+        PostComment(
+            Target.ISSUE,
+            issue,
+            "**Budget review needed:** the resolve leg reached its configured "
+            "spend cap before finishing. Review the cap and resume when ready; "
+            "the saved handover will be provided to the next fixer leg.",
+        ),
+        Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED),
+        Relabel(Target.ISSUE, issue, None, Label.NEEDS_BUDGET_REVIEW),
+    ]
+
+
 def resolve_actions(
     issue: int,
     result: AgentResult,
@@ -345,17 +360,7 @@ def resolve_actions(
     # about whether a PR exists on GitHub, and a real PR must never be stranded
     # unlabelled just because the session was killed a second after opening it.
     if budget_exhausted(result.exit_reason):
-        return [
-            PostComment(
-                Target.ISSUE,
-                issue,
-                "**Budget review needed:** the resolve leg reached its configured "
-                "spend cap before finishing. Review the cap and resume when ready; "
-                "the saved handover will be provided to the next fixer leg.",
-            ),
-            Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED),
-            Relabel(Target.ISSUE, issue, None, Label.NEEDS_BUDGET_REVIEW),
-        ]
+        return budget_actions(issue)
     if infra_death(result.exit_reason):
         return []
     if fu is ResolveFollowup.BLOCKED:
@@ -394,6 +399,8 @@ def author_actions(issue: int, result: AgentResult) -> list[Action]:
     fu = author_followup(result)
     if fu is AuthorFollowup.AUTHORED:
         return []  # stay ai-working; dispatcher persists phase=authored
+    if budget_exhausted(result.exit_reason):
+        return budget_actions(issue)
     # The same guard the other three tails carry (review M15) — this leg was the
     # one that missed it. `author_followup` maps a killed session to RETRY, so an
     # OOM'd author leg relabelled ai-working→ai-ready, the fixer re-picked the
