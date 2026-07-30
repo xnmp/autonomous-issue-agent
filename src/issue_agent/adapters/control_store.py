@@ -1945,6 +1945,115 @@ class SQLiteControlStore:
             )
             return True
 
+    def record_world_snapshot(
+        self,
+        *,
+        deployment: str,
+        subject_kind: str,
+        observations: Mapping[
+            int,
+            tuple[str, Mapping[str, JsonValue], Correlation],
+        ],
+    ) -> int:
+        """Atomically publish one role feed's complete membership for a kind."""
+
+        if not deployment or subject_kind not in {"issue", "pr"}:
+            raise ValueError("world snapshot identity is incomplete")
+        if any(number <= 0 for number in observations):
+            raise ValueError("world snapshot subject numbers must be positive")
+        changed = 0
+        with self.transaction() as db:
+            prior = {
+                int(row["subject_number"]): str(row["content_hash"])
+                for row in db.execute(
+                    "SELECT subject_number, content_hash "
+                    "FROM world_observations "
+                    "WHERE deployment=? AND subject_kind=?",
+                    (deployment, subject_kind),
+                ).fetchall()
+            }
+            for number, (content_hash, raw_facts, correlation) in sorted(
+                observations.items()
+            ):
+                if not content_hash or content_hash.startswith("tombstone:"):
+                    raise ValueError("world observation hash is invalid")
+                facts = {"present": True, **dict(raw_facts)}
+                encoded = json.dumps(
+                    facts,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                expected_hash = hashlib.sha256(encoded.encode()).hexdigest()
+                if content_hash != expected_hash:
+                    raise ValueError(
+                        "world observation hash does not match its facts"
+                    )
+                if prior.get(number) == content_hash:
+                    continue
+                db.execute(
+                    "INSERT INTO world_observations("
+                    "deployment, subject_kind, subject_number, content_hash, "
+                    "observed_at) VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(deployment, subject_kind, subject_number) "
+                    "DO UPDATE SET content_hash=excluded.content_hash, "
+                    "observed_at=excluded.observed_at",
+                    (
+                        deployment,
+                        subject_kind,
+                        number,
+                        content_hash,
+                        _stamp(self._now()),
+                    ),
+                )
+                self._event(
+                    db,
+                    WorldObserved(
+                        subject_kind,
+                        number,
+                        content_hash,
+                        facts,
+                    ),
+                    correlation=correlation,
+                )
+                changed += 1
+            for number, old_hash in sorted(prior.items()):
+                if number in observations or old_hash.startswith("tombstone:"):
+                    continue
+                tombstone_hash = "tombstone:" + hashlib.sha256(
+                    f"{subject_kind}:{number}".encode()
+                ).hexdigest()
+                db.execute(
+                    "UPDATE world_observations SET content_hash=?, observed_at=? "
+                    "WHERE deployment=? AND subject_kind=? AND subject_number=?",
+                    (
+                        tombstone_hash,
+                        _stamp(self._now()),
+                        deployment,
+                        subject_kind,
+                        number,
+                    ),
+                )
+                correlation = (
+                    Correlation(issue=number)
+                    if subject_kind == "issue"
+                    else Correlation(pr=number)
+                )
+                self._event(
+                    db,
+                    WorldObserved(
+                        subject_kind,
+                        number,
+                        tombstone_hash,
+                        {
+                            "present": False,
+                            "reason": "absent_from_feed",
+                        },
+                    ),
+                    correlation=correlation,
+                )
+                changed += 1
+        return changed
+
     def snapshot(self, scope: BudgetScope) -> AccountingSnapshot:
         try:
             with self._connect() as db:

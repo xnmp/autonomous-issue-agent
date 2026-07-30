@@ -15,7 +15,11 @@ from .events import (
     ProjectionSnapshot,
     SpendRecorded,
     WorldObserved,
+    JsonValue,
 )
+
+WorldSubject = tuple[str, int]
+WorldFeedSubject = tuple[str, str, str, str, int]
 
 
 @dataclass(frozen=True)
@@ -29,7 +33,13 @@ class RunProjection:
 class ReadModel:
     runs: Mapping[str, RunProjection] = field(default_factory=dict)
     levels: Mapping[str, EventEnvelope] = field(default_factory=dict)
-    observed: Mapping[tuple[str, int], EventEnvelope] = field(default_factory=dict)
+    observed: Mapping[WorldSubject, EventEnvelope] = field(default_factory=dict)
+    observed_by_feed: Mapping[WorldFeedSubject, EventEnvelope] = field(
+        default_factory=dict
+    )
+    world_facts: Mapping[WorldSubject, Mapping[str, JsonValue]] = field(
+        default_factory=dict
+    )
     spend_micros_by_basis: Mapping[str, int] = field(default_factory=dict)
     applied_event_ids: frozenset[str] = frozenset()
     events: tuple[EventEnvelope, ...] = ()
@@ -40,7 +50,7 @@ def fold(events: Iterable[EventEnvelope]) -> ReadModel:
     ordered = sorted(unique.values(), key=lambda event: event.order_key)
     runs: dict[str, RunProjection] = {}
     levels: dict[str, EventEnvelope] = {}
-    observed: dict[tuple[str, int], EventEnvelope] = {}
+    observed_by_feed: dict[WorldFeedSubject, EventEnvelope] = {}
     spend: dict[str, int] = {}
     starts_by_event_id: dict[str, str] = {}
 
@@ -86,17 +96,81 @@ def fold(events: Iterable[EventEnvelope]) -> ReadModel:
                 {state_key: event for state_key in payload.open_levels}
             )
         elif isinstance(payload, WorldObserved):
-            observed[(payload.subject_kind, payload.subject_number)] = event
+            feed_key = (
+                event.producer.deployment,
+                event.producer.repository,
+                event.producer.role,
+                payload.subject_kind,
+                payload.subject_number,
+            )
+            observed_by_feed[feed_key] = event
         elif isinstance(payload, SpendRecorded):
             spend[payload.basis] = (
                 spend.get(payload.basis, 0) + payload.amount_micros
             )
 
+    observed, world_facts = _aggregate_world(observed_by_feed)
     return ReadModel(
         runs=MappingProxyType(runs),
         levels=MappingProxyType(levels),
         observed=MappingProxyType(observed),
+        observed_by_feed=MappingProxyType(observed_by_feed),
+        world_facts=MappingProxyType(
+            {
+                subject: MappingProxyType(facts)
+                for subject, facts in world_facts.items()
+            }
+        ),
         spend_micros_by_basis=MappingProxyType(spend),
         applied_event_ids=frozenset(unique),
         events=tuple(ordered),
     )
+
+
+def _aggregate_world(
+    by_feed: Mapping[WorldFeedSubject, EventEnvelope],
+) -> tuple[
+    dict[WorldSubject, EventEnvelope],
+    dict[WorldSubject, dict[str, JsonValue]],
+]:
+    subjects = {
+        (key[3], key[4])
+        for key in by_feed
+    }
+    observed: dict[WorldSubject, EventEnvelope] = {}
+    facts_by_subject: dict[WorldSubject, dict[str, JsonValue]] = {}
+    for subject in subjects:
+        candidates = [
+            event
+            for key, event in by_feed.items()
+            if (key[3], key[4]) == subject
+        ]
+        active = [
+            event
+            for event in candidates
+            if isinstance(event.payload, WorldObserved)
+            and event.payload.facts.get("present") is not False
+        ]
+        if not active:
+            latest = max(candidates, key=lambda event: event.order_key)
+            observed[subject] = latest
+            facts_by_subject[subject] = {"present": False}
+            continue
+        observed[subject] = max(active, key=lambda event: event.order_key)
+        field_values: dict[
+            str,
+            tuple[tuple[object, ...], JsonValue],
+        ] = {}
+        for event in active:
+            payload = event.payload
+            assert isinstance(payload, WorldObserved)
+            for field, value in payload.facts.items():
+                prior = field_values.get(field)
+                if prior is None or event.order_key > prior[0]:
+                    field_values[field] = (event.order_key, value)
+        facts_by_subject[subject] = {
+            field: value
+            for field, (_order, value) in field_values.items()
+        }
+        facts_by_subject[subject]["present"] = True
+    return observed, facts_by_subject

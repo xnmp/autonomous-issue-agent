@@ -315,7 +315,7 @@ def build_deployment_v2(
         )
         for role, path, log, events in feed_rows
     )
-    pr_issue = _v2_pr_issue(model.events)
+    pr_issue = _v2_pr_issue(model)
     grouped: dict[int, list[EventEnvelope]] = {}
     unattributed_events: list[EventEnvelope] = []
     for event in model.events:
@@ -392,18 +392,18 @@ def _v2_health(
     )
 
 
-def _v2_pr_issue(events: Iterable[EventEnvelope]) -> dict[int, int]:
+def _v2_pr_issue(model: ReadModel) -> dict[int, int]:
     result: dict[int, int] = {}
-    for event in events:
+    for event in model.events:
         correlation = event.correlation
         if correlation.pr is not None and correlation.issue is not None:
             result[correlation.pr] = correlation.issue
-        payload = event.payload
-        if not isinstance(payload, WorldObserved) or payload.subject_kind != "pr":
+    for (kind, number), facts in model.world_facts.items():
+        if kind != "pr" or facts.get("present") is False:
             continue
-        closing = payload.facts.get("closing_issue")
+        closing = facts.get("closing_issue")
         if isinstance(closing, int) and closing > 0:
-            result[payload.subject_number] = closing
+            result[number] = closing
     return result
 
 
@@ -486,14 +486,7 @@ def _v2_issue_row(
     running.sort(
         key=lambda leg: leg.ts or datetime.min.replace(tzinfo=timezone.utc)
     )
-    observations = [
-        event
-        for event in ordered
-        if isinstance(event.payload, WorldObserved)
-        and event.payload.subject_kind == "issue"
-        and event.payload.subject_number == issue
-    ]
-    facts = observations[-1].payload.facts if observations else {}
+    facts = model.world_facts.get(("issue", issue), {})
     labels_raw = facts.get("labels", ())
     labels = (
         {str(label) for label in labels_raw}

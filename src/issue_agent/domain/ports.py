@@ -351,6 +351,17 @@ class WorldObservationStore(Protocol):
         correlation: Correlation,
     ) -> bool: ...
 
+    def record_world_snapshot(
+        self,
+        *,
+        deployment: str,
+        subject_kind: str,
+        observations: Mapping[
+            int,
+            tuple[str, Mapping[str, JsonValue], Correlation],
+        ],
+    ) -> int: ...
+
 
 @runtime_checkable
 class BranchState(Protocol):

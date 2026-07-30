@@ -1,4 +1,5 @@
 from dataclasses import fields
+from datetime import datetime, timedelta, timezone
 
 from issue_agent.adapters.event_log import EventLog
 from issue_agent.domain.events import (
@@ -110,6 +111,118 @@ def test_rotation_retention_keeps_latest_world_observation(tmp_path) -> None:
     assert payload.facts == {"state": "OPEN"}
     assert observed.event_id == original.event_id
     assert observed.occurred_at == original.occurred_at
+
+
+def test_world_fold_merges_fields_and_applies_tombstones_per_feed(
+    tmp_path,
+) -> None:
+    now = datetime(2026, 7, 30, tzinfo=timezone.utc)
+    fix = EventLog(
+        str(tmp_path / "fix.jsonl"),
+        Producer("fix-deployment", "owner/repo", "fix", 100, "boot"),
+    )
+    steward = EventLog(
+        str(tmp_path / "steward.jsonl"),
+        Producer(
+            "steward-deployment",
+            "owner/repo",
+            "steward",
+            101,
+            "boot",
+        ),
+    )
+    fix_observation = fix.emit(
+        WorldObserved(
+            "issue",
+            7,
+            "fix-hash",
+            {
+                "present": True,
+                "state": "open",
+                "labels": ["ai-working"],
+            },
+        ),
+        correlation=Correlation(issue=7),
+        causation_time=now,
+    )
+    steward_observation = steward.emit(
+        WorldObserved(
+            "issue",
+            7,
+            "steward-hash",
+            {
+                "present": True,
+                "title": "Operator title",
+                "comments": [{"author": "human", "body": "reply"}],
+            },
+        ),
+        correlation=Correlation(issue=7),
+        causation_time=now + timedelta(seconds=1),
+    )
+
+    combined = fold((fix_observation, steward_observation))
+
+    assert combined.world_facts[("issue", 7)] == {
+        "present": True,
+        "state": "open",
+        "labels": ["ai-working"],
+        "title": "Operator title",
+        "comments": [{"author": "human", "body": "reply"}],
+    }
+    assert len(combined.observed_by_feed) == 2
+
+    steward_tombstone = steward.emit(
+        WorldObserved(
+            "issue",
+            7,
+            "tombstone:steward",
+            {"present": False, "reason": "absent_from_feed"},
+        ),
+        correlation=Correlation(issue=7),
+        causation_time=now + timedelta(seconds=2),
+    )
+    after_tombstone = fold(
+        (fix_observation, steward_observation, steward_tombstone)
+    )
+
+    assert after_tombstone.world_facts[("issue", 7)] == {
+        "present": True,
+        "state": "open",
+        "labels": ["ai-working"],
+    }
+    assert after_tombstone.observed[("issue", 7)] == fix_observation
+
+
+def test_world_fold_marks_subject_absent_only_after_every_feed_tombstones(
+    tmp_path,
+) -> None:
+    now = datetime(2026, 7, 30, tzinfo=timezone.utc)
+    log = EventLog(str(tmp_path / "events.jsonl"), _producer())
+    present = log.emit(
+        WorldObserved(
+            "pr",
+            9,
+            "present",
+            {"present": True, "state": "OPEN"},
+        ),
+        correlation=Correlation(pr=9),
+        causation_time=now,
+    )
+    absent = log.emit(
+        WorldObserved(
+            "pr",
+            9,
+            "tombstone:absent",
+            {"present": False, "reason": "absent_from_feed"},
+        ),
+        correlation=Correlation(pr=9),
+        causation_time=now + timedelta(seconds=1),
+    )
+
+    model = fold((present, absent))
+
+    assert model.world_facts[("pr", 9)] == {"present": False}
+    assert model.observed[("pr", 9)] == absent
 
 
 def test_oversized_event_is_rejected_before_write(tmp_path) -> None:
