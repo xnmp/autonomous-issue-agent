@@ -17,6 +17,7 @@ import json
 import math
 
 from ...domain import dashboard as dash
+from ...domain.actions import AgentKind
 
 # Frecency windows: (seconds, weight). An event inside 24h counts in all three,
 # which is the intended pile-up — a repo that moved this morning must outrank a
@@ -29,6 +30,8 @@ LIFECYCLE_LABELS = frozenset(
     {"ai-ready", "ai-working", "ai-done", "ai-blocked", "needs-human-review"}
 )
 PRIORITY_LABELS = ("P1", "P2", "P3")
+_AGENT_KINDS = frozenset(kind.name for kind in AgentKind)
+_PR_AGENT_KINDS = dash.REVIEW_KINDS | dash.REPAIR_KINDS | {"PR_RESUME"}
 
 
 def _utcnow() -> datetime:
@@ -806,18 +809,15 @@ def _journal_notification(event: dict, issue: int) -> dict | None:
         role = event.get("role")
         dispatch = event.get("dispatch")
         number = _event_number(event.get("number"))
-        known_kinds = (
-            dash.ISSUE_NUMBERED | dash.REVIEW_KINDS | dash.REPAIR_KINDS
-        )
         if (
-            kind not in known_kinds
+            kind not in _AGENT_KINDS
             or role not in dash.ROLE_NAMES
             or number is None
             or not isinstance(dispatch, str)
             or not dispatch.strip()
         ):
             return None
-        pr = number if kind in dash.REVIEW_KINDS | dash.REPAIR_KINDS else None
+        pr = number if kind in _PR_AGENT_KINDS else None
         target = f" for PR #{pr}" if pr is not None else ""
         return {
             "severity": "info",
