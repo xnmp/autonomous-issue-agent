@@ -433,6 +433,93 @@ def test_run_honours_result_despite_post_result_raise(monkeypatch):
     assert r.is_error is False
 
 
+def test_unpinned_sdk_legs_journal_the_init_models_resolved_value(monkeypatch, tmp_path):
+    """Default-model review and steward receipts name the concrete SDK model."""
+    from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
+
+    for role, kind in (("review", "REVIEW"), ("steward", "TRIAGE"), ("steward", "GROOM")):
+        init = type("InitMessage", (), {
+            "subtype": "init", "data": {"model": "claude-opus-4-1"},
+        })()
+        result = _ResultMessage(
+            is_error=False, structured_output={"decision": "APPROVE"}, session_id="s1",
+        )
+        _install_fake_sdk(monkeypatch, [init, result])
+
+        journal = Journal(str(tmp_path / f"{role}-{kind}.jsonl"))
+        runner = JournalingRuntime(AgentRunner(), journal, role=role)
+        runner.set_context(role, kind, 100, 91)
+
+        asyncio.run(runner.run(AgentTask(prompt="unconfigured SDK leg")))
+
+        start, settled = read_events(journal.path)
+        assert start["model"] == ""
+        assert settled["model"] == "claude-opus-4-1"
+
+
+def test_pinned_sdk_review_journal_keeps_the_configured_model(monkeypatch, tmp_path):
+    """Configured aliases remain the journal's model across the SDK session."""
+    from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
+
+    init = type("InitMessage", (), {
+        "subtype": "init", "data": {"model": "claude-opus-4-1"},
+    })()
+    result = _ResultMessage(
+        is_error=False, structured_output={"decision": "APPROVE"}, session_id="s1",
+    )
+    _install_fake_sdk(monkeypatch, [init, result])
+    journal = Journal(str(tmp_path / "review-journal.jsonl"))
+    runner = JournalingRuntime(AgentRunner(), journal, role="review")
+    runner.set_context("review", "REVIEW", 100, 91)
+
+    asyncio.run(runner.run(AgentTask(prompt="configured SDK leg", model="opus")))
+
+    start, settled = read_events(journal.path)
+    assert start["model"] == "opus"
+    assert settled["model"] == "opus"
+
+
+def test_unpinned_sdk_no_result_journals_the_init_models_resolved_value(monkeypatch, tmp_path):
+    """A dropped terminal envelope retains the SDK model in its settled receipt."""
+    from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
+
+    init = type("InitMessage", (), {
+        "subtype": "init", "data": {"model": "claude-opus-4-1"},
+    })()
+    _install_fake_sdk(monkeypatch, [init])
+    journal = Journal(str(tmp_path / "review-journal.jsonl"))
+    runner = JournalingRuntime(AgentRunner(), journal, role="review")
+    runner.set_context("review", "REVIEW", 100, 91)
+
+    asyncio.run(runner.run(AgentTask(prompt="unconfigured SDK leg")))
+
+    start, settled = read_events(journal.path)
+    assert start["model"] == ""
+    assert settled["exit_reason"] == "no_result"
+    assert settled["model"] == "claude-opus-4-1"
+
+
+def test_unpinned_sdk_timeout_journals_the_init_models_resolved_value(monkeypatch, tmp_path):
+    """An idle SDK leg keeps its init model when its timeout settles it."""
+    from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
+
+    init = type("InitMessage", (), {
+        "subtype": "init", "data": {"model": "claude-opus-4-1"},
+    })()
+    _install_hanging_sdk(monkeypatch, [init])
+    journal = Journal(str(tmp_path / "review-journal.jsonl"))
+    runner = JournalingRuntime(
+        AgentRunner(idle_timeout=0.05, poll_slice=0.01), journal, role="review"
+    )
+    runner.set_context("review", "REVIEW", 100, 91)
+
+    asyncio.run(runner.run(AgentTask(prompt="unconfigured SDK leg")))
+
+    _, settled = read_events(journal.path)
+    assert settled["exit_reason"] == "idle_timeout"
+    assert settled["model"] == "claude-opus-4-1"
+
+
 def test_run_skips_task_notification_followup_result(monkeypatch):
     """A background task finishing injects a synthetic follow-up whose ResultMessage
     carries origin={"kind":"task-notification"}. It must NOT be taken as our result —

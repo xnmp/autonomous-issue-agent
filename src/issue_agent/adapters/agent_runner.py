@@ -204,6 +204,25 @@ def _declared_status(structured: Any) -> str:
     return ""
 
 
+def reported_model(msg: Any) -> str:
+    """Concrete model named by an SDK init or result message, if any.
+
+    A task may intentionally leave ``model`` unset and let the SDK choose its
+    deployable default. The SDK reports that choice in the init message's data;
+    newer result envelopes may report it directly. Keep this adapter boundary
+    tolerant of either append-only SDK shape.
+    """
+    direct = getattr(msg, "model", None)
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    data = getattr(msg, "data", None)
+    if isinstance(data, dict):
+        nested = data.get("model")
+        if isinstance(nested, str) and nested.strip():
+            return nested.strip()
+    return ""
+
+
 def result_to_agent_result(msg: Any) -> AgentResult:
     """Pure: SDK ResultMessage → domain AgentResult. Duck-typed (reads attrs) so
     a test can pass a stand-in object. Mirrors claude_outcome / save_session:
@@ -239,6 +258,7 @@ def result_to_agent_result(msg: Any) -> AgentResult:
         summary=summary,
         needs=needs,
         cost_usd=float(getattr(msg, "total_cost_usd", 0.0) or 0.0),
+        model=reported_model(msg),
         session_id=getattr(msg, "session_id", "") or "",
         structured=structured if isinstance(structured, dict) else None,
         exit_reason=exit_reason_from_envelope(
@@ -528,6 +548,19 @@ class AgentRunner(AgentRuntime):
         last_kind = "none"
         last_msg: Any = None  # the actual last message object (for drop-path forensics)
         terminal_seen = ""    # any terminal_reason observed across the stream
+        resolved_model = ""   # the SDK init model for an intentionally unpinned task
+
+        def with_resolved_model(result: AgentResult) -> AgentResult:
+            """Keep the init model on every returned terminal outcome.
+
+            The SDK only supplies an init envelope before a no-result, idle, or
+            wall timeout outcome, so waiting for a ResultMessage loses the only
+            concrete model attribution for an otherwise settled journal receipt.
+            """
+            if resolved_model and not result.model:
+                return dataclasses.replace(result, model=resolved_model)
+            return result
+
         # Running token total, so an abort still reports what it spent. Only the
         # final ResultMessage carries dollars, so without this every wall-cap /
         # idle / dropped-result run ledgers $0.00 no matter how long it ran.
@@ -551,9 +584,9 @@ class AgentRunner(AgentRuntime):
                     if elapsed >= self._max_runtime:
                         await _aclose_quietly(agen)
                         if final is None:
-                            return self._wall_timeout(
+                            return with_resolved_model(self._wall_timeout(
                                 elapsed, last_trace, usage_acc, msg_count
-                            )
+                            ))
                         self._log(
                             f"sdk: WALL — {elapsed:.0f}s exceeded max "
                             f"{self._max_runtime:.0f}s, but a ResultMessage was "
@@ -623,14 +656,14 @@ class AgentRunner(AgentRuntime):
                             pending.cancel()
                             await _aclose_quietly(agen)
                             if final is None:
-                                return AgentResult(
+                                return with_resolved_model(AgentResult(
                                     is_error=True, status="timeout",
                                     exit_reason=ExitReason.IDLE_TIMEOUT,
                                     summary=f"agent idle >{self._idle_timeout:.0f}s "
                                             "(no stream event)",
                                     usage=usage_acc,
                                     stream_usage=usage_acc,
-                                )
+                                ))
                             stream_ended = True  # had a result; honour it below
                             break
                         elapsed = now - started_at
@@ -646,9 +679,9 @@ class AgentRunner(AgentRuntime):
                                 # between-receives wall path above: this branch used
                                 # to omit it, so a limping-stream wall abort ledgered
                                 # $0.00 — the precise hole merge_usage exists to close.
-                                return self._wall_timeout(
+                                return with_resolved_model(self._wall_timeout(
                                     elapsed, last_trace, usage_acc, msg_count
-                                )
+                                ))
                             self._log(
                                 f"sdk: WALL — {elapsed:.0f}s exceeded max "
                                 f"{self._max_runtime:.0f}s, but a ResultMessage was "
@@ -668,6 +701,7 @@ class AgentRunner(AgentRuntime):
                 msg_count += 1
                 last_kind = type(message).__name__
                 last_msg = message
+                resolved_model = reported_model(message) or resolved_model
                 usage_acc = merge_usage(usage_acc, getattr(message, "usage", None))
                 # Capture any terminal_reason the SDK attaches to ANY message — a
                 # background-requested turn end carries it on a non-Result message,
@@ -735,6 +769,7 @@ class AgentRunner(AgentRuntime):
                 # Best-effort — an exception with __slots__ refuses the write.
                 try:
                     exc.harness_last_trace = last_trace
+                    exc.harness_resolved_model = resolved_model
                 except Exception:
                     pass
                 raise
@@ -774,14 +809,15 @@ class AgentRunner(AgentRuntime):
                 + " — result-delivery drop (no exception raised)"
                 + forensic
             )
-            return AgentResult(
+            return with_resolved_model(AgentResult(
                 is_error=True,
                 summary="no ResultMessage from query()",
                 exit_reason=ExitReason.NO_RESULT,
                 usage=usage_acc,
                 stream_usage=usage_acc,
-            )
+            ))
         result = result_to_agent_result(final)
+        result = with_resolved_model(result)
         # Attach the stream sum to the COMPLETED result too: journaled beside the
         # ResultMessage total, each completed run becomes a calibration pair, and
         # the estimator learns its $/token rate in stream units — the only units
