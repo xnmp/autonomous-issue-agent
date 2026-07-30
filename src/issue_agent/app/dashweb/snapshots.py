@@ -31,6 +31,7 @@ LIFECYCLE_LABELS = frozenset(
 )
 PRIORITY_LABELS = ("P1", "P2", "P3")
 _AGENT_KINDS = frozenset(kind.name for kind in AgentKind)
+_DISPATCH_AGENT_KINDS = _AGENT_KINDS - {"ROUTE"}
 _PR_AGENT_KINDS = dash.REVIEW_KINDS | dash.REPAIR_KINDS | {"PR_RESUME"}
 
 
@@ -759,9 +760,14 @@ def journal_notifications(rows, limit: int = 100) -> list[dict]:
         projected = _journal_notification(event, issue)
         if projected is None:
             continue
+        identity_source = (
+            {"issue": issue, "dispatch": event["dispatch"]}
+            if event.get("event") == "agent_run_start"
+            else {"issue": issue, "event": event}
+        )
         identity = hashlib.sha256(
             json.dumps(
-                {"issue": issue, "event": event},
+                identity_source,
                 sort_keys=True,
                 separators=(",", ":"),
                 default=str,
@@ -810,7 +816,7 @@ def _journal_notification(event: dict, issue: int) -> dict | None:
         dispatch = event.get("dispatch")
         number = _event_number(event.get("number"))
         if (
-            kind not in _AGENT_KINDS
+            kind not in _DISPATCH_AGENT_KINDS
             or role not in dash.ROLE_NAMES
             or number is None
             or not isinstance(dispatch, str)
