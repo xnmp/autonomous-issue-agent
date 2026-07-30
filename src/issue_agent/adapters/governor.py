@@ -425,7 +425,9 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
         return [tests_result.reason]
 
     declarations, _ = gate.parse_test_immutability_exceptions(
-        ctx.test_immutability_exceptions
+        gate.active_test_immutability_manifest(
+            ctx.changed_files, ctx.test_immutability_exceptions
+        )
     )
     new_tests, impl = gate.partition_changed(
         ctx.changed_files,
@@ -497,7 +499,7 @@ def _push_gate_for_branch(branch: str, ctx: GateContext) -> list[str]:
             ctx.changed_files,
             ctx.exists_at_base,
             exists_at_head=ctx.exists_at_head,
-            issue_number=gate.branch_issue_number(ctx.branch),
+            issue_number=gate.branch_issue_number(branch),
             exception_manifest=ctx.test_immutability_exceptions,
         ),
     )

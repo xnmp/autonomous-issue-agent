@@ -13,7 +13,25 @@ fail() { echo "Push blocked: $1"; exit 1; }
 # shellcheck source=_pr_common.sh
 . "$(dirname "$0")/_pr_common.sh"
 
-branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+checked_out_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+branch="$checked_out_branch"
+remote_seen=""
+for arg in "$@"; do
+  [ "$arg" = "push" ] && continue
+  case "$arg" in -*) continue ;; esac
+  if [ -z "$remote_seen" ]; then
+    remote_seen=1
+    continue
+  fi
+  destination="${arg#+}"
+  case "$destination" in *:*) destination="${destination#*:}" ;; esac
+  destination="${destination#refs/heads/}"
+  case "$destination" in
+    HEAD|@) branch="$checked_out_branch" ;;
+    *) branch="$destination" ;;
+  esac
+  break
+done
 base="${BASE_BRANCH:-dev}"
 
 # Only governed-shape branches carry harness work; anything else → allow.

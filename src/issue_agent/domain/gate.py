@@ -459,6 +459,13 @@ def parse_test_immutability_exceptions(
     return tuple(declarations), ""
 
 
+def active_test_immutability_manifest(
+    changed: Iterable[str], manifest: str
+) -> str:
+    """Return this change's declaration, excluding an audit record from its base."""
+    return manifest if TEST_IMMUTABILITY_EXCEPTIONS in changed else ""
+
+
 def check_tests_immutable(
     changed: Iterable[str],
     exists_at_base: Callable[[str], bool],
@@ -469,14 +476,12 @@ def check_tests_immutable(
 ) -> GateResult:
     """Deny existing-test changes unless a narrow, auditable exception matches."""
     changed_files = tuple(changed)
-    declarations, parse_error = parse_test_immutability_exceptions(exception_manifest)
+    active_manifest = active_test_immutability_manifest(
+        changed_files, exception_manifest
+    )
+    declarations, parse_error = parse_test_immutability_exceptions(active_manifest)
     if parse_error:
         return deny(parse_error)
-    if declarations and TEST_IMMUTABILITY_EXCEPTIONS not in changed_files:
-        return deny(
-            "test-immutability exceptions must be committed in "
-            f"'{TEST_IMMUTABILITY_EXCEPTIONS}'"
-        )
     by_path = {declaration.path: declaration for declaration in declarations}
     existing_tests = {
         path for path in changed_files if looks_like_test(path) and exists_at_base(path)

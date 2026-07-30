@@ -738,8 +738,8 @@ def _test_immutability_exception_notice(diff: str) -> str:
     )
     return (
         "🚨 TEST IMMUTABILITY EXCEPTION DECLARED. Judge each justification and "
-        "REQUEST_CHANGES if it weakens coverage or its replacement is inadequate:\n"
-        f"{details}"
+        "REQUEST_CHANGES if it weakens coverage or its replacement is inadequate.\n"
+        f"{_fenced('test immutability exception', details)}"
     )
 
 
