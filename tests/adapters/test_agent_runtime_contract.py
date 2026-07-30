@@ -118,16 +118,25 @@ def test_review_verdict_contract_is_shared_and_drives_dashboard_guardrails():
     claude = _claude_result(
         structured={"decision": "APPROVE", "body": "looks good"},
     )
-    codex = _codex_result(
+    codex_changes_requested = _codex_result(
         structured={"decision": "REQUEST_CHANGES", "body": "please fix this"},
+    )
+    codex_approve = _codex_result(
+        structured={"decision": "APPROVE", "body": "looks good"},
     )
 
     assert claude.status == "APPROVE"
-    assert codex.status == "REQUEST_CHANGES"
+    assert codex_changes_requested.status == "REQUEST_CHANGES"
+    assert codex_approve.status == "APPROVE"
 
     codex_event = {
         "event": "agent_run", "role": "review", "kind": "REVIEW",
-        "number": 125, "issue": 125, "status": codex.status,
+        "number": 125, "issue": 125, "status": codex_changes_requested.status,
+        "model": "gpt-5.6-sol",
+    }
+    codex_approve_event = {
+        "event": "agent_run", "role": "review", "kind": "REVIEW",
+        "number": 127, "issue": 127, "status": codex_approve.status,
         "model": "gpt-5.6-sol",
     }
     claude_event = {
@@ -137,6 +146,7 @@ def test_review_verdict_contract_is_shared_and_drives_dashboard_guardrails():
     }
 
     assert stage_for([codex_event]) == "changes requested"
+    assert stage_for([codex_approve_event]) == "awaiting merge"
     assert stage_for([claude_event]) == "awaiting merge"
     assert first_pass_verdicts(build_issue_rows([codex_event, claude_event], [])) == (1, 1)
 
