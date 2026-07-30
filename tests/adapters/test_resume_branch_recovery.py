@@ -68,6 +68,61 @@ def test_resume_recreates_removed_worktree_on_original_branch_with_blocked_commi
     ).returncode == 1
 
 
+def test_resume_ignores_stale_synthesized_branch_when_recovering_blocked_work(tmp_path):
+    """A stale fallback branch must not hide the original blocked-work branch."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str, cwd: Path = repo) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=cwd, check=True, text=True, capture_output=True,
+        ).stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test User")
+    (repo / "base.txt").write_text("base\n")
+    git("add", "base.txt")
+    git("commit", "-qm", "base")
+    git("branch", "-M", "dev")
+
+    def worktree_git(args: list[str], cwd: str) -> GitResult:
+        if args[:2] == ["fetch", "origin"]:
+            return GitResult(0, "")
+        return _subprocess_git(args, cwd)
+
+    issue = 5
+    original_branch = "fix/5-preserve-blocked-work"
+    stale_branch = "fix/5-retitled-after-blocked-work"
+    worktrees = Worktrees(str(repo), worktree_root="worktrees", run=worktree_git)
+    original_cwd = Path(worktrees.ensure(issue, original_branch))
+    (original_cwd / "blocked.txt").write_text("blocked work\n")
+    git("add", "blocked.txt", cwd=original_cwd)
+    git("commit", "-qm", "blocked work", cwd=original_cwd)
+    blocked_commit = git("rev-parse", "HEAD", cwd=original_cwd)
+    git("worktree", "remove", str(original_cwd), "--force")
+    git("branch", stale_branch, "dev")
+
+    iss = IssueView(issue, title="Retitled after blocked work", body="body", comments=(
+        Comment("fix-bot", "asking", "t1"),
+        Comment("alice", "continue", "t2"),
+    ))
+    runner = FakeRunner(AgentResult(is_error=False, status="blocked", session_id="s5"))
+    workflow = _workflow(
+        FakeGateway(issues={issue: iss}, pr_for_issue={}),
+        Store(str(tmp_path / "state")),
+        runner,
+        worktrees,
+        fix_bot="fix-bot",
+    )
+
+    asyncio.run(workflow.resume(issue))
+
+    recovered_cwd = Path(runner.tasks[0].cwd)
+    assert git("branch", "--show-current", cwd=recovered_cwd) == original_branch
+    assert git("rev-parse", "HEAD", cwd=recovered_cwd) == blocked_commit
+
+
 def test_resolve_persists_branch_for_future_reply_recovery(tmp_path):
     issue = 5
     title = "Preserve blocked work"
