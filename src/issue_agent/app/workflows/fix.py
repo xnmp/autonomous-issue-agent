@@ -475,6 +475,7 @@ class FixWorkflow:
         self.store.save_session(issue, result.session_id)
         self._decay_infra_deaths(issue, result)
         pr = self.gateway.pr_for_issue(issue)
+        self._journal_budget_path(issue, "resolve", result.exit_reason, pr)
         if outcome.resolve_followup(result, pr is not None) is outcome.ResolveFollowup.RETRY:
             self._bump_resolve_retry(issue, result)
         self.executor.execute_all(self._resolve_actions(issue, result, pr))
@@ -528,9 +529,14 @@ class FixWorkflow:
             self._decay_infra_deaths(issue, author)
             fu_author = outcome.author_followup(author)
             if fu_author is not outcome.AuthorFollowup.AUTHORED:
+                pr = self.gateway.pr_for_issue(issue)
+                self._journal_budget_path(issue, "author", author.exit_reason, pr)
                 if fu_author is outcome.AuthorFollowup.RETRY:
                     self._bump_resolve_retry(issue, author)
-                self.executor.execute_all(outcome.author_actions(issue, author))
+                self.executor.execute_all(
+                    self._resolve_actions(issue, author, pr)
+                    if pr is not None else outcome.author_actions(issue, author)
+                )
                 return
             self.store.set_phase(issue, "authored")
 
@@ -571,6 +577,7 @@ class FixWorkflow:
             pr = self.gateway.pr_for_issue(issue)
             fu = outcome.implement_followup(impl, pr is not None)
             if fu is not outcome.ImplementFollowup.CONTRACT_CHANGE:
+                self._journal_budget_path(issue, "implement", impl.exit_reason, pr)
                 if fu is outcome.ImplementFollowup.RETRY:
                     self._bump_resolve_retry(issue, impl)
                 self.executor.execute_all(self._resolve_actions(issue, impl, pr))
@@ -618,6 +625,8 @@ class FixWorkflow:
         paid session per poll on the most expensive leg (#39's shape). Infra
         deaths don't count (no attempt was made); blocked / PR-opened outcomes
         don't requeue, so they never reach here."""
+        if outcome.budget_exhausted(result.exit_reason):
+            return
         if outcome.infra_death(result.exit_reason):
             # …but it IS counted against the separate, higher infra ceiling
             # (review C3/D2c): dying before a result is its own paid loop, and
@@ -627,6 +636,18 @@ class FixWorkflow:
             self.store.bump_infra_deaths(issue)
             return
         self.store.set_resolve_retries(issue, self.store.get_resolve_retries(issue) + 1)
+
+    def _journal_budget_path(self, issue: int, leg: str, reason, pr: int | None) -> None:
+        """Record the operator-cap path separately from capability escalation."""
+        if pr is not None or not outcome.budget_exhausted(reason):
+            return
+        journal = self.cfg.journal
+        if journal is None:
+            return
+        try:
+            journal.emit("budget_path", issue=issue, leg=leg, exit_reason=reason.value)
+        except Exception as exc:  # noqa: BLE001 — telemetry never fails a dispatch
+            self.cfg.log(f"agent #{issue}: budget path not journalled ({exc})")
 
     async def resume(self, issue: int) -> None:
         iss = self.gateway.get_issue(issue)

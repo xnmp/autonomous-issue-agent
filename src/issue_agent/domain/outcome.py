@@ -39,15 +39,21 @@ HUMAN is already engaged (they answered a question to get here); silently
 requeueing would discard that engagement and re-run a paid session on the same
 unanswered ambiguity. Keeping it `ai-blocked` keeps the human in the loop.
 
-**Infra death** (`KILLED_EXTERNALLY` / `TRANSPORT_DEATH`) emits no label move on
-the issue legs and burns no retry anywhere. The session died for a reason the
-agent had no part in — an OOM/jetsam SIGKILL mid-e2e (FAILURE-MODES #58), an
-operator kill, a severed control stream. Treating that as an attempt did two
-concrete harms: it marched the CI/review/rebase breakers toward
-`needs-human-review` on work that was never actually tried, and it relabelled
-`ai-working`→`ai-ready`, racing an operator's manual `ai-blocked` (#65). Leaving
-the issue `ai-working` is the DESIGNED settle path: the in-process reaper sees an
-`ai-working` issue with no live session on the next idle tick and requeues it once.
+## Exit-reason taxonomy
+
+There are three policy classes, defined here so retry callers cannot drift:
+
+* **agent strikes** (`AGENT_ERROR`, timeouts, no result) mean the agent returned
+  or remained alive long enough to make an attempt; the relevant retry breaker
+  advances.
+* **infra deaths** (`KILLED_EXTERNALLY`, `TRANSPORT_DEATH`) are non-strikes.
+  They leave issue legs alone for the reaper and count only against the separate
+  infra-death ceiling.
+* **budget exhaustion** (`BUDGET_EXHAUSTED`, surfaced by Codex as
+  `error_max_budget_usd`) is also a non-strike, but it is actionable: the resolve
+  path blocks the issue for a cap review and labels it `needs-budget-review`.
+  The graceful wind-down handover is therefore preserved for the next deliberately
+  resumed leg rather than being discarded in an automatic retry loop.
 """
 
 from __future__ import annotations
@@ -105,6 +111,16 @@ def infra_death(reason: ExitReason | None) -> bool:
     at exactly today's behavior until an adapter starts populating the field.
     """
     return reason in (ExitReason.KILLED_EXTERNALLY, ExitReason.TRANSPORT_DEATH)
+
+
+def budget_exhausted(reason: ExitReason | None) -> bool:
+    """Whether the harness ended a leg at its configured spend ceiling.
+
+    This is deliberately separate from ``infra_death``: both are non-strikes,
+    but a budget cap needs an operator-visible budget path rather than the
+    automatic reaper retry used for a transient process or gateway death.
+    """
+    return reason is ExitReason.BUDGET_EXHAUSTED
 
 
 # ── deterministic transport deaths (#13) ──────────────────────────────────────
@@ -300,6 +316,29 @@ def resolve_followup(result: AgentResult, pr_opened: bool) -> ResolveFollowup:
 _BLOCKED_FOOTER = "\n\n---\n_Reply to unblock. Any team member can answer._"
 
 
+def unblock_prompt(heading: str, message: str) -> str:
+    """Build a blocked-thread prompt that `last_human_reply` can resume from."""
+    return f"{heading}\n\n{message}{_BLOCKED_FOOTER}"
+
+
+def budget_actions(issue: int) -> list[Action]:
+    """Stop a budget-capped resolve-family leg for an operator cap review."""
+    return [
+        PostComment(
+            Target.ISSUE,
+            issue,
+            unblock_prompt(
+                "**Agent needs input:**",
+                "**Budget review needed:** the resolve leg reached its configured "
+                "spend cap before finishing. Review the cap and resume when ready; "
+                "the saved handover will be provided to the next fixer leg.",
+            ),
+        ),
+        Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED),
+        Relabel(Target.ISSUE, issue, None, Label.NEEDS_BUDGET_REVIEW),
+    ]
+
+
 def resolve_actions(
     issue: int,
     result: AgentResult,
@@ -310,7 +349,9 @@ def resolve_actions(
     """resolve-issue.sh tail as Actions. pr is the discovered PR number (ground
     truth) or None. PR opened → label issue+PR ai-pr-open; blocked → comment the
     'needs' and ai-blocked; error → back to ai-ready (never strand ai-working);
-    infra death → NOTHING (stay ai-working for the reaper; see module docstring)."""
+    infra death → NOTHING (stay ai-working for the reaper); budget exhaustion →
+    ai-blocked + needs-budget-review so a cap decision, not an agent breaker,
+    controls continuation (see module docstring)."""
     if issue_closed_without_pr:
         return [
             RemoveWorktree(issue),
@@ -326,12 +367,14 @@ def resolve_actions(
     # Checked AFTER the ground-truth PR branch: how the session died says nothing
     # about whether a PR exists on GitHub, and a real PR must never be stranded
     # unlabelled just because the session was killed a second after opening it.
+    if budget_exhausted(result.exit_reason):
+        return budget_actions(issue)
     if infra_death(result.exit_reason):
         return []
     if fu is ResolveFollowup.BLOCKED:
         needs = result.needs or result.summary or "see logs"
         return [
-            PostComment(Target.ISSUE, issue, f"**Agent needs input:**\n\n{needs}{_BLOCKED_FOOTER}"),
+            PostComment(Target.ISSUE, issue, unblock_prompt("**Agent needs input:**", needs)),
             Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED),
         ]
     return [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)]
@@ -364,6 +407,8 @@ def author_actions(issue: int, result: AgentResult) -> list[Action]:
     fu = author_followup(result)
     if fu is AuthorFollowup.AUTHORED:
         return []  # stay ai-working; dispatcher persists phase=authored
+    if budget_exhausted(result.exit_reason):
+        return budget_actions(issue)
     # The same guard the other three tails carry (review M15) — this leg was the
     # one that missed it. `author_followup` maps a killed session to RETRY, so an
     # OOM'd author leg relabelled ai-working→ai-ready, the fixer re-picked the
@@ -377,7 +422,7 @@ def author_actions(issue: int, result: AgentResult) -> list[Action]:
     if fu is AuthorFollowup.BLOCKED:
         needs = result.needs or result.summary or "see logs"
         return [
-            PostComment(Target.ISSUE, issue, f"**Author needs input:**\n\n{needs}{_BLOCKED_FOOTER}"),
+            PostComment(Target.ISSUE, issue, unblock_prompt("**Author needs input:**", needs)),
             Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED),
         ]
     return [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)]
@@ -454,7 +499,7 @@ def resume_actions(
     if classify_outcome(result) == Outcome.BLOCKED:
         needs = result.needs or result.summary or "see logs"
         return [
-            PostComment(Target.ISSUE, issue, f"**Agent still needs input:**\n\n{needs}{_BLOCKED_FOOTER}"),
+            PostComment(Target.ISSUE, issue, unblock_prompt("**Agent still needs input:**", needs)),
             Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED),
         ]
     return [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED)]
@@ -473,7 +518,7 @@ def pr_resume_actions(pr: int, result: AgentResult) -> list[Action]:
     if classify_outcome(result) is Outcome.BLOCKED:
         needs = result.needs or result.summary or "see logs"
         return [
-            PostComment(Target.PR, pr, f"**Agent still needs input:**\n\n{needs}{_BLOCKED_FOOTER}"),
+            PostComment(Target.PR, pr, unblock_prompt("**Agent still needs input:**", needs)),
         ]
     return [Relabel(Target.PR, pr, Label.AI_BLOCKED, Label.AI_PR_OPEN)]
 
@@ -545,7 +590,7 @@ def fix_ci_actions(pr: int, result: AgentResult) -> list[Action]:
         # it thought it needed. The human inherits a mystery.
         needs = result.needs or result.summary or "see logs"
         return [
-            PostComment(Target.PR, pr, f"**Agent needs input:**\n\n{needs}{_BLOCKED_FOOTER}"),
+            PostComment(Target.PR, pr, unblock_prompt("**Agent needs input:**", needs)),
             Relabel(Target.PR, pr, None, Label.AI_BLOCKED),
         ]
     return []
