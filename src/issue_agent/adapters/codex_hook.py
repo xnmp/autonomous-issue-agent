@@ -105,11 +105,16 @@ def _without_generated_instructions(content: str) -> str:
     return content[:start] + suffix.removeprefix("\n")
 
 
-def _gov_script(governor_path: str) -> str:
+def _gov_script(governor_path: str, legacy_review_only: bool = False) -> str:
     # Mirrors plugin/hooks/dispatch.sh: fail OPEN if uv is missing (the PR gate +
     # CI + reviewer are the real boundary), else pipe stdin into the governor.
+    legacy_comment = (
+        "# Legacy ISSUE_AGENT_REVIEW_READ_ONLY=1 argument is ignored; policy is per-leg.\n"
+        if legacy_review_only else ""
+    )
     return f"""#!/usr/bin/env bash
 # Codex PreToolUse hook → harness governor (auto-generated; do not edit).
+{legacy_comment}# Read-only state is supplied only by the review child environment.
 if ! command -v uv >/dev/null 2>&1; then
   echo "bash_governor: uv not found; allowing (gate degraded)" >&2
   exit 0
@@ -227,7 +232,7 @@ def write_hook_config(
 
     gov_script_path = os.path.join(hooks_dir, "gov.sh")
     with open(gov_script_path, "w") as f:
-        f.write(_gov_script(governor_path))
+        f.write(_gov_script(governor_path, review_only))
     os.chmod(
         gov_script_path,
         os.stat(gov_script_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH,

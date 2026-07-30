@@ -1608,8 +1608,6 @@ def test_codex_reviewer_defers_hook_installation_until_dispatch(tmp_path, monkey
     assert hook_calls == []
 
 
-
-
 def test_codex_reviewer_names_its_unpriced_budget_warning(tmp_path, monkeypatch, capsys):
     """A review deployment must not inherit a fixer-only warning that sends the
     operator to the wrong knob while REVIEW_BUDGET_USD is unmeasurable."""
