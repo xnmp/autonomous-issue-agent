@@ -219,6 +219,14 @@ self-referential `TEST_CMD`/`.harness/test-cmd` (the #63 fork-bomb class) into
 a loud bounded failure instead of an unbounded process tree; gate timeouts
 kill the whole process group, not just the direct child.
 
+Existing tests remain immutable by default. A wrong expectation may be corrected
+only with a tracked `.harness/test-immutability-exceptions` line in the form
+`<issue> | <test path> | <reason> | <replacement test>`. The issue must match the
+branch and the path must match an existing changed test. An empty replacement
+means an in-place rewrite; deletion requires a new replacement test in the same
+diff. Both Python and Bash gates fail closed on malformed or unmatched entries,
+and reviewer task builders elevate the declaration from the PR diff.
+
 Late-heartbeat reconciliation requires both the wall threshold and a positive
 wall-minus-active-monotonic gap, distinguishing a machine suspension from an
 ordinary long agent leg. A detected gap journals a `stall`, re-verifies durable

@@ -267,7 +267,7 @@ and non-circumventable; "Prompt" = honor-system instruction in `AGENT.md`;
 | 12 | Adversarial pre-PR verdict = PASS | **Hook (soft)** | `check-pr.sh` §8 reads `.harness/adversarial-verdict`, which the agent writes — see note below |
 | 13 | ADR referenced when a governed path changes | **Hook** | `check-pr.sh` §9 (`Governs:` line in `docs/adr/*`, matched with `grep -F`) |
 | 14 | AC generated/posted **before** code | **Hook (marker)** + reviewer | `check-pr.sh` §4 requires `.harness/ac-posted`; reviewer dim 3 checks evidence vs AC |
-| 15 | Don't modify/delete existing tests | **Hook** + reviewer | `check-pr.sh` §7b blocks edits to test files present on base; reviewer dim 1/2 |
+| 15 | Existing tests are immutable unless a narrow correction is declared | **Hook** + reviewer | `check-pr.sh` §7b requires a tracked, issue/file/reason-scoped `.harness/test-immutability-exceptions`; deletions require a new replacement test, and reviewer prompts elevate every declaration |
 | 16 | Every commit subject uses an allowed prefix | **Hook** | `check-commit.sh` (commit-time) + `check-pr.sh` §6 re-checks the whole log (closes the `-F` bypass) |
 | 17 | Don't violate `INVARIANTS.md` | **Prompt** + reviewer + steward | `AGENT.md`; reviewer dim 5; steward owns the file (no marker — accepted) |
 | 18 | Don't refactor unrelated code | **Prompt** + reviewer | `AGENT.md` hard rule; reviewer flags scope creep — no structural diff-scope bound |

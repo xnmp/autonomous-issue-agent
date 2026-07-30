@@ -219,7 +219,16 @@ don't keep going back to edit it — each re-plan costs a full model round-trip.
 ## Hard rules
 - Do NOT use `--no-verify`, `-n` on commit, `HUSKY=0`, or override
   `core.hooksPath`. The gate is mandatory and these are blocked anyway.
-- Do NOT skip, disable, or modify existing tests. Do NOT refactor unrelated code.
+- Do NOT skip, disable, or modify existing tests by default. If the issue itself
+  requires correcting a genuinely wrong existing expectation, commit
+  `.harness/test-immutability-exceptions` (force-add it because `.harness/` is
+  normally ignored), with one strict line per file:
+  `<issue> | <test path> | <why the expectation is wrong> | <replacement test>`.
+  Leave the final field empty for an in-place correction. Deletion requires a
+  replacement that is a new test file in the same change. The gate rejects
+  malformed, wrong-issue, unmatched, or undeclared edits and surfaces accepted
+  declarations loudly to the reviewer.
+- Do NOT refactor unrelated code.
 - Do NOT suppress a quality/security signal for the code THIS change adds or
   modifies in order to go green. The default is to fix the underlying cause:
   exclusions, threshold drops, `nosec`/`noqa`/`eslint-disable`/`# type: ignore`,
