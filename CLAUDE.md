@@ -228,6 +228,10 @@ diff. Both Python and Bash gates fail closed on malformed or unmatched entries,
 and reviewer task builders elevate the declaration from the PR diff. A manifest
 inherited from the base is inert audit history; a later issue claiming an
 exception replaces its contents with declarations for that issue only.
+Open-PR push revalidation derives its checks from checkout `HEAD`, so every
+explicit source ref must resolve to that same commit. To push another commit,
+check it out first or use `HEAD:<destination>`; the gate fails closed rather
+than applying `HEAD` evidence to different content.
 
 Late-heartbeat reconciliation requires both the wall threshold and a positive
 wall-minus-active-monotonic gap, distinguishing a machine suspension from an
