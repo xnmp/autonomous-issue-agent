@@ -163,6 +163,27 @@ class Executor:
             self._journal.emit("escalation", **fields)
         alert(self._alert_cmd, event_line("escalation", **fields))
 
+    def _human_wait_transition(self, action: Relabel) -> None:
+        """Journal the durable edges of an issue's human-input wait."""
+        if self._journal is None or action.target is not Target.ISSUE:
+            return
+        state = None
+        if action.add is Label.AI_BLOCKED:
+            state = "waiting"
+        elif (
+            action.remove is Label.AI_BLOCKED
+            and action.add is Label.AI_WORKING
+        ):
+            state = "cleared"
+        if state is not None:
+            self._journal.emit(
+                "deferred",
+                state=state,
+                issue=action.number,
+                reason="human",
+                blocker="human",
+            )
+
     def _already_applied(self, action: Action) -> bool:
         """Best-effort idempotency probe for a retry after an ambiguous reply.
 
@@ -216,6 +237,8 @@ class Executor:
             and action.add is Label.NEEDS_HUMAN_REVIEW
         ):
             self._escalated(action)
+        if isinstance(action, Relabel):
+            self._human_wait_transition(action)
         elif isinstance(action, EscalateCiPending):
             self._mark_ci_pending_escalated(action.pr, action.head)
             self._escalated(
@@ -284,6 +307,7 @@ class Executor:
             # and a journal that claims it did is worse than one that is silent.
             if action.add is Label.NEEDS_HUMAN_REVIEW:
                 self._escalated(action)
+            self._human_wait_transition(action)
         elif isinstance(action, EscalateCiPending):
             self._apply_ci_escalation(action, resume=False)
         elif isinstance(action, PostComment):

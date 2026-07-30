@@ -470,6 +470,8 @@ def _hold_reporter(journal: Journal | None, repo: str, log):
                 for event in read_events_tail(journal.path):
                     if event.get("event") not in {"deferred", "hold"}:
                         continue
+                    if event.get("reason") == "human":
+                        continue
                     key = event_key(event)
                     if key is None:
                         continue

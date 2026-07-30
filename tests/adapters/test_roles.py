@@ -1006,6 +1006,26 @@ def test_the_hold_dedup_survives_a_daemon_restart(tmp_path):
     assert len(_holds_in(journal)) == 1
 
 
+def test_hold_reporter_does_not_clear_executor_owned_human_wait(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    journal.emit(
+        "deferred",
+        state="waiting",
+        issue=5,
+        reason="human",
+        blocker="human",
+    )
+
+    _hold_reporter(journal, "o/r", lambda _m: None)(WorldState())
+
+    human_events = [
+        event
+        for event in _holds_in(journal)
+        if event.get("reason") == "human"
+    ]
+    assert [event["state"] for event in human_events] == ["waiting"]
+
+
 # ── CI pending-deadline reporting (#30) ──────────────────────────────────────
 _STALL_CFG = FixConfig(fix_bot=FIX_BOT, ci_pending_max_seconds=3600)
 _EMPTY_FIX_STATE = FixState()
