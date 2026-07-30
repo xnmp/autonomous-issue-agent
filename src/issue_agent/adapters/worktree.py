@@ -289,11 +289,55 @@ class Worktrees:
 
     def _remove(self, issue: int) -> None:
         listing = self._git(["worktree", "list", "--porcelain"], self.repo_dir)
+        if listing.code != 0:
+            raise WorktreeUnavailable(
+                f"cannot inspect worktrees before removing issue #{issue}"
+            )
         branch = _issue_worktree_branch(listing.out, issue)
-        self._git(["worktree", "remove", self.path(issue), "--force"], self.repo_dir)
-        self._git(["worktree", "prune"], self.repo_dir)
+        abs_path = os.path.join(self.repo_dir, self.path(issue))
+        if (
+            not worktree_list_contains_issue(listing.out, issue)
+            and not self._path_exists(abs_path)
+        ):
+            return
+        removed = self._git(
+            ["worktree", "remove", self.path(issue), "--force"],
+            self.repo_dir,
+        )
+        if removed.code != 0:
+            raise WorktreeUnavailable(
+                f"git refused to remove the worktree for issue #{issue}"
+            )
+        pruned = self._git(["worktree", "prune"], self.repo_dir)
+        if pruned.code != 0:
+            raise WorktreeUnavailable(
+                f"git refused to prune worktrees after removing issue #{issue}"
+            )
+        verified = self._git(
+            ["worktree", "list", "--porcelain"], self.repo_dir
+        )
+        if (
+            verified.code != 0
+            or worktree_list_contains_issue(verified.out, issue)
+            or self._path_exists(abs_path)
+        ):
+            raise WorktreeUnavailable(
+                f"worktree removal for issue #{issue} could not be verified"
+            )
         if branch:
-            self._git(["branch", "-D", branch], self.repo_dir)
+            deleted = self._git(["branch", "-D", branch], self.repo_dir)
+            if deleted.code != 0:
+                raise WorktreeUnavailable(
+                    f"git refused to delete retained branch {branch!r}"
+                )
+            branch_state = self._git(
+                ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+                self.repo_dir,
+            )
+            if branch_state.code == 0 or branch_state.code > 1:
+                raise WorktreeUnavailable(
+                    f"branch deletion for {branch!r} could not be verified"
+                )
 
     def reset(self, issue: int) -> None:
         """Discard all uncommitted work in the issue's worktree (tracked + untracked),

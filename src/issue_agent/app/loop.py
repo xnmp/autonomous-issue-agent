@@ -52,6 +52,7 @@ def _ignore_log(_message: str) -> None:
 
 DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 80.0
 _SHUTDOWN_ESCALATION_RESERVE_SECONDS = 10.0
+_SHUTDOWN_PREPARE_RESERVE_SECONDS = 2.0
 _SHUTDOWN_FINALIZE_RESERVE_SECONDS = 5.0
 _SHUTDOWN_TERMINALIZE_RESERVE_SECONDS = 3.0
 
@@ -142,6 +143,7 @@ class Daemon:
     # The systemd hard stop is 90s, leaving 10s for interpreter/supervisor exit.
     shutdown_timeout_seconds: float = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
     recover: Callable[[], object] | None = None
+    prepare_shutdown: Callable[[], object] | None = None
     finalize: Callable[[], object] | None = None
     terminalize: Callable[[], object] | None = None
     _state: DaemonState = field(
@@ -162,6 +164,8 @@ class Daemon:
     _retry_after_seconds: float | None = field(default=None, init=False, repr=False)
     _shutdown_deadline: float | None = field(default=None, init=False, repr=False)
     _requires_hard_exit: bool = field(default=False, init=False, repr=False)
+    _shutdown_prepared: bool = field(default=False, init=False, repr=False)
+    _shutdown_prepare_clean: bool = field(default=True, init=False, repr=False)
     _finalized: bool = field(default=False, init=False, repr=False)
     _finalize_clean: bool = field(default=True, init=False, repr=False)
     _terminalized: bool = field(default=False, init=False, repr=False)
@@ -339,6 +343,9 @@ class Daemon:
                 return not self._dispatches
             self._dispatch_closed = True
             self._accept_dispatches = False
+        prepared = True
+        if cancel:
+            prepared = self._prepare_shutdown()
         if cancel and self.cancel_active_dispatches is not None:
             try:
                 self.cancel_active_dispatches()
@@ -406,16 +413,36 @@ class Daemon:
                 terminalized = False
         else:
             finalized = self._finalize()
-            terminalized = True
+            terminalized = self._terminalize() if cancel else True
         pool.shutdown(wait=False, cancel_futures=cancel)
         if unfinished:
             return False
-        return finalized and terminalized
+        return prepared and finalized and terminalized
 
     def _remaining_shutdown_time(self) -> float:
         if self._shutdown_deadline is None:
             return self.shutdown_timeout_seconds
         return max(0.0, self._shutdown_deadline - time.monotonic())
+
+    def _prepare_shutdown(self) -> bool:
+        if self._shutdown_prepared:
+            return self._shutdown_prepare_clean
+        self._shutdown_prepared = True
+        if self.prepare_shutdown is None:
+            return True
+        self._shutdown_prepare_clean = self._bounded_shutdown_call(
+            self.prepare_shutdown,
+            "shutdown intent persistence",
+            max_seconds=max(
+                0.0,
+                self._remaining_shutdown_time()
+                - min(
+                    _SHUTDOWN_PREPARE_RESERVE_SECONDS,
+                    self.shutdown_timeout_seconds * 0.2,
+                ),
+            ),
+        )
+        return self._shutdown_prepare_clean
 
     def _bounded_shutdown_call(
         self,

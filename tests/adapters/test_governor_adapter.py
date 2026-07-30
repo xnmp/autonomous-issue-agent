@@ -7,6 +7,8 @@ hook test drives the async callback with a stub build_ctx.
 
 import asyncio
 
+import pytest
+
 from issue_agent.domain import governor_policy
 from issue_agent.adapters.governor import (
     _GATE_HANDLERS,
@@ -89,6 +91,24 @@ def test_durable_publication_mode_routes_remote_writes_through_broker():
     )
     assert not protected.allowed
     assert "protected branch" in protected.reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "ISSUE_AGENT_CONTROL_DB=/tmp/fake.db "
+        "issue-agent-publish git push origin HEAD:issue-42",
+        "env ISSUE_AGENT_REPOSITORY=attacker/other "
+        "issue-agent-publish gh pr create --title Fix",
+        "env ISSUE_AGENT_PUBLICATION_OWNER=attacker "
+        "issue-agent-publish git push origin HEAD:issue-42",
+    ),
+)
+def test_paid_child_cannot_override_publication_authority(command):
+    verdict = evaluate_command(command, ctx(durable_publish=True))
+
+    assert not verdict.allowed
+    assert "publication authority cannot be overridden" in verdict.reason
 
 
 # Force-push/delete of a protected branch must be DENIED through the full adapter

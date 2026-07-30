@@ -7,13 +7,9 @@
 #                                          # units (every repo installed this way)
 #   bin/install-systemd.sh uninstall <name>  # remove just <name>'s three units
 #
-# Per-repo naming: units install as issue-agent-{fix-watcher,review-watcher,
-# steward}-<NAME>.service, where NAME is derived from the config's TARGET_DIR
-# (sanitized basename) — the same "one checkout, one name" convention
-# bin/point-at.sh uses for per-repo logs. Without this, a second `install-
-# systemd.sh` run (for a different repo) would silently overwrite the FIRST
-# repo's units (same fixed names) and repoint its already-enabled units at the
-# second repo on next restart.
+# Per-deployment naming: the CLI passes its resolved overlay identity as
+# ISSUE_AGENT_DEPLOYMENT_ID. Direct legacy invocations derive owner+repository
+# from REPO, then fall back to TARGET_DIR's basename only when REPO is absent.
 #
 # Config snapshot: AGENT_ENV usually points at the shared, mutable
 # config/.active.<name>.env, which bin/point-at.sh / `issue-agent install-service`
@@ -67,18 +63,30 @@ SYSTEMD_ANALYZE="$(command -v systemd-analyze || true)"
 # Watchers must run with cwd = target repo (cwd-relative git/worktree ops). Inject
 # WorkingDirectory from the config's TARGET_DIR. (lib.sh also cd's as a backstop.)
 TARGET_DIR="$(set -a; . "$CONFIG"; set +a; printf '%s' "${TARGET_DIR:-}")"
+CONFIG_REPO="$(set -a; . "$CONFIG"; set +a; printf '%s' "${REPO:-}")"
 [ -n "$TARGET_DIR" ] || echo "⚠ TARGET_DIR not set in $CONFIG — watchers would run from the harness dir (wrong repo). Set TARGET_DIR."
 
-# Derive NAME from the checkout dir (lowercased, sanitized basename) — falls
-# back to "target" if TARGET_DIR is empty (legacy single-repo config with no
-# TARGET_DIR set; still installs, just without a distinguishing suffix).
-_raw_name="$(basename "${TARGET_DIR:-target}")"
+# The CLI identity includes the repository owner and preserves explicit
+# multi-checkout names. Direct invocations use the same owner/repository shape.
+_raw_name="${ISSUE_AGENT_DEPLOYMENT_ID:-}"
+if [ -z "$_raw_name" ] && [ -n "$CONFIG_REPO" ]; then
+  _raw_name="${CONFIG_REPO//\//-}"
+fi
+[ -n "$_raw_name" ] || _raw_name="$(basename "${TARGET_DIR:-target}")"
 NAME="$(printf '%s' "$_raw_name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]/-/g; s/^-+//; s/-+$//')"
 NAME="${NAME:-target}"
 
 SNAP_DIR="$HOME/.config/issue-agent"
 mkdir -p "$SNAP_DIR"; chmod 700 "$SNAP_DIR"
 SNAP_CONFIG="$SNAP_DIR/$NAME.env"
+if [ -f "$SNAP_CONFIG" ]; then
+  SNAP_REPO="$(set -a; . "$SNAP_CONFIG"; set +a; printf '%s' "${REPO:-}")"
+  SNAP_TARGET="$(set -a; . "$SNAP_CONFIG"; set +a; printf '%s' "${TARGET_DIR:-}")"
+  if [ "$SNAP_REPO" != "$CONFIG_REPO" ] || [ "$SNAP_TARGET" != "$TARGET_DIR" ]; then
+    echo "REFUSING deployment '$NAME': existing snapshot belongs to REPO='$SNAP_REPO' TARGET_DIR='$SNAP_TARGET', requested REPO='$CONFIG_REPO' TARGET_DIR='$TARGET_DIR'" >&2
+    exit 2
+  fi
+fi
 STAGE="$(mktemp -d "$UD/.issue-agent-install.XXXXXX")"
 cleanup() {
   rm -rf -- "$STAGE"

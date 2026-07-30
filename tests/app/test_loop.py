@@ -15,7 +15,7 @@ from issue_agent.app.loop import Daemon
 from issue_agent.domain.actions import NoOp, Relabel, Target
 from issue_agent.domain.events import TelemetryEvent, TickGated
 from issue_agent.domain.labels import Label
-from issue_agent.domain.world import WorldState
+from issue_agent.domain.world import PRView, WorldState
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
 
 
@@ -66,7 +66,12 @@ def test_tick_executes_cheap_actions_before_agent_dispatches():
         def relabel(self, kind, number, remove, add):
             executed.append(("relabel", number))
 
-        def enable_auto_merge(self, pr, method):
+        def get_pr(self, pr, *, mergeability=True, checks=True):
+            del mergeability, checks
+            return PRView(pr, head_ref_oid=f"head-{pr}")
+
+        def enable_auto_merge(self, pr, method, expected_head):
+            assert expected_head == f"head-{pr}"
             executed.append(("automerge", pr))
             return True
 
@@ -100,10 +105,13 @@ def test_observation_and_lifecycle_continue_while_the_only_dispatch_slot_is_busy
 
     class LiveGateway(FakeGateway):
         def __init__(self):
-            super().__init__()
+            super().__init__(
+                prs={24: PRView(24, head_ref_oid="head-24")}
+            )
             self.arm_attempts = 0
 
-        def enable_auto_merge(self, pr, method):
+        def enable_auto_merge(self, pr, method, expected_head):
+            assert expected_head == "head-24"
             self.arm_attempts += 1
             return self.arm_attempts > 1
 
@@ -304,13 +312,20 @@ def test_operator_interrupt_cancels_async_dispatch_and_joins_pool():
 
     started = threading.Event()
     cancelled = threading.Event()
+    prepared = threading.Event()
+    terminalized = threading.Event()
 
     async def dispatch(_action):
         started.set()
         try:
             await asyncio.Event().wait()
         finally:
+            assert prepared.is_set()
             cancelled.set()
+
+    def terminalize():
+        assert cancelled.is_set()
+        terminalized.set()
 
     runtime = CancellableAsyncDispatch(dispatch)
     daemon = Daemon(
@@ -320,7 +335,9 @@ def test_operator_interrupt_cancels_async_dispatch_and_joins_pool():
         Executor(FakeGateway(), run_agent=runtime),
         poll_seconds=1,
         dispatch_capacity=1,
+        prepare_shutdown=prepared.set,
         cancel_active_dispatches=runtime.cancel_all,
+        terminalize=terminalize,
     )
 
     def interrupt(_seconds):
@@ -331,6 +348,7 @@ def test_operator_interrupt_cancels_async_dispatch_and_joins_pool():
         daemon.run_forever(sleep=interrupt, now=lambda: 0)
 
     assert cancelled.wait(timeout=1)
+    assert terminalized.is_set()
     assert daemon.active_dispatches == ()
     assert daemon.available_dispatch_slots == 0
 

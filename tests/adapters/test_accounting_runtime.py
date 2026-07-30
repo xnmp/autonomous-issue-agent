@@ -100,6 +100,66 @@ def test_paid_run_has_reservation_before_runtime_and_settles(tmp_path) -> None:
     assert runtime.calls == 1
 
 
+def test_resumed_session_uses_distinct_per_leg_settlement_receipts(
+    tmp_path,
+) -> None:
+    runtime = Runtime(
+        AgentResult(
+            False,
+            status="ok",
+            cost_usd=0.1,
+            session_id="resumed-session",
+            usage={"input_tokens": 100, "output_tokens": 10},
+        )
+    )
+    wrapper, store = _wrapper(tmp_path, runtime)
+
+    asyncio.run(
+        wrapper.run(RuntimePlan("first", model="gpt-test", max_budget_usd=2))
+    )
+    asyncio.run(
+        wrapper.run(RuntimePlan("second", model="gpt-test", max_budget_usd=2))
+    )
+
+    with store._connect() as db:
+        receipts = tuple(
+            row[0]
+            for row in db.execute(
+                "SELECT provider_receipt_id FROM charges ORDER BY charge_id"
+            )
+        )
+    assert len(receipts) == 2
+    assert len(set(receipts)) == 2
+    assert all("resumed-session" in receipt for receipt in receipts)
+    assert store.active_reservation_runs() == ()
+
+
+def test_codex_missing_usage_never_settles_productive_run_as_free(
+    tmp_path,
+) -> None:
+    wrapper, store = _wrapper(
+        tmp_path,
+        Runtime(
+            AgentResult(
+                False,
+                status="pushed",
+                cost_usd=0,
+                session_id="usage-blind",
+                usage=None,
+            )
+        ),
+    )
+
+    result = asyncio.run(
+        wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2))
+    )
+
+    assert result.status == "pushed"
+    assert len(store.active_reservation_runs()) == 1
+    with store._connect() as db:
+        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
+
+
 def test_total_only_codex_usage_cannot_turn_nonzero_spend_into_zero(
     tmp_path,
 ) -> None:
@@ -227,7 +287,7 @@ def test_subscription_usage_is_synthetically_priced_and_consumes_cap(
     assert tuple(charge) == (8_000_000, "synthetic", "test")
 
 
-def test_codex_runtime_exception_preserves_reservation_for_rollout_recovery(
+def test_codex_runtime_exception_releases_after_completed_teardown(
     tmp_path,
 ) -> None:
     class Death:
@@ -239,15 +299,18 @@ def test_codex_runtime_exception_preserves_reservation_for_rollout_recovery(
         asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
     except RuntimeError:
         pass
-    assert len(store.active_reservation_runs()) == 1
+    assert store.active_reservation_runs() == ()
     with store._connect() as db:
         state, reason = db.execute(
             "SELECT state, release_reason FROM budget_reservations"
         ).fetchone()
-    assert (state, reason) == ("active", None)
+    assert (state, reason) == (
+        "released",
+        "runtime_exception_spend_unknown",
+    )
 
 
-def test_codex_result_normalization_failure_preserves_reservation(tmp_path) -> None:
+def test_codex_result_normalization_failure_releases_reservation(tmp_path) -> None:
     wrapper, store = _wrapper(
         tmp_path,
         Runtime(
@@ -260,6 +323,29 @@ def test_codex_result_normalization_failure_preserves_reservation(tmp_path) -> N
     )
 
     with pytest.raises(ValueError):
+        asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
+
+    assert store.active_reservation_runs() == ()
+
+
+def test_forced_codex_shutdown_intent_preserves_reservation_for_recovery(
+    tmp_path,
+) -> None:
+    class Death:
+        def __init__(self):
+            self.prepare_shutdown = lambda: None
+
+        async def run(self, _task):
+            self.prepare_shutdown()
+            raise RuntimeError("killed")
+
+    runtime = Death()
+    wrapper, store = _wrapper(tmp_path, runtime)
+    runtime.prepare_shutdown = lambda: store.record_owned_cancellation_intents(
+        "o/r:fix", "shutdown_deadline_spend_unknown"
+    )
+
+    with pytest.raises(RuntimeError, match="killed"):
         asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
 
     assert len(store.active_reservation_runs()) == 1
@@ -316,7 +402,14 @@ def test_successful_settlement_removes_crash_recovery_evidence(tmp_path) -> None
     evidence_dir = str(tmp_path / "spend-evidence")
     wrapper, _store = _wrapper(
         tmp_path,
-        Runtime(AgentResult(False, status="ok", session_id="receipt")),
+        Runtime(
+            AgentResult(
+                False,
+                status="ok",
+                cost_usd=1,
+                session_id="receipt",
+            )
+        ),
         evidence_dir=evidence_dir,
     )
     wrapper.set_run_identity("known-run", "leg")

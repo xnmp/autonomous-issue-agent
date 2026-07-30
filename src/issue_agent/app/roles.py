@@ -109,6 +109,7 @@ from ..domain.events import (
 )
 from ..domain.ports import (
     CiPendingState,
+    CommandRecovery,
     EventSink,
     IssueStateReasonReads,
     LevelState,
@@ -145,6 +146,17 @@ def _role_state_dir(cfg: HarnessConfig, role: str) -> str:
         "review": cfg.review_state_dir,
         "steward": cfg.steward_state_dir,
     }[role]
+
+
+def _deployment_identity(cfg: HarnessConfig, role: str) -> str:
+    checkout = os.path.realpath(cfg.target_dir) if cfg.target_dir else ""
+    return hashlib.sha256(
+        f"{cfg.repo}:{checkout}:{role}".encode()
+    ).hexdigest()[:16]
+
+
+def _owner_identity(cfg: HarnessConfig, role: str) -> str:
+    return f"{cfg.repo}:{role}:{_deployment_identity(cfg, role)}"
 
 
 def _control_store(
@@ -226,6 +238,7 @@ def _with_accounting(
         journal.events.producer.deployment,
         journal.events.producer.role,
         journal.events.line_limit,
+        owner_id=_owner_identity(cfg, role),
     )
 
 
@@ -346,6 +359,8 @@ def _recovery(
     effects: EffectRecovery,
     journal: TypedJournal,
     worktrees: Worktrees | None = None,
+    *,
+    owner_id: str,
 ) -> Callable[[], object]:
     from ..adapters.process_supervisor import ProcessSupervisor
 
@@ -357,7 +372,7 @@ def _recovery(
         effects,
         CodexSpendReconciler(control, _spend_evidence_dirs(cfg)),
         journal,
-        f"{cfg.repo}:{journal.events.producer.role}",
+        owner_id,
     )
 
     def recover() -> object:
@@ -378,16 +393,34 @@ def _force_kill(state_dir: str) -> Callable[[], object]:
 
 def _shutdown_finalize(
     control: SQLiteControlStore,
-    effects: EffectRecovery,
+    effects: CommandRecovery,
+    *,
+    owner_id: str,
 ) -> Callable[[], object]:
-    """Flush committed remote effects/outbox without replaying boot recovery."""
+    """Persist remaining ownership and flush effects before forced teardown."""
 
     def finalize() -> object:
+        control.record_owned_cancellation_intents(
+            owner_id, "shutdown_deadline_spend_unknown"
+        )
         drained = effects.drain_pending_commands()
         control.flush_bound_outbox()
         return drained
 
     return finalize
+
+
+def _shutdown_prepare(
+    control: SQLiteControlStore,
+    *,
+    owner_id: str,
+) -> Callable[[], object]:
+    def prepare() -> object:
+        return control.record_owned_cancellation_intents(
+            owner_id, "shutdown_deadline_spend_unknown"
+        )
+
+    return prepare
 
 
 def _shutdown_terminalize(
@@ -435,9 +468,7 @@ def _reported_world(
     role: str,
     log: Callable[[str], None],
 ) -> Callable:
-    deployment = hashlib.sha256(
-        f"{cfg.repo}:{cfg.target_dir}:{role}".encode()
-    ).hexdigest()[:16]
+    deployment = _deployment_identity(cfg, role)
     return WorldReporter(control, deployment, log).wrap(observe)
 
 
@@ -530,12 +561,29 @@ class CancellableAsyncDispatch:
 
 
 class DispatchPathReservations:
-    """Atomic issue/path leases shared by admission and running routers."""
+    """Atomic issue/path leases shared across threads and deployments."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        control: SQLiteControlStore | None = None,
+        *,
+        repository: str = "",
+        role: str = "",
+        owner_id: str = "",
+    ) -> None:
         self._lock = threading.Lock()
         self._paths: dict[int, frozenset[str]] = {}
         self._actions: dict[RunAgent, int] = {}
+        self._control = control
+        self._repository = repository
+        self._role = role
+        self._owner_id = owner_id
+        if control is not None and (
+            not repository or not role or not owner_id
+        ):
+            raise ValueError(
+                "durable dispatch claims require repository, role, and owner"
+            )
 
     def _conflicts(self, issue: int, paths: frozenset[str]) -> bool:
         return any(
@@ -554,6 +602,15 @@ class DispatchPathReservations:
         with self._lock:
             if issue in self._paths or self._conflicts(issue, paths):
                 return False
+            if self._control is not None and not self._control.claim_dispatch(
+                self._repository,
+                self._role,
+                issue,
+                action.kind.name,
+                self._owner_id,
+                paths,
+            ):
+                return False
             self._paths[issue] = paths
             self._actions[action] = issue
             return True
@@ -564,6 +621,17 @@ class DispatchPathReservations:
             expanded = self._paths.get(issue, frozenset()) | paths
             if self._conflicts(issue, expanded):
                 return False
+            if (
+                self._control is not None
+                and not self._control.expand_dispatch_claim(
+                    self._repository,
+                    self._role,
+                    issue,
+                    self._owner_id,
+                    paths,
+                )
+            ):
+                return False
             self._paths[issue] = expanded
             return True
 
@@ -572,6 +640,13 @@ class DispatchPathReservations:
             issue = self._actions.pop(action, None)
             if issue is not None:
                 self._paths.pop(issue, None)
+                if self._control is not None:
+                    self._control.release_dispatch_claim(
+                        self._repository,
+                        self._role,
+                        issue,
+                        self._owner_id,
+                    )
 
     def issue_for(self, action: RunAgent) -> int | None:
         with self._lock:
@@ -1622,11 +1697,12 @@ def build_fix_daemon(
     prepare_cwd = runtime_binding.prepare_cwd
 
     control = _control_store(cfg, cfg.state_dir, journal)
+    owner_id = _owner_identity(cfg, "fix")
     effect_executor = _effects(
         gateway,
         control,
         repository=cfg.repo,
-        identity=f"{cfg.repo}:fix",
+        identity=owner_id,
         config_version=cfg.config_version,
     )
     executor = Executor(
@@ -1650,7 +1726,12 @@ def build_fix_daemon(
         runtime=cfg.fixer_runtime.value,
         state_dir=cfg.state_dir,
     )
-    reservations = DispatchPathReservations()
+    reservations = DispatchPathReservations(
+        control,
+        repository=cfg.repo,
+        role="fix",
+        owner_id=owner_id,
+    )
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, worktrees, fix_runner, executor,
         prepare_cwd=prepare_cwd, journal=journal,
@@ -1737,7 +1818,7 @@ def build_fix_daemon(
             store,
             world,
             inflight,
-            control.abandoned_dispatch_counts(f"{cfg.repo}:fix"),
+            control.abandoned_dispatch_counts(owner_id),
         )
         report_holds(world, inflight)
         report_prediction_outcomes(world)
@@ -1798,6 +1879,7 @@ def build_fix_daemon(
         effect_executor,
         journal,
         worktrees,
+        owner_id=owner_id,
     )
     daemon = Daemon(
         "fix",
@@ -1818,11 +1900,19 @@ def build_fix_daemon(
         dispatch_rejected=reservations.finish,
         heartbeat_path=os.path.join(cfg.state_dir, "heartbeat.json"),
         recover=recovery,
-        finalize=_shutdown_finalize(control, effect_executor),
+        prepare_shutdown=_shutdown_prepare(
+            control,
+            owner_id=owner_id,
+        ),
+        finalize=_shutdown_finalize(
+            control,
+            effect_executor,
+            owner_id=owner_id,
+        ),
         terminalize=_shutdown_terminalize(
             control,
             CodexSpendReconciler(control, _spend_evidence_dirs(cfg)),
-            owner_id=f"{cfg.repo}:fix",
+            owner_id=owner_id,
             state_dir=cfg.state_dir,
             role="fix",
         ),
@@ -1926,11 +2016,12 @@ def build_review_daemon(
 
     # Reviewer has no worktree/issue side; pass a no-op Worktrees-like None usage.
     control = _control_store(cfg, cfg.review_state_dir, journal)
+    owner_id = _owner_identity(cfg, "review")
     effect_executor = _effects(
         gateway,
         control,
         repository=cfg.repo,
-        identity=f"{cfg.repo}:review",
+        identity=owner_id,
         config_version=cfg.config_version,
     )
     executor = Executor(
@@ -1969,7 +2060,7 @@ def build_review_daemon(
             _review_state(
                 store,
                 world,
-                control.abandoned_dispatch_counts(f"{cfg.repo}:review"),
+                control.abandoned_dispatch_counts(owner_id),
             ),
         )
 
@@ -1978,7 +2069,12 @@ def build_review_daemon(
         adopt_unlabeled=rcfg.adopt_unlabeled,
     ))
     recovery = _recovery(
-        cfg.review_state_dir, cfg, control, effect_executor, journal
+        cfg.review_state_dir,
+        cfg,
+        control,
+        effect_executor,
+        journal,
+        owner_id=owner_id,
     )
 
     return Daemon("review", _reported_world(
@@ -1997,13 +2093,21 @@ def build_review_daemon(
                       cfg.review_state_dir, "heartbeat.json"
                   ),
                   recover=recovery,
-                  finalize=_shutdown_finalize(control, effect_executor),
+                  prepare_shutdown=_shutdown_prepare(
+                      control,
+                      owner_id=owner_id,
+                  ),
+                  finalize=_shutdown_finalize(
+                      control,
+                      effect_executor,
+                      owner_id=owner_id,
+                  ),
                   terminalize=_shutdown_terminalize(
                       control,
                       CodexSpendReconciler(
                           control, _spend_evidence_dirs(cfg)
                       ),
-                      owner_id=f"{cfg.repo}:review",
+                      owner_id=owner_id,
                       state_dir=cfg.review_state_dir,
                       role="review",
                   ))
@@ -2096,11 +2200,12 @@ def build_steward_daemon(
         **_spend_cfg(cfg, "steward"),
     )
     control = _control_store(cfg, cfg.steward_state_dir, journal)
+    owner_id = _owner_identity(cfg, "steward")
     effect_executor = _effects(
         gateway,
         control,
         repository=cfg.repo,
-        identity=f"{cfg.repo}:steward",
+        identity=owner_id,
         config_version=cfg.config_version,
     )
     executor = Executor(
@@ -2162,7 +2267,7 @@ def build_steward_daemon(
         # this only runs on a genuinely fresh world.
         report_recurrences(world)
         state = TriageState(seen_at={i.number: store.get_triage_at(i.number) for i in world.issues})
-        deaths = control.abandoned_dispatch_counts(f"{cfg.repo}:steward")
+        deaths = control.abandoned_dispatch_counts(owner_id)
 
         def exhausted(n: int) -> bool:
             spent = store.get_infra_deaths(n) + deaths.get(n, 0)
@@ -2210,7 +2315,12 @@ def build_steward_daemon(
     # alone needs just open issues.
     observe = gateway.build_steward_world if jira_on else gateway.build_triage_world
     recovery = _recovery(
-        cfg.steward_state_dir, cfg, control, effect_executor, journal
+        cfg.steward_state_dir,
+        cfg,
+        control,
+        effect_executor,
+        journal,
+        owner_id=owner_id,
     )
     return Daemon("steward", _reported_world(
                       observe, control, cfg, "steward", steward_log
@@ -2227,13 +2337,21 @@ def build_steward_daemon(
                       cfg.steward_state_dir, "heartbeat.json"
                   ),
                   recover=recovery,
-                  finalize=_shutdown_finalize(control, effect_executor),
+                  prepare_shutdown=_shutdown_prepare(
+                      control,
+                      owner_id=owner_id,
+                  ),
+                  finalize=_shutdown_finalize(
+                      control,
+                      effect_executor,
+                      owner_id=owner_id,
+                  ),
                   terminalize=_shutdown_terminalize(
                       control,
                       CodexSpendReconciler(
                           control, _spend_evidence_dirs(cfg)
                       ),
-                      owner_id=f"{cfg.repo}:steward",
+                      owner_id=owner_id,
                       state_dir=cfg.steward_state_dir,
                       role="steward",
                   ))

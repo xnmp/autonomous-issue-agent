@@ -203,19 +203,56 @@ def test_default_git_runner_real_success_path_unaffected(tmp_path):
     assert "git version" in result.out
 
 
+class RemovalGit:
+    def __init__(self, branch="fix/5-small-win", remove_code=0):
+        self.branch = branch
+        self.remove_code = remove_code
+        self.present = True
+        self.branch_present = bool(branch)
+        self.calls = []
+
+    def __call__(self, args, cwd):
+        self.calls.append((args, cwd))
+        if args[:2] == ["worktree", "list"]:
+            return GitResult(
+                0,
+                (
+                    "worktree /repo/.claude/worktrees/issue-5\n"
+                    "HEAD deadbeef\n"
+                    f"branch refs/heads/{self.branch}\n\n"
+                    if self.present
+                    else ""
+                ),
+            )
+        if args[:2] == ["worktree", "remove"]:
+            if self.remove_code == 0:
+                self.present = False
+            return GitResult(self.remove_code, "")
+        if args[:2] == ["branch", "-D"]:
+            self.branch_present = False
+            return GitResult(0, "")
+        if args[:2] == ["show-ref", "--verify"]:
+            return GitResult(0 if self.branch_present else 1, "")
+        return GitResult(0, "")
+
+
 def test_remove_calls_remove_prune_and_deletes_the_issue_branch():
-    fg = FakeGit({
-        "worktree list": GitResult(
-            0,
-            "worktree /repo/.claude/worktrees/issue-5\n"
-            "HEAD deadbeef\n"
-            "branch refs/heads/fix/5-small-win\n\n",
-        )
-    })
-    Worktrees("/repo", run=fg).remove(5)
-    kinds = [a[0][:2] for a in fg.calls]
+    git = RemovalGit()
+    Worktrees("/repo", run=git).remove(5)
+    kinds = [a[0][:2] for a in git.calls]
     assert ["worktree", "remove"] in kinds and ["worktree", "prune"] in kinds
-    assert (["branch", "-D", "fix/5-small-win"], "/repo") in fg.calls
+    assert (["branch", "-D", "fix/5-small-win"], "/repo") in git.calls
+
+
+def test_remove_failure_is_retriable_and_preserves_branch():
+    git = RemovalGit(remove_code=1)
+
+    with pytest.raises(WorktreeUnavailable, match="refused to remove"):
+        Worktrees("/repo", run=git).remove(5)
+
+    assert git.present
+    assert git.branch_present
+    assert not any(args[:2] == ["branch", "-D"] for args, _cwd in git.calls)
 
 
 def test_remove_never_deletes_a_branch_when_the_issue_worktree_is_absent():
@@ -227,18 +264,11 @@ def test_remove_never_deletes_a_branch_when_the_issue_worktree_is_absent():
 
 
 def test_remove_never_deletes_an_arbitrary_branch_from_the_issue_worktree():
-    fg = FakeGit({
-        "worktree list": GitResult(
-            0,
-            "worktree /repo/.claude/worktrees/issue-5\n"
-            "HEAD deadbeef\n"
-            "branch refs/heads/dev\n\n",
-        )
-    })
+    git = RemovalGit(branch="dev")
 
-    Worktrees("/repo", run=fg).remove(5)
+    Worktrees("/repo", run=git).remove(5)
 
-    assert not any(args[:2] == ["branch", "-D"] for args, _cwd in fg.calls)
+    assert not any(args[:2] == ["branch", "-D"] for args, _cwd in git.calls)
 
 
 def test_reset_discards_uncommitted_in_the_issue_worktree():

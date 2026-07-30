@@ -51,7 +51,7 @@ from ..domain.events import (
     encode_event_line,
 )
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 SCHEMA_BASELINE_VERSION = 9
 LEGACY_V8_SCHEMA_DIGEST = (
     "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
@@ -197,6 +197,15 @@ class Lease:
     pgid: int
     started_at: datetime
     process_start_ticks: int = 0
+
+
+@dataclass(frozen=True)
+class PublicationAuthority:
+    run_id: RunId
+    repository: str
+    owner_id: str
+    pgid: int
+    process_start_ticks: int
 
 
 @dataclass(frozen=True)
@@ -430,12 +439,32 @@ CREATE TABLE run_cancellation_intents (
 );
 """
 
+_MIGRATION_V11 = """
+CREATE TABLE dispatch_claims (
+    repository TEXT NOT NULL,
+    role TEXT NOT NULL,
+    target TEXT NOT NULL,
+    leg TEXT NOT NULL,
+    owner_id TEXT NOT NULL,
+    owner_pid INTEGER NOT NULL CHECK (owner_pid > 0),
+    owner_start_ticks INTEGER NOT NULL CHECK (owner_start_ticks > 0),
+    paths_json TEXT NOT NULL,
+    claimed_at TEXT NOT NULL,
+    PRIMARY KEY (repository, role, target)
+);
+
+CREATE UNIQUE INDEX runs_active_dispatch_unique
+ON runs(dispatch_id)
+WHERE state IN ('reserved', 'starting', 'running');
+"""
+
 _SCHEMA_MIGRATIONS = (
     # Version 9 is the immutable adoption baseline shipped by the architectural
     # hardening cutover. Its exact source digest already exists in deployed
     # databases, so future code validates rather than rewriting that history.
     SchemaMigration(SCHEMA_BASELINE_VERSION, _DDL),
     SchemaMigration(10, _MIGRATION_V10),
+    SchemaMigration(11, _MIGRATION_V11),
 )
 
 if tuple(migration.version for migration in _SCHEMA_MIGRATIONS) != tuple(
@@ -556,35 +585,12 @@ class SQLiteControlStore:
         if os.path.exists(self.path) and os.path.getsize(self.path):
             self.integrity_check()
         with self._connect() as db:
-            existing = db.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' "
-                "AND name='schema_migrations'"
-            ).fetchone()
-            applied = (
-                tuple(
-                    (int(row["version"]), str(row["source_digest"]))
-                    for row in db.execute(
-                        "SELECT version, source_digest FROM schema_migrations "
-                        "ORDER BY version"
-                    ).fetchall()
-                )
-                if existing
-                else ()
-            )
+            applied = self._migration_history(db)
         self._validate_migration_history(applied)
-        applied_versions = {version for version, _digest in applied}
         for migration in _SCHEMA_MIGRATIONS:
-            if migration.version in applied_versions:
-                continue
             self._apply_schema_migration(migration)
         with self._connect() as db:
-            final_history = tuple(
-                (int(row["version"]), str(row["source_digest"]))
-                for row in db.execute(
-                    "SELECT version, source_digest FROM schema_migrations "
-                    "ORDER BY version"
-                ).fetchall()
-            )
+            final_history = self._migration_history(db)
         self._validate_migration_history(final_history, require_current=True)
         os.chmod(self.path, stat.S_IRUSR | stat.S_IWUSR)
         self.integrity_check()
@@ -624,10 +630,36 @@ class SQLiteControlStore:
                 f"{SCHEMA_VERSION}"
             )
 
+    @staticmethod
+    def _migration_history(
+        db: sqlite3.Connection,
+    ) -> tuple[tuple[int, str], ...]:
+        existing = db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='schema_migrations'"
+        ).fetchone()
+        if existing is None:
+            return ()
+        return tuple(
+            (int(row["version"]), str(row["source_digest"]))
+            for row in db.execute(
+                "SELECT version, source_digest FROM schema_migrations "
+                "ORDER BY version"
+            ).fetchall()
+        )
+
     def _apply_schema_migration(self, migration: SchemaMigration) -> None:
+        applied = False
         with self._connect() as db:
             try:
                 db.execute("BEGIN IMMEDIATE")
+                history = self._migration_history(db)
+                self._validate_migration_history(history)
+                if migration.version in {
+                    version for version, _digest in history
+                }:
+                    db.commit()
+                    return
                 for statement in _sql_statements(migration.source):
                     db.execute(statement)
                 db.execute(
@@ -644,12 +676,13 @@ class SQLiteControlStore:
                         migration.version,
                         "before_commit",
                     )
+                applied = True
             except BaseException:
                 db.rollback()
                 raise
             else:
                 db.commit()
-        if self._migration_observer is not None:
+        if applied and self._migration_observer is not None:
             self._migration_observer(migration.version, "committed")
 
     def integrity_check(self) -> None:
@@ -926,6 +959,32 @@ class SQLiteControlStore:
             for row in rows
         )
 
+    def publication_authority(
+        self, run_id: RunId
+    ) -> PublicationAuthority | None:
+        """Return authority only for an active, supervised paid run."""
+
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT b.repository, r.owner_id, l.pgid, "
+                "l.process_start_ticks FROM runs r "
+                "JOIN budget_reservations b ON b.run_id=r.run_id "
+                "JOIN leases l ON l.run_id=r.run_id "
+                "WHERE r.run_id=? "
+                "AND r.state IN ('starting', 'running') "
+                "AND b.state='active'",
+                (str(run_id),),
+            ).fetchone()
+        if row is None:
+            return None
+        return PublicationAuthority(
+            run_id,
+            str(row["repository"]),
+            str(row["owner_id"]),
+            int(row["pgid"]),
+            int(row["process_start_ticks"]),
+        )
+
     def reclaim_dead_leases(
         self,
         owner_id: str | Callable[[int, int], bool],
@@ -1097,6 +1156,16 @@ class SQLiteControlStore:
             for row in rows
         )
 
+    def has_cancellation_intent(self, run_id: RunId) -> bool:
+        with self._connect() as db:
+            return (
+                db.execute(
+                    "SELECT 1 FROM run_cancellation_intents WHERE run_id=?",
+                    (str(run_id),),
+                ).fetchone()
+                is not None
+            )
+
     def mark_cancellation_handover_written(self, run_id: RunId) -> None:
         with self.transaction() as db:
             updated = db.execute(
@@ -1174,6 +1243,157 @@ class SQLiteControlStore:
                 ),
             )
             return True
+
+    def claim_dispatch(
+        self,
+        repository: str,
+        role: str,
+        issue: int,
+        leg: str,
+        owner_id: str,
+        paths: frozenset[str],
+    ) -> bool:
+        """Atomically reserve one paid target/path set across deployments."""
+
+        if (
+            not repository
+            or not role
+            or issue == 0
+            or not leg
+            or not owner_id
+        ):
+            raise ValueError("dispatch claim identity is incomplete")
+        from .process_supervisor import ProcessSupervisor
+
+        identity = ProcessSupervisor.process_identity(os.getpid())
+        if identity is None:
+            raise ProcessLookupError("dispatch owner identity is unavailable")
+        target = _dispatch_claim_target(issue)
+        encoded_paths = _json(sorted(paths))
+        with self.transaction() as db:
+            rows = db.execute(
+                "SELECT target, owner_id, owner_pid, owner_start_ticks, "
+                "paths_json FROM dispatch_claims "
+                "WHERE repository=? AND role=?",
+                (repository, role),
+            ).fetchall()
+            live = []
+            for row in rows:
+                if ProcessSupervisor.matches_identity(
+                    int(row["owner_pid"]),
+                    int(row["owner_start_ticks"]),
+                ):
+                    live.append(row)
+                    continue
+                db.execute(
+                    "DELETE FROM dispatch_claims "
+                    "WHERE repository=? AND role=? AND target=?",
+                    (repository, role, row["target"]),
+                )
+            for row in live:
+                try:
+                    other_paths = frozenset(json.loads(row["paths_json"]))
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise CorruptControlStore(
+                        "dispatch claim contains invalid paths"
+                    ) from exc
+                if (
+                    row["target"] == target
+                    or not paths
+                    or not other_paths
+                    or bool(paths & other_paths)
+                ):
+                    return False
+            db.execute(
+                "INSERT INTO dispatch_claims("
+                "repository, role, target, leg, owner_id, owner_pid, "
+                "owner_start_ticks, paths_json, claimed_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    repository,
+                    role,
+                    target,
+                    leg,
+                    owner_id,
+                    identity.pid,
+                    identity.start_ticks,
+                    encoded_paths,
+                    _stamp(self._now()),
+                ),
+            )
+            return True
+
+    def expand_dispatch_claim(
+        self,
+        repository: str,
+        role: str,
+        issue: int,
+        owner_id: str,
+        paths: frozenset[str],
+    ) -> bool:
+        """Add router-discovered paths without racing another deployment."""
+
+        target = _dispatch_claim_target(issue)
+        with self.transaction() as db:
+            owned = db.execute(
+                "SELECT paths_json FROM dispatch_claims "
+                "WHERE repository=? AND role=? AND target=? AND owner_id=?",
+                (repository, role, target, owner_id),
+            ).fetchone()
+            if owned is None:
+                return False
+            try:
+                expanded = frozenset(json.loads(owned["paths_json"])) | paths
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise CorruptControlStore(
+                    "dispatch claim contains invalid paths"
+                ) from exc
+            rows = db.execute(
+                "SELECT target, paths_json FROM dispatch_claims "
+                "WHERE repository=? AND role=? AND target<>?",
+                (repository, role, target),
+            ).fetchall()
+            for row in rows:
+                try:
+                    other_paths = frozenset(json.loads(row["paths_json"]))
+                except (TypeError, json.JSONDecodeError) as exc:
+                    raise CorruptControlStore(
+                        "dispatch claim contains invalid paths"
+                    ) from exc
+                if (
+                    not expanded
+                    or not other_paths
+                    or bool(expanded & other_paths)
+                ):
+                    return False
+            db.execute(
+                "UPDATE dispatch_claims SET paths_json=? "
+                "WHERE repository=? AND role=? AND target=? AND owner_id=?",
+                (
+                    _json(sorted(expanded)),
+                    repository,
+                    role,
+                    target,
+                    owner_id,
+                ),
+            )
+            return True
+
+    def release_dispatch_claim(
+        self,
+        repository: str,
+        role: str,
+        issue: int,
+        owner_id: str,
+    ) -> bool:
+        target = _dispatch_claim_target(issue)
+        with self.transaction() as db:
+            cursor = db.execute(
+                "DELETE FROM dispatch_claims "
+                "WHERE repository=? AND role=? AND target=? AND owner_id=?",
+                (repository, role, target, owner_id),
+            )
+            return cursor.rowcount == 1
 
     def receipt(
         self,
@@ -1375,6 +1595,24 @@ class SQLiteControlStore:
                         requested,
                         request.cap,
                         "idempotent reservation" if identical else "conflicting reservation",
+                    )
+                active_dispatch = db.execute(
+                    "SELECT run_id FROM runs WHERE dispatch_id=? "
+                    "AND state IN ('reserved', 'starting', 'running')",
+                    (request.dispatch_id,),
+                ).fetchone()
+                if active_dispatch is not None:
+                    settled, reserved = self._balance(db, request.scope)
+                    return ReservationResult(
+                        AccountingDisposition.CONFLICT,
+                        None,
+                        Money(
+                            request.scope.currency,
+                            settled + reserved,
+                        ),
+                        requested,
+                        request.cap,
+                        "an active run already owns this dispatch",
                     )
                 committed = Money.zero(request.scope.currency)
                 for limit in limits:
@@ -2505,6 +2743,12 @@ def _dispatch_issue(dispatch_id: str) -> int | None:
     if isinstance(value, int) and not isinstance(value, bool) and value > 0:
         return value
     return None
+
+
+def _dispatch_claim_target(issue: int) -> str:
+    if issue == 0:
+        raise ValueError("dispatch claim target cannot be zero")
+    return f"issue:{issue}" if issue > 0 else f"pr:{-issue}"
 
 
 def _receipt_digest(receipt: EffectReceipt) -> str:

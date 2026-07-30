@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from issue_agent.adapters import agent_publish
 from issue_agent.adapters.agent_publish import (
     AgentPublicationBroker,
     CommandResult,
@@ -23,8 +24,11 @@ class Remote:
         self.remote = ""
         self.pr = ""
         self.pr_state = ""
+        self.pr_head = ""
         self.effects = []
         self.crash_after_push = False
+        self.intervene_before_push = ""
+        self.create_pr_head = ""
 
     def run(self, argv, _cwd):
         if argv == ("git", "rev-parse", "HEAD"):
@@ -42,13 +46,21 @@ class Remote:
             return CommandResult(0, output)
         if argv[:2] == ("git", "push"):
             self.effects.append(argv)
-            self.remote = self.head
+            if self.intervene_before_push:
+                self.remote = self.intervene_before_push
+            lease = next(
+                arg for arg in argv if arg.startswith("--force-with-lease=")
+            )
+            expected = lease.split(":", 1)[1]
+            if self.remote != expected:
+                return CommandResult(1, "", "stale remote lease")
+            self.remote = argv[-1].split(":", 1)[0]
             if self.crash_after_push:
                 raise KeyboardInterrupt
             return CommandResult(0, "pushed\n")
         if argv[:3] == ("gh", "pr", "list"):
             output = (
-                f'[{{"number":42,"headRefOid":"{self.head}",'
+                f'[{{"number":42,"headRefOid":"{self.pr_head or self.head}",'
                 f'"state":"{self.pr_state}","url":"{self.pr}"}}]'
                 if self.pr and self.pr_state == "OPEN"
                 else "[]"
@@ -58,6 +70,7 @@ class Remote:
             self.effects.append(argv)
             self.pr = "https://example.test/pull/42"
             self.pr_state = "OPEN"
+            self.pr_head = self.create_pr_head or self.head
             return CommandResult(0, self.pr + "\n")
         raise AssertionError(argv)
 
@@ -97,7 +110,7 @@ def test_push_is_committed_then_receipted(tmp_path):
     )
 
     result = publisher.publish(
-        ("git", "push", "--force-with-lease", "origin", "HEAD:issue-42"),
+        ("git", "push", "origin", "HEAD:issue-42"),
         str(tmp_path),
     )
 
@@ -106,9 +119,9 @@ def test_push_is_committed_then_receipted(tmp_path):
     assert remote.effects[0] == (
         "git",
         "push",
-        "--force-with-lease",
+        "--force-with-lease=refs/heads/issue-42:",
         "origin",
-        "HEAD:refs/heads/issue-42",
+        "abc123:refs/heads/issue-42",
     )
     assert control.pending_commands() == ()
     with control._connect() as db:
@@ -171,7 +184,7 @@ def test_pending_push_refuses_an_intervening_remote_revision(tmp_path):
         run=remote.run,
     )
     command = publisher._command(
-        ("git", "push", "--force", "origin", "HEAD:issue-42"),
+        ("git", "push", "origin", "HEAD:issue-42"),
         str(tmp_path),
     )
     pending = control.enqueue_command(command)
@@ -182,6 +195,48 @@ def test_pending_push_refuses_an_intervening_remote_revision(tmp_path):
     assert result.code == 75
     assert remote.effects == []
     assert control.pending_commands()[0].state == "pending"
+
+
+def test_replayed_push_uses_captured_sha_after_local_head_moves(tmp_path):
+    remote = Remote()
+    control = store(tmp_path)
+    publisher = AgentPublicationBroker(
+        control,
+        repository="o/r",
+        owner="o/r:fix",
+        run=remote.run,
+    )
+    command = publisher._command(
+        ("git", "push", "origin", "HEAD:issue-42"),
+        str(tmp_path),
+    )
+    pending = control.enqueue_command(command)
+    remote.head = "moved-local-head"
+
+    result = publisher._run_pending(pending)
+
+    assert result.code == 0
+    assert remote.remote == "abc123"
+    assert remote.effects[0][-1] == "abc123:refs/heads/issue-42"
+
+
+def test_push_exact_lease_preserves_concurrent_remote_update(tmp_path):
+    remote = Remote()
+    remote.remote = "prior"
+    remote.intervene_before_push = "intervening"
+    publisher = broker(tmp_path, remote)
+
+    result = publisher.publish(
+        ("git", "push", "origin", "HEAD:issue-42"),
+        str(tmp_path),
+    )
+
+    assert result.code != 0
+    assert remote.remote == "intervening"
+    with publisher.store._connect() as db:
+        assert db.execute(
+            "SELECT state FROM lifecycle_commands"
+        ).fetchone()[0] == "unknown_outcome"
 
 
 def test_pr_body_file_is_snapshotted_before_command_commit(tmp_path):
@@ -242,11 +297,47 @@ def test_closed_pr_with_same_head_does_not_satisfy_open_pr_publication(
     assert remote.pr_state == "OPEN"
 
 
+def test_pr_create_exit_zero_requires_matching_remote_head(tmp_path):
+    remote = Remote()
+    remote.create_pr_head = "different-head"
+    publisher = broker(tmp_path, remote)
+
+    result = publisher.publish(
+        (
+            "gh",
+            "pr",
+            "create",
+            "--base",
+            "dev",
+            "--title",
+            "Fix",
+            "--body",
+            "Fixes #42",
+        ),
+        str(tmp_path),
+    )
+
+    assert result.code != 0
+    assert remote.pr_head == "different-head"
+    with publisher.store._connect() as db:
+        command_state = db.execute(
+            "SELECT state FROM lifecycle_commands"
+        ).fetchone()[0]
+        receipt_state = db.execute(
+            "SELECT status FROM effect_receipts"
+        ).fetchone()[0]
+    assert (command_state, receipt_state) == (
+        "retryable_failure",
+        "retryable_failure",
+    )
+
+
 @pytest.mark.parametrize(
     "args",
     (
         ("git", "push", "--dry-run", "origin", "HEAD:issue-42"),
         ("git", "push", "--force", "origin", "HEAD:main"),
+        ("git", "push", "--force-with-lease", "origin", "HEAD:issue-42"),
         ("git", "push", "--tags", "origin"),
         ("git", "push", "upstream", "HEAD:issue-42"),
         ("git", "push", "origin", "other:issue-42"),
@@ -314,3 +405,52 @@ def test_broker_rejects_origin_for_a_different_repository(tmp_path):
             ("git", "push", "origin", "HEAD:issue-42"),
             str(tmp_path),
         )
+
+
+def test_cli_uses_supervised_ancestor_authority_not_child_environment(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    captured = {}
+    trusted = {
+        "ISSUE_AGENT_CONTROL_DB": str(tmp_path / "trusted.db"),
+        "ISSUE_AGENT_REPOSITORY": "o/r",
+        "ISSUE_AGENT_PUBLICATION_OWNER": "o/r:fix:deployment",
+        "ISSUE_AGENT_RUN_ID": "run-1",
+        "ISSUE_AGENT_CONFIG_VERSION": "cfg-1",
+    }
+
+    class TrustedStore:
+        def __init__(self, path):
+            captured["path"] = path
+
+        def integrity_check(self):
+            return None
+
+    class Publisher:
+        def __init__(self, _store, **kwargs):
+            captured.update(kwargs)
+
+        def publish(self, argv, cwd):
+            captured["argv"] = argv
+            captured["cwd"] = cwd
+            return CommandResult(0, "ok\n")
+
+    monkeypatch.setenv("ISSUE_AGENT_CONTROL_DB", "/tmp/attacker.db")
+    monkeypatch.setenv("ISSUE_AGENT_REPOSITORY", "attacker/other")
+    monkeypatch.setattr(
+        agent_publish,
+        "_trusted_publication_environment",
+        lambda: trusted,
+    )
+    monkeypatch.setattr(agent_publish, "SQLiteControlStore", TrustedStore)
+    monkeypatch.setattr(agent_publish, "AgentPublicationBroker", Publisher)
+
+    with pytest.raises(SystemExit) as stopped:
+        agent_publish.main(["git", "push", "origin", "HEAD:issue-42"])
+
+    assert stopped.value.code == 0
+    assert captured["path"] == trusted["ISSUE_AGENT_CONTROL_DB"]
+    assert captured["repository"] == "o/r"
+    assert captured["owner"] == "o/r:fix:deployment"
+    assert captured["config_version"] == "cfg-1"

@@ -21,11 +21,14 @@ from issue_agent.domain.actions import (
     Target,
 )
 from issue_agent.domain.labels import Label
+from issue_agent.domain.world import PRView
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
 
 
 def _exec():
-    gw = FakeGateway()
+    gw = FakeGateway(
+        prs={100: PRView(100, head_ref_oid="head-100")}
+    )
     removed, ran = [], []
     ex = Executor(
         gw,
@@ -68,7 +71,9 @@ def test_post_comment():
 
 
 def test_ci_pending_escalation_marks_head_after_verified_write():
-    gw = FakeGateway()
+    gw = FakeGateway(
+        prs={100: PRView(100, head_ref_oid="head-100")}
+    )
     gw.has_label = lambda kind, number, label: True
     marked = []
     ex = Executor(gw, mark_ci_pending_escalated=lambda pr, head: marked.append(
@@ -82,7 +87,9 @@ def test_ci_pending_escalation_marks_head_after_verified_write():
 
 
 def test_ci_pending_escalation_withholds_marker_when_relabel_is_not_verified():
-    gw = FakeGateway()
+    gw = FakeGateway(
+        prs={100: PRView(100, head_ref_oid="head-100")}
+    )
     gw.has_label = lambda kind, number, label: False
     marked = []
     ex = Executor(gw, mark_ci_pending_escalated=lambda pr, head: marked.append(
@@ -110,7 +117,9 @@ def test_enable_auto_merge_persists_the_armed_marker():
     # The decide side's marker guard (FixState.automerge_enabled) only works if
     # arming WRITES the marker — it never did (T3 probe: zero production call
     # sites), so every merge-ready PR re-armed on every poll.
-    gw = FakeGateway()
+    gw = FakeGateway(
+        prs={100: PRView(100, head_ref_oid="head-100")}
+    )
     marked = []
     ex = Executor(gw, mark_automerge=marked.append)
     ex.execute(EnableAutoMerge(100, "squash"))
@@ -123,7 +132,9 @@ def test_enable_auto_merge_failure_withholds_the_marker():
     # required protected branch rules" on an unprotected base), writing it
     # anyway suppresses should_automerge forever on a PR that is otherwise
     # merge-ready — #537 sat APPROVED + green + CLEAN and never merged.
-    gw = FakeGateway()
+    gw = FakeGateway(
+        prs={100: PRView(100, head_ref_oid="head-100")}
+    )
     gw.automerge_ok = False
     marked = []
     ex = Executor(gw, mark_automerge=marked.append)
@@ -298,3 +309,40 @@ def test_execute_all_logs_nothing_extra_when_every_action_succeeds():
     ex.execute_all([RemoveWorktree(9)])
     assert removed == [9]
     assert not any("FAILED" in line for line in logged)
+
+
+def test_failed_worktree_cleanup_withholds_dependent_state_transitions():
+    gw = FakeGateway()
+    cleared = []
+    logged = []
+
+    def fail_remove(_issue):
+        raise RuntimeError("stale registry")
+
+    ex = Executor(
+        gw,
+        remove_worktree=fail_remove,
+        clear_issue_state=lambda pr, issue, merged: cleared.append(
+            (pr, issue, merged)
+        ),
+        log=logged.append,
+    )
+
+    succeeded = ex.execute_all(
+        [
+            RemoveWorktree(9),
+            Relabel(
+                Target.ISSUE,
+                9,
+                Label.AI_PR_OPEN,
+                Label.AI_DONE,
+            ),
+            ClearIssueState(pr=100, issue=9, merged=True),
+            RemoveWorktree(10),
+        ]
+    )
+
+    assert succeeded is False
+    assert gw.calls == []
+    assert cleared == []
+    assert any("SKIPPED" in line and "issue #9" in line for line in logged)

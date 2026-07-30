@@ -26,6 +26,9 @@ class Gateway:
         self.run_attempt = 0
         self.dependencies = set()
         self.reviews = set()
+        self.advance_before_auto_merge = ""
+        self.advance_before_update = ""
+        self.advance_before_review = ""
 
     def relabel(self, kind, number, remove, add):
         self.calls.append(("relabel", kind, number, remove, add))
@@ -57,17 +60,26 @@ class Gateway:
         del head
         return self.run_attempt
 
-    def enable_auto_merge(self, pr, method):
-        self.calls.append(("auto_merge", pr, method))
+    def enable_auto_merge(self, pr, method, expected_head):
+        if self.advance_before_auto_merge:
+            self.head = self.advance_before_auto_merge
+        if self.head != expected_head:
+            return False
+        self.calls.append(("auto_merge", pr, method, expected_head))
         self.auto_merge.add(pr)
         return True
 
-    def is_auto_merge_enabled_or_merged(self, pr):
-        return pr in self.auto_merge
+    def is_auto_merge_enabled_or_merged(self, pr, expected_head):
+        return pr in self.auto_merge and self.head == expected_head
 
-    def update_branch(self, pr):
-        self.calls.append(("update_branch", pr))
+    def update_branch(self, pr, expected_head):
+        if self.advance_before_update:
+            self.head = self.advance_before_update
+        if self.head != expected_head:
+            return False
+        self.calls.append(("update_branch", pr, expected_head))
         self.head = f"{self.head}-updated"
+        return True
 
     def is_branch_updated(self, pr, prior_head):
         del pr
@@ -80,9 +92,13 @@ class Gateway:
     def has_blocked_by(self, issue, blocker):
         return (issue, blocker) in self.dependencies
 
-    def submit_review(self, pr, event, body):
-        self.calls.append(("review", pr, event, body, self.head))
-        self.reviews.add((pr, event, body, self.head))
+    def submit_review(self, pr, event, body, expected_head):
+        if self.advance_before_review:
+            self.head = self.advance_before_review
+        if self.head != expected_head:
+            return False
+        self.calls.append(("review", pr, event, body, expected_head))
+        self.reviews.add((pr, event, body, expected_head))
         return True
 
     def has_review(self, pr, event, body, head):
@@ -197,7 +213,7 @@ def test_ambiguous_auto_merge_is_reconciled_without_duplicate(tmp_path) -> None:
     gateway.enable_auto_merge = original
 
     assert executor.execute(action)
-    assert gateway.calls == [("auto_merge", 7, "squash")]
+    assert gateway.calls == [("auto_merge", 7, "squash", "head-1")]
     assert store.pending_commands() == ()
 
 
@@ -220,7 +236,7 @@ def test_ambiguous_branch_update_uses_original_revision_to_reconcile(
     gateway.update_branch = original
 
     assert executor.execute(action)
-    assert gateway.calls == [("update_branch", 7)]
+    assert gateway.calls == [("update_branch", 7, "head-1")]
     assert store.pending_commands() == ()
 
 
@@ -360,6 +376,47 @@ def test_ambiguous_review_and_same_body_on_new_head_are_distinct(
         ("review", 7, "APPROVE", "looks good", "head-2"),
     ]
     assert store.pending_commands() == ()
+
+
+@pytest.mark.parametrize(
+    ("action", "race_attribute"),
+    (
+        (EnableAutoMerge(7, "squash"), "advance_before_auto_merge"),
+        (UpdateBranch(7), "advance_before_update"),
+    ),
+)
+def test_pr_mutation_server_guard_rejects_check_to_write_head_race(
+    tmp_path,
+    action,
+    race_attribute,
+) -> None:
+    executor, gateway, store = _executor(tmp_path)
+    setattr(gateway, race_attribute, "head-2")
+
+    assert executor.execute(action) is False
+
+    assert gateway.calls == []
+    with store._connect() as db:
+        statuses = {
+            row[0]
+            for row in db.execute("SELECT status FROM effect_receipts")
+        }
+    assert "succeeded" not in statuses
+
+
+def test_review_server_guard_rejects_check_to_write_head_race(
+    tmp_path,
+) -> None:
+    executor, gateway, store = _executor(tmp_path)
+    gateway.advance_before_review = "head-2"
+
+    assert executor.submit_review(7, "APPROVE", "looks good") is False
+
+    assert gateway.calls == []
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT status FROM effect_receipts"
+        ).fetchone()[0] == "permanent_failure"
 
 
 def test_boot_drain_executes_committed_pending_command(tmp_path) -> None:

@@ -212,9 +212,12 @@ class FakeRunner:
 
 
 def test_write_command_builders_are_pure_contracts():
-    assert build_submit_review_args("o/r", 100, "APPROVE", "lgtm") == [
+    assert build_submit_review_args(
+        "o/r", 100, "APPROVE", "lgtm", "head"
+    ) == [
         "api", "repos/o/r/pulls/100/reviews", "--method", "POST",
         "-f", "event=APPROVE", "-f", "body=lgtm",
+        "-f", "commit_id=head",
     ]
     assert build_relabel_args("o/r", "issue", 5, "ai-ready", "ai-working") == [
         "issue", "edit", "5", "--repo", "o/r",
@@ -230,8 +233,11 @@ def test_write_command_builders_are_pure_contracts():
     assert build_close_issue_args("o/r", 5, "not_planned", "") == [
         "issue", "close", "5", "--repo", "o/r", "--reason", "not_planned",
     ]
-    assert build_enable_auto_merge_args("o/r", 100, "squash") == [
+    assert build_enable_auto_merge_args(
+        "o/r", 100, "squash", "head"
+    ) == [
         "pr", "merge", "100", "--repo", "o/r", "--auto", "--squash", "--delete-branch",
+        "--match-head-commit", "head",
     ]
     assert build_blocker_id_args("o/r", 42) == ["api", "repos/o/r/issues/42", "--jq", ".id"]
     assert build_add_blocked_by_args("o/r", 7, 5551234) == [
@@ -271,7 +277,7 @@ def test_close_issue_argv():
 def test_enable_auto_merge_argv():
     fr = FakeRunner()
     gw = GitHubGateway("o/r", runner=fr)
-    gw.enable_auto_merge(100, "squash")
+    gw.enable_auto_merge(100, "squash", "head")
     argv, _ = fr.calls[0]
     assert argv[1:4] == ["pr", "merge", "100"]
     assert "--auto" in argv and "--squash" in argv and "--delete-branch" in argv
@@ -283,26 +289,46 @@ def test_enable_auto_merge_verifies_armed_on_github():
     # True; anything else — including the GraphQL refusal on a base branch
     # with no required-check protection — → False, so the caller never latches
     # the don't-re-arm marker on an arm GitHub rejected (the #537 wedge).
-    armed = FakeRunner({"pr view 100": {"autoMergeRequest": {"enabledAt": "x"}, "state": "OPEN"}})
-    assert GitHubGateway("o/r", runner=armed).enable_auto_merge(100, "squash") is True
+    armed = FakeRunner({"pr view 100": {
+        "autoMergeRequest": {"enabledAt": "x"},
+        "state": "OPEN",
+        "headRefOid": "head",
+    }})
+    assert GitHubGateway("o/r", runner=armed).enable_auto_merge(
+        100, "squash", "head"
+    ) is True
 
-    landed = FakeRunner({"pr view 100": {"autoMergeRequest": None, "state": "MERGED"}})
-    assert GitHubGateway("o/r", runner=landed).enable_auto_merge(100, "squash") is True
+    landed = FakeRunner({"pr view 100": {
+        "autoMergeRequest": None,
+        "state": "MERGED",
+        "headRefOid": "head",
+    }})
+    assert GitHubGateway("o/r", runner=landed).enable_auto_merge(
+        100, "squash", "head"
+    ) is True
 
-    refused = FakeRunner({"pr view 100": {"autoMergeRequest": None, "state": "OPEN"}})
-    assert GitHubGateway("o/r", runner=refused).enable_auto_merge(100, "squash") is False
+    refused = FakeRunner({"pr view 100": {
+        "autoMergeRequest": None,
+        "state": "OPEN",
+        "headRefOid": "head",
+    }})
+    assert GitHubGateway("o/r", runner=refused).enable_auto_merge(
+        100, "squash", "head"
+    ) is False
 
     unreadable = FakeRunner()  # probe returns "" → not armed, never a crash
-    assert GitHubGateway("o/r", runner=unreadable).enable_auto_merge(100, "squash") is False
+    assert GitHubGateway("o/r", runner=unreadable).enable_auto_merge(
+        100, "squash", "head"
+    ) is False
 
 
 def test_update_branch_argv():
     fr = FakeRunner()
     gw = GitHubGateway("o/r", runner=fr)
-    gw.update_branch(100)
+    gw.update_branch(100, "head")
     argv, _ = fr.calls[0]
-    assert argv[1:4] == ["pr", "update-branch", "100"]
-    assert argv[4:6] == ["--repo", "o/r"]
+    assert argv[1:3] == ["api", "repos/o/r/pulls/100/update-branch"]
+    assert "expected_head_sha=head" in argv
 
 
 def test_add_blocked_by_resolves_id_then_posts():
@@ -330,7 +356,7 @@ def test_submit_review_returns_true_on_success():
     # gh `api ... POST` prints the created-review JSON on success → non-empty → True.
     fr = FakeRunner({"api repos/o/r/pulls/100/reviews": {"id": 1, "state": "APPROVED"}})
     gw = GitHubGateway("o/r", runner=fr)
-    assert gw.submit_review(100, "APPROVE", "lgtm") is True
+    assert gw.submit_review(100, "APPROVE", "lgtm", "head") is True
     argv, _ = fr.calls[0]
     assert argv[1] == "api" and "--method" in argv and "POST" in argv
 
@@ -339,7 +365,7 @@ def test_submit_review_returns_false_on_failure():
     # a failed POST (422/403) → runner returns "" (and logs stderr) → False.
     fr = FakeRunner()  # no canned response → "" for every call
     gw = GitHubGateway("o/r", runner=fr)
-    assert gw.submit_review(100, "APPROVE", "lgtm") is False
+    assert gw.submit_review(100, "APPROVE", "lgtm", "head") is False
 
 
 def test_has_review_flattens_all_paginated_api_pages():

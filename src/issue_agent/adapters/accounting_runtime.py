@@ -52,6 +52,7 @@ class AccountingRuntime(AgentRuntime):
     event_deployment: str = ""
     event_role: str = ""
     event_line_limit: int = 0
+    owner_id: str = ""
     _context: contextvars.ContextVar[tuple[int | None, str, int]] = field(
         default_factory=lambda: contextvars.ContextVar(
             f"accounting_context_{uuid.uuid4().hex}", default=(None, "", 0)
@@ -104,6 +105,7 @@ class AccountingRuntime(AgentRuntime):
         run_id = RunId(correlated_run_id or uuid.uuid4().hex)
         dispatch_id = json.dumps(
             {
+                "repository": self.repository,
                 "role": self.role,
                 "kind": kind or "unknown",
                 "number": number,
@@ -129,7 +131,7 @@ class AccountingRuntime(AgentRuntime):
             self.config_version,
             tuple(additional),
             kind or "paid",
-            f"{self.repository}:{self.role}",
+            self.owner_id or f"{self.repository}:{self.role}",
         )
         # Paid child ownership is recorded by the runtime's ProcessSupervisor.
         # The daemon itself must not be registered as the reservation lease:
@@ -156,7 +158,7 @@ class AccountingRuntime(AgentRuntime):
                 "ISSUE_AGENT_REPOSITORY": self.repository,
                 "ISSUE_AGENT_DURABLE_PUBLISH": "1",
                 "ISSUE_AGENT_PUBLICATION_OWNER": (
-                    f"{self.repository}:{self.role}"
+                    self.owner_id or f"{self.repository}:{self.role}"
                 ),
                 **(
                     {
@@ -186,6 +188,21 @@ class AccountingRuntime(AgentRuntime):
     ) -> AgentResult:
         usage = _token_usage(result.usage, self.runtime_name)
         provider_amount = Money.from_major("USD", result.cost_usd)
+        if (
+            self.runtime_name == "codex"
+            and usage is None
+            and provider_amount.micros <= 0
+        ):
+            if self.spend_evidence_dir:
+                from .spend_recovery import CodexSpendReconciler
+
+                CodexSpendReconciler(
+                    self.store, (self.spend_evidence_dir,)
+                ).reconcile(run_id)
+            # Missing Codex usage is not evidence of a free run. Retain the
+            # full reservation when the rollout cannot yet be reconciled; boot
+            # recovery will settle it or release it with visible unknown spend.
+            return result
         priced_by_rate_card = (
             self.rate_table is not None
             and usage is not None
@@ -232,7 +249,10 @@ class AccountingRuntime(AgentRuntime):
                 run_id,
                 amount,
                 basis,
-                result.session_id or f"run:{run_id}",
+                (
+                    f"{self.runtime_name}:"
+                    f"{result.session_id or 'no-session'}:{run_id}"
+                ),
                 usage,
                 self.rate_table.rate_card_id
                 if (
@@ -271,12 +291,15 @@ class AccountingRuntime(AgentRuntime):
                 reconciled = CodexSpendReconciler(
                     self.store, (self.spend_evidence_dir,)
                 ).reconcile(run_id)
-            if not reconciled and self.runtime_name != "codex":
+            forced_shutdown = (
+                self.runtime_name == "codex"
+                and self.store.has_cancellation_intent(run_id)
+            )
+            if not reconciled and not forced_shutdown:
                 # The inner runtime has completed supervised teardown before this
-                # path. Codex is different: rollout evidence can become readable
-                # only after the killed CLI process is reaped, so an inconclusive
-                # attempt must leave its reservation active for shutdown or boot
-                # recovery.
+                # path. A forced shutdown first persists its intent; only that
+                # path leaves an inconclusive Codex reservation active because
+                # rollout evidence can become readable after process reap.
                 self.store.release(
                     run_id, "runtime_exception_spend_unknown"
                 )

@@ -68,6 +68,8 @@ from issue_agent.app.roles import (
     _prediction_outcome_reporter,
     _recurrence_reporter,
     _review_state,
+    _shutdown_finalize,
+    _shutdown_prepare,
     _shutdown_terminalize,
 )
 from issue_agent.domain.agent_task import RuntimeName
@@ -159,6 +161,23 @@ def test_hard_shutdown_reconciles_killed_rollout_before_releasing_capacity(
         pgid=123,
         process_start_ticks=99,
     )
+    _shutdown_prepare(control, owner_id="o/r:fix")()
+    assert control.has_cancellation_intent(run_id)
+    order = []
+
+    class Effects:
+        def drain_pending_commands(self):
+            order.append("effects")
+            return 0
+
+    _shutdown_finalize(
+        control,
+        Effects(),
+        owner_id="o/r:fix",
+    )()
+
+    assert order == ["effects"]
+    assert control.active_reservation_runs("o/r:fix") == (run_id,)
 
     class Spend:
         def reconcile(self, candidate):
@@ -284,6 +303,40 @@ def test_concurrent_router_expansions_atomically_reserve_one_shared_path():
     assert sorted(results) == [False, True]
     snapshots = {item.issue: item.paths for item in reservations.snapshot()}
     assert sum("src/shared.py" in paths for paths in snapshots.values()) == 1
+
+
+def test_distinct_checkouts_share_durable_fix_dispatch_claims(
+    tmp_path,
+) -> None:
+    path = str(tmp_path / "control.sqlite3")
+    first_store = SQLiteControlStore(path)
+    second_store = SQLiteControlStore(path)
+    first_store.initialize()
+    second_store.initialize()
+    first = DispatchPathReservations(
+        first_store,
+        repository="o/r",
+        role="fix",
+        owner_id="o/r:fix:checkout-a",
+    )
+    second = DispatchPathReservations(
+        second_store,
+        repository="o/r",
+        role="fix",
+        owner_id="o/r:fix:checkout-b",
+    )
+    action = RunAgent(AgentKind.RESOLVE, 7)
+
+    assert first.reserve(action, 7, frozenset({"src/a.py"}))
+    assert not second.reserve(action, 7, frozenset({"src/b.py"}))
+    assert not second.reserve(
+        RunAgent(AgentKind.RESOLVE, 8),
+        8,
+        frozenset({"src/a.py"}),
+    )
+
+    first.finish(action)
+    assert second.reserve(action, 7, frozenset({"src/b.py"}))
 
 
 # ── resolve-retries (issue-keyed) ──────────────────────────────────────────────
@@ -818,18 +871,19 @@ def _steward_decide(
     )
     control = SQLiteControlStore(str(tmp_path / "control.db"))
     control.initialize()
+    cfg = HarnessConfig(repo="o/r", target_dir=str(tmp_path), **cfg_kw)
+    owner_id = roles._owner_identity(cfg, "steward")
     for index, target in enumerate(process_deaths):
         run_id = RunId(f"dead-{index}")
         control.start_run(
             run_id,
             json.dumps({"breaker_key": target}),
             "TRIAGE",
-            "o/r:steward",
+            owner_id,
             "test",
         )
         control.complete_run(run_id, state="abandoned", outcome="dead_lease")
     monkeypatch.setattr(roles, "_control_store", lambda *_args: control)
-    cfg = HarnessConfig(repo="o/r", target_dir=str(tmp_path), **cfg_kw)
     gw = FakeGateway()
     gw.build_triage_world = lambda: WorldState()   # observe is never called here
     daemon = roles.build_steward_daemon(cfg, gw, store, FakeRunner(AgentResult(is_error=False)))

@@ -93,10 +93,13 @@ class InMemoryGitHub:
     def has_review(self, pr: int, event: str, body: str, head: str) -> bool:
         return (pr, event, body, head) in self.submitted_reviews
 
-    def is_auto_merge_enabled_or_merged(self, pr: int) -> bool:
+    def is_auto_merge_enabled_or_merged(
+        self, pr: int, expected_head: str
+    ) -> bool:
         current = self.prs.get(pr)
-        return pr in self.automerge_enabled or (
-            current is not None and current.state.upper() == "MERGED"
+        return current is not None and current.head_ref_oid == expected_head and (
+            pr in self.automerge_enabled
+            or current.state.upper() == "MERGED"
         )
 
     def is_branch_updated(self, pr: int, prior_head: str) -> bool:
@@ -161,23 +164,30 @@ class InMemoryGitHub:
         if current is not None:
             self.issues[number] = replace(current, state="closed")
 
-    def enable_auto_merge(self, pr: int, method: str) -> bool:
+    def enable_auto_merge(
+        self, pr: int, method: str, expected_head: str
+    ) -> bool:
         self._maybe_fail("enable_auto_merge")
+        current = self.prs.get(pr)
+        if current is None or current.head_ref_oid != expected_head:
+            return False
         self.calls.append(("automerge", pr, method))
         if self.automerge_ok:
             self.automerge_enabled.add(pr)
         return self.automerge_ok
 
-    def update_branch(self, pr: int) -> None:
+    def update_branch(self, pr: int, expected_head: str) -> bool:
         self._maybe_fail("update_branch")
-        self.calls.append(("update_branch", pr))
         current = self.prs.get(pr)
-        if current is not None:
+        if current is not None and current.head_ref_oid == expected_head:
+            self.calls.append(("update_branch", pr))
             self.prs[pr] = replace(
                 current,
                 head_ref_oid=f"{current.head_ref_oid}-updated",
                 merge_state="CLEAN",
             )
+            return True
+        return False
 
     def rerun_failed_checks(self, pr: int) -> int:
         self._maybe_fail("rerun_failed_checks")
@@ -188,13 +198,20 @@ class InMemoryGitHub:
             self.run_attempts[head] = self.run_attempts.get(head, 0) + 1
         return self.rerun_run_id
 
-    def submit_review(self, pr: int, event: str, body: str) -> bool:
+    def submit_review(
+        self, pr: int, event: str, body: str, expected_head: str
+    ) -> bool:
         self._maybe_fail("submit_review")
         self.calls.append(("review", pr, event, body))
         current = self.prs.get(pr)
-        if self.submit_ok and current is not None:
-            self.submitted_reviews.add((pr, event, body, current.head_ref_oid))
-        return self.submit_ok
+        if (
+            self.submit_ok
+            and current is not None
+            and current.head_ref_oid == expected_head
+        ):
+            self.submitted_reviews.add((pr, event, body, expected_head))
+            return True
+        return False
 
     def add_blocked_by(self, issue: int, blocker: int) -> None:
         self._maybe_fail("add_blocked_by")

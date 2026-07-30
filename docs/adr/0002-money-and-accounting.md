@@ -20,13 +20,13 @@ Codex persists the run id, rollout discovery coordinates, pre-run baseline,
 and locked rates before provider launch. Recovery prices the surviving rollout
 delta with `basis=reconciled` before releasing capacity.
 The runtime's process supervisor—not the long-lived daemon PID—owns the paid
-child. An exception from Codex reconciles available evidence immediately and
-otherwise preserves the active reservation because rollout usage can become
-readable only after process reap. Forced shutdown persists its cancellation
-intent, kills and reaps the provider process, retries settlement, and leaves
-any still-indeterminate reservation and lease active for boot recovery.
-Non-Codex runtimes release after their supervised teardown returns without a
-settleable provider receipt.
+child. An exception reconciles available Codex evidence immediately and
+otherwise releases after supervised child teardown. Forced shutdown first
+persists its cancellation intent; that marker prevents the unwinding worker
+from releasing an indeterminate reservation because rollout usage can become
+readable only after process reap. Shutdown then kills and reaps the provider
+process, retries settlement, and leaves any still-indeterminate reservation
+and lease active for boot recovery.
 
 Armed caps fail closed when accounting or required pricing is unavailable.
 

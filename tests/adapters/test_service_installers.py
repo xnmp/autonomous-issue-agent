@@ -90,6 +90,65 @@ def test_systemd_installer_renders_validated_units_with_absolute_uv(tmp_path):
     assert all(f"ExecStart={uv} " in unit.read_text() for unit in units)
 
 
+def test_systemd_deployment_ids_do_not_collide_and_reject_repointing(
+    tmp_path,
+):
+    env, home, _uv = _environment(tmp_path, systemd=True)
+    config = Path(env["AGENT_ENV"])
+    first_target = tmp_path / "acme" / "app"
+    second_target = tmp_path / "other" / "app"
+    first_target.mkdir(parents=True)
+    second_target.mkdir(parents=True)
+    config.write_text(
+        f'REPO="acme/app"\nTARGET_DIR="{first_target}"\n'
+    )
+    first_env = {
+        **env,
+        "ISSUE_AGENT_DEPLOYMENT_ID": "acme-app",
+    }
+
+    first = subprocess.run(
+        ["bash", str(ROOT / "bin/install-systemd.sh")],
+        env=first_env,
+        capture_output=True,
+        text=True,
+    )
+    assert first.returncode == 0, first.stderr
+
+    config.write_text(
+        f'REPO="other/app"\nTARGET_DIR="{second_target}"\n'
+    )
+    second_env = {
+        **env,
+        "ISSUE_AGENT_DEPLOYMENT_ID": "other-app",
+    }
+    second = subprocess.run(
+        ["bash", str(ROOT / "bin/install-systemd.sh")],
+        env=second_env,
+        capture_output=True,
+        text=True,
+    )
+    assert second.returncode == 0, second.stderr
+    units = tuple((home / ".config/systemd/user").glob("*.service"))
+    assert len(units) == 6
+    assert sum(path.name.endswith("-acme-app.service") for path in units) == 3
+    assert sum(path.name.endswith("-other-app.service") for path in units) == 3
+
+    collision = subprocess.run(
+        ["bash", str(ROOT / "bin/install-systemd.sh")],
+        env={
+            **env,
+            "ISSUE_AGENT_DEPLOYMENT_ID": "acme-app",
+        },
+        capture_output=True,
+        text=True,
+    )
+    assert collision.returncode == 2
+    assert "REFUSING deployment 'acme-app'" in collision.stderr
+    snapshot = home / ".config/issue-agent/acme-app.env"
+    assert 'REPO="acme/app"' in snapshot.read_text()
+
+
 def test_systemd_failed_activation_rolls_back_units_and_config(tmp_path):
     env, home, _uv = _environment(
         tmp_path, systemd=True, fail_pattern="review-watcher"

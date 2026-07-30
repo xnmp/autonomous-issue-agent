@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import multiprocessing
+import os
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -24,6 +25,7 @@ from issue_agent.adapters.control_store import (
     SQLiteControlStore,
     SettlementRequest,
 )
+from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.domain.contracts import (
     BudgetScope,
     CommandId,
@@ -91,6 +93,16 @@ def _reserve_in_process(path: str, index: int, start, results) -> None:
     results.put(store.reserve(_request(index)).disposition.value)
 
 
+def _initialize_in_process(path: str, start, results) -> None:
+    start.wait(timeout=5)
+    try:
+        SQLiteControlStore(path).initialize()
+    except BaseException as exc:
+        results.put(f"{type(exc).__name__}: {exc}")
+    else:
+        results.put("ok")
+
+
 def test_control_store_initializes_with_restrictive_permissions_and_integrity(tmp_path):
     store = _store(tmp_path)
     assert Path(store.path).stat().st_mode & 0o777 == 0o600
@@ -100,7 +112,7 @@ def test_control_store_initializes_with_restrictive_permissions_and_integrity(tm
             "SELECT version, length(source_digest) FROM schema_migrations "
             "ORDER BY version"
         ).fetchall()
-    assert history == [(9, 64), (10, 64)]
+    assert history == [(9, 64), (10, 64), (11, 64)]
 
 
 def test_shipped_v8_database_upgrades_without_rewriting_history_or_data(
@@ -112,6 +124,8 @@ def test_shipped_v8_database_upgrades_without_rewriting_history_or_data(
     with sqlite3.connect(store.path) as db:
         db.execute("DROP TABLE run_cancellation_intents")
         db.execute("DROP TABLE level_state")
+        db.execute("DROP TABLE dispatch_claims")
+        db.execute("DROP INDEX runs_active_dispatch_unique")
         db.execute("DELETE FROM schema_migrations")
         db.execute(
             "INSERT INTO schema_migrations("
@@ -135,7 +149,7 @@ def test_shipped_v8_database_upgrades_without_rewriting_history_or_data(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name='level_state'"
         ).fetchone()
-    assert [version for version, _digest in history] == [8, 9, 10]
+    assert [version for version, _digest in history] == [8, 9, 10, 11]
     assert history[0][1] == (
         "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
     )
@@ -143,7 +157,161 @@ def test_shipped_v8_database_upgrades_without_rewriting_history_or_data(
     assert level_state == ("level_state",)
 
 
-@pytest.mark.parametrize("version", (9, 10))
+@pytest.mark.parametrize("starting_version", ("fresh", "v8", "v9"))
+def test_concurrent_role_boot_serializes_schema_migrations(
+    tmp_path,
+    starting_version,
+):
+    path = tmp_path / f"concurrent-{starting_version}.db"
+    if starting_version != "fresh":
+        SQLiteControlStore(str(path)).initialize()
+        with sqlite3.connect(path) as db:
+            db.execute("DROP TABLE dispatch_claims")
+            db.execute("DROP INDEX runs_active_dispatch_unique")
+            db.execute("DELETE FROM schema_migrations WHERE version=11")
+            db.execute("DROP TABLE run_cancellation_intents")
+            db.execute("DELETE FROM schema_migrations WHERE version=10")
+            if starting_version == "v8":
+                db.execute("DROP TABLE level_state")
+                db.execute("DELETE FROM schema_migrations")
+                db.execute(
+                    "INSERT INTO schema_migrations("
+                    "version, applied_at, source_digest) VALUES (8, ?, ?)",
+                    (NOW.isoformat(), LEGACY_V8_SCHEMA_DIGEST),
+                )
+            db.commit()
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    results = context.Queue()
+    processes = tuple(
+        context.Process(
+            target=_initialize_in_process,
+            args=(str(path), start, results),
+        )
+        for _index in range(3)
+    )
+    for process in processes:
+        process.start()
+    start.set()
+    observed = tuple(results.get(timeout=10) for _process in processes)
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+
+    assert observed == ("ok", "ok", "ok")
+    with sqlite3.connect(path) as db:
+        assert tuple(
+            row[0]
+            for row in db.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ) == (
+            (8, 9, 10, 11)
+            if starting_version == "v8"
+            else (9, 10, 11)
+        )
+
+
+def test_dispatch_claims_serialize_targets_and_overlapping_paths(
+    tmp_path,
+) -> None:
+    store = _store(tmp_path)
+
+    assert store.claim_dispatch(
+        "o/r",
+        "fix",
+        7,
+        "RESOLVE",
+        "deployment-a",
+        frozenset({"src/shared.py"}),
+    )
+    assert not store.claim_dispatch(
+        "o/r",
+        "fix",
+        7,
+        "RESUME",
+        "deployment-b",
+        frozenset({"src/other.py"}),
+    )
+    assert not store.claim_dispatch(
+        "o/r",
+        "fix",
+        8,
+        "RESOLVE",
+        "deployment-b",
+        frozenset({"src/shared.py"}),
+    )
+    assert store.claim_dispatch(
+        "o/r",
+        "fix",
+        8,
+        "RESOLVE",
+        "deployment-b",
+        frozenset({"src/independent.py"}),
+    )
+
+    assert not store.release_dispatch_claim(
+        "o/r", "fix", 7, "deployment-b"
+    )
+    assert store.release_dispatch_claim(
+        "o/r", "fix", 7, "deployment-a"
+    )
+    assert store.claim_dispatch(
+        "o/r",
+        "fix",
+        7,
+        "RESUME",
+        "deployment-b",
+        frozenset({"src/other.py"}),
+    )
+
+
+def test_active_dispatch_id_is_cross_process_admission_authority(
+    tmp_path,
+) -> None:
+    store = _store(tmp_path)
+    first = _request(1)
+    second = dataclasses.replace(
+        _request(2),
+        dispatch_id=first.dispatch_id,
+    )
+
+    assert store.reserve(first).disposition is AccountingDisposition.AVAILABLE
+    duplicate = store.reserve(second)
+
+    assert duplicate.disposition is AccountingDisposition.CONFLICT
+    assert duplicate.detail == "an active run already owns this dispatch"
+
+
+def test_publication_authority_requires_active_reservation_and_live_lease(
+    tmp_path,
+) -> None:
+    store = _store(tmp_path)
+    request = dataclasses.replace(
+        _request(1),
+        owner_id="o/r:fix:deployment",
+    )
+    assert store.reserve(request).admitted
+    assert store.publication_authority(request.run_id) is None
+    pgid = os.getpgid(0)
+    identity = ProcessSupervisor.process_identity(pgid)
+    assert identity is not None
+    store.register_process_lease(
+        request.run_id,
+        pid=pgid,
+        pgid=pgid,
+        process_start_ticks=identity.start_ticks,
+    )
+
+    authority = store.publication_authority(request.run_id)
+
+    assert authority is not None
+    assert authority.repository == "o/r"
+    assert authority.owner_id == "o/r:fix:deployment"
+    assert authority.pgid == pgid
+
+
+@pytest.mark.parametrize("version", (9, 10, 11))
 @pytest.mark.parametrize("stage", ("before_commit", "committed"))
 def test_schema_migration_restart_is_atomic_at_every_boundary(
     tmp_path,
@@ -183,7 +351,7 @@ def test_schema_migration_restart_is_atomic_at_every_boundary(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name='run_cancellation_intents'"
         ).fetchone()
-    assert versions == (9, 10)
+    assert versions == (9, 10, 11)
     assert cancellation_table == ("run_cancellation_intents",)
 
 

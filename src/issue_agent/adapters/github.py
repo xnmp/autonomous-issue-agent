@@ -566,10 +566,17 @@ def parse_world(issues: list[dict], prs: list[dict], now: str = "") -> WorldStat
 
 
 # ── write command builders ──────────────────────────────────────────────────
-def build_submit_review_args(repo: str, pr: int, event: str, body: str) -> list[str]:
+def build_submit_review_args(
+    repo: str,
+    pr: int,
+    event: str,
+    body: str,
+    head: str,
+) -> list[str]:
     return [
         "api", f"repos/{repo}/pulls/{pr}/reviews", "--method", "POST",
         "-f", f"event={event}", "-f", f"body={body}",
+        "-f", f"commit_id={head}",
     ]
 
 
@@ -597,12 +604,37 @@ def build_close_issue_args(repo: str, number: int, reason: str, comment: str) ->
     return args
 
 
-def build_enable_auto_merge_args(repo: str, pr: int, method: str) -> list[str]:
-    return ["pr", "merge", str(pr), "--repo", repo, "--auto", f"--{method}", "--delete-branch"]
+def build_enable_auto_merge_args(
+    repo: str,
+    pr: int,
+    method: str,
+    expected_head: str,
+) -> list[str]:
+    return [
+        "pr",
+        "merge",
+        str(pr),
+        "--repo",
+        repo,
+        "--auto",
+        f"--{method}",
+        "--delete-branch",
+        "--match-head-commit",
+        expected_head,
+    ]
 
 
-def build_update_branch_args(repo: str, pr: int) -> list[str]:
-    return ["pr", "update-branch", str(pr), "--repo", repo]
+def build_update_branch_args(
+    repo: str, pr: int, expected_head: str
+) -> list[str]:
+    return [
+        "api",
+        f"repos/{repo}/pulls/{pr}/update-branch",
+        "--method",
+        "PUT",
+        "-f",
+        f"expected_head_sha={expected_head}",
+    ]
 
 
 def build_blocker_id_args(repo: str, blocker: int) -> list[str]:
@@ -1369,14 +1401,18 @@ class GitHubGateway:
         except Exception:  # noqa: BLE001 — see the section comment
             return ""
 
-    def submit_review(self, pr: int, event: str, body: str) -> bool:
+    def submit_review(
+        self, pr: int, event: str, body: str, head: str
+    ) -> bool:
         """POST a review. Returns True iff gh succeeded. A failed submit (e.g. 422
         'can't approve your own PR' when the identity collides with the author, or a
         403 from a misconfigured App) returns False so the caller does NOT record a
         phantom 'reviewed' state — the daemon retries the same PR next poll. The
         underlying gh failure is surfaced on stderr by `_subprocess_runner`. gh's
         `api ... POST` prints the created-review JSON on success (non-empty)."""
-        out = self._gh(build_submit_review_args(self.repo, pr, event, body))
+        out = self._gh(
+            build_submit_review_args(self.repo, pr, event, body, head)
+        )
         return bool(out.strip())
 
     # ── writes ──
@@ -1448,7 +1484,9 @@ class GitHubGateway:
             for item in reviews
         )
 
-    def is_auto_merge_enabled_or_merged(self, pr: int) -> bool:
+    def is_auto_merge_enabled_or_merged(
+        self, pr: int, expected_head: str
+    ) -> bool:
         data = self._gh_json(
             [
                 "pr",
@@ -1457,12 +1495,16 @@ class GitHubGateway:
                 "--repo",
                 self.repo,
                 "--json",
-                "autoMergeRequest,state",
+                "autoMergeRequest,state,headRefOid",
             ]
         )
-        return isinstance(data, dict) and (
-            data.get("autoMergeRequest") is not None
-            or str(data.get("state") or "").upper() == "MERGED"
+        return (
+            isinstance(data, dict)
+            and data.get("headRefOid") == expected_head
+            and (
+                data.get("autoMergeRequest") is not None
+                or str(data.get("state") or "").upper() == "MERGED"
+            )
         )
 
     def is_branch_updated(self, pr: int, prior_head: str) -> bool:
@@ -1520,7 +1562,9 @@ class GitHubGateway:
     def close_issue(self, number: int, reason: str, comment: str) -> None:
         self._gh(build_close_issue_args(self.repo, number, reason, comment))
 
-    def enable_auto_merge(self, pr: int, method: str) -> bool:
+    def enable_auto_merge(
+        self, pr: int, method: str, expected_head: str
+    ) -> bool:
         """`gh pr merge --auto`. Returns True iff GitHub actually armed
         auto-merge — or merged the PR outright (gh merges immediately when the
         PR is already CLEAN). Success is VERIFIED with a follow-up read, not
@@ -1532,20 +1576,30 @@ class GitHubGateway:
         NONE), the marker was written anyway, and #537 sat APPROVED+green+CLEAN
         but unmergeable-by-harness forever — armed-in-state, never
         armed-on-GitHub. The caller must key the marker on this return."""
-        self._gh(build_enable_auto_merge_args(self.repo, pr, method))
+        self._gh(
+            build_enable_auto_merge_args(
+                self.repo, pr, method, expected_head
+            )
+        )
         try:
-            return self.is_auto_merge_enabled_or_merged(pr)
+            return self.is_auto_merge_enabled_or_merged(pr, expected_head)
         except Exception:  # noqa: BLE001 — unreadable is not confirmed
             return False
 
-    def update_branch(self, pr: int) -> None:
+    def update_branch(self, pr: int, expected_head: str) -> bool:
         """Bring a BEHIND PR branch up to date with base (merge base into head), so
         an armed auto-merge can land it. Fail-soft: a transient 'already up to date'
         / merge-conflict race must not abort the poll — it's re-evaluated next tick."""
         try:
-            self._gh(build_update_branch_args(self.repo, pr))
+            return bool(
+                self._gh(
+                    build_update_branch_args(
+                        self.repo, pr, expected_head
+                    )
+                ).strip()
+            )
         except Exception:
-            return
+            return False
 
     def add_blocked_by(self, issue: int, blocker: int) -> None:
         """Create a native 'issue is blocked_by blocker' dependency. The POST wants

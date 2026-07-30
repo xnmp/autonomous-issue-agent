@@ -911,6 +911,7 @@ def test_install_service_proceeds_on_compose_success(tmp_path, monkeypatch):
 
     real_run = cli.subprocess.run
     calls: list[list[str]] = []
+    detailed_calls: list[tuple[list[str], dict]] = []
 
     class _Result:
         def __init__(self, returncode: int) -> None:
@@ -920,6 +921,7 @@ def test_install_service_proceeds_on_compose_success(tmp_path, monkeypatch):
         if cmd[0] == "bash" and cmd[1] == "-c":
             return real_run(cmd, **kwargs)
         calls.append(cmd)
+        detailed_calls.append((cmd, kwargs))
         return _Result(0)
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
@@ -928,6 +930,13 @@ def test_install_service_proceeds_on_compose_success(tmp_path, monkeypatch):
     assert any(
         "install-systemd.sh" in c[1] or "install-launchd.sh" in c[1] for c in calls
     )
+    install_call = next(
+        kwargs
+        for command, kwargs in detailed_calls
+        if "install-systemd.sh" in command[1]
+        or "install-launchd.sh" in command[1]
+    )
+    assert install_call["env"]["ISSUE_AGENT_DEPLOYMENT_ID"] == "myapp"
 
 
 # ── TEST_CMD verification (a wrong command wedges the whole gate) ──────────────

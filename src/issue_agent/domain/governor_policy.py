@@ -389,6 +389,16 @@ _GIT_CONFIG_ENV = (
     "GIT_CONFIG", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_NOSYSTEM",
 )
 
+_PUBLICATION_AUTHORITY_ENV = frozenset(
+    {
+        "ISSUE_AGENT_CONTROL_DB",
+        "ISSUE_AGENT_REPOSITORY",
+        "ISSUE_AGENT_PUBLICATION_OWNER",
+        "ISSUE_AGENT_RUN_ID",
+        "ISSUE_AGENT_CONFIG_VERSION",
+    }
+)
+
 
 def _has_clustered_n(full_words: list[str]) -> bool:
     """Short-flag cluster containing `n`, e.g. `-nm`, `-an`, `-nv` — each is
@@ -533,6 +543,7 @@ def _push_destructive_target(push_words: list[str]) -> str | None:
 def bypass_reason(
     full_words: list[str], kind: str, env: list[str] | None = None,
     extra_env: tuple[str, ...] = (),
+    durable_wrapper: bool = False,
 ) -> str | None:
     """Return a human-readable reason if this command tries to bypass the gate.
 
@@ -541,6 +552,18 @@ def bypass_reason(
     """
     all_env = [*(env or []), *extra_env]
     joined = " ".join([*all_env, *full_words])
+    if durable_wrapper:
+        assigned = {
+            item.partition("=")[0]
+            for item in all_env
+            if "=" in item
+        }
+        protected = sorted(assigned & _PUBLICATION_AUTHORITY_ENV)
+        if protected:
+            return (
+                "publication authority cannot be overridden by the paid "
+                f"child: {', '.join(protected)}"
+            )
 
     # Force-push / delete of a PROTECTED branch (main/master/dev). Parsed from the
     # AST tokens, not the raw string, so `git push --force origin main`,
@@ -613,7 +636,13 @@ def find_violations(command: str) -> list[str]:
         g = classify(words)
         if g is None:
             continue
-        r = bypass_reason(g.full_words, g.kind, env, g.extra_env)
+        r = bypass_reason(
+            g.full_words,
+            g.kind,
+            env,
+            g.extra_env,
+            g.durable_wrapper,
+        )
         if r:
             reasons.append(r)
     return reasons

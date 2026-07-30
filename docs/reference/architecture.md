@@ -34,7 +34,9 @@ five candidates per changed tick and persists a title/body signature after a
 successful delivery, preventing harness comments from self-amplifying spend.
 It also performs a free reconciliation over open PR metadata and posts one
 advisory flag when a changed path is governed by an ADR that the PR description
-does not cite. The publication governor remains the hard admission gate.
+does not cite. The shell governor is advisory defense-in-depth; durable
+commands, server-side revision guards, SQLite ownership, and trusted readback
+are the publication authority.
 
 ## The five properties worth preserving
 
@@ -118,9 +120,10 @@ failure decisions; and exercised ordinary, exhausted, duplicate, and
 conflicting-receipt admissions on the pre-existing live primary database.
 Fresh databases use the v9 adoption baseline. The exact digest emitted by the
 previously shipped v8 initializer remains an accepted immutable predecessor,
-so deployed v8 databases upgrade through v9/v10 without rewritten history.
+so deployed v8 databases upgrade through v9/v10/v11 without rewritten history.
 Every migration is digest-validated and individually transactional; restart
-tests interrupt both sides of every migration commit boundary. Machine-readable
+and concurrent-role tests interrupt both sides of every migration commit
+boundary and serialize fresh/v8/v9 boot. Machine-readable
 evidence is in `control-store-migration-evidence.json`.
 The bounded production-shaped boot, active SIGTERM shutdown, isolated Codex
 accounting run, cleanup receipt, and post-canary invariants are captured in
@@ -128,9 +131,12 @@ accounting run, cleanup receipt, and post-canary invariants are captured in
 JSONL is bounded
 schema-v2 telemetry and a projection feed; losing it cannot authorize a write,
 deduplicate work, or admit spend.
-Every lifecycle command is scoped to both repository and role identity in the
-shared store. A daemon queries only its exact scope, so sibling repositories
-and the fixer/reviewer/steward credentials cannot claim each other's work.
+Every lifecycle command and paid run is scoped to repository, role, and stable
+checkout deployment identity in the shared store. Cross-process dispatch/path
+claims remain repository/role-global, so two intentionally allowed checkouts
+cannot both admit the same target or overlapping path set. A daemon queries
+only its exact ownership scope, so sibling deployments and roles cannot cancel,
+recover, or receipt each other's work.
 
 The dashboard is a read-only projection consumer. Its canonical operational
 model is rebuilt by the pure `domain/projection.py::fold` over schema-v2
@@ -198,11 +204,12 @@ leases are reclaimed.
 `SIGTERM` moves the daemon through `RUNNING → DRAINING → STOPPED`: paid
 admission stops first, active work receives a bounded cancellation window,
 handover and receipts are persisted, the outbox is flushed, and remaining
-groups are killed. Before a deadline-forced hard exit, one control transaction
-releases every owned reservation with unknown-spend provenance, terminalizes
-the run, removes its lease, and persists cancellation intent; state-owned
-handovers and the resulting outbox transitions are then flushed. Missing the
-shutdown deadline changes a clean request to a transient exit. Exit codes
+groups are killed. Before cancellation, owned active runs receive a durable
+cancellation intent. Forced teardown then reconciles measured rollout usage; a
+still-indeterminate paid run retains its reservation and evidence for boot
+recovery instead of manufacturing a zero charge or releasing unknown capacity.
+State-owned handovers and the resulting outbox transitions are then flushed.
+Missing the shutdown deadline changes a clean request to a transient exit. Exit codes
 distinguish clean/operator stops, transient
 failures, invalid configuration, duplicate instances, incompatible schemas,
 and corrupt stores so service managers do not restart permanent failures.
@@ -221,9 +228,15 @@ Target `AGENTS.md` and `CLAUDE.md` files share one byte ceiling and one encoded
 untrusted block appended only to the user task for both providers. Codex
 project-document loading and Claude project setting sources are disabled, so
 target files never enter developer/system authority.
-Child agent processes receive an explicit environment allowlist plus only the
-selected provider credential. GitHub, SSH, and git publication credentials are
-hard-denied; branch/PR publication goes through the durable broker.
+Child agent processes receive an explicit environment allowlist plus the
+selected provider credential. Supported branch/PR publication goes through the
+durable broker, whose authority is recovered from the immutable supervised
+ancestor and matched to the live SQLite run/lease instead of trusted from
+child-controlled assignments. Publication credentials are nevertheless still
+recoverable in the child process/filesystem topology; the governor and broker
+do not constitute credential isolation. All runtimes therefore remain
+trusted-inbound-only until the trigger-gated separately privileged artifact
+publisher is deployed.
 
 ## Module manifest
 

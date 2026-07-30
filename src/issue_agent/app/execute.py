@@ -648,12 +648,39 @@ class Executor:
         are applied one-at-a-time by Daemon.tick, which already isolates per
         action)."""
         succeeded = True
+        failed_worktree_cleanup: set[int] = set()
         for action in actions:
+            issue = _cleanup_dependency_issue(action)
+            if (
+                issue is not None
+                and issue in failed_worktree_cleanup
+                and not isinstance(action, RemoveWorktree)
+            ):
+                succeeded = False
+                self._log(
+                    f"SKIPPED: {self._describe(action)} — worktree cleanup "
+                    f"for issue #{issue} was not verified"
+                )
+                continue
             try:
                 self.execute(action)
             except Exception as exc:  # noqa: BLE001 - one bad action must not sink its siblings
                 succeeded = False
+                if isinstance(action, RemoveWorktree):
+                    failed_worktree_cleanup.add(action.issue)
                 desc = self._describe(action)
                 msg = f"FAILED: {desc} — {exc!r}; continuing with remaining actions"
                 self._log(msg)
         return succeeded
+
+
+def _cleanup_dependency_issue(action: Action) -> int | None:
+    if isinstance(action, RemoveWorktree):
+        return action.issue
+    if isinstance(action, ClearIssueState):
+        return action.issue
+    if isinstance(action, CloseIssue):
+        return action.number
+    if isinstance(action, Relabel) and action.target is Target.ISSUE:
+        return action.number
+    return None

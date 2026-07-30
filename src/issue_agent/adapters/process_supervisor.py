@@ -425,6 +425,14 @@ class ProcessSupervisor:
         return current is not None and current[0].start_ticks == identity.start_ticks
 
     @classmethod
+    def _group_identities(cls, pgid: int) -> tuple[ProcessIdentity, ...]:
+        return tuple(
+            identity
+            for identity, _ppid, member_pgid in cls._process_table().values()
+            if member_pgid == pgid
+        )
+
+    @classmethod
     def process_identity(cls, pid: int) -> ProcessIdentity | None:
         """Return the reuse-safe identity for a currently live process."""
 
@@ -480,23 +488,30 @@ class ProcessSupervisor:
             # of any process group, so signalling would be unsafe.
             return
         if current_leader is None:
-            members = tuple(
-                identity
-                for identity, _ppid, pgid in cls._process_table().values()
-                if pgid == registration.pgid
-            )
+            members = cls._group_identities(registration.pgid)
             cls._terminate_identities(members, grace_seconds)
             return
         pgid = registration.pgid
+        owned = {
+            identity.pid: identity
+            for identity in cls._group_identities(pgid)
+        }
         try:
             os.killpg(pgid, signal.SIGTERM)
         except ProcessLookupError:
             return
         deadline = time.monotonic() + max(0.0, grace_seconds)
-        while cls._alive(pgid) and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
+            live_owned = tuple(
+                identity
+                for identity in owned.values()
+                if cls._same_process(identity)
+            )
+            if not live_owned:
+                return
+            owned.update(
+                (identity.pid, identity)
+                for identity in cls._group_identities(pgid)
+            )
             time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
-        if cls._alive(pgid) and cls._same_process(registration.leader):
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        cls._terminate_identities(tuple(owned.values()), 0.0)

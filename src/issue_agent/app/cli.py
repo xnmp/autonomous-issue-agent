@@ -1401,7 +1401,11 @@ def cmd_install_service(args) -> int:
         err(f"compose-env.sh failed (exit {r.returncode}) — not installing the "
             f"service against a stale/missing config/.active.{name}.env.")
         return r.returncode
-    env = dict(os.environ, AGENT_ENV=_active_env_path(name))
+    env = dict(
+        os.environ,
+        AGENT_ENV=_active_env_path(name),
+        ISSUE_AGENT_DEPLOYMENT_ID=name,
+    )
     script = "install-launchd.sh" if sys.platform == "darwin" else "install-systemd.sh"
     cmd = ["/bin/bash", _bin(script)]
     # Pass a single-role selector through (launchd installer supports --fix/etc).

@@ -204,6 +204,47 @@ def test_group_descendant_is_killed_after_registered_leader_exits(
     assert supervisor.registrations() == ()
 
 
+def test_term_grace_kills_stubborn_descendant_after_leader_exits(
+    tmp_path,
+) -> None:
+    child_pid_file = tmp_path / "stubborn-child.pid"
+    process = subprocess.Popen(
+        [
+            "/bin/sh",
+            "-c",
+            (
+                "trap 'exit 0' TERM; "
+                "(trap '' TERM; while :; do sleep 1; done) & "
+                f"echo $! > {child_pid_file}; "
+                "while :; do sleep 1; done"
+            ),
+        ],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 3
+    while not child_pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    child_pid = int(child_pid_file.read_text().strip())
+    supervisor = ProcessSupervisor(str(tmp_path), grace_seconds=0.1)
+    run_id = RunId("leader-exits-during-grace")
+    supervisor.register(run_id, os.getpgid(process.pid))
+
+    supervisor.kill_tree(run_id)
+
+    _wait_dead(process)
+    deadline = time.monotonic() + 3
+    while (
+        ProcessSupervisor.process_identity(child_pid) is not None
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.02)
+    assert process.returncode == 0
+    assert ProcessSupervisor.process_identity(child_pid) is None
+    assert supervisor.registrations() == ()
+
+
 def test_supervised_command_registers_before_work_executes(tmp_path) -> None:
     supervisor = ProcessSupervisor(str(tmp_path), grace_seconds=0.05)
     run_id = RunId("wrapped")

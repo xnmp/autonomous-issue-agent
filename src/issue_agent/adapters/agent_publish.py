@@ -25,6 +25,7 @@ from ..domain.contracts import (
     EffectReceipt,
     EffectStatus,
     LifecycleCommand,
+    RunId,
 )
 from .control_store import PendingCommand, SQLiteControlStore
 from .event_log import EventLog
@@ -39,6 +40,14 @@ class CommandResult:
 
 
 RunCommand = Callable[[tuple[str, ...], str], CommandResult]
+
+_AUTHORITY_ENV_KEYS = (
+    "ISSUE_AGENT_CONTROL_DB",
+    "ISSUE_AGENT_REPOSITORY",
+    "ISSUE_AGENT_PUBLICATION_OWNER",
+    "ISSUE_AGENT_RUN_ID",
+    "ISSUE_AGENT_CONFIG_VERSION",
+)
 
 
 def _run_command(argv: tuple[str, ...], cwd: str) -> CommandResult:
@@ -153,14 +162,17 @@ class AgentPublicationBroker:
         cwd = str(payload["cwd"])
         result = self.run(argv, cwd)
         reconciled = self._reconcile(command)
-        if result.code == 0 or reconciled is True:
+        if reconciled is True:
             status = EffectStatus.SUCCEEDED
             error = None
         elif reconciled is False:
             status = EffectStatus.RETRYABLE_FAILURE
             error = (
                 result.stderr.strip()[:1000]
-                or f"publication command exited {result.code}"
+                or (
+                    f"publication command exited {result.code}, but its "
+                    "postcondition did not match"
+                )
             )
         else:
             status = EffectStatus.UNKNOWN_OUTCOME
@@ -184,10 +196,12 @@ class AgentPublicationBroker:
                 error=error,
             )
         )
-        return (
-            result
-            if status is not EffectStatus.SUCCEEDED
-            else CommandResult(0, result.stdout, result.stderr)
+        if status is EffectStatus.SUCCEEDED:
+            return CommandResult(0, result.stdout, result.stderr)
+        return CommandResult(
+            result.code if result.code != 0 else 75,
+            result.stdout,
+            error or result.stderr,
         )
 
     def _command(self, argv: tuple[str, ...], cwd: str) -> LifecycleCommand:
@@ -201,7 +215,7 @@ class AgentPublicationBroker:
             "current branch",
         )
         if argv[:2] == ("git", "push"):
-            normalized, destination = _normalized_push(argv[2:], branch)
+            flags, destination = _push_spec(argv[2:], branch)
             remote = "origin"
             remote_url = self._required_output(
                 ("git", "remote", "get-url", "--push", remote),
@@ -212,6 +226,12 @@ class AgentPublicationBroker:
             prior = self._remote_branch(remote, destination, resolved_cwd)
             if prior is None:
                 raise RuntimeError("cannot verify remote branch before push")
+            normalized = _captured_push(
+                flags,
+                destination,
+                captured_head=head,
+                prior_remote_revision=prior,
+            )
             kind = CommandKind.PUBLISH_BRANCH
             target = f"branch:{self.repository}:{destination}"
             payload: dict[str, object] = {
@@ -436,7 +456,7 @@ def _lifecycle_command(
     )
 
 
-def _normalized_push(
+def _push_spec(
     args: tuple[str, ...], current_branch: str
 ) -> tuple[tuple[str, ...], str]:
     unsupported = {
@@ -454,11 +474,19 @@ def _normalized_push(
         "--push-option",
         "--repo",
         "--no-verify",
+        "--force",
+        "-f",
+        "--force-with-lease",
     }
     if any(
         arg in unsupported
         or arg.startswith(
-            ("--receive-pack=", "--exec=", "--push-option=")
+            (
+                "--receive-pack=",
+                "--exec=",
+                "--push-option=",
+                "--force-with-lease=",
+            )
         )
         for arg in args
     ):
@@ -466,9 +494,6 @@ def _normalized_push(
             "durable publisher accepts one concrete branch update only"
         )
     supported_flags = {
-        "--force",
-        "-f",
-        "--force-with-lease",
         "--set-upstream",
         "-u",
         "--porcelain",
@@ -480,7 +505,6 @@ def _normalized_push(
     flags = tuple(arg for arg in args if arg.startswith("-"))
     if any(
         flag not in supported_flags
-        and not flag.startswith("--force-with-lease=")
         for flag in flags
     ):
         raise ValueError("durable publisher received an unsupported push option")
@@ -508,33 +532,24 @@ def _normalized_push(
         or destination in {"main", "master", "dev"}
     ):
         raise ValueError("push destination branch is unavailable")
-    normalized_flags = tuple(
-        flag
-        for flag in flags
-        if flag
-        in {
-            "--force",
-            "-f",
-            "--force-with-lease",
-            "--set-upstream",
-            "-u",
-            "--porcelain",
-            "--quiet",
-            "-q",
-            "--verbose",
-            "-v",
-        }
-        or flag.startswith("--force-with-lease=")
-    )
+    return flags, destination
+
+
+def _captured_push(
+    flags: tuple[str, ...],
+    destination: str,
+    *,
+    captured_head: str,
+    prior_remote_revision: str,
+) -> tuple[str, ...]:
+    remote_ref = f"refs/heads/{destination}"
     return (
-        (
-            "git",
-            "push",
-            *normalized_flags,
-            "origin",
-            f"HEAD:refs/heads/{destination}",
-        ),
-        destination,
+        "git",
+        "push",
+        *flags,
+        f"--force-with-lease={remote_ref}:{prior_remote_revision}",
+        "origin",
+        f"{captured_head}:{remote_ref}",
     )
 
 
@@ -630,30 +645,107 @@ def _snapshot_body_file(
     return tuple(normalized)
 
 
+def _process_environment(pid: int) -> dict[str, str]:
+    raw = Path(f"/proc/{pid}/environ").read_bytes()
+    result: dict[str, str] = {}
+    for item in raw.split(b"\0"):
+        if not item or b"=" not in item:
+            continue
+        name, value = item.split(b"=", 1)
+        result[name.decode("utf-8", "replace")] = value.decode(
+            "utf-8", "replace"
+        )
+    return result
+
+
+def _process_parent(pid: int) -> int:
+    raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    close = raw.rfind(")")
+    fields = raw[close + 1 :].split()
+    if close < 0 or len(fields) < 3:
+        raise RuntimeError(f"cannot parse process identity for pid {pid}")
+    return int(fields[1])
+
+
+def _ancestor_pids(pid: int) -> tuple[int, ...]:
+    ancestors: list[int] = []
+    seen: set[int] = set()
+    current = _process_parent(pid)
+    while current > 1 and current not in seen and len(ancestors) < 64:
+        seen.add(current)
+        ancestors.append(current)
+        current = _process_parent(current)
+    return tuple(reversed(ancestors))
+
+
+def _trusted_publication_environment() -> dict[str, str]:
+    """Recover immutable run authority from the supervised ancestor process."""
+
+    from .process_supervisor import ProcessSupervisor
+
+    for pid in _ancestor_pids(os.getpid()):
+        try:
+            candidate = _process_environment(pid)
+        except OSError:
+            continue
+        if any(not candidate.get(key) for key in _AUTHORITY_ENV_KEYS):
+            continue
+        try:
+            store = SQLiteControlStore(candidate["ISSUE_AGENT_CONTROL_DB"])
+            store.integrity_check()
+            authority = store.publication_authority(
+                RunId(candidate["ISSUE_AGENT_RUN_ID"])
+            )
+            candidate_pgid = os.getpgid(pid)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if (
+            authority is None
+            or authority.repository
+            != candidate["ISSUE_AGENT_REPOSITORY"]
+            or authority.owner_id
+            != candidate["ISSUE_AGENT_PUBLICATION_OWNER"]
+            or candidate_pgid != authority.pgid
+            or not ProcessSupervisor.matches_identity(
+                authority.pgid, authority.process_start_ticks
+            )
+        ):
+            continue
+        return candidate
+    raise RuntimeError(
+        "publication authority is unavailable from a live supervised run"
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     args = tuple(argv if argv is not None else sys.argv[1:])
-    path = os.environ.get("ISSUE_AGENT_CONTROL_DB", "")
-    repository = os.environ.get("ISSUE_AGENT_REPOSITORY", "")
-    if not path or not repository:
+    try:
+        authority_env = _trusted_publication_environment()
+    except (OSError, RuntimeError, ValueError) as exc:
         raise SystemExit(
-            "issue-agent-publish is available only inside a supervised agent run"
-        )
+            "issue-agent-publish is available only inside a supervised "
+            f"agent run: {exc}"
+        ) from exc
+    path = authority_env["ISSUE_AGENT_CONTROL_DB"]
+    repository = authority_env["ISSUE_AGENT_REPOSITORY"]
     store = SQLiteControlStore(path)
-    store.initialize()
-    event_path = os.environ.get("ISSUE_AGENT_EVENT_LOG", "")
+    store.integrity_check()
+    event_path = authority_env.get("ISSUE_AGENT_EVENT_LOG", "")
     if event_path:
         producer = Producer(
-            os.environ["ISSUE_AGENT_EVENT_DEPLOYMENT"],
+            authority_env["ISSUE_AGENT_EVENT_DEPLOYMENT"],
             repository,
-            os.environ["ISSUE_AGENT_EVENT_ROLE"],
+            authority_env["ISSUE_AGENT_EVENT_ROLE"],
             os.getpid(),
-            f"{os.environ.get('ISSUE_AGENT_RUN_ID', 'unscoped')}:{uuid.uuid4().hex}",
+            f"{authority_env['ISSUE_AGENT_RUN_ID']}:{uuid.uuid4().hex}",
         )
         events = EventLog(
             event_path,
             producer,
             line_limit=int(
-                os.environ.get("ISSUE_AGENT_EVENT_LINE_LIMIT", "65536")
+                authority_env.get(
+                    "ISSUE_AGENT_EVENT_LINE_LIMIT", "65536"
+                )
             ),
         )
         store.bind_event_outbox(
@@ -665,9 +757,9 @@ def main(argv: list[str] | None = None) -> None:
     broker = AgentPublicationBroker(
         store,
         repository=repository,
-        config_version=os.environ.get("ISSUE_AGENT_CONFIG_VERSION", ""),
+        config_version=authority_env["ISSUE_AGENT_CONFIG_VERSION"],
         identity=f"agent-publication:{os.getpid()}",
-        owner=os.environ.get("ISSUE_AGENT_PUBLICATION_OWNER", ""),
+        owner=authority_env["ISSUE_AGENT_PUBLICATION_OWNER"],
     )
     try:
         result = broker.publish(args, os.getcwd())
