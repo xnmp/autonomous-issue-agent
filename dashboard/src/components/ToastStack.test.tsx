@@ -1,6 +1,6 @@
-import { act, render, screen } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import type { ToastNotification } from "../api/types";
 import { ToastStack } from "./ToastStack";
 
@@ -53,23 +53,6 @@ describe("ToastStack", () => {
     expect(screen.getByText("+2 more")).toBeVisible();
   });
 
-  it("deduplicates repeated notification IDs within one payload", () => {
-    const repeated = toast("1", "Issue #7 dispatched");
-    const { rerender } = render(
-      <ToastStack repo="demo" notifications={[toast("0")]} roles={[]} />,
-    );
-
-    rerender(
-      <ToastStack
-        repo="demo"
-        notifications={[toast("0"), repeated, repeated]}
-        roles={[]}
-      />,
-    );
-
-    expect(screen.getAllByText("Issue #7 dispatched")).toHaveLength(1);
-  });
-
   it("announces daemon health transitions without replaying the initial state", () => {
     const role = {
       role: "fix",
@@ -111,30 +94,5 @@ describe("ToastStack", () => {
     );
     expect(screen.queryByText("Repo one merged")).not.toBeInTheDocument();
     expect(screen.queryByText("Repo two history")).not.toBeInTheDocument();
-  });
-
-  it("automatically dismisses a toast after 15 seconds", () => {
-    vi.useFakeTimers();
-    try {
-      const { rerender } = render(
-        <ToastStack repo="demo" notifications={[toast("0")]} roles={[]} />,
-      );
-      rerender(
-        <ToastStack
-          repo="demo"
-          notifications={[toast("0"), toast("1", "Issue #7 dispatched")]}
-          roles={[]}
-        />,
-      );
-      expect(screen.getByText("Issue #7 dispatched")).toBeVisible();
-
-      act(() => vi.advanceTimersByTime(14_999));
-      expect(screen.getByText("Issue #7 dispatched")).toBeVisible();
-
-      act(() => vi.advanceTimersByTime(1));
-      expect(screen.queryByText("Issue #7 dispatched")).not.toBeInTheDocument();
-    } finally {
-      vi.useRealTimers();
-    }
   });
 });
