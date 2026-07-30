@@ -228,6 +228,10 @@ CASES = (
          _base_repo, ["push", "-o", "audit", "origin"],
          False, env={"TEST_CMD": "true"}, open_pr="13",
          reason_contains="existing test file"),
+    Case("clustered_push_option_preserves_refspec_less_destination", "push",
+         _base_repo, ["push", "-vo", "audit", "origin"],
+         False, env={"TEST_CMD": "true"}, open_pr="13",
+         reason_contains="existing test file"),
     Case("command_local_config_cannot_hide_non_head_source", "push",
          _non_head_source,
          [

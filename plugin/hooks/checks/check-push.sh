@@ -118,14 +118,59 @@ destinations=()
 remote_seen=""
 remote_name=""
 delete_mode=""
+consume_push_value=""
 for arg in "$@"; do
+  if [ -n "$consume_push_value" ]; then
+    consume_push_value=""
+    continue
+  fi
   case "$arg" in
+    -o|--push-option|--receive-pack|--exec|--repo)
+      consume_push_value=1
+      continue
+      ;;
+    -[^-]*o*)
+      option_prefix="${arg%%o*}"
+      case "$option_prefix" in *d*) delete_mode=1 ;; esac
+      case "$arg" in *o) consume_push_value=1 ;; esac
+      continue
+      ;;
+    --push-option=*|--receive-pack=*|--exec=*|--repo=*) continue ;;
     --delete|-d|-[^-]*d*) delete_mode=1 ;;
   esac
 done
+consume_push_value=""
 for arg in "$@"; do
+  if [ -n "$consume_push_value" ]; then
+    if [ "$consume_push_value" = "remote" ]; then
+      remote_name="$arg"
+      remote_seen=1
+    fi
+    consume_push_value=""
+    continue
+  fi
   [ "$arg" = "push" ] && continue
-  case "$arg" in -*) continue ;; esac
+  case "$arg" in
+    -o|--push-option|--receive-pack|--exec)
+      consume_push_value="value"
+      continue
+      ;;
+    --repo)
+      consume_push_value="remote"
+      continue
+      ;;
+    --repo=*)
+      remote_name="${arg#--repo=}"
+      remote_seen=1
+      continue
+      ;;
+    -[^-]*o*)
+      case "$arg" in *o) consume_push_value="value" ;; esac
+      continue
+      ;;
+    --push-option=*|--receive-pack=*|--exec=*) continue ;;
+    -*) continue ;;
+  esac
   if [ -z "$remote_seen" ]; then
     remote_seen=1
     case "$arg" in

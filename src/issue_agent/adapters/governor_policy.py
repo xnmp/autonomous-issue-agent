@@ -275,6 +275,7 @@ def _has_clustered_n(full_words: list[str]) -> bool:
 PROTECTED_BRANCHES = ("main", "master", "dev")
 
 _FORCE_PUSH_FLAGS = ("--force", "-f", "--force-with-lease", "--force-if-includes")
+_PUSH_VALUE_OPTIONS = ("-o", "--push-option", "--receive-pack", "--exec")
 
 
 @dataclass(frozen=True)
@@ -309,8 +310,37 @@ def parse_push_args(push_words: list[str]) -> PushArgs:
     has_force = False
     is_delete = False
     is_bulk = False
-    refspecs: list[str] = []
+    positionals: list[str] = []
+    remote_from_option = ""
+    consume_as = ""
     for w in args:
+        if consume_as:
+            if consume_as == "remote":
+                remote_from_option = w
+            consume_as = ""
+            continue
+        if w in _PUSH_VALUE_OPTIONS:
+            consume_as = "value"
+            continue
+        if w == "--repo":
+            consume_as = "remote"
+            continue
+        if w.startswith("--repo="):
+            remote_from_option = w.partition("=")[2]
+            continue
+        if (
+            w.startswith("--push-option=")
+            or w.startswith("--receive-pack=")
+            or w.startswith("--exec=")
+        ):
+            continue
+        if w.startswith("-") and not w.startswith("--") and "o" in w[1:]:
+            option_flags, _, option_value = w[1:].partition("o")
+            has_force = has_force or "f" in option_flags
+            is_delete = is_delete or "d" in option_flags
+            if not option_value:
+                consume_as = "value"
+            continue
         if w in _FORCE_PUSH_FLAGS:
             has_force = True
             continue
@@ -335,21 +365,27 @@ def parse_push_args(push_words: list[str]) -> PushArgs:
         # +main` is the form), so collect ALL bare words as candidate refspecs and
         # also test the remote slot — a protected name there is harmless (it's a
         # remote, not a ref) UNLESS it carries '+'/':' refspec syntax.
-        refspecs.append(w)
+        positionals.append(w)
+    remote_slots = 0 if remote_from_option else 1
     candidates = tuple(
-        r for i, r in enumerate(refspecs)
-        if i != 0 or r.startswith("+") or ":" in r
+        refspec
+        for index, refspec in enumerate(positionals)
+        if index >= remote_slots
+        or refspec.startswith("+")
+        or ":" in refspec
     )
-    remote = (
-        refspecs[0]
-        if refspecs and not refspecs[0].startswith("+") and ":" not in refspecs[0]
+    positional_remote = (
+        positionals[0]
+        if positionals
+        and not positionals[0].startswith("+")
+        and ":" not in positionals[0]
         else ""
     )
     return PushArgs(
         has_force=has_force,
         is_delete=is_delete,
         is_bulk=is_bulk,
-        remote=remote,
+        remote=remote_from_option or positional_remote,
         candidate_refspecs=candidates,
     )
 
