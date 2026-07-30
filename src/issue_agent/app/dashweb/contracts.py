@@ -167,6 +167,7 @@ class IssueCard(Contract):
     pr_url: str | None
     pr_state: str | None
     stage: str | None
+    attention_reason: str | None = None
     done: bool
     steps: list[CardStep]
     cost_usd: float | None
@@ -272,6 +273,7 @@ class IssueDetailPayload(Warned):
     title: str | None
     url: str | None
     stage: str | None
+    attention_reason: str | None = None
     done: bool
     prs: list[int]
     pull_requests: list[PullRequestLink]

@@ -373,6 +373,8 @@ export interface components {
         };
         /** IssueCard */
         IssueCard: {
+            /** Attention Reason */
+            attention_reason?: string | null;
             /** Cost Usd */
             cost_usd: number | null;
             /** Done */
@@ -435,6 +437,8 @@ export interface components {
         };
         /** IssueDetailPayload */
         IssueDetailPayload: {
+            /** Attention Reason */
+            attention_reason?: string | null;
             /** Cost Usd */
             cost_usd: number | null;
             /** Done */

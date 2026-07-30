@@ -538,6 +538,16 @@ def _flags(row: dash.IssueRow) -> list[str]:
     return flags
 
 
+def _blocked_reason(row: dash.IssueRow) -> str | None:
+    """First useful line from the newest blocked leg, bounded for compact rows."""
+    for event in reversed(row.events):
+        if event.get("event") != "agent_run" or event.get("status") != "blocked":
+            continue
+        raw = str(event.get("needs") or event.get("summary") or "").strip()
+        return raw.splitlines()[0][:240] if raw else None
+    return None
+
+
 def _model_effort(row: dash.IssueRow, model: str) -> str | None:
     matches = [
         event
@@ -647,6 +657,7 @@ def issue_card(
         "pr_url": (gh_pr or {}).get("url"),
         "pr_state": _pr_state(gh_pr),
         "stage": row.stage,
+        "attention_reason": _blocked_reason(row),
         "done": row.done,
         "steps": collapse_steps(row),
         "cost_usd": row.cost_usd,
@@ -1076,6 +1087,7 @@ def issue_detail(
         "title": (gh_issue or {}).get("title"),
         "url": (gh_issue or {}).get("url"),
         "stage": row.stage,
+        "attention_reason": _blocked_reason(row),
         "done": row.done,
         "prs": list(row.prs),
         "pull_requests": [

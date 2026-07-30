@@ -49,6 +49,36 @@ function polled(data: IssuesPayload): Polled<IssuesPayload> {
 }
 
 describe("IssuesTab", () => {
+  it("states that a blocked agent awaits a reply and shows its reason", () => {
+    render(
+      <IssuesTab
+        repo="demo"
+        sub="inflight"
+        issues={polled({
+          in_flight: [{
+            ...doneCard,
+            issue: 121,
+            title: "Clarify the API contract",
+            stage: "awaiting human reply",
+            attention_reason: "Choose endpoint A or B.",
+            done: false,
+            flags: [],
+          }],
+          pending: [],
+          done: [],
+          backlog: [],
+          gh_ok: true,
+          warnings: [],
+        })}
+        onSetSub={vi.fn()}
+        onOpenIssue={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("awaiting human reply · Choose endpoint A or B.")).toBeVisible();
+    expect(screen.queryByText("blocked", { exact: true })).not.toBeInTheDocument();
+  });
+
   it("expands done rows before opening the full issue and hides rounds by default", async () => {
     const onOpenIssue = vi.fn();
     render(

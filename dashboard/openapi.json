@@ -620,6 +620,17 @@
       "IssueCard": {
         "additionalProperties": true,
         "properties": {
+          "attention_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attention Reason"
+          },
           "cost_usd": {
             "anyOf": [
               {
@@ -905,6 +916,17 @@
       "IssueDetailPayload": {
         "additionalProperties": true,
         "properties": {
+          "attention_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attention Reason"
+          },
           "cost_usd": {
             "anyOf": [
               {

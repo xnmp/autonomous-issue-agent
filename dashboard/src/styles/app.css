@@ -1048,6 +1048,15 @@
   font-weight: 600;
   overflow-wrap: anywhere;
 }
+.issue-attention {
+  color: var(--danger);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .compact-issue {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);

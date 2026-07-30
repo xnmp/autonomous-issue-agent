@@ -594,6 +594,33 @@ def test_agent_run_records_context_cost_and_usage(tmp_path):
                      "kind": "RESOLVE", "cost_usd": 1.25}
 
 
+def test_blocked_run_journals_bounded_reason_and_summary(tmp_path):
+    result = AgentResult(
+        is_error=False,
+        status="blocked",
+        needs="Which endpoint?\n" + ("x" * 2_000),
+        summary="Need an API decision",
+    )
+    rt, journal, _ = _runtime(tmp_path, result)
+
+    asyncio.run(rt.run(AgentTask(prompt="p")))
+
+    run = _settled(journal.path)[0]
+    assert run["needs"].startswith("Which endpoint?")
+    assert len(run["needs"]) == 1_000
+    assert run["summary"] == "Need an API decision"
+
+
+def test_nonblocked_run_does_not_grow_the_journal_with_prompt_text(tmp_path):
+    result = AgentResult(is_error=False, status="done", needs="ignored", summary="ignored")
+    rt, journal, _ = _runtime(tmp_path, result)
+
+    asyncio.run(rt.run(AgentTask(prompt="p")))
+
+    run = _settled(journal.path)[0]
+    assert "needs" not in run and "summary" not in run
+
+
 def test_missing_usage_stays_distinct_from_zero_tokens(tmp_path):
     rt, journal, _ = _runtime(tmp_path, AgentResult(is_error=False, usage=None))
     asyncio.run(rt.run(AgentTask(prompt="p")))
