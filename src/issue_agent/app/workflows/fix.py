@@ -98,7 +98,7 @@ class FixWorkflow:
                 return remembered
         branch_for_issue = getattr(self.worktrees, "branch_for_issue", None)
         if branch_for_issue is not None:
-            remembered = branch_for_issue(issue)
+            remembered = branch_for_issue(issue, fallback)
             if remembered:
                 return remembered
         return fallback

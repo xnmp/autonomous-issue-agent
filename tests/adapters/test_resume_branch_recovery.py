@@ -4,8 +4,15 @@ import asyncio
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from issue_agent.adapters.store import Store
-from issue_agent.adapters.worktree import GitResult, Worktrees, _subprocess_git
+from issue_agent.adapters.worktree import (
+    GitResult,
+    WorktreeBranchAmbiguous,
+    Worktrees,
+    _subprocess_git,
+)
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.world import Comment, IssueView
 
@@ -138,6 +145,17 @@ def test_resolve_persists_branch_for_future_reply_recovery(tmp_path):
 def test_branch_for_issue_recovers_a_unique_retained_branch():
     refs = GitResult(0, "\n".join(["dev", "fix/5-original-title", "fix/50-other-issue"]))
 
-    assert Worktrees("/repo", run=FakeGit({"for-each-ref": refs})).branch_for_issue(5) == (
+    assert Worktrees("/repo", run=FakeGit({"for-each-ref": refs})).branch_for_issue(
+        5, "fix/5-retitled"
+    ) == (
         "fix/5-original-title"
     )
+
+
+def test_branch_for_issue_fails_for_multiple_retained_branches():
+    refs = GitResult(0, "\n".join(["fix/5-first", "fix/5-second"]))
+
+    with pytest.raises(WorktreeBranchAmbiguous, match="multiple retained branches"):
+        Worktrees("/repo", run=FakeGit({"for-each-ref": refs})).branch_for_issue(
+            5, "fix/5-retitled"
+        )
