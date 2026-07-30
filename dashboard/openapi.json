@@ -620,6 +620,17 @@
       "IssueCard": {
         "additionalProperties": true,
         "properties": {
+          "attention_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attention Reason"
+          },
           "cost_usd": {
             "anyOf": [
               {
@@ -656,6 +667,44 @@
             },
             "title": "Flags",
             "type": "array"
+          },
+          "human_action": {
+            "anyOf": [
+              {
+                "enum": [
+                  "merge-ready",
+                  "awaiting-reply",
+                  "escalated"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Human Action"
+          },
+          "human_wait_s": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Human Wait S"
+          },
+          "human_wait_since_ts": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Human Wait Since Ts"
           },
           "idle_active": {
             "title": "Idle Active",
@@ -905,6 +954,17 @@
       "IssueDetailPayload": {
         "additionalProperties": true,
         "properties": {
+          "attention_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Attention Reason"
+          },
           "cost_usd": {
             "anyOf": [
               {

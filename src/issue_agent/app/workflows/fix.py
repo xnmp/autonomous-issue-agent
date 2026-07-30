@@ -78,6 +78,9 @@ class FixWorkflow:
     runner: AgentRuntime
     executor: object
     prepare_cwd: Callable[[str], None] | None = None
+    # Atomic application-level reservation update for router-expanded paths.
+    # None keeps standalone workflow tests and serial callers unchanged.
+    reserve_paths: Callable[[int, frozenset[str]], bool] | None = None
 
     def _ensure_cwd(self, issue: int, branch: str) -> str:
         cwd = self.worktrees.ensure(issue, branch)
@@ -169,6 +172,17 @@ class FixWorkflow:
         kind — a naming nicety must never be able to kill a leg."""
         override = getattr(self.runner, "leg_kind", None) if kind else None
         return override(kind) if override is not None else contextlib.nullcontext()
+
+    def _route_receipt(self):
+        """Expose a ROUTE decision to a journalling runner when it supports it.
+
+        The router result is only a tier. This workflow is the layer that turns
+        it into the selected model and effort, so it is the sole honest source
+        for the ROUTE event's decision fields. Bare runners used by callers and
+        tests retain their existing one-method runtime contract.
+        """
+        receipt = getattr(self.runner, "route_receipt", None)
+        return receipt() if receipt is not None else contextlib.nullcontext(lambda *_: None)
 
     async def _run_logged(self, label: str, issue: int, task, *, kind: str | None = None):
         self.cfg.log(f"agent #{issue}: {label} — running")
@@ -434,27 +448,38 @@ class FixWorkflow:
             return cfg, False
         if cfg.model:
             return self._escalated(cfg, issue, "resolve", iss=iss), False
-        try:
-            result = await self._run_logged(
-                "route", issue,
-                task_builders.build_router_task(
-                    iss.title, iss.body, runtime=self.cfg.fixer_runtime
-                ),
-                kind=AgentKind.ROUTE.name,
+        with self._route_receipt() as record_decision:
+            try:
+                result = await self._run_logged(
+                    "route", issue,
+                    task_builders.build_router_task(
+                        iss.title, iss.body, runtime=self.cfg.fixer_runtime
+                    ),
+                    kind=AgentKind.ROUTE.name,
+                )
+                tier = result.field("tier")
+                predicted_paths = normalize_predicted_paths(result.field("predicted_paths"))
+                save_prediction = getattr(self.store, "save_predicted_paths", None)
+                if save_prediction is not None:
+                    save_prediction(issue, predicted_paths)
+            except Exception as exc:  # noqa: BLE001 — routing is advisory, never fatal
+                self.cfg.log(f"agent #{issue}: route — failed ({exc}); dispatching unrouted")
+                return self._escalated(cfg, issue, "resolve", iss=iss), False
+            routed = self._escalated(
+                cfg, issue, "resolve", tier=tier or DEFAULT_TIER, iss=iss
             )
-            tier = result.field("tier")
-            predicted_paths = normalize_predicted_paths(result.field("predicted_paths"))
-            save_prediction = getattr(self.store, "save_predicted_paths", None)
-            if save_prediction is not None:
-                save_prediction(issue, predicted_paths)
-        except Exception as exc:  # noqa: BLE001 — routing is advisory, never fatal
-            self.cfg.log(f"agent #{issue}: route — failed ({exc}); dispatching unrouted")
-            return self._escalated(cfg, issue, "resolve", iss=iss), False
-        routed = self._escalated(cfg, issue, "resolve", tier=tier or DEFAULT_TIER, iss=iss)
-        self.cfg.log(
-            f"agent #{issue}: route — tier={tier or 'unknown'} → model={routed.model}"
-        )
-        return routed, self._prediction_overlaps_open_pr(issue, predicted_paths)
+            record_decision(routed.model, routed.effort)
+            self.cfg.log(
+                f"agent #{issue}: route — tier={tier or 'unknown'} → model={routed.model}"
+            )
+            reservation_conflict = (
+                self.reserve_paths is not None
+                and not self.reserve_paths(issue, predicted_paths)
+            )
+            return routed, (
+                reservation_conflict
+                or self._prediction_overlaps_open_pr(issue, predicted_paths)
+            )
 
     async def resolve(self, issue: int) -> None:
         if self.cfg.author_tests_split:

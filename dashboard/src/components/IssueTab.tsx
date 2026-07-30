@@ -141,6 +141,9 @@ export function IssueTab({
               {d.done ? <Chip tone="ok">done</Chip> : null}
             </div>
             <div className="issue-hd-line issue-hd-meta">
+              {d.stage === "awaiting human reply" && d.attention_reason ? (
+                <span className="issue-attention">{d.attention_reason}</span>
+              ) : null}
               {d.pull_requests.map((pr) =>
                 pr.url ? (
                   <a

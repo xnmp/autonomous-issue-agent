@@ -56,6 +56,7 @@ export function stateTone(state: StepState | null | undefined): Tone {
     case "ok":
       return "ok";
     case "failed":
+    case "blocked":
       return "fail";
     case "running":
       return "running";
@@ -87,7 +88,9 @@ export function statusTone(status: string | null | undefined): Tone {
 /** Every flag is a problem; severity splits red from orange-ish yellow. */
 export function flagTone(flag: IssueFlag): Tone {
   if (flag === "waiting") return "info";
-  return flag === "escalated" || flag === "spend-blocked" ? "fail" : "running";
+  return flag === "escalated" || flag === "spend-blocked" || flag === "blocked"
+    ? "fail"
+    : "running";
 }
 
 export function prStateTone(state: string | null | undefined): Tone {

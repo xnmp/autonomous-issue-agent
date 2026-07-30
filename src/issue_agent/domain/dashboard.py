@@ -299,7 +299,8 @@ def stage_for(events, running: tuple[RunningLeg, ...] = ()) -> str:
          `recurrence`                          → "recurred"
          `spend_block`                         → "blocked (spend)"
          `hold`                                → "held"
-         `+ai-blocked`                         → "blocked"
+         `+ai-blocked`                         → "blocked" (the web projection
+                                                  adds the recorded reason)
          review run APPROVE                    → "awaiting merge"
          review run REQUEST_CHANGES            → "changes requested"
          errored run                           → "run failed"
@@ -377,14 +378,16 @@ def _stage_of_event(e: dict) -> str:
     if name == "agent_run":
         kind = str(e.get("kind") or "")
         status = str(e.get("status") or "")
+        if e.get("is_error"):
+            return "run failed"
+        if status == "blocked":
+            return "awaiting human reply"
         if kind in REVIEW_KINDS:
             if status == "APPROVE":
                 return "awaiting merge"
             if status == "REQUEST_CHANGES":
                 return "changes requested"
             return "reviewed"
-        if e.get("is_error"):
-            return "run failed"
         if kind in RESOLVE_KINDS or kind in REPAIR_KINDS:
             return "awaiting review"
         return ""

@@ -289,7 +289,9 @@ function InFlightTable({
             const alert = (
               card.stage === "blocked"
               || card.stage === "escalated"
-              || card.flags.some((flag) => flag === "escalated" || flag === "spend-blocked")
+              || card.flags.some(
+                (flag) => flag === "escalated" || flag === "spend-blocked" || flag === "blocked",
+              )
             );
             return (
               <Fragment key={card.issue}>
@@ -788,6 +790,11 @@ function taskName(step: CardStep): string {
 }
 
 function IssueSummary({ card, open }: { card: IssueCard; open: boolean }) {
+  const now = useClock();
+  const humanWait = card.human_wait_since_ts
+    ? Math.max(0, (now - Date.parse(card.human_wait_since_ts)) / 1000)
+    : (card.human_wait_s ?? null);
+  const secondaryFlags = card.flags.filter((flag) => flag !== card.human_action);
   return (
     <div className="issue-summary">
       <span className={`chev${open ? " open" : ""}`} aria-hidden="true">▸</span>
@@ -795,13 +802,28 @@ function IssueSummary({ card, open }: { card: IssueCard; open: boolean }) {
         <span className="issue-summary-title" title={card.title ?? undefined}>
           {card.title ?? <span className="faint">title unavailable</span>}
         </span>
+        {card.stage === "awaiting human reply" ? (
+          <span
+            className="issue-attention"
+            title={card.attention_reason ?? "The agent is waiting for a reply."}
+          >
+            awaiting human reply
+            {card.attention_reason ? ` · ${card.attention_reason}` : ""}
+          </span>
+        ) : null}
         <div className="row-wrap">
           <IssueNumber issue={card.issue} url={card.url} />
           <PrLink card={card} />
           {card.stage === "blocked" || card.stage === "escalated" ? (
             <span className="attention-stage">{card.stage}</span>
           ) : null}
-          {card.flags.length > 0 ? <FlagList flags={card.flags} /> : null}
+          {card.human_action ? (
+            <span className={`human-action human-action-${card.human_action}`}>
+              {card.human_action.replace("-", " ")}
+              {humanWait !== null ? ` · ${duration(humanWait, false)}` : ""}
+            </span>
+          ) : null}
+          {secondaryFlags.length > 0 ? <FlagList flags={secondaryFlags} /> : null}
         </div>
       </div>
     </div>
@@ -904,7 +926,7 @@ function DurationBreakdown({
       <span title="time actively progressing through harness work">
         <span className="faint">work</span> {duration(working, showSeconds)}
       </span>
-      <span title="time waiting on a dependency or hold">
+      <span title="time waiting on a dependency, hold, or human input">
         <span className="faint">idle</span> {duration(idle, showSeconds)}
       </span>
     </span>

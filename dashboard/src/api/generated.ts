@@ -373,6 +373,8 @@ export interface components {
         };
         /** IssueCard */
         IssueCard: {
+            /** Attention Reason */
+            attention_reason?: string | null;
             /** Cost Usd */
             cost_usd: number | null;
             /** Done */
@@ -383,6 +385,12 @@ export interface components {
             estimated: boolean;
             /** Flags */
             flags: string[];
+            /** Human Action */
+            human_action?: ("merge-ready" | "awaiting-reply" | "escalated") | null;
+            /** Human Wait S */
+            human_wait_s?: number | null;
+            /** Human Wait Since Ts */
+            human_wait_since_ts?: string | null;
             /** Idle Active */
             idle_active: boolean;
             /** Idle S */
@@ -435,6 +443,8 @@ export interface components {
         };
         /** IssueDetailPayload */
         IssueDetailPayload: {
+            /** Attention Reason */
+            attention_reason?: string | null;
             /** Cost Usd */
             cost_usd: number | null;
             /** Done */

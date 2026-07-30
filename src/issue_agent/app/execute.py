@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
+import threading
 import time
 
 from ..adapters.github import GhUnavailable
@@ -120,6 +121,10 @@ class Executor:
         self._pending_actions = pending_actions
         self._retry_delays = retry_delays
         self._sleep = sleep
+        # Paid dispatches run outside this lock. Every lifecycle side effect
+        # they emit is serialized with the observation loop, preserving the
+        # single-writer pending queue and deterministic GitHub transitions.
+        self._action_lock = threading.RLock()
 
     def _describe(self, action: Action) -> str:
         """Human-readable one-liner for the action being applied."""
@@ -162,6 +167,27 @@ class Executor:
         if self._journal is not None:
             self._journal.emit("escalation", **fields)
         alert(self._alert_cmd, event_line("escalation", **fields))
+
+    def _human_wait_transition(self, action: Relabel) -> None:
+        """Journal the durable edges of an issue's human-input wait."""
+        if self._journal is None or action.target is not Target.ISSUE:
+            return
+        state = None
+        if action.add is Label.AI_BLOCKED:
+            state = "waiting"
+        elif (
+            action.remove is Label.AI_BLOCKED
+            and action.add is Label.AI_WORKING
+        ):
+            state = "cleared"
+        if state is not None:
+            self._journal.emit(
+                "deferred",
+                state=state,
+                issue=action.number,
+                reason="human",
+                blocker="human",
+            )
 
     def _already_applied(self, action: Action) -> bool:
         """Best-effort idempotency probe for a retry after an ambiguous reply.
@@ -216,6 +242,8 @@ class Executor:
             and action.add is Label.NEEDS_HUMAN_REVIEW
         ):
             self._escalated(action)
+        if isinstance(action, Relabel):
+            self._human_wait_transition(action)
         elif isinstance(action, EscalateCiPending):
             self._mark_ci_pending_escalated(action.pr, action.head)
             self._escalated(
@@ -284,6 +312,7 @@ class Executor:
             # and a journal that claims it did is worse than one that is silent.
             if action.add is Label.NEEDS_HUMAN_REVIEW:
                 self._escalated(action)
+            self._human_wait_transition(action)
         elif isinstance(action, EscalateCiPending):
             self._apply_ci_escalation(action, resume=False)
         elif isinstance(action, PostComment):
@@ -379,6 +408,13 @@ class Executor:
         return True
 
     def execute(self, action: Action, *, replayed: bool = False) -> None:
+        if isinstance(action, RunAgent):
+            self._execute(action, replayed=replayed)
+            return
+        with self._action_lock:
+            self._execute(action, replayed=replayed)
+
+    def _execute(self, action: Action, *, replayed: bool = False) -> None:
         if isinstance(action, NoOp):
             return
         desc = self._describe(action)
@@ -429,6 +465,12 @@ class Executor:
             )
 
     def reconcile_recent_actions(
+        self, started_at: datetime, woke_at: datetime
+    ) -> None:
+        with self._action_lock:
+            self._reconcile_recent_actions(started_at, woke_at)
+
+    def _reconcile_recent_actions(
         self, started_at: datetime, woke_at: datetime
     ) -> None:
         """Verify durable receipts around a stall and repair missing writes.
@@ -499,6 +541,10 @@ class Executor:
                 continue
 
     def replay_pending(self) -> bool:
+        with self._action_lock:
+            return self._replay_pending()
+
+    def _replay_pending(self) -> bool:
         """Replay durable writes, quarantining unverifiable entries after the bound."""
         if self._pending_actions is None:
             return True

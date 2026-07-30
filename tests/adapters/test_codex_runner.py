@@ -290,6 +290,79 @@ def _fake_codex(tmp, body: str) -> str:
     return path
 
 
+def test_cancelled_run_terminates_its_process_group():
+    tmp = tempfile.mkdtemp()
+    pid_file = os.path.join(tmp, "pid")
+    body = f'''
+echo $$ > "{pid_file}"
+while true; do
+  echo "working" >&2
+  sleep 0.05
+done
+'''
+
+    async def scenario():
+        runner = CodexRunner(
+            codex_bin=_fake_codex(tmp, body),
+            env={"OPENAI_API_KEY": "test-key"},
+        )
+        task = asyncio.create_task(runner.run(AgentTask(prompt="x")))
+        for _ in range(100):
+            if os.path.exists(pid_file):
+                break
+            await asyncio.sleep(0.01)
+        assert os.path.exists(pid_file)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    pid = int(open(pid_file).read())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
+@pytest.mark.parametrize(
+    "closed_streams",
+    ("exec 2>&-", "exec 1>&- 2>&-"),
+    ids=("stdout-drain", "process-wait"),
+)
+def test_cancelled_after_stderr_eof_terminates_its_process_group(closed_streams):
+    tmp = tempfile.mkdtemp()
+    pid_file = os.path.join(tmp, "pid")
+    ready_file = os.path.join(tmp, "ready")
+    body = f'''
+echo $$ > "{pid_file}"
+{closed_streams}
+echo ready > "{ready_file}"
+sleep 30
+'''
+
+    async def scenario():
+        runner = CodexRunner(
+            codex_bin=_fake_codex(tmp, body),
+            env={"OPENAI_API_KEY": "test-key"},
+        )
+        task = asyncio.create_task(runner.run(AgentTask(prompt="x")))
+        for _ in range(100):
+            if os.path.exists(ready_file):
+                break
+            await asyncio.sleep(0.01)
+        assert os.path.exists(ready_file)
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    pid = int(open(pid_file).read())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+
+
 def test_run_parses_output_file_and_session_stdout_fallback():
     # Session id on STDOUT exercises the FALLBACK branch only — real `codex exec`
     # emits it on stderr (covered by test_run_reads_session_id_from_stderr, the

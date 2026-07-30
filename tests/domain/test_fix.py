@@ -20,6 +20,7 @@ from issue_agent.domain.fix import (
     CiFlake,
     FixConfig,
     FixState,
+    InFlightFix,
     HOLD_BLOCKER,
     HOLD_OVERLAP,
     Hold,
@@ -241,6 +242,91 @@ def test_busy_fixer_dispatches_nothing_new():
     assert _run_agents(actions) == []
     # and a busy fixer does not reap (the run-lock is held).
     assert not any(isinstance(a, Relabel) for a in actions)
+
+
+def test_available_slots_dispatch_only_path_disjoint_issues():
+    w = world(issues=[
+        issue(1, "ai-ready", predicted_paths=frozenset({"src/a.py"})),
+        issue(2, "ai-ready", predicted_paths=frozenset({"src/b.py"})),
+        issue(3, "ai-ready", predicted_paths=frozenset({"src/b.py"})),
+    ])
+
+    actions = decide_fix(
+        w,
+        CFG,
+        FixState(),
+        fixer_busy=False,
+        dispatch_slots=3,
+    )
+
+    assert _run_agents(actions) == [
+        RunAgent(AgentKind.RESOLVE, 1),
+        RunAgent(AgentKind.RESOLVE, 2),
+    ]
+
+
+def test_unknown_path_resolves_are_staged_until_router_prediction_is_observed():
+    w = world(issues=[
+        issue(1, "ai-ready"),
+        issue(2, "ai-ready"),
+    ])
+
+    actions = decide_fix(
+        w,
+        CFG,
+        FixState(),
+        fixer_busy=False,
+        dispatch_slots=2,
+    )
+
+    assert _run_agents(actions) == [RunAgent(AgentKind.RESOLVE, 1)]
+
+
+def test_active_unknown_path_resolve_excludes_other_work():
+    w = world(issues=[
+        issue(2, "ai-ready", predicted_paths=frozenset({"src/free.py"})),
+    ])
+    inflight = (InFlightFix(1, exclusive=True),)
+
+    assert pick_ready_issue(w, inflight) is None
+    assert issue_holds(w, inflight) == (
+        Hold(2, HOLD_OVERLAP, blocker_issue=1),
+    )
+
+
+def test_inflight_paths_hold_a_ready_issue_before_it_has_a_pr():
+    w = world(issues=[
+        issue(2, "ai-ready", predicted_paths=frozenset({"src/shared.py"})),
+        issue(3, "ai-ready", predicted_paths=frozenset({"src/free.py"})),
+    ])
+    inflight = (InFlightFix(1, frozenset({"src/shared.py"})),)
+
+    assert pick_ready_issue(w, inflight) == 3
+    assert issue_holds(w, inflight) == (
+        Hold(2, HOLD_OVERLAP, blocker_issue=1),
+    )
+
+
+def test_inflight_issue_cannot_receive_a_second_pr_leg():
+    repair = pr(
+        100,
+        "ai-pr-open",
+        state="OPEN",
+        head_ref_name="fix/5-x",
+        closing_issue=5,
+        changed_files=frozenset({"src/a.py"}),
+        reviews=(Review("CHANGES_REQUESTED", "review-bot", "t1"),),
+    )
+
+    actions = decide_fix(
+        world(prs=[repair]),
+        CFG,
+        FixState(inflight=(InFlightFix(5, frozenset({"src/a.py"})),)),
+        fixer_busy=True,
+        dispatch_slots=1,
+    )
+
+    assert _run_agents(actions) == []
 
 
 # ── resume dedupe (anti-loop) ──────────────────────────────────────────────────
@@ -1105,6 +1191,24 @@ def test_reap_requeues_orphaned_issue_to_ready():
     assert Relabel(Target.ISSUE, 8, Label.AI_WORKING, Label.AI_READY) in reap_actions(w)
 
 
+def test_reap_protects_only_active_issues_while_pool_is_occupied():
+    w = world(issues=[
+        issue(8, "ai-working"),
+        issue(9, "ai-working"),
+    ])
+
+    actions = decide_fix(
+        w,
+        CFG,
+        FixState(inflight=(InFlightFix(8, frozenset({"src/a.py"})),)),
+        fixer_busy=True,
+        dispatch_slots=0,
+    )
+
+    assert Relabel(Target.ISSUE, 8, Label.AI_WORKING, Label.AI_READY) not in actions
+    assert Relabel(Target.ISSUE, 9, Label.AI_WORKING, Label.AI_READY) in actions
+
+
 def test_reap_ignores_prs_entirely():
     # review M22/D9: the PR arm is deleted, not merely unused. Nothing in the SDK
     # port adds ai-working to a PR, so the arm could only ever fire on a label a
@@ -1298,6 +1402,61 @@ def test_cleanup_still_closes_a_merged_issue_github_left_open():
     assert any(isinstance(a, CloseIssue) and a.number == 8 for a in actions)
 
 
+def test_cleanup_defers_active_issue_but_still_cleans_unrelated_terminal_pr():
+    active = pr(
+        50, "ai-pr-open", state="MERGED", closing_issue=8,
+        head_ref_name="fix/8-thing",
+    )
+    unrelated = pr(
+        51, "ai-pr-open", state="MERGED", closing_issue=9,
+        head_ref_name="fix/9-thing",
+    )
+    w = world(
+        issues=[
+            issue(8, "ai-pr-open", state="closed"),
+            issue(9, "ai-pr-open", state="closed"),
+        ],
+        prs=[active, unrelated],
+    )
+
+    actions = decide_fix(
+        w,
+        CFG,
+        FixState(inflight=(InFlightFix(8, frozenset({"src/a.py"})),)),
+        fixer_busy=True,
+        dispatch_slots=0,
+    )
+
+    assert RemoveWorktree(8) not in actions
+    assert not any(
+        isinstance(action, ClearIssueState) and action.issue == 8
+        for action in actions
+    )
+    assert Relabel(
+        Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE
+    ) not in actions
+    assert RemoveWorktree(9) in actions
+    assert ClearIssueState(pr=51, issue=9, merged=True) in actions
+
+
+def test_deferred_active_merge_cleanup_runs_after_worker_settles():
+    merged = pr(
+        50, "ai-pr-open", state="MERGED", closing_issue=8,
+        head_ref_name="fix/8-thing",
+    )
+    w = world(
+        issues=[issue(8, "ai-pr-open", state="closed")],
+        prs=[merged],
+    )
+
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+
+    assert RemoveWorktree(8) in actions
+    assert ClearIssueState(pr=50, issue=8, merged=True) in actions
+    assert Relabel(Target.PR, 50, Label.AI_PR_OPEN, None) in actions
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE) in actions
+
+
 # ── issue-driven cleanup: the PR is gone from the world entirely (#28) ───────
 def test_orphaned_cleanup_repairs_a_closed_issue_with_no_covering_pr():
     w = world(issues=[issue(8, "ai-pr-open", state="closed")])
@@ -1306,6 +1465,14 @@ def test_orphaned_cleanup_repairs_a_closed_issue_with_no_covering_pr():
         Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE),
         ClearIssueState(pr=None, issue=8, merged=True),
     ]
+
+
+def test_orphaned_cleanup_defers_an_active_issue():
+    w = world(issues=[issue(8, "ai-pr-open", state="closed")])
+
+    assert orphaned_cleanup_actions(
+        w, active_issues=frozenset({8})
+    ) == []
 
 
 def test_orphaned_cleanup_ignores_an_issue_its_pr_still_covers():

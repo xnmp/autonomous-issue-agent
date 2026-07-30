@@ -26,11 +26,17 @@ from dataclasses import dataclass, field
 DEFAULT_TTL_S = 45.0
 GH_TIMEOUT_S = 30.0
 
-ISSUE_FIELDS = "number,title,url,body,labels,state,createdAt,closedAt,comments"
+ISSUE_FIELDS = (
+    "number,title,url,body,labels,state,createdAt,closedAt,updatedAt,comments"
+)
 # `gh issue list` paginates to this bound. Reaching it is surfaced to callers:
 # a long-run trend that quietly omitted history would be worse than no trend.
 ISSUE_HISTORY_LIMIT = 1000
-PR_FIELDS = "number,title,url,state,mergedAt"
+PR_FIELDS = (
+    "number,title,url,state,mergedAt,updatedAt,reviewDecision,"
+    "statusCheckRollup,autoMergeRequest,latestReviews,labels,comments,"
+    "isDraft,mergeable,mergeStateStatus"
+)
 
 
 @dataclass
