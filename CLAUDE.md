@@ -251,6 +251,9 @@ and appends that scratch document to the next fixer task for the same issue.
 For unpinned Claude SDK tasks, the SDK init/result envelope's resolved model is
 carried into the terminal journal record; starts remain empty until a configured
 task model exists. This keeps default-model attribution append-compatible.
+Both runtime adapters normalize structured terminal `status` and review
+`decision` values before journaling, so review verdict analytics retain one
+`agent_run.status` grammar across Claude and Codex.
 The handover is byte-bounded, issue-scoped, encoded as untrusted context before
 the current authoritative task, and retired after successful delivery. This is
 deterministic post-mortem synthesis, so it adds no model call or unbounded grace
