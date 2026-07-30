@@ -27,7 +27,7 @@ from issue_agent.adapters.journal import (
     read_events,
     total_tokens,
 )
-from issue_agent.domain.agent_task import AgentTask
+from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.outcome import AgentResult, ExitReason
 
 ABORT_USAGE = {
@@ -64,7 +64,7 @@ def _seed_priced_history(rt, journal, cost=3.826, usage=None, stream_usage=None)
         exit_reason=ExitReason.OK, usage=usage or dict(ABORT_USAGE),
         stream_usage=stream_usage,
     )
-    asyncio.run(rt.run(AgentTask(prompt="p", model="opus")))
+    asyncio.run(rt.run(RuntimePlan(prompt="p", model="opus")))
 
 
 # ── the pure rate/price helpers ───────────────────────────────────────────────
@@ -145,7 +145,7 @@ def test_a_wall_capped_run_reaches_the_ledger_instead_of_vanishing(tmp_path):
         exit_reason=ExitReason.WALL_TIMEOUT, usage=dict(ABORT_USAGE),
     )
     rt.set_context("fix", "RESOLVE", 2, 2)
-    asyncio.run(rt.run(AgentTask(prompt="p", model="opus")))
+    asyncio.run(rt.run(RuntimePlan(prompt="p", model="opus")))
 
     aborted = [s for s in _spend(ledger) if s["issue"] == 2]
     assert len(aborted) == 1
@@ -164,7 +164,7 @@ def test_the_estimate_matches_what_the_same_tokens_really_cost(tmp_path):
         exit_reason=ExitReason.WALL_TIMEOUT, usage=dict(ABORT_USAGE),
     )
     rt.set_context("fix", "RESOLVE", 2, 2)
-    asyncio.run(rt.run(AgentTask(prompt="p", model="opus")))
+    asyncio.run(rt.run(RuntimePlan(prompt="p", model="opus")))
 
     est = [s for s in _spend(ledger) if s["issue"] == 2][0]["cost_usd"]
     assert abs(est - 3.826) < 0.01
@@ -186,7 +186,7 @@ def test_a_skewed_abort_is_priced_near_truth_not_3_5x_high(tmp_path):
         usage=dict(stream), stream_usage=dict(stream),
     )
     rt.set_context("fix", "RESOLVE", 2, 2)
-    asyncio.run(rt.run(AgentTask(prompt="p", model="opus")))
+    asyncio.run(rt.run(RuntimePlan(prompt="p", model="opus")))
 
     est = [s for s in _spend(ledger) if s["issue"] == 2][0]["cost_usd"]
     assert abs(est - 3.826) < 0.01
@@ -198,7 +198,7 @@ def test_a_real_cost_is_recorded_as_measured_not_estimated(tmp_path):
         exit_reason=ExitReason.OK, usage=dict(ABORT_USAGE),
     ))
     rt.set_context("fix", "RESOLVE", 7, 7)
-    asyncio.run(rt.run(AgentTask(prompt="p", model="opus")))
+    asyncio.run(rt.run(RuntimePlan(prompt="p", model="opus")))
 
     line = _spend(ledger)[0]
     assert line["cost_usd"] == 1.25
@@ -214,7 +214,7 @@ def test_an_abort_with_no_history_records_no_fabricated_cost(tmp_path):
         exit_reason=ExitReason.WALL_TIMEOUT, usage=dict(ABORT_USAGE),
     ))
     rt.set_context("fix", "RESOLVE", 3, 3)
-    asyncio.run(rt.run(AgentTask(prompt="p", model="opus")))
+    asyncio.run(rt.run(RuntimePlan(prompt="p", model="opus")))
 
     assert _spend(ledger) == []
     run = [e for e in read_events(journal.path) if e["event"] == "agent_run"][0]
@@ -233,7 +233,7 @@ def test_an_abort_that_reported_no_tokens_stays_out_of_the_ledger(tmp_path):
         exit_reason=ExitReason.WALL_TIMEOUT, usage=None,
     )
     rt.set_context("fix", "RESOLVE", 4, 4)
-    asyncio.run(rt.run(AgentTask(prompt="p", model="opus")))
+    asyncio.run(rt.run(RuntimePlan(prompt="p", model="opus")))
 
     assert [s for s in _spend(ledger) if s["issue"] == 4] == []
 
@@ -252,7 +252,7 @@ def test_estimated_spend_counts_toward_the_caps_that_scan_the_ledger(tmp_path):
     )
     for _ in range(3):
         rt.set_context("fix", "RESOLVE", 9, 9)
-        asyncio.run(rt.run(AgentTask(prompt="p", model="opus")))
+        asyncio.run(rt.run(RuntimePlan(prompt="p", model="opus")))
 
     # three timed-out resolves on issue 9, each ~$3.83
     assert sum_issue(ledger, "o/r", 9) > 10.0

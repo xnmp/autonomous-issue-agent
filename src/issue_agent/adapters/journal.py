@@ -40,7 +40,7 @@ import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
-from ..domain.agent_task import AgentTask
+from .runtime_plan import ContextualRuntime, RunIdentityRuntime, RuntimePlan
 from ..domain.outcome import AgentResult, ExitReason, deterministic_death
 from .handover import (
     HandoverScope,
@@ -95,6 +95,8 @@ class Journal:
     """Append-only JSONL sink at `path`. Frozen: a journal is its path."""
 
     path: str
+    monthly_rotation: bool = False
+    canonical: bool = False
 
     def emit(self, event: str, **fields) -> None:
         """Append one event line. NEVER raises — see rule 1 in the module
@@ -104,10 +106,33 @@ class Journal:
             parent = os.path.dirname(self.path)
             if parent:
                 os.makedirs(parent, exist_ok=True)
+            if self.monthly_rotation:
+                self._rotate_monthly()
             with open(self.path, "a", encoding="utf-8") as fh:
                 fh.write(line + "\n")  # ONE write: POSIX append atomicity
         except Exception as exc:  # noqa: BLE001 — observability is never fatal
             sys.stderr.write(f"journal: dropped {event!r} event ({exc})\n")
+
+    def _rotate_monthly(self) -> None:
+        try:
+            modified = datetime.fromtimestamp(
+                os.path.getmtime(self.path), tz=timezone.utc
+            )
+        except FileNotFoundError:
+            return
+        current = _now()
+        if (modified.year, modified.month) == (current.year, current.month):
+            return
+        root, extension = os.path.splitext(self.path)
+        archive = f"{root}.{modified:%Y-%m}{extension}"
+        suffix = 1
+        while os.path.exists(archive):
+            archive = f"{root}.{modified:%Y-%m}.{suffix}{extension}"
+            suffix += 1
+        try:
+            os.rename(self.path, archive)
+        except FileNotFoundError:
+            pass
 
 
 def default_ledger_path() -> str:
@@ -174,12 +199,14 @@ class RunContext:
 class _DeferredRouteReceipt:
     """A completed router receipt, held until its dispatch decision is known."""
 
-    task: AgentTask | None = None
+    task: RuntimePlan | None = None
     result: AgentResult | None = None
     duration_s: float = 0.0
     model: str = ""
     effort: str | None = None
     context: RunContext | None = None
+    run_id: str = ""
+    leg_id: str = ""
 
     def decide(self, model: str | None, effort: object | None) -> None:
         self.model = model or ""
@@ -203,13 +230,17 @@ class JournalingRuntime:
         repo: str = "",
         role: str = "",
         runtime: str = "",
+        state_dir: str = "",
     ):
         self.inner = inner
         self.journal = journal
-        self.ledger = Journal(ledger_path) if ledger_path else None
+        self.ledger = (
+            Journal(ledger_path, monthly_rotation=True) if ledger_path else None
+        )
         self.repo = repo
         self.role = role
         self.runtime = runtime
+        self.state_dir = state_dir
         self._context = contextvars.ContextVar(
             f"journal_run_context_{id(self)}",
             default=RunContext(role=role),
@@ -220,6 +251,17 @@ class JournalingRuntime:
             f"journal_route_receipt_{id(self)}",
             default=None,
         )
+
+    def __getattr__(self, name: str):
+        """Preserve the decorated runtime's explicit operational surface.
+
+        The wrapper owns journaling only. Runtime-specific preflight and
+        identity attributes remain capabilities of the wrapped adapter rather
+        than being copied into this composition layer.
+        """
+
+        inner = object.__getattribute__(self, "inner")
+        return getattr(inner, name)
 
     @property
     def context(self) -> RunContext:
@@ -243,6 +285,8 @@ class JournalingRuntime:
             role=role, kind=kind, number=number, issue=issue,
             dispatch_id=uuid.uuid4().hex[:12],
         ))
+        if isinstance(self.inner, ContextualRuntime):
+            self.inner.set_context(role, kind, number, issue)
 
     @contextlib.contextmanager
     def leg_kind(self, kind: str):
@@ -284,33 +328,13 @@ class JournalingRuntime:
                     self._record(
                         receipt.task, receipt.result, receipt.duration_s,
                         route_decision=receipt,
+                        run_id=receipt.run_id,
+                        leg_id=receipt.leg_id,
                     )
                 finally:
                     self._context.reset(context_token)
 
-    def __getattr__(self, name: str):
-        """Delegate anything this decorator does not define to the wrapped
-        runtime. Without it (review S7) a decorated runtime silently loses the
-        inner surface callers use — e.g. `roles.py`'s startup
-        `fix_runner.preflight()` codex readiness check would become an
-        AttributeError (or, behind a `getattr(..., None)` probe, a silent
-        no-op) the moment the wrap order changed.
-
-        Dunders are NOT delegated: implicit special-method lookup bypasses
-        `__getattr__` anyway, so delegating them only produces half-working
-        protocols (`__await__`, copy/pickle) that lie about what this object is.
-        `inner` is read off `__dict__` directly so a half-initialised instance
-        raises AttributeError instead of recursing forever.
-        """
-        if name.startswith("__") and name.endswith("__"):
-            raise AttributeError(name)
-        try:
-            inner = object.__getattribute__(self, "inner")
-        except AttributeError:
-            raise AttributeError(name) from None
-        return getattr(inner, name)
-
-    async def run(self, task: AgentTask) -> AgentResult:
+    async def run(self, task: RuntimePlan) -> AgentResult:
         """Journal the dispatch BEFORE the await and the settlement after it —
         including when the await raises.
 
@@ -325,9 +349,15 @@ class JournalingRuntime:
         UNCHANGED — the crash isolation the raise buys (`Daemon.tick` catches,
         issue keeps `ai-working`, reaper requeues) must not change.
         """
-        scope = HandoverScope(role=self.context.role, issue=self.context.issue)
+        scope = HandoverScope(
+            role=self.context.role,
+            issue=self.context.issue,
+            state_dir=self.state_dir,
+        )
         prepared = with_previous_handover(task, scope)
-        self._record_start(task)
+        run_id, leg_id = self._record_start(task)
+        if isinstance(self.inner, RunIdentityRuntime):
+            self.inner.set_run_identity(run_id, leg_id)
         t0 = time.monotonic()
         try:
             result = await self.inner.run(prepared.task)
@@ -355,6 +385,8 @@ class JournalingRuntime:
                     exit_reason=ExitReason.TRANSPORT_DEATH,
                 ),
                 time.monotonic() - t0,
+                run_id=run_id,
+                leg_id=leg_id,
                 error=error,
                 deterministic=(det.signature if det else None),
                 detail=((det.path or None) if det else None),
@@ -363,12 +395,16 @@ class JournalingRuntime:
         duration_s = time.monotonic() - t0
         deferred = self._deferred_route_receipt.get()
         if deferred is None:
-            self._record(task, result, duration_s)
+            self._record(
+                task, result, duration_s, run_id=run_id, leg_id=leg_id
+            )
         else:
             deferred.task = task
             deferred.result = result
             deferred.duration_s = duration_s
             deferred.context = self.context
+            deferred.run_id = run_id
+            deferred.leg_id = leg_id
         retire_delivered_handover(
             task, result, scope, prepared.handover_digest
         )
@@ -382,14 +418,18 @@ class JournalingRuntime:
                 number=ctx.number,
                 issue=ctx.issue,
                 dispatch=ctx.dispatch_id,
+                run_id=run_id,
+                leg_id=leg_id,
                 trigger=receipt.trigger,
                 bytes=receipt.byte_size,
             )
         return result
 
-    def _record_start(self, task: AgentTask) -> None:
+    def _record_start(self, task: RuntimePlan) -> tuple[str, str]:
         """The pre-await half of the pair. Carries the same
         role/kind/number/issue as the settled line so the two correlate."""
+        run_id = uuid.uuid4().hex
+        leg_id = uuid.uuid4().hex
         try:
             ctx = self.context
             self.journal.emit(
@@ -399,14 +439,21 @@ class JournalingRuntime:
                 number=ctx.number,
                 issue=ctx.issue,
                 dispatch=ctx.dispatch_id,
+                run_id=run_id,
+                leg_id=leg_id,
                 model=task.model or "",
             )
         except Exception as exc:  # noqa: BLE001 — never fail a run over its receipt
             sys.stderr.write(f"journal: could not record agent_run_start ({exc})\n")
+        return run_id, leg_id
 
     def _record(
-        self, task: AgentTask, result: AgentResult, duration_s: float,
-        route_decision: _DeferredRouteReceipt | None = None, **extra,
+        self, task: RuntimePlan, result: AgentResult, duration_s: float,
+        route_decision: _DeferredRouteReceipt | None = None,
+        *,
+        run_id: str,
+        leg_id: str,
+        **extra,
     ) -> None:
         try:
             ctx = self.context
@@ -453,6 +500,8 @@ class JournalingRuntime:
                 number=ctx.number,
                 issue=ctx.issue,
                 dispatch=ctx.dispatch_id,
+                run_id=run_id,
+                leg_id=leg_id,
                 **route_fields,
                 duration_s=round(duration_s, 1),
                 cost_usd=cost,
@@ -465,6 +514,7 @@ class JournalingRuntime:
                 is_error=result.is_error,
                 exit_reason=(result.exit_reason.value if result.exit_reason else None),
                 session_id=result.session_id,
+                runtime=self.runtime,
                 usage=usage,
                 usage_stream=stream,
                 turns=getattr(result, "num_turns", None),
@@ -489,6 +539,8 @@ class JournalingRuntime:
                     number=ctx.number,
                     issue=ctx.issue,
                     dispatch=ctx.dispatch_id,
+                    run_id=run_id,
+                    leg_id=leg_id,
                     model=(task.model or getattr(result, "model", "") or ""),
                     session_id=result.session_id,
                     warning=telemetry_warning,
@@ -500,10 +552,20 @@ class JournalingRuntime:
             billed = cost if cost > 0 else estimated
             if self.ledger is not None and billed > 0:
                 self.ledger.emit(
-                    "spend", repo=self.repo, issue=ctx.issue, kind=ctx.kind,
+                    "spend", schema=2, repo=self.repo, issue=ctx.issue, kind=ctx.kind,
                     role=ctx.role, runtime=self.runtime,
                     model=(task.model or getattr(result, "model", "") or ""),
-                    cost_usd=billed, estimated=(cost <= 0) or None, usage=usage,
+                    cost_usd=billed,
+                    currency="USD",
+                    basis=(
+                        "learned_estimate"
+                        if cost <= 0
+                        else "configured_rate_card"
+                        if self.runtime == "codex"
+                        else "provider_reported"
+                    ),
+                    estimated=(cost <= 0) or None,
+                    usage=usage,
                 )
         except Exception as exc:  # noqa: BLE001 — never fail a run over its receipt
             sys.stderr.write(f"journal: could not record agent_run ({exc})\n")
@@ -838,6 +900,8 @@ def stalled_run_annotations(
                 "run_started_at": start.get("ts"),
                 "run_finished_at": event.get("ts"),
                 "suspended_seconds": suspended_seconds,
+                "run_id": start.get("run_id") or event.get("run_id"),
+                "leg_id": start.get("leg_id") or event.get("leg_id"),
             }
         )
     return annotations

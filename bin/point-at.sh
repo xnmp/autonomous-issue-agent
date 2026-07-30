@@ -59,7 +59,7 @@ info() { printf '\033[36m▸ %s\033[0m\n' "$1"; }
 # executing at depth ≥ 2 means the command re-entered the gate (#63) — refuse.
 # Exported: the probe transports run_target_test_cmd into a `timeout bash -c`
 # subshell via `declare -f`, which does NOT carry plain script variables.
-export RTC_SCRUB_STATIC="TEST_CMD LINT_CMD TYPECHECK_CMD EDIT_CHECK_CMD ALLOW_UNTESTED RED_MUST_FAIL VERIFY_RED_AT_COMMIT BASE_BRANCH GATE_TEST_TIMEOUT_S GATE_GH_RETRY_SLEEP GH_APP_ID GH_APP_KEY_FILE GH_APP_INSTALL_ID TARGET_DIR AGENT_ENV"
+export RTC_SCRUB_STATIC="TEST_CMD LINT_CMD TYPECHECK_CMD EDIT_CHECK_CMD ALLOW_UNTESTED RED_MUST_FAIL VERIFY_RED_AT_COMMIT BASE_BRANCH GATE_TEST_TIMEOUT_S GATE_GH_RETRY_SLEEP HARNESS_SCREENSHOTS_READ GH_APP_ID GH_APP_KEY_FILE GH_APP_INSTALL_ID TARGET_DIR AGENT_ENV"
 
 run_target_test_cmd() {  # run_target_test_cmd "<command>"
   _rtc_depth="${HARNESS_GATE_DEPTH:-0}"

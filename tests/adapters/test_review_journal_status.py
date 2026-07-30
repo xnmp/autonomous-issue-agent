@@ -11,7 +11,7 @@ import pytest
 from issue_agent.adapters.agent_runner import result_to_agent_result
 from issue_agent.adapters.codex_runner import parse_codex_envelope
 from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
-from issue_agent.domain.agent_task import AgentTask
+from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.dashboard import build_issue_rows, first_pass_verdicts, stage_for
 
 
@@ -40,7 +40,7 @@ def _settled_review_event(tmp_path, result, kind: str) -> dict:
     journal = Journal(str(tmp_path / f"{kind}-{result.status}.jsonl"))
     runtime = JournalingRuntime(_StaticRuntime(result), journal, role="review")
     runtime.set_context("review", kind, 125, 125)
-    asyncio.run(runtime.run(AgentTask(prompt="review")))
+    asyncio.run(runtime.run(RuntimePlan(prompt="review")))
     return read_events(journal.path)[1]
 
 
@@ -56,7 +56,15 @@ def test_review_journal_envelope_is_runtime_invariant(tmp_path, kind, verdict):
     )
 
     assert set(codex_event) == set(claude_event)
-    for field in set(claude_event) - {"ts", "dispatch", "duration_s", "cost_usd"}:
+    generated_identity = {
+        "ts",
+        "dispatch",
+        "run_id",
+        "leg_id",
+        "duration_s",
+        "cost_usd",
+    }
+    for field in set(claude_event) - generated_identity:
         assert codex_event[field] == claude_event[field]
     assert codex_event["status"] == verdict
 

@@ -1,7 +1,7 @@
 """AgentRunner — the ONLY module that imports the Claude Agent SDK.
 
 Replaces the bash `run_claude` + `claude_outcome` + the per-script arg assembly.
-Translates a pure `AgentTask` into `ClaudeAgentOptions`, runs `query()` to
+Translates a pure `RuntimePlan` into `ClaudeAgentOptions`, runs `query()` to
 completion, and normalises the final `ResultMessage` into the domain's
 `AgentResult` (decision read from the envelope, NEVER prose — same contract as
 agent/lib.sh:claude_outcome).
@@ -16,11 +16,16 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import os
+import shutil
 import time
+import uuid
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
-from ..domain.agent_task import AgentRuntime, AgentTask, git_identity_env
+from .runtime_plan import AgentRuntime, RuntimePlan, git_identity_env
+from ..domain.contracts import RunId
 from ..domain.outcome import AgentResult, ExitReason, declared_status
 
 # Longest single slice we block waiting for the next stream event before we come
@@ -32,8 +37,6 @@ _WATCHDOG_POLL_SLICE = 30.0
 # Sentinel: "no event this iteration" (idle slice elapsed / stream ended). Distinct
 # from any real SDK message and from None (which could be a legitimate yielded value).
 _NO_MESSAGE = object()
-
-
 def _default_wall_clock() -> float:
     return time.time()
 
@@ -79,12 +82,12 @@ DEFAULT_MAX_BUFFER_BYTES = 16 * 1024 * 1024
 
 
 def build_option_kwargs(
-    task: AgentTask,
+    task: RuntimePlan,
     permission_mode: str = DEFAULT_PERMISSION_MODE,
     extra_hooks: dict | None = None,
     max_buffer_size: int | None = None,
 ) -> dict[str, Any]:
-    """Pure: AgentTask → kwargs for ClaudeAgentOptions. No SDK import, no I/O, so
+    """Pure: RuntimePlan → kwargs for ClaudeAgentOptions. No SDK import, no I/O, so
     it is unit-tested directly. `extra_hooks` is the already-built
     {"PreToolUse": [HookMatcher(...)]} dict from the governor adapter (passed in
     so this stays SDK-free); merged verbatim."""
@@ -399,6 +402,7 @@ class AgentRunner(AgentRuntime):
         poll_slice: float = _WATCHDOG_POLL_SLICE,
         max_runtime: float | None = None,
         max_buffer_size: int | None = DEFAULT_MAX_BUFFER_BYTES,
+        process_supervisor: Any = None,
     ):
         self.permission_mode = permission_mode
         # Pre-built {"PreToolUse": [HookMatcher(...)]} from the governor adapter.
@@ -435,6 +439,7 @@ class AgentRunner(AgentRuntime):
         # reviewer's big-file Read must degrade to token cost, not a dead
         # transport (#13). None/0 leaves the SDK's own 1MB default in place.
         self._max_buffer_size = max_buffer_size
+        self._process_supervisor = process_supervisor
 
     def _slice_timeout(self) -> float:
         """How long to block on one observation slice. The poll slice, floored by
@@ -471,15 +476,36 @@ class AgentRunner(AgentRuntime):
             stream_usage=usage,
         )
 
-    async def run(self, task: AgentTask) -> AgentResult:
+    async def run(self, task: RuntimePlan) -> AgentResult:
         # Lazy import: keeps the SDK out of domain-only / unit-test paths.
         import asyncio
 
+        import claude_agent_sdk
         from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
 
+        supervised_run_id = RunId(uuid.uuid4().hex)
         kwargs = build_option_kwargs(
             task, self.permission_mode, self.hooks, self._max_buffer_size
         )
+        if self._process_supervisor is not None:
+            bundled = (
+                Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude"
+            )
+            executable = (
+                str(bundled)
+                if bundled.is_file() and os.access(bundled, os.X_OK)
+                else shutil.which("claude")
+            )
+            if executable is None:
+                raise FileNotFoundError("Claude CLI executable is unavailable")
+            wrapper, supervisor_env = self._process_supervisor.supervised_cli(
+                supervised_run_id, executable
+            )
+            kwargs["cli_path"] = wrapper
+            kwargs["env"] = {
+                **kwargs.get("env", {}),
+                **supervisor_env,
+            }
         # Older SDK builds have no such field and reject it at construction.
         if "max_buffer_size" in kwargs and "max_buffer_size" not in _option_field_names():
             kwargs.pop("max_buffer_size")
@@ -557,6 +583,7 @@ class AgentRunner(AgentRuntime):
         # unarmed cap has no baseline to keep.
         started_at = self._wall_clock() if self._max_runtime is not None else 0.0
         agen = query(prompt=task.prompt, options=options).__aiter__()
+        receive_started = False
         pending: Any = None
         try:
             while True:
@@ -620,7 +647,11 @@ class AgentRunner(AgentRuntime):
                     # true hang, or a sleep-spanning gap on macOS where the monotonic
                     # clock freezes, still trips the idle timeout and frees the laptop).
                     last_event = self._wall_clock()
-                    pending = asyncio.ensure_future(agen.__anext__())
+                    if not receive_started:
+                        pending = asyncio.ensure_future(agen.__anext__())
+                        receive_started = True
+                    else:
+                        pending = asyncio.ensure_future(agen.__anext__())
                     while True:
                         done, _ = await asyncio.wait(
                             {pending}, timeout=self._slice_timeout()
@@ -683,7 +714,12 @@ class AgentRunner(AgentRuntime):
                         break
                 else:
                     try:
-                        message = await agen.__anext__()
+                        if not receive_started:
+                            pending = asyncio.ensure_future(agen.__anext__())
+                            receive_started = True
+                            message = await pending
+                        else:
+                            message = await agen.__anext__()
                     except StopAsyncIteration:
                         break
                 msg_count += 1
@@ -768,6 +804,9 @@ class AgentRunner(AgentRuntime):
                 except Exception:
                     pass
                 raise
+        finally:
+            if self._process_supervisor is not None:
+                self._process_supervisor.kill_tree(supervised_run_id)
         if final is None:
             # No ResultMessage emitted (transport died) → surface as an error,
             # never silently as success. Matches the bash rc!=0 path.
@@ -834,7 +873,6 @@ class AgentRunner(AgentRuntime):
                 f"(out={usage_acc.get('output_tokens', 0)}) vs result "
                 f"{res_t} (out={result.usage.get('output_tokens', 0)})"
             )
-        return result
         # An errored envelope gets its forensics logged AT THE MOMENT OF FAILURE,
         # while the raw ResultMessage is still in hand. Everything below is
         # dropped by the AgentResult mapping, so without this the daemon log says

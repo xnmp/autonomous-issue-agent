@@ -15,26 +15,41 @@ remain on the daemon thread. Review and steward keep synchronous dispatch.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
+import tempfile
 import threading
-from collections.abc import Awaitable, Callable
+import uuid
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from functools import partial
+from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from ..adapters.agent_runner import AgentRunner
+from ..adapters.agent_publish import AgentPublicationBroker
+from ..adapters.control_store import (
+    LegacySpendMigrationError,
+    SQLiteControlStore,
+)
+from ..adapters.effects import GitHubEffectExecutor
+from ..adapters.accounting_runtime import AccountingRuntime
+from ..adapters.event_log import EventLog
+from ..adapters.typed_journal import TypedJournal
 from ..adapters.github import GitHubGateway, Identity
 from ..adapters.journal import (
     Journal,
     JournalingRuntime,
-    default_ledger_path,
     ci_flake_keys,
     ci_pending_keys,
     duplicate_pr_keys,
+    default_ledger_path,
     read_events_tail,
     recurrence_keys,
-    unsettled_starts,
 )
 from ..adapters.store import Store
+from ..adapters.spend_recovery import CodexSpendReconciler, spend_evidence_dir
 from ..adapters.wake import WakeSignal, wake_path
 from ..adapters.worktree import Worktrees
 from ..domain.fix import (
@@ -67,13 +82,212 @@ from ..domain.triage import (
 )
 from ..domain.jira import jira_phase, jira_sync_needed
 from ..domain.actions import AgentKind, Relabel, RunAgent, Target
-from ..domain.agent_task import AgentRuntime
+from ..adapters.runtime_plan import AgentRuntime
+from ..domain.agent_task import RuntimeName
+from ..domain.contracts import BudgetScope, Money
+from ..domain.events import Producer
+from ..domain.ports import (
+    CiPendingState,
+    IssueStateReasonReads,
+    PredictionReader,
+    RecentMergesReads,
+)
 from .config import HarnessConfig
 from .dispatch import AgentDispatcher, DispatchConfig
 from .execute import Executor
 from .loop import Daemon
 from .mcp import mcp_servers_from_file
-from .spend_gate import build_daily_spend_gate
+from .world_reporter import WorldReporter
+from .recovery import RecoveryCoordinator
+
+
+def _ignore_world(_world: object) -> None:
+    return None
+
+
+def _spend_evidence_dirs(cfg: HarnessConfig) -> tuple[str, ...]:
+    return tuple(
+        spend_evidence_dir(os.path.abspath(path))
+        for path in dict.fromkeys(
+            (cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir)
+        )
+        if path
+    )
+
+
+def _role_state_dir(cfg: HarnessConfig, role: str) -> str:
+    return {
+        "fix": cfg.state_dir,
+        "review": cfg.review_state_dir,
+        "steward": cfg.steward_state_dir,
+    }[role]
+
+
+def _control_store(
+    cfg: HarnessConfig,
+    state_dir: str,
+    journal: TypedJournal,
+) -> SQLiteControlStore:
+    """Open the one accounting/control authority shared by all role daemons."""
+
+    control = SQLiteControlStore(_control_store_path(cfg, state_dir))
+    control.initialize()
+    control.bind_event_outbox(
+        journal.events.prepare,
+        journal.events.append_committed,
+        line_limit=journal.events.line_limit,
+        destination=journal.events.producer.feed_identity,
+    )
+    from ..adapters.process_supervisor import ProcessSupervisor
+
+    RecoveryCoordinator(
+        ProcessSupervisor(state_dir or os.path.dirname(control.path)),
+        control,
+        CodexSpendReconciler(control, _spend_evidence_dirs(cfg)),
+        journal,
+        f"{cfg.repo}:{journal.events.producer.role}",
+    ).recover()
+    return control
+
+
+def _control_store_path(cfg: HarnessConfig, state_dir: str) -> str:
+    configured = tuple(
+        os.path.abspath(path)
+        for path in (
+            cfg.state_dir,
+            cfg.review_state_dir,
+            cfg.steward_state_dir,
+        )
+        if path
+    )
+    common = os.path.commonpath(configured) if configured else ""
+    if not common or common == os.path.sep:
+        common = os.path.dirname(os.path.abspath(state_dir)) if state_dir else ""
+    effective = common or tempfile.mkdtemp(prefix="issue-agent-control-")
+    return os.path.join(effective, "issue-agent-control", "control.db")
+
+
+def migrate_legacy_spend(cfg: HarnessConfig, state_dir: str) -> int:
+    """Import all rotated legacy ledgers before the first paid admission."""
+
+    control = SQLiteControlStore(_control_store_path(cfg, state_dir))
+    control.initialize()
+    current = Path(default_ledger_path())
+    candidates = (
+        tuple(sorted(current.parent.glob(f"{current.stem}*{current.suffix}")))
+        if current.parent.is_dir()
+        else ()
+    )
+    imported = 0
+    for path in candidates:
+        report = control.import_legacy_spend(str(path))
+        if report.rejected:
+            raise LegacySpendMigrationError(
+                f"{path}: rejected {report.rejected} legacy spend row(s); "
+                "repair or quarantine the ledger before paid work can start"
+            )
+        if not report.idempotent:
+            imported += report.imported
+    return imported
+
+
+def _with_accounting(
+    runtime: AgentRuntime,
+    control: SQLiteControlStore,
+    cfg: HarnessConfig,
+    role: str,
+    runtime_name: str,
+    journal: TypedJournal,
+) -> AgentRuntime:
+    money = lambda value: Money("USD", int(value * 1_000_000)) if value > 0 else None
+    return AccountingRuntime(
+        runtime,
+        control,
+        cfg.repo,
+        role,
+        money(cfg.daily_spend_cap_usd),
+        money(cfg.global_daily_spend_cap_usd),
+        money(cfg.issue_spend_cap_usd),
+        cfg.config_version,
+        runtime_name,
+        spend_evidence_dir(_role_state_dir(cfg, role)),
+        journal.events.path,
+        journal.events.producer.deployment,
+        journal.events.producer.role,
+        journal.events.line_limit,
+    )
+
+
+def _effects(
+    gateway: GitHubGateway,
+    control: SQLiteControlStore,
+    *,
+    repository: str,
+    identity: str,
+    config_version: str,
+) -> GitHubEffectExecutor:
+    executor = GitHubEffectExecutor(
+        gateway,
+        control,
+        repository=repository,
+        identity=identity,
+        config_version=config_version,
+    )
+    executor.drain_pending_commands()
+    AgentPublicationBroker(
+        control,
+        repository=repository,
+        config_version=config_version,
+        identity=f"{identity}:publication",
+        owner=identity,
+    ).drain_pending_commands()
+    return executor
+
+
+def _recovery(
+    state_dir: str,
+    cfg: HarnessConfig,
+    control: SQLiteControlStore,
+    effects: GitHubEffectExecutor,
+    journal: TypedJournal,
+) -> Callable[[], object]:
+    from ..adapters.process_supervisor import ProcessSupervisor
+
+    effective_state_dir = state_dir or os.path.dirname(control.path)
+    coordinator = RecoveryCoordinator(
+        ProcessSupervisor(effective_state_dir),
+        control,
+        CodexSpendReconciler(control, _spend_evidence_dirs(cfg)),
+        journal,
+        f"{cfg.repo}:{journal.events.producer.role}",
+    )
+
+    def recover() -> object:
+        report = coordinator.recover()
+        effects.drain_pending_commands()
+        return report
+
+    return recover
+
+
+def _force_kill(state_dir: str) -> Callable[[], object]:
+    from ..adapters.process_supervisor import ProcessSupervisor
+
+    supervisor = ProcessSupervisor(state_dir)
+    return supervisor.recover_orphans
+
+
+def _reported_world(
+    observe: Callable,
+    control: SQLiteControlStore,
+    cfg: HarnessConfig,
+    role: str,
+    log: Callable[[str], None],
+) -> Callable:
+    deployment = hashlib.sha256(
+        f"{cfg.repo}:{cfg.target_dir}:{role}".encode()
+    ).hexdigest()[:16]
+    return WorldReporter(control, deployment, log).wrap(observe)
 
 
 class CancellableAsyncDispatch:
@@ -296,6 +510,30 @@ def _journal(store: Store) -> Journal:
     return Journal(os.path.join(store.state_dir, "journal.jsonl"))
 
 
+def _typed_journal(
+    legacy: Journal,
+    cfg: HarnessConfig,
+    role: str,
+    state_dir: str,
+) -> TypedJournal:
+    """Attach the canonical v2 sink without changing the historical test seam."""
+
+    deployment = hashlib.sha256(
+        f"{cfg.repo}:{cfg.target_dir}:{role}".encode()
+    ).hexdigest()[:16]
+    events = EventLog(
+        os.path.join(state_dir, "events-v2.jsonl"),
+        Producer(
+            deployment,
+            cfg.repo,
+            role,
+            os.getpid(),
+            uuid.uuid4().hex,
+        ),
+    )
+    return TypedJournal(legacy, events)
+
+
 def _wake_check(cfg: HarnessConfig, store: Store):
     """The role's push wake, or None when WEBHOOK_WAKE is off (poll only).
 
@@ -314,30 +552,59 @@ def _wake_check(cfg: HarnessConfig, store: Store):
     return WakeSignal(wake_path(store.state_dir)).pending
 
 
-def _spend_cfg(cfg: HarnessConfig, role: str, ledger: str) -> dict:
-    """The spend-breaker slice of DispatchConfig, identical for all three roles."""
+def _spend_cfg(cfg: HarnessConfig, role: str) -> dict:
+    """Paid-run attribution; SQLite owns all admission decisions."""
     return {
         "role": role,
         "repo": cfg.repo,
-        "spend_ledger_path": ledger,
-        "issue_spend_cap_usd": cfg.issue_spend_cap_usd,
-        "daily_spend_cap_usd": cfg.daily_spend_cap_usd,
-        "global_daily_spend_cap_usd": cfg.global_daily_spend_cap_usd,
-        "alert_cmd": cfg.alert_cmd,
     }
 
 
-def _spend_gate(cfg: HarnessConfig, ledger: str):
-    """The daily caps as a `Daemon.tick_gate` — checked before observe, so a
-    capped daemon costs no GraphQL quota and writes no labels (#27). Every role
-    that can dispatch a paid run gets one; all three share the DispatchConfig
-    caps, so all three are gated."""
-    return build_daily_spend_gate(
-        ledger,
-        repo=cfg.repo,
-        repo_cap=cfg.daily_spend_cap_usd,
-        global_cap=cfg.global_daily_spend_cap_usd,
+def _control_spend_gate(
+    cfg: HarnessConfig, control: SQLiteControlStore
+) -> Callable[[], str | None] | None:
+    """Fast-path daily admission over the same authority as reservation."""
+
+    caps = tuple(
+        (repository, dimension, cap)
+        for repository, dimension, cap in (
+            (cfg.repo, "repository", cfg.daily_spend_cap_usd),
+            ("*", "global", cfg.global_daily_spend_cap_usd),
+        )
+        if cap > 0
     )
+    if not caps:
+        return None
+
+    def gate() -> str | None:
+        now = datetime.now(timezone.utc)
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        for repository, dimension, cap_usd in caps:
+            scope = BudgetScope(
+                repository,
+                dimension,
+                "USD",
+                start.date().isoformat(),
+                start,
+                start + timedelta(days=1),
+                ZoneInfo("UTC"),
+            )
+            snapshot = control.snapshot(scope)
+            if snapshot.disposition.value != "available":
+                return (
+                    "ACCOUNTING "
+                    f"{snapshot.disposition.value.upper()} — {snapshot.detail}"
+                )
+            cap = Money("USD", int(cap_usd * 1_000_000))
+            if snapshot.committed.micros >= cap.micros:
+                return (
+                    f"{dimension} daily spend cap reached: "
+                    f"${snapshot.committed.micros / 1_000_000:.2f} / "
+                    f"${cap_usd:.2f}"
+                )
+        return None
+
+    return gate
 
 
 def _build_codex_runner(
@@ -349,6 +616,7 @@ def _build_codex_runner(
     resume_on_retry: bool,
     leg_role: str,
     log,
+    state_dir: str = "",
 ):
     """Build either role's Codex adapter from the single runtime config.
 
@@ -365,6 +633,7 @@ def _build_codex_runner(
     the only place that knows the role for certain, so it says so here.
     """
     from ..adapters.codex_runner import CodexProvider, CodexRunner
+    from ..adapters.process_supervisor import ProcessSupervisor
 
     runtime = cfg.codex_runtime
     return CodexRunner(
@@ -395,21 +664,10 @@ def _build_codex_runner(
         cost_per_mtok=runtime.cost_per_mtok,
         cost_per_mtok_cached_in=runtime.cost_per_mtok_cached_in,
         enforce_budget=runtime.enforce_budget,
+        process_supervisor=ProcessSupervisor(state_dir) if state_dir else None,
+        spend_evidence_dir=spend_evidence_dir(state_dir),
         **({"default_model": default_model} if default_model else {}),
     )
-
-
-def _process_deaths(store: Store) -> dict[int, int]:
-    """Paid runs this role's journal shows starting and never settling, keyed
-    the way the `infra-deaths` counter is (review P0R-4).
-
-    A session the DAEMON did not outlive — SIGKILL, OOM, `systemctl restart`
-    mid-run — reaches none of the bump sites, because every one of them is code
-    that runs after the death. The `agent_run_start` line written before the
-    await is the only durable trace, so the decide side reconstructs the count
-    from it. Read-side only: nothing new is written on the hot path, and the
-    scan is a bounded tail of a file this role already owns."""
-    return unsettled_starts(read_events_tail(_journal(store).path))
 
 
 def _inject_predicted_paths(store: Store, world):
@@ -419,14 +677,13 @@ def _inject_predicted_paths(store: Store, world):
     local, advisory routing state. Joining them here keeps the domain decision
     pure and makes any unreadable state indistinguishable from no prediction.
     """
-    get_predictions = getattr(store, "get_predicted_paths", None)
-    if get_predictions is None:
+    if not isinstance(store, PredictionReader):
         return world
     issues = []
     changed = False
     for issue in world.issues:
         try:
-            predicted = get_predictions(issue.number)
+            predicted = store.get_predicted_paths(issue.number)
         except Exception:  # noqa: BLE001 — a hint must never stop a fix tick
             predicted = frozenset()
         combined = issue.predicted_paths | frozenset(predicted or ())
@@ -435,7 +692,9 @@ def _inject_predicted_paths(store: Store, world):
     return replace(world, issues=tuple(issues)) if changed else world
 
 
-def _prediction_outcome_reporter(journal: Journal | None, repo: str, store: Store, log):
+def _prediction_outcome_reporter(
+    journal: Journal | None, repo: str, store: Store, log, control=None
+):
     """Journal each terminal PR's predicted-versus-actual files exactly once.
 
     This runs before cleanup clears the per-issue prediction state. The event is
@@ -445,10 +704,13 @@ def _prediction_outcome_reporter(journal: Journal | None, repo: str, store: Stor
     seen: set[str] = set()
 
     def report(world) -> None:
-        get_predictions = getattr(store, "get_predicted_paths", None)
-        if get_predictions is None:
+        if not isinstance(store, PredictionReader):
             return
-        prior = read_events_tail(journal.path) if journal is not None else ()
+        prior = (
+            read_events_tail(journal.path)
+            if journal is not None and control is None
+            else ()
+        )
         prior_keys = {
             event.get("block_key") for event in prior
             if event.get("event") == "path_prediction"
@@ -457,13 +719,19 @@ def _prediction_outcome_reporter(journal: Journal | None, repo: str, store: Stor
             if pr.state not in ("MERGED", "CLOSED") or pr.closing_issue is None:
                 continue
             try:
-                predicted = frozenset(get_predictions(pr.closing_issue) or ())
+                predicted = frozenset(
+                    store.get_predicted_paths(pr.closing_issue) or ()
+                )
             except Exception:  # noqa: BLE001 — observability is fail-open
                 continue
             if not predicted:
                 continue
             key = f"path-prediction:{repo}:{pr.closing_issue}:{pr.number}"
             if key in seen or key in prior_keys:
+                continue
+            if control is not None and not control.claim(
+                "path-prediction", repo, key
+            ):
                 continue
             seen.add(key)
             matched = predicted & pr.changed_files
@@ -486,6 +754,7 @@ def _fix_state(
     store: Store,
     world,
     inflight: tuple[InFlightFix, ...] = (),
+    process_deaths: Mapping[int, int] | None = None,
 ) -> FixState:
     """Read the per-issue/PR orchestration state the fix decision needs."""
     sessions = frozenset(i.number for i in world.issues if store.has_session(i.number))
@@ -509,13 +778,9 @@ def _fix_state(
     # and the dispatcher writes under whichever one the dying leg used. Read the
     # union, or a leg escalates on a counter nobody reads.
     #
-    # The store counter only ever sees deaths the PROCESS SURVIVED. Deaths that
-    # took the daemon with them (SIGKILL/OOM/restart) left an unsettled
-    # `agent_run_start` in the journal and nothing else, so they are added here
-    # — the one place where both halves can be summed without either write side
-    # knowing about the other (review P0R-4). A raise-path death is in the store
-    # counter AND has a settled `transport_death` line, so `unsettled_starts`
-    # nets it to zero and it is counted exactly once.
+    # The file-backed workflow counter sees deaths the process survived.
+    # SIGKILL/OOM/restart deaths come from reclaimed control-store runs through
+    # ``process_deaths``. Telemetry is never queried to reconstruct authority.
     #
     # A PR's entry SUMS both key spaces (review P1R-1, matching `_review_state`).
     # When the dispatcher's pre-handler `issue_for_pr` lookup fails — and the
@@ -525,14 +790,7 @@ def _fix_state(
     # never trips. Summing folds the orphaned half back into the key the domain
     # actually reads. `alt` is skipped when it IS the breaker key (an issueless
     # PR, where breaker_key already == -pr), so nothing is counted twice.
-    deaths = dict(_process_deaths(store))
-    # Observation now runs while these dispatches are alive. Their durable
-    # start receipts are intentionally unsettled until the leg finishes, but
-    # they are not process deaths. Remove one reconstructed death per active
-    # dispatch key; historical unsettled rounds under the same key remain.
-    for active in inflight:
-        if deaths.get(active.issue, 0) > 0:
-            deaths[active.issue] -= 1
+    deaths = dict(process_deaths or {})
 
     def _infra_for_pr(p) -> int:
         k = breaker_key(p)
@@ -551,13 +809,11 @@ def _fix_state(
     # breaker-keyed) because a re-run is an act on a PR's check runs, and a PR
     # with no resolvable issue has check runs like any other.
     ci_rerun_head = {p.number: store.get_ci_rerun_head(p.number) for p in world.prs}
-    get_ci_pending_head = getattr(
-        store, "get_ci_pending_escalated_head", lambda _pr: ""
-    )
     ci_pending_escalated = frozenset(
         (p.number, head)
         for p in world.prs
-        if (head := get_ci_pending_head(p.number))
+        if isinstance(store, CiPendingState)
+        and (head := store.get_ci_pending_escalated_head(p.number))
     )
     return FixState(
         sessions=sessions, resumed_at=resumed, pr_resumed_at=pr_resumed,
@@ -639,7 +895,7 @@ def _hold_reporter(
         nonlocal active
         if active is None:
             active = {}
-        if journal is not None:
+        if journal is not None and not journal.canonical:
             # Executor-owned human edges can land between polls. Replaying the
             # durable edge log keeps this reporter synchronized across both
             # daemon restarts and in-process writers.
@@ -698,7 +954,9 @@ def _hold_reporter(
     return report
 
 
-def _ci_stall_reporter(journal: Journal | None, repo: str, fix_cfg: FixConfig, log):
+def _ci_stall_reporter(
+    journal: Journal | None, repo: str, fix_cfg: FixConfig, log, control=None
+):
     """Build the per-poll reporter for a CI pending-deadline breach (#30).
 
     The escalation itself is `decide_fix`'s (a comment + needs-human-review);
@@ -728,10 +986,14 @@ def _ci_stall_reporter(journal: Journal | None, repo: str, fix_cfg: FixConfig, l
             key = f"ci-pending:{repo}:{stall.pr}:{stall.head}"
             if key in seen:
                 continue
+            if control is not None and not control.claim("ci-pending", repo, key):
+                continue
             seen.add(key)
             if journal is None:
                 continue
-            if key in ci_pending_keys(read_events_tail(journal.path)):
+            if control is None and key in ci_pending_keys(
+                read_events_tail(journal.path)
+            ):
                 continue
             journal.emit(
                 "ci_pending_deadline", pr=stall.pr, head=stall.head,
@@ -741,7 +1003,9 @@ def _ci_stall_reporter(journal: Journal | None, repo: str, fix_cfg: FixConfig, l
     return report
 
 
-def _duplicate_pr_reporter(journal: Journal | None, repo: str, fix_cfg: FixConfig, log):
+def _duplicate_pr_reporter(
+    journal: Journal | None, repo: str, fix_cfg: FixConfig, log, control=None
+):
     """Build the per-poll reporter for the duplicate-PR guard (#39).
 
     The refusal itself is `decide_fix`'s (a comment + ai-ready → ai-blocked);
@@ -766,10 +1030,14 @@ def _duplicate_pr_reporter(journal: Journal | None, repo: str, fix_cfg: FixConfi
             key = f"duplicate-pr:{repo}:{dup.issue}:{dup.pr}"
             if key in seen:
                 continue
+            if control is not None and not control.claim("duplicate-pr", repo, key):
+                continue
             seen.add(key)
             if journal is None:
                 continue
-            if key in duplicate_pr_keys(read_events_tail(journal.path)):
+            if control is None and key in duplicate_pr_keys(
+                read_events_tail(journal.path)
+            ):
                 continue
             journal.emit(
                 "duplicate_pr_guard", issue=dup.issue, pr=dup.pr,
@@ -779,7 +1047,9 @@ def _duplicate_pr_reporter(journal: Journal | None, repo: str, fix_cfg: FixConfi
     return report
 
 
-def _ci_flake_reporter(journal: Journal | None, repo: str, fix_cfg: FixConfig, log):
+def _ci_flake_reporter(
+    journal: Journal | None, repo: str, fix_cfg: FixConfig, log, control=None
+):
     """Build the per-poll reporter for a CONFIRMED flake (#38).
 
     `ci_rerun` (written by the Executor) says a free re-run fired; this says it
@@ -803,10 +1073,14 @@ def _ci_flake_reporter(journal: Journal | None, repo: str, fix_cfg: FixConfig, l
             key = f"ci-flake:{repo}:{flake.pr}:{flake.head}"
             if key in seen:
                 continue
+            if control is not None and not control.claim("ci-flake", repo, key):
+                continue
             seen.add(key)
             if journal is None:
                 continue
-            if key in ci_flake_keys(read_events_tail(journal.path)):
+            if control is None and key in ci_flake_keys(
+                read_events_tail(journal.path)
+            ):
                 continue
             journal.emit(
                 "ci_flake", pr=flake.pr, head=flake.head, block_key=key,
@@ -815,7 +1089,9 @@ def _ci_flake_reporter(journal: Journal | None, repo: str, fix_cfg: FixConfig, l
     return report
 
 
-def _recurrence_reporter(journal: Journal | None, gateway, repo: str, fix_bot: str, log):
+def _recurrence_reporter(
+    journal: Journal | None, gateway, repo: str, fix_bot: str, log, control=None
+):
     """Build the per-poll reporter for LITERAL reopens (harness #10, kind=reopen).
 
     A merged PR is not ground truth that the problem is fixed. The truest
@@ -843,26 +1119,27 @@ def _recurrence_reporter(journal: Journal | None, gateway, repo: str, fix_bot: s
     healthy repo. A gateway without the method (a fake, a legacy adapter) yields
     an inert reporter rather than an AttributeError out of the decide closure.
     """
-    state_reason = getattr(gateway, "issue_state_reason", None)
-    recent_merges = getattr(gateway, "recently_merged_issues", None)
-    if state_reason is None:
-        return lambda _world: None
+    if not isinstance(gateway, IssueStateReasonReads):
+        return _ignore_world
     seen: set[str] = set()
 
     def report(world) -> None:
         reopened = [
             i.number for i in world.issues
             if i.state == "open" and i.has(Label.AI_DONE)
-            and state_reason(i.number) == "reopened"
+            and gateway.issue_state_reason(i.number) == "reopened"
         ]
         if not reopened:
             return
         # Only now is the merged list worth a call: it exists solely to name the
         # PR that shipped the thing that came back.
         shipped: dict[int, int] = {}
-        if recent_merges is not None and fix_bot:
+        if isinstance(gateway, RecentMergesReads) and fix_bot:
             try:
-                shipped = {m.issue: m.pr for m in (recent_merges(fix_bot) or ())}
+                shipped = {
+                    m.issue: m.pr
+                    for m in (gateway.recently_merged_issues(fix_bot) or ())
+                }
             except Exception as exc:  # noqa: BLE001 — enrichment, never fatal
                 log(f"recurrence: could not read merged PRs ({exc})")
         for number in reopened:
@@ -873,10 +1150,14 @@ def _recurrence_reporter(journal: Journal | None, gateway, repo: str, fix_bot: s
             key = f"recurrence:{repo}:{number}:reopen"
             if key in seen:
                 continue
+            if control is not None and not control.claim("recurrence", repo, key):
+                continue
             seen.add(key)
             if journal is None:
                 continue
-            if key in recurrence_keys(read_events_tail(journal.path)):
+            if control is None and key in recurrence_keys(
+                read_events_tail(journal.path)
+            ):
                 continue
             # of_issue == issue: a reopen is an issue recurring as ITSELF, which
             # keeps one event shape for both kinds so the metric reads them
@@ -920,8 +1201,7 @@ def build_fix_daemon(
         max_infra_deaths=fix_runtime.max_infra_deaths,
         arm_on_open=cfg.arm_on_open_active,
     )
-    journal = _journal(store)
-    ledger = default_ledger_path()
+    journal = _typed_journal(_journal(store), cfg, "fix", store.state_dir)
     dcfg = DispatchConfig(
         base_branch=repo_cfg.base_branch,
         fix=FixTaskConfig(
@@ -940,19 +1220,19 @@ def build_fix_daemon(
         # The same ceiling `fix_cfg` escalates on, so a deterministic death can
         # saturate the counter rather than pay for cap-1 identical retries (#13).
         max_infra_deaths=fix_runtime.max_infra_deaths,
-        **_spend_cfg(cfg, "fix", ledger),
+        **_spend_cfg(cfg, "fix"),
     )
     # Fixer runtime: Codex (GPT-5.5) swaps the runner AND installs the governor as
     # a Codex hook in each worktree (the Claude runner gets its governor via SDK
     # hooks=, so prepare_cwd stays None there). Reviewer/steward always use Claude.
     fix_runner = runner
     prepare_cwd = None
-    if cfg.fixer_runtime == "codex":
+    if cfg.fixer_runtime is RuntimeName.CODEX:
         from ..adapters.codex_runner import (
             codex_budget_not_enforced_warning,
             codex_cost_blindspot_warning,
         )
-        from ..adapters.codex_hook import write_hook_config
+        from ..adapters.codex_hook import HookPreparingRuntime, write_hook_config
 
         fix_runner = _build_codex_runner(
             cfg,
@@ -963,6 +1243,7 @@ def build_fix_daemon(
             resume_on_retry=True,
             leg_role="fix",
             log=_log("fix"),
+            state_dir=cfg.state_dir,
         )
         # Surface a codex misconfig (missing bin/key) at STARTUP, not on the first
         # dispatch — a clear one-liner instead of an opaque per-issue exit 1.
@@ -1005,9 +1286,10 @@ def build_fix_daemon(
         # installs the PostToolUse edit-check when EDIT_CHECK_CMD is set.
         prepare_cwd = partial(
             write_hook_config, agents_md=cfg.agent_md, edit_check_cmd=cfg.edit_check_cmd,
-            log=_log("fix"),
+            log=_log("fix"), state_dir=cfg.state_dir,
         )
-    elif cfg.fixer_runtime == "glm":
+        fix_runner = HookPreparingRuntime(fix_runner, prepare_cwd)
+    elif cfg.fixer_runtime is RuntimeName.GLM:
         # GLM speaks Anthropic's wire protocol, so the SAME Claude runner is used
         # with the profile's env injected (base URL + model aliases + auth token);
         # prepare_cwd stays None because that runner gets its governor via SDK
@@ -1032,6 +1314,14 @@ def build_fix_daemon(
                 f"profile {_glm_env['CLAUDE_CONFIG_DIR']})"
             )
 
+    control = _control_store(cfg, cfg.state_dir, journal)
+    effect_executor = _effects(
+        gateway,
+        control,
+        repository=cfg.repo,
+        identity=f"{cfg.repo}:fix",
+        config_version=cfg.config_version,
+    )
     executor = Executor(
         gateway, remove_worktree=worktrees.remove, log=_log("fix"),
         mark_automerge=store.mark_automerge, mark_ci_rerun=store.set_ci_rerun_head,
@@ -1039,23 +1329,33 @@ def build_fix_daemon(
         clear_issue_state=store.cleanup_pr,
         journal=journal, alert_cmd=cfg.alert_cmd,
         pending_actions=store,
+        effect_executor=effect_executor,
     )
     # Wrapped LAST, so the decorator sees whichever runtime actually ran (Claude or
     # the Codex swap above) and the ledger is runtime-agnostic.
+    fix_runner = _with_accounting(
+        fix_runner, control, cfg, "fix", cfg.fixer_runtime.value, journal
+    )
     fix_runner = JournalingRuntime(
-        fix_runner, journal, ledger, cfg.repo, "fix", cfg.fixer_runtime
+        fix_runner,
+        journal,
+        repo=cfg.repo,
+        role="fix",
+        runtime=cfg.fixer_runtime.value,
+        state_dir=cfg.state_dir,
     )
     reservations = DispatchPathReservations()
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, worktrees, fix_runner, executor,
         prepare_cwd=prepare_cwd, journal=journal,
         reserve_fix_paths=reservations.expand,
+        dedupe=control,
     )
     dispatch_runtime = CancellableAsyncDispatch(
         dispatcher.dispatch,
         finished=reservations.finish,
     )
-    executor._run_agent = dispatch_runtime  # noqa: SLF001
+    executor.bind_dispatch(dispatch_runtime)
 
     report_holds = _hold_reporter(
         journal,
@@ -1066,11 +1366,17 @@ def build_fix_daemon(
         ),
     )
     report_prediction_outcomes = _prediction_outcome_reporter(
-        journal, cfg.repo, store, _log("fix")
+        journal, cfg.repo, store, _log("fix"), control
     )
-    report_ci_stalls = _ci_stall_reporter(journal, cfg.repo, fix_cfg, _log("fix"))
-    report_duplicates = _duplicate_pr_reporter(journal, cfg.repo, fix_cfg, _log("fix"))
-    report_ci_flakes = _ci_flake_reporter(journal, cfg.repo, fix_cfg, _log("fix"))
+    report_ci_stalls = _ci_stall_reporter(
+        journal, cfg.repo, fix_cfg, _log("fix"), control
+    )
+    report_duplicates = _duplicate_pr_reporter(
+        journal, cfg.repo, fix_cfg, _log("fix"), control
+    )
+    report_ci_flakes = _ci_flake_reporter(
+        journal, cfg.repo, fix_cfg, _log("fix"), control
+    )
     daemon_ref: dict[str, Daemon] = {}
 
     issue_kinds = frozenset({AgentKind.RESOLVE, AgentKind.RESUME})
@@ -1120,7 +1426,12 @@ def build_fix_daemon(
         # worlds (and the store reads happen once, not twice).
         world = _inject_predicted_paths(store, world)
         inflight = reservations.snapshot()
-        state = _fix_state(store, world, inflight)
+        state = _fix_state(
+            store,
+            world,
+            inflight,
+            control.abandoned_dispatch_counts(f"{cfg.repo}:fix"),
+        )
         report_holds(world, inflight)
         report_prediction_outcomes(world)
         report_ci_stalls(world)
@@ -1175,24 +1486,33 @@ def build_fix_daemon(
     ))
     daemon = Daemon(
         "fix",
-        gateway.build_world,
+        _reported_world(
+            gateway.build_world, control, cfg, "fix", _log("fix")
+        ),
         decide,
         executor,
         cfg.tick_interval_seconds,
         _log("fix"),
         journal=journal,
-        tick_gate=_spend_gate(cfg, ledger),
+        tick_gate=_control_spend_gate(cfg, control),
         wake_check=_wake_check(cfg, store),
         dispatch_capacity=cfg.fix_dispatch_concurrency,
         dispatch_key=dispatch_key,
         cancel_active_dispatches=dispatch_runtime.cancel_all,
+        force_kill_dispatches=_force_kill(cfg.state_dir),
         dispatch_rejected=reservations.finish,
+        heartbeat_path=os.path.join(cfg.state_dir, "heartbeat.json"),
+        recover=_recovery(cfg.state_dir, cfg, control, effect_executor, journal),
     )
     daemon_ref["daemon"] = daemon
     return daemon
 
 
-def _review_state(store: Store, world) -> ReviewState:
+def _review_state(
+    store: Store,
+    world,
+    process_deaths: Mapping[int, int] | None = None,
+) -> ReviewState:
     """Read the per-PR state `decide_review` needs — including the ceiling
     counter that stops the reviewer paying for a PR that never converges.
 
@@ -1214,7 +1534,7 @@ def _review_state(store: Store, world) -> ReviewState:
     and a set literal dedupes it, so nothing is double counted."""
     sessions = frozenset(p.number for p in world.prs if store.get_pr_session(p.number))
     last = {p.number: store.get_last_sha(p.number) for p in world.prs}
-    deaths = _process_deaths(store)  # review P0R-4 — see _fix_state
+    deaths = process_deaths or {}
     unproductive = {
         p.number: sum(
             store.get_infra_deaths(k) + deaths.get(k, 0)
@@ -1232,8 +1552,7 @@ def build_review_daemon(
 ) -> Daemon:
     repo_cfg = cfg.repository
     review_runtime = cfg.review_runtime
-    journal = _journal(store)
-    ledger = default_ledger_path()
+    journal = _typed_journal(_journal(store), cfg, "review", store.state_dir)
     rcfg = ReviewConfig(
         review_bot=review_runtime.bot, identity_mode=repo_cfg.identity_mode,
         trigger_label=Label(review_runtime.trigger_label),
@@ -1243,9 +1562,7 @@ def build_review_daemon(
         # separately from this ceiling. Until it lands the domain default
         # applies — a missing knob must never mean "no ceiling", which is the
         # unbounded state P0R-3 describes.
-        max_unproductive_rounds=getattr(
-            review_runtime, "max_unproductive_rounds", DEFAULT_MAX_UNPRODUCTIVE_ROUNDS
-        ),
+        max_unproductive_rounds=review_runtime.max_unproductive_rounds,
     )
     dcfg = DispatchConfig(
         base_branch=repo_cfg.base_branch,
@@ -1269,12 +1586,12 @@ def build_review_daemon(
         # reads off this counter — same value, same getattr fallback, so a
         # deterministic death saturates to exactly what escalates (#13).
         max_infra_deaths=rcfg.max_unproductive_rounds,
-        **_spend_cfg(cfg, "review", ledger),
+        **_spend_cfg(cfg, "review"),
     )
     review_runner = runner
     review_execution_cwd = ""
     review_prepare_cwd = None
-    if review_runtime.runtime == "codex":
+    if review_runtime.runtime is RuntimeName.CODEX:
         from ..adapters.codex_runner import (
             codex_budget_not_enforced_warning,
             codex_cost_blindspot_warning,
@@ -1291,6 +1608,7 @@ def build_review_daemon(
             resume_on_retry=False,
             leg_role="review",
             log=_log("review"),
+            state_dir=cfg.review_state_dir,
         )
         reason = review_runner.preflight()
         if reason is not None:
@@ -1319,16 +1637,20 @@ def build_review_daemon(
         )
         if budget_notice is not None:
             _log("review")(budget_notice)
-        # Codex ignores AgentTask's SDK-only tool policy.  The workflow installs
+        # Codex ignores RuntimePlan's SDK-only tool policy. The workflow installs
         # this dedicated read-only Bash allow-list immediately before each leg,
         # in the explicit target checkout only.  Builder-time writes would let a
         # test run corrupt a simultaneously active fixer worktree.
-        from ..adapters.codex_hook import write_hook_config
+        from ..adapters.codex_hook import HookPreparingRuntime, write_hook_config
 
         review_execution_cwd = cfg.target_dir
         if review_execution_cwd:
             review_prepare_cwd = partial(
-                write_hook_config, review_only=True, log=_log("review")
+                write_hook_config, review_only=True, log=_log("review"),
+                state_dir=cfg.review_state_dir,
+            )
+            review_runner = HookPreparingRuntime(
+                review_runner, review_prepare_cwd
             )
         else:
             _log("review")(
@@ -1343,34 +1665,78 @@ def build_review_daemon(
     )
 
     # Reviewer has no worktree/issue side; pass a no-op Worktrees-like None usage.
+    control = _control_store(cfg, cfg.review_state_dir, journal)
+    effect_executor = _effects(
+        gateway,
+        control,
+        repository=cfg.repo,
+        identity=f"{cfg.repo}:review",
+        config_version=cfg.config_version,
+    )
     executor = Executor(
         gateway,
         log=_log("review"),
         journal=journal,
         alert_cmd=cfg.alert_cmd,
         pending_actions=store,
+        effect_executor=effect_executor,
     )
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, None,
         JournalingRuntime(
-            review_runner, journal, ledger, cfg.repo, "review", review_runtime.runtime
+            _with_accounting(
+                review_runner,
+                control,
+                cfg,
+                "review",
+                review_runtime.runtime.value,
+                journal,
+            ),
+            journal,
+            repo=cfg.repo,
+            role="review",
+            runtime=review_runtime.runtime.value,
+            state_dir=cfg.review_state_dir,
         ),
-        executor, journal=journal,
+        executor, journal=journal, dedupe=control,
     )
-    executor._run_agent = lambda a: asyncio.run(dispatcher.dispatch(a))  # noqa: SLF001
+    dispatch_runtime = CancellableAsyncDispatch(dispatcher.dispatch)
+    executor.bind_dispatch(dispatch_runtime)
 
     def decide(world):
-        return decide_review(world, rcfg, _review_state(store, world))
+        return decide_review(
+            world,
+            rcfg,
+            _review_state(
+                store,
+                world,
+                control.abandoned_dispatch_counts(f"{cfg.repo}:review"),
+            ),
+        )
 
     _log("review")(review_capability_line(
         can_approve=rcfg.identity_mode == IdentityMode.THREE,
         adopt_unlabeled=rcfg.adopt_unlabeled,
     ))
 
-    return Daemon("review", gateway.build_review_world, decide, executor,
+    return Daemon("review", _reported_world(
+                      gateway.build_review_world, control, cfg, "review",
+                      _log("review")
+                  ), decide, executor,
                   cfg.tick_interval_seconds, _log("review"), journal=journal,
-                  tick_gate=_spend_gate(cfg, ledger),
-                  wake_check=_wake_check(cfg, store))
+                  tick_gate=_control_spend_gate(cfg, control),
+                  wake_check=_wake_check(cfg, store),
+                  dispatch_capacity=1,
+                  cancel_active_dispatches=dispatch_runtime.cancel_all,
+                  force_kill_dispatches=_force_kill(
+                      cfg.review_state_dir or store.state_dir
+                  ),
+                  heartbeat_path=os.path.join(
+                      cfg.review_state_dir, "heartbeat.json"
+                  ),
+                  recover=_recovery(
+                      cfg.review_state_dir, cfg, control, effect_executor, journal
+                  ))
 
 
 _CODEOWNERS_PATHS = ("CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS")
@@ -1407,8 +1773,9 @@ def build_steward_daemon(
 ) -> Daemon:
     steward_log = _log("steward")
     repo_cfg = cfg.repository
-    journal = _journal(store)
-    ledger = default_ledger_path()
+    journal = _typed_journal(
+        _journal(store), cfg, "steward", store.state_dir
+    )
     steward_runtime = cfg.steward_runtime
     jira_runtime = cfg.jira_runtime
     tcfg_dom = TriageConfig(
@@ -1456,7 +1823,15 @@ def build_steward_daemon(
         # Not for dispatching anything — the steward's recurrence check needs to
         # know whose merged PRs count as "shipped by this harness".
         fix_bot=cfg.fix_runtime.bot,
-        **_spend_cfg(cfg, "steward", ledger),
+        **_spend_cfg(cfg, "steward"),
+    )
+    control = _control_store(cfg, cfg.steward_state_dir, journal)
+    effect_executor = _effects(
+        gateway,
+        control,
+        repository=cfg.repo,
+        identity=f"{cfg.repo}:steward",
+        config_version=cfg.config_version,
     )
     executor = Executor(
         gateway,
@@ -1464,13 +1839,24 @@ def build_steward_daemon(
         journal=journal,
         alert_cmd=cfg.alert_cmd,
         pending_actions=store,
+        effect_executor=effect_executor,
     )
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, None,
-        JournalingRuntime(runner, journal, ledger, cfg.repo, "steward", "claude"),
-        executor, journal=journal,
+        JournalingRuntime(
+            _with_accounting(
+                runner, control, cfg, "steward", "claude", journal
+            ),
+            journal,
+            repo=cfg.repo,
+            role="steward",
+            runtime="claude",
+            state_dir=cfg.steward_state_dir,
+        ),
+        executor, journal=journal, dedupe=control,
     )
-    executor._run_agent = lambda a: asyncio.run(dispatcher.dispatch(a))  # noqa: SLF001
+    dispatch_runtime = CancellableAsyncDispatch(dispatcher.dispatch)
+    executor.bind_dispatch(dispatch_runtime)
 
     # Same ceiling shape as the reviewer's (review P0R-3), for the same reason:
     # the steward's "already handled" markers — `triage-N.at` and the jira phase
@@ -1481,12 +1867,10 @@ def build_steward_daemon(
     # steward inventing lifecycle state for an issue it never triaged. It stops
     # spending and says so, once per change in the suppressed set (not once per
     # poll — a line repeated 4,300 times a day is a line nobody reads).
-    max_deaths = getattr(
-        steward_runtime, "max_infra_deaths", DEFAULT_MAX_UNPRODUCTIVE_ROUNDS
-    )
+    max_deaths = steward_runtime.max_infra_deaths
     suppressed_last: set[int] = set()
     report_recurrences = _recurrence_reporter(
-        journal, gateway, cfg.repo, cfg.fix_runtime.bot, steward_log
+        journal, gateway, cfg.repo, cfg.fix_runtime.bot, steward_log, control
     )
     # What this daemon can actually DO here — not what it is configured with
     # (#46). The two differ: JIRA_SYNC=1 with no project key is `jira_sync=off`,
@@ -1497,7 +1881,7 @@ def build_steward_daemon(
         promote=tcfg_dom.promote,
         jira_sync=jira_on,
         recurrence=bool(cfg.fix_runtime.bot)
-        and getattr(gateway, "issue_state_reason", None) is not None,
+        and isinstance(gateway, IssueStateReasonReads),
     ))
     if cfg.steward_groom_edit:
         steward_log("STEWARD_GROOM_EDIT=1 is inert: grooming currently comments only; issue bodies are never edited")
@@ -1508,7 +1892,7 @@ def build_steward_daemon(
         # this only runs on a genuinely fresh world.
         report_recurrences(world)
         state = TriageState(seen_at={i.number: store.get_triage_at(i.number) for i in world.issues})
-        deaths = _process_deaths(store)
+        deaths = control.abandoned_dispatch_counts(f"{cfg.repo}:steward")
 
         def exhausted(n: int) -> bool:
             spent = store.get_infra_deaths(n) + deaths.get(n, 0)
@@ -1552,6 +1936,20 @@ def build_steward_daemon(
     # Jira needs closed ai-done issues too (for the final Done transition); triage
     # alone needs just open issues.
     observe = gateway.build_steward_world if jira_on else gateway.build_triage_world
-    return Daemon("steward", observe, decide, executor, cfg.tick_interval_seconds,
-                  steward_log, journal=journal, tick_gate=_spend_gate(cfg, ledger),
-                  wake_check=_wake_check(cfg, store))
+    return Daemon("steward", _reported_world(
+                      observe, control, cfg, "steward", steward_log
+                  ), decide, executor, cfg.tick_interval_seconds,
+                  steward_log, journal=journal,
+                  tick_gate=_control_spend_gate(cfg, control),
+                  wake_check=_wake_check(cfg, store),
+                  dispatch_capacity=1,
+                  cancel_active_dispatches=dispatch_runtime.cancel_all,
+                  force_kill_dispatches=_force_kill(
+                      cfg.steward_state_dir or store.state_dir
+                  ),
+                  heartbeat_path=os.path.join(
+                      cfg.steward_state_dir, "heartbeat.json"
+                  ),
+                  recover=_recovery(
+                      cfg.steward_state_dir, cfg, control, effect_executor, journal
+                  ))

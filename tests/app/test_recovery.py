@@ -1,0 +1,187 @@
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+import sqlite3
+from zoneinfo import ZoneInfo
+
+from issue_agent.adapters.control_store import (
+    AccountingDisposition,
+    Lease,
+    ReservationRequest,
+    SQLiteControlStore,
+    SettlementRequest,
+)
+from issue_agent.app.recovery import RecoveryCoordinator
+from issue_agent.domain.contracts import (
+    BudgetScope,
+    Money,
+    PriceQuote,
+    PricingBasis,
+    ReservationId,
+    RunId,
+)
+
+
+@dataclass(frozen=True)
+class _Disposition:
+    value: str = "available"
+
+
+@dataclass(frozen=True)
+class _Release:
+    disposition: _Disposition = _Disposition()
+
+
+@dataclass(frozen=True)
+class _Lease:
+    run_id: RunId
+
+
+class _Supervisor:
+    def recover_orphans(self):
+        return (RunId("orphan"),)
+
+
+class _Control:
+    def __init__(self):
+        self.released = []
+
+    def reclaim_dead_leases(self, _owner_id, _is_alive):
+        return (RunId("recovered"),)
+
+    def active_reservation_runs(self, _owner_id):
+        return (RunId("recovered"), RunId("live"))
+
+    def leases(self, _owner_id):
+        return (_Lease(RunId("live")),)
+
+    def release(self, run_id, reason):
+        self.released.append((run_id, reason))
+        return _Release()
+
+    def pending_commands(self):
+        return ("pending",)
+
+
+class _Spend:
+    def __init__(self, settled=()):
+        self.settled = frozenset(settled)
+        self.seen = []
+
+    def reconcile(self, run_id):
+        self.seen.append(run_id)
+        return run_id in self.settled
+
+
+class _Abandonments:
+    def __init__(self):
+        self.calls = []
+
+    def abandon_run(self, run_id, reason):
+        self.calls.append((run_id, reason))
+        return True
+
+
+def test_recovery_reconciles_dead_reservation_before_unknown_release():
+    control = _Control()
+    spend = _Spend((RunId("recovered"),))
+    abandonments = _Abandonments()
+
+    report = RecoveryCoordinator(
+        _Supervisor(), control, spend, abandonments, "o/r:fix"
+    ).recover()
+
+    assert report.killed_orphans == (RunId("orphan"),)
+    assert report.reclaimed_leases == (RunId("recovered"),)
+    assert report.spend_unknown == ()
+    assert report.pending_commands == 1
+    assert spend.seen == [RunId("recovered")]
+    assert control.released == []
+    assert abandonments.calls == [
+        (RunId("recovered"), "process ownership lost")
+    ]
+
+
+def test_recovery_releases_only_orphaned_indeterminate_spend():
+    control = _Control()
+    spend = _Spend()
+    abandonments = _Abandonments()
+
+    report = RecoveryCoordinator(
+        _Supervisor(), control, spend, abandonments, "o/r:fix"
+    ).recover()
+
+    assert report.spend_unknown == (RunId("recovered"),)
+    assert control.released == [(RunId("recovered"), "spend_unknown")]
+    assert RunId("live") not in spend.seen
+
+
+def test_dead_lease_with_recovered_spend_keeps_one_abandoned_terminal_outcome(
+    tmp_path, monkeypatch
+):
+    now = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
+    store = SQLiteControlStore(
+        str(tmp_path / "control.db"), now=lambda: now
+    )
+    store.initialize()
+    run_id = RunId("crashed")
+    scope = BudgetScope(
+        "o/r",
+        "daily",
+        "USD",
+        "2026-07-30",
+        now.replace(hour=0),
+        now.replace(hour=0) + timedelta(days=1),
+        ZoneInfo("UTC"),
+    )
+    request = ReservationRequest(
+        ReservationId("reservation"),
+        run_id,
+        "dispatch",
+        scope,
+        PriceQuote("gpt", "card", "v1", now, Money("USD", 10)),
+        Money("USD", 100),
+        "config",
+        owner_id="o/r:fix",
+    )
+    store.reserve(
+        request,
+        lease=Lease(run_id, "dispatch", "owner", 999_999, 999_999, now),
+    )
+
+    class Reconciler:
+        def reconcile(self, recovered_run_id):
+            result = store.settle(
+                SettlementRequest(
+                    recovered_run_id,
+                    Money("USD", 7),
+                    PricingBasis.RECONCILED,
+                    "provider-receipt",
+                    None,
+                    None,
+                    None,
+                )
+            )
+            return result.disposition is AccountingDisposition.AVAILABLE
+
+    abandonments = _Abandonments()
+    monkeypatch.setattr(
+        "issue_agent.app.recovery._pid_alive", lambda _pid, _start: False
+    )
+    report = RecoveryCoordinator(
+        _Supervisor(), store, Reconciler(), abandonments, "o/r:fix"
+    ).recover()
+
+    with sqlite3.connect(store.path) as db:
+        state, outcome, receipt = db.execute(
+            "SELECT state, outcome, provider_receipt_id FROM runs WHERE run_id=?",
+            (str(run_id),),
+        ).fetchone()
+    assert report.reclaimed_leases == (run_id,)
+    assert (state, outcome, receipt) == (
+        "abandoned",
+        "dead_lease",
+        "provider-receipt",
+    )
+    assert abandonments.calls == [
+        (run_id, "process ownership lost")
+    ]

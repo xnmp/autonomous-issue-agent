@@ -23,6 +23,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
 
+from .contracts import TestExecution, TestExecutionStatus
 from .refs import is_governed_branch
 
 
@@ -336,13 +337,15 @@ def check_visual_evidence(
     changed: Iterable[str],
     screenshots_read: Iterable[str],
     pr_body: str = "",
+    *,
+    receipt_available: bool = True,
 ) -> GateResult:
     """When the agent declared a visual acceptance criterion (.harness/visual-ac),
     the PR must commit screenshots under evidence/ AND the agent must have actually
     READ each committed screenshot (loaded it into its vision context, recorded by
-    the PostToolUse(Read) hook in .harness/screenshots-read). A captured-but-unread
-    screenshot is unverified proof → blocked. Non-visual issues (the common case) →
-    ALLOW.
+    the PostToolUse(Read) hook in a harness-owned receipt). A captured-but-unread
+    screenshot is unverified proof → blocked. Non-visual issues (the common case)
+    → ALLOW.
 
     ONE SCREENSHOT PER AC ITEM (P3.6-lite). One screenshot for a five-criterion PR
     proves one criterion, so when the body's `## Acceptance Criteria` section parses
@@ -362,6 +365,11 @@ def check_visual_evidence(
         return deny(
             "a visual acceptance criterion was declared (.harness/visual-ac) but no "
             "screenshot is committed under evidence/ — capture one with agent-browser"
+        )
+    if not receipt_available:
+        return deny(
+            "trusted screenshot-read receipt is unavailable — open each evidence "
+            "image with the Read tool before opening the PR"
         )
     read = set(screenshots_read)
     unread = [os.path.basename(f) for f in images if os.path.basename(f) not in read]
@@ -501,27 +509,6 @@ def check_project_commands(
         return deny(f"Lint failed (LINT_CMD): {lint_cmd}")
     if typecheck_cmd and not run(typecheck_cmd):
         return deny(f"Typecheck failed (TYPECHECK_CMD): {typecheck_cmd}")
-    return ALLOW
-
-
-# ── markers + adversarial verdict (check-pr.sh §4/§8) ─────────────────────────
-def check_markers(ac_posted: bool, test_plan_posted: bool) -> GateResult:
-    if not ac_posted:
-        return deny(
-            "no Acceptance Criteria posted on the issue yet (.harness/ac-posted "
-            "missing — post AC as an issue comment FIRST)"
-        )
-    if not test_plan_posted:
-        return deny("no Test Plan posted on the issue yet (.harness/test-plan-posted missing)")
-    return ALLOW
-
-
-def check_adversarial_verdict(verdict: str) -> GateResult:
-    """.harness/adversarial-verdict must start with PASS. Port of §8."""
-    if not verdict.startswith("PASS"):
-        return deny(
-            "adversarial pre-PR review did not return PASS (.harness/adversarial-verdict)"
-        )
     return ALLOW
 
 
@@ -859,7 +846,7 @@ def partition_changed(
 
 def check_red_fails(
     inputs: RedFailInputs,
-    revert_and_run: Callable[[tuple[str, ...]], bool | None],
+    revert_and_run: Callable[[tuple[str, ...]], TestExecution],
 ) -> GateResult:
     """§10: with the implementation reverted, the NEW tests MUST fail (real red).
     Catches the tautological / wrong-layer test (#39 class).
@@ -885,24 +872,38 @@ def check_red_fails(
             "without the implementation. " + NO_TEST_CMD_HINT
         )
     if not inputs.base_resolvable:
-        return ALLOW  # fail-open: degraded simulation must never wedge a real PR
+        return deny(
+            "the base revision cannot be resolved, so trusted red-test evidence "
+            "cannot be produced; retry after restoring the base ref"
+        )
     if not inputs.new_test_files:
         return ALLOW  # §5 owns the "must add a test" rule
     if not inputs.impl_files:
         return ALLOW  # pure-test diff: nothing to revert
 
-    passed_with_impl_reverted = revert_and_run(inputs.impl_files)
-    if passed_with_impl_reverted is None:
+    execution = revert_and_run(inputs.impl_files)
+    if execution.status is TestExecutionStatus.INFRA_ERROR:
         return deny(
-            "GATE RECURSION: the test command re-entered the harness gate and was "
-            "refused (see #63) — the red-fail check cannot run. Fix the "
-            "test-command configuration (self-referential TEST_CMD/.harness/test-cmd)."
+            "red-test verification hit an infrastructure error; only a genuine "
+            "TEST_FAILED receipt is red evidence. Fix the verifier/test-command "
+            "configuration and retry."
         )
-    if passed_with_impl_reverted:
+    if execution.status is TestExecutionStatus.TIMED_OUT:
+        return deny(
+            "red-test verification timed out; a timeout is infrastructure failure, "
+            "not evidence that the new test detects the reverted implementation"
+        )
+    if execution.status is TestExecutionStatus.CANCELLED:
+        return deny(
+            "red-test verification was cancelled; cancellation is not red evidence"
+        )
+    if execution.status is TestExecutionStatus.PASSED:
         return deny(
             "the new test(s) still PASS with the implementation reverted — they do "
             "not exercise the change (tautological or wrong-layer test). Assert on "
             "the observable behaviour the change produces, not on a constant that is "
             f"always true. New test file(s): {' '.join(inputs.new_test_files)}"
         )
-    return ALLOW
+    if execution.status is TestExecutionStatus.TEST_FAILED:
+        return ALLOW
+    return deny("red-test verification returned an unknown evidence status")

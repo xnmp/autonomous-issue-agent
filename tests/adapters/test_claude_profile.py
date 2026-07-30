@@ -13,7 +13,7 @@ from issue_agent.adapters.claude_profile import (
     endpoint_host,
     parse_dotenv,
 )
-from issue_agent.domain.agent_task import AgentTask
+from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.outcome import AgentResult
 
 SETTINGS_ENV = {
@@ -142,9 +142,9 @@ def test_endpoint_host_reports_the_host_only():
 
 class _RecordingRuntime:
     def __init__(self):
-        self.tasks: list[AgentTask] = []
+        self.tasks: list[RuntimePlan] = []
 
-    async def run(self, task: AgentTask) -> AgentResult:
+    async def run(self, task: RuntimePlan) -> AgentResult:
         self.tasks.append(task)
         return AgentResult(is_error=False, status="done")
 
@@ -157,7 +157,7 @@ def test_the_runtime_injects_its_env_into_every_task():
     inner = _RecordingRuntime()
     runtime = EnvInjectingRuntime(inner, env={"ANTHROPIC_BASE_URL": "https://api.z.ai"})
 
-    result = _run(runtime, AgentTask(prompt="fix it"))
+    result = _run(runtime, RuntimePlan(prompt="fix it"))
 
     assert result.status == "done"
     assert inner.tasks[0].env == {"ANTHROPIC_BASE_URL": "https://api.z.ai"}
@@ -169,7 +169,7 @@ def test_the_tasks_own_env_wins_over_the_injected_one():
     inner = _RecordingRuntime()
     runtime = EnvInjectingRuntime(inner, env={"TEST_CMD": "profile", "BASE": "z"})
 
-    _run(runtime, AgentTask(prompt="p", env={"TEST_CMD": "uv run pytest"}))
+    _run(runtime, RuntimePlan(prompt="p", env={"TEST_CMD": "uv run pytest"}))
 
     assert inner.tasks[0].env == {"TEST_CMD": "uv run pytest", "BASE": "z"}
 
@@ -178,7 +178,7 @@ def test_injection_does_not_mutate_the_caller_or_the_configured_env():
     inner = _RecordingRuntime()
     env = {"BASE": "z"}
     runtime = EnvInjectingRuntime(inner, env=env)
-    task = AgentTask(prompt="p", env={"TEST_CMD": "t"})
+    task = RuntimePlan(prompt="p", env={"TEST_CMD": "t"})
 
     _run(runtime, task)
 

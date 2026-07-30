@@ -342,6 +342,34 @@ def test_submit_review_returns_false_on_failure():
     assert gw.submit_review(100, "APPROVE", "lgtm") is False
 
 
+def test_has_review_flattens_all_paginated_api_pages():
+    fr = FakeRunner(
+        {
+            "api repos/o/r/pulls/100/reviews": [
+                [
+                    {
+                        "state": "APPROVED",
+                        "body": "old",
+                        "commit_id": "head",
+                    }
+                ],
+                [
+                    {
+                        "state": "APPROVED",
+                        "body": "lgtm",
+                        "commit_id": "head",
+                    }
+                ],
+            ]
+        }
+    )
+    gw = GitHubGateway("o/r", runner=fr)
+
+    assert gw.has_review(100, "APPROVE", "lgtm", "head")
+    argv, _token = fr.calls[0]
+    assert argv[-2:] == ["--paginate", "--slurp"]
+
+
 def test_get_issue_parses_response():
     resp = {"number": 5, "title": "x", "labels": [{"name": "ai-ready"}],
             "state": "OPEN", "author": {"login": "a"}}

@@ -103,7 +103,11 @@ class Backend:
         snapshot = self.snapshot(name)
         local_tz = _local_timezone(timezone_name)
         first_observed_day = snapshots.first_observed_day(snapshot, local_tz)
-        issues, issue_error = self.gh.issues(snapshot.repo)
+        issues, issue_error = (
+            ([], None)
+            if snapshot.deployment.schema_version == 2
+            else self.gh.issues(snapshot.repo)
+        )
         recurrence_events = [
             event
             for row in snapshot.deployment.issues
@@ -148,6 +152,15 @@ class Backend:
         snap = self.snapshot(name)
         now = self.now_fn()
         gh_issues, gh_prs, warnings = self._gh_context(snap.repo)
+        if snap.deployment.schema_version == 2:
+            gh_issues = {
+                number: _github_enrichment(issue)
+                for number, issue in gh_issues.items()
+            }
+            gh_prs = {
+                number: _github_enrichment(pr)
+                for number, pr in gh_prs.items()
+            }
         rows = snap.deployment.issues
         projected_by_model = snapshots.projected_cost_by_model(rows)
         projected_eta = snapshots.mean_wall_clock_s(rows)
@@ -172,25 +185,52 @@ class Backend:
             )
 
         row_by_issue = {row.issue: row for row in rows}
-        ready_numbers = {
-            number
-            for number, issue in gh_issues.items()
-            if ghdata.is_open(issue) and "ai-ready" in snapshots.labels_of(issue)
-        }
+        ready_numbers = (
+            {
+                row.issue
+                for row in rows
+                if row.stage == "queued" and not row.done
+            }
+            if snap.deployment.schema_version == 2
+            else {
+                number
+                for number, issue in gh_issues.items()
+                if ghdata.is_open(issue)
+                and "ai-ready" in snapshots.labels_of(issue)
+            }
+        )
         in_flight_numbers = {
             row.issue for row in rows if not row.done and row.issue not in ready_numbers
         }
         pending, backlog = [], []
-        for number, issue in sorted(gh_issues.items()):
-            if not ghdata.is_open(issue):
-                continue
-            labels = snapshots.labels_of(issue)
-            if "ai-ready" in labels:
-                pending.append(snapshots.pending_card(issue, row_by_issue.get(number)))
-            elif snapshots.is_backlog(issue):
-                backlog.append(
-                    snapshots.backlog_card(issue, now, row_by_issue.get(number))
+        if snap.deployment.schema_version == 2:
+            for number in sorted(ready_numbers):
+                issue = {
+                    "number": number,
+                    "state": "OPEN",
+                    "labels": [{"name": "ai-ready"}],
+                    **gh_issues.get(number, {}),
+                }
+                pending.append(
+                    snapshots.pending_card(issue, row_by_issue.get(number))
                 )
+        else:
+            for number, issue in sorted(gh_issues.items()):
+                if not ghdata.is_open(issue):
+                    continue
+                labels = snapshots.labels_of(issue)
+                if "ai-ready" in labels:
+                    pending.append(
+                        snapshots.pending_card(
+                            issue, row_by_issue.get(number)
+                        )
+                    )
+                elif snapshots.is_backlog(issue):
+                    backlog.append(
+                        snapshots.backlog_card(
+                            issue, now, row_by_issue.get(number)
+                        )
+                    )
         return {
             "in_flight": [
                 card(row) for row in rows
@@ -210,6 +250,15 @@ class Backend:
         if row is None:
             return None
         gh_issues, gh_prs, warnings = self._gh_context(snap.repo)
+        if snap.deployment.schema_version == 2:
+            gh_issues = {
+                key: _github_enrichment(value)
+                for key, value in gh_issues.items()
+            }
+            gh_prs = {
+                key: _github_enrichment(value)
+                for key, value in gh_prs.items()
+            }
         detail = snapshots.issue_detail(
             row, self.now_fn(), gh_issues.get(number), gh_prs
         )
@@ -236,7 +285,6 @@ class Backend:
         return actions.launch_detached(
             actions.start_command(self.harness_root, name), log_path
         )
-
     def promote(self, name: str, number: int) -> tuple[bool, str]:
         if not self.known(name):
             return False, f"unknown deployment '{name}'"
@@ -254,6 +302,16 @@ class Backend:
         return actions.run_label_commands(
             actions.priority_commands(repo, number, priority)
         )
+
+
+def _github_enrichment(value: dict) -> dict:
+    """Only fields GitHub may add to an authoritative v2 projection."""
+
+    return {
+        key: value[key]
+        for key in ("title", "url")
+        if value.get(key) is not None
+    }
 
 
 def _local_timezone(name: str | None):

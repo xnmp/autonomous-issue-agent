@@ -12,12 +12,18 @@ from __future__ import annotations
 import math
 import os
 import re
-import subprocess
-from dataclasses import dataclass, fields
+import hashlib
+import json
+from dataclasses import MISSING, dataclass, field, fields
+from enum import Enum
+from types import MappingProxyType
 
 from ..adapters.agent_runner import DEFAULT_MAX_BUFFER_BYTES
+from ..adapters.env_file import source_env_file
+from ..domain.agent_task import RuntimeName
 from ..domain.effort import EFFORT_LADDER, Effort, parse_effort
 from ..domain.identity import normalize_login
+from ..domain.pricing import parse_model_rate_table
 from ..domain.review import IdentityMode, ReviewMode
 
 
@@ -84,7 +90,7 @@ class FixRuntimeConfig:
 @dataclass(frozen=True)
 class ReviewRuntimeConfig:
     bot: str
-    runtime: str
+    runtime: RuntimeName
     model: str | None
     prompt: str
     mode: ReviewMode
@@ -149,7 +155,7 @@ class CodexRuntimeConfig:
     # `HarnessConfig.codex_cost_per_mtok`.
     cost_per_mtok: tuple[tuple[str, float, float], ...] = ()
     cost_per_mtok_cached_in: tuple[tuple[str, float], ...] = ()
-    # Kill a run once its priced spend crosses AgentTask.max_budget_usd (#29).
+    # Kill a run once its priced spend crosses RuntimePlan.max_budget_usd (#29).
     # See `HarnessConfig.codex_enforce_budget`.
     enforce_budget: bool = True
 
@@ -221,11 +227,25 @@ class HarnessConfig:
     # requires ≥1 review and ≥1 status check; "0" = never arm early. There is
     # deliberately no "1": forcing early arming without the verified server-side
     # gate would merge unreviewed work.
-    arm_on_open: str = "auto"
+    arm_on_open: str = field(
+        default="auto",
+        metadata={
+            "env": "ARM_ON_OPEN",
+            "coerce": "choice",
+            "choices": ("auto", "0"),
+        },
+    )
     # The probe's boot-time verdict (main.build_role fills it; never from env).
     arm_on_open_active: bool = False
     auto_merge: bool = True
-    merge_method: str = "squash"
+    merge_method: str = field(
+        default="squash",
+        metadata={
+            "env": "MERGE_METHOD",
+            "coerce": "choice",
+            "choices": ("squash", "merge", "rebase"),
+        },
+    )
     ci_ignore_checks: str = ""
     close_issue_on_merge: bool = True
     # Bound on how long CI may sit PENDING before the PR goes to a human (#30).
@@ -307,7 +327,6 @@ class HarnessConfig:
     #   delegated — the single-pass reviewer + a cheap code-scout subagent it
     #            delegates codebase search to (REVIEW_SCOUT_MODEL, default sonnet),
     #            so the expensive reviewer reasons over summaries not raw files.
-    # Legacy REVIEW_MULTI_AGENT=1 is honoured as an alias for multi.
     review_mode: ReviewMode = ReviewMode.SINGLE
     # Adopt rogue PRs (opened directly, no trigger label) into review. Default on:
     # a PR reviewed by nobody is the worse failure. Opt out per-PR with no-ai-review.
@@ -364,11 +383,11 @@ class HarnessConfig:
     # CLI, e.g. GPT-5.5), or "glm" (GLM via Z.ai's Anthropic-compatible endpoint —
     # the SAME Claude SDK runner with the profile's env injected). Only the FIXER
     # leg switches. See docs/reference/codex-runner.md.
-    fixer_runtime: str = "claude"
+    fixer_runtime: RuntimeName = RuntimeName.CLAUDE
     # Reviewer runtime: Codex is the deployment default; set "claude" explicitly
     # for the recommended mixed-runtime posture that preserves independent
     # implementer/reviewer failure modes.
-    reviewer_runtime: str = "codex"
+    reviewer_runtime: RuntimeName = RuntimeName.CODEX
     codex_bin: str = "codex"
     codex_model: str = ""              # blank → CodexRunner default (GPT-5.5)
     codex_provider_id: str = "openai-custom"  # NOT "openai": reserved by codex-cli ≥0.142
@@ -378,11 +397,32 @@ class HarnessConfig:
     # then requires the CODEX_ENV_KEY env var to hold the key.
     codex_base_url: str = ""
     codex_env_key: str = "OPENAI_API_KEY"
-    codex_wire_api: str = "responses"
-    codex_sandbox: str = "danger-full-access"
+    codex_wire_api: str = field(
+        default="responses",
+        metadata={
+            "env": "CODEX_WIRE_API",
+            "coerce": "choice",
+            "choices": ("responses", "chat"),
+        },
+    )
+    codex_sandbox: str = field(
+        default="danger-full-access",
+        metadata={
+            "env": "CODEX_SANDBOX",
+            "coerce": "choice",
+            "choices": ("read-only", "workspace-write", "danger-full-access"),
+        },
+    )
     # codex exec's own default is LOW effort (live session_meta, 2026-07-27);
     # medium is the deliberate implementer default. "" = leave codex alone.
-    codex_reasoning_effort: str = "medium"
+    codex_reasoning_effort: str = field(
+        default="medium",
+        metadata={
+            "env": "CODEX_REASONING_EFFORT",
+            "coerce": "choice",
+            "choices": ("", "low", "medium", "high", "xhigh"),
+        },
+    )
     # FIXER_RUNTIME=glm: path to a Claude Code PROFILE's settings.json (e.g.
     # ~/.cc-glm/settings.json). Its parent directory IS the profile dir, and both
     # the settings `env` block and the profile's `.env` are read at build time to
@@ -480,14 +520,9 @@ class HarnessConfig:
     # ── spend circuit breakers ────────────────────────────────────────────────
     # Per-agent budgets (MAX_BUDGET_USD et al) bound ONE session; nothing bounded
     # the aggregate, so a leg that retries forever spent without limit while every
-    # individual run stayed under budget. These caps close that. All three read the
-    # one shared ledger (adapters.journal.default_ledger_path) but differ in scope:
-    #   issue  — lifetime spend on one issue of THIS repo; escalates it to a human.
-    #   daily  — today's spend on THIS repo (per-repo overlay knob, #32).
-    #   global — today's spend across EVERY repo and role on this machine; belongs
-    #            in config/shared.env. Off by default so adding it never silently
-    #            tightens an existing deployment.
-    # Both daily caps pause dispatch until 00:00 UTC without touching any label.
+    # individual run stayed under budget. SQLite reservations enforce all three
+    # atomically: lifetime issue spend, current-period repository spend, and
+    # current-period host-global spend.
     # 0 disables any of them.
     issue_spend_cap_usd: float = 25.0
     daily_spend_cap_usd: float = 50.0
@@ -502,6 +537,12 @@ class HarnessConfig:
     # of an opaque ValueError three frames deep in int()/float(). Not itself an
     # env knob; never set this directly.
     parse_errors: tuple[str, ...] = ()
+
+    @property
+    def config_version(self) -> str:
+        """Stable identity of the immutable snapshot used by one admission."""
+
+        return hashlib.sha256(repr(self).encode()).hexdigest()[:16]
 
     @property
     def tick_interval_seconds(self) -> int:
@@ -684,17 +725,16 @@ class HarnessConfig:
             ("JIRA_SYNC_BUDGET_USD", self.jira_budget_usd),
         ):
             _require_positive(errors, name, value)
-        if self.fixer_runtime not in ("claude", "codex", "glm"):
-            errors.append("FIXER_RUNTIME must be 'claude', 'codex' or 'glm'")
-        elif self.fixer_runtime == "glm" and not self.glm_settings_file.strip():
+        if self.fixer_runtime is RuntimeName.GLM and not self.glm_settings_file.strip():
             # The glm runtime IS "the Claude runner plus a profile's env"; with no
             # profile there is nothing to inject and the fixer would silently run
             # on Anthropic credentials instead. Existence of the file is a
             # build-time check (roles); emptiness is a config error.
             errors.append("GLM_SETTINGS_FILE is required when FIXER_RUNTIME=glm")
-        if self.reviewer_runtime not in ("claude", "codex"):
-            errors.append("REVIEWER_RUNTIME must be 'claude' or 'codex'")
-        elif self.reviewer_runtime == "codex" and self.review_mode is not ReviewMode.SINGLE:
+        if (
+            self.reviewer_runtime is RuntimeName.CODEX
+            and self.review_mode is not ReviewMode.SINGLE
+        ):
             errors.append(
                 "REVIEWER_RUNTIME=codex supports REVIEW_MODE=single only; "
                 "multi/delegated rely on Claude subagents and model aliases"
@@ -714,12 +754,44 @@ class HarnessConfig:
         _require_non_negative(
             errors, "GLOBAL_DAILY_SPEND_CAP_USD", self.global_daily_spend_cap_usd
         )
+        caps_armed = any(
+            cap > 0
+            for cap in (
+                self.issue_spend_cap_usd,
+                self.daily_spend_cap_usd,
+                self.global_daily_spend_cap_usd,
+            )
+        )
+        if (
+            caps_armed
+            and (
+                self.fixer_runtime is RuntimeName.CODEX
+                or self.reviewer_runtime is RuntimeName.CODEX
+            )
+            and not self.codex_budget_priceable
+        ):
+            errors.append(
+                "armed spend caps require positive Codex input/output pricing; "
+                "set CODEX_COST_PER_MTOK_IN/OUT or disable every spend cap"
+            )
         return tuple(errors)
 
     def validate(self) -> None:
         errors = self.validation_errors()
         if errors:
             raise ValueError("invalid harness config: " + "; ".join(errors))
+
+    @property
+    def codex_budget_priceable(self) -> bool:
+        """Complete pricing includes rejecting malformed configured overrides."""
+
+        return (
+            self.codex_runtime.budget_priceable
+            and not any(
+                error.startswith("CODEX_COST_PER_MTOK ")
+                for error in self.parse_errors
+            )
+        )
 
     def describe(self) -> str:
         """Resolved-config summary printed at daemon startup (lean P5.1): the
@@ -738,10 +810,10 @@ class HarnessConfig:
         # verdict either way is the startup log asserting something it hasn't
         # checked — which is the bug this line is here to not repeat.
         fix_budget = f"fix_budget=${self.fix_budget_usd:.2f}"
-        if self.fixer_runtime == "codex" and self.fix_budget_usd > 0:
+        if self.fixer_runtime is RuntimeName.CODEX and self.fix_budget_usd > 0:
             # Every fallback and per-model rate needs both token classes priced.
             # One zero leaves a routed model able to spend outside the meter.
-            priced = self.codex_runtime.budget_priceable
+            priced = self.codex_budget_priceable
             if self.codex_enforce_budget and priced:
                 fallback = (
                     f"wall cap {self.agent_max_runtime:.0f}s remains the fallback"
@@ -781,12 +853,12 @@ class HarnessConfig:
             f"identity={getattr(self.identity_mode, 'value', self.identity_mode)} "
             f"{cadence} "
             f"probe={f'on/{self.world_probe_ttl_seconds}s' if self.world_probe else 'off'}",
-            f"fixer={self.fixer_runtime} fix_model={model(self.fix_model)} "
+            f"fixer={self.fixer_runtime.value} fix_model={model(self.fix_model)} "
             f"fix_effort={getattr(self.fix_effort, 'value', None) or '(runtime default)'} "
             f"escalate={'on' if self.escalate_on_evidence else 'off'} "
             f"dispatch_concurrency={self.fix_dispatch_concurrency} "
             f"{fix_budget}",
-            f"reviewer={self.reviewer_runtime} review_model={model(self.review_model)} "
+            f"reviewer={self.reviewer_runtime.value} review_model={model(self.review_model)} "
             f"mode={self.review_mode.value} review_budget=${self.review_budget_usd:.2f} "
             f"rejections_cap={self.max_review_rejections}",
             f"retry_caps: resolve={self.max_resolve_retries} ci={self.max_ci_retries} "
@@ -877,6 +949,33 @@ def _effort(env: dict, key: str, default: Effort | None, errors: list[str]) -> E
     return parsed
 
 
+def _runtime(
+    env: dict,
+    key: str,
+    default: RuntimeName,
+    allowed: frozenset[RuntimeName],
+    errors: list[str],
+) -> RuntimeName:
+    raw = env.get(key)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        runtime = RuntimeName(str(raw).strip())
+    except ValueError:
+        errors.append(
+            f"{key} must be one of {[item.value for item in sorted(allowed, key=lambda item: item.value)]}, "
+            f"got {raw!r} — using default {default.value}"
+        )
+        return default
+    if runtime not in allowed:
+        errors.append(
+            f"{key} must be one of {[item.value for item in sorted(allowed, key=lambda item: item.value)]}, "
+            f"got {raw!r} — using default {default.value}"
+        )
+        return default
+    return runtime
+
+
 def _require_non_negative(errors: list[str], name: str, value: int | float) -> None:
     if value < 0:
         errors.append(f"{name} must be >= 0")
@@ -891,11 +990,227 @@ def _require_positive(errors: list[str], name: str, value: int | float) -> None:
 # knob default to" is the HarnessConfig dataclass field itself — from_env reads
 # it here instead of restating a literal (the drift class that produced the
 # POLL_SECONDS 60-vs-20 mismatch, review S7).
-_FIELD_DEFAULTS = {f.name: f.default for f in fields(HarnessConfig)}
+_INTERNAL_CONFIG_FIELDS = frozenset(
+    {
+        "arm_on_open_active",
+        "agent_md",
+        "triage_prompt",
+        "codex_cost_per_mtok_cached_in",
+        "parse_errors",
+    }
+)
+_ENV_NAME_OVERRIDES = {
+    "fix_budget_usd": "MAX_BUDGET_USD",
+    "max_review_rejections": "REVIEW_MAX_REJECTIONS",
+    "triage_budget_usd": "STEWARD_TRIAGE_BUDGET_USD",
+    "harness_root": "HARNESS_ROOT_DIR",
+    "jira_budget_usd": "JIRA_SYNC_BUDGET_USD",
+    "agent_idle_timeout": "AGENT_IDLE_TIMEOUT_SECONDS",
+    "agent_max_runtime": "AGENT_MAX_RUNTIME_SECONDS",
+    "codex_backoff_base": "CODEX_BACKOFF_BASE_SECONDS",
+    "codex_rate_limit_backoff_base": "CODEX_RATE_LIMIT_BACKOFF_BASE_SECONDS",
+    "codex_max_rate_limit_wait": "CODEX_MAX_RATE_LIMIT_WAIT_SECONDS",
+}
+_COERCE_OVERRIDES: dict[str, str] = {
+    "identity_mode": "identity_mode",
+    "state_dir": "state_dir",
+    "review_state_dir": "state_dir",
+    "steward_state_dir": "state_dir",
+    "fix_effort": "effort",
+    "review_model": "review_model",
+    "review_mode": "review_mode",
+    "review_prompt": "stripped",
+    "steward_triage_model": "optional_string",
+    "review_gate_model": "optional_string",
+    "review_validation_model": "optional_string",
+    "review_scout_model": "optional_string",
+    "fixer_runtime": "runtime",
+    "reviewer_runtime": "runtime",
+    "codex_cost_per_mtok": "rate_table",
+}
+_CHOICE_OVERRIDES: dict[str, tuple[str, ...]] = {
+    "identity_mode": tuple(item.value for item in IdentityMode),
+    "fix_effort": tuple(item.value for item in EFFORT_LADDER),
+    "review_mode": tuple(item.value for item in ReviewMode),
+    "fixer_runtime": tuple(item.value for item in RuntimeName),
+    "reviewer_runtime": (RuntimeName.CLAUDE.value, RuntimeName.CODEX.value),
+}
+
+
+def _default_coercion(definition) -> str:
+    default = definition.default
+    if isinstance(default, bool):
+        return "bool"
+    if isinstance(default, int):
+        return "int"
+    if isinstance(default, float):
+        return "float"
+    if default is None:
+        return "optional_string"
+    return "string"
+
+
+def _install_config_metadata() -> None:
+    """Attach the single env/coercion table to every operator-facing field."""
+
+    for definition in fields(HarnessConfig):
+        if definition.name in _INTERNAL_CONFIG_FIELDS:
+            continue
+        existing = dict(definition.metadata)
+        metadata = {
+            "env": _ENV_NAME_OVERRIDES.get(
+                definition.name, definition.name.upper()
+            ),
+            "coerce": _COERCE_OVERRIDES.get(
+                definition.name,
+                str(existing.get("coerce") or _default_coercion(definition)),
+            ),
+        }
+        choices = existing.get("choices") or _CHOICE_OVERRIDES.get(
+            definition.name
+        )
+        if choices is not None:
+            metadata["choices"] = tuple(choices)
+        definition.metadata = MappingProxyType(metadata)
+
+
+_install_config_metadata()
+_FIELD_DEFINITIONS = {item.name: item for item in fields(HarnessConfig)}
+_FIELD_DEFAULTS = {name: item.default for name, item in _FIELD_DEFINITIONS.items()}
 
 
 def _dc_default(field: str):
     return _FIELD_DEFAULTS[field]
+
+
+def _env_name(field_name: str) -> str:
+    return str(_FIELD_DEFINITIONS[field_name].metadata["env"])
+
+
+def _raw(
+    env: dict,
+    field_name: str,
+    *,
+    default: object = MISSING,
+) -> object:
+    fallback = _dc_default(field_name) if default is MISSING else default
+    return env.get(_env_name(field_name), fallback)
+
+
+def _metadata_choice(
+    env: dict, field_name: str, errors: list[str]
+) -> str:
+    """Parse a choice field from its dataclass metadata.
+
+    Adding a choice knob has one source of truth for env name, default, coercion,
+    validation, and generated reference rendering.
+    """
+
+    definition = _FIELD_DEFINITIONS[field_name]
+    env_name = str(definition.metadata["env"])
+    choices = tuple(str(item) for item in definition.metadata["choices"])
+    default = str(definition.default)
+    raw = env.get(env_name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    value = str(raw).strip()
+    if value not in choices:
+        errors.append(
+            f"{env_name} must be one of {list(choices)}, got {raw!r} "
+            f"— using default {default!r}"
+        )
+        return default
+    return value
+
+
+def generated_env_reference() -> str:
+    """Render the complete operator env template from field metadata."""
+
+    lines = [
+        "# Generated from HarnessConfig metadata; do not hand-edit.",
+        "# Set REPO and FIX_BOT before starting a daemon.",
+        "",
+    ]
+    for definition in fields(HarnessConfig):
+        metadata = definition.metadata
+        if not metadata:
+            continue
+        default = definition.default
+        if default is MISSING or default is None or isinstance(default, tuple):
+            rendered = ""
+        elif isinstance(default, bool):
+            rendered = "1" if default else "0"
+        elif isinstance(default, Enum):
+            rendered = str(default.value)
+        else:
+            rendered = str(default)
+        choices = metadata.get("choices")
+        suffix = (
+            "  # choices: " + "|".join(str(item) for item in choices)
+            if choices
+            else f"  # {metadata['coerce']}"
+        )
+        lines.append(
+            f"{metadata['env']}={json.dumps(rendered, ensure_ascii=False)}{suffix}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _metadata_value(
+    env: dict,
+    field_name: str,
+    errors: list[str],
+    *,
+    default: object = MISSING,
+) -> object:
+    """Parse one field entirely from its metadata definition."""
+
+    definition = _FIELD_DEFINITIONS[field_name]
+    fallback = definition.default if default is MISSING else default
+    coercion = str(definition.metadata["coerce"])
+    env_name = _env_name(field_name)
+    if coercion == "bool":
+        return _b(env, env_name, bool(fallback), errors)
+    if coercion == "int":
+        return _coerce_int(env, env_name, int(fallback), errors)
+    if coercion == "float":
+        return _coerce_float(env, env_name, float(fallback), errors)
+    if coercion == "choice":
+        return _metadata_choice(env, field_name, errors)
+    if coercion == "identity_mode":
+        return _coerce_identity_mode(env, errors)
+    if coercion == "effort":
+        return _effort(env, env_name, fallback, errors)
+    if coercion == "runtime":
+        allowed = frozenset(
+            RuntimeName(value) for value in definition.metadata["choices"]
+        )
+        return _runtime(env, env_name, fallback, allowed, errors)
+    if coercion == "review_mode":
+        raw = env.get(env_name)
+        if raw is None or not str(raw).strip():
+            return fallback
+        value = str(raw).strip().casefold()
+        choices = tuple(str(item) for item in definition.metadata["choices"])
+        if value not in choices:
+            errors.append(
+                f"{env_name} must be one of {list(choices)}, got {raw!r} "
+                f"— using default {getattr(fallback, 'value', fallback)!r}"
+            )
+            return fallback
+        return ReviewMode(value)
+    raw = env.get(env_name)
+    if raw is None:
+        return fallback
+    if coercion == "optional_string":
+        return str(raw) or None
+    if coercion == "stripped":
+        return str(raw).strip()
+    if coercion in {"string", "state_dir", "review_model"}:
+        return str(raw)
+    raise RuntimeError(
+        f"unsupported config coercion {coercion!r} for {field_name}"
+    )
 
 
 def _coerce_int(env: dict, key: str, default: int, errors: list[str]) -> int:
@@ -942,106 +1257,14 @@ def _coerce_float(env: dict, key: str, default: float, errors: list[str]) -> flo
     return value
 
 
-def _coerce_rate_table(
+def _coerce_rate_tables(
     env: dict, key: str, errors: list[str]
-) -> tuple[tuple[str, float, float], ...]:
-    """Parse per-model `IN/OUT[/CACHED_IN]` rates into an ordered table.
+) -> tuple[tuple[tuple[str, float, float], ...], tuple[tuple[str, float], ...]]:
+    """Parse normal and cached tiers in one pass so their entries cannot drift."""
 
-    Same contract as the other coercions: empty/absent is UNSET (an empty
-    table, i.e. "price everything with the scalar fallback"), and anything
-    malformed is dropped AND named in `errors`, so it surfaces through
-    `validation_errors()` instead of silently mispricing every run on this
-    runtime. Naming the offending entry matters more here than usual — a
-    typo'd model name is otherwise indistinguishable from a model the operator
-    genuinely did not want to override, and both read as "the fallback price",
-    which is the bug this knob exists to fix.
-
-    Rates must be finite and >= 0 for the same reason `_coerce_float` rejects
-    nan/inf: every downstream range check passes for nan, so a nan rate would
-    zero out the ledger and silently disarm both spend caps.
-
-    A model named twice keeps its FIRST entry (lookup scans in order) and the
-    duplicate is reported — "which of my two prices won?" should not be a
-    question an operator has to answer by reading the parser.
-    """
-    raw = env.get(key)
-    if raw is None or not raw.strip():
-        return ()
-    table: list[tuple[str, float, float]] = []
-    seen: set[str] = set()
-    for entry in raw.split(","):
-        entry = entry.strip()
-        if not entry:
-            continue
-        model, sep, rates = entry.partition("=")
-        model = model.strip().casefold()
-        components = [component.strip() for component in rates.split("/")]
-        if not (sep and model and len(components) in (2, 3)):
-            errors.append(
-                f"{key} entry {entry!r} must look like 'model=IN/OUT[/CACHED_IN]' "
-                f"(USD per million tokens) — ignoring it"
-            )
-            continue
-        try:
-            rate_in, rate_out = (float(component) for component in components[:2])
-            rate_cached_in = (
-                float(components[2]) if len(components) == 3 else rate_in / 10
-            )
-        except ValueError:
-            errors.append(
-                f"{key} entry {entry!r} has non-numeric rates — ignoring it"
-            )
-            continue
-        if not all(math.isfinite(r) and r >= 0 for r in (rate_in, rate_out, rate_cached_in)):
-            errors.append(
-                f"{key} entry {entry!r} must have finite, non-negative rates "
-                f"— ignoring it"
-            )
-            continue
-        # An EXPLICIT cache rate of 0 (or below) is rejected rather than stored:
-        # it would price every cache read free, and a cache-heavy leg reads as a
-        # fraction of its real cost, so MAX_BUDGET_USD stops bounding the run.
-        # Omit the component to take the list-price default instead.
-        if len(components) == 3 and rate_cached_in <= 0:
-            errors.append(
-                f"{key} entry {entry!r} must have a positive CACHED_IN rate "
-                f"(omit it for the list-price default) — ignoring it"
-            )
-            continue
-        if model in seen:
-            errors.append(f"{key} names {model!r} more than once — keeping the first")
-            continue
-        seen.add(model)
-        table.append((model, rate_in, rate_out))
-    return tuple(table)
-
-
-def _coerce_cached_rate_table(env: dict) -> tuple[tuple[str, float], ...]:
-    """Derive the cache tier from optional third per-model rate components."""
-    raw = env.get("CODEX_COST_PER_MTOK", "")
-    if not raw or not raw.strip():
-        return ()
-    rates: list[tuple[str, float]] = []
-    seen: set[str] = set()
-    for entry in raw.split(","):
-        model, sep, components_raw = entry.strip().partition("=")
-        components = [part.strip() for part in components_raw.split("/")]
-        if not (sep and model.strip() and len(components) in (2, 3)):
-            continue
-        try:
-            normal, out = (float(component) for component in components[:2])
-            cached = float(components[2]) if len(components) == 3 else normal / 10
-        except ValueError:
-            continue
-        # Mirror `_coerce_rate_table`'s rejections so the two tables cannot
-        # disagree about which entries exist.
-        if not all(math.isfinite(r) and r >= 0 for r in (normal, out, cached)):
-            continue
-        key = model.strip().casefold()
-        if key and key not in seen and cached > 0:
-            seen.add(key)
-            rates.append((key, cached))
-    return tuple(rates)
+    table, cached, parse_errors = parse_model_rate_table(env.get(key, ""))
+    errors.extend(f"{key} {error} — ignoring it" for error in parse_errors)
+    return table, cached
 
 
 def _coerce_identity_mode(env: dict, errors: list[str]) -> IdentityMode:
@@ -1149,22 +1372,7 @@ def _file_env(path: str, inherited: dict) -> dict[str, str] | None:
         # and let the caller keep the inherited environment.
         if not assigned:
             return None
-        proc = subprocess.run(
-            ["bash", "-c", 'set -a; . "$1"; set +a; env -0', "issue-agent-env", path],
-            env=dict(inherited),
-            check=True,
-            capture_output=True,
-            timeout=30,
-        )
-        out: dict[str, str] = {}
-        for item in proc.stdout.split(b"\0"):
-            if not item or b"=" not in item:
-                continue
-            key, value = item.split(b"=", 1)
-            name = key.decode(errors="replace")
-            if name in assigned:
-                out[name] = value.decode(errors="replace")
-        return out
+        return source_env_file(path, inherited, assigned_only=True)
     except Exception:  # noqa: BLE001 — config load must not die on a bad file
         return None
 
@@ -1203,203 +1411,59 @@ def _authoritative_env(e: dict) -> dict:
 
 
 def from_env(env: dict | None = None) -> HarnessConfig:
+    """Build one immutable snapshot from the metadata-backed config table."""
+
     e = _authoritative_env(env if env is not None else os.environ)
-    # Malformed-numeric fallbacks accumulate here and ride along on the config
-    # (HarnessConfig.parse_errors) so validation_errors() can report them —
-    # from_env itself must never traceback on operator input (review M2).
     errors: list[str] = []
-    repo = e.get("REPO", "")
-    reviewer_runtime = e.get("REVIEWER_RUNTIME", _dc_default("reviewer_runtime"))
-    # The Codex default model cannot be handed to the Claude SDK when an
-    # operator deliberately chooses the diversity posture. An explicit model
-    # always wins; only an omitted REVIEW_MODEL is runtime-specific.
-    review_model = e.get("REVIEW_MODEL") or (
-        "opus" if reviewer_runtime == "claude" else _dc_default("review_model")
-    )
-    return HarnessConfig(
-        repo=repo,
-        base_branch=e.get("BASE_BRANCH", _dc_default("base_branch")),
-        target_dir=e.get("TARGET_DIR", _dc_default("target_dir")),
-        identity_mode=_coerce_identity_mode(e, errors),
-        fix_bot=e.get("FIX_BOT", _dc_default("fix_bot")),
-        # Default to the shared GitHub App login so an operator only needs to
-        # supply the App credentials (GH_APP_*), not restate the bot name. Override
-        # per-repo/shared only if running a differently-named App.
-        review_bot=e.get("REVIEW_BOT", _dc_default("review_bot")),
-        steward_bot=e.get("STEWARD_BOT", _dc_default("steward_bot")),
-        # review M5/D7: default state dirs are now per-repo (see
-        # _default_state_dir) — an explicit env value (even if it happens to
-        # equal the computed default) always wins; only absent/empty falls
-        # through to the per-repo default.
-        state_dir=e.get("STATE_DIR") or _default_state_dir(repo, "issue-agent"),
-        review_state_dir=e.get("REVIEW_STATE_DIR") or _default_state_dir(repo, "review-agent"),
-        steward_state_dir=e.get("STEWARD_STATE_DIR") or _default_state_dir(repo, "steward-agent"),
-        worktree_root=e.get("WORKTREE_ROOT", _dc_default("worktree_root")),
-        poll_seconds=_coerce_int(e, "POLL_SECONDS", _dc_default("poll_seconds"), errors),
-        fix_dispatch_concurrency=_coerce_int(
+    special = {
+        "state_dir",
+        "review_state_dir",
+        "steward_state_dir",
+        "review_model",
+        "codex_cost_per_mtok",
+    }
+    values: dict[str, object] = {}
+    for definition in fields(HarnessConfig):
+        if not definition.metadata or definition.name in special:
+            continue
+        values[definition.name] = _metadata_value(
             e,
-            "FIX_DISPATCH_CONCURRENCY",
-            _dc_default("fix_dispatch_concurrency"),
+            definition.name,
             errors,
+            default=("" if definition.name == "repo" else MISSING),
+        )
+
+    repo = str(values["repo"])
+    reviewer_runtime = values["reviewer_runtime"]
+    if not isinstance(reviewer_runtime, RuntimeName):
+        raise RuntimeError("reviewer runtime metadata did not produce RuntimeName")
+
+    values.update(
+        state_dir=(
+            str(_metadata_value(e, "state_dir", errors))
+            or _default_state_dir(repo, "issue-agent")
         ),
-        webhook_wake=_b(e, "WEBHOOK_WAKE", _dc_default("webhook_wake"), errors),
-        reconcile_seconds=_coerce_int(
-            e, "RECONCILE_SECONDS", _dc_default("reconcile_seconds"), errors
+        review_state_dir=(
+            str(_metadata_value(e, "review_state_dir", errors))
+            or _default_state_dir(repo, "review-agent")
         ),
-        arm_on_open=e.get("ARM_ON_OPEN", _dc_default("arm_on_open")),
-        world_probe=_b(e, "WORLD_PROBE", _dc_default("world_probe"), errors),
-        world_probe_ttl_seconds=_coerce_int(
-            e, "WORLD_PROBE_TTL_SECONDS", _dc_default("world_probe_ttl_seconds"), errors
+        steward_state_dir=(
+            str(_metadata_value(e, "steward_state_dir", errors))
+            or _default_state_dir(repo, "steward-agent")
         ),
-        auto_merge=_b(e, "AUTO_MERGE", _dc_default("auto_merge"), errors),
-        merge_method=e.get("MERGE_METHOD", _dc_default("merge_method")),
-        ci_ignore_checks=e.get("CI_IGNORE_CHECKS", _dc_default("ci_ignore_checks")),
-        ci_pending_max_seconds=_coerce_int(
-            e, "CI_PENDING_MAX_SECONDS", _dc_default("ci_pending_max_seconds"), errors
+        review_model=(
+            str(e.get(_env_name("review_model")) or "")
+            or (
+                "opus"
+                if reviewer_runtime is RuntimeName.CLAUDE
+                else _dc_default("review_model")
+            )
         ),
-        duplicate_pr_guard=_b(
-            e, "DUPLICATE_PR_GUARD", _dc_default("duplicate_pr_guard"), errors
-        ),
-        ci_free_rerun=_b(e, "CI_FREE_RERUN", _dc_default("ci_free_rerun"), errors),
-        close_issue_on_merge=_b(e, "CLOSE_ISSUE_ON_MERGE", _dc_default("close_issue_on_merge"), errors),
-        auto_rebase_conflicts=_b(e, "AUTO_REBASE_CONFLICTS", _dc_default("auto_rebase_conflicts"), errors),
-        max_rebase_retries=_coerce_int(e, "MAX_REBASE_RETRIES", _dc_default("max_rebase_retries"), errors),
-        max_resolve_retries=_coerce_int(
-            e, "MAX_RESOLVE_RETRIES", _dc_default("max_resolve_retries"), errors
-        ),
-        max_ci_retries=_coerce_int(e, "MAX_CI_RETRIES", _dc_default("max_ci_retries"), errors),
-        max_infra_deaths=_coerce_int(e, "MAX_INFRA_DEATHS", _dc_default("max_infra_deaths"), errors),
-        max_unproductive_review_rounds=_coerce_int(
-            e, "MAX_UNPRODUCTIVE_REVIEW_ROUNDS",
-            _dc_default("max_unproductive_review_rounds"), errors,
-        ),
-        max_review_rejections=_coerce_int(
-            e, "REVIEW_MAX_REJECTIONS", _dc_default("max_review_rejections"), errors
-        ),
-        max_review_retries=_coerce_int(
-            e, "MAX_REVIEW_RETRIES", _dc_default("max_review_retries"), errors
-        ),
-        review_trigger_label=e.get("REVIEW_TRIGGER_LABEL", _dc_default("review_trigger_label")),
-        fix_model=e.get("FIX_MODEL") or _dc_default("fix_model"),
-        fix_effort=_effort(e, "FIX_EFFORT", _dc_default("fix_effort"), errors),
-        escalate_on_evidence=_b(
-            e, "ESCALATE_ON_EVIDENCE", _dc_default("escalate_on_evidence"), errors
-        ),
-        review_model=review_model,
-        steward_triage_model=e.get("STEWARD_TRIAGE_MODEL", _dc_default("steward_triage_model"))
-        or None,
-        fix_budget_usd=_coerce_float(e, "MAX_BUDGET_USD", _dc_default("fix_budget_usd"), errors),
-        review_budget_usd=_coerce_float(
-            e, "REVIEW_BUDGET_USD", _dc_default("review_budget_usd"), errors
-        ),
-        triage_budget_usd=_coerce_float(
-            e, "STEWARD_TRIAGE_BUDGET_USD", _dc_default("triage_budget_usd"), errors
-        ),
-        review_mode=ReviewMode.from_env(
-            e.get("REVIEW_MODE", ""), _b(e, "REVIEW_MULTI_AGENT", False, errors)
-        ),
-        # Operator REVIEW_PROMPT override, if any (wins wholesale). Blank/unset →
-        # "", and main.py loads the default from plugin/REVIEW_PROMPT.md (kept out
-        # of this pure dict→config mapping, like agent_md). A whitespace-only value
-        # is treated as unset so it can't strip the reviewer's whole rubric.
-        review_prompt=(e.get("REVIEW_PROMPT") or "").strip(),
-        review_adopt_unlabeled=_b(
-            e, "REVIEW_ADOPT_UNLABELED", _dc_default("review_adopt_unlabeled"), errors
-        ),
-        review_gate_model=e.get("REVIEW_GATE_MODEL", _dc_default("review_gate_model")) or None,
-        review_validation_model=(
-            e.get("REVIEW_VALIDATION_MODEL", _dc_default("review_validation_model")) or None
-        ),
-        review_scout_model=e.get("REVIEW_SCOUT_MODEL", _dc_default("review_scout_model")) or None,
-        review_gate_budget_usd=_coerce_float(
-            e, "REVIEW_GATE_BUDGET_USD", _dc_default("review_gate_budget_usd"), errors
-        ),
-        review_dimension_budget_usd=_coerce_float(
-            e, "REVIEW_DIMENSION_BUDGET_USD", _dc_default("review_dimension_budget_usd"), errors
-        ),
-        review_validation_budget_usd=_coerce_float(
-            e, "REVIEW_VALIDATION_BUDGET_USD", _dc_default("review_validation_budget_usd"), errors
-        ),
-        steward_triage=_b(e, "STEWARD_TRIAGE", _dc_default("steward_triage"), errors),
-        steward_groom=_b(e, "STEWARD_GROOM", _dc_default("steward_groom"), errors),
-        steward_groom_edit=_b(e, "STEWARD_GROOM_EDIT", _dc_default("steward_groom_edit"), errors),
-        steward_promote=_b(e, "STEWARD_PROMOTE", _dc_default("steward_promote"), errors),
-        steward_owner=e.get("STEWARD_OWNER", _dc_default("steward_owner")),
-        edit_check_cmd=e.get("EDIT_CHECK_CMD", _dc_default("edit_check_cmd")),
-        author_tests_split=_b(e, "AUTHOR_TESTS_SPLIT", _dc_default("author_tests_split"), errors),
-        max_contract_rounds=_coerce_int(
-            e, "MAX_CONTRACT_ROUNDS", _dc_default("max_contract_rounds"), errors
-        ),
-        fix_mcp_config=e.get("FIX_MCP_CONFIG", _dc_default("fix_mcp_config")),
-        harness_root=e.get("HARNESS_ROOT_DIR", _dc_default("harness_root")),
-        jira_sync=_b(e, "JIRA_SYNC", _dc_default("jira_sync"), errors),
-        jira_project_key=e.get("JIRA_PROJECT_KEY", _dc_default("jira_project_key")),
-        jira_cloud_id=e.get("JIRA_CLOUD_ID", _dc_default("jira_cloud_id")),
-        jira_mcp_config=e.get("JIRA_MCP_CONFIG", _dc_default("jira_mcp_config")),
-        jira_mcp_tools=e.get("JIRA_MCP_TOOLS", _dc_default("jira_mcp_tools")),
-        jira_budget_usd=_coerce_float(e, "JIRA_SYNC_BUDGET_USD", _dc_default("jira_budget_usd"), errors),
-        fixer_runtime=e.get("FIXER_RUNTIME", _dc_default("fixer_runtime")),
-        reviewer_runtime=reviewer_runtime,
-        codex_bin=e.get("CODEX_BIN", _dc_default("codex_bin")),
-        codex_model=e.get("CODEX_MODEL", _dc_default("codex_model")),
-        codex_provider_id=e.get("CODEX_PROVIDER_ID", _dc_default("codex_provider_id")),
-        codex_provider_name=e.get("CODEX_PROVIDER_NAME", _dc_default("codex_provider_name")),
-        codex_base_url=e.get("CODEX_BASE_URL", _dc_default("codex_base_url")),
-        codex_env_key=e.get("CODEX_ENV_KEY", _dc_default("codex_env_key")),
-        codex_wire_api=e.get("CODEX_WIRE_API", _dc_default("codex_wire_api")),
-        codex_sandbox=e.get("CODEX_SANDBOX", _dc_default("codex_sandbox")),
-        codex_reasoning_effort=e.get(
-            "CODEX_REASONING_EFFORT", _dc_default("codex_reasoning_effort")
-        ),
-        glm_settings_file=e.get("GLM_SETTINGS_FILE", _dc_default("glm_settings_file")),
-        agent_idle_timeout=_coerce_float(
-            e, "AGENT_IDLE_TIMEOUT_SECONDS", _dc_default("agent_idle_timeout"), errors
-        ),
-        agent_max_runtime=_coerce_float(
-            e, "AGENT_MAX_RUNTIME_SECONDS", _dc_default("agent_max_runtime"), errors
-        ),
-        sdk_max_buffer_bytes=_coerce_int(
-            e, "SDK_MAX_BUFFER_BYTES", _dc_default("sdk_max_buffer_bytes"), errors
-        ),
-        codex_transport_retries=_coerce_int(
-            e, "CODEX_TRANSPORT_RETRIES", _dc_default("codex_transport_retries"), errors
-        ),
-        codex_backoff_base=_coerce_float(
-            e, "CODEX_BACKOFF_BASE_SECONDS", _dc_default("codex_backoff_base"), errors
-        ),
-        codex_rate_limit_backoff_base=_coerce_float(
-            e,
-            "CODEX_RATE_LIMIT_BACKOFF_BASE_SECONDS",
-            _dc_default("codex_rate_limit_backoff_base"),
-            errors,
-        ),
-        codex_max_rate_limit_wait=_coerce_float(
-            e, "CODEX_MAX_RATE_LIMIT_WAIT_SECONDS", _dc_default("codex_max_rate_limit_wait"), errors
-        ),
-        codex_max_rate_limit_retries=_coerce_int(
-            e, "CODEX_MAX_RATE_LIMIT_RETRIES", _dc_default("codex_max_rate_limit_retries"), errors
-        ),
-        codex_cost_per_mtok_in=_coerce_float(
-            e, "CODEX_COST_PER_MTOK_IN", _dc_default("codex_cost_per_mtok_in"), errors
-        ),
-        codex_cost_per_mtok_out=_coerce_float(
-            e, "CODEX_COST_PER_MTOK_OUT", _dc_default("codex_cost_per_mtok_out"), errors
-        ),
-        codex_cost_per_mtok=_coerce_rate_table(e, "CODEX_COST_PER_MTOK", errors),
-        codex_cost_per_mtok_cached_in=_coerce_cached_rate_table(e),
-        codex_enforce_budget=_b(
-            e, "CODEX_ENFORCE_BUDGET", _dc_default("codex_enforce_budget"), errors
-        ),
-        issue_spend_cap_usd=_coerce_float(
-            e, "ISSUE_SPEND_CAP_USD", _dc_default("issue_spend_cap_usd"), errors
-        ),
-        daily_spend_cap_usd=_coerce_float(
-            e, "DAILY_SPEND_CAP_USD", _dc_default("daily_spend_cap_usd"), errors
-        ),
-        global_daily_spend_cap_usd=_coerce_float(
-            e, "GLOBAL_DAILY_SPEND_CAP_USD",
-            _dc_default("global_daily_spend_cap_usd"), errors,
-        ),
-        alert_cmd=e.get("ALERT_CMD", _dc_default("alert_cmd")),
-        parse_errors=tuple(errors),
     )
+    rates, cached_rates = _coerce_rate_tables(
+        e, _env_name("codex_cost_per_mtok"), errors
+    )
+    values["codex_cost_per_mtok"] = rates
+    values["codex_cost_per_mtok_cached_in"] = cached_rates
+    values["parse_errors"] = tuple(errors)
+    return HarnessConfig(**values)

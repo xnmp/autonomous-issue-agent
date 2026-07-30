@@ -461,7 +461,10 @@ operator mistakes — recorded so they aren't re-diagnosed as bugs.
 - 10+ subagent attempts failed — the file is outside the sandboxed working dir. By design; operator must edit it outside the session.
 
 **87. Marker files in `.claude/` — Claude Code refuses to write sensitive paths**
-- State markers (`.ac-posted`, `.adversarial-verdict`) under `.claude/` couldn't be written even under broad allow-lists → gate unpassable. Moved markers to `.harness/`. (Design fix, but rooted in a by-design permission rule.)
+- State markers (`.ac-posted`, `.adversarial-verdict`) under `.claude/` couldn't
+  be written even under broad allow-lists → gate unpassable. They were first
+  moved to `.harness/`, then retired as authorization evidence because the
+  gated agent could self-author them.
 
 **88. Gate never armed — `.claude/` untracked, not copied into worktrees**
 - `git worktree add` only materializes *tracked* files; the target's untracked `.claude/` (settings, hooks, dispatch) was absent in every worktree → governor + gates silently no-op. Fixed by arming via `--settings` with an absolute path to the harness's own dispatch, and ultimately by in-process injection.
@@ -595,6 +598,17 @@ operator mistakes — recorded so they aren't re-diagnosed as bugs.
   `WORKTREE_ROOT`, preserving isolation from local edits while matching the
   dependency-resolution environment used by issue worktrees.
 
+**112. Late `asyncio.subprocess.Process.wait()` slept after the child was reaped**
+- After stdout/stderr EOF, a late `Process.wait()` could attach its future while
+  the CPython subprocess transport was finalizing. The child watcher had already
+  reaped the process and set `returncode`, but the late future was never woken;
+  every affected Codex attempt paid the full 10-second reap timeout. It made the
+  silent-generation budget-kill timing sentinel fail only after another
+  subprocess test had run. FIXED 2026-07-30: teardown observes the child
+  watcher's authoritative `returncode` with a bounded async poll after the two
+  pipes are drained. The existing silent-generation test is retained as the
+  behavioral regression: a budget crossing must return in under two seconds.
+
 ---
 
 _Generated from transcript mining, 2026-07-21. ~103 distinct entries after
@@ -604,4 +618,5 @@ docs/IMPROVEMENT-PLAN.md). #107–#110 added 2026-07-26 from the two adversarial
 reviews (docs/REVIEW-2026-07-25-adversarial.md,
 docs/REVIEW-2026-07-26-p0-rereview.md) — the first three are new failure
 CLASSES, not instances; #110 is about the remediation process itself. #111
-added 2026-07-28 from the seventh tauri-explorer deployment._
+added 2026-07-28 from the seventh tauri-explorer deployment. #112 added
+2026-07-30 during the architectural hardening full-suite gate._

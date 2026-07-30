@@ -2,7 +2,7 @@
 
 These are the contract between each agent and the harness (the decision is read
 from structured_output, never prose). Kept as plain dicts so they pass straight
-into AgentTask.schema → ClaudeAgentOptions.output_format.
+into RuntimePlan.schema → ClaudeAgentOptions.output_format.
 """
 
 from __future__ import annotations
@@ -90,7 +90,7 @@ REVIEW_SCHEMA: dict = {
     "required": ["decision", "body"],
 }
 
-# ── multi-agent review (REVIEW_MULTI_AGENT) ──────────────────────────────────
+# ── multi-agent review (REVIEW_MODE=multi) ───────────────────────────────────
 # The /code-review pattern ported as dispatcher-level orchestration: a cheap
 # skip-gate, N parallel dimension specialists that each emit raw candidate
 # findings, a per-finding adversarial validator, then a PURE synthesis into the

@@ -14,6 +14,7 @@ dependencies = []
 # to find the sibling plugin/ + config/ trees — a plain wheel omits them.
 [project.scripts]
 issue-agent = "issue_agent.app.cli:main"
+issue-agent-publish = "issue_agent.adapters.agent_publish:main"
 
 # The adapter layer (Phase 2+) imports the Claude Agent SDK. Kept as an optional
 # extra so the domain layer + its tests stay installable with zero third-party deps.
@@ -60,13 +61,19 @@ testpaths = ["tests/domain", "tests/adapters", "tests/app"]
 python_files = ["test_*.py"]
 addopts = "-q"
 
+[tool.pyrefly]
+preset = "basic"
+project-includes = ["src", "tests"]
+search-path = [".", "src", "tests/domain", "tests/adapters", "tests/app"]
+ignore-missing-imports = ["fastapi", "fastapi.*", "uvicorn"]
+
 # ── Architectural linting (import-linter) ─────────────────────────────────────
 # Enforces the hexagonal layering the design depends on: the domain is pure
 # (no adapters, no app, no SDK), and dependencies only ever point downward
 # (app → adapters → domain). A violation here is a design regression, not a
 # style nit — `make arch` (in `make test`) fails the build on it.
 [tool.importlinter]
-root_package = "issue_agent"
+root_packages = ["issue_agent", "plugin"]
 # Required so the "forbidden" contract can reason about imports of external
 # packages (claude_agent_sdk / openai) leaving the domain layer.
 include_external_packages = true
@@ -90,6 +97,28 @@ forbidden_modules = [
     "claude_agent_sdk",
     "openai",
 ]
+
+[[tool.importlinter.contracts]]
+name = "Plugin hooks depend only on the domain core"
+type = "forbidden"
+source_modules = ["plugin"]
+forbidden_modules = [
+    "issue_agent.adapters",
+    "issue_agent.app",
+]
+
+[[tool.importlinter.contracts]]
+name = "Daemon modules do not depend on the optional web stack"
+type = "forbidden"
+source_modules = [
+    "issue_agent.app.main",
+    "issue_agent.app.loop",
+    "issue_agent.app.roles",
+    "issue_agent.app.dispatch",
+    "issue_agent.app.execute",
+    "issue_agent.app.workflows",
+]
+forbidden_modules = ["fastapi", "uvicorn"]
 
 [dependency-groups]
 dev = [

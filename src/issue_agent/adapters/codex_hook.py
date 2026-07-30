@@ -18,20 +18,43 @@ from __future__ import annotations
 import os
 import stat
 import json
+import hashlib
 import subprocess
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
+
+from .runtime_plan import AgentRuntime, RuntimePlan
+from ..domain.outcome import AgentResult
 
 # Absolute path to the shared governor (…/src/issue_agent/adapters → repo root).
 _HARNESS_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
 GOVERNOR_PATH = os.path.join(_HARNESS_ROOT, "plugin", "hooks", "bash_governor.py")
+EDIT_CHECK_PATH = os.path.join(_HARNESS_ROOT, "plugin", "hooks", "edit_check.sh")
 REPOSITORY_INSTRUCTIONS_MAX_BYTES = 32 * 1024
 _REPOSITORY_INSTRUCTIONS_HEADING = "\n\n# Repository instructions (CLAUDE.md)\n"
 _AGENTS_INSTRUCTIONS_HEADING = "\n\n# Repository instructions (AGENTS.md)\n\n"
 _GENERATED_INSTRUCTIONS_START = "<!-- issue-agent generated instructions: start -->"
 _GENERATED_INSTRUCTIONS_END = "<!-- issue-agent generated instructions: end -->"
+
+
+def evidence_receipt_path(state_dir: str, cwd: str) -> str:
+    """Harness-owned screenshot-read receipt for one exact worktree."""
+
+    resolved = os.path.realpath(cwd)
+    key = Path(resolved).name + "-" + hashlib.sha256(
+        resolved.encode()
+    ).hexdigest()[:12]
+    return os.path.join(state_dir, "evidence", key, "screenshots-read")
+
+
+def _hook_key(cwd: str) -> str:
+    resolved = os.path.realpath(cwd)
+    return Path(resolved).name + "-" + hashlib.sha256(
+        resolved.encode()
+    ).hexdigest()[:12]
 
 
 def _repository_instructions(
@@ -105,16 +128,19 @@ def _without_generated_instructions(content: str) -> str:
     return content[:start] + suffix.removeprefix("\n")
 
 
-def _gov_script(governor_path: str, review_only: bool = False) -> str:
-    # Mirrors plugin/hooks/dispatch.sh: fail OPEN if uv is missing (the PR gate +
-    # CI + reviewer are the real boundary), else pipe stdin into the governor.
+def _gov_script(
+    governor_path: str,
+    screenshots_receipt: str,
+    review_only: bool = False,
+) -> str:
     return f"""#!/usr/bin/env bash
 # Codex PreToolUse hook → harness governor (auto-generated; do not edit).
 if ! command -v uv >/dev/null 2>&1; then
-  echo "bash_governor: uv not found; allowing (gate degraded)" >&2
-  exit 0
+  echo "bash_governor: uv not found; refusing ungoverned command" >&2
+  exit 2
 fi
 {('export ISSUE_AGENT_REVIEW_READ_ONLY=1' if review_only else '')}
+export HARNESS_SCREENSHOTS_READ={json.dumps(screenshots_receipt)}
 exec uv run --quiet "{governor_path}"
 """
 
@@ -162,7 +188,8 @@ timeout = 120
     return toml
 
 
-_READ_RECORD_SCRIPT = r"""#!/usr/bin/env bash
+def _read_record_script(marker_path: str) -> str:
+    return r"""#!/usr/bin/env bash
 # Codex PostToolUse(Read) hook → record evidence screenshots the agent looked at.
 # Observe-only: always exit 0.
 set -uo pipefail
@@ -183,25 +210,18 @@ case "$low" in
   *evidence/*.png|*evidence/*.jpg|*evidence/*.jpeg|*evidence/*.gif|*evidence/*.webp) ;;
   *) exit 0 ;;
 esac
-mkdir -p "$cwd/.harness" 2>/dev/null || exit 0
-printf '%s\n' "$(basename "$fp")" >> "$cwd/.harness/screenshots-read" 2>/dev/null || exit 0
+marker=""" + json.dumps(marker_path) + r"""
+mkdir -p "$(dirname "$marker")" 2>/dev/null || exit 0
+printf '%s\n' "$(basename "$fp")" >> "$marker" 2>/dev/null || exit 0
 exit 0
 """
 
 
 def _edit_check_script(edit_check_cmd: str) -> str:
-    # Runs the project's fast check; exit 2 + stderr on failure feeds the error
-    # back to the model (Codex block contract). Fail OPEN if the command is unset.
     return f"""#!/usr/bin/env bash
 # Codex PostToolUse hook → edit-time check (auto-generated; do not edit).
-out=$({edit_check_cmd} 2>&1)
-rc=$?
-if [ "$rc" -ne 0 ]; then
-  echo "Edit check failed ({edit_check_cmd}):" >&2
-  echo "$out" >&2
-  exit 2
-fi
-exit 0
+export EDIT_CHECK_CMD={json.dumps(edit_check_cmd)}
+exec {json.dumps(EDIT_CHECK_PATH)}
 """
 
 
@@ -210,6 +230,7 @@ def write_hook_config(
     edit_check_cmd: str = "",
     review_only: bool = False,
     log: Callable[[str], None] | None = None,
+    state_dir: str = "",
 ) -> str:
     """Emit `<cwd>/.codex/config.toml` + `.codex/hooks/gov.sh` so a `codex exec`
     run in `cwd` enforces the governor on every Bash call. When `agents_md` is
@@ -220,13 +241,17 @@ def write_hook_config(
 
     NOTE: AGENTS.override.md lands inside the worktree and is locally excluded;
     a target's tracked AGENTS.md remains byte-for-byte untouched."""
-    codex_dir = os.path.join(cwd, ".codex")
+    if not state_dir:
+        raise OSError("STATE_DIR is required for Codex hook containment")
+    key = _hook_key(cwd)
+    screenshots_receipt = evidence_receipt_path(state_dir, cwd)
+    codex_dir = os.path.join(state_dir, "codex-hooks", key)
     hooks_dir = os.path.join(codex_dir, "hooks")
     os.makedirs(hooks_dir, exist_ok=True)
 
     gov_script_path = os.path.join(hooks_dir, "gov.sh")
     with open(gov_script_path, "w") as f:
-        f.write(_gov_script(governor_path, review_only))
+        f.write(_gov_script(governor_path, screenshots_receipt, review_only))
     os.chmod(
         gov_script_path,
         os.stat(gov_script_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH,
@@ -234,7 +259,11 @@ def write_hook_config(
 
     read_record_script_path = os.path.join(hooks_dir, "read_record.sh")
     with open(read_record_script_path, "w") as f:
-        f.write(_READ_RECORD_SCRIPT)
+        f.write(
+            _read_record_script(
+                screenshots_receipt
+            )
+        )
     os.chmod(
         read_record_script_path,
         os.stat(read_record_script_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH,
@@ -250,28 +279,15 @@ def write_hook_config(
             os.stat(edit_check_script_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH,
         )
 
-    agents_path = os.path.join(cwd, "AGENTS.override.md")
     target_agents_path = Path(cwd) / "AGENTS.md"
     try:
         target_agents = target_agents_path.read_text()
     except FileNotFoundError:
         target_agents = ""
-    try:
-        existing = Path(agents_path).read_text()
-    except FileNotFoundError:
-        existing = ""
-    target_instructions = _without_generated_instructions(existing)
     generated = agents_md
     if target_agents:
         generated += _AGENTS_INSTRUCTIONS_HEADING + target_agents
-    separator = "" if not target_instructions or target_instructions.endswith("\n") else "\n"
-    fixed = (
-        target_instructions + separator
-        + _GENERATED_INSTRUCTIONS_START + "\n"
-        + generated
-        + _REPOSITORY_INSTRUCTIONS_HEADING
-        + "\n" + _GENERATED_INSTRUCTIONS_END + "\n"
-    )
+    fixed = generated + _REPOSITORY_INSTRUCTIONS_HEADING
     repository_instructions, truncated = _repository_instructions(
         cwd,
         max_bytes=max(
@@ -280,24 +296,7 @@ def write_hook_config(
     )
     if repository_instructions:
         generated += _REPOSITORY_INSTRUCTIONS_HEADING + repository_instructions
-    tracked_override = subprocess.run(
-        [
-            "git", "-C", cwd, "ls-files", "--error-unmatch",
-            "AGENTS.override.md",
-        ],
-        capture_output=True,
-        check=False,
-    ).returncode == 0
-    developer_instructions = generated if tracked_override else ""
-    if (agents_md or target_agents or repository_instructions) and not tracked_override:
-        with open(agents_path, "w") as f:
-            f.write(target_instructions)
-            f.write(separator)
-            f.write(f"{_GENERATED_INSTRUCTIONS_START}\n")
-            f.write(generated)
-            if generated and not generated.endswith("\n"):
-                f.write("\n")
-            f.write(f"{_GENERATED_INSTRUCTIONS_END}\n")
+    developer_instructions = generated
     config_path = os.path.join(codex_dir, "config.toml")
     with open(config_path, "w") as f:
         f.write(_config_toml(
@@ -314,3 +313,25 @@ def write_hook_config(
         )
         (log or print)(message)
     return config_path
+
+
+class HookPreparingRuntime(AgentRuntime):
+    """Install immutable hook configuration outside the target worktree."""
+
+    def __init__(
+        self,
+        inner: AgentRuntime,
+        prepare: Callable[[str], str],
+    ):
+        self.inner = inner
+        self.prepare = prepare
+
+    async def run(self, task: RuntimePlan) -> AgentResult:
+        if not task.cwd:
+            raise RuntimeError("Codex containment requires an explicit cwd")
+        config_path = self.prepare(task.cwd)
+        prepared = replace(
+            task,
+            env={**task.env, "CODEX_HOME": os.path.dirname(config_path)},
+        )
+        return await self.inner.run(prepared)

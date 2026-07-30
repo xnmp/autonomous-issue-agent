@@ -6,9 +6,9 @@ with one typed surface. Two state roots:
   * STATE_DIR (per-issue / per-PR daemon state): session ids, resume / ci /
     review retry counters, the resumed-at reply mark, the automerge marker.
     These feed FixState / ReviewState / TriageState in the domain.
-  * worktree `.harness/` (the agent's own on-disk declaration the gate reads):
-    ac-posted, test-plan-posted, test-cmd, adversarial-verdict. The agent writes
-    these via Bash; the gate (and the GateContext builder) reads them.
+  * worktree `.harness/` (non-authoritative agent declarations): visual-ac,
+    visual-ac and test-cmd. Claims can schedule verification or select
+    a command, but never supply an authorization verdict.
 
 Path construction is pure (testable without touching disk); the read/write
 helpers are thin. Mirrors cleanup.sh's state-file set so teardown stays in sync.
@@ -644,10 +644,13 @@ class Store:
             self.clear_issue_resume_state(issue_key)
 
 
-# ── worktree .harness/ markers (the agent's on-disk declaration) ──────────────
+# ── worktree .harness/ claims and local test command ──────────────────────────
 class HarnessMarkers:
-    """Reads the `.harness/` markers the agent writes in its worktree. Used by
-    the GateContext builder. `root` is the worktree path (cwd)."""
+    """Reads non-authoritative `.harness/` claims and the local test command.
+
+    Claims may schedule stricter verification but never prove a gate condition.
+    `root` is the worktree path (cwd).
+    """
 
     def __init__(self, root: str):
         self.dir = os.path.join(root, ".harness")
@@ -662,26 +665,10 @@ class HarnessMarkers:
         except (FileNotFoundError, OSError):
             return ""
 
-    def ac_posted(self) -> bool:
-        return os.path.exists(self._path("ac-posted"))
-
-    def test_plan_posted(self) -> bool:
-        return os.path.exists(self._path("test-plan-posted"))
-
-    def adversarial_verdict(self) -> str:
-        return self._read("adversarial-verdict").strip()
-
     def visual_ac(self) -> bool:
         """The agent declared a visual acceptance criterion (touched .harness/visual-ac),
         so the PR gate requires a committed + read screenshot."""
         return os.path.exists(self._path("visual-ac"))
-
-    def screenshots_read(self) -> tuple[str, ...]:
-        """Basenames of evidence screenshots the agent actually READ (recorded by the
-        PostToolUse(Read) hook, one per line in .harness/screenshots-read)."""
-        return tuple(
-            ln.strip() for ln in self._read("screenshots-read").splitlines() if ln.strip()
-        )
 
     def test_cmd(self) -> str | None:
         """First non-blank line of .harness/test-cmd (prc_resolve_test_cmd's

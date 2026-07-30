@@ -52,7 +52,7 @@ when visual evidence needs reviewer judgement. This is a deliberate documented
 limitation, not a signal to rubber-stamp or uniformly reject screenshots.
 
 This is a **second runtime adapter**, NOT an OpenAI-SDK rewrite. A fixer run is
-`AgentTask → AgentResult`; `AgentRunner` realises that over the Claude SDK, and a
+`RuntimePlan → AgentResult`; `AgentRunner` realises that over the Claude SDK, and a
 `CodexRunner` realises the *same interface* over `codex exec`. Everything above the
 runner (gate, lifecycle, dispatch, follow-up, governor) is unchanged.
 
@@ -83,10 +83,10 @@ All against `codex exec` 0.142.3 + GPT-5.5 via an OpenAI-compatible gateway
 
 ## The interface to satisfy
 
-`CodexRunner.run(task: AgentTask) -> AgentResult` (async), drop-in for `AgentRunner`.
-Map each `AgentTask` field to a `codex exec` flag:
+`CodexRunner.run(plan: RuntimePlan) -> AgentResult` (async), drop-in for `AgentRunner`.
+Map each `RuntimePlan` field to a `codex exec` flag:
 
-| AgentTask field | codex exec |
+| RuntimePlan field | codex exec |
 |---|---|
 | `prompt` | positional prompt arg (pass `</dev/null` on stdin to avoid the stdin-wait hang) |
 | `schema` | write to a temp file → `--output-schema <file>` (add ALL keys to `required`) |

@@ -1,6 +1,5 @@
 """Entry point — `python -m issue_agent.app.main <fix|review|steward>`.
 
-Replaces `make run-fix` / `run-review` / `run-steward` (agent/watcher.sh etc.).
 Builds the identity (fixer = ambient/PAT; review+steward = GitHub App token), the
 adapters, the governor hook, and runs the chosen role's daemon forever.
 """
@@ -9,21 +8,35 @@ from __future__ import annotations
 
 import dataclasses
 import os
-import subprocess
+import signal
 import sys
 import time
 from collections.abc import Callable
 
 from ..adapters.agent_runner import AgentRunner
+from ..adapters.control_store import (
+    CorruptControlStore,
+    IncompatibleSchema,
+    LegacySpendMigrationError,
+)
+from ..adapters.env_file import source_env_file
 from ..adapters.app_token import AppCredentials, AppTokenMinter, default_mint_fn
-from ..adapters.github import GitHubGateway, Identity
+from ..adapters.codex_hook import evidence_receipt_path
+from ..adapters.github import GhUnavailable, GitHubGateway, Identity
 from ..adapters.governor import build_hooks
-from ..adapters.single_instance import AlreadyRunning, acquire
+from ..adapters.single_instance import AlreadyRunning, UnsafeLockFile, acquire
+from ..adapters.systemd_notify import SystemdNotifier
 from ..adapters.store import Store
 from ..adapters.worktree import Worktrees, build_gate_context
 from ..domain.world import WorldState, fix_probe_safe
+from ..domain.supervision import ExitCode
 from .config import HarnessConfig, describe_command, from_env, render_agent_md
-from .roles import build_fix_daemon, build_review_daemon, build_steward_daemon
+from .roles import (
+    build_fix_daemon,
+    build_review_daemon,
+    build_steward_daemon,
+    migrate_legacy_spend,
+)
 from .world_probe import WorldProbe
 
 
@@ -39,33 +52,38 @@ def _load_agent_env(env: dict) -> dict:
     path = env.get("AGENT_ENV", "")
     if not path:
         return env
-    try:
-        proc = subprocess.run(
-            [
-                "bash",
-                "-c",
-                'set -a; source "$1"; set +a; env -0',
-                "issue-agent-env",
-                path,
-            ],
-            env=env,
-            check=True,
-            capture_output=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as exc:
-        raise ValueError(f"could not load AGENT_ENV {path!r}: {exc}") from exc
-
-    loaded = env.copy()
-    for item in proc.stdout.split(b"\0"):
-        if not item or b"=" not in item:
-            continue
-        key, value = item.split(b"=", 1)
-        loaded[key.decode()] = value.decode()
+    loaded = source_env_file(path, env)
     loaded["AGENT_ENV"] = path
     return loaded
 
 
-def _app_identity(cfg_env: dict, warn: Callable[[str], None] = lambda _m: None) -> Identity:
+def _ignore_log(_message: str) -> None:
+    pass
+
+
+def _validate_reload_candidate(env: dict[str, str]) -> None:
+    candidate = from_env(_load_agent_env(env))
+    candidate.validate()
+
+
+class _TerminationHandler:
+    """First SIGTERM requests orderly drain; a second forces boot recovery."""
+
+    def __init__(self, hard_exit: Callable[[int], None] = os._exit):
+        self._hard_exit = hard_exit
+        self._requested = False
+
+    def __call__(self, _signum, _frame) -> None:
+        if self._requested:
+            self._hard_exit(int(ExitCode.TRANSIENT))
+            return
+        self._requested = True
+        raise SystemExit(ExitCode.CLEAN)
+
+
+def _app_identity(
+    cfg_env: dict, warn: Callable[[str], None] = _ignore_log
+) -> Identity:
     """review/steward identity: GitHub App installation token if configured AND
     USABLE, else a static bot token, else ambient. Mirrors gh_review/gh_steward
     priority.
@@ -177,6 +195,21 @@ def build_role(role: str, env: dict | None = None):
     )
 
     target_dir = cfg.target_dir or os.getcwd()
+    runner_state_dir = {
+        "fix": cfg.state_dir,
+        "review": cfg.review_state_dir,
+        "steward": cfg.steward_state_dir,
+    }[role]
+    state_dir = runner_state_dir
+    if state_dir:
+        from ..adapters.process_supervisor import ProcessSupervisor
+
+        recovered = ProcessSupervisor(state_dir).recover_orphans()
+        if recovered:
+            sys.stderr.write(
+                f"{role}: recovered {len(recovered)} orphaned process group(s) "
+                "before adapter initialization\n"
+            )
 
     # Resolved-config print (lean P5.1): every daemon start states what it
     # ACTUALLY loaded — the only structural defense against the silent-default
@@ -206,6 +239,10 @@ def build_role(role: str, env: dict | None = None):
             # tests gate (check_tests) denies every pr-create/push. Mirrors the
             # bash checks' ALLOW_UNTESTED — an overlay fact, never agent-set.
             allow_untested=env.get("ALLOW_UNTESTED", "") == "1",
+            screenshots_read_path=evidence_receipt_path(
+                runner_state_dir, cwd
+            ),
+            durable_publish=True,
         )
 
     # Live per-commit breadcrumb (red:/green:/docs:) from inside the agent session,
@@ -220,17 +257,24 @@ def build_role(role: str, env: dict | None = None):
     # diagnosing. Boot logs whether it's active so the log is self-describing.
     debug = env.get("ISSUE_AGENT_DEBUG", "0") not in ("", "0", "false", "False")
     hooks = build_hooks(
-        build_ctx, edit_check_cmd=cfg.edit_check_cmd or None, log=_commit_log, debug=debug
+        build_ctx,
+        edit_check_cmd=cfg.edit_check_cmd or None,
+        log=_commit_log,
+        debug=debug,
+        trusted_state_dir=runner_state_dir,
     )
     _idle = cfg.agent_idle_timeout if cfg.agent_idle_timeout > 0 else None
     # Two independent caps: silence (idle) and total elapsed (wall). The wall cap is
     # what bounds a limping post-suspend stream, which never goes silent enough to
     # trip the idle watchdog. 0 on either knob disables that one only.
     _wall = cfg.agent_max_runtime if cfg.agent_max_runtime > 0 else None
+    from ..adapters.process_supervisor import ProcessSupervisor
+
     runner = AgentRunner(
         hooks=hooks, log=_commit_log, debug=debug,
         idle_timeout=_idle, max_runtime=_wall,
         max_buffer_size=cfg.sdk_max_buffer_bytes or None,
+        process_supervisor=ProcessSupervisor(runner_state_dir),
     )
     worktrees = Worktrees(target_dir, cfg.worktree_root, cfg.base_branch)
 
@@ -272,7 +316,15 @@ def build_role(role: str, env: dict | None = None):
         # (not in from_env) because it needs the gateway; a flip of the repo's
         # protection therefore takes effect at the next daemon restart.
         if cfg.arm_on_open != "0":
-            active = gw.merge_gate_protection(cfg.base_branch)
+            try:
+                active = gw.merge_gate_protection(cfg.base_branch)
+            except GhUnavailable as exc:
+                active = False
+                sys.stderr.write(
+                    f"{role}: arm-on-open inactive — branch protection could "
+                    f"not be verified ({exc}); auto-merge will wait for "
+                    "APPROVE + green CI\n"
+                )
             cfg = dataclasses.replace(cfg, arm_on_open_active=active)
             sys.stderr.write(
                 f"{role}: arm-on-open "
@@ -307,17 +359,23 @@ def build_role(role: str, env: dict | None = None):
 def main(argv: list[str] | None = None) -> None:
     argv = argv if argv is not None else sys.argv[1:]
     if not argv:
-        raise SystemExit("usage: python -m issue_agent.app.main <fix|review|steward>")
+        raise SystemExit(ExitCode.INVALID_CONFIG)
     role = argv[0]
     if role not in ("fix", "review", "steward"):
-        raise SystemExit(f"unknown role: {role!r} (use fix|review|steward)")
+        raise SystemExit(ExitCode.INVALID_CONFIG)
+
+    signal.signal(signal.SIGTERM, _TerminationHandler())
 
     # Single-instance guard: refuse to start a second daemon of the same (role,
     # repo). A duplicate would poll independently and double-dispatch (two fixers
     # both grab ai-ready), breaking the single-fixer invariant. flock auto-frees
     # on process death, so there's no stale-lock hazard. Held for the whole run
     # via `_lock` (the open fd IS the lock; GC/exit releases it).
-    env = _load_agent_env(dict(os.environ))
+    try:
+        env = _load_agent_env(dict(os.environ))
+    except ValueError as exc:
+        sys.stderr.write(f"{role}: invalid configuration — {exc}\n")
+        raise SystemExit(ExitCode.INVALID_CONFIG) from exc
     # review C5(b): export the composed config into THIS process's environment
     # before building anything. No adapter subprocess call passes `env=`
     # explicitly, so every shell-out downstream (bash gate checkers, git, gh,
@@ -334,11 +392,24 @@ def main(argv: list[str] | None = None) -> None:
     # overlay didn't touch.
     os.environ.update(env)
     repo = env.get("REPO", "")
+    state_dir_key = {
+        "fix": "STATE_DIR",
+        "review": "REVIEW_STATE_DIR",
+        "steward": "STEWARD_STATE_DIR",
+    }[role]
     try:
-        _lock = acquire(role, repo)  # noqa: F841 — kept alive for process lifetime
+        _lock = acquire(  # noqa: F841 — kept alive for process lifetime
+            role,
+            repo,
+            target_dir=env.get("TARGET_DIR", ""),
+            state_dir=env.get(state_dir_key, ""),
+        )
     except AlreadyRunning as e:
         sys.stderr.write(f"{role}: refusing to start — {e}\n")
-        raise SystemExit(3) from e
+        raise SystemExit(ExitCode.DUPLICATE_INSTANCE) from e
+    except (ValueError, UnsafeLockFile) as e:
+        sys.stderr.write(f"{role}: invalid deployment lock — {e}\n")
+        raise SystemExit(ExitCode.INVALID_CONFIG) from e
 
     # Record the proxy posture at boot so a "can't reach api.github.com" failure is
     # diagnosable from the role log alone (the daemon inherits the launching shell's
@@ -350,11 +421,45 @@ def main(argv: list[str] | None = None) -> None:
         f"NO_PROXY={env.get('NO_PROXY') or env.get('no_proxy') or '<unset>'} "
         f"DEBUG={'on' if _dbg else 'off'}\n"
     )
-    daemon = build_role(role, env)
+    try:
+        daemon = build_role(role, env)
+        cfg = from_env(env)
+        cfg.validate()
+        state_dir = {
+            "fix": cfg.state_dir,
+            "review": cfg.review_state_dir,
+            "steward": cfg.steward_state_dir,
+        }[role]
+        imported = migrate_legacy_spend(cfg, state_dir)
+        if imported:
+            sys.stderr.write(
+                f"{role}: imported {imported} legacy spend row(s) "
+                "before paid admission\n"
+            )
+    except IncompatibleSchema as exc:
+        sys.stderr.write(f"{role}: incompatible control-store schema — {exc}\n")
+        raise SystemExit(ExitCode.INCOMPATIBLE_SCHEMA) from exc
+    except CorruptControlStore as exc:
+        sys.stderr.write(f"{role}: corrupt control store — {exc}\n")
+        raise SystemExit(ExitCode.STORE_CORRUPTION) from exc
+    except LegacySpendMigrationError as exc:
+        sys.stderr.write(f"{role}: operator repair required — {exc}\n")
+        raise SystemExit(ExitCode.OPERATOR_REPAIR_REQUIRED) from exc
+    except ValueError as exc:
+        sys.stderr.write(f"{role}: invalid configuration — {exc}\n")
+        raise SystemExit(ExitCode.INVALID_CONFIG) from exc
+    notifier = SystemdNotifier(env)
+    notifier.ready(f"{role} daemon initialized")
     # ISSUE_AGENT_MAX_TICKS bounds the loop (the demo-gate / a one-shot run); unset
     # = run forever like the bash daemons.
     raw = env.get("ISSUE_AGENT_MAX_TICKS")
-    max_ticks = int(raw) if raw else None
+    try:
+        max_ticks = int(raw) if raw else None
+    except ValueError as exc:
+        sys.stderr.write(
+            f"{role}: invalid ISSUE_AGENT_MAX_TICKS={raw!r}\n"
+        )
+        raise SystemExit(ExitCode.INVALID_CONFIG) from exc
     # Hot reload (HOT_RELOAD=0 disables): a change to the harness's HEAD
     # commit (never a mid-edit save — commit-gated so partial changes cannot
     # load) or to the composed env file restarts this daemon through point-at's
@@ -370,12 +475,19 @@ def main(argv: list[str] | None = None) -> None:
         watch = ReloadWatch(
             harness_root,
             files=tuple(p for p in (os.environ.get("AGENT_ENV"),) if p),
+            validate=lambda: _validate_reload_candidate(dict(os.environ)),
         )
         reload_check = watch.changed
-    daemon.run_forever(
-        sleep=time.sleep, now=lambda: int(time.time()), max_ticks=max_ticks,
-        reload_check=reload_check,
-    )
+    try:
+        daemon.run_forever(
+            sleep=time.sleep, now=lambda: int(time.time()), max_ticks=max_ticks,
+            reload_check=reload_check,
+            scheduler_progress=lambda: notifier.progress(
+                f"{role} scheduler progressed"
+            ),
+        )
+    finally:
+        notifier.stopping(f"{role} daemon stopped")
 
 
 if __name__ == "__main__":

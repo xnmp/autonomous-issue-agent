@@ -13,11 +13,23 @@ from dataclasses import dataclass, replace
 from ...domain import review as review_dom
 from ..planners import tasks as task_builders
 from ..planners.tasks import ReviewTaskConfig
-from ...domain.agent_task import AgentRuntime
+from ...adapters.runtime_plan import AgentRuntime
+from ...domain.agent_task import (
+    RUNTIME_CAPABILITIES,
+    RuntimeCapabilities,
+    RuntimeName,
+)
 from ...domain.fix import breaker_key
 from ...domain.labels import Label
 from ...domain.lifecycle import pr_escalation
 from ...domain.outcome import AgentResult
+from ...domain.ports import (
+    ActionExecutor,
+    LegacyJournal,
+    WorkflowGitHubReads,
+    WorkflowState,
+)
+from .base import run_leg
 
 _EXTERNAL_REVIEW_SESSION = "github-review"
 _FRESH_REVIEW_SESSION = "codex-review"
@@ -31,25 +43,39 @@ class ReviewWorkflowConfig:
     review_bot: str
     review_trigger_label: str
     log: Callable[[str], None]
-    reviewer_runtime: str = "claude"
-    # Codex ignores AgentTask's SDK-only tool policy, so it must run only after
+    reviewer_runtime: RuntimeName = RuntimeName.CLAUDE
+    reviewer_capabilities: RuntimeCapabilities = RUNTIME_CAPABILITIES[
+        RuntimeName.CLAUDE
+    ]
+    # Codex ignores RuntimePlan's SDK-only tool policy, so it must run only after
     # its read-only governor is installed in this explicit checkout.  An empty
     # cwd is a containment failure, never permission to fall back to os.getcwd().
     execution_cwd: str = ""
     prepare_cwd: Callable[[str], None] | None = None
-    journal: object | None = None
+    journal: LegacyJournal | None = None
+
+    def __post_init__(self) -> None:
+        runtime = (
+            self.reviewer_runtime
+            if isinstance(self.reviewer_runtime, RuntimeName)
+            else RuntimeName(self.reviewer_runtime)
+        )
+        object.__setattr__(self, "reviewer_runtime", runtime)
+        object.__setattr__(
+            self, "reviewer_capabilities", RUNTIME_CAPABILITIES[runtime]
+        )
 
 
 @dataclass
 class ReviewWorkflow:
     cfg: ReviewWorkflowConfig
-    gateway: object
-    store: object
+    gateway: WorkflowGitHubReads
+    store: WorkflowState
     runner: AgentRuntime
     # Required, not optional: escalation writes go through the funnel or not at
     # all (review M10). A default would let a caller silently reintroduce the
     # direct-gateway bypass this field exists to remove.
-    executor: object
+    executor: ActionExecutor
     log_run: Callable[[str, int, object], Awaitable[object]] | None = None
 
     def _trigger_label(self) -> Label:
@@ -123,14 +149,7 @@ class ReviewWorkflow:
             )
         if self.log_run is not None:
             return await self.log_run(label, pr, task)
-        self.cfg.log(f"agent #{pr}: {label} — running")
-        result = await self.runner.run(task)
-        self.cfg.log(
-            f"agent #{pr}: {label} — done "
-            f"(status={result.status or ('error' if result.is_error else 'ok')}"
-            f"{f', ${result.cost_usd:.2f}' if result.cost_usd else ''})"
-        )
-        return result
+        return await run_leg(self.runner, self.cfg.log, label, pr, task)
 
     def _prepare_task(self, task):
         """Install Codex's review governor immediately before each agent leg.
@@ -140,7 +159,7 @@ class ReviewWorkflow:
         its own, so the configured target checkout is the sole permitted hook
         destination and is also made the task's execution cwd.
         """
-        if self.cfg.reviewer_runtime != "codex":
+        if not self.cfg.reviewer_capabilities.requires_external_governor:
             return task
         if not self.cfg.execution_cwd or self.cfg.prepare_cwd is None:
             self.cfg.log(
@@ -197,7 +216,11 @@ class ReviewWorkflow:
             return
         self.store.save_pr_session(
             pr,
-            _FRESH_REVIEW_SESSION if self.cfg.reviewer_runtime == "codex" else result.session_id,
+            (
+                _FRESH_REVIEW_SESSION
+                if not self.cfg.reviewer_capabilities.resume_preserves_sandbox
+                else result.session_id
+            ),
         )
         self.store.set_last_sha(pr, p.head_ref_oid)
         self._record_patch(pr, signature)
@@ -265,7 +288,11 @@ class ReviewWorkflow:
         if result.session_id:
             self.store.save_pr_session(
                 pr,
-                _FRESH_REVIEW_SESSION if self.cfg.reviewer_runtime == "codex" else result.session_id,
+                (
+                    _FRESH_REVIEW_SESSION
+                    if not self.cfg.reviewer_capabilities.resume_preserves_sandbox
+                    else result.session_id
+                ),
             )
         self.store.set_last_sha(pr, p.head_ref_oid)
         self._record_patch(pr, signature)
@@ -407,7 +434,7 @@ class ReviewWorkflow:
             self.cfg.log(f"review #{pr}: gate says non-reviewable "
                          f"({gate.field('reason') or 'no behavioural change'}) → APPROVE")
             sub = review_dom.gate_submission(prior, self.cfg.max_review_rejections)
-            if self.gateway.submit_review(pr, sub.event, sub.body):
+            if self.executor.submit_review(pr, sub.event, sub.body):
                 self._persist_review_state(pr, p.head_ref_oid, round_number, signature)
                 self._progress(p)
             else:
@@ -474,7 +501,7 @@ class ReviewWorkflow:
             # result, never touching the dispatcher's raise-path counter.
             self._no_progress(p, "incomplete fan-out, no verdict to submit")
             return
-        if not self.gateway.submit_review(pr, sub.event, sub.body):
+        if not self.executor.submit_review(pr, sub.event, sub.body):
             self._no_progress(p, "review POST failed")
             return  # failed POST → leave state untouched (retried next poll)
         if sub.escalate:
@@ -533,7 +560,7 @@ class ReviewWorkflow:
             result.field("decision"), result.field("body"),
             prior_rejections, self.cfg.max_review_rejections,
         )
-        if not self.gateway.submit_review(pr, sub.event, sub.body):
+        if not self.executor.submit_review(pr, sub.event, sub.body):
             return False
         # Log the OUTCOME of a successful submit — always on (not DEBUG-gated). Without
         # this, a clean review was invisible on stdout: `dispatch` then silence until

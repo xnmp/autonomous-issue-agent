@@ -13,6 +13,7 @@ import pytest
 from issue_agent.adapters.single_instance import (
     AlreadyRunning,
     InstanceLock,
+    UnsafeLockFile,
     _lock_path,
     acquire,
 )
@@ -67,3 +68,34 @@ def test_release_is_idempotent():
     lock = acquire("steward", "owner/repo-F")
     lock.release()
     lock.release()  # must not raise on a double release
+
+
+def test_same_repo_different_checkouts_do_not_collide(tmp_path):
+    a = acquire("fix", "owner/repo-G", target_dir=str(tmp_path / "one"))
+    b = acquire("fix", "owner/repo-G", target_dir=str(tmp_path / "two"))
+    try:
+        assert a.path != b.path
+    finally:
+        a.release()
+        b.release()
+
+
+def test_lock_lives_under_state_dir(tmp_path):
+    lock = acquire("fix", "owner/repo-H", state_dir=str(tmp_path))
+    try:
+        assert os.path.dirname(lock.path) == str(tmp_path / "locks")
+    finally:
+        lock.release()
+
+
+def test_empty_repo_is_rejected():
+    with pytest.raises(ValueError, match="REPO"):
+        acquire("fix", "")
+
+
+def test_foreign_symlink_lock_is_rejected(tmp_path):
+    path = _lock_path("fix", "owner/repo-I", state_dir=str(tmp_path))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.symlink(tmp_path / "somewhere-else", path)
+    with pytest.raises(UnsafeLockFile):
+        acquire("fix", "owner/repo-I", state_dir=str(tmp_path))

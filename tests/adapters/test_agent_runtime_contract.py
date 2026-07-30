@@ -13,7 +13,12 @@ from types import SimpleNamespace
 
 from issue_agent.adapters.agent_runner import result_to_agent_result
 from issue_agent.adapters.codex_runner import parse_codex_envelope
-from issue_agent.domain.agent_task import AgentRuntime, AgentTask, McpServer, SubagentDef
+from issue_agent.adapters.runtime_plan import (
+    AgentRuntime,
+    McpServer,
+    RuntimePlan,
+    SubagentDef,
+)
 from issue_agent.domain.outcome import AgentResult, Outcome, classify_outcome
 
 
@@ -40,7 +45,7 @@ def _codex_result(*, structured, exit_code=0, session_id="s1", stderr=""):
 
 def test_runtime_contract_accepts_task_and_returns_agent_result_shape():
     class FakeRuntime:
-        async def run(self, task: AgentTask) -> AgentResult:
+        async def run(self, task: RuntimePlan) -> AgentResult:
             return AgentResult(
                 is_error=False,
                 status="done",
@@ -52,7 +57,7 @@ def test_runtime_contract_accepts_task_and_returns_agent_result_shape():
 
 
 def test_task_interface_collects_tool_policy_for_runner_adapters():
-    task = AgentTask(
+    task = RuntimePlan(
         prompt="review",
         allowed_tools=("Read",),
         mcp_servers=(McpServer("sonar", {"command": "sonar"}, "mcp__sonar__*"),),

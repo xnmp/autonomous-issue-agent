@@ -1,11 +1,11 @@
-"""Single-instance guard — one daemon per (role, repo).
+"""Single-instance guard — one daemon per deployment checkout and role.
 
 Two fix daemons polling the same repo both grab `ai-ready` and dispatch in
 parallel, breaking the single-fixer invariant (observed: #54/#58 dispatched
 concurrently after an accidental double `point-at` launch). This is a
 process-level lock, not a domain concern, so it lives in adapters.
 
-Mechanism: an advisory `flock(LOCK_EX | LOCK_NB)` on a per-(role, repo) file.
+Mechanism: an advisory `flock(LOCK_EX | LOCK_NB)` on a per-deployment file.
 flock is held by the OPEN FILE DESCRIPTION and released by the kernel when the
 process exits — crash, kill -9, or clean shutdown alike. So unlike a pidfile
 holding a written PID, there is no stale-lock problem: a dead daemon's lock is
@@ -20,6 +20,7 @@ import errno
 import fcntl
 import hashlib
 import os
+import stat
 import tempfile
 from dataclasses import dataclass
 
@@ -45,22 +46,54 @@ class InstanceLock:
 
 
 class AlreadyRunning(RuntimeError):
-    """Another daemon already holds the (role, repo) lock."""
+    """Another daemon already holds the deployment lock."""
 
 
-def _lock_path(role: str, repo: str) -> str:
-    """A stable path unique to (role, repo). repo is hashed so a slash-bearing
-    `owner/name` is filesystem-safe and the path length stays bounded."""
-    key = hashlib.sha1(f"{role}\0{repo}".encode()).hexdigest()[:16]
+class UnsafeLockFile(RuntimeError):
+    """The lock path is not a regular file owned by this deployment."""
+
+
+def _lock_path(
+    role: str,
+    repo: str,
+    target_dir: str = "",
+    state_dir: str = "",
+) -> str:
+    """Stable lock path unique to ``(role, repo, absolute target checkout)``."""
+    if not repo.strip():
+        raise ValueError("REPO must be non-empty before acquiring a daemon lock")
+    checkout = os.path.realpath(target_dir) if target_dir else ""
+    key = hashlib.sha256(f"{role}\0{repo}\0{checkout}".encode()).hexdigest()[:20]
     safe_role = "".join(c if c.isalnum() else "-" for c in role)
-    return os.path.join(tempfile.gettempdir(), f"issue-agent-{safe_role}-{key}.lock")
+    parent = (
+        os.path.join(os.path.abspath(state_dir), "locks")
+        if state_dir
+        else tempfile.gettempdir()
+    )
+    return os.path.join(parent, f"issue-agent-{safe_role}-{key}.lock")
 
 
-def acquire(role: str, repo: str) -> InstanceLock:
-    """Take the (role, repo) lock or raise AlreadyRunning. Non-blocking: a second
-    daemon fails fast instead of queueing behind the first."""
-    path = _lock_path(role, repo)
-    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+def acquire(
+    role: str,
+    repo: str,
+    *,
+    target_dir: str = "",
+    state_dir: str = "",
+) -> InstanceLock:
+    """Take the deployment lock or fail without following a foreign symlink."""
+    path = _lock_path(role, repo, target_dir, state_dir)
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EISDIR):
+            raise UnsafeLockFile(f"unsafe daemon lock path: {path}") from exc
+        raise
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise UnsafeLockFile(f"daemon lock is not a regular file: {path}")
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError as e:

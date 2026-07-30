@@ -24,6 +24,7 @@ import subprocess
 import sys
 
 from ..adapters.wake import touch_wake, wake_path
+from ..adapters.single_instance import AlreadyRunning, UnsafeLockFile, acquire
 from .config import from_env
 
 # The events that can change any role's decision: issue/PR lifecycle and
@@ -95,42 +96,61 @@ def run(env: dict | None = None, spawn=subprocess.Popen, gh_run=subprocess.run) 
     if not (cfg.repo or "").strip():
         _log("REPO is unset — refusing to start (is the repo overlay composed?)")
         return 2
+    try:
+        instance_lock = acquire(
+            "webhook",
+            cfg.repo,
+            target_dir=cfg.target_dir,
+            state_dir=cfg.state_dir,
+        )
+    except (AlreadyRunning, UnsafeLockFile, OSError) as exc:
+        _log(str(exc))
+        return 3
     events = env.get("WEBHOOK_EVENTS") or DEFAULT_EVENTS
     wakes = [
         wake_path(d)
         for d in (cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir)
         if d
     ]
-    cmd = forward_command(cfg.repo, events)
-    gc_dangling_hooks(cfg.repo, gh_run)
-    _log(f"forwarding {events} for {cfg.repo} → {len(wakes)} role wake files")
     try:
-        proc = spawn(cmd, stdout=subprocess.PIPE, stderr=None, text=True, bufsize=1)
-    except OSError as exc:
-        _log(
-            f"could not start `{' '.join(cmd)}`: {exc} — is the gh webhook "
-            "extension installed (`gh extension install cli/gh-webhook`) and "
-            "does the token carry admin:repo_hook? Daemons continue at the "
-            "reconcile cadence."
-        )
-        return 127
+        cmd = forward_command(cfg.repo, events)
+        gc_dangling_hooks(cfg.repo, gh_run)
+        _log(f"forwarding {events} for {cfg.repo} → {len(wakes)} role wake files")
+        try:
+            proc = spawn(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=None,
+                text=True,
+                bufsize=1,
+            )
+        except OSError as exc:
+            _log(
+                f"could not start `{' '.join(cmd)}`: {exc} — is the gh webhook "
+                "extension installed (`gh extension install cli/gh-webhook`) and "
+                "does the token carry admin:repo_hook? Daemons continue at the "
+                "reconcile cadence."
+            )
+            return 127
 
-    deliveries = 0
-    if proc.stdout is not None:
-        for line in proc.stdout:
-            if not line.strip():
-                continue
-            # PAYLOAD IGNORED BY DESIGN — a line is an edge, not data.
-            deliveries += 1
-            for path in wakes:
-                touch_wake(path)
-    rc = proc.wait()
-    _log(
-        f"`gh webhook forward` EXITED (status {rc}) after {deliveries} deliveries "
-        "— push wake is DOWN; daemons fall back to the reconcile cadence until "
-        "the supervisor restarts it"
-    )
-    return rc if rc != 0 else 1
+        deliveries = 0
+        if proc.stdout is not None:
+            for line in proc.stdout:
+                if not line.strip():
+                    continue
+                # PAYLOAD IGNORED BY DESIGN — a line is an edge, not data.
+                deliveries += 1
+                for path in wakes:
+                    touch_wake(path)
+        rc = proc.wait()
+        _log(
+            f"`gh webhook forward` EXITED (status {rc}) after {deliveries} deliveries "
+            "— push wake is DOWN; daemons fall back to the reconcile cadence until "
+            "the supervisor restarts it"
+        )
+        return rc if rc != 0 else 1
+    finally:
+        instance_lock.release()
 
 
 def main() -> None:

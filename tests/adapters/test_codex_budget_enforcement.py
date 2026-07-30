@@ -16,7 +16,7 @@ from issue_agent.adapters.codex_runner import (
     read_rollout_turns,
 )
 from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
-from issue_agent.domain.agent_task import AgentTask
+from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.outcome import ExitReason, infra_death
 
 
@@ -110,7 +110,7 @@ def test_crossing_budget_kills_run_and_settles_operator_receipt(tmp_path, monkey
     runtime.set_context("fix", "RESOLVE", 29, 29)
 
     result = asyncio.run(
-        runtime.run(AgentTask(prompt="x", max_budget_usd=20.0))
+        runtime.run(RuntimePlan(prompt="x", max_budget_usd=20.0))
     )
 
     assert result.status == "error_max_budget_usd"
@@ -153,7 +153,7 @@ def test_final_rollout_crossing_cannot_escape_on_clean_exit(tmp_path, monkeypatc
 
     result = asyncio.run(
         _runner(tmp_path, body, poll_slice=30.0).run(
-            AgentTask(prompt="x", max_budget_usd=20.0)
+            RuntimePlan(prompt="x", max_budget_usd=20.0)
         )
     )
 
@@ -179,7 +179,7 @@ def test_final_stderr_usage_crossing_cannot_escape_without_rollout(
 
     result = asyncio.run(
         _runner(tmp_path, body, poll_slice=30.0).run(
-            AgentTask(prompt="x", max_budget_usd=20.0)
+            RuntimePlan(prompt="x", max_budget_usd=20.0)
         )
     )
 
@@ -225,7 +225,7 @@ def test_headerless_run_uses_rollout_for_inflight_budget_enforcement(
 
     result = asyncio.run(
         _runner(tmp_path, body).run(
-            AgentTask(prompt="x", cwd=str(worktree), max_budget_usd=20.0)
+            RuntimePlan(prompt="x", cwd=str(worktree), max_budget_usd=20.0)
         )
     )
 
@@ -252,7 +252,7 @@ def test_echoed_usage_fixture_does_not_price_or_kill_inflight_run(
 
     result = asyncio.run(
         _runner(tmp_path, body, poll_slice=0.01).run(
-            AgentTask(prompt="x", max_budget_usd=20.0)
+            RuntimePlan(prompt="x", max_budget_usd=20.0)
         )
     )
 
@@ -303,7 +303,7 @@ def test_implausible_early_rollout_usage_is_rejected_not_budget_killed(
 
     result = asyncio.run(
         _runner(tmp_path, body, log=logs.append).run(
-            AgentTask(prompt="x", cwd=str(worktree), max_budget_usd=20.0)
+            RuntimePlan(prompt="x", cwd=str(worktree), max_budget_usd=20.0)
         )
     )
 
@@ -319,7 +319,7 @@ def test_under_budget_run_completes_normally(tmp_path, monkeypatch):
 
     result = asyncio.run(
         _runner(tmp_path, _chatty_body(seconds=1)).run(
-            AgentTask(prompt="x", max_budget_usd=20.0)
+            RuntimePlan(prompt="x", max_budget_usd=20.0)
         )
     )
 
@@ -340,7 +340,7 @@ def test_cache_heavy_live_budget_sampler_does_not_kill_a_sub_twenty_dollar_leg(
 
     result = asyncio.run(
         _runner(tmp_path, _chatty_body(seconds=1)).run(
-            AgentTask(prompt="x", max_budget_usd=20.0)
+            RuntimePlan(prompt="x", max_budget_usd=20.0)
         )
     )
 
@@ -356,7 +356,7 @@ def test_resumed_leg_uses_its_own_usage_and_turn_delta(tmp_path, monkeypatch):
 
     result = asyncio.run(
         _runner(tmp_path, _chatty_body(seconds=1)).run(
-            AgentTask(prompt="x", max_budget_usd=20.0, resume=SID)
+            RuntimePlan(prompt="x", max_budget_usd=20.0, resume=SID)
         )
     )
 
@@ -394,7 +394,7 @@ def test_a_resumed_leg_subtracts_the_baselines_cached_tokens_too(tmp_path, monke
 
     result = asyncio.run(
         _runner(tmp_path, body).run(
-            AgentTask(prompt="x", max_budget_usd=20.0, resume=SID)
+            RuntimePlan(prompt="x", max_budget_usd=20.0, resume=SID)
         )
     )
 
@@ -409,14 +409,18 @@ def test_budget_only_watchdog_samples_a_silent_generation(tmp_path, monkeypatch)
     _write_rollout(tmp_path, input_tokens=5_000_000, output_tokens=100_000)
     runner = _runner(
         tmp_path,
-        f'echo "session id: {SID}" >&2\nsleep 3\n',
+        (
+            f'echo "session id: {SID}" >&2\n'
+            f"touch '{_rollout_path(tmp_path)}'\n"
+            "sleep 3\n"
+        ),
         idle_timeout=None,
         max_runtime=None,
     )
 
     started = time.monotonic()
     result = asyncio.run(
-        runner.run(AgentTask(prompt="x", max_budget_usd=20.0))
+        runner.run(RuntimePlan(prompt="x", max_budget_usd=20.0))
     )
 
     assert time.monotonic() - started < 2
@@ -430,7 +434,7 @@ def test_enforcement_switch_off_leaves_the_same_run_alone(tmp_path, monkeypatch)
     result = asyncio.run(
         _runner(
             tmp_path, _chatty_body(seconds=1), enforce_budget=False
-        ).run(AgentTask(prompt="x", max_budget_usd=20.0))
+        ).run(RuntimePlan(prompt="x", max_budget_usd=20.0))
     )
 
     assert result.exit_reason is ExitReason.OK

@@ -1,0 +1,200 @@
+from __future__ import annotations
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+from issue_agent.adapters.process_supervisor import ProcessSupervisor
+from issue_agent.domain.contracts import RunId
+
+
+def _wait_dead(process: subprocess.Popen[bytes]) -> None:
+    deadline = time.monotonic() + 3
+    while process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert process.poll() is not None
+
+
+def test_registered_process_group_is_killed_and_receipt_removed(tmp_path) -> None:
+    process = subprocess.Popen(
+        ["sleep", "30"], start_new_session=True, stdout=subprocess.DEVNULL
+    )
+    supervisor = ProcessSupervisor(str(tmp_path), grace_seconds=0.05)
+    run_id = RunId("run-1")
+    supervisor.register(run_id, os.getpgid(process.pid))
+
+    supervisor.kill_tree(run_id)
+
+    _wait_dead(process)
+    assert supervisor.registrations() == ()
+
+
+def test_boot_recovery_kills_all_valid_registered_groups(tmp_path) -> None:
+    processes = [
+        subprocess.Popen(["sleep", "30"], start_new_session=True)
+        for _ in range(2)
+    ]
+    supervisor = ProcessSupervisor(str(tmp_path), grace_seconds=0.05)
+    for index, process in enumerate(processes):
+        supervisor.register(RunId(f"run-{index}"), os.getpgid(process.pid))
+
+    assert supervisor.recover_orphans() == (RunId("run-0"), RunId("run-1"))
+    for process in processes:
+        _wait_dead(process)
+
+
+def test_malformed_registration_is_quarantined_without_signalling(tmp_path) -> None:
+    directory = tmp_path / "process-groups"
+    directory.mkdir()
+    (directory / "bad.json").write_text('{"pgid": "not-a-pid"}')
+
+    assert ProcessSupervisor(str(tmp_path)).recover_orphans() == ()
+    assert (directory / "bad.invalid").exists()
+
+
+def test_registered_pid_tree_kills_descendants_without_signalling_parent_group(
+    tmp_path,
+) -> None:
+    process = subprocess.Popen(["sleep", "30"])
+    supervisor = ProcessSupervisor(str(tmp_path), grace_seconds=0.05)
+    root = next(
+        identity
+        for identity in supervisor.direct_children()
+        if identity.pid == process.pid
+    )
+    run_id = RunId("claude-run")
+    supervisor.register_process_tree(run_id, (root,))
+
+    supervisor.kill_process_tree(run_id)
+
+    _wait_dead(process)
+
+
+def test_boot_recovery_reaps_registered_pid_tree(tmp_path) -> None:
+    process = subprocess.Popen(["sleep", "30"])
+    supervisor = ProcessSupervisor(str(tmp_path), grace_seconds=0.05)
+    root = next(
+        identity
+        for identity in supervisor.direct_children()
+        if identity.pid == process.pid
+    )
+    supervisor.register_process_tree(RunId("claude-run"), (root,))
+
+    assert supervisor.recover_orphans() == (RunId("claude-run"),)
+    _wait_dead(process)
+
+
+def test_stale_group_leader_identity_is_never_signalled(
+    tmp_path, monkeypatch
+) -> None:
+    process = subprocess.Popen(
+        ["sleep", "30"], start_new_session=True, stdout=subprocess.DEVNULL
+    )
+    supervisor = ProcessSupervisor(str(tmp_path), grace_seconds=0)
+    run_id = RunId("stale")
+    supervisor.register(run_id, os.getpgid(process.pid))
+    receipt = tmp_path / "process-groups" / "stale.json"
+    raw = json.loads(receipt.read_text())
+    raw["leader"]["start_ticks"] += 1
+    receipt.write_text(json.dumps(raw))
+    signalled = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: signalled.append((pgid, sig)))
+
+    assert supervisor.recover_orphans() == (run_id,)
+    assert signalled == []
+    assert process.poll() is None
+    process.terminate()
+    _wait_dead(process)
+
+
+def test_group_descendant_is_killed_after_registered_leader_exits(
+    tmp_path,
+) -> None:
+    child_pid_file = tmp_path / "child.pid"
+    process = subprocess.Popen(
+        [
+            "/bin/sh",
+            "-c",
+            f"sleep 30 & echo $! > {child_pid_file}; sleep 0.2",
+        ],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+    )
+    supervisor = ProcessSupervisor(str(tmp_path), grace_seconds=0.05)
+    run_id = RunId("leader-exited")
+    supervisor.register(run_id, os.getpgid(process.pid))
+    process.wait(timeout=3)
+    child_pid = int(child_pid_file.read_text().strip())
+    assert ProcessSupervisor.process_identity(child_pid) is not None
+
+    supervisor.kill_tree(run_id)
+
+    deadline = time.monotonic() + 3
+    while (
+        ProcessSupervisor.process_identity(child_pid) is not None
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.02)
+    assert ProcessSupervisor.process_identity(child_pid) is None
+    assert supervisor.registrations() == ()
+
+
+def test_supervised_command_registers_before_work_executes(tmp_path) -> None:
+    supervisor = ProcessSupervisor(str(tmp_path), grace_seconds=0.05)
+    run_id = RunId("wrapped")
+    command = supervisor.supervised_command(
+        run_id,
+        (
+            sys.executable,
+            "-c",
+            "import time; time.sleep(30)",
+        ),
+    )
+    process = subprocess.Popen(command, start_new_session=True)
+    deadline = time.monotonic() + 3
+    while not supervisor.registrations() and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    registration = supervisor.registrations()[0]
+    assert registration.run_id == run_id
+    assert registration.pgid == process.pid
+    assert registration.leader.pid == process.pid
+
+    supervisor.kill_tree(run_id)
+    _wait_dead(process)
+
+
+def test_supervised_sdk_cli_registers_session_before_target_executes(
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    marker = tmp_path / "target-started"
+    target = tmp_path / "claude"
+    target.write_text(
+        "#!/bin/sh\n"
+        '[ -z "${ISSUE_AGENT_SUPERVISOR_RUN_ID:-}" ] || exit 8\n'
+        f'echo started > "{marker}"\n'
+        "sleep 30\n"
+    )
+    target.chmod(0o755)
+    supervisor = ProcessSupervisor(str(state_dir), grace_seconds=0.05)
+    run_id = RunId("sdk-cli")
+    wrapper, supervised_env = supervisor.supervised_cli(run_id, str(target))
+    process = subprocess.Popen(
+        [wrapper, "--sdk-argument"],
+        env={**os.environ, **supervised_env},
+    )
+    deadline = time.monotonic() + 3
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+
+    assert marker.exists()
+    registration = supervisor.registrations()[0]
+    assert registration.leader.pid == process.pid
+    assert registration.pgid == process.pid
+
+    supervisor.kill_tree(run_id)
+    _wait_dead(process)

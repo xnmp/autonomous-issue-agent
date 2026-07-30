@@ -126,16 +126,17 @@ prc_allow_untested() { [ "${ALLOW_UNTESTED:-0}" = 1 ]; }
 # documented edge is the price of keeping this mechanism simple.
 
 PRC_GATE_RECURSION_RC=213
+PRC_TEST_TIMEOUT_RC=124
 
 # Static floor of knobs to scrub, mirrored in governor.TARGET_CMD_SCRUB_KNOBS
 # and point-at's RTC_SCRUB_STATIC (drift-checked by
 # tests/test_deployment_env_sanitization.sh). The deployment's FULL knob set
 # arrives dynamically via HARNESS_DEPLOY_KNOBS (written by compose-env.sh), so
 # a newly added knob is scrubbed without touching these lists.
-PRC_SCRUB_STATIC="TEST_CMD LINT_CMD TYPECHECK_CMD EDIT_CHECK_CMD ALLOW_UNTESTED RED_MUST_FAIL VERIFY_RED_AT_COMMIT BASE_BRANCH GATE_TEST_TIMEOUT_S GATE_GH_RETRY_SLEEP GH_APP_ID GH_APP_KEY_FILE GH_APP_INSTALL_ID TARGET_DIR AGENT_ENV"
+PRC_SCRUB_STATIC="TEST_CMD LINT_CMD TYPECHECK_CMD EDIT_CHECK_CMD ALLOW_UNTESTED RED_MUST_FAIL VERIFY_RED_AT_COMMIT BASE_BRANCH GATE_TEST_TIMEOUT_S GATE_GH_RETRY_SLEEP HARNESS_SCREENSHOTS_READ GH_APP_ID GH_APP_KEY_FILE GH_APP_INSTALL_ID TARGET_DIR AGENT_ENV"
 
-prc_run_test_cmd() {  # prc_run_test_cmd "<resolved command>" → rc, 213 = refused
-  local _depth="${HARNESS_GATE_DEPTH:-0}" _v
+prc_run_test_cmd() {  # → rc; 213=recursion, 124=timeout
+  local _depth="${HARNESS_GATE_DEPTH:-0}" _v _timeout="${GATE_TEST_TIMEOUT_S:-300}"
   case "$_depth" in ''|*[!0-9]*) _depth=0 ;; esac
   if [ "$_depth" -ge 2 ]; then
     echo "GATE RECURSION: refusing to run a test command at gate depth $_depth — the resolved command re-entered the harness gate (self-referential TEST_CMD/.harness/test-cmd, see #63): $1" >&2
@@ -145,9 +146,19 @@ prc_run_test_cmd() {  # prc_run_test_cmd "<resolved command>" → rc, 213 = refu
   for _v in $PRC_SCRUB_STATIC ${HARNESS_DEPLOY_KNOBS:-} HARNESS_DEPLOY_KNOBS; do
     case "$_v" in [A-Za-z_]*) _scrub+=(-u "$_v") ;; esac
   done
-  env "${_scrub[@]}" \
-    HARNESS_GATE_DEPTH="$((_depth + 1))" \
-    bash -c "$1"
+  case "$_timeout" in ''|*[!0-9]*) _timeout=300 ;; esac
+  [ "$_timeout" -gt 0 ] || _timeout=300
+  if command -v timeout >/dev/null 2>&1; then
+    env "${_scrub[@]}" \
+      HARNESS_GATE_DEPTH="$((_depth + 1))" \
+      timeout --signal=TERM --kill-after=5 "$_timeout" bash -c "$1"
+  else
+    # macOS has no coreutils timeout by default. The Python/SDK verifier remains
+    # authoritative there; this advisory stack refuses rather than claiming a
+    # potentially unbounded command produced trusted evidence.
+    echo "red-check: timeout command unavailable; refusing target command" >&2
+    return "$PRC_TEST_TIMEOUT_RC"
+  fi
 }
 
 # §1 — local test suite must pass (CI re-runs authoritatively, when present).
@@ -273,7 +284,7 @@ prc_check_red_fails() {  # prc_check_red_fails "<changed-file-list>"
 
   # Resolve the bare base ref (shared resolver — see prc_resolve_base_ref).
   local baseref; baseref="$(prc_resolve_base_ref)"
-  [ -n "$baseref" ] || { echo "red-check: cannot resolve base '$base' — skipping (fail-open)" >&2; return 0; }
+  [ -n "$baseref" ] || fail "red-check: cannot resolve base '$base' — trusted red-test evidence cannot be produced"
 
   # Partition changed files: new tests (keep at HEAD) vs implementation (revert).
   local f new_tests=() impl_existing=() impl_all=()
@@ -319,6 +330,9 @@ prc_check_red_fails() {  # prc_check_red_fails "<changed-file-list>"
 
   if [ "$_rrc" -eq "$PRC_GATE_RECURSION_RC" ]; then
     fail "GATE RECURSION: the test command re-entered the harness gate and was refused (see #63) — the red-fail check cannot run. Fix the test-command configuration (self-referential TEST_CMD/.harness/test-cmd)."
+  fi
+  if [ "$_rrc" -eq "$PRC_TEST_TIMEOUT_RC" ]; then
+    fail "red-test verification timed out — timeout is infrastructure failure, not evidence that the new test detects the reverted implementation"
   fi
 
   [ "$passed" = 0 ] || fail "the new test(s) still PASS with the implementation reverted — they do not exercise the change (tautological or wrong-layer test). Assert on the observable behaviour the change produces, not on a constant that is always true. New test file(s): ${new_tests[*]}"

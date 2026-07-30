@@ -1,0 +1,226 @@
+import json
+from datetime import datetime, timedelta, timezone
+
+from issue_agent.adapters.event_log import EventLog
+from issue_agent.app.dashboard import collect
+from issue_agent.domain.events import (
+    AgentRunCompleted,
+    AgentRunStarted,
+    Correlation,
+    DaemonStateChanged,
+    Producer,
+    SpendRecorded,
+    WorldObserved,
+)
+
+
+NOW = datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def test_collect_prefers_v2_fold_and_ignores_legacy_lifecycle(tmp_path) -> None:
+    state = tmp_path / "fix"
+    state.mkdir()
+    legacy = state / "journal.jsonl"
+    legacy.write_text(
+        '{"ts":"2026-07-30T09:00:00Z","event":"action",'
+        '"desc":"relabel issue #7: +ai-done"}\n'
+    )
+    events = EventLog(
+        str(state / "events-v2.jsonl"),
+        Producer("deployment", "owner/repo", "fix", 100, "boot"),
+    )
+    events.emit(
+        WorldObserved(
+            "issue",
+            7,
+            "hash",
+            {"state": "open", "labels": ["ai-working"]},
+        ),
+        correlation=Correlation(issue=7),
+        causation_time=NOW,
+    )
+    correlation = Correlation(
+        issue=7,
+        dispatch_id="dispatch-1",
+        run_id="run-1",
+        leg_id="leg-1",
+    )
+    events.emit(
+        AgentRunStarted("model", "RESOLVE"),
+        correlation=correlation,
+        causation_time=NOW,
+    )
+    events.emit(
+        AgentRunCompleted(
+            "done",
+            False,
+            None,
+            1_000,
+            "model",
+            "codex",
+            500_000,
+            "USD",
+            "configured_rate_card",
+            None,
+            None,
+            "RESOLVE",
+        ),
+        correlation=correlation,
+        causation_time=NOW,
+    )
+
+    deployment = collect(
+        "demo",
+        "owner/repo",
+        (
+            str(legacy),
+            str(tmp_path / "review" / "journal.jsonl"),
+            str(tmp_path / "steward" / "journal.jsonl"),
+        ),
+        str(tmp_path / "logs"),
+        str(tmp_path / "spend.jsonl"),
+        now_fn=lambda: NOW,
+    )
+
+    assert deployment.schema_version == 2
+    assert deployment.issues[0].issue == 7
+    assert deployment.issues[0].stage == "awaiting review"
+    assert deployment.issues[0].done is False
+    assert deployment.issues[0].cost_usd == 0.5
+
+
+def test_collect_counts_reconciled_spend_without_a_completion_event(
+    tmp_path,
+) -> None:
+    state = tmp_path / "fix"
+    state.mkdir()
+    events = EventLog(
+        str(state / "events-v2.jsonl"),
+        Producer("deployment", "owner/repo", "fix", 100, "boot"),
+    )
+    events.emit(
+        WorldObserved(
+            "issue",
+            7,
+            "hash",
+            {"state": "open", "labels": ["ai-working"]},
+        ),
+        correlation=Correlation(issue=7),
+        causation_time=NOW,
+    )
+    events.emit(
+        SpendRecorded(
+            "recovered-run",
+            700_000,
+            "USD",
+            "reconciled",
+            None,
+            None,
+        ),
+        correlation=Correlation(issue=7, run_id="recovered-run"),
+        causation_time=NOW,
+    )
+
+    deployment = collect(
+        "demo",
+        "owner/repo",
+        (
+            str(state / "journal.jsonl"),
+            str(tmp_path / "review" / "journal.jsonl"),
+            str(tmp_path / "steward" / "journal.jsonl"),
+        ),
+        str(tmp_path / "logs"),
+        str(tmp_path / "spend.jsonl"),
+        now_fn=lambda: NOW,
+    )
+
+    assert deployment.issues[0].cost_usd == 0.7
+    assert deployment.metrics.today_usd == 0.7
+    assert deployment.metrics.total_cost_usd == 0.7
+
+
+def test_v2_health_uses_scheduler_heartbeat_when_events_are_quiet(
+    tmp_path,
+) -> None:
+    state = tmp_path / "fix"
+    state.mkdir()
+    old = NOW - timedelta(hours=2)
+    events = EventLog(
+        str(state / "events-v2.jsonl"),
+        Producer("deployment", "owner/repo", "fix", 100, "boot"),
+    )
+    events.emit(
+        WorldObserved("issue", 7, "hash", {"state": "open"}),
+        correlation=Correlation(issue=7),
+        causation_time=old,
+    )
+    (state / "heartbeat.json").write_text(
+        json.dumps(
+            {
+                "pid": 100,
+                "state": "running",
+                "in_flight": [],
+                "updated_at": NOW.isoformat(),
+            }
+        )
+    )
+
+    deployment = collect(
+        "demo",
+        "owner/repo",
+        (
+            str(state / "journal.jsonl"),
+            str(tmp_path / "review" / "journal.jsonl"),
+            str(tmp_path / "steward" / "journal.jsonl"),
+        ),
+        str(tmp_path / "logs"),
+        str(tmp_path / "spend.jsonl"),
+        now_fn=lambda: NOW,
+        stale_after_s=60,
+    )
+
+    fix_health = next(item for item in deployment.health if item.role == "fix")
+    assert fix_health.stale is False
+    assert fix_health.last_ts == NOW
+
+
+def test_v2_health_rejects_stopped_heartbeat_and_terminal_state(
+    tmp_path,
+) -> None:
+    state = tmp_path / "fix"
+    state.mkdir()
+    events = EventLog(
+        str(state / "events-v2.jsonl"),
+        Producer("deployment", "owner/repo", "fix", 100, "boot"),
+    )
+    events.emit(
+        DaemonStateChanged("draining", "stopped", "shutdown complete"),
+        causation_time=NOW,
+    )
+    (state / "heartbeat.json").write_text(
+        json.dumps(
+            {
+                "pid": 100,
+                "state": "stopped",
+                "in_flight": [],
+                "updated_at": NOW.isoformat(),
+            }
+        )
+    )
+
+    deployment = collect(
+        "demo",
+        "owner/repo",
+        (
+            str(state / "journal.jsonl"),
+            str(tmp_path / "review" / "journal.jsonl"),
+            str(tmp_path / "steward" / "journal.jsonl"),
+        ),
+        str(tmp_path / "logs"),
+        str(tmp_path / "spend.jsonl"),
+        now_fn=lambda: NOW,
+        stale_after_s=1_800,
+    )
+
+    fix_health = next(item for item in deployment.health if item.role == "fix")
+    assert fix_health.stale is True

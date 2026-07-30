@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import os
 import subprocess
+import hashlib
+from collections.abc import Callable
 
 # Reserved exit status the point-at relaunch loop recognises as "same daemon,
 # new code, go again" — anything else propagates as a real exit.
@@ -53,34 +55,45 @@ def _head_commit(repo_root: str) -> str:
 
 
 class ReloadWatch:
-    """Baselines the harness repo's HEAD (plus explicit files' mtimes) at
+    """Baselines the harness repo's HEAD (plus explicit file contents) at
     construction; `changed()` answers against that baseline."""
 
-    def __init__(self, repo_root: str, files: tuple[str, ...] = ()):
+    def __init__(
+        self,
+        repo_root: str,
+        files: tuple[str, ...] = (),
+        validate: Callable[[], None] | None = None,
+    ):
         self.repo_root = repo_root
         self.files = files
+        self.validate = validate
         self._base = self._fingerprint()
 
-    def _mtimes(self) -> tuple[float, ...]:
+    def _digests(self) -> tuple[str, ...]:
         out = []
         for path in self.files:
             try:
-                out.append(os.stat(path).st_mtime)
+                with open(path, "rb") as handle:
+                    out.append(hashlib.sha256(handle.read()).hexdigest())
             except OSError:
-                out.append(0.0)
+                out.append("")
         return tuple(out)
 
-    def _fingerprint(self) -> tuple[str, tuple[float, ...]]:
-        return (_head_commit(self.repo_root), self._mtimes())
+    def _fingerprint(self) -> tuple[str, tuple[str, ...]]:
+        return (_head_commit(self.repo_root), self._digests())
 
     def changed(self) -> bool:
         try:
-            head, mtimes = self._fingerprint()
-            base_head, base_mtimes = self._base
+            head, digests = self._fingerprint()
+            base_head, base_digests = self._base
             # "" means git couldn't answer (transiently or at all): compare only
             # what we CAN see rather than flapping between "" and a real sha.
-            if head and base_head and head != base_head:
-                return True
-            return mtimes != base_mtimes
+            changed = (
+                bool(head and base_head and head != base_head)
+                or digests != base_digests
+            )
+            if changed and self.validate is not None:
+                self.validate()
+            return changed
         except Exception:  # noqa: BLE001 — a broken watch must not kill the daemon
             return False

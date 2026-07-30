@@ -16,7 +16,7 @@ Contract (Claude Code PreToolUse hook):
 
 Design rules:
   * Never executes the command — only inspects structure.
-  * Fail-OPEN on parse errors / unknown input (other layers handle those).
+  * Fail-CLOSED when parsing cannot resolve a possibly governed command.
   * Fail-CLOSED on a *recognised* bypass attempt (--no-verify, core.hooksPath,
     HUSKY=0, etc.), no matter how deeply nested.
 
@@ -52,7 +52,7 @@ ORDER_CHECKER = "checks/check-commit-order.sh"
 # governance. These have no checker script — they are pure bypass guards
 # (git-config can redirect core.hooksPath; git-push can run --no-verify).
 try:
-    from issue_agent.adapters.governor_policy import (
+    from issue_agent.domain.governor_policy import (
         Governed,
         arg_value,
         bypass_reason,
@@ -60,11 +60,13 @@ try:
         extract_commands,
         extract_commands_with_env,
         find_violations,
+        resolve,
+        Unresolvable,
     )
 except ModuleNotFoundError:
     _ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     sys.path.insert(0, os.path.join(_ROOT, "src"))
-    from issue_agent.adapters.governor_policy import (  # type: ignore[no-redef]
+    from issue_agent.domain.governor_policy import (  # type: ignore[no-redef]
         Governed,
         arg_value,
         bypass_reason,
@@ -72,6 +74,8 @@ except ModuleNotFoundError:
         extract_commands,
         extract_commands_with_env,
         find_violations,
+        resolve,
+        Unresolvable,
     )
 
 
@@ -164,6 +168,13 @@ def main() -> None:
         if violation:
             _block(f"Blocked: {violation}")
 
+    resolution = resolve(command)
+    if isinstance(resolution, Unresolvable):
+        _block(
+            "Blocked: command cannot be governed statically — "
+            f"{resolution.reason}. Use a literal executable and argv."
+        )
+
     governed: list[tuple[Governed, list[str]]] = []
     for words, env in extract_commands_with_env(command):
         g = classify(words)
@@ -189,6 +200,20 @@ def main() -> None:
         rc, out = _run_checker(CHECKERS[g.kind], g.checker_args)
         if rc != 0:
             _block(out)
+        if (
+            os.environ.get("ISSUE_AGENT_DURABLE_PUBLISH") == "1"
+            and g.kind in {"git-push", "gh-pr-create"}
+            and not g.durable_wrapper
+        ):
+            command = (
+                "issue-agent-publish git push …"
+                if g.kind == "git-push"
+                else "issue-agent-publish gh pr create …"
+            )
+            _block(
+                f"Blocked: remote publication must use `{command}` so the "
+                "effect has a durable command and receipt"
+            )
         if g.kind == "git-commit":
             rc2, out2 = _run_checker(ORDER_CHECKER, g.checker_args)
             if rc2 != 0:

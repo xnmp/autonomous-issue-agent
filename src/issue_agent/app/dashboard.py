@@ -9,8 +9,14 @@ import os
 from datetime import datetime, timezone
 
 from ..adapters.journal import read_events
+from ..adapters.heartbeat import read_heartbeat_time
+from ..domain.events import EventEnvelope, decode_event
+from ..domain.projection import fold
 from ..domain.dashboard import *
-from ..domain.dashboard import _utcnow
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 # ── collection (the only I/O) ─────────────────────────────────────────────────
 def deployment_names(repos_dir: str) -> tuple[str, ...]:
@@ -35,13 +41,75 @@ def collect(
 ) -> Deployment:
     """Read one deployment's journals + the global ledger and report on them.
     Read-only; every missing file is an empty history (`read_events`'s rule)."""
+    now_fn = now_fn or _utcnow
+    legacy_paths = tuple(journal_paths)
+    typed_paths = tuple(
+        os.path.join(os.path.dirname(path), "events-v2.jsonl")
+        for path in legacy_paths
+    )
+    if any(glob.glob(f"{path}*") for path in typed_paths):
+        typed_feeds = tuple(
+            (
+                role,
+                path,
+                os.path.join(log_dir, f"{role}-{name}.log"),
+                _read_v2_events(path),
+            )
+            for role, path in zip(ROLE_NAMES, typed_paths)
+        )
+        model = fold(
+            event
+            for _role, _path, _log, events in typed_feeds
+            for event in events
+        )
+        heartbeat_times = {
+            role: stamp
+            for role, legacy_path in zip(ROLE_NAMES, legacy_paths)
+            if (
+                stamp := read_heartbeat_time(
+                    os.path.join(os.path.dirname(legacy_path), "heartbeat.json")
+                )
+            )
+            is not None
+        }
+        return build_deployment_v2(
+            name,
+            repo,
+            typed_feeds,
+            model,
+            now_fn,
+            stale_after_s,
+            heartbeat_times,
+        )
     feeds = tuple(
         (role, path, os.path.join(log_dir, f"{role}-{name}.log"), read_events(path))
-        for role, path in zip(ROLE_NAMES, list(journal_paths))
+        for role, path in zip(ROLE_NAMES, legacy_paths)
     )
     return build_deployment(
         name, repo, feeds, read_events(ledger_path), now_fn, stale_after_s
     )
+
+
+def _read_v2_events(path: str) -> tuple[EventEnvelope, ...]:
+    """Read current and rotated v2 files; reject incompatible schemas loudly."""
+
+    events: list[EventEnvelope] = []
+    for candidate in sorted(glob.glob(f"{path}*")):
+        try:
+            lines = open(candidate, encoding="utf-8").read().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                raw = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(raw, dict):
+                raise ValueError(f"{candidate}: event line is not an object")
+            events.append(decode_event(raw))
+    return tuple(events)
 
 
 # ── text render ───────────────────────────────────────────────────────────────
@@ -386,7 +454,7 @@ __all__ = [
     "DaemonHealth",
     "Deployment",
     "IssueRow",
-    "Leg",
+    "RunSummary",
     "Metrics",
     "RunningLeg",
     "STALE_AFTER_S",

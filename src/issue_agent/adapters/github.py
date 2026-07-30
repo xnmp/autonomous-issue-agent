@@ -211,11 +211,13 @@ class GhUnavailable(RuntimeError):
         detail: str,
         argv: list[str] | None = None,
         timed_out: bool = False,
+        retry_after_s: float | None = None,
     ):
         self.kind = kind
         self.detail = _one_line(detail)
         self.argv = tuple(argv or ())
         self.timed_out = timed_out
+        self.retry_after_s = retry_after_s
         super().__init__(f"GitHub {self.headline}: {self.detail}")
 
     @property
@@ -1377,6 +1379,101 @@ class GitHubGateway:
         ])
         return isinstance(data, dict) and str(data.get("state") or "").upper() == "CLOSED"
 
+    def has_review(self, pr: int, event: str, body: str, head: str) -> bool:
+        state = {
+            "APPROVE": "APPROVED",
+            "REQUEST_CHANGES": "CHANGES_REQUESTED",
+            "COMMENT": "COMMENTED",
+        }.get(event.upper(), event.upper())
+        data = self._gh_json(
+            [
+                "api",
+                f"repos/{self.repo}/pulls/{pr}/reviews",
+                "--paginate",
+                "--slurp",
+            ]
+        )
+        if not isinstance(data, list):
+            return False
+        reviews = [
+            item
+            for page in data
+            for item in (page if isinstance(page, list) else [page])
+        ]
+        return any(
+            isinstance(item, dict)
+            and str(item.get("state") or "").upper() == state
+            and item.get("body") == body
+            and item.get("commit_id") == head
+            for item in reviews
+        )
+
+    def is_auto_merge_enabled_or_merged(self, pr: int) -> bool:
+        data = self._gh_json(
+            [
+                "pr",
+                "view",
+                str(pr),
+                "--repo",
+                self.repo,
+                "--json",
+                "autoMergeRequest,state",
+            ]
+        )
+        return isinstance(data, dict) and (
+            data.get("autoMergeRequest") is not None
+            or str(data.get("state") or "").upper() == "MERGED"
+        )
+
+    def is_branch_updated(self, pr: int, prior_head: str) -> bool:
+        data = self._gh_json(
+            [
+                "pr",
+                "view",
+                str(pr),
+                "--repo",
+                self.repo,
+                "--json",
+                "headRefOid,mergeStateStatus",
+            ]
+        )
+        if not isinstance(data, dict):
+            return False
+        return (
+            bool(data.get("headRefOid"))
+            and data.get("headRefOid") != prior_head
+            and str(data.get("mergeStateStatus") or "").upper() != "BEHIND"
+        )
+
+    def max_run_attempt(self, head: str) -> int | None:
+        data = self._gh_json(
+            [
+                "api",
+                f"repos/{self.repo}/actions/runs?head_sha={head}&per_page=100",
+            ]
+        )
+        if not isinstance(data, dict) or not isinstance(
+            data.get("workflow_runs"), list
+        ):
+            return None
+        attempts = [
+            int(item.get("run_attempt") or 0)
+            for item in data["workflow_runs"]
+            if isinstance(item, dict)
+        ]
+        return max(attempts, default=0)
+
+    def has_blocked_by(self, issue: int, blocker: int) -> bool:
+        data = self._gh_json(
+            [
+                "api",
+                f"repos/{self.repo}/issues/{issue}/dependencies/blocked_by",
+                "--jq",
+                "[.[].number]",
+            ]
+        )
+        return isinstance(data, list) and blocker in data
+
     def comment(self, kind: str, number: int, body: str) -> None:
         self._gh(build_comment_args(self.repo, kind, number, body))
 
@@ -1397,15 +1494,9 @@ class GitHubGateway:
         armed-on-GitHub. The caller must key the marker on this return."""
         self._gh(build_enable_auto_merge_args(self.repo, pr, method))
         try:
-            raw = self._gh_json(
-                ["pr", "view", str(pr), "--repo", self.repo,
-                 "--json", "autoMergeRequest,state"]
-            )
-        except Exception:  # noqa: BLE001 — an unreadable probe is "not armed", never a crash
+            return self.is_auto_merge_enabled_or_merged(pr)
+        except Exception:  # noqa: BLE001 — unreadable is not confirmed
             return False
-        if not isinstance(raw, dict):
-            return False
-        return raw.get("autoMergeRequest") is not None or raw.get("state") == "MERGED"
 
     def update_branch(self, pr: int) -> None:
         """Bring a BEHIND PR branch up to date with base (merge base into head), so
@@ -1521,6 +1612,20 @@ def _subprocess_runner(argv: list[str], token: str | None) -> str:
             return "[]"
         kind = classify_gh_failure(detail)
         if kind is not None:
-            raise GhUnavailable(kind, detail, argv=argv)
+            raise GhUnavailable(
+                kind,
+                detail,
+                argv=argv,
+                retry_after_s=_retry_after(detail),
+            )
         return ""
     return res.stdout
+
+
+def _retry_after(detail: str) -> float | None:
+    match = re.search(
+        r"retry[- ]after\s*[:=]?\s*(\d+(?:\.\d+)?)",
+        detail or "",
+        re.IGNORECASE,
+    )
+    return float(match.group(1)) if match else None

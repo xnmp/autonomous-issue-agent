@@ -1,6 +1,6 @@
 """CodexRunner — runs a headless agent task on the OpenAI **Codex CLI** instead
 of the Claude Agent SDK, so the *fixer* leg can use a different/cheaper model
-(e.g. GPT-5.5 via an OpenAI-compatible gateway). Drop-in for `AgentRunner`: same `run(AgentTask) ->
+(e.g. GPT-5.5 via an OpenAI-compatible gateway). Drop-in for `AgentRunner`: same `run(RuntimePlan) ->
 AgentResult` contract, so the domain/orchestration layer is unchanged.
 
 This is the SECOND runtime adapter (see docs/CODEX-RUNNER.md). It speaks to
@@ -17,19 +17,22 @@ isolation, and structured output that our fixer depends on.
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import os
 import re
 import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from ..domain.agent_task import AgentRuntime, AgentTask, git_identity_env
+from .runtime_plan import AgentRuntime, RuntimePlan, git_identity_env
 from ..domain.outcome import (
     AgentResult,
     ExitReason,
+    MAX_BUDGET_STATUS,
     Outcome,
     classify_outcome,
     declared_status,
@@ -58,6 +61,51 @@ DEFAULT_REASONING_EFFORT = "medium"
 # through, while retaining only a bounded diagnostic if a producer goes larger.
 _STDERR_STREAM_LIMIT = 4 * 1024 * 1024
 _STDERR_RETAINED_LINE_BYTES = 16 * 1024
+_SPEND_EVIDENCE_VERSION = 1
+
+
+def spend_evidence_path(directory: str, run_id: str) -> str:
+    """Stable, path-safe location for one reserved provider run."""
+
+    digest = hashlib.sha256(str(run_id).encode()).hexdigest()
+    return os.path.join(directory, f"{digest}.json")
+
+
+def write_spend_evidence(
+    directory: str, run_id: str, evidence: dict[str, Any]
+) -> None:
+    """Atomically persist the data needed to price a killed Codex rollout."""
+
+    if not directory or not run_id:
+        return
+    os.makedirs(directory, exist_ok=True)
+    path = spend_evidence_path(directory, run_id)
+    temporary = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    payload = {
+        "version": _SPEND_EVIDENCE_VERSION,
+        "run_id": str(run_id),
+        **evidence,
+    }
+    try:
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def remove_spend_evidence(directory: str, run_id: str) -> None:
+    if not directory or not run_id:
+        return
+    try:
+        os.unlink(spend_evidence_path(directory, str(run_id)))
+    except FileNotFoundError:
+        pass
 
 
 @dataclass(frozen=True)
@@ -118,7 +166,7 @@ def _strict_schema(schema: dict) -> dict:
 
 
 def build_codex_argv(
-    task: AgentTask,
+    task: RuntimePlan,
     *,
     codex_bin: str = "codex",
     provider: CodexProvider | None = None,
@@ -129,7 +177,7 @@ def build_codex_argv(
     inject_system_prompt: bool = True,
     reasoning_effort: str = DEFAULT_REASONING_EFFORT,
 ) -> list[str]:
-    """Pure: AgentTask → `codex exec` argv. No subprocess, no I/O (the caller
+    """Pure: RuntimePlan → `codex exec` argv. No subprocess, no I/O (the caller
     writes the schema/output temp files and passes their paths). Unit-tested.
 
     `schema_path`: where the caller wrote the (strictified) JSON schema, mapped
@@ -974,7 +1022,7 @@ class CodexRunner(AgentRuntime):
     cost_per_mtok: tuple[tuple[str, float, float], ...] = ()
     cost_per_mtok_cached_in: tuple[tuple[str, float], ...] | None = None
     # Per-run spend ceiling (#29). codex has no per-session budget FLAG, so the
-    # only way `AgentTask.max_budget_usd` can bound a run is for us to watch the
+    # only way `RuntimePlan.max_budget_usd` can bound a run is for us to watch the
     # session's own streamed token counters and kill it. With this True (the
     # default) the stderr pump samples those counters on the poll-slice cadence
     # and, once THIS LEG's priced spend crosses the task budget, kills the
@@ -987,12 +1035,17 @@ class CodexRunner(AgentRuntime):
     # `budget_overrun_usd` for why a $0.00-per-run runtime must not be killed
     # on a dollar threshold.
     enforce_budget: bool = True
+    process_supervisor: Any = None
+    # Accounting writes a reservation identity into RuntimePlan.env. Persisting
+    # its rollout coordinates here lets boot recovery settle measured usage
+    # after SIGKILL or machine loss, before releasing the reservation.
+    spend_evidence_dir: str = ""
 
     def __post_init__(self) -> None:
         self._log = self.log or (lambda _m: None)
         self._wall_clock = self.wall_clock or time.time
 
-    def _resolved_model(self, task: AgentTask) -> str:
+    def _resolved_model(self, task: RuntimePlan) -> str:
         """The model this leg ACTUALLY runs on. An unpinned task carries
         model=None and codex is invoked with the runner's default, so anything
         that reports or prices a leg — commit attribution, the exec log, the
@@ -1101,7 +1154,7 @@ class CodexRunner(AgentRuntime):
             )
         return None
 
-    async def run(self, task: AgentTask) -> AgentResult:
+    async def run(self, task: RuntimePlan) -> AgentResult:
         # Fail LOUD, not opaque: if the runtime isn't set up, surface the exact
         # reason as the result summary (and log it) instead of a bare exit-1.
         reason = self.preflight()
@@ -1127,7 +1180,7 @@ class CodexRunner(AgentRuntime):
 
         return _replace(result, model=result.model or self._resolved_model(task))
 
-    async def _run_in(self, task: AgentTask, tmpdir: str) -> AgentResult:
+    async def _run_in(self, task: RuntimePlan, tmpdir: str) -> AgentResult:
         """The retry loop, given a scratch dir whose lifetime `run` owns."""
         import asyncio
         import random
@@ -1289,7 +1342,7 @@ class CodexRunner(AgentRuntime):
             await asyncio.sleep(delay)
 
     async def _exec_once(
-        self, argv: list[str], task: AgentTask, output_path: str,
+        self, argv: list[str], task: RuntimePlan, output_path: str,
         usage_baseline: tuple[str, dict, int | None] | None = None,
     ) -> tuple[AgentResult, int, str, str, bool]:
         """One `codex exec` invocation: spawn, stream stderr live, parse the
@@ -1315,11 +1368,40 @@ class CodexRunner(AgentRuntime):
         rollout_started_at = time.time()
         attempt_started_at = time.monotonic()
         execution_cwd = task.cwd or os.getcwd()
+        rate_in, rate_out, rate_cached_in = rates_with_cache_for_model(
+            model, self.cost_per_mtok, self.cost_per_mtok_cached_in,
+            fallback_in=self.cost_per_mtok_in, fallback_out=self.cost_per_mtok_out,
+        )
+        accounting_run_id = proc_env.get("ISSUE_AGENT_RUN_ID", "")
+        evidence = {
+            "cwd": os.path.realpath(execution_cwd),
+            "rollout_started_at": rollout_started_at,
+            "session_id": task.resume or "",
+            "baseline_session_id": usage_baseline[0] if usage_baseline else "",
+            "baseline_usage": usage_baseline[1] if usage_baseline else None,
+            "model": model,
+            "cost_per_mtok_in": rate_in,
+            "cost_per_mtok_out": rate_out,
+            "cost_per_mtok_cached_in": rate_cached_in,
+            "codex_home": proc_env.get("CODEX_HOME", ""),
+            "config_version": proc_env.get("ISSUE_AGENT_CONFIG_VERSION", ""),
+        }
+        write_spend_evidence(
+            self.spend_evidence_dir, accounting_run_id, evidence
+        )
+        supervision_run_id = f"codex-{uuid.uuid4().hex}"
+        spawn_argv = (
+            self.process_supervisor.supervised_command(
+                supervision_run_id, argv
+            )
+            if self.process_supervisor is not None
+            else tuple(argv)
+        )
         # Set cwd on the subprocess too, not only via `-C`: the resume subcommand
         # rejects `-C`, so this is how a resumed run still executes in the worktree
         # (harmless on the exec path — it matches the `-C` we also pass there).
         proc = await asyncio.create_subprocess_exec(
-            *argv,
+            *spawn_argv,
             stdin=asyncio.subprocess.DEVNULL,  # codex waits on stdin otherwise
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -1334,7 +1416,6 @@ class CodexRunner(AgentRuntime):
             start_new_session=True,
             limit=_STDERR_STREAM_LIMIT,
         )
-
         # Stream stderr LIVE rather than buffering to exit: codex exec emits its
         # per-tool-call trace (exec/apply_patch/tokens) to stderr, so live-reading
         # it is the only mid-run visibility we get (the whole resolve is one
@@ -1356,10 +1437,6 @@ class CodexRunner(AgentRuntime):
         # price a sample with the SAME rates the end-of-run accounting will use;
         # two lookups could drift apart and kill a run at a threshold the ledger
         # then disagrees with.
-        rate_in, rate_out, rate_cached_in = rates_with_cache_for_model(
-            model, self.cost_per_mtok, self.cost_per_mtok_cached_in,
-            fallback_in=self.cost_per_mtok_in, fallback_out=self.cost_per_mtok_out,
-        )
         # The budget check is armed only when it can actually fire: enforcement
         # on, a budget set, and a non-zero price. An unpriced runtime reads every
         # run as $0.00 (see budget_overrun_usd), so arming there would be a cap
@@ -1371,6 +1448,7 @@ class CodexRunner(AgentRuntime):
         )
         last_budget_check = self._wall_clock() if budget_armed else 0.0
         session_id = task.resume or ""
+        evidence_session_id = session_id
         implausible_usage_logged = False
         stderr_pending = b""
 
@@ -1384,19 +1462,34 @@ class CodexRunner(AgentRuntime):
             line during the run would let echoed data suppress later root-rollout
             discovery and poison budget enforcement.
             """
-            nonlocal session_id
+            nonlocal session_id, evidence_session_id
             if session_id:
                 return session_id
             stderr = "\n".join(err_chunks)
             session_id = discover_rollout_session(
                 execution_cwd, rollout_started_at
             )
+            if session_id and session_id != evidence_session_id:
+                evidence_session_id = session_id
+                write_spend_evidence(
+                    self.spend_evidence_dir,
+                    accounting_run_id,
+                    {**evidence, "session_id": session_id},
+                )
             if session_id or not allow_legacy_header:
                 return session_id
-            return (
+            legacy = (
                 _session_id_from_lines(stderr)
                 or _session_id_from_lines(extra_output)
             )
+            if legacy and legacy != evidence_session_id:
+                evidence_session_id = legacy
+                write_spend_evidence(
+                    self.spend_evidence_dir,
+                    accounting_run_id,
+                    {**evidence, "session_id": legacy},
+                )
+            return legacy
 
         def _trusted_usage(usage: dict | None, sid: str) -> dict | None:
             """Reject one implausible early sample and make the rejection loud."""
@@ -1619,6 +1712,24 @@ class CodexRunner(AgentRuntime):
             except Exception:
                 return ""
 
+        async def _observe_process_exit(timeout: float) -> bool:
+            """Wait on returncode without CPython's late Process.wait race.
+
+            After both pipe transports disconnect, ``Process.wait()`` can attach
+            an exit waiter after the transport has already scheduled its final
+            callback. In that race returncode is set but the new future sleeps
+            until timeout. The child watcher still reaps the process and updates
+            returncode, so bounded polling observes the authoritative state.
+            """
+
+            deadline = asyncio.get_running_loop().time() + timeout
+            while proc.returncode is None:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    return False
+                await asyncio.sleep(min(0.01, remaining))
+            return True
+
         # Drain stdout CONCURRENTLY with the live stderr pump — a full stdout pipe
         # would otherwise deadlock the child — but bound each read SEPARATELY:
         #
@@ -1652,10 +1763,13 @@ class CodexRunner(AgentRuntime):
                 except (asyncio.CancelledError, Exception):
                     pass
                 stdout = ""
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=10)
-            except asyncio.TimeoutError:
-                pass  # reaped best-effort; the group was killed
+            if not await _observe_process_exit(10):
+                hung = True
+                self._log(
+                    "codex: process exit was not observed within 10s after "
+                    "stream teardown"
+                )
+                _kill_quietly(proc)
         except asyncio.CancelledError:
             # Cancellation may land during stderr pumping, residual stdout
             # draining, or process reaping. All are post-spawn ownership:
@@ -1667,12 +1781,16 @@ class CodexRunner(AgentRuntime):
                 await stdout_task
             except (asyncio.CancelledError, Exception):
                 pass
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=10)
-            except asyncio.TimeoutError:
-                pass
+            if not await _observe_process_exit(10):
+                _kill_quietly(proc)
             raise
-        exit_code = proc.returncode or 0
+        finally:
+            if self.process_supervisor is not None:
+                # Successful leaders may leave background descendants that close
+                # inherited streams. Ownership ends only after the whole group is
+                # gone, never by deleting its durable receipt.
+                self.process_supervisor.kill_tree(supervision_run_id)
+        exit_code = proc.returncode if proc.returncode is not None else 124
         stderr = "\n".join(err_chunks)
         self._log(f"codex: exit {exit_code} (stderr {len(stderr)}B, out {len(stdout)}B)")
         if exit_code != 0 and stderr:
@@ -1723,8 +1841,8 @@ class CodexRunner(AgentRuntime):
                     # The literal subtype the Claude SDK reports on ITS budget
                     # abort. Reusing the exact string keeps one greppable value
                     # in the journal across both runtimes.
-                    status="error_max_budget_usd",
-                    envelope_subtype="error_max_budget_usd",
+                    status=MAX_BUDGET_STATUS,
+                    envelope_subtype=MAX_BUDGET_STATUS,
                     exit_reason=ExitReason.BUDGET_EXHAUSTED,
                     summary=(
                         f"codex spend ${spend:.2f} crossed MAX_BUDGET_USD="
@@ -1808,8 +1926,8 @@ class CodexRunner(AgentRuntime):
             return (
                 AgentResult(
                     is_error=True,
-                    status="error_max_budget_usd",
-                    envelope_subtype="error_max_budget_usd",
+                    status=MAX_BUDGET_STATUS,
+                    envelope_subtype=MAX_BUDGET_STATUS,
                     exit_reason=ExitReason.BUDGET_EXHAUSTED,
                     summary=(
                         f"codex final spend ${final_overrun:.2f} crossed "

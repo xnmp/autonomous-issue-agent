@@ -40,15 +40,12 @@ job someone still has to do; the same file in `history/` is a record.
 
 ## open/
 
-- [2026-07-27-handover-fourth-deployment.md](open/2026-07-27-handover-fourth-deployment.md)
-  — **start here.** The working brief for the next deployment session: current
-  daemon state, everything that changed in the optimization session and what to
-  watch on its first real dispatch (routing, synthetic codex pricing, patch-id
-  skips, holds, recurrences), candidate issue batch, monitoring recipe, gotchas
 - [residuals.md](open/residuals.md) — everything deliberately still open, why,
   and what triggers the work. **Read §1 before pointing this at a real repo.**
-- [issues/](open/issues/) — three unresolved incident write-ups, not
-  re-validated against the current tree
+- [2026-07-30-architectural-review-and-plan.md](open/2026-07-30-architectural-review-and-plan.md)
+  — completed implementation record; retained here until the changes land.
+- [issues/](open/issues/) — unresolved incident write-ups awaiting
+  re-validation against the current tree.
 
 ## history/
 
@@ -92,8 +89,6 @@ specs), plus the SDK-port planning docs (`refactor-sdk.md`,
 `refactor-roadmap.md`, `architecture-status.md`) that describe a migration since
 completed.
 
-These remain accurate about the **legacy bash watchers** under `agent/`,
-`review/`, `steward/`, which still exist and still run under
-`FIXER_RUNTIME=codex` / `make run-fix-sh`. They are **not** accurate about the
-default SDK path. `plugin/hooks/checks/` in particular is live for codex mode
-and is pinned against the Python gate by `tests/test_gate_parity.py`.
+The archived specs describe deleted bash watchers and are not accurate about
+the Python path. `plugin/hooks/checks/` is still live for Codex mode and is
+pinned against the Python gate by `tests/test_gate_parity.py`.

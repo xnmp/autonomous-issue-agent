@@ -2,22 +2,32 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ...adapters.journal import groomed_keys, read_events_tail, recurrence_keys
 from ...domain import triage as triage_dom
-from ...domain.agent_task import AgentRuntime
+from ...adapters.runtime_plan import AgentRuntime
+from ...domain.ports import (
+    ActionExecutor,
+    ControlStore,
+    LegacyJournal,
+    RecentMergesReads,
+    WorkflowGitHubReads,
+    WorkflowState,
+)
 from ...domain.triage import TriageConfig
 from ...domain.triage import TriageVerdict
 from ..planners import tasks as task_builders
 from ..planners.tasks import GroomTaskConfig, TriageTaskConfig
+from .base import run_leg
 
 
 @dataclass(frozen=True)
 class StewardWorkflowConfig:
     triage: TriageTaskConfig | None
     triage_cfg: TriageConfig | None
-    log: object
+    log: Callable[[str], None]
     groom: GroomTaskConfig | None = None
     # Fixer login — whose merged PRs form the "already shipped by this harness"
     # reference set the recurrence check matches against (harness #10). Blank →
@@ -28,7 +38,8 @@ class StewardWorkflowConfig:
     repo: str = ""
     # Where recurrence events land. Optional so every existing caller/test keeps
     # working; None → the label + comment still happen, only the metric is lost.
-    journal: object | None = None
+    journal: LegacyJournal | None = None
+    dedupe: ControlStore | None = None
 
 
 def _merge_lines(merged) -> str:
@@ -42,10 +53,10 @@ def _merge_lines(merged) -> str:
 @dataclass
 class StewardWorkflow:
     cfg: StewardWorkflowConfig
-    gateway: object
-    store: object
+    gateway: WorkflowGitHubReads
+    store: WorkflowState
     runner: AgentRuntime
-    executor: object
+    executor: ActionExecutor
     # `block_key`s this process has already journalled — the in-memory half of the
     # recurrence edge trigger. The journal read below is the half that survives a
     # daemon restart; this one keeps the steady state free of file reads.
@@ -60,11 +71,10 @@ class StewardWorkflow:
         Same contract as `FixWorkflow._prompt_input`: a context fetch may never
         kill the leg it was only meant to enrich.
         """
-        fn = getattr(self.gateway, "recently_merged_issues", None)
-        if fn is None or not self.cfg.fix_bot:
+        if not isinstance(self.gateway, RecentMergesReads) or not self.cfg.fix_bot:
             return ()
         try:
-            return tuple(fn(self.cfg.fix_bot) or ())
+            return tuple(self.gateway.recently_merged_issues(self.cfg.fix_bot) or ())
         except Exception as exc:  # noqa: BLE001 — see docstring
             self.cfg.log(f"recurrence context unavailable: {exc}")
             return ()
@@ -80,7 +90,10 @@ class StewardWorkflow:
         journal = self.cfg.journal
         if journal is None:
             return
-        if key in recurrence_keys(read_events_tail(journal.path)):
+        if self.cfg.dedupe is not None:
+            if not self.cfg.dedupe.claim("recurrence", self.cfg.repo, key):
+                return
+        elif key in recurrence_keys(read_events_tail(journal.path)):
             return
         journal.emit(
             "recurrence", kind="refiled", issue=issue, of_issue=of_issue,
@@ -93,7 +106,12 @@ class StewardWorkflow:
             return
         self._emitted.add(key)
         journal = self.cfg.journal
-        if journal is None or key in groomed_keys(read_events_tail(journal.path)):
+        if journal is None:
+            return
+        if self.cfg.dedupe is not None:
+            if not self.cfg.dedupe.claim("groomed", self.cfg.repo, key):
+                return
+        elif key in groomed_keys(read_events_tail(journal.path)):
             return
         fields = {"kind": kind, "issue": issue, "block_key": key}
         if ref:
@@ -106,6 +124,10 @@ class StewardWorkflow:
         key = f"groomed:{self.cfg.repo}:{issue}:{kind}:{ref or pr}"
         if key in self._emitted:
             return True
+        if self.cfg.dedupe is not None:
+            # Durable effects are independently idempotent. Do not consume the
+            # telemetry dedupe key before the remote advisory write succeeds.
+            return False
         journal = self.cfg.journal
         return journal is not None and key in groomed_keys(read_events_tail(journal.path))
 
@@ -115,9 +137,15 @@ class StewardWorkflow:
             return
         iss = self.gateway.get_issue(issue)
         merged = self._recent_merges()
-        result = await self.runner.run(task_builders.build_groom_task(
-            issue, iss.title, iss.body, self.cfg.groom, _merge_lines(merged)
-        ))
+        result = await run_leg(
+            self.runner,
+            self.cfg.log,
+            "groom",
+            issue,
+            task_builders.build_groom_task(
+                issue, iss.title, iss.body, self.cfg.groom, _merge_lines(merged)
+            ),
+        )
         if result.is_error or not isinstance(result.structured, dict):
             self.cfg.log(f"groom #{issue}: {result.status or 'error'} — no finding, will retry")
             return
@@ -165,7 +193,9 @@ class StewardWorkflow:
             issue, iss.title, iss.body, thread, self.cfg.triage,
             recent_merges=_merge_lines(merged),
         )
-        result = await self.runner.run(task)
+        result = await run_leg(
+            self.runner, self.cfg.log, "triage", issue, task
+        )
         if result.is_error or not isinstance(result.structured, dict):
             self.cfg.log(f"triage #{issue}: {result.status or 'error'} — no verdict, will retry")
             return

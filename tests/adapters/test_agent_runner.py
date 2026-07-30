@@ -1,9 +1,10 @@
-"""AgentRunner pure mapping — AgentTask→options kwargs and ResultMessage→AgentResult.
+"""AgentRunner pure mapping — RuntimePlan→options kwargs and ResultMessage→AgentResult.
 
 No live SDK call: build_option_kwargs and result_to_agent_result are pure, and
 result mapping is duck-typed so a stand-in object stands in for ResultMessage.
 """
 
+import asyncio
 from dataclasses import dataclass
 
 from issue_agent.adapters import agent_runner
@@ -13,7 +14,7 @@ from issue_agent.adapters.agent_runner import (
     build_option_kwargs,
     result_to_agent_result,
 )
-from issue_agent.domain.agent_task import AgentTask, McpServer, SubagentDef
+from issue_agent.adapters.runtime_plan import McpServer, RuntimePlan, SubagentDef
 from issue_agent.domain.outcome import ExitReason
 
 
@@ -23,12 +24,12 @@ def test_default_permission_mode_is_bypass():
 
 def test_schema_maps_to_output_format():
     schema = {"type": "object"}
-    kw = build_option_kwargs(AgentTask(prompt="x", schema=schema))
+    kw = build_option_kwargs(RuntimePlan(prompt="x", schema=schema))
     assert kw["output_format"] == {"type": "json_schema", "schema": schema}
 
 
 def test_append_system_prompt_uses_claude_code_preset():
-    kw = build_option_kwargs(AgentTask(prompt="x", append_system_prompt="rules"))
+    kw = build_option_kwargs(RuntimePlan(prompt="x", append_system_prompt="rules"))
     assert kw["system_prompt"] == {
         "type": "preset",
         "preset": "claude_code",
@@ -38,12 +39,12 @@ def test_append_system_prompt_uses_claude_code_preset():
 
 def test_no_append_still_uses_preset():
     # The SDK defaults to a MINIMAL prompt; we must opt into the claude_code preset.
-    kw = build_option_kwargs(AgentTask(prompt="x"))
+    kw = build_option_kwargs(RuntimePlan(prompt="x"))
     assert kw["system_prompt"] == {"type": "preset", "preset": "claude_code"}
 
 
 def test_subagents_map_to_agents_dict_and_add_task_tool():
-    task = AgentTask(
+    task = RuntimePlan(
         prompt="x",
         allowed_tools=("Read",),
         subagents=(
@@ -69,13 +70,13 @@ def test_subagents_map_to_agents_dict_and_add_task_tool():
 
 
 def test_no_subagents_means_no_agents_key_and_no_task_tool():
-    kw = build_option_kwargs(AgentTask(prompt="x", allowed_tools=("Read",)))
+    kw = build_option_kwargs(RuntimePlan(prompt="x", allowed_tools=("Read",)))
     assert "agents" not in kw
     assert "Task" not in kw.get("allowed_tools", [])
 
 
 def test_tools_model_budget_cwd_resume_map():
-    task = AgentTask(
+    task = RuntimePlan(
         prompt="x",
         allowed_tools=("Read", "Bash(git *)"),
         disallowed_tools=("Edit", "Write"),
@@ -97,7 +98,7 @@ def test_tools_model_budget_cwd_resume_map():
 
 
 def test_mcp_servers_and_tool_globs():
-    task = AgentTask(
+    task = RuntimePlan(
         prompt="x",
         allowed_tools=("Read",),
         mcp_servers=(McpServer("sonarqube", {"command": "npx"}, "mcp__sonarqube__*"),),
@@ -109,12 +110,12 @@ def test_mcp_servers_and_tool_globs():
 
 def test_hooks_passed_through():
     sentinel = {"PreToolUse": ["matcher"]}
-    kw = build_option_kwargs(AgentTask(prompt="x"), extra_hooks=sentinel)
+    kw = build_option_kwargs(RuntimePlan(prompt="x"), extra_hooks=sentinel)
     assert kw["hooks"] is sentinel
 
 
 def test_permission_mode_override():
-    kw = build_option_kwargs(AgentTask(prompt="x"), permission_mode="auto")
+    kw = build_option_kwargs(RuntimePlan(prompt="x"), permission_mode="auto")
     assert kw["permission_mode"] == "auto"
 
 
@@ -126,21 +127,21 @@ def test_default_buffer_survives_a_five_megabyte_read():
 
 
 def test_buffer_knob_reaches_the_options():
-    kw = build_option_kwargs(AgentTask(prompt="x"), max_buffer_size=4096)
+    kw = build_option_kwargs(RuntimePlan(prompt="x"), max_buffer_size=4096)
     assert kw["max_buffer_size"] == 4096
 
 
 def test_no_buffer_knob_leaves_the_sdk_default_alone():
-    kw = build_option_kwargs(AgentTask(prompt="x"))
+    kw = build_option_kwargs(RuntimePlan(prompt="x"))
     assert "max_buffer_size" not in kw
-    assert "max_buffer_size" not in build_option_kwargs(AgentTask(prompt="x"), max_buffer_size=0)
+    assert "max_buffer_size" not in build_option_kwargs(RuntimePlan(prompt="x"), max_buffer_size=0)
 
 
 def test_a_runner_applies_the_default_buffer_to_every_session(monkeypatch):
     seen = {}
     _install_fake_sdk(monkeypatch, [_ResultMessage(is_error=False)], capture=seen)
     monkeypatch.setattr(agent_runner, "_OPTION_FIELDS", frozenset({"max_buffer_size"}))
-    asyncio.run(AgentRunner().run(AgentTask(prompt="x")))
+    asyncio.run(AgentRunner().run(RuntimePlan(prompt="x")))
     assert seen["options"]["max_buffer_size"] == DEFAULT_MAX_BUFFER_BYTES
 
 
@@ -151,7 +152,7 @@ def test_buffer_option_is_dropped_on_an_sdk_build_without_the_field(monkeypatch)
     _install_fake_sdk(monkeypatch, [_ResultMessage(is_error=False)], capture=seen)
     monkeypatch.setattr(agent_runner, "_OPTION_FIELDS", frozenset())
     logged: list[str] = []
-    asyncio.run(AgentRunner(log=logged.append).run(AgentTask(prompt="x")))
+    asyncio.run(AgentRunner(log=logged.append).run(RuntimePlan(prompt="x")))
     assert "max_buffer_size" not in seen["options"]
     assert any("no max_buffer_size" in m for m in logged)
 
@@ -174,14 +175,14 @@ def test_the_installed_sdk_accepts_max_buffer_size():
 def test_effort_reaches_the_options_as_the_sdk_word():
     from issue_agent.domain.effort import Effort
 
-    kw = build_option_kwargs(AgentTask(prompt="x", effort=Effort.HIGH))
+    kw = build_option_kwargs(RuntimePlan(prompt="x", effort=Effort.HIGH))
     assert kw["effort"] == "high"
 
 
 def test_a_task_with_no_effort_says_nothing():
     """Adding the field must not pin every existing dispatch to the harness's
     idea of an effort — a task with no opinion keeps the SDK's own default."""
-    assert "effort" not in build_option_kwargs(AgentTask(prompt="x"))
+    assert "effort" not in build_option_kwargs(RuntimePlan(prompt="x"))
 
 
 def test_effort_option_is_dropped_on_an_sdk_build_without_the_field(monkeypatch):
@@ -193,7 +194,7 @@ def test_effort_option_is_dropped_on_an_sdk_build_without_the_field(monkeypatch)
     _install_fake_sdk(monkeypatch, [_ResultMessage(is_error=False)], capture=seen)
     monkeypatch.setattr(agent_runner, "_OPTION_FIELDS", frozenset())
     logged: list[str] = []
-    asyncio.run(AgentRunner(log=logged.append).run(AgentTask(prompt="x", effort=Effort.HIGH)))
+    asyncio.run(AgentRunner(log=logged.append).run(RuntimePlan(prompt="x", effort=Effort.HIGH)))
     assert "effort" not in seen["options"]
     assert any("no effort option" in m for m in logged)
 
@@ -204,7 +205,7 @@ def test_effort_survives_to_the_session_on_a_build_that_has_the_field(monkeypatc
     seen = {}
     _install_fake_sdk(monkeypatch, [_ResultMessage(is_error=False)], capture=seen)
     monkeypatch.setattr(agent_runner, "_OPTION_FIELDS", frozenset({"effort"}))
-    asyncio.run(AgentRunner().run(AgentTask(prompt="x", effort=Effort.LOW)))
+    asyncio.run(AgentRunner().run(RuntimePlan(prompt="x", effort=Effort.LOW)))
     assert seen["options"]["effort"] == "low"
 
 
@@ -236,7 +237,7 @@ def test_a_transport_death_carries_the_last_trace_on_the_exception(monkeypatch):
     carrier.content = [blk]
     _install_fake_sdk(monkeypatch, [carrier], raise_after=True)
     try:
-        asyncio.run(AgentRunner().run(AgentTask(prompt="x")))
+        asyncio.run(AgentRunner().run(RuntimePlan(prompt="x")))
     except RuntimeError as exc:
         assert "Read(evidence/shot.png)" in getattr(exc, "harness_last_trace", "")
     else:
@@ -428,7 +429,7 @@ def test_run_honours_result_despite_post_result_raise(monkeypatch):
         session_id="s1",
     )
     _install_fake_sdk(monkeypatch, [msg], raise_after=True)
-    r = asyncio.run(AgentRunner().run(AgentTask(prompt="x")))
+    r = asyncio.run(AgentRunner().run(RuntimePlan(prompt="x")))
     # The post-result ProcessError must NOT clobber the captured envelope.
     assert r.status == "pr_opened"
     assert r.session_id == "s1"
@@ -452,7 +453,7 @@ def test_unpinned_sdk_legs_journal_the_init_models_resolved_value(monkeypatch, t
         runner = JournalingRuntime(AgentRunner(), journal, role=role)
         runner.set_context(role, kind, 100, 91)
 
-        asyncio.run(runner.run(AgentTask(prompt="unconfigured SDK leg")))
+        asyncio.run(runner.run(RuntimePlan(prompt="unconfigured SDK leg")))
 
         start, settled = read_events(journal.path)
         assert start["model"] == ""
@@ -474,7 +475,7 @@ def test_pinned_sdk_review_journal_keeps_the_configured_model(monkeypatch, tmp_p
     runner = JournalingRuntime(AgentRunner(), journal, role="review")
     runner.set_context("review", "REVIEW", 100, 91)
 
-    asyncio.run(runner.run(AgentTask(prompt="configured SDK leg", model="opus")))
+    asyncio.run(runner.run(RuntimePlan(prompt="configured SDK leg", model="opus")))
 
     start, settled = read_events(journal.path)
     assert start["model"] == "opus"
@@ -493,7 +494,7 @@ def test_unpinned_sdk_no_result_journals_the_init_models_resolved_value(monkeypa
     runner = JournalingRuntime(AgentRunner(), journal, role="review")
     runner.set_context("review", "REVIEW", 100, 91)
 
-    asyncio.run(runner.run(AgentTask(prompt="unconfigured SDK leg")))
+    asyncio.run(runner.run(RuntimePlan(prompt="unconfigured SDK leg")))
 
     start, settled = read_events(journal.path)
     assert start["model"] == ""
@@ -515,7 +516,7 @@ def test_unpinned_sdk_timeout_journals_the_init_models_resolved_value(monkeypatc
     )
     runner.set_context("review", "REVIEW", 100, 91)
 
-    asyncio.run(runner.run(AgentTask(prompt="unconfigured SDK leg")))
+    asyncio.run(runner.run(RuntimePlan(prompt="unconfigured SDK leg")))
 
     _, settled = read_events(journal.path)
     assert settled["exit_reason"] == "idle_timeout"
@@ -535,7 +536,7 @@ def test_run_skips_task_notification_followup_result(monkeypatch):
         session_id="real",
     )
     _install_fake_sdk(monkeypatch, [followup, real])
-    r = asyncio.run(AgentRunner().run(AgentTask(prompt="x")))
+    r = asyncio.run(AgentRunner().run(RuntimePlan(prompt="x")))
     assert r.status == "pr_opened"
     assert r.session_id == "real"
 
@@ -543,7 +544,7 @@ def test_run_skips_task_notification_followup_result(monkeypatch):
 def test_run_reraises_when_crash_before_any_result(monkeypatch):
     _install_fake_sdk(monkeypatch, [], raise_after=True)
     try:
-        asyncio.run(AgentRunner().run(AgentTask(prompt="x")))
+        asyncio.run(AgentRunner().run(RuntimePlan(prompt="x")))
     except RuntimeError:
         pass
     else:
@@ -563,7 +564,7 @@ def test_transport_death_is_logged_with_type_and_last_message(monkeypatch):
     _install_fake_sdk(monkeypatch, [carrier], raise_after=True)  # raise, no result
     logged: list[str] = []
     try:
-        asyncio.run(AgentRunner(log=logged.append, debug=True).run(AgentTask(prompt="x")))
+        asyncio.run(AgentRunner(log=logged.append, debug=True).run(RuntimePlan(prompt="x")))
     except RuntimeError:
         pass
     joined = "\n".join(logged)
@@ -576,7 +577,7 @@ def test_transport_death_logged_even_without_debug(monkeypatch):
     _install_fake_sdk(monkeypatch, [], raise_after=True)
     logged: list[str] = []
     try:
-        asyncio.run(AgentRunner(log=logged.append, debug=False).run(AgentTask(prompt="x")))
+        asyncio.run(AgentRunner(log=logged.append, debug=False).run(RuntimePlan(prompt="x")))
     except RuntimeError:
         pass
     assert any("transport died before any ResultMessage" in m for m in logged)
@@ -608,7 +609,7 @@ def test_idle_timeout_trips_on_hang(monkeypatch):
     _install_hanging_sdk(monkeypatch, [], hang_after=True)
     logged: list[str] = []
     r = asyncio.run(
-        AgentRunner(log=logged.append, idle_timeout=0.2).run(AgentTask(prompt="x"))
+        AgentRunner(log=logged.append, idle_timeout=0.2).run(RuntimePlan(prompt="x"))
     )
     assert r.is_error and r.status == "timeout"
     assert r.exit_reason is ExitReason.IDLE_TIMEOUT
@@ -637,7 +638,7 @@ def test_dispatch_cancellation_joins_pending_watchdog_receive(monkeypatch):
     async def scenario():
         task = asyncio.create_task(
             AgentRunner(idle_timeout=60.0, poll_slice=0.01).run(
-                AgentTask(prompt="x")
+                RuntimePlan(prompt="x")
             )
         )
         await asyncio.sleep(0.02)
@@ -655,7 +656,7 @@ def test_clean_end_without_result_classifies_as_no_result(monkeypatch):
     yielded a ResultMessage. It is an error, but a DIFFERENT one from the agent
     reporting failure — the taxonomy has to say which."""
     _install_fake_sdk(monkeypatch, [])  # ends cleanly, no result, no raise
-    r = asyncio.run(AgentRunner().run(AgentTask(prompt="x")))
+    r = asyncio.run(AgentRunner().run(RuntimePlan(prompt="x")))
     assert r.is_error is True
     assert r.exit_reason is ExitReason.NO_RESULT
 
@@ -685,7 +686,7 @@ def test_idle_watchdog_trips_on_wall_clock_not_monotonic(monkeypatch):
     r = asyncio.run(
         AgentRunner(
             log=logged.append, idle_timeout=900.0, poll_slice=0.05, wall_clock=wall
-        ).run(AgentTask(prompt="x"))
+        ).run(RuntimePlan(prompt="x"))
     )
     assert r.is_error and r.status == "timeout"
     assert any("IDLE" in m for m in logged)
@@ -710,7 +711,7 @@ def test_idle_timeout_does_not_trip_on_steady_stream(monkeypatch):
     fake.query = fake_query
     monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake)
 
-    r = asyncio.run(AgentRunner(idle_timeout=0.2).run(AgentTask(prompt="x")))
+    r = asyncio.run(AgentRunner(idle_timeout=0.2).run(RuntimePlan(prompt="x")))
     assert r.is_error is False and r.status == "pr_opened"  # completed, never tripped
 
 
@@ -743,7 +744,7 @@ def test_gap_longer_than_poll_slice_still_delivers_result(monkeypatch):
     logged: list[str] = []
     r = asyncio.run(
         AgentRunner(log=logged.append, idle_timeout=5.0, poll_slice=0.05).run(
-            AgentTask(prompt="x")
+            RuntimePlan(prompt="x")
         )
     )
     # The result survives the > poll_slice gaps; no idle trip, no drop.
@@ -783,7 +784,7 @@ def test_wall_cap_trips_when_idle_timeout_is_disabled(monkeypatch):
         AgentRunner(
             log=logged.append, idle_timeout=None, max_runtime=900.0,
             poll_slice=0.05, wall_clock=wall,
-        ).run(AgentTask(prompt="x"))
+        ).run(RuntimePlan(prompt="x"))
     )
 
     assert r.is_error and r.status == "timeout"
@@ -816,7 +817,7 @@ def test_wall_cap_trips_on_a_limping_stream_the_idle_watchdog_never_catches(monk
     r = asyncio.run(
         AgentRunner(
             log=logged.append, idle_timeout=900.0, max_runtime=900.0, wall_clock=wall
-        ).run(AgentTask(prompt="x"))
+        ).run(RuntimePlan(prompt="x"))
     )
 
     assert r.exit_reason is ExitReason.WALL_TIMEOUT
@@ -835,7 +836,7 @@ def test_wall_cap_honours_a_result_already_captured(monkeypatch):
     wall = _jumping_wall([1000.0, 1000.0, 1000.0, 4600.0])
 
     r = asyncio.run(
-        AgentRunner(max_runtime=900.0, wall_clock=wall).run(AgentTask(prompt="x"))
+        AgentRunner(max_runtime=900.0, wall_clock=wall).run(RuntimePlan(prompt="x"))
     )
 
     assert r.status == "pr_opened"
@@ -854,7 +855,7 @@ def test_healthy_short_run_is_not_capped(monkeypatch):
 
     r = asyncio.run(
         AgentRunner(log=logged.append, idle_timeout=900.0, max_runtime=2700.0).run(
-            AgentTask(prompt="x")
+            RuntimePlan(prompt="x")
         )
     )
 
@@ -952,19 +953,19 @@ def test_wall_timeout_result_carries_the_tokens_spent_before_the_abort():
 
 
 def test_env_carries_git_identity_when_model_set():
-    kw = build_option_kwargs(AgentTask(prompt="p", model="claude-sonnet-5"))
+    kw = build_option_kwargs(RuntimePlan(prompt="p", model="claude-sonnet-5"))
     assert kw["env"]["GIT_AUTHOR_NAME"] == "Harness - claude-sonnet-5"
     assert kw["env"]["GIT_COMMITTER_NAME"] == "Harness - claude-sonnet-5"
 
 
 def test_task_env_override_beats_identity():
     kw = build_option_kwargs(
-        AgentTask(prompt="p", model="m", env={"GIT_AUTHOR_NAME": "me"})
+        RuntimePlan(prompt="p", model="m", env={"GIT_AUTHOR_NAME": "me"})
     )
     assert kw["env"]["GIT_AUTHOR_NAME"] == "me"
     assert kw["env"]["GIT_COMMITTER_NAME"] == "Harness - m"
 
 
 def test_no_model_no_task_env_emits_no_env():
-    kw = build_option_kwargs(AgentTask(prompt="p"))
+    kw = build_option_kwargs(RuntimePlan(prompt="p"))
     assert "env" not in kw

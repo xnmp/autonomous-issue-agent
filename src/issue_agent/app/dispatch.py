@@ -1,5 +1,5 @@
 """AgentDispatcher — turns a RunAgent(kind, n) into: gather inputs → build the
-AgentTask → run it → apply the pure follow-up Actions + persist session/counters.
+RuntimePlan → run it → apply pure follow-up Actions + persist session/counters.
 
 This is the impure glue the executor's `run_agent` calls. It owns the GitHub
 reads the follow-up needs (notably the ground-truth "did a PR actually open?"
@@ -15,31 +15,36 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
-
 from collections.abc import Callable
 
-from ..adapters.journal import (
-    COST_BLINDSPOT_MIN_RUNS,
-    alert,
-    cost_blindspot_warning,
-    event_line,
-    read_events_tail,
-    spend_blocked_keys,
-    sum_issue,
-)
 from ..domain import review as review_dom, triage as triage_dom
-from ..domain.actions import AgentKind, PostComment, RunAgent
-from ..domain.agent_task import AgentRuntime
-from ..domain.labels import Label
-from ..domain.lifecycle import issue_escalation, pr_escalation
+from ..domain.actions import AgentKind, RunAgent
+from ..adapters.runtime_plan import (
+    AgentRuntime,
+    ContextualRuntime,
+)
+from ..domain.agent_task import (
+    RuntimeName,
+)
 from ..domain.outcome import deterministic_death
+from ..domain.ports import (
+    ActionExecutor,
+    ControlStore,
+    FixWorktreePort,
+    LegacyJournal,
+    WorkflowGitHubReads,
+    WorkflowState,
+)
 from .planners.tasks import FixTaskConfig, GroomTaskConfig, JiraTaskConfig, ReviewTaskConfig, TriageTaskConfig
-from .spend_gate import read_daily_cap_breach
 from .workflows.fix import FixWorkflow, FixWorkflowConfig
 from .workflows.jira import JiraSyncWorkflow, JiraSyncWorkflowConfig
 from .workflows.review import ReviewWorkflow, ReviewWorkflowConfig
 from .workflows.steward import StewardWorkflow, StewardWorkflowConfig
+from .workflows.base import run_leg
+
+
+def _ignore_log(_message: str) -> None:
+    pass
 
 
 @dataclass
@@ -66,7 +71,7 @@ class DispatchConfig:
     # verdicts on a PR (the rejection ceiling), distinguishing them from any human
     # or other-bot reviews.
     review_bot: str = ""
-    reviewer_runtime: str = "claude"
+    reviewer_runtime: RuntimeName = RuntimeName.CLAUDE
     review_execution_cwd: str = ""
     review_prepare_cwd: Callable[[str], None] | None = None
     fix_mcp_config: str = ""
@@ -75,35 +80,21 @@ class DispatchConfig:
     # reviewer's trigger label (default ai-pr-open; ai-review for an external repo).
     review_trigger_label: str = "ai-pr-open"
     # Diagnostic logger (stderr in production; the steward passes its tagged logger).
-    log: Callable[[str], None] = lambda _m: None
+    log: Callable[[str], None] = _ignore_log
     # Fixer login, threaded to FixWorkflow so its resume path filters comments
     # with the same rule the decide side uses (see FixWorkflowConfig.fix_bot).
     fix_bot: str = ""
     # Fixer runtime ("claude" | "codex"), threaded to FixWorkflow so difficulty
     # routing picks from the runtime's own model family (see MODEL_TIERS).
-    fixer_runtime: str = "claude"
+    fixer_runtime: RuntimeName = RuntimeName.CLAUDE
+
     # Kill switch for the evidence-driven tier/effort ladder (#16). See
     # FixWorkflowConfig.escalate_on_evidence.
     escalate_on_evidence: bool = True
-    # ── spend circuit breakers ────────────────────────────────────────────────
-    # Which daemon this dispatcher belongs to, and the repo it targets: journal
-    # attribution only, but without them a shared ledger cannot answer "who spent
-    # this?".
+    # Paid accounting is enforced by the runtime wrapper over SQLite. These two
+    # fields only provide durable run attribution.
     role: str = ""
     repo: str = ""
-    # The GLOBAL ledger (see adapters.journal.default_ledger_path). Blank → the
-    # caps are inert, because a cap that cannot read the spend would either block
-    # everything or nothing depending on how the read failed.
-    spend_ledger_path: str = ""
-    # 0 disables either cap. Defaults here are 0 (not the operator defaults in
-    # HarnessConfig) so a hand-built DispatchConfig — every test, every caller
-    # that predates this — keeps exactly its old behavior.
-    issue_spend_cap_usd: float = 0.0
-    # Today's spend on `repo` (#32 — the ledger is shared, the knob is per-repo).
-    daily_spend_cap_usd: float = 0.0
-    # Today's spend across every repo on this box (config/shared.env).
-    global_daily_spend_cap_usd: float = 0.0
-    alert_cmd: str = ""
     # The ceiling this role's decide side reads off the infra-death counter
     # (fix: max_infra_deaths; review: max_unproductive_rounds). Used ONLY to
     # saturate the counter on a deterministic death (#13) so the role's existing
@@ -111,6 +102,12 @@ class DispatchConfig:
     # 0 = unknown/disabled → the ordinary +1 bump, i.e. exactly today's behavior
     # for every hand-built DispatchConfig.
     max_infra_deaths: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reviewer_runtime, RuntimeName):
+            self.reviewer_runtime = RuntimeName(self.reviewer_runtime)
+        if not isinstance(self.fixer_runtime, RuntimeName):
+            self.fixer_runtime = RuntimeName(self.fixer_runtime)
 
     def fix_workflow_config(self) -> FixWorkflowConfig:
         return FixWorkflowConfig(
@@ -166,14 +163,15 @@ class AgentDispatcher:
     def __init__(
         self,
         cfg: DispatchConfig,
-        gateway,
-        store,
-        worktrees,
+        gateway: WorkflowGitHubReads,
+        store: WorkflowState,
+        worktrees: FixWorktreePort,
         runner: AgentRuntime,
-        executor,
-        prepare_cwd=None,
-        journal=None,
-        reserve_fix_paths=None,
+        executor: ActionExecutor,
+        prepare_cwd: Callable[[str], None] | None = None,
+        journal: LegacyJournal | None = None,
+        reserve_fix_paths: Callable[[int, frozenset[str]], bool] | None = None,
+        dedupe: ControlStore | None = None,
     ):
         self.cfg = cfg
         self.gw = gateway
@@ -185,10 +183,6 @@ class AgentDispatcher:
         # gateway must not silently move a counter into a key space nobody
         # reads (review P1R-1); see `_spend_target`.
         self._issue_memo: dict[int, int] = {}
-        # `block_key`s already journalled/alerted this process — the in-memory
-        # half of the spend cap's edge trigger (review P1R-2).
-        self._spend_blocked: set[str] = set()
-        self._cost_blindspot_checked = False
         self.fix_workflow = FixWorkflow(
             # Journal folded in here for the same reason as the steward's below:
             # it arrives as a constructor argument, not through DispatchConfig.
@@ -210,7 +204,11 @@ class AgentDispatcher:
             # The journal reaches the dispatcher as a constructor argument, not
             # through DispatchConfig, so it is folded in here rather than being
             # duplicated as a second config field that could disagree with it.
-            replace(cfg.steward_workflow_config(), journal=journal),
+            replace(
+                cfg.steward_workflow_config(),
+                journal=journal,
+                dedupe=dedupe,
+            ),
             gateway, store, runner, executor,
         )
         self.jira_workflow = JiraSyncWorkflow(cfg.jira_workflow_config(), gateway, store, runner)
@@ -219,14 +217,9 @@ class AgentDispatcher:
         """Run one agent leg, bracketing it with start/done breadcrumbs so a long
         in-session TDD run isn't a silent gap in the log. The per-commit milestones
         (red:/green:/docs:) are logged live by the governor hook as they happen."""
-        self.cfg.log(f"agent #{issue}: {label} — running")
-        result = await self.runner.run(task)
-        self.cfg.log(
-            f"agent #{issue}: {label} — done "
-            f"(status={result.status or ('error' if result.is_error else 'ok')}"
-            f"{f', ${result.cost_usd:.2f}' if result.cost_usd else ''})"
+        return await run_leg(
+            self.runner, self.cfg.log, label, issue, task
         )
-        return result
 
     # Kinds keyed by PR number rather than issue number. The per-issue spend cap
     # needs the ISSUE behind the work, so these are resolved through the gateway.
@@ -307,185 +300,6 @@ class AgentDispatcher:
                 )
         return -action.number
 
-    def _pr_escalation_label(self, kind: AgentKind) -> Label:
-        """Which lifecycle label a PR escalation removes. The reviewer's trigger
-        label is configurable (ai-review on a repo where another bot owns
-        ai-pr-open) and removing the wrong one leaves the PR pickable forever
-        (review M10/D4); the fixer's PR legs are always gated on ai-pr-open. An
-        unknown string is a misconfiguration — fall back loudly rather than
-        crash mid-escalation, exactly as `ReviewWorkflow._trigger_label` does."""
-        if kind not in (AgentKind.REVIEW, AgentKind.RE_REVIEW):
-            return Label.AI_PR_OPEN
-        try:
-            return Label(self.cfg.review_trigger_label)
-        except ValueError:
-            self.cfg.log(
-                f"spend: REVIEW_TRIGGER_LABEL '{self.cfg.review_trigger_label}' is not "
-                f"a known lifecycle label — escalating from '{Label.AI_PR_OPEN.value}'"
-            )
-            return Label.AI_PR_OPEN
-
-    def _blocked_on_spend(self, action: RunAgent, issue: int | None) -> bool:
-        """Two circuit breakers, checked before a single token is bought.
-
-        **Per-issue (lifetime)** — a one-shot escalation. Work that has already
-        cost the cap is not going to converge on the next retry, so it moves
-        <lifecycle label> → needs-human-review, which structurally removes it
-        from the pickable set. Uses the domain's `issue_escalation` /
-        `pr_escalation` so the comment+relabel pair matches every other breaker.
-
-        Escalating the ISSUE is only one-shot for issue-keyed legs (review
-        P1R-2). A PR-keyed leg is picked from the PR's OWN labels, so relabelling
-        the issue behind it left the PR ai-pr-open, pickable, and hitting the cap
-        again on the very next poll: 10 polls, 10 "Circuit breaker" comments, 10
-        spend_block events and 10 ALERT_CMD runs — ~4,300 a day at
-        POLL_SECONDS=20. The escalation therefore targets whatever the DISPATCH
-        is gated on, and the journal/alert pair is edge-triggered on top of that
-        (`_spend_block`), so a mechanism that ever regresses degrades to one
-        noisy line per poll instead of one alert per poll.
-
-        **Daily (this repo, and the whole box)** — deliberately NOT a label
-        change. It is a LEVEL-triggered condition, not an event: the money comes
-        back at midnight UTC, and marking each blocked issue needs-human-review
-        would leave a human to hand-unwind a dozen labels the next morning for a
-        condition that healed itself.
-
-        This is now the BACKSTOP for the daily caps, not the primary check: the
-        churn it accepted ("one no-op dispatch attempt per issue per poll") was
-        never free, because reaching here already cost a world build and the
-        claim relabel (#27). `app.spend_gate` front-runs it at the top of the
-        tick, so in a correctly wired daemon this arm should rarely fire. It
-        stays because a DispatchConfig can be built without a gate, and a
-        breaker with one enforcement point is a breaker with none.
-        """
-        path = self.cfg.spend_ledger_path
-        if not path:
-            return False
-        cap = self.cfg.issue_spend_cap_usd
-        if cap > 0 and issue is not None:
-            spent = sum_issue(path, self.cfg.repo, issue)
-            if spent >= cap:
-                reason = (
-                    f"Spend on this issue reached ${spent:.2f}, at or over the "
-                    f"ISSUE_SPEND_CAP_USD of ${cap:.2f}."
-                )
-                if action.kind in self._PR_KEYED:
-                    target, number = "pr", action.number
-                    escalation = pr_escalation(
-                        action.number, reason,
-                        from_label=self._pr_escalation_label(action.kind),
-                    )
-                else:
-                    target, number = "issue", issue
-                    escalation = issue_escalation(issue, reason, Label.AI_WORKING)
-                first_block = self._spend_block(
-                    f"issue #{issue} has spent ${spent:.2f} of its ${cap:.2f} cap "
-                    f"— escalating {target} #{number}",
-                    block_key=f"issue:{self.cfg.repo}:{issue}:cap:{cap:g}",
-                    scope="issue", issue=issue, spent=round(spent, 4), cap=cap,
-                    target=target, number=number,
-                )
-                actions = escalation.actions()
-                self.executor.execute_all(
-                    actions if first_block
-                    else [action for action in actions if not isinstance(action, PostComment)]
-                )
-                return True
-        breach = read_daily_cap_breach(
-            path,
-            repo=self.cfg.repo,
-            repo_cap=self.cfg.daily_spend_cap_usd,
-            global_cap=self.cfg.global_daily_spend_cap_usd,
-        )
-        if breach is not None:
-            self._spend_block(
-                breach.message,
-                block_key=breach.block_key(
-                    datetime.now(timezone.utc).date().isoformat()
-                ),
-                scope=breach.scope, spent=round(breach.spent, 4), cap=breach.cap,
-            )
-            return True
-        return False
-
-    def _spend_block(self, message: str, *, block_key: str, **fields) -> bool:
-        """Log every time; return True only for the first block at this key.
-
-        A cap is a level, not an event: it stays tripped on every subsequent
-        poll, so the return value gates the GitHub escalation as well as the
-        journal/alert side effects. The cap value is part of the caller's key:
-        raising or lowering it is a new operator-visible fact that may alert once.
-        The identity travels IN the event (`block_key`), so the dedup survives a
-        process restart by reading the journal this daemon already owns — the
-        flood shape is a wedged daemon under `Restart=always`, where an
-        in-process set alone would be empty again every few seconds. The set is
-        kept as a cache so the steady state costs no file read.
-
-        The LOG line is deliberately not deduped: it is local, free, and "why is
-        this PR not moving?" must be answerable from the log of any single poll.
-        """
-        self.cfg.log(f"SPEND CAP: {message}")
-        if block_key in self._spend_blocked:
-            return False
-        self._spend_blocked.add(block_key)
-        if self.journal is not None:
-            if block_key in spend_blocked_keys(read_events_tail(self.journal.path)):
-                return False
-            self.journal.emit("spend_block", block_key=block_key, **fields)
-        alert(self.cfg.alert_cmd, event_line("spend_block", block_key=block_key, **fields))
-        return True
-
-    def _any_cap_armed(self) -> bool:
-        return any((
-            self.cfg.issue_spend_cap_usd > 0,
-            self.cfg.daily_spend_cap_usd > 0,
-            self.cfg.global_daily_spend_cap_usd > 0,
-        ))
-
-    def _warn_if_the_caps_are_blind(self) -> None:
-        """One loud line, once per process, when a spend cap is armed but every
-        settled run so far cost $0.00 (review P1R-5) — i.e. the ledger both caps
-        scan is empty and neither can ever fire, for any loop shape.
-
-        Evidence-based rather than config-based, because the cause is usually
-        the PLAN (a subscription-plan gateway reports no per-run cost) and no
-        amount of harness config reveals that. Checked on the dispatch path
-        rather than at startup for the same reason: at startup there is no
-        evidence yet. The check stops for good as soon as there are enough
-        settled runs to judge, so it is not a per-dispatch file read.
-        """
-        if self._cost_blindspot_checked or self.journal is None:
-            return
-        if not self.cfg.spend_ledger_path:
-            return  # caps already inert by construction — DispatchConfig says so
-        if not self._any_cap_armed():
-            self._cost_blindspot_checked = True
-            return
-        runs = [
-            e for e in read_events_tail(self.journal.path)
-            if e.get("event") == "agent_run"
-        ]
-        if len(runs) < COST_BLINDSPOT_MIN_RUNS:
-            return  # not enough evidence yet — ask again on the next dispatch
-        self._cost_blindspot_checked = True
-        warning = cost_blindspot_warning(
-            runs,
-            issue_spend_cap_usd=self.cfg.issue_spend_cap_usd,
-            # Either daily cap makes the ledger load-bearing, and a deployment
-            # that only sets the global one is just as blind (#32).
-            daily_spend_cap_usd=(
-                self.cfg.daily_spend_cap_usd or self.cfg.global_daily_spend_cap_usd
-            ),
-        )
-        if warning is None:
-            return
-        self.cfg.log(warning)
-        self.journal.emit(
-            "cost_blindspot", runs=len(runs),
-            issue_cap=self.cfg.issue_spend_cap_usd,
-            daily_cap=self.cfg.daily_spend_cap_usd,
-        )
-
     async def dispatch(self, action: RunAgent) -> None:
         handler = {
             AgentKind.RESOLVE: self.fix_workflow.resolve,
@@ -503,14 +317,12 @@ class AgentDispatcher:
         if handler is None:
             return
         issue, resolved = self._spend_target(action)
-        if self._blocked_on_spend(action, issue):
-            return
-        self._warn_if_the_caps_are_blind()
         # Tag every leg this dispatch runs (a multi-agent review runs six) with the
         # same context, so the ledger attributes each one to the work that caused it.
-        set_context = getattr(self.runner, "set_context", None)
-        if set_context is not None:
-            set_context(self.cfg.role, action.kind.name, action.number, issue)
+        if isinstance(self.runner, ContextualRuntime):
+            self.runner.set_context(
+                self.cfg.role, action.kind.name, action.number, issue
+            )
         try:
             await handler(action.number)
         except (KeyboardInterrupt, SystemExit, asyncio.CancelledError):

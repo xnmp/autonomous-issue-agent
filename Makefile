@@ -2,14 +2,14 @@
 SHELL := /bin/bash
 HARNESS_ROOT := $(shell pwd)
 
-.PHONY: help test test-governor test-hooks test-orchestration test-deployment-env test-point-at test-domain test-adapters test-app test-parity arch doctor dashboard-ui \
-	        install bootstrap point-at run-fix run-review run-steward run-fix-sh run-review-sh run-steward-sh demo-gate \
+.PHONY: help test test-config-generated test-governor test-hooks test-deployment-env test-point-at test-domain test-adapters test-app test-parity arch typecheck doctor dashboard-ui \
+	        install point-at run-fix run-review run-steward demo-gate \
         install-launchd install-systemd \
         uninstall-launchd uninstall-systemd demo-init lint clean
 
 help:
 	@echo "Autonomous Issue Agent — make targets:"
-	@echo "  make test               run the full self-test suite (governor + hooks + orchestration + domain)"
+	@echo "  make test               run the full Python, hook, parity, and architecture suites"
 	@echo "  make test-domain        run the pure Python domain behavioural suite (Phase 0/1 port)"
 	@echo "  make test-adapters      run the Python adapter suite (Phase 2: AgentRunner + governor)"
 	@echo "  make test-app           run the app-layer suite (dashboard web collectors + endpoints)"
@@ -17,23 +17,25 @@ help:
 	@echo "  make test-parity        run the gate PARITY suite (same case through bash + Python gates)"
 	@echo "  make doctor             preflight: tooling, config, identities, repo access"
 	@echo "  make install            install the 'issue-agent' CLI (uv sync + ~/.local/bin shim)"
-	@echo "  make bootstrap TARGET=/path/to/repo   install the plugin into a target repo"
-	@echo "  make point-at REPO=<name>   point harness at config/repos/<name>.env: doctor + dev branch + bootstrap + run all 3 watchers"
+	@echo "  make point-at REPO=<name>   compose config, preflight, ensure dev branch, and run all 3 daemons"
 	@echo "  make run-fix            run the Python fix watcher in the foreground (Ctrl-C to stop)"
 	@echo "  make run-review         run the Python review watcher in the foreground"
 	@echo "  make run-steward        run the Python steward in the foreground"
-	@echo "  make run-*-sh           run shell compatibility wrappers around Python watchers"
 	@echo "  make install-launchd    install+load the 3 launchd agents (macOS)"
 	@echo "  make install-systemd    install+enable the 3 systemd user units (Linux)"
 	@echo "  make demo-init          create + seed the local demo target repo"
 	@echo "  make clean              remove caches and demo scratch"
 
-# test-deployment-env is NOT in this chain: it re-runs the two bash suites
-# under a hostile env, doubling their wall clock — and `make test` is the
+# test-deployment-env is NOT in this chain: it re-runs the hook and adapter
+# suites under a hostile env, substantially increasing wall clock — and `make test` is the
 # self-hosted TEST_CMD paid on every gate run. CI runs it as its own step.
-test: test-governor test-hooks test-orchestration test-point-at test-domain test-adapters test-app test-parity arch
+test: test-config-generated test-governor test-hooks test-point-at test-domain test-adapters test-app test-parity arch typecheck
 	@echo ""
 	@echo "✓ all suites passed"
+
+test-config-generated:
+	@echo "== config (generated metadata reference) =="
+	@diff -u config/agent.env.example <(uv run --quiet python scripts/generate_config_example.py)
 
 test-governor:
 	@echo "== governor (pytest) =="
@@ -42,10 +44,6 @@ test-governor:
 test-hooks:
 	@echo "== hooks (bash) =="
 	@bash tests/test_hooks.sh
-
-test-orchestration:
-	@echo "== orchestration (bash, fakes) =="
-	@bash tests/test_orchestration.sh
 
 test-deployment-env:
 	@echo "== deployment environment sanitization =="
@@ -65,12 +63,13 @@ test-adapters:
 	@echo "== adapters (pytest: AgentRunner mapping + in-process governor) =="
 	@uv run --quiet --extra sdk --with pytest pytest tests/adapters/
 
-# The dashboard/CLI app layer. Deliberately NOT installed with `--extra dash`:
+# The orchestration/dashboard/CLI app layer. Deliberately NOT installed with
+# `--extra dash`:
 # the endpoint tests importorskip fastapi, so this target is the standing proof
 # that `make test` stays green on a machine that never installed the extra.
 test-app:
-	@echo "== app (pytest: dashboard web collectors + endpoints) =="
-	@uv run --quiet --with pytest pytest tests/app/
+	@echo "== app (pytest: orchestration + dashboard + endpoints) =="
+	@uv run --quiet --extra sdk --with pytest pytest tests/app/
 
 # Build the dashboard SPA into dashboard/dist (gitignored). Needed before
 # `issue-agent dashboard --serve` prefers the interactive UI over the v1 page.
@@ -95,6 +94,10 @@ arch:
 	@echo "== arch (import-linter: hexagonal layering) =="
 	@uv run --extra dev --with tree-sitter --with tree-sitter-bash lint-imports
 
+typecheck:
+	@echo "== typecheck (pyrefly: src + tests) =="
+	@uv run pyrefly check
+
 doctor:
 	@bash bin/doctor.sh
 
@@ -104,12 +107,8 @@ doctor:
 install:
 	@bash bin/install.sh
 
-bootstrap:
-	@test -n "$(TARGET)" || { echo "usage: make bootstrap TARGET=/path/to/repo"; exit 1; }
-	@bash bin/bootstrap.sh "$(TARGET)"
-
 # One command: compose config/shared.env + config/repos/<REPO>.env, preflight,
-# ensure the base branch, bootstrap the target, and run all three watchers in
+# ensure the base branch, prepare local excludes/labels, and run all three daemons in
 # the foreground (Ctrl-C stops all). e.g. make point-at REPO=myapp
 point-at:
 	@test -n "$(REPO)" || { echo "usage: make point-at REPO=<name>  (reads config/repos/<name>.env)"; exit 1; }
@@ -123,18 +122,6 @@ run-review:
 
 run-steward:
 	@uv run --extra sdk --with tree-sitter --with tree-sitter-bash python -m issue_agent.app.main steward
-
-# Legacy shell targets retained as compatibility wrappers. They load the same
-# shell-style config files operators used before, then hand orchestration to
-# Python instead of running the retired Bash poll loops.
-run-fix-sh:
-	@bash bin/run-role.sh fix
-
-run-review-sh:
-	@bash bin/run-role.sh review
-
-run-steward-sh:
-	@bash bin/run-role.sh steward
 
 # Phase 5 acceptance gate — live end-to-end against a throwaway demo repo.
 demo-gate:
@@ -158,7 +145,7 @@ demo-init:
 
 lint:
 	@command -v shellcheck >/dev/null 2>&1 && shellcheck -x \
-		agent/*.sh review/*.sh steward/*.sh bin/*.sh plugin/hooks/*.sh plugin/hooks/checks/*.sh \
+		bin/*.sh plugin/hooks/*.sh plugin/hooks/checks/*.sh \
 		|| echo "shellcheck not installed — skipping (brew install shellcheck)"
 
 clean:

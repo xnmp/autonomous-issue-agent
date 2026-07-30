@@ -29,7 +29,7 @@ import json
 import os
 from dataclasses import dataclass
 
-from ..domain.agent_task import AgentRuntime, AgentTask
+from .runtime_plan import AgentRuntime, RuntimePlan
 from ..domain.outcome import AgentResult
 
 # Provider key as it appears in a Z.ai profile's `.env`, mapped onto the header
@@ -135,5 +135,5 @@ class EnvInjectingRuntime:
     inner: AgentRuntime
     env: dict[str, str]
 
-    async def run(self, task: AgentTask) -> AgentResult:
+    async def run(self, task: RuntimePlan) -> AgentResult:
         return await self.inner.run(dataclasses.replace(task, env={**self.env, **task.env}))

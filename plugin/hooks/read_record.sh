@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # PostToolUse(Read) hook. When the agent Reads an evidence screenshot (an image
 # under evidence/), it has loaded the pixels into its vision context — record the
-# basename in .harness/screenshots-read so the PR gate can require captured
+# basename in the harness-owned receipt so the PR gate can require captured
 # screenshots were actually LOOKED AT (check_visual_evidence).
 #
 # Observe-only: always exit 0 (never blocks). Reads the hook JSON on stdin.
@@ -31,6 +31,7 @@ case "$low" in
   *) exit 0 ;;
 esac
 
-mkdir -p "$cwd/.harness" 2>/dev/null || exit 0
-printf '%s\n' "$(basename "$fp")" >> "$cwd/.harness/screenshots-read" 2>/dev/null || exit 0
+[ -n "${HARNESS_SCREENSHOTS_READ:-}" ] || exit 0
+mkdir -p "$(dirname "$HARNESS_SCREENSHOTS_READ")" 2>/dev/null || exit 0
+printf '%s\n' "$(basename "$fp")" >> "$HARNESS_SCREENSHOTS_READ" 2>/dev/null || exit 0
 exit 0

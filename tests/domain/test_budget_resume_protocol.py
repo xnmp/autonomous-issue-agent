@@ -1,6 +1,6 @@
 """Budget review keeps the established blocked-issue resume contract."""
 
-from builders import Comment, issue, world
+from tests.domain.builders import Comment, issue, world
 
 from issue_agent.domain.actions import AgentKind, Relabel, RunAgent, Target
 from issue_agent.domain.fix import FixConfig, FixState, decide_fix

@@ -54,13 +54,7 @@ don't keep going back to edit it — each re-plan costs a full model round-trip.
    page loads". Before fixing the criterion, trace the change to the layer that
    actually PRODUCES the observable result (the source of truth), not the first
    symbol you find — a constant may be overwritten downstream at runtime.
-   Immediately after posting, create the marker file `.harness/ac-posted` with a
-   shell command (`mkdir -p .harness && touch .harness/ac-posted`). Use Bash, NOT
-   the Edit/Write tool — paths under `.claude/` are treated as sensitive and will
-   be refused. The PR gate checks for it.
-3. Post a `## Test Plan` comment (what you will test + proof type). Immediately
-   after posting, `touch .harness/test-plan-posted` (via Bash). The PR gate checks
-   for it. (You write these markers yourself — nothing external creates them.)
+3. Post a `## Test Plan` comment (what you will test + proof type).
    **The test MUST assert on the observable value (step 2), at the layer that
    produces it, and MUST FAIL if the change is reverted.** A test that passes
    without your change (a tautology like `expect(x).toBe(x)`, or one that exercises
@@ -185,8 +179,8 @@ don't keep going back to edit it — each re-plan costs a full model round-trip.
      ACs): commit + Read it per step 6, then spawn the adversarial subagent alone.
    The adversarial subagent gets a fresh context and only the diff + acceptance
    criteria + whatever evidence is already committed. It must return PASS. Write
-   its verdict to `.harness/adversarial-verdict` as `PASS <reason>` or
-   `FAIL <reason>` (via Bash, e.g. `echo "PASS …" > .harness/adversarial-verdict`).
+   Record its findings in the PR description or review discussion. This is
+   process discipline, not self-authored authorization evidence.
    **On FAIL: fix the findings, then verify the FIXES — do not re-run the full
    review.** Spawn a SCOPED verifier subagent (fresh context) given only: the
    FAIL findings verbatim, the diff of your fixes (diff since the review ran),
@@ -208,8 +202,13 @@ don't keep going back to edit it — each re-plan costs a full model round-trip.
      red?" If not → FAIL.
    - **Observable seam untested** — the acceptance criterion names a user-visible
      or contract-level result, but no test asserts at that seam.
-9. Open the PR with an EXPLICIT base of `$BASE_BRANCH` — always pass
-   `--base "$BASE_BRANCH"` to `gh pr create`. Without it, `gh` targets the repo's
+9. Publish remote changes only through the durable broker: use
+   `issue-agent-publish git push …` for every push and
+   `issue-agent-publish gh pr create …` to open the PR. The broker commits a
+   lifecycle command before the network effect and reconciles an ambiguous
+   outcome before retrying. Open the PR with an EXPLICIT base of
+   `$BASE_BRANCH` — always pass `--base "$BASE_BRANCH"` to the brokered
+   `gh pr create`. Without it, `gh` targets the repo's
    DEFAULT branch (often `main`), which routes the PR through the wrong branch's CI
    and breaks auto-merge; the PR gate rejects a PR whose base ≠ `$BASE_BRANCH`.
    Include a `## Acceptance Criteria` section — written as a `- [ ]` checklist, one

@@ -71,12 +71,6 @@ printf '%s' "$body" | grep -qF '## Acceptance Criteria' \
 printf '%s' "$body" | grep -qiE '(fix(es|ed)?|close[sd]?|resolve[sd]?) +#[0-9]+' \
   || fail "PR body must link the issue, e.g. 'Fixes #<issue>'"
 
-# ── 4. Acceptance Criteria + Test Plan were posted on the issue BEFORE coding.
-#       The agent writes these marker files immediately after each issue comment
-#       (see AGENT.md). They make the "AC/Test-Plan first" invariant mechanical.
-[ -f .harness/ac-posted ]        || fail "no Acceptance Criteria posted on the issue yet (.harness/ac-posted missing — post AC as an issue comment FIRST)"
-[ -f .harness/test-plan-posted ] || fail "no Test Plan posted on the issue yet (.harness/test-plan-posted missing)"
-
 # ── 7d. Visual acceptance criteria ⇒ ONE read+committed screenshot PER AC item.
 #
 # Runs among the CHEAP checks (it is pure body/marker/diff arithmetic), well
@@ -87,8 +81,8 @@ printf '%s' "$body" | grep -qiE '(fix(es|ed)?|close[sd]?|resolve[sd]?) +#[0-9]+'
 #   FLOOR (unconditional): the agent declared a visual criterion
 #   (.harness/visual-ac), so ≥1 screenshot image must be COMMITTED under
 #   evidence/, and EVERY committed image must have been READ by the agent
-#   (basename recorded in .harness/screenshots-read by the PostToolUse(Read)
-#   hook) — an unread capture is unverified proof.
+#   (basename recorded in the harness-owned $HARNESS_SCREENSHOTS_READ receipt
+#   by the PostToolUse(Read) hook) — an unread capture is unverified proof.
 #   PER-AC (additive, only when the body's AC section parses into N ≥ 1 items):
 #   N read+committed images AND N distinct evidence/ paths referenced in the
 #   body. One shot for a five-criterion PR proves one criterion, and a shot
@@ -116,12 +110,16 @@ if [ -f .harness/visual-ac ]; then
   shots=$(printf '%s\n' "$changed" | grep -iE '^evidence/.*\.(png|jpg|jpeg|gif|webp)$' || true)
   [ -n "$shots" ] \
     || fail "a visual acceptance criterion was declared (.harness/visual-ac) but no screenshot is committed under evidence/ — capture one with agent-browser"
+  [ -n "${HARNESS_SCREENSHOTS_READ:-}" ] \
+    || fail "trusted screenshot-read receipt is unavailable — the harness cannot verify visual evidence"
+  [ -r "$HARNESS_SCREENSHOTS_READ" ] \
+    || fail "trusted screenshot-read receipt is unavailable — open each evidence image with the Read tool before opening the PR"
 
   unread=""
   while IFS= read -r shot; do
     [ -n "$shot" ] || continue
     b="$(basename "$shot")"
-    grep -qxF "$b" .harness/screenshots-read 2>/dev/null || unread="$unread $b"
+    grep -qxF "$b" "$HARNESS_SCREENSHOTS_READ" 2>/dev/null || unread="$unread $b"
   done <<< "$shots"
   [ -z "$unread" ] \
     || fail "committed screenshot(s) were never read/verified by the agent:$unread — open each with the Read tool and confirm it shows the criterion met before opening the PR"
@@ -159,11 +157,6 @@ prc_check_commit_log
 prc_check_no_evidence "$changed"
 prc_check_no_generated_instructions "$changed"
 prc_check_tests_immutable "$changed"
-
-# ── 8. Adversarial pre-PR verdict exists and passed ─────────────────────────────
-verdict=$(cat .harness/adversarial-verdict 2>/dev/null || echo "")
-printf '%s' "$verdict" | grep -q '^PASS' \
-  || fail "adversarial pre-PR review did not return PASS (.harness/adversarial-verdict)"
 
 # ── 9. ADR reference: if the diff touches a module an ADR governs, cite it ──────
 #

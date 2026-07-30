@@ -23,13 +23,15 @@
 # script copies the resolved config to a stable per-repo file
 # (~/.config/issue-agent/<name>.env, chmod 600 — it may carry tokens) and bakes
 # THAT path in, so each repo's unit keeps reading its own config.
-set -uo pipefail
+set -euo pipefail
 HARNESS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIG="${AGENT_ENV:-$HARNESS_ROOT/config/agent.env}"
 UD="$HOME/.config/systemd/user"
 mkdir -p "$UD"
 
 services=(issue-agent-fix-watcher issue-agent-review-watcher issue-agent-steward)
+DRY_RUN=0
+[ "${1:-}" != "--dry-run" ] || DRY_RUN=1
 
 if [ "${1:-}" = "uninstall" ]; then
   if [ -n "${2:-}" ]; then
@@ -55,6 +57,13 @@ if [ "${1:-}" = "uninstall" ]; then
 fi
 
 [ -f "$CONFIG" ] || { echo "config not found: $CONFIG"; exit 1; }
+UV_BIN="$(command -v uv || true)"
+[ -n "$UV_BIN" ] || { echo "uv executable not found"; exit 1; }
+SYSTEMD_ANALYZE="$(command -v systemd-analyze || true)"
+[ -n "$SYSTEMD_ANALYZE" ] || {
+  echo "systemd-analyze is required to validate rendered units"
+  exit 1
+}
 # Watchers must run with cwd = target repo (cwd-relative git/worktree ops). Inject
 # WorkingDirectory from the config's TARGET_DIR. (lib.sh also cd's as a backstop.)
 TARGET_DIR="$(set -a; . "$CONFIG"; set +a; printf '%s' "${TARGET_DIR:-}")"
@@ -70,19 +79,95 @@ NAME="${NAME:-target}"
 SNAP_DIR="$HOME/.config/issue-agent"
 mkdir -p "$SNAP_DIR"; chmod 700 "$SNAP_DIR"
 SNAP_CONFIG="$SNAP_DIR/$NAME.env"
-cp "$CONFIG" "$SNAP_CONFIG"
-chmod 600 "$SNAP_CONFIG"
+STAGE="$(mktemp -d "$UD/.issue-agent-install.XXXXXX")"
+cleanup() {
+  rm -rf -- "$STAGE"
+}
+trap cleanup EXIT
 
-for s in "${services[@]}"; do
+for index in "${!services[@]}"; do
+  s="${services[$index]}"
   src="$HARNESS_ROOT/ops/systemd/$s.service"
-  dst="$UD/$s-$NAME.service"
+  candidate="$STAGE/$s-$NAME.service"
   sed -e "s#@HARNESS_ROOT@#$HARNESS_ROOT#g" -e "s#@CONFIG@#$SNAP_CONFIG#g" \
-      -e "s#@TARGET_DIR@#${TARGET_DIR:-/}#g" -e "s#@NAME@#$NAME#g" "$src" > "$dst"
+      -e "s#@TARGET_DIR@#${TARGET_DIR:-/}#g" -e "s#@NAME@#$NAME#g" \
+      -e "s#@UV_BIN@#$UV_BIN#g" "$src" > "$candidate"
+  "$SYSTEMD_ANALYZE" --user verify "$candidate"
+done
+
+if [ "$DRY_RUN" -eq 1 ]; then
+  echo "validated ${#services[@]} unit(s) for deployment '$NAME'"
+  echo "executable: $UV_BIN"
+  echo "config snapshot: $SNAP_CONFIG"
+  exit 0
+fi
+
+if [ -f "$SNAP_CONFIG" ]; then
+  cp "$SNAP_CONFIG" "$STAGE/config.previous"
+fi
+
+for index in "${!services[@]}"; do
+  s="${services[$index]}"
+  dst="$UD/$s-$NAME.service"
+  [ ! -f "$dst" ] || cp "$dst" "$STAGE/$index.previous"
+  systemctl --user is-active --quiet "$s-$NAME.service" \
+    && touch "$STAGE/$index.active" || true
+  systemctl --user is-enabled --quiet "$s-$NAME.service" \
+    && touch "$STAGE/$index.enabled" || true
+done
+
+rollback() {
+  status=$?
+  [ "$status" -ne 0 ] || status=1
+  trap - ERR INT TERM
+  set +e
+  if [ -f "$STAGE/config.previous" ]; then
+    mv "$STAGE/config.previous" "$SNAP_CONFIG"
+  else
+    rm -f -- "$SNAP_CONFIG"
+  fi
+  for index in "${!services[@]}"; do
+    s="${services[$index]}"
+    dst="$UD/$s-$NAME.service"
+    systemctl --user disable --now "$s-$NAME.service" >/dev/null 2>&1
+    if [ -f "$STAGE/$index.previous" ]; then
+      mv "$STAGE/$index.previous" "$dst"
+    else
+      rm -f -- "$dst"
+    fi
+  done
+  systemctl --user daemon-reload >/dev/null 2>&1
+  for index in "${!services[@]}"; do
+    s="${services[$index]}"
+    [ ! -f "$STAGE/$index.enabled" ] \
+      || systemctl --user enable "$s-$NAME.service" >/dev/null 2>&1
+    [ ! -f "$STAGE/$index.active" ] \
+      || systemctl --user restart "$s-$NAME.service" >/dev/null 2>&1
+  done
+  echo "installation failed; restored previous known-good units" >&2
+  exit "$status"
+}
+trap rollback ERR INT TERM
+
+install -m 600 "$CONFIG" "$STAGE/config.next"
+mv "$STAGE/config.next" "$SNAP_CONFIG"
+for index in "${!services[@]}"; do
+  s="${services[$index]}"
+  mv "$STAGE/$s-$NAME.service" "$UD/$s-$NAME.service"
 done
 systemctl --user daemon-reload
+# Stop the complete legacy writer set before any new role imports the shared
+# spend ledger. Sequential restart would let the first new role admit against a
+# snapshot while an old review/steward process could still append a late charge.
 for s in "${services[@]}"; do
-  systemctl --user enable --now "$s-$NAME.service"
+  systemctl --user stop "$s-$NAME.service"
+done
+for s in "${services[@]}"; do
+  systemctl --user enable "$s-$NAME.service"
+  systemctl --user restart "$s-$NAME.service"
+  systemctl --user is-active --quiet "$s-$NAME.service"
   echo "✓ enabled+started $s-$NAME"
 done
+trap - ERR INT TERM
 echo "Done. 'systemctl --user status issue-agent-*-$NAME' or"
 echo "'journalctl --user -u issue-agent-fix-watcher-$NAME -f' to confirm."

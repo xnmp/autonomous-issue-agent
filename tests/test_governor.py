@@ -19,7 +19,7 @@ SRC = os.path.join(ROOT, "src")
 if SRC not in sys.path:
     sys.path.insert(0, SRC)
 
-from issue_agent.adapters import governor_policy as gov  # noqa: E402
+from issue_agent.domain import governor_policy as gov  # noqa: E402
 HOOK = os.path.join(ROOT, "plugin", "hooks", "bash_governor.py")
 spec = importlib.util.spec_from_file_location("bash_governor", HOOK)
 hook = importlib.util.module_from_spec(spec)
@@ -511,14 +511,14 @@ def test_read_only_without_a_declared_role_still_blocks(monkeypatch):
     ) == 2
 
 
-def test_fix_leg_is_not_caged_by_an_inherited_review_hook(monkeypatch):
+def test_fix_leg_still_obeys_the_runtime_portable_gh_allowlist(monkeypatch):
     """The #113 regression: the flag is present (a nested fixer worktree ran the
     reviewer's hook), but this leg is a FIX, so the reviewer's surface must not
     apply to it."""
     assert _drive_main(
         monkeypatch, _REVIEW_ONLY_DENIED,
         {"ISSUE_AGENT_REVIEW_READ_ONLY": "1", "ISSUE_AGENT_LEG_ROLE": "fix"},
-    ) == 0
+    ) == 2
 
 
 def test_fix_role_does_not_disarm_the_ordinary_gates(monkeypatch):

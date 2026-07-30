@@ -226,7 +226,7 @@ def test_detailed_review_step_uses_the_model_reported_at_settlement():
 
 
 def test_a_leg_that_exited_for_any_reason_but_ok_reads_as_failed():
-    leg = dash.Leg(None, "fix", "RESOLVE", 1, 1, "m", "", "budget_exhausted", 0.0, 0.0, False, "")
+    leg = dash.RunSummary(None, "fix", "RESOLVE", 1, 1, "m", "", "budget_exhausted", 0.0, 0.0, False, "")
     assert snapshots.leg_state(leg) == "failed"
 
 

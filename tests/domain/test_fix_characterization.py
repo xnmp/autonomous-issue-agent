@@ -5,7 +5,7 @@ workflow outcomes without pinning the entire ordered action list, so the fix
 workflow can be extracted/refactored while preserving behavior.
 """
 
-from builders import Check, Comment, Review, issue, pr, world
+from tests.domain.builders import Check, Comment, Review, issue, pr, world
 
 from issue_agent.domain.actions import (
     AgentKind,

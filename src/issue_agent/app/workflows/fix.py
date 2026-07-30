@@ -18,7 +18,18 @@ from ...domain import outcome
 from ..planners import tasks as task_builders
 from ..planners.tasks import FixTaskConfig
 from ...domain.actions import AgentKind, Relabel, Target
-from ...domain.agent_task import AgentRuntime
+from ...adapters.runtime_plan import AgentRuntime, RunTelemetryRuntime
+from ...domain.ports import (
+    ActionExecutor,
+    BranchState,
+    CiPromptReads,
+    FixWorktreePort,
+    LegacyJournal,
+    PredictionWriter,
+    ReviewPromptReads,
+    WorkflowGitHubReads,
+    WorkflowState,
+)
 from ...domain.ci import latest_other_review
 from ...domain.effort import (
     DEFAULT_EFFORT,
@@ -38,6 +49,13 @@ from ...domain.world import (
     paths_overlap_open_prs,
 )
 from ..mcp import mcp_servers_for_checks
+from .base import run_leg
+
+
+def _discard_route_decision(
+    _model: str | None, _effort: object | None
+) -> None:
+    return None
 
 
 @dataclass(frozen=True)
@@ -66,17 +84,17 @@ class FixWorkflowConfig:
     # tests / when the daemon runs without one). Escalations must be queryable:
     # the routing guardrail is "split the metrics by tier", which is unanswerable
     # if the tier a leg actually ran at was never recorded.
-    journal: object | None = None
+    journal: LegacyJournal | None = None
 
 
 @dataclass
 class FixWorkflow:
     cfg: FixWorkflowConfig
-    gateway: object
-    store: object
-    worktrees: object
+    gateway: WorkflowGitHubReads
+    store: WorkflowState
+    worktrees: FixWorktreePort
     runner: AgentRuntime
-    executor: object
+    executor: ActionExecutor
     prepare_cwd: Callable[[str], None] | None = None
     # Atomic application-level reservation update for router-expanded paths.
     # None keeps standalone workflow tests and serial callers unchanged.
@@ -84,9 +102,8 @@ class FixWorkflow:
 
     def _ensure_cwd(self, issue: int, branch: str) -> str:
         cwd = self.worktrees.ensure(issue, branch)
-        save_branch = getattr(self.store, "save_branch", None)
-        if save_branch is not None:
-            save_branch(issue, branch)
+        if isinstance(self.store, BranchState):
+            self.store.save_branch(issue, branch)
         if self.prepare_cwd is not None:
             self.prepare_cwd(cwd)
         self.cfg.log(f"worktree #{issue}: ready on '{branch}' → {cwd}")
@@ -94,19 +111,16 @@ class FixWorkflow:
 
     def _resume_branch(self, issue: int, title: str) -> str:
         fallback = f"fix/{issue}-{slugify(title) or 'issue'}"
-        get_branch = getattr(self.store, "get_branch", None)
-        if get_branch is not None:
-            remembered = get_branch(issue)
+        if isinstance(self.store, BranchState):
+            remembered = self.store.get_branch(issue)
             if remembered:
                 return remembered
-        branch_for_issue = getattr(self.worktrees, "branch_for_issue", None)
-        if branch_for_issue is not None:
-            remembered = branch_for_issue(issue, fallback)
-            if remembered:
-                return remembered
+        remembered = self.worktrees.branch_for_issue(issue, fallback)
+        if remembered:
+            return remembered
         return fallback
 
-    def _prompt_input(self, method: str, *args, **kwargs) -> str:
+    def _review_comments(self, pr: int) -> str:
         """Best-effort fetch of a prompt INPUT (review M13/D6).
 
         The two repair legs feed the agent a failed-CI log and the reviewer's
@@ -118,13 +132,21 @@ class FixWorkflow:
         shipped before the methods existed, and the agent rediscovers the
         failure itself. The alternative (an AttributeError out of fix_ci) turns
         a cosmetic gap into a dead repair leg."""
-        fn = getattr(self.gateway, method, None)
-        if fn is None:
+        if not isinstance(self.gateway, ReviewPromptReads):
             return ""
         try:
-            return fn(*args, **kwargs) or ""
+            return self.gateway.review_comments(pr) or ""
         except Exception as exc:  # noqa: BLE001 — see docstring
-            self.cfg.log(f"prompt input '{method}' unavailable: {exc}")
+            self.cfg.log(f"prompt input 'review_comments' unavailable: {exc}")
+            return ""
+
+    def _failed_run_log(self, pr: int, branch: str) -> str:
+        if not isinstance(self.gateway, CiPromptReads):
+            return ""
+        try:
+            return self.gateway.failed_run_log(pr, branch=branch) or ""
+        except Exception as exc:  # noqa: BLE001 — advisory prompt enrichment
+            self.cfg.log(f"prompt input 'failed_run_log' unavailable: {exc}")
             return ""
 
     def _decay_infra_deaths(self, key: int, result, alt_key: int | None = None) -> None:
@@ -170,8 +192,9 @@ class FixWorkflow:
         runtime knows how. A bare/undecorated runner (an injected fake, the
         legacy adapters) has no `leg_kind` and simply keeps the dispatch's
         kind — a naming nicety must never be able to kill a leg."""
-        override = getattr(self.runner, "leg_kind", None) if kind else None
-        return override(kind) if override is not None else contextlib.nullcontext()
+        if kind and isinstance(self.runner, RunTelemetryRuntime):
+            return self.runner.leg_kind(kind)
+        return contextlib.nullcontext()
 
     def _route_receipt(self):
         """Expose a ROUTE decision to a journalling runner when it supports it.
@@ -181,19 +204,19 @@ class FixWorkflow:
         for the ROUTE event's decision fields. Bare runners used by callers and
         tests retain their existing one-method runtime contract.
         """
-        receipt = getattr(self.runner, "route_receipt", None)
-        return receipt() if receipt is not None else contextlib.nullcontext(lambda *_: None)
+        if isinstance(self.runner, RunTelemetryRuntime):
+            return self.runner.route_receipt()
+        return contextlib.nullcontext(_discard_route_decision)
 
     async def _run_logged(self, label: str, issue: int, task, *, kind: str | None = None):
-        self.cfg.log(f"agent #{issue}: {label} — running")
-        with self._leg_kind(kind):
-            result = await self.runner.run(task)
-        self.cfg.log(
-            f"agent #{issue}: {label} — done "
-            f"(status={outcome.status_label(result)}"
-            f"{f', ${result.cost_usd:.2f}' if result.cost_usd else ''})"
+        return await run_leg(
+            self.runner,
+            self.cfg.log,
+            label,
+            issue,
+            task,
+            scope=self._leg_kind(kind),
         )
-        return result
 
     # ── escalation on evidence (#16) ────────────────────────────────────────
     @staticmethod
@@ -459,9 +482,8 @@ class FixWorkflow:
                 )
                 tier = result.field("tier")
                 predicted_paths = normalize_predicted_paths(result.field("predicted_paths"))
-                save_prediction = getattr(self.store, "save_predicted_paths", None)
-                if save_prediction is not None:
-                    save_prediction(issue, predicted_paths)
+                if isinstance(self.store, PredictionWriter):
+                    self.store.save_predicted_paths(issue, predicted_paths)
             except Exception as exc:  # noqa: BLE001 — routing is advisory, never fatal
                 self.cfg.log(f"agent #{issue}: route — failed ({exc}); dispatching unrouted")
                 return self._escalated(cfg, issue, "resolve", iss=iss), False
@@ -540,7 +562,9 @@ class FixWorkflow:
             return
         self.store.save_model(issue, fix_cfg.model)
         if self.store.get_phase(issue) != "authored":
-            author = await self.runner.run(
+            author = await self._run_logged(
+                "author",
+                issue,
                 task_builders.build_author_task(
                     issue,
                     iss.title,
@@ -548,7 +572,8 @@ class FixWorkflow:
                     cwd,
                     fix_cfg,
                     human_reply=human_reply,
-                )
+                ),
+                kind="AUTHOR",
             )
             self.store.save_session(issue, author.session_id)
             self._decay_infra_deaths(issue, author)
@@ -586,7 +611,9 @@ class FixWorkflow:
         trail: list[str] = []
         rounds = 0
         while True:
-            impl = await self.runner.run(
+            impl = await self._run_logged(
+                "implement",
+                issue,
                 task_builders.build_implement_task(
                     issue,
                     iss.title,
@@ -595,7 +622,8 @@ class FixWorkflow:
                     fix_cfg,
                     uphold_note=uphold_note,
                     human_reply=human_reply,
-                )
+                ),
+                kind="IMPLEMENT",
             )
             self.store.save_session(issue, impl.session_id)
             self._decay_infra_deaths(issue, impl)
@@ -616,7 +644,9 @@ class FixWorkflow:
                 return
             rounds += 1
             self.worktrees.reset(issue)
-            adj = await self.runner.run(
+            adj = await self._run_logged(
+                "adjudicate",
+                issue,
                 # The SAME config the implementer ran on (routed + escalated),
                 # not the unrouted base: the adjudicator's job is to overrule
                 # the implementer's objection, and an arbiter that reasons
@@ -630,7 +660,8 @@ class FixWorkflow:
                     cwd,
                     fix_cfg,
                     human_reply=human_reply,
-                )
+                ),
+                kind="ADJUDICATE",
             )
             self.store.save_session(issue, adj.session_id)
             verdict = outcome.adjudication(adj)
@@ -717,7 +748,7 @@ class FixWorkflow:
                 issue, iss.title, iss.body, reply, cwd, fix_cfg
             )
         )
-        result = await self.runner.run(task)
+        result = await self._run_logged("resume", issue, task, kind="RESUME")
         self.store.save_session(issue, result.session_id)
         pr = self.gateway.pr_for_issue(issue)
         if outcome.infra_death(result.exit_reason):
@@ -774,7 +805,9 @@ class FixWorkflow:
             reply_comment.body, cwd, self.store.get_session(issue),
             self._repair_fix_cfg(issue, "resume", iss=iss), fork=fork,
         )
-        result = await self.runner.run(task)
+        result = await self._run_logged(
+            "pr-resume", issue, task, kind="PR_RESUME"
+        )
         self.store.save_session(issue, result.session_id)
         if outcome.infra_death(result.exit_reason):
             self.store.bump_infra_deaths(issue)
@@ -793,7 +826,7 @@ class FixWorkflow:
         # not the review body (review M13): dispatching without them rendered an
         # empty "Inline comments:" header and cost rounds off the 4-rejection
         # ceiling while the fixer guessed at what was being asked.
-        inline = self._prompt_input("review_comments", pr)
+        inline = self._review_comments(pr)
         fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
         task = task_builders.build_address_review_task(
             pr, review_body, inline, cwd, self.store.get_session(issue),
@@ -803,7 +836,9 @@ class FixWorkflow:
             ),
             fork=fork,
         )
-        result = await self.runner.run(task)
+        result = await self._run_logged(
+            "address-review", issue, task, kind="ADDRESS_REVIEW"
+        )
         self.store.save_session(issue, result.session_id)
         out = outcome.address_review_actions(pr, result)
         self.executor.execute_all(out.actions)
@@ -841,7 +876,7 @@ class FixWorkflow:
         # `branch` is passed because the PRView is already in hand: it saves the
         # gateway a `gh pr view` round-trip it would otherwise make to find the
         # head branch `gh run list` needs.
-        failed_log = self._prompt_input("failed_run_log", pr, branch=p.head_ref_name)
+        failed_log = self._failed_run_log(pr, p.head_ref_name)
         mcp_servers = mcp_servers_for_checks(
             self.cfg.fix_mcp_config, [c.name for c in p.checks], self.cfg.harness_root
         )
@@ -855,7 +890,7 @@ class FixWorkflow:
             self._repair_fix_cfg(issue, "fix-ci"),
             mcp_servers=mcp_servers,
         )
-        result = await self.runner.run(task)
+        result = await self._run_logged("fix-ci", issue, task, kind="FIX_CI")
         self.store.save_session(issue, result.session_id)
         # An externally-killed session made no attempt, so it must not march the
         # CI breaker toward needs-human-review (FAILURE-MODES #58: six SIGKILLs on
@@ -879,7 +914,7 @@ class FixWorkflow:
             pr, self.cfg.base_branch, cwd, self.store.get_session(issue),
             self._repair_fix_cfg(issue, "rebase")
         )
-        result = await self.runner.run(task)
+        result = await self._run_logged("rebase", issue, task, kind="REBASE")
         self.store.save_session(issue, result.session_id)
         # Same rule as fix_ci: an infra kill is not a failed rebase attempt.
         if not outcome.infra_death(result.exit_reason):

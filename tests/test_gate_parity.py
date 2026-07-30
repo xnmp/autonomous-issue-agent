@@ -76,7 +76,7 @@ CHECKS = ROOT / "plugin" / "hooks" / "checks"
 GATE_ENV_KNOBS = (
     "TEST_CMD", "LINT_CMD", "TYPECHECK_CMD", "ALLOW_UNTESTED", "RED_MUST_FAIL",
     "VERIFY_RED_AT_COMMIT", "BASE_BRANCH", "GATE_TEST_TIMEOUT_S",
-    "GATE_GH_RETRY_SLEEP",
+    "GATE_GH_RETRY_SLEEP", "HARNESS_SCREENSHOTS_READ",
 )
 
 
@@ -117,9 +117,6 @@ def compliant_pr_repo(tmp_path: Path) -> Path:
     (repo / "token.py").write_text("def token(): return 1\n")
     _git(repo, "add", "token.py")
     _git(repo, "commit", "-qm", "green: implement token")
-    (repo / ".harness" / "ac-posted").touch()
-    (repo / ".harness" / "test-plan-posted").touch()
-    (repo / ".harness" / "adversarial-verdict").write_text("PASS looks good\n")
     (repo / ".harness" / "test-cmd").write_text("test -f token.py\n")
     return repo
 
@@ -271,6 +268,9 @@ def python_verdict(
     command = shlex.join([tool, *argv])
 
     def build_ctx(cwd: str):
+        receipt = env.get("HARNESS_SCREENSHOTS_READ", "")
+        if receipt and not os.path.isabs(receipt):
+            receipt = os.path.abspath(os.path.join(cwd, receipt))
         return build_gate_context(
             cwd,
             base_branch=env.get("BASE_BRANCH", "dev"),
@@ -280,6 +280,7 @@ def python_verdict(
             verify_red_at_commit=env.get("VERIFY_RED_AT_COMMIT", "1") != "0",
             allow_untested=env.get("ALLOW_UNTESTED", "") == "1",
             gh=fake_gh_runner(open_pr),
+            screenshots_read_path=receipt,
         )
 
     if not complete:
@@ -392,6 +393,13 @@ def _non_image_evidence_repo(tmp_path: Path) -> Path:
 def _read_screenshot_repo(tmp_path: Path) -> Path:
     repo = _visual_repo(tmp_path)
     commit_evidence(repo, "evidence/ac-1.png")
+    (repo.parent / "screenshots-read").write_text("ac-1.png\n")
+    return repo
+
+
+def _forged_screenshot_repo(tmp_path: Path) -> Path:
+    repo = _visual_repo(tmp_path)
+    commit_evidence(repo, "evidence/ac-1.png")
     (repo / ".harness" / "screenshots-read").write_text("ac-1.png\n")
     return repo
 
@@ -411,9 +419,6 @@ def _weakened_test_repo(tmp_path: Path) -> Path:
     (repo / "impl.py").write_text("x = 1\n")
     _git(repo, "add", "tests/test_keep.py", "impl.py")
     _git(repo, "commit", "-qm", "green: impl + weaken existing test")
-    (repo / ".harness" / "ac-posted").touch()
-    (repo / ".harness" / "test-plan-posted").touch()
-    (repo / ".harness" / "adversarial-verdict").write_text("PASS\n")
     return repo
 
 
@@ -421,7 +426,7 @@ GOLDEN: tuple[Case, ...] = (
     # ── the happy path: everything the harness asks for, allowed by both ─────
     Case("good_pr", "pr", compliant_pr_repo, _pr_argv(), True),
 
-    # ── PR shape (§0b/§2/§3/§4/§8) ───────────────────────────────────────────
+    # ── PR shape (§0b/§2/§3) ─────────────────────────────────────────────────
     Case("bad_base", "pr", compliant_pr_repo, _pr_argv(base="main"), False,
          reason_contains="must be 'dev'"),
     Case("no_base", "pr", compliant_pr_repo,
@@ -433,13 +438,6 @@ GOLDEN: tuple[Case, ...] = (
          reason_contains="Fixes #"),
     Case("web_flag", "pr", compliant_pr_repo, _pr_argv(extra=["--web"]), False,
          reason_contains="--web"),
-    Case("missing_ac_marker", "pr",
-         lambda p: _rm(compliant_pr_repo(p), ".harness/ac-posted"), _pr_argv(), False,
-         reason_contains="ac-posted"),
-    Case("failed_adversarial_verdict", "pr",
-         lambda p: _write(compliant_pr_repo(p), ".harness/adversarial-verdict", "FAIL nope\n"),
-         _pr_argv(), False, reason_contains="adversarial"),
-
     # ── M6 [repro]: the base branch moved on. The ONLY difference from
     #    `good_pr` is a commit on `dev`; the branch is untouched. ─────────────
     Case("base_advanced_pr", "pr", _base_advanced_repo, _pr_argv(), True),
@@ -454,7 +452,22 @@ GOLDEN: tuple[Case, ...] = (
          reason_contains="evidence/"),
     Case("visual_ac_without_screenshot", "pr", _visual_repo, _pr_argv(), False,
          reason_contains="no screenshot is committed"),
-    Case("visual_ac_with_read_screenshot", "pr", _read_screenshot_repo, _pr_argv(), True),
+    Case(
+        "visual_ac_with_read_screenshot",
+        "pr",
+        _read_screenshot_repo,
+        _pr_argv(),
+        True,
+        env={"HARNESS_SCREENSHOTS_READ": "../screenshots-read"},
+    ),
+    Case(
+        "visual_ac_with_forged_worktree_receipt",
+        "pr",
+        _forged_screenshot_repo,
+        _pr_argv(),
+        False,
+        reason_contains="trusted screenshot-read receipt",
+    ),
     Case("existing_test_weakened", "pr", _weakened_test_repo, _pr_argv(), False,
          env={"TEST_CMD": "true"}, reason_contains="existing test file"),
 
@@ -616,13 +629,13 @@ def test_golden_covers_every_rule_family() -> None:
     family_of = {
         "good_pr": "pr-shape", "bad_base": "pr-shape", "no_base": "pr-shape",
         "missing_ac": "pr-shape", "missing_issue_link": "pr-shape",
-        "web_flag": "pr-shape", "missing_ac_marker": "pr-shape",
-        "failed_adversarial_verdict": "pr-shape",
+        "web_flag": "pr-shape",
         "base_advanced_pr": "base-range", "base_advanced_push": "base-range",
         "base_advanced_branch_still_checked": "base-range",
         "non_image_evidence": "evidence",
         "visual_ac_without_screenshot": "evidence",
         "visual_ac_with_read_screenshot": "evidence",
+        "visual_ac_with_forged_worktree_receipt": "evidence",
         "existing_test_weakened": "evidence",
         "adr_governed_path_uncited": "adr", "adr_governed_path_cited": "adr",
         "adr_governs_untouched_path": "adr",
@@ -820,16 +833,7 @@ def test_divergence_commit_rule_order(tmp_path: Path) -> None:
     assert "TDD ordering" in python.output
 
 
-def test_bound_sh_dash_c_skips_both_gates(tmp_path: Path) -> None:
-    """Every parity claim above is bounded by this: `sh -c 'git push …'`
-    classifies as nothing, so NEITHER stack gates it (M9 / re-review R3-F8).
-
-    The classification layer is shared code (`adapters/governor_policy`, which
-    `plugin/hooks/bash_governor.py` imports), so this is not drift between the
-    two gates — it is one hole under both.  Asserted, not assumed: if the
-    classifier ever learns to see through `sh -c`, this test fails and the
-    bound can be lifted from the module docstring.  The permanent record lives
-    in tests/test_governor.py's strict-xfail block (wave P1-2 / C2d)."""
+def test_sh_dash_c_is_denied_as_unresolvable(tmp_path: Path) -> None:
     repo = compliant_pr_repo(tmp_path)
     env = {"BASE_BRANCH": "dev", "TEST_CMD": "false"}
 
@@ -847,10 +851,9 @@ def test_bound_sh_dash_c_skips_both_gates(tmp_path: Path) -> None:
              "cwd": str(repo)},
             None, None,
         ))
-    assert result == {}, (
-        "sh -c is now classified — good news; update the module docstring's "
-        "bound and this test"
-    )
+    output = result["hookSpecificOutput"]
+    assert output["permissionDecision"] == "deny"
+    assert "cannot be governed statically" in output["permissionDecisionReason"]
 
 
 # ── doctor: the operator-facing claims this wave had to make true ────────────

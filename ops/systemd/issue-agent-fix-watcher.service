@@ -7,15 +7,25 @@
 [Unit]
 Description=Autonomous issue agent — fix watcher (@NAME@)
 After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
 
 [Service]
-Type=simple
-ExecStart=uv run --extra sdk --with tree-sitter --with tree-sitter-bash python -m issue_agent.app.main fix
+Type=notify
+NotifyAccess=main
+ExecStart=@UV_BIN@ run --extra sdk --with tree-sitter --with tree-sitter-bash python -m issue_agent.app.main fix
 WorkingDirectory=@HARNESS_ROOT@
 Environment=AGENT_ENV=@CONFIG@
 Environment=TARGET_DIR=@TARGET_DIR@
-Restart=always
+Restart=on-failure
 RestartSec=30
+RestartPreventExitStatus=0 2 3 4 5 6
+TimeoutStopSec=90
+WatchdogSec=120
+KillSignal=SIGTERM
+FinalKillSignal=SIGKILL
+MemoryMax=4G
+TasksMax=512
 StandardOutput=journal
 StandardError=journal
 

@@ -1,6 +1,6 @@
 """Lifecycle value objects over the GitHub label control plane."""
 
-from builders import issue, pr
+from tests.domain.builders import issue, pr
 
 from issue_agent.domain.labels import Label
 from issue_agent.domain.lifecycle import (

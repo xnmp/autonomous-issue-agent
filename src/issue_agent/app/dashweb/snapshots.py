@@ -123,7 +123,7 @@ def repos_payload(
 
 
 # ── legs → steps ──────────────────────────────────────────────────────────────
-def leg_state(leg: dash.Leg) -> str:
+def leg_state(leg: dash.RunSummary) -> str:
     """A settled leg is `failed` when it exited for any reason other than a
     clean finish. `status` is the AGENT's claim; `exit_reason` is the
     envelope's, and only the envelope can see a run that died."""
@@ -212,8 +212,8 @@ def detailed_steps(row: dash.IssueRow) -> list[dict]:
     return steps
 
 
-def _settled_event(row: dash.IssueRow, leg: dash.Leg) -> dict:
-    """The raw `agent_run` a Leg was built from — `Leg` keeps only what the
+def _settled_event(row: dash.IssueRow, leg: dash.RunSummary) -> dict:
+    """The raw `agent_run` a RunSummary was built from — it keeps only what the
     aggregation needs, and the drill-down also wants turns/usage."""
     for e in row.events:
         if (
@@ -225,16 +225,16 @@ def _settled_event(row: dash.IssueRow, leg: dash.Leg) -> dict:
     return {}
 
 
-def _turns(row: dash.IssueRow, leg: dash.Leg):
+def _turns(row: dash.IssueRow, leg: dash.RunSummary):
     return _settled_event(row, leg).get("turns")
 
 
-def _usage(row: dash.IssueRow, leg: dash.Leg):
+def _usage(row: dash.IssueRow, leg: dash.RunSummary):
     usage = _settled_event(row, leg).get("usage")
     return usage if isinstance(usage, dict) else None
 
 
-def _model_for_leg(row: dash.IssueRow, leg: dash.Leg) -> str | None:
+def _model_for_leg(row: dash.IssueRow, leg: dash.RunSummary) -> str | None:
     """Configured model for a settled task, including old journal shapes.
 
     Some runtimes recorded the model on ``agent_run_start`` but not on the

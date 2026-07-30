@@ -1,6 +1,6 @@
 """CI-state precedence + distinct-actor review — the watcher-lib lessons."""
 
-from builders import Check, Review
+from tests.domain.builders import Check, Review
 
 from issue_agent.domain.ci import (
     ci_state,

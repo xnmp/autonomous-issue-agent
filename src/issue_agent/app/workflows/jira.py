@@ -2,25 +2,28 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from ..planners import tasks as task_builders
 from ..planners.tasks import JiraTaskConfig
-from ...domain.agent_task import AgentRuntime
+from ...adapters.runtime_plan import AgentRuntime
 from ...domain.jira import jira_sync_outcome, plan_jira_sync
+from ...domain.ports import WorkflowGitHubReads, WorkflowState
+from .base import run_leg
 
 
 @dataclass(frozen=True)
 class JiraSyncWorkflowConfig:
     jira: JiraTaskConfig | None
-    log: object
+    log: Callable[[str], None]
 
 
 @dataclass
 class JiraSyncWorkflow:
     cfg: JiraSyncWorkflowConfig
-    gateway: object
-    store: object
+    gateway: WorkflowGitHubReads
+    store: WorkflowState
     runner: AgentRuntime
 
     async def sync(self, issue: int) -> None:
@@ -31,10 +34,14 @@ class JiraSyncWorkflow:
         plan = plan_jira_sync(iss.labels, key, self.store.get_jira_phase(issue))
         if not plan.should_run or plan.target is None:
             return
-        result = await self.runner.run(
+        result = await run_leg(
+            self.runner,
+            self.cfg.log,
+            "jira-sync",
+            issue,
             task_builders.build_jira_sync_task(
                 issue, iss.title, iss.body, plan.target, plan.existing_key, self.cfg.jira
-            )
+            ),
         )
         outcome = jira_sync_outcome(
             is_error=result.is_error,

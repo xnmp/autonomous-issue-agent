@@ -11,7 +11,7 @@ Two layers, mirroring the gate's pure/impure split:
     git/fs.
 
   * `make_pretooluse_hook(build_ctx)` — the SDK callback. Builds a real
-    GateContext from the hook's cwd (the git-backed builder is Phase 4) and
+    GateContext from the hook's cwd using the git-backed builder and
     returns the SDK deny shape on the first violation. Fail-OPEN on its own
     errors (the gate is a fast nudge; CI/review are the real boundary), but
     fail-CLOSED on a recognised bypass — same policy as the bash.
@@ -32,8 +32,9 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from ..domain import gate
+from ..domain.contracts import TestExecution, TestExecutionStatus
 from ..domain.refs import is_governed_branch
-from . import governor_policy
+from ..domain import governor_policy
 
 
 def _no_adrs() -> tuple[gate.Adr, ...]:
@@ -53,7 +54,7 @@ def _no_check(_cmd: str) -> bool:
     return True
 
 
-# ── worktree facts the gate rules need (injected; built from git in Phase 4) ──
+# ── worktree facts the gate rules need (injected; built from git) ─────────────
 @dataclass(frozen=True)
 class GateContext:
     base_branch: str = "dev"
@@ -83,11 +84,9 @@ class GateContext:
     # POLICY is pure/domain; the actual sleeping is the adapter's business, so it
     # is injected and defaults to a no-op (tests never wait).
     open_pr_retry_sleep: Callable[[], None] = lambda: None
-    ac_posted: bool = False
-    test_plan_posted: bool = False
-    adversarial_verdict: str = ""
     visual_ac: bool = False                  # agent declared a visual criterion
     screenshots_read: tuple[str, ...] = ()   # evidence images the agent actually read
+    screenshots_receipt_available: bool = True
     harness_test_cmd: str | None = None
     env_test_cmd: str | None = None
     # Operator opt-out for a genuinely test-less repo (ALLOW_UNTESTED=1 in the
@@ -96,9 +95,19 @@ class GateContext:
     allow_untested: bool = False
     exists_at_base: Callable[[str], bool] = lambda f: False
     run_tests: Callable[[str], bool | None] = lambda c: True
-    revert_and_run: Callable[[tuple[str, ...]], bool | None] = lambda impl: False
+    revert_and_run: Callable[[tuple[str, ...]], TestExecution] = lambda impl: TestExecution(
+        TestExecutionStatus.INFRA_ERROR,
+        ("unbound",),
+        127,
+        0,
+        "",
+        "",
+        "unbound",
+        "unknown",
+    )
     red_must_fail: bool = True
     verify_red_at_commit: bool = True   # run the suite on a `red:` commit, require failure
+    durable_publish: bool = False
     # ── the two rules ported from bash in wave P1-2 (review M6) ───────────────
     # The worktree the gate is judging. Filled by `complete_gate_context` from
     # the hook's cwd; "" means "nobody said", which makes the worktree-derived
@@ -193,7 +202,8 @@ _CHECK_TIMEOUT_S = 120.0
 TARGET_CMD_SCRUB_KNOBS = (
     "TEST_CMD", "LINT_CMD", "TYPECHECK_CMD", "EDIT_CHECK_CMD", "ALLOW_UNTESTED",
     "RED_MUST_FAIL", "VERIFY_RED_AT_COMMIT", "BASE_BRANCH",
-    "GATE_TEST_TIMEOUT_S", "GATE_GH_RETRY_SLEEP", "GH_APP_ID",
+    "GATE_TEST_TIMEOUT_S", "GATE_GH_RETRY_SLEEP", "HARNESS_SCREENSHOTS_READ",
+    "GH_APP_ID",
     "GH_APP_KEY_FILE", "GH_APP_INSTALL_ID", "TARGET_DIR", "AGENT_ENV",
 )
 
@@ -383,22 +393,24 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
     pr_base = _extract_after_flag(argv, "--base", "-B")
 
     # The tuple order IS the contract check-pr.sh mirrors, section for section
-    # (§0, §0b, §2/§3, §4, §7d, §5, §6, §7, §7b, §8, §9, then §1 and §7c).
+    # (§0, §0b, §2/§3, §7d, §5, §6, §7, §7b, §9, then §1 and §7c).
     # tests/test_gate_parity.py runs golden cases through both and compares the
     # first denial, so a reorder on one side without the other fails loudly.
     cheap_checks: tuple[Callable[[], gate.GateResult], ...] = (
         lambda: gate.check_no_web(argv),
         lambda: gate.check_pr_base(pr_base, ctx.base_branch),
         lambda: gate.check_pr_body(body),
-        lambda: gate.check_markers(ctx.ac_posted, ctx.test_plan_posted),
         lambda: gate.check_visual_evidence(
-            ctx.visual_ac, ctx.changed_files, ctx.screenshots_read, body
+            ctx.visual_ac,
+            ctx.changed_files,
+            ctx.screenshots_read,
+            body,
+            receipt_available=ctx.screenshots_receipt_available,
         ),
         lambda: gate.check_required_test(ctx.branch, ctx.changed_files),
         lambda: gate.check_commit_log(ctx.branch_subjects),
         lambda: gate.check_no_evidence(ctx.changed_files),
         lambda: gate.check_tests_immutable(ctx.changed_files, ctx.exists_at_base),
-        lambda: gate.check_adversarial_verdict(ctx.adversarial_verdict),
         # §9 — ported from bash in wave P1-2 (review M6). Cheap only in the sense
         # that matters here (no test run), but it does touch the filesystem, so
         # it sits LAST among the cheap checks: a repo with no docs/adr/ pays one
@@ -539,6 +551,14 @@ def evaluate_command(command: str, ctx: GateContext) -> Verdict:
     """Decide whether a Bash command is allowed. Bypass detection first (fail
     CLOSED), then route each governed command to its gate. Returns the FIRST
     violation's reason (the hook can only deny once)."""
+    resolution = governor_policy.resolve(command)
+    if isinstance(resolution, governor_policy.Unresolvable):
+        return Verdict(
+            False,
+            "Blocked: command cannot be governed statically — "
+            f"{resolution.reason}. Use a literal executable and argv.",
+        )
+
     # 1) Bypass detection across every command node (reuse the bash core).
     bypass = governor_policy.find_violations(command)
     if bypass:
@@ -584,10 +604,22 @@ def evaluate_command(command: str, ctx: GateContext) -> Verdict:
             reasons = _pr_gate(list(g.checker_args), ctx)
             if reasons:
                 return Verdict(False, f"PR blocked: {reasons[0]}")
+            if ctx.durable_publish and not g.durable_wrapper:
+                return Verdict(
+                    False,
+                    "PR publication must use `issue-agent-publish gh pr create "
+                    "…` so the remote effect has a durable command and receipt",
+                )
         elif g.kind == "git-push":
             reasons = _push_gate(list(g.checker_args), ctx)
             if reasons:
                 return Verdict(False, f"Push blocked: {reasons[0]}")
+            if ctx.durable_publish and not g.durable_wrapper:
+                return Verdict(
+                    False,
+                    "Branch publication must use `issue-agent-publish git push "
+                    "…` so the remote effect has a durable command and receipt",
+                )
         # git-config: bypass-only (handled above).
     return Verdict(True)
 
@@ -653,16 +685,20 @@ def make_posttooluse_hook(
 _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
 
-def _record_screenshot_read(cwd: str, name: str) -> None:
-    """Append a read screenshot's basename to <cwd>/.harness/screenshots-read."""
-    hdir = os.path.join(cwd, ".harness")
-    os.makedirs(hdir, exist_ok=True)
-    with open(os.path.join(hdir, "screenshots-read"), "a") as f:
+def _record_screenshot_read(state_dir: str, cwd: str, name: str) -> None:
+    """Append to the harness-owned receipt for this exact worktree."""
+
+    from .codex_hook import evidence_receipt_path
+
+    path = evidence_receipt_path(state_dir, cwd)
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    with open(path, "a") as f:
         f.write(name + "\n")
+    os.chmod(path, 0o600)
 
 
 def make_read_record_hook(
-    record: Callable[[str, str], None] = _record_screenshot_read,
+    record: Callable[[str, str], None] = lambda _cwd, _name: None,
 ):
     """Build the PostToolUse(Read) HookCallback. When the agent Reads an evidence
     screenshot (an image under `evidence/`), it has loaded the pixels into its own
@@ -720,7 +756,7 @@ def make_pretooluse_hook(
     debug: bool = False,
 ):
     """Build the PreToolUse(Bash) HookCallback. `build_ctx(cwd) -> GateContext`
-    is the git/fs-backed fact gatherer (Phase 4); injected so this stays pure and
+    is the git/fs-backed fact gatherer; injected so this stays pure and
     testable. `log` receives a live breadcrumb for each allowed `git commit`
     (red:/green:/docs: milestones) so a long in-session run isn't a silent gap.
     When `debug`, every Bash command the agent attempts is logged with its
@@ -808,6 +844,7 @@ def build_hooks(
     edit_check_cmd: str | None = None,
     log: Callable[[str], None] = lambda _m: None,
     debug: bool = False,
+    trusted_state_dir: str = "",
 ) -> dict:
     """Convenience: the hooks dict AgentRunner wants. Always registers the
     PreToolUse(Bash) governor and a PostToolUse(Read) screenshot-read recorder;
@@ -817,7 +854,18 @@ def build_hooks(
     every command + verdict. Imports the SDK lazily."""
     from claude_agent_sdk import HookMatcher
 
-    post: list = [HookMatcher(matcher="Read", hooks=[make_read_record_hook()])]
+    record = (
+        (
+            lambda cwd, name: _record_screenshot_read(
+                trusted_state_dir, cwd, name
+            )
+        )
+        if trusted_state_dir
+        else (lambda _cwd, _name: None)
+    )
+    post: list = [HookMatcher(
+        matcher="Read", hooks=[make_read_record_hook(record=record)]
+    )]
     if edit_check_cmd:
         post.append(
             HookMatcher(

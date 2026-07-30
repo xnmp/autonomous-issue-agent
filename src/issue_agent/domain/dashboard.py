@@ -9,6 +9,21 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import Iterable, Mapping
+
+from .events import (
+    AgentRunCompleted,
+    AgentRunStarted,
+    DaemonStateChanged,
+    EscalationRaised,
+    EventEnvelope,
+    RecurrenceDetected,
+    SpendBlocked,
+    SpendRecorded,
+    WorldObserved,
+    encode_event,
+)
+from .projection import ReadModel
 
 # The three role daemons, in the order `journal_paths` returns their journals.
 ROLE_NAMES = ("fix", "review", "steward")
@@ -152,7 +167,7 @@ def event_issue(event: dict, pr_issue: dict[int, int]) -> int | None:
 
 # ── rows ──────────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
-class Leg:
+class RunSummary:
     """One settled agent run — the unit both the cost mix and the rounds count
     are computed over."""
 
@@ -189,7 +204,7 @@ class IssueRow:
     issue: int
     stage: str
     cost_usd: float
-    legs: tuple[Leg, ...]
+    legs: tuple[RunSummary, ...]
     running: tuple[RunningLeg, ...]
     rounds: int  # review legs against this issue's PRs
     approvals: int
@@ -248,6 +263,7 @@ class Deployment:
     issues: tuple[IssueRow, ...]  # newest activity first
     metrics: Metrics
     unattributed: tuple[dict, ...]  # events naming no issue (daily caps, ticks)
+    schema_version: int = 1
 
 
 @dataclass(frozen=True)
@@ -264,6 +280,331 @@ class Snapshot:
     def last_activity(self) -> datetime | None:
         stamps = [ts for ts in self.timestamps if ts]
         return max(stamps) if stamps else None
+
+
+def build_deployment_v2(
+    name: str,
+    repo: str,
+    feeds: Iterable[
+        tuple[str, str, str, tuple[EventEnvelope, ...]]
+    ],
+    model: ReadModel,
+    now_fn,
+    stale_after_s: float = STALE_AFTER_S,
+    heartbeat_times: Mapping[str, datetime] | None = None,
+) -> Deployment:
+    """Build the dashboard exclusively from the canonical schema-v2 fold.
+
+    GitHub observations enter through ``WorldObserved``. No current GitHub read,
+    prose parsing, journal-tail inference, or legacy event name participates in
+    lifecycle state.
+    """
+
+    now = now_fn()
+    feed_rows = tuple(feeds)
+    heartbeats = heartbeat_times or {}
+    health = tuple(
+        _v2_health(
+            role,
+            path,
+            log,
+            events,
+            now,
+            stale_after_s,
+            heartbeats.get(role),
+        )
+        for role, path, log, events in feed_rows
+    )
+    pr_issue = _v2_pr_issue(model.events)
+    grouped: dict[int, list[EventEnvelope]] = {}
+    unattributed_events: list[EventEnvelope] = []
+    for event in model.events:
+        issue = _v2_event_issue(event, pr_issue)
+        if issue is None:
+            unattributed_events.append(event)
+        else:
+            grouped.setdefault(issue, []).append(event)
+
+    rows = tuple(
+        sorted(
+            (
+                _v2_issue_row(issue, events, model, pr_issue)
+                for issue, events in grouped.items()
+            ),
+            key=_row_sort_key,
+            reverse=True,
+        )
+    )
+    today = now.astimezone(timezone.utc).date()
+    today_usd = sum(
+        payload.amount_micros / 1_000_000
+        for event in model.events
+        if event.occurred_at.astimezone(timezone.utc).date() == today
+        and isinstance((payload := event.payload), SpendRecorded)
+    )
+    unattributed = tuple(encode_event(event) for event in unattributed_events)
+    return Deployment(
+        name=name,
+        repo=repo,
+        health=health,
+        issues=rows,
+        metrics=build_metrics(rows, unattributed, today_usd),
+        unattributed=unattributed,
+        schema_version=2,
+    )
+
+
+def _v2_health(
+    role: str,
+    path: str,
+    log_path: str,
+    events: tuple[EventEnvelope, ...],
+    now: datetime,
+    stale_after_s: float,
+    heartbeat_at: datetime | None = None,
+) -> DaemonHealth:
+    ordered = sorted(events, key=lambda event: event.order_key)
+    last_event_at = ordered[-1].occurred_at if ordered else None
+    candidates = tuple(
+        stamp for stamp in (last_event_at, heartbeat_at) if stamp is not None
+    )
+    last = max(candidates) if candidates else None
+    daemon_states = tuple(
+        event.payload
+        for event in ordered
+        if isinstance(event.payload, DaemonStateChanged)
+    )
+    explicitly_stopped = (
+        bool(daemon_states) and daemon_states[-1].state == "stopped"
+    )
+    return DaemonHealth(
+        role=role,
+        journal_path=path,
+        log_path=log_path,
+        events=len(events),
+        last_ts=last,
+        last_event=ordered[-1].type if ordered else "",
+        stale=(
+            explicitly_stopped
+            or last is None
+            or (now - last).total_seconds() > stale_after_s
+        ),
+    )
+
+
+def _v2_pr_issue(events: Iterable[EventEnvelope]) -> dict[int, int]:
+    result: dict[int, int] = {}
+    for event in events:
+        correlation = event.correlation
+        if correlation.pr is not None and correlation.issue is not None:
+            result[correlation.pr] = correlation.issue
+        payload = event.payload
+        if not isinstance(payload, WorldObserved) or payload.subject_kind != "pr":
+            continue
+        closing = payload.facts.get("closing_issue")
+        if isinstance(closing, int) and closing > 0:
+            result[payload.subject_number] = closing
+    return result
+
+
+def _v2_event_issue(
+    event: EventEnvelope, pr_issue: dict[int, int]
+) -> int | None:
+    correlation = event.correlation
+    if correlation.issue is not None:
+        return correlation.issue
+    if correlation.pr is not None:
+        return pr_issue.get(correlation.pr)
+    payload = event.payload
+    if isinstance(payload, WorldObserved):
+        if payload.subject_kind == "issue":
+            return payload.subject_number
+        if payload.subject_kind == "pr":
+            return pr_issue.get(payload.subject_number)
+    if isinstance(payload, EscalationRaised) and payload.target == "issue":
+        return payload.number
+    return None
+
+
+def _v2_issue_row(
+    issue: int,
+    events: list[EventEnvelope],
+    model: ReadModel,
+    pr_issue: dict[int, int],
+) -> IssueRow:
+    ordered = sorted(events, key=lambda event: event.order_key)
+    run_ids = {
+        event.correlation.run_id
+        for event in ordered
+        if event.correlation.run_id
+    }
+    legs: list[RunSummary] = []
+    running: list[RunningLeg] = []
+    for run_id in run_ids:
+        run = model.runs.get(run_id)
+        if run is None:
+            continue
+        start_payload = run.start.payload
+        completion_payload = (
+            run.completion.payload if run.completion is not None else None
+        )
+        if isinstance(completion_payload, AgentRunCompleted):
+            correlation = run.completion.correlation
+            legs.append(
+                RunSummary(
+                    ts=run.completion.occurred_at,
+                    role=run.completion.producer.role,
+                    kind=completion_payload.kind,
+                    number=correlation.pr or correlation.issue,
+                    issue=issue,
+                    model=completion_payload.model,
+                    status=completion_payload.status,
+                    exit_reason=completion_payload.exit_reason or "",
+                    duration_s=completion_payload.duration_ms / 1000,
+                    cost_usd=(completion_payload.cost_micros or 0) / 1_000_000,
+                    estimated=completion_payload.pricing_basis
+                    == "learned_estimate",
+                    session_id=correlation.session_id or "",
+                )
+            )
+        elif run.abandoned is None and isinstance(
+            start_payload, AgentRunStarted
+        ):
+            correlation = run.start.correlation
+            running.append(
+                RunningLeg(
+                    ts=run.start.occurred_at,
+                    role=run.start.producer.role,
+                    kind=start_payload.kind,
+                    number=correlation.pr or correlation.issue,
+                    issue=issue,
+                    model=start_payload.model,
+                )
+            )
+
+    legs.sort(key=lambda leg: leg.ts or datetime.min.replace(tzinfo=timezone.utc))
+    running.sort(
+        key=lambda leg: leg.ts or datetime.min.replace(tzinfo=timezone.utc)
+    )
+    observations = [
+        event
+        for event in ordered
+        if isinstance(event.payload, WorldObserved)
+        and event.payload.subject_kind == "issue"
+        and event.payload.subject_number == issue
+    ]
+    facts = observations[-1].payload.facts if observations else {}
+    labels_raw = facts.get("labels", ())
+    labels = (
+        {str(label) for label in labels_raw}
+        if isinstance(labels_raw, (tuple, list, set, frozenset))
+        else set()
+    )
+    done = str(facts.get("state") or "").casefold() == "closed" or "ai-done" in labels
+    stage = _v2_stage(ordered, tuple(running), tuple(legs), labels, done)
+    prs = tuple(
+        sorted(
+            {
+                pr
+                for pr, linked_issue in pr_issue.items()
+                if linked_issue == issue
+            }
+            | {
+                event.correlation.pr
+                for event in ordered
+                if event.correlation.pr is not None
+            }
+        )
+    )
+    review_legs = [leg for leg in legs if leg.kind in REVIEW_KINDS]
+    spend_events = [
+        event.payload
+        for event in ordered
+        if isinstance(event.payload, SpendRecorded)
+    ]
+    cost_usd = (
+        sum(payload.amount_micros for payload in spend_events) / 1_000_000
+        if spend_events
+        else sum(leg.cost_usd for leg in legs)
+    )
+    return IssueRow(
+        issue=issue,
+        stage=stage,
+        cost_usd=round(cost_usd, 4),
+        legs=tuple(legs),
+        running=() if done else tuple(running),
+        rounds=len(review_legs),
+        approvals=sum(leg.status == "APPROVE" for leg in review_legs),
+        changes_requested=sum(
+            leg.status == "REQUEST_CHANGES" for leg in review_legs
+        ),
+        escalations=sum(
+            isinstance(event.payload, EscalationRaised) for event in ordered
+        ),
+        recurrences=sum(
+            isinstance(event.payload, RecurrenceDetected) for event in ordered
+        ),
+        spend_blocks=sum(
+            isinstance(event.payload, SpendBlocked) for event in ordered
+        ),
+        prs=prs,
+        models=tuple(
+            dict.fromkeys(
+                leg.model
+                for leg in (*legs, *running)
+                if leg.model
+            )
+        ),
+        last_ts=ordered[-1].occurred_at if ordered else None,
+        done=done,
+        events=tuple(encode_event(event) for event in ordered),
+    )
+
+
+def _v2_stage(
+    events: list[EventEnvelope],
+    running: tuple[RunningLeg, ...],
+    legs: tuple[RunSummary, ...],
+    labels: set[str],
+    done: bool,
+) -> str:
+    if done:
+        return "done"
+    if "needs-human-review" in labels:
+        return "escalated"
+    if "ai-blocked" in labels:
+        return "blocked"
+    if running:
+        return _STAGE_RUNNING.get(
+            running[-1].kind,
+            f"running {running[-1].kind or 'agent'}",
+        )
+    if any(isinstance(event.payload, RecurrenceDetected) for event in events):
+        return "recurred"
+    if any(isinstance(event.payload, SpendBlocked) for event in events):
+        return "blocked (spend)"
+    if legs:
+        leg = legs[-1]
+        if leg.exit_reason:
+            return "run failed"
+        if leg.status == "blocked":
+            return "awaiting human reply"
+        if leg.kind in REVIEW_KINDS:
+            if leg.status == "APPROVE":
+                return "awaiting merge"
+            if leg.status == "REQUEST_CHANGES":
+                return "changes requested"
+            return "reviewed"
+        if leg.kind in RESOLVE_KINDS | REPAIR_KINDS:
+            return "awaiting review"
+    for label, stage in (
+        ("ai-pr-open", "pr open"),
+        ("ai-working", "working"),
+        ("ai-ready", "queued"),
+    ):
+        if label in labels:
+            return stage
+    return "unknown"
 
 
 # ── stage inference (HEURISTIC — see the table in the docstring) ──────────────
@@ -498,10 +839,10 @@ def _issue_row(issue: int, events: list[dict], running: tuple[RunningLeg, ...]) 
     )
 
 
-def _leg(e: dict) -> Leg:
+def _leg(e: dict) -> RunSummary:
     cost = _float(e.get("cost_usd"))
     estimated = _float(e.get("cost_estimated_usd"))
-    return Leg(
+    return RunSummary(
         ts=parse_ts(e.get("ts")),
         role=str(e.get("role") or ""),
         kind=str(e.get("kind") or "?"),
@@ -564,7 +905,7 @@ def build_metrics(rows, unattributed, today_usd: float) -> Metrics:
     for leg in legs:
         cost, n = by_kind.get(leg.kind, (0.0, 0))
         by_kind[leg.kind] = (cost + leg.cost_usd, n + 1)
-    total = sum(leg.cost_usd for leg in legs)
+    total = sum(row.cost_usd for row in rows)
     done = [row for row in rows if row.done]
     approvals, changes = first_pass_verdicts(rows)
     reviewed = [row for row in rows if row.rounds]
@@ -604,7 +945,8 @@ def build_deployment(
     """Assemble one deployment's report. Pure: `feeds` is
     `(role, journal_path, log_path, events)` tuples already read off disk.
     """
-    now_fn = now_fn or _utcnow
+    if now_fn is None:
+        raise ValueError("build_deployment requires an injected clock")
     now = now_fn()
     health = tuple(
         _health(role, journal, log, events, now, stale_after_s)
@@ -660,10 +1002,6 @@ def _health(role, journal_path, log_path, events, now, stale_after_s) -> DaemonH
 
 
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
 def _stamp_date(now: datetime) -> str:
     return now.astimezone(timezone.utc).date().isoformat()
 
@@ -700,7 +1038,7 @@ def _events_within(events, seconds: float, now_fn) -> list[dict]:
     ]
 
 
-def unsettled_start_events(events, window_s: float = 86400.0, now_fn=_utcnow) -> list[dict]:
+def unsettled_start_events(events, window_s: float, now_fn) -> list[dict]:
     """Return agent starts still owed a settlement, grouped per dispatch."""
     scoped = _events_within(events, window_s, now_fn) if window_s > 0 else list(events)
     starts: dict[tuple, list[dict]] = {}

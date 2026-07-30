@@ -20,15 +20,27 @@ from collections.abc import Callable, Hashable
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+import json
+import os
 import threading
 import time
 
 from ..adapters.github import GhUnavailable
 from ..adapters.journal import read_events_tail, stalled_run_annotations
-from ..domain.actions import Action, RunAgent
+from ..domain.actions import Action, Relabel, RunAgent
+from ..domain.supervision import (
+    ClockSample,
+    DaemonState,
+    ExitCode,
+    suspension_between,
+)
 from ..domain.world import WorldState
 from .execute import Executor
 from .world_probe import WorldUnchanged
+
+
+def _ignore_log(_message: str) -> None:
+    pass
 
 
 def order_for_execution(actions: list[Action]) -> list[Action]:
@@ -54,6 +66,25 @@ def order_for_execution(actions: list[Action]) -> list[Action]:
     return [*cheap, *dispatches]
 
 
+def dispatch_claim_ids(actions: list[Action]) -> frozenset[int]:
+    """Identity set of relabels whose only purpose is claiming a paid dispatch.
+
+    Decision functions emit these as an adjacent ``Relabel, RunAgent`` pair.
+    When accounting blocks admission, independent free lifecycle work still
+    executes, but the paired claim must not orphan the target in an in-flight
+    label with no process behind it.
+    """
+
+    return frozenset(
+        id(actions[index - 1])
+        for index, action in enumerate(actions)
+        if index > 0
+        and isinstance(action, RunAgent)
+        and isinstance(actions[index - 1], Relabel)
+        and actions[index - 1].number == action.number
+    )
+
+
 @dataclass
 class Daemon:
     name: str
@@ -61,7 +92,7 @@ class Daemon:
     decide: Callable[[WorldState], list[Action]]
     executor: Executor
     poll_seconds: int = 60
-    log: Callable[[str], None] = lambda msg: None
+    log: Callable[[str], None] = _ignore_log
     # Optional JSONL journal (adapters.journal.Journal). Default None keeps every
     # existing construction working; when set, the skipped-tick arm becomes a
     # countable event rather than a line in a log nobody kept.
@@ -90,9 +121,16 @@ class Daemon:
     # Fix wiring owns the asyncio tasks underneath executor worker threads.
     # This hook cancels them on operator/fatal shutdown before the pool joins.
     cancel_active_dispatches: Callable[[], None] | None = None
+    force_kill_dispatches: Callable[[], object] | None = None
     # Decision-side path leases are acquired before lifecycle writes execute.
     # Any dispatch that never reaches the runtime must release that lease here.
     dispatch_rejected: Callable[[RunAgent], None] | None = None
+    heartbeat_path: str = ""
+    shutdown_timeout_seconds: float = 85.0
+    recover: Callable[[], object] | None = None
+    _state: DaemonState = field(
+        default=DaemonState.STARTING, init=False, repr=False
+    )
     _gated_on: str | None = field(default=None, init=False, repr=False)
     _dispatch_pool: ThreadPoolExecutor | None = field(
         default=None, init=False, repr=False
@@ -105,6 +143,7 @@ class Daemon:
     )
     _accept_dispatches: bool = field(default=True, init=False, repr=False)
     _dispatch_closed: bool = field(default=False, init=False, repr=False)
+    _retry_after_seconds: float | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.dispatch_capacity < 0:
@@ -114,6 +153,64 @@ class Daemon:
                 max_workers=self.dispatch_capacity,
                 thread_name_prefix=f"{self.name}-dispatch",
             )
+        if self.shutdown_timeout_seconds <= 0:
+            raise ValueError("shutdown timeout must be positive")
+
+    @property
+    def state(self) -> DaemonState:
+        return self._state
+
+    def _transition(self, state: DaemonState, reason: str = "") -> None:
+        allowed = {
+            DaemonState.STARTING: {DaemonState.RUNNING, DaemonState.DRAINING},
+            DaemonState.RUNNING: {DaemonState.DRAINING},
+            DaemonState.DRAINING: {DaemonState.STOPPED},
+            DaemonState.STOPPED: set(),
+        }
+        if state is self._state:
+            return
+        if state not in allowed[self._state]:
+            raise RuntimeError(
+                f"invalid daemon transition {self._state.value} -> {state.value}"
+            )
+        previous = self._state
+        self._state = state
+        self.log(
+            f"{self.name}: state {previous.value} -> {state.value}"
+            + (f" ({reason})" if reason else "")
+        )
+        if self.journal is not None:
+            self.journal.emit(
+                "daemon_state",
+                previous=previous.value,
+                state=state.value,
+                reason=reason,
+            )
+
+    def _write_heartbeat(self) -> None:
+        if not self.heartbeat_path:
+            return
+        parent = os.path.dirname(self.heartbeat_path)
+        try:
+            if parent:
+                os.makedirs(parent, mode=0o700, exist_ok=True)
+            temporary = f"{self.heartbeat_path}.{os.getpid()}.tmp"
+            payload = {
+                "pid": os.getpid(),
+                "state": self._state.value,
+                "in_flight": [
+                    {"kind": action.kind.name, "number": action.number}
+                    for action in self.active_dispatches
+                ],
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            with open(temporary, "w", encoding="utf-8") as stream:
+                json.dump(payload, stream, sort_keys=True)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.heartbeat_path)
+        except OSError as exc:
+            self.log(f"{self.name}: heartbeat write failed: {exc}")
 
     @property
     def active_dispatches(self) -> tuple[RunAgent, ...]:
@@ -195,7 +292,7 @@ class Daemon:
         if pending:
             wait(pending)
 
-    def shutdown_dispatches(self, *, cancel: bool) -> None:
+    def shutdown_dispatches(self, *, cancel: bool) -> bool:
         """Close admission, optionally cancel active async work, and join.
 
         ThreadPoolExecutor workers are non-daemon. Joining them explicitly is
@@ -205,10 +302,10 @@ class Daemon:
         """
         pool = self._dispatch_pool
         if pool is None:
-            return
+            return True
         with self._dispatch_lock:
             if self._dispatch_closed:
-                return
+                return not self._dispatches
             self._dispatch_closed = True
             self._accept_dispatches = False
         if cancel and self.cancel_active_dispatches is not None:
@@ -216,22 +313,43 @@ class Daemon:
                 self.cancel_active_dispatches()
             except Exception as exc:  # noqa: BLE001 - shutdown must still join
                 self.log(f"{self.name}: dispatch cancellation failed: {exc}")
-        pool.shutdown(wait=True, cancel_futures=cancel)
+        with self._dispatch_lock:
+            pending = tuple(self._dispatches)
+        _done, unfinished = wait(pending, timeout=self.shutdown_timeout_seconds)
+        if unfinished:
+            self.log(
+                f"{self.name}: shutdown deadline expired with "
+                f"{len(unfinished)} dispatch(es) still active"
+            )
+            if self.force_kill_dispatches is not None:
+                try:
+                    self.force_kill_dispatches()
+                except Exception as exc:  # noqa: BLE001 - keep escalating shutdown
+                    self.log(
+                        f"{self.name}: forced process teardown failed: {exc}"
+                    )
+                _done, unfinished = wait(
+                    unfinished,
+                    timeout=min(5.0, self.shutdown_timeout_seconds),
+                )
+        pool.shutdown(wait=False, cancel_futures=cancel)
+        if unfinished:
+            return False
+        return True
 
     def _gate_blocks_this_tick(self) -> bool:
         """True when `tick_gate` says to skip. Edge-triggered logging: a level
         that stays tripped for hours must not print a line every poll, and the
         clearing edge is the line an operator actually waits for.
 
-        Fails OPEN: a gate that raises must not wedge the daemon, and every
-        breaker it front-runs is still enforced at dispatch time."""
+        Fails closed for paid admission: an accounting read error must never be
+        interpreted as zero spend. Observation and free reconciliation continue."""
         if self.tick_gate is None:
             return False
         try:
             reason = self.tick_gate()
         except Exception as exc:  # noqa: BLE001 - a broken gate ≠ a stopped daemon
-            self.log(f"{self.name}: tick gate failed (proceeding): {exc}")
-            return False
+            reason = f"ACCOUNTING UNAVAILABLE — {exc}"
         if reason is None:
             if self._gated_on is not None:
                 self.log(f"{self.name}: resuming — {self._gated_on} no longer applies")
@@ -265,8 +383,7 @@ class Daemon:
                 "skipping observe/dispatch this tick"
             )
             return []
-        if self._gate_blocks_this_tick():
-            return []
+        paid_blocked = self._gate_blocks_this_tick()
         try:
             world = self.observe()
             actions = self.decide(world)
@@ -278,6 +395,7 @@ class Daemon:
             # already proves liveness.
             return []
         except GhUnavailable as exc:
+            self._retry_after_seconds = exc.retry_after_s
             self.log(
                 f"{self.name}: world build failed: GitHub {exc.headline} — "
                 f"skipping tick, no actions taken ({exc.detail})"
@@ -291,11 +409,21 @@ class Daemon:
         except Exception as exc:  # noqa: BLE001 - crash-isolate a poll
             self.log(f"{self.name}: poll pass failed (continuing): {exc}")
             return []
+        blocked_claims = dispatch_claim_ids(actions) if paid_blocked else frozenset()
         ordered = order_for_execution(actions)
         taken: list[Action] = []
         for action in ordered:
             try:
+                if id(action) in blocked_claims:
+                    continue
                 if isinstance(action, RunAgent):
+                    if paid_blocked:
+                        self._release_rejected_dispatch(action)
+                        self.log(
+                            f"{self.name}: paid dispatch {action.kind.name} "
+                            f"#{action.number} blocked; free tick work completed"
+                        )
+                        continue
                     if self._dispatch_pool is None:
                         # Preserve the synchronous tick contract: the decision
                         # was taken even when its execution raises and is crash-
@@ -331,6 +459,7 @@ class Daemon:
         max_ticks: int | None = None,
         reload_check: Callable[[], bool] | None = None,
         active_now: Callable[[], float] = time.monotonic,
+        scheduler_progress: Callable[[], None] | None = None,
     ) -> None:
         """Loop tick→sleep with a heartbeat. `now`/`sleep` injected (testable).
         `max_ticks` bounds the loop for tests; None = forever.
@@ -344,6 +473,7 @@ class Daemon:
             else f"poll {self.poll_seconds}s"
         )
         self.log(f"{self.name}: watching ({mode})")
+        self._transition(DaemonState.RUNNING)
         last = now()
         last_active = active_now()
         last_logged = last
@@ -356,13 +486,19 @@ class Daemon:
                 elapsed = cur - last
                 active_elapsed = cur_active - last_active
                 previous = last
+                previous_active = last_active
                 last = cur
                 last_active = cur_active
                 # A late wall heartbeat is a stall only when wall time advanced
                 # beyond monotonic active time. Synchronous paid legs routinely
                 # exceed the wall threshold and must not generate incident records
                 # or replay lifecycle state merely because they were productive.
-                suspended = max(0, round(elapsed - active_elapsed))
+                suspended = round(
+                    suspension_between(
+                        ClockSample(previous, previous_active),
+                        ClockSample(cur, cur_active),
+                    ).suspended_seconds
+                )
                 if elapsed >= self.poll_seconds * 4 and suspended > 0:
                     stall_started = datetime.fromtimestamp(
                         cur - suspended, tz=timezone.utc
@@ -394,8 +530,12 @@ class Daemon:
                             suspended_seconds=suspended,
                             stall_clock_offset_seconds=stall_clock_offset,
                         )
-                        path = getattr(self.journal, "path", "")
-                        if path and suspended > 0:
+                        path = self.journal.path
+                        if (
+                            path
+                            and suspended > 0
+                            and not self.journal.canonical
+                        ):
                             for annotation in stalled_run_annotations(
                                 read_events_tail(path),
                                 observed_from,
@@ -411,6 +551,8 @@ class Daemon:
                                     woke_at=woke_at.isoformat(),
                                     detected_suspended_seconds=suspended,
                                 )
+                    if self.recover is not None:
+                        self.recover()
                     self.executor.reconcile_recent_actions(
                         reconcile_from,
                         woke_at,
@@ -420,6 +562,9 @@ class Daemon:
                     self.log(f"{self.name}: ♥ alive (poll {self.poll_seconds}s)")
                     last_logged = cur
                 self.tick()
+                self._write_heartbeat()
+                if scheduler_progress is not None:
+                    scheduler_progress()
                 ticks += 1
                 reload_requested = reload_check is not None and reload_check()
                 if reload_requested and self.active_dispatches:
@@ -440,37 +585,60 @@ class Daemon:
                         "restarting with no session in flight"
                     )
                     raise SystemExit(RELOAD_EXIT_CODE)
-                self._sleep_interval(sleep)
-            self.shutdown_dispatches(cancel=False)
-        except BaseException:
-            self.shutdown_dispatches(cancel=True)
+                self._sleep_interval(sleep, scheduler_progress)
+            self._transition(DaemonState.DRAINING, "loop completed")
+            clean = self.shutdown_dispatches(cancel=False)
+            self._transition(DaemonState.STOPPED)
+            if not clean:
+                raise SystemExit(ExitCode.TRANSIENT)
+        except BaseException as exc:
+            if self._state not in {DaemonState.DRAINING, DaemonState.STOPPED}:
+                self._transition(DaemonState.DRAINING, "shutdown requested")
+            clean = True
+            if self._state is not DaemonState.STOPPED:
+                clean = self.shutdown_dispatches(cancel=True)
+                self._transition(DaemonState.STOPPED)
+            self._write_heartbeat()
+            if not clean:
+                raise SystemExit(ExitCode.TRANSIENT) from exc
             raise
 
-    def _sleep_interval(self, sleep: Callable[[int], None]) -> None:
+    def _sleep_interval(
+        self,
+        sleep: Callable[[int], None],
+        scheduler_progress: Callable[[], None] | None = None,
+    ) -> None:
         """Sleep one poll interval, cut short by a push wake if one is wired.
 
-        Without `wake_check` this is exactly the old `sleep(poll_seconds)` — one
-        call, so a fake sleep still sees the interval it was asked for. With it,
-        the same total is served in ≤1s slices and abandoned on the first
-        delivery. A wake_check that raises is treated as "no wake": losing push
-        latency must never wedge the reconciler."""
-        if self.wake_check is None:
-            sleep(self.poll_seconds)
+        A notifier slices even quiet/retry-after waits to keep a systemd
+        watchdog alive. A wake check uses ≤1s slices and returns on delivery.
+        Without either callback this remains one sleep call for compatibility."""
+        interval = max(
+            self.poll_seconds,
+            int(self._retry_after_seconds or 0),
+        )
+        self._retry_after_seconds = None
+        if self.wake_check is None and scheduler_progress is None:
+            sleep(interval)
             return
-        remaining = self.poll_seconds
+        wake_check = self.wake_check
+        remaining = interval
         while remaining > 0:
-            step = 1 if remaining > 1 else remaining
+            step_limit = 1 if wake_check is not None else 30
+            step = min(step_limit, remaining)
             sleep(step)
             remaining -= step
+            if scheduler_progress is not None:
+                scheduler_progress()
+            if wake_check is None:
+                continue
             try:
-                woken = self.wake_check()
+                woken = wake_check()
             except Exception as exc:  # noqa: BLE001 - a broken wake ≠ a dead daemon
                 self.log(f"{self.name}: wake check failed (polling on): {exc}")
-                # Serve out the REST of the interval unsliced: returning here
-                # would tick after ~1s, and a persistently-broken check would
-                # turn the slow reconciler into a 1s hot loop against the API.
-                if remaining > 0:
-                    sleep(remaining)
-                return
+                # Disable probing for this interval, but keep the remainder
+                # sliced so the service watchdog still sees scheduler liveness.
+                wake_check = None
+                continue
             if woken:
                 return

@@ -1,5 +1,4 @@
-"""FIX_MCP_CONFIG → MCP servers for the CI-fix leg (Python port of
-agent/lib.sh:ci_mcp_for_pr).
+"""FIX_MCP_CONFIG → MCP servers for the CI-fix leg.
 
 FIX_MCP_CONFIG is a JSON map keyed by a check-name extended-regex:
 
@@ -21,7 +20,11 @@ import os
 import re
 from collections.abc import Callable
 
-from ..domain.agent_task import McpServer
+from ..adapters.runtime_plan import McpServer
+
+
+def _ignore_log(_message: str) -> None:
+    pass
 
 
 def _default_load(path: str) -> dict:
@@ -34,7 +37,7 @@ def mcp_servers_from_file(
     tools: str,
     harness_root: str = "",
     load: Callable[[str], dict] = _default_load,
-    log: Callable[[str], None] = lambda _m: None,
+    log: Callable[[str], None] = _ignore_log,
 ) -> tuple[McpServer, ...]:
     """Load an MCP config file (`{"mcpServers": {<name>: <spec>}}`) and build an
     `McpServer(name, spec, tools)` per server, all sharing the `tools` allow-glob.
@@ -61,7 +64,7 @@ def mcp_servers_for_checks(
     check_names: list[str],
     harness_root: str = "",
     load: Callable[[str], dict] = _default_load,
-    log: Callable[[str], None] = lambda _m: None,
+    log: Callable[[str], None] = _ignore_log,
 ) -> tuple[McpServer, ...]:
     """Attach the MCP servers whose check-name regex matches a check on the PR.
 

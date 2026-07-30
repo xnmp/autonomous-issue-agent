@@ -7,7 +7,7 @@ a guaranteed merge conflict (the #59-vs-#60 collision).
 
 import pytest
 
-from builders import issue, pr, world
+from tests.domain.builders import issue, pr, world
 
 from issue_agent.domain.world import (
     Comment,

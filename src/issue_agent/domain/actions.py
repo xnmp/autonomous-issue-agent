@@ -2,7 +2,7 @@
 
 Decision functions (`decide_fix`, `decide_review`, `decide_steward`) are pure:
 they take a `WorldState` (plus config) and return an ordered list of `Action`s.
-The orchestration layer (Phase 3+) interprets each Action against adapters
+The orchestration layer interprets each Action against adapters
 (GitHub, AgentRunner, worktree). Keeping the decision as data — not direct
 side-effects — is what makes the whole pipeline unit-testable: a test asserts
 on the returned Actions, never on a mock call log.

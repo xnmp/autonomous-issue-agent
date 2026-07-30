@@ -5,10 +5,10 @@
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>dev.issue-agent.fix-watcher</string>
+  <key>Label</key><string>@LABEL@</string>
   <key>ProgramArguments</key>
   <array>
-	    <string>uv</string>
+	    <string>@UV_BIN@</string>
 	    <string>run</string>
 	    <string>--extra</string>
 	    <string>sdk</string>
@@ -18,7 +18,7 @@
 	    <string>tree-sitter-bash</string>
 	    <string>python</string>
 	    <string>-m</string>
-	    <string>issue_agent.app.main</string>
+	    <string>issue_agent.app.launchd_main</string>
 	    <string>fix</string>
   </array>
   <key>EnvironmentVariables</key>
@@ -29,9 +29,10 @@
 	  </dict>
 	  <key>WorkingDirectory</key><string>@HARNESS_ROOT@</string>
   <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key>
+  <dict><key>SuccessfulExit</key><false/></dict>
   <key>ThrottleInterval</key><integer>30</integer>
-  <key>StandardOutPath</key><string>/tmp/issue-agent-fix-watcher.out.log</string>
-  <key>StandardErrorPath</key><string>/tmp/issue-agent-fix-watcher.err.log</string>
+  <key>StandardOutPath</key><string>@LOG_DIR@/fix-watcher.out.log</string>
+  <key>StandardErrorPath</key><string>@LOG_DIR@/fix-watcher.err.log</string>
 </dict>
 </plist>

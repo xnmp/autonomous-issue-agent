@@ -16,11 +16,7 @@ from __future__ import annotations
 import plistlib
 from pathlib import Path
 
-from tree_sitter import Language, Parser
-import tree_sitter_bash as tsb
-
 ROOT = Path(__file__).resolve().parents[2]
-_BASH_PARSER = Parser(Language(tsb.language()))
 
 
 def _read(path: str) -> str:
@@ -51,15 +47,14 @@ def _parse_makefile_targets(text: str) -> dict[str, list[str]]:
     return targets
 
 
-def test_makefile_defaults_to_python_watchers_and_keeps_compat_shell_targets():
+def test_makefile_exposes_only_python_watchers():
     targets = _parse_makefile_targets(_read("Makefile"))
 
     for role in ("fix", "review", "steward"):
-        assert f"run-{role}" in targets and f"run-{role}-sh" in targets
+        assert f"run-{role}" in targets
+        assert f"run-{role}-sh" not in targets
         recipe = " ".join(targets[f"run-{role}"])
         assert f"python -m issue_agent.app.main {role}" in recipe
-        sh_recipe = " ".join(targets[f"run-{role}-sh"]).strip()
-        assert sh_recipe == f"@bash bin/run-role.sh {role}"
 
     # No target's recipe anywhere still shells out to a retired bash watcher.
     for recipe in targets.values():
@@ -69,35 +64,12 @@ def test_makefile_defaults_to_python_watchers_and_keeps_compat_shell_targets():
         assert "steward/steward.sh" not in joined
 
 
-# ── bin/run-role.sh: parse the actual `exec` argv, not the script text ───────
-def _walk(node):
-    yield node
-    for child in node.children:
-        yield from _walk(child)
-
-
-def _exec_argv(script_text: str) -> list[str]:
-    """The argv of the script's `exec` command, as real AST tokens (tree-sitter-
-    bash — the same parser the governor uses), so a match can't come from a
-    `#` comment mentioning the old watcher paths."""
-    tree = _BASH_PARSER.parse(script_text.encode())
-    for node in _walk(tree.root_node):
-        if node.type != "command" or not node.children:
-            continue
-        name = node.children[0]
-        if name.type == "command_name" and name.text.decode() == "exec":
-            return [c.text.decode("utf-8", "replace") for c in node.children[1:]]
-    raise AssertionError("no `exec` command found in script")
-
-
-def test_shell_compat_wrapper_delegates_to_python_runtime():
-    text = _read("bin/run-role.sh")
-    argv = _exec_argv(text)
-
-    assert argv[-4:-1] == ["python", "-m", "issue_agent.app.main"]
-    assert "agent/watcher.sh" not in text
-    assert "review/review-watcher.sh" not in text
-    assert "steward/steward.sh" not in text
+def test_retired_shell_watchers_are_absent():
+    assert not (ROOT / "bin/run-role.sh").exists()
+    for directory in ("agent", "review", "steward"):
+        assert not any(
+            path.is_file() for path in (ROOT / directory).rglob("*")
+        )
 
 
 # ── systemd units: parse [Section]/key=value, don't grep the raw text ────────
@@ -133,9 +105,15 @@ def test_systemd_units_run_python_from_harness_root_with_target_dir_env():
     for path, role in units.items():
         service = _parse_unit(_read(path))["Service"]
         exec_start = service["ExecStart"][0]
+        assert exec_start.split()[0] == "@UV_BIN@"
         assert exec_start.split()[-3:] == ["-m", "issue_agent.app.main", role]
         assert service["WorkingDirectory"] == ["@HARNESS_ROOT@"]
         assert "TARGET_DIR=@TARGET_DIR@" in service["Environment"]
+        assert service["Restart"] == ["on-failure"]
+        assert service["RestartPreventExitStatus"] == ["0 2 3 4 5 6"]
+        unit = _parse_unit(_read(path))["Unit"]
+        assert unit["StartLimitIntervalSec"] == ["300"]
+        assert unit["StartLimitBurst"] == ["3"]
         assert not any("watcher.sh" in v for v in exec_start.split())
 
 
@@ -150,7 +128,14 @@ def test_launchd_plists_run_python_from_harness_root_with_target_dir_env():
     for path, role in plists.items():
         data = plistlib.loads(_read(path).encode())
         argv = data["ProgramArguments"]
-        assert argv[-4:] == ["python", "-m", "issue_agent.app.main", role]
+        assert argv[0] == "@UV_BIN@"
+        assert argv[-4:] == [
+            "python",
+            "-m",
+            "issue_agent.app.launchd_main",
+            role,
+        ]
         assert data["WorkingDirectory"] == "@HARNESS_ROOT@"
         assert data["EnvironmentVariables"]["TARGET_DIR"] == "@TARGET_DIR@"
+        assert data["KeepAlive"] == {"SuccessfulExit": False}
         assert not any("watcher.sh" in arg for arg in argv)

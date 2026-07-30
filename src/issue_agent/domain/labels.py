@@ -5,8 +5,7 @@ no shared database; an issue's position in the pipeline IS its label set. This
 module names those labels and the legal transitions, so the rest of the domain
 can reason about state moves without hard-coding string literals everywhere.
 
-Source of truth in the bash: agent/watcher.sh (relabel calls), cleanup.sh,
-steward.sh, bin/bootstrap.sh (the label set installed on a target repo).
+Source of truth for lifecycle labels shared by decisions and setup tooling.
 """
 
 from __future__ import annotations

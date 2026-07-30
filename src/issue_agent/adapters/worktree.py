@@ -14,6 +14,7 @@ _pr_common.sh:prc_check_red_fails (revert impl to base, run tests, restore HEAD)
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -24,6 +25,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from ..domain.contracts import TestExecution, TestExecutionStatus
 from ..domain.gate import OpenPrLookup, resolve_test_cmd
 from .governor import GateContext, run_target_command
 from .store import HarnessMarkers
@@ -422,6 +424,8 @@ def build_gate_context(
     gh: GhRunner = _subprocess_gh,
     run_tests: Callable[[str], bool] | None = None,
     retry_sleep: Callable[[], None] = _sleep_between_probes,
+    screenshots_read_path: str = "",
+    durable_publish: bool = False,
 ) -> GateContext:
     """Gather the worktree facts the governor's gate rules need. Pure-ish: all
     git/gh access goes through the injected `git`/`gh` runners, so a fake
@@ -444,6 +448,19 @@ def build_gate_context(
         changed = tuple(f for f in diff.out.splitlines() if f)
 
     markers = HarnessMarkers(cwd)
+    screenshots_read: tuple[str, ...] = ()
+    screenshots_receipt_available = False
+    if screenshots_read_path:
+        try:
+            with open(screenshots_read_path, encoding="utf-8") as receipt:
+                screenshots_read = tuple(
+                    line.strip()
+                    for line in receipt.read(64 * 1024).splitlines()
+                    if line.strip()
+                )
+            screenshots_receipt_available = True
+        except OSError:
+            screenshots_read = ()
 
     def open_pr(target_branch: str) -> OpenPrLookup:
         """Resolved ONLY when the governor actually gates a push (see
@@ -478,7 +495,7 @@ def build_gate_context(
 
     rt = run_tests or _default_run_tests
 
-    def revert_and_run(impl_files: tuple[str, ...]) -> bool | None:
+    def revert_and_run(impl_files: tuple[str, ...]) -> TestExecution:
         """§10: drop new impl / revert modified impl to base, run the test cmd,
         restore HEAD. Returns whether the suite PASSED with impl reverted (True
         ⇒ tautological); None if the run was REFUSED (gate re-entry, #63) —
@@ -486,29 +503,94 @@ def build_gate_context(
         red') on any git error, matching prc_check_red_fails. A timed-out run
         (see `_default_run_tests`) also surfaces as this same False/'did not
         pass' signal — the existing fail-open contract for §10."""
-        if not baseref:
-            return False
         # Same precedence as every other gate rule — operator TEST_CMD first
         # (P1R-18). This site used to inline its own `markers.test_cmd() or
         # env_test_cmd` order, so §10 would have kept running the agent-written
         # command even after the domain's `resolve_test_cmd` stopped preferring
         # it. One resolver, one order.
         test_cmd = resolve_test_cmd(markers.test_cmd(), env_test_cmd)
-        if not test_cmd:
-            return False
+
+        def receipt(
+            status: TestExecutionStatus,
+            *,
+            code: int | None = None,
+            output: str = "",
+            started: float | None = None,
+        ) -> TestExecution:
+            revision = git(["rev-parse", "HEAD"], cwd).out.strip() or "unknown"
+            duration_ms = (
+                max(0, round((time.monotonic() - started) * 1000))
+                if started is not None
+                else 0
+            )
+            digest = hashlib.sha256(output.encode()).hexdigest()
+            return TestExecution(
+                status=status,
+                command=("/bin/bash", "-c", test_cmd or "<unresolved>"),
+                exit_code=code,
+                duration_ms=duration_ms,
+                stdout_digest=digest,
+                stderr_digest=digest,
+                executor_identity="issue-agent:trusted-verifier",
+                repository_revision=revision,
+            )
+
+        if not baseref or not test_cmd:
+            return receipt(TestExecutionStatus.INFRA_ERROR, code=127)
+        started = time.monotonic()
         try:
             for f in impl_files:
                 if exists_at_base(f):
-                    git(["checkout", "-q", baseref, "--", f], cwd)
+                    if git(["checkout", "-q", baseref, "--", f], cwd).code != 0:
+                        return receipt(
+                            TestExecutionStatus.INFRA_ERROR,
+                            code=127,
+                            started=started,
+                        )
                 else:
                     try:
                         os.remove(os.path.join(cwd, f))
                     except OSError:
                         pass
-            passed = rt(test_cmd)
+            if run_tests is not None:
+                passed = rt(test_cmd)
+                status = (
+                    TestExecutionStatus.INFRA_ERROR
+                    if passed is None
+                    else TestExecutionStatus.PASSED
+                    if passed
+                    else TestExecutionStatus.TEST_FAILED
+                )
+                code = 127 if passed is None else 0 if passed else 1
+                return receipt(status, code=code, started=started)
+            rc, output = run_target_command(
+                test_cmd, cwd, _test_timeout_s(), capture=True
+            )
+            if rc is None:
+                return receipt(
+                    TestExecutionStatus.INFRA_ERROR,
+                    code=127,
+                    output=output,
+                    started=started,
+                )
+            if rc == 124:
+                return receipt(
+                    TestExecutionStatus.TIMED_OUT,
+                    output=output,
+                    started=started,
+                )
+            return receipt(
+                (
+                    TestExecutionStatus.PASSED
+                    if rc == 0
+                    else TestExecutionStatus.TEST_FAILED
+                ),
+                code=rc,
+                output=output,
+                started=started,
+            )
         finally:
             git(["checkout", "-q", "HEAD", "--", *impl_files], cwd)
-        return passed
 
     return GateContext(
         base_branch=base_branch,
@@ -519,11 +601,9 @@ def build_gate_context(
         open_pr=open_pr,
         open_pr_retry_sleep=retry_sleep,
         allow_untested=allow_untested,
-        ac_posted=markers.ac_posted(),
-        test_plan_posted=markers.test_plan_posted(),
-        adversarial_verdict=markers.adversarial_verdict(),
         visual_ac=markers.visual_ac(),
-        screenshots_read=markers.screenshots_read(),
+        screenshots_read=screenshots_read,
+        screenshots_receipt_available=screenshots_receipt_available,
         harness_test_cmd=markers.test_cmd(),
         env_test_cmd=env_test_cmd,
         exists_at_base=exists_at_base,
@@ -531,4 +611,5 @@ def build_gate_context(
         revert_and_run=revert_and_run,
         red_must_fail=red_must_fail,
         verify_red_at_commit=verify_red_at_commit,
+        durable_publish=durable_publish,
     )

@@ -12,10 +12,9 @@ GitHub repo, any OpenAI-compatible or Anthropic model gateway, via environment c
 > **▶ The design below has been implemented, and then superseded.** The harness
 > was ported from bash orchestration to a Python + Claude Agent SDK core; the
 > runnable path is now `src/issue_agent/` (hexagonal: `domain/` pure, `adapters/`
-> I/O, `app/` wiring) plus `plugin/` (enforcement). The bash watchers under
-> `agent/` `review/` `steward/` still exist and still run under
-> `FIXER_RUNTIME=codex`, which is what the nine `0N-*.md` specs — now in
-> [docs/archive/](docs/archive/) — still describe accurately.
+> I/O, `app/` wiring) plus `plugin/` (enforcement). The bash watchers have been
+> deleted; the nine `0N-*.md` specs in [docs/archive/](docs/archive/) are
+> historical only. Codex uses the Python daemon plus the shared gate scripts.
 >
 > **For the current system, start with
 > [docs/reference/architecture.md](docs/reference/architecture.md)**, then

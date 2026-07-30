@@ -1,16 +1,18 @@
 """Gate-rule behaviour (Phase 1) — pure ports of check-*.sh + _pr_common.sh."""
 
+from issue_agent.domain.contracts import (
+    TestExecution as ExecutionReceipt,
+    TestExecutionStatus as ExecutionStatus,
+)
 from issue_agent.domain.gate import (
     OpenPrLookup,
     PushGateMode,
     RedFailInputs,
-    check_adversarial_verdict,
     check_branch_name,
     check_commit_log,
     check_commit_message,
     commit_phase,
     check_commit_order,
-    check_markers,
     check_no_evidence,
     check_no_web,
     check_visual_evidence,
@@ -34,6 +36,26 @@ from issue_agent.domain.gate import (
     resolve_test_cmd,
     unverified_push_denial,
 )
+
+
+def execution(status: ExecutionStatus) -> ExecutionReceipt:
+    code = (
+        0
+        if status is ExecutionStatus.PASSED
+        else 1
+        if status in {ExecutionStatus.TEST_FAILED, ExecutionStatus.INFRA_ERROR}
+        else None
+    )
+    return ExecutionReceipt(
+        status,
+        ("pytest",),
+        code,
+        1,
+        "stdout",
+        "stderr",
+        "verifier",
+        "deadbeef",
+    )
 
 
 # ── branch name ─────────────────────────────────────────────────────────────
@@ -299,19 +321,6 @@ def test_existing_test_must_not_change():
     assert check_tests_immutable(["tests/test_new.py"], lambda f: f in existed).ok
 
 
-# ── markers + adversarial ─────────────────────────────────────────────────────
-def test_markers_required():
-    assert not check_markers(False, True).ok
-    assert not check_markers(True, False).ok
-    assert check_markers(True, True).ok
-
-
-def test_adversarial_verdict_must_pass():
-    assert check_adversarial_verdict("PASS looks good").ok
-    assert not check_adversarial_verdict("FAIL tautological").ok
-    assert not check_adversarial_verdict("").ok
-
-
 # ── test command resolution + §1 ──────────────────────────────────────────────
 # P1R-18: `check_tests` is the push gate's only real teeth and the GATED AGENT
 # writes `.harness/test-cmd` (under bypassPermissions, with a governor that only
@@ -380,14 +389,18 @@ def test_red_fail_blocks_tautological_test():
     # impl reverted but suite STILL passes → the test doesn't exercise the change.
     inp = RedFailInputs(test_cmd="pytest", new_test_files=("tests/test_x.py",),
                         impl_files=("src/x.py",))
-    res = check_red_fails(inp, revert_and_run=lambda impl: True)
+    res = check_red_fails(
+        inp, revert_and_run=lambda impl: execution(ExecutionStatus.PASSED)
+    )
     assert not res.ok and "tautological" in res.reason
 
 
 def test_red_fail_allows_genuine_red():
     inp = RedFailInputs(test_cmd="pytest", new_test_files=("tests/test_x.py",),
                         impl_files=("src/x.py",))
-    assert check_red_fails(inp, revert_and_run=lambda impl: False).ok
+    assert check_red_fails(
+        inp, revert_and_run=lambda impl: execution(ExecutionStatus.TEST_FAILED)
+    ).ok
 
 
 def test_red_fail_skips_without_new_tests():
@@ -400,13 +413,16 @@ def test_red_fail_skips_without_new_tests():
 
 def test_red_fail_skips_pure_test_diff():
     inp = RedFailInputs(test_cmd="pytest", new_test_files=("tests/test_x.py",), impl_files=())
-    assert check_red_fails(inp, revert_and_run=lambda impl: True).ok
+    assert check_red_fails(
+        inp, revert_and_run=lambda impl: execution(ExecutionStatus.PASSED)
+    ).ok
 
 
 def test_red_fail_skips_when_explicitly_disabled():
     base = dict(new_test_files=("tests/test_x.py",), impl_files=("src/x.py",))
     assert check_red_fails(
-        RedFailInputs(test_cmd="pytest", red_must_fail=False, **base), lambda i: True
+        RedFailInputs(test_cmd="pytest", red_must_fail=False, **base),
+        lambda i: execution(ExecutionStatus.PASSED),
     ).ok
 
 
@@ -425,7 +441,8 @@ def test_red_fail_denies_when_no_test_command():
 def test_red_fail_no_command_allowed_with_explicit_opt_out():
     base = dict(new_test_files=("tests/test_x.py",), impl_files=("src/x.py",))
     assert check_red_fails(
-        RedFailInputs(test_cmd="", allow_untested=True, **base), lambda i: True
+        RedFailInputs(test_cmd="", allow_untested=True, **base),
+        lambda i: execution(ExecutionStatus.PASSED),
     ).ok
 
 
@@ -434,13 +451,33 @@ def test_red_fail_opt_out_does_not_excuse_a_tautological_test():
     # simulation still runs and still blocks a test that passes without the impl.
     inp = RedFailInputs(test_cmd="pytest", new_test_files=("tests/test_x.py",),
                         impl_files=("src/x.py",), allow_untested=True)
-    assert not check_red_fails(inp, revert_and_run=lambda impl: True).ok
+    assert not check_red_fails(
+        inp, revert_and_run=lambda impl: execution(ExecutionStatus.PASSED)
+    ).ok
 
 
-def test_red_fail_fails_open_on_unresolvable_base():
+def test_red_fail_denies_on_unresolvable_base():
     inp = RedFailInputs(test_cmd="pytest", new_test_files=("tests/test_x.py",),
                         impl_files=("src/x.py",), base_resolvable=False)
-    assert check_red_fails(inp, revert_and_run=lambda impl: True).ok
+    assert not check_red_fails(
+        inp, revert_and_run=lambda impl: execution(ExecutionStatus.PASSED)
+    ).ok
+
+
+def test_red_fail_rejects_timeout_and_infrastructure_failure_as_evidence():
+    inp = RedFailInputs(
+        test_cmd="pytest",
+        new_test_files=("tests/test_x.py",),
+        impl_files=("src/x.py",),
+    )
+    timeout = check_red_fails(
+        inp, lambda _impl: execution(ExecutionStatus.TIMED_OUT)
+    )
+    infra = check_red_fails(
+        inp, lambda _impl: execution(ExecutionStatus.INFRA_ERROR)
+    )
+    assert not timeout.ok and "timed out" in timeout.reason
+    assert not infra.ok and "infrastructure" in infra.reason
 
 
 # ── verify-red-at-commit (fail-fast on the red commit) ────────────────────────

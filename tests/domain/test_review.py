@@ -2,7 +2,7 @@
 
 from dataclasses import replace
 
-from builders import pr, world
+from tests.domain.builders import pr, world
 
 from issue_agent.domain.actions import AgentKind, PostComment, Relabel, RunAgent, Target
 from issue_agent.domain.labels import Label
@@ -24,7 +24,7 @@ from issue_agent.domain.review import (
     unproductive_ceiling_hit,
     unproductive_escalation_reason,
 )
-from builders import Review
+from tests.domain.builders import Review
 
 CFG = ReviewConfig(review_bot="review-bot")
 
@@ -56,29 +56,24 @@ def test_comment_review_is_not_a_verdict_on_head():
     )
 
 
-# ── ReviewMode resolution (REVIEW_MODE + legacy REVIEW_MULTI_AGENT alias) ──
+# ── ReviewMode resolution ──
 def test_review_mode_default_is_single():
-    assert ReviewMode.from_env("", False) is ReviewMode.SINGLE
+    assert ReviewMode.from_env("") is ReviewMode.SINGLE
 
 
 def test_review_mode_explicit_wins():
-    assert ReviewMode.from_env("delegated", False) is ReviewMode.DELEGATED
-    assert ReviewMode.from_env("multi", False) is ReviewMode.MULTI
-    assert ReviewMode.from_env("single", True) is ReviewMode.SINGLE  # explicit beats alias
-
-
-def test_review_mode_multi_agent_alias():
-    # legacy REVIEW_MULTI_AGENT=1 with no REVIEW_MODE → MULTI
-    assert ReviewMode.from_env("", True) is ReviewMode.MULTI
+    assert ReviewMode.from_env("delegated") is ReviewMode.DELEGATED
+    assert ReviewMode.from_env("multi") is ReviewMode.MULTI
+    assert ReviewMode.from_env("single") is ReviewMode.SINGLE
 
 
 def test_review_mode_unknown_falls_back_to_single():
     # fail-safe: a typo'd mode never silently disables review
-    assert ReviewMode.from_env("delegted", False) is ReviewMode.SINGLE
+    assert ReviewMode.from_env("delegted") is ReviewMode.SINGLE
 
 
 def test_review_mode_case_insensitive():
-    assert ReviewMode.from_env("DELEGATED", False) is ReviewMode.DELEGATED
+    assert ReviewMode.from_env("DELEGATED") is ReviewMode.DELEGATED
 
 
 def test_initial_review_for_unsessioned_pr():

@@ -86,8 +86,8 @@ class IdentityMode(str, Enum):
 
 class ReviewMode(str, Enum):
     """How the reviewer examines a PR. Three genuine strategies (was a single
-    REVIEW_MULTI_AGENT bool; a bool can't encode three states without an illegal
-    combination, so it is an enum):
+    boolean; a bool cannot encode three states without an illegal combination,
+    so it is an enum):
 
       SINGLE    — one session-resumed agent reads the diff + files itself.
       MULTI     — the /code-review fan-out (skip-gate → parallel dimension
@@ -104,18 +104,15 @@ class ReviewMode(str, Enum):
     DELEGATED = "delegated"
 
     @classmethod
-    def from_env(cls, mode: str, multi_agent_alias: bool) -> "ReviewMode":
-        """Resolve REVIEW_MODE, honouring the legacy REVIEW_MULTI_AGENT=1 alias.
-        Explicit REVIEW_MODE wins; else the alias maps to MULTI; else SINGLE.
-        Unknown REVIEW_MODE values fall back to SINGLE (fail-safe: the cheapest,
-        most-proven path, never a silent no-review)."""
+    def from_env(cls, mode: str) -> "ReviewMode":
+        """Resolve REVIEW_MODE; malformed values fail safe to SINGLE."""
         raw = (mode or "").strip().lower()
         if raw:
             try:
                 return cls(raw)
             except ValueError:
                 return cls.SINGLE
-        return cls.MULTI if multi_agent_alias else cls.SINGLE
+        return cls.SINGLE
 
 
 @dataclass(frozen=True)
@@ -454,7 +451,7 @@ def review_submission(
     return ReviewSubmission(event="REQUEST_CHANGES", body=body)
 
 
-# ── multi-agent review synthesis (REVIEW_MULTI_AGENT) ─────────────────────────
+# ── multi-agent review synthesis (REVIEW_MODE=multi) ──────────────────────────
 # The dispatcher runs the LLM legs (skip-gate → parallel dimension specialists →
 # per-finding adversarial validators); the DECISION — which findings survived and
 # what verdict they add up to — is pure and lives here, so it is unit-tested with

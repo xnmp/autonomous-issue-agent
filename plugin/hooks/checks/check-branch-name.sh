@@ -5,7 +5,7 @@
 #
 # Enforces: branch names must be feat|fix|chore|refactor/<issue>-… so the PR gate
 # and orchestration can derive the issue number and required-test class.
-# (Keep this prefix set in sync with agent/lib.sh pr_for_issue/issue_from_branch.)
+# Keep this prefix set in sync with domain.refs.
 set -uo pipefail
 
 name=""

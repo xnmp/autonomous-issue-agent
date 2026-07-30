@@ -7,19 +7,21 @@ adapter method each Action triggers, using a fake gateway.
 
 Leaf side-effects (Relabel/PostComment/CloseIssue/EnableAutoMerge/RemoveWorktree)
 are handled fully here. `RunAgent` is delegated to an injected `run_agent`
-callable — building the per-kind AgentTask (resolve/resume/fix-ci/review/…) is
-Phase 4 work; the executor just routes to it.
+callable — building the per-kind RuntimePlan (resolve/resume/fix-ci/review/…)
+belongs to application planning; the executor just routes to it.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
+import json
 import threading
 import time
 
 from ..adapters.github import GhUnavailable
-from ..adapters.journal import alert, event_line, parse_ts, read_events_tail
+from ..adapters.effects import ImmediateGitHubEffectExecutor
+from ..adapters.journal import alert, parse_ts, read_events_tail
 from ..adapters.store import decode_lifecycle_action, encode_lifecycle_action
 from ..domain.actions import (
     Action,
@@ -43,6 +45,17 @@ from ..domain.labels import ADVISORY_LABELS, Label
 _KIND = {Target.ISSUE: "issue", Target.PR: "pr"}
 _DURABLE_ACTIONS = (Relabel, PostComment, CloseIssue, EscalateCiPending)
 _DEFAULT_RETRY_DELAYS = (1.0, 3.0, 9.0)
+
+
+def _ignore_log(_message: str) -> None:
+    pass
+
+
+def _missing_handler(name: str):
+    def missing(*_args) -> None:
+        raise RuntimeError(f"required executor handler is not configured: {name}")
+
+    return missing
 
 
 def _is_advisory_relabel(action: Relabel) -> bool:
@@ -79,16 +92,21 @@ class Executor:
         pending_actions=None,
         retry_delays: tuple[float, ...] = _DEFAULT_RETRY_DELAYS,
         sleep: Callable[[float], None] = time.sleep,
+        effect_executor=None,
     ):
         self.gateway = gateway
-        self._remove_worktree = remove_worktree or (lambda issue: None)
-        self._run_agent = run_agent or (lambda action: None)
+        self._remove_worktree = remove_worktree or _missing_handler(
+            "remove_worktree"
+        )
+        self._run_agent = run_agent
         # Persist the "already armed" marker the decide side reads
         # (FixState.automerge_enabled). Without this write the marker file was
         # never created (T3 probe finding: store.mark_automerge had zero
         # production call sites), so should_automerge re-armed every poll —
         # one wasted `gh pr merge --auto` per merge-ready PR per tick.
-        self._mark_automerge = mark_automerge or (lambda pr: None)
+        self._mark_automerge = mark_automerge or _missing_handler(
+            "mark_automerge"
+        )
         # Persists the "this head has spent its ONE free CI re-run" marker the
         # decide side reads (FixState.ci_rerun_head). Only the fix daemon wires
         # it (Store.set_ci_rerun_head); a default no-op would make the re-run
@@ -96,19 +114,20 @@ class Executor:
         # when it is absent — see there.
         self._mark_ci_rerun = mark_ci_rerun
         self._mark_ci_pending_escalated = (
-            mark_ci_pending_escalated or (lambda pr, head: None)
+            mark_ci_pending_escalated
+            or _missing_handler("mark_ci_pending_escalated")
         )
         # Retires STATE_DIR files on the ClearIssueState arm (review M4/D8:
         # Store.clear_issue/clear_pr_review had zero production call sites).
         # Default no-op keeps tests/other roles' Executors quiet — only the
         # fix daemon wires this (Store.cleanup_pr).
-        self._clear_issue_state = clear_issue_state or (
-            lambda pr, issue, merged: None
+        self._clear_issue_state = clear_issue_state or _missing_handler(
+            "clear_issue_state"
         )
         # Log EVERY applied action so state changes (label moves, comments, close,
         # auto-merge, worktree removal, agent dispatch) are visible instead of
         # inferred. One funnel = one audit trail. Default no-op keeps tests quiet.
-        self._log = log or (lambda _m: None)
+        self._log = log or _ignore_log
         # Structured twin of the log line above: the same audit trail, machine-
         # readable, so `issue-agent status` can answer "what changed overnight?"
         # from a file instead of a human eyeballing rotated stderr. None = off.
@@ -121,10 +140,31 @@ class Executor:
         self._pending_actions = pending_actions
         self._retry_delays = retry_delays
         self._sleep = sleep
+        self._effect_executor = (
+            effect_executor
+            if effect_executor is not None
+            else ImmediateGitHubEffectExecutor(gateway)
+        )
         # Paid dispatches run outside this lock. Every lifecycle side effect
         # they emit is serialized with the observation loop, preserving the
         # single-writer pending queue and deterministic GitHub transitions.
         self._action_lock = threading.RLock()
+
+    def bind_dispatch(self, run_agent: Callable[[RunAgent], None]) -> None:
+        """Bind the paid-dispatch handler exactly once.
+
+        Lifecycle-only executors may stay unbound. Executing ``RunAgent`` on an
+        unbound executor is a composition error, never a successful no-op.
+        """
+
+        if self._run_agent is not None:
+            raise RuntimeError("dispatch handler is already bound")
+        self._run_agent = run_agent
+
+    def submit_review(self, pr: int, event: str, body: str) -> bool:
+        if self._effect_executor is None:
+            raise RuntimeError("review effect executor is not configured")
+        return self._effect_executor.submit_review(pr, event, body)
 
     def _describe(self, action: Action) -> str:
         """Human-readable one-liner for the action being applied."""
@@ -166,7 +206,10 @@ class Executor:
         fields = {"target": _KIND[action.target], "number": action.number}
         if self._journal is not None:
             self._journal.emit("escalation", **fields)
-        alert(self._alert_cmd, event_line("escalation", **fields))
+        alert(
+            self._alert_cmd,
+            json.dumps({"event": "escalation", **fields}, sort_keys=True),
+        )
 
     def _human_wait_transition(self, action: Relabel) -> None:
         """Journal the durable edges of an issue's human-input wait."""
@@ -198,42 +241,7 @@ class Executor:
         queue removal. Older test gateways without these read methods simply
         fall back to the write attempt.
         """
-        if isinstance(action, Relabel):
-            has_label = getattr(self.gateway, "has_label", None)
-            if has_label is None:
-                return False
-            removed = (
-                action.remove is None
-                or not has_label(
-                    _KIND[action.target], action.number, action.remove.value
-                )
-            )
-            added = (
-                action.add is None
-                or has_label(_KIND[action.target], action.number, action.add.value)
-            )
-            return removed and added
-        if isinstance(action, PostComment):
-            has_comment = getattr(self.gateway, "has_comment", None)
-            return bool(
-                has_comment
-                and has_comment(_KIND[action.target], action.number, action.body)
-            )
-        if isinstance(action, CloseIssue):
-            issue_closed = getattr(self.gateway, "is_issue_closed", None)
-            return bool(issue_closed and issue_closed(action.number))
-        if isinstance(action, EscalateCiPending):
-            has_comment = getattr(self.gateway, "has_comment", None)
-            has_label = getattr(self.gateway, "has_label", None)
-            return bool(
-                has_comment
-                and has_label
-                and has_comment("pr", action.pr, action.body)
-                and has_label(
-                    "pr", action.pr, Label.NEEDS_HUMAN_REVIEW.value
-                )
-            )
-        return False
+        return self._effect_executor.reconcile(action) is True
 
     def _report_recovered_escalation(self, action: Action) -> None:
         """Preserve the operator signal when a lost acknowledgement is recovered."""
@@ -255,95 +263,83 @@ class Executor:
                 )
             )
 
-    def _apply_ci_escalation(
-        self, action: EscalateCiPending, *, resume: bool
-    ) -> None:
-        """Apply the comment+label composite without duplicating a partial write."""
-        has_comment = getattr(self.gateway, "has_comment", None)
-        has_label = getattr(self.gateway, "has_label", None)
-        comment_present = bool(
-            resume
-            and has_comment
-            and has_comment("pr", action.pr, action.body)
-        )
-        label_present = bool(
-            resume
-            and has_label
-            and has_label("pr", action.pr, Label.NEEDS_HUMAN_REVIEW.value)
-        )
-        if not comment_present:
-            self.gateway.comment("pr", action.pr, action.body)
-        if not label_present:
-            self.gateway.relabel(
-                "pr",
-                action.pr,
-                Label.AI_PR_OPEN.value,
-                Label.NEEDS_HUMAN_REVIEW.value,
-            )
-        if has_comment is not None and not has_comment("pr", action.pr, action.body):
-            raise LifecycleWriteUnverified(
-                f"CI stall escalation comment for PR #{action.pr} was not verified"
-            )
-        if has_label is not None and not has_label(
-            "pr", action.pr, Label.NEEDS_HUMAN_REVIEW.value
-        ):
-            raise LifecycleWriteUnverified(
-                f"CI stall escalation label for PR #{action.pr} was not verified"
-            )
-        self._mark_ci_pending_escalated(action.pr, action.head)
-        self._escalated(
-            Relabel(
-                Target.PR,
-                action.pr,
-                Label.AI_PR_OPEN,
-                Label.NEEDS_HUMAN_REVIEW,
-            )
-        )
-
     def _apply_once(self, action: Action) -> None:
-        if isinstance(action, Relabel):
-            self.gateway.relabel(
-                _KIND[action.target],
-                action.number,
-                action.remove.value if action.remove else None,
-                action.add.value if action.add else None,
-            )
-            # AFTER the write: an escalation that GitHub rejected did not happen,
-            # and a journal that claims it did is worse than one that is silent.
-            if action.add is Label.NEEDS_HUMAN_REVIEW:
-                self._escalated(action)
-            self._human_wait_transition(action)
-        elif isinstance(action, EscalateCiPending):
-            self._apply_ci_escalation(action, resume=False)
-        elif isinstance(action, PostComment):
-            self.gateway.comment(_KIND[action.target], action.number, action.body)
-        elif isinstance(action, CloseIssue):
-            self.gateway.close_issue(action.number, action.reason, action.comment)
-        elif isinstance(action, EnableAutoMerge):
-            # The marker is the domain's "don't re-arm" latch, so it must record
-            # what GITHUB did, not what we attempted: an unconditional write here
-            # wedged #537 (arm failed on an unprotected base branch, marker set,
-            # should_automerge suppressed forever on a PR that was APPROVED +
-            # green + CLEAN). Falsy/None returns (old gateways, test fakes) are
-            # treated as failure — better to re-arm next poll than to latch a lie.
-            if self.gateway.enable_auto_merge(action.pr, action.method):
-                self._mark_automerge(action.pr)
-            else:
-                self._log(
-                    f"auto-merge PR #{action.pr}: NOT armed (gh failed or GitHub "
-                    "refused); marker withheld so next poll retries"
+        if self._effect_executor.handles(action):
+            if isinstance(action, RerunFailedChecks):
+                if self._mark_ci_rerun is None:
+                    self._log(
+                        f"CI re-run PR #{action.pr}: skipped (no marker writer "
+                        "wired) — the paid CI-fix leg dispatches next poll"
+                    )
+                    return
+                self._mark_ci_rerun(action.pr, action.head)
+            outcome = self._effect_executor.execute(action)
+            if isinstance(action, Relabel):
+                if outcome is False:
+                    raise LifecycleWriteUnverified(
+                        f"relabel for {_KIND[action.target]} "
+                        f"#{action.number} was not verified"
+                    )
+                if action.add is Label.NEEDS_HUMAN_REVIEW:
+                    self._escalated(action)
+                self._human_wait_transition(action)
+            elif isinstance(action, EnableAutoMerge):
+                if outcome:
+                    self._mark_automerge(action.pr)
+                else:
+                    self._log(
+                        f"auto-merge PR #{action.pr}: NOT armed (gh failed or "
+                        "GitHub refused); marker withheld so next poll retries"
+                    )
+            elif isinstance(action, RerunFailedChecks):
+                if outcome is None:
+                    self._log(
+                        f"CI re-run PR #{action.pr}: no failed Actions run found "
+                        "(or gh refused) — the paid CI-fix leg dispatches next poll"
+                    )
+                if self._journal is not None:
+                    self._journal.emit(
+                        "ci_rerun", pr=action.pr, head=action.head,
+                        run_id=outcome or 0, ok=outcome is not None,
+                    )
+            elif isinstance(action, EscalateCiPending):
+                if outcome is False:
+                    raise LifecycleWriteUnverified(
+                        f"CI stall escalation for PR #{action.pr} was not verified"
+                    )
+                self._mark_ci_pending_escalated(action.pr, action.head)
+                self._escalated(
+                    Relabel(
+                        Target.PR,
+                        action.pr,
+                        Label.AI_PR_OPEN,
+                        Label.NEEDS_HUMAN_REVIEW,
+                    )
                 )
-        elif isinstance(action, UpdateBranch):
-            self.gateway.update_branch(action.pr)
-        elif isinstance(action, RerunFailedChecks):
-            self._rerun_failed_checks(action)
-        elif isinstance(action, AddDependency):
-            self.gateway.add_blocked_by(action.issue, action.blocker)
-        elif isinstance(action, RemoveWorktree):
+            return
+        if isinstance(
+            action,
+            (
+                Relabel,
+                PostComment,
+                CloseIssue,
+                EnableAutoMerge,
+                UpdateBranch,
+                RerunFailedChecks,
+                EscalateCiPending,
+                AddDependency,
+            ),
+        ):
+            raise RuntimeError(
+                f"privileged effect adapter does not handle {type(action).__name__}"
+            )
+        if isinstance(action, RemoveWorktree):
             self._remove_worktree(action.issue)
         elif isinstance(action, ClearIssueState):
             self._clear_issue_state(action.pr, action.issue, action.merged)
         elif isinstance(action, RunAgent):
+            if self._run_agent is None:
+                raise RuntimeError("RunAgent executed before dispatch was bound")
             self._run_agent(action)
         elif isinstance(action, NoOp):
             return
@@ -351,10 +347,7 @@ class Executor:
             raise TypeError(f"unhandled action: {action!r}")
 
     def _apply_retry_once(self, action: Action) -> None:
-        if isinstance(action, EscalateCiPending):
-            self._apply_ci_escalation(action, resume=True)
-        else:
-            self._apply_once(action)
+        self._apply_once(action)
 
     def _apply_with_retry(
         self, action: Action, desc: str, *, resume_first: bool = False
@@ -483,7 +476,12 @@ class Executor:
         Relabels are state transitions, so only the latest receipt per target
         is meaningful. Additive/idempotent actions retain journal order.
         """
-        path = getattr(self._journal, "path", "")
+        # Canonical deployments already reconciled durable commands through
+        # the control store before this callback. JSONL replay is historical
+        # compatibility for old files and isolated tests only.
+        if self._journal is not None and self._journal.canonical:
+            return
+        path = self._journal.path if self._journal is not None else ""
         if not path:
             return
         actions: list[Action] = []
@@ -588,52 +586,14 @@ class Executor:
                     self._journal.emit("action_quarantined", **fields)
                 alert(
                     self._alert_cmd,
-                    event_line("action_quarantined", **fields),
+                    json.dumps(
+                        {"event": "action_quarantined", **fields},
+                        sort_keys=True,
+                    ),
                 )
             except Exception:
                 return False
         return True
-
-    def _rerun_failed_checks(self, action: RerunFailedChecks) -> None:
-        """The free CI re-run (#38): spend the head's ONE allowance, then ask
-        GitHub to re-run the failed checks.
-
-        The marker is written FIRST, deliberately. The two orderings fail in
-        opposite directions, and only one of them is bounded:
-
-          * mark → rerun: if this process dies (or gh fails) in between, the
-            allowance is spent and the next poll dispatches the paid FIX_CI leg
-            — precisely what would have happened with no re-run at all.
-          * rerun → mark: a death in between leaves a spent re-run unrecorded,
-            so the next poll re-runs again, and again — an unbounded free-CI
-            loop with no breaker anywhere behind it (every retry counter in the
-            fixer counts AGENT attempts, and this dispatches no agent).
-
-        Without an injected marker writer there is no way to record the
-        allowance, so the re-run is SKIPPED rather than run unbounded — the
-        review/steward Executors, and any test that doesn't wire one, keep the
-        pre-#38 behaviour instead of gaining a loop."""
-        if self._mark_ci_rerun is None:
-            self._log(
-                f"CI re-run PR #{action.pr}: skipped (no marker writer wired) — "
-                "the paid CI-fix leg dispatches next poll"
-            )
-            return
-        self._mark_ci_rerun(action.pr, action.head)
-        run_id = self.gateway.rerun_failed_checks(action.pr)
-        if run_id is None:
-            # Nothing to re-run (external status contexts, no Actions run) or gh
-            # refused. Soft by design: the marker above already guarantees the
-            # next poll pays for the leg instead of retrying this.
-            self._log(
-                f"CI re-run PR #{action.pr}: no failed Actions run found (or gh "
-                "refused) — the paid CI-fix leg dispatches next poll"
-            )
-        if self._journal is not None:
-            self._journal.emit(
-                "ci_rerun", pr=action.pr, head=action.head, run_id=run_id or 0,
-                ok=run_id is not None,
-            )
 
     def execute_all(self, actions) -> bool:
         """Apply every action, even if one raises (review S7): before this, one

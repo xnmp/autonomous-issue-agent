@@ -480,22 +480,14 @@ def test_namespace_coverage_check_is_not_vacuously_true():
     assert used != cleared
 
 
-# ── .harness markers ──
-def test_harness_markers():
+# ── .harness claims ──
+def test_harness_test_command():
     with tempfile.TemporaryDirectory() as root:
         hd = os.path.join(root, ".harness")
         os.makedirs(hd)
         m = HarnessMarkers(root)
-        assert m.ac_posted() is False
-        open(os.path.join(hd, "ac-posted"), "w").close()
-        open(os.path.join(hd, "test-plan-posted"), "w").close()
-        with open(os.path.join(hd, "adversarial-verdict"), "w") as f:
-            f.write("PASS looks good\n")
         with open(os.path.join(hd, "test-cmd"), "w") as f:
             f.write("\n  \ncd backend && pytest -q\nextra\n")
-        assert m.ac_posted() is True
-        assert m.test_plan_posted() is True
-        assert m.adversarial_verdict() == "PASS looks good"
         assert m.test_cmd() == "cd backend && pytest -q"  # first non-blank line
 
 
@@ -504,18 +496,17 @@ def test_harness_test_cmd_none_when_absent():
         assert HarnessMarkers(root).test_cmd() is None
 
 
-def test_visual_ac_and_screenshots_read_markers():
+def test_visual_ac_is_a_claim_but_read_receipts_are_not_worktree_markers():
     with tempfile.TemporaryDirectory() as root:
         hd = os.path.join(root, ".harness")
         os.makedirs(hd)
         m = HarnessMarkers(root)
         assert m.visual_ac() is False
-        assert m.screenshots_read() == ()
         open(os.path.join(hd, "visual-ac"), "w").close()
         with open(os.path.join(hd, "screenshots-read"), "w") as f:
             f.write("tab-title.png\n\nchart.png\n")
         assert m.visual_ac() is True
-        assert m.screenshots_read() == ("tab-title.png", "chart.png")  # blanks dropped
+        assert not hasattr(m, "screenshots_read")
 
 
 # ── runtime-tagged sessions (the FIXER_RUNTIME flip, 2026-07-27) ──────────────

@@ -27,7 +27,8 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-import tempfile
+
+from ..adapters.env_file import source_env_file
 
 # HARNESS_ROOT: …/src/issue_agent/app/cli.py → repo root. Same walk main.py uses.
 # This is what makes the CLI checkout-resident: plugin/ + config/ are siblings.
@@ -102,23 +103,6 @@ _OVERLAY_FIELDS = (
     "TEST_CMD", "DAILY_SPEND_CAP_USD", "FIXER_RUNTIME", "REVIEWER_RUNTIME", "REVIEW_MODE",
 )
 
-# M12: a hand-edited overlay's KEY <spaces> = <spaces> VALUE is not valid bash
-# (sourcing it either no-ops the assignment or errors), but it is an obvious,
-# common typo. Collapse the spacing on assignment-SHAPED lines only — before
-# handing the file to real bash — so the typo is forgiven while quoting,
-# `${VAR}` expansion, and trailing `# comment`s still get real shell semantics
-# from the `source` below (not a second bespoke parser).
-_ASSIGNMENT_SPACING_RE = re.compile(r"^(\s*(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$")
-
-
-def _normalize_assignment_spacing(text: str) -> str:
-    out = []
-    for line in text.splitlines():
-        m = _ASSIGNMENT_SPACING_RE.match(line)
-        out.append(f"{m.group(1)}={m.group(2)}" if m else line)
-    return "\n".join(out) + "\n"
-
-
 def _source_env_file(path: str) -> dict[str, str]:
     """Shell-semantics read of every var a single overlay/env file sets (M12).
 
@@ -136,43 +120,20 @@ def _source_env_file(path: str) -> dict[str, str]:
     stray syntax error) — same "absent, not an error" contract the regex
     reader had.
     """
-    try:
-        with open(path) as f:
-            raw = f.read()
-    except OSError:
-        return {}
-    normalized = _normalize_assignment_spacing(raw)
     env = os.environ.copy()
     for key in _OVERLAY_FIELDS:
         env.pop(key, None)
-    tmp_path = ""
     try:
-        with tempfile.NamedTemporaryFile(
-            "w", suffix=".env", delete=False, encoding="utf-8"
-        ) as tmp:
-            tmp.write(normalized)
-            tmp_path = tmp.name
-        proc = subprocess.run(
-            ["bash", "-c", 'set -a; source "$1"; set +a; env -0', "issue-agent-overlay", tmp_path],
-            env=env, capture_output=True, timeout=10,
+        result = source_env_file(
+            path,
+            env,
+            assigned_only=True,
+            normalize_spacing=True,
+            timeout_seconds=10,
         )
-    except (OSError, subprocess.SubprocessError):
+    except ValueError:
         return {}
-    finally:
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-    if proc.returncode != 0:
-        return {}
-    result: dict[str, str] = {}
-    for item in proc.stdout.split(b"\0"):
-        if not item or b"=" not in item:
-            continue
-        key, _sep, val = item.partition(b"=")
-        result[key.decode(errors="replace")] = val.decode(errors="replace")
-    return result
+    return {key: value for key, value in result.items() if key in _OVERLAY_FIELDS}
 
 
 def read_repo_env_field(path: str, field: str) -> str:
@@ -851,7 +812,25 @@ def cmd_stop(args) -> int:
             os.kill(pid, 15)  # SIGTERM — daemons/flocks free cleanly
         except ProcessLookupError:
             pass
-    ok("sent SIGTERM")
+    deadline = time.monotonic() + 90
+    remaining = set(pids)
+    while remaining and time.monotonic() < deadline:
+        for pid in tuple(remaining):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                remaining.discard(pid)
+            except PermissionError:
+                pass
+        if remaining:
+            time.sleep(0.1)
+    if remaining:
+        err(
+            "watchers did not stop within 90s "
+            f"(still alive: {' '.join(map(str, sorted(remaining)))})"
+        )
+        return 1
+    ok("watchers stopped and verified")
     return 0
 
 

@@ -1,7 +1,7 @@
 """Steward triage behaviour — candidate selection, dedupe, no-feedback-loop,
 and the two-audience verdict→action mapping."""
 
-from builders import issue, world
+from tests.domain.builders import issue, world
 
 from issue_agent.domain.actions import AddDependency, PostComment, Relabel, Target
 from issue_agent.domain.labels import Label

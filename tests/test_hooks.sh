@@ -11,7 +11,7 @@ for gate_knob in \
   TEST_CMD LINT_CMD TYPECHECK_CMD EDIT_CHECK_CMD ALLOW_UNTESTED RED_MUST_FAIL \
   VERIFY_RED_AT_COMMIT BASE_BRANCH GATE_TEST_TIMEOUT_S GATE_GH_RETRY_SLEEP \
   GH_APP_ID GH_APP_KEY_FILE GH_APP_INSTALL_ID TARGET_DIR AGENT_ENV \
-  ${HARNESS_DEPLOY_KNOBS:-} HARNESS_DEPLOY_KNOBS; do
+  HARNESS_SCREENSHOTS_READ ${HARNESS_DEPLOY_KNOBS:-} HARNESS_DEPLOY_KNOBS; do
   unset "$gate_knob"
 done
 # NOTE: HARNESS_GATE_DEPTH is deliberately not in the list — it is the #63
@@ -214,8 +214,6 @@ setup_pr_repo() {
     echo "def token(): return 1" > token.py
     git add token.py
     git -c core.hooksPath=/dev/null commit -qm "green: implement token"
-    : > .harness/ac-posted; : > .harness/test-plan-posted
-    echo "PASS looks good" > .harness/adversarial-verdict
     # A GENUINE test command: passes only WITH the impl, so §1 is green and §7c
     # goes red on revert. The gate now fails CLOSED without one (ALLOW_UNTESTED=1
     # is the opt-out), so every case below would otherwise be blocked at §1 —
@@ -244,30 +242,11 @@ out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base de
 [ "$rc" -eq 1 ] && ok "missing Fixes #n blocked" || no "missing Fixes #n blocked" "rc=$rc"
 rm -rf "$d"
 
-# Missing test-plan marker → blocked.
-d=$(setup_pr_repo); rm -f "$d/.harness/test-plan-posted"
-out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-[ "$rc" -eq 1 ] && ok "missing test-plan marker blocked" || no "missing test-plan marker blocked" "rc=$rc"
-rm -rf "$d"
-
-# Missing AC marker → blocked (AC-posted-before-code enforcement).
-d=$(setup_pr_repo); rm -f "$d/.harness/ac-posted"
-out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-[ "$rc" -eq 1 ] && ok "missing AC marker blocked" || no "missing AC marker blocked" "rc=$rc"
-rm -rf "$d"
-
-# Failing adversarial verdict → blocked.
-d=$(setup_pr_repo); echo "FAIL nope" > "$d/.harness/adversarial-verdict"
-out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-[ "$rc" -eq 1 ] && ok "FAIL verdict blocked" || no "FAIL verdict blocked" "rc=$rc"
-rm -rf "$d"
-
 # fix/ branch with NO test file in the diff → blocked.
 d=$(fresh_repo)
 ( cd "$d" && mkdir -p .claude .harness && git switch -qc fix/9-notest \
     && echo x>x.py && git add x.py && git -c core.hooksPath=/dev/null commit -qm "red: placeholder" \
-    && echo y>y.py && git add y.py && git -c core.hooksPath=/dev/null commit -qm "green: impl" \
-    && : > .harness/ac-posted; : > .harness/test-plan-posted && echo PASS > .harness/adversarial-verdict )
+    && echo y>y.py && git add y.py && git -c core.hooksPath=/dev/null commit -qm "green: impl" )
 out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
 { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'regression test'; } \
   && ok "fix/ without regression test blocked" || no "fix/ without regression test blocked" "rc=$rc out=${out:0:160}"
@@ -297,8 +276,7 @@ rm -rf "$d"
 d=$(fresh_repo)
 ( cd "$d" && mkdir -p .claude .harness && git switch -qc fix/11-x \
     && echo "def test_x(): pass" > test_x_regression.py && git add test_x_regression.py \
-    && echo z>z.py && git add z.py && git -c core.hooksPath=/dev/null commit -qm "green: impl no red" \
-    && : > .harness/ac-posted; : > .harness/test-plan-posted && echo PASS > .harness/adversarial-verdict )
+    && echo z>z.py && git add z.py && git -c core.hooksPath=/dev/null commit -qm "green: impl no red" )
 out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
 { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'TDD ordering'; } \
   && ok "PR gate catches green-without-red" || no "PR gate catches green-without-red" "rc=$rc out=${out:0:160}"
@@ -338,8 +316,7 @@ d=$(fresh_repo)
     && git -c core.hooksPath=/dev/null commit -qm "red: a" \
     && echo impl>impl.py && git add impl.py \
     && printf 'wip arbitrary message no prefix\n' > /tmp/cm.txt \
-    && git -c core.hooksPath=/dev/null commit -qF /tmp/cm.txt \
-    && : > .harness/ac-posted; : > .harness/test-plan-posted && echo PASS > .harness/adversarial-verdict )
+    && git -c core.hooksPath=/dev/null commit -qF /tmp/cm.txt )
 out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
 { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'allowed prefix'; } \
   && ok "PR gate catches -F bad-prefix commit" || no "PR gate catches -F bad-prefix commit" "rc=$rc out=${out:0:160}"
@@ -357,8 +334,7 @@ d=$(fresh_repo)
   # now MODIFY the pre-existing test
   echo "def test_keep(): assert False  # weakened" > tests/test_keep.py
   echo impl>impl.py; git add tests/test_keep.py impl.py
-  git -c core.hooksPath=/dev/null commit -qm "green: impl + weaken existing test"
-  : > .harness/ac-posted; : > .harness/test-plan-posted; echo PASS > .harness/adversarial-verdict )
+  git -c core.hooksPath=/dev/null commit -qm "green: impl + weaken existing test" )
 out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
 { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'existing test file'; } \
   && ok "modifying existing test blocked" || no "modifying existing test blocked" "rc=$rc out=${out:0:160}"
@@ -370,8 +346,7 @@ d=$(fresh_repo)
     && echo "def test_modulo_integration(): assert True" > tests/test_modulo.py && git add tests/test_modulo.py \
     && git -c core.hooksPath=/dev/null commit -qm "red: modulo test" \
     && echo "def modulo(a,b): return a%b" > mod.py && git add mod.py \
-    && git -c core.hooksPath=/dev/null commit -qm "green: modulo" \
-    && : > .harness/ac-posted; : > .harness/test-plan-posted && echo PASS > .harness/adversarial-verdict )
+    && git -c core.hooksPath=/dev/null commit -qm "green: modulo" )
 out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='test -f mod.py' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body '## Acceptance Criteria
 - modulo
 
@@ -384,14 +359,14 @@ echo "== check-pr.sh §7d (one screenshot per AC item) =="
 # and commits <n> screenshots, all recorded as read by the agent.
 setup_visual_repo() {  # setup_visual_repo <n-screenshots> [<n-read>]
   local d n read_n i; d=$(setup_pr_repo); n="$1"; read_n="${2:-$1}"
+  : > "$d.trusted-screenshots-read"
   ( cd "$d"
     mkdir -p evidence
     : > .harness/visual-ac
-    : > .harness/screenshots-read
     i=1
     while [ "$i" -le "$n" ]; do
       printf '\x89PNG' > "evidence/ac-$i.png"
-      [ "$i" -le "$read_n" ] && echo "ac-$i.png" >> .harness/screenshots-read
+      [ "$i" -le "$read_n" ] && echo "ac-$i.png" >> "$d.trusted-screenshots-read"
       i=$((i + 1))
     done
     if [ "$n" -gt 0 ]; then
@@ -405,7 +380,7 @@ AC3_ONE_LINK=$'## Acceptance Criteria\n- [ ] one\n- [ ] two\n- [ ] three\n\n![on
 
 # 3 AC items but only 2 screenshots → blocked, message names both counts.
 d=$(setup_visual_repo 2)
-out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_LINKED" 2>&1 ); rc=$?
+out=$( cd "$d" && HARNESS_SCREENSHOTS_READ="$d.trusted-screenshots-read" BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_LINKED" 2>&1 ); rc=$?
 { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q '3 AC items but only 2'; } \
   && ok "3 AC items with 2 screenshots blocked (counts named)" \
   || no "per-AC screenshot count enforced" "rc=$rc out=${out:0:200}"
@@ -413,14 +388,14 @@ rm -rf "$d"
 
 # 3 AC items, 3 read+committed screenshots, each referenced → allowed.
 d=$(setup_visual_repo 3)
-out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_LINKED" 2>&1 ); rc=$?
+out=$( cd "$d" && HARNESS_SCREENSHOTS_READ="$d.trusted-screenshots-read" BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_LINKED" 2>&1 ); rc=$?
 [ "$rc" -eq 0 ] && ok "one screenshot per AC item passes" || no "one screenshot per AC item passes" "rc=$rc out=${out:0:200}"
 rm -rf "$d"
 
 # Enough screenshots, but the body links only one → blocked (unlinked shots are
 # invisible to the reviewer).
 d=$(setup_visual_repo 3)
-out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_ONE_LINK" 2>&1 ); rc=$?
+out=$( cd "$d" && HARNESS_SCREENSHOTS_READ="$d.trusted-screenshots-read" BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_ONE_LINK" 2>&1 ); rc=$?
 { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'references only 1'; } \
   && ok "unreferenced screenshots blocked" || no "body must reference each screenshot" "rc=$rc out=${out:0:200}"
 rm -rf "$d"
@@ -428,22 +403,32 @@ rm -rf "$d"
 # Unparseable (prose) AC section → falls back to the ≥1-screenshot floor: one
 # read+committed shot passes even though the body links nothing.
 d=$(setup_visual_repo 1)
-out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
+out=$( cd "$d" && HARNESS_SCREENSHOTS_READ="$d.trusted-screenshots-read" BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
 [ "$rc" -eq 0 ] && ok "prose AC section falls back to the 1-screenshot floor" || no "AC parse miss must not deny" "rc=$rc out=${out:0:200}"
 rm -rf "$d"
 
 # Floor still holds: visual-ac declared with no screenshot committed → blocked.
 d=$(setup_visual_repo 0)
-out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_LINKED" 2>&1 ); rc=$?
+out=$( cd "$d" && HARNESS_SCREENSHOTS_READ="$d.trusted-screenshots-read" BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_LINKED" 2>&1 ); rc=$?
 { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'no screenshot is committed'; } \
   && ok "visual-ac without any screenshot blocked" || no "visual-ac floor (>=1 shot)" "rc=$rc out=${out:0:200}"
 rm -rf "$d"
 
 # Floor still holds: a committed screenshot the agent never READ → blocked.
 d=$(setup_visual_repo 3 2)
-out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_LINKED" 2>&1 ); rc=$?
+out=$( cd "$d" && HARNESS_SCREENSHOTS_READ="$d.trusted-screenshots-read" BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_LINKED" 2>&1 ); rc=$?
 { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'never read/verified'; } \
   && ok "unread screenshot blocked" || no "visual-ac floor (all shots read)" "rc=$rc out=${out:0:200}"
+rm -rf "$d"
+
+# An agent-authored worktree marker cannot substitute for the harness receipt.
+d=$(setup_visual_repo 1)
+rm -f "$d.trusted-screenshots-read"
+printf '%s\n' "ac-1.png" > "$d/.harness/screenshots-read"
+out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'trusted screenshot-read receipt'; } \
+  && ok "worktree screenshot-read forgery blocked" \
+  || no "trusted screenshot receipt required" "rc=$rc out=${out:0:200}"
 rm -rf "$d"
 
 # No .harness/visual-ac → the whole rule is inert, even with a 3-item checklist.
@@ -466,9 +451,7 @@ setup_redfail_repo() {  # setup_redfail_repo <branch>
     git -c core.hooksPath=/dev/null commit -qm "red: add test"
     echo "def add(a,b): return a+b" > add.py                 # NEW impl (reverted to red)
     git add add.py
-    git -c core.hooksPath=/dev/null commit -qm "green: add"
-    : > .harness/ac-posted; : > .harness/test-plan-posted
-    echo "PASS" > .harness/adversarial-verdict )
+    git -c core.hooksPath=/dev/null commit -qm "green: add" )
   echo "$d"
 }
 RF_BODY=$'## Acceptance Criteria\n- add works\n\nFixes #20'

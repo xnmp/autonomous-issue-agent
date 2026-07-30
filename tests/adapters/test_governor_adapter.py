@@ -7,7 +7,7 @@ hook test drives the async callback with a stub build_ctx.
 
 import asyncio
 
-from issue_agent.adapters import governor_policy
+from issue_agent.domain import governor_policy
 from issue_agent.adapters.governor import (
     GateContext,
     evaluate_command,
@@ -15,11 +15,28 @@ from issue_agent.adapters.governor import (
     make_pretooluse_hook,
     make_read_record_hook,
 )
+from issue_agent.domain.contracts import (
+    TestExecution as ExecutionReceipt,
+    TestExecutionStatus as ExecutionStatus,
+)
 from issue_agent.domain.gate import OpenPrLookup
 
 
 def ctx(**kw) -> GateContext:
     return GateContext(**kw)
+
+
+def execution(passed: bool) -> ExecutionReceipt:
+    return ExecutionReceipt(
+        ExecutionStatus.PASSED if passed else ExecutionStatus.TEST_FAILED,
+        ("pytest",),
+        0 if passed else 1,
+        1,
+        "stdout",
+        "stderr",
+        "verifier",
+        "deadbeef",
+    )
 
 
 # ── bypass detection (fail CLOSED — reuses bash_governor core) ─────────────────
@@ -40,6 +57,33 @@ def test_hookspath_override_blocked():
 
 def test_ungoverned_command_allowed():
     assert evaluate_command("ls -la && cat README.md", ctx()).allowed
+
+
+def test_durable_publication_mode_routes_remote_writes_through_broker():
+    push = evaluate_command(
+        "git push origin HEAD:issue-42",
+        ctx(
+            durable_publish=True,
+            branch="issue-42",
+            open_pr=lambda _branch: OpenPrLookup.NO,
+        ),
+    )
+    assert not push.allowed
+    assert "issue-agent-publish git push" in push.reason
+    assert evaluate_command(
+        "issue-agent-publish git push origin HEAD:issue-42",
+        ctx(
+            durable_publish=True,
+            branch="issue-42",
+            open_pr=lambda _branch: OpenPrLookup.NO,
+        ),
+    ).allowed
+    protected = evaluate_command(
+        "issue-agent-publish git push --force origin HEAD:main",
+        ctx(durable_publish=True),
+    )
+    assert not protected.allowed
+    assert "protected branch" in protected.reason
 
 
 # Force-push/delete of a protected branch must be DENIED through the full adapter
@@ -126,13 +170,10 @@ def _good_pr_ctx():
         branch="fix/5-x",
         branch_subjects=("red: t", "green: impl"),
         changed_files=("src/x.py", "tests/test_x.py"),
-        ac_posted=True,
-        test_plan_posted=True,
-        adversarial_verdict="PASS ok",
         harness_test_cmd="pytest",
         exists_at_base=lambda f: False,
         run_tests=lambda c: True,
-        revert_and_run=lambda impl: False,  # genuine red
+        revert_and_run=lambda impl: execution(False),  # genuine red
     )
 
 
@@ -158,16 +199,18 @@ def test_pr_web_blocked():
     assert not v.allowed and "--web" in v.reason
 
 
-def test_pr_missing_markers_blocked():
-    c = _good_pr_ctx()
-    c = GateContext(**{**c.__dict__, "ac_posted": False})
-    v = evaluate_command(_good_pr_cmd(), c)
-    assert not v.allowed and "Acceptance Criteria" in v.reason
+def test_self_authored_marker_fields_cannot_enter_gate_context():
+    names = set(GateContext.__dataclass_fields__)
+    assert names.isdisjoint(
+        {"ac_posted", "test_plan_posted", "adversarial_verdict"}
+    )
 
 
 def test_pr_tautological_test_blocked():
     c = _good_pr_ctx()
-    c = GateContext(**{**c.__dict__, "revert_and_run": lambda impl: True})  # passes w/o impl
+    c = GateContext(**{
+        **c.__dict__, "revert_and_run": lambda impl: execution(True)
+    })  # passes w/o impl
     v = evaluate_command(_good_pr_cmd(), c)
     assert not v.allowed and "tautological" in v.reason
 
@@ -197,7 +240,7 @@ def test_pr_gate_short_circuits_cheap_denial_before_running_expensive_checks():
     """A cheap, wrong-base denial must arrive WITHOUT ever running
     check_tests or check_red_fails."""
     run_tests, run_calls = _counting(True)
-    revert_and_run, revert_calls = _counting(False)
+    revert_and_run, revert_calls = _counting(execution(False))
     c = GateContext(**{
         **_good_pr_ctx().__dict__,
         "run_tests": run_tests,
@@ -220,7 +263,7 @@ def test_pr_gate_runs_expensive_checks_when_nothing_cheap_denies():
     suite-running checks on a genuinely compliant PR — both must actually run
     exactly once."""
     run_tests, run_calls = _counting(True)
-    revert_and_run, revert_calls = _counting(False)  # False ⇒ genuinely red ⇒ ALLOW
+    revert_and_run, revert_calls = _counting(execution(False))
     c = GateContext(**{
         **_good_pr_ctx().__dict__,
         "run_tests": run_tests,

@@ -1,6 +1,6 @@
 """Fix-watcher decision behaviour — the poll_once control flow + invariants."""
 
-from builders import Check, Comment, Review, closing_ref, issue, pr, world
+from tests.domain.builders import Check, Comment, Review, closing_ref, issue, pr, world
 
 from issue_agent.domain.actions import (
     AgentKind,

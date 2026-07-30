@@ -62,6 +62,8 @@ import re
 from dataclasses import dataclass
 from enum import Enum
 
+MAX_BUDGET_STATUS = "error_max_budget_usd"
+
 from .actions import (  # noqa: F401
     Action,
     ClearIssueState,

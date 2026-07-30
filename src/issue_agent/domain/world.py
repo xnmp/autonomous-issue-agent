@@ -1,7 +1,7 @@
 """WorldState and its value objects.
 
 These are the pure, frozen representations of the GitHub ground truth the
-daemons read each poll. An adapter (Phase 3) builds them from `gh` JSON; the
+daemons read each poll. An adapter builds them from `gh` JSON; the
 domain decision functions consume them and never touch GitHub directly.
 
 Naming mirrors the GitHub JSON the bash reads (headRefName, headRefOid,

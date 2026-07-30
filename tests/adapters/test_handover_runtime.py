@@ -9,16 +9,16 @@ import pytest
 
 import issue_agent.adapters.handover as handover_adapter
 from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
-from issue_agent.domain.agent_task import AgentTask
+from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.outcome import AgentResult, ExitReason
 
 
 class RecordingRuntime:
     def __init__(self, result: AgentResult):
         self.result = result
-        self.tasks: list[AgentTask] = []
+        self.tasks: list[RuntimePlan] = []
 
-    async def run(self, task: AgentTask) -> AgentResult:
+    async def run(self, task: RuntimePlan) -> AgentResult:
         self.tasks.append(task)
         return self.result
 
@@ -72,7 +72,7 @@ def test_deadly_ceiling_writes_repository_handover_and_journals_receipt(
     journal = Journal(str(tmp_path / "journal.jsonl"))
     runtime = JournalingRuntime(inner, journal, repo="xnmp/repo", role="fix")
     runtime.set_context("fix", "RESOLVE", 82, 82)
-    task = AgentTask(prompt="Resolve issue #82", cwd=str(repo))
+    task = RuntimePlan(prompt="Resolve issue #82", cwd=str(repo))
 
     actual = asyncio.run(runtime.run(task))
 
@@ -137,7 +137,7 @@ def test_matching_handover_is_delivered_once_as_untrusted_context(tmp_path: Path
     harness.mkdir()
     (harness / "handover.md").write_text(handover, encoding="utf-8")
     inner = RecordingRuntime(AgentResult(is_error=False, exit_reason=ExitReason.OK))
-    original = AgentTask(prompt="Current retry instructions", cwd=str(repo))
+    original = RuntimePlan(prompt="Current retry instructions", cwd=str(repo))
     runtime = JournalingRuntime(inner, Journal(str(tmp_path / "journal.jsonl")))
     runtime.set_context("fix", "RESOLVE", 82, 82)
 
@@ -168,12 +168,12 @@ def test_handover_is_scoped_to_issue_and_absent_after_successful_delivery(
     )
     writer = JournalingRuntime(killed, journal, role="fix")
     writer.set_context("fix", "RESOLVE", 82, 82)
-    asyncio.run(writer.run(AgentTask(prompt="Issue 82 work", cwd=str(repo))))
+    asyncio.run(writer.run(RuntimePlan(prompt="Issue 82 work", cwd=str(repo))))
 
     other = RecordingRuntime(AgentResult(is_error=False, exit_reason=ExitReason.OK))
     other_runtime = JournalingRuntime(other, journal, role="fix")
     other_runtime.set_context("fix", "RESOLVE", 83, 83)
-    asyncio.run(other_runtime.run(AgentTask(prompt="Issue 83 work", cwd=str(repo))))
+    asyncio.run(other_runtime.run(RuntimePlan(prompt="Issue 83 work", cwd=str(repo))))
     assert other.tasks[0].prompt == "Issue 83 work"
 
     successor = RecordingRuntime(
@@ -182,14 +182,14 @@ def test_handover_is_scoped_to_issue_and_absent_after_successful_delivery(
     successor_runtime = JournalingRuntime(successor, journal, role="fix")
     successor_runtime.set_context("fix", "FIX_CI", 200, 82)
     asyncio.run(
-        successor_runtime.run(AgentTask(prompt="Issue 82 successor", cwd=str(repo)))
+        successor_runtime.run(RuntimePlan(prompt="Issue 82 successor", cwd=str(repo)))
     )
     assert "Previous exhausted-leg handover" in successor.tasks[0].prompt
 
     third = RecordingRuntime(AgentResult(is_error=False, exit_reason=ExitReason.OK))
     third_runtime = JournalingRuntime(third, journal, role="fix")
     third_runtime.set_context("fix", "FIX_CI", 200, 82)
-    asyncio.run(third_runtime.run(AgentTask(prompt="Issue 82 third", cwd=str(repo))))
+    asyncio.run(third_runtime.run(RuntimePlan(prompt="Issue 82 third", cwd=str(repo))))
     assert third.tasks[0].prompt == "Issue 82 third"
 
 
@@ -205,7 +205,7 @@ def test_successor_cannot_force_unbounded_cleanup_read(tmp_path: Path) -> None:
     )
 
     class ReplacingRuntime:
-        async def run(self, task: AgentTask) -> AgentResult:
+        async def run(self, task: RuntimePlan) -> AgentResult:
             path.write_bytes(b"x" * (64 * 1024 + 1))
             return AgentResult(is_error=False, exit_reason=ExitReason.OK)
 
@@ -214,7 +214,7 @@ def test_successor_cannot_force_unbounded_cleanup_read(tmp_path: Path) -> None:
     )
     runtime.set_context("fix", "RESOLVE", 82, 82)
 
-    actual = asyncio.run(runtime.run(AgentTask(prompt="continue", cwd=str(repo))))
+    actual = asyncio.run(runtime.run(RuntimePlan(prompt="continue", cwd=str(repo))))
 
     assert actual.exit_reason is ExitReason.OK
     assert path.stat().st_size == 64 * 1024 + 1
@@ -227,7 +227,7 @@ def test_oversized_handover_cannot_flood_the_next_leg_prompt(tmp_path: Path) -> 
     prefix = b"<!-- issue-agent-handover role=fix issue=82 -->\n"
     (harness / "handover.md").write_bytes(prefix + b"x" * (64 * 1024))
     inner = RecordingRuntime(AgentResult(is_error=False, exit_reason=ExitReason.OK))
-    original = AgentTask(prompt="Current retry instructions", cwd=str(repo))
+    original = RuntimePlan(prompt="Current retry instructions", cwd=str(repo))
     runtime = JournalingRuntime(inner, Journal(str(tmp_path / "journal.jsonl")))
     runtime.set_context("fix", "RESOLVE", 82, 82)
 
@@ -253,7 +253,7 @@ def test_huge_multibyte_result_fields_stay_within_the_deliverable_limit(
     runtime = JournalingRuntime(killed, journal, role="fix")
     runtime.set_context("fix", "RESOLVE", 82, 82)
 
-    asyncio.run(runtime.run(AgentTask(prompt="p" * 100_000, cwd=str(repo))))
+    asyncio.run(runtime.run(RuntimePlan(prompt="p" * 100_000, cwd=str(repo))))
 
     raw = (repo / ".harness" / "handover.md").read_bytes()
     assert len(raw) <= 64 * 1024
@@ -263,7 +263,7 @@ def test_huge_multibyte_result_fields_stay_within_the_deliverable_limit(
     )
     next_runtime = JournalingRuntime(successor, journal, role="fix")
     next_runtime.set_context("fix", "RESOLVE", 82, 82)
-    asyncio.run(next_runtime.run(AgentTask(prompt="continue", cwd=str(repo))))
+    asyncio.run(next_runtime.run(RuntimePlan(prompt="continue", cwd=str(repo))))
     assert "Previous exhausted-leg handover" in successor.tasks[0].prompt
 
 
@@ -287,7 +287,7 @@ def test_handover_io_failures_do_not_mask_the_original_result(
     journal = Journal(str(tmp_path / "journal.jsonl"))
     runtime = JournalingRuntime(inner, journal)
     runtime.set_context("fix", "RESOLVE", 82, 82)
-    original = AgentTask(prompt="Keep retrying safely", cwd=str(repo))
+    original = RuntimePlan(prompt="Keep retrying safely", cwd=str(repo))
 
     actual = asyncio.run(runtime.run(original))
 
@@ -315,7 +315,7 @@ def test_git_inspection_timeout_preserves_original_ceiling_result(
         raise subprocess.TimeoutExpired(["git", "status"], 5)
 
     monkeypatch.setattr(handover_adapter.subprocess, "run", time_out)
-    actual = asyncio.run(runtime.run(AgentTask(prompt="p", cwd=str(repo))))
+    actual = asyncio.run(runtime.run(RuntimePlan(prompt="p", cwd=str(repo))))
 
     assert actual is expected
     assert not (repo / ".harness" / "handover.md").exists()
@@ -341,7 +341,7 @@ def test_git_inspection_nonzero_is_recorded_without_masking_the_result(
         return subprocess.CompletedProcess(argv, 128, "", "repository busy")
 
     monkeypatch.setattr(handover_adapter.subprocess, "run", fail_git)
-    actual = asyncio.run(runtime.run(AgentTask(prompt="p", cwd=str(repo))))
+    actual = asyncio.run(runtime.run(RuntimePlan(prompt="p", cwd=str(repo))))
 
     written = (repo / ".harness" / "handover.md").read_text(encoding="utf-8")
     assert actual is expected
