@@ -79,23 +79,24 @@ def test_agent_run_start_announces_each_new_dispatch():
     assert len({item["id"] for item in notifications}) == 4
 
 
-def test_duplicate_dispatch_receipts_emit_one_notification():
-    dispatch = {
-        "ts": ts(1),
+def test_distinct_legs_for_one_dispatch_emit_one_notification():
+    shared = {
         "event": "agent_run_start",
         "role": "fix",
-        "kind": "RESOLVE",
         "number": 7,
         "issue": 7,
         "dispatch": "resolve-7",
     }
+    events = [
+        {**shared, "ts": ts(1), "kind": "ROUTE", "model": "router"},
+        {**shared, "ts": ts(2), "kind": "RESOLVE", "model": "resolver"},
+        {**shared, "ts": ts(3), "kind": "RESOLVE", "model": "resolver-retry"},
+    ]
 
-    notifications = snapshots.journal_notifications(rows_for([
-        dispatch,
-        dict(dispatch),
-    ]))
+    notifications = snapshots.journal_notifications(rows_for(events))
 
     assert [item["title"] for item in notifications] == ["Issue #7 dispatched"]
+    assert notifications[0]["detail"] == "RESOLVE started"
 
 
 def test_malformed_dispatch_receipts_fail_open():
