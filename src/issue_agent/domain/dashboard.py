@@ -297,7 +297,8 @@ def stage_for(events, running: tuple[RunningLeg, ...] = ()) -> str:
          `recurrence`                          → "recurred"
          `spend_block`                         → "blocked (spend)"
          `hold`                                → "held"
-         `+ai-blocked`                         → "awaiting human reply"
+         `+ai-blocked`                         → "blocked" (the web projection
+                                                  adds the recorded reason)
          review run APPROVE                    → "awaiting merge"
          review run REQUEST_CHANGES            → "changes requested"
          errored run                           → "run failed"
