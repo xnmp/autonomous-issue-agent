@@ -13,6 +13,7 @@ import json
 import os
 import sqlite3
 import stat
+import tempfile
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -58,6 +59,7 @@ LEGACY_V8_SCHEMA_DIGEST = (
     "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
 )
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
+AUTHORITY_WITNESS_FORMAT = "issue-agent-control-authority-v1"
 
 
 class ControlStoreError(RuntimeError):
@@ -594,10 +596,25 @@ class SQLiteControlStore:
         os.makedirs(parent, mode=0o700, exist_ok=True)
         os.chmod(parent, stat.S_IRWXU)
         with self._initialization_lock():
-            if os.path.exists(self.path) and os.path.getsize(self.path):
+            witness_exists = self._authority_witness_exists()
+            database_exists = self._database_exists(
+                allow_empty=not witness_exists
+            )
+            if witness_exists:
+                self._validate_authority_witness()
+                if not database_exists:
+                    raise CorruptControlStore(
+                        "control-store authority database disappeared after "
+                        "initialization"
+                    )
+            if database_exists:
                 self.integrity_check()
             with self._connect() as db:
                 applied = self._migration_history(db)
+                if not applied and self._has_user_schema(db):
+                    raise IncompatibleSchema(
+                        "historyless nonempty control store cannot be adopted"
+                    )
             self._validate_migration_history(applied)
             for migration in _SCHEMA_MIGRATIONS:
                 self._apply_schema_migration(migration)
@@ -608,6 +625,103 @@ class SQLiteControlStore:
             )
             os.chmod(self.path, stat.S_IRUSR | stat.S_IWUSR)
             self.integrity_check()
+            if not witness_exists:
+                self._write_authority_witness()
+
+    @property
+    def authority_witness_path(self) -> str:
+        return f"{self.path}.authority"
+
+    def _database_exists(self, *, allow_empty: bool = False) -> bool:
+        try:
+            metadata = os.stat(self.path, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISREG(metadata.st_mode):
+            raise CorruptControlStore(
+                f"control-store path is not a regular file: {self.path}"
+            )
+        if metadata.st_size <= 0:
+            if allow_empty:
+                return False
+            raise CorruptControlStore(
+                f"control-store authority database is empty: {self.path}"
+            )
+        return True
+
+    def _authority_witness_exists(self) -> bool:
+        try:
+            os.stat(self.authority_witness_path, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        return True
+
+    def _validate_authority_witness(self) -> None:
+        path = self.authority_witness_path
+        try:
+            metadata = os.stat(path, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+            ):
+                raise CorruptControlStore(
+                    f"unsafe control-store authority witness: {path}"
+                )
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, flags)
+            try:
+                encoded = os.read(fd, 256)
+                if os.read(fd, 1):
+                    raise CorruptControlStore(
+                        "control-store authority witness is oversized"
+                    )
+            finally:
+                os.close(fd)
+        except OSError as exc:
+            raise CorruptControlStore(
+                f"cannot read control-store authority witness: {exc}"
+            ) from exc
+        if encoded.decode(errors="replace").strip() != AUTHORITY_WITNESS_FORMAT:
+            raise CorruptControlStore(
+                "control-store authority witness has an unknown format"
+            )
+
+    def _write_authority_witness(self) -> None:
+        path = self.authority_witness_path
+        parent = os.path.dirname(path)
+        prefix = f".{os.path.basename(path)}."
+        fd, temporary = tempfile.mkstemp(prefix=prefix, dir=parent)
+        try:
+            os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+            encoded = f"{AUTHORITY_WITNESS_FORMAT}\n".encode()
+            written = 0
+            while written < len(encoded):
+                written += os.write(fd, encoded[written:])
+            os.fsync(fd)
+            os.close(fd)
+            fd = -1
+            try:
+                os.link(temporary, path, follow_symlinks=False)
+            except FileExistsError:
+                self._validate_authority_witness()
+            directory_fd = os.open(
+                parent,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
 
     @contextmanager
     def _initialization_lock(self) -> Iterator[None]:
@@ -687,6 +801,16 @@ class SQLiteControlStore:
             ).fetchall()
         )
 
+    @staticmethod
+    def _has_user_schema(db: sqlite3.Connection) -> bool:
+        return (
+            db.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE name NOT LIKE 'sqlite_%' LIMIT 1"
+            ).fetchone()
+            is not None
+        )
+
     def _apply_schema_migration(self, migration: SchemaMigration) -> None:
         applied = False
         with self._connect() as db:
@@ -725,13 +849,132 @@ class SQLiteControlStore:
             self._migration_observer(migration.version, "committed")
 
     def integrity_check(self) -> None:
+        if not self._database_exists():
+            raise CorruptControlStore(
+                "control-store authority database does not exist"
+            )
         try:
             with self._connect() as db:
                 result = db.execute("PRAGMA quick_check").fetchone()[0]
+                if result != "ok":
+                    raise CorruptControlStore(
+                        f"control-store integrity check failed: {result}"
+                    )
+                history = self._migration_history(db)
+                self._validate_migration_history(history)
+                if history and history[-1][0] == SCHEMA_VERSION:
+                    self._assert_semantic_integrity(db)
         except sqlite3.DatabaseError as exc:
             raise CorruptControlStore(f"control-store integrity check failed: {exc}") from exc
-        if result != "ok":
-            raise CorruptControlStore(f"control-store integrity check failed: {result}")
+
+    @staticmethod
+    def _assert_semantic_integrity(db: sqlite3.Connection) -> None:
+        foreign_key_error = db.execute("PRAGMA foreign_key_check").fetchone()
+        if foreign_key_error is not None:
+            raise CorruptControlStore(
+                "control-store foreign-key integrity check failed: "
+                f"{tuple(foreign_key_error)}"
+            )
+
+        violations = (
+            (
+                "reservation primary limit is absent or inconsistent",
+                """
+                SELECT r.run_id
+                FROM budget_reservations AS r
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM reservation_limits AS l
+                    WHERE l.run_id=r.run_id
+                      AND l.repository=r.repository
+                      AND l.dimension=r.dimension
+                      AND l.period_id=r.period_id
+                      AND l.period_start=r.period_start
+                      AND l.period_end=r.period_end
+                      AND l.period_timezone=r.period_timezone
+                      AND l.currency=r.currency
+                      AND l.cap_micros=r.cap_micros
+                )
+                LIMIT 1
+                """,
+            ),
+            (
+                "reservation limits use a conflicting currency",
+                """
+                SELECT r.run_id
+                FROM budget_reservations AS r
+                JOIN reservation_limits AS l ON l.run_id=r.run_id
+                WHERE l.currency<>r.currency
+                LIMIT 1
+                """,
+            ),
+            (
+                "reservation settlement and charge disagree",
+                """
+                SELECT r.run_id
+                FROM budget_reservations AS r
+                LEFT JOIN charges AS c ON c.run_id=r.run_id
+                GROUP BY r.run_id, r.state
+                HAVING (r.state='settled' AND COUNT(c.charge_id)<>1)
+                    OR (r.state<>'settled' AND COUNT(c.charge_id)<>0)
+                LIMIT 1
+                """,
+            ),
+            (
+                "charge and reservation currencies disagree",
+                """
+                SELECT r.run_id
+                FROM budget_reservations AS r
+                JOIN charges AS c ON c.run_id=r.run_id
+                WHERE r.currency<>c.currency
+                LIMIT 1
+                """,
+            ),
+            (
+                "run and charge provider receipts disagree",
+                """
+                SELECT r.run_id
+                FROM runs AS r
+                JOIN charges AS c ON c.run_id=r.run_id
+                WHERE r.provider_receipt_id IS NULL
+                   OR r.provider_receipt_id<>c.provider_receipt_id
+                LIMIT 1
+                """,
+            ),
+            (
+                "lifecycle command and effect receipt states disagree",
+                """
+                SELECT c.command_id
+                FROM lifecycle_commands AS c
+                LEFT JOIN effect_receipts AS r ON r.command_id=c.command_id
+                WHERE (
+                    c.state IN (
+                        'succeeded', 'retryable_failure',
+                        'permanent_failure', 'unknown_outcome'
+                    )
+                ) <> (r.command_id IS NOT NULL)
+                   OR (r.command_id IS NOT NULL AND r.status<>c.state)
+                LIMIT 1
+                """,
+            ),
+        )
+        for detail, query in violations:
+            row = db.execute(query).fetchone()
+            if row is not None:
+                raise CorruptControlStore(
+                    f"control-store semantic integrity failed: {detail} "
+                    f"({row[0]})"
+                )
+
+        for row in db.execute(
+            "SELECT command_id, payload_json, payload_digest "
+            "FROM lifecycle_commands"
+        ).fetchall():
+            digest = hashlib.sha256(str(row["payload_json"]).encode()).hexdigest()
+            if digest != row["payload_digest"]:
+                raise CorruptControlStore(
+                    "control-store semantic integrity failed: lifecycle "
+                    f"command payload digest disagrees ({row['command_id']})"
+                )
 
     def adopt_legacy_owner(
         self,
@@ -1738,6 +1981,7 @@ class SQLiteControlStore:
             *request.additional_limits,
         )
         try:
+            self.integrity_check()
             with self.transaction() as db:
                 prior = db.execute(
                     "SELECT * FROM budget_reservations WHERE run_id=?",
@@ -1905,6 +2149,15 @@ class SQLiteControlStore:
                     requested,
                     request.cap,
                 )
+        except CorruptControlStore as exc:
+            return ReservationResult(
+                AccountingDisposition.CORRUPT,
+                None,
+                Money.zero(request.scope.currency),
+                requested,
+                request.cap,
+                str(exc),
+            )
         except (sqlite3.DatabaseError, OSError) as exc:
             return ReservationResult(
                 AccountingDisposition.UNAVAILABLE,
@@ -2605,9 +2858,10 @@ class SQLiteControlStore:
         raw = source.read_bytes()
         source_digest = hashlib.sha256(raw).hexdigest()
         migration_id = f"legacy-spend:{source_digest}"
-        parsed: list[tuple[str, dict[str, Any], int, datetime, int]] = []
+        parsed: list[tuple[str, str, int, int, datetime, str, int]] = []
+        occurrences: dict[str, int] = {}
         rejected = 0
-        for index, line in enumerate(raw.splitlines()):
+        for line in raw.splitlines():
             try:
                 row = json.loads(line)
                 if not isinstance(row, dict) or row.get("event") != "spend":
@@ -2627,34 +2881,61 @@ class SQLiteControlStore:
                 amount = Decimal(
                     str(row.get("billed_cost_usd", row["cost_usd"]))
                 )
-                if not amount.is_finite():
-                    raise ValueError("non-finite amount")
+                if not amount.is_finite() or amount < 0:
+                    raise ValueError("amount must be finite and nonnegative")
                 micros = int(
                     (amount * Decimal(1_000_000)).quantize(
                         Decimal("1"), rounding=ROUND_HALF_UP
                     )
                 )
-                if micros < 0:
-                    raise ValueError("negative amount")
+                normalized_repository = repository.strip()
+                model = str(row.get("model") or "<unknown>")
+                normalized_stamp = _stamp(stamp)
+                semantic_row = json.dumps(
+                    {
+                        "amount_micros": micros,
+                        "issue": issue,
+                        "model": model,
+                        "repository": normalized_repository,
+                        "settled_at": normalized_stamp,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                occurrence = occurrences.get(semantic_row, 0) + 1
+                occurrences[semantic_row] = occurrence
                 row_identity = hashlib.sha256(
-                    stamp.strftime("%Y-%m").encode()
-                    + b":"
-                    + str(index).encode()
-                    + b":"
-                    + line
+                    f"{semantic_row}:{occurrence}".encode()
                 ).hexdigest()
                 run_id = hashlib.sha256(
                     f"legacy-spend-row:{row_identity}".encode()
                 ).hexdigest()
-                parsed.append((run_id, row, micros, stamp, issue))
+                parsed.append(
+                    (
+                        run_id,
+                        normalized_repository,
+                        issue,
+                        micros,
+                        stamp,
+                        model,
+                        occurrence,
+                    )
+                )
             except (
                 InvalidOperation,
                 KeyError,
+                OverflowError,
                 TypeError,
                 ValueError,
                 json.JSONDecodeError,
             ):
                 rejected += 1
+
+        if rejected:
+            raise LegacySpendMigrationError(
+                f"{source}: rejected {rejected} legacy spend row(s); "
+                "no rows were imported"
+            )
 
         imported = 0
         total = 0
@@ -2673,14 +2954,46 @@ class SQLiteControlStore:
                     Money("USD", int(existing["amount_micros"])),
                     True,
                 )
-            for run_id, row, micros, stamp, issue in parsed:
+            for (
+                run_id,
+                repository,
+                issue,
+                micros,
+                stamp,
+                model,
+                occurrence,
+            ) in parsed:
                 period_start = stamp.astimezone(timezone.utc).replace(
                     hour=0, minute=0, second=0, microsecond=0
                 )
                 period_end = period_start + timedelta(days=1)
                 period_id = period_start.date().isoformat()
                 settled_at = _stamp(stamp)
-                repository = str(row["repo"])
+                previously_imported = int(
+                    db.execute(
+                        "SELECT COUNT(*) "
+                        "FROM runs AS r "
+                        "JOIN budget_reservations AS b ON b.run_id=r.run_id "
+                        "JOIN charges AS c ON c.run_id=r.run_id "
+                        "JOIN reservation_limits AS l ON l.run_id=r.run_id "
+                        "WHERE r.kind='legacy-import' "
+                        "AND TRIM(b.repository)=? "
+                        "AND b.model=? "
+                        "AND c.amount_micros=? "
+                        "AND c.currency='USD' "
+                        "AND c.settled_at=? "
+                        "AND l.dimension=?",
+                        (
+                            repository,
+                            model,
+                            micros,
+                            settled_at,
+                            f"issue:{issue}",
+                        ),
+                    ).fetchone()[0]
+                )
+                if occurrence <= previously_imported:
+                    continue
                 db.execute(
                     "INSERT OR IGNORE INTO runs("
                     "run_id, dispatch_id, kind, owner_id, state, "
@@ -2717,7 +3030,7 @@ class SQLiteControlStore:
                         _stamp(period_end),
                         micros,
                         9_000_000_000_000_000_000,
-                        str(row.get("model") or "<unknown>"),
+                        model,
                         settled_at,
                         settled_at,
                         settled_at,
@@ -2966,4 +3279,7 @@ def _stamp(value: datetime) -> str:
 
 
 def _parse_stamp(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("control-store timestamps must be timezone-aware")
+    return parsed

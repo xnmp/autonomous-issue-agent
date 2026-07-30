@@ -20,6 +20,7 @@ from issue_agent.adapters.control_store import (
     CorruptControlStore,
     IncompatibleSchema,
     LEGACY_V8_SCHEMA_DIGEST,
+    LegacySpendMigrationError,
     Lease,
     ReservationRequest,
     SQLiteControlStore,
@@ -106,6 +107,9 @@ def _initialize_in_process(path: str, start, results) -> None:
 def test_control_store_initializes_with_restrictive_permissions_and_integrity(tmp_path):
     store = _store(tmp_path)
     assert Path(store.path).stat().st_mode & 0o777 == 0o600
+    assert Path(store.authority_witness_path).read_text().strip() == (
+        "issue-agent-control-authority-v1"
+    )
     store.integrity_check()
     with sqlite3.connect(store.path) as db:
         history = db.execute(
@@ -113,6 +117,58 @@ def test_control_store_initializes_with_restrictive_permissions_and_integrity(tm
             "ORDER BY version"
         ).fetchall()
     assert history == [(9, 64), (10, 64), (11, 64), (12, 64)]
+
+
+def test_established_control_store_disappearance_is_not_fresh_initialized(
+    tmp_path,
+):
+    store = _store(tmp_path)
+    assert store.reserve(_request(1)).admitted
+    Path(store.path).unlink()
+
+    with pytest.raises(CorruptControlStore, match="disappeared"):
+        SQLiteControlStore(store.path).initialize()
+
+    assert not Path(store.path).exists()
+
+
+def test_valid_pre_witness_database_is_adopted_once(tmp_path):
+    store = _store(tmp_path)
+    Path(store.authority_witness_path).unlink()
+
+    SQLiteControlStore(store.path).initialize()
+
+    assert Path(store.authority_witness_path).read_text().strip() == (
+        "issue-agent-control-authority-v1"
+    )
+
+
+def test_empty_interrupted_first_initialization_can_resume(tmp_path):
+    path = tmp_path / "state" / "control.db"
+    path.parent.mkdir()
+    path.touch()
+
+    SQLiteControlStore(str(path)).initialize()
+
+    assert path.stat().st_size > 0
+
+
+def test_historyless_nonempty_database_is_rejected_without_adoption(tmp_path):
+    path = tmp_path / "state" / "control.db"
+    path.parent.mkdir()
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE unrelated_authority(value TEXT)")
+
+    with pytest.raises(IncompatibleSchema, match="historyless nonempty"):
+        SQLiteControlStore(str(path)).initialize()
+
+    with sqlite3.connect(path) as db:
+        assert db.execute(
+            "SELECT name FROM sqlite_master WHERE name='unrelated_authority'"
+        ).fetchone() == ("unrelated_authority",)
+        assert db.execute(
+            "SELECT name FROM sqlite_master WHERE name='schema_migrations'"
+        ).fetchone() is None
 
 
 def test_shipped_v8_database_upgrades_without_rewriting_history_or_data(
@@ -490,6 +546,24 @@ def test_corrupt_database_is_rejected_before_migration_or_admission(tmp_path):
 
     with pytest.raises(CorruptControlStore, match="integrity check failed"):
         SQLiteControlStore(str(path)).initialize()
+
+
+def test_semantically_corrupt_accounting_is_rejected_before_admission(tmp_path):
+    store = _store(tmp_path)
+    assert store.reserve(_request(1)).admitted
+    with sqlite3.connect(store.path) as db:
+        db.execute(
+            "UPDATE reservation_limits SET cap_micros=cap_micros+1 "
+            "WHERE run_id='run-1' AND dimension='daily'"
+        )
+        db.commit()
+
+    reopened = SQLiteControlStore(store.path)
+    with pytest.raises(CorruptControlStore, match="primary limit"):
+        reopened.initialize()
+    result = reopened.reserve(_request(2))
+    assert result.disposition is AccountingDisposition.CORRUPT
+    assert "primary limit" in result.detail
 
 
 @pytest.mark.parametrize(
@@ -1309,7 +1383,7 @@ def test_legacy_spend_import_preserves_all_live_cap_dimensions(tmp_path):
 
     third = {**first, "cost_usd": 0.5, "model": "legacy-3"}
     ledger.write_text(
-        "\n".join(json.dumps(row) for row in (first, second, third)) + "\n"
+        "\n".join(json.dumps(row) for row in (third, first, second)) + "\n"
     )
     appended = store.import_legacy_spend(str(ledger))
     assert appended.imported == 1
@@ -1332,6 +1406,50 @@ def test_legacy_spend_import_rejects_unattributed_rows(tmp_path):
         + "\n"
     )
 
-    report = store.import_legacy_spend(str(ledger))
-    assert report.imported == 0
-    assert report.rejected == 1
+    with pytest.raises(LegacySpendMigrationError, match="no rows were imported"):
+        store.import_legacy_spend(str(ledger))
+
+    with sqlite3.connect(store.path) as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM migration_imports"
+        ).fetchone() == (0,)
+        assert db.execute(
+            "SELECT COUNT(*) FROM runs WHERE kind='legacy-import'"
+        ).fetchone() == (0,)
+
+
+@pytest.mark.parametrize(
+    ("timestamp", "amount"),
+    (
+        (NOW.replace(tzinfo=None).isoformat(), "1"),
+        (NOW.isoformat(), "-0.0000001"),
+        (NOW.isoformat(), "NaN"),
+        (NOW.isoformat(), "Infinity"),
+    ),
+)
+def test_legacy_spend_import_rejects_invalid_authority_rows_atomically(
+    tmp_path,
+    timestamp,
+    amount,
+):
+    store = _store(tmp_path)
+    ledger = tmp_path / "spend.jsonl"
+    valid = {
+        "event": "spend",
+        "ts": NOW.isoformat(),
+        "repo": "o/r",
+        "issue": 42,
+        "cost_usd": 1,
+    }
+    invalid = {**valid, "ts": timestamp, "cost_usd": amount}
+    ledger.write_text(
+        "\n".join(json.dumps(row) for row in (valid, invalid)) + "\n"
+    )
+
+    with pytest.raises(LegacySpendMigrationError, match="no rows were imported"):
+        store.import_legacy_spend(str(ledger))
+
+    with sqlite3.connect(store.path) as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM runs WHERE kind='legacy-import'"
+        ).fetchone() == (0,)
