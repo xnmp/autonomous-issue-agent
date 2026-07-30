@@ -163,11 +163,10 @@ def test_final_rollout_crossing_cannot_escape_on_clean_exit(tmp_path, monkeypatc
     assert result.cost_usd == pytest.approx(28.0)
 
 
-def test_final_stderr_usage_crossing_cannot_escape_without_rollout(
+def test_final_stderr_usage_cannot_mint_a_budget_verdict_without_rollout(
     tmp_path, monkeypatch
 ):
-    """Older codex versions report final usage only on stderr. That fallback
-    must receive the same final-crossing check as rollout-backed accounting."""
+    """Agent-controlled stderr is telemetry, not provider billing evidence."""
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     body = (
         'out=""; prev=""\n'
@@ -184,9 +183,11 @@ def test_final_stderr_usage_crossing_cannot_escape_without_rollout(
         )
     )
 
-    assert result.status == "error_max_budget_usd"
-    assert result.exit_reason is ExitReason.BUDGET_EXHAUSTED
-    assert result.cost_usd == pytest.approx(28.0)
+    assert result.status == "pr_opened"
+    assert result.exit_reason is ExitReason.OK
+    assert result.cost_usd == 0
+    assert result.usage["source"] == "stderr"
+    assert "excluded from pricing" in result.telemetry_warning
 
 
 def test_headerless_run_uses_rollout_for_inflight_budget_enforcement(

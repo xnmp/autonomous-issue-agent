@@ -29,6 +29,7 @@ from issue_agent.adapters.codex_runner import (
     codex_budget_not_enforced_warning,
     codex_cost_blindspot_warning,
     codex_cost_usd,
+    implausible_codex_usage_warning,
     rates_for_model,
     spend_evidence_path,
     parse_codex_envelope,
@@ -726,6 +727,7 @@ def test_headerless_01460_recovers_root_rollout_usage_cost_turns_and_ledger(
         "output_tokens": 100_000,
         "cache_read_input_tokens": 50_000,
         "cache_creation_input_tokens": 0,
+        "source": "rollout",
     }
     assert result.num_turns == 2
     # (950000 * $5 + 50000 * $0.50 + 100000 * $30) / 1e6.
@@ -1565,6 +1567,7 @@ def test_usage_read_from_the_modern_split_token_line():
         "output_tokens": 4341,
         "cache_read_input_tokens": 12000,
         "cache_creation_input_tokens": 0,
+        "source": "stderr",
     }
 
 
@@ -1631,6 +1634,7 @@ def test_read_rollout_usage_prefers_last_cumulative_token_count(tmp_path):
         "output_tokens": 604,
         "cache_read_input_tokens": 35328,
         "cache_creation_input_tokens": 7,
+        "source": "rollout",
     }
 
 
@@ -1698,8 +1702,9 @@ def test_envelope_falls_back_to_stderr_usage_when_no_rollout():
         cost_per_mtok_out=30.0,
     )
     assert r.usage["total_tokens"] == 1820
-    # Total-only prices at the HIGHER rate — over-estimation is the safe direction.
-    assert r.cost_usd == 1820 * 30.0 / 1_000_000.0
+    assert r.usage["source"] == "stderr"
+    assert r.cost_usd == 0
+    assert "untrusted telemetry" in r.telemetry_warning
 
 
 def test_cost_defaults_cached_input_to_one_tenth_of_the_input_rate():
@@ -1714,6 +1719,45 @@ def test_cost_is_zero_without_rates():
     usage = {"input_tokens": 48000, "output_tokens": 4341}
     assert codex_cost_usd(usage, cost_per_mtok_in=0.0, cost_per_mtok_out=0.0) == 0.0
     assert codex_cost_usd(None, cost_per_mtok_in=1.25, cost_per_mtok_out=10.0) == 0.0
+
+
+def test_stderr_usage_is_never_a_pricing_receipt():
+    usage = {
+        "input_tokens": 1_000_000,
+        "output_tokens": 1_000_000,
+        "source": "stderr",
+    }
+    assert codex_cost_usd(
+        usage,
+        cost_per_mtok_in=5,
+        cost_per_mtok_out=30,
+    ) == 0
+
+
+def test_plausibility_rate_ceiling_remains_armed_after_two_minutes():
+    usage = {
+        "input_tokens": 0,
+        "output_tokens": 20_000_000,
+        "source": "rollout",
+    }
+    warning = implausible_codex_usage_warning(
+        usage,
+        elapsed_s=600,
+        has_baseline=False,
+        cost_per_mtok_in=5,
+        cost_per_mtok_out=30,
+    )
+    assert "$50.00/minute" in warning
+    assert (
+        implausible_codex_usage_warning(
+            usage,
+            elapsed_s=720,
+            has_baseline=False,
+            cost_per_mtok_in=5,
+            cost_per_mtok_out=30,
+        )
+        == ""
+    )
 
 
 def test_total_only_usage_is_priced_at_the_higher_rate():
@@ -1731,12 +1775,13 @@ def test_envelope_carries_cost_and_usage_when_rates_are_set():
         exit_code=0, last_message=msg, stderr=_MODERN_USAGE_LINE,
         cost_per_mtok_in=1.25, cost_per_mtok_out=10.0,
     )
-    # (36000 * 1.25 + 12000 * 0.125 + 4341 * 10) / 1e6.
-    assert r.cost_usd == pytest.approx(0.08991)
+    assert r.cost_usd == 0
     assert r.usage == {
         "input_tokens": 48000, "output_tokens": 4341,
         "cache_read_input_tokens": 12000, "cache_creation_input_tokens": 0,
+        "source": "stderr",
     }
+    assert "excluded from pricing" in r.telemetry_warning
 
 
 def test_envelope_cost_stays_zero_when_rates_are_unset():
@@ -1755,17 +1800,35 @@ def test_a_failed_codex_run_still_reports_the_tokens_it_burned():
         cost_per_mtok_in=1.25, cost_per_mtok_out=10.0,
     )
     assert r.is_error is True
-    # (36000 * 1.25 + 12000 * 0.125 + 4341 * 10) / 1e6.
-    assert r.cost_usd == pytest.approx(0.08991)
+    assert r.cost_usd == 0
+    assert r.usage["source"] == "stderr"
 
 
 def _costed_codex(tmp) -> str:
-    """A stub that writes an envelope AND prints a codex token-usage line."""
+    """A stub that writes provider-owned rollout usage and an envelope."""
+    usage_event = json.dumps(
+        {
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 48000,
+                        "cached_input_tokens": 12000,
+                        "cache_write_input_tokens": 0,
+                        "output_tokens": 4341,
+                    }
+                },
+            }
+        },
+        separators=(",", ":"),
+    )
     body = (
         'out=""; prev=""\n'
         'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
+        'mkdir -p "$CODEX_HOME/sessions/2026/07/30"\n'
+        f"printf '%s\\n' '{usage_event}' > "
+        '"$CODEX_HOME/sessions/2026/07/30/rollout-now-sess-cost.jsonl"\n'
         'echo "session id: sess-cost" >&2\n'
-        'echo "' + _MODERN_USAGE_LINE + '" >&2\n'
         'printf \'%s\' \'{"status":"pr_opened","summary":"done","needs":""}\' > "$out"\n'
         'exit 0\n'
     )
@@ -1778,7 +1841,8 @@ def test_run_flows_codex_cost_into_the_result():
     spend caps see codex at all."""
     tmp = tempfile.mkdtemp()
     runner = CodexRunner(
-        codex_bin=_costed_codex(tmp), env={"OPENAI_API_KEY": "k"},
+        codex_bin=_costed_codex(tmp),
+        env={"OPENAI_API_KEY": "k", "CODEX_HOME": tmp},
         cost_per_mtok_in=1.25, cost_per_mtok_out=10.0,
     )
     r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
@@ -1791,7 +1855,10 @@ def test_run_reports_zero_cost_without_rates():
     """Anti-vacuity twin: same stub, no price table → 0.0 (and the startup
     warning below is the operator's only signal)."""
     tmp = tempfile.mkdtemp()
-    runner = CodexRunner(codex_bin=_costed_codex(tmp), env={"OPENAI_API_KEY": "k"})
+    runner = CodexRunner(
+        codex_bin=_costed_codex(tmp),
+        env={"OPENAI_API_KEY": "k", "CODEX_HOME": tmp},
+    )
     r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
     assert r.status == "pr_opened"
     assert r.cost_usd == 0.0
@@ -1806,7 +1873,8 @@ def test_a_codex_run_on_shipped_defaults_ledgers_a_nonzero_cost():
     cfg = from_env({"REPO": "x"})
     tmp = tempfile.mkdtemp()
     runner = CodexRunner(
-        codex_bin=_costed_codex(tmp), env={"OPENAI_API_KEY": "k"},
+        codex_bin=_costed_codex(tmp),
+        env={"OPENAI_API_KEY": "k", "CODEX_HOME": tmp},
         cost_per_mtok_in=cfg.codex_runtime.cost_per_mtok_in,
         cost_per_mtok_out=cfg.codex_runtime.cost_per_mtok_out,
     )
@@ -1975,7 +2043,8 @@ def test_two_routed_tiers_ledger_different_dollars_for_identical_tokens():
 
     def _cost(model):
         runner = CodexRunner(
-            codex_bin=codex, env={"OPENAI_API_KEY": "k"},
+            codex_bin=codex,
+            env={"OPENAI_API_KEY": "k", "CODEX_HOME": tmp},
             cost_per_mtok_in=5.0, cost_per_mtok_out=30.0,
             cost_per_mtok=_LUNA_TERRA,
         )
@@ -1992,7 +2061,8 @@ def test_an_unpinned_leg_is_priced_with_the_runners_default_model():
     default — and must be priced as that, not at the scalar fallback."""
     tmp = tempfile.mkdtemp()
     runner = CodexRunner(
-        codex_bin=_costed_codex(tmp), env={"OPENAI_API_KEY": "k"},
+        codex_bin=_costed_codex(tmp),
+        env={"OPENAI_API_KEY": "k", "CODEX_HOME": tmp},
         default_model="gpt-5.6-terra",
         cost_per_mtok_in=5.0, cost_per_mtok_out=30.0,
         cost_per_mtok=_LUNA_TERRA,
@@ -2006,7 +2076,8 @@ def test_a_model_outside_the_table_still_prices_at_the_scalars():
     """Anti-vacuity twin: the table is an override, not a replacement."""
     tmp = tempfile.mkdtemp()
     runner = CodexRunner(
-        codex_bin=_costed_codex(tmp), env={"OPENAI_API_KEY": "k"},
+        codex_bin=_costed_codex(tmp),
+        env={"OPENAI_API_KEY": "k", "CODEX_HOME": tmp},
         cost_per_mtok_in=1.25, cost_per_mtok_out=10.0,
         cost_per_mtok=(("gpt-5.6-terra", 10.0, 60.0),),
     )

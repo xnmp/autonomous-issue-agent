@@ -275,6 +275,27 @@ class AccountingRuntime(AgentRuntime):
     ) -> AgentResult:
         usage = _token_usage(result.usage, self.runtime_name)
         provider_amount = Money.from_major("USD", result.cost_usd)
+        codex_source = (
+            str(result.usage.get("source") or "")
+            if isinstance(result.usage, dict)
+            else ""
+        )
+        untrusted_codex_usage = (
+            self.runtime_name == "codex"
+            and isinstance(result.usage, dict)
+            and codex_source
+            not in {
+                UsageSource.PROVIDER.value,
+                UsageSource.ROLLOUT.value,
+                UsageSource.RECONCILED.value,
+            }
+        )
+        if untrusted_codex_usage:
+            # Codex stderr is agent-controlled output, not a provider receipt.
+            # Preserve it in telemetry, but do not let either its counters or
+            # a legacy cost derived from them release budget authority.
+            usage = None
+            provider_amount = Money.zero("USD")
         used_stream_fallback = False
         if (
             (usage is None or usage.total_tokens == 0)
@@ -610,10 +631,17 @@ def _token_usage(raw: object, runtime: str) -> TokenUsage | None:
         if runtime == "codex"
         else input_total
     )
+    if runtime == "codex":
+        try:
+            source = UsageSource(str(raw.get("source") or ""))
+        except ValueError:
+            source = UsageSource.STDERR
+    else:
+        source = UsageSource.PROVIDER
     return TokenUsage(
         disjoint_input,
         int(raw.get("output_tokens", 0) or 0),
         cache_read,
         cache_write,
-        UsageSource.ROLLOUT if runtime == "codex" else UsageSource.PROVIDER,
+        source,
     )

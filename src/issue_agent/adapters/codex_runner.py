@@ -327,6 +327,7 @@ def parse_codex_usage(stderr: str) -> dict | None:
             "output_tokens": _int_tokens(m.group(3)),
             "cache_read_input_tokens": _int_tokens(m.group(2)),
             "cache_creation_input_tokens": 0,
+            "source": UsageSource.STDERR.value,
         }
     m2 = _TOKEN_TOTAL_RE.search(line)
     if m2:
@@ -336,6 +337,7 @@ def parse_codex_usage(stderr: str) -> dict | None:
             "cache_read_input_tokens": 0,
             "cache_creation_input_tokens": 0,
             "total_tokens": _int_tokens(m2.group(1) or m2.group(2)),
+            "source": UsageSource.STDERR.value,
         }
     if len(lines) < 2 or not _TOKEN_HEADER_RE.match(lines[-2]):
         return None
@@ -348,6 +350,7 @@ def parse_codex_usage(stderr: str) -> dict | None:
         "cache_read_input_tokens": 0,
         "cache_creation_input_tokens": 0,
         "total_tokens": _int_tokens(m3.group(1)),
+        "source": UsageSource.STDERR.value,
     }
 
 
@@ -468,6 +471,7 @@ def read_rollout_usage(session_id: str, codex_home: str | None = None) -> dict |
             "cache_creation_input_tokens": int(
                 found.get("cache_write_input_tokens", 0) or 0
             ),
+            "source": UsageSource.ROLLOUT.value,
         }
     except Exception:  # noqa: BLE001 — accounting fallback must never kill a run
         return None
@@ -528,10 +532,25 @@ def usage_delta(end: dict | None, start: dict | None) -> dict | None:
         return None
     if not isinstance(start, dict):
         return end
-    keys = set(end) | set(start)
-    return {
-        k: max(0, int(end.get(k, 0) or 0) - int(start.get(k, 0) or 0)) for k in keys
+    keys = (
+        "input_tokens",
+        "output_tokens",
+        "cache_read_input_tokens",
+        "cache_creation_input_tokens",
+        "total_tokens",
+    )
+    delta = {
+        key: max(
+            0,
+            int(end.get(key, 0) or 0) - int(start.get(key, 0) or 0),
+        )
+        for key in keys
+        if key in end or key in start
     }
+    source = end.get("source")
+    if isinstance(source, str):
+        delta["source"] = source
+    return delta
 
 
 def codex_cost_usd(
@@ -558,7 +577,10 @@ def codex_cost_usd(
     An older codex that printed only a TOTAL is priced at the HIGHER of the two
     rates. Caps exist to stop runaway spend, so the only safe rounding direction
     is over-estimation — an under-counted cap is a cap that never fires."""
-    if not isinstance(usage, dict):
+    if (
+        not isinstance(usage, dict)
+        or usage.get("source") == UsageSource.STDERR.value
+    ):
         return 0.0
     rate_in = max(float(cost_per_mtok_in or 0.0), 0.0)
     rate_out = max(float(cost_per_mtok_out or 0.0), 0.0)
@@ -593,8 +615,8 @@ def codex_cost_usd(
     return total * max(rate_in, rate_out) / 1_000_000.0
 
 
-_EARLY_USAGE_WINDOW_SECONDS = 120.0
-_MAX_PLAUSIBLE_EARLY_COST_USD = 100.0
+_PLAUSIBILITY_FLOOR_SECONDS = 120.0
+_MAX_PLAUSIBLE_COST_PER_MINUTE_USD = 50.0
 
 
 def implausible_codex_usage_warning(
@@ -615,7 +637,7 @@ def implausible_codex_usage_warning(
     output was mistaken for the run's own receipt; acting on it is more
     dangerous than temporarily declining to price it.
     """
-    if has_baseline or elapsed_s >= _EARLY_USAGE_WINDOW_SECONDS:
+    if not isinstance(usage, dict):
         return ""
     cost = codex_cost_usd(
         usage,
@@ -623,12 +645,19 @@ def implausible_codex_usage_warning(
         cost_per_mtok_out=cost_per_mtok_out,
         cost_per_mtok_cached_in=cost_per_mtok_cached_in,
     )
-    if cost <= _MAX_PLAUSIBLE_EARLY_COST_USD:
+    elapsed_for_ceiling = max(elapsed_s, _PLAUSIBILITY_FLOOR_SECONDS)
+    ceiling = (
+        elapsed_for_ceiling
+        * _MAX_PLAUSIBLE_COST_PER_MINUTE_USD
+        / 60.0
+    )
+    if cost <= ceiling:
         return ""
     return (
         f"fresh Codex usage implies ${cost:.2f} after {elapsed_s:.1f}s "
-        f"(>${_MAX_PLAUSIBLE_EARLY_COST_USD:.2f} inside "
-        f"{_EARLY_USAGE_WINDOW_SECONDS:.0f}s)"
+        f"(>${ceiling:.2f} at the "
+        f"${_MAX_PLAUSIBLE_COST_PER_MINUTE_USD:.2f}/minute plausibility ceiling"
+        f"{' after a resumed-session delta' if has_baseline else ''})"
     )
 
 
@@ -662,7 +691,11 @@ def budget_overrun_usd(
     Returns the spend rather than a bool so the caller can report what the run
     had actually burned when it was stopped — a kill that cannot say how much
     it cost is not evidence of anything."""
-    if max_budget_usd <= 0 or not isinstance(usage, dict):
+    if (
+        max_budget_usd <= 0
+        or not isinstance(usage, dict)
+        or usage.get("source") == UsageSource.STDERR.value
+    ):
         return None
     rate_in = max(float(cost_per_mtok_in or 0), 0)
     rate_out = max(float(cost_per_mtok_out or 0), 0)
@@ -925,11 +958,11 @@ def parse_codex_envelope(
     envelope itself signals an error status.
 
     Token usage: a caller-supplied `usage` (the exact split from the session
-    rollout file, see read_rollout_usage) wins; otherwise it is read off
-    `stderr` and priced with the caller's rates — review M1: this is what makes
-    codex spend visible to the ledger and therefore to both spend caps. A run
-    that DIED still burned tokens, so usage/cost ride on every return path, not
-    just the happy one."""
+    rollout file, see read_rollout_usage) wins; otherwise stderr telemetry is
+    retained but explicitly tagged as untrusted. Stderr includes arbitrary
+    agent-controlled output, so it is never priced or used for a budget verdict.
+    A run that died still carries trustworthy rollout usage on every return
+    path, not just the happy one."""
     structured: dict | None = None
     raw = (last_message or "").strip()
     if raw:
@@ -940,7 +973,22 @@ def parse_codex_envelope(
         except (json.JSONDecodeError, ValueError):
             structured = None
 
-    usage = usage or parse_codex_usage(stderr)
+    if usage is not None:
+        usage = {
+            **usage,
+            "source": str(
+                usage.get("source") or UsageSource.ROLLOUT.value
+            ),
+        }
+    else:
+        usage = parse_codex_usage(stderr)
+    stderr_warning = (
+        "Codex reported usage only on stderr; retained as untrusted telemetry "
+        "and excluded from pricing and budget enforcement"
+        if usage is not None
+        and usage.get("source") == UsageSource.STDERR.value
+        else ""
+    )
     cost = codex_cost_usd(
         usage,
         cost_per_mtok_in=cost_per_mtok_in,
@@ -958,11 +1006,13 @@ def parse_codex_envelope(
                 session_id=session_id,
                 cost_usd=cost,
                 usage=usage,
+                telemetry_warning=stderr_warning,
                 exit_reason=ExitReason.AGENT_ERROR,
             )
         return AgentResult(
             is_error=False, summary=raw[:2000], session_id=session_id,
             cost_usd=cost, usage=usage,
+            telemetry_warning=stderr_warning,
             exit_reason=ExitReason.OK,
         )
 
@@ -979,6 +1029,7 @@ def parse_codex_envelope(
         # no rates are configured or codex printed no usage line.
         cost_usd=cost,
         usage=usage,
+        telemetry_warning=stderr_warning,
         session_id=session_id,
         structured=structured,
         # A parsed envelope means the agentic loop reached its own terminal —
@@ -1584,8 +1635,19 @@ class CodexRunner(AgentRuntime):
             return legacy
 
         def _trusted_usage(usage: dict | None, sid: str) -> dict | None:
-            """Reject one implausible early sample and make the rejection loud."""
+            """Accept only provider-owned, plausible usage evidence."""
             nonlocal implausible_usage_logged
+            if (
+                isinstance(usage, dict)
+                and usage.get("source") == UsageSource.STDERR.value
+            ):
+                if not implausible_usage_logged:
+                    self._log(
+                        "codex: UNTRUSTED USAGE — stderr counter retained only "
+                        "as telemetry, never priced or budget-enforced"
+                    )
+                    implausible_usage_logged = True
+                return None
             has_baseline = (
                 usage_baseline is not None and sid == usage_baseline[0]
             )

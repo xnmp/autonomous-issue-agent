@@ -254,7 +254,11 @@ def test_resumed_session_uses_distinct_per_leg_settlement_receipts(
             status="ok",
             cost_usd=0.1,
             session_id="resumed-session",
-            usage={"input_tokens": 100, "output_tokens": 10},
+            usage={
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "source": "rollout",
+            },
         )
     )
     wrapper, store = _wrapper(tmp_path, runtime)
@@ -305,7 +309,7 @@ def test_codex_missing_usage_never_settles_productive_run_as_free(
         assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
 
 
-def test_total_only_codex_usage_cannot_turn_nonzero_spend_into_zero(
+def test_stderr_codex_usage_cannot_release_a_paid_reservation(
     tmp_path,
 ) -> None:
     runtime = Runtime(
@@ -320,6 +324,7 @@ def test_total_only_codex_usage_cannot_turn_nonzero_spend_into_zero(
                 "cache_read_input_tokens": 0,
                 "cache_creation_input_tokens": 0,
                 "total_tokens": 125_000,
+                "source": "stderr",
             },
         )
     )
@@ -329,18 +334,9 @@ def test_total_only_codex_usage_cannot_turn_nonzero_spend_into_zero(
         wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2))
     )
 
+    assert len(store.active_reservation_runs()) == 1
     with store._connect() as db:
-        charge = db.execute(
-            "SELECT amount_micros, basis, usage_json, rate_card_id, "
-            "rate_card_version FROM charges"
-        ).fetchone()
-    assert tuple(charge) == (
-        1_250_000,
-        "configured_rate_card",
-        None,
-        "test",
-        "v1",
-    )
+        assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 0
 
 
 def test_exhausted_cap_blocks_before_runtime(tmp_path) -> None:
