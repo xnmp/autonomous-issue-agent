@@ -673,7 +673,8 @@ def test_headerless_01460_recovers_root_rollout_usage_cost_turns_and_ledger(
         event for event in read_events(journal.path) if event["event"] == "agent_run"
     ][0]
     assert agent_run["session_id"] == good_sid
-    assert agent_run["cost_usd"] == pytest.approx(8.0)
+    # The journal records the same cache-aware leg cost as the result.
+    assert agent_run["cost_usd"] == pytest.approx(7.775)
     assert agent_run["turns"] == 2
     spend = read_events(ledger_path)
     assert len(spend) == 1
