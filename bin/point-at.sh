@@ -134,7 +134,9 @@ if [ -n "${TARGET_DIR:-}" ] && git -C "$TARGET_DIR" rev-parse --is-inside-work-t
       info "  creating '$BASE_BRANCH' off origin/$default$warn_default (CREATE_BASE_BRANCH=1)"
       git -C "$TARGET_DIR" fetch origin "$default" --quiet \
         && git -C "$TARGET_DIR" branch "$BASE_BRANCH" "origin/$default" 2>/dev/null \
-        && git -C "$TARGET_DIR" push -u origin "$BASE_BRANCH" \
+        && uv run --quiet issue-agent publish-base-branch \
+             --repo "$REPO" --name "$NAME" --target-dir "$TARGET_DIR" \
+             --branch "$BASE_BRANCH" \
         && grn "  ✓ created and pushed '$BASE_BRANCH'" \
         || { red "  ✗ could not create '$BASE_BRANCH' (check push access to $REPO)"; exit 1; }
     else
@@ -241,11 +243,10 @@ fi
 # harness never creates them.
 
 info "ensuring GitHub lifecycle labels on $REPO"
-for l in ai-triage ai-ready ai-working ai-blocked ai-pr-open ai-done ai-suggestion maybe-resolved needs-budget-review \
-         trivial minor major needs-human-review needs-design invariant \
-         recurrence P1 P2 P3 harness; do
-  gh label create "$l" --repo "$REPO" >/dev/null 2>&1 || true
-done
+if ! uv run --quiet issue-agent prepare-remote --repo "$REPO" --name "$NAME"; then
+  red "  ✗ lifecycle label preparation failed; refusing to start without the remote command receipts"
+  exit 1
+fi
 grn "  ✓ labels ensured"
 
 # Enable GitHub native auto-merge on the target so an approved+green PR merges
@@ -255,7 +256,8 @@ grn "  ✓ labels ensured"
 # needs admin on the repo — a non-admin failure is a warning, not fatal.
 if [ "${ENSURE_AUTO_MERGE:-1}" != "0" ]; then
   info "ensuring GitHub auto-merge is enabled on $REPO"
-  if gh api -X PATCH "repos/$REPO" -F allow_auto_merge=true >/dev/null 2>&1; then
+  if uv run --quiet issue-agent prepare-remote --repo "$REPO" --name "$NAME" \
+      --skip-labels --ensure-auto-merge; then
     grn "  ✓ allow_auto_merge=true"
   else
     red "  ⚠ could not enable allow_auto_merge (need admin on $REPO?) — approved PRs"

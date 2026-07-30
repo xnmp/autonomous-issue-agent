@@ -478,6 +478,7 @@ def main(argv: list[str] | None = None) -> None:
             validate=lambda: _validate_reload_candidate(dict(os.environ)),
         )
         reload_check = watch.changed
+    hard_exit_code: int | None = None
     try:
         daemon.run_forever(
             sleep=time.sleep, now=lambda: int(time.time()), max_ticks=max_ticks,
@@ -486,8 +487,18 @@ def main(argv: list[str] | None = None) -> None:
                 f"{role} scheduler progressed"
             ),
         )
+    except SystemExit:
+        if daemon.requires_hard_exit:
+            hard_exit_code = int(ExitCode.TRANSIENT)
+        else:
+            raise
     finally:
         notifier.stopping(f"{role} daemon stopped")
+    if hard_exit_code is not None:
+        # ThreadPoolExecutor workers are intentionally non-daemon. If a runtime
+        # ignored cancellation after the application deadline, normal Python
+        # shutdown would wait for it forever and cross TimeoutStopSec.
+        os._exit(hard_exit_code)
 
 
 if __name__ == "__main__":

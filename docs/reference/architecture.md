@@ -19,7 +19,7 @@ decide    a PURE function            world + config + state → list[Action]
 execute   Executor.execute()         the ONE place writes happen
 dispatch  AgentDispatcher            RunAgent → an actual paid agent session
 control   SQLiteControlStore         leases, spend, dedup, commands, receipts
-effects   GitHubEffectExecutor       narrow privileged mutation boundary
+effects   effect adapters            narrow privileged mutation boundaries
 ```
 
 The layering is hexagonal and **machine-enforced** (import-linter contracts
@@ -46,9 +46,11 @@ tests pass.
    `domain/` performs a write. This is why adding escalation alerting and the
    journal were one-place changes.
 2. **One privileged write funnel.** Harness lifecycle mutations become durable
-   `LifecycleCommand`s and are executed by `GitHubEffectExecutor` with an
-   idempotency key, expected revision, and receipt. Paid agents publish branches
-   and open PRs through `issue-agent-publish`; `AgentPublicationBroker` commits
+   `LifecycleCommand`s and are executed by `GitHubEffectExecutor` or
+   `GitHubOperatorEffects` with an idempotency key, expected revision, and
+   receipt. This includes CLI/dashboard labels, bootstrap settings, base-branch
+   creation, and webhook relay lifecycle. Paid agents publish branches and open
+   PRs through `issue-agent-publish`; `AgentPublicationBroker` commits
    intent before the network call and reconciles remote state before retrying an
    ambiguous outcome. Credential isolation remains separately trigger-gated,
    so this is durability—not an untrusted-input security claim.
@@ -205,6 +207,8 @@ every reservation and lifecycle command.
 
 Untrusted repository, issue, review, CI, and Jira text crosses into planners as
 `domain/trust.py::Untrusted`; raw strings are rejected at the fence boundary.
+Target `AGENTS.md` and `CLAUDE.md` files share one byte ceiling and one encoded
+untrusted block when delivered to Codex.
 Child agent processes receive an explicit environment allowlist plus only the
 selected provider credential. GitHub, SSH, and git publication credentials are
 hard-denied; branch/PR publication goes through the durable broker.
@@ -230,11 +234,13 @@ module requires placing it in the appropriate tier and explaining it here.
 `adapters/agent_runner.py`, `adapters/app_token.py`,
 `adapters/child_env.py`, `adapters/claude_profile.py`,
 `adapters/codex_hook.py`, `adapters/codex_runner.py`,
-`adapters/control_store.py`, `adapters/effects.py`,
+`adapters/control_path.py`, `adapters/control_store.py`,
+`adapters/effects.py`,
 `adapters/env_file.py`, `adapters/event_log.py`, `adapters/github.py`,
 `adapters/governor.py`, `adapters/handover.py`,
 `adapters/heartbeat.py`, `adapters/journal.py`,
-`adapters/process_supervisor.py`, `adapters/reload.py`,
+`adapters/operator_effects.py`, `adapters/process_supervisor.py`,
+`adapters/reload.py`,
 `adapters/runtime_plan.py`, `adapters/single_instance.py`,
 `adapters/spend_recovery.py`, `adapters/store.py`,
 `adapters/supervised_exec.py`, `adapters/systemd_notify.py`,

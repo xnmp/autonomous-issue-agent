@@ -988,3 +988,51 @@ def test_report_tells_you_a_red_suite_blocks_the_fixer(capsys):
     cli.report_test_cmd_check("pytest", cli.TestCmdCheck(exit_code=1, seconds=3.0))
     combined = "".join(capsys.readouterr())
     assert "denies every push" in combined
+
+
+def test_ready_routes_operator_label_through_durable_effects(
+    monkeypatch, capsys
+):
+    calls = []
+
+    class Effects:
+        def set_issue_labels(self, issue, *, add=(), remove=()):
+            calls.append((issue, add, remove))
+            return True, "ok"
+
+    monkeypatch.setattr(cli, "detect_target_dir", lambda _cwd: "/repo")
+    monkeypatch.setattr(cli, "resolve_name", lambda *_args, **_kwargs: "demo")
+    monkeypatch.setattr(cli, "_operator_effects", lambda *_args: Effects())
+    args = argparse.Namespace(repo="o/r", issues=["9"])
+
+    assert cli.cmd_ready(args) == 0
+    assert calls == [(9, ("ai-ready",), ())]
+    assert "#9" in capsys.readouterr().out
+
+
+def test_remote_bootstrap_uses_effect_commands_for_every_requested_write(
+    monkeypatch,
+):
+    labels = []
+    auto_merge = []
+
+    class Effects:
+        def ensure_label(self, label, **_kwargs):
+            labels.append(label)
+            return True, "ok"
+
+        def set_repository_auto_merge(self, enabled):
+            auto_merge.append(enabled)
+            return True, "ok"
+
+    monkeypatch.setattr(cli, "_operator_effects", lambda *_args: Effects())
+    args = argparse.Namespace(
+        repo="o/r",
+        name="demo",
+        skip_labels=False,
+        ensure_auto_merge=True,
+    )
+
+    assert cli.cmd_prepare_remote(args) == 0
+    assert tuple(labels) == cli.REMOTE_LABELS
+    assert auto_merge == [True]

@@ -17,7 +17,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
-import tempfile
 import threading
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -33,6 +32,7 @@ from ..adapters.control_store import (
     LegacySpendMigrationError,
     SQLiteControlStore,
 )
+from ..adapters.control_path import control_store_path
 from ..adapters.effects import GitHubEffectExecutor
 from ..adapters.accounting_runtime import AccountingRuntime
 from ..adapters.event_log import EventLog
@@ -165,20 +165,10 @@ def _control_store(
 
 
 def _control_store_path(cfg: HarnessConfig, state_dir: str) -> str:
-    configured = tuple(
-        os.path.abspath(path)
-        for path in (
-            cfg.state_dir,
-            cfg.review_state_dir,
-            cfg.steward_state_dir,
-        )
-        if path
+    return control_store_path(
+        (cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir),
+        fallback_state_dir=state_dir,
     )
-    common = os.path.commonpath(configured) if configured else ""
-    if not common or common == os.path.sep:
-        common = os.path.dirname(os.path.abspath(state_dir)) if state_dir else ""
-    effective = common or tempfile.mkdtemp(prefix="issue-agent-control-")
-    return os.path.join(effective, "issue-agent-control", "control.db")
 
 
 def migrate_legacy_spend(cfg: HarnessConfig, state_dir: str) -> int:
@@ -378,7 +368,21 @@ def _force_kill(state_dir: str) -> Callable[[], object]:
     from ..adapters.process_supervisor import ProcessSupervisor
 
     supervisor = ProcessSupervisor(state_dir)
-    return supervisor.recover_orphans
+    return supervisor.force_kill_all
+
+
+def _shutdown_finalize(
+    control: SQLiteControlStore,
+    effects: EffectRecovery,
+) -> Callable[[], object]:
+    """Flush committed remote effects/outbox without replaying boot recovery."""
+
+    def finalize() -> object:
+        drained = effects.drain_pending_commands()
+        control.flush_bound_outbox()
+        return drained
+
+    return finalize
 
 
 def _reported_world(
@@ -1756,7 +1760,7 @@ def build_fix_daemon(
         dispatch_rejected=reservations.finish,
         heartbeat_path=os.path.join(cfg.state_dir, "heartbeat.json"),
         recover=recovery,
-        finalize=recovery,
+        finalize=_shutdown_finalize(control, effect_executor),
     )
     daemon_ref["daemon"] = daemon
     return daemon
@@ -1927,7 +1931,8 @@ def build_review_daemon(
                   heartbeat_path=os.path.join(
                       cfg.review_state_dir, "heartbeat.json"
                   ),
-                  recover=recovery, finalize=recovery)
+                  recover=recovery,
+                  finalize=_shutdown_finalize(control, effect_executor))
 
 
 _CODEOWNERS_PATHS = ("CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS")
@@ -2147,4 +2152,5 @@ def build_steward_daemon(
                   heartbeat_path=os.path.join(
                       cfg.steward_state_dir, "heartbeat.json"
                   ),
-                  recover=recovery, finalize=recovery)
+                  recover=recovery,
+                  finalize=_shutdown_finalize(control, effect_executor))

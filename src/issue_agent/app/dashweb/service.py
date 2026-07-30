@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ...adapters.dashweb import actions, costchart, ghdata, system, usage, verification
 from ...adapters.journal import default_ledger_path
+from ...adapters.operator_effects import build_operator_effects
 from ...domain import dashboard as dash
 from .. import cli
 from . import snapshots
@@ -27,6 +28,7 @@ class Backend:
         now_fn=None,
         stale_after_s: float = dash.STALE_AFTER_S,
         snapshot_ttl_s: float = 3.0,
+        effects_factory=build_operator_effects,
     ):
         self.harness_root = harness_root or cli.HARNESS_ROOT
         self.gh = gh or ghdata.GhReader()
@@ -39,6 +41,7 @@ class Backend:
         # the daemons themselves tick every 20s.
         self._snapshots = ghdata.TtlCache(ttl_s=snapshot_ttl_s)
         self._self_repo = system.remote_repo(self.harness_root)
+        self.effects_factory = effects_factory
 
     # ── journal side ──
     def names(self) -> tuple[str, ...]:
@@ -291,7 +294,8 @@ class Backend:
         repo = self.overlay_field(name, "REPO")
         if not repo:
             return False, f"no REPO configured for deployment '{name}'"
-        return actions.run_label_commands([actions.promote_command(repo, number)])
+        effects = self._operator_effects(name, repo)
+        return effects.set_issue_labels(number, add=("ai-ready",))
 
     def priority(self, name: str, number: int, priority: str | None) -> tuple[bool, str]:
         if not self.known(name):
@@ -299,8 +303,31 @@ class Backend:
         repo = self.overlay_field(name, "REPO")
         if not repo:
             return False, f"no REPO configured for deployment '{name}'"
-        return actions.run_label_commands(
-            actions.priority_commands(repo, number, priority)
+        effects = self._operator_effects(name, repo)
+        if priority:
+            ensured, detail = effects.ensure_label(
+                priority,
+                color=actions.PRIORITY_COLORS[priority],
+                description=f"harness priority {priority}",
+            )
+            if not ensured:
+                return False, detail
+        add, remove = actions.priority_change(priority)
+        return effects.set_issue_labels(
+            number,
+            add=add,
+            remove=remove,
+        )
+
+    def _operator_effects(self, name: str, repo: str):
+        state_dirs = tuple(
+            self.overlay_field(name, field)
+            for field in ("STATE_DIR", "REVIEW_STATE_DIR", "STEWARD_STATE_DIR")
+        )
+        return self.effects_factory(
+            repo,
+            state_dirs,
+            identity=f"{repo}:dashboard",
         )
 
 

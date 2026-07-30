@@ -232,6 +232,11 @@ class CommandKind(str, Enum):
     SUBMIT_REVIEW = "submit_review"
     PUBLISH_BRANCH = "publish_branch"
     OPEN_PULL_REQUEST = "open_pull_request"
+    ENSURE_LABEL = "ensure_label"
+    SET_ISSUE_LABELS = "set_issue_labels"
+    SET_REPOSITORY_AUTO_MERGE = "set_repository_auto_merge"
+    DELETE_RELAY_HOOK = "delete_relay_hook"
+    START_RELAY_FORWARD = "start_relay_forward"
 
 
 @dataclass(frozen=True)

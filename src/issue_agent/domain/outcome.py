@@ -117,6 +117,7 @@ class ExitReason(str, Enum):
     WALL_TIMEOUT = "wall_timeout"          # total runtime exceeded the wall cap
     KILLED_EXTERNALLY = "killed_externally"  # SIGKILL from outside (OOM, operator)
     TRANSPORT_DEATH = "transport_death"    # stream/gateway died before any result
+    OPERATOR_CANCELLED = "operator_cancelled"  # orderly daemon/operator teardown
     NO_RESULT = "no_result"                # stream ended cleanly, no ResultMessage
 
 

@@ -170,6 +170,14 @@ class ProcessSupervisor:
         self.unregister(run_id)
 
     def recover_orphans(self) -> tuple[RunId, ...]:
+        return self._reap_registered(self.grace_seconds)
+
+    def force_kill_all(self) -> tuple[RunId, ...]:
+        """Reap every owned process immediately at the application deadline."""
+
+        return self._reap_registered(0.0)
+
+    def _reap_registered(self, grace_seconds: float) -> tuple[RunId, ...]:
         recovered: list[RunId] = []
         for path in (
             sorted(self.directory.glob("*.json"))
@@ -182,7 +190,7 @@ class ProcessSupervisor:
                 # Quarantine it instead of guessing a process id.
                 path.rename(path.with_suffix(".invalid"))
                 continue
-            self._terminate(registration, self.grace_seconds)
+            self._terminate(registration, grace_seconds)
             recovered.append(registration.run_id)
             try:
                 path.unlink()
@@ -197,7 +205,7 @@ class ProcessSupervisor:
             if run_id is None:
                 path.rename(path.with_suffix(".invalid"))
                 continue
-            self._terminate_identities(identities, self.grace_seconds)
+            self._terminate_identities(identities, grace_seconds)
             recovered.append(run_id)
             try:
                 path.unlink()

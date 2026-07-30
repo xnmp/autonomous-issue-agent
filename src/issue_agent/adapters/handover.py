@@ -31,8 +31,12 @@ _MAX_TASK_BYTES = 24 * 1024
 _MAX_SUMMARY_BYTES = 4 * 1024
 _MAX_SESSION_BYTES = 512
 _GIT_TIMEOUT_SECONDS = 5
-_DEADLY_CEILINGS = frozenset(
-    (ExitReason.BUDGET_EXHAUSTED, ExitReason.WALL_TIMEOUT)
+_HANDOVER_TRIGGERS = frozenset(
+    (
+        ExitReason.BUDGET_EXHAUSTED,
+        ExitReason.WALL_TIMEOUT,
+        ExitReason.OPERATOR_CANCELLED,
+    )
 )
 _SCOPE_LINE = re.compile(r"^<!-- issue-agent-handover role=(\w+) issue=(\d+) -->$")
 
@@ -116,13 +120,13 @@ def with_previous_handover(task: RuntimePlan, scope: HandoverScope) -> PreparedT
 def write_exhaustion_handover(
     task: RuntimePlan, result: AgentResult, scope: HandoverScope
 ) -> HandoverReceipt | None:
-    """Write a bounded repository snapshot for budget and wall-clock deaths.
+    """Write a bounded repository snapshot for interrupted resumable work.
 
     This is deterministic post-mortem synthesis: no extra model invocation and
     therefore no grace spend. All inspection and writes are bounded and
     fail-soft; callers always return the original terminal result.
     """
-    if not scope.eligible or result.exit_reason not in _DEADLY_CEILINGS:
+    if not scope.eligible or result.exit_reason not in _HANDOVER_TRIGGERS:
         return None
     path = _handover_path(task, scope)
     if path is None:
@@ -205,9 +209,9 @@ def _render_handover(
     trigger = result.exit_reason.value if result.exit_reason else "unknown"
     return (
         f"<!-- issue-agent-handover role={scope.role} issue={scope.issue} -->\n"
-        "# Exhausted-leg handover\n\n"
-        "Generated as a bounded post-mortem snapshot after an agent ceiling ended "
-        "the leg. Treat this as historical context; the current task and repository "
+        "# Interrupted-leg handover\n\n"
+        "Generated as a bounded post-mortem snapshot after the leg ended before "
+        "normal completion. Treat this as historical context; the current task and repository "
         "instructions remain authoritative.\n\n"
         f"- Trigger: `{trigger}`\n"
         f"- Session: `{session}`\n"

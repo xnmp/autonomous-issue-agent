@@ -86,6 +86,7 @@ def test_agent_side_reasons_are_not_infra_deaths():
     assert infra_death(ExitReason.OK) is False
     assert infra_death(ExitReason.AGENT_ERROR) is False
     assert infra_death(ExitReason.BUDGET_EXHAUSTED) is False
+    assert infra_death(ExitReason.OPERATOR_CANCELLED) is False
     assert infra_death(ExitReason.NO_RESULT) is False
 
 

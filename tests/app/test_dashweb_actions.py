@@ -9,6 +9,7 @@ edit so a half-applied change cannot leave an issue with no priority at all.
 import pytest
 
 from issue_agent.adapters.dashweb import actions, costchart
+from issue_agent.app.dashweb import service
 
 
 # ── start ─────────────────────────────────────────────────────────────────────
@@ -42,54 +43,77 @@ def test_launch_failure_is_reported_not_raised(tmp_path):
     assert ok is False and "launch" in detail
 
 
-# ── promote ───────────────────────────────────────────────────────────────────
-def test_promote_adds_ai_ready_to_the_target_repos_issue():
-    assert actions.promote_command("o/r", 9) == [
-        "gh", "issue", "edit", "9", "-R", "o/r", "--add-label", "ai-ready"
-    ]
-
-
 # ── priority ──────────────────────────────────────────────────────────────────
-def test_setting_a_priority_creates_the_label_then_swaps_in_one_edit():
-    create, edit = actions.priority_commands("o/r", 9, "P2")
-    assert create[:4] == ["gh", "label", "create", "P2"]
-    assert edit[:6] == ["gh", "issue", "edit", "9", "-R", "o/r"]
-    assert edit[6:] == ["--remove-label", "P1", "--remove-label", "P3", "--add-label", "P2"]
+def test_setting_a_priority_is_one_atomic_label_intent():
+    add, remove = actions.priority_change("P2")
+    assert add == ("P2",)
+    assert remove == ("P1", "P3")
 
 
 def test_clearing_a_priority_removes_all_three_and_creates_nothing():
-    commands = actions.priority_commands("o/r", 9, None)
-    assert len(commands) == 1
-    assert commands[0][6:] == [
-        "--remove-label", "P1", "--remove-label", "P2", "--remove-label", "P3"
-    ]
+    add, remove = actions.priority_change(None)
+    assert add == ()
+    assert remove == ("P1", "P2", "P3")
 
 
 def test_an_unknown_priority_is_rejected_before_any_command_is_built():
     with pytest.raises(ValueError):
-        actions.priority_commands("o/r", 9, "P9")
+        actions.priority_change("P9")
 
 
-def test_an_existing_label_error_is_not_fatal_but_the_edit_failing_is():
+def test_dashboard_label_actions_use_the_durable_operator_effect_port(
+    monkeypatch,
+):
     calls = []
 
-    def run(argv):
-        calls.append(argv)
-        return (1, "label already exists") if argv[1] == "label" else (0, "")
+    class Effects:
+        def ensure_label(self, label, **kwargs):
+            calls.append(("ensure", label, kwargs))
+            return True, "ok"
 
-    ok, _detail = actions.run_label_commands(actions.priority_commands("o/r", 9, "P1"), run)
-    assert ok and len(calls) == 2
+        def set_issue_labels(self, issue, *, add=(), remove=()):
+            calls.append(("set", issue, add, remove))
+            return True, "ok"
 
+    factory_calls = []
 
-def test_the_final_commands_failure_is_reported_to_the_operator():
-    ok, detail = actions.run_label_commands([["gh", "issue", "edit"]],
-                                            lambda argv: (1, "no such issue"))
-    assert ok is False and detail == "no such issue"
+    def factory(repo, state_dirs, *, identity):
+        factory_calls.append((repo, state_dirs, identity))
+        return Effects()
 
+    monkeypatch.setattr(service.system, "remote_repo", lambda _root: "harness/repo")
+    backend = service.Backend(effects_factory=factory)
+    monkeypatch.setattr(backend, "known", lambda _name: True)
+    values = {
+        "REPO": "o/r",
+        "STATE_DIR": "/state/fix",
+        "REVIEW_STATE_DIR": "/state/review",
+        "STEWARD_STATE_DIR": "/state/steward",
+    }
+    monkeypatch.setattr(
+        backend,
+        "overlay_field",
+        lambda _name, field: values[field],
+    )
 
-def test_running_a_missing_binary_reports_it_rather_than_raising():
-    code, message = actions.run_command(["/nonexistent/binary"])
-    assert code == 127 and "installed" in message
+    assert backend.promote("demo", 9) == (True, "ok")
+    assert backend.priority("demo", 9, "P2") == (True, "ok")
+
+    assert factory_calls == [
+        (
+            "o/r",
+            ("/state/fix", "/state/review", "/state/steward"),
+            "o/r:dashboard",
+        ),
+        (
+            "o/r",
+            ("/state/fix", "/state/review", "/state/steward"),
+            "o/r:dashboard",
+        ),
+    ]
+    assert calls[0] == ("set", 9, ("ai-ready",), ())
+    assert calls[1][0:2] == ("ensure", "P2")
+    assert calls[2] == ("set", 9, ("P2",), ("P1", "P3"))
 
 
 # ── cost chart ────────────────────────────────────────────────────────────────

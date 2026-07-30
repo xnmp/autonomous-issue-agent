@@ -29,6 +29,7 @@ import time
 from dataclasses import dataclass
 
 from ..adapters.env_file import source_env_file
+from ..adapters.operator_effects import build_operator_effects
 
 # HARNESS_ROOT: …/src/issue_agent/app/cli.py → repo root. Same walk main.py uses.
 # This is what makes the CLI checkout-resident: plugin/ + config/ are siblings.
@@ -1259,15 +1260,22 @@ def _label_issues(args, label: str) -> int:
     if not repo:
         err("could not detect the repo. Pass --repo owner/name.")
         return 2
+    target_dir = detect_target_dir(os.getcwd())
+    name = resolve_name(repo, target_dir=target_dir)
+    effects = _operator_effects(repo, name, "cli")
     rc = 0
     for n in args.issues:
-        r = subprocess.run(
-            ["gh", "issue", "edit", str(n), "-R", repo, "--add-label", label]
-        )
-        if r.returncode == 0:
+        try:
+            number = int(n)
+        except ValueError:
+            err(f"invalid issue number {n!r}")
+            rc = 1
+            continue
+        applied, detail = effects.set_issue_labels(number, add=(label,))
+        if applied:
             ok(f"#{n} → {label}")
         else:
-            err(f"failed to label #{n}")
+            err(f"failed to label #{n}: {detail}")
             rc = 1
     return rc
 
@@ -1278,6 +1286,92 @@ def cmd_ready(args) -> int:
 
 def cmd_triage(args) -> int:
     return _label_issues(args, "ai-triage")
+
+
+REMOTE_LABELS = (
+    "ai-triage",
+    "ai-ready",
+    "ai-working",
+    "ai-blocked",
+    "ai-pr-open",
+    "ai-done",
+    "ai-suggestion",
+    "maybe-resolved",
+    "needs-budget-review",
+    "trivial",
+    "minor",
+    "major",
+    "needs-human-review",
+    "needs-design",
+    "invariant",
+    "recurrence",
+    "P1",
+    "P2",
+    "P3",
+    "harness",
+)
+
+
+def _operator_effects(repo: str, name: str, channel: str):
+    overlay = os.path.join(REPOS_DIR, f"{name}.env")
+    fields = _source_env_file(overlay)
+    state_dirs = tuple(
+        fields.get(key, "")
+        for key in ("STATE_DIR", "REVIEW_STATE_DIR", "STEWARD_STATE_DIR")
+    )
+    if not any(state_dirs):
+        state_dirs = (
+            os.path.expanduser(f"~/.local/state/issue-agent-{name}"),
+            os.path.expanduser(f"~/.local/state/review-agent-{name}"),
+            os.path.expanduser(f"~/.local/state/steward-agent-{name}"),
+        )
+    return build_operator_effects(
+        repo,
+        state_dirs,
+        identity=f"{repo}:operator:{channel}",
+    )
+
+
+def cmd_prepare_remote(args) -> int:
+    """Durably provision the remote prerequisites used by point-at."""
+
+    effects = _operator_effects(args.repo, args.name, "bootstrap")
+    failures = []
+    if not args.skip_labels:
+        for label in REMOTE_LABELS:
+            applied, detail = effects.ensure_label(
+                label,
+                color={"P1": "b60205", "P2": "d93f0b", "P3": "fbca04"}.get(
+                    label, "ededed"
+                ),
+                description=(
+                    f"harness priority {label}"
+                    if label in {"P1", "P2", "P3"}
+                    else ""
+                ),
+            )
+            if not applied:
+                failures.append(f"label {label}: {detail}")
+    if args.ensure_auto_merge:
+        applied, detail = effects.set_repository_auto_merge(True)
+        if not applied:
+            failures.append(f"allow_auto_merge: {detail}")
+    if failures:
+        for failure in failures:
+            err(f"remote preparation failed — {failure}")
+        return 1
+    ok("remote lifecycle labels and repository settings verified")
+    return 0
+
+
+def cmd_publish_base_branch(args) -> int:
+    effects = _operator_effects(args.repo, args.name, "bootstrap")
+    applied, detail = effects.publish_base_branch(args.target_dir, args.branch)
+    if not applied:
+        err(f"failed to publish base branch: {detail}")
+        return 1
+    ok(f"published origin/{args.branch} with a durable effect receipt")
+    return 0
 
 
 def cmd_install_service(args) -> int:
@@ -1478,6 +1572,20 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("issues", nargs="+", help="issue number(s)")
     sp.add_argument("--repo", default="", help="owner/name (default: auto-detect)")
     sp.set_defaults(func=cmd_triage)
+
+    sp = sub.add_parser("prepare-remote", help=argparse.SUPPRESS)
+    sp.add_argument("--repo", required=True)
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--ensure-auto-merge", action="store_true")
+    sp.add_argument("--skip-labels", action="store_true")
+    sp.set_defaults(func=cmd_prepare_remote)
+
+    sp = sub.add_parser("publish-base-branch", help=argparse.SUPPRESS)
+    sp.add_argument("--repo", required=True)
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--target-dir", required=True)
+    sp.add_argument("--branch", required=True)
+    sp.set_defaults(func=cmd_publish_base_branch)
 
     sp = sub.add_parser("install-service", help="install the OS service units (launchd/systemd)")
     add_context_flags(sp)

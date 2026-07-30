@@ -2,15 +2,15 @@
 
 Status: Accepted
 Date: 2026-07-30
-Governs: src/issue_agent/adapters/effects.py src/issue_agent/domain/trust.py src/issue_agent/domain/gate.py plugin/hooks/
+Governs: src/issue_agent/adapters/effects.py src/issue_agent/adapters/operator_effects.py src/issue_agent/domain/trust.py src/issue_agent/domain/gate.py plugin/hooks/
 
 ## Decision
 
 Agent prompts, repository text, CI output, and agent-written files are
 untrusted claims. They are encoded through `adapters/untrusted.py`; they never
 directly authorize publication. GitHub mutations are represented as durable,
-idempotency-keyed `LifecycleCommand`s and executed by the narrow effects
-adapter. An unknown remote outcome is reconciled before retry.
+idempotency-keyed `LifecycleCommand`s and executed by the narrow daemon or
+operator effects adapter. An unknown remote outcome is reconciled before retry.
 Commands carry an exact repository and executor-role identity. The shared
 control store exposes pending work only to that scope. Publication commands
 also capture the prior remote revision; a remote value that is neither the

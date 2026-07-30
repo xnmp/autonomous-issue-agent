@@ -88,6 +88,26 @@ def test_boot_recovery_kills_all_valid_registered_groups(tmp_path) -> None:
         _wait_dead(process)
 
 
+def test_shutdown_force_kill_does_not_spend_the_boot_recovery_grace_per_group(
+    tmp_path,
+) -> None:
+    processes = [
+        subprocess.Popen(["sleep", "30"], start_new_session=True)
+        for _ in range(2)
+    ]
+    supervisor = ProcessSupervisor(str(tmp_path), grace_seconds=10)
+    for index, process in enumerate(processes):
+        supervisor.register(RunId(f"forced-{index}"), os.getpgid(process.pid))
+
+    started = time.monotonic()
+    reaped = supervisor.force_kill_all()
+
+    assert reaped == (RunId("forced-0"), RunId("forced-1"))
+    assert time.monotonic() - started < 1
+    for process in processes:
+        _wait_dead(process)
+
+
 def test_malformed_registration_is_quarantined_without_signalling(tmp_path) -> None:
     directory = tmp_path / "process-groups"
     directory.mkdir()

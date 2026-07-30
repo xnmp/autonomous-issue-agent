@@ -23,6 +23,7 @@ import os
 import subprocess
 import sys
 
+from ..adapters.operator_effects import build_operator_effects
 from ..adapters.wake import touch_wake, wake_path
 from ..adapters.single_instance import AlreadyRunning, UnsafeLockFile, acquire
 from .config import from_env
@@ -41,42 +42,12 @@ def _log(msg: str) -> None:
     sys.stderr.flush()
 
 
-def forward_command(repo: str, events: str) -> list[str]:
-    return ["gh", "webhook", "forward", f"--repo={repo}", f"--events={events}"]
-
-
-def gc_dangling_hooks(repo: str, gh_run=subprocess.run) -> None:
-    """Delete leftover `name:"cli"` relay hooks on the target repo.
-
-    `gh webhook forward` POSTs a brand-new "cli" hook to `repos/<repo>/hooks`
-    on EVERY invocation and never deletes it (cli/gh-webhook has no teardown),
-    so the supervisor's restart loop would accrete one active hook per
-    websocket drop until GitHub's per-repo cap 422s and push wake dies for
-    good — leaving the operator to hand-delete the relics. Running this before
-    each spawn bounds the leak at one live hook between restarts. "cli" hooks
-    exist ONLY as forward relays (repo webhooks are name "web"), so this can
-    never touch a real webhook; it WOULD cut off a second forwarder someone
-    runs by hand against the same repo, which is why it logs what it deleted.
-    Best-effort: a failed GC costs a dangling hook, never the forwarder."""
-    try:
-        res = gh_run(
-            ["gh", "api", f"repos/{repo}/hooks", "--paginate",
-             "--jq", '.[] | select(.name == "cli") | .id'],
-            capture_output=True, text=True, timeout=60,
-        )
-        ids = [ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()]
-        for hook_id in ids:
-            gh_run(
-                ["gh", "api", "-X", "DELETE", f"repos/{repo}/hooks/{hook_id}"],
-                capture_output=True, text=True, timeout=60,
-            )
-        if ids:
-            _log(f"deleted {len(ids)} dangling cli relay hook(s) on {repo}")
-    except Exception as exc:  # noqa: BLE001 - GC must never stop the forwarder
-        _log(f"relay-hook GC failed ({exc}) — continuing; a hook may dangle")
-
-
-def run(env: dict | None = None, spawn=subprocess.Popen, gh_run=subprocess.run) -> int:
+def run(
+    env: dict | None = None,
+    spawn=subprocess.Popen,
+    gh_run=subprocess.run,
+    effects_factory=build_operator_effects,
+) -> int:
     """Forward deliveries into wake touches until the child exits. Returns the
     exit status to propagate (never 0 — the forwarder is meant to run forever,
     so any return is a death the supervisor should restart)."""
@@ -113,20 +84,30 @@ def run(env: dict | None = None, spawn=subprocess.Popen, gh_run=subprocess.run) 
         if d
     ]
     try:
-        cmd = forward_command(cfg.repo, events)
-        gc_dangling_hooks(cfg.repo, gh_run)
+        state_dirs = tuple(
+            path
+            for path in (
+                cfg.state_dir,
+                cfg.review_state_dir,
+                cfg.steward_state_dir,
+            )
+            if path
+        )
         _log(f"forwarding {events} for {cfg.repo} → {len(wakes)} role wake files")
         try:
-            proc = spawn(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=None,
-                text=True,
-                bufsize=1,
+            effects = effects_factory(
+                cfg.repo,
+                state_dirs,
+                identity=f"{cfg.repo}:webhook",
+                run=gh_run,
             )
-        except OSError as exc:
+            proc = effects.start_relay_forward(
+                events,
+                spawn=spawn,
+            )
+        except Exception as exc:  # noqa: BLE001 - poll reconciliation stays live
             _log(
-                f"could not start `{' '.join(cmd)}`: {exc} — is the gh webhook "
+                f"could not start the durable relay forwarder: {exc} — is the gh webhook "
                 "extension installed (`gh extension install cli/gh-webhook`) and "
                 "does the token carry admin:repo_hook? Daemons continue at the "
                 "reconcile cadence."

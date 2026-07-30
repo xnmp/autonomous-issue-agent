@@ -7,6 +7,7 @@ inspectable and migratable; this module intentionally exposes no legacy writer.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import contextvars
 import json
@@ -568,28 +569,43 @@ class JournalingRuntime:
         try:
             result = await self.inner.run(prepared.task)
         except BaseException as exc:  # noqa: BLE001 — recorded, never handled
-            # BaseException, not Exception: a cancellation or Ctrl-C mid-run
-            # leaves exactly the same requeue-and-re-dispatch signature, so it
-            # deserves the same receipt. The bare `raise` preserves the
-            # exception object and its traceback verbatim.
+            # BaseException, not Exception: cancellation and Ctrl-C must also
+            # settle the started run. They receive an operator-cancelled
+            # handover rather than consuming an infrastructure-death life. The
+            # bare `raise` preserves the exception and traceback verbatim.
+            operator_cancelled = isinstance(
+                exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+            )
             error = f"{type(exc).__name__}: {str(exc)[:200]}"
-            # A death the INPUT causes gets its own journal shape (#13): the
-            # `transport_death` exit_reason is shared with the stochastic kind,
-            # so without these fields the ledger cannot tell the loop that will
-            # never converge from the one a retry rescues.
-            det = deterministic_death(
-                f"{type(exc).__name__}: {exc}",
-                str(getattr(exc, "harness_last_trace", "") or ""),
+            # A transport death the INPUT causes gets its own journal shape
+            # (#13), so the ledger can distinguish it from a stochastic death.
+            det = (
+                None
+                if operator_cancelled
+                else deterministic_death(
+                    f"{type(exc).__name__}: {exc}",
+                    str(getattr(exc, "harness_last_trace", "") or ""),
+                )
+            )
+            terminal = AgentResult(
+                is_error=True,
+                status="cancelled" if operator_cancelled else "raised",
+                cost_usd=0.0,
+                model=str(getattr(exc, "harness_resolved_model", "") or ""),
+                exit_reason=(
+                    ExitReason.OPERATOR_CANCELLED
+                    if operator_cancelled
+                    else ExitReason.TRANSPORT_DEATH
+                ),
+            )
+            receipt = (
+                write_exhaustion_handover(task, terminal, scope)
+                if operator_cancelled
+                else None
             )
             self._record(
                 task,
-                AgentResult(
-                    is_error=True,
-                    status="raised",
-                    cost_usd=0.0,
-                    model=str(getattr(exc, "harness_resolved_model", "") or ""),
-                    exit_reason=ExitReason.TRANSPORT_DEATH,
-                ),
+                terminal,
                 time.monotonic() - t0,
                 run_id=run_id,
                 leg_id=leg_id,
@@ -597,6 +613,14 @@ class JournalingRuntime:
                 deterministic=(det.signature if det else None),
                 detail=((det.path or None) if det else None),
             )
+            if receipt is not None:
+                ctx = self.context
+                self.journal.emit(
+                    TelemetryEvent(
+                        HandoverWritten(receipt.trigger, receipt.byte_size),
+                        _run_correlation(ctx, run_id, leg_id),
+                    )
+                )
             raise
         duration_s = time.monotonic() - t0
         deferred = self._deferred_route_receipt.get()

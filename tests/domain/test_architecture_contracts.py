@@ -4,12 +4,21 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).parents[2]
 DOMAIN = ROOT / "src" / "issue_agent" / "domain"
 APP = ROOT / "src" / "issue_agent" / "app"
 PLUGIN = ROOT / "plugin"
+PRIVILEGED_EFFECT_ADAPTERS = frozenset(
+    {
+        Path("src/issue_agent/adapters/agent_publish.py"),
+        Path("src/issue_agent/adapters/effects.py"),
+        Path("src/issue_agent/adapters/github.py"),
+        Path("src/issue_agent/adapters/operator_effects.py"),
+    }
+)
 
 REMOTE_WRITES = frozenset(
     {
@@ -110,6 +119,69 @@ def test_app_gateway_usage_is_read_only() -> None:
                     f"{path.relative_to(ROOT)}:{node.lineno} "
                     f"{receiver}.{node.func.attr}"
                 )
+    assert violations == []
+
+
+def _literal_argv(node: ast.List | ast.Tuple) -> tuple[str, ...]:
+    values = []
+    for item in node.elts:
+        if not isinstance(item, ast.Constant) or not isinstance(item.value, str):
+            break
+        values.append(item.value)
+    return tuple(values)
+
+
+def _is_remote_mutation(argv: tuple[str, ...]) -> bool:
+    if argv[:3] in {
+        ("gh", "issue", "edit"),
+        ("gh", "label", "create"),
+        ("gh", "webhook", "forward"),
+    }:
+        return True
+    if argv[:2] == ("git", "push"):
+        return True
+    return (
+        argv[:2] == ("gh", "api")
+        and "-X" in argv
+        and any(method in argv for method in ("POST", "PATCH", "PUT", "DELETE"))
+    )
+
+
+def test_remote_cli_mutations_live_only_in_privileged_effect_adapters() -> None:
+    assert _is_remote_mutation(("gh", "issue", "edit", "1"))
+    assert _is_remote_mutation(("gh", "api", "-X", "DELETE", "repos/o/r/hooks/1"))
+    assert _is_remote_mutation(("git", "push", "origin", "branch"))
+    violations: list[str] = []
+    roots = (
+        ROOT / "src" / "issue_agent" / "app",
+        ROOT / "src" / "issue_agent" / "adapters",
+    )
+    for root in roots:
+        for path in _python_files(root):
+            relative = path.relative_to(ROOT)
+            if relative in PRIVILEGED_EFFECT_ADAPTERS:
+                continue
+            tree = ast.parse(path.read_text(), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.List, ast.Tuple)):
+                    continue
+                argv = _literal_argv(node)
+                if _is_remote_mutation(argv):
+                    violations.append(f"{relative}:{node.lineno} {' '.join(argv)}")
+    command = re.compile(
+        r"\b(gh\s+(?:issue\s+edit|label\s+create|"
+        r"webhook\s+forward|api\s+-X\s+(?:POST|PATCH|PUT|DELETE))|git\s+push)\b"
+    )
+    for directory in (ROOT / "bin", ROOT / "plugin"):
+        for path in sorted(directory.rglob("*.sh")):
+            for lineno, line in enumerate(path.read_text().splitlines(), 1):
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                if command.search(stripped):
+                    violations.append(
+                        f"{path.relative_to(ROOT)}:{lineno} {stripped}"
+                    )
     assert violations == []
 
 

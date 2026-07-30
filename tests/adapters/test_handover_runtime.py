@@ -24,6 +24,11 @@ class RecordingRuntime:
         return self.result
 
 
+class CancellingRuntime:
+    async def run(self, _task: RuntimePlan) -> AgentResult:
+        raise asyncio.CancelledError()
+
+
 def _git(repo: Path, *args: str) -> None:
     subprocess.run(
         ["git", *args],
@@ -124,6 +129,38 @@ def test_deadly_ceiling_writes_repository_handover_and_journals_receipt(
     ).stdout
     assert ".harness" not in status
     assert ".harness" not in changed
+
+
+def test_operator_cancellation_writes_state_handover_before_re_raising(
+    tmp_path: Path,
+) -> None:
+    repo = _worktree(tmp_path)
+    state = tmp_path / "state"
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    runtime = JournalingRuntime(
+        CancellingRuntime(),
+        journal,
+        repo="xnmp/repo",
+        role="fix",
+        state_dir=str(state),
+    )
+    runtime.set_context("fix", "RESOLVE", 82, 82)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            runtime.run(RuntimePlan(prompt="Resolve issue #82", cwd=str(repo)))
+        )
+
+    handover = (state / "handovers" / "issue-82.md").read_text()
+    assert "Trigger: `operator_cancelled`" in handover
+    events = read_events(journal.path)
+    settled = next(event for event in events if event["event"] == "agent_run")
+    assert settled["status"] == "cancelled"
+    assert settled["exit_reason"] == "operator_cancelled"
+    receipt = next(
+        event for event in events if event["event"] == "handover_written"
+    )
+    assert receipt["trigger"] == "operator_cancelled"
 
 
 def test_matching_handover_is_delivered_once_as_untrusted_context(tmp_path: Path) -> None:

@@ -368,8 +368,63 @@ def test_shutdown_deadline_forces_process_teardown_and_exits_transient():
     assert started.is_set()
     assert stopped.value.code is ExitCode.TRANSIENT
     assert forced == [True]
+    assert daemon.requires_hard_exit is True
     release.set()
     daemon.wait_for_dispatches()
+
+
+def test_shutdown_reconciles_before_force_killing_remaining_processes():
+    from issue_agent.domain.actions import AgentKind, RunAgent
+
+    release = threading.Event()
+    order = []
+
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _world: [RunAgent(AgentKind.RESOLVE, 7)],
+        Executor(
+            FakeGateway(),
+            run_agent=lambda _action: release.wait(timeout=5),
+        ),
+        poll_seconds=1,
+        dispatch_capacity=1,
+        shutdown_timeout_seconds=0.1,
+        finalize=lambda: order.append("reconcile"),
+        force_kill_dispatches=lambda: order.append("kill"),
+    )
+
+    with pytest.raises(SystemExit):
+        daemon.run_forever(
+            sleep=lambda _seconds: None,
+            now=lambda: 0,
+            max_ticks=1,
+        )
+
+    assert order == ["reconcile", "kill"]
+    release.set()
+    daemon.wait_for_dispatches()
+
+
+def test_application_shutdown_deadline_fits_inside_every_systemd_hard_stop():
+    from pathlib import Path
+    import re
+
+    from issue_agent.app.loop import DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
+
+    root = Path(__file__).parents[2]
+    units = tuple((root / "ops" / "systemd").glob("issue-agent-*.service"))
+    assert units
+    hard_stops = []
+    for path in units:
+        match = re.search(
+            r"^TimeoutStopSec=(\d+(?:\.\d+)?)$",
+            path.read_text(),
+            re.M,
+        )
+        assert match is not None
+        hard_stops.append(float(match.group(1)))
+    assert all(DEFAULT_SHUTDOWN_TIMEOUT_SECONDS + 5 < stop for stop in hard_stops)
 
 
 def test_interrupt_before_worker_registration_is_sticky():

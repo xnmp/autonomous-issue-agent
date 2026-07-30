@@ -50,6 +50,11 @@ def _ignore_log(_message: str) -> None:
     pass
 
 
+DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 80.0
+_SHUTDOWN_ESCALATION_RESERVE_SECONDS = 10.0
+_SHUTDOWN_FINALIZE_RESERVE_SECONDS = 5.0
+
+
 def order_for_execution(actions: list[Action]) -> list[Action]:
     """Cheap, terminal actions first; agent dispatches last (stable partition).
 
@@ -132,7 +137,9 @@ class Daemon:
     # Any dispatch that never reaches the runtime must release that lease here.
     dispatch_rejected: Callable[[RunAgent], None] | None = None
     heartbeat_path: str = ""
-    shutdown_timeout_seconds: float = 85.0
+    # Total application deadline, including forced teardown and reconciliation.
+    # The systemd hard stop is 90s, leaving 10s for interpreter/supervisor exit.
+    shutdown_timeout_seconds: float = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
     recover: Callable[[], object] | None = None
     finalize: Callable[[], object] | None = None
     _state: DaemonState = field(
@@ -151,6 +158,10 @@ class Daemon:
     _accept_dispatches: bool = field(default=True, init=False, repr=False)
     _dispatch_closed: bool = field(default=False, init=False, repr=False)
     _retry_after_seconds: float | None = field(default=None, init=False, repr=False)
+    _shutdown_deadline: float | None = field(default=None, init=False, repr=False)
+    _requires_hard_exit: bool = field(default=False, init=False, repr=False)
+    _finalized: bool = field(default=False, init=False, repr=False)
+    _finalize_clean: bool = field(default=True, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.dispatch_capacity < 0:
@@ -166,6 +177,12 @@ class Daemon:
     @property
     def state(self) -> DaemonState:
         return self._state
+
+    @property
+    def requires_hard_exit(self) -> bool:
+        """Whether bounded cleanup left threads that can block interpreter exit."""
+
+        return self._requires_hard_exit
 
     def _transition(self, state: DaemonState, reason: str = "") -> None:
         allowed = {
@@ -308,7 +325,11 @@ class Daemon:
         """
         pool = self._dispatch_pool
         if pool is None:
-            return True
+            return self._finalize()
+        if self._shutdown_deadline is None:
+            self._shutdown_deadline = (
+                time.monotonic() + self.shutdown_timeout_seconds
+            )
         with self._dispatch_lock:
             if self._dispatch_closed:
                 return not self._dispatches
@@ -321,25 +342,86 @@ class Daemon:
                 self.log(f"{self.name}: dispatch cancellation failed: {exc}")
         with self._dispatch_lock:
             pending = tuple(self._dispatches)
-        _done, unfinished = wait(pending, timeout=self.shutdown_timeout_seconds)
+        graceful_budget = max(
+            0.0,
+            self._remaining_shutdown_time()
+            - min(
+                _SHUTDOWN_ESCALATION_RESERVE_SECONDS,
+                self.shutdown_timeout_seconds * 0.5,
+            ),
+        )
+        _done, unfinished = wait(pending, timeout=graceful_budget)
         if unfinished:
             self.log(
                 f"{self.name}: shutdown deadline expired with "
                 f"{len(unfinished)} dispatch(es) still active"
             )
+            # Persist/reconcile already-started effects before destroying the
+            # process groups that may be carrying their final acknowledgements.
+            finalized = self._finalize(
+                reserve_seconds=min(
+                    _SHUTDOWN_FINALIZE_RESERVE_SECONDS,
+                    self.shutdown_timeout_seconds * 0.2,
+                )
+            )
             if self.force_kill_dispatches is not None:
-                try:
-                    self.force_kill_dispatches()
-                except Exception as exc:  # noqa: BLE001 - keep escalating shutdown
-                    self.log(
-                        f"{self.name}: forced process teardown failed: {exc}"
-                    )
+                self._bounded_shutdown_call(
+                    self.force_kill_dispatches,
+                    "forced process teardown",
+                    max_seconds=self._remaining_shutdown_time(),
+                )
                 _done, unfinished = wait(
                     unfinished,
-                    timeout=min(5.0, self.shutdown_timeout_seconds),
+                    timeout=self._remaining_shutdown_time(),
                 )
+        else:
+            finalized = self._finalize()
         pool.shutdown(wait=False, cancel_futures=cancel)
         if unfinished:
+            return False
+        return finalized
+
+    def _remaining_shutdown_time(self) -> float:
+        if self._shutdown_deadline is None:
+            return self.shutdown_timeout_seconds
+        return max(0.0, self._shutdown_deadline - time.monotonic())
+
+    def _bounded_shutdown_call(
+        self,
+        callback: Callable[[], object],
+        description: str,
+        *,
+        max_seconds: float | None = None,
+    ) -> bool:
+        budget = self._remaining_shutdown_time()
+        if max_seconds is not None:
+            budget = min(budget, max_seconds)
+        if budget <= 0:
+            self.log(f"{self.name}: no shutdown budget remains for {description}")
+            return False
+        completed = threading.Event()
+        failures: list[BaseException] = []
+
+        def invoke() -> None:
+            try:
+                callback()
+            except BaseException as exc:  # noqa: BLE001 - report after join
+                failures.append(exc)
+            finally:
+                completed.set()
+
+        worker = threading.Thread(
+            target=invoke,
+            name=f"{self.name}-shutdown-{description.replace(' ', '-')}",
+            daemon=True,
+        )
+        worker.start()
+        completed.wait(timeout=budget)
+        if not completed.is_set():
+            self.log(f"{self.name}: {description} exceeded the shutdown deadline")
+            return False
+        if failures:
+            self.log(f"{self.name}: {description} failed: {failures[0]}")
             return False
         return True
 
@@ -582,10 +664,10 @@ class Daemon:
                 self._sleep_interval(sleep, scheduler_progress)
             self._transition(DaemonState.DRAINING, "loop completed")
             clean = self.shutdown_dispatches(cancel=False)
-            clean = self._finalize() and clean
             self._transition(DaemonState.STOPPED)
             self._write_heartbeat()
             if not clean:
+                self._requires_hard_exit = True
                 raise SystemExit(ExitCode.TRANSIENT)
         except BaseException as exc:
             if self._state not in {DaemonState.DRAINING, DaemonState.STOPPED}:
@@ -593,22 +675,32 @@ class Daemon:
             clean = True
             if self._state is not DaemonState.STOPPED:
                 clean = self.shutdown_dispatches(cancel=True)
-                clean = self._finalize() and clean
                 self._transition(DaemonState.STOPPED)
             self._write_heartbeat()
             if not clean:
+                self._requires_hard_exit = True
                 raise SystemExit(ExitCode.TRANSIENT) from exc
             raise
 
-    def _finalize(self) -> bool:
+    def _finalize(self, *, reserve_seconds: float = 0.0) -> bool:
+        if self._finalized:
+            return self._finalize_clean
+        self._finalized = True
         if self.finalize is None:
             return True
-        try:
-            self.finalize()
-        except Exception as exc:  # noqa: BLE001 - shutdown must reach STOPPED
-            self.log(f"{self.name}: shutdown reconciliation failed: {exc}")
-            return False
-        return True
+        if self._shutdown_deadline is None:
+            self._shutdown_deadline = (
+                time.monotonic() + self.shutdown_timeout_seconds
+            )
+        self._finalize_clean = self._bounded_shutdown_call(
+            self.finalize,
+            "shutdown reconciliation",
+            max_seconds=max(
+                0.0,
+                self._remaining_shutdown_time() - reserve_seconds,
+            ),
+        )
+        return self._finalize_clean
 
     def _sleep_interval(
         self,
