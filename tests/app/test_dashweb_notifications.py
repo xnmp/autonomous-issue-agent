@@ -120,6 +120,24 @@ def test_agent_run_start_announces_each_new_dispatch():
             "issue": 7,
             "dispatch": "review-12",
         },
+        {
+            "ts": ts(3),
+            "event": "agent_run_start",
+            "role": "fix",
+            "kind": "PR_RESUME",
+            "number": 12,
+            "issue": 7,
+            "dispatch": "pr-resume-12",
+        },
+        {
+            "ts": ts(4),
+            "event": "agent_run_start",
+            "role": "steward",
+            "kind": "GROOM",
+            "number": 7,
+            "issue": 7,
+            "dispatch": "groom-7",
+        },
     ]
 
     notifications = snapshots.journal_notifications(rows_for(events))
@@ -127,9 +145,11 @@ def test_agent_run_start_announces_each_new_dispatch():
     assert [(item["title"], item["detail"]) for item in notifications] == [
         ("Issue #7 dispatched", "RESOLVE started"),
         ("Issue #7 dispatched", "REVIEW for PR #12 started"),
+        ("Issue #7 dispatched", "PR_RESUME for PR #12 started"),
+        ("Issue #7 dispatched", "GROOM started"),
     ]
     assert all(item["severity"] == "info" for item in notifications)
-    assert len({item["id"] for item in notifications}) == 2
+    assert len({item["id"] for item in notifications}) == 4
 
 
 def test_duplicate_dispatch_receipts_emit_one_notification():
