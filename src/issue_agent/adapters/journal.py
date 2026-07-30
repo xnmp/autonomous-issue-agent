@@ -21,6 +21,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
 from .runtime_plan import ContextualRuntime, RunIdentityRuntime, RuntimePlan
+from ..domain.contracts import Money
 from ..domain.events import (
     ActionApplied,
     ActionFailed,
@@ -739,7 +740,7 @@ class JournalingRuntime:
                         max(0, int(round(duration_s * 1000))),
                         str(route_fields.get("model") or probe_model),
                         self.runtime,
-                        max(0, int(round(cost * 1_000_000))),
+                        Money.from_major("USD", max(0.0, cost)).micros,
                         "USD",
                         (
                             "configured_rate_card"

@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
 from types import MappingProxyType
 from typing import Mapping, NewType
@@ -39,6 +40,28 @@ class Money:
     @classmethod
     def zero(cls, currency: str = "USD") -> Money:
         return cls(currency, 0)
+
+    @classmethod
+    def from_major(
+        cls,
+        currency: str,
+        amount: str | int | float | Decimal,
+    ) -> Money:
+        """Convert currency major units with one repository-wide rounding rule."""
+
+        try:
+            decimal = Decimal(str(amount))
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError("money amount must be numeric") from exc
+        if not decimal.is_finite() or decimal < 0:
+            raise ValueError("money amount must be finite and non-negative")
+        micros = int(
+            (decimal * Decimal(1_000_000)).quantize(
+                Decimal("1"),
+                rounding=ROUND_HALF_UP,
+            )
+        )
+        return cls(currency, micros)
 
     def __add__(self, other: Money) -> Money:
         if self.currency != other.currency:

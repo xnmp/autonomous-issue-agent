@@ -203,7 +203,11 @@ def _with_accounting(
     runtime_name: str,
     journal: TypedJournal,
 ) -> AgentRuntime:
-    money = lambda value: Money("USD", int(value * 1_000_000)) if value > 0 else None
+    money = (
+        lambda value: Money.from_major("USD", value)
+        if value > 0
+        else None
+    )
     return AccountingRuntime(
         runtime,
         control,
@@ -226,7 +230,7 @@ def _with_accounting(
 
 def _budget_policy(cfg: HarnessConfig) -> BudgetPolicy:
     def money(value: float) -> Money:
-        return Money("USD", int(round(value * 1_000_000)))
+        return Money.from_major("USD", value)
 
     limits: dict[tuple[str, str], Money] = {}
     for kind in (
@@ -735,7 +739,7 @@ def _control_spend_gate(
                     "ACCOUNTING "
                     f"{snapshot.disposition.value.upper()} — {snapshot.detail}"
                 )
-            cap = Money("USD", int(cap_usd * 1_000_000))
+            cap = Money.from_major("USD", cap_usd)
             if snapshot.committed.micros >= cap.micros:
                 return (
                     f"{dimension} daily spend cap reached: "

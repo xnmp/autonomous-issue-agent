@@ -708,9 +708,7 @@ def budget_overrun_usd(
             usd_per_million_to_micros(conservative),
             usd_per_million_to_micros(conservative),
         )
-    maximum = Money(
-        "USD", int(round(max_budget_usd * 1_000_000))
-    )
+    maximum = Money.from_major("USD", max_budget_usd)
     sample = BudgetSentinel(lambda: normalized, rates, maximum).sample()
     if sample is None:
         return None

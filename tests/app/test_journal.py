@@ -674,6 +674,19 @@ def test_agent_run_preserves_codex_total_only_usage(tmp_path):
     }
 
 
+def test_agent_run_cost_rounds_identically_to_authoritative_money(tmp_path):
+    result = AgentResult(
+        is_error=False,
+        status="ok",
+        cost_usd=0.0065895,
+    )
+    rt, journal, _ledger = _runtime(tmp_path, result)
+
+    asyncio.run(rt.run(RuntimePlan(prompt="p")))
+
+    assert _settled(journal.path)[0]["cost_usd"] == 0.00659
+
+
 def test_missing_usage_stays_distinct_from_zero_tokens(tmp_path):
     rt, journal, _ = _runtime(tmp_path, AgentResult(is_error=False, usage=None))
     asyncio.run(rt.run(RuntimePlan(prompt="p")))

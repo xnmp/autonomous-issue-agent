@@ -7,7 +7,6 @@ import contextvars
 import json
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
 from .runtime_plan import AgentRuntime, RuntimePlan
@@ -95,17 +94,7 @@ class AccountingRuntime(AgentRuntime):
             )
         except KeyError as exc:
             return _blocked(str(exc))
-        declared = Money(
-            "USD",
-            max(
-                0,
-                int(
-                    (Decimal(str(task.max_budget_usd)) * 1_000_000).quantize(
-                        Decimal("1"), rounding=ROUND_HALF_UP
-                    )
-                ),
-            ),
-        )
+        declared = Money.from_major("USD", task.max_budget_usd)
         if declared != maximum:
             return _blocked(
                 f"task budget {declared.micros} disagrees with policy "
@@ -196,14 +185,7 @@ class AccountingRuntime(AgentRuntime):
         self, run_id: RunId, model: str | None, result: AgentResult
     ) -> AgentResult:
         usage = _token_usage(result.usage, self.runtime_name)
-        provider_amount = Money(
-            "USD",
-            int(
-                (Decimal(str(result.cost_usd)) * 1_000_000).quantize(
-                    Decimal("1"), rounding=ROUND_HALF_UP
-                )
-            ),
-        )
+        provider_amount = Money.from_major("USD", result.cost_usd)
         priced_by_rate_card = (
             self.rate_table is not None
             and usage is not None

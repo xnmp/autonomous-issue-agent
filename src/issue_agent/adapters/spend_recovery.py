@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP
 
 from .codex_runner import (
     codex_cost_usd,
@@ -48,29 +47,19 @@ class CodexSpendReconciler:
                 usage = self._usage(evidence, session_id)
                 if usage is None:
                     return False
-                amount = Money(
+                amount = Money.from_major(
                     "USD",
-                    int(
-                        (
-                            Decimal(
-                                str(
-                                    codex_cost_usd(
-                                        usage,
-                                        cost_per_mtok_in=float(
-                                            evidence["cost_per_mtok_in"]
-                                        ),
-                                        cost_per_mtok_out=float(
-                                            evidence["cost_per_mtok_out"]
-                                        ),
-                                        cost_per_mtok_cached_in=float(
-                                            evidence["cost_per_mtok_cached_in"]
-                                        ),
-                                    )
-                                )
-                            )
-                            * 1_000_000
-                        )
-                        .quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+                    codex_cost_usd(
+                        usage,
+                        cost_per_mtok_in=float(
+                            evidence["cost_per_mtok_in"]
+                        ),
+                        cost_per_mtok_out=float(
+                            evidence["cost_per_mtok_out"]
+                        ),
+                        cost_per_mtok_cached_in=float(
+                            evidence["cost_per_mtok_cached_in"]
+                        ),
                     ),
                 )
             except (KeyError, TypeError, ValueError, ArithmeticError):

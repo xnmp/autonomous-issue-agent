@@ -28,6 +28,26 @@ def test_money_is_integer_currency_safe_arithmetic():
         Money("USD", -1)
 
 
+@pytest.mark.parametrize(
+    ("amount", "micros"),
+    (
+        ("0", 0),
+        ("0.0000004", 0),
+        ("0.0000005", 1),
+        ("0.0065895", 6_590),
+        (1.25, 1_250_000),
+    ),
+)
+def test_money_major_units_use_decimal_half_up(amount, micros):
+    assert Money.from_major("USD", amount) == Money("USD", micros)
+
+
+@pytest.mark.parametrize("amount", ("malformed", "NaN", "Infinity", "-0.01"))
+def test_money_major_units_reject_ambiguous_values(amount):
+    with pytest.raises(ValueError):
+        Money.from_major("USD", amount)
+
+
 def test_token_usage_is_disjoint_and_stderr_is_not_accounting_evidence():
     usage = TokenUsage(5, 7, 11, 13, UsageSource.STDERR)
     assert usage.total_tokens == 36
