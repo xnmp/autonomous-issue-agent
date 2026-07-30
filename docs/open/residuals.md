@@ -13,8 +13,8 @@ plan §6b, the lean-core handover §5, and the improvement plan's §4 backlog.
 ## 1. Blocking anything — before you point this at a repo you care about
 
 Nothing in the code. The P0/P1 findings from both reviews are closed
-(`44fbd16` → `1968888`). What remains is **operational**, and all three matter
-on a first real run:
+(`44fbd16` → `1968888`). The remaining restrictions are **operational**, and
+the first two matter whenever inbound repository content is not trusted:
 
 ### 1.1 Publication credentials are still present in agent processes
 
@@ -42,10 +42,19 @@ The remaining `.harness/visual-ac` claim can only make the gate stricter by
 scheduling committed-screenshot verification; `.harness/test-cmd` selects a
 command but never supplies its result. Neither can authorize publication.
 
-### 1.3 It has never run against real GitHub
-Every one of the ~1,500 tests fakes the gh boundary. The first real run tests
-the fidelity of those fakes as much as it tests the harness. Start with a
-throwaway repo, `ISSUE_AGENT_MAX_TICKS=1`, and one trivial self-authored issue.
+### 1.3 The first real GitHub canary is complete
+
+The 2026-07-31 release canary used a self-authored issue in
+`xnmp/autonomous-issue-agent`. It exercised durable label effects, paid Codex
+admission and settlement, an active SIGTERM shutdown, handover persistence,
+process cleanup, and the dashboard projection. The original issue labels were
+restored and the final control-store check found no live runs, reservations,
+or leases. The immutable receipt is
+[live-release-canary-evidence.json](../reference/live-release-canary-evidence.json).
+
+This closes the first-run fidelity risk; it does not replace a bounded canary
+when onboarding a different repository or credential topology. Start each new
+deployment with `ISSUE_AGENT_MAX_TICKS=1` and a trivial self-authored issue.
 
 ---
 
