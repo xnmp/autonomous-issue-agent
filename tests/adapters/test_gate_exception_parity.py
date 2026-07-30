@@ -172,7 +172,94 @@ def _configured_matching_refs(tmp_path: Path) -> Path:
     return repo
 
 
+def _inherited_base_repo(tmp_path: Path, branch_manifest: str) -> Path:
+    """Base already carries ANOTHER issue's manifest; the branch needs its own.
+
+    This is the second use of the feature in a repository's life, and the path
+    every later exception takes. `_inherited_manifest` only covers the branch
+    that leaves the file alone.
+    """
+    repo = fresh_repo(tmp_path)
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_keep.py").write_text("def test_keep(): assert True\n")
+    _git(repo, "add", "tests/test_keep.py")
+    _git(repo, "commit", "-qm", "test: baseline")
+    (repo / ".harness").mkdir()
+    (repo / ".harness" / "test-immutability-exceptions").write_text(
+        "7 | tests/test_legacy.py | an earlier issue corrected this |\n"
+    )
+    _git(repo, "add", "-f", ".harness/test-immutability-exceptions")
+    _git(repo, "commit", "-qm", "chore: retain prior issue audit record")
+    _git(repo, "switch", "-qc", "fix/13-correct-test")
+    (repo / "tests" / "test_regression.py").write_text("def test_new(): assert True\n")
+    _git(repo, "add", "tests/test_regression.py")
+    _git(repo, "commit", "-qm", "red: regression")
+    (repo / "tests" / "test_keep.py").write_text("def test_keep(): assert False\n")
+    (repo / "impl.py").write_text("fixed = True\n")
+    _git(repo, "add", "tests/test_keep.py", "impl.py")
+    _git(repo, "commit", "-qm", "green: correct behavior and expectation")
+    (repo / ".harness" / "test-immutability-exceptions").write_text(branch_manifest)
+    _git(repo, "add", "-f", ".harness/test-immutability-exceptions")
+    _git(repo, "commit", "-qm", "chore: declare corrected test")
+    (repo / ".harness" / "ac-posted").touch()
+    (repo / ".harness" / "test-plan-posted").touch()
+    (repo / ".harness" / "adversarial-verdict").write_text("PASS\n")
+    return repo
+
+
+def _inherited_appended(tmp_path: Path) -> Path:
+    return _inherited_base_repo(
+        tmp_path,
+        "7 | tests/test_legacy.py | an earlier issue corrected this |\n"
+        "13 | tests/test_keep.py | baseline encoded the defect |\n",
+    )
+
+
+def _inherited_replaced(tmp_path: Path) -> Path:
+    return _inherited_base_repo(
+        tmp_path, "13 | tests/test_keep.py | baseline encoded the defect |\n"
+    )
+
+
+def _over_exception_bound(tmp_path: Path) -> Path:
+    """One manifest may not except an unbounded number of existing tests."""
+    repo = fresh_repo(tmp_path)
+    (repo / "tests").mkdir()
+    paths = [f"tests/test_keep_{index}.py" for index in range(4)]
+    for path in paths:
+        (repo / path).write_text("def test_keep(): assert True\n")
+    _git(repo, "add", *paths)
+    _git(repo, "commit", "-qm", "test: baseline")
+    (repo / ".harness").mkdir()
+    _git(repo, "switch", "-qc", "fix/13-correct-test")
+    (repo / "tests" / "test_regression.py").write_text("def test_new(): assert True\n")
+    _git(repo, "add", "tests/test_regression.py")
+    _git(repo, "commit", "-qm", "red: regression")
+    for path in paths:
+        (repo / path).write_text("def test_keep(): assert False\n")
+    (repo / "impl.py").write_text("fixed = True\n")
+    _git(repo, "add", *paths, "impl.py")
+    _git(repo, "commit", "-qm", "green: correct behavior and expectation")
+    (repo / ".harness" / "test-immutability-exceptions").write_text(
+        "".join(f"13 | {path} | baseline encoded the defect |\n" for path in paths)
+    )
+    _git(repo, "add", "-f", ".harness/test-immutability-exceptions")
+    _git(repo, "commit", "-qm", "chore: declare corrected tests")
+    (repo / ".harness" / "ac-posted").touch()
+    (repo / ".harness" / "test-plan-posted").touch()
+    (repo / ".harness" / "adversarial-verdict").write_text("PASS\n")
+    return repo
+
+
 CASES = (
+    Case("inherited_appended", "pr", _inherited_appended, _pr_argv(), False,
+         env={"TEST_CMD": "true"},
+         reason_contains="replace its contents with declarations for #13 only"),
+    Case("inherited_replaced", "pr", _inherited_replaced, _pr_argv(), True,
+         env={"TEST_CMD": "test -f impl.py"}),
+    Case("over_exception_bound", "pr", _over_exception_bound, _pr_argv(), False,
+         env={"TEST_CMD": "true"},
+         reason_contains="too many test-immutability exceptions"),
     Case("declared", "pr", _valid, _pr_argv(), True,
          env={"TEST_CMD": "test -f impl.py"}),
     Case("unicode", "pr",

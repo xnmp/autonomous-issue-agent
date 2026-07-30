@@ -727,8 +727,8 @@ def _test_immutability_exception_notice(diff: str) -> str:
         if not error:
             return ""
         return (
-            "🚨 TEST IMMUTABILITY EXCEPTION manifest is malformed. "
-            "REQUEST_CHANGES unless the gate rejects it.\n"
+            "🚨 TEST IMMUTABILITY EXCEPTION manifest is rejected by the gate "
+            f"({error}). REQUEST_CHANGES unless the gate rejects it.\n"
             f"{_fenced('test immutability exception', raw)}"
         )
     details = "\n".join(

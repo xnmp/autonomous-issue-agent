@@ -96,7 +96,9 @@ class GateContext:
     # the agent must not be able to grant itself the exemption.
     allow_untested: bool = False
     exists_at_base: Callable[[str], bool] = lambda f: False
-    exists_at_head: Callable[[str], bool] = lambda f: True
+    # Fail CLOSED like check_tests_immutable's own default: an unwired
+    # resolver must lose the exception, not skip the deletion requirement.
+    exists_at_head: Callable[[str], bool] = lambda f: False
     # Production always replaces this with the lazy git-backed resolver in
     # build_gate_context. The permissive constructor default keeps isolated
     # policy tests independent of repository I/O, like the other callbacks.

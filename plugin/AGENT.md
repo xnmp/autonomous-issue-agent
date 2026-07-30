@@ -225,11 +225,13 @@ don't keep going back to edit it — each re-plan costs a full model round-trip.
   normally ignored), with one strict line per file:
   `<issue> | <test path> | <why the expectation is wrong> | <replacement test>`.
   Leave the final field empty for an in-place correction. Deletion requires a
-  replacement that is a new test file in the same change. A manifest inherited
-  from the base is audit history: leave it untouched for an ordinary change, or
-  replace it (do not append) with only the current issue's declarations when
-  claiming a new exception. The gate rejects
-  malformed, wrong-issue, unmatched, or undeclared edits and surfaces accepted
+  replacement that is a new test file in the same change. At most THREE files
+  per change — if you need more, the change is too broad: split it or escalate.
+  The audit trail lives in the manifest's git history, not in the file, so a
+  manifest inherited from the base is inert: leave it untouched for an ordinary
+  change, or REPLACE it (never append) with only the current issue's
+  declarations when claiming a new exception. The gate rejects malformed,
+  over-bound, wrong-issue, unmatched, or undeclared edits and surfaces accepted
   declarations loudly to the reviewer.
 - Do NOT refactor unrelated code.
 - Do NOT suppress a quality/security signal for the code THIS change adds or

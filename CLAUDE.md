@@ -225,9 +225,13 @@ only with a tracked `.harness/test-immutability-exceptions` line in the form
 branch and the path must match an existing changed test. An empty replacement
 means an in-place rewrite; deletion requires a new replacement test in the same
 diff. Both Python and Bash gates fail closed on malformed or unmatched entries,
-and reviewer task builders elevate the declaration from the PR diff. A manifest
-inherited from the base is inert audit history; a later issue claiming an
-exception replaces its contents with declarations for that issue only.
+and reviewer task builders elevate the declaration from the PR diff. At most
+three files may be excepted in one change: per-file scoping bounds WHICH
+tests, and the count bounds HOW MANY, so one manifest cannot quietly retire
+the gate for a whole change. The audit trail is the manifest's git history,
+not the file — a manifest inherited from the base is inert, and a later issue
+claiming an exception REPLACES its contents with declarations for that issue
+only rather than appending to them.
 Open-PR push revalidation derives its checks from checkout `HEAD`, so every
 explicit source ref must resolve to that same commit. To push another commit,
 check it out first or use `HEAD:<destination>`; the gate fails closed rather

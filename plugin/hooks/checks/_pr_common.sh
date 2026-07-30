@@ -240,7 +240,11 @@ prc_valid_test_path() {
 
 prc_check_tests_immutable() {  # prc_check_tests_immutable "<changed-file-list>"
   local f manifest line pipes decl_issue decl_file decl_reason decl_replacement
-  local extra issue_number seen matched replacement
+  local extra issue_number seen matched replacement decl_count
+  # Twin of MAX_TEST_IMMUTABILITY_EXCEPTIONS in domain/gate.py — the two are
+  # pinned together by tests/adapters/test_gate_exception_parity.py.
+  local max_exceptions=3
+  decl_count=0
   manifest=""
   if printf '%s\n' "$1" | grep -qxF '.harness/test-immutability-exceptions'; then
     manifest=$(git show HEAD:.harness/test-immutability-exceptions 2>/dev/null || true)
@@ -271,7 +275,7 @@ prc_check_tests_immutable() {  # prc_check_tests_immutable "<changed-file-list>"
           || fail "malformed test-immutability exception: invalid replacement test"
       fi
       [ "$decl_issue" = "$issue_number" ] \
-        || fail "test-immutability exception for '$decl_file' names issue #$decl_issue, not current issue #${issue_number:-unknown}"
+        || fail "test-immutability exception for '$decl_file' names issue #$decl_issue, not current issue #${issue_number:-unknown} — a manifest inherited from the base is audit history kept in git; replace its contents with declarations for #${issue_number:-unknown} only"
       printf '%s\n' "$seen" | grep -qxF "$decl_file" \
         && fail "malformed test-immutability exception: duplicate file '$decl_file'"
       seen="${seen}${seen:+
@@ -282,7 +286,12 @@ prc_check_tests_immutable() {  # prc_check_tests_immutable "<changed-file-list>"
           && ! git cat-file -e "$base:$decl_file" 2>/dev/null; then
         fail "test-immutability exception names unchanged or new file '$decl_file'"
       fi
+      decl_count=$((decl_count + 1))
     done <<< "$manifest"
+    # Checked AFTER the per-line loop so both stacks report the same FIRST
+    # error when a manifest is both over the bound and malformed.
+    [ "$decl_count" -le "$max_exceptions" ] \
+      || fail "too many test-immutability exceptions ($decl_count > $max_exceptions): split this change or escalate to a human"
   fi
 
   while IFS= read -r f; do

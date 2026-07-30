@@ -1,6 +1,7 @@
 """Behavioral contract for audited corrections to wrong existing tests."""
 
 from issue_agent.domain.gate import (
+    MAX_TEST_IMMUTABILITY_EXCEPTIONS,
     TEST_IMMUTABILITY_EXCEPTIONS,
     check_tests_immutable,
     partition_changed,
@@ -161,3 +162,95 @@ def test_declared_corrected_test_stays_present_during_implementation_revert():
 
     assert tests == ("tests/test_app.py",)
     assert implementation == ("src/app.py", TEST_IMMUTABILITY_EXCEPTIONS)
+
+
+def test_unwired_head_resolver_loses_the_exception_instead_of_skipping_deletion():
+    """The deletion branch must fail CLOSED when its resolver is not wired.
+
+    `exists_at_head` gates the strictest rule in this check — a declared
+    deletion has to name a replacement test. A permissive default let a caller
+    that forgot the callback delete an existing test with no replacement.
+    """
+    changed = _changed("tests/test_app.py", TEST_IMMUTABILITY_EXCEPTIONS)
+    manifest = "124 | tests/test_app.py | expectation was wrong |\n"
+
+    unwired = check_tests_immutable(
+        changed, _base, issue_number=124, exception_manifest=manifest
+    )
+    wired = check_tests_immutable(
+        changed,
+        _base,
+        exists_at_head=lambda _path: True,
+        issue_number=124,
+        exception_manifest=manifest,
+    )
+
+    assert not unwired.ok
+    assert "replacement" in unwired.reason
+    assert wired.ok
+
+
+def test_one_change_may_not_except_more_tests_than_the_bound():
+    """Per-file scoping bounds WHICH tests; this bounds HOW MANY.
+
+    Without it a single manifest neutralises the immutability gate for a whole
+    change, leaving reviewer judgement as the only remaining backstop.
+    """
+    over = MAX_TEST_IMMUTABILITY_EXCEPTIONS + 1
+    paths = [f"tests/test_{i}.py" for i in range(over)]
+    manifest = "".join(f"124 | {path} | expectation was wrong |\n" for path in paths)
+    at_bound = "".join(
+        f"124 | {path} | expectation was wrong |\n"
+        for path in paths[:MAX_TEST_IMMUTABILITY_EXCEPTIONS]
+    )
+    base = set(paths).__contains__
+    head = lambda _path: True  # noqa: E731
+
+    denied = check_tests_immutable(
+        _changed(*paths, TEST_IMMUTABILITY_EXCEPTIONS),
+        base,
+        exists_at_head=head,
+        issue_number=124,
+        exception_manifest=manifest,
+    )
+    allowed = check_tests_immutable(
+        _changed(*paths[:MAX_TEST_IMMUTABILITY_EXCEPTIONS], TEST_IMMUTABILITY_EXCEPTIONS),
+        base,
+        exists_at_head=head,
+        issue_number=124,
+        exception_manifest=at_bound,
+    )
+
+    assert not denied.ok
+    assert "too many test-immutability exceptions" in denied.reason
+    assert allowed.ok
+
+
+def test_inherited_manifest_must_be_replaced_and_the_denial_says_so():
+    """Appending to another issue's manifest is the second use of this feature.
+
+    The denial has to name the remedy: the inherited lines are audit history in
+    git and must be replaced, not extended.
+    """
+    changed = _changed("tests/test_app.py", TEST_IMMUTABILITY_EXCEPTIONS)
+    appended = check_tests_immutable(
+        changed,
+        _base,
+        exists_at_head=lambda _path: True,
+        issue_number=124,
+        exception_manifest=(
+            "13 | tests/test_legacy.py | an earlier issue corrected this |\n"
+            "124 | tests/test_app.py | expectation was wrong |\n"
+        ),
+    )
+    replaced = check_tests_immutable(
+        changed,
+        _base,
+        exists_at_head=lambda _path: True,
+        issue_number=124,
+        exception_manifest="124 | tests/test_app.py | expectation was wrong |\n",
+    )
+
+    assert not appended.ok
+    assert "replace its contents with declarations for #124 only" in appended.reason
+    assert replaced.ok

@@ -26,6 +26,10 @@ from enum import Enum
 from .refs import is_governed_branch
 
 TEST_IMMUTABILITY_EXCEPTIONS = ".harness/test-immutability-exceptions"
+# How many existing tests ONE change may correct. Deliberately small: beyond a
+# handful the change is no longer "this expectation was wrong", it is a rewrite
+# of the suite, and that needs a human rather than a manifest line.
+MAX_TEST_IMMUTABILITY_EXCEPTIONS = 3
 
 
 # ── result type ──────────────────────────────────────────────────────────────
@@ -456,6 +460,17 @@ def parse_test_immutability_exceptions(
         declarations.append(
             TestImmutabilityException(int(issue), path, reason, replacement)
         )
+    # Per-file and per-issue scoping bounds WHICH tests an exception may touch,
+    # not HOW MANY. Without a count bound one manifest neutralises the whole
+    # immutability gate for a change, leaving reviewer judgement as the only
+    # backstop. A change that genuinely needs more is a human decision — which
+    # is the decision this gate exists to force.
+    if len(declarations) > MAX_TEST_IMMUTABILITY_EXCEPTIONS:
+        return (), (
+            f"too many test-immutability exceptions ({len(declarations)} > "
+            f"{MAX_TEST_IMMUTABILITY_EXCEPTIONS}): split this change or escalate "
+            "to a human"
+        )
     return tuple(declarations), ""
 
 
@@ -470,7 +485,10 @@ def check_tests_immutable(
     changed: Iterable[str],
     exists_at_base: Callable[[str], bool],
     *,
-    exists_at_head: Callable[[str], bool] = lambda _path: True,
+    # Fail CLOSED: this callback gates the strictest branch (a declared
+    # deletion must name a replacement test), so a caller that forgets to wire
+    # it must lose the exception, never silently skip the requirement.
+    exists_at_head: Callable[[str], bool] = lambda _path: False,
     issue_number: int | None = None,
     exception_manifest: str = "",
 ) -> GateResult:
@@ -490,7 +508,9 @@ def check_tests_immutable(
         if declaration.issue_number != issue_number:
             return deny(
                 f"test-immutability exception for '{declaration.path}' names issue "
-                f"#{declaration.issue_number}, not current issue #{issue_number}"
+                f"#{declaration.issue_number}, not current issue #{issue_number} — "
+                "a manifest inherited from the base is audit history kept in git; "
+                f"replace its contents with declarations for #{issue_number} only"
             )
         if declaration.path not in existing_tests:
             return deny(
