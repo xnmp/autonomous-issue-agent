@@ -180,7 +180,10 @@ that matters is not "wrong answer" but "loop that bills forever":
 Provider-billed runtimes settle their reported cost. Subscription runtimes
 whose provider reports zero use the configured versioned rate card as an
 explicit synthetic token meter, so sequential Claude/GLM work cannot release
-its reservation back to a nominally armed cap at zero.
+its reservation back to a nominally armed cap at zero. If the final usage
+envelope is missing, an armed cap conservatively prices the observed stream
+accumulator; if neither trustworthy usage nor pricing authority exists, the
+full reservation remains active instead of becoming new headroom.
 
 Counters decay on any leg that returns a result, so the ceilings bound
 *consecutive* failure rather than accumulating over a healthy issue's lifetime.
@@ -199,8 +202,14 @@ launcher again. A launcher death before registration refuses `exec`; a death
 after registration is recoverable through the same authoritative run record.
 
 Each deployment has a role/repository/checkout-scoped lock and a stable
-deployment identity. Startup validates configuration, lock ownership, the
-control-store schema and adapter construction before reporting readiness.
+deployment identity. Locks live in a private per-user host runtime directory,
+not a configurable role state root, so two overlays aimed at one checkout
+cannot acquire independent locks. Startup validates configuration, lock
+ownership, the control-store schema and adapter construction before reporting
+readiness. Schema bootstrap is serialized across role processes with a
+per-database advisory lock. Recovery snapshots leases and performs OS liveness
+probes outside SQLite write transactions, then revalidates the complete lease
+identity before reclaiming it.
 The scheduler heartbeat and systemd watchdog represent scheduler progress, not
 merely process liveness.
 
@@ -260,8 +269,11 @@ so Codex cannot mint a trusted receipt and visual-acceptance publication fails
 closed on that runtime. Service upgrades likewise stage complete
 unit/plist-plus-private-config pairs; both systemd and launchd restore the
 previous pair if activation fails. Partial-role service upgrades are rejected:
-all legacy writers must stop before any role imports or admits against the
-SQLite authority.
+all unsuffixed, target-basename, repository-derived, and current-name legacy
+writers stop before any role imports or admits against the SQLite authority.
+Foreground and installed processes also carry an explicit deployment identity;
+operator stop/status discovery filters by that identity and never signals an
+unrelated deployment's role daemon.
 
 ## Module manifest
 

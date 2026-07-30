@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-30T18:35:45Z",
+  "generated_at": "2026-07-30T21:29:02Z",
   "repository": "xnmp/autonomous-issue-agent",
   "purpose": "Release evidence for the 2026-07-30 architectural implementation plan",
   "builds": {
@@ -287,6 +287,78 @@
         },
         "steward": {
           "pid": 3030477,
+          "heartbeat_state": "stopped",
+          "in_flight": []
+        }
+      },
+      "control_store": {
+        "integrity": "ok",
+        "schema_migrations": [
+          9,
+          10,
+          11,
+          12
+        ],
+        "nonterminal_runs": 0,
+        "active_reservations": 0,
+        "leases": 0,
+        "dispatch_claims": 0,
+        "pending_commands": 0
+      },
+      "operator_warning": "The repository rejected automatic enablement of allow_auto_merge; the canary continued with the documented manual repository-setting warning."
+    }
+  },
+  "final_release_safety_follow_up": {
+    "observed_at": "2026-07-30T21:29:02Z",
+    "commit": "6295a85726c177520bdb2506dd4080df221775bb",
+    "code_tree": "9546b5ee11320a30bee479252cb5bcc6740b2f86",
+    "closed_findings": [
+      "Armed subscription caps conservatively price observed stream usage when a final provider envelope is absent; unpriceable or usage-blind completed work retains its reservation.",
+      "systemd stops and removes current, unsuffixed, target-basename, and repository-derived predecessor units as one rollback-safe all-role cutover.",
+      "launchd unloads and removes unsuffixed predecessor jobs and restores their plists and loaded state if any new load fails.",
+      "Foreground and installed daemons export a stable deployment identity, and stop/status process discovery filters role PIDs by that identity.",
+      "Lease liveness probes run outside SQLite write transactions and reclaim only a transactionally revalidated lease identity.",
+      "The singleton lock authority is host-private and independent of configurable role state roots.",
+      "Concurrent role bootstrap serializes WAL selection and schema migration through a per-database advisory lock.",
+      "Wrapper option operands cannot obscure a governed mutation or dynamic interpreter from the advisory governor."
+    ],
+    "full_suite": {
+      "command": "make test",
+      "result": "passed",
+      "shell_hooks": 90,
+      "point_at": 7,
+      "domain_pytest": 646,
+      "adapter_pytest": 700,
+      "application_pytest": 1288,
+      "gate_parity": 48,
+      "import_contracts": 4,
+      "pyrefly_errors": 0
+    },
+    "focused_canaries": {
+      "installer_command": "uv run pytest -q tests/adapters/test_service_installers.py",
+      "installer_result": "passed with simulated systemctl/launchctl success and rollback state machines",
+      "concurrent_fresh_schema_command": "ten consecutive runs of tests/adapters/test_control_store.py::test_concurrent_role_boot_serializes_schema_migrations",
+      "concurrent_fresh_schema_result": "30 of 30 role processes initialized successfully"
+    },
+    "live_command": "ISSUE_AGENT_MAX_TICKS=0 bash bin/point-at.sh self",
+    "live_result": {
+      "exit_code": 0,
+      "doctor_errors": 0,
+      "doctor_warnings": 3,
+      "clean_origin_dev_test": "passed",
+      "roles": {
+        "fix": {
+          "pid": 3083566,
+          "heartbeat_state": "stopped",
+          "in_flight": []
+        },
+        "review": {
+          "pid": 3083569,
+          "heartbeat_state": "stopped",
+          "in_flight": []
+        },
+        "steward": {
+          "pid": 3083568,
           "heartbeat_state": "stopped",
           "in_flight": []
         }
