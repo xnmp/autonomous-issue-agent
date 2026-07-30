@@ -539,7 +539,7 @@ def _flags(row: dash.IssueRow, human_action: str | None = None) -> list[str]:
     newest_leg_blocked = (
         bool(row.legs)
         and row.legs[-1].status.lower() == "blocked"
-        and row.stage in {"awaiting review", "reviewed"}
+        and row.stage in {"awaiting review", "reviewed", "awaiting human reply"}
     )
     if row.stage == "blocked" or newest_leg_blocked:
         flags.append("blocked")
@@ -550,6 +550,20 @@ def _flags(row: dash.IssueRow, human_action: str | None = None) -> list[str]:
     return flags
 
 
+def _blocked_reason(row: dash.IssueRow) -> str | None:
+    """First useful line from the newest blocked leg, bounded for compact rows."""
+    for event in reversed(row.events):
+        if event.get("event") != "agent_run" or event.get("status") != "blocked":
+            continue
+        raw = str(event.get("needs") or event.get("summary") or "").strip()
+        return raw.splitlines()[0][:240] if raw else None
+    return None
+
+
+def _display_stage(row: dash.IssueRow) -> str:
+    if row.stage == "blocked" and _blocked_reason(row):
+        return "awaiting human reply"
+    return row.stage
 def _labels_set(issue: dict | None) -> set[str]:
     return set(labels_of(issue or {}))
 
@@ -813,7 +827,8 @@ def issue_card(
         "pr": pr,
         "pr_url": (gh_pr or {}).get("url"),
         "pr_state": _pr_state(gh_pr),
-        "stage": row.stage,
+        "stage": _display_stage(row),
+        "attention_reason": _blocked_reason(row),
         "done": row.done,
         "steps": collapse_steps(row),
         "cost_usd": row.cost_usd,
@@ -1245,7 +1260,8 @@ def issue_detail(
         "issue": row.issue,
         "title": (gh_issue or {}).get("title"),
         "url": (gh_issue or {}).get("url"),
-        "stage": row.stage,
+        "stage": _display_stage(row),
+        "attention_reason": _blocked_reason(row),
         "done": row.done,
         "prs": list(row.prs),
         "pull_requests": [

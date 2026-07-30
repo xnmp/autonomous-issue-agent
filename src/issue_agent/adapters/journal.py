@@ -58,6 +58,12 @@ _USAGE_KEYS = (
     "cache_read_input_tokens",
     "cache_creation_input_tokens",
 )
+_BLOCKED_TEXT_LIMIT = 1_000
+
+
+def _bounded_blocked_text(value: object) -> str | None:
+    text = str(value or "").strip()
+    return text[:_BLOCKED_TEXT_LIMIT] or None
 
 
 def _now() -> datetime:
@@ -462,6 +468,14 @@ class JournalingRuntime:
                 usage=usage,
                 usage_stream=stream,
                 turns=getattr(result, "num_turns", None),
+                **(
+                    {
+                        "needs": _bounded_blocked_text(result.needs),
+                        "summary": _bounded_blocked_text(result.summary),
+                    }
+                    if result.status == "blocked"
+                    else {}
+                ),
                 **extra,
             )
             telemetry_warning = str(

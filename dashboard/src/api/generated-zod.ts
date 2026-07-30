@@ -59,6 +59,7 @@ const CardStep = z
   .passthrough();
 const IssueCard = z
   .object({
+    attention_reason: z.union([z.string(), z.null()]).optional(),
     cost_usd: z.union([z.number(), z.null()]),
     done: z.boolean(),
     elapsed_s: z.union([z.number(), z.null()]),
@@ -177,6 +178,7 @@ const IssueStep = z
   .passthrough();
 const IssueDetailPayload = z
   .object({
+    attention_reason: z.union([z.string(), z.null()]).optional(),
     cost_usd: z.union([z.number(), z.null()]),
     done: z.boolean(),
     elapsed_s: z.union([z.number(), z.null()]),
@@ -435,6 +437,7 @@ const endpoints = makeApi([
     ],
     response: z
       .object({
+        attention_reason: z.union([z.string(), z.null()]).optional(),
         cost_usd: z.union([z.number(), z.null()]),
         done: z.boolean(),
         elapsed_s: z.union([z.number(), z.null()]),

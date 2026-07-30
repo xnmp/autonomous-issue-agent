@@ -798,6 +798,15 @@ function IssueSummary({ card, open }: { card: IssueCard; open: boolean }) {
         <span className="issue-summary-title" title={card.title ?? undefined}>
           {card.title ?? <span className="faint">title unavailable</span>}
         </span>
+        {card.stage === "awaiting human reply" ? (
+          <span
+            className="issue-attention"
+            title={card.attention_reason ?? "The agent is waiting for a reply."}
+          >
+            awaiting human reply
+            {card.attention_reason ? ` · ${card.attention_reason}` : ""}
+          </span>
+        ) : null}
         <div className="row-wrap">
           <IssueNumber issue={card.issue} url={card.url} />
           <PrLink card={card} />
