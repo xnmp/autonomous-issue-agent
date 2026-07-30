@@ -14,6 +14,7 @@ both are tested with no live model call.
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import time
 from collections.abc import Callable
@@ -370,6 +371,17 @@ async def _aclose_quietly(agen: Any) -> None:
         pass
 
 
+async def _cancel_task_quietly(task: Any) -> None:
+    """Cancel and join a child receive task before closing its generator."""
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
+
+
 class AgentRunner(AgentRuntime):
     """Runs headless agent tasks over the SDK. One instance per process; safe to
     call `run` concurrently for distinct `cwd`s (each query is its own SDK
@@ -545,6 +557,7 @@ class AgentRunner(AgentRuntime):
         # unarmed cap has no baseline to keep.
         started_at = self._wall_clock() if self._max_runtime is not None else 0.0
         agen = query(prompt=task.prompt, options=options).__aiter__()
+        pending: Any = None
         try:
             while True:
                 # Total-runtime cap, checked BETWEEN receives as well as inside the
@@ -628,7 +641,7 @@ class AgentRunner(AgentRuntime):
                                 f"(>{self._idle_timeout:.0f}s); treating as hung "
                                 f"(last: {last_trace or 'none'})"
                             )
-                            pending.cancel()
+                            await _cancel_task_quietly(pending)
                             await _aclose_quietly(agen)
                             if final is None:
                                 return with_resolved_model(AgentResult(
@@ -647,7 +660,7 @@ class AgentRunner(AgentRuntime):
                             # watchdog never fires) but the session has run past any
                             # plausible task length. Tear down exactly like the idle
                             # path — a capped session must not leak its subprocess.
-                            pending.cancel()
+                            await _cancel_task_quietly(pending)
                             await _aclose_quietly(agen)
                             if final is None:
                                 # usage_acc MUST ride along here exactly as on the
@@ -710,6 +723,13 @@ class AgentRunner(AgentRuntime):
                             self._log("sdk: skipping task-notification follow-up result")
                         continue
                     final = message
+        except asyncio.CancelledError:
+            # Daemon shutdown cancels the root dispatch task from another
+            # thread. Closing the SDK generator tears down its query subprocess;
+            # cancellation stays outside the infrastructure-death breaker.
+            await _cancel_task_quietly(pending)
+            await _aclose_quietly(agen)
+            raise
         except Exception as exc:
             # The SDK raises the CLI's trailing ProcessError when Claude Code
             # exits non-zero AFTER delivering its ResultMessage — e.g. an

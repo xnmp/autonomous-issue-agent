@@ -29,6 +29,7 @@ it exactly once — never `write(line)` then `write("\\n")`.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import json
 import math
 import os
@@ -57,6 +58,12 @@ _USAGE_KEYS = (
     "cache_read_input_tokens",
     "cache_creation_input_tokens",
 )
+_BLOCKED_TEXT_LIMIT = 1_000
+
+
+def _bounded_blocked_text(value: object) -> str | None:
+    text = str(value or "").strip()
+    return text[:_BLOCKED_TEXT_LIMIT] or None
 
 
 def _now() -> datetime:
@@ -203,8 +210,24 @@ class JournalingRuntime:
         self.repo = repo
         self.role = role
         self.runtime = runtime
-        self.context = RunContext(role=role)
-        self._deferred_route_receipt: _DeferredRouteReceipt | None = None
+        self._context = contextvars.ContextVar(
+            f"journal_run_context_{id(self)}",
+            default=RunContext(role=role),
+        )
+        self._deferred_route_receipt = contextvars.ContextVar[
+            _DeferredRouteReceipt | None
+        ](
+            f"journal_route_receipt_{id(self)}",
+            default=None,
+        )
+
+    @property
+    def context(self) -> RunContext:
+        return self._context.get()
+
+    @context.setter
+    def context(self, value: RunContext) -> None:
+        self._context.set(value)
 
     def set_context(self, role: str, kind: str, number: int, issue: int | None) -> None:
         """Called by the dispatcher immediately before it hands off to a handler.
@@ -216,10 +239,10 @@ class JournalingRuntime:
         inherits it. Random rather than sequential because the counter's whole
         purpose is surviving a process death, and a per-process sequence
         restarts at 0 with the daemon."""
-        self.context = RunContext(
+        self._context.set(RunContext(
             role=role, kind=kind, number=number, issue=issue,
             dispatch_id=uuid.uuid4().hex[:12],
-        )
+        ))
 
     @contextlib.contextmanager
     def leg_kind(self, kind: str):
@@ -235,12 +258,11 @@ class JournalingRuntime:
         router run is real spend); it just lands in its own bucket instead of
         inflating the one it precedes.
         """
-        previous = self.context
-        self.context = replace(previous, kind=kind)
+        token = self._context.set(replace(self.context, kind=kind))
         try:
             yield
         finally:
-            self.context = previous
+            self._context.reset(token)
 
     @contextlib.contextmanager
     def route_receipt(self):
@@ -250,23 +272,21 @@ class JournalingRuntime:
         resolve model and effort after applying its escalation policy. The start
         receipt remains immediate; this only delays the successful settlement.
         """
-        previous = self._deferred_route_receipt
         receipt = _DeferredRouteReceipt()
-        self._deferred_route_receipt = receipt
+        receipt_token = self._deferred_route_receipt.set(receipt)
         try:
             yield receipt.decide
         finally:
-            self._deferred_route_receipt = previous
+            self._deferred_route_receipt.reset(receipt_token)
             if receipt.result is not None and receipt.task is not None:
-                previous_context = self.context
+                context_token = self._context.set(receipt.context or self.context)
                 try:
-                    self.context = receipt.context or previous_context
                     self._record(
                         receipt.task, receipt.result, receipt.duration_s,
                         route_decision=receipt,
                     )
                 finally:
-                    self.context = previous_context
+                    self._context.reset(context_token)
 
     def __getattr__(self, name: str):
         """Delegate anything this decorator does not define to the wrapped
@@ -341,7 +361,7 @@ class JournalingRuntime:
             )
             raise
         duration_s = time.monotonic() - t0
-        deferred = self._deferred_route_receipt
+        deferred = self._deferred_route_receipt.get()
         if deferred is None:
             self._record(task, result, duration_s)
         else:
@@ -448,6 +468,14 @@ class JournalingRuntime:
                 usage=usage,
                 usage_stream=stream,
                 turns=getattr(result, "num_turns", None),
+                **(
+                    {
+                        "needs": _bounded_blocked_text(result.needs),
+                        "summary": _bounded_blocked_text(result.summary),
+                    }
+                    if result.status == "blocked"
+                    else {}
+                ),
                 **extra,
             )
             telemetry_warning = str(

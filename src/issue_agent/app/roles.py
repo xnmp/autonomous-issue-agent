@@ -7,16 +7,17 @@ Each `build_*_daemon` binds:
   * executor → applies the leaf Actions; its `run_agent` drives the (async)
                AgentDispatcher for RunAgent actions.
 
-The dispatcher is async (SDK query is a coroutine), but Daemon.tick is sync, so
-`run_agent` runs the coroutine to completion with asyncio.run — one agent at a
-time, matching the bash single-fixer / sequential model.
+The dispatcher is async (SDK query is a coroutine). Each paid fix leg owns a
+bounded background worker and event loop; observation and lifecycle writes
+remain on the daemon thread. Review and steward keep synchronous dispatch.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Callable
+import threading
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from functools import partial
 
@@ -39,6 +40,7 @@ from ..adapters.worktree import Worktrees
 from ..domain.fix import (
     FixConfig,
     FixState,
+    InFlightFix,
     breaker_key,
     ci_flakes,
     ci_pending_stalls,
@@ -64,7 +66,7 @@ from ..domain.triage import (
     triage_candidates,
 )
 from ..domain.jira import jira_phase, jira_sync_needed
-from ..domain.actions import AgentKind, RunAgent
+from ..domain.actions import AgentKind, Relabel, RunAgent, Target
 from ..domain.agent_task import AgentRuntime
 from .config import HarnessConfig
 from .dispatch import AgentDispatcher, DispatchConfig
@@ -72,6 +74,150 @@ from .execute import Executor
 from .loop import Daemon
 from .mcp import mcp_servers_from_file
 from .spend_gate import build_daily_spend_gate
+
+
+class CancellableAsyncDispatch:
+    """Run one dispatch coroutine per worker thread with cooperative shutdown.
+
+    Each worker owns its event loop, while the daemon main thread retains a
+    thread-safe cancellation handle. Cancelling the root task propagates into
+    the async agent runner, whose subprocess cleanup terminates its process
+    group before the worker exits.
+    """
+
+    def __init__(
+        self,
+        dispatch: Callable[[RunAgent], Awaitable[None]],
+        finished: Callable[[RunAgent], None] | None = None,
+    ) -> None:
+        self._dispatch = dispatch
+        self._finished = finished
+        self._lock = threading.Lock()
+        self._active: dict[
+            int,
+            tuple[
+                asyncio.AbstractEventLoop,
+                asyncio.Task[None],
+                threading.Event,
+            ],
+        ] = {}
+        # Sticky: cancellation may win the race before a submitted pool worker
+        # reaches __call__. Every later registration observes this edge too.
+        self._shutdown = threading.Event()
+
+    def _new_cancel_event(self) -> threading.Event:
+        return threading.Event()
+
+    async def _run(
+        self, action: RunAgent, cancel_requested: threading.Event
+    ) -> None:
+        task = asyncio.create_task(self._dispatch(action))
+        try:
+            while not task.done():
+                if cancel_requested.is_set():
+                    task.cancel()
+                # call_soon_threadsafe is the normal shutdown path. The bounded
+                # wait is a portability fallback for event loops whose self-pipe
+                # wake is unavailable during teardown.
+                await asyncio.wait((task,), timeout=1.0)
+            await task
+        except asyncio.CancelledError:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            raise
+
+    def __call__(self, action: RunAgent) -> None:
+        loop = asyncio.new_event_loop()
+        cancel_requested = self._new_cancel_event()
+        task = loop.create_task(self._run(action, cancel_requested))
+        token = id(task)
+        with self._lock:
+            self._active[token] = (loop, task, cancel_requested)
+            if self._shutdown.is_set():
+                cancel_requested.set()
+                task.cancel()
+        try:
+            loop.run_until_complete(task)
+        finally:
+            with self._lock:
+                self._active.pop(token, None)
+            loop.run_until_complete(loop.shutdown_asyncgens())
+            loop.close()
+            if self._finished is not None:
+                self._finished(action)
+
+    def cancel_all(self) -> None:
+        with self._lock:
+            self._shutdown.set()
+            active = tuple(self._active.values())
+        for loop, task, cancel_requested in active:
+            cancel_requested.set()
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                # The worker may have completed and closed its loop after the
+                # snapshot. Its future is already settling; continue cancelling
+                # the remaining workers.
+                continue
+
+
+class DispatchPathReservations:
+    """Atomic issue/path leases shared by admission and running routers."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._paths: dict[int, frozenset[str]] = {}
+        self._actions: dict[RunAgent, int] = {}
+
+    def _conflicts(self, issue: int, paths: frozenset[str]) -> bool:
+        return any(
+            other_issue != issue
+            and (
+                not paths
+                or not other_paths
+                or bool(paths & other_paths)
+            )
+            for other_issue, other_paths in self._paths.items()
+        )
+
+    def reserve(
+        self, action: RunAgent, issue: int, paths: frozenset[str]
+    ) -> bool:
+        with self._lock:
+            if issue in self._paths or self._conflicts(issue, paths):
+                return False
+            self._paths[issue] = paths
+            self._actions[action] = issue
+            return True
+
+    def expand(self, issue: int, paths: frozenset[str]) -> bool:
+        """Atomically add router predictions; one colliding router loses."""
+        with self._lock:
+            expanded = self._paths.get(issue, frozenset()) | paths
+            if self._conflicts(issue, expanded):
+                return False
+            self._paths[issue] = expanded
+            return True
+
+    def finish(self, action: RunAgent) -> None:
+        with self._lock:
+            issue = self._actions.pop(action, None)
+            if issue is not None:
+                self._paths.pop(issue, None)
+
+    def issue_for(self, action: RunAgent) -> int | None:
+        with self._lock:
+            return self._actions.get(action)
+
+    def snapshot(self) -> tuple[InFlightFix, ...]:
+        with self._lock:
+            return tuple(
+                InFlightFix(issue, paths, exclusive=not paths)
+                for issue, paths in self._paths.items()
+            )
 
 
 def _log(name: str):
@@ -335,7 +481,11 @@ def _prediction_outcome_reporter(journal: Journal | None, repo: str, store: Stor
     return report
 
 
-def _fix_state(store: Store, world) -> FixState:
+def _fix_state(
+    store: Store,
+    world,
+    inflight: tuple[InFlightFix, ...] = (),
+) -> FixState:
     """Read the per-issue/PR orchestration state the fix decision needs."""
     sessions = frozenset(i.number for i in world.issues if store.has_session(i.number))
     resumed = {i.number: store.get_resumed_at(i.number) for i in world.issues}
@@ -374,7 +524,14 @@ def _fix_state(store: Store, world) -> FixState:
     # never trips. Summing folds the orphaned half back into the key the domain
     # actually reads. `alt` is skipped when it IS the breaker key (an issueless
     # PR, where breaker_key already == -pr), so nothing is counted twice.
-    deaths = _process_deaths(store)
+    deaths = dict(_process_deaths(store))
+    # Observation now runs while these dispatches are alive. Their durable
+    # start receipts are intentionally unsettled until the leg finishes, but
+    # they are not process deaths. Remove one reconstructed death per active
+    # dispatch key; historical unsettled rounds under the same key remain.
+    for active in inflight:
+        if deaths.get(active.issue, 0) > 0:
+            deaths[active.issue] -= 1
 
     def _infra_for_pr(p) -> int:
         k = breaker_key(p)
@@ -408,6 +565,7 @@ def _fix_state(store: Store, world) -> FixState:
         rebase_retries=rebase_retries, resolve_retries=resolve_retries,
         infra_deaths=infra_deaths, ci_rerun_head=ci_rerun_head,
         ci_pending_escalated=ci_pending_escalated,
+        inflight=inflight,
     )
 
 
@@ -476,7 +634,7 @@ def _hold_reporter(
                 blocker_pr = None
         return (issue, str(event.get("reason") or ""), blocker_pr, blocker_issue)
 
-    def report(world) -> None:
+    def report(world, inflight=()) -> None:
         nonlocal active
         if active is None:
             active = {}
@@ -496,7 +654,9 @@ def _hold_reporter(
                 elif event.get("state") == "waiting" or event.get("event") == "hold":
                     active[key] = event
 
-        current = {key_for(hold): hold for hold in issue_holds(world)}
+        current = {
+            key_for(hold): hold for hold in issue_holds(world, tuple(inflight))
+        }
         current.update({
             (issue.number, "human", None, None): issue
             for issue in world.open_issues()
@@ -882,11 +1042,17 @@ def build_fix_daemon(
     fix_runner = JournalingRuntime(
         fix_runner, journal, ledger, cfg.repo, "fix", cfg.fixer_runtime
     )
+    reservations = DispatchPathReservations()
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, worktrees, fix_runner, executor,
         prepare_cwd=prepare_cwd, journal=journal,
+        reserve_fix_paths=reservations.expand,
     )
-    executor._run_agent = lambda a: asyncio.run(dispatcher.dispatch(a))  # noqa: SLF001
+    dispatch_runtime = CancellableAsyncDispatch(
+        dispatcher.dispatch,
+        finished=reservations.finish,
+    )
+    executor._run_agent = dispatch_runtime  # noqa: SLF001
 
     report_holds = _hold_reporter(
         journal,
@@ -902,6 +1068,46 @@ def build_fix_daemon(
     report_ci_stalls = _ci_stall_reporter(journal, cfg.repo, fix_cfg, _log("fix"))
     report_duplicates = _duplicate_pr_reporter(journal, cfg.repo, fix_cfg, _log("fix"))
     report_ci_flakes = _ci_flake_reporter(journal, cfg.repo, fix_cfg, _log("fix"))
+    daemon_ref: dict[str, Daemon] = {}
+
+    issue_kinds = frozenset({AgentKind.RESOLVE, AgentKind.RESUME})
+
+    def dispatch_key(action: RunAgent):
+        # `decide` reserves every action from the observed world before tick()
+        # submits it. Reuse that exact identity; a second live GitHub lookup can
+        # disagree with a world-probe snapshot and defeat issue deduplication.
+        issue = reservations.issue_for(action)
+        if issue is None:
+            return (action.kind, action.number)
+        return (
+            ("issue", issue)
+            if issue > 0
+            else ("pr", action.number)
+        )
+
+    def action_reservation(
+        action: RunAgent, world
+    ) -> tuple[int, frozenset[str]]:
+        issues = {issue.number: issue for issue in world.issues}
+        prs = {pr.number: pr for pr in world.prs}
+        if action.kind in issue_kinds:
+            issue = action.number
+            view = issues.get(issue)
+            paths = (
+                view.declared_paths | view.predicted_paths
+                if view is not None
+                else frozenset()
+            )
+            return issue, paths
+        pr = prs.get(action.number)
+        issue = breaker_key(pr) if pr is not None else -action.number
+        view = issues.get(issue)
+        paths = (pr.changed_files if pr is not None else frozenset()) | (
+            view.declared_paths | view.predicted_paths
+            if view is not None
+            else frozenset()
+        )
+        return issue, paths
 
     def decide(world):
         # Report BEFORE deciding: if decide_fix raises, the tick still leaves a
@@ -910,13 +1116,53 @@ def build_fix_daemon(
         # state decide_fix decides on, so the two can never describe different
         # worlds (and the store reads happen once, not twice).
         world = _inject_predicted_paths(store, world)
-        state = _fix_state(store, world)
-        report_holds(world)
+        inflight = reservations.snapshot()
+        state = _fix_state(store, world, inflight)
+        report_holds(world, inflight)
         report_prediction_outcomes(world)
         report_ci_stalls(world)
         report_duplicates(world)
         report_ci_flakes(world, state)
-        return decide_fix(world, fix_cfg, state, fixer_busy())
+        daemon = daemon_ref.get("daemon")
+        externally_busy = fixer_busy()
+        slots = (
+            daemon.available_dispatch_slots
+            if daemon is not None and not externally_busy
+            else 0
+        )
+        decided = decide_fix(
+            world,
+            fix_cfg,
+            state,
+            fixer_busy=bool(inflight) or externally_busy,
+            dispatch_slots=slots,
+        )
+        rejected: list[RunAgent] = []
+        rejected_issues: set[int] = set()
+        for action in decided:
+            if not isinstance(action, RunAgent):
+                continue
+            issue, paths = action_reservation(action, world)
+            if not reservations.reserve(action, issue, paths):
+                rejected.append(action)
+                rejected_issues.add(issue)
+                _log("fix")(
+                    f"dispatch {action.kind.name} #{action.number}: deferred — "
+                    "path reservation changed during decision"
+                )
+        if not rejected:
+            return decided
+        return [
+            action
+            for action in decided
+            if action not in rejected
+            and not (
+                isinstance(action, Relabel)
+                and action.target is Target.ISSUE
+                and action.number in rejected_issues
+                and action.add is Label.AI_WORKING
+            )
+        ]
 
     _log("fix")(fix_capability_line(
         auto_merge=fix_cfg.auto_merge,
@@ -924,10 +1170,23 @@ def build_fix_daemon(
         escalate_on_evidence=cfg.escalate_on_evidence,
         arm_on_open=fix_cfg.arm_on_open,
     ))
-    return Daemon("fix", gateway.build_world, decide, executor,
-                  cfg.tick_interval_seconds, _log("fix"), journal=journal,
-                  tick_gate=_spend_gate(cfg, ledger),
-                  wake_check=_wake_check(cfg, store))
+    daemon = Daemon(
+        "fix",
+        gateway.build_world,
+        decide,
+        executor,
+        cfg.tick_interval_seconds,
+        _log("fix"),
+        journal=journal,
+        tick_gate=_spend_gate(cfg, ledger),
+        wake_check=_wake_check(cfg, store),
+        dispatch_capacity=cfg.fix_dispatch_concurrency,
+        dispatch_key=dispatch_key,
+        cancel_active_dispatches=dispatch_runtime.cancel_all,
+        dispatch_rejected=reservations.finish,
+    )
+    daemon_ref["daemon"] = daemon
+    return daemon
 
 
 def _review_state(store: Store, world) -> ReviewState:

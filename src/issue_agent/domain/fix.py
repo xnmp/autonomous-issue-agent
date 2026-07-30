@@ -8,9 +8,9 @@ Orchestration state that lives in STATE_DIR files (sessions, resumed-at marks,
 automerge markers) is passed in explicitly as `FixState`, and the live-fixer
 run-lock as `fixer_busy` — so the decision stays a pure function of its inputs.
 
-Concurrency model (preserved): ONE fixer, sequential dispatch. Within a single
-poll only ONE fixer-consuming action is emitted; non-fixer actions (auto-merge,
-cleanup) are independent of the lock.
+Concurrency is explicit input: the application supplies free dispatch slots and
+the active issues/paths. The pure decision fills only disjoint slots; non-fixer
+actions (auto-merge, cleanup) remain independent of pool occupancy.
 """
 
 from __future__ import annotations
@@ -157,6 +157,11 @@ class FixState:
     # while a second FAILURE on the SAME head is evidence the diff is broken and
     # goes straight to a paid FIX_CI leg. Missing/"" = never re-run.
     ci_rerun_head: dict[int, str] = field(default_factory=dict)
+    # Paid work currently executing in the application dispatch pool. This is
+    # observation state, not persisted orchestration state: it prevents a second
+    # leg for the same issue and extends the path-overlap serializer to work that
+    # has not opened a PR yet.
+    inflight: tuple["InFlightFix", ...] = ()
     # (PR, head SHA) pairs already escalated by the pending-CI deadline. Unlike
     # the label-based one-shot used by older breakers, this survives an
     # operator deliberately restoring ai-pr-open while the same check runs.
@@ -166,6 +171,16 @@ class FixState:
 # ── holds (why a ready issue was NOT picked) ─────────────────────────────────
 HOLD_BLOCKER = "blocker"
 HOLD_OVERLAP = "overlap"
+
+
+@dataclass(frozen=True)
+class InFlightFix:
+    issue: int
+    paths: frozenset[str] = frozenset()
+    # A leg without a concrete declared/router-predicted path cannot yet be
+    # proven disjoint from other work. Keep it exclusive until the router
+    # persists a usable prediction and a later observation refreshes this value.
+    exclusive: bool = False
 
 
 @dataclass(frozen=True)
@@ -203,7 +218,11 @@ def _overlapping_open_pr(
     return None
 
 
-def _holds(issue: IssueView, world: WorldState) -> tuple[Hold, ...]:
+def _holds(
+    issue: IssueView,
+    world: WorldState,
+    inflight: tuple[InFlightFix, ...] = (),
+) -> tuple[Hold, ...]:
     """Every reason THIS issue is held back, ignoring its label/state (the
     caller decides who is eligible to be held). Empty ⇒ dispatchable.
 
@@ -226,10 +245,28 @@ def _holds(issue: IssueView, world: WorldState) -> tuple[Hold, ...]:
     )
     if overlap is not None:
         holds.append(Hold(issue.number, HOLD_OVERLAP, blocker_pr=overlap.number))
+    paths = issue.declared_paths | issue.predicted_paths
+    for active in inflight:
+        if active.issue == issue.number:
+            holds.append(
+                Hold(issue.number, HOLD_OVERLAP, blocker_issue=active.issue)
+            )
+            break
+        if (
+            active.exclusive
+            or not paths
+            or (active.paths and paths & active.paths)
+        ):
+            holds.append(
+                Hold(issue.number, HOLD_OVERLAP, blocker_issue=active.issue)
+            )
+            break
     return tuple(holds)
 
 
-def issue_holds(world: WorldState) -> tuple[Hold, ...]:
+def issue_holds(
+    world: WorldState, inflight: tuple[InFlightFix, ...] = ()
+) -> tuple[Hold, ...]:
     """Every hold in force this poll: for each OPEN, ai-ready issue that
     `pick_ready_issue` will skip, why. Pure; ordered by the world's issue order,
     then blocker-before-overlap for a doubly-held issue.
@@ -241,7 +278,7 @@ def issue_holds(world: WorldState) -> tuple[Hold, ...]:
         hold
         for issue in world.open_issues()
         if issue_lifecycle(issue).is_ready
-        for hold in _holds(issue, world)
+        for hold in _holds(issue, world, inflight)
     )
 
 
@@ -335,7 +372,9 @@ def duplicate_pr_guards(
 
 
 # ── cores ────────────────────────────────────────────────────────────────────
-def pick_ready_issue(world: WorldState) -> int | None:
+def pick_ready_issue(
+    world: WorldState, inflight: tuple[InFlightFix, ...] = ()
+) -> int | None:
     """Highest-priority ai-ready issue number, or None. Port of watcher.sh §1
     (P1<P2<P3<none; ties broken by issue number for determinism — the bash relied
     on gh's list order, we make it explicit).
@@ -358,7 +397,7 @@ def pick_ready_issue(world: WorldState) -> int | None:
     hold journal explains THIS decision rather than a copy of it."""
     ready = [
         i for i in world.open_issues()
-        if issue_lifecycle(i).is_ready and not _holds(i, world)
+        if issue_lifecycle(i).is_ready and not _holds(i, world, inflight)
     ]
     if not ready:
         return None
@@ -580,9 +619,14 @@ def should_update_branch(pr: PRView, cfg: FixConfig) -> bool:
     ) in (CIState.OK, CIState.NONE)
 
 
-def reap_actions(world: WorldState) -> list[Action]:
-    """When no fixer is alive, an ISSUE still ai-working is orphaned (the run
-    died before resetting the label) → requeue it. Port of watcher-lib.sh:reap.
+def reap_actions(
+    world: WorldState, active_issues: frozenset[int] = frozenset()
+) -> list[Action]:
+    """An ai-working issue with no live leg is orphaned → requeue it.
+
+    Active issue identities are excluded individually. A continuously occupied
+    pool must not suppress recovery of an unrelated orphan, while reaping the
+    issue a healthy worker owns would double-dispatch it.
 
     Where it requeues TO depends on ground truth, not on how the run died
     (re-review P0R-5): an issue that ALREADY HAS AN OPEN PR is repaired to
@@ -615,6 +659,7 @@ def reap_actions(world: WorldState) -> list[Action]:
             Label.AI_PR_OPEN if issue.number in with_open_pr else Label.AI_READY,
         )
         for issue in world.issues_with(Label.AI_WORKING)
+        if issue.number not in active_issues
     ]
 
 
@@ -701,7 +746,9 @@ def cleanup_actions(
     return actions
 
 
-def orphaned_cleanup_actions(world: WorldState) -> list[Action]:
+def orphaned_cleanup_actions(
+    world: WorldState, active_issues: frozenset[int] = frozenset()
+) -> list[Action]:
     """The ISSUE-driven half of merge cleanup (#28): repair an `ai-pr-open` issue
     whose PR is no longer observable anywhere in the world.
 
@@ -754,7 +801,7 @@ def orphaned_cleanup_actions(world: WorldState) -> list[Action]:
     }
     actions: list[Action] = []
     for issue in world.issues_with(Label.AI_PR_OPEN):
-        if issue.number in covered:
+        if issue.number in covered or issue.number in active_issues:
             continue
         if issue.state == "open" and issue.state_reason != "reopened":
             continue
@@ -1005,11 +1052,12 @@ def decide_fix(
     cfg: FixConfig,
     state: FixState,
     fixer_busy: bool,
+    dispatch_slots: int | None = None,
 ) -> list[Action]:
     """One fix-watcher poll. Emits, in poll_once order:
 
       reap (when idle) → CI pending-deadline escalation (lock-free) →
-      duplicate-PR guard (lock-free) → at most ONE fixer-consuming dispatch
+      duplicate-PR guard (lock-free) → bounded fixer-consuming dispatches
       (PR repairs > issue resume > new resolve) →
       auto-merge (lock-free) → cleanup of merged/closed PRs (lock-free).
 
@@ -1017,26 +1065,56 @@ def decide_fix(
     FIX_CI dispatch (#38) — a free GitHub-side action, so it consumes no fixer
     either.
 
-    Only ONE fixer-consuming action is ever returned per poll (the single-fixer
-    invariant). `fixer_busy` reflects the live run-lock and gates the reap step.
+    `dispatch_slots=None` preserves the legacy single-fixer contract: idle means
+    one slot, busy means none. The fix daemon passes its pool's current free
+    slots explicitly. A legacy external busy lock still gates the whole reaper;
+    pool-backed state identifies active issues, so unrelated orphans can recover
+    while healthy live legs remain protected.
 
-    **Single-fixer is enforced by process TOPOLOGY, not by labels** (review
-    M22/D9). One daemon per repo (`single_instance` flock) dispatching
-    synchronously is the whole mechanism: the poll cannot run while a dispatch
-    is in flight, so `consumed` only has to bound ONE poll's emissions. There is
-    deliberately no PR-side `ai-working` busy marker — the SDK port never added
-    one, and the removes/guards that pretended otherwise were deleted rather
-    than left to read as protection a future parallel dispatcher could trust.
-    Reintroducing parallelism (P2) means designing a real lease, not restoring
-    those label writes.
+    Concurrency is enforced twice: this pure decision reserves issue identities
+    and known paths while filling the supplied slots, and the application pool
+    independently bounds workers and rejects duplicate issue keys. There is
+    deliberately no PR-side `ai-working` marker — active dispatch state is the
+    lease, including PR legs mapped back to their linked issue.
     """
     actions: list[Action] = []
 
-    # reap runs only when idle (bash: reap() returns early if fixer_busy).
-    if not fixer_busy:
-        actions.extend(reap_actions(world))
+    active_issues = frozenset(active.issue for active in state.inflight)
+    # A legacy external lock exposes only a boolean, so it cannot identify the
+    # issue to protect and retains global suppression. Pool state carries exact
+    # identities and can safely reap every other orphan.
+    if not fixer_busy or state.inflight:
+        actions.extend(reap_actions(world, active_issues))
 
-    consumed = fixer_busy
+    remaining = (
+        (0 if fixer_busy else 1)
+        if dispatch_slots is None
+        else max(0, dispatch_slots)
+    )
+    inflight = list(state.inflight)
+    issues_by_number = {issue.number: issue for issue in world.issues}
+
+    def dispatchable(issue: int, paths: frozenset[str]) -> bool:
+        exclusive = not paths
+        return all(
+            active.issue != issue
+            and not exclusive
+            and not active.exclusive
+            and not (active.paths and paths & active.paths)
+            for active in inflight
+        )
+
+    def claim(issue: int, paths: frozenset[str]) -> None:
+        nonlocal remaining
+        inflight.append(InFlightFix(issue, paths, exclusive=not paths))
+        remaining -= 1
+
+    def issue_paths(issue: int) -> frozenset[str]:
+        view = issues_by_number.get(issue)
+        if view is None:
+            return frozenset()
+        return view.declared_paths | view.predicted_paths
+
     # Only the fixer's OWN PRs are actionable here — see `fixer_prs`.
     open_prs = list(fixer_prs(world, cfg))
     pr_resume_replies = {
@@ -1045,7 +1123,7 @@ def decide_fix(
     }
 
     # 0) CI pending deadline (#30). Lock-free: it dispatches no agent, so unlike
-    # every breaker below it does not read `consumed`, and for a given world it
+    # every breaker below it does not read the dispatch budget, and for a given world it
     # emits the same actions whether the fixer is busy or idle. It runs FIRST and
     # REMOVES the stalled PR from `open_prs` so no later pass can act on a PR this
     # poll is handing to a human — escalating and dispatching the same PR in one
@@ -1082,8 +1160,12 @@ def decide_fix(
             # PR-stage blockers are answered on the PR, while the saved agent
             # transcript belongs to its linked issue. A qualifying reply gets a
             # dedicated PR-keyed dispatch; all other blocked PRs remain quiet.
-            if not consumed and pr.number in pr_resume_replies:
+            if remaining and pr.number in pr_resume_replies:
                 bkey = breaker_key(pr)
+                issue, _reply_at = pr_resume_replies[pr.number]
+                paths = pr.changed_files | issue_paths(issue)
+                if not dispatchable(issue, paths):
+                    continue
                 if infra_ceiling_hit(state, cfg, bkey):
                     actions.extend(_escalate_pr(
                         pr.number, infra_escalation_reason(cfg.max_infra_deaths),
@@ -1091,9 +1173,9 @@ def decide_fix(
                     ))
                     continue
                 actions.append(RunAgent(AgentKind.PR_RESUME, pr.number))
-                consumed = True
+                claim(issue, paths)
             continue
-        if not consumed:
+        if remaining:
             issue_n = _issue_for_pr(pr)
             bkey = breaker_key(pr)  # retry-counter key (issue N, or -PR when issueless)
             # 3·0) A PR the fixer CANNOT resolve to an issue (no closing-ref AND a
@@ -1128,6 +1210,9 @@ def decide_fix(
             # the conflict existed). Bounded by a breaker → needs-human-review, so
             # a conflict it genuinely can't resolve escalates instead of looping.
             if cfg.auto_rebase_conflicts and pr.is_conflicting():
+                paths = pr.changed_files | issue_paths(issue_n)
+                if not dispatchable(issue_n, paths):
+                    continue
                 if infra_ceiling_hit(state, cfg, bkey):
                     actions.extend(_escalate_pr(
                         pr.number, infra_escalation_reason(cfg.max_infra_deaths)))
@@ -1141,7 +1226,7 @@ def decide_fix(
                     ))
                     continue
                 actions.append(RunAgent(AgentKind.REBASE, pr.number))
-                consumed = True
+                claim(issue_n, paths)
                 continue
             review = latest_other_review(pr.reviews, cfg.fix_bot)
             if (
@@ -1149,6 +1234,9 @@ def decide_fix(
                 and review.state == REVIEW_CHANGES_REQUESTED
                 and not review_superseded(review, pr)
             ):
+                paths = pr.changed_files | issue_paths(issue_n)
+                if not dispatchable(issue_n, paths):
+                    continue
                 # Circuit breaker: repeated address-review ATTEMPTS on the SAME
                 # review escalate to a human rather than looping forever. The
                 # counter is keyed to the review's submitted_at — a stored count
@@ -1167,7 +1255,7 @@ def decide_fix(
                     ))
                     continue
                 actions.append(RunAgent(AgentKind.ADDRESS_REVIEW, pr.number))
-                consumed = True
+                claim(issue_n, paths)
                 continue
             # A superseded CHANGES_REQUESTED review (head moved past it) falls
             # through: the fixer's push is awaiting re-review, but a CI failure
@@ -1175,12 +1263,14 @@ def decide_fix(
             # (The `not lifecycle.is_working` conjunct that used to guard this
             # was deleted with the rest of the phantom PR busy-marker — review
             # M22/D9: nothing ever adds ai-working to a PR, so it was
-            # permanently true. See decide_fix's docstring for what actually
-            # enforces single-fixer.)
+            # permanently true. See decide_fix's docstring for the live lease.)
             if (
                 ci_state(pr.checks, cfg.ci_ignore_checks, known=pr.checks_known)
                 == CIState.FAILURE
             ):
+                paths = pr.changed_files | issue_paths(issue_n)
+                if not dispatchable(issue_n, paths):
+                    continue
                 if infra_ceiling_hit(state, cfg, bkey):
                     actions.extend(_escalate_pr(
                         pr.number, infra_escalation_reason(cfg.max_infra_deaths)))
@@ -1205,7 +1295,7 @@ def decide_fix(
                 # practice the two never meet — the free re-run fires on the
                 # FIRST failure of a head, when the counter is 0.
                 #
-                # Emits no RunAgent, so `consumed` is untouched: this costs no
+                # Emits no RunAgent, so the dispatch budget is untouched: this costs no
                 # fixer and another PR may still dispatch a real leg this poll.
                 # The re-run flips the checks to PENDING, and the #49
                 # pending-outranks-failure rule then makes the fixer wait for
@@ -1217,14 +1307,18 @@ def decide_fix(
                     )
                     continue
                 actions.append(RunAgent(AgentKind.FIX_CI, pr.number))
-                consumed = True
+                claim(issue_n, paths)
                 continue
 
-    # 2) Blocked issue with a NEW answer (first one only).
-    if not consumed:
+    # 2) Blocked issues with NEW answers, up to the remaining disjoint slots.
+    if remaining:
         needing = issues_needing_any_resume(world, state, cfg)
-        if needing:
-            n, _at = needing[0]
+        for n, _at in needing:
+            if not remaining:
+                break
+            paths = issue_paths(n)
+            if not dispatchable(n, paths):
+                continue
             if infra_ceiling_hit(state, cfg, n):
                 actions.extend(issue_escalation(
                     n, infra_escalation_reason(cfg.max_infra_deaths), Label.AI_BLOCKED,
@@ -1234,15 +1328,15 @@ def decide_fix(
                     Relabel(Target.ISSUE, n, Label.AI_BLOCKED, Label.AI_WORKING)
                 )
                 actions.append(RunAgent(AgentKind.RESUME, n))
-                consumed = True
+                claim(n, paths)
 
-    # 3) New ai-ready issue (highest priority), only after repair work.
-    if not consumed:
-        n = pick_ready_issue(world)
+    # 3) New ai-ready issues, only after repair work and only while slots remain.
+    while remaining:
+        n = pick_ready_issue(world, tuple(inflight))
         if n is not None and n in guarded:
             # The duplicate guard above relabels this issue out of the ready set;
             # let the next poll pick the next candidate.
-            pass
+            break
         elif n is not None:
             if breaker_tripped(
                 state.resolve_retries.get(n, 0), cfg.max_resolve_retries
@@ -1253,16 +1347,20 @@ def decide_fix(
                     "opening a PR — this issue needs a human look.",
                     Label.AI_READY,
                 ).actions())
+                break
             elif infra_ceiling_hit(state, cfg, n):
                 actions.extend(issue_escalation(
                     n, infra_escalation_reason(cfg.max_infra_deaths), Label.AI_READY,
                 ).actions())
+                break
             else:
                 actions.append(
                     Relabel(Target.ISSUE, n, Label.AI_READY, Label.AI_WORKING)
                 )
                 actions.append(RunAgent(AgentKind.RESOLVE, n))
-                consumed = True
+                claim(n, issue_paths(n))
+        else:
+            break
 
     # 3c) auto-merge + branch-update: lock-free and INDEPENDENT of the fixer, so
     # they get their OWN pass over the same PRs (review M14). They used to sit at
@@ -1277,12 +1375,12 @@ def decide_fix(
     #   before this logic existed. should_update_branch is marker-independent by
     #   design; both are self-limiting so neither re-fires needlessly.
     # Every predicate here reads the WORLD only (labels, reviews, checks, the
-    # marker) — never `consumed`/`fixer_busy` — which is what makes "independent"
+    # marker) — never dispatch budget / pool occupancy — which makes "independent"
     # checkable: for a given world these two arms emit the same actions in both
     # lock states. (A PR escalated on an EARLIER poll carries needs-human-review,
     # so is_blocked keeps it out; a PR escalated on THIS poll is not filtered,
-    # because reading this poll's escalations would re-import the lock dependence
-    # — escalation itself only happens when the fixer is idle.)
+    # because reading this poll's escalations would re-import pool dependence —
+    # escalation itself only happens when a dispatch slot is available.)
     for pr in open_prs:
         if pr_lifecycle(pr).is_blocked:
             continue  # a human owns the next move — don't arm anything
@@ -1295,6 +1393,11 @@ def decide_fix(
     for pr in world.prs:
         if pr_lifecycle(pr).needs_cleanup:
             issue_n = _issue_for_pr(pr)
+            if issue_n in active_issues:
+                # A terminal worker can still emit lifecycle follow-ups. Defer
+                # the whole cleanup transaction so it cannot resurrect a closed
+                # issue or lose a terminal relabel after this poll publishes it.
+                continue
             observed = _observed_issue(world, issue_n)
             actions.extend(cleanup_actions(
                 pr, issue_n, cfg,
@@ -1309,6 +1412,6 @@ def decide_fix(
     # world can no longer see at all. Lock-free, and deliberately AFTER (4) so
     # `covered` reflects the same snapshot the PR-driven arm just consumed — the
     # two are disjoint by construction, never both acting on one issue.
-    actions.extend(orphaned_cleanup_actions(world))
+    actions.extend(orphaned_cleanup_actions(world, active_issues))
 
     return actions

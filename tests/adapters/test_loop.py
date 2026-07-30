@@ -1,6 +1,10 @@
 """Daemon loop — tick sequencing, crash isolation, heartbeat."""
 
+import asyncio
 import json
+import threading
+
+import pytest
 
 from issue_agent.adapters.journal import Journal, read_events
 from issue_agent.adapters.github import GhUnavailable
@@ -89,6 +93,292 @@ def test_tick_executes_cheap_actions_before_agent_dispatches():
         ("run", 500),
         ("run", 534),          # dispatch order among dispatches preserved
     ]
+
+
+def test_observation_and_lifecycle_continue_while_the_only_dispatch_slot_is_busy():
+    """N=1 remains serial for paid work but no longer makes the daemon blind."""
+    from issue_agent.domain.actions import AgentKind, EnableAutoMerge, RunAgent
+
+    started = threading.Event()
+    release = threading.Event()
+    observations = []
+
+    class LiveGateway(FakeGateway):
+        def __init__(self):
+            super().__init__()
+            self.arm_attempts = 0
+
+        def enable_auto_merge(self, pr, method):
+            self.arm_attempts += 1
+            return self.arm_attempts > 1
+
+    gateway = LiveGateway()
+
+    def run_agent(_action):
+        started.set()
+        assert release.wait(timeout=5)
+
+    executor = Executor(gateway, run_agent=run_agent)
+    daemon = Daemon(
+        "fix",
+        lambda: observations.append(len(observations) + 1) or WorldState(),
+        lambda _world: [
+            EnableAutoMerge(24, "squash"),
+            RunAgent(AgentKind.RESOLVE, 7),
+        ],
+        executor,
+        dispatch_capacity=1,
+    )
+
+    first = daemon.tick()
+    assert started.wait(timeout=1)
+    second = daemon.tick()
+
+    assert observations == [1, 2]
+    assert gateway.arm_attempts == 2, "a failed arm retries on the next poll"
+    assert [a for a in first + second if isinstance(a, RunAgent)] == [
+        RunAgent(AgentKind.RESOLVE, 7)
+    ], "the same issue is never double-dispatched"
+
+    release.set()
+    daemon.wait_for_dispatches()
+
+
+def test_background_dispatch_is_bounded_and_admits_independent_targets():
+    from issue_agent.domain.actions import AgentKind, RunAgent
+
+    release = threading.Event()
+    started: list[int] = []
+    started_two = threading.Event()
+    next_issue = iter((1, 2, 3))
+
+    def run_agent(action):
+        started.append(action.number)
+        if len(started) == 2:
+            started_two.set()
+        assert release.wait(timeout=5)
+
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _world: [RunAgent(AgentKind.RESOLVE, next(next_issue))],
+        Executor(FakeGateway(), run_agent=run_agent),
+        dispatch_capacity=2,
+    )
+
+    daemon.tick()
+    daemon.tick()
+    assert started_two.wait(timeout=1)
+    third = daemon.tick()
+
+    assert set(started) == {1, 2}
+    assert len(daemon.active_dispatches) == 2
+    assert third == [], "the third paid leg is not accepted above the bound"
+
+    release.set()
+    daemon.wait_for_dispatches()
+
+
+def test_rejected_dispatch_releases_exclusive_lease_and_can_retry():
+    from issue_agent.app.roles import DispatchPathReservations
+    from issue_agent.domain.actions import AgentKind, RunAgent
+
+    started = threading.Event()
+    release = threading.Event()
+    retried = threading.Event()
+    reservations = DispatchPathReservations()
+    occupying = RunAgent(AgentKind.RESOLVE, 1)
+    rejected = RunAgent(AgentKind.RESOLVE, 50)
+    ticks = 0
+
+    def decide(_world):
+        nonlocal ticks
+        ticks += 1
+        if ticks == 1:
+            return [occupying]
+        assert reservations.reserve(rejected, 50, frozenset())
+        return [rejected]
+
+    def run_agent(action):
+        if action == occupying:
+            started.set()
+            assert release.wait(timeout=5)
+        else:
+            retried.set()
+            reservations.finish(action)
+
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        decide,
+        Executor(FakeGateway(), run_agent=run_agent),
+        dispatch_capacity=1,
+        dispatch_rejected=reservations.finish,
+    )
+
+    daemon.tick()
+    assert started.wait(timeout=1)
+    assert daemon.tick() == []
+    assert reservations.snapshot() == ()
+
+    unrelated = RunAgent(AgentKind.RESOLVE, 99)
+    assert reservations.reserve(unrelated, 99, frozenset({"src/z.py"}))
+    reservations.finish(unrelated)
+
+    release.set()
+    daemon.wait_for_dispatches()
+    assert daemon.tick() == [rejected]
+    assert retried.wait(timeout=1)
+    daemon.wait_for_dispatches()
+
+
+def test_submit_exception_releases_decision_lease():
+    from issue_agent.app.roles import DispatchPathReservations
+    from issue_agent.domain.actions import AgentKind, RunAgent
+
+    reservations = DispatchPathReservations()
+    action = RunAgent(AgentKind.RESOLVE, 50)
+    assert reservations.reserve(action, 50, frozenset())
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _world: [action],
+        Executor(FakeGateway()),
+        dispatch_capacity=1,
+        dispatch_rejected=reservations.finish,
+    )
+    assert daemon._dispatch_pool is not None
+    daemon._dispatch_pool.shutdown()
+
+    assert daemon.tick() == []
+    assert reservations.snapshot() == ()
+    assert reservations.reserve(
+        RunAgent(AgentKind.RESOLVE, 99),
+        99,
+        frozenset({"src/z.py"}),
+    )
+
+
+def test_hot_reload_drains_paid_work_while_observation_continues():
+    from issue_agent.adapters.reload import RELOAD_EXIT_CODE
+    from issue_agent.domain.actions import AgentKind, RunAgent
+
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    observations = []
+    sleeps = 0
+
+    def run_agent(_action):
+        started.set()
+        assert release.wait(timeout=5)
+        finished.set()
+
+    def sleep(_seconds):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 2:
+            release.set()
+            assert finished.wait(timeout=1)
+
+    daemon = Daemon(
+        "fix",
+        lambda: observations.append(len(observations) + 1) or WorldState(),
+        lambda _world: [RunAgent(AgentKind.RESOLVE, 7)],
+        Executor(FakeGateway(), run_agent=run_agent),
+        poll_seconds=1,
+        dispatch_capacity=1,
+    )
+
+    with pytest.raises(SystemExit) as stopped:
+        daemon.run_forever(
+            sleep=sleep,
+            now=lambda: 0,
+            max_ticks=4,
+            reload_check=lambda: True,
+        )
+
+    assert started.is_set()
+    assert stopped.value.code == RELOAD_EXIT_CODE
+    assert observations == [1, 2, 3]
+
+
+def test_operator_interrupt_cancels_async_dispatch_and_joins_pool():
+    from issue_agent.app.roles import CancellableAsyncDispatch
+    from issue_agent.domain.actions import AgentKind, RunAgent
+
+    started = threading.Event()
+    cancelled = threading.Event()
+
+    async def dispatch(_action):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    runtime = CancellableAsyncDispatch(dispatch)
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _world: [RunAgent(AgentKind.RESOLVE, 7)],
+        Executor(FakeGateway(), run_agent=runtime),
+        poll_seconds=1,
+        dispatch_capacity=1,
+        cancel_active_dispatches=runtime.cancel_all,
+    )
+
+    def interrupt(_seconds):
+        assert started.wait(timeout=1)
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        daemon.run_forever(sleep=interrupt, now=lambda: 0)
+
+    assert cancelled.wait(timeout=1)
+    assert daemon.active_dispatches == ()
+    assert daemon.available_dispatch_slots == 0
+
+
+def test_interrupt_before_worker_registration_is_sticky():
+    from issue_agent.app.roles import CancellableAsyncDispatch
+    from issue_agent.domain.actions import AgentKind, RunAgent
+
+    registering = threading.Event()
+    allow_registration = threading.Event()
+
+    class PausedRegistration(CancellableAsyncDispatch):
+        def _new_cancel_event(self):
+            registering.set()
+            assert allow_registration.wait(timeout=1)
+            return super()._new_cancel_event()
+
+        def cancel_all(self):
+            super().cancel_all()
+            allow_registration.set()
+
+    async def dispatch(_action):
+        await asyncio.Event().wait()
+
+    runtime = PausedRegistration(dispatch)
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _world: [RunAgent(AgentKind.RESOLVE, 7)],
+        Executor(FakeGateway(), run_agent=runtime),
+        poll_seconds=1,
+        dispatch_capacity=1,
+        cancel_active_dispatches=runtime.cancel_all,
+    )
+
+    def interrupt(_seconds):
+        assert registering.wait(timeout=1)
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        daemon.run_forever(sleep=interrupt, now=lambda: 0)
+
+    assert daemon.active_dispatches == ()
 
 
 def test_tick_isolated_from_action_crash():

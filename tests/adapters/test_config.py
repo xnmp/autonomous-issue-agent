@@ -814,6 +814,23 @@ def test_max_infra_deaths_zero_is_a_valid_off_value():
     assert c.validation_errors() == ()
 
 
+def test_fix_dispatch_concurrency_defaults_dormant_and_can_be_activated():
+    assert from_env({"REPO": "x"}).fix_dispatch_concurrency == 1
+    assert from_env({
+        "REPO": "x",
+        "FIX_DISPATCH_CONCURRENCY": "2",
+    }).fix_dispatch_concurrency == 2
+
+
+def test_fix_dispatch_concurrency_must_be_positive():
+    cfg = from_env({
+        "REPO": "x",
+        "FIX_BOT": "fix-bot",
+        "FIX_DISPATCH_CONCURRENCY": "0",
+    })
+    assert "FIX_DISPATCH_CONCURRENCY must be > 0" in cfg.validation_errors()
+
+
 def test_codex_is_priced_out_of_the_box_so_the_spend_caps_are_not_blind():
     # A subscription bills $0, but the quota it draws down is real — so the
     # shipped rates are non-zero (synthetic dollars over real token volume) and

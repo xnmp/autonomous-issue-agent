@@ -386,6 +386,8 @@ def test_non_dict_usage_is_dropped_rather_than_stored():
 # is a genuine transport failure.
 import asyncio
 
+import pytest
+
 from issue_agent.adapters.agent_runner import AgentRunner
 
 
@@ -611,6 +613,41 @@ def test_idle_timeout_trips_on_hang(monkeypatch):
     assert r.is_error and r.status == "timeout"
     assert r.exit_reason is ExitReason.IDLE_TIMEOUT
     assert any("IDLE" in m for m in logged)
+
+
+def test_dispatch_cancellation_joins_pending_watchdog_receive(monkeypatch):
+    closed = asyncio.Event()
+
+    async def fake_query(prompt, options):
+        try:
+            await asyncio.Event().wait()
+            yield object()
+        finally:
+            closed.set()
+
+    import sys
+    import types
+
+    fake = types.ModuleType("claude_agent_sdk")
+    fake.ClaudeAgentOptions = lambda **kw: object()
+    fake.ResultMessage = _ResultMessage
+    fake.query = fake_query
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", fake)
+
+    async def scenario():
+        task = asyncio.create_task(
+            AgentRunner(idle_timeout=60.0, poll_slice=0.01).run(
+                AgentTask(prompt="x")
+            )
+        )
+        await asyncio.sleep(0.02)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert closed.is_set()
+        assert asyncio.all_tasks() == {asyncio.current_task()}
+
+    asyncio.run(scenario())
 
 
 def test_clean_end_without_result_classifies_as_no_result(monkeypatch):

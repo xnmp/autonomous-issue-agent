@@ -163,8 +163,18 @@ class AgentDispatcher:
     AgentRunner; `gateway`/`store`/`worktrees` are the adapters. `run` is
     `runner.run` (async). All collaborators are injected → fully fakeable."""
 
-    def __init__(self, cfg: DispatchConfig, gateway, store, worktrees,
-                 runner: AgentRuntime, executor, prepare_cwd=None, journal=None):
+    def __init__(
+        self,
+        cfg: DispatchConfig,
+        gateway,
+        store,
+        worktrees,
+        runner: AgentRuntime,
+        executor,
+        prepare_cwd=None,
+        journal=None,
+        reserve_fix_paths=None,
+    ):
         self.cfg = cfg
         self.gw = gateway
         self.store = store
@@ -183,7 +193,13 @@ class AgentDispatcher:
             # Journal folded in here for the same reason as the steward's below:
             # it arrives as a constructor argument, not through DispatchConfig.
             replace(cfg.fix_workflow_config(), journal=journal),
-            gateway, store, worktrees, runner, executor, prepare_cwd,
+            gateway,
+            store,
+            worktrees,
+            runner,
+            executor,
+            prepare_cwd,
+            reserve_fix_paths,
         )
         self.review_workflow = ReviewWorkflow(
             replace(cfg.review_workflow_config(), journal=journal),

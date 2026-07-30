@@ -167,6 +167,7 @@ def create_app(
     @app.get(
         "/api/repos/{name}/issues/{number}",
         response_model=contracts.IssueDetailPayload,
+        response_model_exclude_unset=True,
     )
     async def api_issue(name: str, number: int):
         await require_known(name)

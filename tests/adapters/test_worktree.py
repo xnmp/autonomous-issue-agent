@@ -2,7 +2,9 @@
 
 import os
 import subprocess
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -48,6 +50,33 @@ def test_ensure_reuses_existing_worktree():
     assert path.endswith("issue-5")
     # existing → no `worktree add`
     assert not any(a[0][:2] == ["worktree", "add"] for a in fg.calls)
+
+
+def test_concurrent_worktree_setup_serializes_shared_git_metadata():
+    active = 0
+    maximum = 0
+    guard = threading.Lock()
+
+    def git(_args, _cwd):
+        nonlocal active, maximum
+        with guard:
+            active += 1
+            maximum = max(maximum, active)
+        time.sleep(0.002)
+        with guard:
+            active -= 1
+        return GitResult(0, "")
+
+    worktrees = Worktrees("/repo", run=git, path_exists=lambda _path: True)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        paths = tuple(pool.map(
+            lambda spec: worktrees.ensure(*spec),
+            ((5, "fix/5-x"), (6, "fix/6-y")),
+        ))
+
+    assert paths[0].endswith("issue-5")
+    assert paths[1].endswith("issue-6")
+    assert maximum == 1
 
 
 def test_worktree_list_matches_exact_issue_directory_not_prefix():

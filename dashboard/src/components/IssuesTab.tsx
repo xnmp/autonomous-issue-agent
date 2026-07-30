@@ -286,7 +286,9 @@ function InFlightTable({
               ? null
               : card.idle_s + (card.idle_active ? offset : 0);
             const open = expanded === card.issue;
-            const alert = card.flags.some((flag) => flag === "escalated" || flag === "spend-blocked");
+            const alert = card.flags.some(
+              (flag) => flag === "escalated" || flag === "spend-blocked" || flag === "blocked",
+            );
             return (
               <Fragment key={card.issue}>
                 <tr
@@ -784,6 +786,11 @@ function taskName(step: CardStep): string {
 }
 
 function IssueSummary({ card, open }: { card: IssueCard; open: boolean }) {
+  const now = useClock();
+  const humanWait = card.human_wait_since_ts
+    ? Math.max(0, (now - Date.parse(card.human_wait_since_ts)) / 1000)
+    : (card.human_wait_s ?? null);
+  const secondaryFlags = card.flags.filter((flag) => flag !== card.human_action);
   return (
     <div className="issue-summary">
       <span className={`chev${open ? " open" : ""}`} aria-hidden="true">▸</span>
@@ -791,10 +798,25 @@ function IssueSummary({ card, open }: { card: IssueCard; open: boolean }) {
         <span className="issue-summary-title" title={card.title ?? undefined}>
           {card.title ?? <span className="faint">title unavailable</span>}
         </span>
+        {card.stage === "awaiting human reply" ? (
+          <span
+            className="issue-attention"
+            title={card.attention_reason ?? "The agent is waiting for a reply."}
+          >
+            awaiting human reply
+            {card.attention_reason ? ` · ${card.attention_reason}` : ""}
+          </span>
+        ) : null}
         <div className="row-wrap">
           <IssueNumber issue={card.issue} url={card.url} />
           <PrLink card={card} />
-          {card.flags.length > 0 ? <FlagList flags={card.flags} /> : null}
+          {card.human_action ? (
+            <span className={`human-action human-action-${card.human_action}`}>
+              {card.human_action.replace("-", " ")}
+              {humanWait !== null ? ` · ${duration(humanWait, false)}` : ""}
+            </span>
+          ) : null}
+          {secondaryFlags.length > 0 ? <FlagList flags={secondaryFlags} /> : null}
         </div>
       </div>
     </div>

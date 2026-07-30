@@ -59,11 +59,17 @@ const CardStep = z
   .passthrough();
 const IssueCard = z
   .object({
+    attention_reason: z.union([z.string(), z.null()]).optional(),
     cost_usd: z.union([z.number(), z.null()]),
     done: z.boolean(),
     elapsed_s: z.union([z.number(), z.null()]),
     estimated: z.boolean(),
     flags: z.array(z.string()),
+    human_action: z
+      .union([z.enum(["merge-ready", "awaiting-reply", "escalated"]), z.null()])
+      .optional(),
+    human_wait_s: z.union([z.number(), z.null()]).optional(),
+    human_wait_since_ts: z.union([z.string(), z.null()]).optional(),
     idle_active: z.boolean(),
     idle_s: z.union([z.number(), z.null()]),
     issue: z.number().int(),
@@ -172,6 +178,7 @@ const IssueStep = z
   .passthrough();
 const IssueDetailPayload = z
   .object({
+    attention_reason: z.union([z.string(), z.null()]).optional(),
     cost_usd: z.union([z.number(), z.null()]),
     done: z.boolean(),
     elapsed_s: z.union([z.number(), z.null()]),
@@ -430,6 +437,7 @@ const endpoints = makeApi([
     ],
     response: z
       .object({
+        attention_reason: z.union([z.string(), z.null()]).optional(),
         cost_usd: z.union([z.number(), z.null()]),
         done: z.boolean(),
         elapsed_s: z.union([z.number(), z.null()]),
