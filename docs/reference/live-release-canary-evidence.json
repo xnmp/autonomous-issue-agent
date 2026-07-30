@@ -242,9 +242,9 @@
     }
   },
   "adversarial_blocker_follow_up": {
-    "observed_at": "2026-07-30T20:49:38Z",
-    "commit": "e399771daf7c7db280127e58b060bd5199f8f17e",
-    "code_tree": "9b9a694181ac232a9570623ef97eadfa1f84284c",
+    "observed_at": "2026-07-30T20:57:15Z",
+    "commit": "c8b2c5dc52c55c8489f4e5a76a675e7b2da7274b",
+    "code_tree": "d78c8a8ab39aa7cef3d0b8502b20e7f40a834cdc",
     "closed_findings": [
       "Concurrent review validators use independent reservations under one durable top-level dispatch claim.",
       "Legacy role owners atomically adopt active runs, leases, and nonterminal effects at the deployment-identity cutover.",
@@ -275,17 +275,17 @@
       "clean_target_test": "passed",
       "roles": {
         "fix": {
-          "pid": 2954690,
+          "pid": 2998287,
           "heartbeat_state": "stopped",
           "in_flight": []
         },
         "review": {
-          "pid": 2954691,
+          "pid": 2998288,
           "heartbeat_state": "stopped",
           "in_flight": []
         },
         "steward": {
-          "pid": 2954692,
+          "pid": 2998289,
           "heartbeat_state": "stopped",
           "in_flight": []
         }
