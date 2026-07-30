@@ -286,6 +286,8 @@ class CommandKind(str, Enum):
     SET_REPOSITORY_AUTO_MERGE = "set_repository_auto_merge"
     DELETE_RELAY_HOOK = "delete_relay_hook"
     START_RELAY_FORWARD = "start_relay_forward"
+    CREATE_JIRA_ISSUE = "create_jira_issue"
+    TRANSITION_JIRA_ISSUE = "transition_jira_issue"
 
 
 @dataclass(frozen=True)

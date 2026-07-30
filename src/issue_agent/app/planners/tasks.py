@@ -28,7 +28,12 @@ from ...domain.trust import Untrusted, as_untrusted, untrusted_block
 from ...adapters.runtime_plan import McpServer, SubagentDef
 from ...domain.agent_task import RuntimeName
 from ...domain.effort import DEFAULT_TIER, Effort, TIER_LADDER
-from ...domain.jira import JiraPhase
+from ...domain.jira import (
+    JiraPhase,
+    jira_correlation_id,
+    valid_jira_project_key,
+    valid_jira_ticket_key,
+)
 from .schemas import (
     ADJUDICATE_SCHEMA,
     AUTHOR_SCHEMA,
@@ -1397,13 +1402,25 @@ class JiraTaskConfig:
     max_budget_usd: float = 0.50
     model: str | None = None
 
+    def __post_init__(self) -> None:
+        if not valid_jira_project_key(self.project_key):
+            raise ValueError(
+                "Jira project key must be 2-10 uppercase alphanumeric "
+                "characters and start with a letter"
+            )
+        if not self.repo:
+            raise ValueError("Jira sync requires a repository identity")
+
 
 def build_jira_sync_task(
     issue_number: int,
     title: Untrusted,
     body: Untrusted,
     target: JiraPhase,
-    existing_key: str, cfg: JiraTaskConfig,
+    existing_key: str,
+    cfg: JiraTaskConfig,
+    *,
+    reconcile_first: bool = False,
 ) -> PlannedRun:
     """Create or transition the Jira ticket mirroring GitHub issue #N.
 
@@ -1415,31 +1432,54 @@ def build_jira_sync_task(
     gh_url = f"https://github.com/{cfg.repo}/issues/{issue_number}" if cfg.repo else f"GitHub issue #{issue_number}"
     cloud = f" on Jira site '{cfg.cloud_id}'" if cfg.cloud_id else ""
     want = _JIRA_PHASE_WORDS[target]
+    correlation = jira_correlation_id(
+        cfg.repo,
+        cfg.project_key,
+        issue_number,
+    )
     if existing_key:
+        if not valid_jira_ticket_key(existing_key, cfg.project_key):
+            raise ValueError("existing Jira key is outside the configured project")
         prompt = (
             f"Mirror GitHub issue #{issue_number} onto its existing Jira ticket "
             f"{existing_key}{cloud}. Move {existing_key} to {want}.\n"
-            f"1. Call getTransitionsForJiraIssue for {existing_key} to find the available "
-            "transitions.\n"
+            f"1. Read {existing_key} first, then call "
+            "getTransitionsForJiraIssue to find the available transitions.\n"
             "2. If it is NOT already in that status, call transitionJiraIssue with the "
             "matching transition id; return status=transitioned. If it is already there, "
             "change nothing and return status=nothing.\n"
-            "Make the minimum number of calls. Do not edit any other field."
+            f"Return ticket_key={existing_key} in either case. Make the minimum "
+            "number of calls. Do not edit any other field."
         )
     else:
         prompt = (
-            f"Create a Jira ticket mirroring GitHub issue #{issue_number} in project "
-            f"'{cfg.project_key}'{cloud}, then set its status.\n"
-            f"1. Create a 'Task' issue for GitHub issue #{issue_number}; derive its "
+            f"Reconcile or create the Jira ticket mirroring GitHub issue "
+            f"#{issue_number} in project '{cfg.project_key}'{cloud}.\n"
+            f"Correlation marker: [{correlation}]\n"
+            "1. Search this configured project for that exact correlation "
+            "marker. If exactly one ticket already contains it, do not create "
+            "another; use that ticket and return its key.\n"
+            "2. Only when the search proves no matching ticket exists, create "
+            f"one 'Task' for GitHub issue #{issue_number}; derive its "
             "summary from the encoded title below, and put a "
-            f"link to {gh_url} plus a one-line context in the description.\n"
-            f"2. Move the new ticket to {want} (getTransitionsForJiraIssue → "
+            f"link to {gh_url}, the exact correlation marker, and a one-line "
+            "context in the description.\n"
+            f"3. Move the reconciled ticket to {want} "
+            "(getTransitionsForJiraIssue → "
             "transitionJiraIssue) unless it is created there already.\n"
-            "Return status=created with ticket_key set to the new key (e.g. ABC-123). "
+            "Return status=created only if this run created it; otherwise return "
+            "status=nothing. Always set ticket_key to the reconciled ticket's "
+            f"key in project {cfg.project_key}. "
             "Make the minimum number of calls.\n\n"
             f"{_fenced('github issue title', title)}\n"
             f"{_fenced('github issue body', body)}"
         )
+        if reconcile_first:
+            prompt = (
+                "A prior attempt has an unknown outcome. The search/readback "
+                "step is mandatory and must complete before any create call.\n"
+                + prompt
+            )
     return PlannedRun(
         prompt=prompt,
         schema=JIRA_SYNC_SCHEMA,

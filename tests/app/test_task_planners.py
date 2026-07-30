@@ -865,17 +865,28 @@ JIRA_CFG = JiraTaskConfig(
 )
 
 
+@pytest.mark.parametrize(
+    "project_key",
+    ("", "a", "abc", "A-", "ABCDEFGHIJK", "ABC; DROP"),
+)
+def test_jira_task_config_rejects_unsafe_project_keys(project_key):
+    with pytest.raises(ValueError, match="project key"):
+        JiraTaskConfig(project_key=project_key, repo="o/r")
+
+
 def test_jira_sync_create_when_no_key():
     t = build_jira_sync_task(
         5, U("Null token"), U("crashes"), JiraPhase.TODO, "", JIRA_CFG
     )
     assert t.schema is JIRA_SYNC_SCHEMA
-    assert "Create a Jira ticket" in t.prompt
+    assert "Reconcile or create the Jira ticket" in t.prompt
     assert "project 'ABC'" in t.prompt
     assert "GitHub issue #5" in t.prompt
     assert '"Null token"' in t.prompt
     assert "github.com/o/r/issues/5" in t.prompt           # backlink
     assert "status=created" in t.prompt and "ticket_key" in t.prompt
+    assert "Search this configured project" in t.prompt
+    assert "[issue-agent:" in t.prompt
     # the Atlassian MCP + its tool glob ride along.
     assert t.mcp_servers and t.mcp_servers[0].name == "atlassian"
     assert "mcp__atlassian__*" in t.all_allowed_tools()
@@ -888,7 +899,7 @@ def test_jira_sync_transition_when_key_present():
     assert "ABC-12" in t.prompt
     assert "getTransitionsForJiraIssue" in t.prompt and "transitionJiraIssue" in t.prompt
     assert "in-progress" in t.prompt.lower()
-    assert "Create a Jira ticket" not in t.prompt           # not a create
+    assert "Reconcile or create" not in t.prompt           # not a create
 
 
 def test_jira_sync_done_phrasing():

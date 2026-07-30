@@ -13,6 +13,8 @@ Stdlib only; no adapters/SDK imports (enforced by import-linter).
 
 from __future__ import annotations
 
+import hashlib
+import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
@@ -61,6 +63,37 @@ class JiraSyncOutcome:
     @property
     def should_persist(self) -> bool:
         return self.result is JiraSyncResult.PERSIST
+
+
+_PROJECT_KEY = re.compile(r"^[A-Z][A-Z0-9]{1,9}$")
+
+
+def valid_jira_project_key(project_key: str) -> bool:
+    return bool(_PROJECT_KEY.fullmatch(project_key))
+
+
+def valid_jira_ticket_key(ticket_key: str, project_key: str) -> bool:
+    if not valid_jira_project_key(project_key):
+        return False
+    return bool(
+        re.fullmatch(
+            rf"{re.escape(project_key)}-[1-9][0-9]*",
+            ticket_key,
+        )
+    ) and len(ticket_key) <= 64
+
+
+def jira_correlation_id(
+    repository: str,
+    project_key: str,
+    issue: int,
+) -> str:
+    if not repository or not valid_jira_project_key(project_key) or issue <= 0:
+        raise ValueError("complete Jira correlation scope is required")
+    digest = hashlib.sha256(
+        f"{repository}\0{project_key}\0{issue}".encode()
+    ).hexdigest()
+    return f"issue-agent:{digest[:32]}"
 
 
 # Lifecycle label → phase, in DESCENDING precedence (first match wins). An issue
@@ -113,11 +146,19 @@ def plan_jira_sync(labels: Iterable[Label], existing_key: str, last_phase: str) 
 
 
 def jira_sync_outcome(
-    *, is_error: bool, status: str, returned_ticket_key: str, existing_key: str, target: JiraPhase,
+    *,
+    is_error: bool,
+    status: str,
+    returned_ticket_key: str,
+    existing_key: str,
+    target: JiraPhase,
+    project_key: str,
 ) -> JiraSyncOutcome:
     if is_error or status == "failed":
         return JiraSyncOutcome(JiraSyncResult.RETRY, reason="failed")
     ticket_key = existing_key or returned_ticket_key.strip()
     if not ticket_key:
         return JiraSyncOutcome(JiraSyncResult.RETRY, reason="missing_ticket_key")
+    if not valid_jira_ticket_key(ticket_key, project_key):
+        return JiraSyncOutcome(JiraSyncResult.RETRY, reason="invalid_ticket_key")
     return JiraSyncOutcome(JiraSyncResult.PERSIST, ticket_key=ticket_key, phase=target.value)

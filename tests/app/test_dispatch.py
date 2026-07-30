@@ -439,7 +439,7 @@ def test_jira_create_persists_key_and_phase():
                                     structured={"status": "created", "ticket_key": "ABC-9"}))
     d = _jira_dispatcher(gw, store, runner)
     asyncio.run(d.dispatch(RunAgent(AgentKind.JIRA_SYNC, 5)))
-    assert "Create a Jira ticket" in runner.tasks[0].prompt   # no key → create
+    assert "Reconcile or create the Jira ticket" in runner.tasks[0].prompt
     assert store.get_jira_key(5) == "ABC-9"
     assert store.get_jira_phase(5) == "todo"
 

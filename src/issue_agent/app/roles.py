@@ -2235,6 +2235,7 @@ def build_steward_daemon(
                 repo=repo_cfg.repo, mcp_servers=mcp, max_budget_usd=jira_runtime.budget_usd,
                 model=steward_runtime.triage_model,
     )
+    owner_id = _owner_identity(cfg, "steward")
     dcfg = DispatchConfig(
         base_branch=repo_cfg.base_branch,
         triage=TriageTaskConfig(
@@ -2251,10 +2252,11 @@ def build_steward_daemon(
         # Not for dispatching anything — the steward's recurrence check needs to
         # know whose merged PRs count as "shipped by this harness".
         fix_bot=cfg.fix_runtime.bot,
+        command_identity=f"{owner_id}:jira",
+        config_version=cfg.config_version,
         **_spend_cfg(cfg, "steward"),
     )
     control = _control_store(cfg, cfg.steward_state_dir, journal)
-    owner_id = _owner_identity(cfg, "steward")
     effect_executor = _effects(
         gateway,
         control,

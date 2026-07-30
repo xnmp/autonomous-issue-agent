@@ -15,7 +15,7 @@ FIX_SCHEMA: dict = {
         "summary": {"type": "string"},
         "needs": {"type": "string", "description": "if blocked, exactly what is needed"},
     },
-    "required": ["status", "summary"],
+    "required": ["status", "ticket_key", "summary"],
 }
 
 # Author leg (test/interface writer, when AUTHOR_TESTS_SPLIT is on). The author

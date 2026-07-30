@@ -2577,6 +2577,23 @@ class SQLiteControlStore:
             for row in rows
         )
 
+    def latest_command(self, logical_key: str) -> PendingCommand | None:
+        if not logical_key:
+            raise ValueError("logical command key is required")
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT * FROM lifecycle_commands WHERE logical_key=? "
+                "ORDER BY occurrence DESC LIMIT 1",
+                (logical_key,),
+            ).fetchone()
+        if row is None:
+            return None
+        return PendingCommand(
+            _command_from_row(row),
+            str(row["state"]),
+            int(row["attempts"]),
+        )
+
     def begin_command(self, command_id: CommandId) -> None:
         with self.transaction() as db:
             row = db.execute(

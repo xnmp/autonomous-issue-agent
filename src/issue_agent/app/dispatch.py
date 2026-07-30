@@ -96,6 +96,8 @@ class DispatchConfig:
     # fields only provide durable run attribution.
     role: str = ""
     repo: str = ""
+    command_identity: str = ""
+    config_version: str = ""
     # The ceiling this role's decide side reads off the infra-death counter
     # (fix: max_infra_deaths; review: max_unproductive_rounds). Used ONLY to
     # saturate the counter on a deterministic death (#13) so the role's existing
@@ -152,7 +154,13 @@ class DispatchConfig:
         )
 
     def jira_workflow_config(self) -> JiraSyncWorkflowConfig:
-        return JiraSyncWorkflowConfig(jira=self.jira, log=self.log)
+        return JiraSyncWorkflowConfig(
+            jira=self.jira,
+            log=self.log,
+            repository=self.repo,
+            command_identity=self.command_identity,
+            config_version=self.config_version,
+        )
 
 
 class AgentDispatcher:
@@ -212,7 +220,13 @@ class AgentDispatcher:
             ),
             gateway, store, runner, executor,
         )
-        self.jira_workflow = JiraSyncWorkflow(cfg.jira_workflow_config(), gateway, store, runner)
+        self.jira_workflow = JiraSyncWorkflow(
+            cfg.jira_workflow_config(),
+            gateway,
+            store,
+            runner,
+            dedupe if hasattr(dedupe, "enqueue_command") else None,
+        )
 
     async def _run_logged(self, label: str, issue: int, task):
         """Run one agent leg, bracketing it with start/done breadcrumbs so a long

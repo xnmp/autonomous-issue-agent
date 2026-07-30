@@ -1,5 +1,7 @@
 """GitHub lifecycle → Jira phase mapping + sync-needed decision (pure)."""
 
+import pytest
+
 from issue_agent.domain.jira import (
     JiraPhase,
     JiraSyncDecision,
@@ -91,18 +93,18 @@ def test_plan_skips_when_existing_ticket_already_at_target():
 def test_outcome_retries_on_agent_failure_or_failed_status():
     assert jira_sync_outcome(
         is_error=True, status="error", returned_ticket_key="ABC-1",
-        existing_key="", target=JiraPhase.TODO,
+        existing_key="", target=JiraPhase.TODO, project_key="ABC",
     ).result is JiraSyncResult.RETRY
     assert jira_sync_outcome(
         is_error=False, status="failed", returned_ticket_key="ABC-1",
-        existing_key="", target=JiraPhase.TODO,
+        existing_key="", target=JiraPhase.TODO, project_key="ABC",
     ).result is JiraSyncResult.RETRY
 
 
 def test_outcome_requires_ticket_key_for_create():
     outcome = jira_sync_outcome(
         is_error=False, status="created", returned_ticket_key="",
-        existing_key="", target=JiraPhase.TODO,
+        existing_key="", target=JiraPhase.TODO, project_key="ABC",
     )
 
     assert outcome.result is JiraSyncResult.RETRY
@@ -112,11 +114,12 @@ def test_outcome_requires_ticket_key_for_create():
 def test_outcome_persists_created_key_or_existing_transition_key():
     created = jira_sync_outcome(
         is_error=False, status="created", returned_ticket_key=" ABC-1 ",
-        existing_key="", target=JiraPhase.TODO,
+        existing_key="", target=JiraPhase.TODO, project_key="ABC",
     )
     transitioned = jira_sync_outcome(
         is_error=False, status="transitioned", returned_ticket_key="",
         existing_key="ABC-1", target=JiraPhase.IN_PROGRESS,
+        project_key="ABC",
     )
 
     assert created.result is JiraSyncResult.PERSIST
@@ -125,3 +128,28 @@ def test_outcome_persists_created_key_or_existing_transition_key():
     assert transitioned.result is JiraSyncResult.PERSIST
     assert transitioned.ticket_key == "ABC-1"
     assert transitioned.phase == "in_progress"
+
+
+@pytest.mark.parametrize(
+    "ticket_key",
+    (
+        "OTHER-1",
+        "ABC-0",
+        "ABC--1",
+        "abc-1",
+        "ABC-1; transition OTHER-2",
+        "ABC-9999999999999999999999999999999999999999999999999999999999999",
+    ),
+)
+def test_outcome_rejects_keys_outside_the_configured_project(ticket_key):
+    outcome = jira_sync_outcome(
+        is_error=False,
+        status="created",
+        returned_ticket_key=ticket_key,
+        existing_key="",
+        target=JiraPhase.TODO,
+        project_key="ABC",
+    )
+
+    assert outcome.result is JiraSyncResult.RETRY
+    assert outcome.reason == "invalid_ticket_key"
