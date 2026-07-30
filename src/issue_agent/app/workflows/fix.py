@@ -78,6 +78,9 @@ class FixWorkflow:
     runner: AgentRuntime
     executor: object
     prepare_cwd: Callable[[str], None] | None = None
+    # Atomic application-level reservation update for router-expanded paths.
+    # None keeps standalone workflow tests and serial callers unchanged.
+    reserve_paths: Callable[[int, frozenset[str]], bool] | None = None
 
     def _ensure_cwd(self, issue: int, branch: str) -> str:
         cwd = self.worktrees.ensure(issue, branch)
@@ -469,7 +472,14 @@ class FixWorkflow:
             self.cfg.log(
                 f"agent #{issue}: route — tier={tier or 'unknown'} → model={routed.model}"
             )
-            return routed, self._prediction_overlaps_open_pr(issue, predicted_paths)
+            reservation_conflict = (
+                self.reserve_paths is not None
+                and not self.reserve_paths(issue, predicted_paths)
+            )
+            return routed, (
+                reservation_conflict
+                or self._prediction_overlaps_open_pr(issue, predicted_paths)
+            )
 
     async def resolve(self, issue: int) -> None:
         if self.cfg.author_tests_split:

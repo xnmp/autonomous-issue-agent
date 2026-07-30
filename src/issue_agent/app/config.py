@@ -179,6 +179,10 @@ class HarnessConfig:
     # (60 here, "20" there) — from_env now reads its default off THIS field, so
     # there is exactly one source and 20 (the value that actually shipped) wins.
     poll_seconds: int = 20
+    # Paid fix legs run independently of observation. One preserves serial
+    # dispatch while retaining decoupled polling; values >1 admit disjoint work
+    # up to this bound. Review and steward dispatch remain synchronous.
+    fix_dispatch_concurrency: int = 1
     # Webhook push (#1): `gh webhook forward` runs as a supervised fourth
     # process and touches each role's wake file on every delivery. Deliveries
     # are WAKE SIGNALS ONLY — never acted on as payloads — so the stateless
@@ -598,6 +602,9 @@ class HarnessConfig:
         # behind a range check on the substituted default.
         errors: list[str] = list(self.parse_errors)
         _require_positive(errors, "POLL_SECONDS", self.poll_seconds)
+        _require_positive(
+            errors, "FIX_DISPATCH_CONCURRENCY", self.fix_dispatch_concurrency
+        )
         # Same rule as POLL_SECONDS: 0 is not "disabled", it is a busy loop.
         _require_positive(errors, "RECONCILE_SECONDS", self.reconcile_seconds)
         _require_non_negative(errors, "MAX_CI_RETRIES", self.max_ci_retries)
@@ -754,6 +761,7 @@ class HarnessConfig:
             f"fixer={self.fixer_runtime} fix_model={model(self.fix_model)} "
             f"fix_effort={getattr(self.fix_effort, 'value', None) or '(runtime default)'} "
             f"escalate={'on' if self.escalate_on_evidence else 'off'} "
+            f"dispatch_concurrency={self.fix_dispatch_concurrency} "
             f"{fix_budget}",
             f"reviewer={self.reviewer_runtime} review_model={model(self.review_model)} "
             f"mode={self.review_mode.value} review_budget=${self.review_budget_usd:.2f} "
@@ -1164,6 +1172,12 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         steward_state_dir=e.get("STEWARD_STATE_DIR") or _default_state_dir(repo, "steward-agent"),
         worktree_root=e.get("WORKTREE_ROOT", _dc_default("worktree_root")),
         poll_seconds=_coerce_int(e, "POLL_SECONDS", _dc_default("poll_seconds"), errors),
+        fix_dispatch_concurrency=_coerce_int(
+            e,
+            "FIX_DISPATCH_CONCURRENCY",
+            _dc_default("fix_dispatch_concurrency"),
+            errors,
+        ),
         webhook_wake=_b(e, "WEBHOOK_WAKE", _dc_default("webhook_wake"), errors),
         reconcile_seconds=_coerce_int(
             e, "RECONCILE_SECONDS", _dc_default("reconcile_seconds"), errors
