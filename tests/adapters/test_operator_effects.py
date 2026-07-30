@@ -14,6 +14,7 @@ class Remote:
         self.issue_labels = {"backlog"}
         self.issue_revision = 1
         self.auto_merge = False
+        self.reject_auto_merge = False
         self.repo_revision = 1
         self.hooks = []
         self.next_hook = 100
@@ -73,8 +74,9 @@ class Remote:
             )
         if argv[:4] == ["gh", "api", "-X", "PATCH"]:
             self._before_mutation()
-            self.auto_merge = True
-            self.repo_revision += 1
+            if not self.reject_auto_merge:
+                self.auto_merge = True
+                self.repo_revision += 1
             return self.result()
         if argv[:3] == ["gh", "api", "repos/o/r/hooks"]:
             return self.result(json.dumps(self.hooks))
@@ -177,6 +179,28 @@ def test_remote_bootstrap_mutations_all_receive_terminal_receipts(tmp_path) -> N
     assert remote.catalog == {"P1"}
     assert remote.auto_merge is True
     assert remote.remote_branches == {"dev": remote.local_head}
+    assert store.pending_commands() == ()
+
+
+def test_confirmed_repository_setting_rejection_is_terminal_until_reinvoked(
+    tmp_path,
+) -> None:
+    effects, remote, store = _effects(tmp_path)
+    remote.reject_auto_merge = True
+
+    first = effects.set_repository_auto_merge(True)
+    assert first[0] is False
+    assert "rejected" in first[1]
+    assert store.pending_commands() == ()
+
+    second = effects.set_repository_auto_merge(True)
+    patches = [
+        call
+        for call in remote.calls
+        if call[:4] == ("gh", "api", "-X", "PATCH")
+    ]
+    assert second[0] is False
+    assert len(patches) == 2
     assert store.pending_commands() == ()
 
 

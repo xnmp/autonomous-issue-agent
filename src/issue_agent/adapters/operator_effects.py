@@ -197,6 +197,7 @@ class GitHubOperatorEffects:
                         f"allow_auto_merge={'true' if enabled else 'false'}",
                     ]
                 ),
+                unconfirmed_status=EffectStatus.PERMANENT_FAILURE,
             )
             return True, "ok"
         except Exception as exc:  # noqa: BLE001 - operator-facing result
@@ -384,6 +385,7 @@ class GitHubOperatorEffects:
         reconcile: Callable[[], bool],
         revision: Callable[[], str],
         apply: Callable[[], object],
+        unconfirmed_status: EffectStatus = EffectStatus.RETRYABLE_FAILURE,
     ) -> None:
         pending = self.store.enqueue_command(command)
         command = pending.command
@@ -393,7 +395,8 @@ class GitHubOperatorEffects:
             pending = self.store.enqueue_command_occurrence(command)
             command = pending.command
         if pending.state == EffectStatus.PERMANENT_FAILURE.value:
-            raise OperatorEffectError(f"{command.command_id}: permanent failure")
+            pending = self.store.enqueue_command_occurrence(command)
+            command = pending.command
         if pending.state in {"executing", EffectStatus.UNKNOWN_OUTCOME.value}:
             if reconcile():
                 self.store.resolve_unknown_effect(
@@ -446,6 +449,15 @@ class GitHubOperatorEffects:
                 return
             raise
         applied = reconcile()
+        error = (
+            None
+            if applied
+            else (
+                "remote rejected the requested state"
+                if unconfirmed_status is EffectStatus.PERMANENT_FAILURE
+                else "remote state did not confirm mutation"
+            )
+        )
         self.store.record_effect(
             EffectReceipt(
                 command.command_id,
@@ -455,13 +467,13 @@ class GitHubOperatorEffects:
                 (
                     EffectStatus.SUCCEEDED
                     if applied
-                    else EffectStatus.RETRYABLE_FAILURE
+                    else unconfirmed_status
                 ),
-                error=None if applied else "remote state did not confirm mutation",
+                error=error,
             )
         )
         if not applied:
-            raise OperatorEffectError("remote state did not confirm mutation")
+            raise OperatorEffectError(error or "remote mutation failed")
 
     def _command(
         self,
