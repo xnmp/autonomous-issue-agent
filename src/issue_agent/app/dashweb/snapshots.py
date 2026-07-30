@@ -18,17 +18,13 @@ import math
 
 from ...domain import dashboard as dash
 from ...domain.actions import AgentKind
+from ...domain.labels import LIFECYCLE_LABELS
 
 # Frecency windows: (seconds, weight). An event inside 24h counts in all three,
 # which is the intended pile-up — a repo that moved this morning must outrank a
 # repo that moved a fortnight ago even if the fortnight-old one has more events.
 FRECENCY_WINDOWS = ((86400.0, 3.0), (7 * 86400.0, 1.0), (30 * 86400.0, 0.25))
 
-# The lifecycle labels the harness owns. An open issue carrying none of them has
-# never been offered to the harness — that is the backlog.
-LIFECYCLE_LABELS = frozenset(
-    {"ai-ready", "ai-working", "ai-done", "ai-blocked", "needs-human-review"}
-)
 PRIORITY_LABELS = ("P1", "P2", "P3")
 _AGENT_KINDS = frozenset(kind.name for kind in AgentKind)
 _DISPATCH_AGENT_KINDS = _AGENT_KINDS - {"ROUTE"}
