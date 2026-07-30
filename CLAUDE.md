@@ -237,7 +237,9 @@ evidence; push explicit refspecs instead. Refs supplied by
 `remote.<name>.push` are parsed and checked by the same source/destination
 rules. Unsafe refspec-less modes, config-query failures, wildcards, matching
 refspecs, mirrors, and command-local push overrides fail closed and require an
-explicit `HEAD:<destination>`.
+explicit `HEAD:<destination>`. Push options that take a separate value are
+consumed before identifying the remote and refspecs, so option payloads cannot
+shift the source/destination parse.
 
 Late-heartbeat reconciliation requires both the wall threshold and a positive
 wall-minus-active-monotonic gap, distinguishing a machine suspension from an
