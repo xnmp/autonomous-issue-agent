@@ -225,7 +225,9 @@ only with a tracked `.harness/test-immutability-exceptions` line in the form
 branch and the path must match an existing changed test. An empty replacement
 means an in-place rewrite; deletion requires a new replacement test in the same
 diff. Both Python and Bash gates fail closed on malformed or unmatched entries,
-and reviewer task builders elevate the declaration from the PR diff.
+and reviewer task builders elevate the declaration from the PR diff. A manifest
+inherited from the base is inert audit history; a later issue claiming an
+exception replaces its contents with declarations for that issue only.
 
 Late-heartbeat reconciliation requires both the wall threshold and a positive
 wall-minus-active-monotonic gap, distinguishing a machine suspension from an
