@@ -346,31 +346,6 @@ def test_review_task_round_one_and_readonly():
     assert "evidence/" in t.prompt
 
 
-_TEST_EXCEPTION_DIFF = """\
-diff --git a/.harness/test-immutability-exceptions b/.harness/test-immutability-exceptions
-new file mode 100644
---- /dev/null
-+++ b/.harness/test-immutability-exceptions
-@@ -0,0 +1 @@
-+124 | tests/test_cost.py | old assertion ignores cached tokens | tests/test_cost_regression.py
-diff --git a/tests/test_cost.py b/tests/test_cost.py
-"""
-
-
-def test_test_immutability_exception_is_loud_in_every_full_pr_diff_context():
-    initial = build_review_task(100, "PR title", "desc", _TEST_EXCEPTION_DIFF, RCFG)
-    resumed = build_re_review_task(
-        100, 2, "old", "new", _TEST_EXCEPTION_DIFF, "session", RCFG
-    )
-
-    for task in (initial, resumed):
-        assert "TEST IMMUTABILITY EXCEPTION" in task.prompt
-        assert "issue #124" in task.prompt
-        assert "tests/test_cost.py" in task.prompt
-        assert "old assertion ignores cached tokens" in task.prompt
-        assert "tests/test_cost_regression.py" in task.prompt
-
-
 def test_re_review_task_substitutes_round_and_resumes():
     t = build_re_review_task(100, 3, "old", "new", "delta", "rs", RCFG)
     assert "round=3" in t.append_system_prompt

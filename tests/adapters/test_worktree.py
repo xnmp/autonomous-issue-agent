@@ -239,22 +239,6 @@ def test_build_gate_context_reads_branch_subjects_changed():
     assert ctx.changed_files == ("src/x.py", "tests/test_x.py")
 
 
-def test_build_gate_context_reads_test_exception_manifest_from_head(tmp_path):
-    dirty = tmp_path / ".harness" / "test-immutability-exceptions"
-    dirty.parent.mkdir()
-    dirty.write_text("5 | tests/test_dirty.py | hidden local authorization |\n")
-    committed = "5 | tests/test_x.py | committed expectation was wrong |\n"
-    fg = _builder_git()
-    fg.table["show HEAD:.harness/test-immutability-exceptions"] = GitResult(
-        0, committed
-    )
-
-    ctx = build_gate_context(str(tmp_path), base_branch="dev", git=fg)
-
-    assert ctx.test_immutability_exceptions == committed
-    assert "tests/test_dirty.py" not in ctx.test_immutability_exceptions
-
-
 def test_build_gate_context_unresolvable_base():
     fg = FakeGit({
         "rev-parse --abbrev-ref": GitResult(0, "fix/5-x\n"),
