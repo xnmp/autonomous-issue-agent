@@ -51,6 +51,9 @@ class Label(str, Enum):
 
     # Escalation.
     NEEDS_HUMAN_REVIEW = "needs-human-review"  # review/address-review exhausted
+    # A runtime budget cap needs an operator to change the cap or resume from
+    # the handover; it says nothing about the agent's capability.
+    NEEDS_BUDGET_REVIEW = "needs-budget-review"
 
     # Priority (orthogonal to lifecycle; used only for ordering ai-ready).
     P1 = "P1"
@@ -64,6 +67,7 @@ ADVISORY_LABELS: frozenset[Label] = frozenset(
     {
         Label.RECURRENCE,
         Label.MAYBE_RESOLVED,
+        Label.NEEDS_BUDGET_REVIEW,
     }
 )
 
