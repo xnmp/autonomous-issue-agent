@@ -63,6 +63,19 @@ def test_absent_mismatched_and_malformed_declarations_fail_closed():
     assert not unicode_issue.ok and "invalid issue" in unicode_issue.reason
 
 
+def test_declaration_must_name_the_current_branch_issue():
+    result = check_tests_immutable(
+        _changed("tests/test_app.py"),
+        _base,
+        exists_at_head=lambda _path: True,
+        issue_number=125,
+        exception_manifest="124 | tests/test_app.py | old expectation was wrong |\n",
+    )
+
+    assert not result.ok
+    assert "issue #125" in result.reason
+
+
 def test_deletion_requires_a_new_changed_replacement_test():
     manifest = (
         "124 | tests/test_app.py | moved focused coverage "
@@ -87,6 +100,32 @@ def test_deletion_requires_a_new_changed_replacement_test():
 
     assert allowed.ok
     assert not denied.ok and "replacement" in denied.reason
+
+
+def test_deletion_rejects_unchanged_or_non_test_replacements():
+    changed = _changed("tests/test_app.py", "tests/test_old.py", "src/app.py")
+    base = lambda path: path in {"tests/test_app.py", "tests/test_old.py"}
+    head = lambda path: path in {"tests/test_old.py", "src/app.py"}
+
+    unchanged = check_tests_immutable(
+        changed,
+        base,
+        exists_at_head=head,
+        issue_number=124,
+        exception_manifest=(
+            "124 | tests/test_app.py | moved coverage | tests/test_old.py\n"
+        ),
+    )
+    non_test = check_tests_immutable(
+        changed,
+        base,
+        exists_at_head=head,
+        issue_number=124,
+        exception_manifest="124 | tests/test_app.py | moved coverage | src/app.py\n",
+    )
+
+    assert not unchanged.ok
+    assert not non_test.ok
 
 
 def test_declared_corrected_test_stays_present_during_implementation_revert():

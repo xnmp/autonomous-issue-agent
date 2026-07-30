@@ -73,6 +73,12 @@ CASES = (
          ),
          _pr_argv(), False, env={"TEST_CMD": "true"},
          reason_contains="invalid issue"),
+    Case("malformed", "pr",
+         lambda path: _with_manifest(
+             path, "13 | tests/test_keep.py | missing final field\n"
+         ),
+         _pr_argv(), False, env={"TEST_CMD": "true"},
+         reason_contains="malformed"),
     Case("dirty_override", "pr", _dirty_override, _pr_argv(), False,
          env={"TEST_CMD": "true"}, reason_contains="unchanged or new file"),
     Case("dirty_recreated_deletion", "pr", _dirty_recreated_deletion,
