@@ -8,7 +8,8 @@ from pathlib import Path
 import pytest
 
 import issue_agent.adapters.handover as handover_adapter
-from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
+from tests.fakes.legacy_journal import Journal
+from issue_agent.adapters.journal import JournalingRuntime, read_events
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.outcome import AgentResult, ExitReason
 

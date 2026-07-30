@@ -9,12 +9,17 @@ import asyncio
 
 from issue_agent.domain import governor_policy
 from issue_agent.adapters.governor import (
+    _GATE_HANDLERS,
     GateContext,
     evaluate_command,
     make_posttooluse_hook,
     make_pretooluse_hook,
     make_read_record_hook,
 )
+
+
+def test_gate_registry_covers_every_classified_kind():
+    assert frozenset(_GATE_HANDLERS) == governor_policy.GOVERNED_KINDS
 from issue_agent.domain.contracts import (
     TestExecution as ExecutionReceipt,
     TestExecutionStatus as ExecutionStatus,

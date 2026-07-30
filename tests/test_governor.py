@@ -414,57 +414,25 @@ def test_direct_no_verify_is_blocked_anti_vacuity_baseline():
     assert gov.find_violations("git commit --no-verify -m x")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="M9/R3-F8: `sh -c '<payload>'` puts the payload in an opaque "
-    "string leaf; classify() never sees a nested `git` command, so "
-    "`sh -c 'git commit --no-verify -m x'` skips the gate entirely.",
-)
-def test_sh_c_bypasses_the_no_verify_block():
+def test_sh_c_is_unresolvable_and_blocked():
     assert gov.find_violations("sh -c 'git commit --no-verify -m x'")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="M9/R3-F8: same as sh -c — `bash -c '<payload>'` is an opaque "
-    "string leaf to the parser, so `bash -c 'git commit --no-verify -m x'` "
-    "skips the gate entirely.",
-)
-def test_bash_c_bypasses_the_no_verify_block():
+def test_bash_c_is_unresolvable_and_blocked():
     assert gov.find_violations("bash -c 'git commit --no-verify -m x'")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="M9/R3-F8: `python -c '<payload>'` hides the git invocation "
-    "inside a language-interpreter string classify() never inspects, so "
-    "`python -c \"...os.system('git commit --no-verify -m x')\"` skips the "
-    "gate entirely.",
-)
-def test_python_c_bypasses_the_no_verify_block():
+def test_python_c_is_unresolvable_and_blocked():
     assert gov.find_violations(
         "python -c \"import os; os.system('git commit --no-verify -m x')\""
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="M9/R3-F8: `eval '<payload>'` re-executes its string argument as "
-    "shell at runtime, but statically it is one opaque string leaf, so "
-    "`eval 'git commit --no-verify -m x'` skips the gate entirely.",
-)
-def test_eval_bypasses_the_no_verify_block():
+def test_eval_is_unresolvable_and_blocked():
     assert gov.find_violations("eval 'git commit --no-verify -m x'")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="M9/R3-F8: `xargs <cmd> <args>` puts `git` as the SECOND word of "
-    "the command node (first is `xargs`), which classify()'s "
-    "first-word-only check never looks past, so `xargs git commit "
-    "--no-verify -m x` skips the gate entirely.",
-)
-def test_xargs_bypasses_the_no_verify_block():
+def test_xargs_before_git_is_unresolvable_and_blocked():
     assert gov.find_violations("xargs git commit --no-verify -m x")
 
 

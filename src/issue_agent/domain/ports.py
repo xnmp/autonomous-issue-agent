@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Protocol, TypeVar, runtime_checkable
 
 from .actions import Action
-from .events import Correlation, JsonValue
+from .events import Correlation, JsonValue, TelemetryEvent
 from .contracts import (
     BudgetScope,
     CommandId,
@@ -54,8 +54,9 @@ class RecentlyMergedRef(Protocol):
 class WorkflowGitHubReads(GitHubReads, Protocol):
     """Read surface required by paid workflows.
 
-    Missing optional enrichment is represented by an empty value or a typed
-    transport exception, never by an absent method discovered with ``getattr``.
+    Missing optional enrichment is represented by an empty value. A transport
+    failure raises the adapter's typed unavailable exception and aborts the
+    observation; it is never converted to an empty world.
     """
 
     def get_issue(self, number: int) -> IssueView: ...
@@ -93,7 +94,12 @@ class IssueStore(Protocol):
 
 
 class WorkflowState(Protocol):
-    """Durable state used by fix/review/steward/Jira workflows."""
+    """Durable workflow state.
+
+    Missing scalar values use their documented empty/zero value. Read,
+    corruption, and write failures propagate and fail the current workflow;
+    callers never treat them as an absent marker.
+    """
 
     def get_branch(self, issue: int) -> str: ...
     def save_branch(self, issue: int, branch: str) -> None: ...
@@ -139,21 +145,32 @@ class WorkflowState(Protocol):
 
 
 class ActionExecutor(Protocol):
+    """Durable privileged effects.
+
+    ``False`` means at least one effect remains non-terminal. Transport and
+    ambiguous outcomes are persisted/reconciled by the implementation rather
+    than exposed as a successful return.
+    """
+
     def execute_all(self, actions: Iterable[Action]) -> bool: ...
     def submit_review(self, pr: int, event: str, body: str) -> bool: ...
 
 
 class LegacyJournal(Protocol):
-    """Temporary typed boundary for the retained read-only JSONL converter."""
+    """Read-only locator retained solely for historical JSONL conversion."""
 
     path: str
     canonical: bool
 
-    def emit(self, event: str, **fields: object) -> None: ...
-
 
 @runtime_checkable
 class WorktreePort(Protocol):
+    """Local checkout ownership.
+
+    ``branch_for_issue`` returns ``None`` only when no checkout exists. Invalid
+    or unsafe paths and command failures raise; callers must not infer absence.
+    """
+
     def ensure(self, issue: int, branch: str) -> str: ...
     def remove(self, issue: int) -> None: ...
     def branch_for_issue(self, issue: int, fallback: str) -> str | None: ...
@@ -164,12 +181,18 @@ class FixWorktreePort(WorktreePort, Protocol):
 
 
 class EventSink(Protocol):
-    """Best-effort telemetry only; never a control-state reader."""
+    """Best-effort typed telemetry only; never a control-state reader.
 
-    def emit(self, event: object) -> None: ...
+    Implementations contain write failures and may drop an event. The method
+    has no success result because telemetry cannot authorize later behavior.
+    """
+
+    def emit(self, event: TelemetryEvent) -> None: ...
 
 
 class Clock(Protocol):
+    """Injected wall/monotonic time; invalid sleeps raise ``ValueError``."""
+
     def now(self) -> datetime: ...
     def monotonic_ns(self) -> int: ...
     def sleep(self, seconds: float) -> None: ...
@@ -184,7 +207,11 @@ class AccountingStatus(str):
 
 
 class SpendAccount(Protocol):
-    """Transactional paid-admission authority; every operation is idempotent."""
+    """Transactional paid-admission authority.
+
+    Every mutation is idempotent. Expected exhaustion/unavailability/conflict
+    is returned as a typed disposition; malformed requests raise before I/O.
+    """
 
     def snapshot(self, scope: BudgetScope) -> object: ...
     def reserve(
@@ -232,7 +259,11 @@ class RecoveryRelease(Protocol):
 
 
 class RecoveryControl(Protocol):
-    """Operational subset used by boot/suspend recovery."""
+    """Operational subset used by boot/suspend recovery.
+
+    Store corruption/unavailability raises and blocks admission/startup.
+    Missing leases/reservations are normal empty results.
+    """
 
     def reclaim_dead_leases(
         self, owner_id: str, is_alive: Callable[[int, int], bool]
@@ -244,18 +275,44 @@ class RecoveryControl(Protocol):
 
 
 class SpendReconciler(Protocol):
-    """Settle exact surviving provider evidence; false means indeterminate."""
+    """Settle exact surviving provider evidence; ``False`` means indeterminate.
+
+    Provider or store failures propagate so recovery cannot release capacity
+    after an unverified attempt.
+    """
 
     def reconcile(self, run_id: RunId) -> bool: ...
 
 
 class RunAbandonmentSink(Protocol):
-    """Emit a correction for a durable run proven dead by recovery."""
+    """Emit a correction for a durable run proven dead by recovery.
+
+    ``False`` means the referenced start was unavailable; telemetry failure
+    never changes operational recovery state.
+    """
 
     def abandon_run(self, run_id: RunId, reason: str) -> bool: ...
 
 
+class WorktreeRecovery(Protocol):
+    """Idempotent local checkout recovery; any validation failure is fatal."""
+
+    def prune_validate(self) -> int: ...
+
+
+class CommandRecovery(Protocol):
+    """Reconcile-first remote command recovery; ambiguity stays pending."""
+
+    def drain_pending_commands(self) -> int: ...
+
+
 class ControlStore(Protocol):
+    """Transactional control authority.
+
+    Claims/receipts return ``False`` for an idempotent/conflicting repeat.
+    Corruption, schema, and storage failures raise and fail closed.
+    """
+
     def transaction(self) -> AbstractContextManager[object]: ...
     def claim(self, namespace: str, scope: str, key: str) -> bool: ...
     def receipt(
@@ -264,7 +321,29 @@ class ControlStore(Protocol):
     def flush_outbox(self, sink: EventSink) -> int: ...
 
 
+@runtime_checkable
+class LevelState(Protocol):
+    """Restart-safe level memory; corrupt/unavailable reads fail closed."""
+
+    def load_level_state(
+        self, namespace: str, scope: str
+    ) -> Mapping[str, Mapping[str, JsonValue]]: ...
+
+    def replace_level_state(
+        self,
+        namespace: str,
+        scope: str,
+        values: Mapping[str, Mapping[str, JsonValue]],
+    ) -> None: ...
+
+
 class WorldObservationStore(Protocol):
+    """Persist committed observation hashes.
+
+    ``False`` is an idempotent unchanged observation. Storage failures raise;
+    they are not interpreted as a changed or empty world.
+    """
+
     def record_world_observation(
         self,
         *,
@@ -279,12 +358,14 @@ class WorldObservationStore(Protocol):
 
 @runtime_checkable
 class BranchState(Protocol):
+    """Durable branch mapping; ``None`` means absent, failures raise."""
     def save_branch(self, issue: int, branch: str) -> None: ...
     def get_branch(self, issue: int) -> str | None: ...
 
 
 @runtime_checkable
 class PredictionWriter(Protocol):
+    """Durable advisory path prediction; storage failures raise."""
     def save_predicted_paths(
         self, issue: int, paths: frozenset[str]
     ) -> None: ...
@@ -292,29 +373,35 @@ class PredictionWriter(Protocol):
 
 @runtime_checkable
 class PredictionReader(Protocol):
+    """Read path prediction; empty means absent, storage failures raise."""
     def get_predicted_paths(self, issue: int) -> frozenset[str]: ...
 
 
 @runtime_checkable
 class CiPendingState(Protocol):
+    """Read the escalated head; empty means absent, storage failures raise."""
     def get_ci_pending_escalated_head(self, pr: int) -> str: ...
 
 
 @runtime_checkable
 class IssueStateReasonReads(Protocol):
+    """Read GitHub state reason; transport failures raise."""
     def issue_state_reason(self, issue: int) -> str: ...
 
 
 @runtime_checkable
 class RecentMergesReads(Protocol):
+    """Read recent merges; transport failure raises, no matches is empty."""
     def recently_merged_issues(self, author: str) -> tuple[object, ...]: ...
 
 
 @runtime_checkable
 class ReviewPromptReads(Protocol):
+    """Read review context; transport failure raises."""
     def review_comments(self, pr: int) -> str: ...
 
 
 @runtime_checkable
 class CiPromptReads(Protocol):
+    """Read CI failure context; transport failure raises."""
     def failed_run_log(self, pr: int, *, branch: str) -> str: ...

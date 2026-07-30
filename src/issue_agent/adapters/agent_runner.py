@@ -24,6 +24,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from .child_env import CHILD_ENV_MANIFEST
 from .runtime_plan import AgentRuntime, RuntimePlan, git_identity_env
 from ..domain.contracts import RunId
 from ..domain.outcome import AgentResult, ExitReason, declared_status
@@ -506,6 +507,9 @@ class AgentRunner(AgentRuntime):
                 **kwargs.get("env", {}),
                 **supervisor_env,
             }
+            kwargs["env"][CHILD_ENV_MANIFEST] = " ".join(
+                sorted(kwargs["env"])
+            )
         # Older SDK builds have no such field and reject it at construction.
         if "max_buffer_size" in kwargs and "max_buffer_size" not in _option_field_names():
             kwargs.pop("max_buffer_size")
@@ -855,7 +859,7 @@ class AgentRunner(AgentRuntime):
         # Attach the stream sum to the COMPLETED result too: journaled beside the
         # ResultMessage total, each completed run becomes a calibration pair, and
         # the estimator learns its $/token rate in stream units — the only units
-        # an aborted run can ever be priced in (see observed_cost_per_token).
+        # the accounting runtime can retain the provider evidence on abort.
         if usage_acc:
             result = dataclasses.replace(result, stream_usage=dict(usage_acc))
         # Calibration line for the abort-cost estimator: on a COMPLETED run both

@@ -17,9 +17,15 @@ uv run python scripts/benchmark_control_plane.py --iterations 500
 ```
 
 The probe reports p50/p95/max latency for a complete reserve→outbox→release
-cycle and resulting database/event-log size. The full suite separately measures
+cycle, committed-outbox publication delay, projection rebuild time, exhausted
+and unavailable admission/tick latency, active-child shutdown time, and
+database/event-log growth per transition. The full suite separately measures
 two-process final-cap races, hundreds of concurrent accounting transitions,
-outbox retry after sink failure, active-child shutdown, and orphan recovery.
+outbox retry after sink failure, shutdown finalization, and orphan recovery.
+
+Record probe output from deployment-class storage before raising throughput.
+Treat the numbers as a local capacity observation, not a portable promise:
+filesystem sync behavior dominates SQLite and append-only event latency.
 
 Re-evaluate SQLite or the single-host design when any of these become true:
 

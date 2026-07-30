@@ -56,6 +56,7 @@ import pytest
 
 from issue_agent.app import main as main_module
 from issue_agent.app.main import _load_agent_env
+from tests.fakes.executor import ImmediateExecutor as Executor
 
 ROOT = Path(__file__).resolve().parents[2]
 COMPOSE_ENV_SH = ROOT / "bin" / "compose-env.sh"
@@ -579,7 +580,6 @@ def test_build_role_does_not_reload_env_when_already_provided(
 
 
 def test_world_probe_preserves_fix_daemon_dispatch_identity(monkeypatch, tmp_path):
-    from issue_agent.app.execute import Executor
     from issue_agent.app.loop import Daemon
     from issue_agent.domain.world import WorldState
 

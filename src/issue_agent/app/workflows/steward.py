@@ -5,19 +5,26 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from ...adapters.journal import groomed_keys, read_events_tail, recurrence_keys
 from ...domain import triage as triage_dom
 from ...adapters.runtime_plan import AgentRuntime
+from ...domain.events import (
+    Correlation,
+    IssueGroomed,
+    RecurrenceDetected,
+    TelemetryEvent,
+)
+from ...domain.leg import Leg, LegTarget
 from ...domain.ports import (
     ActionExecutor,
     ControlStore,
-    LegacyJournal,
+    EventSink,
     RecentMergesReads,
     WorkflowGitHubReads,
     WorkflowState,
 )
 from ...domain.triage import TriageConfig
 from ...domain.triage import TriageVerdict
+from ...domain.trust import as_untrusted
 from ..planners import tasks as task_builders
 from ..planners.tasks import GroomTaskConfig, TriageTaskConfig
 from .base import run_leg
@@ -38,7 +45,7 @@ class StewardWorkflowConfig:
     repo: str = ""
     # Where recurrence events land. Optional so every existing caller/test keeps
     # working; None → the label + comment still happen, only the metric is lost.
-    journal: LegacyJournal | None = None
+    journal: EventSink | None = None
     dedupe: ControlStore | None = None
 
 
@@ -90,14 +97,16 @@ class StewardWorkflow:
         journal = self.cfg.journal
         if journal is None:
             return
-        if self.cfg.dedupe is not None:
-            if not self.cfg.dedupe.claim("recurrence", self.cfg.repo, key):
-                return
-        elif key in recurrence_keys(read_events_tail(journal.path)):
+        dedupe = self.cfg.dedupe
+        if dedupe is not None and not dedupe.claim(
+            "recurrence", self.cfg.repo, key
+        ):
             return
         journal.emit(
-            "recurrence", kind="refiled", issue=issue, of_issue=of_issue,
-            pr=pr, block_key=key,
+            TelemetryEvent(
+                RecurrenceDetected("refiled", of_issue, key),
+                Correlation(issue=issue, pr=(pr or None)),
+            )
         )
 
     def _journal_groomed(self, issue: int, kind: str, *, ref: str = "", pr: int = 0) -> None:
@@ -108,28 +117,30 @@ class StewardWorkflow:
         journal = self.cfg.journal
         if journal is None:
             return
-        if self.cfg.dedupe is not None:
-            if not self.cfg.dedupe.claim("groomed", self.cfg.repo, key):
-                return
-        elif key in groomed_keys(read_events_tail(journal.path)):
+        dedupe = self.cfg.dedupe
+        if dedupe is not None and not dedupe.claim(
+            "groomed", self.cfg.repo, key
+        ):
             return
         fields = {"kind": kind, "issue": issue, "block_key": key}
         if ref:
             fields["reference"] = ref
         if pr:
             fields["pr"] = pr
-        journal.emit("groomed", **fields)
+        journal.emit(
+            TelemetryEvent(
+                IssueGroomed(key, kind, fields),
+                Correlation(issue=issue, pr=(pr or None)),
+            )
+        )
 
     def _groomed(self, issue: int, kind: str, *, ref: str = "", pr: int = 0) -> bool:
         key = f"groomed:{self.cfg.repo}:{issue}:{kind}:{ref or pr}"
         if key in self._emitted:
             return True
-        if self.cfg.dedupe is not None:
-            # Durable effects are independently idempotent. Do not consume the
-            # telemetry dedupe key before the remote advisory write succeeds.
-            return False
-        journal = self.cfg.journal
-        return journal is not None and key in groomed_keys(read_events_tail(journal.path))
+        # Durable effects are independently idempotent. Do not consume the
+        # telemetry dedupe key before the remote advisory write succeeds.
+        return False
 
     async def groom(self, issue: int) -> None:
         """Classify an existing issue for one-shot, advisory queue cleanup."""
@@ -140,10 +151,19 @@ class StewardWorkflow:
         result = await run_leg(
             self.runner,
             self.cfg.log,
-            "groom",
-            issue,
+            Leg(
+                "GROOM",
+                LegTarget.ISSUE,
+                issue,
+                True,
+                ("global", "repository", "issue"),
+            ),
             task_builders.build_groom_task(
-                issue, iss.title, iss.body, self.cfg.groom, _merge_lines(merged)
+                issue,
+                as_untrusted(iss.title),
+                as_untrusted(iss.body),
+                self.cfg.groom,
+                as_untrusted(_merge_lines(merged)),
             ),
         )
         if result.is_error or not isinstance(result.structured, dict):
@@ -190,11 +210,24 @@ class StewardWorkflow:
         thread = "\n\n---\n\n".join(f"@{c.author}: {c.body}" for c in iss.comments)
         merged = self._recent_merges()
         task = task_builders.build_triage_task(
-            issue, iss.title, iss.body, thread, self.cfg.triage,
-            recent_merges=_merge_lines(merged),
+            issue,
+            as_untrusted(iss.title),
+            as_untrusted(iss.body),
+            as_untrusted(thread),
+            self.cfg.triage,
+            recent_merges=as_untrusted(_merge_lines(merged)),
         )
         result = await run_leg(
-            self.runner, self.cfg.log, "triage", issue, task
+            self.runner,
+            self.cfg.log,
+            Leg(
+                "TRIAGE",
+                LegTarget.ISSUE,
+                issue,
+                True,
+                ("global", "repository", "issue"),
+            ),
+            task,
         )
         if result.is_error or not isinstance(result.structured, dict):
             self.cfg.log(f"triage #{issue}: {result.status or 'error'} — no verdict, will retry")

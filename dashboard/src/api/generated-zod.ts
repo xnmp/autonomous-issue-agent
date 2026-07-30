@@ -3,7 +3,7 @@ import { z } from "zod";
 
 const RoleHealth = z
   .object({
-    alive: z.boolean(),
+    alive: z.union([z.boolean(), z.null()]),
     events: z.number().int(),
     last_event: z.union([z.string(), z.null()]),
     last_event_ts: z.union([z.string(), z.null()]),
@@ -14,7 +14,7 @@ const RoleHealth = z
   .passthrough();
 const RepoSummary = z
   .object({
-    active: z.boolean(),
+    active: z.union([z.boolean(), z.null()]),
     done: z.number().int(),
     frecency: z.number(),
     in_flight: z.number().int(),

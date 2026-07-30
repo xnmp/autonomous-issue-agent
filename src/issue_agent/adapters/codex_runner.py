@@ -28,7 +28,14 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from .child_env import child_process_env
 from .runtime_plan import AgentRuntime, RuntimePlan, git_identity_env
+from ..domain.contracts import Money, TokenUsage, UsageSource
+from ..domain.pricing import (
+    BudgetSentinel,
+    ModelRates,
+    usd_per_million_to_micros,
+)
 from ..domain.outcome import (
     AgentResult,
     ExitReason,
@@ -655,17 +662,59 @@ def budget_overrun_usd(
     Returns the spend rather than a bool so the caller can report what the run
     had actually burned when it was stopped — a kill that cannot say how much
     it cost is not evidence of anything."""
-    if max_budget_usd <= 0:
+    if max_budget_usd <= 0 or not isinstance(usage, dict):
         return None
-    spend = codex_cost_usd(
-        usage,
-        cost_per_mtok_in=cost_per_mtok_in,
-        cost_per_mtok_out=cost_per_mtok_out,
-        cost_per_mtok_cached_in=cost_per_mtok_cached_in,
+    rate_in = max(float(cost_per_mtok_in or 0), 0)
+    rate_out = max(float(cost_per_mtok_out or 0), 0)
+    rate_cached = (
+        rate_in / 10
+        if cost_per_mtok_cached_in is None
+        else float(cost_per_mtok_cached_in)
     )
-    if spend <= 0 or spend < max_budget_usd:
+    if not rate_cached > 0:
+        rate_cached = rate_in
+    if min(rate_in, rate_out, rate_cached) <= 0:
         return None
-    return spend
+    tokens_in = int(usage.get("input_tokens", 0) or 0)
+    tokens_out = int(usage.get("output_tokens", 0) or 0)
+    if tokens_in or tokens_out:
+        cached = int(usage.get("cache_read_input_tokens", 0) or 0)
+        if cached < 0 or cached > tokens_in:
+            cached = 0
+        normalized = TokenUsage(
+            tokens_in - cached,
+            tokens_out,
+            cached,
+            0,
+            UsageSource.ROLLOUT,
+        )
+        rates = ModelRates(
+            usd_per_million_to_micros(rate_in),
+            usd_per_million_to_micros(rate_out),
+            usd_per_million_to_micros(rate_cached),
+            usd_per_million_to_micros(rate_in),
+        )
+    else:
+        total = int(usage.get("total_tokens", 0) or 0)
+        if total <= 0:
+            return None
+        conservative = max(rate_in, rate_out)
+        normalized = TokenUsage(
+            0, total, source=UsageSource.ROLLOUT
+        )
+        rates = ModelRates(
+            usd_per_million_to_micros(conservative),
+            usd_per_million_to_micros(conservative),
+            usd_per_million_to_micros(conservative),
+            usd_per_million_to_micros(conservative),
+        )
+    maximum = Money(
+        "USD", int(round(max_budget_usd * 1_000_000))
+    )
+    sample = BudgetSentinel(lambda: normalized, rates, maximum).sample()
+    if sample is None:
+        return None
+    return sample[1].micros / 1_000_000
 
 
 def rates_for_model(
@@ -1134,19 +1183,20 @@ class CodexRunner(AgentRuntime):
                 "Codex CLI or set CODEX_BIN. (FIXER_RUNTIME=codex)"
             )
         key_var = self.provider.env_key
-        proc_env = {**os.environ, **self.env}
+        configured_key = self.env.get(key_var)
+        inherited_key = os.environ.get(key_var)
         if not self.provider.base_url:
             # OAuth mode (no custom gateway): codex authenticates from the
             # credentials `codex login` stored. An env key ALSO satisfies it
             # (codex accepts either), so only the absence of both is fatal.
             auth_file = os.path.join(os.path.expanduser("~"), ".codex", "auth.json")
-            if proc_env.get(key_var) or os.path.exists(auth_file):
+            if configured_key or inherited_key or os.path.exists(auth_file):
                 return None
             return (
                 f"codex has no credentials — no {auth_file} (run `codex login`) "
                 f"and {key_var} is unset. (FIXER_RUNTIME=codex, default provider)"
             )
-        if not proc_env.get(key_var):
+        if not configured_key and not inherited_key:
             return (
                 f"{key_var} is unset — the Codex fixer cannot authenticate to "
                 f"{self.provider.base_url}. Export {key_var} (or ANTHROPIC_AUTH_TOKEN, "
@@ -1354,12 +1404,15 @@ class CodexRunner(AgentRuntime):
         model = self._resolved_model(task)
         # Commit attribution: author/committer name carries the effective model.
         # Below self.env/task.env so an explicit override stays an override.
-        proc_env = {
-            **os.environ,
-            **git_identity_env(model),
-            **self.env,
-            **task.env,
-        }
+        proc_env = child_process_env(
+            os.environ,
+            {
+                **git_identity_env(model),
+                **self.env,
+                **task.env,
+            },
+            additional_keys=(self.provider.env_key,),
+        )
         self._log(f"codex: exec model={model} cwd={task.cwd or '.'}")
         # Rollout metadata uses wall-clock UTC while the plausibility guard only
         # needs elapsed process time. Keep the two clocks separate: wall time

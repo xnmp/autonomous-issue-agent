@@ -152,9 +152,10 @@ export function modelTone(model: string, effort?: string | null): Tone {
 
 /* ----------------------------------------------------- daemon health */
 
-export type HealthState = "ok" | "stale" | "dead";
+export type HealthState = "ok" | "stale" | "dead" | "unknown";
 
 export function roleHealth(role: RoleHealth): HealthState {
+  if (role.alive === null) return "unknown";
   if (!role.alive) return "dead";
   return role.stale ? "stale" : "ok";
 }
@@ -163,12 +164,14 @@ export const HEALTH_TONE: Record<HealthState, Tone> = {
   ok: "ok",
   stale: "running",
   dead: "fail",
+  unknown: "neutral",
 };
 
 export const HEALTH_LABEL: Record<HealthState, string> = {
   ok: "ok",
   stale: "stale",
   dead: "dead",
+  unknown: "unknown",
 };
 
 /* ------------------------------------------------------ utilization */

@@ -17,7 +17,7 @@ class Warned(Contract):
 
 class RoleHealth(Contract):
     role: str
-    alive: bool
+    alive: bool | None
     stale: bool
     last_event_ts: str | None
     last_event: str | None
@@ -30,7 +30,7 @@ class RepoSummary(Contract):
     repo: str | None
     target_dir: str | None
     is_self: bool
-    active: bool
+    active: bool | None
     roles: list[RoleHealth]
     frecency: float
     last_activity_ts: str | None

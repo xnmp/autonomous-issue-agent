@@ -2,7 +2,9 @@
 
 import pytest
 
-from issue_agent.app.execute import Executor
+from issue_agent.adapters.journal import _legacy_event_record
+from issue_agent.app.execute import Executor as DurableExecutor
+from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.domain.actions import (
     ClearIssueState,
     CloseIssue,
@@ -38,6 +40,19 @@ def test_relabel_passes_label_values():
     ex, gw, _, _ = _exec()
     ex.execute(Relabel(Target.ISSUE, 5, Label.AI_READY, Label.AI_WORKING))
     assert gw.calls == [("relabel", "issue", 5, "ai-ready", "ai-working")]
+
+
+def test_remote_action_fails_closed_without_a_durable_effect_executor():
+    gateway = FakeGateway()
+
+    with pytest.raises(
+        RuntimeError, match="durable effect executor is not configured"
+    ):
+        DurableExecutor(gateway).execute(
+            Relabel(Target.ISSUE, 5, Label.AI_READY, Label.AI_WORKING)
+        )
+
+    assert gateway.calls == []
 
 
 def test_relabel_pr_target_and_none():
@@ -129,6 +144,8 @@ class _Journal:
         self.events = []
 
     def emit(self, event, **fields):
+        if not isinstance(event, str):
+            event, fields = _legacy_event_record(event)
         self.events.append((event, fields))
 
 

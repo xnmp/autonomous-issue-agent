@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import multiprocessing
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -12,6 +15,7 @@ import pytest
 from issue_agent.adapters.control_store import (
     AccountingDisposition,
     BudgetLimit,
+    CorruptControlStore,
     Lease,
     ReservationRequest,
     SQLiteControlStore,
@@ -77,10 +81,48 @@ def _request(index: int, maximum: int = 60, cap: int = 100) -> ReservationReques
     )
 
 
+def _reserve_in_process(path: str, index: int, start, results) -> None:
+    store = SQLiteControlStore(path)
+    store.initialize()
+    start.wait(timeout=5)
+    results.put(store.reserve(_request(index)).disposition.value)
+
+
 def test_control_store_initializes_with_restrictive_permissions_and_integrity(tmp_path):
     store = _store(tmp_path)
     assert Path(store.path).stat().st_mode & 0o777 == 0o600
     store.integrity_check()
+
+
+def test_corrupt_database_is_rejected_before_migration_or_admission(tmp_path):
+    path = tmp_path / "state" / "control.db"
+    path.parent.mkdir()
+    path.write_bytes(b"not a sqlite database")
+
+    with pytest.raises(CorruptControlStore, match="integrity check failed"):
+        SQLiteControlStore(str(path)).initialize()
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["database or disk is full", "attempt to write a readonly database"],
+)
+def test_storage_write_faults_fail_paid_admission_closed(
+    tmp_path, monkeypatch, message
+):
+    store = _store(tmp_path)
+
+    @contextmanager
+    def unavailable_transaction():
+        raise sqlite3.OperationalError(message)
+        yield
+
+    monkeypatch.setattr(store, "transaction", unavailable_transaction)
+
+    result = store.reserve(_request(1))
+
+    assert result.disposition is AccountingDisposition.UNAVAILABLE
+    assert message in result.detail
 
 
 def test_abandoned_run_counts_come_from_control_state_not_telemetry(tmp_path):
@@ -119,6 +161,65 @@ def test_transactional_reservations_admit_only_one_racer_for_final_capacity(tmp_
         "exhausted",
     ]
     assert store.snapshot(_scope()).reserved == Money("USD", 60)
+
+
+def test_two_processes_racing_final_capacity_admit_exactly_one(tmp_path):
+    path = str(tmp_path / "state" / "control.db")
+    _store(tmp_path)
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_reserve_in_process,
+            args=(path, index, start, results),
+        )
+        for index in (1, 2)
+    ]
+    for process in processes:
+        process.start()
+    start.set()
+    values = sorted(results.get(timeout=10) for _ in processes)
+    for process in processes:
+        process.join(timeout=10)
+        assert process.exitcode == 0
+
+    assert values == ["available", "exhausted"]
+
+
+def test_hundreds_of_concurrent_reservations_all_reach_one_terminal_state(
+    tmp_path,
+):
+    store = _store(tmp_path)
+    requests = tuple(
+        _request(index, maximum=1, cap=200) for index in range(200)
+    )
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        admissions = tuple(pool.map(store.reserve, requests))
+    assert all(result.admitted for result in admissions)
+
+    def finalize(request: ReservationRequest):
+        if int(str(request.run_id).split("-")[-1]) % 2:
+            return store.release(request.run_id, "stress")
+        return store.settle(
+            SettlementRequest(
+                request.run_id,
+                Money("USD", 1),
+                PricingBasis.PROVIDER_REPORTED,
+                f"receipt-{request.run_id}",
+                None,
+                None,
+                None,
+            )
+        )
+
+    with ThreadPoolExecutor(max_workers=32) as pool:
+        tuple(pool.map(finalize, requests))
+
+    snapshot = store.snapshot(_scope())
+    assert snapshot.reserved == Money("USD", 0)
+    assert snapshot.committed == Money("USD", 100)
+    assert store.active_reservation_runs() == ()
 
 
 def test_reservation_and_owner_lease_commit_atomically(tmp_path):

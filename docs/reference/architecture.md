@@ -1,6 +1,6 @@
 # Architecture — how the harness works now
 
-Current as of 2026-07-30. This supersedes the numbered `0N-*.md` specs in
+Current as of 2026-07-31. This supersedes the numbered `0N-*.md` specs in
 `docs/archive/`, which describe the **original bash design**: the scripts they
 document have been deleted. Only the shared `plugin/hooks/checks/` gate stack
 remains because Codex uses it on the live Python path.
@@ -32,6 +32,9 @@ advisory comments and the orthogonal `maybe-resolved` label for verified recent
 merge matches or stale references, never a close action. Grooming is capped at
 five candidates per changed tick and persists a title/body signature after a
 successful delivery, preventing harness comments from self-amplifying spend.
+It also performs a free reconciliation over open PR metadata and posts one
+advisory flag when a changed path is governed by an ADR that the PR description
+does not cite. The publication governor remains the hard admission gate.
 
 ## The five properties worth preserving
 
@@ -83,7 +86,7 @@ The fixer is governed at two levels:
 - **The advisory governor hook** (`adapters/governor.py` +
   `plugin/hooks/bash_governor.py`)
   inspects every Bash call the agent makes. Its parsing core
-  (`governor_policy.py`) is *shared* between the Python and bash entry points,
+  (`domain/governor_policy.py`) is *shared* between the Python and bash entry points,
   which is why that half provably cannot drift.
 - **The gates** (`domain/gate.py` for the SDK path, `plugin/hooks/checks/*.sh`
   for codex mode) enforce the PR/push/commit contract: base branch, acceptance
@@ -107,6 +110,11 @@ and makes genuinely unrecoverable spend visible before capacity is released.
 At upgrade, current and rotated legacy ledgers are imported idempotently into
 repository-daily, global-daily, and issue-lifetime scopes before paid
 admission; malformed or unattributed rows require operator repair.
+The 2026-07-31 migration rehearsal replayed 303 real historical rows twice,
+matched source digest/count/amount/window, passed SQLite integrity, and
+completed an admitted-and-settled primary-store canary without changing the
+legacy source. Machine-readable evidence is in
+`control-store-migration-evidence.json`.
 JSONL is bounded
 schema-v2 telemetry and a projection feed; losing it cannot authorize a write,
 deduplicate work, or admit spend.
@@ -120,6 +128,8 @@ events; GitHub reads may enrich titles and URLs but never infer lifecycle
 success or turn an unavailable observation into an empty world.
 Per-role scheduler heartbeats supply liveness freshness when an unchanged world
 correctly emits no new observation event.
+If process discovery is unavailable, dashboard liveness is `unknown`; recent
+activity is never promoted into proof that a role is alive or dead.
 Event streams retain eight rotated files plus the current file. Rotation writes
 an open-level snapshot and re-emits the latest observation for every world
 subject, so bounded retention and restart do not resurrect a cleared level,
@@ -180,6 +190,54 @@ is the sole env/coercion/choice table, drives `from_env`, and generates
 `config/agent.env.example`. The immutable config snapshot hash is recorded on
 every reservation and lifecycle command.
 
+Untrusted repository, issue, review, CI, and Jira text crosses into planners as
+`domain/trust.py::Untrusted`; raw strings are rejected at the fence boundary.
+Child agent processes receive an explicit environment allowlist plus only the
+selected provider credential. GitHub, SSH, and git publication credentials are
+hard-denied; branch/PR publication goes through the durable broker.
+
+## Module manifest
+
+This list is intentionally checked against the filesystem. Adding a top-level
+module requires placing it in the appropriate tier and explaining it here.
+
+`domain/` — pure values and policy:
+`domain/actions.py`, `domain/agent_task.py`, `domain/ci.py`,
+`domain/contracts.py`, `domain/dashboard.py`, `domain/effort.py`,
+`domain/events.py`, `domain/fix.py`, `domain/gate.py`,
+`domain/governor_policy.py`, `domain/identity.py`, `domain/jira.py`,
+`domain/labels.py`, `domain/leg.py`, `domain/lifecycle.py`,
+`domain/outcome.py`, `domain/ports.py`, `domain/pricing.py`,
+`domain/projection.py`, `domain/refs.py`, `domain/review.py`,
+`domain/supervision.py`, `domain/triage.py`, `domain/trust.py`, and
+`domain/world.py`.
+
+`adapters/` — filesystem, process, provider, and remote-I/O implementations:
+`adapters/accounting_runtime.py`, `adapters/agent_publish.py`,
+`adapters/agent_runner.py`, `adapters/app_token.py`,
+`adapters/child_env.py`, `adapters/claude_profile.py`,
+`adapters/codex_hook.py`, `adapters/codex_runner.py`,
+`adapters/control_store.py`, `adapters/effects.py`,
+`adapters/env_file.py`, `adapters/event_log.py`, `adapters/github.py`,
+`adapters/governor.py`, `adapters/handover.py`,
+`adapters/heartbeat.py`, `adapters/journal.py`,
+`adapters/process_supervisor.py`, `adapters/reload.py`,
+`adapters/runtime_plan.py`, `adapters/single_instance.py`,
+`adapters/spend_recovery.py`, `adapters/store.py`,
+`adapters/supervised_exec.py`, `adapters/systemd_notify.py`,
+`adapters/typed_journal.py`, `adapters/untrusted.py`,
+`adapters/wake.py`, and `adapters/worktree.py`. Dashboard-specific read
+adapters live under `adapters/dashweb/`.
+
+`app/` — composition and use-case orchestration:
+`app/cli.py`, `app/config.py`, `app/dashboard.py`, `app/dispatch.py`,
+`app/execute.py`, `app/launchd_main.py`, `app/loop.py`, `app/main.py`,
+`app/mcp.py`, `app/recovery.py`, `app/roles.py`, `app/webhook.py`,
+`app/world_probe.py`, and `app/world_reporter.py`.
+Provider-neutral task construction is isolated in `app/planners/`; paid
+workflow sequencing and the single `run_leg` path are in `app/workflows/`;
+the web composition/read-model boundary is in `app/dashweb/`.
+
 ## Where the detail lives
 
 | Topic | File |
@@ -188,6 +246,9 @@ every reservation and lifecycle command.
 | Pointing it at a repo, config layout | [CLAUDE.md](../../CLAUDE.md) |
 | Codex runtime | [codex-runner.md](codex-runner.md) |
 | Authority/capability matrix | [capability-authority-matrix.md](capability-authority-matrix.md) |
+| Capacity boundary and benchmark | [capacity.md](capacity.md) |
+| Prompt-size measurement | [prompt-budget.md](prompt-budget.md) |
+| Control-store migration evidence | [control-store-migration-evidence.json](control-store-migration-evidence.json) |
 | Architectural decisions | [../adr/](../adr/) |
 | 110 recorded failure modes | [failure-modes.md](failure-modes.md) |
 | What's still open | [../open/residuals.md](../open/residuals.md) |

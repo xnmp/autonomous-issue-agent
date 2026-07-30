@@ -2,9 +2,10 @@
 
 import asyncio
 
-from issue_agent.app.execute import Executor
+from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.planners.tasks import FixTaskConfig
 from issue_agent.app.workflows.fix import FixWorkflow, FixWorkflowConfig
+from issue_agent.domain.events import BudgetPathEntered
 from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.world import IssueView
 
@@ -50,10 +51,11 @@ def assert_budget_path(gateway, store, journal, leg):
     assert store.get_resolve_retries(5) == 0
     assert ("relabel", "issue", 5, "ai-working", "ai-blocked") in gateway.calls
     assert ("relabel", "issue", 5, None, "needs-budget-review") in gateway.calls
-    assert journal.events == [(
-        "budget_path",
-        {"issue": 5, "leg": leg, "exit_reason": "budget_exhausted"},
-    )]
+    assert len(journal.events) == 1
+    event, fields = journal.events[0]
+    assert fields == {}
+    assert event.payload == BudgetPathEntered(leg, "budget_exhausted")
+    assert event.correlation.issue == 5
 
 
 def test_budget_exhausted_resolve_blocks_for_cap_review_without_a_strike():

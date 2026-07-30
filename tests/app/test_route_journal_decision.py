@@ -2,9 +2,10 @@
 
 import asyncio
 
-from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
+from tests.fakes.legacy_journal import Journal
+from issue_agent.adapters.journal import JournalingRuntime, read_events
 from issue_agent.adapters.store import Store
-from issue_agent.app.execute import Executor
+from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.planners.tasks import FixTaskConfig
 from issue_agent.app.workflows.fix import FixWorkflow, FixWorkflowConfig
 from issue_agent.adapters.runtime_plan import RuntimePlan
@@ -21,7 +22,7 @@ def test_route_event_records_the_decision_not_the_probe_model(tmp_path):
     runtime = JournalingRuntime(SeqRunner([
         AgentResult(is_error=False, session_id="rt", structured={"tier": "complex"}),
         AgentResult(is_error=False, status="pr_opened", session_id="s5", cost_usd=3.0),
-    ]), journal, str(tmp_path / "spend.jsonl"), "o/r", "fix")
+    ]), journal, repo="o/r", role="fix")
     runtime.set_context("fix", "RESOLVE", 5, 5)
     gateway = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
     store = FakeStore()

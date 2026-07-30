@@ -94,10 +94,8 @@ def repos_payload(
             alive = {h.role: (roles_up is not None and h.role in roles_up) for h in health}
             active = s.name in live
         else:
-            # No /proc: a daemon that journalled recently is the best available
-            # evidence it is ticking. Announced in the payload, never silent.
-            alive = {h.role: (not h.stale) for h in health}
-            active = any(alive.values())
+            alive = {h.role: None for h in health}
+            active = None
         rows.append(
             {
                 "name": s.name,
@@ -115,9 +113,9 @@ def repos_payload(
     rows.sort(key=lambda r: (r["frecency"], r["last_activity_ts"] or ""), reverse=True)
     payload = {"repos": rows, "warnings": []}
     if not scan_ok:
-        payload["liveness"] = "journal-heuristic"
+        payload["liveness"] = "unknown"
         payload["warnings"].append(
-            "process scan unavailable — daemon liveness inferred from journal staleness"
+            "process scan unavailable — daemon liveness is unknown"
         )
     return payload
 
@@ -1224,7 +1222,7 @@ def overview_payload(
         roles_up = live.get(snapshot.name)
         alive = {h.role: (roles_up is not None and h.role in roles_up) for h in dep.health}
     else:
-        alive = {h.role: (not h.stale) for h in dep.health}
+        alive = {h.role: None for h in dep.health}
     return {
         "metrics": metrics_json(dep.metrics),
         "cost_mix": cost_mix(dep.metrics),
@@ -1235,7 +1233,7 @@ def overview_payload(
         },
         "health": [health_json(h, alive[h.role]) for h in dep.health],
         "unattributed": list(dep.unattributed[-20:]),
-        "warnings": [] if scan_ok else ["daemon liveness inferred from journal staleness"],
+        "warnings": [] if scan_ok else ["daemon liveness is unknown"],
     }
 
 

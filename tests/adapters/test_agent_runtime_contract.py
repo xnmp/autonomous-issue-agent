@@ -20,6 +20,11 @@ from issue_agent.adapters.runtime_plan import (
     SubagentDef,
 )
 from issue_agent.domain.outcome import AgentResult, Outcome, classify_outcome
+from issue_agent.domain.agent_task import (
+    RUNTIME_CAPABILITIES,
+    TASK_FIELD_NAMES,
+    RuntimeName,
+)
 
 
 def _claude_result(*, structured, is_error=False, result="", session_id="s1"):
@@ -65,6 +70,22 @@ def test_task_interface_collects_tool_policy_for_runner_adapters():
     )
 
     assert task.all_allowed_tools() == ["Read", "mcp__sonar__*", "Task"]
+
+
+def test_runtime_capability_registry_is_exhaustive_and_covers_every_field():
+    assert frozenset(RUNTIME_CAPABILITIES) == frozenset(RuntimeName)
+    for capabilities in RUNTIME_CAPABILITIES.values():
+        assert capabilities.supported_task_fields <= TASK_FIELD_NAMES
+
+
+def test_codex_declares_sdk_only_containment_fields_unsupported():
+    capabilities = RUNTIME_CAPABILITIES[RuntimeName.CODEX]
+
+    assert not capabilities.supports("allowed_tools")
+    assert not capabilities.supports("disallowed_tools")
+    assert not capabilities.supports("fork_session")
+    assert not capabilities.supports("mcp_servers")
+    assert not capabilities.supports("subagents")
 
 
 def test_successful_structured_envelope_contract_is_shared():

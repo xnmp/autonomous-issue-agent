@@ -6,22 +6,30 @@ import contextlib
 from collections.abc import Callable
 from contextlib import AbstractContextManager
 
-from ...adapters.runtime_plan import AgentRuntime, RuntimePlan
+from ...adapters.runtime_plan import AgentRuntime, RunTelemetryRuntime
+from ...domain.leg import Leg
 from ...domain.outcome import AgentResult
+from ..planners.run import PlannedRun, compose_runtime_plan
 
 
 async def run_leg(
     runner: AgentRuntime,
     log: Callable[[str], None],
-    label: str,
-    target: int,
-    task: RuntimePlan,
+    leg: Leg,
+    task: PlannedRun,
     *,
     scope: AbstractContextManager[object] | None = None,
 ) -> AgentResult:
+    target = leg.number or 0
+    label = leg.kind.casefold().replace("_", "-")
     log(f"agent #{target}: {label} — running")
-    with scope or contextlib.nullcontext():
-        result = await runner.run(task)
+    telemetry_scope = (
+        runner.leg_kind(leg.kind)
+        if isinstance(runner, RunTelemetryRuntime)
+        else contextlib.nullcontext()
+    )
+    with telemetry_scope, scope or contextlib.nullcontext():
+        result = await runner.run(compose_runtime_plan(task))
     status = result.status or ("error" if result.is_error else "ok")
     log(
         f"agent #{target}: {label} — done "

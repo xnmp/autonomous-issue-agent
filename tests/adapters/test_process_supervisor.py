@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 
+from issue_agent.adapters.child_env import CHILD_ENV_MANIFEST
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.domain.contracts import RunId
 
@@ -176,6 +177,8 @@ def test_supervised_sdk_cli_registers_session_before_target_executes(
     target.write_text(
         "#!/bin/sh\n"
         '[ -z "${ISSUE_AGENT_SUPERVISOR_RUN_ID:-}" ] || exit 8\n'
+        '[ -z "${GH_TOKEN:-}" ] || exit 9\n'
+        '[ "${TEST_CMD:-}" = "uv run pytest" ] || exit 10\n'
         f'echo started > "{marker}"\n'
         "sleep 30\n"
     )
@@ -185,7 +188,13 @@ def test_supervised_sdk_cli_registers_session_before_target_executes(
     wrapper, supervised_env = supervisor.supervised_cli(run_id, str(target))
     process = subprocess.Popen(
         [wrapper, "--sdk-argument"],
-        env={**os.environ, **supervised_env},
+        env={
+            **os.environ,
+            **supervised_env,
+            "GH_TOKEN": "must-not-reach-child",
+            "TEST_CMD": "uv run pytest",
+            CHILD_ENV_MANIFEST: "TEST_CMD",
+        },
     )
     deadline = time.monotonic() + 3
     while not marker.exists() and time.monotonic() < deadline:

@@ -37,11 +37,12 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
+from tests.fakes.legacy_journal import Journal
+from issue_agent.adapters.journal import JournalingRuntime, read_events
 from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.store import Store
 from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
-from issue_agent.app.execute import Executor
+from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.planners.tasks import (
     FixTaskConfig,
     REVIEW_DIMENSIONS,
@@ -49,6 +50,9 @@ from issue_agent.app.planners.tasks import (
 )
 from issue_agent.app.roles import (
     DispatchPathReservations,
+    EffectRecovery,
+    _FIX_RUNTIME_REGISTRY,
+    _REVIEW_RUNTIME_REGISTRY,
     _ci_flake_reporter,
     _ci_stall_reporter,
     _duplicate_pr_reporter,
@@ -59,6 +63,7 @@ from issue_agent.app.roles import (
     _recurrence_reporter,
     _review_state,
 )
+from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.actions import (
     AgentKind,
     EscalateCiPending,
@@ -88,6 +93,35 @@ from issue_agent.domain.world import (
     WorldState,
 )
 
+
+def test_runtime_wiring_registries_cover_every_supported_runtime():
+    assert frozenset(_FIX_RUNTIME_REGISTRY) == frozenset(RuntimeName)
+    assert frozenset(_REVIEW_RUNTIME_REGISTRY) == {
+        RuntimeName.CLAUDE,
+        RuntimeName.CODEX,
+    }
+
+
+def test_effect_recovery_drains_remote_actions_and_agent_publications():
+    calls = []
+
+    class Recovery:
+        def __init__(self, name, count):
+            self.name = name
+            self.count = count
+
+        def drain_pending_commands(self):
+            calls.append(self.name)
+            return self.count
+
+    recovery = EffectRecovery(
+        Recovery("actions", 2),
+        Recovery("publications", 3),
+    )
+
+    assert recovery.drain_pending_commands() == 5
+    assert calls == ["actions", "publications"]
+
 from test_dispatch import (
     FakeRunner,
     FakeWorktrees,
@@ -99,6 +133,12 @@ from test_dispatch import (
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
 
 FIX_BOT = "fix-bot"
+
+
+def _control(tmp_path) -> SQLiteControlStore:
+    control = SQLiteControlStore(str(tmp_path / "control.sqlite3"))
+    control.initialize()
+    return control
 
 
 def _dispatcher(gw, store, runner, **overrides):
@@ -612,7 +652,9 @@ def test_a_raise_path_death_is_counted_once_not_twice(tmp_path):
     gw = FakeGateway(issues={issue: IssueView(issue, title="t", body="b")})
     store = Store(state_dir=str(tmp_path))
     journal = Journal(os.path.join(str(tmp_path), "journal.jsonl"))
-    runner = JournalingRuntime(RaisingRunner(), journal, "", "o/r", "fix")
+    runner = JournalingRuntime(
+        RaisingRunner(), journal, repo="o/r", role="fix"
+    )
     d = _dispatcher(gw, store, runner)
 
     def world():
@@ -860,15 +902,26 @@ def test_releasing_a_defer_emits_one_clear_then_allows_a_new_begin(tmp_path):
     assert logs[1] == "issue #522 no longer waiting on PR #123; eligible for dispatch"
 
 
-def test_restart_clears_a_legacy_hold_that_is_no_longer_active(tmp_path):
+def test_restart_clears_a_persisted_hold_that_is_no_longer_active(tmp_path):
     journal = Journal(str(tmp_path / "journal.jsonl"))
-    journal.emit(
-        "hold", issue=522, reason="overlap", blocker="pr#123",
-        block_key="hold:o/r:522:overlap:pr#123",
+    control = _control(tmp_path)
+    control.replace_level_state(
+        "holds",
+        "o/r",
+        {
+            "522:overlap:123:": {
+                "issue": 522,
+                "reason": "overlap",
+                "blocker_pr": 123,
+                "blocker_issue": None,
+            }
+        },
     )
     logs = []
 
-    _hold_reporter(journal, "o/r", logs.append)(_held_world("MERGED"))
+    _hold_reporter(
+        journal, "o/r", logs.append, control=control
+    )(_held_world("MERGED"))
 
     assert _holds_in(journal)[-1]["state"] == "cleared"
     assert logs == [
@@ -967,8 +1020,13 @@ def test_the_hold_dedup_survives_a_daemon_restart(tmp_path):
     an in-process set alone would re-emit every boot. A FRESH reporter over the
     same journal must stay silent."""
     journal = Journal(str(tmp_path / "journal.jsonl"))
-    _hold_reporter(journal, "o/r", lambda _m: None)(_held_world())
-    _hold_reporter(journal, "o/r", lambda _m: None)(_held_world())
+    control = _control(tmp_path)
+    _hold_reporter(
+        journal, "o/r", lambda _m: None, control=control
+    )(_held_world())
+    _hold_reporter(
+        journal, "o/r", lambda _m: None, control=control
+    )(_held_world())
 
     assert len(_holds_in(journal)) == 1
 
@@ -1046,8 +1104,13 @@ def test_a_new_head_wedging_again_is_its_own_event(tmp_path):
 
 def test_the_stall_dedup_survives_a_daemon_restart(tmp_path):
     journal = Journal(str(tmp_path / "journal.jsonl"))
-    _ci_stall_reporter(journal, "o/r", _STALL_CFG, lambda _m: None)(_stalled_world())
-    _ci_stall_reporter(journal, "o/r", _STALL_CFG, lambda _m: None)(_stalled_world())
+    control = _control(tmp_path)
+    _ci_stall_reporter(
+        journal, "o/r", _STALL_CFG, lambda _m: None, control
+    )(_stalled_world())
+    _ci_stall_reporter(
+        journal, "o/r", _STALL_CFG, lambda _m: None, control
+    )(_stalled_world())
 
     assert len(_stalls_in(journal)) == 1
 
@@ -1176,8 +1239,13 @@ def test_the_reopen_dedup_survives_a_daemon_restart(tmp_path):
     corrupts the metric — an in-process set alone would re-emit on every boot."""
     journal = Journal(str(tmp_path / "journal.jsonl"))
     gw = _ReopenGateway(reasons={522: "reopened"})
-    _recurrence_reporter(journal, gw, "o/r", "fix-bot", lambda _m: None)(_resolved_world())
-    _recurrence_reporter(journal, gw, "o/r", "fix-bot", lambda _m: None)(_resolved_world())
+    control = _control(tmp_path)
+    _recurrence_reporter(
+        journal, gw, "o/r", "fix-bot", lambda _m: None, control
+    )(_resolved_world())
+    _recurrence_reporter(
+        journal, gw, "o/r", "fix-bot", lambda _m: None, control
+    )(_resolved_world())
 
     assert len(_recurrences_in(journal)) == 1
 
@@ -1585,8 +1653,13 @@ def test_the_fixers_own_pr_is_never_reported_as_a_duplicate(tmp_path):
 
 def test_the_duplicate_dedup_survives_a_daemon_restart(tmp_path):
     journal = Journal(str(tmp_path / "journal.jsonl"))
-    _duplicate_pr_reporter(journal, "o/r", _GUARD_CFG, lambda _m: None)(_duplicate_world())
-    _duplicate_pr_reporter(journal, "o/r", _GUARD_CFG, lambda _m: None)(_duplicate_world())
+    control = _control(tmp_path)
+    _duplicate_pr_reporter(
+        journal, "o/r", _GUARD_CFG, lambda _m: None, control
+    )(_duplicate_world())
+    _duplicate_pr_reporter(
+        journal, "o/r", _GUARD_CFG, lambda _m: None, control
+    )(_duplicate_world())
     assert len(_duplicates_in(journal)) == 1
 
 

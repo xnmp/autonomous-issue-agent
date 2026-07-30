@@ -34,7 +34,8 @@ from issue_agent.adapters.codex_runner import (
     parse_codex_envelope,
     parse_codex_usage,
 )
-from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
+from tests.fakes.legacy_journal import Journal
+from issue_agent.adapters.journal import JournalingRuntime, read_events
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.app.config import from_env
 from issue_agent.app.planners.schemas import AUTHOR_SCHEMA, FIX_SCHEMA, IMPLEMENT_SCHEMA
@@ -701,7 +702,6 @@ def test_headerless_01460_recovers_root_rollout_usage_cost_turns_and_ledger(
             spend_evidence_dir=str(tmp_path / "spend-evidence"),
         ),
         journal,
-        ledger_path=ledger_path,
         repo="xnmp/autonomous-issue-agent",
         role="fix",
     )
@@ -733,11 +733,7 @@ def test_headerless_01460_recovers_root_rollout_usage_cost_turns_and_ledger(
     # The journal records the same cache-aware leg cost as the result.
     assert agent_run["cost_usd"] == pytest.approx(7.775)
     assert agent_run["turns"] == 2
-    spend = read_events(ledger_path)
-    assert len(spend) == 1
-    assert spend[0]["event"] == "spend"
-    # The spend ledger carries the same cache-aware receipt.
-    assert spend[0]["cost_usd"] == pytest.approx(7.775)
+    assert read_events(ledger_path) == [], "legacy spend JSONL is read-only"
     evidence = json.loads(
         open(
             spend_evidence_path(

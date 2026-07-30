@@ -1,29 +1,8 @@
-"""JSONL event journal + spend ledger — the harness's flight recorder.
+"""Read-only compatibility tools for historical JSONL plus typed run telemetry.
 
-Two append-only JSONL files, one line per event:
-
-  * the per-role **journal** (`<STATE_DIR>/journal.jsonl`) — every agent run,
-    every applied action, every escalation, every spend block, every skipped
-    tick. This is what makes "what did the harness actually DO last night?"
-    answerable without re-reading a rotated stderr log.
-  * the global **spend ledger** (`$XDG_STATE_HOME/issue-agent/spend.jsonl`) —
-    one `spend` line per costed run, shared by EVERY repo and role on the box.
-    Cost is the one resource that is genuinely global: three daemons across four
-    repos draw on one billing account, so a per-repo cap cannot see the sum.
-
-Design rules, both hard-won:
-
-1. **Observability must never add a failure mode.** `Journal.emit` catches
-   everything and degrades to a single stderr line. A daemon that dies because
-   its log directory went read-only has traded a working harness for a diary.
-2. **Readers tolerate garbage.** A process killed mid-`write()` leaves a
-   truncated final line; a reader that raises on it turns one crash into a
-   permanently unreadable ledger. Malformed lines are skipped in silence.
-
-Append atomicity is POSIX's: a single `write()` of a short line to a file opened
-`O_APPEND` is not interleaved with other appenders, so three daemons may share
-one ledger without locking. Hence `emit` builds the whole line first and writes
-it exactly once — never `write(line)` then `write("\\n")`.
+Live producers write only schema-v2 events through ``TypedJournal``. The
+legacy readers tolerate malformed/truncated lines so old deployments remain
+inspectable and migratable; this module intentionally exposes no legacy writer.
 """
 
 from __future__ import annotations
@@ -41,7 +20,35 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
 from .runtime_plan import ContextualRuntime, RunIdentityRuntime, RuntimePlan
+from ..domain.events import (
+    ActionApplied,
+    ActionFailed,
+    ActionRetried,
+    ActionVerified,
+    AgentRunCompleted,
+    AgentRunStarted,
+    BudgetPathEntered,
+    CiFlakeDetected,
+    CiPendingDeadline,
+    DaemonStateChanged,
+    DuplicatePrPrevented,
+    EscalationRaised,
+    GithubUnavailable,
+    HandoverWritten,
+    IssueGroomed,
+    LevelChanged,
+    PathPrediction,
+    RecurrenceDetected,
+    ReviewSkipped,
+    RoutingEscalated,
+    StallDetected,
+    TelemetryEvent,
+    TelemetryWarning,
+    TickGated,
+    Correlation,
+)
 from ..domain.outcome import AgentResult, ExitReason, deterministic_death
+from ..domain.ports import EventSink
 from .handover import (
     HandoverScope,
     retire_delivered_handover,
@@ -77,62 +84,230 @@ def _stamp(now_fn=_now) -> str:
     return now_fn().replace(microsecond=0).isoformat()
 
 
-def event_line(event: str, now_fn=_now, **fields) -> str:
-    """Serialise one event to its JSONL line (no trailing newline).
-
-    Shared by `Journal.emit` and the alert hook so an alert payload is byte-for-
-    byte the line that landed in the journal. `default=str` means a stray enum or
-    Path degrades to its repr instead of raising; `sort_keys` keeps diffs of two
-    journals meaningful.
-    """
-    return json.dumps(
-        {"ts": _stamp(now_fn), "event": event, **fields}, default=str, sort_keys=True
-    )
-
-
 @dataclass(frozen=True)
-class Journal:
-    """Append-only JSONL sink at `path`. Frozen: a journal is its path."""
+class LegacyJournalLocator:
+    """Path metadata for read-only historical JSONL compatibility."""
 
     path: str
-    monthly_rotation: bool = False
     canonical: bool = False
 
-    def emit(self, event: str, **fields) -> None:
-        """Append one event line. NEVER raises — see rule 1 in the module
-        docstring. A failure costs one stderr line and the event, nothing more."""
-        try:
-            line = event_line(event, **fields)
-            parent = os.path.dirname(self.path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            if self.monthly_rotation:
-                self._rotate_monthly()
-            with open(self.path, "a", encoding="utf-8") as fh:
-                fh.write(line + "\n")  # ONE write: POSIX append atomicity
-        except Exception as exc:  # noqa: BLE001 — observability is never fatal
-            sys.stderr.write(f"journal: dropped {event!r} event ({exc})\n")
 
-    def _rotate_monthly(self) -> None:
-        try:
-            modified = datetime.fromtimestamp(
-                os.path.getmtime(self.path), tz=timezone.utc
-            )
-        except FileNotFoundError:
-            return
-        current = _now()
-        if (modified.year, modified.month) == (current.year, current.month):
-            return
-        root, extension = os.path.splitext(self.path)
-        archive = f"{root}.{modified:%Y-%m}{extension}"
-        suffix = 1
-        while os.path.exists(archive):
-            archive = f"{root}.{modified:%Y-%m}.{suffix}{extension}"
-            suffix += 1
-        try:
-            os.rename(self.path, archive)
-        except FileNotFoundError:
-            pass
+def _legacy_event_record(event: TelemetryEvent) -> tuple[str, dict[str, object]]:
+    """Lossy schema-v2 → legacy view used only by historical test fixtures."""
+
+    payload = event.payload
+    correlation = event.correlation
+    common: dict[str, object] = {
+        key: value
+        for key, value in {
+            "issue": correlation.issue,
+            "pr": correlation.pr,
+            "dispatch": correlation.dispatch_id,
+            "run_id": correlation.run_id,
+            "leg_id": correlation.leg_id,
+            "session_id": correlation.session_id,
+        }.items()
+        if value is not None
+    }
+    if isinstance(payload, AgentRunStarted):
+        return "agent_run_start", {
+            **common,
+            "model": payload.model,
+            "kind": payload.kind,
+            **dict(payload.attributes or {}),
+        }
+    if isinstance(payload, AgentRunCompleted):
+        result = {
+            **common,
+            "status": payload.status,
+            "is_error": payload.is_error,
+            "exit_reason": payload.exit_reason,
+            "duration_s": payload.duration_ms / 1000,
+            "model": payload.model,
+            "runtime": payload.runtime,
+            "usage": dict(payload.usage) if payload.usage is not None else None,
+            "kind": payload.kind,
+            **dict(payload.attributes or {}),
+        }
+        if payload.summary is not None:
+            result["summary"] = payload.summary
+        if payload.cost_micros is not None:
+            result["cost_usd"] = payload.cost_micros / 1_000_000
+        return "agent_run", result
+    if isinstance(payload, ActionApplied):
+        structured = dict(payload.attributes or {})
+        structured.setdefault("type", payload.kind)
+        structured.setdefault("target", payload.target.upper())
+        if payload.number is not None:
+            structured.setdefault("number", payload.number)
+        return "action", {
+            **common,
+            "desc": payload.display,
+            "action": structured,
+            **{
+                key: value
+                for key, value in structured.items()
+                if key in {"attempts", "replayed"}
+            },
+        }
+    if isinstance(payload, ActionFailed):
+        return "action_failed", {
+            **common,
+            "desc": payload.display,
+            "error": payload.error,
+            "pending": payload.disposition == "retryable_failure",
+            "attempts": payload.attempts,
+        }
+    if isinstance(payload, ActionRetried):
+        return "action_retry", {
+            **common,
+            "desc": payload.display,
+            "attempt": payload.attempt,
+            "delay_seconds": payload.delay_ms / 1000,
+            "error": payload.error,
+        }
+    if isinstance(payload, ActionVerified):
+        return "action_verified", {**common, "desc": payload.display}
+    if isinstance(payload, EscalationRaised):
+        return "escalation", {
+            "target": payload.target,
+            "number": payload.number,
+        }
+    if isinstance(payload, LevelChanged):
+        issue = correlation.issue
+        attributes = dict(payload.attributes or {})
+        return "deferred", {
+            **common,
+            "state": payload.state,
+            "reason": payload.reason,
+            **(
+                {}
+                if "blocker_pr" in attributes or "blocker_issue" in attributes
+                else {"blocker": payload.state_key.rsplit(":", 1)[-1] or None}
+            ),
+            **attributes,
+            **({"issue": issue} if issue is not None else {}),
+        }
+    if isinstance(payload, TickGated):
+        return "tick_gated", {**common, "reason": payload.reason}
+    if isinstance(payload, GithubUnavailable):
+        return "gh_unavailable", {
+            **common,
+            "kind": payload.kind,
+            "detail": payload.detail,
+            "retry_after_s": (
+                payload.retry_after_ms / 1000
+                if payload.retry_after_ms is not None
+                else None
+            ),
+        }
+    if isinstance(payload, StallDetected):
+        return "stall", {
+            **common,
+            "stall_id": payload.stall_id,
+            "started_at": payload.started_at,
+            "woke_at": payload.woke_at,
+            "suspended_seconds": payload.suspended_ms / 1000,
+            "elapsed_seconds": payload.elapsed_ms / 1000,
+            "stall_clock_offset_seconds": payload.clock_offset_ms / 1000,
+        }
+    if isinstance(payload, HandoverWritten):
+        return "handover_written", {
+            **common,
+            "trigger": payload.trigger,
+            "bytes": payload.bytes_written,
+        }
+    if isinstance(payload, PathPrediction):
+        return "path_prediction", {
+            **common,
+            "predicted_paths": list(payload.predicted_paths),
+            "changed_files": list(payload.changed_files),
+            "matched_paths": list(payload.matched_paths),
+            "block_key": payload.signature,
+        }
+    if isinstance(payload, RecurrenceDetected):
+        return "recurrence", {
+            **common,
+            "pr": correlation.pr or 0,
+            "kind": payload.kind,
+            "of_issue": payload.original_issue,
+            "block_key": payload.signature,
+        }
+    if isinstance(payload, ReviewSkipped):
+        return "review_skip", {
+            **common,
+            "reviewer": payload.reviewer,
+            "head_sha": payload.head_sha,
+            "reason": payload.reason,
+        }
+    if isinstance(payload, CiFlakeDetected):
+        return "ci_flake", {
+            **common,
+            "head": payload.head_sha,
+            "block_key": payload.signature,
+        }
+    if isinstance(payload, CiPendingDeadline):
+        return "ci_pending_deadline", {
+            **common,
+            "head": payload.head_sha,
+            "seconds": payload.seconds,
+            "checks": list(payload.checks),
+            "block_key": payload.signature,
+        }
+    if isinstance(payload, DuplicatePrPrevented):
+        return "duplicate_pr_guard", {
+            **common,
+            "author": payload.author,
+            "block_key": payload.signature,
+        }
+    if isinstance(payload, RoutingEscalated):
+        return "route_escalation", {
+            **common,
+            "leg": payload.leg,
+            "from_tier": payload.from_tier,
+            "to_tier": payload.to_tier,
+            "from_effort": payload.from_effort,
+            "to_effort": payload.to_effort,
+            "model": payload.model,
+            "ceiling": payload.ceiling,
+            **dict(payload.evidence),
+        }
+    if isinstance(payload, BudgetPathEntered):
+        return "budget_path", {
+            **common,
+            "leg": payload.leg,
+            "exit_reason": payload.exit_reason,
+        }
+    if isinstance(payload, IssueGroomed):
+        return "groomed", {
+            **common,
+            "block_key": payload.signature,
+            "kind": payload.disposition,
+            **dict(payload.attributes or {}),
+        }
+    if isinstance(payload, DaemonStateChanged):
+        return "daemon_state", {
+            **common,
+            "previous": payload.previous,
+            "state": payload.state,
+            "reason": payload.reason,
+        }
+    if isinstance(payload, TelemetryWarning):
+        name = payload.code if payload.code in {
+            "action_quarantined",
+            "action_reconcile_skipped",
+            "ci_rerun",
+            "cost_blindspot",
+        } else "telemetry_warning"
+        return name, {
+            **common,
+            **dict(payload.details or {}),
+            "warning": payload.warning,
+        }
+    return "telemetry_warning", {
+        **common,
+        "warning": payload.event_type,
+    }
 
 
 def default_ledger_path() -> str:
@@ -195,6 +370,26 @@ class RunContext:
     dispatch_id: str = ""
 
 
+def _run_correlation(
+    context: RunContext,
+    run_id: str,
+    leg_id: str,
+    session_id: str | None = None,
+) -> Correlation:
+    return Correlation(
+        issue=context.issue,
+        pr=(
+            context.number
+            if context.issue is None and context.number > 0
+            else None
+        ),
+        dispatch_id=context.dispatch_id or None,
+        run_id=run_id,
+        leg_id=leg_id,
+        session_id=session_id,
+    )
+
+
 @dataclass
 class _DeferredRouteReceipt:
     """A completed router receipt, held until its dispatch decision is known."""
@@ -225,8 +420,7 @@ class JournalingRuntime:
     def __init__(
         self,
         inner,
-        journal: Journal,
-        ledger_path: str = "",
+        journal: EventSink,
         repo: str = "",
         role: str = "",
         runtime: str = "",
@@ -234,9 +428,6 @@ class JournalingRuntime:
     ):
         self.inner = inner
         self.journal = journal
-        self.ledger = (
-            Journal(ledger_path, monthly_rotation=True) if ledger_path else None
-        )
         self.repo = repo
         self.role = role
         self.runtime = runtime
@@ -302,10 +493,25 @@ class JournalingRuntime:
         router run is real spend); it just lands in its own bucket instead of
         inflating the one it precedes.
         """
-        token = self._context.set(replace(self.context, kind=kind))
+        previous = self.context
+        token = self._context.set(replace(previous, kind=kind))
+        if isinstance(self.inner, ContextualRuntime):
+            self.inner.set_context(
+                previous.role,
+                kind,
+                previous.number,
+                previous.issue,
+            )
         try:
             yield
         finally:
+            if isinstance(self.inner, ContextualRuntime):
+                self.inner.set_context(
+                    previous.role,
+                    previous.kind,
+                    previous.number,
+                    previous.issue,
+                )
             self._context.reset(token)
 
     @contextlib.contextmanager
@@ -412,16 +618,10 @@ class JournalingRuntime:
         if receipt is not None:
             ctx = self.context
             self.journal.emit(
-                "handover_written",
-                role=ctx.role,
-                kind=ctx.kind,
-                number=ctx.number,
-                issue=ctx.issue,
-                dispatch=ctx.dispatch_id,
-                run_id=run_id,
-                leg_id=leg_id,
-                trigger=receipt.trigger,
-                bytes=receipt.byte_size,
+                TelemetryEvent(
+                    HandoverWritten(receipt.trigger, receipt.byte_size),
+                    _run_correlation(ctx, run_id, leg_id),
+                )
             )
         return result
 
@@ -433,15 +633,14 @@ class JournalingRuntime:
         try:
             ctx = self.context
             self.journal.emit(
-                "agent_run_start",
-                role=ctx.role,
-                kind=ctx.kind,
-                number=ctx.number,
-                issue=ctx.issue,
-                dispatch=ctx.dispatch_id,
-                run_id=run_id,
-                leg_id=leg_id,
-                model=task.model or "",
+                TelemetryEvent(
+                    AgentRunStarted(
+                        task.model or "",
+                        ctx.kind,
+                        {"role": ctx.role, "number": ctx.number},
+                    ),
+                    _run_correlation(ctx, run_id, leg_id),
+                )
             )
         except Exception as exc:  # noqa: BLE001 — never fail a run over its receipt
             sys.stderr.write(f"journal: could not record agent_run_start ({exc})\n")
@@ -476,96 +675,97 @@ class JournalingRuntime:
                 }
                 if route_decision is not None else {"model": probe_model}
             )
-            # An ABORTED run (wall cap, idle, dropped result) never receives the
-            # ResultMessage that carries dollars, so `cost` is 0.0 however long it
-            # ran. Observed on the first real deployment: 906s and four commits
-            # ledgered as $0.00 — meaning repeated timeouts accumulate real spend
-            # that BOTH caps are structurally blind to. Price the tokens instead,
-            # at a rate learned from this journal's own completed runs.
-            #
-            # The estimate lands in its own field and NEVER in `cost_usd`, so it
-            # cannot become evidence for the next estimate (see
-            # `observed_cost_per_token`). The ledger — what the caps actually read
-            # — takes the true cost when there is one, else the estimate.
+            # Admission and settlement use the control store's configured rate
+            # table. A telemetry stream must never become a pricing authority.
             estimated = 0.0
-            basis = stream if total_tokens(stream) > 0 else usage
-            if cost <= 0 and total_tokens(basis) > 0:
-                estimated = estimate_cost_usd(
-                    basis, observed_cost_per_token(read_events_tail(self.journal.path))
-                )
-            self.journal.emit(
-                "agent_run",
-                role=ctx.role,
-                kind=ctx.kind,
-                number=ctx.number,
-                issue=ctx.issue,
-                dispatch=ctx.dispatch_id,
-                run_id=run_id,
-                leg_id=leg_id,
-                **route_fields,
-                duration_s=round(duration_s, 1),
-                cost_usd=cost,
-                cost_estimated_usd=(estimated or None),
-                status=result.status,
-                # The envelope's own kind, alongside the agent's claimed `status`.
-                # Without it, an errored run that self-declared "success" (#501)
-                # leaves nothing in the journal to explain WHY it errored.
-                envelope_subtype=(getattr(result, "envelope_subtype", "") or None),
-                is_error=result.is_error,
-                exit_reason=(result.exit_reason.value if result.exit_reason else None),
-                session_id=result.session_id,
-                runtime=self.runtime,
-                usage=usage,
-                usage_stream=stream,
-                turns=getattr(result, "num_turns", None),
-                **(
-                    {
-                        "needs": _bounded_blocked_text(result.needs),
-                        "summary": _bounded_blocked_text(result.summary),
-                    }
-                    if result.status == "blocked"
-                    else {}
+            attributes = {
+                "role": ctx.role,
+                "number": ctx.number,
+                "effort": route_fields.get("effort"),
+                "probe_model": route_fields.get("probe_model"),
+                "envelope_subtype": (
+                    getattr(result, "envelope_subtype", "") or None
                 ),
-                **extra,
+                "usage_stream": stream,
+                "turns": getattr(result, "num_turns", None),
+                "needs": (
+                    _bounded_blocked_text(result.needs)
+                    if result.status == "blocked"
+                    else None
+                ),
+            }
+            attributes = {
+                key: value
+                for key, value in attributes.items()
+                if value is not None
+            }
+            for key in ("error", "deterministic", "detail"):
+                if key in extra:
+                    attributes[key] = extra[key]
+            self.journal.emit(
+                TelemetryEvent(
+                    AgentRunCompleted(
+                        result.status,
+                        result.is_error,
+                        (
+                            result.exit_reason.value
+                            if result.exit_reason
+                            else None
+                        ),
+                        max(0, int(round(duration_s * 1000))),
+                        str(route_fields.get("model") or probe_model),
+                        self.runtime,
+                        max(0, int(round(cost * 1_000_000))),
+                        "USD",
+                        (
+                            "configured_rate_card"
+                            if self.runtime == "codex"
+                            else "provider_reported"
+                        ),
+                        usage,
+                        (
+                            _bounded_blocked_text(result.summary)
+                            if result.status == "blocked"
+                            else None
+                        ),
+                        ctx.kind,
+                        attributes,
+                    ),
+                    _run_correlation(
+                        ctx,
+                        run_id,
+                        leg_id,
+                        result.session_id or None,
+                    ),
+                )
             )
             telemetry_warning = str(
                 getattr(result, "telemetry_warning", "") or ""
             )
             if telemetry_warning:
                 self.journal.emit(
-                    "telemetry_warning",
-                    role=ctx.role,
-                    kind=ctx.kind,
-                    number=ctx.number,
-                    issue=ctx.issue,
-                    dispatch=ctx.dispatch_id,
-                    run_id=run_id,
-                    leg_id=leg_id,
-                    model=(task.model or getattr(result, "model", "") or ""),
-                    session_id=result.session_id,
-                    warning=telemetry_warning,
-                )
-            # Only costed runs reach the ledger: a $0.00 line is pure noise in the
-            # file the spend caps scan on every dispatch. An estimated cost is not
-            # noise — it is the only figure an aborted run will ever have — so it
-            # counts, flagged so an auditor can tell measured from inferred.
-            billed = cost if cost > 0 else estimated
-            if self.ledger is not None and billed > 0:
-                self.ledger.emit(
-                    "spend", schema=2, repo=self.repo, issue=ctx.issue, kind=ctx.kind,
-                    role=ctx.role, runtime=self.runtime,
-                    model=(task.model or getattr(result, "model", "") or ""),
-                    cost_usd=billed,
-                    currency="USD",
-                    basis=(
-                        "learned_estimate"
-                        if cost <= 0
-                        else "configured_rate_card"
-                        if self.runtime == "codex"
-                        else "provider_reported"
-                    ),
-                    estimated=(cost <= 0) or None,
-                    usage=usage,
+                    TelemetryEvent(
+                        TelemetryWarning(
+                            "runtime",
+                            telemetry_warning,
+                            {
+                                "role": ctx.role,
+                                "kind": ctx.kind,
+                                "number": ctx.number,
+                                "model": (
+                                    task.model
+                                    or getattr(result, "model", "")
+                                    or ""
+                                ),
+                            },
+                        ),
+                        _run_correlation(
+                            ctx,
+                            run_id,
+                            leg_id,
+                            result.session_id or None,
+                        ),
+                    )
                 )
         except Exception as exc:  # noqa: BLE001 — never fail a run over its receipt
             sys.stderr.write(f"journal: could not record agent_run ({exc})\n")
@@ -1080,135 +1280,6 @@ def groomed_keys(events) -> set[str]:
     return _emitted_block_keys(events, "groomed")
 
 
-# How many settled runs must agree before the ledger is declared blind. Small
-# enough to fire within one poll cycle of a fresh daemon, large enough that a
-# single genuinely-free run (a session that died before billing) is not it.
-COST_BLINDSPOT_MIN_RUNS = 5
-
-
-def cost_blindspot_warning(
-    runs,
-    *,
-    issue_spend_cap_usd: float,
-    daily_spend_cap_usd: float,
-    min_runs: int = COST_BLINDSPOT_MIN_RUNS,
-) -> str | None:
-    """The ONE loud line for a spend cap that cannot see a single dollar
-    (review P1R-5). `runs` is the settled `agent_run` events; returns None
-    (silence) when no cap is armed, when there is not enough evidence yet, or
-    when any run DID record a cost — there is then nothing to mislead about.
-
-    `JournalingRuntime._record` writes a ledger line only when `cost > 0`, and
-    that is the right call (a $0.00 line is noise in the file both caps scan on
-    every dispatch). The consequence is what needed saying out loud: a
-    subscription-plan Claude gateway reports $0.00 for every run and an
-    un-priced Codex reports nothing at all, so the ledger stays EMPTY, both caps
-    read $0.00 forever, and neither can fire for any loop shape. The D2
-    acceptance ("the wall cap and the infra ceiling bound it") does not cover
-    it: the wall cap bounds one session's LENGTH, not the number of sessions.
-
-    Sibling of `codex_cost_blindspot_warning`, which announces the same blind
-    spot for the one cause it can detect at startup (missing codex prices); this
-    one is evidence-based and catches every cause, including the plan.
-    """
-    if issue_spend_cap_usd <= 0 and daily_spend_cap_usd <= 0:
-        return None
-    runs = list(runs)
-    if len(runs) < max(1, min_runs):
-        return None
-    if any(_cost(r) > 0 for r in runs):
-        return None
-    caps = ", ".join(
-        part
-        for part in (
-            f"issue=${issue_spend_cap_usd:.2f}" if issue_spend_cap_usd > 0 else "",
-            f"daily=${daily_spend_cap_usd:.2f}" if daily_spend_cap_usd > 0 else "",
-        )
-        if part
-    )
-    return (
-        f"spend: WARNING — spend caps are armed ({caps}) but the last "
-        f"{len(runs)} agent runs all recorded $0.00, so NOTHING reaches the "
-        "spend ledger and NEITHER cap can ever fire. A subscription-plan Claude "
-        "gateway reports no per-run cost, and codex reports none unless "
-        "CODEX_COST_PER_MTOK_IN/OUT are set. Until a run records a cost, the "
-        "only bounds on this harness's spend are the wall cap (one session's "
-        "length) and the retry/infra ceilings (a loop's length) — not dollars."
-    )
-
-
-def total_tokens(usage) -> int:
-    """Every token counter in an SDK usage block, summed. Input/output/cache are
-    all billed, so the total is the right cost substrate; the per-counter split
-    only matters if you are pricing them separately, which `observed_cost_per_token`
-    deliberately does not."""
-    if not isinstance(usage, dict):
-        return 0
-    return sum(
-        int(v) for v in usage.values()
-        if isinstance(v, (int, float)) and not isinstance(v, bool)
-    )
-
-
-def observed_cost_per_token(events) -> float:
-    """Blended $/token LEARNED from completed runs, or 0.0 with no evidence.
-
-    An aborted run reports tokens but no dollars — cost only ever arrives on the
-    final ResultMessage. Rather than hardcode a price table (which goes stale
-    silently, and is wrong for every gateway/plan that is not the list price),
-    read the rate off runs that reported BOTH. It self-calibrates to whatever the
-    operator is actually billed at, and returns 0.0 — "no estimate" — until there
-    is evidence, so a fresh install never invents a number.
-
-    A single blended rate rather than per-counter prices: cache-read dominates
-    real runs, so the counters move together. Measured on the first deployment,
-    a resolve ($1.383e-6/tok) and a review ($1.395e-6/tok) agreed to within 1%.
-
-    Only TRUE costs feed this. Estimated runs record their figure in
-    `cost_estimated_usd`, never in `cost_usd`, precisely so an estimate can never
-    become evidence for the next estimate.
-
-    UNITS: the denominator is the run's `usage_stream` total (the stream-summed
-    accumulator) whenever the event has one, because that is the only total an
-    ABORTED run ever has — rate and multiplicand must be the same quantity.
-    Learning against the ResultMessage's `usage` while pricing aborts on stream
-    sums overbilled aborts ~3.5x (the two totals were measured 43.2M vs 12.1M
-    on one run, 2026-07-26). Events journaled before `usage_stream` existed
-    only feed the fallback rate, used when no stream-denominated pair exists
-    yet — a legacy-rate estimate stays overbilled, never underbilled.
-    """
-    cost = 0.0
-    tokens = 0
-    legacy_cost = 0.0
-    legacy_tokens = 0
-    for e in events:
-        if e.get("event") != "agent_run":
-            continue
-        c = _cost(e)
-        if c <= 0:
-            continue
-        t_stream = total_tokens(e.get("usage_stream"))
-        t_result = total_tokens(e.get("usage"))
-        if t_stream > 0:
-            cost += c
-            tokens += t_stream
-        elif t_result > 0:
-            legacy_cost += c
-            legacy_tokens += t_result
-    if tokens > 0:
-        return cost / tokens
-    return legacy_cost / legacy_tokens if legacy_tokens > 0 else 0.0
-
-
-def estimate_cost_usd(usage, rate: float) -> float:
-    """Price a run's tokens at a learned blended rate. 0.0 when either is absent
-    — an unknown cost must read as unknown, never as a fabricated number."""
-    if rate <= 0:
-        return 0.0
-    tokens = total_tokens(usage)
-    return round(tokens * rate, 6) if tokens > 0 else 0.0
-
-
 def _cost(event: dict) -> float:
     try:
         return float(event.get("cost_usd", 0.0) or 0.0)
@@ -1224,22 +1295,17 @@ def _int(value) -> int | None:
 
 
 __all__ = [
-    "COST_BLINDSPOT_MIN_RUNS",
-    "Journal",
     "JournalingRuntime",
+    "LegacyJournalLocator",
     "RunContext",
     "alert",
-    "cost_blindspot_warning",
     "death_key",
     "default_ledger_path",
-    "estimate_cost_usd",
-    "event_line",
     "events_within",
     "ci_flake_keys",
     "ci_pending_keys",
     "duplicate_pr_keys",
     "hold_keys",
-    "observed_cost_per_token",
     "parse_ts",
     "read_events",
     "read_events_tail",
@@ -1250,7 +1316,6 @@ __all__ = [
     "spend_blocked_keys",
     "sum_issue",
     "sum_today",
-    "total_tokens",
     "unsettled_start_events",
     "unsettled_starts",
 ]

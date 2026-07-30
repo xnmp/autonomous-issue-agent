@@ -16,6 +16,7 @@ from issue_agent.domain.contracts import (
     TestExecutionStatus as ExecutionStatus,
     TokenUsage,
     UsageSource,
+    daily_budget_scope,
 )
 
 
@@ -46,6 +47,44 @@ def test_quote_and_scope_reject_naive_or_impossible_time():
             "o/r", "daily", "USD", "day", now, now - timedelta(seconds=1),
             ZoneInfo("UTC"),
         )
+
+
+@pytest.mark.parametrize(
+    "instant,zone,hours,period_id",
+    [
+        (
+            datetime(2026, 10, 4, 12, tzinfo=timezone.utc),
+            "Australia/Sydney",
+            23,
+            "2026-10-04",
+        ),
+        (
+            datetime(2026, 4, 5, 12, tzinfo=timezone.utc),
+            "Australia/Sydney",
+            25,
+            "2026-04-05",
+        ),
+        (
+            datetime(2028, 2, 29, 12, tzinfo=timezone.utc),
+            "UTC",
+            24,
+            "2028-02-29",
+        ),
+    ],
+)
+def test_daily_budget_periods_follow_civil_dst_and_leap_boundaries(
+    instant, zone, hours, period_id
+):
+    scope = daily_budget_scope(
+        "o/r", "repository", "USD", instant, ZoneInfo(zone)
+    )
+
+    elapsed = (
+        scope.period_end.astimezone(timezone.utc)
+        - scope.period_start.astimezone(timezone.utc)
+    )
+    assert elapsed == timedelta(hours=hours)
+    assert scope.period_id == period_id
 
 
 def test_only_genuine_nonzero_test_exit_can_be_red_evidence():

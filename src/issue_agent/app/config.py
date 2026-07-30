@@ -317,6 +317,7 @@ class HarnessConfig:
     review_model: str | None = "gpt-5.6-terra"
     steward_triage_model: str | None = "sonnet"
     fix_budget_usd: float = 10.0
+    router_budget_usd: float = 0.10
     review_budget_usd: float = 8.0
     triage_budget_usd: float = 0.75
     # REVIEW_MODE: single (default) | multi | delegated.
@@ -717,6 +718,7 @@ class HarnessConfig:
         _require_non_negative(errors, "MAX_CONTRACT_ROUNDS", self.max_contract_rounds)
         for name, value in (
             ("MAX_BUDGET_USD", self.fix_budget_usd),
+            ("ROUTER_BUDGET_USD", self.router_budget_usd),
             ("REVIEW_BUDGET_USD", self.review_budget_usd),
             ("STEWARD_TRIAGE_BUDGET_USD", self.triage_budget_usd),
             ("REVIEW_GATE_BUDGET_USD", self.review_gate_budget_usd),
@@ -1001,6 +1003,7 @@ _INTERNAL_CONFIG_FIELDS = frozenset(
 )
 _ENV_NAME_OVERRIDES = {
     "fix_budget_usd": "MAX_BUDGET_USD",
+    "router_budget_usd": "ROUTER_BUDGET_USD",
     "max_review_rejections": "REVIEW_MAX_REJECTIONS",
     "triage_budget_usd": "STEWARD_TRIAGE_BUDGET_USD",
     "harness_root": "HARNESS_ROOT_DIR",

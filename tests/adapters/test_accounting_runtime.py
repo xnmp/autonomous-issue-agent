@@ -14,6 +14,27 @@ from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.contracts import Money
 from issue_agent.domain.events import Producer, SpendRecorded, decode_event_line
 from issue_agent.domain.outcome import AgentResult, ExitReason
+from issue_agent.domain.pricing import (
+    BudgetPolicy,
+    ModelRates,
+    RateTable,
+    UnknownModelPolicy,
+)
+
+
+def _policy(maximum=2_000_000):
+    return BudgetPolicy({("fix", "RESOLVE"): Money("USD", maximum)})
+
+
+def _rates():
+    return RateTable(
+        "test",
+        "v1",
+        "USD",
+        {},
+        UnknownModelPolicy.USE_FALLBACK,
+        ModelRates(5_000_000, 30_000_000, 500_000, 5_000_000),
+    )
 
 
 class Runtime:
@@ -29,19 +50,23 @@ class Runtime:
 def _wrapper(tmp_path, runtime, cap=5_000_000, evidence_dir=""):
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
+    wrapper = AccountingRuntime(
+        runtime,
+        store,
+        "o/r",
+        "fix",
+        Money("USD", cap),
+        None,
+        None,
+        "cfg",
+        "codex",
+        _policy(),
+        _rates(),
+        spend_evidence_dir=evidence_dir,
+    )
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
     return (
-        AccountingRuntime(
-            runtime,
-            store,
-            "o/r",
-            "fix",
-            Money("USD", cap),
-            None,
-            None,
-            "cfg",
-            "codex",
-            evidence_dir,
-        ),
+        wrapper,
         store,
     )
 
@@ -58,7 +83,9 @@ def test_paid_run_has_reservation_before_runtime_and_settles(tmp_path) -> None:
     )
     wrapper, store = _wrapper(tmp_path, runtime)
 
-    result = asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
+    result = asyncio.run(
+        wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2))
+    )
 
     assert result.status == "ok"
     assert runtime.calls == 1
@@ -93,7 +120,9 @@ def test_disabled_caps_still_reserve_and_settle_subscription_run(tmp_path) -> No
         None,
         "cfg",
         "claude",
+        _policy(),
     )
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
 
     result = asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
 

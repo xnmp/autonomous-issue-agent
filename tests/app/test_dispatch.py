@@ -11,7 +11,7 @@ import pytest
 from issue_agent.adapters.github import GhUnavailable
 from issue_agent.adapters.store import Store
 from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
-from issue_agent.app.execute import Executor
+from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.domain.actions import AgentKind, RunAgent
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.app.planners.tasks import (
@@ -182,6 +182,9 @@ class FakeWorktrees:
     def branch_for_issue(self, issue, fallback):
         del issue
         return fallback
+
+    def prune_validate(self):
+        return 0
 
 
 class FakeRunner:

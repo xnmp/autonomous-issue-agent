@@ -2,7 +2,7 @@
 
 Status: Accepted
 Date: 2026-07-30
-Governs: src/issue_agent/adapters/effects.py src/issue_agent/adapters/untrusted.py src/issue_agent/domain/gate.py plugin/hooks/
+Governs: src/issue_agent/adapters/effects.py src/issue_agent/domain/trust.py src/issue_agent/domain/gate.py plugin/hooks/
 
 ## Decision
 

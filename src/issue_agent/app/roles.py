@@ -21,7 +21,7 @@ import tempfile
 import threading
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
@@ -38,15 +38,11 @@ from ..adapters.accounting_runtime import AccountingRuntime
 from ..adapters.event_log import EventLog
 from ..adapters.typed_journal import TypedJournal
 from ..adapters.github import GitHubGateway, Identity
+from ..adapters.governor import read_adrs
 from ..adapters.journal import (
-    Journal,
     JournalingRuntime,
-    ci_flake_keys,
-    ci_pending_keys,
-    duplicate_pr_keys,
+    LegacyJournalLocator,
     default_ledger_path,
-    read_events_tail,
-    recurrence_keys,
 )
 from ..adapters.store import Store
 from ..adapters.spend_recovery import CodexSpendReconciler, spend_evidence_dir
@@ -72,10 +68,18 @@ from ..domain.review import (
     ReviewState,
     decide_review,
 )
-from .planners.tasks import FixTaskConfig, GroomTaskConfig, JiraTaskConfig, ReviewTaskConfig, TriageTaskConfig
+from .planners.tasks import (
+    REVIEW_DIMENSIONS,
+    FixTaskConfig,
+    GroomTaskConfig,
+    JiraTaskConfig,
+    ReviewTaskConfig,
+    TriageTaskConfig,
+)
 from ..domain.triage import (
     TriageConfig,
     TriageState,
+    adr_steward_actions,
     parse_codeowners_default,
     grooming_candidates,
     triage_candidates,
@@ -85,20 +89,39 @@ from ..domain.actions import AgentKind, Relabel, RunAgent, Target
 from ..adapters.runtime_plan import AgentRuntime
 from ..domain.agent_task import RuntimeName
 from ..domain.contracts import BudgetScope, Money
-from ..domain.events import Producer
+from ..domain.pricing import (
+    BudgetPolicy,
+    ModelRates,
+    RateTable,
+    UnknownModelPolicy,
+    usd_per_million_to_micros,
+)
+from ..domain.events import (
+    CiFlakeDetected,
+    CiPendingDeadline,
+    Correlation,
+    DuplicatePrPrevented,
+    LevelChanged,
+    PathPrediction,
+    Producer,
+    RecurrenceDetected,
+    TelemetryEvent,
+)
 from ..domain.ports import (
     CiPendingState,
+    EventSink,
     IssueStateReasonReads,
+    LevelState,
     PredictionReader,
     RecentMergesReads,
 )
-from .config import HarnessConfig
+from .config import CodexRuntimeConfig, HarnessConfig, ReviewRuntimeConfig
 from .dispatch import AgentDispatcher, DispatchConfig
 from .execute import Executor
 from .loop import Daemon
 from .mcp import mcp_servers_from_file
 from .world_reporter import WorldReporter
-from .recovery import RecoveryCoordinator
+from .recovery import NoWorktreeRecovery, RecoveryCoordinator
 
 
 def _ignore_world(_world: object) -> None:
@@ -138,15 +161,6 @@ def _control_store(
         line_limit=journal.events.line_limit,
         destination=journal.events.producer.feed_identity,
     )
-    from ..adapters.process_supervisor import ProcessSupervisor
-
-    RecoveryCoordinator(
-        ProcessSupervisor(state_dir or os.path.dirname(control.path)),
-        control,
-        CodexSpendReconciler(control, _spend_evidence_dirs(cfg)),
-        journal,
-        f"{cfg.repo}:{journal.events.producer.role}",
-    ).recover()
     return control
 
 
@@ -210,12 +224,97 @@ def _with_accounting(
         money(cfg.issue_spend_cap_usd),
         cfg.config_version,
         runtime_name,
+        _budget_policy(cfg),
+        _rate_table(cfg, runtime_name),
         spend_evidence_dir(_role_state_dir(cfg, role)),
         journal.events.path,
         journal.events.producer.deployment,
         journal.events.producer.role,
         journal.events.line_limit,
     )
+
+
+def _budget_policy(cfg: HarnessConfig) -> BudgetPolicy:
+    def money(value: float) -> Money:
+        return Money("USD", int(round(value * 1_000_000)))
+
+    limits: dict[tuple[str, str], Money] = {}
+    for kind in (
+        "RESOLVE",
+        "RESUME",
+        "PR_RESUME",
+        "ADDRESS_REVIEW",
+        "FIX_CI",
+        "REBASE",
+        "AUTHOR",
+        "IMPLEMENT",
+        "ADJUDICATE",
+    ):
+        limits[("fix", kind)] = money(cfg.fix_budget_usd)
+    limits[("fix", "ROUTE")] = money(cfg.router_budget_usd)
+    for kind in ("REVIEW", "RE_REVIEW"):
+        limits[("review", kind)] = money(cfg.review_budget_usd)
+    limits[("review", "REVIEW_GATE")] = money(cfg.review_gate_budget_usd)
+    for key, _focus in REVIEW_DIMENSIONS:
+        normalized = key.upper().replace("-", "_")
+        limits[("review", f"REVIEW_{normalized}")] = money(
+            cfg.review_dimension_budget_usd
+        )
+        limits[("review", f"VALIDATE_{normalized}")] = money(
+            cfg.review_validation_budget_usd
+        )
+    limits[("steward", "TRIAGE")] = money(cfg.triage_budget_usd)
+    limits[("steward", "GROOM")] = money(cfg.triage_budget_usd)
+    limits[("steward", "JIRA_SYNC")] = money(cfg.jira_budget_usd)
+    return BudgetPolicy(limits)
+
+
+def _rate_table(
+    cfg: HarnessConfig, runtime_name: str
+) -> RateTable | None:
+    if runtime_name != RuntimeName.CODEX.value:
+        return None
+    try:
+        fallback = ModelRates(
+            usd_per_million_to_micros(cfg.codex_cost_per_mtok_in),
+            usd_per_million_to_micros(cfg.codex_cost_per_mtok_out),
+            usd_per_million_to_micros(cfg.codex_cost_per_mtok_in / 10),
+            usd_per_million_to_micros(cfg.codex_cost_per_mtok_in),
+        )
+        cached = dict(cfg.codex_cost_per_mtok_cached_in)
+        rates = {
+            model: ModelRates(
+                usd_per_million_to_micros(rate_in),
+                usd_per_million_to_micros(rate_out),
+                usd_per_million_to_micros(
+                    cached.get(model, rate_in / 10)
+                ),
+                usd_per_million_to_micros(rate_in),
+            )
+            for model, rate_in, rate_out in cfg.codex_cost_per_mtok
+        }
+    except ValueError:
+        return None
+    return RateTable(
+        "codex-config",
+        cfg.config_version,
+        "USD",
+        rates,
+        UnknownModelPolicy.USE_FALLBACK,
+        fallback,
+    )
+
+
+@dataclass(frozen=True)
+class EffectRecovery:
+    actions: GitHubEffectExecutor
+    publications: AgentPublicationBroker
+
+    def drain_pending_commands(self) -> int:
+        return (
+            self.actions.drain_pending_commands()
+            + self.publications.drain_pending_commands()
+        )
 
 
 def _effects(
@@ -225,7 +324,7 @@ def _effects(
     repository: str,
     identity: str,
     config_version: str,
-) -> GitHubEffectExecutor:
+) -> EffectRecovery:
     executor = GitHubEffectExecutor(
         gateway,
         control,
@@ -233,23 +332,23 @@ def _effects(
         identity=identity,
         config_version=config_version,
     )
-    executor.drain_pending_commands()
-    AgentPublicationBroker(
+    publications = AgentPublicationBroker(
         control,
         repository=repository,
         config_version=config_version,
         identity=f"{identity}:publication",
         owner=identity,
-    ).drain_pending_commands()
-    return executor
+    )
+    return EffectRecovery(executor, publications)
 
 
 def _recovery(
     state_dir: str,
     cfg: HarnessConfig,
     control: SQLiteControlStore,
-    effects: GitHubEffectExecutor,
+    effects: EffectRecovery,
     journal: TypedJournal,
+    worktrees: Worktrees | None = None,
 ) -> Callable[[], object]:
     from ..adapters.process_supervisor import ProcessSupervisor
 
@@ -257,6 +356,8 @@ def _recovery(
     coordinator = RecoveryCoordinator(
         ProcessSupervisor(effective_state_dir),
         control,
+        worktrees or NoWorktreeRecovery(),
+        effects,
         CodexSpendReconciler(control, _spend_evidence_dirs(cfg)),
         journal,
         f"{cfg.repo}:{journal.events.producer.role}",
@@ -264,9 +365,10 @@ def _recovery(
 
     def recover() -> object:
         report = coordinator.recover()
-        effects.drain_pending_commands()
+        control.flush_bound_outbox()
         return report
 
+    recover()
     return recover
 
 
@@ -501,17 +603,14 @@ def steward_capability_line(*, triage: bool, promote: bool, jira_sync: bool,
     )
 
 
-def _journal(store: Store) -> Journal:
-    """Each role journals beside its own state, because each role already has an
-    isolated STATE_DIR — so three daemons never contend on one file. The GLOBAL
-    ledger is the deliberate exception: cost is the one quantity that must be
-    summed across every role and repo, and POSIX append atomicity makes sharing
-    it safe without a lock."""
-    return Journal(os.path.join(store.state_dir, "journal.jsonl"))
+def _journal(store: Store) -> LegacyJournalLocator:
+    """Locate historical JSONL while live telemetry writes only schema v2."""
+
+    return LegacyJournalLocator(os.path.join(store.state_dir, "journal.jsonl"))
 
 
 def _typed_journal(
-    legacy: Journal,
+    legacy: LegacyJournalLocator,
     cfg: HarnessConfig,
     role: str,
     state_dir: str,
@@ -531,7 +630,7 @@ def _typed_journal(
             uuid.uuid4().hex,
         ),
     )
-    return TypedJournal(legacy, events)
+    return TypedJournal(legacy.path, events)
 
 
 def _wake_check(cfg: HarnessConfig, store: Store):
@@ -670,6 +769,225 @@ def _build_codex_runner(
     )
 
 
+@dataclass(frozen=True)
+class _FixRuntimeBinding:
+    runner: AgentRuntime
+    prepare_cwd: Callable[[str], None] | None = None
+
+
+def _bind_claude_fix_runtime(
+    _cfg: HarnessConfig,
+    _runtime_config: CodexRuntimeConfig,
+    runner: AgentRuntime,
+) -> _FixRuntimeBinding:
+    return _FixRuntimeBinding(runner)
+
+
+def _bind_codex_fix_runtime(
+    cfg: HarnessConfig,
+    runtime_config: CodexRuntimeConfig,
+    _runner: AgentRuntime,
+) -> _FixRuntimeBinding:
+    from ..adapters.codex_hook import HookPreparingRuntime, write_hook_config
+    from ..adapters.codex_runner import (
+        codex_budget_not_enforced_warning,
+        codex_cost_blindspot_warning,
+    )
+
+    log = _log("fix")
+    runner = _build_codex_runner(
+        cfg,
+        default_model=runtime_config.model or None,
+        sandbox=runtime_config.sandbox,
+        inject_system_prompt=False,
+        resume_on_retry=True,
+        leg_role="fix",
+        log=log,
+        state_dir=cfg.state_dir,
+    )
+    reason = runner.preflight()
+    log(
+        f"codex: NOT READY at startup — {reason}"
+        if reason is not None
+        else "codex: runtime ready (bin + key present)"
+    )
+    blindspot = codex_cost_blindspot_warning(
+        cost_per_mtok_in=runtime_config.cost_per_mtok_in,
+        cost_per_mtok_out=runtime_config.cost_per_mtok_out,
+        issue_spend_cap_usd=cfg.issue_spend_cap_usd,
+        daily_spend_cap_usd=cfg.daily_spend_cap_usd,
+        max_runtime=runtime_config.max_runtime,
+        unpriced_cached_models=runtime_config.unpriced_cached_models,
+    )
+    if blindspot is not None:
+        log(blindspot)
+    budget_notice = codex_budget_not_enforced_warning(
+        fix_budget_usd=cfg.fix_budget_usd,
+        max_runtime=runtime_config.max_runtime,
+        enforced=runtime_config.enforce_budget,
+        priced=runtime_config.budget_priceable,
+        pricing_gap=runtime_config.budget_pricing_gap,
+    )
+    if budget_notice is not None:
+        log(budget_notice)
+    prepare_cwd = partial(
+        write_hook_config,
+        agents_md=cfg.agent_md,
+        edit_check_cmd=cfg.edit_check_cmd,
+        log=log,
+        state_dir=cfg.state_dir,
+    )
+    return _FixRuntimeBinding(
+        HookPreparingRuntime(runner, prepare_cwd),
+        prepare_cwd,
+    )
+
+
+def _bind_glm_fix_runtime(
+    cfg: HarnessConfig,
+    _runtime_config: CodexRuntimeConfig,
+    runner: AgentRuntime,
+) -> _FixRuntimeBinding:
+    from ..adapters.claude_profile import (
+        EnvInjectingRuntime,
+        claude_profile_env,
+        endpoint_host,
+    )
+
+    log = _log("fix")
+    try:
+        environment = claude_profile_env(cfg.glm_settings_file)
+    except ValueError as exc:
+        log(f"glm: NOT READY at startup — {exc}")
+        return _FixRuntimeBinding(runner)
+    log(
+        f"glm: runtime ready (endpoint {endpoint_host(environment)}, "
+        f"profile {environment['CLAUDE_CONFIG_DIR']})"
+    )
+    return _FixRuntimeBinding(
+        EnvInjectingRuntime(runner, env=environment)
+    )
+
+
+_FIX_RUNTIME_REGISTRY: Mapping[
+    RuntimeName,
+    Callable[
+        [HarnessConfig, CodexRuntimeConfig, AgentRuntime],
+        _FixRuntimeBinding,
+    ],
+] = {
+    RuntimeName.CLAUDE: _bind_claude_fix_runtime,
+    RuntimeName.CODEX: _bind_codex_fix_runtime,
+    RuntimeName.GLM: _bind_glm_fix_runtime,
+}
+
+if frozenset(_FIX_RUNTIME_REGISTRY) != frozenset(RuntimeName):
+    raise RuntimeError("fix runtime registry is not exhaustive")
+
+
+@dataclass(frozen=True)
+class _ReviewRuntimeBinding:
+    runner: AgentRuntime
+    execution_cwd: str = ""
+    prepare_cwd: Callable[[str], None] | None = None
+
+
+def _bind_claude_review_runtime(
+    _cfg: HarnessConfig,
+    _runtime_config: ReviewRuntimeConfig,
+    runner: AgentRuntime,
+) -> _ReviewRuntimeBinding:
+    return _ReviewRuntimeBinding(runner)
+
+
+def _bind_codex_review_runtime(
+    cfg: HarnessConfig,
+    runtime_config: ReviewRuntimeConfig,
+    _runner: AgentRuntime,
+) -> _ReviewRuntimeBinding:
+    from ..adapters.codex_hook import HookPreparingRuntime, write_hook_config
+    from ..adapters.codex_runner import (
+        codex_budget_not_enforced_warning,
+        codex_cost_blindspot_warning,
+    )
+
+    log = _log("review")
+    runner = _build_codex_runner(
+        cfg,
+        default_model=runtime_config.model,
+        sandbox="read-only",
+        inject_system_prompt=True,
+        resume_on_retry=False,
+        leg_role="review",
+        log=log,
+        state_dir=cfg.review_state_dir,
+    )
+    reason = runner.preflight()
+    log(
+        f"codex: NOT READY at startup — {reason}"
+        if reason is not None
+        else "codex: runtime ready (bin + key present)"
+    )
+    blindspot = codex_cost_blindspot_warning(
+        cost_per_mtok_in=cfg.codex_runtime.cost_per_mtok_in,
+        cost_per_mtok_out=cfg.codex_runtime.cost_per_mtok_out,
+        issue_spend_cap_usd=cfg.issue_spend_cap_usd,
+        daily_spend_cap_usd=cfg.daily_spend_cap_usd,
+        max_runtime=cfg.codex_runtime.max_runtime,
+        runtime_name="REVIEWER_RUNTIME",
+        unpriced_cached_models=cfg.codex_runtime.unpriced_cached_models,
+    )
+    if blindspot is not None:
+        log(blindspot)
+    budget_notice = codex_budget_not_enforced_warning(
+        fix_budget_usd=runtime_config.budget_usd,
+        max_runtime=cfg.codex_runtime.max_runtime,
+        enforced=cfg.codex_runtime.enforce_budget,
+        priced=cfg.codex_runtime.budget_priceable,
+        pricing_gap=cfg.codex_runtime.budget_pricing_gap,
+        budget_name="REVIEW_BUDGET_USD",
+        runtime_name="REVIEWER_RUNTIME",
+    )
+    if budget_notice is not None:
+        log(budget_notice)
+    execution_cwd = cfg.target_dir
+    if not execution_cwd:
+        log(
+            "codex: NOT READY at startup — REVIEWER_RUNTIME=codex requires "
+            "TARGET_DIR so its read-only governor has an explicit checkout"
+        )
+        return _ReviewRuntimeBinding(runner)
+    prepare_cwd = partial(
+        write_hook_config,
+        review_only=True,
+        log=log,
+        state_dir=cfg.review_state_dir,
+    )
+    return _ReviewRuntimeBinding(
+        HookPreparingRuntime(runner, prepare_cwd),
+        execution_cwd,
+        prepare_cwd,
+    )
+
+
+_REVIEW_RUNTIME_REGISTRY: Mapping[
+    RuntimeName,
+    Callable[
+        [HarnessConfig, ReviewRuntimeConfig, AgentRuntime],
+        _ReviewRuntimeBinding,
+    ],
+] = {
+    RuntimeName.CLAUDE: _bind_claude_review_runtime,
+    RuntimeName.CODEX: _bind_codex_review_runtime,
+}
+
+_SUPPORTED_REVIEW_RUNTIMES = frozenset(
+    {RuntimeName.CLAUDE, RuntimeName.CODEX}
+)
+if frozenset(_REVIEW_RUNTIME_REGISTRY) != _SUPPORTED_REVIEW_RUNTIMES:
+    raise RuntimeError("review runtime registry is not exhaustive")
+
+
 def _inject_predicted_paths(store: Store, world):
     """Attach persisted router predictions to this tick's GitHub issue views.
 
@@ -693,7 +1011,7 @@ def _inject_predicted_paths(store: Store, world):
 
 
 def _prediction_outcome_reporter(
-    journal: Journal | None, repo: str, store: Store, log, control=None
+    journal: EventSink | None, repo: str, store: Store, log, control=None
 ):
     """Journal each terminal PR's predicted-versus-actual files exactly once.
 
@@ -706,15 +1024,6 @@ def _prediction_outcome_reporter(
     def report(world) -> None:
         if not isinstance(store, PredictionReader):
             return
-        prior = (
-            read_events_tail(journal.path)
-            if journal is not None and control is None
-            else ()
-        )
-        prior_keys = {
-            event.get("block_key") for event in prior
-            if event.get("event") == "path_prediction"
-        }
         for pr in world.prs:
             if pr.state not in ("MERGED", "CLOSED") or pr.closing_issue is None:
                 continue
@@ -727,11 +1036,9 @@ def _prediction_outcome_reporter(
             if not predicted:
                 continue
             key = f"path-prediction:{repo}:{pr.closing_issue}:{pr.number}"
-            if key in seen or key in prior_keys:
+            if key in seen:
                 continue
-            if control is not None and not control.claim(
-                "path-prediction", repo, key
-            ):
+            if control is not None and not control.claim("path-prediction", repo, key):
                 continue
             seen.add(key)
             matched = predicted & pr.changed_files
@@ -741,10 +1048,15 @@ def _prediction_outcome_reporter(
             )
             if journal is not None:
                 journal.emit(
-                    "path_prediction", issue=pr.closing_issue, pr=pr.number,
-                    predicted_paths=sorted(predicted),
-                    changed_files=sorted(pr.changed_files),
-                    matched_paths=sorted(matched), block_key=key,
+                    TelemetryEvent(
+                        PathPrediction(
+                            tuple(sorted(predicted)),
+                            tuple(sorted(pr.changed_files)),
+                            tuple(sorted(matched)),
+                            key,
+                        ),
+                        Correlation(issue=pr.closing_issue, pr=pr.number),
+                    )
                 )
 
     return report
@@ -827,10 +1139,11 @@ def _fix_state(
 
 
 def _hold_reporter(
-    journal: Journal | None,
+    journal: EventSink | None,
     repo: str,
     log,
     issue_is_blocked: Callable[[int], bool] | None = None,
+    control=None,
 ):
     """Report defer begin/clear transitions without steady-state tick noise.
 
@@ -840,9 +1153,9 @@ def _hold_reporter(
     #522 cost ~30 minutes of live investigation before anyone could tell which
     it was).
 
-    The journal is the restart-safe edge memory. A fresh daemon reconstructs
-    active deferrals before comparing the current world, so it neither repeats
-    a begin nor loses the eventual clear.
+    The schema-v2 world projection is the durable source for dashboard levels.
+    This reporter keeps only process-local edge memory; telemetry is never read
+    to reconstruct orchestration state.
     """
     active: dict[tuple[int, str, int | None, int | None], dict] | None = None
 
@@ -864,6 +1177,18 @@ def _hold_reporter(
             "blocker_issue": blocker_issue,
         }
 
+    def stored_key(key) -> str:
+        issue, reason, blocker_pr, blocker_issue = key
+        return f"{issue}:{reason}:{blocker_pr or ''}:{blocker_issue or ''}"
+
+    def key_from_fields(fields) -> tuple[int, str, int | None, int | None]:
+        return (
+            int(fields["issue"]),
+            str(fields["reason"]),
+            fields.get("blocker_pr"),
+            fields.get("blocker_issue"),
+        )
+
     def waiting_label(key) -> str:
         issue, reason, blocker_pr, blocker_issue = key
         if reason == "human":
@@ -874,42 +1199,16 @@ def _hold_reporter(
             return f"issue #{issue} waiting on #{blocker_issue}"
         return f"issue #{issue} waiting on an open dependency"
 
-    def event_key(event) -> tuple[int, str, int | None, int | None] | None:
-        try:
-            issue = int(event.get("issue") or 0)
-        except (TypeError, ValueError):
-            return None
-        if issue <= 0:
-            return None
-        blocker_pr = event.get("blocker_pr")
-        blocker_issue = event.get("blocker_issue")
-        legacy_blocker = str(event.get("blocker") or "")
-        if blocker_pr is None and legacy_blocker.lower().startswith("pr#"):
-            try:
-                blocker_pr = int(legacy_blocker[3:])
-            except ValueError:
-                blocker_pr = None
-        return (issue, str(event.get("reason") or ""), blocker_pr, blocker_issue)
-
     def report(world, inflight=()) -> None:
         nonlocal active
         if active is None:
-            active = {}
-        if journal is not None and not journal.canonical:
-            # Executor-owned human edges can land between polls. Replaying the
-            # durable edge log keeps this reporter synchronized across both
-            # daemon restarts and in-process writers.
-            active = {}
-            for event in read_events_tail(journal.path):
-                if event.get("event") not in {"deferred", "hold"}:
-                    continue
-                key = event_key(event)
-                if key is None:
-                    continue
-                if event.get("state") == "cleared":
-                    active.pop(key, None)
-                elif event.get("state") == "waiting" or event.get("event") == "hold":
-                    active[key] = event
+            if isinstance(control, LevelState):
+                active = {
+                    key_from_fields(fields): dict(fields)
+                    for fields in control.load_level_state("holds", repo).values()
+                }
+            else:
+                active = {}
 
         current = {
             key_for(hold): hold for hold in issue_holds(world, tuple(inflight))
@@ -938,7 +1237,18 @@ def _hold_reporter(
             message = waiting_label(key)
             log(f"DEFERRED: {message}; dispatches once that clears")
             if journal is not None:
-                journal.emit("deferred", state="waiting", **fields_for(key))
+                fields = fields_for(key)
+                journal.emit(
+                    TelemetryEvent(
+                        LevelChanged(
+                            f"hold:{stored_key(key)}",
+                            "waiting",
+                            str(fields["reason"]),
+                            fields,
+                        ),
+                        Correlation(issue=key[0]),
+                    )
+                )
             active[key] = fields_for(key)
 
         for key in active.keys() - current.keys():
@@ -948,14 +1258,31 @@ def _hold_reporter(
                 "eligible for dispatch"
             )
             if journal is not None:
-                journal.emit("deferred", state="cleared", **fields_for(key))
+                fields = fields_for(key)
+                journal.emit(
+                    TelemetryEvent(
+                        LevelChanged(
+                            f"hold:{stored_key(key)}",
+                            "cleared",
+                            str(fields["reason"]),
+                            fields,
+                        ),
+                        Correlation(issue=key[0]),
+                    )
+                )
             active.pop(key, None)
+        if isinstance(control, LevelState):
+            control.replace_level_state(
+                "holds",
+                repo,
+                {stored_key(key): fields for key, fields in active.items()},
+            )
 
     return report
 
 
 def _ci_stall_reporter(
-    journal: Journal | None, repo: str, fix_cfg: FixConfig, log, control=None
+    journal: EventSink | None, repo: str, fix_cfg: FixConfig, log, control=None
 ):
     """Build the per-poll reporter for a CI pending-deadline breach (#30).
 
@@ -991,20 +1318,23 @@ def _ci_stall_reporter(
             seen.add(key)
             if journal is None:
                 continue
-            if control is None and key in ci_pending_keys(
-                read_events_tail(journal.path)
-            ):
-                continue
             journal.emit(
-                "ci_pending_deadline", pr=stall.pr, head=stall.head,
-                seconds=stall.seconds, checks=list(stall.checks), block_key=key,
+                TelemetryEvent(
+                    CiPendingDeadline(
+                        stall.head,
+                        stall.seconds,
+                        tuple(stall.checks),
+                        key,
+                    ),
+                    Correlation(pr=stall.pr),
+                )
             )
 
     return report
 
 
 def _duplicate_pr_reporter(
-    journal: Journal | None, repo: str, fix_cfg: FixConfig, log, control=None
+    journal: EventSink | None, repo: str, fix_cfg: FixConfig, log, control=None
 ):
     """Build the per-poll reporter for the duplicate-PR guard (#39).
 
@@ -1035,20 +1365,18 @@ def _duplicate_pr_reporter(
             seen.add(key)
             if journal is None:
                 continue
-            if control is None and key in duplicate_pr_keys(
-                read_events_tail(journal.path)
-            ):
-                continue
             journal.emit(
-                "duplicate_pr_guard", issue=dup.issue, pr=dup.pr,
-                author=dup.author, block_key=key,
+                TelemetryEvent(
+                    DuplicatePrPrevented(dup.author, key),
+                    Correlation(issue=dup.issue, pr=dup.pr),
+                )
             )
 
     return report
 
 
 def _ci_flake_reporter(
-    journal: Journal | None, repo: str, fix_cfg: FixConfig, log, control=None
+    journal: EventSink | None, repo: str, fix_cfg: FixConfig, log, control=None
 ):
     """Build the per-poll reporter for a CONFIRMED flake (#38).
 
@@ -1078,19 +1406,18 @@ def _ci_flake_reporter(
             seen.add(key)
             if journal is None:
                 continue
-            if control is None and key in ci_flake_keys(
-                read_events_tail(journal.path)
-            ):
-                continue
             journal.emit(
-                "ci_flake", pr=flake.pr, head=flake.head, block_key=key,
+                TelemetryEvent(
+                    CiFlakeDetected(flake.head, key),
+                    Correlation(pr=flake.pr),
+                )
             )
 
     return report
 
 
 def _recurrence_reporter(
-    journal: Journal | None, gateway, repo: str, fix_bot: str, log, control=None
+    journal: EventSink | None, gateway, repo: str, fix_bot: str, log, control=None
 ):
     """Build the per-poll reporter for LITERAL reopens (harness #10, kind=reopen).
 
@@ -1155,18 +1482,19 @@ def _recurrence_reporter(
             seen.add(key)
             if journal is None:
                 continue
-            if control is None and key in recurrence_keys(
-                read_events_tail(journal.path)
-            ):
-                continue
             # of_issue == issue: a reopen is an issue recurring as ITSELF, which
             # keeps one event shape for both kinds so the metric reads them
             # together. No label and no comment here — the reopened issue is
             # already the visible artifact, and the harness must never write to
             # an issue a human just deliberately reopened.
             journal.emit(
-                "recurrence", kind="reopen", issue=number, of_issue=number,
-                pr=shipped.get(number, 0), block_key=key,
+                TelemetryEvent(
+                    RecurrenceDetected("reopen", number, key),
+                    Correlation(
+                        issue=number,
+                        pr=(shipped.get(number) or None),
+                    ),
+                )
             )
 
     return report
@@ -1207,6 +1535,7 @@ def build_fix_daemon(
         fix=FixTaskConfig(
             repo_cfg.repo, repo_cfg.base_branch, cfg.agent_md,
             fix_runtime.budget_usd, fix_runtime.model, fix_runtime.effort,
+            router_budget_usd=cfg.router_budget_usd,
         ),
         max_review_rejections=cfg.max_review_rejections,
         author_tests_split=fix_runtime.author_tests_split,
@@ -1222,97 +1551,11 @@ def build_fix_daemon(
         max_infra_deaths=fix_runtime.max_infra_deaths,
         **_spend_cfg(cfg, "fix"),
     )
-    # Fixer runtime: Codex (GPT-5.5) swaps the runner AND installs the governor as
-    # a Codex hook in each worktree (the Claude runner gets its governor via SDK
-    # hooks=, so prepare_cwd stays None there). Reviewer/steward always use Claude.
-    fix_runner = runner
-    prepare_cwd = None
-    if cfg.fixer_runtime is RuntimeName.CODEX:
-        from ..adapters.codex_runner import (
-            codex_budget_not_enforced_warning,
-            codex_cost_blindspot_warning,
-        )
-        from ..adapters.codex_hook import HookPreparingRuntime, write_hook_config
-
-        fix_runner = _build_codex_runner(
-            cfg,
-            default_model=codex_runtime.model or None,
-            sandbox=codex_runtime.sandbox,
-            # AGENT.md reaches Codex through the worktree instructions below.
-            inject_system_prompt=False,
-            resume_on_retry=True,
-            leg_role="fix",
-            log=_log("fix"),
-            state_dir=cfg.state_dir,
-        )
-        # Surface a codex misconfig (missing bin/key) at STARTUP, not on the first
-        # dispatch — a clear one-liner instead of an opaque per-issue exit 1.
-        _reason = fix_runner.preflight()
-        if _reason is not None:
-            _log("fix")(f"codex: NOT READY at startup — {_reason}")
-        else:
-            _log("fix")("codex: runtime ready (bin + key present)")
-        # Review M1 / D12: ONE loud line at build time (never per dispatch) when a
-        # spend cap is armed but no codex price table is set — those caps cannot see
-        # a single codex dollar, and codex has no per-session budget flag either.
-        # Structurally unreachable on FIXER_RUNTIME=claude (this whole block is).
-        _blindspot = codex_cost_blindspot_warning(
-            cost_per_mtok_in=codex_runtime.cost_per_mtok_in,
-            cost_per_mtok_out=codex_runtime.cost_per_mtok_out,
-            issue_spend_cap_usd=cfg.issue_spend_cap_usd,
-            daily_spend_cap_usd=cfg.daily_spend_cap_usd,
-            max_runtime=codex_runtime.max_runtime,
-            unpriced_cached_models=codex_runtime.unpriced_cached_models,
-        )
-        if _blindspot is not None:
-            _log("fix")(_blindspot)
-        # #29: the OTHER half, which used to be reachable only through the line
-        # above — and therefore only when pricing was left unconfigured. It now
-        # warns when the budget check cannot bound a run (enforcement off or
-        # incomplete pricing); with both in place it emits an informational
-        # notice that native codex support is absent but harness enforcement is
-        # active. Either way `describe()` prints the matching verdict.
-        _unbounded = codex_budget_not_enforced_warning(
-            fix_budget_usd=cfg.fix_budget_usd,
-            max_runtime=codex_runtime.max_runtime,
-            enforced=codex_runtime.enforce_budget,
-            priced=codex_runtime.budget_priceable,
-            pricing_gap=codex_runtime.budget_pricing_gap,
-        )
-        if _unbounded is not None:
-            _log("fix")(_unbounded)
-        # prepare_cwd installs the governor hook and writes AGENTS.override.md into
-        # each worktree, composing the harness + target instructions. It also
-        # installs the PostToolUse edit-check when EDIT_CHECK_CMD is set.
-        prepare_cwd = partial(
-            write_hook_config, agents_md=cfg.agent_md, edit_check_cmd=cfg.edit_check_cmd,
-            log=_log("fix"), state_dir=cfg.state_dir,
-        )
-        fix_runner = HookPreparingRuntime(fix_runner, prepare_cwd)
-    elif cfg.fixer_runtime is RuntimeName.GLM:
-        # GLM speaks Anthropic's wire protocol, so the SAME Claude runner is used
-        # with the profile's env injected (base URL + model aliases + auth token);
-        # prepare_cwd stays None because that runner gets its governor via SDK
-        # hooks, exactly as on FIXER_RUNTIME=claude.
-        from ..adapters.claude_profile import (
-            EnvInjectingRuntime,
-            claude_profile_env,
-            endpoint_host,
-        )
-
-        try:
-            _glm_env = claude_profile_env(cfg.glm_settings_file)
-        except ValueError as exc:
-            # Same contract as the codex preflight: a misconfig is ONE loud line at
-            # startup, not an opaque failure on the first dispatch. Unwrapped means
-            # the fixer runs on plain Claude — visibly wrong beats silently wrong.
-            _log("fix")(f"glm: NOT READY at startup — {exc}")
-        else:
-            fix_runner = EnvInjectingRuntime(runner, env=_glm_env)
-            _log("fix")(
-                f"glm: runtime ready (endpoint {endpoint_host(_glm_env)}, "
-                f"profile {_glm_env['CLAUDE_CONFIG_DIR']})"
-            )
+    runtime_binding = _FIX_RUNTIME_REGISTRY[cfg.fixer_runtime](
+        cfg, codex_runtime, runner
+    )
+    fix_runner = runtime_binding.runner
+    prepare_cwd = runtime_binding.prepare_cwd
 
     control = _control_store(cfg, cfg.state_dir, journal)
     effect_executor = _effects(
@@ -1329,7 +1572,7 @@ def build_fix_daemon(
         clear_issue_state=store.cleanup_pr,
         journal=journal, alert_cmd=cfg.alert_cmd,
         pending_actions=store,
-        effect_executor=effect_executor,
+        effect_executor=effect_executor.actions,
     )
     # Wrapped LAST, so the decorator sees whichever runtime actually ran (Claude or
     # the Codex swap above) and the ledger is runtime-agnostic.
@@ -1364,6 +1607,7 @@ def build_fix_daemon(
         issue_is_blocked=lambda issue: gateway.get_issue(issue).has(
             Label.AI_BLOCKED
         ),
+        control=control,
     )
     report_prediction_outcomes = _prediction_outcome_reporter(
         journal, cfg.repo, store, _log("fix"), control
@@ -1484,6 +1728,14 @@ def build_fix_daemon(
         escalate_on_evidence=cfg.escalate_on_evidence,
         arm_on_open=fix_cfg.arm_on_open,
     ))
+    recovery = _recovery(
+        cfg.state_dir,
+        cfg,
+        control,
+        effect_executor,
+        journal,
+        worktrees,
+    )
     daemon = Daemon(
         "fix",
         _reported_world(
@@ -1502,7 +1754,8 @@ def build_fix_daemon(
         force_kill_dispatches=_force_kill(cfg.state_dir),
         dispatch_rejected=reservations.finish,
         heartbeat_path=os.path.join(cfg.state_dir, "heartbeat.json"),
-        recover=_recovery(cfg.state_dir, cfg, control, effect_executor, journal),
+        recover=recovery,
+        finalize=recovery,
     )
     daemon_ref["daemon"] = daemon
     return daemon
@@ -1588,75 +1841,12 @@ def build_review_daemon(
         max_infra_deaths=rcfg.max_unproductive_rounds,
         **_spend_cfg(cfg, "review"),
     )
-    review_runner = runner
-    review_execution_cwd = ""
-    review_prepare_cwd = None
-    if review_runtime.runtime is RuntimeName.CODEX:
-        from ..adapters.codex_runner import (
-            codex_budget_not_enforced_warning,
-            codex_cost_blindspot_warning,
-        )
-
-        # Review is deliberately read-only in the operator's checkout. Codex
-        # cannot apply the sandbox flag to `exec resume`, so the workflow makes
-        # Codex re-reviews fresh rather than carrying a writable resume session.
-        review_runner = _build_codex_runner(
-            cfg,
-            default_model=review_runtime.model,
-            sandbox="read-only",
-            inject_system_prompt=True,
-            resume_on_retry=False,
-            leg_role="review",
-            log=_log("review"),
-            state_dir=cfg.review_state_dir,
-        )
-        reason = review_runner.preflight()
-        if reason is not None:
-            _log("review")(f"codex: NOT READY at startup — {reason}")
-        else:
-            _log("review")("codex: runtime ready (bin + key present)")
-        blindspot = codex_cost_blindspot_warning(
-            cost_per_mtok_in=cfg.codex_runtime.cost_per_mtok_in,
-            cost_per_mtok_out=cfg.codex_runtime.cost_per_mtok_out,
-            issue_spend_cap_usd=cfg.issue_spend_cap_usd,
-            daily_spend_cap_usd=cfg.daily_spend_cap_usd,
-            max_runtime=cfg.codex_runtime.max_runtime,
-            runtime_name="REVIEWER_RUNTIME",
-            unpriced_cached_models=cfg.codex_runtime.unpriced_cached_models,
-        )
-        if blindspot is not None:
-            _log("review")(blindspot)
-        budget_notice = codex_budget_not_enforced_warning(
-            fix_budget_usd=review_runtime.budget_usd,
-            max_runtime=cfg.codex_runtime.max_runtime,
-            enforced=cfg.codex_runtime.enforce_budget,
-            priced=cfg.codex_runtime.budget_priceable,
-            pricing_gap=cfg.codex_runtime.budget_pricing_gap,
-            budget_name="REVIEW_BUDGET_USD",
-            runtime_name="REVIEWER_RUNTIME",
-        )
-        if budget_notice is not None:
-            _log("review")(budget_notice)
-        # Codex ignores RuntimePlan's SDK-only tool policy. The workflow installs
-        # this dedicated read-only Bash allow-list immediately before each leg,
-        # in the explicit target checkout only.  Builder-time writes would let a
-        # test run corrupt a simultaneously active fixer worktree.
-        from ..adapters.codex_hook import HookPreparingRuntime, write_hook_config
-
-        review_execution_cwd = cfg.target_dir
-        if review_execution_cwd:
-            review_prepare_cwd = partial(
-                write_hook_config, review_only=True, log=_log("review"),
-                state_dir=cfg.review_state_dir,
-            )
-            review_runner = HookPreparingRuntime(
-                review_runner, review_prepare_cwd
-            )
-        else:
-            _log("review")(
-                "codex: NOT READY at startup — REVIEWER_RUNTIME=codex requires "
-                "TARGET_DIR so its read-only governor has an explicit checkout"
-            )
+    runtime_binding = _REVIEW_RUNTIME_REGISTRY[review_runtime.runtime](
+        cfg, review_runtime, runner
+    )
+    review_runner = runtime_binding.runner
+    review_execution_cwd = runtime_binding.execution_cwd
+    review_prepare_cwd = runtime_binding.prepare_cwd
 
     dcfg = replace(
         dcfg,
@@ -1679,7 +1869,7 @@ def build_review_daemon(
         journal=journal,
         alert_cmd=cfg.alert_cmd,
         pending_actions=store,
-        effect_executor=effect_executor,
+        effect_executor=effect_executor.actions,
     )
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, None,
@@ -1718,6 +1908,9 @@ def build_review_daemon(
         can_approve=rcfg.identity_mode == IdentityMode.THREE,
         adopt_unlabeled=rcfg.adopt_unlabeled,
     ))
+    recovery = _recovery(
+        cfg.review_state_dir, cfg, control, effect_executor, journal
+    )
 
     return Daemon("review", _reported_world(
                       gateway.build_review_world, control, cfg, "review",
@@ -1734,9 +1927,7 @@ def build_review_daemon(
                   heartbeat_path=os.path.join(
                       cfg.review_state_dir, "heartbeat.json"
                   ),
-                  recover=_recovery(
-                      cfg.review_state_dir, cfg, control, effect_executor, journal
-                  ))
+                  recover=recovery, finalize=recovery)
 
 
 _CODEOWNERS_PATHS = ("CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS")
@@ -1839,7 +2030,7 @@ def build_steward_daemon(
         journal=journal,
         alert_cmd=cfg.alert_cmd,
         pending_actions=store,
-        effect_executor=effect_executor,
+        effect_executor=effect_executor.actions,
     )
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, None,
@@ -1872,6 +2063,7 @@ def build_steward_daemon(
     report_recurrences = _recurrence_reporter(
         journal, gateway, cfg.repo, cfg.fix_runtime.bot, steward_log, control
     )
+    adrs = read_adrs(os.path.join(cfg.target_dir, "docs", "adr"))
     # What this daemon can actually DO here — not what it is configured with
     # (#46). The two differ: JIRA_SYNC=1 with no project key is `jira_sync=off`,
     # and recurrence watching needs a FIX_BOT to attribute merged PRs to.
@@ -1903,6 +2095,9 @@ def build_steward_daemon(
             for n in triage_candidates(world, tcfg_dom, state)
             if not exhausted(n)
         ]
+        actions.extend(
+            adr_steward_actions(world.prs, adrs, steward_runtime.bot)
+        )
         actions.extend(
             RunAgent(AgentKind.GROOM, n)
             for n in grooming_candidates(
@@ -1936,6 +2131,9 @@ def build_steward_daemon(
     # Jira needs closed ai-done issues too (for the final Done transition); triage
     # alone needs just open issues.
     observe = gateway.build_steward_world if jira_on else gateway.build_triage_world
+    recovery = _recovery(
+        cfg.steward_state_dir, cfg, control, effect_executor, journal
+    )
     return Daemon("steward", _reported_world(
                       observe, control, cfg, "steward", steward_log
                   ), decide, executor, cfg.tick_interval_seconds,
@@ -1950,6 +2148,4 @@ def build_steward_daemon(
                   heartbeat_path=os.path.join(
                       cfg.steward_state_dir, "heartbeat.json"
                   ),
-                  recover=_recovery(
-                      cfg.steward_state_dir, cfg, control, effect_executor, journal
-                  ))
+                  recover=recovery, finalize=recovery)

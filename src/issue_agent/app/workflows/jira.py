@@ -9,7 +9,9 @@ from ..planners import tasks as task_builders
 from ..planners.tasks import JiraTaskConfig
 from ...adapters.runtime_plan import AgentRuntime
 from ...domain.jira import jira_sync_outcome, plan_jira_sync
+from ...domain.leg import Leg, LegTarget
 from ...domain.ports import WorkflowGitHubReads, WorkflowState
+from ...domain.trust import as_untrusted
 from .base import run_leg
 
 
@@ -37,10 +39,20 @@ class JiraSyncWorkflow:
         result = await run_leg(
             self.runner,
             self.cfg.log,
-            "jira-sync",
-            issue,
+            Leg(
+                "JIRA_SYNC",
+                LegTarget.ISSUE,
+                issue,
+                True,
+                ("global", "repository", "issue"),
+            ),
             task_builders.build_jira_sync_task(
-                issue, iss.title, iss.body, plan.target, plan.existing_key, self.cfg.jira
+                issue,
+                as_untrusted(iss.title),
+                as_untrusted(iss.body),
+                plan.target,
+                plan.existing_key,
+                self.cfg.jira,
             ),
         )
         outcome = jira_sync_outcome(

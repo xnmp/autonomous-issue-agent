@@ -16,6 +16,9 @@ import tree_sitter_bash as tsb
 PARSER = Parser(Language(tsb.language()))
 
 GUARDED_GIT_SUBCMDS = ("config", "push")
+GOVERNED_KINDS = frozenset(
+    {"git-branch", "git-commit", "git-config", "git-push", "gh-pr-create"}
+)
 
 # These argument node types carry a literal string value that an agent could
 # hide a flag in. ansi_c_string ($'...') was a real bypass — it MUST be unwrapped.
@@ -356,6 +359,8 @@ def resolve(command: str) -> Resolution:
             continue
         if (
             base not in _LITERAL_CONSUMERS
+            and base not in _PASSTHROUGH_WRAPPERS
+            and base != "env"
             and any(_basename(word) in _GOVERNED_BINARIES for word in words[1:])
         ):
             return Unresolvable(
@@ -597,6 +602,12 @@ def find_violations(command: str) -> list[str]:
     Does not run checkers (those touch the filesystem); only structural bypass
     detection. Returns an empty list when nothing structural is wrong.
     """
+    resolution = resolve(command)
+    if isinstance(resolution, Unresolvable):
+        return [
+            "command cannot be governed statically: "
+            f"{resolution.reason}"
+        ]
     reasons: list[str] = []
     for words, env in extract_commands_with_env(command):
         g = classify(words)

@@ -27,7 +27,7 @@ class RuntimeCapabilities:
         return field_name in self.supported_task_fields
 
 
-_COMMON_TASK_FIELDS = frozenset(
+TASK_FIELD_NAMES = frozenset(
     {
         "prompt",
         "schema",
@@ -41,6 +41,8 @@ _COMMON_TASK_FIELDS = frozenset(
         "resume",
         "fork_session",
         "env",
+        "mcp_servers",
+        "subagents",
     }
 )
 
@@ -51,8 +53,7 @@ RUNTIME_CAPABILITIES = {
         renders_images=True,
         native_budget_enforcement=True,
         requires_external_governor=False,
-        supported_task_fields=_COMMON_TASK_FIELDS
-        | {"mcp_servers", "subagents"},
+        supported_task_fields=TASK_FIELD_NAMES,
     ),
     RuntimeName.CODEX: RuntimeCapabilities(
         supports_resume=True,
@@ -60,7 +61,14 @@ RUNTIME_CAPABILITIES = {
         renders_images=True,
         native_budget_enforcement=False,
         requires_external_governor=True,
-        supported_task_fields=_COMMON_TASK_FIELDS,
+        supported_task_fields=TASK_FIELD_NAMES
+        - {
+            "allowed_tools",
+            "disallowed_tools",
+            "fork_session",
+            "mcp_servers",
+            "subagents",
+        },
     ),
     RuntimeName.GLM: RuntimeCapabilities(
         supports_resume=True,
@@ -68,8 +76,7 @@ RUNTIME_CAPABILITIES = {
         renders_images=True,
         native_budget_enforcement=True,
         requires_external_governor=False,
-        supported_task_fields=_COMMON_TASK_FIELDS
-        | {"mcp_servers", "subagents"},
+        supported_task_fields=TASK_FIELD_NAMES,
     ),
 }
 

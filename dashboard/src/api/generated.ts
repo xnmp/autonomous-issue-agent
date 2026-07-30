@@ -644,7 +644,7 @@ export interface components {
         /** RepoSummary */
         RepoSummary: {
             /** Active */
-            active: boolean;
+            active: boolean | null;
             /** Done */
             done: number;
             /** Frecency */
@@ -678,7 +678,7 @@ export interface components {
         /** RoleHealth */
         RoleHealth: {
             /** Alive */
-            alive: boolean;
+            alive: boolean | null;
             /** Events */
             events: number;
             /** Last Event */

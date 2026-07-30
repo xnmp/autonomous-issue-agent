@@ -6,12 +6,14 @@ import threading
 
 import pytest
 
-from issue_agent.adapters.journal import Journal, read_events
+from tests.fakes.legacy_journal import Journal
+from issue_agent.adapters.journal import read_events
 from issue_agent.adapters.github import GhUnavailable
 from issue_agent.adapters.store import Store
-from issue_agent.app.execute import Executor
+from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.loop import Daemon
 from issue_agent.domain.actions import NoOp, Relabel, Target
+from issue_agent.domain.events import TelemetryEvent, TickGated
 from issue_agent.domain.labels import Label
 from issue_agent.domain.world import WorldState
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
@@ -499,6 +501,36 @@ def test_run_forever_bounded_by_max_ticks():
     assert slept == [60, 60, 60]
 
 
+def test_normal_shutdown_flushes_the_finalizer_once():
+    finalized = []
+    d, _ = _daemon(lambda _world: [])
+    d.finalize = lambda: finalized.append("flushed")
+
+    d.run_forever(
+        sleep=lambda _seconds: None,
+        now=lambda: 0,
+        max_ticks=1,
+    )
+
+    assert finalized == ["flushed"]
+
+
+def test_failed_shutdown_finalizer_forces_transient_exit():
+    from issue_agent.domain.supervision import ExitCode
+
+    d, _ = _daemon(lambda _world: [])
+    d.finalize = lambda: (_ for _ in ()).throw(RuntimeError("disk full"))
+
+    with pytest.raises(SystemExit) as stopped:
+        d.run_forever(
+            sleep=lambda _seconds: None,
+            now=lambda: 0,
+            max_ticks=1,
+        )
+
+    assert stopped.value.code is ExitCode.TRANSIENT
+
+
 def test_scheduler_progress_covers_tick_and_quiet_wait():
     progress = []
 
@@ -543,7 +575,7 @@ def test_run_forever_warns_on_suspend_stall():
     assert any("suspended/stalled" in m for m in logs)
 
 
-def test_late_heartbeat_journals_reconciles_and_annotates_overlapping_leg(tmp_path):
+def test_suspend_recovery_never_replays_actions_from_telemetry(tmp_path):
     journal = Journal(str(tmp_path / "journal.jsonl"))
     rows = [
         {
@@ -631,36 +663,10 @@ def test_late_heartbeat_journals_reconciles_and_annotates_overlapping_leg(tmp_pa
             "suspended_seconds": 180,
         }
     ]
-    assert gateway.calls == [("comment", 5, "blocked")]
+    assert gateway.calls == []
     assert recoveries == ["recovered"]
-    assert any(
-        event["event"] == "action"
-        and event["desc"] == "comment issue #5 (7 chars)"
-        and event.get("replayed") is True
-        for event in events
-    )
-    assert [
-        {
-            key: event[key]
-            for key in (
-                "event",
-                "dispatch",
-                "issue",
-                "stall_started_at",
-                "suspended_seconds",
-            )
-        }
-        for event in events
-        if event["event"] == "agent_run_stall"
-    ] == [
-        {
-            "event": "agent_run_stall",
-            "dispatch": "dispatch-5",
-            "issue": 5,
-            "stall_started_at": "1970-01-01T00:01:00+00:00",
-            "suspended_seconds": 180,
-        }
-    ]
+    assert not any(event.get("replayed") is True for event in events)
+    assert not any(event["event"] == "agent_run_stall" for event in events)
 
 
 def test_heartbeat_below_stall_threshold_does_not_reconcile_or_journal(tmp_path):
@@ -741,7 +747,7 @@ def test_long_active_late_heartbeat_does_not_stall_or_reconcile(tmp_path):
     assert not any(event["event"] in {"stall", "agent_run_stall"} for event in events)
 
 
-def test_stall_reconciliation_includes_poll_interval_before_estimated_gap(tmp_path):
+def test_stall_diagnostic_does_not_turn_legacy_receipts_into_commands(tmp_path):
     journal = Journal(str(tmp_path / "journal.jsonl"))
     receipt = {
         "ts": "1970-01-01T00:00:30+00:00",
@@ -776,7 +782,7 @@ def test_stall_reconciliation_includes_poll_interval_before_estimated_gap(tmp_pa
     )
 
     events = read_events(journal.path)
-    assert gateway.calls == [("relabel", "issue", 5, None, "ai-blocked")]
+    assert gateway.calls == []
     assert any(
         event["event"] == "stall"
         and event["started_at"] == "1970-01-01T00:01:00+00:00"
@@ -785,7 +791,7 @@ def test_stall_reconciliation_includes_poll_interval_before_estimated_gap(tmp_pa
     )
 
 
-def test_stall_annotation_uses_each_legs_clock_gap_not_shifted_start_estimate(
+def test_legacy_run_rows_do_not_synthesize_control_corrections(
     tmp_path,
 ):
     journal = Journal(str(tmp_path / "journal.jsonl"))
@@ -873,10 +879,7 @@ def test_stall_annotation_uses_each_legs_clock_gap_not_shifted_start_estimate(
         event for event in read_events(journal.path)
         if event["event"] == "agent_run_stall"
     ]
-    assert [
-        (event["dispatch"], event["suspended_seconds"])
-        for event in annotations
-    ] == [("crossed-gap", 60)]
+    assert annotations == []
 
 
 def _waking_daemon(wake_check, poll_seconds=60, logs=None):
@@ -1091,7 +1094,11 @@ def test_a_gated_tick_is_journalled_once_per_trip():
     d, _, _, _ = _gated_daemon(lambda: "SPEND CAP: paused", journal=j)
     for _ in range(4):
         d.tick()
-    assert j.events == [("tick_gated", {"reason": "SPEND CAP: paused"})]
+    assert len(j.events) == 1
+    event, fields = j.events[0]
+    assert fields == {}
+    assert isinstance(event, TelemetryEvent)
+    assert event.payload == TickGated("SPEND CAP: paused")
 
 
 def test_no_gate_is_the_default_and_changes_nothing():

@@ -6,6 +6,7 @@ import os
 import sys
 
 from ..domain.contracts import RunId
+from .child_env import CHILD_ENV_MANIFEST, child_process_env
 from .process_supervisor import ProcessSupervisor
 
 _STATE_ENV = "ISSUE_AGENT_SUPERVISOR_STATE_DIR"
@@ -39,6 +40,11 @@ def supervised_cli_main() -> None:
         target = environment.pop(_TARGET_ENV)
     except KeyError as exc:
         raise SystemExit(f"missing supervised CLI environment: {exc}") from exc
+    explicit_keys = environment.pop(CHILD_ENV_MANIFEST, "").split()
+    environment = child_process_env(
+        environment,
+        additional_keys=explicit_keys,
+    )
     os.setsid()
     ProcessSupervisor(state_dir).register(
         RunId(raw_run_id),

@@ -23,8 +23,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from .actions import Action, AddDependency, PostComment, Relabel, Target
+from .gate import Adr, check_adr_references
 from .labels import LIFECYCLE_LABELS, Label
-from .world import IssueView, WorldState
+from .world import IssueView, PRView, WorldState
+
+
+_ADR_STEWARD_PREFIX = "**Architecture decision check:**"
 
 
 @dataclass(frozen=True)
@@ -37,6 +41,47 @@ class TriageConfig:
     # Resolved by the app layer (CODEOWNERS → STEWARD_OWNER → none). Blank → the
     # owner section is still posted but tagged generically ("a maintainer").
     owner_handle: str = ""
+
+
+def adr_steward_actions(
+    prs: tuple[PRView, ...],
+    adrs: tuple[Adr, ...],
+    steward_bot: str,
+) -> list[Action]:
+    """Flag governed PRs whose description omits the applicable ADR.
+
+    The PR-create governor is the hard gate for harness publications. This
+    advisory reconciler also covers human/external PRs and older open PRs. A
+    prior comment suppresses repeats only when it came from the configured
+    steward identity; repository text cannot forge the durable observation.
+    """
+
+    actions: list[Action] = []
+    for pr in prs:
+        if pr.state.upper() != "OPEN":
+            continue
+        result = check_adr_references(
+            lambda: adrs,
+            pr.changed_files,
+            pr.body,
+        )
+        if result.ok:
+            continue
+        if any(
+            comment.author.casefold() == steward_bot.casefold()
+            and comment.body.startswith(_ADR_STEWARD_PREFIX)
+            for comment in pr.comments
+        ):
+            continue
+        actions.append(
+            PostComment(
+                Target.PR,
+                pr.number,
+                f"{_ADR_STEWARD_PREFIX} {result.reason}. "
+                "Cite the governing ADR in the PR description or add a focused ADR.",
+            )
+        )
+    return actions
 
 
 def parse_codeowners_default(text: str) -> str:

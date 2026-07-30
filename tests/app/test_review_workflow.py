@@ -4,8 +4,13 @@ import asyncio
 
 import pytest
 
-from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
-from issue_agent.app.execute import Executor
+from tests.fakes.legacy_journal import Journal
+from issue_agent.adapters.journal import (
+    JournalingRuntime,
+    _legacy_event_record,
+    read_events,
+)
+from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.planners.schemas import REVIEW_SCHEMA
 from issue_agent.app.workflows.review import ReviewWorkflow, ReviewWorkflowConfig
 from issue_agent.domain.outcome import AgentResult
@@ -30,6 +35,8 @@ class FakeJournal:
         self.events: list[tuple[str, dict]] = []
 
     def emit(self, event, **fields):
+        if not isinstance(event, str):
+            event, fields = _legacy_event_record(event)
         self.events.append((event, fields))
 
 
@@ -209,7 +216,7 @@ def test_single_review_submits_before_persisting_state():
     assert store.rounds[100] == 1
 
 
-def test_codex_shaped_review_verdict_submits_and_ledgers_attributed_usage(tmp_path):
+def test_codex_shaped_review_verdict_submits_with_attributed_usage(tmp_path):
     """The Codex runner's schema-normalised result must travel through the
     ordinary REVIEW_SCHEMA submission seam and leave a queryable review ledger
     receipt; neither assertion is a constructor-level proxy."""
@@ -217,7 +224,6 @@ def test_codex_shaped_review_verdict_submits_and_ledgers_attributed_usage(tmp_pa
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     journal = Journal(str(tmp_path / "review-journal.jsonl"))
-    ledger = str(tmp_path / "spend.jsonl")
     runner = JournalingRuntime(
         FakeRunner(AgentResult(
             is_error=False,
@@ -227,7 +233,10 @@ def test_codex_shaped_review_verdict_submits_and_ledgers_attributed_usage(tmp_pa
             usage={"input_tokens": 10, "output_tokens": 20},
             structured={"decision": "APPROVE", "body": "looks good"},
         )),
-        journal, ledger, "o/r", "review", "codex",
+        journal,
+        repo="o/r",
+        role="review",
+        runtime="codex",
     )
     runner.set_context("review", "REVIEW", 100, None)
 
@@ -235,11 +244,15 @@ def test_codex_shaped_review_verdict_submits_and_ledgers_attributed_usage(tmp_pa
 
     assert runner.inner.tasks[0].schema == REVIEW_SCHEMA
     assert any(call[:3] == ("review", 100, "APPROVE") for call in gw.calls)
-    spend = read_events(ledger)[0]
-    assert spend["role"] == "review"
-    assert spend["runtime"] == "codex"
-    assert spend["model"] == "gpt-5.6-terra"
-    assert spend["usage"] == {
+    run = [
+        event
+        for event in read_events(journal.path)
+        if event["event"] == "agent_run"
+    ][0]
+    assert run["role"] == "review"
+    assert run["runtime"] == "codex"
+    assert run["model"] == "gpt-5.6-terra"
+    assert run["usage"] == {
         "input_tokens": 10, "output_tokens": 20,
         "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
     }

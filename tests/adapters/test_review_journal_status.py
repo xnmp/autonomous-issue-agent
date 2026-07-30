@@ -10,7 +10,8 @@ import pytest
 
 from issue_agent.adapters.agent_runner import result_to_agent_result
 from issue_agent.adapters.codex_runner import parse_codex_envelope
-from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
+from tests.fakes.legacy_journal import Journal
+from issue_agent.adapters.journal import JournalingRuntime, read_events
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.dashboard import build_issue_rows, first_pass_verdicts, stage_for
 

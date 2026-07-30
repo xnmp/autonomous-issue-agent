@@ -14,6 +14,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from ...domain import fix as fix_domain
+from ...domain.events import (
+    BudgetPathEntered,
+    Correlation,
+    RoutingEscalated,
+    TelemetryEvent,
+)
+from ...domain.leg import Leg, LegTarget
 from ...domain import outcome
 from ..planners import tasks as task_builders
 from ..planners.tasks import FixTaskConfig
@@ -24,7 +31,7 @@ from ...domain.ports import (
     BranchState,
     CiPromptReads,
     FixWorktreePort,
-    LegacyJournal,
+    EventSink,
     PredictionWriter,
     ReviewPromptReads,
     WorkflowGitHubReads,
@@ -43,6 +50,7 @@ from ...domain.effort import (
 from ...domain.labels import Label
 from ...domain.refs import slugify
 from ...domain.review import count_outstanding_change_requests
+from ...domain.trust import as_untrusted
 from ...domain.world import (
     REVIEW_CHANGES_REQUESTED,
     normalize_predicted_paths,
@@ -84,7 +92,7 @@ class FixWorkflowConfig:
     # tests / when the daemon runs without one). Escalations must be queryable:
     # the routing guardrail is "split the metrics by tier", which is unanswerable
     # if the tier a leg actually ran at was never recorded.
-    journal: LegacyJournal | None = None
+    journal: EventSink | None = None
 
 
 @dataclass
@@ -212,10 +220,14 @@ class FixWorkflow:
         return await run_leg(
             self.runner,
             self.cfg.log,
-            label,
-            issue,
+            Leg(
+                kind or label.upper().replace("-", "_"),
+                LegTarget.ISSUE,
+                issue,
+                True,
+                ("global", "repository", "issue"),
+            ),
             task,
-            scope=self._leg_kind(kind),
         )
 
     # ── escalation on evidence (#16) ────────────────────────────────────────
@@ -305,20 +317,25 @@ class FixWorkflow:
             return
         try:
             journal.emit(
-                "route_escalation", issue=issue, leg=leg,
-                notches=signals.notches(),
-                from_tier=before.tier if tiered else None,
-                to_tier=after.tier if tiered else None,
-                ceiling=ceiling,
-                from_effort=before.effort.value, to_effort=after.effort.value,
-                # `None`, not "" — the same "not applicable" encoding the tier
-                # fields use, so an unrouted leg (router died, no FIX_MODEL: the
-                # runtime picks) does not open a "" bucket in `group_by(.model)`.
-                model=model,
-                recurrence=signals.recurrence,
-                resolve_retries=signals.resolve_retries,
-                ci_retries=signals.ci_retries,
-                review_rounds=signals.review_rounds,
+                TelemetryEvent(
+                    RoutingEscalated(
+                        leg,
+                        before.tier if tiered else None,
+                        after.tier if tiered else None,
+                        before.effort.value,
+                        after.effort.value,
+                        {
+                            "notches": signals.notches(),
+                            "recurrence": signals.recurrence,
+                            "resolve_retries": signals.resolve_retries,
+                            "ci_retries": signals.ci_retries,
+                            "review_rounds": signals.review_rounds,
+                        },
+                        model,
+                        ceiling,
+                    ),
+                    Correlation(issue=issue),
+                )
             )
         except Exception as exc:  # noqa: BLE001 — telemetry never fails a dispatch
             self.cfg.log(f"agent #{issue}: escalation not journalled ({exc})")
@@ -476,7 +493,10 @@ class FixWorkflow:
                 result = await self._run_logged(
                     "route", issue,
                     task_builders.build_router_task(
-                        iss.title, iss.body, runtime=self.cfg.fixer_runtime
+                        as_untrusted(iss.title),
+                        as_untrusted(iss.body),
+                        runtime=self.cfg.fixer_runtime,
+                        max_budget_usd=cfg.router_budget_usd,
                     ),
                     kind=AgentKind.ROUTE.name,
                 )
@@ -517,7 +537,13 @@ class FixWorkflow:
             ])
             return
         self.store.save_model(issue, fix_cfg.model)
-        task = task_builders.build_resolve_task(issue, iss.title, iss.body, cwd, fix_cfg)
+        task = task_builders.build_resolve_task(
+            issue,
+            as_untrusted(iss.title),
+            as_untrusted(iss.body),
+            cwd,
+            fix_cfg,
+        )
         result = await self._run_logged("resolve", issue, task)
         self.store.save_session(issue, result.session_id)
         self._decay_infra_deaths(issue, result)
@@ -567,11 +593,11 @@ class FixWorkflow:
                 issue,
                 task_builders.build_author_task(
                     issue,
-                    iss.title,
-                    iss.body,
+                    as_untrusted(iss.title),
+                    as_untrusted(iss.body),
                     cwd,
                     fix_cfg,
-                    human_reply=human_reply,
+                    human_reply=as_untrusted(human_reply),
                 ),
                 kind="AUTHOR",
             )
@@ -616,12 +642,12 @@ class FixWorkflow:
                 issue,
                 task_builders.build_implement_task(
                     issue,
-                    iss.title,
-                    iss.body,
+                    as_untrusted(iss.title),
+                    as_untrusted(iss.body),
                     cwd,
                     fix_cfg,
-                    uphold_note=uphold_note,
-                    human_reply=human_reply,
+                    uphold_note=as_untrusted(uphold_note),
+                    human_reply=as_untrusted(human_reply),
                 ),
                 kind="IMPLEMENT",
             )
@@ -654,12 +680,12 @@ class FixWorkflow:
                 # exactly when the issue is hard enough to have escalated.
                 task_builders.build_adjudicate_task(
                     issue,
-                    iss.title,
-                    iss.body,
-                    objection,
+                    as_untrusted(iss.title),
+                    as_untrusted(iss.body),
+                    as_untrusted(objection),
                     cwd,
                     fix_cfg,
-                    human_reply=human_reply,
+                    human_reply=as_untrusted(human_reply),
                 ),
                 kind="ADJUDICATE",
             )
@@ -701,7 +727,12 @@ class FixWorkflow:
         if journal is None:
             return
         try:
-            journal.emit("budget_path", issue=issue, leg=leg, exit_reason=reason.value)
+            journal.emit(
+                TelemetryEvent(
+                    BudgetPathEntered(leg, reason.value),
+                    Correlation(issue=issue),
+                )
+            )
         except Exception as exc:  # noqa: BLE001 — telemetry never fails a dispatch
             self.cfg.log(f"agent #{issue}: budget path not journalled ({exc})")
 
@@ -741,11 +772,16 @@ class FixWorkflow:
         fix_cfg = self._repair_fix_cfg(issue, "resume", iss=iss)
         task = (
             task_builders.build_resume_task(
-                reply, cwd, session_id, fix_cfg, fork=fork
+                as_untrusted(reply), cwd, session_id, fix_cfg, fork=fork
             )
             if session_id
             else task_builders.build_fresh_reply_task(
-                issue, iss.title, iss.body, reply, cwd, fix_cfg
+                issue,
+                as_untrusted(iss.title),
+                as_untrusted(iss.body),
+                as_untrusted(reply),
+                cwd,
+                fix_cfg,
             )
         )
         result = await self._run_logged("resume", issue, task, kind="RESUME")
@@ -802,7 +838,9 @@ class FixWorkflow:
         cwd = self._ensure_cwd(issue, p.head_ref_name)
         fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
         task = task_builders.build_resume_task(
-            reply_comment.body, cwd, self.store.get_session(issue),
+            as_untrusted(reply_comment.body),
+            cwd,
+            self.store.get_session(issue),
             self._repair_fix_cfg(issue, "resume", iss=iss), fork=fork,
         )
         result = await self._run_logged(
@@ -829,7 +867,11 @@ class FixWorkflow:
         inline = self._review_comments(pr)
         fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
         task = task_builders.build_address_review_task(
-            pr, review_body, inline, cwd, self.store.get_session(issue),
+            pr,
+            as_untrusted(review_body),
+            as_untrusted(inline),
+            cwd,
+            self.store.get_session(issue),
             self._repair_fix_cfg(
                 issue, "address-review",
                 review_rounds=count_outstanding_change_requests(p.reviews, self.cfg.fix_bot),
@@ -881,7 +923,11 @@ class FixWorkflow:
             self.cfg.fix_mcp_config, [c.name for c in p.checks], self.cfg.harness_root
         )
         task = task_builders.build_fix_ci_task(
-            pr, failed, failed_log, cwd, self.store.get_session(issue),
+            pr,
+            as_untrusted(failed),
+            as_untrusted(failed_log),
+            cwd,
+            self.store.get_session(issue),
             # No `review_rounds` here (nor on `rebase`), though `p.reviews` is in
             # hand: review dissatisfaction is evidence about the RESOLUTION, and
             # a red pipeline or a conflicted branch is a different failure mode.

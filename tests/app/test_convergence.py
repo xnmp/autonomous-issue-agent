@@ -47,7 +47,7 @@ from tests.domain.builders import Check, Comment, Review, issue, pr, world
 from issue_agent.adapters.store import Store
 from issue_agent.app import roles
 from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
-from issue_agent.app.execute import Executor
+from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.loop import Daemon
 from issue_agent.app.planners.tasks import FixTaskConfig
 from issue_agent.domain import outcome

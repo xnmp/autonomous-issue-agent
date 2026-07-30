@@ -60,8 +60,9 @@ export function Sidebar({
   });
 
   const list = repos.data?.repos ?? [];
-  const active = list.filter((r) => r.active);
-  const past = list.filter((r) => !r.active);
+  const active = list.filter((r) => r.active === true);
+  const unknown = list.filter((r) => r.active === null);
+  const past = list.filter((r) => r.active === false);
   const quotaByRepo = new Map(
     (usage.data?.harness?.per_repo ?? []).map((quota) => [quota.name, quota]),
   );
@@ -146,9 +147,9 @@ export function Sidebar({
       </button>
       {!collapsed ? (
       <div className="sidebar-scroll">
-        {repos.data?.liveness === "journal-heuristic" ? (
-          <Chip tone="running" title="/proc scan unavailable — liveness inferred from journal staleness">
-            heuristic liveness
+        {repos.data?.liveness === "unknown" ? (
+          <Chip tone="neutral" title="/proc scan unavailable — daemon liveness is unknown">
+            liveness unknown
           </Chip>
         ) : null}
         {repos.error ? (
@@ -175,6 +176,23 @@ export function Sidebar({
             />
           ))}
         </div>
+
+        {unknown.length > 0 ? (
+          <div className="rail-group">
+            <div className="rail-heading">
+              Unknown <span className="faint num">{unknown.length}</span>
+            </div>
+            {unknown.map((r) => (
+              <RepoRow
+                key={r.name}
+                repo={r}
+                selected={r.name === activeRepo}
+                onSelect={() => onSelectRepo(r.name)}
+                quota={options.showPerRepoQuotas ? quotaByRepo.get(r.name) : undefined}
+              />
+            ))}
+          </div>
+        ) : null}
 
         {past.length > 0 ? (
           <details className="rail-group rail-past">
@@ -293,7 +311,7 @@ function RepoRow({
     "repo-row",
     selected ? "selected" : "",
     repo.is_self ? "is-self" : "",
-    repo.active ? "" : "inactive",
+    repo.active === false ? "inactive" : "",
   ]
     .filter(Boolean)
     .join(" ");
@@ -310,7 +328,7 @@ function RepoRow({
           ) : null}
         </div>
         <div className="repo-line2">
-          {repo.active ? (
+          {repo.active === true ? (
             <span className="row" style={{ gap: 3 }}>
               {repo.roles.map((role) => {
                 const h = roleHealth(role);
@@ -323,6 +341,8 @@ function RepoRow({
                 );
               })}
             </span>
+          ) : repo.active === null ? (
+            <span className="faint">liveness unknown</span>
           ) : (
             <span className="faint">idle</span>
           )}

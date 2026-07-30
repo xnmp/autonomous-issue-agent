@@ -187,6 +187,32 @@ class Worktrees:
     def path(self, issue: int) -> str:
         return os.path.join(self.worktree_root, f"issue-{issue}")
 
+    def prune_validate(self) -> int:
+        """Prune stale metadata and validate the remaining worktree registry."""
+
+        with self._mutation_lock:
+            pruned = self._git(["worktree", "prune"], self.repo_dir)
+            if pruned.code != 0:
+                raise WorktreeUnavailable("git worktree prune failed during recovery")
+            listing = self._git(
+                ["worktree", "list", "--porcelain"], self.repo_dir
+            )
+            if listing.code != 0:
+                raise WorktreeUnavailable(
+                    "git worktree list failed during recovery"
+                )
+            paths = [
+                line.removeprefix("worktree ").strip()
+                for line in listing.out.splitlines()
+                if line.startswith("worktree ")
+            ]
+            missing = [path for path in paths if not self._path_exists(path)]
+            if missing:
+                raise WorktreeUnavailable(
+                    f"worktree registry contains missing paths: {missing!r}"
+                )
+            return len(paths)
+
     def branch_for_issue(self, issue: int, fallback: str) -> str:
         """Return a retained harness branch for an older issue leg.
 

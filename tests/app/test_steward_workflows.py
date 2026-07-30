@@ -2,8 +2,9 @@
 
 import asyncio
 
-from issue_agent.adapters.journal import Journal, read_events
-from issue_agent.app.execute import Executor
+from tests.fakes.legacy_journal import Journal
+from issue_agent.adapters.journal import read_events
+from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.workflows.jira import JiraSyncWorkflow, JiraSyncWorkflowConfig
 from issue_agent.app.workflows.steward import StewardWorkflow, StewardWorkflowConfig
 from issue_agent.domain.labels import Label

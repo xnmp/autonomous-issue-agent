@@ -9,7 +9,7 @@ import time
 import pytest
 
 from issue_agent.adapters.reload import RELOAD_EXIT_CODE, ReloadWatch
-from issue_agent.app.execute import Executor
+from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.loop import Daemon
 from issue_agent.domain.world import WorldState
 

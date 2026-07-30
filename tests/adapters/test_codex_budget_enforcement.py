@@ -15,7 +15,8 @@ from issue_agent.adapters.codex_runner import (
     budget_overrun_usd,
     read_rollout_turns,
 )
-from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
+from tests.fakes.legacy_journal import Journal
+from issue_agent.adapters.journal import JournalingRuntime, read_events
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.outcome import ExitReason, infra_death
 

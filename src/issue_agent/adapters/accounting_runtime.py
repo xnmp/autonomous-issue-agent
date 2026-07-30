@@ -6,7 +6,7 @@ import uuid
 import contextvars
 import json
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
@@ -20,8 +20,10 @@ from ..domain.contracts import (
     RunId,
     TokenUsage,
     UsageSource,
+    daily_budget_scope,
 )
 from ..domain.outcome import AgentResult, ExitReason, MAX_BUDGET_STATUS
+from ..domain.pricing import BudgetPolicy, RateTable, price
 from .control_store import (
     AccountingDisposition,
     BudgetLimit,
@@ -44,6 +46,8 @@ class AccountingRuntime(AgentRuntime):
     issue_cap: Money | None
     config_version: str
     runtime_name: str
+    budget_policy: BudgetPolicy
+    rate_table: RateTable | None = None
     spend_evidence_dir: str = ""
     event_log_path: str = ""
     event_deployment: str = ""
@@ -79,12 +83,20 @@ class AccountingRuntime(AgentRuntime):
     async def run(self, task: RuntimePlan) -> AgentResult:
         now = datetime.now(timezone.utc)
         issue, kind, number = self._context.get()
+        if self.runtime_name == "codex" and self.rate_table is None:
+            return _blocked("codex pricing is unavailable")
         if self.issue_cap is not None and issue is None:
             return _blocked("issue spend scope is unavailable")
         limits = list(self._limits(now, issue))
         primary, *additional = limits
-        maximum = Money(
-            primary.cap.currency,
+        try:
+            maximum = self.budget_policy.maximum_for(
+                self.role, kind or ""
+            )
+        except KeyError as exc:
+            return _blocked(str(exc))
+        declared = Money(
+            "USD",
             max(
                 0,
                 int(
@@ -94,6 +106,11 @@ class AccountingRuntime(AgentRuntime):
                 ),
             ),
         )
+        if declared != maximum:
+            return _blocked(
+                f"task budget {declared.micros} disagrees with policy "
+                f"{maximum.micros} for {self.role}/{kind}"
+            )
         correlated_run_id, _leg_id = self._identity.get()
         run_id = RunId(correlated_run_id or uuid.uuid4().hex)
         dispatch_id = json.dumps(
@@ -168,32 +185,44 @@ class AccountingRuntime(AgentRuntime):
         )
         try:
             result = await self.inner.run(runtime_task)
-            return self._settle_result(run_id, result)
+            return self._settle_result(
+                run_id, task.model or result.model, result
+            )
         except BaseException:
             self._recover_or_release(run_id)
             raise
 
     def _settle_result(
-        self, run_id: RunId, result: AgentResult
+        self, run_id: RunId, model: str | None, result: AgentResult
     ) -> AgentResult:
         usage = _token_usage(result.usage, self.runtime_name)
-        amount = Money(
-            "USD",
-            int(
-                (Decimal(str(result.cost_usd)) * 1_000_000).quantize(
-                    Decimal("1"), rounding=ROUND_HALF_UP
-                )
-            ),
-        )
-        basis = (
-            PricingBasis.SYNTHETIC
-            if result.cost_usd <= 0
-            else (
-                PricingBasis.CONFIGURED_RATE_CARD
-                if self.runtime_name == "codex"
+        if (
+            self.rate_table is not None
+            and usage is not None
+            and usage.trusted_for_accounting
+        ):
+            if not model:
+                raise RuntimeError("configured-rate settlement needs a model")
+            amount = price(
+                usage,
+                self.rate_table.rates_for(model),
+                self.rate_table.currency,
+            )
+            basis = PricingBasis.CONFIGURED_RATE_CARD
+        else:
+            amount = Money(
+                "USD",
+                int(
+                    (Decimal(str(result.cost_usd)) * 1_000_000).quantize(
+                        Decimal("1"), rounding=ROUND_HALF_UP
+                    )
+                ),
+            )
+            basis = (
+                PricingBasis.SYNTHETIC
+                if result.cost_usd <= 0
                 else PricingBasis.PROVIDER_REPORTED
             )
-        )
         settlement = self.store.settle(
             SettlementRequest(
                 run_id,
@@ -202,13 +231,15 @@ class AccountingRuntime(AgentRuntime):
                 result.session_id or f"run:{run_id}",
                 usage,
                 (
-                    "codex-config"
+                    self.rate_table.rate_card_id
                     if basis is PricingBasis.CONFIGURED_RATE_CARD
+                    and self.rate_table is not None
                     else None
                 ),
                 (
-                    self.config_version
+                    self.rate_table.version
                     if basis is PricingBasis.CONFIGURED_RATE_CARD
+                    and self.rate_table is not None
                     else None
                 ),
             )
@@ -289,17 +320,8 @@ class AccountingRuntime(AgentRuntime):
 def _daily_scope(
     repository: str, dimension: str, currency: str, now: datetime
 ) -> BudgetScope:
-    start = now.astimezone(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    return BudgetScope(
-        repository,
-        dimension,
-        currency,
-        start.date().isoformat(),
-        start,
-        start + timedelta(days=1),
-        ZoneInfo("UTC"),
+    return daily_budget_scope(
+        repository, dimension, currency, now, ZoneInfo("UTC")
     )
 
 

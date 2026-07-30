@@ -81,17 +81,30 @@ class _Abandonments:
         return True
 
 
+class _Worktrees:
+    def prune_validate(self):
+        return 2
+
+
+class _Commands:
+    def drain_pending_commands(self):
+        return 1
+
+
 def test_recovery_reconciles_dead_reservation_before_unknown_release():
     control = _Control()
     spend = _Spend((RunId("recovered"),))
     abandonments = _Abandonments()
 
     report = RecoveryCoordinator(
-        _Supervisor(), control, spend, abandonments, "o/r:fix"
+        _Supervisor(), control, _Worktrees(), _Commands(),
+        spend, abandonments, "o/r:fix"
     ).recover()
 
     assert report.killed_orphans == (RunId("orphan"),)
     assert report.reclaimed_leases == (RunId("recovered"),)
+    assert report.validated_worktrees == 2
+    assert report.recovered_commands == 1
     assert report.spend_unknown == ()
     assert report.pending_commands == 1
     assert spend.seen == [RunId("recovered")]
@@ -107,12 +120,69 @@ def test_recovery_releases_only_orphaned_indeterminate_spend():
     abandonments = _Abandonments()
 
     report = RecoveryCoordinator(
-        _Supervisor(), control, spend, abandonments, "o/r:fix"
+        _Supervisor(), control, _Worktrees(), _Commands(),
+        spend, abandonments, "o/r:fix"
     ).recover()
 
     assert report.spend_unknown == (RunId("recovered"),)
     assert control.released == [(RunId("recovered"), "spend_unknown")]
     assert RunId("live") not in spend.seen
+
+
+def test_recovery_runs_the_fixed_crash_consistency_sequence():
+    calls = []
+
+    class Supervisor:
+        def recover_orphans(self):
+            calls.append("kill_orphans")
+            return ()
+
+    class Control(_Control):
+        def reclaim_dead_leases(self, owner_id, is_alive):
+            calls.append("reclaim_leases")
+            return ()
+
+        def active_reservation_runs(self, owner_id):
+            calls.append("reconstruct_spend")
+            return ()
+
+        def pending_commands(self):
+            calls.append("inspect_pending")
+            return ()
+
+    class Worktrees:
+        def prune_validate(self):
+            calls.append("validate_worktrees")
+            return 0
+
+    class Commands:
+        def drain_pending_commands(self):
+            calls.append("drain_commands")
+            return 0
+
+    class Abandonments:
+        def abandon_run(self, run_id, reason):
+            calls.append("correct_abandonment")
+            return True
+
+    RecoveryCoordinator(
+        Supervisor(),
+        Control(),
+        Worktrees(),
+        Commands(),
+        _Spend(),
+        Abandonments(),
+        "o/r:fix",
+    ).recover()
+
+    assert calls == [
+        "kill_orphans",
+        "reclaim_leases",
+        "validate_worktrees",
+        "drain_commands",
+        "reconstruct_spend",
+        "inspect_pending",
+    ]
 
 
 def test_dead_lease_with_recovered_spend_keeps_one_abandoned_terminal_outcome(
@@ -168,7 +238,8 @@ def test_dead_lease_with_recovered_spend_keeps_one_abandoned_terminal_outcome(
         "issue_agent.app.recovery._pid_alive", lambda _pid, _start: False
     )
     report = RecoveryCoordinator(
-        _Supervisor(), store, Reconciler(), abandonments, "o/r:fix"
+        _Supervisor(), store, _Worktrees(), _Commands(),
+        Reconciler(), abandonments, "o/r:fix"
     ).recover()
 
     with sqlite3.connect(store.path) as db:

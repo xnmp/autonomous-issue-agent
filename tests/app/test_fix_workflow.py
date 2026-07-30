@@ -6,8 +6,9 @@ shrinking into a router without losing behavior coverage.
 
 import asyncio
 
+from issue_agent.adapters.journal import _legacy_event_record
 from issue_agent.adapters.store import Store
-from issue_agent.app.execute import Executor
+from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.workflows.fix import FixWorkflow, FixWorkflowConfig
 from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.app.planners.tasks import FixTaskConfig
@@ -1113,6 +1114,8 @@ class RecordingJournal:
         self.events = []
 
     def emit(self, event, **fields):
+        if not isinstance(event, str):
+            event, fields = _legacy_event_record(event)
         self.events.append((event, fields))
 
 
@@ -1677,12 +1680,12 @@ def test_resolve_persists_its_model_for_later_repair_legs():
 
 def _journalled_resolve(tmp_path, runner):
     """Run a routed resolve through the real JournalingRuntime and return
-    (journalled agent_runs, ledgered spend lines)."""
-    from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
+    attributed agent-run telemetry."""
+    from tests.fakes.legacy_journal import Journal
+    from issue_agent.adapters.journal import JournalingRuntime, read_events
 
     journal = Journal(str(tmp_path / "journal.jsonl"))
-    ledger = str(tmp_path / "spend.jsonl")
-    rt = JournalingRuntime(runner, journal, ledger, "o/r", "fix")
+    rt = JournalingRuntime(runner, journal, repo="o/r", role="fix")
     rt.set_context("fix", "RESOLVE", 5, 5)
 
     gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
@@ -1691,11 +1694,11 @@ def _journalled_resolve(tmp_path, runner):
     ).resolve(5))
 
     runs = [e for e in read_events(journal.path) if e["event"] == "agent_run"]
-    return runs, read_events(ledger)
+    return runs
 
 
 def test_the_router_leg_journals_as_route_and_the_resolve_as_resolve(tmp_path):
-    runs, _ = _journalled_resolve(tmp_path, SeqRunner([
+    runs = _journalled_resolve(tmp_path, SeqRunner([
         _router_result("standard"),
         AgentResult(is_error=False, status="pr_opened", session_id="s5", cost_usd=3.0),
     ]))
@@ -1705,26 +1708,25 @@ def test_the_router_leg_journals_as_route_and_the_resolve_as_resolve(tmp_path):
     )
 
 
-def test_a_route_leg_is_still_real_spend_and_still_reaches_the_ledger(tmp_path):
-    """Renaming the bucket must not empty it: a router run costs money, and the
-    spend caps read the ledger."""
-    _, spend = _journalled_resolve(tmp_path, SeqRunner([
+def test_a_route_leg_keeps_its_cost_in_run_telemetry(tmp_path):
+    """Renaming the bucket must not erase its cost attribution."""
+    runs = _journalled_resolve(tmp_path, SeqRunner([
         AgentResult(is_error=False, session_id="rt", cost_usd=0.07,
                     structured={"tier": "standard"}),
         AgentResult(is_error=False, status="pr_opened", session_id="s5", cost_usd=3.0),
     ]))
 
-    assert [(s["kind"], s["cost_usd"]) for s in spend] == [
+    assert [(run["kind"], run["cost_usd"]) for run in runs] == [
         ("ROUTE", 0.07), ("RESOLVE", 3.0),
     ]
-    assert all(s["issue"] == 5 for s in spend), "both legs bill the issue that caused them"
+    assert all(run["issue"] == 5 for run in runs)
 
 
 def test_the_route_leg_stays_inside_the_dispatch_that_ran_it(tmp_path):
     """One dispatch, one `dispatch` id — `unsettled_starts` counts one death per
     dispatch, so a classify probe that minted its own id would charge a daemon
     restart twice."""
-    runs, _ = _journalled_resolve(tmp_path, SeqRunner([
+    runs = _journalled_resolve(tmp_path, SeqRunner([
         _router_result("standard"),
         AgentResult(is_error=False, status="pr_opened", session_id="s5", cost_usd=3.0),
     ]))
@@ -1746,10 +1748,10 @@ def test_the_resolve_after_a_dead_router_is_still_journalled_as_resolve(tmp_path
             return AgentResult(is_error=False, status="pr_opened",
                                session_id="s5", cost_usd=3.0)
 
-    runs, spend = _journalled_resolve(tmp_path, DeadRouter())
+    runs = _journalled_resolve(tmp_path, DeadRouter())
 
     assert [r["kind"] for r in runs] == ["ROUTE", "RESOLVE"]
-    assert [s["kind"] for s in spend] == ["RESOLVE"], "the dead router cost nothing"
+    assert [r["kind"] for r in runs if r["cost_usd"] > 0] == ["RESOLVE"]
 
 
 def test_a_runner_that_cannot_name_its_legs_still_resolves():

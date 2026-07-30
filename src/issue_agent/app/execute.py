@@ -14,15 +14,14 @@ belongs to application planning; the executor just routes to it.
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import datetime
+import hashlib
 import json
 import threading
 import time
 
 from ..adapters.github import GhUnavailable
-from ..adapters.effects import ImmediateGitHubEffectExecutor
-from ..adapters.journal import alert, parse_ts, read_events_tail
-from ..adapters.store import decode_lifecycle_action, encode_lifecycle_action
+from ..adapters.journal import alert
+from ..adapters.store import encode_lifecycle_action
 from ..domain.actions import (
     Action,
     AddDependency,
@@ -40,10 +39,30 @@ from ..domain.actions import (
     Target,
 )
 from ..domain.labels import ADVISORY_LABELS, Label
+from ..domain.events import (
+    ActionApplied,
+    ActionFailed,
+    ActionRetried,
+    Correlation,
+    EscalationRaised,
+    LevelChanged,
+    TelemetryEvent,
+    TelemetryWarning,
+)
 
 # gh subcommand kind per target.
 _KIND = {Target.ISSUE: "issue", Target.PR: "pr"}
 _DURABLE_ACTIONS = (Relabel, PostComment, CloseIssue, EscalateCiPending)
+_PRIVILEGED_ACTIONS = (
+    Relabel,
+    PostComment,
+    CloseIssue,
+    EnableAutoMerge,
+    UpdateBranch,
+    RerunFailedChecks,
+    EscalateCiPending,
+    AddDependency,
+)
 _DEFAULT_RETRY_DELAYS = (1.0, 3.0, 9.0)
 
 
@@ -65,11 +84,116 @@ def _is_advisory_relabel(action: Relabel) -> bool:
     )
 
 
+def _action_spec(action: Action) -> tuple[str, str, int | None, dict]:
+    """Return one structured telemetry shape for every action verb."""
+
+    if isinstance(action, _DURABLE_ACTIONS):
+        raw = encode_lifecycle_action(action)
+        target = str(raw.get("target") or (
+            "PR" if isinstance(action, EscalateCiPending) else "ISSUE"
+        )).lower()
+        number = (
+            action.pr if isinstance(action, EscalateCiPending) else action.number
+        )
+        return str(raw["type"]), target, number, raw
+    if isinstance(action, EnableAutoMerge):
+        return "enable_auto_merge", "pr", action.pr, {
+            "type": "enable_auto_merge", "pr": action.pr, "method": action.method,
+        }
+    if isinstance(action, UpdateBranch):
+        return "update_branch", "pr", action.pr, {
+            "type": "update_branch", "pr": action.pr,
+        }
+    if isinstance(action, RerunFailedChecks):
+        return "rerun_failed_checks", "pr", action.pr, {
+            "type": "rerun_failed_checks", "pr": action.pr, "head": action.head,
+        }
+    if isinstance(action, AddDependency):
+        return "add_dependency", "issue", action.issue, {
+            "type": "add_dependency",
+            "issue": action.issue,
+            "blocker": action.blocker,
+        }
+    if isinstance(action, RemoveWorktree):
+        return "remove_worktree", "worktree", action.issue, {
+            "type": "remove_worktree", "issue": action.issue,
+        }
+    if isinstance(action, ClearIssueState):
+        number = action.pr or action.issue
+        return "clear_issue_state", "state", number, {
+            "type": "clear_issue_state",
+            "pr": action.pr,
+            "issue": action.issue,
+            "merged": action.merged,
+        }
+    if isinstance(action, RunAgent):
+        return "run_agent", action.kind.name.lower(), action.number or None, {
+            "type": "run_agent",
+            "kind": action.kind.name,
+            "number": action.number,
+        }
+    if isinstance(action, NoOp):
+        return "noop", "local", None, {
+            "type": "noop", "reason": action.reason,
+        }
+    raise TypeError(f"unhandled action telemetry: {action!r}")
+
+
+def _action_correlation(action: Action) -> Correlation:
+    if isinstance(action, (Relabel, PostComment)):
+        if action.target is Target.ISSUE:
+            return Correlation(issue=action.number)
+        return Correlation(pr=action.number)
+    if isinstance(action, CloseIssue):
+        return Correlation(issue=action.number)
+    if isinstance(
+        action,
+        (EnableAutoMerge, UpdateBranch, RerunFailedChecks, EscalateCiPending),
+    ):
+        return Correlation(pr=action.pr)
+    if isinstance(action, AddDependency):
+        return Correlation(issue=action.issue)
+    if isinstance(action, (RemoveWorktree,)):
+        return Correlation(issue=action.issue)
+    if isinstance(action, ClearIssueState):
+        return Correlation(issue=action.issue, pr=action.pr)
+    if isinstance(action, RunAgent):
+        issue_kinds = {"RESOLVE", "RESUME", "TRIAGE", "GROOM"}
+        if action.number <= 0:
+            return Correlation()
+        if action.kind.name in issue_kinds:
+            return Correlation(issue=action.number)
+        return Correlation(pr=action.number)
+    return Correlation()
+
+
+def _action_id(action: Action) -> str:
+    _kind, _target, _number, structured = _action_spec(action)
+    material = json.dumps(structured, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(material.encode()).hexdigest()
+
+
 class LifecycleWriteUnverified(RuntimeError):
     """GitHub returned without raising, but the requested state is still absent."""
 
 
 _TRANSIENT_WRITE_ERRORS = (GhUnavailable, LifecycleWriteUnverified)
+
+
+class MissingEffectExecutor:
+    """Fail closed when composition omitted the durable effect boundary."""
+
+    def handles(self, action: Action) -> bool:
+        return isinstance(action, _PRIVILEGED_ACTIONS)
+
+    def execute(self, _action: Action) -> bool:
+        raise RuntimeError("durable effect executor is not configured")
+
+    def submit_review(self, _pr: int, _event: str, _body: str) -> bool:
+        raise RuntimeError("durable effect executor is not configured")
+
+    def reconcile(self, _action: Action) -> bool | None:
+        raise RuntimeError("durable effect executor is not configured")
 
 
 class Executor:
@@ -140,11 +264,7 @@ class Executor:
         self._pending_actions = pending_actions
         self._retry_delays = retry_delays
         self._sleep = sleep
-        self._effect_executor = (
-            effect_executor
-            if effect_executor is not None
-            else ImmediateGitHubEffectExecutor(gateway)
-        )
+        self._effect_executor = effect_executor or MissingEffectExecutor()
         # Paid dispatches run outside this lock. Every lifecycle side effect
         # they emit is serialized with the observation loop, preserving the
         # single-writer pending queue and deterministic GitHub transitions.
@@ -205,7 +325,12 @@ class Executor:
         future escalation path can be added without it being noticed."""
         fields = {"target": _KIND[action.target], "number": action.number}
         if self._journal is not None:
-            self._journal.emit("escalation", **fields)
+            self._journal.emit(
+                TelemetryEvent(
+                    EscalationRaised(fields["target"], action.number),
+                    _action_correlation(action),
+                )
+            )
         alert(
             self._alert_cmd,
             json.dumps({"event": "escalation", **fields}, sort_keys=True),
@@ -225,11 +350,14 @@ class Executor:
             state = "cleared"
         if state is not None:
             self._journal.emit(
-                "deferred",
-                state=state,
-                issue=action.number,
-                reason="human",
-                blocker="human",
+                TelemetryEvent(
+                    LevelChanged(
+                        f"issue:{action.number}:deferred:human",
+                        state,
+                        "human",
+                    ),
+                    Correlation(issue=action.number),
+                )
             )
 
     def _already_applied(self, action: Action) -> bool:
@@ -299,8 +427,18 @@ class Executor:
                     )
                 if self._journal is not None:
                     self._journal.emit(
-                        "ci_rerun", pr=action.pr, head=action.head,
-                        run_id=outcome or 0, ok=outcome is not None,
+                        TelemetryEvent(
+                            TelemetryWarning(
+                                "ci_rerun",
+                                "free CI rerun attempted",
+                                {
+                                    "head": action.head,
+                                    "run_id": outcome or 0,
+                                    "ok": outcome is not None,
+                                },
+                            ),
+                            Correlation(pr=action.pr),
+                        )
                     )
             elif isinstance(action, EscalateCiPending):
                 if outcome is False:
@@ -317,19 +455,7 @@ class Executor:
                     )
                 )
             return
-        if isinstance(
-            action,
-            (
-                Relabel,
-                PostComment,
-                CloseIssue,
-                EnableAutoMerge,
-                UpdateBranch,
-                RerunFailedChecks,
-                EscalateCiPending,
-                AddDependency,
-            ),
-        ):
+        if isinstance(action, _PRIVILEGED_ACTIONS):
             raise RuntimeError(
                 f"privileged effect adapter does not handle {type(action).__name__}"
             )
@@ -369,11 +495,16 @@ class Executor:
         for delay in self._retry_delays:
             if self._journal is not None:
                 self._journal.emit(
-                    "action_retry",
-                    desc=desc,
-                    attempt=attempts,
-                    delay_seconds=delay,
-                    error=str(last),
+                    TelemetryEvent(
+                        ActionRetried(
+                            _action_id(action),
+                            desc,
+                            attempts,
+                            int(delay * 1000),
+                            str(last),
+                        ),
+                        _action_correlation(action),
+                    )
                 )
             self._log(
                 f"RETRY: {desc} after "
@@ -432,11 +563,20 @@ class Executor:
             )
             if self._journal is not None:
                 self._journal.emit(
-                    "action_failed",
-                    desc=desc,
-                    error=str(exc),
-                    pending=pending,
-                    attempts=attempts + len(self._retry_delays),
+                    TelemetryEvent(
+                        ActionFailed(
+                            _action_id(action),
+                            desc,
+                            (
+                                "retryable_failure"
+                                if pending
+                                else "permanent_failure"
+                            ),
+                            str(exc),
+                            attempts + len(self._retry_delays),
+                        ),
+                        _action_correlation(action),
+                    )
                 )
             if (
                 isinstance(exc, LifecycleWriteUnverified)
@@ -445,98 +585,21 @@ class Executor:
                 return
             raise
         if self._journal is not None:
-            fields = {
-                "desc": desc,
-                "attempts": attempts,
-                "replayed": replayed,
-            }
-            if isinstance(action, _DURABLE_ACTIONS):
-                fields["action"] = encode_lifecycle_action(action)
+            kind, target, number, structured = _action_spec(action)
+            structured.update({"attempts": attempts, "replayed": replayed})
             self._journal.emit(
-                "action",
-                **fields,
-            )
-
-    def reconcile_recent_actions(
-        self, started_at: datetime, woke_at: datetime
-    ) -> None:
-        with self._action_lock:
-            self._reconcile_recent_actions(started_at, woke_at)
-
-    def _reconcile_recent_actions(
-        self, started_at: datetime, woke_at: datetime
-    ) -> None:
-        """Verify durable receipts around a stall and repair missing writes.
-
-        The journal is a receipt, not proof that remote state survived an
-        environmental outage. Structured receipts are replayed through the
-        same idempotency probes and bounded queue as #64. Rows without a
-        structured payload are non-durable actions (or legacy receipts) and
-        are ignored; a present but malformed payload remains observable.
-        Relabels are state transitions, so only the latest receipt per target
-        is meaningful. Additive/idempotent actions retain journal order.
-        """
-        # Canonical deployments already reconciled durable commands through
-        # the control store before this callback. JSONL replay is historical
-        # compatibility for old files and isolated tests only.
-        if self._journal is not None and self._journal.canonical:
-            return
-        path = self._journal.path if self._journal is not None else ""
-        if not path:
-            return
-        actions: list[Action] = []
-        latest_relabels: dict[tuple[Target, int], int] = {}
-        for event in read_events_tail(path):
-            if event.get("event") != "action":
-                continue
-            timestamp = parse_ts(event.get("ts"))
-            if timestamp is None or not (started_at <= timestamp <= woke_at):
-                continue
-            if "action" not in event:
-                continue
-            raw = event.get("action")
-            try:
-                action = decode_lifecycle_action(raw)
-            except ValueError as exc:
-                self._journal.emit(
-                    "action_reconcile_skipped",
-                    desc=str(event.get("desc") or ""),
-                    error=str(exc),
+                TelemetryEvent(
+                    ActionApplied(
+                        _action_id(action),
+                        kind,
+                        target,
+                        desc,
+                        number,
+                        structured,
+                    ),
+                    _action_correlation(action),
                 )
-                continue
-            actions.append(action)
-            if isinstance(action, Relabel) and not _is_advisory_relabel(action):
-                latest_relabels[(action.target, action.number)] = len(actions) - 1
-
-        for index, action in enumerate(actions):
-            if (
-                isinstance(action, Relabel)
-                and not _is_advisory_relabel(action)
-                and latest_relabels[(action.target, action.number)] != index
-            ):
-                continue
-            desc = self._describe(action)
-            try:
-                already_applied = self._already_applied(action)
-            except Exception:
-                # Route an unreadable verification probe through the durable
-                # executor too. Its second probe may recover; otherwise the
-                # existing #64 failure path journals and queues the action.
-                try:
-                    self.execute(action, replayed=True)
-                except Exception:
-                    pass
-                continue
-            if already_applied:
-                self._journal.emit("action_verified", desc=desc)
-                continue
-            try:
-                self.execute(action, replayed=True)
-            except Exception:
-                # execute() already journalled the failure and persisted every
-                # transient/unverified durable write. Continue so one broken
-                # target does not prevent independent receipts being checked.
-                continue
+            )
 
     def replay_pending(self) -> bool:
         with self._action_lock:
@@ -552,10 +615,14 @@ class Executor:
             self._log(f"FAILED: cannot read pending lifecycle actions — {exc}")
             if self._journal is not None:
                 self._journal.emit(
-                    "action_failed",
-                    desc="load pending lifecycle actions",
-                    error=str(exc),
-                    pending=True,
+                    TelemetryEvent(
+                        ActionFailed(
+                            None,
+                            "load pending lifecycle actions",
+                            "retryable_failure",
+                            str(exc),
+                        )
+                    )
                 )
             return False
         for index, action in enumerate(pending):
@@ -583,7 +650,16 @@ class Executor:
                 self._log(f"QUARANTINED: {desc} — {exc}")
                 fields = {"desc": desc, "error": str(exc)}
                 if self._journal is not None:
-                    self._journal.emit("action_quarantined", **fields)
+                    self._journal.emit(
+                        TelemetryEvent(
+                            TelemetryWarning(
+                                "action_quarantined",
+                                str(exc),
+                                fields,
+                            ),
+                            _action_correlation(action),
+                        )
+                    )
                 alert(
                     self._alert_cmd,
                     json.dumps(

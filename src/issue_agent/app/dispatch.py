@@ -27,11 +27,12 @@ from ..domain.agent_task import (
     RuntimeName,
 )
 from ..domain.outcome import deterministic_death
+from ..domain.leg import Leg, LegTarget
 from ..domain.ports import (
     ActionExecutor,
     ControlStore,
     FixWorktreePort,
-    LegacyJournal,
+    EventSink,
     WorkflowGitHubReads,
     WorkflowState,
 )
@@ -169,7 +170,7 @@ class AgentDispatcher:
         runner: AgentRuntime,
         executor: ActionExecutor,
         prepare_cwd: Callable[[str], None] | None = None,
-        journal: LegacyJournal | None = None,
+        journal: EventSink | None = None,
         reserve_fix_paths: Callable[[int, frozenset[str]], bool] | None = None,
         dedupe: ControlStore | None = None,
     ):
@@ -218,7 +219,16 @@ class AgentDispatcher:
         in-session TDD run isn't a silent gap in the log. The per-commit milestones
         (red:/green:/docs:) are logged live by the governor hook as they happen."""
         return await run_leg(
-            self.runner, self.cfg.log, label, issue, task
+            self.runner,
+            self.cfg.log,
+            Leg(
+                label.upper().replace("-", "_").replace(":", "_"),
+                LegTarget.PR,
+                issue,
+                True,
+                ("global", "repository", "issue"),
+            ),
+            task,
         )
 
     # Kinds keyed by PR number rather than issue number. The per-issue spend cap

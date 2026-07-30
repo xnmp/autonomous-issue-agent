@@ -19,15 +19,22 @@ from __future__ import annotations
 from collections.abc import Callable, Hashable
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import json
 import os
 import threading
 import time
+import uuid
 
 from ..adapters.github import GhUnavailable
-from ..adapters.journal import read_events_tail, stalled_run_annotations
 from ..domain.actions import Action, Relabel, RunAgent
+from ..domain.events import (
+    DaemonStateChanged,
+    GithubUnavailable,
+    StallDetected,
+    TelemetryEvent,
+    TickGated,
+)
 from ..domain.supervision import (
     ClockSample,
     DaemonState,
@@ -93,9 +100,8 @@ class Daemon:
     executor: Executor
     poll_seconds: int = 60
     log: Callable[[str], None] = _ignore_log
-    # Optional JSONL journal (adapters.journal.Journal). Default None keeps every
-    # existing construction working; when set, the skipped-tick arm becomes a
-    # countable event rather than a line in a log nobody kept.
+    # Optional typed telemetry sink. When set, skipped ticks become countable
+    # events rather than lines in a log nobody retained.
     journal: object | None = None
     # Optional pre-observe gate (app.spend_gate). Returning a reason string
     # means "this whole tick is pointless" — checked BEFORE observe so a
@@ -128,6 +134,7 @@ class Daemon:
     heartbeat_path: str = ""
     shutdown_timeout_seconds: float = 85.0
     recover: Callable[[], object] | None = None
+    finalize: Callable[[], object] | None = None
     _state: DaemonState = field(
         default=DaemonState.STARTING, init=False, repr=False
     )
@@ -181,10 +188,9 @@ class Daemon:
         )
         if self.journal is not None:
             self.journal.emit(
-                "daemon_state",
-                previous=previous.value,
-                state=state.value,
-                reason=reason,
+                TelemetryEvent(
+                    DaemonStateChanged(previous.value, state.value, reason)
+                )
             )
 
     def _write_heartbeat(self) -> None:
@@ -359,7 +365,7 @@ class Daemon:
             self.log(f"{self.name}: {reason}")
             self._gated_on = reason
             if self.journal is not None:
-                self.journal.emit("tick_gated", reason=reason)
+                self.journal.emit(TelemetryEvent(TickGated(reason)))
         return True
 
     def tick(self) -> list[Action]:
@@ -404,7 +410,19 @@ class Daemon:
             # harness did nothing because there was nothing to do" and "the
             # harness could not see" — indistinguishable from actions alone.
             if self.journal is not None:
-                self.journal.emit("gh_unavailable", kind=exc.kind, detail=exc.detail)
+                self.journal.emit(
+                    TelemetryEvent(
+                        GithubUnavailable(
+                            exc.kind,
+                            exc.detail,
+                            (
+                                int(exc.retry_after_s * 1000)
+                                if exc.retry_after_s is not None
+                                else None
+                            ),
+                        )
+                    )
+                )
             return []
         except Exception as exc:  # noqa: BLE001 - crash-isolate a poll
             self.log(f"{self.name}: poll pass failed (continuing): {exc}")
@@ -514,49 +532,25 @@ class Daemon:
                         f"(expected ~{self.poll_seconds}s) "
                         "— likely suspended/stalled; catching up"
                     )
-                    observed_from = datetime.fromtimestamp(
-                        previous, tz=timezone.utc
-                    )
-                    reconcile_from = min(
-                        observed_from,
-                        stall_started - timedelta(seconds=self.poll_seconds),
-                    )
                     if self.journal is not None:
                         self.journal.emit(
-                            "stall",
-                            started_at=stall_started.isoformat(),
-                            woke_at=woke_at.isoformat(),
-                            elapsed_seconds=elapsed,
-                            suspended_seconds=suspended,
-                            stall_clock_offset_seconds=stall_clock_offset,
-                        )
-                        path = self.journal.path
-                        if (
-                            path
-                            and suspended > 0
-                            and not self.journal.canonical
-                        ):
-                            for annotation in stalled_run_annotations(
-                                read_events_tail(path),
-                                observed_from,
-                                woke_at,
-                                suspended,
-                            ):
-                                self.journal.emit(
-                                    "agent_run_stall",
-                                    **annotation,
-                                    stall_started_at=stall_started.isoformat(),
-                                    stall_clock_offset_seconds=stall_clock_offset,
-                                    observed_from=observed_from.isoformat(),
-                                    woke_at=woke_at.isoformat(),
-                                    detected_suspended_seconds=suspended,
+                            TelemetryEvent(
+                                StallDetected(
+                                    (
+                                        f"{self.name}:"
+                                        f"{stall_clock_offset:g}:"
+                                        f"{uuid.uuid4().hex}"
+                                    ),
+                                    stall_started.isoformat(),
+                                    woke_at.isoformat(),
+                                    int(suspended * 1000),
+                                    int(elapsed * 1000),
+                                    int(stall_clock_offset * 1000),
                                 )
+                            )
+                        )
                     if self.recover is not None:
                         self.recover()
-                    self.executor.reconcile_recent_actions(
-                        reconcile_from,
-                        woke_at,
-                    )
                     last_logged = cur
                 elif cur - last_logged >= heartbeat_seconds:
                     self.log(f"{self.name}: ♥ alive (poll {self.poll_seconds}s)")
@@ -588,6 +582,7 @@ class Daemon:
                 self._sleep_interval(sleep, scheduler_progress)
             self._transition(DaemonState.DRAINING, "loop completed")
             clean = self.shutdown_dispatches(cancel=False)
+            clean = self._finalize() and clean
             self._transition(DaemonState.STOPPED)
             if not clean:
                 raise SystemExit(ExitCode.TRANSIENT)
@@ -597,11 +592,22 @@ class Daemon:
             clean = True
             if self._state is not DaemonState.STOPPED:
                 clean = self.shutdown_dispatches(cancel=True)
+                clean = self._finalize() and clean
                 self._transition(DaemonState.STOPPED)
             self._write_heartbeat()
             if not clean:
                 raise SystemExit(ExitCode.TRANSIENT) from exc
             raise
+
+    def _finalize(self) -> bool:
+        if self.finalize is None:
+            return True
+        try:
+            self.finalize()
+        except Exception as exc:  # noqa: BLE001 - shutdown must reach STOPPED
+            self.log(f"{self.name}: shutdown reconciliation failed: {exc}")
+            return False
+        return True
 
     def _sleep_interval(
         self,

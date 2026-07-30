@@ -547,6 +547,90 @@ class Verdict:
     reason: str = ""
 
 
+def _allow_git_config(
+    _command: governor_policy.Governed, _ctx: GateContext
+) -> Verdict:
+    """`git config` reaches routing only for bypass checks handled earlier."""
+
+    return Verdict(True)
+
+
+def _gate_branch(
+    command: governor_policy.Governed, _ctx: GateContext
+) -> Verdict:
+    name = _extract_after_flag(list(command.checker_args), "-b", "-c")
+    result = gate.check_branch_name(name)
+    return Verdict(result.ok, result.reason)
+
+
+def _gate_commit(
+    command: governor_policy.Governed, ctx: GateContext
+) -> Verdict:
+    message = _extract_after_flag(
+        list(command.checker_args), "-m", "--message"
+    )
+    for result in (
+        gate.check_commit_message(message),
+        gate.check_commit_order(
+            message, ctx.branch_subjects, ctx.base_resolvable
+        ),
+        gate.check_project_commands(
+            ctx.lint_cmd, ctx.typecheck_cmd, ctx.run_check
+        ),
+    ):
+        if not result.ok:
+            return Verdict(False, result.reason)
+    test_cmd = gate.resolve_test_cmd(ctx.harness_test_cmd, ctx.env_test_cmd)
+    red = gate.check_red_is_red(
+        message, test_cmd, ctx.run_tests, ctx.verify_red_at_commit
+    )
+    return Verdict(red.ok, red.reason)
+
+
+def _gate_pr_create(
+    command: governor_policy.Governed, ctx: GateContext
+) -> Verdict:
+    reasons = _pr_gate(list(command.checker_args), ctx)
+    if reasons:
+        return Verdict(False, f"PR blocked: {reasons[0]}")
+    if ctx.durable_publish and not command.durable_wrapper:
+        return Verdict(
+            False,
+            "PR publication must use `issue-agent-publish gh pr create "
+            "…` so the remote effect has a durable command and receipt",
+        )
+    return Verdict(True)
+
+
+def _gate_push(
+    command: governor_policy.Governed, ctx: GateContext
+) -> Verdict:
+    reasons = _push_gate(list(command.checker_args), ctx)
+    if reasons:
+        return Verdict(False, f"Push blocked: {reasons[0]}")
+    if ctx.durable_publish and not command.durable_wrapper:
+        return Verdict(
+            False,
+            "Branch publication must use `issue-agent-publish git push "
+            "…` so the remote effect has a durable command and receipt",
+        )
+    return Verdict(True)
+
+
+_GATE_HANDLERS: dict[
+    str, Callable[[governor_policy.Governed, GateContext], Verdict]
+] = {
+    "git-branch": _gate_branch,
+    "git-commit": _gate_commit,
+    "git-config": _allow_git_config,
+    "git-push": _gate_push,
+    "gh-pr-create": _gate_pr_create,
+}
+
+if frozenset(_GATE_HANDLERS) != governor_policy.GOVERNED_KINDS:
+    raise RuntimeError("governor gate registry is not exhaustive")
+
+
 def evaluate_command(command: str, ctx: GateContext) -> Verdict:
     """Decide whether a Bash command is allowed. Bypass detection first (fail
     CLOSED), then route each governed command to its gate. Returns the FIRST
@@ -566,61 +650,18 @@ def evaluate_command(command: str, ctx: GateContext) -> Verdict:
 
     # 2) Route governed commands to gate checks.
     for words, _env in governor_policy.extract_commands_with_env(command):
-        g = governor_policy.classify(words)
-        if g is None:
+        governed = governor_policy.classify(words)
+        if governed is None:
             continue
-        if g.kind == "git-branch":
-            name = _extract_after_flag(list(g.checker_args), "-b", "-c")
-            res = gate.check_branch_name(name)
-            if not res.ok:
-                return Verdict(False, res.reason)
-        elif g.kind == "git-commit":
-            msg = _extract_after_flag(list(g.checker_args), "-m", "--message")
-            res = gate.check_commit_message(msg)
-            if not res.ok:
-                return Verdict(False, res.reason)
-            order = gate.check_commit_order(msg, ctx.branch_subjects, ctx.base_resolvable)
-            if not order.ok:
-                return Verdict(False, order.reason)
-            # Project lint + typecheck (check-commit.sh:54-59), ported in wave
-            # P1-2 (review M6): the SDK path never ran them, so doctor's
-            # "✓ LINT_CMD set" described a command nothing executed. Between the
-            # pure checks above and the suite-running one below — same slot, same
-            # order (lint then typecheck) as the bash.
-            project = gate.check_project_commands(
-                ctx.lint_cmd, ctx.typecheck_cmd, ctx.run_check
+        handler = _GATE_HANDLERS.get(governed.kind)
+        if handler is None:
+            return Verdict(
+                False,
+                f"Blocked: no gate registered for {governed.kind!r}",
             )
-            if not project.ok:
-                return Verdict(False, project.reason)
-            # Fail-fast: a `red:` commit's tests must actually fail (run on the
-            # working tree now). §10 at PR time remains the committed-state backstop.
-            test_cmd = gate.resolve_test_cmd(ctx.harness_test_cmd, ctx.env_test_cmd)
-            red = gate.check_red_is_red(
-                msg, test_cmd, ctx.run_tests, ctx.verify_red_at_commit
-            )
-            if not red.ok:
-                return Verdict(False, red.reason)
-        elif g.kind == "gh-pr-create":
-            reasons = _pr_gate(list(g.checker_args), ctx)
-            if reasons:
-                return Verdict(False, f"PR blocked: {reasons[0]}")
-            if ctx.durable_publish and not g.durable_wrapper:
-                return Verdict(
-                    False,
-                    "PR publication must use `issue-agent-publish gh pr create "
-                    "…` so the remote effect has a durable command and receipt",
-                )
-        elif g.kind == "git-push":
-            reasons = _push_gate(list(g.checker_args), ctx)
-            if reasons:
-                return Verdict(False, f"Push blocked: {reasons[0]}")
-            if ctx.durable_publish and not g.durable_wrapper:
-                return Verdict(
-                    False,
-                    "Branch publication must use `issue-agent-publish git push "
-                    "…` so the remote effect has a durable command and receipt",
-                )
-        # git-config: bypass-only (handled above).
+        result = handler(governed, ctx)
+        if not result.allowed:
+            return result
     return Verdict(True)
 
 

@@ -8,9 +8,11 @@ from ..adapters.process_supervisor import ProcessSupervisor as DurableProcessSup
 from ..domain.contracts import RunId
 from ..domain.ports import (
     ProcessSupervisor,
+    CommandRecovery,
     RecoveryControl,
     RunAbandonmentSink,
     SpendReconciler,
+    WorktreeRecovery,
 )
 
 
@@ -18,6 +20,8 @@ from ..domain.ports import (
 class RecoveryReport:
     killed_orphans: tuple[RunId, ...]
     reclaimed_leases: tuple[RunId, ...]
+    validated_worktrees: int
+    recovered_commands: int
     spend_unknown: tuple[RunId, ...]
     pending_commands: int
 
@@ -26,6 +30,8 @@ class RecoveryReport:
 class RecoveryCoordinator:
     supervisor: ProcessSupervisor
     control: RecoveryControl
+    worktrees: WorktreeRecovery
+    commands: CommandRecovery
     spend: SpendReconciler
     abandonments: RunAbandonmentSink
     owner_id: str
@@ -35,6 +41,8 @@ class RecoveryCoordinator:
         reclaimed = self.control.reclaim_dead_leases(
             self.owner_id, _pid_alive
         )
+        validated_worktrees = self.worktrees.prune_validate()
+        recovered_commands = self.commands.drain_pending_commands()
         unknown: list[RunId] = []
         live_runs = {
             lease.run_id for lease in self.control.leases(self.owner_id)
@@ -54,9 +62,18 @@ class RecoveryCoordinator:
         return RecoveryReport(
             killed,
             reclaimed,
+            validated_worktrees,
+            recovered_commands,
             tuple(unknown),
             len(self.control.pending_commands()),
         )
+
+
+class NoWorktreeRecovery:
+    """Null object for roles that never own issue worktrees."""
+
+    def prune_validate(self) -> int:
+        return 0
 
 
 def _pid_alive(pid: int, start_ticks: int) -> bool:

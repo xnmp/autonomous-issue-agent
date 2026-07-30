@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, time, timedelta
 from enum import Enum
 from types import MappingProxyType
 from typing import Mapping, NewType
@@ -141,6 +141,32 @@ class BudgetScope:
         _aware(self.period_end, "period_end")
         if self.period_end <= self.period_start:
             raise ValueError("budget period end must follow its start")
+
+
+def daily_budget_scope(
+    repository: str,
+    dimension: str,
+    currency: str,
+    at: datetime,
+    period_timezone: ZoneInfo,
+) -> BudgetScope:
+    """Build a civil-day scope without assuming every day has 24 hours."""
+
+    _aware(at, "at")
+    local_date = at.astimezone(period_timezone).date()
+    start = datetime.combine(local_date, time.min, period_timezone)
+    end = datetime.combine(
+        local_date + timedelta(days=1), time.min, period_timezone
+    )
+    return BudgetScope(
+        repository,
+        dimension,
+        currency,
+        local_date.isoformat(),
+        start,
+        end,
+        period_timezone,
+    )
 
 
 class TestExecutionStatus(str, Enum):

@@ -5,7 +5,9 @@ from tests.domain.builders import issue, world
 
 from issue_agent.domain.actions import AddDependency, PostComment, Relabel, Target
 from issue_agent.domain.labels import Label
+from issue_agent.domain.gate import Adr
 from issue_agent.domain.triage import (
+    adr_steward_actions,
     TriageConfig,
     TriageState,
     TriageVerdict,
@@ -17,8 +19,64 @@ from issue_agent.domain.triage import (
     recurrence_actions,
     triage_candidates,
 )
+from issue_agent.domain.world import Comment, PRView
 
 CFG = TriageConfig(steward_bot="steward-bot", enabled=True)
+
+
+# ── architecture-decision stewardship ─────────────────────────────────────────
+def test_steward_flags_open_governed_pr_without_adr_citation():
+    pr = PRView(
+        7,
+        body="No architecture section",
+        changed_files=frozenset({"src/auth/token.py"}),
+    )
+
+    actions = adr_steward_actions(
+        (pr,),
+        (Adr("0001-trust.md", ("src/auth",)),),
+        "steward-bot",
+    )
+
+    assert len(actions) == 1
+    assert isinstance(actions[0], PostComment)
+    assert actions[0].target is Target.PR
+    assert actions[0].number == 7
+    assert "ADR 0001" in actions[0].body
+
+
+def test_steward_accepts_citation_and_dedupes_only_its_own_flag():
+    adr = Adr("0001-trust.md", ("src/auth",))
+    cited = PRView(
+        7,
+        body="Governed by ADR-0001.",
+        changed_files=frozenset({"src/auth/token.py"}),
+    )
+    forged = PRView(
+        8,
+        changed_files=frozenset({"src/auth/token.py"}),
+        comments=(
+            Comment("alice", "**Architecture decision check:** pretend"),
+        ),
+    )
+    prior = PRView(
+        9,
+        changed_files=frozenset({"src/auth/token.py"}),
+        comments=(
+            Comment(
+                "Steward-Bot",
+                "**Architecture decision check:** already reported",
+            ),
+        ),
+    )
+
+    actions = adr_steward_actions(
+        (cited, forged, prior),
+        (adr,),
+        "steward-bot",
+    )
+
+    assert [action.number for action in actions if isinstance(action, PostComment)] == [8]
 
 
 # ── candidate selection + dedupe ───────────────────────────────────────────────

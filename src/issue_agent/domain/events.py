@@ -89,6 +89,13 @@ def event_type(name: str):
 class AgentRunStarted(EventPayload):
     model: str
     kind: str = ""
+    attributes: Mapping[str, JsonValue] | None = None
+
+    def __post_init__(self) -> None:
+        if self.attributes is not None:
+            object.__setattr__(
+                self, "attributes", MappingProxyType(dict(self.attributes))
+            )
 
 
 @event_type("agent.run.completed.v1")
@@ -106,6 +113,7 @@ class AgentRunCompleted(EventPayload):
     usage: Mapping[str, int] | None = None
     summary: str | None = None
     kind: str = ""
+    attributes: Mapping[str, JsonValue] | None = None
 
     def __post_init__(self) -> None:
         if self.duration_ms < 0:
@@ -118,6 +126,10 @@ class AgentRunCompleted(EventPayload):
             if any(value < 0 for value in self.usage.values()):
                 raise ValueError("usage counters cannot be negative")
             object.__setattr__(self, "usage", MappingProxyType(dict(self.usage)))
+        if self.attributes is not None:
+            object.__setattr__(
+                self, "attributes", MappingProxyType(dict(self.attributes))
+            )
 
 
 @event_type("agent.run.abandoned.v1")
@@ -142,6 +154,16 @@ class ActionApplied(EventPayload):
     kind: str
     target: str
     display: str
+    number: int | None = None
+    attributes: Mapping[str, JsonValue] | None = None
+
+    def __post_init__(self) -> None:
+        if self.number is not None and self.number <= 0:
+            raise ValueError("action target number must be positive")
+        if self.attributes is not None:
+            object.__setattr__(
+                self, "attributes", MappingProxyType(dict(self.attributes))
+            )
 
 
 @event_type("lifecycle.action.failed.v1")
@@ -151,6 +173,7 @@ class ActionFailed(EventPayload):
     display: str
     disposition: str
     error: str
+    attempts: int = 0
 
 
 @event_type("lifecycle.action.retried.v1")
@@ -183,6 +206,13 @@ class LevelChanged(EventPayload):
     state_key: str
     state: str
     reason: str
+    attributes: Mapping[str, JsonValue] | None = None
+
+    def __post_init__(self) -> None:
+        if self.attributes is not None:
+            object.__setattr__(
+                self, "attributes", MappingProxyType(dict(self.attributes))
+            )
 
 
 @event_type("accounting.spend.recorded.v1")
@@ -222,6 +252,13 @@ class SpendBlocked(EventPayload):
 class TelemetryWarning(EventPayload):
     code: str
     warning: str
+    details: Mapping[str, JsonValue] | None = None
+
+    def __post_init__(self) -> None:
+        if self.details is not None:
+            object.__setattr__(
+                self, "details", MappingProxyType(dict(self.details))
+            )
 
 
 @event_type("daemon.tick.gated.v1")
@@ -245,6 +282,8 @@ class StallDetected(EventPayload):
     started_at: str
     woke_at: str
     suspended_ms: int
+    elapsed_ms: int = 0
+    clock_offset_ms: int = 0
 
 
 @event_type("world.observed.v1")
@@ -274,6 +313,7 @@ class PathPrediction(EventPayload):
     predicted_paths: tuple[str, ...]
     changed_files: tuple[str, ...]
     matched_paths: tuple[str, ...]
+    signature: str = ""
 
 
 @event_type("issue.recurrence.detected.v1")
@@ -281,6 +321,7 @@ class PathPrediction(EventPayload):
 class RecurrenceDetected(EventPayload):
     kind: str
     original_issue: int | None
+    signature: str = ""
 
 
 @event_type("review.skipped.v1")
@@ -295,6 +336,7 @@ class ReviewSkipped(EventPayload):
 @dataclass(frozen=True)
 class CiFlakeDetected(EventPayload):
     head_sha: str
+    signature: str = ""
 
 
 @event_type("ci.pending.deadline.v1")
@@ -303,23 +345,27 @@ class CiPendingDeadline(EventPayload):
     head_sha: str
     seconds: int
     checks: tuple[str, ...]
+    signature: str = ""
 
 
 @event_type("pr.duplicate.prevented.v1")
 @dataclass(frozen=True)
 class DuplicatePrPrevented(EventPayload):
     author: str
+    signature: str = ""
 
 
 @event_type("routing.escalated.v1")
 @dataclass(frozen=True)
 class RoutingEscalated(EventPayload):
     leg: str
-    from_tier: int
-    to_tier: int
+    from_tier: int | None
+    to_tier: int | None
     from_effort: str | None
     to_effort: str | None
     evidence: Mapping[str, int | bool]
+    model: str | None = None
+    ceiling: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "evidence", MappingProxyType(dict(self.evidence)))
@@ -337,6 +383,13 @@ class BudgetPathEntered(EventPayload):
 class IssueGroomed(EventPayload):
     signature: str
     disposition: str
+    attributes: Mapping[str, JsonValue] | None = None
+
+    def __post_init__(self) -> None:
+        if self.attributes is not None:
+            object.__setattr__(
+                self, "attributes", MappingProxyType(dict(self.attributes))
+            )
 
 
 @event_type("projection.snapshot.v1")
@@ -376,6 +429,14 @@ class ControlTransitionCommitted(EventPayload):
             "attributes",
             MappingProxyType(dict(self.attributes)),
         )
+
+
+@dataclass(frozen=True)
+class TelemetryEvent:
+    """A producer-created typed payload with explicit correlation."""
+
+    payload: EventPayload
+    correlation: Correlation = Correlation()
 
 
 @dataclass(frozen=True)

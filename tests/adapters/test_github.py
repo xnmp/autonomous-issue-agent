@@ -515,7 +515,7 @@ def test_review_world_survives_one_failing_pr_fetch():
     assert [p.number for p in w.prs] == [900]  # 374 dropped, 900 survived
 
 
-def test_build_steward_world_includes_open_and_closed_ai_done():
+def test_build_steward_world_includes_open_and_closed_ai_done_and_open_prs():
     # open issue list returns #5; closed-ai-done list returns #9. The world must
     # union them so the final Done transition isn't missed on an already-closed issue.
     def runner(argv, token):
@@ -529,11 +529,24 @@ def test_build_steward_world_includes_open_and_closed_ai_done():
             return json.dumps({"number": 5, "state": "OPEN", "labels": [{"name": "ai-ready"}]})
         if "issue view 9" in key:
             return json.dumps({"number": 9, "state": "CLOSED", "labels": [{"name": "ai-done"}]})
+        if "pr list" in key:
+            return json.dumps([{"number": 12}])
+        if "pr view 12" in key:
+            assert "pr checks" not in key
+            return json.dumps(
+                {
+                    "number": 12,
+                    "state": "OPEN",
+                    "body": "change",
+                    "files": [{"path": "src/auth/token.py"}],
+                }
+            )
         return ""
 
     gw = GitHubGateway("o/r", runner=runner)
     w = gw.build_steward_world()
     assert sorted(i.number for i in w.issues) == [5, 9]
+    assert [pr.number for pr in w.prs] == [12]
 
 
 # ── P0.7: loud warning when a world-building list hits the --limit cap ────────

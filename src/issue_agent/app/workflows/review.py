@@ -11,6 +11,9 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 
 from ...domain import review as review_dom
+from ...domain.events import Correlation, ReviewSkipped, TelemetryEvent
+from ...domain.leg import Leg, LegTarget
+from ...domain.trust import as_untrusted
 from ..planners import tasks as task_builders
 from ..planners.tasks import ReviewTaskConfig
 from ...adapters.runtime_plan import AgentRuntime
@@ -25,7 +28,7 @@ from ...domain.lifecycle import pr_escalation
 from ...domain.outcome import AgentResult
 from ...domain.ports import (
     ActionExecutor,
-    LegacyJournal,
+    EventSink,
     WorkflowGitHubReads,
     WorkflowState,
 )
@@ -52,7 +55,7 @@ class ReviewWorkflowConfig:
     # cwd is a containment failure, never permission to fall back to os.getcwd().
     execution_cwd: str = ""
     prepare_cwd: Callable[[str], None] | None = None
-    journal: LegacyJournal | None = None
+    journal: EventSink | None = None
 
     def __post_init__(self) -> None:
         runtime = (
@@ -149,7 +152,18 @@ class ReviewWorkflow:
             )
         if self.log_run is not None:
             return await self.log_run(label, pr, task)
-        return await run_leg(self.runner, self.cfg.log, label, pr, task)
+        return await run_leg(
+            self.runner,
+            self.cfg.log,
+            Leg(
+                label.upper().replace("-", "_").replace(":", "_"),
+                LegTarget.PR,
+                pr,
+                True,
+                ("global", "repository", "issue"),
+            ),
+            task,
+        )
 
     def _prepare_task(self, task):
         """Install Codex's review governor immediately before each agent leg.
@@ -190,11 +204,19 @@ class ReviewWorkflow:
         signature = review_dom.patch_signature(diff)
         if self.cfg.review_mode is review_dom.ReviewMode.DELEGATED:
             task = task_builders.build_delegated_review_task(
-                pr, p.title, p.body, diff, self.cfg.review
+                pr,
+                as_untrusted(p.title),
+                as_untrusted(p.body),
+                as_untrusted(diff),
+                self.cfg.review,
             )
         else:
             task = task_builders.build_review_task(
-                pr, p.title, p.body, diff, self.cfg.review
+                pr,
+                as_untrusted(p.title),
+                as_untrusted(p.body),
+                as_untrusted(diff),
+                self.cfg.review,
             )
         result = await self._run_logged("review", pr, task)
         if result.is_error:
@@ -252,20 +274,36 @@ class ReviewWorkflow:
                 (r.body for r in reversed(p.reviews) if r.body.strip()), ""
             )
             task = task_builders.build_delegated_re_review_task(
-                pr, round_number, last_sha, p.head_ref_oid, diff,
-                prior_review, self.cfg.review,
+                pr,
+                round_number,
+                last_sha,
+                p.head_ref_oid,
+                as_untrusted(diff),
+                as_untrusted(prior_review),
+                self.cfg.review,
             )
         else:
             session_id = self.store.get_pr_session(pr)
             if session_id in (_EXTERNAL_REVIEW_SESSION, _FRESH_REVIEW_SESSION):
                 prior = review_dom.latest_reviewer_verdict(p, self.cfg.review_bot)
                 task = task_builders.build_fresh_re_review_task(
-                    pr, round_number, p.title, p.body, last_sha, p.head_ref_oid,
-                    diff, prior.body if prior else "", self.cfg.review,
+                    pr,
+                    round_number,
+                    as_untrusted(p.title),
+                    as_untrusted(p.body),
+                    last_sha,
+                    p.head_ref_oid,
+                    as_untrusted(diff),
+                    as_untrusted(prior.body if prior else ""),
+                    self.cfg.review,
                 )
             else:
                 task = task_builders.build_re_review_task(
-                    pr, round_number, last_sha, p.head_ref_oid, diff,
+                    pr,
+                    round_number,
+                    last_sha,
+                    p.head_ref_oid,
+                    as_untrusted(diff),
                     session_id, self.cfg.review,
                 )
         result = await self._run_logged("re-review", pr, task)
@@ -313,11 +351,14 @@ class ReviewWorkflow:
         )
         if self.cfg.journal is not None:
             self.cfg.journal.emit(
-                "review_skip",
-                pr=p.number,
-                reviewer=self.cfg.review_bot,
-                head_sha=p.head_ref_oid,
-                reason="reviewer-verdict-on-head",
+                TelemetryEvent(
+                    ReviewSkipped(
+                        self.cfg.review_bot,
+                        p.head_ref_oid,
+                        "reviewer-verdict-on-head",
+                    ),
+                    Correlation(pr=p.number),
+                )
             )
         return True
 
@@ -419,7 +460,14 @@ class ReviewWorkflow:
 
         # 1. skip-gate — a pure doc/format/config diff short-circuits to APPROVE.
         gate = await self._run_logged("review-gate", pr,
-            task_builders.build_review_gate_task(pr, p.title, p.body, diff, rcfg))
+            task_builders.build_review_gate_task(
+                pr,
+                as_untrusted(p.title),
+                as_untrusted(p.body),
+                as_untrusted(diff),
+                rcfg,
+            ),
+        )
         if gate.is_error:
             # transport failure — leave state untouched, retry next poll (but
             # COUNT the round: the retry is not free, and an is_error gate that
@@ -449,7 +497,15 @@ class ReviewWorkflow:
         dim_results = await self._gather_legs([
             self._run_logged(f"review:{key}", pr,
                 task_builders.build_review_dimension_task(
-                    pr, key, focus, p.title, p.body, diff, rcfg))
+                    pr,
+                    key,
+                    focus,
+                    as_untrusted(p.title),
+                    as_untrusted(p.body),
+                    as_untrusted(diff),
+                    rcfg,
+                )
+            )
             for key, focus in dims
         ])
         complete = True
@@ -472,7 +528,14 @@ class ReviewWorkflow:
             verdicts = await self._gather_legs([
                 self._run_logged(f"validate:{f.dimension}", pr,
                     task_builders.build_review_validation_task(
-                        pr, f.dimension, f.location, f.claim, diff, rcfg))
+                        pr,
+                        f.dimension,
+                        as_untrusted(f.location),
+                        as_untrusted(f.claim),
+                        as_untrusted(diff),
+                        rcfg,
+                    )
+                )
                 for f in candidates
             ])
             validated = []

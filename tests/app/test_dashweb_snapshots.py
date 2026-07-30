@@ -128,13 +128,14 @@ def test_proc_scan_failure_is_reported_not_swallowed(tmp_path):
     assert (live, ok) == ({}, False)
 
 
-def test_repos_payload_falls_back_to_journal_staleness_without_proc():
+def test_repos_payload_reports_unknown_liveness_without_proc():
     dep = build([{"ts": ts(minutes=1), "event": "tick", "role": "fix"}])
     snap = dash.Snapshot("demo", "o/r", "/t", dep, (NOW,))
     payload = snapshots.repos_payload([snap], {}, False, NOW)
-    assert payload["liveness"] == "journal-heuristic"
+    assert payload["liveness"] == "unknown"
     assert payload["warnings"]
-    assert payload["repos"][0]["active"] is True
+    assert payload["repos"][0]["active"] is None
+    assert all(role["alive"] is None for role in payload["repos"][0]["roles"])
 
 
 def test_repos_payload_is_pre_sorted_by_frecency():

@@ -1104,7 +1104,8 @@ class GitHubGateway:
 
     def build_triage_world(self) -> WorldState:
         """All OPEN issues (the steward triages untriaged ones — those carrying no
-        lifecycle label — so it must see every open issue, not just labelled ones)."""
+        lifecycle label — so it must see every open issue, not just labelled ones)
+        plus open PR metadata for the steward's ADR-citation reconciler."""
         nums = self._gh_json(
             ["issue", "list", "--repo", self.repo, "--state", "open",
              "--json", "number", "--limit", str(_LIST_LIMIT)]
@@ -1114,7 +1115,42 @@ class GitHubGateway:
             i for n in sorted(int(x["number"]) for x in nums)
             if (i := self._safe_get_issue(n)) is not None
         )
-        return WorldState(issues=issues, now=build_time())
+        return WorldState(
+            issues=issues,
+            prs=self._open_steward_prs(),
+            now=build_time(),
+        )
+
+    def _open_steward_prs(self) -> tuple[PRView, ...]:
+        """Open PR descriptions/files/comments, without mergeability or checks."""
+
+        rows = self._gh_json(
+            [
+                "pr",
+                "list",
+                "--repo",
+                self.repo,
+                "--state",
+                "open",
+                "--json",
+                "number",
+                "--limit",
+                str(_LIST_LIMIT),
+            ]
+        ) or []
+        _warn_if_list_truncated("gh pr list --state open (steward)", len(rows))
+        return tuple(
+            pr
+            for number in sorted(int(row["number"]) for row in rows)
+            if (
+                pr := self._safe_get_pr(
+                    number,
+                    mergeability=False,
+                    checks=False,
+                )
+            )
+            is not None
+        )
 
     def build_steward_world(self) -> WorldState:
         """Triage world (all open issues) PLUS recently-CLOSED ai-done issues, so
@@ -1139,7 +1175,11 @@ class GitHubGateway:
         issues = tuple(
             i for n in sorted(nums) if (i := self._safe_get_issue(n)) is not None
         )
-        return WorldState(issues=issues, now=build_time())
+        return WorldState(
+            issues=issues,
+            prs=self._open_steward_prs(),
+            now=build_time(),
+        )
 
     def pr_for_issue(self, issue: int) -> int | None:
         """Open PR whose head branch matches ^(feat|fix|chore|refactor)/<issue>-.

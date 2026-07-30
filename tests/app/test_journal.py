@@ -16,12 +16,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from tests.fakes.legacy_journal import Journal
 from issue_agent.adapters.journal import (
-    COST_BLINDSPOT_MIN_RUNS,
-    Journal,
     JournalingRuntime,
     alert,
-    cost_blindspot_warning,
     death_key,
     default_ledger_path,
     events_within,
@@ -38,7 +36,7 @@ from issue_agent.adapters.journal import (
 )
 from issue_agent.adapters.store import Store
 from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
-from issue_agent.app.execute import Executor
+from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.planners.tasks import FixTaskConfig, ReviewTaskConfig
 from issue_agent.domain.actions import AgentKind, Relabel, RunAgent, Target
 from issue_agent.adapters.runtime_plan import AgentRuntime, RuntimePlan
@@ -484,7 +482,9 @@ def test_concurrent_dispatches_keep_task_local_journal_attribution(tmp_path):
             return AgentResult(is_error=False, status="done")
 
     journal = Journal(str(tmp_path / "journal.jsonl"))
-    runtime = JournalingRuntime(YieldingRuntime(), journal, "", "o/r", "fix")
+    runtime = JournalingRuntime(
+        YieldingRuntime(), journal, repo="o/r", role="fix"
+    )
 
     async def dispatch(kind, number):
         runtime.set_context("fix", kind, number, number)
@@ -612,7 +612,11 @@ class FakeInner:
 def _runtime(tmp_path, result, repo="o/r"):
     journal = Journal(str(tmp_path / "journal.jsonl"))
     ledger = str(tmp_path / "spend.jsonl")
-    return JournalingRuntime(FakeInner(result), journal, ledger, repo, "fix"), journal, ledger
+    return (
+        JournalingRuntime(FakeInner(result), journal, repo=repo, role="fix"),
+        journal,
+        ledger,
+    )
 
 
 def _settled(journal_path) -> list[dict]:
@@ -647,9 +651,7 @@ def test_agent_run_records_context_cost_and_usage(tmp_path):
                             "cache_read_input_tokens": 30, "cache_creation_input_tokens": 40}
     assert isinstance(run["duration_s"], float)
 
-    spend = read_events(ledger)[0]
-    assert spend == {**spend, "event": "spend", "repo": "o/r", "issue": 5,
-                     "kind": "RESOLVE", "cost_usd": 1.25}
+    assert read_events(ledger) == [], "legacy spend JSONL is read-only"
 
 
 def test_missing_usage_stays_distinct_from_zero_tokens(tmp_path):
@@ -673,7 +675,9 @@ def test_each_leg_of_a_multi_leg_dispatch_gets_its_own_attributed_line(tmp_path)
     for _ in range(3):
         asyncio.run(rt.run(RuntimePlan(prompt="leg")))
     assert len(_settled(journal.path)) == 3
-    assert sum_issue(ledger, "o/r", 5) == pytest.approx(1.5)
+    assert sum(
+        event["cost_usd"] for event in _settled(journal.path)
+    ) == pytest.approx(1.5)
 
 
 # ── #40: one leg of a dispatch under its own kind ────────────────────────────
@@ -699,17 +703,20 @@ def test_a_leg_kind_keeps_the_dispatch_id_and_the_rest_of_the_context(tmp_path):
     assert all((r["role"], r["number"], r["issue"]) == ("fix", 5, 5) for r in runs)
 
 
-def test_a_renamed_leg_is_still_ledgered(tmp_path):
-    """A router run is real spend — the caps must still see it, under its own
-    bucket."""
-    rt, _, ledger = _runtime(tmp_path, AgentResult(is_error=False, cost_usd=0.07))
+def test_a_renamed_leg_keeps_its_cost_attribution(tmp_path):
+    """A router run remains attributable under its own telemetry bucket."""
+    rt, journal, ledger = _runtime(
+        tmp_path, AgentResult(is_error=False, cost_usd=0.07)
+    )
     rt.set_context("fix", "RESOLVE", 5, 5)
     with rt.leg_kind("ROUTE"):
         asyncio.run(rt.run(RuntimePlan(prompt="classify")))
 
-    spend = read_events(ledger)
-    assert [(s["kind"], s["cost_usd"]) for s in spend] == [("ROUTE", 0.07)]
-    assert sum_issue(ledger, "o/r", 5) == pytest.approx(0.07)
+    assert [
+        (event["kind"], event["cost_usd"])
+        for event in _settled(journal.path)
+    ] == [("ROUTE", 0.07)]
+    assert read_events(ledger) == []
 
 
 def test_a_leg_kind_unwinds_when_the_leg_raises(tmp_path):
@@ -718,7 +725,7 @@ def test_a_leg_kind_unwinds_when_the_leg_raises(tmp_path):
             raise RuntimeError("router transport died")
 
     journal = Journal(str(tmp_path / "journal.jsonl"))
-    rt = JournalingRuntime(Boom(), journal, "", "o/r", "fix")
+    rt = JournalingRuntime(Boom(), journal, repo="o/r", role="fix")
     rt.set_context("fix", "RESOLVE", 5, 5)
     with pytest.raises(RuntimeError):
         with rt.leg_kind("ROUTE"):
@@ -766,7 +773,7 @@ def test_configured_model_precedes_runtime_model_in_every_journal_receipt(tmp_pa
         "agent_run": "opus",
         "telemetry_warning": "opus",
     }
-    assert read_events(ledger)[0]["model"] == "opus"
+    assert read_events(ledger) == []
 
 
 def test_result_is_returned_unchanged_and_inner_still_sees_the_task(tmp_path):
@@ -824,7 +831,7 @@ def test_the_dispatch_is_journalled_before_the_await(tmp_path):
     # that this dispatch ever happened.
     journal = Journal(str(tmp_path / "journal.jsonl"))
     inner = SnoopingInner(journal.path, AgentResult(is_error=False))
-    rt = JournalingRuntime(inner, journal, "", "o/r", "fix")
+    rt = JournalingRuntime(inner, journal, repo="o/r", role="fix")
     rt.set_context("fix", "RESOLVE", 5, 5)
 
     asyncio.run(rt.run(RuntimePlan(prompt="p", model="opus")))
@@ -843,7 +850,9 @@ def test_a_run_that_raises_is_settled_as_a_transport_death_and_re_raises(tmp_pat
     boom = RuntimeError("Stream closed unexpectedly")
     journal = Journal(str(tmp_path / "journal.jsonl"))
     ledger = str(tmp_path / "spend.jsonl")
-    rt = JournalingRuntime(RaisingInner(boom), journal, ledger, "o/r", "fix")
+    rt = JournalingRuntime(
+        RaisingInner(boom), journal, repo="o/r", role="fix"
+    )
     rt.set_context("fix", "RESOLVE", 5, 5)
 
     with pytest.raises(RuntimeError) as raised:
@@ -885,7 +894,9 @@ def test_a_deterministic_death_is_journaled_distinctly_with_the_offending_path(t
     )
     boom.harness_last_trace = "AssistantMessage → Read(evidence/ac-3-titles.png)"
     journal = Journal(str(tmp_path / "journal.jsonl"))
-    rt = JournalingRuntime(RaisingInner(boom), journal, str(tmp_path / "spend.jsonl"), "o/r", "review")
+    rt = JournalingRuntime(
+        RaisingInner(boom), journal, repo="o/r", role="review"
+    )
     rt.set_context("review", "REVIEW", 552, 545)
 
     with pytest.raises(RuntimeError):
@@ -978,7 +989,7 @@ def test_the_wrappers_own_attributes_win_over_the_inners(tmp_path):
         role = "steward"
 
     journal = Journal(str(tmp_path / "j.jsonl"))
-    rt = JournalingRuntime(Shadowing(), journal, "", "o/r", "fix")
+    rt = JournalingRuntime(Shadowing(), journal, repo="o/r", role="fix")
     assert rt.role == "fix" and rt.journal is journal
 
 
@@ -1025,47 +1036,6 @@ def test_an_ordinary_relabel_is_not_an_escalation(tmp_path):
     ex = Executor(FakeGateway(), journal=journal)
     ex.execute(Relabel(Target.ISSUE, 5, Label.AI_WORKING, Label.AI_PR_OPEN))
     assert [e for e in read_events(journal.path) if e["event"] == "escalation"] == []
-
-
-# ── the caps are blind when every run costs $0 (review P1R-5) ────────────────
-def _zero_runs(n, cost=0.0):
-    return [{"ts": _at(NOW), "event": "agent_run", "kind": "RESOLVE",
-             "number": 5, "cost_usd": cost} for _ in range(n)]
-
-
-def test_a_ledger_that_can_never_receive_a_line_is_announced():
-    """`_record` writes a ledger line only when cost > 0 — right, because a
-    $0.00 line is noise in the file both caps scan every dispatch. But a
-    subscription plan reports $0.00 for EVERY run, so the ledger stays empty,
-    both caps read $0.00 forever and neither can fire for any loop shape. The
-    operator has to be told the cap they configured is inert."""
-    warning = cost_blindspot_warning(
-        _zero_runs(COST_BLINDSPOT_MIN_RUNS),
-        issue_spend_cap_usd=25.0, daily_spend_cap_usd=50.0,
-    )
-    assert warning is not None
-    assert "$25.00" in warning and "$50.00" in warning
-    assert "$0.00" in warning and "NEITHER cap can ever fire" in warning
-
-
-def test_one_costed_run_proves_the_ledger_works_and_silences_the_warning():
-    """Anti-vacuity twin: on a metered plan this must say nothing at all, or it
-    becomes the permanently-on line operators learn to scroll past."""
-    runs = _zero_runs(COST_BLINDSPOT_MIN_RUNS) + _zero_runs(1, cost=0.42)
-    assert cost_blindspot_warning(
-        runs, issue_spend_cap_usd=25.0, daily_spend_cap_usd=50.0) is None
-
-
-def test_no_armed_cap_means_nothing_to_be_blind_about():
-    assert cost_blindspot_warning(
-        _zero_runs(50), issue_spend_cap_usd=0.0, daily_spend_cap_usd=0.0) is None
-
-
-def test_too_few_runs_is_not_yet_evidence():
-    """One free run is a session that died before billing, not a blind cap."""
-    assert cost_blindspot_warning(
-        _zero_runs(COST_BLINDSPOT_MIN_RUNS - 1),
-        issue_spend_cap_usd=25.0, daily_spend_cap_usd=50.0) is None
 
 
 def test_spend_blocked_keys_reads_only_keyed_blocks():
@@ -1121,7 +1091,7 @@ def test_dispatcher_tags_the_runtime_with_the_dispatch_context(tmp_path):
     ledger = str(tmp_path / "spend.jsonl")
     journal = Journal(str(tmp_path / "j.jsonl"))
     inner = FakeInner(AgentResult(is_error=False, status="pushed", cost_usd=0.5))
-    runtime = JournalingRuntime(inner, journal, ledger, "o/r", "fix")
+    runtime = JournalingRuntime(inner, journal, repo="o/r", role="fix")
     gw = FakeGateway(
         issues={5: IssueView(5, title="t", body="b")},
         prs={100: PRView(100)},
@@ -1152,7 +1122,8 @@ def test_dispatcher_tags_the_runtime_with_the_dispatch_context(tmp_path):
 
     run = [e for e in read_events(journal.path) if e["event"] == "agent_run"][0]
     assert (run["role"], run["kind"], run["number"], run["issue"]) == ("fix", "FIX_CI", 100, 5)
-    assert read_events(ledger)[0]["issue"] == 5
+    assert run["issue"] == 5
+    assert read_events(ledger) == []
 
 
 # ── Daemon: GhUnavailable is a countable event ────────────────────────────────

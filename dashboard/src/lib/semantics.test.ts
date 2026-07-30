@@ -3,6 +3,7 @@ import {
   combinedVerificationStatus,
   kindLabel,
   modelTone,
+  roleHealth,
   stageTone,
 } from "./semantics";
 
@@ -50,5 +51,19 @@ describe("dashboard semantics", () => {
     ["claude-opus-5", "xhigh", "tier-high"],
   ])("colors %s at %s by capability tier", (model, effort, tone) => {
     expect(modelTone(model, effort)).toBe(tone);
+  });
+
+  it("keeps unavailable process liveness distinct from dead", () => {
+    expect(
+      roleHealth({
+        role: "fix",
+        alive: null,
+        stale: false,
+        last_event_ts: null,
+        last_event: null,
+        events: 1,
+        log_path: null,
+      }),
+    ).toBe("unknown");
   });
 });

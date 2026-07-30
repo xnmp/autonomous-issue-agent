@@ -1731,8 +1731,15 @@
         "additionalProperties": true,
         "properties": {
           "active": {
-            "title": "Active",
-            "type": "boolean"
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Active"
           },
           "done": {
             "title": "Done",
@@ -1839,8 +1846,15 @@
         "additionalProperties": true,
         "properties": {
           "alive": {
-            "title": "Alive",
-            "type": "boolean"
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Alive"
           },
           "events": {
             "title": "Events",
