@@ -61,15 +61,16 @@ describe("IssuesTab", () => {
           done: [doneCard],
           backlog: [],
           gh_ok: true,
+          notifications: [],
           warnings: [],
         })}
-        onSetSub={vi.fn()}
         onOpenIssue={onOpenIssue}
       />,
     );
 
     expect(screen.queryByRole("columnheader", { name: "Rounds" })).not.toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: /Verification/ })).toBeVisible();
+    expect(screen.getByRole("columnheader", { name: /Date/ })).toBeVisible();
     const verification = screen.getByRole("cell", { name: "pending" });
     expect(verification).toBeVisible();
     expect(screen.getByText("pending", { exact: true })).toHaveAttribute(
@@ -87,6 +88,29 @@ describe("IssuesTab", () => {
     fireEvent.contextMenu(screen.getByRole("columnheader", { name: /Issue \/ PR/ }));
     await userEvent.click(screen.getByRole("checkbox", { name: "Rounds" }));
     expect(screen.getByRole("columnheader", { name: /Rounds/ })).toBeVisible();
+  });
+
+  it("uses clock durations and can omit seconds", () => {
+    render(
+      <IssuesTab
+        repo="demo"
+        sub="done"
+        issues={polled({
+          in_flight: [],
+          pending: [],
+          done: [{ ...doneCard, working_s: 4_638, idle_s: 62 }],
+          backlog: [],
+          gh_ok: true,
+          notifications: [],
+          warnings: [],
+        })}
+        onOpenIssue={vi.fn()}
+        showDurationSeconds={false}
+      />,
+    );
+
+    expect(screen.getByText("1:17")).toBeVisible();
+    expect(screen.getByText("1m")).toBeVisible();
   });
 
   it("expands formatted backlog context and keeps noisy columns disabled by default", async () => {
@@ -108,17 +132,25 @@ describe("IssuesTab", () => {
             recurrence_count: 2,
             age_days: 1,
             comments: 7,
+            issue_type: "bug",
+            difficulty: "medium",
+            impact: "high",
           }],
           gh_ok: true,
+          notifications: [],
           warnings: [],
         })}
-        onSetSub={vi.fn()}
         onOpenIssue={vi.fn()}
       />,
     );
 
     expect(screen.queryByRole("columnheader", { name: "Recurrence" })).not.toBeInTheDocument();
     expect(screen.queryByRole("columnheader", { name: "# comments" })).not.toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: /Type/ })).toBeVisible();
+    expect(screen.getByRole("columnheader", { name: /Difficulty/ })).toBeVisible();
+    expect(screen.getByRole("columnheader", { name: /Impact/ })).toBeVisible();
+    expect(screen.getByText("medium")).toBeVisible();
+    expect(screen.getByText("high")).toBeVisible();
     expect(screen.getByText("The incident came back")).toHaveClass("recurrence-2");
 
     await userEvent.click(screen.getByRole("row", { name: /The incident came back/ }));
@@ -151,9 +183,9 @@ describe("IssuesTab", () => {
             comments: 0,
           }],
           gh_ok: true,
+          notifications: [],
           warnings: [],
         })}
-        onSetSub={vi.fn()}
         onOpenIssue={vi.fn()}
       />,
     );

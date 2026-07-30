@@ -39,6 +39,24 @@ describe("ResizableTable", () => {
     expect(container.querySelector("col")).toHaveStyle({ width: "168px" });
   });
 
+  it("supports a narrower floor for compact data columns", async () => {
+    const { container } = render(
+      <ResizableTable
+        storageKey="compact-table"
+        columns={[{ key: "cost", label: "Cost", width: 92, minWidth: 72 }]}
+      >
+        <tbody><tr><td>$1.00</td></tr></tbody>
+      </ResizableTable>,
+    );
+
+    const separator = screen.getByRole("separator", { name: "Resize Cost column" });
+    separator.focus();
+    await userEvent.keyboard("{ArrowLeft}{ArrowLeft}");
+
+    expect(separator).toHaveAttribute("aria-valuemin", "72");
+    expect(container.querySelector("col")).toHaveStyle({ width: "72px" });
+  });
+
   it("tracks pointer movement in both resize directions", () => {
     const { container } = render(
       <ResizableTable
@@ -55,6 +73,106 @@ describe("ResizableTable", () => {
     fireEvent(window, new MouseEvent("pointerup", { bubbles: true }));
 
     expect(container.querySelector("col")).toHaveStyle({ width: "120px" });
+  });
+
+  it("rearranges headers and their cells with drag or keyboard controls", () => {
+    render(
+      <ResizableTable
+        storageKey="reorder-table"
+        columns={[
+          { key: "issue", label: "Issue", width: 180 },
+          { key: "status", label: "Status", width: 140 },
+          { key: "cost", label: "Cost", width: 120 },
+        ]}
+      >
+        <tbody>
+          <tr>
+            <td>#20</td>
+            <td>done</td>
+            <td>$1.20</td>
+          </tr>
+        </tbody>
+      </ResizableTable>,
+    );
+
+    const headers = () => screen.getAllByRole("columnheader");
+    const headerAt = (index: number) => {
+      const header = headers()[index];
+      expect(header).toBeDefined();
+      return header!;
+    };
+    const cells = () => screen.getAllByRole("cell").map((cell) => cell.textContent);
+    fireEvent.dragStart(headerAt(0));
+    fireEvent.dragOver(headerAt(2));
+    fireEvent.drop(headerAt(2));
+    fireEvent.dragEnd(headerAt(0));
+
+    expect(headers().map((header) => header.dataset.columnKey)).toEqual(["status", "cost", "issue"]);
+    expect(cells()).toEqual(["done", "$1.20", "#20"]);
+
+    fireEvent.keyDown(headerAt(2), { key: "ArrowLeft", altKey: true });
+    expect(headers().map((header) => header.dataset.columnKey)).toEqual(["status", "issue", "cost"]);
+    expect(cells()).toEqual(["done", "#20", "$1.20"]);
+  });
+
+  it("does not reorder or resize when Alt+Arrow is pressed on a resize handle", () => {
+    const { container } = render(
+      <ResizableTable
+        storageKey="resize-not-reorder"
+        columns={[
+          { key: "issue", label: "Issue", width: 180 },
+          { key: "cost", label: "Cost", width: 120 },
+        ]}
+      >
+        <tbody><tr><td>#20</td><td>$1.20</td></tr></tbody>
+      </ResizableTable>,
+    );
+
+    fireEvent.keyDown(
+      screen.getByRole("separator", { name: "Resize Cost column" }),
+      { key: "ArrowLeft", altKey: true },
+    );
+
+    expect(screen.getAllByRole("columnheader").map((header) => header.dataset.columnKey))
+      .toEqual(["issue", "cost"]);
+    expect(container.querySelectorAll("col")[1]).toHaveStyle({ width: "120px" });
+  });
+
+  it("preserves hidden columns in their saved order while visible columns move", () => {
+    const allColumns = [
+      { key: "issue", label: "Issue", width: 180 },
+      { key: "status", label: "Status", width: 140 },
+      { key: "cost", label: "Cost", width: 120 },
+    ];
+    const { rerender } = render(
+      <ResizableTable storageKey="hidden-order" columns={allColumns}>
+        <tbody><tr><td>#20</td><td>done</td><td>$1.20</td></tr></tbody>
+      </ResizableTable>,
+    );
+    fireEvent.keyDown(screen.getAllByRole("columnheader")[1]!, {
+      key: "ArrowLeft",
+      altKey: true,
+    });
+
+    rerender(
+      <ResizableTable storageKey="hidden-order" columns={[allColumns[0]!, allColumns[2]!]}>
+        <tbody><tr><td>#20</td><td>$1.20</td></tr></tbody>
+      </ResizableTable>,
+    );
+    fireEvent.keyDown(screen.getAllByRole("columnheader")[1]!, {
+      key: "ArrowLeft",
+      altKey: true,
+    });
+
+    rerender(
+      <ResizableTable storageKey="hidden-order" columns={allColumns}>
+        <tbody><tr><td>#20</td><td>done</td><td>$1.20</td></tr></tbody>
+      </ResizableTable>,
+    );
+    expect(screen.getAllByRole("columnheader").map((header) => header.dataset.columnKey))
+      .toEqual(["status", "cost", "issue"]);
+    expect(screen.getAllByRole("cell").map((cell) => cell.textContent))
+      .toEqual(["done", "$1.20", "#20"]);
   });
 
   it("sorts rows in both directions from an accessible header button", async () => {
