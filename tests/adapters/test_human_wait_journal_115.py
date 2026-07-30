@@ -87,6 +87,64 @@ def test_unreadable_blocked_issue_does_not_create_a_false_clear(tmp_path):
     assert [event["state"] for event in human_events] == ["waiting"]
 
 
+def test_unlabelled_issue_clears_after_authoritative_manual_recovery_read(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    journal.emit(
+        "deferred",
+        state="waiting",
+        issue=5,
+        reason="human",
+        blocker="human",
+    )
+    probed = []
+    report = _hold_reporter(
+        journal,
+        "o/r",
+        lambda _message: None,
+        issue_is_blocked=lambda issue: probed.append(issue) or False,
+    )
+
+    report(WorldState())
+
+    human_events = [
+        event
+        for event in _holds_in(journal)
+        if event.get("reason") == "human"
+    ]
+    assert probed == [5]
+    assert [event["state"] for event in human_events] == ["waiting", "cleared"]
+
+
+def test_failed_authoritative_read_preserves_absent_human_wait(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    journal.emit(
+        "deferred",
+        state="waiting",
+        issue=5,
+        reason="human",
+        blocker="human",
+    )
+    logs = []
+
+    def unreadable(_issue):
+        raise RuntimeError("temporary read failure")
+
+    _hold_reporter(
+        journal,
+        "o/r",
+        logs.append,
+        issue_is_blocked=unreadable,
+    )(WorldState())
+
+    human_events = [
+        event
+        for event in _holds_in(journal)
+        if event.get("reason") == "human"
+    ]
+    assert [event["state"] for event in human_events] == ["waiting"]
+    assert logs == ["issue #5 human-wait probe failed: temporary read failure"]
+
+
 def test_live_reporter_observes_executor_wait_written_between_polls(tmp_path):
     journal = Journal(str(tmp_path / "journal.jsonl"))
     report = _hold_reporter(journal, "o/r", lambda _message: None)

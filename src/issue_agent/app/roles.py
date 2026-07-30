@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import Callable
 from dataclasses import replace
 from functools import partial
 
@@ -410,7 +411,12 @@ def _fix_state(store: Store, world) -> FixState:
     )
 
 
-def _hold_reporter(journal: Journal | None, repo: str, log):
+def _hold_reporter(
+    journal: Journal | None,
+    repo: str,
+    log,
+    issue_is_blocked: Callable[[int], bool] | None = None,
+):
     """Report defer begin/clear transitions without steady-state tick noise.
 
     `pick_ready_issue` skips an ai-ready issue whose files overlap an in-flight
@@ -497,11 +503,20 @@ def _hold_reporter(journal: Journal | None, repo: str, log):
             if issue.has(Label.AI_BLOCKED)
         })
         observed_issue_numbers = {issue.number for issue in world.issues}
-        current.update({
-            key: event
-            for key, event in active.items()
-            if key[1] == "human" and key[0] not in observed_issue_numbers
-        })
+        for key, event in active.items():
+            if key[1] != "human" or key[0] in observed_issue_numbers:
+                continue
+            if issue_is_blocked is None:
+                current[key] = event
+                continue
+            try:
+                still_blocked = issue_is_blocked(key[0])
+            except Exception as exc:  # noqa: BLE001 - unread is not an unblock
+                log(f"issue #{key[0]} human-wait probe failed: {exc}")
+                current[key] = event
+            else:
+                if still_blocked:
+                    current[key] = event
         for key in current.keys() - active.keys():
             message = waiting_label(key)
             log(f"DEFERRED: {message}; dispatches once that clears")
@@ -873,7 +888,14 @@ def build_fix_daemon(
     )
     executor._run_agent = lambda a: asyncio.run(dispatcher.dispatch(a))  # noqa: SLF001
 
-    report_holds = _hold_reporter(journal, cfg.repo, _log("fix"))
+    report_holds = _hold_reporter(
+        journal,
+        cfg.repo,
+        _log("fix"),
+        issue_is_blocked=lambda issue: gateway.get_issue(issue).has(
+            Label.AI_BLOCKED
+        ),
+    )
     report_prediction_outcomes = _prediction_outcome_reporter(
         journal, cfg.repo, store, _log("fix")
     )
