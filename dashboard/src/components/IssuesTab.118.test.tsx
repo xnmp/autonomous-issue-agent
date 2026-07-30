@@ -68,4 +68,41 @@ describe("human-owned actions", () => {
     expect(screen.getByText(/merge ready · 5m/)).toBeVisible();
     expect(screen.queryByRole("button", { name: /merge/i })).not.toBeInTheDocument();
   });
+
+  it("alerts on a blocked row and renders its blocked leg as a failure", () => {
+    const blocked: IssueCard = {
+      ...card,
+      stage: "blocked",
+      human_action: null,
+      human_wait_since_ts: null,
+      human_wait_s: null,
+      flags: ["blocked"],
+      steps: [{
+        kind: "ADDRESS_REVIEW",
+        state: "blocked",
+        status: "blocked",
+        cost_usd: 2,
+      }],
+    };
+
+    const { container } = render(
+      <IssuesTab
+        repo="demo"
+        sub="inflight"
+        issues={polled({
+          in_flight: [blocked],
+          pending: [],
+          done: [],
+          backlog: [],
+          gh_ok: true,
+          notifications: [],
+          warnings: [],
+        })}
+        onOpenIssue={vi.fn()}
+      />,
+    );
+
+    expect(container.querySelector("tbody > tr")).toHaveClass("row-alert");
+    expect(screen.getByTitle(/ADDRESS_REVIEW · blocked · blocked/)).toHaveClass("chip-fail");
+  });
 });

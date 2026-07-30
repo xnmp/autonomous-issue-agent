@@ -286,7 +286,9 @@ function InFlightTable({
               ? null
               : card.idle_s + (card.idle_active ? offset : 0);
             const open = expanded === card.issue;
-            const alert = card.flags.some((flag) => flag === "escalated" || flag === "spend-blocked");
+            const alert = card.flags.some(
+              (flag) => flag === "escalated" || flag === "spend-blocked" || flag === "blocked",
+            );
             return (
               <Fragment key={card.issue}>
                 <tr

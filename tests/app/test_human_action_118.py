@@ -213,3 +213,21 @@ def test_malformed_comment_author_does_not_break_human_action_projection():
     assert snapshots.issue_card(
         row_for([RESOLVE], 7), NOW, gh_issue=issue
     )["human_action"] == "awaiting-reply"
+
+
+def test_cleanly_blocked_leg_flags_the_row_and_is_not_a_successful_step():
+    blocked = {
+        "ts": ts(minutes=20),
+        "event": "agent_run",
+        "role": "fix",
+        "kind": "ADDRESS_REVIEW",
+        "number": 90,
+        "issue": 7,
+        "status": "blocked",
+        "exit_reason": "ok",
+    }
+
+    card = snapshots.issue_card(row_for([RESOLVE, blocked], 7), NOW)
+
+    assert "blocked" in card["flags"]
+    assert card["steps"][-1]["state"] == "blocked"

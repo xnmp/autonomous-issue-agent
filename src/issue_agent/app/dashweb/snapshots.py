@@ -127,7 +127,9 @@ def leg_state(leg: dash.Leg) -> str:
     """A settled leg is `failed` when it exited for any reason other than a
     clean finish. `status` is the AGENT's claim; `exit_reason` is the
     envelope's, and only the envelope can see a run that died."""
-    return "failed" if leg.exit_reason not in ("", "ok") else "ok"
+    if leg.exit_reason not in ("", "ok"):
+        return "failed"
+    return "blocked" if leg.status.lower() == "blocked" else "ok"
 
 
 def collapse_steps(row: dash.IssueRow) -> list[dict]:
@@ -534,6 +536,13 @@ def _flags(row: dash.IssueRow, human_action: str | None = None) -> list[str]:
         flags.append("recurred")
     if row.spend_blocks:
         flags.append("spend-blocked")
+    newest_leg_blocked = (
+        bool(row.legs)
+        and row.legs[-1].status.lower() == "blocked"
+        and row.stage == "awaiting review"
+    )
+    if row.stage == "blocked" or newest_leg_blocked:
+        flags.append("blocked")
     if _deferred_event(row):
         flags.append("waiting")
     if human_action:
