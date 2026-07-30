@@ -424,7 +424,14 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
     if not tests_result.ok:
         return [tests_result.reason]
 
-    new_tests, impl = gate.partition_changed(ctx.changed_files, ctx.exists_at_base)
+    declarations, _ = gate.parse_test_immutability_exceptions(
+        ctx.test_immutability_exceptions
+    )
+    new_tests, impl = gate.partition_changed(
+        ctx.changed_files,
+        ctx.exists_at_base,
+        (declaration.path for declaration in declarations),
+    )
     red_fail_result = gate.check_red_fails(
         gate.RedFailInputs(
             test_cmd=test_cmd,

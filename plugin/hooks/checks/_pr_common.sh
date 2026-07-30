@@ -246,6 +246,8 @@ prc_check_tests_immutable() {  # prc_check_tests_immutable "<changed-file-list>"
   seen=""
 
   if [ -n "$manifest" ]; then
+    printf '%s\n' "$1" | grep -qxF '.harness/test-immutability-exceptions' \
+      || fail "test-immutability exceptions must be committed in '.harness/test-immutability-exceptions'"
     while IFS= read -r line; do
       pipes=$(printf '%s' "$line" | tr -cd '|' | wc -c | tr -d ' ')
       [ "$pipes" = "3" ] \
@@ -353,11 +355,18 @@ prc_check_red_fails() {  # prc_check_red_fails "<changed-file-list>"
   [ -n "$baseref" ] || { echo "red-check: cannot resolve base '$base' — skipping (fail-open)" >&2; return 0; }
 
   # Partition changed files: new tests (keep at HEAD) vs implementation (revert).
-  local f new_tests=() impl_existing=() impl_all=()
+  local f new_tests=() impl_existing=() impl_all=() declared_test
+  local exception_manifest
+  exception_manifest=$(cat .harness/test-immutability-exceptions 2>/dev/null || true)
   while IFS= read -r f; do
     [ -n "$f" ] || continue
+    declared_test=""
+    while IFS= read -r line; do
+      IFS='|' read -r decl_issue decl_file decl_reason decl_replacement extra <<< "$line"
+      [ "$(prc_trim "$decl_file")" = "$f" ] && declared_test=1
+    done <<< "$exception_manifest"
     if printf '%s' "$f" | grep -qE "$PR_TEST_FILE_RE" \
-       && ! git cat-file -e "$baseref:$f" 2>/dev/null; then
+       && { [ -n "$declared_test" ] || ! git cat-file -e "$baseref:$f" 2>/dev/null; }; then
       new_tests+=("$f"); continue          # a NEW test file → keep it at HEAD
     fi
     impl_all+=("$f")                         # implementation (or non-test change)

@@ -472,6 +472,11 @@ def check_tests_immutable(
     declarations, parse_error = parse_test_immutability_exceptions(exception_manifest)
     if parse_error:
         return deny(parse_error)
+    if declarations and TEST_IMMUTABILITY_EXCEPTIONS not in changed_files:
+        return deny(
+            "test-immutability exceptions must be committed in "
+            f"'{TEST_IMMUTABILITY_EXCEPTIONS}'"
+        )
     by_path = {declaration.path: declaration for declaration in declarations}
     existing_tests = {
         path for path in changed_files if looks_like_test(path) and exists_at_base(path)
@@ -951,17 +956,18 @@ class RedFailInputs:
 
 
 def partition_changed(
-    changed: Iterable[str], exists_at_base: Callable[[str], bool]
+    changed: Iterable[str],
+    exists_at_base: Callable[[str], bool],
+    declared_test_paths: Iterable[str] = (),
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Split a changed-file list into (new_test_files, impl_files), the partition
-    §10 needs: a NEW test file is one that looks like a test AND did not exist at
-    base; everything else is implementation (or a non-test change)."""
+    """Split red-producing tests from files reverted for the §10 simulation."""
+    declared = set(declared_test_paths)
     new_tests: list[str] = []
     impl: list[str] = []
     for f in changed:
         if not f:
             continue
-        if looks_like_test(f) and not exists_at_base(f):
+        if looks_like_test(f) and (not exists_at_base(f) or f in declared):
             new_tests.append(f)
         else:
             impl.append(f)

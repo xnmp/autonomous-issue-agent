@@ -4,6 +4,7 @@ from issue_agent.domain.gate import (
     OpenPrLookup,
     PushGateMode,
     RedFailInputs,
+    TEST_IMMUTABILITY_EXCEPTIONS,
     check_adversarial_verdict,
     check_branch_name,
     check_commit_log,
@@ -300,7 +301,7 @@ def test_existing_test_must_not_change():
 
 
 def test_existing_test_can_change_with_matching_issue_scoped_exception():
-    changed = ["tests/test_app.py"]
+    changed = ["tests/test_app.py", TEST_IMMUTABILITY_EXCEPTIONS]
     manifest = (
         "124 | tests/test_app.py | old expectation encodes the pricing bug | \n"
     )
@@ -317,7 +318,7 @@ def test_existing_test_can_change_with_matching_issue_scoped_exception():
 
 
 def test_existing_test_exception_fails_closed_when_absent_mismatched_or_malformed():
-    changed = ["tests/test_app.py"]
+    changed = ["tests/test_app.py", TEST_IMMUTABILITY_EXCEPTIONS]
     exists_at_base = lambda path: path == "tests/test_app.py"
     exists_now = lambda path: path == "tests/test_app.py"
 
@@ -349,7 +350,7 @@ def test_existing_test_exception_fails_closed_when_absent_mismatched_or_malforme
 
 def test_existing_test_exception_must_match_the_current_branch_issue():
     result = check_tests_immutable(
-        ["tests/test_app.py"],
+        ["tests/test_app.py", TEST_IMMUTABILITY_EXCEPTIONS],
         lambda _path: True,
         exists_now=lambda _path: True,
         issue_number=125,
@@ -367,7 +368,11 @@ def test_deleted_existing_test_requires_a_new_changed_replacement_test():
         "124 | tests/test_app.py | obsolete expectation moved to focused coverage "
         "| tests/test_app_regression.py\n"
     )
-    changed = ["tests/test_app.py", "tests/test_app_regression.py"]
+    changed = [
+        "tests/test_app.py",
+        "tests/test_app_regression.py",
+        TEST_IMMUTABILITY_EXCEPTIONS,
+    ]
     exists_at_base = lambda path: path == "tests/test_app.py"
 
     allowed = check_tests_immutable(
@@ -378,7 +383,7 @@ def test_deleted_existing_test_requires_a_new_changed_replacement_test():
         exception_manifest=manifest,
     )
     denied_without_replacement = check_tests_immutable(
-        ["tests/test_app.py"],
+        ["tests/test_app.py", TEST_IMMUTABILITY_EXCEPTIONS],
         exists_at_base,
         exists_now=lambda _path: False,
         issue_number=124,
@@ -393,7 +398,7 @@ def test_deleted_existing_test_requires_a_new_changed_replacement_test():
 
 
 def test_deleted_existing_test_rejects_unchanged_or_non_test_replacement():
-    changed = ["tests/test_app.py", "src/app.py"]
+    changed = ["tests/test_app.py", "src/app.py", TEST_IMMUTABILITY_EXCEPTIONS]
     exists_at_base = lambda path: path in {"tests/test_app.py", "tests/test_old.py"}
     exists_now = lambda path: path in {"tests/test_old.py", "src/app.py"}
 
@@ -495,6 +500,17 @@ def test_partition_splits_new_tests_from_impl():
     )
     assert new_tests == ("tests/test_new.py",)
     assert impl == ("src/app.py",)
+
+
+def test_partition_keeps_declared_corrected_test_when_implementation_is_reverted():
+    new_tests, impl = partition_changed(
+        ["src/app.py", "tests/test_existing.py", TEST_IMMUTABILITY_EXCEPTIONS],
+        lambda path: path in {"src/app.py", "tests/test_existing.py"},
+        declared_test_paths=("tests/test_existing.py",),
+    )
+
+    assert new_tests == ("tests/test_existing.py",)
+    assert impl == ("src/app.py", TEST_IMMUTABILITY_EXCEPTIONS)
 
 
 def test_red_fail_blocks_tautological_test():
