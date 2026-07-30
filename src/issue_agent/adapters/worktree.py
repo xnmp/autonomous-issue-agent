@@ -23,7 +23,11 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from ..domain.gate import OpenPrLookup, resolve_test_cmd
+from ..domain.gate import (
+    TEST_IMMUTABILITY_EXCEPTIONS,
+    OpenPrLookup,
+    resolve_test_cmd,
+)
 from .governor import GateContext, run_target_command
 from .store import HarnessMarkers
 
@@ -427,6 +431,9 @@ def build_gate_context(
         changed = tuple(f for f in diff.out.splitlines() if f)
 
     markers = HarnessMarkers(cwd)
+    committed_exceptions = git(
+        ["show", f"HEAD:{TEST_IMMUTABILITY_EXCEPTIONS}"], cwd
+    )
 
     def open_pr(target_branch: str) -> OpenPrLookup:
         """Resolved ONLY when the governor actually gates a push (see
@@ -508,7 +515,9 @@ def build_gate_context(
         ac_posted=markers.ac_posted(),
         test_plan_posted=markers.test_plan_posted(),
         adversarial_verdict=markers.adversarial_verdict(),
-        test_immutability_exceptions=markers.test_immutability_exceptions(),
+        test_immutability_exceptions=(
+            committed_exceptions.out if committed_exceptions.code == 0 else ""
+        ),
         visual_ac=markers.visual_ac(),
         screenshots_read=markers.screenshots_read(),
         harness_test_cmd=markers.test_cmd(),

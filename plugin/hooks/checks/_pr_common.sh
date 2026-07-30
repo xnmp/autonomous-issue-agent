@@ -241,7 +241,7 @@ prc_valid_test_path() {
 prc_check_tests_immutable() {  # prc_check_tests_immutable "<changed-file-list>"
   local f manifest line pipes decl_issue decl_file decl_reason decl_replacement
   local extra issue_number seen matched replacement
-  manifest=$(cat .harness/test-immutability-exceptions 2>/dev/null || true)
+  manifest=$(git show HEAD:.harness/test-immutability-exceptions 2>/dev/null || true)
   issue_number=$(printf '%s' "$branch" | sed -nE 's#^(feat|fix|chore|refactor)/([0-9]+)-.*#\2#p')
   seen=""
 
@@ -357,7 +357,7 @@ prc_check_red_fails() {  # prc_check_red_fails "<changed-file-list>"
   # Partition changed files: new tests (keep at HEAD) vs implementation (revert).
   local f new_tests=() impl_existing=() impl_all=() declared_test
   local exception_manifest
-  exception_manifest=$(cat .harness/test-immutability-exceptions 2>/dev/null || true)
+  exception_manifest=$(git show HEAD:.harness/test-immutability-exceptions 2>/dev/null || true)
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     declared_test=""
