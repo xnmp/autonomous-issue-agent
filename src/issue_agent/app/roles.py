@@ -569,7 +569,12 @@ def _fix_state(
     )
 
 
-def _hold_reporter(journal: Journal | None, repo: str, log):
+def _hold_reporter(
+    journal: Journal | None,
+    repo: str,
+    log,
+    issue_is_blocked: Callable[[int], bool] | None = None,
+):
     """Report defer begin/clear transitions without steady-state tick noise.
 
     `pick_ready_issue` skips an ai-ready issue whose files overlap an in-flight
@@ -589,6 +594,12 @@ def _hold_reporter(journal: Journal | None, repo: str, log):
 
     def fields_for(key):
         issue, reason, blocker_pr, blocker_issue = key
+        if reason == "human":
+            return {
+                "issue": issue,
+                "reason": reason,
+                "blocker": "human",
+            }
         return {
             "issue": issue,
             "reason": reason,
@@ -597,7 +608,9 @@ def _hold_reporter(journal: Journal | None, repo: str, log):
         }
 
     def waiting_label(key) -> str:
-        issue, _reason, blocker_pr, blocker_issue = key
+        issue, reason, blocker_pr, blocker_issue = key
+        if reason == "human":
+            return f"issue #{issue} waiting on human input"
         if blocker_pr is not None:
             return f"issue #{issue} waiting on PR #{blocker_pr}"
         if blocker_issue is not None:
@@ -625,21 +638,45 @@ def _hold_reporter(journal: Journal | None, repo: str, log):
         nonlocal active
         if active is None:
             active = {}
-            if journal is not None:
-                for event in read_events_tail(journal.path):
-                    if event.get("event") not in {"deferred", "hold"}:
-                        continue
-                    key = event_key(event)
-                    if key is None:
-                        continue
-                    if event.get("state") == "cleared":
-                        active.pop(key, None)
-                    elif event.get("state") == "waiting" or event.get("event") == "hold":
-                        active[key] = event
+        if journal is not None:
+            # Executor-owned human edges can land between polls. Replaying the
+            # durable edge log keeps this reporter synchronized across both
+            # daemon restarts and in-process writers.
+            active = {}
+            for event in read_events_tail(journal.path):
+                if event.get("event") not in {"deferred", "hold"}:
+                    continue
+                key = event_key(event)
+                if key is None:
+                    continue
+                if event.get("state") == "cleared":
+                    active.pop(key, None)
+                elif event.get("state") == "waiting" or event.get("event") == "hold":
+                    active[key] = event
 
         current = {
             key_for(hold): hold for hold in issue_holds(world, tuple(inflight))
         }
+        current.update({
+            (issue.number, "human", None, None): issue
+            for issue in world.open_issues()
+            if issue.has(Label.AI_BLOCKED)
+        })
+        observed_issue_numbers = {issue.number for issue in world.issues}
+        for key, event in active.items():
+            if key[1] != "human" or key[0] in observed_issue_numbers:
+                continue
+            if issue_is_blocked is None:
+                current[key] = event
+                continue
+            try:
+                still_blocked = issue_is_blocked(key[0])
+            except Exception as exc:  # noqa: BLE001 - unread is not an unblock
+                log(f"issue #{key[0]} human-wait probe failed: {exc}")
+                current[key] = event
+            else:
+                if still_blocked:
+                    current[key] = event
         for key in current.keys() - active.keys():
             message = waiting_label(key)
             log(f"DEFERRED: {message}; dispatches once that clears")
@@ -1017,7 +1054,14 @@ def build_fix_daemon(
     )
     executor._run_agent = dispatch_runtime  # noqa: SLF001
 
-    report_holds = _hold_reporter(journal, cfg.repo, _log("fix"))
+    report_holds = _hold_reporter(
+        journal,
+        cfg.repo,
+        _log("fix"),
+        issue_is_blocked=lambda issue: gateway.get_issue(issue).has(
+            Label.AI_BLOCKED
+        ),
+    )
     report_prediction_outcomes = _prediction_outcome_reporter(
         journal, cfg.repo, store, _log("fix")
     )

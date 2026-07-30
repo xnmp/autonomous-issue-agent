@@ -919,7 +919,7 @@ function DurationBreakdown({
       <span title="time actively progressing through harness work">
         <span className="faint">work</span> {duration(working, showSeconds)}
       </span>
-      <span title="time waiting on a dependency or hold">
+      <span title="time waiting on a dependency, hold, or human input">
         <span className="faint">idle</span> {duration(idle, showSeconds)}
       </span>
     </span>
