@@ -186,5 +186,59 @@
       "shell_hooks": "passed"
     },
     "hard_deadline_note": "Cooperative live cancellation settled measured usage. Forced hard-deadline terminalization and restart boundaries are covered by real SQLite integration tests so the release canary did not deliberately require SIGKILL."
+  },
+  "release_candidate_follow_up": {
+    "observed_at": "2026-07-30T20:13:40Z",
+    "commit": "3f79725563de6c452d0f18d993254cc55e067c50",
+    "code_tree": "8b804c422b28306115aea74c8884016d69983313",
+    "full_suite": {
+      "command": "make test",
+      "result": "passed",
+      "shell_hooks": 90,
+      "point_at": 7,
+      "domain_pytest": 646,
+      "adapter_pytest": 671,
+      "application_pytest": 1285,
+      "gate_parity": 48,
+      "import_contracts": 4,
+      "pyrefly_errors": 0
+    },
+    "live_command": "ISSUE_AGENT_MAX_TICKS=0 bash bin/point-at.sh self",
+    "live_result": {
+      "exit_code": 0,
+      "doctor_errors": 0,
+      "doctor_warnings": 3,
+      "clean_origin_dev_test": "passed",
+      "roles": {
+        "fix": {
+          "pid": 2857864,
+          "heartbeat_state": "stopped",
+          "in_flight": []
+        },
+        "review": {
+          "pid": 2857865,
+          "heartbeat_state": "stopped",
+          "in_flight": []
+        },
+        "steward": {
+          "pid": 2857866,
+          "heartbeat_state": "stopped",
+          "in_flight": []
+        }
+      },
+      "control_store": {
+        "schema_migrations": [
+          9,
+          10,
+          11
+        ],
+        "nonterminal_runs": 0,
+        "active_reservations": 0,
+        "leases": 0,
+        "dispatch_claims": 0,
+        "pending_commands": 0
+      },
+      "operator_warning": "The repository rejected automatic enablement of allow_auto_merge; the canary continued with the documented manual repository-setting warning."
+    }
   }
 }
