@@ -235,9 +235,9 @@ than applying `HEAD` evidence to different content. Bulk `--all` / `--mirror`
 pushes are rejected because they cannot bind every updated branch to that
 evidence; push explicit refspecs instead. Refs supplied by
 `remote.<name>.push` are parsed and checked by the same source/destination
-rules. Unsafe refspec-less modes, config-query failures, wildcards, mirrors,
-and command-local push overrides fail closed and require an explicit
-`HEAD:<destination>`.
+rules. Unsafe refspec-less modes, config-query failures, wildcards, matching
+refspecs, mirrors, and command-local push overrides fail closed and require an
+explicit `HEAD:<destination>`.
 
 Late-heartbeat reconciliation requires both the wall threshold and a positive
 wall-minus-active-monotonic gap, distinguishing a machine suspension from an
