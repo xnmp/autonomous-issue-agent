@@ -13,76 +13,78 @@ fail() { echo "Push blocked: $1"; exit 1; }
 # shellcheck source=_pr_common.sh
 . "$(dirname "$0")/_pr_common.sh"
 
+base="${BASE_BRANCH:-dev}"
+
+prc_check_push_destination() {
+  local branch="$1"
+  local pr="" pr_rc=1 baseref diff_range log_range changed
+
+  # Only governed-shape branches carry harness work; anything else is not this
+  # gate's business, but later destinations in the same push still are.
+  case "$branch" in
+    feat/*|fix/*|chore/*|refactor/*) : ;;
+    *) return 0 ;;
+  esac
+
+  # Is there an OPEN PR for this destination? If not, this is a pre-PR push.
+  # Lookup failures retry once and then fail closed.
+  for _attempt in 1 2; do
+    pr=$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // ""' 2>/dev/null)
+    pr_rc=$?
+    [ "$pr_rc" -eq 0 ] && break
+    [ "$_attempt" = 1 ] && sleep "${GATE_GH_RETRY_SLEEP:-2}"
+  done
+  [ "$pr_rc" -eq 0 ] \
+    || fail "could not verify PR state for branch '$branch' — 'gh pr list' failed twice (gh/network/auth error). The push gate needs to know whether an open PR exists, so it fails CLOSED rather than letting an unverified push through. Check connectivity and 'gh auth status', then retry the push shortly."
+  [ -n "$pr" ] || return 0
+
+  # Resolve the base once per governed destination. The working-tree state is
+  # shared, while the issue identity and open-PR lookup belong to the ref being
+  # written.
+  baseref="$(prc_resolve_base_ref)"
+  [ -n "$baseref" ] || return 0
+  diff_range="$baseref...HEAD"
+  log_range="$baseref..HEAD"
+  changed=$(git diff --name-only "$diff_range" 2>/dev/null || echo "")
+
+  prc_check_commit_log
+  prc_check_no_evidence "$changed"
+  prc_check_no_generated_instructions "$changed"
+  prc_check_tests_immutable "$changed"
+  prc_check_tests
+}
+
+prc_normalize_push_destination() {
+  local destination="${1#+}"
+  case "$destination" in *:*) destination="${destination#*:}" ;; esac
+  destination="${destination#refs/heads/}"
+  case "$destination" in
+    HEAD|@) printf '%s' "$checked_out_branch" ;;
+    *) printf '%s' "$destination" ;;
+  esac
+}
+
 checked_out_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
-branch="$checked_out_branch"
+destinations=()
 remote_seen=""
 for arg in "$@"; do
   [ "$arg" = "push" ] && continue
   case "$arg" in -*) continue ;; esac
   if [ -z "$remote_seen" ]; then
     remote_seen=1
+    case "$arg" in
+      +*|*:*) destinations+=("$(prc_normalize_push_destination "$arg")") ;;
+    esac
     continue
   fi
-  destination="${arg#+}"
-  case "$destination" in *:*) destination="${destination#*:}" ;; esac
-  destination="${destination#refs/heads/}"
-  case "$destination" in
-    HEAD|@) branch="$checked_out_branch" ;;
-    *) branch="$destination" ;;
-  esac
-  break
+  destinations+=("$(prc_normalize_push_destination "$arg")")
 done
-base="${BASE_BRANCH:-dev}"
 
-# Only governed-shape branches carry harness work; anything else → allow.
-case "$branch" in
-  feat/*|fix/*|chore/*|refactor/*) : ;;
-  *) exit 0 ;;
-esac
-
-# Is there an OPEN PR for this branch? If not, this is a pre-PR push → allow
-# (the create gate will enforce later).
-#
-# FAIL CLOSED when the lookup itself fails. This used to `|| echo ""` and treat
-# a gh/network error as "no PR" — i.e. the gate's own precondition was a bypass:
-# one flaky `gh` call (proxy hiccup, expired token, rate limit) silently skipped
-# the ENTIRE push gate on a branch that does have an open PR. Retry once first,
-# because a transient blip is the common case and a needless denial costs the
-# agent a turn; if it still fails we deny, since a blocked push is recoverable
-# (the agent just pushes again) but an ungated push is not.
-# GATE_GH_RETRY_SLEEP is a knob only so the self-test can drive this path fast.
-pr=""; pr_rc=1
-for _attempt in 1 2; do
-  pr=$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // ""' 2>/dev/null)
-  pr_rc=$?
-  [ "$pr_rc" -eq 0 ] && break
-  [ "$_attempt" = 1 ] && sleep "${GATE_GH_RETRY_SLEEP:-2}"
+if [ "${#destinations[@]}" -eq 0 ]; then
+  destinations=("$checked_out_branch")
+fi
+for branch in "${destinations[@]}"; do
+  prc_check_push_destination "$branch"
 done
-[ "$pr_rc" -eq 0 ] \
-  || fail "could not verify PR state for branch '$branch' — 'gh pr list' failed twice (gh/network/auth error). The push gate needs to know whether an open PR exists, so it fails CLOSED rather than letting an unverified push through. Check connectivity and 'gh auth status', then retry the push shortly."
-[ -n "$pr" ] || exit 0
-
-# An open PR exists → re-verify the new state. Resolve the base ref, then the two
-# distinct ranges (review M6): three dots for `git diff`, TWO for `git log`. One
-# shared three-dot range made prc_check_commit_log read the base branch's own
-# commits, so every push to an open PR was blocked as soon as anything merged
-# into the base ("Merge pull request #7 …" carries no allowed prefix) — on the
-# ADDRESS_REVIEW / FIX_CI legs, i.e. exactly when the base HAS advanced.
-baseref="$(prc_resolve_base_ref)"
-# Can't resolve base → fail open (don't block a push over a local ref gap).
-[ -n "$baseref" ] || exit 0
-diff_range="$baseref...HEAD"
-log_range="$baseref..HEAD"
-
-changed=$(git diff --name-only "$diff_range" 2>/dev/null || echo "")
-
-# Shared, state-derived checks (same code path as check-pr.sh). Cheap structural
-# checks first, the suite-running one last — same order as
-# adapters/governor.py:_push_gate_for_branch (review M21).
-prc_check_commit_log
-prc_check_no_evidence "$changed"
-prc_check_no_generated_instructions "$changed"
-prc_check_tests_immutable "$changed"
-prc_check_tests
 
 exit 0
