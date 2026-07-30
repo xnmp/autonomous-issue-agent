@@ -22,7 +22,10 @@ schema-v2 events, and the single projection fold; the bash watchers and their
 suite are deleted.
 Verification includes `make test`, dashboard unit/type/build/E2E checks, a
 bounded live steward tick against `xnmp/autonomous-issue-agent`, and the live
-probes documented in `HARNESS.md`/`docs/reference/capacity.md`.
+probes documented in `HARNESS.md`/`docs/reference/capacity.md`. The immutable
+[live release canary evidence](../reference/live-release-canary-evidence.json)
+records the all-role boot, an active SIGTERM shutdown, authoritative Codex
+usage settlement, durable remote cleanup, and zero residual control state.
 
 This document remains the **record** for the maintainability refactor: it owns
 sequencing, scope, and the adjudicated design decisions. The codex plan remains

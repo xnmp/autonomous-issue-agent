@@ -120,6 +120,9 @@ The v9 adoption baseline and every later migration are immutable,
 digest-validated, and individually transactional; restart tests interrupt
 both sides of every migration commit boundary. Machine-readable evidence is in
 `control-store-migration-evidence.json`.
+The bounded production-shaped boot, active SIGTERM shutdown, isolated Codex
+accounting run, cleanup receipt, and post-canary invariants are captured in
+`live-release-canary-evidence.json`.
 JSONL is bounded
 schema-v2 telemetry and a projection feed; losing it cannot authorize a write,
 deduplicate work, or admit spend.
@@ -276,6 +279,7 @@ the web composition/read-model boundary is in `app/dashweb/`.
 | Capacity boundary and benchmark | [capacity.md](capacity.md) |
 | Prompt-size measurement | [prompt-budget.md](prompt-budget.md) |
 | Control-store migration evidence | [control-store-migration-evidence.json](control-store-migration-evidence.json) |
+| Live release canary evidence | [live-release-canary-evidence.json](live-release-canary-evidence.json) |
 | Architectural decisions | [../adr/](../adr/) |
 | 110 recorded failure modes | [failure-modes.md](failure-modes.md) |
 | What's still open | [../open/residuals.md](../open/residuals.md) |

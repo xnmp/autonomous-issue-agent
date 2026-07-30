@@ -1,0 +1,190 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-07-30T18:35:45Z",
+  "repository": "xnmp/autonomous-issue-agent",
+  "purpose": "Release evidence for the 2026-07-30 architectural implementation plan",
+  "builds": {
+    "all_role_boot": "5ba484f9235bc10738023bda9323e57185f81e01",
+    "active_shutdown": "f4f82beea72956a21eadc803a9a3672cf91cd834",
+    "accounting_canary": "740cb2be0ba4d49a6d82534c274490480e7054f7",
+    "money_precision_correction": "40f66dac71e9bc7a2a9c7649cb14dba7b13a5d1a"
+  },
+  "all_role_boot": {
+    "roles": {
+      "fix": {
+        "boot_id": "e3e94ac5f442495884907f5aa9114c52",
+        "running_at": "2026-07-30T18:00:25.578Z",
+        "stopped_at": "2026-07-30T18:00:25.579Z"
+      },
+      "review": {
+        "boot_id": "e4ad13b94f164b8ea86abda2853605c0",
+        "running_at": "2026-07-30T18:00:25.040Z",
+        "stopped_at": "2026-07-30T18:00:25.042Z"
+      },
+      "steward": {
+        "boot_id": "3072cfe6404541ff9697bfcc5443caed",
+        "running_at": "2026-07-30T18:00:25.067Z",
+        "stopped_at": "2026-07-30T18:00:25.068Z"
+      }
+    },
+    "max_ticks": 0,
+    "result": "Each role completed starting -> running -> draining -> stopped."
+  },
+  "active_shutdown": {
+    "issue": 148,
+    "signal": "SIGTERM",
+    "daemon_pid": 2553319,
+    "daemon_state_events": [
+      {
+        "state": "running",
+        "at": "2026-07-30T18:14:24.247Z"
+      },
+      {
+        "state": "draining",
+        "reason": "shutdown requested",
+        "at": "2026-07-30T18:16:30.861Z"
+      },
+      {
+        "state": "stopped",
+        "at": "2026-07-30T18:16:30.925Z"
+      }
+    ],
+    "run_id": "129795638ad94bf39c20e49ad67a020c",
+    "reservation_id": "0438d337843f4a26b477ef96eee361fe",
+    "maximum_micros": 20000000,
+    "settled_amount_micros": 120858,
+    "child_pid": 2556941,
+    "child_pgid": 2556941,
+    "child_process_start_ticks": 14640457,
+    "terminal_checks": {
+      "daemon_and_child_absent": true,
+      "nonterminal_runs": 0,
+      "active_reservations": 0,
+      "leases": 0
+    },
+    "handover": {
+      "path": "/home/chong/.local/state/issue-agent-self/handovers/issue-148.md",
+      "trigger": "operator_cancelled",
+      "bytes": 4207,
+      "sha256": "2d3e4cccfa24e965c4dc8385d1c3bf717e69cafedf572b8e436c34b939b0a227"
+    }
+  },
+  "accounting_canary": {
+    "issue": 148,
+    "route": {
+      "run_id": "6bcf2068b4b8456e942e86d9b6c819a5",
+      "reservation_id": "a4af16784acf49cb9afb5baaf6c69e74",
+      "state": "completed",
+      "outcome": "settled",
+      "started_at": "2026-07-30T18:26:21.187Z",
+      "completed_at": "2026-07-30T18:26:29.906Z",
+      "maximum_micros": 100000,
+      "amount_micros": 6590,
+      "currency": "USD",
+      "basis": "configured_rate_card",
+      "usage": {
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "input_tokens": 25461,
+        "output_tokens": 149,
+        "source": "rollout"
+      },
+      "provider_receipt_id": "019fb447-089e-76e3-908d-b72cdcd625e2",
+      "spend_recorded_event_amount_micros": 6590
+    },
+    "resolve_cancelled_during_shutdown": {
+      "run_id": "cd5707944c5440c7965173c9b2f5da56",
+      "reservation_id": "d0bb9f4559b44935a5156a5dfaa19900",
+      "state": "completed",
+      "outcome": "settled",
+      "started_at": "2026-07-30T18:26:50.964Z",
+      "completed_at": "2026-07-30T18:27:09.682Z",
+      "maximum_micros": 20000000,
+      "amount_micros": 168014,
+      "currency": "USD",
+      "basis": "reconciled",
+      "usage": {
+        "cache_read_tokens": 26368,
+        "cache_write_tokens": 0,
+        "input_tokens": 28242,
+        "output_tokens": 454,
+        "source": "reconciled"
+      },
+      "provider_receipt_id": "codex-recovered:019fb447-7a50-7f53-8c3e-aa32b808046f:cd5707944c5440c7965173c9b2f5da56",
+      "spend_recorded_event_amount_micros": 168014,
+      "execution_exit_reason": "operator_cancelled"
+    },
+    "terminal_checks": {
+      "heartbeat_state": "stopped",
+      "heartbeat_in_flight": [],
+      "nonterminal_runs": 0,
+      "active_reservations": 0,
+      "leases": 0
+    }
+  },
+  "money_precision_follow_up": {
+    "observed_on_build": "740cb2be0ba4d49a6d82534c274490480e7054f7",
+    "observation": "The authoritative charge and accounting.spend.recorded event were 6590 micros; the descriptive agent.run.completed event used binary round() and reported 6589 micros.",
+    "corrected_on_build": "40f66dac71e9bc7a2a9c7649cb14dba7b13a5d1a",
+    "correction": "All major-unit conversions use Money.from_major with decimal ROUND_HALF_UP at micro precision.",
+    "verification": [
+      "Boundary contracts cover 0.0000004 -> 0, 0.0000005 -> 1, and 0.0065895 -> 6590 micros.",
+      "The journal contract covers 0.0065895 major units -> 0.006590 USD.",
+      "The complete make test suite passed after the correction."
+    ],
+    "live_rerun": "Not repeated: the authoritative live charge already proved rollout accounting at 6590 micros; the follow-up changed only shared deterministic conversion and is covered at its public boundaries."
+  },
+  "credential_containment": {
+    "task_codex_home": "/home/chong/.local/state/issue-agent-self/codex-hooks/issue-148-1bc93ad9478f",
+    "directory_mode": "0700",
+    "auth_link": "auth.json",
+    "auth_link_target": "/home/chong/.codex/auth.json",
+    "auth_target_mode": "0600",
+    "secret_copied_into_worktree": false
+  },
+  "remote_cleanup": {
+    "issue": 148,
+    "observed_at": "2026-07-30T18:34:04Z",
+    "state": "OPEN",
+    "labels": [
+      "bug",
+      "impact:medium",
+      "effort:medium"
+    ],
+    "durable_effect": {
+      "command_id": "43dae122c471cd71940efaeff520eb6a90cfcf9f6404167f900e266fd7a618df",
+      "kind": "set_issue_labels",
+      "state": "succeeded",
+      "completed_at": "2026-07-30T18:28:03.551Z",
+      "receipt_digest": "98ea066946e8590506b207feecfed20b5436dbd6473c5206a73da126f94d16b6"
+    },
+    "canary_worktree_registered_after_cleanup": false
+  },
+  "dashboard": {
+    "observed_at": "2026-07-30T18:34:04Z",
+    "deployment": "self",
+    "issue": 148,
+    "status": "run failed",
+    "displayed_spend_usd": "0.30",
+    "exit_reasons": [
+      "agent_error",
+      "operator_cancelled",
+      "transport_death"
+    ],
+    "daemon_status": "STALE because the bounded canary was deliberately stopped"
+  },
+  "verification": {
+    "command": "make test",
+    "result": "passed",
+    "suites": {
+      "domain_pytest": 635,
+      "adapter_pytest": 631,
+      "application_pytest": 1282,
+      "gate_parity": 48,
+      "import_contracts": 4,
+      "pyrefly_errors": 0,
+      "shell_hooks": "passed"
+    },
+    "hard_deadline_note": "Cooperative live cancellation settled measured usage. Forced hard-deadline terminalization and restart boundaries are covered by real SQLite integration tests so the release canary did not deliberately require SIGKILL."
+  }
+}
