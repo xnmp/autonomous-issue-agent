@@ -213,6 +213,44 @@ def test_resolve_infra_death_does_not_bump_resolve_counter():
     assert store.get_resolve_retries(5) == 0
 
 
+def test_budget_exhausted_resolve_blocks_for_cap_review_without_a_strike():
+    """A runtime cap is an operator budget decision, not failed agent work.
+
+    The workflow must stop the automatic requeue, retain the completed-attempt
+    counter, and leave an operator-visible journal receipt explaining why.
+    """
+    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
+    store = FakeStore()
+    journal = RecordingJournal()
+    runner = FakeRunner(AgentResult(
+        is_error=True,
+        envelope_subtype="error_max_budget_usd",
+        exit_reason=ExitReason.BUDGET_EXHAUSTED,
+    ))
+
+    asyncio.run(_workflow(gw, store, runner, journal=journal).resolve(5))
+
+    assert store.get_resolve_retries(5) == 0
+    assert ("relabel", "issue", 5, "ai-working", "ai-blocked") in gw.calls
+    assert ("relabel", "issue", 5, None, "needs-budget-review") in gw.calls
+    assert journal.events == [(
+        "budget_path",
+        {"issue": 5, "leg": "resolve", "exit_reason": "budget_exhausted"},
+    )]
+
+
+def test_agent_error_resolve_still_bumps_the_strike_counter():
+    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(
+        is_error=True, exit_reason=ExitReason.AGENT_ERROR,
+    ))
+
+    asyncio.run(_workflow(gw, store, runner).resolve(5))
+
+    assert store.get_resolve_retries(5) == 1
+
+
 def test_resume_empty_body_reply_returns_issue_to_blocked():
     # T3 probe finding: the old early-return left the issue ai-working, which
     # the reaper turned into ai-ready → an unbounded RESOLVE loop. An empty
