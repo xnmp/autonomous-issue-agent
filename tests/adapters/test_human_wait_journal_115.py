@@ -60,3 +60,28 @@ def test_restart_reconciles_human_wait_after_manual_unblock(tmp_path):
     ]
     assert [event["state"] for event in human_events] == ["waiting", "cleared"]
     assert human_events[-1]["blocker"] == "human"
+
+
+def test_unreadable_blocked_issue_does_not_create_a_false_clear(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    journal.emit(
+        "deferred",
+        state="waiting",
+        issue=5,
+        reason="human",
+        blocker="human",
+    )
+    report = _hold_reporter(journal, "o/r", lambda _message: None)
+    blocked = WorldState(issues=(
+        IssueView(5, labels=frozenset({Label.AI_BLOCKED})),
+    ))
+
+    report(WorldState())
+    report(blocked)
+
+    human_events = [
+        event
+        for event in _holds_in(journal)
+        if event.get("reason") == "human"
+    ]
+    assert [event["state"] for event in human_events] == ["waiting"]

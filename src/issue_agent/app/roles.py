@@ -492,6 +492,12 @@ def _hold_reporter(journal: Journal | None, repo: str, log):
             for issue in world.open_issues()
             if issue.has(Label.AI_BLOCKED)
         })
+        observed_issue_numbers = {issue.number for issue in world.issues}
+        current.update({
+            key: event
+            for key, event in active.items()
+            if key[1] == "human" and key[0] not in observed_issue_numbers
+        })
         for key in current.keys() - active.keys():
             message = waiting_label(key)
             log(f"DEFERRED: {message}; dispatches once that clears")
