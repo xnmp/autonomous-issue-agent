@@ -447,6 +447,14 @@ def _malformed_test_exception_repo(tmp_path: Path) -> Path:
     )
 
 
+def _dirty_manifest_override_repo(tmp_path: Path) -> Path:
+    repo = _mismatched_test_exception_repo(tmp_path)
+    (repo / ".harness" / "test-immutability-exceptions").write_text(
+        "13 | tests/test_keep.py | dirty local authorization must be ignored |\n"
+    )
+    return repo
+
+
 GOLDEN: tuple[Case, ...] = (
     # ── the happy path: everything the harness asks for, allowed by both ─────
     Case("good_pr", "pr", compliant_pr_repo, _pr_argv(), True),
@@ -494,6 +502,9 @@ GOLDEN: tuple[Case, ...] = (
          reason_contains="unchanged or new file"),
     Case("existing_test_declaration_malformed", "pr", _malformed_test_exception_repo,
          _pr_argv(), False, env={"TEST_CMD": "true"}, reason_contains="malformed"),
+    Case("existing_test_dirty_declaration_ignored", "pr", _dirty_manifest_override_repo,
+         _pr_argv(), False, env={"TEST_CMD": "true"},
+         reason_contains="unchanged or new file"),
 
     # ── ADR citation (§9) — PORTED to Python in wave P1-2. Before the port the
     #    Python column of these two rows was ALLOW/ALLOW: the rule was dead on
@@ -665,6 +676,7 @@ def test_golden_covers_every_rule_family() -> None:
         "existing_test_declared": "test-immutability",
         "existing_test_declaration_mismatch": "test-immutability",
         "existing_test_declaration_malformed": "test-immutability",
+        "existing_test_dirty_declaration_ignored": "test-immutability",
         "adr_governed_path_uncited": "adr", "adr_governed_path_cited": "adr",
         "adr_governs_untouched_path": "adr",
         "lint_fails": "project-commands", "lint_passes": "project-commands",
