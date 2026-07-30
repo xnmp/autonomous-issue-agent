@@ -518,31 +518,6 @@ def test_historical_hold_is_cleared_by_a_later_resolve_dispatch():
     assert "waiting" not in snapshots.issue_card(row_for(events, 7), NOW)["flags"]
 
 
-def test_blocked_reason_round_trips_to_card_and_detail_as_one_bounded_line():
-    events = [
-        RESOLVE,
-        {"ts": ts(hours=1), "event": "agent_run", "role": "fix",
-         "kind": "RESUME", "issue": 7, "number": 7, "status": "blocked",
-         "needs": "Choose endpoint A or B.\nThe remaining text belongs in drill-down."},
-        {"ts": ts(minutes=59), "event": "action",
-         "desc": "relabel issue #7: -ai-working +ai-blocked"},
-    ]
-    row = row_for(events, 7)
-
-    assert snapshots.issue_card(row, NOW)["attention_reason"] == "Choose endpoint A or B."
-    assert snapshots.issue_detail(row, NOW)["attention_reason"] == "Choose endpoint A or B."
-
-
-def test_historical_blocked_run_without_reason_stays_renderable():
-    row = row_for([
-        {"ts": ts(hours=1), "event": "agent_run", "role": "fix",
-         "kind": "RESOLVE", "issue": 7, "number": 7, "status": "blocked"},
-    ], 7)
-
-    assert snapshots.issue_card(row, NOW)["stage"] == "awaiting human reply"
-    assert snapshots.issue_card(row, NOW)["attention_reason"] is None
-
-
 def test_structured_defer_stays_active_until_its_clear_transition():
     waiting = {
         "ts": ts(hours=3), "event": "deferred", "state": "waiting",

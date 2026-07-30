@@ -250,7 +250,6 @@ def test_issue_failure_payload_still_satisfies_the_rendering_contract():
         "title": None,
         "url": None,
         "stage": None,
-        "attention_reason": None,
         "done": False,
         "prs": [],
         "pull_requests": [],

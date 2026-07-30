@@ -328,7 +328,7 @@ def _stage_of_event(e: dict) -> str:
             for label, stage in (
                 ("ai-done", "done"),
                 ("needs-human-review", "escalated"),
-                ("ai-blocked", "awaiting human reply"),
+                ("ai-blocked", "blocked"),
                 ("ai-pr-open", "pr open"),
                 ("ai-working", "working"),
                 ("ai-ready", "queued"),

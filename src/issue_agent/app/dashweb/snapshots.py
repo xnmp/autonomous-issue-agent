@@ -548,6 +548,12 @@ def _blocked_reason(row: dash.IssueRow) -> str | None:
     return None
 
 
+def _display_stage(row: dash.IssueRow) -> str:
+    if row.stage == "blocked" and _blocked_reason(row):
+        return "awaiting human reply"
+    return row.stage
+
+
 def _model_effort(row: dash.IssueRow, model: str) -> str | None:
     matches = [
         event
@@ -656,7 +662,7 @@ def issue_card(
         "pr": pr,
         "pr_url": (gh_pr or {}).get("url"),
         "pr_state": _pr_state(gh_pr),
-        "stage": row.stage,
+        "stage": _display_stage(row),
         "attention_reason": _blocked_reason(row),
         "done": row.done,
         "steps": collapse_steps(row),
@@ -1086,7 +1092,7 @@ def issue_detail(
         "issue": row.issue,
         "title": (gh_issue or {}).get("title"),
         "url": (gh_issue or {}).get("url"),
-        "stage": row.stage,
+        "stage": _display_stage(row),
         "attention_reason": _blocked_reason(row),
         "done": row.done,
         "prs": list(row.prs),
