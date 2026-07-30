@@ -38,7 +38,9 @@ on Claude aliases and SDK subagents, so configuration rejects those combinations
 instead of silently dropping legs. The reviewer runs in the operator checkout
 under Codex's read-only sandbox and a dedicated governor allow-list (`git diff`,
 `gh pr diff/view`, `cat`, `ls`), so filesystem and ambient-GitHub mutation paths
-are both contained. Because Codex's resume grammar cannot carry a sandbox
+are both contained. The runner supplies that policy in the review child's
+environment; generated hook files contain no persistent review state, so a
+later fixer cannot inherit the reviewer's boundary. Because Codex's resume grammar cannot carry a sandbox
 setting, every Codex re-review and in-leg transport retry is intentionally a
 fresh session; it receives the prior verdict as context and cannot regain a
 writable resume mode. The governor hook is installed only immediately before a
