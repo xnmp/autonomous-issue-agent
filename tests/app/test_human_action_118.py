@@ -29,6 +29,9 @@ def test_pr_query_collects_human_action_inputs():
         "latestReviews",
         "labels",
         "comments",
+        "isDraft",
+        "mergeable",
+        "mergeStateStatus",
     ):
         assert field in fields
 
@@ -41,6 +44,9 @@ def test_approved_green_open_pr_without_automerge_is_merge_ready():
             "state": "OPEN",
             "reviewDecision": "APPROVED",
             "autoMergeRequest": None,
+            "isDraft": False,
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
             "statusCheckRollup": [{
                 "conclusion": "SUCCESS",
                 "completedAt": ts(minutes=20),
@@ -63,6 +69,9 @@ def test_approved_green_open_pr_without_automerge_is_merge_ready():
         {"statusCheckRollup": [{"conclusion": "FAILURE"}]},
         {"autoMergeRequest": {"enabledAt": "now"}},
         {"state": "MERGED", "mergedAt": ts()},
+        {"isDraft": True},
+        {"mergeable": "CONFLICTING"},
+        {"mergeStateStatus": "DIRTY"},
     ],
 )
 def test_pr_that_still_has_harness_work_is_not_merge_ready(override):
@@ -70,6 +79,9 @@ def test_pr_that_still_has_harness_work_is_not_merge_ready(override):
         "state": "OPEN",
         "reviewDecision": "APPROVED",
         "autoMergeRequest": None,
+        "isDraft": False,
+        "mergeable": "MERGEABLE",
+        "mergeStateStatus": "CLEAN",
         "statusCheckRollup": [{"conclusion": "SUCCESS"}],
         **override,
     }
@@ -152,6 +164,27 @@ def test_past_escalation_is_not_a_current_human_action_after_resume():
         NOW,
         gh_issue={"labels": [{"name": "needs-human-review"}]},
     )["human_action"] is None
+
+
+def test_readded_external_escalation_does_not_reuse_cleared_wait_start():
+    row = row_for([
+        RESOLVE,
+        {"ts": ts(hours=2), "event": "escalation", "issue": 7},
+        {"ts": ts(hours=1), "event": "action",
+         "desc": "relabel issue #7: -needs-human-review +ai-working"},
+    ], 7)
+
+    card = snapshots.issue_card(
+        row,
+        NOW,
+        gh_issue={
+            "labels": [{"name": "needs-human-review"}],
+            "updatedAt": ts(minutes=10),
+        },
+    )
+
+    assert card["human_action"] == "escalated"
+    assert card["human_wait_s"] == 600
 
 
 def test_malformed_check_rollup_is_not_merge_ready():

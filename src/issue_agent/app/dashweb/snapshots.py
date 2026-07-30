@@ -625,6 +625,23 @@ def _merge_ready_since(pr: dict) -> datetime | None:
     return max(stamps, default=dash.parse_ts(pr.get("updatedAt")))
 
 
+def _active_escalation_at(row: dash.IssueRow) -> datetime | None:
+    """Newest escalation not superseded by a recorded label transition."""
+    active_at: datetime | None = None
+    for event in row.events:
+        if event.get("event") == "escalation":
+            active_at = dash.parse_ts(event.get("ts"))
+        elif event.get("event") == "action":
+            fact = dash.parse_action(str(event.get("desc") or ""))
+            if (
+                fact is not None
+                and fact.verb == "relabel"
+                and "needs-human-review" in fact.removed
+            ):
+                active_at = None
+    return active_at
+
+
 def _human_action(
     row: dash.IssueRow,
     gh_issue: dict | None,
@@ -635,11 +652,18 @@ def _human_action(
     issue_labels = _labels_set(gh_issue)
     pr_labels = _labels_set(gh_pr)
     if "needs-human-review" in issue_labels | pr_labels:
-        event = next(
-            (e for e in reversed(row.events) if e.get("event") == "escalation"),
-            None,
+        external_updates = (
+            dash.parse_ts(item.get("updatedAt"))
+            for item, labels in (
+                (gh_issue, issue_labels),
+                (gh_pr, pr_labels),
+            )
+            if item is not None and "needs-human-review" in labels
         )
-        return "escalated", dash.parse_ts((event or {}).get("ts")) or row.last_ts
+        return "escalated", _active_escalation_at(row) or max(
+            (stamp for stamp in external_updates if stamp is not None),
+            default=None,
+        )
     prompt_times = [
         prompt_at
         for item, labels in (
@@ -655,6 +679,9 @@ def _human_action(
         gh_pr
         and str(gh_pr.get("state") or "").upper() == "OPEN"
         and not gh_pr.get("mergedAt")
+        and not gh_pr.get("isDraft")
+        and str(gh_pr.get("mergeable") or "").upper() == "MERGEABLE"
+        and str(gh_pr.get("mergeStateStatus") or "").upper() == "CLEAN"
         and str(gh_pr.get("reviewDecision") or "").upper() == "APPROVED"
         and _checks_green(gh_pr.get("statusCheckRollup"))
         and not gh_pr.get("autoMergeRequest")
