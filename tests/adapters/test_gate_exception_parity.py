@@ -64,6 +64,31 @@ def _dirty_recreated_deletion(tmp_path: Path) -> Path:
     return repo
 
 
+def _inherited_manifest(tmp_path: Path) -> Path:
+    repo = fresh_repo(tmp_path)
+    (repo / ".harness").mkdir()
+    manifest = repo / ".harness" / "test-immutability-exceptions"
+    manifest.write_text(
+        "13 | tests/test_old_issue.py | issue 13 corrected this expectation |\n"
+    )
+    _git(repo, "add", "-f", ".harness/test-immutability-exceptions")
+    _git(repo, "commit", "-qm", "chore: retain prior issue audit record")
+    _git(repo, "switch", "-qc", "fix/14-next-issue")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_regression.py").write_text(
+        "def test_regression(): assert True\n"
+    )
+    _git(repo, "add", "tests/test_regression.py")
+    _git(repo, "commit", "-qm", "red: specify next issue regression")
+    (repo / "impl.py").write_text("fixed = True\n")
+    _git(repo, "add", "impl.py")
+    _git(repo, "commit", "-qm", "green: implement next issue")
+    (repo / ".harness" / "ac-posted").touch()
+    (repo / ".harness" / "test-plan-posted").touch()
+    (repo / ".harness" / "adversarial-verdict").write_text("PASS\n")
+    return repo
+
+
 CASES = (
     Case("declared", "pr", _valid, _pr_argv(), True,
          env={"TEST_CMD": "test -f impl.py"}),
@@ -84,6 +109,14 @@ CASES = (
     Case("dirty_recreated_deletion", "pr", _dirty_recreated_deletion,
          _pr_argv(), False, env={"TEST_CMD": "true"},
          reason_contains="replacement"),
+    Case("inherited_manifest", "pr", _inherited_manifest, _pr_argv(), True,
+         env={"TEST_CMD": "test -f impl.py"}),
+    Case("push_destination_issue", "push",
+         lambda path: _with_manifest(
+             path, "14 | tests/test_keep.py | destination issue correction |\n"
+         ),
+         ["push", "origin", "HEAD:refs/heads/fix/14-correct-test"], True,
+         env={"TEST_CMD": "true"}, open_pr="14"),
 )
 
 

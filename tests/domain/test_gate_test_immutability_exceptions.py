@@ -76,6 +76,30 @@ def test_declaration_must_name_the_current_branch_issue():
     assert "issue #125" in result.reason
 
 
+def test_inherited_manifest_is_inactive_on_the_next_issue_branch():
+    inherited = (
+        "124 | tests/test_app.py | old expectation was wrong on issue 124 |\n"
+    )
+
+    ordinary_change = check_tests_immutable(
+        ["src/app.py"],
+        _base,
+        issue_number=125,
+        exception_manifest=inherited,
+    )
+    undeclared_test_change = check_tests_immutable(
+        ["tests/test_app.py"],
+        _base,
+        exists_at_head=lambda _path: True,
+        issue_number=125,
+        exception_manifest=inherited,
+    )
+
+    assert ordinary_change.ok
+    assert not undeclared_test_change.ok
+    assert "existing test file" in undeclared_test_change.reason
+
+
 def test_deletion_requires_a_new_changed_replacement_test():
     manifest = (
         "124 | tests/test_app.py | moved focused coverage "
