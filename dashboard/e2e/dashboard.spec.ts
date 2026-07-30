@@ -203,15 +203,26 @@ async function mockApi(page: Page, reposDelayMs = 0) {
       issuePolls += 1;
       return json(route, {
         ...issues,
-        notifications: issuePolls <= 2 ? [] : [{
-          id: "merge-50",
-          ts: "2026-07-29T08:00:00Z",
-          severity: "info",
-          title: "Issue #50 completed",
-          detail: "PR #75 merged",
-          issue: 50,
-          pr: 75,
-        }],
+        notifications: issuePolls <= 2 ? [] : [
+          {
+            id: "dispatch-49",
+            ts: "2026-07-29T07:59:00Z",
+            severity: "info",
+            title: "Issue #49 dispatched",
+            detail: "REVIEW for PR #74 started",
+            issue: 49,
+            pr: 74,
+          },
+          {
+            id: "merge-50",
+            ts: "2026-07-29T08:00:00Z",
+            severity: "info",
+            title: "Issue #50 completed",
+            detail: "PR #75 merged",
+            issue: 50,
+            pr: 75,
+          },
+        ],
       });
     }
     if (path === "/api/repos/self/issues/50") return json(route, issue);
@@ -324,11 +335,14 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
 
   await expect(page.getByRole("status").filter({ hasText: "Issue #50 completed" }))
     .toBeVisible({ timeout: 7_000 });
+  await expect(page.getByRole("status").filter({ hasText: "Issue #49 dispatched" }))
+    .toBeVisible();
   await page.screenshot({
     path: "../evidence/dashboard-toasts.png",
     fullPage: true,
   });
   await page.getByRole("button", { name: "Dismiss Issue #50 completed" }).click();
+  await page.getByRole("button", { name: "Dismiss Issue #49 dispatched" }).click();
 
   const quotaButton = page.getByRole("button", { name: "Quota", exact: true });
   await expect(quotaButton).toHaveAttribute("aria-expanded", "false");

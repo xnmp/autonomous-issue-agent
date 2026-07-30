@@ -3,6 +3,16 @@ import type { RoleHealth, ToastNotification } from "../api/types";
 
 const VISIBLE_TOASTS = 4;
 const RETAINED_TOASTS = 20;
+const TOAST_LIFETIME_MS = 15_000;
+
+type ActiveToast = ToastNotification & { expiresAt: number };
+
+function activeToast(notification: ToastNotification): ActiveToast {
+  return {
+    ...notification,
+    expiresAt: Date.now() + TOAST_LIFETIME_MS,
+  };
+}
 
 export function ToastStack({
   repo,
@@ -13,7 +23,7 @@ export function ToastStack({
   notifications: readonly ToastNotification[] | null;
   roles: readonly RoleHealth[];
 }) {
-  const [toasts, setToasts] = useState<ToastNotification[]>([]);
+  const [toasts, setToasts] = useState<ActiveToast[]>([]);
   const seen = useRef(new Set<string>());
   const journalReady = useRef(false);
   const previousHealth = useRef(new Map<string, boolean>());
@@ -35,7 +45,10 @@ export function ToastStack({
     const fresh = notifications.filter((notification) => !seen.current.has(notification.id));
     if (fresh.length === 0) return;
     for (const notification of fresh) seen.current.add(notification.id);
-    setToasts((current) => [...current, ...fresh].slice(-RETAINED_TOASTS));
+    setToasts((current) => [
+      ...current,
+      ...fresh.map(activeToast),
+    ].slice(-RETAINED_TOASTS));
   }, [notifications]);
 
   useEffect(() => {
@@ -60,11 +73,24 @@ export function ToastStack({
         });
       }
       if (changed.length > 0) {
-        setToasts((existing) => [...existing, ...changed].slice(-RETAINED_TOASTS));
+        setToasts((existing) => [
+          ...existing,
+          ...changed.map(activeToast),
+        ].slice(-RETAINED_TOASTS));
       }
     }
     previousHealth.current = current;
   }, [repo, roles]);
+
+  useEffect(() => {
+    if (toasts.length === 0) return;
+    const nextExpiry = Math.min(...toasts.map((toast) => toast.expiresAt));
+    const timeout = window.setTimeout(() => {
+      const now = Date.now();
+      setToasts((current) => current.filter((toast) => toast.expiresAt > now));
+    }, Math.max(0, nextExpiry - Date.now()));
+    return () => window.clearTimeout(timeout);
+  }, [toasts]);
 
   if (toasts.length === 0) return null;
   const overflow = Math.max(0, toasts.length - VISIBLE_TOASTS);

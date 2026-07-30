@@ -797,6 +797,18 @@ def _journal_notification(event: dict, issue: int) -> dict | None:
             "issue": issue,
             "pr": number if event.get("target") == "pr" else None,
         }
+    if name == "agent_run_start":
+        kind = str(event.get("kind") or "")
+        number = _event_number(event.get("number"))
+        pr = number if kind in dash.REVIEW_KINDS | dash.REPAIR_KINDS else None
+        target = f" for PR #{pr}" if pr is not None else ""
+        return {
+            "severity": "info",
+            "title": f"Issue #{issue} dispatched",
+            "detail": f"{kind or 'Agent run'}{target} started",
+            "issue": issue,
+            "pr": pr,
+        }
     if name != "agent_run":
         return None
     status = str(event.get("status") or "")
