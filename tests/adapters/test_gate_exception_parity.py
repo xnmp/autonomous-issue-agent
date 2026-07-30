@@ -151,6 +151,17 @@ def _bulk_push_with_unvalidated_branch(tmp_path: Path) -> Path:
     return repo
 
 
+def _configured_non_head_source(tmp_path: Path) -> Path:
+    repo = _non_head_source(tmp_path)
+    _git(
+        repo,
+        "config",
+        "remote.origin.push",
+        "bad-local-ref:refs/heads/fix/13-open-pr",
+    )
+    return repo
+
+
 CASES = (
     Case("declared", "pr", _valid, _pr_argv(), True,
          env={"TEST_CMD": "test -f impl.py"}),
@@ -199,6 +210,10 @@ CASES = (
          _bulk_push_with_unvalidated_branch, ["push", "--mirror", "origin"],
          False, env={"TEST_CMD": "test -f impl.py"}, open_pr="13",
          reason_contains="bulk push"),
+    Case("configured_push_refspec_cannot_hide_non_head_source", "push",
+         _configured_non_head_source, ["push", "origin"],
+         False, env={"TEST_CMD": "test -f impl.py"}, open_pr="13",
+         reason_contains="source ref"),
 )
 
 
