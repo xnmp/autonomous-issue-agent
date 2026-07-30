@@ -31,6 +31,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
@@ -46,6 +47,7 @@ from issue_agent.app.planners.tasks import (
     ReviewTaskConfig,
 )
 from issue_agent.app.roles import (
+    DispatchPathReservations,
     _ci_flake_reporter,
     _ci_stall_reporter,
     _duplicate_pr_reporter,
@@ -63,7 +65,13 @@ from issue_agent.domain.actions import (
     RunAgent,
     Target,
 )
-from issue_agent.domain.fix import FixConfig, FixState, breaker_key, decide_fix
+from issue_agent.domain.fix import (
+    FixConfig,
+    FixState,
+    InFlightFix,
+    breaker_key,
+    decide_fix,
+)
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.refs import issue_from_branch
@@ -170,6 +178,39 @@ def _cfg(**overrides):
 
 def _has_run(actions, kind) -> bool:
     return any(isinstance(a, RunAgent) and a.kind is kind for a in actions)
+
+
+def test_concurrent_router_expansions_atomically_reserve_one_shared_path():
+    reservations = DispatchPathReservations()
+    first = RunAgent(AgentKind.RESOLVE, 1)
+    second = RunAgent(AgentKind.RESOLVE, 2)
+    assert reservations.reserve(first, 1, frozenset({"src/a.py"}))
+    assert reservations.reserve(second, 2, frozenset({"src/b.py"}))
+    assert reservations.issue_for(first) == 1
+    assert reservations.issue_for(second) == 2
+
+    gate = threading.Barrier(3)
+    results: list[bool] = []
+
+    def expand(issue):
+        gate.wait()
+        results.append(
+            reservations.expand(issue, frozenset({"src/shared.py"}))
+        )
+
+    threads = [
+        threading.Thread(target=expand, args=(1,)),
+        threading.Thread(target=expand, args=(2,)),
+    ]
+    for thread in threads:
+        thread.start()
+    gate.wait()
+    for thread in threads:
+        thread.join(timeout=1)
+
+    assert sorted(results) == [False, True]
+    snapshots = {item.issue: item.paths for item in reservations.snapshot()}
+    assert sum("src/shared.py" in paths for paths in snapshots.values()) == 1
 
 
 # ── resolve-retries (issue-keyed) ──────────────────────────────────────────────
@@ -642,6 +683,24 @@ def test_healthy_runs_in_the_journal_are_not_process_deaths(tmp_path):
     assert _fix_state(store, world).infra_deaths[issue] == 0
     assert _has_run(decide_fix(world, _cfg(max_infra_deaths=2), _fix_state(store, world),
                                False), AgentKind.RESOLVE)
+
+
+def test_a_currently_running_dispatch_is_not_reconstructed_as_a_process_death(tmp_path):
+    issue = 8
+    store = Store(state_dir=str(tmp_path))
+    world = WorldState(issues=(
+        IssueView(issue, title="t", body="b", labels=frozenset({Label.AI_WORKING})),
+    ))
+    _journal_lines(tmp_path, _killed("RESOLVE", issue, issue, "live"))
+
+    state = _fix_state(
+        store,
+        world,
+        (InFlightFix(issue, frozenset({"src/x.py"})),),
+    )
+
+    assert state.infra_deaths[issue] == 0
+    assert state.inflight == (InFlightFix(issue, frozenset({"src/x.py"})),)
 
 
 def test_a_raise_path_death_is_counted_once_not_twice(tmp_path):

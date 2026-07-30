@@ -19,6 +19,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -172,6 +173,14 @@ class Worktrees:
         self.base_branch = base_branch
         self._git = run
         self._path_exists = path_exists
+        # `git worktree add/remove/prune` mutate shared repository metadata.
+        # Paid work may overlap, but those short setup/cleanup transactions may
+        # not race each other on `.git/worktrees` and branch refs.
+        # Residual: agent-owned git commands run in separate processes after
+        # setup and cannot acquire this in-process lock. Concurrent `git fetch`
+        # may still contend on shared remote-ref lockfiles; rollout metrics must
+        # treat that signature as cross-leg interference, not a code failure.
+        self._mutation_lock = threading.RLock()
 
     def path(self, issue: int) -> str:
         return os.path.join(self.worktree_root, f"issue-{issue}")
@@ -202,6 +211,10 @@ class Worktrees:
         )
 
     def ensure(self, issue: int, branch: str) -> str:
+        with self._mutation_lock:
+            return self._ensure(issue, branch)
+
+    def _ensure(self, issue: int, branch: str) -> str:
         """Ensure a worktree for the issue exists on `branch`; return its abs
         path. Port of ensure_worktree: reuse existing, else create from the
         branch ref or off origin/base.
@@ -239,6 +252,10 @@ class Worktrees:
         return abs_path
 
     def remove(self, issue: int) -> None:
+        with self._mutation_lock:
+            self._remove(issue)
+
+    def _remove(self, issue: int) -> None:
         listing = self._git(["worktree", "list", "--porcelain"], self.repo_dir)
         branch = _issue_worktree_branch(listing.out, issue)
         self._git(["worktree", "remove", self.path(issue), "--force"], self.repo_dir)
