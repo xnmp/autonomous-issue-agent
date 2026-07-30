@@ -117,6 +117,13 @@ CASES = (
          ),
          ["push", "origin", "HEAD:refs/heads/fix/14-correct-test"], True,
          env={"TEST_CMD": "true"}, open_pr="14"),
+    Case("multi_ref_push_checks_every_destination", "push", _base_repo,
+         [
+             "push", "origin", "scratch",
+             "HEAD:refs/heads/fix/13-correct-test",
+         ],
+         False, env={"TEST_CMD": "true"}, open_pr="13",
+         reason_contains="existing test file"),
 )
 
 
