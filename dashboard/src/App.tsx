@@ -12,8 +12,17 @@ import {
 import { Sidebar } from "./components/Sidebar";
 import { TabStrip, type TabDef } from "./components/TabStrip";
 import { OverviewTab } from "./components/OverviewTab";
-import { IssuesTab } from "./components/IssuesTab";
+import {
+  IssuesTab,
+  type BacklogPromotionPhase,
+} from "./components/IssuesTab";
 import { useIssues } from "./features/issues/useIssues";
+import type {
+  BacklogCard,
+  IssuesPayload,
+  PendingCard,
+  Priority,
+} from "./api/types";
 import { IssueTab } from "./components/IssueTab";
 import { VerificationTab } from "./components/VerificationTab";
 import { EmptyState } from "./components/ui/Feedback";
@@ -27,6 +36,44 @@ import { ToastStack } from "./components/ToastStack";
 
 const TOP_POLL_MS = 10_000;
 const OPTIONS_STORAGE = "issue-agent.dashboard.options";
+
+function priorityFromLabels(labels: string[]): Priority {
+  const priority = labels
+    .map((label) => label.toUpperCase())
+    .find((label): label is Exclude<Priority, null> => (
+      label === "P1" || label === "P2" || label === "P3"
+    ));
+  return priority ?? null;
+}
+
+function pendingCardFromBacklog(card: BacklogCard): PendingCard {
+  return {
+    issue: card.issue,
+    title: card.title,
+    url: card.url,
+    priority: priorityFromLabels(card.labels),
+    labels: Array.from(new Set([...card.labels, "ai-ready"])),
+    held: false,
+    hold_reason: null,
+    overlap: null,
+  };
+}
+
+interface OptimisticPromotion {
+  card: BacklogCard;
+  requestSucceeded: boolean;
+}
+
+function promotionConfirmed(
+  promotion: OptimisticPromotion,
+  issues: IssuesPayload,
+): boolean {
+  const issue = promotion.card.issue;
+  const active = issues.in_flight.some((card) => card.issue === issue)
+    || issues.pending.some((card) => card.issue === issue);
+  const stillBacklogged = issues.backlog.some((card) => card.issue === issue);
+  return active || (promotion.requestSucceeded && !stillBacklogged);
+}
 
 function storedOptions(): DashboardOptions {
   const defaults: DashboardOptions = {
@@ -102,35 +149,64 @@ export default function App() {
   }, [route]);
 
   const issues = useIssues(selectedRepo);
-  const [promotedBacklog, setPromotedBacklog] = useState<Record<string, number[]>>({});
-  const hiddenBacklog = selectedRepo ? (promotedBacklog[selectedRepo] ?? []) : [];
+  const [promotedBacklog, setPromotedBacklog] = useState<
+    Record<string, OptimisticPromotion[]>
+  >({});
+  const optimisticPromotions = selectedRepo ? (promotedBacklog[selectedRepo] ?? []) : [];
+  const currentIssues = issues.data;
+  const unresolvedPromotions = currentIssues
+    ? optimisticPromotions.filter((promotion) => (
+        !promotionConfirmed(promotion, currentIssues)
+      ))
+    : optimisticPromotions;
+  const promotedIssueNumbers = new Set(
+    optimisticPromotions.map(({ card }) => card.issue),
+  );
   const displayedIssues = {
     ...issues,
     data: issues.data
       ? {
           ...issues.data,
-          backlog: issues.data.backlog.filter((card) => !hiddenBacklog.includes(card.issue)),
+          backlog: issues.data.backlog.filter(
+            (card) => !promotedIssueNumbers.has(card.issue),
+          ),
+          pending: [
+            ...issues.data.pending,
+            ...unresolvedPromotions.map(({ card }) => pendingCardFromBacklog(card)),
+          ],
         }
       : null,
   };
   useEffect(() => {
-    if (!selectedRepo || !issues.data) return;
+    const data = issues.data;
+    if (!selectedRepo || !data) return;
     setPromotedBacklog((current) => {
-      const hidden = current[selectedRepo] ?? [];
-      const stillPending = hidden.filter((issue) => (
-        issues.data?.backlog.some((card) => card.issue === issue)
+      const optimistic = current[selectedRepo] ?? [];
+      const unresolved = optimistic.filter((promotion) => (
+        !promotionConfirmed(promotion, data)
       ));
-      if (stillPending.length === hidden.length) return current;
-      return { ...current, [selectedRepo]: stillPending };
+      if (unresolved.length === optimistic.length) return current;
+      return { ...current, [selectedRepo]: unresolved };
     });
   }, [issues.data, selectedRepo]);
-  const setBacklogPromotion = useCallback((issue: number, pending: boolean) => {
+  const setBacklogPromotion = useCallback((
+    card: BacklogCard,
+    phase: BacklogPromotionPhase,
+  ) => {
     if (!selectedRepo) return;
     setPromotedBacklog((current) => {
       const existing = current[selectedRepo] ?? [];
-      const next = pending
-        ? Array.from(new Set([...existing, issue]))
-        : existing.filter((candidate) => candidate !== issue);
+      const matching = existing.find((candidate) => candidate.card.issue === card.issue);
+      const withoutCard = existing.filter(
+        (candidate) => candidate.card.issue !== card.issue,
+      );
+      const next = phase === "failed"
+        ? withoutCard
+        : phase === "succeeded"
+          ? matching
+            ? [...withoutCard, { ...matching, requestSucceeded: true }]
+            : existing
+          : [...withoutCard, { card, requestSucceeded: false }];
       return { ...current, [selectedRepo]: next };
     });
   }, [selectedRepo]);
@@ -282,7 +358,7 @@ function Body({
   issues: ReturnType<typeof useIssues>;
   onSetSub: (s: IssuesSub) => void;
   onOpenIssue: (n: number) => void;
-  onBacklogPromotion: (issue: number, pending: boolean) => void;
+  onBacklogPromotion: (card: BacklogCard, phase: BacklogPromotionPhase) => void;
   hasRepos: boolean;
   reposLoading: boolean;
   showProjectedCost: boolean;

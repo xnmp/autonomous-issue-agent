@@ -50,12 +50,14 @@ import {
 
 const MarkdownBody = lazy(() => import("./ui/MarkdownBody"));
 
+export type BacklogPromotionPhase = "pending" | "succeeded" | "failed";
+
 interface IssuesTabProps {
   repo: string;
   sub: IssuesSub;
   issues: Polled<IssuesPayload>;
   onOpenIssue: (issue: number) => void;
-  onBacklogPromotion?: (issue: number, pending: boolean) => void;
+  onBacklogPromotion?: (card: BacklogCard, phase: BacklogPromotionPhase) => void;
   showProjectedCost?: boolean;
   showDurationSeconds?: boolean;
 }
@@ -586,7 +588,7 @@ function BacklogTable({
   ghOk: boolean;
   visible: ReadonlySet<string>;
   onRefresh: () => void;
-  onPromotion: (issue: number, pending: boolean) => void;
+  onPromotion: (card: BacklogCard, phase: BacklogPromotionPhase) => void;
 }) {
   const [expanded, setExpanded] = useState<number | null>(null);
   const [promote, setPromote] = useState<BacklogCard | null>(null);
@@ -621,12 +623,13 @@ function BacklogTable({
     const card = promote;
     setError(null);
     setPromote(null);
-    onPromotion(card.issue, true);
+    onPromotion(card, "pending");
     try {
       await api.promote(repo, card.issue);
+      onPromotion(card, "succeeded");
       onRefresh();
     } catch (caught) {
-      onPromotion(card.issue, false);
+      onPromotion(card, "failed");
       setError(caught instanceof Error ? caught.message : String(caught));
     }
   };

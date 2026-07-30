@@ -57,6 +57,36 @@ const backlogIssue = {
   impact: null,
 };
 
+const historicalDoneIssue = {
+  issue: 120,
+  title: "Previous completion",
+  url: "https://github.com/o/r/issues/120",
+  pr: null,
+  pr_url: null,
+  pr_state: null,
+  stage: "done",
+  done: true,
+  steps: [],
+  cost_usd: null,
+  estimated: false,
+  projected_cost_usd: null,
+  projected_model: null,
+  started_ts: null,
+  last_ts: null,
+  elapsed_s: null,
+  working_s: null,
+  idle_s: null,
+  idle_active: false,
+  projected_eta_s: null,
+  models: [],
+  model_badges: [],
+  rounds: null,
+  flags: [],
+  issue_verification: null,
+  pr_verification: null,
+  merged_ts: null,
+};
+
 function json(body: unknown): Response {
   return new Response(JSON.stringify(body), {
     status: 200,
@@ -201,6 +231,7 @@ describe("App navigation", () => {
           }
           return json({
             ...issues,
+            done: [historicalDoneIssue],
             backlog: [backlogIssue],
           });
         }
@@ -261,5 +292,45 @@ describe("App navigation", () => {
     expect(await screen.findByText("Toast notifications")).toBeVisible();
     expect(screen.getByRole("tab", { name: /Backlog/ })).toHaveTextContent("1");
     expect(screen.getByRole("tab", { name: /In flight/ })).toHaveTextContent("0");
+  });
+
+  it("clears optimistic state when a successful promotion advances directly to done", async () => {
+    window.location.hash = "#/repo/demo/issues/backlog";
+    let finishPromotion: (response: Response) => void = () => {};
+    let serverDone = false;
+    const promotion = new Promise<Response>((resolve) => {
+      finishPromotion = resolve;
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input);
+        if (path === "/api/repos") return json(repos);
+        if (path === "/api/usage") return json(usage);
+        if (path.endsWith("/promote")) return promotion;
+        if (path.endsWith("/issues")) {
+          return serverDone
+            ? json({ ...issues, done: [historicalDoneIssue] })
+            : json({ ...issues, backlog: [backlogIssue] });
+        }
+        return json({ rows: [], warnings: [] });
+      }),
+    );
+
+    render(<App />);
+
+    await screen.findByText("Toast notifications");
+    await userEvent.click(screen.getByRole("button", { name: "Promote #120 to ai-ready" }));
+    await userEvent.click(screen.getByRole("button", { name: "Promote #120" }));
+    expect(screen.getByRole("tab", { name: /In flight/ })).toHaveTextContent("1");
+
+    serverDone = true;
+    finishPromotion(json({ ok: true, detail: "promoted" }));
+
+    await waitFor(() => {
+      expect(screen.getByRole("tab", { name: /In flight/ })).toHaveTextContent("0");
+    });
+    expect(screen.getByRole("tab", { name: /Done/ })).toHaveTextContent("1");
+    expect(screen.getByRole("tab", { name: /Backlog/ })).toHaveTextContent("0");
   });
 });
