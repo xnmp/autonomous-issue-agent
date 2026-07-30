@@ -120,6 +120,37 @@ def _non_head_source(tmp_path: Path) -> Path:
     return repo
 
 
+def _bulk_push_with_unvalidated_branch(tmp_path: Path) -> Path:
+    repo = fresh_repo(tmp_path)
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_keep.py").write_text(
+        "def test_keep(): assert True\n"
+    )
+    _git(repo, "add", "tests/test_keep.py")
+    _git(repo, "commit", "-qm", "test: baseline")
+    _git(repo, "switch", "-qc", "fix/13-open-pr")
+    (repo / "tests" / "test_keep.py").write_text(
+        "def test_keep(): assert False\n"
+    )
+    _git(repo, "add", "tests/test_keep.py")
+    _git(repo, "commit", "-qm", "test: weaken existing coverage")
+    _git(repo, "switch", "-q", "dev")
+    _git(repo, "switch", "-qc", "fix/14-clean-checkout")
+    (repo / "tests" / "test_regression.py").write_text(
+        "def test_regression(): assert True\n"
+    )
+    _git(repo, "add", "tests/test_regression.py")
+    _git(repo, "commit", "-qm", "red: specify regression")
+    (repo / "impl.py").write_text("fixed = True\n")
+    _git(repo, "add", "impl.py")
+    _git(repo, "commit", "-qm", "green: implement fix")
+    (repo / ".harness").mkdir()
+    (repo / ".harness" / "ac-posted").touch()
+    (repo / ".harness" / "test-plan-posted").touch()
+    (repo / ".harness" / "adversarial-verdict").write_text("PASS\n")
+    return repo
+
+
 CASES = (
     Case("declared", "pr", _valid, _pr_argv(), True,
          env={"TEST_CMD": "test -f impl.py"}),
@@ -160,6 +191,14 @@ CASES = (
          ["push", "origin", "bad-local-ref:refs/heads/fix/13-open-pr"],
          False, env={"TEST_CMD": "test -f impl.py"}, open_pr="13",
          reason_contains="source ref"),
+    Case("push_all_cannot_hide_an_unvalidated_branch", "push",
+         _bulk_push_with_unvalidated_branch, ["push", "--all", "origin"],
+         False, env={"TEST_CMD": "test -f impl.py"}, open_pr="13",
+         reason_contains="bulk push"),
+    Case("push_mirror_cannot_hide_an_unvalidated_branch", "push",
+         _bulk_push_with_unvalidated_branch, ["push", "--mirror", "origin"],
+         False, env={"TEST_CMD": "test -f impl.py"}, open_pr="13",
+         reason_contains="bulk push"),
 )
 
 
