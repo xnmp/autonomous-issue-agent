@@ -240,8 +240,12 @@ and `--mirror` pushes are rejected because they cannot bind every updated
 branch to that evidence; push explicit refspecs instead. Refs supplied by
 `remote.<name>.push` are parsed and checked by the same source/destination
 rules. Unsafe refspec-less modes, config-query failures, wildcards, matching
-refspecs, mirrors, and command-local push overrides fail closed and require an
-explicit `HEAD:<destination>`. Push options that take a separate value are
+refspecs, and mirrors fail closed and require an explicit
+`HEAD:<destination>`. Command-local git config (`-c`, `--config-env`, and
+`GIT_CONFIG_*` in the environment) is refused outright on a governed push:
+the gate resolves destinations with its own `git config` subprocess, which
+cannot see config supplied to that invocation, so it would be validating a
+different push from the one git performs. Push options that take a separate value are
 consumed before identifying the remote and refspecs, so option payloads cannot
 shift the source/destination parse.
 

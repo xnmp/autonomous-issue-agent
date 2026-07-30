@@ -529,29 +529,34 @@ def bypass_reason(
                     f"force-push/delete targeting protected branch '{dst}' is not "
                     f"allowed. The fixer only pushes its own feature branch."
                 )
-        if (
-            sub is not None
-            and sub[0] == "push"
-            and not parse_push_args(sub[1]).candidate_refspecs
-        ):
+        if sub is not None and sub[0] == "push":
+            # The gate resolves push destinations with its OWN `git config`
+            # subprocess, which cannot see config supplied to THIS invocation.
+            # Enumerating the dangerous keys is the losing game: `remote.*.push`
+            # was closed by name, and `remote.*.mirror` (a whole-ref mirror
+            # push) and `push.default=matching` walked through the same door.
+            # Nor can the refspec-less path be singled out — a `-c` value is
+            # itself ambiguous to argv parsing. So: no command-local config on
+            # a governed push, at all. Plain `git push origin HEAD:<branch>` is
+            # unaffected, and that is what the harness actually runs.
+            reason = (
+                "command-local git config cannot be seen by the gate's own "
+                "config lookup, so this push cannot be validated; drop the "
+                "-c/--config-env override and push HEAD:<destination>"
+            )
             for index, word in enumerate(full_words):
-                value = ""
-                if word == "-c" and index + 1 < len(full_words):
-                    value = full_words[index + 1]
-                elif word.startswith("-c") and len(word) > 2:
-                    value = word[2:]
-                if re.match(r"(?i)^remote\..+\.push=", value):
-                    return (
-                        "command-local remote.*.push overrides cannot be "
-                        "validated; use an explicit HEAD:<destination> refspec"
-                    )
-                if word.startswith("--config-env="):
-                    name = word.removeprefix("--config-env=").split("=", 1)[0]
-                    if re.match(r"(?i)^remote\..+\.push$", name):
-                        return (
-                            "command-local remote.*.push overrides cannot be "
-                            "validated; use an explicit HEAD:<destination> refspec"
-                        )
+                if word == "-c" or (word.startswith("-c") and len(word) > 2):
+                    return reason
+                if word == "--config-env" or word.startswith("--config-env="):
+                    return reason
+            for assignment in all_env:
+                name = assignment.split("=", 1)[0]
+                if re.match(
+                    r"(?i)^GIT_CONFIG(_PARAMETERS|_COUNT|_KEY_\d+|_VALUE_\d+"
+                    r"|_GLOBAL|_SYSTEM|_NOSYSTEM)?$",
+                    name,
+                ):
+                    return reason
 
     # --no-verify (long form) is unambiguous on both commit and push.
     if "--no-verify" in full_words:

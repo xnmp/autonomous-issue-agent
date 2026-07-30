@@ -355,7 +355,39 @@ CASES = (
              "origin",
          ],
          False, env={"TEST_CMD": "test -f impl.py"}, open_pr="13",
-         reason_contains="command-local remote"),
+         reason_contains="command-local git config"),
+    # `remote.*.push` was closed by name; `remote.*.mirror` and
+    # `push.default=matching` walked through the same door, because the gate
+    # resolves a refspec-less push with its OWN `git config` subprocess, which
+    # cannot see config given to this invocation. Mirror mode pushes every ref,
+    # so an unvalidated open-PR branch rides along. Pinned as a class.
+    Case("command_local_mirror_cannot_hide_unvalidated_branch", "push",
+         _bulk_push_with_unvalidated_branch,
+         ["-c", "remote.origin.mirror=true", "push", "origin"],
+         False, env={"TEST_CMD": "test -f impl.py"}, open_pr="14",
+         reason_contains="command-local git config"),
+    Case("command_local_push_default_cannot_hide_unvalidated_branch", "push",
+         _bulk_push_with_unvalidated_branch,
+         ["-c", "push.default=matching", "push", "origin"],
+         False, env={"TEST_CMD": "test -f impl.py"}, open_pr="14",
+         reason_contains="command-local git config"),
+    Case("config_env_cannot_hide_unvalidated_branch", "push",
+         _bulk_push_with_unvalidated_branch,
+         ["--config-env=remote.origin.mirror=SNEAKY", "push", "origin"],
+         False, env={"TEST_CMD": "test -f impl.py"}, open_pr="14",
+         reason_contains="command-local git config"),
+    # Even with an explicit refspec: the gate cannot see the override, so it
+    # cannot know the push it validated is the push git will perform.
+    Case("command_local_config_rejected_even_with_explicit_refspec", "push",
+         _valid,
+         ["-c", "remote.origin.mirror=true", "push", "origin",
+          "HEAD:refs/heads/fix/13-correct-test"],
+         False, env={"TEST_CMD": "test -f impl.py"}, open_pr="13",
+         reason_contains="command-local git config"),
+    # The ordinary push the harness actually runs stays allowed.
+    Case("plain_explicit_refspec_push_still_allowed", "push", _valid,
+         ["push", "origin", "HEAD:refs/heads/fix/13-correct-test"],
+         True, env={"TEST_CMD": "test -f impl.py"}, open_pr="13"),
 )
 
 

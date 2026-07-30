@@ -15,6 +15,20 @@ fail() { echo "Push blocked: $1"; exit 1; }
 
 base="${BASE_BRANCH:-dev}"
 
+# Twin of adapters/governor_policy.py:bypass_reason. The gate reads git config
+# with its own subprocess, blind to config given to THIS invocation, so it
+# cannot validate any push carrying a command-local override. Enumerating keys
+# lost twice (remote.*.push closed by name; remote.*.mirror and
+# push.default=matching walked through the same door), and a `-c` value is
+# ambiguous to argv parsing besides — so reject the class.
+for arg in "$@"; do
+  case "$arg" in
+    -c|-c?*|--config-env|--config-env=*)
+      fail "command-local git config cannot be seen by the gate's own config lookup, so this push cannot be validated; drop the -c/--config-env override and push HEAD:<destination>"
+      ;;
+  esac
+done
+
 consume_push_value=""
 for arg in "$@"; do
   if [ -n "$consume_push_value" ]; then
@@ -35,24 +49,6 @@ for arg in "$@"; do
       fail "bulk push modes (--all/--branches/--mirror) cannot be validated against one checkout HEAD; push explicit HEAD:<destination> refspecs instead"
       ;;
   esac
-done
-
-previous_arg=""
-for arg in "$@"; do
-  config_override=""
-  if [ "$previous_arg" = "-c" ]; then
-    config_override="$arg"
-  fi
-  case "$arg" in
-    -cremote.*.push=*) config_override="${arg#-c}" ;;
-    --config-env=remote.*.push=*) config_override="${arg#--config-env=}" ;;
-  esac
-  case "$config_override" in
-    remote.*.push=*)
-      fail "command-local remote.*.push overrides cannot be validated; use an explicit HEAD:<destination> refspec"
-      ;;
-  esac
-  previous_arg="$arg"
 done
 
 prc_check_push_destination() {
