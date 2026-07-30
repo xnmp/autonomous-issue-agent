@@ -450,8 +450,8 @@ def build_gate_context(
             return False
         return git(["cat-file", "-e", f"{baseref}:{path}"], cwd).code == 0
 
-    def exists_now(path: str) -> bool:
-        return os.path.exists(os.path.join(cwd, path))
+    def exists_at_head(path: str) -> bool:
+        return git(["cat-file", "-e", f"HEAD:{path}"], cwd).code == 0
 
     def _default_run_tests(cmd: str) -> bool | None:
         """Run the test command via `governor.run_target_command` (env scrub +
@@ -523,7 +523,7 @@ def build_gate_context(
         harness_test_cmd=markers.test_cmd(),
         env_test_cmd=env_test_cmd,
         exists_at_base=exists_at_base,
-        exists_now=exists_now,
+        exists_at_head=exists_at_head,
         run_tests=rt,
         revert_and_run=revert_and_run,
         red_must_fail=red_must_fail,

@@ -357,7 +357,7 @@ diff --git a/tests/test_cost.py b/tests/test_cost.py
 """
 
 
-def test_test_immutability_exception_is_loud_in_every_reviewer_diff_context():
+def test_test_immutability_exception_is_loud_in_every_full_pr_diff_context():
     initial = build_review_task(100, "PR title", "desc", _TEST_EXCEPTION_DIFF, RCFG)
     resumed = build_re_review_task(
         100, 2, "old", "new", _TEST_EXCEPTION_DIFF, "session", RCFG

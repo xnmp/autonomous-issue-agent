@@ -167,6 +167,9 @@ class ReviewWorkflow:
             return
         # SINGLE and DELEGATED share the submit-before-persist contract; they differ
         # only in the task builder (delegated attaches a code-scout subagent).
+        # Always the full base-to-HEAD PR diff, not an incremental review delta:
+        # reviewer prompts must retain tracked test-exception declarations from
+        # earlier commits on every fresh/delegated re-review.
         diff = self.gateway.pr_diff(pr)
         signature = review_dom.patch_signature(diff)
         if self.cfg.review_mode is review_dom.ReviewMode.DELEGATED:

@@ -437,7 +437,7 @@ def parse_test_immutability_exceptions(
         if len(fields) != 4:
             return (), f"malformed test-immutability exception on line {number}"
         issue, path, reason, replacement = fields
-        if not issue.isdigit() or int(issue) <= 0:
+        if re.fullmatch(r"[1-9][0-9]*", issue) is None:
             return (), f"malformed test-immutability exception on line {number}: invalid issue"
         if not _valid_repo_test_path(path):
             return (), f"malformed test-immutability exception on line {number}: invalid test file"
@@ -463,7 +463,7 @@ def check_tests_immutable(
     changed: Iterable[str],
     exists_at_base: Callable[[str], bool],
     *,
-    exists_now: Callable[[str], bool] = lambda _path: True,
+    exists_at_head: Callable[[str], bool] = lambda _path: True,
     issue_number: int | None = None,
     exception_manifest: str = "",
 ) -> GateResult:
@@ -502,7 +502,7 @@ def check_tests_immutable(
                 f"existing test file '{path}' was modified/deleted — add NEW tests "
                 "instead of changing existing ones"
             )
-        if exists_now(path):
+        if exists_at_head(path):
             continue
         replacement = declaration.replacement
         if not replacement:
@@ -513,7 +513,7 @@ def check_tests_immutable(
         if (
             replacement not in changed_files
             or exists_at_base(replacement)
-            or not exists_now(replacement)
+            or not exists_at_head(replacement)
         ):
             return deny(
                 f"replacement test '{replacement}' for deleted '{path}' must be a "

@@ -96,7 +96,7 @@ class GateContext:
     # the agent must not be able to grant itself the exemption.
     allow_untested: bool = False
     exists_at_base: Callable[[str], bool] = lambda f: False
-    exists_now: Callable[[str], bool] = lambda f: True
+    exists_at_head: Callable[[str], bool] = lambda f: True
     run_tests: Callable[[str], bool | None] = lambda c: True
     revert_and_run: Callable[[tuple[str, ...]], bool | None] = lambda impl: False
     red_must_fail: bool = True
@@ -402,7 +402,7 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
         lambda: gate.check_tests_immutable(
             ctx.changed_files,
             ctx.exists_at_base,
-            exists_now=ctx.exists_now,
+            exists_at_head=ctx.exists_at_head,
             issue_number=gate.branch_issue_number(ctx.branch),
             exception_manifest=ctx.test_immutability_exceptions,
         ),
@@ -496,7 +496,7 @@ def _push_gate_for_branch(branch: str, ctx: GateContext) -> list[str]:
         lambda: gate.check_tests_immutable(
             ctx.changed_files,
             ctx.exists_at_base,
-            exists_now=ctx.exists_now,
+            exists_at_head=ctx.exists_at_head,
             issue_number=gate.branch_issue_number(ctx.branch),
             exception_manifest=ctx.test_immutability_exceptions,
         ),

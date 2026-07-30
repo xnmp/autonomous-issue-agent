@@ -455,6 +455,29 @@ def _dirty_manifest_override_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def _unicode_issue_exception_repo(tmp_path: Path) -> Path:
+    return _test_exception_repo(
+        tmp_path,
+        "１３ | tests/test_keep.py | Unicode digits are not the manifest grammar |\n",
+    )
+
+
+def _dirty_recreated_deleted_test_repo(tmp_path: Path) -> Path:
+    repo = _weakened_test_repo(tmp_path)
+    _git(repo, "rm", "tests/test_keep.py")
+    _git(repo, "commit", "-qm", "test: remove obsolete expectation")
+    manifest = repo / ".harness" / "test-immutability-exceptions"
+    manifest.write_text(
+        "13 | tests/test_keep.py | deleted expectation requires replacement |\n"
+    )
+    _git(repo, "add", "-f", ".harness/test-immutability-exceptions")
+    _git(repo, "commit", "-qm", "chore: declare deleted test")
+    (repo / "tests" / "test_keep.py").write_text(
+        "def test_keep(): assert True  # dirty recreation must not count\n"
+    )
+    return repo
+
+
 GOLDEN: tuple[Case, ...] = (
     # ── the happy path: everything the harness asks for, allowed by both ─────
     Case("good_pr", "pr", compliant_pr_repo, _pr_argv(), True),
@@ -505,6 +528,10 @@ GOLDEN: tuple[Case, ...] = (
     Case("existing_test_dirty_declaration_ignored", "pr", _dirty_manifest_override_repo,
          _pr_argv(), False, env={"TEST_CMD": "true"},
          reason_contains="unchanged or new file"),
+    Case("existing_test_unicode_issue_malformed", "pr", _unicode_issue_exception_repo,
+         _pr_argv(), False, env={"TEST_CMD": "true"}, reason_contains="invalid issue"),
+    Case("deleted_test_dirty_recreation_ignored", "pr", _dirty_recreated_deleted_test_repo,
+         _pr_argv(), False, env={"TEST_CMD": "true"}, reason_contains="replacement"),
 
     # ── ADR citation (§9) — PORTED to Python in wave P1-2. Before the port the
     #    Python column of these two rows was ALLOW/ALLOW: the rule was dead on
@@ -677,6 +704,8 @@ def test_golden_covers_every_rule_family() -> None:
         "existing_test_declaration_mismatch": "test-immutability",
         "existing_test_declaration_malformed": "test-immutability",
         "existing_test_dirty_declaration_ignored": "test-immutability",
+        "existing_test_unicode_issue_malformed": "test-immutability",
+        "deleted_test_dirty_recreation_ignored": "test-immutability",
         "adr_governed_path_uncited": "adr", "adr_governed_path_cited": "adr",
         "adr_governs_untouched_path": "adr",
         "lint_fails": "project-commands", "lint_passes": "project-commands",

@@ -299,14 +299,14 @@ prc_check_tests_immutable() {  # prc_check_tests_immutable "<changed-file-list>"
       done <<< "$manifest"
       [ -n "$matched" ] \
         || fail "existing test file '$f' was modified/deleted — add NEW tests instead of changing existing ones"
-      [ -e "$f" ] && continue
+      git cat-file -e "HEAD:$f" 2>/dev/null && continue
       [ -n "$replacement" ] \
         || fail "existing test file '$f' was deleted — its exception must name a replacement test"
       printf '%s\n' "$1" | grep -qxF "$replacement" \
         || fail "replacement test '$replacement' for deleted '$f' must be a new test file in this change"
       if git cat-file -e "origin/$base:$replacement" 2>/dev/null \
           || git cat-file -e "$base:$replacement" 2>/dev/null \
-          || [ ! -e "$replacement" ]; then
+          || ! git cat-file -e "HEAD:$replacement" 2>/dev/null; then
         fail "replacement test '$replacement' for deleted '$f' must be a new test file in this change"
       fi
     fi
