@@ -299,6 +299,127 @@ def test_existing_test_must_not_change():
     assert check_tests_immutable(["tests/test_new.py"], lambda f: f in existed).ok
 
 
+def test_existing_test_can_change_with_matching_issue_scoped_exception():
+    changed = ["tests/test_app.py"]
+    manifest = (
+        "124 | tests/test_app.py | old expectation encodes the pricing bug | \n"
+    )
+
+    result = check_tests_immutable(
+        changed,
+        lambda path: path == "tests/test_app.py",
+        exists_now=lambda path: path == "tests/test_app.py",
+        issue_number=124,
+        exception_manifest=manifest,
+    )
+
+    assert result.ok
+
+
+def test_existing_test_exception_fails_closed_when_absent_mismatched_or_malformed():
+    changed = ["tests/test_app.py"]
+    exists_at_base = lambda path: path == "tests/test_app.py"
+    exists_now = lambda path: path == "tests/test_app.py"
+
+    assert not check_tests_immutable(
+        changed,
+        exists_at_base,
+        exists_now=exists_now,
+        issue_number=124,
+    ).ok
+    assert not check_tests_immutable(
+        changed,
+        exists_at_base,
+        exists_now=exists_now,
+        issue_number=124,
+        exception_manifest=(
+            "124 | tests/test_other.py | wrong expectation | \n"
+        ),
+    ).ok
+    malformed = check_tests_immutable(
+        changed,
+        exists_at_base,
+        exists_now=exists_now,
+        issue_number=124,
+        exception_manifest="124 | tests/test_app.py | missing replacement field\n",
+    )
+    assert not malformed.ok
+    assert "malformed" in malformed.reason
+
+
+def test_existing_test_exception_must_match_the_current_branch_issue():
+    result = check_tests_immutable(
+        ["tests/test_app.py"],
+        lambda _path: True,
+        exists_now=lambda _path: True,
+        issue_number=125,
+        exception_manifest=(
+            "124 | tests/test_app.py | old expectation encodes the bug | \n"
+        ),
+    )
+
+    assert not result.ok
+    assert "issue #125" in result.reason
+
+
+def test_deleted_existing_test_requires_a_new_changed_replacement_test():
+    manifest = (
+        "124 | tests/test_app.py | obsolete expectation moved to focused coverage "
+        "| tests/test_app_regression.py\n"
+    )
+    changed = ["tests/test_app.py", "tests/test_app_regression.py"]
+    exists_at_base = lambda path: path == "tests/test_app.py"
+
+    allowed = check_tests_immutable(
+        changed,
+        exists_at_base,
+        exists_now=lambda path: path == "tests/test_app_regression.py",
+        issue_number=124,
+        exception_manifest=manifest,
+    )
+    denied_without_replacement = check_tests_immutable(
+        ["tests/test_app.py"],
+        exists_at_base,
+        exists_now=lambda _path: False,
+        issue_number=124,
+        exception_manifest=(
+            "124 | tests/test_app.py | obsolete expectation was wrong | \n"
+        ),
+    )
+
+    assert allowed.ok
+    assert not denied_without_replacement.ok
+    assert "replacement" in denied_without_replacement.reason
+
+
+def test_deleted_existing_test_rejects_unchanged_or_non_test_replacement():
+    changed = ["tests/test_app.py", "src/app.py"]
+    exists_at_base = lambda path: path in {"tests/test_app.py", "tests/test_old.py"}
+    exists_now = lambda path: path in {"tests/test_old.py", "src/app.py"}
+
+    unchanged = check_tests_immutable(
+        changed,
+        exists_at_base,
+        exists_now=exists_now,
+        issue_number=124,
+        exception_manifest=(
+            "124 | tests/test_app.py | moved coverage | tests/test_old.py\n"
+        ),
+    )
+    non_test = check_tests_immutable(
+        changed,
+        exists_at_base,
+        exists_now=exists_now,
+        issue_number=124,
+        exception_manifest=(
+            "124 | tests/test_app.py | moved coverage | src/app.py\n"
+        ),
+    )
+
+    assert not unchanged.ok
+    assert not non_test.ok
+
+
 # ── markers + adversarial ─────────────────────────────────────────────────────
 def test_markers_required():
     assert not check_markers(False, True).ok
