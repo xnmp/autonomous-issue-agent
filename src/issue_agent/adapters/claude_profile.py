@@ -9,10 +9,11 @@ Anthropic's, so `AgentRunner` is reused verbatim.
 
 Two reasons the env must be injected explicitly rather than left to the CLI:
 
-  * the daemon runs SDK sessions with `setting_sources=["project"]`, so a
-    profile's `settings.json` is never loaded — including its `env` block. That
-    exclusion is DESIRED (an interactive profile's hooks/plugins have no place in
-    a headless daemon); only the env is wanted, so only the env is taken.
+  * the daemon runs SDK sessions with `setting_sources=[]`, so neither a
+    profile nor an untrusted target repository can inject settings or CLAUDE.md
+    into provider authority. That exclusion is DESIRED (interactive hooks and
+    plugins have no place in a headless daemon); only the endpoint env is wanted,
+    so only the env is taken.
   * `ANTHROPIC_API_KEY` must be actively BLANKED. Inherited from the launching
     shell it would let the CLI fall back to Anthropic credentials and bill a
     real Anthropic account for what was configured as a GLM run.

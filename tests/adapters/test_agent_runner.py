@@ -94,7 +94,12 @@ def test_tools_model_budget_cwd_resume_map():
     assert kw["cwd"] == "/wt/issue-5"
     assert kw["resume"] == "sess-123"
     assert kw["fork_session"] is True
-    assert kw["setting_sources"] == ["project"]
+    assert kw["setting_sources"] == []
+
+
+def test_target_project_settings_are_never_loaded_as_provider_authority():
+    kw = build_option_kwargs(RuntimePlan(prompt="x", cwd="/target"))
+    assert kw["setting_sources"] == []
 
 
 def test_mcp_servers_and_tool_globs():

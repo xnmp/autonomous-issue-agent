@@ -112,11 +112,13 @@ and makes genuinely unrecoverable spend visible before capacity is released.
 At upgrade, current and rotated legacy ledgers are imported idempotently into
 repository-daily, global-daily, and issue-lifetime scopes before paid
 admission; malformed or unattributed rows require operator repair.
-The 2026-07-31 migration rehearsal replayed 303 real historical rows twice,
-matched source digest/count/amount/window, passed SQLite integrity, and
-completed an admitted-and-settled primary-store canary without changing the
-legacy source. The canary was executed against the pre-existing live primary
-database, not a temporary rehearsal store. Machine-readable evidence is in
+The 2026-07-31 migration rehearsal replayed a 98.531-hour, 303-row historical
+window twice; matched source digest, per-scope balances, count, amount, and
+failure decisions; and exercised ordinary, exhausted, duplicate, and
+conflicting-receipt admissions on the pre-existing live primary database.
+The v9 adoption baseline and every later migration are immutable,
+digest-validated, and individually transactional; restart tests interrupt
+both sides of every migration commit boundary. Machine-readable evidence is in
 `control-store-migration-evidence.json`.
 JSONL is bounded
 schema-v2 telemetry and a projection feed; losing it cannot authorize a write,
@@ -191,9 +193,12 @@ leases are reclaimed.
 `SIGTERM` moves the daemon through `RUNNING → DRAINING → STOPPED`: paid
 admission stops first, active work receives a bounded cancellation window,
 handover and receipts are persisted, the outbox is flushed, and remaining
-groups are killed. Missing the shutdown deadline changes a clean request to a
-transient exit; a second SIGTERM hard-exits transiently so boot recovery owns
-the remaining receipts. Exit codes distinguish clean/operator stops, transient
+groups are killed. Before a deadline-forced hard exit, one control transaction
+releases every owned reservation with unknown-spend provenance, terminalizes
+the run, removes its lease, and persists cancellation intent; state-owned
+handovers and the resulting outbox transitions are then flushed. Missing the
+shutdown deadline changes a clean request to a transient exit. Exit codes
+distinguish clean/operator stops, transient
 failures, invalid configuration, duplicate instances, incompatible schemas,
 and corrupt stores so service managers do not restart permanent failures.
 
@@ -208,7 +213,9 @@ every reservation and lifecycle command.
 Untrusted repository, issue, review, CI, and Jira text crosses into planners as
 `domain/trust.py::Untrusted`; raw strings are rejected at the fence boundary.
 Target `AGENTS.md` and `CLAUDE.md` files share one byte ceiling and one encoded
-untrusted block when delivered to Codex.
+untrusted block appended only to the user task for both providers. Codex
+project-document loading and Claude project setting sources are disabled, so
+target files never enter developer/system authority.
 Child agent processes receive an explicit environment allowlist plus only the
 selected provider credential. GitHub, SSH, and git publication credentials are
 hard-denied; branch/PR publication goes through the durable broker.
@@ -241,6 +248,7 @@ module requires placing it in the appropriate tier and explaining it here.
 `adapters/heartbeat.py`, `adapters/journal.py`,
 `adapters/operator_effects.py`, `adapters/process_supervisor.py`,
 `adapters/reload.py`,
+`adapters/repository_guidance.py`,
 `adapters/runtime_plan.py`, `adapters/single_instance.py`,
 `adapters/spend_recovery.py`, `adapters/store.py`,
 `adapters/supervised_exec.py`, `adapters/systemd_notify.py`,

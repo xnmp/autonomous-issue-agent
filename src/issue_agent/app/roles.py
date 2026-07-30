@@ -385,6 +385,41 @@ def _shutdown_finalize(
     return finalize
 
 
+def _shutdown_terminalize(
+    control: SQLiteControlStore,
+    *,
+    owner_id: str,
+    state_dir: str,
+    role: str,
+) -> Callable[[], object]:
+    """Make the hard-deadline path durably terminal before `os._exit`."""
+
+    from ..adapters.handover import write_shutdown_handover
+
+    reason = "shutdown_deadline_spend_unknown"
+
+    def terminalize() -> object:
+        control.terminalize_owned_runs(owner_id, reason)
+        written = 0
+        for intent in control.pending_cancellation_intents(owner_id):
+            receipt = write_shutdown_handover(
+                state_dir=state_dir,
+                role=role,
+                issue=intent.issue_number,
+                run_id=str(intent.run_id),
+                kind=intent.kind,
+                reason=intent.reason,
+            )
+            if receipt is None:
+                continue
+            control.mark_cancellation_handover_written(intent.run_id)
+            written += 1
+        control.flush_bound_outbox()
+        return written
+
+    return terminalize
+
+
 def _reported_world(
     observe: Callable,
     control: SQLiteControlStore,
@@ -786,7 +821,11 @@ def _bind_claude_fix_runtime(
     _runtime_config: CodexRuntimeConfig,
     runner: AgentRuntime,
 ) -> _FixRuntimeBinding:
-    return _FixRuntimeBinding(runner)
+    from ..adapters.repository_guidance import RepositoryGuidanceRuntime
+
+    return _FixRuntimeBinding(
+        RepositoryGuidanceRuntime(runner, log=_log("fix"))
+    )
 
 
 def _bind_codex_fix_runtime(
@@ -870,8 +909,13 @@ def _bind_glm_fix_runtime(
         f"glm: runtime ready (endpoint {endpoint_host(environment)}, "
         f"profile {environment['CLAUDE_CONFIG_DIR']})"
     )
+    from ..adapters.repository_guidance import RepositoryGuidanceRuntime
+
     return _FixRuntimeBinding(
-        EnvInjectingRuntime(runner, env=environment)
+        RepositoryGuidanceRuntime(
+            EnvInjectingRuntime(runner, env=environment),
+            log=log,
+        )
     )
 
 
@@ -903,7 +947,11 @@ def _bind_claude_review_runtime(
     _runtime_config: ReviewRuntimeConfig,
     runner: AgentRuntime,
 ) -> _ReviewRuntimeBinding:
-    return _ReviewRuntimeBinding(runner)
+    from ..adapters.repository_guidance import RepositoryGuidanceRuntime
+
+    return _ReviewRuntimeBinding(
+        RepositoryGuidanceRuntime(runner, log=_log("review"))
+    )
 
 
 def _bind_codex_review_runtime(
@@ -1761,6 +1809,12 @@ def build_fix_daemon(
         heartbeat_path=os.path.join(cfg.state_dir, "heartbeat.json"),
         recover=recovery,
         finalize=_shutdown_finalize(control, effect_executor),
+        terminalize=_shutdown_terminalize(
+            control,
+            owner_id=f"{cfg.repo}:fix",
+            state_dir=cfg.state_dir,
+            role="fix",
+        ),
     )
     daemon_ref["daemon"] = daemon
     return daemon
@@ -1932,7 +1986,13 @@ def build_review_daemon(
                       cfg.review_state_dir, "heartbeat.json"
                   ),
                   recover=recovery,
-                  finalize=_shutdown_finalize(control, effect_executor))
+                  finalize=_shutdown_finalize(control, effect_executor),
+                  terminalize=_shutdown_terminalize(
+                      control,
+                      owner_id=f"{cfg.repo}:review",
+                      state_dir=cfg.review_state_dir,
+                      role="review",
+                  ))
 
 
 _CODEOWNERS_PATHS = ("CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS")
@@ -2153,4 +2213,10 @@ def build_steward_daemon(
                       cfg.steward_state_dir, "heartbeat.json"
                   ),
                   recover=recovery,
-                  finalize=_shutdown_finalize(control, effect_executor))
+                  finalize=_shutdown_finalize(control, effect_executor),
+                  terminalize=_shutdown_terminalize(
+                      control,
+                      owner_id=f"{cfg.repo}:steward",
+                      state_dir=cfg.steward_state_dir,
+                      role="steward",
+                  ))

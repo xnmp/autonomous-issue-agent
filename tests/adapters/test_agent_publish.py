@@ -30,6 +30,8 @@ class Remote:
             return CommandResult(0, self.head + "\n")
         if argv == ("git", "branch", "--show-current"):
             return CommandResult(0, self.branch + "\n")
+        if argv == ("git", "remote", "get-url", "--push", "origin"):
+            return CommandResult(0, "git@github.com:o/r.git\n")
         if argv[:3] == ("git", "ls-remote", "--heads"):
             output = (
                 f"{self.remote}\trefs/heads/{self.branch}\n"
@@ -99,6 +101,13 @@ def test_push_is_committed_then_receipted(tmp_path):
 
     assert result.code == 0
     assert len(remote.effects) == 1
+    assert remote.effects[0] == (
+        "git",
+        "push",
+        "--force-with-lease",
+        "origin",
+        "HEAD:refs/heads/issue-42",
+    )
     assert control.pending_commands() == ()
     with control._connect() as db:
         kind, state, attempts = db.execute(
@@ -198,6 +207,8 @@ def test_pr_body_file_is_snapshotted_before_command_commit(tmp_path):
     effect = remote.effects[0]
     assert "--body-file" not in effect
     assert effect[effect.index("--body") + 1] == "Fixes #42\n"
+    assert effect[effect.index("--repo") + 1] == "o/r"
+    assert effect[effect.index("--head") + 1] == "issue-42"
 
 
 @pytest.mark.parametrize(
@@ -206,6 +217,8 @@ def test_pr_body_file_is_snapshotted_before_command_commit(tmp_path):
         ("git", "push", "--dry-run", "origin", "HEAD:issue-42"),
         ("git", "push", "--force", "origin", "HEAD:main"),
         ("git", "push", "--tags", "origin"),
+        ("git", "push", "upstream", "HEAD:issue-42"),
+        ("git", "push", "origin", "other:issue-42"),
     ),
 )
 def test_broker_rejects_non_effects_and_broad_or_protected_pushes(
@@ -213,3 +226,60 @@ def test_broker_rejects_non_effects_and_broad_or_protected_pushes(
 ):
     with pytest.raises(ValueError):
         broker(tmp_path, Remote()).publish(args, str(tmp_path))
+
+
+@pytest.mark.parametrize(
+    "args",
+    (
+        (
+            "gh",
+            "pr",
+            "create",
+            "--repo",
+            "attacker/other",
+            "--title",
+            "Fix",
+        ),
+        (
+            "gh",
+            "pr",
+            "create",
+            "--head=attacker:branch",
+            "--title",
+            "Fix",
+        ),
+        (
+            "gh",
+            "pr",
+            "create",
+            "-Rattacker/other",
+            "--title",
+            "Fix",
+        ),
+    ),
+)
+def test_broker_rejects_cross_repository_pull_request_scope(tmp_path, args):
+    with pytest.raises(ValueError, match="fixed by the durable command"):
+        broker(tmp_path, Remote()).publish(args, str(tmp_path))
+
+
+def test_broker_rejects_origin_for_a_different_repository(tmp_path):
+    remote = Remote()
+
+    def run(argv, cwd):
+        if argv == ("git", "remote", "get-url", "--push", "origin"):
+            return CommandResult(0, "git@github.com:attacker/other.git\n")
+        return remote.run(argv, cwd)
+
+    publisher = AgentPublicationBroker(
+        store(tmp_path),
+        repository="o/r",
+        owner="o/r:fix",
+        run=run,
+    )
+
+    with pytest.raises(ValueError, match="configured repository"):
+        publisher.publish(
+            ("git", "push", "origin", "HEAD:issue-42"),
+            str(tmp_path),
+        )

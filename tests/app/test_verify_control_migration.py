@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from issue_agent.adapters.control_store import SQLiteControlStore
 from scripts.verify_control_migration import summarize_legacy, verify
 
 
@@ -34,34 +35,41 @@ def _ledger(path, *, hours=48, malformed=False):
 def test_shadow_replay_and_primary_canary_are_independently_verified(tmp_path):
     ledger = tmp_path / "spend.jsonl"
     _ledger(ledger)
+    database = tmp_path / "control.db"
+    SQLiteControlStore(str(database)).initialize()
 
     report = verify(
         ledger,
-        tmp_path / "control.db",
+        database,
         canary_repository="o/r",
         minimum_hours=24,
     )
 
     assert report["status"] == "passed"
     assert report["legacy"]["amount_micros"] == 3_250_000
-    assert report["shadow"] == {
-        "rows_match": True,
-        "totals_match": True,
-        "rejected_rows_match": True,
-        "idempotent_replay": True,
-        "representative_hours": 48.0,
+    assert report["shadow"]["rows_match"] is True
+    assert report["shadow"]["totals_match"] is True
+    assert report["shadow"]["scope_balance_fingerprint_match"] is True
+    assert report["shadow"]["admission_decisions"] == {
+        "ordinary_match": True,
+        "cap_exhaustion_match": True,
     }
-    assert report["primary_canary"]["database_preexisting"] is False
+    assert all(report["shadow"]["deduplication_decisions"].values())
+    assert all(report["shadow"]["failure_decisions"].values())
+    assert report["primary_canary"]["database_preexisting"] is True
     assert report["primary_canary"]["legacy_export_unchanged"] is True
+    assert report["provenance"]["source_digest"] == report["legacy"]["source_digest"]
 
 
 def test_verifier_rejects_short_or_malformed_windows(tmp_path):
     short = tmp_path / "short.jsonl"
     _ledger(short, hours=1)
     with pytest.raises(RuntimeError, match="require 24h"):
+        database = tmp_path / "short.db"
+        SQLiteControlStore(str(database)).initialize()
         verify(
             short,
-            tmp_path / "short.db",
+            database,
             canary_repository="o/r",
             minimum_hours=24,
         )
@@ -69,10 +77,25 @@ def test_verifier_rejects_short_or_malformed_windows(tmp_path):
     malformed = tmp_path / "malformed.jsonl"
     _ledger(malformed, malformed=True)
     assert summarize_legacy(malformed).rejected == 1
+    malformed_database = tmp_path / "malformed.db"
+    SQLiteControlStore(str(malformed_database)).initialize()
     with pytest.raises(RuntimeError, match="rejected 1"):
         verify(
             malformed,
-            tmp_path / "malformed.db",
+            malformed_database,
+            canary_repository="o/r",
+            minimum_hours=24,
+        )
+
+
+def test_verifier_refuses_a_synthetic_nonoperational_database(tmp_path):
+    ledger = tmp_path / "spend.jsonl"
+    _ledger(ledger)
+
+    with pytest.raises(RuntimeError, match="existing operational"):
+        verify(
+            ledger,
+            tmp_path / "missing.db",
             canary_repository="o/r",
             minimum_hours=24,
         )

@@ -10,6 +10,7 @@ import pytest
 import issue_agent.adapters.handover as handover_adapter
 from tests.fakes.legacy_journal import Journal
 from issue_agent.adapters.journal import JournalingRuntime, read_events
+from issue_agent.adapters.handover import write_shutdown_handover
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.outcome import AgentResult, ExitReason
 
@@ -27,6 +28,24 @@ class RecordingRuntime:
 class CancellingRuntime:
     async def run(self, _task: RuntimePlan) -> AgentResult:
         raise asyncio.CancelledError()
+
+
+def test_hard_deadline_writes_state_owned_cancellation_handover(tmp_path):
+    receipt = write_shutdown_handover(
+        state_dir=str(tmp_path),
+        role="fix",
+        issue=82,
+        run_id="run-82",
+        kind="RESOLVE",
+        reason="shutdown_deadline_spend_unknown",
+    )
+
+    assert receipt is not None
+    path = tmp_path / "handovers" / "issue-82.md"
+    content = path.read_text()
+    assert "operator_cancelled" in content
+    assert "run-82" in content
+    assert "unknown spend provenance" in content
 
 
 def _git(repo: Path, *args: str) -> None:

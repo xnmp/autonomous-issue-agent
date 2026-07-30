@@ -153,6 +153,67 @@ def write_exhaustion_handover(
         return None
 
 
+def write_shutdown_handover(
+    *,
+    state_dir: str,
+    role: str,
+    issue: int | None,
+    run_id: str,
+    kind: str,
+    reason: str,
+) -> HandoverReceipt | None:
+    """Persist cancellation intent when a worker cannot return before exit."""
+
+    if not state_dir or not role or not run_id or not reason:
+        return None
+    filename = (
+        f"issue-{issue}.md"
+        if issue is not None and issue > 0
+        else f"run-{hashlib.sha256(run_id.encode()).hexdigest()[:16]}.md"
+    )
+    path = Path(state_dir) / "handovers" / filename
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        marker = (
+            f"<!-- issue-agent-handover role={role} issue={issue} -->"
+            if issue is not None and issue > 0
+            else (
+                "<!-- issue-agent-shutdown-handover "
+                f"role={role} run={hashlib.sha256(run_id.encode()).hexdigest()[:16]} -->"
+            )
+        )
+        content = (
+            f"{marker}\n"
+            "# Interrupted-leg handover\n\n"
+            "The daemon reached its bounded shutdown deadline after cancelling "
+            "and terminating the supervised process group. The control store "
+            "transactionally released the reservation, removed its lease, and "
+            "recorded this run as operator-cancelled with unknown spend "
+            "provenance.\n\n"
+            f"- Trigger: `{ExitReason.OPERATOR_CANCELLED.value}`\n"
+            f"- Run: `{_bounded_text(run_id, _MAX_SESSION_BYTES)}`\n"
+            f"- Kind: `{_bounded_text(kind, _MAX_SESSION_BYTES)}`\n"
+            f"- Reason: {_bounded_text(reason, _MAX_SUMMARY_BYTES)}\n\n"
+            "## Next step\n\n"
+            "Inspect the preserved worktree and provider rollout evidence. "
+            "Re-run verification before publishing, and do not infer that the "
+            "interrupted model request was free.\n"
+        )
+        encoded = content.encode("utf-8")
+        if len(encoded) > _MAX_HANDOVER_BYTES:
+            raise OSError(
+                f"rendered handover exceeds {_MAX_HANDOVER_BYTES} bytes"
+            )
+        _atomic_write(path, encoded)
+        return HandoverReceipt(
+            trigger=ExitReason.OPERATOR_CANCELLED.value,
+            byte_size=len(encoded),
+        )
+    except Exception as exc:  # noqa: BLE001 - deadline evidence is fail-soft
+        _warn(f"could not write {path}: {exc}")
+        return None
+
+
 def retire_delivered_handover(
     task: RuntimePlan,
     result: AgentResult,

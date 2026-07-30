@@ -392,6 +392,7 @@ def test_shutdown_reconciles_before_force_killing_remaining_processes():
         shutdown_timeout_seconds=0.1,
         finalize=lambda: order.append("reconcile"),
         force_kill_dispatches=lambda: order.append("kill"),
+        terminalize=lambda: order.append("terminalize"),
     )
 
     with pytest.raises(SystemExit):
@@ -401,7 +402,98 @@ def test_shutdown_reconciles_before_force_killing_remaining_processes():
             max_ticks=1,
         )
 
-    assert order == ["reconcile", "kill"]
+    assert order == ["reconcile", "kill", "terminalize"]
+    release.set()
+    daemon.wait_for_dispatches()
+
+
+def test_shutdown_deadline_commits_terminal_control_state_before_hard_exit(
+    tmp_path,
+):
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+
+    from issue_agent.adapters.control_store import (
+        ReservationRequest,
+        SQLiteControlStore,
+    )
+    from issue_agent.domain.actions import AgentKind, RunAgent
+    from issue_agent.domain.contracts import (
+        Money,
+        PriceQuote,
+        ReservationId,
+        RunId,
+        daily_budget_scope,
+    )
+
+    control = SQLiteControlStore(str(tmp_path / "control.db"))
+    control.initialize()
+    now = datetime.now(timezone.utc)
+    run_id = RunId("deadline-run")
+    request = ReservationRequest(
+        ReservationId("deadline-reservation"),
+        run_id,
+        json.dumps(
+            {
+                "kind": "RESOLVE",
+                "number": 7,
+                "issue": 7,
+                "breaker_key": 7,
+            }
+        ),
+        daily_budget_scope("o/r", "repository", "USD", now, ZoneInfo("UTC")),
+        PriceQuote(
+            "model",
+            "card",
+            "v1",
+            now,
+            Money("USD", 1_000_000),
+        ),
+        Money("USD", 2_000_000),
+        "config-v1",
+        kind="RESOLVE",
+        owner_id="o/r:fix",
+    )
+    assert control.reserve(request).admitted
+    control.register_process_lease(
+        run_id,
+        pid=123,
+        pgid=123,
+        process_start_ticks=99,
+    )
+    started = threading.Event()
+    release = threading.Event()
+
+    def run_agent(_action):
+        started.set()
+        release.wait(timeout=5)
+
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _world: [RunAgent(AgentKind.RESOLVE, 7)],
+        Executor(FakeGateway(), run_agent=run_agent),
+        poll_seconds=1,
+        dispatch_capacity=1,
+        shutdown_timeout_seconds=0.1,
+        force_kill_dispatches=lambda: None,
+        terminalize=lambda: control.terminalize_owned_runs(
+            "o/r:fix",
+            "shutdown_deadline_spend_unknown",
+        ),
+    )
+
+    with pytest.raises(SystemExit):
+        daemon.run_forever(
+            sleep=lambda _seconds: None,
+            now=lambda: 0,
+            max_ticks=1,
+        )
+
+    assert started.is_set()
+    assert control.active_reservation_runs("o/r:fix") == ()
+    assert control.leases("o/r:fix") == ()
+    assert control.pending_cancellation_intents("o/r:fix")[0].run_id == run_id
     release.set()
     daemon.wait_for_dispatches()
 

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlparse
 
 from ..domain.contracts import (
     CommandId,
@@ -200,22 +201,35 @@ class AgentPublicationBroker:
             "current branch",
         )
         if argv[:2] == ("git", "push"):
-            remote, destination = _push_target(argv[2:], branch)
+            normalized, destination = _normalized_push(argv[2:], branch)
+            remote = "origin"
+            remote_url = self._required_output(
+                ("git", "remote", "get-url", "--push", remote),
+                resolved_cwd,
+                "origin push URL",
+            )
+            _require_repository_remote(remote_url, self.repository)
             prior = self._remote_branch(remote, destination, resolved_cwd)
             if prior is None:
                 raise RuntimeError("cannot verify remote branch before push")
             kind = CommandKind.PUBLISH_BRANCH
             target = f"branch:{self.repository}:{destination}"
             payload: dict[str, object] = {
-                "argv": list(argv),
+                "argv": list(normalized),
                 "cwd": resolved_cwd,
                 "remote": remote,
+                "remote_url": remote_url,
                 "branch": destination,
                 "prior_remote_revision": prior,
                 "owner": self.owner,
             }
         elif argv[:3] == ("gh", "pr", "create"):
-            normalized = _snapshot_body_file(argv, resolved_cwd)
+            normalized = _normalized_pr_create(
+                argv,
+                resolved_cwd,
+                repository=self.repository,
+                branch=branch,
+            )
             prior = self._pull_request(branch, head, resolved_cwd)
             if prior is None:
                 raise RuntimeError("cannot verify pull-request state before create")
@@ -418,9 +432,9 @@ def _lifecycle_command(
     )
 
 
-def _push_target(
+def _normalized_push(
     args: tuple[str, ...], current_branch: str
-) -> tuple[str, str]:
+) -> tuple[tuple[str, ...], str]:
     unsupported = {
         "--all",
         "--branches",
@@ -434,6 +448,8 @@ def _push_target(
         "--exec",
         "-o",
         "--push-option",
+        "--repo",
+        "--no-verify",
     }
     if any(
         arg in unsupported
@@ -445,13 +461,40 @@ def _push_target(
         raise ValueError(
             "durable publisher accepts one concrete branch update only"
         )
+    supported_flags = {
+        "--force",
+        "-f",
+        "--force-with-lease",
+        "--set-upstream",
+        "-u",
+        "--porcelain",
+        "--quiet",
+        "-q",
+        "--verbose",
+        "-v",
+    }
+    flags = tuple(arg for arg in args if arg.startswith("-"))
+    if any(
+        flag not in supported_flags
+        and not flag.startswith("--force-with-lease=")
+        for flag in flags
+    ):
+        raise ValueError("durable publisher received an unsupported push option")
     positional = tuple(arg for arg in args if not arg.startswith("-"))
-    remote = positional[0] if positional else "origin"
-    refspecs = positional[1:]
+    if positional and positional[0] != "origin":
+        raise ValueError("durable publisher accepts only the configured origin")
+    refspecs = positional[1:] if positional else ()
     if len(refspecs) > 1:
         raise ValueError("durable publisher accepts one push refspec")
     refspec = refspecs[0] if refspecs else current_branch
-    destination = refspec.rsplit(":", 1)[-1]
+    if ":" in refspec:
+        source, destination = refspec.rsplit(":", 1)
+        if source != "HEAD":
+            raise ValueError("push source must be the captured HEAD")
+    else:
+        if refspec not in {"HEAD", current_branch}:
+            raise ValueError("push source must be the captured HEAD")
+        destination = current_branch
     if destination in {"HEAD", ""}:
         destination = current_branch
     destination = destination.removeprefix("refs/heads/")
@@ -461,7 +504,99 @@ def _push_target(
         or destination in {"main", "master", "dev"}
     ):
         raise ValueError("push destination branch is unavailable")
-    return remote, destination
+    normalized_flags = tuple(
+        flag
+        for flag in flags
+        if flag
+        in {
+            "--force",
+            "-f",
+            "--force-with-lease",
+            "--set-upstream",
+            "-u",
+            "--porcelain",
+            "--quiet",
+            "-q",
+            "--verbose",
+            "-v",
+        }
+        or flag.startswith("--force-with-lease=")
+    )
+    return (
+        (
+            "git",
+            "push",
+            *normalized_flags,
+            "origin",
+            f"HEAD:refs/heads/{destination}",
+        ),
+        destination,
+    )
+
+
+def _require_repository_remote(remote_url: str, repository: str) -> None:
+    """Reject a same-command push whose remote is outside configured authority."""
+
+    host, resolved_repository = _remote_identity(remote_url)
+    approved_host = os.environ.get("GH_HOST", "github.com").lower()
+    if (
+        host.lower() != approved_host
+        or resolved_repository.lower() != repository.lower()
+    ):
+        raise ValueError(
+            "origin push URL does not match the configured repository"
+        )
+
+
+def _remote_identity(remote_url: str) -> tuple[str, str]:
+    raw = remote_url.strip()
+    if "://" in raw:
+        parsed = urlparse(raw)
+        host = parsed.hostname or ""
+        path = parsed.path
+    elif "@" in raw and ":" in raw:
+        authority, path = raw.split(":", 1)
+        host = authority.rsplit("@", 1)[-1]
+    else:
+        raise ValueError("origin push URL is not a remote repository URL")
+    parts = tuple(part for part in path.strip("/").split("/") if part)
+    if len(parts) != 2 or not host:
+        raise ValueError("origin push URL has no owner/repository identity")
+    owner, name = parts
+    return host, f"{owner}/{name.removesuffix('.git')}"
+
+
+def _normalized_pr_create(
+    argv: tuple[str, ...],
+    cwd: str,
+    *,
+    repository: str,
+    branch: str,
+) -> tuple[str, ...]:
+    snapshotted = _snapshot_body_file(argv, cwd)
+    forbidden = {"--repo", "-R", "--head", "-H"}
+    for index, arg in enumerate(snapshotted[3:], start=3):
+        if (
+            arg in forbidden
+            or arg.startswith("--repo=")
+            or arg.startswith("--head=")
+            or (arg.startswith("-R") and arg != "-R")
+            or (arg.startswith("-H") and arg != "-H")
+        ):
+            raise ValueError(
+                "pull-request repository and head are fixed by the durable command"
+            )
+        if index > 3 and snapshotted[index - 1] in forbidden:
+            raise ValueError(
+                "pull-request repository and head are fixed by the durable command"
+            )
+    return (
+        *snapshotted,
+        "--repo",
+        repository,
+        "--head",
+        branch,
+    )
 
 
 def _snapshot_body_file(

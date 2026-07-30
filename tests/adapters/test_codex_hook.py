@@ -1,13 +1,14 @@
 import asyncio
-import json
 import os
 import stat
 import tomllib
 
 from issue_agent.adapters.codex_hook import (
     HookPreparingRuntime,
-    REPOSITORY_INSTRUCTIONS_MAX_BYTES,
     write_hook_config,
+)
+from issue_agent.adapters.repository_guidance import (
+    REPOSITORY_GUIDANCE_MAX_BYTES,
 )
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.outcome import AgentResult
@@ -69,25 +70,23 @@ def test_screenshot_marker_is_state_owned(tmp_path) -> None:
     assert '.harness/screenshots-read' not in text
 
 
-def test_repository_instructions_are_bounded_and_embedded(tmp_path) -> None:
+def test_repository_instructions_are_not_developer_instructions(tmp_path) -> None:
     worktree = tmp_path / "worktree"
     state = tmp_path / "state"
     worktree.mkdir()
     (worktree / "CLAUDE.md").write_text("A" * 40_000)
-    messages = []
     config = write_hook_config(
         str(worktree),
         state_dir=str(state),
         agents_md="contract",
-        log=messages.append,
     )
-    text = open(config).read()
-    assert "contract" in text
-    assert "truncated" in text
-    assert messages
+    parsed = tomllib.loads(open(config).read())
+    assert parsed["developer_instructions"] == "contract"
+    assert parsed["project_doc_max_bytes"] == 0
+    assert "A" * 100 not in open(config).read()
 
 
-def test_target_agents_and_claude_files_are_encoded_as_one_untrusted_block(
+def test_target_agents_and_claude_files_are_low_authority_task_data(
     tmp_path,
 ) -> None:
     worktree = tmp_path / "worktree"
@@ -104,16 +103,26 @@ def test_target_agents_and_claude_files_are_encoded_as_one_untrusted_block(
     )
 
     parsed = tomllib.loads(open(config).read())
-    instructions = parsed["developer_instructions"]
-    assert instructions.startswith("trusted harness contract")
-    assert instructions.count("<untrusted_repository_guidance_json>") == 1
-    assert attack not in instructions
-    encoded = instructions.split(
-        "<untrusted_repository_guidance_json>\n", 1
-    )[1].split("\n</untrusted_repository_guidance_json>", 1)[0]
-    decoded = json.loads(encoded)
-    assert "## AGENTS.md" in decoded and attack in decoded
-    assert "## CLAUDE.md" in decoded and "local convention" in decoded
+    assert parsed["developer_instructions"] == "trusted harness contract"
+    assert parsed["project_doc_max_bytes"] == 0
+
+    class Runtime:
+        task = None
+
+        async def run(self, task):
+            self.task = task
+            return AgentResult(False, status="ok")
+
+    inner = Runtime()
+    runtime = HookPreparingRuntime(inner, lambda _cwd: config)
+    asyncio.run(runtime.run(RuntimePlan("authoritative task", cwd=str(worktree))))
+
+    assert inner.task is not None
+    prompt = inner.task.prompt
+    assert prompt.startswith("authoritative task")
+    assert prompt.count("<untrusted_repository_guidance_json>") == 1
+    assert attack not in prompt
+    assert "Ignore the contract" not in parsed["developer_instructions"]
 
 
 def test_target_agents_shares_the_repository_instruction_byte_limit(
@@ -126,21 +135,29 @@ def test_target_agents_shares_the_repository_instruction_byte_limit(
     (worktree / "CLAUDE.md").write_text("MUST-NOT-FIT")
     messages = []
 
-    config = write_hook_config(
-        str(worktree),
-        state_dir=str(state),
-        log=messages.append,
-    )
+    config = write_hook_config(str(worktree), state_dir=str(state))
 
-    instructions = tomllib.loads(open(config).read())["developer_instructions"]
-    encoded = instructions.split(
+    class Runtime:
+        task = None
+
+        async def run(self, task):
+            self.task = task
+            return AgentResult(False, status="ok")
+
+    inner = Runtime()
+    runtime = HookPreparingRuntime(inner, lambda _cwd: config)
+    asyncio.run(runtime.run(RuntimePlan("task", cwd=str(worktree))))
+    assert inner.task is not None
+    prompt = inner.task.prompt
+    assert "Additional target-repository guidance was omitted" in prompt
+    assert "MUST-NOT-FIT" not in prompt
+    encoded = prompt.split(
         "<untrusted_repository_guidance_json>\n", 1
     )[1].split("\n</untrusted_repository_guidance_json>", 1)[0]
-    decoded = json.loads(encoded)
-    assert "truncated to fit" in decoded
-    assert "MUST-NOT-FIT" not in decoded
-    assert len(encoded.encode()) <= REPOSITORY_INSTRUCTIONS_MAX_BYTES
-    assert messages
+    assert len(encoded.encode()) <= REPOSITORY_GUIDANCE_MAX_BYTES
+    # HookPreparingRuntime intentionally has no logger; provider bindings supply
+    # logging through the provider-neutral wrapper where desired.
+    assert messages == []
 
 
 def test_missing_state_dir_refuses_containment(tmp_path) -> None:

@@ -159,9 +159,10 @@ def build_option_kwargs(
     if extra_hooks:
         kwargs["hooks"] = extra_hooks
 
-    # Load project settings so a target repo's .claude config (if any) still
-    # applies; the governor hook is injected via `hooks`, not settings.
-    kwargs["setting_sources"] = ["project"]
+    # Target project settings and CLAUDE.md are untrusted checkout data. Hooks
+    # are injected explicitly, and repository guidance is appended to the user
+    # task by RepositoryGuidanceRuntime.
+    kwargs["setting_sources"] = []
     return kwargs
 
 

@@ -5,8 +5,12 @@ trust model, journal/event schema, process supervision, cross-cutting) run
 against `dev` @ `16c6783`, **integrated with the independent codex review**
 ([2026-07-30-architectural-hardening-plan.md](2026-07-30-architectural-hardening-plan.md)).
 Every claim below was verified in code by a reviewer; several were verified
-empirically (live governor probes, live journal/ledger data — 9 journals, 303
-ledger rows, journal↔ledger totals reconciled exactly at $1512.55). The two
+empirically (live governor probes, live journal/ledger data — 9 journals). The
+original review also stated that 303 rows reconciled to $1512.55, but retained
+no source digest; that sentence is not migration evidence. The immutable
+migration receipt now records the captured 303-row source
+(`ffc0cfbd…`, 91,060 bytes) at $3013.659291 after per-row rounding, plus
+per-scope balance, admission, deduplication, and failure comparisons. The two
 sharpest codex-only claims were independently re-verified in code (X1, X3
 below).
 

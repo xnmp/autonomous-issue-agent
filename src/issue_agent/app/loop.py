@@ -53,6 +53,7 @@ def _ignore_log(_message: str) -> None:
 DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 80.0
 _SHUTDOWN_ESCALATION_RESERVE_SECONDS = 10.0
 _SHUTDOWN_FINALIZE_RESERVE_SECONDS = 5.0
+_SHUTDOWN_TERMINALIZE_RESERVE_SECONDS = 3.0
 
 
 def order_for_execution(actions: list[Action]) -> list[Action]:
@@ -142,6 +143,7 @@ class Daemon:
     shutdown_timeout_seconds: float = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
     recover: Callable[[], object] | None = None
     finalize: Callable[[], object] | None = None
+    terminalize: Callable[[], object] | None = None
     _state: DaemonState = field(
         default=DaemonState.STARTING, init=False, repr=False
     )
@@ -162,6 +164,8 @@ class Daemon:
     _requires_hard_exit: bool = field(default=False, init=False, repr=False)
     _finalized: bool = field(default=False, init=False, repr=False)
     _finalize_clean: bool = field(default=True, init=False, repr=False)
+    _terminalized: bool = field(default=False, init=False, repr=False)
+    _terminalize_clean: bool = field(default=True, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.dispatch_capacity < 0:
@@ -365,21 +369,37 @@ class Daemon:
                 )
             )
             if self.force_kill_dispatches is not None:
-                self._bounded_shutdown_call(
+                terminalize_reserve = min(
+                    _SHUTDOWN_TERMINALIZE_RESERVE_SECONDS,
+                    self.shutdown_timeout_seconds * 0.2,
+                )
+                killed = self._bounded_shutdown_call(
                     self.force_kill_dispatches,
                     "forced process teardown",
-                    max_seconds=self._remaining_shutdown_time(),
+                    max_seconds=max(
+                        0.0,
+                        self._remaining_shutdown_time()
+                        - terminalize_reserve,
+                    ),
+                )
+                terminalized = (
+                    self._terminalize()
+                    if killed
+                    else False
                 )
                 _done, unfinished = wait(
                     unfinished,
                     timeout=self._remaining_shutdown_time(),
                 )
+            else:
+                terminalized = False
         else:
             finalized = self._finalize()
+            terminalized = True
         pool.shutdown(wait=False, cancel_futures=cancel)
         if unfinished:
             return False
-        return finalized
+        return finalized and terminalized
 
     def _remaining_shutdown_time(self) -> float:
         if self._shutdown_deadline is None:
@@ -701,6 +721,19 @@ class Daemon:
             ),
         )
         return self._finalize_clean
+
+    def _terminalize(self) -> bool:
+        if self._terminalized:
+            return self._terminalize_clean
+        self._terminalized = True
+        if self.terminalize is None:
+            return True
+        self._terminalize_clean = self._bounded_shutdown_call(
+            self.terminalize,
+            "durable run terminalization",
+            max_seconds=self._remaining_shutdown_time(),
+        )
+        return self._terminalize_clean
 
     def _sleep_interval(
         self,

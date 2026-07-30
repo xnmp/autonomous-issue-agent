@@ -51,7 +51,8 @@ from ..domain.events import (
     encode_event_line,
 )
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
+SCHEMA_BASELINE_VERSION = 9
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 
 
@@ -196,6 +197,15 @@ class Lease:
 
 
 @dataclass(frozen=True)
+class RunCancellationIntent:
+    run_id: RunId
+    dispatch_id: str
+    kind: str
+    issue_number: int | None
+    reason: str
+
+
+@dataclass(frozen=True)
 class PendingCommand:
     command: LifecycleCommand
     state: str
@@ -210,6 +220,16 @@ class MigrationReport:
     rejected: int
     amount: Money
     idempotent: bool = False
+
+
+@dataclass(frozen=True)
+class SchemaMigration:
+    version: int
+    source: str
+
+    @property
+    def digest(self) -> str:
+        return hashlib.sha256(self.source.encode()).hexdigest()
 
 
 _DDL = """
@@ -395,6 +415,31 @@ CREATE TABLE IF NOT EXISTS migration_imports (
 );
 """
 
+_MIGRATION_V10 = """
+CREATE TABLE run_cancellation_intents (
+    run_id TEXT PRIMARY KEY REFERENCES runs(run_id) ON DELETE RESTRICT,
+    dispatch_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    issue_number INTEGER CHECK (issue_number IS NULL OR issue_number > 0),
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    handover_written_at TEXT
+);
+"""
+
+_SCHEMA_MIGRATIONS = (
+    # Version 9 is the immutable adoption baseline shipped by the architectural
+    # hardening cutover. Its exact source digest already exists in deployed
+    # databases, so future code validates rather than rewriting that history.
+    SchemaMigration(SCHEMA_BASELINE_VERSION, _DDL),
+    SchemaMigration(10, _MIGRATION_V10),
+)
+
+if tuple(migration.version for migration in _SCHEMA_MIGRATIONS) != tuple(
+    range(SCHEMA_BASELINE_VERSION, SCHEMA_VERSION + 1)
+):
+    raise RuntimeError("control-store migrations must be contiguous")
+
 
 class SQLiteControlStore:
     """One SQLite database, safe for threads and cooperating daemon processes."""
@@ -405,6 +450,7 @@ class SQLiteControlStore:
         *,
         busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
         now: Callable[[], datetime] | None = None,
+        migration_observer: Callable[[int, str], None] | None = None,
     ):
         if not path:
             raise ValueError("control-store path is required")
@@ -413,6 +459,7 @@ class SQLiteControlStore:
         self.path = os.path.abspath(path)
         self.busy_timeout_ms = busy_timeout_ms
         self._now = now or (lambda: datetime.now(timezone.utc))
+        self._migration_observer = migration_observer
         self._event_factory: (
             Callable[[EventPayload, Correlation], EventEnvelope] | None
         ) = None
@@ -498,139 +545,104 @@ class SQLiteControlStore:
         if os.path.exists(self.path) and os.path.getsize(self.path):
             self.integrity_check()
         with self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
             existing = db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' "
                 "AND name='schema_migrations'"
             ).fetchone()
-            if existing:
-                row = db.execute(
-                    "SELECT COALESCE(MAX(version), 0) AS version FROM schema_migrations"
-                ).fetchone()
-                version = int(row["version"])
-                if version > SCHEMA_VERSION:
-                    raise IncompatibleSchema(
-                        f"control store schema {version} is newer than {SCHEMA_VERSION}"
-                    )
-            db.executescript(_DDL)
-            command_columns = {
-                row["name"]
+            applied = (
+                tuple(
+                    (int(row["version"]), str(row["source_digest"]))
+                    for row in db.execute(
+                        "SELECT version, source_digest FROM schema_migrations "
+                        "ORDER BY version"
+                    ).fetchall()
+                )
+                if existing
+                else ()
+            )
+        self._validate_migration_history(applied)
+        applied_versions = {version for version, _digest in applied}
+        for migration in _SCHEMA_MIGRATIONS:
+            if migration.version in applied_versions:
+                continue
+            self._apply_schema_migration(migration)
+        with self._connect() as db:
+            final_history = tuple(
+                (int(row["version"]), str(row["source_digest"]))
                 for row in db.execute(
-                    "PRAGMA table_info(lifecycle_commands)"
+                    "SELECT version, source_digest FROM schema_migrations "
+                    "ORDER BY version"
                 ).fetchall()
-            }
-            if "config_version" not in command_columns:
-                db.execute(
-                    "ALTER TABLE lifecycle_commands "
-                    "ADD COLUMN config_version TEXT NOT NULL DEFAULT ''"
-                )
-            if "logical_key" not in command_columns:
-                db.execute(
-                    "ALTER TABLE lifecycle_commands "
-                    "ADD COLUMN logical_key TEXT NOT NULL DEFAULT ''"
-                )
-                db.execute(
-                    "UPDATE lifecycle_commands SET logical_key=idempotency_key "
-                    "WHERE logical_key=''"
-                )
-            if "occurrence" not in command_columns:
-                db.execute(
-                    "ALTER TABLE lifecycle_commands "
-                    "ADD COLUMN occurrence INTEGER NOT NULL DEFAULT 0"
-                )
-            if "repository" not in command_columns:
-                db.execute(
-                    "ALTER TABLE lifecycle_commands "
-                    "ADD COLUMN repository TEXT NOT NULL DEFAULT ''"
-                )
-            if "executor_identity" not in command_columns:
-                db.execute(
-                    "ALTER TABLE lifecycle_commands "
-                    "ADD COLUMN executor_identity TEXT NOT NULL DEFAULT ''"
-                )
-            # Pre-v8 commands cannot be assigned safely: the shared store may
-            # contain multiple repositories and role credentials. Fail them
-            # closed instead of letting whichever daemon boots first execute.
-            db.execute(
-                "UPDATE lifecycle_commands SET state='permanent_failure', "
-                "updated_at=? WHERE (repository='' OR executor_identity='') "
-                "AND state IN ('pending','executing','retryable_failure',"
-                "'unknown_outcome')",
-                (_stamp(self._now()),),
             )
-            db.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS lifecycle_command_occurrences "
-                "ON lifecycle_commands(logical_key, occurrence)"
-            )
-            outbox_columns = {
-                row["name"]
-                for row in db.execute(
-                    "PRAGMA table_info(event_outbox)"
-                ).fetchall()
-            }
-            if "failed_at" not in outbox_columns:
-                db.execute("ALTER TABLE event_outbox ADD COLUMN failed_at TEXT")
-            if "failure" not in outbox_columns:
-                db.execute("ALTER TABLE event_outbox ADD COLUMN failure TEXT")
-            if "destination" not in outbox_columns:
-                db.execute(
-                    "ALTER TABLE event_outbox "
-                    "ADD COLUMN destination TEXT NOT NULL DEFAULT ''"
-                )
-                for row in db.execute(
-                    "SELECT outbox_id, event_json FROM event_outbox "
-                    "WHERE destination=''"
-                ).fetchall():
-                    try:
-                        event = decode_event_line(row["event_json"])
-                    except (TypeError, ValueError) as exc:
-                        db.execute(
-                            "UPDATE event_outbox SET failed_at=?, failure=? "
-                            "WHERE outbox_id=?",
-                            (
-                                _stamp(self._now()),
-                                f"destination migration: {exc}"[:500],
-                                row["outbox_id"],
-                            ),
-                        )
-                        continue
-                    db.execute(
-                        "UPDATE event_outbox SET destination=? WHERE outbox_id=?",
-                        (event.producer.feed_identity, row["outbox_id"]),
-                    )
-            db.execute(
-                "CREATE INDEX IF NOT EXISTS event_outbox_destination_pending "
-                "ON event_outbox(destination, emitted_at, failed_at, outbox_id)"
-            )
-            lease_columns = {
-                row["name"]
-                for row in db.execute("PRAGMA table_info(leases)").fetchall()
-            }
-            if "process_start_ticks" not in lease_columns:
-                db.execute(
-                    "ALTER TABLE leases ADD COLUMN process_start_ticks "
-                    "INTEGER NOT NULL DEFAULT 0"
-                )
-            # Schema v1 reservations predate multi-scope accounting. Preserve
-            # their original primary scope as a limit row so global/repository
-            # balances remain complete after the in-place v2 migration.
-            db.execute(
-                "INSERT OR IGNORE INTO reservation_limits("
-                "run_id, repository, dimension, period_id, period_start, "
-                "period_end, period_timezone, currency, cap_micros) "
-                "SELECT run_id, repository, dimension, period_id, period_start, "
-                "period_end, period_timezone, currency, cap_micros "
-                "FROM budget_reservations"
-            )
-            digest = hashlib.sha256(_DDL.encode()).hexdigest()
-            db.execute(
-                "INSERT OR IGNORE INTO schema_migrations(version, applied_at, source_digest) "
-                "VALUES (?, ?, ?)",
-                (SCHEMA_VERSION, _stamp(self._now()), digest),
-            )
-            db.commit()
+        self._validate_migration_history(final_history, require_current=True)
         os.chmod(self.path, stat.S_IRUSR | stat.S_IWUSR)
         self.integrity_check()
+
+    def _validate_migration_history(
+        self,
+        history: tuple[tuple[int, str], ...],
+        *,
+        require_current: bool = False,
+    ) -> None:
+        expected = {
+            migration.version: migration.digest
+            for migration in _SCHEMA_MIGRATIONS
+        }
+        if not history:
+            if require_current:
+                raise IncompatibleSchema("control-store migration history is empty")
+            return
+        versions = tuple(version for version, _digest in history)
+        if versions[0] != SCHEMA_BASELINE_VERSION or versions != tuple(
+            range(versions[0], versions[-1] + 1)
+        ):
+            raise IncompatibleSchema(
+                "control-store migration history is not contiguous from "
+                f"baseline {SCHEMA_BASELINE_VERSION}: {versions}"
+            )
+        if versions[-1] > SCHEMA_VERSION:
+            raise IncompatibleSchema(
+                f"control store schema {versions[-1]} is newer than "
+                f"{SCHEMA_VERSION}"
+            )
+        for version, digest in history:
+            if expected.get(version) != digest:
+                raise IncompatibleSchema(
+                    f"control-store migration {version} digest mismatch"
+                )
+        if require_current and versions[-1] != SCHEMA_VERSION:
+            raise IncompatibleSchema(
+                f"control store stopped at schema {versions[-1]}, expected "
+                f"{SCHEMA_VERSION}"
+            )
+
+    def _apply_schema_migration(self, migration: SchemaMigration) -> None:
+        with self._connect() as db:
+            try:
+                db.execute("BEGIN IMMEDIATE")
+                for statement in _sql_statements(migration.source):
+                    db.execute(statement)
+                db.execute(
+                    "INSERT INTO schema_migrations("
+                    "version, applied_at, source_digest) VALUES (?, ?, ?)",
+                    (
+                        migration.version,
+                        _stamp(self._now()),
+                        migration.digest,
+                    ),
+                )
+                if self._migration_observer is not None:
+                    self._migration_observer(
+                        migration.version,
+                        "before_commit",
+                    )
+            except BaseException:
+                db.rollback()
+                raise
+            else:
+                db.commit()
+        if self._migration_observer is not None:
+            self._migration_observer(migration.version, "committed")
 
     def integrity_check(self) -> None:
         try:
@@ -977,6 +989,144 @@ class SQLiteControlStore:
                 ).fetchall()
             )
         return tuple(RunId(row["run_id"]) for row in rows)
+
+    def terminalize_owned_runs(
+        self,
+        owner_id: str,
+        reason: str,
+    ) -> tuple[RunCancellationIntent, ...]:
+        """Atomically cancel every owned active reservation after forced kill.
+
+        The cancellation intent is committed in the same transaction as the
+        reservation release, terminal run state, and lease removal. A bounded
+        teardown can therefore hard-exit without leaving boot recovery to
+        discover what shutdown already knew.
+        """
+
+        if not owner_id or not reason:
+            raise ValueError("run owner and cancellation reason are required")
+        intents: list[RunCancellationIntent] = []
+        with self.transaction() as db:
+            rows = db.execute(
+                "SELECT r.run_id, r.dispatch_id, r.kind FROM runs r "
+                "JOIN budget_reservations b ON b.run_id=r.run_id "
+                "WHERE r.owner_id=? AND b.state='active' "
+                "AND r.state NOT IN ('completed','cancelled','abandoned') "
+                "ORDER BY b.created_at",
+                (owner_id,),
+            ).fetchall()
+            now = _stamp(self._now())
+            for row in rows:
+                run_id = RunId(row["run_id"])
+                issue_number = _dispatch_issue(row["dispatch_id"])
+                intent = RunCancellationIntent(
+                    run_id,
+                    row["dispatch_id"],
+                    row["kind"],
+                    issue_number,
+                    reason,
+                )
+                db.execute(
+                    "INSERT INTO run_cancellation_intents("
+                    "run_id, dispatch_id, kind, issue_number, reason, created_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        str(run_id),
+                        intent.dispatch_id,
+                        intent.kind,
+                        intent.issue_number,
+                        reason,
+                        now,
+                    ),
+                )
+                db.execute(
+                    "UPDATE budget_reservations SET state='released', "
+                    "release_reason=?, updated_at=? WHERE run_id=?",
+                    (reason, now, str(run_id)),
+                )
+                db.execute(
+                    "UPDATE runs SET state='cancelled', outcome=?, "
+                    "completed_at=? WHERE run_id=?",
+                    (reason, now, str(run_id)),
+                )
+                lease = db.execute(
+                    "SELECT 1 FROM leases WHERE run_id=?",
+                    (str(run_id),),
+                ).fetchone()
+                db.execute(
+                    "DELETE FROM leases WHERE run_id=?",
+                    (str(run_id),),
+                )
+                correlation = _run_correlation(
+                    run_id,
+                    intent.dispatch_id,
+                )
+                self._transition(
+                    db,
+                    "reservation",
+                    str(run_id),
+                    "released",
+                    {"reason": reason, "spend_provenance": "unknown"},
+                    correlation=correlation,
+                )
+                if lease is not None:
+                    self._transition(
+                        db,
+                        "lease",
+                        str(run_id),
+                        "released",
+                        {"reason": reason},
+                        correlation=correlation,
+                    )
+                self._transition(
+                    db,
+                    "run",
+                    str(run_id),
+                    "cancelled",
+                    {"outcome": reason, "handover_intent": True},
+                    correlation=correlation,
+                )
+                intents.append(intent)
+        return tuple(intents)
+
+    def pending_cancellation_intents(
+        self,
+        owner_id: str,
+    ) -> tuple[RunCancellationIntent, ...]:
+        if not owner_id:
+            raise ValueError("run owner is required")
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT i.run_id, i.dispatch_id, i.kind, i.issue_number, "
+                "i.reason FROM run_cancellation_intents i JOIN runs r "
+                "ON r.run_id=i.run_id WHERE r.owner_id=? "
+                "AND i.handover_written_at IS NULL ORDER BY i.created_at",
+                (owner_id,),
+            ).fetchall()
+        return tuple(
+            RunCancellationIntent(
+                RunId(row["run_id"]),
+                row["dispatch_id"],
+                row["kind"],
+                (
+                    int(row["issue_number"])
+                    if row["issue_number"] is not None
+                    else None
+                ),
+                row["reason"],
+            )
+            for row in rows
+        )
+
+    def mark_cancellation_handover_written(self, run_id: RunId) -> None:
+        with self.transaction() as db:
+            updated = db.execute(
+                "UPDATE run_cancellation_intents SET handover_written_at=? "
+                "WHERE run_id=? AND handover_written_at IS NULL",
+                (_stamp(self._now()), str(run_id)),
+            )
+            if updated.rowcount != 1:
+                raise KeyError(str(run_id))
 
     def abandoned_dispatch_counts(self, owner_id: str) -> dict[int, int]:
         """Return durable crash counts keyed by the domain breaker target.
@@ -2368,6 +2518,16 @@ def _run_correlation(run_id: RunId, dispatch_id: str) -> Correlation:
     )
 
 
+def _dispatch_issue(dispatch_id: str) -> int | None:
+    try:
+        value = json.loads(dispatch_id).get("issue")
+    except (AttributeError, TypeError, json.JSONDecodeError):
+        return None
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value
+    return None
+
+
 def _receipt_digest(receipt: EffectReceipt) -> str:
     encoded = _json(
         {
@@ -2403,6 +2563,23 @@ def _json_value(value: object) -> object:
     if isinstance(value, (tuple, list)):
         return [_json_value(item) for item in value]
     raise TypeError(f"{type(value).__name__} is not JSON-serializable control data")
+
+
+def _sql_statements(source: str) -> tuple[str, ...]:
+    """Split immutable migration source without `executescript` auto-commits."""
+
+    statements: list[str] = []
+    pending: list[str] = []
+    for line in source.splitlines():
+        pending.append(line)
+        candidate = "\n".join(pending).strip()
+        if candidate and sqlite3.complete_statement(candidate):
+            statements.append(candidate)
+            pending.clear()
+    remainder = "\n".join(pending).strip()
+    if remainder:
+        raise IncompatibleSchema("control-store migration source is incomplete")
+    return tuple(statements)
 
 
 def _stamp(value: datetime) -> str:

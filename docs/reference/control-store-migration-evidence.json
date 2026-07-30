@@ -1,32 +1,62 @@
 {
   "command": "uv run python scripts/verify_control_migration.py /home/chong/.local/state/issue-agent/spend.jsonl --database /home/chong/.local/state/issue-agent-control/control.db --canary-repository xnmp/autonomous-issue-agent --minimum-hours 24",
   "database_integrity": "ok",
-  "executed_at": "2026-07-30T16:33:05Z",
+  "executed_at": "2026-07-30T17:54:28Z",
   "legacy": {
     "accepted": 303,
     "amount_micros": 3013659291,
     "first_at": "2026-07-26T02:13:08+00:00",
     "last_at": "2026-07-30T04:45:00+00:00",
+    "line_digest": "5327789bf816d8eda2c71009e73f3119033d519fbe729b273257a9017f64545d",
     "rejected": 0,
     "representative_hours": 98.531,
     "rows": 303,
+    "source_bytes": 91060,
     "source_digest": "ffc0cfbd718df8d7a68b79d78886ab2339a01d90e596ffc891c2a886b77ff185"
   },
   "migration_version": 1,
   "primary_canary": {
     "admitted": true,
     "amount_micros": 1,
+    "conflicting_settlement_rejected": true,
     "database": "/home/chong/.local/state/issue-agent-control/control.db",
     "database_preexisting": true,
+    "exhausted_admission_rejected": true,
+    "idempotent_reservation": true,
+    "idempotent_settlement": true,
     "legacy_export_unchanged": true,
     "repository": "xnmp/autonomous-issue-agent",
+    "runtime_path": "SQLiteControlStore.reserve -> settle on the existing operational database",
     "settled": true
   },
+  "provenance": {
+    "historical_total_note": "The plan's earlier $1512.55 sentence had no retained source digest and is not migration evidence. This immutable report supersedes it with the captured 303-row source digest and per-row rounded total.",
+    "line_digest": "5327789bf816d8eda2c71009e73f3119033d519fbe729b273257a9017f64545d",
+    "source_bytes": 91060,
+    "source_digest": "ffc0cfbd718df8d7a68b79d78886ab2339a01d90e596ffc891c2a886b77ff185",
+    "source_path": "/home/chong/.local/state/issue-agent/spend.jsonl",
+    "verifier_digest": "6c2a37409ae72628b5d3d84667d72453c160125cb74232132f8a538f6364c3fc"
+  },
   "shadow": {
+    "admission_decisions": {
+      "cap_exhaustion_match": true,
+      "ordinary_match": true
+    },
+    "deduplication_decisions": {
+      "legacy_source_replay_idempotent": true,
+      "primary_reservation_replay_idempotent": true,
+      "primary_settlement_replay_idempotent": true
+    },
+    "failure_decisions": {
+      "conflicting_provider_receipt_rejected": true,
+      "source_rejections_match": true
+    },
     "idempotent_replay": true,
     "rejected_rows_match": true,
     "representative_hours": 98.531,
     "rows_match": true,
+    "scope_balance_count": 82,
+    "scope_balance_fingerprint_match": true,
     "totals_match": true
   },
   "status": "passed"

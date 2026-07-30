@@ -17,6 +17,7 @@ from issue_agent.adapters.control_store import (
     BudgetLimit,
     ControlStoreError,
     CorruptControlStore,
+    IncompatibleSchema,
     Lease,
     ReservationRequest,
     SQLiteControlStore,
@@ -93,6 +94,77 @@ def test_control_store_initializes_with_restrictive_permissions_and_integrity(tm
     store = _store(tmp_path)
     assert Path(store.path).stat().st_mode & 0o777 == 0o600
     store.integrity_check()
+    with sqlite3.connect(store.path) as db:
+        history = db.execute(
+            "SELECT version, length(source_digest) FROM schema_migrations "
+            "ORDER BY version"
+        ).fetchall()
+    assert history == [(9, 64), (10, 64)]
+
+
+@pytest.mark.parametrize("version", (9, 10))
+@pytest.mark.parametrize("stage", ("before_commit", "committed"))
+def test_schema_migration_restart_is_atomic_at_every_boundary(
+    tmp_path,
+    version,
+    stage,
+):
+    path = tmp_path / f"control-{version}-{stage}.db"
+    tripped = False
+
+    def interrupt(observed_version, observed_stage):
+        nonlocal tripped
+        if (
+            not tripped
+            and observed_version == version
+            and observed_stage == stage
+        ):
+            tripped = True
+            raise RuntimeError("simulated process death")
+
+    with pytest.raises(RuntimeError, match="simulated process death"):
+        SQLiteControlStore(
+            str(path),
+            migration_observer=interrupt,
+        ).initialize()
+
+    reopened = SQLiteControlStore(str(path))
+    reopened.initialize()
+    reopened.integrity_check()
+    with sqlite3.connect(path) as db:
+        versions = tuple(
+            row[0]
+            for row in db.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        )
+        cancellation_table = db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='run_cancellation_intents'"
+        ).fetchone()
+    assert versions == (9, 10)
+    assert cancellation_table == ("run_cancellation_intents",)
+
+
+def test_schema_migration_digest_and_contiguity_are_validated(tmp_path):
+    store = _store(tmp_path)
+    with sqlite3.connect(store.path) as db:
+        db.execute(
+            "UPDATE schema_migrations SET source_digest='tampered' "
+            "WHERE version=9"
+        )
+        db.commit()
+
+    with pytest.raises(IncompatibleSchema, match="digest mismatch"):
+        SQLiteControlStore(store.path).initialize()
+
+    other = SQLiteControlStore(str(tmp_path / "other.db"))
+    other.initialize()
+    with sqlite3.connect(other.path) as db:
+        db.execute("DELETE FROM schema_migrations WHERE version=9")
+        db.commit()
+    with pytest.raises(IncompatibleSchema, match="not contiguous"):
+        SQLiteControlStore(other.path).initialize()
 
 
 def test_corrupt_database_is_rejected_before_migration_or_admission(tmp_path):
@@ -151,6 +223,59 @@ def test_abandoned_run_counts_come_from_control_state_not_telemetry(tmp_path):
     )
     assert store.release(request.run_id, "spend_unknown").disposition.value == "available"
     assert store.abandoned_dispatch_counts("o/r:fix") == {42: 1}
+
+
+def test_shutdown_terminalization_is_one_atomic_durable_outcome(tmp_path):
+    store = _store(tmp_path)
+    request = dataclasses.replace(
+        _request(1),
+        dispatch_id=json.dumps(
+            {
+                "kind": "RESOLVE",
+                "number": 42,
+                "issue": 42,
+                "breaker_key": 42,
+            }
+        ),
+        kind="RESOLVE",
+        owner_id="o/r:fix",
+    )
+    assert store.reserve(request).admitted
+    store.register_process_lease(
+        request.run_id,
+        pid=123,
+        pgid=123,
+        process_start_ticks=99,
+    )
+
+    intents = store.terminalize_owned_runs(
+        "o/r:fix",
+        "shutdown_deadline_spend_unknown",
+    )
+
+    assert len(intents) == 1
+    assert intents[0].issue_number == 42
+    assert store.active_reservation_runs("o/r:fix") == ()
+    assert store.leases("o/r:fix") == ()
+    assert store.pending_cancellation_intents("o/r:fix") == intents
+    with sqlite3.connect(store.path) as db:
+        run = db.execute(
+            "SELECT state, outcome FROM runs WHERE run_id=?",
+            (str(request.run_id),),
+        ).fetchone()
+        reservation = db.execute(
+            "SELECT state, release_reason FROM budget_reservations "
+            "WHERE run_id=?",
+            (str(request.run_id),),
+        ).fetchone()
+    assert run == ("cancelled", "shutdown_deadline_spend_unknown")
+    assert reservation == (
+        "released",
+        "shutdown_deadline_spend_unknown",
+    )
+
+    store.mark_cancellation_handover_written(request.run_id)
+    assert store.pending_cancellation_intents("o/r:fix") == ()
 
 
 def test_transactional_reservations_admit_only_one_racer_for_final_capacity(tmp_path):
