@@ -148,18 +148,36 @@ class CodexRuntimeConfig:
     # remain the fallback for any model not named here. See
     # `HarnessConfig.codex_cost_per_mtok`.
     cost_per_mtok: tuple[tuple[str, float, float], ...] = ()
+    cost_per_mtok_cached_in: tuple[tuple[str, float], ...] = ()
     # Kill a run once its priced spend crosses AgentTask.max_budget_usd (#29).
     # See `HarnessConfig.codex_enforce_budget`.
     enforce_budget: bool = True
 
     @property
+    def budget_pricing_gap(self) -> str:
+        """Which price knob leaves the dollar budget unenforceable, else "".
+
+        Named rather than boolean so the startup warning can point at the rate
+        that is actually missing: a zeroed CACHED_IN used to be reported as a
+        CODEX_COST_PER_MTOK_IN/OUT problem, sending the operator to two knobs
+        that were already correct."""
+        if self.cost_per_mtok_in <= 0 or self.cost_per_mtok_out <= 0:
+            return "both CODEX_COST_PER_MTOK_IN and CODEX_COST_PER_MTOK_OUT"
+        if any(rate_in <= 0 or rate_out <= 0 for _, rate_in, rate_out in self.cost_per_mtok):
+            return "every per-model IN/OUT rate in CODEX_COST_PER_MTOK"
+        if any(rate <= 0 for _, rate in self.cost_per_mtok_cached_in):
+            return "every per-model CACHED_IN rate in CODEX_COST_PER_MTOK"
+        return ""
+
+    @property
     def budget_priceable(self) -> bool:
         """Whether every configured model path has complete dollar pricing."""
-        return (
-            self.cost_per_mtok_in > 0
-            and self.cost_per_mtok_out > 0
-            and all(rate_in > 0 and rate_out > 0 for _, rate_in, rate_out in self.cost_per_mtok)
-        )
+        return not self.budget_pricing_gap
+
+    @property
+    def unpriced_cached_models(self) -> tuple[str, ...]:
+        """Models whose cache tier prices at $0 — cached spend is invisible."""
+        return tuple(model for model, rate in self.cost_per_mtok_cached_in if rate <= 0)
 
 
 @dataclass(frozen=True)
@@ -434,13 +452,17 @@ class HarnessConfig:
     # which is exactly the axis routing moves. CLAUDE.md's routing guardrail
     # ("split by routed model tier") is unsatisfiable without this.
     #
-    # `CODEX_COST_PER_MTOK='model=IN/OUT,model=IN/OUT'`, USD per MILLION tokens,
-    # e.g. 'gpt-5.6-luna=1.25/10,gpt-5.6-terra=10/60'. Every leg is priced with
+    # `CODEX_COST_PER_MTOK='model=IN/OUT[/CACHED_IN],...'`, USD per MILLION tokens,
+    # e.g. 'gpt-5.6-luna=1.25/10/0.125,gpt-5.6-terra=10/60'. Cached input
+    # defaults to one tenth of the ordinary input rate when omitted, and must be
+    # positive when given (a $0 cache tier under-counts a cache-heavy leg by
+    # ~7x — #89). Every leg is priced with
     # the model it ACTUALLY ran (task.model, or the runner's default when the
     # task pinned none). A model absent from the table — and the whole knob
     # when unset — falls back to the scalars above, so an existing deployment
     # prices exactly as it did before.
     codex_cost_per_mtok: tuple[tuple[str, float, float], ...] = ()
+    codex_cost_per_mtok_cached_in: tuple[tuple[str, float], ...] = ()
     # #29: whether MAX_BUDGET_USD actually BOUNDS a codex run. codex has no
     # per-session budget flag, so the harness enforces it by sampling the
     # session's streamed token counters and killing the run once this leg's
@@ -592,6 +614,7 @@ class HarnessConfig:
             cost_per_mtok_in=self.codex_cost_per_mtok_in,
             cost_per_mtok_out=self.codex_cost_per_mtok_out,
             cost_per_mtok=self.codex_cost_per_mtok,
+            cost_per_mtok_cached_in=self.codex_cost_per_mtok_cached_in,
             enforce_budget=self.codex_enforce_budget,
         )
 
@@ -922,7 +945,7 @@ def _coerce_float(env: dict, key: str, default: float, errors: list[str]) -> flo
 def _coerce_rate_table(
     env: dict, key: str, errors: list[str]
 ) -> tuple[tuple[str, float, float], ...]:
-    """`'model=IN/OUT,model=IN/OUT'` → an ordered (model, in, out) table (#43).
+    """Parse per-model `IN/OUT[/CACHED_IN]` rates into an ordered table.
 
     Same contract as the other coercions: empty/absent is UNSET (an empty
     table, i.e. "price everything with the scalar fallback"), and anything
@@ -951,33 +974,74 @@ def _coerce_rate_table(
         if not entry:
             continue
         model, sep, rates = entry.partition("=")
-        rate_in, slash, rate_out = rates.partition("/")
         model = model.strip().casefold()
-        if not (sep and slash and model):
+        components = [component.strip() for component in rates.split("/")]
+        if not (sep and model and len(components) in (2, 3)):
             errors.append(
-                f"{key} entry {entry!r} must look like 'model=IN/OUT' "
+                f"{key} entry {entry!r} must look like 'model=IN/OUT[/CACHED_IN]' "
                 f"(USD per million tokens) — ignoring it"
             )
             continue
         try:
-            parsed = (float(rate_in.strip()), float(rate_out.strip()))
+            rate_in, rate_out = (float(component) for component in components[:2])
+            rate_cached_in = (
+                float(components[2]) if len(components) == 3 else rate_in / 10
+            )
         except ValueError:
             errors.append(
                 f"{key} entry {entry!r} has non-numeric rates — ignoring it"
             )
             continue
-        if not all(math.isfinite(r) and r >= 0 for r in parsed):
+        if not all(math.isfinite(r) and r >= 0 for r in (rate_in, rate_out, rate_cached_in)):
             errors.append(
                 f"{key} entry {entry!r} must have finite, non-negative rates "
                 f"— ignoring it"
+            )
+            continue
+        # An EXPLICIT cache rate of 0 (or below) is rejected rather than stored:
+        # it would price every cache read free, and a cache-heavy leg reads as a
+        # fraction of its real cost, so MAX_BUDGET_USD stops bounding the run.
+        # Omit the component to take the list-price default instead.
+        if len(components) == 3 and rate_cached_in <= 0:
+            errors.append(
+                f"{key} entry {entry!r} must have a positive CACHED_IN rate "
+                f"(omit it for the list-price default) — ignoring it"
             )
             continue
         if model in seen:
             errors.append(f"{key} names {model!r} more than once — keeping the first")
             continue
         seen.add(model)
-        table.append((model, parsed[0], parsed[1]))
+        table.append((model, rate_in, rate_out))
     return tuple(table)
+
+
+def _coerce_cached_rate_table(env: dict) -> tuple[tuple[str, float], ...]:
+    """Derive the cache tier from optional third per-model rate components."""
+    raw = env.get("CODEX_COST_PER_MTOK", "")
+    if not raw or not raw.strip():
+        return ()
+    rates: list[tuple[str, float]] = []
+    seen: set[str] = set()
+    for entry in raw.split(","):
+        model, sep, components_raw = entry.strip().partition("=")
+        components = [part.strip() for part in components_raw.split("/")]
+        if not (sep and model.strip() and len(components) in (2, 3)):
+            continue
+        try:
+            normal, out = (float(component) for component in components[:2])
+            cached = float(components[2]) if len(components) == 3 else normal / 10
+        except ValueError:
+            continue
+        # Mirror `_coerce_rate_table`'s rejections so the two tables cannot
+        # disagree about which entries exist.
+        if not all(math.isfinite(r) and r >= 0 for r in (normal, out, cached)):
+            continue
+        key = model.strip().casefold()
+        if key and key not in seen and cached > 0:
+            seen.add(key)
+            rates.append((key, cached))
+    return tuple(rates)
 
 
 def _coerce_identity_mode(env: dict, errors: list[str]) -> IdentityMode:
@@ -1322,6 +1386,7 @@ def from_env(env: dict | None = None) -> HarnessConfig:
             e, "CODEX_COST_PER_MTOK_OUT", _dc_default("codex_cost_per_mtok_out"), errors
         ),
         codex_cost_per_mtok=_coerce_rate_table(e, "CODEX_COST_PER_MTOK", errors),
+        codex_cost_per_mtok_cached_in=_coerce_cached_rate_table(e),
         codex_enforce_budget=_b(
             e, "CODEX_ENFORCE_BUDGET", _dc_default("codex_enforce_budget"), errors
         ),

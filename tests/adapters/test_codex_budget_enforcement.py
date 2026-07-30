@@ -41,11 +41,12 @@ def _write_rollout(
     *,
     input_tokens: int,
     output_tokens: int,
+    cached_input_tokens: int = 0,
     sid: str = SID,
 ) -> None:
     usage = {
         "input_tokens": input_tokens,
-        "cached_input_tokens": 0,
+        "cached_input_tokens": cached_input_tokens,
         "cache_write_input_tokens": 0,
         "output_tokens": output_tokens,
     }
@@ -326,6 +327,29 @@ def test_under_budget_run_completes_normally(tmp_path, monkeypatch):
     assert result.exit_reason is ExitReason.OK
 
 
+def test_cache_heavy_live_budget_sampler_does_not_kill_a_sub_twenty_dollar_leg(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _write_rollout(
+        tmp_path,
+        input_tokens=3_974_000,
+        cached_input_tokens=3_773_000,
+        output_tokens=9_500,
+    )
+
+    result = asyncio.run(
+        _runner(tmp_path, _chatty_body(seconds=1)).run(
+            AgentTask(prompt="x", max_budget_usd=20.0)
+        )
+    )
+
+    assert result.status == "pr_opened"
+    assert result.exit_reason is ExitReason.OK
+    # (201000 * $5 + 3773000 * $0.50 + 9500 * $30) / 1e6.
+    assert result.cost_usd == pytest.approx(3.1765)
+
+
 def test_resumed_leg_uses_its_own_usage_and_turn_delta(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
     _write_rollout(tmp_path, input_tokens=5_000_000, output_tokens=100_000)
@@ -339,6 +363,45 @@ def test_resumed_leg_uses_its_own_usage_and_turn_delta(tmp_path, monkeypatch):
     assert result.exit_reason is ExitReason.OK
     assert result.cost_usd == pytest.approx(0.0)
     assert result.num_turns == 0
+
+
+def test_a_resumed_leg_subtracts_the_baselines_cached_tokens_too(tmp_path, monkeypatch):
+    """The cached counter is cumulative like the others: pricing the raw total
+    would re-ledger the previous leg's cache reads, and a cached count larger
+    than the leg's own input delta reads as distrusted telemetry (full rate)."""
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    _write_rollout(
+        tmp_path, input_tokens=1_000_000, cached_input_tokens=800_000, output_tokens=10_000
+    )
+    grown = json.dumps({
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "last_token_usage": {"input_tokens": 1},
+                "total_token_usage": {
+                    "input_tokens": 2_000_000,
+                    "cached_input_tokens": 1_700_000,
+                    "cache_write_input_tokens": 0,
+                    "output_tokens": 20_000,
+                },
+            },
+        }
+    })
+    body = _chatty_body(seconds=1).replace(
+        "printf '%s'",
+        f"printf '%s\\n' '{grown}' >> '{_rollout_path(tmp_path)}'\nprintf '%s'",
+    )
+
+    result = asyncio.run(
+        _runner(tmp_path, body).run(
+            AgentTask(prompt="x", max_budget_usd=20.0, resume=SID)
+        )
+    )
+
+    assert result.exit_reason is ExitReason.OK
+    # delta: 1_000_000 in of which 900_000 cached, 10_000 out.
+    # (100000 * $5 + 900000 * $0.50 + 10000 * $30) / 1e6.
+    assert result.cost_usd == pytest.approx(1.25)
 
 
 def test_budget_only_watchdog_samples_a_silent_generation(tmp_path, monkeypatch):
