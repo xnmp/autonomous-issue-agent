@@ -32,6 +32,7 @@ export type CardStep = Schema["CardStep"];
 export type IssueCard = Schema["IssueCard"];
 export type PendingCard = Schema["PendingCard"];
 export type BacklogCard = Schema["BacklogCard"];
+export type ToastNotification = Schema["ToastNotification"];
 export type IssuesPayload = Schema["IssuesPayload"];
 export type TokenUsage = Schema["TokenUsage"];
 export type IssueStep = Schema["IssueStep"];

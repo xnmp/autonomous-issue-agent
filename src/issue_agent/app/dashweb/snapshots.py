@@ -12,6 +12,8 @@ passes them here for projection into API payloads.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone, tzinfo
+import hashlib
+import json
 import math
 
 from ...domain import dashboard as dash
@@ -541,10 +543,31 @@ def _model_effort(row: dash.IssueRow, model: str) -> str | None:
     return str(matches[-1]["effort"]) if matches else None
 
 
-def model_badges(row: dash.IssueRow) -> list[dict]:
+def model_badges(row: dash.IssueRow, models=None) -> list[dict]:
     return [
         {"model": model, "effort": _model_effort(row, model)}
+        for model in (row.models if models is None else models)
+    ]
+
+
+def active_card_models(row: dash.IssueRow) -> list[str]:
+    """Models doing issue work, excluding models used only for review."""
+    review_models = {
+        str(event.get("model"))
+        for event in row.events
+        if event.get("kind") in dash.REVIEW_KINDS and event.get("model")
+    }
+    issue_work_models = {
+        str(event.get("model"))
+        for event in row.events
+        if event.get("kind") not in dash.REVIEW_KINDS
+        and event.get("kind") != "ROUTE"
+        and event.get("model")
+    }
+    return [
+        model
         for model in row.models
+        if model not in review_models or model in issue_work_models
     ]
 
 
@@ -611,6 +634,7 @@ def issue_card(
     # Done: to the last thing that happened, which is where the clock stopped.
     end = row.last_ts if (row.done and row.last_ts) else now
     elapsed, working, idle, idle_active = _duration_breakdown(row, started, end)
+    displayed_models = list(row.models) if row.done else active_card_models(row)
     card = {
         "issue": row.issue,
         "title": (gh_issue or {}).get("title"),
@@ -632,8 +656,8 @@ def issue_card(
         "idle_s": round(idle) if idle is not None else None,
         "idle_active": idle_active,
         "projected_eta_s": projected_eta_s,
-        "models": list(row.models),
-        "model_badges": model_badges(row),
+        "models": displayed_models,
+        "model_badges": model_badges(row, displayed_models),
         "rounds": row.rounds,
         "flags": _flags(row),
         "issue_verification": issue_verification,
@@ -686,7 +710,145 @@ def backlog_card(
         "age_days": age_days(issue.get("createdAt"), now),
         "age_s": age_seconds(issue.get("createdAt"), now),
         "comments": _comment_count(issue.get("comments")),
+        "issue_type": _label_value(labels, ("type:",), exact=("bug", "feature")),
+        "difficulty": _label_value(labels, ("difficulty:", "effort:")),
+        "impact": _label_value(labels, ("impact:",)),
     }
+
+
+def _label_value(
+    labels: list[str],
+    prefixes: tuple[str, ...],
+    *,
+    exact: tuple[str, ...] = (),
+) -> str | None:
+    """Extract one compact planning value without teaching the SPA label grammar."""
+    lowered = [(label, label.lower()) for label in labels]
+    for expected in exact:
+        if any(value == expected for _label, value in lowered):
+            return expected
+    for label, value in lowered:
+        for prefix in prefixes:
+            if value.startswith(prefix) and len(label) > len(prefix):
+                return label[len(prefix):]
+    return None
+
+
+def journal_notifications(rows, limit: int = 100) -> list[dict]:
+    """Actionable journal transitions, newest window only.
+
+    The browser establishes its high-water mark from this stream on first load,
+    so returning history is safe. Unknown and malformed events deliberately
+    disappear rather than weakening the whole dashboard response.
+    """
+    candidates: list[tuple[datetime, int, int, dict]] = []
+    ordinal = 0
+    for row in rows:
+        for event in row.events:
+            stamp = dash.parse_ts(event.get("ts"))
+            if stamp is not None:
+                candidates.append((stamp, ordinal, row.issue, event))
+            ordinal += 1
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    notifications = []
+    for stamp, _ordinal, issue, event in candidates:
+        projected = _journal_notification(event, issue)
+        if projected is None:
+            continue
+        identity = hashlib.sha256(
+            json.dumps(
+                {"issue": issue, "event": event},
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        notifications.append({
+            "id": identity,
+            "ts": iso(stamp),
+            **projected,
+        })
+    return notifications[-max(0, limit):] if limit > 0 else []
+
+
+def _journal_notification(event: dict, issue: int) -> dict | None:
+    name = event.get("event")
+    if name == "action":
+        fact = dash.parse_action(str(event.get("desc") or ""))
+        if fact and (
+            (fact.verb == "clear" and fact.merged)
+            or (fact.verb == "relabel" and "ai-done" in fact.added)
+        ):
+            pr = fact.number if fact.target == "pr" else None
+            return {
+                "severity": "info",
+                "title": f"Issue #{issue} completed",
+                "detail": f"PR #{pr} merged" if pr is not None else None,
+                "issue": issue,
+                "pr": pr,
+            }
+        return None
+    if name == "escalation":
+        number = _event_number(event.get("number"))
+        return {
+            "severity": "attention",
+            "title": f"Issue #{issue} escalated",
+            "detail": "Human review is required",
+            "issue": issue,
+            "pr": number if event.get("target") == "pr" else None,
+        }
+    if name != "agent_run":
+        return None
+    status = str(event.get("status") or "")
+    kind = str(event.get("kind") or "")
+    number = _event_number(event.get("number"))
+    if status == "blocked":
+        return {
+            "severity": "attention",
+            "title": f"Issue #{issue} needs input",
+            "detail": "Agent is blocked on a human reply",
+            "issue": issue,
+            "pr": None,
+        }
+    failure = " ".join(
+        str(event.get(field) or "").lower()
+        for field in ("status", "envelope_subtype", "exit_reason")
+    )
+    if "error_max_budget_usd" in failure or "timeout" in failure:
+        budget = "error_max_budget_usd" in failure
+        return {
+            "severity": "attention",
+            "title": f"Issue #{issue} run stopped",
+            "detail": (
+                "Budget limit reached"
+                if budget
+                else "Run timed out"
+            ),
+            "issue": issue,
+            "pr": number if kind in dash.REVIEW_KINDS | dash.REPAIR_KINDS else None,
+        }
+    if kind in dash.REVIEW_KINDS and status in {"APPROVE", "REQUEST_CHANGES"}:
+        if number is None:
+            return None
+        return {
+            "severity": "info" if status == "APPROVE" else "attention",
+            "title": (
+                f"PR #{number} approved"
+                if status == "APPROVE"
+                else f"PR #{number} needs changes"
+            ),
+            "detail": "Review verdict submitted",
+            "issue": issue,
+            "pr": number,
+        }
+    return None
+
+
+def _event_number(value) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _comment_count(value) -> int:

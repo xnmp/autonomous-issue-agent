@@ -67,9 +67,42 @@
             ],
             "title": "Comments"
           },
+          "difficulty": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Difficulty"
+          },
+          "impact": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Impact"
+          },
           "issue": {
             "title": "Issue",
             "type": "integer"
+          },
+          "issue_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Issue Type"
           },
           "labels": {
             "items": {
@@ -1210,6 +1243,14 @@
             "title": "In Flight",
             "type": "array"
           },
+          "notifications": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ToastNotification"
+            },
+            "title": "Notifications",
+            "type": "array"
+          },
           "pending": {
             "items": {
               "$ref": "#/components/schemas/PendingCard"
@@ -1823,6 +1864,72 @@
           "events"
         ],
         "title": "StepEventsPayload",
+        "type": "object"
+      },
+      "ToastNotification": {
+        "additionalProperties": true,
+        "properties": {
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "issue": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Issue"
+          },
+          "pr": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr"
+          },
+          "severity": {
+            "enum": [
+              "info",
+              "attention"
+            ],
+            "title": "Severity",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "ts": {
+            "title": "Ts",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "ts",
+          "severity",
+          "title"
+        ],
+        "title": "ToastNotification",
         "type": "object"
       },
       "TokenUsage": {

@@ -11,9 +11,9 @@ export interface TabDef {
 }
 
 /**
- * The tab strip. Persistent per-repo tabs (Overview | Issues) first, then the
- * dynamically opened closeable tabs (issues, verification) in the order they
- * were opened — never re-sorted, so a tab does not move under the cursor.
+ * The tab strip. Persistent per-repo views come first, then dynamically opened
+ * issue tabs in the order they were opened, so a tab does not move under the
+ * cursor.
  */
 export function TabStrip({ tabs }: { tabs: TabDef[] }) {
   return (
@@ -48,7 +48,7 @@ export function TabStrip({ tabs }: { tabs: TabDef[] }) {
   );
 }
 
-/** Sub-tab pills (Issues: In flight & pending | Done | Backlog). */
+/** Compact tabs for nested views such as issue task/event detail. */
 export function SubTabs<T extends string>({
   value,
   options,

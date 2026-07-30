@@ -16,6 +16,7 @@ export type DashboardTheme = typeof DASHBOARD_THEMES[number][0];
 export interface DashboardOptions {
   showProjectedCost: boolean;
   showPerRepoQuotas: boolean;
+  showDurationSeconds: boolean;
   theme: DashboardTheme;
 }
 
@@ -84,6 +85,17 @@ export function OptionsMenu({
               onChange={(event) => onChange({ ...options, showPerRepoQuotas: event.target.checked })}
             />
             <span>Show per-repo quotas</span>
+          </label>
+          <label className="column-menu-item">
+            <input
+              type="checkbox"
+              checked={options.showDurationSeconds}
+              onChange={(event) => onChange({
+                ...options,
+                showDurationSeconds: event.target.checked,
+              })}
+            />
+            <span>Show seconds in durations</span>
           </label>
         </div>
       ) : null}
