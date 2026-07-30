@@ -8,11 +8,15 @@ and do not pin subprocess or SDK internals.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from issue_agent.adapters.agent_runner import result_to_agent_result
 from issue_agent.adapters.codex_runner import parse_codex_envelope
+from issue_agent.adapters.journal import Journal, JournalingRuntime, read_events
 from issue_agent.domain.dashboard import build_issue_rows, first_pass_verdicts, stage_for
 from issue_agent.domain.agent_task import AgentRuntime, AgentTask, McpServer, SubagentDef
 from issue_agent.domain.outcome import AgentResult, Outcome, classify_outcome
@@ -37,6 +41,24 @@ def _codex_result(*, structured, exit_code=0, session_id="s1", stderr=""):
         session_id=session_id,
         stderr=stderr,
     )
+
+
+class _StaticRuntime:
+    def __init__(self, result):
+        self.result = result
+
+    async def run(self, _task):
+        return self.result
+
+
+def _settled_review_event(tmp_path, result, kind: str) -> dict:
+    journal = Journal(str(tmp_path / f"{kind}-{result.status}.jsonl"))
+    runtime = JournalingRuntime(_StaticRuntime(result), journal, role="review")
+    runtime.set_context("review", kind, 125, 125)
+
+    asyncio.run(runtime.run(AgentTask(prompt="review")))
+
+    return read_events(journal.path)[1]
 
 
 def test_runtime_contract_accepts_task_and_returns_agent_result_shape():
@@ -149,6 +171,24 @@ def test_review_verdict_contract_is_shared_and_drives_dashboard_guardrails():
     assert stage_for([codex_approve_event]) == "awaiting merge"
     assert stage_for([claude_event]) == "awaiting merge"
     assert first_pass_verdicts(build_issue_rows([codex_event, claude_event], [])) == (1, 1)
+
+
+@pytest.mark.parametrize("kind", ["REVIEW", "RE_REVIEW"])
+@pytest.mark.parametrize("verdict", ["APPROVE", "REQUEST_CHANGES"])
+def test_review_journal_envelope_is_runtime_invariant(tmp_path, kind, verdict):
+    """The settled journal event, not only AgentResult, is cross-runtime stable."""
+    structured = {"decision": verdict, "body": "review body"}
+    claude_event = _settled_review_event(
+        tmp_path / "claude", _claude_result(structured=structured), kind,
+    )
+    codex_event = _settled_review_event(
+        tmp_path / "codex", _codex_result(structured=structured), kind,
+    )
+
+    assert set(codex_event) == set(claude_event)
+    for field in set(claude_event) - {"ts", "dispatch", "duration_s", "cost_usd"}:
+        assert codex_event[field] == claude_event[field]
+    assert codex_event["status"] == verdict
 
 
 def test_transport_failure_without_envelope_is_error():
