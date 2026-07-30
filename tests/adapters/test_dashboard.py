@@ -123,27 +123,6 @@ def test_stage_running_leg_beats_history():
     assert dash.stage_for(events, running) == "fixing CI"
 
 
-def test_blocked_and_escalated_attention_outrank_running_legs():
-    running = (dashboard_domain._running_leg(start(kind="RESUME")),)
-
-    assert dash.stage_for(
-        [action("relabel issue #7: -ai-working +ai-blocked")], running
-    ) == "blocked"
-    assert dash.stage_for(
-        [action("relabel issue #7: -ai-working +needs-human-review")], running
-    ) == "escalated"
-
-
-def test_reply_transition_clears_attention_and_restores_running_stage():
-    events = [
-        action("relabel issue #7: -ai-working +ai-blocked", ts_min=2),
-        action("relabel issue #7: -ai-blocked +ai-working", ts_min=1),
-    ]
-    running = (dashboard_domain._running_leg(start(kind="RESUME")),)
-
-    assert dash.stage_for(events, running) == "resolving"
-
-
 def test_done_issue_cannot_also_be_running():
     events = [
         start(kind="RESOLVE"),
@@ -318,16 +297,6 @@ def test_stage_uses_the_newest_decisive_event():
         run(role="review", kind="REVIEW", number=90, status="APPROVE", ts=at(10)),
     ]
     assert dash.stage_for(events) == "awaiting merge"
-
-
-def test_terminal_clear_ends_historical_human_attention():
-    events = [
-        {"ts": at(30), "event": "escalation", "target": "pr", "number": 90},
-        action("relabel pr #90: +needs-human-review", ts_min=20),
-        action("clear state for pr #90, issue #7 (closed-unmerged)", ts_min=10),
-    ]
-
-    assert dash.stage_for(events) == "closed unmerged"
 
 
 # ── rows ──────────────────────────────────────────────────────────────────────

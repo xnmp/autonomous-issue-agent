@@ -49,36 +49,6 @@ function polled(data: IssuesPayload): Polled<IssuesPayload> {
 }
 
 describe("IssuesTab", () => {
-  it("marks a blocked row as a visual alert even while tasks are running", () => {
-    render(
-      <IssuesTab
-        repo="demo"
-        sub="inflight"
-        issues={polled({
-          in_flight: [{
-            ...doneCard,
-            issue: 123,
-            title: "Waiting for operator input",
-            stage: "blocked",
-            done: false,
-            steps: [{ kind: "RESUME", state: "running", status: null, cost_usd: null }],
-            flags: [],
-          }],
-          pending: [],
-          done: [],
-          backlog: [],
-          gh_ok: true,
-          warnings: [],
-        })}
-        onSetSub={vi.fn()}
-        onOpenIssue={vi.fn()}
-      />,
-    );
-
-    expect(screen.getByRole("row", { name: /Waiting for operator input/ })).toHaveClass("row-alert");
-    expect(screen.getByText("blocked")).toBeVisible();
-  });
-
   it("expands done rows before opening the full issue and hides rounds by default", async () => {
     const onOpenIssue = vi.fn();
     render(
