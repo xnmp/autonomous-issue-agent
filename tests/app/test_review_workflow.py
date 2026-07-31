@@ -1311,7 +1311,7 @@ def test_claim_target_changed_defers_and_journals_dispatch_deferred(tmp_path):
     """ADR 0008: when the fresh breaker_key disagrees with the claim the
     dispatcher reserved, review() must defer (no paid run) AND surface a
     TelemetryWarning('dispatch_deferred', ...) with Correlation(pr=N) so a
-    persistent linkage flap is visible on the dashboard warning feed, not just
+    persistent linkage flap is visible in the dashboard per-issue event view, not just
     the log."""
     pr = PRView(100, head_ref_name="fix/6-moved", closing_issue=6)
     gw = FakeGateway(prs={100: pr})

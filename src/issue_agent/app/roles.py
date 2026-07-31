@@ -2531,7 +2531,9 @@ def build_steward_daemon(
             rejected.add(action)
             steward_log(
                 f"dispatch {action.kind.name} #{action.number}: deferred — "
-                "another deployment owns the target"
+                f"issue {action.number} is already reserved (another steward "
+                "action on the same issue this tick, or another deployment's "
+                "claim)"
             )
         return [
             action

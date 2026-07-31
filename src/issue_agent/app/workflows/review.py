@@ -131,7 +131,8 @@ class ReviewWorkflow:
             f"changed to {fresh_target} before execution"
         )
         # Spend-safe but otherwise silent: a persistent linkage flap re-defers
-        # every tick, so surface it on the dashboard warning feed (ADR 0008).
+        # every tick, so surface it in the dashboard's per-issue event view
+        # (ADR 0008).
         if self.cfg.journal is not None:
             try:
                 self.cfg.journal.emit(

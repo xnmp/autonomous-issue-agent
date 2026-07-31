@@ -842,7 +842,8 @@ class FixWorkflow:
     ) -> None:
         """A deferral is spend-safe but silent: a persistent linkage flap would
         re-defer the same dispatch every tick with only a log line. The event
-        makes a livelock visible on the dashboard's warning feed (ADR 0008)."""
+        makes a livelock visible in the dashboard's per-issue event view
+        (ADR 0008)."""
         journal = self.cfg.journal
         if journal is None:
             return

@@ -20,6 +20,7 @@ from functools import partial
 
 from ..domain import review as review_dom, triage as triage_dom
 from ..domain.actions import AgentKind, RunAgent
+from ..domain.events import Correlation, TelemetryEvent, TelemetryWarning
 from ..adapters.runtime_plan import (
     AgentRuntime,
     ContextualRuntime,
@@ -401,6 +402,24 @@ class AgentDispatcher:
                     f"— claim target {claim_target} carries no issue; refusing "
                     "live-lookup identity (ADR 0008)"
                 )
+                if self.journal is not None:
+                    try:
+                        self.journal.emit(
+                            TelemetryEvent(
+                                TelemetryWarning(
+                                    "dispatch_deferred",
+                                    f"{action.kind.name} claim target "
+                                    f"{claim_target} carries no issue",
+                                    {"observed_target": claim_target},
+                                ),
+                                Correlation(pr=action.number),
+                            )
+                        )
+                    except Exception as exc:  # noqa: BLE001 — telemetry must not block
+                        self.cfg.log(
+                            f"dispatch PR #{action.number}: deferral not "
+                            f"journalled ({exc})"
+                        )
                 return
             handler = partial(handler, issue_hint=issue)
         if action.kind in {

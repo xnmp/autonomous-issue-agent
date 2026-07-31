@@ -197,7 +197,7 @@ def test_fix_ci_defers_and_journals_dispatch_deferred_when_claim_disagrees():
     """ADR 0008: `_dispatch_pr` defers (no paid run) when the fresh breaker_key
     disagrees with the claimed issue_hint, AND surfaces a
     TelemetryWarning('dispatch_deferred', ...) with Correlation(pr=N) so a
-    persistent linkage flap is visible on the dashboard warning feed."""
+    persistent linkage flap is visible in the dashboard per-issue event view."""
     pr = PRView(100, head_ref_name="fix/6-moved", closing_issue=6,
                 checks=(Check("unit", bucket="fail"),))
     gw = FakeGateway(prs={100: pr})
