@@ -305,6 +305,21 @@ class WorldObserved(EventPayload):
         object.__setattr__(self, "facts", MappingProxyType(dict(self.facts)))
 
 
+@event_type("world.feed.retired.v1")
+@dataclass(frozen=True)
+class WorldFeedRetired(EventPayload):
+    deployment: str
+    repository: str
+    role: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "repository", canonical_repository(self.repository)
+        )
+        if not self.deployment or not self.repository or not self.role:
+            raise ValueError("retired world feed identity is incomplete")
+
+
 @event_type("handover.written.v1")
 @dataclass(frozen=True)
 class HandoverWritten(EventPayload):

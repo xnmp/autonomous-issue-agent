@@ -176,12 +176,16 @@ def _control_store(
     control.initialize()
     role = journal.events.producer.role
     prior_owners: tuple[str, ...] = ()
+    prior_deployment = ""
     if cfg.repo_input and cfg.repo_input != cfg.repo:
+        prior_deployment = _deployment_identity_for_repository(
+            cfg, role, cfg.repo_input
+        )
         prior_owners = (
             f"{cfg.repo_input}:{role}",
             (
                 f"{cfg.repo_input}:{role}:"
-                f"{_deployment_identity_for_repository(cfg, role, cfg.repo_input)}"
+                f"{prior_deployment}"
             ),
         )
     control.adopt_legacy_owner(
@@ -196,6 +200,17 @@ def _control_store(
         line_limit=journal.events.line_limit,
         destination=journal.events.producer.feed_identity,
     )
+    if prior_deployment:
+        control.adopt_projection_feed(
+            prior_deployment=prior_deployment,
+            current_deployment=journal.events.producer.deployment,
+            repository=cfg.repo,
+            role=role,
+            prior_destination=(
+                f"{prior_deployment}:{cfg.repo_input}:{role}"
+            ),
+            current_destination=journal.events.producer.feed_identity,
+        )
     return control
 
 

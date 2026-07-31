@@ -48,10 +48,12 @@ from ..domain.events import (
     JsonValue,
     MAX_EVENT_LINE_BYTES,
     SpendRecorded,
+    WorldFeedRetired,
     WorldObserved,
     decode_event_line,
     encode_event_line,
 )
+from ..domain.repository import canonical_repository
 
 SCHEMA_VERSION = 13
 SCHEMA_BASELINE_VERSION = 9
@@ -859,6 +861,12 @@ class SQLiteControlStore:
                         "before_commit",
                     )
                 applied = True
+            except sqlite3.IntegrityError as exc:
+                db.rollback()
+                raise IncompatibleSchema(
+                    f"control-store migration {migration.version} found "
+                    "conflicting authority rows; operator repair is required"
+                ) from exc
             except BaseException:
                 db.rollback()
                 raise
@@ -1045,6 +1053,86 @@ class SQLiteControlStore:
                 (owner_id, repository, *prior),
             ).rowcount
             return (runs, commands)
+
+    def adopt_projection_feed(
+        self,
+        *,
+        prior_deployment: str,
+        current_deployment: str,
+        repository: str,
+        role: str,
+        prior_destination: str,
+        current_destination: str,
+    ) -> tuple[int, int]:
+        """Retire a case-alias feed without stranding membership or outbox rows."""
+
+        if (
+            not prior_deployment
+            or not current_deployment
+            or not repository
+            or not role
+            or not prior_destination
+            or not current_destination
+        ):
+            raise ValueError("projection feed adoption identity is incomplete")
+        if prior_deployment == current_deployment:
+            return (0, 0)
+        if (
+            self._event_factory is None
+            or self._event_destination != current_destination
+        ):
+            raise ValueError(
+                "current projection event destination must be bound before adoption"
+            )
+        retirement_key = hashlib.sha256(
+            f"{prior_destination}->{current_destination}".encode()
+        ).hexdigest()
+        with self.transaction() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO dedupe_keys("
+                "namespace, scope, key, claimed_at"
+                ") VALUES ('world-feed-retirement', ?, ?, ?)",
+                (
+                    current_destination,
+                    retirement_key,
+                    _stamp(self._now()),
+                ),
+            )
+            if not int(db.execute("SELECT changes()").fetchone()[0]):
+                return (0, 0)
+            moved_outbox = db.execute(
+                "UPDATE event_outbox SET destination=? "
+                "WHERE destination=? AND emitted_at IS NULL",
+                (current_destination, prior_destination),
+            ).rowcount
+            prior_rows = int(
+                db.execute(
+                    "SELECT COUNT(*) FROM world_observations "
+                    "WHERE deployment=?",
+                    (prior_deployment,),
+                ).fetchone()[0]
+            )
+            db.execute(
+                "INSERT OR IGNORE INTO world_observations("
+                "deployment, subject_kind, subject_number, content_hash, "
+                "observed_at"
+                ") SELECT ?, subject_kind, subject_number, content_hash, "
+                "observed_at FROM world_observations WHERE deployment=?",
+                (current_deployment, prior_deployment),
+            )
+            db.execute(
+                "DELETE FROM world_observations WHERE deployment=?",
+                (prior_deployment,),
+            )
+            self._event(
+                db,
+                WorldFeedRetired(
+                    prior_deployment,
+                    repository,
+                    role,
+                ),
+            )
+            return (prior_rows, moved_outbox)
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -2130,13 +2218,12 @@ class SQLiteControlStore:
                     (str(request.run_id),),
                 ).fetchone()
                 if prior is not None:
-                    identical = (
-                        prior["reservation_id"] == str(request.reservation_id)
-                        and prior["maximum_micros"] == requested.micros
-                        and prior["currency"] == requested.currency
-                        and prior["period_id"] == request.scope.period_id
-                        and prior["rate_card_id"] == request.quote.rate_card_id
-                        and prior["rate_card_version"] == request.quote.rate_card_version
+                    identical = self._reservation_request_matches(
+                        db,
+                        prior,
+                        request,
+                        limits,
+                        lease,
                     )
                     disposition = (
                         AccountingDisposition.AVAILABLE
@@ -2309,6 +2396,129 @@ class SQLiteControlStore:
                 request.cap,
                 str(exc),
             )
+
+    @staticmethod
+    def _reservation_request_matches(
+        db: sqlite3.Connection,
+        prior: sqlite3.Row,
+        request: ReservationRequest,
+        limits: tuple[BudgetLimit, ...],
+        lease: Lease | None,
+    ) -> bool:
+        """Match the complete authority, not a convenient subset of its IDs."""
+
+        run = db.execute(
+            "SELECT dispatch_id, kind, owner_id, state, config_version "
+            "FROM runs WHERE run_id=?",
+            (str(request.run_id),),
+        ).fetchone()
+        if run is None:
+            return False
+        actual_reservation = tuple(
+            prior[name]
+            for name in (
+                "reservation_id",
+                "repository",
+                "dimension",
+                "period_id",
+                "period_start",
+                "period_end",
+                "period_timezone",
+                "currency",
+                "maximum_micros",
+                "cap_micros",
+                "model",
+                "rate_card_id",
+                "rate_card_version",
+                "quote_effective_at",
+                "config_version",
+                "state",
+            )
+        )
+        expected_reservation = (
+            str(request.reservation_id),
+            request.scope.repository,
+            request.scope.dimension,
+            request.scope.period_id,
+            _stamp(request.scope.period_start),
+            _stamp(request.scope.period_end),
+            str(request.scope.period_timezone),
+            request.scope.currency,
+            request.quote.maximum_charge.micros,
+            request.cap.micros,
+            request.quote.model,
+            request.quote.rate_card_id,
+            request.quote.rate_card_version,
+            _stamp(request.quote.effective_at),
+            request.config_version,
+            "active",
+        )
+        actual_run = tuple(
+            run[name]
+            for name in (
+                "dispatch_id",
+                "kind",
+                "owner_id",
+                "state",
+                "config_version",
+            )
+        )
+        expected_run = (
+            request.dispatch_id,
+            request.kind,
+            request.owner_id,
+            "running" if lease is not None else "reserved",
+            request.config_version,
+        )
+        actual_limits = [
+            tuple(row)
+            for row in db.execute(
+                "SELECT repository, dimension, period_id, period_start, "
+                "period_end, period_timezone, currency, cap_micros "
+                "FROM reservation_limits WHERE run_id=? "
+                "ORDER BY repository, dimension, period_id, currency",
+                (str(request.run_id),),
+            ).fetchall()
+        ]
+        expected_limits = sorted(
+            (
+                limit.scope.repository,
+                limit.scope.dimension,
+                limit.scope.period_id,
+                _stamp(limit.scope.period_start),
+                _stamp(limit.scope.period_end),
+                str(limit.scope.period_timezone),
+                limit.scope.currency,
+                limit.cap.micros,
+            )
+            for limit in limits
+        )
+        persisted_lease = db.execute(
+            "SELECT dispatch_id, owner_id, pid, pgid, process_start_ticks, "
+            "started_at FROM leases WHERE run_id=?",
+            (str(request.run_id),),
+        ).fetchone()
+        expected_lease = (
+            None
+            if lease is None
+            else (
+                lease.dispatch_id,
+                lease.owner_id,
+                lease.pid,
+                lease.pgid,
+                lease.process_start_ticks,
+                _stamp(lease.started_at),
+            )
+        )
+        actual_lease = (
+            None if persisted_lease is None else tuple(persisted_lease)
+        )
+        return (
+            actual_reservation == expected_reservation
+            and actual_run == expected_run
+            and actual_limits == expected_limits
+            and actual_lease == expected_lease
+        )
 
     def settle(self, request: SettlementRequest) -> SettlementResult:
         with self.transaction() as db:
@@ -3017,7 +3227,8 @@ class SQLiteControlStore:
         raw = source.read_bytes()
         source_digest = hashlib.sha256(raw).hexdigest()
         migration_id = f"legacy-spend:{source_digest}"
-        parsed: list[tuple[str, str, int, int, datetime, str, int]] = []
+        source_identity = str(source.resolve())
+        parsed: list[tuple[str, str, int, int, datetime, str]] = []
         occurrences: dict[str, int] = {}
         rejected = 0
         for line in raw.splitlines():
@@ -3047,7 +3258,7 @@ class SQLiteControlStore:
                         Decimal("1"), rounding=ROUND_HALF_UP
                     )
                 )
-                normalized_repository = repository.strip()
+                normalized_repository = canonical_repository(repository)
                 model = str(row.get("model") or "<unknown>")
                 normalized_stamp = _stamp(stamp)
                 semantic_row = json.dumps(
@@ -3064,7 +3275,7 @@ class SQLiteControlStore:
                 occurrence = occurrences.get(semantic_row, 0) + 1
                 occurrences[semantic_row] = occurrence
                 row_identity = hashlib.sha256(
-                    f"{semantic_row}:{occurrence}".encode()
+                    f"{source_identity}:{semantic_row}:{occurrence}".encode()
                 ).hexdigest()
                 run_id = hashlib.sha256(
                     f"legacy-spend-row:{row_identity}".encode()
@@ -3077,7 +3288,6 @@ class SQLiteControlStore:
                         micros,
                         stamp,
                         model,
-                        occurrence,
                     )
                 )
             except (
@@ -3120,7 +3330,6 @@ class SQLiteControlStore:
                 micros,
                 stamp,
                 model,
-                occurrence,
             ) in parsed:
                 period_start = stamp.astimezone(timezone.utc).replace(
                     hour=0, minute=0, second=0, microsecond=0
@@ -3128,31 +3337,6 @@ class SQLiteControlStore:
                 period_end = period_start + timedelta(days=1)
                 period_id = period_start.date().isoformat()
                 settled_at = _stamp(stamp)
-                previously_imported = int(
-                    db.execute(
-                        "SELECT COUNT(*) "
-                        "FROM runs AS r "
-                        "JOIN budget_reservations AS b ON b.run_id=r.run_id "
-                        "JOIN charges AS c ON c.run_id=r.run_id "
-                        "JOIN reservation_limits AS l ON l.run_id=r.run_id "
-                        "WHERE r.kind='legacy-import' "
-                        "AND TRIM(b.repository)=? "
-                        "AND b.model=? "
-                        "AND c.amount_micros=? "
-                        "AND c.currency='USD' "
-                        "AND c.settled_at=? "
-                        "AND l.dimension=?",
-                        (
-                            repository,
-                            model,
-                            micros,
-                            settled_at,
-                            f"issue:{issue}",
-                        ),
-                    ).fetchone()[0]
-                )
-                if occurrence <= previously_imported:
-                    continue
                 db.execute(
                     "INSERT OR IGNORE INTO runs("
                     "run_id, dispatch_id, kind, owner_id, state, "

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import multiprocessing
 import os
@@ -49,9 +50,11 @@ from issue_agent.domain.events import (
     Producer,
     SpendRecorded,
     TelemetryWarning,
+    WorldFeedRetired,
     WorldObserved,
     new_event_id,
 )
+from issue_agent.domain.projection import fold
 
 
 NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
@@ -179,6 +182,49 @@ def test_repository_alias_migration_unifies_authoritative_rows(tmp_path):
             ).fetchall()
         }
     assert repositories == {"o/r"}
+
+
+def test_repository_alias_claim_collision_fails_as_permanent_schema_error(
+    tmp_path,
+):
+    store = _store(tmp_path)
+    with store._connect() as db:
+        db.execute("DELETE FROM schema_migrations WHERE version=13")
+        claim = (
+            "fix",
+            "issue:7",
+            "RESOLVE",
+            "owner",
+            123,
+            10,
+            "[]",
+            NOW.isoformat(),
+        )
+        db.execute(
+            "INSERT INTO dispatch_claims("
+            "repository, role, target, leg, owner_id, owner_pid, "
+            "owner_start_ticks, paths_json, claimed_at"
+            ") VALUES ('Acme/App', ?, ?, ?, ?, ?, ?, ?, ?)",
+            claim,
+        )
+        db.execute(
+            "INSERT INTO dispatch_claims("
+            "repository, role, target, leg, owner_id, owner_pid, "
+            "owner_start_ticks, paths_json, claimed_at"
+            ") VALUES ('acme/app', ?, ?, ?, ?, ?, ?, ?, ?)",
+            claim,
+        )
+
+    with pytest.raises(
+        IncompatibleSchema,
+        match="conflicting authority rows; operator repair is required",
+    ):
+        SQLiteControlStore(store.path).initialize()
+
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT MAX(version) FROM schema_migrations"
+        ).fetchone()[0] == 12
 
 
 def test_valid_pre_witness_database_is_adopted_once(tmp_path):
@@ -762,6 +808,84 @@ def test_transactional_reservations_admit_only_one_racer_for_final_capacity(tmp_
     assert store.snapshot(_scope()).reserved == Money("USD", 60)
 
 
+def test_reservation_replay_requires_the_complete_same_paid_authority(tmp_path):
+    store = _store(tmp_path)
+    original = _request(1)
+    assert store.reserve(original).admitted
+    assert store.reserve(original).detail == "idempotent reservation"
+
+    other_scope = dataclasses.replace(
+        original.scope,
+        repository="other/repo",
+        dimension="weekly",
+        period_id="2026-W31",
+        period_end=original.scope.period_end + timedelta(days=6),
+    )
+    global_scope = dataclasses.replace(
+        original.scope,
+        repository="*",
+        dimension="global",
+    )
+    conflicting = dataclasses.replace(
+        original,
+        dispatch_id="other-dispatch",
+        scope=other_scope,
+        quote=dataclasses.replace(
+            original.quote,
+            model="other-model",
+            effective_at=NOW + timedelta(seconds=1),
+        ),
+        cap=Money("USD", 1),
+        config_version="config-v2",
+        additional_limits=(BudgetLimit(global_scope, Money("USD", 1)),),
+        kind="REVIEW",
+        owner_id="other-owner",
+    )
+
+    result = store.reserve(conflicting)
+
+    assert result.disposition is AccountingDisposition.CONFLICT
+    with store._connect() as db:
+        persisted = db.execute(
+            "SELECT b.repository, b.cap_micros, r.dispatch_id, r.owner_id "
+            "FROM budget_reservations b JOIN runs r ON r.run_id=b.run_id "
+            "WHERE b.run_id=?",
+            (str(original.run_id),),
+        ).fetchone()
+        limit_count = db.execute(
+            "SELECT COUNT(*) FROM reservation_limits WHERE run_id=?",
+            (str(original.run_id),),
+        ).fetchone()[0]
+    assert tuple(persisted) == ("o/r", 100, "dispatch-1", "reservation")
+    assert limit_count == 1
+
+
+@pytest.mark.parametrize("terminal", ("settled", "released"))
+def test_terminal_reservation_is_not_a_new_paid_admission(tmp_path, terminal):
+    store = _store(tmp_path)
+    request = _request(1)
+    assert store.reserve(request).admitted
+    if terminal == "settled":
+        store.settle(
+            SettlementRequest(
+                request.run_id,
+                Money("USD", 1),
+                PricingBasis.PROVIDER_REPORTED,
+                "terminal-receipt",
+                None,
+                None,
+                None,
+            )
+        )
+    else:
+        store.release(request.run_id, "cancelled")
+
+    assert (
+        store.reserve(request).disposition
+        is AccountingDisposition.CONFLICT
+    )
+
+
 def test_two_processes_racing_final_capacity_admit_exactly_one(tmp_path):
     path = str(tmp_path / "state" / "control.db")
     _store(tmp_path)
@@ -834,6 +958,7 @@ def test_reservation_and_owner_lease_commit_atomically(tmp_path):
     )
 
     assert store.reserve(request, lease=lease).admitted
+    assert store.reserve(request, lease=lease).detail == "idempotent reservation"
 
     assert store.leases() == (lease,)
     assert store.active_reservation_runs() == (request.run_id,)
@@ -1373,6 +1498,94 @@ def test_failed_bound_publication_stays_pending_until_rebind(tmp_path):
     assert isinstance(published[0].payload, ControlTransitionCommitted)
 
 
+def test_projection_feed_adoption_flushes_old_outbox_and_retires_membership(
+    tmp_path,
+):
+    store = _store(tmp_path)
+    old = Producer("old-deployment", "Acme/App", "fix", 123, "old-boot")
+    current = Producer(
+        "current-deployment", "acme/app", "fix", 124, "current-boot"
+    )
+    sequences = {old.identity: 0, current.identity: 0}
+
+    def factory(producer):
+        def create(payload, correlation):
+            sequence = sequences[producer.identity]
+            sequences[producer.identity] += 1
+            return EventEnvelope(
+                payload,
+                new_event_id(NOW + timedelta(milliseconds=sequence)),
+                sequence,
+                NOW + timedelta(milliseconds=sequence),
+                NOW + timedelta(milliseconds=sequence),
+                sequence,
+                producer,
+                correlation,
+            )
+
+        return create
+
+    old_destination = "old-deployment:Acme/App:fix"
+    store.bind_event_outbox(
+        factory(old),
+        lambda _event: (_ for _ in ()).throw(RuntimeError("sink down")),
+        destination=old_destination,
+    )
+    assert store.reserve(_request(1)).admitted
+    facts = {"present": True, "state": "open"}
+    content_hash = hashlib.sha256(
+        json.dumps(facts, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert store.record_world_snapshot(
+        deployment="old-deployment",
+        subject_kind="issue",
+        observations={
+            7: (content_hash, facts, Correlation(issue=7)),
+        },
+    ) == 1
+    with store._connect() as db:
+        db.execute(
+            "UPDATE event_outbox SET destination=? "
+            "WHERE destination=? AND emitted_at IS NULL",
+            (old_destination, old.feed_identity),
+        )
+
+    published = []
+    store.bind_event_outbox(
+        factory(current),
+        published.append,
+        destination=current.feed_identity,
+    )
+    assert store.adopt_projection_feed(
+        prior_deployment="old-deployment",
+        current_deployment="current-deployment",
+        repository="acme/app",
+        role="fix",
+        prior_destination=old_destination,
+        current_destination=current.feed_identity,
+    ) == (1, 2)
+    assert isinstance(published[-1].payload, WorldFeedRetired)
+
+    assert store.record_world_snapshot(
+        deployment="current-deployment",
+        subject_kind="issue",
+        observations={},
+    ) == 1
+    model = fold(published)
+    assert model.world_facts[("issue", 7)] == {"present": False}
+    assert all(key[0] != "old-deployment" for key in model.observed_by_feed)
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM event_outbox WHERE emitted_at IS NULL"
+        ).fetchone()[0] == 0
+        assert [
+            row["deployment"]
+            for row in db.execute(
+                "SELECT DISTINCT deployment FROM world_observations"
+            ).fetchall()
+        ] == ["current-deployment"]
+
+
 def test_world_observation_dedup_is_latest_state_and_outbox_atomic(tmp_path):
     store = _store(tmp_path)
     producer = Producer("deployment", "o/r", "fix", 123, "boot")
@@ -1472,6 +1685,67 @@ def test_legacy_spend_import_preserves_all_live_cap_dimensions(tmp_path):
     appended = store.import_legacy_spend(str(ledger))
     assert appended.imported == 1
     assert store.snapshot(repository).settled == Money("USD", 2_500_000)
+
+
+def test_legacy_spend_import_uses_canonical_repository_scope(tmp_path):
+    store = _store(tmp_path)
+    ledger = tmp_path / "spend.jsonl"
+    ledger.write_text(
+        json.dumps(
+            {
+                "event": "spend",
+                "ts": NOW.isoformat(),
+                "repo": " Acme/App ",
+                "issue": 7,
+                "cost_usd": 49,
+                "model": "legacy",
+            }
+        )
+        + "\n"
+    )
+
+    assert store.import_legacy_spend(str(ledger)).imported == 1
+
+    scope = dataclasses.replace(
+        _scope(), repository="acme/app", dimension="repository"
+    )
+    assert store.snapshot(scope).settled == Money("USD", 49_000_000)
+
+
+def test_distinct_rotated_ledgers_keep_identical_semantic_spend_rows(
+    tmp_path,
+):
+    store = _store(tmp_path)
+    common = {
+        "event": "spend",
+        "ts": NOW.isoformat(),
+        "repo": "o/r",
+        "issue": 7,
+        "cost_usd": 1.25,
+        "model": "legacy",
+    }
+    first = tmp_path / "spend.1.jsonl"
+    second = tmp_path / "spend.2.jsonl"
+    first.write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in (dict(common, issue=8), common)
+        )
+        + "\n"
+    )
+    second.write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in (common, dict(common, issue=9))
+        )
+        + "\n"
+    )
+
+    assert store.import_legacy_spend(str(first)).imported == 2
+    assert store.import_legacy_spend(str(second)).imported == 2
+
+    scope = dataclasses.replace(_scope(), dimension="repository")
+    assert store.snapshot(scope).settled == Money("USD", 5_000_000)
 
 
 def test_legacy_spend_import_rejects_unattributed_rows(tmp_path):

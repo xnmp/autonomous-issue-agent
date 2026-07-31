@@ -14,6 +14,7 @@ from .events import (
     LevelChanged,
     ProjectionSnapshot,
     SpendRecorded,
+    WorldFeedRetired,
     WorldObserved,
     JsonValue,
 )
@@ -53,10 +54,21 @@ def fold(events: Iterable[EventEnvelope]) -> ReadModel:
     observed_by_feed: dict[WorldFeedSubject, EventEnvelope] = {}
     spend: dict[str, int] = {}
     starts_by_event_id: dict[str, str] = {}
+    retired_feeds: set[tuple[str, str, str]] = set()
 
     for event in ordered:
         payload = event.payload
         run_id = event.correlation.run_id
+        feed = (
+            event.producer.deployment,
+            event.producer.repository,
+            event.producer.role,
+        )
+        if (
+            isinstance(payload, (LevelChanged, ProjectionSnapshot, WorldObserved))
+            and feed in retired_feeds
+        ):
+            continue
         if isinstance(payload, AgentRunStarted) and run_id:
             runs[run_id] = RunProjection(event)
             starts_by_event_id[event.event_id] = run_id
@@ -77,11 +89,6 @@ def fold(events: Iterable[EventEnvelope]) -> ReadModel:
             else:
                 levels[payload.state_key] = event
         elif isinstance(payload, ProjectionSnapshot):
-            feed = (
-                event.producer.deployment,
-                event.producer.repository,
-                event.producer.role,
-            )
             levels = {
                 state_key: level
                 for state_key, level in levels.items()
@@ -95,6 +102,28 @@ def fold(events: Iterable[EventEnvelope]) -> ReadModel:
             levels.update(
                 {state_key: event for state_key in payload.open_levels}
             )
+        elif isinstance(payload, WorldFeedRetired):
+            retired_feed = (
+                payload.deployment,
+                payload.repository,
+                payload.role,
+            )
+            retired_feeds.add(retired_feed)
+            levels = {
+                state_key: level
+                for state_key, level in levels.items()
+                if (
+                    level.producer.deployment,
+                    level.producer.repository,
+                    level.producer.role,
+                )
+                != retired_feed
+            }
+            observed_by_feed = {
+                key: observed
+                for key, observed in observed_by_feed.items()
+                if key[:3] != retired_feed
+            }
         elif isinstance(payload, WorldObserved):
             feed_key = (
                 event.producer.deployment,

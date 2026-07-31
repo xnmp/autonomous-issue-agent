@@ -267,7 +267,7 @@ def verify(
     )
     legacy_gate_blocked = store.snapshot(scope).settled.micros >= 1
     if (
-        repeated_reservation.disposition is not AccountingDisposition.AVAILABLE
+        repeated_reservation.disposition is not AccountingDisposition.CONFLICT
         or not repeated_settlement.idempotent
         or conflicting_settlement.disposition
         is not AccountingDisposition.CONFLICT
@@ -329,8 +329,9 @@ def verify(
             },
             "deduplication_decisions": {
                 "legacy_source_replay_idempotent": repeated.idempotent,
-                "primary_reservation_replay_idempotent": (
-                    repeated_reservation.admitted
+                "terminal_reservation_replay_rejected": (
+                    repeated_reservation.disposition
+                    is AccountingDisposition.CONFLICT
                 ),
                 "primary_settlement_replay_idempotent": (
                     repeated_settlement.idempotent
@@ -358,7 +359,10 @@ def verify(
                 "SQLiteControlStore.reserve -> settle on the existing "
                 "operational database"
             ),
-            "idempotent_reservation": repeated_reservation.admitted,
+            "terminal_reservation_replay_rejected": (
+                repeated_reservation.disposition
+                is AccountingDisposition.CONFLICT
+            ),
             "idempotent_settlement": repeated_settlement.idempotent,
             "conflicting_settlement_rejected": (
                 conflicting_settlement.disposition

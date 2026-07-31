@@ -8,6 +8,7 @@ from issue_agent.domain.events import (
     Producer,
     ProjectionSnapshot,
     TelemetryWarning,
+    WorldFeedRetired,
     WorldObserved,
     decode_event_line,
     encode_event,
@@ -225,6 +226,33 @@ def test_world_fold_marks_subject_absent_only_after_every_feed_tombstones(
     assert model.observed[("pr", 9)] == absent
 
 
+def test_world_fold_retires_every_subject_from_an_adopted_feed(tmp_path) -> None:
+    old = EventLog(
+        str(tmp_path / "old.jsonl"),
+        Producer("old-deployment", "Acme/App", "fix", 100, "old-boot"),
+    )
+    current = EventLog(
+        str(tmp_path / "current.jsonl"),
+        Producer("new-deployment", "acme/app", "fix", 101, "new-boot"),
+    )
+    present = old.emit(
+        WorldObserved(
+            "issue",
+            7,
+            "present",
+            {"present": True, "state": "open"},
+        )
+    )
+    retired = current.emit(
+        WorldFeedRetired("old-deployment", "acme/app", "fix")
+    )
+
+    model = fold((present, retired))
+
+    assert ("issue", 7) not in model.world_facts
+    assert model.observed_by_feed == {}
+
+
 def test_oversized_event_is_rejected_before_write(tmp_path) -> None:
     path = tmp_path / "events.jsonl"
     log = EventLog(str(path), _producer(), line_limit=100)
@@ -289,6 +317,9 @@ _SAMPLE = {
     "subject_number": 1,
     "content_hash": "hash",
     "facts": {},
+    "deployment": "deployment",
+    "repository": "owner/repo",
+    "role": "fix",
     "trigger": "budget",
     "bytes_written": 1,
     "predicted_paths": ("a.py",),
