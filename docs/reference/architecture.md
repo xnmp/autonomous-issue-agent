@@ -30,10 +30,11 @@ The Pyrefly seam gate structurally assigns every production adapter to each
 domain port it implements. An AST coverage contract requires every newly
 declared Protocol to join that checked set or an explicit documented exemption,
 so the global annotation-backlog suppressions cannot hide a new port drift.
-Pyrefly checks the explicit `src` and `tests` inputs without consulting ambient
-Git ignore files: linked issue worktrees live below a scratch path excluded by
-the primary checkout's shared `.git/info/exclude`, but their type gate must be
-identical to the primary checkout's.
+Pyrefly checks the explicit `src` and `tests` inputs without applying its default
+hidden-directory exclusions or consulting ambient Git ignore files: linked issue
+worktrees live below the hidden `.claude/worktrees` scratch path and that path is
+also excluded by the primary checkout's shared `.git/info/exclude`, but their type
+gate must be identical to the primary checkout's.
 
 The steward optionally grooms open issue bodies (`STEWARD_GROOM=1`): it emits
 advisory comments and the orthogonal `maybe-resolved` label for verified recent

@@ -69,9 +69,11 @@ addopts = "-q"
 [tool.pyrefly]
 preset = "default"
 project-includes = ["src", "tests"]
-# Linked issue worktrees live below a path ignored by the primary checkout's
-# shared .git/info/exclude. Pyrefly must type-check the explicit project inputs
-# regardless of that ambient worktree-scratch ignore.
+# Linked issue worktrees live below the hidden `.claude/worktrees` path, which
+# Pyrefly's default dot-directory heuristic excludes. The primary checkout also
+# ignores that path through its shared .git/info/exclude. Explicit project inputs
+# must win over both ambient exclusions so the gate is location-independent.
+disable-project-excludes-heuristics = true
 use-ignore-files = false
 search-path = [".", "src", "tests/domain", "tests/adapters", "tests/app"]
 ignore-missing-imports = ["fastapi", "fastapi.*", "uvicorn"]
