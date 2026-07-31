@@ -824,5 +824,98 @@
       "pending_outbox": 0
     },
     "operator_warning": "The repository rejected automatic enablement of allow_auto_merge; the bounded canary continued with the documented manual repository-setting warning."
+  },
+  "schema_v14_final_release_follow_up": {
+    "observed_from": "2026-07-31T04:08:19Z",
+    "observed_through": "2026-07-31T04:16:32Z",
+    "commit": "e444e7b033c7a68d7d5deb1f32d1277547718fe1",
+    "code_tree": "3dfd52024ea616734e78dfe736532b65873259c7",
+    "closed_findings": [
+      "Every admitted production run is bound to its coarse dispatch claim before provider execution; a dead daemon cannot release the claim while a bound child run remains nonterminal.",
+      "Machine-global control authority is independent of deployment-local state roots, and conflicting legacy deployment-local authority fails closed.",
+      "Issue-less review retains repository and global capabilities while fix work without an issue remains blocked.",
+      "CLI status and dashboard usage read settled charges from the canonical SQLite authority, including the shared global daily cap.",
+      "Same-repository checkout repoints preserve bounded ancestry, reap predecessor process registries, and adopt control-store ownership before new work is admitted."
+    ],
+    "full_suite": {
+      "command": "UV_CACHE_DIR=/tmp/issue-agent-uv-cache make test",
+      "result": "passed",
+      "shell_hooks": 90,
+      "point_at": 7,
+      "domain_pytest": 659,
+      "adapter_pytest": 797,
+      "application_pytest": 1334,
+      "gate_parity": 48,
+      "import_contracts": 4,
+      "pyrefly_errors": 0
+    },
+    "live_roles": {
+      "command": "ISSUE_AGENT_MAX_TICKS=0 UV_CACHE_DIR=/tmp/issue-agent-uv-cache bash bin/point-at.sh self",
+      "exit_code": 0,
+      "doctor_errors": 0,
+      "doctor_warnings": 3,
+      "clean_origin_dev_test": "passed",
+      "roles": {
+        "fix": [
+          "starting",
+          "running",
+          "draining",
+          "stopped"
+        ],
+        "review": [
+          "starting",
+          "running",
+          "draining",
+          "stopped"
+        ],
+        "steward": [
+          "starting",
+          "running",
+          "draining",
+          "stopped"
+        ]
+      }
+    },
+    "control_store": {
+      "path": "/home/chong/.local/state/issue-agent-control/control.db",
+      "database_mode": "0600",
+      "authority_witness_mode": "0600",
+      "integrity": "ok",
+      "foreign_key_check_rows": 0,
+      "schema_migrations": [
+        9,
+        10,
+        11,
+        12,
+        13,
+        14
+      ],
+      "nonterminal_runs": 0,
+      "active_reservations": 0,
+      "leases": 0,
+      "dispatch_claims": 0,
+      "dispatch_claim_runs": 0,
+      "pending_commands": 0,
+      "pending_outbox": 0,
+      "current_utc_day_settled_micros": {
+        "all_repositories": 1,
+        "xnmp/autonomous-issue-agent": 1
+      }
+    },
+    "operator_surfaces": {
+      "status": {
+        "repository_daily_cap": "disabled",
+        "global_daily_cap_usd": 1500
+      },
+      "dashboard": {
+        "root_http_status": 200,
+        "repos_api_http_status": 200,
+        "usage_api_http_status": 200,
+        "global_daily_cap_usd": 1500,
+        "self_in_flight": 0,
+        "self_done": 0
+      }
+    },
+    "operator_warning": "The repository rejected automatic enablement of allow_auto_merge; the bounded canary continued with the documented manual repository-setting warning."
   }
 }

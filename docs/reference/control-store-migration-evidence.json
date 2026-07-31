@@ -160,5 +160,57 @@
       "pending_commands": 0,
       "pending_outbox": 0
     }
+  },
+  "schema_v14_dispatch_claim_follow_up": {
+    "observed_at": "2026-07-31T04:16:32Z",
+    "commit": "e444e7b033c7a68d7d5deb1f32d1277547718fe1",
+    "code_tree": "3dfd52024ea616734e78dfe736532b65873259c7",
+    "current_schema_version": 14,
+    "supported_upgrade_histories": [
+      [
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14
+      ],
+      [
+        9,
+        10,
+        11,
+        12,
+        13,
+        14
+      ]
+    ],
+    "concurrency_contract": "Three spawned role processes concurrently initialize fresh, v8, and v9 databases; every process succeeds and the final history is contiguous and digest-valid through v14.",
+    "restart_contract": "Each v9, v10, v11, v12, v13, and v14 migration is interrupted before commit and immediately after commit, then reopened and integrity-checked.",
+    "dispatch_claim_contract": "A claim bound to a nonterminal child run survives daemon death and continues to block a sibling admission until owner recovery terminalizes the run and releases its accounting reservation.",
+    "authority_contract": "All deployment-local state roots resolve the same per-account canonical control authority; an existing deployment-local database is rejected rather than silently splitting ownership.",
+    "full_suite": "make test passed with 797 adapter tests, including schema concurrency, restart, dispatch-claim child liveness, machine-authority, repoint adoption, and settled-spend cases.",
+    "live_primary": {
+      "path": "/home/chong/.local/state/issue-agent-control/control.db",
+      "schema_migrations": [
+        9,
+        10,
+        11,
+        12,
+        13,
+        14
+      ],
+      "database_integrity": "ok",
+      "foreign_key_check_rows": 0,
+      "database_mode": "0600",
+      "authority_witness_mode": "0600",
+      "nonterminal_runs": 0,
+      "active_reservations": 0,
+      "leases": 0,
+      "dispatch_claims": 0,
+      "dispatch_claim_runs": 0,
+      "pending_commands": 0,
+      "pending_outbox": 0
+    }
   }
 }
