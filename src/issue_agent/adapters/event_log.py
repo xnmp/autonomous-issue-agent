@@ -28,6 +28,7 @@ from ..domain.events import (
     new_event_id,
 )
 
+
 @dataclass
 class EventLog:
     path: str
@@ -135,12 +136,12 @@ class EventLog:
             os.makedirs(parent, mode=0o700, exist_ok=True)
         fd = os.open(
             self.path,
-            os.O_APPEND | os.O_CREAT | os.O_WRONLY | os.O_CLOEXEC,
+            os.O_APPEND | os.O_CREAT | os.O_RDWR | os.O_CLOEXEC,
             0o600,
         )
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
-            starting_size = os.fstat(fd).st_size
+            starting_size = self._truncate_incomplete_tail(fd)
             offset = 0
             try:
                 while offset < len(encoded):
@@ -162,6 +163,39 @@ class EventLog:
             except OSError:
                 pass
             os.close(fd)
+
+    @staticmethod
+    def _truncate_incomplete_tail(fd: int) -> int:
+        """Return the complete-line boundary after discarding a killed append."""
+
+        size = os.fstat(fd).st_size
+        if size == 0:
+            return 0
+        while True:
+            try:
+                if os.pread(fd, 1, size - 1) == b"\n":
+                    return size
+                break
+            except InterruptedError:
+                continue
+
+        cursor = size
+        complete_size = 0
+        while cursor > 0:
+            start = max(0, cursor - MAX_EVENT_LINE_BYTES)
+            while True:
+                try:
+                    chunk = os.pread(fd, cursor - start, start)
+                    break
+                except InterruptedError:
+                    continue
+            newline = chunk.rfind(b"\n")
+            if newline >= 0:
+                complete_size = start + newline + 1
+                break
+            cursor = start
+        os.ftruncate(fd, complete_size)
+        return complete_size
 
     @contextmanager
     def _path_lock(self) -> Iterator[None]:

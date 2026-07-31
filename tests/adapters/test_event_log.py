@@ -15,6 +15,7 @@ from issue_agent.domain.events import (
     WorldObserved,
     decode_event_line,
     encode_event,
+    encode_event_line,
     event_registry,
 )
 from issue_agent.domain.projection import fold
@@ -91,6 +92,27 @@ def test_event_log_rolls_back_a_fragment_before_outbox_retry(
     monkeypatch.setattr(os, "write", real_write)
     retried = log.emit(TelemetryWarning("write", "retried"))
     assert decode_event_line(path.read_text()) == retried
+
+
+def test_outbox_retry_discards_fragment_left_by_killed_writer(tmp_path) -> None:
+    path = tmp_path / "events.jsonl"
+    log = EventLog(str(path), _producer())
+    original = log.emit(TelemetryWarning("write", "complete"))
+    retried = log.prepare(TelemetryWarning("write", "retried"))
+    encoded = (encode_event_line(retried) + "\n").encode()
+
+    fd = os.open(path, os.O_APPEND | os.O_WRONLY)
+    try:
+        os.write(fd, encoded[: len(encoded) // 2])
+    finally:
+        os.close(fd)
+
+    log.append_committed(retried)
+
+    decoded = tuple(
+        decode_event_line(line) for line in path.read_text().splitlines()
+    )
+    assert decoded == (original, retried)
 
 
 def test_rotation_preserves_open_level_in_snapshot(tmp_path) -> None:
