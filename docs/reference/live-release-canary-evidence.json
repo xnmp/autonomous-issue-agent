@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-31T02:56:49Z",
+  "generated_at": "2026-07-31T03:13:12Z",
   "repository": "xnmp/autonomous-issue-agent",
   "purpose": "Release evidence for the 2026-07-30 architectural implementation plan",
   "builds": {
@@ -9,7 +9,7 @@
     "accounting_canary": "740cb2be0ba4d49a6d82534c274490480e7054f7",
     "money_precision_correction": "40f66dac71e9bc7a2a9c7649cb14dba7b13a5d1a",
     "final_audit_remediation": "9786b5f65a516930e3758ab9ed360d657ba141cb",
-    "final_release": "6efba6f2a459738f549c796bf919ea5529371416"
+    "final_release": "dbca28ee4f12bb75c74003bffa329128cedc4ae4"
   },
   "all_role_boot": {
     "roles": {
@@ -724,6 +724,97 @@
       "database_mode": "0600",
       "event_writer_lock_modes": "0600",
       "integrity": "ok",
+      "self_role_world_rows_after_stop": 0,
+      "nonterminal_runs": 0,
+      "active_reservations": 0,
+      "leases": 0,
+      "dispatch_claims": 0,
+      "pending_commands": 0,
+      "pending_outbox": 0
+    },
+    "operator_warning": "The repository rejected automatic enablement of allow_auto_merge; the bounded canary continued with the documented manual repository-setting warning."
+  },
+  "final_event_append_recovery_follow_up": {
+    "observed_at": "2026-07-31T03:13:12Z",
+    "commit": "dbca28ee4f12bb75c74003bffa329128cedc4ae4",
+    "code_tree": "70c571faeb5f4411a03b521f08cb159e055acf27",
+    "closed_finding": "An append now discards only an unterminated trailing record while holding the stable path lock and inode lock, so a durable outbox retry after writer death produces one complete event instead of concatenating onto the killed writer's fragment.",
+    "crash_canary": {
+      "mechanism": "A forked writer exited with status 137 from inside os.write after persisting half an encoded event; the parent retried the same committed envelope through EventLog.append_committed.",
+      "killed_append_exit": 137,
+      "recovered_events": 2,
+      "decode": "ok",
+      "result": "The complete predecessor and exactly one retried event decoded through the production schema-v2 codec."
+    },
+    "full_suite": {
+      "command": "make test",
+      "result": "passed",
+      "shell_hooks": 90,
+      "point_at": 7,
+      "domain_pytest": 659,
+      "adapter_pytest": 784,
+      "application_pytest": 1320,
+      "gate_parity": 48,
+      "import_contracts": 4,
+      "pyrefly_errors": 0
+    },
+    "live_roles": {
+      "command": "ISSUE_AGENT_MAX_TICKS=0 GATE_PROBE=0 bash bin/point-at.sh self",
+      "exit_code": 0,
+      "doctor_errors": 0,
+      "doctor_warnings": 3,
+      "roles": {
+        "fix": {
+          "pid": 4009691,
+          "heartbeat_state": "stopped",
+          "in_flight": []
+        },
+        "review": {
+          "pid": 4009692,
+          "heartbeat_state": "stopped",
+          "in_flight": []
+        },
+        "steward": {
+          "pid": 4009693,
+          "heartbeat_state": "stopped",
+          "in_flight": []
+        }
+      },
+      "process_supervision": {
+        "remaining_registration_receipts": 0
+      }
+    },
+    "event_logs": {
+      "schema_v2_events_decoded": 328,
+      "writer_lock_modes": "0600",
+      "feed_retirements": {
+        "fix": {
+          "deployment": "e7f63b256a30fbf4",
+          "pid": 4009691,
+          "restartable": true
+        },
+        "review": {
+          "deployment": "30e2d1145844dc4e",
+          "pid": 4009692,
+          "restartable": true
+        },
+        "steward": {
+          "deployment": "934214f238852f48",
+          "pid": 4009693,
+          "restartable": true
+        }
+      }
+    },
+    "control_store": {
+      "database_mode": "0600",
+      "integrity": "ok",
+      "schema_migrations": [
+        9,
+        10,
+        11,
+        12,
+        13
+      ],
       "self_role_world_rows_after_stop": 0,
       "nonterminal_runs": 0,
       "active_reservations": 0,
