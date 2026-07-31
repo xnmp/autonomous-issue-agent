@@ -752,6 +752,27 @@ def test_status_merge_agent_run_start_does_not_appear_in_last_runs(tmp_path):
     assert out.count("RESOLVE") == 1
 
 
+def test_status_caps_resolve_overlay_then_shared_config(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path / "repos"))
+    Path(cli.REPOS_DIR).mkdir()
+    monkeypatch.setattr(cli, "SHARED_ENV", str(tmp_path / "shared.env"))
+    Path(cli.SHARED_ENV).write_text(
+        'DAILY_SPEND_CAP_USD="99"\n'
+        'GLOBAL_DAILY_SPEND_CAP_USD="1500"\n'
+    )
+    (Path(cli.REPOS_DIR) / "self.env").write_text(
+        'REPO="o/r"\n'
+        'TARGET_DIR="/srv/o-r"\n'
+        'DAILY_SPEND_CAP_USD="0"\n'
+    )
+
+    assert cli.daily_cap("self") == 0
+    assert cli.global_daily_cap("self") == 1500
+
+
 # ── P0R-2: refuse a resolved overlay that belongs to a DIFFERENT repo/checkout
 # ── check_overlay_mismatch (pure) ─────────────────────────────────────────────
 def test_check_overlay_mismatch_detects_wrong_repo(tmp_path):
