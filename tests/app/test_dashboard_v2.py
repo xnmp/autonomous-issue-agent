@@ -1,8 +1,12 @@
 import json
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from issue_agent.adapters.event_log import EventLog
 from issue_agent.app.dashboard import collect
+from issue_agent.app.dashweb import service
+from issue_agent.domain.dashboard import Snapshot
 from issue_agent.domain.events import (
     AgentRunCompleted,
     AgentRunStarted,
@@ -10,6 +14,7 @@ from issue_agent.domain.events import (
     DaemonStateChanged,
     Producer,
     SpendRecorded,
+    WorldFeedRetired,
     WorldObserved,
 )
 
@@ -34,7 +39,7 @@ def test_collect_prefers_v2_fold_and_ignores_legacy_lifecycle(tmp_path) -> None:
             "issue",
             7,
             "hash",
-            {"state": "open", "labels": ["ai-working"]},
+            {"state": "open", "labels": ["ai-ready", "P2"]},
         ),
         correlation=Correlation(issue=7),
         causation_time=NOW,
@@ -85,8 +90,10 @@ def test_collect_prefers_v2_fold_and_ignores_legacy_lifecycle(tmp_path) -> None:
     assert deployment.schema_version == 2
     assert deployment.issues[0].issue == 7
     assert deployment.issues[0].stage == "awaiting review"
+    assert deployment.issues[0].lane == "pending"
     assert deployment.issues[0].done is False
     assert deployment.issues[0].cost_usd == 0.5
+    assert deployment.metrics.in_flight_issues == 0
 
 
 def test_collect_counts_reconciled_spend_without_a_completion_event(
@@ -137,6 +144,146 @@ def test_collect_counts_reconciled_spend_without_a_completion_event(
     assert deployment.issues[0].cost_usd == 0.7
     assert deployment.metrics.today_usd == 0.7
     assert deployment.metrics.total_cost_usd == 0.7
+
+
+@pytest.mark.parametrize("retirement", ["tombstone", "feed"])
+def test_v2_dashboard_excludes_issues_absent_from_the_current_world(
+    tmp_path,
+    retirement,
+) -> None:
+    state = tmp_path / "fix"
+    state.mkdir()
+    events = EventLog(
+        str(state / "events-v2.jsonl"),
+        Producer("deployment", "owner/repo", "fix", 100, "boot"),
+    )
+    events.emit(
+        WorldObserved(
+            "issue",
+            7,
+            "present",
+            {"present": True, "state": "open", "labels": ["ai-working"]},
+        ),
+        correlation=Correlation(issue=7),
+        causation_time=NOW,
+    )
+    events.emit(
+        (
+            WorldObserved(
+                "issue",
+                7,
+                "absent",
+                {"present": False, "reason": "absent_from_feed"},
+            )
+            if retirement == "tombstone"
+            else WorldFeedRetired(
+                "deployment",
+                "owner/repo",
+                "fix",
+                restartable=True,
+            )
+        ),
+        correlation=Correlation(issue=7),
+        causation_time=NOW,
+    )
+
+    deployment = collect(
+        "demo",
+        "owner/repo",
+        (
+            str(state / "journal.jsonl"),
+            str(tmp_path / "review" / "journal.jsonl"),
+            str(tmp_path / "steward" / "journal.jsonl"),
+        ),
+        str(tmp_path / "logs"),
+        str(tmp_path / "spend.jsonl"),
+        now_fn=lambda: NOW,
+    )
+
+    assert deployment.issues == ()
+    assert deployment.metrics.in_flight_issues == 0
+
+
+def test_v2_dashboard_places_current_unowned_open_issue_in_backlog(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    state = tmp_path / "fix"
+    state.mkdir()
+    events = EventLog(
+        str(state / "events-v2.jsonl"),
+        Producer("deployment", "owner/repo", "fix", 100, "boot"),
+    )
+    events.emit(
+        WorldObserved(
+            "issue",
+            7,
+            "present",
+            {
+                "present": True,
+                "state": "open",
+                "title": "Untriaged bug",
+                "labels": ["bug", "P1"],
+                "comments_total": 3,
+            },
+        ),
+        correlation=Correlation(issue=7),
+        causation_time=NOW,
+    )
+    deployment = collect(
+        "demo",
+        "owner/repo",
+        (
+            str(state / "journal.jsonl"),
+            str(tmp_path / "review" / "journal.jsonl"),
+            str(tmp_path / "steward" / "journal.jsonl"),
+        ),
+        str(tmp_path / "logs"),
+        str(tmp_path / "spend.jsonl"),
+        now_fn=lambda: NOW,
+    )
+    snapshot = Snapshot(
+        "demo",
+        "owner/repo",
+        str(tmp_path),
+        deployment,
+        (NOW,),
+    )
+
+    class Gh:
+        def issues(self, _repo):
+            return ([], "")
+
+        def prs(self, _repo):
+            return ([], "")
+
+    backend = service.Backend(gh=Gh(), now_fn=lambda: NOW)
+    monkeypatch.setattr(backend, "snapshot", lambda _name: snapshot)
+    monkeypatch.setattr(backend, "verification", lambda: {"rows": []})
+
+    payload = backend.issues("demo")
+
+    assert payload["in_flight"] == []
+    assert payload["pending"] == []
+    assert payload["done"] == []
+    assert payload["backlog"] == [
+        {
+            "issue": 7,
+            "title": "Untriaged bug",
+            "url": None,
+            "body": None,
+            "labels": ["bug", "P1"],
+            "recurrence": False,
+            "recurrence_count": 0,
+            "age_days": None,
+            "age_s": None,
+            "comments": 3,
+            "issue_type": "bug",
+            "difficulty": None,
+            "impact": None,
+        }
+    ]
+    assert deployment.metrics.in_flight_issues == 0
 
 
 def test_v2_health_uses_scheduler_heartbeat_when_events_are_quiet(

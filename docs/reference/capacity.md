@@ -5,10 +5,13 @@ operational state; rotated schema-v2 JSONL owns telemetry. There is no broker or
 distributed lock.
 
 Each event stream retains at most eight rotated 32 MiB files plus its current
-file. Every rotation writes the complete open-level projection into the new
-current file and re-emits each subject's latest world observation. Startup
-restores both before accepting events. Projection rebuild is therefore bounded
-without losing active level state or stable GitHub facts.
+file. Every append/rotation transaction holds a stable path-level interprocess
+lock. Rotation rebuilds retention state from the locked files, then writes the
+active level envelopes, permanent feed-retirement fences, and every feed's
+latest subject observation into the new current file before pruning. Startup
+restores the same state before accepting events. Projection rebuild is
+therefore bounded without losing active level state or stable GitHub facts,
+including when a supervised publisher and daemon share the stream.
 
 Re-run the local control-plane probe with:
 

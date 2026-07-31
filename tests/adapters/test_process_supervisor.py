@@ -88,6 +88,24 @@ def test_boot_recovery_kills_all_valid_registered_groups(tmp_path) -> None:
         _wait_dead(process)
 
 
+def test_legacy_recovery_does_not_reap_a_live_sibling_owner(tmp_path) -> None:
+    process = subprocess.Popen(
+        ["sleep", "30"],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+    )
+    supervisor = ProcessSupervisor(str(tmp_path), grace_seconds=0.05)
+    run_id = RunId("live-sibling")
+    supervisor.register(run_id, os.getpgid(process.pid))
+    try:
+        assert supervisor.recover_abandoned_orphans() == ()
+        assert process.poll() is None
+        assert supervisor.registrations()[0].run_id == run_id
+    finally:
+        supervisor.kill_tree(run_id)
+        _wait_dead(process)
+
+
 def test_shutdown_force_kill_does_not_spend_the_boot_recovery_grace_per_group(
     tmp_path,
 ) -> None:

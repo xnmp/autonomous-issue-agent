@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import fcntl
 import os
+import stat
 import threading
 import time
+import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,12 +39,20 @@ class EventLog:
     _seq: int = field(default=0, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
     _opened_at: float = field(default_factory=time.time, init=False)
-    _open_levels: dict[str, object] = field(default_factory=dict, init=False)
-    _latest_observations: dict[tuple[str, int], EventEnvelope] = field(
+    _open_levels: dict[str, EventEnvelope] = field(
         default_factory=dict, init=False
     )
+    _latest_observations: dict[
+        tuple[str, str, str, str, int], EventEnvelope
+    ] = field(
+        default_factory=dict, init=False
+    )
+    _feed_retirements: dict[
+        tuple[str, str, str], EventEnvelope
+    ] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
+        self.path = str(Path(self.path).resolve())
         if min(
             self.max_bytes,
             self.max_age_seconds,
@@ -48,11 +60,12 @@ class EventLog:
             self.line_limit,
         ) <= 0:
             raise ValueError("event-log bounds must be positive")
-        self._restore_open_levels()
-        try:
-            self._opened_at = os.path.getmtime(self.path)
-        except OSError:
-            pass
+        with self._path_lock():
+            self._restore_projection_state()
+            try:
+                self._opened_at = os.path.getmtime(self.path)
+            except OSError:
+                pass
 
     def emit(
         self,
@@ -63,9 +76,10 @@ class EventLog:
     ) -> EventEnvelope:
         with self._lock:
             envelope = self._prepare(payload, correlation, causation_time)
-            self._append(envelope)
-            self._remember_level(envelope)
-            self._rotate_if_needed()
+            with self._path_lock():
+                self._append(envelope)
+                self._remember_level(envelope)
+                self._rotate_if_needed()
             return envelope
 
     def prepare(
@@ -82,9 +96,10 @@ class EventLog:
         """Publish an envelope only after the state transition that owns it commits."""
 
         with self._lock:
-            self._append(event)
-            self._remember_level(event)
-            self._rotate_if_needed()
+            with self._path_lock():
+                self._append(event)
+                self._remember_level(event)
+                self._rotate_if_needed()
 
     def _prepare(
         self,
@@ -148,7 +163,38 @@ class EventLog:
                 pass
             os.close(fd)
 
+    @contextmanager
+    def _path_lock(self) -> Iterator[None]:
+        """Serialize append and replacement against every writer for this path."""
+
+        current = Path(self.path)
+        current.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        lock_path = current.parent / f".{current.name}.writer.lock"
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(lock_path, flags, 0o600)
+        try:
+            metadata = os.fstat(fd)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+            ):
+                raise OSError(
+                    f"event-log writer lock is not a user-owned regular file: "
+                    f"{lock_path}"
+                )
+            os.fchmod(fd, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
     def _rotate_if_needed(self) -> None:
+        """Rotate while the stable path lock is held by the caller."""
+
         try:
             size = os.path.getsize(self.path)
         except FileNotFoundError:
@@ -156,51 +202,80 @@ class EventLog:
         expired = time.time() - self._opened_at >= self.max_age_seconds
         if size < self.max_bytes and not expired:
             return
-        suffix = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+        suffix = (
+            datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+            + f".{uuid.uuid4().hex}"
+        )
         os.replace(self.path, f"{self.path}.{suffix}")
         self._opened_at = time.time()
-        if self._open_levels:
-            now = datetime.now(timezone.utc)
-            snapshot = EventEnvelope(
-                payload=ProjectionSnapshot(dict(self._open_levels)),
-                event_id=new_event_id(now),
-                seq=self._seq,
-                occurred_at=now,
-                observed_at=now,
-                monotonic_ns=time.monotonic_ns(),
-                producer=self.producer,
+        self._restore_projection_state(reset=True)
+        retained = {
+            event.event_id: event
+            for event in (
+                *self._feed_retirements.values(),
+                *self._open_levels.values(),
+                *self._latest_observations.values(),
             )
-            self._seq += 1
-            self._append(snapshot)
-        for key in sorted(self._latest_observations):
-            observed = self._latest_observations[key]
-            self._append(observed)
+        }
+        for event in sorted(retained.values(), key=lambda item: item.order_key):
+            self._append(event)
         self._prune_rotated_files()
 
     def _remember_level(self, event: EventEnvelope) -> None:
         payload = event.payload
-        if (
-            isinstance(payload, WorldFeedRetired)
-            and (
+        event_feed = (
+            event.producer.deployment,
+            event.producer.repository,
+            event.producer.role,
+        )
+        if isinstance(payload, WorldFeedRetired):
+            retired_feed = (
                 payload.deployment,
                 payload.repository,
                 payload.role,
             )
-            == (
-                event.producer.deployment,
-                event.producer.repository,
-                event.producer.role,
-            )
-        ):
-            self._open_levels.clear()
-            self._latest_observations.clear()
+            self._open_levels = {
+                key: level
+                for key, level in self._open_levels.items()
+                if (
+                    level.producer.deployment,
+                    level.producer.repository,
+                    level.producer.role,
+                )
+                != retired_feed
+            }
+            self._latest_observations = {
+                key: observed
+                for key, observed in self._latest_observations.items()
+                if key[:3] != retired_feed
+            }
+            if not payload.restartable:
+                self._feed_retirements[retired_feed] = event
+            return
+        if event_feed in self._feed_retirements:
             return
         if isinstance(payload, ProjectionSnapshot):
-            self._open_levels = dict(payload.open_levels)
+            self._open_levels = {
+                key: level
+                for key, level in self._open_levels.items()
+                if (
+                    level.producer.deployment,
+                    level.producer.repository,
+                    level.producer.role,
+                )
+                != event_feed
+            }
+            self._open_levels.update(
+                {key: event for key in payload.open_levels}
+            )
             return
         if isinstance(payload, WorldObserved):
             self._latest_observations[
-                (payload.subject_kind, payload.subject_number)
+                (
+                    *event_feed,
+                    payload.subject_kind,
+                    payload.subject_number,
+                )
             ] = event
             return
         if not isinstance(payload, LevelChanged):
@@ -210,15 +285,15 @@ class EventLog:
         if state in {"cleared", "closed", "stopped", "resolved"}:
             self._open_levels.pop(state_key, None)
         else:
-            self._open_levels[state_key] = {
-                "state": state,
-                "event_id": event.event_id,
-                "occurred_at": event.occurred_at.isoformat(),
-            }
+            self._open_levels[state_key] = event
 
-    def _restore_open_levels(self) -> None:
+    def _restore_projection_state(self, *, reset: bool = False) -> None:
         from ..domain.events import decode_event_line
 
+        if reset:
+            self._open_levels.clear()
+            self._latest_observations.clear()
+            self._feed_retirements.clear()
         current = Path(self.path)
         rotated = sorted(current.parent.glob(f"{current.name}.*"))
         paths = [*rotated, *([current] if current.exists() else [])]

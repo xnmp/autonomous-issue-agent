@@ -38,6 +38,7 @@ from .roles import (
     build_review_daemon,
     build_steward_daemon,
     migrate_legacy_spend,
+    process_supervision_state_dir,
 )
 from .world_probe import WorldProbe
 
@@ -206,7 +207,12 @@ def build_role(role: str, env: dict | None = None):
     if state_dir:
         from ..adapters.process_supervisor import ProcessSupervisor
 
-        recovered = ProcessSupervisor(state_dir).recover_orphans()
+        legacy_recovered = ProcessSupervisor(
+            state_dir
+        ).recover_abandoned_orphans()
+        recovered = legacy_recovered + ProcessSupervisor(
+            process_supervision_state_dir(cfg, role, state_dir)
+        ).recover_orphans()
         if recovered:
             sys.stderr.write(
                 f"{role}: recovered {len(recovered)} orphaned process group(s) "
@@ -280,7 +286,9 @@ def build_role(role: str, env: dict | None = None):
         hooks=hooks, log=_commit_log, debug=debug,
         idle_timeout=_idle, max_runtime=_wall,
         max_buffer_size=cfg.sdk_max_buffer_bytes or None,
-        process_supervisor=ProcessSupervisor(runner_state_dir),
+        process_supervisor=ProcessSupervisor(
+            process_supervision_state_dir(cfg, role, runner_state_dir)
+        ),
     )
     worktrees = Worktrees(target_dir, cfg.worktree_root, cfg.base_branch)
 

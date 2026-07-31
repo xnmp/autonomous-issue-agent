@@ -192,7 +192,7 @@ class Backend:
             {
                 row.issue
                 for row in rows
-                if row.stage == "queued" and not row.done
+                if row.lane == "pending" and not row.done
             }
             if snap.deployment.schema_version == 2
             else {
@@ -202,20 +202,45 @@ class Backend:
                 and "ai-ready" in snapshots.labels_of(issue)
             }
         )
+        backlog_numbers = (
+            {
+                row.issue
+                for row in rows
+                if row.lane == "backlog" and not row.done
+            }
+            if snap.deployment.schema_version == 2
+            else set()
+        )
         in_flight_numbers = {
-            row.issue for row in rows if not row.done and row.issue not in ready_numbers
+            row.issue
+            for row in rows
+            if (
+                not row.done
+                and row.issue not in ready_numbers
+                and row.issue not in backlog_numbers
+            )
         }
         pending, backlog = [], []
         if snap.deployment.schema_version == 2:
             for number in sorted(ready_numbers):
-                issue = {
-                    "number": number,
-                    "state": "OPEN",
-                    "labels": [{"name": "ai-ready"}],
-                    **gh_issues.get(number, {}),
-                }
+                issue = _projected_issue(
+                    row_by_issue[number],
+                    gh_issues.get(number, {}),
+                )
                 pending.append(
                     snapshots.pending_card(issue, row_by_issue.get(number))
+                )
+            for number in sorted(backlog_numbers):
+                issue = _projected_issue(
+                    row_by_issue[number],
+                    gh_issues.get(number, {}),
+                )
+                backlog.append(
+                    snapshots.backlog_card(
+                        issue,
+                        now,
+                        row_by_issue.get(number),
+                    )
                 )
         else:
             for number, issue in sorted(gh_issues.items()):
@@ -237,7 +262,7 @@ class Backend:
         return {
             "in_flight": [
                 card(row) for row in rows
-                if not row.done and row.issue not in ready_numbers
+                if row.issue in in_flight_numbers
             ],
             "pending": pending,
             "done": [card(row) for row in rows if row.done],
@@ -338,6 +363,26 @@ def _github_enrichment(value: dict) -> dict:
         key: value[key]
         for key in ("title", "url")
         if value.get(key) is not None
+    }
+
+
+def _projected_issue(row: dash.IssueRow, enrichment: dict) -> dict:
+    """Presentation fields from the authoritative v2 world projection."""
+
+    facts = row.facts
+    labels = facts.get("labels", ())
+    projected_labels = (
+        [str(label) for label in labels]
+        if isinstance(labels, (tuple, list, set, frozenset))
+        else []
+    )
+    return {
+        "number": row.issue,
+        "state": str(facts.get("state") or ""),
+        "title": facts.get("title"),
+        "labels": projected_labels,
+        "comments": facts.get("comments_total", facts.get("comments", ())),
+        **enrichment,
     }
 
 

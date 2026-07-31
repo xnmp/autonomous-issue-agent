@@ -284,6 +284,85 @@ class ProcessSupervisor:
         self._discard_dead_launcher_intents()
         return self._reap_registered(self.grace_seconds)
 
+    def recover_abandoned_orphans(self) -> tuple[RunId, ...]:
+        """Safely drain a pre-deployment-scope registry during upgrade.
+
+        A legacy state root can be shared by sibling checkouts. A live launch
+        owner or live external parent therefore makes a receipt authoritative
+        for that sibling, not an orphan this process may terminate.
+        """
+
+        table = self._process_table()
+        recovered: list[RunId] = []
+        for path in (
+            sorted(self.directory.glob("*.json"))
+            if self.directory.exists()
+            else ()
+        ):
+            registration = self._read(path)
+            if registration is None:
+                path.rename(path.with_suffix(".invalid"))
+                continue
+            intent = self._read_intent(
+                self._intent_path(registration.run_id)
+            )
+            if (
+                intent is not None
+                and self.matches_identity(
+                    intent.launcher.pid,
+                    intent.launcher.start_ticks,
+                )
+            ):
+                continue
+            leader = table.get(registration.leader.pid)
+            if (
+                leader is not None
+                and leader[0] == registration.leader
+                and leader[1] > 1
+                and leader[1] in table
+            ):
+                continue
+            self.kill_tree(registration.run_id, self.grace_seconds)
+            recovered.append(registration.run_id)
+
+        for path in (
+            sorted(self.tree_directory.glob("*.json"))
+            if self.tree_directory.exists()
+            else ()
+        ):
+            run_id, identities = self._read_tree(path)
+            if run_id is None:
+                path.rename(path.with_suffix(".invalid"))
+                continue
+            live_pids = {
+                identity.pid
+                for identity in identities
+                if (
+                    (entry := table.get(identity.pid)) is not None
+                    and entry[0] == identity
+                )
+            }
+            externally_owned = any(
+                entry[1] > 1
+                and entry[1] not in live_pids
+                and entry[1] in table
+                for identity in identities
+                if (
+                    (entry := table.get(identity.pid)) is not None
+                    and entry[0] == identity
+                )
+            )
+            if externally_owned:
+                continue
+            self._terminate_identities(identities, self.grace_seconds)
+            recovered.append(run_id)
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        self._discard_dead_launcher_intents()
+        return tuple(recovered)
+
     def force_kill_all(self) -> tuple[RunId, ...]:
         """Reap every owned process immediately at the application deadline."""
 

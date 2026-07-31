@@ -223,6 +223,15 @@ remain visible while a task is live and when an older settlement omitted them.
   "overlap": null }   // reserved: steward overlap prediction not built yet
 ```
 
+Under schema v2, bucket membership and labels come only from the current
+`world_facts` projection. `present=false` subjects and subjects removed by feed
+retirement produce no card, even when historical run events remain. A current
+open issue with no lifecycle label is backlog; `ai-ready` is pending; owned
+lifecycle states are in flight; closed/`ai-done` issues are done. GitHub reads
+may enrich title and URL but cannot move a card between buckets. This keeps an
+unavailable or differently timed dashboard GitHub read from overriding daemon
+reality.
+
 `held`/`hold_reason` from the newest journal `hold` event for that issue.
 
 `BacklogCard` (gh: open issues with NONE of ai-ready/ai-working/ai-done/

@@ -7,7 +7,7 @@ processes, HTTP, GitHub, or rendering.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Mapping
 
@@ -21,8 +21,10 @@ from .events import (
     SpendBlocked,
     SpendRecorded,
     WorldObserved,
+    JsonValue,
     encode_event,
 )
+from .labels import LIFECYCLE_LABELS
 from .projection import ReadModel
 
 # The three role daemons, in the order `journal_paths` returns their journals.
@@ -217,6 +219,8 @@ class IssueRow:
     last_ts: datetime | None
     done: bool
     events: tuple[dict, ...]  # the drill-down, in global ts order
+    facts: Mapping[str, JsonValue] = field(default_factory=dict)
+    lane: str = "in_flight"
 
     @property
     def kinds(self) -> tuple[str, ...]:
@@ -316,13 +320,18 @@ def build_deployment_v2(
         for role, path, log, events in feed_rows
     )
     pr_issue = _v2_pr_issue(model)
+    current_issues = {
+        number
+        for (kind, number), facts in model.world_facts.items()
+        if kind == "issue" and facts.get("present") is True
+    }
     grouped: dict[int, list[EventEnvelope]] = {}
     unattributed_events: list[EventEnvelope] = []
     for event in model.events:
         issue = _v2_event_issue(event, pr_issue)
         if issue is None:
             unattributed_events.append(event)
-        else:
+        elif issue in current_issues:
             grouped.setdefault(issue, []).append(event)
 
     rows = tuple(
@@ -495,6 +504,7 @@ def _v2_issue_row(
     )
     done = str(facts.get("state") or "").casefold() == "closed" or "ai-done" in labels
     stage = _v2_stage(ordered, tuple(running), tuple(legs), labels, done)
+    lane = _v2_lane(facts, labels, done)
     prs = tuple(
         sorted(
             {
@@ -551,7 +561,30 @@ def _v2_issue_row(
         last_ts=ordered[-1].occurred_at if ordered else None,
         done=done,
         events=tuple(encode_event(event) for event in ordered),
+        facts=facts,
+        lane=lane,
     )
+
+
+def _v2_lane(
+    facts: Mapping[str, JsonValue],
+    labels: set[str],
+    done: bool,
+) -> str:
+    if done:
+        return "done"
+    if (
+        "ai-ready" in labels
+        and labels.isdisjoint({"ai-blocked", "needs-human-review"})
+    ):
+        return "pending"
+    lifecycle = {label.value for label in LIFECYCLE_LABELS}
+    if (
+        str(facts.get("state") or "").casefold() == "open"
+        and labels.isdisjoint(lifecycle)
+    ):
+        return "backlog"
+    return "in_flight"
 
 
 def _v2_stage(
@@ -904,7 +937,11 @@ def build_metrics(rows, unattributed, today_usd: float) -> Metrics:
     reviewed = [row for row in rows if row.rounds]
     return Metrics(
         done_issues=len(done),
-        in_flight_issues=sum(1 for row in rows if not row.done),
+        in_flight_issues=sum(
+            1
+            for row in rows
+            if not row.done and row.lane == "in_flight"
+        ),
         total_cost_usd=round(total, 4),
         cost_per_done_usd=round(total / len(done), 4) if done else 0.0,
         by_kind=tuple(

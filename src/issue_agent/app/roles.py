@@ -161,6 +161,23 @@ def _deployment_identity(cfg: HarnessConfig, role: str) -> str:
     return _deployment_identity_for_repository(cfg, role, cfg.repo)
 
 
+def process_supervision_state_dir(
+    cfg: HarnessConfig,
+    role: str,
+    state_dir: str | None = None,
+) -> str:
+    """Private process registry for one ``(repo, checkout, role)`` deployment."""
+
+    root = state_dir if state_dir is not None else _role_state_dir(cfg, role)
+    if not root:
+        raise ValueError("process supervisor state directory is required")
+    return os.path.join(
+        root,
+        "process-supervision",
+        _deployment_identity(cfg, role),
+    )
+
+
 def _owner_identity(cfg: HarnessConfig, role: str) -> str:
     return f"{cfg.repo}:{role}:{_deployment_identity(cfg, role)}"
 
@@ -407,8 +424,15 @@ def _recovery(
     from ..adapters.process_supervisor import ProcessSupervisor
 
     effective_state_dir = state_dir or os.path.dirname(control.path)
+    role = journal.events.producer.role
     coordinator = RecoveryCoordinator(
-        ProcessSupervisor(effective_state_dir),
+        ProcessSupervisor(
+            process_supervision_state_dir(
+                cfg,
+                role,
+                effective_state_dir,
+            )
+        ),
         control,
         worktrees or NoWorktreeRecovery(),
         effects,
@@ -426,10 +450,16 @@ def _recovery(
     return recover
 
 
-def _force_kill(state_dir: str) -> Callable[[], object]:
+def _force_kill(
+    cfg: HarnessConfig,
+    role: str,
+    state_dir: str,
+) -> Callable[[], object]:
     from ..adapters.process_supervisor import ProcessSupervisor
 
-    supervisor = ProcessSupervisor(state_dir)
+    supervisor = ProcessSupervisor(
+        process_supervision_state_dir(cfg, role, state_dir)
+    )
     return supervisor.force_kill_all
 
 
@@ -931,7 +961,13 @@ def _build_codex_runner(
         cost_per_mtok=runtime.cost_per_mtok,
         cost_per_mtok_cached_in=runtime.cost_per_mtok_cached_in,
         enforce_budget=runtime.enforce_budget,
-        process_supervisor=ProcessSupervisor(state_dir) if state_dir else None,
+        process_supervisor=(
+            ProcessSupervisor(
+                process_supervision_state_dir(cfg, leg_role, state_dir)
+            )
+            if state_dir
+            else None
+        ),
         spend_evidence_dir=spend_evidence_dir(state_dir),
         **({"default_model": default_model} if default_model else {}),
     )
@@ -1941,7 +1977,7 @@ def build_fix_daemon(
         dispatch_capacity=cfg.fix_dispatch_concurrency,
         dispatch_key=dispatch_key,
         cancel_active_dispatches=dispatch_runtime.cancel_all,
-        force_kill_dispatches=_force_kill(cfg.state_dir),
+        force_kill_dispatches=_force_kill(cfg, "fix", cfg.state_dir),
         dispatch_rejected=reservations.finish,
         heartbeat_path=os.path.join(cfg.state_dir, "heartbeat.json"),
         recover=recovery,
@@ -2179,6 +2215,8 @@ def build_review_daemon(
                   cancel_active_dispatches=dispatch_runtime.cancel_all,
                   dispatch_rejected=reservations.finish,
                   force_kill_dispatches=_force_kill(
+                      cfg,
+                      "review",
                       cfg.review_state_dir or store.state_dir
                   ),
                   heartbeat_path=os.path.join(
@@ -2463,6 +2501,8 @@ def build_steward_daemon(
                   cancel_active_dispatches=dispatch_runtime.cancel_all,
                   dispatch_rejected=reservations.finish,
                   force_kill_dispatches=_force_kill(
+                      cfg,
+                      "steward",
                       cfg.steward_state_dir or store.state_dir
                   ),
                   heartbeat_path=os.path.join(

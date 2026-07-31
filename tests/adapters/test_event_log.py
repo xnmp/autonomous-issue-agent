@@ -1,4 +1,5 @@
 import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import fields
 from datetime import datetime, timedelta, timezone
 
@@ -9,7 +10,6 @@ from issue_agent.domain.events import (
     Correlation,
     LevelChanged,
     Producer,
-    ProjectionSnapshot,
     TelemetryWarning,
     WorldFeedRetired,
     WorldObserved,
@@ -22,6 +22,14 @@ from issue_agent.domain.projection import fold
 
 def _producer() -> Producer:
     return Producer("test", "owner/repo", "fix", 100, "boot")
+
+
+def _retained_events(log: EventLog):
+    return tuple(
+        decode_event_line(line)
+        for event_path in log.paths()
+        for line in event_path.read_text().splitlines()
+    )
 
 
 def test_event_log_appends_complete_v2_lines(tmp_path) -> None:
@@ -93,8 +101,8 @@ def test_rotation_preserves_open_level_in_snapshot(tmp_path) -> None:
     log.emit(LevelChanged("issue:1:deferred", "waiting", "dependency"))
     log.emit(LevelChanged("issue:2:deferred", "waiting", "dependency"))
 
-    current = path.read_text().splitlines()
-    assert decode_event_line(current[0]).type == "projection.snapshot.v1"
+    assert "issue:1:deferred" in fold(_retained_events(log)).levels
+    assert "issue:2:deferred" in fold(_retained_events(log)).levels
     assert len(log.paths()) == 2
 
 
@@ -116,10 +124,9 @@ def test_rotation_retention_bounds_files_and_restart_snapshot(tmp_path) -> None:
     restarted.emit(
         LevelChanged("issue:8:deferred", "waiting", "dependency")
     )
-    snapshot = decode_event_line(path.read_text().splitlines()[0]).payload
-    assert isinstance(snapshot, ProjectionSnapshot)
-    assert "issue:1:deferred" in snapshot.open_levels
-    assert "issue:8:deferred" in snapshot.open_levels
+    levels = fold(_retained_events(restarted)).levels
+    assert "issue:1:deferred" in levels
+    assert "issue:8:deferred" in levels
 
 
 def test_restart_does_not_resurrect_a_cleared_level(tmp_path) -> None:
@@ -136,9 +143,9 @@ def test_restart_does_not_resurrect_a_cleared_level(tmp_path) -> None:
     restarted.emit(
         LevelChanged("issue:2:deferred", "waiting", "dependency")
     )
-    snapshot = decode_event_line(path.read_text().splitlines()[0]).payload
-    assert isinstance(snapshot, ProjectionSnapshot)
-    assert set(snapshot.open_levels) == {"issue:2:deferred"}
+    assert set(fold(_retained_events(restarted)).levels) == {
+        "issue:2:deferred"
+    }
 
 
 def test_rotation_retention_keeps_latest_world_observation(tmp_path) -> None:
@@ -164,6 +171,76 @@ def test_rotation_retention_keeps_latest_world_observation(tmp_path) -> None:
     assert payload.facts == {"state": "OPEN"}
     assert observed.event_id == original.event_id
     assert observed.occurred_at == original.occurred_at
+
+
+def test_rotation_reloads_canonical_observations_from_other_writers(
+    tmp_path,
+) -> None:
+    path = tmp_path / "events.jsonl"
+    writer_a = EventLog(
+        str(path),
+        Producer("checkout-a", "owner/repo", "fix", 100, "boot-a"),
+        max_bytes=1,
+        max_rotated_files=1,
+    )
+    writer_b = EventLog(
+        str(path),
+        Producer("checkout-b", "owner/repo", "fix", 101, "boot-b"),
+        max_bytes=1,
+        max_rotated_files=1,
+    )
+    writer_a.emit(
+        WorldObserved(
+            "issue",
+            7,
+            "world-hash",
+            {"present": True, "state": "open"},
+        ),
+        correlation=Correlation(issue=7),
+    )
+
+    writer_b.emit(TelemetryWarning("rotation", "first"))
+    writer_b.emit(TelemetryWarning("rotation", "second"))
+
+    assert fold(_retained_events(writer_b)).world_facts[("issue", 7)] == {
+        "present": True,
+        "state": "open",
+    }
+
+
+def test_simultaneous_rotations_are_serialized_by_stable_path_lock(
+    tmp_path,
+) -> None:
+    path = tmp_path / "events.jsonl"
+    writers = (
+        EventLog(
+            str(path),
+            Producer("checkout-a", "owner/repo", "fix", 100, "boot-a"),
+            max_bytes=1,
+            max_rotated_files=4,
+        ),
+        EventLog(
+            str(path),
+            Producer("checkout-b", "owner/repo", "fix", 101, "boot-b"),
+            max_bytes=1,
+            max_rotated_files=4,
+        ),
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        emitted = tuple(
+            pool.map(
+                lambda item: item[0].emit(
+                    TelemetryWarning("rotation", item[1])
+                ),
+                ((writers[0], "a"), (writers[1], "b")),
+            )
+        )
+
+    retained_ids = {
+        event.event_id for event in _retained_events(writers[0])
+    }
+    assert {event.event_id for event in emitted} <= retained_ids
 
 
 def test_world_fold_merges_fields_and_applies_tombstones_per_feed(

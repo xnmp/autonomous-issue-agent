@@ -147,6 +147,12 @@ claims remain repository/role-global, so two intentionally allowed checkouts
 cannot both admit the same target or overlapping path set. A daemon queries
 only its exact ownership scope, so sibling deployments and roles cannot cancel,
 recover, or receipt each other's work.
+Process-group, process-tree, and launch-intent receipts use the same stable
+checkout deployment identity beneath each role state root. Boot and shutdown
+therefore reap only that deployment's children even when sibling checkouts
+intentionally share the repo-level default state root. Upgrade recovery inspects
+the former unscoped registry conservatively: a live recorded launcher or live
+external parent remains authoritative and is never signalled.
 At the deployment-identity cutover, the first role deployment atomically adopts
 the former `<repository>:<role>` run, lease, and nonterminal command scope.
 Reconcile-before-write then prevents a changed owner identity from duplicating
@@ -162,9 +168,13 @@ process liveness.
 If process discovery is unavailable, dashboard liveness is `unknown`; recent
 activity is never promoted into proof that a role is alive or dead.
 Event streams retain eight rotated files plus the current file. Rotation writes
-an open-level snapshot and re-emits the latest observation for every world
-subject, so bounded retention and restart do not resurrect a cleared level,
-discard an active one, or make an unchanged issue disappear.
+the active level envelopes, permanent feed-retirement fences, and the latest
+observation for every `(feed, world subject)` into the new current file, so
+bounded retention and restart do not resurrect a cleared level, discard an
+active one, or make an unchanged issue disappear. A stable per-path
+interprocess lock covers append, replacement, authoritative on-disk reseeding,
+and pruning; multiple daemon/publisher writers cannot rotate stale in-memory
+state over one another.
 
 Every paid run is bounded by layered breakers, because the failure mode
 that matters is not "wrong answer" but "loop that bills forever":

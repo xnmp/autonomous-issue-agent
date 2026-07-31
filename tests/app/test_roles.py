@@ -31,7 +31,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import threading
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -40,6 +42,7 @@ import pytest
 
 from tests.fakes.legacy_journal import Journal
 from issue_agent.adapters.journal import JournalingRuntime, read_events
+from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.control_store import (
     AccountingDisposition,
     ReservationRequest,
@@ -48,6 +51,7 @@ from issue_agent.adapters.control_store import (
 )
 from issue_agent.adapters.store import Store
 from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
+from issue_agent.app.config import from_env
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.planners.tasks import (
     FixTaskConfig,
@@ -71,6 +75,7 @@ from issue_agent.app.roles import (
     _shutdown_finalize,
     _shutdown_prepare,
     _shutdown_terminalize,
+    process_supervision_state_dir,
 )
 from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.actions import (
@@ -116,6 +121,53 @@ def test_runtime_wiring_registries_cover_every_supported_runtime():
         RuntimeName.CLAUDE,
         RuntimeName.CODEX,
     }
+
+
+def test_process_supervision_isolated_between_checkouts_sharing_state(
+    tmp_path,
+) -> None:
+    shared = tmp_path / "shared-state"
+    checkout_a = tmp_path / "checkout-a"
+    checkout_b = tmp_path / "checkout-b"
+    checkout_a.mkdir()
+    checkout_b.mkdir()
+    common = {
+        "REPO": "owner/repo",
+        "STATE_DIR": str(shared),
+    }
+    cfg_a = from_env({**common, "TARGET_DIR": str(checkout_a)})
+    cfg_b = from_env({**common, "TARGET_DIR": str(checkout_b)})
+    supervisor_a = ProcessSupervisor(
+        process_supervision_state_dir(cfg_a, "fix"),
+        grace_seconds=0.05,
+    )
+    supervisor_b = ProcessSupervisor(
+        process_supervision_state_dir(cfg_b, "fix"),
+        grace_seconds=0.05,
+    )
+    assert supervisor_a.state_dir != supervisor_b.state_dir
+
+    process = subprocess.Popen(
+        ["sleep", "30"],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+    )
+    try:
+        run_id = RunId("checkout-a-paid-run")
+        supervisor_a.register(run_id, os.getpgid(process.pid))
+
+        assert supervisor_b.recover_orphans() == ()
+        assert process.poll() is None
+        assert supervisor_a.recover_orphans() == (run_id,)
+
+        deadline = time.monotonic() + 3
+        while process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert process.poll() is not None
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
 
 
 def test_hard_shutdown_reconciles_killed_rollout_before_releasing_capacity(
