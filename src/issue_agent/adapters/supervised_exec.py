@@ -50,14 +50,20 @@ def _register(
     )
     control_db = environment.get("ISSUE_AGENT_CONTROL_DB", "")
     accounting_run_id = environment.get("ISSUE_AGENT_RUN_ID", "")
-    if not control_db and not accounting_run_id:
+    accounting_owner_id = environment.get("ISSUE_AGENT_OWNER_ID", "")
+    if not control_db and not accounting_run_id and not accounting_owner_id:
         return
-    if not control_db or accounting_run_id != str(run_id):
+    if (
+        not control_db
+        or accounting_run_id != str(run_id)
+        or not accounting_owner_id
+    ):
         raise RuntimeError(
             "supervised process identity does not match its accounting run"
         )
     SQLiteControlStore(control_db).register_process_lease(
         run_id,
+        expected_owner_id=accounting_owner_id,
         pid=registration.leader.pid,
         pgid=registration.pgid,
         process_start_ticks=registration.leader.start_ticks,

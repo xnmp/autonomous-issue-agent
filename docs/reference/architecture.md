@@ -120,7 +120,7 @@ failure decisions; and exercised ordinary, exhausted, duplicate, and
 conflicting-receipt admissions on the pre-existing live primary database.
 Fresh databases use the v9 adoption baseline. The exact digest emitted by the
 previously shipped v8 initializer remains an accepted immutable predecessor,
-so deployed v8 databases upgrade through v9/v10/v11/v12/v13/v14/v15/v16
+so deployed v8 databases upgrade through v9/v10/v11/v12/v13/v14/v15/v16/v17
 without rewritten history. V13 canonicalizes GitHub's case-insensitive `owner/name`
 repository identity across commands, reservations, limits, and dispatch claims;
 startup also adopts both historical mixed-case owner formats so in-flight
@@ -140,6 +140,16 @@ reconcile-only. Recovery can release only spawn-pending work while atomically
 rechecking that no lease registered and the run never started; any reservation
 that may have reached a paid provider remains unavailable until positive
 settlement evidence or explicit operator resolution.
+V17 separates workload repository attribution from the budget scope that
+admitted a run, so global-only reservations still charge the correct
+repository. It also restores pre-v16 reserved/no-lease rows to spawn-pending
+when the old lease-before-exec contract proves they never launched. Paid child
+registration carries the launcher's immutable expected owner and checks it in
+the lease transaction, while a normal completion that races dead-lease spend
+recovery converges with an equal recovered charge and corrects the false
+abandonment. Read-only spend projections validate the current migration
+history, SQLite quick check, foreign keys, and semantic invariants before
+showing authoritative current-day values.
 Every migration is digest-validated and individually transactional; restart
 and concurrent-role tests interrupt both sides of every migration commit
 boundary and serialize fresh/v8/v9 boot. Machine-readable

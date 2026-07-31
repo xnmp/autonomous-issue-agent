@@ -475,12 +475,14 @@ def test_shutdown_deadline_preserves_indeterminate_spend_for_boot_recovery(
         ),
         Money("USD", 2_000_000),
         "config-v1",
+        "o/r",
         kind="RESOLVE",
         owner_id="o/r:fix",
     )
     assert control.reserve(request).admitted
     control.register_process_lease(
         run_id,
+        expected_owner_id=request.owner_id,
         pid=123,
         pgid=123,
         process_start_ticks=99,

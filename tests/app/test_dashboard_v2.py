@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -192,6 +193,7 @@ def test_production_dashboard_today_spend_comes_from_sqlite_not_telemetry(
             ),
             Money("USD", 10_000_000),
             "cfg",
+            "owner/repo",
         )
     )
     store.settle(
@@ -254,7 +256,10 @@ def test_production_dashboard_today_spend_comes_from_sqlite_not_telemetry(
     )
 
 
-@pytest.mark.parametrize("control_state", ["missing", "invalid"])
+@pytest.mark.parametrize(
+    "control_state",
+    ["missing", "invalid", "semantic"],
+)
 def test_unavailable_sqlite_spend_preserves_dashboard_history(
     tmp_path,
     control_state,
@@ -262,6 +267,47 @@ def test_unavailable_sqlite_spend_preserves_dashboard_history(
     control_db = tmp_path / "control.db"
     if control_state == "invalid":
         control_db.write_text("not a SQLite database")
+    elif control_state == "semantic":
+        start = NOW.replace(hour=0, minute=0, second=0, microsecond=0)
+        store = SQLiteControlStore(str(control_db), now=lambda: NOW)
+        store.initialize()
+        request = ReservationRequest(
+            ReservationId("corrupt-reservation"),
+            RunId("corrupt-run"),
+            "dispatch",
+            BudgetScope(
+                "owner/repo",
+                "daily",
+                "USD",
+                start.date().isoformat(),
+                start,
+                start + timedelta(days=1),
+                ZoneInfo("UTC"),
+            ),
+            PriceQuote(
+                "gpt-test", "card", "v1", NOW, Money("USD", 1_000_000)
+            ),
+            Money("USD", 10_000_000),
+            "cfg",
+            "owner/repo",
+        )
+        assert store.reserve(request).admitted
+        assert store.settle(
+            SettlementRequest(
+                request.run_id,
+                Money("USD", 700_000),
+                PricingBasis.CONFIGURED_RATE_CARD,
+                "provider-receipt",
+                None,
+                "card",
+                "v1",
+            )
+        ).disposition.value == "available"
+        with sqlite3.connect(control_db) as db:
+            db.execute(
+                "DELETE FROM reservation_limits WHERE run_id=?",
+                (str(request.run_id),),
+            )
     state = tmp_path / "fix"
     state.mkdir()
     events = EventLog(

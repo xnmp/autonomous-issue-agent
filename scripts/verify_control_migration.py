@@ -186,6 +186,7 @@ def verify(
             ),
             Money("USD", 9_000_000_000_000_000_000),
             "migration-canary-v1",
+            canary_repository,
             kind="migration-canary",
             owner_id=f"{canary_repository}:migration",
         )
@@ -222,6 +223,7 @@ def verify(
             ),
             Money("USD", 9_000_000_000_000_000_000),
             "migration-canary-v1",
+            canary_repository,
             kind="migration-canary",
             owner_id=f"{canary_repository}:migration",
         )
@@ -264,6 +266,7 @@ def verify(
             ),
             Money("USD", 1),
             "migration-canary-v1",
+            canary_repository,
             kind="migration-canary",
             owner_id=f"{canary_repository}:migration",
         )

@@ -53,6 +53,7 @@ def _reserve_paid_run(
         PriceQuote("model", "test", "1", now, Money("USD", 1)),
         Money("USD", 10),
         "cfg",
+        "o/r",
         kind="RESOLVE",
         owner_id="o/r:fix",
     )
@@ -403,6 +404,7 @@ def test_supervised_paid_command_registers_the_sqlite_run_lease(tmp_path) -> Non
             **supervisor.launch_guard_env(),
             "ISSUE_AGENT_CONTROL_DB": store.path,
             "ISSUE_AGENT_RUN_ID": str(run_id),
+            "ISSUE_AGENT_OWNER_ID": request.owner_id,
         },
     )
     deadline = time.monotonic() + 3
@@ -431,7 +433,7 @@ def test_supervised_paid_command_refuses_exec_after_launcher_death(
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
     run_id = RunId("orphaned-launch")
-    _reserve_paid_run(store, run_id)
+    request = _reserve_paid_run(store, run_id)
     marker = tmp_path / "paid-command-started"
     command = supervisor.supervised_command(
         run_id,
@@ -449,6 +451,7 @@ def test_supervised_paid_command_refuses_exec_after_launcher_death(
             **os.environ,
             "ISSUE_AGENT_CONTROL_DB": store.path,
             "ISSUE_AGENT_RUN_ID": str(run_id),
+            "ISSUE_AGENT_OWNER_ID": request.owner_id,
             "ISSUE_AGENT_SUPERVISOR_PARENT_PID": "99999999",
             "ISSUE_AGENT_SUPERVISOR_PARENT_START_TICKS": "1",
         },

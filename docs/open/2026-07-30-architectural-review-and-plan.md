@@ -44,16 +44,20 @@ retired-owner rows fence any missed or rebooted prior process from reacquiring
 control-store authority.
 
 The 2026-07-31 remediation pass then closed the independent post-implementation
-findings: reservation recovery now distinguishes provably unlaunched work from
-execution-possible spend (schema v16), tombstoned and unattributed schema-v2
-facts remain in historical metrics, current-day spend comes from settled
-SQLite charges (an absent or unreadable authority is explicitly unknown and
-does not hide journal history), legacy history is read-only fallback only,
-readiness follows fallible initialization, the type gate checks behavioral
-protocol contracts, and scheduler progress drives systemd watchdog heartbeats.
+findings: reservation recovery distinguishes provably unlaunched work from
+execution-possible spend; normal settlement converges with equal recovered
+evidence instead of falsely failing a successful run; delayed pre-spawn
+children retain and revalidate their original owner fence; and schema v17
+separates workload repository attribution from global/repository cap scope.
+Tombstoned and unattributed schema-v2 facts remain in historical metrics, and
+current-day spend comes from semantically validated settled SQLite charges (an
+absent, unreadable, or corrupt authority is explicitly unknown and does not
+hide journal history). Legacy history is read-only fallback only, readiness
+follows fallible initialization, the type gate checks behavioral protocol
+contracts, and scheduler progress drives systemd watchdog heartbeats.
 Verification reran the full self-test gate, exercised a real `Type=notify`
 transient service under `WatchdogSec=4`, bounded-booted all three roles from
-this checkout, and checked the migrated schema-v16 store for zero nonterminal
+this checkout, and checked the migrated schema-v17 store for zero nonterminal
 runs, active reservations, leases, actionable commands, and pending outbox
 records.
 

@@ -59,6 +59,7 @@ def _request(
         ),
         Money("USD", cap_micros),
         "benchmark",
+        scope.repository,
     )
 
 

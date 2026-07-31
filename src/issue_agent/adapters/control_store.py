@@ -57,7 +57,7 @@ from ..domain.events import (
 )
 from ..domain.repository import canonical_repository
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 SCHEMA_BASELINE_VERSION = 9
 LEGACY_V8_SCHEMA_DIGEST = (
     "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
@@ -162,14 +162,26 @@ def read_settled_spend(
     try:
         db.execute(f"PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}")
         db.execute("PRAGMA query_only=ON")
+        quick_check = db.execute("PRAGMA quick_check").fetchone()[0]
+        if quick_check != "ok":
+            raise CorruptControlStore(
+                f"control-store integrity check failed: {quick_check}"
+            )
+        checker = SQLiteControlStore(path)
+        checker._validate_migration_history(
+            checker._migration_history(db),
+            require_current=True,
+        )
+        checker._assert_semantic_integrity(db)
         rows = db.execute(
-            "SELECT r.repository, COALESCE(SUM(c.amount_micros), 0) AS amount "
+            "SELECT r.workload_repository, "
+            "COALESCE(SUM(c.amount_micros), 0) AS amount "
             "FROM charges c JOIN budget_reservations r ON r.run_id=c.run_id "
             "WHERE c.currency=? AND c.settled_at>=? AND c.settled_at<? "
-            "GROUP BY r.repository",
+            "GROUP BY r.workload_repository",
             (currency, start, end),
         ).fetchall()
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, ControlStoreError) as exc:
         return SettledSpend(
             AccountingDisposition.UNAVAILABLE,
             None,
@@ -179,7 +191,9 @@ def read_settled_spend(
     finally:
         db.close()
     by_repository = {
-        str(row["repository"]): Money(currency, int(row["amount"]))
+        str(row["workload_repository"]): Money(
+            currency, int(row["amount"])
+        )
         for row in rows
     }
     return SettledSpend(
@@ -198,20 +212,33 @@ class ReservationRequest:
     quote: PriceQuote
     cap: Money
     config_version: str
+    workload_repository: str
     additional_limits: tuple["BudgetLimit", ...] = ()
     kind: str = "paid"
     owner_id: str = "reservation"
 
     def __post_init__(self) -> None:
+        workload_repository = canonical_repository(
+            self.workload_repository
+        )
+        object.__setattr__(
+            self, "workload_repository", workload_repository
+        )
         if self.scope.currency != self.quote.maximum_charge.currency:
             raise ValueError("reservation scope and quote currency differ")
         if self.cap.currency != self.scope.currency:
             raise ValueError("reservation cap and scope currency differ")
         if not str(self.reservation_id) or not str(self.run_id):
             raise ValueError("reservation and run identities are required")
-        if not self.config_version or not self.kind or not self.owner_id:
+        if (
+            not self.config_version
+            or not self.kind
+            or not self.owner_id
+            or not workload_repository
+        ):
             raise ValueError(
-                "configuration version, run kind, and owner identity are required"
+                "configuration version, run kind, owner identity, and workload "
+                "repository are required"
             )
         for limit in self.additional_limits:
             if limit.scope.currency != self.scope.currency:
@@ -640,6 +667,73 @@ FROM budget_reservations
 WHERE state='active';
 """
 
+_MIGRATION_V17 = """
+ALTER TABLE budget_reservations
+ADD COLUMN workload_repository TEXT NOT NULL DEFAULT '*'
+    CHECK (workload_repository <> '');
+
+UPDATE budget_reservations
+SET workload_repository = CASE
+    WHEN repository <> '*' THEN repository
+    WHEN json_valid((
+        SELECT dispatch_id FROM runs
+        WHERE runs.run_id=budget_reservations.run_id
+    )) THEN CASE
+        WHEN json_type((
+            SELECT dispatch_id FROM runs
+            WHERE runs.run_id=budget_reservations.run_id
+        ), '$.repository')='text'
+        AND TRIM(json_extract((
+            SELECT dispatch_id FROM runs
+            WHERE runs.run_id=budget_reservations.run_id
+        ), '$.repository')) NOT IN ('', '*')
+        THEN LOWER(TRIM(json_extract((
+            SELECT dispatch_id FROM runs
+            WHERE runs.run_id=budget_reservations.run_id
+        ), '$.repository')))
+        ELSE '*'
+    END
+    ELSE '*'
+END;
+
+UPDATE budget_reservations
+SET workload_repository = (
+    SELECT MIN(repository)
+    FROM reservation_limits
+    WHERE reservation_limits.run_id=budget_reservations.run_id
+      AND reservation_limits.repository<>'*'
+)
+WHERE workload_repository='*'
+  AND EXISTS (
+      SELECT 1
+      FROM reservation_limits
+      WHERE reservation_limits.run_id=budget_reservations.run_id
+        AND reservation_limits.repository<>'*'
+  );
+
+UPDATE reservation_recovery
+SET policy='spawn_pending',
+    reason='pre-v16 reservation durably proven unlaunched',
+    updated_at=(
+        SELECT updated_at FROM budget_reservations
+        WHERE budget_reservations.run_id=reservation_recovery.run_id
+    )
+WHERE policy='reconcile_only'
+  AND reason='reservation predates durable recovery classification'
+  AND EXISTS (
+      SELECT 1
+      FROM budget_reservations AS reservation
+      JOIN runs AS run ON run.run_id=reservation.run_id
+      WHERE reservation.run_id=reservation_recovery.run_id
+        AND reservation.state='active'
+        AND run.state IN ('reserved', 'starting')
+        AND NOT EXISTS (
+            SELECT 1 FROM leases
+            WHERE leases.run_id=reservation.run_id
+        )
+  );
+"""
+
 _SCHEMA_MIGRATIONS = (
     # Version 9 is the immutable adoption baseline shipped by the architectural
     # hardening cutover. Its exact source digest already exists in deployed
@@ -652,6 +746,7 @@ _SCHEMA_MIGRATIONS = (
     SchemaMigration(14, _MIGRATION_V14),
     SchemaMigration(15, _MIGRATION_V15),
     SchemaMigration(16, _MIGRATION_V16),
+    SchemaMigration(17, _MIGRATION_V17),
 )
 
 if tuple(migration.version for migration in _SCHEMA_MIGRATIONS) != tuple(
@@ -1081,6 +1176,16 @@ class SQLiteControlStore:
 
         violations = (
             (
+                "active reservation recovery classification is absent",
+                """
+                SELECT r.run_id
+                FROM budget_reservations AS r
+                LEFT JOIN reservation_recovery AS rr ON rr.run_id=r.run_id
+                WHERE r.state='active' AND rr.run_id IS NULL
+                LIMIT 1
+                """,
+            ),
+            (
                 "reservation primary limit is absent or inconsistent",
                 """
                 SELECT r.run_id
@@ -1107,6 +1212,17 @@ class SQLiteControlStore:
                 FROM budget_reservations AS r
                 JOIN reservation_limits AS l ON l.run_id=r.run_id
                 WHERE l.currency<>r.currency
+                LIMIT 1
+                """,
+            ),
+            (
+                "workload repository conflicts with reservation limits",
+                """
+                SELECT r.run_id
+                FROM budget_reservations AS r
+                JOIN reservation_limits AS l ON l.run_id=r.run_id
+                WHERE l.repository<>'*'
+                  AND l.repository<>r.workload_repository
                 LIMIT 1
                 """,
             ),
@@ -1541,15 +1657,22 @@ class SQLiteControlStore:
         self,
         run_id: RunId,
         *,
+        expected_owner_id: str,
         pid: int,
         pgid: int,
         process_start_ticks: int,
     ) -> Lease:
         """Bind a spawned process to its reserved run before paid work executes."""
 
-        if pid <= 0 or pgid <= 0 or process_start_ticks <= 0:
+        if (
+            not expected_owner_id
+            or pid <= 0
+            or pgid <= 0
+            or process_start_ticks <= 0
+        ):
             raise ValueError("live process identity is required")
         with self.transaction() as db:
+            self._assert_owner_active(db, expected_owner_id)
             run = db.execute(
                 "SELECT dispatch_id, owner_id, state FROM runs WHERE run_id=?",
                 (str(run_id),),
@@ -1557,6 +1680,11 @@ class SQLiteControlStore:
             if run is None:
                 raise ControlStoreError(
                     f"process lease has no reserved run: {run_id}"
+                )
+            if run["owner_id"] != expected_owner_id:
+                raise RetiredOwnerError(
+                    f"reserved run owner changed from {expected_owner_id!r} "
+                    f"to {run['owner_id']!r} before process registration"
                 )
             if run["state"] in {"completed", "cancelled", "abandoned"}:
                 raise ControlStoreError(
@@ -2766,17 +2894,19 @@ class SQLiteControlStore:
                 )
                 db.execute(
                     "INSERT INTO budget_reservations("
-                    "reservation_id, run_id, repository, dimension, period_id, "
-                    "period_start, period_end, period_timezone, currency, "
+                    "reservation_id, run_id, repository, workload_repository, "
+                    "dimension, period_id, period_start, period_end, "
+                    "period_timezone, currency, "
                     "maximum_micros, cap_micros, model, rate_card_id, "
                     "rate_card_version, quote_effective_at, config_version, "
                     "state, created_at, updated_at"
                     ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                    "'active', ?, ?)",
+                    "?, 'active', ?, ?)",
                     (
                         str(request.reservation_id),
                         str(request.run_id),
                         request.scope.repository,
+                        request.workload_repository,
                         request.scope.dimension,
                         request.scope.period_id,
                         _stamp(request.scope.period_start),
@@ -2934,6 +3064,7 @@ class SQLiteControlStore:
             for name in (
                 "reservation_id",
                 "repository",
+                "workload_repository",
                 "dimension",
                 "period_id",
                 "period_start",
@@ -2953,6 +3084,7 @@ class SQLiteControlStore:
         expected_reservation = (
             str(request.reservation_id),
             request.scope.repository,
+            request.workload_repository,
             request.scope.dimension,
             request.scope.period_id,
             _stamp(request.scope.period_start),
@@ -3083,6 +3215,68 @@ class SQLiteControlStore:
                     and existing["rate_card_id"] == request.rate_card_id
                     and existing["rate_card_version"] == request.rate_card_version
                 )
+                recovered_confirmation = (
+                    existing["run_id"] == str(request.run_id)
+                    and existing["basis"] == PricingBasis.RECONCILED.value
+                    and request.basis is not PricingBasis.RECONCILED
+                    and existing["amount_micros"] == request.amount.micros
+                    and existing["currency"] == request.amount.currency
+                )
+                if recovered_confirmation:
+                    # A dead-child sweep may settle the same final Codex
+                    # evidence while the live caller is normalizing its
+                    # already-returned result. Equal monetary authority must
+                    # converge without duplicating or rewriting the charge.
+                    run = db.execute(
+                        "SELECT state, outcome FROM runs WHERE run_id=?",
+                        (str(request.run_id),),
+                    ).fetchone()
+                    corrected = (
+                        run is not None
+                        and run["state"] == "abandoned"
+                        and run["outcome"] == "dead_lease"
+                    )
+                    already_corrected = (
+                        run is not None
+                        and run["state"] == "completed"
+                        and run["outcome"] == "settled"
+                    )
+                    if corrected:
+                        db.execute(
+                            "UPDATE runs SET state='completed', "
+                            "outcome='settled', completed_at=? "
+                            "WHERE run_id=?",
+                            (_stamp(self._now()), str(request.run_id)),
+                        )
+                        db.execute(
+                            "UPDATE reservation_recovery SET "
+                            "reason='normal completion confirmed recovered "
+                            "settlement', updated_at=? WHERE run_id=?",
+                            (_stamp(self._now()), str(request.run_id)),
+                        )
+                        self._transition(
+                            db,
+                            "run",
+                            str(request.run_id),
+                            "completed",
+                            {
+                                "outcome": "settled",
+                                "settlement": "recovery_confirmed",
+                            },
+                            correlation=_run_correlation(
+                                request.run_id,
+                                reservation["dispatch_id"],
+                            ),
+                        )
+                    if corrected or already_corrected:
+                        return SettlementResult(
+                            AccountingDisposition.AVAILABLE,
+                            request.amount,
+                            idempotent=True,
+                            detail=(
+                                "normal completion matched recovered settlement"
+                            ),
+                        )
                 return SettlementResult(
                     (
                         AccountingDisposition.AVAILABLE
@@ -3143,6 +3337,27 @@ class SQLiteControlStore:
                     str(request.run_id),
                 ),
             )
+            corrected_dead_lease = False
+            if request.basis is not PricingBasis.RECONCILED:
+                # The normal caller can win after lease reclamation but before
+                # the recovery reconciler. Its successful settlement proves
+                # the accounting owner survived the child, so dead_lease is a
+                # stale recovery observation rather than a terminal outcome.
+                corrected_dead_lease = bool(
+                    db.execute(
+                        "UPDATE runs SET state='completed', outcome='settled', "
+                        "completed_at=? WHERE run_id=? AND state='abandoned' "
+                        "AND outcome='dead_lease'",
+                        (_stamp(self._now()), str(request.run_id)),
+                    ).rowcount
+                )
+                if corrected_dead_lease:
+                    db.execute(
+                        "UPDATE reservation_recovery SET "
+                        "reason='normal settlement won recovery race', "
+                        "updated_at=? WHERE run_id=?",
+                        (_stamp(self._now()), str(request.run_id)),
+                    )
             db.execute("DELETE FROM leases WHERE run_id=?", (str(request.run_id),))
             self._event(
                 db,
@@ -3181,6 +3396,18 @@ class SQLiteControlStore:
                 },
                 correlation=correlation,
             )
+            if corrected_dead_lease:
+                self._transition(
+                    db,
+                    "run",
+                    str(request.run_id),
+                    "completed",
+                    {
+                        "outcome": "settled",
+                        "settlement": "normal_after_reclaim",
+                    },
+                    correlation=correlation,
+                )
             return SettlementResult(
                 AccountingDisposition.AVAILABLE,
                 request.amount,
@@ -3926,16 +4153,18 @@ class SQLiteControlStore:
                 total += micros
                 db.execute(
                     "INSERT INTO budget_reservations("
-                    "reservation_id, run_id, repository, dimension, period_id, "
-                    "period_start, period_end, period_timezone, currency, "
-                    "maximum_micros, cap_micros, model, rate_card_id, "
-                    "rate_card_version, quote_effective_at, config_version, "
-                    "state, created_at, updated_at) VALUES (?, ?, ?, "
-                    "'repository', ?, ?, ?, 'UTC', 'USD', ?, ?, ?, 'legacy', "
-                    "'1', ?, 'legacy-v1', 'settled', ?, ?)",
+                    "reservation_id, run_id, repository, workload_repository, "
+                    "dimension, period_id, period_start, period_end, "
+                    "period_timezone, currency, maximum_micros, cap_micros, "
+                    "model, rate_card_id, rate_card_version, "
+                    "quote_effective_at, config_version, state, created_at, "
+                    "updated_at) VALUES (?, ?, ?, ?, 'repository', ?, ?, ?, "
+                    "'UTC', 'USD', ?, ?, ?, 'legacy', '1', ?, 'legacy-v1', "
+                    "'settled', ?, ?)",
                     (
                         f"legacy:{run_id}",
                         run_id,
+                        repository,
                         repository,
                         period_id,
                         _stamp(period_start),

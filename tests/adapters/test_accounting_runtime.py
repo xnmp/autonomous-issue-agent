@@ -130,6 +130,48 @@ def test_paid_run_has_reservation_before_runtime_and_settles(tmp_path) -> None:
     assert runtime.calls == 1
 
 
+def test_global_only_cap_keeps_workload_repository(tmp_path) -> None:
+    runtime = Runtime(
+        AgentResult(
+            False,
+            status="ok",
+            cost_usd=1,
+            session_id="global-receipt",
+            usage={"input_tokens": 100, "output_tokens": 10},
+        )
+    )
+    store = SQLiteControlStore(str(tmp_path / "control.db"))
+    store.initialize()
+    wrapper = AccountingRuntime(
+        runtime,
+        store,
+        "o/r",
+        "fix",
+        None,
+        Money("USD", 5_000_000),
+        None,
+        "cfg",
+        "codex",
+        _policy(),
+        _rates(),
+    )
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
+
+    result = asyncio.run(
+        wrapper.run(
+            RuntimePlan("work", model="gpt-test", max_budget_usd=2)
+        )
+    )
+
+    assert result.status == "ok"
+    with store._connect() as db:
+        attribution = db.execute(
+            "SELECT repository, workload_repository "
+            "FROM budget_reservations"
+        ).fetchone()
+    assert tuple(attribution) == ("*", "o/r")
+
+
 def test_production_runtime_binds_paid_run_to_dispatch_claim(tmp_path) -> None:
     runtime = Runtime(
         AgentResult(
@@ -239,6 +281,7 @@ def test_paid_run_carries_portable_ancestor_authority_bundle(
     assert authority["ISSUE_AGENT_REPOSITORY"] == "o/r"
     assert authority["ISSUE_AGENT_CONTROL_DB"].endswith("control.db")
     assert authority["ISSUE_AGENT_RUN_ID"]
+    assert authority["ISSUE_AGENT_OWNER_ID"]
     assert authority["ISSUE_AGENT_PUBLICATION_CWD"] == str(tmp_path)
     assert authority["ISSUE_AGENT_PUBLICATION_BRANCH"] == "fix/1-test"
     assert authority["ISSUE_AGENT_PUBLICATION_ISSUE"] == "1"

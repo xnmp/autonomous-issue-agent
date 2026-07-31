@@ -254,6 +254,7 @@ def test_dead_lease_with_recovered_spend_keeps_one_abandoned_terminal_outcome(
         PriceQuote("gpt", "card", "v1", now, Money("USD", 10)),
         Money("USD", 100),
         "config",
+        "o/r",
         owner_id="o/r:fix",
     )
     store.reserve(
@@ -329,6 +330,7 @@ def test_suspend_recovery_preserves_live_owned_lease_and_settlement(
         PriceQuote("gpt", "card", "v1", now, Money("USD", 10)),
         Money("USD", 100),
         "config",
+        "o/r",
         owner_id="o/r:fix",
     )
     store.reserve(
@@ -413,6 +415,7 @@ def test_periodic_sweep_retains_usage_blind_reservation_after_grace(
             ),
             Money("USD", 100),
             "config",
+            "o/r",
             owner_id="o/r:fix",
         )
     )
@@ -482,6 +485,7 @@ def test_periodic_sweep_releases_only_stale_unlaunched_reservation(
             ),
             Money("USD", 100),
             "config",
+            "o/r",
             owner_id="o/r:fix",
         )
     )
@@ -535,6 +539,7 @@ def test_spawn_registration_wins_race_with_periodic_release(tmp_path):
             ),
             Money("USD", 100),
             "config",
+            "o/r",
             owner_id="o/r:fix",
         )
     )

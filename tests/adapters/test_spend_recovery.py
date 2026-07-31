@@ -40,6 +40,7 @@ def _reserved_store(tmp_path):
         PriceQuote("gpt", "card", "v1", NOW, Money("USD", 1_000_000)),
         Money("USD", 2_000_000),
         "cfg",
+        "o/r",
     )
     assert store.reserve(request).admitted
     return store, scope, run_id

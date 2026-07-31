@@ -290,6 +290,7 @@ def test_explicit_repoint_adopts_and_releases_old_accounting_owner(
         PriceQuote("model", "test", "1", now, Money("USD", 60)),
         Money("USD", 100),
         "cfg",
+        "o/r",
         kind="RESOLVE",
         owner_id=old_owner,
     )
@@ -364,12 +365,14 @@ def test_hard_shutdown_reconciles_killed_rollout_before_releasing_capacity(
             ),
             Money("USD", 2_000),
             "config-v1",
+            "o/r",
             kind="RESOLVE",
             owner_id="o/r:fix",
         )
     ).admitted
     control.register_process_lease(
         run_id,
+        expected_owner_id="o/r:fix",
         pid=123,
         pgid=123,
         process_start_ticks=99,
