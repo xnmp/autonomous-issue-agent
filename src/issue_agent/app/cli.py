@@ -19,6 +19,7 @@ resolve_name, synth_repo_env) are unit-tested with no git/network.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -31,6 +32,7 @@ from dataclasses import dataclass
 from ..adapters.env_file import source_env_file
 from ..adapters.operator_effects import build_operator_effects
 from ..domain.repository import canonical_repository, repository_equal
+from .config import REPOINT_HISTORY_ENV, parse_repoint_history
 
 # HARNESS_ROOT: …/src/issue_agent/app/cli.py → repo root. Same walk main.py uses.
 # This is what makes the CLI checkout-resident: plugin/ + config/ are siblings.
@@ -103,6 +105,7 @@ def parse_remote_url(url: str) -> str:
 _OVERLAY_FIELDS = (
     "REPO", "TARGET_DIR", "STATE_DIR", "REVIEW_STATE_DIR", "STEWARD_STATE_DIR",
     "TEST_CMD", "DAILY_SPEND_CAP_USD", "FIXER_RUNTIME", "REVIEWER_RUNTIME", "REVIEW_MODE",
+    REPOINT_HISTORY_ENV,
 )
 
 def _source_env_file(path: str) -> dict[str, str]:
@@ -312,6 +315,63 @@ def _q(value: str) -> str:
     return "'" + value.replace("'", "'\\''") + "'"
 
 
+def _encoded_repoint_history(
+    history: tuple[tuple[str, str], ...],
+) -> str:
+    return json.dumps(
+        [
+            {"repository": repository, "target_dir": target_dir}
+            for repository, target_dir in history
+        ],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def repoint_history_for_overlay(
+    overlay: str,
+    *,
+    repository: str,
+    target_dir: str,
+) -> tuple[tuple[str, str], ...]:
+    """Preserve exact prior deployments when an overlay is regenerated."""
+
+    existing = _source_env_file(overlay)
+    if not existing:
+        raise ValueError("existing overlay could not be read safely")
+    history = parse_repoint_history(existing.get(REPOINT_HISTORY_ENV, ""))
+    prior_repository = canonical_repository(existing.get("REPO", ""))
+    prior_target = existing.get("TARGET_DIR", "")
+    if not prior_repository or not prior_target:
+        raise ValueError(
+            "existing overlay must record both REPO and TARGET_DIR"
+        )
+    if prior_repository != canonical_repository(repository):
+        raise ValueError(
+            "cross-repository overlay reuse is not a supported repoint; "
+            "choose a different --name"
+        )
+    if not os.path.isabs(prior_target):
+        raise ValueError(
+            "existing TARGET_DIR must be absolute before a supported repoint"
+        )
+    history = (
+        (prior_repository, os.path.realpath(prior_target)),
+        *history,
+    )
+    current = (
+        canonical_repository(repository),
+        os.path.realpath(target_dir),
+    )
+    deduplicated = tuple(
+        identity
+        for identity in dict.fromkeys(history)
+        if identity != current
+    )
+    # Reuse the config boundary's validation and bounded-history contract.
+    return parse_repoint_history(_encoded_repoint_history(deduplicated))
+
+
 def synth_repo_env(
     *,
     repo: str,
@@ -323,6 +383,7 @@ def synth_repo_env(
     review_mode: str = "",
     max_budget: str = "",
     review_budget: str = "",
+    repointed_from_deployments: tuple[tuple[str, str], ...] = (),
 ) -> str:
     """Render a config/repos/<name>.env overlay from flags. Keys mirror exactly
     what app/config.from_env reads, and state dirs are isolated per name (matching
@@ -342,6 +403,13 @@ def synth_repo_env(
         f'REVIEW_STATE_DIR="$HOME/.local/state/review-agent-{name}"',
         f'STEWARD_STATE_DIR="$HOME/.local/state/steward-agent-{name}"',
     ]
+    if repointed_from_deployments:
+        lines += [
+            "",
+            "# Exact prior deployments authorized for one-time recovery/adoption.",
+            f"{REPOINT_HISTORY_ENV}="
+            f"{_q(_encoded_repoint_history(repointed_from_deployments))}",
+        ]
     opt = [
         ("TEST_CMD", test_cmd),
         ("EDIT_CHECK_CMD", edit_check_cmd),
@@ -785,6 +853,8 @@ def _resolve_context(args) -> tuple[str, str, str]:
     """(repo, target_dir, name) from flags then cwd auto-detection."""
     cwd = os.getcwd()
     target_dir = args.target_dir or detect_target_dir(cwd)
+    if target_dir:
+        target_dir = os.path.realpath(target_dir)
     repo = canonical_repository(args.repo or detect_repo(cwd))
     # Pass target_dir so a repo with several overlays resolves to the one for THIS
     # working copy (cwd wins), not the alphabetically-first REPO match.
@@ -852,6 +922,25 @@ def cmd_start(args) -> int:
             return 2
     if not os.path.isfile(overlay) or args.write_config:
         os.makedirs(REPOS_DIR, exist_ok=True)
+        repoint_history: tuple[tuple[str, str], ...] = ()
+        if os.path.isfile(overlay):
+            try:
+                repoint_history = repoint_history_for_overlay(
+                    overlay,
+                    repository=repo,
+                    target_dir=target_dir,
+                )
+            except ValueError as exc:
+                err(
+                    "REFUSING to overwrite deployment lineage in "
+                    f"config/repos/{name}.env: {exc}"
+                )
+                return 2
+            if repoint_history:
+                info(
+                    "recording explicit repoint lineage for "
+                    f"{len(repoint_history)} prior deployment(s)"
+                )
         # Resolve TEST_CMD: explicit flag wins; else probe the repo with a cheap
         # read-only LLM search. Empty result → the repo has no tests: proceed, but
         # LOUDLY. Only done when synthesizing a fresh overlay (not on reuse).
@@ -875,6 +964,7 @@ def cmd_start(args) -> int:
             base_branch=args.base_branch, test_cmd=test_cmd,
             edit_check_cmd=args.edit_check_cmd or "", review_mode=args.review_mode or "",
             max_budget=args.max_budget or "", review_budget=args.review_budget or "",
+            repointed_from_deployments=repoint_history,
         )
         with open(overlay, "w") as f:
             f.write(content)
@@ -1010,14 +1100,20 @@ def global_daily_cap(name: str) -> float:
 
 
 def spend_status_lines(
-    journal_file: str | list[str], ledger_file: str, cap: float = 0.0, now_fn=None,
-    repo: str | None = None, global_cap: float = 0.0,
+    journal_file: str | list[str],
+    cap: float = 0.0,
+    now_fn=None,
+    repo: str | None = None,
+    global_cap: float = 0.0,
+    *,
+    repository_spent: float = 0.0,
+    all_repositories_spent: float = 0.0,
 ) -> list[str]:
     """The spend/health section of `issue-agent status`, as plain lines.
 
-    Pure over the files so it is testable without daemons: reads only, and an
-    absent or empty journal yields `[]` — a status command that shouts about a
-    missing file on a fresh install teaches operators to ignore it.
+    Reads only the event files; authoritative SQLite spend totals are injected
+    by the caller so rendering stays deterministic and testable without a
+    daemon. An absent history and zero spend yield `[]`.
 
     M11: `journal_file` may be a single path (back-compat — pre-M11 callers,
     e.g. tests/adapters/test_journal.py outside this leg's file ownership,
@@ -1043,7 +1139,6 @@ def spend_status_lines(
         parse_ts,
         read_events,
         repeated_dispatch_warning,
-        sum_today,
     )
 
     now_fn = now_fn or (lambda: datetime.now(timezone.utc))
@@ -1055,7 +1150,7 @@ def spend_status_lines(
     # corrupts the ordering of the events after it) rather than raising —
     # readers tolerating garbage is the module's own contract (journal.py).
     events.sort(key=lambda e: parse_ts(e.get("ts")) or datetime.min.replace(tzinfo=timezone.utc))
-    spent = sum_today(ledger_file, now_fn)
+    spent = all_repositories_spent
     if not events and not spent:
         return []
 
@@ -1064,9 +1159,8 @@ def spend_status_lines(
     # all-repos total read as "you have $640 of headroom" on a box where the
     # other deployment had spent it all. Cap and number must share a scope.
     if repo:
-        repo_spent = sum_today(ledger_file, now_fn, repo=repo)
         budget = f" / ${cap:.2f} cap" if cap > 0 else " (no daily cap)"
-        lines.append(f"  today, {repo}: ${repo_spent:.2f}{budget}")
+        lines.append(f"  today, {repo}: ${repository_spent:.2f}{budget}")
         global_budget = (
             f" / ${global_cap:.2f} cap" if global_cap > 0 else " (no global cap)"
         )
@@ -1143,12 +1237,38 @@ def cmd_status(args) -> int:
     # even if the journal is unreadable — the diagnostic must not be the thing
     # that fails when things are going wrong.
     try:
-        from ..adapters.journal import default_ledger_path
+        from datetime import datetime, timezone
+        from zoneinfo import ZoneInfo
 
+        from ..adapters.control_path import canonical_control_store_path
+        from ..adapters.control_store import read_settled_spend
+        from ..domain.contracts import daily_budget_scope
+
+        now = datetime.now(timezone.utc)
+        period = daily_budget_scope(
+            "*", "global", "USD", now, ZoneInfo("UTC")
+        )
+        spend = read_settled_spend(
+            canonical_control_store_path(),
+            period.period_start,
+            period.period_end,
+        )
+        configured_repo = read_repo_env_field(
+            os.path.join(REPOS_DIR, f"{name}.env"),
+            "REPO",
+        )
         for line in spend_status_lines(
-            journal_paths(name), default_ledger_path(), daily_cap(name),
-            repo=read_repo_env_field(os.path.join(REPOS_DIR, f"{name}.env"), "REPO"),
+            journal_paths(name),
+            daily_cap(name),
+            now_fn=lambda: now,
+            repo=configured_repo,
             global_cap=global_daily_cap(name),
+            repository_spent=(
+                spend.for_repository(configured_repo).micros / 1_000_000
+                if configured_repo
+                else 0.0
+            ),
+            all_repositories_spent=spend.total.micros / 1_000_000,
         ):
             print(line)
     except Exception as exc:  # noqa: BLE001

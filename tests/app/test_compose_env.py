@@ -561,6 +561,10 @@ def test_build_role_does_not_reload_env_when_already_provided(
         raise AssertionError("build_role reloaded env via _load_agent_env")
 
     monkeypatch.setattr(main_module, "_load_agent_env", _must_not_be_called)
+    monkeypatch.setattr(
+        "issue_agent.app.config.machine_control_authority_root",
+        lambda: str(tmp_path / "machine-state"),
+    )
 
     # FIX_BOT is required as of review P1R-7 (an unset one made every
     # unresolvable PR author read as ours), so a config built here must carry it.
@@ -649,6 +653,10 @@ def test_build_role_self_loads_env_when_called_standalone_without_one(
         return real(env)
 
     monkeypatch.setattr(main_module, "_load_agent_env", _counting)
+    monkeypatch.setattr(
+        "issue_agent.app.config.machine_control_authority_root",
+        lambda: str(tmp_path / "machine-state"),
+    )
     monkeypatch.setenv("REPO", "o/r")
     monkeypatch.setenv("FIX_BOT", "fix-bot")  # required since review P1R-7
     monkeypatch.setenv("ARM_ON_OPEN", "0")

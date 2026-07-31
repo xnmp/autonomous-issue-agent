@@ -228,6 +228,7 @@ def test_codex_usage_reads_the_newest_rollout_end_to_end(tmp_path):
 # ── harness caps ──────────────────────────────────────────────────────────────
 def test_harness_usage_sums_today_globally_and_per_repo(tmp_path, monkeypatch):
     from issue_agent.app import cli
+    from issue_agent.adapters.control_store import SQLiteControlStore
     from datetime import datetime, timezone
 
     monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path / "repos"))
@@ -235,16 +236,24 @@ def test_harness_usage_sums_today_globally_and_per_repo(tmp_path, monkeypatch):
     (tmp_path / "repos" / "demo.env").write_text("REPO='o/r'\nDAILY_SPEND_CAP_USD=20\n")
     ledger = tmp_path / "spend.jsonl"
     ledger.write_text(
-        '{"ts": "2026-07-29T01:00:00+00:00", "event": "spend", "repo": "o/r", "cost_usd": 1.5}\n'
-        '{"ts": "2026-07-29T02:00:00+00:00", "event": "spend", "repo": "o/other", "cost_usd": 2.0}\n'
-        '{"ts": "2026-07-28T02:00:00+00:00", "event": "spend", "repo": "o/r", "cost_usd": 9.0}\n'
+        '{"ts": "2026-07-29T01:00:00+00:00", "event": "spend", "repo": "o/r", "issue": 1, "cost_usd": 1.5}\n'
+        '{"ts": "2026-07-29T02:00:00+00:00", "event": "spend", "repo": "o/other", "issue": 2, "cost_usd": 2.0}\n'
+        '{"ts": "2026-07-28T02:00:00+00:00", "event": "spend", "repo": "o/r", "issue": 1, "cost_usd": 9.0}\n'
     )
+    control = SQLiteControlStore(str(tmp_path / "control.db"))
+    control.initialize()
+    control.import_legacy_spend(str(ledger))
     now = lambda: datetime(2026, 7, 29, 12, tzinfo=timezone.utc)  # noqa: E731
     def config_for(name):
         path = tmp_path / "repos" / f"{name}.env"
         return cli.read_repo_env_field(str(path), "REPO"), cli.daily_cap(name), 0.0
 
-    result = usage.harness_usage(["demo"], config_for, str(ledger), now_fn=now)
+    result = usage.harness_usage(
+        ["demo"],
+        config_for,
+        control.path,
+        now_fn=now,
+    )
     assert result["today_all_repos_usd"] == 3.5
     assert result["per_repo"][0]["today_usd"] == 1.5
     assert result["per_repo"][0]["daily_cap_usd"] == 20.0

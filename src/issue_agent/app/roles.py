@@ -148,17 +148,56 @@ def _role_state_dir(cfg: HarnessConfig, role: str) -> str:
     }[role]
 
 
-def _deployment_identity_for_repository(
-    cfg: HarnessConfig, role: str, repository: str
+def _deployment_identity_for_target(
+    repository: str,
+    target_dir: str,
+    role: str,
 ) -> str:
-    checkout = os.path.realpath(cfg.target_dir) if cfg.target_dir else ""
+    checkout = os.path.realpath(target_dir) if target_dir else ""
     return hashlib.sha256(
         f"{repository}:{checkout}:{role}".encode()
     ).hexdigest()[:16]
 
 
+def _deployment_identity_for_repository(
+    cfg: HarnessConfig, role: str, repository: str
+) -> str:
+    return _deployment_identity_for_target(
+        repository,
+        cfg.target_dir,
+        role,
+    )
+
+
 def _deployment_identity(cfg: HarnessConfig, role: str) -> str:
     return _deployment_identity_for_repository(cfg, role, cfg.repo)
+
+
+def _prior_deployments(
+    cfg: HarnessConfig,
+    role: str,
+) -> tuple[tuple[str, str], ...]:
+    """Exact prior ``(repository, deployment)`` identities authorized by config."""
+
+    candidates = list(cfg.repointed_from_deployments)
+    if cfg.repo_input and cfg.repo_input != cfg.repo:
+        candidates.append((cfg.repo_input, cfg.target_dir))
+    current = (cfg.repo, _deployment_identity(cfg, role))
+    return tuple(
+        identity
+        for identity in dict.fromkeys(
+            (
+                repository,
+                _deployment_identity_for_target(
+                    repository,
+                    target_dir,
+                    role,
+                ),
+            )
+            for repository, target_dir in candidates
+        )
+        if identity != current
+    )
 
 
 def process_supervision_state_dir(
@@ -178,6 +217,22 @@ def process_supervision_state_dir(
     )
 
 
+def prior_process_supervision_state_dirs(
+    cfg: HarnessConfig,
+    role: str,
+    state_dir: str | None = None,
+) -> tuple[str, ...]:
+    """Registries this explicit repoint is authorized to reap at boot."""
+
+    root = state_dir if state_dir is not None else _role_state_dir(cfg, role)
+    if not root:
+        raise ValueError("process supervisor state directory is required")
+    return tuple(
+        os.path.join(root, "process-supervision", deployment)
+        for _repository, deployment in _prior_deployments(cfg, role)
+    )
+
+
 def _owner_identity(cfg: HarnessConfig, role: str) -> str:
     return f"{cfg.repo}:{role}:{_deployment_identity(cfg, role)}"
 
@@ -192,19 +247,15 @@ def _control_store(
     control = SQLiteControlStore(_control_store_path(cfg, state_dir))
     control.initialize()
     role = journal.events.producer.role
-    prior_owners: tuple[str, ...] = ()
-    prior_deployment = ""
-    if cfg.repo_input and cfg.repo_input != cfg.repo:
-        prior_deployment = _deployment_identity_for_repository(
-            cfg, role, cfg.repo_input
+    prior_deployments = _prior_deployments(cfg, role)
+    prior_owners = tuple(
+        owner
+        for repository, deployment in prior_deployments
+        for owner in (
+            f"{repository}:{role}",
+            f"{repository}:{role}:{deployment}",
         )
-        prior_owners = (
-            f"{cfg.repo_input}:{role}",
-            (
-                f"{cfg.repo_input}:{role}:"
-                f"{prior_deployment}"
-            ),
-        )
+    )
     control.adopt_legacy_owner(
         cfg.repo,
         role,
@@ -217,15 +268,13 @@ def _control_store(
         line_limit=journal.events.line_limit,
         destination=journal.events.producer.feed_identity,
     )
-    if prior_deployment:
+    for prior_repository, prior_deployment in prior_deployments:
         control.adopt_projection_feed(
             prior_deployment=prior_deployment,
             current_deployment=journal.events.producer.deployment,
             repository=cfg.repo,
             role=role,
-            prior_destination=(
-                f"{prior_deployment}:{cfg.repo_input}:{role}"
-            ),
+            prior_destination=f"{prior_deployment}:{prior_repository}:{role}",
             current_destination=journal.events.producer.feed_identity,
         )
     return control
@@ -235,6 +284,7 @@ def _control_store_path(cfg: HarnessConfig, state_dir: str) -> str:
     return control_store_path(
         (cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir),
         fallback_state_dir=state_dir,
+        authority_root=cfg.control_authority_root,
     )
 
 
@@ -295,6 +345,7 @@ def _with_accounting(
         owner_id=_owner_identity(cfg, role),
         github_host=os.environ.get("GH_HOST", "github.com"),
         approved_base_branch=cfg.base_branch,
+        require_dispatch_claim=True,
     )
 
 
@@ -815,9 +866,7 @@ def _typed_journal(
 ) -> TypedJournal:
     """Attach the canonical v2 sink without changing the historical test seam."""
 
-    deployment = hashlib.sha256(
-        f"{cfg.repo}:{cfg.target_dir}:{role}".encode()
-    ).hexdigest()[:16]
+    deployment = _deployment_identity(cfg, role)
     events = EventLog(
         os.path.join(state_dir, "events-v2.jsonl"),
         Producer(

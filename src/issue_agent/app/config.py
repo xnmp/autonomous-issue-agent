@@ -19,6 +19,7 @@ from enum import Enum
 from types import MappingProxyType
 
 from ..adapters.agent_runner import DEFAULT_MAX_BUFFER_BYTES
+from ..adapters.control_path import machine_control_authority_root
 from ..adapters.env_file import source_env_file
 from ..domain.agent_task import RuntimeName
 from ..domain.effort import EFFORT_LADDER, Effort, parse_effort
@@ -32,6 +33,48 @@ from ..domain.repository import (
 
 
 SHELL_CMD_LOG_LIMIT = 120
+REPOINT_HISTORY_ENV = "REPOINTED_FROM_DEPLOYMENTS"
+MAX_REPOINT_HISTORY = 32
+
+
+def parse_repoint_history(raw: str) -> tuple[tuple[str, str], ...]:
+    """Decode the explicit repository/checkout lineage written by the CLI."""
+
+    if not raw.strip():
+        return ()
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{REPOINT_HISTORY_ENV} must be valid JSON") from exc
+    if not isinstance(value, list):
+        raise ValueError(f"{REPOINT_HISTORY_ENV} must be a JSON list")
+    if len(value) > MAX_REPOINT_HISTORY:
+        raise ValueError(
+            f"{REPOINT_HISTORY_ENV} cannot contain more than "
+            f"{MAX_REPOINT_HISTORY} deployments"
+        )
+    result: list[tuple[str, str]] = []
+    identities: set[tuple[str, str]] = set()
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"{REPOINT_HISTORY_ENV}[{index}] must be an object"
+            )
+        repository = canonical_repository(str(item.get("repository") or ""))
+        target_dir = str(item.get("target_dir") or "")
+        if repository_validation_error(repository) or not repository:
+            raise ValueError(
+                f"{REPOINT_HISTORY_ENV}[{index}].repository is invalid"
+            )
+        if not target_dir or not os.path.isabs(target_dir):
+            raise ValueError(
+                f"{REPOINT_HISTORY_ENV}[{index}].target_dir must be absolute"
+            )
+        identity = (repository, os.path.realpath(target_dir))
+        if identity not in identities:
+            identities.add(identity)
+            result.append(identity)
+    return tuple(result)
 
 
 def describe_command(value: str | None, *, empty: str = "EMPTY",
@@ -205,6 +248,13 @@ class HarnessConfig:
     state_dir: str = ""
     review_state_dir: str = ""
     steward_state_dir: str = ""
+    control_authority_root: str = ""
+    # Explicit ancestry produced only by `issue-agent start --write-config`.
+    # It authorizes adopting and reaping those exact prior deployments during
+    # a supported checkout/repository repoint; arbitrary siblings stay isolated.
+    repointed_from_deployments: tuple[tuple[str, str], ...] = field(
+        default=(), repr=False, compare=False
+    )
     worktree_root: str = ".claude/worktrees"
     # review S7: this literal used to disagree with from_env's own "20" literal
     # (60 here, "20" there) — from_env now reads its default off THIS field, so
@@ -702,6 +752,14 @@ class HarnessConfig:
             errors.append("REPO must be set (owner/name) — is the repo overlay composed?")
         elif detail := repository_validation_error(self.repo):
             errors.append(f"REPO {self.repo!r} {detail}")
+        if any(
+            repository != self.repo
+            for repository, _target_dir in self.repointed_from_deployments
+        ):
+            errors.append(
+                f"{REPOINT_HISTORY_ENV} can only contain the current REPO; "
+                "cross-repository overlay reuse requires a different --name"
+            )
         if not (self.fix_bot or "").strip():
             # review P1R-7: an unset FIX_BOT used to pass validate() silently.
             # Worse, `login_eq("", "")` used to be True, so with fix_bot=="" a
@@ -884,7 +942,10 @@ class HarnessConfig:
             f"{f'${self.global_daily_spend_cap_usd:.2f}' if self.global_daily_spend_cap_usd > 0 else 'off'} "
             f"alert={describe_command(self.alert_cmd, empty='none')}",
             f"edit_check={describe_command(self.edit_check_cmd, empty='none')}",
-            f"state={self.state_dir or '(unset)'} target={self.target_dir or '(cwd)'}",
+            f"state={self.state_dir or '(unset)'} "
+            f"control={self.control_authority_root or '(deployment state parent)'} "
+            f"target={self.target_dir or '(cwd)'} "
+            f"repoint_ancestors={len(self.repointed_from_deployments)}",
         ])
 
 
@@ -1005,7 +1066,9 @@ _INTERNAL_CONFIG_FIELDS = frozenset(
         "agent_md",
         "triage_prompt",
         "codex_cost_per_mtok_cached_in",
+        "control_authority_root",
         "parse_errors",
+        "repointed_from_deployments",
         "repo_input",
     }
 )
@@ -1479,5 +1542,13 @@ def from_env(env: dict | None = None) -> HarnessConfig:
     )
     values["codex_cost_per_mtok"] = rates
     values["codex_cost_per_mtok_cached_in"] = cached_rates
+    try:
+        values["repointed_from_deployments"] = parse_repoint_history(
+            str(e.get(REPOINT_HISTORY_ENV) or "")
+        )
+    except ValueError as exc:
+        errors.append(str(exc))
+        values["repointed_from_deployments"] = ()
+    values["control_authority_root"] = machine_control_authority_root()
     values["parse_errors"] = tuple(errors)
     return HarnessConfig(**values)

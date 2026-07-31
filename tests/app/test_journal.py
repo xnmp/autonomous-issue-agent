@@ -1181,13 +1181,33 @@ def test_daemon_journals_a_skipped_tick_when_github_is_unavailable(tmp_path):
 def test_status_summary_is_silent_with_no_history(tmp_path):
     from issue_agent.app.cli import spend_status_lines
 
-    assert spend_status_lines(str(tmp_path / "j.jsonl"), str(tmp_path / "s.jsonl")) == []
+    assert spend_status_lines(str(tmp_path / "j.jsonl")) == []
+
+
+def test_status_summary_reports_sqlite_spend_without_legacy_history(
+    tmp_path,
+):
+    from issue_agent.app.cli import spend_status_lines
+
+    output = "\n".join(
+        spend_status_lines(
+            str(tmp_path / "absent-journal.jsonl"),
+            50.0,
+            lambda: NOW,
+            repo="o/r",
+            global_cap=100.0,
+            repository_spent=1.25,
+            all_repositories_spent=3.5,
+        )
+    )
+
+    assert "today, o/r: $1.25 / $50.00 cap" in output
+    assert "today, all repos: $3.50 / $100.00 cap" in output
 
 
 def test_status_summary_reports_spend_runs_and_warnings(tmp_path):
     from issue_agent.app.cli import spend_status_lines
 
-    ledger = _write(str(tmp_path / "spend.jsonl"), _spend(NOW, 12.5))
     journal = str(tmp_path / "j.jsonl")
     _write(
         journal,
@@ -1199,7 +1219,14 @@ def test_status_summary_reports_spend_runs_and_warnings(tmp_path):
         json.dumps({"ts": _at(NOW - timedelta(hours=3)), "event": "escalation",
                     "target": "issue", "number": 5}),
     )
-    out = "\n".join(spend_status_lines(journal, ledger, 50.0, lambda: NOW))
+    out = "\n".join(
+        spend_status_lines(
+            journal,
+            50.0,
+            lambda: NOW,
+            all_repositories_spent=12.5,
+        )
+    )
 
     assert "$12.50" in out and "$50.00 cap" in out
     assert "RESOLVE" in out and "#5" in out and "agent_error" in out

@@ -6,6 +6,7 @@ import json
 import multiprocessing
 import os
 import sqlite3
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from issue_agent.adapters.control_path import control_store_path
 from issue_agent.adapters.control_store import (
     AccountingDisposition,
     BudgetLimit,
@@ -26,6 +28,7 @@ from issue_agent.adapters.control_store import (
     ReservationRequest,
     SQLiteControlStore,
     SettlementRequest,
+    read_settled_spend,
 )
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.domain.contracts import (
@@ -120,7 +123,7 @@ def test_control_store_initializes_with_restrictive_permissions_and_integrity(tm
             "ORDER BY version"
         ).fetchall()
     assert history == [
-        (9, 64), (10, 64), (11, 64), (12, 64), (13, 64)
+        (9, 64), (10, 64), (11, 64), (12, 64), (13, 64), (14, 64)
     ]
 
 
@@ -153,6 +156,8 @@ def test_repository_alias_migration_unifies_authoritative_rows(tmp_path):
     )
     store.enqueue_command(command)
     with store._connect() as db:
+        db.execute("DROP TABLE dispatch_claim_runs")
+        db.execute("DELETE FROM schema_migrations WHERE version=14")
         db.execute("DELETE FROM schema_migrations WHERE version=13")
         db.execute(
             "UPDATE lifecycle_commands SET repository='O/R'"
@@ -189,6 +194,8 @@ def test_repository_alias_claim_collision_fails_as_permanent_schema_error(
 ):
     store = _store(tmp_path)
     with store._connect() as db:
+        db.execute("DROP TABLE dispatch_claim_runs")
+        db.execute("DELETE FROM schema_migrations WHERE version=14")
         db.execute("DELETE FROM schema_migrations WHERE version=13")
         claim = (
             "fix",
@@ -273,6 +280,7 @@ def test_shipped_v8_database_upgrades_without_rewriting_history_or_data(
     request = _request(1)
     assert store.reserve(request).admitted
     with sqlite3.connect(store.path) as db:
+        db.execute("DROP TABLE dispatch_claim_runs")
         db.execute("DROP TABLE run_cancellation_intents")
         db.execute("DROP TABLE level_state")
         db.execute("DROP TABLE dispatch_claims")
@@ -306,6 +314,7 @@ def test_shipped_v8_database_upgrades_without_rewriting_history_or_data(
         11,
         12,
         13,
+        14,
     ]
     assert history[0][1] == (
         "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
@@ -323,6 +332,8 @@ def test_concurrent_role_boot_serializes_schema_migrations(
     if starting_version != "fresh":
         SQLiteControlStore(str(path)).initialize()
         with sqlite3.connect(path) as db:
+            db.execute("DROP TABLE dispatch_claim_runs")
+            db.execute("DELETE FROM schema_migrations WHERE version=14")
             db.execute("DELETE FROM schema_migrations WHERE version=13")
             db.execute("DELETE FROM schema_migrations WHERE version=12")
             db.execute("DROP TABLE dispatch_claims")
@@ -364,9 +375,9 @@ def test_concurrent_role_boot_serializes_schema_migrations(
                 "SELECT version FROM schema_migrations ORDER BY version"
             )
         ) == (
-            (8, 9, 10, 11, 12, 13)
+            (8, 9, 10, 11, 12, 13, 14)
             if starting_version == "v8"
-            else (9, 10, 11, 12, 13)
+            else (9, 10, 11, 12, 13, 14)
         )
 
 
@@ -459,6 +470,79 @@ def test_dispatch_claim_process_probe_runs_outside_write_transaction(
 
     assert store.claim_dispatch(
         "o/r", "fix", 2, "RESOLVE", "owner-b", frozenset({"b.py"})
+    )
+
+
+def test_dispatch_claim_survives_dead_daemon_while_bound_child_is_live(
+    tmp_path,
+) -> None:
+    store = _store(tmp_path)
+    owner = "o/r:fix:checkout-a"
+    run_id = RunId("bound-child")
+    request = dataclasses.replace(
+        _request(1),
+        run_id=run_id,
+        reservation_id=ReservationId("bound-child-reservation"),
+        owner_id=owner,
+        kind="RESOLVE",
+    )
+    assert store.claim_dispatch(
+        "o/r", "fix", 42, "RESOLVE", owner, frozenset({"src/shared.py"})
+    )
+    assert store.reserve(request).admitted
+    assert store.bind_dispatch_claim("o/r", "fix", 42, owner, run_id)
+
+    process = subprocess.Popen(
+        ["sleep", "30"],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+    )
+    try:
+        identity = ProcessSupervisor.process_identity(process.pid)
+        assert identity is not None
+        store.register_lease(
+            Lease(
+                run_id,
+                request.dispatch_id,
+                owner,
+                process.pid,
+                os.getpgid(process.pid),
+                NOW,
+                identity.start_ticks,
+            )
+        )
+        with store._connect() as db:
+            db.execute(
+                "UPDATE dispatch_claims SET owner_pid=?, owner_start_ticks=? "
+                "WHERE repository='o/r' AND role='fix' AND target='issue:42'",
+                (2_000_000_000, 1),
+            )
+
+        assert not store.claim_dispatch(
+            "o/r",
+            "fix",
+            42,
+            "RESOLVE",
+            "o/r:fix:checkout-b",
+            frozenset({"src/shared.py"}),
+        )
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+
+    assert store.reclaim_dead_leases(
+        owner, lambda _pid, _start: False
+    ) == (run_id,)
+    assert store.release(run_id, "spend_unknown").disposition.value == (
+        "available"
+    )
+    assert store.claim_dispatch(
+        "o/r",
+        "fix",
+        42,
+        "RESOLVE",
+        "o/r:fix:checkout-b",
+        frozenset({"src/shared.py"}),
     )
 
 
@@ -604,7 +688,7 @@ def test_publication_authority_requires_active_reservation_and_live_lease(
     assert authority.pgid == pgid
 
 
-@pytest.mark.parametrize("version", (9, 10, 11, 12, 13))
+@pytest.mark.parametrize("version", (9, 10, 11, 12, 13, 14))
 @pytest.mark.parametrize("stage", ("before_commit", "committed"))
 def test_schema_migration_restart_is_atomic_at_every_boundary(
     tmp_path,
@@ -644,7 +728,7 @@ def test_schema_migration_restart_is_atomic_at_every_boundary(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name='run_cancellation_intents'"
         ).fetchone()
-    assert versions == (9, 10, 11, 12, 13)
+    assert versions == (9, 10, 11, 12, 13, 14)
     assert cancellation_table == ("run_cancellation_intents",)
 
 
@@ -694,6 +778,26 @@ def test_semantically_corrupt_accounting_is_rejected_before_admission(tmp_path):
     result = reopened.reserve(_request(2))
     assert result.disposition is AccountingDisposition.CORRUPT
     assert "primary limit" in result.detail
+
+
+def test_semantically_corrupt_dispatch_binding_is_rejected(tmp_path):
+    store = _store(tmp_path)
+    owner = "o/r:fix:deployment"
+    request = dataclasses.replace(_request(1), owner_id=owner)
+    assert store.claim_dispatch(
+        "o/r", "fix", 1, "RESOLVE", owner, frozenset({"src/a.py"})
+    )
+    assert store.reserve(request).admitted
+    assert store.bind_dispatch_claim(
+        "o/r", "fix", 1, owner, request.run_id
+    )
+    with sqlite3.connect(store.path) as db:
+        db.execute(
+            "UPDATE runs SET owner_id='other-owner' WHERE run_id='run-1'"
+        )
+
+    with pytest.raises(CorruptControlStore, match="bound run owners"):
+        SQLiteControlStore(store.path).initialize()
 
 
 @pytest.mark.parametrize(
@@ -1054,7 +1158,21 @@ def test_dead_lease_liveness_probe_does_not_hold_sqlite_write_lock(
 
 
 def test_one_transaction_enforces_shared_global_limit_across_repositories(tmp_path):
-    store = _store(tmp_path)
+    authority = tmp_path / "machine-state"
+    paths = (
+        control_store_path(
+            (str(tmp_path / "repo-a" / "fix"),),
+            authority_root=str(authority),
+        ),
+        control_store_path(
+            (str(tmp_path / "repo-b" / "fix"),),
+            authority_root=str(authority),
+        ),
+    )
+    assert paths[0] == paths[1]
+    stores = tuple(SQLiteControlStore(path, now=lambda: NOW) for path in paths)
+    for store in stores:
+        store.initialize()
     global_scope = BudgetScope(
         "*",
         "global",
@@ -1076,8 +1194,11 @@ def test_one_transaction_enforces_shared_global_limit_across_repositories(tmp_pa
     with ThreadPoolExecutor(max_workers=2) as pool:
         results = tuple(
             pool.map(
-                store.reserve,
-                (request("o/one", 1), request("o/two", 2)),
+                lambda pair: pair[0].reserve(pair[1]),
+                (
+                    (stores[0], request("o/one", 1)),
+                    (stores[1], request("o/two", 2)),
+                ),
             )
         )
 
@@ -1085,7 +1206,65 @@ def test_one_transaction_enforces_shared_global_limit_across_repositories(tmp_pa
         "available",
         "exhausted",
     ]
-    assert store.snapshot(global_scope).reserved == Money("USD", 60)
+    assert stores[0].snapshot(global_scope).reserved == Money("USD", 60)
+
+
+def test_settled_spend_read_model_uses_authoritative_charges(tmp_path) -> None:
+    store = _store(tmp_path)
+    first = _request(1)
+    second = dataclasses.replace(
+        _request(2),
+        scope=dataclasses.replace(_scope(), repository="o/other"),
+    )
+    assert store.reserve(first).admitted
+    assert store.reserve(second).admitted
+    assert store.settle(
+        SettlementRequest(
+            first.run_id,
+            Money("USD", 25),
+            PricingBasis.PROVIDER_REPORTED,
+            "receipt-1",
+            None,
+            None,
+            None,
+        )
+    ).disposition is AccountingDisposition.AVAILABLE
+    assert store.settle(
+        SettlementRequest(
+            second.run_id,
+            Money("USD", 40),
+            PricingBasis.PROVIDER_REPORTED,
+            "receipt-2",
+            None,
+            None,
+            None,
+        )
+    ).disposition is AccountingDisposition.AVAILABLE
+
+    summary = read_settled_spend(
+        store.path,
+        NOW.replace(hour=0),
+        NOW.replace(hour=0) + timedelta(days=1),
+    )
+
+    assert summary.total == Money("USD", 65)
+    assert summary.for_repository("O/R") == Money("USD", 25)
+    assert summary.for_repository("o/other") == Money("USD", 40)
+    assert summary.for_repository("o/absent") == Money.zero("USD")
+
+
+def test_missing_control_store_reads_as_zero_without_creating_it(tmp_path) -> None:
+    path = tmp_path / "absent" / "control.db"
+
+    summary = read_settled_spend(
+        str(path),
+        NOW.replace(hour=0),
+        NOW.replace(hour=0) + timedelta(days=1),
+    )
+
+    assert summary.total == Money.zero("USD")
+    assert summary.by_repository == {}
+    assert not path.exists()
 
 
 def test_settle_is_idempotent_and_conflicting_receipt_is_rejected(tmp_path):

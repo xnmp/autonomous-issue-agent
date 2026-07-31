@@ -120,11 +120,16 @@ failure decisions; and exercised ordinary, exhausted, duplicate, and
 conflicting-receipt admissions on the pre-existing live primary database.
 Fresh databases use the v9 adoption baseline. The exact digest emitted by the
 previously shipped v8 initializer remains an accepted immutable predecessor,
-so deployed v8 databases upgrade through v9/v10/v11/v12/v13 without rewritten
+so deployed v8 databases upgrade through v9/v10/v11/v12/v13/v14 without rewritten
 history. V13 canonicalizes GitHub's case-insensitive `owner/name` repository
 identity across commands, reservations, limits, and dispatch claims; startup
 also adopts both historical mixed-case owner formats so in-flight authority is
 not stranded by the cutover.
+V14 binds each coarse dispatch claim to every admitted run in that workflow.
+Claim reaping treats any bound nonterminal run as authoritative until its owner
+recovers and terminalizes it, closing the crash window where a sibling checkout
+could start duplicate paid work while the original child or descendant still
+ran.
 Every migration is digest-validated and individually transactional; restart
 and concurrent-role tests interrupt both sides of every migration commit
 boundary and serialize fresh/v8/v9 boot. Machine-readable
@@ -135,6 +140,8 @@ coarser paid-dispatch authority is instead the durable target/path claim made
 before the workflow starts and released on every completion, rejection, or
 cancellation path. Process liveness is snapshotted before the claim
 transaction, so OS inspection never holds SQLite's cross-process write lock.
+The snapshot fingerprint includes bound run state and lease PID/start identity;
+a concurrent bind or lease transition is conservatively retained and retried.
 The bounded production-shaped boot, active SIGTERM shutdown, isolated Codex
 accounting run, cleanup receipt, and post-canary invariants are captured in
 `live-release-canary-evidence.json`.
@@ -147,6 +154,12 @@ claims remain repository/role-global, so two intentionally allowed checkouts
 cannot both admit the same target or overlapping path set. A daemon queries
 only its exact ownership scope, so sibling deployments and roles cannot cancel,
 recover, or receipt each other's work.
+The supported exception is an explicit same-repository checkout repoint:
+`issue-agent start --write-config` records a bounded lineage of exact prior
+checkout identities. The first boot reaps only those process registries and
+adopts their run/lease/claim/command and projection-feed ownership. The marker
+persists across repeated repoints so an interrupted intermediate boot cannot
+strand an older reservation. Cross-repository overlay reuse is refused.
 Process-group, process-tree, and launch-intent receipts use the same stable
 checkout deployment identity beneath each role state root. Boot and shutdown
 therefore reap only that deployment's children even when sibling checkouts
@@ -157,6 +170,16 @@ At the deployment-identity cutover, the first role deployment atomically adopts
 the former `<repository>:<role>` run, lease, and nonterminal command scope.
 Reconcile-before-write then prevents a changed owner identity from duplicating
 an ambiguous legacy effect.
+
+The control database is rooted at the operating-system service account's
+`~/.local/state/issue-agent-control/control.db`, independently of every
+repository's `STATE_DIR` values. Custom repository state roots therefore cannot
+split the host-global reservation pool. Startup fails closed if it finds the
+former deployment-local database at a custom root; that authority must be
+migrated into the canonical database before the deployment can restart.
+CLI status and dashboard usage endpoints project current-period settled charges
+directly from this SQLite authority. The historical JSONL spend ledger is read
+only during idempotent migration and cannot make current spend appear as zero.
 
 The dashboard is a read-only projection consumer. Its canonical operational
 model is rebuilt by the pure `domain/projection.py::fold` over schema-v2
@@ -189,6 +212,11 @@ that matters is not "wrong answer" but "loop that bills forever":
 - `AGENT_MAX_RUNTIME_SECONDS` wall cap, checked between events
 - repository/global/issue caps over atomic SQLite reservations; an armed cap
   blocks admission if accounting is unavailable or the runtime is unpriceable
+
+An adopted PR that genuinely has no closing issue omits only the inapplicable
+issue scope; its review legs still reserve against repository and global caps.
+A missing issue on issue-scoped fix work remains a fail-closed attribution
+error.
 
 Provider-billed runtimes settle their reported cost. Subscription runtimes
 whose provider reports zero use the configured versioned rate card as an

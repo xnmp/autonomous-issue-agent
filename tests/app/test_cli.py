@@ -11,6 +11,8 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 from issue_agent.app import cli
 
 
@@ -444,6 +446,75 @@ def test_synth_repo_env_quotes_special_chars():
     assert _source_env(text)["TEST_CMD"] == cmd
 
 
+def test_synth_repo_env_records_exact_repoint_lineage():
+    text = cli.synth_repo_env(
+        repo="o/r",
+        target_dir="/srv/current",
+        name="r",
+        repointed_from_deployments=(
+            ("o/r", "/srv/old"),
+            ("o/r", "/srv/older"),
+        ),
+    )
+
+    assert json.loads(
+        _source_env(text)["REPOINTED_FROM_DEPLOYMENTS"]
+    ) == [
+        {"repository": "o/r", "target_dir": "/srv/old"},
+        {"repository": "o/r", "target_dir": "/srv/older"},
+    ]
+
+
+def test_repoint_history_preserves_unstarted_and_started_ancestors(tmp_path):
+    overlay = tmp_path / "app.env"
+    overlay.write_text(
+        "REPO='o/r'\n"
+        "TARGET_DIR='/srv/second'\n"
+        "REPOINTED_FROM_DEPLOYMENTS='"
+        '[{"repository":"o/r","target_dir":"/srv/first"}]'
+        "'\n"
+    )
+
+    history = cli.repoint_history_for_overlay(
+        str(overlay),
+        repository="o/r",
+        target_dir="/srv/third",
+    )
+
+    assert history == (
+        ("o/r", "/srv/second"),
+        ("o/r", "/srv/first"),
+    )
+
+
+def test_repoint_history_refuses_to_discard_malformed_lineage(tmp_path):
+    overlay = tmp_path / "app.env"
+    overlay.write_text(
+        "REPO='o/r'\n"
+        "TARGET_DIR='/srv/old'\n"
+        "REPOINTED_FROM_DEPLOYMENTS='not-json'\n"
+    )
+
+    with pytest.raises(ValueError, match="valid JSON"):
+        cli.repoint_history_for_overlay(
+            str(overlay),
+            repository="o/r",
+            target_dir="/srv/new",
+        )
+
+
+def test_repoint_history_rejects_cross_repository_overlay_reuse(tmp_path):
+    overlay = tmp_path / "app.env"
+    overlay.write_text("REPO='old/repo'\nTARGET_DIR='/srv/old'\n")
+
+    with pytest.raises(ValueError, match="different --name"):
+        cli.repoint_history_for_overlay(
+            str(overlay),
+            repository="new/repo",
+            target_dir="/srv/new",
+        )
+
+
 # ── harness worktree path ─────────────────────────────────────────────────────
 def test_harness_worktree_path_default_is_sibling():
     p = cli.harness_worktree_path("/Users/me/Repos/MyApp-combined-agent")
@@ -623,7 +694,9 @@ def test_status_merges_all_three_journals_in_global_ts_order(tmp_path):
     )
     now = datetime(2026, 7, 25, 12, tzinfo=timezone.utc)
     out = "\n".join(cli.spend_status_lines(
-        [fix_j, review_j, steward_j], str(tmp_path / "ledger.jsonl"), 10.0, lambda: now
+        [fix_j, review_j, steward_j],
+        10.0,
+        lambda: now,
     ))
     # review/steward events reach the render — the M11 blind spot.
     assert "REVIEW" in out and "#9" in out
@@ -648,11 +721,12 @@ def test_status_merge_anti_vacuity_single_populated_journal_unchanged(tmp_path):
     )
     missing_review = str(tmp_path / "review" / "journal.jsonl")
     missing_steward = str(tmp_path / "steward" / "journal.jsonl")
-    ledger = str(tmp_path / "ledger.jsonl")
     now = datetime(2026, 7, 25, 12, tzinfo=timezone.utc)
-    out_single = cli.spend_status_lines(fix_j, ledger, 10.0, lambda: now)
+    out_single = cli.spend_status_lines(fix_j, 10.0, lambda: now)
     out_multi = cli.spend_status_lines(
-        [fix_j, missing_review, missing_steward], ledger, 10.0, lambda: now
+        [fix_j, missing_review, missing_steward],
+        10.0,
+        lambda: now,
     )
     assert out_single == out_multi
     assert out_single != []  # sanity: the fixture actually produced output
@@ -672,7 +746,9 @@ def test_status_merge_agent_run_start_does_not_appear_in_last_runs(tmp_path):
                     "kind": "RESOLVE", "number": 1, "cost_usd": 1.0, "status": "ok"}),
     )
     now = datetime(2026, 7, 25, 12, tzinfo=timezone.utc)
-    out = "\n".join(cli.spend_status_lines(fix_j, str(tmp_path / "ledger.jsonl"), 10.0, lambda: now))
+    out = "\n".join(
+        cli.spend_status_lines(fix_j, 10.0, lambda: now)
+    )
     assert out.count("RESOLVE") == 1
 
 

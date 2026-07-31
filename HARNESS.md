@@ -53,6 +53,11 @@ records the snapshot version that created it.
 Important fields:
 
 - `REPO=owner/name` and `TARGET_DIR=/absolute/path` are required.
+- `issue-agent start --write-config` may repoint an existing overlay only to a
+  new checkout of the same repository. It preserves a bounded
+  `REPOINTED_FROM_DEPLOYMENTS` lineage so the first boot can reap and adopt
+  those exact old deployment identities. Use a different `--name` for another
+  repository; do not hand-author the lineage.
 - `FIX_BOT` must differ from `REVIEW_BOT` in three-identity mode.
 - `TEST_CMD` must terminate. The trusted executor bounds it, scrubs deployment
   controls, stamps recursion depth, and kills the full process group on timeout.
@@ -64,6 +69,11 @@ Important fields:
 - `MAX_BUDGET_USD` / `REVIEW_BUDGET_USD` bound a leg.
 - `ISSUE_SPEND_CAP_USD`, `DAILY_SPEND_CAP_USD`, and
   `GLOBAL_DAILY_SPEND_CAP_USD` are enforced transactionally by SQLite.
+  The database is fixed per operating-system service account at
+  `~/.local/state/issue-agent-control/control.db`; custom per-repository state
+  roots never create independent global-cap pools.
+  A genuinely issue-less adopted PR is charged to repository/global scopes;
+  the issue scope is omitted because no issue authority exists.
 - `ISSUE_AGENT_MAX_TICKS=N` is the safe one/few-tick live canary control.
 
 Do not put shell watch commands in `TEST_CMD`; `pytest`, `vitest run`, and
@@ -121,7 +131,8 @@ trusted code; `PolicyDisposition.INDETERMINATE` never becomes allow.
 
 ## State, recovery, and accounting
 
-SQLite under the deployment state root is authoritative for:
+The per-account SQLite database at
+`~/.local/state/issue-agent-control/control.db` is authoritative for:
 
 - paid reservations and charges;
 - run/lease ownership;
@@ -144,6 +155,9 @@ usage provenance, and rate-card identity.
 At boot and after a suspension gap, recovery runs in a fixed order: kill known
 orphan groups, reclaim dead leases, reconcile/release unsettled spend, drain
 commands through receipt verification, and emit abandoned-run corrections.
+An explicit same-repository repoint first reaps the recorded prior checkout
+registries and atomically adopts their run, lease, claim, command, outbox, and
+world-feed authority; unrelated sibling checkouts remain isolated.
 Historical JSONL is never queried for these decisions.
 
 Schema-v2 JSONL is rotated projection input and telemetry only. The dashboard
@@ -161,6 +175,9 @@ issue-agent dashboard --html
 For deployments with `events-v2.jsonl`, all dashboard surfaces use the one pure
 `domain/projection.py::fold`. GitHub calls may enrich links/titles but do not
 infer lifecycle state.
+CLI and dashboard quota totals are read-only projections of settled SQLite
+charges for the current budget period; the legacy spend ledger is migration
+input only.
 
 ## Testing
 

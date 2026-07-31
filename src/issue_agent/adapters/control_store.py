@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from ..domain.contracts import (
@@ -55,7 +56,7 @@ from ..domain.events import (
 )
 from ..domain.repository import canonical_repository
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 SCHEMA_BASELINE_VERSION = 9
 LEGACY_V8_SCHEMA_DIGEST = (
     "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
@@ -99,6 +100,64 @@ class AccountingSnapshot:
     @property
     def committed(self) -> Money:
         return self.settled + self.reserved
+
+
+@dataclass(frozen=True)
+class SettledSpend:
+    total: Money
+    by_repository: Mapping[str, Money]
+
+    def for_repository(self, repository: str) -> Money:
+        return self.by_repository.get(
+            canonical_repository(repository),
+            Money.zero(self.total.currency),
+        )
+
+
+def read_settled_spend(
+    path: str,
+    period_start: datetime,
+    period_end: datetime,
+    *,
+    currency: str = "USD",
+) -> SettledSpend:
+    """Read settled charges without creating or mutating the control store."""
+
+    zero = Money.zero(currency)
+    if period_end <= period_start:
+        raise ValueError("spend period end must follow its start")
+    start = _stamp(period_start)
+    end = _stamp(period_end)
+    if not os.path.isfile(path):
+        return SettledSpend(zero, MappingProxyType({}))
+
+    uri = Path(path).resolve().as_uri() + "?mode=ro"
+    db = sqlite3.connect(
+        uri,
+        uri=True,
+        timeout=DEFAULT_BUSY_TIMEOUT_MS / 1000,
+    )
+    db.row_factory = sqlite3.Row
+    try:
+        db.execute(f"PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}")
+        db.execute("PRAGMA query_only=ON")
+        rows = db.execute(
+            "SELECT r.repository, COALESCE(SUM(c.amount_micros), 0) AS amount "
+            "FROM charges c JOIN budget_reservations r ON r.run_id=c.run_id "
+            "WHERE c.currency=? AND c.settled_at>=? AND c.settled_at<? "
+            "GROUP BY r.repository",
+            (currency, start, end),
+        ).fetchall()
+    finally:
+        db.close()
+    by_repository = {
+        str(row["repository"]): Money(currency, int(row["amount"]))
+        for row in rows
+    }
+    return SettledSpend(
+        Money(currency, sum(item.micros for item in by_repository.values())),
+        MappingProxyType(by_repository),
+    )
 
 
 @dataclass(frozen=True)
@@ -202,6 +261,16 @@ class Lease:
     pgid: int
     started_at: datetime
     process_start_ticks: int = 0
+
+
+@dataclass(frozen=True)
+class _DispatchClaimObservation:
+    target: str
+    owner_id: str
+    owner_pid: int
+    owner_start_ticks: int
+    paths_json: str
+    bound_runs: tuple[tuple[str, str, int, int], ...]
 
 
 @dataclass(frozen=True)
@@ -490,6 +559,23 @@ SET repository=LOWER(TRIM(repository))
 WHERE repository <> LOWER(TRIM(repository));
 """
 
+_MIGRATION_V14 = """
+CREATE TABLE dispatch_claim_runs (
+    repository TEXT NOT NULL,
+    role TEXT NOT NULL,
+    target TEXT NOT NULL,
+    run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,
+    bound_at TEXT NOT NULL,
+    PRIMARY KEY (repository, role, target, run_id),
+    FOREIGN KEY (repository, role, target)
+        REFERENCES dispatch_claims(repository, role, target)
+        ON DELETE CASCADE
+);
+
+CREATE INDEX dispatch_claim_runs_run
+ON dispatch_claim_runs(run_id);
+"""
+
 _SCHEMA_MIGRATIONS = (
     # Version 9 is the immutable adoption baseline shipped by the architectural
     # hardening cutover. Its exact source digest already exists in deployed
@@ -499,6 +585,7 @@ _SCHEMA_MIGRATIONS = (
     SchemaMigration(11, _MIGRATION_V11),
     SchemaMigration(12, _MIGRATION_V12),
     SchemaMigration(13, _MIGRATION_V13),
+    SchemaMigration(14, _MIGRATION_V14),
 )
 
 if tuple(migration.version for migration in _SCHEMA_MIGRATIONS) != tuple(
@@ -980,6 +1067,20 @@ class SQLiteControlStore:
                     )
                 ) <> (r.command_id IS NOT NULL)
                    OR (r.command_id IS NOT NULL AND r.status<>c.state)
+                LIMIT 1
+                """,
+            ),
+            (
+                "dispatch claim and bound run owners disagree",
+                """
+                SELECT dcr.run_id
+                FROM dispatch_claim_runs AS dcr
+                JOIN dispatch_claims AS dc
+                  ON dc.repository=dcr.repository
+                 AND dc.role=dcr.role
+                 AND dc.target=dcr.target
+                JOIN runs AS r ON r.run_id=dcr.run_id
+                WHERE dc.owner_id<>r.owner_id
                 LIMIT 1
                 """,
             ),
@@ -1776,41 +1877,38 @@ class SQLiteControlStore:
         target = _dispatch_claim_target(issue)
         encoded_paths = _json(sorted(paths))
         with self._connect() as db:
-            observed = db.execute(
-                "SELECT target, owner_pid, owner_start_ticks "
-                "FROM dispatch_claims WHERE repository=? AND role=?",
-                (repository, role),
-            ).fetchall()
-        liveness = {
-            (
-                str(row["target"]),
-                int(row["owner_pid"]),
-                int(row["owner_start_ticks"]),
-            ): ProcessSupervisor.matches_identity(
-                int(row["owner_pid"]),
-                int(row["owner_start_ticks"]),
+            observed = self._dispatch_claim_observations(
+                db, repository, role
             )
-            for row in observed
+        liveness = {
+            claim: (
+                ProcessSupervisor.matches_identity(
+                    claim.owner_pid,
+                    claim.owner_start_ticks,
+                )
+                or any(
+                    state in {"reserved", "starting", "running"}
+                    for (
+                        _run_id,
+                        state,
+                        _lease_pid,
+                        _lease_start_ticks,
+                    ) in claim.bound_runs
+                )
+            )
+            for claim in observed
         }
         with self.transaction() as db:
-            rows = db.execute(
-                "SELECT target, owner_id, owner_pid, owner_start_ticks, "
-                "paths_json FROM dispatch_claims "
-                "WHERE repository=? AND role=?",
-                (repository, role),
-            ).fetchall()
-            live = []
-            for row in rows:
-                claim_identity = (
-                    str(row["target"]),
-                    int(row["owner_pid"]),
-                    int(row["owner_start_ticks"]),
-                )
-                # A claim created or replaced after the read-only snapshot is
-                # conservatively live. Process inspection must never run while
-                # SQLite's cross-process write lock is held.
-                if liveness.get(claim_identity, True):
-                    live.append(row)
+            current = self._dispatch_claim_observations(
+                db, repository, role
+            )
+            live: list[_DispatchClaimObservation] = []
+            for claim in current:
+                # A claim or child binding changed after the read-only snapshot
+                # is conservatively live. Process inspection must never run
+                # while SQLite's cross-process write lock is held.
+                if liveness.get(claim, True):
+                    live.append(claim)
                     continue
                 db.execute(
                     "DELETE FROM dispatch_claims "
@@ -1819,20 +1917,20 @@ class SQLiteControlStore:
                     (
                         repository,
                         role,
-                        row["target"],
-                        row["owner_pid"],
-                        row["owner_start_ticks"],
+                        claim.target,
+                        claim.owner_pid,
+                        claim.owner_start_ticks,
                     ),
                 )
-            for row in live:
+            for claim in live:
                 try:
-                    other_paths = frozenset(json.loads(row["paths_json"]))
+                    other_paths = frozenset(json.loads(claim.paths_json))
                 except (TypeError, json.JSONDecodeError) as exc:
                     raise CorruptControlStore(
                         "dispatch claim contains invalid paths"
                     ) from exc
                 if (
-                    row["target"] == target
+                    claim.target == target
                     or not paths
                     or not other_paths
                     or bool(paths & other_paths)
@@ -1852,6 +1950,105 @@ class SQLiteControlStore:
                     identity.pid,
                     identity.start_ticks,
                     encoded_paths,
+                    _stamp(self._now()),
+                ),
+            )
+            return True
+
+    @staticmethod
+    def _dispatch_claim_observations(
+        db: sqlite3.Connection,
+        repository: str,
+        role: str,
+    ) -> tuple[_DispatchClaimObservation, ...]:
+        rows = db.execute(
+            "SELECT dc.target, dc.owner_id, dc.owner_pid, "
+            "dc.owner_start_ticks, dc.paths_json, dcr.run_id, r.state, "
+            "l.pid AS lease_pid, l.process_start_ticks AS lease_start_ticks "
+            "FROM dispatch_claims dc "
+            "LEFT JOIN dispatch_claim_runs dcr "
+            "ON dcr.repository=dc.repository AND dcr.role=dc.role "
+            "AND dcr.target=dc.target "
+            "LEFT JOIN runs r ON r.run_id=dcr.run_id "
+            "LEFT JOIN leases l ON l.run_id=dcr.run_id "
+            "WHERE dc.repository=? AND dc.role=? "
+            "ORDER BY dc.target, dcr.run_id",
+            (repository, role),
+        ).fetchall()
+        grouped: dict[
+            str,
+            tuple[sqlite3.Row, list[tuple[str, str, int, int]]],
+        ] = {}
+        for row in rows:
+            target = str(row["target"])
+            base, bindings = grouped.setdefault(target, (row, []))
+            if row["run_id"] is not None:
+                bindings.append(
+                    (
+                        str(row["run_id"]),
+                        str(row["state"]),
+                        int(row["lease_pid"] or 0),
+                        int(row["lease_start_ticks"] or 0),
+                    )
+                )
+        return tuple(
+            _DispatchClaimObservation(
+                target,
+                str(base["owner_id"]),
+                int(base["owner_pid"]),
+                int(base["owner_start_ticks"]),
+                str(base["paths_json"]),
+                tuple(bindings),
+            )
+            for target, (base, bindings) in grouped.items()
+        )
+
+    def bind_dispatch_claim(
+        self,
+        repository: str,
+        role: str,
+        issue: int,
+        owner_id: str,
+        run_id: RunId,
+    ) -> bool:
+        """Attach one admitted run so child liveness protects its global claim."""
+
+        if (
+            not repository
+            or not role
+            or issue == 0
+            or not owner_id
+            or not str(run_id)
+        ):
+            raise ValueError("dispatch claim binding identity is incomplete")
+        target = _dispatch_claim_target(issue)
+        with self.transaction() as db:
+            claim = db.execute(
+                "SELECT owner_id FROM dispatch_claims "
+                "WHERE repository=? AND role=? AND target=?",
+                (repository, role, target),
+            ).fetchone()
+            run = db.execute(
+                "SELECT owner_id, state FROM runs WHERE run_id=?",
+                (str(run_id),),
+            ).fetchone()
+            if (
+                claim is None
+                or run is None
+                or claim["owner_id"] != owner_id
+                or run["owner_id"] != owner_id
+                or run["state"] not in {"reserved", "starting", "running"}
+            ):
+                return False
+            db.execute(
+                "INSERT OR IGNORE INTO dispatch_claim_runs("
+                "repository, role, target, run_id, bound_at"
+                ") VALUES (?, ?, ?, ?, ?)",
+                (
+                    repository,
+                    role,
+                    target,
+                    str(run_id),
                     _stamp(self._now()),
                 ),
             )

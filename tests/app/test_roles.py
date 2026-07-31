@@ -45,13 +45,15 @@ from issue_agent.adapters.journal import JournalingRuntime, read_events
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.control_store import (
     AccountingDisposition,
+    Lease,
     ReservationRequest,
     SQLiteControlStore,
     SettlementRequest,
 )
 from issue_agent.adapters.store import Store
 from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
-from issue_agent.app.config import from_env
+from issue_agent.app.config import HarnessConfig, from_env
+from issue_agent.app.main import _recover_supervised_processes
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.planners.tasks import (
     FixTaskConfig,
@@ -65,6 +67,8 @@ from issue_agent.app.roles import (
     _REVIEW_RUNTIME_REGISTRY,
     _ci_flake_reporter,
     _ci_stall_reporter,
+    _control_store,
+    _control_store_path,
     _duplicate_pr_reporter,
     _fix_state,
     _hold_reporter,
@@ -72,9 +76,12 @@ from issue_agent.app.roles import (
     _prediction_outcome_reporter,
     _recurrence_reporter,
     _review_state,
+    _journal,
+    _owner_identity,
     _shutdown_finalize,
     _shutdown_prepare,
     _shutdown_terminalize,
+    _typed_journal,
     process_supervision_state_dir,
 )
 from issue_agent.domain.agent_task import RuntimeName
@@ -168,6 +175,160 @@ def test_process_supervision_isolated_between_checkouts_sharing_state(
         if process.poll() is None:
             process.kill()
             process.wait()
+
+
+def test_explicit_repoint_recovers_prior_processes_but_not_siblings(
+    tmp_path,
+) -> None:
+    shared = str(tmp_path / "shared-state")
+    prior_target = str(tmp_path / "prior")
+    current_target = str(tmp_path / "current")
+    sibling_target = str(tmp_path / "sibling")
+    for target in (prior_target, current_target, sibling_target):
+        os.makedirs(target)
+    base = HarnessConfig(
+        repo="o/r",
+        target_dir=prior_target,
+        state_dir=shared,
+        review_state_dir=shared,
+        steward_state_dir=shared,
+    )
+    current = replace(
+        base,
+        target_dir=current_target,
+        repointed_from_deployments=(("o/r", prior_target),),
+    )
+    sibling = replace(base, target_dir=sibling_target)
+    prior_supervisor = ProcessSupervisor(
+        process_supervision_state_dir(base, "fix"),
+        grace_seconds=0.05,
+    )
+    sibling_supervisor = ProcessSupervisor(
+        process_supervision_state_dir(sibling, "fix"),
+        grace_seconds=0.05,
+    )
+    prior_process = subprocess.Popen(
+        ["sleep", "30"],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+    )
+    sibling_process = subprocess.Popen(
+        ["sleep", "30"],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+    )
+    try:
+        prior_run = RunId("prior-repoint-run")
+        sibling_run = RunId("unrelated-sibling-run")
+        prior_supervisor.register(prior_run, os.getpgid(prior_process.pid))
+        sibling_supervisor.register(
+            sibling_run, os.getpgid(sibling_process.pid)
+        )
+
+        assert _recover_supervised_processes(
+            current, "fix", shared
+        ) == (prior_run,)
+
+        deadline = time.monotonic() + 3
+        while (
+            prior_process.poll() is None
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+        assert prior_process.poll() is not None
+        assert sibling_process.poll() is None
+        assert sibling_supervisor.registrations()[0].run_id == sibling_run
+    finally:
+        if prior_process.poll() is None:
+            prior_process.kill()
+            prior_process.wait()
+        if sibling_process.poll() is None:
+            sibling_process.kill()
+            sibling_process.wait()
+
+
+def test_explicit_repoint_adopts_and_releases_old_accounting_owner(
+    tmp_path,
+) -> None:
+    state_root = tmp_path / "state"
+    state = str(state_root / "fix")
+    review_state = str(state_root / "review")
+    steward_state = str(state_root / "steward")
+    prior_target = str(tmp_path / "prior")
+    current_target = str(tmp_path / "current")
+    old = HarnessConfig(
+        repo="o/r",
+        target_dir=prior_target,
+        state_dir=state,
+        review_state_dir=review_state,
+        steward_state_dir=steward_state,
+    )
+    current = replace(
+        old,
+        target_dir=current_target,
+        repointed_from_deployments=(("o/r", prior_target),),
+    )
+    store = SQLiteControlStore(_control_store_path(old, state))
+    store.initialize()
+    now = datetime.now(timezone.utc)
+    period_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    scope = BudgetScope(
+        "o/r",
+        "repository",
+        "USD",
+        now.date().isoformat(),
+        period_start,
+        period_start + timedelta(days=1),
+        ZoneInfo("UTC"),
+    )
+    old_owner = _owner_identity(old, "fix")
+    request = ReservationRequest(
+        ReservationId("repoint-old-reservation"),
+        RunId("repoint-old-run"),
+        "repoint-old-dispatch",
+        scope,
+        PriceQuote("model", "test", "1", now, Money("USD", 60)),
+        Money("USD", 100),
+        "cfg",
+        kind="RESOLVE",
+        owner_id=old_owner,
+    )
+    assert store.reserve(request).admitted
+    store.register_lease(
+        Lease(
+            request.run_id,
+            request.dispatch_id,
+            old_owner,
+            2_000_000_000,
+            2_000_000_000,
+            now,
+            1,
+        )
+    )
+
+    journal = _typed_journal(
+        _journal(Store(state_dir=state)),
+        current,
+        "fix",
+        state,
+    )
+    adopted = _control_store(current, state, journal)
+    current_owner = _owner_identity(current, "fix")
+    assert adopted.leases(current_owner)[0].run_id == request.run_id
+    assert adopted.reclaim_dead_leases(
+        current_owner, lambda _pid, _start: False
+    ) == (request.run_id,)
+    assert adopted.release(request.run_id, "spend_unknown").disposition.value == (
+        "available"
+    )
+
+    next_request = replace(
+        request,
+        reservation_id=ReservationId("repoint-new-reservation"),
+        run_id=RunId("repoint-new-run"),
+        owner_id=current_owner,
+    )
+    assert adopted.reserve(next_request).admitted
 
 
 def test_hard_shutdown_reconciles_killed_rollout_before_releasing_capacity(
@@ -1522,10 +1683,13 @@ def _glm_daemon(tmp_path, settings_file: str):
     from issue_agent.app.config import from_env
     from issue_agent.app.roles import build_fix_daemon
 
-    cfg = from_env({
-        "REPO": "o/r", "FIX_BOT": FIX_BOT, "FIXER_RUNTIME": "glm",
-        "GLM_SETTINGS_FILE": settings_file, **_role_state_env(tmp_path),
-    })
+    cfg = replace(
+        from_env({
+            "REPO": "o/r", "FIX_BOT": FIX_BOT, "FIXER_RUNTIME": "glm",
+            "GLM_SETTINGS_FILE": settings_file, **_role_state_env(tmp_path),
+        }),
+        control_authority_root=str(tmp_path / "machine-state"),
+    )
     return build_fix_daemon(
         cfg, _BuildableGateway(), Store(str(tmp_path / "state")), FakeWorktrees(),
         FakeRunner(AgentResult(is_error=False)),
@@ -1655,11 +1819,14 @@ def _codex_daemon(tmp_path, **env):
     from issue_agent.app.config import from_env
     from issue_agent.app.roles import build_fix_daemon
 
-    cfg = from_env({
-        "REPO": "o/r", "FIX_BOT": FIX_BOT, "FIXER_RUNTIME": "codex",
-        **_role_state_env(tmp_path), "MAX_BUDGET_USD": "20",
-        "AGENT_MAX_RUNTIME_SECONDS": "3600", **env,
-    })
+    cfg = replace(
+        from_env({
+            "REPO": "o/r", "FIX_BOT": FIX_BOT, "FIXER_RUNTIME": "codex",
+            **_role_state_env(tmp_path), "MAX_BUDGET_USD": "20",
+            "AGENT_MAX_RUNTIME_SECONDS": "3600", **env,
+        }),
+        control_authority_root=str(tmp_path / "machine-state"),
+    )
     return build_fix_daemon(
         cfg, _BuildableGateway(), Store(str(tmp_path / "state")), FakeWorktrees(),
         FakeRunner(AgentResult(is_error=False)),
@@ -1698,12 +1865,15 @@ def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
             return ""
 
     monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
-    cfg = from_env({
-        "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEWER_RUNTIME": "codex",
-        "REVIEW_MODEL": "gpt-5.6-terra", "REVIEW_BUDGET_USD": "2.5",
-        **_role_state_env(tmp_path),
-        "TARGET_DIR": str(tmp_path),
-    })
+    cfg = replace(
+        from_env({
+            "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEWER_RUNTIME": "codex",
+            "REVIEW_MODEL": "gpt-5.6-terra", "REVIEW_BUDGET_USD": "2.5",
+            **_role_state_env(tmp_path),
+            "TARGET_DIR": str(tmp_path),
+        }),
+        control_authority_root=str(tmp_path / "machine-state"),
+    )
 
     daemon = build_review_daemon(
         cfg, _BuildableGateway(), Store(str(tmp_path / "review-state")),
@@ -1774,11 +1944,14 @@ def test_codex_reviewer_defers_hook_installation_until_dispatch(tmp_path, monkey
     monkeypatch.setattr(
         codex_hook, "write_hook_config", lambda *args, **kwargs: hook_calls.append((args, kwargs))
     )
-    cfg = from_env({
-        "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEWER_RUNTIME": "codex",
-        **_role_state_env(tmp_path),
-        "TARGET_DIR": str(tmp_path / "target"),
-    })
+    cfg = replace(
+        from_env({
+            "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEWER_RUNTIME": "codex",
+            **_role_state_env(tmp_path),
+            "TARGET_DIR": str(tmp_path / "target"),
+        }),
+        control_authority_root=str(tmp_path / "machine-state"),
+    )
 
     build_review_daemon(
         cfg, _BuildableGateway(), Store(str(tmp_path / "review-state")),
@@ -1803,12 +1976,15 @@ def test_codex_reviewer_names_its_unpriced_budget_warning(tmp_path, monkeypatch,
             return None
 
     monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
-    cfg = from_env({
-        "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEWER_RUNTIME": "codex",
-        **_role_state_env(tmp_path),
-        "REVIEW_BUDGET_USD": "2.5", "CODEX_COST_PER_MTOK_IN": "0",
-        "CODEX_COST_PER_MTOK_OUT": "0",
-    })
+    cfg = replace(
+        from_env({
+            "REPO": "o/r", "FIX_BOT": FIX_BOT, "REVIEWER_RUNTIME": "codex",
+            **_role_state_env(tmp_path),
+            "REVIEW_BUDGET_USD": "2.5", "CODEX_COST_PER_MTOK_IN": "0",
+            "CODEX_COST_PER_MTOK_OUT": "0",
+        }),
+        control_authority_root=str(tmp_path / "machine-state"),
+    )
 
     build_review_daemon(
         cfg, _BuildableGateway(), Store(str(tmp_path / "review-state")),

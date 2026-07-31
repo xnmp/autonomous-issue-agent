@@ -1,5 +1,6 @@
 """Config-from-env mapping."""
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -86,6 +87,8 @@ def test_every_operator_field_has_env_and_coercion_metadata():
     internal = {
         "arm_on_open_active",
         "agent_md",
+        "control_authority_root",
+        "repointed_from_deployments",
         "triage_prompt",
         "codex_cost_per_mtok_cached_in",
         "parse_errors",
@@ -130,6 +133,74 @@ def test_defaults():
     assert c.jira_project_key == ""
     assert c.jira_mcp_config == "config/mcp/atlassian.json"
     assert c.jira_mcp_tools == "mcp__atlassian__*"
+
+
+def test_custom_state_roots_keep_one_machine_accounting_authority(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "issue_agent.app.config.machine_control_authority_root",
+        lambda: "/machine/state",
+    )
+
+    first = from_env(
+        {
+            "REPO": "o/one",
+            "STATE_DIR": "/srv/one/fix",
+            "REVIEW_STATE_DIR": "/srv/one/review",
+            "STEWARD_STATE_DIR": "/srv/one/steward",
+        }
+    )
+    second = from_env(
+        {
+            "REPO": "o/two",
+            "STATE_DIR": "/var/lib/two/fix",
+            "REVIEW_STATE_DIR": "/var/lib/two/review",
+            "STEWARD_STATE_DIR": "/var/lib/two/steward",
+        }
+    )
+
+    assert first.control_authority_root == "/machine/state"
+    assert second.control_authority_root == "/machine/state"
+
+
+def test_explicit_repoint_history_is_normalized_and_deduplicated():
+    raw = json.dumps(
+        [
+            {"repository": "Acme/App", "target_dir": "/srv/app-old"},
+            {"repository": "acme/app", "target_dir": "/srv/app-old"},
+            {"repository": "acme/app", "target_dir": "/srv/app-older"},
+        ]
+    )
+
+    cfg = from_env({"REPO": "acme/app", "REPOINTED_FROM_DEPLOYMENTS": raw})
+
+    assert cfg.repointed_from_deployments == (
+        ("acme/app", "/srv/app-old"),
+        ("acme/app", "/srv/app-older"),
+    )
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        "not-json",
+        "{}",
+        '[{"repository":"o/r","target_dir":"relative"}]',
+        '[{"repository":"","target_dir":"/srv/old"}]',
+    ),
+)
+def test_malformed_repoint_history_fails_config_validation(raw):
+    cfg = from_env(
+        {
+            "REPO": "o/r",
+            "FIX_BOT": "fix-bot",
+            "REPOINTED_FROM_DEPLOYMENTS": raw,
+        }
+    )
+
+    with pytest.raises(ValueError, match="REPOINTED_FROM_DEPLOYMENTS"):
+        cfg.validate()
 
 
 def test_review_trigger_label_override():

@@ -125,6 +125,65 @@ def test_paid_run_has_reservation_before_runtime_and_settles(tmp_path) -> None:
     assert runtime.calls == 1
 
 
+def test_production_runtime_binds_paid_run_to_dispatch_claim(tmp_path) -> None:
+    runtime = Runtime(
+        AgentResult(
+            False,
+            status="ok",
+            cost_usd=1,
+            session_id="receipt",
+            usage={"input_tokens": 10, "output_tokens": 5},
+        )
+    )
+    wrapper, store = _wrapper(tmp_path, runtime)
+    wrapper = dataclasses.replace(
+        wrapper,
+        owner_id="o/r:fix:deployment",
+        require_dispatch_claim=True,
+    )
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
+    assert store.claim_dispatch(
+        "o/r",
+        "fix",
+        1,
+        "RESOLVE",
+        "o/r:fix:deployment",
+        frozenset({"src/a.py"}),
+    )
+
+    result = asyncio.run(
+        wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2))
+    )
+
+    assert result.status == "ok"
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM dispatch_claim_runs "
+            "WHERE repository='o/r' AND role='fix' AND target='issue:1'"
+        ).fetchone()[0] == 1
+
+
+def test_production_runtime_releases_admission_when_claim_is_missing(
+    tmp_path,
+) -> None:
+    runtime = Runtime(AgentResult(False, status="must-not-run"))
+    wrapper, store = _wrapper(tmp_path, runtime)
+    wrapper = dataclasses.replace(
+        wrapper,
+        owner_id="o/r:fix:deployment",
+        require_dispatch_claim=True,
+    )
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
+
+    result = asyncio.run(
+        wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2))
+    )
+
+    assert result.status == "dispatch_claim_unavailable"
+    assert runtime.calls == 0
+    assert store.active_reservation_runs() == ()
+
+
 def test_paid_run_carries_portable_ancestor_authority_bundle(
     tmp_path, monkeypatch
 ) -> None:
@@ -243,6 +302,72 @@ def test_issue_less_pr_repair_keeps_branch_bound_publication_authority(
     )
     assert authority["ISSUE_AGENT_PUBLICATION_ISSUE"] == "0"
     assert authority["ISSUE_AGENT_PUBLICATION_BRANCH"] == "fix/1-test"
+
+
+def test_issue_less_review_keeps_repository_and_global_caps(tmp_path) -> None:
+    runtime = Runtime(
+        AgentResult(
+            False,
+            status="reviewed",
+            cost_usd=1,
+            session_id="review-receipt",
+            usage={"input_tokens": 100, "output_tokens": 10},
+        )
+    )
+    store = SQLiteControlStore(str(tmp_path / "control.db"))
+    store.initialize()
+    wrapper = AccountingRuntime(
+        runtime,
+        store,
+        "o/r",
+        "review",
+        Money("USD", 5_000_000),
+        Money("USD", 10_000_000),
+        Money("USD", 25_000_000),
+        "cfg",
+        "claude",
+        BudgetPolicy({("review", "REVIEW"): Money("USD", 2_000_000)}),
+        _rates(),
+    )
+    wrapper.set_context("review", "REVIEW", 42, None)
+
+    result = asyncio.run(
+        wrapper.run(
+            RuntimePlan("review", model="gpt-test", max_budget_usd=2)
+        )
+    )
+
+    assert result.status == "reviewed"
+    assert runtime.calls == 1
+    with store._connect() as db:
+        scopes = {
+            tuple(row)
+            for row in db.execute(
+                "SELECT repository, dimension FROM budget_reservations "
+                "UNION ALL "
+                "SELECT repository, dimension FROM reservation_limits"
+            )
+        }
+    assert scopes == {("o/r", "repository"), ("*", "global")}
+
+
+def test_missing_issue_still_blocks_issue_scoped_fix_work(tmp_path) -> None:
+    runtime = Runtime(AgentResult(False, status="should-not-run"))
+    wrapper, _store = _wrapper(tmp_path, runtime)
+    wrapper = dataclasses.replace(
+        wrapper,
+        issue_cap=Money("USD", 25_000_000),
+    )
+    wrapper.set_context("fix", "RESOLVE", 1, None)
+
+    result = asyncio.run(
+        wrapper.run(RuntimePlan("work", max_budget_usd=2))
+    )
+
+    assert result.summary == (
+        "paid admission blocked: issue spend scope is unavailable"
+    )
+    assert runtime.calls == 0
 
 
 def test_resumed_session_uses_distinct_per_leg_settlement_receipts(

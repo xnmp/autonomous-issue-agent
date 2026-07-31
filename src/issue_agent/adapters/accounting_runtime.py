@@ -73,6 +73,7 @@ class AccountingRuntime(AgentRuntime):
     owner_id: str = ""
     github_host: str = "github.com"
     approved_base_branch: str = "dev"
+    require_dispatch_claim: bool = False
     _context: contextvars.ContextVar[tuple[int | None, str, int]] = field(
         default_factory=lambda: contextvars.ContextVar(
             f"accounting_context_{uuid.uuid4().hex}", default=(None, "", 0)
@@ -109,7 +110,12 @@ class AccountingRuntime(AgentRuntime):
             and self._caps_armed()
         ):
             return _blocked("codex pricing is unavailable")
-        if self.issue_cap is not None and issue is None:
+        issue_less_review = self.role == "review" and number > 0
+        if (
+            self.issue_cap is not None
+            and issue is None
+            and not issue_less_review
+        ):
             return _blocked("issue spend scope is unavailable")
         limits = list(self._limits(now, issue))
         primary, *additional = limits
@@ -195,6 +201,27 @@ class AccountingRuntime(AgentRuntime):
                     f"{reservation.disposition.value} ({reservation.detail})"
                 ),
                 exit_reason=ExitReason.BUDGET_EXHAUSTED,
+            )
+        if self.require_dispatch_claim and not self.store.bind_dispatch_claim(
+            self.repository,
+            self.role,
+            _breaker_key(kind or "", number, issue),
+            request.owner_id,
+            run_id,
+        ):
+            released = self.store.release(
+                run_id,
+                "dispatch_claim_binding_unavailable",
+            )
+            return AgentResult(
+                is_error=True,
+                status="dispatch_claim_unavailable",
+                envelope_subtype="dispatch_claim_unavailable",
+                summary=(
+                    "paid admission cancelled: its global target/path claim "
+                    f"could not be bound ({released.disposition.value})"
+                ),
+                exit_reason=ExitReason.AGENT_ERROR,
             )
         publication_owner = (
             self.owner_id or f"{self.repository}:{self.role}"

@@ -18,8 +18,11 @@ import os
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
-from ..journal import default_ledger_path, sum_today
+from ...domain.contracts import daily_budget_scope
+from ..control_path import canonical_control_store_path
+from ..control_store import read_settled_spend
 from .ghdata import TtlCache
 
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -351,12 +354,24 @@ def codex_usage(sessions_root: str | None = None) -> dict:
 
 
 # ── harness caps ──────────────────────────────────────────────────────────────
-def harness_usage(names, config_for, ledger_path: str | None = None, now_fn=None) -> dict:
-    """Today's ledgered spend against the configured caps, per deployment and
-    in total. Reuses the CLI's cap resolution (overlay wins over shared) so the
-    dashboard and `issue-agent status` cannot report different caps."""
-    ledger = ledger_path or default_ledger_path()
+def harness_usage(
+    names,
+    config_for,
+    control_db_path: str | None = None,
+    now_fn=None,
+) -> dict:
+    """Today's authoritative settled spend against each configured cap."""
+
     now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+    now = now_fn()
+    period = daily_budget_scope(
+        "*", "global", "USD", now, ZoneInfo("UTC")
+    )
+    spend = read_settled_spend(
+        control_db_path or canonical_control_store_path(),
+        period.period_start,
+        period.period_end,
+    )
     per_repo = []
     global_cap = 0.0
     for name in names:
@@ -365,14 +380,25 @@ def harness_usage(names, config_for, ledger_path: str | None = None, now_fn=None
             {
                 "name": name,
                 "repo": repo,
-                "today_usd": round(sum_today(ledger, now_fn, repo=repo or None), 4),
+                "today_usd": round(
+                    (
+                        spend.for_repository(repo).micros
+                        if repo
+                        else 0
+                    )
+                    / 1_000_000,
+                    4,
+                ),
                 "daily_cap_usd": daily_cap or None,
             }
         )
         global_cap = max(global_cap, configured_global_cap)
     return {
         "global_daily_cap_usd": global_cap or None,
-        "today_all_repos_usd": round(sum_today(ledger, now_fn), 4),
+        "today_all_repos_usd": round(
+            spend.total.micros / 1_000_000,
+            4,
+        ),
         "per_repo": per_repo,
     }
 

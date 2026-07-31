@@ -609,6 +609,53 @@ operator mistakes — recorded so they aren't re-diagnosed as bugs.
   pipes are drained. The existing silent-generation test is retained as the
   behavioral regression: a budget crossing must return in under two seconds.
 
+**113. Custom repository state roots split the machine-wide spend cap**
+- The SQLite path was derived from the common parent of one repository's fix,
+  review, and steward state directories. Default overlays happened to share
+  `~/.local/state`, but supported custom roots gave each repository a separate
+  database: two repositories could each admit against the full
+  `GLOBAL_DAILY_SPEND_CAP_USD`. FIXED 2026-07-31: every deployment owned by one
+  operating-system account now resolves the same canonical control database,
+  independently of repository state roots. A pre-existing deployment-local
+  database fails startup closed instead of being silently orphaned.
+
+**114. Default rogue-PR adoption was rejected by the default issue cap**
+- Review correctly adopted a directly opened PR with no closing issue, but
+  accounting treated its legitimate missing issue as an attribution failure
+  whenever `ISSUE_SPEND_CAP_USD` was armed (the default). The provider never
+  ran; retries eventually escalated an unreviewed PR. FIXED 2026-07-31:
+  genuinely issue-less review legs omit only the issue limit and retain atomic
+  repository/global reservations. Missing issue attribution for fix work still
+  fails closed.
+
+**115. Current SQLite charges were invisible in CLI/dashboard quota totals**
+- Paid admission and settlement had moved to SQLite, but `issue-agent status`
+  and `/api/usage` still summed the frozen legacy JSONL ledger. New spend
+  consumed caps while both operator surfaces reported `$0.00`. FIXED
+  2026-07-31: both surfaces read the current budget period's settled charges
+  from the canonical SQLite authority; the legacy ledger is migration input
+  only.
+
+**116. Supported checkout repoint stranded old ownership**
+- Deployment identity correctly included checkout path, but regenerating an
+  overlay for a new checkout changed the owner before recovery. Old
+  reservations, leases, commands, projections, and process receipts became
+  unreachable and could consume capacity forever. FIXED 2026-07-31:
+  `--write-config` records a bounded same-repository lineage; boot reaps and
+  adopts only those exact prior deployments. The lineage survives repeated
+  interrupted repoints, unrelated siblings remain isolated, and
+  cross-repository overlay reuse is refused.
+
+**117. A dead daemon released a dispatch claim while its paid child was alive**
+- Global target/path claims were keyed to the daemon PID. After an abrupt daemon
+  death, a sibling checkout saw that PID dead and acquired the same claim even
+  though the original supervised agent process still ran and could publish.
+  FIXED 2026-07-31 (schema v14): each admitted run is bound to its dispatch
+  claim before provider execution. A bound nonterminal run remains authoritative
+  until its owner recovers and terminalizes it, with daemon liveness probes
+  outside the SQLite write transaction and a full structural revalidation
+  before deletion.
+
 ---
 
 _Generated from transcript mining, 2026-07-21. ~103 distinct entries after
@@ -619,4 +666,5 @@ reviews (docs/REVIEW-2026-07-25-adversarial.md,
 docs/REVIEW-2026-07-26-p0-rereview.md) — the first three are new failure
 CLASSES, not instances; #110 is about the remediation process itself. #111
 added 2026-07-28 from the seventh tauri-explorer deployment. #112 added
-2026-07-30 during the architectural hardening full-suite gate._
+2026-07-30 during the architectural hardening full-suite gate. #113–#117 added
+2026-07-31 during the final release audits._

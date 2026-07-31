@@ -31,6 +31,7 @@ from ..adapters.store import Store
 from ..adapters.worktree import Worktrees, build_gate_context
 from ..domain.world import WorldState, fix_probe_safe
 from ..domain.supervision import ExitCode
+from ..domain.contracts import RunId
 from ..domain.repository import canonical_repository
 from .config import HarnessConfig, describe_command, from_env, render_agent_md
 from .roles import (
@@ -38,6 +39,7 @@ from .roles import (
     build_review_daemon,
     build_steward_daemon,
     migrate_legacy_spend,
+    prior_process_supervision_state_dirs,
     process_supervision_state_dir,
 )
 from .world_probe import WorldProbe
@@ -62,6 +64,29 @@ def _load_agent_env(env: dict) -> dict:
 
 def _ignore_log(_message: str) -> None:
     pass
+
+
+def _recover_supervised_processes(
+    cfg: HarnessConfig,
+    role: str,
+    state_dir: str,
+) -> tuple[RunId, ...]:
+    """Reap legacy, explicitly repointed, then current deployment registries."""
+
+    from ..adapters.process_supervisor import ProcessSupervisor
+
+    legacy = ProcessSupervisor(state_dir).recover_abandoned_orphans()
+    repointed = tuple(
+        run_id
+        for prior_state_dir in prior_process_supervision_state_dirs(
+            cfg, role, state_dir
+        )
+        for run_id in ProcessSupervisor(prior_state_dir).recover_orphans()
+    )
+    current = ProcessSupervisor(
+        process_supervision_state_dir(cfg, role, state_dir)
+    ).recover_orphans()
+    return (*legacy, *repointed, *current)
 
 
 def _validate_reload_candidate(env: dict[str, str]) -> None:
@@ -205,14 +230,7 @@ def build_role(role: str, env: dict | None = None):
     }[role]
     state_dir = runner_state_dir
     if state_dir:
-        from ..adapters.process_supervisor import ProcessSupervisor
-
-        legacy_recovered = ProcessSupervisor(
-            state_dir
-        ).recover_abandoned_orphans()
-        recovered = legacy_recovered + ProcessSupervisor(
-            process_supervision_state_dir(cfg, role, state_dir)
-        ).recover_orphans()
+        recovered = _recover_supervised_processes(cfg, role, state_dir)
         if recovered:
             sys.stderr.write(
                 f"{role}: recovered {len(recovered)} orphaned process group(s) "
