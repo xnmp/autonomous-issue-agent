@@ -352,8 +352,14 @@ Child agent processes receive an explicit environment allowlist plus the
 selected provider credential. Supported branch/PR publication goes through the
 durable broker, whose authority is recovered from the immutable supervised
 ancestor and matched to the live SQLite run/lease instead of trusted from
-child-controlled assignments. The authority is carried as a compact bundle so
-the same ancestor check works through `/proc` on Linux and `ps` on macOS; its
+child-controlled assignments. The registered process-group leader remains as
+an authority-carrier ancestor while the provider runs in its child; accounting,
+event, and publication variables are removed before the provider or target test
+starts. Advisory leg-role and durable-publication markers remain visible to the
+hook. The Codex hook receives the operator base branch as a quoted, hook-local
+value, so PR validation does not require exporting deployment configuration to
+target commands. The authority is carried as a compact bundle so the same
+ancestor check works through `/proc` on Linux and `ps` on macOS; its
 GitHub host is captured by the daemon, and both push remotes and `gh --repo`
 scope are pinned to that host rather than child-controlled `GH_HOST`.
 Publication credentials are nevertheless still

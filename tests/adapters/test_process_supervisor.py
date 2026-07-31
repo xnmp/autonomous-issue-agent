@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import signal
@@ -425,6 +426,186 @@ def test_supervised_paid_command_registers_the_sqlite_run_lease(tmp_path) -> Non
     assert store.leases() == ()
 
 
+def test_supervised_paid_command_carries_authority_outside_target_environment(
+    tmp_path,
+) -> None:
+    state_dir = tmp_path / "state"
+    supervisor = ProcessSupervisor(str(state_dir), grace_seconds=0.05)
+    store = SQLiteControlStore(str(tmp_path / "control.db"))
+    store.initialize()
+    run_id = RunId("authority-carrier")
+    request = _reserve_paid_run(store, run_id)
+    observed = tmp_path / "observed.json"
+    authority = {
+        "ISSUE_AGENT_BASE_BRANCH": "canary/live",
+        "ISSUE_AGENT_PUBLICATION_BRANCH": "fix/150-health",
+    }
+    bundle = base64.urlsafe_b64encode(
+        json.dumps(authority, separators=(",", ":")).encode()
+    ).decode()
+    program = (
+        "import json, os; "
+        "from pathlib import Path; "
+        "from issue_agent.adapters.agent_publish import _process_environment; "
+        f"Path({str(observed)!r}).write_text(json.dumps({{"
+        "'child': {k: os.environ.get(k) for k in ("
+        "'ISSUE_AGENT_AUTHORITY_BUNDLE', 'ISSUE_AGENT_CONTROL_DB', "
+        "'ISSUE_AGENT_RUN_ID', 'ISSUE_AGENT_OWNER_ID', "
+        "'ISSUE_AGENT_BASE_BRANCH', 'ISSUE_AGENT_EVENT_LOG', "
+        "'ISSUE_AGENT_DURABLE_PUBLISH', 'ISSUE_AGENT_LEG_ROLE')}, "
+        "'carrier': _process_environment(os.getppid())}))"
+    )
+    command = supervisor.supervised_command(
+        run_id,
+        (sys.executable, "-c", program),
+    )
+
+    completed = subprocess.run(
+        command,
+        start_new_session=True,
+        env={
+            **os.environ,
+            **supervisor.launch_guard_env(),
+            "ISSUE_AGENT_CONTROL_DB": store.path,
+            "ISSUE_AGENT_RUN_ID": str(run_id),
+            "ISSUE_AGENT_OWNER_ID": request.owner_id,
+            "ISSUE_AGENT_BASE_BRANCH": "canary/live",
+            "ISSUE_AGENT_EVENT_LOG": str(tmp_path / "events.jsonl"),
+            "ISSUE_AGENT_AUTHORITY_BUNDLE": bundle,
+            "ISSUE_AGENT_DURABLE_PUBLISH": "1",
+            "ISSUE_AGENT_LEG_ROLE": "fix",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    result = json.loads(observed.read_text())
+    assert result["child"] == {
+        "ISSUE_AGENT_AUTHORITY_BUNDLE": None,
+        "ISSUE_AGENT_CONTROL_DB": None,
+        "ISSUE_AGENT_RUN_ID": None,
+        "ISSUE_AGENT_OWNER_ID": None,
+        "ISSUE_AGENT_BASE_BRANCH": None,
+        "ISSUE_AGENT_EVENT_LOG": None,
+        "ISSUE_AGENT_DURABLE_PUBLISH": "1",
+        "ISSUE_AGENT_LEG_ROLE": "fix",
+    }
+    assert result["carrier"] == authority
+
+    supervisor.kill_tree(run_id)
+    store.release(run_id, "test complete")
+    assert store.leases() == ()
+
+
+def test_carrier_forwards_direct_termination_to_the_target_group(tmp_path) -> None:
+    supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
+    run_id = RunId("carrier-signal")
+    target_pid_file = tmp_path / "target.pid"
+    command = supervisor.supervised_command(
+        run_id,
+        (
+            sys.executable,
+            "-c",
+            (
+                "import os, signal, time; from pathlib import Path; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                f"Path({str(target_pid_file)!r}).write_text(str(os.getpid())); "
+                "time.sleep(30)"
+            ),
+        ),
+    )
+    process = subprocess.Popen(command, start_new_session=True)
+    deadline = time.monotonic() + 3
+    while not target_pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert target_pid_file.exists()
+    target_pid = int(target_pid_file.read_text())
+
+    try:
+        process.terminate()
+        _wait_dead(process)
+        deadline = time.monotonic() + 3
+        while (
+            ProcessSupervisor.process_identity(target_pid) is not None
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+
+        assert ProcessSupervisor.process_identity(target_pid) is None
+        assert process.returncode == -signal.SIGKILL
+    finally:
+        supervisor.kill_tree(run_id)
+
+
+def test_carrier_escalation_kills_descendants_forked_during_grace(
+    tmp_path,
+) -> None:
+    supervisor = ProcessSupervisor(str(tmp_path / "state"), grace_seconds=0.05)
+    run_id = RunId("carrier-fork-race")
+    target_pid_file = tmp_path / "targets.pid"
+    target = tmp_path / "resistant_target.py"
+    target.write_text(
+        "import os\n"
+        "import signal\n"
+        "import time\n"
+        "from pathlib import Path\n"
+        "triggered = False\n"
+        "def resist(_signum, _frame):\n"
+        "    global triggered\n"
+        "    triggered = True\n"
+        "signal.signal(signal.SIGTERM, resist)\n"
+        f"path = Path({str(target_pid_file)!r})\n"
+        "path.write_text(f'{os.getpid()}\\n')\n"
+        "while not triggered:\n"
+        "    time.sleep(0.01)\n"
+        "while True:\n"
+        "    child = os.fork()\n"
+        "    if child == 0:\n"
+        "        signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "        time.sleep(30)\n"
+        "        os._exit(0)\n"
+        "    with path.open('a') as stream:\n"
+        "        stream.write(f'{child}\\n')\n"
+        "    time.sleep(0.05)\n"
+    )
+    command = supervisor.supervised_command(
+        run_id,
+        (sys.executable, str(target)),
+    )
+    process = subprocess.Popen(command, start_new_session=True)
+    deadline = time.monotonic() + 3
+    while not target_pid_file.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert target_pid_file.exists()
+
+    try:
+        process.terminate()
+        _wait_dead(process)
+        target_pids = tuple(
+            int(line) for line in target_pid_file.read_text().splitlines()
+        )
+        deadline = time.monotonic() + 3
+        while (
+            any(
+                ProcessSupervisor.process_identity(pid) is not None
+                for pid in target_pids
+            )
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.02)
+
+        assert len(target_pids) > 2
+        assert process.returncode == -signal.SIGKILL
+        assert all(
+            ProcessSupervisor.process_identity(pid) is None
+            for pid in target_pids
+        )
+    finally:
+        supervisor.kill_tree(run_id)
+
+
 def test_supervised_paid_command_refuses_exec_after_launcher_death(
     tmp_path,
 ) -> None:
@@ -476,6 +657,8 @@ def test_supervised_sdk_cli_registers_session_before_target_executes(
         '[ -z "${ISSUE_AGENT_SUPERVISOR_RUN_ID:-}" ] || exit 8\n'
         '[ -z "${GH_TOKEN:-}" ] || exit 9\n'
         '[ "${TEST_CMD:-}" = "uv run pytest" ] || exit 10\n'
+        '[ -z "${ISSUE_AGENT_AUTHORITY_BUNDLE:-}" ] || exit 11\n'
+        '[ "${ISSUE_AGENT_DURABLE_PUBLISH:-}" = "1" ] || exit 12\n'
         f'echo started > "{marker}"\n'
         "sleep 30\n"
     )
@@ -490,7 +673,12 @@ def test_supervised_sdk_cli_registers_session_before_target_executes(
             **supervised_env,
             "GH_TOKEN": "must-not-reach-child",
             "TEST_CMD": "uv run pytest",
-            CHILD_ENV_MANIFEST: "TEST_CMD",
+            "ISSUE_AGENT_AUTHORITY_BUNDLE": "must-stay-in-carrier",
+            "ISSUE_AGENT_DURABLE_PUBLISH": "1",
+            CHILD_ENV_MANIFEST: (
+                "TEST_CMD ISSUE_AGENT_AUTHORITY_BUNDLE "
+                "ISSUE_AGENT_DURABLE_PUBLISH"
+            ),
         },
     )
     deadline = time.monotonic() + 3

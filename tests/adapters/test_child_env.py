@@ -1,4 +1,7 @@
-from issue_agent.adapters.child_env import child_process_env
+from issue_agent.adapters.child_env import (
+    child_process_env,
+    without_supervisor_authority,
+)
 
 
 def test_child_environment_is_allowlisted_and_has_no_publication_credentials():
@@ -32,3 +35,24 @@ def test_provider_specific_auth_key_can_be_admitted_explicitly():
     )
 
     assert selected == {"CUSTOM_PROVIDER_KEY": "secret"}
+
+
+def test_paid_child_keeps_advisory_markers_without_control_authority():
+    selected = without_supervisor_authority(
+        {
+            "PATH": "/bin",
+            "ISSUE_AGENT_AUTHORITY_BUNDLE": "authority",
+            "ISSUE_AGENT_CONTROL_DB": "/state/control.db",
+            "ISSUE_AGENT_RUN_ID": "run-1",
+            "ISSUE_AGENT_OWNER_ID": "owner-1",
+            "ISSUE_AGENT_BASE_BRANCH": "dev",
+            "ISSUE_AGENT_DURABLE_PUBLISH": "1",
+            "ISSUE_AGENT_LEG_ROLE": "fix",
+        }
+    )
+
+    assert selected == {
+        "PATH": "/bin",
+        "ISSUE_AGENT_DURABLE_PUBLISH": "1",
+        "ISSUE_AGENT_LEG_ROLE": "fix",
+    }

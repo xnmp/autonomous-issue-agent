@@ -746,6 +746,12 @@ class ProcessSupervisor:
         )
 
     @classmethod
+    def live_group_identities(cls, pgid: int) -> tuple[ProcessIdentity, ...]:
+        """Return reuse-safe identities for every live member of a group."""
+
+        return cls._group_identities(pgid)
+
+    @classmethod
     def process_identity(cls, pid: int) -> ProcessIdentity | None:
         """Return the reuse-safe identity for a currently live process."""
 

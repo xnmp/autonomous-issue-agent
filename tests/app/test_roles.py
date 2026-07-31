@@ -1925,6 +1925,26 @@ def test_codex_fixer_declares_its_role_so_a_review_hook_cannot_cage_it(tmp_path,
     assert seen["env"]["ISSUE_AGENT_LEG_ROLE"] == "fix"
 
 
+def test_codex_fixer_composes_operator_base_into_gate_local_hook(tmp_path):
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    daemon = _codex_daemon(
+        tmp_path,
+        BASE_BRANCH="canary/dashboard-e2e",
+    )
+    dispatcher = daemon.executor._run_agent._dispatch.__self__
+
+    prepare_cwd = dispatcher.fix_workflow.prepare_cwd
+    assert prepare_cwd is not None
+    prepare_cwd(str(worktree))
+
+    scripts = tuple(
+        (tmp_path / "state" / "codex-hooks").glob("*/hooks/gov.sh")
+    )
+    assert len(scripts) == 1
+    assert "export BASE_BRANCH=canary/dashboard-e2e" in scripts[0].read_text()
+
+
 def test_codex_reviewer_defers_hook_installation_until_dispatch(tmp_path, monkeypatch):
     """Building a daemon must not mutate a fixer worktree's Codex hook."""
     from issue_agent.adapters import codex_hook, codex_runner

@@ -21,7 +21,11 @@ This is the deployment truth, not a security claim inferred from hooks.
 All paid runtimes receive the durable `issue-agent-publish` command. Raw
 `git push` and `gh pr create` are denied on the supported hook paths; the broker
 records `PUBLISH_BRANCH`/`OPEN_PULL_REQUEST` commands and trusted receipts and
-reconciles executing/unknown commands on boot. Because the model still runs as
+reconciles executing/unknown commands on boot. A registered supervisor ancestor
+retains the compact authority bundle while provider and target-command
+environments omit accounting, event, and publication authority. The Codex
+pre-tool gate receives its base branch only inside the generated hook process.
+Because the model still runs as
 the daemon's OS account, filesystem or local-socket access may recover
 publication authority despite environment scrubbing. Bypassing the advisory
 hook is therefore still possible and keeps every runtime in the trusted-inbound

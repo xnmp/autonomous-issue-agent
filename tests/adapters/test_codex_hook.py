@@ -1,6 +1,7 @@
 import asyncio
 import os
 import stat
+import subprocess
 import tomllib
 
 from issue_agent.adapters.codex_hook import (
@@ -41,6 +42,37 @@ def test_generated_governor_fails_closed_without_uv(tmp_path) -> None:
     assert "uv not found; refusing" in text
     assert "exit 2" in text
     assert os.stat(script).st_mode & stat.S_IXUSR
+
+
+def test_generated_governor_receives_operator_base_without_exporting_to_agent(
+    tmp_path,
+) -> None:
+    worktree = tmp_path / "worktree"
+    state = tmp_path / "state"
+    binaries = tmp_path / "bin"
+    worktree.mkdir()
+    binaries.mkdir()
+    uv = binaries / "uv"
+    uv.write_text("#!/bin/sh\nprintf '%s' \"${BASE_BRANCH:-missing}\"\n")
+    uv.chmod(0o755)
+    config = write_hook_config(
+        str(worktree),
+        state_dir=str(state),
+        base_branch="canary/dashboard-e2e",
+    )
+    script = os.path.join(os.path.dirname(config), "hooks", "gov.sh")
+
+    completed = subprocess.run(
+        [script],
+        input="{}",
+        text=True,
+        capture_output=True,
+        env={"PATH": f"{binaries}:/usr/bin:/bin"},
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stdout == "canary/dashboard-e2e"
 
 
 def test_edit_check_delegates_to_the_shared_guarded_wrapper(tmp_path) -> None:

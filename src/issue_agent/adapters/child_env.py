@@ -63,6 +63,29 @@ _PUBLICATION_CREDENTIAL_KEYS = frozenset(
     }
 )
 
+# The supervised launcher retains every ISSUE_AGENT_* control-plane value.
+# Provider processes receive only the two advisory markers their governor must
+# evaluate.  An allowlist makes future authority keys scrubbed by default.
+AGENT_VISIBLE_ISSUE_AGENT_KEYS = frozenset(
+    {
+        "ISSUE_AGENT_DURABLE_PUBLISH",
+        "ISSUE_AGENT_LEG_ROLE",
+    }
+)
+
+
+def without_supervisor_authority(environment: Mapping[str, str]) -> dict[str, str]:
+    """Remove control-plane authority from a paid provider's environment."""
+
+    return {
+        key: value
+        for key, value in environment.items()
+        if (
+            not key.startswith("ISSUE_AGENT_")
+            or key in AGENT_VISIBLE_ISSUE_AGENT_KEYS
+        )
+    }
+
 
 def child_process_env(
     inherited: Mapping[str, str],

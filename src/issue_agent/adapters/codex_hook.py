@@ -20,6 +20,7 @@ import stat
 import json
 import hashlib
 import secrets
+import shlex
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -71,7 +72,13 @@ def _without_generated_instructions(content: str) -> str:
 def _gov_script(
     governor_path: str,
     review_only: bool = False,
+    base_branch: str = "",
 ) -> str:
+    gate_base = (
+        f"export BASE_BRANCH={shlex.quote(base_branch)}"
+        if base_branch
+        else ""
+    )
     return f"""#!/usr/bin/env bash
 # Codex PreToolUse hook → harness governor (auto-generated; do not edit).
 if ! command -v uv >/dev/null 2>&1; then
@@ -79,6 +86,8 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 2
 fi
 {('export ISSUE_AGENT_REVIEW_READ_ONLY=1' if review_only else '')}
+# Gate-local operator authority: target commands never inherit BASE_BRANCH.
+{gate_base}
 # Codex PostToolUse executes inside the paid child and cannot mint trusted
 # visual evidence. Remove an ambient/exported path on every governed command.
 unset HARNESS_SCREENSHOTS_READ
@@ -165,6 +174,7 @@ def write_hook_config(
     cwd: str, governor_path: str = GOVERNOR_PATH, agents_md: str = "",
     edit_check_cmd: str = "",
     review_only: bool = False,
+    base_branch: str = "",
     log: Callable[[str], None] | None = None,
     state_dir: str = "",
     auth_file: str = "",
@@ -188,7 +198,7 @@ def write_hook_config(
 
     gov_script_path = os.path.join(hooks_dir, "gov.sh")
     with open(gov_script_path, "w") as f:
-        f.write(_gov_script(governor_path, review_only))
+        f.write(_gov_script(governor_path, review_only, base_branch))
     os.chmod(
         gov_script_path,
         os.stat(gov_script_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH,

@@ -118,6 +118,23 @@ def test_render_agent_md_expands_and_strips():
     assert "$ISSUE_NUMBER" in out  # left literal — agent fills it per-issue
 
 
+def test_rendered_agent_contract_names_the_configured_non_default_base():
+    cfg = HarnessConfig(
+        repo="o/harness",
+        base_branch="canary/dashboard-e2e",
+    )
+    template = (
+        Path(__file__).parents[2] / "plugin" / "AGENT.md"
+    ).read_text()
+
+    rendered = render_agent_md(template, cfg)
+
+    assert "running headless on the `canary/dashboard-e2e` branch" in rendered
+    assert "running headless on the `dev` branch" not in rendered
+    assert "do NOT call `gh issue create`" in rendered
+    assert "file an issue on" not in rendered
+
+
 def test_defaults():
     c = from_env({"REPO": "o/r"})
     assert c.repo == "o/r"

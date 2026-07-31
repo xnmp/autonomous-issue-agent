@@ -1100,6 +1100,7 @@ def _bind_codex_fix_runtime(
     prepare_cwd = partial(
         write_hook_config,
         agents_md=cfg.agent_md,
+        base_branch=cfg.base_branch,
         edit_check_cmd=cfg.edit_check_cmd,
         log=log,
         state_dir=cfg.state_dir,
@@ -1237,6 +1238,7 @@ def _bind_codex_review_runtime(
     prepare_cwd = partial(
         write_hook_config,
         review_only=True,
+        base_branch=cfg.base_branch,
         log=log,
         state_dir=cfg.review_state_dir,
         auth_file=runner.oauth_auth_file(),
