@@ -1,13 +1,27 @@
 import json
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from issue_agent.adapters.event_log import EventLog
+from issue_agent.adapters.control_store import (
+    ReservationRequest,
+    SettlementRequest,
+    SQLiteControlStore,
+)
 from issue_agent.app.dashboard import collect, render_html, render_text
 from issue_agent.app.dashweb import service, snapshots
 from issue_agent.adapters.dashweb import system
 from issue_agent.domain.dashboard import Snapshot
+from issue_agent.domain.contracts import (
+    BudgetScope,
+    Money,
+    PriceQuote,
+    PricingBasis,
+    ReservationId,
+    RunId,
+)
 from issue_agent.domain.events import (
     AgentRunCompleted,
     AgentRunStarted,
@@ -147,8 +161,99 @@ def test_collect_counts_reconciled_spend_without_a_completion_event(
     assert deployment.metrics.total_cost_usd == 0.7
 
 
+def test_production_dashboard_today_spend_comes_from_sqlite_not_telemetry(
+    tmp_path,
+) -> None:
+    start = NOW.replace(hour=0, minute=0, second=0, microsecond=0)
+    store = SQLiteControlStore(
+        str(tmp_path / "control.db"), now=lambda: NOW
+    )
+    store.initialize()
+    run_id = RunId("settled-with-dropped-telemetry")
+    scope = BudgetScope(
+        "owner/repo",
+        "daily",
+        "USD",
+        start.date().isoformat(),
+        start,
+        start + timedelta(days=1),
+        ZoneInfo("UTC"),
+    )
+    store.reserve(
+        ReservationRequest(
+            ReservationId("reservation"),
+            run_id,
+            "dispatch",
+            scope,
+            PriceQuote(
+                "gpt-test", "card", "v1", NOW, Money("USD", 1_000_000)
+            ),
+            Money("USD", 10_000_000),
+            "cfg",
+        )
+    )
+    store.settle(
+        SettlementRequest(
+            run_id,
+            Money("USD", 700_000),
+            PricingBasis.CONFIGURED_RATE_CARD,
+            "provider-receipt",
+            None,
+            "card",
+            "v1",
+        )
+    )
+    state = tmp_path / "fix"
+    state.mkdir()
+    EventLog(
+        str(state / "events-v2.jsonl"),
+        Producer("deployment", "owner/repo", "fix", 100, "boot"),
+    ).emit(
+        WorldObserved(
+            "issue",
+            7,
+            "present",
+            {"present": True, "state": "open", "labels": ["ai-ready"]},
+        ),
+        correlation=Correlation(issue=7),
+        causation_time=NOW,
+    )
+    journal_paths = [
+        str(state / "journal.jsonl"),
+        str(tmp_path / "review" / "journal.jsonl"),
+        str(tmp_path / "steward" / "journal.jsonl"),
+    ]
+
+    deployment = collect(
+        "demo",
+        "owner/repo",
+        journal_paths,
+        str(tmp_path / "logs"),
+        str(tmp_path / "spend.jsonl"),
+        now_fn=lambda: NOW,
+        control_db_path=store.path,
+    )
+    snapshot = system.collect_snapshot(
+        name="demo",
+        repo="owner/repo",
+        target_dir=str(tmp_path),
+        journal_paths=journal_paths,
+        log_dir=str(tmp_path / "logs"),
+        ledger_path=str(tmp_path / "spend.jsonl"),
+        now_fn=lambda: NOW,
+        stale_after_s=60,
+        control_db_path=store.path,
+    )
+
+    assert deployment.metrics.today_usd == 0.7
+    assert snapshot.deployment.metrics.today_usd == 0.7
+    assert "today (settled SQLite, this repo): $0.70" in render_text(
+        [deployment], now_fn=lambda: NOW
+    )
+
+
 @pytest.mark.parametrize("retirement", ["tombstone", "feed"])
-def test_v2_dashboard_excludes_issues_absent_from_the_current_world(
+def test_v2_dashboard_hides_unfinished_issues_absent_from_current_world(
     tmp_path,
     retirement,
 ) -> None:
@@ -203,6 +308,74 @@ def test_v2_dashboard_excludes_issues_absent_from_the_current_world(
 
     assert deployment.issues == ()
     assert deployment.metrics.in_flight_issues == 0
+
+
+def test_v2_dashboard_preserves_tombstoned_done_metrics_and_spend(
+    tmp_path,
+) -> None:
+    state = tmp_path / "fix"
+    state.mkdir()
+    events = EventLog(
+        str(state / "events-v2.jsonl"),
+        Producer("deployment", "owner/repo", "fix", 100, "boot"),
+    )
+    events.emit(
+        WorldObserved(
+            "issue",
+            7,
+            "done",
+            {
+                "present": True,
+                "state": "closed",
+                "labels": ["ai-done"],
+            },
+        ),
+        correlation=Correlation(issue=7),
+        causation_time=NOW,
+    )
+    events.emit(
+        SpendRecorded(
+            "settled-run",
+            700_000,
+            "USD",
+            "configured_rate_card",
+            "card",
+            "v1",
+        ),
+        correlation=Correlation(issue=7, run_id="settled-run"),
+        causation_time=NOW,
+    )
+    events.emit(
+        WorldObserved(
+            "issue",
+            7,
+            "absent",
+            {"present": False, "reason": "absent_from_feed"},
+        ),
+        correlation=Correlation(issue=7),
+        causation_time=NOW,
+    )
+
+    deployment = collect(
+        "demo",
+        "owner/repo",
+        (
+            str(state / "journal.jsonl"),
+            str(tmp_path / "review" / "journal.jsonl"),
+            str(tmp_path / "steward" / "journal.jsonl"),
+        ),
+        str(tmp_path / "logs"),
+        str(tmp_path / "spend.jsonl"),
+        now_fn=lambda: NOW,
+    )
+
+    assert tuple(row.issue for row in deployment.issues) == (7,)
+    assert deployment.issues[0].done is True
+    assert deployment.issues[0].lane == "done"
+    assert deployment.issues[0].cost_usd == 0.7
+    assert deployment.metrics.done_issues == 1
+    assert deployment.metrics.total_cost_usd == 0.7
+    assert deployment.metrics.cost_per_done_usd == 0.7
 
 
 def test_v2_dashboard_places_current_unowned_open_issue_in_backlog(
@@ -489,6 +662,56 @@ def test_fresh_deployment_without_event_file_is_defined_as_empty_v2(
     assert deployment.issues == ()
     assert deployment.warnings == ()
     assert all(item.stale for item in deployment.health)
+
+
+def test_legacy_only_upgrade_history_remains_readable_on_both_surfaces(
+    tmp_path,
+) -> None:
+    state = tmp_path / "fix"
+    state.mkdir()
+    legacy = state / "journal.jsonl"
+    legacy.write_text(
+        json.dumps(
+            {
+                "ts": NOW.isoformat(),
+                "event": "action",
+                "desc": "relabel issue #7: +ai-done",
+            }
+        )
+        + "\n"
+    )
+    journal_paths = [
+        str(legacy),
+        str(tmp_path / "review" / "journal.jsonl"),
+        str(tmp_path / "steward" / "journal.jsonl"),
+    ]
+
+    deployment = collect(
+        "demo",
+        "owner/repo",
+        journal_paths,
+        str(tmp_path / "logs"),
+        str(tmp_path / "spend.jsonl"),
+        now_fn=lambda: NOW,
+    )
+    snapshot = system.collect_snapshot(
+        name="demo",
+        repo="owner/repo",
+        target_dir=str(tmp_path),
+        journal_paths=journal_paths,
+        log_dir=str(tmp_path / "logs"),
+        ledger_path=str(tmp_path / "spend.jsonl"),
+        now_fn=lambda: NOW,
+        stale_after_s=60,
+    )
+
+    for observed in (deployment, snapshot.deployment):
+        assert observed.schema_version == 1
+        assert tuple(row.issue for row in observed.issues) == (7,)
+        assert observed.issues[0].done is True
+        assert observed.warnings == (
+            "showing read-only schema-v1 dashboard history",
+        )
 
 
 def test_v2_health_rejects_stopped_heartbeat_and_terminal_state(

@@ -40,6 +40,7 @@ _ROTATION_SUFFIX = re.compile(
 class EventReadResult:
     events: tuple[EventEnvelope, ...]
     malformed_lines: int = 0
+    source_files: int = 0
 
 
 def read_event_log(path: str) -> EventReadResult:
@@ -76,7 +77,7 @@ def read_event_log(path: str) -> EventReadResult:
                 events.append(decode_event(raw))
             except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                 malformed += 1
-    return EventReadResult(tuple(events), malformed)
+    return EventReadResult(tuple(events), malformed, len(candidates))
 
 
 @dataclass

@@ -1424,6 +1424,7 @@ def cmd_dashboard(args) -> int:
     and `| less` all want those) and take precedence over --serve.
     """
     from ..adapters.journal import default_ledger_path
+    from ..adapters.control_path import canonical_control_store_path
     from . import dashboard as dash
 
     names = list(args.names) or list(dash.deployment_names(REPOS_DIR))
@@ -1443,6 +1444,7 @@ def cmd_dashboard(args) -> int:
                 logs,
                 ledger,
                 stale_after_s=args.stale_minutes * 60.0,
+                control_db_path=canonical_control_store_path(),
             )
             for name in names
         ]

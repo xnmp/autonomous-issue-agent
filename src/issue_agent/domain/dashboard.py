@@ -301,6 +301,7 @@ def build_deployment_v2(
     stale_after_s: float = STALE_AFTER_S,
     heartbeat_times: Mapping[str, datetime] | None = None,
     warnings: tuple[str, ...] = (),
+    settled_today_usd: float | None = None,
 ) -> Deployment:
     """Build the dashboard exclusively from the canonical schema-v2 fold.
 
@@ -325,21 +326,16 @@ def build_deployment_v2(
         for role, path, log, events in feed_rows
     )
     pr_issue = _v2_pr_issue(model)
-    current_issues = {
-        number
-        for (kind, number), facts in model.world_facts.items()
-        if kind == "issue" and facts.get("present") is True
-    }
     grouped: dict[int, list[EventEnvelope]] = {}
     unattributed_events: list[EventEnvelope] = []
     for event in model.events:
         issue = _v2_event_issue(event, pr_issue)
         if issue is None:
             unattributed_events.append(event)
-        elif issue in current_issues:
+        else:
             grouped.setdefault(issue, []).append(event)
 
-    rows = tuple(
+    historical_rows = tuple(
         sorted(
             (
                 _v2_issue_row(issue, events, model, pr_issue)
@@ -349,12 +345,21 @@ def build_deployment_v2(
             reverse=True,
         )
     )
+    rows = tuple(
+        row
+        for row in historical_rows
+        if row.facts.get("present") is True or row.done
+    )
     today = now.astimezone(timezone.utc).date()
-    today_usd = sum(
-        payload.amount_micros / 1_000_000
-        for event in model.events
-        if event.occurred_at.astimezone(timezone.utc).date() == today
-        and isinstance((payload := event.payload), SpendRecorded)
+    today_usd = (
+        settled_today_usd
+        if settled_today_usd is not None
+        else sum(
+            payload.amount_micros / 1_000_000
+            for event in model.events
+            if event.occurred_at.astimezone(timezone.utc).date() == today
+            and isinstance((payload := event.payload), SpendRecorded)
+        )
     )
     unattributed = tuple(encode_event(event) for event in unattributed_events)
     return Deployment(
@@ -362,7 +367,7 @@ def build_deployment_v2(
         repo=repo,
         health=health,
         issues=rows,
-        metrics=build_metrics(rows, unattributed, today_usd),
+        metrics=build_metrics(historical_rows, unattributed, today_usd),
         unattributed=unattributed,
         schema_version=2,
         warnings=warnings,
@@ -501,7 +506,7 @@ def _v2_issue_row(
     running.sort(
         key=lambda leg: leg.ts or datetime.min.replace(tzinfo=timezone.utc)
     )
-    facts = model.world_facts.get(("issue", issue), {})
+    facts = _v2_issue_facts(issue, ordered, model)
     labels_raw = facts.get("labels", ())
     labels = (
         {str(label) for label in labels_raw}
@@ -572,6 +577,31 @@ def _v2_issue_row(
         facts=facts,
         lane=lane,
     )
+
+
+def _v2_issue_facts(
+    issue: int,
+    ordered: list[EventEnvelope],
+    model: ReadModel,
+) -> dict[str, JsonValue]:
+    """Keep terminal facts for history after the live world tombstones a row."""
+
+    current = dict(model.world_facts.get(("issue", issue), {}))
+    if current.get("present") is True:
+        return current
+    historical: dict[str, JsonValue] = {}
+    for event in ordered:
+        payload = event.payload
+        if (
+            isinstance(payload, WorldObserved)
+            and payload.subject_kind == "issue"
+            and payload.subject_number == issue
+            and payload.facts.get("present") is not False
+        ):
+            historical.update(payload.facts)
+    historical.update(current)
+    historical["present"] = False
+    return historical
 
 
 def _dashboard_event_view(
@@ -677,6 +707,8 @@ def _v2_lane(
 ) -> str:
     if done:
         return "done"
+    if facts.get("present") is False:
+        return "historical"
     if (
         "ai-ready" in labels
         and labels.isdisjoint({"ai-blocked", "needs-human-review"})
@@ -1075,6 +1107,8 @@ def build_deployment(
     ledger_events=(),
     now_fn=None,
     stale_after_s: float = STALE_AFTER_S,
+    warnings: tuple[str, ...] = (),
+    settled_today_usd: float | None = None,
 ) -> Deployment:
     """Assemble one deployment's report. Pure: `feeds` is
     `(role, journal_path, log_path, events)` tuples already read off disk.
@@ -1098,12 +1132,16 @@ def build_deployment(
     pr_issue = pr_issue_map(merged)
     unattributed = tuple(e for e in merged if event_issue(e, pr_issue) is None)
     today = _stamp_date(now)
-    today_usd = sum(
-        _float(e.get("cost_usd"))
-        for e in ledger_events
-        if e.get("event") == "spend"
-        and str(e.get("ts", ""))[:10] == today
-        and (not repo or e.get("repo") == repo)
+    today_usd = (
+        settled_today_usd
+        if settled_today_usd is not None
+        else sum(
+            _float(e.get("cost_usd"))
+            for e in ledger_events
+            if e.get("event") == "spend"
+            and str(e.get("ts", ""))[:10] == today
+            and (not repo or e.get("repo") == repo)
+        )
     )
     return Deployment(
         name=name,
@@ -1112,6 +1150,7 @@ def build_deployment(
         issues=rows,
         metrics=build_metrics(rows, unattributed, today_usd),
         unattributed=unattributed,
+        warnings=warnings,
     )
 
 

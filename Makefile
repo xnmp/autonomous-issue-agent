@@ -104,7 +104,7 @@ typecheck:
 	@uv run pyrefly check
 	@echo "== typecheck (pyrefly: required port conformance) =="
 	@uv run pyrefly check tests/typecheck/port_conformance.py \
-		--error bad-argument-type,bad-assignment,missing-attribute \
+		--error bad-return,bad-argument-type,bad-assignment,missing-attribute \
 		--progress-bar no
 
 doctor:

@@ -504,7 +504,10 @@ class Daemon:
                 self.journal.emit(TelemetryEvent(TickGated(reason)))
         return True
 
-    def tick(self) -> list[Action]:
+    def tick(
+        self,
+        scheduler_progress: Callable[[], None] | None = None,
+    ) -> list[Action]:
         """One observe→decide→execute pass. Returns the actions taken (for tests
         / logging). Never raises out: a failed pass logs and yields [] so the
         daemon loop continues (the bash `poll_once || log` contract).
@@ -525,9 +528,13 @@ class Daemon:
                 "skipping observe/dispatch this tick"
             )
             return []
+        if scheduler_progress is not None:
+            scheduler_progress()
         paid_blocked = self._gate_blocks_this_tick()
         try:
             world = self.observe()
+            if scheduler_progress is not None:
+                scheduler_progress()
             actions = self.decide(world)
         except WorldUnchanged:
             # The probe proved this tick would observe the world the last full
@@ -616,6 +623,9 @@ class Daemon:
                     # ownership, so its finally cannot release decision leases.
                     self._release_rejected_dispatch(action)
                 self.log(f"{self.name}: action {action!r} failed: {exc}")
+            finally:
+                if scheduler_progress is not None:
+                    scheduler_progress()
         return taken
 
     def run_forever(
@@ -704,7 +714,7 @@ class Daemon:
                 elif cur - last_logged >= heartbeat_seconds:
                     self.log(f"{self.name}: ♥ alive (poll {self.poll_seconds}s)")
                     last_logged = cur
-                self.tick()
+                self.tick(scheduler_progress)
                 self._write_heartbeat()
                 if scheduler_progress is not None:
                     scheduler_progress()

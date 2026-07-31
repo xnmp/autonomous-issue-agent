@@ -22,6 +22,7 @@ import os
 
 from ...adapters.dashweb import actions, costchart
 from ...adapters.dashweb.bundle import bundle_snapshot, published_dist
+from ...adapters.control_path import canonical_control_store_path
 from .. import cli
 from . import contracts
 from .ports import DashboardBackend
@@ -73,7 +74,10 @@ def create_app(
     from fastapi.responses import HTMLResponse, JSONResponse, Response
     from starlette.concurrency import run_in_threadpool
 
-    backend = backend or Backend(harness_root=harness_root)
+    backend = backend or Backend(
+        harness_root=harness_root,
+        control_db_path=canonical_control_store_path(),
+    )
     should_offload = isinstance(backend, Backend) if offload_backend is None else offload_backend
     root = harness_root or getattr(backend, "harness_root", cli.HARNESS_ROOT)
     assets = bundle_snapshot(root, pin=True)

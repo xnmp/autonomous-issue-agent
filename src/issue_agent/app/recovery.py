@@ -109,12 +109,14 @@ class RecoveryCoordinator:
         for run_id in candidates:
             if run_id not in reclaimed and run_id in live_runs:
                 continue
-            abandoned.add(run_id)
             if self.spend.reconcile(run_id):
                 continue
-            result = self.control.release(run_id, "spend_unknown")
+            result = self.control.release_unlaunched(
+                run_id, "unlaunched_reservation"
+            )
             if result.disposition.value == "available":
                 unknown.append(run_id)
+                abandoned.add(run_id)
         for run_id in sorted(abandoned):
             try:
                 self.abandonments.abandon_run(

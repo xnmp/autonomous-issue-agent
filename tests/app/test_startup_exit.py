@@ -85,3 +85,68 @@ def test_second_sigterm_escalates_to_transient_hard_exit():
 
     assert first.value.code is ExitCode.CLEAN
     assert exits == [int(ExitCode.TRANSIENT)]
+
+
+@pytest.mark.parametrize("failure_seam", ("max_ticks", "reload_watch"))
+def test_systemd_ready_is_withheld_until_synchronous_startup_succeeds(
+    tmp_path,
+    monkeypatch,
+    failure_seam,
+):
+    env_file = tmp_path / "agent.env"
+    env_file.write_text('REPO="o/r"\n')
+    monkeypatch.setenv("AGENT_ENV", str(env_file))
+    monkeypatch.setenv("HOT_RELOAD", "1")
+    monkeypatch.setattr(
+        main_module, "acquire", lambda *_args, **_kwargs: object()
+    )
+
+    class Daemon:
+        requires_hard_exit = False
+
+        def run_forever(self, **_kwargs):
+            raise AssertionError("startup failure entered the daemon loop")
+
+    class Config:
+        state_dir = str(tmp_path / "fix")
+        review_state_dir = str(tmp_path / "review")
+        steward_state_dir = str(tmp_path / "steward")
+
+        def validate(self):
+            return None
+
+    notifications = []
+
+    class Notifier:
+        def __init__(self, _env):
+            pass
+
+        def ready(self, status):
+            notifications.append(status)
+
+    monkeypatch.setattr(main_module, "build_role", lambda *_args: Daemon())
+    monkeypatch.setattr(main_module, "from_env", lambda _env: Config())
+    monkeypatch.setattr(
+        main_module, "migrate_legacy_spend", lambda *_args: 0
+    )
+    monkeypatch.setattr(main_module, "SystemdNotifier", Notifier)
+    if failure_seam == "max_ticks":
+        monkeypatch.setenv("ISSUE_AGENT_MAX_TICKS", "not-an-integer")
+        expected = SystemExit
+    else:
+        monkeypatch.delenv("ISSUE_AGENT_MAX_TICKS", raising=False)
+
+        class BrokenReloadWatch:
+            def __init__(self, *_args, **_kwargs):
+                raise RuntimeError("reload watch initialization failed")
+
+        monkeypatch.setattr(
+            "issue_agent.adapters.reload.ReloadWatch",
+            BrokenReloadWatch,
+        )
+        expected = RuntimeError
+
+    with pytest.raises(expected):
+        main_module.main(["fix"])
+
+    assert notifications == []

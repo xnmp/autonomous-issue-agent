@@ -724,7 +724,7 @@ def test_scheduler_progress_covers_tick_and_quiet_wait():
     progress = []
 
     def observe():
-        assert progress == []
+        assert progress == ["completed"]
         return WorldState()
 
     d, _ = _daemon(lambda _world: [], observe=observe)
@@ -735,7 +735,7 @@ def test_scheduler_progress_covers_tick_and_quiet_wait():
         scheduler_progress=lambda: progress.append("completed"),
     )
 
-    assert progress == ["completed", "completed", "completed"]
+    assert progress == ["completed"] * 5
 
 
 def test_failed_shutdown_deadline_overrides_clean_signal_exit():
@@ -1169,7 +1169,7 @@ def test_wake_failure_keeps_long_remainder_watchdog_safe():
 
     assert sum(slept) == 300
     assert max(slept) <= 30
-    assert len(progress) == len(slept) + 1
+    assert len(progress) == len(slept) + 3
 
 
 def _gated_daemon(gate, logs=None, journal=None):

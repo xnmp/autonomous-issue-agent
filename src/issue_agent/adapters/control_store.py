@@ -57,7 +57,7 @@ from ..domain.events import (
 )
 from ..domain.repository import canonical_repository
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 SCHEMA_BASELINE_VERSION = 9
 LEGACY_V8_SCHEMA_DIGEST = (
     "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
@@ -599,6 +599,23 @@ CREATE INDEX retired_owners_successor
 ON retired_owners(successor_owner_id);
 """
 
+_MIGRATION_V16 = """
+CREATE TABLE reservation_recovery (
+    run_id TEXT PRIMARY KEY REFERENCES budget_reservations(run_id)
+        ON DELETE CASCADE,
+    policy TEXT NOT NULL CHECK (policy IN ('spawn_pending', 'running',
+        'reconcile_only')),
+    reason TEXT,
+    updated_at TEXT NOT NULL
+);
+
+INSERT INTO reservation_recovery(run_id, policy, reason, updated_at)
+SELECT run_id, 'reconcile_only',
+       'reservation predates durable recovery classification', updated_at
+FROM budget_reservations
+WHERE state='active';
+"""
+
 _SCHEMA_MIGRATIONS = (
     # Version 9 is the immutable adoption baseline shipped by the architectural
     # hardening cutover. Its exact source digest already exists in deployed
@@ -610,6 +627,7 @@ _SCHEMA_MIGRATIONS = (
     SchemaMigration(13, _MIGRATION_V13),
     SchemaMigration(14, _MIGRATION_V14),
     SchemaMigration(15, _MIGRATION_V15),
+    SchemaMigration(16, _MIGRATION_V16),
 )
 
 if tuple(migration.version for migration in _SCHEMA_MIGRATIONS) != tuple(
@@ -1472,6 +1490,11 @@ class SQLiteControlStore:
                 "UPDATE runs SET state='running' WHERE run_id=?",
                 (str(lease.run_id),),
             )
+            db.execute(
+                "UPDATE reservation_recovery SET policy='running', "
+                "reason=NULL, updated_at=? WHERE run_id=?",
+                (_stamp(self._now()), str(lease.run_id)),
+            )
             self._transition(
                 db,
                 "lease",
@@ -1565,6 +1588,11 @@ class SQLiteControlStore:
             db.execute(
                 "UPDATE runs SET state='running', "
                 "started_at=COALESCE(started_at, ?) WHERE run_id=?",
+                (_stamp(started_at), str(run_id)),
+            )
+            db.execute(
+                "UPDATE reservation_recovery SET policy='running', "
+                "reason=NULL, updated_at=? WHERE run_id=?",
                 (_stamp(started_at), str(run_id)),
             )
             self._transition(
@@ -1759,6 +1787,24 @@ class SQLiteControlStore:
                 ).rowcount
                 if not updated:
                     continue
+                retained_reason = (
+                    "process ownership lost before spend reconciliation"
+                )
+                db.execute(
+                    "UPDATE reservation_recovery SET policy='reconcile_only', "
+                    "reason=?, updated_at=? WHERE run_id=?",
+                    (retained_reason, _stamp(self._now()), str(run_id)),
+                )
+                reservation = db.execute(
+                    "SELECT state FROM budget_reservations WHERE run_id=?",
+                    (str(run_id),),
+                ).fetchone()
+                if reservation is not None and reservation["state"] == "active":
+                    self._event(
+                        db,
+                        ReservationRetained(str(run_id), retained_reason),
+                        correlation=Correlation(run_id=str(run_id)),
+                    )
                 self._transition(
                     db,
                     "run",
@@ -1811,7 +1857,7 @@ class SQLiteControlStore:
         run_id: RunId,
         reason: str,
     ) -> bool:
-        """Publish why an active reservation remains unavailable as headroom."""
+        """Persist a completed run whose spend remains indeterminate."""
 
         if not reason:
             raise ValueError("reservation retention reason is required")
@@ -1823,6 +1869,22 @@ class SQLiteControlStore:
             ).fetchone()
             if row is None or row["state"] != "active":
                 return False
+            now = _stamp(self._now())
+            db.execute(
+                "UPDATE reservation_recovery SET policy='reconcile_only', "
+                "reason=?, updated_at=? WHERE run_id=?",
+                (reason, now, str(run_id)),
+            )
+            db.execute(
+                "UPDATE runs SET "
+                "state=CASE WHEN state IN ('completed','cancelled','abandoned') "
+                "THEN state ELSE 'completed' END, "
+                "outcome=CASE WHEN state IN ('completed','cancelled','abandoned') "
+                "THEN outcome ELSE 'spend_unreconciled' END, "
+                "completed_at=COALESCE(completed_at, ?) WHERE run_id=?",
+                (now, str(run_id)),
+            )
+            db.execute("DELETE FROM leases WHERE run_id=?", (str(run_id),))
             self._event(
                 db,
                 ReservationRetained(str(run_id), reason),
@@ -2708,6 +2770,12 @@ class SQLiteControlStore:
                         now,
                     ),
                 )
+                db.execute(
+                    "INSERT INTO reservation_recovery("
+                    "run_id, policy, reason, updated_at"
+                    ") VALUES (?, 'spawn_pending', NULL, ?)",
+                    (str(request.run_id), now),
+                )
                 for limit in limits:
                     db.execute(
                         "INSERT INTO reservation_limits("
@@ -2744,6 +2812,11 @@ class SQLiteControlStore:
                     db.execute(
                         "UPDATE runs SET state='running' WHERE run_id=?",
                         (str(lease.run_id),),
+                    )
+                    db.execute(
+                        "UPDATE reservation_recovery SET policy='running', "
+                        "reason=NULL, updated_at=? WHERE run_id=?",
+                        (now, str(lease.run_id)),
                     )
                     self._transition(
                         db,
@@ -3094,55 +3167,97 @@ class SQLiteControlStore:
         if not reason:
             raise ValueError("reservation release reason is required")
         with self.transaction() as db:
-            reservation = db.execute(
-                "SELECT state, release_reason FROM budget_reservations WHERE run_id=?",
+            return self._release(db, run_id, reason)
+
+    def release_unlaunched(
+        self, run_id: RunId, reason: str
+    ) -> ReleaseResult:
+        """Release only a reservation durably proven never to have run."""
+
+        if not reason:
+            raise ValueError("reservation release reason is required")
+        with self.transaction() as db:
+            recovery = db.execute(
+                "SELECT rr.policy, r.state AS run_state, "
+                "EXISTS(SELECT 1 FROM leases l WHERE l.run_id=rr.run_id) "
+                "AS has_lease "
+                "FROM reservation_recovery rr JOIN runs r "
+                "ON r.run_id=rr.run_id WHERE rr.run_id=?",
                 (str(run_id),),
             ).fetchone()
-            if reservation is None:
-                return ReleaseResult(
-                    AccountingDisposition.CONFLICT, run_id, detail="run has no reservation"
-                )
-            if reservation["state"] == "released":
-                identical = reservation["release_reason"] == reason
-                return ReleaseResult(
-                    (
-                        AccountingDisposition.AVAILABLE
-                        if identical
-                        else AccountingDisposition.CONFLICT
-                    ),
-                    run_id,
-                    idempotent=identical,
-                    detail="" if identical else "conflicting release reason",
-                )
-            if reservation["state"] != "active":
+            if (
+                recovery is None
+                or recovery["policy"] != "spawn_pending"
+                or recovery["run_state"] not in {"reserved", "starting"}
+                or bool(recovery["has_lease"])
+            ):
                 return ReleaseResult(
                     AccountingDisposition.CONFLICT,
                     run_id,
-                    detail=f"reservation is already {reservation['state']}",
+                    detail=(
+                        "reservation lacks durable proof that paid execution "
+                        "never started"
+                    ),
                 )
-            now = _stamp(self._now())
-            db.execute(
-                "UPDATE budget_reservations SET state='released', release_reason=?, "
-                "updated_at=? WHERE run_id=?",
-                (reason, now, str(run_id)),
+            return self._release(db, run_id, reason)
+
+    def _release(
+        self,
+        db: sqlite3.Connection,
+        run_id: RunId,
+        reason: str,
+    ) -> ReleaseResult:
+        reservation = db.execute(
+            "SELECT state, release_reason FROM budget_reservations WHERE run_id=?",
+            (str(run_id),),
+        ).fetchone()
+        if reservation is None:
+            return ReleaseResult(
+                AccountingDisposition.CONFLICT,
+                run_id,
+                detail="run has no reservation",
             )
-            db.execute(
-                "UPDATE runs SET "
-                "state=CASE WHEN state='abandoned' THEN 'abandoned' ELSE 'cancelled' END, "
-                "outcome=CASE WHEN state='abandoned' THEN outcome ELSE 'released' END, "
-                "completed_at=? WHERE run_id=?",
-                (now, str(run_id)),
+        if reservation["state"] == "released":
+            identical = reservation["release_reason"] == reason
+            return ReleaseResult(
+                (
+                    AccountingDisposition.AVAILABLE
+                    if identical
+                    else AccountingDisposition.CONFLICT
+                ),
+                run_id,
+                idempotent=identical,
+                detail="" if identical else "conflicting release reason",
             )
-            db.execute("DELETE FROM leases WHERE run_id=?", (str(run_id),))
-            self._transition(
-                db,
-                "reservation",
-                str(run_id),
-                "released",
-                {"reason": reason},
-                correlation=Correlation(run_id=str(run_id)),
+        if reservation["state"] != "active":
+            return ReleaseResult(
+                AccountingDisposition.CONFLICT,
+                run_id,
+                detail=f"reservation is already {reservation['state']}",
             )
-            return ReleaseResult(AccountingDisposition.AVAILABLE, run_id)
+        now = _stamp(self._now())
+        db.execute(
+            "UPDATE budget_reservations SET state='released', release_reason=?, "
+            "updated_at=? WHERE run_id=?",
+            (reason, now, str(run_id)),
+        )
+        db.execute(
+            "UPDATE runs SET "
+            "state=CASE WHEN state='abandoned' THEN 'abandoned' ELSE 'cancelled' END, "
+            "outcome=CASE WHEN state='abandoned' THEN outcome ELSE 'released' END, "
+            "completed_at=? WHERE run_id=?",
+            (now, str(run_id)),
+        )
+        db.execute("DELETE FROM leases WHERE run_id=?", (str(run_id),))
+        self._transition(
+            db,
+            "reservation",
+            str(run_id),
+            "released",
+            {"reason": reason},
+            correlation=Correlation(run_id=str(run_id)),
+        )
+        return ReleaseResult(AccountingDisposition.AVAILABLE, run_id)
 
     def enqueue_command(self, command: LifecycleCommand) -> PendingCommand:
         payload = _json(command.payload)

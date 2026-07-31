@@ -13,10 +13,10 @@ from issue_agent.adapters.codex_runner import (
     spend_evidence_path,
     write_spend_evidence,
 )
-from issue_agent.adapters.control_store import SQLiteControlStore
+from issue_agent.adapters.control_store import Lease, SQLiteControlStore
 from issue_agent.adapters.event_log import EventLog
 from issue_agent.adapters.runtime_plan import RuntimePlan
-from issue_agent.domain.contracts import Money
+from issue_agent.domain.contracts import Money, RunId
 from issue_agent.domain.events import (
     Producer,
     ReservationRetained,
@@ -763,7 +763,7 @@ def test_codex_runtime_exception_releases_after_completed_teardown(
         ).fetchone()
     assert (state, reason) == (
         "released",
-        "runtime_exception_spend_unknown",
+        "runtime_exception_before_launch",
     )
 
 
@@ -829,7 +829,57 @@ def test_non_codex_runtime_exception_releases_after_completed_teardown(
         ).fetchone()
     assert (state, reason) == (
         "released",
-        "runtime_exception_spend_unknown",
+        "runtime_exception_before_launch",
+    )
+
+
+def test_runtime_exception_after_child_registration_retains_reservation(
+    tmp_path,
+) -> None:
+    class Death:
+        store: SQLiteControlStore
+        run_id: RunId
+
+        async def run(self, task):
+            run_id = RunId(task.env["ISSUE_AGENT_RUN_ID"])
+            self.run_id = run_id
+            with self.store._connect() as db:
+                dispatch_id, owner_id = db.execute(
+                    "SELECT dispatch_id, owner_id FROM runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+            self.store.register_lease(
+                Lease(
+                    run_id,
+                    dispatch_id,
+                    owner_id,
+                    os.getpid(),
+                    os.getpgid(os.getpid()),
+                    self.store._now(),
+                    1,
+                )
+            )
+            raise RuntimeError("transport died after provider launch")
+
+    runtime = Death()
+    wrapper, store = _wrapper(tmp_path, runtime, runtime_name="claude")
+    runtime.store = store
+
+    with pytest.raises(RuntimeError, match="after provider launch"):
+        asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
+
+    assert store.active_reservation_runs() == (runtime.run_id,)
+    with store._connect() as db:
+        policy, run_state, outcome, reservation_state = db.execute(
+            "SELECT rr.policy, r.state, r.outcome, b.state "
+            "FROM reservation_recovery rr JOIN runs r ON r.run_id=rr.run_id "
+            "JOIN budget_reservations b ON b.run_id=rr.run_id"
+        ).fetchone()
+    assert (policy, run_state, outcome, reservation_state) == (
+        "reconcile_only",
+        "completed",
+        "spend_unreconciled",
+        "active",
     )
 
 

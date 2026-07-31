@@ -47,8 +47,9 @@ class _Supervisor:
 
 
 class _Control:
-    def __init__(self):
+    def __init__(self, unlaunched=()):
         self.released = []
+        self.unlaunched = frozenset(unlaunched)
 
     def reclaim_dead_leases(self, _owner_id, _is_alive):
         return (RunId("recovered"),)
@@ -62,7 +63,9 @@ class _Control:
     def leases(self, _owner_id):
         return (_Lease(RunId("live")),)
 
-    def release(self, run_id, reason):
+    def release_unlaunched(self, run_id, reason):
+        if run_id not in self.unlaunched:
+            return _Release(_Disposition("conflict"))
         self.released.append((run_id, reason))
         return _Release()
 
@@ -122,7 +125,7 @@ def test_recovery_reconciles_dead_reservation_before_unknown_release():
     ]
 
 
-def test_recovery_releases_only_orphaned_indeterminate_spend():
+def test_recovery_never_releases_indeterminate_spend_after_execution():
     control = _Control()
     spend = _Spend()
     abandonments = _Abandonments()
@@ -132,9 +135,12 @@ def test_recovery_releases_only_orphaned_indeterminate_spend():
         spend, abandonments, "o/r:fix"
     ).recover()
 
-    assert report.spend_unknown == (RunId("recovered"),)
-    assert control.released == [(RunId("recovered"), "spend_unknown")]
+    assert report.spend_unknown == ()
+    assert control.released == []
     assert RunId("live") not in spend.seen
+    assert abandonments.calls == [
+        (RunId("recovered"), "process ownership lost")
+    ]
 
 
 def test_recovery_completes_when_abandonment_telemetry_raises():
@@ -154,10 +160,8 @@ def test_recovery_completes_when_abandonment_telemetry_raises():
         "o/r:fix",
     ).recover()
 
-    assert report.spend_unknown == (RunId("recovered"),)
-    assert control.released == [
-        (RunId("recovered"), "spend_unknown")
-    ]
+    assert report.spend_unknown == ()
+    assert control.released == []
 
 
 def test_recovery_runs_the_fixed_crash_consistency_sequence():
@@ -379,7 +383,7 @@ def test_suspend_recovery_preserves_live_owned_lease_and_settlement(
     assert abandonments.calls == []
 
 
-def test_periodic_sweep_releases_usage_blind_reservation_after_grace(
+def test_periodic_sweep_retains_usage_blind_reservation_after_grace(
     tmp_path,
 ):
     reserved_at = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
@@ -412,6 +416,9 @@ def test_periodic_sweep_releases_usage_blind_reservation_after_grace(
             owner_id="o/r:fix",
         )
     )
+    assert store.record_reservation_retained(
+        run_id, "trusted usage and provider charge unavailable"
+    )
     coordinator = RecoveryCoordinator(
         _Supervisor(),
         store,
@@ -430,5 +437,137 @@ def test_periodic_sweep_releases_usage_blind_reservation_after_grace(
     current[0] = reserved_at + timedelta(minutes=3)
     report = coordinator.sweep_reservations()
 
+    assert report.spend_unknown == ()
+    assert store.active_reservation_runs("o/r:fix") == (run_id,)
+    with sqlite3.connect(store.path) as db:
+        policy, state, outcome = db.execute(
+            "SELECT rr.policy, r.state, r.outcome "
+            "FROM reservation_recovery rr JOIN runs r "
+            "ON r.run_id=rr.run_id WHERE rr.run_id=?",
+            (str(run_id),),
+        ).fetchone()
+    assert (policy, state, outcome) == (
+        "reconcile_only",
+        "completed",
+        "spend_unreconciled",
+    )
+
+
+def test_periodic_sweep_releases_only_stale_unlaunched_reservation(
+    tmp_path,
+):
+    reserved_at = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
+    store = SQLiteControlStore(
+        str(tmp_path / "control.db"), now=lambda: reserved_at
+    )
+    store.initialize()
+    run_id = RunId("never-launched")
+    scope = BudgetScope(
+        "o/r",
+        "daily",
+        "USD",
+        "2026-07-30",
+        reserved_at.replace(hour=0),
+        reserved_at.replace(hour=0) + timedelta(days=1),
+        ZoneInfo("UTC"),
+    )
+    store.reserve(
+        ReservationRequest(
+            ReservationId("never-launched-reservation"),
+            run_id,
+            "dispatch",
+            scope,
+            PriceQuote(
+                "gpt", "card", "v1", reserved_at, Money("USD", 10)
+            ),
+            Money("USD", 100),
+            "config",
+            owner_id="o/r:fix",
+        )
+    )
+    report = RecoveryCoordinator(
+        _Supervisor(),
+        store,
+        _Worktrees(),
+        _Commands(),
+        _Spend(),
+        _Abandonments(),
+        "o/r:fix",
+        reservation_grace=timedelta(minutes=2),
+        now=lambda: reserved_at + timedelta(minutes=3),
+    ).sweep_reservations()
+
     assert report.spend_unknown == (run_id,)
     assert store.active_reservation_runs("o/r:fix") == ()
+    with sqlite3.connect(store.path) as db:
+        state, reason = db.execute(
+            "SELECT state, release_reason FROM budget_reservations "
+            "WHERE run_id=?",
+            (str(run_id),),
+        ).fetchone()
+    assert (state, reason) == ("released", "unlaunched_reservation")
+
+
+def test_spawn_registration_wins_race_with_periodic_release(tmp_path):
+    reserved_at = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
+    store = SQLiteControlStore(
+        str(tmp_path / "control.db"), now=lambda: reserved_at
+    )
+    store.initialize()
+    run_id = RunId("spawn-race")
+    scope = BudgetScope(
+        "o/r",
+        "daily",
+        "USD",
+        "2026-07-30",
+        reserved_at.replace(hour=0),
+        reserved_at.replace(hour=0) + timedelta(days=1),
+        ZoneInfo("UTC"),
+    )
+    store.reserve(
+        ReservationRequest(
+            ReservationId("spawn-race-reservation"),
+            run_id,
+            "dispatch",
+            scope,
+            PriceQuote(
+                "gpt", "card", "v1", reserved_at, Money("USD", 10)
+            ),
+            Money("USD", 100),
+            "config",
+            owner_id="o/r:fix",
+        )
+    )
+
+    class RegisteringReconciler:
+        def reconcile(self, candidate):
+            store.register_lease(
+                Lease(
+                    candidate,
+                    "dispatch",
+                    "o/r:fix",
+                    123,
+                    123,
+                    reserved_at,
+                    1,
+                )
+            )
+            return False
+
+    report = RecoveryCoordinator(
+        _Supervisor(),
+        store,
+        _Worktrees(),
+        _Commands(),
+        RegisteringReconciler(),
+        _Abandonments(),
+        "o/r:fix",
+        reservation_grace=timedelta(minutes=2),
+        now=lambda: reserved_at + timedelta(minutes=3),
+    ).sweep_reservations()
+
+    assert report.spend_unknown == ()
+    assert store.active_reservation_runs("o/r:fix") == (run_id,)
+    assert tuple(lease.run_id for lease in store.leases("o/r:fix")) == (
+        run_id,
+    )

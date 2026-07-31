@@ -157,7 +157,9 @@ def default_mint_fn(creds: AppCredentials) -> tuple[str, str, int]:
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )
-    with urllib.request.urlopen(req) as resp:  # noqa: S310 - fixed https host
+    with urllib.request.urlopen(  # noqa: S310 - fixed https host
+        req, timeout=30
+    ) as resp:
         data = _json.loads(resp.read().decode())
     token = data.get("token", "")
     expires_at = data.get("expires_at", "")

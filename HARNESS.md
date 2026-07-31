@@ -108,9 +108,11 @@ Uninstall is two-phase on both platforms: every loaded role must stop
 successfully before any definition is deleted, so a failure stays loud and
 recoverable.
 
-Systemd units use SIGTERM draining, a 90-second stop deadline, watchdog
-readiness, restart-rate limits, memory/task bounds, and do not restart permanent
-configuration/schema/store failures. View logs with:
+Systemd units use SIGTERM draining, a 90-second stop deadline, readiness after
+all synchronous startup checks, and a five-minute watchdog fed by scheduler
+and bounded GitHub-operation progress. Restart rates and memory/task counts are
+bounded, and permanent configuration/schema/store failures do not restart.
+View logs with:
 
 ```bash
 journalctl --user -u issue-agent-fix-watcher-<name> -f
@@ -168,8 +170,10 @@ Settlement is idempotent and records currency, integer micros, pricing basis,
 usage provenance, and rate-card identity.
 
 At boot and after a suspension gap, recovery runs in a fixed order: kill known
-orphan groups, reclaim dead leases, reconcile/release unsettled spend, drain
-commands through receipt verification, and emit abandoned-run corrections.
+orphan groups, reclaim dead leases, reconcile unsettled spend, release only
+reservations durably proven never launched, drain commands through receipt
+verification, and emit abandoned-run corrections. A run that may have reached
+a paid provider remains fail-closed until positive settlement evidence exists.
 An explicit same-repository repoint first reaps the recorded prior checkout
 registries and atomically adopts their run, lease, claim, command, outbox, and
 world-feed authority; unrelated sibling checkouts remain isolated.

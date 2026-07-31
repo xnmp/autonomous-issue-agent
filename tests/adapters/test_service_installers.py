@@ -260,6 +260,7 @@ def test_systemd_installer_renders_validated_units_with_absolute_uv(tmp_path):
     assert len(units) == 3
     assert all(f"ExecStart={uv} " in unit.read_text() for unit in units)
     assert all("NotifyAccess=all" in unit.read_text() for unit in units)
+    assert all("WatchdogSec=300" in unit.read_text() for unit in units)
     assert all(
         "Environment=ISSUE_AGENT_DEPLOYMENT_ID=target-repo"
         in unit.read_text()

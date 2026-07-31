@@ -293,8 +293,13 @@ class Store:
         except ValueError:
             return "", 0
 
-    def set_review_retry(self, issue: int, at: str, n: int) -> None:
-        self._write(self.issue_path(issue, "review-retries"), f"{at} {n}")
+    def set_review_retry(
+        self, issue: int, at: str, retries: int
+    ) -> None:
+        self._write(
+            self.issue_path(issue, "review-retries"),
+            f"{at} {retries}",
+        )
 
     def clear_review_retry(self, issue: int) -> None:
         self._remove(self.issue_path(issue, "review-retries"))
@@ -345,8 +350,8 @@ class Store:
     def get_round(self, pr: int) -> int:
         return self._read_int(self.pr_path(pr, "round"), default=1)
 
-    def set_round(self, pr: int, n: int) -> None:
-        self._write(self.pr_path(pr, "round"), str(n))
+    def set_round(self, pr: int, round_number: int) -> None:
+        self._write(self.pr_path(pr, "round"), str(round_number))
 
     # ── automerge marker ──
     def automerge_enabled(self, pr: int) -> bool:

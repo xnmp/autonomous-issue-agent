@@ -194,7 +194,11 @@ def _review_prompt(cfg: HarnessConfig) -> str:
         return ""
 
 
-def build_role(role: str, env: dict | None = None):
+def build_role(
+    role: str,
+    env: dict | None = None,
+    scheduler_progress: Callable[[], None] | None = None,
+):
     # review S7/D3: `main()` already loads AGENT_ENV once (via `_load_agent_env`,
     # which shells out to `bash -c ... env -0`) and passes the merged dict here —
     # only self-load when called standalone (env=None) so the documented
@@ -339,7 +343,11 @@ def build_role(role: str, env: dict | None = None):
         return daemon
 
     if role == "fix":
-        gw = GitHubGateway(cfg.repo, Identity(static_token=env.get("FIX_BOT_TOKEN") or None))
+        gw = GitHubGateway(
+            cfg.repo,
+            Identity(static_token=env.get("FIX_BOT_TOKEN") or None),
+            progress=scheduler_progress,
+        )
         # runtime-tagged sessions: a FIXER_RUNTIME flip must cold-start resume
         # legs, not feed the new runtime the old runtime's session ids.
         store = Store(cfg.state_dir, runtime=cfg.fixer_runtime)
@@ -372,16 +380,24 @@ def build_role(role: str, env: dict | None = None):
             probe_when=fix_probe_safe,
         )
     if role == "review":
-        gw = GitHubGateway(cfg.repo, _app_identity(env, warn=_commit_log),
-                           review_pr_label=cfg.review_trigger_label,
-                           review_adopt_unlabeled=cfg.review_adopt_unlabeled)
+        gw = GitHubGateway(
+            cfg.repo,
+            _app_identity(env, warn=_commit_log),
+            review_pr_label=cfg.review_trigger_label,
+            review_adopt_unlabeled=cfg.review_adopt_unlabeled,
+            progress=scheduler_progress,
+        )
         # A runtime flip must cold-start review legs too.  In particular, Codex
         # resume cannot preserve its read-only sandbox, and legacy Claude
         # session ids must never reach `codex exec resume`.
         store = Store(cfg.review_state_dir, runtime=cfg.reviewer_runtime)
         return _probed(build_review_daemon(cfg, gw, store, runner), gw)
     if role == "steward":
-        gw = GitHubGateway(cfg.repo, _app_identity(env, warn=_commit_log))
+        gw = GitHubGateway(
+            cfg.repo,
+            _app_identity(env, warn=_commit_log),
+            progress=scheduler_progress,
+        )
         store = Store(cfg.steward_state_dir)
         return _probed(build_steward_daemon(cfg, gw, store, runner), gw)
     raise SystemExit(f"unknown role: {role!r} (use fix|review|steward)")
@@ -452,8 +468,13 @@ def main(argv: list[str] | None = None) -> None:
         f"NO_PROXY={env.get('NO_PROXY') or env.get('no_proxy') or '<unset>'} "
         f"DEBUG={'on' if _dbg else 'off'}\n"
     )
+    notifier = SystemdNotifier(env)
+
+    def scheduler_progress() -> None:
+        notifier.progress(f"{role} scheduler progressed")
+
     try:
-        daemon = build_role(role, env)
+        daemon = build_role(role, env, scheduler_progress)
         cfg = from_env(env)
         cfg.validate()
         state_dir = {
@@ -482,8 +503,6 @@ def main(argv: list[str] | None = None) -> None:
     except ValueError as exc:
         sys.stderr.write(f"{role}: invalid configuration — {exc}\n")
         raise SystemExit(ExitCode.INVALID_CONFIG) from exc
-    notifier = SystemdNotifier(env)
-    notifier.ready(f"{role} daemon initialized")
     # ISSUE_AGENT_MAX_TICKS bounds the loop (the demo-gate / a one-shot run); unset
     # = run forever like the bash daemons.
     raw = env.get("ISSUE_AGENT_MAX_TICKS")
@@ -512,14 +531,13 @@ def main(argv: list[str] | None = None) -> None:
             validate=lambda: _validate_reload_candidate(dict(os.environ)),
         )
         reload_check = watch.changed
+    notifier.ready(f"{role} daemon initialized")
     hard_exit_code: int | None = None
     try:
         daemon.run_forever(
             sleep=time.sleep, now=lambda: int(time.time()), max_ticks=max_ticks,
             reload_check=reload_check,
-            scheduler_progress=lambda: notifier.progress(
-                f"{role} scheduler progressed"
-            ),
+            scheduler_progress=scheduler_progress,
         )
     except SystemExit:
         if daemon.requires_hard_exit:

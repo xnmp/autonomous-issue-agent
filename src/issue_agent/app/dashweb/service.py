@@ -29,6 +29,7 @@ class Backend:
         stale_after_s: float = dash.STALE_AFTER_S,
         snapshot_ttl_s: float = 3.0,
         effects_factory=build_operator_effects,
+        control_db_path: str = "",
     ):
         self.harness_root = harness_root or cli.HARNESS_ROOT
         self.gh = gh or ghdata.GhReader()
@@ -42,6 +43,7 @@ class Backend:
         self._snapshots = ghdata.TtlCache(ttl_s=snapshot_ttl_s)
         self._self_repo = system.remote_repo(self.harness_root)
         self.effects_factory = effects_factory
+        self.control_db_path = control_db_path
 
     # ── journal side ──
     def names(self) -> tuple[str, ...]:
@@ -71,6 +73,7 @@ class Backend:
                 ledger_path=default_ledger_path(),
                 now_fn=self.now_fn,
                 stale_after_s=self.stale_after_s,
+                control_db_path=self.control_db_path,
             ),
         )
 

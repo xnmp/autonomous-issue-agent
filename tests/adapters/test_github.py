@@ -197,6 +197,18 @@ def test_identity_ambient_is_none():
     assert Identity().env_token() is None
 
 
+def test_gateway_reports_scheduler_progress_after_each_bounded_call():
+    progress = []
+    gateway = GitHubGateway(
+        "o/r",
+        runner=lambda _argv, _token: '[{"number":7}]',
+        progress=lambda: progress.append("completed"),
+    )
+
+    assert gateway.list_issue_numbers("ai-ready") == [7]
+    assert progress == ["completed"]
+
+
 # ── gateway with a fake runner ────────────────────────────────────────────────
 class FakeRunner:
     def __init__(self, responses=None):
@@ -1178,7 +1190,7 @@ def test_auth_outages_are_transient_unavailability(stderr):
 
 
 def test_runner_raises_network_on_timeout(monkeypatch, capsys):
-    """The 120s kill produced NO data; returning "" made a hung `gh pr view` look
+    """The bounded kill produced NO data; returning "" made a hung `gh pr view` look
     like a successful read of an empty world. `timed_out` marks it as the
     per-call case so `_safe_get_pr` can still isolate one wedged PR."""
     def _timeout(argv, capture_output, text, env, timeout):

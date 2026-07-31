@@ -536,7 +536,7 @@ def test_main_exports_composed_env_into_os_environ_before_building(tmp_path, mon
 
     stop = RuntimeError("stop-before-build-role")
 
-    def _boom(role, env):
+    def _boom(role, env, _scheduler_progress=None):
         raise stop
 
     monkeypatch.setattr(main_module, "build_role", _boom)

@@ -43,8 +43,9 @@ from ..domain.world import (
 # Hard ceiling on any single `gh` subprocess. A `gh pr view` requesting lazily
 # computed fields (mergeable / mergeStateStatus) can hang indefinitely on a
 # just-merged PR; without a timeout that wedges the synchronous poll loop. 120s is
-# far above a healthy call (<2s) yet bounds the pathological hang.
-_GH_TIMEOUT_S = 120.0
+# far above a healthy call (<2s), below the service watchdog interval, and
+# paired with a scheduler-progress callback after every call.
+_GH_TIMEOUT_S = 30.0
 
 # Cap on `gh issue list` / `gh pr list` world-building calls. gh has no
 # "there were more" signal short of paginating (cursor-following, unshipped
@@ -734,10 +735,12 @@ class GitHubGateway:
         runner: Callable[[list[str], str | None], str] | None = None,
         review_pr_label: str = "ai-pr-open",
         review_adopt_unlabeled: bool = False,
+        progress: Callable[[], None] | None = None,
     ):
         self.repo = repo
         self.identity = identity or Identity()
         self._run = runner or _subprocess_runner
+        self._progress = progress
         # PR label the review daemon selects on (see build_review_world). Default
         # matches the harness pipeline; an external-repo reviewer passes "ai-review".
         self.review_pr_label = review_pr_label
@@ -749,7 +752,11 @@ class GitHubGateway:
         # Guard EVERY call, not just the _gh_json ones: a list subcommand read as
         # raw text (`--jq`) truncates just as silently (review C2).
         _require_list_limit(args)
-        return self._run(["gh", *args], self.identity.env_token())
+        try:
+            return self._run(["gh", *args], self.identity.env_token())
+        finally:
+            if self._progress is not None:
+                self._progress()
 
     def _gh_json(self, args: list[str]) -> object:
         out = self._gh(args)

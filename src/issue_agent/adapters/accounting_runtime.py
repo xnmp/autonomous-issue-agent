@@ -475,13 +475,17 @@ class AccountingRuntime(AgentRuntime):
                 and self.store.has_cancellation_intent(run_id)
             )
             if not reconciled and not forced_shutdown:
-                # The inner runtime has completed supervised teardown before this
-                # path. A forced shutdown first persists its intent; only that
-                # path leaves an inconclusive Codex reservation active because
-                # rollout evidence can become readable after process reap.
-                self.store.release(
-                    run_id, "runtime_exception_spend_unknown"
+                released = self.store.release_unlaunched(
+                    run_id, "runtime_exception_before_launch"
                 )
+                if (
+                    released.disposition
+                    is not AccountingDisposition.AVAILABLE
+                ):
+                    self.store.record_reservation_retained(
+                        run_id,
+                        "runtime failed after paid execution may have started",
+                    )
         except Exception:
             # Preserve the causal runtime/normalization/settlement exception.
             # An unavailable authority remains fail-closed and boot recovery

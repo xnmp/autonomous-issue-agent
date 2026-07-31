@@ -6,10 +6,12 @@ import html as _html
 import json
 import os
 import glob
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
+from ..adapters.control_store import read_settled_spend
 from ..adapters.event_log import read_event_log
 from ..adapters.heartbeat import read_heartbeat_time
+from ..adapters.journal import read_events
 from ..domain.projection import fold
 from ..domain.dashboard import (
     ActionFact,
@@ -57,16 +59,42 @@ def collect(
     ledger_path: str,
     now_fn=None,
     stale_after_s: float = STALE_AFTER_S,
+    control_db_path: str | None = None,
 ) -> Deployment:
     """Read one deployment's journals + the global ledger and report on them.
     Read-only; every missing file is an empty history (`read_events`'s rule)."""
     now_fn = now_fn or _utcnow
+    settled_today_usd = _settled_today_usd(
+        control_db_path, repo, now_fn()
+    )
     legacy_paths = tuple(journal_paths)
     typed_paths = tuple(
         os.path.join(os.path.dirname(path), "events-v2.jsonl")
         for path in legacy_paths
     )
     results = tuple(read_event_log(path) for path in typed_paths)
+    if not any(result.source_files for result in results) and any(
+        os.path.isfile(path) for path in (*legacy_paths, ledger_path)
+    ):
+        legacy_feeds = tuple(
+            (
+                role,
+                path,
+                os.path.join(log_dir, f"{role}-{name}.log"),
+                tuple(read_events(path)),
+            )
+            for role, path in zip(ROLE_NAMES, legacy_paths)
+        )
+        return build_deployment(
+            name,
+            repo,
+            legacy_feeds,
+            tuple(read_events(ledger_path)),
+            now_fn,
+            stale_after_s,
+            ("showing read-only schema-v1 dashboard history",),
+            settled_today_usd,
+        )
     typed_feeds = tuple(
         (
             role,
@@ -108,7 +136,26 @@ def collect(
         stale_after_s,
         heartbeat_times,
         warnings,
+        settled_today_usd,
     )
+
+
+def _settled_today_usd(
+    control_db_path: str | None,
+    repository: str,
+    now: datetime,
+) -> float | None:
+    if not control_db_path:
+        return None
+    start = now.astimezone(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    spend = read_settled_spend(
+        control_db_path,
+        start,
+        start + timedelta(days=1),
+    )
+    return spend.for_repository(repository).micros / 1_000_000
 
 
 # ── text render ───────────────────────────────────────────────────────────────
@@ -155,7 +202,7 @@ def _metrics_lines(m: Metrics) -> list[str]:
             if m.done_issues
             else "no done issue yet"
         ),
-        f"    today (ledger, this repo): ${m.today_usd:.2f}",
+        f"    today (settled SQLite, this repo): ${m.today_usd:.2f}",
         "    cost mix: "
         + (
             " · ".join(
@@ -299,7 +346,7 @@ def _html_metrics(m: Metrics) -> str:
             "$ per done issue",
             f"${m.cost_per_done_usd:.2f}" if m.done_issues else "—",
         ),
-        ("today (ledger, this repo)", f"${m.today_usd:.2f}"),
+        ("today (settled SQLite, this repo)", f"${m.today_usd:.2f}"),
         ("cost mix by leg", _esc(mix) or "—"),
         (
             "first-pass approval",

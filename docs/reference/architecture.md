@@ -120,8 +120,8 @@ failure decisions; and exercised ordinary, exhausted, duplicate, and
 conflicting-receipt admissions on the pre-existing live primary database.
 Fresh databases use the v9 adoption baseline. The exact digest emitted by the
 previously shipped v8 initializer remains an accepted immutable predecessor,
-so deployed v8 databases upgrade through v9/v10/v11/v12/v13/v14/v15 without
-rewritten history. V13 canonicalizes GitHub's case-insensitive `owner/name`
+so deployed v8 databases upgrade through v9/v10/v11/v12/v13/v14/v15/v16
+without rewritten history. V13 canonicalizes GitHub's case-insensitive `owner/name`
 repository identity across commands, reservations, limits, and dispatch claims;
 startup also adopts both historical mixed-case owner formats so in-flight
 authority is not stranded by the cutover.
@@ -135,6 +135,11 @@ transfers active ownership and retires the complete recorded lineage in one
 transaction. Every role store is then bound to its current owner: all later
 transactions recheck that durable fence, fresh claims and reservations from a
 retired owner fail closed, and a rebooted old service exits cleanly at startup.
+V16 classifies every active reservation as spawn-pending, running, or
+reconcile-only. Recovery can release only spawn-pending work while atomically
+rechecking that no lease registered and the run never started; any reservation
+that may have reached a paid provider remains unavailable until positive
+settlement evidence or explicit operator resolution.
 Every migration is digest-validated and individually transactional; restart
 and concurrent-role tests interrupt both sides of every migration commit
 boundary and serialize fresh/v8/v9 boot. Machine-readable
@@ -261,7 +266,10 @@ per-database advisory lock. Recovery snapshots leases and performs OS liveness
 probes outside SQLite write transactions, then revalidates the complete lease
 identity before reclaiming it.
 The scheduler heartbeat and systemd watchdog represent scheduler progress, not
-merely process liveness.
+merely process liveness. GitHub calls are individually bounded below the
+watchdog deadline and report progress between calls; action execution reports
+between actions, so a degraded but advancing tick is not mistaken for a hung
+scheduler.
 
 Agent processes run in their own process groups. Both Codex and the Claude SDK
 start through a state-owned registration wrapper that records the group leader
