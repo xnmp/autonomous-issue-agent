@@ -69,6 +69,9 @@ class _Control:
         self.released.append((run_id, reason))
         return _Release()
 
+    def release_retained(self, _run_id, _reason, _retained_before):
+        return _Release(_Disposition("conflict"))
+
     def pending_commands(self):
         return ("pending",)
 
@@ -385,7 +388,7 @@ def test_suspend_recovery_preserves_live_owned_lease_and_settlement(
     assert abandonments.calls == []
 
 
-def test_periodic_sweep_retains_usage_blind_reservation_after_grace(
+def test_periodic_sweep_releases_usage_blind_reservation_after_grace(
     tmp_path,
 ):
     reserved_at = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
@@ -422,13 +425,14 @@ def test_periodic_sweep_retains_usage_blind_reservation_after_grace(
     assert store.record_reservation_retained(
         run_id, "trusted usage and provider charge unavailable"
     )
+    abandonments = _Abandonments()
     coordinator = RecoveryCoordinator(
         _Supervisor(),
         store,
         _Worktrees(),
         _Commands(),
         _Spend(),
-        _Abandonments(),
+        abandonments,
         "o/r:fix",
         reservation_grace=timedelta(minutes=2),
         now=lambda: current[0],
@@ -440,19 +444,30 @@ def test_periodic_sweep_retains_usage_blind_reservation_after_grace(
     current[0] = reserved_at + timedelta(minutes=3)
     report = coordinator.sweep_reservations()
 
-    assert report.spend_unknown == ()
-    assert store.active_reservation_runs("o/r:fix") == (run_id,)
+    assert report.spend_unknown == (run_id,)
+    assert store.active_reservation_runs("o/r:fix") == ()
+    assert store.snapshot(scope).reserved == Money.zero("USD")
+    assert abandonments.calls == []
     with sqlite3.connect(store.path) as db:
-        policy, state, outcome = db.execute(
-            "SELECT rr.policy, r.state, r.outcome "
-            "FROM reservation_recovery rr JOIN runs r "
-            "ON r.run_id=rr.run_id WHERE rr.run_id=?",
+        policy, reservation_state, reason, run_state, outcome = db.execute(
+            "SELECT rr.policy, b.state, b.release_reason, r.state, r.outcome "
+            "FROM reservation_recovery rr "
+            "JOIN budget_reservations b ON b.run_id=rr.run_id "
+            "JOIN runs r ON r.run_id=rr.run_id WHERE rr.run_id=?",
             (str(run_id),),
         ).fetchone()
-    assert (policy, state, outcome) == (
+    assert (
+        policy,
+        reservation_state,
+        reason,
+        run_state,
+        outcome,
+    ) == (
         "reconcile_only",
+        "released",
+        "unmeasured_completed_reservation",
         "completed",
-        "spend_unreconciled",
+        "spend_unmeasured_released",
     )
 
 

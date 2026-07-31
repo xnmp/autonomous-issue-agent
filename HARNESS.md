@@ -174,6 +174,12 @@ orphan groups, reclaim dead leases, reconcile unsettled spend, release only
 reservations durably proven never launched, drain commands through receipt
 verification, and emit abandoned-run corrections. A run that may have reached
 a paid provider remains fail-closed until positive settlement evidence exists.
+Completed runs that returned without trusted usage or a provider charge are a
+separate liveness case: recovery retries provider reconciliation through the
+reservation grace window, then atomically releases the retained maximum and
+records `spend_unmeasured_released`. This keeps repeated usage-blind results
+from permanently exhausting admission capacity while preserving an explicit
+operator-visible accounting gap.
 An explicit same-repository repoint first reaps the recorded prior checkout
 registries and atomically adopts their run, lease, claim, command, outbox, and
 world-feed authority; unrelated sibling checkouts remain isolated.

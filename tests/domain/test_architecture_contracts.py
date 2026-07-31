@@ -180,6 +180,64 @@ def test_app_cannot_gate_mutating_port_calls_on_runtime_protocol_probes() -> Non
     assert violations == []
 
 
+def test_every_domain_port_is_type_checked_or_explicitly_exempted() -> None:
+    """A new Protocol cannot bypass the seam-sensitive Pyrefly gate."""
+
+    ports_tree = ast.parse(
+        (DOMAIN / "ports.py").read_text(),
+        filename=str(DOMAIN / "ports.py"),
+    )
+    protocols = {
+        node.name
+        for node in ports_tree.body
+        if isinstance(node, ast.ClassDef)
+        and any(
+            isinstance(base, ast.Name) and base.id == "Protocol"
+            for base in node.bases
+        )
+    }
+    conformance_path = ROOT / "tests" / "typecheck" / "port_conformance.py"
+    conformance_tree = ast.parse(
+        conformance_path.read_text(),
+        filename=str(conformance_path),
+    )
+
+    def declared(name: str) -> set[str]:
+        for node in conformance_tree.body:
+            if (
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Name) and target.id == name
+                    for target in node.targets
+                )
+                and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id == "frozenset"
+                and len(node.value.args) == 1
+                and isinstance(node.value.args[0], ast.Set)
+            ):
+                return {
+                    item.value
+                    for item in node.value.args[0].elts
+                    if isinstance(item, ast.Constant)
+                    and isinstance(item.value, str)
+                }
+        raise AssertionError(f"{name} must be one literal frozenset")
+
+    covered = declared("COVERED_PORTS")
+    exempt = declared("EXEMPT_PORTS")
+    checked = {
+        node.returns.id
+        for node in conformance_tree.body
+        if isinstance(node, ast.FunctionDef)
+        and isinstance(node.returns, ast.Name)
+    }
+
+    assert covered.isdisjoint(exempt)
+    assert covered | exempt == protocols
+    assert covered == checked
+
+
 def _literal_argv(node: ast.List | ast.Tuple) -> tuple[str, ...]:
     values = []
     for item in node.elts:

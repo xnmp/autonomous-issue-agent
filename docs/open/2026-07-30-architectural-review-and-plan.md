@@ -49,12 +49,17 @@ execution-possible spend; normal settlement converges with equal recovered
 evidence instead of falsely failing a successful run; delayed pre-spawn
 children retain and revalidate their original owner fence; and schema v17
 separates workload repository attribution from global/repository cap scope.
+Completed usage-blind runs receive a bounded reconciliation grace and an
+atomic, explicitly unmeasured release, preventing retained maximums from
+permanently exhausting admission capacity without making ambiguous migrated or
+dead-lease work releasable.
 Tombstoned and unattributed schema-v2 facts remain in historical metrics, and
 current-day spend comes from semantically validated settled SQLite charges (an
 absent, unreadable, or corrupt authority is explicitly unknown and does not
 hide journal history). Legacy history is read-only fallback only, readiness
-follows fallible initialization, the type gate checks behavioral protocol
-contracts, and scheduler progress drives systemd watchdog heartbeats.
+follows fallible initialization, the type gate checks every production port
+through an exhaustiveness manifest, duplicate/orphan run events retain their
+terminal metrics, and scheduler progress drives systemd watchdog heartbeats.
 Verification reran the full self-test gate, exercised a real `Type=notify`
 transient service under `WatchdogSec=4`, bounded-booted all three roles from
 this checkout, and checked the migrated schema-v17 store for zero nonterminal

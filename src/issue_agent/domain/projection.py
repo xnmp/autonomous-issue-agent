@@ -25,7 +25,7 @@ WorldFeedSubject = tuple[str, str, str, str, int]
 
 @dataclass(frozen=True)
 class RunProjection:
-    start: EventEnvelope
+    start: EventEnvelope | None = None
     completion: EventEnvelope | None = None
     abandoned: EventEnvelope | None = None
 
@@ -70,12 +70,21 @@ def fold(events: Iterable[EventEnvelope]) -> ReadModel:
         ):
             continue
         if isinstance(payload, AgentRunStarted) and run_id:
-            runs[run_id] = RunProjection(event)
+            prior = runs.get(run_id)
+            if prior is None:
+                runs[run_id] = RunProjection(event)
+            elif prior.start is None:
+                runs[run_id] = RunProjection(
+                    event, prior.completion, prior.abandoned
+                )
             starts_by_event_id[event.event_id] = run_id
         elif isinstance(payload, AgentRunCompleted) and run_id:
             prior = runs.get(run_id)
-            if prior is not None:
-                runs[run_id] = RunProjection(prior.start, event, prior.abandoned)
+            runs[run_id] = RunProjection(
+                prior.start if prior is not None else None,
+                event,
+                prior.abandoned if prior is not None else None,
+            )
         elif isinstance(payload, AgentRunAbandoned):
             corrected_run = starts_by_event_id.get(payload.corrects)
             if corrected_run:

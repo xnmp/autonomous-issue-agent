@@ -3452,6 +3452,93 @@ class SQLiteControlStore:
                 )
             return self._release(db, run_id, reason)
 
+    def release_retained(
+        self,
+        run_id: RunId,
+        reason: str,
+        retained_before: datetime,
+    ) -> ReleaseResult:
+        """Release a completed, unmeasured run after its reconciliation grace."""
+
+        if not reason:
+            raise ValueError("retained reservation release reason is required")
+        cutoff = _stamp(retained_before)
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT b.state AS reservation_state, b.release_reason, "
+                "rr.policy, rr.updated_at AS recovery_updated_at, "
+                "r.state AS run_state, r.outcome, "
+                "EXISTS(SELECT 1 FROM leases l WHERE l.run_id=b.run_id) "
+                "AS has_lease "
+                "FROM budget_reservations b "
+                "LEFT JOIN reservation_recovery rr ON rr.run_id=b.run_id "
+                "JOIN runs r ON r.run_id=b.run_id WHERE b.run_id=?",
+                (str(run_id),),
+            ).fetchone()
+            if row is None:
+                return ReleaseResult(
+                    AccountingDisposition.CONFLICT,
+                    run_id,
+                    detail="run has no reservation",
+                )
+            if row["reservation_state"] == "released":
+                identical = row["release_reason"] == reason
+                return ReleaseResult(
+                    (
+                        AccountingDisposition.AVAILABLE
+                        if identical
+                        else AccountingDisposition.CONFLICT
+                    ),
+                    run_id,
+                    idempotent=identical,
+                    detail=(
+                        ""
+                        if identical
+                        else "conflicting release reason"
+                    ),
+                )
+            eligible = (
+                row["reservation_state"] == "active"
+                and row["policy"] == "reconcile_only"
+                and row["run_state"] == "completed"
+                and row["outcome"] == "spend_unreconciled"
+                and not bool(row["has_lease"])
+                and row["recovery_updated_at"] is not None
+                and str(row["recovery_updated_at"]) <= cutoff
+            )
+            if not eligible:
+                return ReleaseResult(
+                    AccountingDisposition.CONFLICT,
+                    run_id,
+                    detail=(
+                        "reservation is not a stale completed "
+                        "accounting-retained run"
+                    ),
+                )
+            now = _stamp(self._now())
+            db.execute(
+                "UPDATE budget_reservations SET state='released', "
+                "release_reason=?, updated_at=? WHERE run_id=?",
+                (reason, now, str(run_id)),
+            )
+            db.execute(
+                "UPDATE runs SET outcome='spend_unmeasured_released' "
+                "WHERE run_id=?",
+                (str(run_id),),
+            )
+            self._transition(
+                db,
+                "reservation",
+                str(run_id),
+                "released",
+                {
+                    "reason": reason,
+                    "accounting": "unmeasured_after_reconciliation_grace",
+                },
+                correlation=Correlation(run_id=str(run_id)),
+            )
+            return ReleaseResult(AccountingDisposition.AVAILABLE, run_id)
+
     def _release(
         self,
         db: sqlite3.Connection,

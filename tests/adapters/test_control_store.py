@@ -1706,6 +1706,39 @@ def test_normal_settlement_converges_with_dead_lease_recovery(
     assert charges == 1
 
 
+def test_dead_lease_cannot_use_completed_unmeasured_release_path(
+    tmp_path,
+) -> None:
+    store = _store(tmp_path)
+    request = dataclasses.replace(_request(1), owner_id="o/r:fix")
+    assert store.reserve(
+        request,
+        lease=Lease(
+            request.run_id,
+            request.dispatch_id,
+            request.owner_id,
+            123,
+            123,
+            NOW,
+            99,
+        ),
+    ).admitted
+    assert store.reclaim_dead_leases(
+        request.owner_id, lambda _pid, _start: False
+    ) == (request.run_id,)
+
+    released = store.release_retained(
+        request.run_id,
+        "unmeasured_completed_reservation",
+        NOW + timedelta(minutes=3),
+    )
+
+    assert released.disposition is AccountingDisposition.CONFLICT
+    assert store.active_reservation_runs(request.owner_id) == (
+        request.run_id,
+    )
+
+
 def test_release_is_terminal_idempotent_and_returns_capacity(tmp_path):
     store = _store(tmp_path)
     store.reserve(_request(1))

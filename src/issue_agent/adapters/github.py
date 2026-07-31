@@ -1548,7 +1548,7 @@ class GitHubGateway:
         except Exception:  # noqa: BLE001 — see the section comment
             return ()
 
-    def issue_state_reason(self, number: int) -> str:
+    def issue_state_reason(self, issue: int) -> str:
         """An issue's `stateReason`, lower-cased ("reopened" | "completed" |
         "not_planned" | ""). Lower-cased because GitHub serves the GraphQL enum
         (REOPENED), and `parse_issue` already normalises `state` the same way —
@@ -1564,7 +1564,7 @@ class GitHubGateway:
         """
         try:
             d = self._gh_json(
-                ["issue", "view", str(number), "--repo", self.repo,
+                ["issue", "view", str(issue), "--repo", self.repo,
                  "--json", "stateReason"]
             )
             if not isinstance(d, dict):
@@ -1621,9 +1621,9 @@ class GitHubGateway:
             for item in (data.get("comments") or [])
         )
 
-    def is_issue_closed(self, number: int) -> bool:
+    def is_issue_closed(self, issue: int) -> bool:
         data = self._gh_json([
-            "issue", "view", str(number), "--repo", self.repo, "--json", "state",
+            "issue", "view", str(issue), "--repo", self.repo, "--json", "state",
         ])
         return isinstance(data, dict) and str(data.get("state") or "").upper() == "CLOSED"
 

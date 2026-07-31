@@ -20,9 +20,6 @@ from .actions import Action
 from .events import Correlation, EventEnvelope, JsonValue, TelemetryEvent
 from .contracts import (
     BudgetScope,
-    CommandId,
-    EffectReceipt,
-    LifecycleCommand,
     Money,
     PriceQuote,
     ReservationId,
@@ -44,10 +41,14 @@ class GitHubReads(Protocol):
 
 
 class RecentlyMergedRef(Protocol):
-    issue: int
-    title: str
-    pr: int
-    merged_at: str
+    @property
+    def issue(self) -> int: ...
+    @property
+    def title(self) -> str: ...
+    @property
+    def pr(self) -> int: ...
+    @property
+    def merged_at(self) -> str: ...
 
 
 @runtime_checkable
@@ -73,18 +74,6 @@ class WorkflowGitHubReads(GitHubReads, Protocol):
     def recently_merged_issues(
         self, author: str, limit: int = 30
     ) -> tuple[RecentlyMergedRef, ...]: ...
-
-
-class GitHubEffects(Protocol):
-    """Narrow privileged effect port.
-
-    Commands are idempotent within ``idempotency_key`` scope.  An ambiguous
-    remote response returns an UNKNOWN_OUTCOME receipt and is reconciled before
-    retry.
-    """
-
-    def execute_command(self, command: LifecycleCommand) -> EffectReceipt: ...
-    def reconcile_command(self, command_id: CommandId) -> EffectReceipt | None: ...
 
 
 class WorkflowState(Protocol):
@@ -155,8 +144,10 @@ class ActionExecutor(Protocol):
 class LegacyJournal(Protocol):
     """Read-only locator retained solely for historical JSONL conversion."""
 
-    path: str
-    canonical: bool
+    @property
+    def path(self) -> str: ...
+    @property
+    def canonical(self) -> bool: ...
 
 
 @runtime_checkable
@@ -244,15 +235,18 @@ class ProcessSupervisor(Protocol):
 
 
 class RecoveryLease(Protocol):
-    run_id: RunId
+    @property
+    def run_id(self) -> RunId: ...
 
 
 class RecoveryDisposition(Protocol):
-    value: str
+    @property
+    def value(self) -> str: ...
 
 
 class RecoveryRelease(Protocol):
-    disposition: RecoveryDisposition
+    @property
+    def disposition(self) -> RecoveryDisposition: ...
 
 
 class RecoveryControl(Protocol):
@@ -272,6 +266,12 @@ class RecoveryControl(Protocol):
     def leases(self, owner_id: str) -> tuple[RecoveryLease, ...]: ...
     def release_unlaunched(
         self, run_id: RunId, reason: str
+    ) -> RecoveryRelease: ...
+    def release_retained(
+        self,
+        run_id: RunId,
+        reason: str,
+        retained_before: datetime,
     ) -> RecoveryRelease: ...
     def pending_commands(self) -> tuple[object, ...]: ...
 

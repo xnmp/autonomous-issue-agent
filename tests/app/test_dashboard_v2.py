@@ -114,6 +114,62 @@ def test_collect_prefers_v2_fold_and_ignores_legacy_lifecycle(tmp_path) -> None:
     assert deployment.metrics.in_flight_issues == 0
 
 
+def test_completion_without_start_still_contributes_visible_cost(
+    tmp_path,
+) -> None:
+    state = tmp_path / "fix"
+    state.mkdir()
+    events = EventLog(
+        str(state / "events-v2.jsonl"),
+        Producer("deployment", "owner/repo", "fix", 100, "boot"),
+    )
+    events.emit(
+        WorldObserved(
+            "issue",
+            8,
+            "hash",
+            {"state": "open", "labels": ["ai-ready"]},
+        ),
+        correlation=Correlation(issue=8),
+        causation_time=NOW,
+    )
+    events.emit(
+        AgentRunCompleted(
+            "done",
+            False,
+            None,
+            1_000,
+            "model",
+            "codex",
+            500_000,
+            "USD",
+            "configured_rate_card",
+            None,
+            None,
+            "RESOLVE",
+        ),
+        correlation=Correlation(issue=8, run_id="orphan-completion"),
+        causation_time=NOW,
+    )
+
+    deployment = collect(
+        "demo",
+        "owner/repo",
+        (
+            str(state / "journal.jsonl"),
+            str(tmp_path / "review" / "journal.jsonl"),
+            str(tmp_path / "steward" / "journal.jsonl"),
+        ),
+        str(tmp_path / "logs"),
+        str(tmp_path / "spend.jsonl"),
+        control_db_path=str(tmp_path / "missing-control.db"),
+        now_fn=lambda: NOW,
+    )
+
+    assert deployment.issues[0].cost_usd == 0.5
+    assert deployment.issues[0].legs[0].status == "done"
+
+
 def test_collect_counts_reconciled_spend_without_a_completion_event(
     tmp_path,
 ) -> None:

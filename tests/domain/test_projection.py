@@ -43,6 +43,38 @@ def test_fold_is_duplicate_safe_and_joins_runs_by_run_id() -> None:
     assert len(model.applied_event_ids) == 2
 
 
+def test_duplicate_start_does_not_erase_a_completed_run() -> None:
+    first = _event(AgentRunStarted("m"), "start-1", 0, run_id="run")
+    complete = _event(
+        AgentRunCompleted("ok", False, None, 1, "m", "codex"),
+        "complete",
+        1,
+        run_id="run",
+    )
+    duplicate = _event(
+        AgentRunStarted("m"), "start-2", 2, run_id="run"
+    )
+
+    projected = fold((first, complete, duplicate)).runs["run"]
+
+    assert projected.start == first
+    assert projected.completion == complete
+
+
+def test_completion_without_start_remains_in_the_read_model() -> None:
+    complete = _event(
+        AgentRunCompleted("ok", False, None, 1, "m", "codex"),
+        "complete",
+        1,
+        run_id="run",
+    )
+
+    projected = fold((complete,)).runs["run"]
+
+    assert projected.start is None
+    assert projected.completion == complete
+
+
 def test_abandonment_corrects_the_specific_start_event() -> None:
     start = _event(AgentRunStarted("m"), "start", 0, run_id="run")
     abandoned = _event(AgentRunAbandoned("start", "dead lease"), "end", 1)

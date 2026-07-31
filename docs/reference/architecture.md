@@ -26,6 +26,10 @@ The layering is hexagonal and **machine-enforced** (import-linter contracts
 in `make test`): `domain/` is pure — no I/O, no env, no clock — `adapters/` is
 I/O, `app/` is wiring. New pure logic goes in `domain/`; new I/O goes behind an
 existing adapter or an injected callable.
+The Pyrefly seam gate structurally assigns every production adapter to each
+domain port it implements. An AST coverage contract requires every newly
+declared Protocol to join that checked set or an explicit documented exemption,
+so the global annotation-backlog suppressions cannot hide a new port drift.
 
 The steward optionally grooms open issue bodies (`STEWARD_GROOM=1`): it emits
 advisory comments and the orthogonal `maybe-resolved` label for verified recent
@@ -150,6 +154,11 @@ recovery converges with an equal recovered charge and corrects the false
 abandonment. Read-only spend projections validate the current migration
 history, SQLite quick check, foreign keys, and semantic invariants before
 showing authoritative current-day values.
+Completed usage-blind runs use a narrower bounded adjudication path: recovery
+first retries exact provider reconciliation for the reservation grace window,
+then atomically releases only a lease-free `completed/spend_unreconciled`
+reservation and records `spend_unmeasured_released`. Migrated ambiguous rows,
+dead leases, and running work cannot enter this path.
 Every migration is digest-validated and individually transactional; restart
 and concurrent-role tests interrupt both sides of every migration commit
 boundary and serialize fresh/v8/v9 boot. Machine-readable
@@ -209,6 +218,9 @@ The dashboard is a read-only projection consumer. Its canonical operational
 model is rebuilt by the pure `domain/projection.py::fold` over schema-v2
 events; GitHub reads may enrich titles and URLs but never infer lifecycle
 success or turn an unavailable observation into an empty world.
+The fold retains the first start for a run, never lets a duplicate start erase
+its terminal state, and preserves a completion even when its start aged out of
+the bounded event window, keeping visible cost and completion metrics intact.
 Per-role scheduler heartbeats supply scheduler-health freshness when an
 unchanged world correctly emits no new observation event; they do not infer
 process liveness.

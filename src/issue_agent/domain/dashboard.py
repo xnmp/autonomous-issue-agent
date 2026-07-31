@@ -472,7 +472,9 @@ def _v2_issue_row(
         run = model.runs.get(run_id)
         if run is None:
             continue
-        start_payload = run.start.payload
+        start_payload = (
+            run.start.payload if run.start is not None else None
+        )
         completion_payload = (
             run.completion.payload if run.completion is not None else None
         )
@@ -498,6 +500,7 @@ def _v2_issue_row(
         elif run.abandoned is None and isinstance(
             start_payload, AgentRunStarted
         ):
+            assert run.start is not None
             correlation = run.start.correlation
             running.append(
                 RunningLeg(

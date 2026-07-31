@@ -117,6 +117,14 @@ class RecoveryCoordinator:
             if result.disposition.value == "available":
                 unknown.append(run_id)
                 abandoned.add(run_id)
+                continue
+            retained = self.control.release_retained(
+                run_id,
+                "unmeasured_completed_reservation",
+                cutoff,
+            )
+            if retained.disposition.value == "available":
+                unknown.append(run_id)
         for run_id in sorted(abandoned):
             try:
                 self.abandonments.abandon_run(
