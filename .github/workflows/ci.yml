@@ -7,9 +7,9 @@ name: CI
 # self-hosting deployment, and a safety net for hand-merged PRs either way.
 on:
   push:
-    branches: [main, dev]
+    branches: [main, dev, canary/a76e620-dashboard-e2e]
   pull_request:
-    branches: [main, dev]
+    branches: [main, dev, canary/a76e620-dashboard-e2e]
 
 concurrency:
   group: ci-${{ github.ref }}
