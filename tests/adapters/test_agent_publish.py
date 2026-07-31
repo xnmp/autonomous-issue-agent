@@ -35,6 +35,7 @@ class Remote:
         self.intervene_before_push = ""
         self.create_pr_head = ""
         self.arm_after_push = False
+        self.origin_url = "git@github.com:o/r.git"
 
     def run(self, argv, _cwd):
         if argv == ("git", "rev-parse", "HEAD"):
@@ -42,7 +43,7 @@ class Remote:
         if argv == ("git", "branch", "--show-current"):
             return CommandResult(0, self.branch + "\n")
         if argv == ("git", "remote", "get-url", "--push", "origin"):
-            return CommandResult(0, "git@github.com:o/r.git\n")
+            return CommandResult(0, self.origin_url + "\n")
         if argv[:3] == ("git", "ls-remote", "--heads"):
             output = (
                 f"{self.remote}\trefs/heads/{self.branch}\n"
@@ -142,7 +143,7 @@ def test_push_is_committed_then_receipted(tmp_path):
         "git",
         "push",
         "--force-with-lease=refs/heads/fix/42-issue:",
-        "origin",
+        "git@github.com:o/r.git",
         "abc123:refs/heads/fix/42-issue",
     )
     assert control.pending_commands() == ()
@@ -257,6 +258,61 @@ def test_crash_after_push_is_reconciled_without_duplicate_effect(tmp_path):
     assert publisher.drain_pending_commands() == 1
     assert len(remote.effects) == 1
     assert control.pending_commands() == ()
+
+
+def test_replay_refuses_switched_origin_until_authority_is_restored(tmp_path):
+    remote = Remote()
+    remote.crash_after_push = True
+    control = store(tmp_path)
+    publisher = AgentPublicationBroker(
+        control,
+        repository="o/r",
+        base_branch="dev",
+        owner="o/r:fix",
+        run=remote.run,
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        publisher.publish(
+            ("git", "push", "origin", "HEAD:fix/42-issue"),
+            str(tmp_path),
+        )
+    remote.crash_after_push = False
+    remote.origin_url = "git@github.com:attacker/other.git"
+
+    assert publisher.drain_pending_commands() == 0
+    assert len(remote.effects) == 1
+    assert control.pending_commands()[0].state == "executing"
+
+    remote.origin_url = "git@github.com:o/r.git"
+    assert publisher.drain_pending_commands() == 1
+    assert len(remote.effects) == 1
+    assert control.pending_commands() == ()
+
+
+def test_pending_publication_never_uses_a_switched_symbolic_origin(tmp_path):
+    remote = Remote()
+    control = store(tmp_path)
+    publisher = AgentPublicationBroker(
+        control,
+        repository="o/r",
+        base_branch="dev",
+        owner="o/r:fix",
+        run=remote.run,
+    )
+    command = publisher._command(
+        ("git", "push", "origin", "HEAD:fix/42-issue"),
+        str(tmp_path),
+    )
+    pending = control.enqueue_command(command)
+    remote.origin_url = "git@github.com:attacker/other.git"
+
+    result = publisher._run_pending(pending)
+
+    assert result.code == 75
+    assert "configured repository" in result.stderr
+    assert remote.effects == []
+    assert control.pending_commands()[0].state == "pending"
 
 
 def test_pending_push_refuses_an_intervening_remote_revision(tmp_path):

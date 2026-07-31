@@ -227,6 +227,9 @@ class AgentPublicationBroker:
 
     def _run_pending(self, pending: PendingCommand) -> CommandResult:
         command = pending.command
+        authority_error = self._origin_authority_error(command)
+        if authority_error:
+            return CommandResult(75, stderr=authority_error)
         if pending.state == EffectStatus.SUCCEEDED.value:
             reconciled = self._reconcile(command)
             if reconciled is True:
@@ -307,7 +310,7 @@ class AgentPublicationBroker:
                     ),
                 )
             remote_head = self._remote_branch(
-                "origin", str(payload["branch"]), cwd
+                str(payload["remote_url"]), str(payload["branch"]), cwd
             )
             if remote_head != command.expected_revision:
                 now = datetime.now(timezone.utc)
@@ -332,6 +335,9 @@ class AgentPublicationBroker:
                         "pull-request creation"
                     ),
                 )
+        authority_error = self._origin_authority_error(command)
+        if authority_error:
+            return CommandResult(75, stderr=authority_error)
         if (
             command.kind is CommandKind.PUBLISH_BRANCH
             and not self._disable_auto_merge_before_push(
@@ -465,7 +471,9 @@ class AgentPublicationBroker:
                 self.repository,
                 self.host,
             )
-            prior = self._remote_branch(remote, destination, resolved_cwd)
+            prior = self._remote_branch(
+                remote_url, destination, resolved_cwd
+            )
             if prior is None:
                 raise RuntimeError("cannot verify remote branch before push")
             normalized = _captured_push(
@@ -473,6 +481,7 @@ class AgentPublicationBroker:
                 destination,
                 captured_head=head,
                 prior_remote_revision=prior,
+                remote=remote_url,
             )
             kind = CommandKind.PUBLISH_BRANCH
             target = f"branch:{self.repository}:{destination}"
@@ -494,8 +503,19 @@ class AgentPublicationBroker:
                 branch=branch,
                 base_branch=self.base_branch,
             )
+            remote = "origin"
+            remote_url = self._required_output(
+                ("git", "remote", "get-url", "--push", remote),
+                resolved_cwd,
+                "origin push URL",
+            )
+            _require_repository_remote(
+                remote_url,
+                self.repository,
+                self.host,
+            )
             remote_head = self._remote_branch(
-                "origin", branch, resolved_cwd
+                remote_url, branch, resolved_cwd
             )
             if remote_head is None:
                 raise RuntimeError(
@@ -522,7 +542,12 @@ class AgentPublicationBroker:
             )
             if prior:
                 return self._command_for_existing_pr(
-                    normalized, resolved_cwd, branch, head, prior
+                    normalized,
+                    resolved_cwd,
+                    branch,
+                    head,
+                    prior,
+                    remote_url,
                 )
             kind = CommandKind.OPEN_PULL_REQUEST
             target = f"pull-request:{self.repository}:{branch}"
@@ -533,6 +558,8 @@ class AgentPublicationBroker:
                 "base_branch": self.base_branch,
                 "prior_remote_object": "",
                 "owner": self.owner,
+                "remote": remote,
+                "remote_url": remote_url,
             }
         else:
             raise ValueError(
@@ -555,6 +582,7 @@ class AgentPublicationBroker:
         branch: str,
         head: str,
         remote_object: str,
+        remote_url: str,
     ) -> LifecycleCommand:
         payload: dict[str, object] = {
             "argv": list(argv),
@@ -563,6 +591,8 @@ class AgentPublicationBroker:
             "base_branch": self.base_branch,
             "prior_remote_object": remote_object,
             "owner": self.owner,
+            "remote": "origin",
+            "remote_url": remote_url,
         }
         return _lifecycle_command(
             CommandKind.OPEN_PULL_REQUEST,
@@ -575,11 +605,13 @@ class AgentPublicationBroker:
         )
 
     def _reconcile(self, command: LifecycleCommand) -> bool | None:
+        if self._origin_authority_error(command):
+            return None
         payload = command.payload
         cwd = str(payload["cwd"])
         if command.kind is CommandKind.PUBLISH_BRANCH:
             current = self._remote_branch(
-                str(payload["remote"]), str(payload["branch"]), cwd
+                str(payload["remote_url"]), str(payload["branch"]), cwd
             )
             if current is None:
                 return None
@@ -604,6 +636,39 @@ class AgentPublicationBroker:
                 return False
             return None
         return None
+
+    def _origin_authority_error(self, command: LifecycleCommand) -> str:
+        if command.kind not in {
+            CommandKind.PUBLISH_BRANCH,
+            CommandKind.OPEN_PULL_REQUEST,
+        }:
+            return "publication command kind is outside broker authority"
+        payload = command.payload
+        cwd = str(payload.get("cwd") or "")
+        captured = str(payload.get("remote_url") or "").strip()
+        remote = str(payload.get("remote") or "")
+        if not cwd or not captured or remote != "origin":
+            return "publication command lacks captured origin authority"
+        result = self._execute(
+            ("git", "remote", "get-url", "--push", remote), cwd
+        )
+        if result.code != 0 or not result.stdout.strip():
+            return "origin push URL is unavailable; refusing publication"
+        current = result.stdout.strip()
+        try:
+            _require_repository_remote(current, self.repository, self.host)
+            _require_repository_remote(captured, self.repository, self.host)
+        except ValueError:
+            return (
+                "origin push URL does not match the configured repository; "
+                "refusing publication"
+            )
+        if current != captured:
+            return (
+                "origin push URL changed after command capture; refusing "
+                "publication"
+            )
+        return ""
 
     def _remote_branch(
         self, remote: str, branch: str, cwd: str
@@ -915,6 +980,7 @@ def _captured_push(
     *,
     captured_head: str,
     prior_remote_revision: str,
+    remote: str,
 ) -> tuple[str, ...]:
     remote_ref = f"refs/heads/{destination}"
     return (
@@ -922,7 +988,7 @@ def _captured_push(
         "push",
         *flags,
         f"--force-with-lease={remote_ref}:{prior_remote_revision}",
-        "origin",
+        remote,
         f"{captured_head}:{remote_ref}",
     )
 
