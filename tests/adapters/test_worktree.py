@@ -459,7 +459,7 @@ def test_default_run_tests_scrubs_harness_knobs_from_child_environment(tmp_path,
         "ALLOW_UNTESTED", "RED_MUST_FAIL", "VERIFY_RED_AT_COMMIT",
         "BASE_BRANCH", "GATE_TEST_TIMEOUT_S", "GATE_GH_RETRY_SLEEP",
         "GH_APP_ID", "GH_APP_KEY_FILE", "GH_APP_INSTALL_ID", "TARGET_DIR",
-        "AGENT_ENV",
+        "AGENT_ENV", "ISSUE_AGENT_DEPLOYMENT_ID",
     ):
         monkeypatch.setenv(name, "outer-value")
     monkeypatch.setenv("TARGET_TEST_SENTINEL", "retained")
@@ -468,7 +468,8 @@ def test_default_run_tests_scrubs_harness_knobs_from_child_environment(tmp_path,
     assert ctx.run_tests(
         "test \"$TARGET_TEST_SENTINEL\" = retained && "
         "test -z \"${TEST_CMD:-}\" && test -z \"${GH_APP_ID:-}\" && "
-        "test -z \"${TARGET_DIR:-}\" && test -z \"${AGENT_ENV:-}\""
+        "test -z \"${TARGET_DIR:-}\" && test -z \"${AGENT_ENV:-}\" && "
+        "test -z \"${ISSUE_AGENT_DEPLOYMENT_ID:-}\""
     ) is True
 
 
