@@ -350,7 +350,7 @@ def build_role(
         )
         # runtime-tagged sessions: a FIXER_RUNTIME flip must cold-start resume
         # legs, not feed the new runtime the old runtime's session ids.
-        store = Store(cfg.state_dir, runtime=cfg.fixer_runtime)
+        store = Store(cfg.state_dir, runtime=cfg.fixer_runtime.value)
         # Server merge-gate probe (once per boot): only a positively verified
         # strict review+checks gate permits automated merging. Probed here
         # (not in from_env) because it needs the gateway; a flip of the repo's
@@ -390,7 +390,7 @@ def build_role(
         # A runtime flip must cold-start review legs too.  In particular, Codex
         # resume cannot preserve its read-only sandbox, and legacy Claude
         # session ids must never reach `codex exec resume`.
-        store = Store(cfg.review_state_dir, runtime=cfg.reviewer_runtime)
+        store = Store(cfg.review_state_dir, runtime=cfg.reviewer_runtime.value)
         return _probed(build_review_daemon(cfg, gw, store, runner), gw)
     if role == "steward":
         gw = GitHubGateway(

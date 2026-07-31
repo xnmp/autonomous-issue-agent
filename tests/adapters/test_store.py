@@ -7,6 +7,7 @@ import tempfile
 
 from issue_agent.adapters import store as store_module
 from issue_agent.adapters.store import HarnessMarkers, Store
+from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.triage import grooming_candidates, grooming_content
 from issue_agent.domain.world import IssueView, WorldState
 
@@ -544,6 +545,27 @@ def test_pr_sessions_are_tagged_the_same_way(tmp_path):
     s.save_pr_session(41, "rev-1")
     assert s.get_pr_session(41) == "rev-1"
     assert Store(str(tmp_path), runtime="codex").get_pr_session(41) == ""
+
+
+def test_runtime_enum_writes_canonical_tags_and_reads_deployed_legacy_tags(
+    tmp_path,
+):
+    store = Store(str(tmp_path), runtime=RuntimeName.CODEX)
+    store.save_session(7, "session-new")
+    store.save_model(7, "gpt-5.6-terra")
+    store.save_pr_session(11, "review-new")
+
+    assert (tmp_path / "issue-7.session").read_text() == "codex:session-new"
+    assert (tmp_path / "issue-7.model").read_text() == "codex:gpt-5.6-terra"
+    assert (tmp_path / "pr-11.session").read_text() == "codex:review-new"
+
+    (tmp_path / "issue-7.session").write_text("RuntimeName.CODEX:session-old")
+    (tmp_path / "issue-7.model").write_text("RuntimeName.CODEX:gpt-5.6-terra")
+    (tmp_path / "pr-11.session").write_text("RuntimeName.CODEX:review-old")
+
+    assert store.get_session(7) == "session-old"
+    assert store.get_model(7) == "gpt-5.6-terra"
+    assert store.get_pr_session(11) == "review-old"
 
 
 def test_model_marker_roundtrip_and_runtime_isolation():

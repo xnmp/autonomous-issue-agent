@@ -169,13 +169,14 @@ class AccountingRuntime(AgentRuntime):
             sort_keys=True,
             separators=(",", ":"),
         )
+        reserved_model = task.model or "<runtime-default>"
         request = ReservationRequest(
             ReservationId(uuid.uuid4().hex),
             run_id,
             dispatch_id,
             primary.scope,
             PriceQuote(
-                task.model or "<runtime-default>",
+                reserved_model,
                 "task-budget",
                 self.config_version,
                 now,
@@ -296,7 +297,7 @@ class AccountingRuntime(AgentRuntime):
         # here would turn an unavailable accounting authority into new budget
         # headroom even though the paid runtime already completed.
         return self._settle_result(
-            run_id, task.model or result.model, result
+            run_id, task.model or result.model or reserved_model, result
         )
 
     def _settle_result(

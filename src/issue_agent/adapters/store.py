@@ -20,6 +20,7 @@ import json
 import os
 from dataclasses import dataclass
 
+from ..domain.agent_task import RuntimeName
 from ..domain.world import normalize_predicted_paths
 
 # ── suffix universe (review M4/D8) ──────────────────────────────────────────
@@ -71,7 +72,14 @@ class Store:
     # a read under a DIFFERENT runtime returns "" — the leg cold-starts, which
     # every resume-shaped leg supports. Legacy untagged files (bare uuid) read
     # as "claude", the only runtime that existed when they were written.
-    runtime: str = "claude"
+    runtime: str | RuntimeName = RuntimeName.CLAUDE.value
+
+    def _runtime_tag(self) -> str:
+        return (
+            self.runtime.value
+            if isinstance(self.runtime, RuntimeName)
+            else self.runtime
+        )
 
     # ── pure path helpers ──
     def issue_path(self, issue: int, suffix: str) -> str:
@@ -151,7 +159,12 @@ class Store:
         tag, _, sid = raw.partition(":")
         if not sid:  # no ":" — legacy bare id, written before tagging existed
             tag, sid = "claude", raw
-        return sid if tag == self.runtime else ""
+        runtime = self._runtime_tag()
+        # Older composition roots interpolated RuntimeName directly and wrote
+        # `RuntimeName.CODEX:<value>`. Accept that deployed shape while every
+        # new write uses the stable enum value (`codex:<value>`).
+        legacy_enum_tag = f"RuntimeName.{runtime.upper()}"
+        return sid if tag in {runtime, legacy_enum_tag} else ""
 
     def get_session(self, issue: int) -> str:
         return self._session_for_runtime(self._read(self.issue_path(issue, "session")))
@@ -159,7 +172,8 @@ class Store:
     def save_session(self, issue: int, session_id: str) -> None:
         if session_id:
             self._write(
-                self.issue_path(issue, "session"), f"{self.runtime}:{session_id}"
+                self.issue_path(issue, "session"),
+                f"{self._runtime_tag()}:{session_id}",
             )
 
     def has_session(self, issue: int) -> bool:
@@ -175,7 +189,10 @@ class Store:
 
     def save_model(self, issue: int, model: str | None) -> None:
         if model:
-            self._write(self.issue_path(issue, "model"), f"{self.runtime}:{model}")
+            self._write(
+                self.issue_path(issue, "model"),
+                f"{self._runtime_tag()}:{model}",
+            )
 
     # ── router path predictions ─────────────────────────────────────────────
     def get_predicted_paths(self, issue: int) -> frozenset[str]:
@@ -200,7 +217,10 @@ class Store:
 
     def save_pr_session(self, pr: int, session_id: str) -> None:
         if session_id:
-            self._write(self.pr_path(pr, "session"), f"{self.runtime}:{session_id}")
+            self._write(
+                self.pr_path(pr, "session"),
+                f"{self._runtime_tag()}:{session_id}",
+            )
 
     # ── resume reply mark + counter ──
     def get_resumed_at(self, issue: int) -> str:

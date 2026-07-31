@@ -130,6 +130,41 @@ def test_paid_run_has_reservation_before_runtime_and_settles(tmp_path) -> None:
     assert runtime.calls == 1
 
 
+def test_unpinned_codex_run_without_reported_model_uses_reserved_fallback(
+    tmp_path,
+) -> None:
+    runtime = Runtime(
+        AgentResult(
+            False,
+            status="ok",
+            cost_usd=1.25,
+            session_id="resume-receipt",
+            usage={
+                "input_tokens": 100,
+                "output_tokens": 10,
+                "source": "rollout",
+            },
+        )
+    )
+    wrapper, store = _wrapper(tmp_path, runtime)
+
+    result = asyncio.run(
+        wrapper.run(RuntimePlan("resume", max_budget_usd=2))
+    )
+
+    assert result.status == "ok"
+    assert store.active_reservation_runs() == ()
+    with store._connect() as db:
+        reservation_model = db.execute(
+            "SELECT model FROM budget_reservations"
+        ).fetchone()[0]
+        amount, basis = db.execute(
+            "SELECT amount_micros, basis FROM charges"
+        ).fetchone()
+    assert reservation_model == "<runtime-default>"
+    assert (amount, basis) == (800, "configured_rate_card")
+
+
 def test_global_only_cap_keeps_workload_repository(tmp_path) -> None:
     runtime = Runtime(
         AgentResult(
