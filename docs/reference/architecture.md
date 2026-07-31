@@ -312,11 +312,16 @@ unit/plist-plus-private-config pairs; both systemd and launchd restore the
 previous pair if activation fails. Partial-role service upgrades are rejected:
 all unsuffixed, target-basename, repository-derived, and current-name legacy
 writers stop before any role imports or admits against the SQLite authority.
-launchd keys labels, logs, and its private config snapshot by the stable CLI
-deployment name rather than the mutable checkout path. A same-name checkout
-repoint therefore replaces one three-role job set atomically; checksum-era
-plists with that embedded deployment identity are stopped and removed during
-cutover, restored on failure, and included in scoped uninstall.
+Deployment names have one canonical lowercase representation; the CLI and
+both installers reject lossy aliases before service paths are resolved.
+Systemd and launchd key definitions and private snapshots by that stable name,
+while treating `TARGET_DIR` as the mutable component of a same-repository
+repoint. A repoint therefore replaces one three-role set atomically; launchd
+also stops and removes checksum-era plists with the same embedded identity,
+restores them on failure, and includes them in scoped uninstall. Both
+uninstallers stop the complete resolved role set before deleting any
+definition; a stop failure preserves every recoverable unit/plist and returns
+nonzero.
 Foreground and installed processes also carry an explicit deployment identity;
 operator stop/status discovery filters by that identity and never signals an
 unrelated deployment's role daemon.

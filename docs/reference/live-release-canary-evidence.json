@@ -1018,5 +1018,52 @@
         "Private-repository branch protection was unavailable under the current GitHub plan, so arm-on-open stayed inactive."
       ]
     }
+  },
+  "service_lifecycle_audit_follow_up": {
+    "observed_at": "2026-07-31T05:14:32Z",
+    "commit": "14a44b05807222fdd67eb7c8bccc649bfc67c6a2",
+    "code_tree": "76cd0e6566707cba3230934bef39d51a973deaee",
+    "source_audit": {
+      "candidate": "d233528fd562b7fdc0a6a09115d546fc6350e600",
+      "verdict": "blocked",
+      "p0_findings": 0,
+      "p1_findings": 3
+    },
+    "closed_findings": [
+      "Systemd now permits a stable-name same-repository checkout repoint, stops all three prior units before changing the private snapshot, and restores the prior unit/config state if activation fails.",
+      "Deployment names have one canonical lowercase representation at the CLI and installer boundaries; lossy aliases and aliasing existing artifacts fail closed before mutation.",
+      "Systemd and launchd uninstall resolve and stop the complete role set before deleting any definition; one stop/unload failure preserves every unit/plist and returns nonzero."
+    ],
+    "red_canaries": {
+      "systemd_repoint": "first install exited 0; same-name same-repository target change exited 2 and left the old snapshot",
+      "identity_alias": "Acme App and acme-app both installed successfully into the same three launchd paths, silently replacing checkout A with checkout B",
+      "failed_uninstall": "forced systemd disable and launchd unload failures were ignored; both uninstallers exited 0 and deleted all three recoverable definitions"
+    },
+    "green_canaries": {
+      "systemd_repoint": "exactly three stable-name units remain; every old stop precedes every replacement restart; units and private snapshot name checkout B",
+      "identity_alias": "CLI parsing, direct installer input, and pre-existing artifact scans reject noncanonical or colliding aliases with exit 2 and no mutation",
+      "failed_uninstall": "a forced review-role stop/unload failure returns nonzero and all three definitions remain on both platforms",
+      "successful_uninstall": "existing scoped and all-deployment success cases continue to remove only their resolved definitions"
+    },
+    "full_suite": {
+      "command": "UV_CACHE_DIR=/tmp/issue-agent-uv-cache make test",
+      "result": "passed",
+      "shell_hooks": 90,
+      "point_at": 7,
+      "domain_pytest": 659,
+      "adapter_pytest": 807,
+      "application_pytest": 1337,
+      "gate_parity": 48,
+      "import_contracts": 4,
+      "pyrefly_errors": 0
+    },
+    "deployment_environment_suite": "passed with 807 adapter tests and 90 hook contracts",
+    "live_systemd_dry_run": {
+      "command": "AGENT_ENV=config/.active.self.env ISSUE_AGENT_DEPLOYMENT_ID=self bash bin/install-systemd.sh --dry-run",
+      "result": "validated three units with the real systemd-analyze",
+      "executable": "/home/chong/.local/bin/uv",
+      "config_snapshot": "/home/chong/.config/issue-agent/self.env",
+      "persistent_services_changed": false
+    }
   }
 }

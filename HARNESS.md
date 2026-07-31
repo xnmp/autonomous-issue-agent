@@ -93,11 +93,15 @@ artifacts on failure. Rendered service definitions pin the absolute `uv`
 executable found during installation; the installers' `--dry-run` mode
 validates candidates without replacing live definitions. Each
 role/repository/checkout owns a distinct lock and identity.
-launchd filenames and private snapshots use the stable CLI deployment name,
-not a checksum of the mutable checkout path. Reinstalling the same deployment
-after a supported checkout repoint unloads all three prior jobs before the
-snapshot changes; checksum-era jobs carrying that identity are migrated in the
-same rollback-safe cutover and a scoped uninstall removes them as well.
+Deployment names have one canonical lowercase `[a-z0-9._-]` representation;
+the CLI and both installers reject lossy aliases before they can collide.
+Systemd and launchd key definitions and private snapshots by that stable name,
+while allowing `TARGET_DIR` to change for a same-repository repoint. Every
+prior role stops before the snapshot changes; launchd also migrates
+checksum-era jobs carrying that identity in the rollback-safe cutover.
+Uninstall is two-phase on both platforms: every loaded role must stop
+successfully before any definition is deleted, so a failure stays loud and
+recoverable.
 
 Systemd units use SIGTERM draining, a 90-second stop deadline, watchdog
 readiness, restart-rate limits, memory/task bounds, and do not restart permanent

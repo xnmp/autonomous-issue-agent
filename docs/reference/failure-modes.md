@@ -667,9 +667,38 @@ operator mistakes — recorded so they aren't re-diagnosed as bugs.
   by their embedded identity, and restores their files and loaded state if the
   cutover fails. Other deployments remain untouched.
 
+**119. Systemd refused the supported same-name checkout repoint**
+- The systemd installer used the stable deployment name for unit paths but
+  treated the snapshot's old `TARGET_DIR` as an immutable collision. A
+  same-repository `--write-config` repoint therefore failed before stopping or
+  replacing the prior units, and scoped uninstall left the blocking snapshot
+  behind. FIXED 2026-07-31: repository identity remains immutable, while the
+  target path is an explicitly mutable part of one stable deployment. All
+  three old units stop before the snapshot changes, and activation failure
+  restores the prior units, config, and enabled/active state.
+
+**120. Lossy deployment-name aliases collided in service-manager paths**
+- The CLI accepted arbitrary `--name` values while installers lowercased and
+  replaced unsafe characters. Distinct raw names such as `Acme App`,
+  `ACME-APP`, and `acme-app` therefore selected the same definitions, snapshot,
+  and logs; a same-repository sibling could silently replace the first
+  deployment. FIXED 2026-07-31: deployment names have one canonical lowercase
+  `[a-z0-9._-]` representation at the CLI boundary. Both installers reject
+  direct noncanonical identities and refuse any existing unit/plist whose
+  embedded raw identity aliases the requested canonical name.
+
+**121. Service uninstall deleted definitions after stop failure**
+- Systemd ignored `disable --now` failure and launchd ignored `unload` failure,
+  then both removed every unit/plist and returned success. A still-live daemon
+  could survive as an unmanaged writer with its recovery artifact erased.
+  FIXED 2026-07-31: uninstall resolves the complete target set, stops every
+  loaded role first, returns nonzero on any failure, and deletes definitions
+  only after the whole stop phase succeeds. A failed uninstall preserves all
+  definitions for operator recovery.
+
 ---
 
-_Generated from transcript mining, 2026-07-21. ~104 distinct entries after
+_Generated from transcript mining, 2026-07-21. ~107 distinct entries after
 dedup across 7 parallel search passes over the full transcript corpus.
 #104–#106 added 2026-07-25 from the T3 convergence-test probe (see
 docs/IMPROVEMENT-PLAN.md). #107–#110 added 2026-07-26 from the two adversarial
@@ -677,5 +706,5 @@ reviews (docs/REVIEW-2026-07-25-adversarial.md,
 docs/REVIEW-2026-07-26-p0-rereview.md) — the first three are new failure
 CLASSES, not instances; #110 is about the remediation process itself. #111
 added 2026-07-28 from the seventh tauri-explorer deployment. #112 added
-2026-07-30 during the architectural hardening full-suite gate. #113–#118 added
+2026-07-30 during the architectural hardening full-suite gate. #113–#121 added
 2026-07-31 during the final release audits._
