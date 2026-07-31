@@ -379,5 +379,105 @@
       },
       "operator_warning": "The repository rejected automatic enablement of allow_auto_merge; the canary continued with the documented manual repository-setting warning."
     }
+  },
+  "schema_v13_release_follow_up": {
+    "observed_at": "2026-07-31T01:21:01Z",
+    "runtime_commit": "36e3599021ef1c9c42e599cb7cf36852afed9f81",
+    "runtime_code_tree": "21309477bdcbb0b5b8902c22a8e1ee2729ce8321",
+    "release_commit": "2b0a2a0b8442ce3fd04aa49f3d161c750292cbc6",
+    "release_code_tree": "3586054961222521e194ae0b46d07afc3323aa4f",
+    "release_delta_note": "The release commit differs from the live role build only in the migration verifier and its repeat-run regression; the verifier was executed live from the release commit.",
+    "closed_findings": [
+      "Case aliases cannot bypass imported-spend caps; distinct rotated ledger files retain every occurrence, including byte-identical files, while same-source legacy receipts remain idempotent.",
+      "Reservation replay compares the complete persisted authority and rejects conflicting or terminal replays.",
+      "Repository-alias collisions during schema v13 migration fail permanently with a typed operator-repair error instead of restart-looping.",
+      "Repository canonicalization adopts pending outbox rows and retires old world-feed membership, including late old observations.",
+      "Event-log appends are process-locked, complete short writes, and truncate fragments before a durable-outbox retry.",
+      "World observations are byte-bounded so one pathological PR cannot roll back its sibling snapshot rows.",
+      "launchd unloads every current scoped writer before replacing the shared config snapshot.",
+      "Target commands scrub ISSUE_AGENT_DEPLOYMENT_ID and repository authority is canonical across configuration, commands, claims, events, spend, and CLI selection."
+    ],
+    "full_suite": {
+      "command": "make test",
+      "result": "passed",
+      "shell_hooks": 90,
+      "point_at": 7,
+      "domain_pytest": 656,
+      "adapter_pytest": 768,
+      "application_pytest": 1316,
+      "gate_parity": 48,
+      "import_contracts": 4,
+      "pyrefly_errors": 0
+    },
+    "hostile_deployment_environment": {
+      "command": "make test-deployment-env",
+      "result": "passed",
+      "scrub_lists": "in sync across Python and both bash copies",
+      "shell_hooks": 90
+    },
+    "dashboard": {
+      "unit_tests": 70,
+      "typecheck": "passed",
+      "production_build": "passed",
+      "playwright_workflows": 4,
+      "live_http": {
+        "root": "200 HTML production application",
+        "repos_api": "returned self, xnmp-keifu, and xnmp-tauri-explorer",
+        "self_overview_api": "returned all three stopped role feeds",
+        "text_fold": "rendered the self deployment"
+      }
+    },
+    "live_roles": {
+      "all_role_command": "ISSUE_AGENT_MAX_TICKS=0 bash bin/point-at.sh self",
+      "all_role_result": {
+        "exit_code": 0,
+        "doctor_errors": 0,
+        "doctor_warnings": 3,
+        "clean_origin_dev_test": "passed",
+        "fix": {
+          "heartbeat_state": "stopped",
+          "in_flight": []
+        },
+        "review": {
+          "heartbeat_state": "stopped",
+          "in_flight": []
+        },
+        "steward": {
+          "heartbeat_state": "stopped",
+          "in_flight": []
+        }
+      },
+      "real_observation_command": "ROLES=steward ISSUE_AGENT_MAX_TICKS=1 GATE_PROBE=0 bash bin/point-at.sh self",
+      "real_observation_result": "One GitHub-backed polling tick completed running -> draining -> stopped."
+    },
+    "migration_canary": {
+      "command": "uv run python scripts/verify_control_migration.py /home/chong/.local/state/issue-agent/spend.jsonl --database /home/chong/.local/state/issue-agent-control/control.db --canary-repository xnmp/autonomous-issue-agent --minimum-hours 24",
+      "result": "passed",
+      "run_id": "migration-canary-v3-ffc0cfbd718df8d7-ea98a29752944171-xnmp/autonomous-issue-agent",
+      "settled_amount_micros": 1,
+      "terminal_reservation_replay_rejected": true,
+      "settlement_replay_idempotent": true,
+      "conflicting_settlement_rejected": true,
+      "legacy_export_unchanged": true
+    },
+    "control_store": {
+      "database_mode": "0600",
+      "authority_witness_mode": "0600",
+      "integrity": "ok",
+      "schema_migrations": [
+        9,
+        10,
+        11,
+        12,
+        13
+      ],
+      "nonterminal_runs": 0,
+      "active_reservations": 0,
+      "leases": 0,
+      "dispatch_claims": 0,
+      "pending_commands": 0,
+      "pending_outbox": 0
+    },
+    "operator_warning": "The repository rejected automatic enablement of allow_auto_merge; the canary continued with the documented manual repository-setting warning."
   }
 }

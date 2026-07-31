@@ -97,5 +97,68 @@
       "dispatch_claims": 0,
       "pending_commands": 0
     }
+  },
+  "schema_v13_release_follow_up": {
+    "observed_at": "2026-07-31T01:21:01Z",
+    "commit": "2b0a2a0b8442ce3fd04aa49f3d161c750292cbc6",
+    "code_tree": "3586054961222521e194ae0b46d07afc3323aa4f",
+    "current_schema_version": 13,
+    "supported_upgrade_histories": [
+      [
+        8,
+        9,
+        10,
+        11,
+        12,
+        13
+      ],
+      [
+        9,
+        10,
+        11,
+        12,
+        13
+      ]
+    ],
+    "concurrency_contract": "Three spawned role processes concurrently initialize fresh, v8, and v9 databases; every process succeeds and the final history is contiguous and digest-valid through v13.",
+    "restart_contract": "Each v9, v10, v11, v12, and v13 migration is interrupted before commit and immediately after commit, then reopened and integrity-checked.",
+    "collision_contract": "Case-alias authority rows that would collide under schema v13 canonicalization fail with a permanent typed operator-repair error and leave the committed history at v12.",
+    "full_suite": "make test passed with 768 adapter tests, including schema concurrency, restart, digest, contiguity, and collision cases.",
+    "live_verifier": {
+      "command": "uv run python scripts/verify_control_migration.py /home/chong/.local/state/issue-agent/spend.jsonl --database /home/chong/.local/state/issue-agent-control/control.db --canary-repository xnmp/autonomous-issue-agent --minimum-hours 24",
+      "status": "passed",
+      "run_id": "migration-canary-v3-ffc0cfbd718df8d7-ea98a29752944171-xnmp/autonomous-issue-agent",
+      "verifier_digest": "338903e5888c5fe2953f74c2b3f645a86ce82ee5dcf96336fda20baefad5194a",
+      "source_digest": "ffc0cfbd718df8d7a68b79d78886ab2339a01d90e596ffc891c2a886b77ff185",
+      "rows": 303,
+      "amount_micros": 3013659291,
+      "representative_hours": 98.531,
+      "rows_match": true,
+      "totals_match": true,
+      "scope_balance_fingerprint_match": true,
+      "legacy_source_replay_idempotent": true,
+      "terminal_reservation_replay_rejected": true,
+      "primary_settlement_replay_idempotent": true,
+      "conflicting_provider_receipt_rejected": true,
+      "legacy_export_unchanged": true
+    },
+    "live_primary": {
+      "schema_migrations": [
+        9,
+        10,
+        11,
+        12,
+        13
+      ],
+      "database_integrity": "ok",
+      "database_mode": "0600",
+      "authority_witness_mode": "0600",
+      "nonterminal_runs": 0,
+      "active_reservations": 0,
+      "leases": 0,
+      "dispatch_claims": 0,
+      "pending_commands": 0,
+      "pending_outbox": 0
+    }
   }
 }
