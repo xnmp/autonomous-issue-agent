@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-31T01:53:00Z",
+  "generated_at": "2026-07-31T02:17:29Z",
   "repository": "xnmp/autonomous-issue-agent",
   "purpose": "Release evidence for the 2026-07-30 architectural implementation plan",
   "builds": {
@@ -8,7 +8,8 @@
     "active_shutdown": "f4f82beea72956a21eadc803a9a3672cf91cd834",
     "accounting_canary": "740cb2be0ba4d49a6d82534c274490480e7054f7",
     "money_precision_correction": "40f66dac71e9bc7a2a9c7649cb14dba7b13a5d1a",
-    "final_audit_remediation": "9786b5f65a516930e3758ab9ed360d657ba141cb"
+    "final_audit_remediation": "9786b5f65a516930e3758ab9ed360d657ba141cb",
+    "final_release": "cc0dc5a513ee0790ce5f3327ecd57adbc9f408d9"
   },
   "all_role_boot": {
     "roles": {
@@ -540,6 +541,85 @@
         12,
         13
       ],
+      "nonterminal_runs": 0,
+      "active_reservations": 0,
+      "leases": 0,
+      "dispatch_claims": 0,
+      "pending_commands": 0,
+      "pending_outbox": 0
+    },
+    "operator_warning": "The repository rejected automatic enablement of allow_auto_merge; the bounded canary continued with the documented manual repository-setting warning."
+  },
+  "final_projection_and_governor_follow_up": {
+    "observed_at": "2026-07-31T02:17:29Z",
+    "commit": "cc0dc5a513ee0790ce5f3327ecd57adbc9f408d9",
+    "code_tree": "865ead832b86072438ce2a077246784e986bdc19",
+    "closed_findings": [
+      "The advisory governor rejects gh api request bodies, attached or separate field arguments, and explicit methods; authenticated mutations cannot pass as API reads.",
+      "Clean shutdown commits a restartable feed-retirement event and deletes that role's stored world membership; stopped feeds cannot remain permanently authoritative, while later observations safely reactivate the stable deployment identity.",
+      "CloseIssue recovery recognizes either its exact comment or exact close state as partial progress, so a lost acknowledgement between the two writes cannot be rejected as unrelated revision drift."
+    ],
+    "full_suite": {
+      "command": "make test",
+      "result": "passed",
+      "shell_hooks": 90,
+      "point_at": 7,
+      "domain_pytest": 659,
+      "adapter_pytest": 780,
+      "application_pytest": 1316,
+      "gate_parity": 48,
+      "import_contracts": 4,
+      "pyrefly_errors": 0
+    },
+    "live_roles": {
+      "command": "ISSUE_AGENT_MAX_TICKS=0 GATE_PROBE=0 bash bin/point-at.sh self",
+      "exit_code": 0,
+      "doctor_errors": 0,
+      "doctor_warnings": 3,
+      "feed_retirements": {
+        "fix": {
+          "deployment": "e7f63b256a30fbf4",
+          "pid": 3866334,
+          "restartable": true
+        },
+        "review": {
+          "deployment": "30e2d1145844dc4e",
+          "pid": 3866335,
+          "restartable": true
+        },
+        "steward": {
+          "deployment": "934214f238852f48",
+          "pid": 3866336,
+          "restartable": true
+        }
+      },
+      "heartbeats": {
+        "fix": {
+          "state": "stopped",
+          "in_flight": []
+        },
+        "review": {
+          "state": "stopped",
+          "in_flight": []
+        },
+        "steward": {
+          "state": "stopped",
+          "in_flight": []
+        }
+      }
+    },
+    "control_store": {
+      "database_mode": "0600",
+      "authority_witness_mode": "0600",
+      "integrity": "ok",
+      "schema_migrations": [
+        9,
+        10,
+        11,
+        12,
+        13
+      ],
+      "self_role_world_rows_after_stop": 0,
       "nonterminal_runs": 0,
       "active_reservations": 0,
       "leases": 0,
