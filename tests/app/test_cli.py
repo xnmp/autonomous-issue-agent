@@ -214,6 +214,27 @@ def test_derive_name_sanitizes_and_falls_back():
     assert cli.derive_name("o/weird name!") == "o-weird-name"
 
 
+@pytest.mark.parametrize(
+    ("alias", "canonical"),
+    (
+        ("Acme App", "acme-app"),
+        ("acme@app", "acme-app"),
+        ("ACME-APP", "acme-app"),
+    ),
+)
+def test_explicit_deployment_name_aliases_are_rejected(
+    alias,
+    canonical,
+):
+    with pytest.raises(ValueError, match=repr(canonical)):
+        cli.resolve_name("acme/app", explicit=alias)
+    with pytest.raises(SystemExit) as exc:
+        cli.build_parser().parse_args(
+            ["install-service", "--name", alias]
+        )
+    assert exc.value.code == 2
+
+
 # ── P0R-2: derive_name includes the owner (collision fix) ─────────────────────
 def test_derive_name_includes_owner():
     assert cli.derive_name("acme/app") == "acme-app"

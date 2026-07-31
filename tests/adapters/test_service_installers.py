@@ -35,6 +35,15 @@ def _environment(
             """
 [ "${1:-}" != "--user" ] || shift
 printf '%s\n' "$*" >> "$SERVICE_LOG"
+if [ "${1:-}" = "disable" ] && [ -n "${FAIL_UNINSTALL_PATTERN:-}" ]; then
+  case "$*" in
+    *"$FAIL_UNINSTALL_PATTERN"*) exit 9 ;;
+  esac
+fi
+if [ "${1:-}" = "stop" ] \
+  && [ "${REQUIRE_OLD_SNAPSHOT_DURING_STOP:-0}" = "1" ]; then
+  grep -q 'KNOWN_GOOD=1' "$CUTOVER_SNAPSHOT" || exit 9
+fi
 if [ "${1:-}" = "is-active" ] || [ "${1:-}" = "is-enabled" ]; then
   selector="ACTIVE_UNITS"
   [ "${1:-}" != "is-enabled" ] || selector="ENABLED_UNITS"
@@ -64,6 +73,11 @@ exit 0
             fake_bin / "launchctl",
             """
 printf '%s\n' "$*" >> "$SERVICE_LOG"
+if [ "${1:-}" = "unload" ] && [ -n "${FAIL_UNINSTALL_PATTERN:-}" ]; then
+  case "${2:-}" in
+    *"$FAIL_UNINSTALL_PATTERN"*) exit 9 ;;
+  esac
+fi
 if [ "${1:-}" = "unload" ] \
   && [ "${REQUIRE_OLD_SNAPSHOT_DURING_UNLOAD:-0}" = "1" ]; then
   grep -q 'KNOWN_GOOD=1' "$CUTOVER_SNAPSHOT" || exit 9
@@ -94,15 +108,132 @@ exit 0
         "AGENT_ENV": str(config),
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "FAIL_PATTERN": fail_pattern,
+        "FAIL_UNINSTALL_PATTERN": "",
         "FAIL_ONCE_FILE": str(tmp_path / "failed-once"),
         "SERVICE_LOG": str(tmp_path / "service.log"),
         "LOADED_LABELS": "",
         "ACTIVE_UNITS": "",
         "ENABLED_UNITS": "",
         "REQUIRE_OLD_SNAPSHOT_DURING_UNLOAD": "0",
+        "REQUIRE_OLD_SNAPSHOT_DURING_STOP": "0",
         "CUTOVER_SNAPSHOT": "",
     }
     return env, home, fake_bin / "uv"
+
+
+@pytest.mark.parametrize("systemd", (True, False))
+def test_service_installers_reject_noncanonical_deployment_identity(
+    tmp_path,
+    systemd,
+):
+    env, home, _uv = _environment(tmp_path, systemd=systemd)
+    env["ISSUE_AGENT_DEPLOYMENT_ID"] = "Acme App"
+    script = "install-systemd.sh" if systemd else "install-launchd.sh"
+
+    result = subprocess.run(
+        ["bash", str(ROOT / "bin" / script)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "non-canonical deployment identity" in result.stderr
+    assert not tuple(
+        (
+            home / ".config/systemd/user"
+            if systemd
+            else home / "Library/LaunchAgents"
+        ).glob("*")
+    )
+
+
+@pytest.mark.parametrize("systemd", (True, False))
+def test_service_installers_refuse_an_existing_identity_alias(
+    tmp_path,
+    systemd,
+):
+    env, home, _uv = _environment(tmp_path, systemd=systemd)
+    env["ISSUE_AGENT_DEPLOYMENT_ID"] = "acme-app"
+    if systemd:
+        artifact = (
+            home
+            / ".config/systemd/user"
+            / "issue-agent-fix-watcher-acme-app.service"
+        )
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text(
+            "Environment=ISSUE_AGENT_DEPLOYMENT_ID=Acme App\n"
+        )
+        script = "install-systemd.sh"
+    else:
+        artifact = (
+            home
+            / "Library/LaunchAgents"
+            / "dev.issue-agent.fix-watcher.123456.plist"
+        )
+        artifact.parent.mkdir(parents=True)
+        artifact.write_text(
+            "<key>ISSUE_AGENT_DEPLOYMENT_ID</key>"
+            "<string>Acme App</string>\n"
+        )
+        script = "install-launchd.sh"
+
+    result = subprocess.run(
+        ["bash", str(ROOT / "bin" / script)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "deployment identity alias" in result.stderr
+    assert artifact.exists()
+
+
+@pytest.mark.parametrize("systemd", (True, False))
+def test_service_uninstall_preserves_every_definition_when_stop_fails(
+    tmp_path,
+    systemd,
+):
+    env, home, _uv = _environment(tmp_path, systemd=systemd)
+    env["ISSUE_AGENT_DEPLOYMENT_ID"] = "acme-app"
+    config = Path(env["AGENT_ENV"])
+    target = tmp_path / "target-repo"
+    config.write_text(f'REPO="acme/app"\nTARGET_DIR="{target}"\n')
+    script = "install-systemd.sh" if systemd else "install-launchd.sh"
+    install = subprocess.run(
+        ["bash", str(ROOT / "bin" / script)],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert install.returncode == 0, install.stderr
+    artifact_dir = (
+        home / ".config/systemd/user"
+        if systemd
+        else home / "Library/LaunchAgents"
+    )
+    artifacts = tuple(artifact_dir.glob("*"))
+    assert len(artifacts) == 3
+
+    env["FAIL_UNINSTALL_PATTERN"] = "review-watcher"
+    uninstall = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "bin" / script),
+            "uninstall",
+            "acme-app",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert uninstall.returncode != 0
+    assert "REFUSING uninstall" in uninstall.stderr
+    assert all(path.exists() for path in artifacts)
+    assert "removed 3" not in uninstall.stdout
 
 
 def test_systemd_installer_renders_validated_units_with_absolute_uv(tmp_path):
@@ -302,6 +433,65 @@ def test_systemd_deployment_ids_do_not_collide_and_reject_repointing(
     assert "REFUSING deployment 'acme-app'" in collision.stderr
     snapshot = home / ".config/issue-agent/acme-app.env"
     assert 'REPO="acme/app"' in snapshot.read_text()
+
+
+def test_systemd_same_name_repoint_replaces_all_units_atomically(
+    tmp_path,
+):
+    env, home, _uv = _environment(tmp_path, systemd=True)
+    env["ISSUE_AGENT_DEPLOYMENT_ID"] = "acme-app"
+    config = Path(env["AGENT_ENV"])
+    first_target = tmp_path / "checkout-a"
+    second_target = tmp_path / "checkout-b"
+    first_target.mkdir()
+    second_target.mkdir()
+    config.write_text(
+        f'REPO="acme/app"\nTARGET_DIR="{first_target}"\nKNOWN_GOOD=1\n'
+    )
+
+    first = subprocess.run(
+        ["bash", str(ROOT / "bin/install-systemd.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert first.returncode == 0, first.stderr
+    service_log = Path(env["SERVICE_LOG"])
+    first_call_count = len(service_log.read_text().splitlines())
+    snapshot = home / ".config/issue-agent/acme-app.env"
+
+    config.write_text(
+        f'REPO="acme/app"\nTARGET_DIR="{second_target}"\n'
+    )
+    env["REQUIRE_OLD_SNAPSHOT_DURING_STOP"] = "1"
+    env["CUTOVER_SNAPSHOT"] = str(snapshot)
+    second = subprocess.run(
+        ["bash", str(ROOT / "bin/install-systemd.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert second.returncode == 0, second.stderr
+    unit_dir = home / ".config/systemd/user"
+    units = tuple(unit_dir.glob("*.service"))
+    assert len(units) == 3
+    assert all(path.name.endswith("-acme-app.service") for path in units)
+    assert all(
+        f"Environment=TARGET_DIR={second_target}" in path.read_text()
+        for path in units
+    )
+    assert str(second_target) in snapshot.read_text()
+    second_calls = service_log.read_text().splitlines()[first_call_count:]
+    stops = [
+        second_calls.index(f"stop {path.name}")
+        for path in units
+    ]
+    restarts = [
+        second_calls.index(f"restart {path.name}")
+        for path in units
+    ]
+    assert max(stops) < min(restarts)
 
 
 def test_systemd_second_checkout_preserves_same_repo_deployment(

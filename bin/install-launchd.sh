@@ -11,13 +11,17 @@ CONFIG="${AGENT_ENV:-$HARNESS_ROOT/config/agent.env}"
 LA="$HOME/Library/LaunchAgents"
 mkdir -p "$LA"
 
+canonical_deployment_id() {
+  normalized="$(printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9._-]/-/g; s/^-+//; s/-+$//')"
+  printf '%s' "${normalized:-target}"
+}
+
 deployment_id_for_target() {
   target_dir="$1"
   if [ -n "${ISSUE_AGENT_DEPLOYMENT_ID:-}" ]; then
-    normalized="$(printf '%s' "$ISSUE_AGENT_DEPLOYMENT_ID" \
-      | tr '[:upper:]' '[:lower:]' \
-      | sed -E 's/[^a-z0-9._-]/-/g; s/^-+//; s/-+$//')"
-    printf '%s' "${normalized:-target}"
+    canonical_deployment_id "$ISSUE_AGENT_DEPLOYMENT_ID"
     return
   fi
   printf '%s' "$CONFIG|$target_dir" | cksum | awk '{print $1}'
@@ -68,10 +72,27 @@ if [ "${1:-}" = "uninstall" ]; then
       "$LA"/dev.issue-agent.steward*.plist
     )
   fi
+  targets=()
   for plist in "${patterns[@]}"; do
     [ -e "$plist" ] || continue
-    launchctl unload "$plist" 2>/dev/null || true
-    rm -f "$plist"
+    duplicate=0
+    for target in "${targets[@]}"; do
+      [ "$target" != "$plist" ] || duplicate=1
+    done
+    [ "$duplicate" -eq 1 ] || targets+=("$plist")
+  done
+  stop_failed=0
+  for plist in "${targets[@]}"; do
+    label="$(basename "$plist" .plist)"
+    if launchctl list "$label" >/dev/null 2>&1 \
+       && ! launchctl unload "$plist"; then
+      echo "REFUSING uninstall: failed to unload $label; plist definitions were preserved" >&2
+      stop_failed=1
+    fi
+  done
+  [ "$stop_failed" -eq 0 ] || exit 1
+  for plist in "${targets[@]}"; do
+    rm -f -- "$plist"
     echo "unloaded + removed $(basename "$plist" .plist)"
   done
   exit 0
@@ -91,6 +112,24 @@ CONFIG_REPO="$(set -a; . "$CONFIG"; set +a; printf '%s' "${REPO:-}")"
 [ -n "$TARGET_DIR" ] || echo "⚠ TARGET_DIR not set in $CONFIG — watchers will run from the harness dir and create worktrees in the wrong repo. Set TARGET_DIR."
 deployment_id="$(deployment_id_for_target "$TARGET_DIR")"
 DEPLOYMENT_NAME="${ISSUE_AGENT_DEPLOYMENT_ID:-$deployment_id}"
+[ -z "${ISSUE_AGENT_DEPLOYMENT_ID:-}" ] \
+  || [ "$ISSUE_AGENT_DEPLOYMENT_ID" = "$deployment_id" ] || {
+  echo "REFUSING non-canonical deployment identity '$ISSUE_AGENT_DEPLOYMENT_ID'; use '$deployment_id'" >&2
+  exit 2
+}
+if [ -n "${ISSUE_AGENT_DEPLOYMENT_ID:-}" ]; then
+  for installed in "$LA"/dev.issue-agent.*.plist; do
+    [ -e "$installed" ] || continue
+    installed_identity="$(plist_deployment_identity "$installed")"
+    [ -n "$installed_identity" ] || continue
+    [ "$(canonical_deployment_id "$installed_identity")" = "$deployment_id" ] \
+      || continue
+    [ "$installed_identity" = "$DEPLOYMENT_NAME" ] || {
+      echo "REFUSING deployment identity alias '$DEPLOYMENT_NAME': $installed embeds '$installed_identity' but both map to '$deployment_id'" >&2
+      exit 2
+    }
+  done
+fi
 LOG_DIR="$HOME/Library/Logs/issue-agent/$deployment_id"
 mkdir -p "$LOG_DIR"
 SNAP_DIR="$HOME/Library/Application Support/issue-agent"

@@ -148,6 +148,26 @@ def read_repo_env_field(path: str, field: str) -> str:
     return _source_env_file(path).get(field, "")
 
 
+def canonical_deployment_name(value: str) -> str:
+    """Canonical service/config identity accepted at mutating boundaries."""
+
+    normalized = re.sub(
+        r"[^a-z0-9._-]",
+        "-",
+        value.strip().lower(),
+    ).strip("-")
+    return normalized or "target"
+
+
+def _deployment_name_arg(value: str) -> str:
+    canonical = canonical_deployment_name(value)
+    if value != canonical:
+        raise argparse.ArgumentTypeError(
+            f"deployment name must be canonical; use {canonical!r}"
+        )
+    return canonical
+
+
 def derive_name(repo: str) -> str:
     """Fallback overlay name from a repo slug: OWNER-NAME, lowercased, safe chars.
 
@@ -173,8 +193,7 @@ def derive_name(repo: str) -> str:
     """
     repo = canonical_repository(repo)
     parts = [p for p in repo.split("/") if p] if repo else []
-    base = "-".join(parts).lower()
-    return re.sub(r"[^a-z0-9._-]", "-", base).strip("-") or "target"
+    return canonical_deployment_name("-".join(parts))
 
 
 def resolve_name(
@@ -204,7 +223,12 @@ def resolve_name(
     """
     repo = canonical_repository(repo)
     if explicit:
-        return explicit
+        canonical = canonical_deployment_name(explicit)
+        if explicit != canonical:
+            raise ValueError(
+                f"deployment name must be canonical; use {canonical!r}"
+            )
+        return canonical
     if repo and os.path.isdir(repos_dir):
         envs = [fn for fn in sorted(os.listdir(repos_dir)) if fn.endswith(".env")]
         want = os.path.realpath(target_dir) if target_dir else ""
@@ -1755,7 +1779,12 @@ def build_parser() -> argparse.ArgumentParser:
     def add_context_flags(sp):
         sp.add_argument("--repo", default="", help="owner/name (default: auto-detect from cwd)")
         sp.add_argument("--target-dir", default="", help="target working copy (default: git root of cwd)")
-        sp.add_argument("--name", default="", help="config/repos/<name>.env overlay name (default: reuse/derive)")
+        sp.add_argument(
+            "--name",
+            default="",
+            type=_deployment_name_arg,
+            help="canonical config/repos/<name>.env overlay name (default: reuse/derive)",
+        )
 
     sp = sub.add_parser("init", help="interactive first-run: create config/shared.env")
     sp.add_argument("--force", action="store_true", help="overwrite an existing shared.env")
@@ -1844,14 +1873,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("prepare-remote", help=argparse.SUPPRESS)
     sp.add_argument("--repo", required=True)
-    sp.add_argument("--name", required=True)
+    sp.add_argument("--name", required=True, type=_deployment_name_arg)
     sp.add_argument("--ensure-auto-merge", action="store_true")
     sp.add_argument("--skip-labels", action="store_true")
     sp.set_defaults(func=cmd_prepare_remote)
 
     sp = sub.add_parser("publish-base-branch", help=argparse.SUPPRESS)
     sp.add_argument("--repo", required=True)
-    sp.add_argument("--name", required=True)
+    sp.add_argument("--name", required=True, type=_deployment_name_arg)
     sp.add_argument("--target-dir", required=True)
     sp.add_argument("--branch", required=True)
     sp.set_defaults(func=cmd_publish_base_branch)

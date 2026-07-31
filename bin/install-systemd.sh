@@ -25,32 +25,47 @@ CONFIG="${AGENT_ENV:-$HARNESS_ROOT/config/agent.env}"
 UD="$HOME/.config/systemd/user"
 mkdir -p "$UD"
 
+canonical_deployment_id() {
+  normalized="$(printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9._-]/-/g; s/^-+//; s/-+$//')"
+  printf '%s' "${normalized:-target}"
+}
+
 services=(issue-agent-fix-watcher issue-agent-review-watcher issue-agent-steward)
 DRY_RUN=0
 [ "${1:-}" != "--dry-run" ] || DRY_RUN=1
 
 if [ "${1:-}" = "uninstall" ]; then
   if [ -n "${2:-}" ]; then
-    uninstall_name="$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]/-/g; s/^-+//; s/-+$//')"
-    uninstall_name="${uninstall_name:-target}"
+    uninstall_name="$(canonical_deployment_id "$2")"
     pattern="issue-agent-*-$uninstall_name.service"
   else
     pattern="issue-agent-*.service"
   fi
-  removed=0
+  targets=()
   for f in "$UD"/$pattern; do
     [ -e "$f" ] || continue
-    s="$(basename "$f" .service)"
-    systemctl --user disable --now "$s.service" 2>/dev/null || true
-    rm -f "$f"
-    removed=$((removed + 1))
+    targets+=("$f")
   done
-  systemctl --user daemon-reload 2>/dev/null || true
-  if [ "$removed" -eq 0 ]; then
+  if [ "${#targets[@]}" -eq 0 ]; then
     echo "no matching units found (${2:-all repos})"
-  else
-    echo "removed $removed unit(s)${2:+ for '$2'}"
+    exit 0
   fi
+  stop_failed=0
+  for f in "${targets[@]}"; do
+    s="$(basename "$f" .service)"
+    if ! systemctl --user disable --now "$s.service"; then
+      echo "REFUSING uninstall: failed to disable and stop $s.service; service definitions were preserved" >&2
+      stop_failed=1
+    fi
+  done
+  [ "$stop_failed" -eq 0 ] || exit 1
+  for f in "${targets[@]}"; do
+    rm -f -- "$f"
+  done
+  systemctl --user daemon-reload
+  echo "removed ${#targets[@]} unit(s)${2:+ for '$2'}"
   exit 0
 fi
 
@@ -75,9 +90,29 @@ if [ -z "$_raw_name" ] && [ -n "$CONFIG_REPO" ]; then
   _raw_name="${CONFIG_REPO//\//-}"
 fi
 [ -n "$_raw_name" ] || _raw_name="$(basename "${TARGET_DIR:-target}")"
-NAME="$(printf '%s' "$_raw_name" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]/-/g; s/^-+//; s/-+$//')"
-NAME="${NAME:-target}"
+NAME="$(canonical_deployment_id "$_raw_name")"
 DEPLOYMENT_NAME="${ISSUE_AGENT_DEPLOYMENT_ID:-$NAME}"
+[ -z "${ISSUE_AGENT_DEPLOYMENT_ID:-}" ] \
+  || [ "$ISSUE_AGENT_DEPLOYMENT_ID" = "$NAME" ] || {
+  echo "REFUSING non-canonical deployment identity '$ISSUE_AGENT_DEPLOYMENT_ID'; use '$NAME'" >&2
+  exit 2
+}
+if [ -n "${ISSUE_AGENT_DEPLOYMENT_ID:-}" ]; then
+  for installed in "$UD"/issue-agent-*.service; do
+    [ -e "$installed" ] || continue
+    installed_identity="$(
+      sed -n 's/^Environment=ISSUE_AGENT_DEPLOYMENT_ID=//p' "$installed" \
+        | tail -n 1
+    )"
+    [ -n "$installed_identity" ] || continue
+    [ "$(canonical_deployment_id "$installed_identity")" = "$NAME" ] \
+      || continue
+    [ "$installed_identity" = "$DEPLOYMENT_NAME" ] || {
+      echo "REFUSING deployment identity alias '$DEPLOYMENT_NAME': $installed embeds '$installed_identity' but both map to '$NAME'" >&2
+      exit 2
+    }
+  done
+fi
 _legacy_target_raw="$(basename "${TARGET_DIR:-target}")"
 LEGACY_TARGET_NAME="$(printf '%s' "$_legacy_target_raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9._-]/-/g; s/^-+//; s/-+$//')"
 LEGACY_TARGET_NAME="${LEGACY_TARGET_NAME:-target}"
@@ -90,7 +125,7 @@ SNAP_CONFIG="$SNAP_DIR/$NAME.env"
 if [ -f "$SNAP_CONFIG" ]; then
   SNAP_REPO="$(set -a; . "$SNAP_CONFIG"; set +a; printf '%s' "${REPO:-}")"
   SNAP_TARGET="$(set -a; . "$SNAP_CONFIG"; set +a; printf '%s' "${TARGET_DIR:-}")"
-  if [ "$SNAP_REPO" != "$CONFIG_REPO" ] || [ "$SNAP_TARGET" != "$TARGET_DIR" ]; then
+  if [ "$SNAP_REPO" != "$CONFIG_REPO" ]; then
     echo "REFUSING deployment '$NAME': existing snapshot belongs to REPO='$SNAP_REPO' TARGET_DIR='$SNAP_TARGET', requested REPO='$CONFIG_REPO' TARGET_DIR='$TARGET_DIR'" >&2
     exit 2
   fi
