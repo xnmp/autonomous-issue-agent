@@ -93,6 +93,11 @@ artifacts on failure. Rendered service definitions pin the absolute `uv`
 executable found during installation; the installers' `--dry-run` mode
 validates candidates without replacing live definitions. Each
 role/repository/checkout owns a distinct lock and identity.
+launchd filenames and private snapshots use the stable CLI deployment name,
+not a checksum of the mutable checkout path. Reinstalling the same deployment
+after a supported checkout repoint unloads all three prior jobs before the
+snapshot changes; checksum-era jobs carrying that identity are migrated in the
+same rollback-safe cutover and a scoped uninstall removes them as well.
 
 Systemd units use SIGTERM draining, a 90-second stop deadline, watchdog
 readiness, restart-rate limits, memory/task bounds, and do not restart permanent

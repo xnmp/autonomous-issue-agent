@@ -656,9 +656,20 @@ operator mistakes — recorded so they aren't re-diagnosed as bugs.
   outside the SQLite write transaction and a full structural revalidation
   before deletion.
 
+**118. A launchd checkout repoint left the prior three jobs running**
+- launchd labels and private snapshots were keyed by a checksum of the active
+  config path and `TARGET_DIR`, while the stable CLI deployment name was only
+  embedded inside each plist. Reinstalling after a supported same-name checkout
+  repoint therefore loaded three new jobs without discovering or unloading the
+  old three; scoped uninstall removed only the new checksum. FIXED 2026-07-31:
+  launchd now keys current artifacts by the stable deployment name, replaces
+  all roles before swapping the snapshot, discovers checksum-era predecessors
+  by their embedded identity, and restores their files and loaded state if the
+  cutover fails. Other deployments remain untouched.
+
 ---
 
-_Generated from transcript mining, 2026-07-21. ~103 distinct entries after
+_Generated from transcript mining, 2026-07-21. ~104 distinct entries after
 dedup across 7 parallel search passes over the full transcript corpus.
 #104–#106 added 2026-07-25 from the T3 convergence-test probe (see
 docs/IMPROVEMENT-PLAN.md). #107–#110 added 2026-07-26 from the two adversarial
@@ -666,5 +677,5 @@ reviews (docs/REVIEW-2026-07-25-adversarial.md,
 docs/REVIEW-2026-07-26-p0-rereview.md) — the first three are new failure
 CLASSES, not instances; #110 is about the remediation process itself. #111
 added 2026-07-28 from the seventh tauri-explorer deployment. #112 added
-2026-07-30 during the architectural hardening full-suite gate. #113–#117 added
+2026-07-30 during the architectural hardening full-suite gate. #113–#118 added
 2026-07-31 during the final release audits._

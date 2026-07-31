@@ -917,5 +917,41 @@
       }
     },
     "operator_warning": "The repository rejected automatic enablement of allow_auto_merge; the bounded canary continued with the documented manual repository-setting warning."
+  },
+  "launchd_repoint_audit_follow_up": {
+    "observed_at": "2026-07-31T04:40:51Z",
+    "commit": "73c7371e47781fc5805aad8fe879475c093a594b",
+    "code_tree": "823da2eb01a0c570f641557b8c8b2cd377ebbb7a",
+    "source_audit": {
+      "candidate": "1525b1d280315f9285fa5a0295ea7500aeb5ddf6",
+      "verdict": "blocked",
+      "p0_findings": 0,
+      "p1_findings": 1
+    },
+    "closed_finding": "A same-name macOS checkout repoint no longer derives a second launchd identity from the changed target path. All three prior jobs are unloaded before the private snapshot changes, and checksum-era jobs with the same embedded deployment identity participate in cutover, rollback, and scoped uninstall.",
+    "red_canary": {
+      "first_install_exit": 0,
+      "repoint_install_exit": 0,
+      "remaining_plists": 6,
+      "prior_unload_calls": 0
+    },
+    "green_canaries": {
+      "same_name_repoint": "three stable-name plists remain; every prior unload precedes every replacement load; all jobs and the private snapshot name the new checkout",
+      "checksum_migration": "all three loaded checksum-era predecessors are unloaded and removed while another deployment remains untouched",
+      "scoped_uninstall": "the stable deployment and its checksum-era predecessors are removed while another deployment remains untouched",
+      "failed_cutover": "all checksum-era predecessor plists, their loaded state, and the prior config snapshot are restored"
+    },
+    "full_suite": {
+      "command": "UV_CACHE_DIR=/tmp/issue-agent-uv-cache make test",
+      "result": "passed",
+      "shell_hooks": 90,
+      "point_at": 7,
+      "domain_pytest": 659,
+      "adapter_pytest": 800,
+      "application_pytest": 1334,
+      "gate_parity": 48,
+      "import_contracts": 4,
+      "pyrefly_errors": 0
+    }
   }
 }
