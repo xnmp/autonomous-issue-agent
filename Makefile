@@ -2,7 +2,7 @@
 SHELL := /bin/bash
 HARNESS_ROOT := $(shell pwd)
 
-.PHONY: help test test-config-generated test-governor test-hooks test-deployment-env test-point-at test-domain test-adapters test-app test-parity arch typecheck doctor dashboard-ui \
+.PHONY: help test test-config-generated test-governor test-residuals test-hooks test-deployment-env test-point-at test-domain test-adapters test-app test-parity arch typecheck doctor dashboard-ui \
 	        install point-at run-fix run-review run-steward demo-gate \
         install-launchd install-systemd \
         uninstall-launchd uninstall-systemd demo-init lint clean
@@ -29,7 +29,7 @@ help:
 # test-deployment-env is NOT in this chain: it re-runs the hook and adapter
 # suites under a hostile env, substantially increasing wall clock — and `make test` is the
 # self-hosted TEST_CMD paid on every gate run. CI runs it as its own step.
-test: test-config-generated test-governor test-hooks test-point-at test-domain test-adapters test-app test-parity arch typecheck
+test: test-config-generated test-governor test-residuals test-hooks test-point-at test-domain test-adapters test-app test-parity arch typecheck
 	@echo ""
 	@echo "✓ all suites passed"
 
@@ -40,6 +40,11 @@ test-config-generated:
 test-governor:
 	@echo "== governor (pytest) =="
 	@uv run --quiet tests/test_governor.py
+
+test-residuals:
+	@echo "== accepted residuals (pytest: strict xfail registry) =="
+	@uv run --quiet --with pytest --with tree-sitter --with tree-sitter-bash \
+		pytest tests/test_residuals.py
 
 test-hooks:
 	@echo "== hooks (bash) =="
@@ -97,6 +102,10 @@ arch:
 typecheck:
 	@echo "== typecheck (pyrefly: src + tests) =="
 	@uv run pyrefly check
+	@echo "== typecheck (pyrefly: required port conformance) =="
+	@uv run pyrefly check tests/typecheck/port_conformance.py \
+		--error bad-argument-type,bad-assignment,missing-attribute \
+		--progress-bar no
 
 doctor:
 	@bash bin/doctor.sh

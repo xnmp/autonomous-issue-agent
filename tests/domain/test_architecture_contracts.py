@@ -122,6 +122,64 @@ def test_app_gateway_usage_is_read_only() -> None:
     assert violations == []
 
 
+def test_app_cannot_gate_mutating_port_calls_on_runtime_protocol_probes() -> None:
+    """A structural runtime probe must never turn a durable write into a skip."""
+
+    mutation_prefixes = (
+        "abandon_",
+        "bump_",
+        "claim",
+        "clear_",
+        "drain_",
+        "enqueue_",
+        "execute_",
+        "flush_",
+        "prune_",
+        "receipt",
+        "record_",
+        "recover_",
+        "release",
+        "remove",
+        "replace_",
+        "reserve",
+        "retire_",
+        "save_",
+        "set_",
+        "settle",
+    )
+    ports_tree = ast.parse(
+        (DOMAIN / "ports.py").read_text(),
+        filename=str(DOMAIN / "ports.py"),
+    )
+    mutating_ports = {
+        node.name
+        for node in ports_tree.body
+        if isinstance(node, ast.ClassDef)
+        and any(
+            isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and member.name.startswith(mutation_prefixes)
+            for member in node.body
+        )
+    }
+
+    violations: list[str] = []
+    for path in _python_files(APP):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "isinstance"
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Name)
+                and node.args[1].id in mutating_ports
+            ):
+                violations.append(
+                    f"{path.relative_to(ROOT)}:{node.lineno} {node.args[1].id}"
+                )
+    assert violations == []
+
+
 def _literal_argv(node: ast.List | ast.Tuple) -> tuple[str, ...]:
     values = []
     for item in node.elts:

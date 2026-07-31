@@ -28,11 +28,9 @@ from ...domain.actions import AgentKind, Relabel, Target
 from ...adapters.runtime_plan import AgentRuntime, RunTelemetryRuntime
 from ...domain.ports import (
     ActionExecutor,
-    BranchState,
     CiPromptReads,
     FixWorktreePort,
     EventSink,
-    PredictionWriter,
     ReviewPromptReads,
     WorkflowGitHubReads,
     WorkflowState,
@@ -110,8 +108,7 @@ class FixWorkflow:
 
     def _ensure_cwd(self, issue: int, branch: str) -> str:
         cwd = self.worktrees.ensure(issue, branch)
-        if isinstance(self.store, BranchState):
-            self.store.save_branch(issue, branch)
+        self.store.save_branch(issue, branch)
         if self.prepare_cwd is not None:
             self.prepare_cwd(cwd)
         self.cfg.log(f"worktree #{issue}: ready on '{branch}' → {cwd}")
@@ -119,10 +116,9 @@ class FixWorkflow:
 
     def _resume_branch(self, issue: int, title: str) -> str:
         fallback = f"fix/{issue}-{slugify(title) or 'issue'}"
-        if isinstance(self.store, BranchState):
-            remembered = self.store.get_branch(issue)
-            if remembered:
-                return remembered
+        remembered = self.store.get_branch(issue)
+        if remembered:
+            return remembered
         remembered = self.worktrees.branch_for_issue(issue, fallback)
         if remembered:
             return remembered
@@ -505,8 +501,7 @@ class FixWorkflow:
                 )
                 tier = result.field("tier")
                 predicted_paths = normalize_predicted_paths(result.field("predicted_paths"))
-                if isinstance(self.store, PredictionWriter):
-                    self.store.save_predicted_paths(issue, predicted_paths)
+                self.store.save_predicted_paths(issue, predicted_paths)
             except Exception as exc:  # noqa: BLE001 — routing is advisory, never fatal
                 self.cfg.log(f"agent #{issue}: route — failed ({exc}); dispatching unrouted")
                 return self._escalated(cfg, issue, "resolve", iss=iss), False

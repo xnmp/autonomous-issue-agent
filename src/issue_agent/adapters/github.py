@@ -205,6 +205,7 @@ class GhUnavailable(RuntimeError):
         "network": "unreachable (network)",
         "server": "server error (5xx)",
     }
+    _MAX_DETAIL_BYTES = 8 * 1024
 
     def __init__(
         self,
@@ -215,7 +216,9 @@ class GhUnavailable(RuntimeError):
         retry_after_s: float | None = None,
     ):
         self.kind = kind
-        self.detail = _one_line(detail)
+        self.detail = _cap_bytes(
+            _one_line(detail), self._MAX_DETAIL_BYTES
+        )
         self.argv = tuple(argv or ())
         self.timed_out = timed_out
         self.retry_after_s = retry_after_s

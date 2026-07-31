@@ -463,6 +463,12 @@ def _effects(
     return EffectRecovery(executor, publications)
 
 
+@dataclass(frozen=True)
+class _RecoveryHooks:
+    after_suspend: Callable[[], object]
+    sweep_reservations: Callable[[], object]
+
+
 def _recovery(
     state_dir: str,
     cfg: HarnessConfig,
@@ -472,7 +478,7 @@ def _recovery(
     worktrees: Worktrees | None = None,
     *,
     owner_id: str,
-) -> Callable[[], object]:
+) -> _RecoveryHooks:
     from ..adapters.process_supervisor import ProcessSupervisor
 
     effective_state_dir = state_dir or os.path.dirname(control.path)
@@ -493,13 +499,16 @@ def _recovery(
         owner_id,
     )
 
-    def recover() -> object:
-        report = coordinator.recover()
+    def flush_after(callback: Callable[[], object]) -> object:
+        report = callback()
         control.flush_bound_outbox()
         return report
 
-    recover()
-    return recover
+    flush_after(coordinator.recover)
+    return _RecoveryHooks(
+        lambda: flush_after(coordinator.recover_after_suspend),
+        lambda: flush_after(coordinator.sweep_reservations),
+    )
 
 
 def _force_kill(
@@ -1412,7 +1421,7 @@ def _hold_reporter(
     repo: str,
     log,
     issue_is_blocked: Callable[[int], bool] | None = None,
-    control=None,
+    control: LevelState | None = None,
 ):
     """Report defer begin/clear transitions without steady-state tick noise.
 
@@ -1471,7 +1480,7 @@ def _hold_reporter(
     def report(world, inflight=()) -> None:
         nonlocal active
         if active is None:
-            if isinstance(control, LevelState):
+            if control is not None:
                 active = {
                     key_from_fields(fields): dict(fields)
                     for fields in control.load_level_state("holds", repo).values()
@@ -1540,7 +1549,7 @@ def _hold_reporter(
                     )
                 )
             active.pop(key, None)
-        if isinstance(control, LevelState):
+        if control is not None:
             control.replace_level_state(
                 "holds",
                 repo,
@@ -2030,7 +2039,8 @@ def build_fix_daemon(
         force_kill_dispatches=_force_kill(cfg, "fix", cfg.state_dir),
         dispatch_rejected=reservations.finish,
         heartbeat_path=os.path.join(cfg.state_dir, "heartbeat.json"),
-        recover=recovery,
+        recover=recovery.after_suspend,
+        sweep_reservations=recovery.sweep_reservations,
         prepare_shutdown=_shutdown_prepare(
             control,
             owner_id=owner_id,
@@ -2272,7 +2282,8 @@ def build_review_daemon(
                   heartbeat_path=os.path.join(
                       cfg.review_state_dir, "heartbeat.json"
                   ),
-                  recover=recovery,
+                  recover=recovery.after_suspend,
+                  sweep_reservations=recovery.sweep_reservations,
                   prepare_shutdown=_shutdown_prepare(
                       control,
                       owner_id=owner_id,
@@ -2558,7 +2569,8 @@ def build_steward_daemon(
                   heartbeat_path=os.path.join(
                       cfg.steward_state_dir, "heartbeat.json"
                   ),
-                  recover=recovery,
+                  recover=recovery.after_suspend,
+                  sweep_reservations=recovery.sweep_reservations,
                   prepare_shutdown=_shutdown_prepare(
                       control,
                       owner_id=owner_id,

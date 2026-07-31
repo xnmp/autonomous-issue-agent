@@ -187,7 +187,13 @@ def main() -> None:
     #    the variable_assignment env prefixes (HUSKY=0 git …) and any env vars
     #    recovered from an `env KEY=VAL git …` wrapper (g.extra_env) are checked.
     for g, env in governed:
-        reason = bypass_reason(g.full_words, g.kind, env, g.extra_env)
+        reason = bypass_reason(
+            g.full_words,
+            g.kind,
+            env,
+            g.extra_env,
+            g.durable_wrapper,
+        )
         if reason:
             _block(f"Blocked: {reason}")
 
@@ -223,4 +229,13 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException as exc:
+        sys.stderr.write(
+            "Blocked: command governor failed safely — "
+            f"{type(exc).__name__}\n"
+        )
+        sys.exit(2)

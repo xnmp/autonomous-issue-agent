@@ -4,9 +4,9 @@ This is the deployment truth, not a security claim inferred from hooks.
 
 | Runtime | Sandbox/tool surface | Resume | Budget evidence | Governor coverage | Agent publication credentials | Supported inbound trust |
 |---|---|---|---|---|---|---|
-| Claude | SDK tool allow/deny; worktree cwd; broad fixer Bash | yes; sandbox preserved | provider result/usage; native limit | in-process PreToolUse + gates | currently visible to the agent process | trusted inbound only |
-| Codex | `workspace-write`/`read-only` selection; child process group | supported, but resume cannot preserve every exec-only sandbox flag | rollout counters priced by configured card | state-owned absolute hook; fail-closed resolver + gates | currently inherited by the Codex child | trusted inbound only |
-| GLM | Claude SDK surface with a validated profile/environment | Claude semantics | provider result where supplied; otherwise explicit unknown | Claude hook path | currently visible to the agent process | trusted inbound only |
+| Claude | SDK tool allow/deny; worktree cwd; broad fixer Bash | yes; sandbox preserved | provider result/usage; native limit | in-process PreToolUse + gates | publication env keys are scrubbed from supervised commands; same-account home/filesystem access remains | trusted inbound only |
+| Codex | `workspace-write`/`read-only` selection; child process group | supported, but resume cannot preserve every exec-only sandbox flag | rollout counters priced by configured card | state-owned absolute hook; fail-closed resolver + gates | publication env keys are scrubbed; operator HOME and same-account filesystem access remain | trusted inbound only |
+| GLM | Claude SDK surface with a validated profile/environment | Claude semantics | provider result where supplied; otherwise explicit unknown | Claude hook path | publication env keys are scrubbed from supervised commands; same-account home/filesystem access remains | trusted inbound only |
 
 | Concern | Authority | Failure posture |
 |---|---|---|
@@ -21,9 +21,11 @@ This is the deployment truth, not a security claim inferred from hooks.
 All paid runtimes receive the durable `issue-agent-publish` command. Raw
 `git push` and `gh pr create` are denied on the supported hook paths; the broker
 records `PUBLISH_BRANCH`/`OPEN_PULL_REQUEST` commands and trusted receipts and
-reconciles executing/unknown commands on boot. Because credentials remain in
-the child until the trigger-gated isolation phase, bypassing the advisory hook
-is still possible and keeps every runtime in the trusted-inbound posture.
+reconciles executing/unknown commands on boot. Because the model still runs as
+the daemon's OS account, filesystem or local-socket access may recover
+publication authority despite environment scrubbing. Bypassing the advisory
+hook is therefore still possible and keeps every runtime in the trusted-inbound
+posture.
 
 The trigger-gated end state for untrusted inbound repositories removes
 publication credentials from agent children and publishes verified artifacts

@@ -48,6 +48,7 @@ from ..domain.events import (
     EventPayload,
     JsonValue,
     MAX_EVENT_LINE_BYTES,
+    ReservationRetained,
     SpendRecorded,
     WorldFeedRetired,
     WorldObserved,
@@ -652,6 +653,11 @@ class SQLiteControlStore:
         self._event_line_limit = MAX_EVENT_LINE_BYTES
         self._flushing_outbox = False
         self._bound_owner_id: str | None = None
+        self._telemetry_enqueue_failures = 0
+
+    @property
+    def telemetry_enqueue_failures(self) -> int:
+        return self._telemetry_enqueue_failures
 
     def bind_event_outbox(
         self,
@@ -693,7 +699,7 @@ class SQLiteControlStore:
             state,
             dict(detail or {}),
         )
-        self.enqueue_event(self._event_factory(payload, correlation), db)
+        self._enqueue_operational_event(db, payload, correlation)
 
     def _event(
         self,
@@ -702,8 +708,25 @@ class SQLiteControlStore:
         *,
         correlation: Correlation = Correlation(),
     ) -> None:
-        if self._event_factory is not None:
-            self.enqueue_event(self._event_factory(payload, correlation), db)
+        self._enqueue_operational_event(db, payload, correlation)
+
+    def _enqueue_operational_event(
+        self,
+        db: sqlite3.Connection,
+        payload: EventPayload,
+        correlation: Correlation,
+    ) -> None:
+        """Keep telemetry encoding failures outside authoritative transactions."""
+
+        if self._event_factory is None:
+            return
+        try:
+            self.enqueue_event(
+                self._event_factory(payload, correlation),
+                db,
+            )
+        except Exception:
+            self._telemetry_enqueue_failures += 1
 
     def _flush_bound_outbox(self) -> int:
         if self._event_sink is None or self._flushing_outbox:
@@ -741,7 +764,7 @@ class SQLiteControlStore:
                     )
             if database_exists:
                 self.integrity_check()
-            with self._connect() as db:
+            with self._connect(create=not database_exists) as db:
                 applied = self._migration_history(db)
                 if not applied and self._has_user_schema(db):
                     raise IncompatibleSchema(
@@ -1765,6 +1788,47 @@ class SQLiteControlStore:
                 ).fetchall()
             )
         return tuple(RunId(row["run_id"]) for row in rows)
+
+    def stale_active_reservation_runs(
+        self,
+        owner_id: str,
+        created_before: datetime,
+    ) -> tuple[RunId, ...]:
+        """Return active reservations old enough to be outside spawn grace."""
+
+        cutoff = _stamp(created_before)
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT b.run_id FROM budget_reservations b JOIN runs r "
+                "ON r.run_id=b.run_id WHERE b.state='active' "
+                "AND r.owner_id=? AND b.created_at<=? ORDER BY b.created_at",
+                (owner_id, cutoff),
+            ).fetchall()
+        return tuple(RunId(row["run_id"]) for row in rows)
+
+    def record_reservation_retained(
+        self,
+        run_id: RunId,
+        reason: str,
+    ) -> bool:
+        """Publish why an active reservation remains unavailable as headroom."""
+
+        if not reason:
+            raise ValueError("reservation retention reason is required")
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT b.state, r.dispatch_id FROM budget_reservations b "
+                "JOIN runs r ON r.run_id=b.run_id WHERE b.run_id=?",
+                (str(run_id),),
+            ).fetchone()
+            if row is None or row["state"] != "active":
+                return False
+            self._event(
+                db,
+                ReservationRetained(str(run_id), reason),
+                correlation=_run_correlation(run_id, row["dispatch_id"]),
+            )
+            return True
 
     def record_owned_cancellation_intents(
         self,
@@ -3832,12 +3896,23 @@ class SQLiteControlStore:
         ).fetchone()["amount"]
         return int(settled), int(reserved)
 
-    def _connect(self) -> sqlite3.Connection:
-        db = sqlite3.connect(
-            self.path,
-            timeout=self.busy_timeout_ms / 1000,
-            isolation_level=None,
-        )
+    def _connect(self, *, create: bool = False) -> sqlite3.Connection:
+        mode = "rwc" if create else "rw"
+        uri = f"{Path(self.path).as_uri()}?mode={mode}"
+        try:
+            db = sqlite3.connect(
+                uri,
+                timeout=self.busy_timeout_ms / 1000,
+                isolation_level=None,
+                uri=True,
+            )
+        except sqlite3.OperationalError as exc:
+            if not create and not os.path.exists(self.path):
+                raise CorruptControlStore(
+                    "control-store authority database disappeared after "
+                    "initialization"
+                ) from exc
+            raise
         db.row_factory = sqlite3.Row
         db.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
         db.execute("PRAGMA foreign_keys=ON")

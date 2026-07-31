@@ -969,11 +969,11 @@ class PatchStore(FakeStore):
         super().__init__()
         self.patch_ids = {}
 
-    def get_last_patch_id(self, pr):
-        return self.patch_ids.get(pr, "")
+    def get_last_patch_id(self, p):
+        return self.patch_ids.get(p, "")
 
-    def set_last_patch_id(self, pr, patch_id):
-        self.patch_ids[pr] = patch_id
+    def set_last_patch_id(self, p, s):
+        self.patch_ids[p] = s
 
 
 class DiffGateway(FakeGateway):
@@ -1257,7 +1257,7 @@ def test_the_skip_costs_exactly_one_diff_fetch_no_matter_the_mode():
 def test_an_unreadable_patch_baseline_reviews_rather_than_skips():
     """Fail-safe: a store that cannot answer must never be read as 'unchanged'."""
     class BrokenStore(PatchStore):
-        def get_last_patch_id(self, pr):
+        def get_last_patch_id(self, p):
             raise OSError("state dir gone")
 
     store = BrokenStore()
@@ -1274,7 +1274,7 @@ def test_rebound_verdict_prevents_paid_review_when_cache_write_fails():
     """Once GitHub has the new-head verdict, a cache failure must not buy a
     duplicate paid review; the next poll reconciles the remote review."""
     class UnwritableSha(PatchStore):
-        def set_last_sha(self, pr, sha):
+        def set_last_sha(self, p, s):
             raise OSError("read-only state dir")
 
     store = UnwritableSha()

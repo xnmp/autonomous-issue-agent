@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
+import re
 import stat
 import threading
 import time
@@ -24,9 +26,57 @@ from ..domain.events import (
     ProjectionSnapshot,
     WorldFeedRetired,
     WorldObserved,
+    decode_event,
     encode_event_line,
     new_event_id,
 )
+
+_ROTATION_SUFFIX = re.compile(
+    r"^\d{8}T\d{6}\.\d{6}Z\.[0-9a-f]{32}$"
+)
+
+
+@dataclass(frozen=True)
+class EventReadResult:
+    events: tuple[EventEnvelope, ...]
+    malformed_lines: int = 0
+
+
+def read_event_log(path: str) -> EventReadResult:
+    """Read the current feed and writer-generated rotations, skipping bad lines."""
+
+    current = Path(path)
+    rotations = (
+        tuple(
+            candidate
+            for candidate in sorted(current.parent.glob(f"{current.name}.*"))
+            if _ROTATION_SUFFIX.fullmatch(
+                candidate.name.removeprefix(f"{current.name}.")
+            )
+        )
+        if current.parent.exists()
+        else ()
+    )
+    candidates = (*rotations, *((current,) if current.exists() else ()))
+    events: list[EventEnvelope] = []
+    malformed = 0
+    for candidate in candidates:
+        try:
+            lines = candidate.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            malformed += 1
+            continue
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                raw = json.loads(line)
+                if not isinstance(raw, dict):
+                    raise ValueError("event line is not an object")
+                events.append(decode_event(raw))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                malformed += 1
+    return EventReadResult(tuple(events), malformed)
 
 
 @dataclass

@@ -14,6 +14,7 @@ from tree_sitter import Language, Parser
 import tree_sitter_bash as tsb
 
 PARSER = Parser(Language(tsb.language()))
+MAX_AST_DEPTH = 64
 
 GUARDED_GIT_SUBCMDS = ("config", "push")
 GOVERNED_KINDS = frozenset(
@@ -48,7 +49,11 @@ def _deescape(s: str) -> str:
     return "".join(out)
 
 
-def arg_value(node) -> str:
+class PolicyComplexityError(ValueError):
+    """The shell AST exceeds the bounded surface the governor can inspect."""
+
+
+def arg_value(node, *, _depth: int = 0) -> str:
     """Logical string value of an argument node (unwraps quotes/concatenation/
     ANSI-C quoting and shell backslash escapes).
 
@@ -56,6 +61,10 @@ def arg_value(node) -> str:
     `--no\\-verify` all collapse to their runtime string so bypass detection
     cannot be hidden behind quoting or escaping.
     """
+    if _depth > MAX_AST_DEPTH:
+        raise PolicyComplexityError(
+            f"shell syntax exceeds the maximum depth of {MAX_AST_DEPTH}"
+        )
     t = node.type
     if t == "string":
         # double-quoted: keep only literal string_content chunks
@@ -68,7 +77,9 @@ def arg_value(node) -> str:
         # is to recover flag spellings like $'--no-verify', not escape sequences.)
         return _text(node)[2:-1] if _text(node).startswith("$'") else _text(node)
     if t in ("concatenation", "word") and node.children:
-        return "".join(arg_value(c) for c in node.children)
+        return "".join(
+            arg_value(c, _depth=_depth + 1) for c in node.children
+        )
     # Leaf word/number/other: de-escape shell backslashes.
     return _deescape(_text(node))
 
@@ -105,15 +116,19 @@ def extract_commands_with_env(src: str) -> list[tuple[list[str], list[str]]]:
     tree = PARSER.parse(bytes(src, "utf-8"))
     out: list[tuple[list[str], list[str]]] = []
 
-    def visit(node):
+    def visit(node, depth: int) -> None:
+        if depth > MAX_AST_DEPTH:
+            raise PolicyComplexityError(
+                f"shell syntax exceeds the maximum depth of {MAX_AST_DEPTH}"
+            )
         if node.type == "command":
             words, env = _command_parts(node)
             if words:
                 out.append((words, env))
         for child in node.children:
-            visit(child)
+            visit(child, depth + 1)
 
-    visit(tree.root_node)
+    visit(tree.root_node, 0)
     return out
 
 
@@ -361,12 +376,19 @@ _GH_READS = {
 def resolve(command: str) -> Resolution:
     """Resolve a shell program without deferring command identity to runtime."""
 
-    tree = PARSER.parse(command.encode())
+    try:
+        tree = PARSER.parse(command.encode())
+    except Exception as exc:
+        return Unresolvable(f"shell parser failed: {type(exc).__name__}")
     if tree.root_node.has_error:
         return Unresolvable("shell parse contains an ERROR node")
-    pending = [tree.root_node]
+    pending = [(tree.root_node, 0)]
     while pending:
-        node = pending.pop()
+        node, depth = pending.pop()
+        if depth > MAX_AST_DEPTH:
+            return Unresolvable(
+                f"shell syntax exceeds the maximum depth of {MAX_AST_DEPTH}"
+            )
         if node.type == "function_definition":
             # A function can forward "$@" or rewrite its arguments before a
             # later invocation. Shell expansion semantics are runtime state,
@@ -375,9 +397,13 @@ def resolve(command: str) -> Resolution:
             return Unresolvable(
                 "shell function definitions defer command resolution"
             )
-        pending.extend(node.children)
+        pending.extend((child, depth + 1) for child in node.children)
     governed: list[Governed] = []
-    for words, _env in extract_commands_with_env(command):
+    try:
+        commands = extract_commands_with_env(command)
+    except (PolicyComplexityError, RecursionError) as exc:
+        return Unresolvable(str(exc))
+    for words, _env in commands:
         if not words:
             continue
         inner, _extra_env = _strip_env_wrapper(words)

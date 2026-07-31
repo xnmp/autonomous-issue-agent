@@ -14,18 +14,30 @@ per-scope balance, admission, deduplication, and failure comparisons. The two
 sharpest codex-only claims were independently re-verified in code (X1, X3
 below).
 
-**Status: IMPLEMENTED AND VERIFIED 2026-07-31.** Phases 0–7 are present on
-the working tree, with the deliberately trigger-gated credential-free
-publisher in 5.7 remaining gated exactly as this plan specifies. The live
+**Status: IMPLEMENTED WITH DOCUMENTED DIVERGENCES — 2026-07-31.** The live
 authorities are SQLite control state, durable lifecycle commands/receipts,
 schema-v2 events, and the single projection fold; the bash watchers and their
-suite are deleted.
-Verification includes `make test`, dashboard unit/type/build/E2E checks, a
-bounded live steward tick against `xnmp/autonomous-issue-agent`, and the live
-probes documented in `HARNESS.md`/`docs/reference/capacity.md`. The immutable
+suite are deleted. Two mechanisms in this plan were not implemented as
+written:
+
+- Phase 4.7 was a hard cutover, not a live
+  `CONTROL_STORE_MODE=legacy|shadow|primary` rollout. There is no dual-write
+  mode or online rollback. The retained legacy source, immutable source and
+  line digests, transactional importer, and offline comparator are the
+  migration evidence and recovery boundary.
+- Phase 5.3 closes the enumerated resolver/wrapper cases, not arbitrary
+  indirect execution. Script files, `script -c`, interpreter `-e`, and
+  `git rebase --exec` remain advisory-governor residuals registered as strict
+  xfails in `tests/test_residuals.py`.
+
+Verification includes `make test`, dashboard unit/type/build/E2E checks, and a
+bounded live steward tick against `xnmp/autonomous-issue-agent`. The immutable
 [live release canary evidence](../reference/live-release-canary-evidence.json)
-records the all-role boot, an active SIGTERM shutdown, authoritative Codex
-usage settlement, durable remote cleanup, and zero residual control state.
+records the all-role foreground boot, an active SIGTERM shutdown,
+authoritative Codex usage settlement, durable remote cleanup, and zero
+residual control state. That canary was narrow: one repository, one runtime,
+one self-authored issue, no cap exhaustion, no dispatch concurrency, no fault
+injection, and no systemd boot. It verifies only the recorded paths.
 The final repoint audit also produced schema v15: foreground snapshot
 replacement now quiesces the stable deployment before mutation, while durable
 retired-owner rows fence any missed or rebooted prior process from reacquiring
@@ -219,14 +231,14 @@ Python and bash entry points (no twin); gate parity suite is best-in-class;
    (`WorldUnchanged` probe) — emit `observed` events on change, and the
    dashboard's own gh client, TTL cache, and `_human_action` archaeology
    retire.
-4. **Break the dashboard during migration; shadow-migrate the money.** (User
-   decision + codex refinement.) Telemetry/dashboard compatibility shims are
-   not built — pre-v2 journals are dropped by the fold. But **accounting
-   authority migrates via a time-bounded shadow mode** (`CONTROL_STORE_MODE=
-   legacy|shadow|primary` with discrepancy alerts and a canary), because money
-   errors are not recoverable by a re-render. Dual writes are time-bounded and
-   every migration flag carries an owner, promotion metric, and removal issue
-   (codex §18 discipline).
+4. **Break the dashboard during migration; protect the money migration.**
+   (User decision + codex refinement.) Telemetry/dashboard compatibility
+   shims are not built — pre-v2 journals are dropped by the fold. The plan
+   originally required a time-bounded `CONTROL_STORE_MODE` shadow rollout.
+   Implementation diverged to a hard cutover with retained immutable legacy
+   input, source/line/verifier digests, transactional import, and an offline
+   comparison window; see 4.7. No live dual-write flag or online rollback was
+   shipped.
 5. **Ports before events.** Typed protocols (C1) are the foundation; the
    event work and the control store land as ports. Doing events first would
    rebuild them on duck typing.
@@ -272,9 +284,10 @@ Python and bash entry points (no twin); gate parity suite is best-in-class;
      events, `leg_id`/`stall_id`, corrections-by-id, total order, one fold,
      world observation.
    - *Break-everything migration* (mine) **vs** *compatibility adapters +
-     shadow* (codex): **split the difference by risk class** — dashboard/
-     telemetry may break (user decision stands); money and dedup authority
-     migrate via shadow mode (decision 4).
+     shadow* (codex): the plan selected a risk-class split, but the accounting
+     implementation hard-cut to SQLite. The retained digest-bound legacy
+     source and offline comparator supply verification, not live shadow writes
+     (decision 4, divergence documented in 4.7).
    - *Tri-state resolver as the governor class fix* (mine) **vs** *governor
      demoted to advisory, credentials as the boundary* (codex): **both** —
      codex's framing is the honest end-state; the resolver still closes the
@@ -468,7 +481,9 @@ Single-owner seam work. **Prerequisite to Phases 2-6.**
   `Money(currency, micros)`, `TokenUsage` (disjoint counters + `source`),
   `PriceQuote` (rate-card id/version), `RunId`/`DispatchId`/`CommandId`,
   `BudgetScope` (explicit period id/start/end/tz — "today" is not a storage
-  key), `TestExecution` + `TestExecutionStatus`, `PolicyDisposition`,
+  key), `TestExecution` + `TestExecutionStatus`, `PolicyDisposition`
+  (shared vocabulary only; live gate enforcement uses `GateResult` and
+  `OpenPrLookup`),
   `LifecycleCommand`/`EffectReceipt`, `EventEnvelope`. Constructors reject
   negative tokens, invalid currency, naive timestamps, impossible states.
 - **1.3 Delete all 17 `getattr` shims** (C2). Genuine optionality becomes
@@ -685,12 +700,16 @@ comparison clean before dedup cutover.*
   CORRUPT` blocks paid admission (now enforced by the store, superseding the
   0.3 containment); estimator scoped by runtime+model (B4's contamination);
   GLM gets a rate table or an explicit synthetic basis (B2).
-- **4.7 Migration**: `CONTROL_STORE_MODE=legacy|shadow|primary` per decision
-  3.4 — import legacy ledger with deterministic ids + source digest; shadow
-  for ≥ one representative window comparing totals/dedup/failure behavior;
-  canary primary on one trusted repo; keep read-only legacy export for the
-  rollback window. Rollback = stop paid admission + reconcile, never restore
-  an older ledger over new charges.
+- **4.7 Migration — implementation divergence from decision 3.4**: authority
+  was hard-cut to SQLite; `CONTROL_STORE_MODE` and dual writes were never
+  implemented, and the historical spend JSONL is no longer written. Before a
+  cutover, stop all roles, retain a mode-0600 copy of the legacy ledger and
+  any pre-existing control database, and record SHA-256 digests outside the
+  mutable state directory. Import uses deterministic ids and transactional
+  schema migrations. `scripts/verify_control_migration.py` is the offline
+  comparator for totals, per-scope balances, deduplication, failure decisions,
+  and source immutability. The retained source plus its digest is the recovery
+  input; rollback never means restoring an older database over new charges.
 - **4.8 The pricing test battery**: the ten untested contracts from the
   budget review + codex's concurrency set — two processes racing the final
   available dollar, hundreds of concurrent reserve/settle/release, period
@@ -699,7 +718,7 @@ comparison clean before dedup cutover.*
 
 *Metric: $/merged-PR becomes trustworthy (basis-split); 100% of paid runs
 have a prior reservation; ledger gap after kills → 0. Guardrail: no new
-escalations from spurious cap trips; shadow totals reconcile.*
+escalations from spurious cap trips; offline migration totals reconcile.*
 
 ### Phase 5 — Trust: commands/receipts, authoritative gates, advisory governor
 
@@ -724,21 +743,22 @@ onboarding but is now concretely designed (codex §12 is the reference).
   each marker either re-derived from a party the agent cannot author as
   (`ac-posted` from FIX_BOT-authored GitHub comments), hook-written to
   STATE_DIR (done in 0.7), or honestly reclassified Hook→Prompt in HARNESS.md
-  (`adversarial-verdict`). `PolicyDisposition.INDETERMINATE` (e.g. CI
-  unreachable) never becomes allow.
+  (`adversarial-verdict`). Live enforcement is through `GateResult` and the
+  `OpenPrLookup` tri-state: an unavailable/indeterminate observation never
+  becomes allow. `PolicyDisposition` remains vocabulary, not a call-path
+  enforcement type.
 
 **Layer B — advisory hardening + staged isolation:**
 
-- **5.3 Tri-state resolver** (G1, G2, G6, residuals §1.2 as one class):
+- **5.3 Tri-state resolver** (G1, G2, G6, residuals §1.1 as one class):
   `resolve(command) -> Governed(kind, argv) | Ungoverned | Unresolvable`;
-  `Unresolvable` = anything deferring resolution past parse time (interpreter
-  `-c`, `eval`, `$VAR`/function-name in command position, `-c alias.*`,
-  unrecognized wrapper before a governed binary, parse `ERROR` node) →
-  **deny with actionable message**. Invert wrapper polarity: governed-binary-
-  anywhere triggers classification; explicit allowlist suppresses
-  (`grep git`). The five strict-xfails flip green; each newly-accepted
-  residual gets its own strict-xfail (G9 discipline). Documented as
-  **advisory** — no safety claim rests on it (decision 3.6).
+  `Unresolvable` covers parse errors/depth, functions, supported interpreter
+  `-c`, `eval`, dynamic command positions, and obscuring wrappers and is
+  denied with an actionable message. This closes the enumerated wrapper class,
+  not every program capable of indirect execution. Script files, util-linux
+  `script -c`, `node`/`perl`/`ruby -e`, and `git rebase --exec` remain
+  `Ungoverned`; each is registered as a strict xfail (G-6 discipline).
+  Documented as **advisory** — no safety claim rests on parsing (decision 3.6).
 - **5.4 `gh` allowlist in the governor** (G7), not in runtime-specific
   `disallowed_tools` — making the policy runtime-portable is the fix for the
   entire "only enforced on Claude" class. Codex fail-open on missing `uv`
@@ -764,10 +784,11 @@ onboarding but is now concretely designed (codex §12 is the reference).
   that cannot enforce filesystem/egress isolation — those stay
   trusted-inbound-only.
 
-*Metric: governor bypass class closed by construction (xfails green); 100% of
-remote mutations carry command + receipt; prompt-injection surface
-single-seamed. Guardrail: fixer false-denial rate — watch one deployment for
-spurious `Unresolvable` denials and allowlist deliberately.*
+*Metric: enumerated resolver/wrapper bypasses deny and every accepted indirect
+execution hole has a strict xfail; 100% of remote mutations carry command +
+receipt; prompt-injection surface single-seamed. Guardrail: fixer false-denial
+rate — watch one deployment for spurious `Unresolvable` denials and allowlist
+deliberately.*
 
 ### Phase 6 — World observation + dashboard refold (the payoff)
 
@@ -826,9 +847,9 @@ inferred success.*
   the completeness bar.
 - **7.8 Remove compatibility paths + retire migration flags** (codex P6.3,
   §18): JSONL control queries, free-form `event_line`, direct privileged
-  writes, agent-marker gate evidence, `CONTROL_STORE_MODE`, dual writes —
-  each removed when its exit criterion passed, each with a dated removal
-  issue. Keep a read-only converter for historical JSONL.
+  writes, and agent-marker authorization evidence were removed. The planned
+  `CONTROL_STORE_MODE` and dual-write paths never shipped, so there was no
+  flag to retire. Keep read-only historical input only for migration/evidence.
 - **7.9 Legacy deletion** (residuals P6.1, now unblocked): with
   `InMemoryGitHub` promoted (1.4) and parity suites guarding
   `plugin/hooks/checks/`, the legacy bash watchers and their suites can go.
@@ -894,14 +915,13 @@ Hard ordering rules (from the codex plan, adopted verbatim):
 - Do not add supervisor retries around non-idempotent commands.
 - Do not split modules before contract ownership is decided.
 
-Migration flags (each with owner, promotion metric, abort thresholds,
-rollback instructions, and a dated removal issue — codex §18):
-
-| Flag | Values | Removal condition |
-|---|---|---|
-| `CONTROL_STORE_MODE` | `legacy`, `shadow`, `primary` | store primary proven; legacy control reads deleted (7.8) |
-| `TRUSTED_PUBLISH` | `off`, effect-kind allowlist, `on` | all direct writes routed; (credentials removed only at layer B) |
-| `EVENT_FORMAT` | `legacy`, `v2` | all producers/consumers on v2 (no `dual` — dashboard may break, decision 3.4) |
+There are no live migration flags; `docs/reference/migration-flags.json` is
+the executable manifest and is currently empty. `CONTROL_STORE_MODE` was
+planned but never existed: accounting hard-cut to SQLite with retained
+digest-bound legacy input and an offline comparator. Trusted publication and
+schema-v2 events likewise cut over without runtime dual-write switches. Future
+flags must carry an owner, promotion metric, abort thresholds, rollback
+instructions, and a dated removal issue before landing.
 
 Abort a canary when: an admitted paid run lacks a reservation; accounting
 totals diverge without explained provenance; a command may have duplicated a

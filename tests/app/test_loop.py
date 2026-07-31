@@ -857,6 +857,27 @@ def test_suspend_recovery_never_replays_actions_from_telemetry(tmp_path):
     assert not any(event["event"] == "agent_run_stall" for event in events)
 
 
+def test_reservation_sweep_runs_on_bounded_tick_cadence():
+    sweeps = []
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _world: [],
+        Executor(FakeGateway()),
+        poll_seconds=1,
+        sweep_reservations=lambda: sweeps.append("swept"),
+        reservation_sweep_ticks=2,
+    )
+
+    daemon.run_forever(
+        sleep=lambda _seconds: None,
+        now=lambda: 0,
+        max_ticks=2,
+    )
+
+    assert sweeps == ["swept"]
+
+
 def test_heartbeat_below_stall_threshold_does_not_reconcile_or_journal(tmp_path):
     journal = Journal(str(tmp_path / "journal.jsonl"))
     receipt = {

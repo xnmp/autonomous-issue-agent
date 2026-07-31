@@ -225,20 +225,20 @@ class Store:
     def get_ci_retries(self, issue: int) -> int:
         return self._read_int(self.issue_path(issue, "ci-retries"))
 
-    def set_ci_retries(self, issue: int, n: int) -> None:
-        self._write(self.issue_path(issue, "ci-retries"), str(n))
+    def set_ci_retries(self, issue: int, retries: int) -> None:
+        self._write(self.issue_path(issue, "ci-retries"), str(retries))
 
     def get_resolve_retries(self, issue: int) -> int:
         return self._read_int(self.issue_path(issue, "resolve-retries"))
 
-    def set_resolve_retries(self, issue: int, n: int) -> None:
-        self._write(self.issue_path(issue, "resolve-retries"), str(n))
+    def set_resolve_retries(self, issue: int, retries: int) -> None:
+        self._write(self.issue_path(issue, "resolve-retries"), str(retries))
 
     def get_rebase_retries(self, issue: int) -> int:
         return self._read_int(self.issue_path(issue, "rebase-retries"))
 
-    def set_rebase_retries(self, issue: int, n: int) -> None:
-        self._write(self.issue_path(issue, "rebase-retries"), str(n))
+    def set_rebase_retries(self, issue: int, retries: int) -> None:
+        self._write(self.issue_path(issue, "rebase-retries"), str(retries))
 
     # ── infra-death ceiling (review C3/D2c) ──
     # NOT a retry counter: a session that dies before returning a result made no
@@ -256,14 +256,14 @@ class Store:
         self._write(path, str(n))
         return n
 
-    def set_infra_deaths(self, key: int, n: int) -> None:
+    def set_infra_deaths(self, key: int, count: int) -> None:
         """Write the counter directly, for a death that is worth more than one
         life. A DETERMINISTIC death (#13) reproduces on every retry, so charging
         it 1 buys the identical unwinnable dispatch cap-1 more times; the
         dispatcher saturates the counter instead and the role's existing ceiling
         escalates on the next poll. Monotonic at the call site (max of current
         and the cap) — a saturate must never lower a tally."""
-        self._write(self.issue_path(key, "infra-deaths"), str(max(0, int(n))))
+        self._write(self.issue_path(key, "infra-deaths"), str(max(0, int(count))))
 
     def clear_infra_deaths(self, key: int) -> None:
         """Decay: this key just produced a RETURNED result, so the transport and

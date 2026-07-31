@@ -50,6 +50,17 @@ class FakeStore:
         self.phases = {}
         self.infra_deaths = {}
         self.models = {}
+        self.branches = {}
+        self.predicted_paths = {}
+
+    def save_branch(self, issue, branch):
+        self.branches[issue] = branch
+
+    def get_branch(self, issue):
+        return self.branches.get(issue, "")
+
+    def save_predicted_paths(self, issue, paths):
+        self.predicted_paths[issue] = frozenset(paths)
 
     def save_session(self, i, s):
         self.sessions[i] = s

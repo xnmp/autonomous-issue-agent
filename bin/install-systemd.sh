@@ -286,6 +286,20 @@ stop_unit() {
   fi
 }
 
+assert_running() {
+  unit="$1"
+  active_state="$(
+    systemctl --user show "$unit" --property=ActiveState --value
+  )"
+  sub_state="$(
+    systemctl --user show "$unit" --property=SubState --value
+  )"
+  if [ "$active_state" != "active" ] || [ "$sub_state" != "running" ]; then
+    echo "activation check failed for $unit: ${active_state:-unknown} (${sub_state:-unknown})" >&2
+    return 1
+  fi
+}
+
 # Stop all currently named roles plus the unsuffixed, target-basename, and
 # repository-derived predecessors before any replacement role may import the
 # shared ledger. Every removed predecessor is restored by rollback above.
@@ -312,7 +326,8 @@ for s in "${services[@]}"; do
   systemctl --user enable "$s-$NAME.service"
   systemctl --user restart "$s-$NAME.service"
   systemctl --user is-active --quiet "$s-$NAME.service"
-  echo "✓ enabled+started $s-$NAME"
+  assert_running "$s-$NAME.service"
+  echo "✓ enabled+started $s-$NAME: active (running)"
 done
 trap - ERR INT TERM
 echo "Done. 'systemctl --user status issue-agent-*-$NAME' or"

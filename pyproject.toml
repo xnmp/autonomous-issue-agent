@@ -57,15 +57,37 @@ build-backend = "hatchling.build"
 packages = ["src/issue_agent"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests/domain", "tests/adapters", "tests/app"]
+testpaths = [
+    "tests/domain",
+    "tests/adapters",
+    "tests/app",
+    "tests/test_residuals.py",
+]
 python_files = ["test_*.py"]
 addopts = "-q"
 
 [tool.pyrefly]
-preset = "basic"
+preset = "default"
 project-includes = ["src", "tests"]
 search-path = [".", "src", "tests/domain", "tests/adapters", "tests/app"]
 ignore-missing-imports = ["fastapi", "fastapi.*", "uvicorn"]
+
+[tool.pyrefly.errors]
+# Removal issues are indexed by rule in:
+# docs/open/issues/pyrefly-default-backlog.md
+# `make typecheck` re-enables seam-sensitive rules for the explicit authority
+# port conformance module while this migration backlog is retired.
+bad-argument-type = "ignore"
+missing-attribute = "ignore"
+bad-index = "ignore"
+unsupported-operation = "ignore"
+bad-assignment = "ignore"
+not-iterable = "ignore"
+bad-override = "ignore"
+bad-specialization = "ignore"
+bad-return = "ignore"
+unsafe-overlap = "ignore"
+no-matching-overload = "ignore"
 
 # ── Architectural linting (import-linter) ─────────────────────────────────────
 # Enforces the hexagonal layering the design depends on: the domain is pure

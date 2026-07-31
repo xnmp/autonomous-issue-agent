@@ -2,17 +2,36 @@
 
 from __future__ import annotations
 
-import glob
 import html as _html
 import json
 import os
+import glob
 from datetime import datetime, timezone
 
-from ..adapters.journal import read_events
+from ..adapters.event_log import read_event_log
 from ..adapters.heartbeat import read_heartbeat_time
-from ..domain.events import EventEnvelope, decode_event
 from ..domain.projection import fold
-from ..domain.dashboard import *
+from ..domain.dashboard import (
+    ActionFact,
+    DaemonHealth,
+    Deployment,
+    IssueRow,
+    Metrics,
+    REVIEW_KINDS,
+    ROLE_NAMES,
+    RunSummary,
+    RunningLeg,
+    STALE_AFTER_S,
+    build_deployment,
+    build_deployment_v2,
+    build_issue_rows,
+    build_metrics,
+    event_issue,
+    first_pass_verdicts,
+    parse_action,
+    pr_issue_map,
+    stage_for,
+)
 
 
 def _utcnow() -> datetime:
@@ -47,69 +66,49 @@ def collect(
         os.path.join(os.path.dirname(path), "events-v2.jsonl")
         for path in legacy_paths
     )
-    if any(glob.glob(f"{path}*") for path in typed_paths):
-        typed_feeds = tuple(
-            (
-                role,
-                path,
-                os.path.join(log_dir, f"{role}-{name}.log"),
-                _read_v2_events(path),
-            )
-            for role, path in zip(ROLE_NAMES, typed_paths)
+    results = tuple(read_event_log(path) for path in typed_paths)
+    typed_feeds = tuple(
+        (
+            role,
+            path,
+            os.path.join(log_dir, f"{role}-{name}.log"),
+            result.events,
         )
-        model = fold(
-            event
-            for _role, _path, _log, events in typed_feeds
-            for event in events
+        for role, path, result in zip(
+            ROLE_NAMES, typed_paths, results
         )
-        heartbeat_times = {
-            role: stamp
-            for role, legacy_path in zip(ROLE_NAMES, legacy_paths)
-            if (
-                stamp := read_heartbeat_time(
-                    os.path.join(os.path.dirname(legacy_path), "heartbeat.json")
-                )
-            )
-            is not None
-        }
-        return build_deployment_v2(
-            name,
-            repo,
-            typed_feeds,
-            model,
-            now_fn,
-            stale_after_s,
-            heartbeat_times,
-        )
-    feeds = tuple(
-        (role, path, os.path.join(log_dir, f"{role}-{name}.log"), read_events(path))
-        for role, path in zip(ROLE_NAMES, legacy_paths)
     )
-    return build_deployment(
-        name, repo, feeds, read_events(ledger_path), now_fn, stale_after_s
+    model = fold(
+        event
+        for _role, _path, _log, events in typed_feeds
+        for event in events
     )
-
-
-def _read_v2_events(path: str) -> tuple[EventEnvelope, ...]:
-    """Read current and rotated v2 files; reject incompatible schemas loudly."""
-
-    events: list[EventEnvelope] = []
-    for candidate in sorted(glob.glob(f"{path}*")):
-        try:
-            lines = open(candidate, encoding="utf-8").read().splitlines()
-        except OSError:
-            continue
-        for line in lines:
-            if not line.strip():
-                continue
-            try:
-                raw = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(raw, dict):
-                raise ValueError(f"{candidate}: event line is not an object")
-            events.append(decode_event(raw))
-    return tuple(events)
+    heartbeat_times = {
+        role: stamp
+        for role, legacy_path in zip(ROLE_NAMES, legacy_paths)
+        if (
+            stamp := read_heartbeat_time(
+                os.path.join(os.path.dirname(legacy_path), "heartbeat.json")
+            )
+        )
+        is not None
+    }
+    malformed = sum(result.malformed_lines for result in results)
+    warnings = (
+        (f"skipped {malformed} malformed schema-v2 event line(s)",)
+        if malformed
+        else ()
+    )
+    return build_deployment_v2(
+        name,
+        repo,
+        typed_feeds,
+        model,
+        now_fn,
+        stale_after_s,
+        heartbeat_times,
+        warnings,
+    )
 
 
 # ── text render ───────────────────────────────────────────────────────────────
@@ -122,6 +121,7 @@ def render_text(deployments, now_fn=None, details: bool = False) -> str:
     for dep in deployments:
         out.append("")
         out.append(f"═══ {dep.repo or '(repo unknown)'}   [{dep.name}]")
+        out.extend(f"  WARNING: {warning}" for warning in dep.warnings)
         out.append("  daemons:")
         for h in dep.health:
             mark = "STALE" if h.stale else "ok   "
@@ -254,6 +254,10 @@ def render_html(deployments, now_fn=None) -> str:
         parts.append(
             f"<h2>{_esc(dep.repo or '(repo unknown)')} "
             f"<span class='meta'>[{_esc(dep.name)}]</span></h2>"
+        )
+        parts.extend(
+            f"<p class='flag'>WARNING: {_esc(warning)}</p>"
+            for warning in dep.warnings
         )
         parts.append(_html_metrics(dep.metrics))
         parts.append("<h3>daemons</h3>")
@@ -392,8 +396,8 @@ def serve(port: int, build_html, host: str = "127.0.0.1") -> None:
             self.end_headers()
             self.wfile.write(body)
 
-        def log_message(self, *_args):  # keep the terminal for the dashboard
-            pass
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args  # keep the terminal for the dashboard
 
     HTTPServer((host, port), Handler).serve_forever()
 
@@ -433,20 +437,6 @@ def _table(headers, rows) -> str:
         "<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>" for row in rows
     )
     return f"<table><tr>{head}</tr>{body}</table>"
-
-
-def _int(value) -> int | None:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _float(value) -> float:
-    try:
-        return float(value or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
 
 
 __all__ = [

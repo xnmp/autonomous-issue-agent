@@ -17,7 +17,12 @@ from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.event_log import EventLog
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.contracts import Money
-from issue_agent.domain.events import Producer, SpendRecorded, decode_event_line
+from issue_agent.domain.events import (
+    Producer,
+    ReservationRetained,
+    SpendRecorded,
+    decode_event_line,
+)
 from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.pricing import (
     BudgetPolicy,
@@ -188,9 +193,9 @@ def test_paid_run_carries_portable_ancestor_authority_bundle(
     tmp_path, monkeypatch
 ) -> None:
     class CapturingRuntime(Runtime):
-        async def run(self, task):
-            self.task = task
-            return await super().run(task)
+        async def run(self, _task):
+            self.task = _task
+            return await super().run(_task)
 
     runtime = CapturingRuntime(
         AgentResult(
@@ -267,9 +272,9 @@ def test_issue_less_pr_repair_keeps_branch_bound_publication_authority(
     tmp_path,
 ) -> None:
     class CapturingRuntime(Runtime):
-        async def run(self, task):
-            self.task = task
-            return await super().run(task)
+        async def run(self, _task):
+            self.task = _task
+            return await super().run(_task)
 
     runtime = CapturingRuntime(
         AgentResult(
@@ -424,6 +429,15 @@ def test_codex_missing_usage_never_settles_productive_run_as_free(
         ),
     )
 
+    event_log = EventLog(
+        str(tmp_path / "events-v2.jsonl"),
+        Producer("deployment", "o/r", "fix", 100, "boot"),
+    )
+    store.bind_event_outbox(
+        event_log.prepare,
+        event_log.append_committed,
+    )
+
     result = asyncio.run(
         wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2))
     )
@@ -432,6 +446,21 @@ def test_codex_missing_usage_never_settles_productive_run_as_free(
     assert len(store.active_reservation_runs()) == 1
     with store._connect() as db:
         assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
+    events = tuple(
+        decode_event_line(line)
+        for line in (tmp_path / "events-v2.jsonl").read_text().splitlines()
+    )
+    retained = [
+        event.payload
+        for event in events
+        if isinstance(event.payload, ReservationRetained)
+    ]
+    assert retained == [
+        ReservationRetained(
+            str(store.active_reservation_runs()[0]),
+            "trusted usage and provider charge unavailable",
+        )
+    ]
 
 
 def test_stderr_codex_usage_cannot_release_a_paid_reservation(

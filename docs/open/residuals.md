@@ -12,19 +12,34 @@ plan §6b, the lean-core handover §5, and the improvement plan's §4 backlog.
 
 ## 1. Blocking anything — before you point this at a repo you care about
 
-Nothing in the code. The P0/P1 findings from both reviews are closed
-(`44fbd16` → `1968888`). The remaining restrictions are **operational**, and
-the first two matter whenever inbound repository content is not trusted:
+The control-plane correctness blockers are closed. The remaining restrictions
+are trust-boundary residuals: they matter whenever inbound repository content
+is not trusted. Every named residual below is executable in
+`tests/test_residuals.py`; the tests assert the desired closed behavior under
+`xfail(strict=True)`, so fixing one requires removing or updating its registry
+entry.
 
 ### 1.1 Publication credentials are still present in agent processes
 
-SQLite reservations, commands, receipts, and process leases are authoritative,
-and the governor now denies command shapes it cannot resolve. Supported agent
-push/PR flows go through `issue-agent-publish`, with durable commands, remote
-readback, and receipts. That does not make an agent-local hook an authorization
-boundary. Claude/Codex/GLM children still run in the daemon's publication
-environment; an agent that bypasses the advisory hook, or recovers credentials
-through filesystem/local-socket access, can still publish directly.
+SQLite reservations, commands, receipts, and process leases are authoritative.
+Supported agent push/PR flows go through `issue-agent-publish`, with durable
+commands, remote readback, and receipts. Publication environment variables are
+removed from supervised child commands, but the model still runs as the daemon
+OS account and inherits its home-directory surface. Environment scrubbing does
+not prevent recovery through filesystem or local-socket access
+(`CRED-HOME`). An agent-local hook therefore remains defense-in-depth, not an
+authorization boundary.
+
+The resolver denies parse errors, excessive syntax depth, functions, dynamic
+command positions, supported interpreter `-c` forms, obscuring wrappers, and
+all governed commands it recognizes. It does **not** close arbitrary indirect
+execution. The accepted holes are:
+
+- script-file execution through `bash file.sh` or `./file.sh`
+  (`GOV-SCRIPT-FILE`);
+- util-linux `script -c` (`GOV-SCRIPT-C`);
+- `node`/`perl`/`ruby -e` (`GOV-INTERPRETER-E`);
+- `git rebase --exec` (`GOV-REBASE-EXEC`).
 
 **Consequence:** do not point this at a repository whose inbound issue, PR,
 review, or CI text is supplied by people you do not trust. The trigger-gated
@@ -38,9 +53,12 @@ The PR gate no longer reads `.harness/ac-posted`, `test-plan-posted`, or
 test results come from the trusted executor, and adversarial review is process
 discipline rather than self-attestation.
 
-The remaining `.harness/visual-ac` claim can only make the gate stricter by
-scheduling committed-screenshot verification; `.harness/test-cmd` selects a
-command but never supplies its result. Neither can authorize publication.
+The remaining `.harness/visual-ac` claim is agent-writable
+(`CLAIM-VISUAL-AC`) but can only make the gate stricter by scheduling
+committed-screenshot verification. `.harness/test-cmd` remains an agent-selected
+fallback when the operator supplies no `TEST_CMD` (`CLAIM-TEST-CMD`), but it
+never supplies the execution result. Neither claim alone authorizes
+publication.
 
 ### 1.3 The first real GitHub canary is complete
 
@@ -52,9 +70,15 @@ restored and the final control-store check found no live runs, reservations,
 or leases. The immutable receipt is
 [live-release-canary-evidence.json](../reference/live-release-canary-evidence.json).
 
-This closes the first-run fidelity risk; it does not replace a bounded canary
-when onboarding a different repository or credential topology. Start each new
-deployment with `ISSUE_AGENT_MAX_TICKS=1` and a trivial self-authored issue.
+This was a real but narrow canary: one repository, Codex, and one self-authored
+issue. It did not hit a configured cap, exercise concurrent dispatch, inject
+disk/database/process faults, or boot the systemd units. Consequently it did
+not expose the later-reviewed database-deletion, retained-reservation,
+suspend-wake, dashboard-v2, or systemd-readiness defects. It closes only the
+specific paths recorded in the receipt; it does not replace a bounded canary
+for a different repository, runtime, service manager, or credential topology.
+Start each new deployment with `ISSUE_AGENT_MAX_TICKS=1` and a trivial
+self-authored issue.
 
 ---
 

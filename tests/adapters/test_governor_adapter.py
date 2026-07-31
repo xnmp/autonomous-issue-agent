@@ -66,6 +66,18 @@ def test_ungoverned_command_allowed():
     assert evaluate_command("ls -la && cat README.md", ctx()).allowed
 
 
+def test_policy_exception_denies_instead_of_failing_open(monkeypatch):
+    def fail(_command):
+        raise RuntimeError("injected parser failure")
+
+    monkeypatch.setattr(governor_policy, "resolve", fail)
+
+    verdict = evaluate_command("git push origin dev", ctx())
+
+    assert not verdict.allowed
+    assert "failed safely" in verdict.reason
+
+
 def test_gh_api_input_mutation_is_blocked():
     verdict = evaluate_command(
         "gh api repos/o/r/issues/1 --input payload.json",

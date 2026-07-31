@@ -33,7 +33,7 @@ def test_steward_triage_promotes_ready_issue_and_records_post_action_updated_at(
             super().__init__(issues={7: issue})
             self.reads = 0
 
-        def get_issue(self, n):
+        def get_issue(self, number):
             self.reads += 1
             return issue if self.reads == 1 else updated
 

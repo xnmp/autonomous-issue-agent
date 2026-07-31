@@ -132,3 +132,20 @@ def test_boot_recovery_abandons_persisted_start_idempotently(tmp_path) -> None:
     ]
     assert len(corrections) == 1
     assert corrections[0].payload.corrects == events[0].event_id
+
+
+def test_abandonment_emit_failure_is_isolated(tmp_path, monkeypatch) -> None:
+    journal = _journal(tmp_path)
+    journal.emit(
+        TelemetryEvent(
+            AgentRunStarted("model", "RESOLVE"),
+            Correlation(run_id="run-1"),
+        )
+    )
+
+    def fail(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(journal.events, "emit", fail)
+
+    assert journal.abandon_run(RunId("run-1"), "dead lease") is False

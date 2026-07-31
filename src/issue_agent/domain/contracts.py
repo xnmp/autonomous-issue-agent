@@ -24,6 +24,14 @@ CommandId = NewType("CommandId", str)
 ReservationId = NewType("ReservationId", str)
 
 _CURRENCY = re.compile(r"^[A-Z]{3}$")
+MAX_RECEIPT_ERROR_BYTES = 8 * 1024
+
+
+def _bounded_utf8(value: str, max_bytes: int) -> str:
+    encoded = value.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
 
 
 @dataclass(frozen=True, order=True)
@@ -343,6 +351,12 @@ class EffectReceipt:
             raise ValueError("a successful effect cannot carry an error")
         if not successful and not self.error:
             raise ValueError("an unsuccessful effect must carry an error")
+        if self.error is not None:
+            object.__setattr__(
+                self,
+                "error",
+                _bounded_utf8(self.error, MAX_RECEIPT_ERROR_BYTES),
+            )
 
 
 def _aware(value: datetime, field_name: str) -> None:

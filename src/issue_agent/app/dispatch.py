@@ -163,6 +163,30 @@ class DispatchConfig:
         )
 
 
+class _NoFixWorktrees:
+    """Typed null object for roles that cannot dispatch fix work."""
+
+    @staticmethod
+    def _unavailable() -> RuntimeError:
+        return RuntimeError("fix worktrees are unavailable for this role")
+
+    def ensure(self, issue: int, branch: str) -> str:
+        del issue, branch
+        raise self._unavailable()
+
+    def remove(self, issue: int) -> None:
+        del issue
+        raise self._unavailable()
+
+    def branch_for_issue(self, issue: int, fallback: str) -> str | None:
+        del issue, fallback
+        raise self._unavailable()
+
+    def reset(self, issue: int) -> None:
+        del issue
+        raise self._unavailable()
+
+
 class AgentDispatcher:
     """Runs one RunAgent action end-to-end. `executor` applies the follow-up
     Actions (so all writes funnel through one place); `runner` is the SDK
@@ -174,7 +198,7 @@ class AgentDispatcher:
         cfg: DispatchConfig,
         gateway: WorkflowGitHubReads,
         store: WorkflowState,
-        worktrees: FixWorktreePort,
+        worktrees: FixWorktreePort | None,
         runner: AgentRuntime,
         executor: ActionExecutor,
         prepare_cwd: Callable[[str], None] | None = None,
@@ -192,13 +216,14 @@ class AgentDispatcher:
         # gateway must not silently move a counter into a key space nobody
         # reads (review P1R-1); see `_spend_target`.
         self._issue_memo: dict[int, int] = {}
+        fix_worktrees = worktrees if worktrees is not None else _NoFixWorktrees()
         self.fix_workflow = FixWorkflow(
             # Journal folded in here for the same reason as the steward's below:
             # it arrives as a constructor argument, not through DispatchConfig.
             replace(cfg.fix_workflow_config(), journal=journal),
             gateway,
             store,
-            worktrees,
+            fix_worktrees,
             runner,
             executor,
             prepare_cwd,

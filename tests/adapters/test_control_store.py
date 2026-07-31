@@ -147,6 +147,19 @@ def test_established_control_store_disappearance_is_not_fresh_initialized(
     assert not Path(store.path).exists()
 
 
+def test_established_control_store_read_does_not_recreate_deleted_authority(
+    tmp_path,
+):
+    store = _store(tmp_path)
+    assert store.reserve(_request(1)).admitted
+    Path(store.path).unlink()
+
+    with pytest.raises(CorruptControlStore, match="disappeared"):
+        store.snapshot(_scope())
+
+    assert not Path(store.path).exists()
+
+
 def test_repository_alias_migration_unifies_authoritative_rows(tmp_path):
     store = _store(tmp_path)
     assert store.reserve(_request(1)).admitted
@@ -1480,6 +1493,38 @@ def test_lifecycle_command_and_effect_receipt_are_durable_and_idempotent(tmp_pat
     assert store.pending_commands() == ()
 
 
+def test_large_effect_error_is_bounded_and_receipt_still_commits(tmp_path):
+    store = _store(tmp_path)
+    command = LifecycleCommand(
+        CommandId("large-error"),
+        "comment:issue/1:large-error",
+        CommandKind.POST_COMMENT,
+        "issue:1",
+        None,
+        {"body": "hello"},
+        repository="o/r",
+        executor_identity="o/r:fix",
+    )
+    store.enqueue_command(command)
+    store.begin_command(command.command_id)
+
+    receipt = EffectReceipt(
+        command.command_id,
+        "broker",
+        NOW,
+        NOW,
+        EffectStatus.RETRYABLE_FAILURE,
+        error="x" * 70_000,
+    )
+
+    assert store.record_effect(receipt)
+    persisted = store.effect_receipt(command.command_id)
+    assert persisted is not None
+    assert persisted.status is EffectStatus.RETRYABLE_FAILURE
+    assert persisted.error == receipt.error
+    assert len((persisted.error or "").encode()) <= 8 * 1024
+
+
 def test_concurrent_recurrence_claims_share_one_active_occurrence(tmp_path):
     store = _store(tmp_path)
     command = LifecycleCommand(
@@ -1576,7 +1621,7 @@ def test_shared_outbox_flushes_only_the_bound_role_feed(tmp_path):
     assert [item.event_id for item in fix_seen] == ["fix-event"]
 
 
-def test_oversized_event_rolls_back_and_cannot_poison_later_outbox_rows(
+def test_oversized_event_cannot_roll_back_operational_state_or_poison_outbox(
     tmp_path,
 ):
     store = _store(tmp_path)
@@ -1602,15 +1647,15 @@ def test_oversized_event_rolls_back_and_cannot_poison_later_outbox_rows(
     store.bind_event_outbox(
         factory, published.append, line_limit=600
     )
-    with pytest.raises(ValueError, match="outbox event line"):
-        store.record_world_observation(
-            deployment="deployment",
-            subject_kind="issue",
-            subject_number=1,
-            content_hash="large",
-            facts={"body": "x" * 1_000},
-            correlation=Correlation(issue=1),
-        )
+    assert store.record_world_observation(
+        deployment="deployment",
+        subject_kind="issue",
+        subject_number=1,
+        content_hash="large",
+        facts={"body": "x" * 1_000},
+        correlation=Correlation(issue=1),
+    )
+    assert store.telemetry_enqueue_failures == 1
 
     assert store.record_world_observation(
         deployment="deployment",
@@ -1625,6 +1670,11 @@ def test_oversized_event_rolls_back_and_cannot_poison_later_outbox_rows(
         for event in published
         if isinstance(event.payload, WorldObserved)
     ] == [2]
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT content_hash FROM world_observations "
+            "WHERE subject_kind='issue' AND subject_number=1"
+        ).fetchone()[0] == "large"
 
 
 def test_existing_oversized_outbox_row_is_dead_lettered_not_blocking(

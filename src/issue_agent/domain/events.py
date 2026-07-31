@@ -252,6 +252,13 @@ class SpendBlocked(EventPayload):
     reason: str
 
 
+@event_type("accounting.reservation.retained.v1")
+@dataclass(frozen=True)
+class ReservationRetained(EventPayload):
+    run_id: str
+    reason: str
+
+
 @event_type("telemetry.warning.v1")
 @dataclass(frozen=True)
 class TelemetryWarning(EventPayload):

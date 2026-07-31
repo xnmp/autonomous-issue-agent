@@ -34,11 +34,11 @@ class RetryRecordingStore(FakeStore):
     def get_ci_retries(self, i):
         return self.ci_retries.get(i, 0)
 
-    def set_rebase_retries(self, i, n):
-        self.rebase_retries[i] = n
+    def set_rebase_retries(self, i, retries):
+        self.rebase_retries[i] = retries
 
-    def get_rebase_retries(self, i):
-        return self.rebase_retries.get(i, 0)
+    def get_rebase_retries(self, issue):
+        return self.rebase_retries.get(issue, 0)
 
 
 def _workflow(gw, store, runner, wt=None, **cfg_overrides):
@@ -1440,7 +1440,7 @@ def test_a_repair_leg_sees_the_recurrence_label_too():
 
 def test_a_repair_leg_dispatches_even_when_the_issue_cannot_be_fetched():
     class NoIssues(FakeGateway):
-        def get_issue(self, n):
+        def get_issue(self, number):
             raise GhUnavailable("network", "get_issue timed out (test-injected)")
 
     gw = NoIssues(prs={100: _pr_with_rounds(1)})
@@ -1535,9 +1535,9 @@ def test_the_kill_switch_costs_no_gateway_read_on_a_repair_leg():
     class CountingGateway(FakeGateway):
         issue_reads = 0
 
-        def get_issue(self, n):
+        def get_issue(self, number):
             type(self).issue_reads += 1
-            return super().get_issue(n)
+            return super().get_issue(number)
 
     gw = CountingGateway(prs={100: _pr_with_rounds(4)}, issues={5: IssueView(5)})
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s5"))
@@ -1555,9 +1555,9 @@ def test_the_resume_leg_does_not_refetch_the_issue_it_already_holds():
     class CountingGateway(FakeGateway):
         issue_reads = 0
 
-        def get_issue(self, n):
+        def get_issue(self, number):
             type(self).issue_reads += 1
-            return super().get_issue(n)
+            return super().get_issue(number)
 
     iss = IssueView(
         5, title="t", body="b",

@@ -353,6 +353,9 @@ class AccountingRuntime(AgentRuntime):
             # provider charge nor trusted usage. Recovery can reconcile Codex
             # evidence; every other runtime stays visibly fail-closed instead
             # of silently admitting unlimited zero-dollar work.
+            self.store.record_reservation_retained(
+                run_id, "trusted usage and provider charge unavailable"
+            )
             return result
         if (
             usage is not None
@@ -363,6 +366,9 @@ class AccountingRuntime(AgentRuntime):
         ):
             # Observed work with no usable pricing authority cannot safely
             # become a zero-dollar charge. Keep the maximum reservation.
+            self.store.record_reservation_retained(
+                run_id, "pricing authority unavailable"
+            )
             return result
         priced_by_rate_card = (
             self.rate_table is not None

@@ -655,34 +655,41 @@ def evaluate_command(command: str, ctx: GateContext) -> Verdict:
     """Decide whether a Bash command is allowed. Bypass detection first (fail
     CLOSED), then route each governed command to its gate. Returns the FIRST
     violation's reason (the hook can only deny once)."""
-    resolution = governor_policy.resolve(command)
-    if isinstance(resolution, governor_policy.Unresolvable):
-        return Verdict(
-            False,
-            "Blocked: command cannot be governed statically — "
-            f"{resolution.reason}. Use a literal executable and argv.",
-        )
-
-    # 1) Bypass detection across every command node (reuse the bash core).
-    bypass = governor_policy.find_violations(command)
-    if bypass:
-        return Verdict(False, f"Blocked: {bypass[0]}")
-
-    # 2) Route governed commands to gate checks.
-    for words, _env in governor_policy.extract_commands_with_env(command):
-        governed = governor_policy.classify(words)
-        if governed is None:
-            continue
-        handler = _GATE_HANDLERS.get(governed.kind)
-        if handler is None:
+    try:
+        resolution = governor_policy.resolve(command)
+        if isinstance(resolution, governor_policy.Unresolvable):
             return Verdict(
                 False,
-                f"Blocked: no gate registered for {governed.kind!r}",
+                "Blocked: command cannot be governed statically — "
+                f"{resolution.reason}. Use a literal executable and argv.",
             )
-        result = handler(governed, ctx)
-        if not result.allowed:
-            return result
-    return Verdict(True)
+
+        # 1) Bypass detection across every command node (reuse the bash core).
+        bypass = governor_policy.find_violations(command)
+        if bypass:
+            return Verdict(False, f"Blocked: {bypass[0]}")
+
+        # 2) Route governed commands to gate checks.
+        for words, _env in governor_policy.extract_commands_with_env(command):
+            governed = governor_policy.classify(words)
+            if governed is None:
+                continue
+            handler = _GATE_HANDLERS.get(governed.kind)
+            if handler is None:
+                return Verdict(
+                    False,
+                    f"Blocked: no gate registered for {governed.kind!r}",
+                )
+            result = handler(governed, ctx)
+            if not result.allowed:
+                return result
+        return Verdict(True)
+    except Exception as exc:
+        return Verdict(
+            False,
+            "Blocked: command governor failed safely — "
+            f"{type(exc).__name__}. Retry with a simpler literal command.",
+        )
 
 
 # ── SDK hook wiring ───────────────────────────────────────────────────────────

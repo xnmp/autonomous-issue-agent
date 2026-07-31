@@ -51,6 +51,7 @@ def _ignore_log(_message: str) -> None:
 
 
 DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 80.0
+DEFAULT_RESERVATION_SWEEP_TICKS = 30
 _SHUTDOWN_ESCALATION_RESERVE_SECONDS = 10.0
 _SHUTDOWN_PREPARE_RESERVE_SECONDS = 2.0
 _SHUTDOWN_FINALIZE_RESERVE_SECONDS = 5.0
@@ -134,6 +135,8 @@ class Daemon:
     # The systemd hard stop is 90s, leaving 10s for interpreter/supervisor exit.
     shutdown_timeout_seconds: float = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
     recover: Callable[[], object] | None = None
+    sweep_reservations: Callable[[], object] | None = None
+    reservation_sweep_ticks: int = DEFAULT_RESERVATION_SWEEP_TICKS
     prepare_shutdown: Callable[[], object] | None = None
     finalize: Callable[[], object] | None = None
     terminalize: Callable[[], object] | None = None
@@ -172,6 +175,8 @@ class Daemon:
             )
         if self.shutdown_timeout_seconds <= 0:
             raise ValueError("shutdown timeout must be positive")
+        if self.reservation_sweep_ticks <= 0:
+            raise ValueError("reservation sweep cadence must be positive")
 
     @property
     def state(self) -> DaemonState:
@@ -704,6 +709,17 @@ class Daemon:
                 if scheduler_progress is not None:
                     scheduler_progress()
                 ticks += 1
+                if (
+                    self.sweep_reservations is not None
+                    and ticks % self.reservation_sweep_ticks == 0
+                ):
+                    try:
+                        self.sweep_reservations()
+                    except Exception as exc:
+                        self.log(
+                            f"{self.name}: reservation sweep failed "
+                            f"(continuing): {exc}"
+                        )
                 reload_requested = reload_check is not None and reload_check()
                 if reload_requested and self.active_dispatches:
                     if not reload_pending:

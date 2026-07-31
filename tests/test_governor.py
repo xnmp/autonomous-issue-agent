@@ -11,6 +11,8 @@ or:  uv run tests/test_governor.py   (pytest is in the inline deps)
 import os
 import sys
 import importlib.util
+import json
+import subprocess
 
 import pytest
 
@@ -427,6 +429,41 @@ def test_governor_protects_every_broker_authority_field():
 
     protected = gov._PUBLICATION_AUTHORITY_ENV
     assert set(_AUTHORITY_ENV_KEYS) | {_AUTHORITY_BUNDLE} <= protected
+
+
+def test_deeply_nested_command_is_unresolvable_without_recursing():
+    command = "$(" * 1_500 + "git push --no-verify origin dev" + ")" * 1_500
+
+    resolution = gov.resolve(command)
+
+    assert isinstance(resolution, gov.Unresolvable)
+    assert "depth" in resolution.reason
+
+
+@pytest.mark.parametrize("assignment", sorted(gov._PUBLICATION_AUTHORITY_ENV))
+def test_bash_hook_blocks_every_durable_publication_authority_override(
+    assignment,
+):
+    payload = json.dumps(
+        {
+            "tool_input": {
+                "command": (
+                    f"{assignment}=attacker "
+                    "issue-agent-publish git push origin fix/1-x"
+                )
+            }
+        }
+    )
+
+    result = subprocess.run(
+        [sys.executable, HOOK],
+        input=payload,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 2
+    assert assignment in result.stderr
 
 
 @pytest.mark.parametrize(

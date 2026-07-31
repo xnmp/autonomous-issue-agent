@@ -169,7 +169,7 @@ def detailed_steps(row: dash.IssueRow) -> list[dict]:
             "cost_usd": leg.cost_usd,
             "estimated": leg.estimated,
             "model": _model_for_leg(row, leg),
-            "effort": _settled_event(row, leg).get("effort"),
+            "effort": _effort_for_leg(row, leg),
             "session_id": leg.session_id or None,
             "turns": _turns(row, leg),
             "usage": _usage(row, leg),
@@ -264,6 +264,28 @@ def _model_for_leg(row: dash.IssueRow, leg: dash.RunSummary) -> str | None:
         and event.get("model")
     ]
     return str(starts[-1]["model"]) if starts else None
+
+
+def _effort_for_leg(row: dash.IssueRow, leg: dash.RunSummary) -> str | None:
+    settled = _settled_event(row, leg)
+    if settled.get("effort"):
+        return str(settled["effort"])
+    dispatch = str(settled.get("dispatch") or "")
+    starts = [
+        event
+        for event in row.events
+        if event.get("event") == "agent_run_start"
+        and (
+            (dispatch and str(event.get("dispatch") or "") == dispatch)
+            or (
+                not dispatch
+                and event.get("kind") == leg.kind
+                and event.get("number") == leg.number
+            )
+        )
+        and event.get("effort")
+    ]
+    return str(starts[-1]["effort"]) if starts else None
 
 
 # ── issue cards ───────────────────────────────────────────────────────────────
@@ -1233,7 +1255,10 @@ def overview_payload(
         },
         "health": [health_json(h, alive[h.role]) for h in dep.health],
         "unattributed": list(dep.unattributed[-20:]),
-        "warnings": [] if scan_ok else ["daemon liveness is unknown"],
+        "warnings": [
+            *dep.warnings,
+            *([] if scan_ok else ["daemon liveness is unknown"]),
+        ],
     }
 
 

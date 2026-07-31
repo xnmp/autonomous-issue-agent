@@ -54,6 +54,13 @@ if [ "${1:-}" = "is-active" ] || [ "${1:-}" = "is-enabled" ]; then
   [ -f "$HOME/.config/systemd/user/${3:-${2:-}}" ]
   exit $?
 fi
+if [ "${1:-}" = "show" ]; then
+  case "$*" in
+    *"property=ActiveState"*) printf '%s\n' "${ACTIVE_STATE:-active}" ;;
+    *"property=SubState"*) printf '%s\n' "${SUB_STATE:-running}" ;;
+  esac
+  exit 0
+fi
 if [ "${1:-}" = "restart" ] && [ -n "${FAIL_PATTERN:-}" ]; then
   case "${2:-}" in
     *"$FAIL_PATTERN"*)
@@ -114,6 +121,8 @@ exit 0
         "LOADED_LABELS": "",
         "ACTIVE_UNITS": "",
         "ENABLED_UNITS": "",
+        "ACTIVE_STATE": "active",
+        "SUB_STATE": "running",
         "REQUIRE_OLD_SNAPSHOT_DURING_UNLOAD": "0",
         "REQUIRE_OLD_SNAPSHOT_DURING_STOP": "0",
         "CUTOVER_SNAPSHOT": "",
@@ -250,10 +259,30 @@ def test_systemd_installer_renders_validated_units_with_absolute_uv(tmp_path):
     units = sorted((home / ".config/systemd/user").glob("*.service"))
     assert len(units) == 3
     assert all(f"ExecStart={uv} " in unit.read_text() for unit in units)
+    assert all("NotifyAccess=all" in unit.read_text() for unit in units)
     assert all(
         "Environment=ISSUE_AGENT_DEPLOYMENT_ID=target-repo"
         in unit.read_text()
         for unit in units
+    )
+    assert result.stdout.count("active (running)") == 3
+
+
+def test_systemd_installer_rolls_back_if_unit_is_not_running(tmp_path):
+    env, home, _uv = _environment(tmp_path, systemd=True)
+    env["SUB_STATE"] = "failed"
+
+    result = subprocess.run(
+        ["bash", str(ROOT / "bin/install-systemd.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "activation check failed" in result.stderr
+    assert not tuple(
+        (home / ".config/systemd/user").glob("*.service")
     )
 
 

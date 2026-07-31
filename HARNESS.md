@@ -141,7 +141,8 @@ trigger-gated on untrusted-repo onboarding; see
 `docs/reference/capability-authority-matrix.md`.
 
 Agent-written gate markers are claims. Tests and remote facts are re-derived by
-trusted code; `PolicyDisposition.INDETERMINATE` never becomes allow.
+trusted code. Live enforcement uses `GateResult` and `OpenPrLookup`; an
+unavailable or indeterminate observation never becomes allow.
 
 ## State, recovery, and accounting
 
@@ -236,3 +237,8 @@ Confirm:
 - the dashboard renders the observed issue from the v2 fold.
 
 Only then install the unattended services.
+
+On Linux, `issue-agent install-service` verifies every systemd unit reaches
+`active (running)` before reporting success and rolls the installation back if
+any role does not. The earlier foreground release canary did not exercise
+systemd; verify the service-manager path separately for each host.

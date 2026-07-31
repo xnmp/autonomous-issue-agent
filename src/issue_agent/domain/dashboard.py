@@ -12,11 +12,14 @@ from datetime import datetime, timedelta, timezone
 from typing import Iterable, Mapping
 
 from .events import (
+    ActionApplied,
     AgentRunCompleted,
+    AgentRunStallCorrected,
     AgentRunStarted,
     DaemonStateChanged,
     EscalationRaised,
     EventEnvelope,
+    LevelChanged,
     RecurrenceDetected,
     SpendBlocked,
     SpendRecorded,
@@ -268,6 +271,7 @@ class Deployment:
     metrics: Metrics
     unattributed: tuple[dict, ...]  # events naming no issue (daily caps, ticks)
     schema_version: int = 1
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -296,6 +300,7 @@ def build_deployment_v2(
     now_fn,
     stale_after_s: float = STALE_AFTER_S,
     heartbeat_times: Mapping[str, datetime] | None = None,
+    warnings: tuple[str, ...] = (),
 ) -> Deployment:
     """Build the dashboard exclusively from the canonical schema-v2 fold.
 
@@ -360,6 +365,7 @@ def build_deployment_v2(
         metrics=build_metrics(rows, unattributed, today_usd),
         unattributed=unattributed,
         schema_version=2,
+        warnings=warnings,
     )
 
 
@@ -560,10 +566,108 @@ def _v2_issue_row(
         ),
         last_ts=ordered[-1].occurred_at if ordered else None,
         done=done,
-        events=tuple(encode_event(event) for event in ordered),
+        events=tuple(
+            _dashboard_event_view(event, model) for event in ordered
+        ),
         facts=facts,
         lane=lane,
     )
+
+
+def _dashboard_event_view(
+    event: EventEnvelope,
+    model: ReadModel,
+) -> dict[str, JsonValue]:
+    """Typed event plus presentation fields; never a lifecycle/state fold."""
+
+    encoded = encode_event(event)
+    payload = event.payload
+    correlation = event.correlation
+    view: dict[str, JsonValue] = {
+        **encoded,
+        "ts": encoded["occurred_at"],
+        "role": event.producer.role,
+        **{
+            key: value
+            for key, value in {
+                "issue": correlation.issue,
+                "pr": correlation.pr,
+                "dispatch": correlation.dispatch_id,
+                "run_id": correlation.run_id,
+                "leg_id": correlation.leg_id,
+                "session_id": correlation.session_id,
+            }.items()
+            if value is not None
+        },
+    }
+    data = dict(encoded["data"])
+    view.update(data)
+    if isinstance(payload, AgentRunStarted):
+        view.update(dict(payload.attributes or {}))
+        view["event"] = "agent_run_start"
+        view["number"] = correlation.pr or correlation.issue
+    elif isinstance(payload, AgentRunCompleted):
+        view.update(dict(payload.attributes or {}))
+        view["event"] = "agent_run"
+        view["number"] = correlation.pr or correlation.issue
+        view["duration_s"] = payload.duration_ms / 1000
+        view["cost_usd"] = (
+            payload.cost_micros / 1_000_000
+            if payload.cost_micros is not None
+            else None
+        )
+        view["usage"] = (
+            dict(payload.usage) if payload.usage is not None else None
+        )
+    elif isinstance(payload, ActionApplied):
+        structured = dict(payload.attributes or {})
+        structured.setdefault("type", payload.kind)
+        structured.setdefault("target", payload.target.upper())
+        if payload.number is not None:
+            structured.setdefault("number", payload.number)
+        view.update(
+            {
+                "event": "action",
+                "desc": payload.display,
+                "action": structured,
+            }
+        )
+    elif isinstance(payload, EscalationRaised):
+        view["event"] = "escalation"
+    elif isinstance(payload, LevelChanged):
+        attributes = dict(payload.attributes or {})
+        view.update(attributes)
+        view["event"] = "deferred"
+        if (
+            "blocker_pr" not in attributes
+            and "blocker_issue" not in attributes
+        ):
+            view["blocker"] = (
+                payload.state_key.rsplit(":", 1)[-1] or None
+            )
+    elif isinstance(payload, AgentRunStallCorrected):
+        corrected = next(
+            (
+                candidate
+                for candidate in model.events
+                if candidate.event_id == payload.corrects
+            ),
+            None,
+        )
+        view.update(
+            {
+                "event": "agent_run_stall",
+                "stall_started_at": (
+                    corrected.occurred_at.isoformat()
+                    if corrected is not None
+                    else event.occurred_at.isoformat()
+                ),
+                "suspended_seconds": payload.suspended_ms / 1000,
+            }
+        )
+    else:
+        view["event"] = event.type
+    return view
 
 
 def _v2_lane(

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Protocol, TypeVar, runtime_checkable
 
 from .actions import Action
-from .events import Correlation, JsonValue, TelemetryEvent
+from .events import Correlation, EventEnvelope, JsonValue, TelemetryEvent
 from .contracts import (
     BudgetScope,
     CommandId,
@@ -240,6 +240,7 @@ class ProcessSupervisor(Protocol):
     def unregister(self, run_id: RunId) -> None: ...
     def kill_tree(self, run_id: RunId, grace_seconds: float = 10.0) -> None: ...
     def recover_orphans(self) -> tuple[RunId, ...]: ...
+    def recover_abandoned_orphans(self) -> tuple[RunId, ...]: ...
 
 
 class RecoveryLease(Protocol):
@@ -265,6 +266,9 @@ class RecoveryControl(Protocol):
         self, owner_id: str, is_alive: Callable[[int, int], bool]
     ) -> tuple[RunId, ...]: ...
     def active_reservation_runs(self, owner_id: str) -> tuple[RunId, ...]: ...
+    def stale_active_reservation_runs(
+        self, owner_id: str, created_before: datetime
+    ) -> tuple[RunId, ...]: ...
     def leases(self, owner_id: str) -> tuple[RecoveryLease, ...]: ...
     def release(self, run_id: RunId, reason: str) -> RecoveryRelease: ...
     def pending_commands(self) -> tuple[object, ...]: ...
@@ -314,7 +318,13 @@ class ControlStore(Protocol):
     def receipt(
         self, namespace: str, scope: str, key: str, payload: Mapping[str, object]
     ) -> bool: ...
-    def flush_outbox(self, sink: EventSink) -> int: ...
+    def flush_outbox(
+        self,
+        emit: Callable[[EventEnvelope], None],
+        limit: int = 100,
+        *,
+        destination: str | None = None,
+    ) -> int: ...
 
 
 @runtime_checkable
@@ -369,21 +379,6 @@ class WorldObservationStore(Protocol):
         repository: str,
         role: str,
     ) -> int: ...
-
-
-@runtime_checkable
-class BranchState(Protocol):
-    """Durable branch mapping; ``None`` means absent, failures raise."""
-    def save_branch(self, issue: int, branch: str) -> None: ...
-    def get_branch(self, issue: int) -> str | None: ...
-
-
-@runtime_checkable
-class PredictionWriter(Protocol):
-    """Durable advisory path prediction; storage failures raise."""
-    def save_predicted_paths(
-        self, issue: int, paths: frozenset[str]
-    ) -> None: ...
 
 
 @runtime_checkable

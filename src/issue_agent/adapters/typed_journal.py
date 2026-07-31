@@ -41,17 +41,22 @@ class TypedJournal:
         return self.legacy_path
 
     def emit(self, event: TelemetryEvent) -> None:
+        self._emit_payload(event.payload, event.correlation)
+
+    def _emit_payload(self, payload, correlation: Correlation) -> bool:
         try:
             with self._lock:
                 self.events.emit(
-                    event.payload,
-                    correlation=event.correlation,
+                    payload,
+                    correlation=correlation,
                 )
         except Exception as exc:  # telemetry cannot fail orchestration
             sys.stderr.write(
-                f"typed journal: dropped {event.payload.event_type!r} "
+                f"typed journal: dropped {payload.event_type!r} "
                 f"event ({exc})\n"
             )
+            return False
+        return True
 
     def abandon_run(self, run_id: RunId, reason: str) -> bool:
         """Correct a persisted start after recovery proves its process is dead."""
@@ -77,18 +82,16 @@ class TypedJournal:
                 ):
                     start = event
         if start is None:
-            self.events.emit(
+            return self._emit_payload(
                 TelemetryWarning(
                     "abandoned_run_without_start",
                     f"run {run_id}: {reason}",
                 ),
-                correlation=Correlation(run_id=str(run_id)),
+                Correlation(run_id=str(run_id)),
             )
-            return False
         if start.event_id in corrected:
             return True
-        self.events.emit(
+        return self._emit_payload(
             AgentRunAbandoned(start.event_id, reason),
-            correlation=start.correlation,
+            start.correlation,
         )
-        return True

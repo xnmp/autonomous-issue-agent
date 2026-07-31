@@ -4,8 +4,9 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from issue_agent.adapters.event_log import EventLog
-from issue_agent.app.dashboard import collect
-from issue_agent.app.dashweb import service
+from issue_agent.app.dashboard import collect, render_html, render_text
+from issue_agent.app.dashweb import service, snapshots
+from issue_agent.adapters.dashweb import system
 from issue_agent.domain.dashboard import Snapshot
 from issue_agent.domain.events import (
     AgentRunCompleted,
@@ -329,6 +330,165 @@ def test_v2_health_uses_scheduler_heartbeat_when_events_are_quiet(
     fix_health = next(item for item in deployment.health if item.role == "fix")
     assert fix_health.stale is False
     assert fix_health.last_ts == NOW
+
+
+def test_v2_emit_fold_issue_detail_preserves_run_drilldown_fields(
+    tmp_path,
+) -> None:
+    state = tmp_path / "fix"
+    state.mkdir()
+    events = EventLog(
+        str(state / "events-v2.jsonl"),
+        Producer("deployment", "owner/repo", "fix", 100, "boot"),
+    )
+    events.emit(
+        WorldObserved(
+            "issue",
+            7,
+            "present",
+            {"present": True, "state": "open", "labels": ["ai-working"]},
+        ),
+        correlation=Correlation(issue=7),
+        causation_time=NOW,
+    )
+    correlation = Correlation(
+        issue=7,
+        dispatch_id="dispatch-1",
+        run_id="run-1",
+        leg_id="leg-1",
+        session_id="session-1",
+    )
+    events.emit(
+        AgentRunStarted(
+            "gpt-test",
+            "RESOLVE",
+            {"effort": "high"},
+        ),
+        correlation=correlation,
+        causation_time=NOW,
+    )
+    events.emit(
+        AgentRunCompleted(
+            "blocked",
+            False,
+            None,
+            2_500,
+            "gpt-test",
+            "codex",
+            500_000,
+            "USD",
+            "configured_rate_card",
+            {"input_tokens": 10, "output_tokens": 2},
+            "Need an API credential",
+            "RESOLVE",
+            {"turns": 4, "needs": "Need an API credential"},
+        ),
+        correlation=correlation,
+        causation_time=NOW,
+    )
+
+    deployment = collect(
+        "demo",
+        "owner/repo",
+        (
+            str(state / "journal.jsonl"),
+            str(tmp_path / "review" / "journal.jsonl"),
+            str(tmp_path / "steward" / "journal.jsonl"),
+        ),
+        str(tmp_path / "logs"),
+        str(tmp_path / "spend.jsonl"),
+        now_fn=lambda: NOW,
+    )
+
+    detail = snapshots.issue_detail(deployment.issues[0], NOW)
+    assert detail["attention_reason"] == "Need an API credential"
+    assert detail["steps"][0]["effort"] == "high"
+    assert detail["steps"][0]["turns"] == 4
+    assert detail["steps"][0]["usage"] == {
+        "input_tokens": 10,
+        "output_tokens": 2,
+    }
+    assert detail["steps"][0]["session_id"] == "session-1"
+
+
+def test_bad_v2_lines_warn_without_crashing_any_dashboard_renderer(
+    tmp_path,
+) -> None:
+    state = tmp_path / "fix"
+    state.mkdir()
+    path = state / "events-v2.jsonl"
+    path.write_text(
+        '{"schema_version":2,"type":"unknown.event.v1"}\n'
+        '{"schema_version":1}\n'
+        '{not json\n'
+    )
+    path.with_suffix(".jsonl.bak").write_text("{ignored backup\n")
+
+    deployment = collect(
+        "demo",
+        "owner/repo",
+        (
+            str(state / "journal.jsonl"),
+            str(tmp_path / "review" / "journal.jsonl"),
+            str(tmp_path / "steward" / "journal.jsonl"),
+        ),
+        str(tmp_path / "logs"),
+        str(tmp_path / "spend.jsonl"),
+        now_fn=lambda: NOW,
+    )
+
+    assert deployment.schema_version == 2
+    assert deployment.warnings == (
+        "skipped 3 malformed schema-v2 event line(s)",
+    )
+    assert "skipped 3 malformed" in render_text(
+        [deployment], now_fn=lambda: NOW
+    )
+    assert "skipped 3 malformed" in render_html(
+        [deployment], now_fn=lambda: NOW
+    )
+
+    snapshot = system.collect_snapshot(
+        name="demo",
+        repo="owner/repo",
+        target_dir=str(tmp_path),
+        journal_paths=[
+            str(state / "journal.jsonl"),
+            str(tmp_path / "review" / "journal.jsonl"),
+            str(tmp_path / "steward" / "journal.jsonl"),
+        ],
+        log_dir=str(tmp_path / "logs"),
+        ledger_path=str(tmp_path / "spend.jsonl"),
+        now_fn=lambda: NOW,
+        stale_after_s=60,
+    )
+    overview = snapshots.overview_payload(
+        snapshot, {}, scan_ok=True
+    )
+    assert overview["warnings"] == [
+        "skipped 3 malformed schema-v2 event line(s)"
+    ]
+
+
+def test_fresh_deployment_without_event_file_is_defined_as_empty_v2(
+    tmp_path,
+) -> None:
+    deployment = collect(
+        "demo",
+        "owner/repo",
+        tuple(
+            str(tmp_path / role / "journal.jsonl")
+            for role in ("fix", "review", "steward")
+        ),
+        str(tmp_path / "logs"),
+        str(tmp_path / "spend.jsonl"),
+        now_fn=lambda: NOW,
+    )
+
+    assert deployment.schema_version == 2
+    assert deployment.issues == ()
+    assert deployment.warnings == ()
+    assert all(item.stale for item in deployment.health)
 
 
 def test_v2_health_rejects_stopped_heartbeat_and_terminal_state(
