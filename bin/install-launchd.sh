@@ -11,6 +11,24 @@ CONFIG="${AGENT_ENV:-$HARNESS_ROOT/config/agent.env}"
 LA="$HOME/Library/LaunchAgents"
 mkdir -p "$LA"
 
+deployment_id_for_target() {
+  target_dir="$1"
+  if [ -n "${ISSUE_AGENT_DEPLOYMENT_ID:-}" ]; then
+    normalized="$(printf '%s' "$ISSUE_AGENT_DEPLOYMENT_ID" \
+      | tr '[:upper:]' '[:lower:]' \
+      | sed -E 's/[^a-z0-9._-]/-/g; s/^-+//; s/-+$//')"
+    printf '%s' "${normalized:-target}"
+    return
+  fi
+  printf '%s' "$CONFIG|$target_dir" | cksum | awk '{print $1}'
+}
+
+plist_deployment_identity() {
+  sed -n \
+    's#.*<key>ISSUE_AGENT_DEPLOYMENT_ID</key>[[:space:]]*<string>\([^<]*\)</string>.*#\1#p' \
+    "$1" | head -n 1
+}
+
 units=(fix-watcher review-watcher steward)
 DRY_RUN=0
 [ "${1:-}" != "--dry-run" ] || DRY_RUN=1
@@ -28,12 +46,21 @@ if [ "${1:-}" = "uninstall" ]; then
       exit 1
     }
     TARGET_DIR="$(set -a; . "$CONFIG"; set +a; printf '%s' "${TARGET_DIR:-}")"
-    deployment_id="$(printf '%s' "$CONFIG|$TARGET_DIR" | cksum | awk '{print $1}')"
+    deployment_id="$(deployment_id_for_target "$TARGET_DIR")"
+    deployment_name="${ISSUE_AGENT_DEPLOYMENT_ID:-$deployment_id}"
     patterns=(
       "$LA/dev.issue-agent.fix-watcher.$deployment_id.plist"
       "$LA/dev.issue-agent.review-watcher.$deployment_id.plist"
       "$LA/dev.issue-agent.steward.$deployment_id.plist"
     )
+    if [ -n "${ISSUE_AGENT_DEPLOYMENT_ID:-}" ]; then
+      for plist in "$LA"/dev.issue-agent.*.plist; do
+        [ -e "$plist" ] || continue
+        [ "$(plist_deployment_identity "$plist")" = "$deployment_name" ] \
+          || continue
+        patterns+=("$plist")
+      done
+    fi
   else
     patterns=(
       "$LA"/dev.issue-agent.fix-watcher*.plist
@@ -62,7 +89,7 @@ PLUTIL="$(command -v plutil || true)"
 TARGET_DIR="$(set -a; . "$CONFIG"; set +a; printf '%s' "${TARGET_DIR:-}")"
 CONFIG_REPO="$(set -a; . "$CONFIG"; set +a; printf '%s' "${REPO:-}")"
 [ -n "$TARGET_DIR" ] || echo "⚠ TARGET_DIR not set in $CONFIG — watchers will run from the harness dir and create worktrees in the wrong repo. Set TARGET_DIR."
-deployment_id="$(printf '%s' "$CONFIG|$TARGET_DIR" | cksum | awk '{print $1}')"
+deployment_id="$(deployment_id_for_target "$TARGET_DIR")"
 DEPLOYMENT_NAME="${ISSUE_AGENT_DEPLOYMENT_ID:-$deployment_id}"
 LOG_DIR="$HOME/Library/Logs/issue-agent/$deployment_id"
 mkdir -p "$LOG_DIR"
@@ -72,7 +99,7 @@ SNAP_CONFIG="$SNAP_DIR/$deployment_id.env"
 if [ -f "$SNAP_CONFIG" ]; then
   SNAP_REPO="$(set -a; . "$SNAP_CONFIG"; set +a; printf '%s' "${REPO:-}")"
   SNAP_TARGET="$(set -a; . "$SNAP_CONFIG"; set +a; printf '%s' "${TARGET_DIR:-}")"
-  if [ "$SNAP_REPO" != "$CONFIG_REPO" ] || [ "$SNAP_TARGET" != "$TARGET_DIR" ]; then
+  if [ "$SNAP_REPO" != "$CONFIG_REPO" ]; then
     echo "REFUSING deployment '$deployment_id': existing snapshot belongs to REPO='$SNAP_REPO' TARGET_DIR='$SNAP_TARGET', requested REPO='$CONFIG_REPO' TARGET_DIR='$TARGET_DIR'" >&2
     exit 2
   fi
@@ -135,6 +162,35 @@ for index in "${!units[@]}"; do
     || cp "$legacy_dst" "$STAGE/$index.legacy.previous"
 done
 
+# Releases before stable deployment labels keyed plist names by
+# CONFIG|TARGET_DIR even though the plist already carried the stable CLI
+# identity. Discover those predecessors by their embedded identity so a
+# checkout repoint cannot leave the old persistent writers running.
+predecessor_plists=()
+predecessor_labels=()
+if [ -n "${ISSUE_AGENT_DEPLOYMENT_ID:-}" ]; then
+  for u in "${units[@]}"; do
+    current="$LA/dev.issue-agent.$u.$deployment_id.plist"
+    unsuffixed="$LA/dev.issue-agent.$u.plist"
+    for predecessor in "$LA/dev.issue-agent.$u."*.plist; do
+      [ -e "$predecessor" ] || continue
+      [ "$predecessor" != "$current" ] || continue
+      [ "$predecessor" != "$unsuffixed" ] || continue
+      [ "$(plist_deployment_identity "$predecessor")" = "$DEPLOYMENT_NAME" ] \
+        || continue
+      predecessor_plists+=("$predecessor")
+      predecessor_labels+=("$(basename "$predecessor" .plist)")
+    done
+  done
+fi
+for index in "${!predecessor_plists[@]}"; do
+  predecessor="${predecessor_plists[$index]}"
+  label="${predecessor_labels[$index]}"
+  cp "$predecessor" "$STAGE/predecessor.$index.previous"
+  launchctl list "$label" >/dev/null 2>&1 \
+    && touch "$STAGE/predecessor.$index.loaded" || true
+done
+
 rollback() {
   status=$?
   [ "$status" -ne 0 ] || status=1
@@ -167,6 +223,13 @@ rollback() {
       rm -f -- "$legacy_dst"
     fi
   done
+  for index in "${!predecessor_plists[@]}"; do
+    predecessor="${predecessor_plists[$index]}"
+    launchctl unload "$predecessor" >/dev/null 2>&1
+    if [ -f "$STAGE/predecessor.$index.previous" ]; then
+      mv "$STAGE/predecessor.$index.previous" "$predecessor"
+    fi
+  done
   for index in "${!units[@]}"; do
     u="${units[$index]}"
     label="dev.issue-agent.$u.$deployment_id"
@@ -180,6 +243,10 @@ rollback() {
     legacy_dst="$LA/$legacy_label.plist"
     [ ! -f "$STAGE/$index.legacy.loaded" ] \
       || launchctl load "$legacy_dst" >/dev/null 2>&1
+  done
+  for index in "${!predecessor_plists[@]}"; do
+    [ ! -f "$STAGE/predecessor.$index.loaded" ] \
+      || launchctl load "${predecessor_plists[$index]}" >/dev/null 2>&1
   done
   echo "installation failed; restored previous known-good plists and config" >&2
   exit "$status"
@@ -198,6 +265,21 @@ for index in "${!units[@]}"; do
   elif [ -f "$dst" ]; then
     launchctl unload "$dst" 2>/dev/null || true
   fi
+done
+
+# Stop and remove target-derived predecessors owned by this stable deployment
+# before changing its snapshot. Rollback above restores both their files and
+# loaded state if any replacement job fails to load.
+for index in "${!predecessor_plists[@]}"; do
+  predecessor="${predecessor_plists[$index]}"
+  label="${predecessor_labels[$index]}"
+  if [ -f "$STAGE/predecessor.$index.loaded" ]; then
+    launchctl unload "$predecessor"
+  else
+    launchctl unload "$predecessor" 2>/dev/null || true
+  fi
+  launchctl remove "$label" 2>/dev/null || true
+  rm -f -- "$predecessor"
 done
 
 # Unsuffixed jobs predate deployment-scoped labels. Stop the complete writer

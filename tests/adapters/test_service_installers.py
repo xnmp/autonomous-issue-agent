@@ -441,6 +441,184 @@ def test_launchd_installer_renders_validated_plists_with_absolute_uv(tmp_path):
     )
 
 
+def test_launchd_same_name_repoint_replaces_all_loaded_jobs_atomically(
+    tmp_path,
+):
+    env, home, _uv = _environment(tmp_path, systemd=False)
+    env["ISSUE_AGENT_DEPLOYMENT_ID"] = "acme-app"
+    config = Path(env["AGENT_ENV"])
+    first_target = tmp_path / "checkout-a"
+    second_target = tmp_path / "checkout-b"
+    first_target.mkdir()
+    second_target.mkdir()
+    config.write_text(
+        f'REPO="acme/app"\nTARGET_DIR="{first_target}"\nKNOWN_GOOD=1\n'
+    )
+
+    first = subprocess.run(
+        ["bash", str(ROOT / "bin/install-launchd.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert first.returncode == 0, first.stderr
+    service_log = Path(env["SERVICE_LOG"])
+    first_call_count = len(service_log.read_text().splitlines())
+    snapshot = (
+        home
+        / "Library/Application Support/issue-agent"
+        / "acme-app.env"
+    )
+
+    config.write_text(
+        f'REPO="acme/app"\nTARGET_DIR="{second_target}"\n'
+    )
+    env["REQUIRE_OLD_SNAPSHOT_DURING_UNLOAD"] = "1"
+    env["CUTOVER_SNAPSHOT"] = str(snapshot)
+    second = subprocess.run(
+        ["bash", str(ROOT / "bin/install-launchd.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert second.returncode == 0, second.stderr
+    launch_agents = home / "Library/LaunchAgents"
+    plists = tuple(launch_agents.glob("*.plist"))
+    assert len(plists) == 3
+    assert all(path.name.endswith(".acme-app.plist") for path in plists)
+    assert all(
+        plistlib.loads(path.read_bytes())["EnvironmentVariables"]["TARGET_DIR"]
+        == str(second_target)
+        for path in plists
+    )
+    assert str(second_target) in snapshot.read_text()
+    second_calls = service_log.read_text().splitlines()[first_call_count:]
+    unloads = [
+        second_calls.index(f"unload {path}")
+        for path in plists
+    ]
+    loads = [
+        second_calls.index(f"load {path}")
+        for path in plists
+    ]
+    assert max(unloads) < min(loads)
+
+
+def test_launchd_stable_identity_migrates_and_uninstalls_checksum_jobs(
+    tmp_path,
+):
+    env, home, _uv = _environment(tmp_path, systemd=False)
+    env["ISSUE_AGENT_DEPLOYMENT_ID"] = "acme-app"
+    config = Path(env["AGENT_ENV"])
+    target = tmp_path / "target-repo"
+    config.write_text(f'REPO="acme/app"\nTARGET_DIR="{target}"\n')
+    launch_agents = home / "Library/LaunchAgents"
+    launch_agents.mkdir(parents=True)
+    units = ("fix-watcher", "review-watcher", "steward")
+    predecessor_paths = tuple(
+        launch_agents / f"dev.issue-agent.{unit}.123456.plist"
+        for unit in units
+    )
+    other_paths = tuple(
+        launch_agents / f"dev.issue-agent.{unit}.999999.plist"
+        for unit in units
+    )
+    for path in predecessor_paths:
+        path.write_text(
+            "<key>ISSUE_AGENT_DEPLOYMENT_ID</key>"
+            "<string>acme-app</string>\n"
+        )
+    for path in other_paths:
+        path.write_text(
+            "<key>ISSUE_AGENT_DEPLOYMENT_ID</key>"
+            "<string>other-app</string>\n"
+        )
+
+    install = subprocess.run(
+        ["bash", str(ROOT / "bin/install-launchd.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert install.returncode == 0, install.stderr
+    assert not any(path.exists() for path in predecessor_paths)
+    assert all(path.exists() for path in other_paths)
+    current_paths = tuple(
+        launch_agents / f"dev.issue-agent.{unit}.acme-app.plist"
+        for unit in units
+    )
+    assert all(path.exists() for path in current_paths)
+    calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
+    for path in predecessor_paths:
+        assert f"unload {path}" in calls
+        assert f"remove {path.stem}" in calls
+
+    uninstall = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "bin/install-launchd.sh"),
+            "uninstall",
+            "acme-app",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert uninstall.returncode == 0, uninstall.stderr
+    assert not any(path.exists() for path in current_paths)
+    assert all(path.exists() for path in other_paths)
+
+
+def test_launchd_failed_stable_cutover_restores_checksum_predecessors(
+    tmp_path,
+):
+    env, home, _uv = _environment(
+        tmp_path,
+        systemd=False,
+        fail_pattern="review-watcher",
+    )
+    env["ISSUE_AGENT_DEPLOYMENT_ID"] = "acme-app"
+    config = Path(env["AGENT_ENV"])
+    target = tmp_path / "target-repo"
+    config.write_text(f'REPO="acme/app"\nTARGET_DIR="{target}"\n')
+    launch_agents = home / "Library/LaunchAgents"
+    launch_agents.mkdir(parents=True)
+    units = ("fix-watcher", "review-watcher", "steward")
+    predecessor_paths = tuple(
+        launch_agents / f"dev.issue-agent.{unit}.123456.plist"
+        for unit in units
+    )
+    for path in predecessor_paths:
+        path.write_text(
+            "<key>ISSUE_AGENT_DEPLOYMENT_ID</key>"
+            "<string>acme-app</string>\n"
+        )
+
+    result = subprocess.run(
+        ["bash", str(ROOT / "bin/install-launchd.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert all(path.exists() for path in predecessor_paths)
+    assert not any(
+        launch_agents.glob("dev.issue-agent.*.acme-app.plist")
+    )
+    assert not (
+        home
+        / "Library/Application Support/issue-agent"
+        / "acme-app.env"
+    ).exists()
+    calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
+    for path in predecessor_paths:
+        assert calls.count(f"load {path}") == 1
+
+
 def test_launchd_scoped_uninstall_preserves_other_deployments(tmp_path):
     env, home, _uv = _environment(tmp_path, systemd=False)
     config = Path(env["AGENT_ENV"])
