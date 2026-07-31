@@ -10,7 +10,10 @@ from issue_agent.adapters.agent_publish import (
     AgentPublicationBroker,
     CommandResult,
 )
-from issue_agent.adapters.control_store import SQLiteControlStore
+from issue_agent.adapters.control_store import (
+    RetiredOwnerError,
+    SQLiteControlStore,
+)
 from issue_agent.adapters.event_log import EventLog
 from issue_agent.domain.contracts import CommandKind
 from issue_agent.domain.events import (
@@ -170,6 +173,92 @@ def test_push_is_committed_then_receipted(tmp_path):
         if isinstance(event.payload, ControlTransitionCommitted)
         and event.payload.entity_kind == "lifecycle_command"
     ] == ["pending", "executing", "succeeded"]
+
+
+def test_owner_retirement_after_enqueue_fences_publication(tmp_path):
+    remote = Remote()
+    control = store(tmp_path)
+    successor = SQLiteControlStore(control.path)
+    successor.initialize()
+    old_owner = "o/r:fix:deployment-1"
+    new_owner = "o/r:fix:deployment-2"
+    origin_reads = 0
+
+    def retire_after_enqueue(argv, cwd):
+        nonlocal origin_reads
+        if argv == ("git", "remote", "get-url", "--push", "origin"):
+            origin_reads += 1
+            if origin_reads == 2:
+                successor.adopt_legacy_owner(
+                    "o/r",
+                    "fix",
+                    new_owner,
+                    prior_owner_ids=(old_owner,),
+                )
+        return remote.run(argv, cwd)
+
+    publisher = AgentPublicationBroker(
+        control,
+        repository="o/r",
+        base_branch="dev",
+        owner=old_owner,
+        run=retire_after_enqueue,
+    )
+
+    with pytest.raises(RetiredOwnerError, match="deployment-2"):
+        publisher.publish(
+            ("git", "push", "origin", "HEAD:fix/42-issue"),
+            str(tmp_path),
+        )
+
+    assert remote.effects == []
+    assert successor.pending_commands(
+        repository="o/r",
+        executor_identity=new_owner,
+    )
+
+
+def test_owner_retirement_after_begin_fences_remote_mutation(tmp_path):
+    remote = Remote()
+    control = store(tmp_path)
+    successor = SQLiteControlStore(control.path)
+    successor.initialize()
+    old_owner = "o/r:fix:deployment-1"
+    new_owner = "o/r:fix:deployment-2"
+    retired = False
+
+    def retire_before_push(argv, cwd):
+        nonlocal retired
+        if argv[:3] == ("gh", "pr", "list") and not retired:
+            successor.adopt_legacy_owner(
+                "o/r",
+                "fix",
+                new_owner,
+                prior_owner_ids=(old_owner,),
+            )
+            retired = True
+        return remote.run(argv, cwd)
+
+    publisher = AgentPublicationBroker(
+        control,
+        repository="o/r",
+        base_branch="dev",
+        owner=old_owner,
+        run=retire_before_push,
+    )
+
+    with pytest.raises(RetiredOwnerError, match="deployment-2"):
+        publisher.publish(
+            ("git", "push", "origin", "HEAD:fix/42-issue"),
+            str(tmp_path),
+        )
+
+    assert remote.effects == []
+    assert remote.remote == ""
+    assert successor.pending_commands(
+        repository="o/r",
+        executor_identity=new_owner,
+    )
 
 
 def test_push_disables_and_verifies_existing_auto_merge_first(tmp_path):

@@ -440,6 +440,21 @@ def test_deeply_nested_command_is_unresolvable_without_recursing():
     assert "depth" in resolution.reason
 
 
+def test_bash_hook_blocks_deeply_nested_command():
+    command = "$(" * 1_500 + "git push --no-verify origin dev" + ")" * 1_500
+    payload = json.dumps({"tool_input": {"command": command}})
+
+    result = subprocess.run(
+        [sys.executable, HOOK],
+        input=payload,
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 2
+    assert "depth" in result.stderr
+
+
 @pytest.mark.parametrize("assignment", sorted(gov._PUBLICATION_AUTHORITY_ENV))
 def test_bash_hook_blocks_every_durable_publication_authority_override(
     assignment,

@@ -65,6 +65,12 @@ transient service under `WatchdogSec=4`, bounded-booted all three roles from
 this checkout, and checked the migrated schema-v17 store for zero nonterminal
 runs, active reservations, leases, actionable commands, and pending outbox
 records.
+A final exact-HEAD audit also exercised retirement between publication
+transitions. Paid-child publication stores are now bound to the deployment
+owner, so every later durable write is fenced, and the broker revalidates that
+owner immediately before each remote push, pull-request creation, auto-merge
+disable, or compensating close. Commands already adopted by a successor remain
+recoverable, while the retired publisher cannot cross the completed repoint.
 
 This document remains the **record** for the maintainability refactor: it owns
 sequencing, scope, and the adjudicated design decisions. The codex plan remains

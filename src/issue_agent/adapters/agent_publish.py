@@ -175,6 +175,7 @@ class AgentPublicationBroker:
             )
         ):
             raise ValueError("publication execution authority is incomplete")
+        self.store.bind_active_owner(owner)
         self.run = (
             (
                 lambda argv, cwd: _run_command(
@@ -225,6 +226,15 @@ class AgentPublicationBroker:
         if executable is None:
             raise ValueError("publication command executable is unsupported")
         return self.run((executable, *argv[1:]), cwd)
+
+    def _execute_mutation(
+        self, argv: tuple[str, ...], cwd: str
+    ) -> CommandResult:
+        # Repoint quiescence closes the check/use interval; this last check
+        # prevents a publisher already between durable transitions from
+        # crossing a completed owner retirement.
+        self.store.assert_owner_active(self.owner)
+        return self._execute(argv, cwd)
 
     def _run_pending(self, pending: PendingCommand) -> CommandResult:
         command = pending.command
@@ -383,7 +393,7 @@ class AgentPublicationBroker:
                     "branch publication"
                 ),
             )
-        result = self._execute(argv, cwd)
+        result = self._execute_mutation(argv, cwd)
         reconciled = self._reconcile(command)
         compensated = False
         if (
@@ -775,7 +785,7 @@ class AgentPublicationBroker:
             number = row.get("number")
             if not isinstance(number, int) or number <= 0:
                 return False
-            disabled = self._execute(
+            disabled = self._execute_mutation(
                 (
                     "gh",
                     "pr",
@@ -820,7 +830,7 @@ class AgentPublicationBroker:
         ]
         if len(mismatched) != 1:
             return False
-        close = self._execute(
+        close = self._execute_mutation(
             (
                 "gh",
                 "pr",
