@@ -22,6 +22,7 @@ from ..domain.actions import (
     UpdateBranch,
 )
 from ..domain.labels import Label
+from ..domain.repository import canonical_repository
 from ..domain.contracts import (
     CommandId,
     CommandKind,
@@ -214,7 +215,7 @@ class GitHubEffectExecutor:
             raise ValueError("effect repository and executor identity are required")
         self.gateway = gateway
         self.store = store
-        self.repository = repository
+        self.repository = canonical_repository(repository)
         self.identity = identity
         self.config_version = config_version
 
@@ -773,6 +774,7 @@ def command_for_action(
     repository: str,
     executor_identity: str,
 ) -> LifecycleCommand:
+    repository = canonical_repository(repository)
     kind, target = _command_identity(action)
     payload = {**_jsonable(action), **dict(payload_extra or {})}
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))

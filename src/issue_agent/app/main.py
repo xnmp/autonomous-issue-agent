@@ -31,6 +31,7 @@ from ..adapters.store import Store
 from ..adapters.worktree import Worktrees, build_gate_context
 from ..domain.world import WorldState, fix_probe_safe
 from ..domain.supervision import ExitCode
+from ..domain.repository import canonical_repository
 from .config import HarnessConfig, describe_command, from_env, render_agent_md
 from .roles import (
     build_fix_daemon,
@@ -394,7 +395,7 @@ def main(argv: list[str] | None = None) -> None:
     # the service unit already set, inherited env stays for anything the
     # overlay didn't touch.
     os.environ.update(env)
-    repo = env.get("REPO", "")
+    repo = canonical_repository(env.get("REPO", ""))
     state_dir_key = {
         "fix": "STATE_DIR",
         "review": "REVIEW_STATE_DIR",

@@ -23,6 +23,7 @@ from ..domain.contracts import (
     EffectStatus,
     LifecycleCommand,
 )
+from ..domain.repository import canonical_repository
 
 EFFECT_TIMEOUT_SECONDS = 60.0
 
@@ -72,7 +73,7 @@ class GitHubOperatorEffects:
     ):
         if not repository or not identity:
             raise ValueError("operator effect repository and identity are required")
-        self.repository = repository
+        self.repository = canonical_repository(repository)
         self.store = store
         self.identity = identity
         self.config_version = config_version

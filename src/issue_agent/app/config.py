@@ -25,6 +25,10 @@ from ..domain.effort import EFFORT_LADDER, Effort, parse_effort
 from ..domain.identity import normalize_login
 from ..domain.pricing import parse_model_rate_table
 from ..domain.review import IdentityMode, ReviewMode
+from ..domain.repository import (
+    canonical_repository,
+    repository_validation_error,
+)
 
 
 SHELL_CMD_LOG_LIMIT = 120
@@ -189,6 +193,9 @@ class CodexRuntimeConfig:
 @dataclass(frozen=True)
 class HarnessConfig:
     repo: str
+    # Exact operator spelling retained only to adopt pre-canonical active
+    # control ownership during upgrade. It does not affect equality/config IDs.
+    repo_input: str = field(default="", repr=False, compare=False)
     base_branch: str = "dev"
     target_dir: str = ""
     identity_mode: IdentityMode = IdentityMode.THREE
@@ -539,6 +546,11 @@ class HarnessConfig:
     # env knob; never set this directly.
     parse_errors: tuple[str, ...] = ()
 
+    def __post_init__(self) -> None:
+        raw = self.repo_input or self.repo
+        object.__setattr__(self, "repo_input", raw.strip())
+        object.__setattr__(self, "repo", canonical_repository(self.repo))
+
     @property
     def config_version(self) -> str:
         """Stable identity of the immutable snapshot used by one admission."""
@@ -688,6 +700,8 @@ class HarnessConfig:
             # poll: an empty REPO means a missing/mis-composed overlay (the
             # silent-default class, #50).
             errors.append("REPO must be set (owner/name) — is the repo overlay composed?")
+        elif detail := repository_validation_error(self.repo):
+            errors.append(f"REPO {self.repo!r} {detail}")
         if not (self.fix_bot or "").strip():
             # review P1R-7: an unset FIX_BOT used to pass validate() silently.
             # Worse, `login_eq("", "")` used to be True, so with fix_bot=="" a
@@ -992,6 +1006,7 @@ _INTERNAL_CONFIG_FIELDS = frozenset(
         "triage_prompt",
         "codex_cost_per_mtok_cached_in",
         "parse_errors",
+        "repo_input",
     }
 )
 _ENV_NAME_OVERRIDES = {
@@ -1429,7 +1444,10 @@ def from_env(env: dict | None = None) -> HarnessConfig:
             default=("" if definition.name == "repo" else MISSING),
         )
 
-    repo = str(values["repo"])
+    repo_input = str(values["repo"]).strip()
+    repo = canonical_repository(repo_input)
+    values["repo"] = repo
+    values["repo_input"] = repo_input
     reviewer_runtime = values["reviewer_runtime"]
     if not isinstance(reviewer_runtime, RuntimeName):
         raise RuntimeError("reviewer runtime metadata did not produce RuntimeName")

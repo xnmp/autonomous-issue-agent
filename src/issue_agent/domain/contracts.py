@@ -16,6 +16,8 @@ from types import MappingProxyType
 from typing import Mapping, NewType
 from zoneinfo import ZoneInfo
 
+from .repository import canonical_repository
+
 RunId = NewType("RunId", str)
 DispatchId = NewType("DispatchId", str)
 CommandId = NewType("CommandId", str)
@@ -156,6 +158,9 @@ class BudgetScope:
     period_timezone: ZoneInfo
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "repository", canonical_repository(self.repository)
+        )
         if not self.repository or not self.dimension or not self.period_id:
             raise ValueError("repository, dimension, and period_id are required")
         if not _CURRENCY.fullmatch(self.currency):
@@ -303,6 +308,9 @@ class LifecycleCommand:
     executor_identity: str = ""
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "repository", canonical_repository(self.repository)
+        )
         if not str(self.command_id) or not self.idempotency_key or not self.target:
             raise ValueError("command identity, idempotency key, and target are required")
         if not self.repository or not self.executor_identity:

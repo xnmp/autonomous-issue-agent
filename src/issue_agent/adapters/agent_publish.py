@@ -33,6 +33,7 @@ from .control_store import PendingCommand, SQLiteControlStore
 from .event_log import EventLog
 from ..domain.events import Producer
 from ..domain.refs import is_governed_branch, issue_from_branch
+from ..domain.repository import canonical_repository
 
 
 @dataclass(frozen=True)
@@ -149,7 +150,7 @@ class AgentPublicationBroker:
                 "owner are required"
             )
         self.store = store
-        self.repository = repository
+        self.repository = canonical_repository(repository)
         self.host = host.lower()
         self.base_branch = base_branch
         self.config_version = config_version
@@ -869,6 +870,7 @@ def _lifecycle_command(
     repository: str,
     executor_identity: str,
 ) -> LifecycleCommand:
+    repository = canonical_repository(repository)
     encoded = json.dumps(
         {
             "kind": kind.value,

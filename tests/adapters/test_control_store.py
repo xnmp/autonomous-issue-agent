@@ -116,7 +116,9 @@ def test_control_store_initializes_with_restrictive_permissions_and_integrity(tm
             "SELECT version, length(source_digest) FROM schema_migrations "
             "ORDER BY version"
         ).fetchall()
-    assert history == [(9, 64), (10, 64), (11, 64), (12, 64)]
+    assert history == [
+        (9, 64), (10, 64), (11, 64), (12, 64), (13, 64)
+    ]
 
 
 def test_established_control_store_disappearance_is_not_fresh_initialized(
@@ -130,6 +132,53 @@ def test_established_control_store_disappearance_is_not_fresh_initialized(
         SQLiteControlStore(store.path).initialize()
 
     assert not Path(store.path).exists()
+
+
+def test_repository_alias_migration_unifies_authoritative_rows(tmp_path):
+    store = _store(tmp_path)
+    assert store.reserve(_request(1)).admitted
+    command = LifecycleCommand(
+        CommandId("alias-command"),
+        "github:alias-command",
+        CommandKind.POST_COMMENT,
+        "issue:7",
+        None,
+        {"target": "issue", "number": 7, "body": "done"},
+        "cfg",
+        "o/r",
+        "o/r:fix",
+    )
+    store.enqueue_command(command)
+    with store._connect() as db:
+        db.execute("DELETE FROM schema_migrations WHERE version=13")
+        db.execute(
+            "UPDATE lifecycle_commands SET repository='O/R'"
+        )
+        db.execute(
+            "UPDATE budget_reservations SET repository='O/R'"
+        )
+        db.execute(
+            "UPDATE reservation_limits SET repository='O/R' "
+            "WHERE repository='o/r'"
+        )
+
+    reopened = SQLiteControlStore(store.path, now=lambda: NOW)
+    reopened.initialize()
+
+    with reopened._connect() as db:
+        assert db.execute(
+            "SELECT DISTINCT repository FROM lifecycle_commands"
+        ).fetchall()[0][0] == "o/r"
+        assert db.execute(
+            "SELECT DISTINCT repository FROM budget_reservations"
+        ).fetchall()[0][0] == "o/r"
+        repositories = {
+            row[0]
+            for row in db.execute(
+                "SELECT DISTINCT repository FROM reservation_limits"
+            ).fetchall()
+        }
+    assert repositories == {"o/r"}
 
 
 def test_valid_pre_witness_database_is_adopted_once(tmp_path):
@@ -210,6 +259,7 @@ def test_shipped_v8_database_upgrades_without_rewriting_history_or_data(
         10,
         11,
         12,
+        13,
     ]
     assert history[0][1] == (
         "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
@@ -227,6 +277,7 @@ def test_concurrent_role_boot_serializes_schema_migrations(
     if starting_version != "fresh":
         SQLiteControlStore(str(path)).initialize()
         with sqlite3.connect(path) as db:
+            db.execute("DELETE FROM schema_migrations WHERE version=13")
             db.execute("DELETE FROM schema_migrations WHERE version=12")
             db.execute("DROP TABLE dispatch_claims")
             db.execute("DELETE FROM schema_migrations WHERE version=11")
@@ -267,9 +318,9 @@ def test_concurrent_role_boot_serializes_schema_migrations(
                 "SELECT version FROM schema_migrations ORDER BY version"
             )
         ) == (
-            (8, 9, 10, 11, 12)
+            (8, 9, 10, 11, 12, 13)
             if starting_version == "v8"
-            else (9, 10, 11, 12)
+            else (9, 10, 11, 12, 13)
         )
 
 
@@ -419,6 +470,39 @@ def test_legacy_owner_adoption_preserves_active_runs_leases_and_commands(
     )
 
 
+def test_case_alias_owner_is_adopted_by_canonical_deployment(tmp_path) -> None:
+    store = _store(tmp_path)
+    prior = "Acme/App:fix:old-deployment"
+    prior_legacy = "Acme/App:fix"
+    current = "acme/app:fix:new-deployment"
+    request = dataclasses.replace(_request(1), owner_id=prior)
+    assert store.reserve(request).admitted
+    command = LifecycleCommand(
+        CommandId("alias-owner-command"),
+        "github:alias-owner-command",
+        CommandKind.POST_COMMENT,
+        "issue:7",
+        None,
+        {"target": "issue", "number": 7, "body": "done"},
+        "cfg",
+        "Acme/App",
+        prior_legacy,
+    )
+    store.enqueue_command(command)
+
+    assert store.adopt_legacy_owner(
+        "acme/app",
+        "fix",
+        current,
+        prior_owner_ids=(prior_legacy, prior),
+    ) == (1, 1)
+
+    assert store.pending_commands(
+        repository="acme/app",
+        executor_identity=current,
+    )[0].command.command_id == command.command_id
+
+
 def test_concurrent_sublegs_may_share_a_dispatch_context(
     tmp_path,
 ) -> None:
@@ -474,7 +558,7 @@ def test_publication_authority_requires_active_reservation_and_live_lease(
     assert authority.pgid == pgid
 
 
-@pytest.mark.parametrize("version", (9, 10, 11, 12))
+@pytest.mark.parametrize("version", (9, 10, 11, 12, 13))
 @pytest.mark.parametrize("stage", ("before_commit", "committed"))
 def test_schema_migration_restart_is_atomic_at_every_boundary(
     tmp_path,
@@ -514,7 +598,7 @@ def test_schema_migration_restart_is_atomic_at_every_boundary(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name='run_cancellation_intents'"
         ).fetchone()
-    assert versions == (9, 10, 11, 12)
+    assert versions == (9, 10, 11, 12, 13)
     assert cancellation_table == ("run_cancellation_intents",)
 
 

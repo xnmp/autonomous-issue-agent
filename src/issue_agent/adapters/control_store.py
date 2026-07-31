@@ -53,7 +53,7 @@ from ..domain.events import (
     encode_event_line,
 )
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 SCHEMA_BASELINE_VERSION = 9
 LEGACY_V8_SCHEMA_DIGEST = (
     "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
@@ -470,6 +470,24 @@ _MIGRATION_V12 = """
 DROP INDEX IF EXISTS runs_active_dispatch_unique;
 """
 
+_MIGRATION_V13 = """
+UPDATE lifecycle_commands
+SET repository=LOWER(TRIM(repository))
+WHERE repository <> LOWER(TRIM(repository));
+
+UPDATE budget_reservations
+SET repository=LOWER(TRIM(repository))
+WHERE repository <> '*' AND repository <> LOWER(TRIM(repository));
+
+UPDATE reservation_limits
+SET repository=LOWER(TRIM(repository))
+WHERE repository <> '*' AND repository <> LOWER(TRIM(repository));
+
+UPDATE dispatch_claims
+SET repository=LOWER(TRIM(repository))
+WHERE repository <> LOWER(TRIM(repository));
+"""
+
 _SCHEMA_MIGRATIONS = (
     # Version 9 is the immutable adoption baseline shipped by the architectural
     # hardening cutover. Its exact source digest already exists in deployed
@@ -478,6 +496,7 @@ _SCHEMA_MIGRATIONS = (
     SchemaMigration(10, _MIGRATION_V10),
     SchemaMigration(11, _MIGRATION_V11),
     SchemaMigration(12, _MIGRATION_V12),
+    SchemaMigration(13, _MIGRATION_V13),
 )
 
 if tuple(migration.version for migration in _SCHEMA_MIGRATIONS) != tuple(
@@ -981,6 +1000,8 @@ class SQLiteControlStore:
         repository: str,
         role: str,
         owner_id: str,
+        *,
+        prior_owner_ids: tuple[str, ...] = (),
     ) -> tuple[int, int]:
         """Atomically move pre-deployment ownership into the first upgrader.
 
@@ -993,23 +1014,35 @@ class SQLiteControlStore:
         legacy = f"{repository}:{role}"
         if not repository or not role or not owner_id:
             raise ValueError("legacy owner adoption identity is incomplete")
-        if owner_id == legacy:
+        prior = tuple(
+            candidate
+            for candidate in dict.fromkeys((legacy, *prior_owner_ids))
+            if candidate and candidate != owner_id
+        )
+        if not prior:
             return (0, 0)
+        placeholders = ",".join("?" for _candidate in prior)
         with self.transaction() as db:
             runs = db.execute(
-                "UPDATE runs SET owner_id=? WHERE owner_id=?",
-                (owner_id, legacy),
+                f"UPDATE runs SET owner_id=? WHERE owner_id IN ({placeholders})",
+                (owner_id, *prior),
             ).rowcount
             db.execute(
-                "UPDATE leases SET owner_id=? WHERE owner_id=?",
-                (owner_id, legacy),
+                f"UPDATE leases SET owner_id=? WHERE owner_id IN ({placeholders})",
+                (owner_id, *prior),
+            )
+            db.execute(
+                f"UPDATE dispatch_claims SET owner_id=? "
+                f"WHERE repository=? AND role=? "
+                f"AND owner_id IN ({placeholders})",
+                (owner_id, repository, role, *prior),
             )
             commands = db.execute(
                 "UPDATE lifecycle_commands SET executor_identity=? "
-                "WHERE repository=? AND executor_identity=? "
+                f"WHERE repository=? AND executor_identity IN ({placeholders}) "
                 "AND state IN ('pending','executing','retryable_failure',"
                 "'unknown_outcome')",
-                (owner_id, repository, legacy),
+                (owner_id, repository, *prior),
             ).rowcount
             return (runs, commands)
 

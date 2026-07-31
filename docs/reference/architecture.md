@@ -120,8 +120,11 @@ failure decisions; and exercised ordinary, exhausted, duplicate, and
 conflicting-receipt admissions on the pre-existing live primary database.
 Fresh databases use the v9 adoption baseline. The exact digest emitted by the
 previously shipped v8 initializer remains an accepted immutable predecessor,
-so deployed v8 databases upgrade through v9/v10/v11/v12 without rewritten
-history.
+so deployed v8 databases upgrade through v9/v10/v11/v12/v13 without rewritten
+history. V13 canonicalizes GitHub's case-insensitive `owner/name` repository
+identity across commands, reservations, limits, and dispatch claims; startup
+also adopts both historical mixed-case owner formats so in-flight authority is
+not stranded by the cutover.
 Every migration is digest-validated and individually transactional; restart
 and concurrent-role tests interrupt both sides of every migration commit
 boundary and serialize fresh/v8/v9 boot. Machine-readable
@@ -287,7 +290,8 @@ module requires placing it in the appropriate tier and explaining it here.
 `domain/governor_policy.py`, `domain/identity.py`, `domain/jira.py`,
 `domain/labels.py`, `domain/leg.py`, `domain/lifecycle.py`,
 `domain/outcome.py`, `domain/ports.py`, `domain/pricing.py`,
-`domain/projection.py`, `domain/refs.py`, `domain/review.py`,
+`domain/projection.py`, `domain/refs.py`, `domain/repository.py`,
+`domain/review.py`,
 `domain/supervision.py`, `domain/triage.py`, `domain/trust.py`, and
 `domain/world.py`.
 

@@ -184,12 +184,12 @@ def test_dashboard_recovery_command_is_absolute_and_shell_safe():
 
 
 def test_parse_remote_url_ssh():
-    assert cli.parse_remote_url("git@github.com:acme/MyApp.git") == "acme/MyApp"
+    assert cli.parse_remote_url("git@github.com:acme/MyApp.git") == "acme/myapp"
 
 
 def test_parse_remote_url_https_and_trailing_git():
-    assert cli.parse_remote_url("https://github.com/acme/MyApp.git") == "acme/MyApp"
-    assert cli.parse_remote_url("https://github.com/acme/MyApp") == "acme/MyApp"
+    assert cli.parse_remote_url("https://github.com/acme/MyApp.git") == "acme/myapp"
+    assert cli.parse_remote_url("https://github.com/acme/MyApp") == "acme/myapp"
 
 
 def test_parse_remote_url_https_trailing_slash():
@@ -283,7 +283,7 @@ def test_read_repo_env_field_does_not_leak_ambient_env(tmp_path, monkeypatch):
 
 def test_resolve_name_matches_overlay_despite_trailing_comment(tmp_path):
     (tmp_path / "myapp.env").write_text('REPO="acme/App"  # prod\n')
-    assert cli.resolve_name("acme/App", repos_dir=str(tmp_path)) == "myapp"
+    assert cli.resolve_name("ACME/app", repos_dir=str(tmp_path)) == "myapp"
 
 
 def test_resolve_name_matches_overlay_with_spaced_equals(tmp_path):
@@ -414,7 +414,7 @@ def test_synth_repo_env_minimal_keys():
         repo="acme/MyApp", target_dir="/repos/myapp", name="myapp"
     )
     env = _source_env(text)
-    assert env["REPO"] == "acme/MyApp"
+    assert env["REPO"] == "acme/myapp"
     assert env["TARGET_DIR"] == "/repos/myapp"
     assert env["BASE_BRANCH"] == "dev"
     assert "issue-agent-myapp" in env["STATE_DIR"]

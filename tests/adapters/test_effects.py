@@ -238,6 +238,29 @@ def test_command_identity_includes_expected_revision() -> None:
     assert first.command_id != second.command_id
 
 
+def test_command_identity_canonicalizes_repository_case_aliases() -> None:
+    action = Relabel(
+        Target.PR,
+        2,
+        Label.AI_PR_OPEN,
+        Label.NEEDS_HUMAN_REVIEW,
+    )
+
+    first = command_for_action(
+        action,
+        repository="Acme/App",
+        executor_identity="broker",
+    )
+    second = command_for_action(
+        action,
+        repository="acme/app",
+        executor_identity="broker",
+    )
+
+    assert first.repository == second.repository == "acme/app"
+    assert first.command_id == second.command_id
+
+
 def test_expected_revision_blocks_stale_effect(tmp_path) -> None:
     executor, gateway, store = _executor(tmp_path)
     gateway.head = "new-head"

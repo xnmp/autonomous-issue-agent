@@ -148,11 +148,17 @@ def _role_state_dir(cfg: HarnessConfig, role: str) -> str:
     }[role]
 
 
-def _deployment_identity(cfg: HarnessConfig, role: str) -> str:
+def _deployment_identity_for_repository(
+    cfg: HarnessConfig, role: str, repository: str
+) -> str:
     checkout = os.path.realpath(cfg.target_dir) if cfg.target_dir else ""
     return hashlib.sha256(
-        f"{cfg.repo}:{checkout}:{role}".encode()
+        f"{repository}:{checkout}:{role}".encode()
     ).hexdigest()[:16]
+
+
+def _deployment_identity(cfg: HarnessConfig, role: str) -> str:
+    return _deployment_identity_for_repository(cfg, role, cfg.repo)
 
 
 def _owner_identity(cfg: HarnessConfig, role: str) -> str:
@@ -169,10 +175,20 @@ def _control_store(
     control = SQLiteControlStore(_control_store_path(cfg, state_dir))
     control.initialize()
     role = journal.events.producer.role
+    prior_owners: tuple[str, ...] = ()
+    if cfg.repo_input and cfg.repo_input != cfg.repo:
+        prior_owners = (
+            f"{cfg.repo_input}:{role}",
+            (
+                f"{cfg.repo_input}:{role}:"
+                f"{_deployment_identity_for_repository(cfg, role, cfg.repo_input)}"
+            ),
+        )
     control.adopt_legacy_owner(
         cfg.repo,
         role,
         _owner_identity(cfg, role),
+        prior_owner_ids=prior_owners,
     )
     control.bind_event_outbox(
         journal.events.prepare,

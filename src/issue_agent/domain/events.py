@@ -15,6 +15,8 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, ClassVar, Mapping, TypeVar, get_origin, get_type_hints
 
+from .repository import canonical_repository
+
 JsonScalar = str | int | float | bool | None
 JsonValue = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
 PayloadT = TypeVar("PayloadT", bound="EventPayload")
@@ -30,6 +32,9 @@ class Producer:
     boot_id: str
 
     def __post_init__(self) -> None:
+        object.__setattr__(
+            self, "repository", canonical_repository(self.repository)
+        )
         if not self.deployment or not self.role or not self.boot_id:
             raise ValueError("event producer identity is incomplete")
         if self.pid <= 0:

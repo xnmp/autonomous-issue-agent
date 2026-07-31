@@ -89,6 +89,7 @@ def test_every_operator_field_has_env_and_coercion_metadata():
         "triage_prompt",
         "codex_cost_per_mtok_cached_in",
         "parse_errors",
+        "repo_input",
     }
     for definition in fields(HarnessConfig):
         if definition.name in internal:
@@ -183,6 +184,21 @@ def test_validate_fails_loud_on_empty_repo():
 
     with pytest.raises(ValueError, match="REPO"):
         from_env({}).validate()
+
+
+@pytest.mark.parametrize(
+    "repository",
+    (
+        "github.com/o/r",
+        "https://github.com/o/r",
+        "o/r.git",
+        "o//r",
+        "owner_name/repo",
+    ),
+)
+def test_validate_rejects_repository_alias_and_url_shapes(repository):
+    with pytest.raises(ValueError, match="REPO"):
+        from_env({"REPO": repository}).validate()
 
 
 def test_a_shell_command_is_logged_quoted_and_whole_when_it_fits():
@@ -648,6 +664,8 @@ def test_repo_slug_is_case_insensitive_like_github_repo_identity():
     # genuinely distinct repos, but here for case variants of one repo).
     a = from_env({"REPO": "Acme/Widget"})
     b = from_env({"REPO": "acme/widget"})
+    assert a.repo == b.repo == "acme/widget"
+    assert a.repo_input == "Acme/Widget"
     assert a.state_dir == b.state_dir
     assert a.review_state_dir == b.review_state_dir
     assert a.steward_state_dir == b.steward_state_dir
