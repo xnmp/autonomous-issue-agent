@@ -1,6 +1,6 @@
 # Architecture — how the harness works now
 
-Current as of 2026-07-31. This supersedes the numbered `0N-*.md` specs in
+Current as of 2026-08-01. This supersedes the numbered `0N-*.md` specs in
 `docs/archive/`, which describe the **original bash design**: the scripts they
 document have been deleted. Only the shared `plugin/hooks/checks/` gate stack
 remains because Codex uses it on the live Python path.
@@ -321,6 +321,18 @@ signals only reuse-safe identities currently observed in the recorded process
 group; a reused leader PID invalidates the receipt and is never signalled.
 Normal shutdown and boot recovery terminate and reap the complete tree before
 leases are reclaimed.
+Recovery trigger policy is an immutable domain mapping consumed by the
+application coordinator. Boot performs an unconditional current-deployment
+reap plus lease, worktree, command, and immediate reservation reconciliation;
+suspend-wake uses only the ownership-checked abandoned-process reaper and the
+configured reservation grace; periodic resync reclaims dead leases and sweeps
+stale reservations without touching processes, worktrees, or commands. Legacy,
+explicitly repointed, and current-deployment process registries are reaped in
+the boot trigger's pre-adapter phase. The remaining current-state
+reconciliation runs explicitly after graph construction and legacy-spend
+migration but before readiness; a missing production trigger hook fails
+startup. Network fail-soft behavior and operation-local reconcile-first effects
+are not recovery triggers.
 `SIGTERM` moves the daemon through `RUNNING → DRAINING → STOPPED`: paid
 admission stops first, active work receives a bounded cancellation window,
 handover and receipts are persisted, the outbox is flushed, and remaining
@@ -404,7 +416,7 @@ module requires placing it in the appropriate tier and explaining it here.
 `domain/labels.py`, `domain/leg.py`, `domain/lifecycle.py`,
 `domain/outcome.py`, `domain/ports.py`, `domain/pricing.py`,
 `domain/projection.py`, `domain/refs.py`, `domain/repository.py`,
-`domain/reservation_recovery.py`,
+`domain/recovery.py`, `domain/reservation_recovery.py`,
 `domain/review.py`,
 `domain/supervision.py`, `domain/triage.py`, `domain/trust.py`, and
 `domain/world.py`.
@@ -451,7 +463,7 @@ the web composition/read-model boundary is in `app/dashweb/`.
 | Prompt-size measurement | [prompt-budget.md](prompt-budget.md) |
 | Control-store migration evidence | [control-store-migration-evidence.json](control-store-migration-evidence.json) |
 | Live release canary evidence | [live-release-canary-evidence.json](live-release-canary-evidence.json) |
-| Architectural decisions | [../adr/](../adr/) |
+| Architectural decisions | [../adr/README.md](../adr/README.md) |
 | 110 recorded failure modes | [failure-modes.md](failure-modes.md) |
 | What's still open | [../open/residuals.md](../open/residuals.md) |
 | How it got here | [../history/](../history/) |

@@ -1,4 +1,4 @@
-"""Explicit environment policy for paid agent child processes."""
+"""ADR 0011 child environment, with ADR 0005 ancestor authority retention."""
 
 from __future__ import annotations
 
@@ -63,7 +63,7 @@ _PUBLICATION_CREDENTIAL_KEYS = frozenset(
     }
 )
 
-# The supervised launcher retains every ISSUE_AGENT_* control-plane value.
+# ADR 0005: the supervised launcher retains ISSUE_AGENT_* control-plane values.
 # Provider processes receive only the two advisory markers their governor must
 # evaluate.  An allowlist makes future authority keys scrubbed by default.
 AGENT_VISIBLE_ISSUE_AGENT_KEYS = frozenset(

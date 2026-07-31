@@ -1,4 +1,4 @@
-"""Change-probe gate for the per-tick world build (rate-limit relief).
+"""ADR 0010 change probe for the per-tick world build.
 
 Every tick each daemon rebuilds its whole world through `gh` list/view calls —
 GraphQL-backed and ~14 points a build, which exhausted the shared review/steward

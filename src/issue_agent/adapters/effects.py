@@ -1,4 +1,4 @@
-"""Narrow privileged executor for durable GitHub lifecycle commands."""
+"""ADR 0001's narrow executor for durable GitHub lifecycle commands."""
 
 from __future__ import annotations
 

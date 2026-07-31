@@ -6,6 +6,7 @@ from issue_agent.adapters.control_store import (
     RetiredOwnerError,
 )
 from issue_agent.app import main as main_module
+from issue_agent.domain.recovery import RecoveryTrigger
 from issue_agent.domain.supervision import ExitCode
 
 
@@ -21,7 +22,7 @@ def test_startup_failures_map_to_permanent_exit_classes(
     tmp_path, monkeypatch, failure, expected
 ):
     env_file = tmp_path / "agent.env"
-    env_file.write_text('REPO="o/r"\n')
+    env_file.write_text('REPO="o/r"\nFIX_BOT="fixer"\n')
     monkeypatch.setenv("AGENT_ENV", str(env_file))
     monkeypatch.setattr(
         main_module, "acquire", lambda *_args, **_kwargs: object()
@@ -30,6 +31,9 @@ def test_startup_failures_map_to_permanent_exit_classes(
         main_module,
         "build_role",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+    monkeypatch.setattr(
+        main_module, "_recover_pre_adapter_processes", lambda *_args: ()
     )
 
     with pytest.raises(SystemExit) as stopped:
@@ -57,7 +61,7 @@ def test_retired_deployment_owner_exits_cleanly_without_service_restart(
     monkeypatch,
 ):
     env_file = tmp_path / "agent.env"
-    env_file.write_text('REPO="o/r"\n')
+    env_file.write_text('REPO="o/r"\nFIX_BOT="fixer"\n')
     monkeypatch.setenv("AGENT_ENV", str(env_file))
     monkeypatch.setattr(
         main_module, "acquire", lambda *_args, **_kwargs: object()
@@ -68,6 +72,9 @@ def test_retired_deployment_owner_exits_cleanly_without_service_restart(
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             RetiredOwnerError("old owner")
         ),
+    )
+    monkeypatch.setattr(
+        main_module, "_recover_pre_adapter_processes", lambda *_args: ()
     )
 
     with pytest.raises(SystemExit) as stopped:
@@ -87,6 +94,129 @@ def test_second_sigterm_escalates_to_transient_hard_exit():
     assert exits == [int(ExitCode.TRANSIENT)]
 
 
+def test_boot_recovery_is_explicitly_sequenced_before_readiness(
+    tmp_path, monkeypatch
+):
+    events = []
+    env_file = tmp_path / "agent.env"
+    env_file.write_text('REPO="o/r"\n')
+    monkeypatch.setenv("AGENT_ENV", str(env_file))
+    monkeypatch.setenv("HOT_RELOAD", "0")
+    monkeypatch.setenv("ISSUE_AGENT_MAX_TICKS", "1")
+    monkeypatch.setattr(
+        main_module, "acquire", lambda *_args, **_kwargs: object()
+    )
+
+    class Config:
+        state_dir = str(tmp_path / "fix")
+        review_state_dir = str(tmp_path / "review")
+        steward_state_dir = str(tmp_path / "steward")
+
+        def validate(self):
+            events.append("validate")
+
+    class Daemon:
+        requires_hard_exit = False
+
+        def reconcile(self, trigger):
+            events.append(("reconcile", trigger))
+
+        def run_forever(self, **_kwargs):
+            events.append("run")
+
+    class Notifier:
+        def __init__(self, _env):
+            pass
+
+        def progress(self, _status):
+            pass
+
+        def ready(self, _status):
+            events.append("ready")
+
+        def stopping(self, _status):
+            events.append("stopping")
+
+    monkeypatch.setattr(main_module, "from_env", lambda _env: Config())
+    monkeypatch.setattr(
+        main_module,
+        "_recover_pre_adapter_processes",
+        lambda trigger, *_args: events.append(("preflight", trigger)) or (),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "build_role",
+        lambda *_args: events.append("build") or Daemon(),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "migrate_legacy_spend",
+        lambda *_args: events.append("migrate") or 0,
+    )
+    monkeypatch.setattr(main_module, "SystemdNotifier", Notifier)
+
+    main_module.main(["fix"])
+
+    assert events == [
+        "validate",
+        ("preflight", RecoveryTrigger.BOOT),
+        "build",
+        "migrate",
+        ("reconcile", RecoveryTrigger.BOOT),
+        "ready",
+        "run",
+        "stopping",
+    ]
+
+
+def test_missing_recovery_trigger_withholds_readiness(tmp_path, monkeypatch):
+    env_file = tmp_path / "agent.env"
+    env_file.write_text('REPO="o/r"\n')
+    monkeypatch.setenv("AGENT_ENV", str(env_file))
+    monkeypatch.setattr(
+        main_module, "acquire", lambda *_args, **_kwargs: object()
+    )
+
+    class Config:
+        state_dir = str(tmp_path / "fix")
+        review_state_dir = str(tmp_path / "review")
+        steward_state_dir = str(tmp_path / "steward")
+
+        def validate(self):
+            return None
+
+    class Daemon:
+        reconcile = None
+
+    notifications = []
+
+    class Notifier:
+        def __init__(self, _env):
+            pass
+
+        def progress(self, _status):
+            pass
+
+        def ready(self, status):
+            notifications.append(status)
+
+    monkeypatch.setattr(main_module, "from_env", lambda _env: Config())
+    monkeypatch.setattr(
+        main_module, "_recover_pre_adapter_processes", lambda *_args: ()
+    )
+    monkeypatch.setattr(main_module, "build_role", lambda *_args: Daemon())
+    monkeypatch.setattr(
+        main_module, "migrate_legacy_spend", lambda *_args: 0
+    )
+    monkeypatch.setattr(main_module, "SystemdNotifier", Notifier)
+
+    with pytest.raises(SystemExit) as stopped:
+        main_module.main(["fix"])
+
+    assert stopped.value.code is ExitCode.INVALID_CONFIG
+    assert notifications == []
+
+
 @pytest.mark.parametrize("failure_seam", ("max_ticks", "reload_watch"))
 def test_systemd_ready_is_withheld_until_synchronous_startup_succeeds(
     tmp_path,
@@ -104,10 +234,17 @@ def test_systemd_ready_is_withheld_until_synchronous_startup_succeeds(
     class Daemon:
         requires_hard_exit = False
 
+        def reconcile(self, _trigger):
+            return None
+
         def run_forever(self, **_kwargs):
             raise AssertionError("startup failure entered the daemon loop")
 
     class Config:
+        repo = "o/r"
+        repo_input = "o/r"
+        target_dir = ""
+        repointed_from_deployments = ()
         state_dir = str(tmp_path / "fix")
         review_state_dir = str(tmp_path / "review")
         steward_state_dir = str(tmp_path / "steward")

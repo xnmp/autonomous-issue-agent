@@ -1,4 +1,4 @@
-"""The PR/commit/push gate — pure port of plugin/hooks/checks/*.sh + _pr_common.sh.
+"""ADR 0011 PR/commit/push gate policy.
 
 Every rule returns a `GateResult` (Allow | Deny(reason)). The rules that derive
 truth from data — branch name, commit prefixes + TDD ordering, PR body, required

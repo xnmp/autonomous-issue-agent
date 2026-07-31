@@ -1,11 +1,11 @@
-"""Hot-reload watch — restart a daemon when the harness's own code changes.
+"""ADR 0007 hot reload — restart when coherent harness state changes.
 
 The nodemon/uvicorn-reload pattern, with two properties those don't need:
 
-* A restart may only happen BETWEEN ticks. Dispatch is synchronous inside
-  `Daemon.tick`, so between ticks there is never an agent session in flight —
-  a reload can therefore never kill paid work, which is what made every manual
-  restart in the 2026-07-27 deployment a wait-for-settle exercise.
+* A restart may only complete BETWEEN ticks after admission closes and active
+  dispatches drain. Observation continues during the drain, but a reload never
+  kills paid work — the constraint learned from manual restarts in the
+  2026-07-27 deployment.
 
 * The trigger is the harness repo's HEAD commit, not file mtimes. An mtime
   watch reloads on every editor save, so a tick boundary landing between two

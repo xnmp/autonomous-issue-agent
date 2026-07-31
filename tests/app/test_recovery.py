@@ -21,6 +21,7 @@ from issue_agent.domain.contracts import (
     ReservationId,
     RunId,
 )
+from issue_agent.domain.recovery import RecoveryTrigger
 
 
 @dataclass(frozen=True)
@@ -113,9 +114,9 @@ def test_recovery_reconciles_dead_reservation_before_unknown_release():
     report = RecoveryCoordinator(
         _Supervisor(), control, _Worktrees(), _Commands(),
         spend, abandonments, "o/r:fix"
-    ).recover()
+    ).reconcile(RecoveryTrigger.BOOT)
 
-    assert report.killed_orphans == (RunId("orphan"),)
+    assert report.killed_orphans == ()
     assert report.reclaimed_leases == (RunId("recovered"),)
     assert report.validated_worktrees == 2
     assert report.recovered_commands == 1
@@ -136,7 +137,7 @@ def test_recovery_never_releases_indeterminate_spend_after_execution():
     report = RecoveryCoordinator(
         _Supervisor(), control, _Worktrees(), _Commands(),
         spend, abandonments, "o/r:fix"
-    ).recover()
+    ).reconcile(RecoveryTrigger.BOOT)
 
     assert report.spend_unknown == ()
     assert control.released == []
@@ -161,7 +162,7 @@ def test_recovery_completes_when_abandonment_telemetry_raises():
         _Spend(),
         BrokenTelemetry(),
         "o/r:fix",
-    ).recover()
+    ).reconcile(RecoveryTrigger.BOOT)
 
     assert report.spend_unknown == ()
     assert control.released == []
@@ -219,15 +220,83 @@ def test_recovery_runs_the_fixed_crash_consistency_sequence():
         _Spend(),
         Abandonments(),
         "o/r:fix",
-    ).recover()
+    ).reconcile(RecoveryTrigger.BOOT)
 
     assert calls == [
-        "kill_orphans",
         "reclaim_leases",
         "validate_worktrees",
         "drain_commands",
         "reconstruct_spend",
         "inspect_pending",
+    ]
+
+
+def test_wake_and_periodic_triggers_execute_only_their_declared_arms():
+    calls = []
+
+    class Supervisor:
+        def recover_orphans(self):
+            calls.append("reap_all")
+            return ()
+
+        def recover_abandoned_orphans(self):
+            calls.append("reap_abandoned")
+            return ()
+
+    class Control(_Control):
+        def reclaim_dead_leases(self, _owner_id, _is_alive):
+            calls.append("reclaim_leases")
+            return ()
+
+        def leases(self, _owner_id):
+            calls.append("read_leases")
+            return ()
+
+        def stale_active_reservation_runs(self, _owner_id, _created_before):
+            calls.append("read_stale_reservations")
+            return ()
+
+        def pending_commands(self):
+            calls.append("inspect_pending")
+            return ()
+
+    class Worktrees:
+        def prune_validate(self):
+            calls.append("validate_worktrees")
+            return 0
+
+    class Commands:
+        def drain_pending_commands(self):
+            calls.append("drain_commands")
+            return 0
+
+    coordinator = RecoveryCoordinator(
+        Supervisor(),
+        Control(),
+        Worktrees(),
+        Commands(),
+        _Spend(),
+        _Abandonments(),
+        "o/r:fix",
+    )
+
+    coordinator.reconcile(RecoveryTrigger.WAKE)
+    assert calls == [
+        "reap_abandoned",
+        "reclaim_leases",
+        "validate_worktrees",
+        "drain_commands",
+        "read_leases",
+        "read_stale_reservations",
+        "inspect_pending",
+    ]
+
+    calls.clear()
+    coordinator.reconcile(RecoveryTrigger.PERIODIC)
+    assert calls == [
+        "reclaim_leases",
+        "read_leases",
+        "read_stale_reservations",
     ]
 
 
@@ -287,7 +356,7 @@ def test_dead_lease_with_recovered_spend_keeps_one_abandoned_terminal_outcome(
     report = RecoveryCoordinator(
         _Supervisor(), store, _Worktrees(), _Commands(),
         Reconciler(), abandonments, "o/r:fix"
-    ).recover()
+    ).reconcile(RecoveryTrigger.BOOT)
 
     with sqlite3.connect(store.path) as db:
         state, outcome, receipt = db.execute(
@@ -366,7 +435,7 @@ def test_suspend_recovery_preserves_live_owned_lease_and_settlement(
         abandonments,
         "o/r:fix",
         now=lambda: now + timedelta(hours=1),
-    ).recover_after_suspend()
+    ).reconcile(RecoveryTrigger.WAKE)
 
     assert report.reclaimed_leases == ()
     assert store.active_reservation_runs("o/r:fix") == (run_id,)
@@ -438,11 +507,11 @@ def test_periodic_sweep_releases_usage_blind_reservation_after_grace(
         now=lambda: current[0],
     )
 
-    assert coordinator.sweep_reservations().spend_unknown == ()
+    assert coordinator.reconcile(RecoveryTrigger.PERIODIC).spend_unknown == ()
     assert store.active_reservation_runs("o/r:fix") == (run_id,)
 
     current[0] = reserved_at + timedelta(minutes=3)
-    report = coordinator.sweep_reservations()
+    report = coordinator.reconcile(RecoveryTrigger.PERIODIC)
 
     assert report.spend_unknown == (run_id,)
     assert store.active_reservation_runs("o/r:fix") == ()
@@ -514,7 +583,7 @@ def test_periodic_sweep_releases_only_stale_unlaunched_reservation(
         "o/r:fix",
         reservation_grace=timedelta(minutes=2),
         now=lambda: reserved_at + timedelta(minutes=3),
-    ).sweep_reservations()
+    ).reconcile(RecoveryTrigger.PERIODIC)
 
     assert report.spend_unknown == (run_id,)
     assert store.active_reservation_runs("o/r:fix") == ()
@@ -584,7 +653,7 @@ def test_spawn_registration_wins_race_with_periodic_release(tmp_path):
         "o/r:fix",
         reservation_grace=timedelta(minutes=2),
         now=lambda: reserved_at + timedelta(minutes=3),
-    ).sweep_reservations()
+    ).reconcile(RecoveryTrigger.PERIODIC)
 
     assert report.spend_unknown == ()
     assert store.active_reservation_runs("o/r:fix") == (run_id,)

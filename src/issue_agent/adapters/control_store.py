@@ -1,4 +1,4 @@
-"""SQLite operational authority for one deployment.
+"""SQLite operational authority defined by ADR 0003.
 
 The store owns reservations, run/lease state, deduplication, lifecycle commands,
 effect receipts, and the event outbox.  Transactions are intentionally short:

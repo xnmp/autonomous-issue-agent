@@ -1,4 +1,4 @@
-"""Webhook forwarder — `python -m issue_agent.app.webhook`.
+"""ADR 0010 wake-only webhook forwarder.
 
 Runs `gh webhook forward` as a child process and turns every delivery into a
 WAKE for the three role daemons: touch each role's wake file, nothing else.

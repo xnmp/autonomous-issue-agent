@@ -1,4 +1,4 @@
-"""Generic daemon loop — observe → decide → execute → sleep, with heartbeat.
+"""ADR 0010 reconciliation loop — observe → decide → execute → sleep.
 
 Replaces the three near-identical bash `while true; do … sleep; done` loops
 (watcher.sh / review-watcher.sh / steward.sh). A `Daemon` is parameterised by:
@@ -35,6 +35,7 @@ from ..domain.events import (
     TelemetryEvent,
     TickGated,
 )
+from ..domain.recovery import RecoveryTrigger
 from ..domain.supervision import (
     ClockSample,
     DaemonState,
@@ -134,8 +135,8 @@ class Daemon:
     # Total application deadline, including forced teardown and reconciliation.
     # The systemd hard stop is 90s, leaving 10s for interpreter/supervisor exit.
     shutdown_timeout_seconds: float = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
-    recover: Callable[[], object] | None = None
-    sweep_reservations: Callable[[], object] | None = None
+    # ADR 0006: callers emit semantic triggers; the coordinator selects arms.
+    reconcile: Callable[[RecoveryTrigger], object] | None = None
     reservation_sweep_ticks: int = DEFAULT_RESERVATION_SWEEP_TICKS
     prepare_shutdown: Callable[[], object] | None = None
     finalize: Callable[[], object] | None = None
@@ -708,8 +709,8 @@ class Daemon:
                                 )
                             )
                         )
-                    if self.recover is not None:
-                        self.recover()
+                    if self.reconcile is not None:
+                        self.reconcile(RecoveryTrigger.WAKE)
                     last_logged = cur
                 elif cur - last_logged >= heartbeat_seconds:
                     self.log(f"{self.name}: ♥ alive (poll {self.poll_seconds}s)")
@@ -720,11 +721,11 @@ class Daemon:
                     scheduler_progress()
                 ticks += 1
                 if (
-                    self.sweep_reservations is not None
+                    self.reconcile is not None
                     and ticks % self.reservation_sweep_ticks == 0
                 ):
                     try:
-                        self.sweep_reservations()
+                        self.reconcile(RecoveryTrigger.PERIODIC)
                     except Exception as exc:
                         self.log(
                             f"{self.name}: reservation sweep failed "

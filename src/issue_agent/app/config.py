@@ -1,4 +1,4 @@
-"""Environment → config objects (port of the agent.env vars the bash reads).
+"""Environment → immutable config snapshot under ADR 0007.
 
 Pure mapping `dict → HarnessConfig` so tests construct it without os.environ —
 with one deliberate exception: an env carrying `AGENT_ENV` is re-resolved

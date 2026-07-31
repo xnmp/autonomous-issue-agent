@@ -1,4 +1,4 @@
-"""Cross-process authority for deployment-scoped remote effects."""
+"""ADR 0008 fencing for deployment-scoped remote effects."""
 
 from __future__ import annotations
 

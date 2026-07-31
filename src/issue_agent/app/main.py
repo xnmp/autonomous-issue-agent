@@ -33,6 +33,7 @@ from ..adapters.worktree import Worktrees, build_gate_context
 from ..domain.world import WorldState, fix_probe_safe
 from ..domain.supervision import ExitCode
 from ..domain.contracts import RunId
+from ..domain.recovery import RecoveryArm, RecoveryTrigger, recovery_plan
 from ..domain.repository import canonical_repository
 from .config import HarnessConfig, describe_command, from_env, render_agent_md
 from .roles import (
@@ -67,12 +68,19 @@ def _ignore_log(_message: str) -> None:
     pass
 
 
-def _recover_supervised_processes(
+def _recover_pre_adapter_processes(
+    trigger: RecoveryTrigger,
     cfg: HarnessConfig,
     role: str,
     state_dir: str,
 ) -> tuple[RunId, ...]:
-    """Reap legacy, explicitly repointed, then current deployment registries."""
+    """Run ADR 0006's pre-adapter process phase for every owned scope."""
+
+    if (
+        RecoveryArm.REAP_ALL_PROCESSES
+        not in recovery_plan(trigger).preflight_arms
+    ):
+        return ()
 
     from ..adapters.process_supervisor import ProcessSupervisor
 
@@ -233,14 +241,6 @@ def build_role(
         "review": cfg.review_state_dir,
         "steward": cfg.steward_state_dir,
     }[role]
-    state_dir = runner_state_dir
-    if state_dir:
-        recovered = _recover_supervised_processes(cfg, role, state_dir)
-        if recovered:
-            sys.stderr.write(
-                f"{role}: recovered {len(recovered)} orphaned process group(s) "
-                "before adapter initialization\n"
-            )
 
     # Resolved-config print (lean P5.1): every daemon start states what it
     # ACTUALLY loaded — the only structural defense against the silent-default
@@ -474,7 +474,6 @@ def main(argv: list[str] | None = None) -> None:
         notifier.progress(f"{role} scheduler progressed")
 
     try:
-        daemon = build_role(role, env, scheduler_progress)
         cfg = from_env(env)
         cfg.validate()
         state_dir = {
@@ -482,12 +481,27 @@ def main(argv: list[str] | None = None) -> None:
             "review": cfg.review_state_dir,
             "steward": cfg.steward_state_dir,
         }[role]
+        if state_dir:
+            recovered = _recover_pre_adapter_processes(
+                RecoveryTrigger.BOOT, cfg, role, state_dir
+            )
+            if recovered:
+                sys.stderr.write(
+                    f"{role}: recovered {len(recovered)} orphaned process "
+                    "group(s) before adapter initialization\n"
+                )
+        daemon = build_role(role, env, scheduler_progress)
         imported = migrate_legacy_spend(cfg, state_dir)
         if imported:
             sys.stderr.write(
                 f"{role}: imported {imported} legacy spend row(s) "
                 "before paid admission\n"
             )
+        if daemon.reconcile is None:
+            raise ValueError(
+                f"{role} daemon recovery trigger is not configured"
+            )
+        daemon.reconcile(RecoveryTrigger.BOOT)
     except IncompatibleSchema as exc:
         sys.stderr.write(f"{role}: incompatible control-store schema — {exc}\n")
         raise SystemExit(ExitCode.INCOMPATIBLE_SCHEMA) from exc

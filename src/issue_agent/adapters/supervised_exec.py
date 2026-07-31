@@ -103,7 +103,7 @@ def _wait_for_target(pid: int) -> None:
 def _carry_authority_and_exec(
     command: list[str], environment: Mapping[str, str]
 ) -> None:
-    """Keep authority in this ancestor and exec the provider in a clean child."""
+    """Apply ADR 0005: retain ancestor authority and scrub the provider."""
 
     prior_mask = signal.pthread_sigmask(
         signal.SIG_BLOCK,

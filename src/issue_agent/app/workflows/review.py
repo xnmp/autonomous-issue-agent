@@ -1,4 +1,4 @@
-"""Review workflow dispatch.
+"""Review workflow continuation under ADR 0009.
 
 Owns single, delegated, and multi-agent review dispatch outside the central
 AgentDispatcher so review behavior can evolve behind a role-specific module.

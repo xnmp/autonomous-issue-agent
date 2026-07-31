@@ -556,6 +556,35 @@ def test_architecture_manifest_names_every_top_level_module_and_app_subtier() ->
         assert f"`app/{subtier}/`" in architecture
 
 
+def test_every_adr_is_referenced_by_a_governed_source_file() -> None:
+    decisions = (ROOT / "docs" / "adr").glob(
+        "[0-9][0-9][0-9][0-9]-*.md"
+    )
+    for adr in sorted(decisions):
+        decision = adr.read_text()
+        match = re.match(r"# ADR ([0-9]{4})\b", decision)
+        assert match is not None, f"{adr.name} has no ADR id"
+        marker = f"ADR {match.group(1)}"
+        governs = next(
+            (
+                line.removeprefix("Governs: ")
+                for line in decision.splitlines()
+                if line.startswith("Governs: ")
+            ),
+            "",
+        )
+        source_files = tuple(
+            ROOT / token
+            for token in governs.split()
+            if token.startswith("src/") and token.endswith(".py")
+        )
+        assert source_files, f"{adr.name} governs no source file"
+        assert any(
+            path.is_file() and marker in path.read_text()
+            for path in source_files
+        ), f"{adr.name} is not referenced by a governed source file"
+
+
 def test_prompt_budget_evidence_matches_current_instruction_file() -> None:
     prompt = (ROOT / "CLAUDE.md").read_text()
     evidence = (

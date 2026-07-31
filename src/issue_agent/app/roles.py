@@ -96,6 +96,7 @@ from ..domain.pricing import (
     UnknownModelPolicy,
     usd_per_million_to_micros,
 )
+from ..domain.recovery import RecoveryTrigger
 from ..domain.events import (
     CiFlakeDetected,
     CiPendingDeadline,
@@ -465,8 +466,7 @@ def _effects(
 
 @dataclass(frozen=True)
 class _RecoveryHooks:
-    after_suspend: Callable[[], object]
-    sweep_reservations: Callable[[], object]
+    reconcile: Callable[[RecoveryTrigger], object]
 
 
 def _recovery(
@@ -499,16 +499,12 @@ def _recovery(
         owner_id,
     )
 
-    def flush_after(callback: Callable[[], object]) -> object:
-        report = callback()
+    def reconcile(trigger: RecoveryTrigger) -> object:
+        report = coordinator.reconcile(trigger)
         control.flush_bound_outbox()
         return report
 
-    flush_after(coordinator.recover)
-    return _RecoveryHooks(
-        lambda: flush_after(coordinator.recover_after_suspend),
-        lambda: flush_after(coordinator.sweep_reservations),
-    )
+    return _RecoveryHooks(reconcile)
 
 
 def _force_kill(
@@ -2041,8 +2037,7 @@ def build_fix_daemon(
         force_kill_dispatches=_force_kill(cfg, "fix", cfg.state_dir),
         dispatch_rejected=reservations.finish,
         heartbeat_path=os.path.join(cfg.state_dir, "heartbeat.json"),
-        recover=recovery.after_suspend,
-        sweep_reservations=recovery.sweep_reservations,
+        reconcile=recovery.reconcile,
         prepare_shutdown=_shutdown_prepare(
             control,
             owner_id=owner_id,
@@ -2284,8 +2279,7 @@ def build_review_daemon(
                   heartbeat_path=os.path.join(
                       cfg.review_state_dir, "heartbeat.json"
                   ),
-                  recover=recovery.after_suspend,
-                  sweep_reservations=recovery.sweep_reservations,
+                  reconcile=recovery.reconcile,
                   prepare_shutdown=_shutdown_prepare(
                       control,
                       owner_id=owner_id,
@@ -2572,8 +2566,7 @@ def build_steward_daemon(
                   heartbeat_path=os.path.join(
                       cfg.steward_state_dir, "heartbeat.json"
                   ),
-                  recover=recovery.after_suspend,
-                  sweep_reservations=recovery.sweep_reservations,
+                  reconcile=recovery.reconcile,
                   prepare_shutdown=_shutdown_prepare(
                       control,
                       owner_id=owner_id,

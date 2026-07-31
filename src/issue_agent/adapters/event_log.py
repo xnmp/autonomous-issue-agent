@@ -1,4 +1,4 @@
-"""Durable, bounded writer for schema-v2 telemetry events."""
+"""ADR 0004's durable, bounded schema-v2 telemetry writer."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Fix workflow dispatch.
+"""Fix workflow continuation under ADR 0009.
 
 This module owns the impure fix-side agent dispatch sequence: gather GitHub and
 store state, build an agent task, run it, persist session/counter markers, then

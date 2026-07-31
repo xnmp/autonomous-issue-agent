@@ -1,4 +1,4 @@
-"""Install the harness governor as a Codex **PreToolUse** hook in a worktree.
+"""Install ADR 0011's advisory Codex **PreToolUse** hook in a worktree.
 
 Codex hooks fire before each Bash tool call and pass JSON on stdin whose shape
 is field-identical to Claude Code's (`tool_name`, `tool_input.command`, `cwd`),

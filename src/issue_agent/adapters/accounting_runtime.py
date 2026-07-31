@@ -1,4 +1,4 @@
-"""Agent runtime decorator enforcing reserve-before-run accounting."""
+"""ADR 0002's reserve-before-run accounting boundary."""
 
 from __future__ import annotations
 

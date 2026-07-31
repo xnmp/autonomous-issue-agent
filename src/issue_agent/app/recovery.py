@@ -1,13 +1,19 @@
-"""Idempotent boot/suspend recovery coordinator."""
+"""Idempotent boot, wake, and periodic recovery coordinator."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from collections.abc import Callable
 
 from ..adapters.process_supervisor import ProcessSupervisor as DurableProcessSupervisor
 from ..domain.contracts import RunId
+from ..domain.recovery import (
+    RecoveryArm,
+    RecoveryGrace,
+    RecoveryTrigger,
+    recovery_plan,
+)
 from ..domain.reservation_recovery import (
     ReservationRecoveryAction,
     ReservationRecoveryState,
@@ -25,18 +31,13 @@ from ..domain.ports import (
 
 @dataclass(frozen=True)
 class RecoveryReport:
+    trigger: RecoveryTrigger
     killed_orphans: tuple[RunId, ...]
     reclaimed_leases: tuple[RunId, ...]
     validated_worktrees: int
     recovered_commands: int
     spend_unknown: tuple[RunId, ...]
     pending_commands: int
-
-
-@dataclass(frozen=True)
-class ReservationSweepReport:
-    reclaimed_leases: tuple[RunId, ...]
-    spend_unknown: tuple[RunId, ...]
 
 
 @dataclass
@@ -51,57 +52,63 @@ class RecoveryCoordinator:
     reservation_grace: timedelta = timedelta(minutes=2)
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
 
-    def recover(self) -> RecoveryReport:
-        killed = self.supervisor.recover_orphans()
-        reclaimed = self.control.reclaim_dead_leases(
-            self.owner_id, _pid_alive
+    def reconcile(self, trigger: RecoveryTrigger) -> RecoveryReport:
+        """Execute the trigger-selected arm set from ADR 0006."""
+
+        plan = recovery_plan(trigger)
+        arms = plan.coordinator_arms
+        killed: tuple[RunId, ...] = ()
+        if RecoveryArm.REAP_ALL_PROCESSES in arms:
+            killed = self.supervisor.recover_orphans()
+        elif RecoveryArm.REAP_ABANDONED_PROCESSES in arms:
+            killed = self.supervisor.recover_abandoned_orphans()
+
+        reclaimed: tuple[RunId, ...] = ()
+        if RecoveryArm.RECLAIM_LEASES in arms:
+            reclaimed = self.control.reclaim_dead_leases(
+                self.owner_id, _pid_alive
+            )
+
+        validated_worktrees = (
+            self.worktrees.prune_validate()
+            if RecoveryArm.VALIDATE_WORKTREES in arms
+            else 0
         )
-        validated_worktrees = self.worktrees.prune_validate()
-        recovered_commands = self.commands.drain_pending_commands()
-        sweep = self._sweep(timedelta(0), reclaimed)
+        recovered_commands = (
+            self.commands.drain_pending_commands()
+            if RecoveryArm.DRAIN_COMMANDS in arms
+            else 0
+        )
+
+        spend_unknown: tuple[RunId, ...] = ()
+        if RecoveryArm.SWEEP_RESERVATIONS in arms:
+            grace = (
+                timedelta(0)
+                if plan.reservation_grace is RecoveryGrace.IMMEDIATE
+                else self.reservation_grace
+            )
+            reclaimed, spend_unknown = self._sweep(grace, reclaimed)
+
         return RecoveryReport(
+            trigger,
             killed,
-            sweep.reclaimed_leases,
+            reclaimed,
             validated_worktrees,
             recovered_commands,
-            sweep.spend_unknown,
-            len(self.control.pending_commands()),
+            spend_unknown,
+            (
+                len(self.control.pending_commands())
+                if RecoveryArm.DRAIN_COMMANDS in arms
+                else 0
+            ),
         )
-
-    def recover_after_suspend(self) -> RecoveryReport:
-        """Recover after wake without reaping a process owned by this daemon."""
-
-        killed = self.supervisor.recover_abandoned_orphans()
-        reclaimed = self.control.reclaim_dead_leases(
-            self.owner_id, _pid_alive
-        )
-        validated_worktrees = self.worktrees.prune_validate()
-        recovered_commands = self.commands.drain_pending_commands()
-        sweep = self._sweep(self.reservation_grace, reclaimed)
-        return RecoveryReport(
-            killed,
-            sweep.reclaimed_leases,
-            validated_worktrees,
-            recovered_commands,
-            sweep.spend_unknown,
-            len(self.control.pending_commands()),
-        )
-
-    def sweep_reservations(self) -> ReservationSweepReport:
-        """Reconcile or release stale capacity without process-group reaping."""
-
-        return self._sweep(self.reservation_grace)
 
     def _sweep(
         self,
         grace: timedelta,
-        reclaimed_leases: tuple[RunId, ...] | None = None,
-    ) -> ReservationSweepReport:
-        reclaimed = (
-            self.control.reclaim_dead_leases(self.owner_id, _pid_alive)
-            if reclaimed_leases is None
-            else reclaimed_leases
-        )
+        reclaimed_leases: tuple[RunId, ...],
+    ) -> tuple[tuple[RunId, ...], tuple[RunId, ...]]:
+        reclaimed = reclaimed_leases
         live_runs = {
             lease.run_id for lease in self.control.leases(self.owner_id)
         }
@@ -160,7 +167,7 @@ class RecoveryCoordinator:
                 )
             except Exception:
                 pass
-        return ReservationSweepReport(reclaimed, tuple(unknown))
+        return reclaimed, tuple(unknown)
 
 
 class NoWorktreeRecovery:

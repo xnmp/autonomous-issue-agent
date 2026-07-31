@@ -15,6 +15,7 @@ from issue_agent.app.loop import Daemon
 from issue_agent.domain.actions import NoOp, Relabel, Target
 from issue_agent.domain.events import TelemetryEvent, TickGated
 from issue_agent.domain.labels import Label
+from issue_agent.domain.recovery import RecoveryTrigger
 from issue_agent.domain.world import PRView, WorldState
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
 
@@ -829,7 +830,7 @@ def test_suspend_recovery_never_replays_actions_from_telemetry(tmp_path):
         ),
         poll_seconds=60,
         journal=journal,
-        recover=lambda: recoveries.append("recovered"),
+        reconcile=recoveries.append,
     )
 
     times = iter([0, 240])
@@ -854,7 +855,7 @@ def test_suspend_recovery_never_replays_actions_from_telemetry(tmp_path):
         }
     ]
     assert gateway.calls == []
-    assert recoveries == ["recovered"]
+    assert recoveries == [RecoveryTrigger.WAKE]
     assert not any(event.get("replayed") is True for event in events)
     assert not any(event["event"] == "agent_run_stall" for event in events)
 
@@ -867,7 +868,7 @@ def test_reservation_sweep_runs_on_bounded_tick_cadence():
         lambda _world: [],
         Executor(FakeGateway()),
         poll_seconds=1,
-        sweep_reservations=lambda: sweeps.append("swept"),
+        reconcile=sweeps.append,
         reservation_sweep_ticks=2,
     )
 
@@ -877,7 +878,7 @@ def test_reservation_sweep_runs_on_bounded_tick_cadence():
         max_ticks=2,
     )
 
-    assert sweeps == ["swept"]
+    assert sweeps == [RecoveryTrigger.PERIODIC]
 
 
 def test_heartbeat_below_stall_threshold_does_not_reconcile_or_journal(tmp_path):

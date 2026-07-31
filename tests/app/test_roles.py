@@ -53,7 +53,7 @@ from issue_agent.adapters.control_store import (
 from issue_agent.adapters.store import Store
 from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
 from issue_agent.app.config import HarnessConfig, from_env
-from issue_agent.app.main import _recover_supervised_processes
+from issue_agent.app.main import _recover_pre_adapter_processes
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.planners.tasks import (
     FixTaskConfig,
@@ -110,6 +110,7 @@ from issue_agent.domain.contracts import (
     RunId,
 )
 from issue_agent.domain.refs import issue_from_branch
+from issue_agent.domain.recovery import RecoveryTrigger
 from issue_agent.domain.review import ReviewConfig, ReviewMode, decide_review
 from issue_agent.domain.world import (
     Check,
@@ -177,7 +178,7 @@ def test_process_supervision_isolated_between_checkouts_sharing_state(
             process.wait()
 
 
-def test_explicit_repoint_recovers_prior_processes_but_not_siblings(
+def test_boot_preflight_recovers_current_and_repointed_but_not_siblings(
     tmp_path,
 ) -> None:
     shared = str(tmp_path / "shared-state")
@@ -203,11 +204,20 @@ def test_explicit_repoint_recovers_prior_processes_but_not_siblings(
         process_supervision_state_dir(base, "fix"),
         grace_seconds=0.05,
     )
+    current_supervisor = ProcessSupervisor(
+        process_supervision_state_dir(current, "fix"),
+        grace_seconds=0.05,
+    )
     sibling_supervisor = ProcessSupervisor(
         process_supervision_state_dir(sibling, "fix"),
         grace_seconds=0.05,
     )
     prior_process = subprocess.Popen(
+        ["sleep", "30"],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+    )
+    current_process = subprocess.Popen(
         ["sleep", "30"],
         start_new_session=True,
         stdout=subprocess.DEVNULL,
@@ -219,29 +229,42 @@ def test_explicit_repoint_recovers_prior_processes_but_not_siblings(
     )
     try:
         prior_run = RunId("prior-repoint-run")
+        current_run = RunId("current-deployment-run")
         sibling_run = RunId("unrelated-sibling-run")
         prior_supervisor.register(prior_run, os.getpgid(prior_process.pid))
+        current_supervisor.register(
+            current_run, os.getpgid(current_process.pid)
+        )
         sibling_supervisor.register(
             sibling_run, os.getpgid(sibling_process.pid)
         )
 
-        assert _recover_supervised_processes(
-            current, "fix", shared
-        ) == (prior_run,)
+        assert _recover_pre_adapter_processes(
+            RecoveryTrigger.WAKE, current, "fix", shared
+        ) == ()
+        assert prior_process.poll() is None
+        assert current_process.poll() is None
+        assert _recover_pre_adapter_processes(
+            RecoveryTrigger.BOOT, current, "fix", shared
+        ) == (prior_run, current_run)
 
         deadline = time.monotonic() + 3
         while (
-            prior_process.poll() is None
+            (prior_process.poll() is None or current_process.poll() is None)
             and time.monotonic() < deadline
         ):
             time.sleep(0.02)
         assert prior_process.poll() is not None
+        assert current_process.poll() is not None
         assert sibling_process.poll() is None
         assert sibling_supervisor.registrations()[0].run_id == sibling_run
     finally:
         if prior_process.poll() is None:
             prior_process.kill()
             prior_process.wait()
+        if current_process.poll() is None:
+            current_process.kill()
+            current_process.wait()
         if sibling_process.poll() is None:
             sibling_process.kill()
             sibling_process.wait()

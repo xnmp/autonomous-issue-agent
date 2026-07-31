@@ -1,4 +1,4 @@
-"""Filesystem state — the STATE_DIR files + the worktree `.harness/` markers.
+"""ADR 0009 workflow continuity and low-authority worktree claims.
 
 Replaces the scattered `cat`/`echo`/`rm -f "$STATE_DIR/issue-N.…"` in the bash
 with one typed surface. Two state roots:

@@ -1,4 +1,4 @@
-"""One filesystem location rule for the deployment-wide control authority."""
+"""ADR 0008 filesystem scope for the shared control authority."""
 
 from __future__ import annotations
 

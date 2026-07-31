@@ -524,7 +524,10 @@ def test_main_exports_composed_env_into_os_environ_before_building(tmp_path, mon
     # runs (no real GitHub/worktree/adapter construction), but os.environ.
     # update(env) — the line under test — executes for real.
     env_file = tmp_path / "agent.env"
-    env_file.write_text('REPO="o/r"\nCI_IGNORE_CHECKS="Format.*"\nMAX_INFRA_DEATHS="9"\n')
+    env_file.write_text(
+        'REPO="o/r"\nFIX_BOT="fixer"\n'
+        'CI_IGNORE_CHECKS="Format.*"\nMAX_INFRA_DEATHS="9"\n'
+    )
     monkeypatch.setenv("AGENT_ENV", str(env_file))
     monkeypatch.delenv("CI_IGNORE_CHECKS", raising=False)
     monkeypatch.delenv("MAX_INFRA_DEATHS", raising=False)
@@ -540,6 +543,11 @@ def test_main_exports_composed_env_into_os_environ_before_building(tmp_path, mon
         raise stop
 
     monkeypatch.setattr(main_module, "build_role", _boom)
+    monkeypatch.setattr(
+        main_module,
+        "_recover_pre_adapter_processes",
+        lambda *_args: (),
+    )
 
     with pytest.raises(RuntimeError):
         main_module.main(["fix"])
