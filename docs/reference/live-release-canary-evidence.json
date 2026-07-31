@@ -1,13 +1,14 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-30T21:29:02Z",
+  "generated_at": "2026-07-31T01:53:00Z",
   "repository": "xnmp/autonomous-issue-agent",
   "purpose": "Release evidence for the 2026-07-30 architectural implementation plan",
   "builds": {
     "all_role_boot": "5ba484f9235bc10738023bda9323e57185f81e01",
     "active_shutdown": "f4f82beea72956a21eadc803a9a3672cf91cd834",
     "accounting_canary": "740cb2be0ba4d49a6d82534c274490480e7054f7",
-    "money_precision_correction": "40f66dac71e9bc7a2a9c7649cb14dba7b13a5d1a"
+    "money_precision_correction": "40f66dac71e9bc7a2a9c7649cb14dba7b13a5d1a",
+    "final_audit_remediation": "9786b5f65a516930e3758ab9ed360d657ba141cb"
   },
   "all_role_boot": {
     "roles": {
@@ -479,5 +480,73 @@
       "pending_outbox": 0
     },
     "operator_warning": "The repository rejected automatic enablement of allow_auto_merge; the canary continued with the documented manual repository-setting warning."
+  },
+  "final_audit_remediation_follow_up": {
+    "observed_at": "2026-07-31T01:53:00Z",
+    "commit": "9786b5f65a516930e3758ab9ed360d657ba141cb",
+    "code_tree": "681f9428bcf9966b5dc44eea5f56480e3d58cf2c",
+    "closed_findings": [
+      "Pull-request publication records exactly one permanent receipt after captured local or remote revision drift; the command cannot remain stranded in executing.",
+      "Commit-time red-test authorization consumes a typed trusted-execution receipt; timeout, cancellation, and infrastructure failure cannot masquerade as a failing test.",
+      "CloseIssue applies its comment before the close, verifies closed state, exact reason, and exact comment, and can finish a partially applied close after restart without reclosing it."
+    ],
+    "targeted_regressions": {
+      "command": "uv run pytest -q tests/domain/test_gate.py tests/adapters/test_governor_adapter.py tests/adapters/test_worktree.py tests/adapters/test_agent_publish.py tests/adapters/test_effects.py tests/adapters/test_github.py",
+      "result": "passed"
+    },
+    "full_suite": {
+      "command": "make test",
+      "result": "passed",
+      "shell_hooks": 90,
+      "point_at": 7,
+      "domain_pytest": 657,
+      "adapter_pytest": 776,
+      "application_pytest": 1316,
+      "gate_parity": 48,
+      "import_contracts": 4,
+      "pyrefly_errors": 0
+    },
+    "live_roles": {
+      "command": "ISSUE_AGENT_MAX_TICKS=0 GATE_PROBE=0 bash bin/point-at.sh self",
+      "exit_code": 0,
+      "doctor_errors": 0,
+      "doctor_warnings": 3,
+      "roles": {
+        "fix": {
+          "pid": 3802110,
+          "heartbeat_state": "stopped",
+          "in_flight": []
+        },
+        "review": {
+          "pid": 3802111,
+          "heartbeat_state": "stopped",
+          "in_flight": []
+        },
+        "steward": {
+          "pid": 3802112,
+          "heartbeat_state": "stopped",
+          "in_flight": []
+        }
+      }
+    },
+    "control_store": {
+      "database_mode": "0600",
+      "authority_witness_mode": "0600",
+      "integrity": "ok",
+      "schema_migrations": [
+        9,
+        10,
+        11,
+        12,
+        13
+      ],
+      "nonterminal_runs": 0,
+      "active_reservations": 0,
+      "leases": 0,
+      "dispatch_claims": 0,
+      "pending_commands": 0,
+      "pending_outbox": 0
+    },
+    "operator_warning": "The repository rejected automatic enablement of allow_auto_merge; the bounded canary continued with the documented manual repository-setting warning."
   }
 }
