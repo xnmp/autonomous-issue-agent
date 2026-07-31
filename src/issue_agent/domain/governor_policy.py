@@ -470,8 +470,27 @@ def resolve(command: str) -> Resolution:
                 len(inner) >= 2
                 and inner[1] == "api"
                 and not any(
-                    word in {"-X", "--method", "-f", "--raw-field", "-F", "--field"}
-                    or word.startswith(("-X", "--method="))
+                    word
+                    in {
+                        "-X",
+                        "--method",
+                        "-f",
+                        "--raw-field",
+                        "-F",
+                        "--field",
+                        "--input",
+                    }
+                    or word.startswith(
+                        (
+                            "-X",
+                            "-f",
+                            "-F",
+                            "--method=",
+                            "--raw-field=",
+                            "--field=",
+                            "--input=",
+                        )
+                    )
                     for word in inner[2:]
                 )
             )

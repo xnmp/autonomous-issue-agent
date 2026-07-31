@@ -2175,6 +2175,42 @@ class SQLiteControlStore:
                 changed += 1
         return changed
 
+    def retire_projection_feed(
+        self,
+        *,
+        deployment: str,
+        repository: str,
+        role: str,
+    ) -> int:
+        """Remove a stopped role's membership and commit its fold tombstone."""
+
+        repository = canonical_repository(repository)
+        destination = f"{deployment}:{repository}:{role}"
+        if not deployment or not role:
+            raise ValueError("projection feed retirement identity is incomplete")
+        if (
+            self._event_factory is None
+            or self._event_destination != destination
+        ):
+            raise ValueError(
+                "retiring projection feed must be bound to its event destination"
+            )
+        with self.transaction() as db:
+            removed = db.execute(
+                "DELETE FROM world_observations WHERE deployment=?",
+                (deployment,),
+            ).rowcount
+            self._event(
+                db,
+                WorldFeedRetired(
+                    deployment,
+                    repository,
+                    role,
+                    restartable=True,
+                ),
+            )
+            return removed
+
     def snapshot(self, scope: BudgetScope) -> AccountingSnapshot:
         try:
             with self._connect() as db:

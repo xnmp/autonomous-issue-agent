@@ -66,6 +66,16 @@ def test_ungoverned_command_allowed():
     assert evaluate_command("ls -la && cat README.md", ctx()).allowed
 
 
+def test_gh_api_input_mutation_is_blocked():
+    verdict = evaluate_command(
+        "gh api repos/o/r/issues/1 --input payload.json",
+        ctx(),
+    )
+
+    assert not verdict.allowed
+    assert "allowlist" in verdict.reason
+
+
 def test_durable_publication_mode_routes_remote_writes_through_broker():
     push = evaluate_command(
         "git push origin HEAD:issue-42",

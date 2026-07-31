@@ -311,6 +311,7 @@ class WorldFeedRetired(EventPayload):
     deployment: str
     repository: str
     role: str
+    restartable: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(

@@ -362,6 +362,14 @@ class WorldObservationStore(Protocol):
         ],
     ) -> int: ...
 
+    def retire_projection_feed(
+        self,
+        *,
+        deployment: str,
+        repository: str,
+        role: str,
+    ) -> int: ...
+
 
 @runtime_checkable
 class BranchState(Protocol):

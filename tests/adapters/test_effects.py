@@ -230,6 +230,34 @@ def test_partial_close_recovery_restores_missing_comment_without_reclosing(
     assert (state, attempts, status) == ("succeeded", 2, "succeeded")
 
 
+def test_partial_close_recovery_finishes_close_after_comment_ack_is_lost(
+    tmp_path,
+) -> None:
+    executor, gateway, store = _executor(tmp_path)
+    action = CloseIssue(4, "completed", "done")
+    original = gateway.comment
+
+    def committed_then_lost(*args):
+        original(*args)
+        gateway.issue_revision = "issue-rev-after-comment"
+        raise RuntimeError("comment reply lost")
+
+    gateway.comment = committed_then_lost
+    with pytest.raises(RuntimeError, match="comment reply lost"):
+        executor.execute(action)
+    gateway.comment = original
+
+    assert executor.execute(action)
+
+    assert gateway.calls == [
+        ("comment", "issue", 4, "done"),
+        ("close", 4, "completed", ""),
+    ]
+    assert gateway.issue_closure(4) == (True, "completed")
+    assert gateway.has_comment("issue", 4, "done")
+    assert store.pending_commands() == ()
+
+
 def test_close_issue_reconciliation_requires_reason_and_comment(
     tmp_path,
 ) -> None:

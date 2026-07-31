@@ -305,6 +305,45 @@ def test_world_fold_retires_every_subject_from_an_adopted_feed(tmp_path) -> None
     assert model.observed_by_feed == {}
 
 
+def test_restartable_feed_retirement_clears_rotation_snapshot_cache(
+    tmp_path,
+) -> None:
+    path = tmp_path / "events.jsonl"
+    log = EventLog(str(path), _producer())
+    log.emit(
+        WorldObserved(
+            "issue",
+            7,
+            "present",
+            {"present": True, "state": "OPEN"},
+        )
+    )
+    log.emit(
+        WorldFeedRetired(
+            "test",
+            "owner/repo",
+            "fix",
+            restartable=True,
+        )
+    )
+
+    restarted = EventLog(str(path), _producer(), max_bytes=1)
+    restarted.emit(TelemetryWarning("rotation", "force"))
+
+    current = (
+        tuple(
+            decode_event_line(line)
+            for line in path.read_text().splitlines()
+        )
+        if path.exists()
+        else ()
+    )
+    assert not any(
+        isinstance(event.payload, WorldObserved)
+        for event in current
+    )
+
+
 def test_oversized_event_is_rejected_before_write(tmp_path) -> None:
     path = tmp_path / "events.jsonl"
     log = EventLog(str(path), _producer(), line_limit=100)
@@ -372,6 +411,7 @@ _SAMPLE = {
     "deployment": "deployment",
     "repository": "owner/repo",
     "role": "fix",
+    "restartable": False,
     "trigger": "budget",
     "bytes_written": 1,
     "predicted_paths": ("a.py",),

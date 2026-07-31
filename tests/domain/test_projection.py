@@ -10,6 +10,8 @@ from issue_agent.domain.events import (
     Producer,
     ProjectionSnapshot,
     SpendRecorded,
+    WorldFeedRetired,
+    WorldObserved,
 )
 from issue_agent.domain.projection import fold
 
@@ -104,4 +106,69 @@ def test_projection_snapshot_replaces_only_its_own_feed_levels() -> None:
     assert set(fold([fix_open, review_open, review_snapshot]).levels) == {
         "fix:issue:1",
         "review:pr:2",
+    }
+
+
+def test_cleanly_stopped_feed_cannot_keep_newer_tombstone_present() -> None:
+    present = _event(
+        WorldObserved(
+            "issue",
+            7,
+            "present",
+            {"present": True, "state": "OPEN"},
+        ),
+        "present",
+        1,
+    )
+    retired = _event(
+        WorldFeedRetired("test", "o/r", "fix", restartable=True),
+        "retired",
+        2,
+    )
+    tombstone = _event(
+        WorldObserved(
+            "issue",
+            7,
+            "absent",
+            {"present": False, "reason": "absent_from_feed"},
+        ),
+        "absent",
+        3,
+        role="steward",
+    )
+
+    model = fold((present, retired, tombstone))
+
+    assert model.world_facts[("issue", 7)] == {"present": False}
+    assert all(key[2] != "fix" for key in model.observed_by_feed)
+
+
+def test_restarted_feed_reactivates_stable_deployment_identity() -> None:
+    present = _event(
+        WorldObserved("issue", 7, "old", {"present": True}),
+        "old",
+        1,
+    )
+    retired = _event(
+        WorldFeedRetired("test", "o/r", "fix", restartable=True),
+        "retired",
+        2,
+    )
+    restarted = _event(
+        WorldObserved(
+            "issue",
+            8,
+            "new",
+            {"present": True, "state": "OPEN"},
+        ),
+        "new",
+        3,
+    )
+
+    model = fold((present, retired, restarted))
+
+    assert ("issue", 7) not in model.world_facts
+    assert model.world_facts[("issue", 8)] == {
+        "present": True,
+        "state": "OPEN",
     }

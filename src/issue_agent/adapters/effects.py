@@ -271,7 +271,7 @@ class GitHubEffectExecutor:
         repairing_partial_close = (
             pending.state != "pending"
             and isinstance(action, CloseIssue)
-            and self._close_state_matches(action)
+            and self._close_effect_partially_applied(action)
         )
         if pending.state in {
             "executing",
@@ -702,6 +702,17 @@ class GitHubEffectExecutor:
             return False
         closed, reason = self.gateway.issue_closure(action.number)
         return closed and reason.lower() == action.reason.lower()
+
+    def _close_effect_partially_applied(self, action: CloseIssue) -> bool:
+        if self._close_state_matches(action):
+            return True
+        return (
+            bool(action.comment)
+            and isinstance(self.gateway, CommentVerifier)
+            and self.gateway.has_comment(
+                "issue", action.number, action.comment
+            )
+        )
 
     def reconcile(self, action: Action) -> bool | None:
         return self._reconcile(action)

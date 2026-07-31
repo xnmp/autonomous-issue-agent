@@ -1586,6 +1586,71 @@ def test_projection_feed_adoption_flushes_old_outbox_and_retires_membership(
         ] == ["current-deployment"]
 
 
+def test_clean_shutdown_retires_world_membership_until_role_restarts(
+    tmp_path,
+):
+    store = _store(tmp_path)
+    producer = Producer("deployment", "o/r", "fix", 123, "boot")
+    published = []
+    sequence = 0
+
+    def factory(payload, correlation):
+        nonlocal sequence
+        event = EventEnvelope(
+            payload,
+            new_event_id(NOW + timedelta(milliseconds=sequence)),
+            sequence,
+            NOW + timedelta(milliseconds=sequence),
+            NOW + timedelta(milliseconds=sequence),
+            sequence,
+            producer,
+            correlation,
+        )
+        sequence += 1
+        return event
+
+    store.bind_event_outbox(
+        factory,
+        published.append,
+        destination=producer.feed_identity,
+    )
+    facts = {"present": True, "state": "OPEN"}
+    content_hash = hashlib.sha256(
+        json.dumps(facts, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    observations = {
+        7: (content_hash, facts, Correlation(issue=7)),
+    }
+    assert store.record_world_snapshot(
+        deployment="deployment",
+        subject_kind="issue",
+        observations=observations,
+    ) == 1
+
+    assert store.retire_projection_feed(
+        deployment="deployment",
+        repository="o/r",
+        role="fix",
+    ) == 1
+
+    retirement = published[-1].payload
+    assert isinstance(retirement, WorldFeedRetired)
+    assert retirement.restartable is True
+    assert ("issue", 7) not in fold(published).world_facts
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM world_observations "
+            "WHERE deployment='deployment'"
+        ).fetchone()[0] == 0
+
+    assert store.record_world_snapshot(
+        deployment="deployment",
+        subject_kind="issue",
+        observations=observations,
+    ) == 1
+    assert fold(published).world_facts[("issue", 7)] == facts
+
+
 def test_world_observation_dedup_is_latest_state_and_outbox_atomic(tmp_path):
     store = _store(tmp_path)
     producer = Producer("deployment", "o/r", "fix", 123, "boot")

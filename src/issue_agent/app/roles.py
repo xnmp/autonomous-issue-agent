@@ -438,6 +438,7 @@ def _shutdown_finalize(
     effects: CommandRecovery,
     *,
     owner_id: str,
+    retire_projection_feed: Callable[[], object],
 ) -> Callable[[], object]:
     """Persist remaining ownership and flush effects before forced teardown."""
 
@@ -446,6 +447,7 @@ def _shutdown_finalize(
             owner_id, "shutdown_deadline_spend_unknown"
         )
         drained = effects.drain_pending_commands()
+        retire_projection_feed()
         control.flush_bound_outbox()
         return drained
 
@@ -1951,6 +1953,11 @@ def build_fix_daemon(
             control,
             effect_executor,
             owner_id=owner_id,
+            retire_projection_feed=lambda: control.retire_projection_feed(
+                deployment=_deployment_identity(cfg, "fix"),
+                repository=cfg.repo,
+                role="fix",
+            ),
         ),
         terminalize=_shutdown_terminalize(
             control,
@@ -2186,6 +2193,13 @@ def build_review_daemon(
                       control,
                       effect_executor,
                       owner_id=owner_id,
+                      retire_projection_feed=lambda: (
+                          control.retire_projection_feed(
+                              deployment=_deployment_identity(cfg, "review"),
+                              repository=cfg.repo,
+                              role="review",
+                          )
+                      ),
                   ),
                   terminalize=_shutdown_terminalize(
                       control,
@@ -2463,6 +2477,13 @@ def build_steward_daemon(
                       control,
                       effect_executor,
                       owner_id=owner_id,
+                      retire_projection_feed=lambda: (
+                          control.retire_projection_feed(
+                              deployment=_deployment_identity(cfg, "steward"),
+                              repository=cfg.repo,
+                              role="steward",
+                          )
+                      ),
                   ),
                   terminalize=_shutdown_terminalize(
                       control,

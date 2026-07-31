@@ -18,6 +18,7 @@ from ..domain.events import (
     MAX_EVENT_LINE_BYTES,
     Producer,
     ProjectionSnapshot,
+    WorldFeedRetired,
     WorldObserved,
     encode_event_line,
     new_event_id,
@@ -178,6 +179,22 @@ class EventLog:
 
     def _remember_level(self, event: EventEnvelope) -> None:
         payload = event.payload
+        if (
+            isinstance(payload, WorldFeedRetired)
+            and (
+                payload.deployment,
+                payload.repository,
+                payload.role,
+            )
+            == (
+                event.producer.deployment,
+                event.producer.repository,
+                event.producer.role,
+            )
+        ):
+            self._open_levels.clear()
+            self._latest_observations.clear()
+            return
         if isinstance(payload, ProjectionSnapshot):
             self._open_levels = dict(payload.open_levels)
             return

@@ -429,6 +429,41 @@ def test_governor_protects_every_broker_authority_field():
     assert set(_AUTHORITY_ENV_KEYS) | {_AUTHORITY_BUNDLE} <= protected
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        "--input payload.json",
+        "--input=payload.json",
+        "-f state=closed",
+        "-fstate=closed",
+        "-F state=closed",
+        "-Fstate=closed",
+        "--field state=closed",
+        "--field=state=closed",
+        "--raw-field state=closed",
+        "--raw-field=state=closed",
+        "-X POST",
+        "-XPOST",
+        "--method POST",
+        "--method=POST",
+    ),
+)
+def test_gh_api_body_and_method_options_are_unresolvable(arguments):
+    resolution = gov.resolve(
+        f"gh api repos/o/r/issues/1 {arguments}"
+    )
+
+    assert isinstance(resolution, gov.Unresolvable)
+    assert "allowlist" in resolution.reason
+
+
+def test_literal_gh_api_get_remains_allowed():
+    assert isinstance(
+        gov.resolve("gh api repos/o/r/issues/1"),
+        gov.Ungoverned,
+    )
+
+
 def test_python_c_is_unresolvable_and_blocked():
     assert gov.find_violations(
         "python -c \"import os; os.system('git commit --no-verify -m x')\""

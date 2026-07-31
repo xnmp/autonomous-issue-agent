@@ -108,7 +108,11 @@ def fold(events: Iterable[EventEnvelope]) -> ReadModel:
                 payload.repository,
                 payload.role,
             )
-            retired_feeds.add(retired_feed)
+            # Alias adoption permanently fences the old deployment. A clean
+            # stop only ends the current incarnation; the stable identity may
+            # legitimately publish again after restart.
+            if not payload.restartable:
+                retired_feeds.add(retired_feed)
             levels = {
                 state_key: level
                 for state_key, level in levels.items()

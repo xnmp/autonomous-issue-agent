@@ -174,9 +174,10 @@ def test_hard_shutdown_reconciles_killed_rollout_before_releasing_capacity(
         control,
         Effects(),
         owner_id="o/r:fix",
+        retire_projection_feed=lambda: order.append("retire-feed"),
     )()
 
-    assert order == ["effects"]
+    assert order == ["effects", "retire-feed"]
     assert control.active_reservation_runs("o/r:fix") == (run_id,)
 
     class Spend:
