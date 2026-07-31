@@ -7,6 +7,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$ROOT/bin/lib/gate-probe.sh"
 # shellcheck source=bin/lib/logging.sh
 . "$ROOT/bin/lib/logging.sh"
+# shellcheck source=bin/lib/harness-cli.sh
+. "$ROOT/bin/lib/harness-cli.sh"
 PASS=0
 FAIL=0
 
@@ -21,6 +23,40 @@ no() {
   [ -n "${2:-}" ] && printf '       %s\n' "$2"
 }
 
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT
+harness_project="$scratch/harness project"
+target_project="$scratch/target project"
+fake_bin="$scratch/bin"
+mkdir -p "$harness_project" "$target_project" "$fake_bin"
+cat >"$fake_bin/uv" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$PWD" >"$HARNESS_CLI_TEST_PWD"
+printf '%s\n' "$*" >"$HARNESS_CLI_TEST_ARGS"
+EOF
+chmod +x "$fake_bin/uv"
+HARNESS_ROOT="$harness_project"
+HARNESS_CLI_TEST_PWD="$scratch/cli-pwd"
+HARNESS_CLI_TEST_ARGS="$scratch/cli-args"
+export HARNESS_ROOT HARNESS_CLI_TEST_PWD HARNESS_CLI_TEST_ARGS
+if (cd "$target_project" && PATH="$fake_bin:$PATH" \
+    run_harness_issue_agent prepare-remote --repo o/r); then
+  cli_pwd="$(cat "$HARNESS_CLI_TEST_PWD")"
+  cli_args="$(cat "$HARNESS_CLI_TEST_ARGS")"
+else
+  cli_pwd=""
+  cli_args=""
+fi
+if [ "$cli_pwd" = "$harness_project" ] \
+  && [ "$cli_args" = "run --quiet issue-agent prepare-remote --repo o/r" ]; then
+  ok "nested CLI commands resolve from the harness project"
+else
+  no "nested CLI commands resolve from the harness project" \
+    "pwd=${cli_pwd:-<missing>} args=${cli_args:-<missing>}"
+fi
+HARNESS_ROOT="$ROOT"
+export HARNESS_ROOT
+
 timestamped="$(printf 'one\ntwo\n' | timestamp_lines)"
 timestamp_line_one="${timestamped%%$'\n'*}"
 timestamp_line_two="${timestamped#*$'\n'}"
@@ -31,8 +67,6 @@ else
   no "role log lines receive UTC ISO timestamps" "$timestamped"
 fi
 
-scratch="$(mktemp -d)"
-trap 'rm -rf "$scratch"' EXIT
 target="$scratch/target with spaces"
 mkdir -p "$target/node_modules"
 touch "$target/node_modules/checkout-local-dependency"

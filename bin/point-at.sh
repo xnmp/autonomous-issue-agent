@@ -37,6 +37,8 @@ HARNESS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$HARNESS_ROOT/bin/lib/gate-probe.sh"
 # shellcheck source=bin/lib/logging.sh
 . "$HARNESS_ROOT/bin/lib/logging.sh"
+# shellcheck source=bin/lib/harness-cli.sh
+. "$HARNESS_ROOT/bin/lib/harness-cli.sh"
 NAME="${1:?usage: bin/point-at.sh <name>  (reads config/repos/<name>.env)}"
 SHARED="$HARNESS_ROOT/config/shared.env"
 REPO_ENV="$HARNESS_ROOT/config/repos/$NAME.env"
@@ -135,7 +137,7 @@ if [ -n "${TARGET_DIR:-}" ] && git -C "$TARGET_DIR" rev-parse --is-inside-work-t
       info "  creating '$BASE_BRANCH' off origin/$default$warn_default (CREATE_BASE_BRANCH=1)"
       git -C "$TARGET_DIR" fetch origin "$default" --quiet \
         && git -C "$TARGET_DIR" branch "$BASE_BRANCH" "origin/$default" 2>/dev/null \
-        && uv run --quiet issue-agent publish-base-branch \
+        && run_harness_issue_agent publish-base-branch \
              --repo "$REPO" --name "$NAME" --target-dir "$TARGET_DIR" \
              --branch "$BASE_BRANCH" \
         && grn "  ✓ created and pushed '$BASE_BRANCH'" \
@@ -244,7 +246,7 @@ fi
 # harness never creates them.
 
 info "ensuring GitHub lifecycle labels on $REPO"
-if ! uv run --quiet issue-agent prepare-remote --repo "$REPO" --name "$NAME"; then
+if ! run_harness_issue_agent prepare-remote --repo "$REPO" --name "$NAME"; then
   red "  ✗ lifecycle label preparation failed; refusing to start without the remote command receipts"
   exit 1
 fi
@@ -257,7 +259,7 @@ grn "  ✓ labels ensured"
 # needs admin on the repo — a non-admin failure is a warning, not fatal.
 if [ "${ENSURE_AUTO_MERGE:-1}" != "0" ]; then
   info "ensuring GitHub auto-merge is enabled on $REPO"
-  if uv run --quiet issue-agent prepare-remote --repo "$REPO" --name "$NAME" \
+  if run_harness_issue_agent prepare-remote --repo "$REPO" --name "$NAME" \
       --skip-labels --ensure-auto-merge; then
     grn "  ✓ allow_auto_merge=true"
   else
