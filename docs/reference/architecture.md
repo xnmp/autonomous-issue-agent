@@ -54,9 +54,14 @@ tests pass.
 2. **One privileged write funnel.** Harness lifecycle mutations become durable
    `LifecycleCommand`s and are executed by `GitHubEffectExecutor` or
    `GitHubOperatorEffects` with an idempotency key, expected revision, and
-   receipt. This includes CLI/dashboard labels, bootstrap settings, base-branch
-   creation, and webhook relay lifecycle. Paid agents publish branches and open
-   PRs through `issue-agent-publish`; `AgentPublicationBroker` commits
+   receipt. `DurableEffectRunner` alone owns the command transition/receipt
+   protocol. Deployment-scoped effects hold shared `DeploymentAuthority`; a
+   repoint takes the same repo/role lock exclusively, so an old mutation either
+   completes before retirement or fails its owner check after it. Peer effects
+   remain concurrent and no SQLite transaction spans network I/O. This includes
+   CLI/dashboard labels, bootstrap settings, base-branch creation, Jira sync,
+   and webhook relay lifecycle. Paid agents publish branches and open PRs
+   through `issue-agent-publish`; `AgentPublicationBroker` commits
    intent before the network call and reconciles remote state before retrying an
    ambiguous outcome. Credential isolation remains separately trigger-gated,
    so this is durability—not an untrusted-input security claim.
@@ -159,6 +164,11 @@ first retries exact provider reconciliation for the reservation grace window,
 then atomically releases only a lease-free `completed/spend_unreconciled`
 reservation and records `spend_unmeasured_released`. Migrated ambiguous rows,
 dead leases, and running work cannot enter this path.
+The coordinator feeds lease, reconciliation, and compare-and-set results into
+the pure `domain/reservation_recovery.py` state machine. That model owns action
+ordering and terminal reporting; SQLite remains responsible for atomically
+proving that a requested release is still eligible. New runtimes or evidence
+sources therefore extend one decision table rather than adding recovery loops.
 Every migration is digest-validated and individually transactional; restart
 and concurrent-role tests interrupt both sides of every migration commit
 boundary and serialize fresh/v8/v9 boot. Machine-readable
@@ -233,7 +243,9 @@ bounded retention and restart do not resurrect a cleared level, discard an
 active one, or make an unchanged issue disappear. A stable per-path
 interprocess lock covers append, replacement, authoritative on-disk reseeding,
 and pruning; multiple daemon/publisher writers cannot rotate stale in-memory
-state over one another.
+state over one another. `EventLogSegments` is the sole segment locator and
+accepts only the writer's timestamp-plus-UUID suffix, so backup or unrelated
+siblings are never projected or deleted.
 
 Every paid run is bounded by layered breakers, because the failure mode
 that matters is not "wrong answer" but "loop that bills forever":
@@ -378,6 +390,7 @@ module requires placing it in the appropriate tier and explaining it here.
 `domain/labels.py`, `domain/leg.py`, `domain/lifecycle.py`,
 `domain/outcome.py`, `domain/ports.py`, `domain/pricing.py`,
 `domain/projection.py`, `domain/refs.py`, `domain/repository.py`,
+`domain/reservation_recovery.py`,
 `domain/review.py`,
 `domain/supervision.py`, `domain/triage.py`, `domain/trust.py`, and
 `domain/world.py`.
@@ -388,6 +401,7 @@ module requires placing it in the appropriate tier and explaining it here.
 `adapters/child_env.py`, `adapters/claude_profile.py`,
 `adapters/codex_hook.py`, `adapters/codex_runner.py`,
 `adapters/control_path.py`, `adapters/control_store.py`,
+`adapters/deployment_authority.py`, `adapters/durable_effects.py`,
 `adapters/effects.py`,
 `adapters/env_file.py`, `adapters/event_log.py`, `adapters/github.py`,
 `adapters/governor.py`, `adapters/handover.py`,

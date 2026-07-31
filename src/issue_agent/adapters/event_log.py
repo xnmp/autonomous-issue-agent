@@ -43,22 +43,44 @@ class EventReadResult:
     source_files: int = 0
 
 
+@dataclass(frozen=True)
+class EventLogSegments:
+    """The canonical feed and only rotations the writer is allowed to own."""
+
+    current: Path
+
+    @property
+    def rotations(self) -> tuple[Path, ...]:
+        if not self.current.parent.exists():
+            return ()
+        prefix = f"{self.current.name}."
+        retained: list[Path] = []
+        for candidate in sorted(
+            self.current.parent.glob(f"{self.current.name}.*")
+        ):
+            if not _ROTATION_SUFFIX.fullmatch(
+                candidate.name.removeprefix(prefix)
+            ):
+                continue
+            try:
+                metadata = candidate.lstat()
+            except OSError:
+                continue
+            if stat.S_ISREG(metadata.st_mode):
+                retained.append(candidate)
+        return tuple(retained)
+
+    @property
+    def paths(self) -> tuple[Path, ...]:
+        current = (self.current,) if self.current.exists() else ()
+        return (*self.rotations, *current)
+
+
 def read_event_log(path: str) -> EventReadResult:
     """Read the current feed and writer-generated rotations, skipping bad lines."""
 
     current = Path(path)
-    rotations = (
-        tuple(
-            candidate
-            for candidate in sorted(current.parent.glob(f"{current.name}.*"))
-            if _ROTATION_SUFFIX.fullmatch(
-                candidate.name.removeprefix(f"{current.name}.")
-            )
-        )
-        if current.parent.exists()
-        else ()
-    )
-    candidates = (*rotations, *((current,) if current.exists() else ()))
+    candidates = EventLogSegments(current).paths
     events: list[EventEnvelope] = []
     malformed = 0
     for candidate in candidates:
@@ -380,9 +402,7 @@ class EventLog:
             self._latest_observations.clear()
             self._feed_retirements.clear()
         current = Path(self.path)
-        rotated = sorted(current.parent.glob(f"{current.name}.*"))
-        paths = [*rotated, *([current] if current.exists() else [])]
-        for path in paths:
+        for path in EventLogSegments(current).paths:
             try:
                 with path.open(encoding="utf-8") as stream:
                     for line in stream:
@@ -398,8 +418,7 @@ class EventLog:
                 continue
 
     def _prune_rotated_files(self) -> None:
-        current = Path(self.path)
-        rotated = sorted(current.parent.glob(f"{current.name}.*"))
+        rotated = EventLogSegments(Path(self.path)).rotations
         for expired in rotated[:-self.max_rotated_files]:
             try:
                 expired.unlink()
@@ -407,6 +426,4 @@ class EventLog:
                 continue
 
     def paths(self) -> tuple[Path, ...]:
-        current = Path(self.path)
-        rotated = sorted(current.parent.glob(f"{current.name}.*"))
-        return tuple([*rotated, *([current] if current.exists() else [])])
+        return EventLogSegments(Path(self.path)).paths

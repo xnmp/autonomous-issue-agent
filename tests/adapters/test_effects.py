@@ -3,7 +3,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from issue_agent.adapters.control_store import SQLiteControlStore
+from issue_agent.adapters.control_store import (
+    RetiredOwnerError,
+    SQLiteControlStore,
+)
 from issue_agent.adapters.effects import GitHubEffectExecutor, command_for_action
 from issue_agent.domain.actions import (
     AddDependency,
@@ -150,6 +153,41 @@ def test_remote_effect_is_committed_before_execution_and_deduplicated(tmp_path) 
         ("relabel", "issue", 4, "ai-ready", "ai-working")
     ]
     assert store.pending_commands() == ()
+
+
+def test_owner_retirement_before_apply_fences_github_mutation(tmp_path) -> None:
+    executor, gateway, store = _executor(tmp_path)
+    successor = SQLiteControlStore(store.path)
+    successor.initialize()
+    old_owner = "o/r:fix"
+    new_owner = "o/r:fix:deployment-2"
+    original = gateway.has_label
+    retired = False
+
+    def retire_before_apply(kind, number, label):
+        nonlocal retired
+        if not retired:
+            successor.adopt_legacy_owner(
+                "o/r",
+                "fix",
+                new_owner,
+                prior_owner_ids=(old_owner,),
+            )
+            retired = True
+        return original(kind, number, label)
+
+    gateway.has_label = retire_before_apply
+
+    with pytest.raises(RetiredOwnerError, match="deployment-2"):
+        executor.execute(
+            Relabel(Target.ISSUE, 4, Label.AI_READY, Label.AI_WORKING)
+        )
+
+    assert gateway.calls == []
+    assert successor.pending_commands(
+        repository="o/r",
+        executor_identity=new_owner,
+    )
 
 
 def test_reversed_effect_gets_a_new_durable_occurrence(tmp_path) -> None:

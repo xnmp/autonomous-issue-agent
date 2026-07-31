@@ -1,6 +1,8 @@
 import base64
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -218,47 +220,65 @@ def test_owner_retirement_after_enqueue_fences_publication(tmp_path):
     )
 
 
-def test_owner_retirement_after_begin_fences_remote_mutation(tmp_path):
+def test_owner_retirement_waits_for_inflight_remote_mutation(tmp_path):
     remote = Remote()
     control = store(tmp_path)
     successor = SQLiteControlStore(control.path)
     successor.initialize()
     old_owner = "o/r:fix:deployment-1"
     new_owner = "o/r:fix:deployment-2"
-    retired = False
+    mutation_started = Event()
+    finish_mutation = Event()
+    retirement_started = Event()
+    retirement_completed = Event()
 
-    def retire_before_push(argv, cwd):
-        nonlocal retired
-        if argv[:3] == ("gh", "pr", "list") and not retired:
-            successor.adopt_legacy_owner(
-                "o/r",
-                "fix",
-                new_owner,
-                prior_owner_ids=(old_owner,),
-            )
-            retired = True
+    def block_during_push(argv, cwd):
+        if argv[:2] == ("git", "push"):
+            mutation_started.set()
+            assert finish_mutation.wait(timeout=1)
         return remote.run(argv, cwd)
+
+    def retire_owner() -> tuple[int, int]:
+        retirement_started.set()
+        result = successor.adopt_legacy_owner(
+            "o/r",
+            "fix",
+            new_owner,
+            prior_owner_ids=(old_owner,),
+        )
+        retirement_completed.set()
+        return result
 
     publisher = AgentPublicationBroker(
         control,
         repository="o/r",
         base_branch="dev",
         owner=old_owner,
-        run=retire_before_push,
+        run=block_during_push,
     )
 
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        publication = pool.submit(
+            publisher.publish,
+            ("git", "push", "origin", "HEAD:fix/42-issue"),
+            str(tmp_path),
+        )
+        assert mutation_started.wait(timeout=1)
+        retirement = pool.submit(retire_owner)
+        assert retirement_started.wait(timeout=1)
+        assert not retirement_completed.wait(timeout=0.1)
+        finish_mutation.set()
+
+        assert publication.result(timeout=1).code == 0
+        assert retirement.result(timeout=1) == (0, 0)
+
+    assert retirement_completed.is_set()
+    assert len(remote.effects) == 1
     with pytest.raises(RetiredOwnerError, match="deployment-2"):
         publisher.publish(
             ("git", "push", "origin", "HEAD:fix/42-issue"),
             str(tmp_path),
         )
-
-    assert remote.effects == []
-    assert remote.remote == ""
-    assert successor.pending_commands(
-        repository="o/r",
-        executor_identity=new_owner,
-    )
 
 
 def test_push_disables_and_verifies_existing_auto_merge_first(tmp_path):
@@ -341,7 +361,7 @@ def test_crash_after_push_is_reconciled_without_duplicate_effect(tmp_path):
             ("git", "push", "origin", "HEAD:fix/42-issue"), str(tmp_path)
         )
     assert len(remote.effects) == 1
-    assert control.pending_commands()[0].state == "executing"
+    assert control.pending_commands()[0].state == "unknown_outcome"
 
     remote.crash_after_push = False
     assert publisher.drain_pending_commands() == 1
@@ -371,7 +391,7 @@ def test_replay_refuses_switched_origin_until_authority_is_restored(tmp_path):
 
     assert publisher.drain_pending_commands() == 0
     assert len(remote.effects) == 1
-    assert control.pending_commands()[0].state == "executing"
+    assert control.pending_commands()[0].state == "unknown_outcome"
 
     remote.origin_url = "git@github.com:o/r.git"
     assert publisher.drain_pending_commands() == 1

@@ -16,7 +16,6 @@ import subprocess
 import sys
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urlparse
@@ -24,12 +23,13 @@ from urllib.parse import urlparse
 from ..domain.contracts import (
     CommandId,
     CommandKind,
-    EffectReceipt,
     EffectStatus,
     LifecycleCommand,
     RunId,
 )
 from .control_store import PendingCommand, SQLiteControlStore
+from .deployment_authority import DeploymentAuthority, deployment_role
+from .durable_effects import DurableEffectRunner, EffectOutcome
 from .event_log import EventLog
 from ..domain.events import Producer
 from ..domain.refs import is_governed_branch, issue_from_branch
@@ -176,6 +176,16 @@ class AgentPublicationBroker:
         ):
             raise ValueError("publication execution authority is incomplete")
         self.store.bind_active_owner(owner)
+        self.effects = DurableEffectRunner(
+            store,
+            DeploymentAuthority(
+                store,
+                self.repository,
+                deployment_role(self.repository, owner),
+                owner,
+            ),
+            executor_identity=identity,
+        )
         self.run = (
             (
                 lambda argv, cwd: _run_command(
@@ -192,7 +202,7 @@ class AgentPublicationBroker:
 
     def publish(self, argv: tuple[str, ...], cwd: str) -> CommandResult:
         command = self._command(argv, cwd)
-        pending = self.store.enqueue_command(command)
+        pending = self.effects.enqueue(command)
         return self._run_pending(pending)
 
     def drain_pending_commands(self) -> int:
@@ -230,11 +240,7 @@ class AgentPublicationBroker:
     def _execute_mutation(
         self, argv: tuple[str, ...], cwd: str
     ) -> CommandResult:
-        # Repoint quiescence closes the check/use interval; this last check
-        # prevents a publisher already between durable transitions from
-        # crossing a completed owner retirement.
-        self.store.assert_owner_active(self.owner)
-        return self._execute(argv, cwd)
+        return self.effects.authorized(lambda: self._execute(argv, cwd))
 
     def _run_pending(self, pending: PendingCommand) -> CommandResult:
         command = pending.command
@@ -254,24 +260,23 @@ class AgentPublicationBroker:
         if pending.state in {"executing", EffectStatus.UNKNOWN_OUTCOME.value}:
             reconciled = self._reconcile(command)
             if reconciled is True:
-                self.store.resolve_unknown_effect(
-                    self._receipt(command, EffectStatus.SUCCEEDED)
+                return self.effects.resolve_unknown(
+                    command,
+                    self._successful_outcome(command),
                 )
-                return CommandResult(0)
             if reconciled is None:
                 return CommandResult(
                     75,
                     stderr="publication outcome remains unknown; refusing retry",
                 )
-            self.store.retry_reconciled_command(command.command_id)
+            self.effects.retry_reconciled(command)
 
         reconciled = self._reconcile(command)
         if reconciled is True:
-            self.store.begin_command(command.command_id)
-            self.store.record_effect(
-                self._receipt(command, EffectStatus.SUCCEEDED)
+            return self.effects.execute(
+                command,
+                lambda: self._successful_outcome(command),
             )
-            return CommandResult(0)
         if reconciled is None:
             return CommandResult(
                 75,
@@ -280,8 +285,14 @@ class AgentPublicationBroker:
                     "refusing publication"
                 ),
             )
-        self.store.begin_command(command.command_id)
-        started = datetime.now(timezone.utc)
+        return self.effects.execute(
+            command,
+            lambda: self._perform_publication(command),
+        )
+
+    def _perform_publication(
+        self, command: LifecycleCommand
+    ) -> EffectOutcome[CommandResult]:
         payload = command.payload
         argv = tuple(str(item) for item in payload["argv"])
         cwd = str(payload["cwd"])
@@ -296,13 +307,11 @@ class AgentPublicationBroker:
                     "current branch",
                 )
             except RuntimeError as exc:
-                self._record_started_failure(
-                    command,
-                    started,
+                return EffectOutcome(
+                    CommandResult(75, stderr=str(exc)),
                     EffectStatus.RETRYABLE_FAILURE,
-                    str(exc),
+                    error=str(exc),
                 )
-                return CommandResult(75, stderr=str(exc))
             if (
                 current_head != command.expected_revision
                 or current_branch != str(payload["branch"])
@@ -311,18 +320,16 @@ class AgentPublicationBroker:
                     "local branch revision changed before pull-request "
                     "creation"
                 )
-                self._record_started_failure(
-                    command,
-                    started,
-                    EffectStatus.PERMANENT_FAILURE,
-                    error,
-                )
-                return CommandResult(
-                    75,
-                    stderr=(
-                        "local branch revision changed; refusing stale "
-                        "pull-request creation"
+                return EffectOutcome(
+                    CommandResult(
+                        75,
+                        stderr=(
+                            "local branch revision changed; refusing stale "
+                            "pull-request creation"
+                        ),
                     ),
+                    EffectStatus.PERMANENT_FAILURE,
+                    error=error,
                 )
             remote_head = self._remote_branch(
                 str(payload["remote_url"]), str(payload["branch"]), cwd
@@ -332,69 +339,57 @@ class AgentPublicationBroker:
                     "cannot verify remote branch revision before pull-request "
                     "creation"
                 )
-                self._record_started_failure(
-                    command,
-                    started,
+                return EffectOutcome(
+                    CommandResult(75, stderr=error),
                     EffectStatus.RETRYABLE_FAILURE,
-                    error,
+                    error=error,
                 )
-                return CommandResult(75, stderr=error)
             if remote_head != command.expected_revision:
                 error = (
                     "remote branch revision changed before pull-request "
                     "creation"
                 )
-                self._record_started_failure(
-                    command,
-                    started,
-                    EffectStatus.PERMANENT_FAILURE,
-                    error,
-                )
-                return CommandResult(
-                    75,
-                    stderr=(
-                        "remote branch revision changed; refusing stale "
-                        "pull-request creation"
+                return EffectOutcome(
+                    CommandResult(
+                        75,
+                        stderr=(
+                            "remote branch revision changed; refusing stale "
+                            "pull-request creation"
+                        ),
                     ),
+                    EffectStatus.PERMANENT_FAILURE,
+                    error=error,
                 )
         authority_error = self._origin_authority_error(command)
         if authority_error:
-            self._record_started_failure(
-                command,
-                started,
+            return EffectOutcome(
+                CommandResult(75, stderr=authority_error),
                 EffectStatus.RETRYABLE_FAILURE,
-                authority_error,
+                error=authority_error,
             )
-            return CommandResult(75, stderr=authority_error)
         if (
             command.kind is CommandKind.PUBLISH_BRANCH
             and not self._disable_auto_merge_before_push(
-                str(payload["branch"]), cwd
+                str(payload["branch"]), cwd, authority_held=True
             )
         ):
-            now = datetime.now(timezone.utc)
-            self.store.record_effect(
-                EffectReceipt(
-                    command.command_id,
-                    self.identity,
-                    started,
-                    now,
-                    EffectStatus.RETRYABLE_FAILURE,
-                    error=(
-                        "could not verify auto-merge was disabled before "
-                        "updating the pull-request branch"
-                    ),
-                )
+            error = (
+                "could not verify auto-merge was disabled before updating "
+                "the pull-request branch"
             )
-            return CommandResult(
-                75,
-                stderr=(
+            return EffectOutcome(
+                CommandResult(
+                    75,
+                    stderr=(
                     "could not verify auto-merge was disabled; refusing "
                     "branch publication"
+                    ),
                 ),
+                EffectStatus.RETRYABLE_FAILURE,
+                error=error,
             )
-        result = self._execute_mutation(argv, cwd)
-        reconciled = self._reconcile(command)
+        result = self._execute(argv, cwd)
+        reconciled = self._reconcile(command, authority_held=True)
         compensated = False
         if (
             command.kind is CommandKind.OPEN_PULL_REQUEST
@@ -402,9 +397,9 @@ class AgentPublicationBroker:
             and result.code == 0
         ):
             compensated = self._close_mismatched_pull_request(
-                command, result
+                command, result, authority_held=True
             )
-            reconciled = self._reconcile(command)
+            reconciled = self._reconcile(command, authority_held=True)
         if reconciled is True:
             status = EffectStatus.SUCCEEDED
             error = None
@@ -429,28 +424,34 @@ class AgentPublicationBroker:
                 result.stderr.strip()[:1000]
                 or f"publication command exited {result.code}; readback unavailable"
             )
-        self.store.record_effect(
-            EffectReceipt(
-                command.command_id,
-                self.identity,
-                started,
-                datetime.now(timezone.utc),
-                status,
-                remote_object_id=self._remote_object(command),
-                remote_revision=(
-                    command.expected_revision
-                    if status is EffectStatus.SUCCEEDED
-                    else None
-                ),
-                error=error,
-            )
-        )
         if status is EffectStatus.SUCCEEDED:
-            return CommandResult(0, result.stdout, result.stderr)
-        return CommandResult(
-            result.code if result.code != 0 else 75,
-            result.stdout,
-            error or result.stderr,
+            value = CommandResult(0, result.stdout, result.stderr)
+        else:
+            value = CommandResult(
+                result.code if result.code != 0 else 75,
+                result.stdout,
+                error or result.stderr,
+            )
+        return EffectOutcome(
+            value,
+            status,
+            remote_object_id=self._remote_object(command),
+            remote_revision=(
+                command.expected_revision
+                if status is EffectStatus.SUCCEEDED
+                else None
+            ),
+            error=error,
+        )
+
+    def _successful_outcome(
+        self, command: LifecycleCommand
+    ) -> EffectOutcome[CommandResult]:
+        return EffectOutcome(
+            CommandResult(0),
+            EffectStatus.SUCCEEDED,
+            remote_object_id=self._remote_object(command),
+            remote_revision=command.expected_revision,
         )
 
     def _command(self, argv: tuple[str, ...], cwd: str) -> LifecycleCommand:
@@ -632,7 +633,12 @@ class AgentPublicationBroker:
             self.owner,
         )
 
-    def _reconcile(self, command: LifecycleCommand) -> bool | None:
+    def _reconcile(
+        self,
+        command: LifecycleCommand,
+        *,
+        authority_held: bool = False,
+    ) -> bool | None:
         if self._origin_authority_error(command):
             return None
         payload = command.payload
@@ -645,7 +651,9 @@ class AgentPublicationBroker:
                 return None
             if current == command.expected_revision:
                 return self._disable_auto_merge_before_push(
-                    str(payload["branch"]), cwd
+                    str(payload["branch"]),
+                    cwd,
+                    authority_held=authority_held,
                 )
             if current == str(payload["prior_remote_revision"]):
                 return False
@@ -769,7 +777,11 @@ class AgentPublicationBroker:
         return str(row.get("url") or row.get("number") or "")
 
     def _disable_auto_merge_before_push(
-        self, branch: str, cwd: str
+        self,
+        branch: str,
+        cwd: str,
+        *,
+        authority_held: bool = False,
     ) -> bool:
         """A write-capable push must not inherit a merge armed for an old SHA."""
 
@@ -785,7 +797,12 @@ class AgentPublicationBroker:
             number = row.get("number")
             if not isinstance(number, int) or number <= 0:
                 return False
-            disabled = self._execute_mutation(
+            execute = (
+                self._execute
+                if authority_held
+                else self._execute_mutation
+            )
+            disabled = execute(
                 (
                     "gh",
                     "pr",
@@ -808,7 +825,11 @@ class AgentPublicationBroker:
         )
 
     def _close_mismatched_pull_request(
-        self, command: LifecycleCommand, result: CommandResult
+        self,
+        command: LifecycleCommand,
+        result: CommandResult,
+        *,
+        authority_held: bool = False,
     ) -> bool:
         branch = str(command.payload["branch"])
         cwd = str(command.payload["cwd"])
@@ -830,7 +851,12 @@ class AgentPublicationBroker:
         ]
         if len(mismatched) != 1:
             return False
-        close = self._execute_mutation(
+        execute = (
+            self._execute
+            if authority_held
+            else self._execute_mutation
+        )
+        close = execute(
             (
                 "gh",
                 "pr",
@@ -871,45 +897,6 @@ class AgentPublicationBroker:
             str(command.expected_revision),
             str(command.payload["cwd"]),
         )
-
-    def _receipt(
-        self, command: LifecycleCommand, status: EffectStatus
-    ) -> EffectReceipt:
-        now = datetime.now(timezone.utc)
-        return EffectReceipt(
-            command.command_id,
-            self.identity,
-            now,
-            now,
-            status,
-            remote_object_id=self._remote_object(command),
-            remote_revision=command.expected_revision,
-            error=None,
-        )
-
-    def _record_started_failure(
-        self,
-        command: LifecycleCommand,
-        started: datetime,
-        status: EffectStatus,
-        error: str,
-    ) -> None:
-        if status not in {
-            EffectStatus.RETRYABLE_FAILURE,
-            EffectStatus.PERMANENT_FAILURE,
-        }:
-            raise ValueError("started publication failures require a terminal verdict")
-        self.store.record_effect(
-            EffectReceipt(
-                command.command_id,
-                self.identity,
-                started,
-                datetime.now(timezone.utc),
-                status,
-                error=error,
-            )
-        )
-
 
 def _lifecycle_command(
     kind: CommandKind,

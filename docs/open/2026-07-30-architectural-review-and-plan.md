@@ -67,10 +67,23 @@ runs, active reservations, leases, actionable commands, and pending outbox
 records.
 A final exact-HEAD audit also exercised retirement between publication
 transitions. Paid-child publication stores are now bound to the deployment
-owner, so every later durable write is fenced, and the broker revalidates that
-owner immediately before each remote push, pull-request creation, auto-merge
-disable, or compensating close. Commands already adopted by a successor remain
-recoverable, while the retired publisher cannot cross the completed repoint.
+owner, so every later durable write is fenced. Owner adoption and all
+privileged publisher/GitHub mutations share repo/role-scoped cross-process
+authority: peer effects hold shared access while owner retirement is exclusive,
+so concurrency is preserved and
+an old effect either finishes before retirement commits or fails its owner
+check after retirement. This closes the check/use interval without holding a
+SQLite transaction across network I/O. Commands already adopted by a successor
+remain recoverable, while the retired publisher cannot cross the completed
+repoint. A single durable-effect runner now owns lifecycle transitions and
+receipts for GitHub actions, paid publication, operator/bootstrap commands, and
+Jira sync; an architecture test rejects new independent transition machines.
+Reservation sweeping likewise feeds observed lease, spend, and atomic-release
+results through one pure domain state machine, keeping policy out of the
+coordinator while SQLite rechecks release eligibility. Event-log readers,
+projection restoration, retention, and path
+enumeration also share the strict writer-generated rotation suffix; unrelated
+siblings are neither projected nor deleted.
 
 This document remains the **record** for the maintainability refactor: it owns
 sequencing, scope, and the adjudicated design decisions. The codex plan remains

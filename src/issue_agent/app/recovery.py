@@ -8,6 +8,11 @@ from collections.abc import Callable
 
 from ..adapters.process_supervisor import ProcessSupervisor as DurableProcessSupervisor
 from ..domain.contracts import RunId
+from ..domain.reservation_recovery import (
+    ReservationRecoveryAction,
+    ReservationRecoveryState,
+    decide_reservation_recovery,
+)
 from ..domain.ports import (
     ProcessSupervisor,
     CommandRecovery,
@@ -107,24 +112,47 @@ class RecoveryCoordinator:
         unknown: list[RunId] = []
         abandoned = set(reclaimed)
         for run_id in candidates:
-            if run_id not in reclaimed and run_id in live_runs:
-                continue
-            if self.spend.reconcile(run_id):
-                continue
-            result = self.control.release_unlaunched(
-                run_id, "unlaunched_reservation"
+            state = ReservationRecoveryState.observed(
+                live_lease=run_id in live_runs,
+                lease_reclaimed=run_id in reclaimed,
             )
-            if result.disposition.value == "available":
-                unknown.append(run_id)
-                abandoned.add(run_id)
-                continue
-            retained = self.control.release_retained(
-                run_id,
-                "unmeasured_completed_reservation",
-                cutoff,
-            )
-            if retained.disposition.value == "available":
-                unknown.append(run_id)
+            while True:
+                decision = decide_reservation_recovery(state)
+                if decision.action is ReservationRecoveryAction.PRESERVE:
+                    break
+                if decision.action is ReservationRecoveryAction.RECONCILE_SPEND:
+                    state = state.after_spend_reconciliation(
+                        settled=self.spend.reconcile(run_id)
+                    )
+                    continue
+                if decision.action is ReservationRecoveryAction.RELEASE_UNLAUNCHED:
+                    result = self.control.release_unlaunched(
+                        run_id, "unlaunched_reservation"
+                    )
+                    state = state.after_unlaunched_release(
+                        released=result.disposition.value == "available"
+                    )
+                    continue
+                if decision.action is ReservationRecoveryAction.RELEASE_RETAINED:
+                    result = self.control.release_retained(
+                        run_id,
+                        "unmeasured_completed_reservation",
+                        cutoff,
+                    )
+                    state = state.after_retained_release(
+                        released=result.disposition.value == "available"
+                    )
+                    continue
+                if decision.action is not ReservationRecoveryAction.COMPLETE:
+                    raise AssertionError(
+                        f"unsupported reservation recovery action: "
+                        f"{decision.action}"
+                    )
+                if decision.report_spend_unknown:
+                    unknown.append(run_id)
+                if decision.record_abandonment:
+                    abandoned.add(run_id)
+                break
         for run_id in sorted(abandoned):
             try:
                 self.abandonments.abandon_run(

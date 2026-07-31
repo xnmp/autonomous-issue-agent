@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -31,6 +32,7 @@ from issue_agent.adapters.control_store import (
     SettlementRequest,
     read_settled_spend,
 )
+from issue_agent.adapters.deployment_authority import DeploymentAuthority
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.domain.contracts import (
     BudgetScope,
@@ -793,6 +795,94 @@ def test_repoint_permanently_fences_the_prior_owner_from_authority(
         current_owner,
         frozenset({"src/shared.py"}),
     )
+
+
+def test_repoint_waits_for_inflight_remote_effect_authority(
+    tmp_path,
+) -> None:
+    current_store = _store(tmp_path)
+    old_store = SQLiteControlStore(current_store.path, now=lambda: NOW)
+    old_store.initialize()
+    old_owner = "o/r:fix:deployment-1"
+    current_owner = "o/r:fix:deployment-2"
+    authority = DeploymentAuthority(
+        old_store,
+        "o/r",
+        "fix",
+        old_owner,
+    )
+    retirement_started = Event()
+    retirement_completed = Event()
+
+    def retire_owner() -> tuple[int, int]:
+        retirement_started.set()
+        result = current_store.adopt_legacy_owner(
+            "o/r",
+            "fix",
+            current_owner,
+            prior_owner_ids=(old_owner,),
+        )
+        retirement_completed.set()
+        return result
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with authority.effect():
+            retirement = pool.submit(retire_owner)
+            assert retirement_started.wait(timeout=1)
+            assert not retirement_completed.wait(timeout=0.1)
+            old_store.assert_owner_active(old_owner)
+
+        assert retirement.result(timeout=1) == (0, 0)
+
+    assert retirement_completed.is_set()
+    with pytest.raises(RetiredOwnerError, match="deployment-2"):
+        with authority.effect():
+            pass
+
+
+def test_peer_effects_share_authority_without_serializing_each_other(
+    tmp_path,
+) -> None:
+    store = _store(tmp_path)
+    authority = DeploymentAuthority(
+        store,
+        "o/r",
+        "fix",
+        "o/r:fix:deployment-1",
+    )
+    first_entered = Event()
+    second_entered = Event()
+    release = Event()
+
+    def first() -> None:
+        with authority.effect():
+            first_entered.set()
+            assert release.wait(timeout=1)
+
+    def second() -> None:
+        assert first_entered.wait(timeout=1)
+        with authority.effect():
+            second_entered.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_result = pool.submit(first)
+        second_result = pool.submit(second)
+        assert second_entered.wait(timeout=1)
+        release.set()
+        first_result.result(timeout=1)
+        second_result.result(timeout=1)
+
+
+def test_deployment_authority_rejects_a_mismatched_lock_scope(tmp_path) -> None:
+    store = _store(tmp_path)
+
+    with pytest.raises(ValueError, match="role does not match"):
+        DeploymentAuthority(
+            store,
+            "o/r",
+            "review",
+            "o/r:fix:deployment-1",
+        )
 
 
 def test_repoint_fences_delayed_pre_spawn_child_on_fresh_store(

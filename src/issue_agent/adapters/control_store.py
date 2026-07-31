@@ -56,6 +56,10 @@ from ..domain.events import (
     encode_event_line,
 )
 from ..domain.repository import canonical_repository
+from .deployment_authority import (
+    deployment_effect_barrier,
+    deployment_role,
+)
 
 SCHEMA_VERSION = 17
 SCHEMA_BASELINE_VERSION = 9
@@ -1369,6 +1373,8 @@ class SQLiteControlStore:
         legacy = f"{repository}:{role}"
         if not repository or not role or not owner_id:
             raise ValueError("legacy owner adoption identity is incomplete")
+        if deployment_role(repository, owner_id) != role:
+            raise ValueError("legacy owner adoption role does not match owner")
         prior = tuple(
             candidate
             for candidate in dict.fromkeys((legacy, *prior_owner_ids))
@@ -1377,7 +1383,11 @@ class SQLiteControlStore:
         if not prior:
             return (0, 0)
         placeholders = ",".join("?" for _candidate in prior)
-        with self.transaction() as db:
+        with deployment_effect_barrier(
+            self.path,
+            repository,
+            role,
+        ), self.transaction() as db:
             self._assert_owner_active(db, owner_id)
             prior_rows = db.execute(
                 f"SELECT owner_id, repository, role FROM retired_owners "

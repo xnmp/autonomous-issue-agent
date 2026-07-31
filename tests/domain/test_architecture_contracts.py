@@ -36,6 +36,16 @@ REMOTE_WRITES = frozenset(
         "update_branch",
     }
 )
+DURABLE_EFFECT_TRANSITIONS = frozenset(
+    {
+        "begin_command",
+        "enqueue_command",
+        "enqueue_command_occurrence",
+        "record_effect",
+        "resolve_unknown_effect",
+        "retry_reconciled_command",
+    }
+)
 MIGRATION_FLAGS = frozenset(
     {"CONTROL_STORE_MODE", "TRUSTED_PUBLISH", "EVENT_FORMAT", "SUPERVISION_NOTIFY"}
 )
@@ -334,6 +344,29 @@ def test_app_cannot_construct_the_non_durable_effect_adapter() -> None:
                 for name in imported
             ):
                 violations.append(f"{path.relative_to(ROOT)}:{node.lineno}")
+    assert violations == []
+
+
+def test_durable_effect_transitions_have_one_lifecycle_coordinator() -> None:
+    """Effect adapters cannot grow independent command state machines."""
+
+    coordinator = Path("src/issue_agent/adapters/durable_effects.py")
+    violations: list[str] = []
+    for root in (APP, ROOT / "src" / "issue_agent" / "adapters"):
+        for path in _python_files(root):
+            relative = path.relative_to(ROOT)
+            if relative == coordinator:
+                continue
+            tree = ast.parse(path.read_text(), filename=str(path))
+            for node in ast.walk(tree):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in DURABLE_EFFECT_TRANSITIONS
+                ):
+                    violations.append(
+                        f"{relative}:{node.lineno} {node.func.attr}"
+                    )
     assert violations == []
 
 

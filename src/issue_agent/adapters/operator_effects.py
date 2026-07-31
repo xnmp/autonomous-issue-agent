@@ -11,15 +11,15 @@ import hashlib
 import json
 import subprocess
 from collections.abc import Callable, Iterable, Mapping
-from datetime import datetime, timezone
 from typing import Any
 
 from .control_path import control_store_path
-from .control_store import PendingCommand, SQLiteControlStore
+from .control_store import SQLiteControlStore
+from .deployment_authority import UnfencedEffectAuthority
+from .durable_effects import DurableEffectRunner, EffectOutcome
 from ..domain.contracts import (
     CommandId,
     CommandKind,
-    EffectReceipt,
     EffectStatus,
     LifecycleCommand,
 )
@@ -78,6 +78,11 @@ class GitHubOperatorEffects:
         self.identity = identity
         self.config_version = config_version
         self.run = run
+        self.effects = DurableEffectRunner(
+            store,
+            UnfencedEffectAuthority(),
+            executor_identity=identity,
+        )
 
     def ensure_label(
         self,
@@ -298,21 +303,20 @@ class GitHubOperatorEffects:
             baseline,
             {"events": events},
         )
-        pending = self.store.enqueue_command(command)
+        pending = self.effects.enqueue(command)
         if pending.state == EffectStatus.SUCCEEDED.value:
-            pending = self.store.enqueue_command_occurrence(command)
+            pending = self.effects.enqueue_occurrence(command)
             command = pending.command
         elif pending.state in {"executing", EffectStatus.UNKNOWN_OUTCOME.value}:
             if self._relay_hooks():
-                self.store.resolve_unknown_effect(
-                    self._receipt(command, EffectStatus.SUCCEEDED)
+                self.effects.resolve_unknown(
+                    command,
+                    EffectOutcome(None, EffectStatus.SUCCEEDED),
                 )
-                pending = self.store.enqueue_command_occurrence(command)
+                pending = self.effects.enqueue_occurrence(command)
                 command = pending.command
             else:
-                self.store.retry_reconciled_command(command.command_id)
-        self.store.begin_command(command.command_id)
-        started = datetime.now(timezone.utc)
+                self.effects.retry_reconciled(command)
         argv = [
             "gh",
             "webhook",
@@ -320,64 +324,47 @@ class GitHubOperatorEffects:
             f"--repo={self.repository}",
             f"--events={events}",
         ]
-        try:
-            process = spawn(
-                argv,
-                stdout=subprocess.PIPE,
-                stderr=None,
-                text=True,
-                bufsize=1,
-            )
-        except BaseException as exc:
-            self.store.record_effect(
-                EffectReceipt(
-                    command.command_id,
-                    self.identity,
-                    started,
-                    datetime.now(timezone.utc),
+
+        def spawn_and_verify() -> EffectOutcome[Any]:
+            try:
+                process = spawn(
+                    argv,
+                    stdout=subprocess.PIPE,
+                    stderr=None,
+                    text=True,
+                    bufsize=1,
+                )
+            except BaseException as exc:
+                return EffectOutcome(
+                    exc,
                     EffectStatus.RETRYABLE_FAILURE,
                     error=f"{type(exc).__name__}: {exc}",
                 )
-            )
-            raise
-        try:
-            hooks = self._relay_hooks()
-        except Exception as exc:  # noqa: BLE001 - creation outcome is ambiguous
-            self.store.record_effect(
-                EffectReceipt(
-                    command.command_id,
-                    self.identity,
-                    started,
-                    datetime.now(timezone.utc),
+            try:
+                hooks = self._relay_hooks()
+            except Exception as exc:  # noqa: BLE001 - outcome is ambiguous
+                return EffectOutcome(
+                    process,
                     EffectStatus.UNKNOWN_OUTCOME,
                     error=f"relay hook could not be verified: {exc}",
                 )
-            )
-            return process
-        if hooks:
-            self.store.record_effect(
-                EffectReceipt(
-                    command.command_id,
-                    self.identity,
-                    started,
-                    datetime.now(timezone.utc),
+            if hooks:
+                return EffectOutcome(
+                    process,
                     EffectStatus.SUCCEEDED,
                     remote_object_id=str(hooks[-1]["id"]),
                     remote_revision=_digest(hooks),
                 )
+            return EffectOutcome(
+                process,
+                EffectStatus.UNKNOWN_OUTCOME,
+                error="forwarder started but relay hook is not yet observable",
             )
-        else:
-            self.store.record_effect(
-                EffectReceipt(
-                    command.command_id,
-                    self.identity,
-                    started,
-                    datetime.now(timezone.utc),
-                    EffectStatus.UNKNOWN_OUTCOME,
-                    error="forwarder started but relay hook is not yet observable",
-                )
-            )
-        return process
+
+        result = self.effects.execute(command, spawn_and_verify)
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
     def _execute(
         self,
@@ -388,83 +375,62 @@ class GitHubOperatorEffects:
         apply: Callable[[], object],
         unconfirmed_status: EffectStatus = EffectStatus.RETRYABLE_FAILURE,
     ) -> None:
-        pending = self.store.enqueue_command(command)
+        pending = self.effects.enqueue(command)
         command = pending.command
         if pending.state == EffectStatus.SUCCEEDED.value:
             if reconcile():
                 return
-            pending = self.store.enqueue_command_occurrence(command)
+            pending = self.effects.enqueue_occurrence(command)
             command = pending.command
         if pending.state == EffectStatus.PERMANENT_FAILURE.value:
-            pending = self.store.enqueue_command_occurrence(command)
+            pending = self.effects.enqueue_occurrence(command)
             command = pending.command
         if pending.state in {"executing", EffectStatus.UNKNOWN_OUTCOME.value}:
             if reconcile():
-                self.store.resolve_unknown_effect(
-                    self._receipt(command, EffectStatus.SUCCEEDED)
+                self.effects.resolve_unknown(
+                    command,
+                    EffectOutcome(None, EffectStatus.SUCCEEDED),
                 )
                 return
             if revision() != command.expected_revision:
                 raise UnknownOperatorEffect(
                     f"{command.command_id}: target changed while outcome was unknown"
                 )
-            self.store.retry_reconciled_command(command.command_id)
+            self.effects.retry_reconciled(command)
         if revision() != command.expected_revision:
-            now = datetime.now(timezone.utc)
-            self.store.begin_command(command.command_id)
-            self.store.record_effect(
-                EffectReceipt(
-                    command.command_id,
-                    self.identity,
-                    now,
-                    now,
+            self.effects.execute(
+                command,
+                lambda: EffectOutcome(
+                    None,
                     EffectStatus.PERMANENT_FAILURE,
                     error="expected revision no longer matches remote target",
-                )
+                ),
             )
             raise OperatorEffectError("remote target changed before mutation")
-        self.store.begin_command(command.command_id)
-        started = datetime.now(timezone.utc)
-        try:
-            apply()
-        except BaseException as exc:
+
+        def apply_and_verify() -> EffectOutcome[bool]:
             try:
-                applied = reconcile()
-            except Exception:
-                applied = False
-            self.store.record_effect(
-                EffectReceipt(
-                    command.command_id,
-                    self.identity,
-                    started,
-                    datetime.now(timezone.utc),
-                    (
-                        EffectStatus.SUCCEEDED
-                        if applied
-                        else EffectStatus.UNKNOWN_OUTCOME
-                    ),
-                    error=None if applied else f"{type(exc).__name__}: {exc}",
+                apply()
+            except BaseException:
+                try:
+                    applied = reconcile()
+                except Exception:
+                    applied = False
+                if not applied:
+                    raise
+                return EffectOutcome(True, EffectStatus.SUCCEEDED)
+            applied = reconcile()
+            error = (
+                None
+                if applied
+                else (
+                    "remote rejected the requested state"
+                    if unconfirmed_status is EffectStatus.PERMANENT_FAILURE
+                    else "remote state did not confirm mutation"
                 )
             )
-            if applied:
-                return
-            raise
-        applied = reconcile()
-        error = (
-            None
-            if applied
-            else (
-                "remote rejected the requested state"
-                if unconfirmed_status is EffectStatus.PERMANENT_FAILURE
-                else "remote state did not confirm mutation"
-            )
-        )
-        self.store.record_effect(
-            EffectReceipt(
-                command.command_id,
-                self.identity,
-                started,
-                datetime.now(timezone.utc),
+            return EffectOutcome(
+                applied,
                 (
                     EffectStatus.SUCCEEDED
                     if applied
@@ -472,9 +438,15 @@ class GitHubOperatorEffects:
                 ),
                 error=error,
             )
-        )
+
+        applied = self.effects.execute(command, apply_and_verify)
         if not applied:
-            raise OperatorEffectError(error or "remote mutation failed")
+            error = (
+                "remote rejected the requested state"
+                if unconfirmed_status is EffectStatus.PERMANENT_FAILURE
+                else "remote state did not confirm mutation"
+            )
+            raise OperatorEffectError(error)
 
     def _command(
         self,
@@ -506,21 +478,6 @@ class GitHubOperatorEffects:
             self.config_version,
             self.repository,
             self.identity,
-        )
-
-    def _receipt(
-        self,
-        command: LifecycleCommand,
-        status: EffectStatus,
-    ) -> EffectReceipt:
-        now = datetime.now(timezone.utc)
-        return EffectReceipt(
-            command.command_id,
-            self.identity,
-            now,
-            now,
-            status,
-            error=None if status is EffectStatus.SUCCEEDED else status.value,
         )
 
     def _label_exists(self, label: str) -> bool:
@@ -627,14 +584,15 @@ class GitHubOperatorEffects:
                 continue
             hooks = self._relay_hooks()
             if hooks:
-                self.store.resolve_unknown_effect(
-                    self._receipt(pending.command, EffectStatus.SUCCEEDED)
+                self.effects.resolve_unknown(
+                    pending.command,
+                    EffectOutcome(None, EffectStatus.SUCCEEDED),
                 )
             elif pending.state in {
                 "executing",
                 EffectStatus.UNKNOWN_OUTCOME.value,
             }:
-                self.store.retry_reconciled_command(pending.command.command_id)
+                self.effects.retry_reconciled(pending.command)
 
     def _json(self, argv: list[str]) -> object:
         completed = self.run(

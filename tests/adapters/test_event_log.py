@@ -128,6 +128,26 @@ def test_rotation_preserves_open_level_in_snapshot(tmp_path) -> None:
     assert len(log.paths()) == 2
 
 
+def test_rotation_ignores_and_preserves_non_rotation_siblings(tmp_path) -> None:
+    path = tmp_path / "events.jsonl"
+    backup = tmp_path / "events.jsonl.000.backup"
+    backup_log = EventLog(str(backup), _producer())
+    backup_log.emit(
+        LevelChanged("issue:99:deferred", "waiting", "backup-only")
+    )
+    backup_content = backup.read_bytes()
+    log = EventLog(
+        str(path), _producer(), max_bytes=1, max_rotated_files=1
+    )
+
+    log.emit(LevelChanged("issue:1:deferred", "waiting", "live"))
+    log.emit(LevelChanged("issue:2:deferred", "waiting", "live"))
+
+    assert backup.read_bytes() == backup_content
+    assert backup not in log.paths()
+    assert "issue:99:deferred" not in fold(_retained_events(log)).levels
+
+
 def test_rotation_retention_bounds_files_and_restart_snapshot(tmp_path) -> None:
     path = tmp_path / "events.jsonl"
     log = EventLog(

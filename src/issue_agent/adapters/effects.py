@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import fields, is_dataclass
-from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Mapping, Protocol, runtime_checkable
 
@@ -26,10 +25,11 @@ from ..domain.repository import canonical_repository
 from ..domain.contracts import (
     CommandId,
     CommandKind,
-    EffectReceipt,
     EffectStatus,
     LifecycleCommand,
 )
+from .deployment_authority import DeploymentAuthority, deployment_role
+from .durable_effects import DurableEffectRunner, EffectOutcome
 
 _TARGET = {Target.ISSUE: "issue", Target.PR: "pr"}
 
@@ -218,6 +218,16 @@ class GitHubEffectExecutor:
         self.repository = canonical_repository(repository)
         self.identity = identity
         self.config_version = config_version
+        self.effects = DurableEffectRunner(
+            store,
+            DeploymentAuthority(
+                store,
+                self.repository,
+                deployment_role(self.repository, identity),
+                identity,
+            ),
+            executor_identity=identity,
+        )
 
     def handles(self, action: Action) -> bool:
         return isinstance(
@@ -238,7 +248,7 @@ class GitHubEffectExecutor:
         pending = self._pending_for_action(action)
         if pending is None:
             command = self._command(action)
-            pending = self.store.enqueue_command(command)
+            pending = self.effects.enqueue(command)
         else:
             command = pending.command
             action = action_from_command(command)
@@ -250,24 +260,19 @@ class GitHubEffectExecutor:
                 raise UnknownEffectOutcome(
                     f"{command.command_id}: succeeded effect cannot be verified"
                 )
-            pending = self.store.enqueue_command_occurrence(command)
+            pending = self.effects.enqueue_occurrence(command)
             command = pending.command
         if pending.state == EffectStatus.PERMANENT_FAILURE.value:
             return False
         if pending.state == "pending" and not self._revision_matches(command):
-            now = datetime.now(timezone.utc)
-            self.store.begin_command(command.command_id)
-            self.store.record_effect(
-                EffectReceipt(
-                    command.command_id,
-                    self.identity,
-                    now,
-                    now,
+            return self.effects.execute(
+                command,
+                lambda: EffectOutcome(
+                    False,
                     EffectStatus.PERMANENT_FAILURE,
                     error="expected revision no longer matches remote target",
-                )
+                ),
             )
-            return False
         repairing_partial_close = (
             pending.state != "pending"
             and isinstance(action, CloseIssue)
@@ -279,46 +284,42 @@ class GitHubEffectExecutor:
         }:
             reconciled = self._reconcile(action, command)
             if reconciled is True:
-                self.store.resolve_unknown_effect(
-                    self._receipt(command, EffectStatus.SUCCEEDED)
+                return self.effects.resolve_unknown(
+                    command,
+                    EffectOutcome(True, EffectStatus.SUCCEEDED),
                 )
-                return True
             if reconciled is None:
                 raise UnknownEffectOutcome(
                     f"{command.command_id}: remote outcome remains unknown"
                 )
-            self.store.retry_reconciled_command(command.command_id)
+            self.effects.retry_reconciled(command)
         else:
             reconciled = self._reconcile(action, command)
             if reconciled is True:
                 # A deployment cutover or target revision change can produce a
                 # new command identity for an effect that already landed.
-                self.store.begin_command(command.command_id)
-                self.store.record_effect(
-                    self._receipt(command, EffectStatus.SUCCEEDED)
+                return self.effects.execute(
+                    command,
+                    lambda: EffectOutcome(
+                        True,
+                        EffectStatus.SUCCEEDED,
+                    ),
                 )
-                return True
         if (
             pending.state != "pending"
             and not repairing_partial_close
             and not self._revision_matches(command)
         ):
-            now = datetime.now(timezone.utc)
-            self.store.begin_command(command.command_id)
-            self.store.record_effect(
-                EffectReceipt(
-                    command.command_id,
-                    self.identity,
-                    now,
-                    now,
+            return self.effects.execute(
+                command,
+                lambda: EffectOutcome(
+                    False,
                     EffectStatus.PERMANENT_FAILURE,
                     error="expected revision no longer matches remote target",
-                )
+                ),
             )
-            return False
-        self.store.begin_command(command.command_id)
-        started = datetime.now(timezone.utc)
-        try:
+
+        def apply_and_verify() -> EffectOutcome[bool]:
             applied = self._apply(action, command)
             if not applied:
                 outcome = False
@@ -328,25 +329,9 @@ class GitHubEffectExecutor:
                 raise UnknownEffectOutcome(
                     f"{command.command_id}: remote postcondition is unavailable"
                 )
-        except BaseException as exc:
-            completed = datetime.now(timezone.utc)
-            receipt = EffectReceipt(
-                command.command_id,
-                self.identity,
-                started,
-                completed,
-                EffectStatus.UNKNOWN_OUTCOME,
-                error=f"{type(exc).__name__}: {exc}",
-            )
-            self.store.record_effect(receipt)
-            raise
-        retryable = not outcome
-        self.store.record_effect(
-            EffectReceipt(
-                command.command_id,
-                self.identity,
-                started,
-                datetime.now(timezone.utc),
+            retryable = not outcome
+            return EffectOutcome(
+                outcome,
                 (
                     EffectStatus.RETRYABLE_FAILURE
                     if retryable
@@ -358,8 +343,8 @@ class GitHubEffectExecutor:
                     else None
                 ),
             )
-        )
-        return outcome
+
+        return self.effects.execute(command, apply_and_verify)
 
     def submit_review(
         self, pr: int, event: str, body: str, expected_head: str
@@ -385,7 +370,7 @@ class GitHubEffectExecutor:
             self.repository,
             self.identity,
         )
-        pending = self.store.enqueue_command(command)
+        pending = self.effects.enqueue(command)
         return self._run_review_command(pending)
 
     def _run_review_command(self, pending) -> bool:
@@ -402,7 +387,7 @@ class GitHubEffectExecutor:
                 )
             if self.gateway.has_review(pr, event, body, head):
                 return True
-            pending = self.store.enqueue_command_occurrence(command)
+            pending = self.effects.enqueue_occurrence(command)
             command = pending.command
         if pending.state == EffectStatus.PERMANENT_FAILURE.value:
             return False
@@ -412,39 +397,32 @@ class GitHubEffectExecutor:
                     f"{command.command_id}: review outcome requires reconciliation"
                 )
             if self.gateway.has_review(pr, event, body, head):
-                self.store.resolve_unknown_effect(
-                    self._receipt(command, EffectStatus.SUCCEEDED)
+                return self.effects.resolve_unknown(
+                    command,
+                    EffectOutcome(True, EffectStatus.SUCCEEDED),
                 )
-                return True
-            self.store.retry_reconciled_command(command.command_id)
+            self.effects.retry_reconciled(command)
         elif isinstance(self.gateway, ReviewVerifier) and self.gateway.has_review(
             pr, event, body, head
         ):
             # Deployment-scoped identities change the command digest. Reconcile
             # a matching pre-cutover review before the new identity can submit
             # the same GitHub review again.
-            self.store.begin_command(command.command_id)
-            self.store.record_effect(
-                self._receipt(command, EffectStatus.SUCCEEDED)
+            return self.effects.execute(
+                command,
+                lambda: EffectOutcome(True, EffectStatus.SUCCEEDED),
             )
-            return True
         if not self._revision_matches(command):
-            now = datetime.now(timezone.utc)
-            self.store.begin_command(command.command_id)
-            self.store.record_effect(
-                EffectReceipt(
-                    command.command_id,
-                    self.identity,
-                    now,
-                    now,
+            return self.effects.execute(
+                command,
+                lambda: EffectOutcome(
+                    False,
                     EffectStatus.PERMANENT_FAILURE,
                     error="review head changed before submission",
-                )
+                ),
             )
-            return False
-        self.store.begin_command(command.command_id)
-        started = datetime.now(timezone.utc)
-        try:
+
+        def submit_and_verify() -> EffectOutcome[bool]:
             applied = bool(
                 self.gateway.submit_review(pr, event, body, head)
             )
@@ -459,34 +437,21 @@ class GitHubEffectExecutor:
                         f"{command.command_id}: submitted review is not "
                         "visible on the captured revision"
                     )
-        except BaseException as exc:
-            self.store.record_effect(
-                EffectReceipt(
-                    command.command_id,
-                    self.identity,
-                    started,
-                    datetime.now(timezone.utc),
-                    EffectStatus.UNKNOWN_OUTCOME,
-                    error=f"{type(exc).__name__}: {exc}",
+            return EffectOutcome(
+                applied,
+                (
+                    EffectStatus.SUCCEEDED
+                    if applied
+                    else EffectStatus.PERMANENT_FAILURE
+                ),
+                error=(
+                    None
+                    if applied
+                    else "GitHub rejected review submission"
                 )
             )
-            raise
-        status = (
-            EffectStatus.SUCCEEDED
-            if applied
-            else EffectStatus.PERMANENT_FAILURE
-        )
-        self.store.record_effect(
-            EffectReceipt(
-                command.command_id,
-                self.identity,
-                started,
-                datetime.now(timezone.utc),
-                status,
-                error=None if applied else "GitHub rejected review submission",
-            )
-        )
-        return applied
+
+        return self.effects.execute(command, submit_and_verify)
 
     def drain_pending_commands(self) -> int:
         """Resume durable commands after restart without blindly repeating ambiguity."""
@@ -800,20 +765,6 @@ class GitHubEffectExecutor:
                 f"{command.command_id}: current revision is unavailable"
             )
         return current == command.expected_revision
-
-    def _receipt(
-        self, command: LifecycleCommand, status: EffectStatus
-    ) -> EffectReceipt:
-        now = datetime.now(timezone.utc)
-        return EffectReceipt(
-            command.command_id,
-            self.identity,
-            now,
-            now,
-            status,
-            error=None if status is EffectStatus.SUCCEEDED else status.value,
-        )
-
 
 def command_for_action(
     action: Action,
