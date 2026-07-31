@@ -10,6 +10,7 @@ from issue_agent.adapters.journal import (
     _legacy_event_record,
     read_events,
 )
+from issue_agent.domain.events import Correlation, TelemetryWarning
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.planners.schemas import REVIEW_SCHEMA
 from issue_agent.app.workflows.review import ReviewWorkflow, ReviewWorkflowConfig
@@ -1293,3 +1294,61 @@ def test_rebound_verdict_prevents_paid_review_when_cache_write_fails():
 
     assert runner.tasks == []
     assert any(call[0] == "review" for call in gw.calls)
+
+
+class RecordingJournal:
+    """Captures raw TelemetryEvent objects (not the lossy legacy view) so a
+    deferral's `code` and `Correlation` can be asserted directly."""
+
+    def __init__(self):
+        self.events = []
+
+    def emit(self, event):
+        self.events.append(event)
+
+
+def test_claim_target_changed_defers_and_journals_dispatch_deferred(tmp_path):
+    """ADR 0008: when the fresh breaker_key disagrees with the claim the
+    dispatcher reserved, review() must defer (no paid run) AND surface a
+    TelemetryWarning('dispatch_deferred', ...) with Correlation(pr=N) so a
+    persistent linkage flap is visible on the dashboard warning feed, not just
+    the log."""
+    pr = PRView(100, head_ref_name="fix/6-moved", closing_issue=6)
+    gw = FakeGateway(prs={100: pr})
+    runner = FakeRunner(AgentResult(is_error=False))
+    journal = RecordingJournal()
+
+    asyncio.run(
+        _workflow(gw, FakeStore(), runner, journal=journal).review(
+            100, claim_target=5
+        )
+    )
+
+    assert runner.tasks == []
+    assert gw.calls == []
+    warnings = [e for e in journal.events if isinstance(e.payload, TelemetryWarning)]
+    assert len(warnings) == 1
+    event = warnings[0]
+    assert event.payload.code == "dispatch_deferred"
+    assert event.correlation == Correlation(pr=100)
+    assert event.payload.details == {"observed_target": 5, "fresh_target": 6}
+
+
+def test_claim_target_changed_defers_even_when_journalling_raises():
+    """Telemetry must never block the deferral it is reporting on."""
+    class ExplodingJournal:
+        def emit(self, event):
+            raise OSError("journal disk full")
+
+    pr = PRView(100, head_ref_name="fix/6-moved", closing_issue=6)
+    gw = FakeGateway(prs={100: pr})
+    runner = FakeRunner(AgentResult(is_error=False))
+
+    result = asyncio.run(
+        _workflow(gw, FakeStore(), runner, journal=ExplodingJournal()).review(
+            100, claim_target=5
+        )
+    )
+
+    assert result is None
+    assert runner.tasks == []

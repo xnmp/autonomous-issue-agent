@@ -11,7 +11,12 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 
 from ...domain import review as review_dom
-from ...domain.events import Correlation, ReviewSkipped, TelemetryEvent
+from ...domain.events import (
+    Correlation,
+    ReviewSkipped,
+    TelemetryEvent,
+    TelemetryWarning,
+)
 from ...domain.leg import Leg, LegTarget
 from ...domain.trust import as_untrusted
 from ..planners import tasks as task_builders
@@ -125,6 +130,28 @@ class ReviewWorkflow:
             f"review #{pr.number}: deferred — observed target {claim_target} "
             f"changed to {fresh_target} before execution"
         )
+        # Spend-safe but otherwise silent: a persistent linkage flap re-defers
+        # every tick, so surface it on the dashboard warning feed (ADR 0008).
+        if self.cfg.journal is not None:
+            try:
+                self.cfg.journal.emit(
+                    TelemetryEvent(
+                        TelemetryWarning(
+                            "dispatch_deferred",
+                            f"observed target {claim_target} changed to "
+                            f"{fresh_target} before execution",
+                            {
+                                "observed_target": claim_target,
+                                "fresh_target": fresh_target,
+                            },
+                        ),
+                        Correlation(pr=pr.number),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 — telemetry must not block
+                self.cfg.log(
+                    f"review #{pr.number}: deferral not journalled ({exc})"
+                )
         return False
 
     def _no_progress(

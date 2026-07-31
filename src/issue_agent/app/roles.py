@@ -2227,7 +2227,8 @@ def build_review_daemon(
             rejected_prs.add(action.number)
             _log("review")(
                 f"dispatch {action.kind.name} PR #{action.number}: "
-                "deferred — another deployment owns the target"
+                f"deferred — target {issue} is already reserved (another PR "
+                "on the same issue here, or another deployment's claim)"
             )
         if not rejected_prs:
             return actions

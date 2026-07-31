@@ -390,7 +390,18 @@ class AgentDispatcher:
             AgentKind.ADDRESS_REVIEW,
             AgentKind.FIX_CI,
             AgentKind.REBASE,
-        } and claim_target is not None and issue is not None:
+        } and claim_target is not None:
+            # ADR 0008: a fix PR dispatch whose reserved claim carries no issue
+            # must not fall through to a live linkage lookup — that would run
+            # under an identity that was never claimed. decide_fix currently
+            # never dispatches issueless PR work, so this is a fence, not a path.
+            if issue is None:
+                self.cfg.log(
+                    f"dispatch {action.kind.name} PR #{action.number}: deferred "
+                    f"— claim target {claim_target} carries no issue; refusing "
+                    "live-lookup identity (ADR 0008)"
+                )
+                return
             handler = partial(handler, issue_hint=issue)
         if action.kind in {
             AgentKind.REVIEW,

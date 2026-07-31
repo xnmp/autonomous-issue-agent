@@ -19,6 +19,7 @@ from ...domain.events import (
     Correlation,
     RoutingEscalated,
     TelemetryEvent,
+    TelemetryWarning,
 )
 from ...domain.leg import Leg, LegTarget
 from ...domain import outcome
@@ -832,8 +833,33 @@ class FixWorkflow:
                 f"dispatch for PR #{pr}: deferred — observed target "
                 f"{issue_hint} changed to {fresh_target} before execution"
             )
+            self._journal_deferral(pr, issue_hint, fresh_target)
             return None
         return current, issue_hint if issue_hint > 0 else None
+
+    def _journal_deferral(
+        self, pr: int, observed: int, fresh: int
+    ) -> None:
+        """A deferral is spend-safe but silent: a persistent linkage flap would
+        re-defer the same dispatch every tick with only a log line. The event
+        makes a livelock visible on the dashboard's warning feed (ADR 0008)."""
+        journal = self.cfg.journal
+        if journal is None:
+            return
+        try:
+            journal.emit(
+                TelemetryEvent(
+                    TelemetryWarning(
+                        "dispatch_deferred",
+                        f"observed target {observed} changed to {fresh} "
+                        "before execution",
+                        {"observed_target": observed, "fresh_target": fresh},
+                    ),
+                    Correlation(pr=pr),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — telemetry must not block dispatch
+            self.cfg.log(f"dispatch for PR #{pr}: deferral not journalled ({exc})")
 
     async def resume_pr(
         self, pr: int, *, issue_hint: int | None = None

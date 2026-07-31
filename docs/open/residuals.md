@@ -127,6 +127,16 @@ Two smaller ones worth doing whenever the files are next touched:
   converter. They are never queried for admission, deduplication, process
   ownership, or effect authorization.
 
+- Legacy issue-keyed review retry counters (pre-ADR-0008 writes) are still
+  honored by `roles._review_state`'s read union. A counter written under issue
+  N for a PR that is later relinked away is never cleared by that PR's
+  `_progress`, so a *different* PR later linked to issue N inherits it and its
+  `unproductive_rounds` starts inflated. Pre-existing leakage; it drains as
+  legacy counters clear on productive rounds. Trigger for a one-time counter
+  migration: an observed premature `needs-human-review` escalation whose
+  rejection count includes a stale issue-keyed entry (2026-08-01 adversarial
+  review, P2-4).
+
 ---
 
 ## 5. Per-incident notes

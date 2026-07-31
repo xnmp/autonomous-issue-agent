@@ -1022,3 +1022,30 @@ def test_address_review_success_counts_the_retry_and_touches_no_label(tmp_path):
     assert store.get_review_retry(5) == ("T1", 1)
     assert not any(c[0] == "relabel" for c in gw.calls)  # no gh write at all, not a failed one
     assert store.get_infra_deaths(5) == 0
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [AgentKind.PR_RESUME, AgentKind.ADDRESS_REVIEW, AgentKind.FIX_CI, AgentKind.REBASE],
+)
+def test_fix_pr_kind_defers_without_dispatch_when_claim_target_carries_no_issue(kind, tmp_path):
+    """ADR 0008: a reserved claim that resolves to a negative (issueless) target
+    must fence the dispatch entirely — no handler call, no live gh lookup to
+    re-derive an identity that was never claimed. `fail_on={"issue_for_pr"}`
+    proves the live lookup path is never taken (it would raise if it were)."""
+    store = Store(state_dir=str(tmp_path))
+    pr = PRView(100, head_ref_name="fix/5-x", closing_issue=5)
+    gw = FakeGateway(prs={100: pr}, fail_on={"issue_for_pr"})
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="c5"))
+    action = RunAgent(kind, 100)
+    d = _ci_dispatcher(
+        gw, store, runner,
+        dispatch_claim_target=lambda candidate: -100 if candidate == action else None,
+    )
+
+    asyncio.run(d.dispatch(action))
+
+    assert runner.tasks == []
+    assert store.get_session(5) == ""
+    assert store.get_infra_deaths(5) == 0
+    assert gw.calls == []
