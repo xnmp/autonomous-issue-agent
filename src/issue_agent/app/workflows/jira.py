@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from typing import Any
 
 from ..planners import tasks as task_builders
@@ -41,6 +40,7 @@ class JiraSyncWorkflowConfig:
     log: Callable[[str], None]
     repository: str = ""
     command_identity: str = ""
+    deployment_owner_id: str = ""
     config_version: str = ""
 
 
@@ -57,7 +57,16 @@ class JiraSyncWorkflow:
     )
 
     def __post_init__(self) -> None:
-        if self.commands is not None and self.cfg.command_identity:
+        if self.commands is not None and self.cfg.jira is not None:
+            if not (
+                self.cfg.repository
+                and self.cfg.command_identity
+                and self.cfg.deployment_owner_id
+            ):
+                raise ValueError(
+                    "durable Jira effects require repository, command identity, "
+                    "and deployment owner"
+                )
             self.effects = DurableEffectRunner(
                 self.commands,
                 DeploymentAuthority(
@@ -65,9 +74,9 @@ class JiraSyncWorkflow:
                     self.cfg.repository,
                     deployment_role(
                         self.cfg.repository,
-                        self.cfg.command_identity,
+                        self.cfg.deployment_owner_id,
                     ),
-                    self.cfg.command_identity,
+                    self.cfg.deployment_owner_id,
                 ),
                 executor_identity=self.cfg.command_identity,
             )
@@ -191,54 +200,44 @@ class JiraSyncWorkflow:
             )
             return result, outcome
 
-        started_at = datetime.now(timezone.utc)
         receipted = pending is not None and not reconcile_first
+
+        async def execute_effect() -> EffectOutcome[tuple[Any, Any]]:
+            result, outcome = await run_and_classify()
+            return EffectOutcome(
+                (result, outcome),
+                (
+                    EffectStatus.SUCCEEDED
+                    if outcome.should_persist
+                    else EffectStatus.UNKNOWN_OUTCOME
+                ),
+                remote_object_id=(
+                    outcome.ticket_key if outcome.should_persist else None
+                ),
+                remote_revision=(
+                    outcome.phase if outcome.should_persist else None
+                ),
+                error=(
+                    None
+                    if outcome.should_persist
+                    else outcome.reason or "Jira outcome is ambiguous"
+                ),
+            )
+
         if receipted:
             assert pending is not None
-
-            async def execute_new() -> EffectOutcome[tuple[Any, Any]]:
-                result, outcome = await run_and_classify()
-                return EffectOutcome(
-                    (result, outcome),
-                    (
-                        EffectStatus.SUCCEEDED
-                        if outcome.should_persist
-                        else EffectStatus.UNKNOWN_OUTCOME
-                    ),
-                    remote_object_id=(
-                        outcome.ticket_key if outcome.should_persist else None
-                    ),
-                    remote_revision=(
-                        outcome.phase if outcome.should_persist else None
-                    ),
-                    error=(
-                        None
-                        if outcome.should_persist
-                        else outcome.reason or "Jira outcome is ambiguous"
-                    ),
-                )
-
             result, outcome = await self._effect_runner().execute_async(
                 pending.command,
-                execute_new,
+                execute_effect,
+            )
+        elif pending is not None and reconcile_first:
+            result, outcome = await self._effect_runner().reconcile_async(
+                pending.command,
+                execute_effect,
             )
         else:
-            try:
-                result, outcome = await run_and_classify()
-            except BaseException:
-                self._record_unknown(
-                    pending,
-                    started_at,
-                    "agent leg interrupted",
-                )
-                raise
+            result, outcome = await run_and_classify()
         if not outcome.should_persist:
-            if not receipted:
-                self._record_unknown(
-                    pending,
-                    started_at,
-                    outcome.reason or "Jira outcome is ambiguous",
-                )
             if outcome.reason == "missing_ticket_key":
                 self.cfg.log(f"jira-sync #{issue}: {result.status} but no ticket_key returned — will retry")
                 return
@@ -250,16 +249,6 @@ class JiraSyncWorkflow:
                 return
             self.cfg.log(f"jira-sync #{issue}: failed ({result.summary or 'see logs'}) — will retry")
             return
-        if pending is not None and reconcile_first:
-            self._effect_runner().resolve_unknown(
-                pending.command,
-                EffectOutcome(
-                    None,
-                    EffectStatus.SUCCEEDED,
-                    remote_object_id=outcome.ticket_key,
-                    remote_revision=outcome.phase,
-                ),
-            )
         self.store.set_jira_key(issue, outcome.ticket_key)
         self.store.set_jira_phase(issue, outcome.phase)
         self.cfg.log(f"jira-sync #{issue}: {result.status} {outcome.ticket_key} → {outcome.phase}")
@@ -322,24 +311,3 @@ class JiraSyncWorkflow:
                 "Jira lifecycle effects require durable command storage"
             )
         return self.effects
-
-    def _record_unknown(
-        self,
-        pending,
-        started_at: datetime,
-        error: str,
-    ) -> None:
-        if pending is None or pending.state in {
-            EffectStatus.UNKNOWN_OUTCOME.value,
-            EffectStatus.PERMANENT_FAILURE.value,
-        }:
-            return
-        self._effect_runner().record_existing(
-            pending.command,
-            EffectOutcome(
-                None,
-                EffectStatus.UNKNOWN_OUTCOME,
-                error=error[:500],
-            ),
-            started=started_at,
-        )

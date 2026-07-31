@@ -2397,6 +2397,7 @@ def build_steward_daemon(
         # know whose merged PRs count as "shipped by this harness".
         fix_bot=cfg.fix_runtime.bot,
         command_identity=f"{owner_id}:jira",
+        deployment_owner_id=owner_id,
         config_version=cfg.config_version,
         **_spend_cfg(cfg, "steward"),
     )

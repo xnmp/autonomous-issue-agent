@@ -57,6 +57,10 @@ def _runner(tmp_path) -> tuple[DurableEffectRunner, SQLiteControlStore]:
     )
 
 
+def _reply_lost() -> EffectOutcome[None]:
+    raise RuntimeError("reply lost")
+
+
 def test_runner_commits_executing_before_effect_and_terminal_receipt_after(
     tmp_path,
 ) -> None:
@@ -135,6 +139,68 @@ def test_null_effect_outcome_becomes_unknown_instead_of_staying_executing(
     assert store.pending_commands()[0].state == (
         EffectStatus.UNKNOWN_OUTCOME.value
     )
+
+
+def test_async_reconciliation_only_resolves_authoritatively_proven_success(
+    tmp_path,
+) -> None:
+    runner, store = _runner(tmp_path)
+    command = _command()
+    runner.enqueue(command)
+
+    with pytest.raises(RuntimeError, match="reply lost"):
+        runner.execute(command, _reply_lost)
+
+    async def still_ambiguous() -> EffectOutcome[str]:
+        return EffectOutcome(
+            "not-proven",
+            EffectStatus.UNKNOWN_OUTCOME,
+            error="readback unavailable",
+        )
+
+    assert asyncio.run(
+        runner.reconcile_async(command, still_ambiguous)
+    ) == "not-proven"
+    assert store.pending_commands()[0].state == "unknown_outcome"
+    first_receipt = store.effect_receipt(command.command_id)
+    assert first_receipt is not None
+    assert first_receipt.error == "RuntimeError: reply lost"
+
+    async def proven() -> EffectOutcome[str]:
+        return EffectOutcome(
+            "comment-1",
+            EffectStatus.SUCCEEDED,
+            remote_object_id="comment-1",
+        )
+
+    assert asyncio.run(runner.reconcile_async(command, proven)) == "comment-1"
+    assert store.pending_commands() == ()
+    final_receipt = store.effect_receipt(command.command_id)
+    assert final_receipt is not None
+    assert final_receipt.status is EffectStatus.SUCCEEDED
+    assert final_receipt.remote_object_id == "comment-1"
+
+
+def test_null_async_reconciliation_preserves_existing_unknown_receipt(
+    tmp_path,
+) -> None:
+    runner, store = _runner(tmp_path)
+    command = _command()
+    runner.enqueue(command)
+
+    with pytest.raises(RuntimeError, match="reply lost"):
+        runner.execute(command, _reply_lost)
+
+    async def missing_outcome() -> EffectOutcome[None]:
+        return cast(Any, None)
+
+    with pytest.raises(TypeError, match="returned no outcome"):
+        asyncio.run(runner.reconcile_async(command, missing_outcome))
+
+    assert store.pending_commands()[0].state == "unknown_outcome"
+    receipt = store.effect_receipt(command.command_id)
+    assert receipt is not None
+    assert receipt.error == "RuntimeError: reply lost"
 
 
 def test_async_effect_finishes_before_owner_retirement_can_commit(

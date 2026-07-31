@@ -136,6 +136,21 @@ class DurableEffectRunner:
             self._commit_receipt(receipt)
             return outcome.value
 
+    async def reconcile_async(
+        self,
+        command: LifecycleCommand,
+        operation: Callable[[], Awaitable[EffectOutcome[T]]],
+    ) -> T:
+        """Reconcile ambiguity and receipt proven success under one authority."""
+
+        with self.authority.effect():
+            started = self.now()
+            outcome = await operation()
+            receipt = self._outcome_receipt(command, started, outcome)
+            if receipt.status is EffectStatus.SUCCEEDED:
+                self.control.resolve_unknown_effect(receipt)
+            return outcome.value
+
     def record_existing(
         self,
         command: LifecycleCommand,

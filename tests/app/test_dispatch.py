@@ -434,6 +434,18 @@ def _jira_dispatcher(gw, store, runner):
     return AgentDispatcher(cfg, gw, store, None, runner, executor)
 
 
+def test_jira_dispatch_keeps_command_attribution_separate_from_authority():
+    owner = "o/r:steward:deployment-1"
+    cfg = DispatchConfig(
+        repo="o/r",
+        command_identity=f"{owner}:jira",
+        deployment_owner_id=owner,
+    ).jira_workflow_config()
+
+    assert cfg.command_identity == f"{owner}:jira"
+    assert cfg.deployment_owner_id == owner
+
+
 def _issue(n, *labels):
     return IssueView(n, title="t", body="b", labels=frozenset(labels))
 

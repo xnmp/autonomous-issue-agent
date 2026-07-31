@@ -1,9 +1,13 @@
 """Steward and Jira workflow wiring tests."""
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
+
+import pytest
 
 from tests.fakes.legacy_journal import Journal
-from issue_agent.adapters.control_store import SQLiteControlStore
+from issue_agent.adapters.control_store import RetiredOwnerError, SQLiteControlStore
 from issue_agent.adapters.journal import read_events
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.workflows.jira import JiraSyncWorkflow, JiraSyncWorkflowConfig
@@ -472,20 +476,49 @@ def test_jira_sync_created_without_key_logs_and_retries():
     ]
 
 
-def _durable_jira_workflow(tmp_path, gateway, state, runner, logs=None):
+def _durable_jira_workflow(
+    tmp_path,
+    gateway,
+    state,
+    runner,
+    logs=None,
+    *,
+    deployment_owner_id="o/r:steward:test",
+):
     commands = SQLiteControlStore(str(tmp_path / "control.db"))
     commands.initialize()
     cfg = JiraSyncWorkflowConfig(
         jira=JiraTaskConfig(project_key="PROJ", repo="o/r"),
         log=(logs or []).append,
         repository="o/r",
-        command_identity="o/r:steward:test:jira",
+        command_identity=f"{deployment_owner_id}:jira",
+        deployment_owner_id=deployment_owner_id,
         config_version="cfg",
     )
     return (
         JiraSyncWorkflow(cfg, gateway, state, runner, commands),
         commands,
     )
+
+
+def test_durable_jira_requires_explicit_deployment_owner(tmp_path):
+    commands = SQLiteControlStore(str(tmp_path / "control.db"))
+    commands.initialize()
+    cfg = JiraSyncWorkflowConfig(
+        jira=JiraTaskConfig(project_key="PROJ", repo="o/r"),
+        log=lambda _message: None,
+        repository="o/r",
+        command_identity="o/r:steward:deployment-1:jira",
+    )
+
+    with pytest.raises(ValueError, match="deployment owner"):
+        JiraSyncWorkflow(
+            cfg,
+            FakeGateway(),
+            FakeStore(),
+            FakeRunner(AgentResult(is_error=False)),
+            commands,
+        )
 
 
 def test_jira_create_has_durable_command_and_success_receipt(tmp_path):
@@ -575,6 +608,91 @@ def test_jira_unknown_create_reconciles_before_retry_without_duplicate_intent(
         assert db.execute(
             "SELECT state FROM lifecycle_commands"
         ).fetchone()[0] == "succeeded"
+
+
+def test_jira_reconcile_holds_base_owner_authority_through_success_receipt(
+    tmp_path,
+):
+    gateway = FakeGateway(issues={5: IssueView(
+        5,
+        title="Fix bug",
+        body="body",
+        labels=frozenset({Label.AI_READY}),
+        updated_at="revision-1",
+    )})
+    state = FakeStore()
+    reconcile_entered = Event()
+    release_reconcile = Event()
+
+    class BlockingReconcileRunner:
+        def __init__(self):
+            self.calls = 0
+
+        async def run(self, _task):
+            self.calls += 1
+            if self.calls == 1:
+                return AgentResult(
+                    is_error=True,
+                    status="error",
+                    summary="reply lost",
+                )
+            reconcile_entered.set()
+            while not release_reconcile.is_set():
+                await asyncio.sleep(0.01)
+            return AgentResult(
+                is_error=False,
+                status="nothing",
+                structured={"ticket_key": "PROJ-7"},
+            )
+
+    old_owner = "o/r:steward:deployment-1"
+    new_owner = "o/r:steward:deployment-2"
+    runner = BlockingReconcileRunner()
+    workflow, commands = _durable_jira_workflow(
+        tmp_path,
+        gateway,
+        state,
+        runner,
+        deployment_owner_id=old_owner,
+    )
+    asyncio.run(workflow.sync(5))
+    pending = commands.pending_commands()[0]
+    assert pending.state == "unknown_outcome"
+    assert pending.command.executor_identity == f"{old_owner}:jira"
+
+    retirement_done = Event()
+
+    def retire() -> None:
+        successor = SQLiteControlStore(commands.path)
+        successor.initialize()
+        successor.adopt_legacy_owner(
+            "o/r",
+            "steward",
+            new_owner,
+            prior_owner_ids=(old_owner,),
+        )
+        retirement_done.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        reconciliation = pool.submit(
+            lambda: asyncio.run(workflow.sync(5))
+        )
+        assert reconcile_entered.wait(timeout=1)
+        retirement = pool.submit(retire)
+        assert not retirement_done.wait(timeout=0.1)
+        release_reconcile.set()
+        reconciliation.result(timeout=1)
+        retirement.result(timeout=1)
+
+    receipt = commands.effect_receipt(pending.command.command_id)
+    assert receipt is not None
+    assert receipt.executor_identity == f"{old_owner}:jira"
+    assert receipt.status.value == "succeeded"
+    assert state.get_jira_key(5) == "PROJ-7"
+    assert retirement_done.is_set()
+    assert workflow.effects is not None
+    with pytest.raises(RetiredOwnerError, match="deployment-2"):
+        workflow.effects.authorized(lambda: None)
 
 
 def test_jira_invalid_returned_key_never_reaches_state_or_later_prompt(

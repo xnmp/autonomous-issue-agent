@@ -77,7 +77,10 @@ SQLite transaction across network I/O. Commands already adopted by a successor
 remain recoverable, while the retired publisher cannot cross the completed
 repoint. A single durable-effect runner now owns lifecycle transitions and
 receipts for GitHub actions, paid publication, operator/bootstrap commands, and
-Jira sync; an architecture test rejects new independent transition machines.
+Jira sync. Jira command attribution remains namespaced while retirement checks
+the base deployment owner, and reconcile-first agent execution holds that
+authority through the proven-success receipt. An architecture test rejects new
+independent transition machines.
 Reservation sweeping likewise feeds observed lease, spend, and atomic-release
 results through one pure domain state machine, keeping policy out of the
 coordinator while SQLite rechecks release eligibility. Event-log readers,

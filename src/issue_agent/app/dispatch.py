@@ -97,6 +97,7 @@ class DispatchConfig:
     role: str = ""
     repo: str = ""
     command_identity: str = ""
+    deployment_owner_id: str = ""
     config_version: str = ""
     # The ceiling this role's decide side reads off the infra-death counter
     # (fix: max_infra_deaths; review: max_unproductive_rounds). Used ONLY to
@@ -159,6 +160,7 @@ class DispatchConfig:
             log=self.log,
             repository=self.repo,
             command_identity=self.command_identity,
+            deployment_owner_id=self.deployment_owner_id,
             config_version=self.config_version,
         )
 

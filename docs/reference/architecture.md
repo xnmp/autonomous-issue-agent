@@ -55,10 +55,13 @@ tests pass.
    `LifecycleCommand`s and are executed by `GitHubEffectExecutor` or
    `GitHubOperatorEffects` with an idempotency key, expected revision, and
    receipt. `DurableEffectRunner` alone owns the command transition/receipt
-   protocol. Deployment-scoped effects hold shared `DeploymentAuthority`; a
-   repoint takes the same repo/role lock exclusively, so an old mutation either
-   completes before retirement or fails its owner check after it. Peer effects
-   remain concurrent and no SQLite transaction spans network I/O. This includes
+   protocol, including reconcile-first async effects. Command/receipt identities
+   may be subsystem-namespaced for recovery and attribution, but authority is
+   always checked against the base deployment owner. Deployment-scoped effects
+   hold shared `DeploymentAuthority`; a repoint takes the same repo/role lock
+   exclusively, so an old mutation either completes before retirement or fails
+   its owner check after it. Peer effects remain concurrent and no SQLite
+   transaction spans network I/O. This includes
    CLI/dashboard labels, bootstrap settings, base-branch creation, Jira sync,
    and webhook relay lifecycle. Paid agents publish branches and open PRs
    through `issue-agent-publish`; `AgentPublicationBroker` commits
