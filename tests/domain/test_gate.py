@@ -136,8 +136,22 @@ def test_commit_log_scoped_order():
 
 def test_red_is_red_matches_scoped():
     # a scoped red commit still triggers the red-is-red suite check
-    assert check_red_is_red("test(red): t", "pytest", lambda _c: True).ok is False
-    assert check_red_is_red("test(red): t", "pytest", lambda _c: False).ok is True
+    assert (
+        check_red_is_red(
+            "test(red): t",
+            "pytest",
+            lambda _c: execution(ExecutionStatus.PASSED),
+        ).ok
+        is False
+    )
+    assert (
+        check_red_is_red(
+            "test(red): t",
+            "pytest",
+            lambda _c: execution(ExecutionStatus.TEST_FAILED),
+        ).ok
+        is True
+    )
 
 
 def test_commit_log_rejects_bad_prefix():
@@ -483,22 +497,50 @@ def test_red_fail_rejects_timeout_and_infrastructure_failure_as_evidence():
 # ── verify-red-at-commit (fail-fast on the red commit) ────────────────────────
 def test_red_is_red_only_fires_on_red_commit():
     # a green:/other commit is never subject to this check, even if tests pass.
-    assert check_red_is_red("green: impl", "pytest", lambda c: True).ok
-    assert check_red_is_red("plan: types", "pytest", lambda c: True).ok
+    passed = lambda _c: execution(ExecutionStatus.PASSED)
+    assert check_red_is_red("green: impl", "pytest", passed).ok
+    assert check_red_is_red("plan: types", "pytest", passed).ok
 
 
 def test_red_is_red_blocks_passing_red_commit():
-    res = check_red_is_red("red: add failing test", "pytest", lambda c: True)
+    res = check_red_is_red(
+        "red: add failing test",
+        "pytest",
+        lambda _c: execution(ExecutionStatus.PASSED),
+    )
     assert not res.ok and "not" in res.reason.lower()
 
 
 def test_red_is_red_allows_failing_red_commit():
-    assert check_red_is_red("red: add failing test", "pytest", lambda c: False).ok
+    assert check_red_is_red(
+        "red: add failing test",
+        "pytest",
+        lambda _c: execution(ExecutionStatus.TEST_FAILED),
+    ).ok
+
+
+def test_red_is_red_rejects_non_test_failures():
+    timeout = check_red_is_red(
+        "red: add failing test",
+        "pytest",
+        lambda _c: execution(ExecutionStatus.TIMED_OUT),
+    )
+    infra = check_red_is_red(
+        "red: add failing test",
+        "pytest",
+        lambda _c: execution(ExecutionStatus.INFRA_ERROR),
+    )
+
+    assert not timeout.ok and "timed out" in timeout.reason
+    assert not infra.ok and "infrastructure" in infra.reason
 
 
 def test_red_is_red_skips_when_no_cmd_or_disabled():
-    assert check_red_is_red("red: t", "", lambda c: True).ok            # no test cmd
-    assert check_red_is_red("red: t", "pytest", lambda c: True, enabled=False).ok
+    passed = lambda _c: execution(ExecutionStatus.PASSED)
+    assert check_red_is_red("red: t", "", passed).ok
+    assert check_red_is_red(
+        "red: t", "pytest", passed, enabled=False
+    ).ok
 
 
 # ── push-gate precondition: the open-PR lookup (check-push.sh) ────────────────

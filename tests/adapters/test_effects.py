@@ -7,6 +7,7 @@ from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.effects import GitHubEffectExecutor, command_for_action
 from issue_agent.domain.actions import (
     AddDependency,
+    CloseIssue,
     EnableAutoMerge,
     PostComment,
     Relabel,
@@ -31,6 +32,7 @@ class Gateway:
         self.advance_before_auto_merge = ""
         self.advance_before_update = ""
         self.advance_before_review = ""
+        self.issue_closures = {}
 
     def relabel(self, kind, number, remove, add):
         self.calls.append(("relabel", kind, number, remove, add))
@@ -48,6 +50,15 @@ class Gateway:
 
     def has_comment(self, kind, number, body):
         return (kind, number, body) in self.comments
+
+    def close_issue(self, number, reason, comment):
+        self.calls.append(("close", number, reason, comment))
+        self.issue_closures[number] = (True, reason)
+        if comment:
+            self.comments.add(("issue", number, comment))
+
+    def issue_closure(self, number):
+        return self.issue_closures.get(number, (False, ""))
 
     def get_pr(self, pr, *, mergeability=True, checks=True):
         del mergeability, checks
@@ -177,6 +188,63 @@ def test_ambiguous_comment_is_reconciled_before_any_retry(tmp_path) -> None:
 
     assert gateway.calls == [("comment", "issue", 4, "done")]
     assert store.pending_commands() == ()
+
+
+def test_close_issue_applies_comment_then_exact_close_state(tmp_path) -> None:
+    executor, gateway, store = _executor(tmp_path)
+
+    assert executor.execute(CloseIssue(4, "completed", "done"))
+
+    assert gateway.calls == [
+        ("comment", "issue", 4, "done"),
+        ("close", 4, "completed", ""),
+    ]
+    assert gateway.issue_closure(4) == (True, "completed")
+    assert gateway.has_comment("issue", 4, "done")
+    assert store.pending_commands() == ()
+
+
+def test_partial_close_recovery_restores_missing_comment_without_reclosing(
+    tmp_path,
+) -> None:
+    executor, gateway, store = _executor(tmp_path)
+    action = CloseIssue(4, "completed", "done")
+    command = executor._command(action)
+    store.enqueue_command(command)
+    store.begin_command(command.command_id)
+    gateway.issue_revision = "issue-rev-after-close"
+    gateway.issue_closures[4] = (True, "completed")
+
+    assert executor.execute(action)
+
+    assert gateway.calls == [("comment", "issue", 4, "done")]
+    assert gateway.has_comment("issue", 4, "done")
+    assert store.pending_commands() == ()
+    with store._connect() as db:
+        state, attempts = db.execute(
+            "SELECT state, attempts FROM lifecycle_commands"
+        ).fetchone()
+        status = db.execute(
+            "SELECT status FROM effect_receipts"
+        ).fetchone()[0]
+    assert (state, attempts, status) == ("succeeded", 2, "succeeded")
+
+
+def test_close_issue_reconciliation_requires_reason_and_comment(
+    tmp_path,
+) -> None:
+    executor, gateway, _ = _executor(tmp_path)
+    action = CloseIssue(4, "completed", "done")
+    gateway.issue_closures[4] = (True, "not_planned")
+    gateway.comments.add(("issue", 4, "done"))
+    assert executor._reconcile(action) is False
+
+    gateway.issue_closures[4] = (True, "completed")
+    gateway.comments.clear()
+    assert executor._reconcile(action) is False
+
+    gateway.comments.add(("issue", 4, "done"))
+    assert executor._reconcile(action) is True
 
 
 def test_legacy_unknown_comment_is_adopted_and_reconciled_without_duplicate(

@@ -168,24 +168,60 @@ def test_green_with_red_allowed():
 
 # ── verify-red-at-commit through the adapter ──────────────────────────────────
 def test_red_commit_blocked_when_tests_pass():
-    c = ctx(harness_test_cmd="pytest", run_tests=lambda cmd: True)  # tests PASS at red
+    c = ctx(
+        harness_test_cmd="pytest",
+        run_red_tests=lambda _cmd: execution(True),
+    )
     v = evaluate_command("git commit -m 'red: add test'", c)
     assert not v.allowed and "PASS" in v.reason
 
 
 def test_red_commit_allowed_when_tests_fail():
-    c = ctx(harness_test_cmd="pytest", run_tests=lambda cmd: False)  # genuinely red
+    c = ctx(
+        harness_test_cmd="pytest",
+        run_red_tests=lambda _cmd: execution(False),
+    )
     assert evaluate_command("git commit -m 'red: add test'", c).allowed
 
 
 def test_red_commit_allowed_when_verification_disabled():
-    c = ctx(harness_test_cmd="pytest", run_tests=lambda cmd: True, verify_red_at_commit=False)
+    c = ctx(
+        harness_test_cmd="pytest",
+        run_red_tests=lambda _cmd: execution(True),
+        verify_red_at_commit=False,
+    )
     assert evaluate_command("git commit -m 'red: add test'", c).allowed
 
 
 def test_red_commit_allowed_with_no_test_cmd():
     # no resolvable test command → no teeth here (PR-time §10 still applies).
-    assert evaluate_command("git commit -m 'red: add test'", ctx(run_tests=lambda cmd: True)).allowed
+    assert evaluate_command(
+        "git commit -m 'red: add test'",
+        ctx(run_red_tests=lambda _cmd: execution(True)),
+    ).allowed
+
+
+def test_red_commit_denied_when_test_execution_times_out():
+    timeout = ExecutionReceipt(
+        ExecutionStatus.TIMED_OUT,
+        ("pytest",),
+        None,
+        1,
+        "stdout",
+        "stderr",
+        "verifier",
+        "deadbeef",
+    )
+    verdict = evaluate_command(
+        "git commit -m 'red: add test'",
+        ctx(
+            harness_test_cmd="pytest",
+            run_red_tests=lambda _cmd: timeout,
+        ),
+    )
+
+    assert not verdict.allowed
+    assert "timed out" in verdict.reason
 
 
 # ── PR gate ───────────────────────────────────────────────────────────────────

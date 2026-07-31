@@ -276,32 +276,36 @@ class AgentPublicationBroker:
         argv = tuple(str(item) for item in payload["argv"])
         cwd = str(payload["cwd"])
         if command.kind is CommandKind.OPEN_PULL_REQUEST:
-            current_head = self._required_output(
-                ("git", "rev-parse", "HEAD"), cwd, "local HEAD"
-            )
-            current_branch = self._required_output(
-                ("git", "branch", "--show-current"),
-                cwd,
-                "current branch",
-            )
+            try:
+                current_head = self._required_output(
+                    ("git", "rev-parse", "HEAD"), cwd, "local HEAD"
+                )
+                current_branch = self._required_output(
+                    ("git", "branch", "--show-current"),
+                    cwd,
+                    "current branch",
+                )
+            except RuntimeError as exc:
+                self._record_started_failure(
+                    command,
+                    started,
+                    EffectStatus.RETRYABLE_FAILURE,
+                    str(exc),
+                )
+                return CommandResult(75, stderr=str(exc))
             if (
                 current_head != command.expected_revision
                 or current_branch != str(payload["branch"])
             ):
-                now = datetime.now(timezone.utc)
-                self.store.begin_command(command.command_id)
-                self.store.record_effect(
-                    EffectReceipt(
-                        command.command_id,
-                        self.identity,
-                        now,
-                        now,
-                        EffectStatus.PERMANENT_FAILURE,
-                        error=(
-                            "local branch revision changed before pull-request "
-                            "creation"
-                        ),
-                    )
+                error = (
+                    "local branch revision changed before pull-request "
+                    "creation"
+                )
+                self._record_started_failure(
+                    command,
+                    started,
+                    EffectStatus.PERMANENT_FAILURE,
+                    error,
                 )
                 return CommandResult(
                     75,
@@ -313,21 +317,28 @@ class AgentPublicationBroker:
             remote_head = self._remote_branch(
                 str(payload["remote_url"]), str(payload["branch"]), cwd
             )
+            if remote_head is None:
+                error = (
+                    "cannot verify remote branch revision before pull-request "
+                    "creation"
+                )
+                self._record_started_failure(
+                    command,
+                    started,
+                    EffectStatus.RETRYABLE_FAILURE,
+                    error,
+                )
+                return CommandResult(75, stderr=error)
             if remote_head != command.expected_revision:
-                now = datetime.now(timezone.utc)
-                self.store.begin_command(command.command_id)
-                self.store.record_effect(
-                    EffectReceipt(
-                        command.command_id,
-                        self.identity,
-                        now,
-                        now,
-                        EffectStatus.PERMANENT_FAILURE,
-                        error=(
-                            "remote branch revision changed before "
-                            "pull-request creation"
-                        ),
-                    )
+                error = (
+                    "remote branch revision changed before pull-request "
+                    "creation"
+                )
+                self._record_started_failure(
+                    command,
+                    started,
+                    EffectStatus.PERMANENT_FAILURE,
+                    error,
                 )
                 return CommandResult(
                     75,
@@ -338,6 +349,12 @@ class AgentPublicationBroker:
                 )
         authority_error = self._origin_authority_error(command)
         if authority_error:
+            self._record_started_failure(
+                command,
+                started,
+                EffectStatus.RETRYABLE_FAILURE,
+                authority_error,
+            )
             return CommandResult(75, stderr=authority_error)
         if (
             command.kind is CommandKind.PUBLISH_BRANCH
@@ -858,6 +875,29 @@ class AgentPublicationBroker:
             remote_object_id=self._remote_object(command),
             remote_revision=command.expected_revision,
             error=None,
+        )
+
+    def _record_started_failure(
+        self,
+        command: LifecycleCommand,
+        started: datetime,
+        status: EffectStatus,
+        error: str,
+    ) -> None:
+        if status not in {
+            EffectStatus.RETRYABLE_FAILURE,
+            EffectStatus.PERMANENT_FAILURE,
+        }:
+            raise ValueError("started publication failures require a terminal verdict")
+        self.store.record_effect(
+            EffectReceipt(
+                command.command_id,
+                self.identity,
+                started,
+                datetime.now(timezone.utc),
+                status,
+                error=error,
+            )
         )
 
 

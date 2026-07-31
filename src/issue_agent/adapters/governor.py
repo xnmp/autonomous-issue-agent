@@ -57,6 +57,20 @@ def _no_check(_cmd: str) -> bool:
     return True
 
 
+def _unbound_test_execution(_cmd: str) -> TestExecution:
+    """Fail closed when a context omits the trusted red-test executor."""
+    return TestExecution(
+        TestExecutionStatus.INFRA_ERROR,
+        ("unbound",),
+        127,
+        0,
+        "",
+        "",
+        "unbound",
+        "unknown",
+    )
+
+
 # ── worktree facts the gate rules need (injected; built from git) ─────────────
 @dataclass(frozen=True)
 class GateContext:
@@ -98,6 +112,7 @@ class GateContext:
     allow_untested: bool = False
     exists_at_base: Callable[[str], bool] = lambda f: False
     run_tests: Callable[[str], bool | None] = lambda c: True
+    run_red_tests: Callable[[str], TestExecution] = _unbound_test_execution
     revert_and_run: Callable[[tuple[str, ...]], TestExecution] = lambda impl: TestExecution(
         TestExecutionStatus.INFRA_ERROR,
         ("unbound",),
@@ -587,7 +602,7 @@ def _gate_commit(
             return Verdict(False, result.reason)
     test_cmd = gate.resolve_test_cmd(ctx.harness_test_cmd, ctx.env_test_cmd)
     red = gate.check_red_is_red(
-        message, test_cmd, ctx.run_tests, ctx.verify_red_at_commit
+        message, test_cmd, ctx.run_red_tests, ctx.verify_red_at_commit
     )
     return Verdict(red.ok, red.reason)
 

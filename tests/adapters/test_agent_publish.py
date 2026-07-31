@@ -411,6 +411,104 @@ def test_pr_literal_body_is_snapshotted_before_command_commit(tmp_path):
     assert effect[effect.index("--base") + 1] == "dev"
 
 
+def test_pr_publication_records_local_revision_drift_without_stranding(
+    tmp_path,
+):
+    remote = Remote()
+    remote.remote = remote.head
+    control = store(tmp_path)
+    publisher = AgentPublicationBroker(
+        control,
+        repository="o/r",
+        base_branch="dev",
+        owner="o/r:fix",
+        run=remote.run,
+    )
+    command = publisher._command(
+        (
+            "gh",
+            "pr",
+            "create",
+            "--base",
+            "dev",
+            "--title",
+            "Fix",
+            "--body",
+            "Fixes #42",
+        ),
+        str(tmp_path),
+    )
+    pending = control.enqueue_command(command)
+    remote.head = "new-local-head"
+
+    result = publisher._run_pending(pending)
+
+    assert result.code == 75
+    assert remote.effects == []
+    with control._connect() as db:
+        state, attempts = db.execute(
+            "SELECT state, attempts FROM lifecycle_commands"
+        ).fetchone()
+        statuses = tuple(
+            row[0]
+            for row in db.execute(
+                "SELECT status FROM effect_receipts"
+            ).fetchall()
+        )
+    assert (state, attempts) == ("permanent_failure", 1)
+    assert statuses == ("permanent_failure",)
+    assert publisher.drain_pending_commands() == 0
+
+
+def test_pr_publication_records_remote_revision_drift_without_stranding(
+    tmp_path,
+):
+    remote = Remote()
+    remote.remote = remote.head
+    control = store(tmp_path)
+    publisher = AgentPublicationBroker(
+        control,
+        repository="o/r",
+        base_branch="dev",
+        owner="o/r:fix",
+        run=remote.run,
+    )
+    command = publisher._command(
+        (
+            "gh",
+            "pr",
+            "create",
+            "--base",
+            "dev",
+            "--title",
+            "Fix",
+            "--body",
+            "Fixes #42",
+        ),
+        str(tmp_path),
+    )
+    pending = control.enqueue_command(command)
+    remote.remote = "new-remote-head"
+
+    result = publisher._run_pending(pending)
+
+    assert result.code == 75
+    assert remote.effects == []
+    with control._connect() as db:
+        state, attempts = db.execute(
+            "SELECT state, attempts FROM lifecycle_commands"
+        ).fetchone()
+        statuses = tuple(
+            row[0]
+            for row in db.execute(
+                "SELECT status FROM effect_receipts"
+            ).fetchall()
+        )
+    assert (state, attempts) == ("permanent_failure", 1)
+    assert statuses == ("permanent_failure",)
+    assert publisher.drain_pending_commands() == 0
+
+
 @pytest.mark.parametrize(
     "file_args",
     (

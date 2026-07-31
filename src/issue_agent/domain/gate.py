@@ -780,7 +780,10 @@ def check_push_target(targets: tuple[str, ...] | None) -> GateResult:
 
 
 def check_red_is_red(
-    commit_msg: str, test_cmd: str, run_tests: Callable[[str], bool | None], enabled: bool = True
+    commit_msg: str,
+    test_cmd: str,
+    run_tests: Callable[[str], TestExecution],
+    enabled: bool = True,
 ) -> GateResult:
     """Verify a `red:` commit is ACTUALLY red — run the test command on the working
     tree at commit time and require it to FAIL. The commit-order gate only checks the
@@ -798,16 +801,25 @@ def check_red_is_red(
         return ALLOW
     if not test_cmd:
         return ALLOW
-    passed = run_tests(test_cmd)
-    if passed is None:
+    execution = run_tests(test_cmd)
+    if execution.status is TestExecutionStatus.TEST_FAILED:
+        return ALLOW
+    if execution.status is TestExecutionStatus.TIMED_OUT:
         return deny(
-            f"GATE RECURSION: the test command re-entered the harness gate and was "
-            f"refused (see #63) — cannot verify this red: commit is actually red. "
-            f"Fix the test-command configuration (self-referential "
-            f"TEST_CMD/.harness/test-cmd): {test_cmd}"
+            f"the test command timed out, so it cannot prove this red: commit "
+            f"contains a failing test: {test_cmd}"
         )
-    if not passed:
-        return ALLOW  # tests fail → genuinely red → good
+    if execution.status is TestExecutionStatus.CANCELLED:
+        return deny(
+            f"the test command was cancelled, so it cannot prove this red: "
+            f"commit contains a failing test: {test_cmd}"
+        )
+    if execution.status is TestExecutionStatus.INFRA_ERROR:
+        return deny(
+            f"test infrastructure failed, so it cannot prove this red: commit "
+            f"contains a failing test. Check the test command and gate "
+            f"configuration: {test_cmd}"
+        )
     return deny(
         f"'red:' commit but the test suite PASSES ({test_cmd}) — the new test is not "
         "actually failing. A red commit must contain a test that FAILS without the "

@@ -657,6 +657,66 @@ def build_gate_context(
 
     rt = run_tests or _default_run_tests
 
+    def receipt(
+        command: str,
+        status: TestExecutionStatus,
+        *,
+        code: int | None = None,
+        output: str = "",
+        started: float | None = None,
+    ) -> TestExecution:
+        revision = git(["rev-parse", "HEAD"], cwd).out.strip() or "unknown"
+        duration_ms = (
+            max(0, round((time.monotonic() - started) * 1000))
+            if started is not None
+            else 0
+        )
+        digest = hashlib.sha256(output.encode()).hexdigest()
+        return TestExecution(
+            status=status,
+            command=("/bin/bash", "-c", command or "<unresolved>"),
+            exit_code=code,
+            duration_ms=duration_ms,
+            stdout_digest=digest,
+            stderr_digest=digest,
+            executor_identity="issue-agent:trusted-verifier",
+            repository_revision=revision,
+        )
+
+    def run_red_tests(cmd: str) -> TestExecution:
+        """Return typed evidence; only TEST_FAILED authorizes a red commit."""
+        started = time.monotonic()
+        if run_tests is not None:
+            passed = rt(cmd)
+            status = (
+                TestExecutionStatus.INFRA_ERROR
+                if passed is None
+                else TestExecutionStatus.PASSED
+                if passed
+                else TestExecutionStatus.TEST_FAILED
+            )
+            code = 127 if passed is None else 0 if passed else 1
+            return receipt(cmd, status, code=code, started=started)
+        rc, output = run_target_command(
+            cmd, cwd, _test_timeout_s(), capture=True
+        )
+        status = classify_test_exit_code(rc, _test_failure_exit_codes())
+        return receipt(
+            cmd,
+            status,
+            code=(
+                None
+                if status
+                in {
+                    TestExecutionStatus.TIMED_OUT,
+                    TestExecutionStatus.CANCELLED,
+                }
+                else 127 if rc is None else rc
+            ),
+            output=output,
+            started=started,
+        )
+
     def revert_and_run(impl_files: tuple[str, ...]) -> TestExecution:
         """§10: drop new impl / revert modified impl to base, run the test cmd,
         restore HEAD, and return a typed trusted-execution receipt. Only an exit
@@ -670,39 +730,17 @@ def build_gate_context(
         # it. One resolver, one order.
         test_cmd = resolve_test_cmd(markers.test_cmd(), env_test_cmd)
 
-        def receipt(
-            status: TestExecutionStatus,
-            *,
-            code: int | None = None,
-            output: str = "",
-            started: float | None = None,
-        ) -> TestExecution:
-            revision = git(["rev-parse", "HEAD"], cwd).out.strip() or "unknown"
-            duration_ms = (
-                max(0, round((time.monotonic() - started) * 1000))
-                if started is not None
-                else 0
-            )
-            digest = hashlib.sha256(output.encode()).hexdigest()
-            return TestExecution(
-                status=status,
-                command=("/bin/bash", "-c", test_cmd or "<unresolved>"),
-                exit_code=code,
-                duration_ms=duration_ms,
-                stdout_digest=digest,
-                stderr_digest=digest,
-                executor_identity="issue-agent:trusted-verifier",
-                repository_revision=revision,
-            )
-
         if not baseref or not test_cmd:
-            return receipt(TestExecutionStatus.INFRA_ERROR, code=127)
+            return receipt(
+                test_cmd, TestExecutionStatus.INFRA_ERROR, code=127
+            )
         started = time.monotonic()
         try:
             for f in impl_files:
                 if exists_at_base(f):
                     if git(["checkout", "-q", baseref, "--", f], cwd).code != 0:
                         return receipt(
+                            test_cmd,
                             TestExecutionStatus.INFRA_ERROR,
                             code=127,
                             started=started,
@@ -722,7 +760,9 @@ def build_gate_context(
                     else TestExecutionStatus.TEST_FAILED
                 )
                 code = 127 if passed is None else 0 if passed else 1
-                return receipt(status, code=code, started=started)
+                return receipt(
+                    test_cmd, status, code=code, started=started
+                )
             rc, output = run_target_command(
                 test_cmd, cwd, _test_timeout_s(), capture=True
             )
@@ -730,6 +770,7 @@ def build_gate_context(
                 rc, _test_failure_exit_codes()
             )
             return receipt(
+                test_cmd,
                 status,
                 code=(
                     None
@@ -761,6 +802,7 @@ def build_gate_context(
         env_test_cmd=env_test_cmd,
         exists_at_base=exists_at_base,
         run_tests=rt,
+        run_red_tests=run_red_tests,
         revert_and_run=revert_and_run,
         red_must_fail=red_must_fail,
         verify_red_at_commit=verify_red_at_commit,

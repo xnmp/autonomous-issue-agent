@@ -311,6 +311,22 @@ def test_close_issue_argv():
     assert "--comment" in argv
 
 
+def test_issue_closure_reads_exact_state_and_reason():
+    fr = FakeRunner(
+        {
+            "issue view 5": {
+                "state": "CLOSED",
+                "stateReason": "COMPLETED",
+            }
+        }
+    )
+    gw = GitHubGateway("o/r", runner=fr)
+
+    assert gw.issue_closure(5) == (True, "completed")
+    argv, _ = fr.calls[0]
+    assert argv[-2:] == ["--json", "state,stateReason"]
+
+
 def test_enable_auto_merge_argv():
     fr = FakeRunner({"pr view 100": {
         "autoMergeRequest": None,

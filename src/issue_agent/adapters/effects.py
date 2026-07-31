@@ -49,8 +49,8 @@ class CommentVerifier(Protocol):
 
 
 @runtime_checkable
-class IssueStateVerifier(Protocol):
-    def is_issue_closed(self, issue: int) -> bool: ...
+class IssueClosureVerifier(Protocol):
+    def issue_closure(self, issue: int) -> tuple[bool, str]: ...
 
 
 @runtime_checkable
@@ -268,6 +268,11 @@ class GitHubEffectExecutor:
                 )
             )
             return False
+        repairing_partial_close = (
+            pending.state != "pending"
+            and isinstance(action, CloseIssue)
+            and self._close_state_matches(action)
+        )
         if pending.state in {
             "executing",
             EffectStatus.UNKNOWN_OUTCOME.value,
@@ -293,7 +298,11 @@ class GitHubEffectExecutor:
                     self._receipt(command, EffectStatus.SUCCEEDED)
                 )
                 return True
-        if pending.state != "pending" and not self._revision_matches(command):
+        if (
+            pending.state != "pending"
+            and not repairing_partial_close
+            and not self._revision_matches(command)
+        ):
             now = datetime.now(timezone.utc)
             self.store.begin_command(command.command_id)
             self.store.record_effect(
@@ -516,7 +525,23 @@ class GitHubEffectExecutor:
             self.gateway.comment(_TARGET[action.target], action.number, action.body)
             return True
         elif isinstance(action, CloseIssue):
-            self.gateway.close_issue(action.number, action.reason, action.comment)
+            if (
+                not isinstance(self.gateway, IssueClosureVerifier)
+                or (
+                    action.comment
+                    and not isinstance(self.gateway, CommentVerifier)
+                )
+            ):
+                self.gateway.close_issue(
+                    action.number, action.reason, action.comment
+                )
+                return True
+            if action.comment and not self.gateway.has_comment(
+                "issue", action.number, action.comment
+            ):
+                self.gateway.comment("issue", action.number, action.comment)
+            if not self._close_state_matches(action):
+                self.gateway.close_issue(action.number, action.reason, "")
             return True
         elif isinstance(action, EnableAutoMerge):
             if command is None or not command.expected_revision:
@@ -597,9 +622,17 @@ class GitHubEffectExecutor:
                 _TARGET[action.target], action.number, action.body
             )
         if isinstance(action, CloseIssue):
-            if not isinstance(self.gateway, IssueStateVerifier):
+            if not isinstance(self.gateway, IssueClosureVerifier):
                 return None
-            return self.gateway.is_issue_closed(action.number)
+            if not self._close_state_matches(action):
+                return False
+            if not action.comment:
+                return True
+            if not isinstance(self.gateway, CommentVerifier):
+                return None
+            return self.gateway.has_comment(
+                "issue", action.number, action.comment
+            )
         if isinstance(action, EscalateCiPending):
             if not isinstance(
                 self.gateway, CommentVerifier
@@ -663,6 +696,12 @@ class GitHubEffectExecutor:
                 return None
             return self.gateway.has_blocked_by(action.issue, action.blocker)
         return None
+
+    def _close_state_matches(self, action: CloseIssue) -> bool:
+        if not isinstance(self.gateway, IssueClosureVerifier):
+            return False
+        closed, reason = self.gateway.issue_closure(action.number)
+        return closed and reason.lower() == action.reason.lower()
 
     def reconcile(self, action: Action) -> bool | None:
         return self._reconcile(action)

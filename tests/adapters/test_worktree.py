@@ -439,6 +439,21 @@ def test_default_run_tests_denies_on_timeout(tmp_path, monkeypatch, capsys):
     assert "1" in err  # names the configured timeout
 
 
+def test_red_commit_runner_classifies_timeout_as_non_authorizing(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("GATE_TEST_TIMEOUT_S", "1")
+    context = build_gate_context(
+        str(tmp_path), base_branch="dev", git=_builder_git()
+    )
+
+    execution = context.run_red_tests("sleep 5")
+
+    assert execution.status is ExecutionStatus.TIMED_OUT
+    assert execution.exit_code is None
+    assert "timed out" in capsys.readouterr().err.lower()
+
+
 def test_default_run_tests_passes_fast_command_unaffected(tmp_path, monkeypatch):
     """The timeout must not disturb the ordinary (fast, well-behaved) case."""
     monkeypatch.setenv("GATE_TEST_TIMEOUT_S", "5")

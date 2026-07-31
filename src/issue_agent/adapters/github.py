@@ -1617,6 +1617,26 @@ class GitHubGateway:
         ])
         return isinstance(data, dict) and str(data.get("state") or "").upper() == "CLOSED"
 
+    def issue_closure(self, number: int) -> tuple[bool, str]:
+        """Strict close-effect readback; unlike recurrence reads, failures raise."""
+        data = self._gh_json(
+            [
+                "issue",
+                "view",
+                str(number),
+                "--repo",
+                self.repo,
+                "--json",
+                "state,stateReason",
+            ]
+        )
+        if not isinstance(data, dict):
+            return False, ""
+        return (
+            str(data.get("state") or "").upper() == "CLOSED",
+            str(data.get("stateReason") or "").lower(),
+        )
+
     def has_review(self, pr: int, event: str, body: str, head: str) -> bool:
         state = {
             "APPROVE": "APPROVED",
