@@ -254,6 +254,85 @@ def test_production_dashboard_today_spend_comes_from_sqlite_not_telemetry(
     )
 
 
+@pytest.mark.parametrize("control_state", ["missing", "invalid"])
+def test_unavailable_sqlite_spend_preserves_dashboard_history(
+    tmp_path,
+    control_state,
+) -> None:
+    control_db = tmp_path / "control.db"
+    if control_state == "invalid":
+        control_db.write_text("not a SQLite database")
+    state = tmp_path / "fix"
+    state.mkdir()
+    events = EventLog(
+        str(state / "events-v2.jsonl"),
+        Producer("deployment", "owner/repo", "fix", 100, "boot"),
+    )
+    events.emit(
+        WorldObserved(
+            "issue",
+            7,
+            "present",
+            {"present": True, "state": "open", "labels": ["ai-working"]},
+        ),
+        correlation=Correlation(issue=7),
+        causation_time=NOW,
+    )
+    events.emit(
+        SpendRecorded(
+            "journalled-run",
+            700_000,
+            "USD",
+            "configured_rate_card",
+            "card",
+            "v1",
+        ),
+        correlation=Correlation(issue=7, run_id="journalled-run"),
+        causation_time=NOW,
+    )
+    journal_paths = [
+        str(state / "journal.jsonl"),
+        str(tmp_path / "review" / "journal.jsonl"),
+        str(tmp_path / "steward" / "journal.jsonl"),
+    ]
+
+    deployment = collect(
+        "demo",
+        "owner/repo",
+        journal_paths,
+        str(tmp_path / "logs"),
+        str(tmp_path / "spend.jsonl"),
+        now_fn=lambda: NOW,
+        control_db_path=str(control_db),
+    )
+    snapshot = system.collect_snapshot(
+        name="demo",
+        repo="owner/repo",
+        target_dir=str(tmp_path),
+        journal_paths=journal_paths,
+        log_dir=str(tmp_path / "logs"),
+        ledger_path=str(tmp_path / "spend.jsonl"),
+        now_fn=lambda: NOW,
+        stale_after_s=60,
+        control_db_path=str(control_db),
+    )
+
+    for observed in (deployment, snapshot.deployment):
+        assert observed.issues[0].cost_usd == 0.7
+        assert observed.metrics.total_cost_usd == 0.7
+        assert observed.metrics.today_usd is None
+        assert any(
+            warning.startswith("settled SQLite spend unavailable:")
+            for warning in observed.warnings
+        )
+    assert "today (settled SQLite, this repo): unavailable" in render_text(
+        [deployment], now_fn=lambda: NOW
+    )
+    assert ">unavailable<" in render_html(
+        [deployment], now_fn=lambda: NOW
+    )
+
+
 def test_v2_unattributed_events_keep_cost_and_guardrail_metrics(tmp_path):
     state = tmp_path / "fix"
     state.mkdir()

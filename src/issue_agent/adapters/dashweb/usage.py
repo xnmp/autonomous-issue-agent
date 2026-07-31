@@ -372,18 +372,21 @@ def harness_usage(
         period.period_start,
         period.period_end,
     )
+    if spend.total is None:
+        raise RuntimeError(spend.detail or "settled spend is unavailable")
     per_repo = []
     global_cap = 0.0
     for name in names:
         repo, daily_cap, configured_global_cap = config_for(name)
+        repository_spend = spend.for_repository(repo) if repo else None
         per_repo.append(
             {
                 "name": name,
                 "repo": repo,
                 "today_usd": round(
                     (
-                        spend.for_repository(repo).micros
-                        if repo
+                        repository_spend.micros
+                        if repository_spend is not None
                         else 0
                     )
                     / 1_000_000,
@@ -412,7 +415,11 @@ def usage_payload(names, config_for, fetch=None) -> dict:
         harness = harness_usage(names, config_for)
         harness_error = ""
     except Exception as exc:  # noqa: BLE001
-        harness = {"global_daily_cap_usd": None, "today_all_repos_usd": 0.0, "per_repo": []}
+        harness = {
+            "global_daily_cap_usd": None,
+            "today_all_repos_usd": None,
+            "per_repo": [],
+        }
         harness_error = f"harness caps unreadable ({exc})"
     warnings = [
         message

@@ -81,8 +81,8 @@ def collect_snapshot(
     control_db_path: str | None = None,
 ) -> dash.Snapshot:
     now = now_fn()
-    settled_today_usd = _settled_today_usd(
-        control_db_path, repo, now
+    settled_today_usd, settled_today_unavailable, spend_warnings = (
+        _settled_today_usd(control_db_path, repo, now)
     )
     typed_paths = tuple(
         os.path.join(os.path.dirname(path), "events-v2.jsonl")
@@ -108,8 +108,12 @@ def collect_snapshot(
             tuple(read_events(ledger_path)),
             now_fn,
             stale_after_s,
-            ("showing read-only schema-v1 dashboard history",),
+            (
+                "showing read-only schema-v1 dashboard history",
+                *spend_warnings,
+            ),
             settled_today_usd,
+            settled_today_unavailable,
         )
         timestamps = tuple(
             stamp
@@ -147,7 +151,7 @@ def collect_snapshot(
         is not None
     }
     malformed = sum(result.malformed_lines for result in results)
-    warnings = (
+    warnings = spend_warnings + (
         (f"skipped {malformed} malformed schema-v2 event line(s)",)
         if malformed
         else ()
@@ -162,6 +166,7 @@ def collect_snapshot(
         heartbeat_times=heartbeat_times,
         warnings=warnings,
         settled_today_usd=settled_today_usd,
+        settled_today_unavailable=settled_today_unavailable,
     )
     timestamps = tuple(
         event.observed_at
@@ -173,7 +178,7 @@ def collect_snapshot(
 
 def _settled_today_usd(control_db_path, repository, now):
     if not control_db_path:
-        return None
+        return None, False, ()
     start = now.astimezone(timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
@@ -182,7 +187,14 @@ def _settled_today_usd(control_db_path, repository, now):
         start,
         start + timedelta(days=1),
     )
-    return spend.for_repository(repository).micros / 1_000_000
+    amount = spend.for_repository(repository)
+    if amount is None:
+        return (
+            None,
+            True,
+            (f"settled SQLite spend unavailable: {spend.detail}",),
+        )
+    return amount.micros / 1_000_000, False, ()
 
 
 def remote_repo(root: str) -> str:

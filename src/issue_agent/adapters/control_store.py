@@ -109,10 +109,14 @@ class AccountingSnapshot:
 
 @dataclass(frozen=True)
 class SettledSpend:
-    total: Money
+    disposition: AccountingDisposition
+    total: Money | None
     by_repository: Mapping[str, Money]
+    detail: str = ""
 
-    def for_repository(self, repository: str) -> Money:
+    def for_repository(self, repository: str) -> Money | None:
+        if self.total is None:
+            return None
         return self.by_repository.get(
             canonical_repository(repository),
             Money.zero(self.total.currency),
@@ -128,20 +132,32 @@ def read_settled_spend(
 ) -> SettledSpend:
     """Read settled charges without creating or mutating the control store."""
 
-    zero = Money.zero(currency)
     if period_end <= period_start:
         raise ValueError("spend period end must follow its start")
     start = _stamp(period_start)
     end = _stamp(period_end)
     if not os.path.isfile(path):
-        return SettledSpend(zero, MappingProxyType({}))
+        return SettledSpend(
+            AccountingDisposition.UNAVAILABLE,
+            None,
+            MappingProxyType({}),
+            f"control store does not exist: {path}",
+        )
 
     uri = Path(path).resolve().as_uri() + "?mode=ro"
-    db = sqlite3.connect(
-        uri,
-        uri=True,
-        timeout=DEFAULT_BUSY_TIMEOUT_MS / 1000,
-    )
+    try:
+        db = sqlite3.connect(
+            uri,
+            uri=True,
+            timeout=DEFAULT_BUSY_TIMEOUT_MS / 1000,
+        )
+    except sqlite3.Error as exc:
+        return SettledSpend(
+            AccountingDisposition.UNAVAILABLE,
+            None,
+            MappingProxyType({}),
+            f"control store could not be opened read-only: {exc}",
+        )
     db.row_factory = sqlite3.Row
     try:
         db.execute(f"PRAGMA busy_timeout={DEFAULT_BUSY_TIMEOUT_MS}")
@@ -153,6 +169,13 @@ def read_settled_spend(
             "GROUP BY r.repository",
             (currency, start, end),
         ).fetchall()
+    except sqlite3.Error as exc:
+        return SettledSpend(
+            AccountingDisposition.UNAVAILABLE,
+            None,
+            MappingProxyType({}),
+            f"settled spend could not be read: {exc}",
+        )
     finally:
         db.close()
     by_repository = {
@@ -160,6 +183,7 @@ def read_settled_spend(
         for row in rows
     }
     return SettledSpend(
+        AccountingDisposition.AVAILABLE,
         Money(currency, sum(item.micros for item in by_repository.values())),
         MappingProxyType(by_repository),
     )

@@ -1303,6 +1303,17 @@ def cmd_status(args) -> int:
             os.path.join(REPOS_DIR, f"{name}.env"),
             "REPO",
         )
+        repository_spend = (
+            spend.for_repository(configured_repo)
+            if configured_repo
+            else None
+        )
+        if spend.total is None or (
+            configured_repo and repository_spend is None
+        ):
+            raise RuntimeError(
+                spend.detail or "settled spend is unavailable"
+            )
         for line in spend_status_lines(
             journal_paths(name),
             daily_cap(name),
@@ -1310,8 +1321,8 @@ def cmd_status(args) -> int:
             repo=configured_repo,
             global_cap=global_daily_cap(name),
             repository_spent=(
-                spend.for_repository(configured_repo).micros / 1_000_000
-                if configured_repo
+                repository_spend.micros / 1_000_000
+                if repository_spend is not None
                 else 0.0
             ),
             all_repositories_spent=spend.total.micros / 1_000_000,

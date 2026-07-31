@@ -64,8 +64,10 @@ def collect(
     """Read one deployment's journals + the global ledger and report on them.
     Read-only; every missing file is an empty history (`read_events`'s rule)."""
     now_fn = now_fn or _utcnow
-    settled_today_usd = _settled_today_usd(
-        control_db_path, repo, now_fn()
+    settled_today_usd, settled_today_unavailable, spend_warnings = (
+        _settled_today_usd(
+            control_db_path, repo, now_fn()
+        )
     )
     legacy_paths = tuple(journal_paths)
     typed_paths = tuple(
@@ -92,8 +94,12 @@ def collect(
             tuple(read_events(ledger_path)),
             now_fn,
             stale_after_s,
-            ("showing read-only schema-v1 dashboard history",),
+            (
+                "showing read-only schema-v1 dashboard history",
+                *spend_warnings,
+            ),
             settled_today_usd,
+            settled_today_unavailable,
         )
     typed_feeds = tuple(
         (
@@ -122,7 +128,7 @@ def collect(
         is not None
     }
     malformed = sum(result.malformed_lines for result in results)
-    warnings = (
+    warnings = spend_warnings + (
         (f"skipped {malformed} malformed schema-v2 event line(s)",)
         if malformed
         else ()
@@ -137,6 +143,7 @@ def collect(
         heartbeat_times,
         warnings,
         settled_today_usd,
+        settled_today_unavailable,
     )
 
 
@@ -144,9 +151,9 @@ def _settled_today_usd(
     control_db_path: str | None,
     repository: str,
     now: datetime,
-) -> float | None:
+) -> tuple[float | None, bool, tuple[str, ...]]:
     if not control_db_path:
-        return None
+        return None, False, ()
     start = now.astimezone(timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
@@ -155,7 +162,14 @@ def _settled_today_usd(
         start,
         start + timedelta(days=1),
     )
-    return spend.for_repository(repository).micros / 1_000_000
+    amount = spend.for_repository(repository)
+    if amount is None:
+        return (
+            None,
+            True,
+            (f"settled SQLite spend unavailable: {spend.detail}",),
+        )
+    return amount.micros / 1_000_000, False, ()
 
 
 # ── text render ───────────────────────────────────────────────────────────────
@@ -202,7 +216,12 @@ def _metrics_lines(m: Metrics) -> list[str]:
             if m.done_issues
             else "no done issue yet"
         ),
-        f"    today (settled SQLite, this repo): ${m.today_usd:.2f}",
+        "    today (settled SQLite, this repo): "
+        + (
+            f"${m.today_usd:.2f}"
+            if m.today_usd is not None
+            else "unavailable"
+        ),
         "    cost mix: "
         + (
             " · ".join(
@@ -346,7 +365,12 @@ def _html_metrics(m: Metrics) -> str:
             "$ per done issue",
             f"${m.cost_per_done_usd:.2f}" if m.done_issues else "—",
         ),
-        ("today (settled SQLite, this repo)", f"${m.today_usd:.2f}"),
+        (
+            "today (settled SQLite, this repo)",
+            f"${m.today_usd:.2f}"
+            if m.today_usd is not None
+            else "unavailable",
+        ),
         ("cost mix by leg", _esc(mix) or "—"),
         (
             "first-pass approval",

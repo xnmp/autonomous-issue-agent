@@ -1373,13 +1373,14 @@ def test_settled_spend_read_model_uses_authoritative_charges(tmp_path) -> None:
         NOW.replace(hour=0) + timedelta(days=1),
     )
 
+    assert summary.disposition is AccountingDisposition.AVAILABLE
     assert summary.total == Money("USD", 65)
     assert summary.for_repository("O/R") == Money("USD", 25)
     assert summary.for_repository("o/other") == Money("USD", 40)
     assert summary.for_repository("o/absent") == Money.zero("USD")
 
 
-def test_missing_control_store_reads_as_zero_without_creating_it(tmp_path) -> None:
+def test_missing_control_store_is_unknown_without_creating_it(tmp_path) -> None:
     path = tmp_path / "absent" / "control.db"
 
     summary = read_settled_spend(
@@ -1388,9 +1389,30 @@ def test_missing_control_store_reads_as_zero_without_creating_it(tmp_path) -> No
         NOW.replace(hour=0) + timedelta(days=1),
     )
 
-    assert summary.total == Money.zero("USD")
+    assert summary.disposition is AccountingDisposition.UNAVAILABLE
+    assert summary.total is None
+    assert summary.for_repository("o/r") is None
     assert summary.by_repository == {}
+    assert "does not exist" in summary.detail
     assert not path.exists()
+
+
+def test_invalid_control_store_is_unknown_without_mutating_it(tmp_path) -> None:
+    path = tmp_path / "control.db"
+    original = b"not a SQLite database"
+    path.write_bytes(original)
+
+    summary = read_settled_spend(
+        str(path),
+        NOW.replace(hour=0),
+        NOW.replace(hour=0) + timedelta(days=1),
+    )
+
+    assert summary.disposition is AccountingDisposition.UNAVAILABLE
+    assert summary.total is None
+    assert summary.for_repository("o/r") is None
+    assert summary.detail
+    assert path.read_bytes() == original
 
 
 def test_settle_is_idempotent_and_conflicting_receipt_is_rejected(tmp_path):

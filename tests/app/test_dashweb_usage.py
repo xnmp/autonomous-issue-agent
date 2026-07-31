@@ -257,3 +257,37 @@ def test_harness_usage_sums_today_globally_and_per_repo(tmp_path, monkeypatch):
     assert result["today_all_repos_usd"] == 3.5
     assert result["per_repo"][0]["today_usd"] == 1.5
     assert result["per_repo"][0]["daily_cap_usd"] == 20.0
+
+
+def test_harness_usage_never_reports_missing_authority_as_zero(tmp_path):
+    with pytest.raises(RuntimeError, match="does not exist"):
+        usage.harness_usage(
+            [],
+            lambda _name: ("", 0.0, 0.0),
+            str(tmp_path / "missing" / "control.db"),
+        )
+
+
+def test_usage_payload_marks_unavailable_harness_spend_unknown(monkeypatch):
+    monkeypatch.setattr(
+        usage,
+        "claude_usage",
+        lambda fetch=None: {"error": None},
+    )
+    monkeypatch.setattr(
+        usage,
+        "codex_usage",
+        lambda: {"error": None},
+    )
+
+    def unavailable_harness(*_args, **_kwargs):
+        raise RuntimeError("control store does not exist")
+
+    monkeypatch.setattr(usage, "harness_usage", unavailable_harness)
+
+    result = usage.usage_payload([], lambda _name: ("", 0.0, 0.0))
+
+    assert result["harness"]["today_all_repos_usd"] is None
+    assert result["warnings"] == [
+        "harness caps unreadable (control store does not exist)"
+    ]

@@ -254,7 +254,7 @@ class Metrics:
     escalations: int
     recurrences: int
     spend_blocks: int
-    today_usd: float  # from the global ledger, scoped to this repo
+    today_usd: float | None  # settled SQLite spend, or unknown
 
     @property
     def first_pass_rate(self) -> float | None:
@@ -302,6 +302,7 @@ def build_deployment_v2(
     heartbeat_times: Mapping[str, datetime] | None = None,
     warnings: tuple[str, ...] = (),
     settled_today_usd: float | None = None,
+    settled_today_unavailable: bool = False,
 ) -> Deployment:
     """Build the dashboard exclusively from the canonical schema-v2 fold.
 
@@ -352,13 +353,17 @@ def build_deployment_v2(
     )
     today = now.astimezone(timezone.utc).date()
     today_usd = (
-        settled_today_usd
-        if settled_today_usd is not None
-        else sum(
-            payload.amount_micros / 1_000_000
-            for event in model.events
-            if event.occurred_at.astimezone(timezone.utc).date() == today
-            and isinstance((payload := event.payload), SpendRecorded)
+        None
+        if settled_today_unavailable
+        else (
+            settled_today_usd
+            if settled_today_usd is not None
+            else sum(
+                payload.amount_micros / 1_000_000
+                for event in model.events
+                if event.occurred_at.astimezone(timezone.utc).date() == today
+                and isinstance((payload := event.payload), SpendRecorded)
+            )
         )
     )
     unattributed = tuple(
@@ -1066,7 +1071,11 @@ def first_pass_verdicts(rows) -> tuple[int, int]:
     )
 
 
-def build_metrics(rows, unattributed, today_usd: float) -> Metrics:
+def build_metrics(
+    rows,
+    unattributed,
+    today_usd: float | None,
+) -> Metrics:
     legs = [leg for row in rows for leg in row.legs]
     legs += [
         _leg(e) for e in unattributed if e.get("event") == "agent_run"
@@ -1118,7 +1127,7 @@ def build_metrics(rows, unattributed, today_usd: float) -> Metrics:
         recurrences=sum(row.recurrences for row in rows),
         spend_blocks=sum(row.spend_blocks for row in rows)
         + sum(1 for e in unattributed if e.get("event") == "spend_block"),
-        today_usd=round(today_usd, 4),
+        today_usd=round(today_usd, 4) if today_usd is not None else None,
     )
 
 
@@ -1131,6 +1140,7 @@ def build_deployment(
     stale_after_s: float = STALE_AFTER_S,
     warnings: tuple[str, ...] = (),
     settled_today_usd: float | None = None,
+    settled_today_unavailable: bool = False,
 ) -> Deployment:
     """Assemble one deployment's report. Pure: `feeds` is
     `(role, journal_path, log_path, events)` tuples already read off disk.
@@ -1155,14 +1165,18 @@ def build_deployment(
     unattributed = tuple(e for e in merged if event_issue(e, pr_issue) is None)
     today = _stamp_date(now)
     today_usd = (
-        settled_today_usd
-        if settled_today_usd is not None
-        else sum(
-            _float(e.get("cost_usd"))
-            for e in ledger_events
-            if e.get("event") == "spend"
-            and str(e.get("ts", ""))[:10] == today
-            and (not repo or e.get("repo") == repo)
+        None
+        if settled_today_unavailable
+        else (
+            settled_today_usd
+            if settled_today_usd is not None
+            else sum(
+                _float(e.get("cost_usd"))
+                for e in ledger_events
+                if e.get("event") == "spend"
+                and str(e.get("ts", ""))[:10] == today
+                and (not repo or e.get("repo") == repo)
+            )
         )
     )
     return Deployment(
