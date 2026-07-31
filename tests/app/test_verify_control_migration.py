@@ -60,6 +60,18 @@ def test_shadow_replay_and_primary_canary_are_independently_verified(tmp_path):
     assert report["primary_canary"]["legacy_export_unchanged"] is True
     assert report["provenance"]["source_digest"] == report["legacy"]["source_digest"]
 
+    repeated = verify(
+        ledger,
+        database,
+        canary_repository="o/r",
+        minimum_hours=24,
+    )
+    assert repeated["status"] == "passed"
+    assert (
+        repeated["primary_canary"]["run_id"]
+        != report["primary_canary"]["run_id"]
+    )
+
 
 def test_verifier_rejects_short_or_malformed_windows(tmp_path):
     short = tmp_path / "short.jsonl"

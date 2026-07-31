@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import sqlite3
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -158,7 +159,9 @@ def verify(
     store.integrity_check()
 
     canary_run = RunId(
-        f"migration-canary-v2-{summary.source_digest[:16]}-{canary_repository}"
+        "migration-canary-v3-"
+        f"{summary.source_digest[:16]}-{uuid.uuid4().hex[:16]}-"
+        f"{canary_repository}"
     )
     now = datetime.now(timezone.utc)
     scope = daily_budget_scope(
@@ -348,6 +351,7 @@ def verify(
             },
         },
         "primary_canary": {
+            "run_id": str(canary_run),
             "repository": canary_repository,
             "database": str(database.resolve()),
             "database_preexisting": database_preexisting,
