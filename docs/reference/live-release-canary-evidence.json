@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-31T02:17:29Z",
+  "generated_at": "2026-07-31T02:56:49Z",
   "repository": "xnmp/autonomous-issue-agent",
   "purpose": "Release evidence for the 2026-07-30 architectural implementation plan",
   "builds": {
@@ -9,7 +9,7 @@
     "accounting_canary": "740cb2be0ba4d49a6d82534c274490480e7054f7",
     "money_precision_correction": "40f66dac71e9bc7a2a9c7649cb14dba7b13a5d1a",
     "final_audit_remediation": "9786b5f65a516930e3758ab9ed360d657ba141cb",
-    "final_release": "cc0dc5a513ee0790ce5f3327ecd57adbc9f408d9"
+    "final_release": "6efba6f2a459738f549c796bf919ea5529371416"
   },
   "all_role_boot": {
     "roles": {
@@ -619,6 +619,111 @@
         12,
         13
       ],
+      "self_role_world_rows_after_stop": 0,
+      "nonterminal_runs": 0,
+      "active_reservations": 0,
+      "leases": 0,
+      "dispatch_claims": 0,
+      "pending_commands": 0,
+      "pending_outbox": 0
+    },
+    "operator_warning": "The repository rejected automatic enablement of allow_auto_merge; the bounded canary continued with the documented manual repository-setting warning."
+  },
+  "final_concurrency_projection_follow_up": {
+    "observed_at": "2026-07-31T02:56:49Z",
+    "commit": "6efba6f2a459738f549c796bf919ea5529371416",
+    "code_tree": "f6c1b15da53bb55dba0b20725b7da7820e1ef413",
+    "closed_findings": [
+      "Process-group, process-tree, and launch-intent registries are scoped by the stable repository, checkout, and role deployment identity; startup and shutdown cannot reap a sibling checkout's paid work.",
+      "The schema-v2 dashboard emits rows only for current present issue facts and derives pending, backlog, in-flight, and done lanes from that authority; retired or tombstoned history cannot reappear as active.",
+      "Event-log append, rotation, authoritative reseeding, and pruning share a stable path-level interprocess lock; reseeding retains active levels, permanent retirement fences, and the latest observation per feed and subject."
+    ],
+    "targeted_regressions": {
+      "command": "uv run pytest -q tests/app/test_dashboard_v2.py tests/adapters/test_event_log.py tests/adapters/test_process_supervisor.py tests/app/test_roles.py",
+      "result": "passed",
+      "covered": [
+        "shared-state sibling checkout recovery",
+        "safe legacy-registry upgrade recovery",
+        "tombstone and feed-retirement dashboard exclusion",
+        "current unowned issue backlog classification",
+        "stale multi-writer observation retention",
+        "simultaneous rotation serialization"
+      ]
+    },
+    "full_suite": {
+      "command": "make test",
+      "result": "passed",
+      "shell_hooks": 90,
+      "point_at": 7,
+      "domain_pytest": 659,
+      "adapter_pytest": 783,
+      "application_pytest": 1320,
+      "gate_parity": 48,
+      "import_contracts": 4,
+      "pyrefly_errors": 0
+    },
+    "live_roles": {
+      "command": "ISSUE_AGENT_MAX_TICKS=0 GATE_PROBE=0 bash bin/point-at.sh self",
+      "exit_code": 0,
+      "doctor_errors": 0,
+      "doctor_warnings": 3,
+      "feed_retirements": {
+        "fix": {
+          "deployment": "e7f63b256a30fbf4",
+          "pid": 3959665,
+          "restartable": true
+        },
+        "review": {
+          "deployment": "30e2d1145844dc4e",
+          "pid": 3959664,
+          "restartable": true
+        },
+        "steward": {
+          "deployment": "934214f238852f48",
+          "pid": 3959666,
+          "restartable": true
+        }
+      },
+      "heartbeats": {
+        "fix": {
+          "state": "stopped",
+          "in_flight": []
+        },
+        "review": {
+          "state": "stopped",
+          "in_flight": []
+        },
+        "steward": {
+          "state": "stopped",
+          "in_flight": []
+        }
+      },
+      "process_supervision": {
+        "scoped_deployments": [
+          "e7f63b256a30fbf4",
+          "30e2d1145844dc4e",
+          "934214f238852f48"
+        ],
+        "remaining_registration_receipts": 0
+      }
+    },
+    "live_dashboard": {
+      "command": "uv run issue-agent dashboard --name self --serve 18321",
+      "issues_endpoint": "/api/repos/self/issues",
+      "http_status": 200,
+      "in_flight": 0,
+      "pending": 0,
+      "done": 0,
+      "backlog": 0,
+      "notifications": 0,
+      "repository_summary_in_flight": 0,
+      "repository_summary_done": 0,
+      "role_liveness": "all stopped"
+    },
+    "control_store": {
+      "database_mode": "0600",
+      "event_writer_lock_modes": "0600",
+      "integrity": "ok",
       "self_role_world_rows_after_stop": 0,
       "nonterminal_runs": 0,
       "active_reservations": 0,
