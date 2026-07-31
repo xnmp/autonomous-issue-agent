@@ -5,11 +5,13 @@ from issue_agent.adapters.event_log import EventLog
 from issue_agent.app.config import HarnessConfig
 from issue_agent.app.roles import _reported_world
 from issue_agent.domain.events import (
+    MAX_EVENT_LINE_BYTES,
     Producer,
     WorldObserved,
     decode_event_line,
 )
 from issue_agent.domain.world import (
+    Check,
     Comment,
     IssueView,
     PRView,
@@ -159,3 +161,72 @@ def test_world_wrapper_includes_bounded_issue_and_pr_interactions(
     assert pr.facts["reviews_total"] == 25
     assert len(pr.facts["reviews"]) == 20
     assert pr.facts["reviews"][0]["author"] == "reviewer-5"
+
+
+def test_pathological_pr_facts_cannot_roll_back_the_snapshot(
+    tmp_path: Path,
+) -> None:
+    event_path = tmp_path / "events-v2.jsonl"
+    events = EventLog(
+        str(event_path),
+        Producer("deployment", "o/r", "fix", 123, "boot"),
+    )
+    control = SQLiteControlStore(str(tmp_path / "control.db"))
+    control.initialize()
+    control.bind_event_outbox(events.prepare, events.append_committed)
+    hostile = "😀\\\"\n" * 1_000
+    comments = tuple(
+        Comment(f"author-{index}-{hostile}", hostile, hostile)
+        for index in range(20)
+    )
+    reviews = tuple(
+        Review(hostile, hostile, hostile, hostile, hostile)
+        for _index in range(20)
+    )
+    checks = tuple(
+        Check(hostile, hostile, hostile, hostile, run_id=index)
+        for index in range(100)
+    )
+    paths = frozenset(
+        f"path-{index}-{hostile}" for index in range(100)
+    )
+    observe = _reported_world(
+        lambda: WorldState(
+            prs=(
+                PRView(
+                    8,
+                    title=hostile,
+                    comments=comments,
+                    reviews=reviews,
+                    checks=checks,
+                    changed_files=paths,
+                ),
+                PRView(9, title="small"),
+            ),
+        ),
+        control,
+        HarnessConfig(repo="o/r", target_dir=str(tmp_path)),
+        "fix",
+        lambda _message: None,
+    )
+
+    observe()
+
+    lines = event_path.read_bytes().splitlines(keepends=True)
+    assert lines
+    assert all(len(line) <= MAX_EVENT_LINE_BYTES for line in lines)
+    observed = [
+        decode_event_line(line.decode()).payload
+        for line in lines
+        if isinstance(decode_event_line(line.decode()).payload, WorldObserved)
+    ]
+    prs = {
+        payload.subject_number: payload
+        for payload in observed
+        if payload.subject_kind == "pr"
+    }
+    assert set(prs) == {8, 9}
+    assert prs[8].facts["observation_truncated"] is True
+    assert prs[8].facts["changed_files_total"] == 100
+    assert prs[8].facts["checks_total"] == 100
+    assert prs[9].facts["title"] == "small"

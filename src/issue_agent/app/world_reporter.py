@@ -17,6 +17,24 @@ _MAX_PATHS = 100
 _MAX_PATH_CHARS = 300
 _MAX_CHECKS = 100
 _MAX_CHECK_TEXT_CHARS = 200
+_MAX_LABELS = 100
+_MAX_OPEN_BLOCKERS = 100
+_MAX_FACTS_BYTES = 48 * 1024
+_MAX_GENERAL_TEXT_JSON_BYTES = 1_024
+_MAX_BODY_JSON_BYTES = 768
+_MAX_PATH_JSON_BYTES = 384
+_MAX_CHECK_TEXT_JSON_BYTES = 256
+_COMPACT_COLLECTION_ITEMS = 5
+_COLLECTION_KEYS = (
+    "comments",
+    "reviews",
+    "checks",
+    "changed_files",
+    "declared_paths",
+    "predicted_paths",
+    "open_blockers",
+    "labels",
+)
 
 
 def _ignore_log(_message: str) -> None:
@@ -58,62 +76,74 @@ class WorldReporter:
 
     @staticmethod
     def _issue_facts(issue: IssueView) -> dict[str, JsonValue]:
-        return {
+        return _fit_facts({
             "present": True,
-            "title": issue.title,
-            "state": issue.state,
-            "state_reason": issue.state_reason,
-            "labels": sorted(label.value for label in issue.labels),
-            "updated_at": issue.updated_at,
-            "author": issue.author,
+            "title": _bounded_text(issue.title),
+            "state": _bounded_text(issue.state),
+            "state_reason": _bounded_text(issue.state_reason),
+            "labels": [
+                _bounded_text(label.value)
+                for label in sorted(issue.labels, key=lambda item: item.value)[
+                    :_MAX_LABELS
+                ]
+            ],
+            "updated_at": _bounded_text(issue.updated_at),
+            "author": _bounded_text(issue.author),
             "blocked_by_open": issue.blocked_by_open,
-            "open_blockers": list(issue.open_blocker_numbers),
+            "open_blockers": list(
+                issue.open_blocker_numbers[:_MAX_OPEN_BLOCKERS]
+            ),
             "declared_paths": _bounded_paths(issue.declared_paths),
             "predicted_paths": _bounded_paths(issue.predicted_paths),
             "comments_total": len(issue.comments),
             "comments": [
                 {
-                    "author": comment.author,
+                    "author": _bounded_text(comment.author),
                     "body": _bounded_body(comment.body),
-                    "created_at": comment.created_at,
+                    "created_at": _bounded_text(comment.created_at),
                 }
                 for comment in issue.comments[-_MAX_INTERACTIONS:]
             ],
-        }
+        })
 
     @staticmethod
     def _pr_facts(pr: PRView) -> dict[str, JsonValue]:
         facts: dict[str, JsonValue] = {
             "present": True,
-            "title": pr.title,
-            "state": pr.state,
-            "labels": sorted(label.value for label in pr.labels),
-            "head_sha": pr.head_ref_oid,
-            "head_ref": pr.head_ref_name,
-            "base_ref": pr.base_ref_name,
-            "base_sha": pr.base_ref_oid,
+            "title": _bounded_text(pr.title),
+            "state": _bounded_text(pr.state),
+            "labels": [
+                _bounded_text(label.value)
+                for label in sorted(pr.labels, key=lambda item: item.value)[
+                    :_MAX_LABELS
+                ]
+            ],
+            "head_sha": _bounded_text(pr.head_ref_oid),
+            "head_ref": _bounded_text(pr.head_ref_name),
+            "base_ref": _bounded_text(pr.base_ref_name),
+            "base_sha": _bounded_text(pr.base_ref_oid),
             "draft": pr.is_draft,
-            "author": pr.author,
+            "author": _bounded_text(pr.author),
             "closing_issue": pr.closing_issue,
             "changed_files_total": len(pr.changed_files),
             "changed_files": _bounded_paths(pr.changed_files),
             "comments_total": len(pr.comments),
             "comments": [
                 {
-                    "author": comment.author,
+                    "author": _bounded_text(comment.author),
                     "body": _bounded_body(comment.body),
-                    "created_at": comment.created_at,
+                    "created_at": _bounded_text(comment.created_at),
                 }
                 for comment in pr.comments[-_MAX_INTERACTIONS:]
             ],
             "reviews_total": len(pr.reviews),
             "reviews": [
                 {
-                    "author": review.author,
-                    "state": review.state,
+                    "author": _bounded_text(review.author),
+                    "state": _bounded_text(review.state),
                     "body": _bounded_body(review.body),
-                    "submitted_at": review.submitted_at,
-                    "commit_id": review.commit_id,
+                    "submitted_at": _bounded_text(review.submitted_at),
+                    "commit_id": _bounded_text(review.commit_id),
                 }
                 for review in pr.reviews[-_MAX_INTERACTIONS:]
             ],
@@ -123,20 +153,20 @@ class WorldReporter:
             facts["checks_total"] = len(pr.checks)
             facts["checks"] = [
                 {
-                    "name": check.name[:_MAX_CHECK_TEXT_CHARS],
-                    "state": check.state[:_MAX_CHECK_TEXT_CHARS],
-                    "bucket": check.bucket[:_MAX_CHECK_TEXT_CHARS],
-                    "started_at": check.started_at,
+                    "name": _bounded_check_text(check.name),
+                    "state": _bounded_check_text(check.state),
+                    "bucket": _bounded_check_text(check.bucket),
+                    "started_at": _bounded_text(check.started_at),
                     "advisory": check.advisory,
                     "run_id": check.run_id,
                 }
                 for check in pr.checks[:_MAX_CHECKS]
             ]
         if pr.mergeable:
-            facts["mergeable"] = pr.mergeable
+            facts["mergeable"] = _bounded_text(pr.mergeable)
         if pr.merge_state:
-            facts["merge_state"] = pr.merge_state
-        return facts
+            facts["merge_state"] = _bounded_text(pr.merge_state)
+        return _fit_facts(facts)
 
     def _report_snapshot(
         self,
@@ -161,14 +191,69 @@ class WorldReporter:
 
 
 def _bounded_body(body: str) -> str:
-    return body[:_MAX_INTERACTION_BODY_CHARS]
+    return _bounded_text(
+        body[:_MAX_INTERACTION_BODY_CHARS],
+        _MAX_BODY_JSON_BYTES,
+    )
 
 
 def _bounded_paths(paths: frozenset[str]) -> list[str]:
     return [
-        path[:_MAX_PATH_CHARS]
+        _bounded_text(path[:_MAX_PATH_CHARS], _MAX_PATH_JSON_BYTES)
         for path in sorted(paths)[:_MAX_PATHS]
     ]
+
+
+def _bounded_check_text(value: str) -> str:
+    return _bounded_text(
+        value[:_MAX_CHECK_TEXT_CHARS],
+        _MAX_CHECK_TEXT_JSON_BYTES,
+    )
+
+
+def _bounded_text(
+    value: str,
+    maximum_json_bytes: int = _MAX_GENERAL_TEXT_JSON_BYTES,
+) -> str:
+    if len(json.dumps(value).encode()) <= maximum_json_bytes:
+        return value
+    low = 0
+    high = len(value)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(json.dumps(value[:middle]).encode()) <= maximum_json_bytes:
+            low = middle
+        else:
+            high = middle - 1
+    return value[:low]
+
+
+def _fit_facts(facts: dict[str, JsonValue]) -> dict[str, JsonValue]:
+    if _encoded_size(facts) <= _MAX_FACTS_BYTES:
+        return facts
+    compacted = dict(facts)
+    compacted["observation_truncated"] = True
+    for key in _COLLECTION_KEYS:
+        value = compacted.get(key)
+        if isinstance(value, list) and len(value) > _COMPACT_COLLECTION_ITEMS:
+            if key in {"comments", "reviews"}:
+                compacted[key] = value[-_COMPACT_COLLECTION_ITEMS:]
+            else:
+                compacted[key] = value[:_COMPACT_COLLECTION_ITEMS]
+    if _encoded_size(compacted) <= _MAX_FACTS_BYTES:
+        return compacted
+    for key in _COLLECTION_KEYS:
+        if isinstance(compacted.get(key), list):
+            compacted[key] = []
+    if _encoded_size(compacted) > _MAX_FACTS_BYTES:
+        raise ValueError("bounded world facts exceed the event safety budget")
+    return compacted
+
+
+def _encoded_size(facts: dict[str, JsonValue]) -> int:
+    return len(
+        json.dumps(facts, sort_keys=True, separators=(",", ":")).encode()
+    )
 
 
 def _content_hash(facts: dict[str, JsonValue]) -> str:

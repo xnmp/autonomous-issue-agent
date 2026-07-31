@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 import threading
 import time
@@ -122,10 +123,28 @@ class EventLog:
             0o600,
         )
         try:
-            written = os.write(fd, encoded)
-            if written != len(encoded):
-                raise OSError(f"short event append: {written}/{len(encoded)}")
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            starting_size = os.fstat(fd).st_size
+            offset = 0
+            try:
+                while offset < len(encoded):
+                    try:
+                        written = os.write(fd, encoded[offset:])
+                    except InterruptedError:
+                        continue
+                    if written <= 0:
+                        raise OSError(
+                            f"short event append: {offset}/{len(encoded)}"
+                        )
+                    offset += written
+            except BaseException:
+                os.ftruncate(fd, starting_size)
+                raise
         finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
             os.close(fd)
 
     def _rotate_if_needed(self) -> None:

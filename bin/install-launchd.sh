@@ -186,6 +186,20 @@ rollback() {
 }
 trap rollback ERR INT TERM
 
+# Stop every deployment-scoped writer while the rollback snapshot is still the
+# config they were launched with. Replacing it first lets an old process reload
+# new authority during the cutover window.
+for index in "${!units[@]}"; do
+  u="${units[$index]}"
+  label="dev.issue-agent.$u.$deployment_id"
+  dst="$LA/$label.plist"
+  if [ -f "$dst" ] && [ -f "$STAGE/$index.loaded" ]; then
+    launchctl unload "$dst"
+  elif [ -f "$dst" ]; then
+    launchctl unload "$dst" 2>/dev/null || true
+  fi
+done
+
 # Unsuffixed jobs predate deployment-scoped labels. Stop the complete writer
 # set before replacing config or loading any role, and retain their files in
 # STAGE so a later load failure can restore the old deployment atomically.
@@ -208,7 +222,6 @@ for index in "${!units[@]}"; do
   u="${units[$index]}"
   label="dev.issue-agent.$u.$deployment_id"
   dst="$LA/$label.plist"
-  [ ! -f "$dst" ] || launchctl unload "$dst" 2>/dev/null || true
   mv "$STAGE/$label.plist" "$dst"
 done
 

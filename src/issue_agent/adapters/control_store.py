@@ -3226,8 +3226,11 @@ class SQLiteControlStore:
         source = Path(source_path)
         raw = source.read_bytes()
         source_digest = hashlib.sha256(raw).hexdigest()
-        migration_id = f"legacy-spend:{source_digest}"
         source_identity = str(source.resolve())
+        migration_id = "legacy-spend:" + hashlib.sha256(
+            f"{source_identity}:{source_digest}".encode()
+        ).hexdigest()
+        legacy_migration_id = f"legacy-spend:{source_digest}"
         parsed: list[tuple[str, str, int, int, datetime, str]] = []
         occurrences: dict[str, int] = {}
         rejected = 0
@@ -3310,13 +3313,20 @@ class SQLiteControlStore:
         total = 0
         with self.transaction() as db:
             existing = db.execute(
-                "SELECT row_count, rejected_count, amount_micros "
+                "SELECT migration_id, row_count, rejected_count, amount_micros "
                 "FROM migration_imports WHERE migration_id=?",
                 (migration_id,),
             ).fetchone()
+            if existing is None:
+                existing = db.execute(
+                    "SELECT migration_id, row_count, rejected_count, "
+                    "amount_micros FROM migration_imports "
+                    "WHERE migration_id=? AND source_path=?",
+                    (legacy_migration_id, source_identity),
+                ).fetchone()
             if existing is not None:
                 return MigrationReport(
-                    migration_id,
+                    str(existing["migration_id"]),
                     source_digest,
                     int(existing["row_count"]),
                     int(existing["rejected_count"]),

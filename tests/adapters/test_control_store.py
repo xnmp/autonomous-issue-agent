@@ -1748,6 +1748,68 @@ def test_distinct_rotated_ledgers_keep_identical_semantic_spend_rows(
     assert store.snapshot(scope).settled == Money("USD", 5_000_000)
 
 
+def test_byte_identical_rotated_ledgers_are_distinct_sources(tmp_path):
+    store = _store(tmp_path)
+    row = {
+        "event": "spend",
+        "ts": NOW.isoformat(),
+        "repo": "o/r",
+        "issue": 7,
+        "cost_usd": 1.25,
+        "model": "legacy",
+    }
+    first = tmp_path / "spend.1.jsonl"
+    second = tmp_path / "spend.2.jsonl"
+    content = json.dumps(row) + "\n"
+    first.write_text(content)
+    second.write_text(content)
+
+    assert store.import_legacy_spend(str(first)).imported == 1
+    assert store.import_legacy_spend(str(second)).imported == 1
+    assert store.import_legacy_spend(str(first)).idempotent
+    assert store.import_legacy_spend(str(second)).idempotent
+
+    scope = dataclasses.replace(_scope(), dimension="repository")
+    assert store.snapshot(scope).settled == Money("USD", 2_500_000)
+
+
+def test_legacy_digest_only_receipt_remains_idempotent_for_same_source(
+    tmp_path,
+):
+    store = _store(tmp_path)
+    ledger = tmp_path / "spend.jsonl"
+    ledger.write_text(
+        json.dumps(
+            {
+                "event": "spend",
+                "ts": NOW.isoformat(),
+                "repo": "o/r",
+                "issue": 7,
+                "cost_usd": 1.25,
+            }
+        )
+        + "\n"
+    )
+    store.import_legacy_spend(str(ledger))
+    legacy_id = "legacy-spend:" + hashlib.sha256(
+        ledger.read_bytes()
+    ).hexdigest()
+    with store._connect() as db:
+        db.execute(
+            "UPDATE migration_imports SET migration_id=?",
+            (legacy_id,),
+        )
+
+    repeated = store.import_legacy_spend(str(ledger))
+
+    assert repeated.idempotent
+    assert repeated.migration_id == legacy_id
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM migration_imports"
+        ).fetchone()[0] == 1
+
+
 def test_legacy_spend_import_rejects_unattributed_rows(tmp_path):
     store = _store(tmp_path)
     ledger = tmp_path / "spend.jsonl"

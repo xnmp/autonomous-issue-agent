@@ -1,5 +1,8 @@
+import os
 from dataclasses import fields
 from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from issue_agent.adapters.event_log import EventLog
 from issue_agent.domain.events import (
@@ -31,6 +34,55 @@ def test_event_log_appends_complete_v2_lines(tmp_path) -> None:
     decoded = decode_event_line((tmp_path / "events.jsonl").read_text().strip())
     assert decoded == emitted
     assert decoded.correlation.issue == 1
+
+
+def test_event_log_completes_a_short_write_without_splitting_the_line(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "events.jsonl"
+    log = EventLog(str(path), _producer())
+    real_write = os.write
+    calls = 0
+
+    def short_once(fd, content):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return real_write(fd, content[: len(content) // 2])
+        return real_write(fd, content)
+
+    monkeypatch.setattr(os, "write", short_once)
+    emitted = log.emit(TelemetryWarning("write", "short"))
+
+    lines = path.read_text().splitlines()
+    assert len(lines) == 1
+    assert decode_event_line(lines[0]) == emitted
+    assert calls == 2
+
+
+def test_event_log_rolls_back_a_fragment_before_outbox_retry(
+    tmp_path, monkeypatch
+) -> None:
+    path = tmp_path / "events.jsonl"
+    log = EventLog(str(path), _producer())
+    real_write = os.write
+    calls = 0
+
+    def fail_after_fragment(fd, content):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return real_write(fd, content[: len(content) // 2])
+        raise OSError("disk write failed")
+
+    monkeypatch.setattr(os, "write", fail_after_fragment)
+    with pytest.raises(OSError, match="disk write failed"):
+        log.emit(TelemetryWarning("write", "failed"))
+    assert path.read_bytes() == b""
+
+    monkeypatch.setattr(os, "write", real_write)
+    retried = log.emit(TelemetryWarning("write", "retried"))
+    assert decode_event_line(path.read_text()) == retried
 
 
 def test_rotation_preserves_open_level_in_snapshot(tmp_path) -> None:

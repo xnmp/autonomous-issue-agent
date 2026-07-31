@@ -64,6 +64,10 @@ exit 0
             fake_bin / "launchctl",
             """
 printf '%s\n' "$*" >> "$SERVICE_LOG"
+if [ "${1:-}" = "unload" ] \
+  && [ "${REQUIRE_OLD_SNAPSHOT_DURING_UNLOAD:-0}" = "1" ]; then
+  grep -q 'KNOWN_GOOD=1' "$CUTOVER_SNAPSHOT" || exit 9
+fi
 if [ "${1:-}" = "list" ]; then
   case " ${LOADED_LABELS:-} " in
     *" ${2:-} "*) exit 0 ;;
@@ -95,6 +99,8 @@ exit 0
         "LOADED_LABELS": "",
         "ACTIVE_UNITS": "",
         "ENABLED_UNITS": "",
+        "REQUIRE_OLD_SNAPSHOT_DURING_UNLOAD": "0",
+        "CUTOVER_SNAPSHOT": "",
     }
     return env, home, fake_bin / "uv"
 
@@ -610,6 +616,61 @@ def test_launchd_failed_load_restores_every_known_good_plist(tmp_path):
         for label in labels
     )
     assert "KNOWN_GOOD=1" in snapshot.read_text()
+
+
+def test_launchd_stops_every_current_writer_before_swapping_config(
+    tmp_path,
+):
+    env, home, _uv = _environment(tmp_path, systemd=False)
+    config = Path(env["AGENT_ENV"])
+    target = tmp_path / "target-repo"
+    checksum = subprocess.run(
+        ["cksum"],
+        input=f"{config}|{target}",
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()[0]
+    launch_agents = home / "Library/LaunchAgents"
+    launch_agents.mkdir(parents=True)
+    labels = (
+        f"dev.issue-agent.fix-watcher.{checksum}",
+        f"dev.issue-agent.review-watcher.{checksum}",
+        f"dev.issue-agent.steward.{checksum}",
+    )
+    for label in labels:
+        (launch_agents / f"{label}.plist").write_text("known-good")
+    snapshot = (
+        home
+        / "Library/Application Support/issue-agent"
+        / f"{checksum}.env"
+    )
+    snapshot.parent.mkdir(parents=True)
+    snapshot.write_text(
+        f'REPO=""\nTARGET_DIR="{target}"\nKNOWN_GOOD=1\n'
+    )
+    env["REQUIRE_OLD_SNAPSHOT_DURING_UNLOAD"] = "1"
+    env["CUTOVER_SNAPSHOT"] = str(snapshot)
+
+    result = subprocess.run(
+        ["bash", str(ROOT / "bin/install-launchd.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
+    unloads = [
+        calls.index(f"unload {launch_agents / f'{label}.plist'}")
+        for label in labels
+    ]
+    loads = [
+        calls.index(f"load {launch_agents / f'{label}.plist'}")
+        for label in labels
+    ]
+    assert max(unloads) < min(loads)
+    assert "KNOWN_GOOD=1" not in snapshot.read_text()
 
 
 def test_launchd_success_uses_stable_private_config_snapshot(tmp_path):
