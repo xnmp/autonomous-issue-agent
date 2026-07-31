@@ -369,6 +369,7 @@ class RunContext:
     kind: str = ""
     number: int = 0
     issue: int | None = None
+    claim_target: int | None = None
     dispatch_id: str = ""
 
 
@@ -464,22 +465,38 @@ class JournalingRuntime:
     def context(self, value: RunContext) -> None:
         self._context.set(value)
 
-    def set_context(self, role: str, kind: str, number: int, issue: int | None) -> None:
+    def set_context(
+        self,
+        role: str,
+        kind: str,
+        number: int,
+        issue: int | None,
+        claim_target: int | None = None,
+    ) -> None:
         """Called by the dispatcher immediately before it hands off to a handler.
-        Mutable state on purpose: threading a context through every workflow
-        signature would touch a dozen call sites to carry a field only the
-        journal reads.
+        Mutable state on purpose: journaling and paid admission consume the
+        same dispatch context across every workflow leg.
 
         Each call mints a fresh `dispatch_id`; every leg the handler runs
         inherits it. Random rather than sequential because the counter's whole
         purpose is surviving a process death, and a per-process sequence
         restarts at 0 with the daemon."""
         self._context.set(RunContext(
-            role=role, kind=kind, number=number, issue=issue,
+            role=role,
+            kind=kind,
+            number=number,
+            issue=issue,
+            claim_target=claim_target,
             dispatch_id=uuid.uuid4().hex[:12],
         ))
         if isinstance(self.inner, ContextualRuntime):
-            self.inner.set_context(role, kind, number, issue)
+            self.inner.set_context(
+                role,
+                kind,
+                number,
+                issue,
+                claim_target=claim_target,
+            )
 
     @contextlib.contextmanager
     def leg_kind(self, kind: str):
@@ -503,6 +520,7 @@ class JournalingRuntime:
                 kind,
                 previous.number,
                 previous.issue,
+                claim_target=previous.claim_target,
             )
         try:
             yield
@@ -513,6 +531,7 @@ class JournalingRuntime:
                     previous.kind,
                     previous.number,
                     previous.issue,
+                    claim_target=previous.claim_target,
                 )
             self._context.reset(token)
 
@@ -870,17 +889,18 @@ def death_key(event: dict) -> int | None:
     """The `infra-deaths` counter key an event's dispatch would have been
     charged to, or None if the event names no usable target.
 
-    Mirrors `AgentDispatcher.dispatch`'s `key = issue if issue is not None else
-    -action.number` exactly — including `domain.fix.breaker_key`'s negated-PR
-    convention for a PR with no resolvable issue — because the whole point of
-    `unsettled_starts` is to feed the SAME per-key ceiling the surviving-process
-    bump feeds. Duplicated as a convention (a one-line formula) rather than
-    imported: adapters must not depend on app.
+    ADR 0008 makes review convergence stably PR-keyed; fix and steward failures
+    use their issue when known and the negated PR fallback otherwise. This
+    mirrors the application policy because `unsettled_starts` must feed the
+    same ceiling as a surviving-process bump. Kept local because adapters
+    cannot import app.
     """
+    number = _int(event.get("number"))
+    if str(event.get("role") or "").casefold() == "review":
+        return None if number is None else -number
     issue = _int(event.get("issue"))
     if issue is not None:
         return issue
-    number = _int(event.get("number"))
     return None if number is None else -number
 
 

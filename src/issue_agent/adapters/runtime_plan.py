@@ -148,7 +148,12 @@ class AgentRuntime(Protocol):
 @runtime_checkable
 class ContextualRuntime(AgentRuntime, Protocol):
     def set_context(
-        self, role: str, kind: str, number: int, issue: int | None
+        self,
+        role: str,
+        kind: str,
+        number: int,
+        issue: int | None,
+        claim_target: int | None = None,
     ) -> None: ...
 
 

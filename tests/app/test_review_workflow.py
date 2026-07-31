@@ -762,9 +762,9 @@ def test_multi_re_review_at_ceiling_escalates():
 # raise, so the dispatcher's `except BaseException` bump never sees them. These
 # pin the write half of the ceiling: the read half lives in
 # tests/adapters/test_roles.py, which drives it through decide_review.
-def _counter(store, pr_number=100, issue=None):
-    """The counter under the key the dispatcher's death bump would use."""
-    return store.get_infra_deaths(issue if issue is not None else -pr_number)
+def _counter(store, pr_number=100):
+    """The stable PR-keyed review convergence counter."""
+    return store.get_infra_deaths(-pr_number)
 
 
 def _bumps(store) -> int:
@@ -873,17 +873,19 @@ def test_a_multi_leg_that_raises_is_counted_by_the_workflow_not_the_dispatcher()
     assert _counter(store) == 1
 
 
-def test_the_counter_key_is_the_linked_issue_when_the_pr_has_one():
-    """Key agreement with `AgentDispatcher.dispatch`, which bumps under
-    `gateway.issue_for_pr(pr)`. A disagreement here reproduces PR #112: the
-    write lands under one key and the ceiling reads another, forever."""
+def test_the_counter_key_stays_with_the_pr_when_it_has_a_linked_issue():
+    """Review retry identity is independent of mutable issue linkage.
+
+    The dispatcher's raised-session path and the workflow's returned-error path
+    must both charge the stable PR key or relinking can reset the ceiling.
+    """
     pr = PRView(100, head_ref_oid="abc", head_ref_name="fix/42-x", closing_issue=42)
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
 
     asyncio.run(_workflow(gw, store, FakeRunner(AgentResult(is_error=True))).review(100))
 
-    assert store.infra_deaths == {42: 1}
+    assert store.infra_deaths == {-100: 1}
     assert gw.issue_for_pr(100) == 42  # the key the dispatcher would have used
 
 
@@ -909,7 +911,7 @@ def test_a_confirmed_submit_clears_the_unproductive_round_tally():
     pr = PRView(100, head_ref_oid="abc", title="t", body="b", closing_issue=7)
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
-    store.infra_deaths[7] = 4  # four earlier rounds bought nothing
+    store.infra_deaths[-100] = 4  # four earlier rounds bought nothing
     runner = FakeRunner(AgentResult(
         is_error=False, session_id="rs",
         structured={"decision": "APPROVE", "body": "looks good"},
@@ -917,7 +919,7 @@ def test_a_confirmed_submit_clears_the_unproductive_round_tally():
 
     asyncio.run(_workflow(gw, store, runner).review(100))
 
-    assert store.get_infra_deaths(7) == 0, "a productive round must reset the tally"
+    assert store.get_infra_deaths(-100) == 0, "a productive round must reset the tally"
 
 
 def test_a_round_that_submits_nothing_still_counts():
@@ -926,19 +928,21 @@ def test_a_round_that_submits_nothing_still_counts():
     pr = PRView(100, head_ref_oid="abc", title="t", body="b", closing_issue=7)
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
-    store.infra_deaths[7] = 4
+    store.infra_deaths[-100] = 4
     runner = FakeRunner(AgentResult(is_error=True, status="error"))
 
     asyncio.run(_workflow(gw, store, runner).review(100))
 
-    assert store.get_infra_deaths(7) == 5, "an unproductive round still counts up"
+    assert store.get_infra_deaths(-100) == 5, "an unproductive round still counts up"
 
 
 def test_a_productive_round_clears_the_orphaned_half_too():
-    """Same composition gap as the fix role (verification sweep):
-    `roles._review_state` READS the union {breaker_key(pr), -pr}, so decay that
-    cleared only the resolved key left a phantom unproductive round that read as
-    real on every later poll and walked a healthy PR toward escalation."""
+    """A productive round clears both the stable key and legacy issue key.
+
+    Deployments before ADR 0008 could write review deaths under either key.
+    Migration reads and decay must therefore include both until those counters
+    have naturally drained.
+    """
     pr = PRView(100, head_ref_oid="abc", title="t", body="b", closing_issue=7)
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()

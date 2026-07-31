@@ -818,12 +818,33 @@ class FixWorkflow:
             self._decay_infra_deaths(issue, result)
         self.executor.execute_all(outcome.resume_actions(issue, result, pr))
 
-    async def resume_pr(self, pr: int) -> None:
+    def _dispatch_pr(self, pr: int, issue_hint: int | None):
+        """Bind fresh PR state to the issue captured by its claim (ADR 0008)."""
+        if issue_hint is None:
+            issue = self.gateway.issue_for_pr(pr)
+            if issue is None:
+                return None
+            return self.gateway.get_pr(pr), issue
+        current = self.gateway.get_pr(pr)
+        fresh_target = fix_domain.breaker_key(current)
+        if fresh_target != issue_hint:
+            self.cfg.log(
+                f"dispatch for PR #{pr}: deferred — observed target "
+                f"{issue_hint} changed to {fresh_target} before execution"
+            )
+            return None
+        return current, issue_hint if issue_hint > 0 else None
+
+    async def resume_pr(
+        self, pr: int, *, issue_hint: int | None = None
+    ) -> None:
         """Resume a PR-stage block using the linked issue's saved transcript."""
-        issue = self.gateway.issue_for_pr(pr)
+        dispatch = self._dispatch_pr(pr, issue_hint)
+        if dispatch is None:
+            return
+        p, issue = dispatch
         if issue is None:
             return
-        p = self.gateway.get_pr(pr)
         reply_comment = fix_domain.last_human_reply(p, self.cfg.fix_bot)
         if reply_comment is None or not reply_comment.body.strip():
             if reply_comment is not None:
@@ -851,11 +872,15 @@ class FixWorkflow:
             self._decay_infra_deaths(issue, result, alt_key=-pr)
         self.executor.execute_all(outcome.pr_resume_actions(pr, result))
 
-    async def address_review(self, pr: int) -> None:
-        issue = self.gateway.issue_for_pr(pr)
+    async def address_review(
+        self, pr: int, *, issue_hint: int | None = None
+    ) -> None:
+        dispatch = self._dispatch_pr(pr, issue_hint)
+        if dispatch is None:
+            return
+        p, issue = dispatch
         if issue is None:
             return
-        p = self.gateway.get_pr(pr)
         cwd = self._ensure_cwd(issue, p.head_ref_name)
         review_body = self.latest_review_body(p)
         # The file:line asks reviewers actually make live in the INLINE comments,
@@ -904,11 +929,15 @@ class FixWorkflow:
             base = n if at == review_at else 0
             self.store.set_review_retry(issue, review_at, base + 1)
 
-    async def fix_ci(self, pr: int) -> None:
-        issue = self.gateway.issue_for_pr(pr)
+    async def fix_ci(
+        self, pr: int, *, issue_hint: int | None = None
+    ) -> None:
+        dispatch = self._dispatch_pr(pr, issue_hint)
+        if dispatch is None:
+            return
+        p, issue = dispatch
         if issue is None:
             return
-        p = self.gateway.get_pr(pr)
         cwd = self._ensure_cwd(issue, p.head_ref_name)
         failed = "\n".join(c.name for c in p.checks if c.bucket == "fail")
         # Check NAMES alone were all the prompt carried (review M13) — the agent
@@ -948,11 +977,15 @@ class FixWorkflow:
             self.store.bump_infra_deaths(issue)
         self.executor.execute_all(outcome.fix_ci_actions(pr, result))
 
-    async def rebase(self, pr: int) -> None:
-        issue = self.gateway.issue_for_pr(pr)
+    async def rebase(
+        self, pr: int, *, issue_hint: int | None = None
+    ) -> None:
+        dispatch = self._dispatch_pr(pr, issue_hint)
+        if dispatch is None:
+            return
+        p, issue = dispatch
         if issue is None:
             return
-        p = self.gateway.get_pr(pr)
         cwd = self._ensure_cwd(issue, p.head_ref_name)
         task = task_builders.build_rebase_task(
             pr, self.cfg.base_branch, cwd, self.store.get_session(issue),

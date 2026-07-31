@@ -2,7 +2,7 @@
 
 Status: Accepted
 Date: 2026-08-01
-Governs: src/issue_agent/adapters/control_path.py src/issue_agent/adapters/control_store.py src/issue_agent/adapters/deployment_authority.py src/issue_agent/adapters/single_instance.py src/issue_agent/app/roles.py src/issue_agent/app/cli.py
+Governs: src/issue_agent/adapters/control_path.py src/issue_agent/adapters/control_store.py src/issue_agent/adapters/deployment_authority.py src/issue_agent/adapters/single_instance.py src/issue_agent/adapters/accounting_runtime.py src/issue_agent/adapters/journal.py src/issue_agent/adapters/runtime_plan.py src/issue_agent/app/roles.py src/issue_agent/app/dispatch.py src/issue_agent/app/workflows/fix.py src/issue_agent/app/workflows/review.py src/issue_agent/app/cli.py
 
 ## Context
 
@@ -26,6 +26,19 @@ receipts are queried and mutated only within their exact ownership scope.
 Repository/role-global dispatch and path claims prevent intentionally parallel
 checkouts from buying duplicate or overlapping work.
 
+A dispatch target is derived once from the observed world before the claim is
+acquired. The reservation carries that identity through workflow routing and
+paid admission. A later PR read may validate that its linkage still agrees, but
+cannot replace the reserved target; disagreement defers the dispatch. Claim
+identity and spend scope remain distinct: an issue-linked PR uses its positive
+issue number for both, while an issueless PR claims its negative PR number and
+has no per-issue spend scope.
+
+Retry identity answers a different question from claim and spend identity.
+Review convergence is always keyed by negative PR number, so closing-link
+changes cannot erase paid failed rounds. Fix and steward retry ceilings remain
+issue-keyed because their work and lifecycle are issue-owned.
+
 A supported checkout repoint carries an explicit bounded lineage. Adoption
 transfers its live durable ownership transactionally and permanently retires
 the prior owners. Remote effects share a repository/role deployment barrier;
@@ -42,5 +55,7 @@ discovery, and stale service definitions.
   headroom or a second command authority.
 - Repoint is an explicit migration, not permission to adopt arbitrary sibling
   checkouts or repositories.
+- A transient or changing PR-linkage read cannot move an admitted dispatch to
+  a different claim or breaker key after decision.
 - No SQLite transaction spans a remote call; deployment fencing orders the
   call against retirement while command receipts handle remote ambiguity.

@@ -887,7 +887,7 @@ def test_a_review_that_always_dies_pre_result_is_bounded_at_the_ceiling(tmp_path
     assert dispatches == 5, "20 polls must not buy 20 review sessions"
     assert comments == 1, "the handoff is announced once, not once per poll"
     assert Label.NEEDS_HUMAN_REVIEW in labels and Label.AI_PR_OPEN not in labels
-    assert store.get_infra_deaths(9) == 5  # written under the linked issue number
+    assert store.get_infra_deaths(-pr_view.number) == 5
 
 
 def test_without_the_ceiling_the_same_run_buys_a_session_every_poll(tmp_path, monkeypatch):
@@ -949,7 +949,7 @@ def test_a_healthy_review_dispatches_once_and_never_hits_the_ceiling(tmp_path):
     assert dispatches == 1 and comments == 0
     assert any(c[0] == "review" and c[2] == "APPROVE" for c in gw.calls)
     assert store.get_pr_session(pr_view.number) == "rs"
-    assert store.get_infra_deaths(9) == 0
+    assert store.get_infra_deaths(-pr_view.number) == 0
     assert labels == {Label.AI_PR_OPEN}
 
 
@@ -1066,13 +1066,22 @@ def test_control_store_process_deaths_bound_the_review_role(tmp_path):
     w = WorldState(prs=(pr_view,))
 
     assert _review_state(
-        store, w, process_deaths={9: 1}
+        store, w, process_deaths={-pr_view.number: 1}
     ).unproductive_rounds[pr_view.number] == 1
     assert RunAgent(AgentKind.REVIEW, pr_view.number) in decide_review(
-        w, rcfg, _review_state(store, w, process_deaths={9: 1}))
+        w,
+        rcfg,
+        _review_state(
+            store, w, process_deaths={-pr_view.number: 1}
+        ),
+    )
 
     actions = decide_review(
-        w, rcfg, _review_state(store, w, process_deaths={9: 2})
+        w,
+        rcfg,
+        _review_state(
+            store, w, process_deaths={-pr_view.number: 2}
+        ),
     )
     assert not any(isinstance(a, RunAgent) for a in actions)
     assert Relabel(Target.PR, pr_view.number, Label.AI_PR_OPEN,
@@ -1921,6 +1930,185 @@ def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
     # #113: the leg carries its own role, so the governor never has to infer it
     # from a hook file that a differently-roled leg may also resolve to.
     assert seen["env"]["ISSUE_AGENT_LEG_ROLE"] == "review"
+
+
+def test_review_daemon_claim_agrees_with_branch_resolved_issue(tmp_path):
+    """A review claim and paid admission must identify the same target.
+
+    GitHub does not populate ``closing_issue`` for every non-default-base PR,
+    but the fixer's branch still carries its issue number.  The composed
+    review daemon must reach the runner and submit its verdict in that world;
+    otherwise the durable claim and accounting admission disagree before any
+    paid work can start.
+    """
+    from issue_agent.app.config import from_env
+    from issue_agent.app.roles import build_review_daemon
+
+    pr = PRView(
+        152,
+        head_ref_name="fix/150-live-e2e",
+        head_ref_oid="head-152",
+        closing_issue=None,
+        title="dashboard health",
+        body="Adds a health endpoint.",
+        labels=frozenset({Label.AI_PR_OPEN}),
+        state="OPEN",
+        author=FIX_BOT,
+    )
+    world = WorldState(prs=(pr,))
+
+    class BranchLinkedReviewGateway(_BuildableGateway):
+        def build_review_world(self):
+            return world
+
+    gateway = BranchLinkedReviewGateway(
+        prs={pr.number: pr},
+        fail_on={"issue_for_pr"},
+    )
+    runner = FakeRunner(
+        AgentResult(
+            is_error=False,
+            session_id="review-session",
+            structured={"decision": "APPROVE", "body": "lgtm"},
+        )
+    )
+    cfg = replace(
+        from_env({
+            "REPO": "o/r",
+            "FIX_BOT": FIX_BOT,
+            "REVIEW_BOT": REVIEW_BOT,
+            "REVIEWER_RUNTIME": "claude",
+            "TARGET_DIR": str(tmp_path),
+            **_role_state_env(tmp_path),
+        }),
+        control_authority_root=str(tmp_path / "machine-state"),
+    )
+    store = Store(str(tmp_path / "review-state"))
+    daemon = build_review_daemon(cfg, gateway, store, runner)
+
+    actions = daemon.tick()
+    daemon.wait_for_dispatches()
+    assert daemon.shutdown_dispatches(cancel=False)
+
+    assert RunAgent(AgentKind.REVIEW, pr.number) in actions
+    assert len(runner.tasks) == 1
+    assert ("review", pr.number, "APPROVE", "lgtm") in gateway.calls
+    assert store.get_pr_session(pr.number) == "review-session"
+
+
+def test_review_daemon_defers_changed_linkage_without_spend_or_retry(
+    tmp_path,
+):
+    from issue_agent.app.config import from_env
+    from issue_agent.app.roles import build_review_daemon
+
+    observed = PRView(
+        152,
+        head_ref_name="fix/150-live-e2e",
+        head_ref_oid="head-152",
+        closing_issue=None,
+        title="dashboard health",
+        body="Adds a health endpoint.",
+        labels=frozenset({Label.AI_PR_OPEN}),
+        state="OPEN",
+        author=FIX_BOT,
+    )
+    changed = replace(
+        observed,
+        head_ref_name="fix/151-relinked",
+        closing_issue=151,
+    )
+    world = WorldState(prs=(observed,))
+
+    class RelinkedReviewGateway(_BuildableGateway):
+        def build_review_world(self):
+            return world
+
+    gateway = RelinkedReviewGateway(prs={changed.number: changed})
+    runner = FakeRunner(
+        AgentResult(
+            is_error=True,
+            status="must-not-run",
+        )
+    )
+    cfg = replace(
+        from_env({
+            "REPO": "o/r",
+            "FIX_BOT": FIX_BOT,
+            "REVIEW_BOT": REVIEW_BOT,
+            "REVIEWER_RUNTIME": "claude",
+            "TARGET_DIR": str(tmp_path),
+            **_role_state_env(tmp_path),
+        }),
+        control_authority_root=str(tmp_path / "machine-state"),
+    )
+    store = Store(str(tmp_path / "review-state"))
+    daemon = build_review_daemon(cfg, gateway, store, runner)
+
+    actions = daemon.tick()
+    daemon.wait_for_dispatches()
+    assert daemon.shutdown_dispatches(cancel=False)
+
+    assert RunAgent(AgentKind.REVIEW, observed.number) in actions
+    assert runner.tasks == []
+    assert not any(call[0] == "review" for call in gateway.calls)
+    assert store.get_infra_deaths(150) == 0
+    assert store.get_infra_deaths(151) == 0
+
+
+def test_paid_review_failure_remains_counted_after_later_relink(tmp_path):
+    from issue_agent.app.config import from_env
+    from issue_agent.app.roles import build_review_daemon
+
+    observed = PRView(
+        152,
+        head_ref_name="fix/150-live-e2e",
+        head_ref_oid="head-152",
+        closing_issue=150,
+        title="dashboard health",
+        body="Adds a health endpoint.",
+        labels=frozenset({Label.AI_PR_OPEN}),
+        state="OPEN",
+        author=FIX_BOT,
+    )
+    world = WorldState(prs=(observed,))
+
+    class ReviewGateway(_BuildableGateway):
+        def build_review_world(self):
+            return world
+
+    gateway = ReviewGateway(prs={observed.number: observed})
+    runner = FakeRunner(
+        AgentResult(is_error=True, status="provider-error")
+    )
+    cfg = replace(
+        from_env({
+            "REPO": "o/r",
+            "FIX_BOT": FIX_BOT,
+            "REVIEW_BOT": REVIEW_BOT,
+            "REVIEWER_RUNTIME": "claude",
+            "TARGET_DIR": str(tmp_path),
+            **_role_state_env(tmp_path),
+        }),
+        control_authority_root=str(tmp_path / "machine-state"),
+    )
+    store = Store(str(tmp_path / "review-state"))
+    daemon = build_review_daemon(cfg, gateway, store, runner)
+
+    daemon.tick()
+    daemon.wait_for_dispatches()
+    assert daemon.shutdown_dispatches(cancel=False)
+
+    relinked = replace(
+        observed,
+        head_ref_name="fix/151-relinked",
+        closing_issue=151,
+    )
+    state = _review_state(store, WorldState(prs=(relinked,)))
+    assert state.unproductive_rounds[observed.number] == 1
+    assert store.get_infra_deaths(-observed.number) == 1
+    assert store.get_infra_deaths(150) == 0
+    assert store.get_infra_deaths(151) == 0
 
 
 def test_codex_fixer_declares_its_role_so_a_review_hook_cannot_cage_it(tmp_path, monkeypatch):

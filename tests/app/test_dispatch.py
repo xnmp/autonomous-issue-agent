@@ -5,6 +5,7 @@ proving the dispatcher routes inputs→task→run→follow-up correctly. The DEC
 are tested in tests/domain; here we verify the wiring."""
 
 import asyncio
+from dataclasses import replace
 
 import pytest
 
@@ -401,13 +402,23 @@ def test_triage_routes_to_steward_workflow():
     assert store.triage_at[7] == "t_post"
 
 
-def _ci_dispatcher(gw, store, runner, fix_mcp_config=""):
+def _ci_dispatcher(
+    gw, store, runner, fix_mcp_config="", dispatch_claim_target=None
+):
     cfg = DispatchConfig(
         fix=FixTaskConfig("o/r", agent_md="AM"),
         fix_mcp_config=fix_mcp_config, harness_root="/tmp/none",
     )
     executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
-    return AgentDispatcher(cfg, gw, store, FakeWorktrees(), runner, executor)
+    return AgentDispatcher(
+        cfg,
+        gw,
+        store,
+        FakeWorktrees(),
+        runner,
+        executor,
+        dispatch_claim_target=dispatch_claim_target,
+    )
 
 
 def _ci_pr():
@@ -421,6 +432,58 @@ def test_fix_ci_routes_to_fix_workflow():
     d = _ci_dispatcher(gw, FakeStore(), runner)
     asyncio.run(d.dispatch(RunAgent(AgentKind.FIX_CI, 100)))
     assert "SonarQube Code Analysis" in runner.tasks[0].prompt
+
+
+def test_fix_ci_uses_observed_claim_issue_when_live_lookup_fails():
+    gw = FakeGateway(
+        prs={100: _ci_pr()},
+        fail_on={"issue_for_pr"},
+    )
+    runner = FakeRunner(
+        AgentResult(is_error=False, status="pushed", session_id="c5")
+    )
+    store = FakeStore()
+    action = RunAgent(AgentKind.FIX_CI, 100)
+    d = _ci_dispatcher(
+        gw,
+        store,
+        runner,
+        dispatch_claim_target=lambda candidate: (
+            5 if candidate == action else None
+        ),
+    )
+
+    asyncio.run(d.dispatch(action))
+
+    assert "SonarQube Code Analysis" in runner.tasks[0].prompt
+    assert store.sessions[5] == "c5"
+
+
+def test_fix_ci_defers_when_fresh_pr_linkage_disagrees_with_claim():
+    changed = replace(
+        _ci_pr(),
+        head_ref_name="fix/6-moved",
+        closing_issue=6,
+    )
+    gw = FakeGateway(prs={100: changed})
+    runner = FakeRunner(
+        AgentResult(is_error=False, status="pushed", session_id="wrong")
+    )
+    store = FakeStore()
+    action = RunAgent(AgentKind.FIX_CI, 100)
+    d = _ci_dispatcher(
+        gw,
+        store,
+        runner,
+        dispatch_claim_target=lambda candidate: (
+            5 if candidate == action else None
+        ),
+    )
+
+    asyncio.run(d.dispatch(action))
+
+    assert runner.tasks == []
+    assert store.sessions == {}
 
 
 # ── Jira lifecycle sync ─────────────────────────────────────────────────────────
@@ -694,11 +757,8 @@ def _review_pr():
     return PRView(100, head_ref_name="fix/5-x", closing_issue=5)
 
 
-def test_a_death_whose_issue_lookup_failed_retries_before_changing_key_space(tmp_path):
-    """The transient that fails the pre-handler lookup is frequently over by the
-    time the exception unwinds, and one extra gh call on a path that just burned
-    a whole session is free. Without the retry this death lands on -100, which
-    `_fix_state` never reads."""
+def test_review_death_stays_pr_keyed_when_issue_lookup_fails(tmp_path):
+    """Review convergence belongs to the PR, independently of linkage reads."""
     store = Store(state_dir=str(tmp_path))
     gw = FlakyIssueLookup(prs={100: _review_pr()}, issue=5, fail_calls={1})
     d = _dispatcher(gw, store, RaisingRunner())
@@ -706,16 +766,12 @@ def test_a_death_whose_issue_lookup_failed_retries_before_changing_key_space(tmp
     with pytest.raises(RuntimeError):
         asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
 
-    assert gw.lookups == 2, "the lookup was retried on the death path"
-    assert store.get_infra_deaths(5) == 1
-    assert store.get_infra_deaths(-100) == 0
+    assert gw.lookups == 1
+    assert store.get_infra_deaths(5) == 0
+    assert store.get_infra_deaths(-100) == 1
 
 
-def test_a_permanently_flaky_lookup_reuses_the_issue_this_process_resolved(tmp_path):
-    """The review's repro: six paid deaths on one PR while the gateway is sick.
-    All six must land under ONE key the decide side reads — the last issue this
-    process successfully resolved for that PR — not split across two key spaces
-    where neither half reaches the ceiling."""
+def test_repeated_review_deaths_share_one_pr_key_across_lookup_outcomes(tmp_path):
     store = Store(state_dir=str(tmp_path))
     gw = FlakyIssueLookup(prs={100: _review_pr()}, issue=5, fail_calls=set(range(2, 99)))
     d = _dispatcher(gw, store, RaisingRunner())
@@ -724,14 +780,11 @@ def test_a_permanently_flaky_lookup_reuses_the_issue_this_process_resolved(tmp_p
         with pytest.raises(RuntimeError):
             asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
 
-    assert store.get_infra_deaths(5) == 6, "one key, six deaths"
-    assert store.get_infra_deaths(-100) == 0
+    assert store.get_infra_deaths(5) == 0
+    assert store.get_infra_deaths(-100) == 6, "one stable key, six deaths"
 
 
-def test_a_lookup_that_never_answers_falls_back_loudly_to_the_negated_key(tmp_path):
-    """When neither attempt answers and this process has never resolved the PR,
-    `-pr` is all there is — but the operator must be told, because the fix
-    role's `_fix_state` reads `breaker_key(pr)` and may not see it."""
+def test_review_death_needs_no_retry_lookup_to_choose_its_pr_key(tmp_path):
     store = Store(state_dir=str(tmp_path))
     logged: list[str] = []
     gw = FlakyIssueLookup(prs={100: _review_pr()}, issue=5, always=True)
@@ -742,7 +795,6 @@ def test_a_lookup_that_never_answers_falls_back_loudly_to_the_negated_key(tmp_pa
         asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
 
     assert store.get_infra_deaths(-100) == 1
-    assert any("could not be resolved on either attempt" in m for m in logged)
     assert any("could not resolve issue for PR #100" in m for m in logged)
 
 

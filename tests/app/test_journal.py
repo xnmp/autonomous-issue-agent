@@ -373,14 +373,14 @@ def test_default_ledger_path_is_global_and_honours_xdg(monkeypatch):
 # session ends, so a death that takes the daemon with it leaves an
 # `agent_run_start` and nothing else — and systemd brings the process back to
 # buy the same session again.
-def _start(dt, kind="RESOLVE", number=5, issue=5, dispatch=""):
-    return {"ts": _at(dt), "event": "agent_run_start", "role": "fix",
+def _start(dt, kind="RESOLVE", number=5, issue=5, dispatch="", role="fix"):
+    return {"ts": _at(dt), "event": "agent_run_start", "role": role,
             "kind": kind, "number": number, "issue": issue, "model": "opus",
             "dispatch": dispatch}
 
 
-def _run(dt, kind="RESOLVE", number=5, issue=5, dispatch="", **extra):
-    return {"ts": _at(dt), "event": "agent_run", "role": "fix", "kind": kind,
+def _run(dt, kind="RESOLVE", number=5, issue=5, dispatch="", role="fix", **extra):
+    return {"ts": _at(dt), "event": "agent_run", "role": role, "kind": kind,
             "number": number, "issue": issue, "cost_usd": 0.0,
             "dispatch": dispatch, **extra}
 
@@ -417,13 +417,13 @@ def test_a_concurrent_fanout_of_legs_reports_no_deaths():
     starts and settlements in arbitrary order. Pairing "a start is unsettled if
     no settlement precedes the next start" would report 7 phantom deaths for
     this — one healthy review would trip a ceiling of 5 on its own."""
-    starts = [_start(NOW - timedelta(seconds=60 - i), kind="REVIEW", number=100, issue=7)
+    starts = [_start(NOW - timedelta(seconds=60 - i), kind="REVIEW", number=100, issue=7, role="review")
               for i in range(8)]
-    settles = [_run(NOW - timedelta(seconds=30 - i), kind="REVIEW", number=100, issue=7)
+    settles = [_run(NOW - timedelta(seconds=30 - i), kind="REVIEW", number=100, issue=7, role="review")
                for i in range(8)]
     assert unsettled_starts(starts + settles, now_fn=lambda: NOW) == {}
     # …and the same journal WITH one leg killed reports exactly one death.
-    assert unsettled_starts(starts + settles[:-1], now_fn=lambda: NOW) == {7: 1}
+    assert unsettled_starts(starts + settles[:-1], now_fn=lambda: NOW) == {-100: 1}
 
 
 def test_a_dispatch_killed_mid_fanout_is_ONE_death_not_one_per_leg():
@@ -433,10 +433,10 @@ def test_a_dispatch_killed_mid_fanout_is_ONE_death_not_one_per_leg():
     which is exactly the "memory pressure must not walk healthy work to a human"
     rule (FAILURE-MODES #58) inverted."""
     legs = [_start(NOW - timedelta(seconds=60 - i), kind="REVIEW", number=100,
-                   issue=7, dispatch="d1") for i in range(6)]
+                   issue=7, dispatch="d1", role="review") for i in range(6)]
     settled_two = [_run(NOW - timedelta(seconds=30 - i), kind="REVIEW", number=100,
-                        issue=7, dispatch="d1") for i in range(2)]
-    assert unsettled_starts(legs + settled_two, now_fn=lambda: NOW) == {7: 1}
+                        issue=7, dispatch="d1", role="review") for i in range(2)]
+    assert unsettled_starts(legs + settled_two, now_fn=lambda: NOW) == {-100: 1}
 
 
 def test_separate_dispatches_are_separate_deaths():
@@ -445,17 +445,17 @@ def test_separate_dispatches_are_separate_deaths():
     one would never trip on the loop it exists for."""
     events = [
         _start(NOW - timedelta(minutes=m), kind="REVIEW", number=100, issue=7,
-               dispatch=f"d{m}")
+               dispatch=f"d{m}", role="review")
         for m in (30, 20, 10)
     ]
-    assert unsettled_starts(events, now_fn=lambda: NOW) == {7: 3}
+    assert unsettled_starts(events, now_fn=lambda: NOW) == {-100: 3}
 
 
 def test_a_fully_settled_dispatch_is_no_death():
     legs = [_start(NOW - timedelta(seconds=60 - i), kind="REVIEW", number=100,
-                   issue=7, dispatch="d1") for i in range(6)]
+                   issue=7, dispatch="d1", role="review") for i in range(6)]
     settles = [_run(NOW - timedelta(seconds=30 - i), kind="REVIEW", number=100,
-                    issue=7, dispatch="d1") for i in range(6)]
+                    issue=7, dispatch="d1", role="review") for i in range(6)]
     assert unsettled_starts(legs + settles, now_fn=lambda: NOW) == {}
 
 
@@ -526,22 +526,22 @@ def test_a_journal_written_before_dispatch_ids_still_counts_deaths():
     assert unsettled_starts([legacy], now_fn=lambda: NOW) == {5: 1}
 
 
-def test_deaths_key_to_the_issue_so_they_meet_the_dispatchers_counter():
-    """The key must be the one `AgentDispatcher.dispatch` bumps `infra-deaths`
-    under, or the ceiling reads a counter nobody writes (the PR #112 class)."""
+def test_review_deaths_key_to_the_pr_even_when_an_issue_is_linked():
     assert unsettled_starts(
-        [_start(NOW, kind="REVIEW", number=100, issue=7)], now_fn=lambda: NOW
-    ) == {7: 1}
+        [_start(NOW, kind="REVIEW", number=100, issue=7, role="review")],
+        now_fn=lambda: NOW,
+    ) == {-100: 1}
 
 
 def test_an_issueless_prs_death_keys_to_the_negated_pr_number():
     """`breaker_key`'s convention for a PR with no closing ref and a Jira-keyed
     branch: the dispatcher falls back to `-action.number`, so this must too."""
     assert unsettled_starts(
-        [_start(NOW, kind="RE_REVIEW", number=112, issue=None)], now_fn=lambda: NOW
+        [_start(NOW, kind="RE_REVIEW", number=112, issue=None, role="review")], now_fn=lambda: NOW
     ) == {-112: 1}
     assert death_key({"number": 112, "issue": None}) == -112
     assert death_key({"number": 112, "issue": 9}) == 9
+    assert death_key({"role": "review", "number": 112, "issue": 9}) == -112
     assert death_key({}) is None
 
 

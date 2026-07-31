@@ -201,6 +201,13 @@ claims remain repository/role-global, so two intentionally allowed checkouts
 cannot both admit the same target or overlapping path set. A daemon queries
 only its exact ownership scope, so sibling deployments and roles cannot cancel,
 recover, or receipt each other's work.
+The observed-world target used to acquire a dispatch claim is carried through
+workflow routing and paid admission. A fresh PR read may validate that target
+but cannot replace it; changed linkage defers to a new observation. An issueless
+PR is claimed by negative PR number without manufacturing a per-issue spend
+scope (ADR 0008).
+Review retry/death ceilings are separately keyed by negative PR number so a
+later closing-link edit cannot erase an already-paid unproductive round.
 The supported exception is an explicit same-repository checkout repoint:
 `issue-agent start --write-config` records a bounded lineage of exact prior
 checkout identities. The first boot reaps only those process registries and

@@ -1875,6 +1875,7 @@ def build_fix_daemon(
         prepare_cwd=prepare_cwd, journal=journal,
         reserve_fix_paths=reservations.expand,
         dedupe=control,
+        dispatch_claim_target=reservations.issue_for,
     )
     dispatch_runtime = CancellableAsyncDispatch(
         dispatcher.dispatch,
@@ -2072,22 +2073,10 @@ def _review_state(
     """Read the per-PR state `decide_review` needs — including the ceiling
     counter that stops the reviewer paying for a PR that never converges.
 
-    `unproductive_rounds` is PR-keyed in the domain but reconciled from TWO
-    store key spaces here, because the two write sides disagree by construction
-    (review P0R-3):
-
-      * `AgentDispatcher.dispatch` bumps `infra-deaths` under
-        `gateway.issue_for_pr(pr)`, falling back to `-pr` when that lookup
-        returns None *or raises* — and the flakiness that kills sessions is
-        exactly the flakiness that fails the lookup, so a PR's deaths can land
-        in BOTH key spaces across a run of polls;
-      * `ReviewWorkflow` bumps the same counter under `breaker_key(pr)` (pure,
-        from the PRView it already fetched) for a round that ran and persisted
-        nothing.
-
-    Summing the union is what makes the ceiling see every paid round regardless
-    of which key the writer chose. `breaker_key(pr) == -pr` for an issueless PR,
-    and a set literal dedupes it, so nothing is double counted."""
+    New review failures and recovered deaths use the stable `-PR` key so a
+    closing-link change cannot erase a paid round. The current issue key is
+    included only to migrate counters written before that policy. For an
+    issueless PR both keys coincide and the set deduplicates them."""
     sessions = frozenset(p.number for p in world.prs if store.get_pr_session(p.number))
     last = {p.number: store.get_last_sha(p.number) for p in world.prs}
     deaths = process_deaths or {}
@@ -2198,7 +2187,10 @@ def build_review_daemon(
             runtime=review_runtime.runtime.value,
             state_dir=cfg.review_state_dir,
         ),
-        executor, journal=journal, dedupe=control,
+        executor,
+        journal=journal,
+        dedupe=control,
+        dispatch_claim_target=reservations.issue_for,
     )
     dispatch_runtime = CancellableAsyncDispatch(
         dispatcher.dispatch,
@@ -2216,13 +2208,19 @@ def build_review_daemon(
                 control.abandoned_dispatch_counts(owner_id),
             ),
         )
+        prs = {pr.number: pr for pr in world.prs}
         rejected_prs: set[int] = set()
         for action in actions:
             if not isinstance(action, RunAgent):
                 continue
+            pr = prs.get(action.number)
+            # ADR 0008: the repository-global claim and paid admission must use
+            # one target identity. Branch linkage is authoritative when GitHub
+            # omits a closing issue on a non-default-base PR.
+            issue = breaker_key(pr) if pr is not None else -action.number
             if reservations.reserve(
                 action,
-                -action.number,
+                issue,
                 frozenset({f"pr:{action.number}"}),
             ):
                 continue
@@ -2431,7 +2429,10 @@ def build_steward_daemon(
             runtime="claude",
             state_dir=cfg.steward_state_dir,
         ),
-        executor, journal=journal, dedupe=control,
+        executor,
+        journal=journal,
+        dedupe=control,
+        dispatch_claim_target=reservations.issue_for,
     )
     dispatch_runtime = CancellableAsyncDispatch(
         dispatcher.dispatch,

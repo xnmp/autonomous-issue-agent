@@ -114,7 +114,24 @@ class ReviewWorkflow:
             pr_escalation(pr, reason, from_label=self._trigger_label()).actions()
         )
 
-    def _no_progress(self, pr, reason: str) -> None:
+    def _claim_matches(self, pr, claim_target: int | None) -> bool:
+        """Enforce ADR 0008's observation-to-admission target fence."""
+        if claim_target is None:
+            return True
+        fresh_target = breaker_key(pr)
+        if fresh_target == claim_target:
+            return True
+        self.cfg.log(
+            f"review #{pr.number}: deferred — observed target {claim_target} "
+            f"changed to {fresh_target} before execution"
+        )
+        return False
+
+    def _no_progress(
+        self,
+        pr,
+        reason: str,
+    ) -> None:
         """Record that a PAID review round advanced nothing (review P0R-3).
 
         Every `return` in this class that skips `save_pr_session`/`set_last_sha`
@@ -125,13 +142,11 @@ class ReviewWorkflow:
         dispatcher's `except BaseException` bump only fires when the leg RAISED
         out of the workflow, and these paths all return normally.
 
-        Written under `breaker_key(pr)` — the same counter the dispatcher's
-        death bump uses, and `app.roles._review_state` reads the union of that
-        key and `-pr.number`, so writer and reader agree whichever branch each
-        took. `pr` is the PRView (not the number) so the key is derived purely,
-        with no extra gh call on a path that is already a failure.
+        Review convergence is PR-keyed, independently of issue-keyed claim and
+        spend attribution. A later closing-link change must not erase a paid
+        failed round from the reviewer's ceiling.
         """
-        key = breaker_key(pr)
+        key = -pr.number
         try:
             n = self.store.bump_infra_deaths(key)
         except Exception as exc:  # noqa: BLE001 — a counter must not mask the failure
@@ -191,12 +206,21 @@ class ReviewWorkflow:
             return None
         return replace(task, cwd=self.cfg.execution_cwd)
 
-    async def review(self, pr: int) -> None:
+    async def review(
+        self, pr: int, *, claim_target: int | None = None
+    ) -> None:
         p = self.gateway.get_pr(pr)
+        if not self._claim_matches(p, claim_target):
+            return
         if self._already_reviewed(p):
             return
         if self.cfg.review_mode is review_dom.ReviewMode.MULTI:
-            await self._review_multi(pr, round_number=1, p=p)
+            await self._review_multi(
+                pr,
+                round_number=1,
+                p=p,
+                claim_target=claim_target,
+            )
             return
         # SINGLE and DELEGATED share the submit-before-persist contract; they differ
         # only in the task builder (delegated attaches a code-scout subagent).
@@ -252,14 +276,18 @@ class ReviewWorkflow:
         self.store.set_last_sha(pr, p.head_ref_oid)
         self._record_patch(pr, signature)
         self.store.set_round(pr, 1)
-        self._progress(p)
+        self._progress(p, claim_target)
 
-    async def re_review(self, pr: int) -> None:
+    async def re_review(
+        self, pr: int, *, claim_target: int | None = None
+    ) -> None:
         # The diff comes first, in EVERY mode: a head advance that leaves the
         # patch unchanged (a mechanical rebase) must be settled by one `gh pr
         # diff` rather than by a paid review round — most of all under MULTI,
         # whose round is a gate + 5 dimensions + N validators (harness #2).
         p = self.gateway.get_pr(pr)
+        if not self._claim_matches(p, claim_target):
+            return
         if self._already_reviewed(p):
             return
         diff = self._revision_bound_diff(p)
@@ -271,7 +299,13 @@ class ReviewWorkflow:
             return
         round_number = self.store.get_round(pr) + 1
         if self.cfg.review_mode is review_dom.ReviewMode.MULTI:
-            await self._review_multi(pr, round_number=round_number, p=p, diff=diff)
+            await self._review_multi(
+                pr,
+                round_number=round_number,
+                p=p,
+                diff=diff,
+                claim_target=claim_target,
+            )
             return
         last_sha = self.store.get_last_sha(pr)
         if self.cfg.review_mode is review_dom.ReviewMode.DELEGATED:
@@ -345,7 +379,7 @@ class ReviewWorkflow:
         self.store.set_last_sha(pr, p.head_ref_oid)
         self._record_patch(pr, signature)
         self.store.set_round(pr, round_number)
-        self._progress(p)
+        self._progress(p, claim_target)
 
     def _already_reviewed(self, p) -> bool:
         """Settle a retried dispatch when GitHub already has our verdict on HEAD."""
@@ -497,7 +531,12 @@ class ReviewWorkflow:
         ]
 
     async def _review_multi(
-        self, pr: int, round_number: int, p=None, diff: str | None = None
+        self,
+        pr: int,
+        round_number: int,
+        p=None,
+        diff: str | None = None,
+        claim_target: int | None = None,
     ) -> None:
         """The /code-review pattern as dispatcher orchestration: skip-gate →
         parallel dimension specialists → per-finding adversarial validation →
@@ -557,7 +596,7 @@ class ReviewWorkflow:
                 pr, sub.event, sub.body, p.head_ref_oid
             ):
                 self._persist_review_state(pr, p.head_ref_oid, round_number, signature)
-                self._progress(p)
+                self._progress(p, claim_target)
             else:
                 self._no_progress(p, "gate APPROVE POST failed")
             return
@@ -645,9 +684,9 @@ class ReviewWorkflow:
         if sub.escalate:
             self._escalate(pr, prior + 1)
         self._persist_review_state(pr, p.head_ref_oid, round_number, signature)
-        self._progress(p)
+        self._progress(p, claim_target)
 
-    def _progress(self, p) -> None:
+    def _progress(self, p, claim_target: int | None = None) -> None:
         """A round DID advance: clear the no-progress tally (the reviewer's twin
         of review P1R-3's decay).
 
@@ -666,7 +705,14 @@ class ReviewWorkflow:
         session. Clearing only the resolved key would strand that death forever
         — it reads as real on every later poll and walks a healthy PR toward
         needs-human-review. Decay must clear exactly the set the read unions."""
-        for key in {breaker_key(p), -p.number}:
+        # Clear the stable key plus the current issue key used by deployments
+        # predating the PR-keyed policy. New failures are written only to -PR.
+        legacy = (
+            claim_target
+            if claim_target is not None
+            else breaker_key(p)
+        )
+        for key in {-p.number, legacy}:
             try:
                 self.store.clear_infra_deaths(key)
             except Exception as exc:  # noqa: BLE001 — decay is best-effort, never fatal

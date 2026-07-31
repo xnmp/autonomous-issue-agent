@@ -74,9 +74,12 @@ class AccountingRuntime(AgentRuntime):
     github_host: str = "github.com"
     approved_base_branch: str = "dev"
     require_dispatch_claim: bool = False
-    _context: contextvars.ContextVar[tuple[int | None, str, int]] = field(
+    _context: contextvars.ContextVar[
+        tuple[int | None, str, int, int | None]
+    ] = field(
         default_factory=lambda: contextvars.ContextVar(
-            f"accounting_context_{uuid.uuid4().hex}", default=(None, "", 0)
+            f"accounting_context_{uuid.uuid4().hex}",
+            default=(None, "", 0, None),
         ),
         init=False,
         repr=False,
@@ -92,9 +95,14 @@ class AccountingRuntime(AgentRuntime):
     )
 
     def set_context(
-        self, role: str, kind: str, number: int, issue: int | None
+        self,
+        role: str,
+        kind: str,
+        number: int,
+        issue: int | None,
+        claim_target: int | None = None,
     ) -> None:
-        self._context.set((issue, kind, number))
+        self._context.set((issue, kind, number, claim_target))
 
     def set_run_identity(self, run_id: str, leg_id: str) -> None:
         if not run_id or not leg_id:
@@ -103,7 +111,15 @@ class AccountingRuntime(AgentRuntime):
 
     async def run(self, task: RuntimePlan) -> AgentResult:
         now = datetime.now(timezone.utc)
-        issue, kind, number = self._context.get()
+        issue, kind, number, claim_target = self._context.get()
+        # ADR 0008: paid admission binds the decision-side target unchanged;
+        # review convergence remains PR-owned even when spend is issue-scoped.
+        target = (
+            claim_target
+            if claim_target is not None
+            else _breaker_key(kind, number, issue)
+        )
+        retry_key = -number if self.role == "review" else target
         if (
             self.runtime_name == "codex"
             and self.rate_table is None
@@ -156,7 +172,8 @@ class AccountingRuntime(AgentRuntime):
                 "kind": kind or "unknown",
                 "number": number,
                 "issue": issue,
-                "breaker_key": _breaker_key(kind, number, issue),
+                "breaker_key": retry_key,
+                "claim_target": target,
                 "cwd": (
                     str(Path(task.cwd).resolve())
                     if task.cwd is not None
@@ -207,7 +224,7 @@ class AccountingRuntime(AgentRuntime):
         if self.require_dispatch_claim and not self.store.bind_dispatch_claim(
             self.repository,
             self.role,
-            _breaker_key(kind or "", number, issue),
+            target,
             request.owner_id,
             run_id,
         ):

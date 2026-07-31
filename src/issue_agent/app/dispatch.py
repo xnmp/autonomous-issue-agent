@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, replace
 from collections.abc import Callable
+from functools import partial
 
 from ..domain import review as review_dom, triage as triage_dom
 from ..domain.actions import AgentKind, RunAgent
@@ -207,6 +208,7 @@ class AgentDispatcher:
         journal: EventSink | None = None,
         reserve_fix_paths: Callable[[int, frozenset[str]], bool] | None = None,
         dedupe: ControlStore | None = None,
+        dispatch_claim_target: Callable[[RunAgent], int | None] | None = None,
     ):
         self.cfg = cfg
         self.gw = gateway
@@ -214,6 +216,7 @@ class AgentDispatcher:
         self.runner = runner
         self.executor = executor
         self.journal = journal
+        self.dispatch_claim_target = dispatch_claim_target
         # PR → issue answers this process has actually received. A dying
         # gateway must not silently move a counter into a key space nobody
         # reads (review P1R-1); see `_spend_target`.
@@ -299,18 +302,28 @@ class AgentDispatcher:
             self._issue_memo[pr] = issue
         return issue, True
 
-    def _spend_target(self, action: RunAgent) -> tuple[int | None, bool]:
-        """`(issue, resolved)` for the dispatch as a whole. `issue` is None only
-        when it is genuinely unknowable; unknown is tolerated — it costs
-        per-issue attribution, never a dispatch."""
+    def _spend_target(
+        self, action: RunAgent
+    ) -> tuple[int | None, bool, int | None]:
+        """Issue scope, resolution status, and the reserved claim target.
+
+        ADR 0008 makes the decision-side reservation authoritative for a
+        production dispatch. Re-reading linkage here can disagree with the
+        observed world after its global claim was acquired. Hand-built
+        dispatchers without reservations retain the gateway fallback.
+        """
+        if self.dispatch_claim_target is not None:
+            target = self.dispatch_claim_target(action)
+            if target is not None:
+                return (target if target > 0 else None), True, target
         if action.kind not in self._PR_KEYED:
-            return action.number, True
+            return action.number, True, None
         issue, resolved = self._lookup_issue(action.number)
         if resolved:
-            return issue, True
+            return issue, True, None
         # The lookup failed. The last answer this process got for the SAME PR is
         # a far better key than a silent switch to the negated-PR space.
-        return self._issue_memo.get(action.number), False
+        return self._issue_memo.get(action.number), False, None
 
     def _issue_number(self, action: RunAgent) -> int | None:
         """The issue this dispatch spends against (see `_spend_target`)."""
@@ -332,6 +345,10 @@ class AgentDispatcher:
              counter genuinely may not be read by the fix role's `_fix_state`
              (the review role already reads the union — see `roles._review_state`).
         """
+        # Review retry policy is PR-keyed even when claim/spend attribution is
+        # issue-keyed. A later relink must not erase a paid failed round.
+        if action.kind in {AgentKind.REVIEW, AgentKind.RE_REVIEW}:
+            return -action.number
         if issue is not None:
             return issue
         if action.kind not in self._PR_KEYED:
@@ -367,12 +384,28 @@ class AgentDispatcher:
         }.get(action.kind)
         if handler is None:
             return
-        issue, resolved = self._spend_target(action)
+        issue, resolved, claim_target = self._spend_target(action)
+        if action.kind in {
+            AgentKind.PR_RESUME,
+            AgentKind.ADDRESS_REVIEW,
+            AgentKind.FIX_CI,
+            AgentKind.REBASE,
+        } and claim_target is not None and issue is not None:
+            handler = partial(handler, issue_hint=issue)
+        if action.kind in {
+            AgentKind.REVIEW,
+            AgentKind.RE_REVIEW,
+        } and claim_target is not None:
+            handler = partial(handler, claim_target=claim_target)
         # Tag every leg this dispatch runs (a multi-agent review runs six) with the
         # same context, so the ledger attributes each one to the work that caused it.
         if isinstance(self.runner, ContextualRuntime):
             self.runner.set_context(
-                self.cfg.role, action.kind.name, action.number, issue
+                self.cfg.role,
+                action.kind.name,
+                action.number,
+                issue,
+                claim_target=claim_target,
             )
         try:
             await handler(action.number)

@@ -15,6 +15,7 @@ from issue_agent.adapters.codex_runner import (
 )
 from issue_agent.adapters.control_store import Lease, SQLiteControlStore
 from issue_agent.adapters.event_log import EventLog
+from issue_agent.adapters.journal import JournalingRuntime
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.contracts import Money, RunId
 from issue_agent.domain.events import (
@@ -30,6 +31,7 @@ from issue_agent.domain.pricing import (
     RateTable,
     UnknownModelPolicy,
 )
+from tests.fakes.legacy_journal import Journal
 
 
 def _policy(maximum=2_000_000):
@@ -432,6 +434,176 @@ def test_issue_less_review_keeps_repository_and_global_caps(tmp_path) -> None:
             )
         }
     assert scopes == {("o/r", "repository"), ("*", "global")}
+
+
+def test_issue_less_review_binds_pr_claim_without_issue_budget_scope(
+    tmp_path,
+) -> None:
+    runtime = Runtime(
+        AgentResult(
+            False,
+            status="reviewed",
+            usage={"input_tokens": 1, "output_tokens": 1},
+        )
+    )
+    wrapper, store = _wrapper(tmp_path, runtime)
+    owner = "o/r:review:deployment"
+    wrapper = dataclasses.replace(
+        wrapper,
+        role="review",
+        owner_id=owner,
+        require_dispatch_claim=True,
+        budget_policy=BudgetPolicy(
+            {("review", "REVIEW"): Money("USD", 2_000_000)}
+        ),
+    )
+    assert store.claim_dispatch(
+        "o/r",
+        "review",
+        -42,
+        "REVIEW",
+        owner,
+        frozenset({"pr:42"}),
+    )
+    wrapper.set_context(
+        "review",
+        "REVIEW",
+        42,
+        None,
+        claim_target=-42,
+    )
+
+    result = asyncio.run(
+        wrapper.run(
+            RuntimePlan("review", model="gpt-test", max_budget_usd=2)
+        )
+    )
+
+    assert result.status == "reviewed"
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM dispatch_claim_runs "
+            "WHERE repository='o/r' AND role='review' AND target='pr:42'"
+        ).fetchone()[0] == 1
+        dimensions = {
+            row[0]
+            for row in db.execute(
+                "SELECT dimension FROM reservation_limits"
+            )
+        }
+    assert dimensions == {"repository"}
+
+
+def test_issue_less_multi_review_preserves_pr_claim_across_leg_context(
+    tmp_path,
+) -> None:
+    runtime = Runtime(
+        AgentResult(
+            False,
+            status="reviewed",
+            usage={"input_tokens": 1, "output_tokens": 1},
+        )
+    )
+    accounting, store = _wrapper(tmp_path, runtime)
+    owner = "o/r:review:deployment"
+    accounting = dataclasses.replace(
+        accounting,
+        role="review",
+        owner_id=owner,
+        require_dispatch_claim=True,
+        budget_policy=BudgetPolicy(
+            {("review", "REVIEW_GATE"): Money("USD", 2_000_000)}
+        ),
+    )
+    assert store.claim_dispatch(
+        "o/r",
+        "review",
+        -42,
+        "REVIEW",
+        owner,
+        frozenset({"pr:42"}),
+    )
+    journaled = JournalingRuntime(
+        accounting,
+        Journal(str(tmp_path / "events.jsonl")),
+        repo="o/r",
+        role="review",
+    )
+    journaled.set_context(
+        "review",
+        "REVIEW",
+        42,
+        None,
+        claim_target=-42,
+    )
+
+    with journaled.leg_kind("REVIEW_GATE"):
+        result = asyncio.run(
+            journaled.run(
+                RuntimePlan(
+                    "review gate",
+                    model="gpt-test",
+                    max_budget_usd=2,
+                )
+            )
+        )
+
+    assert result.status == "reviewed"
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM dispatch_claim_runs "
+            "WHERE repository='o/r' AND role='review' AND target='pr:42'"
+        ).fetchone()[0] == 1
+
+
+def test_linked_review_separates_issue_claim_from_pr_retry_key(tmp_path) -> None:
+    runtime = Runtime(
+        AgentResult(
+            False,
+            status="reviewed",
+            usage={"input_tokens": 1, "output_tokens": 1},
+        )
+    )
+    wrapper, store = _wrapper(tmp_path, runtime)
+    owner = "o/r:review:deployment"
+    wrapper = dataclasses.replace(
+        wrapper,
+        role="review",
+        owner_id=owner,
+        require_dispatch_claim=True,
+        budget_policy=BudgetPolicy(
+            {("review", "REVIEW"): Money("USD", 2_000_000)}
+        ),
+    )
+    assert store.claim_dispatch(
+        "o/r",
+        "review",
+        9,
+        "REVIEW",
+        owner,
+        frozenset({"pr:42"}),
+    )
+    wrapper.set_context(
+        "review",
+        "REVIEW",
+        42,
+        9,
+        claim_target=9,
+    )
+
+    result = asyncio.run(
+        wrapper.run(
+            RuntimePlan("review", model="gpt-test", max_budget_usd=2)
+        )
+    )
+
+    assert result.status == "reviewed"
+    with store._connect() as db:
+        payload = json.loads(
+            db.execute("SELECT dispatch_id FROM runs").fetchone()[0]
+        )
+    assert payload["claim_target"] == 9
+    assert payload["breaker_key"] == -42
 
 
 def test_missing_issue_still_blocks_issue_scoped_fix_work(tmp_path) -> None:
