@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from issue_agent.adapters import control_path
 from issue_agent.adapters.event_log import EventLog
 from issue_agent.app import cli, dashboard as dash
 from issue_agent.domain import dashboard as dashboard_domain
@@ -29,6 +30,15 @@ from issue_agent.domain.events import (
 )
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_machine_control_authority(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        control_path,
+        "machine_control_authority_root",
+        lambda: str(tmp_path / "machine-state"),
+    )
 
 
 def _now():

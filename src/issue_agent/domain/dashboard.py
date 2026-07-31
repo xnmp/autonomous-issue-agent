@@ -361,7 +361,10 @@ def build_deployment_v2(
             and isinstance((payload := event.payload), SpendRecorded)
         )
     )
-    unattributed = tuple(encode_event(event) for event in unattributed_events)
+    unattributed = tuple(
+        _dashboard_event_view(event, model)
+        for event in unattributed_events
+    )
     return Deployment(
         name=name,
         repo=repo,
@@ -664,6 +667,11 @@ def _dashboard_event_view(
         )
     elif isinstance(payload, EscalationRaised):
         view["event"] = "escalation"
+    elif isinstance(payload, SpendBlocked):
+        view["event"] = "spend_block"
+    elif isinstance(payload, SpendRecorded):
+        view["event"] = "spend"
+        view["cost_usd"] = payload.amount_micros / 1_000_000
     elif isinstance(payload, LevelChanged):
         attributes = dict(payload.attributes or {})
         view.update(attributes)
@@ -1067,7 +1075,21 @@ def build_metrics(rows, unattributed, today_usd: float) -> Metrics:
     for leg in legs:
         cost, n = by_kind.get(leg.kind, (0.0, 0))
         by_kind[leg.kind] = (cost + leg.cost_usd, n + 1)
-    total = sum(row.cost_usd for row in rows)
+    unattributed_cost: dict[str, float] = {}
+    for index, event in enumerate(unattributed):
+        event_name = event.get("event")
+        if event_name not in {"agent_run", "spend"}:
+            continue
+        identity = str(
+            event.get("run_id")
+            or event.get("event_id")
+            or f"unattributed:{index}"
+        )
+        if event_name == "spend" or identity not in unattributed_cost:
+            unattributed_cost[identity] = _float(event.get("cost_usd"))
+    total = sum(row.cost_usd for row in rows) + sum(
+        unattributed_cost.values()
+    )
     done = [row for row in rows if row.done]
     approvals, changes = first_pass_verdicts(rows)
     reviewed = [row for row in rows if row.rounds]

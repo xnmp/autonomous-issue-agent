@@ -27,7 +27,9 @@ from issue_agent.domain.events import (
     AgentRunStarted,
     Correlation,
     DaemonStateChanged,
+    EscalationRaised,
     Producer,
+    SpendBlocked,
     SpendRecorded,
     WorldFeedRetired,
     WorldObserved,
@@ -250,6 +252,81 @@ def test_production_dashboard_today_spend_comes_from_sqlite_not_telemetry(
     assert "today (settled SQLite, this repo): $0.70" in render_text(
         [deployment], now_fn=lambda: NOW
     )
+
+
+def test_v2_unattributed_events_keep_cost_and_guardrail_metrics(tmp_path):
+    state = tmp_path / "fix"
+    state.mkdir()
+    events = EventLog(
+        str(state / "events-v2.jsonl"),
+        Producer("deployment", "owner/repo", "fix", 100, "boot"),
+    )
+    correlation = Correlation(
+        dispatch_id="maintenance",
+        run_id="unattributed-run",
+        leg_id="unattributed-leg",
+    )
+    events.emit(
+        AgentRunStarted("gpt-test", "MAINTENANCE"),
+        correlation=correlation,
+        causation_time=NOW,
+    )
+    events.emit(
+        AgentRunCompleted(
+            "ok",
+            False,
+            None,
+            1_000,
+            "gpt-test",
+            "codex",
+            800_000,
+            "USD",
+            "configured_rate_card",
+            None,
+            None,
+            "MAINTENANCE",
+        ),
+        correlation=correlation,
+        causation_time=NOW,
+    )
+    events.emit(
+        SpendRecorded(
+            "unattributed-run",
+            800_000,
+            "USD",
+            "configured_rate_card",
+            "card",
+            "v1",
+        ),
+        correlation=correlation,
+        causation_time=NOW,
+    )
+    events.emit(
+        SpendBlocked("global", "exhausted", 800_000, 500_000, "USD", "cap"),
+        causation_time=NOW,
+    )
+    events.emit(
+        EscalationRaised("pr", 90),
+        causation_time=NOW,
+    )
+
+    deployment = collect(
+        "demo",
+        "owner/repo",
+        (
+            str(state / "journal.jsonl"),
+            str(tmp_path / "review" / "journal.jsonl"),
+            str(tmp_path / "steward" / "journal.jsonl"),
+        ),
+        str(tmp_path / "logs"),
+        str(tmp_path / "spend.jsonl"),
+        now_fn=lambda: NOW,
+    )
+
+    assert deployment.metrics.total_cost_usd == 0.8
+    assert deployment.metrics.by_kind == (("MAINTENANCE", 0.8, 1),)
+    assert deployment.metrics.spend_blocks == 1
+    assert deployment.metrics.escalations == 1
 
 
 @pytest.mark.parametrize("retirement", ["tombstone", "feed"])
