@@ -262,6 +262,7 @@ def _control_store(
         _owner_identity(cfg, role),
         prior_owner_ids=prior_owners,
     )
+    control.bind_active_owner(_owner_identity(cfg, role))
     control.bind_event_outbox(
         journal.events.prepare,
         journal.events.append_committed,

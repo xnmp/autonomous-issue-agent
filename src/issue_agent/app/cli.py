@@ -887,6 +887,46 @@ def _resolve_context(args) -> tuple[str, str, str]:
     return repo, target_dir, name
 
 
+def _stop_deployment(name: str) -> int:
+    """Stop and verify every foreground or service-owned process for a name."""
+
+    launchers = _launcher_pids(name)
+    roles = _role_pids(name)
+    pids = sorted(
+        set(launchers)
+        | {pid for group in roles.values() for pid in group}
+    )
+    if not pids:
+        info(f"no watchers running for '{name}'.")
+        return 0
+    info(f"stopping watchers for '{name}' (pids: {' '.join(map(str, pids))})")
+    for pid in pids:
+        try:
+            os.kill(pid, 15)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 90
+    remaining = set(pids)
+    while remaining and time.monotonic() < deadline:
+        for pid in tuple(remaining):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                remaining.discard(pid)
+            except PermissionError:
+                pass
+        if remaining:
+            time.sleep(0.1)
+    if remaining:
+        err(
+            "watchers did not stop within 90s "
+            f"(still alive: {' '.join(map(str, sorted(remaining)))})"
+        )
+        return 1
+    ok("watchers stopped and verified")
+    return 0
+
+
 def cmd_start(args) -> int:
     repo, target_dir, name = _resolve_context(args)
     if not repo:
@@ -945,10 +985,11 @@ def cmd_start(args) -> int:
                 f"config/repos/{name}.env for THIS checkout."
             )
             return 2
-    if not os.path.isfile(overlay) or args.write_config:
+    replacing_overlay = os.path.isfile(overlay)
+    if not replacing_overlay or args.write_config:
         os.makedirs(REPOS_DIR, exist_ok=True)
         repoint_history: tuple[tuple[str, str], ...] = ()
-        if os.path.isfile(overlay):
+        if replacing_overlay:
             try:
                 repoint_history = repoint_history_for_overlay(
                     overlay,
@@ -991,6 +1032,18 @@ def cmd_start(args) -> int:
             max_budget=args.max_budget or "", review_budget=args.review_budget or "",
             repointed_from_deployments=repoint_history,
         )
+        if replacing_overlay:
+            info(
+                f"quiescing '{name}' before replacing its immutable "
+                "deployment snapshot"
+            )
+            stopped = _stop_deployment(name)
+            if stopped != 0:
+                err(
+                    f"REFUSING to rewrite config/repos/{name}.env while its "
+                    "existing deployment is still running"
+                )
+                return stopped
         with open(overlay, "w") as f:
             f.write(content)
         ok(f"wrote config/repos/{name}.env  (repo={repo}, target={target_dir})")
@@ -1022,39 +1075,7 @@ def cmd_stop(args) -> int:
         err("This would SIGTERM another deployment's daemons. Pass --name <other> "
             "for the overlay that matches this checkout.")
         return 2
-    launchers = _launcher_pids(name)
-    roles = _role_pids(name)
-    pids = sorted(set(launchers) | {p for ps in roles.values() for p in ps})
-    if not pids:
-        info(f"no watchers running for '{name}'.")
-        return 0
-    info(f"stopping watchers for '{name}' (pids: {' '.join(map(str, pids))})")
-    # Kill launchers first (their trap tears down the group), then any strays.
-    for pid in pids:
-        try:
-            os.kill(pid, 15)  # SIGTERM — daemons/flocks free cleanly
-        except ProcessLookupError:
-            pass
-    deadline = time.monotonic() + 90
-    remaining = set(pids)
-    while remaining and time.monotonic() < deadline:
-        for pid in tuple(remaining):
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                remaining.discard(pid)
-            except PermissionError:
-                pass
-        if remaining:
-            time.sleep(0.1)
-    if remaining:
-        err(
-            "watchers did not stop within 90s "
-            f"(still alive: {' '.join(map(str, sorted(remaining)))})"
-        )
-        return 1
-    ok("watchers stopped and verified")
-    return 0
+    return _stop_deployment(name)
 
 
 # M11: STATE_DIR/REVIEW_STATE_DIR/STEWARD_STATE_DIR paired with the synth

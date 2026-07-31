@@ -3,6 +3,7 @@ import pytest
 from issue_agent.adapters.control_store import (
     CorruptControlStore,
     IncompatibleSchema,
+    RetiredOwnerError,
 )
 from issue_agent.app import main as main_module
 from issue_agent.domain.supervision import ExitCode
@@ -49,6 +50,29 @@ def test_reload_candidate_runs_full_config_validation(monkeypatch):
     main_module._validate_reload_candidate({"REPO": "o/r"})
 
     assert validated == [True]
+
+
+def test_retired_deployment_owner_exits_cleanly_without_service_restart(
+    tmp_path,
+    monkeypatch,
+):
+    env_file = tmp_path / "agent.env"
+    env_file.write_text('REPO="o/r"\n')
+    monkeypatch.setenv("AGENT_ENV", str(env_file))
+    monkeypatch.setattr(
+        main_module, "acquire", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(
+        main_module,
+        "build_role",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RetiredOwnerError("old owner")
+        ),
+    )
+
+    with pytest.raises(SystemExit) as stopped:
+        main_module.main(["fix"])
+    assert stopped.value.code is ExitCode.CLEAN
 
 
 def test_second_sigterm_escalates_to_transient_hard_exit():

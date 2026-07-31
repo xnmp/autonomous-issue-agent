@@ -26,6 +26,7 @@ from issue_agent.adapters.control_store import (
     LegacySpendMigrationError,
     Lease,
     ReservationRequest,
+    RetiredOwnerError,
     SQLiteControlStore,
     SettlementRequest,
     read_settled_spend,
@@ -123,7 +124,13 @@ def test_control_store_initializes_with_restrictive_permissions_and_integrity(tm
             "ORDER BY version"
         ).fetchall()
     assert history == [
-        (9, 64), (10, 64), (11, 64), (12, 64), (13, 64), (14, 64)
+        (9, 64),
+        (10, 64),
+        (11, 64),
+        (12, 64),
+        (13, 64),
+        (14, 64),
+        (15, 64),
     ]
 
 
@@ -156,6 +163,8 @@ def test_repository_alias_migration_unifies_authoritative_rows(tmp_path):
     )
     store.enqueue_command(command)
     with store._connect() as db:
+        db.execute("DROP TABLE retired_owners")
+        db.execute("DELETE FROM schema_migrations WHERE version=15")
         db.execute("DROP TABLE dispatch_claim_runs")
         db.execute("DELETE FROM schema_migrations WHERE version=14")
         db.execute("DELETE FROM schema_migrations WHERE version=13")
@@ -194,6 +203,8 @@ def test_repository_alias_claim_collision_fails_as_permanent_schema_error(
 ):
     store = _store(tmp_path)
     with store._connect() as db:
+        db.execute("DROP TABLE retired_owners")
+        db.execute("DELETE FROM schema_migrations WHERE version=15")
         db.execute("DROP TABLE dispatch_claim_runs")
         db.execute("DELETE FROM schema_migrations WHERE version=14")
         db.execute("DELETE FROM schema_migrations WHERE version=13")
@@ -280,6 +291,7 @@ def test_shipped_v8_database_upgrades_without_rewriting_history_or_data(
     request = _request(1)
     assert store.reserve(request).admitted
     with sqlite3.connect(store.path) as db:
+        db.execute("DROP TABLE retired_owners")
         db.execute("DROP TABLE dispatch_claim_runs")
         db.execute("DROP TABLE run_cancellation_intents")
         db.execute("DROP TABLE level_state")
@@ -315,6 +327,7 @@ def test_shipped_v8_database_upgrades_without_rewriting_history_or_data(
         12,
         13,
         14,
+        15,
     ]
     assert history[0][1] == (
         "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
@@ -332,6 +345,8 @@ def test_concurrent_role_boot_serializes_schema_migrations(
     if starting_version != "fresh":
         SQLiteControlStore(str(path)).initialize()
         with sqlite3.connect(path) as db:
+            db.execute("DROP TABLE retired_owners")
+            db.execute("DELETE FROM schema_migrations WHERE version=15")
             db.execute("DROP TABLE dispatch_claim_runs")
             db.execute("DELETE FROM schema_migrations WHERE version=14")
             db.execute("DELETE FROM schema_migrations WHERE version=13")
@@ -375,9 +390,9 @@ def test_concurrent_role_boot_serializes_schema_migrations(
                 "SELECT version FROM schema_migrations ORDER BY version"
             )
         ) == (
-            (8, 9, 10, 11, 12, 13, 14)
+            (8, 9, 10, 11, 12, 13, 14, 15)
             if starting_version == "v8"
-            else (9, 10, 11, 12, 13, 14)
+            else (9, 10, 11, 12, 13, 14, 15)
         )
 
 
@@ -633,6 +648,95 @@ def test_case_alias_owner_is_adopted_by_canonical_deployment(tmp_path) -> None:
     )[0].command.command_id == command.command_id
 
 
+def test_repoint_permanently_fences_the_prior_owner_from_authority(
+    tmp_path,
+) -> None:
+    current_store = _store(tmp_path)
+    old_owner = "o/r:fix:deployment-1"
+    current_owner = "o/r:fix:deployment-2"
+    old_store = SQLiteControlStore(current_store.path, now=lambda: NOW)
+    old_store.initialize()
+    old_store.bind_active_owner(old_owner)
+
+    assert current_store.adopt_legacy_owner(
+        "o/r",
+        "fix",
+        current_owner,
+        prior_owner_ids=(old_owner,),
+    ) == (0, 0)
+
+    with pytest.raises(RetiredOwnerError, match="deployment-2"):
+        old_store.assert_owner_active(old_owner)
+    assert not old_store.claim_dispatch(
+        "o/r",
+        "fix",
+        91,
+        "RESOLVE",
+        old_owner,
+        frozenset({"src/shared.py"}),
+    )
+    refused = old_store.reserve(
+        dataclasses.replace(
+            _request(91),
+            owner_id=old_owner,
+        )
+    )
+    assert refused.disposition is AccountingDisposition.UNAVAILABLE
+    assert "retired" in refused.detail
+    with pytest.raises(RetiredOwnerError, match="deployment-2"):
+        old_store.replace_level_state("fix", "o/r", {})
+
+    current_store.bind_active_owner(current_owner)
+    assert current_store.claim_dispatch(
+        "o/r",
+        "fix",
+        91,
+        "RESOLVE",
+        current_owner,
+        frozenset({"src/shared.py"}),
+    )
+
+
+def test_repoint_retirement_is_transitive_and_cannot_be_reversed(
+    tmp_path,
+) -> None:
+    store = _store(tmp_path)
+    first = "o/r:fix:deployment-1"
+    second = "o/r:fix:deployment-2"
+    third = "o/r:fix:deployment-3"
+
+    store.adopt_legacy_owner(
+        "o/r",
+        "fix",
+        second,
+        prior_owner_ids=(first,),
+    )
+    store.adopt_legacy_owner(
+        "o/r",
+        "fix",
+        third,
+        prior_owner_ids=(first, second),
+    )
+
+    with store._connect() as db:
+        retired = dict(
+            db.execute(
+                "SELECT owner_id, successor_owner_id FROM retired_owners "
+                "WHERE owner_id IN (?, ?)",
+                (first, second),
+            ).fetchall()
+        )
+    assert retired == {first: third, second: third}
+    with pytest.raises(RetiredOwnerError, match="deployment-3"):
+        store.adopt_legacy_owner(
+            "o/r",
+            "fix",
+            second,
+            prior_owner_ids=(first,),
+        )
+    store.assert_owner_active(third)
+
+
 def test_concurrent_sublegs_may_share_a_dispatch_context(
     tmp_path,
 ) -> None:
@@ -688,7 +792,7 @@ def test_publication_authority_requires_active_reservation_and_live_lease(
     assert authority.pgid == pgid
 
 
-@pytest.mark.parametrize("version", (9, 10, 11, 12, 13, 14))
+@pytest.mark.parametrize("version", (9, 10, 11, 12, 13, 14, 15))
 @pytest.mark.parametrize("stage", ("before_commit", "committed"))
 def test_schema_migration_restart_is_atomic_at_every_boundary(
     tmp_path,
@@ -728,7 +832,7 @@ def test_schema_migration_restart_is_atomic_at_every_boundary(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name='run_cancellation_intents'"
         ).fetchone()
-    assert versions == (9, 10, 11, 12, 13, 14)
+    assert versions == (9, 10, 11, 12, 13, 14, 15)
     assert cancellation_table == ("run_cancellation_intents",)
 
 

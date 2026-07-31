@@ -56,7 +56,7 @@ from ..domain.events import (
 )
 from ..domain.repository import canonical_repository
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 SCHEMA_BASELINE_VERSION = 9
 LEGACY_V8_SCHEMA_DIGEST = (
     "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
@@ -78,6 +78,10 @@ class CorruptControlStore(ControlStoreError):
 
 
 class LegacySpendMigrationError(ControlStoreError):
+    pass
+
+
+class RetiredOwnerError(ControlStoreError):
     pass
 
 
@@ -576,6 +580,24 @@ CREATE INDEX dispatch_claim_runs_run
 ON dispatch_claim_runs(run_id);
 """
 
+_MIGRATION_V15 = """
+CREATE TABLE retired_owners (
+    owner_id TEXT PRIMARY KEY,
+    successor_owner_id TEXT NOT NULL,
+    repository TEXT NOT NULL,
+    role TEXT NOT NULL,
+    retired_at TEXT NOT NULL,
+    CHECK (owner_id <> ''),
+    CHECK (successor_owner_id <> ''),
+    CHECK (repository <> ''),
+    CHECK (role <> ''),
+    CHECK (owner_id <> successor_owner_id)
+);
+
+CREATE INDEX retired_owners_successor
+ON retired_owners(successor_owner_id);
+"""
+
 _SCHEMA_MIGRATIONS = (
     # Version 9 is the immutable adoption baseline shipped by the architectural
     # hardening cutover. Its exact source digest already exists in deployed
@@ -586,6 +608,7 @@ _SCHEMA_MIGRATIONS = (
     SchemaMigration(12, _MIGRATION_V12),
     SchemaMigration(13, _MIGRATION_V13),
     SchemaMigration(14, _MIGRATION_V14),
+    SchemaMigration(15, _MIGRATION_V15),
 )
 
 if tuple(migration.version for migration in _SCHEMA_MIGRATIONS) != tuple(
@@ -628,6 +651,7 @@ class SQLiteControlStore:
         self._event_destination: str | None = None
         self._event_line_limit = MAX_EVENT_LINE_BYTES
         self._flushing_outbox = False
+        self._bound_owner_id: str | None = None
 
     def bind_event_outbox(
         self,
@@ -1084,6 +1108,18 @@ class SQLiteControlStore:
                 LIMIT 1
                 """,
             ),
+            (
+                "retired owner scope disagrees with its successor",
+                """
+                SELECT retired.owner_id
+                FROM retired_owners AS retired
+                JOIN retired_owners AS successor
+                  ON successor.owner_id=retired.successor_owner_id
+                WHERE retired.repository<>successor.repository
+                   OR retired.role<>successor.role
+                LIMIT 1
+                """,
+            ),
         )
         for detail, query in violations:
             row = db.execute(query).fetchone()
@@ -1103,6 +1139,35 @@ class SQLiteControlStore:
                     "control-store semantic integrity failed: lifecycle "
                     f"command payload digest disagrees ({row['command_id']})"
                 )
+
+    @staticmethod
+    def _assert_owner_active(
+        db: sqlite3.Connection,
+        owner_id: str,
+    ) -> None:
+        row = db.execute(
+            "SELECT successor_owner_id FROM retired_owners WHERE owner_id=?",
+            (owner_id,),
+        ).fetchone()
+        if row is not None:
+            raise RetiredOwnerError(
+                f"deployment owner {owner_id!r} was retired in favor of "
+                f"{row['successor_owner_id']!r}"
+            )
+
+    def assert_owner_active(self, owner_id: str) -> None:
+        """Fail when a deployment identity has permanently lost authority."""
+
+        if not owner_id:
+            raise ValueError("deployment owner identity is required")
+        with self._connect() as db:
+            self._assert_owner_active(db, owner_id)
+
+    def bind_active_owner(self, owner_id: str) -> None:
+        """Fence every subsequent write made through this role's store."""
+
+        self.assert_owner_active(owner_id)
+        self._bound_owner_id = owner_id
 
     def adopt_legacy_owner(
         self,
@@ -1132,6 +1197,22 @@ class SQLiteControlStore:
             return (0, 0)
         placeholders = ",".join("?" for _candidate in prior)
         with self.transaction() as db:
+            self._assert_owner_active(db, owner_id)
+            prior_rows = db.execute(
+                f"SELECT owner_id, repository, role FROM retired_owners "
+                f"WHERE owner_id IN ({placeholders})",
+                prior,
+            ).fetchall()
+            for row in prior_rows:
+                if (
+                    row["repository"] != repository
+                    or row["role"] != role
+                ):
+                    raise ControlStoreError(
+                        f"retired owner {row['owner_id']!r} belongs to "
+                        f"{row['repository']}:{row['role']}, not "
+                        f"{repository}:{role}"
+                    )
             runs = db.execute(
                 f"UPDATE runs SET owner_id=? WHERE owner_id IN ({placeholders})",
                 (owner_id, *prior),
@@ -1153,6 +1234,25 @@ class SQLiteControlStore:
                 "'unknown_outcome')",
                 (owner_id, repository, *prior),
             ).rowcount
+            retired_at = _stamp(self._now())
+            db.executemany(
+                "INSERT INTO retired_owners("
+                "owner_id, successor_owner_id, repository, role, retired_at"
+                ") VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(owner_id) DO UPDATE SET "
+                "successor_owner_id=excluded.successor_owner_id, "
+                "retired_at=excluded.retired_at",
+                (
+                    (
+                        candidate,
+                        owner_id,
+                        repository,
+                        role,
+                        retired_at,
+                    )
+                    for candidate in prior
+                ),
+            )
             return (runs, commands)
 
     def adopt_projection_feed(
@@ -1240,6 +1340,8 @@ class SQLiteControlStore:
         with self._connect() as db:
             try:
                 db.execute("BEGIN IMMEDIATE")
+                if self._bound_owner_id is not None:
+                    self._assert_owner_active(db, self._bound_owner_id)
                 yield db
             except BaseException:
                 db.rollback()
@@ -1260,6 +1362,7 @@ class SQLiteControlStore:
     ) -> None:
         now = _stamp(self._now())
         with self.transaction() as db:
+            self._assert_owner_active(db, owner_id)
             db.execute(
                 "INSERT INTO runs(run_id, dispatch_id, kind, owner_id, state, "
                 "config_version, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -1898,62 +2001,66 @@ class SQLiteControlStore:
             )
             for claim in observed
         }
-        with self.transaction() as db:
-            current = self._dispatch_claim_observations(
-                db, repository, role
-            )
-            live: list[_DispatchClaimObservation] = []
-            for claim in current:
-                # A claim or child binding changed after the read-only snapshot
-                # is conservatively live. Process inspection must never run
-                # while SQLite's cross-process write lock is held.
-                if liveness.get(claim, True):
-                    live.append(claim)
-                    continue
+        try:
+            with self.transaction() as db:
+                self._assert_owner_active(db, owner_id)
+                current = self._dispatch_claim_observations(
+                    db, repository, role
+                )
+                live: list[_DispatchClaimObservation] = []
+                for claim in current:
+                    # A claim or child binding changed after the read-only snapshot
+                    # is conservatively live. Process inspection must never run
+                    # while SQLite's cross-process write lock is held.
+                    if liveness.get(claim, True):
+                        live.append(claim)
+                        continue
+                    db.execute(
+                        "DELETE FROM dispatch_claims "
+                        "WHERE repository=? AND role=? AND target=? "
+                        "AND owner_pid=? AND owner_start_ticks=?",
+                        (
+                            repository,
+                            role,
+                            claim.target,
+                            claim.owner_pid,
+                            claim.owner_start_ticks,
+                        ),
+                    )
+                for claim in live:
+                    try:
+                        other_paths = frozenset(json.loads(claim.paths_json))
+                    except (TypeError, json.JSONDecodeError) as exc:
+                        raise CorruptControlStore(
+                            "dispatch claim contains invalid paths"
+                        ) from exc
+                    if (
+                        claim.target == target
+                        or not paths
+                        or not other_paths
+                        or bool(paths & other_paths)
+                    ):
+                        return False
                 db.execute(
-                    "DELETE FROM dispatch_claims "
-                    "WHERE repository=? AND role=? AND target=? "
-                    "AND owner_pid=? AND owner_start_ticks=?",
+                    "INSERT INTO dispatch_claims("
+                    "repository, role, target, leg, owner_id, owner_pid, "
+                    "owner_start_ticks, paths_json, claimed_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         repository,
                         role,
-                        claim.target,
-                        claim.owner_pid,
-                        claim.owner_start_ticks,
+                        target,
+                        leg,
+                        owner_id,
+                        identity.pid,
+                        identity.start_ticks,
+                        encoded_paths,
+                        _stamp(self._now()),
                     ),
                 )
-            for claim in live:
-                try:
-                    other_paths = frozenset(json.loads(claim.paths_json))
-                except (TypeError, json.JSONDecodeError) as exc:
-                    raise CorruptControlStore(
-                        "dispatch claim contains invalid paths"
-                    ) from exc
-                if (
-                    claim.target == target
-                    or not paths
-                    or not other_paths
-                    or bool(paths & other_paths)
-                ):
-                    return False
-            db.execute(
-                "INSERT INTO dispatch_claims("
-                "repository, role, target, leg, owner_id, owner_pid, "
-                "owner_start_ticks, paths_json, claimed_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    repository,
-                    role,
-                    target,
-                    leg,
-                    owner_id,
-                    identity.pid,
-                    identity.start_ticks,
-                    encoded_paths,
-                    _stamp(self._now()),
-                ),
-            )
-            return True
+                return True
+        except RetiredOwnerError:
+            return False
 
     @staticmethod
     def _dispatch_claim_observations(
@@ -2022,37 +2129,41 @@ class SQLiteControlStore:
         ):
             raise ValueError("dispatch claim binding identity is incomplete")
         target = _dispatch_claim_target(issue)
-        with self.transaction() as db:
-            claim = db.execute(
-                "SELECT owner_id FROM dispatch_claims "
-                "WHERE repository=? AND role=? AND target=?",
-                (repository, role, target),
-            ).fetchone()
-            run = db.execute(
-                "SELECT owner_id, state FROM runs WHERE run_id=?",
-                (str(run_id),),
-            ).fetchone()
-            if (
-                claim is None
-                or run is None
-                or claim["owner_id"] != owner_id
-                or run["owner_id"] != owner_id
-                or run["state"] not in {"reserved", "starting", "running"}
-            ):
-                return False
-            db.execute(
-                "INSERT OR IGNORE INTO dispatch_claim_runs("
-                "repository, role, target, run_id, bound_at"
-                ") VALUES (?, ?, ?, ?, ?)",
-                (
-                    repository,
-                    role,
-                    target,
-                    str(run_id),
-                    _stamp(self._now()),
-                ),
-            )
-            return True
+        try:
+            with self.transaction() as db:
+                self._assert_owner_active(db, owner_id)
+                claim = db.execute(
+                    "SELECT owner_id FROM dispatch_claims "
+                    "WHERE repository=? AND role=? AND target=?",
+                    (repository, role, target),
+                ).fetchone()
+                run = db.execute(
+                    "SELECT owner_id, state FROM runs WHERE run_id=?",
+                    (str(run_id),),
+                ).fetchone()
+                if (
+                    claim is None
+                    or run is None
+                    or claim["owner_id"] != owner_id
+                    or run["owner_id"] != owner_id
+                    or run["state"] not in {"reserved", "starting", "running"}
+                ):
+                    return False
+                db.execute(
+                    "INSERT OR IGNORE INTO dispatch_claim_runs("
+                    "repository, role, target, run_id, bound_at"
+                    ") VALUES (?, ?, ?, ?, ?)",
+                    (
+                        repository,
+                        role,
+                        target,
+                        str(run_id),
+                        _stamp(self._now()),
+                    ),
+                )
+                return True
+        except RetiredOwnerError:
+            return False
 
     def expand_dispatch_claim(
         self,
@@ -2446,6 +2557,7 @@ class SQLiteControlStore:
         try:
             self.integrity_check()
             with self.transaction() as db:
+                self._assert_owner_active(db, request.owner_id)
                 prior = db.execute(
                     "SELECT * FROM budget_reservations WHERE run_id=?",
                     (str(request.run_id),),
@@ -2614,6 +2726,15 @@ class SQLiteControlStore:
         except CorruptControlStore as exc:
             return ReservationResult(
                 AccountingDisposition.CORRUPT,
+                None,
+                Money.zero(request.scope.currency),
+                requested,
+                request.cap,
+                str(exc),
+            )
+        except RetiredOwnerError as exc:
+            return ReservationResult(
+                AccountingDisposition.UNAVAILABLE,
                 None,
                 Money.zero(request.scope.currency),
                 requested,
@@ -2964,6 +3085,7 @@ class SQLiteControlStore:
         digest = hashlib.sha256(payload.encode()).hexdigest()
         now = _stamp(self._now())
         with self.transaction() as db:
+            self._assert_owner_active(db, command.executor_identity)
             row = db.execute(
                 "SELECT * FROM lifecycle_commands WHERE idempotency_key=?",
                 (command.idempotency_key,),
@@ -3038,6 +3160,7 @@ class SQLiteControlStore:
         payload_digest = hashlib.sha256(payload.encode()).hexdigest()
         now = _stamp(self._now())
         with self.transaction() as db:
+            self._assert_owner_active(db, command.executor_identity)
             existing = db.execute(
                 "SELECT logical_key FROM lifecycle_commands WHERE command_id=?",
                 (str(command.command_id),),

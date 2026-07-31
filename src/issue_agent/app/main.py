@@ -19,6 +19,7 @@ from ..adapters.control_store import (
     CorruptControlStore,
     IncompatibleSchema,
     LegacySpendMigrationError,
+    RetiredOwnerError,
 )
 from ..adapters.env_file import source_env_file
 from ..adapters.app_token import AppCredentials, AppTokenMinter, default_mint_fn
@@ -475,6 +476,9 @@ def main(argv: list[str] | None = None) -> None:
     except LegacySpendMigrationError as exc:
         sys.stderr.write(f"{role}: operator repair required — {exc}\n")
         raise SystemExit(ExitCode.OPERATOR_REPAIR_REQUIRED) from exc
+    except RetiredOwnerError as exc:
+        sys.stderr.write(f"{role}: deployment owner retired — {exc}\n")
+        raise SystemExit(ExitCode.CLEAN) from exc
     except ValueError as exc:
         sys.stderr.write(f"{role}: invalid configuration — {exc}\n")
         raise SystemExit(ExitCode.INVALID_CONFIG) from exc

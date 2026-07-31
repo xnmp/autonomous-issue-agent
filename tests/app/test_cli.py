@@ -860,6 +860,7 @@ def _start_args(**overrides) -> argparse.Namespace:
         test_cmd="", no_init=True, edit_check_cmd="", review_mode="",
         max_budget="", review_budget="", max_ticks=None, write_config=False,
         worktree=False, worktree_path="",
+        no_verify_test_cmd=False,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -909,6 +910,74 @@ def test_cmd_start_reuses_matching_overlay_no_warning(tmp_path, monkeypatch, cap
     captured = capsys.readouterr()
     assert "reusing config/repos/app.env" in captured.out
     assert captured.err == ""
+
+
+def test_cmd_start_write_config_stops_existing_deployment_before_rewrite(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _prep_mismatch_overlay(tmp_path, monkeypatch)
+    overlay = tmp_path / "app.env"
+    original = overlay.read_text()
+    events: list[tuple[str, str]] = []
+
+    def stop(name: str) -> int:
+        events.append((f"stop:{name}", overlay.read_text()))
+        return 0
+
+    def execve(*_args) -> None:
+        events.append(("exec", overlay.read_text()))
+
+    monkeypatch.setattr(cli, "_stop_deployment", stop)
+    monkeypatch.setattr(cli.os, "execve", execve)
+
+    rc = cli.cmd_start(
+        _start_args(
+            repo="acme/app",
+            target_dir="/srv/acme-app",
+            name="app",
+            write_config=True,
+            test_cmd="make test",
+            no_verify_test_cmd=True,
+        )
+    )
+
+    assert rc is None
+    assert events[0] == ("stop:app", original)
+    assert events[1][0] == "exec"
+    assert events[1][1] != original
+    assert "TEST_CMD='make test'" in events[1][1]
+
+
+def test_cmd_start_write_config_preserves_overlay_when_quiescence_fails(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _prep_mismatch_overlay(tmp_path, monkeypatch)
+    overlay = tmp_path / "app.env"
+    original = overlay.read_text()
+    execve_calls: list[tuple] = []
+    monkeypatch.setattr(cli, "_stop_deployment", lambda _name: 1)
+    monkeypatch.setattr(
+        cli.os,
+        "execve",
+        lambda *args: execve_calls.append(args),
+    )
+
+    rc = cli.cmd_start(
+        _start_args(
+            repo="acme/app",
+            target_dir="/srv/acme-app",
+            name="app",
+            write_config=True,
+            test_cmd="make test",
+            no_verify_test_cmd=True,
+        )
+    )
+
+    assert rc == 1
+    assert overlay.read_text() == original
+    assert execve_calls == []
 
 
 def test_cmd_stop_refuses_wrong_repo_overlay(tmp_path, monkeypatch, capsys):
