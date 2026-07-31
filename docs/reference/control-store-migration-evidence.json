@@ -212,5 +212,65 @@
       "pending_commands": 0,
       "pending_outbox": 0
     }
+  },
+  "schema_v15_owner_retirement_follow_up": {
+    "observed_at": "2026-07-31T05:45:53Z",
+    "commit": "161c956e4b19c4fad5915fe8aba348ec48275cc5",
+    "code_tree": "237c5bd1811080e563e47c45d212906f4f09e4e3",
+    "current_schema_version": 15,
+    "supported_upgrade_histories": [
+      [
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      [
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ]
+    ],
+    "concurrency_contract": "Three spawned role processes concurrently initialize fresh, v8, and v9 databases; every process succeeds and the final history is contiguous and digest-valid through v15.",
+    "restart_contract": "Each v9, v10, v11, v12, v13, v14, and v15 migration is interrupted before commit and immediately after commit, then reopened and integrity-checked.",
+    "retirement_contract": "Repoint adoption transfers active runs, leases, claims, and nonterminal commands while retiring every recorded prior owner in the same transaction. Repeated repoints converge each retired owner on the latest successor and cannot reverse into a retired identity.",
+    "authority_fence_contract": "A role binds its store to the current owner after adoption. Every later write transaction rechecks schema-v15 retirement; direct claims and reservations by a retired owner fail closed, and a rebooted retired service exits cleanly.",
+    "full_suite": "make test passed with 811 adapter tests, including schema concurrency/restart, old-owner/new-owner claim reproduction, transitive retirement, bound-transaction fencing, and fail-closed reservation cases.",
+    "live_primary": {
+      "path": "/home/chong/.local/state/issue-agent-control/control.db",
+      "schema_migrations": [
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "database_integrity": "ok",
+      "foreign_key_check_rows": 0,
+      "database_mode": "0600",
+      "authority_witness_mode": "0600",
+      "retired_owner_rows": {
+        "fix": 1,
+        "review": 1,
+        "steward": 1
+      },
+      "nonterminal_runs": 0,
+      "active_reservations": 0,
+      "leases": 0,
+      "dispatch_claims": 0,
+      "dispatch_claim_runs": 0,
+      "pending_commands": 0,
+      "pending_outbox": 0
+    }
   }
 }

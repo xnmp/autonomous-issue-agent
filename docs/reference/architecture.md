@@ -120,16 +120,21 @@ failure decisions; and exercised ordinary, exhausted, duplicate, and
 conflicting-receipt admissions on the pre-existing live primary database.
 Fresh databases use the v9 adoption baseline. The exact digest emitted by the
 previously shipped v8 initializer remains an accepted immutable predecessor,
-so deployed v8 databases upgrade through v9/v10/v11/v12/v13/v14 without rewritten
-history. V13 canonicalizes GitHub's case-insensitive `owner/name` repository
-identity across commands, reservations, limits, and dispatch claims; startup
-also adopts both historical mixed-case owner formats so in-flight authority is
-not stranded by the cutover.
+so deployed v8 databases upgrade through v9/v10/v11/v12/v13/v14/v15 without
+rewritten history. V13 canonicalizes GitHub's case-insensitive `owner/name`
+repository identity across commands, reservations, limits, and dispatch claims;
+startup also adopts both historical mixed-case owner formats so in-flight
+authority is not stranded by the cutover.
 V14 binds each coarse dispatch claim to every admitted run in that workflow.
 Claim reaping treats any bound nonterminal run as authoritative until its owner
 recovers and terminalizes it, closing the crash window where a sibling checkout
 could start duplicate paid work while the original child or descendant still
 ran.
+V15 records retired deployment owners and their successors. Repoint adoption
+transfers active ownership and retires the complete recorded lineage in one
+transaction. Every role store is then bound to its current owner: all later
+transactions recheck that durable fence, fresh claims and reservations from a
+retired owner fail closed, and a rebooted old service exits cleanly at startup.
 Every migration is digest-validated and individually transactional; restart
 and concurrent-role tests interrupt both sides of every migration commit
 boundary and serialize fresh/v8/v9 boot. Machine-readable
@@ -159,7 +164,11 @@ The supported exception is an explicit same-repository checkout repoint:
 checkout identities. The first boot reaps only those process registries and
 adopts their run/lease/claim/command and projection-feed ownership. The marker
 persists across repeated repoints so an interrupted intermediate boot cannot
-strand an older reservation. Cross-repository overlay reuse is refused.
+strand an older reservation. Before the overlay changes, the CLI stops and
+verifies all foreground and service-owned processes carrying its stable name;
+failure preserves the old snapshot. Schema v15 permanently fences the adopted
+owners, covering processes missed by OS discovery and old service definitions
+started after reboot. Cross-repository overlay reuse is refused.
 Process-group, process-tree, and launch-intent receipts use the same stable
 checkout deployment identity beneath each role state root. Boot and shutdown
 therefore reap only that deployment's children even when sibling checkouts

@@ -696,6 +696,18 @@ operator mistakes — recorded so they aren't re-diagnosed as bugs.
   only after the whole stop phase succeeds. A failed uninstall preserves all
   definitions for operator recovery.
 
+**122. Foreground repoint left the prior installed deployment authoritative**
+- `issue-agent start --write-config` replaced the overlay and launched the new
+  checkout without stopping installed role processes. Checkout-scoped locks let
+  both generations run, and ownership adoption only rewrote existing rows: the
+  old owner could immediately acquire a fresh unrelated dispatch claim and
+  continue paid work from its private old snapshot. FIXED 2026-07-31 (schema
+  v15): replacement first stops and verifies every process with the stable
+  deployment name and preserves the overlay on failure. Repoint adoption also
+  durably retires prior owners; every role-bound control transaction rechecks
+  that fence, retired claims/reservations fail closed, and a rebooted old
+  service exits cleanly.
+
 ---
 
 _Generated from transcript mining, 2026-07-21. ~107 distinct entries after
@@ -706,5 +718,5 @@ reviews (docs/REVIEW-2026-07-25-adversarial.md,
 docs/REVIEW-2026-07-26-p0-rereview.md) — the first three are new failure
 CLASSES, not instances; #110 is about the remediation process itself. #111
 added 2026-07-28 from the seventh tauri-explorer deployment. #112 added
-2026-07-30 during the architectural hardening full-suite gate. #113–#121 added
+2026-07-30 during the architectural hardening full-suite gate. #113–#122 added
 2026-07-31 during the final release audits._

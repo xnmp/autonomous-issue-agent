@@ -56,8 +56,13 @@ Important fields:
 - `issue-agent start --write-config` may repoint an existing overlay only to a
   new checkout of the same repository. It preserves a bounded
   `REPOINTED_FROM_DEPLOYMENTS` lineage so the first boot can reap and adopt
-  those exact old deployment identities. Use a different `--name` for another
-  repository; do not hand-author the lineage.
+  those exact old deployment identities. Before replacing the overlay, the CLI
+  stops and verifies every foreground or installed process carrying that
+  deployment name; a stop failure leaves the old overlay unchanged. Schema v15
+  then retires every prior owner identity in the shared control store. An old
+  process that survived discovery loses all write authority, and an old service
+  started after reboot exits cleanly instead of reacquiring work. Use a
+  different `--name` for another repository; do not hand-author the lineage.
 - `FIX_BOT` must differ from `REVIEW_BOT` in three-identity mode.
 - `TEST_CMD` must terminate. The trusted executor bounds it, scrubs deployment
   controls, stamps recursion depth, and kills the full process group on timeout.

@@ -9,7 +9,8 @@
     "accounting_canary": "740cb2be0ba4d49a6d82534c274490480e7054f7",
     "money_precision_correction": "40f66dac71e9bc7a2a9c7649cb14dba7b13a5d1a",
     "final_audit_remediation": "9786b5f65a516930e3758ab9ed360d657ba141cb",
-    "final_release": "dbca28ee4f12bb75c74003bffa329128cedc4ae4"
+    "final_release": "dbca28ee4f12bb75c74003bffa329128cedc4ae4",
+    "owner_fence_remediation": "161c956e4b19c4fad5915fe8aba348ec48275cc5"
   },
   "all_role_boot": {
     "roles": {
@@ -1065,5 +1066,106 @@
       "config_snapshot": "/home/chong/.config/issue-agent/self.env",
       "persistent_services_changed": false
     }
+  },
+  "foreground_repoint_owner_fence_follow_up": {
+    "observed_at": "2026-07-31T05:45:53Z",
+    "commit": "161c956e4b19c4fad5915fe8aba348ec48275cc5",
+    "code_tree": "237c5bd1811080e563e47c45d212906f4f09e4e3",
+    "source_audit": {
+      "candidate": "28d9db2af17b108d41bc2cb10d67b15f77692a01",
+      "verdict": "blocked",
+      "p0_findings": 0,
+      "p1_findings": 1
+    },
+    "closed_finding": "Foreground overlay replacement now stops and verifies all processes carrying the stable deployment name before changing the snapshot, preserves the old overlay on failure, and schema v15 permanently fences prior owners from every role-bound control write.",
+    "red_canary": {
+      "old_persistent_lock": "acquired",
+      "new_foreground_lock": "acquired",
+      "adoption_result": [
+        0,
+        0
+      ],
+      "old_claim_after_adoption": true,
+      "new_unrelated_claim_concurrent": true
+    },
+    "green_canaries": {
+      "cli_cutover": "A matching existing overlay is observed unchanged when quiescence begins; successful quiescence precedes replacement and exec; failed quiescence returns nonzero without changing the overlay or launching.",
+      "owner_fence": "After adoption, the old bound store cannot claim, reserve, or make an unrelated level-state write; the current owner can claim normally.",
+      "repeated_repoint": "Every prior owner converges on the latest successor, and a retired intermediate owner cannot adopt authority again.",
+      "service_restart": "A retired owner is rejected during role construction and exits with the clean service-manager class, preventing restart loops."
+    },
+    "full_suite": {
+      "command": "UV_CACHE_DIR=/tmp/issue-agent-uv-cache make test",
+      "result": "passed",
+      "shell_hooks": 90,
+      "point_at": 7,
+      "domain_pytest": 659,
+      "adapter_pytest": 811,
+      "application_pytest": 1340,
+      "gate_parity": 48,
+      "import_contracts": 4,
+      "pyrefly_errors": 0
+    },
+    "deployment_environment_suite": "passed with 811 adapter tests and 90 hook contracts",
+    "live_roles": {
+      "command": "ISSUE_AGENT_MAX_TICKS=0 UV_CACHE_DIR=/tmp/issue-agent-uv-cache bash bin/point-at.sh self",
+      "exit_code": 0,
+      "doctor_errors": 0,
+      "doctor_warnings": 3,
+      "clean_origin_dev_test": "passed",
+      "repository_access": "fix and review identities authenticated; base-branch CI present on 10 of 10 sampled pull requests",
+      "roles": {
+        "fix": [
+          "starting",
+          "running",
+          "draining",
+          "stopped"
+        ],
+        "review": [
+          "starting",
+          "running",
+          "draining",
+          "stopped"
+        ],
+        "steward": [
+          "starting",
+          "running",
+          "draining",
+          "stopped"
+        ]
+      }
+    },
+    "control_store": {
+      "path": "/home/chong/.local/state/issue-agent-control/control.db",
+      "database_mode": "0600",
+      "authority_witness_mode": "0600",
+      "integrity": "ok",
+      "foreign_key_check_rows": 0,
+      "schema_migrations": [
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ],
+      "retired_owner_rows": {
+        "fix": 1,
+        "review": 1,
+        "steward": 1
+      },
+      "nonterminal_runs": 0,
+      "active_reservations": 0,
+      "leases": 0,
+      "dispatch_claims": 0,
+      "dispatch_claim_runs": 0,
+      "pending_commands": 0,
+      "pending_outbox": 0
+    },
+    "operator_warnings": [
+      "The repository rejected automatic enablement of allow_auto_merge; manual enablement remains documented.",
+      "Private-repository branch protection was unavailable under the current GitHub plan, so arm-on-open stayed inactive."
+    ]
   }
 }

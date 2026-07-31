@@ -26,6 +26,10 @@ probes documented in `HARNESS.md`/`docs/reference/capacity.md`. The immutable
 [live release canary evidence](../reference/live-release-canary-evidence.json)
 records the all-role boot, an active SIGTERM shutdown, authoritative Codex
 usage settlement, durable remote cleanup, and zero residual control state.
+The final repoint audit also produced schema v15: foreground snapshot
+replacement now quiesces the stable deployment before mutation, while durable
+retired-owner rows fence any missed or rebooted prior process from reacquiring
+control-store authority.
 
 This document remains the **record** for the maintainability refactor: it owns
 sequencing, scope, and the adjudicated design decisions. The codex plan remains
