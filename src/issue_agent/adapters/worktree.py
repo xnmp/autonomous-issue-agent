@@ -350,6 +350,103 @@ class Worktrees:
         self._git(["clean", "-fd"], wt)
 
 
+class ReviewCheckouts:
+    """Detached per-PR worktrees pinned at the exact reviewed head SHA.
+
+    Review legs used to execute in the operator's live target checkout, so
+    every on-disk read saw whatever branch (and dirty state) the operator
+    left there — on keifu #165 (2026-08-01) the reviewer quoted `chong-dev`'s
+    stale code while stamping the fresh head SHA, and three phantom
+    REQUEST_CHANGES rounds nearly escalated a correct PR. The verdict binds a
+    SHA, so the code the reviewer reads MUST be that SHA: a detached worktree
+    per PR, refreshed to the head each round, unreachable by the operator's
+    branch switches and invisible to their uncommitted work.
+    """
+
+    def __init__(
+        self,
+        repo_dir: str,
+        worktree_root: str = ".claude/worktrees",
+        run: GitRunner = _subprocess_git,
+        path_exists: Callable[[str], bool] = os.path.isdir,
+    ):
+        self.repo_dir = repo_dir
+        self.worktree_root = worktree_root
+        self._git = run
+        self._path_exists = path_exists
+        self._mutation_lock = threading.RLock()
+        # (pr → last ensured sha): a multi-mode round runs several legs against
+        # one head; only the first pays the fetch/reset.
+        self._ensured: dict[int, str] = {}
+
+    def path(self, pr: int) -> str:
+        return os.path.join(self.worktree_root, f"review-pr-{pr}")
+
+    def ensure(self, pr: int, head_sha: str) -> str:
+        """Return an absolute path whose checkout IS `head_sha`, or raise
+        `WorktreeUnavailable`. Never returns a stale or dirty view: a caller
+        that cannot get the pinned head must defer the round, not review
+        whatever happens to be on disk."""
+        if not head_sha:
+            raise WorktreeUnavailable("review checkout needs a head SHA")
+        with self._mutation_lock:
+            abs_path = os.path.join(self.repo_dir, self.path(pr))
+            if (
+                self._ensured.get(pr) == head_sha
+                and self._path_exists(abs_path)
+            ):
+                return abs_path
+            # GitHub always serves refs/pull/<n>/head; fetching the bare SHA
+            # is not universally allowed, the PR ref is.
+            self._git(
+                ["fetch", "origin", f"refs/pull/{pr}/head", "--quiet"],
+                self.repo_dir,
+            )
+            present = self._git(
+                ["cat-file", "-e", f"{head_sha}^{{commit}}"], self.repo_dir
+            )
+            if present.code != 0:
+                raise WorktreeUnavailable(
+                    f"reviewed head {head_sha} for PR #{pr} is not reachable "
+                    "after fetching its PR ref (force-pushed away?) — defer "
+                    "and re-observe"
+                )
+            if self._path_exists(abs_path):
+                self._git(["checkout", "--detach", head_sha], abs_path)
+                self._git(["reset", "--hard", head_sha], abs_path)
+                # -fd, not -fdx: ignored build caches (target/, node_modules)
+                # are expensive and cannot alter tracked review content.
+                self._git(["clean", "-fd"], abs_path)
+            else:
+                made = self._git(
+                    ["worktree", "add", "--detach", self.path(pr), head_sha],
+                    self.repo_dir,
+                )
+                if made.code != 0 or not self._path_exists(abs_path):
+                    raise WorktreeUnavailable(
+                        f"review worktree for PR #{pr} could not be created at "
+                        f"{abs_path!r}"
+                    )
+            confirmed = self._git(["rev-parse", "HEAD"], abs_path)
+            if confirmed.out.strip() != head_sha:
+                raise WorktreeUnavailable(
+                    f"review worktree for PR #{pr} is at "
+                    f"{confirmed.out.strip()[:12]!r}, not the reviewed head "
+                    f"{head_sha[:12]!r}"
+                )
+            self._ensured[pr] = head_sha
+            return abs_path
+
+    def remove(self, pr: int) -> None:
+        """Best-effort removal after a settled round; the next round recreates."""
+        with self._mutation_lock:
+            self._ensured.pop(pr, None)
+            self._git(
+                ["worktree", "remove", "--force", self.path(pr)], self.repo_dir
+            )
+            self._git(["worktree", "prune"], self.repo_dir)
+
+
 # ── GateContext builder ───────────────────────────────────────────────────────
 _DEFAULT_TEST_TIMEOUT_S = 600.0
 
@@ -788,6 +885,7 @@ def build_gate_context(
 
     return GateContext(
         base_branch=base_branch,
+        repository=repo,
         branch=branch,
         branch_subjects=subjects,
         base_resolvable=base_resolvable,

@@ -47,7 +47,7 @@ from ..adapters.journal import (
 from ..adapters.store import Store
 from ..adapters.spend_recovery import CodexSpendReconciler, spend_evidence_dir
 from ..adapters.wake import WakeSignal, wake_path
-from ..adapters.worktree import Worktrees
+from ..adapters.worktree import ReviewCheckouts, Worktrees
 from ..domain.fix import (
     FixConfig,
     FixState,
@@ -2140,10 +2140,25 @@ def build_review_daemon(
     review_execution_cwd = runtime_binding.execution_cwd
     review_prepare_cwd = runtime_binding.prepare_cwd
 
+    # Reviews must read the code the verdict binds. A pinned per-PR detached
+    # worktree replaces the operator's live checkout as execution cwd whenever
+    # a target checkout exists (keifu #165: stale-checkout reviews produced
+    # phantom REQUEST_CHANGES rounds under fresh SHAs).
+    review_checkout = None
+    review_checkout_cleanup = None
+    if review_execution_cwd:
+        _review_checkouts = ReviewCheckouts(
+            review_execution_cwd, worktree_root=cfg.worktree_root
+        )
+        review_checkout = _review_checkouts.ensure
+        review_checkout_cleanup = _review_checkouts.remove
+
     dcfg = replace(
         dcfg,
         review_execution_cwd=review_execution_cwd,
         review_prepare_cwd=review_prepare_cwd,
+        review_checkout=review_checkout,
+        review_checkout_cleanup=review_checkout_cleanup,
     )
 
     # Reviewer has no worktree/issue side; pass a no-op Worktrees-like None usage.

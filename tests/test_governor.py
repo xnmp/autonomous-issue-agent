@@ -535,6 +535,36 @@ def test_workflow_mandated_issue_comments_are_allowed(command):
 @pytest.mark.parametrize(
     "command",
     (
+        "gh issue comment 156 --repo xnmp/keifu --body '## Acceptance Criteria'",
+        "gh issue comment 156 -R xnmp/keifu --body x",
+        "gh issue comment 156 --repo=xnmp/keifu --body x",
+        "gh issue comment 156 --repo https://github.com/xnmp/keifu --body x",
+    ),
+)
+def test_own_repo_restated_via_repo_flag_is_allowed(command):
+    """Agents habitually restate the ambient repo as --repo <own repo>
+    (observed on keifu #155/#156, 2026-08-01) — that is not a retarget."""
+    assert isinstance(
+        gov.resolve(command, repository="xnmp/keifu"), gov.Ungoverned
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "gh issue comment 156 --repo other/repo --body hi",
+        "gh issue comment 156 -R xnmp/keifu2 --body hi",
+        "gh issue comment 156 --repo=xnmp --body hi",
+    ),
+)
+def test_foreign_repo_via_repo_flag_stays_denied(command):
+    resolution = gov.resolve(command, repository="xnmp/keifu")
+    assert isinstance(resolution, gov.Unresolvable)
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
         # verb boundary
         "gh issue close 155",
         "gh issue edit 155 --add-label done",

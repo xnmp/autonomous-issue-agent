@@ -75,6 +75,7 @@ def _unbound_test_execution(_cmd: str) -> TestExecution:
 @dataclass(frozen=True)
 class GateContext:
     base_branch: str = "dev"
+    repository: str = ""                     # deployment repo (owner/name)
     branch: str = ""                         # current HEAD branch
     branch_subjects: tuple[str, ...] = ()    # commit subjects on branch since base
     base_resolvable: bool = True
@@ -656,7 +657,9 @@ def evaluate_command(command: str, ctx: GateContext) -> Verdict:
     CLOSED), then route each governed command to its gate. Returns the FIRST
     violation's reason (the hook can only deny once)."""
     try:
-        resolution = governor_policy.resolve(command)
+        resolution = governor_policy.resolve(
+            command, repository=ctx.repository
+        )
         if isinstance(resolution, governor_policy.Unresolvable):
             return Verdict(
                 False,

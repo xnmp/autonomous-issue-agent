@@ -168,7 +168,7 @@ def main() -> None:
         if violation:
             _block(f"Blocked: {violation}")
 
-    resolution = resolve(command)
+    resolution = resolve(command, repository=os.environ.get("REPO", ""))
     if isinstance(resolution, Unresolvable):
         _block(
             "Blocked: command cannot be governed statically — "

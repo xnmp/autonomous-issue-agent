@@ -384,12 +384,25 @@ _GH_READS = {
 # assignment (GH_REPO=...) fail closed. `gh pr comment` has no workflow
 # consumer — the reviewer leg is fenced read-only before resolve() runs.
 _GH_COMMENT_BODY_FLAGS = frozenset({"--body", "-b", "--body-file", "-F"})
+_GH_COMMENT_REPO_FLAGS = frozenset({"--repo", "-R"})
+
+
+def _same_repository(value: str, repository: str) -> bool:
+    """Does a --repo value name the deployment repository? Accepts the
+    owner/name form and the https URL form gh itself accepts."""
+    v = value.strip().removesuffix(".git").rstrip("/")
+    for prefix in ("https://github.com/", "http://github.com/", "github.com/"):
+        if v.lower().startswith(prefix):
+            v = v[len(prefix):]
+            break
+    return bool(repository) and v.lower() == repository.lower()
 
 
 def _gh_issue_comment_allowed(
     inner: list[str],
     env_assignments: object,
     extra_env: object,
+    repository: str = "",
 ) -> bool:
     if env_assignments or extra_env:
         return False
@@ -397,27 +410,48 @@ def _gh_issue_comment_allowed(
         return False
     selector: str | None = None
     has_body = False
-    expect_value = False
+    expect_body_value = False
+    expect_repo_value = False
     for word in inner[3:]:
-        if expect_value:
-            expect_value = False
+        if expect_body_value:
+            expect_body_value = False
+            continue
+        if expect_repo_value:
+            expect_repo_value = False
+            if not _same_repository(word, repository):
+                return False
             continue
         if word.startswith("-"):
-            flag = word.split("=", 1)[0]
-            if flag not in _GH_COMMENT_BODY_FLAGS:
-                return False
-            has_body = True
-            if "=" not in word:
-                expect_value = True
-            continue
+            flag, _, inline = word.partition("=")
+            if flag in _GH_COMMENT_BODY_FLAGS:
+                has_body = True
+                if not inline:
+                    expect_body_value = True
+                continue
+            # Agents habitually pass --repo <own repo>; that is the ambient
+            # target restated, not a retarget. Any OTHER repo fails closed.
+            if flag in _GH_COMMENT_REPO_FLAGS:
+                if inline:
+                    if not _same_repository(inline, repository):
+                        return False
+                else:
+                    expect_repo_value = True
+                continue
+            return False
         if selector is not None:
             return False
         selector = word
+    if expect_body_value or expect_repo_value:
+        return False
     return selector is not None and selector.isdigit() and has_body
 
 
-def resolve(command: str) -> Resolution:
-    """Resolve a shell program without deferring command identity to runtime."""
+def resolve(command: str, repository: str = "") -> Resolution:
+    """Resolve a shell program without deferring command identity to runtime.
+
+    `repository` (owner/name) is the deployment's own repo; it only widens the
+    workflow-mandated `gh issue comment` allowance to the `--repo <own repo>`
+    spelling agents habitually use. Empty keeps the strictest form."""
 
     try:
         tree = PARSER.parse(command.encode())
@@ -534,7 +568,9 @@ def resolve(command: str) -> Resolution:
                 len(inner) >= 3
                 and inner[1] in _GH_READS
                 and inner[2] in _GH_READS[inner[1]]
-            ) or _gh_issue_comment_allowed(inner, _env, _extra_env)
+            ) or _gh_issue_comment_allowed(
+                inner, _env, _extra_env, repository
+            )
             api_read = (
                 len(inner) >= 2
                 and inner[1] == "api"

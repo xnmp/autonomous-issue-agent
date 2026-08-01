@@ -77,6 +77,8 @@ class DispatchConfig:
     reviewer_runtime: RuntimeName = RuntimeName.CLAUDE
     review_execution_cwd: str = ""
     review_prepare_cwd: Callable[[str], None] | None = None
+    review_checkout: Callable[[int, str], str] | None = None
+    review_checkout_cleanup: Callable[[int], None] | None = None
     fix_mcp_config: str = ""
     harness_root: str = ""
     # PR label removed when a review escalates to needs-human-review. Matches the
@@ -139,6 +141,8 @@ class DispatchConfig:
             reviewer_runtime=self.reviewer_runtime,
             execution_cwd=self.review_execution_cwd,
             prepare_cwd=self.review_prepare_cwd,
+            review_checkout=self.review_checkout,
+            review_checkout_cleanup=self.review_checkout_cleanup,
             review_trigger_label=self.review_trigger_label,
             log=self.log,
         )

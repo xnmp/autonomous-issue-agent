@@ -807,3 +807,109 @@ def test_p1r_18_built_context_falls_back_to_the_marker_without_an_operator_cmd(t
 
     ctx.revert_and_run(("src/x.py",))
     assert ran == ["pytest tests/test_x.py"]
+
+
+# ── ReviewCheckouts: pinned per-PR review worktrees (keifu #165) ─────────────
+SHA = "2250d0f56c91d536b375ff1fc7e228d44f357470"
+
+
+def _review_checkouts(table, exists=lambda p: False):
+    fg = FakeGit(table)
+    rc = wt_mod.ReviewCheckouts(
+        "/repo", run=fg, path_exists=exists
+    )
+    return rc, fg
+
+
+def test_review_checkout_creates_detached_worktree_at_head():
+    rc, fg = _review_checkouts(
+        {
+            f"cat-file -e {SHA}": GitResult(0, ""),
+            "rev-parse HEAD": GitResult(0, SHA + "\n"),
+        },
+        exists=lambda p: p.endswith("review-pr-165"),
+    )
+    # First call: path does not exist yet → worktree add. Simulate by making
+    # exists() False before add: use a stateful exists.
+    seen = {"added": False}
+
+    def exists(path):
+        return seen["added"]
+
+    rc._path_exists = exists
+    original = fg.table
+    real_call = fg.__call__
+
+    def call(args, cwd):
+        if args[:2] == ["worktree", "add"]:
+            seen["added"] = True
+        return real_call(args, cwd)
+
+    rc._git = call
+    path = rc.ensure(165, SHA)
+    assert path == "/repo/.claude/worktrees/review-pr-165"
+    joined = [" ".join(a) for a, _ in fg.calls]
+    assert any(j.startswith("fetch origin refs/pull/165/head") for j in joined)
+    assert any(
+        j.startswith(f"worktree add --detach .claude/worktrees/review-pr-165 {SHA}")
+        for j in joined
+    )
+
+
+def test_review_checkout_refreshes_existing_worktree_and_verifies_head():
+    rc, fg = _review_checkouts(
+        {
+            f"cat-file -e {SHA}": GitResult(0, ""),
+            "rev-parse HEAD": GitResult(0, SHA + "\n"),
+        },
+        exists=lambda p: True,
+    )
+    path = rc.ensure(165, SHA)
+    joined = [" ".join(a) for a, _ in fg.calls]
+    assert any(j.startswith(f"checkout --detach {SHA}") for j in joined)
+    assert any(j.startswith(f"reset --hard {SHA}") for j in joined)
+    assert any(j.startswith("clean -fd") for j in joined)
+    # Memoized second call for the same head does no further git work.
+    n = len(fg.calls)
+    assert rc.ensure(165, SHA) == path
+    assert len(fg.calls) == n
+
+
+def test_review_checkout_raises_when_head_is_unreachable():
+    rc, _fg = _review_checkouts(
+        {f"cat-file -e {SHA}": GitResult(1, "")}, exists=lambda p: True
+    )
+    with pytest.raises(WorktreeUnavailable):
+        rc.ensure(165, SHA)
+
+
+def test_review_checkout_raises_when_verified_head_differs():
+    rc, _fg = _review_checkouts(
+        {
+            f"cat-file -e {SHA}": GitResult(0, ""),
+            "rev-parse HEAD": GitResult(0, "deadbeef\n"),
+        },
+        exists=lambda p: True,
+    )
+    with pytest.raises(WorktreeUnavailable):
+        rc.ensure(165, SHA)
+
+
+def test_review_checkout_remove_forgets_memo():
+    rc, fg = _review_checkouts(
+        {
+            f"cat-file -e {SHA}": GitResult(0, ""),
+            "rev-parse HEAD": GitResult(0, SHA + "\n"),
+        },
+        exists=lambda p: True,
+    )
+    rc.ensure(165, SHA)
+    rc.remove(165)
+    joined = [" ".join(a) for a, _ in fg.calls]
+    assert any(
+        j.startswith("worktree remove --force .claude/worktrees/review-pr-165")
+        for j in joined
+    )
+    n = len(fg.calls)
+    rc.ensure(165, SHA)  # re-ensures after removal (no stale memo)
+    assert len(fg.calls) > n

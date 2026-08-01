@@ -1352,3 +1352,53 @@ def test_claim_target_changed_defers_even_when_journalling_raises():
 
     assert result is None
     assert runner.tasks == []
+
+
+# ── pinned per-PR review checkouts (keifu #165, 2026-08-01) ──────────────────
+def test_review_runs_in_the_pinned_checkout_for_the_reviewed_head():
+    """The verdict binds a head SHA; the leg's cwd must be a checkout OF that
+    SHA, never the operator's live checkout (three phantom REQUEST_CHANGES
+    rounds quoted stale chong-dev code under fresh SHAs)."""
+    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="abc", reviews=())})
+    store = FakeStore()
+    runner = FakeRunner(
+        AgentResult(is_error=False, status="APPROVE", summary="ok")
+    )
+    pinned: list[tuple[int, str]] = []
+    removed: list[int] = []
+
+    def checkout(pr, head):
+        pinned.append((pr, head))
+        return f"/pinned/review-pr-{pr}"
+
+    wf = _workflow(
+        gw, store, runner,
+        review_checkout=checkout,
+        review_checkout_cleanup=removed.append,
+    )
+    asyncio.run(wf.review(100))
+
+    assert pinned == [(100, "abc")]
+    assert [t.cwd for t in runner.tasks] == ["/pinned/review-pr-100"]
+    # settled round → pinned checkout released
+    assert removed == [100]
+
+
+def test_review_defers_when_the_pinned_checkout_is_unavailable():
+    """Reviewing unpinned code is worse than waiting a poll: no leg runs, no
+    verdict is posted, and no reviewed-state advances."""
+    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="abc", reviews=())})
+    store = FakeStore()
+    runner = FakeRunner(
+        AgentResult(is_error=False, status="APPROVE", summary="ok")
+    )
+
+    def checkout(_pr, _head):
+        raise RuntimeError("head not reachable after fetch")
+
+    wf = _workflow(gw, store, runner, review_checkout=checkout)
+    asyncio.run(wf.review(100))
+
+    assert runner.tasks == []
+    assert not store.get_last_sha(100)
+    assert not store.get_pr_session(100)

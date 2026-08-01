@@ -61,6 +61,15 @@ class ReviewWorkflowConfig:
     execution_cwd: str = ""
     prepare_cwd: Callable[[str], None] | None = None
     journal: EventSink | None = None
+    # Pinned per-PR review checkout: (pr, head_sha) → abs path whose HEAD is
+    # exactly head_sha, or raise. When set, review legs never execute in the
+    # operator's live checkout — on-disk reads there see whatever branch and
+    # dirty state the operator has (keifu #165, 2026-08-01: three phantom
+    # REQUEST_CHANGES rounds quoting stale chong-dev code under a fresh SHA).
+    # A failure to pin DEFERS the round; reviewing unpinned code is worse than
+    # waiting a poll.
+    review_checkout: Callable[[int, str], str] | None = None
+    review_checkout_cleanup: Callable[[int], None] | None = None
 
     def __post_init__(self) -> None:
         runtime = (
@@ -185,8 +194,8 @@ class ReviewWorkflow:
             f"unproductive round {n}"
         )
 
-    async def _run_logged(self, label: str, pr: int, task):
-        task = self._prepare_task(task)
+    async def _run_logged(self, label: str, pr: int, task, head_sha: str = ""):
+        task = self._prepare_task(task, pr, head_sha)
         if task is None:
             return AgentResult(
                 is_error=True,
@@ -208,31 +217,44 @@ class ReviewWorkflow:
             task,
         )
 
-    def _prepare_task(self, task):
-        """Install Codex's review governor immediately before each agent leg.
+    def _prepare_task(self, task, pr: int = 0, head_sha: str = ""):
+        """Pin the leg's cwd to the reviewed head, then install Codex's review
+        governor immediately before each agent leg.
 
         A builder-time write can mutate whichever checkout happens to run a
-        test, including an in-flight fixer worktree.  Review has no worktree of
-        its own, so the configured target checkout is the sole permitted hook
-        destination and is also made the task's execution cwd.
+        test, including an in-flight fixer worktree — so the hook install
+        happens here, into the same directory the leg will execute in. That
+        directory is the per-PR pinned checkout when configured (the verdict
+        binds `head_sha`; the code the reviewer reads must be that SHA, not
+        the operator's live checkout), else the configured target checkout.
         """
+        cwd = self.cfg.execution_cwd
+        if self.cfg.review_checkout is not None and pr and head_sha:
+            try:
+                cwd = self.cfg.review_checkout(pr, head_sha)
+            except Exception as exc:  # noqa: BLE001 — stale review is the worse outcome
+                self.cfg.log(
+                    f"review #{pr}: pinned checkout at {head_sha[:12]} "
+                    f"unavailable ({exc}) — deferring this round"
+                )
+                return None
         if not self.cfg.reviewer_capabilities.requires_external_governor:
-            return task
-        if not self.cfg.execution_cwd or self.cfg.prepare_cwd is None:
+            return replace(task, cwd=cwd) if cwd else task
+        if not cwd or self.cfg.prepare_cwd is None:
             self.cfg.log(
                 "review: Codex containment unavailable — set TARGET_DIR to the "
                 "review checkout; refusing to run without a governor hook"
             )
             return None
         try:
-            self.cfg.prepare_cwd(self.cfg.execution_cwd)
+            self.cfg.prepare_cwd(cwd)
         except OSError as exc:
             self.cfg.log(
-                f"review: Codex containment setup failed in {self.cfg.execution_cwd}: {exc}; "
+                f"review: Codex containment setup failed in {cwd}: {exc}; "
                 "refusing to run"
             )
             return None
-        return replace(task, cwd=self.cfg.execution_cwd)
+        return replace(task, cwd=cwd)
 
     async def review(
         self, pr: int, *, claim_target: int | None = None
@@ -273,7 +295,7 @@ class ReviewWorkflow:
                 as_untrusted(diff),
                 self.cfg.review,
             )
-        result = await self._run_logged("review", pr, task)
+        result = await self._run_logged("review", pr, task, p.head_ref_oid)
         if result.is_error:
             self.cfg.log(
                 f"review #{pr}: agent errored (status={result.status or 'error'}, "
@@ -376,7 +398,7 @@ class ReviewWorkflow:
                     as_untrusted(diff),
                     session_id, self.cfg.review,
                 )
-        result = await self._run_logged("re-review", pr, task)
+        result = await self._run_logged("re-review", pr, task, p.head_ref_oid)
         if result.is_error:
             # do NOT advance sha/round — retry same diff next poll. Log cost so a
             # budget-cap abort (delegated review + scout subagents share one budget)
@@ -597,7 +619,7 @@ class ReviewWorkflow:
         prior = review_dom.count_prior_rejections(p.reviews, self.cfg.review_bot)
 
         # 1. skip-gate — a pure doc/format/config diff short-circuits to APPROVE.
-        gate = await self._run_logged("review-gate", pr,
+        gate = await self._run_logged("review-gate", pr, head_sha=p.head_ref_oid, task=
             task_builders.build_review_gate_task(
                 pr,
                 as_untrusted(p.title),
@@ -635,7 +657,7 @@ class ReviewWorkflow:
         # partial result; it retries next poll instead.
         dims = task_builders.REVIEW_DIMENSIONS
         dim_results = await self._gather_legs([
-            self._run_logged(f"review:{key}", pr,
+            self._run_logged(f"review:{key}", pr, head_sha=p.head_ref_oid, task=
                 task_builders.build_review_dimension_task(
                     pr,
                     key,
@@ -666,7 +688,7 @@ class ReviewWorkflow:
         # as a fact either — the PR is simply retried next poll.
         if candidates:
             verdicts = await self._gather_legs([
-                self._run_logged(f"validate:{f.dimension}", pr,
+                self._run_logged(f"validate:{f.dimension}", pr, head_sha=p.head_ref_oid, task=
                     task_builders.build_review_validation_task(
                         pr,
                         f.dimension,
@@ -745,6 +767,16 @@ class ReviewWorkflow:
                 self.store.clear_infra_deaths(key)
             except Exception as exc:  # noqa: BLE001 — decay is best-effort, never fatal
                 self.cfg.log(f"review #{p.number}: no-progress counter not cleared ({exc})")
+        # A settled round no longer needs its pinned checkout; the next round
+        # recreates one at the then-current head. Best-effort — a leftover
+        # worktree is a directory, not a correctness hazard.
+        if self.cfg.review_checkout_cleanup is not None:
+            try:
+                self.cfg.review_checkout_cleanup(p.number)
+            except Exception as exc:  # noqa: BLE001
+                self.cfg.log(
+                    f"review #{p.number}: pinned checkout not removed ({exc})"
+                )
 
     def _persist_review_state(
         self, pr: int, head_oid: str, round_number: int, signature: str
