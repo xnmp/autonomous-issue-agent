@@ -694,3 +694,16 @@ def test_pr_body_denial_teaches_the_full_required_shape():
     assert "Fixes #" in missing_ac.reason
     missing_kw = check_pr_body("## Acceptance Criteria\n- x")
     assert "Fixes #" in missing_kw.reason and "- [ ]" in missing_kw.reason
+
+
+def test_rust_test_files_are_recognized_as_tests():
+    """Rust integration tests are bare .rs files under tests/ (each compiled
+    as its own crate by cargo) — keifu #155's tests/help_popup_scroll_test.rs
+    was rejected by the .py-only tests/ arm (2026-08-01)."""
+    from issue_agent.domain.gate import looks_like_test
+
+    assert looks_like_test("tests/help_popup_scroll_test.rs")
+    assert looks_like_test("tests/scroll.rs")
+    assert looks_like_test("src/app/mouse_test.rs")
+    assert not looks_like_test("src/app/mouse.rs")
+    assert not looks_like_test("tests/fixtures/data.json")

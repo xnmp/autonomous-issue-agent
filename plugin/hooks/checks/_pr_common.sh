@@ -33,7 +33,7 @@
 # bash 3.2-safe: no mapfile, no process substitution — here-strings only.
 
 # Shared file-name pattern for "this looks like a test file".
-PR_TEST_FILE_RE='(e2e|integration|regression|test|spec).*\.(spec|test)\.|(^|/)test_.*\.py|.*_test\.(py|go|ts|js)|tests?/.*\.py'
+PR_TEST_FILE_RE='(e2e|integration|regression|test|spec).*\.(spec|test)\.|(^|/)test_.*\.py|.*_test\.(py|go|ts|js|rs)|tests?/.*\.(py|rs)'
 
 # Allowed commit-subject prefix: a bare harness prefix (`red: `) OR a conventional
 # commit optionally carrying the phase as a scope (`test(red): `). The scoped form

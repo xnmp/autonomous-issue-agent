@@ -46,8 +46,12 @@ def deny(reason: str) -> GateResult:
 TEST_FILE_RE = re.compile(
     r"(e2e|integration|regression|test|spec).*\.(spec|test)\."
     r"|(^|/)test_.*\.py"
-    r"|.*_test\.(py|go|ts|js)"
-    r"|tests?/.*\.py"
+    r"|.*_test\.(py|go|ts|js|rs)"
+    # Rust integration tests are BY CONVENTION bare .rs files under tests/
+    # (cargo compiles each as its own test crate) — the detector's .py-only
+    # tests/ arm rejected `tests/help_popup_scroll_test.rs` on keifu #155
+    # (2026-08-01) even though `cargo test` ran it.
+    r"|tests?/.*\.(py|rs)"
 )
 
 # Stricter pattern for the feat/ branch "must add an e2e/integration test" rule
@@ -55,8 +59,8 @@ TEST_FILE_RE = re.compile(
 FEAT_TEST_RE = re.compile(
     r"(e2e|integration).*\.(spec|test)\."
     r"|(^|/)test_.*\.py"
-    r"|.*_test\.(py|go|ts|js)"
-    r"|tests?/.*\.(py|spec|test)"
+    r"|.*_test\.(py|go|ts|js|rs)"
+    r"|tests?/.*\.(py|rs|spec|test)"
 )
 
 # Two accepted forms for the harness's TDD/phase markers:

@@ -145,7 +145,7 @@ case "$branch" in
     # Prefer an explicit e2e/integration test, but accept any conventional test
     # file path (test_*.py, *_test.go, tests/…) so projects without "e2e" in the
     # filename are not falsely blocked.
-    printf '%s\n' "$changed" | grep -qE '(e2e|integration).*\.(spec|test)\.|(^|/)test_.*\.py|.*_test\.(py|go|ts|js)|tests?/.*\.(py|spec|test)' \
+    printf '%s\n' "$changed" | grep -qE '(e2e|integration).*\.(spec|test)\.|(^|/)test_.*\.py|.*_test\.(py|go|ts|js|rs)|tests?/.*\.(py|rs|spec|test)' \
       || fail "feat/ branch must add an e2e/integration (or conventional) test (none found in the diff)" ;;
   fix/*)
     printf '%s\n' "$changed" | grep -qE "$PR_TEST_FILE_RE" \
