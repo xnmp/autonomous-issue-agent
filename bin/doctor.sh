@@ -377,7 +377,7 @@ if command -v gh >/dev/null 2>&1; then
           else
             case "$_probe_out" in
               *"HTTP 403"*|*"Resource not accessible"*)
-                bad "review identity '$_bot_login' CANNOT write to $REPO — a label write returned 403 despite permissions.push=true. Every relabel, comment and review the harness makes will fail AFTER the leg is paid for. Re-mint REVIEW_BOT_TOKEN with Issues: Read+Write, Pull requests: Read+Write, Contents: Read (fine-grained), or grant the account write access and accept the invite" ;;
+                bad "review identity '$_bot_login' CANNOT write to $REPO — a label write returned 403 despite permissions.push=true. Every relabel, comment and review the harness makes will fail AFTER the leg is paid for. the usual cause on a PERSONAL repo owned by someone else: fine-grained PATs can only target repos the token's own account owns (resource-owner limitation), so NO fine-grained grant can ever cover this repo — mint a CLASSIC PAT with 'repo' scope for the bot as REVIEW_BOT_TOKEN instead. On the bot's own repo or an org repo, re-mint fine-grained with Issues: Read+Write, Pull requests: Read+Write, Contents: Read" ;;
               *"HTTP 422"*|*"already_exists"*)
                 # Permission was fine; the name collided. Do NOT delete a label
                 # this run did not create.
@@ -388,13 +388,13 @@ if command -v gh >/dev/null 2>&1; then
                 # the old unreadable-scopes warning still belongs — once the probe
                 # has an answer, the guess is noise (a ✗ already names the
                 # re-mint, a ✓ already proves Issues: Write).
-                warn "review identity write probe could not run against $REPO (${_probe_out%%$'\n'*}) — write capability is UNVERIFIED; a fine-grained PAT's per-scope grants are not readable via the API, so if lifecycle writes or approvals 403 with 'Resource not accessible by personal access token', re-mint REVIEW_BOT_TOKEN with Issues: Read+Write, Pull requests: Read+Write, Contents: Read" ;;
+                warn "review identity write probe could not run against $REPO (${_probe_out%%$'\n'*}) — write capability is UNVERIFIED; a fine-grained PAT's per-scope grants are not readable via the API, so if lifecycle writes or approvals 403 with 'Resource not accessible by personal access token', re-mint REVIEW_BOT_TOKEN (classic 'repo' scope for a cross-account personal repo; fine-grained Issues/PRs RW + Contents R otherwise)" ;;
             esac
           fi
           _probe_created=""
           trap - INT TERM
         else
-          bad "review identity '$_bot_login' can READ $REPO but not write (permissions.push=${_perm:-unknown}) — every approval will 403 AFTER the review is paid for. Invite it as a collaborator with WRITE and accept the invite from that account; a fine-grained PAT additionally needs Pull requests: Read+Write, Issues: Read+Write, Contents: Read"
+          bad "review identity '$_bot_login' can READ $REPO but not write (permissions.push=${_perm:-unknown}) — every approval will 403 AFTER the review is paid for. Invite it as a collaborator with WRITE and accept the invite from that account; a fine-grained PAT cannot cover a cross-account personal repo at all (use classic 'repo' scope); on own/org repos it needs Pull requests: Read+Write, Issues: Read+Write, Contents: Read"
         fi
       fi
     fi

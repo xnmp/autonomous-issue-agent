@@ -150,8 +150,13 @@ def test_denied_write_is_an_error_naming_the_scopes_to_remint(tmp_path):
     assert "CANNOT write" in out
     error_line = next(line for line in out.splitlines() if "CANNOT write" in line)
     assert "✗" in error_line
+    # Cross-account personal repos need a CLASSIC PAT — fine-grained tokens
+    # cannot select another user's personal repo as resource owner, so naming
+    # only fine-grained scopes sent the operator down a dead end (2026-08-02:
+    # a re-minted fine-grained token 403'd identically).
+    assert "CLASSIC PAT" in error_line
+    assert "repo" in error_line
     assert "Issues: Read+Write" in error_line
-    assert "Pull requests: Read+Write" in error_line
     assert "REVIEW_BOT_TOKEN" in error_line
 
 
