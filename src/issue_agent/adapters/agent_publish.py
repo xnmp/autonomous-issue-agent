@@ -87,7 +87,7 @@ def _run_command(
 
 
 def _publication_environment(
-    trusted_path: str, *, host: str
+    trusted_path: str, *, host: str, gh_binary: str = ""
 ) -> dict[str, str]:
     environment = dict(os.environ)
     dangerous = {
@@ -113,6 +113,21 @@ def _publication_environment(
     environment["GH_HOST"] = host
     environment["GIT_CONFIG_NOSYSTEM"] = "1"
     environment["GIT_CONFIG_GLOBAL"] = os.devnull
+    # Nulling the global config above also removed the operator's
+    # credential.helper, so an https push prompted for a username and died
+    # headless (`could not read Username`, keifu #39, 2026-08-01). Restore
+    # auth through the ONE path this broker already trusts: the absolute gh
+    # binary recovered from the supervised ancestor, reading its ambient
+    # login (GH_CONFIG_DIR was scrubbed, so gh uses the operator's real
+    # config, not an agent-supplied redirect). The empty first helper entry
+    # clears any inherited helper list; prompting stays forbidden.
+    if gh_binary:
+        environment["GIT_CONFIG_COUNT"] = "2"
+        environment["GIT_CONFIG_KEY_0"] = f"credential.https://{host}.helper"
+        environment["GIT_CONFIG_VALUE_0"] = ""
+        environment["GIT_CONFIG_KEY_1"] = f"credential.https://{host}.helper"
+        environment["GIT_CONFIG_VALUE_1"] = f"!{gh_binary} auth git-credential"
+    environment["GIT_TERMINAL_PROMPT"] = "0"
     return environment
 
 
@@ -192,7 +207,7 @@ class AgentPublicationBroker:
                     argv,
                     cwd,
                     environment=_publication_environment(
-                        trusted_path, host=self.host
+                        trusted_path, host=self.host, gh_binary=gh_binary
                     ),
                 )
             )

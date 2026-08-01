@@ -1030,3 +1030,30 @@ def test_cli_uses_supervised_ancestor_authority_not_child_environment(
     assert captured["authorized_branch"] == "fix/42-issue"
     assert captured["expected_issue"] == 42
     assert captured["git_binary"] == "/usr/bin/git"
+
+
+def test_publication_environment_authenticates_via_trusted_gh(monkeypatch):
+    """Nulling the global gitconfig removed the operator's credential.helper,
+    so headless https pushes died on a username prompt (keifu #39,
+    2026-08-01). The environment must route credentials through the trusted
+    absolute gh binary and forbid terminal prompts."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/attacker/gitconfig")
+    monkeypatch.setenv("GH_CONFIG_DIR", "/attacker/gh")
+    env = agent_publish._publication_environment(
+        "/usr/bin", host="github.com", gh_binary="/opt/gh/bin/gh"
+    )
+    assert env["GIT_CONFIG_COUNT"] == "2"
+    assert env["GIT_CONFIG_KEY_0"] == "credential.https://github.com.helper"
+    assert env["GIT_CONFIG_VALUE_0"] == ""
+    assert env["GIT_CONFIG_KEY_1"] == "credential.https://github.com.helper"
+    assert env["GIT_CONFIG_VALUE_1"] == "!/opt/gh/bin/gh auth git-credential"
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+    # The scrubs that motivated the regression stay intact.
+    assert env["GIT_CONFIG_GLOBAL"] == "/dev/null"
+    assert "GH_CONFIG_DIR" not in env
+
+
+def test_publication_environment_without_gh_still_forbids_prompts(monkeypatch):
+    env = agent_publish._publication_environment("/usr/bin", host="github.com")
+    assert "GIT_CONFIG_COUNT" not in env
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
