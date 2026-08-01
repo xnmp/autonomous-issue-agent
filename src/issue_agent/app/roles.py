@@ -1164,14 +1164,18 @@ class _ReviewRuntimeBinding:
 
 
 def _bind_claude_review_runtime(
-    _cfg: HarnessConfig,
+    cfg: HarnessConfig,
     _runtime_config: ReviewRuntimeConfig,
     runner: AgentRuntime,
 ) -> _ReviewRuntimeBinding:
     from ..adapters.repository_guidance import RepositoryGuidanceRuntime
 
+    # execution_cwd is what arms the pinned per-PR review checkout (roles
+    # builds ReviewCheckouts off it) — without it Claude review legs read
+    # whatever the operator's live checkout happens to contain (0d2e295 M1).
     return _ReviewRuntimeBinding(
-        RepositoryGuidanceRuntime(runner, log=_log("review"))
+        RepositoryGuidanceRuntime(runner, log=_log("review")),
+        execution_cwd=cfg.target_dir,
     )
 
 

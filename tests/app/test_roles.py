@@ -1932,6 +1932,29 @@ def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
     assert seen["env"]["ISSUE_AGENT_LEG_ROLE"] == "review"
 
 
+def _git_target(tmp_path):
+    """A real git checkout for TARGET_DIR. The Claude review binding arms the
+    per-PR pinned checkout off TARGET_DIR (0d2e295 M1), so a review leg only
+    runs when the PR's head SHA actually exists in that repo — a bare tmp dir
+    now (correctly) defers every round instead of reviewing it."""
+    repo = tmp_path / "target"
+    subprocess.run(
+        ["git", "init", "-q", str(repo)], check=True, capture_output=True
+    )
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.email=t@example.com",
+            "-c", "user.name=t", "commit", "--allow-empty", "-q", "-m", "seed",
+        ],
+        check=True, capture_output=True,
+    )
+    sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    return str(repo), sha
+
+
 def test_review_daemon_claim_agrees_with_branch_resolved_issue(tmp_path):
     """A review claim and paid admission must identify the same target.
 
@@ -1944,10 +1967,11 @@ def test_review_daemon_claim_agrees_with_branch_resolved_issue(tmp_path):
     from issue_agent.app.config import from_env
     from issue_agent.app.roles import build_review_daemon
 
+    target_dir, head_sha = _git_target(tmp_path)
     pr = PRView(
         152,
         head_ref_name="fix/150-live-e2e",
-        head_ref_oid="head-152",
+        head_ref_oid=head_sha,
         closing_issue=None,
         title="dashboard health",
         body="Adds a health endpoint.",
@@ -1978,7 +2002,7 @@ def test_review_daemon_claim_agrees_with_branch_resolved_issue(tmp_path):
             "FIX_BOT": FIX_BOT,
             "REVIEW_BOT": REVIEW_BOT,
             "REVIEWER_RUNTIME": "claude",
-            "TARGET_DIR": str(tmp_path),
+            "TARGET_DIR": target_dir,
             **_role_state_env(tmp_path),
         }),
         control_authority_root=str(tmp_path / "machine-state"),
@@ -1992,6 +2016,11 @@ def test_review_daemon_claim_agrees_with_branch_resolved_issue(tmp_path):
 
     assert RunAgent(AgentKind.REVIEW, pr.number) in actions
     assert len(runner.tasks) == 1
+    # M1: the Claude leg executed in the pinned per-PR checkout, not the
+    # operator's live TARGET_DIR.
+    assert runner.tasks[0].cwd == os.path.join(
+        target_dir, ".claude", "worktrees", "review-pr-152"
+    )
     assert ("review", pr.number, "APPROVE", "lgtm") in gateway.calls
     assert store.get_pr_session(pr.number) == "review-session"
 
@@ -2060,10 +2089,11 @@ def test_paid_review_failure_remains_counted_after_later_relink(tmp_path):
     from issue_agent.app.config import from_env
     from issue_agent.app.roles import build_review_daemon
 
+    target_dir, head_sha = _git_target(tmp_path)
     observed = PRView(
         152,
         head_ref_name="fix/150-live-e2e",
-        head_ref_oid="head-152",
+        head_ref_oid=head_sha,
         closing_issue=150,
         title="dashboard health",
         body="Adds a health endpoint.",
@@ -2087,7 +2117,7 @@ def test_paid_review_failure_remains_counted_after_later_relink(tmp_path):
             "FIX_BOT": FIX_BOT,
             "REVIEW_BOT": REVIEW_BOT,
             "REVIEWER_RUNTIME": "claude",
-            "TARGET_DIR": str(tmp_path),
+            "TARGET_DIR": target_dir,
             **_role_state_env(tmp_path),
         }),
         control_authority_root=str(tmp_path / "machine-state"),

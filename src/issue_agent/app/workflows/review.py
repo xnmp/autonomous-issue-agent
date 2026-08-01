@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from ...domain import review as review_dom
 from ...domain.events import (
@@ -41,6 +41,22 @@ from .base import run_leg
 
 _EXTERNAL_REVIEW_SESSION = "github-review"
 _FRESH_REVIEW_SESSION = "codex-review"
+
+# A round that could not PIN its checkout never ran a paid leg — it must defer
+# (retry next poll) without feeding the unproductive-round counter, or five
+# free deferrals walk a healthy PR into needs-human-review (0d2e295 H3).
+_PIN_DEFERRED_STATUS = "review_checkout_deferred"
+
+# …but "free" cannot mean "unbounded and invisible" (adversarial F1): a
+# checkout that can NEVER be pinned (TARGET_DIR not a repo, dead origin) would
+# otherwise stall the PR forever with no escalation and no dashboard signal.
+# Past this consecutive-deferral streak, further deferrals count as
+# unproductive rounds again, restoring the escalation bound.
+_MAX_FREE_PIN_DEFERRALS = 5
+
+
+def _pin_deferred(result) -> bool:
+    return bool(result.is_error) and result.status == _PIN_DEFERRED_STATUS
 
 
 @dataclass(frozen=True)
@@ -94,6 +110,9 @@ class ReviewWorkflow:
     # direct-gateway bypass this field exists to remove.
     executor: ActionExecutor
     log_run: Callable[[str, int, object], Awaitable[object]] | None = None
+    # Consecutive pin-deferral streak per PR (daemon lifetime; a restart
+    # resets it, and a permanently broken config re-earns it within minutes).
+    _pin_deferrals: dict[int, int] = field(default_factory=dict)
 
     def _trigger_label(self) -> Label:
         """The reviewer's trigger label as a domain Label. Both the default
@@ -194,8 +213,45 @@ class ReviewWorkflow:
             f"unproductive round {n}"
         )
 
+    def _pin_deferral(self, p, result) -> bool:
+        """True when `result` is a pin deferral — the caller must return
+        without submitting anything. Every deferral is journalled on the ADR
+        0008 pattern (same shape as `_claim_matches`' dispatch_deferred: a
+        persistent flap must be visible in the dashboard's per-issue event
+        view, not only the log), and only a bounded streak is exempt from the
+        unproductive-round counter — past `_MAX_FREE_PIN_DEFERRALS` the
+        escalation bound is restored so an unpinnable PR still reaches a
+        human."""
+        if not _pin_deferred(result):
+            return False
+        n = self._pin_deferrals.get(p.number, 0) + 1
+        self._pin_deferrals[p.number] = n
+        if self.cfg.journal is not None:
+            try:
+                self.cfg.journal.emit(
+                    TelemetryEvent(
+                        TelemetryWarning(
+                            "review_pin_deferred",
+                            f"review #{p.number}: pinned checkout at "
+                            f"{p.head_ref_oid[:12] or '?'} unavailable — "
+                            f"deferral {n} in a row",
+                            {"streak": n, "head": p.head_ref_oid},
+                        ),
+                        Correlation(pr=p.number),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 — telemetry must not block
+                self.cfg.log(
+                    f"review #{p.number}: pin deferral not journalled ({exc})"
+                )
+        if n > _MAX_FREE_PIN_DEFERRALS:
+            self._no_progress(p, f"pin deferral streak {n}")
+        return True
+
     async def _run_logged(self, label: str, pr: int, task, head_sha: str = ""):
         task = self._prepare_task(task, pr, head_sha)
+        if isinstance(task, AgentResult):
+            return task
         if task is None:
             return AgentResult(
                 is_error=True,
@@ -229,7 +285,20 @@ class ReviewWorkflow:
         the operator's live checkout), else the configured target checkout.
         """
         cwd = self.cfg.execution_cwd
-        if self.cfg.review_checkout is not None and pr and head_sha:
+        if self.cfg.review_checkout is not None and pr:
+            if not head_sha:
+                # Never silently fall back to the live checkout: an empty head
+                # SHA means the observation was degenerate — defer, re-observe
+                # (0d2e295 M2).
+                self.cfg.log(
+                    f"review #{pr}: no head SHA to pin the checkout to — "
+                    "deferring this round"
+                )
+                return AgentResult(
+                    is_error=True,
+                    status=_PIN_DEFERRED_STATUS,
+                    summary=f"review #{pr}: no head SHA to pin",
+                )
             try:
                 cwd = self.cfg.review_checkout(pr, head_sha)
             except Exception as exc:  # noqa: BLE001 — stale review is the worse outcome
@@ -237,7 +306,11 @@ class ReviewWorkflow:
                     f"review #{pr}: pinned checkout at {head_sha[:12]} "
                     f"unavailable ({exc}) — deferring this round"
                 )
-                return None
+                return AgentResult(
+                    is_error=True,
+                    status=_PIN_DEFERRED_STATUS,
+                    summary=f"review #{pr}: pinned checkout unavailable",
+                )
         if not self.cfg.reviewer_capabilities.requires_external_governor:
             return replace(task, cwd=cwd) if cwd else task
         if not cwd or self.cfg.prepare_cwd is None:
@@ -296,6 +369,8 @@ class ReviewWorkflow:
                 self.cfg.review,
             )
         result = await self._run_logged("review", pr, task, p.head_ref_oid)
+        if self._pin_deferral(p, result):
+            return
         if result.is_error:
             self.cfg.log(
                 f"review #{pr}: agent errored (status={result.status or 'error'}, "
@@ -399,6 +474,8 @@ class ReviewWorkflow:
                     session_id, self.cfg.review,
                 )
         result = await self._run_logged("re-review", pr, task, p.head_ref_oid)
+        if self._pin_deferral(p, result):
+            return
         if result.is_error:
             # do NOT advance sha/round — retry same diff next poll. Log cost so a
             # budget-cap abort (delegated review + scout subagents share one budget)
@@ -628,6 +705,8 @@ class ReviewWorkflow:
                 rcfg,
             ),
         )
+        if self._pin_deferral(p, gate):
+            return
         if gate.is_error:
             # transport failure — leave state untouched, retry next poll (but
             # COUNT the round: the retry is not free, and an is_error gate that
@@ -670,6 +749,14 @@ class ReviewWorkflow:
             )
             for key, focus in dims
         ])
+        lost = next((r for r in dim_results if _pin_deferred(r)), None)
+        if lost is not None:
+            # The pinned checkout vanished mid-round (gate ensured it, a
+            # dimension lost it). Sibling spend is sunk either way; the streak
+            # counter keeps this bounded and journalled.
+            self.cfg.log(f"review #{pr}: pinned checkout lost mid-round — deferring")
+            self._pin_deferral(p, lost)
+            return
         complete = True
         candidates: list[review_dom.Finding] = []
         for (key, _focus), res in zip(dims, dim_results):
@@ -700,6 +787,13 @@ class ReviewWorkflow:
                 )
                 for f in candidates
             ])
+            lost = next((v for v in verdicts if _pin_deferred(v)), None)
+            if lost is not None:
+                self.cfg.log(
+                    f"review #{pr}: pinned checkout lost mid-round — deferring"
+                )
+                self._pin_deferral(p, lost)
+                return
             validated = []
             for f, v in zip(candidates, verdicts):
                 if v.is_error:
@@ -767,6 +861,11 @@ class ReviewWorkflow:
                 self.store.clear_infra_deaths(key)
             except Exception as exc:  # noqa: BLE001 — decay is best-effort, never fatal
                 self.cfg.log(f"review #{p.number}: no-progress counter not cleared ({exc})")
+        # The pin-deferral streak clears on confirmed PROGRESS, not on a
+        # successful pin: multi-mode's gate pins successfully every round even
+        # when a later dimension defers the round, and a pin-time reset would
+        # let that loop evade the deferral bound forever.
+        self._pin_deferrals.pop(p.number, None)
         # A settled round no longer needs its pinned checkout; the next round
         # recreates one at the then-current head. Best-effort — a leftover
         # worktree is a directory, not a correctness hazard.

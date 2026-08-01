@@ -1402,3 +1402,127 @@ def test_review_defers_when_the_pinned_checkout_is_unavailable():
     assert runner.tasks == []
     assert not store.get_last_sha(100)
     assert not store.get_pr_session(100)
+    # 0d2e295 H3: a deferral paid for nothing — it must NOT feed the
+    # unproductive-round counter, or five free deferrals escalate the PR.
+    assert store.infra_deaths == {}
+
+
+def test_re_review_pin_deferral_is_not_an_unproductive_round():
+    """H3's expensive shape: pre-fix, five pin deferrals walked an APPROVED-
+    but-unmergeable PR into needs-human-review without a single leg running."""
+    review = Review(
+        "CHANGES_REQUESTED", "review-bot[bot]", "t1", commit_id="old",
+    )
+    gw = FakeGateway(
+        prs={100: PRView(100, head_ref_oid="new", reviews=(review,))}
+    )
+    store = FakeStore()
+    runner = FakeRunner(
+        AgentResult(is_error=False, status="APPROVE", summary="ok")
+    )
+
+    def checkout(_pr, _head):
+        raise RuntimeError("worktree add failed")
+
+    wf = _workflow(gw, store, runner, review_checkout=checkout)
+    for _ in range(5):
+        asyncio.run(wf.re_review(100))
+
+    assert runner.tasks == []
+    assert store.infra_deaths == {}
+
+
+def test_pin_deferrals_are_journalled_and_bounded_not_silent_forever():
+    """Adversarial F1: 'free' must not mean 'unbounded and invisible'. Every
+    deferral emits a review_pin_deferred TelemetryWarning (ADR 0008 — the
+    dashboard's per-issue view, not just the log), and past the free streak the
+    unproductive-round counter resumes so an unpinnable PR still escalates."""
+    review = Review(
+        "CHANGES_REQUESTED", "review-bot[bot]", "t1", commit_id="old",
+    )
+    gw = FakeGateway(
+        prs={100: PRView(100, head_ref_oid="new", reviews=(review,))}
+    )
+    store = FakeStore()
+    runner = FakeRunner(
+        AgentResult(is_error=False, status="APPROVE", summary="ok")
+    )
+    journal = RecordingJournal()
+
+    def checkout(_pr, _head):
+        raise RuntimeError("TARGET_DIR is not a git repository")
+
+    wf = _workflow(
+        gw, store, runner, journal=journal, review_checkout=checkout
+    )
+    for _ in range(8):
+        asyncio.run(wf.re_review(100))
+
+    assert runner.tasks == []
+    warnings = [
+        e.payload for e in journal.events
+        if isinstance(e.payload, TelemetryWarning)
+        and e.payload.code == "review_pin_deferred"
+    ]
+    assert len(warnings) == 8                     # every deferral is visible
+    assert warnings[-1].details["streak"] == 8
+    # 5 free, then the escalation bound resumes: deferrals 6-8 count.
+    assert store.infra_deaths == {-100: 3}
+
+
+def test_a_progressed_round_resets_the_deferral_streak():
+    """A transient flap (a few deferrals, then a round that actually lands a
+    verdict) must never accumulate toward the resumed counting. The reset is
+    on confirmed PROGRESS, not on a successful pin — multi-mode's gate pins
+    successfully even in rounds a dimension later defers."""
+    review = Review(
+        "CHANGES_REQUESTED", "review-bot[bot]", "t1", commit_id="old",
+    )
+    gw = FakeGateway(
+        prs={100: PRView(100, head_ref_oid="new", reviews=(review,))}
+    )
+    store = FakeStore()
+    runner = FakeRunner(
+        AgentResult(
+            is_error=False,
+            structured={"decision": "APPROVE", "body": "lgtm"},
+        )
+    )
+    flaky = {"fail": True}
+
+    def checkout(_pr, _head):
+        if flaky["fail"]:
+            raise RuntimeError("flap")
+        return "/pinned"
+
+    wf = _workflow(gw, store, runner, review_checkout=checkout)
+    for _ in range(4):                     # 4 deferrals — under the free cap
+        asyncio.run(wf.re_review(100))
+    flaky["fail"] = False
+    asyncio.run(wf.re_review(100))         # pin succeeds → streak resets
+    assert wf._pin_deferrals == {}
+    assert store.infra_deaths == {}
+
+
+def test_an_empty_head_sha_defers_rather_than_reviewing_the_live_checkout():
+    """0d2e295 M2: with a pinned-checkout policy configured, an empty head SHA
+    must DEFER the leg, never silently fall back to the live checkout. (Every
+    public path today also fails the revision-bound diff first; this pins the
+    contract of the task-preparation seam itself so a future caller cannot
+    reintroduce the fallback.)"""
+    pinned: list[tuple[int, str]] = []
+
+    def checkout(pr, head):
+        pinned.append((pr, head))
+        return "/pinned"
+
+    wf = _workflow(
+        FakeGateway(prs={}), FakeStore(),
+        FakeRunner(AgentResult(is_error=False)),
+        review_checkout=checkout,
+    )
+    out = wf._prepare_task(object(), pr=100, head_sha="")
+
+    assert isinstance(out, AgentResult)
+    assert out.is_error and out.status == "review_checkout_deferred"
+    assert pinned == []

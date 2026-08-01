@@ -19,6 +19,7 @@ import hmac
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -369,11 +370,15 @@ class ReviewCheckouts:
         worktree_root: str = ".claude/worktrees",
         run: GitRunner = _subprocess_git,
         path_exists: Callable[[str], bool] = os.path.isdir,
+        remove_tree: Callable[[str], None] | None = None,
     ):
         self.repo_dir = repo_dir
         self.worktree_root = worktree_root
         self._git = run
         self._path_exists = path_exists
+        self._remove_tree = remove_tree if remove_tree is not None else (
+            lambda p: shutil.rmtree(p, ignore_errors=False)
+        )
         self._mutation_lock = threading.RLock()
         # (pr → last ensured sha): a multi-mode round runs several legs against
         # one head; only the first pays the fetch/reset.
@@ -391,9 +396,23 @@ class ReviewCheckouts:
             raise WorktreeUnavailable("review checkout needs a head SHA")
         with self._mutation_lock:
             abs_path = os.path.join(self.repo_dir, self.path(pr))
+            is_worktree = False
+            if self._path_exists(abs_path):
+                # A directory here is NOT proof of a usable worktree. If it is
+                # a plain unregistered dir (partial remove; a prune racing an
+                # add), git commands run inside it discover the PARENT repo —
+                # so a reset/clean "refresh" would destroy the operator's live
+                # checkout, and the rev-parse confirmation would pass because
+                # the parent's HEAD had just been moved. Only a toplevel that
+                # IS this path may be mutated.
+                is_worktree = self._is_this_worktree(pr, abs_path)
+                if not is_worktree:
+                    self._remove_stale_dir(pr, abs_path)
             if (
-                self._ensured.get(pr) == head_sha
-                and self._path_exists(abs_path)
+                is_worktree
+                and self._ensured.get(pr) == head_sha
+                and self._git(["rev-parse", "HEAD"], abs_path).out.strip()
+                == head_sha
             ):
                 return abs_path
             # GitHub always serves refs/pull/<n>/head; fetching the bare SHA
@@ -411,13 +430,36 @@ class ReviewCheckouts:
                     "after fetching its PR ref (force-pushed away?) — defer "
                     "and re-observe"
                 )
-            if self._path_exists(abs_path):
-                self._git(["checkout", "--detach", head_sha], abs_path)
-                self._git(["reset", "--hard", head_sha], abs_path)
-                # -fd, not -fdx: ignored build caches (target/, node_modules)
-                # are expensive and cannot alter tracked review content.
-                self._git(["clean", "-fd"], abs_path)
+            if is_worktree:
+                # Re-verify immediately before mutating: the classification
+                # above is separated from this point by a network fetch (up to
+                # 60s), and the original H1 mechanism reappears if the .git
+                # link vanishes in that window. Between this check and the
+                # refresh there are only local sub-second ops.
+                if not self._is_this_worktree(pr, abs_path):
+                    raise WorktreeUnavailable(
+                        f"review worktree for PR #{pr} stopped being a "
+                        "worktree during fetch — defer"
+                    )
+                for refresh in (
+                    ["checkout", "--detach", head_sha],
+                    ["reset", "--hard", head_sha],
+                    # -fd, not -fdx: ignored build caches (target/,
+                    # node_modules) are expensive and cannot alter tracked
+                    # review content.
+                    ["clean", "-fd"],
+                ):
+                    step = self._git(refresh, abs_path)
+                    if step.code != 0:
+                        raise WorktreeUnavailable(
+                            f"review worktree for PR #{pr} could not be "
+                            f"refreshed (git {refresh[0]} failed) — defer"
+                        )
             else:
+                # A registration whose directory is gone makes `worktree add`
+                # fail forever; prune first so this path self-heals instead of
+                # deferring every round.
+                self._git(["worktree", "prune"], self.repo_dir)
                 made = self._git(
                     ["worktree", "add", "--detach", self.path(pr), head_sha],
                     self.repo_dir,
@@ -436,6 +478,62 @@ class ReviewCheckouts:
                 )
             self._ensured[pr] = head_sha
             return abs_path
+
+    def _is_this_worktree(self, pr: int, abs_path: str) -> bool:
+        """True iff git agrees the directory's toplevel IS the directory.
+
+        Fail-safe tri-state collapsed the right way: a rev-parse that FAILS
+        (60s timeout, spawn failure under process pressure — #63's class) means
+        "could not classify", and an unclassifiable directory must DEFER, never
+        be deleted as garbage. Only a successful answer naming a DIFFERENT
+        toplevel proves a plain dir."""
+        if os.path.islink(abs_path):
+            # A link is never this worktree. Without this, a link to the
+            # PARENT repo makes both realpaths resolve to the parent, the
+            # comparison below passes, and the refresh loop reset --hards the
+            # operator's live checkout — H1 routed around the stale-dir guard.
+            return False
+        top = self._git(["rev-parse", "--show-toplevel"], abs_path)
+        if top.code != 0 or not top.out.strip():
+            raise WorktreeUnavailable(
+                f"review checkout for PR #{pr} at {abs_path!r} could not be "
+                "classified (rev-parse failed) — defer"
+            )
+        return os.path.realpath(top.out.strip()) == os.path.realpath(abs_path)
+
+    def _remove_stale_dir(self, pr: int, abs_path: str) -> None:
+        """Delete a plain (unregistered) directory squatting on the worktree
+        path, so `worktree add` can recreate it. Refuses anything that is not
+        strictly inside this repo's worktree root — the one thing this class
+        must never delete is the parent checkout."""
+        if os.path.islink(abs_path):
+            # Remove the LINK, never its pointee: rmtree(realpath) would
+            # destroy whatever the link names (possibly a sibling PR's
+            # checkout) while leaving the link squatting forever.
+            try:
+                os.unlink(abs_path)
+            except OSError as exc:
+                raise WorktreeUnavailable(
+                    f"stale review checkout link for PR #{pr} could not be "
+                    f"removed ({exc}) — defer"
+                ) from exc
+            self._git(["worktree", "prune"], self.repo_dir)
+            return
+        root = os.path.realpath(os.path.join(self.repo_dir, self.worktree_root))
+        target = os.path.realpath(abs_path)
+        if not target.startswith(root + os.sep):
+            raise WorktreeUnavailable(
+                f"stale review checkout for PR #{pr} at {abs_path!r} is "
+                "outside the worktree root — refusing to delete"
+            )
+        try:
+            self._remove_tree(abs_path)
+        except OSError as exc:
+            raise WorktreeUnavailable(
+                f"stale review checkout for PR #{pr} could not be removed "
+                f"({exc}) — defer"
+            ) from exc
+        self._git(["worktree", "prune"], self.repo_dir)
 
     def remove(self, pr: int) -> None:
         """Best-effort removal after a settled round; the next round recreates."""
