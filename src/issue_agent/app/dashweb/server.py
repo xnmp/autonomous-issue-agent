@@ -89,6 +89,10 @@ def create_app(
     elif assets.lease is not None:
         assets.lease.close()
 
+    @app.get("/api/health")
+    async def api_health():
+        return {"ok": True}
+
     def degraded(kind: str, exc: Exception, **empty) -> dict:
         return {
             **empty,
