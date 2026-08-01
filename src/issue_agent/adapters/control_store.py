@@ -61,7 +61,7 @@ from .deployment_authority import (
     deployment_role,
 )
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 SCHEMA_BASELINE_VERSION = 9
 LEGACY_V8_SCHEMA_DIGEST = (
     "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
@@ -361,6 +361,10 @@ class PendingCommand:
     command: LifecycleCommand
     state: str
     attempts: int
+    # Verified GitHub REFUSALS only — readbacks that proved the requested state
+    # absent. `attempts` also counts executions an outage interrupted, so the
+    # ADR 0012 retry ceiling reads this instead (see control-store v18).
+    refusals: int = 0
 
 
 @dataclass(frozen=True)
@@ -738,6 +742,15 @@ WHERE policy='reconcile_only'
   );
 """
 
+_MIGRATION_V18 = """
+ALTER TABLE lifecycle_commands
+ADD COLUMN refusals INTEGER NOT NULL DEFAULT 0 CHECK (refusals >= 0);
+
+UPDATE lifecycle_commands
+SET refusals = 1
+WHERE state='retryable_failure';
+"""
+
 _SCHEMA_MIGRATIONS = (
     # Version 9 is the immutable adoption baseline shipped by the architectural
     # hardening cutover. Its exact source digest already exists in deployed
@@ -751,6 +764,14 @@ _SCHEMA_MIGRATIONS = (
     SchemaMigration(15, _MIGRATION_V15),
     SchemaMigration(16, _MIGRATION_V16),
     SchemaMigration(17, _MIGRATION_V17),
+    # v18 separates VERIFIED REFUSALS from attempts (ADR 0012). `attempts` is
+    # incremented by every `begin_command`, including the ones a GitHub outage
+    # produced (unknown_outcome → retry_reconciled → re-execute), so a ten-tick
+    # degradation used to pre-burn the retry ceiling and retire a command on
+    # its first genuine 403. Existing `retryable_failure` rows backfill to 1 —
+    # exactly what that state asserts (the last receipt was a refusal) — rather
+    # than to `attempts`, which would import the very over-count being fixed.
+    SchemaMigration(18, _MIGRATION_V18),
 )
 
 if tuple(migration.version for migration in _SCHEMA_MIGRATIONS) != tuple(
@@ -3631,7 +3652,10 @@ class SQLiteControlStore:
                         f"idempotency key {command.idempotency_key!r} conflicts"
                     )
                 return PendingCommand(
-                    _command_from_row(row), row["state"], row["attempts"]
+                    _command_from_row(row),
+                    row["state"],
+                    row["attempts"],
+                    int(row["refusals"]),
                 )
             db.execute(
                 "INSERT INTO lifecycle_commands(command_id, idempotency_key, "
@@ -3724,6 +3748,7 @@ class SQLiteControlStore:
                     _command_from_row(latest),
                     str(latest["state"]),
                     int(latest["attempts"]),
+                    int(latest["refusals"]),
                 )
             occurrence = (
                 int(latest["occurrence"]) + 1 if latest is not None else 0
@@ -3828,7 +3853,12 @@ class SQLiteControlStore:
                 tuple(params),
             ).fetchall()
         return tuple(
-            PendingCommand(_command_from_row(row), row["state"], row["attempts"])
+            PendingCommand(
+                _command_from_row(row),
+                row["state"],
+                row["attempts"],
+                int(row["refusals"]),
+            )
             for row in rows
         )
 
@@ -3847,6 +3877,7 @@ class SQLiteControlStore:
             _command_from_row(row),
             str(row["state"]),
             int(row["attempts"]),
+            int(row["refusals"]),
         )
 
     def begin_command(self, command_id: CommandId) -> None:
@@ -3927,6 +3958,48 @@ class SQLiteControlStore:
             )
             self._insert_effect(db, receipt, _receipt_digest(receipt))
 
+    def exhaust_command(self, receipt: EffectReceipt) -> bool:
+        """Retire a command that has burned its retry ceiling (ADR 0012).
+
+        A remote write GitHub keeps refusing for a permanent reason — the
+        keifu incident: a review identity whose PAT lacked Issues:Write, so
+        every relabel returned 403, verified as "not applied", and was
+        re-executed on every tick forever — is not retryable. Crossing the
+        ceiling is the only transition into `permanent_failure` from
+        `retryable_failure`, and it is a REPLACEMENT of the last failure
+        receipt so the command keeps exactly one receipt.
+
+        The lifecycle_commands row (payload included) is deliberately left in
+        place: once the operator fixes the identity they must still be able to
+        see what never posted. `enqueue_command_occurrence` is the existing
+        primitive for deliberately re-running such an effect.
+
+        Returns False for ANY state that is no longer `retryable_failure` —
+        another daemon retired it, or the write actually landed between the
+        ceiling test and this call. Neither is an error: a concurrent SUCCESS
+        raising here would surface as an exception out of `execute_all` and
+        charge the caller a spurious stall. The False answer means "not retired
+        by me", which is exactly what a once-only escalation needs.
+        """
+
+        if receipt.status is not EffectStatus.PERMANENT_FAILURE:
+            raise ValueError("an exhausted command must receipt permanent_failure")
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT state FROM lifecycle_commands WHERE command_id=?",
+                (str(receipt.command_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError(str(receipt.command_id))
+            if row["state"] != EffectStatus.RETRYABLE_FAILURE.value:
+                return False
+            db.execute(
+                "DELETE FROM effect_receipts WHERE command_id=?",
+                (str(receipt.command_id),),
+            )
+            self._insert_effect(db, receipt, _receipt_digest(receipt))
+            return True
+
     def record_effect(self, receipt: EffectReceipt) -> bool:
         digest = _receipt_digest(receipt)
         with self.transaction() as db:
@@ -3959,11 +4032,25 @@ class SQLiteControlStore:
                 digest,
             ),
         )
+        # `refusals` counts only outcomes GitHub actually refused — a readback
+        # that proved the requested state absent. A SUCCEEDED receipt clears it
+        # (the command is done, and a later occurrence starts clean); every
+        # other status leaves it UNCHANGED. Unknown outcomes carry no
+        # information about the token's permissions, so neither charging them
+        # (which lets an outage retire a good command) nor clearing on them
+        # (which lets a flaky network make the ceiling unreachable for a
+        # permanently denied write) is correct — ADR 0012.
         db.execute(
-            "UPDATE lifecycle_commands SET state=?, updated_at=? WHERE command_id=?",
+            "UPDATE lifecycle_commands SET state=?, updated_at=?, "
+            "refusals=CASE ?"
+            " WHEN 'retryable_failure' THEN refusals+1"
+            " WHEN 'succeeded' THEN 0"
+            " ELSE refusals END "
+            "WHERE command_id=?",
             (
                 receipt.status.value,
                 _stamp(self._now()),
+                receipt.status.value,
                 str(receipt.command_id),
             ),
         )

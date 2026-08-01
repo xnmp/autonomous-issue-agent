@@ -34,6 +34,8 @@ class EffectControl(Protocol):
 
     def record_effect(self, receipt: EffectReceipt) -> bool: ...
 
+    def exhaust_command(self, receipt: EffectReceipt) -> bool: ...
+
 
 @dataclass(frozen=True)
 class EffectOutcome(Generic[T]):
@@ -181,6 +183,23 @@ class DurableEffectRunner:
                 raise ValueError("resolved unknown effects must be successful")
             self.control.resolve_unknown_effect(receipt)
         return outcome.value
+
+    def exhaust(self, command: LifecycleCommand, error: str) -> bool:
+        """Retire a command whose retry ceiling is spent. True iff this call
+        performed the transition (so the caller escalates exactly once)."""
+
+        if not error:
+            raise ValueError("an exhausted command requires an error")
+        with self.authority.effect():
+            now = self.now()
+            return self.control.exhaust_command(
+                self._receipt(
+                    command,
+                    now,
+                    EffectStatus.PERMANENT_FAILURE,
+                    error=error,
+                )
+            )
 
     def retry_reconciled(self, command: LifecycleCommand) -> None:
         with self.authority.effect():

@@ -162,6 +162,30 @@ Two smaller ones worth doing whenever the files are next touched:
   rejection count includes a stale issue-keyed entry (2026-08-01 adversarial
   review, P2-4).
 
+- `unknown_outcome` lifecycle commands have NO retry ceiling: a command whose
+  reconcile read permanently fails (e.g. the target issue was deleted) retries
+  one gh call per tick forever, visibly (the drain logs it) but unbounded.
+  Round-1 of the 2026-08-02 effect-retry work bounded this by accident via the
+  shared attempts counter; round-2 correctly stopped counting outages toward
+  the refusal ceiling and thereby unmasked it. Trigger: an `unknown_outcome`
+  command older than a configured tick-age escalates like an exhausted one
+  (ADR 0012 — the loop currently has an event only via drain logs, no ceiling).
+
+- `harness_signal` (2026-08-02) lets a durable command bypass the optimistic
+  revision guard. The only minter is `steward_stall_actions`, and the payload
+  is written solely by harness code — but a paid child that opened
+  `ISSUE_AGENT_CONTROL_DB` directly could forge a flagged row, and such a row
+  now buys a guard bypass rather than just a write. Same accepted posture as
+  the capability matrix ("children inherit publication capability; trusted
+  inbound content only"); noted because the blast radius widened marginally.
+  Trigger: any move to untrusted inbound content revisits this field first.
+
+- The doctor Issues:Write live-probe (2026-08-02) only runs for
+  `REVIEW_BOT_TOKEN` deployments; GitHub App-auth deployments (`GH_APP_ID`)
+  skip it silently — an installation missing Issues:Write still surfaces only
+  at the first denied write (now ceiling-bounded rather than looping).
+  Trigger: first App-auth deployment adds an installation-permissions probe.
+
 ---
 
 ## 5. Per-incident notes

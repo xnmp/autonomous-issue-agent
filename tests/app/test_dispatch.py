@@ -131,6 +131,17 @@ class FakeStore:
     def set_triage_at(self, i, at):
         self.triage_at[i] = at
 
+    def get_steward_stalls(self, i, leg):
+        return self.__dict__.setdefault("steward_stalls", {}).get((i, leg), 0)
+
+    def bump_steward_stalls(self, i, leg):
+        stalls = self.__dict__.setdefault("steward_stalls", {})
+        stalls[(i, leg)] = stalls.get((i, leg), 0) + 1
+        return stalls[(i, leg)]
+
+    def clear_steward_stalls(self, i, leg):
+        self.__dict__.setdefault("steward_stalls", {})[(i, leg)] = 0
+
     def set_groom_at(self, i, at):
         self.groom_at[i] = at
 

@@ -29,6 +29,7 @@ from ..domain.agent_task import (
     RuntimeName,
 )
 from ..domain.outcome import deterministic_death
+from ..domain.steward_stall import DEFAULT_STEWARD_ERROR_CEILING
 from ..domain.leg import Leg, LegTarget
 from ..domain.ports import (
     ActionExecutor,
@@ -110,6 +111,9 @@ class DispatchConfig:
     # 0 = unknown/disabled → the ordinary +1 bump, i.e. exactly today's behavior
     # for every hand-built DispatchConfig.
     max_infra_deaths: int = 0
+    # ADR 0012: consecutive verdict-less paid steward legs allowed per issue
+    # version before the steward stops re-buying and escalates.
+    steward_error_ceiling: int = DEFAULT_STEWARD_ERROR_CEILING
 
     def __post_init__(self) -> None:
         if not isinstance(self.reviewer_runtime, RuntimeName):
@@ -158,6 +162,7 @@ class DispatchConfig:
             # steward's own identity.
             fix_bot=self.fix_bot,
             repo=self.repo,
+            error_ceiling=self.steward_error_ceiling,
         )
 
     def jira_workflow_config(self) -> JiraSyncWorkflowConfig:

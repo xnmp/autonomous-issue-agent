@@ -20,6 +20,7 @@ from .actions import Action
 from .events import Correlation, EventEnvelope, JsonValue, TelemetryEvent
 from .contracts import (
     BudgetScope,
+    LifecycleCommand,
     Money,
     PriceQuote,
     ReservationId,
@@ -119,6 +120,9 @@ class WorkflowState(Protocol):
     def set_infra_deaths(self, key: int, count: int) -> None: ...
     def clear_infra_deaths(self, key: int) -> None: ...
     def set_triage_at(self, issue: int, at: str) -> None: ...
+    def get_steward_stalls(self, issue: int, leg: str) -> int: ...
+    def bump_steward_stalls(self, issue: int, leg: str) -> int: ...
+    def clear_steward_stalls(self, issue: int, leg: str) -> None: ...
     def set_groom_at(self, issue: int, at: str) -> None: ...
     def set_groom_content(self, issue: int, content: str) -> None: ...
     def get_jira_key(self, issue: int) -> str: ...
@@ -327,6 +331,36 @@ class ControlStore(Protocol):
         *,
         destination: str | None = None,
     ) -> int: ...
+
+
+@runtime_checkable
+class PendingEffect(Protocol):
+    """One durable lifecycle command that is still owed to GitHub."""
+
+    @property
+    def command(self) -> LifecycleCommand: ...
+    @property
+    def state(self) -> str: ...
+
+
+@runtime_checkable
+class PendingEffectReads(Protocol):
+    """Read side of the durable lifecycle-command queue (ADR 0012).
+
+    Answers exactly one question — "is this remote write still owed?" — so a
+    caller can tell a write that was DEFERRED to the durable outbox from one
+    that was never committed at all. It never authorizes an effect and never
+    substitutes for the executor's own result. Optional: a composition without
+    it must treat an unconfirmed write as lost, which is the conservative
+    reading.
+    """
+
+    def pending_commands(
+        self,
+        *,
+        repository: str | None = None,
+        executor_identity: str | None = None,
+    ) -> tuple[PendingEffect, ...]: ...
 
 
 @runtime_checkable

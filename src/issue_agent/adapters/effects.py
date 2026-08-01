@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from dataclasses import fields, is_dataclass
 from enum import Enum
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 
 from ..domain.actions import (
     Action,
+    is_harness_signal,
     AddDependency,
     CloseIssue,
     EnableAutoMerge,
@@ -28,10 +30,38 @@ from ..domain.contracts import (
     EffectStatus,
     LifecycleCommand,
 )
+from ..domain.effect_retry import (
+    DEFAULT_EFFECT_RETRY_CEILING,
+    effect_ceiling_reached,
+    exhausted_effect_advice,
+    exhausted_effect_reason,
+)
+from ..domain.events import Correlation, LevelChanged, TelemetryEvent
+from ..domain.ports import EventSink
 from .deployment_authority import DeploymentAuthority, deployment_role
 from .durable_effects import DurableEffectRunner, EffectOutcome
+from .journal import alert
 
 _TARGET = {Target.ISSUE: "issue", Target.PR: "pr"}
+
+
+def _stderr_log(line: str) -> None:
+    sys.stderr.write(f"effects: {line}\n")
+
+
+def _target_correlation(target: str) -> Correlation:
+    """`issue:42` / `pr:7` → the matching correlation, or an empty one for a
+    target shape this build does not know (never raise while escalating)."""
+    kind, _, raw = (target or "").partition(":")
+    try:
+        number = int(raw)
+    except ValueError:
+        return Correlation()
+    if kind == "issue":
+        return Correlation(issue=number)
+    if kind == "pr":
+        return Correlation(pr=number)
+    return Correlation()
 
 
 class UnknownEffectOutcome(RuntimeError):
@@ -210,6 +240,10 @@ class GitHubEffectExecutor:
         repository: str,
         identity: str,
         config_version: str = "",
+        retry_ceiling: int = DEFAULT_EFFECT_RETRY_CEILING,
+        journal: EventSink | None = None,
+        alert_cmd: str = "",
+        log: Callable[[str], None] | None = None,
     ):
         if not repository or not identity:
             raise ValueError("effect repository and executor identity are required")
@@ -218,6 +252,10 @@ class GitHubEffectExecutor:
         self.repository = canonical_repository(repository)
         self.identity = identity
         self.config_version = config_version
+        self.retry_ceiling = retry_ceiling
+        self.journal = journal
+        self.alert_cmd = alert_cmd
+        self.log = log if log is not None else _stderr_log
         self.effects = DurableEffectRunner(
             store,
             DeploymentAuthority(
@@ -262,6 +300,8 @@ class GitHubEffectExecutor:
                 )
             pending = self.effects.enqueue_occurrence(command)
             command = pending.command
+        if self._retire_if_exhausted(pending):
+            return False
         if pending.state == EffectStatus.PERMANENT_FAILURE.value:
             return False
         if pending.state == "pending" and not self._revision_matches(command):
@@ -389,6 +429,8 @@ class GitHubEffectExecutor:
                 return True
             pending = self.effects.enqueue_occurrence(command)
             command = pending.command
+        if self._retire_if_exhausted(pending):
+            return False
         if pending.state == EffectStatus.PERMANENT_FAILURE.value:
             return False
         if pending.state in {"executing", EffectStatus.UNKNOWN_OUTCOME.value}:
@@ -467,11 +509,87 @@ class GitHubEffectExecutor:
                     applied = self._run_review_command(pending)
                 else:
                     applied = self.execute(action_from_command(command))
-            except Exception:
+            except Exception as exc:  # noqa: BLE001 — see below
+                # One command must not stop the drain: an unreconstructable
+                # payload or a single wedged target would otherwise strand
+                # every other queued write behind it. But it must not be
+                # SILENT either — a swallowed GhUnavailable here was
+                # indistinguishable from a clean drain, which is how the
+                # unbounded 403 loop stayed invisible. The command keeps its
+                # state, so the next tick retries it under the same ceiling.
+                self.log(
+                    f"lifecycle command {command.command_id} "
+                    f"({command.kind.value} on {command.target}) could not be "
+                    f"drained: {type(exc).__name__}: {exc}"
+                )
                 continue
             if applied:
                 completed += 1
         return completed
+
+    def _retire_if_exhausted(self, pending) -> bool:
+        """Retire a command that has burned its retry ceiling, once.
+
+        True means the caller must stop: the command is now (or was already
+        moved to) `permanent_failure`. Infra failures never arrive here — they
+        receipt `unknown_outcome`, which the ceiling predicate ignores.
+        """
+        command = pending.command
+        if not effect_ceiling_reached(
+            pending.state, pending.refusals, self.retry_ceiling
+        ):
+            return False
+        retired = self.effects.exhaust(
+            command,
+            exhausted_effect_reason(
+                command.kind.value,
+                command.target,
+                pending.refusals,
+                self.retry_ceiling,
+            ),
+        )
+        if not retired:
+            # Another process already retired (and escalated) this command.
+            return True
+        advice = exhausted_effect_advice(command.kind.value, command.target)
+        self.log(advice)
+        if self.journal is not None:
+            self.journal.emit(
+                TelemetryEvent(
+                    LevelChanged(
+                        f"command:{command.command_id}:effect_retry",
+                        "exhausted",
+                        "retry_ceiling",
+                        {
+                            "kind": command.kind.value,
+                            "target": command.target,
+                            "attempts": pending.attempts,
+                            "refusals": pending.refusals,
+                            "ceiling": self.retry_ceiling,
+                            "executor_identity": self.identity,
+                        },
+                    ),
+                    _target_correlation(command.target),
+                )
+            )
+        alert(
+            self.alert_cmd,
+            json.dumps(
+                {
+                    "event": "effect_retry_exhausted",
+                    "command_id": str(command.command_id),
+                    "kind": command.kind.value,
+                    "target": command.target,
+                    "attempts": pending.attempts,
+                    "refusals": pending.refusals,
+                    "ceiling": self.retry_ceiling,
+                    "identity": self.identity,
+                    "advice": advice,
+                },
+                sort_keys=True,
+            ),
+        )
+        return True
 
     def _apply(
         self,
@@ -686,7 +804,14 @@ class GitHubEffectExecutor:
         expected = _expected_revision(action)
         extra: dict[str, object] = {}
         _kind, target = _command_identity(action)
-        if expected is None and target.startswith("pr:"):
+        if is_harness_signal(action):
+            # ADR 0012: a harness-owned signal binds NO revision, so
+            # `_revision_matches` short-circuits to True and the write is never
+            # discarded because the issue moved. Escalations explain why the
+            # harness stopped; a human commenting in the same tick must not
+            # delete that explanation. See Relabel.harness_signal.
+            expected = None
+        elif expected is None and target.startswith("pr:"):
             number = int(target.split(":", 1)[1])
             expected = self.gateway.get_pr(
                 number, mergeability=False, checks=False
@@ -828,12 +953,14 @@ def action_from_command(command: LifecycleCommand) -> Action:
                 if "expected_revision" in payload
                 else command.expected_revision
             ),
+            bool(payload.get("harness_signal", False)),
         )
     if command.kind is CommandKind.POST_COMMENT:
         return PostComment(
             Target(payload["target"]),
             int(payload["number"]),
             str(payload["body"]),
+            bool(payload.get("harness_signal", False)),
         )
     if command.kind is CommandKind.CLOSE_ISSUE:
         return CloseIssue(

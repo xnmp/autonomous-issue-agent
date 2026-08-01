@@ -87,6 +87,7 @@ from ..domain.triage import (
 from ..domain.jira import jira_phase, jira_sync_needed
 from ..domain.actions import AgentKind, Relabel, RunAgent, Target
 from ..adapters.runtime_plan import AgentRuntime, RuntimePlan
+from ..domain.effect_retry import DEFAULT_EFFECT_RETRY_CEILING
 from ..domain.outcome import AgentResult
 from ..domain.agent_task import RuntimeName
 from ..domain.contracts import BudgetScope, Money
@@ -451,6 +452,10 @@ def _effects(
     identity: str,
     config_version: str,
     base_branch: str,
+    retry_ceiling: int = DEFAULT_EFFECT_RETRY_CEILING,
+    journal: TypedJournal | None = None,
+    alert_cmd: str = "",
+    log: Callable[[str], None] | None = None,
 ) -> EffectRecovery:
     executor = GitHubEffectExecutor(
         gateway,
@@ -458,6 +463,10 @@ def _effects(
         repository=repository,
         identity=identity,
         config_version=config_version,
+        retry_ceiling=retry_ceiling,
+        journal=journal,
+        alert_cmd=alert_cmd,
+        log=log,
     )
     publications = AgentPublicationBroker(
         control,
@@ -2076,6 +2085,10 @@ def build_fix_daemon(
         identity=owner_id,
         config_version=cfg.config_version,
         base_branch=cfg.base_branch,
+        retry_ceiling=cfg.effect_retry_ceiling,
+        journal=journal,
+        alert_cmd=cfg.alert_cmd,
+        log=_log("fix"),
     )
     executor = Executor(
         gateway, remove_worktree=worktrees.remove, log=_log("fix"),
@@ -2408,6 +2421,10 @@ def build_review_daemon(
         identity=owner_id,
         config_version=cfg.config_version,
         base_branch=cfg.base_branch,
+        retry_ceiling=cfg.effect_retry_ceiling,
+        journal=journal,
+        alert_cmd=cfg.alert_cmd,
+        log=_log("review"),
     )
     executor = Executor(
         gateway,
@@ -2669,6 +2686,7 @@ def build_steward_daemon(
         command_identity=f"{owner_id}:jira",
         deployment_owner_id=owner_id,
         config_version=cfg.config_version,
+        steward_error_ceiling=cfg.steward_error_ceiling,
         **_spend_cfg(cfg, "steward"),
     )
     control = _control_store(cfg, cfg.steward_state_dir, journal)
@@ -2679,6 +2697,10 @@ def build_steward_daemon(
         identity=owner_id,
         config_version=cfg.config_version,
         base_branch=cfg.base_branch,
+        retry_ceiling=cfg.effect_retry_ceiling,
+        journal=journal,
+        alert_cmd=cfg.alert_cmd,
+        log=steward_log,
     )
     executor = Executor(
         gateway,

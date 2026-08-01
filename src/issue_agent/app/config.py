@@ -22,10 +22,12 @@ from ..adapters.agent_runner import DEFAULT_MAX_BUFFER_BYTES
 from ..adapters.control_path import machine_control_authority_root
 from ..adapters.env_file import source_env_file
 from ..domain.agent_task import RuntimeName
+from ..domain.effect_retry import DEFAULT_EFFECT_RETRY_CEILING
 from ..domain.effort import EFFORT_LADDER, Effort, parse_effort
 from ..domain.identity import normalize_login
 from ..domain.pricing import parse_model_rate_table
 from ..domain.review import IdentityMode, ReviewMode
+from ..domain.steward_stall import DEFAULT_STEWARD_ERROR_CEILING
 from ..domain.repository import (
     canonical_repository,
     repository_validation_error,
@@ -358,6 +360,21 @@ class HarnessConfig:
     # this the multi-mode fan-out (gate + dimensions + validators) re-ran every
     # poll, forever, on a PR nobody was waiting on. 0 disables.
     max_unproductive_review_rounds: int = 5
+    # ADR 0012 ceiling for durable GitHub writes: how many times one lifecycle
+    # command may be re-executed after its readback says "not applied" before it
+    # is retired to permanent_failure and escalated. Bounds the keifu incident
+    # (a write-denied PAT re-attempting the same 403 every tick, forever). Counts
+    # attempts, not time, and only verified refusals — infra failures receipt
+    # unknown_outcome and are reconciled instead. See domain/effect_retry.py.
+    effect_retry_ceiling: int = DEFAULT_EFFECT_RETRY_CEILING
+    # ADR 0012 ceiling for PAID steward legs on one version of one issue. A
+    # triage/groom leg that returns no usable verdict (budget cap, agent error,
+    # malformed output) leaves the issue's baseline unrecorded, so the next sweep
+    # re-selects it and buys the leg again — unbounded spend on an issue nothing
+    # can classify. After this many consecutive failures the issue's baseline is
+    # recorded anyway and an operator decision is surfaced; any later edit to the
+    # issue starts a fresh series. See domain/steward_stall.py.
+    steward_error_ceiling: int = DEFAULT_STEWARD_ERROR_CEILING
     review_trigger_label: str = "ai-pr-open"
     fix_model: str | None = None
     # FIX_EFFORT: base reasoning effort for the fix legs, runtime-agnostic
@@ -751,6 +768,12 @@ class HarnessConfig:
         _require_non_negative(errors, "MAX_INFRA_DEATHS", self.max_infra_deaths)
         _require_non_negative(
             errors, "MAX_UNPRODUCTIVE_REVIEW_ROUNDS", self.max_unproductive_review_rounds
+        )
+        # Positive, not non-negative: 0 here does not mean "disabled", it means
+        # "restore the unbounded retry loop ADR 0012 forbids".
+        _require_positive(errors, "EFFECT_RETRY_CEILING", self.effect_retry_ceiling)
+        _require_positive(
+            errors, "STEWARD_ERROR_CEILING", self.steward_error_ceiling
         )
         if not (self.repo or "").strip():
             # Fail LOUD at startup, not with an opaque gh error on the first

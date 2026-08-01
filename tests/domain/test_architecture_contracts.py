@@ -304,6 +304,25 @@ def test_remote_cli_mutations_live_only_in_privileged_effect_adapters() -> None:
                 stripped = line.strip()
                 if stripped.startswith("#"):
                     continue
+                # Narrow, per-LINE exemption for a preflight capability probe.
+                # Pinned three ways — the marker, the FILE it may appear in,
+                # and the endpoint it may target — so the marker cannot be
+                # pasted onto an arbitrary mutation, in doctor.sh or anywhere
+                # else, to buy an exemption it was never reviewed for.
+                if (
+                    "harness:preflight-probe" in stripped
+                    and path.name == "doctor.sh"
+                    and re.search(r'repos/\$REPO/labels', stripped)
+                ):
+                    continue
+                # It creates and immediately deletes a throwaway repo label to
+                # prove the review identity can write BEFORE any paid leg runs
+                # (keifu, 2026-08-01 — a scope-less PAT was otherwise only
+                # discovered when a paid verdict 403'd on every tick). It
+                # touches no issue, PR or branch, carries no lifecycle meaning,
+                # and no daemon tick can reach it, so the durability and
+                # authority guarantees this contract protects do not apply. A
+                # real lifecycle mutation added to doctor.sh still fails here.
                 if command.search(stripped):
                     violations.append(
                         f"{path.relative_to(ROOT)}:{lineno} {stripped}"

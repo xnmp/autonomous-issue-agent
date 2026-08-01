@@ -417,7 +417,8 @@ module requires placing it in the appropriate tier and explaining it here.
 
 `domain/` — pure values and policy:
 `domain/actions.py`, `domain/agent_task.py`, `domain/ci.py`,
-`domain/contracts.py`, `domain/dashboard.py`, `domain/effort.py`,
+`domain/contracts.py`, `domain/dashboard.py`, `domain/effect_retry.py`,
+`domain/effort.py`,
 `domain/events.py`, `domain/fix.py`, `domain/gate.py`,
 `domain/governor_policy.py`, `domain/identity.py`, `domain/jira.py`,
 `domain/labels.py`, `domain/leg.py`, `domain/lifecycle.py`,
@@ -426,6 +427,7 @@ module requires placing it in the appropriate tier and explaining it here.
 `domain/projection.py`, `domain/refs.py`, `domain/repository.py`,
 `domain/recovery.py`, `domain/reservation_recovery.py`,
 `domain/review.py`,
+`domain/steward_stall.py`,
 `domain/supervision.py`, `domain/triage.py`, `domain/trust.py`, and
 `domain/world.py`.
 

@@ -62,6 +62,15 @@ class Relabel:
     # None lets compatibility actions bind at command creation. An explicit
     # empty string means the observation lacked a revision and must fail closed.
     expected_revision: str | None = None
+    # ADR 0012 — harness-owned signal. This write reports the HARNESS's own
+    # state (an escalation, a ceiling trip), not a claim about the target's
+    # content, so it is minted WITHOUT an optimistic revision guard: a comment
+    # arriving between decide and execute must not silently discard the
+    # escalation that explains why the harness stopped. Delivery stays bounded
+    # by the durable retry ceiling, and the label/body is fixed text the
+    # harness authored — never agent- or user-supplied. Do NOT set it on a
+    # write whose correctness depends on the target being unchanged.
+    harness_signal: bool = False
 
 
 @dataclass(frozen=True)
@@ -69,6 +78,8 @@ class PostComment:
     target: Target
     number: int
     body: str
+    # See Relabel.harness_signal.
+    harness_signal: bool = False
 
 
 @dataclass(frozen=True)
@@ -213,8 +224,16 @@ Action = Union[
     NoOp,
 ]
 
+def is_harness_signal(action: object) -> bool:
+    """Whether this action is a harness-owned signal exempt from the optimistic
+    revision guard (see `Relabel.harness_signal`). Total by construction: an
+    action type that has no such field is never exempt."""
+    return bool(getattr(action, "harness_signal", False))
+
+
 __all__ = [
     "Target",
+    "is_harness_signal",
     "AgentKind",
     "Relabel",
     "PostComment",

@@ -323,18 +323,66 @@ if command -v gh >/dev/null 2>&1; then
         _perm="$(GH_TOKEN="$REVIEW_BOT_TOKEN" gh api "repos/$REPO" --jq '.permissions.push' 2>/dev/null)"
         if [ "$_perm" = "true" ]; then
           ok "review identity '$_bot_login' authenticates and has WRITE access to $REPO"
-          # `.permissions.push` reports the COLLABORATOR ROLE. A fine-grained PAT
-          # carries a second, independent permission set that this (or any other
-          # read-only call) cannot introspect — so push=true still 403s the
-          # approve if the token was minted without Pull requests: Read+Write.
-          # That is exactly how the first real deployment failed: label writes
-          # succeeded (Issues: write) while POST /pulls/N/reviews came back
-          # "Resource not accessible by personal access token". Say so, because a
-          # bare ✓ here reads as "approvals will work" and it cannot promise that.
-          case "$REVIEW_BOT_TOKEN" in
-            github_pat_*)
-              warn "REVIEW_BOT_TOKEN is a fine-grained PAT — its per-scope grants are not readable via the API. If approvals 403 with 'Resource not accessible by personal access token', re-mint it with Pull requests: Read+Write (Issues: Read+Write, Contents: Read)" ;;
-          esac
+          # ── live write probe (keifu, 2026-08-01) ───────────────────────────
+          # Everything above is a READ. `.permissions.push` reports the
+          # collaborator ROLE, and a fine-grained PAT's own grants are not
+          # introspectable, so a ✓ there cannot promise a write will land. On
+          # keifu it did not: the steward shared this identity, its PAT lacked
+          # Issues: Write, and every relabel/comment 403'd — after the paid leg
+          # had already run. The harness then re-attempted the same denied write
+          # on every tick.
+          #
+          # So actually write something. A repo LABEL is the cheapest honest
+          # probe: it is repo-level (no issue touched, no notification, no
+          # timeline entry), and POST/DELETE /repos/O/R/labels is gated by
+          # exactly the Issues: Write scope every lifecycle write needs. The
+          # name is randomised so a leftover from an interrupted run can never
+          # collide with a real label, and the delete runs IMMEDIATELY after the
+          # create — no later check can leave it behind.
+          #
+          # The two `gh api -X` lines below carry an explicit exemption marker:
+          # they are a PREFLIGHT CAPABILITY PROBE, not a lifecycle effect. See
+          # tests/domain/test_architecture_contracts.py for the contract they
+          # are exempt from and why the exemption is narrow.
+          _probe_label="harness-probe-$(printf '%04x%04x' "$RANDOM" "$RANDOM")"
+          _probe_delete() {
+            GH_TOKEN="$REVIEW_BOT_TOKEN" gh api -X DELETE "repos/$REPO/labels/$1" >/dev/null 2>&1  # harness:preflight-probe
+          }
+          # A Ctrl-C (or a SIGTERM from a supervising installer) between the
+          # POST and the DELETE would strand the probe label on the repo. Arm
+          # the cleanup BEFORE the create and disarm it right after the normal
+          # delete, so the only way to leak one is a SIGKILL or a dead API.
+          _probe_created=""
+          trap '[ -n "$_probe_created" ] && _probe_delete "$_probe_created"; exit 130' INT TERM
+          _probe_created="$_probe_label"
+          _probe_out="$(GH_TOKEN="$REVIEW_BOT_TOKEN" gh api -X POST "repos/$REPO/labels" -f name="$_probe_label" -f color=ededed -f description="issue-agent doctor write probe" 2>&1)"  # harness:preflight-probe
+          _probe_rc=$?
+          if [ "$_probe_rc" -eq 0 ]; then
+            if _probe_delete "$_probe_label"; then
+              ok "review identity can write (Issues scope live-probed: label created and removed)"
+            else
+              # The write capability IS proven; only the cleanup failed.
+              warn "review identity can write (Issues scope live-probed) but the probe label '$_probe_label' could not be deleted from $REPO — remove it by hand"
+            fi
+          else
+            case "$_probe_out" in
+              *"HTTP 403"*|*"Resource not accessible"*)
+                bad "review identity '$_bot_login' CANNOT write to $REPO — a label write returned 403 despite permissions.push=true. Every relabel, comment and review the harness makes will fail AFTER the leg is paid for. Re-mint REVIEW_BOT_TOKEN with Issues: Read+Write, Pull requests: Read+Write, Contents: Read (fine-grained), or grant the account write access and accept the invite" ;;
+              *"HTTP 422"*|*"already_exists"*)
+                # Permission was fine; the name collided. Do NOT delete a label
+                # this run did not create.
+                ok "review identity can write (Issues scope live-probed: 422 name collision, permission granted)" ;;
+              *)
+                # No verdict: a dead network, a 5xx, or gh itself missing says
+                # nothing about the token's scopes. This is the ONLY branch where
+                # the old unreadable-scopes warning still belongs — once the probe
+                # has an answer, the guess is noise (a ✗ already names the
+                # re-mint, a ✓ already proves Issues: Write).
+                warn "review identity write probe could not run against $REPO (${_probe_out%%$'\n'*}) — write capability is UNVERIFIED; a fine-grained PAT's per-scope grants are not readable via the API, so if lifecycle writes or approvals 403 with 'Resource not accessible by personal access token', re-mint REVIEW_BOT_TOKEN with Issues: Read+Write, Pull requests: Read+Write, Contents: Read" ;;
+            esac
+          fi
+          _probe_created=""
+          trap - INT TERM
         else
           bad "review identity '$_bot_login' can READ $REPO but not write (permissions.push=${_perm:-unknown}) — every approval will 403 AFTER the review is paid for. Invite it as a collaborator with WRITE and accept the invite from that account; a fine-grained PAT additionally needs Pull requests: Read+Write, Issues: Read+Write, Contents: Read"
         fi

@@ -114,7 +114,13 @@ def _initialize_in_process(path: str, start, results) -> None:
         results.put("ok")
 
 
+def _drop_v18(db: sqlite3.Connection) -> None:
+    db.execute("ALTER TABLE lifecycle_commands DROP COLUMN refusals")
+    db.execute("DELETE FROM schema_migrations WHERE version=18")
+
+
 def _drop_v17(db: sqlite3.Connection) -> None:
+    _drop_v18(db)
     db.execute(
         "ALTER TABLE budget_reservations "
         "DROP COLUMN workload_repository"
@@ -144,6 +150,7 @@ def test_control_store_initializes_with_restrictive_permissions_and_integrity(tm
         (15, 64),
         (16, 64),
         (17, 64),
+        (18, 64),
     ]
 
 
@@ -364,6 +371,7 @@ def test_shipped_v8_database_upgrades_without_rewriting_history_or_data(
         15,
         16,
         17,
+        18,
     ]
     assert history[0][1] == (
         "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
@@ -490,9 +498,9 @@ def test_concurrent_role_boot_serializes_schema_migrations(
                 "SELECT version FROM schema_migrations ORDER BY version"
             )
         ) == (
-            (8, 9, 10, 11, 12, 13, 14, 15, 16, 17)
+            (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18)
             if starting_version == "v8"
-            else (9, 10, 11, 12, 13, 14, 15, 16, 17)
+            else (9, 10, 11, 12, 13, 14, 15, 16, 17, 18)
         )
 
 
@@ -1010,7 +1018,7 @@ def test_publication_authority_requires_active_reservation_and_live_lease(
     assert authority.pgid == pgid
 
 
-@pytest.mark.parametrize("version", (9, 10, 11, 12, 13, 14, 15, 16, 17))
+@pytest.mark.parametrize("version", (9, 10, 11, 12, 13, 14, 15, 16, 17, 18))
 @pytest.mark.parametrize("stage", ("before_commit", "committed"))
 def test_schema_migration_restart_is_atomic_at_every_boundary(
     tmp_path,
@@ -1050,7 +1058,7 @@ def test_schema_migration_restart_is_atomic_at_every_boundary(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name='run_cancellation_intents'"
         ).fetchone()
-    assert versions == (9, 10, 11, 12, 13, 14, 15, 16, 17)
+    assert versions == (9, 10, 11, 12, 13, 14, 15, 16, 17, 18)
     assert cancellation_table == ("run_cancellation_intents",)
 
 

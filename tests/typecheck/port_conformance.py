@@ -8,6 +8,7 @@ the ports where a drift could skip a durable write or corrupt control state.
 from issue_agent.adapters.control_store import (
     AccountingDisposition,
     Lease,
+    PendingCommand,
     ReleaseResult,
     SQLiteControlStore,
 )
@@ -35,6 +36,8 @@ from issue_agent.domain.ports import (
     IssueStateReasonReads,
     LegacyJournal,
     LevelState,
+    PendingEffect,
+    PendingEffectReads,
     PredictionReader,
     ProcessSupervisor,
     RecentlyMergedRef,
@@ -69,6 +72,8 @@ COVERED_PORTS = frozenset(
         "IssueStateReasonReads",
         "LegacyJournal",
         "LevelState",
+        "PendingEffect",
+        "PendingEffectReads",
         "PredictionReader",
         "ProcessSupervisor",
         "RecentlyMergedRef",
@@ -111,6 +116,14 @@ def recovery_control(store: SQLiteControlStore) -> RecoveryControl:
 
 def level_state(store: SQLiteControlStore) -> LevelState:
     return store
+
+
+def pending_effect_reads(store: SQLiteControlStore) -> PendingEffectReads:
+    return store
+
+
+def pending_effect(pending: PendingCommand) -> PendingEffect:
+    return pending
 
 
 def world_observations(

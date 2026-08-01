@@ -45,6 +45,7 @@ _ISSUE_SUFFIXES = (
     "session", "resumed-at", "resumes", "ci-retries", "resolve-retries",
     "rebase-retries", "infra-deaths", "review-retries", "phase", "jira",
     "jira-phase", "model", "predicted-paths", "branch", "stall-sig",
+    "steward-stalls-triage", "steward-stalls-groom",
 )
 _PR_SUFFIXES = (
     "session", "last-sha", "round", "automerge", "patch-id", "ci-rerun-head",
@@ -428,6 +429,32 @@ class Store:
 
     def set_triage_at(self, issue: int, at: str) -> None:
         self._write(self.triage_at_path(issue), at)
+
+    # ── steward stall counters (ADR 0012) ──
+    # Consecutive PAID steward legs that returned no usable verdict for this
+    # issue. PER LEG, not shared: triage and groom select on independent
+    # predicates (`grooming_candidates` has no untriaged filter), so a groom
+    # leg that cheerfully reports "no finding" would otherwise erase the triage
+    # strikes that were about to stop an unbuyable issue. Cleared by a leg of
+    # the SAME kind that returns and lands a verdict, and by the trip itself
+    # (which records that leg's baseline instead, so the next series only
+    # starts once a human moves the issue on).
+    def _stall_path(self, issue: int, leg: str) -> str:
+        if leg == "groom":
+            return self.issue_path(issue, "steward-stalls-groom")
+        return self.issue_path(issue, "steward-stalls-triage")
+
+    def get_steward_stalls(self, issue: int, leg: str) -> int:
+        return self._read_int(self._stall_path(issue, leg))
+
+    def bump_steward_stalls(self, issue: int, leg: str) -> int:
+        path = self._stall_path(issue, leg)
+        n = self._read_int(path) + 1
+        self._write(path, str(n))
+        return n
+
+    def clear_steward_stalls(self, issue: int, leg: str) -> None:
+        self._write(self._stall_path(issue, leg), "0")
 
     def get_groom_at(self, issue: int) -> str:
         return self._read(self.groom_at_path(issue))
