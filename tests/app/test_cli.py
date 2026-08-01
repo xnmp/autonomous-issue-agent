@@ -673,6 +673,74 @@ def test_journal_paths_falls_back_to_synth_defaults(tmp_path, monkeypatch):
     assert steward.endswith(os.path.join(".local", "state", "steward-agent-other", "journal.jsonl"))
 
 
+def test_journal_paths_for_a_hand_written_overlay_match_where_daemons_write(
+    tmp_path, monkeypatch
+):
+    """A reconstructed overlay with REPO but no STATE_DIR keys (keifu,
+    2026-08-02): status/dashboard must read the SAME dirs the daemons derive
+    via config.from_env, or every run is invisible while spend accrues."""
+    from issue_agent.app import config as config_mod
+
+    monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
+    (tmp_path / "myapp.env").write_text('REPO="Acme/Widget-App"\n')
+
+    daemon_cfg = config_mod.from_env({"REPO": "Acme/Widget-App"})
+    assert cli.journal_paths("myapp") == [
+        os.path.join(daemon_cfg.state_dir, "journal.jsonl"),
+        os.path.join(daemon_cfg.review_state_dir, "journal.jsonl"),
+        os.path.join(daemon_cfg.steward_state_dir, "journal.jsonl"),
+    ]
+
+
+def _isolated_config(tmp_path, monkeypatch):
+    """Point both config roots at tmp: `config/repos/<name>.env` overlays and
+    the composed `config/.active.<name>.env` snapshots."""
+    repos = tmp_path / "repos"
+    config = tmp_path / "config"
+    repos.mkdir()
+    config.mkdir()
+    monkeypatch.setattr(cli, "REPOS_DIR", str(repos))
+    monkeypatch.setattr(cli, "HARNESS_ROOT", str(tmp_path))
+    return repos, config
+
+
+def test_journal_paths_prefer_the_composed_launch_snapshot(tmp_path, monkeypatch):
+    """REPO lives in `config/shared.env` for many deployments, so it reaches the
+    daemons only through the composed snapshot. Reading the overlay alone
+    derives a state dir nobody writes to and reports an empty history while
+    SQLite spend accrues — the read side must resolve what actually launched."""
+    from issue_agent.app import config as config_mod
+
+    repos, config = _isolated_config(tmp_path, monkeypatch)
+    (repos / "myapp.env").write_text('TARGET_DIR="/srv/myapp"\n')  # no REPO
+    (config / ".active.myapp.env").write_text('REPO="Acme/Widget-App"\n')
+
+    daemon_cfg = config_mod.from_env({"REPO": "Acme/Widget-App"})
+    assert cli.journal_paths("myapp") == [
+        os.path.join(daemon_cfg.state_dir, "journal.jsonl"),
+        os.path.join(daemon_cfg.review_state_dir, "journal.jsonl"),
+        os.path.join(daemon_cfg.steward_state_dir, "journal.jsonl"),
+    ]
+
+
+def test_a_snapshot_missing_one_key_still_falls_through_to_the_overlay(
+    tmp_path, monkeypatch
+):
+    """Per FIELD, not per file: a snapshot that names REPO but not
+    STEWARD_STATE_DIR must not blank the overlay's explicit value."""
+    repos, config = _isolated_config(tmp_path, monkeypatch)
+    (repos / "myapp.env").write_text(
+        'REPO="Acme/Old"\nSTEWARD_STATE_DIR="/custom/steward"\n'
+    )
+    (config / ".active.myapp.env").write_text(
+        'REPO="Acme/New"\nSTATE_DIR="/composed/fix"\n'
+    )
+
+    fix, _review, steward = cli.journal_paths("myapp")
+    assert fix == "/composed/fix/journal.jsonl", "snapshot wins where it speaks"
+    assert steward == "/custom/steward/journal.jsonl", "overlay fills the gap"
+
+
 def test_journal_path_backcompat_is_the_fix_journal(tmp_path, monkeypatch):
     """journal_path (singular, back-compat) stays the fix-only journal — same
     contract tests/adapters/test_journal.py (outside this leg's ownership)

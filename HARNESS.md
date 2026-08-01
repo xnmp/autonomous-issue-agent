@@ -70,7 +70,11 @@ Important fields:
   trusted test runner documents it as assertion failure; timeout, spawn, and
   signal exits can never satisfy the red-test gate.
 - `FIXER_RUNTIME=claude|codex|glm`;
-  `REVIEWER_RUNTIME=claude|codex` (Codex review supports single mode only).
+  `REVIEWER_RUNTIME=claude|codex` (Codex review supports single mode only);
+  `STEWARD_RUNTIME=claude|codex` (triage/groom; Codex needs `TARGET_DIR` and
+  cannot run Jira sync — no MCP transport. An unset `STEWARD_TRIAGE_MODEL`
+  resolves to `sonnet` under claude and to the Codex runner's own default
+  under codex).
 - `MAX_BUDGET_USD` / `REVIEW_BUDGET_USD` bound a leg.
 - `ISSUE_SPEND_CAP_USD`, `DAILY_SPEND_CAP_USD`, and
   `GLOBAL_DAILY_SPEND_CAP_USD` are enforced transactionally by SQLite.

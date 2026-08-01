@@ -58,6 +58,66 @@ def test_reviewer_runtime_accepts_an_explicit_claude_diversity_posture():
     assert cfg.review_model == "opus"
 
 
+def test_steward_runtime_defaults_to_claude_with_its_claude_model():
+    """Back-compat: an overlay written before STEWARD_RUNTIME existed must
+    resolve to exactly the runtime and model it resolved to before."""
+    cfg = from_env({"REPO": "x"})
+
+    assert cfg.steward_runtime.runtime == "claude"
+    assert cfg.steward_runtime.triage_model == "sonnet"
+
+
+def test_a_codex_steward_drops_the_claude_flavoured_default_model():
+    """`sonnet` is an Anthropic alias Codex cannot resolve. Unset means "let
+    the Codex runner choose", never "send the Claude default to Codex"."""
+    cfg = from_env({"REPO": "x", "STEWARD_RUNTIME": "codex"})
+
+    assert cfg.steward_runtime.runtime == "codex"
+    assert cfg.steward_runtime.triage_model is None
+
+
+@pytest.mark.parametrize("runtime", ["claude", "codex"])
+def test_an_explicit_steward_triage_model_survives_either_runtime(runtime):
+    cfg = from_env({
+        "REPO": "x", "STEWARD_RUNTIME": runtime,
+        "STEWARD_TRIAGE_MODEL": "gpt-5.6-terra",
+    })
+
+    assert cfg.steward_runtime.triage_model == "gpt-5.6-terra"
+
+
+@pytest.mark.parametrize("runtime", ["claude", "codex"])
+def test_an_explicitly_empty_triage_model_still_means_the_runtime_default(runtime):
+    """`STEWARD_TRIAGE_MODEL=""` meant None (let the runtime choose) before the
+    per-runtime default existed, and must keep meaning that. Only an ABSENT key
+    takes the default — otherwise a deliberate empty silently becomes
+    "sonnet"."""
+    cfg = from_env({
+        "REPO": "x", "STEWARD_RUNTIME": runtime, "STEWARD_TRIAGE_MODEL": "",
+    })
+
+    assert cfg.steward_runtime.triage_model is None
+
+
+@pytest.mark.parametrize("value", ["glm", "gpt5"])
+def test_steward_runtime_rejects_a_runtime_it_cannot_dispatch(value):
+    """An unsupported value must be reported and fall back to claude, never
+    silently select a runtime the steward has no binder for."""
+    cfg = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "STEWARD_RUNTIME": value})
+
+    _assert_each_knob_flagged_once(cfg.validation_errors(), {"STEWARD_RUNTIME"})
+    assert "must be one of ['claude', 'codex']" in cfg.validation_errors()[0]
+    assert cfg.steward_runtime.runtime == "claude"
+
+
+def test_an_empty_steward_runtime_reads_as_unset():
+    """Every other knob in this table treats "" as "not configured"."""
+    cfg = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "STEWARD_RUNTIME": ""})
+
+    assert cfg.validation_errors() == ()
+    assert cfg.steward_runtime.runtime == "claude"
+
+
 @pytest.mark.parametrize("mode", ["multi", "delegated"])
 def test_codex_reviewer_rejects_modes_it_cannot_execute(mode):
     cfg = from_env({

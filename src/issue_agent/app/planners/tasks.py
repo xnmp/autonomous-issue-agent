@@ -1242,6 +1242,12 @@ class TriageTaskConfig:
     triage_prompt: str = ""          # steward.sh TRIAGE_PROMPT
     max_budget_usd: float = 0.75
     model: str | None = "sonnet"
+    # Explicit checkout for the leg. None keeps the historical behaviour (the
+    # daemon's own cwd, which main.py has already chdir'd to TARGET_DIR).
+    # STEWARD_RUNTIME=codex REQUIRES it: the read-only governor is declared by a
+    # hook script written at the leg's cwd, and containment refuses to run
+    # without one.
+    cwd: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1249,6 +1255,7 @@ class GroomTaskConfig:
     steward_bot: str
     max_budget_usd: float = 0.75
     model: str | None = "sonnet"
+    cwd: str | None = None
 
 
 def build_groom_task(
@@ -1274,7 +1281,7 @@ def build_groom_task(
     return PlannedRun(
         prompt=prompt, schema=GROOM_SCHEMA, allowed_tools=TRIAGE_TOOLS,
         disallowed_tools=("Edit", "Write"), model=cfg.model,
-        max_budget_usd=cfg.max_budget_usd,
+        max_budget_usd=cfg.max_budget_usd, cwd=cfg.cwd,
     )
 
 
@@ -1380,6 +1387,7 @@ def build_triage_task(
         disallowed_tools=("Edit", "Write"),
         model=cfg.model,
         max_budget_usd=cfg.max_budget_usd,
+        cwd=cfg.cwd,
     )
 
 

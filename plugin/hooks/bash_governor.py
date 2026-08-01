@@ -100,35 +100,125 @@ def _run_checker(script_rel: str, args: list[str]) -> tuple[int, str]:
     return res.returncode, (res.stdout + res.stderr)
 
 
-_REVIEW_READ_ONLY_COMMANDS = frozenset({"cat", "ls"})
-_REVIEW_READ_ONLY_GIT = frozenset({"diff"})
-_REVIEW_READ_ONLY_GH_PR = frozenset({"diff", "view"})
+# Read-only Bash surfaces, per LEG ROLE. There is no single "read-only"
+# profile: a reviewer reads one PR's diff, while a steward TRIAGE/GROOM leg
+# reads the issue tracker and repository history to VERIFY the claims its
+# schema asks for (a blocked_by issue number, a stale path reference). Both are
+# strictly non-mutating; only their surfaces differ.
+#
+# Reusing the reviewer's profile for the steward was a real defect, not a
+# tightening: every `gh issue view`, `gh search issues`, `rg`, and `git log` the
+# triage prompt instructs exited 2, and the leg still settled spend and returned
+# "VERIFIED" fields it had no way to verify.
+#
+# Each profile is an allowlist of exact verbs. Adding a verb here widens what a
+# leg reading attacker-controlled issue/PR text can do with the daemon's ambient
+# credentials, so nothing mutating belongs in any of them.
+_READ_ONLY_PROFILES: dict[str, tuple[frozenset, frozenset, dict, str]] = {
+    "review": (
+        frozenset({"cat", "ls"}),                     # bare commands
+        frozenset({"diff"}),                          # git subcommands
+        {"pr": frozenset({"diff", "view"})},          # gh <noun> <verb>
+        "Codex review is read-only; only git diff, gh pr diff/view, cat, and ls are allowed",
+    ),
+    "steward": (
+        frozenset({"cat", "ls", "rg"}),
+        frozenset({"diff", "log", "show"}),
+        {
+            "issue": frozenset({"view", "list"}),
+            "search": frozenset({"issues"}),
+            "pr": frozenset({"diff", "view"}),
+        },
+        "Codex triage is read-only; only git diff/log/show, "
+        "gh issue view/list, gh search issues, gh pr diff/view, rg, cat, and ls "
+        "are allowed",
+    ),
+}
 
 
-def review_only_violation(command: str) -> str | None:
-    """Reject every reviewer Bash command outside the task's read-only surface.
+# ripgrep is allowlisted for the steward, but several of its flags execute
+# subprocesses: --pre/--pre-glob run a command per matched file, --hostname-bin
+# runs one per search, and --search-zip/-z shell out to decompressors. Any of
+# these turns "search the checkout" into "run a repo-resident binary with the
+# daemon's ambient credentials", which is exactly what a read-only profile
+# exists to prevent. Exact-flag denylist, fail-closed on `=` forms and on
+# clustered short flags (clap accepts `-iz`).
+_RG_EXEC_LONG_FLAGS = ("--pre", "--pre-glob", "--hostname-bin", "--search-zip")
+
+
+def _rg_exec_violation(words: list) -> bool:
+    for w in words[1:]:
+        if w == "--":  # option parsing ends; the rest is patterns/paths
+            return False
+        if any(w == f or w.startswith(f + "=") for f in _RG_EXEC_LONG_FLAGS):
+            return True
+        if w.startswith("-") and not w.startswith("--") and "z" in w:
+            return True
+    return False
+
+
+def read_only_violation(command: str, role: str = "") -> str | None:
+    """Reject every Bash command outside `role`'s read-only surface.
 
     Codex does not consume AgentTask.allowed_tools/disallowed_tools. The
     read-only sandbox protects the checkout, but it does not make a `gh` write
-    command harmless, so this hook also prevents an untrusted PR prompt from
-    using the daemon's ambient credentials as an escape hatch.
+    command harmless, so this hook also prevents an untrusted issue/PR prompt
+    from using the daemon's ambient credentials as an escape hatch.
+
+    An UNRECOGNISED role gets the reviewer's narrowest profile, not a wider one:
+    the role arrives from `ISSUE_AGENT_LEG_ROLE`, which only the dispatching
+    runner writes, so an unknown value means the env did not propagate — and a
+    propagation failure must never widen a security boundary.
     """
+    profile = _READ_ONLY_PROFILES.get(role)
+    if profile is None:
+        # Name the observed role: the fallback is deliberate (a propagation
+        # failure must never widen a security boundary), but the reviewer's
+        # message on a steward leg sends the operator hunting in the wrong
+        # role's config.
+        commands, git_verbs, gh_nouns, message = _READ_ONLY_PROFILES["review"]
+        if role:
+            message = (
+                f"{message} (leg role {role!r} has no read-only profile; "
+                "the reviewer's applied)"
+            )
+    else:
+        commands, git_verbs, gh_nouns, message = profile
     for words, _env in extract_commands_with_env(command):
         if not words:
             continue
-        if words[0] in _REVIEW_READ_ONLY_COMMANDS:
+        if words[0] == "rg" and "rg" in commands:
+            if _rg_exec_violation(words):
+                return (
+                    "rg may not spawn subprocesses in a read-only leg "
+                    "(--pre/--pre-glob/--hostname-bin/--search-zip/-z)"
+                )
             continue
-        if len(words) >= 2 and words[0] == "git" and words[1] in _REVIEW_READ_ONLY_GIT:
+        if words[0] in commands:
             continue
+        if words[0] == "git" and words[1:2]:
+            # `git --no-pager log` is a form agents write constantly; the
+            # pager-suppression flags are inert, so unwrap ONLY those before
+            # the verb match. `-c`/other globals stay blocked (config
+            # injection reaches pagers and hooks).
+            verb_at = 1
+            while verb_at < len(words) and words[verb_at] in ("--no-pager", "-P"):
+                verb_at += 1
+            if verb_at < len(words) and words[verb_at] in git_verbs:
+                continue
         if (
             len(words) >= 3
             and words[0] == "gh"
-            and words[1] == "pr"
-            and words[2] in _REVIEW_READ_ONLY_GH_PR
+            and words[2] in gh_nouns.get(words[1], frozenset())
         ):
             continue
-        return "Codex review is read-only; only git diff, gh pr diff/view, cat, and ls are allowed"
+        return message
     return None
+
+
+def review_only_violation(command: str) -> str | None:
+    """Back-compatible alias for the reviewer's profile."""
+    return read_only_violation(command, "review")
 
 
 def main() -> None:
@@ -159,12 +249,15 @@ def main() -> None:
     # propagate keeps its sandbox (fail CLOSED on the security boundary). A
     # fixer whose env failed to propagate is merely blocked, which is loud,
     # costs no correctness, and is the state #113 already describes.
-    review_read_only = (
+    leg_role = os.environ.get("ISSUE_AGENT_LEG_ROLE", "")
+    read_only = (
         os.environ.get("ISSUE_AGENT_REVIEW_READ_ONLY") == "1"
-        and os.environ.get("ISSUE_AGENT_LEG_ROLE") != "fix"
+        and leg_role != "fix"
     )
-    if review_read_only:
-        violation = review_only_violation(command)
+    if read_only:
+        # The role also selects WHICH read-only surface applies: a steward
+        # triage leg reads the tracker, a reviewer reads one PR's diff.
+        violation = read_only_violation(command, leg_role)
         if violation:
             _block(f"Blocked: {violation}")
 

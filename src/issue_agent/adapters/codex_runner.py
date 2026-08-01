@@ -155,20 +155,51 @@ class CodexProvider:
         ]
 
 
+def _nullable(schema: dict) -> dict:
+    """Widen a property's type to admit null, the strict-mode way to say
+    "optional". No `type` to widen → returned unchanged."""
+    declared = schema.get("type")
+    if isinstance(declared, str):
+        if declared == "null":
+            return schema
+        return {**schema, "type": [declared, "null"]}
+    if isinstance(declared, list):
+        if "null" in declared:
+            return schema
+        return {**schema, "type": [*declared, "null"]}
+    return schema
+
+
 def _strict_schema(schema: dict) -> dict:
     """Azure OpenAI strict structured-output requires EVERY property listed in
     `required` (no optional keys) and additionalProperties:false at each object.
     Our domain schemas mark some fields optional, so tighten a shallow copy for
-    the Codex/azure path. Recurses into nested object properties."""
+    the Codex/azure path. Recurses into nested object properties.
+
+    A property that was NOT required becomes nullable as it is forced into
+    `required`. Optionality in these schemas is load-bearing, not incidental:
+    GROOM_SCHEMA has no required fields at all, and TRIAGE_SCHEMA's
+    `recurrence_of` is optional, precisely so an honest "no finding" stays
+    expressible. Making them mandatory-and-non-nullable put a classifier that
+    reads attacker-controlled issue text under pressure to INVENT a match — a
+    fabricated `resolved_by` drawn from the recent-merge list in its own prompt
+    passes the domain whitelist and posts a false "already shipped" comment.
+    Nullable keeps strict mode satisfied while leaving "nothing found" sayable;
+    every consumer already treats null exactly like absent.
+    """
     if not isinstance(schema, dict) or schema.get("type") != "object":
         return schema
     props = schema.get("properties")
     if not isinstance(props, dict):
         return schema
+    optional = set(props) - set(schema.get("required") or ())
     out = dict(schema)
     out["additionalProperties"] = False
     out["required"] = list(props.keys())
-    out["properties"] = {k: _strict_schema(v) for k, v in props.items()}
+    out["properties"] = {
+        k: (_nullable(_strict_schema(v)) if k in optional else _strict_schema(v))
+        for k, v in props.items()
+    }
     return out
 
 

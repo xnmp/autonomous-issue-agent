@@ -234,15 +234,18 @@ class StewardWorkflow:
             return
         s = result.structured
         verdict = TriageVerdict(
-            verdict=s.get("verdict", ""),
-            plain_summary=s.get("plain_summary", ""),
+            # `or ""` throughout, not `get(k, "")`: under strict structured
+            # output an optional field arrives as an explicit JSON null rather
+            # than being absent, and a null must read exactly like absent.
+            verdict=s.get("verdict") or "",
+            plain_summary=s.get("plain_summary") or "",
             acceptance_criteria=tuple(s.get("acceptance_criteria", []) or ()),
             creator_questions=tuple(s.get("creator_questions", []) or ()),
             owner_questions=tuple(s.get("owner_questions", []) or ()),
             blocked_by_issues=tuple(
                 int(n) for n in (s.get("blocked_by_issues", []) or []) if isinstance(n, int)
             ),
-            rationale=s.get("rationale", ""),
+            rationale=s.get("rationale") or "",
             # ints only (bool is an int subclass and is NOT a number here); every
             # other shape reads as "no claim". The number is further checked
             # against `merged_by_issue` in the domain, which is what stops the

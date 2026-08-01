@@ -1932,6 +1932,289 @@ def test_codex_reviewer_uses_the_review_budget_and_model(tmp_path, monkeypatch):
     assert seen["env"]["ISSUE_AGENT_LEG_ROLE"] == "review"
 
 
+# ── STEWARD_RUNTIME wiring (build_steward_daemon) ────────────────────────────
+
+
+def _steward_daemon(tmp_path, **env):
+    from issue_agent.app.config import from_env
+    from issue_agent.app.roles import build_steward_daemon
+
+    cfg = replace(
+        from_env({
+            "REPO": "o/r", "FIX_BOT": FIX_BOT, "STEWARD_BOT": "steward[bot]",
+            **_role_state_env(tmp_path), **env,
+        }),
+        control_authority_root=str(tmp_path / "machine-state"),
+    )
+    gateway = _BuildableGateway()
+    gateway.build_triage_world = lambda: WorldState()
+    gateway.build_steward_world = lambda: WorldState()
+    return build_steward_daemon(
+        cfg, gateway, Store(str(tmp_path / "steward-state")),
+        FakeRunner(AgentResult(is_error=False)),
+    )
+
+
+def _steward_dispatcher(daemon):
+    return daemon.executor._run_agent._dispatch.__self__
+
+
+def test_the_steward_runs_on_claude_when_no_runtime_is_selected(tmp_path):
+    """Back-compat: an overlay that never heard of STEWARD_RUNTIME must keep
+    dispatching triage on the injected Claude runner, priced as claude."""
+    daemon = _steward_daemon(tmp_path, STEWARD_GROOM="1")
+
+    dispatcher = _steward_dispatcher(daemon)
+    assert dispatcher.runner.runtime == "claude"
+    accounting = dispatcher.runner.inner
+    assert accounting.__class__.__name__ == "AccountingRuntime"
+    assert accounting.runtime_name == "claude"
+    assert isinstance(accounting.inner, FakeRunner), (
+        "the Claude steward binds the injected SDK runner unchanged"
+    )
+    # Claude keeps its alias models and its historical implicit cwd.
+    assert dispatcher.cfg.triage.model == "sonnet"
+    assert dispatcher.cfg.groom.model == "sonnet"
+    assert dispatcher.cfg.triage.cwd is None
+
+
+def test_steward_runtime_codex_dispatches_triage_and_groom_on_codex(
+    tmp_path, monkeypatch
+):
+    """STEWARD_RUNTIME=codex must move the paid triage/groom legs onto the
+    Codex adapter with read-only containment, and must still price and journal
+    them as codex — otherwise the spend projection attributes ChatGPT-auth legs
+    to the Anthropic rate card."""
+    from issue_agent.adapters import codex_runner
+
+    seen = {}
+
+    class CapturingCodexRunner:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def preflight(self):
+            return None
+
+        def oauth_auth_file(self):
+            return ""
+
+    monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
+    daemon = _steward_daemon(
+        tmp_path,
+        STEWARD_RUNTIME="codex",
+        STEWARD_GROOM="1",
+        TARGET_DIR=str(tmp_path),
+    )
+
+    dispatcher = _steward_dispatcher(daemon)
+    assert dispatcher.runner.runtime == "codex"
+    accounting = dispatcher.runner.inner
+    assert accounting.__class__.__name__ == "AccountingRuntime"
+    assert accounting.runtime_name == "codex"
+    # The synthetic ChatGPT-auth rate card, not the Claude one.
+    assert accounting.rate_table.rate_card_id == "codex-config"
+    contained = accounting.inner
+    assert contained.__class__.__name__ == "HookPreparingRuntime"
+    assert isinstance(contained.inner, CapturingCodexRunner)
+    # Triage/groom read and classify; they never edit.
+    assert seen["sandbox"] == "read-only"
+    assert seen["resume_on_retry"] is False
+    assert seen["env"]["ISSUE_AGENT_LEG_ROLE"] == "steward"
+    # Codex containment refuses a plan with no cwd, so both legs carry one.
+    assert dispatcher.cfg.triage.cwd == str(tmp_path)
+    assert dispatcher.cfg.groom.cwd == str(tmp_path)
+
+
+def test_a_codex_steward_never_sends_a_claude_model_alias(tmp_path, monkeypatch):
+    """`sonnet` is an Anthropic alias; Codex rejects it outright. An unset
+    STEWARD_TRIAGE_MODEL under codex must resolve to the Codex runner's own
+    default instead of leaking the Claude-flavoured default through."""
+    from issue_agent.adapters import codex_runner
+
+    seen = {}
+
+    class CapturingCodexRunner:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def preflight(self):
+            return None
+
+        def oauth_auth_file(self):
+            return ""
+
+    monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
+    daemon = _steward_daemon(
+        tmp_path, STEWARD_RUNTIME="codex", STEWARD_GROOM="1",
+        TARGET_DIR=str(tmp_path),
+    )
+
+    dispatcher = _steward_dispatcher(daemon)
+    assert dispatcher.cfg.triage.model is None
+    assert dispatcher.cfg.groom.model is None
+    assert seen.get("default_model", "") != "sonnet"
+
+
+def test_an_explicit_triage_model_reaches_the_codex_steward(tmp_path, monkeypatch):
+    """Anti-vacuity twin: the fallback must not swallow an operator's choice."""
+    from issue_agent.adapters import codex_runner
+
+    seen = {}
+
+    class CapturingCodexRunner:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def preflight(self):
+            return None
+
+        def oauth_auth_file(self):
+            return ""
+
+    monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
+    daemon = _steward_daemon(
+        tmp_path, STEWARD_RUNTIME="codex", STEWARD_TRIAGE_MODEL="gpt-5.6-terra",
+        TARGET_DIR=str(tmp_path),
+    )
+
+    assert _steward_dispatcher(daemon).cfg.triage.model == "gpt-5.6-terra"
+    assert seen["default_model"] == "gpt-5.6-terra"
+
+
+def test_a_codex_steward_enforces_the_triage_budget_from_streamed_usage(
+    tmp_path, monkeypatch
+):
+    """Codex has no native dollar flag: the harness kills a run once its priced
+    rollout usage crosses the leg's cap. The steward must inherit that, and the
+    cap it enforces is STEWARD_TRIAGE_BUDGET_USD, not the fixer's."""
+    from issue_agent.adapters import codex_runner
+
+    seen = {}
+
+    class CapturingCodexRunner:
+        def __init__(self, **kwargs):
+            seen.update(kwargs)
+
+        def preflight(self):
+            return None
+
+        def oauth_auth_file(self):
+            return ""
+
+    monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
+    daemon = _steward_daemon(
+        tmp_path, STEWARD_RUNTIME="codex", STEWARD_GROOM="1",
+        STEWARD_TRIAGE_BUDGET_USD="0.75", TARGET_DIR=str(tmp_path),
+    )
+
+    assert seen["enforce_budget"] is True
+    assert seen["cost_per_mtok_in"] > 0 and seen["cost_per_mtok_out"] > 0
+    dispatcher = _steward_dispatcher(daemon)
+    assert dispatcher.cfg.triage.max_budget_usd == 0.75
+    assert dispatcher.cfg.groom.max_budget_usd == 0.75
+
+
+@pytest.mark.parametrize(
+    "target_dir", ["", "/nonexistent/typo-in-target-dir"], ids=["unset", "typo"]
+)
+def test_a_codex_steward_without_a_usable_checkout_disarms_every_capability(
+    tmp_path, monkeypatch, capsys, target_dir
+):
+    """Codex containment is declared by a hook script at the leg's cwd, so with
+    no usable TARGET_DIR there is nothing to contain the leg in.
+
+    The daemon must therefore not merely SAY it cannot triage — it must not
+    decide or dispatch triage/groom/jira at all. An earlier version logged
+    triage=off while `decide` kept emitting paid TRIAGE actions that ran with no
+    CODEX_HOME and no PreToolUse hook: paid, ungoverned legs.
+    """
+    from issue_agent.adapters import codex_runner
+
+    class CapturingCodexRunner:
+        def __init__(self, **kwargs):
+            pass
+
+        def preflight(self):
+            return None
+
+        def oauth_auth_file(self):
+            return ""
+
+    monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
+    daemon = _steward_daemon(
+        tmp_path, STEWARD_RUNTIME="codex", STEWARD_GROOM="1", JIRA_SYNC="1",
+        JIRA_PROJECT_KEY="ABC", TARGET_DIR=target_dir,
+    )
+
+    dispatcher = _steward_dispatcher(daemon)
+    assert dispatcher.cfg.triage_cfg.enabled is False
+    assert dispatcher.cfg.groom is None
+    assert dispatcher.cfg.jira is None
+    # The pure decision emits nothing payable for an untriaged issue.
+    assert daemon.decide(_triaged()) == []
+    assert "STEWARD_RUNTIME=codex requires TARGET_DIR" in capsys.readouterr().err
+
+
+def test_an_unusable_codex_steward_runtime_refuses_rather_than_improvising(
+    tmp_path, monkeypatch
+):
+    """Defence in depth behind the capability gate: if anything ever did reach
+    the runner, it must refuse — never fall back to the BARE Codex runner with
+    the operator's own ~/.codex/config.toml and no governor."""
+    import asyncio
+
+    from issue_agent.adapters import codex_runner
+    from issue_agent.adapters.runtime_plan import RuntimePlan
+
+    class CapturingCodexRunner:
+        def __init__(self, **kwargs):
+            pass
+
+        def preflight(self):
+            return None
+
+        def oauth_auth_file(self):
+            return ""
+
+    monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
+    daemon = _steward_daemon(tmp_path, STEWARD_RUNTIME="codex", TARGET_DIR="")
+
+    runtime = _steward_dispatcher(daemon).runner.inner.inner
+    assert not isinstance(runtime, CapturingCodexRunner)
+    with pytest.raises(RuntimeError, match="requires TARGET_DIR"):
+        asyncio.run(runtime.run(RuntimePlan(prompt="x")))
+
+
+def test_a_codex_steward_keeps_jira_sync_inert_rather_than_unattached(
+    tmp_path, monkeypatch, capsys
+):
+    """The Codex adapter has no MCP transport, so a jira-sync leg dispatched
+    there would run without the Atlassian server. Inert and loud, not silent."""
+    from issue_agent.adapters import codex_runner
+
+    class CapturingCodexRunner:
+        def __init__(self, **kwargs):
+            pass
+
+        def preflight(self):
+            return None
+
+        def oauth_auth_file(self):
+            return ""
+
+    monkeypatch.setattr(codex_runner, "CodexRunner", CapturingCodexRunner)
+    daemon = _steward_daemon(
+        tmp_path, STEWARD_RUNTIME="codex", JIRA_SYNC="1",
+        JIRA_PROJECT_KEY="ABC", TARGET_DIR=str(tmp_path),
+    )
+
+    err = capsys.readouterr().err
+    assert "has no MCP transport — Jira sync inert" in err
+    assert _steward_dispatcher(daemon).cfg.jira is None
+    assert "jira_sync=off" in err
+
+
 def _git_target(tmp_path):
     """A real git checkout for TARGET_DIR. The Claude review binding arms the
     per-PR pinned checkout off TARGET_DIR (0d2e295 M1), so a review leg only

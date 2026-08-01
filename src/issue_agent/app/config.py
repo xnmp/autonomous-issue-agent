@@ -157,6 +157,7 @@ class ReviewRuntimeConfig:
 @dataclass(frozen=True)
 class StewardRuntimeConfig:
     bot: str
+    runtime: RuntimeName
     triage_enabled: bool
     promote: bool
     owner: str
@@ -446,6 +447,11 @@ class HarnessConfig:
     # for the recommended mixed-runtime posture that preserves independent
     # implementer/reviewer failure modes.
     reviewer_runtime: RuntimeName = RuntimeName.CODEX
+    # STEWARD_RUNTIME: which runtime the steward's TRIAGE/GROOM legs run on.
+    # Claude stays the default so existing deployments are byte-identical after
+    # this knob exists. Named `_name` because `steward_runtime` is already the
+    # composed StewardRuntimeConfig property.
+    steward_runtime_name: RuntimeName = RuntimeName.CLAUDE
     codex_bin: str = "codex"
     codex_model: str = ""              # blank → CodexRunner default (GPT-5.5)
     codex_provider_id: str = "openai-custom"  # NOT "openai": reserved by codex-cli ≥0.142
@@ -675,6 +681,7 @@ class HarnessConfig:
     def steward_runtime(self) -> StewardRuntimeConfig:
         return StewardRuntimeConfig(
             bot=self.steward_bot,
+            runtime=self.steward_runtime_name,
             triage_enabled=self.steward_triage,
             promote=self.steward_promote,
             owner=self.steward_owner,
@@ -928,6 +935,9 @@ class HarnessConfig:
             f"reviewer={self.reviewer_runtime.value} review_model={model(self.review_model)} "
             f"mode={self.review_mode.value} review_budget=${self.review_budget_usd:.2f} "
             f"rejections_cap={self.max_review_rejections}",
+            f"steward={self.steward_runtime_name.value} "
+            f"triage_model={model(self.steward_triage_model)} "
+            f"triage_budget=${self.triage_budget_usd:.2f}",
             f"retry_caps: resolve={self.max_resolve_retries} ci={self.max_ci_retries} "
             f"review={self.max_review_retries} rebase={self.max_rebase_retries} "
             f"ci_pending="
@@ -1079,6 +1089,7 @@ _ENV_NAME_OVERRIDES = {
     "triage_budget_usd": "STEWARD_TRIAGE_BUDGET_USD",
     "harness_root": "HARNESS_ROOT_DIR",
     "jira_budget_usd": "JIRA_SYNC_BUDGET_USD",
+    "steward_runtime_name": "STEWARD_RUNTIME",
     "agent_idle_timeout": "AGENT_IDLE_TIMEOUT_SECONDS",
     "agent_max_runtime": "AGENT_MAX_RUNTIME_SECONDS",
     "codex_backoff_base": "CODEX_BACKOFF_BASE_SECONDS",
@@ -1100,6 +1111,7 @@ _COERCE_OVERRIDES: dict[str, str] = {
     "review_scout_model": "optional_string",
     "fixer_runtime": "runtime",
     "reviewer_runtime": "runtime",
+    "steward_runtime_name": "runtime",
     "codex_cost_per_mtok": "rate_table",
 }
 _CHOICE_OVERRIDES: dict[str, tuple[str, ...]] = {
@@ -1108,6 +1120,7 @@ _CHOICE_OVERRIDES: dict[str, tuple[str, ...]] = {
     "review_mode": tuple(item.value for item in ReviewMode),
     "fixer_runtime": tuple(item.value for item in RuntimeName),
     "reviewer_runtime": (RuntimeName.CLAUDE.value, RuntimeName.CODEX.value),
+    "steward_runtime_name": (RuntimeName.CLAUDE.value, RuntimeName.CODEX.value),
 }
 
 
@@ -1408,6 +1421,18 @@ def _default_state_dir(repo: str, role_dir: str) -> str:
     return os.path.expanduser(f"~/.local/state/{role_dir}/{_repo_slug(repo)}")
 
 
+def default_state_dir(repo: str, role_dir: str) -> str:
+    """The state dir a daemon derives when the overlay carries no explicit
+    STATE_DIR/REVIEW_STATE_DIR/STEWARD_STATE_DIR — the public seam for
+    read-side callers (status/dashboard journal discovery). Canonicalizes the
+    repo the same way from_env does, so a raw overlay REPO value ("owner/name",
+    URL forms, case variants) lands on the SAME directory the daemon writes.
+    Any read-side fallback that derives this path differently goes blind
+    exactly when the overlay is hand-written (the keifu 2026-08-02 incident:
+    dashboard showed settled spend with zero runs)."""
+    return _default_state_dir(canonical_repository(repo), role_dir)
+
+
 # Names an env file textually ASSIGNS. Same anchor as bin/compose-env.sh's
 # scan: a commented-out `# FOO=bar` is not a definition, `export FOO=` and
 # leading whitespace are. `.active.env` is machine-written one-line
@@ -1484,6 +1509,28 @@ def _authoritative_env(e: dict) -> dict:
     return e if parsed is None else parsed
 
 
+def _runtime_default_model(
+    env: dict,
+    field_name: str,
+    *,
+    claude_default: object,
+    is_claude: bool,
+) -> str | None:
+    """Resolve a model knob whose DEFAULT depends on the selected runtime.
+
+    Three distinct states, deliberately not two: absent (take the runtime's
+    default), present-and-empty (None — "let the runtime choose"), and present
+    (verbatim). Collapsing the middle state into the first is how an explicit
+    `KEY=""` starts meaning something other than what it meant before.
+    """
+    raw = env.get(_env_name(field_name))
+    if raw is not None:
+        return str(raw).strip() or None
+    if not is_claude:
+        return None
+    return str(claude_default) if claude_default is not None else None
+
+
 def from_env(env: dict | None = None) -> HarnessConfig:
     """Build one immutable snapshot from the metadata-backed config table."""
 
@@ -1494,6 +1541,7 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         "review_state_dir",
         "steward_state_dir",
         "review_model",
+        "steward_triage_model",
         "codex_cost_per_mtok",
     }
     values: dict[str, object] = {}
@@ -1514,6 +1562,9 @@ def from_env(env: dict | None = None) -> HarnessConfig:
     reviewer_runtime = values["reviewer_runtime"]
     if not isinstance(reviewer_runtime, RuntimeName):
         raise RuntimeError("reviewer runtime metadata did not produce RuntimeName")
+    steward_runtime = values["steward_runtime_name"]
+    if not isinstance(steward_runtime, RuntimeName):
+        raise RuntimeError("steward runtime metadata did not produce RuntimeName")
 
     values.update(
         state_dir=(
@@ -1535,6 +1586,22 @@ def from_env(env: dict | None = None) -> HarnessConfig:
                 if reviewer_runtime is RuntimeName.CLAUDE
                 else _dc_default("review_model")
             )
+        ),
+        # An explicit STEWARD_TRIAGE_MODEL always wins, and only an ABSENT one
+        # resolves per runtime. The dataclass default is a Claude alias
+        # ("sonnet"), which Codex rejects outright, so under
+        # STEWARD_RUNTIME=codex an unset knob means None — the Codex runner then
+        # uses CODEX_MODEL, else its own built-in default.
+        #
+        # PRESENT-but-empty keeps its pre-existing `optional_string` meaning,
+        # None ("use the runtime's own default"), on BOTH runtimes. Folding it
+        # into the absent case would silently turn a deliberate
+        # STEWARD_TRIAGE_MODEL="" into "sonnet".
+        steward_triage_model=_runtime_default_model(
+            e,
+            "steward_triage_model",
+            claude_default=_dc_default("steward_triage_model"),
+            is_claude=steward_runtime is RuntimeName.CLAUDE,
         ),
     )
     rates, cached_rates = _coerce_rate_tables(

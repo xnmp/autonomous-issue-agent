@@ -36,7 +36,11 @@ from dataclasses import dataclass
 from ..adapters.env_file import source_env_file
 from ..adapters.operator_effects import build_operator_effects
 from ..domain.repository import canonical_repository, repository_equal
-from .config import REPOINT_HISTORY_ENV, parse_repoint_history
+from .config import (
+    REPOINT_HISTORY_ENV,
+    default_state_dir as config_default_state_dir,
+    parse_repoint_history,
+)
 
 # HARNESS_ROOT: …/src/issue_agent/app/cli.py → repo root. Same walk main.py uses.
 # This is what makes the CLI checkout-resident: plugin/ + config/ are siblings.
@@ -109,7 +113,7 @@ def parse_remote_url(url: str) -> str:
 _OVERLAY_FIELDS = (
     "REPO", "TARGET_DIR", "STATE_DIR", "REVIEW_STATE_DIR", "STEWARD_STATE_DIR",
     "TEST_CMD", "BASE_BRANCH", "DAILY_SPEND_CAP_USD", "GLOBAL_DAILY_SPEND_CAP_USD",
-    "FIXER_RUNTIME", "REVIEWER_RUNTIME", "REVIEW_MODE",
+    "FIXER_RUNTIME", "REVIEWER_RUNTIME", "STEWARD_RUNTIME", "REVIEW_MODE",
     REPOINT_HISTORY_ENV,
 )
 
@@ -1738,25 +1742,61 @@ _JOURNAL_ROLE_DEFAULTS = (
 )
 
 
+def _deployment_env_field(name: str, field: str) -> str:
+    """One composed config field, read the way the DAEMONS resolved it.
+
+    `config/.active.<name>.env` is literally the snapshot a launch composed and
+    the daemons loaded — shared.env plus the repo overlay, already merged. The
+    overlay ALONE goes blind the moment REPO or a `*_STATE_DIR` is set in
+    `config/shared.env` (or only in the snapshot): the read side then derives a
+    state dir nobody writes to, and reports an empty history while SQLite spend
+    accrues. So: snapshot first, overlay second, per field — per field rather
+    than per file, because a snapshot missing one key must still fall through
+    to the overlay rather than blanking it.
+
+    "" for every path that does not exist or does not assign the field, which
+    is the same "absent, not an error" contract `read_repo_env_field` has.
+    """
+    for path in (
+        _active_env_path(name),
+        os.path.join(REPOS_DIR, f"{name}.env"),
+    ):
+        value = read_repo_env_field(path, field)
+        if value:
+            return value
+    return ""
+
+
 def journal_paths(name: str) -> list[str]:
     """Every per-role journal overlay `name`'s daemons may have written (M11):
     fix, review, and steward each get their OWN STATE_DIR and therefore their
     own journal.jsonl. Reading STATE_DIR alone (the pre-M11 `journal_path`)
     made review/steward runs, their spend blocks, and their loops invisible to
-    `issue-agent status`. Overlay value wins per role; an absent/empty one
-    falls back to the same per-role default `synth_repo_env` writes into a
-    freshly generated overlay. A role that never ran still gets a path here —
+    `issue-agent status`. Each role's state dir comes from the composed launch
+    snapshot, else the overlay (`_deployment_env_field`); an absent/empty one
+    falls back to the daemon's own derivation (config.default_state_dir keyed
+    on that same REPO), because that is where the daemons actually write when
+    the key is missing; only a deployment with no REPO anywhere falls back to
+    the `synth_repo_env` `<role>-<name>` layout. A role that never ran still
+    gets a path here —
     `read_events` (adapters/journal.py) already treats a missing file as an
     empty history, not an error, so callers need no existence check and a
     role that never ran is silently skipped, not flagged."""
-    overlay = os.path.join(REPOS_DIR, f"{name}.env")
+    repo = _deployment_env_field(name, "REPO")
     paths = []
     for env_key, dirname in _JOURNAL_ROLE_DEFAULTS:
-        raw = read_repo_env_field(overlay, env_key)
-        state = (
-            os.path.expandvars(os.path.expanduser(raw)) if raw
-            else os.path.expanduser(f"~/.local/state/{dirname}-{name}")
-        )
+        raw = _deployment_env_field(name, env_key)
+        if raw:
+            state = os.path.expandvars(os.path.expanduser(raw))
+        elif repo:
+            # A hand-written overlay with REPO but no explicit state-dir keys:
+            # the daemons fall back to config.default_state_dir, NOT to the
+            # synth `<role>-<name>` layout — deriving anything else here reads
+            # empty journals forever while SQLite spend accrues (keifu
+            # 2026-08-02: dashboard showed $0.57 settled with "no runs").
+            state = config_default_state_dir(repo, dirname)
+        else:
+            state = os.path.expanduser(f"~/.local/state/{dirname}-{name}")
         paths.append(os.path.join(state, "journal.jsonl"))
     return paths
 

@@ -220,7 +220,7 @@ def result_to_agent_result(msg: Any) -> AgentResult:
     needs = ""
     if isinstance(structured, dict):
         summary = structured.get("summary", "") or (getattr(msg, "result", "") or "")
-        needs = structured.get("needs", "")
+        needs = structured.get("needs") or ""
     else:
         summary = getattr(msg, "result", "") or ""
     is_error = bool(getattr(msg, "is_error", True)) or status == "error"

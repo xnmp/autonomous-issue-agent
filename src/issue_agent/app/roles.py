@@ -86,7 +86,8 @@ from ..domain.triage import (
 )
 from ..domain.jira import jira_phase, jira_sync_needed
 from ..domain.actions import AgentKind, Relabel, RunAgent, Target
-from ..adapters.runtime_plan import AgentRuntime
+from ..adapters.runtime_plan import AgentRuntime, RuntimePlan
+from ..domain.outcome import AgentResult
 from ..domain.agent_task import RuntimeName
 from ..domain.contracts import BudgetScope, Money
 from ..domain.pricing import (
@@ -119,7 +120,12 @@ from ..domain.ports import (
     RecentMergesReads,
     SpendReconciler,
 )
-from .config import CodexRuntimeConfig, HarnessConfig, ReviewRuntimeConfig
+from .config import (
+    CodexRuntimeConfig,
+    HarnessConfig,
+    ReviewRuntimeConfig,
+    StewardRuntimeConfig,
+)
 from .dispatch import AgentDispatcher, DispatchConfig
 from .execute import Executor
 from .loop import Daemon
@@ -1269,6 +1275,148 @@ _SUPPORTED_REVIEW_RUNTIMES = frozenset(
 )
 if frozenset(_REVIEW_RUNTIME_REGISTRY) != _SUPPORTED_REVIEW_RUNTIMES:
     raise RuntimeError("review runtime registry is not exhaustive")
+
+
+@dataclass(frozen=True)
+class _UnavailableRuntime(AgentRuntime):
+    """A runtime that cannot be reached, and refuses instead of improvising.
+
+    A misconfigured Codex binding used to hand back the BARE runner: the leg
+    then ran with no CODEX_HOME, no generated PreToolUse hook, and whatever
+    `~/.codex/config.toml` the operator happens to have — a paid, UNGOVERNED
+    leg. Refusing is the only safe terminal state, and it is loud: the same
+    shape `HookPreparingRuntime` already uses for a plan with no cwd.
+    """
+
+    reason: str
+
+    async def run(self, task: RuntimePlan) -> AgentResult:
+        raise RuntimeError(self.reason)
+
+
+@dataclass(frozen=True)
+class _StewardRuntimeBinding:
+    runner: AgentRuntime
+    # Checkout the TRIAGE/GROOM legs execute in. "" means "leave the plan's cwd
+    # unset", which is what the Claude path has always done (main.py has already
+    # chdir'd the daemon into TARGET_DIR).
+    execution_cwd: str = ""
+    # Whether this binding can actually reach a GOVERNED runtime. False disarms
+    # every steward capability at build time, so the daemon neither decides nor
+    # dispatches paid work it cannot contain.
+    ready: bool = True
+
+
+def _bind_claude_steward_runtime(
+    _cfg: HarnessConfig,
+    _runtime_config: StewardRuntimeConfig,
+    runner: AgentRuntime,
+) -> _StewardRuntimeBinding:
+    return _StewardRuntimeBinding(runner)
+
+
+def _bind_codex_steward_runtime(
+    cfg: HarnessConfig,
+    runtime_config: StewardRuntimeConfig,
+    _runner: AgentRuntime,
+) -> _StewardRuntimeBinding:
+    """Triage/groom on Codex: read-only, same containment as a Codex review.
+
+    Triage and grooming are classification legs that read the checkout and
+    return JSON; they never edit. So the capability boundary is the reviewer's,
+    not the fixer's — read-only sandbox, no resume, hook-declared containment.
+    """
+    from ..adapters.codex_hook import HookPreparingRuntime, write_hook_config
+    from ..adapters.codex_runner import (
+        codex_budget_not_enforced_warning,
+        codex_cost_blindspot_warning,
+    )
+
+    log = _log("steward")
+    runner = _build_codex_runner(
+        cfg,
+        default_model=runtime_config.triage_model,
+        sandbox="read-only",
+        inject_system_prompt=True,
+        resume_on_retry=False,
+        leg_role="steward",
+        log=log,
+        state_dir=cfg.steward_state_dir,
+    )
+    reason = runner.preflight()
+    log(
+        f"codex: NOT READY at startup — {reason}"
+        if reason is not None
+        else "codex: runtime ready (bin + key present)"
+    )
+    blindspot = codex_cost_blindspot_warning(
+        cost_per_mtok_in=cfg.codex_runtime.cost_per_mtok_in,
+        cost_per_mtok_out=cfg.codex_runtime.cost_per_mtok_out,
+        issue_spend_cap_usd=cfg.issue_spend_cap_usd,
+        daily_spend_cap_usd=cfg.daily_spend_cap_usd,
+        max_runtime=cfg.codex_runtime.max_runtime,
+        runtime_name="STEWARD_RUNTIME",
+        unpriced_cached_models=cfg.codex_runtime.unpriced_cached_models,
+    )
+    if blindspot is not None:
+        log(blindspot)
+    budget_notice = codex_budget_not_enforced_warning(
+        fix_budget_usd=runtime_config.triage_budget_usd,
+        max_runtime=cfg.codex_runtime.max_runtime,
+        enforced=cfg.codex_runtime.enforce_budget,
+        priced=cfg.codex_runtime.budget_priceable,
+        pricing_gap=cfg.codex_runtime.budget_pricing_gap,
+        budget_name="STEWARD_TRIAGE_BUDGET_USD",
+        runtime_name="STEWARD_RUNTIME",
+    )
+    if budget_notice is not None:
+        log(budget_notice)
+    # An absent OR mis-typed TARGET_DIR both mean "no checkout to contain the
+    # leg in". Checking existence here makes a typo fail once at boot instead of
+    # once per paid dispatch.
+    execution_cwd = cfg.target_dir
+    if not execution_cwd or not os.path.isdir(execution_cwd):
+        detail = (
+            "TARGET_DIR is unset" if not execution_cwd
+            else f"TARGET_DIR {execution_cwd!r} is not a directory"
+        )
+        reason = (
+            "STEWARD_RUNTIME=codex requires TARGET_DIR so its read-only "
+            f"governor has an explicit checkout — {detail}"
+        )
+        log(f"codex: NOT READY at startup — {reason}")
+        return _StewardRuntimeBinding(_UnavailableRuntime(reason), ready=False)
+    prepare_cwd = partial(
+        write_hook_config,
+        review_only=True,
+        base_branch=cfg.base_branch,
+        repository=cfg.repo,
+        log=log,
+        state_dir=cfg.steward_state_dir,
+        auth_file=runner.oauth_auth_file(),
+    )
+    return _StewardRuntimeBinding(
+        HookPreparingRuntime(runner, prepare_cwd),
+        execution_cwd,
+    )
+
+
+_STEWARD_RUNTIME_REGISTRY: Mapping[
+    RuntimeName,
+    Callable[
+        [HarnessConfig, StewardRuntimeConfig, AgentRuntime],
+        _StewardRuntimeBinding,
+    ],
+] = {
+    RuntimeName.CLAUDE: _bind_claude_steward_runtime,
+    RuntimeName.CODEX: _bind_codex_steward_runtime,
+}
+
+_SUPPORTED_STEWARD_RUNTIMES = frozenset(
+    {RuntimeName.CLAUDE, RuntimeName.CODEX}
+)
+if frozenset(_STEWARD_RUNTIME_REGISTRY) != _SUPPORTED_STEWARD_RUNTIMES:
+    raise RuntimeError("steward runtime registry is not exhaustive")
 
 
 def _inject_predicted_paths(store: Store, world):
@@ -2448,18 +2596,40 @@ def build_steward_daemon(
         _journal(store), cfg, "steward", store.state_dir
     )
     steward_runtime = cfg.steward_runtime
+    binding = _STEWARD_RUNTIME_REGISTRY[steward_runtime.runtime](
+        cfg, steward_runtime, runner
+    )
+    steward_runner = binding.runner
+    leg_cwd = binding.execution_cwd or None
+    # A binding that cannot reach a governed runtime disarms every capability
+    # here, at build time. `ready` used to inform only the capability LOG line
+    # while `decide` kept emitting TRIAGE/GROOM — so the daemon announced
+    # triage=off and then dispatched paid, ungoverned legs anyway.
+    groom_enabled = cfg.steward_groom and binding.ready
     jira_runtime = cfg.jira_runtime
     tcfg_dom = TriageConfig(
-        steward_bot=steward_runtime.bot, enabled=steward_runtime.triage_enabled,
+        steward_bot=steward_runtime.bot,
+        enabled=steward_runtime.triage_enabled and binding.ready,
         promote=steward_runtime.promote, triage_label=Label.AI_TRIAGE,
         owner_handle=_resolve_owner_handle(cfg, steward_log),
     )
     # Jira mirror: enabled by default, but INERT without a project key (so it's safe
     # out of the box). The Atlassian MCP spec is loaded from cfg.jira_mcp_config and
     # attached only to the steward's jira-sync task.
-    jira_on = jira_runtime.sync and bool(jira_runtime.project_key)
+    jira_on = jira_runtime.sync and bool(jira_runtime.project_key) and binding.ready
     if jira_runtime.sync and not jira_runtime.project_key:
         steward_log("JIRA_SYNC is on but JIRA_PROJECT_KEY is unset — Jira sync inert")
+    if jira_on and steward_runtime.runtime is not RuntimeName.CLAUDE:
+        # The Codex adapter has no MCP transport at all, so a jira-sync leg
+        # dispatched there would run WITHOUT the Atlassian server and either
+        # hallucinate a ticket key or burn a paid leg returning nothing. Inert
+        # and loud beats silently unattached (the #12 silent-knob class).
+        steward_log(
+            f"JIRA_SYNC is on but STEWARD_RUNTIME="
+            f"{steward_runtime.runtime.value} has no MCP transport — Jira sync "
+            "inert. Set STEWARD_RUNTIME=claude to mirror issues into Jira."
+        )
+        jira_on = False
     jira_cfg = None
     if jira_on:
         mcp = mcp_servers_from_file(
@@ -2484,11 +2654,12 @@ def build_steward_daemon(
         triage=TriageTaskConfig(
             steward_runtime.bot, steward_runtime.triage_prompt,
             steward_runtime.triage_budget_usd, steward_runtime.triage_model,
+            cwd=leg_cwd,
         ),
         groom=GroomTaskConfig(
             steward_runtime.bot, steward_runtime.triage_budget_usd,
-            steward_runtime.triage_model,
-        ) if cfg.steward_groom else None,
+            steward_runtime.triage_model, cwd=leg_cwd,
+        ) if groom_enabled else None,
         triage_cfg=tcfg_dom,
         jira=jira_cfg,
         log=steward_log,
@@ -2526,12 +2697,17 @@ def build_steward_daemon(
         dcfg, gateway, store, None,
         JournalingRuntime(
             _with_accounting(
-                runner, control, cfg, "steward", "claude", journal
+                steward_runner,
+                control,
+                cfg,
+                "steward",
+                steward_runtime.runtime.value,
+                journal,
             ),
             journal,
             repo=cfg.repo,
             role="steward",
-            runtime="claude",
+            runtime=steward_runtime.runtime.value,
             state_dir=cfg.steward_state_dir,
         ),
         executor,
@@ -2565,7 +2741,7 @@ def build_steward_daemon(
     # and recurrence watching needs a FIX_BOT to attribute merged PRs to.
     steward_log(steward_capability_line(
         triage=tcfg_dom.enabled,
-        groom=cfg.steward_groom,
+        groom=groom_enabled,
         promote=tcfg_dom.promote,
         jira_sync=jira_on,
         recurrence=bool(cfg.fix_runtime.bot)
@@ -2599,7 +2775,7 @@ def build_steward_daemon(
             for n in grooming_candidates(
                 world,
                 {i.number: store.get_groom_at(i.number) for i in world.issues},
-                cfg.steward_groom,
+                groom_enabled,
                 {i.number: store.get_groom_content(i.number) for i in world.issues},
             )
             if not exhausted(n)

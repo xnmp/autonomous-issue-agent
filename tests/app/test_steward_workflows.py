@@ -300,6 +300,51 @@ def test_grooming_flags_a_resolved_open_issue_once_and_never_closes_it(tmp_path)
     assert store.groom_at[9] == "after"
 
 
+def test_an_all_null_grooming_verdict_is_exactly_no_finding(tmp_path):
+    """Under codex's strict structured output an optional field arrives as an
+    explicit JSON null, never absent. Null must read as "nothing found" — the
+    same as absent — or the runtime switch alone starts posting advisory
+    comments on issues nothing was found for."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    gw = RecurrenceGateway(
+        {9: IssueView(9, title="Old crash", body="b", author="alice")},
+        merged=(_Merged(42, 300),),
+    )
+    cfg = StewardWorkflowConfig(
+        triage=TriageTaskConfig("steward-bot"), triage_cfg=TriageConfig("steward-bot"),
+        groom=GroomTaskConfig("steward-bot"), log=lambda _m: None,
+        fix_bot="fix-bot", repo="o/r", journal=journal,
+    )
+    runner = FakeRunner(AgentResult(
+        is_error=False,
+        structured={"resolved_by": None, "stale_reference": None},
+    ))
+    workflow = StewardWorkflow(cfg, gw, FakeStore(), runner,
+                               Executor(gw, remove_worktree=FakeWorktrees().remove))
+
+    asyncio.run(workflow.groom(9))
+
+    assert not any(call[0] in ("comment", "relabel", "close") for call in gw.calls)
+    assert [e for e in read_events(journal.path) if e.get("event") == "groomed"] == []
+
+
+def test_a_null_recurrence_of_labels_nothing(tmp_path):
+    """Same rule on the triage side: `recurrence_of: null` is not a claim."""
+    gw = RecurrenceGateway(
+        {9: IssueView(9, title="t", body="b", author="alice")},
+        merged=(_Merged(42, 300),),
+    )
+    runner = FakeRunner(AgentResult(is_error=False, structured={
+        "verdict": "ready", "plain_summary": "s", "acceptance_criteria": ["a"],
+        "creator_questions": [], "owner_questions": [], "recurrence_of": None,
+        "rationale": None, "blocked_by_issues": None,
+    }))
+
+    _run(gw, _recurrence_cfg(), runner)
+
+    assert not any(c[0] == "relabel" and c[4] == "recurrence" for c in gw.calls)
+
+
 def test_grooming_stale_artifact_posts_a_rescope_comment_and_journals(tmp_path):
     journal = Journal(str(tmp_path / "journal.jsonl"))
     gw = RecurrenceGateway({9: IssueView(9, title="Old flag", body="mentions src/removed.py", author="alice")})
