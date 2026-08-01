@@ -23,6 +23,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -870,6 +871,10 @@ def _role_pids(name: str) -> dict[str, list[int]]:
 
 
 # ── subcommand implementations ────────────────────────────────────────────────
+# NixOS has no /bin/bash: resolve the interpreter from PATH once.
+_BASH = shutil.which("bash") or "/bin/bash"
+
+
 def _bin(script: str) -> str:
     return os.path.join(HARNESS_ROOT, "bin", script)
 
@@ -1060,7 +1065,7 @@ def cmd_start(args) -> int:
         env["ISSUE_AGENT_MAX_TICKS"] = str(args.max_ticks)
     info(f"delegating to bin/point-at.sh {name}")
     # exec — hand over the terminal (Ctrl-C trap, log tail live in point-at.sh).
-    os.execve("/bin/bash", ["/bin/bash", _bin("point-at.sh"), name], env)
+    os.execve(_BASH, [_BASH, _bin("point-at.sh"), name], env)
 
 
 def cmd_stop(args) -> int:
@@ -1515,7 +1520,7 @@ def cmd_doctor(args) -> int:
     env = dict(os.environ)
     overlay = os.path.join(REPOS_DIR, f"{name}.env")
     if os.path.isfile(SHARED_ENV) and os.path.isfile(overlay):
-        r = subprocess.run(["/bin/bash", _bin("compose-env.sh"), name])
+        r = subprocess.run([_BASH, _bin("compose-env.sh"), name])
         if r.returncode == 0:
             env["AGENT_ENV"] = _active_env_path(name)
     elif os.path.isfile(SHARED_ENV):
@@ -1538,7 +1543,7 @@ def cmd_doctor(args) -> int:
         warn(f"no overlay config/repos/{name}.env yet — checking config/shared.env "
              f"against the detected repo. `issue-agent start` writes the overlay "
              f"(TEST_CMD, BASE_BRANCH, state dirs); re-run doctor after that.")
-    return subprocess.run(["/bin/bash", _bin("doctor.sh")], env=env).returncode
+    return subprocess.run([_BASH, _bin("doctor.sh")], env=env).returncode
 
 
 def _label_issues(args, label: str) -> int:
@@ -1688,7 +1693,7 @@ def cmd_install_service(args) -> int:
     # service unit got installed pointing AGENT_ENV at a STALE or missing
     # the composed active env (whatever a prior successful compose left behind, or
     # nothing). Fail loud and abort instead of installing against unknown env.
-    r = subprocess.run(["/bin/bash", _bin("compose-env.sh"), name])
+    r = subprocess.run([_BASH, _bin("compose-env.sh"), name])
     if r.returncode != 0:
         err(f"compose-env.sh failed (exit {r.returncode}) — not installing the "
             f"service against a stale/missing config/.active.{name}.env.")
@@ -1699,14 +1704,14 @@ def cmd_install_service(args) -> int:
         ISSUE_AGENT_DEPLOYMENT_ID=name,
     )
     script = "install-launchd.sh" if sys.platform == "darwin" else "install-systemd.sh"
-    cmd = ["/bin/bash", _bin(script)]
+    cmd = [_BASH, _bin(script)]
     return subprocess.run(cmd, env=env).returncode
 
 
 def cmd_uninstall_service(args) -> int:
     script = "install-launchd.sh" if sys.platform == "darwin" else "install-systemd.sh"
     if args.all:
-        return subprocess.run(["/bin/bash", _bin(script), "uninstall"]).returncode
+        return subprocess.run([_BASH, _bin(script), "uninstall"]).returncode
 
     repo, target_dir, name = _resolve_context(args)
     mismatch = check_overlay_mismatch(name, repo, target_dir)
@@ -1724,7 +1729,7 @@ def cmd_uninstall_service(args) -> int:
             "deployment; use --all only when removing every deployment"
         )
         return 2
-    composed = subprocess.run(["/bin/bash", _bin("compose-env.sh"), name])
+    composed = subprocess.run([_BASH, _bin("compose-env.sh"), name])
     if composed.returncode != 0:
         err(
             f"compose-env.sh failed (exit {composed.returncode}) — refusing "
@@ -1737,7 +1742,7 @@ def cmd_uninstall_service(args) -> int:
         ISSUE_AGENT_DEPLOYMENT_ID=name,
     )
     return subprocess.run(
-        ["/bin/bash", _bin(script), "uninstall", name],
+        [_BASH, _bin(script), "uninstall", name],
         env=env,
     ).returncode
 

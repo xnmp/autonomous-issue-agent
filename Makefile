@@ -1,5 +1,6 @@
 # Autonomous Issue Agent — operator entry points.
-SHELL := /bin/bash
+# No slash: GNU make resolves via PATH (NixOS has no /bin/bash).
+SHELL := bash
 HARNESS_ROOT := $(shell pwd)
 
 .PHONY: help test test-config-generated test-governor test-residuals test-hooks test-deployment-env test-point-at test-domain test-adapters test-app test-parity arch typecheck doctor dashboard-ui \

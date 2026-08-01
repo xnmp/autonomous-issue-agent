@@ -1292,7 +1292,7 @@ def test_uninstall_service_all_is_explicit_and_unscoped(monkeypatch) -> None:
     assert cli.cmd_uninstall_service(args) == 0
     assert calls == [
         [
-            "/bin/bash",
+            cli._BASH,
             cli._bin(
                 "install-launchd.sh"
                 if cli.sys.platform == "darwin"

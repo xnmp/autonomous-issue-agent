@@ -1,9 +1,21 @@
 import asyncio
 import os
+import shutil
 import stat
 import subprocess
 import tomllib
 from pathlib import Path
+
+
+def _system_bin_dirs() -> str:
+    # /bin has no bash on NixOS; resolve the real interpreter dirs so the
+    # scrubbed-PATH assertion tests governor behavior, not the host layout.
+    dirs = ["/usr/bin", "/bin"]
+    for tool in ("bash", "env"):
+        found = shutil.which(tool)
+        if found and os.path.dirname(found) not in dirs:
+            dirs.append(os.path.dirname(found))
+    return ":".join(dirs)
 
 from issue_agent.adapters.codex_hook import (
     HookPreparingRuntime,
@@ -68,7 +80,7 @@ def test_generated_governor_receives_operator_base_without_exporting_to_agent(
         input="{}",
         text=True,
         capture_output=True,
-        env={"PATH": f"{binaries}:/usr/bin:/bin"},
+        env={"PATH": f"{binaries}:{_system_bin_dirs()}"},
         check=False,
     )
 

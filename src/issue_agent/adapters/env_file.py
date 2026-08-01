@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
 from collections.abc import Mapping
 
@@ -46,10 +47,16 @@ def source_env_file(
             [
                 "bash",
                 "-c",
-                'set -a; source "$1"; set +a; env -0',
+                'set -a; source "$1"; set +a; exec "$2" -0',
                 "issue-agent-env",
                 "/dev/stdin" if normalize_spacing else path,
+                # env(1) resolved from OUR PATH: `inherited` may carry no
+                # PATH, and bash's fallback path has no env on NixOS.
+                shutil.which("env") or "env",
             ],
+            # Same for bash itself (argv[0] stays "bash" for callers/tests
+            # that key on it; executable= only overrides the binary).
+            executable=shutil.which("bash"),
             env=dict(inherited),
             input=raw.encode() if normalize_spacing else None,
             check=True,
