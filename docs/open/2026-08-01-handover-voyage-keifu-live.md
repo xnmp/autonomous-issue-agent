@@ -55,10 +55,35 @@ issues that arise, keep the dashboard truthful, report findings.
 - `995108b` REPO baked into generated codex gov.sh (agent env is
   allowlist-scrubbed, so 0d2e295's env lookup never fired on codex).
 
-**PENDING: adversarial review of `0d2e295` is running in a background
-subagent** (review-checkout races, _same_repository spoofing). Collect its
-findings and fix before treating that commit as final. All other commits
-were reviewed or are small+tested.
+**ADVERSARIAL REVIEW OF `0d2e295` RETURNED FAIL — fix these FIRST next
+session (full report: the review agent's output, reproduced here):**
+
+- **H1 (data-loss hazard, live now):** `ReviewCheckouts.ensure()` enters the
+  reuse branch on `isdir()` alone. If `review-pr-N` exists as a plain
+  UNREGISTERED dir (partial remove; fix-daemon `worktree prune` racing an
+  add), git discovers the PARENT repo → `reset --hard`/`clean -fd` hit the
+  operator's live checkout, and the `rev-parse` confirmation passes because
+  the parent's HEAD was just moved. Fix: verify `git rev-parse
+  --show-toplevel` == abs_path (or worktree list registration) before
+  mutating; check checkout/reset exit codes. Until fixed, the hazard needs
+  an unusual precondition (stale plain dir) — none exists right now — but
+  do not leave the daemons unattended for long.
+- **H2:** missing-but-registered worktree → `worktree add` fails forever →
+  permanent deferral. Prune (or `add -f`) inside ensure() before giving up.
+- **H3:** pin-failure deferrals call `_no_progress` → counted as PAID
+  unproductive rounds → 5 free deferrals escalate the PR to
+  needs-human-review. Deferral must not feed that counter.
+- **M1:** pinning is inert for Claude reviewers (execution_cwd only set by
+  the codex binding) — multi/delegated modes still run in the live checkout;
+  the multi-mode head_sha threading is currently dead code.
+- **M2:** empty `head_ref_oid` silently skips pinning instead of deferring;
+  make head_sha required.
+- **M3:** already fixed by `995108b` (REPO baked into gov.sh).
+- Low: `review-pr-*` worktrees leak on non-settled paths (no boot
+  reaper/SIGTERM cleanup); ensure() is sync inside a coroutine (300s×5
+  worst-case stall); `_same_repository` has NO spoofing bypass (verified).
+
+All other commits were reviewed or are small+tested.
 
 ## Known open items / next steps
 
