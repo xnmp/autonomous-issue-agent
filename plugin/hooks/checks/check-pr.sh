@@ -155,6 +155,7 @@ esac
 # ── 6/7/7b. Commit hygiene + evidence + test-immutability (shared, state-derived) ─
 prc_check_commit_log
 prc_check_no_evidence "$changed"
+prc_check_no_harness_state "$changed"
 prc_check_no_generated_instructions "$changed"
 prc_check_tests_immutable "$changed"
 

@@ -235,6 +235,17 @@ prc_check_no_evidence() {  # prc_check_no_evidence "<changed-file-list>"
   return 0
 }
 
+# .harness/ is harness-local control state and must never become repo content:
+# a committed .harness/test-cmd (keifu #167 → #156, 2026-08-01) retargeted the
+# trusted red-fail gate for EVERY downstream worktree to another issue's test.
+prc_check_no_harness_state() {  # prc_check_no_harness_state "<changed-file-list>"
+  local bad
+  bad=$(printf '%s\n' "$1" | grep -E '^\.harness(/|$)' || true)
+  [ -z "$bad" ] \
+    || fail ".harness/ files are harness-local control state and are never committed — remove from the diff (git rm --cached): $bad"
+  return 0
+}
+
 # Harness scaffolding may share a filename with a target's tracked instructions.
 # Reject only our marker, leaving legitimate target-owned AGENTS*.md edits valid.
 prc_check_no_generated_instructions() {  # "<changed-file-list>"

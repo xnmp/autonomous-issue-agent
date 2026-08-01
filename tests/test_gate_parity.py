@@ -391,6 +391,18 @@ def _non_image_evidence_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def _committed_harness_state_repo(tmp_path: Path) -> Path:
+    """Keifu #167→#156: a committed .harness/test-cmd retargets the trusted
+    gate for every downstream worktree — harness control state in the diff
+    must deny on both stacks."""
+    repo = compliant_pr_repo(tmp_path)
+    (repo / ".harness").mkdir(exist_ok=True)
+    (repo / ".harness" / "test-cmd").write_text("cargo test one_single_test\n")
+    _git(repo, "add", "-f", ".harness/test-cmd")
+    _git(repo, "commit", "-qm", "chore: oops harness marker")
+    return repo
+
+
 def _read_screenshot_repo(tmp_path: Path) -> Path:
     repo = _visual_repo(tmp_path)
     commit_evidence(repo, "evidence/ac-1.png")
@@ -451,6 +463,8 @@ GOLDEN: tuple[Case, ...] = (
     # ── evidence rules (§7/§7d) ──────────────────────────────────────────────
     Case("non_image_evidence", "pr", _non_image_evidence_repo, _pr_argv(), False,
          reason_contains="evidence/"),
+    Case("committed_harness_state", "pr", _committed_harness_state_repo,
+         _pr_argv(), False, reason_contains=".harness/"),
     Case("visual_ac_without_screenshot", "pr", _visual_repo, _pr_argv(), False,
          reason_contains="no screenshot is committed"),
     Case(
@@ -634,6 +648,7 @@ def test_golden_covers_every_rule_family() -> None:
         "base_advanced_pr": "base-range", "base_advanced_push": "base-range",
         "base_advanced_branch_still_checked": "base-range",
         "non_image_evidence": "evidence",
+        "committed_harness_state": "evidence",
         "visual_ac_without_screenshot": "evidence",
         "visual_ac_with_read_screenshot": "evidence",
         "visual_ac_with_forged_worktree_receipt": "evidence",

@@ -14,6 +14,7 @@ from issue_agent.domain.gate import (
     commit_phase,
     check_commit_order,
     check_no_evidence,
+    check_no_harness_state,
     check_no_web,
     check_visual_evidence,
     count_ac_items,
@@ -203,6 +204,21 @@ def test_evidence_image_may_be_committed():
     assert check_no_evidence(["evidence/shot.png"]).ok
     assert check_no_evidence(["evidence/ui/tab-title.PNG"]).ok
     assert check_no_evidence(["evidence/a.jpg", "src/x.ts"]).ok
+
+
+def test_harness_control_files_are_never_committed():
+    """Keifu #167→#156 (2026-08-01): a committed .harness/test-cmd merged into
+    the base and retargeted the trusted red-fail gate for EVERY downstream
+    worktree to another issue's single test — the gate then rejected an
+    unrelated PR as tautological. Harness-local control state must never be
+    repo content, in any diff."""
+    assert not check_no_harness_state([".harness/test-cmd"]).ok
+    assert not check_no_harness_state(["src/x.py", ".harness/visual-ac"]).ok
+    assert not check_no_harness_state([".harness"]).ok
+    assert check_no_harness_state(["src/x.py", "tests/x_test.py"]).ok
+    # A target repo may legitimately have a similarly named NON-dot path.
+    assert check_no_harness_state(["harness/README.md"]).ok
+    assert check_no_harness_state(["docs/.harness-notes.md"]).ok
 
 
 # ── visual evidence (screenshot captured + read) ──────────────────────────────

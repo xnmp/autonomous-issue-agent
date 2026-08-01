@@ -431,6 +431,7 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
         lambda: gate.check_required_test(ctx.branch, ctx.changed_files),
         lambda: gate.check_commit_log(ctx.branch_subjects),
         lambda: gate.check_no_evidence(ctx.changed_files),
+        lambda: gate.check_no_harness_state(ctx.changed_files),
         lambda: gate.check_tests_immutable(ctx.changed_files, ctx.exists_at_base),
         # §9 — ported from bash in wave P1-2 (review M6). Cheap only in the sense
         # that matters here (no test run), but it does touch the filesystem, so
@@ -511,6 +512,7 @@ def _push_gate_for_branch(branch: str, ctx: GateContext) -> list[str]:
     cheap_checks: tuple[Callable[[], gate.GateResult], ...] = (
         lambda: gate.check_commit_log(ctx.branch_subjects),
         lambda: gate.check_no_evidence(ctx.changed_files),
+        lambda: gate.check_no_harness_state(ctx.changed_files),
         lambda: gate.check_tests_immutable(ctx.changed_files, ctx.exists_at_base),
     )
     for check in cheap_checks:

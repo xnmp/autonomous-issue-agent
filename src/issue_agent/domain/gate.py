@@ -336,6 +336,25 @@ def check_no_evidence(changed: Iterable[str]) -> GateResult:
     return ALLOW
 
 
+def check_no_harness_state(changed: Iterable[str]) -> GateResult:
+    """.harness/ is harness-local control state and must NEVER become repo
+    content. Keifu #156 (2026-08-01): PR #167 committed its issue-scoped
+    `.harness/test-cmd`; once merged, every downstream worktree inherited a
+    trusted-gate test command pinned to ANOTHER issue's single test, making
+    the red-fail revert check vacuous repo-wide (a later PR was rejected as
+    tautological because the gate ran the wrong issue's test). A committed
+    marker is also an agent-writable input to the gate's own teeth — the
+    exact channel P1R-18 closes for the env override."""
+    for f in changed:
+        if f == ".harness" or f.startswith(".harness/"):
+            return deny(
+                f"'{f}' is harness-local control state — .harness/ files are "
+                "never committed; remove it from the diff (git rm --cached) "
+                "and keep it gitignored"
+            )
+    return ALLOW
+
+
 def check_visual_evidence(
     visual_ac: bool,
     changed: Iterable[str],
