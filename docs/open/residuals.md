@@ -91,6 +91,7 @@ self-authored issue.
 | `git -C /other/worktree push` is gated against *this* worktree's state | The destination branch is now correct (P1R-10); per-cwd context is a larger change | rare; documented in `_push_gate` |
 | `resolve_test_cmd` prefers operator `TEST_CMD`; the agent's `.harness/test-cmd` is the fallback | P1R-18 — the gated subject must not choose the gate's teeth | a monorepo's scoped command is ignored when `TEST_CMD` is set |
 | A human closing a PR unmerged leaves `resolve-retries` standing, which now also pins every later resolve to a pricier tier (#16) | `clear_issue_resume_state` keeps the counter deliberately — "fewer retries after a human closed the PR" — and the escalation ladder reads the same counter. The evidence is honest (an attempt did complete and did not ship); the cost consequence was decided for the retry budget, not for routing | an issue a human bounced resolves at a higher tier/effort until it merges; clear `<STATE_DIR>/issue-N.resolve-retries` to reset |
+| `update_branch` can report failure for an update that landed: GitHub's update-branch is async, and `is_branch_updated` verifies before the ref moves (observed live on keifu #166, 2026-08-01 — "did not land" logged, merge commit already on the branch) | The marker semantics are safe either way (the attempt was made; a genuine failure re-arms on the next base advance), and tightening would mean polling inside the executor | the `branch_refresh` telemetry event says `ok=false` for a successful update; read it as "attempted", not as ground truth |
 
 ---
 
