@@ -73,11 +73,20 @@ def _gov_script(
     governor_path: str,
     review_only: bool = False,
     base_branch: str = "",
+    repository: str = "",
 ) -> str:
     gate_base = (
         f"export BASE_BRANCH={shlex.quote(base_branch)}"
         if base_branch
         else ""
+    )
+    # The agent env is allowlist-scrubbed (child_env), so the governor cannot
+    # read the deployment repo from ambient env — bake it into the generated
+    # hook, where the daemon's authority already writes BASE_BRANCH. Without
+    # it the own-repo `--repo` comment form stays denied (keifu #156/#158,
+    # 2026-08-01).
+    gate_repo = (
+        f"export REPO={shlex.quote(repository)}" if repository else ""
     )
     return f"""#!/usr/bin/env bash
 # Codex PreToolUse hook → harness governor (auto-generated; do not edit).
@@ -88,6 +97,7 @@ fi
 {('export ISSUE_AGENT_REVIEW_READ_ONLY=1' if review_only else '')}
 # Gate-local operator authority: target commands never inherit BASE_BRANCH.
 {gate_base}
+{gate_repo}
 # Codex PostToolUse executes inside the paid child and cannot mint trusted
 # visual evidence. Remove an ambient/exported path on every governed command.
 unset HARNESS_SCREENSHOTS_READ
@@ -175,6 +185,7 @@ def write_hook_config(
     edit_check_cmd: str = "",
     review_only: bool = False,
     base_branch: str = "",
+    repository: str = "",
     log: Callable[[str], None] | None = None,
     state_dir: str = "",
     auth_file: str = "",
@@ -198,7 +209,7 @@ def write_hook_config(
 
     gov_script_path = os.path.join(hooks_dir, "gov.sh")
     with open(gov_script_path, "w") as f:
-        f.write(_gov_script(governor_path, review_only, base_branch))
+        f.write(_gov_script(governor_path, review_only, base_branch, repository))
     os.chmod(
         gov_script_path,
         os.stat(gov_script_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH,

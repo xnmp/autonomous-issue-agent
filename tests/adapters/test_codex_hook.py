@@ -3,6 +3,7 @@ import os
 import stat
 import subprocess
 import tomllib
+from pathlib import Path
 
 from issue_agent.adapters.codex_hook import (
     HookPreparingRuntime,
@@ -261,3 +262,30 @@ def test_external_codex_home_links_login_without_copying_it_into_worktree(
 
     auth.write_text("rotated")
     assert open(linked).read() == "rotated"
+
+
+def test_gov_script_exports_the_deployment_repository(tmp_path):
+    """The agent env is allowlist-scrubbed, so the governor's own-repo
+    `--repo` comment allowance needs REPO baked into the generated hook
+    (keifu #156/#158, 2026-08-01)."""
+    config = write_hook_config(
+        str(tmp_path),
+        governor_path="/gov/bash_governor.py",
+        repository="xnmp/keifu",
+        state_dir=str(tmp_path / "state"),
+    )
+    gov = (
+        Path(config).parent / "hooks" / "gov.sh"
+    )
+    text = gov.read_text()
+    assert "export REPO=xnmp/keifu" in text
+
+
+def test_gov_script_omits_repo_export_when_unset(tmp_path):
+    config = write_hook_config(
+        str(tmp_path),
+        governor_path="/gov/bash_governor.py",
+        state_dir=str(tmp_path / "state"),
+    )
+    text = (Path(config).parent / "hooks" / "gov.sh").read_text()
+    assert "export REPO=" not in text
