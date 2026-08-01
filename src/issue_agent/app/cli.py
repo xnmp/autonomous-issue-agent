@@ -19,6 +19,7 @@ resolve_name, synth_repo_env) are unit-tested with no git/network.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import re
@@ -27,7 +28,9 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
+from collections import Counter
 from dataclasses import dataclass
 
 from ..adapters.env_file import source_env_file
@@ -105,7 +108,7 @@ def parse_remote_url(url: str) -> str:
 # elsewhere in this module.
 _OVERLAY_FIELDS = (
     "REPO", "TARGET_DIR", "STATE_DIR", "REVIEW_STATE_DIR", "STEWARD_STATE_DIR",
-    "TEST_CMD", "DAILY_SPEND_CAP_USD", "GLOBAL_DAILY_SPEND_CAP_USD",
+    "TEST_CMD", "BASE_BRANCH", "DAILY_SPEND_CAP_USD", "GLOBAL_DAILY_SPEND_CAP_USD",
     "FIXER_RUNTIME", "REVIEWER_RUNTIME", "REVIEW_MODE",
     REPOINT_HISTORY_ENV,
 )
@@ -161,6 +164,13 @@ def canonical_deployment_name(value: str) -> str:
 
 
 def _deployment_name_arg(value: str) -> str:
+    # argparse runs `type` over a STRING default too, so the "" default of every
+    # --name flag reached this and canonicalised to "target" — which is not equal
+    # to "", so `issue-agent start` (and status/stop/doctor) with no --name died
+    # in the parser before any command ran. "" means "no name given"; only a real
+    # answer is validated.
+    if not value:
+        return ""
     canonical = canonical_deployment_name(value)
     if value != canonical:
         raise argparse.ArgumentTypeError(
@@ -404,7 +414,13 @@ def synth_repo_env(
     target_dir: str,
     name: str,
     base_branch: str = "dev",
+    base_branch_note: str = "",
+    base_branch_suggestion: str = "",
+    suggestions: tuple[tuple[str, str], ...] = (),
     test_cmd: str = "",
+    lint_cmd: str = "",
+    typecheck_cmd: str = "",
+    gate_test_failure_exit_codes: str = "",
     edit_check_cmd: str = "",
     review_mode: str = "",
     max_budget: str = "",
@@ -422,6 +438,15 @@ def synth_repo_env(
         "",
         f"REPO={_q(repo)}",
         f"TARGET_DIR={_q(target_dir)}",
+    ]
+    if base_branch_note:
+        lines.append(f"# BASE_BRANCH inferred from {base_branch_note}.")
+    if base_branch_suggestion:
+        lines.append(
+            f"# detected merge target of recent PRs: {base_branch_suggestion} — set "
+            "BASE_BRANCH explicitly to adopt it."
+        )
+    lines += [
         f"BASE_BRANCH={_q(base_branch)}",
         "",
         "# Isolated daemon state (keeps this deployment's state separate).",
@@ -438,6 +463,8 @@ def synth_repo_env(
         ]
     opt = [
         ("TEST_CMD", test_cmd),
+        ("LINT_CMD", lint_cmd),
+        ("TYPECHECK_CMD", typecheck_cmd),
         ("EDIT_CHECK_CMD", edit_check_cmd),
         ("REVIEW_MODE", review_mode),
         ("MAX_BUDGET_USD", max_budget),
@@ -448,6 +475,25 @@ def synth_repo_env(
         for key, value in opt:
             if value:
                 lines.append(f"{key}={_q(value)}")
+    if gate_test_failure_exit_codes:
+        lines += [
+            "",
+            "# Exit codes this toolchain uses for an ASSERTION failure (trusted red);"
+            " any other non-zero is an infrastructure/build error.",
+            f"GATE_TEST_FAILURE_EXIT_CODES={_q(gate_test_failure_exit_codes)}",
+        ]
+    if suggestions:
+        # Detected, NOT applied. These commands block every commit once set, and
+        # their author here is a model, not the operator — so they stay inert
+        # until a human reads them (ADR 0012: a trusted gate input needs
+        # harness-side or operator provenance, and discovery has neither).
+        lines += [
+            "",
+            "# Detected but NOT applied — each of these BLOCKS every commit once",
+            "# set. Review, then uncomment to adopt.",
+        ]
+        for key, value in suggestions:
+            lines.append(f"# {key}={_q(value)}")
     if not test_cmd:
         # The tests gate is fail-CLOSED (check_tests): with no TEST_CMD and no
         # opt-out, every pr-create/push would be denied. A repo that genuinely
@@ -487,19 +533,323 @@ def detect_repo(cwd: str) -> str:
     return parse_remote_url(_run(["git", "remote", "get-url", "origin"], cwd=cwd))
 
 
-# ── test-command discovery (cheap LLM probe) ──────────────────────────────────
-# Signature files that tell us a test toolchain exists AT ALL. Cheap gate BEFORE
-# spending an LLM call: if none of these are anywhere in the tree, there are no
-# tests and we skip the probe (and the banner fires). Kept broad, not exhaustive
-# — the LLM does the precise read; this only decides "worth asking?".
-_TEST_SIGNS = (
+# ── identity detection + first-line token validation ──────────────────────────
+# Everything below mirrors doctor.sh's identity section (bin/doctor.sh) so `init`
+# cannot write a config doctor is guaranteed to redden. doctor stays the
+# authority: these checks are fail-OPEN, they only move the diagnosis earlier.
+# A GitHub login is [A-Za-z0-9-]; an App's bot account additionally carries a
+# literal `[bot]` suffix. Accepting that suffix (doctor.sh's charset filter does
+# not) is deliberate: rejecting it would fail a legitimate App identity, and it
+# still cannot admit gh's JSON error body, which is what the filter exists for.
+_LOGIN_CHARSET = re.compile(r"\A[A-Za-z0-9-]+(\[bot\])?\Z")
+# Ceiling on every operator re-prompt loop (ADR 0012): a wrong answer must not
+# be able to hold the wizard open forever.
+_PROMPT_ATTEMPTS = 3
+
+
+def normalize_login(login: str) -> str:
+    """doctor.sh `_normalize_login`: trim, lowercase, drop a trailing `[bot]`, so
+    `fix-bot` and `fix-bot[bot]` compare as the one identity they are."""
+    value = login.strip().lower()
+    suffix = "[bot]"
+    return value[: -len(suffix)] if value.endswith(suffix) else value
+
+
+def _gh_login(env: dict[str, str] | None = None, cwd: str | None = None) -> tuple[str, bool]:
+    """(login, gh_answered). gh prints its error BODY to stdout on a bad token, so
+    an unguarded capture reports `{ "message":` as a login — charset-validating
+    the first line (a GitHub login is [A-Za-z0-9-] only) both sanitises the value
+    and detects the failure.
+
+    `gh_answered` is False ONLY when the process could not be executed at all
+    (gh absent, or it hung until the timeout). A non-zero exit means gh ran and
+    GitHub said no, which is a verdict, not an outage — the distinction decides
+    whether an unproven token may be kept."""
+    try:
+        proc = subprocess.run(
+            ["gh", "api", "user", "--jq", ".login"],
+            cwd=cwd, env=env, capture_output=True, text=True, timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "", False
+    if proc.returncode != 0:
+        return "", True
+    first = (proc.stdout or "").strip().splitlines()[:1]
+    login = first[0].strip() if first else ""
+    # `--jq .login` prints a literal `null` when the field is absent, and `null`
+    # passes the charset filter — it would be compared as if it were an account.
+    if login == "null" or not _LOGIN_CHARSET.match(login):
+        return "", True
+    return login, True
+
+
+def detect_fixer_login(cwd: str | None = None) -> str:
+    """The ambient `gh` account the fixer will act as, or '' if gh is unusable."""
+    return _gh_login(cwd=cwd)[0]
+
+
+def gh_login_for_token(token: str) -> tuple[str, bool]:
+    """(login this token authenticates as, whether GitHub answered at all). The
+    token is passed only through the child env and is never printed or logged."""
+    if not token:
+        return "", True
+    env = dict(os.environ, GH_TOKEN=token, GITHUB_TOKEN=token)
+    return _gh_login(env=env)
+
+
+def read_token_input(raw: str) -> tuple[str, str]:
+    """Interpret a token answer as either the secret itself or a file holding it:
+    `@path`, or a bare path that exists. Returns (token, problem) — a problem is
+    an operator-facing message and never contains token material."""
+    value = raw.strip()
+    from_file = value.startswith("@")
+    if from_file:
+        value = value[1:].strip()
+    path = os.path.expanduser(value) if value else ""
+    if not (from_file or (path and os.path.isfile(path))):
+        return value, ""
+    # The message never repeats what was typed: an operator who pastes a token
+    # with a stray leading `@` would otherwise see the secret echoed back.
+    if not path or not os.path.isfile(path):
+        return "", "no file exists at the path you entered — re-enter the token, or @<path> to a readable file."
+    try:
+        with open(path) as handle:
+            return handle.read().strip(), ""
+    except OSError:
+        return "", "that token file could not be read (permissions or I/O) — re-enter the token, or @<path> to a readable file."
+
+
+def prompt_review_bot_token(review_bot: str, attempts: int = _PROMPT_ATTEMPTS) -> str:
+    """Ask for REVIEW_BOT_TOKEN and prove it authenticates AS `review_bot` before
+    it is written. doctor.sh only caught a mismatched/expired token post-hoc, by
+    which point the operator had already been told the config was good.
+
+    A token GitHub ANSWERED about and rejected — expired, or belonging to another
+    account — is never stored, at any exit from this loop. Storing one silently
+    installs whatever account it belongs to (typically the operator's own PAT) as
+    the reviewer identity: three-identity mode is defeated while every check
+    downstream still reads green. The only value kept unproven is one GitHub
+    could not be asked about at all (gh absent), and it is kept loudly."""
+    unproven = ""     # gh could not be run — keepable, doctor re-checks it
+    rejected = False  # gh answered and said no — never keepable
+    for attempt in range(1, attempts + 1):
+        try:
+            raw = getpass.getpass(
+                "  Reviewer token REVIEW_BOT_TOKEN (paste, or @path to a file; "
+                "Enter to skip): "
+            ).strip()
+        except EOFError:
+            raw = ""
+        if not raw:
+            if rejected or unproven:
+                warn(
+                    "no REVIEW_BOT_TOKEN stored — `issue-agent doctor` will flag the "
+                    "missing reviewer identity."
+                )
+            return ""
+        token, problem = read_token_input(raw)
+        if problem:
+            warn(problem)
+        else:
+            login, answered = gh_login_for_token(token)
+            if not answered:
+                unproven = token
+                warn(
+                    "could not run `gh` to validate that token — it would be stored "
+                    "unverified and `issue-agent doctor` must confirm it."
+                )
+            elif not login:
+                rejected = True
+                warn(
+                    "GitHub rejected that token — expired, revoked, or lacking "
+                    "read:user. It will NOT be stored."
+                )
+            elif normalize_login(login) != normalize_login(review_bot):
+                rejected = True
+                warn(
+                    f"that token belongs to '{login}', but REVIEW_BOT is "
+                    f"'{review_bot or 'unset'}' — GitHub 422s every approval when "
+                    "the reviewing account is not the one you configured. It will "
+                    "NOT be stored."
+                )
+            else:
+                ok(f"reviewer token authenticates as '{login}'")
+                return token
+        if attempt < attempts:
+            info(f"try again ({attempts - attempt} attempt(s) left).")
+    if rejected:
+        warn(
+            f"no REVIEW_BOT_TOKEN stored after {attempts} attempts: every token "
+            "offered was rejected by GitHub or belongs to another account, and "
+            "storing one would silently install that account as the reviewer."
+        )
+        return ""
+    if unproven:
+        warn(
+            f"keeping the last token UNVERIFIED after {attempts} attempts (gh could "
+            "not be run) — `issue-agent doctor` re-checks it and is the authority."
+        )
+    return unproven
+
+
+def detect_claude_auth() -> bool:
+    """Is a Claude credential present? Either the CLI's stored login or an API
+    key/token in the environment the daemons inherit."""
+    if os.path.isfile(os.path.expanduser("~/.claude/.credentials.json")):
+        return True
+    return bool(
+        os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    )
+
+
+def detect_codex_auth() -> tuple[bool, str]:
+    """(codex on PATH, auth mode). Mode is 'chatgpt', 'apikey', or '' when
+    unknown/unreadable. Only the auth MODE is read out of ~/.codex/auth.json —
+    never the token material it also holds."""
+    present = bool(shutil.which("codex"))
+    try:
+        with open(os.path.expanduser("~/.codex/auth.json")) as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return present, ""
+    if not isinstance(data, dict):
+        return present, ""
+    mode = str(data.get("auth_mode") or "").strip().lower()
+    if mode in ("chatgpt", "apikey"):
+        return present, mode
+    return present, "apikey" if data.get("OPENAI_API_KEY") else ""
+
+
+def remote_branch_exists(repo: str, branch: str, cwd: str | None = None) -> bool:
+    """Does `branch` exist on the remote? An inferred base that does not exist
+    would send every PR at a missing ref, and point-at.sh would hard-stop on it."""
+    if not repo or not branch:
+        return False
+    return bool(
+        _run(["gh", "api", f"repos/{repo}/branches/{branch}", "--jq", ".name"], cwd=cwd)
+    )
+
+
+def detect_base_branch(
+    target_dir: str, repo: str = "", sample: int = 20
+) -> tuple[str, str]:
+    """(branch, provenance). Where the repo's merged PRs actually land beats the
+    harness default: a repo without a `dev` branch would otherwise have every PR
+    opened against a base that does not exist.
+
+    Candidates are tried in confidence order and each is CONFIRMED to exist on the
+    remote before being offered — an inference is only useful if it names a real
+    merge target. Bounded: at most one probe per candidate. A provenance of ''
+    means nothing was confirmed and the caller holds the harness default; there is
+    then nothing to record, because 'inferred from the default' is not an
+    inference."""
+    raw = _run(
+        [
+            "gh", "pr", "list", "--state", "merged",
+            "--limit", str(sample), "--json", "baseRefName",
+        ],
+        cwd=target_dir,
+    )
+    try:
+        entries = json.loads(raw) if raw else []
+    except ValueError:
+        entries = []
+    bases = [
+        str(entry.get("baseRefName") or "")
+        for entry in entries
+        if isinstance(entry, dict)
+    ] if isinstance(entries, list) else []
+    bases = [base for base in bases if base]
+    candidates: list[tuple[str, str]] = []
+    if bases:
+        branch, hits = Counter(bases).most_common(1)[0]
+        candidates.append((branch, f"{hits}/{len(bases)} of the last merged PRs"))
+    default = _run(
+        ["gh", "repo", "view", "--json", "defaultBranchRef", "-q", ".defaultBranchRef.name"],
+        cwd=target_dir,
+    )
+    if default:
+        candidates.append((default, "the repository default branch"))
+    for branch, note in candidates:
+        if remote_branch_exists(repo, branch, cwd=target_dir):
+            return branch, note
+    return "dev", ""
+
+
+def detect_review_bot(target_dir: str, fixer_login: str, sample: int = 10) -> str:
+    """The account that most often reviews merged PRs here and is NOT the fixer —
+    a suggestion for REVIEW_BOT, since the fixer cannot approve its own PR (422).
+    '' when gh is unreachable, the JSON is malformed, or nobody qualifies."""
+    raw = _run(
+        [
+            "gh", "pr", "list", "--state", "merged",
+            "--limit", str(sample), "--json", "reviews",
+        ],
+        cwd=target_dir,
+    )
+    try:
+        entries = json.loads(raw) if raw else []
+    except ValueError:
+        return ""
+    if not isinstance(entries, list):
+        return ""
+    logins: list[str] = []
+    for entry in entries:
+        reviews = entry.get("reviews") if isinstance(entry, dict) else None
+        for review in reviews if isinstance(reviews, list) else []:
+            author = review.get("author") if isinstance(review, dict) else None
+            login = str((author or {}).get("login") or "") if isinstance(author, dict) else ""
+            if login and normalize_login(login) != normalize_login(fixer_login):
+                logins.append(login)
+    return Counter(logins).most_common(1)[0][0] if logins else ""
+
+
+def gate_failure_exit_codes(test_cmd: str) -> str:
+    """Which exit codes count as TRUSTED red-test evidence for this toolchain, or
+    '' to keep the harness default of 1. `cargo test` reports assertion failures
+    as 101 and reserves 1 for build/usage errors, so the default set would accept
+    a compile failure as an honest failing test."""
+    try:
+        tokens = shlex.split(test_cmd)
+    except ValueError:
+        tokens = test_cmd.split()
+    return "101" if tokens and os.path.basename(tokens[0]) == "cargo" else ""
+
+
+def _ask(prompt: str, default: str = "") -> str:
+    """One operator question. EOF (piped stdin, Ctrl-D) takes the default rather
+    than exploding mid-wizard."""
+    suffix = f" [{default}]" if default else ""
+    try:
+        value = input(f"  {prompt}{suffix}: ").strip()
+    except EOFError:
+        value = ""
+    return value or default
+
+
+# ── repo-command discovery (cheap LLM probe) ──────────────────────────────────
+# Signature files that tell us a checkable toolchain exists AT ALL — test, lint,
+# or typecheck. Cheap gate BEFORE spending an LLM call: if none of these are
+# anywhere in the tree the probe is skipped entirely (and, with no test command,
+# the banner fires). The list covers lint/format/typecheck configs too, because
+# the probe now answers for those as well and a repo can carry a linter without
+# carrying a test suite. Kept broad, not exhaustive — the LLM does the precise
+# read; this only decides "worth asking?".
+_TOOLCHAIN_SIGNS = (
     "pytest.ini", "tox.ini", "conftest.py", "pyproject.toml", "setup.cfg",
     "package.json", "vitest.config", "jest.config", "playwright.config",
     "go.mod", "Cargo.toml", "build.gradle", "pom.xml", "Makefile", "justfile",
     "phpunit.xml", "Gemfile", "*_test.go", "*.test.ts", "*.spec.ts",
+    "ruff.toml", ".ruff.toml", "mypy.ini", "pyrefly.toml", ".flake8",
+    ".eslintrc", ".eslintrc.js", ".eslintrc.json", ".eslintrc.yml",
+    "eslint.config.js", "eslint.config.mjs", "biome.json", ".golangci.yml",
+    "clippy.toml", "rustfmt.toml", ".rustfmt.toml", "tsconfig.json",
+    ".pre-commit-config.yaml",
 )
 
 _TEST_CMD_MARKER = "TEST_CMD:"
+_LINT_CMD_MARKER = "LINT_CMD:"
+_TYPECHECK_CMD_MARKER = "TYPECHECK_CMD:"
 _TEST_DISCOVERY_PROMPT = """\
 You are inspecting a git repository to find the shell command an autonomous \
 agent's PR gate will run as the repo's test suite (non-interactive: it must \
@@ -529,17 +879,33 @@ of the script.
 - For JS/TS prefer the non-watch form (`vitest run`, `jest`, `pnpm test` only if it \
 is non-watch). NEVER return a bare `vitest`/`jest --watch`.
 
-Your ENTIRE reply must be a SINGLE line in exactly this form, nothing before or after:
+Also report the repo's LINT and TYPECHECK commands, if it has them. Those two \
+run on every commit the agent makes, so they must be CHECK-MODE: terminating, \
+non-mutating, and non-zero on a violation. NEVER a formatter that rewrites files \
+(`cargo fmt` alone, `black .`, `prettier --write`) — use the check form \
+(`cargo fmt --check`, `ruff format --check`). Sources: CI workflow yaml, \
+package.json scripts, Makefile/justfile targets, pyproject/Cargo config. \
+Compose a language's lint and format check with `&&` (e.g. \
+`cargo fmt --check && cargo clippy -- -D warnings`).
+
+Your ENTIRE reply must be EXACTLY three lines, nothing before or after:
   TEST_CMD: <the command>
-If — and ONLY if — the repo has NO test suite at all, reply with the single line:
+  LINT_CMD: <the command>
+  TYPECHECK_CMD: <the command>
+Use the sentinel when — and only when — the repo has nothing of that kind:
   TEST_CMD: NO_TESTS
+  LINT_CMD: NO_LINT
+  TYPECHECK_CMD: NO_TYPECHECK
+A repo whose typechecking is inseparable from its build or its test run (Rust, \
+Go) has no separate typecheck command: reply NO_TYPECHECK rather than duplicating \
+the test command.
 
-Do not explain. Do not use code fences. The line must start with `TEST_CMD:`."""
+Do not explain. Do not use code fences. Each line must start with its marker."""
 
 
-def _has_test_signature(target_dir: str) -> bool:
-    """Fast pre-check: does any known test-toolchain signature file exist? Uses
-    git ls-files (respects .gitignore, fast) with a plain-walk fallback."""
+def _has_toolchain_signature(target_dir: str) -> bool:
+    """Fast pre-check: does any known test/lint/typecheck signature file exist?
+    Uses git ls-files (respects .gitignore, fast) with a plain-walk fallback."""
     listing = _run(["git", "ls-files"], cwd=target_dir)
     names = listing.split("\n") if listing else []
     if not names:
@@ -548,7 +914,7 @@ def _has_test_signature(target_dir: str) -> bool:
                 continue
             names.extend(files)
     basenames = {os.path.basename(n) for n in names}
-    for sign in _TEST_SIGNS:
+    for sign in _TOOLCHAIN_SIGNS:
         if sign.startswith("*"):
             suf = sign[1:]
             if any(n.endswith(suf) for n in names):
@@ -558,18 +924,30 @@ def _has_test_signature(target_dir: str) -> bool:
     return False
 
 
-def discover_test_cmd(target_dir: str, model: str = "haiku") -> str:
-    """Find the repo's test command via a cheap read-only LLM probe. Returns the
-    command, or '' if the repo genuinely has no tests (or the probe is unavailable
-    — fail-soft: a missing `claude` must not block `start`). Never raises.
+@dataclass(frozen=True)
+class DiscoveredCommands:
+    """What one discovery probe found. Absent commands are ''."""
+
+    test_cmd: str = ""
+    lint_cmd: str = ""
+    typecheck_cmd: str = ""
+
+
+def discover_repo_commands(target_dir: str, model: str = "haiku") -> DiscoveredCommands:
+    """Find the repo's test/lint/typecheck commands via a cheap read-only LLM
+    probe. Empty fields mean the repo genuinely has none (or the probe is
+    unavailable — fail-soft: a missing `claude` must not block `start`). Never
+    raises.
 
     Cheap by construction: a signature-file pre-check skips the LLM call entirely
     for repos with no test toolchain, and the call itself is Haiku + read-only
-    tools (Read/Glob/Grep) so it can't mutate anything."""
+    tools (Read/Glob/Grep) so it can't mutate anything. All three commands come
+    from ONE call — lint and typecheck are read off the same repo inspection the
+    test command already pays for."""
     if not target_dir or not os.path.isdir(target_dir):
-        return ""
-    if not _has_test_signature(target_dir):
-        return ""  # no toolchain → definitely no tests; don't spend a call
+        return DiscoveredCommands()
+    if not _has_toolchain_signature(target_dir):
+        return DiscoveredCommands()  # no toolchain → don't spend a call
     try:
         proc = subprocess.run(
             [
@@ -581,25 +959,44 @@ def discover_test_cmd(target_dir: str, model: str = "haiku") -> str:
             cwd=target_dir, capture_output=True, text=True, timeout=180,
         )
     except (OSError, subprocess.SubprocessError):
-        return ""  # claude absent / timed out — fail soft, proceed without a cmd
+        return DiscoveredCommands()  # claude absent/timed out — proceed without
     if proc.returncode != 0:
-        return ""
-    return _parse_test_cmd_reply(proc.stdout or "")
+        return DiscoveredCommands()
+    return parse_discovery_reply(proc.stdout or "")
 
 
-def _parse_test_cmd_reply(text: str) -> str:
-    """Extract the command from the model's `TEST_CMD: <cmd>` line. Robust to a
-    stray prose line or a code fence the model adds despite instructions: we scan
-    for the LAST marker line (weak models sometimes echo the instruction first)
-    and take everything after the marker. NO_TESTS (or an empty command) → ''."""
+def discover_test_cmd(target_dir: str, model: str = "haiku") -> str:
+    """The test command alone (`discover_repo_commands().test_cmd`)."""
+    return discover_repo_commands(target_dir, model).test_cmd
+
+
+def _parse_marked_line(text: str, marker: str, sentinel: str) -> str:
+    """Extract one `MARKER: <cmd>` line. Robust to a stray prose line or a code
+    fence the model adds despite instructions: we scan for the LAST marker line
+    (weak models sometimes echo the instruction first) and take everything after
+    the marker. The sentinel (or an empty command) → ''."""
     cmd = ""
     for line in text.splitlines():
         line = line.strip().strip("`").strip()
-        if line.startswith(_TEST_CMD_MARKER):
-            cmd = line[len(_TEST_CMD_MARKER):].strip()
-    if not cmd or cmd.upper() == "NO_TESTS":
+        if line.startswith(marker):
+            cmd = line[len(marker):].strip()
+    if not cmd or cmd.upper() == sentinel:
         return ""
     return cmd
+
+
+def parse_discovery_reply(text: str) -> DiscoveredCommands:
+    """Read the probe's three marker lines. A reply missing a line simply yields
+    '' for it — an old/weak model that answers only TEST_CMD still works."""
+    return DiscoveredCommands(
+        test_cmd=_parse_marked_line(text, _TEST_CMD_MARKER, "NO_TESTS"),
+        lint_cmd=_parse_marked_line(text, _LINT_CMD_MARKER, "NO_LINT"),
+        typecheck_cmd=_parse_marked_line(text, _TYPECHECK_CMD_MARKER, "NO_TYPECHECK"),
+    )
+
+
+def _parse_test_cmd_reply(text: str) -> str:
+    return _parse_marked_line(text, _TEST_CMD_MARKER, "NO_TESTS")
 
 
 # ── test-command VERIFICATION (does the discovered command actually work?) ────
@@ -688,6 +1085,169 @@ def report_test_cmd_check(cmd: str, check: TestCmdCheck) -> None:
         "fails, so the fixer would burn a session and then be blocked.\n"
         "    Fix the suite, or correct TEST_CMD in the overlay before starting."
     )
+
+
+# A DENY-LIST of command shapes that REWRITE the tree, not an allow-list of safe
+# ones: anything not named here is still trialed, so this cannot certify a
+# command as harmless. It exists because the mutating and check-mode spellings of
+# a formatter differ by one flag, a model asked for "the lint command" reaches
+# for the mutating one, and a formatter that rewrites the tree EXITS 0 — so the
+# trial run cannot catch it and it would be promoted live on a green result.
+# Each entry: (label, does this command appear?, flags that make it check-mode,
+# flags that make it mutating).
+_MUTATING_CHECK_SHAPES: tuple[tuple[str, str, tuple[str, ...], tuple[str, ...]], ...] = (
+    ("cargo fmt", r"\bcargo\s+fmt\b", (r"--check",), ()),
+    ("ruff format", r"\bruff\s+format\b", (r"--check", r"--diff"), ()),
+    ("black", r"\bblack\b", (r"--check", r"--diff"), ()),
+    ("isort", r"\bisort\b", (r"--check", r"--check-only", r"--diff"), ()),
+    ("dotnet format", r"\bdotnet\s+format\b", (r"--verify-no-changes",), ()),
+    ("prettier", r"\bprettier\b", (), (r"--write", r"(?<![\w-])-w(?![\w-])")),
+    ("gofmt", r"\bgofmt\b", (), (r"(?<![\w-])-w(?![\w-])",)),
+    ("goimports", r"\bgoimports\b", (), (r"(?<![\w-])-w(?![\w-])",)),
+)
+
+
+def mutating_check_command(cmd: str) -> str:
+    """Why `cmd` must not be run or promoted as a check command, or '' if no known
+    mutating shape matches. A gate command has to be a QUESTION about the tree; one
+    that rewrites it would edit the operator's checkout on every commit the gate
+    fires — and would pass its own trial run while doing so."""
+    for label, trigger, check_flags, write_flags in _MUTATING_CHECK_SHAPES:
+        if not re.search(trigger, cmd):
+            continue
+        if check_flags and not any(re.search(flag, cmd) for flag in check_flags):
+            return f"`{label}` REWRITES files without {' or '.join(check_flags)}"
+        if any(re.search(flag, cmd) for flag in write_flags):
+            return f"`{label}` was given a write flag, so it REWRITES files"
+    return ""
+
+
+def _disposable_worktree(target_dir: str) -> str:
+    """A throwaway detached worktree of the target's HEAD, or '' if one cannot be
+    made. Callers must pass it to `_discard_worktree`."""
+    try:
+        root = tempfile.mkdtemp(prefix="issue-agent-trial-")
+    except OSError:
+        return ""
+    path = os.path.join(root, "wt")
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "add", "--detach", path, "HEAD"],
+            cwd=target_dir, capture_output=True, text=True, timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        shutil.rmtree(root, ignore_errors=True)
+        return ""
+    if result.returncode != 0:
+        shutil.rmtree(root, ignore_errors=True)
+        return ""
+    return path
+
+
+def _discard_worktree(target_dir: str, path: str) -> None:
+    """Remove a disposable worktree and its temp root. Best-effort: a leftover
+    directory must not fail `start`."""
+    for argv in (["worktree", "remove", "--force", path], ["worktree", "prune"]):
+        try:
+            subprocess.run(
+                ["git", *argv], cwd=target_dir, capture_output=True, text=True,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+    shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+
+
+def verify_check_cmd(
+    cmd: str, target_dir: str, timeout_s: float = _VERIFY_TIMEOUT_S, run=None
+) -> TestCmdCheck | None:
+    """Trial-run a DISCOVERED check command in a disposable worktree of the
+    target's HEAD, never in the operator's working copy. None means it was not
+    run at all (no worktree could be made) — which is a refusal, not a pass:
+    the command is model-authored, and executing it against a tree a human may be
+    mid-edit on is not a risk this step is allowed to take to answer a question.
+
+    TEST_CMD keeps verifying in the real checkout: it is the command the gate
+    itself will run there, so a trial elsewhere would verify something else."""
+    worktree = _disposable_worktree(target_dir)
+    if not worktree:
+        return None
+    try:
+        return verify_test_cmd(cmd, worktree, timeout_s, run=run)
+    finally:
+        _discard_worktree(target_dir, worktree)
+
+
+def resolve_check_command(
+    key: str,
+    flag_value: str,
+    discovered: str,
+    target_dir: str,
+    *,
+    interactive: bool,
+    verify: bool = True,
+) -> tuple[str, str]:
+    """Decide what LINT_CMD/TYPECHECK_CMD the overlay may carry LIVE, and what it
+    may only suggest. Returns (live, suggestion) — at most one is non-empty.
+
+    These are trusted gate inputs: once set, each one BLOCKS every commit the
+    fixer makes. A discovered value's author is a model, so it carries no
+    operator or harness provenance (ADR 0012) and cannot be promoted on its own.
+    It becomes live only after the operator confirms it AND it survives the same
+    bounded trial run TEST_CMD gets; where that confirmation cannot happen
+    (non-TTY) it is written as an inert comment instead. An explicit flag is
+    already an operator decision and is written live."""
+    if flag_value:
+        return flag_value, ""
+    if not discovered:
+        return "", ""
+    mutating = mutating_check_command(discovered)
+    if mutating:
+        warn(
+            f"discovered {key} is not check-mode: {mutating}.\n"
+            f"    A gate command must ASK about the tree, not rewrite it — and a "
+            "formatter that rewrites it still exits 0, so no trial run would "
+            "catch this.\n"
+            f"    Recorded as a commented suggestion only: {discovered}"
+        )
+        return "", discovered
+    if not interactive:
+        info(
+            f"detected a candidate {key} but there is no terminal to confirm it — "
+            "recording it as a commented suggestion only."
+        )
+        return "", discovered
+    answer = _ask(f"{key} (Enter to accept, type a replacement, or '-' to skip)", discovered)
+    if answer == "-":
+        info(f"{key} skipped — the commit gate will not run it.")
+        return "", discovered
+    if not verify:
+        return answer, ""
+    info(f"trial-running {key} in a throwaway worktree (up to {_VERIFY_TIMEOUT_S:.0f}s)…")
+    check = verify_check_cmd(answer, target_dir)
+    if check is None:
+        warn(
+            f"could not create a disposable worktree to trial {key} safely, so it "
+            "was NOT run.\n"
+            "    Recorded as a commented suggestion instead — running a "
+            "model-authored command in your working copy is not an acceptable way "
+            "to answer this."
+        )
+        return "", answer
+    if check.passed:
+        ok(f"verified {key} ({check.seconds:.0f}s)")
+        return answer, ""
+    outcome = (
+        f"did not finish within {_VERIFY_TIMEOUT_S:.0f}s"
+        if check.timed_out else f"exited {check.exit_code}"
+    )
+    warn(
+        f"{key} {outcome} on a clean checkout: {answer}\n"
+        "    Setting it would block EVERY commit the fixer makes, so it is "
+        "recorded as a commented suggestion instead.\n"
+        f"    Fix it (or correct the command), then set {key} in the overlay."
+    )
+    return "", answer
 
 
 def _no_tests_banner() -> None:
@@ -948,7 +1508,13 @@ def cmd_start(args) -> int:
     # hand-authored overlay (e.g. myapp.env) or collides with a primary-checkout run.
     if getattr(args, "worktree", False) or getattr(args, "worktree_path", ""):
         info("--worktree: provisioning an isolated worktree (primary checkout untouched)")
-        wt = ensure_harness_worktree(target_dir, args.base_branch, getattr(args, "worktree_path", "") or "")
+        # BASE_BRANCH may still be unresolved here (inference happens with the
+        # overlay); the detach ref falls back to the repo default anyway.
+        wt = ensure_harness_worktree(
+            target_dir,
+            getattr(args, "base_branch", None) or "dev",
+            getattr(args, "worktree_path", "") or "",
+        )
         if not wt:
             return 2
         target_dir = wt
@@ -965,7 +1531,15 @@ def cmd_start(args) -> int:
             err("Run `issue-agent init` once to create it, then retry.")
             return 2
         info("first run — no config/shared.env yet; running `init`.")
-        rc = cmd_init(argparse.Namespace(force=False))
+        # Suggest the account that already reviews merged PRs here: the fixer
+        # cannot approve its own PR (422), so REVIEW_BOT must be someone else and
+        # the operator rarely knows which of their accounts the harness expects.
+        rc = cmd_init(
+            argparse.Namespace(
+                force=False,
+                review_bot_default=detect_review_bot(target_dir, detect_fixer_login(target_dir)),
+            )
+        )
         if rc != 0 or not os.path.isfile(SHARED_ENV):
             return rc or 2
         print()
@@ -1015,14 +1589,81 @@ def cmd_start(args) -> int:
         # Resolve TEST_CMD: explicit flag wins; else probe the repo with a cheap
         # read-only LLM search. Empty result → the repo has no tests: proceed, but
         # LOUDLY. Only done when synthesizing a fresh overlay (not on reuse).
+        interactive = sys.stdin.isatty()
         test_cmd = args.test_cmd or ""
-        if not test_cmd:
-            info("no --test-cmd given — searching the repo for its test command…")
-            test_cmd = discover_test_cmd(target_dir)
-            if test_cmd:
-                ok(f"discovered TEST_CMD: {test_cmd}")
+        lint_flag = getattr(args, "lint_cmd", "") or ""
+        typecheck_flag = getattr(args, "typecheck_cmd", "") or ""
+        discovered = DiscoveredCommands()
+        if not (test_cmd and lint_flag and typecheck_flag):
+            wanted = [
+                label for label, supplied in (
+                    ("test", test_cmd), ("lint", lint_flag), ("typecheck", typecheck_flag)
+                ) if not supplied
+            ]
+            info(f"searching the repo for its {'/'.join(wanted)} command(s)…")
+            discovered = discover_repo_commands(target_dir)
+            if not test_cmd:
+                test_cmd = discovered.test_cmd
+                if test_cmd:
+                    ok(f"discovered TEST_CMD: {test_cmd}")
+                else:
+                    _no_tests_banner()
+        suggestions: list[tuple[str, str]] = []
+        # LINT_CMD/TYPECHECK_CMD are commit-blocking gate inputs, so a DISCOVERED
+        # one is confirmed and trial-run before it can go live; anything that
+        # fails either step is written as an inert comment (see
+        # resolve_check_command).
+        verify_checks = not getattr(args, "no_verify_test_cmd", False)
+        lint_cmd, lint_suggestion = resolve_check_command(
+            "LINT_CMD", lint_flag, discovered.lint_cmd, target_dir,
+            interactive=interactive, verify=verify_checks,
+        )
+        typecheck_cmd, typecheck_suggestion = resolve_check_command(
+            "TYPECHECK_CMD", typecheck_flag, discovered.typecheck_cmd, target_dir,
+            interactive=interactive, verify=verify_checks,
+        )
+        if lint_suggestion:
+            suggestions.append(("LINT_CMD", lint_suggestion))
+        if typecheck_suggestion:
+            suggestions.append(("TYPECHECK_CMD", typecheck_suggestion))
+        # BASE_BRANCH: an explicit --base-branch wins; else a previously written
+        # value is preserved (a regenerate must not silently re-point a
+        # deployment's merge target); else infer from where this repo's merged PRs
+        # actually land.
+        base_branch = args.base_branch or ""
+        base_note = ""
+        base_suggestion = ""
+        if not base_branch and replacing_overlay:
+            base_branch = read_repo_env_field(overlay, "BASE_BRANCH")
+            if base_branch:
+                info(
+                    f"keeping BASE_BRANCH={base_branch} from the existing overlay "
+                    "(pass --base-branch to change it)"
+                )
+        if not base_branch:
+            inferred, base_note = detect_base_branch(target_dir, repo)
+            if interactive:
+                base_branch = _ask(
+                    "Base branch for PRs (the harness auto-merges approved PRs "
+                    "into this branch)",
+                    inferred,
+                )
+                if base_branch != inferred:
+                    base_note = "an operator answer at `issue-agent start`"
             else:
-                _no_tests_banner()
+                # Adopting an inferred merge target unattended would walk straight
+                # past point-at.sh's base-branch hard stop — the interlock that
+                # makes choosing where this harness MERGES a conscious operator
+                # act. Keep the default, record the finding, let the stop fire.
+                detected_note = base_note
+                base_branch = "dev"
+                base_suggestion = inferred if inferred != "dev" else ""
+                base_note = ""
+                if base_suggestion:
+                    info(
+                        f"recent PRs merge into '{base_suggestion}' ({detected_note})"
+                        " — keeping BASE_BRANCH=dev; pass --base-branch to adopt it."
+                    )
         # Verify whatever we ended up with — discovered OR hand-supplied. A typo
         # in --test-cmd wedges the gate exactly as badly as a bad guess, and this
         # is the last moment before the value is written into the overlay and
@@ -1032,7 +1673,10 @@ def cmd_start(args) -> int:
             report_test_cmd_check(test_cmd, verify_test_cmd(test_cmd, target_dir))
         content = synth_repo_env(
             repo=repo, target_dir=target_dir, name=name,
-            base_branch=args.base_branch, test_cmd=test_cmd,
+            base_branch=base_branch, base_branch_note=base_note,
+            base_branch_suggestion=base_suggestion, suggestions=tuple(suggestions),
+            test_cmd=test_cmd, lint_cmd=lint_cmd, typecheck_cmd=typecheck_cmd,
+            gate_test_failure_exit_codes=gate_failure_exit_codes(test_cmd),
             edit_check_cmd=args.edit_check_cmd or "", review_mode=args.review_mode or "",
             max_budget=args.max_budget or "", review_budget=args.review_budget or "",
             repointed_from_deployments=repoint_history,
@@ -1754,42 +2398,115 @@ def cmd_init(args) -> int:
         err(f"config/shared.env already exists — refusing to clobber. Edit it, or re-run with --force.")
         return 2
     if not sys.stdin.isatty():
-        err("`issue-agent init` is interactive; run it in a terminal (or copy config/agent.env.example → config/shared.env by hand).")
+        err("`issue-agent init` is interactive; run it in a terminal (or copy config/shared.example.env → config/shared.env by hand).")
         return 2
 
     print(_c("36", "▸ issue-agent init — creating config/shared.env (global identity + secrets)"))
     print("  Press Enter to accept the [default]. These are repo-INDEPENDENT; per-repo")
     print("  knobs (REPO/TARGET_DIR/TEST_CMD) are written by `issue-agent start`.\n")
 
-    def ask(prompt: str, default: str = "") -> str:
-        suffix = f" [{default}]" if default else ""
-        try:
-            val = input(f"  {prompt}{suffix}: ").strip()
-        except EOFError:
-            val = ""
-        return val or default
+    ask = _ask
+
+    def ask_distinct_login(prompt: str, default: str, other_label: str, other: str) -> str:
+        """A login that must not be the fixer's. GitHub 422s a self-approval, so a
+        collision here is not a preference — it wedges every merge. Bounded
+        re-prompt (ADR 0012): after the ceiling the answer stands and doctor is
+        the authority."""
+        value = ""
+        for attempt in range(1, _PROMPT_ATTEMPTS + 1):
+            value = ask(prompt, default)
+            if not value or normalize_login(value) != normalize_login(other):
+                return value
+            warn(
+                f"'{value}' is also {other_label} — GitHub 422s a review submitted "
+                "by the PR's own author, so the fixer's account can never approve "
+                "or merge its own work. Use a separate account."
+            )
+            if attempt < _PROMPT_ATTEMPTS:
+                info(f"try again ({_PROMPT_ATTEMPTS - attempt} attempt(s) left).")
+        warn(f"keeping '{value}' — `issue-agent doctor` will flag it.")
+        return value
 
     fields: list[tuple[str, str]] = []
-    fields.append(("IDENTITY_MODE", ask("Identity mode (three|solo)", "three")))
-    fields.append(("FIX_BOT", ask("Fixer GitHub login (ambient gh auth user)", "")))
-    fields.append(("REVIEW_BOT", ask("Reviewer login (bot; distinct from fixer)", "")))
-    fields.append(("STEWARD_BOT", ask("Steward login (may equal reviewer)", "")))
+    # Normalized once, here: every downstream comparison (and the reviewer-token
+    # prompt that hangs off it) must see the same value, whatever case was typed.
+    identity_mode = ask("Identity mode (three|solo)", "three").lower()
+    fields.append(("IDENTITY_MODE", identity_mode))
+    gh_login = detect_fixer_login()
+    if gh_login:
+        ok(f"gh is authenticated as '{gh_login}'")
+    else:
+        warn("`gh api user` did not answer — gh is unauthenticated or unreachable; "
+             "the fixer login cannot be pre-filled.")
+    fix_bot = ask("Fixer GitHub login (ambient gh auth user)", gh_login)
+    fields.append(("FIX_BOT", fix_bot))
+    review_bot = ask_distinct_login(
+        "Reviewer login (bot; distinct from fixer)",
+        getattr(args, "review_bot_default", "") or "",
+        "the fixer", fix_bot,
+    )
+    fields.append(("REVIEW_BOT", review_bot))
+    fields.append((
+        "STEWARD_BOT",
+        ask_distinct_login(
+            "Steward login (may equal reviewer)", review_bot, "the fixer", fix_bot
+        ),
+    ))
     print()
-    if ask("Configure GitHub App for review+steward identity? (y/N)", "N").lower().startswith("y"):
+    gh_app = ask("Configure GitHub App for review+steward identity? (y/N)", "N").lower().startswith("y")
+    if gh_app:
         fields.append(("GH_APP_ID", ask("GH App ID", "")))
         fields.append(("GH_APP_INSTALL_ID", ask("GH App installation ID", "")))
         fields.append(("GH_APP_KEY_FILE", ask("GH App private-key .pem path", "")))
+    elif identity_mode == "three":
+        # Without an App, approvals are posted with this PAT. Validating it here
+        # (rather than only in doctor) is the difference between a wizard that
+        # cannot produce a doctor-red config and one that reliably does.
+        print("  The reviewer needs its OWN token to post approvals as that account.")
+        token = prompt_review_bot_token(review_bot)
+        if token:
+            fields.append(("REVIEW_BOT_TOKEN", token))
+        else:
+            warn("no REVIEW_BOT_TOKEN set — the reviewer will act as the ambient gh "
+                 "account and GitHub will 422 its approvals.")
     print()
     if ask("Enable Jira sync? (y/N)", "N").lower().startswith("y"):
         fields.append(("JIRA_SYNC", "1"))
         fields.append(("JIRA_PROJECT_KEY", ask("Jira project key (e.g. ACME)", "")))
         fields.append(("JIRA_CLOUD_ID", ask("Jira cloud id / host", "")))
     print()
-    fields.append(("FIXER_RUNTIME", ask("Fixer runtime (claude|codex)", "claude")))
-    fields.append(("REVIEWER_RUNTIME", ask("Reviewer runtime (codex|claude)", "codex")))
+    claude_ready = detect_claude_auth()
+    codex_present, codex_mode = detect_codex_auth()
+    if claude_ready:
+        ok("claude: credentials found (~/.claude or ANTHROPIC_API_KEY/AUTH_TOKEN)")
+    else:
+        warn("claude: no credentials found — run `claude` once to log in, or export "
+             "ANTHROPIC_API_KEY, before selecting it as a runtime.")
+    if not codex_present:
+        warn("codex: not on PATH — install it before selecting it as a runtime.")
+    elif codex_mode == "chatgpt":
+        ok("codex: ChatGPT subscription auth")
+    elif codex_mode == "apikey":
+        ok("codex: API-key auth")
+    else:
+        ok("codex: on PATH (auth mode unknown — `codex login` if it is not signed in)")
+    fields.append((
+        "FIXER_RUNTIME",
+        ask("Fixer runtime (claude|codex)", "claude" if claude_ready or not codex_present else "codex"),
+    ))
+    fields.append((
+        "REVIEWER_RUNTIME",
+        ask("Reviewer runtime (codex|claude)", "codex" if codex_present else "claude"),
+    ))
     if any(k in ("FIXER_RUNTIME", "REVIEWER_RUNTIME") and v == "codex" for k, v in fields):
-        fields.append(("OPENAI_BASE_URL", ask("Gateway base URL (OpenAI-compatible)", "https://api.openai.com/v1")))
-        print("  (OPENAI_API_KEY is read from the launching shell env — not stored here.)")
+        if codex_mode == "chatgpt":
+            info("codex is on ChatGPT auth: the provider reports NO billed cost per "
+                 "run, so spend for those legs is priced from the synthetic "
+                 "CODEX_COST_PER_MTOK rate card, not from an invoice. No gateway "
+                 "base URL is needed.")
+        else:
+            fields.append(("OPENAI_BASE_URL", ask("Gateway base URL (OpenAI-compatible)", "https://api.openai.com/v1")))
+            print("  (OPENAI_API_KEY is read from the launching shell env — not stored here.)")
 
     lines = [
         "# Autonomous issue agent — SHARED config (global identity/secrets).",
@@ -1800,8 +2517,19 @@ def cmd_init(args) -> int:
         if value:
             lines.append(f"{key}={_q(value)}")
     os.makedirs(os.path.dirname(SHARED_ENV), exist_ok=True)
-    with open(SHARED_ENV, "w") as f:
+    # This file may hold a long-lived PAT, so no secret byte may exist in it at
+    # laxer permissions — not even briefly. O_CREAT's mode applies only when the
+    # file is NEW, so a pre-existing (e.g. 0644 --force) file keeps its old mode
+    # through the write unless it is tightened FIRST; hence chmod-before-open,
+    # then chmod again after in case the create path raced an inherited umask.
+    if os.path.exists(SHARED_ENV):
+        os.chmod(SHARED_ENV, 0o600)
+    handle = os.fdopen(
+        os.open(SHARED_ENV, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w"
+    )
+    with handle as f:
         f.write("\n".join(lines) + "\n")
+    os.chmod(SHARED_ENV, 0o600)
     ok(f"wrote {SHARED_ENV}")
     print("  Review it, then `cd <target-repo> && issue-agent start`.")
     return 0
@@ -1842,12 +2570,28 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_context_flags(sp)
     sp.add_argument("--roles", nargs="+", choices=ROLES, help="subset to run (default: all three)")
-    sp.add_argument("--base-branch", default="dev", help="base branch for PRs (default: dev)")
+    # Default None, not "dev": only an ABSENT flag may be inferred from the repo.
+    sp.add_argument(
+        "--base-branch", default=None,
+        help="base branch for PRs (default: inferred from merged PRs, then the "
+             "repo default branch, then 'dev')",
+    )
     sp.add_argument("--test-cmd", default="", help="TEST_CMD (arms the PR/red-fail gate); omit to auto-discover")
     sp.add_argument(
+        "--lint-cmd", default="",
+        help="LINT_CMD (blocks a commit on failure); omit to auto-discover, which "
+             "requires confirmation and a passing trial run before it is written",
+    )
+    sp.add_argument(
+        "--typecheck-cmd", default="",
+        help="TYPECHECK_CMD (blocks a commit on failure); omit to auto-discover, "
+             "which requires confirmation and a passing trial run before it is written",
+    )
+    sp.add_argument(
         "--no-verify-test-cmd", action="store_true",
-        help="skip the one trial run of TEST_CMD (it catches watch-mode and "
-             "missing binaries before they deny every push)",
+        help="skip the one trial run of TEST_CMD and of any confirmed "
+             "LINT_CMD/TYPECHECK_CMD (those runs catch watch-mode and missing "
+             "binaries before they deny every push or block every commit)",
     )
     sp.add_argument("--no-init", action="store_true", help="don't auto-run init on first start; error instead")
     sp.add_argument("--edit-check-cmd", default="", help="EDIT_CHECK_CMD (post-edit typecheck)")
@@ -1948,7 +2692,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv if argv is not None else sys.argv[1:])
-    raise SystemExit(args.func(args))
+    try:
+        raise SystemExit(args.func(args))
+    except KeyboardInterrupt:
+        # Ctrl-C during a wizard prompt is an ordinary way to leave; a traceback
+        # would read as a crash. 130 is the conventional SIGINT exit.
+        print()
+        err("aborted.")
+        raise SystemExit(130) from None
 
 
 if __name__ == "__main__":

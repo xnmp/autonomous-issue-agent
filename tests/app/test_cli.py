@@ -559,19 +559,19 @@ def test_harness_root_points_at_checkout():
 
 
 # ── test-command discovery ────────────────────────────────────────────────────
-def test_has_test_signature_true_for_pyproject(tmp_path):
+def test_has_toolchain_signature_true_for_pyproject(tmp_path):
     (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
-    assert cli._has_test_signature(str(tmp_path)) is True
+    assert cli._has_toolchain_signature(str(tmp_path)) is True
 
 
-def test_has_test_signature_true_for_glob_go_test(tmp_path):
+def test_has_toolchain_signature_true_for_glob_go_test(tmp_path):
     (tmp_path / "foo_test.go").write_text("package x\n")
-    assert cli._has_test_signature(str(tmp_path)) is True
+    assert cli._has_toolchain_signature(str(tmp_path)) is True
 
 
-def test_has_test_signature_false_for_bare_repo(tmp_path):
+def test_has_toolchain_signature_false_for_bare_repo(tmp_path):
     (tmp_path / "README.md").write_text("# hi\n")
-    assert cli._has_test_signature(str(tmp_path)) is False
+    assert cli._has_toolchain_signature(str(tmp_path)) is False
 
 
 def _fake_proc(stdout, returncode=0):
@@ -585,8 +585,8 @@ def _fake_proc(stdout, returncode=0):
 
 def test_discover_test_cmd_skips_llm_when_no_signature(tmp_path, monkeypatch):
     # No signature file → must NOT spend an LLM call; returns '' immediately.
-    # (_has_test_signature is exercised directly by its own tests above.)
-    monkeypatch.setattr(cli, "_has_test_signature", lambda _d: False)
+    # (_has_toolchain_signature is exercised directly by its own tests above.)
+    monkeypatch.setattr(cli, "_has_toolchain_signature", lambda _d: False)
     called = {"n": 0}
 
     def spy(*a, **k):
@@ -599,19 +599,19 @@ def test_discover_test_cmd_skips_llm_when_no_signature(tmp_path, monkeypatch):
 
 
 def test_discover_test_cmd_returns_command(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli, "_has_test_signature", lambda _d: True)
+    monkeypatch.setattr(cli, "_has_toolchain_signature", lambda _d: True)
     monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: _fake_proc("TEST_CMD: uv run pytest\n"))
     assert cli.discover_test_cmd(str(tmp_path)) == "uv run pytest"
 
 
 def test_discover_test_cmd_no_tests_sentinel(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli, "_has_test_signature", lambda _d: True)
+    monkeypatch.setattr(cli, "_has_toolchain_signature", lambda _d: True)
     monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: _fake_proc("TEST_CMD: NO_TESTS\n"))
     assert cli.discover_test_cmd(str(tmp_path)) == ""
 
 
 def test_discover_test_cmd_fail_soft_on_missing_claude(tmp_path, monkeypatch):
-    monkeypatch.setattr(cli, "_has_test_signature", lambda _d: True)
+    monkeypatch.setattr(cli, "_has_toolchain_signature", lambda _d: True)
 
     def boom(*a, **k):
         raise FileNotFoundError("claude")
@@ -860,7 +860,7 @@ def _start_args(**overrides) -> argparse.Namespace:
         test_cmd="", no_init=True, edit_check_cmd="", review_mode="",
         max_budget="", review_budget="", max_ticks=None, write_config=False,
         worktree=False, worktree_path="",
-        no_verify_test_cmd=False,
+        no_verify_test_cmd=False, lint_cmd="", typecheck_cmd="",
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -1409,3 +1409,1205 @@ def test_remote_bootstrap_uses_effect_commands_for_every_requested_write(
     assert cli.cmd_prepare_remote(args) == 0
     assert tuple(labels) == cli.REMOTE_LABELS
     assert auto_merge == [True]
+
+
+# ── setup wizard: identity detection + first-line token validation ────────────
+# doctor.sh validated REVIEW_BOT_TOKEN only after the fact, so `init` could write
+# a config doctor was guaranteed to redden. These cover the wizard's own checks.
+def _gh_stub(fixer: str = "fix-bot", token_logins: dict | None = None):
+    """Stand in for `gh api user`: the ambient call answers `fixer`; a call
+    carrying GH_TOKEN answers whichever login that token belongs to (and mimics
+    gh's real failure shape — error body on stdout, non-zero exit)."""
+    tokens = token_logins or {}
+
+    def run(cmd, **kwargs):
+        token = (kwargs.get("env") or {}).get("GH_TOKEN", "")
+        if token:
+            login = tokens.get(token, "")
+            return _fake_proc(
+                (login or '{"message":"Bad credentials"}') + "\n", 0 if login else 1
+            )
+        return _fake_proc(fixer + "\n", 0 if fixer else 1)
+
+    return run
+
+
+class _Answers:
+    """Scripted operator. Exhaustion is EOF — the same thing a piped stdin or a
+    Ctrl-D mid-wizard does."""
+
+    def __init__(self, items):
+        self.items = list(items)
+        self.prompts: list[str] = []
+
+    def __call__(self, prompt=""):
+        self.prompts.append(prompt)
+        if not self.items:
+            raise EOFError
+        return self.items.pop(0)
+
+
+def _init_env(tmp_path, monkeypatch, *, answers, secrets=(), gh=None):
+    shared = tmp_path / "config" / "shared.env"
+    monkeypatch.setattr(cli, "SHARED_ENV", str(shared))
+    monkeypatch.setattr(cli.sys, "stdin", argparse.Namespace(isatty=lambda: True))
+    monkeypatch.setattr(cli.subprocess, "run", gh or _gh_stub())
+    monkeypatch.setattr(cli, "detect_claude_auth", lambda: True)
+    monkeypatch.setattr(cli, "detect_codex_auth", lambda: (True, "apikey"))
+    asked = _Answers(answers)
+    secret_asked = _Answers(secrets)
+    monkeypatch.setattr("builtins.input", asked)
+    monkeypatch.setattr(cli.getpass, "getpass", secret_asked)
+    return shared, asked, secret_asked
+
+
+def _wizard_answers(**over) -> list[str]:
+    base = {
+        "mode": "three", "fix": "fix-bot", "review": "review-bot",
+        "steward": "review-bot", "app": "N", "jira": "N",
+        "fixer_runtime": "claude", "reviewer_runtime": "claude",
+    }
+    base.update(over)
+    return list(base.values())
+
+
+def _shared_values(text: str) -> dict:
+    return _source_env(text)
+
+
+def test_cmd_init_prefills_fixer_login_from_gh(tmp_path, monkeypatch, capsys):
+    """Enter on the FIX_BOT prompt accepts the account gh is authenticated as."""
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch,
+        answers=_wizard_answers(fix=""), secrets=["", ""],
+        gh=_gh_stub(fixer="ambient-dev"),
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert _shared_values(shared.read_text())["FIX_BOT"] == "ambient-dev"
+    assert "ambient-dev" in capsys.readouterr().out
+
+
+def test_cmd_init_degrades_when_gh_is_unreachable(tmp_path, monkeypatch, capsys):
+    """gh missing/unauthenticated must warn and keep going, not crash the wizard."""
+    def boom(cmd, **kwargs):
+        raise OSError("gh: not found")
+
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch, answers=_wizard_answers(), secrets=["", ""], gh=boom,
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert _shared_values(shared.read_text())["FIX_BOT"] == "fix-bot"
+    assert "gh api user" in capsys.readouterr().err
+
+
+def test_cmd_init_reprompts_when_reviewer_is_the_fixer(tmp_path, monkeypatch, capsys):
+    """A reviewer that IS the fixer 422s every approval — including when the two
+    differ only by case or a [bot] suffix."""
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch,
+        answers=["three", "fix-bot", "Fix-Bot[bot]", "review-bot", "review-bot",
+                 "N", "N", "claude", "claude"],
+        secrets=["", ""],
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert _shared_values(shared.read_text())["REVIEW_BOT"] == "review-bot"
+    assert "422" in capsys.readouterr().err
+
+
+def test_cmd_init_reprompt_loop_is_bounded_and_keeps_the_last_answer(
+    tmp_path, monkeypatch, capsys
+):
+    """A stubborn operator must not be able to hold the wizard open forever."""
+    shared, asked, _s = _init_env(
+        tmp_path, monkeypatch,
+        answers=["three", "fix-bot", "fix-bot", "fix-bot", "fix-bot",
+                 "steward-bot", "N", "N", "claude", "claude"],
+        secrets=["", ""],
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert _shared_values(shared.read_text())["REVIEW_BOT"] == "fix-bot"
+    assert "doctor" in capsys.readouterr().err
+    reviewer_prompts = [p for p in asked.prompts if "Reviewer login" in p]
+    assert len(reviewer_prompts) == 3  # bounded, then the answer stands
+
+
+def test_cmd_init_enforces_steward_distinct_from_fixer(tmp_path, monkeypatch):
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch,
+        answers=["three", "fix-bot", "review-bot", "fix-bot", "steward-bot",
+                 "N", "N", "claude", "claude"],
+        secrets=["", ""],
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert _shared_values(shared.read_text())["STEWARD_BOT"] == "steward-bot"
+
+
+def test_cmd_init_writes_a_token_that_authenticates_as_the_reviewer(
+    tmp_path, monkeypatch
+):
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch, answers=_wizard_answers(), secrets=["good-token"],
+        gh=_gh_stub(token_logins={"good-token": "Review-Bot[bot]"}),
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert _shared_values(shared.read_text())["REVIEW_BOT_TOKEN"] == "good-token"
+
+
+def test_cmd_init_reprompts_a_token_belonging_to_another_account(
+    tmp_path, monkeypatch, capsys
+):
+    """The doctor-red config this wizard used to produce: a valid token for the
+    WRONG account. Caught at input time now."""
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch, answers=_wizard_answers(),
+        secrets=["someone-elses", "good-token"],
+        gh=_gh_stub(token_logins={"someone-elses": "other-human",
+                                  "good-token": "review-bot"}),
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert _shared_values(shared.read_text())["REVIEW_BOT_TOKEN"] == "good-token"
+    captured = capsys.readouterr()
+    assert "other-human" in captured.err
+    assert "someone-elses" not in captured.err + captured.out
+
+
+def test_cmd_init_discards_a_rejected_token_at_the_attempt_ceiling(
+    tmp_path, monkeypatch, capsys
+):
+    """A token GitHub answered about and rejected is NEVER stored. Persisting one
+    silently installs whatever account it belongs to (typically the operator's
+    own PAT) as the reviewer identity, defeating three-identity mode."""
+    shared, _asked, secrets = _init_env(
+        tmp_path, monkeypatch, answers=_wizard_answers(),
+        secrets=["t1", "t2", "t3", "t4"], gh=_gh_stub(token_logins={}),
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    text = shared.read_text()
+    assert "REVIEW_BOT_TOKEN" not in _shared_values(text)
+    assert "t3" not in text
+    assert secrets.items == ["t4"]  # bounded at three attempts
+    assert "no REVIEW_BOT_TOKEN stored" in capsys.readouterr().err
+
+
+def test_cmd_init_discards_a_token_belonging_to_another_account(
+    tmp_path, monkeypatch, capsys
+):
+    """The review's scenario: an operator's personal PAT offered three times. It
+    authenticates fine — for the WRONG identity — so it must not be written."""
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch, answers=_wizard_answers(),
+        secrets=["personal-pat"] * 3,
+        gh=_gh_stub(token_logins={"personal-pat": "the-operator"}),
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert "personal-pat" not in shared.read_text()
+    assert "the-operator" in capsys.readouterr().err
+
+
+def test_cmd_init_skip_after_a_rejected_token_stores_nothing(
+    tmp_path, monkeypatch, capsys
+):
+    """Enter (or EOF) after a rejection is a SKIP, not consent to the rejected
+    value."""
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch, answers=_wizard_answers(),
+        secrets=["wrong-token", ""],
+        gh=_gh_stub(token_logins={"wrong-token": "someone-else"}),
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    text = shared.read_text()
+    assert "wrong-token" not in text
+    assert "REVIEW_BOT_TOKEN" not in _shared_values(text)
+    assert "no REVIEW_BOT_TOKEN stored" in capsys.readouterr().err
+
+
+def test_cmd_init_keeps_an_unverifiable_token_when_gh_cannot_run(
+    tmp_path, monkeypatch, capsys
+):
+    """gh absent is an outage, not a verdict: keep the token, loudly, and let
+    doctor adjudicate. This is the ONLY path that stores an unproven token."""
+    def unusable(cmd, **kwargs):
+        if (kwargs.get("env") or {}).get("GH_TOKEN"):
+            raise OSError("gh: not found")
+        return _fake_proc("fix-bot\n")
+
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch, answers=_wizard_answers(),
+        secrets=["offline-token"] * 3, gh=unusable,
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert _shared_values(shared.read_text())["REVIEW_BOT_TOKEN"] == "offline-token"
+    assert "UNVERIFIED" in capsys.readouterr().err
+
+
+def test_cmd_init_reads_a_token_out_of_a_file(tmp_path, monkeypatch):
+    token_file = tmp_path / "pat.txt"
+    token_file.write_text("file-token\n")
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch, answers=_wizard_answers(),
+        secrets=[f"@{token_file}"],
+        gh=_gh_stub(token_logins={"file-token": "review-bot"}),
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert _shared_values(shared.read_text())["REVIEW_BOT_TOKEN"] == "file-token"
+
+
+def test_cmd_init_reports_a_missing_token_file_and_reprompts(
+    tmp_path, monkeypatch, capsys
+):
+    token_file = tmp_path / "pat.txt"
+    token_file.write_text("file-token\n")
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch, answers=_wizard_answers(),
+        secrets=[f"@{tmp_path / 'nope.txt'}", f"@{token_file}"],
+        gh=_gh_stub(token_logins={"file-token": "review-bot"}),
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert _shared_values(shared.read_text())["REVIEW_BOT_TOKEN"] == "file-token"
+    message = capsys.readouterr().err
+    assert "no file exists at the path you entered" in message
+    assert "nope.txt" not in message  # never echo what was typed
+
+
+def test_cmd_init_never_echoes_token_material(tmp_path, monkeypatch, capsys):
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch, answers=_wizard_answers(), secrets=["s3cret-pat"],
+        gh=_gh_stub(token_logins={"s3cret-pat": "review-bot"}),
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    captured = capsys.readouterr()
+    assert "s3cret-pat" not in captured.out + captured.err
+    assert "s3cret-pat" in _shared_values(shared.read_text())["REVIEW_BOT_TOKEN"]
+
+
+def test_cmd_init_skips_the_token_prompt_when_a_github_app_is_configured(
+    tmp_path, monkeypatch
+):
+    shared, _asked, secrets = _init_env(
+        tmp_path, monkeypatch,
+        answers=["three", "fix-bot", "review-bot", "review-bot", "y",
+                 "123", "456", "/keys/app.pem", "N", "claude", "claude"],
+        secrets=["never-read"],
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    values = _shared_values(shared.read_text())
+    assert values["GH_APP_ID"] == "123"
+    assert "REVIEW_BOT_TOKEN" not in values
+    assert secrets.prompts == []
+
+
+def test_cmd_init_writes_shared_env_private(tmp_path, monkeypatch):
+    """shared.env can hold a long-lived PAT: it must never be group/world readable."""
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch, answers=_wizard_answers(), secrets=["good"],
+        gh=_gh_stub(token_logins={"good": "review-bot"}),
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert oct(shared.stat().st_mode & 0o777) == "0o600"
+
+
+def test_cmd_init_survives_eof_midway_and_still_writes_a_config(
+    tmp_path, monkeypatch
+):
+    """Ctrl-D partway through takes the remaining defaults instead of exploding."""
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch, answers=["three", "fix-bot"], secrets=[],
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    values = _shared_values(shared.read_text())
+    assert values["FIX_BOT"] == "fix-bot"
+    assert values["IDENTITY_MODE"] == "three"
+    assert "REVIEW_BOT_TOKEN" not in values
+
+
+def test_cmd_init_non_tty_names_the_real_shared_template(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "SHARED_ENV", str(tmp_path / "shared.env"))
+    monkeypatch.setattr(cli.sys, "stdin", argparse.Namespace(isatty=lambda: False))
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 2
+    message = capsys.readouterr().err
+    assert "config/shared.example.env" in message
+    assert "agent.env.example" not in message
+    assert (Path(cli.HARNESS_ROOT) / "config" / "shared.example.env").is_file()
+
+
+def test_cmd_init_codex_on_chatgpt_auth_explains_the_synthetic_rate_card(
+    tmp_path, monkeypatch, capsys
+):
+    """ChatGPT-auth codex reports no billed cost, so spend is priced from the
+    rate card and there is no gateway URL to ask for."""
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch,
+        answers=_wizard_answers(reviewer_runtime="codex"), secrets=["", ""],
+    )
+    monkeypatch.setattr(cli, "detect_codex_auth", lambda: (True, "chatgpt"))
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert "OPENAI_BASE_URL" not in _shared_values(shared.read_text())
+    assert "CODEX_COST_PER_MTOK" in capsys.readouterr().out
+
+
+def test_cmd_init_codex_on_api_key_still_asks_for_the_gateway(tmp_path, monkeypatch):
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch,
+        answers=_wizard_answers(reviewer_runtime="codex") + ["https://gw.local/v1"],
+        secrets=["", ""],
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert _shared_values(shared.read_text())["OPENAI_BASE_URL"] == "https://gw.local/v1"
+
+
+def test_cmd_init_uses_the_suggested_reviewer_login_as_the_default(
+    tmp_path, monkeypatch
+):
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch, answers=_wizard_answers(review=""), secrets=["", ""],
+    )
+
+    assert cli.cmd_init(
+        argparse.Namespace(force=False, review_bot_default="suggested-bot")
+    ) == 0
+    assert _shared_values(shared.read_text())["REVIEW_BOT"] == "suggested-bot"
+
+
+# ── runtime auth detection ────────────────────────────────────────────────────
+def test_detect_claude_auth_accepts_an_environment_key(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "x")
+    assert cli.detect_claude_auth() is True
+
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN")
+    assert cli.detect_claude_auth() is False
+
+
+def test_detect_claude_auth_accepts_stored_cli_credentials(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    (tmp_path / ".claude").mkdir()
+    (tmp_path / ".claude" / ".credentials.json").write_text("{}")
+    assert cli.detect_claude_auth() is True
+
+
+def test_detect_codex_auth_reads_the_mode_not_the_secret(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(cli.shutil, "which", lambda _b: "/usr/bin/codex")
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".codex" / "auth.json").write_text(
+        json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": "secret"}})
+    )
+    assert cli.detect_codex_auth() == (True, "chatgpt")
+
+
+def test_detect_codex_auth_tolerates_a_malformed_auth_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(cli.shutil, "which", lambda _b: "/usr/bin/codex")
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".codex" / "auth.json").write_text("{not json")
+    assert cli.detect_codex_auth() == (True, "")
+
+
+def test_detect_codex_auth_reports_a_missing_binary(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(cli.shutil, "which", lambda _b: None)
+    assert cli.detect_codex_auth() == (False, "")
+
+
+# ── token input handling (pure) ───────────────────────────────────────────────
+def test_read_token_input_strips_a_pasted_secret():
+    assert cli.read_token_input("  ghp_abc  ") == ("ghp_abc", "")
+
+
+def test_read_token_input_reads_a_bare_existing_path(tmp_path):
+    path = tmp_path / "pat"
+    path.write_text("from-file\n\n")
+    assert cli.read_token_input(str(path)) == ("from-file", "")
+
+
+def test_read_token_input_reports_a_missing_at_path_without_echoing_it(tmp_path):
+    """A stray leading @ on a pasted PAT must not put the secret in a message."""
+    token, problem = cli.read_token_input(f"@{tmp_path / 'absent'}")
+    assert token == ""
+    assert problem
+    assert "absent" not in problem
+    assert str(tmp_path) not in problem
+
+
+def test_read_token_input_treats_a_bare_nonexistent_path_as_the_token():
+    """A PAT is opaque text; only an EXISTING path (or an explicit @) is a file."""
+    assert cli.read_token_input("/not/a/real/path") == ("/not/a/real/path", "")
+
+
+def test_normalize_login_matches_doctor_semantics():
+    assert cli.normalize_login(" Review-Bot[bot] ") == "review-bot"
+    assert cli.normalize_login("review-bot") == "review-bot"
+
+
+def test_gh_login_for_token_rejects_an_error_body_as_a_login(monkeypatch):
+    """gh writes its error body to stdout: it must never be read as a login, and
+    the call still counts as ANSWERED (a verdict, not an outage)."""
+    monkeypatch.setattr(
+        cli.subprocess, "run",
+        lambda *a, **k: _fake_proc('{"message":"Bad credentials"}\n', 0),
+    )
+    assert cli.gh_login_for_token("bad") == ("", True)
+
+
+def test_gh_login_for_token_reports_an_unrunnable_gh_as_unanswered(monkeypatch):
+    """gh absent is an OUTAGE, not a verdict — the caller may keep the token."""
+    def boom(*a, **k):
+        raise OSError("gh: not found")
+
+    monkeypatch.setattr(cli.subprocess, "run", boom)
+    assert cli.gh_login_for_token("whatever") == ("", False)
+
+
+def test_gh_login_for_token_reports_a_github_refusal_as_answered(monkeypatch):
+    monkeypatch.setattr(
+        cli.subprocess, "run", lambda *a, **k: _fake_proc("gh: HTTP 401\n", 1)
+    )
+    assert cli.gh_login_for_token("expired") == ("", True)
+
+
+# ── base-branch / reviewer inference from repo history ────────────────────────
+def _gh_run_stub(pr_list="", default_branch="", existing_branches=()):
+    """Stand in for the three gh reads base-branch inference makes, dispatching on
+    the REAL argv so a renamed --json field cannot silently pass."""
+    def run(cmd, cwd=None):
+        if cmd[:4] == ["gh", "pr", "list", "--state"]:
+            assert cmd[4] == "merged"
+            assert cmd[cmd.index("--json") + 1] == "baseRefName"
+            return pr_list
+        if cmd[:3] == ["gh", "repo", "view"]:
+            return default_branch
+        if cmd[:2] == ["gh", "api"]:
+            branch = cmd[2].rsplit("/", 1)[-1]
+            return branch if branch in existing_branches else ""
+        raise AssertionError(f"unexpected gh call: {cmd}")
+
+    return run
+
+
+def test_detect_base_branch_takes_the_majority_of_merged_prs(monkeypatch):
+    monkeypatch.setattr(cli, "_run", _gh_run_stub(
+        pr_list=json.dumps(
+            [{"baseRefName": "main"}, {"baseRefName": "main"}, {"baseRefName": "dev"}]
+        ),
+        existing_branches=("main",),
+    ))
+    branch, note = cli.detect_base_branch("/t", "acme/app")
+    assert branch == "main"
+    assert "2/3" in note
+
+
+def test_detect_base_branch_skips_a_branch_that_is_not_on_the_remote(monkeypatch):
+    """An inferred base that does not exist would point every PR at a missing ref
+    (and trip point-at.sh's hard stop) — fall through to the next candidate."""
+    monkeypatch.setattr(cli, "_run", _gh_run_stub(
+        pr_list=json.dumps([{"baseRefName": "deleted-release"}]),
+        default_branch="trunk",
+        existing_branches=("trunk",),
+    ))
+    assert cli.detect_base_branch("/t", "acme/app") == (
+        "trunk", "the repository default branch"
+    )
+
+
+def test_detect_base_branch_falls_back_to_the_default_branch(monkeypatch):
+    monkeypatch.setattr(cli, "_run", _gh_run_stub(
+        pr_list="[]", default_branch="trunk", existing_branches=("trunk",),
+    ))
+    assert cli.detect_base_branch("/t", "acme/app") == (
+        "trunk", "the repository default branch"
+    )
+
+
+def test_detect_base_branch_tolerates_malformed_gh_json(monkeypatch):
+    monkeypatch.setattr(cli, "_run", _gh_run_stub(
+        pr_list="not json at all", default_branch="trunk",
+        existing_branches=("trunk",),
+    ))
+    assert cli.detect_base_branch("/t", "acme/app")[0] == "trunk"
+
+
+def test_detect_base_branch_last_resort_is_dev_with_no_provenance(monkeypatch):
+    """Nothing confirmed → the harness default, and NO provenance comment:
+    'inferred from the harness default' is not an inference."""
+    monkeypatch.setattr(cli, "_run", _gh_run_stub())
+    assert cli.detect_base_branch("/t", "acme/app") == ("dev", "")
+
+
+def test_detect_base_branch_without_a_repo_cannot_confirm_anything(monkeypatch):
+    monkeypatch.setattr(cli, "_run", _gh_run_stub(
+        pr_list=json.dumps([{"baseRefName": "main"}]), existing_branches=("main",),
+    ))
+    assert cli.detect_base_branch("/t", "") == ("dev", "")
+
+
+def test_detect_review_bot_picks_the_most_frequent_non_fixer_reviewer(monkeypatch):
+    payload = json.dumps([
+        {"reviews": [{"author": {"login": "fix-bot"}},
+                     {"author": {"login": "review-bot"}}]},
+        {"reviews": [{"author": {"login": "review-bot"}}]},
+        {"reviews": [{"author": {"login": "someone"}}]},
+    ])
+    seen: list[list[str]] = []
+
+    def run(cmd, cwd=None):
+        seen.append(cmd)
+        return payload
+
+    monkeypatch.setattr(cli, "_run", run)
+    assert cli.detect_review_bot("/t", "Fix-Bot") == "review-bot"
+    # Real argv: a renamed field would return nothing and silently no-op.
+    assert seen[0][:4] == ["gh", "pr", "list", "--state"]
+    assert seen[0][4] == "merged"
+    assert seen[0][seen[0].index("--json") + 1] == "reviews"
+
+
+def test_detect_review_bot_is_empty_when_only_the_fixer_reviews(monkeypatch):
+    payload = json.dumps([{"reviews": [{"author": {"login": "fix-bot"}}]}])
+    monkeypatch.setattr(cli, "_run", lambda cmd, cwd=None: payload)
+    assert cli.detect_review_bot("/t", "fix-bot") == ""
+
+
+def test_detect_review_bot_tolerates_gh_failure_and_malformed_json(monkeypatch):
+    monkeypatch.setattr(cli, "_run", lambda cmd, cwd=None: "")
+    assert cli.detect_review_bot("/t", "fix-bot") == ""
+    monkeypatch.setattr(cli, "_run", lambda cmd, cwd=None: "{oops")
+    assert cli.detect_review_bot("/t", "fix-bot") == ""
+
+
+# ── toolchain-specific trusted red-test exit codes ────────────────────────────
+def test_gate_failure_exit_codes_for_cargo():
+    assert cli.gate_failure_exit_codes("cargo test --all") == "101"
+
+
+def test_gate_failure_exit_codes_left_default_for_other_toolchains():
+    assert cli.gate_failure_exit_codes("uv run pytest -q") == ""
+    assert cli.gate_failure_exit_codes("pnpm exec vitest run") == ""
+    assert cli.gate_failure_exit_codes("") == ""
+
+
+def test_gate_failure_exit_codes_tolerates_an_unparseable_command():
+    assert cli.gate_failure_exit_codes("cargo test 'unbalanced") == "101"
+
+
+# ── discovery probe: lint + typecheck alongside the test command ──────────────
+def test_parse_discovery_reply_reads_all_three_commands():
+    reply = (
+        "TEST_CMD: cargo test\n"
+        "LINT_CMD: cargo fmt --check && cargo clippy -- -D warnings\n"
+        "TYPECHECK_CMD: NO_TYPECHECK\n"
+    )
+    found = cli.parse_discovery_reply(reply)
+    assert found.test_cmd == "cargo test"
+    assert found.lint_cmd == "cargo fmt --check && cargo clippy -- -D warnings"
+    assert found.typecheck_cmd == ""
+
+
+def test_parse_discovery_reply_tolerates_a_reply_with_only_a_test_command():
+    found = cli.parse_discovery_reply("TEST_CMD: uv run pytest")
+    assert found.test_cmd == "uv run pytest"
+    assert found.lint_cmd == ""
+    assert found.typecheck_cmd == ""
+
+
+def test_parse_discovery_reply_honours_the_absence_sentinels():
+    found = cli.parse_discovery_reply(
+        "TEST_CMD: NO_TESTS\nLINT_CMD: NO_LINT\nTYPECHECK_CMD: NO_TYPECHECK\n"
+    )
+    assert (found.test_cmd, found.lint_cmd, found.typecheck_cmd) == ("", "", "")
+
+
+def test_discover_repo_commands_returns_every_command(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "_has_toolchain_signature", lambda _d: True)
+    monkeypatch.setattr(
+        cli.subprocess, "run",
+        lambda *a, **k: _fake_proc(
+            "TEST_CMD: uv run pytest\nLINT_CMD: ruff check\nTYPECHECK_CMD: pyrefly check\n"
+        ),
+    )
+    found = cli.discover_repo_commands(str(tmp_path))
+    assert found.lint_cmd == "ruff check"
+    assert found.typecheck_cmd == "pyrefly check"
+
+
+def test_discover_repo_commands_fail_soft_without_claude(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "_has_toolchain_signature", lambda _d: True)
+
+    def boom(*a, **k):
+        raise OSError("claude: not found")
+
+    monkeypatch.setattr(cli.subprocess, "run", boom)
+    assert cli.discover_repo_commands(str(tmp_path)) == cli.DiscoveredCommands()
+
+
+# ── overlay: the new discovered/inferred keys ─────────────────────────────────
+def test_synth_repo_env_writes_lint_typecheck_and_exit_codes():
+    text = cli.synth_repo_env(
+        repo="o/r", target_dir="/t", name="r",
+        test_cmd="cargo test", lint_cmd="cargo clippy -- -D warnings",
+        typecheck_cmd="", gate_test_failure_exit_codes="101",
+    )
+    env = _source_env(text)
+    assert env["LINT_CMD"] == "cargo clippy -- -D warnings"
+    assert env["GATE_TEST_FAILURE_EXIT_CODES"] == "101"
+    assert "TYPECHECK_CMD" not in env
+
+
+def test_synth_repo_env_omits_exit_codes_when_the_default_is_right():
+    env = _source_env(
+        cli.synth_repo_env(repo="o/r", target_dir="/t", name="r", test_cmd="pytest")
+    )
+    assert "GATE_TEST_FAILURE_EXIT_CODES" not in env
+
+
+def test_synth_repo_env_records_base_branch_provenance():
+    text = cli.synth_repo_env(
+        repo="o/r", target_dir="/t", name="r", base_branch="main",
+        base_branch_note="7/10 of the last merged PRs",
+    )
+    assert "# BASE_BRANCH inferred from 7/10 of the last merged PRs." in text
+    assert _source_env(text)["BASE_BRANCH"] == "main"
+
+
+# ── cmd_start first-run discovery ─────────────────────────────────────────────
+def _fresh_start_env(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path / "repos"))
+    shared = tmp_path / "shared.env"
+    shared.write_text("")
+    monkeypatch.setattr(cli, "SHARED_ENV", str(shared))
+    monkeypatch.setattr(cli.os, "execve", lambda *a: None)
+    return Path(cli.REPOS_DIR) / "app.env"
+
+
+def test_cmd_start_never_adopts_an_inferred_base_branch_unattended(
+    tmp_path, monkeypatch, capsys
+):
+    """point-at.sh hard-stops on a BASE_BRANCH that does not exist — that stop is
+    the operator's conscious-choice gate on where this harness MERGES. Inference
+    with nobody at the terminal must not walk past it: keep the default, record
+    the finding as an inert comment."""
+    overlay = _fresh_start_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "detect_base_branch", lambda _t, _r: ("main", "9/10 of the last merged PRs"))
+
+    cli.cmd_start(_start_args(
+        repo="acme/app", target_dir="/srv/acme-app", name="app",
+        base_branch=None, test_cmd="pytest", no_verify_test_cmd=True,
+    ))
+
+    text = overlay.read_text()
+    assert _source_env(text)["BASE_BRANCH"] == "dev"
+    assert "# detected merge target of recent PRs: main" in text
+    assert "main" in capsys.readouterr().out
+
+
+def test_cmd_start_records_no_suggestion_when_nothing_was_inferred(
+    tmp_path, monkeypatch
+):
+    """Anti-vacuity twin: with no confirmed candidate there is no suggestion and
+    no provenance comment — 'inferred from the harness default' is not a fact."""
+    overlay = _fresh_start_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "detect_base_branch", lambda _t, _r: ("dev", ""))
+
+    cli.cmd_start(_start_args(
+        repo="acme/app", target_dir="/srv/acme-app", name="app",
+        base_branch=None, test_cmd="pytest", no_verify_test_cmd=True,
+    ))
+
+    text = overlay.read_text()
+    assert _source_env(text)["BASE_BRANCH"] == "dev"
+    assert "detected merge target" not in text
+    assert "inferred from" not in text
+
+
+def test_cmd_start_never_infers_over_an_explicit_base_branch(tmp_path, monkeypatch):
+    overlay = _fresh_start_env(tmp_path, monkeypatch)
+
+    def refuse(*a, **k):
+        raise AssertionError("must not infer when --base-branch was passed")
+
+    monkeypatch.setattr(cli, "detect_base_branch", refuse)
+
+    cli.cmd_start(_start_args(
+        repo="acme/app", target_dir="/srv/acme-app", name="app",
+        base_branch="release", test_cmd="pytest", no_verify_test_cmd=True,
+    ))
+
+    assert _source_env(overlay.read_text())["BASE_BRANCH"] == "release"
+
+
+def test_cmd_start_write_config_preserves_the_existing_base_branch(
+    tmp_path, monkeypatch
+):
+    """A regenerate must not silently re-point a live deployment's merge target:
+    the previously written BASE_BRANCH stands unless --base-branch says otherwise."""
+    _prep_mismatch_overlay(tmp_path, monkeypatch)
+    overlay = tmp_path / "app.env"
+    overlay.write_text(
+        'REPO="acme/app"\nTARGET_DIR="/srv/acme-app"\nBASE_BRANCH="release-2"\n'
+    )
+    monkeypatch.setattr(cli.os, "execve", lambda *a: None)
+    monkeypatch.setattr(cli, "_stop_deployment", lambda _n: 0)
+
+    def refuse(*a, **k):
+        raise AssertionError("must not re-infer over a written BASE_BRANCH")
+
+    monkeypatch.setattr(cli, "detect_base_branch", refuse)
+
+    cli.cmd_start(_start_args(
+        repo="acme/app", target_dir="/srv/acme-app", name="app",
+        base_branch=None, write_config=True, test_cmd="pytest",
+        no_verify_test_cmd=True,
+    ))
+
+    assert _source_env(overlay.read_text())["BASE_BRANCH"] == "release-2"
+
+
+def test_cmd_start_write_config_honours_an_explicit_base_branch_override(
+    tmp_path, monkeypatch
+):
+    _prep_mismatch_overlay(tmp_path, monkeypatch)
+    overlay = tmp_path / "app.env"
+    overlay.write_text(
+        'REPO="acme/app"\nTARGET_DIR="/srv/acme-app"\nBASE_BRANCH="release-2"\n'
+    )
+    monkeypatch.setattr(cli.os, "execve", lambda *a: None)
+    monkeypatch.setattr(cli, "_stop_deployment", lambda _n: 0)
+
+    cli.cmd_start(_start_args(
+        repo="acme/app", target_dir="/srv/acme-app", name="app",
+        base_branch="main", write_config=True, test_cmd="pytest",
+        no_verify_test_cmd=True,
+    ))
+
+    assert _source_env(overlay.read_text())["BASE_BRANCH"] == "main"
+
+
+def test_cmd_start_confirms_the_inferred_base_branch_on_a_tty(tmp_path, monkeypatch):
+    overlay = _fresh_start_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "detect_base_branch", lambda _t, _r: ("main", "history"))
+    monkeypatch.setattr(cli.sys, "stdin", argparse.Namespace(isatty=lambda: True))
+    monkeypatch.setattr("builtins.input", _Answers(["trunk"]))
+
+    cli.cmd_start(_start_args(
+        repo="acme/app", target_dir="/srv/acme-app", name="app",
+        base_branch=None, test_cmd="pytest", no_verify_test_cmd=True,
+    ))
+
+    assert _source_env(overlay.read_text())["BASE_BRANCH"] == "trunk"
+
+
+def test_cmd_start_adopts_a_confirmed_base_branch_on_a_tty(tmp_path, monkeypatch):
+    overlay = _fresh_start_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        cli, "detect_base_branch", lambda _t, _r: ("main", "9/10 of the last merged PRs")
+    )
+    monkeypatch.setattr(cli.sys, "stdin", argparse.Namespace(isatty=lambda: True))
+    monkeypatch.setattr("builtins.input", _Answers([""]))
+
+    cli.cmd_start(_start_args(
+        repo="acme/app", target_dir="/srv/acme-app", name="app",
+        base_branch=None, test_cmd="pytest", no_verify_test_cmd=True,
+    ))
+
+    text = overlay.read_text()
+    assert _source_env(text)["BASE_BRANCH"] == "main"
+    assert "# BASE_BRANCH inferred from 9/10 of the last merged PRs." in text
+
+
+def test_cmd_start_writes_cargos_assertion_exit_code(tmp_path, monkeypatch):
+    overlay = _fresh_start_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "detect_base_branch", lambda _t, _r: ("main", "history"))
+
+    cli.cmd_start(_start_args(
+        repo="acme/app", target_dir="/srv/acme-app", name="app",
+        base_branch=None, test_cmd="cargo test", no_verify_test_cmd=True,
+    ))
+
+    assert _source_env(overlay.read_text())["GATE_TEST_FAILURE_EXIT_CODES"] == "101"
+
+
+# ── LINT_CMD/TYPECHECK_CMD: trusted gate inputs, confirmed + trial-run ────────
+def _discovery(**over):
+    return cli.DiscoveredCommands(
+        test_cmd=over.get("test_cmd", "uv run pytest"),
+        lint_cmd=over.get("lint_cmd", "ruff check"),
+        typecheck_cmd=over.get("typecheck_cmd", "pyrefly check"),
+    )
+
+
+def test_cmd_start_writes_discovered_checks_only_as_suggestions_unattended(
+    tmp_path, monkeypatch, capsys
+):
+    """A model-authored command that BLOCKS every commit cannot go live with
+    nobody to confirm it (ADR 0012 provenance): it is written inert."""
+    overlay = _fresh_start_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "detect_base_branch", lambda _t, _r: ("dev", ""))
+    monkeypatch.setattr(cli, "discover_repo_commands", lambda _t: _discovery())
+
+    cli.cmd_start(_start_args(
+        repo="acme/app", target_dir="/srv/acme-app", name="app",
+        base_branch=None, no_verify_test_cmd=True,
+    ))
+
+    text = overlay.read_text()
+    env = _source_env(text)
+    assert env["TEST_CMD"] == "uv run pytest"
+    assert "LINT_CMD" not in env
+    assert "TYPECHECK_CMD" not in env
+    assert "# LINT_CMD='ruff check'" in text
+    assert "# TYPECHECK_CMD='pyrefly check'" in text
+    assert "no terminal to confirm" in capsys.readouterr().out
+
+
+def test_cmd_start_promotes_a_confirmed_check_that_passes_its_trial_run(
+    tmp_path, monkeypatch
+):
+    overlay = _fresh_start_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "detect_base_branch", lambda _t, _r: ("dev", ""))
+    monkeypatch.setattr(
+        cli, "discover_repo_commands", lambda _t: _discovery(typecheck_cmd=""),
+    )
+    monkeypatch.setattr(cli.sys, "stdin", argparse.Namespace(isatty=lambda: True))
+    monkeypatch.setattr("builtins.input", _Answers(["", ""]))
+    monkeypatch.setattr(
+        cli, "verify_check_cmd", lambda *a, **k: cli.TestCmdCheck(exit_code=0, seconds=1.0)
+    )
+
+    cli.cmd_start(_start_args(
+        repo="acme/app", target_dir="/srv/acme-app", name="app", base_branch=None,
+    ))
+
+    assert _source_env(overlay.read_text())["LINT_CMD"] == "ruff check"
+
+
+def test_cmd_start_demotes_a_check_that_fails_its_trial_run(
+    tmp_path, monkeypatch, capsys
+):
+    """A lint command that is already red would block EVERY commit the fixer
+    makes — the exact wedge TEST_CMD verification exists to prevent."""
+    overlay = _fresh_start_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "detect_base_branch", lambda _t, _r: ("dev", ""))
+    monkeypatch.setattr(
+        cli, "discover_repo_commands", lambda _t: _discovery(typecheck_cmd=""),
+    )
+    monkeypatch.setattr(cli.sys, "stdin", argparse.Namespace(isatty=lambda: True))
+    monkeypatch.setattr("builtins.input", _Answers(["", ""]))
+    monkeypatch.setattr(
+        cli, "verify_check_cmd", lambda *a, **k: cli.TestCmdCheck(exit_code=1, seconds=2.0)
+    )
+
+    cli.cmd_start(_start_args(
+        repo="acme/app", target_dir="/srv/acme-app", name="app", base_branch=None,
+    ))
+
+    text = overlay.read_text()
+    assert "LINT_CMD" not in _source_env(text)
+    assert "# LINT_CMD='ruff check'" in text
+    assert "block EVERY commit" in capsys.readouterr().err
+
+
+def test_cmd_start_skips_a_check_the_operator_declines(tmp_path, monkeypatch):
+    overlay = _fresh_start_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "detect_base_branch", lambda _t, _r: ("dev", ""))
+    monkeypatch.setattr(
+        cli, "discover_repo_commands", lambda _t: _discovery(typecheck_cmd=""),
+    )
+    monkeypatch.setattr(cli.sys, "stdin", argparse.Namespace(isatty=lambda: True))
+    monkeypatch.setattr("builtins.input", _Answers(["-", ""]))
+    monkeypatch.setattr(
+        cli, "verify_check_cmd", lambda *a, **k: cli.TestCmdCheck(exit_code=0, seconds=1.0)
+    )
+
+    cli.cmd_start(_start_args(
+        repo="acme/app", target_dir="/srv/acme-app", name="app", base_branch=None,
+    ))
+
+    assert "LINT_CMD" not in _source_env(overlay.read_text())
+
+
+def test_cmd_start_writes_an_operator_supplied_lint_command_live(
+    tmp_path, monkeypatch
+):
+    """An explicit flag is already an operator decision — no confirmation needed,
+    and discovery must not override it."""
+    overlay = _fresh_start_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "detect_base_branch", lambda _t, _r: ("dev", ""))
+    monkeypatch.setattr(cli, "discover_repo_commands", lambda _t: _discovery())
+
+    cli.cmd_start(_start_args(
+        repo="acme/app", target_dir="/srv/acme-app", name="app", base_branch=None,
+        lint_cmd="make lint", typecheck_cmd="make types",
+        test_cmd="pytest", no_verify_test_cmd=True,
+    ))
+
+    env = _source_env(overlay.read_text())
+    assert env["LINT_CMD"] == "make lint"
+    assert env["TYPECHECK_CMD"] == "make types"
+
+
+def test_cmd_start_does_not_rediscover_when_reusing_an_overlay(
+    tmp_path, monkeypatch, capsys
+):
+    """Discovery and inference are first-run only: a reused overlay is authority."""
+    _prep_mismatch_overlay(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli.os, "execve", lambda *a: None)
+
+    def refuse(*a, **k):
+        raise AssertionError("must not probe on overlay reuse")
+
+    monkeypatch.setattr(cli, "detect_base_branch", refuse)
+    monkeypatch.setattr(cli, "discover_repo_commands", refuse)
+
+    cli.cmd_start(_start_args(repo="acme/app", target_dir="/srv/acme-app", name="app"))
+
+    assert "reusing config/repos/app.env" in capsys.readouterr().out
+
+
+def test_cmd_init_tightens_an_existing_shared_env_before_writing_secrets(
+    tmp_path, monkeypatch
+):
+    """--force over a 0644 file: O_CREAT's mode applies only to a NEW file, so
+    without a chmod FIRST the PAT would land in a world-readable file and only be
+    protected afterwards. Asserted at open time, not just at the end."""
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch, answers=_wizard_answers(), secrets=["good"],
+        gh=_gh_stub(token_logins={"good": "review-bot"}),
+    )
+    shared.parent.mkdir(parents=True, exist_ok=True)
+    shared.write_text("stale\n")
+    os.chmod(shared, 0o644)
+    modes: list[str] = []
+    real_open = os.open
+
+    def spy(path, flags, mode=0o777):
+        if str(path) == str(shared):
+            modes.append(oct(os.stat(path).st_mode & 0o777))
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(cli.os, "open", spy)
+
+    assert cli.cmd_init(argparse.Namespace(force=True)) == 0
+    assert modes == ["0o600"]  # already private when the descriptor was taken
+    assert oct(shared.stat().st_mode & 0o777) == "0o600"
+    assert "good" in shared.read_text()
+
+
+def test_cmd_init_identity_mode_is_case_insensitive(tmp_path, monkeypatch):
+    """`Three` must take the same path as `three` — the reviewer-token prompt
+    hangs off this comparison."""
+    shared, _asked, secrets = _init_env(
+        tmp_path, monkeypatch, answers=_wizard_answers(mode="THREE"),
+        secrets=["good"], gh=_gh_stub(token_logins={"good": "review-bot"}),
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    values = _shared_values(shared.read_text())
+    assert values["IDENTITY_MODE"] == "three"
+    assert values["REVIEW_BOT_TOKEN"] == "good"
+    assert secrets.prompts  # the token prompt DID fire
+
+
+def test_main_exits_130_on_keyboard_interrupt(monkeypatch, capsys):
+    """Ctrl-C at a wizard prompt is an ordinary exit, not a crash."""
+    def interrupted(_args):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "cmd_status", interrupted)
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main(["status"])
+    assert excinfo.value.code == 130
+    assert "aborted" in capsys.readouterr().err
+
+
+def test_start_parser_exposes_the_check_command_overrides():
+    args = cli.build_parser().parse_args(
+        ["start", "--lint-cmd", "make lint", "--typecheck-cmd", "make types"]
+    )
+    assert args.lint_cmd == "make lint"
+    assert args.typecheck_cmd == "make types"
+    # None, not "dev": only an ABSENT flag may be inferred/preserved.
+    assert args.base_branch is None
+
+
+def test_start_parses_with_no_name_flag():
+    """argparse runs `type` over the string default too: this used to abort every
+    `issue-agent start`/`status`/`stop` that did not pass --name."""
+    args = cli.build_parser().parse_args(["start"])
+    assert args.name == ""
+    assert cli.build_parser().parse_args(["status"]).name == ""
+
+
+def test_start_still_rejects_a_non_canonical_name():
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["start", "--name", "Weird Name"])
+
+
+# ── discovered check commands must be check-mode, and trialed off the tree ────
+@pytest.mark.parametrize("cmd, fragment", [
+    ("cargo fmt", "cargo fmt"),
+    ("cargo fmt --all", "cargo fmt"),
+    ("prettier --write .", "prettier"),
+    ("npx prettier -w src", "prettier"),
+    ("black .", "black"),
+    ("ruff format", "ruff format"),
+    ("isort .", "isort"),
+    ("gofmt -w ./...", "gofmt"),
+    ("goimports -w .", "goimports"),
+    ("dotnet format", "dotnet format"),
+])
+def test_mutating_check_command_rejects_rewriting_shapes(cmd, fragment):
+    """A formatter that rewrites the tree EXITS 0, so no trial run can catch it —
+    the shape has to be rejected statically."""
+    assert fragment in cli.mutating_check_command(cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "cargo fmt --check && cargo clippy -- -D warnings",
+    "prettier --check .",
+    "black --check .",
+    "ruff format --diff && ruff check",
+    "isort --check-only .",
+    "gofmt -l .",
+    "dotnet format --verify-no-changes",
+    "ruff check",
+    "tsc --noEmit",
+    "eslint .",
+])
+def test_mutating_check_command_accepts_check_mode_shapes(cmd):
+    assert cli.mutating_check_command(cmd) == ""
+
+
+def test_cmd_start_demotes_a_mutating_formatter_without_running_it(
+    tmp_path, monkeypatch, capsys
+):
+    overlay = _fresh_start_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "detect_base_branch", lambda _t, _r: ("dev", ""))
+    monkeypatch.setattr(
+        cli, "discover_repo_commands",
+        lambda _t: cli.DiscoveredCommands(test_cmd="pytest", lint_cmd="cargo fmt"),
+    )
+    monkeypatch.setattr(cli.sys, "stdin", argparse.Namespace(isatty=lambda: True))
+    monkeypatch.setattr("builtins.input", _Answers([""]))
+
+    def refuse(*a, **k):
+        raise AssertionError("a mutating command must never be executed")
+
+    monkeypatch.setattr(cli, "verify_check_cmd", refuse)
+    monkeypatch.setattr(cli, "verify_test_cmd", refuse)
+
+    cli.cmd_start(_start_args(
+        repo="acme/app", target_dir="/srv/acme-app", name="app", base_branch=None,
+        test_cmd="pytest", no_verify_test_cmd=True,
+    ))
+
+    text = overlay.read_text()
+    assert "LINT_CMD" not in _source_env(text)
+    assert "# LINT_CMD='cargo fmt'" in text
+    assert "not check-mode" in capsys.readouterr().err
+
+
+def _init_git_repo(path):
+    """A real one-commit repo — the trial-run tests need genuine git worktrees."""
+    path.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+           "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+    (path / "tracked.txt").write_text("pristine\n")
+    for argv in (["init", "-q", "-b", "main"], ["add", "-A"],
+                 ["commit", "-qm", "seed"]):
+        subprocess.run(["git", *argv], cwd=path, env=env, check=True,
+                       capture_output=True)
+    return path
+
+
+def test_verify_check_cmd_runs_off_the_operator_checkout(tmp_path):
+    """The trial must never execute a model-authored command where a human may be
+    mid-edit: it runs in a throwaway worktree, which is gone afterwards."""
+    repo = _init_git_repo(tmp_path / "repo")
+    seen: list[str] = []
+
+    def fake_run(cmd, cwd, timeout):
+        seen.append(cwd)
+        Path(cwd, "tracked.txt").write_text("MUTATED\n")
+        return 0
+
+    check = cli.verify_check_cmd("whatever", str(repo), run=fake_run)
+
+    assert check is not None and check.passed
+    assert seen and os.path.realpath(seen[0]) != os.path.realpath(repo)
+    assert (repo / "tracked.txt").read_text() == "pristine\n"
+    assert not os.path.exists(seen[0])  # cleaned up
+
+
+def test_verify_check_cmd_refuses_rather_than_using_the_real_tree(tmp_path):
+    """No worktree (not a git repo) → the command is NOT run at all. None is a
+    refusal, and the caller must not read it as a pass."""
+    plain = tmp_path / "plain"
+    plain.mkdir()
+
+    def refuse(*_a, **_k):
+        raise AssertionError("must not run the command outside a worktree")
+
+    assert cli.verify_check_cmd("whatever", str(plain), run=refuse) is None
+
+
+def test_cmd_start_leaves_the_operator_tree_untouched_when_trialing_a_check(
+    tmp_path, monkeypatch
+):
+    """End-to-end: a discovered lint command that rewrites whatever tree it runs
+    in must not reach the operator's working copy."""
+    repo = _init_git_repo(tmp_path / "repo")
+    overlay = _fresh_start_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(cli, "detect_base_branch", lambda _t, _r: ("dev", ""))
+    monkeypatch.setattr(
+        cli, "discover_repo_commands",
+        lambda _t: cli.DiscoveredCommands(lint_cmd="ruff check"),
+    )
+    monkeypatch.setattr(cli.sys, "stdin", argparse.Namespace(isatty=lambda: True))
+    monkeypatch.setattr("builtins.input", _Answers(["", ""]))
+
+    def mutating_gate_runner(cmd, cwd, timeout):
+        Path(cwd, "tracked.txt").write_text("MUTATED\n")
+        return 0
+
+    real_verify = cli.verify_check_cmd
+    monkeypatch.setattr(
+        cli, "verify_check_cmd",
+        lambda cmd, target, *a, **k: real_verify(cmd, target, run=mutating_gate_runner),
+    )
+
+    cli.cmd_start(_start_args(
+        repo="acme/app", target_dir=str(repo), name="app", base_branch=None,
+    ))
+
+    assert (repo / "tracked.txt").read_text() == "pristine\n"
+    assert _source_env(overlay.read_text())["LINT_CMD"] == "ruff check"
+
+
+def test_gh_login_rejects_a_literal_null_from_jq(monkeypatch):
+    """`gh api user --jq .login` prints `null` for an absent field, and `null`
+    passes the login charset — it must not be compared as an account."""
+    monkeypatch.setattr(cli.subprocess, "run", lambda *a, **k: _fake_proc("null\n", 0))
+    assert cli.gh_login_for_token("t") == ("", True)
+    assert cli.detect_fixer_login() == ""
