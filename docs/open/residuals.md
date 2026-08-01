@@ -127,6 +127,19 @@ Two smaller ones worth doing whenever the files are next touched:
   converter. They are never queried for admission, deduplication, process
   ownership, or effect authorization.
 
+- Automated merges on an UNPROTECTED base carry a base-advance TOCTOU: the
+  exact-head approval/CI are validated against the observed base, and the
+  executor binds only the head (`--match-head-commit`) — the base can advance
+  between observation and merge, landing head changes CI never saw against the
+  new base. This was the accepted posture for every pre-2026-07-31 merge; the
+  07-31 hardening closed it by requiring the strict server gate but thereby
+  disabled merging wherever the base cannot carry verifiable protection
+  (private free-plan repos 403 on the protection API), so the fallback was
+  restored 2026-08-01. Where the base CAN carry strict protection, add it —
+  the server then independently re-checks review/CI/up-to-date at merge time.
+  Trigger for revisiting: a merge broken by a base that advanced after its
+  review.
+
 - Legacy issue-keyed review retry counters (pre-ADR-0008 writes) are still
   honored by `roles._review_state`'s read union. A counter written under issue
   N for a PR that is later relinked away is never cleared by that PR's

@@ -82,8 +82,14 @@ class FixConfig:
     max_resolve_retries: int = 3
     # Historical name for the boot-verified server merge gate. True only when
     # branch protection requires review, status checks, and an up-to-date head.
-    # The strict server check closes the base-advance race that an expected-head
-    # merge alone cannot bind.
+    # Informational: should_automerge's exact-head review+CI preconditions are
+    # the whole client-side gate either way. Where the server gate holds it
+    # independently re-checks them at merge time and closes the base-advance
+    # race an expected-head merge cannot bind; where it cannot hold (an
+    # unprotected base, or a private free-plan repo where the protection API
+    # itself 403s) that race is the accepted residual — requiring this flag
+    # unconditionally silently disabled every merge on such repos (observed
+    # 2026-08-01; see residuals.md).
     arm_on_open: bool = False
     # SEPARATE, HIGHER ceiling for sessions that die BEFORE returning a result
     # (review C3/D2c). "Infra deaths are not attempts" stays true for every
@@ -537,10 +543,22 @@ def prs_needing_resume(
 
 def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
     """Port of watcher-lib.sh:maybe_automerge gating. Requires: AUTO_MERGE on, a
-    branch the harness itself authored, a boot-verified strict server merge
-    gate, three-identity mode, an exact-head approval by a distinct actor, and
-    exact-head CI ok|none."""
-    if not cfg.auto_merge or not cfg.arm_on_open:
+    branch the harness itself authored, three-identity mode, an exact-head
+    approval by a distinct actor, and exact-head CI ok|none.
+
+    The boot-verified strict server gate (arm_on_open) is deliberately NOT a
+    precondition: it is defense-in-depth that additionally closes the
+    base-advance race where the base can carry protection. Requiring it
+    unconditionally (2026-07-31 hardening) disabled merging entirely on repos
+    whose base cannot carry verifiable protection — a private free-plan repo
+    403s on the protection API itself — zeroing merges-per-deployment on
+    every current target (observed 2026-08-01). The exact-head preconditions
+    below are the whole client-side gate either way; the executor merges only
+    the observed head (`--match-head-commit`) and never arms persistent
+    GitHub auto-merge (its approval would survive later pushes without
+    last-push protection). Residual on unprotected bases: the base may
+    advance between observation and merge (see residuals.md)."""
+    if not cfg.auto_merge:
         return False
     if not pr.head_ref_oid:
         return False
@@ -574,9 +592,12 @@ def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
     # merge until a review approves and the required checks pass, so waiting
     # for them HERE only adds daemon latency — a busy fixer (one synchronous
     # session per tick) left #539 APPROVED+green and unmerged for the length
-    # of an unrelated resolve (2026-07-27). Arm immediately; GitHub holds the
-    # gate. The review/CI preconditions below remain the whole gate when the
-    # base is unprotected.
+    # of an unrelated resolve (2026-07-27). That early-arm optimization is
+    # retired: the executor deliberately performs exact-head merges and never
+    # arms persistent GitHub auto-merge, so firing before approval would 405
+    # against a protected base every poll (#534-class noise). The review/CI
+    # preconditions below are the whole client-side gate; server protection,
+    # where present, independently re-checks them at merge time.
     review = latest_other_review(pr.reviews, cfg.fix_bot)
     if (
         review is None

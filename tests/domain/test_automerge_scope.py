@@ -140,12 +140,28 @@ def test_arm_on_open_still_respects_scope_marker_and_conflicts():
     assert should_automerge(ours, FixState(), solo) is False
 
 
-def test_without_verified_strict_gate_automated_merge_stays_disabled():
+def test_unreviewed_or_red_ci_never_merges_regardless_of_server_gate():
     unreviewed = PRView(number=4, head_ref_name="fix/9-t", reviews=(), checks=GREEN)
     assert should_automerge(unreviewed, FixState(), _cfg(arm_on_open=False)) is False
     red = _pr("fix/9-t",
                  checks=(Check(name="ci", state="COMPLETED", bucket="fail"),))
     assert should_automerge(red, FixState(), _cfg(arm_on_open=False)) is False
+
+
+def test_exact_head_approval_and_green_ci_merge_without_server_gate():
+    """An unprotected base must not disable merging outright: the exact-head
+    distinct-actor approval + exact-head green CI below ARE the gate there
+    (2026-08-01 voyage: requiring the server gate unconditionally zeroed
+    merges on every repo whose base cannot carry verifiable protection)."""
+    pr = _pr("fix/9-t")
+    assert should_automerge(pr, FixState(), _cfg(arm_on_open=False)) is True
+    # …and the approval must still bind the CURRENT head, server gate or not.
+    stale = _pr(
+        "fix/9-t",
+        head_ref_oid="new-head",
+        reviews=(Review(author="review-bot", state="APPROVED", commit_id="old-head"),),
+    )
+    assert should_automerge(stale, FixState(), _cfg(arm_on_open=False)) is False
 
 
 # ── #48: a failed checks read must never arm a merge ──────────────────────────

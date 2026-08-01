@@ -351,8 +351,11 @@ def build_role(
         # runtime-tagged sessions: a FIXER_RUNTIME flip must cold-start resume
         # legs, not feed the new runtime the old runtime's session ids.
         store = Store(cfg.state_dir, runtime=cfg.fixer_runtime.value)
-        # Server merge-gate probe (once per boot): only a positively verified
-        # strict review+checks gate permits automated merging. Probed here
+        # Server merge-gate probe (once per boot): reports whether the base's
+        # protection independently re-checks review/CI/up-to-date at merge
+        # time. Informational since 2026-08-01 — the exact-head client gate in
+        # should_automerge merges either way; without the server gate the
+        # base-advance TOCTOU residual applies (residuals.md). Probed here
         # (not in from_env) because it needs the gateway; a flip of the repo's
         # protection therefore takes effect at the next daemon restart.
         if cfg.arm_on_open != "0":
@@ -361,18 +364,19 @@ def build_role(
             except GhUnavailable as exc:
                 active = False
                 sys.stderr.write(
-                    f"{role}: arm-on-open inactive — branch protection could "
-                    f"not be verified ({exc}); automated merge is disabled\n"
+                    f"{role}: merge-gate probe — branch protection could "
+                    f"not be verified ({exc})\n"
                 )
             cfg = dataclasses.replace(cfg, arm_on_open_active=active)
             sys.stderr.write(
-                f"{role}: arm-on-open "
+                f"{role}: server merge gate "
                 + (
-                    f"ACTIVE — {cfg.base_branch} protection verifiably requires "
-                    "review + status checks + an up-to-date head\n"
+                    f"VERIFIED — {cfg.base_branch} protection re-checks review "
+                    "+ status checks + up-to-date head at merge time\n"
                     if active else
-                    f"inactive — {cfg.base_branch} protection does not gate "
-                    "review, checks, and base freshness; automated merge disabled\n"
+                    f"absent — {cfg.base_branch} protection does not gate "
+                    "review/checks/base freshness; merges rely on the "
+                    "exact-head client gate alone (base-advance residual)\n"
                 )
             )
         return _probed(
