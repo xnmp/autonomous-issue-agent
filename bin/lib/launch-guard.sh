@@ -1,39 +1,31 @@
-# Duplicate-launcher detection shared by point-at.sh and its regression tests.
+# Duplicate-launcher guard shared by point-at.sh and its regression tests.
 #
-# Prints the pids of OTHER live point-at launchers for the given repo name,
-# one per line; prints nothing when this process is the only launcher.
+# History: this started as a pgrep -f heuristic over "point-at.sh <name>"
+# argvs. That is unwinnable: `$(...)`/pipeline subshells of the launcher
+# inherit its argv, wrapper processes (systemd-inhibit, sh -c, the operator's
+# shell snapshot) quote the launch command in THEIR argv, and forked
+# subshells of any such ancestor inherit it too — each variant made the guard
+# refuse its own first run (observed twice on 2026-08-01), and every
+# exclusion broad enough to silence them also hid a genuine duplicate
+# started from the same terminal. A lock held for the launcher's lifetime has
+# none of those failure modes: wrappers and forked subshells never hold it,
+# and a real second launcher always collides on it.
 #
-# Excluding $$/$PPID is NOT enough: `$(...)`, pipelines and `&&` lists all fork
-# subshells that INHERIT our argv, so /proc shows them as extra
-# "point-at.sh <name>" processes under fresh pids. Matching those made the
-# guard fire on literally every first run. Ancestors bite the same way from
-# the other direction: `systemd-inhibit ... bash point-at.sh <name>` or
-# `sh -c '... point-at.sh <name>'` puts the launch string in every wrapper's
-# argv, so the guard saw its own grandparent and refused the first run
-# (observed 2026-08-01). A genuine second launcher shares neither our ancestor
-# chain nor us as a parent, so drop candidates in our own lineage — and any
-# that exited between pgrep and the check, since a dead process is not a
-# running duplicate.
-duplicate_launcher_pids() {
-  _dlg_name="$1"
-  _dlg_lineage=" $$ "
-  _dlg_a="$PPID"
-  while [ -n "$_dlg_a" ] && [ "$_dlg_a" != "0" ] && [ "$_dlg_a" != "1" ]; do
-    _dlg_lineage="${_dlg_lineage}${_dlg_a} "
-    _dlg_a="$(ps -o ppid= -p "$_dlg_a" 2>/dev/null | tr -d '[:space:]' || true)"
-  done
-  for _dlg_p in $(pgrep -f "point-at\.sh ${_dlg_name}([[:space:]]|\$)" 2>/dev/null || true); do
-    # In our own ancestor chain ⇒ a wrapper quoting the launch command, not a
-    # second launcher. Only the candidate itself is lineage-checked: a genuine
-    # duplicate started from the SAME terminal shares an ancestor with us, so
-    # excluding parents-in-lineage would hide it.
-    case "$_dlg_lineage" in *" $_dlg_p "*) continue ;; esac
-    _dlg_pp="$(ps -o ppid= -p "$_dlg_p" 2>/dev/null | tr -d '[:space:]' || true)"
-    # empty ⇒ exited between pgrep and now (not a live duplicate);
-    # $$ ⇒ a subshell we forked (inherits our argv), not a launcher.
-    if [ -z "$_dlg_pp" ] || [ "$_dlg_pp" = "$$" ]; then
-      continue
-    fi
-    printf '%s\n' "$_dlg_p"
-  done
+# The fd is deliberately inherited by the role daemons the launcher spawns:
+# if the launcher dies but daemons survive, a second launch would still
+# double-dispatch, so the lock must outlive the launcher itself.
+acquire_launch_lock() {
+  _lg_dir="${XDG_STATE_HOME:-$HOME/.local/state}/issue-agent"
+  mkdir -p "$_lg_dir" || return 1
+  LAUNCH_LOCK_FILE="$_lg_dir/point-at.$1.lock"
+  # Append-mode open: MUST NOT truncate the holder's pid hint on a lost race.
+  exec 9>>"$LAUNCH_LOCK_FILE" || return 1
+  flock -n 9 || return 1
+  # We hold the lock — now the truncating write is safe. Operator hint only.
+  printf '%s\n' "$$" >| "$LAUNCH_LOCK_FILE"
+  return 0
+}
+
+launch_lock_holder_hint() {
+  head -n 1 "$LAUNCH_LOCK_FILE" 2>/dev/null || true
 }

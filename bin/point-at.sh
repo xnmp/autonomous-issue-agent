@@ -318,20 +318,12 @@ fi
 # The Python daemons hold a per-(role,repo) flock and will refuse to start a
 # duplicate anyway (the authoritative guard). But catch it HERE too, before the
 # doctor/branch/label dance, so a double `point-at` fails fast with a clear
-# message instead of racing to the flock. Match other point-at.sh processes for
-# THIS repo name, excluding ourselves and our parent. Anchored with a trailing
-# word boundary (end-of-string or space) — unanchored `pgrep -f` substring-
-# matches, so NAME=app would also catch a launcher for NAME=myapp.
-#
-# Lineage-aware detection lives in bin/lib/launch-guard.sh so the regression
-# test can exercise it without a full launch (incident 2026-08-01: a
-# systemd-inhibit wrapper's argv matched the old $$/$PPID-only exclusion and
-# the guard refused its own first run).
-_others="$(duplicate_launcher_pids "$NAME" | tr '\n' ' ' | sed 's/ $//')"
-if [ -n "$_others" ]; then
-  red "a point-at launcher for '$NAME' is already running (pids: $(echo $_others | tr '\n' ' '))."
-  red "Refusing to start a second — duplicate daemons double-dispatch. Stop it first:"
-  red "  kill $_others"
+# message instead of racing to the daemons' flock. A lifetime flock, not a
+# pgrep heuristic — see bin/lib/launch-guard.sh for why argv matching kept
+# refusing its own first run (incident 2026-08-01).
+if ! acquire_launch_lock "$NAME"; then
+  red "a point-at launcher for '$NAME' is already running (pid $(launch_lock_holder_hint), lock: ${LAUNCH_LOCK_FILE:-unknown})."
+  red "Refusing to start a second — duplicate daemons double-dispatch. Stop it first."
   exit 1
 fi
 

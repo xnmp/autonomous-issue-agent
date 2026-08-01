@@ -162,49 +162,46 @@ else
 fi
 
 # ── duplicate-launcher guard (incident 2026-08-01) ────────────────────────────
-# A wrapper (systemd-inhibit, sh -c, …) whose argv quotes the launch command is
-# an ANCESTOR whose cmdline matches the guard's pgrep; the guard must not
-# refuse its own first run because of it, while still catching a genuinely
-# unrelated live launcher.
+# The guard is a lifetime flock, not argv matching: wrappers whose argv quotes
+# the launch command (systemd-inhibit, sh -c, shell snapshots) and forked
+# subshells of any ancestor must not trip it, while a genuine concurrent
+# launcher must always collide on the lock.
 . "$ROOT/bin/lib/launch-guard.sh"
 guard_name="pointat-guard-selftest-$$"
+export XDG_STATE_HOME="$scratch/guard-state"
 
-# False-positive case: the matching process is our own ancestor. The outer
-# script's argv ends in "point-at.sh <name>"; it forks a child bash that runs
-# the guard. The old $$/$PPID-only exclusion reported the ancestor.
-mkdir -p "$scratch/wrapper"
-cat >"$scratch/wrapper/point-at.sh" <<EOF
-#!/usr/bin/env bash
-bash -c '. "$ROOT/bin/lib/launch-guard.sh"; duplicate_launcher_pids "$guard_name"'
-EOF
-chmod +x "$scratch/wrapper/point-at.sh"
-ancestor_out="$(bash "$scratch/wrapper/point-at.sh" "$guard_name")"
-if [ -z "$ancestor_out" ]; then
-  ok "guard ignores its own wrapper ancestors"
+# First acquisition succeeds even under an argv-quoting wrapper chain.
+if sh -c "bash -c '. \"$ROOT/bin/lib/launch-guard.sh\"; acquire_launch_lock $guard_name'" \
+    wrapper "point-at.sh $guard_name" >/dev/null 2>&1; then
+  ok "guard acquires under an argv-quoting wrapper chain"
 else
-  no "guard ignores its own wrapper ancestors" "reported: $ancestor_out"
+  no "guard acquires under an argv-quoting wrapper chain"
 fi
 
-# True-duplicate case: a detached (setsid → reparented off our lineage)
-# process whose argv matches "point-at.sh <name>" must be reported.
-mkdir -p "$scratch/dup"
-cat >"$scratch/dup/point-at.sh" <<'EOF'
-#!/usr/bin/env bash
-sleep 30
-EOF
-chmod +x "$scratch/dup/point-at.sh"
-# Double-fork: the intermediate subshell exits at once, so the sleeper is
-# reparented off this shell — a backgrounded setsid alone execs in place and
-# would keep PPID = $$, which the guard rightly treats as our own subshell.
-( setsid bash "$scratch/dup/point-at.sh" "$guard_name" >/dev/null 2>&1 & )
+# While another live process holds the lock, acquisition must fail…
+lock_file="$XDG_STATE_HOME/issue-agent/point-at.$guard_name.lock"
+mkdir -p "$(dirname "$lock_file")"
+flock "$lock_file" sleep 30 &
+holder_pid=$!
 sleep 0.3
-dup_out="$(duplicate_launcher_pids "$guard_name")"
-pkill -f "dup/point-at\.sh $guard_name" >/dev/null 2>&1 || true
-if [ -n "$dup_out" ]; then
-  ok "guard reports a genuine detached duplicate"
+if (acquire_launch_lock "$guard_name") 2>/dev/null; then
+  no "guard refuses while another launcher holds the lock"
 else
-  no "guard reports a genuine detached duplicate"
+  ok "guard refuses while another launcher holds the lock"
 fi
+
+# …and succeed again once the holder is gone (a dead process is not a
+# running duplicate — flock releases on exit, unlike a stale pid file).
+pkill -P "$holder_pid" >/dev/null 2>&1 || true
+kill "$holder_pid" >/dev/null 2>&1 || true
+wait "$holder_pid" 2>/dev/null || true
+sleep 0.3
+if (acquire_launch_lock "$guard_name") 2>/dev/null; then
+  ok "guard reacquires after the holder exits"
+else
+  no "guard reacquires after the holder exits"
+fi
+unset XDG_STATE_HOME
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
