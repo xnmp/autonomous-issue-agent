@@ -127,6 +127,17 @@ Two smaller ones worth doing whenever the files are next touched:
   converter. They are never queried for admission, deduplication, process
   ownership, or effect authorization.
 
+- `gh issue comment <n> --body …` is agent-allowlisted (bounded: plain body,
+  numeric selector, ambient repo, no other flags/env — 2026-08-01, after the
+  07-31 allowlist blocked the workflow's own mandatory acceptance-criteria
+  step). Two accepted residuals within the trusted-inbound posture: comment
+  BODIES are an unmoderated publication channel (a compromised leg could post
+  file contents to its own issue), and agent-side comments bypass the
+  durable-command/receipt funnel, so a retried leg can double-post. Trigger
+  for promoting comments to a Governed kind with repo-pinned gating and
+  dedup: onboarding any repo with untrusted inbound issues, or an observed
+  double-posted criteria comment causing reviewer confusion.
+
 - Automated merges on an UNPROTECTED base carry a base-advance TOCTOU: the
   exact-head approval/CI are validated against the observed base, and the
   executor binds only the head (`--match-head-commit`) — the base can advance

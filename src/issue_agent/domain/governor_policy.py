@@ -372,6 +372,49 @@ _GH_READS = {
     "workflow": frozenset({"view", "list"}),
 }
 
+# The one create the agent workflow itself REQUIRES: AGENT.md steps 2-3
+# mandate posting acceptance-criteria and test-plan comments to the issue
+# before any code. The 2026-07-31 hardening shipped the read allowlist
+# without it, so every fresh resolve deterministically blocked on its own
+# first workflow step (observed live on keifu #155, 2026-08-01). Bounded to
+# exactly that need — a plain-body comment on a numbered issue of the
+# ambient repo: any other flag (--edit-last/--delete-last mutate the bot's
+# own coordination comments; -R/--repo and URL selectors retarget another
+# repo; -e/-w/no-body go interactive and hang a headless leg) and any env
+# assignment (GH_REPO=...) fail closed. `gh pr comment` has no workflow
+# consumer — the reviewer leg is fenced read-only before resolve() runs.
+_GH_COMMENT_BODY_FLAGS = frozenset({"--body", "-b", "--body-file", "-F"})
+
+
+def _gh_issue_comment_allowed(
+    inner: list[str],
+    env_assignments: object,
+    extra_env: object,
+) -> bool:
+    if env_assignments or extra_env:
+        return False
+    if len(inner) < 4 or inner[1] != "issue" or inner[2] != "comment":
+        return False
+    selector: str | None = None
+    has_body = False
+    expect_value = False
+    for word in inner[3:]:
+        if expect_value:
+            expect_value = False
+            continue
+        if word.startswith("-"):
+            flag = word.split("=", 1)[0]
+            if flag not in _GH_COMMENT_BODY_FLAGS:
+                return False
+            has_body = True
+            if "=" not in word:
+                expect_value = True
+            continue
+        if selector is not None:
+            return False
+        selector = word
+    return selector is not None and selector.isdigit() and has_body
+
 
 def resolve(command: str) -> Resolution:
     """Resolve a shell program without deferring command identity to runtime."""
@@ -491,7 +534,7 @@ def resolve(command: str) -> Resolution:
                 len(inner) >= 3
                 and inner[1] in _GH_READS
                 and inner[2] in _GH_READS[inner[1]]
-            )
+            ) or _gh_issue_comment_allowed(inner, _env, _extra_env)
             api_read = (
                 len(inner) >= 2
                 and inner[1] == "api"

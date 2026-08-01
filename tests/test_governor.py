@@ -516,6 +516,54 @@ def test_literal_gh_api_get_remains_allowed():
     )
 
 
+@pytest.mark.parametrize(
+    "command",
+    (
+        "gh issue comment 155 --body '## Acceptance Criteria'",
+        "gh issue comment 155 --body-file criteria.md",
+        "gh issue comment 155 -b 'short'",
+        "gh issue comment 155 --body='## Test Plan'",
+    ),
+)
+def test_workflow_mandated_issue_comments_are_allowed(command):
+    """AGENT.md steps 2-3 REQUIRE posting acceptance-criteria / test-plan
+    comments before code; the allowlist must not deny the workflow's own
+    first step (keifu #155, 2026-08-01: every fresh resolve blocked)."""
+    assert isinstance(gov.resolve(command), gov.Ungoverned)
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        # verb boundary
+        "gh issue close 155",
+        "gh issue edit 155 --add-label done",
+        "gh pr merge 42 --squash",
+        "gh pr close 42",
+        "gh release create v1",
+        "gh issue delete 155",
+        # gh pr comment has no workflow consumer (reviewer leg is read-only
+        # fenced before resolve() runs)
+        "gh pr comment 42 --body 'reviewed'",
+        # flag boundary inside `issue comment`: mutating the bot's own
+        # coordination comments, retargeting, or going interactive
+        "gh issue comment 155 --delete-last --yes",
+        "gh issue comment 155 --edit-last --body rewritten",
+        "gh issue comment 155 --repo other/repo --body hi",
+        "gh issue comment 155 -R other/repo --body hi",
+        "gh issue comment https://github.com/other/repo/issues/1 --body hi",
+        "gh issue comment 155 --editor",
+        "gh issue comment 155 -w",
+        "gh issue comment 155",
+        "env GH_REPO=victim/repo gh issue comment 1 --body y",
+    ),
+)
+def test_other_gh_mutations_remain_outside_the_allowlist(command):
+    resolution = gov.resolve(command)
+    assert isinstance(resolution, gov.Unresolvable)
+    assert "allowlist" in resolution.reason
+
+
 def test_python_c_is_unresolvable_and_blocked():
     assert gov.find_violations(
         "python -c \"import os; os.system('git commit --no-verify -m x')\""
