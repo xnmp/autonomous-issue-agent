@@ -69,9 +69,14 @@ done
 # deterministically (harness #13; observed live 2026-07-27, PR #552's ~2.3MB
 # screenshots burned review retries on an unwinnable run). Enforce at commit
 # time — where the file is created and the author can still re-capture. Checks
-# files already staged AND images sitting in evidence/: this hook fires BEFORE
-# the command executes, so a compound `git add … && git commit` has staged
-# nothing yet. 700KB default keeps base64 (×4/3) under the 1MB buffer.
+# files already staged AND new/modified images in evidence/: this hook fires
+# BEFORE the command executes, so a compound `git add … && git commit` has
+# staged nothing yet — but an evidence file already committed at HEAD and
+# untouched in the worktree is INHERITED state this author cannot re-capture
+# (2026-08-01: a screenshot merged by keifu PR #154 blocked every later
+# agent's every commit until they moved a file they did not create). Only
+# what this author added or changed is this commit's business. 700KB default
+# keeps base64 (×4/3) under the 1MB buffer.
 # Set EVIDENCE_MAX_IMAGE_KB to adjust; 0 disables.
 max_kb="${EVIDENCE_MAX_IMAGE_KB:-700}"
 if [ "$max_kb" != "0" ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -85,7 +90,7 @@ if [ "$max_kb" != "0" ] && git rev-parse --is-inside-work-tree >/dev/null 2>&1; 
     fi
   done < <(
     { git diff --cached --name-only --diff-filter=AM 2>/dev/null
-      find evidence -maxdepth 3 -type f 2>/dev/null; } |
+      git ls-files --others --modified --exclude-standard -- evidence 2>/dev/null; } |
       grep -iE '\.(png|jpe?g|gif|webp|bmp)$' | sort -u
   )
   if [ -n "$oversized" ]; then

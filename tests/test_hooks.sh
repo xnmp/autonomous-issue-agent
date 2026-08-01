@@ -155,6 +155,22 @@ out=$( cd "$d" && EVIDENCE_MAX_IMAGE_KB=0 bash "$CHECKS/check-commit.sh" commit 
 out=$( cd "$d" && EVIDENCE_MAX_IMAGE_KB=5 bash "$CHECKS/check-commit.sh" commit -m "evidence: shots" 2>&1 ); rc=$?
 [ "$rc" -eq 1 ] && ok "custom limit honoured" || no "custom limit honoured" "rc=$rc"
 rm -rf "$d"
+# An oversized evidence image INHERITED from HEAD (committed by an earlier PR,
+# untouched here) is not this author's to re-capture and must NOT block
+# (2026-08-01: keifu PR #154's merged screenshot blocked every later commit).
+d=$(fresh_repo)
+( cd "$d" && mkdir evidence && head -c 800000 /dev/urandom > evidence/inherited.png \
+    && git add evidence/inherited.png \
+    && EVIDENCE_MAX_IMAGE_KB=0 git commit -qm 'evidence: inherited' )
+out=$( cd "$d" && bash "$CHECKS/check-commit.sh" commit -m "fix: unrelated" 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] && ok "inherited committed oversized png passes" \
+  || no "inherited committed oversized png passes" "rc=$rc out=${out:0:160}"
+# …but the same file MODIFIED in the worktree is this author's again.
+( cd "$d" && head -c 900000 /dev/urandom > evidence/inherited.png )
+out=$( cd "$d" && bash "$CHECKS/check-commit.sh" commit -m "evidence: retake" 2>&1 ); rc=$?
+[ "$rc" -eq 1 ] && ok "modified inherited oversized png blocked" \
+  || no "modified inherited oversized png blocked" "rc=$rc out=${out:0:160}"
+rm -rf "$d"
 
 echo "== check-commit-order.sh (red before green) =="
 # Case A: green with NO prior red on the branch → blocked.
