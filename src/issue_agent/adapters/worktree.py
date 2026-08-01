@@ -741,6 +741,11 @@ def build_gate_context(
     markers = HarnessMarkers(cwd)
     screenshots_read: tuple[str, ...] = ()
     screenshots_receipt_available = False
+    # Distinct from "unavailable": the runtime DOES mint receipts but this
+    # read failed (transient I/O). The gate must say "retry/read the images",
+    # never the capability dead-end message (adversarial P2-3 — the latter
+    # instructs deleting committed evidence over a recoverable condition).
+    screenshots_receipt_unreadable = False
     if screenshots_read_path:
         try:
             with open(screenshots_read_path, encoding="utf-8") as receipt:
@@ -818,6 +823,7 @@ def build_gate_context(
                     screenshots_receipt_available = True
         except OSError:
             screenshots_read = ()
+            screenshots_receipt_unreadable = True
 
     def open_pr(target_branch: str) -> OpenPrLookup:
         """Resolved ONLY when the governor actually gates a push (see
@@ -994,6 +1000,7 @@ def build_gate_context(
         visual_ac=markers.visual_ac(),
         screenshots_read=screenshots_read,
         screenshots_receipt_available=screenshots_receipt_available,
+        screenshots_receipt_unreadable=screenshots_receipt_unreadable,
         harness_test_cmd=markers.test_cmd(),
         env_test_cmd=env_test_cmd,
         exists_at_base=exists_at_base,

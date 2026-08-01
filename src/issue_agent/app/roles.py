@@ -107,6 +107,7 @@ from ..domain.events import (
     Producer,
     RecurrenceDetected,
     TelemetryEvent,
+    TelemetryWarning,
 )
 from ..domain.ports import (
     CiPendingState,
@@ -1661,6 +1662,81 @@ def _duplicate_pr_reporter(
     return report
 
 
+def _stall_reporter(journal: EventSink | None, store: Store, log):
+    """No silent forever: any watched target whose observable signature has
+    not changed for a whole stall threshold emits an escalating
+    `target_stalled` TelemetryWarning — regardless of WHY it is stuck.
+
+    2026-08-01's run produced three unrelated stall shapes (advisory-UNSTABLE
+    merge deadlock, receipt-dead-ended visual resolve, uncounted review
+    deferrals); each per-path fix is necessary, but this watchdog is the
+    boundary measurement that catches the classes nobody has met yet.
+    Telemetry only — it never mutates lifecycle, so a false positive costs a
+    journal line, never a blocked leg. One emit per (target, level) per
+    process; a restart re-announces the current level once, which is the
+    correct behaviour for an operator attaching to a fresh log."""
+    from ..domain.liveness import detect_stalls
+
+    emitted: set[tuple[str, int]] = set()
+
+    def report(world) -> None:
+        seen: dict[str, tuple[str, str]] = {}
+        for pr in world.prs:
+            if pr.state == "OPEN":
+                sig, since = store.get_stall_marker("pr", pr.number)
+                if sig:
+                    seen[f"pr:{pr.number}"] = (sig, since)
+        for issue in world.issues:
+            if issue.state == "open":
+                sig, since = store.get_stall_marker("issue", issue.number)
+                if sig:
+                    seen[f"issue:{issue.number}"] = (sig, since)
+        stalls, next_seen = detect_stalls(world, seen)
+        for key, marker in next_seen.items():
+            if seen.get(key) != marker:
+                kind, _, num = key.partition(":")
+                store.set_stall_marker(kind, int(num), marker[0], marker[1])
+        for stall in stalls:
+            dedupe = (f"{stall.kind}:{stall.number}", stall.level)
+            if dedupe in emitted:
+                continue
+            emitted.add(dedupe)
+            minutes = int(stall.age_seconds // 60)
+            log(
+                f"STALL: {stall.kind} #{stall.number} unchanged for "
+                f"{minutes} min (level {stall.level}) — nothing is moving it"
+            )
+            if journal is None:
+                continue
+            try:
+                journal.emit(
+                    TelemetryEvent(
+                        TelemetryWarning(
+                            "target_stalled",
+                            f"{stall.kind} #{stall.number} unchanged for "
+                            f"{minutes} min",
+                            {
+                                "kind": stall.kind,
+                                "level": stall.level,
+                                "age_seconds": int(stall.age_seconds),
+                            },
+                        ),
+                        Correlation(
+                            pr=stall.number if stall.kind == "pr" else None,
+                            issue=(
+                                stall.number
+                                if stall.kind == "issue"
+                                else None
+                            ),
+                        ),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 — telemetry must not block the tick
+                log(f"stall for {stall.kind} #{stall.number} not journalled ({exc})")
+
+    return report
+
+
 def _ci_flake_reporter(
     journal: EventSink | None, repo: str, fix_cfg: FixConfig, log, control=None
 ):
@@ -1915,6 +1991,7 @@ def build_fix_daemon(
     report_ci_flakes = _ci_flake_reporter(
         journal, cfg.repo, fix_cfg, _log("fix"), control
     )
+    report_stalls = _stall_reporter(journal, store, _log("fix"))
     daemon_ref: dict[str, Daemon] = {}
 
     issue_kinds = frozenset({AgentKind.RESOLVE, AgentKind.RESUME})
@@ -1975,6 +2052,7 @@ def build_fix_daemon(
         report_ci_stalls(world)
         report_duplicates(world)
         report_ci_flakes(world, state)
+        report_stalls(world)
         daemon = daemon_ref.get("daemon")
         externally_busy = fixer_busy()
         slots = (

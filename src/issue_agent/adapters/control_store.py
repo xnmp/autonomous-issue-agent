@@ -3784,6 +3784,26 @@ class SQLiteControlStore:
             )
             return PendingCommand(repeated, "pending", 0)
 
+    def last_published_revision(self, target: str) -> str | None:
+        """The revision this deployment most recently PUBLISHED to `target`
+        (newest succeeded PUBLISH_BRANCH receipt), or None when it never has.
+
+        The publish broker's foreign-write fence (ADR 0012 §2): a remote tip
+        equal to this value is our own published history — the agent may
+        rewrite it; anything else was written by someone else and must be
+        incorporated, not replaced."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT r.remote_revision FROM effect_receipts AS r "
+                "JOIN lifecycle_commands AS c ON c.command_id=r.command_id "
+                "WHERE c.target=? AND c.kind=? AND r.status='succeeded' "
+                "ORDER BY c.created_at DESC, c.rowid DESC LIMIT 1",
+                (target, CommandKind.PUBLISH_BRANCH.value),
+            ).fetchone()
+        if row is None or not row[0]:
+            return None
+        return str(row[0])
+
     def pending_commands(
         self,
         *,

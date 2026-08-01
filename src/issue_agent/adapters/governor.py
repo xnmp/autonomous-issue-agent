@@ -105,6 +105,7 @@ class GateContext:
     visual_ac: bool = False                  # agent declared a visual criterion
     screenshots_read: tuple[str, ...] = ()   # evidence images the agent actually read
     screenshots_receipt_available: bool = True
+    screenshots_receipt_unreadable: bool = False
     harness_test_cmd: str | None = None
     env_test_cmd: str | None = None
     # Operator opt-out for a genuinely test-less repo (ALLOW_UNTESTED=1 in the
@@ -427,6 +428,7 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
             ctx.screenshots_read,
             body,
             receipt_available=ctx.screenshots_receipt_available,
+            receipt_unreadable=ctx.screenshots_receipt_unreadable,
         ),
         lambda: gate.check_required_test(ctx.branch, ctx.changed_files),
         lambda: gate.check_commit_log(ctx.branch_subjects),

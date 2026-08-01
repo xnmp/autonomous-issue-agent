@@ -391,6 +391,34 @@ def _non_image_evidence_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def _tracked_marker_repo(tmp_path: Path) -> Path:
+    """The keifu #167→#156 poisoning shape: `.harness/test-cmd` COMMITTED on
+    the base before the branch exists, so it is inherited history — present
+    in the worktree, absent from the branch diff (the diff-level deny rule
+    cannot fire), and it must not become the gate's resolved test command."""
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    _git(repo, "init", "-q", "-b", "dev")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "config", "commit.gpgsign", "false")
+    (repo / "seed.txt").write_text("seed\n")
+    (repo / ".harness").mkdir()
+    (repo / ".harness" / "test-cmd").write_text("true\n")
+    _git(repo, "add", "seed.txt")
+    _git(repo, "add", "-f", ".harness/test-cmd")
+    _git(repo, "commit", "-qm", "chore: seed with poisoned marker")
+    _git(repo, "switch", "-qc", "fix/8-tracked-marker")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_new.py").write_text("def test_new(): assert True\n")
+    _git(repo, "add", "tests/test_new.py")
+    _git(repo, "commit", "-qm", "red: new regression test")
+    (repo / "impl.py").write_text("x = 1\n")
+    _git(repo, "add", "impl.py")
+    _git(repo, "commit", "-qm", "green: implement")
+    return repo
+
+
 def _committed_harness_state_repo(tmp_path: Path) -> Path:
     """Keifu #167→#156: a committed .harness/test-cmd retargets the trusted
     gate for every downstream worktree — harness control state in the diff
@@ -400,6 +428,12 @@ def _committed_harness_state_repo(tmp_path: Path) -> Path:
     (repo / ".harness" / "test-cmd").write_text("cargo test one_single_test\n")
     _git(repo, "add", "-f", ".harness/test-cmd")
     _git(repo, "commit", "-qm", "chore: oops harness marker")
+    return repo
+
+
+def _unread_receipt_repo(tmp_path: Path) -> Path:
+    repo = _visual_repo(tmp_path)
+    commit_evidence(repo, "evidence/ac-1.png")
     return repo
 
 
@@ -467,6 +501,14 @@ GOLDEN: tuple[Case, ...] = (
          _pr_argv(), False, reason_contains=".harness/"),
     Case("visual_ac_without_screenshot", "pr", _visual_repo, _pr_argv(), False,
          reason_contains="no screenshot is committed"),
+    Case("visual_ac_receipt_unreadable", "pr", _unread_receipt_repo,
+         _pr_argv(), False,
+         # A CONFIGURED-but-unreadable receipt is a recoverable I/O condition:
+         # both stacks must say "read the images again", never the capability
+         # dead-end advice (which tells the agent to delete committed
+         # evidence) — adversarial P2-3/P2-A.
+         env={"HARNESS_SCREENSHOTS_READ": "/nonexistent/screenshots-read"},
+         reason_contains="with the Read tool"),
     Case(
         "visual_ac_with_read_screenshot",
         "pr",
@@ -536,6 +578,13 @@ GOLDEN: tuple[Case, ...] = (
          # No TEST_CMD ⇒ the marker IS the resolved command, and §7c still
          # polices it: 'true' stays green on revert ⇒ tautological ⇒ deny.
          reason_contains="still PASS"),
+    Case("tracked_marker_is_ignored", "pr",
+         _tracked_marker_repo, _pr_argv(), False,
+         # Keifu #167→#156: a COMMITTED marker is repo history that retargets
+         # the gate's teeth for every worktree — both stacks must ignore it.
+         # With no TEST_CMD either, the resolvable command is NONE ⇒ deny for
+         # a missing test command, NOT the tracked marker's verdict.
+         reason_contains="no test command"),
 
     # ── no test command at all → fail CLOSED, and the operator opt-out ───────
     Case("no_test_command", "pr",
@@ -650,6 +699,7 @@ def test_golden_covers_every_rule_family() -> None:
         "non_image_evidence": "evidence",
         "committed_harness_state": "evidence",
         "visual_ac_without_screenshot": "evidence",
+        "visual_ac_receipt_unreadable": "evidence",
         "visual_ac_with_read_screenshot": "evidence",
         "visual_ac_with_forged_worktree_receipt": "evidence",
         "existing_test_weakened": "evidence",
@@ -662,6 +712,7 @@ def test_golden_covers_every_rule_family() -> None:
         "operator_test_cmd_wins": "test-cmd-precedence",
         "operator_tautological_test_cmd_blocks": "test-cmd-precedence",
         "marker_used_when_operator_has_none": "test-cmd-precedence",
+        "tracked_marker_is_ignored": "test-cmd-precedence",
         "no_test_command": "untested", "no_test_command_with_opt_out": "untested",
         "push_without_open_pr": "push", "push_with_open_pr_failing_tests": "push",
         "push_with_open_pr_green": "push", "push_on_ungoverned_branch": "push",

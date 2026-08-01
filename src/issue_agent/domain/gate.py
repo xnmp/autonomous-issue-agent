@@ -362,6 +362,7 @@ def check_visual_evidence(
     pr_body: str = "",
     *,
     receipt_available: bool = True,
+    receipt_unreadable: bool = False,
 ) -> GateResult:
     """When the agent declared a visual acceptance criterion (.harness/visual-ac),
     the PR must commit screenshots under evidence/ AND the agent must have actually
@@ -389,10 +390,22 @@ def check_visual_evidence(
             "a visual acceptance criterion was declared (.harness/visual-ac) but no "
             "screenshot is committed under evidence/ — capture one with agent-browser"
         )
+    if receipt_unreadable:
+        # The runtime mints receipts; THIS read failed. Recoverable — never
+        # the capability dead-end advice (which says to delete evidence).
+        return deny(
+            "trusted screenshot-read receipt is unavailable — open each "
+            "evidence image with the Read tool before opening the PR"
+        )
     if not receipt_available:
         return deny(
-            "trusted screenshot-read receipt is unavailable — open each evidence "
-            "image with the Read tool before opening the PR"
+            "this runtime cannot produce trusted screenshot-read receipts, so "
+            "the visual-evidence path CANNOT pass "
+            "(xnmp/autonomous-issue-agent#153) — convert each visual "
+            "acceptance criterion to a test-asserted one (assert the rendered "
+            "output/state in a test, reference the test by name next to the "
+            "AC item), remove .harness/visual-ac and any evidence/ images, "
+            "and retry"
         )
     read = set(screenshots_read)
     unread = [os.path.basename(f) for f in images if os.path.basename(f) not in read]

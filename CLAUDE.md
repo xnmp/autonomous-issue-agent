@@ -56,6 +56,11 @@ that removes it.
 - Tests assert public behavior and observable outputs. Business rules include
   malformed, absent, boundary, and huge inputs.
 - Comments explain constraints or incident history, never narrate the next line.
+- New gate/review verdict inputs state their provenance (who can write them,
+  in which trust domain); below harness-owned means laundered through a
+  harness-side mint or treated as an untrusted claim. Retry/defer/skip loops
+  carry a journal event and a ceiling. (ADR 0012; existing code migrates when
+  touched.)
 
 Import-linter and AST contracts enforce these boundaries in `make test`.
 

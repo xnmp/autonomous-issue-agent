@@ -520,6 +520,9 @@ class AgentPublicationBroker:
             )
             if prior is None:
                 raise RuntimeError("cannot verify remote branch before push")
+            self._require_no_foreign_discard(
+                head, prior, destination, resolved_cwd
+            )
             normalized = _captured_push(
                 flags,
                 destination,
@@ -720,6 +723,67 @@ class AgentPublicationBroker:
                 "publication"
             )
         return ""
+
+    def _require_no_foreign_discard(
+        self, head: str, prior: str, destination: str, cwd: str
+    ) -> None:
+        """Refuse a non-fast-forward publish over a remote tip this deployment
+        did not put there (ADR 0012 §2; xnmp/autonomous-issue-agent#154).
+
+        The lease (`--force-with-lease=<ref>:<prior>`) makes the push
+        race-safe, not authorship-safe: observed live on keifu #169
+        (2026-08-01), an agent's rebase publish legally force-replaced the
+        remote tip and erased an operator's fix, which the reviewer then
+        re-demanded. "Foreign" is decided by the broker's OWN receipts, not a
+        patch heuristic: a remote tip equal to the revision we last
+        successfully published is the agent's own history, freely rewritable
+        (the ordinary conflicting-rebase flow, whose resolved commits change
+        patch-ids and would false-refuse under `git cherry`-style
+        equivalence). Any other non-fast-forward tip was written by someone
+        else — or predates this deployment's receipts — and must be MERGED,
+        not replaced. A fast-forward always passes (nothing is discarded)."""
+        if not prior:
+            return  # branch does not exist remotely yet — nothing to discard
+        if self._execute(
+            ("git", "cat-file", "-e", f"{prior}^{{commit}}"), cwd
+        ).code != 0:
+            fetched = self._execute(
+                ("git", "fetch", "origin", f"refs/heads/{destination}"), cwd
+            )
+            if (
+                fetched.code != 0
+                or self._execute(
+                    ("git", "cat-file", "-e", f"{prior}^{{commit}}"), cwd
+                ).code
+                != 0
+            ):
+                raise ValueError(
+                    f"cannot verify the commits on origin/{destination} that "
+                    "this push would replace (fetch failed) — run "
+                    f"`git fetch origin {destination}` and retry"
+                )
+        if self._execute(
+            ("git", "merge-base", "--is-ancestor", prior, head), cwd
+        ).code == 0:
+            return  # fast-forward — discards nothing
+        published = self.store.last_published_revision(
+            f"branch:{self.repository}:{destination}"
+        )
+        if published == prior:
+            return  # rewriting only history this harness itself published
+        provenance = (
+            "it was not published by this harness (control-store provenance)"
+            if published
+            else "the remote history predates this deployment's publish "
+            "receipts, so its provenance cannot be established"
+        )
+        raise ValueError(
+            f"push refused: origin/{destination} is at {prior[:10]}, which is "
+            f"not what this harness last published — {provenance}. Merge "
+            f"origin/{destination} into your branch (never rebase over "
+            "commits you have not incorporated) and push again — a "
+            "fast-forward is always accepted"
+        )
 
     def _remote_branch(
         self, remote: str, branch: str, cwd: str

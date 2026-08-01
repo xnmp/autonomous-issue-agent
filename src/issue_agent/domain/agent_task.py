@@ -22,6 +22,13 @@ class RuntimeCapabilities:
     native_budget_enforcement: bool
     requires_external_governor: bool
     supported_task_fields: frozenset[str]
+    # Whether the runtime can produce TRUSTED screenshot-read receipts (the
+    # PostToolUse(Read) hook running in the harness trust domain). A runtime
+    # without this cannot pass the visual-evidence PR gate — visual-AC work
+    # must be routed elsewhere or asserted by tests instead of pixels
+    # (xnmp/autonomous-issue-agent#153; keifu #156 burned ~$3 dead-ending on
+    # this before escalating).
+    mints_visual_receipts: bool = False
 
     def supports(self, field_name: str) -> bool:
         return field_name in self.supported_task_fields
@@ -54,6 +61,7 @@ RUNTIME_CAPABILITIES = {
         native_budget_enforcement=True,
         requires_external_governor=False,
         supported_task_fields=TASK_FIELD_NAMES,
+        mints_visual_receipts=True,
     ),
     RuntimeName.CODEX: RuntimeCapabilities(
         supports_resume=True,

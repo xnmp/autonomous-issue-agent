@@ -104,14 +104,15 @@ count_ac_items() {  # count_ac_items "<pr-body>"
     END { print n + 0 }'
 }
 
-if [ -f .harness/visual-ac ]; then
+if [ -f .harness/visual-ac ] \
+    && ! git ls-files --error-unmatch .harness/visual-ac >/dev/null 2>&1; then
   # Committed screenshot images in the diff (same extension set as §7 /
   # domain/gate.py:IMAGE_EXTS).
   shots=$(printf '%s\n' "$changed" | grep -iE '^evidence/.*\.(png|jpg|jpeg|gif|webp)$' || true)
   [ -n "$shots" ] \
     || fail "a visual acceptance criterion was declared (.harness/visual-ac) but no screenshot is committed under evidence/ — capture one with agent-browser"
   [ -n "${HARNESS_SCREENSHOTS_READ:-}" ] \
-    || fail "trusted screenshot-read receipt is unavailable — the harness cannot verify visual evidence"
+    || fail "this runtime cannot produce trusted screenshot-read receipts, so the visual-evidence path CANNOT pass (xnmp/autonomous-issue-agent#153) — convert each visual acceptance criterion to a test-asserted one (assert the rendered output/state in a test, reference the test by name next to the AC item), remove .harness/visual-ac and any evidence/ images, and re-run gh pr create"
   [ -r "$HARNESS_SCREENSHOTS_READ" ] \
     || fail "trusted screenshot-read receipt is unavailable — open each evidence image with the Read tool before opening the PR"
 

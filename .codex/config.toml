@@ -1,0 +1,2 @@
+# Route eligible sandbox-boundary approval requests to Codex's reviewer agent.
+approvals_reviewer = "auto_review"

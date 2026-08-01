@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from dataclasses import dataclass
 
 from ..domain.agent_task import RuntimeName
@@ -43,11 +44,12 @@ from ..domain.world import normalize_predicted_paths
 _ISSUE_SUFFIXES = (
     "session", "resumed-at", "resumes", "ci-retries", "resolve-retries",
     "rebase-retries", "infra-deaths", "review-retries", "phase", "jira",
-    "jira-phase", "model", "predicted-paths", "branch",
+    "jira-phase", "model", "predicted-paths", "branch", "stall-sig",
 )
 _PR_SUFFIXES = (
     "session", "last-sha", "round", "automerge", "patch-id", "ci-rerun-head",
     "update-branch-head", "ci-pending-escalated-head", "resumed-at",
+    "stall-sig",
 )
 
 # Closed-unmerged requeue cleanup (review M4/D8, handover §5.7): only the
@@ -371,6 +373,35 @@ class Store:
         if sha:
             self._write(self.pr_path(pr, "update-branch-head"), sha)
 
+    # ── stall watchdog markers (no-silent-forever) ──
+    # (signature, since_iso) per watched target: the observable state last
+    # seen and when it first appeared. Written only when the signature
+    # changes, so a stable target costs zero writes per poll.
+    def get_stall_marker(self, kind: str, number: int) -> tuple[str, str]:
+        path = (
+            self.pr_path(number, "stall-sig")
+            if kind == "pr"
+            else self.issue_path(number, "stall-sig")
+        )
+        raw = self._read(path)
+        if not raw:
+            return ("", "")
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return ("", "")
+        return (str(data.get("sig", "")), str(data.get("since", "")))
+
+    def set_stall_marker(
+        self, kind: str, number: int, sig: str, since: str
+    ) -> None:
+        path = (
+            self.pr_path(number, "stall-sig")
+            if kind == "pr"
+            else self.issue_path(number, "stall-sig")
+        )
+        self._write(path, json.dumps({"sig": sig, "since": since}))
+
     def get_ci_pending_escalated_head(self, pr: int) -> str:
         return self._read(self.pr_path(pr, "ci-pending-escalated-head"))
 
@@ -516,22 +547,59 @@ class HarnessMarkers:
     """
 
     def __init__(self, root: str):
+        self.root = root
         self.dir = os.path.join(root, ".harness")
+        # One tracked-check subprocess per marker per instance, not per read:
+        # this runs on the PreToolUse hot path (every agent Bash call).
+        self._tracked_cache: dict[str, bool] = {}
 
     def _path(self, name: str) -> str:
         return os.path.join(self.dir, name)
 
     def _read(self, name: str) -> str:
+        if self._tracked(name):
+            return ""
         try:
             with open(self._path(name)) as f:
                 return f.read()
         except (FileNotFoundError, OSError):
             return ""
 
+    def _tracked(self, name: str) -> bool:
+        """A marker TRACKED by git is repo history, not this session's claim —
+        and repo history is agent/merge-writable input to the gate's own teeth.
+        Keifu #167→#156 (2026-08-01): a committed .harness/test-cmd merged into
+        the base and every downstream worktree's trusted red-fail gate silently
+        ran another issue's single test. Tracked markers are therefore ignored
+        outright (the diff-level deny rule stops NEW commits; this closes the
+        read against history that predates it). Unknowable (git failed) reads
+        as untracked — the marker is non-authoritative either way."""
+        cached = self._tracked_cache.get(name)
+        if cached is not None:
+            return cached
+        try:
+            tracked = (
+                subprocess.run(
+                    [
+                        "git", "-C", self.root, "ls-files",
+                        "--error-unmatch", f".harness/{name}",
+                    ],
+                    capture_output=True,
+                    timeout=10,
+                ).returncode
+                == 0
+            )
+        except Exception:  # noqa: BLE001 — unknowable ⇒ preserve old behaviour
+            tracked = False
+        self._tracked_cache[name] = tracked
+        return tracked
+
     def visual_ac(self) -> bool:
         """The agent declared a visual acceptance criterion (touched .harness/visual-ac),
         so the PR gate requires a committed + read screenshot."""
-        return os.path.exists(self._path("visual-ac"))
+        return os.path.exists(self._path("visual-ac")) and not self._tracked(
+            "visual-ac"
+        )
 
     def test_cmd(self) -> str | None:
         """First non-blank line of .harness/test-cmd (prc_resolve_test_cmd's

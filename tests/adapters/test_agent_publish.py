@@ -41,8 +41,25 @@ class Remote:
         self.create_pr_head = ""
         self.arm_after_push = False
         self.origin_url = "git@github.com:o/r.git"
+        # Discard-check knobs (#154): by default the local head descends from
+        # the remote tip (fast-forward), so the check is inert for every
+        # pre-existing test. non_ff=True simulates a rewritten history; the
+        # foreign/own adjudication itself runs against the REAL control
+        # store's publish receipts.
+        self.non_ff = False
+        self.prior_object_missing = False
+        self.fetch_fails = False
 
     def run(self, argv, _cwd):
+        if argv[:2] == ("git", "cat-file"):
+            return CommandResult(1 if self.prior_object_missing else 0, "")
+        if argv[:2] == ("git", "fetch"):
+            if self.fetch_fails:
+                return CommandResult(1, "", "network down")
+            self.prior_object_missing = False
+            return CommandResult(0, "")
+        if argv[:3] == ("git", "merge-base", "--is-ancestor"):
+            return CommandResult(1 if self.non_ff else 0, "")
         if argv == ("git", "rev-parse", "HEAD"):
             return CommandResult(0, self.head + "\n")
         if argv == ("git", "branch", "--show-current"):
@@ -279,6 +296,84 @@ def test_owner_retirement_waits_for_inflight_remote_mutation(tmp_path):
             ("git", "push", "origin", "HEAD:fix/42-issue"),
             str(tmp_path),
         )
+
+
+def test_push_refuses_a_foreign_remote_tip(tmp_path):
+    """#154 (observed live, keifu #169): the broker's leased force publish is
+    race-safe but was not AUTHORSHIP-safe — an agent rebase erased an operator
+    commit the reviewer then re-demanded. A non-fast-forward push over a tip
+    this deployment never published must refuse with an actionable message,
+    and nothing may reach the remote."""
+    remote = Remote()
+    remote.remote = "operator99"
+    remote.non_ff = True
+    publisher = broker(tmp_path, remote)
+
+    with pytest.raises(ValueError, match="not what this harness last published"):
+        publisher.publish(
+            ("git", "push", "origin", "HEAD:fix/42-issue"),
+            str(tmp_path),
+        )
+    assert remote.effects == []
+
+
+def test_rewriting_our_own_published_history_still_publishes(tmp_path):
+    """The ordinary conflicting-rebase flow: the remote tip is exactly what
+    this broker last pushed (receipt-backed), so the agent may rewrite it —
+    resolved-conflict commits change patch-ids, which is why provenance, not
+    patch-equivalence, is the discriminator (adversarial P0-1)."""
+    remote = Remote()
+    publisher = broker(tmp_path, remote)
+    first = publisher.publish(
+        ("git", "push", "origin", "HEAD:fix/42-issue"),
+        str(tmp_path),
+    )
+    assert first.code == 0 and remote.remote == "abc123"
+
+    remote.head = "rebased99"  # rebased local history, non-FF vs abc123
+    remote.non_ff = True
+    result = publisher.publish(
+        ("git", "push", "origin", "HEAD:fix/42-issue"),
+        str(tmp_path),
+    )
+
+    assert result.code == 0
+    assert remote.remote == "rebased99"
+
+
+def test_unverifiable_prior_refuses_rather_than_publishing_blind(tmp_path):
+    """'I cannot see what I would destroy' must never publish: the prior
+    remote object absent locally AND unfetchable refuses the capture."""
+    remote = Remote()
+    remote.remote = "operator99"
+    remote.non_ff = True
+    remote.prior_object_missing = True
+    remote.fetch_fails = True
+    publisher = broker(tmp_path, remote)
+
+    with pytest.raises(ValueError, match="cannot verify"):
+        publisher.publish(
+            ("git", "push", "origin", "HEAD:fix/42-issue"),
+            str(tmp_path),
+        )
+    assert remote.effects == []
+
+
+def test_missing_prior_object_is_fetched_then_checked(tmp_path):
+    """A worktree that never fetched can still verify: one fetch, then the
+    equivalence check adjudicates."""
+    remote = Remote()
+    remote.remote = "operator99"
+    remote.non_ff = True
+    remote.prior_object_missing = True
+    publisher = broker(tmp_path, remote)
+
+    with pytest.raises(ValueError, match="not what this harness last published"):
+        publisher.publish(
+            ("git", "push", "origin", "HEAD:fix/42-issue"),
+            str(tmp_path),
+        )
+    assert remote.effects == []
 
 
 def test_push_disables_and_verifies_existing_auto_merge_first(tmp_path):

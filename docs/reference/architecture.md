@@ -421,6 +421,7 @@ module requires placing it in the appropriate tier and explaining it here.
 `domain/events.py`, `domain/fix.py`, `domain/gate.py`,
 `domain/governor_policy.py`, `domain/identity.py`, `domain/jira.py`,
 `domain/labels.py`, `domain/leg.py`, `domain/lifecycle.py`,
+`domain/liveness.py`,
 `domain/outcome.py`, `domain/ports.py`, `domain/pricing.py`,
 `domain/projection.py`, `domain/refs.py`, `domain/repository.py`,
 `domain/recovery.py`, `domain/reservation_recovery.py`,

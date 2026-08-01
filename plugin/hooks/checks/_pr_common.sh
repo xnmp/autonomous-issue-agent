@@ -80,7 +80,10 @@ commit_phase() {
 # make impossible.
 prc_resolve_test_cmd() {
   local m=".harness/test-cmd" c="${TEST_CMD:-}"
-  if [ -z "$c" ] && [ -f "$m" ]; then
+  # A TRACKED marker is repo history, not this session's claim (keifu
+  # #167→#156: a committed marker retargeted the gate repo-wide) — ignore it.
+  if [ -z "$c" ] && [ -f "$m" ] \
+      && ! git ls-files --error-unmatch "$m" >/dev/null 2>&1; then
     c="$(tr -d '\r' < "$m" | sed '/^[[:space:]]*$/d' | head -1)"
   fi
   printf '%s' "$c"
