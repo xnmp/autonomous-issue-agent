@@ -298,6 +298,7 @@ def _legacy_event_record(event: TelemetryEvent) -> tuple[str, dict[str, object]]
         name = payload.code if payload.code in {
             "action_quarantined",
             "action_reconcile_skipped",
+            "branch_refresh",
             "ci_rerun",
             "cost_blindspot",
         } else "telemetry_warning"

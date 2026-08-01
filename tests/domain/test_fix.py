@@ -728,6 +728,7 @@ def test_stale_or_unattributed_approval_never_authorizes_current_head():
         assert not should_automerge(candidate, FixState(), CFG)
         assert not should_update_branch(
             replace(candidate, mergeable="MERGEABLE", merge_state="BEHIND"),
+            FixState(),
             CFG,
         )
 
@@ -784,6 +785,133 @@ def test_already_armed_behind_pr_still_updates_branch():
 def test_clean_pr_does_not_update_branch():
     # A CLEAN approved PR arms auto-merge but needs NO branch update.
     actions = decide_fix(world(prs=[_approved_green_pr()]), CFG, FixState(), fixer_busy=False)
+    assert not any(isinstance(a, UpdateBranch) for a in actions)
+
+
+# ── advisory-UNSTABLE refresh (keifu #166, 2026-08-01) ───────────────────────
+def _approved_advisory_unstable_pr():
+    """APPROVED, and the only failing check is operator-ignored (advisory) —
+    GitHub reports UNSTABLE (a failing check wins the enum, masking BEHIND),
+    the exact-head merge gate refuses UNSTABLE, and without a refresh the
+    stale check never re-runs against the base that fixed it."""
+    return pr(
+        100, "ai-pr-open",
+        head_ref_oid="head-100",
+        reviews=(
+            Review("APPROVED", "review-bot", "t1", commit_id="head-100"),
+        ),
+        checks=(
+            Check("build", bucket="pass"),
+            Check("Security Audit", bucket="fail", advisory=True),
+        ),
+        mergeable="MERGEABLE", merge_state="UNSTABLE",
+    )
+
+
+def test_approved_advisory_unstable_pr_gets_a_branch_refresh():
+    w = world(prs=[_approved_advisory_unstable_pr()], base_head="base-1")
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+    assert UpdateBranch(100, "head-100", "base-1") in actions
+
+
+def test_advisory_unstable_refresh_fires_once_per_head_and_base():
+    """The marker breaks the loop: a refresh already dispatched for this
+    (head, base tip) pair (recorded before the update call) must not re-fire —
+    an already-up-to-date branch keeps both parts unchanged forever, and would
+    otherwise push every poll."""
+    st = FixState(update_branch_head={100: "head-100:base-1"})
+    w = world(prs=[_approved_advisory_unstable_pr()], base_head="base-1")
+    actions = decide_fix(w, CFG, st, fixer_busy=False)
+    assert not any(isinstance(a, UpdateBranch) for a in actions)
+
+
+def test_a_base_advance_rearms_the_advisory_refresh():
+    """Adversarial F1 (this arm's whole reason to exist): an attempt made
+    BEFORE the base gained the fix must not permanently disarm the refresh —
+    when the base advances, the key changes and the arm fires again."""
+    st = FixState(update_branch_head={100: "head-100:base-1"})
+    w = world(prs=[_approved_advisory_unstable_pr()], base_head="base-2")
+    actions = decide_fix(w, CFG, st, fixer_busy=False)
+    assert UpdateBranch(100, "head-100", "base-2") in actions
+
+
+def test_an_uncollected_base_head_disables_the_advisory_arm():
+    """base_head "" (hand-built world, older builder, fetch hiccup) must not
+    fire the advisory arm at all: a key that flaps between "H:" and "H:B" on
+    fetch availability would re-fire a no-op update per transition. Without
+    base visibility only the BEHIND arm applies."""
+    w = world(prs=[_approved_advisory_unstable_pr()])  # base_head not collected
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+    assert not any(isinstance(a, UpdateBranch) for a in actions)
+
+
+def test_unknown_merge_state_is_not_refreshed():
+    p = replace(_approved_advisory_unstable_pr(), merge_state="UNKNOWN")
+    actions = decide_fix(
+        world(prs=[p], base_head="base-1"), CFG, FixState(), fixer_busy=False
+    )
+    assert not any(isinstance(a, UpdateBranch) for a in actions)
+
+
+def test_unread_checks_do_not_qualify_for_the_advisory_refresh():
+    """checks_known=False means the checks call failed — UNSTABLE with unread
+    checks is not evidence the failures are advisory."""
+    p = replace(_approved_advisory_unstable_pr(), checks=(), checks_known=False)
+    actions = decide_fix(
+        world(prs=[p], base_head="base-1"), CFG, FixState(), fixer_busy=False
+    )
+    assert not any(isinstance(a, UpdateBranch) for a in actions)
+
+
+def test_genuinely_red_unstable_pr_is_not_refreshed():
+    """A NON-advisory failing check means CI is genuinely red — that is the
+    repair path's job, not a branch update's."""
+    p = replace(
+        _approved_advisory_unstable_pr(),
+        checks=(
+            Check("build", bucket="pass"),
+            Check("Security Audit", bucket="fail"),  # NOT advisory
+        ),
+    )
+    actions = decide_fix(world(prs=[p]), CFG, FixState(), fixer_busy=False)
+    assert not any(isinstance(a, UpdateBranch) for a in actions)
+
+
+def test_operator_regex_ignored_failure_also_qualifies_for_refresh():
+    """CI_IGNORE_CHECKS (regex) is the operator-declared twin of the advisory
+    flag — an UNSTABLE whose failures are all regex-ignored refreshes too."""
+    p = replace(
+        _approved_advisory_unstable_pr(),
+        checks=(
+            Check("build", bucket="pass"),
+            Check("Security Audit", bucket="fail"),  # NOT advisory
+        ),
+    )
+    cfg = replace(CFG, ci_ignore_checks="^Security Audit$")
+    actions = decide_fix(
+        world(prs=[p], base_head="base-1"), cfg, FixState(), fixer_busy=False
+    )
+    assert UpdateBranch(100, "head-100", "base-1") in actions
+
+
+def test_unapproved_advisory_unstable_pr_is_not_refreshed():
+    p = replace(
+        _approved_advisory_unstable_pr(),
+        reviews=(
+            Review(
+                "CHANGES_REQUESTED", "review-bot", "t1", commit_id="head-100"
+            ),
+        ),
+    )
+    actions = decide_fix(world(prs=[p], base_head="base-1"), CFG, FixState(), fixer_busy=False)
+    assert not any(isinstance(a, UpdateBranch) for a in actions)
+
+
+def test_conflicting_unstable_pr_takes_the_rebase_path_not_a_refresh():
+    p = replace(
+        _approved_advisory_unstable_pr(), mergeable="CONFLICTING"
+    )
+    actions = decide_fix(world(prs=[p], base_head="base-1"), CFG, FixState(), fixer_busy=False)
     assert not any(isinstance(a, UpdateBranch) for a in actions)
 
 

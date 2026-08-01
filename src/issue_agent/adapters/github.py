@@ -736,11 +736,18 @@ class GitHubGateway:
         review_pr_label: str = "ai-pr-open",
         review_adopt_unlabeled: bool = False,
         progress: Callable[[], None] | None = None,
+        base_branch: str = "",
     ):
         self.repo = repo
         self.identity = identity or Identity()
         self._run = runner or _subprocess_runner
         self._progress = progress
+        # Configured merge target. Lets build_fix_world observe the base TIP:
+        # GraphQL baseRefOid is a stale anchor (verified live 2026-08-01 — all
+        # keifu PRs still reported the pre-merge oid 30+ min after the base
+        # advanced), so the base-advance signal must come from the ref itself.
+        self.base_branch = base_branch
+        self._base_head_warned = False
         # PR label the review daemon selects on (see build_review_world). Default
         # matches the harness pipeline; an external-repo reviewer passes "ai-review".
         self.review_pr_label = review_pr_label
@@ -1228,8 +1235,40 @@ class GitHubGateway:
         # everything else is already in hand.
         return WorldState(
             issues=issues, prs=prs, closing_refs=self.open_closing_refs(),
-            now=build_time(),
+            now=build_time(), base_head=self._base_head(),
         )
+
+    def _base_head(self) -> str:
+        """Tip of the configured base branch at observation, "" when unknown.
+        Fail-soft — a world build must never fail or wedge on this — but NOT
+        silent (adversarial D1): "" disables the advisory-UNSTABLE refresh
+        outright, so a persistent failure here (token without contents:read, a
+        renamed base branch, sustained 5xx) would relocate the very silent
+        disarm this field exists to remove. First failure per process says so
+        on stderr; recovery is automatic once the read works again."""
+        if not self.base_branch:
+            return ""
+        try:
+            tip = self._gh(
+                [
+                    "api",
+                    f"repos/{self.repo}/git/ref/heads/{self.base_branch}",
+                    "--jq", ".object.sha",
+                ]
+            ).strip()
+        except Exception as exc:  # noqa: BLE001 — fail-soft, never fail the build
+            if not self._base_head_warned:
+                self._base_head_warned = True
+                import sys
+                sys.stderr.write(
+                    f"base tip of '{self.base_branch}' unreadable "
+                    f"({type(exc).__name__}: {str(exc)[:120]}) — the "
+                    "advisory-UNSTABLE branch refresh is DISABLED until this "
+                    "read recovers\n"
+                )
+            return ""
+        self._base_head_warned = False
+        return tip
 
     def build_review_world(self) -> WorldState:
         """The review daemon's slice: ONLY PRs carrying `self.review_pr_label` (open

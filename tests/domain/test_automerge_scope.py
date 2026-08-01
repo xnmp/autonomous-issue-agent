@@ -95,7 +95,7 @@ def test_foreign_prs_are_not_branch_updated_either():
                     Review("APPROVED", "review-bot", commit_id="head"),
                 ), checks=GREEN,
                 mergeable="MERGEABLE", merge_state="BEHIND")
-    assert should_update_branch(pr, _cfg()) is False
+    assert should_update_branch(pr, FixState(), _cfg()) is False
 
 
 def test_harness_prs_are_still_branch_updated():
@@ -104,7 +104,7 @@ def test_harness_prs_are_still_branch_updated():
                     Review("APPROVED", "review-bot", commit_id="head"),
                 ), checks=GREEN,
                 mergeable="MERGEABLE", merge_state="BEHIND")
-    assert should_update_branch(pr, _cfg()) is True
+    assert should_update_branch(pr, FixState(), _cfg()) is True
 
 
 # ── arm_on_open: protection-verified early arming ─────────────────────────────
@@ -190,7 +190,7 @@ def test_unread_checks_do_not_branch_update():
                 reviews=(Review("APPROVED", "review-bot", commit_id="head"),),
                 checks=(), checks_known=False,
                 mergeable="MERGEABLE", merge_state="BEHIND")
-    assert should_update_branch(pr, _cfg()) is False
+    assert should_update_branch(pr, FixState(), _cfg()) is False
 
 
 def test_verified_gate_does_not_turn_unread_checks_into_merge_evidence():

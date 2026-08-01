@@ -47,7 +47,7 @@ _ISSUE_SUFFIXES = (
 )
 _PR_SUFFIXES = (
     "session", "last-sha", "round", "automerge", "patch-id", "ci-rerun-head",
-    "ci-pending-escalated-head", "resumed-at",
+    "update-branch-head", "ci-pending-escalated-head", "resumed-at",
 )
 
 # Closed-unmerged requeue cleanup (review M4/D8, handover §5.7): only the
@@ -359,6 +359,17 @@ class Store:
     def set_ci_rerun_head(self, pr: int, sha: str) -> None:
         if sha:
             self._write(self.pr_path(pr, "ci-rerun-head"), sha)
+
+    # PR → head a branch-refresh (advisory-UNSTABLE arm) was last dispatched
+    # for. Same head-keyed shape and same write-before-execute ordering as the
+    # ci-rerun marker above: refresh-but-not-marked is an unbounded push loop,
+    # marked-but-not-refreshed costs one retry next poll.
+    def get_update_branch_head(self, pr: int) -> str:
+        return self._read(self.pr_path(pr, "update-branch-head"))
+
+    def set_update_branch_head(self, pr: int, sha: str) -> None:
+        if sha:
+            self._write(self.pr_path(pr, "update-branch-head"), sha)
 
     def get_ci_pending_escalated_head(self, pr: int) -> str:
         return self._read(self.pr_path(pr, "ci-pending-escalated-head"))

@@ -242,6 +242,7 @@ class Executor:
         log: Callable[[str], None] | None = None,
         mark_automerge: Callable[[int], None] | None = None,
         mark_ci_rerun: Callable[[int, str], None] | None = None,
+        mark_branch_update: Callable[[int, str], None] | None = None,
         mark_ci_pending_escalated: Callable[[int, str], None] | None = None,
         clear_issue_state: Callable[[int, int | None, bool], None] | None = None,
         journal=None,
@@ -269,6 +270,12 @@ class Executor:
         # loop forever, which is why the arm below refuses to call gh at all
         # when it is absent — see there.
         self._mark_ci_rerun = mark_ci_rerun
+        # Persists the head an advisory-UNSTABLE branch-refresh was dispatched
+        # for (FixState.update_branch_head). Written BEFORE the update call,
+        # same ordering rationale as the ci-rerun marker: marked-but-not-
+        # refreshed costs one retry next poll; refreshed-but-not-marked is an
+        # unbounded push loop.
+        self._mark_branch_update = mark_branch_update
         self._mark_ci_pending_escalated = (
             mark_ci_pending_escalated
             or _missing_handler("mark_ci_pending_escalated")
@@ -436,6 +443,10 @@ class Executor:
                     )
                     return
                 self._mark_ci_rerun(action.pr, action.head)
+            if isinstance(action, UpdateBranch) and self._mark_branch_update is not None:
+                self._mark_branch_update(
+                    action.pr, f"{action.head}:{action.base}"
+                )
             outcome = self._effect_executor.execute(action)
             if isinstance(action, Relabel):
                 if outcome is False:
@@ -453,6 +464,35 @@ class Executor:
                     self._log(
                         f"auto-merge PR #{action.pr}: NOT armed (gh failed or "
                         "GitHub refused); marker withheld so next poll retries"
+                    )
+            elif isinstance(action, UpdateBranch):
+                # The failure must be OBSERVABLE (adversarial F2): the marker
+                # was written before the call (see above — the safe ordering),
+                # so a failed/no-op update spends the one attempt for this
+                # (head, base) pair. A no-op ("already up to date") is the
+                # designed loop terminator; a transient gh failure re-arms on
+                # the next base advance — but only an operator who can SEE it
+                # can act sooner.
+                if outcome is False:
+                    self._log(
+                        f"branch refresh PR #{action.pr}: update did not land "
+                        "(already up to date, or gh failed) — attempt spent for "
+                        "this head; re-arms when the base next advances"
+                    )
+                if self._journal is not None:
+                    self._journal.emit(
+                        TelemetryEvent(
+                            TelemetryWarning(
+                                "branch_refresh",
+                                "branch update attempted",
+                                {
+                                    "head": action.head,
+                                    "base": action.base,
+                                    "ok": bool(outcome),
+                                },
+                            ),
+                            Correlation(pr=action.pr),
+                        )
                     )
             elif isinstance(action, RerunFailedChecks):
                 if outcome is None:

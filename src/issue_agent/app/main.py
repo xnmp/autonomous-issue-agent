@@ -347,6 +347,7 @@ def build_role(
             cfg.repo,
             Identity(static_token=env.get("FIX_BOT_TOKEN") or None),
             progress=scheduler_progress,
+            base_branch=cfg.base_branch,
         )
         # runtime-tagged sessions: a FIXER_RUNTIME flip must cold-start resume
         # legs, not feed the new runtime the old runtime's session ids.

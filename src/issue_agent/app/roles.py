@@ -1403,6 +1403,9 @@ def _fix_state(
     # breaker-keyed) because a re-run is an act on a PR's check runs, and a PR
     # with no resolvable issue has check runs like any other.
     ci_rerun_head = {p.number: store.get_ci_rerun_head(p.number) for p in world.prs}
+    update_branch_head = {
+        p.number: store.get_update_branch_head(p.number) for p in world.prs
+    }
     ci_pending_escalated = frozenset(
         (p.number, head)
         for p in world.prs
@@ -1415,6 +1418,7 @@ def _fix_state(
         ci_retries=ci_retries, review_retries=review_retries,
         rebase_retries=rebase_retries, resolve_retries=resolve_retries,
         infra_deaths=infra_deaths, ci_rerun_head=ci_rerun_head,
+        update_branch_head=update_branch_head,
         ci_pending_escalated=ci_pending_escalated,
         inflight=inflight,
     )
@@ -1852,6 +1856,7 @@ def build_fix_daemon(
     executor = Executor(
         gateway, remove_worktree=worktrees.remove, log=_log("fix"),
         mark_automerge=store.mark_automerge, mark_ci_rerun=store.set_ci_rerun_head,
+        mark_branch_update=store.set_update_branch_head,
         mark_ci_pending_escalated=store.set_ci_pending_escalated_head,
         clear_issue_state=store.cleanup_pr,
         journal=journal, alert_cmd=cfg.alert_cmd,

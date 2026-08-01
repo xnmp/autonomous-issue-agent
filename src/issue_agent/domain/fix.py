@@ -160,6 +160,11 @@ class FixState:
     # while a second FAILURE on the SAME head is evidence the diff is broken and
     # goes straight to a paid FIX_CI leg. Missing/"" = never re-run.
     ci_rerun_head: dict[int, str] = field(default_factory=dict)
+    # PR → head a branch-refresh was last dispatched for (the advisory-UNSTABLE
+    # arm of should_update_branch). Head-keyed like ci_rerun_head: a successful
+    # update creates a NEW head (fresh key), an already-up-to-date update
+    # changes nothing (marker matches, loop stops).
+    update_branch_head: dict[int, str] = field(default_factory=dict)
     # Paid work currently executing in the application dispatch pool. This is
     # observation state, not persisted orchestration state: it prevents a second
     # leg for the same issue and extends the path-overlap serializer to work that
@@ -614,7 +619,21 @@ def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
     ) in (CIState.OK, CIState.NONE)
 
 
-def should_update_branch(pr: PRView, cfg: FixConfig) -> bool:
+def update_branch_marker(pr: PRView, base_head: str) -> str:
+    """The once-per-attempt key for the advisory-UNSTABLE refresh: one attempt
+    per (head, base tip) pair. Head alone is not enough — an attempt made
+    BEFORE the base gained the fix for the advisory check would permanently
+    disarm the refresh for a PR whose head never moves again (keifu #166's
+    exact shape). A no-op update changes neither part, so the loop still
+    terminates; a base advance changes the key, re-arming exactly when the
+    event this arm exists for occurs. Callers gate on a non-empty base_head
+    (an unobserved base disables the arm — see should_update_branch)."""
+    return f"{pr.head_ref_oid}:{base_head}"
+
+
+def should_update_branch(
+    pr: PRView, state: FixState, cfg: FixConfig, base_head: str = ""
+) -> bool:
     """A merge-ready PR (distinct APPROVED review + CI ok/none) that is BEHIND its
     base needs its branch brought up to date so an armed auto-merge can land it.
 
@@ -624,7 +643,18 @@ def should_update_branch(pr: PRView, cfg: FixConfig) -> bool:
     would otherwise stay stuck forever, armed-but-behind. Only MERGEABLE+BEHIND:
     a CONFLICTING branch takes the REBASE agent path (§3a). Self-limiting: after
     an update the branch is no longer BEHIND until the base advances again, so this
-    does not re-fire every poll."""
+    does not re-fire every poll.
+
+    The second arm covers advisory-UNSTABLE (keifu #166, 2026-08-01): a failing
+    check WINS the mergeStateStatus enum, so a PR whose only failures are
+    operator-ignored/advisory checks reports UNSTABLE, never BEHIND — and when
+    the base advances with the fix for that very check (quick-xml audit fixed
+    by #168), nothing re-runs the stale checks: the exact-head merge gate
+    refuses UNSTABLE forever while decide sees CI as ok. Refreshing the branch
+    re-runs the checks against the fixed base. Head-keyed marker: a successful
+    update makes a new head (checks pending block the tail until they settle),
+    an already-up-to-date one changes nothing and the marker stops the loop —
+    this cannot push-loop."""
     if not cfg.auto_merge or cfg.identity_mode != IdentityMode.THREE:
         return False
     if not pr.head_ref_oid:
@@ -633,7 +663,18 @@ def should_update_branch(pr: PRView, cfg: FixConfig) -> bool:
     # is not something to do to a PR the harness did not author.
     if not is_governed_branch(pr.head_ref_name):
         return False
-    if not pr.is_behind():
+    # Requires an OBSERVED base tip: the arm exists to react to base advances,
+    # and without base visibility the marker key would flap between "H:" and
+    # "H:B" on every fetch hiccup, re-firing a no-op update per transition.
+    # No base_head → only the BEHIND arm (which needs no marker) applies.
+    advisory_unstable_refresh = (
+        bool(base_head)
+        and pr.merge_state.upper() == "UNSTABLE"
+        and not pr.is_conflicting()
+        and state.update_branch_head.get(pr.number, "")
+        != update_branch_marker(pr, base_head)
+    )
+    if not pr.is_behind() and not advisory_unstable_refresh:
         return False
     review = latest_other_review(pr.reviews, cfg.fix_bot)
     if (
@@ -1453,8 +1494,10 @@ def decide_fix(
                     pr.number, cfg.merge_method, pr.head_ref_oid
                 )
             )
-        if should_update_branch(pr, cfg):
-            actions.append(UpdateBranch(pr.number, pr.head_ref_oid))
+        if should_update_branch(pr, state, cfg, world.base_head):
+            actions.append(
+                UpdateBranch(pr.number, pr.head_ref_oid, world.base_head)
+            )
 
     # 4) Merged/closed PRs → cleanup (lock-free).
     for pr in world.prs:

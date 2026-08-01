@@ -150,6 +150,39 @@ def test_update_branch():
     assert gw.calls == [("update_branch", 100)]
 
 
+def test_branch_refresh_marks_the_attempt_before_asking_github():
+    # Same safety property (and the same ordering) as the CI re-run marker:
+    # marker THEN gh. Refreshed-but-not-marked is an unbounded push loop.
+    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="head-100")})
+    marked = []
+    ex = Executor(
+        gw, mark_branch_update=lambda pr, key: marked.append((pr, key))
+    )
+    ex.execute(UpdateBranch(100, "head-100", "base-1"))
+    assert marked == [(100, "head-100:base-1")]
+    assert ("update_branch", 100) in gw.calls
+
+
+def test_failed_branch_refresh_is_logged_and_journalled_not_silent():
+    # Adversarial F2: the attempt is spent either way (marker written first);
+    # what must not happen is spending it INVISIBLY.
+    gw = FakeGateway(prs={})  # no PR 100 → update_branch returns False
+    marked, logged = [], []
+    j = _Journal()
+    ex = Executor(
+        gw,
+        mark_branch_update=lambda pr, key: marked.append((pr, key)),
+        journal=j, log=logged.append,
+    )
+    ex.execute(UpdateBranch(100, "head-100", "base-1"))
+    assert marked == [(100, "head-100:base-1")]
+    assert any("did not land" in line for line in logged)
+    kind, fields = next(e for e in j.events if e[0] == "branch_refresh")
+    assert (fields["pr"], fields["head"], fields["base"], fields["ok"]) == (
+        100, "head-100", "base-1", False
+    )
+
+
 # ── free CI re-run (#38) ────────────────────────────────────────────────────
 class _Journal:
     def __init__(self):

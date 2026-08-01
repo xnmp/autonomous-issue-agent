@@ -62,7 +62,9 @@ def closing_ref(pr_number: int, issue_number: int, author: str = "human",
                       base_ref_name=base_ref_name)
 
 
-def world(issues=(), prs=(), now: str = "", closing_refs=()) -> WorldState:
+def world(
+    issues=(), prs=(), now: str = "", closing_refs=(), base_head: str = ""
+) -> WorldState:
     # `now` defaults to "" (unstamped): every time-based gate reads that as
     # "elapsed time unknown" and stays inert, so tests that don't care about
     # time are unaffected by anything the clock does.
@@ -70,7 +72,8 @@ def world(issues=(), prs=(), now: str = "", closing_refs=()) -> WorldState:
     # guard reads as "no evidence of a duplicate" (fail-open) — so every test
     # written before #39 keeps dispatching exactly as it did.
     return WorldState(issues=tuple(issues), prs=tuple(prs),
-                      closing_refs=tuple(closing_refs), now=now)
+                      closing_refs=tuple(closing_refs), now=now,
+                      base_head=base_head)
 
 
 __all__ = [

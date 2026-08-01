@@ -330,6 +330,12 @@ class WorldState:
     # Safe to read only because a world is decided on the tick it was built:
     # WorldProbe raises WorldUnchanged instead of re-serving a cached world.
     now: str = ""
+    # Tip of the configured base branch at observation. "" = NOT COLLECTED (a
+    # hand-built world, a builder that predates this). Needed because GraphQL
+    # baseRefOid is a stale anchor, not the live tip: the advisory-UNSTABLE
+    # branch-refresh re-arms on base advances and this is the only field that
+    # can see one. Consumers must degrade gracefully on "".
+    base_head: str = ""
 
     def open_issues(self) -> tuple[IssueView, ...]:
         return tuple(i for i in self.issues if i.state == "open")
