@@ -27,7 +27,13 @@ ROOT = Path(__file__).resolve().parents[2]
 DOCTOR_SH = ROOT / "bin" / "doctor.sh"
 
 
-def _fake_bin(tmp_path: Path, *, label_post: str, label_delete_rc: int = 0) -> Path:
+def _fake_bin(
+    tmp_path: Path,
+    *,
+    label_post: str,
+    label_delete_rc: int = 0,
+    repo_read: str = "echo widget; exit 0",
+) -> Path:
     """PATH dir whose `gh` answers every read the identity section makes as a
     healthy write-capable collaborator, and whose label POST is scripted by
     `label_post` (a bash snippet run for `gh api -X POST .../labels`).
@@ -59,7 +65,9 @@ done
 if [ "$1" = "api" ]; then
   case "$2" in
     */actions/workflows) echo '1'; exit 0 ;;
-    repos/*)             echo 'true'; exit 0 ;;
+    repos/*)
+      if [ "$4" = ".name" ]; then {repo_read}; fi
+      echo 'true'; exit 0 ;;
   esac
 fi
 exit 0
@@ -184,3 +192,20 @@ def test_probe_does_not_delete_a_label_it_did_not_create(tmp_path):
     assert "live-probed" in out
     assert "CANNOT write" not in out
     assert not [line for line in log.splitlines() if line.startswith("DELETE")]
+
+
+def test_a_rate_limited_bot_is_not_misdiagnosed_as_missing_access(tmp_path):
+    """2026-08-02: the denied-write retry loop exhausted the bot's hourly
+    GraphQL quota, and the (then GraphQL-backed) access check reported
+    'cannot access — invite it as a collaborator' for an identity whose
+    access was fine. The read is REST now, and a rate-limited read must say
+    RATE LIMITED — sending the operator to re-invite a collaborator during a
+    quota exhaustion hides the actual incident."""
+    out, _log = _doctor(
+        tmp_path,
+        label_post="exit 0",
+        repo_read='echo "API rate limit exceeded for user ID 1"; exit 1',
+    )
+    assert "RATE LIMITED" in out
+    assert "do not re-invite" in out
+    assert "invite it as a collaborator (write) and ACCEPT" not in out

@@ -311,8 +311,18 @@ if command -v gh >/dev/null 2>&1; then
         bad "REVIEW_BOT_TOKEN is invalid, expired, or lacks read:user (gh api user failed)"
       elif [ "$(_normalize_login "$_bot_login")" != "$(_normalize_login "${REVIEW_BOT:-}")" ]; then
         bad "REVIEW_BOT_TOKEN belongs to '$_bot_login' but REVIEW_BOT says '${REVIEW_BOT:-unset}' — GitHub would 422 every approval"
-      elif ! GH_TOKEN="$REVIEW_BOT_TOKEN" gh repo view "$REPO" --json name >/dev/null 2>&1; then
-        bad "review identity '$_bot_login' cannot access $REPO — invite it as a collaborator (write) and ACCEPT the invite from that account"
+      # REST, not `gh repo view` (GraphQL): the 2026-08-02 keifu incident's
+      # denied-write retry loop exhausted the bot's hourly GraphQL quota, and
+      # the GraphQL-backed read check then misreported "cannot access — invite
+      # as collaborator" for an identity whose access was fine. REST and
+      # GraphQL quotas are separate, and every check in this block is REST.
+      elif ! _bot_repo_out="$(GH_TOKEN="$REVIEW_BOT_TOKEN" gh api "repos/$REPO" --jq '.name' 2>&1)"; then
+        case "$_bot_repo_out" in
+          *[Rr]ate\ limit*|*rate-limit*)
+            bad "review identity '$_bot_login' is RATE LIMITED by GitHub (not an access problem — do not re-invite). Usually a denied-write retry loop; wait for the hourly reset and check the effect-retry escalations." ;;
+          *)
+            bad "review identity '$_bot_login' cannot access $REPO — invite it as a collaborator (write) and ACCEPT the invite from that account" ;;
+        esac
       else
         # Read access is NOT enough: submitting a review is a write. A bot that
         # can read but not push sails through this section and then 403s on
