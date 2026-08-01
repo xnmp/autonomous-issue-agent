@@ -131,3 +131,11 @@ All other commits were reviewed or are small+tested.
   `~/.local/state/issue-agent-xnmp-keifu` (+review-/steward- variants).
 - Do not touch `/home/chong/Repos/keifu` user state: modified
   `src/ui/issue_compose.rs`, untracked `test.py`, branch `chong-dev`.
+
+## Teardown state (05:17Z)
+
+Keifu launcher SIGTERMed and gone; no daemon/agent processes remain. One
+leftover from the in-flight kill: dispatch claim `xnmp/keifu|fix|issue:156`
+and run `7f12b3ff…` (RESUME, state=running). Next boot's recover() reclaims
+both and emits the abandoned-run correction — expected, verify it happens on
+relaunch. Dashboard server on :8321 left RUNNING deliberately.
