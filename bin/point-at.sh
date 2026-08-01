@@ -39,6 +39,8 @@ HARNESS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 . "$HARNESS_ROOT/bin/lib/logging.sh"
 # shellcheck source=bin/lib/harness-cli.sh
 . "$HARNESS_ROOT/bin/lib/harness-cli.sh"
+# shellcheck source=bin/lib/launch-guard.sh
+. "$HARNESS_ROOT/bin/lib/launch-guard.sh"
 NAME="${1:?usage: bin/point-at.sh <name>  (reads config/repos/<name>.env)}"
 SHARED="$HARNESS_ROOT/config/shared.env"
 REPO_ENV="$HARNESS_ROOT/config/repos/$NAME.env"
@@ -321,27 +323,11 @@ fi
 # word boundary (end-of-string or space) — unanchored `pgrep -f` substring-
 # matches, so NAME=app would also catch a launcher for NAME=myapp.
 #
-# Excluding $$/$PPID is NOT enough: `$(...)`, pipelines and `&&` lists all fork
-# bash subshells that INHERIT our argv, so /proc shows them as extra
-# "point-at.sh <name>" processes under fresh pids. Matching those made the guard
-# fire on literally every first run (it reported its own command-substitution
-# subshell, already reaped by the time the operator ran `ps`). A genuine second
-# launcher is never parented by us, so drop any candidate whose PPID is $$ — and
-# any that exited between pgrep and the check, since a dead process is not a
-# running duplicate.
-_others=""
-for _p in $(pgrep -f "point-at\.sh ${NAME}([[:space:]]|\$)" 2>/dev/null || true); do
-  if [ "$_p" = "$$" ] || [ "$_p" = "$PPID" ]; then
-    continue
-  fi
-  _pp="$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d '[:space:]' || true)"
-  # empty ⇒ exited between pgrep and now (not a live duplicate);
-  # $$      ⇒ a subshell we forked (inherits our argv), not a launcher.
-  if [ -z "$_pp" ] || [ "$_pp" = "$$" ]; then
-    continue
-  fi
-  _others="${_others:+$_others }$_p"
-done
+# Lineage-aware detection lives in bin/lib/launch-guard.sh so the regression
+# test can exercise it without a full launch (incident 2026-08-01: a
+# systemd-inhibit wrapper's argv matched the old $$/$PPID-only exclusion and
+# the guard refused its own first run).
+_others="$(duplicate_launcher_pids "$NAME" | tr '\n' ' ' | sed 's/ $//')"
 if [ -n "$_others" ]; then
   red "a point-at launcher for '$NAME' is already running (pids: $(echo $_others | tr '\n' ' '))."
   red "Refusing to start a second — duplicate daemons double-dispatch. Stop it first:"

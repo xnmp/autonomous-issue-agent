@@ -161,5 +161,50 @@ else
   ok "missing target checkout is rejected"
 fi
 
+# ── duplicate-launcher guard (incident 2026-08-01) ────────────────────────────
+# A wrapper (systemd-inhibit, sh -c, …) whose argv quotes the launch command is
+# an ANCESTOR whose cmdline matches the guard's pgrep; the guard must not
+# refuse its own first run because of it, while still catching a genuinely
+# unrelated live launcher.
+. "$ROOT/bin/lib/launch-guard.sh"
+guard_name="pointat-guard-selftest-$$"
+
+# False-positive case: the matching process is our own ancestor. The outer
+# script's argv ends in "point-at.sh <name>"; it forks a child bash that runs
+# the guard. The old $$/$PPID-only exclusion reported the ancestor.
+mkdir -p "$scratch/wrapper"
+cat >"$scratch/wrapper/point-at.sh" <<EOF
+#!/usr/bin/env bash
+bash -c '. "$ROOT/bin/lib/launch-guard.sh"; duplicate_launcher_pids "$guard_name"'
+EOF
+chmod +x "$scratch/wrapper/point-at.sh"
+ancestor_out="$(bash "$scratch/wrapper/point-at.sh" "$guard_name")"
+if [ -z "$ancestor_out" ]; then
+  ok "guard ignores its own wrapper ancestors"
+else
+  no "guard ignores its own wrapper ancestors" "reported: $ancestor_out"
+fi
+
+# True-duplicate case: a detached (setsid → reparented off our lineage)
+# process whose argv matches "point-at.sh <name>" must be reported.
+mkdir -p "$scratch/dup"
+cat >"$scratch/dup/point-at.sh" <<'EOF'
+#!/usr/bin/env bash
+sleep 30
+EOF
+chmod +x "$scratch/dup/point-at.sh"
+# Double-fork: the intermediate subshell exits at once, so the sleeper is
+# reparented off this shell — a backgrounded setsid alone execs in place and
+# would keep PPID = $$, which the guard rightly treats as our own subshell.
+( setsid bash "$scratch/dup/point-at.sh" "$guard_name" >/dev/null 2>&1 & )
+sleep 0.3
+dup_out="$(duplicate_launcher_pids "$guard_name")"
+pkill -f "dup/point-at\.sh $guard_name" >/dev/null 2>&1 || true
+if [ -n "$dup_out" ]; then
+  ok "guard reports a genuine detached duplicate"
+else
+  no "guard reports a genuine detached duplicate"
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
