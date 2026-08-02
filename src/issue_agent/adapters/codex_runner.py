@@ -292,6 +292,37 @@ def build_codex_argv(
     return argv
 
 
+# Linux caps a SINGLE argv element at MAX_ARG_STRLEN (32 pages = 131072 B);
+# exceeding it kills the spawn with E2BIG before any paid work happens.
+# 100 KB leaves headroom for multibyte counting differences and the
+# supervised_exec wrapper's own argv.
+_PROMPT_ARGV_LIMIT = 100_000
+
+# Ceiling for the stdin route (adversarial F1): removing the E2BIG floor must
+# not let a pathological prompt (a multi-MB `gh pr diff`) spawn and burn a
+# PAID leg on a guaranteed provider context overflow. Refused pre-spawn as an
+# agent error, so the existing retry breakers bound the repeats and escalate.
+_PROMPT_STDIN_HARD_LIMIT = 1_500_000
+
+
+def route_oversize_prompt(argv: list[str]) -> tuple[list[str], bytes | None]:
+    """Pure: move an oversize argv prompt onto stdin.
+
+    `codex exec` reads its instructions from stdin when the prompt argument is
+    `-` (per its own --help; the resume subcommand shares the [PROMPT]
+    grammar). The prompt is always the final element `build_codex_argv`
+    appends. Observed live 2026-08-02: RE_REVIEW keifu #173's diff-bearing
+    prompt exceeded MAX_ARG_STRLEN and the spawn died with `[Errno 7] Argument
+    list too long` — a deterministic death the retry ladder could only repeat,
+    and the dispatch failure then walked the PR to needs-human-review.
+    Threshold-gated rather than always-stdin so the long-proven argv path
+    keeps handling the common case."""
+    prompt = argv[-1]
+    if len(prompt.encode()) <= _PROMPT_ARGV_LIMIT:
+        return argv, None
+    return [*argv[:-1], "-"], prompt.encode()
+
+
 # ── token accounting (review M1 / plan D12) ──────────────────────────────────
 # Codex reports no dollar figure — there is no `total_cost_usd` anywhere on the
 # `codex exec` path — so tokens × a configured price table is the ONLY substrate
@@ -1403,12 +1434,35 @@ class CodexRunner(AgentRuntime):
                 inject_system_prompt=self.inject_system_prompt,
                 reasoning_effort=self.reasoning_effort,
             )
+            argv, stdin_payload = route_oversize_prompt(argv)
+            if stdin_payload is not None:
+                if len(stdin_payload) > _PROMPT_STDIN_HARD_LIMIT:
+                    # Deterministic refusal BEFORE any spend: a prompt this
+                    # size cannot fit a provider context, so paying to find
+                    # out is strictly worse than the E2BIG death this route
+                    # replaced. AGENT_ERROR (a strike) keeps it bounded by
+                    # the ordinary retry ceilings.
+                    return AgentResult(
+                        is_error=True,
+                        status="prompt_oversize",
+                        exit_reason=ExitReason.AGENT_ERROR,
+                        summary=(
+                            f"prompt is {len(stdin_payload)} bytes "
+                            f"(> {_PROMPT_STDIN_HARD_LIMIT}); refusing to "
+                            "dispatch a leg that cannot fit a model context"
+                        ),
+                    )
+                self._log(
+                    f"codex: prompt {len(stdin_payload)}B exceeds the "
+                    f"{_PROMPT_ARGV_LIMIT}B argv bound — routing via stdin"
+                )
             result, exit_code, stderr, stdout, hung = await self._exec_once(
                 argv, run_task, output_path,
                 usage_baseline=(
                     (baseline_sid, baseline_usage, baseline_turns)
                     if baseline_usage else None
                 ),
+                stdin_payload=stdin_payload,
             )
             if hung:
                 # A watchdog fired — surface as a retryable timeout, not a
@@ -1508,6 +1562,7 @@ class CodexRunner(AgentRuntime):
     async def _exec_once(
         self, argv: list[str], task: RuntimePlan, output_path: str,
         usage_baseline: tuple[str, dict, int | None] | None = None,
+        stdin_payload: bytes | None = None,
     ) -> tuple[AgentResult, int, str, str, bool]:
         """One `codex exec` invocation: spawn, stream stderr live, parse the
         envelope. Returns (result, exit_code, stderr, stdout, hung) so run()'s
@@ -1574,7 +1629,13 @@ class CodexRunner(AgentRuntime):
         # (harmless on the exec path — it matches the `-C` we also pass there).
         proc = await asyncio.create_subprocess_exec(
             *spawn_argv,
-            stdin=asyncio.subprocess.DEVNULL,  # codex waits on stdin otherwise
+            # DEVNULL because codex waits on stdin otherwise; PIPE only when an
+            # oversize prompt was routed off argv (route_oversize_prompt).
+            stdin=(
+                asyncio.subprocess.PIPE
+                if stdin_payload is not None
+                else asyncio.subprocess.DEVNULL
+            ),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=proc_env,
@@ -1588,6 +1649,30 @@ class CodexRunner(AgentRuntime):
             start_new_session=True,
             limit=_STDERR_STREAM_LIMIT,
         )
+        feeder_task: asyncio.Task | None = None
+        if stdin_payload is not None:
+            # Feed concurrently with the stderr pump below: a payload larger
+            # than the pipe buffer blocks until codex reads it, and codex may
+            # not read stdin before emitting its first stderr events. Errors
+            # are swallowed — a dead child surfaces through the pump/exit path,
+            # not through this write. The handle is held and cancelled in the
+            # teardown finally (adversarial F2): loop task refs are weak, and
+            # an unretrieved exception would otherwise warn at GC.
+            async def _feed_stdin(payload: bytes) -> None:
+                try:
+                    if proc.stdin is None:
+                        return
+                    proc.stdin.write(payload)
+                    await proc.stdin.drain()
+                except Exception:  # noqa: BLE001 — see docstring above
+                    pass
+                finally:
+                    if proc.stdin is not None:
+                        proc.stdin.close()
+
+            feeder_task = asyncio.get_running_loop().create_task(
+                _feed_stdin(stdin_payload)
+            )
         # Stream stderr LIVE rather than buffering to exit: codex exec emits its
         # per-tool-call trace (exec/apply_patch/tokens) to stderr, so live-reading
         # it is the only mid-run visibility we get (the whole resolve is one
@@ -1975,6 +2060,12 @@ class CodexRunner(AgentRuntime):
                 _kill_quietly(proc)
             raise
         finally:
+            if feeder_task is not None:
+                feeder_task.cancel()
+                try:
+                    await feeder_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             if self.process_supervisor is not None:
                 # Successful leaders may leave background descendants that close
                 # inherited streams. Ownership ends only after the whole group is

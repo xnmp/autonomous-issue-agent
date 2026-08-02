@@ -46,6 +46,44 @@ from issue_agent.domain.effort import Effort
 
 
 # ── build_codex_argv (pure) ─────────────────────────────────────────────────────
+def test_oversize_prompt_moves_to_stdin_small_stays_on_argv():
+    """Linux kills a spawn whose single argv element exceeds MAX_ARG_STRLEN
+    (128 KiB) with E2BIG — observed live on RE_REVIEW keifu #173 (2026-08-02),
+    whose diff-bearing prompt died before any paid work and walked the PR to
+    needs-human-review. Oversize prompts must ride stdin (`codex exec -`)."""
+    from issue_agent.adapters.codex_runner import (
+        _PROMPT_ARGV_LIMIT,
+        route_oversize_prompt,
+    )
+
+    small = build_codex_argv(RuntimePlan(prompt="do it"))
+    routed_small, payload_small = route_oversize_prompt(small)
+    assert payload_small is None
+    assert routed_small == build_codex_argv(RuntimePlan(prompt="do it"))
+
+    big_prompt = "x" * 150_000
+    big = build_codex_argv(RuntimePlan(prompt=big_prompt))
+    routed, payload = route_oversize_prompt(big)
+    assert routed[-1] == "-"
+    assert routed[:-1] == big[:-1]
+    assert payload == big_prompt.encode()
+    # The routed argv is now safely under the per-argument limit everywhere.
+    assert all(len(arg.encode()) < 131072 for arg in routed)
+
+    # Boundary: exactly at the limit stays on argv; one byte over routes.
+    at_limit = ["codex", "exec", "y" * _PROMPT_ARGV_LIMIT]
+    assert route_oversize_prompt(at_limit) == (at_limit, None)
+    over = ["codex", "exec", "y" * (_PROMPT_ARGV_LIMIT + 1)]
+    assert route_oversize_prompt(over)[0][-1] == "-"
+
+    # The limit is BYTES, not characters: a multibyte prompt under the char
+    # count but over the byte count must route (the E2BIG kernel check is
+    # byte-based).
+    multibyte = ["codex", "exec", "€" * (_PROMPT_ARGV_LIMIT // 3 + 1)]
+    routed_mb, payload_mb = route_oversize_prompt(multibyte)
+    assert routed_mb[-1] == "-" and payload_mb is not None
+
+
 def test_argv_basic_shape():
     argv = build_codex_argv(RuntimePlan(prompt="do it"))
     assert argv[:2] == ["codex", "exec"]
