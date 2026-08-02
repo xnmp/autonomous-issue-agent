@@ -144,6 +144,16 @@ class StubBackend:
         self.unblock_channel = channel
         return (True, "ok")
 
+    def park(self, name, number, channel="api"):
+        self._maybe("park")
+        self.park_channel = channel
+        return (True, "ok")
+
+    def unpark(self, name, number, channel="api"):
+        self._maybe("unpark")
+        self.unpark_channel = channel
+        return (True, "ok")
+
     def priority(self, name, number, priority):
         self._maybe("priority")
         self.priority_seen = priority
@@ -307,6 +317,30 @@ def test_unblock_reports_success():
     assert client().post("/api/repos/demo/issues/9/unblock").json() == {
         "ok": True, "detail": "ok"
     }
+
+
+def test_park_and_unpark_report_success_and_stamp_the_channel():
+    backend = StubBackend()
+    c = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL)
+    assert c.post("/api/repos/demo/issues/9/park",
+                  headers={"User-Agent": "Mozilla/5.0"}).json() == {
+        "ok": True, "detail": "ok"
+    }
+    assert backend.park_channel == "ui"
+    assert c.post("/api/repos/demo/issues/9/unpark",
+                  headers={"User-Agent": "curl/8.5"}).json() == {
+        "ok": True, "detail": "ok"
+    }
+    assert backend.unpark_channel == "api"
+
+
+def test_a_park_whose_collectors_fail_is_refused_not_a_500():
+    backend = StubBackend(explode="park")
+    c = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL)
+    response = c.post("/api/repos/demo/issues/9/park")
+    assert response.status_code == 400
+    assert response.json()["ok"] is False
+    assert "collector blew up" in response.json()["detail"]
 
 
 def test_unblock_stamps_the_channel_from_the_user_agent():

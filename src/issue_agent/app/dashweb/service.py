@@ -458,6 +458,196 @@ class Backend:
             return True, "ok — but " + "; ".join(rearm_failures)
         return applied, detail
 
+    def park(
+        self, name: str, number: int, channel: str = "api"
+    ) -> tuple[bool, str]:
+        """Hand this issue's open PR(s) to a human WITHOUT starving the queue.
+
+        Removing `ai-pr-open` is the whole mechanism: the fixer's world only
+        contains ai-pr-open PRs, so the parked PR's paths leave the overlap
+        serializer next tick and held pending issues dispatch. `ai-parked`
+        records the decision on issue and PRs — the steward will not re-triage
+        it, the dashboard shows it as a parked pending row. NOTE: unpark is a
+        RE-ARM, not a label-for-label reversal — escalation labels park
+        stripped (ai-blocked / needs-*-review) stay gone, so the pipeline
+        resumes review/CI legs on the PR (adversarial P2-5).
+
+        Refused when nothing carries ai-pr-open: parking an issue with no
+        harness PR would just hide it (keifu #34 / PR #179, 2026-08-02 —
+        approved, macOS-broken, cap-blocked, and holding five issues hostage).
+        """
+        ok, repo, gh_prs, prs, issue_labels, detail = self._park_context(
+            name, number
+        )
+        if not ok:
+            return False, detail
+        # OPEN only: a merged PR still wearing ai-pr-open is mid merge-cleanup;
+        # stripping the label here would remove the key cleanup_actions drains
+        # on (adversarial P2-7). A PR already wearing ai-parked stays parkable
+        # so a park whose PR write landed but issue write failed can be
+        # retried instead of dead-ending on "no open harness PR" (P2-6).
+        def _pr_labels(pr: int) -> set[str]:
+            return set(snapshots.labels_of(gh_prs.get(pr) or {}))
+
+        parkable = [
+            pr for pr in prs
+            if str((gh_prs.get(pr) or {}).get("state", "")).upper() == "OPEN"
+            and _pr_labels(pr) & {"ai-pr-open", actions.PARKED_LABEL}
+        ]
+        if not parkable:
+            return False, f"nothing to park on #{number}: no open harness PR"
+        effects = self._operator_effects(name, repo, journalled=False)
+        ensured, ensure_detail = effects.ensure_label(
+            actions.PARKED_LABEL,
+            color=actions.PARKED_COLOR,
+            description="operator parked: harness hands-off",
+        )
+        if not ensured:
+            return False, ensure_detail
+        applied, detail = True, "ok"
+        moves: list[tuple[str, int, tuple[str, ...]]] = []
+        for pr in parkable:
+            remove = tuple(x for x in actions.PARK_REMOVES if x in _pr_labels(pr))
+            pr_ok, pr_detail = effects.set_issue_labels(
+                pr, add=(actions.PARKED_LABEL,), remove=remove
+            )
+            if pr_ok:
+                moves.append(("pr", pr, remove))
+            else:
+                applied, detail = False, f"pr #{pr}: {pr_detail}"
+        remove = tuple(x for x in actions.PARK_REMOVES if x in issue_labels)
+        issue_ok, issue_detail = effects.set_issue_labels(
+            number, add=(actions.PARKED_LABEL,), remove=remove
+        )
+        if issue_ok:
+            moves.append(("issue", number, remove))
+        else:
+            applied, detail = False, issue_detail
+        self._journal_park(
+            name, repo, number, "operator_park", moves, applied, channel
+        )
+        return applied, detail
+
+    def unpark(
+        self, name: str, number: int, channel: str = "api"
+    ) -> tuple[bool, str]:
+        """Re-arm a parked issue: restore ai-pr-open on the parked PR(s) so
+        they rejoin review/merge/overlap, and drop ai-parked everywhere.
+        Escalation labels park removed are NOT restored — unparking means
+        "the pipeline may work this again", not "recreate the blocked state"."""
+        ok, repo, gh_prs, prs, issue_labels, detail = self._park_context(
+            name, number
+        )
+        if not ok:
+            return False, detail
+        parked = [
+            pr for pr in prs
+            if actions.PARKED_LABEL
+            in set(snapshots.labels_of(gh_prs.get(pr) or {}))
+        ]
+        if not parked and actions.PARKED_LABEL not in issue_labels:
+            return False, f"#{number} is not parked"
+        effects = self._operator_effects(name, repo, journalled=False)
+        applied, detail = True, "ok"
+        moves: list[tuple[str, int, tuple[str, ...]]] = []
+        for pr in parked:
+            pr_ok, pr_detail = effects.set_issue_labels(
+                pr, add=("ai-pr-open",), remove=(actions.PARKED_LABEL,)
+            )
+            if pr_ok:
+                moves.append(("pr", pr, (actions.PARKED_LABEL,)))
+            else:
+                applied, detail = False, f"pr #{pr}: {pr_detail}"
+        if actions.PARKED_LABEL in issue_labels:
+            add = ("ai-pr-open",) if parked else ()
+            issue_ok, issue_detail = effects.set_issue_labels(
+                number, add=add, remove=(actions.PARKED_LABEL,)
+            )
+            if issue_ok:
+                moves.append(("issue", number, (actions.PARKED_LABEL,)))
+            else:
+                applied, detail = False, issue_detail
+        self._journal_park(
+            name, repo, number, "operator_unpark", moves, applied, channel
+        )
+        return applied, detail
+
+    def _park_context(
+        self, name: str, number: int
+    ) -> tuple[bool, str, dict, list[int], set[str], str]:
+        """(ok, repo, gh_prs, issue's PRs, issue's labels, refusal detail)."""
+        if not self.known(name):
+            return False, "", {}, [], set(), f"unknown deployment '{name}'"
+        repo = self.overlay_field(name, "REPO")
+        if not repo:
+            return False, "", {}, [], set(), f"no REPO configured for '{name}'"
+        try:
+            gh_issues, gh_prs, warnings = self._gh_context(repo)
+        except Exception as exc:  # noqa: BLE001 - operator-facing result
+            return False, repo, {}, [], set(), f"could not read #{number}: {exc}"
+        issue = gh_issues.get(number)
+        if issue is None:
+            return False, repo, {}, [], set(), (
+                warnings[0] if warnings
+                else f"issue #{number} is not open on {repo}"
+            )
+        return (
+            True,
+            repo,
+            gh_prs,
+            self._issue_prs(name, number),
+            set(snapshots.labels_of(issue)),
+            "",
+        )
+
+    def _journal_park(
+        self,
+        name: str,
+        repo: str,
+        number: int,
+        kind: str,
+        moves: list[tuple[str, int, tuple[str, ...]]],
+        applied: bool,
+        channel: str,
+    ) -> None:
+        journal = self._operator_journal(name, repo)
+        if journal is None:
+            return
+        verb = "park" if kind == "operator_park" else "unpark"
+        try:
+            for target, target_number, removed in moves or [
+                ("issue", number, ())
+            ]:
+                journal.emit(
+                    TelemetryEvent(
+                        ActionApplied(
+                            f"operator-{verb}:{uuid.uuid4().hex}",
+                            kind,
+                            target,
+                            f"operator {verb} {target} #{target_number}: "
+                            + (" ".join(f"-{x}" for x in removed) or "(none)"),
+                            target_number,
+                            {
+                                "add": [
+                                    actions.PARKED_LABEL
+                                    if kind == "operator_park"
+                                    else "ai-pr-open"
+                                ],
+                                "remove": list(removed),
+                                "operator": f"{repo}:dashboard",
+                                "channel": channel,
+                                "labels_applied": applied,
+                            },
+                        ),
+                        Correlation(
+                            issue=number,
+                            pr=target_number if target == "pr" else None,
+                        ),
+                    )
+                )
+        except Exception:  # noqa: BLE001 - telemetry never fails the action
+            pass
+
     def _rearm_rejections(
         self, name: str, repo: str, number: int, effects
     ) -> list[str]:

@@ -269,6 +269,39 @@ def create_app(
             ok, detail = False, f"unblock unavailable ({type(exc).__name__}: {exc})"
         return JSONResponse({"ok": ok, "detail": detail}, status_code=200 if ok else 400)
 
+    def _park_route(path: str, method_name: str):
+        async def api_park(
+            name: str,
+            number: int,
+            user_agent: str = Header(default="", include_in_schema=False),
+        ):
+            if number < 1:
+                raise HTTPException(400, "issue number must be positive")
+            channel = "ui" if user_agent.startswith("Mozilla") else "api"
+            # Same collector failure modes as unblock: read before write, so a
+            # broken GitHub read is a refusal the operator can act on, not a 500.
+            try:
+                ok, detail = await invoke(
+                    getattr(backend, method_name), name, number, channel
+                )
+            except Exception as exc:  # noqa: BLE001
+                ok, detail = False, (
+                    f"{path} unavailable ({type(exc).__name__}: {exc})"
+                )
+            return JSONResponse(
+                {"ok": ok, "detail": detail}, status_code=200 if ok else 400
+            )
+
+        # Unique names so the two routes get distinct OpenAPI operation ids.
+        api_park.__name__ = f"api_{method_name}"
+        app.post(
+            f"/api/repos/{{name}}/issues/{{number}}/{path}",
+            response_model=contracts.ActionResult,
+        )(api_park)
+
+    _park_route("park", "park")
+    _park_route("unpark", "unpark")
+
     @app.post(
         "/api/repos/{name}/issues/{number}/priority",
         response_model=contracts.ActionResult,

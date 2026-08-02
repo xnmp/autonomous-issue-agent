@@ -76,6 +76,57 @@ describe("board explainability", () => {
     expect(screen.getByText("3 infra deaths in a row on the same PR")).toBeVisible();
   });
 
+  it("offers Park beside Unblock only when a blocked issue has an open PR", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            issue: 200, title: "Explain the board", url: null,
+            stage: "escalated", done: false, prs: [], pull_requests: [],
+            cost_usd: 1, elapsed_s: 600, working_s: 45, idle_s: 555,
+            idle_active: true, steps: [], events: [], warnings: [],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+    board(polled([{
+      ...base,
+      pr: 179,
+      pr_url: "https://github.com/o/r/pull/179",
+      pr_state: "open",
+      human_action: "escalated",
+      flags: ["escalated"],
+    }]));
+    await userEvent.click(screen.getByRole("row", { name: /Explain the board/ }));
+    expect(await screen.findByRole("button", { name: "Park" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Unblock" })).toBeVisible();
+    vi.unstubAllGlobals();
+  });
+
+  it("offers no Park on a blocked issue without an open PR", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            issue: 200, title: "Explain the board", url: null,
+            stage: "escalated", done: false, prs: [], pull_requests: [],
+            cost_usd: 1, elapsed_s: 600, working_s: 45, idle_s: 555,
+            idle_active: true, steps: [], events: [], warnings: [],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+    board(polled([{ ...base, human_action: "escalated", flags: ["escalated"] }]));
+    await userEvent.click(screen.getByRole("row", { name: /Explain the board/ }));
+    expect(await screen.findByRole("button", { name: "Unblock" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Park" })).not.toBeInTheDocument();
+    vi.unstubAllGlobals();
+  });
+
   it("names an escalation with no recorded reason instead of showing nothing", () => {
     board(polled([{ ...base, human_action: "escalated", flags: ["escalated"] }]));
 

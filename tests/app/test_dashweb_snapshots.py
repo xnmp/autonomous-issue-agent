@@ -788,6 +788,37 @@ def test_pending_card_with_no_journal_history_is_not_held():
     assert (card["held"], card["priority"]) == (False, None)
 
 
+def test_a_parked_issue_renders_as_a_held_pending_row_with_the_parked_reason():
+    card = snapshots.pending_card(
+        {"number": 34, "labels": ["ai-parked", "ai-triage"]}, None)
+    assert (card["held"], card["hold_reason"]) == (True, "parked")
+
+
+def test_a_parked_issue_leaves_the_in_flight_lane_for_pending():
+    # Park moves an issue off the active board even mid-history: an operator
+    # decision outranks whatever legs or holds the journal accumulated.
+    dep = v2_deployment([
+        v2_event(AgentRunStarted("m", kind="RESOLVE"), "a", 0, issue=34, run_id="r"),
+        v2_event(
+            AgentRunCompleted(
+                "done", False, "ok", 1000, "m", "codex",
+                cost_micros=750_000, currency="USD", pricing_basis="api",
+                kind="RESOLVE",
+            ),
+            "b", 1, issue=34, run_id="r",
+        ),
+        v2_event(
+            WorldObserved(
+                "issue", 34, "h",
+                {"present": True, "state": "OPEN",
+                 "labels": ["ai-parked", "ai-triage"]},
+            ),
+            "c", 2, issue=34,
+        ),
+    ])
+    assert dep.issues[0].lane == "pending"
+
+
 def test_pending_card_carries_the_issue_body_for_the_drill_down():
     card = snapshots.pending_card(
         {"number": 9, "labels": ["ai-ready"], "body": "repro steps"}, None)

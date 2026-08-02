@@ -10,6 +10,7 @@ import {
 } from "react";
 import { api } from "../api/client";
 import { useClock, usePolled, type Polled } from "../api/hooks";
+import { tipProps } from "./ui/Tip";
 import type {
   BacklogCard,
   CardStep,
@@ -529,6 +530,18 @@ function PendingTable({
       setBusyIssue(null);
     }
   };
+  const unpark = async (issue: number) => {
+    setBusyIssue(issue);
+    setError(null);
+    try {
+      await api.unpark(repo, issue);
+      onRefresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyIssue(null);
+    }
+  };
   const columns: TableColumn[] = [
     { key: "issue", label: "Issue", width: 360 },
     ...(visible.has("pending-priority") ? [{ key: "priority", label: "Priority", width: 220 }] : []),
@@ -576,7 +589,11 @@ function PendingTable({
                       <td><span className="faint" title="steward overlap prediction not built yet">n/a</span></td>
                     ) : null}
                     {visible.has("pending-hold") ? <td>
-                      {card.held ? (
+                      {card.hold_reason === "parked" ? (
+                        <Chip tone="meta" title="operator parked: a human owns its PR; the queue no longer waits on it">
+                          parked
+                        </Chip>
+                      ) : card.held ? (
                         <Chip tone="info" title={card.hold_reason ?? "pending"}>
                           {card.hold_reason ?? "pending"}
                         </Chip>
@@ -590,7 +607,22 @@ function PendingTable({
                         <div className="row-detail">
                           <div className="row-detail-hd">
                             <strong>Issue context</strong>
-                            {card.url ? <a href={card.url} target="_blank" rel="noreferrer">Open on GitHub ↗</a> : null}
+                            <span className="row-wrap">
+                              {card.hold_reason === "parked" ? (
+                                <button
+                                  className="btn btn-xs"
+                                  disabled={busyIssue === card.issue}
+                                  {...tipProps("Restore the PR to the harness: review, merge and overlap serialization resume")}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    void unpark(card.issue);
+                                  }}
+                                >
+                                  Unpark
+                                </button>
+                              ) : null}
+                              {card.url ? <a href={card.url} target="_blank" rel="noreferrer">Open on GitHub ↗</a> : null}
+                            </span>
                           </div>
                           <FormattedIssueBody body={card.body ?? null} />
                         </div>
@@ -973,6 +1005,9 @@ function TaskDetailRow({
   );
   const steps = detail.data?.steps ?? null;
   const unblockable = blocksOnHuman(card);
+  // Park only makes sense for the blocked-with-an-open-PR shape: a human is
+  // taking the PR over, and the queue must stop waiting for it.
+  const parkable = unblockable && card.pr !== null && card.pr_state === "open";
 
   const doUnblock = async () => {
     setBusy(true);
@@ -980,6 +1015,20 @@ function TaskDetailRow({
     try {
       await api.unblock(repo, card.issue);
       setConfirming(false);
+      detail.refresh();
+      onRefresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doPark = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.park(repo, card.issue);
       detail.refresh();
       onRefresh();
     } catch (caught) {
@@ -1006,6 +1055,19 @@ function TaskDetailRow({
                   }}
                 >
                   Unblock
+                </button>
+              ) : null}
+              {parkable ? (
+                <button
+                  className="btn btn-xs"
+                  disabled={busy}
+                  {...tipProps("Hand the PR to a human and free the queue: other issues stop waiting on its files")}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    void doPark();
+                  }}
+                >
+                  Park
                 </button>
               ) : null}
               <button className="btn btn-xs" onClick={onOpen}>Open full issue</button>

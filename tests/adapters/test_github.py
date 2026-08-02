@@ -927,6 +927,49 @@ def test_build_world_enriches_only_ready_issues_with_blocker_gate():
     assert by_num[6].blocked_by_open is False    # working issue never gated
 
 
+def test_build_world_drops_an_open_pr_the_stale_search_still_labels():
+    # keifu PR #179 (2026-08-03): an operator park removed ai-pr-open, but the
+    # search-backed label list kept returning the PR for minutes, so every
+    # path-overlapping ai-ready issue stayed held on a PR the harness no longer
+    # owned. The per-PR fetch's labels are fresh — they are the authority.
+    def runner(argv, token):
+        key = " ".join(argv)
+        if "issue list" in key:
+            return "[]"
+        if "pr list" in key:
+            return json.dumps([{"number": 179, "state": "OPEN"}])
+        if "pr view 179" in key:
+            return json.dumps({
+                "number": 179, "state": "OPEN",
+                "labels": [{"name": "ai-parked"}],
+                "files": [{"path": "src/app/mod.rs"}],
+            })
+        return ""
+
+    gw = GitHubGateway("o/r", runner=runner)
+    assert gw.build_world().prs == ()
+
+
+def test_build_world_keeps_a_merged_pr_still_wearing_the_label():
+    # The merge-cleanup arms exist to drain exactly this state; the freshness
+    # filter must only govern the OPEN slice.
+    def runner(argv, token):
+        key = " ".join(argv)
+        if "issue list" in key:
+            return "[]"
+        if "pr list" in key:
+            return json.dumps([{"number": 60, "state": "MERGED"}])
+        if "pr view 60" in key:
+            return json.dumps({
+                "number": 60, "state": "MERGED",
+                "labels": [{"name": "ai-pr-open"}],
+            })
+        return ""
+
+    gw = GitHubGateway("o/r", runner=runner)
+    assert [p.number for p in gw.build_world().prs] == [60]
+
+
 # ── closing-reference graph for the duplicate-PR guard (#39) ─────────────────
 def test_parse_closing_refs_flattens_pr_to_issue_pairs():
     data = [
@@ -1942,7 +1985,8 @@ def test_merged_prs_in_the_world_get_the_cheap_fetch():
                "headRefOid": "", "baseRefName": "dev", "labels": [], "reviews": [],
                "state": "MERGED", "closingIssuesReferences": [], "files": [],
                "isDraft": False, "author": {"login": "b"}}
-    open_json = {**pr_json, "number": 541, "state": "OPEN"}
+    open_json = {**pr_json, "number": 541, "state": "OPEN",
+                 "labels": [{"name": "ai-pr-open"}]}
     fr = FakeRunner({
         "pr list --repo": [{"number": 540, "state": "MERGED"},
                            {"number": 541, "state": "OPEN"}],

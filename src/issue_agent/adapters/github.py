@@ -1255,6 +1255,17 @@ class GitHubGateway:
                 checks=pr_states[n] == "OPEN",
             )) is not None
         )
+        # The label lists above are SEARCH-backed and serve stale results: an
+        # OPEN PR whose ai-pr-open was just removed (an operator park) kept
+        # reappearing here for minutes and re-holding every path-overlapping
+        # ai-ready issue (keifu PR #179, 2026-08-03). The per-PR fetch carries
+        # the fresh labels, so they are the authority for the OPEN slice. The
+        # non-OPEN slice stays unfiltered — the merge-cleanup arms exist to
+        # drain PRs in exactly the "merged but still labelled" state.
+        prs = tuple(
+            p for p in prs
+            if p.state != "OPEN" or Label.AI_PR_OPEN in p.labels
+        )
         # One extra list call, and only on a FULL build (a probe-gated tick never
         # reaches here). Fetched AFTER the per-item enrichment so a duplicate
         # guard can never be the reason a world build fails late: by this point

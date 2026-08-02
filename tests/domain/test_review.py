@@ -193,6 +193,14 @@ def test_adopt_skips_already_labelled_pr():
     assert not any(isinstance(a, Relabel) for a in acts)
 
 
+def test_adopt_skips_parked_pr():
+    # An operator park removes the trigger label to take the PR OUT of the
+    # pipeline; adoption re-labelling it undid the park and let the budget arm
+    # re-escalate (keifu PR #179, 2026-08-03). Parked PRs stay the operator's.
+    p = pr(200, "ai-parked", head_ref_oid="abc", author="human")
+    assert decide_review(world(prs=[p]), ADOPT, ReviewState()) == []
+
+
 def test_adopt_skips_closed_pr():
     p = pr(200, head_ref_oid="abc", author="human", state="MERGED")
     assert decide_review(world(prs=[p]), ADOPT, ReviewState()) == []

@@ -805,6 +805,10 @@ def _v2_lane(
         return "done"
     if facts.get("present") is False:
         return "historical"
+    # Parked outranks everything short of done: the operator moved this issue
+    # out of the active board on purpose, however held or escalated it was.
+    if "ai-parked" in labels:
+        return "pending"
     if (
         "ai-ready" in labels
         and labels.isdisjoint({"ai-blocked", "needs-human-review"})

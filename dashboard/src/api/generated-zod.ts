@@ -524,6 +524,32 @@ const endpoints = makeApi([
   },
   {
     method: "post",
+    path: "/api/repos/:name/issues/:number/park",
+    alias: "api_park_api_repos__name__issues__number__park_post",
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "name",
+        type: "Path",
+        schema: z.string(),
+      },
+      {
+        name: "number",
+        type: "Path",
+        schema: z.number().int(),
+      },
+    ],
+    response: z.object({ detail: z.string(), ok: z.boolean() }).passthrough(),
+    errors: [
+      {
+        status: 422,
+        description: `Validation Error`,
+        schema: HTTPValidationError,
+      },
+    ],
+  },
+  {
+    method: "post",
     path: "/api/repos/:name/issues/:number/priority",
     alias: "api_priority_api_repos__name__issues__number__priority_post",
     requestFormat: "json",
@@ -620,6 +646,32 @@ const endpoints = makeApi([
     method: "post",
     path: "/api/repos/:name/issues/:number/unblock",
     alias: "api_unblock_api_repos__name__issues__number__unblock_post",
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "name",
+        type: "Path",
+        schema: z.string(),
+      },
+      {
+        name: "number",
+        type: "Path",
+        schema: z.number().int(),
+      },
+    ],
+    response: z.object({ detail: z.string(), ok: z.boolean() }).passthrough(),
+    errors: [
+      {
+        status: 422,
+        description: `Validation Error`,
+        schema: HTTPValidationError,
+      },
+    ],
+  },
+  {
+    method: "post",
+    path: "/api/repos/:name/issues/:number/unpark",
+    alias: "api_unpark_api_repos__name__issues__number__unpark_post",
     requestFormat: "json",
     parameters: [
       {

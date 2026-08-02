@@ -210,6 +210,23 @@ export const api = {
       s,
     ),
 
+  /** Hands an issue's PR(s) to a human and frees the overlap queue. */
+  park: (name: string, n: number, s?: AbortSignal) =>
+    postJson<ActionResult>(
+      `/api/repos/${enc(name)}/issues/${n}/park`,
+      {},
+      schemas.ActionResult,
+      s,
+    ),
+
+  unpark: (name: string, n: number, s?: AbortSignal) =>
+    postJson<ActionResult>(
+      `/api/repos/${enc(name)}/issues/${n}/unpark`,
+      {},
+      schemas.ActionResult,
+      s,
+    ),
+
   setPriority: (name: string, n: number, priority: Priority, s?: AbortSignal) =>
     postJson<ActionResult>(
       `/api/repos/${enc(name)}/issues/${n}/priority`,

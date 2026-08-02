@@ -59,6 +59,15 @@ class Label(str, Enum):
     AI_SUGGESTION = "ai-suggestion"  # steward-filed suggestion issue
     NEEDS_DESIGN = "needs-design"  # an ADR must be approved first
 
+    # Operator parked: a human owns this issue's PR(s) indefinitely, and the
+    # queue must stop waiting for them. Removing ai-pr-open is what actually
+    # frees the overlap serializer (the fixer's world only contains ai-pr-open
+    # PRs); ai-parked records WHY the label went missing, keeps the steward
+    # from re-triaging the issue, and gives the dashboard a lane to show it
+    # in. Written only by the dashboard's park action (operator-owned,
+    # ADR 0012); no daemon ever adds or removes it.
+    AI_PARKED = "ai-parked"
+
     # Escalation.
     NEEDS_HUMAN_REVIEW = "needs-human-review"  # review/address-review exhausted
     # A runtime budget cap needs an operator to change the cap or resume from
@@ -96,6 +105,7 @@ LIFECYCLE_LABELS: frozenset[Label] = frozenset(
         Label.AI_SUGGESTION,
         Label.NEEDS_DESIGN,
         Label.NEEDS_HUMAN_REVIEW,
+        Label.AI_PARKED,
     }
 )
 

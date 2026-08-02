@@ -19,6 +19,14 @@ PRIORITY_COLORS = {"P1": "b60205", "P2": "d93f0b", "P3": "fbca04"}
 # The three labels that hold an issue on a human. Removing all of them is what
 # "unblock" means; nothing else is added, so the daemons re-derive the stage.
 UNBLOCK_LABELS = ("needs-human-review", "needs-budget-review", "ai-blocked")
+# Park: the operator hands the issue's PR(s) to a human and frees the queue.
+# ai-pr-open is what keeps a PR inside the fixer's overlap serializer, so
+# removing it is the whole mechanism; ai-parked records the decision.
+PARKED_LABEL = "ai-parked"
+PARKED_COLOR = "6a737d"
+# Labels a park strips from issue and PRs: the lifecycle/attention set that
+# would otherwise keep the target rendered as harness-owned or alarmed.
+PARK_REMOVES = ("ai-pr-open", "ai-working", *UNBLOCK_LABELS)
 
 
 def start_command(harness_root: str, name: str) -> list[str]:

@@ -386,13 +386,20 @@ def should_adopt(pr: PRView, cfg: ReviewConfig) -> bool:
     swaps the trigger label for needs-human-review, which drops the PR out of
     `prs_with(trigger_label)` — straight into the adoption sweep, which would
     re-label and re-dispatch it on the very next poll. An escalated PR belongs
-    to a human; adoption must not take it back."""
+    to a human; adoption must not take it back.
+
+    ai-parked is excluded for the same reason: an operator park removes the
+    trigger label to take the PR OUT of the pipeline, and the adoption sweep
+    re-labeled it on the next poll — undoing the park and letting the budget
+    arm re-escalate it (keifu PR #179, 2026-08-03). A parked PR is the
+    operator's until they unpark."""
     return (
         cfg.adopt_unlabeled
         and pr.state == "OPEN"
         and not pr.has(cfg.trigger_label)
         and not pr.has(Label.NO_AI_REVIEW)
         and not pr.has(Label.NEEDS_HUMAN_REVIEW)
+        and not pr.has(Label.AI_PARKED)
         and not pr.is_draft
         and not login_eq(pr.author, cfg.review_bot)
     )

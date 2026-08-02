@@ -728,10 +728,15 @@ def reap_actions(
     WITH the code that adds the label, not before."""
     # Issues with an OPEN PR pointing at them. Deliberately NOT filtered by
     # author: whoever opened it, a second PR for the same issue is the harm.
+    # `closing_refs` is unioned in because `world.prs` now carries only OPEN
+    # PRs wearing ai-pr-open (fresh-label authority, keifu #179) — a parked or
+    # hand-unlabelled PR would otherwise vanish from this set, the reaper
+    # would requeue its issue to ai-ready, and a full RESOLVE would buy the
+    # duplicate PR this guard exists to prevent (adversarial P1-4).
     with_open_pr = {
         n for pr in world.prs if pr.state == "OPEN"
         and (n := _issue_for_pr(pr)) is not None
-    }
+    } | {ref.issue for ref in world.closing_refs}
     # expected_revision comes from the OBSERVED issue, not a live read at
     # command creation (which is a self-fulfilling CAS): a leg completing
     # between this decision and the write performs its own relabel, bumping

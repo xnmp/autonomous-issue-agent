@@ -204,6 +204,52 @@ describe("IssuesTab", () => {
     expect(screen.getByText("the queue is long")).toBeVisible();
   });
 
+  it("badges a parked pending row and offers Unpark in its expansion", async () => {
+    const calls: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        calls.push(String(input));
+        return new Response(JSON.stringify({ ok: true, detail: "ok" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }),
+    );
+    render(
+      <IssuesTab
+        repo="demo"
+        sub="inflight"
+        issues={polled({
+          in_flight: [],
+          pending: [{
+            issue: 34,
+            title: "Parked work",
+            url: null,
+            body: "text",
+            priority: null,
+            labels: ["ai-parked"],
+            held: true,
+            hold_reason: "parked",
+            overlap: null,
+          }],
+          done: [],
+          backlog: [],
+          gh_ok: true,
+          notifications: [],
+          warnings: [],
+        })}
+        onOpenIssue={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("parked")).toBeVisible();
+    await userEvent.click(screen.getByRole("row", { name: /Parked work/ }));
+    await userEvent.click(await screen.findByRole("button", { name: "Unpark" }));
+    expect(calls.some((url) => url.endsWith("/issues/34/unpark"))).toBe(true);
+    vi.unstubAllGlobals();
+  });
+
   it("does not toggle a pending row when a priority button is clicked", async () => {
     vi.stubGlobal(
       "fetch",

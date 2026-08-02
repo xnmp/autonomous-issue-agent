@@ -1498,6 +1498,21 @@ def test_reap_repairs_via_branch_linkage_not_just_closing_ref():
     ]
 
 
+def test_reap_repairs_from_a_closing_ref_when_the_pr_is_parked():
+    # `world.prs` carries only OPEN PRs wearing ai-pr-open (fresh-label
+    # authority), so parking a PR — removing ai-pr-open — drops it from that
+    # set. Without the closing_refs union the reaper requeued to ai-ready and
+    # bought a duplicate RESOLVE plus a second PR (keifu #179 park, 2026-08-03).
+    w = world(
+        issues=[issue(34, "ai-working", updated_at=_REV)],
+        closing_refs=[closing_ref(179, 34)],
+    )
+    assert reap_actions(w) == [
+        Relabel(Target.ISSUE, 34, Label.AI_WORKING, Label.AI_PR_OPEN,
+                expected_revision=_REV)
+    ]
+
+
 def test_reap_still_requeues_when_the_issues_pr_is_closed():
     # Anti-vacuity twin: a CLOSED PR is not work-already-up, so ai-ready remains
     # correct — otherwise this "fix" would strand every issue whose PR a human

@@ -91,6 +91,9 @@ def test_untriaged_excludes_lifecycle_labels():
     assert is_untriaged(issue(1, "ai-ready")) is False
     assert is_untriaged(issue(1, "ai-pr-open")) is False
     assert is_untriaged(issue(1, "needs-design")) is False
+    # keifu #34 (2026-08-03): park removed ai-pr-open and the steward re-triaged
+    # the parked issue on its next tick. Parked means hands-off for every role.
+    assert is_untriaged(issue(1, "ai-parked")) is False
 
 
 def test_ai_triage_label_is_not_a_lifecycle_label():

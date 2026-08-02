@@ -28,7 +28,8 @@ FRECENCY_WINDOWS = ((86400.0, 3.0), (7 * 86400.0, 1.0), (30 * 86400.0, 0.25))
 # The lifecycle labels the harness owns. An open issue carrying none of them has
 # never been offered to the harness — that is the backlog.
 LIFECYCLE_LABELS = frozenset(
-    {"ai-ready", "ai-working", "ai-done", "ai-blocked", "needs-human-review"}
+    {"ai-ready", "ai-working", "ai-done", "ai-blocked", "needs-human-review",
+     "ai-parked"}
 )
 PRIORITY_LABELS = ("P1", "P2", "P3")
 _AGENT_KINDS = frozenset(kind.name for kind in AgentKind)
@@ -1276,7 +1277,8 @@ def _pr_review_state(gh_pr: dict | None) -> str | None:
 
 def pending_card(issue: dict, row: dash.IssueRow | None) -> dict:
     labels = labels_of(issue)
-    defer = _deferred_event(row) if row else {}
+    parked = "ai-parked" in labels
+    defer = {} if parked else (_deferred_event(row) if row else {})
     return {
         "issue": int(issue.get("number") or 0),
         "title": issue.get("title"),
@@ -1284,8 +1286,11 @@ def pending_card(issue: dict, row: dash.IssueRow | None) -> dict:
         "body": issue.get("body"),
         "priority": priority_of(labels),
         "labels": labels,
-        "held": bool(defer),
-        "hold_reason": waiting_label(defer),
+        # Parked outranks any journalled dependency hold: the operator's
+        # decision is the reason this issue is waiting, not the hold that
+        # preceded it.
+        "held": parked or bool(defer),
+        "hold_reason": "parked" if parked else waiting_label(defer),
         "overlap": None,
     }
 

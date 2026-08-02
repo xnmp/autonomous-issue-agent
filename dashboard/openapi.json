@@ -2612,6 +2612,54 @@
         "summary": "Api Cost Chart"
       }
     },
+    "/api/repos/{name}/issues/{number}/park": {
+      "post": {
+        "operationId": "api_park_api_repos__name__issues__number__park_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "number",
+            "required": true,
+            "schema": {
+              "title": "Number",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Api Park"
+      }
+    },
     "/api/repos/{name}/issues/{number}/priority": {
       "post": {
         "operationId": "api_priority_api_repos__name__issues__number__priority_post",
@@ -2823,6 +2871,54 @@
           }
         },
         "summary": "Api Unblock"
+      }
+    },
+    "/api/repos/{name}/issues/{number}/unpark": {
+      "post": {
+        "operationId": "api_unpark_api_repos__name__issues__number__unpark_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "number",
+            "required": true,
+            "schema": {
+              "title": "Number",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Api Unpark"
       }
     },
     "/api/repos/{name}/overview": {
