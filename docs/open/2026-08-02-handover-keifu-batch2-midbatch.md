@@ -8,12 +8,10 @@ reclaims). The web dashboard (127.0.0.1:8321) and all monitors die too.
 
 ## TL;DR for the next session
 
-1. `git status` FIRST. The tree may carry two essentially-complete but
-   NOT-adversarially-reviewed fixes (dashboard run-failed mapping = harness
-   #158; installer shim + drain noise = #156) — a combined `make test` was
-   running at handover time; if it came back green they were committed
-   flagged pending-review, else stashed (`git stash list`). Either way:
-   adversarial-review them before trusting.
+1. RESOLVED before session end: the two subagent fixes (#158 dashboard
+   mapping, #156 installer shims + drain ownership) came back green on the
+   full suite and were committed as `fb7f326`, explicitly FLAGGED PENDING
+   ADVERSARIAL REVIEW — run that review pass before building on them.
 2. Restart: `cd ~/Repos/keifu && issue-agent start` (foreground, session-tied)
    — or better, `issue-agent install-service` to decouple daemons from
    assistant sessions (the handbook's recommendation; tonight proved why).
