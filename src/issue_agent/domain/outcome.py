@@ -41,7 +41,7 @@ unanswered ambiguity. Keeping it `ai-blocked` keeps the human in the loop.
 
 ## Exit-reason taxonomy
 
-There are three policy classes, defined here so retry callers cannot drift:
+There are four policy classes, defined here so retry callers cannot drift:
 
 * **agent strikes** (`AGENT_ERROR`, timeouts, no result) mean the agent returned
   or remained alive long enough to make an attempt; the relevant retry breaker
@@ -49,11 +49,33 @@ There are three policy classes, defined here so retry callers cannot drift:
 * **infra deaths** (`KILLED_EXTERNALLY`, `TRANSPORT_DEATH`) are non-strikes.
   They leave issue legs alone for the reaper and count only against the separate
   infra-death ceiling.
+* **runtime unavailability** (`RUNTIME_UNAVAILABLE`, plus the admission
+  refusals the accounting runtime mints as `AGENT_ERROR` envelope subtypes) is
+  also a non-strike. The leg never started at all, so it is evidence about the
+  deployment, not about the issue. It shares the infra-death ceiling —
+  `infra_class_failure` is the single predicate every quality counter asks.
 * **budget exhaustion** (`BUDGET_EXHAUSTED`, surfaced by Codex as
   `error_max_budget_usd`) is also a non-strike, but it is actionable: the resolve
   path blocks the issue for a cap review and labels it `needs-budget-review`.
   The graceful wind-down handover is therefore preserved for the next deliberately
   resumed leg rather than being discarded in an automatic retry loop.
+
+## Why the fourth class exists (keifu #130, 2026-08-02)
+
+A broken `codex` binary answered every dispatch with an instant HTTP 400: exit
+non-zero, no envelope, no session id, no tokens, $0. `parse_codex_envelope`
+had one bucket for "non-zero exit, no envelope" — `AGENT_ERROR` — so three
+stillborn legs read as three agent attempts. Hours after the binary was fixed
+the FIRST healthy dispatch escalated on `resolve failed 3× without opening a
+PR`, and the same phantom counter fed `EscalationSignals.resolve_retries`,
+which escalated an unrelated issue to high effort and spent $14 on it.
+
+A failure the harness caused measures the harness. It must reach the operator
+as an INFRA escalation, on the infra ceiling, and it must never appear as
+difficulty evidence for a router. The quality counters therefore ask
+`infra_class_failure`, never `infra_death`, and the classification is minted at
+the adapter boundary that can actually observe "no session existed" — never
+inferred later from prose.
 """
 
 from __future__ import annotations
@@ -119,6 +141,11 @@ class ExitReason(str, Enum):
     TRANSPORT_DEATH = "transport_death"    # stream/gateway died before any result
     OPERATOR_CANCELLED = "operator_cancelled"  # orderly daemon/operator teardown
     NO_RESULT = "no_result"                # stream ended cleanly, no ResultMessage
+    # The runtime could not run the leg AT ALL: a broken/missing binary, a spawn
+    # failure, a gateway that refused before any session existed. Distinct from
+    # TRANSPORT_DEATH, which is a session that started and then lost its stream,
+    # and from AGENT_ERROR, which is a session that ran and reported failure.
+    RUNTIME_UNAVAILABLE = "runtime_unavailable"
 
 
 def infra_death(reason: ExitReason | None) -> bool:
@@ -143,6 +170,103 @@ def budget_exhausted(reason: ExitReason | None) -> bool:
     automatic reaper retry used for a transient process or gateway death.
     """
     return reason is ExitReason.BUDGET_EXHAUSTED
+
+
+def runtime_unavailable(reason: ExitReason | None) -> bool:
+    """Whether the runtime never got a session off the ground (keifu #130)."""
+    return reason is ExitReason.RUNTIME_UNAVAILABLE
+
+
+# Envelope subtypes the ADMISSION path mints when a leg is refused before the
+# agent runs. They are reported as `AGENT_ERROR` because they end a dispatch,
+# but nothing about the ISSUE caused them, so they must not march a per-issue
+# quality ceiling. Matched on the envelope subtype the accounting runtime sets,
+# which is HARNESS-OWNED — never on agent-supplied text (CLAUDE.md provenance
+# rule). Lives here, not in a single caller, because every quality counter must
+# read the same list.
+ADMISSION_REFUSAL_SUBTYPES: frozenset[str] = frozenset(
+    {
+        "dispatch_claim_unavailable",
+        "publication_authority_unavailable",
+    }
+)
+
+
+def no_session_evidence(
+    *,
+    session_id: str = "",
+    usage: object = None,
+    cost_usd: float = 0.0,
+    output: str = "",
+    num_turns: int | None = None,
+) -> bool:
+    """True iff NOTHING observable says a model session ever existed.
+
+    Used by the runtime adapters to tell a stillborn dispatch (broken binary,
+    HTTP 400 before the first turn) apart from an agent that ran and failed.
+    Every input is a fact the runtime observed, and ANY of them being present
+    means the leg ran: a session id, a token counter, a priced cost, captured
+    output, or a completed turn.
+
+    Deliberately conservative — it takes only one shred of evidence to be
+    treated as a real attempt. `cost_usd` alone can never carry this decision
+    (a subscription-plan run reports $0.00 on a session that certainly ran),
+    which is exactly why the predicate is a conjunction over every substrate
+    rather than a spend check.
+    """
+    return not (
+        (session_id or "").strip()
+        or usage
+        or cost_usd > 0.0
+        or (output or "").strip()
+        or (num_turns or 0) > 0
+    )
+
+
+def infra_class_failure(result: AgentResult) -> bool:
+    """True iff this failed leg measures the HARNESS, not the issue.
+
+    The single question every QUALITY counter asks before it advances — the
+    resolve breaker, the CI/rebase breakers, and (through the counters they
+    read) the router's difficulty evidence. A leg that never ran, or that died
+    without the agent's participation, says nothing about how hard the issue is
+    or how good the agent's work was; charging it walks a healthy issue to
+    `needs-human-review` at $0 per strike and inflates effort routing on
+    phantom evidence (keifu #130).
+
+    Callers still bump the separate, higher infra-death ceiling, so a
+    PERSISTENT harness fault still reaches a human — under an INFRA reason
+    string, pointed at the runtime rather than at the code the agent never got
+    to touch.
+
+    NOT included, deliberately:
+
+    * `WALL_TIMEOUT`/`IDLE_TIMEOUT` — the leg ran and spent its budget. A
+      reliably-hanging task is a difficulty signal and must keep marching its
+      breaker, or it loops forever at full session cost.
+    * `NO_RESULT` — the stream ended cleanly, so a session existed.
+    * `BUDGET_EXHAUSTED` — a non-strike too, but it has its own operator
+      surface (`budget_exhausted`); callers branch on it first.
+    * `None` — an unclassified/legacy result keeps exactly today's behavior.
+    """
+    return (
+        infra_death(result.exit_reason)
+        or runtime_unavailable(result.exit_reason)
+        or result.envelope_subtype in ADMISSION_REFUSAL_SUBTYPES
+    )
+
+
+def infra_class_reason(result: AgentResult) -> str:
+    """Machine-readable why, for the journal event that records the exemption.
+
+    Blank when the leg is not infra-class, so a caller can use it as the
+    predicate and the payload at once.
+    """
+    if result.envelope_subtype in ADMISSION_REFUSAL_SUBTYPES:
+        return result.envelope_subtype
+    if infra_death(result.exit_reason) or runtime_unavailable(result.exit_reason):
+        return result.exit_reason.value if result.exit_reason else ""
+    return ""
 
 
 # ── deterministic transport deaths (#13) ──────────────────────────────────────
@@ -602,10 +726,14 @@ def address_review_actions(pr: int, result: AgentResult) -> AddressReviewOutcome
     label that was never there — a busy-marker protocol with only a receiving
     half. Single-fixer is enforced by process topology (see `decide_fix`), so
     the ok/error paths now emit nothing at all."""
-    if infra_death(result.exit_reason):
-        # An external kill is not an attempt: leave the breaker where it was, or
-        # a machine under memory pressure walks a healthy PR to
-        # needs-human-review without the fixer ever having read the review.
+    if infra_class_failure(result):
+        # Not an attempt: leave the breaker where it was, or a machine under
+        # memory pressure — or a runtime that cannot start at all (keifu #130)
+        # — walks a healthy PR to needs-human-review without the fixer ever
+        # having read the review. This is the ONE `infra_class_failure` call in
+        # this module: the other guards choose LABEL MOVES, where a stillborn
+        # leg keeps the ordinary requeue so the next poll retries it, and only
+        # a true death is left to the reaper.
         return AddressReviewOutcome([], bump_retry=False)
     if budget_exhausted(result.exit_reason):
         # Not an attempt either — and frequently deterministic (admission

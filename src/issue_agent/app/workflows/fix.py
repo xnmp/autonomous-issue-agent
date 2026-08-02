@@ -17,6 +17,7 @@ from ...domain import fix as fix_domain
 from ...domain.events import (
     BudgetPathEntered,
     Correlation,
+    InfraPathEntered,
     RoutingEscalated,
     TelemetryEvent,
     TelemetryWarning,
@@ -172,7 +173,10 @@ class FixWorkflow:
         here, so the loop this ceiling was tuned for still escalates.
 
         Called instead of, never as well as, the bump sites below — a leg is
-        either an infra death or it is not.
+        either an infra-class failure or it is not. It asks
+        `infra_class_failure`, not `infra_death`: a stillborn leg bumps the
+        infra counter, so clearing it here too would pin the ceiling at 1 and a
+        permanently broken runtime would never escalate (keifu #130).
 
         `alt_key` exists because the READ side unions two key spaces (review
         P1R-1): the dispatcher records a raise-path death under `-pr` whenever
@@ -186,7 +190,7 @@ class FixWorkflow:
         walks a healthy PR toward needs-human-review. Decay must clear exactly
         the set the read unions.
         """
-        if outcome.infra_death(result.exit_reason):
+        if outcome.infra_class_failure(result):
             return
         self.store.clear_infra_deaths(key)
         if alt_key is not None and alt_key != key:
@@ -607,7 +611,7 @@ class FixWorkflow:
                 pr = self.gateway.pr_for_issue(issue)
                 self._journal_budget_path(issue, "author", author.exit_reason, pr)
                 if fu_author is outcome.AuthorFollowup.RETRY:
-                    self._bump_resolve_retry(issue, author)
+                    self._bump_resolve_retry(issue, author, "author")
                 self.executor.execute_all(
                     self._resolve_actions(issue, author, pr)
                     if pr is not None else outcome.author_actions(issue, author)
@@ -657,7 +661,7 @@ class FixWorkflow:
             if fu is not outcome.ImplementFollowup.CONTRACT_CHANGE:
                 self._journal_budget_path(issue, "implement", impl.exit_reason, pr)
                 if fu is outcome.ImplementFollowup.RETRY:
-                    self._bump_resolve_retry(issue, impl)
+                    self._bump_resolve_retry(issue, impl, "implement")
                 self.executor.execute_all(self._resolve_actions(issue, impl, pr))
                 return
 
@@ -699,24 +703,69 @@ class FixWorkflow:
                 else (adj.field("rationale") or adj.summary or "the contract is correct")
             )
 
-    def _bump_resolve_retry(self, issue: int, result) -> None:
+    def _bump_resolve_retry(self, issue: int, result, leg: str = "resolve") -> None:
         """A resolve-family leg that ends in a REQUEUE (error, or a claimed
         'done' with no PR on GitHub) counts toward the resolve breaker. The T3
         convergence probe proved this leg loops UNBOUNDED without one — a full
-        paid session per poll on the most expensive leg (#39's shape). Infra
-        deaths don't count (no attempt was made); blocked / PR-opened outcomes
-        don't requeue, so they never reach here."""
+        paid session per poll on the most expensive leg (#39's shape).
+
+        Only a leg that actually RAN and failed to open a PR counts. An
+        infra-class failure — killed session, transport death, admission
+        refusal, or a runtime that could not start the leg at all — measures
+        the harness, so it takes the separate infra ceiling instead. Blocked /
+        PR-opened outcomes don't requeue, so they never reach here.
+
+        keifu #130 (2026-08-02): a broken codex binary killed three resolve
+        legs at $0 with no session. They landed on THIS counter, and the first
+        healthy dispatch hours later escalated `resolve failed 3× without
+        opening a PR`. The phantom count also reached the router as difficulty
+        evidence. The classification, not the ceiling, was the bug.
+        """
         if outcome.budget_exhausted(result.exit_reason):
             return
-        if outcome.infra_death(result.exit_reason):
+        if outcome.infra_class_failure(result):
             # …but it IS counted against the separate, higher infra ceiling
-            # (review C3/D2c): dying before a result is its own paid loop, and
-            # nothing else bounds it. This is the RETURNED-result twin of
+            # (review C3/D2c): failing to run is its own paid loop, and nothing
+            # else bounds it. This is the RETURNED-result twin of
             # AgentDispatcher.dispatch's bump-on-raise; a leg either raises or
             # returns, so a single death is counted exactly once.
-            self.store.bump_infra_deaths(issue)
+            self._charge_infra_death(issue, leg, result)
             return
         self.store.set_resolve_retries(issue, self.store.get_resolve_retries(issue) + 1)
+
+    def _charge_infra_death(self, issue: int, leg: str, result) -> None:
+        """Bill an infra-class failure to the infra ceiling, and journal it.
+
+        The single entry point for every infra-class exemption in this
+        workflow, so the ceiling and the ADR 0012 journal event can never come
+        apart: an exemption whose event is missing leaves the operator seeing a
+        leg fail and a breaker stand still with nothing connecting the two.
+
+        The bump is guarded for the same reason `AgentDispatcher.dispatch`
+        guards its own (a counter we could not persist must not replace the
+        death we are trying to report) — and here it matters more, because an
+        exception escaping this workflow is re-caught by the dispatcher and
+        reported as a SECOND infra death for the same leg.
+        """
+        try:
+            deaths = self.store.bump_infra_deaths(issue)
+        except Exception as exc:  # noqa: BLE001 — see docstring
+            self.cfg.log(f"agent #{issue}: infra death not persisted ({exc})")
+            return
+        journal = self.cfg.journal
+        if journal is None:
+            return
+        try:
+            journal.emit(
+                TelemetryEvent(
+                    InfraPathEntered(
+                        leg, outcome.infra_class_reason(result), deaths
+                    ),
+                    Correlation(issue=issue),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — telemetry never fails a leg
+            self.cfg.log(f"agent #{issue}: infra path not journalled ({exc})")
 
     def _journal_budget_path(self, issue: int, leg: str, reason, pr: int | None) -> None:
         """Record the operator-cap path separately from capability escalation."""
@@ -786,8 +835,10 @@ class FixWorkflow:
         result = await self._run_logged("resume", issue, task, kind="RESUME")
         self.store.save_session(issue, result.session_id)
         pr = self.gateway.pr_for_issue(issue)
-        if outcome.infra_death(result.exit_reason):
-            # review C3/D2c, RETURNED-result half.
+        if outcome.infra_class_failure(result):
+            # review C3/D2c, RETURNED-result half. Reads `infra_class_failure`
+            # so a runtime that could not start the leg counts here, not as a
+            # quality signal (keifu #130).
             #
             # R1-F10: this used to claim resume_actions "does NOTHING… so the
             # reply must not be consumed by a session that never ran… the
@@ -810,7 +861,7 @@ class FixWorkflow:
             # over, with no retry counter of its own to catch it. A leg either
             # raises (AgentDispatcher.dispatch bumps) or returns (here), never
             # both, so a death is counted exactly once.
-            self.store.bump_infra_deaths(issue)
+            self._charge_infra_death(issue, "resume", result)
         else:
             # No alt_key: RESUME is issue-keyed at the dispatcher
             # (`_issue_number` returns action.number without a lookup), so its
@@ -893,8 +944,8 @@ class FixWorkflow:
             "pr-resume", issue, task, kind="PR_RESUME"
         )
         self.store.save_session(issue, result.session_id)
-        if outcome.infra_death(result.exit_reason):
-            self.store.bump_infra_deaths(issue)
+        if outcome.infra_class_failure(result):
+            self._charge_infra_death(issue, "pr-resume", result)
         else:
             self._decay_infra_deaths(issue, result, alt_key=-pr)
         self.executor.execute_all(outcome.pr_resume_actions(pr, result))
@@ -934,7 +985,7 @@ class FixWorkflow:
         self.store.save_session(issue, result.session_id)
         out = outcome.address_review_actions(pr, result)
         self.executor.execute_all(out.actions)
-        if outcome.infra_death(result.exit_reason):
+        if outcome.infra_class_failure(result):
             # review C3/D2c, RETURNED-result half. address_review_actions
             # exempts an external kill from the review-retry ceiling (no attempt
             # was made) and leaves the PR untouched, so the next poll sees the same
@@ -942,7 +993,7 @@ class FixWorkflow:
             # until this counter bounds it. Same key the review-retry counter
             # uses, so the decide side reads one key per issue. A leg either
             # raises or returns, so a death is counted exactly once.
-            self.store.bump_infra_deaths(issue)
+            self._charge_infra_death(issue, "address-review", result)
         else:
             self._decay_infra_deaths(issue, result, alt_key=-pr)
         if out.bump_retry:
@@ -1001,13 +1052,16 @@ class FixWorkflow:
         # surface instead.
         if outcome.budget_exhausted(result.exit_reason):
             pass
-        elif not outcome.infra_death(result.exit_reason):
+        elif not outcome.infra_class_failure(result):
             self.store.set_ci_retries(issue, self.store.get_ci_retries(issue) + 1)
             self._decay_infra_deaths(issue, result, alt_key=-pr)
         else:
             # Separate, higher ceiling for the deaths themselves (review C3/D2c)
             # — same key the CI counter uses, so the decide side reads one key.
-            self.store.bump_infra_deaths(issue)
+            # `ci_retries` is ALSO router difficulty evidence
+            # (EscalationSignals), so a harness fault charged here would inflate
+            # effort and model tier as well as the breaker (keifu #130).
+            self._charge_infra_death(issue, "fix-ci", result)
         self.executor.execute_all(outcome.fix_ci_actions(pr, result))
 
     async def rebase(
@@ -1030,11 +1084,11 @@ class FixWorkflow:
         # admission/leg is a failed rebase attempt (#155).
         if outcome.budget_exhausted(result.exit_reason):
             pass
-        elif not outcome.infra_death(result.exit_reason):
+        elif not outcome.infra_class_failure(result):
             self.store.set_rebase_retries(issue, self.store.get_rebase_retries(issue) + 1)
             self._decay_infra_deaths(issue, result, alt_key=-pr)
-        else:
-            self.store.bump_infra_deaths(issue)  # review C3/D2c, as in fix_ci
+        else:  # review C3/D2c, as in fix_ci
+            self._charge_infra_death(issue, "rebase", result)
         self.executor.execute_all(outcome.fix_ci_actions(pr, result))
 
     @staticmethod

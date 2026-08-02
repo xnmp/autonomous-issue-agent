@@ -2454,3 +2454,167 @@ def test_the_per_run_scratch_dir_is_removed(tmp_path):
     run_dir = os.path.dirname(out_path)
     assert os.path.basename(run_dir).startswith("codex-run-")
     assert not os.path.exists(run_dir), f"scratch dir leaked: {run_dir}"
+
+
+# ── the runtime could not start (keifu #130) ─────────────────────────────────
+# 2026-08-02: a broken codex binary answered every dispatch with an instant HTTP
+# 400 — exit non-zero, no envelope, no session id, no tokens, $0. This layer is
+# the only one that can see the difference between "the agent ran and failed"
+# and "the agent never ran": by the time the domain holds an AgentResult both
+# are is_error=True. Getting it wrong cost issue #130 a false `resolve failed
+# 3x` escalation on the first healthy dispatch hours later.
+def test_a_runtime_fault_with_no_trace_of_a_session_is_runtime_unavailable():
+    r = parse_codex_envelope(
+        exit_code=1,
+        last_message="",
+        stderr="stream error: unexpected status 400 Bad Request",
+    )
+    assert r.is_error is True
+    assert r.exit_reason is ExitReason.RUNTIME_UNAVAILABLE
+    assert "400 Bad Request" in r.summary
+
+
+def test_a_silent_exec_failure_is_runtime_unavailable():
+    """`supervised_exec` fails a bad exec with a silent `os._exit(127)` — no
+    stderr at all — so the missing/wrong-architecture binary case is carried by
+    the exit code, not by a string. A non-zero exit with nothing on any stream
+    and no session is not something a model can produce."""
+    r = parse_codex_envelope(exit_code=127, last_message="", stderr="")
+    assert r.exit_reason is ExitReason.RUNTIME_UNAVAILABLE
+
+
+def test_exit_127_that_printed_something_is_an_agent_error():
+    """127 is also what a shell returns for a command the AGENT mistyped. Once
+    codex has printed anything, the silence that made 127 unambiguous is gone."""
+    r = parse_codex_envelope(
+        exit_code=127, last_message="", stderr="bash: cargo: command not found",
+    )
+    assert r.exit_reason is ExitReason.AGENT_ERROR
+
+
+def test_an_ordinary_nonzero_exit_with_no_output_is_still_an_agent_error():
+    """Only 127 is the exec-failure code. A silent `exit 1` is codex reporting
+    failure, and must keep marching its breaker."""
+    r = parse_codex_envelope(exit_code=1, last_message="", stderr="")
+    assert r.exit_reason is ExitReason.AGENT_ERROR
+
+
+def test_an_unrecognised_failure_stays_an_agent_error():
+    """The classification is POSITIVE. Absence of evidence is not evidence that
+    the leg never ran — an ordinary codex failure often leaves only a trace, and
+    exempting those would disarm every breaker."""
+    r = parse_codex_envelope(exit_code=1, last_message="", stderr="boom")
+    assert r.exit_reason is ExitReason.AGENT_ERROR
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        {"session_id": "sess-1"},
+        {"usage": {"input_tokens": 4096, "output_tokens": 12}},
+    ],
+)
+def test_a_session_that_existed_is_an_agent_error_whatever_stderr_says(evidence):
+    """The guard half. A leg that produced a session id or tokens made an
+    attempt; a runtime-fault string scrolling past in its trace must not buy it
+    out of the breaker. (Tokens matter on their own: codex prices a
+    subscription run at $0, so a spend check alone would misread it.)"""
+    r = parse_codex_envelope(
+        exit_code=1,
+        last_message="",
+        stderr="stream error: unexpected status 400 Bad Request",
+        **evidence,
+    )
+    assert r.exit_reason is ExitReason.AGENT_ERROR
+
+
+def test_captured_agent_output_beats_a_runtime_fault_signature():
+    r = parse_codex_envelope(
+        exit_code=3,
+        last_message="I rewrote the test helper",
+        stderr="unexpected status 400 Bad Request",
+    )
+    assert r.exit_reason is ExitReason.AGENT_ERROR
+
+
+def test_a_runtime_fault_signature_deep_in_the_agent_trace_is_ignored():
+    """M17 discipline: only the stderr TAIL may decide. The agent's own output
+    scrolls past, and a test fixture or a diff quoting a 400 must never be able
+    to exempt a real failure from its breaker."""
+    trace = "\n".join(
+        ['apply_patch: +    assert body == "unexpected status 400 Bad Request"']
+        + [f"codex| trace line {i}" for i in range(40)]
+        + ["Error: 2 tests failed"]
+    )
+    r = parse_codex_envelope(exit_code=1, last_message="", stderr=trace)
+    assert r.exit_reason is ExitReason.AGENT_ERROR
+
+
+def test_agent_authored_exec_errors_can_never_reach_the_signature_list():
+    """The signature list holds exactly one entry BECAUSE of this. `exec format
+    error` / `no such file or directory` / `command not found` are unreachable
+    from the runtime on the paid path, so listing them would have added no
+    coverage and one laundering channel: text the agent's own tools wrote,
+    buying a real failure out of its breaker."""
+    for agent_text in (
+        "bash: cargo: command not found",
+        "ls: /nope: No such file or directory",
+        "./tool: cannot execute binary file: Exec format error",
+    ):
+        r = parse_codex_envelope(exit_code=1, last_message="", stderr=agent_text)
+        assert r.exit_reason is ExitReason.AGENT_ERROR, agent_text
+
+
+def test_a_parsed_envelope_is_never_a_runtime_fault():
+    r = parse_codex_envelope(
+        exit_code=1,
+        last_message=json.dumps({"status": "error", "summary": "boom"}),
+        stderr="unexpected status 400 Bad Request",
+    )
+    assert r.exit_reason is ExitReason.AGENT_ERROR
+
+
+def test_a_clean_exit_is_never_reclassified():
+    """The branch may only ever narrow a FAILURE."""
+    r = parse_codex_envelope(
+        exit_code=0, last_message="", stderr="unexpected status 400 Bad Request",
+    )
+    assert r.is_error is False
+    assert r.exit_reason is ExitReason.OK
+
+
+# ── the #130 seam, through run() ─────────────────────────────────────────────
+def test_run_classifies_the_130_shape_as_runtime_unavailable():
+    """The load-bearing assumption end to end: a codex build that 400s before
+    any work leaves NO rollout behind, so `discover_rollout_session` finds no
+    session id and the guard opens. Asserted through `run()` rather than
+    `parse_codex_envelope` so a change to rollout discovery — which would make
+    `session_id` non-empty and silently no-op the whole fix — fails here."""
+    tmp = tempfile.mkdtemp()
+    codex = _fake_codex(
+        tmp,
+        'echo "stream error: unexpected status 400 Bad Request" >&2\nexit 1\n',
+    )
+    runner = CodexRunner(
+        codex_bin=codex, env={"OPENAI_API_KEY": "k", "CODEX_HOME": tmp},
+    )
+
+    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
+
+    assert r.is_error is True
+    assert r.session_id == "", "no rollout means no session id"
+    assert r.cost_usd == 0.0
+    assert r.exit_reason is ExitReason.RUNTIME_UNAVAILABLE
+
+
+def test_run_keeps_a_real_agent_failure_a_strike_even_with_no_rollout():
+    """Anti-vacuity twin through the same seam."""
+    tmp = tempfile.mkdtemp()
+    codex = _fake_codex(tmp, 'echo "Error: 2 tests failed" >&2\nexit 1\n')
+    runner = CodexRunner(
+        codex_bin=codex, env={"OPENAI_API_KEY": "k", "CODEX_HOME": tmp},
+    )
+
+    r = asyncio.run(runner.run(RuntimePlan(prompt="x")))
+
+    assert r.exit_reason is ExitReason.AGENT_ERROR

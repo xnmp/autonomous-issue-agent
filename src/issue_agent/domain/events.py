@@ -431,6 +431,24 @@ class BudgetPathEntered(EventPayload):
     exit_reason: str
 
 
+@event_type("infra.path.entered.v1")
+@dataclass(frozen=True)
+class InfraPathEntered(EventPayload):
+    """A failed leg was classed INFRA: it was billed to the infra ceiling
+    rather than to the issue (a quality counter it would otherwise have
+    advanced, or a decay it would otherwise have earned).
+
+    ADR 0012: the exemption is a skip, and a skip needs a journal event and a
+    ceiling. The ceiling is the infra-death counter this same leg bumps;
+    `infra_deaths` carries where it now stands so "why didn't the breaker
+    move?" is answerable from the event log alone (keifu #130).
+    """
+
+    leg: str
+    exit_reason: str
+    infra_deaths: int = 0
+
+
 @event_type("issue.groomed.v1")
 @dataclass(frozen=True)
 class IssueGroomed(EventPayload):

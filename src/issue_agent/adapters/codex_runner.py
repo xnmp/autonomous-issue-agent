@@ -43,6 +43,7 @@ from ..domain.outcome import (
     Outcome,
     classify_outcome,
     declared_status,
+    no_session_evidence,
 )
 
 
@@ -1003,6 +1004,81 @@ def codex_budget_not_enforced_warning(
     )
 
 
+# ── the runtime could not start (keifu #130) ─────────────────────────────────
+# 2026-08-02: a broken `codex` binary answered three resolve dispatches on issue
+# #130 with an instant HTTP 400 — non-zero exit, no envelope, no session id, no
+# tokens, $0. They were classed AGENT_ERROR, marched the resolve breaker, and
+# the first HEALTHY dispatch hours later escalated `resolve failed 3×` to a
+# human. The same phantom count is router difficulty evidence.
+#
+# Classified POSITIVELY, from a signature, and never from the mere absence of
+# evidence: an ordinary codex failure often leaves nothing behind but a stderr
+# trace, and treating "we saw nothing" as "it never ran" would exempt every
+# genuine agent error from every breaker — an unbounded paid loop, the exact
+# failure the breakers exist to stop.
+#
+# Keep this list SHORT and specific, like DETERMINISTIC_DEATH_SIGNATURES: a
+# false positive here buys an unwinnable dispatch until the infra ceiling stops
+# it. Everything unrecognised stays AGENT_ERROR — today's behaviour.
+#
+# ONE entry, on purpose. The obvious additions — "exec format error", "no such
+# file or directory", "command not found" — are all UNREACHABLE from the
+# runtime on the paid path: `supervised_exec` fails a bad exec with a silent
+# `os._exit(127)` and the unsupervised path raises `FileNotFoundError` before
+# this function is ever called. Nothing but codex's stream of the AGENT's tool
+# output can produce those strings (`bash: cargo: command not found`, a
+# failing test's traceback), so listing them would add no coverage and a
+# laundering channel: agent-authored text buying a real failure out of its
+# breaker. The missing-binary case is covered by exit code instead, below.
+_RUNTIME_FAULT_SIGNATURES: tuple[str, ...] = (
+    "unexpected status 400 bad request",  # the #130 shape: broken client build
+)
+
+# `supervised_exec`'s child exits 127 without writing anything when it cannot
+# exec the binary at all. A non-zero exit with NO output on any stream and no
+# session is not something a model can produce.
+_EXEC_FAILURE_EXIT_CODE = 127
+
+
+def _runtime_could_not_start(
+    *,
+    exit_code: int,
+    session_id: str,
+    usage: dict | None,
+    cost: float,
+    raw: str,
+    stderr: str,
+) -> bool:
+    """Whether this non-zero exit is the RUNTIME failing rather than the agent.
+
+    Guarded first by `no_session_evidence`: a run that produced a session id,
+    tokens, spend or output made an attempt, whatever it then printed. Past
+    that guard, either of two POSITIVE observations classifies it:
+
+    1. a silent exec failure — exit 127 with nothing on stderr either;
+    2. a known runtime-fault signature in the stderr TAIL.
+
+    The tail window is the M17 discipline: codex streams the agent's entire
+    tool output to stderr, so matching the whole buffer would let the agent's
+    own text decide retry policy. A fatal startup error is the last thing codex
+    prints before exiting.
+
+    Absence of evidence is never sufficient on its own. An ordinary codex
+    failure often leaves nothing behind but a stderr trace, and treating "we
+    saw nothing" as "it never ran" would exempt every genuine agent error from
+    every breaker — an unbounded paid loop, the exact failure the breakers
+    exist to stop.
+    """
+    if not no_session_evidence(
+        session_id=session_id, usage=usage, cost_usd=cost, output=raw
+    ):
+        return False
+    if exit_code == _EXEC_FAILURE_EXIT_CODE and not (stderr or "").strip():
+        return True
+    low = _stderr_tail(stderr).lower()
+    return any(sig in low for sig in _RUNTIME_FAULT_SIGNATURES)
+
+
 def parse_codex_envelope(
     *,
     exit_code: int,
@@ -1062,6 +1138,13 @@ def parse_codex_envelope(
         # No envelope. If codex also exited non-zero, it's a genuine failure;
         # otherwise surface the free text as the summary (best-effort).
         if exit_code != 0:
+            # …unless the RUNTIME could not run the leg at all, in which case
+            # the failure measures the harness, not the issue (keifu #130). See
+            # `_runtime_could_not_start` for the two-part rule.
+            stillborn = _runtime_could_not_start(
+                exit_code=exit_code, session_id=session_id, usage=usage,
+                cost=cost, raw=raw, stderr=stderr,
+            )
             return AgentResult(
                 is_error=True,
                 summary=(stderr.strip() or raw or f"codex exec exit {exit_code}")[:2000],
@@ -1069,7 +1152,11 @@ def parse_codex_envelope(
                 cost_usd=cost,
                 usage=usage,
                 telemetry_warning=stderr_warning,
-                exit_reason=ExitReason.AGENT_ERROR,
+                exit_reason=(
+                    ExitReason.RUNTIME_UNAVAILABLE
+                    if stillborn
+                    else ExitReason.AGENT_ERROR
+                ),
             )
         return AgentResult(
             is_error=False, summary=raw[:2000], session_id=session_id,

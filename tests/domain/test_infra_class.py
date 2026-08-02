@@ -1,0 +1,169 @@
+"""`infra_class_failure` — which failures measure the harness (keifu #130).
+
+The predicate every QUALITY counter asks. Its boundaries are load-bearing in
+both directions: too narrow and a broken runtime escalates healthy issues at $0
+a strike; too wide and a genuinely failing agent loops forever at full session
+cost.
+"""
+
+import pytest
+
+from issue_agent.domain.outcome import (
+    ADMISSION_REFUSAL_SUBTYPES,
+    AgentResult,
+    ExitReason,
+    address_review_actions,
+    infra_class_failure,
+    infra_class_reason,
+    no_session_evidence,
+)
+from issue_agent.domain.steward_stall import stall_charge
+
+
+def result(**kwargs) -> AgentResult:
+    return AgentResult(is_error=True, **kwargs)
+
+
+# ── the harness's own failures ───────────────────────────────────────────────
+@pytest.mark.parametrize(
+    "reason",
+    [
+        ExitReason.RUNTIME_UNAVAILABLE,
+        ExitReason.TRANSPORT_DEATH,
+        ExitReason.KILLED_EXTERNALLY,
+    ],
+)
+def test_harness_side_endings_are_infra_class(reason):
+    assert infra_class_failure(result(exit_reason=reason))
+
+
+@pytest.mark.parametrize("subtype", sorted(ADMISSION_REFUSAL_SUBTYPES))
+def test_admission_refusals_are_infra_class_despite_reporting_agent_error(subtype):
+    """The accounting runtime ends the dispatch, so it reports AGENT_ERROR.
+    Nothing about the ISSUE caused it, and the condition is usually
+    deployment-wide — charging it sidelines the whole backlog."""
+    assert infra_class_failure(
+        result(envelope_subtype=subtype, exit_reason=ExitReason.AGENT_ERROR)
+    )
+
+
+# ── the agent's own failures ─────────────────────────────────────────────────
+@pytest.mark.parametrize(
+    "reason",
+    [
+        ExitReason.AGENT_ERROR,
+        ExitReason.WALL_TIMEOUT,
+        ExitReason.IDLE_TIMEOUT,
+        ExitReason.NO_RESULT,
+        ExitReason.BUDGET_EXHAUSTED,
+        None,
+    ],
+)
+def test_a_session_that_existed_is_never_infra_class(reason):
+    """`WALL_TIMEOUT` in particular: the leg ran and used its whole budget, so
+    it stays a difficulty signal. `None` (a legacy result) keeps exactly the
+    behaviour it had before the taxonomy existed."""
+    assert not infra_class_failure(result(exit_reason=reason))
+
+
+def test_an_unknown_envelope_subtype_is_not_laundered_into_an_exemption():
+    """The subtype list is HARNESS-MINTED. A runtime — or an agent — that
+    reports an arbitrary subtype must not be able to buy itself out of a
+    breaker by naming one."""
+    assert not infra_class_failure(
+        result(envelope_subtype="dispatch_claim_unavailable_lol",
+               exit_reason=ExitReason.AGENT_ERROR)
+    )
+    assert not infra_class_failure(
+        result(envelope_subtype="", exit_reason=ExitReason.AGENT_ERROR)
+    )
+
+
+# ── the reason string ────────────────────────────────────────────────────────
+def test_infra_class_reason_names_the_cause_and_is_blank_otherwise():
+    assert infra_class_reason(
+        result(exit_reason=ExitReason.RUNTIME_UNAVAILABLE)
+    ) == "runtime_unavailable"
+    assert infra_class_reason(
+        result(envelope_subtype="dispatch_claim_unavailable",
+               exit_reason=ExitReason.AGENT_ERROR)
+    ) == "dispatch_claim_unavailable"
+    assert infra_class_reason(result(exit_reason=ExitReason.AGENT_ERROR)) == ""
+
+
+# ── the evidence predicate ───────────────────────────────────────────────────
+def test_a_dispatch_with_no_evidence_at_all_never_ran():
+    assert no_session_evidence()
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        {"session_id": "sess-1"},
+        {"usage": {"input_tokens": 12}},
+        {"cost_usd": 0.01},
+        {"output": "I looked at the tests"},
+        {"num_turns": 1},
+    ],
+)
+def test_any_single_shred_of_evidence_means_the_leg_ran(evidence):
+    assert not no_session_evidence(**evidence)
+
+
+@pytest.mark.parametrize(
+    "blank", [{"session_id": "   "}, {"output": "\n \t"}, {"usage": {}},
+              {"num_turns": 0}, {"cost_usd": 0.0}],
+)
+def test_blank_and_zero_substrates_are_not_evidence(blank):
+    assert no_session_evidence(**blank)
+
+
+def test_a_subscription_run_reporting_zero_dollars_still_counts_as_run():
+    """`cost_usd` alone can never carry this decision: a subscription-plan
+    session reports $0.00 on a run that certainly happened."""
+    assert not no_session_evidence(
+        session_id="sess-1", cost_usd=0.0, usage={"input_tokens": 900_000}
+    )
+
+
+def test_a_huge_negative_or_absent_num_turns_is_handled():
+    assert no_session_evidence(num_turns=None)
+    assert no_session_evidence(num_turns=-3)
+    assert not no_session_evidence(num_turns=10**9)
+
+
+# ── the counters that read it ────────────────────────────────────────────────
+def test_address_review_does_not_charge_a_round_it_never_bought():
+    """The review-round ceiling is a quality counter too: a runtime that
+    cannot start must not walk a healthy PR to needs-human-review."""
+    out = address_review_actions(7, result(exit_reason=ExitReason.RUNTIME_UNAVAILABLE))
+    assert out.bump_retry is False
+    assert out.actions == []
+
+
+def test_address_review_still_charges_a_round_that_ran():
+    out = address_review_actions(
+        7, result(session_id="s", exit_reason=ExitReason.AGENT_ERROR)
+    )
+    assert out.bump_retry is True
+
+
+def test_steward_stall_keeps_its_own_exemption_list_unchanged():
+    """Moving `ADMISSION_REFUSAL_SUBTYPES` into `domain.outcome` is a pure
+    refactor: the steward's charges are exactly what they were."""
+    assert stall_charge(ExitReason.TRANSPORT_DEATH) == 0
+    assert stall_charge(ExitReason.KILLED_EXTERNALLY) == 0
+    assert stall_charge(ExitReason.AGENT_ERROR, "dispatch_claim_unavailable") == 0
+    assert stall_charge(ExitReason.AGENT_ERROR) == 1
+    assert stall_charge(ExitReason.BUDGET_EXHAUSTED) == 1
+
+
+def test_the_steward_still_charges_a_runtime_that_could_not_start():
+    """Deliberately NOT exempt here, unlike every fix-role counter. A zero
+    charge returns without recording the issue's baseline, so the issue stays
+    selected and the identical paid leg is bought every sweep — and the
+    steward's ceiling only counts legs that RAISED, so nothing would stop it.
+    Bounded-and-mislabelled beats unbounded-and-silent; the pre-existing
+    `infra_death` exemption has the same hole and wants the steward's own fix.
+    """
+    assert stall_charge(ExitReason.RUNTIME_UNAVAILABLE) == 1
