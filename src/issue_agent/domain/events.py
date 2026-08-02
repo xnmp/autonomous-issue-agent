@@ -259,6 +259,31 @@ class ReservationRetained(EventPayload):
     reason: str
 
 
+@event_type("accounting.admission.reconciled.v1")
+@dataclass(frozen=True)
+class AdmissionReconciled(EventPayload):
+    """One reconcile-then-retry attempt taken before a budget escalation.
+
+    keifu #34 (2026-08-02): three legs died on a broken provider binary with
+    $0 measured spend. Their conservatively retained reservations consumed the
+    issue's headroom, so the next dispatch was denied and escalated to a human
+    even though real spend was zero. Admission now runs the existing
+    reservation recovery once before escalating. ADR 0012: exactly one such
+    attempt per dispatch, journaled here.
+
+    ``admitted`` false with ``released_runs`` zero is the ordinary shape of a
+    genuine cap exhaustion, not a defect: it records that reconciliation was
+    tried and found nothing releasable. ``scope`` names the limit that actually
+    tripped, which is the cap an operator would have to move.
+    """
+
+    run_id: str
+    scope: str
+    released_runs: int
+    admitted: bool
+    reason: str
+
+
 @event_type("telemetry.warning.v1")
 @dataclass(frozen=True)
 class TelemetryWarning(EventPayload):

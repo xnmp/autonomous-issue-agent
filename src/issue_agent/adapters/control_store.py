@@ -41,6 +41,7 @@ from ..domain.contracts import (
 from ..domain.events import (
     ActionApplied,
     ActionFailed,
+    AdmissionReconciled,
     BudgetVarianceDetected,
     ControlTransitionCommitted,
     Correlation,
@@ -269,6 +270,9 @@ class ReservationResult:
     requested: Money
     cap: Money
     detail: str = ""
+    # The limit that actually tripped, which is not always the primary scope
+    # when a leg carries repository, global, and issue caps at once.
+    tripped_dimension: str = ""
 
     @property
     def admitted(self) -> bool:
@@ -2075,6 +2079,33 @@ class SQLiteControlStore:
             )
             return True
 
+    def record_admission_reconciled(
+        self,
+        run_id: RunId,
+        scope: str,
+        released_runs: int,
+        admitted: bool,
+        reason: str,
+    ) -> None:
+        """Journal the single reconcile-then-retry admission took (ADR 0012)."""
+
+        if not reason or not scope:
+            raise ValueError("admission reconcile scope and reason are required")
+        if released_runs < 0:
+            raise ValueError("released run count cannot be negative")
+        with self.transaction() as db:
+            self._event(
+                db,
+                AdmissionReconciled(
+                    str(run_id),
+                    scope,
+                    released_runs,
+                    admitted,
+                    reason,
+                ),
+                correlation=Correlation(run_id=str(run_id)),
+            )
+
     def record_owned_cancellation_intents(
         self,
         owner_id: str,
@@ -2910,6 +2941,7 @@ class SQLiteControlStore:
                             limit.cap,
                             "settled + active reservations + requested maximum "
                             f"exceeds {limit.scope.dimension} cap",
+                            limit.scope.dimension,
                         )
                 now = _stamp(self._now())
                 db.execute(

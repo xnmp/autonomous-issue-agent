@@ -24,6 +24,10 @@ from issue_agent.adapters.typed_journal import TypedJournal
 from issue_agent.adapters.worktree import Worktrees
 from issue_agent.app.execute import Executor
 from issue_agent.app.recovery import NoWorktreeRecovery
+from issue_agent.app.roles import (
+    _LateReservationReconciler,
+    _SweepReservationReconciler,
+)
 from issue_agent.domain.ports import (
     ActionExecutor,
     CiPendingState,
@@ -49,6 +53,7 @@ from issue_agent.domain.ports import (
     ReviewPromptReads,
     RunAbandonmentSink,
     SpendReconciler,
+    StaleReservationReconciler,
     WorkflowGitHubReads,
     WorkflowState,
     WorktreePort,
@@ -85,6 +90,7 @@ COVERED_PORTS = frozenset(
         "ReviewPromptReads",
         "RunAbandonmentSink",
         "SpendReconciler",
+        "StaleReservationReconciler",
         "WorkflowGitHubReads",
         "WorkflowState",
         "WorktreePort",
@@ -189,6 +195,18 @@ def process_supervisor(
 def spend_reconciler(
     reconciler: CodexSpendReconciler,
 ) -> SpendReconciler:
+    return reconciler
+
+
+def sweep_reservation_reconciler(
+    reconciler: _SweepReservationReconciler,
+) -> StaleReservationReconciler:
+    return reconciler
+
+
+def late_reservation_reconciler(
+    reconciler: _LateReservationReconciler,
+) -> StaleReservationReconciler:
     return reconciler
 
 

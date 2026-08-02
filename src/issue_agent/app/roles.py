@@ -120,6 +120,7 @@ from ..domain.ports import (
     PredictionReader,
     RecentMergesReads,
     SpendReconciler,
+    StaleReservationReconciler,
 )
 from .config import (
     CodexRuntimeConfig,
@@ -132,7 +133,7 @@ from .execute import Executor
 from .loop import Daemon
 from .mcp import mcp_servers_from_file
 from .world_reporter import WorldReporter
-from .recovery import NoWorktreeRecovery, RecoveryCoordinator
+from .recovery import NoWorktreeRecovery, RecoveryCoordinator, RecoveryReport
 
 
 def _ignore_world(_world: object) -> None:
@@ -322,6 +323,51 @@ def migrate_legacy_spend(cfg: HarnessConfig, state_dir: str) -> int:
     return imported
 
 
+@dataclass
+class _LateReservationReconciler:
+    """Bind admission to recovery despite their composition order.
+
+    Accounting wraps the runtime before the recovery coordinator exists, so the
+    reconciler admission calls on a budget trip is bound afterwards. Until then
+    it is inert, which degrades admission to the pre-keifu-#34 behaviour of
+    escalating immediately rather than inventing headroom.
+    """
+
+    delegate: StaleReservationReconciler | None = None
+
+    def bind(self, delegate: StaleReservationReconciler) -> None:
+        self.delegate = delegate
+
+    def reconcile_stale_reservations(self) -> int:
+        if self.delegate is None:
+            return 0
+        return self.delegate.reconcile_stale_reservations()
+
+
+@dataclass(frozen=True)
+class _SweepReservationReconciler:
+    """On-demand reservation recovery, identical to the periodic sweep.
+
+    Reusing the periodic plan is deliberate: it reclaims dead leases and sweeps
+    reservations without reaping processes, so an admission-time call can never
+    disturb a live paid child. Release eligibility stays entirely with the
+    existing recovery rules.
+    """
+
+    control: SQLiteControlStore
+    owner_id: str
+    sweep: Callable[[RecoveryTrigger], RecoveryReport]
+
+    def reconcile_stale_reservations(self) -> int:
+        # Counted by differencing active reservations rather than reading the
+        # report's spend_unknown set: a run whose spend the sweep settled
+        # exactly also returns headroom, but reports nothing unknown.
+        before = frozenset(self.control.active_reservation_runs(self.owner_id))
+        self.sweep(RecoveryTrigger.PERIODIC)
+        after = frozenset(self.control.active_reservation_runs(self.owner_id))
+        return len(before - after)
+
+
 def _with_accounting(
     runtime: AgentRuntime,
     control: SQLiteControlStore,
@@ -329,6 +375,7 @@ def _with_accounting(
     role: str,
     runtime_name: str,
     journal: TypedJournal,
+    reconciler: _LateReservationReconciler | None = None,
 ) -> AgentRuntime:
     money = (
         lambda value: Money.from_major("USD", value)
@@ -356,6 +403,7 @@ def _with_accounting(
         github_host=os.environ.get("GH_HOST", "github.com"),
         approved_base_branch=cfg.base_branch,
         require_dispatch_claim=True,
+        reservation_reconciler=reconciler,
     )
 
 
@@ -494,6 +542,7 @@ def _recovery(
     worktrees: Worktrees | None = None,
     *,
     owner_id: str,
+    reconciler: _LateReservationReconciler | None = None,
 ) -> _RecoveryHooks:
     from ..adapters.process_supervisor import ProcessSupervisor
 
@@ -515,10 +564,15 @@ def _recovery(
         owner_id,
     )
 
-    def reconcile(trigger: RecoveryTrigger) -> object:
+    def reconcile(trigger: RecoveryTrigger) -> RecoveryReport:
         report = coordinator.reconcile(trigger)
         control.flush_bound_outbox()
         return report
+
+    if reconciler is not None:
+        reconciler.bind(
+            _SweepReservationReconciler(control, owner_id, reconcile)
+        )
 
     return _RecoveryHooks(reconcile)
 
@@ -2101,8 +2155,10 @@ def build_fix_daemon(
     )
     # Wrapped LAST, so the decorator sees whichever runtime actually ran (Claude or
     # the Codex swap above) and the ledger is runtime-agnostic.
+    fix_reconciler = _LateReservationReconciler()
     fix_runner = _with_accounting(
-        fix_runner, control, cfg, "fix", cfg.fixer_runtime.value, journal
+        fix_runner, control, cfg, "fix", cfg.fixer_runtime.value, journal,
+        fix_reconciler,
     )
     fix_runner = JournalingRuntime(
         fix_runner,
@@ -2280,6 +2336,7 @@ def build_fix_daemon(
         journal,
         worktrees,
         owner_id=owner_id,
+        reconciler=fix_reconciler,
     )
     reported_world = _reported_world(
         gateway.build_world, control, cfg, "fix", _log("fix")
@@ -2456,6 +2513,7 @@ def build_review_daemon(
         role="review",
         owner_id=owner_id,
     )
+    review_reconciler = _LateReservationReconciler()
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, None,
         JournalingRuntime(
@@ -2466,6 +2524,7 @@ def build_review_daemon(
                 "review",
                 review_runtime.runtime.value,
                 journal,
+                review_reconciler,
             ),
             journal,
             repo=cfg.repo,
@@ -2543,6 +2602,7 @@ def build_review_daemon(
         effect_executor,
         journal,
         owner_id=owner_id,
+        reconciler=review_reconciler,
     )
 
     return Daemon("review", _reported_world(
@@ -2732,6 +2792,7 @@ def build_steward_daemon(
         role="steward",
         owner_id=owner_id,
     )
+    steward_reconciler = _LateReservationReconciler()
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, None,
         JournalingRuntime(
@@ -2742,6 +2803,7 @@ def build_steward_daemon(
                 "steward",
                 steward_runtime.runtime.value,
                 journal,
+                steward_reconciler,
             ),
             journal,
             repo=cfg.repo,
@@ -2870,6 +2932,7 @@ def build_steward_daemon(
         effect_executor,
         journal,
         owner_id=owner_id,
+        reconciler=steward_reconciler,
     )
     return Daemon("steward", _reported_world(
                       observe, control, cfg, "steward", steward_log
