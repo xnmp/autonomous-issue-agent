@@ -17,7 +17,7 @@ import { ResizableTable, useSortedRows } from "./ui/ResizableTable";
 const POLL_MS = 10_000;
 
 /**
- * The "is this on rails?" view. Reading order is deliberate: the eight tiles
+ * The "is this on rails?" view. Reading order is deliberate: the stat tiles
  * answer *how much and how well*, the cost mix answers *where the money went*,
  * the caps answer *how much runway is left*, and the health cards answer *is
  * anything dead* — with red accents on escalations, recurrences, stale daemons
@@ -54,6 +54,9 @@ export function OverviewTab({
   const escalations = m?.escalations ?? 0;
   const recurrences = m?.recurrences ?? 0;
   const spendBlocks = m?.spend_blocks ?? 0;
+  const byClass = new Map(
+    (m?.interventions_by_class ?? []).map((row) => [row.name, row.count]),
+  );
 
   const dailyPct =
     caps?.today_usd != null && caps?.daily_cap_usd != null && caps.daily_cap_usd > 0
@@ -122,6 +125,13 @@ export function OverviewTab({
           title="review APPROVE vs REQUEST_CHANGES on the first round — the power guardrail"
         />
         <StatTile label="Rounds / PR" value={num(m?.rounds_per_pr, 2)} tone="neutral" />
+        <StatTile
+          label="Interventions / PR"
+          value={num(m?.interventions_per_merged_pr, 2)}
+          sub={`${byClass.get("rearm") ?? 0} rearm / ${byClass.get("policy") ?? 0} policy / ${byClass.get("other") ?? 0} other`}
+          tone={(m?.interventions_per_merged_pr ?? 0) > 0 ? "running" : "ok"}
+          title="journalled operator re-arms per merged PR — the unattended-operation metric; policy promotes are counted but excluded from the ratio"
+        />
         <StatTile
           label="Escalations"
           value={num(escalations)}

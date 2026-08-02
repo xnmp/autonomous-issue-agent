@@ -30,6 +30,7 @@ from ..domain.dashboard import (
     build_metrics,
     event_issue,
     first_pass_verdicts,
+    interventions_line,
     leg_failed,
     parse_action,
     pr_issue_map,
@@ -242,6 +243,7 @@ def _metrics_lines(m: Metrics) -> list[str]:
         + f" · rounds/PR {m.rounds_per_pr}",
         f"    escalations {m.escalations} · recurrences {m.recurrences} · "
         f"spend blocks {m.spend_blocks}",
+        "    " + interventions_line(m),
     ]
     return lines
 
@@ -394,6 +396,7 @@ def _html_metrics(m: Metrics) -> str:
             "escalations / recurrences / spend blocks",
             f"{m.escalations} / {m.recurrences} / {m.spend_blocks}",
         ),
+        ("operator interventions", _esc(interventions_line(m))),
     ]
     body = "".join(f"<tr><th>{_esc(k)}</th><td>{v}</td></tr>" for k, v in rows)
     return f"<table>{body}</table>"

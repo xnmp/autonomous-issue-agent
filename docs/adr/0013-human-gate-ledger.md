@@ -1,6 +1,6 @@
 # ADR 0013 — Human gates are a ledger, not labels plus events
 
-Governs: src/issue_agent/domain/infra_breaker.py
+Governs: src/issue_agent/domain/infra_breaker.py src/issue_agent/domain/dashboard.py
 
 Status: proposed (2026-08-02). Motivating incidents: the 2026-08-02 keifu
 supervised session, especially issue #25 / PR #173.

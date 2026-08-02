@@ -572,6 +572,15 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** InterventionCount */
+        InterventionCount: {
+            /** Count */
+            count: number;
+            /** Name */
+            name: string;
+        } & {
+            [key: string]: unknown;
+        };
         /** KindCost */
         KindCost: {
             /** Kind */
@@ -601,6 +610,18 @@ export interface components {
             first_pass_rate: number | null;
             /** In Flight Issues */
             in_flight_issues: number;
+            /**
+             * Interventions By Class
+             * @default []
+             */
+            interventions_by_class: components["schemas"]["InterventionCount"][];
+            /** Interventions Per Merged Pr */
+            interventions_per_merged_pr: number | null;
+            /**
+             * Interventions Total
+             * @default 0
+             */
+            interventions_total: number;
             /** Recurrences */
             recurrences: number;
             /** Rounds Per Pr */

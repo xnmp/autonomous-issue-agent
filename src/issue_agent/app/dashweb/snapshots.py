@@ -1612,6 +1612,12 @@ def metrics_json(metrics: dash.Metrics) -> dict:
         "recurrences": metrics.recurrences,
         "spend_blocks": metrics.spend_blocks,
         "today_usd": metrics.today_usd,
+        "interventions_total": metrics.interventions_total,
+        "interventions_per_merged_pr": metrics.interventions_per_merged_pr,
+        "interventions_by_class": [
+            {"name": name, "count": count}
+            for name, count in metrics.interventions_by_class
+        ],
         "by_kind": [
             {"kind": kind, "usd": cost, "runs": runs}
             for kind, cost, runs in metrics.by_kind
