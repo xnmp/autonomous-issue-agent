@@ -12,6 +12,7 @@ from issue_agent.adapters.agent_runner import (
     DEFAULT_MAX_BUFFER_BYTES,
     DEFAULT_PERMISSION_MODE,
     build_option_kwargs,
+    resolve_claude_cli,
     result_to_agent_result,
 )
 from issue_agent.adapters.runtime_plan import McpServer, RuntimePlan, SubagentDef
@@ -978,3 +979,27 @@ def test_task_env_override_beats_identity():
 def test_no_model_no_task_env_emits_no_env():
     kw = build_option_kwargs(RuntimePlan(prompt="p"))
     assert "env" not in kw
+
+
+# ── CLI resolution (keifu 2026-08-03: venv rebuilt under a live daemon) ───────
+def test_claude_cli_pin_wins_even_when_bundled_exists(tmp_path):
+    bundled = tmp_path / "claude"
+    bundled.write_text("#!/bin/sh\n")
+    bundled.chmod(0o755)
+    assert resolve_claude_cli(
+        " /pinned/claude ", bundled, which=lambda _: "/path/claude"
+    ) == "/pinned/claude"
+
+
+def test_claude_cli_bundled_then_path_when_unpinned(tmp_path):
+    bundled = tmp_path / "claude"
+    bundled.write_text("#!/bin/sh\n")
+    bundled.chmod(0o755)
+    assert resolve_claude_cli("", bundled) == str(bundled)
+    # The stale-venv shape: the bundled path no longer exists on disk.
+    gone = tmp_path / "deleted-venv" / "claude"
+    assert resolve_claude_cli("", gone, which=lambda _: "/local/claude") == "/local/claude"
+
+
+def test_claude_cli_unresolvable_returns_none(tmp_path):
+    assert resolve_claude_cli("", tmp_path / "missing", which=lambda _: None) is None

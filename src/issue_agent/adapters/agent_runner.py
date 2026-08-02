@@ -166,6 +166,27 @@ def build_option_kwargs(
     return kwargs
 
 
+def resolve_claude_cli(
+    pinned: str,
+    bundled: Path,
+    which: Callable[[str], str | None] = shutil.which,
+) -> str | None:
+    """The CLI the supervised runner will exec, or None when nothing resolves.
+
+    Order: CLAUDE_BIN pin → SDK-bundled binary → PATH. The pin exists because
+    the bundled path derives from `claude_agent_sdk.__file__`, which a live
+    daemon resolves into a venv tree that can be DELETED under it (a `uv sync`
+    rebuild across a Python minor, keifu 2026-08-03 — every review leg died
+    pre-launch with transport_death), and PATH lookup is only as good as the
+    unit's minimal PATH (the CODEX_BIN incident, same class). The pin is taken
+    as given, never validated here — that is the point of pinning."""
+    if pinned.strip():
+        return pinned.strip()
+    if bundled.is_file() and os.access(bundled, os.X_OK):
+        return str(bundled)
+    return which("claude")
+
+
 def exit_reason_from_envelope(subtype: str, is_error: bool) -> ExitReason:
     """Pure: SDK ResultMessage (subtype, is_error) → why the session ended.
 
@@ -491,16 +512,15 @@ class AgentRunner(AgentRuntime):
             task, self.permission_mode, self.hooks, self._max_buffer_size
         )
         if self._process_supervisor is not None:
-            bundled = (
-                Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude"
-            )
-            executable = (
-                str(bundled)
-                if bundled.is_file() and os.access(bundled, os.X_OK)
-                else shutil.which("claude")
+            executable = resolve_claude_cli(
+                os.environ.get("CLAUDE_BIN", ""),
+                Path(claude_agent_sdk.__file__).parent / "_bundled" / "claude",
             )
             if executable is None:
-                raise FileNotFoundError("Claude CLI executable is unavailable")
+                raise FileNotFoundError(
+                    "Claude CLI executable is unavailable — set CLAUDE_BIN "
+                    "to an absolute path to pin it"
+                )
             wrapper, supervisor_env = self._process_supervisor.supervised_cli(
                 supervised_run_id, executable
             )
