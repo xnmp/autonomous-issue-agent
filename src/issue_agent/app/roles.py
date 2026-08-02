@@ -130,6 +130,8 @@ from .config import (
     StewardRuntimeConfig,
 )
 from .dispatch import AgentDispatcher, DispatchConfig
+from .infra_breaker import InfraBreaker
+from ..domain.infra_breaker import BreakerPolicy
 from .execute import Executor
 from .loop import Daemon
 from .mcp import mcp_servers_from_file
@@ -1028,6 +1030,57 @@ def _control_spend_gate(
         return None
 
     return gate
+
+
+def _first_gate(
+    *gates: Callable[[], str | None] | None,
+) -> Callable[[], str | None] | None:
+    """Compose tick gates: the first one with a reason wins, in order.
+
+    Order is precedence, and accounting comes first deliberately — an
+    ACCOUNTING UNAVAILABLE is the reason an operator must act on before any
+    other, and `Daemon._gate_blocks_this_tick` only ever reports one.
+    """
+    active = tuple(gate for gate in gates if gate is not None)
+    if not active:
+        return None
+    if len(active) == 1:
+        return active[0]
+
+    def gate() -> str | None:
+        for candidate in active:
+            reason = candidate()
+            if reason is not None:
+                return reason
+        return None
+
+    return gate
+
+
+def _infra_breaker(
+    cfg: HarnessConfig, journal, log: Callable[[str], None]
+) -> InfraBreaker | None:
+    """The deployment-wide infra breaker, or None when disabled.
+
+    One instance per role process, shared by the dispatch threads that report
+    deaths and the tick thread that reads the gate. "Deployment-wide" means the
+    whole repo's fix backlog — the granularity the incident needed, where four
+    issues each escalated separately for one broken binary. Roles are separate
+    daemons, so a cross-ROLE breaker would need the control store; the fix role
+    is where the paid resolve family lives and is deliberately the only role
+    wired here.
+    """
+    if not cfg.infra_breaker:
+        return None
+    return InfraBreaker(
+        BreakerPolicy.sane(
+            cfg.infra_breaker_deaths,
+            cfg.infra_breaker_window_seconds,
+            cfg.infra_breaker_cooldown_seconds,
+        ),
+        journal=journal,
+        log=log,
+    )
 
 
 def _build_codex_runner(
@@ -2148,6 +2201,7 @@ def build_fix_daemon(
         arm_on_open=cfg.arm_on_open_active,
     )
     journal = _typed_journal(_journal(store), cfg, "fix", store.state_dir)
+    infra_breaker = _infra_breaker(cfg, journal, _log("fix"))
     dcfg = DispatchConfig(
         base_branch=repo_cfg.base_branch,
         fix=FixTaskConfig(
@@ -2167,6 +2221,7 @@ def build_fix_daemon(
         # The same ceiling `fix_cfg` escalates on, so a deterministic death can
         # saturate the counter rather than pay for cap-1 identical retries (#13).
         max_infra_deaths=fix_runtime.max_infra_deaths,
+        infra_breaker=infra_breaker,
         **_spend_cfg(cfg, "fix"),
     )
     runtime_binding = _FIX_RUNTIME_REGISTRY[cfg.fixer_runtime](
@@ -2400,7 +2455,10 @@ def build_fix_daemon(
         cfg.tick_interval_seconds,
         _log("fix"),
         journal=journal,
-        tick_gate=_control_spend_gate(cfg, control),
+        tick_gate=_first_gate(
+            _control_spend_gate(cfg, control),
+            None if infra_breaker is None else infra_breaker.gate_reason,
+        ),
         wake_check=_wake_check(cfg, store),
         dispatch_capacity=cfg.fix_dispatch_concurrency,
         dispatch_key=dispatch_key,

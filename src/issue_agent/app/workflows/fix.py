@@ -33,6 +33,7 @@ from ...domain.ports import (
     CiPromptReads,
     FixWorktreePort,
     EventSink,
+    InfraBreakerPort,
     ReviewPromptReads,
     WorkflowGitHubReads,
     WorkflowState,
@@ -93,6 +94,11 @@ class FixWorkflowConfig:
     # the routing guardrail is "split the metrics by tier", which is unanswerable
     # if the tier a leg actually ran at was never recorded.
     journal: EventSink | None = None
+    # Deployment-wide infra breaker (app.infra_breaker.InfraBreaker). Every
+    # infra-class death is reported to it beside the per-issue ceiling charge,
+    # and every returned result clears it. None = per-issue ceilings only,
+    # which is the pre-breaker behaviour every hand-built config keeps.
+    infra_breaker: InfraBreakerPort | None = None
 
 
 @dataclass
@@ -195,6 +201,10 @@ class FixWorkflow:
         self.store.clear_infra_deaths(key)
         if alt_key is not None and alt_key != key:
             self.store.clear_infra_deaths(alt_key)
+        # Same evidence, deployment scope: a leg that returned ANYTHING proves
+        # the runtime can still run one, which is the probe the deployment-wide
+        # breaker re-arms on.
+        self._report_healthy_leg()
 
     def _leg_kind(self, kind: str | None):
         """Journal the next run under its own `kind` (#40), when the wrapped
@@ -747,6 +757,10 @@ class FixWorkflow:
         exception escaping this workflow is re-caught by the dispatcher and
         reported as a SECOND infra death for the same leg.
         """
+        # Reported BEFORE the ceiling bump: a store that cannot persist the
+        # per-issue counter is itself a deployment-scoped fault, and the death
+        # it failed to record is exactly the evidence the breaker needs.
+        self._report_infra_death(issue, leg, outcome.infra_class_reason(result))
         try:
             deaths = self.store.bump_infra_deaths(issue)
         except Exception as exc:  # noqa: BLE001 — see docstring
@@ -766,6 +780,27 @@ class FixWorkflow:
             )
         except Exception as exc:  # noqa: BLE001 — telemetry never fails a leg
             self.cfg.log(f"agent #{issue}: infra path not journalled ({exc})")
+
+    def _report_infra_death(self, issue: int, leg: str, reason: str) -> None:
+        """Feed the deployment-wide breaker. Never fails the leg: the breaker
+        is an efficiency control, and a broken one must not become a second
+        failure on top of the death it is being told about."""
+        breaker = self.cfg.infra_breaker
+        if breaker is None:
+            return
+        try:
+            breaker.record_death(issue, leg, reason)
+        except Exception as exc:  # noqa: BLE001 — see docstring
+            self.cfg.log(f"agent #{issue}: infra breaker not updated ({exc})")
+
+    def _report_healthy_leg(self) -> None:
+        breaker = self.cfg.infra_breaker
+        if breaker is None:
+            return
+        try:
+            breaker.record_success()
+        except Exception as exc:  # noqa: BLE001 — see `_report_infra_death`
+            self.cfg.log(f"infra breaker not cleared ({exc})")
 
     def _journal_budget_path(self, issue: int, leg: str, reason, pr: int | None) -> None:
         """Record the operator-cap path separately from capability escalation."""

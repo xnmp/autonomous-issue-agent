@@ -450,6 +450,37 @@ class InfraPathEntered(EventPayload):
     infra_deaths: int = 0
 
 
+@event_type("infra.breaker.tripped.v1")
+@dataclass(frozen=True)
+class InfraBreakerTripped(EventPayload):
+    """Infra-class deaths crossed issues: paid dispatch paused deployment-wide.
+
+    ONE event for a storm that used to produce one escalation per affected
+    issue (keifu 2026-08-02). `cause` and `remediation` are machine-checkable
+    strings in ADR 0013's shape — the predicate plus its evidence, and what the
+    harness already tried automatically — so the escalation can be re-evaluated
+    rather than re-read.
+    """
+
+    cause: str
+    remediation: str
+    deaths: int = 0
+    issues: tuple[int, ...] = ()
+    window_seconds: int = 0
+
+
+@event_type("infra.breaker.cleared.v1")
+@dataclass(frozen=True)
+class InfraBreakerCleared(EventPayload):
+    """The breaker re-armed. `reason` is `probe_succeeded` (a leg completed, so
+    the runtime is demonstrably alive) or `cooldown_elapsed` (the bound on the
+    hold expired; a still-broken runtime re-trips within one window)."""
+
+    reason: str
+    cause: str = ""
+    deaths: int = 0
+
+
 @event_type("issue.groomed.v1")
 @dataclass(frozen=True)
 class IssueGroomed(EventPayload):

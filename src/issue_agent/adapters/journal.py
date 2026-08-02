@@ -37,6 +37,8 @@ from ..domain.events import (
     EscalationRaised,
     GithubUnavailable,
     HandoverWritten,
+    InfraBreakerCleared,
+    InfraBreakerTripped,
     InfraPathEntered,
     IssueGroomed,
     LevelChanged,
@@ -287,6 +289,22 @@ def _legacy_event_record(event: TelemetryEvent) -> tuple[str, dict[str, object]]
             "leg": payload.leg,
             "exit_reason": payload.exit_reason,
             "infra_deaths": payload.infra_deaths,
+        }
+    if isinstance(payload, InfraBreakerTripped):
+        return "infra_breaker", {
+            **common,
+            "cause": payload.cause,
+            "remediation": payload.remediation,
+            "deaths": payload.deaths,
+            "issues": list(payload.issues),
+            "window_seconds": payload.window_seconds,
+        }
+    if isinstance(payload, InfraBreakerCleared):
+        return "infra_breaker_cleared", {
+            **common,
+            "reason": payload.reason,
+            "cause": payload.cause,
+            "deaths": payload.deaths,
         }
     if isinstance(payload, IssueGroomed):
         return "groomed", {

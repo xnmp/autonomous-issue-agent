@@ -23,6 +23,11 @@ from ..adapters.control_path import machine_control_authority_root
 from ..adapters.env_file import source_env_file
 from ..domain.agent_task import RuntimeName
 from ..domain.effect_retry import DEFAULT_EFFECT_RETRY_CEILING
+from ..domain.infra_breaker import (
+    DEFAULT_BREAKER_COOLDOWN_SECONDS,
+    DEFAULT_BREAKER_DEATHS,
+    DEFAULT_BREAKER_WINDOW_SECONDS,
+)
 from ..domain.effort import EFFORT_LADDER, Effort, parse_effort
 from ..domain.identity import normalize_login
 from ..domain.pricing import parse_model_rate_table
@@ -353,6 +358,23 @@ class HarnessConfig:
     # 0 disables (wave P0-B wires the counter; this field/knob lands now so the
     # config surface is stable for that wave).
     max_infra_deaths: int = 5
+    # Deployment-wide infra circuit breaker (keifu 2026-08-02 04:53-04:58Z): a
+    # `codex` binary the backend 400'd killed every leg spawn across FOUR issues
+    # in five minutes. Each burned its own per-issue infra ladder and escalated
+    # separately; nothing said "the runtime is broken deployment-wide". The
+    # per-issue ceiling is the wrong granularity for a repo-wide fault, so this
+    # pauses PAID admission for the whole deployment once infra-class deaths
+    # cross issues. Off restores per-issue ceilings as the only bound.
+    infra_breaker: bool = True
+    # Deaths inside INFRA_BREAKER_WINDOW_SECONDS, over ≥2 distinct issues, that
+    # trip it. One issue's repeated deaths never trip it — that stays the
+    # per-issue `max_infra_deaths` ceiling's job.
+    infra_breaker_deaths: int = DEFAULT_BREAKER_DEATHS
+    infra_breaker_window_seconds: int = DEFAULT_BREAKER_WINDOW_SECONDS
+    # How long a trip holds before re-arming on its own. A trip blocks the paid
+    # legs whose success would clear it, so without this the only exit is an
+    # operator restart; a still-broken runtime re-trips within one window.
+    infra_breaker_cooldown_seconds: int = DEFAULT_BREAKER_COOLDOWN_SECONDS
     # Reviewer twin of max_infra_deaths (re-review P0R-3). Counts paid review
     # rounds that advanced NOTHING — a session that died pre-result, but also a
     # fan-out whose synthesis returned None, a failed submit POST, or an errored
@@ -766,6 +788,21 @@ class HarnessConfig:
         _require_non_negative(errors, "MAX_REBASE_RETRIES", self.max_rebase_retries)
         _require_non_negative(errors, "MAX_RESOLVE_RETRIES", self.max_resolve_retries)
         _require_non_negative(errors, "MAX_INFRA_DEATHS", self.max_infra_deaths)
+        # Positive, not non-negative: 0 here is not "disabled" (INFRA_BREAKER=0
+        # is), it is a breaker that trips on nothing or holds for no time.
+        _require_positive(
+            errors, "INFRA_BREAKER_DEATHS", self.infra_breaker_deaths
+        )
+        _require_positive(
+            errors,
+            "INFRA_BREAKER_WINDOW_SECONDS",
+            self.infra_breaker_window_seconds,
+        )
+        _require_positive(
+            errors,
+            "INFRA_BREAKER_COOLDOWN_SECONDS",
+            self.infra_breaker_cooldown_seconds,
+        )
         _require_non_negative(
             errors, "MAX_UNPRODUCTIVE_REVIEW_ROUNDS", self.max_unproductive_review_rounds
         )

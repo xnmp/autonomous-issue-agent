@@ -181,6 +181,19 @@ class EventSink(Protocol):
     def emit(self, event: TelemetryEvent) -> None: ...
 
 
+class InfraBreakerPort(Protocol):
+    """Deployment-wide infra circuit breaker, as a workflow sees it.
+
+    Write-only from the workflow's side: a leg reports what happened to it and
+    never asks whether admission is open. The admission question is the tick
+    gate's, so a leg already in flight when the breaker trips still finishes
+    and settles its spend (`app.infra_breaker.InfraBreaker`).
+    """
+
+    def record_death(self, issue: int, leg: str = "", reason: str = "") -> None: ...
+    def record_success(self) -> None: ...
+
+
 class Clock(Protocol):
     """Injected wall/monotonic time; invalid sleeps raise ``ValueError``."""
 

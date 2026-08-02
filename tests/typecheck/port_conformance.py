@@ -23,6 +23,7 @@ from issue_agent.adapters.store import Store
 from issue_agent.adapters.typed_journal import TypedJournal
 from issue_agent.adapters.worktree import Worktrees
 from issue_agent.app.execute import Executor
+from issue_agent.app.infra_breaker import InfraBreaker
 from issue_agent.app.recovery import NoWorktreeRecovery
 from issue_agent.app.roles import (
     _LateReservationReconciler,
@@ -37,6 +38,7 @@ from issue_agent.domain.ports import (
     EventSink,
     FixWorktreePort,
     GitHubReads,
+    InfraBreakerPort,
     IssueStateReasonReads,
     LegacyJournal,
     LevelState,
@@ -74,6 +76,7 @@ COVERED_PORTS = frozenset(
         "EventSink",
         "FixWorktreePort",
         "GitHubReads",
+        "InfraBreakerPort",
         "IssueStateReasonReads",
         "LegacyJournal",
         "LevelState",
@@ -208,6 +211,10 @@ def late_reservation_reconciler(
     reconciler: _LateReservationReconciler,
 ) -> StaleReservationReconciler:
     return reconciler
+
+
+def infra_breaker(breaker: InfraBreaker) -> InfraBreakerPort:
+    return breaker
 
 
 def event_sink(journal: TypedJournal) -> EventSink:

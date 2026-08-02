@@ -558,6 +558,11 @@ _SAMPLE = {
     "entity_kind": "run",
     "entity_id": "run-id",
     "attributes": {},
+    "cause": "cause(evidence=1)",
+    "remediation": "remediation(attempted=1)",
+    "deaths": 4,
+    "issues": (1, 2),
+    "window_seconds": 600,
 }
 
 

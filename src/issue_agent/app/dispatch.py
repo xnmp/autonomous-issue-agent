@@ -36,6 +36,7 @@ from ..domain.ports import (
     ControlStore,
     FixWorktreePort,
     EventSink,
+    InfraBreakerPort,
     WorkflowGitHubReads,
     WorkflowState,
 )
@@ -114,6 +115,9 @@ class DispatchConfig:
     # ADR 0012: consecutive verdict-less paid steward legs allowed per issue
     # version before the steward stops re-buying and escalates.
     steward_error_ceiling: int = DEFAULT_STEWARD_ERROR_CEILING
+    # Deployment-wide infra breaker (app.infra_breaker.InfraBreaker). None keeps
+    # per-issue ceilings as the only bound, which is every hand-built config.
+    infra_breaker: InfraBreakerPort | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.reviewer_runtime, RuntimeName):
@@ -134,6 +138,7 @@ class DispatchConfig:
             fix_bot=self.fix_bot,
             fixer_runtime=self.fixer_runtime,
             escalate_on_evidence=self.escalate_on_evidence,
+            infra_breaker=self.infra_breaker,
         )
 
     def review_workflow_config(self) -> ReviewWorkflowConfig:
@@ -519,4 +524,17 @@ class AgentDispatcher:
                 # A counter we could not persist must not replace the death we
                 # are trying to report (the traceback is the diagnosis).
                 self.cfg.log(f"infra-death counter not persisted for #{key}: {err}")
+            # The deployment-wide breaker counts DISTINCT targets, so it is told
+            # only about keys that are a real issue number. A `-pr` key is
+            # `_death_key`'s last-resort guess for a PR whose issue could not be
+            # resolved; feeding it in would let one target present as two
+            # distinct "issues" and trip a repo-wide pause on a single-target
+            # fault — the exact confusion this breaker exists to avoid.
+            if key > 0 and self.cfg.infra_breaker is not None:
+                try:
+                    self.cfg.infra_breaker.record_death(
+                        key, action.kind.name.lower(), "raised"
+                    )
+                except Exception as err:  # noqa: BLE001 — see above
+                    self.cfg.log(f"infra breaker not updated for #{key}: {err}")
             raise

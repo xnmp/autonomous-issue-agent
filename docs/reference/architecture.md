@@ -286,6 +286,14 @@ that matters is not "wrong answer" but "loop that bills forever":
 - `MAX_INFRA_DEATHS` / `MAX_UNPRODUCTIVE_REVIEW_ROUNDS` — a *separate, higher*
   ceiling for sessions that die before returning a result, which deliberately do
   not count as attempts
+- `INFRA_BREAKER` — the deployment-wide twin of the per-issue infra ceiling.
+  `INFRA_BREAKER_DEATHS` infra-class deaths over ≥2 distinct issues inside
+  `INFRA_BREAKER_WINDOW_SECONDS` cannot be about any one issue, so paid
+  admission pauses for the whole fix role, once, with a cause and the
+  remediation already attempted (`infra.breaker.tripped.v1`). It re-arms on the
+  next leg that returns a result, or after `INFRA_BREAKER_COOLDOWN_SECONDS`
+  (`infra.breaker.cleared.v1`). One issue dying repeatedly stays
+  `MAX_INFRA_DEATHS`'s business. State is in-memory: a restart re-arms.
 - `MAX_BUDGET_USD` per-leg spend cap — native on the Claude SDK; on codex the
   harness prices streamed rollout counters and kills the process group on
   crossing when `CODEX_ENFORCE_BUDGET=1` and both token prices are positive
@@ -437,7 +445,8 @@ module requires placing it in the appropriate tier and explaining it here.
 `domain/contracts.py`, `domain/dashboard.py`, `domain/effect_retry.py`,
 `domain/effort.py`,
 `domain/events.py`, `domain/fix.py`, `domain/gate.py`,
-`domain/governor_policy.py`, `domain/identity.py`, `domain/jira.py`,
+`domain/governor_policy.py`, `domain/identity.py`,
+`domain/infra_breaker.py`, `domain/jira.py`,
 `domain/labels.py`, `domain/leg.py`, `domain/lifecycle.py`,
 `domain/liveness.py`,
 `domain/outcome.py`, `domain/ports.py`, `domain/pricing.py`,
@@ -472,7 +481,8 @@ adapters live under `adapters/dashweb/`.
 `app/` — composition and use-case orchestration:
 `app/cli.py`, `app/codex_resolution.py`, `app/config.py`, `app/dashboard.py`,
 `app/dispatch.py`,
-`app/execute.py`, `app/identity_pools.py`, `app/launchd_main.py`,
+`app/execute.py`, `app/identity_pools.py`, `app/infra_breaker.py`,
+`app/launchd_main.py`,
 `app/loop.py`, `app/main.py`,
 `app/mcp.py`, `app/recovery.py`, `app/roles.py`, `app/webhook.py`,
 `app/world_probe.py`, and `app/world_reporter.py`.
