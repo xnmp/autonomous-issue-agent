@@ -108,6 +108,21 @@ def test_deployment_name_is_read_off_the_composed_env_path():
     assert system.deployment_of_env("") == ""
 
 
+def test_deployment_name_is_read_off_the_systemd_service_env_path():
+    # The service units point AGENT_ENV at ~/.config/issue-agent/<name>.env,
+    # not the point-at composed snapshot. Every systemd deployment rendered
+    # active:false until this arm existed (keifu, 2026-08-02).
+    assert (
+        system.deployment_of_env("/home/u/.config/issue-agent/keifu.env")
+        == "keifu"
+    )
+    # Repo overlays and dotfiles in other directories must NOT read as live
+    # daemons: the parent directory has to be literally `issue-agent`.
+    assert system.deployment_of_env("/h/config/repos/keifu.env") == ""
+    assert system.deployment_of_env("/home/u/.config/issue-agent/.hidden.env") == ""
+    assert system.deployment_of_env("/home/u/.config/issue-agent/keifu.txt") == ""
+
+
 def test_system_adapter_lists_configured_deployments(tmp_path):
     (tmp_path / "b.env").write_text("REPO=o/b\n")
     (tmp_path / "a.env").write_text("REPO=o/a\n")

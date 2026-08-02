@@ -38,9 +38,24 @@ def _environ_agent_env(blob: bytes) -> str:
 
 
 def deployment_of_env(agent_env: str) -> str:
+    """Deployment name from a daemon's AGENT_ENV path, "" when not a daemon.
+
+    Two launch layouts exist: `point-at` composes `config/.active.<name>.env`,
+    and the systemd/launchd units (HARNESS.md service install) point at
+    `~/.config/issue-agent/<name>.env`. The second arm requires the parent
+    directory to be literally `issue-agent` so repo overlays
+    (`config/repos/<name>.env`) and unrelated `.env` files never read as live
+    daemons. Missing the second arm made every systemd deployment show
+    `active: false` on the dashboard (keifu, observed 2026-08-02)."""
     base = os.path.basename(agent_env or "")
     if base.startswith(".active.") and base.endswith(".env"):
         return base[len(".active.") : -len(".env")]
+    if (
+        base.endswith(".env")
+        and not base.startswith(".")
+        and os.path.basename(os.path.dirname(agent_env or "")) == "issue-agent"
+    ):
+        return base[: -len(".env")]
     return ""
 
 
