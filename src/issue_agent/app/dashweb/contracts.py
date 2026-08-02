@@ -100,6 +100,14 @@ class KindCost(Contract):
     runs: int
 
 
+class InterventionCount(Contract):
+    # `name` is one of domain.dashboard.INTERVENTION_CLASSES — rearm, policy,
+    # or other. Not typed as a Literal: a class this build does not know must
+    # still render, not fail the whole overview payload.
+    name: str
+    count: int
+
+
 class Metrics(Contract):
     done_issues: int
     in_flight_issues: int
@@ -114,6 +122,11 @@ class Metrics(Contract):
     spend_blocks: int
     today_usd: float | None
     by_kind: list[KindCost]
+    interventions_total: int = 0
+    # None when nothing merged — "nobody intervened" and "nothing to divide by"
+    # must not both render as 0.
+    interventions_per_merged_pr: float | None = None
+    interventions_by_class: list[InterventionCount] = []
 
 
 class CostMix(Contract):

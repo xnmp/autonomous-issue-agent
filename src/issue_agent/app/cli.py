@@ -2134,7 +2134,34 @@ def cmd_status(args) -> int:
             print(line)
     except Exception as exc:  # noqa: BLE001
         err(f"(could not read the event journal: {exc})")
+    # Interventions come from the schema-v2 fold, not from `spend_status_lines`:
+    # operator actions are only ever written as typed `lifecycle.action.applied`
+    # events, and the legacy journal.jsonl those lines read no longer exists on
+    # a v2 deployment. Its own try/except for the same reason as the block
+    # above — a diagnostic must not be what fails.
+    try:
+        print(interventions_status_line(name, repo))
+    except Exception as exc:  # noqa: BLE001
+        err(f"(could not read operator interventions: {exc})")
     return 0
+
+
+def interventions_status_line(name: str, repo: str) -> str:
+    """The `interventions:` line of `issue-agent status`, indented to match."""
+    from ..adapters.control_path import canonical_control_store_path
+    from ..adapters.journal import default_ledger_path
+    from ..domain.dashboard import interventions_line
+    from . import dashboard as dash
+
+    deployment = dash.collect(
+        name,
+        repo,
+        journal_paths(name),
+        log_dir(),
+        default_ledger_path(),
+        control_db_path=canonical_control_store_path(),
+    )
+    return "  " + interventions_line(deployment.metrics)
 
 
 def log_dir() -> str:

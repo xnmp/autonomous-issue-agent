@@ -617,6 +617,25 @@
         "title": "HealthTrendDay",
         "type": "object"
       },
+      "InterventionCount": {
+        "additionalProperties": true,
+        "properties": {
+          "count": {
+            "title": "Count",
+            "type": "integer"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "count"
+        ],
+        "title": "InterventionCount",
+        "type": "object"
+      },
       "IssueCard": {
         "additionalProperties": true,
         "properties": {
@@ -1503,6 +1522,31 @@
           },
           "in_flight_issues": {
             "title": "In Flight Issues",
+            "type": "integer"
+          },
+          "interventions_by_class": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/InterventionCount"
+            },
+            "title": "Interventions By Class",
+            "type": "array"
+          },
+          "interventions_per_merged_pr": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Interventions Per Merged Pr"
+          },
+          "interventions_total": {
+            "default": 0,
+            "title": "Interventions Total",
             "type": "integer"
           },
           "recurrences": {

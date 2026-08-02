@@ -27,7 +27,7 @@ from .events import (
     JsonValue,
     encode_event,
 )
-from .labels import LIFECYCLE_LABELS
+from .labels import LIFECYCLE_LABELS, Label
 from .outcome import ExitReason
 from .projection import ReadModel
 
@@ -287,11 +287,39 @@ class Metrics:
     recurrences: int
     spend_blocks: int
     today_usd: float | None  # settled SQLite spend, or unknown
+    # (class, count) for every class in INTERVENTION_CLASSES, always all three.
+    interventions_by_class: tuple[tuple[str, int], ...] = ()
 
     @property
     def first_pass_rate(self) -> float | None:
         total = self.first_pass_approvals + self.first_pass_changes
         return (self.first_pass_approvals / total) if total else None
+
+    @property
+    def interventions_total(self) -> int:
+        return sum(count for _name, count in self.interventions_by_class)
+
+    @property
+    def interventions_per_merged_pr(self) -> float | None:
+        """Rearm+other interventions per merged PR; None when nothing merged.
+
+        `policy` is excluded from the headline ratio on purpose: a hand promote
+        exists because STEWARD_PROMOTE=0 is a chosen gate, so charging it here
+        would make a deliberate configuration read as harness unreliability.
+        It stays in `interventions_by_class` so the choice remains visible and
+        the day the gate opens, the drop is attributable.
+
+        None rather than 0.0 when `done_issues` is 0: "nobody intervened" and
+        "nothing merged to divide by" are opposite readings of the same day.
+        """
+        if not self.done_issues:
+            return None
+        charged = sum(
+            count
+            for name, count in self.interventions_by_class
+            if name != INTERVENTION_POLICY
+        )
+        return round(charged / self.done_issues, 2)
 
 
 @dataclass(frozen=True)
@@ -1142,6 +1170,154 @@ def first_pass_verdicts(rows) -> tuple[int, int]:
     )
 
 
+# ── operator interventions ────────────────────────────────────────────────────
+# "Interventions per merged PR" is the adjudicating metric for running the
+# harness without a manager, so it has to be a number rather than a feeling.
+#
+# The automated split is a PROXY and is named as one. The gap / config /
+# judgment causes an operator assigns in a session review need a human to say
+# WHY the harness stopped; ADR 0013's ledger is where those land. Nothing here
+# invents them. What the journal can answer on its own is what the operator had
+# to DO:
+#
+#   rearm  — the harness wedged and a human re-armed it (unblock, review
+#            dismissal, priority nudge). Closest available stand-in for the
+#            gap class until ADR 0013 lands causes.
+#   policy — a chosen gate rather than a defect: promoting an issue to ai-ready
+#            by hand exists only because STEWARD_PROMOTE=0.
+#   other  — an operator event this grammar does not recognise. An unclassified
+#            intervention is still an intervention, so it is counted, never
+#            dropped; a growing `other` means the grammar owes a class.
+#
+# Manual gh-side work (answering a triage question, closing an issue by hand)
+# reaches the harness as an observed world fact, not as an operator event, and
+# is therefore NOT in this count. The number is a floor on human involvement.
+INTERVENTION_REARM = "rearm"
+INTERVENTION_POLICY = "policy"
+INTERVENTION_OTHER = "other"
+INTERVENTION_CLASSES = (
+    INTERVENTION_REARM,
+    INTERVENTION_POLICY,
+    INTERVENTION_OTHER,
+)
+
+# `ActionApplied.kind` values and `command_id` prefixes minted by the
+# dashboard's operator endpoints (app/dashweb/service.py). The relabel path
+# routes through a durable command whose id is a content digest, so its class
+# is read off the labels it moved instead.
+_REARM_ACTION_KINDS = frozenset({"operator_unblock", "operator_dismiss_review"})
+_REARM_COMMAND_PREFIXES = ("operator-unblock:", "operator-dismiss-review:")
+_RELABEL_ACTION_KIND = "operator_relabel"
+# Hand-adding the promotion label is doing the steward's job for it, which is
+# exactly what STEWARD_PROMOTE=0 asks a human to do. Deliberately narrow: some
+# other lifecycle label arriving from an operator endpoint is a new behaviour
+# nobody has classified, and `other` is where it should surface.
+_POLICY_ADD_LABELS = frozenset({Label.AI_READY.value})
+_PRIORITY_LABELS = frozenset({Label.P1.value, Label.P2.value, Label.P3.value})
+
+
+def _text(value) -> str:
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _label_set(value) -> frozenset[str]:
+    """The labels in an action attribute, tolerating anything at all.
+
+    Operator payloads are JSON off disk: a torn writer, a hand-edited journal,
+    or a future field shape must cost this fold a mis-classification at worst,
+    never a traceback.
+    """
+    if isinstance(value, (list, tuple)):
+        return frozenset(_text(item) for item in value if _text(item))
+    return frozenset()
+
+
+def operator_action(event) -> Mapping | None:
+    """The operator-authored `action` payload of one projected event, or None.
+
+    Provenance: an intervention is an action the DASHBOARD's operator endpoints
+    journalled — they stamp `attributes.operator` with `<repo>:dashboard` and
+    mint `operator_*` kinds. A daemon's own relabel carries neither and is not
+    an intervention, however similar the sentence reads.
+    """
+    if not isinstance(event, Mapping) or event.get("event") != "action":
+        return None
+    action = event.get("action")
+    if not isinstance(action, Mapping):
+        return None
+    if (
+        _text(action.get("operator"))
+        or _text(action.get("type")).startswith("operator")
+        or _text(event.get("command_id")).startswith("operator-")
+    ):
+        return action
+    return None
+
+
+def classify_intervention(action, command_id="") -> str:
+    """One operator action → `rearm` | `policy` | `other`. Total, never raises."""
+    if not isinstance(action, Mapping):
+        return INTERVENTION_OTHER
+    kind = _text(action.get("type"))
+    if kind in _REARM_ACTION_KINDS or _text(command_id).startswith(
+        _REARM_COMMAND_PREFIXES
+    ):
+        return INTERVENTION_REARM
+    if kind == _RELABEL_ACTION_KIND:
+        added = _label_set(action.get("add"))
+        removed = _label_set(action.get("remove"))
+        if added & _POLICY_ADD_LABELS:
+            return INTERVENTION_POLICY
+        moved = added | removed
+        # A priority set/clear also removes the other two P labels, so the whole
+        # move stays inside the priority vocabulary.
+        if moved and moved <= _PRIORITY_LABELS:
+            return INTERVENTION_REARM
+    return INTERVENTION_OTHER
+
+
+def intervention_counts(rows, unattributed=()) -> tuple[tuple[str, int], ...]:
+    """Operator interventions per class, in `INTERVENTION_CLASSES` order.
+
+    Every class is present with an explicit zero: a missing key and a real zero
+    read identically in a dashboard tile, and the difference matters when the
+    question is "did anyone touch this deployment".
+    """
+    counts = dict.fromkeys(INTERVENTION_CLASSES, 0)
+    events = [event for row in rows for event in row.events]
+    events.extend(unattributed)
+    seen: set[str] = set()
+    for index, event in enumerate(events):
+        action = operator_action(event)
+        if action is None:
+            continue
+        # An action correlated to both an issue and a PR can be projected onto
+        # more than one row; the event id is what makes it one intervention.
+        identity = _text(event.get("event_id")) or f"position:{index}"
+        if identity in seen:
+            continue
+        seen.add(identity)
+        counts[classify_intervention(action, event.get("command_id"))] += 1
+    return tuple((name, counts[name]) for name in INTERVENTION_CLASSES)
+
+
+def interventions_line(metrics: Metrics) -> str:
+    """The one-line CLI readout. Pure so `issue-agent status` and the dashboard
+    cannot drift on how the same numbers are worded."""
+    by_class = dict(metrics.interventions_by_class)
+    ratio = metrics.interventions_per_merged_pr
+    return (
+        f"interventions: {metrics.interventions_total} ("
+        + ", ".join(f"{name} {by_class.get(name, 0)}" for name in INTERVENTION_CLASSES)
+        + ") — "
+        + (
+            f"{ratio:.1f} per merged PR"
+            if ratio is not None
+            else "no merged PRs yet"
+        )
+    )
+
+
 def build_metrics(
     rows,
     unattributed,
@@ -1197,6 +1373,7 @@ def build_metrics(
         spend_blocks=sum(row.spend_blocks for row in rows)
         + sum(1 for e in unattributed if e.get("event") == "spend_block"),
         today_usd=round(today_usd, 4) if today_usd is not None else None,
+        interventions_by_class=intervention_counts(rows, unattributed),
     )
 
 

@@ -877,6 +877,36 @@ def test_metrics_json_exposes_first_pass_rate_as_none_before_any_verdict():
     assert snapshots.metrics_json(metrics)["first_pass_rate"] is None
 
 
+def test_metrics_json_carries_the_intervention_split_and_ratio():
+    """The overview payload is the dashboard's only view of the metric, so the
+    per-class split has to survive serialisation, not just the total."""
+    unblock = {
+        "ts": ts(hours=1),
+        "event": "action",
+        "role": "fix",
+        "event_id": "op-1",
+        "command_id": "operator-unblock:1",
+        "desc": "operator unblock issue #7: -ai-blocked",
+        "action": {
+            "type": "operator_unblock",
+            "operator": "o/r:dashboard",
+            "add": [],
+            "remove": ["ai-blocked"],
+        },
+    }
+    metrics = dash.build_metrics(build([RESOLVE, unblock]).issues, (), 0.0)
+
+    payload = snapshots.metrics_json(metrics)
+
+    assert payload["interventions_total"] == 1
+    assert payload["interventions_by_class"] == [
+        {"name": "rearm", "count": 1},
+        {"name": "policy", "count": 0},
+        {"name": "other", "count": 0},
+    ]
+    assert payload["interventions_per_merged_pr"] is None  # nothing merged yet
+
+
 @pytest.mark.parametrize("events", [[], [{"garbage": True}], [{"ts": "not-a-date"}]])
 def test_a_deployment_with_no_usable_events_still_produces_a_payload(events):
     dep = build(events)

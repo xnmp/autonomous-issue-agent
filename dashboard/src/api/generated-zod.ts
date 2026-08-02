@@ -240,11 +240,20 @@ const HealthTrendDay = z
     recurrences: z.number().int(),
   })
   .passthrough();
+const InterventionCount = z
+  .object({ count: z.number().int(), name: z.string() })
+  .passthrough();
 const KindCost = z
   .object({ kind: z.string(), runs: z.number().int(), usd: z.number() })
   .passthrough();
 const Metrics = z
   .object({
+    interventions_by_class: z.array(InterventionCount).optional().default([]),
+    interventions_per_merged_pr: z
+      .union([z.number(), z.null()])
+      .optional()
+      .default(null),
+    interventions_total: z.number().int().optional().default(0),
     by_kind: z.array(KindCost),
     cost_per_done_usd: z.union([z.number(), z.null()]),
     done_issues: z.number().int(),
@@ -358,6 +367,7 @@ export const schemas = {
   Caps,
   CostMix,
   HealthTrendDay,
+  InterventionCount,
   KindCost,
   Metrics,
   SpendBucket,
