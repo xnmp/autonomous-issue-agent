@@ -904,6 +904,21 @@ def test_broker_rejects_non_effects_and_broad_or_protected_pushes(
 
 
 @pytest.mark.parametrize(
+    "flag", ("--force", "-f", "--force-with-lease", "--force-with-lease=x:y")
+)
+def test_force_flag_denial_teaches_the_flagless_recovery(tmp_path, flag):
+    # The generic "one concrete branch update only" refusal sent a rebased
+    # agent down a merge-commit dead end the commit-log gate then rejected
+    # (keifu #132, 2026-08-03). The force-flag denial must say the broker
+    # leases every push itself, so dropping the flag IS the recovery.
+    with pytest.raises(ValueError, match="drop the force flag"):
+        broker(tmp_path, Remote()).publish(
+            ("git", "push", flag, "origin", "HEAD:fix/42-issue"),
+            str(tmp_path),
+        )
+
+
+@pytest.mark.parametrize(
     "args",
     (
             (

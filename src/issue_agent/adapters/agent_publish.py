@@ -955,12 +955,20 @@ class AgentPublicationBroker:
             else "the remote history predates this deployment's publish "
             "receipts, so its provenance cannot be established"
         )
+        # The merge advice names an explicit -m: git's default "Merge
+        # remote-tracking branch ..." subject has no allowed prefix, so the
+        # commit-log gate rejects the very commit this message asks for
+        # (keifu #132, 2026-08-03 — the fence and the gate pointed the agent
+        # in circles until a human read both).
         raise ValueError(
             f"push refused: origin/{destination} is at {prior[:10]}, which is "
             f"not what this harness last published — {provenance}. Merge "
-            f"origin/{destination} into your branch (never rebase over "
-            "commits you have not incorporated) and push again — a "
-            "fast-forward is always accepted"
+            f"origin/{destination} into your branch with an explicit "
+            "prefixed message, e.g. `git merge --no-ff -m \"chore: "
+            f"incorporate published {destination} history\" "
+            f"origin/{destination}` (never rebase over commits you have not "
+            "incorporated), and push again — a fast-forward is always "
+            "accepted"
         )
 
     def _remote_branch(
@@ -1211,10 +1219,25 @@ def _push_spec(
         "--push-option",
         "--repo",
         "--no-verify",
-        "--force",
-        "-f",
-        "--force-with-lease",
     }
+    force_flags = {"--force", "-f", "--force-with-lease"}
+    if any(
+        arg in force_flags or arg.startswith("--force-with-lease=")
+        for arg in args
+    ):
+        # A distinct message: the generic refusal sent a rebased agent down a
+        # merge-commit dead end the commit-log gate then rejected (keifu #132,
+        # 2026-08-03 — a paid leg parked with a byte-identical correct tree on
+        # disk). The broker force-with-leases EVERY push itself from the tip
+        # it observed, so the recovery is to drop the flag, not escalate.
+        raise ValueError(
+            "drop the force flag and push again: the broker adds "
+            "--force-with-lease itself from the remote tip it observed, so a "
+            "plain `issue-agent-publish git push origin HEAD` IS the force "
+            "push. Your rewrite is accepted when origin's tip is the revision "
+            "this harness last published (your own history); a foreign tip "
+            "is refused either way."
+        )
     if any(
         arg in unsupported
         or arg.startswith(
@@ -1222,7 +1245,6 @@ def _push_spec(
                 "--receive-pack=",
                 "--exec=",
                 "--push-option=",
-                "--force-with-lease=",
             )
         )
         for arg in args
