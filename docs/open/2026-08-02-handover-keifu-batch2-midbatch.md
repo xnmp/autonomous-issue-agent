@@ -41,9 +41,18 @@ reclaims). The web dashboard (127.0.0.1:8321) and all monitors die too.
   startup-picker timeout, via the RESUME path; r1 REQUEST_CHANGES;
   address-review admission-rejected on the daily cap, breaker likely
   saturating).
-- ai-ready queue (no PR yet): #143, #159, #161, #162 (+ #18/#25 carry a
-  spurious extra ai-ready — see relabel race below; harmless to leave, the
-  serializer defers on their open PRs).
+- Queue (no PR yet) — ADJUSTED ~02:00Z as the daily cap bound everything:
+  #143/#162 de-queued by operator (ai-ready removed to stop $0 admission
+  rejections burning their retry counters — RE-ADD ai-ready once budget
+  headroom exists); #161 tripped to ai-blocked + needs-budget-review via the
+  resolve-family budget_actions (the CORRECT surface — narrows #155 to the
+  PR-side paths; re-arm by removing needs-budget-review + re-adding
+  ai-ready); #159 resolve leg outcome unknown at handover. #18/#25 carry a
+  spurious extra ai-ready — relabel race below; harmless, serializer defers.
+  #174 (approved) is red on Lint only — likely rustc/clippy DRIFT (keifu has
+  no rust-toolchain.toml; doctor's #33-class warning proven live); fix-ci
+  legs cap-blocked, ladder notched 3 on free rejections. Consider pinning
+  rust-toolchain.toml in keifu next batch.
 - needs-clarification (blocked on OPERATOR ANSWERS — they're addressed to
   @xnmp as issue author): #34, #124, #125, #126, #130, #132, #136, #142,
   #157 (+ new #172 filed by operator tonight, also questioned). Recommended
