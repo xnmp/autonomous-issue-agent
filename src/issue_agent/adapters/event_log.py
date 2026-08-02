@@ -76,30 +76,170 @@ class EventLogSegments:
         return (*self.rotations, *current)
 
 
+def _parse_event_lines(text: str) -> tuple[tuple[EventEnvelope, ...], int]:
+    """Decode whole lines, counting rather than raising on the undecodable ones."""
+
+    events: list[EventEnvelope] = []
+    malformed = 0
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        try:
+            raw = json.loads(line)
+            if not isinstance(raw, dict):
+                raise ValueError("event line is not an object")
+            events.append(decode_event(raw))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            malformed += 1
+    return tuple(events), malformed
+
+
 def read_event_log(path: str) -> EventReadResult:
     """Read the current feed and writer-generated rotations, skipping bad lines."""
 
-    current = Path(path)
-    candidates = EventLogSegments(current).paths
+    candidates = EventLogSegments(Path(path)).paths
     events: list[EventEnvelope] = []
     malformed = 0
     for candidate in candidates:
         try:
-            lines = candidate.read_text(encoding="utf-8").splitlines()
+            text = candidate.read_text(encoding="utf-8")
         except OSError:
             malformed += 1
             continue
-        for line in lines:
-            if not line.strip():
-                continue
-            try:
-                raw = json.loads(line)
-                if not isinstance(raw, dict):
-                    raise ValueError("event line is not an object")
-                events.append(decode_event(raw))
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-                malformed += 1
+        parsed, bad = _parse_event_lines(text)
+        events.extend(parsed)
+        malformed += bad
     return EventReadResult(tuple(events), malformed, len(candidates))
+
+
+# Leading bytes kept to recognise a segment rewritten in place. Raw rather than
+# hashed: comparing 256 bytes is cheaper than digesting them. This is a
+# secondary check only — file identity is `(st_dev, st_ino)`, because the head
+# alone is NOT sufficient. `_rotate_if_needed` replays the retained set into the
+# new file verbatim, so a feed with a long-lived open level opens its next
+# segment with a byte-identical first line.
+_HEAD_PROBE_BYTES = 256
+
+
+@dataclass(frozen=True)
+class _SegmentCache:
+    dev: int
+    ino: int
+    offset: int  # end of the last newline-terminated line parsed into `events`
+    head: bytes
+    events: tuple[EventEnvelope, ...]
+    malformed: int
+    # A feed can be observed mid-append, so the bytes after the last newline are
+    # parsed for this read but never committed to `events`/`offset` — the next
+    # read re-parses them once the line is complete, and no event is counted
+    # twice.
+    tail_events: tuple[EventEnvelope, ...]
+    tail_malformed: int
+
+
+class IncrementalEventLogReader:
+    """`read_event_log` that re-parses only what an append-only feed appended.
+
+    Cost per call is O(bytes appended) instead of O(entire history). Reading the
+    three role feeds from scratch every few seconds pinned a CPU core on the
+    dashboard (keifu, 2026-08-02) and grew without bound as the deployment ran.
+
+    Results equal what `read_event_log` returns for the same files. Only the
+    already-parsed prefix is reused, and only when the segment is still the same
+    inode with the same leading bytes; a rotation, a truncation, or a rewrite
+    re-reads in full. Every read reopens the segment and re-reads the bytes past
+    that prefix, because `(mtime, size)` cannot witness a change: `st_mtime_ns`
+    carries the kernel's coarse tick, so a same-size rewrite inside one tick is
+    invisible to it. What makes the prefix safe to keep is the schema-v2
+    append-only contract, not the timestamp.
+
+    Not thread-safe; the owning collector serialises its reads. It retains every
+    parsed envelope for every live segment for its lifetime — that retention is
+    the saving, and it is bounded by the writer's own rotation limits.
+    """
+
+    def __init__(self) -> None:
+        self._segments: dict[str, _SegmentCache] = {}
+        self._feeds: dict[str, frozenset[str]] = {}
+
+    def read(self, path: str) -> EventReadResult:
+        candidates = EventLogSegments(Path(path)).paths
+        events: list[EventEnvelope] = []
+        malformed = 0
+        for candidate in candidates:
+            entry = self._segment(candidate)
+            if entry is None:
+                malformed += 1  # `read_event_log`'s unreadable-segment count
+                continue
+            events.extend(entry.events)
+            events.extend(entry.tail_events)
+            malformed += entry.malformed + entry.tail_malformed
+        # Rotations are pruned by the writer; retaining their parses would make
+        # this cache the very unbounded thing it exists to remove. Eviction is
+        # scoped to the feed just read — one reader serves all three role feeds,
+        # and a global sweep here made each read evict the other two.
+        live = frozenset(str(candidate) for candidate in candidates)
+        for stale in self._feeds.get(path, frozenset()) - live:
+            self._segments.pop(stale, None)
+        self._feeds[path] = live
+        return EventReadResult(tuple(events), malformed, len(candidates))
+
+    def _segment(self, candidate: Path) -> _SegmentCache | None:
+        key = str(candidate)
+        cached = self._segments.get(key)
+        try:
+            with candidate.open("rb") as stream:
+                # `fstat` on the open handle, not `stat` on the path: it is the
+                # identity of the file actually being read, so a rotation
+                # landing between the two cannot be attributed to the wrong one.
+                entry = _read_segment(stream, cached, os.fstat(stream.fileno()))
+        except OSError:
+            self._segments.pop(key, None)
+            return None
+        self._segments[key] = entry
+        return entry
+
+
+def _read_segment(stream, cached: _SegmentCache | None, status) -> _SegmentCache:
+    head = stream.read(_HEAD_PROBE_BYTES)
+    appended_only = (
+        cached is not None
+        and (status.st_dev, status.st_ino) == (cached.dev, cached.ino)
+        # The committed prefix must still be there. A file shorter than it was
+        # but no shorter than the prefix is the writer's own
+        # `_truncate_incomplete_tail` discarding a killed append, which only
+        # ever cuts back to a newline at or after `offset` — that is a resume,
+        # not a rewrite.
+        and status.st_size >= cached.offset
+        and cached.head == head[: len(cached.head)]
+    )
+    start = cached.offset if appended_only and cached is not None else 0
+    stream.seek(start)
+    chunk = stream.read()
+    # A newline is never part of a multi-byte UTF-8 sequence, so cutting here
+    # decodes to exactly the text a whole-file read would have produced.
+    boundary = chunk.rfind(b"\n")
+    complete, partial = chunk[: boundary + 1], chunk[boundary + 1 :]
+    fresh, fresh_malformed = _parse_event_lines(complete.decode("utf-8"))
+    tail, tail_malformed = _parse_event_lines(partial.decode("utf-8"))
+    return _SegmentCache(
+        dev=status.st_dev,
+        ino=status.st_ino,
+        offset=start + len(complete),
+        head=head,
+        events=(
+            cached.events + fresh
+            if appended_only and cached is not None
+            else fresh
+        ),
+        malformed=(
+            cached.malformed + fresh_malformed
+            if appended_only and cached is not None
+            else fresh_malformed
+        ),
+        tail_events=tail,
+        tail_malformed=tail_malformed,
+    )
 
 
 @dataclass
