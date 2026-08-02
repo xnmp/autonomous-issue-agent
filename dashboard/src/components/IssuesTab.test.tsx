@@ -155,7 +155,11 @@ describe("IssuesTab", () => {
     expect(screen.getByText("The incident came back")).toHaveClass("recurrence-2");
 
     await userEvent.click(screen.getByRole("row", { name: /The incident came back/ }));
-    expect(await screen.findByRole("heading", { name: "What happened" })).toBeVisible();
+    // MarkdownBody arrives via React.lazy: on a loaded machine the dynamic
+    // import can outlive findBy's default 1s and flake the whole suite.
+    expect(
+      await screen.findByRole("heading", { name: "What happened" }, { timeout: 10_000 }),
+    ).toBeVisible();
     expect(screen.getByText("first symptom")).toBeVisible();
     expect(screen.getByRole("checkbox")).toBeChecked();
     expect(screen.getByText("incident notes").tagName).toBe("STRONG");

@@ -1028,12 +1028,14 @@ def test_max_infra_deaths_zero_is_a_valid_off_value():
     assert c.validation_errors() == ()
 
 
-def test_fix_dispatch_concurrency_defaults_dormant_and_can_be_activated():
-    assert from_env({"REPO": "x"}).fix_dispatch_concurrency == 1
+def test_fix_dispatch_concurrency_defaults_to_two_and_can_go_serial():
+    # Default 2 since 2026-08-02: one slot let a single ADDRESS_REVIEW leg
+    # hold the deployment while other PRs' repairs queued behind it.
+    assert from_env({"REPO": "x"}).fix_dispatch_concurrency == 2
     assert from_env({
         "REPO": "x",
-        "FIX_DISPATCH_CONCURRENCY": "2",
-    }).fix_dispatch_concurrency == 2
+        "FIX_DISPATCH_CONCURRENCY": "1",
+    }).fix_dispatch_concurrency == 1
 
 
 def test_fix_dispatch_concurrency_must_be_positive():

@@ -268,10 +268,13 @@ class HarnessConfig:
     # (60 here, "20" there) — from_env now reads its default off THIS field, so
     # there is exactly one source and 20 (the value that actually shipped) wins.
     poll_seconds: int = 20
-    # Paid fix legs run independently of observation. One preserves serial
-    # dispatch while retaining decoupled polling; values >1 admit disjoint work
-    # up to this bound. Review and steward dispatch remain synchronous.
-    fix_dispatch_concurrency: int = 1
+    # Paid fix legs run independently of observation; values >1 admit disjoint
+    # work up to this bound (the path-overlap serializer still keeps same-path
+    # and path-unknown legs exclusive). Default 2 since 2026-08-02: with one
+    # slot a single ADDRESS_REVIEW leg held the whole deployment while other
+    # PRs' repairs queued behind it. Review and steward dispatch remain
+    # synchronous. Set FIX_DISPATCH_CONCURRENCY=1 to restore serial dispatch.
+    fix_dispatch_concurrency: int = 2
     # Webhook push (#1): `gh webhook forward` runs as a supervised fourth
     # process and touches each role's wake file on every delivery. Deliveries
     # are WAKE SIGNALS ONLY — never acted on as payloads — so the stateless

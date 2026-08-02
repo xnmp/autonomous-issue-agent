@@ -394,6 +394,35 @@ button {
   opacity: 0.75;
   font-size: 0.85em;
 }
+/* Long histories compress into per-episode dots: colour is the episode's
+   outcome, hollow marks an operator intervention. Labels stay on the tail. */
+.step-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--ink-muted);
+}
+.step-dot-ok {
+  background: var(--ok);
+}
+.step-dot-fail {
+  background: var(--fail);
+}
+.step-dot-running {
+  background: var(--running);
+}
+.step-dot-meta {
+  background: var(--meta-br);
+}
+.step-dot-op {
+  background: transparent;
+  border: 1.5px solid var(--meta-br);
+}
+.step-elided {
+  font-size: 0.8em;
+  white-space: nowrap;
+}
 .col {
   display: flex;
   flex-direction: column;
