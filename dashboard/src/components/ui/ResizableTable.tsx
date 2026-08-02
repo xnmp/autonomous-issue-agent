@@ -29,6 +29,7 @@ export interface TableSort {
 
 const STORAGE_KEY = "issue-agent.dashboard.column-widths";
 const ORDER_STORAGE_KEY = "issue-agent.dashboard.column-order";
+const SORT_STORAGE_KEY = "issue-agent.dashboard.column-sort";
 export const MIN_COLUMN_WIDTH = 112;
 
 function storedWidths(key: string): Record<string, number> {
@@ -110,12 +111,53 @@ function compareValues(left: SortValue, right: SortValue): number {
   });
 }
 
+/**
+ * A remembered sort is only honoured when it still names a column this table
+ * can sort by: column sets change between releases, and a stale key would
+ * silently sort every row by `undefined` — an unsorted table that claims to be
+ * sorted. Anything unparseable falls back to the caller's initial sort.
+ */
+function storedSort(
+  id: string | undefined,
+  sortableKeys: readonly string[],
+  fallback: TableSort,
+): TableSort {
+  if (!id) return fallback;
+  try {
+    const all = JSON.parse(localStorage.getItem(SORT_STORAGE_KEY) ?? "{}") as Record<string, unknown>;
+    const saved = all[id] as { key?: unknown; direction?: unknown } | undefined;
+    if (!saved || typeof saved.key !== "string" || !sortableKeys.includes(saved.key)) {
+      return fallback;
+    }
+    return { key: saved.key, direction: saved.direction === "desc" ? "desc" : "asc" };
+  } catch {
+    return fallback;
+  }
+}
+
+function persistSort(id: string | undefined, sort: TableSort) {
+  if (!id) return;
+  try {
+    const all = JSON.parse(localStorage.getItem(SORT_STORAGE_KEY) ?? "{}") as Record<string, TableSort>;
+    localStorage.setItem(SORT_STORAGE_KEY, JSON.stringify({ ...all, [id]: sort }));
+  } catch {
+    // Sorting remains available for this session when storage is disabled.
+  }
+}
+
+/**
+ * `storageId` is the stable per-table identity (the same string the table
+ * passes as `storageKey`); omit it and the sort is session-only.
+ */
 export function useSortedRows<T>(
   rows: readonly T[],
   values: Record<string, (row: T) => SortValue>,
   initial: TableSort,
+  storageId?: string,
 ) {
-  const [sort, setSort] = useState<TableSort>(initial);
+  const [sort, setSort] = useState<TableSort>(
+    () => storedSort(storageId, Object.keys(values), initial),
+  );
   const sorted = useMemo(
     () => rows
       .map((row, index) => ({ row, index }))
@@ -127,12 +169,14 @@ export function useSortedRows<T>(
     [rows, sort, values],
   );
   const toggleSort = useCallback((key: string) => {
-    setSort((current) => (
-      current.key === key
+    setSort((current) => {
+      const next: TableSort = current.key === key
         ? { key, direction: current.direction === "asc" ? "desc" : "asc" }
-        : { key, direction: "asc" }
-    ));
-  }, []);
+        : { key, direction: "asc" };
+      persistSort(storageId, next);
+      return next;
+    });
+  }, [storageId]);
   return { rows: sorted, sort, onSort: toggleSort };
 }
 

@@ -125,6 +125,16 @@ export function localDate(ts: string | null | undefined): string {
   });
 }
 
+/** An hour bucket in the reader's own timezone: `Aug 02, 14:00`. */
+export function localHour(ts: string | null | undefined): string {
+  const ms = parseTs(ts);
+  if (ms === null) return DASH;
+  const at = new Date(ms);
+  const day = at.toLocaleDateString(undefined, { month: "short", day: "2-digit" });
+  const hour = String(at.getHours()).padStart(2, "0");
+  return `${day}, ${hour}:00`;
+}
+
 export function clockTime(ts: string | null | undefined): string {
   const ms = parseTs(ts);
   if (ms === null) return DASH;

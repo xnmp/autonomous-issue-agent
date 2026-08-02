@@ -126,7 +126,7 @@ export function IssueTab({
       + (step.usage?.output_tokens ?? 0)
     ),
     when: (step) => step.ts,
-  }, { key: "when", direction: "asc" });
+  }, { key: "when", direction: "asc" }, "issue-tasks");
 
   // The detail payload carries no `human_action`; a live issue that escalated,
   // blocked, or asked a question is exactly the set an unblock applies to.

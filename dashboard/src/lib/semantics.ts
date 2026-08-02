@@ -9,6 +9,7 @@
  */
 
 import type { CostMix, IssueFlag, RoleHealth, StepState } from "../api/types";
+import { isElevatedEffort } from "./models";
 
 export type Tone =
   | "ok" | "running" | "fail" | "info" | "meta" | "link" | "neutral"
@@ -120,6 +121,173 @@ export function prStateTone(state: string | null | undefined): Tone {
   return "neutral";
 }
 
+export interface ReviewMark {
+  glyph: string;
+  label: string;
+  tone: Tone;
+}
+
+/**
+ * Merge readiness as one glyph beside a PR number.
+ *
+ * `null` — the contract's answer whenever the PAT lacks the scope, review has
+ * not spoken, or mergeability is still computing — renders NOTHING. Claiming
+ * either verdict on absent data is the one wrong answer, so absence must not
+ * borrow the shape of a verdict.
+ */
+export function prReviewMark(state: string | null | undefined): ReviewMark | null {
+  if (state === "mergeable") {
+    return { glyph: "✓", label: "approved and mergeable", tone: "ok" };
+  }
+  if (state === "changes_requested") {
+    return { glyph: "±", label: "review requested changes", tone: "running" };
+  }
+  return null;
+}
+
+const VERIFICATION_GLYPH: Record<string, string> = {
+  verified: "✓",
+  misbehaved: "✕",
+  pending: "…",
+  retired: "⊘",
+};
+
+/** The icon-only form of a verification badge; the word stays in the title. */
+export function verificationGlyph(status: string | null | undefined): string {
+  return VERIFICATION_GLYPH[(status ?? "").toLowerCase()] ?? "•";
+}
+
+/**
+ * The badge's hover text: both ledger verdicts and, when the ledger recorded
+ * one, the prose that justifies each. A verdict with no reason still names
+ * itself rather than reading as missing data.
+ */
+export function verificationSummary(parts: {
+  issueStatus?: string | null;
+  issueReason?: string | null;
+  prStatus?: string | null;
+  prReason?: string | null;
+}): string {
+  const line = (
+    subject: string,
+    status: string | null | undefined,
+    reason: string | null | undefined,
+  ) => {
+    const verdict = status?.trim() || "unavailable";
+    const why = reason?.trim();
+    return why ? `${subject}: ${verdict} — ${why}` : `${subject}: ${verdict}`;
+  };
+  return [
+    line("Issue", parts.issueStatus, parts.issueReason),
+    line("PR", parts.prStatus, parts.prReason),
+  ].join("\n");
+}
+
+/* -------------------------------------------- backlog triage taxonomy ---
+ *
+ * Three orthogonal axes the steward writes as GitHub labels. ONE mapping,
+ * consumed by both the backlog columns and the label chips, so a row can never
+ * say two different things about the same value:
+ *
+ *   difficulty — what it costs us. trivial/low = ok (cheap), standard/medium =
+ *                running (attention), complex/high = fail (alarm: this is where
+ *                cost per merged PR goes wrong).
+ *   impact     — what it is worth. Ascending value, never severity:
+ *                low = neutral, medium = info, high = ok (worth doing).
+ *   type       — identity, not severity. bug = fail (something is broken),
+ *                enhancement = ok, feature = info, docs/refactor/chore/test =
+ *                meta (housekeeping).
+ *
+ * Every table is total: an unrecognised word tones neutral rather than
+ * guessing, because these values come from operator-authored labels.
+ * `enhancement` is a frontend rendering concern only — the steward taxonomy
+ * that mints the labels is untouched.
+ */
+
+const TYPE_TONES: Record<string, Tone> = {
+  bug: "fail",
+  defect: "fail",
+  regression: "fail",
+  incident: "fail",
+  enhancement: "ok",
+  improvement: "ok",
+  feature: "info",
+  question: "info",
+  docs: "meta",
+  documentation: "meta",
+  refactor: "meta",
+  chore: "meta",
+  test: "meta",
+  tests: "meta",
+};
+
+const DIFFICULTY_TONES: Record<string, Tone> = {
+  trivial: "ok",
+  easy: "ok",
+  low: "ok",
+  small: "ok",
+  standard: "running",
+  moderate: "running",
+  medium: "running",
+  complex: "fail",
+  hard: "fail",
+  high: "fail",
+  large: "fail",
+};
+
+const IMPACT_TONES: Record<string, Tone> = {
+  low: "neutral",
+  minor: "neutral",
+  medium: "info",
+  moderate: "info",
+  high: "ok",
+  major: "ok",
+  critical: "ok",
+};
+
+function lookupTone(table: Record<string, Tone>, value: string | null | undefined): Tone {
+  if (typeof value !== "string") return "neutral";
+  return table[value.trim().toLowerCase()] ?? "neutral";
+}
+
+export function issueTypeTone(value: string | null | undefined): Tone {
+  return lookupTone(TYPE_TONES, value);
+}
+
+export function difficultyTone(value: string | null | undefined): Tone {
+  return lookupTone(DIFFICULTY_TONES, value);
+}
+
+export function impactTone(value: string | null | undefined): Tone {
+  return lookupTone(IMPACT_TONES, value);
+}
+
+/** Prefixes the backend's `_label_value` reads, mirrored for the chip colour. */
+const LABEL_AXES: { prefixes: string[]; tone: (value: string) => Tone }[] = [
+  { prefixes: ["type:", "kind:"], tone: issueTypeTone },
+  { prefixes: ["difficulty:", "effort:"], tone: difficultyTone },
+  { prefixes: ["impact:"], tone: impactTone },
+];
+
+/**
+ * A raw GitHub label's tone. Labels that encode one of the triage axes take
+ * that axis's colour so the chip and the column agree; everything else stays
+ * neutral, which is what most labels are.
+ */
+export function labelTone(label: string): Tone {
+  const value = label.trim().toLowerCase();
+  for (const axis of LABEL_AXES) {
+    for (const prefix of axis.prefixes) {
+      if (value.startsWith(prefix) && value.length > prefix.length) {
+        return axis.tone(value.slice(prefix.length));
+      }
+    }
+  }
+  // Bare `bug` / `enhancement` / `feature` are the taxonomy without a prefix —
+  // the same shortcut the backend's `exact` set already honours.
+  return TYPE_TONES[value] ?? "neutral";
+}
+
 export function verificationTone(status: string | null | undefined): Tone {
   if (!status) return "neutral";
   const s = status.toUpperCase();
@@ -155,12 +323,17 @@ export function combinedVerificationStatus(
   return "pending";
 }
 
+/**
+ * A model badge's tone: **effort first, capability tier second.**
+ *
+ * Effort is the lever that costs money on any model — a `high` stance burns
+ * multiples of the tokens a `medium` one does whether it runs on haiku or on
+ * opus — so `tier-high` (the red end of the tier ramp) tracks the stance alone
+ * and is not gated on a premium name. Below `high`, the tone names the tier.
+ */
 export function modelTone(model: string, effort?: string | null): Tone {
   const name = model.toLowerCase();
-  const stance = (effort ?? "").toLowerCase();
-  const aboveMedium = ["high", "xhigh", "max", "ultra"].includes(stance);
-  const premium = name.includes("fable") || name.includes("opus") || name.includes("sol");
-  if (premium && aboveMedium) {
+  if (isElevatedEffort(effort)) {
     return "tier-high";
   }
   if (name.includes("fable") || name.includes("opus")) return "tier-sol";

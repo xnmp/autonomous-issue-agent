@@ -211,4 +211,94 @@ describe("ResizableTable", () => {
       "descending",
     );
   });
+
+  describe("remembered sort", () => {
+    function Fixture({ storageId }: { storageId?: string }) {
+      const sorted = useSortedRows(
+        [{ issue: 20 }, { issue: 3 }],
+        { issue: (row) => row.issue, cost: (row) => row.issue },
+        { key: "issue", direction: "asc" },
+        storageId,
+      );
+      return (
+        <ResizableTable
+          storageKey="persisted-sort"
+          columns={[
+            { key: "issue", label: "Issue", width: 180 },
+            { key: "cost", label: "Cost", width: 180 },
+          ]}
+          sort={sorted.sort}
+          onSort={sorted.onSort}
+        >
+          <tbody>
+            {sorted.rows.map((row) => <tr key={row.issue}><td>#{row.issue}</td><td>c</td></tr>)}
+          </tbody>
+        </ResizableTable>
+      );
+    }
+
+    const issueCells = () => screen
+      .getAllByRole("cell")
+      .map((cell) => cell.textContent)
+      .filter((text) => text?.startsWith("#"));
+
+    it("restores the operator's sort after navigating away and back", async () => {
+      const { unmount } = render(<Fixture storageId="remembered" />);
+      await userEvent.click(screen.getByRole("button", { name: "Sort by Issue" }));
+      expect(issueCells()).toEqual(["#20", "#3"]);
+      unmount();
+
+      render(<Fixture storageId="remembered" />);
+      expect(issueCells()).toEqual(["#20", "#3"]);
+      expect(screen.getByRole("columnheader", { name: /Issue/ })).toHaveAttribute(
+        "aria-sort",
+        "descending",
+      );
+    });
+
+    it("keeps each table's sort separate", async () => {
+      const { unmount } = render(<Fixture storageId="table-a" />);
+      await userEvent.click(screen.getByRole("button", { name: "Sort by Issue" }));
+      unmount();
+
+      render(<Fixture storageId="table-b" />);
+      expect(issueCells()).toEqual(["#3", "#20"]);
+    });
+
+    it("ignores a remembered column this table can no longer sort by", () => {
+      localStorage.setItem(
+        "issue-agent.dashboard.column-sort",
+        JSON.stringify({ retired: { key: "gone-in-a-refactor", direction: "desc" } }),
+      );
+
+      render(<Fixture storageId="retired" />);
+
+      expect(issueCells()).toEqual(["#3", "#20"]);
+      expect(screen.getByRole("columnheader", { name: /Issue/ })).toHaveAttribute(
+        "aria-sort",
+        "ascending",
+      );
+    });
+
+    it.each([
+      ["not json at all"],
+      [JSON.stringify({ garbled: "a string, not a sort" })],
+      [JSON.stringify({ garbled: { key: 7, direction: 3 } })],
+    ])("falls back to the initial sort for malformed storage (%s)", (stored) => {
+      localStorage.setItem("issue-agent.dashboard.column-sort", stored);
+
+      render(<Fixture storageId="garbled" />);
+
+      expect(issueCells()).toEqual(["#3", "#20"]);
+    });
+
+    it("stays session-only when the table declares no id", async () => {
+      const { unmount } = render(<Fixture />);
+      await userEvent.click(screen.getByRole("button", { name: "Sort by Issue" }));
+      unmount();
+
+      render(<Fixture />);
+      expect(issueCells()).toEqual(["#3", "#20"]);
+    });
+  });
 });

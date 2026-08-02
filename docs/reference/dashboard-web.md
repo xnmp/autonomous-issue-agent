@@ -371,6 +371,17 @@ index.html). If dist is missing, `/` returns a plain-HTML instruction page.
   blue = informational/queued, magenta = steward/meta, cyan = links/models.
   The self-repo sidebar entry gets a magenta left border + prominent
   `issue-agent` chip.
+- View state the operator sets by clicking is remembered in `localStorage`,
+  keyed per table/section, and every read is fault-tolerant: a disabled or full
+  store degrades to defaults, never to a broken view. Today that covers column
+  widths, order, visibility, sort (column + direction, ignored when the
+  remembered column no longer exists) and the Done section's icon-badge mode.
+- Backlog triage colours are one mapping in `lib/semantics.ts`, shared by the
+  type/difficulty/impact columns and the label chips: difficulty tones by what
+  it costs (trivial ok → complex fail), impact by what it is worth (low neutral
+  → high ok), type by identity (bug fail, enhancement ok, feature info,
+  housekeeping meta). Unknown values tone neutral. Frontend only — the steward's
+  label taxonomy is unchanged.
 - Every list renders an explicit empty state ("no issues in flight") — never a
   blank pane. Every gh-degraded view shows the "GitHub data unavailable" chip.
 - Status badges for steps: kind abbreviation (RES, REV, CI, ADR, REB, TRI) in

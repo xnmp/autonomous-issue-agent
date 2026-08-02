@@ -166,6 +166,79 @@ export function StackedBar({
   );
 }
 
+/* ----------------------------------------------------------- Histogram ---
+ * One series over evenly spaced, dense buckets (spend per hour). Per the
+ * dataviz mark spec: a shared baseline, no gridlines behind 48 thin bars, one
+ * fixed slot colour (a single series never cycles), and a value in every
+ * bucket's tooltip. Empty buckets render as a gap ON the baseline rather than
+ * as a hairline — the series is dense precisely so a quiet night cannot be
+ * re-spaced into a busy one, and a stub bar would read as a small charge.
+ */
+
+export interface HistogramBar {
+  key: string;
+  /** the bucket's own name — appears in its tooltip and on the axis */
+  label: string;
+  value: number;
+}
+
+export function Histogram({
+  bars,
+  formatValue = (v: number) => usd(v),
+  emptyText = "nothing recorded in this window",
+  varName = "--series-1",
+  unit = "",
+}: {
+  bars: HistogramBar[];
+  formatValue?: (v: number) => string;
+  emptyText?: string;
+  varName?: string;
+  /** appended to the bucket tooltip's subject, e.g. "spend" */
+  unit?: string;
+}) {
+  const max = bars.reduce((a, b) => Math.max(a, b.value), 0);
+  // An all-zero series has no shape to show; collapse to the empty line rather
+  // than drawing a flat baseline that looks like a broken chart.
+  if (!(max > 0)) return <div className="empty empty-inline">{emptyText}</div>;
+
+  const total = bars.reduce((a, b) => a + b.value, 0);
+  const peak = bars.reduce((best, b) => (b.value > best.value ? b : best), bars[0]!);
+  const subject = unit ? `${unit} ` : "";
+
+  return (
+    <div className="hist">
+      <div
+        className="hist-plot"
+        role="img"
+        aria-label={`${subject}across ${bars.length} buckets from ${bars[0]!.label} to ${bars[bars.length - 1]!.label}: ${formatValue(total)} in total, peaking at ${formatValue(peak.value)} in ${peak.label}`}
+      >
+        {bars.map((bar) => (
+          <div
+            key={bar.key}
+            className="hist-col"
+            title={`${bar.label} · ${formatValue(bar.value)}`}
+          >
+            {bar.value > 0 ? (
+              <div
+                className="hist-bar"
+                style={{
+                  height: `${(bar.value / max) * 100}%`,
+                  background: `var(${varName})`,
+                }}
+              />
+            ) : null}
+          </div>
+        ))}
+      </div>
+      <div className="hist-axis faint">
+        <span>{bars[0]!.label}</span>
+        <span className="hist-axis-peak num">peak {formatValue(max)}</span>
+        <span>{bars[bars.length - 1]!.label}</span>
+      </div>
+    </div>
+  );
+}
+
 /* -------------------------------------------------- Progress to an ETA ---
  * Elapsed-vs-projection for an in-flight issue, segmented by the leg families
  * that have run so far. Rendered ONLY when the projection is non-null (the
