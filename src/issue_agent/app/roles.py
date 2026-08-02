@@ -55,7 +55,7 @@ from ..domain.fix import (
     breaker_key,
     ci_flakes,
     CiStallStep,
-    ci_stall_remedies,
+    ci_remediations,
     decide_fix,
     duplicate_pr_guards,
     issue_holds,
@@ -1753,14 +1753,23 @@ def _ci_stall_reporter(
     seen: set[str] = set()
 
     def report(world, state: FixState) -> None:
-        for remedy in ci_stall_remedies(world, fix_cfg, state):
+        for remedy in ci_remediations(world, fix_cfg, state):
             stall = remedy.stall
-            checks = ", ".join(stall.checks) or "unnamed"
-            log(
-                f"CI STALL: PR #{stall.pr} has been pending {stall.seconds}s "
-                f"({checks}) \u2014 pending deadline breached; "
-                f"{remedy.step.value}: {remedy.detail}"
-            )
+            if stall.checks or stall.seconds:
+                checks = ", ".join(stall.checks) or "unnamed"
+                log(
+                    f"CI STALL: PR #{stall.pr} has been pending {stall.seconds}s "
+                    f"({checks}) \u2014 pending deadline breached; "
+                    f"{remedy.step.value}: {remedy.detail}"
+                )
+            else:
+                # The cancel-aftermath arm carries no pending clock and no
+                # pinning checks; reporting it as "pending 0s" would describe a
+                # state that never existed.
+                log(
+                    f"CI CANCEL AFTERMATH: PR #{stall.pr} ({stall.head[:7]}) "
+                    f"reads green after a cancel \u2014 {remedy.step.value}"
+                )
             # The STEP is part of the key: cancel, the wait it opens and the
             # escalation that bounds it are three distinct facts about one head,
             # and ADR 0012 wants the wait journalled \u2014 once, not every poll.

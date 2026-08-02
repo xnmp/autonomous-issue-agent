@@ -9,6 +9,7 @@ from issue_agent.adapters.control_store import (
 )
 from issue_agent.adapters.effects import (
     GitHubEffectExecutor,
+    action_from_command,
     StaleExpectedRevision,
     command_for_action,
 )
@@ -964,3 +965,34 @@ def test_a_cancel_without_run_identities_is_refused(tmp_path) -> None:
         executor.execute(CancelWorkflowRuns(7, "head-1", ()))
 
     assert gateway.calls == []
+
+
+def test_a_queued_cancel_is_not_re_minted_every_tick(tmp_path) -> None:
+    # Adversarial review N4: `_pending_for_action` finds a queued command by
+    # reconstructing its action and comparing for equality, so a field dropped
+    # in `action_from_command` makes the rebuilt action differ from the one
+    # being executed — and every tick enqueues ANOTHER command for the cancel
+    # already queued.
+    action = CancelWorkflowRuns(7, "head-1", (42,), "2026-08-02T12:00:00+00:00")
+    command = command_for_action(
+        action, repository="o/r", executor_identity="fix"
+    )
+
+    assert action_from_command(command) == action
+
+
+def test_every_cancel_field_survives_the_command_round_trip(tmp_path) -> None:
+    # Anti-vacuity for the test above: it must fail if a NEW field is added to
+    # the action and forgotten in the adapter, not merely for today's fields.
+    from dataclasses import fields as dataclass_fields
+
+    action = CancelWorkflowRuns(7, "head-1", (42, 43), "2026-08-02T12:00:00Z")
+    command = command_for_action(
+        action, repository="o/r", executor_identity="fix"
+    )
+    rebuilt = action_from_command(command)
+
+    for field in dataclass_fields(CancelWorkflowRuns):
+        assert getattr(rebuilt, field.name) == getattr(action, field.name), (
+            f"{field.name} was dropped in the command round trip"
+        )

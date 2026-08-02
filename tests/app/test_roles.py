@@ -1696,16 +1696,56 @@ def test_the_journal_agrees_with_the_cancel_it_explains(tmp_path):
     assert cancelled == {e["pr"] for e in _steps_in(journal)} == {144}
 
 
-def test_the_journal_agrees_with_the_escalation_it_explains(tmp_path):
+def _green_after_cancel_world(head="sha-aaa"):
+    """A PR whose cancelled run came back with nothing red — the aftermath arm.
+
+    Its pinning check is gone (the run was taken down) and what remains reads as
+    a pass, which is exactly the state `ci_cancel_green_illusions` refuses to
+    treat as evidence.
+    """
+    w = _stalled_world(head=head)
+    pr = w.prs[0]
+    return replace(
+        w,
+        prs=(
+            replace(
+                pr,
+                checks=(
+                    replace(
+                        pr.checks[0], state="COMPLETED", bucket="pass", run_id=4242
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "world_builder,state_builder",
+    [
+        (_stalled_world, lambda: _EMPTY_FIX_STATE),
+        (_green_after_cancel_world, _cancelled_state),
+    ],
+    ids=["pending-deadline", "cancel-aftermath"],
+)
+def test_the_journal_agrees_with_the_escalation_it_explains(
+    tmp_path, world_builder, state_builder
+):
     """The two halves read the SAME derivation, so a journaled stall is always a
     PR decide_fix escalates in that very poll — never a line about a PR nothing
-    acted on, nor an escalation with no record."""
+    acted on, nor an escalation with no record.
+
+    Parametrised over BOTH escalating arms (adversarial review N5): the cancel
+    aftermath used to escalate outside the reporter's view, and this test passed
+    only because its world had no cancel marker to reach that arm.
+    """
     journal = Journal(str(tmp_path / "journal.jsonl"))
-    w = _stalled_world()
-    _ci_stall_reporter(journal, "o/r", _STALL_CFG, lambda _m: None)(w, _EMPTY_FIX_STATE)
+    w = world_builder()
+    state = state_builder()
+    _ci_stall_reporter(journal, "o/r", _STALL_CFG, lambda _m: None)(w, state)
 
     escalated = {
-        a.pr for a in decide_fix(w, _STALL_CFG, _EMPTY_FIX_STATE, fixer_busy=False)
+        a.pr for a in decide_fix(w, _STALL_CFG, state, fixer_busy=False)
         if isinstance(a, EscalateCiPending)
     }
     assert escalated == {e["pr"] for e in _stalls_in(journal)} == {144}

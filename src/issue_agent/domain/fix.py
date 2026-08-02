@@ -1090,9 +1090,7 @@ def parse_cancel_marker(raw: str) -> tuple[str, str]:
     return head, decided_at if sep else ""
 
 
-def cancel_grace_breached(
-    stall: CiPendingStall, cfg: FixConfig, decided_at: str, now: str
-) -> bool:
+def cancel_grace_breached(cfg: FixConfig, decided_at: str, now: str) -> bool:
     """Whether a cancel already issued for this head has had long enough.
 
     The ADR 0012 ceiling on the await-cancel wait: the cancel gets ONE further
@@ -1105,12 +1103,17 @@ def cancel_grace_breached(
         return False
     since = parse_timestamp(decided_at)
     at = parse_timestamp(now)
-    if since is not None and at is not None:
-        return (at - since).total_seconds() >= cfg.ci_pending_max_seconds
-    # Undated (pre-upgrade) marker or unstamped world: the stall clock is the
-    # only bound available. It can be reset by a new pending check, so it is the
-    # fallback, never the primary.
-    return stall.seconds >= 2 * cfg.ci_pending_max_seconds
+    if since is None or at is None:
+        # An UNDATED marker cannot be waited on: the only other clock available
+        # is the stall clock, and that is precisely the one a cancel resets by
+        # letting follow-on jobs start — the S2 hole, kept alive in a fallback
+        # (adversarial review N2). So an undated marker means the grace is
+        # already gone: escalate rather than wait on a bound that may never
+        # arrive. Only pre-upgrade markers are undated; a cancel decided by this
+        # code always carries the poll clock, because a stall cannot be detected
+        # at all unless `world.now` parses.
+        return True
+    return (at - since).total_seconds() >= cfg.ci_pending_max_seconds
 
 
 class CiStallStep(str, Enum):
@@ -1232,7 +1235,7 @@ def ci_stall_remedies(
                 "loop."
             )
         elif cancelled_head == stall.head:
-            if cancel_grace_breached(stall, cfg, cancelled_at, world.now):
+            if cancel_grace_breached(cfg, cancelled_at, world.now):
                 step = CiStallStep.ESCALATE
                 detail = (
                     "The harness cancelled the stuck workflow run, but it was "
@@ -1278,6 +1281,13 @@ def ci_cancel_green_illusions(
     re-run is NOT allowed to read as green: it goes to a human, once, with the
     reason. The re-run spending its budget is what clears the marker's authority
     — after that the CI result is GitHub's again, not the harness's artefact.
+
+    Deliberately gated on the MARKER alone, not on `ci_pending_max_seconds` or
+    `ci_free_rerun` (adversarial review N3): those switches decide whether a
+    cancel may be ISSUED, and turning one off afterwards does not un-cancel a
+    run already taken down. A live marker means this harness cancelled this
+    head, and that stays true — and stays disqualifying — whatever the config
+    says next.
     """
 
     illusions: list[CiStallRemedy] = []
@@ -1304,15 +1314,39 @@ def ci_cancel_green_illusions(
                 CiStallStep.ESCALATE,
                 _issue_for_pr(pr) or 0,
                 (),
-                "The harness cancelled this commit's stuck workflow run and the "
-                "checks came back with nothing red — every job was skipped or "
-                "dropped rather than run, so this green is an artefact of the "
-                "cancellation, not evidence the code passes. Re-run CI before "
+                # Says ONLY what is known. The harness cannot tell a run whose
+                # jobs were skipped by the cancellation from one that finished
+                # green on its own (a cancel that never landed — the mint failed
+                # — leaves the same marker), so it must not assert the first:
+                # an escalation that explains itself wrongly sends the human
+                # looking in the wrong place (adversarial review N1).
+                "The harness requested cancellation of this commit's stuck "
+                "workflow run, and CI now reports nothing red. It cannot tell "
+                "whether those checks actually ran or were skipped by the "
+                "cancellation, so this green is unverified — re-run CI before "
                 "merging.",
                 world.now,
             )
         )
     return tuple(illusions)
+
+
+def ci_remediations(
+    world: WorldState, cfg: FixConfig, state: FixState
+) -> tuple[CiStallRemedy, ...]:
+    """Every CI-remediation step this poll: wedged heads, then cancel aftermath.
+
+    THE single derivation both halves read. `decide_fix` emits exactly this and
+    the wiring journals exactly this, so an escalation can never happen without
+    a record explaining it (adversarial review N5 — the aftermath arm escalated
+    outside the reporter's view, which is the failure
+    `test_the_journal_agrees_with_the_escalation_it_explains` exists to forbid).
+    """
+
+    return (
+        *ci_stall_remedies(world, cfg, state),
+        *ci_cancel_green_illusions(world, cfg, state),
+    )
 
 
 # ── flake-aware CI repair (#38) ──────────────────────────────────────────────
@@ -1503,10 +1537,7 @@ def decide_fix(
     # existing free re-run (#38) picks it up once GitHub reports the run
     # complete. Cancel, wait and escalate all remove the PR from `open_prs` —
     # while the harness is unwedging CI, no repair leg may be dispatched at it.
-    for remedy in (
-        *ci_stall_remedies(world, cfg, state),
-        *ci_cancel_green_illusions(world, cfg, state),
-    ):
+    for remedy in ci_remediations(world, cfg, state):
         action = remedy.action()
         if action is not None:
             actions.append(action)

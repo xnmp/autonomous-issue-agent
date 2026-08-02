@@ -1136,6 +1136,12 @@ def action_from_command(command: LifecycleCommand) -> Action:
             int(payload["pr"]),
             str(payload["head"]),
             tuple(int(run_id) for run_id in payload.get("run_ids", ())),
+            # Round-trip EVERY field the action carries. `_pending_for_action`
+            # matches a queued command by reconstructing it and comparing for
+            # equality, so a dropped field makes the rebuilt action differ from
+            # the one being executed — and the tick mints a SECOND command for
+            # the cancel already queued, every tick (adversarial review N4).
+            str(payload.get("decided_at", "") or ""),
         )
     if command.kind is CommandKind.ADD_DEPENDENCY:
         return AddDependency(int(payload["issue"]), int(payload["blocker"]))

@@ -32,6 +32,7 @@ from issue_agent.domain.fix import (
     breaker_key,
     ci_flakes,
     ci_pending_stalls,
+    ci_remediations,
     ci_stall_remedies,
     cleanup_actions,
     decide_fix,
@@ -2131,15 +2132,26 @@ def test_the_wait_is_bounded_even_when_new_jobs_keep_resetting_the_stall_clock()
     assert [a.pr for a in actions if isinstance(a, EscalateCiPending)] == [100]
 
 
-def test_an_undated_legacy_marker_still_terminates_on_the_stall_clock():
-    # Markers written before the cancel carried a timestamp are bare SHAs. They
-    # must keep converging on the weaker bound rather than wait forever.
+def test_an_undated_legacy_marker_escalates_rather_than_waiting_on_no_clock():
+    # Markers written before the cancel carried a timestamp are bare SHAs, so
+    # there is NO clock to bound their wait — the stall clock is the very one a
+    # cancel resets. Waiting on it kept the S2 hole alive in a fallback
+    # (adversarial review N2), so an undated marker is grace-spent on sight.
+    # The clock here RESETS (a follow-on job starts late), which is precisely
+    # the shape the old fallback never terminated on.
     state = FixState(ci_cancel_head={100: "sha-aaa"})
-    w = world(prs=[_wedged_run_pr()], now=_stall_now(7200))
+    follow_on = pr(
+        100, "ai-pr-open", state="OPEN", head_ref_name="fix/5-x",
+        head_ref_oid="sha-aaa",
+        checks=(Check("late-job", state="IN_PROGRESS",
+                      started_at=_stall_now(100_000), run_id=78),),
+    )
+    w = world(prs=[follow_on], now=_stall_now(103_601))
 
     actions = decide_fix(w, CFG, state, fixer_busy=False)
 
     assert [a.pr for a in actions if isinstance(a, EscalateCiPending)] == [100]
+    assert _cancels(actions) == []
 
 
 def test_disabling_free_re_runs_disables_the_cancel_that_feeds_them():
@@ -2231,7 +2243,11 @@ def test_a_cancelled_run_that_comes_back_green_is_never_treated_as_evidence():
 
     assert not any(isinstance(a, EnableAutoMerge) for a in actions)
     escalations = [a for a in actions if isinstance(a, EscalateCiPending)]
-    assert escalations and "artefact of the cancellation" in escalations[0].body
+    assert escalations and "unverified" in escalations[0].body
+    # It must NOT assert why the checks are green: a cancel that never landed
+    # leaves the same marker, and the run may simply have finished on its own.
+    body = escalations[0].body
+    assert "every job was skipped" not in body and "artefact" not in body
 
 
 def test_a_green_head_the_harness_never_cancelled_is_untouched():
@@ -2292,11 +2308,24 @@ def test_the_green_illusion_escalation_is_one_shot():
     assert not any(isinstance(a, EscalateCiPending) for a in actions)
 
 
+def test_the_cancel_action_carries_everything_its_command_must_round_trip():
+    # Guards adversarial review N4 from the domain side: every field the action
+    # carries has to survive `command_for_action`/`action_from_command`, or the
+    # executor mints a duplicate command per tick. This pins the field set so a
+    # new field cannot be added without the adapter noticing.
+    w = world(prs=[_wedged_run_pr()], now=_stall_now(3601))
+    cancel = _cancels(decide_fix(w, CFG, FixState(), fixer_busy=False))[0]
+
+    assert (cancel.pr, cancel.head, cancel.run_ids, cancel.decided_at) == (
+        100, "sha-aaa", (77,), _stall_now(3601)
+    )
+
+
 def test_remedies_are_the_values_the_decision_acts_on():
     # The journal reads this derivation and the decision emits it, so the two
     # can never disagree about what happened to a stalled head.
     w = world(prs=[_wedged_run_pr()], now=_stall_now(3601))
-    remedies = ci_stall_remedies(w, CFG, FixState())
+    remedies = ci_remediations(w, CFG, FixState())
     assert [r.action() for r in remedies] == _cancels(
         decide_fix(w, CFG, FixState(), fixer_busy=False)
     )
