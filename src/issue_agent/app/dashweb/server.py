@@ -245,6 +245,22 @@ def create_app(
         return JSONResponse({"ok": ok, "detail": detail}, status_code=200 if ok else 400)
 
     @app.post(
+        "/api/repos/{name}/issues/{number}/unblock",
+        response_model=contracts.ActionResult,
+    )
+    async def api_unblock(name: str, number: int):
+        if number < 1:
+            raise HTTPException(400, "issue number must be positive")
+        # Unlike the other actions this one reads (snapshot + GitHub) before it
+        # writes, so it has collector failure modes: report them as a refused
+        # action, never as a 500 the operator cannot read.
+        try:
+            ok, detail = await invoke(backend.unblock, name, number)
+        except Exception as exc:  # noqa: BLE001
+            ok, detail = False, f"unblock unavailable ({type(exc).__name__}: {exc})"
+        return JSONResponse({"ok": ok, "detail": detail}, status_code=200 if ok else 400)
+
+    @app.post(
         "/api/repos/{name}/issues/{number}/priority",
         response_model=contracts.ActionResult,
     )

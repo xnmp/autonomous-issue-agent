@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 import os
+import uuid
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ...adapters.dashweb import actions, costchart, ghdata, system, usage, verification
+from ...adapters.event_log import EventLog
 from ...adapters.journal import default_ledger_path
 from ...adapters.operator_effects import build_operator_effects
+from ...adapters.store import Store
+from ...adapters.typed_journal import TypedJournal
 from ...domain import dashboard as dash
+from ...domain.events import (
+    ActionApplied,
+    Correlation,
+    Producer,
+    TelemetryEvent,
+)
 from .. import cli
 from . import snapshots
 
@@ -44,6 +54,7 @@ class Backend:
         self._self_repo = system.remote_repo(self.harness_root)
         self.effects_factory = effects_factory
         self.control_db_path = control_db_path
+        self._journals: dict[str, TypedJournal | None] = {}
 
     # ── journal side ──
     def names(self) -> tuple[str, ...]:
@@ -347,7 +358,138 @@ class Backend:
             remove=remove,
         )
 
-    def _operator_effects(self, name: str, repo: str):
+    def unblock(self, name: str, number: int) -> tuple[bool, str]:
+        """Undo a hold a human is expected to clear: drop the labels that stop
+        re-dispatch and hand back the retry budget the wedge consumed. Nothing
+        is added — `decide()` re-derives the next lifecycle label itself.
+
+        Refused unless the issue is actually held. Resetting breakers is not a
+        neutral act: on a healthy issue it would silently buy retries nobody
+        asked for, so "nothing to unblock" must cost nothing.
+        """
+        if not self.known(name):
+            return False, f"unknown deployment '{name}'"
+        repo = self.overlay_field(name, "REPO")
+        if not repo:
+            return False, f"no REPO configured for deployment '{name}'"
+        held, unreadable = self._attention_labels(name, repo, number)
+        if unreadable:
+            return False, unreadable
+        if not held:
+            return False, f"nothing to unblock on #{number}"
+        add, remove = actions.unblock_change()
+        # Counters first: a cleared counter with the labels still on holds the
+        # issue exactly as before, while the reverse order would re-admit it
+        # against a breaker that is still tripped.
+        cleared = self._clear_retry_counters(name, number)
+        # Unjournalled effects: this flow writes its own single event below,
+        # because the counter reset happened whatever GitHub then did with the
+        # labels — including the no-op path, which emits nothing of its own.
+        effects = self._operator_effects(name, repo, journalled=False)
+        applied, detail = effects.set_issue_labels(number, add=add, remove=remove)
+        self._journal_unblock(name, repo, number, held, cleared, applied)
+        return applied, detail
+
+    def _attention_labels(
+        self, name: str, repo: str, number: int
+    ) -> tuple[tuple[str, ...], str]:
+        """The labels currently holding this issue (or its PRs) on a human, and
+        a detail when they cannot be read at all.
+
+        A failed read is refused rather than assumed empty: the mutation below
+        would fail on the same unreachable GitHub anyway, and guessing "not
+        held" here is the one guess that costs breaker state.
+        """
+        try:
+            gh_issues, gh_prs, warnings = self._gh_context(repo)
+        except Exception as exc:  # noqa: BLE001 - operator-facing result
+            return (), f"could not read labels for #{number}: {exc}"
+        issue = gh_issues.get(number)
+        if issue is None:
+            return (), (
+                warnings[0] if warnings
+                else f"issue #{number} is not open on {repo}"
+            )
+        labels = set(snapshots.labels_of(issue))
+        for pr in self._issue_prs(name, number):
+            labels.update(snapshots.labels_of(gh_prs.get(pr) or {}))
+        return tuple(
+            label for label in actions.UNBLOCK_LABELS if label in labels
+        ), ""
+
+    def _journal_unblock(
+        self,
+        name: str,
+        repo: str,
+        number: int,
+        held: tuple[str, ...],
+        cleared: int,
+        applied: bool,
+    ) -> None:
+        journal = self._operator_journal(name, repo)
+        if journal is None:
+            return
+        try:
+            journal.emit(
+                TelemetryEvent(
+                    ActionApplied(
+                        f"operator-unblock:{uuid.uuid4().hex}",
+                        "operator_unblock",
+                        "issue",
+                        f"operator unblock issue #{number}: "
+                        + " ".join(f"-{label}" for label in held),
+                        number,
+                        {
+                            "add": [],
+                            "remove": list(held),
+                            "operator": f"{repo}:dashboard",
+                            "retries_cleared": cleared,
+                            "labels_applied": applied,
+                        },
+                    ),
+                    Correlation(issue=number),
+                )
+            )
+        except Exception:  # noqa: BLE001 - telemetry never fails the action
+            pass
+
+    def _clear_retry_counters(self, name: str, number: int) -> int:
+        """Reset the per-attempt ceilings in every role's state dir.
+
+        The operator cannot be asked which role wedged: ci-/rebase-retries are
+        the fix role's, review-retries the review role's. The review role's
+        infra-death ceiling is cleared too — a dead-session loop is precisely
+        what an unblock answers — for the issue and for the negated PR keys
+        (`issue--<pr>.infra-deaths`) `domain.fix.breaker_key` uses when a PR has
+        no resolvable issue. `Store.clear_retries` itself keeps infra-deaths,
+        since no automatic path may reset that ceiling.
+
+        Returns how many counters were actually retired, so the journalled
+        event reports what happened rather than what was attempted.
+        """
+        prs = self._issue_prs(name, number)
+        keys = [number, *(-pr for pr in prs if pr > 0)]
+        cleared = 0
+        for role, path in zip(dash.ROLE_NAMES, cli.journal_paths(name)):
+            state_dir = os.path.dirname(path)
+            if not state_dir:
+                continue
+            store = Store(state_dir)
+            for key in keys:
+                cleared += store.clear_retries(key)
+                if role == "review":
+                    cleared += os.path.exists(store.issue_path(key, "infra-deaths"))
+                    store.clear_infra_deaths(key)
+        return cleared
+
+    def _issue_prs(self, name: str, number: int) -> list[int]:
+        try:
+            row = snapshots.find_row(self.snapshot(name), number)
+        except OSError:
+            return []
+        return list(row.prs) if row is not None else []
+
+    def _operator_effects(self, name: str, repo: str, *, journalled: bool = True):
         state_dirs = tuple(
             self.overlay_field(name, field)
             for field in ("STATE_DIR", "REVIEW_STATE_DIR", "STEWARD_STATE_DIR")
@@ -356,7 +498,47 @@ class Backend:
             repo,
             state_dirs,
             identity=f"{repo}:dashboard",
+            journal=self._operator_journal(name, repo) if journalled else None,
         )
+
+    def _operator_journal(self, name: str, repo: str) -> TypedJournal | None:
+        """Where an operator intervention becomes visible to the fold.
+
+        It is written to the fix role's canonical feed because the dashboard
+        reads only the three role feeds — an event anywhere else does not
+        exist. The producer identity is the dashboard's own and never a
+        daemon's: role liveness and the world projection are per-feed, and an
+        operator click must not stand in for either.
+
+        Cached for the process's lifetime: opening an `EventLog` re-reads the
+        whole feed to restore its projection state, under the writer lock the
+        daemons append through, so building one per request would stall a live
+        fix loop on a mature deployment. The log is append-only, so a cached
+        one can never go stale.
+        """
+        if not repo:
+            return None
+        if name in self._journals:
+            return self._journals[name]
+        legacy = cli.journal_paths(name)[0]
+        journal: TypedJournal | None = None
+        try:
+            events = EventLog(
+                os.path.join(os.path.dirname(legacy), "events-v2.jsonl"),
+                Producer(
+                    f"dashboard:{name}",
+                    repo,
+                    "dashboard",
+                    os.getpid(),
+                    uuid.uuid4().hex,
+                ),
+            )
+        except (OSError, ValueError):
+            journal = None  # telemetry never blocks the mutation
+        else:
+            journal = TypedJournal(legacy, events)
+        self._journals[name] = journal
+        return journal
 
 
 def _github_enrichment(value: dict) -> dict:

@@ -2,13 +2,22 @@ import { useMemo, useState, type KeyboardEvent, type MouseEvent } from "react";
 import { api } from "../api/client";
 import { usePolled, useLiveElapsed } from "../api/hooks";
 import type { IssueStep } from "../api/types";
-import { kindLabel, modelTone, prStateTone, stateTone, stageTone, statusTone } from "../lib/semantics";
+import {
+  kindLabel,
+  modelTone,
+  prStateTone,
+  stateTone,
+  stageTone,
+  statusTone,
+  stepKindTone,
+} from "../lib/semantics";
 import { duration, localTime, num, tokens, usd } from "../lib/format";
 import { shortModel } from "../lib/models";
 import { Chip } from "./ui/Chip";
 import { JsonBlock } from "./ui/Json";
 import { EmptyState, ErrorBanner, Loading, SkeletonRows, WarningList } from "./ui/Feedback";
 import { EventTimeline } from "./EventTimeline";
+import { UnblockModal } from "./UnblockModal";
 import { ColumnMenu, type ColumnChoice } from "./ui/ColumnMenu";
 import {
   ResizableTable,
@@ -60,6 +69,9 @@ export function IssueTab({
     POLL_MS,
   );
   const [openStep, setOpenStep] = useState<number | null>(null);
+  const [confirmUnblock, setConfirmUnblock] = useState(false);
+  const [unblocking, setUnblocking] = useState(false);
+  const [unblockError, setUnblockError] = useState<string | null>(null);
   const [pane, setPane] = useState<"tasks" | "events">("tasks");
   const [columnVisibility, setColumnVisibility] = useState(storedIssueColumns);
   const [columnMenuAt, setColumnMenuAt] = useState<{ x: number; y: number } | null>(null);
@@ -116,6 +128,28 @@ export function IssueTab({
     when: (step) => step.ts,
   }, { key: "when", direction: "asc" });
 
+  // The detail payload carries no `human_action`; a live issue that escalated,
+  // blocked, or asked a question is exactly the set an unblock applies to.
+  const heldForHuman = !!d && !d.done && (
+    !!d.escalation_reason
+    || d.stage === "blocked"
+    || d.stage === "escalated"
+    || d.stage === "awaiting human reply"
+  );
+  const doUnblock = async () => {
+    setUnblocking(true);
+    setUnblockError(null);
+    try {
+      await api.unblock(repo, issue);
+      setConfirmUnblock(false);
+      detail.refresh();
+    } catch (caught) {
+      setUnblockError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setUnblocking(false);
+    }
+  };
+
   return (
     <div className="tabbody" onContextMenu={openColumnMenu}>
       {detail.error ? (
@@ -143,6 +177,17 @@ export function IssueTab({
             <div className="issue-hd-line issue-hd-meta">
               {d.stage === "awaiting human reply" && d.attention_reason ? (
                 <span className="issue-attention">{d.attention_reason}</span>
+              ) : null}
+              {heldForHuman ? (
+                <button
+                  className="btn btn-xs"
+                  onClick={() => {
+                    setUnblockError(null);
+                    setConfirmUnblock(true);
+                  }}
+                >
+                  Unblock
+                </button>
               ) : null}
               {d.pull_requests.map((pr) =>
                 pr.url ? (
@@ -182,6 +227,16 @@ export function IssueTab({
               </span>
             </div>
           </header>
+
+          {d.escalation_reason ? (
+            <div className="banner banner-error" role="status">
+              <span className="banner-mark" aria-hidden="true">!</span>
+              <span className="banner-msg">
+                <strong>Escalated to a human.</strong> {d.escalation_reason}
+              </span>
+            </div>
+          ) : null}
+          {unblockError ? <ErrorBanner message={unblockError} /> : null}
 
           <div className="subtabs issue-section-tabs" role="tablist" aria-label="Issue detail">
             {(["tasks", "events"] as const).map((option) => (
@@ -269,6 +324,16 @@ export function IssueTab({
               <EventTimeline events={d.events} emptyText="no journal events for this issue" />
             </div>
           ) : null}
+
+          {confirmUnblock ? (
+            <UnblockModal
+              issue={issue}
+              busy={unblocking}
+              error={unblockError}
+              onConfirm={() => void doUnblock()}
+              onCancel={() => setConfirmUnblock(false)}
+            />
+          ) : null}
         </>
       ) : null}
     </div>
@@ -310,7 +375,12 @@ function StepRow({
             <span className={`chev${open ? " open" : ""}`} aria-hidden="true">
               ▸
             </span>
-            <Chip tone={tone} square pulse={step.state === "running"} title={step.kind}>
+            <Chip
+              tone={stepKindTone(step.kind, step.state)}
+              square
+              pulse={step.state === "running"}
+              title={step.kind}
+            >
               {kindLabel(step.kind)}
             </Chip>
           </button>
@@ -360,6 +430,15 @@ function StepRow({
           {localTime(step.ts)}
         </td> : null}
       </tr>
+      {/* The note is why this task mattered — a verdict, a question, a failure
+        * reason. It gets a line of its own so no column width can hide it. */}
+      {step.note ? (
+        <tr className={`step-note-row tone-border-${tone}`}>
+          <td colSpan={colSpan}>
+            <span className="task-note">{step.note}</span>
+          </td>
+        </tr>
+      ) : null}
       {open ? (
         <tr className="detail-row">
           <td colSpan={colSpan}>

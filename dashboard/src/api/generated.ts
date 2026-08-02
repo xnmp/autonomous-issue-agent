@@ -123,6 +123,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/repos/{name}/issues/{number}/unblock": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Api Unblock */
+        post: operations["api_unblock_api_repos__name__issues__number__unblock_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/repos/{name}/overview": {
         parameters: {
             query?: never;
@@ -381,6 +398,8 @@ export interface components {
             done: boolean;
             /** Elapsed S */
             elapsed_s: number | null;
+            /** Escalation Reason */
+            escalation_reason?: string | null;
             /** Estimated */
             estimated: boolean;
             /** Flags */
@@ -451,6 +470,8 @@ export interface components {
             done: boolean;
             /** Elapsed S */
             elapsed_s: number | null;
+            /** Escalation Reason */
+            escalation_reason?: string | null;
             /** Events */
             events: {
                 [key: string]: unknown;
@@ -500,6 +521,8 @@ export interface components {
             kind: string;
             /** Model */
             model: string | null;
+            /** Note */
+            note?: string | null;
             /** Role */
             role: string | null;
             /** Session Id */
@@ -1005,6 +1028,38 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["StepEventsPayload"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    api_unblock_api_repos__name__issues__number__unblock_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ActionResult"];
                 };
             };
             /** @description Validation Error */

@@ -65,6 +65,26 @@ export function stateTone(state: StepState | null | undefined): Tone {
   }
 }
 
+/**
+ * Steps the operator performed, not the harness: they cost nothing and are
+ * named in prose by the backend (`unblock`, `relabel (operator)`). They read as
+ * `meta` — the same tone the contract already reserves for steward/self work —
+ * so a human intervention is never mistaken for an agent leg.
+ */
+export const OPERATOR_STEP_KINDS = new Set(["unblock", "relabel (operator)"]);
+
+export function isOperatorStep(kind: string): boolean {
+  return OPERATOR_STEP_KINDS.has(kind.toLowerCase());
+}
+
+/** A step's chip tone: who ran it first, then how it ended. */
+export function stepKindTone(
+  kind: string,
+  state: StepState | null | undefined,
+): Tone {
+  return isOperatorStep(kind) ? "meta" : stateTone(state);
+}
+
 /** `stage_for` is a heuristic string; classify it rather than enumerate it. */
 export function stageTone(stage: string | null | undefined): Tone {
   if (!stage) return "neutral";

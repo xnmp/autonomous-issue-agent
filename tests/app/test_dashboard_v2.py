@@ -1012,3 +1012,66 @@ def test_v2_health_rejects_stopped_heartbeat_and_terminal_state(
 
     fix_health = next(item for item in deployment.health if item.role == "fix")
     assert fix_health.stale is True
+
+
+def test_a_dashboard_operator_action_reads_as_a_step_not_as_daemon_liveness(
+    tmp_path,
+) -> None:
+    """The dashboard appends its interventions to the fix role's feed — the
+    only feed the reader looks at — but it is not the fix daemon: an operator
+    click must show up as a step without making a dead daemon look alive."""
+    from issue_agent.domain.events import ActionApplied
+
+    state = tmp_path / "fix"
+    state.mkdir()
+    old = NOW - timedelta(hours=2)
+    daemon = EventLog(
+        str(state / "events-v2.jsonl"),
+        Producer("deployment", "owner/repo", "fix", 100, "boot"),
+    )
+    daemon.emit(
+        WorldObserved(
+            "issue", 7, "present", {"present": True, "state": "open"}
+        ),
+        correlation=Correlation(issue=7),
+        causation_time=old,
+    )
+    operator = EventLog(
+        str(state / "events-v2.jsonl"),
+        Producer("dashboard:demo", "owner/repo", "dashboard", 101, "boot"),
+    )
+    operator.emit(
+        ActionApplied(
+            "command-1",
+            "operator_unblock",
+            "issue",
+            "operator unblock issue #7: -needs-human-review",
+            7,
+            {"add": [], "remove": ["needs-human-review"], "retries_cleared": True},
+        ),
+        correlation=Correlation(issue=7),
+    )
+
+    deployment = collect(
+        "demo",
+        "owner/repo",
+        (
+            str(state / "journal.jsonl"),
+            str(tmp_path / "review" / "journal.jsonl"),
+            str(tmp_path / "steward" / "journal.jsonl"),
+        ),
+        str(tmp_path / "logs"),
+        str(tmp_path / "spend.jsonl"),
+        now_fn=lambda: NOW,
+        stale_after_s=60,
+    )
+
+    fix_health = next(item for item in deployment.health if item.role == "fix")
+    assert fix_health.stale is True
+    assert fix_health.last_ts == old
+
+    row = next(item for item in deployment.issues if item.issue == 7)
+    step = snapshots.detailed_steps(row)[-1]
+    assert step["kind"] == "unblock"
+    assert step["cost_usd"] == 0.0
+    assert step["note"] == "removed needs-human-review; reset retry counters"

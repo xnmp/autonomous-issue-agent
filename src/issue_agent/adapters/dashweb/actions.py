@@ -16,6 +16,9 @@ import subprocess
 PRIORITY_LABELS = ("P1", "P2", "P3")
 # Neutral-to-hot, so P1 reads as the urgent one in the GitHub UI too.
 PRIORITY_COLORS = {"P1": "b60205", "P2": "d93f0b", "P3": "fbca04"}
+# The three labels that hold an issue on a human. Removing all of them is what
+# "unblock" means; nothing else is added, so the daemons re-derive the stage.
+UNBLOCK_LABELS = ("needs-human-review", "needs-budget-review", "ai-blocked")
 
 
 def start_command(harness_root: str, name: str) -> list[str]:
@@ -43,6 +46,15 @@ def priority_change(priority: str | None) -> tuple[tuple[str, ...], tuple[str, .
     added = (priority,) if priority else ()
     removed = tuple(label for label in PRIORITY_LABELS if label != priority)
     return added, removed
+
+
+def unblock_change() -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The atomic label intent of an operator unblock.
+
+    Removal only: which lifecycle label the issue takes next is `decide()`'s
+    call, and adding one here would race the daemon's own re-derivation.
+    """
+    return (), UNBLOCK_LABELS
 
 
 def launch_detached(argv: list[str], log_path: str) -> tuple[bool, str]:

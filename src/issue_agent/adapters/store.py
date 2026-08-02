@@ -60,6 +60,11 @@ _PR_SUFFIXES = (
 # not participate in the "exactly one cleaner" coverage test above.
 _RESUME_STATE_SUFFIXES = ("session", "phase", "resumed-at")
 
+# Operator unblock (`clear_retries`): the per-attempt ceilings only. Also a
+# strict subset of _ISSUE_SUFFIXES — resolve-retries and infra-deaths are
+# deliberately absent, see clear_retries.
+_RETRY_SUFFIXES = ("ci-retries", "review-retries", "rebase-retries")
+
 
 @dataclass(frozen=True)
 class Store:
@@ -326,6 +331,27 @@ class Store:
 
     def clear_review_retry(self, issue: int) -> None:
         self._remove(self.issue_path(issue, "review-retries"))
+
+    def clear_retries(self, key: int) -> int:
+        """Operator unblock: give the lifecycle its per-attempt budget back.
+        Returns how many counters were actually retired, so a caller can report
+        what it did rather than what it attempted.
+
+        Deliberately partial, on the same conservatism as
+        `clear_issue_resume_state` (handover §5.7): resolve-retries and
+        infra-deaths survive. A human deciding to retry does not make a
+        deterministically dying session or an unresolvable issue cheaper, and
+        those two counters are the only ceilings that bound those loops.
+
+        `key` is `domain.fix.breaker_key`'s key — the issue number, or the
+        NEGATED PR number for a PR with no resolvable issue.
+        """
+        removed = 0
+        for suffix in _RETRY_SUFFIXES:
+            path = self.issue_path(key, suffix)
+            removed += os.path.exists(path)
+            self._remove(path)
+        return removed
 
     # ── pr review head-sha + round ──
     def get_last_sha(self, pr: int) -> str:

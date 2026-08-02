@@ -4,6 +4,7 @@ Every assertion is on what the API promises a client — a sort order, a flag, a
 step's state — never on how the aggregation stores it.
 """
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -28,6 +29,17 @@ def build(events, name="demo", repo="o/r"):
 def row_for(events, issue):
     dep = build(events)
     return next(r for r in dep.issues if r.issue == issue)
+
+
+def row_view(events, legs=(), issue=7):
+    """A row whose feed is exactly `events`, in order.
+
+    The v2 fold attributes an event to an issue by correlation; the legacy
+    dict builder can only re-parse a prose `desc`, so it cannot express the
+    structured actions the current journal emits.
+    """
+    row = row_for([*legs] or [RESOLVE], issue)
+    return replace(row, events=tuple(events))
 
 
 # ── frecency ──────────────────────────────────────────────────────────────────
@@ -821,3 +833,263 @@ def test_a_deployment_with_no_usable_events_still_produces_a_payload(events):
     payload = snapshots.repos_payload([snap], {}, True, NOW)
     assert payload["repos"][0]["in_flight"] == 0
     assert snapshots.overview_payload(snap, {}, True)["metrics"]["total_cost_usd"] == 0.0
+
+
+# ── escalation reason ─────────────────────────────────────────────────────────
+BREAKER_COMMENT = {
+    "ts": ts(hours=2), "event": "action", "issue": 7, "role": "review",
+    "desc": "comment pr #12",
+    "action": {
+        "type": "comment", "target": "PR", "number": 12,
+        "body": "**Circuit breaker:** 5 review rounds on this PR ended "
+                "without a verdict — a human must decide.\nsecond line",
+    },
+}
+ESCALATION = {"ts": ts(hours=2), "event": "escalation", "issue": 7, "pr": 12}
+
+
+def test_escalation_reason_is_the_comment_the_escalating_pass_posted():
+    card = snapshots.issue_card(row_view([BREAKER_COMMENT, ESCALATION]), NOW)
+    assert card["escalation_reason"] == (
+        "Circuit breaker: 5 review rounds on this PR ended without a verdict "
+        "— a human must decide."
+    )
+
+
+def test_an_escalation_with_no_comment_beside_it_has_no_reason():
+    card = snapshots.issue_card(row_view([ESCALATION]), NOW)
+    assert card["escalation_reason"] is None
+
+
+def test_escalation_reason_ignores_a_comment_about_another_target():
+    other = {**BREAKER_COMMENT,
+             "action": {**BREAKER_COMMENT["action"], "number": 99}}
+    assert snapshots.issue_card(row_view([other, ESCALATION]), NOW)[
+        "escalation_reason"
+    ] is None
+
+
+def test_escalation_reason_ignores_a_comment_many_events_away():
+    filler = [
+        {"ts": ts(hours=2), "event": "action", "issue": 7,
+         "desc": f"relabel issue #7: +ai-working{n}"}
+        for n in range(6)
+    ]
+    row = row_view([BREAKER_COMMENT, *filler, ESCALATION])
+    assert snapshots.issue_card(row, NOW)["escalation_reason"] is None
+
+
+@pytest.mark.parametrize("body", [None, "", "   ", {"not": "a string"}])
+def test_a_malformed_escalation_comment_body_yields_no_reason(body):
+    broken = {**BREAKER_COMMENT,
+              "action": {**BREAKER_COMMENT["action"], "body": body}}
+    assert snapshots.issue_card(row_view([broken, ESCALATION]), NOW)[
+        "escalation_reason"
+    ] is None
+
+
+def test_a_reason_retires_with_the_escalation_that_produced_it():
+    """The clients gate their unblock affordance on this field: once a relabel
+    has taken needs-human-review off, there is nothing left to unblock."""
+    cleared = {"ts": ts(hours=1), "event": "action", "issue": 7,
+               "desc": "relabel issue #7: -needs-human-review"}
+    row = row_view([BREAKER_COMMENT, ESCALATION, cleared])
+    assert snapshots.issue_card(row, NOW)["escalation_reason"] is None
+
+
+def test_a_finished_issue_reports_no_escalation_reason():
+    row = replace(row_view([BREAKER_COMMENT, ESCALATION]), done=True)
+    assert snapshots.issue_card(row, NOW)["escalation_reason"] is None
+
+
+def test_a_body_less_comment_does_not_shadow_the_real_reason():
+    empty = {**BREAKER_COMMENT,
+             "action": {**BREAKER_COMMENT["action"], "body": ""}}
+    row = row_view([BREAKER_COMMENT, empty, ESCALATION])
+    assert snapshots.issue_card(row, NOW)["escalation_reason"].startswith(
+        "Circuit breaker:"
+    )
+
+
+def test_two_comments_equally_close_resolve_to_the_later_one():
+    later = {**BREAKER_COMMENT,
+             "action": {**BREAKER_COMMENT["action"], "body": "**Later:** this one"}}
+    row = row_view([BREAKER_COMMENT, ESCALATION, later])
+    assert snapshots.issue_card(row, NOW)["escalation_reason"] == "Later: this one"
+
+
+def test_an_issue_with_no_escalation_at_all_has_no_reason():
+    row = row_view([BREAKER_COMMENT])
+    assert snapshots.issue_detail(row, NOW)["escalation_reason"] is None
+
+
+# ── the clock stops at human attention ────────────────────────────────────────
+ESCALATED_ISSUE = {
+    "title": "wedged",
+    "labels": [{"name": "needs-human-review"}],
+    "updatedAt": ts(hours=2),
+}
+
+
+def test_working_time_stops_accruing_once_the_issue_is_on_a_human():
+    events = [
+        {"ts": ts(hours=3), "event": "agent_run_start", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
+        RESOLVE,
+        ESCALATION,
+    ]
+    card = snapshots.issue_card(row_for(events, 7), NOW, gh_issue=ESCALATED_ISSUE)
+
+    assert card["human_action"] == "escalated"
+    assert card["elapsed_s"] == 3_600  # 3h ago → escalated 2h ago
+    assert card["human_wait_s"] == 7_200  # and still waiting, live
+
+
+def test_the_detail_view_freezes_the_same_clock_as_the_card():
+    events = [
+        {"ts": ts(hours=3), "event": "agent_run_start", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
+        RESOLVE,
+        ESCALATION,
+    ]
+    detail = snapshots.issue_detail(row_for(events, 7), NOW, ESCALATED_ISSUE)
+    assert detail["elapsed_s"] == 3_600
+
+
+def test_a_wait_stamp_older_than_the_first_event_cannot_bound_the_clock():
+    """Nothing can be measured to before the issue existed — the pre-existing
+    'measure to now' behaviour must survive a nonsense stamp."""
+    events = [
+        {"ts": ts(hours=2), "event": "agent_run_start", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
+        {"ts": ts(hours=2), "event": "escalation", "issue": 7},
+    ]
+    stale = {**ESCALATED_ISSUE, "updatedAt": ts(hours=9)}
+    card = snapshots.issue_card(row_for(events, 7), NOW, gh_issue=stale)
+    assert card["elapsed_s"] == 7_200
+
+
+def test_an_unescalated_issue_still_measures_its_clock_to_now():
+    events = [
+        {"ts": ts(hours=2), "event": "agent_run_start", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
+    ]
+    card = snapshots.issue_card(row_for(events, 7), NOW)
+    assert card["human_action"] is None and card["elapsed_s"] == 7_200
+
+
+def test_a_budget_review_label_also_reads_as_needing_a_human():
+    row = row_for([RESOLVE], 7)
+    card = snapshots.issue_card(
+        row, NOW,
+        gh_issue={"labels": [{"name": "needs-budget-review"}], "updatedAt": ts(hours=1)},
+    )
+    assert card["human_action"] == "escalated"
+    assert card["human_wait_s"] == 3_600
+
+
+# ── operator interventions render as steps ────────────────────────────────────
+UNBLOCK = {
+    "ts": ts(hours=1), "event": "action", "issue": 7, "role": "dashboard",
+    "desc": "operator unblock issue #7: -needs-human-review -ai-blocked",
+    "action": {
+        "type": "operator_unblock", "target": "ISSUE", "number": 7,
+        "add": [], "remove": ["needs-human-review", "ai-blocked"],
+        "retries_cleared": True,
+    },
+}
+
+
+def test_a_manual_unblock_is_rendered_as_a_free_step_that_says_what_it_did():
+    steps = snapshots.detailed_steps(row_view([UNBLOCK]))
+    assert [s["kind"] for s in steps] == ["RESOLVE", "unblock"]
+    assert steps[-1]["state"] == "done" and steps[-1]["cost_usd"] == 0.0
+    assert steps[-1]["note"] == (
+        "removed needs-human-review, ai-blocked; reset retry counters"
+    )
+
+
+def test_the_card_strip_shows_the_intervention_too():
+    steps = snapshots.collapse_steps(row_view([UNBLOCK]))
+    assert [s["kind"] for s in steps] == ["RESOLVE", "unblock"]
+
+
+@pytest.mark.parametrize("labels", [None, 7, "needs-human-review"])
+def test_a_malformed_label_list_on_an_intervention_is_survivable(labels):
+    broken = {**UNBLOCK, "action": {"type": "operator_unblock", "remove": labels}}
+    step = snapshots.detailed_steps(row_view([broken]))[-1]
+    assert step["kind"] == "unblock" and step["note"] is None
+
+
+def test_an_operator_relabel_is_its_own_step_kind():
+    relabel = {**UNBLOCK, "action": {
+        "type": "operator_relabel", "target": "ISSUE", "number": 7,
+        "add": ["P1"], "remove": [],
+    }}
+    steps = snapshots.detailed_steps(row_view([relabel]))
+    assert steps[-1]["kind"] == "relabel (operator)"
+    assert steps[-1]["note"] == "added P1"
+
+
+@pytest.mark.parametrize(
+    "action",
+    ["not-a-dict", {}, {"type": "comment"}, {"type": None}, None],
+)
+def test_events_that_are_not_operator_actions_add_no_steps(action):
+    noise = {"ts": ts(hours=1), "event": "action", "issue": 7,
+             "desc": "comment pr #12", "action": action}
+    assert [s["kind"] for s in snapshots.detailed_steps(row_view([noise]))] == [
+        "RESOLVE"
+    ]
+
+
+def test_step_indices_address_the_step_list_after_interventions_are_appended():
+    steps = snapshots.detailed_steps(row_view([UNBLOCK], legs=[RESOLVE, FIX_CI_1]))
+    assert [s["idx"] for s in steps] == [0, 1, 2]
+
+
+# ── per-step notes ────────────────────────────────────────────────────────────
+def test_a_review_step_notes_its_verdict_and_round():
+    reviews = [
+        {"ts": ts(hours=3), "event": "agent_run", "role": "review", "kind": "REVIEW",
+         "issue": 7, "number": 12, "status": "REQUEST_CHANGES", "exit_reason": "ok"},
+        {"ts": ts(hours=2), "event": "agent_run", "role": "review", "kind": "RE_REVIEW",
+         "issue": 7, "number": 12, "status": "APPROVE", "exit_reason": "ok"},
+    ]
+    notes = [s["note"] for s in snapshots.detailed_steps(row_for(reviews, 7))]
+    assert notes == ["REQUEST_CHANGES round 1", "APPROVE round 2"]
+
+
+def test_a_blocked_step_notes_the_question_it_asked():
+    blocked = {
+        "ts": ts(hours=2), "event": "agent_run", "role": "fix", "kind": "RESOLVE",
+        "issue": 7, "number": 7, "status": "blocked", "exit_reason": "ok",
+        "needs": "**Agent needs input:** which database should this migrate?\nmore",
+    }
+    step = snapshots.detailed_steps(row_for([blocked], 7))[0]
+    assert step["note"] == "Agent needs input: which database should this migrate?"
+
+
+def test_a_failed_step_notes_why_it_died():
+    died = {
+        "ts": ts(hours=2), "event": "agent_run", "role": "fix", "kind": "FIX_CI",
+        "issue": 7, "number": 12, "exit_reason": "budget_exhausted",
+        "summary": "admission rejected before the leg started",
+    }
+    step = snapshots.detailed_steps(row_for([died], 7))[0]
+    assert step["note"] == (
+        "budget_exhausted — admission rejected before the leg started"
+    )
+
+
+def test_a_clean_step_has_nothing_to_add():
+    assert snapshots.detailed_steps(row_for([RESOLVE], 7))[0]["note"] is None
+
+
+def test_a_note_is_bounded_for_a_compact_row():
+    blocked = {
+        "ts": ts(hours=2), "event": "agent_run", "role": "fix", "kind": "RESOLVE",
+        "issue": 7, "number": 7, "status": "blocked", "exit_reason": "ok",
+        "needs": "x" * 900,
+    }
+    assert len(snapshots.detailed_steps(row_for([blocked], 7))[0]["note"]) == 240

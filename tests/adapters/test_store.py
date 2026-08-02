@@ -159,6 +159,31 @@ def test_review_retry_pair():
     assert s.get_review_retry(5) == ("", 0)
 
 
+def test_clear_retries_hands_back_only_the_per_attempt_budgets():
+    """An operator unblock resets the retry ceilings a wedge consumed — and
+    deliberately not the two that bound unwinnable work."""
+    s, _ = _store()
+    s.set_ci_retries(5, 3)
+    s.set_review_retry(5, "2026-01-01T00:00:00Z", 2)
+    s.set_rebase_retries(5, 1)
+    s.set_resolve_retries(5, 4)
+    s.set_infra_deaths(5, 5)
+
+    assert s.clear_retries(5) == 3  # reports what it actually retired
+
+    assert s.get_ci_retries(5) == 0
+    assert s.get_review_retry(5) == ("", 0)
+    assert s.get_rebase_retries(5) == 0
+    assert s.get_resolve_retries(5) == 4
+    assert s.get_infra_deaths(5) == 5
+
+
+def test_clear_retries_on_an_untouched_key_is_a_no_op_not_an_error():
+    s, _ = _store()
+    assert s.clear_retries(-112) == 0  # the negated-PR breaker key namespace
+    assert s.get_ci_retries(-112) == 0
+
+
 def test_last_sha_and_round():
     s, _ = _store()
     assert s.get_round(100) == 1  # default

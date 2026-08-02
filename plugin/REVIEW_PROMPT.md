@@ -54,15 +54,19 @@ narrowly.
 
 **Visual evidence: verify the IMAGES, not the filenames.** When the PR commits
 screenshots under `evidence/` (or its `## Acceptance Criteria` names a visual
-outcome), go criterion by criterion: for EACH AC checklist item, find the image the
-body references for it and OPEN it — you are multimodal, so actually read the image
-(the committed blob is in the PR's Files-changed tab and at its `evidence/…` path in
-the checked-out branch). Then judge whether that image SHOWS that criterion met: the
-right screen/state, the asserted text or value visible and legible, in the app as it
-actually runs. REQUEST_CHANGES — quoting the AC item verbatim — if any of these holds
-for any item:
-- no screenshot is referenced for that AC item (an unreferenced pile of images does
-  not tell you which shot proves which criterion);
+outcome), go criterion by criterion: for EACH AC checklist item, find its image and
+OPEN it — you are multimodal, so actually read the image (the committed blob is in
+the PR's Files-changed tab and at its `evidence/…` path in the checked-out branch).
+An image counts as "referenced" for an AC when EITHER the body links it next to
+that criterion OR its filename maps to that criterion unambiguously (e.g.
+`evidence/ac-2-help-toggle-on.png` for AC item 2 — a deliberate naming convention
+is a reference; do not bounce a PR over the body-link formality when the mapping
+is obvious). Then judge whether that image SHOWS that criterion met: the right
+screen/state, the asserted text or value visible and legible, in the app as it
+actually runs. REQUEST_CHANGES — quoting the AC item verbatim — if any of these
+holds for any item:
+- no screenshot is referenced for that AC item under either form above (an
+  unmappable pile of images does not tell you which shot proves which criterion);
 - the referenced image is missing, unopenable/corrupt, blank, or illegible at the
   point that matters;
 - the image does not demonstrate that criterion: wrong page or state, the asserted
@@ -70,8 +74,9 @@ for any item:
   state, an obvious mockup or hand-edited render, a screenshot of source code, or a
   shot that merely proves the app started.
 "A file exists" and "the PR says it shows X" are NOT proof of work — the whole point
-of this dimension is that you looked. Never approve a visual criterion on the
-strength of a filename, a caption, or the PR's prose claim about the image.
+of this dimension is that you looked. A filename/caption tells you WHICH image to
+open, never WHETHER the criterion is met: the content judgment above still requires
+opening it.
 
 ## Dimension 9 — Maintainability (VERY IMPORTANT — weight this heavily)
 Long-term reason-about-ability is the top design concern. Judge whether the CHANGED

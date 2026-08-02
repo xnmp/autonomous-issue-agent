@@ -24,6 +24,8 @@ from ..domain.contracts import (
     EffectStatus,
     LifecycleCommand,
 )
+from ..domain.events import ActionApplied, Correlation, TelemetryEvent
+from ..domain.ports import EventSink
 from ..domain.repository import canonical_repository
 
 EFFECT_TIMEOUT_SECONDS = 60.0
@@ -44,6 +46,7 @@ def build_operator_effects(
     identity: str,
     config_version: str = "",
     run: Callable[..., Any] = subprocess.run,
+    journal: EventSink | None = None,
 ) -> "GitHubOperatorEffects":
     path = control_store_path(
         state_dirs,
@@ -57,6 +60,7 @@ def build_operator_effects(
         identity=identity,
         config_version=config_version,
         run=run,
+        journal=journal,
     )
 
 
@@ -71,6 +75,7 @@ class GitHubOperatorEffects:
         identity: str,
         config_version: str = "",
         run: Callable[..., Any] = subprocess.run,
+        journal: EventSink | None = None,
     ):
         if not repository or not identity:
             raise ValueError("operator effect repository and identity are required")
@@ -79,6 +84,9 @@ class GitHubOperatorEffects:
         self.identity = identity
         self.config_version = config_version
         self.run = run
+        # Optional: an operator mutation is durable with or without telemetry,
+        # and the CLI paths have no journal to write to.
+        self.journal = journal
         self.effects = DurableEffectRunner(
             store,
             UnfencedEffectAuthority(),
@@ -134,6 +142,8 @@ class GitHubOperatorEffects:
         *,
         add: Iterable[str] = (),
         remove: Iterable[str] = (),
+        action_kind: str = "operator_relabel",
+        action_attributes: Mapping[str, Any] | None = None,
     ) -> tuple[bool, str]:
         added = tuple(dict.fromkeys(add))
         removed = tuple(label for label in dict.fromkeys(remove) if label not in added)
@@ -194,9 +204,57 @@ class GitHubOperatorEffects:
                 revision=current_revision,
                 apply=apply,
             )
+            self._journal_label_action(
+                command, issue, added, removed, action_kind, action_attributes
+            )
             return True, "ok"
         except Exception as exc:  # noqa: BLE001 - operator-facing result
             return False, _detail(exc)
+
+    def _journal_label_action(
+        self,
+        command: LifecycleCommand,
+        issue: int,
+        added: tuple[str, ...],
+        removed: tuple[str, ...],
+        kind: str,
+        attributes: Mapping[str, Any] | None,
+    ) -> None:
+        """Make the intervention visible to the dashboard fold.
+
+        Only the path that actually mutated GitHub emits: a no-op relabel (the
+        labels already matched) is not an operator action, and journalling one
+        would render a step for something nobody did.
+
+        Contained end to end, payload construction included: the mutation has
+        already committed here, so nothing telemetry does may turn it into a
+        reported failure.
+        """
+        if self.journal is None:
+            return
+        try:
+            changes = " ".join(
+                [*(f"+{label}" for label in added), *(f"-{label}" for label in removed)]
+            )
+            event = TelemetryEvent(
+                ActionApplied(
+                    str(command.command_id),
+                    kind,
+                    "issue",
+                    f"{kind.replace('_', ' ')} issue #{issue}: {changes}",
+                    issue,
+                    {
+                        "add": list(added),
+                        "remove": list(removed),
+                        "operator": self.identity,
+                        **dict(attributes or {}),
+                    },
+                ),
+                Correlation(issue=issue),
+            )
+            self.journal.emit(event)
+        except Exception:  # noqa: BLE001 - telemetry never fails the mutation
+            pass
 
     def set_repository_auto_merge(self, enabled: bool) -> tuple[bool, str]:
         try:

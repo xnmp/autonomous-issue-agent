@@ -159,6 +159,15 @@ export const api = {
       s,
     ),
 
+  /** Drops the labels that hold an issue for a human, so the daemons resume. */
+  unblock: (name: string, n: number, s?: AbortSignal) =>
+    postJson<ActionResult>(
+      `/api/repos/${enc(name)}/issues/${n}/unblock`,
+      {},
+      schemas.ActionResult,
+      s,
+    ),
+
   setPriority: (name: string, n: number, priority: Priority, s?: AbortSignal) =>
     postJson<ActionResult>(
       `/api/repos/${enc(name)}/issues/${n}/priority`,

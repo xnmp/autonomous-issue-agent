@@ -5,6 +5,7 @@ import {
   modelTone,
   roleHealth,
   stageTone,
+  stepKindTone,
 } from "./semantics";
 
 describe("dashboard semantics", () => {
@@ -51,6 +52,16 @@ describe("dashboard semantics", () => {
     ["claude-opus-5", "xhigh", "tier-high"],
   ])("colors %s at %s by capability tier", (model, effort, tone) => {
     expect(modelTone(model, effort)).toBe(tone);
+  });
+
+  it.each([
+    ["unblock", "done", "meta"],
+    ["relabel (operator)", "done", "meta"],
+    ["RESOLVE", "ok", "ok"],
+    ["FIX_CI", "failed", "fail"],
+    ["REVIEW", "running", "running"],
+  ])("tones %s (%s) by who ran it, then how it ended", (kind, state, tone) => {
+    expect(stepKindTone(kind, state)).toBe(tone);
   });
 
   it("keeps unavailable process liveness distinct from dead", () => {

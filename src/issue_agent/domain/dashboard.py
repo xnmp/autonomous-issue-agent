@@ -420,7 +420,13 @@ def _v2_health(
     stale_after_s: float,
     heartbeat_at: datetime | None = None,
 ) -> DaemonHealth:
-    ordered = sorted(events, key=lambda event: event.order_key)
+    # A role's liveness is what that role published. Other producers may append
+    # to the same feed file (an operator action from the dashboard does), and
+    # counting their events would report a dead daemon as ticking.
+    ordered = sorted(
+        (event for event in events if event.producer.role == role),
+        key=lambda event: event.order_key,
+    )
     last_event_at = ordered[-1].occurred_at if ordered else None
     candidates = tuple(
         stamp for stamp in (last_event_at, heartbeat_at) if stamp is not None
@@ -438,7 +444,7 @@ def _v2_health(
         role=role,
         journal_path=path,
         log_path=log_path,
-        events=len(events),
+        events=len(ordered),
         last_ts=last,
         last_event=ordered[-1].type if ordered else "",
         stale=(

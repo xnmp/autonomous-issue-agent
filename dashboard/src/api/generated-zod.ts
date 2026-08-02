@@ -63,6 +63,7 @@ const IssueCard = z
     cost_usd: z.union([z.number(), z.null()]),
     done: z.boolean(),
     elapsed_s: z.union([z.number(), z.null()]),
+    escalation_reason: z.union([z.string(), z.null()]).optional(),
     estimated: z.boolean(),
     flags: z.array(z.string()),
     human_action: z
@@ -167,6 +168,7 @@ const IssueStep = z
     idx: z.number().int(),
     kind: z.string(),
     model: z.union([z.string(), z.null()]),
+    note: z.union([z.string(), z.null()]).optional(),
     role: z.union([z.string(), z.null()]),
     session_id: z.union([z.string(), z.null()]),
     state: z.string(),
@@ -182,6 +184,7 @@ const IssueDetailPayload = z
     cost_usd: z.union([z.number(), z.null()]),
     done: z.boolean(),
     elapsed_s: z.union([z.number(), z.null()]),
+    escalation_reason: z.union([z.string(), z.null()]).optional(),
     events: z.array(z.object({}).partial().passthrough()),
     idle_active: z.boolean(),
     idle_s: z.union([z.number(), z.null()]),
@@ -441,6 +444,7 @@ const endpoints = makeApi([
         cost_usd: z.union([z.number(), z.null()]),
         done: z.boolean(),
         elapsed_s: z.union([z.number(), z.null()]),
+        escalation_reason: z.union([z.string(), z.null()]).optional(),
         events: z.array(z.object({}).partial().passthrough()),
         idle_active: z.boolean(),
         idle_s: z.union([z.number(), z.null()]),
@@ -580,6 +584,32 @@ const endpoints = makeApi([
         warnings: z.array(z.string()),
       })
       .passthrough(),
+    errors: [
+      {
+        status: 422,
+        description: `Validation Error`,
+        schema: HTTPValidationError,
+      },
+    ],
+  },
+  {
+    method: "post",
+    path: "/api/repos/:name/issues/:number/unblock",
+    alias: "api_unblock_api_repos__name__issues__number__unblock_post",
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "name",
+        type: "Path",
+        schema: z.string(),
+      },
+      {
+        name: "number",
+        type: "Path",
+        schema: z.number().int(),
+      },
+    ],
+    response: z.object({ detail: z.string(), ok: z.boolean() }).passthrough(),
     errors: [
       {
         status: 422,

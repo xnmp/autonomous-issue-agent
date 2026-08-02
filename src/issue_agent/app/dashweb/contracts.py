@@ -168,6 +168,7 @@ class IssueCard(Contract):
     pr_state: str | None
     stage: str | None
     attention_reason: str | None = None
+    escalation_reason: str | None = None
     done: bool
     steps: list[CardStep]
     cost_usd: float | None
@@ -263,6 +264,7 @@ class IssueStep(Contract):
     turns: int | None
     usage: TokenUsage | None
     has_transcript: bool
+    note: str | None = None
 
 
 class PullRequestLink(Contract):
@@ -277,6 +279,7 @@ class IssueDetailPayload(Warned):
     url: str | None
     stage: str | None
     attention_reason: str | None = None
+    escalation_reason: str | None = None
     done: bool
     prs: list[int]
     pull_requests: list[PullRequestLink]

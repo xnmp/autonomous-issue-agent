@@ -259,3 +259,78 @@ def test_unobserved_relay_creation_stays_unknown_until_readback_proves_absence(
 
     assert len(spawns) == 2
     assert store.pending_commands()[0].state == "unknown_outcome"
+
+
+class Journal:
+    def __init__(self):
+        self.events = []
+
+    def emit(self, event):
+        self.events.append(event)
+
+
+def _journalled_effects(tmp_path):
+    store = SQLiteControlStore(str(tmp_path / "control.db"))
+    store.initialize()
+    remote = Remote()
+    journal = Journal()
+    effects = GitHubOperatorEffects(
+        "o/r",
+        store,
+        identity="o/r:dashboard",
+        run=remote.run,
+        journal=journal,
+    )
+    return effects, remote, journal
+
+
+def test_an_applied_label_change_is_journalled_as_an_operator_action(tmp_path):
+    effects, remote, journal = _journalled_effects(tmp_path)
+    remote.issue_labels = {"needs-human-review", "ai-blocked"}
+
+    assert effects.set_issue_labels(
+        9, remove=("needs-human-review", "ai-blocked")
+    ) == (True, "ok")
+
+    (event,) = journal.events
+    payload = event.payload
+    assert payload.kind == "operator_relabel"
+    assert payload.number == 9 and event.correlation.issue == 9
+    assert payload.attributes["remove"] == ["needs-human-review", "ai-blocked"]
+    assert payload.attributes["operator"] == "o/r:dashboard"
+    assert "#9" in payload.display
+
+
+def test_a_caller_may_name_the_operator_action_it_is_performing(tmp_path):
+    effects, remote, journal = _journalled_effects(tmp_path)
+    remote.issue_labels = {"ai-blocked"}
+
+    effects.set_issue_labels(
+        9,
+        remove=("ai-blocked",),
+        action_kind="operator_unblock",
+        action_attributes={"retries_cleared": True},
+    )
+
+    (event,) = journal.events
+    assert event.payload.kind == "operator_unblock"
+    assert event.payload.attributes["retries_cleared"] is True
+
+
+def test_a_label_change_that_changed_nothing_is_not_journalled(tmp_path):
+    effects, remote, journal = _journalled_effects(tmp_path)
+    remote.issue_labels = {"P1"}
+
+    assert effects.set_issue_labels(9, add=("P1",)) == (True, "ok")
+
+    assert journal.events == []
+
+
+def test_a_failed_label_change_is_not_journalled_as_applied(tmp_path):
+    effects, remote, journal = _journalled_effects(tmp_path)
+    remote.issue_labels = {"ai-blocked"}
+    remote.before_mutation = lambda: (_ for _ in ()).throw(OSError("no network"))
+
+    applied, _detail = effects.set_issue_labels(9, remove=("ai-blocked",))
+
+    assert applied is False and journal.events == []

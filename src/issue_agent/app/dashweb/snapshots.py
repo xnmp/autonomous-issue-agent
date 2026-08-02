@@ -35,6 +35,19 @@ _AGENT_KINDS = frozenset(kind.name for kind in AgentKind)
 _DISPATCH_AGENT_KINDS = _AGENT_KINDS - {"ROUTE"}
 _PR_AGENT_KINDS = dash.REVIEW_KINDS | dash.REPAIR_KINDS | {"PR_RESUME"}
 
+# Compact-row text budget: one line, bounded, for prose the harness did not
+# author (agent summaries, escalation comments, operator input).
+_REASON_CHARS = 240
+# An escalation and the comment that explains it are journalled by the same
+# executor pass, so only a handful of events can separate them. A wider window
+# would pair an escalation with an unrelated comment from a later leg.
+_ESCALATION_COMMENT_WINDOW = 4
+# Operator interventions the drill-down renders as steps.
+OPERATOR_ACTION_STEPS = {
+    "operator_unblock": "unblock",
+    "operator_relabel": "relabel (operator)",
+}
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -151,7 +164,77 @@ def collapse_steps(row: dash.IssueRow) -> list[dict]:
         {"kind": r.kind, "state": "running", "status": None, "cost_usd": 0.0}
         for r in row.running
     )
+    steps.extend(
+        {"kind": kind, "state": "done", "status": None, "cost_usd": 0.0}
+        for kind in dict.fromkeys(kind for _event, kind, _note in _operator_steps(row))
+    )
     return steps
+
+
+def _label_list(value: object) -> tuple:
+    return tuple(value) if isinstance(value, (list, tuple)) else ()
+
+
+def _operator_note(action: dict) -> str | None:
+    changes = [
+        f"{verb} {', '.join(labels)}"
+        for verb, key in (("removed", "remove"), ("added", "add"))
+        if (
+            labels := [
+                str(label)
+                for label in _label_list(action.get(key))
+                if str(label)
+            ]
+        )
+    ]
+    if action.get("retries_cleared"):
+        changes.append("reset retry counters")
+    return _reason_line("; ".join(changes))
+
+
+def _operator_steps(row: dash.IssueRow) -> list[tuple[dict, str, str | None]]:
+    """Journalled operator interventions, as (event, step kind, note).
+
+    A manual unblock costs nothing but changes what the harness does next, so
+    it belongs in the step list beside the paid legs rather than only in the
+    raw event feed, where nobody reads it.
+    """
+    steps = []
+    for event in row.events:
+        action = event.get("action")
+        if not isinstance(action, dict):
+            continue
+        kind = OPERATOR_ACTION_STEPS.get(str(action.get("type") or ""))
+        if kind is not None:
+            steps.append((event, kind, _operator_note(action)))
+    return steps
+
+
+def _review_round(row: dash.IssueRow, leg: dash.RunSummary) -> int | None:
+    """1-based ordinal of this review among the reviews of the same PR."""
+    ordinal = 0
+    for other in row.legs:
+        if other.kind in dash.REVIEW_KINDS and other.number == leg.number:
+            ordinal += 1
+            if other is leg:
+                return ordinal
+    return None
+
+
+def _leg_note(row: dash.IssueRow, leg: dash.RunSummary) -> str | None:
+    """One line of story per step: the verdict, the question, or the failure.
+    A leg that did what it was asked adds nothing."""
+    settled = _settled_event(row, leg)
+    summary = _reason_line(settled.get("needs") or settled.get("summary"))
+    if leg_state(leg) == "failed":
+        reason = str(leg.exit_reason or "").strip() or "failed without a reason"
+        return _reason_line(f"{reason} — {summary}" if summary else reason)
+    if leg.status.lower() == "blocked":
+        return summary
+    if leg.kind in dash.REVIEW_KINDS and leg.status:
+        ordinal = _review_round(row, leg)
+        return leg.status if ordinal is None else f"{leg.status} round {ordinal}"
+    return None
 
 
 def detailed_steps(row: dash.IssueRow) -> list[dict]:
@@ -175,6 +258,7 @@ def detailed_steps(row: dash.IssueRow) -> list[dict]:
             "turns": _turns(row, leg),
             "usage": _usage(row, leg),
             "has_transcript": bool(leg.session_id),
+            "note": _leg_note(row, leg),
         }
         for idx, leg in enumerate(row.legs)
     ]
@@ -205,9 +289,37 @@ def detailed_steps(row: dash.IssueRow) -> list[dict]:
             "turns": None,
             "usage": None,
             "has_transcript": False,
+            "note": None,
         }
         for i, r in enumerate(row.running)
     )
+    steps.extend(
+        {
+            "idx": len(steps) + i,
+            "kind": kind,
+            "role": event.get("role"),
+            "ts": event.get("ts"),
+            "state": "done",
+            "status": None,
+            "exit_reason": None,
+            "duration_s": None,
+            "cost_usd": 0.0,
+            "estimated": False,
+            "model": None,
+            "effort": None,
+            "session_id": None,
+            "turns": None,
+            "usage": None,
+            "has_transcript": False,
+            "note": note,
+        }
+        for i, (event, kind, note) in enumerate(_operator_steps(row))
+    )
+    # `idx` is the drill-down's cursor: `step_window_events` resolves it by list
+    # position, so it must be the position and not a running total taken while
+    # the list is still growing.
+    for position, step in enumerate(steps):
+        step["idx"] = position
     return steps
 
 
@@ -571,6 +683,62 @@ def _flags(row: dash.IssueRow, human_action: str | None = None) -> list[str]:
     return flags
 
 
+def _reason_line(raw: object) -> str | None:
+    """First line of prose the harness did not author, bounded for a row.
+
+    A line that OPENS with a bold heading — every breaker comment does, and it
+    would otherwise read as literal asterisks outside a Markdown pane — has all
+    of its bold markers dropped; a line that merely contains one is left alone.
+    """
+    if not isinstance(raw, str) or not (text := raw.strip()):
+        return None
+    line = text.splitlines()[0].strip()
+    if line.startswith("**"):
+        line = line.replace("**", "").strip()
+    return line[:_REASON_CHARS] or None
+
+
+def _escalation_reason(row: dash.IssueRow) -> str | None:
+    """Why the harness handed this issue to a human, while it still is.
+
+    The `escalation` event carries no prose; the escalating pass states its
+    reason in a comment posted in the same executor pass, so the newest
+    escalation is paired with the nearest comment action on the same target.
+    Ties break toward the later event — a breaker comments, then escalates.
+
+    Retirement follows `_active_escalation_at`: a relabel that took
+    needs-human-review off, or a finished issue, ends the reason with it. The
+    clients gate their unblock affordances on this field, so a reason that
+    outlived its escalation would offer to unblock nothing.
+    """
+    events = row.events
+    if row.done or _active_escalation_at(row) is None:
+        return None
+    for index in range(len(events) - 1, -1, -1):
+        if events[index].get("event") != "escalation":
+            continue
+        numbers = {
+            number
+            for number in (events[index].get("pr"), events[index].get("issue"))
+            if isinstance(number, int)
+        }
+        candidates = [
+            (abs(offset - index), -offset, reason)
+            for offset in range(
+                max(0, index - _ESCALATION_COMMENT_WINDOW),
+                min(len(events), index + _ESCALATION_COMMENT_WINDOW + 1),
+            )
+            if isinstance(action := events[offset].get("action"), dict)
+            and action.get("type") == "comment"
+            and (not numbers or action.get("number") in numbers)
+            # A body-less comment beside the escalation is not the reason, and
+            # must not shadow the real one a little further out.
+            and (reason := _reason_line(action.get("body"))) is not None
+        ]
+        return min(candidates)[2] if candidates else None
+    return None
+
+
 def _blocked_reason(row: dash.IssueRow) -> str | None:
     """First useful line from the newest blocked leg, bounded for compact rows."""
     for event in reversed(row.events):
@@ -695,14 +863,18 @@ def _human_action(
         return None, None
     issue_labels = _labels_set(gh_issue)
     pr_labels = _labels_set(gh_pr)
-    if "needs-human-review" in issue_labels | pr_labels:
+    # needs-budget-review is an escalation too: only a cap decision resumes it,
+    # and its own prompt comment may already have been answered, so the
+    # awaiting-reply arm below cannot be relied on to surface it.
+    attention = {"needs-human-review", "needs-budget-review"}
+    if attention & (issue_labels | pr_labels):
         external_updates = (
             dash.parse_ts(item.get("updatedAt"))
             for item, labels in (
                 (gh_issue, issue_labels),
                 (gh_pr, pr_labels),
             )
-            if item is not None and "needs-human-review" in labels
+            if item is not None and attention & labels
         )
         return "escalated", _active_escalation_at(row) or max(
             (stamp for stamp in external_updates if stamp is not None),
@@ -815,6 +987,32 @@ def mean_wall_clock_s(rows) -> float | None:
     return round(sum(spans) / len(spans), 1) if spans else None
 
 
+def _clock_end(
+    row: dash.IssueRow,
+    started: datetime | None,
+    now: datetime,
+    human_wait_since: datetime | None,
+) -> datetime:
+    """Where the working/idle clocks stop.
+
+    In flight the clock runs to NOW; done, to the last thing that happened. An
+    issue parked on a human is neither: the harness stopped working at the
+    escalation/block point, and letting elapsed keep climbing charges the
+    harness for the operator's queue. `human_wait_s` still ticks live, so the
+    wait itself stays visible. A wait stamp at or before the issue's first
+    event cannot bound anything, so it is ignored.
+    """
+    if row.done and row.last_ts:
+        return row.last_ts
+    if (
+        human_wait_since is not None
+        and started is not None
+        and started < human_wait_since < now
+    ):
+        return human_wait_since
+    return now
+
+
 def issue_card(
     row: dash.IssueRow,
     now: datetime,
@@ -830,12 +1028,11 @@ def issue_card(
     started = _started(row)
     pr = row.prs[-1] if row.prs else None
     gh_pr = (gh_prs or {}).get(pr) if pr is not None else None
-    # In flight: the clock is still running, so elapsed is measured to NOW.
-    # Done: to the last thing that happened, which is where the clock stopped.
-    end = row.last_ts if (row.done and row.last_ts) else now
-    elapsed, working, idle, idle_active = _duration_breakdown(row, started, end)
-    displayed_models = list(row.models) if row.done else active_card_models(row)
     human_action, human_wait_since = _human_action(row, gh_issue, gh_pr)
+    elapsed, working, idle, idle_active = _duration_breakdown(
+        row, started, _clock_end(row, started, now, human_wait_since)
+    )
+    displayed_models = list(row.models) if row.done else active_card_models(row)
     human_wait_s = (
         max(0.0, (now - human_wait_since).total_seconds())
         if human_wait_since is not None
@@ -850,6 +1047,7 @@ def issue_card(
         "pr_state": _pr_state(gh_pr),
         "stage": _display_stage(row),
         "attention_reason": _blocked_reason(row),
+        "escalation_reason": _escalation_reason(row),
         "done": row.done,
         "steps": collapse_steps(row),
         "cost_usd": row.cost_usd,
@@ -1278,14 +1476,19 @@ def issue_detail(
     gh_prs: dict[int, dict] | None = None,
 ) -> dict:
     started = _started(row)
-    end = row.last_ts if (row.done and row.last_ts) else now
-    elapsed, working, idle, idle_active = _duration_breakdown(row, started, end)
+    pr = row.prs[-1] if row.prs else None
+    gh_pr = (gh_prs or {}).get(pr) if pr is not None else None
+    _human_action_kind, human_wait_since = _human_action(row, gh_issue, gh_pr)
+    elapsed, working, idle, idle_active = _duration_breakdown(
+        row, started, _clock_end(row, started, now, human_wait_since)
+    )
     return {
         "issue": row.issue,
         "title": (gh_issue or {}).get("title"),
         "url": (gh_issue or {}).get("url"),
         "stage": _display_stage(row),
         "attention_reason": _blocked_reason(row),
+        "escalation_reason": _escalation_reason(row),
         "done": row.done,
         "prs": list(row.prs),
         "pull_requests": [

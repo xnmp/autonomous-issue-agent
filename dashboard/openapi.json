@@ -657,6 +657,17 @@
             ],
             "title": "Elapsed S"
           },
+          "escalation_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Escalation Reason"
+          },
           "estimated": {
             "title": "Estimated",
             "type": "boolean"
@@ -991,6 +1002,17 @@
             ],
             "title": "Elapsed S"
           },
+          "escalation_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Escalation Reason"
+          },
           "events": {
             "items": {
               "additionalProperties": true,
@@ -1184,6 +1206,17 @@
               }
             ],
             "title": "Model"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
           },
           "role": {
             "anyOf": [
@@ -2584,6 +2617,54 @@
           }
         },
         "summary": "Api Step Events"
+      }
+    },
+    "/api/repos/{name}/issues/{number}/unblock": {
+      "post": {
+        "operationId": "api_unblock_api_repos__name__issues__number__unblock_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "number",
+            "required": true,
+            "schema": {
+              "title": "Number",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActionResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Api Unblock"
       }
     },
     "/api/repos/{name}/overview": {

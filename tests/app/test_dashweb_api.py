@@ -134,6 +134,10 @@ class StubBackend:
         self._maybe("promote")
         return (True, "ok")
 
+    def unblock(self, name, number):
+        self._maybe("unblock")
+        return (True, "ok")
+
     def priority(self, name, number, priority):
         self._maybe("priority")
         self.priority_seen = priority
@@ -279,6 +283,27 @@ def test_promote_reports_success():
     assert client().post("/api/repos/demo/issues/9/promote").json() == {
         "ok": True, "detail": "ok"
     }
+
+
+def test_unblock_reports_success():
+    assert client().post("/api/repos/demo/issues/9/unblock").json() == {
+        "ok": True, "detail": "ok"
+    }
+
+
+def test_an_unblock_whose_collectors_fail_is_refused_not_a_500():
+    """It reads (snapshot + GitHub) before it writes, so it has failure modes
+    the other actions do not — the operator must get a readable refusal."""
+    backend = StubBackend(explode="unblock")
+    c = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL)
+    response = c.post("/api/repos/demo/issues/9/unblock")
+    assert response.status_code == 400
+    assert response.json()["ok"] is False
+    assert "collector blew up" in response.json()["detail"]
+
+
+def test_unblock_rejects_a_non_positive_issue_number():
+    assert client().post("/api/repos/demo/issues/0/unblock").status_code == 400
 
 
 def test_priority_accepts_the_three_labels_and_null():

@@ -8,11 +8,12 @@ import {
   type MouseEvent,
 } from "react";
 import { api } from "../api/client";
-import { useClock, type Polled } from "../api/hooks";
+import { useClock, usePolled, type Polled } from "../api/hooks";
 import type {
   BacklogCard,
   CardStep,
   IssueCard,
+  IssueStep,
   IssuesPayload,
   PendingCard,
   Priority,
@@ -25,6 +26,7 @@ import {
   modelTone,
   prStateTone,
   stateTone,
+  stepKindTone,
   verificationTone,
 } from "../lib/semantics";
 import { ageCompact, duration, localDate, localTime, num, usd } from "../lib/format";
@@ -39,6 +41,7 @@ import {
   type TableColumn,
 } from "./ui/ResizableTable";
 import { ConfirmModal } from "./ui/Modal";
+import { UnblockModal } from "./UnblockModal";
 import {
   EmptyState,
   ErrorBanner,
@@ -179,7 +182,9 @@ export function IssuesTab({
         <>
           <SectionTitle>In flight</SectionTitle>
           <InFlightTable
+            repo={repo}
             cards={data?.in_flight ?? []}
+            onRefresh={issues.refresh}
             anchorMs={issues.updatedAt}
             loading={issues.loading}
             visible={visible}
@@ -201,10 +206,12 @@ export function IssuesTab({
 
       {sub === "done" ? (
         <DoneTable
+          repo={repo}
           cards={data?.done ?? []}
           loading={issues.loading}
           visible={visible}
           onOpen={onOpenIssue}
+          onRefresh={issues.refresh}
           showDurationSeconds={showDurationSeconds}
         />
       ) : null}
@@ -225,19 +232,23 @@ export function IssuesTab({
 }
 
 function InFlightTable({
+  repo,
   cards,
   anchorMs,
   loading,
   visible,
   onOpen,
+  onRefresh,
   showProjectedCost,
   showDurationSeconds,
 }: {
+  repo: string;
   cards: IssueCard[];
   anchorMs: number | null;
   loading: boolean;
   visible: ReadonlySet<string>;
   onOpen: (issue: number) => void;
+  onRefresh: () => void;
   showProjectedCost: boolean;
   showDurationSeconds: boolean;
 }) {
@@ -279,24 +290,33 @@ function InFlightTable({
         <tbody>
           {sorted.rows.map((card) => {
             const elapsed = card.elapsed_s === null ? null : card.elapsed_s + offset;
+            // A human-owned issue has a work clock the server already stopped:
+            // ticking it locally would invent minutes nobody worked. The wait
+            // clock on the human-action chip is the one that still moves.
+            const humanOwned = !!card.human_action;
             const working = card.working_s === null
               ? null
-              : card.working_s + (card.idle_active ? 0 : offset);
+              : card.working_s + (card.idle_active || humanOwned ? 0 : offset);
             const idle = card.idle_s === null
               ? null
               : card.idle_s + (card.idle_active ? offset : 0);
             const open = expanded === card.issue;
             const alert = (
-              card.stage === "blocked"
+              humanOwned
+              || card.stage === "blocked"
               || card.stage === "escalated"
               || card.flags.some(
                 (flag) => flag === "escalated" || flag === "spend-blocked" || flag === "blocked",
               )
             );
+            // Merge-ready is attention, not alarm: same treatment, green.
+            const alertClass = !alert
+              ? ""
+              : card.human_action === "merge-ready" ? " row-alert row-alert-ready" : " row-alert";
             return (
               <Fragment key={card.issue}>
                 <tr
-                  className={`clickable${open ? " expanded" : ""}${alert ? " row-alert" : ""}`}
+                  className={`clickable${open ? " expanded" : ""}${alertClass}`}
                   tabIndex={0}
                   aria-expanded={open}
                   onClick={() => setExpanded(open ? null : card.issue)}
@@ -305,7 +325,10 @@ function InFlightTable({
                   <td><IssueSummary card={card} open={open} /></td>
                   {visible.has("tasks") ? <td><StepBadgeRow steps={card.steps} /></td> : null}
                   {visible.has("cost") ? (
-                    <td className="r mono nowrap">
+                    <td
+                      className={`r mono nowrap cost-cell${overBudget(card) ? " cost-over" : ""}`}
+                      title={overBudget(card) ? "over the projected cost for this model" : undefined}
+                    >
                       {usd(card.cost_usd)}
                       {card.estimated ? <span className="faint" title="synthetic dollars (subscription runtime)"> ~</span> : null}
                       {showProjectedCost && card.projected_cost_usd !== null ? (
@@ -345,7 +368,13 @@ function InFlightTable({
                   {visible.has("model") ? <td><ModelList models={card.model_badges ?? card.models.map((model) => ({ model, effort: null }))} /></td> : null}
                 </tr>
                 {open ? (
-                  <TaskDetailRow card={card} colSpan={columns.length} onOpen={() => onOpen(card.issue)} />
+                  <TaskDetailRow
+                    repo={repo}
+                    card={card}
+                    colSpan={columns.length}
+                    onOpen={() => onOpen(card.issue)}
+                    onRefresh={onRefresh}
+                  />
                 ) : null}
               </Fragment>
             );
@@ -482,16 +511,20 @@ function PrioritySelector({
 }
 
 function DoneTable({
+  repo,
   cards,
   loading,
   visible,
   onOpen,
+  onRefresh,
   showDurationSeconds,
 }: {
+  repo: string;
   cards: IssueCard[];
   loading: boolean;
   visible: ReadonlySet<string>;
   onOpen: (issue: number) => void;
+  onRefresh: () => void;
   showDurationSeconds: boolean;
 }) {
   const [expanded, setExpanded] = useState<number | null>(null);
@@ -542,7 +575,7 @@ function DoneTable({
                 >
                   <td><IssueSummary card={card} open={open} /></td>
                   {visible.has("cost") ? (
-                    <td className="r mono">
+                    <td className={`r mono cost-cell${overBudget(card) ? " cost-over" : ""}`}>
                       {usd(card.cost_usd)}
                       {card.estimated ? <span className="faint" title="synthetic dollars"> ~</span> : null}
                     </td>
@@ -568,7 +601,13 @@ function DoneTable({
                   ) : null}
                 </tr>
                 {open ? (
-                  <TaskDetailRow card={card} colSpan={columns.length} onOpen={() => onOpen(card.issue)} />
+                  <TaskDetailRow
+                    repo={repo}
+                    card={card}
+                    colSpan={columns.length}
+                    onOpen={() => onOpen(card.issue)}
+                    onRefresh={onRefresh}
+                  />
                 ) : null}
               </Fragment>
             );
@@ -746,47 +785,156 @@ function BacklogTable({
   );
 }
 
+/**
+ * What actually happened to this issue, in order: one line per task, carrying
+ * the note the backend wrote for it (a review verdict, the question that
+ * blocked it, the failure reason, an operator intervention). Money is the
+ * quietest thing on the line — it only matters when it runs over.
+ *
+ * The card's own `steps` collapse retries and carry no prose, so the story
+ * comes from the issue-detail endpoint; the collapsed strip is the fallback
+ * while that loads or if it fails.
+ */
 function TaskDetailRow({
+  repo,
   card,
   colSpan,
   onOpen,
+  onRefresh,
 }: {
+  repo: string;
   card: IssueCard;
   colSpan: number;
   onOpen: () => void;
+  onRefresh: () => void;
 }) {
+  const [confirming, setConfirming] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const detail = usePolled(
+    `issue:${repo}:${card.issue}`,
+    (signal) => api.issue(repo, card.issue, signal),
+    card.done ? 0 : 5_000,
+  );
+  const steps = detail.data?.steps ?? null;
+  const unblockable = card.human_action === "escalated"
+    || card.human_action === "awaiting-reply";
+
+  const doUnblock = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.unblock(repo, card.issue);
+      setConfirming(false);
+      detail.refresh();
+      onRefresh();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <tr className="detail-row">
       <td colSpan={colSpan}>
         <div className="row-detail">
           <div className="row-detail-hd">
-            <strong>Tasks</strong>
-            <button className="btn btn-xs" onClick={onOpen}>Open full issue</button>
+            <strong>What happened</strong>
+            <span className="row-wrap">
+              {unblockable ? (
+                <button
+                  className="btn btn-xs"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setError(null);
+                    setConfirming(true);
+                  }}
+                >
+                  Unblock
+                </button>
+              ) : null}
+              <button className="btn btn-xs" onClick={onOpen}>Open full issue</button>
+            </span>
           </div>
-          {card.steps.length > 0 ? (
-            <div className="task-summary-list">
+          {error ? <ErrorBanner message={error} /> : null}
+          {card.escalation_reason ? (
+            <div className="task-escalation">{card.escalation_reason}</div>
+          ) : null}
+          {steps !== null && steps.length > 0 ? (
+            <ol className="task-story">
+              {steps.map((step) => <TaskStoryLine key={step.idx} step={step} />)}
+            </ol>
+          ) : null}
+          {steps === null && card.steps.length > 0 ? (
+            <ol className="task-story">
               {card.steps.map((step, index) => (
-                <div className="task-summary" key={`${step.kind}-${index}`}>
-                  <Chip tone={stateTone(step.state)} square pulse={step.state === "running"}>
-                    {taskName(step)}
-                  </Chip>
-                  <span className={`task-state tone-${stateTone(step.state)}`}>
-                    {step.state === "ok" ? "done" : step.state}
-                  </span>
-                  <span className="spacer" />
-                  <span className="mono faint">{usd(step.cost_usd)}</span>
-                </div>
+                <TaskStoryLine key={`${step.kind}-${index}`} step={step} />
               ))}
-            </div>
-          ) : <EmptyState>no tasks recorded yet</EmptyState>}
+            </ol>
+          ) : null}
+          {(steps ?? card.steps).length === 0 ? (
+            <EmptyState>no tasks recorded yet</EmptyState>
+          ) : null}
+          {confirming ? (
+            <UnblockModal
+              issue={card.issue}
+              busy={busy}
+              error={error}
+              onConfirm={() => void doUnblock()}
+              onCancel={() => setConfirming(false)}
+            />
+          ) : null}
         </div>
       </td>
     </tr>
+    );
+}
+
+/** One task, one line. `note` is the payload; everything else is context. */
+function TaskStoryLine({ step }: { step: CardStep | IssueStep }) {
+  const tone = stateTone(step.state);
+  const note = stepNote(step);
+  const cost = step.cost_usd ?? 0;
+  return (
+    <li className={`task-story-line tone-border-${tone}`}>
+      <Chip
+        tone={stepKindTone(step.kind, step.state)}
+        square
+        pulse={step.state === "running"}
+        title={step.kind}
+      >
+        {taskName(step)}
+      </Chip>
+      <span className={`task-state tone-${tone}`}>
+        {step.state === "ok" ? "done" : step.state}
+      </span>
+      {note ? <span className="task-note" title={note}>{note}</span> : null}
+      <span className="spacer" />
+      {cost > 0 ? <span className="mono faint task-cost">{usd(step.cost_usd)}</span> : null}
+    </li>
   );
 }
 
-function taskName(step: CardStep): string {
+/** Only detailed steps carry prose; card steps are the note-less fallback. */
+function stepNote(step: CardStep | IssueStep): string | null {
+  const value = (step as { note?: unknown }).note;
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+function taskName(step: CardStep | IssueStep): string {
   return step.kind.replaceAll("_", " ").toLowerCase();
+}
+
+/** Cost is noise until it exceeds what this model usually spends. */
+function overBudget(card: IssueCard): boolean {
+  const projected = card.projected_cost_usd;
+  return (
+    projected !== null
+    && projected > 0
+    && card.cost_usd !== null
+    && card.cost_usd > projected
+  );
 }
 
 function IssueSummary({ card, open }: { card: IssueCard; open: boolean }) {
@@ -795,6 +943,7 @@ function IssueSummary({ card, open }: { card: IssueCard; open: boolean }) {
     ? Math.max(0, (now - Date.parse(card.human_wait_since_ts)) / 1000)
     : (card.human_wait_s ?? null);
   const secondaryFlags = card.flags.filter((flag) => flag !== card.human_action);
+  const status = humanStatus(card);
   return (
     <div className="issue-summary">
       <span className={`chev${open ? " open" : ""}`} aria-hidden="true">▸</span>
@@ -802,13 +951,12 @@ function IssueSummary({ card, open }: { card: IssueCard; open: boolean }) {
         <span className="issue-summary-title" title={card.title ?? undefined}>
           {card.title ?? <span className="faint">title unavailable</span>}
         </span>
-        {card.stage === "awaiting human reply" ? (
+        {status ? (
           <span
-            className="issue-attention"
-            title={card.attention_reason ?? "The agent is waiting for a reply."}
+            className={`issue-attention${card.human_action === "merge-ready" ? " issue-attention-ready" : ""}`}
+            title={status}
           >
-            awaiting human reply
-            {card.attention_reason ? ` · ${card.attention_reason}` : ""}
+            {status}
           </span>
         ) : null}
         <div className="row-wrap">
@@ -828,6 +976,35 @@ function IssueSummary({ card, open }: { card: IssueCard; open: boolean }) {
       </div>
     </div>
   );
+}
+
+/**
+ * The row's second line: what a human would have to read the issue to learn.
+ *
+ * The chip beside it already names the *kind* of attention, so this line
+ * carries the reason and never repeats the kind. Needs-budget-review arrives as
+ * `escalated` with the cap decision stated in `escalation_reason`.
+ */
+function humanStatus(card: IssueCard): string | null {
+  const prose = (text: string | null | undefined) => text?.trim() || null;
+  switch (card.human_action) {
+    case "escalated":
+      return prose(card.escalation_reason)
+        ?? prose(card.attention_reason)
+        ?? "escalated — see the issue comments";
+    case "awaiting-reply":
+      return prose(card.attention_reason)
+        ?? "the agent asked a question — reply on GitHub to unblock it";
+    case "merge-ready":
+      return "reviewed and green — merge when you are ready";
+    default:
+      break;
+  }
+  if (card.stage === "awaiting human reply") {
+    const why = prose(card.attention_reason);
+    return why ? `awaiting human reply · ${why}` : "awaiting human reply";
+  }
+  return prose(card.escalation_reason);
 }
 
 function CompactIssue({

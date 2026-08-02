@@ -1057,9 +1057,21 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.issue-attention-ready {
+  color: var(--ok);
+}
 .human-action {
   font-size: var(--text-xs);
   font-weight: 700;
+}
+/* Cost is background information until it exceeds the projection. */
+.cost-cell {
+  color: var(--ink-muted);
+  font-size: var(--fs-xs);
+}
+.cost-over {
+  color: var(--running);
+  font-weight: 600;
 }
 .human-action-merge-ready {
   color: var(--ok);
@@ -1136,6 +1148,51 @@
   font-size: var(--fs-xs);
   font-weight: 600;
 }
+/* One task per line, in order: the expansion is a story, not a ledger. */
+.task-story {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.task-story-line {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s2);
+  min-width: 0;
+  padding: var(--s1) var(--s2);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+}
+.task-note {
+  min-width: 0;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.task-cost {
+  font-size: var(--fs-xs);
+  opacity: 0.7;
+}
+.task-escalation {
+  padding: var(--s2);
+  border-left: 3px solid var(--fail);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--fail) 9%, transparent);
+  color: var(--ink);
+}
+/* The note under a task row spans every column, so no width hides it. */
+.step-note-row > td {
+  padding: 0 var(--s2) var(--s2) var(--s3);
+  color: var(--ink-muted);
+}
+.step-note-row .task-note {
+  color: var(--ink-muted);
+  white-space: normal;
+}
 .issue-context {
   max-width: 75ch;
   color: var(--ink-muted);
@@ -1182,9 +1239,20 @@
   background: var(--panel);
   border-left: 1px solid var(--border);
 }
+/* A row that needs a human is read as one object: the whole row is tinted and
+ * bordered, not just a chip inside it. `--row-attn` is the single knob so the
+ * ready variant only restates the colour. */
 .row-alert {
-  box-shadow: inset 2px 0 0 var(--fail);
-  background: color-mix(in srgb, var(--fail) 6%, transparent);
+  --row-attn: var(--fail);
+  box-shadow: inset 3px 0 0 var(--row-attn);
+  background: color-mix(in srgb, var(--row-attn) 9%, transparent);
+}
+.row-alert-ready {
+  --row-attn: var(--ok);
+}
+.tbl tbody tr.row-alert:hover,
+.tbl tbody tr.row-alert.expanded {
+  background: color-mix(in srgb, var(--row-attn) 14%, transparent);
 }
 .attention-stage {
   color: var(--fail);
