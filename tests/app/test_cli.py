@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from issue_agent.app import cli
+from issue_agent.app import cli, codex_resolution
 
 
 from issue_agent.app.config import from_env
@@ -1515,13 +1515,23 @@ class _Answers:
         return self.items.pop(0)
 
 
-def _init_env(tmp_path, monkeypatch, *, answers, secrets=(), gh=None):
+def _codex_report(*, path="/usr/bin/codex", version="0.147.0", findings=()):
+    return codex_resolution.analyse_codex_resolution(
+        path if path.startswith("/") else "codex",
+        path, version,
+        tuple(codex_resolution.CodexCandidate(p, v) for p, v in findings),
+    )
+
+
+def _init_env(tmp_path, monkeypatch, *, answers, secrets=(), gh=None, codex=None):
     shared = tmp_path / "config" / "shared.env"
     monkeypatch.setattr(cli, "SHARED_ENV", str(shared))
     monkeypatch.setattr(cli.sys, "stdin", argparse.Namespace(isatty=lambda: True))
     monkeypatch.setattr(cli.subprocess, "run", gh or _gh_stub())
     monkeypatch.setattr(cli, "detect_claude_auth", lambda: True)
-    monkeypatch.setattr(cli, "detect_codex_auth", lambda: (True, "apikey"))
+    monkeypatch.setattr(cli, "detect_codex_auth", lambda: "apikey")
+    report = codex if codex is not None else _codex_report()
+    monkeypatch.setattr(cli, "report_codex_resolution", lambda _bin: report)
     asked = _Answers(answers)
     secret_asked = _Answers(secrets)
     monkeypatch.setattr("builtins.input", asked)
@@ -1779,6 +1789,83 @@ def test_cmd_init_skips_the_token_prompt_when_a_github_app_is_configured(
     assert secrets.prompts == []
 
 
+def test_cmd_init_pins_codex_bin_when_the_path_hides_a_newer_install(
+    tmp_path, monkeypatch, capsys
+):
+    """2026-08-02 keifu: the wizard's shell found 0.147.0 while the daemons'
+    systemd PATH found 0.142.3, which the provider refuses to serve. Answering
+    nothing (or piped stdin) must still write the absolute pin."""
+    shadowed = codex_resolution.analyse_codex_resolution(
+        "codex", "/run/current-system/sw/bin/codex", "0.142.3",
+        (codex_resolution.CodexCandidate("/run/current-system/sw/bin/codex", "0.142.3"),
+         codex_resolution.CodexCandidate("/home/o/.local/bin/codex", "0.147.0")),
+    )
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch,
+        answers=["three", "fix-bot", "review-bot", "review-bot", "N", "N",
+                 "claude", "codex"],
+        secrets=["", ""], codex=shadowed,
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert _shared_values(shared.read_text())["CODEX_BIN"] == "/home/o/.local/bin/codex"
+
+
+def test_cmd_init_leaves_codex_bin_unpinned_when_resolution_is_clean(
+    tmp_path, monkeypatch
+):
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch,
+        answers=["three", "fix-bot", "review-bot", "review-bot", "N", "N",
+                 "claude", "codex", "https://api.openai.com/v1"],
+        secrets=["", ""],
+        codex=_codex_report(path="/opt/codex", version="0.147.0"),
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert "CODEX_BIN" not in _shared_values(shared.read_text())
+
+
+def test_cmd_init_never_asks_about_codex_for_a_claude_only_deployment(
+    tmp_path, monkeypatch
+):
+    """A deployment that never spawns codex has no reason to answer for a binary
+    it will not run — and no reason to carry a CODEX_BIN into its config."""
+    shadowed = codex_resolution.analyse_codex_resolution(
+        "codex", "/usr/bin/codex", "0.142.3",
+        (codex_resolution.CodexCandidate("/usr/bin/codex", "0.142.3"),
+         codex_resolution.CodexCandidate("/opt/codex", "0.147.0")),
+    )
+    shared, asked, _s = _init_env(
+        tmp_path, monkeypatch, answers=_wizard_answers(), secrets=["", ""],
+        codex=shadowed,
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert "CODEX_BIN" not in _shared_values(shared.read_text())
+    assert not any("CODEX_BIN" in prompt for prompt in asked.prompts)
+
+
+def test_cmd_init_keeps_codex_unpinned_when_the_operator_declines(
+    tmp_path, monkeypatch, capsys
+):
+    shadowed = codex_resolution.analyse_codex_resolution(
+        "codex", "/usr/bin/codex", "0.142.3",
+        (codex_resolution.CodexCandidate("/usr/bin/codex", "0.142.3"),
+         codex_resolution.CodexCandidate("/opt/codex", "0.147.0")),
+    )
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch,
+        answers=["three", "fix-bot", "review-bot", "review-bot", "N", "N",
+                 "claude", "codex", "n", "https://api.openai.com/v1"],
+        secrets=["", ""], codex=shadowed,
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert "CODEX_BIN" not in _shared_values(shared.read_text())
+    assert "unpinned" in capsys.readouterr().err
+
+
 def test_cmd_init_writes_shared_env_private(tmp_path, monkeypatch):
     """shared.env can hold a long-lived PAT: it must never be group/world readable."""
     shared, _asked, _s = _init_env(
@@ -1825,7 +1912,7 @@ def test_cmd_init_codex_on_chatgpt_auth_explains_the_synthetic_rate_card(
         tmp_path, monkeypatch,
         answers=_wizard_answers(reviewer_runtime="codex"), secrets=["", ""],
     )
-    monkeypatch.setattr(cli, "detect_codex_auth", lambda: (True, "chatgpt"))
+    monkeypatch.setattr(cli, "detect_codex_auth", lambda: "chatgpt")
 
     assert cli.cmd_init(argparse.Namespace(force=False)) == 0
     assert "OPENAI_BASE_URL" not in _shared_values(shared.read_text())
@@ -1878,26 +1965,28 @@ def test_detect_claude_auth_accepts_stored_cli_credentials(monkeypatch, tmp_path
 
 def test_detect_codex_auth_reads_the_mode_not_the_secret(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(cli.shutil, "which", lambda _b: "/usr/bin/codex")
     (tmp_path / ".codex").mkdir()
     (tmp_path / ".codex" / "auth.json").write_text(
         json.dumps({"auth_mode": "chatgpt", "tokens": {"access_token": "secret"}})
     )
-    assert cli.detect_codex_auth() == (True, "chatgpt")
+    assert cli.detect_codex_auth() == "chatgpt"
 
 
 def test_detect_codex_auth_tolerates_a_malformed_auth_file(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setattr(cli.shutil, "which", lambda _b: "/usr/bin/codex")
     (tmp_path / ".codex").mkdir()
     (tmp_path / ".codex" / "auth.json").write_text("{not json")
-    assert cli.detect_codex_auth() == (True, "")
+    assert cli.detect_codex_auth() == ""
 
 
-def test_detect_codex_auth_reports_a_missing_binary(monkeypatch, tmp_path):
+def test_detect_codex_auth_does_not_answer_for_binary_presence(monkeypatch, tmp_path):
+    """Presence belongs to the resolution report, which asks about the DAEMONS'
+    PATH; `shutil.which` here would only describe the operator's shell."""
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setattr(cli.shutil, "which", lambda _b: None)
-    assert cli.detect_codex_auth() == (False, "")
+    (tmp_path / ".codex").mkdir()
+    (tmp_path / ".codex" / "auth.json").write_text(json.dumps({"auth_mode": "apikey"}))
+    assert cli.detect_codex_auth() == "apikey"
 
 
 # ── token input handling (pure) ───────────────────────────────────────────────
