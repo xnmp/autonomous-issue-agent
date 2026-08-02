@@ -290,6 +290,7 @@ class CommandKind(str, Enum):
     ENABLE_AUTO_MERGE = "enable_auto_merge"
     UPDATE_BRANCH = "update_branch"
     RERUN_CHECKS = "rerun_checks"
+    CANCEL_CHECKS = "cancel_checks"
     ADD_DEPENDENCY = "add_dependency"
     SUBMIT_REVIEW = "submit_review"
     DISMISS_REVIEW = "dismiss_review"

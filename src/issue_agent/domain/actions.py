@@ -134,6 +134,39 @@ class RerunFailedChecks:
 
 
 @dataclass(frozen=True)
+class CancelWorkflowRuns:
+    """Cancel the workflow runs that have WEDGED this PR's CI.
+
+    GitHub refuses `rerun-failed-jobs` on a run that is still `in_progress`
+    (HTTP 403 "already running"), so for a wedged run the harness's whole re-run
+    capability was dead on arrival: the pending deadline fired, nothing could be
+    re-run, and the PR escalated to a human who then did exactly this by hand
+    (keifu PR #177 — a `Test windows-latest` job pinned `in_progress` for 60+
+    minutes; cancel → wait for completed → rerun-failed-jobs went green).
+
+    Cancelling is the step that makes the run rerunnable. It is NOT a separate
+    budget: cancel + the re-run it unblocks together spend the ONE free re-run
+    this head is allowed (`FixState.ci_rerun_head`), so a head that wedges twice
+    still reaches a human on schedule.
+
+    `head` is the PR head SHA observed when the decision was made and is carried
+    in the action rather than re-read at execution time: the adapter refuses to
+    cancel any run whose `head_sha` differs, so a push landing mid-tick can never
+    have its fresh run cancelled by a decision made about the old commit.
+    """
+
+    pr: int
+    head: str
+    run_ids: tuple[int, ...] = ()
+    # The poll clock this cancel was decided on, carried so the marker the
+    # executor writes can date it. The wait for GitHub to take the run down is
+    # then bounded by time SINCE THE CANCEL — the stall clock cannot bound it,
+    # because cancelling a wedged run is exactly what lets follow-on jobs start,
+    # and a fresh pending check resets that clock (adversarial review S2).
+    decided_at: str = ""
+
+
+@dataclass(frozen=True)
 class EscalateCiPending:
     """One-shot escalation for a stalled CI head.
 
@@ -217,6 +250,7 @@ Action = Union[
     UpdateBranch,
     AddDependency,
     RerunFailedChecks,
+    CancelWorkflowRuns,
     EscalateCiPending,
     RunAgent,
     RemoveWorktree,
@@ -242,6 +276,7 @@ __all__ = [
     "UpdateBranch",
     "AddDependency",
     "RerunFailedChecks",
+    "CancelWorkflowRuns",
     "EscalateCiPending",
     "RunAgent",
     "RemoveWorktree",

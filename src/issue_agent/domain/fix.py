@@ -16,10 +16,12 @@ actions (auto-merge, cleanup) remain independent of pool occupancy.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 
 from .actions import (
     Action,
     AgentKind,
+    CancelWorkflowRuns,
     ClearIssueState,
     CloseIssue,
     EnableAutoMerge,
@@ -37,6 +39,7 @@ from .ci import (
     failed_checks,
     latest_other_review,
     pending_age_seconds,
+    parse_timestamp,
     pending_checks,
     pending_deadline_breached,
 )
@@ -165,6 +168,12 @@ class FixState:
     # update creates a NEW head (fresh key), an already-up-to-date update
     # changes nothing (marker matches, loop stops).
     update_branch_head: dict[int, str] = field(default_factory=dict)
+    # PR → the head SHA whose wedged workflow runs have already been sent a
+    # cancel. Head-keyed for the same reason `ci_rerun_head` is, and separate
+    # from it because cancel and re-run are two ticks of ONE remediation: the
+    # cancel latch stops the harness re-cancelling every poll while GitHub takes
+    # the run down, and the re-run marker is what actually spends the budget.
+    ci_cancel_head: dict[int, str] = field(default_factory=dict)
     # Paid work currently executing in the application dispatch pool. This is
     # observation state, not persisted orchestration state: it prevents a second
     # leg for the same issue and extends the path-overlap serializer to work that
@@ -1045,6 +1054,301 @@ def ci_pending_stalls(world: WorldState, cfg: FixConfig) -> tuple[CiPendingStall
     )
 
 
+# ── wedged-run remediation (keifu PR #177) ───────────────────────────────────
+def stalled_run_ids(pr: PRView, cfg: FixConfig) -> tuple[int, ...]:
+    """The workflow runs pinning this PR at PENDING, or () when unsafe to act.
+
+    The mirror of `ci_rerun_run_ids` for the pending side. A pending EXTERNAL
+    status (or any check whose details URL carried no `/actions/runs/<id>`) has
+    no immutable run identity, so it cannot be cancelled by SHA-verified id and
+    the whole PR falls through to the human escalation that predates this path —
+    cancelling a subset would leave the real pin in place while looking handled.
+    """
+
+    pending = pending_checks(pr.checks, cfg.ci_ignore_checks)
+    if not pending or any(check.run_id is None for check in pending):
+        return ()
+    return tuple(sorted({c.run_id for c in pending if c.run_id is not None}))
+
+
+CANCEL_MARKER_SEP = "@"
+
+
+def parse_cancel_marker(raw: str) -> tuple[str, str]:
+    """`(head, decided_at)` from a ci-cancel marker.
+
+    The marker dates the cancel because the wait for GitHub to act on it cannot
+    be bounded by the stall clock: cancelling a wedged run is precisely what
+    lets follow-on jobs start, and one fresh pending check resets
+    `pending_age_seconds` (adversarial review S2 - a PR sat in await_cancel for
+    11 simulated days). Markers written before the timestamp existed are bare
+    SHAs and parse as `(head, "")`, which falls back to the weaker stall-clock
+    bound rather than escalating a PR mid-upgrade.
+    """
+
+    head, sep, decided_at = (raw or "").partition(CANCEL_MARKER_SEP)
+    return head, decided_at if sep else ""
+
+
+def cancel_grace_breached(cfg: FixConfig, decided_at: str, now: str) -> bool:
+    """Whether a cancel already issued for this head has had long enough.
+
+    The ADR 0012 ceiling on the await-cancel wait: the cancel gets ONE further
+    full pending deadline to take GitHub's run down, measured from WHEN THE
+    CANCEL WAS DECIDED. Derived from the stall deadline rather than configured
+    separately so an operator who tunes one tunes both.
+    """
+
+    if cfg.ci_pending_max_seconds <= 0:
+        return False
+    since = parse_timestamp(decided_at)
+    at = parse_timestamp(now)
+    if since is None or at is None:
+        # An UNDATED marker cannot be waited on: the only other clock available
+        # is the stall clock, and that is precisely the one a cancel resets by
+        # letting follow-on jobs start — the S2 hole, kept alive in a fallback
+        # (adversarial review N2). So an undated marker means the grace is
+        # already gone: escalate rather than wait on a bound that may never
+        # arrive. Only pre-upgrade markers are undated; a cancel decided by this
+        # code always carries the poll clock, because a stall cannot be detected
+        # at all unless `world.now` parses.
+        return True
+    return (at - since).total_seconds() >= cfg.ci_pending_max_seconds
+
+
+class CiStallStep(str, Enum):
+    """What the harness does about ONE stalled CI head this poll."""
+
+    # Take the wedged runs down so their failed jobs become rerunnable.
+    CANCEL = "cancel"
+    # Cancel already issued for this head; GitHub has not completed the run yet.
+    # Deliberately no action: cancellation completing is the next tick's
+    # observation, not something to block a daemon poll on.
+    AWAIT_CANCEL = "await_cancel"
+    # Budget or ceiling spent, or the runs cannot be safely identified — hand to
+    # a human, exactly as the pending deadline did before remediation existed.
+    ESCALATE = "escalate"
+
+
+@dataclass(frozen=True)
+class CiStallRemedy:
+    """One stalled head plus the step the harness takes about it.
+
+    THE single definition of the remediation, for the same reason
+    `ci_pending_stalls` is the single definition of "stalled": `decide_fix`
+    emits exactly this and the wiring journals exactly this, so the journal can
+    never disagree with the decision it explains.
+    """
+
+    stall: CiPendingStall
+    step: CiStallStep
+    issue: int = 0
+    run_ids: tuple[int, ...] = ()
+    detail: str = ""
+    # The poll clock, carried into the cancel so the marker can date it.
+    decided_at: str = ""
+
+    @property
+    def pr(self) -> int:
+        return self.stall.pr
+
+    @property
+    def head(self) -> str:
+        return self.stall.head
+
+    @property
+    def escalation_body(self) -> str:
+        if not self.stall.checks and self.stall.seconds <= 0:
+            # A synthesised stall (the post-cancel green illusion) has no
+            # pending clock and no pinning checks, so `CiPendingStall.reason`
+            # would report a nonexistent "pending for 0 minutes".
+            return self.detail
+        return f"{self.stall.reason} {self.detail}".strip()
+
+    def action(self) -> Action | None:
+        """The remote effect this step needs, or None while waiting."""
+        if self.step is CiStallStep.CANCEL:
+            return CancelWorkflowRuns(
+                self.pr, self.head, self.run_ids, self.decided_at
+            )
+        if self.step is CiStallStep.ESCALATE:
+            return EscalateCiPending(self.pr, self.head, self.escalation_body)
+        return None
+
+
+def ci_stall_remedies(
+    world: WorldState, cfg: FixConfig, state: FixState
+) -> tuple[CiStallRemedy, ...]:
+    """The remediation step for every stalled head this poll.
+
+    A wedged run is not a failure the fixer can act on and not a re-run GitHub
+    will accept: `rerun-failed-jobs` on an `in_progress` run is refused with
+    HTTP 403 "already running", which made the harness's re-run capability dead
+    on arrival for exactly the runs that needed it (keifu PR #177 — a job pinned
+    `in_progress` for 60+ minutes; the operator cancelled, waited for the run to
+    complete, re-ran the failed jobs, and CI went green).
+
+    So the deadline now spends its ONE free re-run instead of a human's time:
+    cancel → (next ticks) await completion → the cancelled run reads as a
+    settled FAILURE, and the pre-existing `free_ci_rerun` arm re-runs it. That
+    is why cancellation takes no budget of its own — the re-run it unblocks is
+    the budget, and a head that has already spent it escalates on sight.
+    """
+
+    prs = {pr.number: pr for pr in fixer_prs(world, cfg)}
+    remedies: list[CiStallRemedy] = []
+    for stall in ci_pending_stalls(world, cfg):
+        if (stall.pr, stall.head) in state.ci_pending_escalated:
+            continue
+        pr = prs.get(stall.pr)
+        issue = (_issue_for_pr(pr) or 0) if pr is not None else 0
+        run_ids = stalled_run_ids(pr, cfg) if pr is not None else ()
+        cancelled_head, cancelled_at = parse_cancel_marker(
+            state.ci_cancel_head.get(stall.pr, "")
+        )
+
+        if not stall.head:
+            # No SHA means no way to prove a cancel targets THIS commit's runs
+            # rather than a push that landed since, and no way to key either
+            # marker. Fail to the human path, never to an unguarded cancel.
+            step = CiStallStep.ESCALATE
+            detail = (
+                "The harness could not resolve the PR head SHA, so it could not "
+                "safely cancel the stuck run (a cancel is only issued for runs "
+                "whose head matches the commit under test)."
+            )
+        elif not cfg.ci_free_rerun:
+            # Cancelling is only worth doing because the free re-run picks the
+            # cancelled run back up. With re-runs disabled the cancel would
+            # destroy the run and buy a PAID repair leg pointed at a failure
+            # nobody produced, so the operator's switch turns this off too.
+            step = CiStallStep.ESCALATE
+            detail = (
+                "Free CI re-runs are disabled, so the harness will not cancel "
+                "the stuck run it could not then re-run."
+            )
+        elif state.ci_rerun_head.get(stall.pr, "") == stall.head:
+            step = CiStallStep.ESCALATE
+            detail = (
+                "This commit's one free CI re-run was already spent and CI has "
+                "wedged again, so the harness stops rather than re-running in a "
+                "loop."
+            )
+        elif cancelled_head == stall.head:
+            if cancel_grace_breached(cfg, cancelled_at, world.now):
+                step = CiStallStep.ESCALATE
+                detail = (
+                    "The harness cancelled the stuck workflow run, but it was "
+                    "still not completed a full deadline later \u2014 GitHub never "
+                    "took it down, so the re-run could not be issued."
+                )
+            else:
+                step = CiStallStep.AWAIT_CANCEL
+                detail = "cancel issued; awaiting run completion before the re-run"
+        elif not run_ids:
+            step = CiStallStep.ESCALATE
+            detail = (
+                "The pending checks carry no GitHub Actions run identity (an "
+                "external status, or an unrecognised details URL), so the "
+                "harness cannot cancel and re-run them."
+            )
+        else:
+            step = CiStallStep.CANCEL
+            detail = (
+                "cancelling the wedged workflow run so its failed jobs become "
+                "rerunnable"
+            )
+        remedies.append(
+            CiStallRemedy(stall, step, issue, run_ids, detail, world.now)
+        )
+    return tuple(remedies)
+
+
+def ci_cancel_green_illusions(
+    world: WorldState, cfg: FixConfig, state: FixState
+) -> tuple[CiStallRemedy, ...]:
+    """Heads the harness cancelled that came back GREEN BY OMISSION.
+
+    The remediation assumes a cancelled run observes as a settled FAILURE, which
+    is what the re-run then acts on. That holds for a job cancelled mid-flight,
+    but GitHub reports jobs that had NOT STARTED when the run was cancelled as
+    `skipped`, and `skipped` buckets as PASS. A run stalled in `queued` — the
+    starved-runner case — can therefore come back with nothing red at all.
+
+    Left alone, `ci_state` would flip PENDING → OK and an already-approved PR
+    would be auto-merged on the strength of CI the harness itself cancelled
+    (adversarial review S3). So a head with a live cancel marker and no spent
+    re-run is NOT allowed to read as green: it goes to a human, once, with the
+    reason. The re-run spending its budget is what clears the marker's authority
+    — after that the CI result is GitHub's again, not the harness's artefact.
+
+    Deliberately gated on the MARKER alone, not on `ci_pending_max_seconds` or
+    `ci_free_rerun` (adversarial review N3): those switches decide whether a
+    cancel may be ISSUED, and turning one off afterwards does not un-cancel a
+    run already taken down. A live marker means this harness cancelled this
+    head, and that stays true — and stays disqualifying — whatever the config
+    says next.
+    """
+
+    illusions: list[CiStallRemedy] = []
+    for pr in fixer_prs(world, cfg):
+        head = pr.head_ref_oid
+        cancelled_head, _at = parse_cancel_marker(
+            state.ci_cancel_head.get(pr.number, "")
+        )
+        if (
+            not head
+            or cancelled_head != head
+            or state.ci_rerun_head.get(pr.number, "") == head
+            or (pr.number, head) in state.ci_pending_escalated
+            or pr_lifecycle(pr).is_blocked
+        ):
+            continue
+        if ci_state(
+            pr.checks, cfg.ci_ignore_checks, known=pr.checks_known
+        ) not in (CIState.OK, CIState.NONE):
+            continue
+        illusions.append(
+            CiStallRemedy(
+                CiPendingStall(pr.number, head, 0, ()),
+                CiStallStep.ESCALATE,
+                _issue_for_pr(pr) or 0,
+                (),
+                # Says ONLY what is known. The harness cannot tell a run whose
+                # jobs were skipped by the cancellation from one that finished
+                # green on its own (a cancel that never landed — the mint failed
+                # — leaves the same marker), so it must not assert the first:
+                # an escalation that explains itself wrongly sends the human
+                # looking in the wrong place (adversarial review N1).
+                "The harness requested cancellation of this commit's stuck "
+                "workflow run, and CI now reports nothing red. It cannot tell "
+                "whether those checks actually ran or were skipped by the "
+                "cancellation, so this green is unverified — re-run CI before "
+                "merging.",
+                world.now,
+            )
+        )
+    return tuple(illusions)
+
+
+def ci_remediations(
+    world: WorldState, cfg: FixConfig, state: FixState
+) -> tuple[CiStallRemedy, ...]:
+    """Every CI-remediation step this poll: wedged heads, then cancel aftermath.
+
+    THE single derivation both halves read. `decide_fix` emits exactly this and
+    the wiring journals exactly this, so an escalation can never happen without
+    a record explaining it (adversarial review N5 — the aftermath arm escalated
+    outside the reporter's view, which is the failure
+    `test_the_journal_agrees_with_the_escalation_it_explains` exists to forbid).
+    """
+
+    return (
+        *ci_stall_remedies(world, cfg, state),
+        *ci_cancel_green_illusions(world, cfg, state),
+    )
+
+
 # ── flake-aware CI repair (#38) ──────────────────────────────────────────────
 def free_ci_rerun(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
     """Whether this PR's ONE free CI re-run is still unspent for its CURRENT
@@ -1229,13 +1533,17 @@ def decide_fix(
     # dependence (the reason the auto-merge pass below deliberately does NOT
     # filter this poll's other escalations) precisely because this arm is
     # lock-free itself.
-    for stall in ci_pending_stalls(world, cfg):
-        if (stall.pr, stall.head) in state.ci_pending_escalated:
-            continue
-        actions.append(
-            EscalateCiPending(stall.pr, stall.head, stall.reason)
-        )
-        open_prs = [p for p in open_prs if p.number != stall.pr]
+    #
+    # Since keifu PR #177 the deadline no longer goes straight to a human: a
+    # wedged run is first cancelled so its failed jobs become rerunnable, and the
+    # existing free re-run (#38) picks it up once GitHub reports the run
+    # complete. Cancel, wait and escalate all remove the PR from `open_prs` —
+    # while the harness is unwedging CI, no repair leg may be dispatched at it.
+    for remedy in ci_remediations(world, cfg, state):
+        action = remedy.action()
+        if action is not None:
+            actions.append(action)
+        open_prs = [p for p in open_prs if p.number != remedy.pr]
 
     # 0b) Duplicate-PR guard (#39). Lock-free for the same reason the pass above
     # is: it dispatches no agent and emits the same actions for a given world

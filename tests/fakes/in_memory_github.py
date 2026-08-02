@@ -38,6 +38,9 @@ class InMemoryGitHub:
         self.automerge_enabled: set[int] = set()
         self.rerun_run_id = 4242
         self.run_attempts: dict[str, int] = {}
+        # head -> {run_id: status}. Absent head = the runs are not this head's,
+        # which is how the SHA guard on cancellation is exercised.
+        self.run_states: dict[str, dict[int, str]] = {}
         self.dependencies: set[tuple[int, int]] = set()
         self.submitted_reviews: set[tuple[int, str, str, str]] = set()
 
@@ -122,6 +125,36 @@ class InMemoryGitHub:
     ) -> dict[int, int] | None:
         current = self.run_attempts.get(head, 0)
         return {run_id: current for run_id in run_ids}
+
+    def workflow_run_states(
+        self, head: str, run_ids: tuple[int, ...]
+    ) -> dict[int, str] | None:
+        states = self.run_states.get(head)
+        if states is None or any(run_id not in states for run_id in run_ids):
+            return None
+        return {run_id: states[run_id] for run_id in run_ids}
+
+    def cancel_workflow_runs(
+        self, head: str, run_ids: tuple[int, ...]
+    ) -> tuple[int, ...] | None:
+        self._maybe_fail("cancel_workflow_runs")
+        states = self.workflow_run_states(head, run_ids)
+        if states is None:
+            return None
+        cancelled = tuple(
+            run_id for run_id, status in states.items() if status != "completed"
+        )
+        self.calls.append(("cancel", head, run_ids))
+        # Deliberately does NOT flip the run to completed: GitHub takes a
+        # cancelled run down asynchronously, and a fake that completes it
+        # synchronously hides the bug where a successful cancel is receipted as
+        # a failure (adversarial review S1). `complete_runs` models the lag.
+        return cancelled
+
+    def complete_runs(self, head: str) -> None:
+        """Let GitHub finish taking the cancelled runs down (next tick)."""
+        for run_id in self.run_states.get(head, {}):
+            self.run_states[head][run_id] = "completed"
 
     def has_blocked_by(self, issue: int, blocker: int) -> bool:
         return (issue, blocker) in self.dependencies

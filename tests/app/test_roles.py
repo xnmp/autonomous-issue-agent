@@ -87,6 +87,7 @@ from issue_agent.app.roles import (
 from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.actions import (
     AgentKind,
+    CancelWorkflowRuns,
     EscalateCiPending,
     Relabel,
     RunAgent,
@@ -1559,6 +1560,12 @@ def _stalls_in(journal):
     ]
 
 
+def _steps_in(journal):
+    return [
+        e for e in read_events(journal.path) if e.get("event") == "ci_stall_step"
+    ]
+
+
 def test_a_wedged_check_is_journaled_once_and_logged_every_poll(tmp_path):
     """AC: the deadlock stops being invisible. The journal carries the PR, the
     head, the elapsed seconds and the pinning check names — enough to compute an
@@ -1569,14 +1576,17 @@ def test_a_wedged_check_is_journaled_once_and_logged_every_poll(tmp_path):
     report = _ci_stall_reporter(journal, "o/r", _STALL_CFG, logs.append)
 
     for _ in range(3):
-        report(_stalled_world())
+        report(_stalled_world(), _EMPTY_FIX_STATE)
 
     assert _stalls_in(journal) == [
         {
             "ts": _stalls_in(journal)[0]["ts"], "event": "ci_pending_deadline",
-            "pr": 144, "head": "sha-aaa", "seconds": 3601,
+            "pr": 144, "issue": 9, "head": "sha-aaa", "seconds": 3601,
             "checks": ["Test (windows-latest)"],
-            "block_key": "ci-pending:o/r:144:sha-aaa",
+            # The remediation STEP is part of the key: this PR's pending check
+            # is an external status with no workflow-run identity, so the only
+            # step available is the human escalation.
+            "block_key": "ci-pending:o/r:144:sha-aaa:escalate",
         }
     ]
     assert len(logs) == 3 and all("#144" in ln for ln in logs)
@@ -1586,7 +1596,7 @@ def test_a_healthy_pending_pr_is_neither_logged_nor_journaled(tmp_path):
     journal = Journal(str(tmp_path / "journal.jsonl"))
     logs = []
     _ci_stall_reporter(journal, "o/r", _STALL_CFG, logs.append)(
-        _stalled_world(elapsed=23 * 60)
+        _stalled_world(elapsed=23 * 60), _EMPTY_FIX_STATE
     )
     assert _stalls_in(journal) == [] and logs == []
 
@@ -1597,8 +1607,8 @@ def test_a_new_head_wedging_again_is_its_own_event(tmp_path):
     journal = Journal(str(tmp_path / "journal.jsonl"))
     report = _ci_stall_reporter(journal, "o/r", _STALL_CFG, lambda _m: None)
 
-    report(_stalled_world(head="sha-aaa"))
-    report(_stalled_world(head="sha-bbb"))
+    report(_stalled_world(head="sha-aaa"), _EMPTY_FIX_STATE)
+    report(_stalled_world(head="sha-bbb"), _EMPTY_FIX_STATE)
 
     assert [e["head"] for e in _stalls_in(journal)] == ["sha-aaa", "sha-bbb"]
 
@@ -1608,24 +1618,134 @@ def test_the_stall_dedup_survives_a_daemon_restart(tmp_path):
     control = _control(tmp_path)
     _ci_stall_reporter(
         journal, "o/r", _STALL_CFG, lambda _m: None, control
-    )(_stalled_world())
+    )(_stalled_world(), _EMPTY_FIX_STATE)
     _ci_stall_reporter(
         journal, "o/r", _STALL_CFG, lambda _m: None, control
-    )(_stalled_world())
+    )(_stalled_world(), _EMPTY_FIX_STATE)
 
     assert len(_stalls_in(journal)) == 1
 
 
-def test_the_journal_agrees_with_the_escalation_it_explains(tmp_path):
+def _wedged_run_world(head="sha-aaa", elapsed=3601):
+    """A stalled PR whose pinning check carries a workflow-run identity, so the
+    harness can cancel it instead of handing it to a human (keifu PR #177)."""
+    w = _stalled_world(head=head, elapsed=elapsed)
+    pr = w.prs[0]
+    return replace(
+        w, prs=(replace(pr, checks=(replace(pr.checks[0], run_id=4242),)),)
+    )
+
+
+def _cancelled_state(at="2026-07-28T13:00:01+00:00"):
+    return FixState(ci_cancel_head={144: f"sha-aaa@{at}"})
+
+
+def test_each_remediation_step_is_journaled_once_with_its_correlation(tmp_path):
+    """ADR 0012: the cancel, the wait it opens and the escalation that bounds it
+    are three facts about one head, each journaled once — a wait that recurs
+    every poll would be noise, and a wait nothing records is invisible."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    report = _ci_stall_reporter(journal, "o/r", _STALL_CFG, lambda _m: None)
+
+    for _ in range(3):
+        report(_wedged_run_world(), _EMPTY_FIX_STATE)
+    for _ in range(3):
+        report(_wedged_run_world(elapsed=3700), _cancelled_state())
+    report(_wedged_run_world(elapsed=7201), _cancelled_state())
+
+    assert [(e["step"], e["block_key"]) for e in _steps_in(journal)] == [
+        ("cancel", "ci-pending:o/r:144:sha-aaa:cancel"),
+        ("await_cancel", "ci-pending:o/r:144:sha-aaa:await_cancel"),
+    ]
+    # Correlation carries both ends of the incident, not just the PR.
+    assert all(
+        (e["pr"], e["issue"]) == (144, 9)
+        for e in _steps_in(journal) + _stalls_in(journal)
+    )
+
+
+def test_a_wedge_the_harness_heals_never_counts_as_an_escalation(tmp_path):
+    """`ci_pending_deadline` is the escalation-rate guardrail. A rate counted
+    from steps that hand nothing to a human is not a rate — the change would
+    appear to worsen the guardrail it exists to protect."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    report = _ci_stall_reporter(journal, "o/r", _STALL_CFG, lambda _m: None)
+
+    report(_wedged_run_world(), _EMPTY_FIX_STATE)
+    report(_wedged_run_world(elapsed=3700), _cancelled_state())
+
+    assert _stalls_in(journal) == []
+    assert [e["step"] for e in _steps_in(journal)] == ["cancel", "await_cancel"]
+
+    # …and the step that DOES reach a human still counts.
+    report(_wedged_run_world(elapsed=7201), _cancelled_state())
+    assert [e["head"] for e in _stalls_in(journal)] == ["sha-aaa"]
+
+
+def test_the_journal_agrees_with_the_cancel_it_explains(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    w = _wedged_run_world()
+    _ci_stall_reporter(journal, "o/r", _STALL_CFG, lambda _m: None)(
+        w, _EMPTY_FIX_STATE
+    )
+
+    cancelled = {
+        a.pr for a in decide_fix(w, _STALL_CFG, _EMPTY_FIX_STATE, fixer_busy=False)
+        if isinstance(a, CancelWorkflowRuns)
+    }
+    assert cancelled == {e["pr"] for e in _steps_in(journal)} == {144}
+
+
+def _green_after_cancel_world(head="sha-aaa"):
+    """A PR whose cancelled run came back with nothing red — the aftermath arm.
+
+    Its pinning check is gone (the run was taken down) and what remains reads as
+    a pass, which is exactly the state `ci_cancel_green_illusions` refuses to
+    treat as evidence.
+    """
+    w = _stalled_world(head=head)
+    pr = w.prs[0]
+    return replace(
+        w,
+        prs=(
+            replace(
+                pr,
+                checks=(
+                    replace(
+                        pr.checks[0], state="COMPLETED", bucket="pass", run_id=4242
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "world_builder,state_builder",
+    [
+        (_stalled_world, lambda: _EMPTY_FIX_STATE),
+        (_green_after_cancel_world, _cancelled_state),
+    ],
+    ids=["pending-deadline", "cancel-aftermath"],
+)
+def test_the_journal_agrees_with_the_escalation_it_explains(
+    tmp_path, world_builder, state_builder
+):
     """The two halves read the SAME derivation, so a journaled stall is always a
     PR decide_fix escalates in that very poll — never a line about a PR nothing
-    acted on, nor an escalation with no record."""
+    acted on, nor an escalation with no record.
+
+    Parametrised over BOTH escalating arms (adversarial review N5): the cancel
+    aftermath used to escalate outside the reporter's view, and this test passed
+    only because its world had no cancel marker to reach that arm.
+    """
     journal = Journal(str(tmp_path / "journal.jsonl"))
-    w = _stalled_world()
-    _ci_stall_reporter(journal, "o/r", _STALL_CFG, lambda _m: None)(w)
+    w = world_builder()
+    state = state_builder()
+    _ci_stall_reporter(journal, "o/r", _STALL_CFG, lambda _m: None)(w, state)
 
     escalated = {
-        a.pr for a in decide_fix(w, _STALL_CFG, _EMPTY_FIX_STATE, fixer_busy=False)
+        a.pr for a in decide_fix(w, _STALL_CFG, state, fixer_busy=False)
         if isinstance(a, EscalateCiPending)
     }
     assert escalated == {e["pr"] for e in _stalls_in(journal)} == {144}

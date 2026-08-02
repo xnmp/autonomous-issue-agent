@@ -1046,6 +1046,122 @@ def test_rerun_failed_checks_preserves_transport_failure_for_durable_recovery():
         gw.rerun_failed_checks("head-1", (4242,))
 
 
+def test_a_cancelled_run_reads_as_a_settled_failure_not_as_green():
+    """The load-bearing half of the wedged-run remediation (keifu PR #177).
+
+    The harness cancels a wedged run so the pre-existing free re-run can act on
+    it, and that handoff exists ONLY because a cancelled run observes as a
+    settled FAILURE. If it ever read as pass/none instead, the harness would
+    have cancelled a PR's CI and then armed auto-merge on the silence.
+    """
+
+    def runner(argv, token):
+        key = " ".join(argv)
+        if "pr view 177" in key:
+            return json.dumps({
+                "number": 177, "state": "OPEN", "headRefOid": "head-177",
+            })
+        if "/commits/head-177/check-runs" in key:
+            return json.dumps([{"check_runs": [{
+                "name": "Test (windows-latest)",
+                "status": "completed",
+                "conclusion": "cancelled",
+                "details_url": (
+                    "https://github.com/o/r/actions/runs/4242/job/99"
+                ),
+            }]}])
+        if "/commits/head-177/statuses" in key:
+            return json.dumps([[]])
+        if "actions/runs/4242" in key:
+            return json.dumps({"conclusion": "cancelled"})
+        return ""
+
+    pr = GitHubGateway("o/r", runner=runner).get_pr(177)
+
+    assert ci_state(pr.checks) is CIState.FAILURE
+    assert pr.checks[0].advisory is False
+    assert pr.checks[0].run_id == 4242
+
+
+# ── wedged-run cancel (keifu PR #177) ────────────────────────────────────────
+def test_cancel_workflow_runs_cancels_the_runs_pinning_the_observed_head():
+    fr = FakeRunner({
+        "api repos/o/r/actions/runs/4242": {
+            "id": 4242, "head_sha": "head-1", "status": "in_progress",
+        },
+        "api repos/o/r/actions/runs/4343": {
+            "id": 4343, "head_sha": "head-1", "status": "queued",
+        },
+    })
+    gw = GitHubGateway("o/r", runner=fr)
+
+    assert gw.cancel_workflow_runs("head-1", (4242, 4343)) == (4242, 4343)
+    assert [
+        call[0][2] for call in fr.calls
+        if call[0][1] == "api" and call[0][2].endswith("/cancel")
+    ] == [
+        "repos/o/r/actions/runs/4242/cancel",
+        "repos/o/r/actions/runs/4343/cancel",
+    ]
+
+
+def test_cancel_workflow_runs_refuses_a_run_belonging_to_a_newer_push():
+    # Cancelling is destructive: a run whose head_sha is not the commit the
+    # decision looked at is someone else's CI, and a partial cancel would leave
+    # the real pin in place while reading as handled.
+    fr = FakeRunner({
+        "api repos/o/r/actions/runs/4242": {
+            "id": 4242, "head_sha": "head-1", "status": "in_progress",
+        },
+        "api repos/o/r/actions/runs/4343": {
+            "id": 4343, "head_sha": "newer-head", "status": "in_progress",
+        },
+    })
+    gw = GitHubGateway("o/r", runner=fr)
+
+    assert gw.cancel_workflow_runs("head-1", (4242, 4343)) is None
+    assert not any(call[0][2].endswith("/cancel") for call in fr.calls)
+
+
+def test_cancel_workflow_runs_is_idempotent_over_an_already_completed_run():
+    # Durable replay must not fail because GitHub already took the run down.
+    fr = FakeRunner({
+        "api repos/o/r/actions/runs/4242": {
+            "id": 4242, "head_sha": "head-1", "status": "completed",
+        },
+    })
+    gw = GitHubGateway("o/r", runner=fr)
+
+    assert gw.cancel_workflow_runs("head-1", (4242,)) == ()
+    assert not any(call[0][2].endswith("/cancel") for call in fr.calls)
+
+
+def test_cancel_workflow_runs_rejects_unusable_run_identities():
+    gw = GitHubGateway("o/r", runner=FakeRunner({}))
+    assert gw.cancel_workflow_runs("", (4242,)) is None
+    assert gw.cancel_workflow_runs("head-1", ()) is None
+    assert gw.cancel_workflow_runs("head-1", (0,)) is None
+    assert gw.cancel_workflow_runs("head-1", (-1,)) is None
+
+
+def test_cancel_workflow_runs_rejects_a_malformed_or_statusless_answer():
+    fr = FakeRunner({
+        "api repos/o/r/actions/runs/4242": {"id": 4242, "head_sha": "head-1"},
+    })
+    assert GitHubGateway("o/r", runner=fr).cancel_workflow_runs(
+        "head-1", (4242,)
+    ) is None
+    assert not any(call[0][2].endswith("/cancel") for call in fr.calls)
+
+
+def test_cancel_workflow_runs_preserves_transport_failure_for_durable_recovery():
+    gw = GitHubGateway(
+        "o/r", runner=_raising_runner(GhUnavailable("server", "HTTP 503"))
+    )
+    with pytest.raises(GhUnavailable):
+        gw.cancel_workflow_runs("head-1", (4242,))
+
+
 def test_failed_run_id_and_failed_run_log_agree_on_the_run():
     # One lookup, two consumers — the CI-fix prompt and the re-run must never
     # disagree about WHICH run failed.
