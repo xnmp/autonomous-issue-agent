@@ -3940,8 +3940,45 @@ class SQLiteControlStore:
                 {"reason": "authoritative verification found no effect"},
             )
 
-    def resolve_unknown_effect(self, receipt: EffectReceipt) -> None:
-        """Replace an ambiguous receipt after authoritative remote verification."""
+    def resolve_unknown_effect(self, receipt: EffectReceipt) -> bool:
+        """Replace an ambiguous receipt after authoritative remote verification.
+
+        True means THIS call performed the reconciliation. False means the
+        command was ALREADY settled `succeeded` by another actor and this call
+        is a no-op that asserts the same outcome — benign, not an error.
+
+        The False answer exists because command enumeration and reconciliation
+        cannot share a transaction: `pending_commands` returns a snapshot, and
+        the reconciling reads between it and this call are remote. keifu PR
+        #177 (2026-08-02): the executing process submitted the review and
+        committed its succeeded receipt while a second drain — hot reload makes
+        two drains overlap routinely — was mid-`has_review` on the same
+        command. The second drain then verified the very effect the first had
+        just settled and got "command is not awaiting reconciliation", a scary
+        line for an outcome both actors agreed on. Two actors independently
+        proving the same success is a benign convergence; the earlier receipt
+        is authoritative (it carries the real execution window) and is kept.
+
+        Every other non-reconcilable state still RAISES. `pending` means a
+        receipt exists for a command that never executed; `retryable_failure` /
+        `permanent_failure` mean a verified success contradicts a recorded
+        failure; a missing row means the receipt has no command. Those are
+        corruption, not convergence, and must stay loud. `succeeded` without a
+        succeeded receipt is likewise corruption — it is the settled state
+        without the evidence that produces it.
+
+        Convergence is also NOT assumed when the two actors demonstrably
+        produced DIFFERENT remote objects. `reconcile_async`'s "reconciling
+        read" is not always read-only: the Jira workflow's is a paid
+        search-then-create MCP leg, so two overlapping workflows can create
+        PROJ-100 and PROJ-101 for one command. Silently answering False there
+        would let the caller persist the key the authoritative receipt does
+        not name, orphaning a paid duplicate with no log line. Differing
+        non-null `remote_object_id`s therefore raise: that is provable
+        divergence, not convergence. Either side null carries no evidence of
+        disagreement (most effects never name a remote object) and stays
+        benign.
+        """
 
         if receipt.status is not EffectStatus.SUCCEEDED:
             raise ValueError("unknown effect can only resolve to succeeded here")
@@ -3950,13 +3987,41 @@ class SQLiteControlStore:
                 "SELECT state FROM lifecycle_commands WHERE command_id=?",
                 (str(receipt.command_id),),
             ).fetchone()
-            if row is None or row["state"] not in {"executing", "unknown_outcome"}:
+            if row is None:
+                raise ControlStoreError("command is not awaiting reconciliation")
+            state = str(row["state"])
+            if state == EffectStatus.SUCCEEDED.value:
+                settled = db.execute(
+                    "SELECT status, remote_object_id FROM effect_receipts "
+                    "WHERE command_id=?",
+                    (str(receipt.command_id),),
+                ).fetchone()
+                if (
+                    settled is None
+                    or str(settled["status"]) != EffectStatus.SUCCEEDED.value
+                ):
+                    raise ControlStoreError(
+                        "command is succeeded without a succeeded receipt"
+                    )
+                surviving = settled["remote_object_id"]
+                if (
+                    surviving
+                    and receipt.remote_object_id
+                    and str(surviving) != str(receipt.remote_object_id)
+                ):
+                    raise ControlStoreError(
+                        "command already succeeded against a different remote "
+                        f"object: {surviving} != {receipt.remote_object_id}"
+                    )
+                return False
+            if state not in {"executing", EffectStatus.UNKNOWN_OUTCOME.value}:
                 raise ControlStoreError("command is not awaiting reconciliation")
             db.execute(
                 "DELETE FROM effect_receipts WHERE command_id=?",
                 (str(receipt.command_id),),
             )
             self._insert_effect(db, receipt, _receipt_digest(receipt))
+            return True
 
     def exhaust_command(self, receipt: EffectReceipt) -> bool:
         """Retire a command that has burned its retry ceiling (ADR 0012).

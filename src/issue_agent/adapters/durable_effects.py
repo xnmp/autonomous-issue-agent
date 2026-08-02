@@ -30,7 +30,7 @@ class EffectControl(Protocol):
 
     def retry_reconciled_command(self, command_id: CommandId) -> None: ...
 
-    def resolve_unknown_effect(self, receipt: EffectReceipt) -> None: ...
+    def resolve_unknown_effect(self, receipt: EffectReceipt) -> bool: ...
 
     def record_effect(self, receipt: EffectReceipt) -> bool: ...
 
@@ -150,6 +150,14 @@ class DurableEffectRunner:
             outcome = await operation()
             receipt = self._outcome_receipt(command, started, outcome)
             if receipt.status is EffectStatus.SUCCEEDED:
+                # False = another actor settled the same success first, so the
+                # caller's answer is unchanged. Unlike `resolve_unknown`, the
+                # `operation` reconciled here is not necessarily read-only —
+                # the Jira workflow's is a paid search-then-create leg — so a
+                # discarded False must not be able to hide a duplicated
+                # creation. It cannot: the store RAISES instead of answering
+                # False when the surviving receipt names a different remote
+                # object than this one.
                 self.control.resolve_unknown_effect(receipt)
             return outcome.value
 
@@ -181,6 +189,10 @@ class DurableEffectRunner:
             receipt = self._outcome_receipt(command, now, outcome)
             if receipt.status is not EffectStatus.SUCCEEDED:
                 raise ValueError("resolved unknown effects must be successful")
+            # False = another actor settled the same success first. The caller's
+            # answer is unchanged either way: the remote effect is applied, and
+            # nothing further is owed. Only a state that cannot hold a verified
+            # success raises out of the store.
             self.control.resolve_unknown_effect(receipt)
         return outcome.value
 
