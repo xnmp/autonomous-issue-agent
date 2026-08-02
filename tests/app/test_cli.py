@@ -1802,7 +1802,8 @@ def test_cmd_init_pins_codex_bin_when_the_path_hides_a_newer_install(
     )
     shared, _asked, _s = _init_env(
         tmp_path, monkeypatch,
-        answers=["three", "fix-bot", "review-bot", "review-bot", "N"],
+        answers=["three", "fix-bot", "review-bot", "review-bot", "N", "N",
+                 "claude", "codex"],
         secrets=["", ""], codex=shadowed,
     )
 
@@ -1814,13 +1815,35 @@ def test_cmd_init_leaves_codex_bin_unpinned_when_resolution_is_clean(
     tmp_path, monkeypatch
 ):
     shared, _asked, _s = _init_env(
-        tmp_path, monkeypatch, answers=_wizard_answers(), secrets=["good"],
-        gh=_gh_stub(token_logins={"good": "review-bot"}),
+        tmp_path, monkeypatch,
+        answers=["three", "fix-bot", "review-bot", "review-bot", "N", "N",
+                 "claude", "codex", "https://api.openai.com/v1"],
+        secrets=["", ""],
         codex=_codex_report(path="/opt/codex", version="0.147.0"),
     )
 
     assert cli.cmd_init(argparse.Namespace(force=False)) == 0
     assert "CODEX_BIN" not in _shared_values(shared.read_text())
+
+
+def test_cmd_init_never_asks_about_codex_for_a_claude_only_deployment(
+    tmp_path, monkeypatch
+):
+    """A deployment that never spawns codex has no reason to answer for a binary
+    it will not run — and no reason to carry a CODEX_BIN into its config."""
+    shadowed = codex_resolution.analyse_codex_resolution(
+        "codex", "/usr/bin/codex", "0.142.3",
+        (codex_resolution.CodexCandidate("/usr/bin/codex", "0.142.3"),
+         codex_resolution.CodexCandidate("/opt/codex", "0.147.0")),
+    )
+    shared, asked, _s = _init_env(
+        tmp_path, monkeypatch, answers=_wizard_answers(), secrets=["", ""],
+        codex=shadowed,
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert "CODEX_BIN" not in _shared_values(shared.read_text())
+    assert not any("CODEX_BIN" in prompt for prompt in asked.prompts)
 
 
 def test_cmd_init_keeps_codex_unpinned_when_the_operator_declines(
@@ -1834,7 +1857,7 @@ def test_cmd_init_keeps_codex_unpinned_when_the_operator_declines(
     shared, _asked, _s = _init_env(
         tmp_path, monkeypatch,
         answers=["three", "fix-bot", "review-bot", "review-bot", "N", "N",
-                 "n", "claude", "claude"],
+                 "claude", "codex", "n", "https://api.openai.com/v1"],
         secrets=["", ""], codex=shadowed,
     )
 

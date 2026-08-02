@@ -10,12 +10,15 @@ import argparse
 import os
 import stat
 import subprocess
+import time
 
 import pytest
 
 from issue_agent.app import cli
 from issue_agent.app.codex_resolution import (
+    MAX_SCAN_DIRS,
     MAX_VERSION_PROBES,
+    VERSION_TIMEOUT_SECONDS,
     CodexCandidate,
     analyse_codex_resolution,
     codex_resolution_report,
@@ -37,6 +40,10 @@ from issue_agent.app.codex_resolution import (
         ("command not found", ""),
         ("\x00\xff garbage", ""),
         ("codex-cli2 0.147.0", "0.147.0"),
+        ("v0.147.0", "0.147.0"),
+        ("codex-cli v0.147.0", "0.147.0"),
+        ("codex 2026-08-02 nightly", ""),
+        ("codex 7", ""),
     ],
 )
 def test_parse_codex_version(output, expected):
@@ -162,20 +169,76 @@ def test_a_binary_that_reports_no_version_is_an_error(tmp_path):
 
 
 def test_symlinked_duplicates_are_one_candidate(tmp_path):
+    """A symlink farm over one install must not read as a shadowed install."""
     real = _fake_codex(tmp_path / "real", "0.147.0")
     link_dir = tmp_path / "link"
     link_dir.mkdir()
-    (link_dir / "codex").symlink_to(real)
+    link = link_dir / "codex"
+    link.symlink_to(real)
 
     report = codex_resolution_report(
         "codex",
         path_env=os.pathsep.join([str(link_dir), str(tmp_path / "real")]),
-        extra_dirs=(), probe=_versions(**{real: "0.147.0"}),
+        extra_dirs=(), probe=_versions(**{real: "0.147.0", str(link): "0.147.0"}),
     )
 
-    assert report.resolved_path == real
-    assert [c.path for c in report.candidates] == [real]
-    assert report.healthy is False and report.findings[0].level == "warn"
+    assert [c.path for c in report.candidates] == [str(link)]
+    assert [f.level for f in report.findings] == ["warn"]  # bare name only
+
+
+def test_the_recommended_pin_is_the_stable_path_not_the_realpath(tmp_path):
+    """NixOS: a realpath is /nix/store/<hash>/bin/codex, which the next garbage
+    collection deletes. Pinning it would bake the very class of failure this
+    check exists to prevent into the config."""
+    store = _fake_codex(tmp_path / "store" / "abc123" / "bin", "0.147.0")
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    stable = profile / "codex"
+    stable.symlink_to(store)
+
+    report = codex_resolution_report(
+        "codex", path_env=str(profile), extra_dirs=(),
+        probe=_versions(**{str(stable): "0.147.0"}),
+    )
+
+    assert report.resolved_path == str(stable)
+    assert report.recommended_bin == str(stable)
+    assert store not in " ".join(f.message for f in report.findings)
+
+
+def test_an_unknown_effective_version_never_recommends_a_switch(tmp_path):
+    """F1: a probe timeout on the real 0.147.0 must not make a stale 0.100.0
+    elsewhere look newer — 'unknown' is not 'old'."""
+    here = _fake_codex(tmp_path / "here", "0.147.0")
+    there = _fake_codex(tmp_path / "there", "0.100.0")
+
+    report = codex_resolution_report(
+        here, path_env=os.pathsep.join([str(tmp_path / "here"), str(tmp_path / "there")]),
+        extra_dirs=(), probe=_versions(**{there: "0.100.0"}),  # `here` answers ''
+    )
+
+    assert report.version == ""
+    assert report.recommended_bin == here
+    assert [f.level for f in report.findings] == ["error"]
+    assert there not in " ".join(f.message for f in report.findings)
+
+
+def test_extra_directories_survive_a_path_at_the_scan_ceiling(tmp_path):
+    """F6: appending the extras to a long PATH and then truncating would drop
+    ~/.local/bin — the one directory the whole check exists to notice."""
+    local = _fake_codex(tmp_path / "local", "0.147.0")
+    filler = [str(tmp_path / f"pad{n}") for n in range(MAX_SCAN_DIRS + 10)]
+    system = _fake_codex(tmp_path / "system", "0.142.3")
+
+    report = codex_resolution_report(
+        "codex",
+        path_env=os.pathsep.join([str(tmp_path / "system"), *filler]),
+        extra_dirs=(str(tmp_path / "local"),),
+        probe=_versions(**{system: "0.142.3", local: "0.147.0"}),
+    )
+
+    assert report.recommended_bin == local
+    assert f"CODEX_BIN={local}" in " ".join(f.message for f in report.findings)
 
 
 def test_the_scan_bounds_how_many_binaries_it_versions(tmp_path):
@@ -311,3 +374,74 @@ def test_doctor_prints_the_resolved_path_and_version_when_healthy(
 
     out = capsys.readouterr().out
     assert "/opt/codex" in out and "0.147.0" in out and "pinned" in out
+
+
+# ── the real probe's bounds ───────────────────────────────────────────────────
+def test_the_probe_abandons_a_spewing_binary_without_buffering_it(tmp_path):
+    """F4: capture_output buffers the WHOLE stream before anything truncates it
+    (measured: 15.9GiB RSS). The bound has to be at the pipe."""
+    path = tmp_path / "bin" / "codex"
+    path.parent.mkdir()
+    path.write_text("#!/bin/sh\nexec yes 0123456789abcdef\n")
+    path.chmod(0o755)
+
+    started = time.monotonic()
+    report = codex_resolution_report(str(path), path_env=str(tmp_path / "bin"),
+                                     extra_dirs=())
+    elapsed = time.monotonic() - started
+
+    # Under the buffer-then-truncate implementation this ran until the
+    # timeout fired; bounded at the pipe it returns as soon as it has enough.
+    assert elapsed < VERSION_TIMEOUT_SECONDS
+    assert [f.level for f in report.findings] == ["error"]
+
+
+def test_the_probe_reports_a_version_the_binary_prints_after_a_banner(tmp_path):
+    path = tmp_path / "bin" / "codex"
+    path.parent.mkdir()
+    path.write_text("#!/bin/sh\necho 'warning: config drift'\necho 'codex-cli 0.147.0'\n")
+    path.chmod(0o755)
+
+    report = codex_resolution_report(str(path), path_env=str(tmp_path / "bin"),
+                                     extra_dirs=())
+
+    assert report.version == "0.147.0"
+    assert report.healthy
+
+
+def test_the_probe_never_reads_the_operators_stdin(tmp_path):
+    """F5: a probe that inherits stdin swallows the wizard's own answers."""
+    path = tmp_path / "bin" / "codex"
+    path.parent.mkdir()
+    path.write_text("#!/bin/sh\nread line && echo \"codex-cli 9.9.9 $line\" || echo 'codex-cli 0.147.0'\n")
+    path.chmod(0o755)
+
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b"operator-answer\n")
+    os.close(write_fd)
+    saved = os.dup(0)
+    try:
+        os.dup2(read_fd, 0)
+        report = codex_resolution_report(str(path), path_env=str(tmp_path / "bin"),
+                                         extra_dirs=())
+    finally:
+        os.dup2(saved, 0)
+        os.close(saved)
+        os.close(read_fd)
+
+    assert report.version == "0.147.0"
+
+
+def test_the_probe_gives_up_on_a_binary_that_never_answers(tmp_path):
+    path = tmp_path / "bin" / "codex"
+    path.parent.mkdir()
+    path.write_text("#!/bin/sh\nsleep 300\n")
+    path.chmod(0o755)
+
+    started = time.monotonic()
+    report = codex_resolution_report(str(path), path_env=str(tmp_path / "bin"),
+                                     extra_dirs=())
+
+    assert time.monotonic() - started < 30
+    assert report.version == ""
+    assert [f.level for f in report.findings] == ["error"]

@@ -2225,6 +2225,15 @@ def cmd_doctor(args) -> int:
         r = subprocess.run([_BASH, _bin("compose-env.sh"), name])
         if r.returncode == 0:
             env["AGENT_ENV"] = _active_env_path(name)
+        else:
+            # P0R-2 adjacency: a FAILED compose used to leave any AGENT_ENV
+            # inherited from the operator's shell in place, so doctor would
+            # preflight whatever snapshot that pointed at — possibly another
+            # deployment's — while reporting on this one. Dropping it makes the
+            # failure visible instead (doctor.sh falls back and complains).
+            env.pop("AGENT_ENV", None)
+            err(f"compose-env.sh failed for '{name}' — checks below run WITHOUT a "
+                f"composed env snapshot.")
     elif os.path.isfile(SHARED_ENV):
         # shared.env exists but this repo has no overlay yet — the normal state
         # before the first `issue-agent start`. compose-env.sh needs both files,
@@ -2580,16 +2589,6 @@ def cmd_init(args) -> int:
         ok("codex: API-key auth")
     else:
         ok("codex: auth mode unknown — `codex login` if it is not signed in")
-    # An unpinned or shadowed codex is written out as an absolute CODEX_BIN by
-    # default: the wizard runs in the operator's shell, the daemons run under
-    # systemd's minimal PATH, and on 2026-08-02 that gap silently downgraded
-    # keifu's codex to a version the provider refuses to serve.
-    if codex_present and not codex.healthy and codex.recommended_bin:
-        if ask(f"Pin CODEX_BIN={codex.recommended_bin}? (Y/n)", "Y").lower().startswith("y"):
-            fields.append(("CODEX_BIN", codex.recommended_bin))
-        else:
-            warn("CODEX_BIN left unpinned — the daemons' PATH decides which codex "
-                 "runs, and `issue-agent doctor` re-checks it.")
     fields.append((
         "FIXER_RUNTIME",
         ask("Fixer runtime (claude|codex)", "claude" if claude_ready or not codex_present else "codex"),
@@ -2599,6 +2598,18 @@ def cmd_init(args) -> int:
         ask("Reviewer runtime (codex|claude)", "codex" if codex_present else "claude"),
     ))
     if any(k in ("FIXER_RUNTIME", "REVIEWER_RUNTIME") and v == "codex" for k, v in fields):
+        # Only once codex is actually selected: a claude-only deployment has no
+        # reason to answer a question about a binary it never spawns. An unpinned
+        # or shadowed codex is then written out as an absolute CODEX_BIN by
+        # default, because the wizard runs in the operator's shell while the
+        # daemons run under systemd's minimal PATH, and on 2026-08-02 that gap
+        # silently downgraded keifu's codex to a version the provider refuses.
+        if not codex.healthy and codex.recommended_bin:
+            if ask(f"Pin CODEX_BIN={codex.recommended_bin}? (Y/n)", "Y").lower().startswith("y"):
+                fields.append(("CODEX_BIN", codex.recommended_bin))
+            else:
+                warn("CODEX_BIN left unpinned — the daemons' PATH decides which "
+                     "codex runs, and `issue-agent doctor` re-checks it.")
         if codex_mode == "chatgpt":
             info("codex is on ChatGPT auth: the provider reports NO billed cost per "
                  "run, so spend for those legs is priced from the synthetic "
