@@ -9,6 +9,7 @@ const base: IssueCard = {
   issue: 200,
   title: "Explain the board",
   url: "https://github.com/o/r/issues/200",
+  labels: [],
   pr: null,
   pr_url: null,
   pr_state: null,

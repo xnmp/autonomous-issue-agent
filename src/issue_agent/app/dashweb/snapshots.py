@@ -1044,6 +1044,7 @@ def issue_card(
         "issue": row.issue,
         "title": (gh_issue or {}).get("title"),
         "url": (gh_issue or {}).get("url"),
+        "labels": card_labels(row, gh_issue),
         "pr": pr,
         "pr_url": (gh_pr or {}).get("url"),
         "pr_state": _pr_state(gh_pr),
@@ -1336,6 +1337,22 @@ def labels_of(issue: dict) -> list[str]:
     return out
 
 
+def card_labels(row: dash.IssueRow, gh_issue: dict | None) -> list[str]:
+    """An issue card's labels, the v2 world projection first.
+
+    A v2 deployment's GitHub enrichment deliberately carries no labels — the
+    projection owns them — so reading only the enrichment left every v2 card
+    unlabelled. A v1 row has no projected facts and only GitHub can answer.
+    Purely presentational either way: nothing here moves a card between lanes.
+    """
+    projected = row.facts.get("labels")
+    if isinstance(projected, (set, frozenset)):
+        return sorted(str(label) for label in projected)
+    if isinstance(projected, (tuple, list)):
+        return [str(label) for label in projected]
+    return labels_of(gh_issue or {})
+
+
 def priority_of(labels) -> str | None:
     for p in PRIORITY_LABELS:
         if p in labels:
@@ -1472,18 +1489,19 @@ def spend_per_hour(
     """Settled agent-run spend by hour, issue-attributed and deployment-level.
 
     Estimated (subscription) dollars are spend and are counted. The basis is the
-    same settlement events that feed `metrics.by_kind`, so the series and the
-    headline totals cannot disagree about what a leg cost.
+    same legs, over the same rows, that feed `metrics.by_kind` — rows the
+    present/done filter hides included, deployment-level runs billed the same
+    way — so the series and the headline totals cannot disagree about what a
+    leg cost.
     """
     charges = [
         (leg.ts, leg.cost_usd)
-        for row in deployment.issues
+        for row in deployment.metrics_issues
         for leg in row.legs
     ]
     charges += [
-        (dash.parse_ts(event.get("ts")), event.get("cost_usd"))
-        for event in deployment.unattributed
-        if isinstance(event, dict) and event.get("event") == "agent_run"
+        (leg.ts, leg.cost_usd)
+        for leg in dash.unattributed_legs(deployment.unattributed)
     ]
     return spend_buckets(charges, now, hours=hours)
 

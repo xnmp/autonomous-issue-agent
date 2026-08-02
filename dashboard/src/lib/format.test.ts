@@ -1,5 +1,5 @@
-import { describe, expect, it } from "vitest";
-import { duration } from "./format";
+import { afterEach, describe, expect, it } from "vitest";
+import { duration, localHour } from "./format";
 
 describe("duration", () => {
   it.each([
@@ -18,4 +18,35 @@ describe("duration", () => {
     expect(duration(-1)).toBe("—");
     expect(duration(Number.POSITIVE_INFINITY)).toBe("—");
   });
+});
+
+describe("localHour", () => {
+  const original = process.env.TZ;
+  afterEach(() => {
+    process.env.TZ = original;
+  });
+
+  it("labels a UTC hour with the reader's real local minutes", () => {
+    // Half of India's population reads every UTC hour boundary at :30. A label
+    // that hardcoded ":00" put the bucket in the wrong half-hour for them.
+    process.env.TZ = "Asia/Kolkata";
+
+    const label = localHour("2026-08-02T14:00:00+00:00");
+
+    expect(label).toContain("19:30");
+    expect(label).not.toContain("19:00");
+  });
+
+  it("labels a whole-offset hour on the hour", () => {
+    process.env.TZ = "UTC";
+
+    expect(localHour("2026-08-02T14:00:00+00:00")).toContain("14:00");
+  });
+
+  it.each([[null], [undefined], [""], ["not a timestamp"]])(
+    "renders %s as an absence rather than an invalid date",
+    (value) => {
+      expect(localHour(value)).toBe("—");
+    },
+  );
 });

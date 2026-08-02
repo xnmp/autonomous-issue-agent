@@ -213,12 +213,16 @@ describe("ResizableTable", () => {
   });
 
   describe("remembered sort", () => {
-    function Fixture({ storageId }: { storageId?: string }) {
+    function Fixture({
+      storageId,
+      visibleKeys,
+    }: { storageId?: string; visibleKeys?: ReadonlySet<string> }) {
       const sorted = useSortedRows(
         [{ issue: 20 }, { issue: 3 }],
         { issue: (row) => row.issue, cost: (row) => row.issue },
         { key: "issue", direction: "asc" },
         storageId,
+        visibleKeys,
       );
       return (
         <ResizableTable
@@ -277,6 +281,37 @@ describe("ResizableTable", () => {
       expect(screen.getByRole("columnheader", { name: /Issue/ })).toHaveAttribute(
         "aria-sort",
         "ascending",
+      );
+    });
+
+    it("ignores a remembered column the reader has since hidden", () => {
+      localStorage.setItem(
+        "issue-agent.dashboard.column-sort",
+        JSON.stringify({ hidden: { key: "cost", direction: "desc" } }),
+      );
+
+      render(<Fixture storageId="hidden" visibleKeys={new Set(["issue"])} />);
+
+      // Sorted by the visible default, and the header that owns the sort says so.
+      expect(issueCells()).toEqual(["#3", "#20"]);
+      expect(screen.getByRole("columnheader", { name: /Issue/ })).toHaveAttribute(
+        "aria-sort",
+        "ascending",
+      );
+    });
+
+    it("still honours a remembered column that is on screen", () => {
+      localStorage.setItem(
+        "issue-agent.dashboard.column-sort",
+        JSON.stringify({ shown: { key: "cost", direction: "desc" } }),
+      );
+
+      render(<Fixture storageId="shown" visibleKeys={new Set(["issue", "cost"])} />);
+
+      expect(issueCells()).toEqual(["#20", "#3"]);
+      expect(screen.getByRole("columnheader", { name: /Cost/ })).toHaveAttribute(
+        "aria-sort",
+        "descending",
       );
     });
 

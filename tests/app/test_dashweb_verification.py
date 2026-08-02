@@ -117,11 +117,27 @@ def test_a_row_with_nothing_to_say_reports_no_reason():
     assert row.reason is None
 
 
-def test_a_three_column_table_still_reports_its_reason():
+def test_a_three_column_table_reports_its_reason_without_the_verdict_word():
+    """The badge beside the reason already says VERIFIED; repeating it in the
+    tooltip is noise whichever column the ledger happened to put it in."""
     row = verification.parse_verification(
         "| #9 thing | abc | VERIFIED — probe stayed green |\n"
     )[0]
-    assert (row.status, row.reason) == ("VERIFIED", "VERIFIED — probe stayed green")
+    assert (row.status, row.reason) == ("VERIFIED", "probe stayed green")
+
+
+def test_a_reason_longer_than_a_tooltip_is_bounded():
+    row = verification.parse_verification(
+        f"| #9 thing | abc | evidence | VERIFIED — {'y' * 5000} |\n"
+    )[0]
+    assert row.reason is not None and len(row.reason) == 240
+
+
+def test_a_bounded_reason_is_taken_from_the_fallback_column_too():
+    row = verification.parse_verification(
+        f"| #9 thing | abc | {'z' * 5000} |\n"
+    )[0]
+    assert row.reason is not None and len(row.reason) == 240
 
 
 def test_reason_indexes_distinguish_issue_and_pr_references():

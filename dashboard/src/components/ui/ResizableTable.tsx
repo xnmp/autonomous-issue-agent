@@ -113,20 +113,29 @@ function compareValues(left: SortValue, right: SortValue): number {
 
 /**
  * A remembered sort is only honoured when it still names a column this table
- * can sort by: column sets change between releases, and a stale key would
- * silently sort every row by `undefined` — an unsorted table that claims to be
- * sorted. Anything unparseable falls back to the caller's initial sort.
+ * can sort by *and currently shows*: column sets change between releases, and
+ * a stale key would silently sort every row by `undefined` — an unsorted table
+ * that claims to be sorted. A key naming a column the reader has hidden is the
+ * same failure wearing a different hat: the rows come back in an order with no
+ * visible explanation and no header carrying the sort indicator. Anything
+ * unparseable falls back to the caller's initial sort.
  */
 function storedSort(
   id: string | undefined,
   sortableKeys: readonly string[],
   fallback: TableSort,
+  visibleKeys?: ReadonlySet<string>,
 ): TableSort {
   if (!id) return fallback;
   try {
     const all = JSON.parse(localStorage.getItem(SORT_STORAGE_KEY) ?? "{}") as Record<string, unknown>;
     const saved = all[id] as { key?: unknown; direction?: unknown } | undefined;
-    if (!saved || typeof saved.key !== "string" || !sortableKeys.includes(saved.key)) {
+    if (
+      !saved
+      || typeof saved.key !== "string"
+      || !sortableKeys.includes(saved.key)
+      || (visibleKeys !== undefined && !visibleKeys.has(saved.key))
+    ) {
       return fallback;
     }
     return { key: saved.key, direction: saved.direction === "desc" ? "desc" : "asc" };
@@ -147,16 +156,19 @@ function persistSort(id: string | undefined, sort: TableSort) {
 
 /**
  * `storageId` is the stable per-table identity (the same string the table
- * passes as `storageKey`); omit it and the sort is session-only.
+ * passes as `storageKey`); omit it and the sort is session-only. `visibleKeys`
+ * is the set of column keys the table is rendering right now; omit it and a
+ * remembered sort is only checked against what the table can sort by.
  */
 export function useSortedRows<T>(
   rows: readonly T[],
   values: Record<string, (row: T) => SortValue>,
   initial: TableSort,
   storageId?: string,
+  visibleKeys?: ReadonlySet<string>,
 ) {
   const [sort, setSort] = useState<TableSort>(
-    () => storedSort(storageId, Object.keys(values), initial),
+    () => storedSort(storageId, Object.keys(values), initial, visibleKeys),
   );
   const sorted = useMemo(
     () => rows
@@ -168,15 +180,17 @@ export function useSortedRows<T>(
       .map(({ row }) => row),
     [rows, sort, values],
   );
+  // Persistence belongs to the event, not to the state updater: React may call
+  // an updater more than once for one interaction (StrictMode does so on
+  // purpose), and a reducer that writes to storage is not a pure function of
+  // its input.
   const toggleSort = useCallback((key: string) => {
-    setSort((current) => {
-      const next: TableSort = current.key === key
-        ? { key, direction: current.direction === "asc" ? "desc" : "asc" }
-        : { key, direction: "asc" };
-      persistSort(storageId, next);
-      return next;
-    });
-  }, [storageId]);
+    const next: TableSort = sort.key === key
+      ? { key, direction: sort.direction === "asc" ? "desc" : "asc" }
+      : { key, direction: "asc" };
+    setSort(next);
+    persistSort(storageId, next);
+  }, [sort, storageId]);
   return { rows: sorted, sort, onSort: toggleSort };
 }
 
@@ -198,6 +212,13 @@ export function ResizableTable({
   const [widths, setWidths] = useState<Record<string, number>>(() => storedWidths(storageKey));
   const [order, setOrder] = useState<string[]>(() => storedOrder(storageKey));
   const [dragging, setDragging] = useState<string | null>(null);
+  // A pointer drag fires faster than React re-renders, so the handlers need the
+  // latest value without waiting for a commit. These mirror the state so the
+  // handler — not the state updater — owns both the next value and its write to
+  // storage: an updater that persists is not a pure function of its input, and
+  // React is free to call it twice for one interaction.
+  const widthsRef = useRef(widths);
+  const orderRef = useRef(order);
   const draggedColumn = useRef<string | null>(null);
   const sourceKeys = useMemo(() => columns.map((column) => column.key), [columns]);
   const orderedKeys = useMemo(() => reconcileOrder(order, sourceKeys), [order, sourceKeys]);
@@ -226,14 +247,13 @@ export function ResizableTable({
   const tableWidth = orderedColumns.reduce((total, column) => total + widthFor(column), 0);
 
   const setWidth = useCallback((column: TableColumn, width: number) => {
-    setWidths((current) => {
-      const next = {
-        ...current,
-        [column.key]: Math.max(minWidthFor(column), Math.round(width)),
-      };
-      persistWidths(storageKey, next);
-      return next;
-    });
+    const next = {
+      ...widthsRef.current,
+      [column.key]: Math.max(minWidthFor(column), Math.round(width)),
+    };
+    widthsRef.current = next;
+    setWidths(next);
+    persistWidths(storageKey, next);
   }, [minWidthFor, storageKey]);
 
   const beginResize = (event: PointerEvent<HTMLSpanElement>, column: TableColumn) => {
@@ -273,25 +293,25 @@ export function ResizableTable({
 
   const moveColumn = useCallback((from: string, to: string) => {
     if (from === to) return;
-    setOrder((current) => {
-      const activeKeys = new Set(sourceKeys);
-      const base = [
-        ...current.filter((key, index) => current.indexOf(key) === index),
-        ...sourceKeys.filter((key) => !current.includes(key)),
-      ];
-      const activeOrder = base.filter((key) => activeKeys.has(key));
-      const fromIndex = activeOrder.indexOf(from);
-      const toIndex = activeOrder.indexOf(to);
-      if (fromIndex < 0 || toIndex < 0) return current;
-      activeOrder.splice(fromIndex, 1);
-      activeOrder.splice(toIndex, 0, from);
-      let activeIndex = 0;
-      const next = base.map((key) => (
-        activeKeys.has(key) ? activeOrder[activeIndex++]! : key
-      ));
-      persistOrder(storageKey, next);
-      return next;
-    });
+    const current = orderRef.current;
+    const activeKeys = new Set(sourceKeys);
+    const base = [
+      ...current.filter((key, index) => current.indexOf(key) === index),
+      ...sourceKeys.filter((key) => !current.includes(key)),
+    ];
+    const activeOrder = base.filter((key) => activeKeys.has(key));
+    const fromIndex = activeOrder.indexOf(from);
+    const toIndex = activeOrder.indexOf(to);
+    if (fromIndex < 0 || toIndex < 0) return;
+    activeOrder.splice(fromIndex, 1);
+    activeOrder.splice(toIndex, 0, from);
+    let activeIndex = 0;
+    const next = base.map((key) => (
+      activeKeys.has(key) ? activeOrder[activeIndex++]! : key
+    ));
+    orderRef.current = next;
+    setOrder(next);
+    persistOrder(storageKey, next);
   }, [sourceKeys, storageKey]);
 
   const moveColumnFromKeyboard = (

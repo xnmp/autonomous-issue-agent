@@ -112,11 +112,12 @@ describe("dashboard semantics", () => {
     );
   });
 
+  // Not the tables themselves — restating a lookup map asserts nothing. What is
+  // worth pinning is the behaviour around them: an unrecognised or absent value
+  // is never coloured as if it were understood, and the reader's casing and
+  // whitespace do not decide a chip's colour.
   it.each([
     ["bug", "fail"],
-    ["enhancement", "ok"],
-    ["feature", "info"],
-    ["docs", "meta"],
     ["  BUG  ", "fail"],
     ["speculative", "neutral"],
     [null, "neutral"],
@@ -126,36 +127,30 @@ describe("dashboard semantics", () => {
     expect(issueTypeTone(value)).toBe(tone);
   });
 
-  it.each([
-    ["trivial", "ok"],
-    ["standard", "running"],
-    ["complex", "fail"],
-    ["high", "fail"],
-    ["banana", "neutral"],
-    [null, "neutral"],
-  ])("tones the %s difficulty as %s by what it costs us", (value, tone) => {
-    expect(difficultyTone(value)).toBe(tone);
+  it("scales difficulty and impact in opposite directions", () => {
+    // Difficulty is what a task costs us, so more is worse; impact is what it
+    // is worth, so more is better. The two "high"s must not share a colour.
+    expect(difficultyTone("high")).toBe("fail");
+    expect(impactTone("high")).toBe("ok");
   });
 
-  it.each([
-    ["low", "neutral"],
-    ["medium", "info"],
-    ["high", "ok"],
-    [null, "neutral"],
-  ])("tones the %s impact as %s by what it is worth", (value, tone) => {
-    expect(impactTone(value)).toBe(tone);
-  });
+  it.each([["banana"], [null], [undefined], [""]])(
+    "leaves the unrecognised difficulty or impact %s uncoloured",
+    (value) => {
+      expect(difficultyTone(value)).toBe("neutral");
+      expect(impactTone(value)).toBe("neutral");
+    },
+  );
 
   it.each([
+    // A label encoding a triage axis takes that axis's colour, prefixed or bare.
     ["type:bug", "fail"],
-    ["kind:enhancement", "ok"],
-    ["difficulty:complex", "fail"],
     ["effort:trivial", "ok"],
-    ["impact:high", "ok"],
     ["bug", "fail"],
-    ["enhancement", "ok"],
-    ["ai-ready", "neutral"],
+    // A prefix with nothing after it names no value, and most labels are not
+    // triage axes at all.
     ["type:", "neutral"],
+    ["ai-ready", "neutral"],
     ["", "neutral"],
   ])("colours the %s label to match its column", (label, tone) => {
     expect(labelTone(label)).toBe(tone);

@@ -758,6 +758,14 @@
             ],
             "title": "Issue Verification Reason"
           },
+          "labels": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Labels",
+            "type": "array"
+          },
           "last_ts": {
             "anyOf": [
               {

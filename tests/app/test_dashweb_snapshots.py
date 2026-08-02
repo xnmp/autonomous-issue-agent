@@ -12,6 +12,15 @@ import pytest
 from issue_agent.adapters.dashweb import ghdata, system
 from issue_agent.app.dashweb import service, snapshots
 from issue_agent.domain import dashboard as dash
+from issue_agent.domain.events import (
+    AgentRunCompleted,
+    AgentRunStarted,
+    Correlation,
+    EventEnvelope,
+    Producer,
+    WorldObserved,
+)
+from issue_agent.domain.projection import fold
 
 NOW = datetime(2026, 7, 29, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -24,6 +33,33 @@ def build(events, name="demo", repo="o/r"):
     feeds = (("fix", "/j/fix", "/l/fix", events), ("review", "/j/rev", "/l/rev", []),
              ("steward", "/j/std", "/l/std", []))
     return dash.build_deployment(name, repo, feeds, (), now_fn=lambda: NOW)
+
+
+def v2_event(payload, event_id, seq, *, role="fix", **correlation):
+    stamp = NOW - timedelta(hours=1)
+    return EventEnvelope(
+        payload,
+        event_id,
+        seq,
+        stamp,
+        stamp,
+        seq,
+        Producer("demo", "o/r", role, 10, "boot"),
+        Correlation(**correlation),
+    )
+
+
+def v2_deployment(events, name="demo", repo="o/r"):
+    """A deployment built the way the daemons build one: schema-v2 events only,
+    folded, with no journal-dict or GitHub input."""
+    feeds = (
+        ("fix", "/j/fix", "/l/fix", tuple(events)),
+        ("review", "/j/rev", "/l/rev", ()),
+        ("steward", "/j/std", "/l/std", ()),
+    )
+    return dash.build_deployment_v2(
+        name, repo, feeds, fold(events), lambda: NOW
+    )
 
 
 def row_for(events, issue):
@@ -1212,6 +1248,49 @@ def test_spend_per_hour_counts_estimated_legs_and_deployment_level_runs():
     assert sum(b["usd"] for b in series) == 0.75
 
 
+def test_spend_per_hour_counts_a_deployment_level_leg_priced_only_by_estimate():
+    """A subscription-priced triage leg has no true cost, only an estimate.
+    Reading the raw event dropped it from the chart while the kind totals
+    charged it — two answers for one leg."""
+    dep = build([
+        {"ts": ts(hours=1), "event": "agent_run", "role": "steward",
+         "kind": "TRIAGE", "cost_estimated_usd": 0.4, "status": "done",
+         "exit_reason": "ok", "model": "m", "session_id": "s", "run_id": "r1"},
+    ])
+
+    series = snapshots.spend_per_hour(dep, NOW)
+
+    assert bucket_at(series, 1)["usd"] == 0.4
+    assert sum(b["usd"] for b in series) == sum(
+        cost for _kind, cost, _runs in dep.metrics.by_kind
+    )
+
+
+def test_spend_per_hour_charges_legs_on_an_issue_the_world_no_longer_shows():
+    """A retired issue is filtered out of the display rows but its legs were
+    still paid for, and the metrics still charge them. The chart reads the same
+    rows or it under-reports the deployment's spend."""
+    dep = v2_deployment([
+        v2_event(AgentRunStarted("m", kind="RESOLVE"), "a", 0, issue=7, run_id="r"),
+        v2_event(
+            AgentRunCompleted(
+                "done", False, "ok", 1000, "m", "codex",
+                cost_micros=750_000, currency="USD", pricing_basis="api",
+                kind="RESOLVE",
+            ),
+            "b", 1, issue=7, run_id="r",
+        ),
+        v2_event(
+            WorldObserved("issue", 7, "hash", {"present": False, "state": "OPEN"}),
+            "c", 2, issue=7,
+        ),
+    ])
+
+    assert [row.issue for row in dep.issues] == []
+    assert dep.metrics.total_cost_usd == 0.75
+    assert sum(b["usd"] for b in snapshots.spend_per_hour(dep, NOW)) == 0.75
+
+
 def test_spend_per_hour_totals_a_huge_journal_without_losing_charges():
     dep = build([
         {**RESOLVE, "ts": ts(hours=n % 47, minutes=n % 60), "cost_usd": 0.01}
@@ -1287,3 +1366,74 @@ def test_cards_omit_a_verification_reason_the_ledger_does_not_give(monkeypatch):
 
     assert card["issue_verification"] == "VERIFIED"
     assert card["issue_verification_reason"] is None
+
+
+def test_a_github_read_cannot_displace_the_projected_issue_state():
+    """The v2 projection is authority for an issue's lifecycle. A GitHub read
+    that disagrees — a stale list, a closed-then-reopened issue — may only add
+    presentation, never overwrite the projected answer."""
+    row = replace(
+        row_for([RESOLVE], 7),
+        facts={"state": "OPEN", "labels": ("ai-ready",)},
+    )
+    enrichment = service._github_issue_enrichment({
+        "number": 7, "title": "the bug", "url": "u/7",
+        "state": "CLOSED", "mergedAt": "2026-07-01T00:00:00+00:00",
+        "reviewDecision": "APPROVED", "mergeable": "MERGEABLE",
+    })
+
+    issue = service._projected_issue(row, enrichment)
+
+    assert issue["state"] == "OPEN"
+    assert (issue["title"], issue["url"]) == ("the bug", "u/7")
+    assert "mergedAt" not in issue
+
+
+def test_pull_request_enrichment_still_carries_its_merge_and_review_state():
+    assert service._github_enrichment({
+        "state": "OPEN", "mergedAt": None, "reviewDecision": "APPROVED",
+        "mergeable": "MERGEABLE", "title": "t", "url": "u",
+    }) == {
+        "state": "OPEN", "reviewDecision": "APPROVED",
+        "mergeable": "MERGEABLE", "title": "t", "url": "u",
+    }
+
+
+# ── card labels ───────────────────────────────────────────────────────────────
+def test_a_card_carries_the_projected_labels_when_github_adds_none():
+    row = replace(row_for([RESOLVE], 7), facts={"labels": ("ai-done", "bug")})
+
+    card = snapshots.issue_card(row, NOW, gh_issue={"title": "t", "url": "u"})
+
+    assert card["labels"] == ["ai-done", "bug"]
+
+
+def test_a_card_falls_back_to_the_github_labels_without_a_projection():
+    card = snapshots.issue_card(
+        row_for([RESOLVE], 7), NOW,
+        gh_issue={"labels": [{"name": "bug"}, "P1"]},
+    )
+
+    assert card["labels"] == ["bug", "P1"]
+
+
+def test_a_card_with_no_labels_anywhere_reports_an_empty_list():
+    assert snapshots.issue_card(row_for([RESOLVE], 7), NOW)["labels"] == []
+
+
+@pytest.mark.parametrize("malformed", [None, "bug", 5, {"name": "bug"}])
+def test_malformed_projected_labels_fall_back_to_the_github_read(malformed):
+    row = replace(row_for([RESOLVE], 7), facts={"labels": malformed})
+
+    card = snapshots.issue_card(row, NOW, gh_issue={"labels": ["P2"]})
+
+    assert card["labels"] == ["P2"]
+
+
+def test_a_card_reports_every_label_of_a_heavily_tagged_issue():
+    row = replace(
+        row_for([RESOLVE], 7),
+        facts={"labels": tuple(f"label-{n}" for n in range(500))},
+    )
+
+    assert len(snapshots.issue_card(row, NOW)["labels"]) == 500

@@ -23,6 +23,8 @@ _STATUS_RE = re.compile(r"\b(MISBEHAVED|VERIFIED|RETIRED|pending)\b", re.IGNOREC
 _VERDICT_PREFIX_RE = re.compile(
     r"^\W*(?:MISBEHAVED|VERIFIED|RETIRED|pending)\b[\s\-—–:;,.]*", re.IGNORECASE
 )
+# One line of unauthored prose, same budget the compact issue rows use.
+_REASON_CHARS = 240
 _SEPARATOR_RE = re.compile(r"^\|[\s:|-]+\|$")
 _ID_RE = re.compile(r"#\d+")
 _PR_RE = re.compile(r"\bPR\s+#(\d+)\b", re.IGNORECASE)
@@ -68,15 +70,26 @@ def status_of(text: str) -> str:
     return word.lower() if word.lower() == "pending" else word.upper()
 
 
+def _reason_prose(text: str) -> str:
+    """The prose of a reason cell: verdict keyword and its punctuation gone."""
+    return _VERDICT_PREFIX_RE.sub("", text.strip()).strip(" -—–:;,.")
+
+
 def reason_of(verdict_text: str, evidence: str = "") -> str | None:
     """Why a row claims its verdict, verdict keyword stripped.
 
     Ledger columns drift, so this falls back to the evidence cell rather than
-    guessing: a three-column table puts the reasoning there. Nothing to say is
+    guessing: a three-column table puts the reasoning there — and puts the
+    verdict there too, so the fallback is stripped exactly like the dedicated
+    cell or the badge would read "VERIFIED — VERIFIED — …". Nothing to say is
     `None`, never an empty badge tooltip.
+
+    The ledger is hand-written prose of no bounded length; a reason is a one
+    line tooltip, so it is truncated to the same budget as every other piece of
+    unauthored text the compact rows carry.
     """
-    trimmed = _VERDICT_PREFIX_RE.sub("", verdict_text.strip()).strip(" -—–:;,.")
-    return trimmed or evidence.strip() or None
+    reason = _reason_prose(verdict_text) or _reason_prose(evidence)
+    return reason[:_REASON_CHARS] or None
 
 
 def parse_verification(text: str) -> list[VerificationRow]:

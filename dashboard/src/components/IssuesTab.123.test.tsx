@@ -8,6 +8,7 @@ const card: IssueCard = {
   issue: 123,
   title: "Waiting for operator input",
   url: "https://github.com/o/r/issues/123",
+  labels: [],
   pr: null,
   pr_url: null,
   pr_state: null,

@@ -76,6 +76,7 @@ const IssueCard = z
     issue: z.number().int(),
     issue_verification: z.union([z.string(), z.null()]).optional(),
     issue_verification_reason: z.union([z.string(), z.null()]).optional(),
+    labels: z.array(z.string()).optional().default([]),
     last_ts: z.union([z.string(), z.null()]),
     merged_ts: z.union([z.string(), z.null()]).optional(),
     model_badges: z.array(ModelBadge).optional().default([]),

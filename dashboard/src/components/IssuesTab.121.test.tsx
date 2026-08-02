@@ -8,6 +8,7 @@ const card: IssueCard = {
   issue: 121,
   title: "Clarify the API contract",
   url: "https://github.com/o/r/issues/121",
+  labels: [],
   pr: null,
   pr_url: null,
   pr_state: null,

@@ -420,6 +420,11 @@ export interface components {
             issue_verification?: string | null;
             /** Issue Verification Reason */
             issue_verification_reason?: string | null;
+            /**
+             * Labels
+             * @default []
+             */
+            labels: string[];
             /** Last Ts */
             last_ts: string | null;
             /** Merged Ts */

@@ -9,6 +9,7 @@ const doneCard: IssueCard = {
   issue: 50,
   title: "Explain completed work",
   url: "https://github.com/o/r/issues/50",
+  labels: [],
   pr: 75,
   pr_url: "https://github.com/o/r/pull/75",
   pr_state: "merged",

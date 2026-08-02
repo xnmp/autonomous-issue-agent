@@ -8,7 +8,7 @@
  * cyan = links/models — holds everywhere by construction.
  */
 
-import type { CostMix, IssueFlag, RoleHealth, StepState } from "../api/types";
+import type { CostMix, IssueCard, IssueFlag, RoleHealth, StepState } from "../api/types";
 import { isElevatedEffort } from "./models";
 
 export type Tone =
@@ -112,6 +112,19 @@ export function flagTone(flag: IssueFlag): Tone {
   return flag === "escalated" || flag === "spend-blocked" || flag === "blocked"
     ? "fail"
     : "running";
+}
+
+/**
+ * Whether the harness has stopped and is waiting on a person.
+ *
+ * `human_action` is the backend's own attention bucket, so the board reads it
+ * rather than re-deriving one from stages and flags. Needs-budget-review
+ * arrives as `escalated` — only a cap decision resumes it — which is why there
+ * is no third arm. Merge-ready is deliberately absent: nothing is stuck there,
+ * the work is finished and waiting to be shipped.
+ */
+export function blocksOnHuman(card: Pick<IssueCard, "human_action">): boolean {
+  return card.human_action === "escalated" || card.human_action === "awaiting-reply";
 }
 
 export function prStateTone(state: string | null | undefined): Tone {

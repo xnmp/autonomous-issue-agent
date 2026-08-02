@@ -170,6 +170,9 @@ class IssueCard(Contract):
     issue: int
     title: str | None
     url: str | None
+    # Presentational only, and optional: a deployment that cannot read labels
+    # (no GitHub, no projected facts) still renders a card.
+    labels: list[str] = []
     pr: int | None
     pr_url: str | None
     pr_state: str | None
