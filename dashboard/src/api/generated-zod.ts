@@ -240,20 +240,14 @@ const HealthTrendDay = z
     recurrences: z.number().int(),
   })
   .passthrough();
-const InterventionCount = z
-  .object({ count: z.number().int(), name: z.string() })
-  .passthrough();
 const KindCost = z
   .object({ kind: z.string(), runs: z.number().int(), usd: z.number() })
   .passthrough();
+const InterventionCount = z
+  .object({ count: z.number().int(), name: z.string() })
+  .passthrough();
 const Metrics = z
   .object({
-    interventions_by_class: z.array(InterventionCount).optional().default([]),
-    interventions_per_merged_pr: z
-      .union([z.number(), z.null()])
-      .optional()
-      .default(null),
-    interventions_total: z.number().int().optional().default(0),
     by_kind: z.array(KindCost),
     cost_per_done_usd: z.union([z.number(), z.null()]),
     done_issues: z.number().int(),
@@ -262,6 +256,9 @@ const Metrics = z
     first_pass_changes: z.union([z.number(), z.null()]),
     first_pass_rate: z.union([z.number(), z.null()]),
     in_flight_issues: z.number().int(),
+    interventions_by_class: z.array(InterventionCount).optional().default([]),
+    interventions_per_merged_pr: z.union([z.number(), z.null()]).optional(),
+    interventions_total: z.number().int().optional().default(0),
     recurrences: z.number().int(),
     rounds_per_pr: z.union([z.number(), z.null()]),
     spend_blocks: z.number().int(),
@@ -367,8 +364,8 @@ export const schemas = {
   Caps,
   CostMix,
   HealthTrendDay,
-  InterventionCount,
   KindCost,
+  InterventionCount,
   Metrics,
   SpendBucket,
   OverviewPayload,

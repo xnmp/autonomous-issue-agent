@@ -388,6 +388,15 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** InterventionCount */
+        InterventionCount: {
+            /** Count */
+            count: number;
+            /** Name */
+            name: string;
+        } & {
+            [key: string]: unknown;
+        };
         /** IssueCard */
         IssueCard: {
             /** Attention Reason */
@@ -572,15 +581,6 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /** InterventionCount */
-        InterventionCount: {
-            /** Count */
-            count: number;
-            /** Name */
-            name: string;
-        } & {
-            [key: string]: unknown;
-        };
         /** KindCost */
         KindCost: {
             /** Kind */
@@ -616,7 +616,7 @@ export interface components {
              */
             interventions_by_class: components["schemas"]["InterventionCount"][];
             /** Interventions Per Merged Pr */
-            interventions_per_merged_pr: number | null;
+            interventions_per_merged_pr?: number | null;
             /**
              * Interventions Total
              * @default 0
