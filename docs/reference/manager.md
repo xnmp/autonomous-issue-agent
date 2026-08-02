@@ -31,7 +31,14 @@ stop. Never self-modify mid-batch.
   workflow): each cycle, read the new journal lines from all three role state
   dirs plus the fix-log tail, report anything notable to the operator, and
   re-arm — a cycle with no events is itself a report ("no new events"), not
-  silence; detect and restart dead daemons; investigate wedged legs before
+  silence. **Monitoring is non-verbose by default** (operator, 2026-08-02):
+  ONE summarising watcher on the 15-minute cycle (new-event counts per role +
+  daemon liveness), no per-event live tail — a line-by-line escalation/verdict
+  stream drowns the operator and the session. Arm a live tail only while
+  actively debugging an incident, and tear it down when the incident closes.
+  Under systemd supervision the role logs are in
+  `journalctl --user -u 'issue-agent-*-<name>'`, not the state-dir log files;
+  detect and restart dead daemons; investigate wedged legs before
   killing; answer `status=blocked` clarification questions (evidence
   unproducible from a worktree/CI → scope it to operator post-verification;
   genuine product ambiguity → escalate to the human, don't guess); tick off
