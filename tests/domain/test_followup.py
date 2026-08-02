@@ -199,7 +199,10 @@ def test_review_request_changes():
 def test_review_escalate_comments_and_flags():
     s = review_submission("ESCALATE", "still broken", 3, 4)
     assert s.event == "COMMENT" and s.escalate is True
-    assert "rounds of requested changes" in s.body
+    # The body names the verdict, not exhausted rounds (keifu #177: verdict
+    # escalations phrased as round exhaustion read like a fencepost bug).
+    assert "returned ESCALATE" in s.body
+    assert "rounds of requested changes" not in s.body
 
 
 # ── infra death: the session never happened, so no leg may act on it ──────────

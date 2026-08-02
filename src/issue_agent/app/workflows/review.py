@@ -129,7 +129,7 @@ class ReviewWorkflow:
             )
             return Label.AI_PR_OPEN
 
-    def _escalate(self, pr: int, rejections: int) -> None:
+    def _escalate(self, pr: int, rejections: int, cause: str = "ceiling") -> None:
         """The reviewer is out of rounds → hand the PR to a human, THROUGH the
         write funnel (review M10/D4).
 
@@ -139,10 +139,21 @@ class ReviewWorkflow:
         event and fired no ALERT_CMD, while the spend-cap escalation on the very
         same daemon did. `Executor` detects the needs-human-review move itself,
         so routing the actions through it is what restores both."""
-        reason = (
-            f"the reviewer requested changes {rejections} time(s) without the PR "
-            f"converging (ceiling {self.cfg.max_review_rejections})."
-        )
+        # The reason must name the REAL cause: a verdict-driven escalation
+        # phrased as a ceiling trip reads like a fencepost bug (keifu PR #177,
+        # 2026-08-02: round-3 ESCALATE verdict, comment said "3 time(s) ...
+        # ceiling 4") and feeds the dashboard's escalation_reason the wrong WHY.
+        if cause == "verdict":
+            reason = (
+                f"the reviewer returned ESCALATE on rejection {rejections} of "
+                f"{self.cfg.max_review_rejections}: this PR needs a human "
+                "decision the review loop cannot make."
+            )
+        else:
+            reason = (
+                f"the reviewer requested changes {rejections} time(s) without the PR "
+                f"converging (ceiling {self.cfg.max_review_rejections})."
+            )
         self.executor.execute_all(
             pr_escalation(pr, reason, from_label=self._trigger_label()).actions()
         )
@@ -826,7 +837,7 @@ class ReviewWorkflow:
             self._no_progress(p, "review POST failed")
             return  # failed POST → leave state untouched (retried next poll)
         if sub.escalate:
-            self._escalate(pr, prior + 1)
+            self._escalate(pr, prior + 1, cause=sub.escalate_cause)
         self._persist_review_state(pr, p.head_ref_oid, round_number, signature)
         self._progress(p, claim_target)
 
@@ -929,5 +940,5 @@ class ReviewWorkflow:
             f"review #{pr} r{round_number}{tally}: submitted {sub.event}{escalated}"
         )
         if sub.escalate:
-            self._escalate(pr, prior_rejections + 1)
+            self._escalate(pr, prior_rejections + 1, cause=sub.escalate_cause)
         return True

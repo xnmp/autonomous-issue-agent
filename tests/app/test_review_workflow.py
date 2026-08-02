@@ -465,6 +465,31 @@ def test_review_escalation_emits_an_escalation_event_through_the_funnel():
     assert ("escalation", {"target": "pr", "number": 100}) in journal.events
     # …and the funnel's comment explains WHY, so the human arrives informed.
     assert any(c[0] == "comment" and "Circuit breaker" in c[3] for c in gw.calls)
+    # A ceiling trip names the ceiling, in the breaker comment itself.
+    breaker = [c[3] for c in gw.calls if c[0] == "comment" and "Circuit breaker" in c[3]]
+    assert breaker and "requested changes" in breaker[0] and "ceiling 4" in breaker[0]
+
+
+def test_verdict_escalation_reason_names_the_verdict_not_the_ceiling():
+    """keifu PR #177 (2026-08-02): sol returned ESCALATE on round 3; the breaker
+    comment said "requested changes 3 time(s) ... (ceiling 4)", which reads as a
+    fencepost bug and hands the dashboard's escalation_reason the wrong WHY."""
+    pr = PRView(100, head_ref_oid="new", title="t", body="b",
+                reviews=(Review("CHANGES_REQUESTED", "review-bot", "t0", body="fix"),))
+    gw = FakeGateway(prs={100: pr})
+    store = FakeStore()
+    store.set_round(100, 2)
+    store.save_pr_session(100, "rs")
+    runner = FakeRunner(AgentResult(
+        is_error=False, structured={"decision": "ESCALATE", "body": "deadlocked"},
+    ))
+
+    asyncio.run(_workflow(gw, store, runner).re_review(100))
+
+    assert ("relabel", "pr", 100, "ai-pr-open", "needs-human-review") in gw.calls
+    breaker = [c[3] for c in gw.calls if c[0] == "comment" and "Circuit breaker" in c[3]]
+    assert breaker and "returned ESCALATE" in breaker[0]
+    assert "requested changes" not in breaker[0]
 
 
 def test_ordinary_rejection_does_not_escalate():

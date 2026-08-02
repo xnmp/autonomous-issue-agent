@@ -403,11 +403,28 @@ def test_submission_request_changes_at_ceiling_escalates():
     # it escalates to a human regardless of the model verdict.
     sub = review_submission("REQUEST_CHANGES", "still wrong", prior_rejections=3, max_rejections=4)
     assert sub.event == "COMMENT" and sub.escalate is True
+    assert sub.escalate_cause == "ceiling"
 
 
 def test_submission_explicit_escalate_always_escalates():
     sub = review_submission("ESCALATE", "deadlocked", prior_rejections=0, max_rejections=4)
     assert sub.escalate is True
+    # The cause names the verdict, not the ceiling: keifu PR #177 escalated on
+    # a round-3 ESCALATE but the breaker comment blamed the ceiling, reading
+    # like a fencepost bug to the operator.
+    assert sub.escalate_cause == "verdict"
+
+
+def test_submission_escalate_verdict_at_ceiling_reports_verdict_cause():
+    # When both apply, the reviewer's explicit verdict is the truer cause.
+    sub = review_submission("ESCALATE", "deadlocked", prior_rejections=3, max_rejections=4)
+    assert sub.escalate is True and sub.escalate_cause == "verdict"
+
+
+def test_submission_non_escalating_paths_carry_no_cause():
+    ok = review_submission("APPROVE", "lgtm", prior_rejections=0, max_rejections=4)
+    bounce = review_submission("REQUEST_CHANGES", "fix", prior_rejections=0, max_rejections=4)
+    assert ok.escalate_cause == "" and bounce.escalate_cause == ""
 
 
 # ── multi-agent review: parse_findings + synthesize_review ────────────────────

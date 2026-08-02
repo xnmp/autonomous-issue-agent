@@ -423,6 +423,12 @@ class ReviewSubmission:
     event: str
     body: str
     escalate: bool = False
+    # Why escalate is set: "verdict" (the reviewer returned ESCALATE) or
+    # "ceiling" (this rejection reached max_rejections). The escalation comment
+    # and journal reason must name the real cause — keifu PR #177 (2026-08-02)
+    # escalated on a round-3 ESCALATE verdict but the breaker comment blamed
+    # the ceiling ("3 time(s) ... ceiling 4"), reading like a fencepost bug.
+    escalate_cause: str = ""
 
 
 def review_submission(
@@ -447,13 +453,25 @@ def review_submission(
         return ReviewSubmission(event="APPROVE", body=body)
     this_rejection = prior_rejections + 1
     if decision == "ESCALATE" or this_rejection >= max_rejections:
+        # The posted body names the real cause too — a verdict escalation
+        # phrased as exhausted rounds reads like a fencepost bug (keifu #177).
+        if decision == "ESCALATE":
+            preamble = (
+                f"The reviewer returned ESCALATE on rejection {this_rejection} "
+                f"of {max_rejections}. Requesting human review."
+            )
+        else:
+            preamble = (
+                f"Through {this_rejection} rounds of requested changes without "
+                "resolution. Requesting human review."
+            )
         return ReviewSubmission(
             event="COMMENT",
-            body=(
-                f"Through {this_rejection} rounds of requested changes without "
-                f"resolution. Requesting human review.\n\n{body}"
-            ),
+            body=f"{preamble}\n\n{body}",
             escalate=True,
+            escalate_cause=(
+                "verdict" if decision == "ESCALATE" else "ceiling"
+            ),
         )
     return ReviewSubmission(event="REQUEST_CHANGES", body=body)
 
