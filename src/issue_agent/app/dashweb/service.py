@@ -837,6 +837,9 @@ class Backend:
 # answer in the same dict key the projection already filled.
 _PR_ENRICHMENT_FIELDS = (
     "title", "url", "state", "mergedAt", "reviewDecision", "mergeable",
+    # The chip's CI colour: ghdata already fetches the rollup, and without it
+    # here every v2 card rendered pr_ci_state=None while CI was visibly red.
+    "statusCheckRollup",
 )
 _ISSUE_ENRICHMENT_FIELDS = ("title", "url")
 
