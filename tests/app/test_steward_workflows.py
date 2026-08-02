@@ -853,3 +853,247 @@ def test_jira_refuses_invalid_persisted_key_before_building_a_prompt():
 
     assert runner.tasks == []
     assert logs == ["jira-sync #5: refusing invalid stored ticket key"]
+
+
+# ── triage `close` disposition, end to end (keifu #143) ──────────────────────
+def _close_verdict(**extra):
+    structured = {
+        "verdict": "close",
+        "plain_summary": "",
+        "acceptance_criteria": [],
+        "creator_questions": [],
+        "owner_questions": [],
+        "close_reason": "PR #170 already ships this; no code change is required.",
+        "reopen_if": "the export still fails on a build newer than PR #170",
+        "close_state_reason": "completed",
+    }
+    structured.update(extra)
+    return AgentResult(is_error=False, structured=structured)
+
+
+def _close_cfg(journal=None):
+    return StewardWorkflowConfig(
+        triage=TriageTaskConfig("steward-bot", triage_prompt="T"),
+        triage_cfg=TriageConfig("steward-bot", enabled=True, promote=True),
+        log=lambda _m: None,
+        repo="o/r",
+        journal=journal,
+    )
+
+
+def _close_events(journal):
+    return [
+        (e["kind"], e["detail"]) for e in read_events(journal.path)
+        if e.get("event") == "groomed"
+        and e.get("kind") in {"closed", "close_unconfirmed", "close_declined"}
+    ]
+
+
+def test_a_close_verdict_comments_closes_and_journals_without_a_paid_resolve_leg(tmp_path):
+    """The incident, end to end: triage says 'close, resolved by merged PR #170'
+    and the steward disposes of it itself — no promote to ai-ready, no operator."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    gw = FakeGateway(issues={143: IssueView(
+        143, title="CSV export broken", body="b", author="alice", updated_at="t1",
+    )})
+    store = FakeStore()
+    executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
+
+    asyncio.run(StewardWorkflow(
+        _close_cfg(journal), gw, store, FakeRunner(_close_verdict()), executor
+    ).triage(143))
+
+    assert ("relabel", "issue", 143, "ai-triage", "ai-closed") in gw.calls
+    close = next(c for c in gw.calls if c[0] == "close")
+    assert close[1] == 143 and close[2] == "completed"
+    assert "PR #170" in close[3] and "Reopen this issue if:" in close[3]
+    assert not any(c[0] == "relabel" and c[4] == "ai-ready" for c in gw.calls)
+    assert not any(c[0] == "relabel" and c[4] == "ai-done" for c in gw.calls)
+    assert store.triage_at[143] == "t1"
+    assert _close_events(journal) == [("closed", "completed")]
+
+
+def test_a_close_missing_its_reason_leaves_the_issue_open_for_a_human(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    gw = FakeGateway(issues={143: IssueView(
+        143, title="t", body="b", author="alice", updated_at="t1",
+    )})
+    executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
+
+    asyncio.run(StewardWorkflow(
+        _close_cfg(journal), gw, FakeStore(),
+        FakeRunner(_close_verdict(close_reason=None, reopen_if=None)), executor,
+    ).triage(143))
+
+    assert not any(c[0] == "close" for c in gw.calls)
+    assert ("relabel", "issue", 143, None, "ai-triage") in gw.calls
+    assert not any(c[0] == "relabel" and c[4] == "ai-ready" for c in gw.calls)
+    assert _close_events(journal) == [("close_declined", "incomplete_verdict")]
+
+
+def test_a_verdict_with_no_close_fields_at_all_never_closes():
+    gw = FakeGateway(issues={143: IssueView(143, title="t", body="b", author="alice")})
+    executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
+
+    asyncio.run(StewardWorkflow(
+        _close_cfg(), gw, FakeStore(),
+        FakeRunner(AgentResult(is_error=False, structured={"verdict": "close"})),
+        executor,
+    ).triage(143))
+
+    assert not any(c[0] == "close" for c in gw.calls)
+
+
+def test_a_reopened_issue_is_triaged_afresh_and_never_re_closed(tmp_path):
+    """The loop guard: a human reopening a steward-closed issue overrules the
+    harness. The next triage may comment, but must not close it again."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    gw = FakeGateway(issues={143: IssueView(
+        143,
+        title="CSV export broken",
+        body="b",
+        author="alice",
+        labels=frozenset({Label.AI_CLOSED}),
+        state_reason="reopened",
+        updated_at="t2",
+    )})
+    executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
+    workflow = StewardWorkflow(
+        _close_cfg(journal), gw, FakeStore(), FakeRunner(_close_verdict()), executor
+    )
+
+    asyncio.run(workflow.triage(143))
+    asyncio.run(workflow.triage(143))
+
+    assert not any(c[0] == "close" for c in gw.calls)
+    assert any(c[0] == "comment" and "reopened by a human" in c[3] for c in gw.calls)
+    # One journalled decline for the issue, however many times it is re-triaged.
+    assert _close_events(journal) == [("close_declined", "reopened")]
+
+
+def test_a_close_does_not_also_post_the_advisory_recurrence_marker(tmp_path):
+    """Both would be about the same merged PR; the close comment already names it,
+    and asking a human to judge a `recurrence` label on a closed issue is noise."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    gw = RecurrenceGateway(
+        {143: IssueView(143, title="t", body="b", author="alice")},
+        merged=(_Merged(42, 170),),
+    )
+    cfg = StewardWorkflowConfig(
+        triage=TriageTaskConfig("steward-bot", triage_prompt="T"),
+        triage_cfg=TriageConfig("steward-bot", enabled=True, promote=True),
+        log=lambda _m: None, fix_bot="fix-bot", repo="o/r", journal=journal,
+    )
+    executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
+
+    asyncio.run(StewardWorkflow(
+        cfg, gw, FakeStore(), FakeRunner(_close_verdict(recurrence_of=42)), executor
+    ).triage(143))
+
+    assert any(c[0] == "close" for c in gw.calls)
+    assert not any(c[0] == "relabel" and c[4] == "recurrence" for c in gw.calls)
+    assert [e for e in read_events(journal.path) if e.get("event") == "recurrence"] == []
+
+
+def test_a_deployment_that_keeps_a_human_in_the_loop_does_not_gain_closing(tmp_path):
+    """STEWARD_PROMOTE=0 is the shipped default. An upgrade must not hand a
+    deployment autonomous issue closing without an operator deciding so."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    gw = FakeGateway(issues={143: IssueView(143, title="t", body="b", author="alice")})
+    cfg = StewardWorkflowConfig(
+        triage=TriageTaskConfig("steward-bot", triage_prompt="T"),
+        triage_cfg=TriageConfig("steward-bot", enabled=True),   # promote off
+        log=lambda _m: None, repo="o/r", journal=journal,
+    )
+    executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
+
+    asyncio.run(StewardWorkflow(
+        cfg, gw, FakeStore(), FakeRunner(_close_verdict()), executor
+    ).triage(143))
+
+    assert not any(c[0] == "close" for c in gw.calls)
+    assert ("relabel", "issue", 143, None, "ai-triage") in gw.calls
+    assert _close_events(journal) == [("close_declined", "promote_off")]
+
+
+def test_non_string_close_fields_do_not_crash_a_paid_leg(tmp_path):
+    """Structured output is enforced provider-side only; a non-conforming runtime
+    must degrade to 'no close', not raise inside a leg already paid for."""
+    gw = FakeGateway(issues={143: IssueView(143, title="t", body="b", author="alice")})
+    store = FakeStore()
+    executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
+
+    asyncio.run(StewardWorkflow(
+        _close_cfg(), gw, store,
+        FakeRunner(_close_verdict(
+            close_reason=["a", "b"], reopen_if=7, close_state_reason={"x": 1},
+        )),
+        executor,
+    ).triage(143))
+
+    assert not any(c[0] == "close" for c in gw.calls)
+    assert ("relabel", "issue", 143, None, "ai-triage") in gw.calls
+    assert 143 in store.triage_at          # the leg completed, nothing raised
+
+
+def test_a_close_the_remote_never_took_is_not_journalled_as_closed(tmp_path):
+    """`execute_all` reports 'no action raised', not 'the write landed'. The close
+    metric is journalled from the observed issue state instead."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+
+    class SilentlyRefusingGateway(FakeGateway):
+        """Accepts the call and leaves the issue open — the shape a durable
+        command retired as a permanent failure presents to `execute_all`."""
+
+        def close_issue(self, number, reason, comment):
+            self.calls.append(("close", number, reason, comment))
+
+    gw = SilentlyRefusingGateway(
+        issues={143: IssueView(143, title="t", body="b", author="alice")},
+    )
+    executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
+
+    asyncio.run(StewardWorkflow(
+        _close_cfg(journal), gw, FakeStore(), FakeRunner(_close_verdict()), executor
+    ).triage(143))
+
+    assert gw.issues[143].state == "open"
+    assert _close_events(journal) == [("close_unconfirmed", "completed")]
+
+
+def test_a_reopened_issue_that_triages_ready_sheds_its_close_marker(tmp_path):
+    """Otherwise ai-closed outlives the close it recorded and keeps reading as
+    terminal to label→phase consumers."""
+    gw = FakeGateway(issues={143: IssueView(
+        143, title="t", body="b", author="alice",
+        labels=frozenset({Label.AI_CLOSED}), state_reason="reopened",
+    )})
+    executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
+    runner = FakeRunner(AgentResult(is_error=False, structured={
+        "verdict": "ready", "plain_summary": "clear",
+        "acceptance_criteria": ["ac"], "creator_questions": [],
+        "owner_questions": [],
+    }))
+
+    asyncio.run(StewardWorkflow(
+        _close_cfg(), gw, FakeStore(), runner, executor
+    ).triage(143))
+
+    assert ("relabel", "issue", 143, "ai-closed", None) in gw.calls
+    assert any(c[0] == "relabel" and c[4] == "ai-ready" for c in gw.calls)
+
+
+def test_the_prompt_tells_the_classifier_close_exists_and_keeps_the_bar_high():
+    gw = FakeGateway(issues={143: IssueView(143, title="t", body="b", author="alice")})
+    runner = FakeRunner(_close_verdict())
+    executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
+
+    asyncio.run(StewardWorkflow(
+        _close_cfg(), gw, FakeStore(), runner, executor
+    ).triage(143))
+
+    prompt = runner.tasks[0].prompt
+    assert "verdict=close" in prompt
+    assert "close_reason" in prompt and "reopen_if" in prompt
+    assert "CONCRETE, CHECKABLE evidence" in prompt
+    assert "close" in runner.tasks[0].schema["properties"]["verdict"]["enum"]

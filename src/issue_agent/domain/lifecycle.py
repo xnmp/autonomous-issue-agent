@@ -40,6 +40,11 @@ class PrPhase(str, Enum):
 
 
 _ISSUE_PHASES: tuple[tuple[Label, IssuePhase], ...] = (
+    # `ai-closed` is deliberately absent: IssuePhase.DONE means "a harness PR
+    # merged for this issue", which a steward triage close never did. A
+    # steward-closed issue is UNTRACKED here, which is the truthful answer for a
+    # view over PIPELINE position. The Jira mapping answers a different question
+    # ("may the ticket rest?") and does map it — see domain/jira.py.
     (Label.AI_DONE, IssuePhase.DONE),
     (Label.NEEDS_HUMAN_REVIEW, IssuePhase.NEEDS_HUMAN_REVIEW),
     (Label.NEEDS_DESIGN, IssuePhase.NEEDS_DESIGN),

@@ -43,6 +43,17 @@ class Label(str, Enum):
     # issue. A human decides whether to close it; it is never lifecycle state.
     MAYBE_RESOLVED = "maybe-resolved"
 
+    # Terminal marker for an issue the STEWARD closed straight out of triage
+    # (already fixed elsewhere, duplicate, invalid, resolved by a merged PR).
+    # Deliberately NOT ai-done: ai-done means "a harness PR merged for this
+    # issue", and `roles._recurrence_reporter` selects exactly open + ai-done +
+    # stateReason=reopened to journal a regression of SHIPPED work. A steward
+    # close ships no code, so reusing ai-done would book every human reopen of a
+    # wontfix as a harness recurrence and corrupt that guardrail metric. Kept out
+    # of LIFECYCLE_LABELS below so a reopened issue is an untriaged candidate
+    # again — a human putting it back means triage starts over.
+    AI_CLOSED = "ai-closed"
+
     # Steward outputs (never auto-promoted; a human disposes).
     AI_TRIAGE = "ai-triage"        # steward has seen it; awaiting author / human promote
     AI_SUGGESTION = "ai-suggestion"  # steward-filed suggestion issue

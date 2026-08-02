@@ -107,6 +107,12 @@ _PHASE_BY_LABEL: tuple[tuple[Label, JiraPhase], ...] = (
     (Label.NEEDS_HUMAN_REVIEW, JiraPhase.IN_PROGRESS),
     (Label.AI_READY, JiraPhase.TODO),
     (Label.AI_TRIAGE, JiraPhase.TODO),
+    # A steward triage close is terminal, so its ticket is Done — but it ranks
+    # LAST on purpose. `ai-closed` is a marker the harness clears when an issue
+    # re-enters triage, and until that clear lands a reopened issue can carry it
+    # alongside a live label; an active phase must win, or a ticket would read
+    # Done while the fixer is building it.
+    (Label.AI_CLOSED, JiraPhase.DONE),
 )
 
 

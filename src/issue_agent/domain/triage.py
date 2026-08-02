@@ -5,8 +5,9 @@ Split into the three independently-testable concerns the bash tangles together:
      the updatedAt dedupe that prevents re-triaging an unchanged issue).
   2. `TriageVerdict` — the structured output the agent returns (verdict + plain
      summary + AC + blocking gaps); pure data.
-  3. `actions_for_verdict` — verdict → comment/relabel actions, gated by
-     STEWARD_PROMOTE.
+  3. `actions_for_verdict` — verdict → comment/relabel/close actions, gated by
+     STEWARD_PROMOTE (and, for `close`, by evidence and by whether a human has
+     already reopened the issue).
   4. `recurrence_actions` — the ADVISORY recurrence marker, kept separate from
      (3) so the triage verdict mapping is unchanged whether or not the recurrence
      context was available.
@@ -19,10 +20,11 @@ themselves bump updatedAt), so only a LATER human reply re-triggers triage.
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from .actions import Action, AddDependency, PostComment, Relabel, Target
+from .actions import Action, AddDependency, CloseIssue, PostComment, Relabel, Target
 from .gate import Adr, check_adr_references
 from .labels import LIFECYCLE_LABELS, Label
 from .world import IssueView, PRView, WorldState
@@ -151,7 +153,7 @@ class TriageVerdict:
     non-empty → blocked. `needs_owner` distinguishes a blocker that only a MAINTAINER
     can clear (e.g. a domain-model decision) from one the author can."""
 
-    verdict: str  # "ready" | "blocked"
+    verdict: str  # "ready" | "blocked" | "close"
     plain_summary: str = ""
     acceptance_criteria: tuple[str, ...] = ()
     creator_questions: tuple[str, ...] = ()
@@ -164,6 +166,44 @@ class TriageVerdict:
     # back, or a shipped feature that does not work). None = no recurrence claimed.
     # Never acted on beyond a label + comment — see `recurrence_actions`.
     recurrence_of: int | None = None
+    # verdict="close" only. Why this issue needs no work, and what would make it
+    # matter again. BOTH must be non-empty for a close to be acted on: a close is
+    # the one triage disposition that ends an issue's life without a human, so an
+    # unexplained one is treated as no close at all (see `is_close`).
+    close_reason: str = ""
+    reopen_if: str = ""
+    # GitHub stateReason the classifier asked for; normalized by `close_state`.
+    close_state_reason: str = ""
+
+    @property
+    def is_close(self) -> bool:
+        """Whether this verdict is a close the steward may execute autonomously.
+
+        A bare verdict="close" is NOT enough. The incident this exists for
+        (keifu #143) was a triage agent concluding a merged PR had already
+        resolved the issue — evidence a human can check. A close with no stated
+        reason, or no condition under which it should come back, is a claim with
+        nothing behind it and degrades to the ordinary human-disposed path.
+        """
+        return (
+            self.verdict == "close"
+            and bool(self.close_reason.strip())
+            and bool(self.reopen_if.strip())
+        )
+
+    @property
+    def close_state(self) -> str:
+        """GitHub `stateReason` for the close.
+
+        "completed" asserts the reported work actually shipped, so only the exact
+        token earns it; every other shape — absent, misspelt, huge, non-string
+        upstream — reads as "not_planned", which claims nothing.
+        """
+        return (
+            "completed"
+            if self.close_state_reason.strip().casefold() == "completed"
+            else "not_planned"
+        )
 
     @property
     def is_blocked(self) -> bool:
@@ -213,14 +253,124 @@ def _owner_mention(cfg: TriageConfig) -> str:
     return cfg.owner_handle.strip() or "a maintainer"
 
 
-def actions_for_verdict(
+# Ceiling on classifier prose the harness republishes. The close comment is the
+# first agent-authored text that accompanies a DESTRUCTIVE act, and its source is
+# an attacker-writable issue body: an unbounded body is a spam vector, and a bare
+# @handle in it is a mass ping GitHub delivers on the harness's behalf. Backticks
+# neutralize the mention without hiding what the classifier actually said.
+_CLOSE_PROSE_LIMIT = 1500
+_MENTION_RE = re.compile(r"@([A-Za-z0-9][A-Za-z0-9-]*)")
+
+
+def _quoted_prose(text: str) -> str:
+    trimmed = text.strip()[:_CLOSE_PROSE_LIMIT]
+    return _MENTION_RE.sub(r"`@\1`", trimmed)
+
+
+def _close_body(author: str, verdict: TriageVerdict) -> str:
+    return (
+        "**Closing this issue 🗂️**\n\n"
+        f"@{author} {_quoted_prose(verdict.close_reason)}\n\n"
+        f"**Reopen this issue if:** {_quoted_prose(verdict.reopen_if)}\n\n"
+        "_Closed by the triage steward. If this is wrong, just reopen it — a "
+        "reopened issue is triaged again from scratch and is never auto-closed "
+        "a second time._"
+    )
+
+
+def close_actions(
     issue_number: int,
     author: str,
     verdict: TriageVerdict,
     cfg: TriageConfig,
 ) -> list[Action]:
-    """Map a triage verdict to comment + relabel actions.
+    """Execute a `close` verdict: mark, then say why, then close.
 
+    The relabel is FIRST so the terminal marker exists before the issue's state
+    changes; a partially-applied close then still shows an operator which issue
+    the steward was disposing of. The comment rides ON the `CloseIssue` command
+    rather than being its own `PostComment`, so the explanation and the close are
+    one durable lifecycle command with one receipt — the executor's closure
+    verifier already reconciles the comment and the state together, which a
+    separate comment action would split into two independently-retried effects.
+    """
+    return [
+        Relabel(Target.ISSUE, issue_number, cfg.triage_label, Label.AI_CLOSED),
+        CloseIssue(issue_number, verdict.close_state, _close_body(author, verdict)),
+    ]
+
+
+def declined_close_actions(
+    issue_number: int,
+    author: str,
+    cfg: TriageConfig,
+    reason: str,
+) -> list[Action]:
+    """A close the steward refuses to execute — hand the issue back to a human.
+
+    Two callers, one shape: a close verdict missing its reason/reopen condition,
+    and a close verdict on an issue a human already reopened. Both post one
+    comment and leave the issue OPEN under `ai-triage`; neither may fall through
+    to the ready path, because "ready" would queue a paid resolve leg for an
+    issue the classifier just said needs no work.
+    """
+    return [
+        PostComment(
+            Target.ISSUE,
+            issue_number,
+            "**Triage needs a human here** 👀\n\n"
+            f"@{author} the triage pass suggested closing this issue, but "
+            f"{reason} — so it stays open for a maintainer to decide.",
+        ),
+        Relabel(Target.ISSUE, issue_number, None, cfg.triage_label),
+    ]
+
+
+def actions_for_verdict(
+    issue_number: int,
+    author: str,
+    verdict: TriageVerdict,
+    cfg: TriageConfig,
+    *,
+    state_reason: str = "",
+    labels: frozenset[Label] = frozenset(),
+) -> list[Action]:
+    """Triage disposition actions, with the terminal close marker retired first.
+
+    An issue that is being triaged at all is back in the pipeline, so a leftover
+    `ai-closed` from an earlier steward close is stale the moment any other
+    disposition is reached. Clearing it here — rather than in each branch — keeps
+    the marker from outliving the close it recorded and reading as terminal to
+    every consumer that maps labels to a phase.
+    """
+    actions = _disposition_actions(
+        issue_number, author, verdict, cfg, state_reason=state_reason
+    )
+    if Label.AI_CLOSED in labels and not any(
+        isinstance(a, CloseIssue) for a in actions
+    ):
+        return [Relabel(Target.ISSUE, issue_number, Label.AI_CLOSED, None), *actions]
+    return actions
+
+
+def _disposition_actions(
+    issue_number: int,
+    author: str,
+    verdict: TriageVerdict,
+    cfg: TriageConfig,
+    *,
+    state_reason: str = "",
+) -> list[Action]:
+    """Map a triage verdict to comment + relabel (+ close) actions.
+
+    CLOSE → the issue needs no work at all (already fixed, duplicate, invalid,
+    resolved by a merged PR): comment with the reason and the reopen condition,
+    close it, and mark it `ai-closed`. Refused — and handed back to a human —
+    when the evidence is incomplete, or when `state_reason` says a human already
+    reopened this issue: `IssueView.state_reason` is the deterministic record
+    that its lifecycle ended once and someone deliberately put it back, and the
+    harness must never overrule that by closing it again. That is also the loop
+    guard: reopen → fresh triage → at most one comment, never a second close.
     BLOCKED → ONE comment with up to two clearly-separated sections: a plain,
     non-technical section addressed to the author (creator_questions), and — when
     there are owner_questions — a technical section addressed to the repo owner
@@ -231,6 +381,36 @@ def actions_for_verdict(
     relabel ai-triage→ai-ready (autonomous front door).
     READY + no promote → same comment but only ADD ai-triage; a human promotes.
     """
+    if verdict.verdict == "close":
+        if not cfg.promote:
+            # Same authority switch that gates ai-ready promotion. Closing an
+            # issue is strictly more destructive than queueing one, so a
+            # deployment that still wants a human to make the state-changing
+            # call must not acquire autonomous closing by hot-reload.
+            return declined_close_actions(
+                issue_number,
+                author,
+                cfg,
+                "this deployment leaves lifecycle decisions to a human "
+                "(STEWARD_PROMOTE is off)",
+            )
+        if not verdict.is_close:
+            return declined_close_actions(
+                issue_number,
+                author,
+                cfg,
+                "it did not say why, or under what condition the issue should "
+                "come back",
+            )
+        if state_reason.strip().casefold() == "reopened":
+            return declined_close_actions(
+                issue_number,
+                author,
+                cfg,
+                "this issue was already closed once and reopened by a human",
+            )
+        return close_actions(issue_number, author, verdict, cfg)
+
     ac = "\n".join(f"- {c}" for c in verdict.acceptance_criteria)
 
     # Verified cross-issue prerequisites → native blocked_by links. Skip a self-
