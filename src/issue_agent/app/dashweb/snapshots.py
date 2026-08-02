@@ -651,46 +651,48 @@ def _suspended_seconds(row: dash.IssueRow, max_seconds: float) -> float:
     return _suspension_partition(row, max_seconds)[0]
 
 
-def _idle_intervals(
+def _union_intervals(
+    intervals: list[tuple[datetime, datetime]],
+) -> list[tuple[datetime, datetime]]:
+    merged: list[tuple[datetime, datetime]] = []
+    for begin, finish in sorted(intervals):
+        if merged and begin <= merged[-1][1]:
+            last_begin, last_finish = merged[-1]
+            merged[-1] = (last_begin, max(last_finish, finish))
+        else:
+            merged.append((begin, finish))
+    return merged
+
+
+def _leg_intervals(
     row: dash.IssueRow,
+    start: datetime,
     end: datetime,
-) -> tuple[list[tuple[datetime, datetime]], bool]:
-    """Union dependency-wait intervals so overlapping blockers count once."""
-    active: set[tuple] = set()
-    legacy = False
-    idle_started: datetime | None = None
+) -> list[tuple[datetime, datetime]]:
+    """When the harness was actually inside a task, as a disjoint union.
+
+    A settled leg's journal stamp is its settlement; its runtime is the
+    reported duration walked back from there. A leg running right now extends
+    to `end`. Everything is clamped to the issue's [start, end] window so a
+    malformed duration cannot mint work time outside the issue's life.
+    """
     intervals: list[tuple[datetime, datetime]] = []
-    timed_events = sorted(
-        (
-            (stamp, index, event)
-            for index, event in enumerate(row.events)
-            if (stamp := dash.parse_ts(event.get("ts"))) is not None
-            and stamp <= end
-        ),
-        key=lambda item: (item[0], item[1]),
-    )
-    for stamp, _index, event in timed_events:
-        was_idle = bool(active) or legacy
-        if event.get("event") == "deferred":
-            legacy = False
-            key = _defer_key(event)
-            if event.get("state") == "cleared":
-                active.discard(key)
-            elif event.get("state") == "waiting":
-                active.add(key)
-        elif event.get("event") == "hold":
-            legacy = True
-        elif legacy and _dispatch_supersedes_legacy_hold(event):
-            legacy = False
-        is_idle = bool(active) or legacy
-        if is_idle and not was_idle:
-            idle_started = stamp
-        elif was_idle and not is_idle and idle_started is not None:
-            intervals.append((idle_started, stamp))
-            idle_started = None
-    if idle_started is not None:
-        intervals.append((idle_started, end))
-    return intervals, bool(active) or legacy
+    for leg in row.legs:
+        if leg.ts is None:
+            continue
+        seconds = leg.duration_s
+        if not math.isfinite(seconds) or seconds <= 0:
+            continue
+        try:
+            begin = leg.ts - timedelta(seconds=seconds)
+        except OverflowError:
+            begin = start
+        intervals.append((max(begin, start), min(leg.ts, end)))
+    for leg in row.running:
+        if leg.ts is None:
+            continue
+        intervals.append((max(leg.ts, start), end))
+    return _union_intervals([iv for iv in intervals if iv[0] < iv[1]])
 
 
 def _duration_breakdown(
@@ -698,22 +700,31 @@ def _duration_breakdown(
     start: datetime | None,
     end: datetime,
 ) -> tuple[float | None, float | None, float | None, bool]:
+    """Working time is time spent inside tasks — the same durations the
+    drill-down lists, so the per-task times sum (modulo overlap and clamping)
+    to the card's work clock. Everything else the issue lived through —
+    waiting on CI, on a review slot, on a dependency, on a human — is idle.
+    The work clock ticks only while a leg is actually running (#34 sat
+    "awaiting merge" with a ticking work clock and 6h of invented work).
+    """
     if start is None:
         return None, None, None, False
     wall_seconds = max(0.0, (end - start).total_seconds())
-    idle_intervals, idle_active = _idle_intervals(row, end)
-    suspended, suspended_while_idle = _suspension_partition(
+    work_intervals = _leg_intervals(row, start, end)
+    suspended, suspended_while_working = _suspension_partition(
         row,
         wall_seconds,
-        idle_intervals,
+        work_intervals,
     )
     elapsed = max(0.0, wall_seconds - suspended)
-    raw_idle = sum(
-        max(0.0, (idle_end - idle_start).total_seconds())
-        for idle_start, idle_end in idle_intervals
+    raw_working = sum(
+        max(0.0, (finish - begin).total_seconds())
+        for begin, finish in work_intervals
     )
-    idle = min(elapsed, max(0.0, raw_idle - suspended_while_idle))
-    return elapsed, elapsed - idle, idle, idle_active and not row.done
+    working = min(elapsed, max(0.0, raw_working - suspended_while_working))
+    idle = max(0.0, elapsed - working)
+    idle_active = not row.done and not row.running
+    return elapsed, working, idle, idle_active
 
 
 def _flags(row: dash.IssueRow, human_action: str | None = None) -> list[str]:

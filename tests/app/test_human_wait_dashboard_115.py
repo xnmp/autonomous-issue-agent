@@ -1,11 +1,17 @@
-"""Dashboard projection coverage for human-input wait spans."""
+"""Dashboard projection coverage for human-input wait spans.
+
+Since the leg-based work/idle partition, a wait on a human needs no
+`deferred` bookkeeping to read as idle: any time outside a task is idle by
+definition. These tests pin that a declared human wait neither inflates nor
+double-counts the partition.
+"""
 
 from issue_agent.app.dashweb import snapshots
 
 from test_dashweb_snapshots import NOW, RESOLVE, row_for, ts
 
 
-def test_human_wait_is_idle_until_reply_driven_resume():
+def test_a_human_wait_reads_as_idle_without_inflating_working_time():
     events = [
         RESOLVE,
         {"ts": ts(hours=2), "event": "deferred", "state": "waiting",
@@ -16,12 +22,14 @@ def test_human_wait_is_idle_until_reply_driven_resume():
 
     detail = snapshots.issue_detail(row_for(events, 7), NOW)
 
-    assert detail["idle_s"] == 3_600
-    assert detail["working_s"] == detail["elapsed_s"] - 3_600
-    assert detail["idle_active"] is False
+    # RESOLVE reports no runtime, so every second of this issue's life was
+    # spent waiting on something — none of it is working time.
+    assert detail["working_s"] == 0
+    assert detail["idle_s"] == detail["elapsed_s"]
+    assert detail["idle_active"] is True
 
 
-def test_human_and_dependency_waits_are_unioned_not_double_counted():
+def test_overlapping_waits_cannot_push_idle_past_elapsed():
     events = [
         RESOLVE,
         {"ts": ts(hours=3), "event": "deferred", "state": "waiting",
@@ -36,5 +44,5 @@ def test_human_and_dependency_waits_are_unioned_not_double_counted():
 
     detail = snapshots.issue_detail(row_for(events, 7), NOW)
 
-    assert detail["idle_s"] == 5_400
-    assert detail["working_s"] == detail["elapsed_s"] - 5_400
+    assert detail["idle_s"] == detail["elapsed_s"]
+    assert detail["working_s"] == 0

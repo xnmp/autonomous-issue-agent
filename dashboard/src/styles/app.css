@@ -114,18 +114,9 @@
   overflow: hidden;
   position: relative;
 }
-/* Collapsed: the rail is gone entirely; only the quota button floats over
-   the board, with the expand affordance tucked under it. */
-.sidebar-float {
-  position: fixed;
-  z-index: 30;
-  left: var(--s2);
-  bottom: var(--s2);
-  display: flex;
-  flex-direction: column;
-  gap: var(--s1);
-  width: 40px;
-}
+/* Collapsed: the rail is gone entirely. The expand toggle keeps the exact
+   spot (and height) the collapse toggle had — top-left, level with the tab
+   row — so it never jumps; the quota button floats alone at bottom-left. */
 .sidebar-float .rail-btn.icon-only {
   width: 40px;
   height: 40px;
@@ -135,13 +126,19 @@
   border: 1px solid var(--border-strong);
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3);
 }
+.sidebar-float .usage-inline.collapsed {
+  position: fixed;
+  z-index: 30;
+  left: var(--s2);
+  bottom: var(--s2);
+}
 /* Beats .sidebar-toggle's absolute positioning (same file, later block). */
 .sidebar-float .sidebar-toggle-float {
-  position: static;
-  width: 40px;
-  height: 24px;
-  color: var(--ink-faint);
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3);
+  position: fixed;
+  z-index: 30;
+  top: var(--s2);
+  left: var(--s2);
+  right: auto;
 }
 .sidebar-toggle {
   position: absolute;
