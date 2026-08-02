@@ -994,8 +994,14 @@ class FixWorkflow:
         self.store.save_session(issue, result.session_id)
         # An externally-killed session made no attempt, so it must not march the
         # CI breaker toward needs-human-review (FAILURE-MODES #58: six SIGKILLs on
-        # one PR burned the whole budget on work that never ran).
-        if not outcome.infra_death(result.exit_reason):
+        # one PR burned the whole budget on work that never ran). Neither did a
+        # budget-capped one (#155): an admission rejection is deterministic, so
+        # counting it walks a healthy PR to needs-human-review at $0 per strike
+        # (keifu PR #174, 2026-08-02) — fix_ci_actions routes it to the budget
+        # surface instead.
+        if outcome.budget_exhausted(result.exit_reason):
+            pass
+        elif not outcome.infra_death(result.exit_reason):
             self.store.set_ci_retries(issue, self.store.get_ci_retries(issue) + 1)
             self._decay_infra_deaths(issue, result, alt_key=-pr)
         else:
@@ -1020,8 +1026,11 @@ class FixWorkflow:
         )
         result = await self._run_logged("rebase", issue, task, kind="REBASE")
         self.store.save_session(issue, result.session_id)
-        # Same rule as fix_ci: an infra kill is not a failed rebase attempt.
-        if not outcome.infra_death(result.exit_reason):
+        # Same rule as fix_ci: neither an infra kill nor a budget-capped
+        # admission/leg is a failed rebase attempt (#155).
+        if outcome.budget_exhausted(result.exit_reason):
+            pass
+        elif not outcome.infra_death(result.exit_reason):
             self.store.set_rebase_retries(issue, self.store.get_rebase_retries(issue) + 1)
             self._decay_infra_deaths(issue, result, alt_key=-pr)
         else:

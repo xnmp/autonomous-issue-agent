@@ -1406,15 +1406,33 @@ def test_infra_ceiling_does_not_escalate_a_pr_with_no_work_to_do():
 
 
 # ── reap ────────────────────────────────────────────────────────────────────────
+# Every reap relabel binds expected_revision to the OBSERVED issue's updated_at:
+# a leg finishing between observation and write bumps updated_at with its own
+# relabel, so the stale repair is discarded instead of resurrecting ai-ready
+# next to the leg's fresh label (keifu #18/#25 dual-label race, 2026-08-02).
+_REV = "2026-08-02T00:00:00Z"
+
+
 def test_reap_requeues_orphaned_issue_to_ready():
-    w = world(issues=[issue(8, "ai-working")])
-    assert Relabel(Target.ISSUE, 8, Label.AI_WORKING, Label.AI_READY) in reap_actions(w)
+    w = world(issues=[issue(8, "ai-working", updated_at=_REV)])
+    assert Relabel(
+        Target.ISSUE, 8, Label.AI_WORKING, Label.AI_READY, expected_revision=_REV
+    ) in reap_actions(w)
+
+
+def test_reap_relabel_fails_closed_without_an_observed_revision():
+    # An issue observed WITHOUT updated_at must carry "" (fail-closed contract
+    # on Relabel.expected_revision), never None — None would let the command
+    # layer mint a fresh revision at write time, a self-fulfilling CAS that
+    # cannot catch the decision going stale.
+    [action] = reap_actions(world(issues=[issue(8, "ai-working")]))
+    assert action.expected_revision == ""
 
 
 def test_reap_protects_only_active_issues_while_pool_is_occupied():
     w = world(issues=[
-        issue(8, "ai-working"),
-        issue(9, "ai-working"),
+        issue(8, "ai-working", updated_at=_REV),
+        issue(9, "ai-working", updated_at=_REV),
     ])
 
     actions = decide_fix(
@@ -1425,8 +1443,10 @@ def test_reap_protects_only_active_issues_while_pool_is_occupied():
         dispatch_slots=0,
     )
 
-    assert Relabel(Target.ISSUE, 8, Label.AI_WORKING, Label.AI_READY) not in actions
-    assert Relabel(Target.ISSUE, 9, Label.AI_WORKING, Label.AI_READY) in actions
+    reaped = {a.number for a in actions if isinstance(a, Relabel)
+              and a.remove is Label.AI_WORKING and a.add is Label.AI_READY}
+    assert 8 not in reaped
+    assert 9 in reaped
 
 
 def test_reap_ignores_prs_entirely():
@@ -1437,8 +1457,12 @@ def test_reap_ignores_prs_entirely():
     assert reap_actions(world(prs=[pr(101, "ai-working")])) == []
     # Anti-vacuity twin: the ISSUE arm on the same world still fires, so an empty
     # list here means "PRs are out of scope", not "reap_actions stopped working".
-    assert reap_actions(world(issues=[issue(8, "ai-working")], prs=[pr(101, "ai-working")])) == [
-        Relabel(Target.ISSUE, 8, Label.AI_WORKING, Label.AI_READY)
+    assert reap_actions(world(
+        issues=[issue(8, "ai-working", updated_at=_REV)],
+        prs=[pr(101, "ai-working")],
+    )) == [
+        Relabel(Target.ISSUE, 8, Label.AI_WORKING, Label.AI_READY,
+                expected_revision=_REV)
     ]
 
 
@@ -1446,9 +1470,13 @@ def test_reap_ignores_prs_entirely():
 # PR back through RESOLVE — that opens a second PR for work already up, and the
 # resolve leg has no counter on its success path, so nothing bounds the repeat.
 def test_reap_repairs_to_pr_open_when_the_issue_already_has_an_open_pr():
-    w = world(issues=[issue(8, "ai-working")], prs=[pr(50, "ai-pr-open", closing_issue=8)])
+    w = world(
+        issues=[issue(8, "ai-working", updated_at=_REV)],
+        prs=[pr(50, "ai-pr-open", closing_issue=8)],
+    )
     assert reap_actions(w) == [
-        Relabel(Target.ISSUE, 8, Label.AI_WORKING, Label.AI_PR_OPEN)
+        Relabel(Target.ISSUE, 8, Label.AI_WORKING, Label.AI_PR_OPEN,
+                expected_revision=_REV)
     ]
 
 
@@ -1456,9 +1484,13 @@ def test_reap_repairs_via_branch_linkage_not_just_closing_ref():
     # The PR that a died-before-relabel session opened often has no closing-ref
     # yet (the body edit is a separate call), so branch linkage is the case that
     # actually fires in the incident this guards.
-    w = world(issues=[issue(8, "ai-working")], prs=[pr(50, head_ref_name="fix/8-thing")])
+    w = world(
+        issues=[issue(8, "ai-working", updated_at=_REV)],
+        prs=[pr(50, head_ref_name="fix/8-thing")],
+    )
     assert reap_actions(w) == [
-        Relabel(Target.ISSUE, 8, Label.AI_WORKING, Label.AI_PR_OPEN)
+        Relabel(Target.ISSUE, 8, Label.AI_WORKING, Label.AI_PR_OPEN,
+                expected_revision=_REV)
     ]
 
 
@@ -1467,11 +1499,12 @@ def test_reap_still_requeues_when_the_issues_pr_is_closed():
     # correct — otherwise this "fix" would strand every issue whose PR a human
     # closed.
     w = world(
-        issues=[issue(8, "ai-working")],
+        issues=[issue(8, "ai-working", updated_at=_REV)],
         prs=[pr(50, closing_issue=8, state="CLOSED")],
     )
     assert reap_actions(w) == [
-        Relabel(Target.ISSUE, 8, Label.AI_WORKING, Label.AI_READY)
+        Relabel(Target.ISSUE, 8, Label.AI_WORKING, Label.AI_READY,
+                expected_revision=_REV)
     ]
 
 
@@ -1482,11 +1515,12 @@ def test_reap_does_not_pay_for_a_second_resolve_when_the_relabel_keeps_failing()
     # the NEXT poll dispatched a full paid RESOLVE. Assert on the money: no
     # RunAgent for issue 8 anywhere in the poll.
     w = world(
-        issues=[issue(8, "ai-working")],
+        issues=[issue(8, "ai-working", updated_at=_REV)],
         prs=[pr(50, "ai-pr-open", closing_issue=8, checks=(Check("unit", bucket="pass"),))],
     )
     actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
-    assert Relabel(Target.ISSUE, 8, Label.AI_WORKING, Label.AI_PR_OPEN) in actions
+    assert Relabel(Target.ISSUE, 8, Label.AI_WORKING, Label.AI_PR_OPEN,
+                   expected_revision=_REV) in actions
     assert not [a for a in actions if isinstance(a, RunAgent) and a.number == 8]
 
 

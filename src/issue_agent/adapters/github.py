@@ -25,6 +25,7 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from urllib.parse import quote
 
 from ..domain.labels import Label
 from ..domain.world import (
@@ -628,15 +629,40 @@ def build_submit_review_args(
 
 def build_relabel_args(
     repo: str, kind: str, number: int, remove: str | None, add: str | None,
-) -> list[str] | None:
+) -> list[list[str]] | None:
+    """REST label commands (one per mutation), never `gh <kind> edit`.
+
+    `gh pr edit --add-label` runs a GraphQL metadata-resolution query (it
+    fetches assignable users/teams alongside labels) that demands `read:org`
+    — a classic PAT scoped to `repo` alone (the supported cross-account bot
+    credential) fails every relabel with a scope error (observed live: review
+    daemon wedged on PR #171, 2026-08-02). Plain `--json` reads are unaffected.
+    The REST issues/labels endpoints accept plain `repo` scope and cover PRs
+    too (a PR is an issue to this endpoint), so `kind` does not select a route.
+
+    ADD BEFORE REMOVE (deliberate, adversarial F1): the pair is no longer one
+    atomic edit, and a permanently failing second call must not strand the
+    target label-less — an unlabeled issue/PR is invisible to every daemon's
+    world build, so nothing would ever repair it. Add-first leaves "both
+    labels" as the stuck state, which the world still sees and re-derives.
+    A DELETE for an already-absent label 404s; the executor's membership
+    verification treats that end state as success, so the failure is benign.
+    """
     if not remove and not add:
         return None
-    args = [kind, "edit", str(number), "--repo", repo]
-    if remove:
-        args += ["--remove-label", remove]
+    commands: list[list[str]] = []
     if add:
-        args += ["--add-label", add]
-    return args
+        commands.append([
+            "api", "--method", "POST",
+            f"repos/{repo}/issues/{number}/labels",
+            "-f", f"labels[]={add}",
+        ])
+    if remove:
+        commands.append([
+            "api", "--method", "DELETE",
+            f"repos/{repo}/issues/{number}/labels/{quote(remove, safe='')}",
+        ])
+    return commands
 
 
 def build_comment_args(repo: str, kind: str, number: int, body: str) -> list[str]:
@@ -1628,8 +1654,8 @@ class GitHubGateway:
 
     # ── writes ──
     def relabel(self, kind: str, number: int, remove: str | None, add: str | None) -> None:
-        args = build_relabel_args(self.repo, kind, number, remove, add)
-        if args is not None:
+        commands = build_relabel_args(self.repo, kind, number, remove, add)
+        for args in commands or []:
             self._gh(args)
 
     def has_label(self, kind: str, number: int, label: str) -> bool:

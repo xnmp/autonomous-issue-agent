@@ -7,7 +7,11 @@ from issue_agent.adapters.control_store import (
     RetiredOwnerError,
     SQLiteControlStore,
 )
-from issue_agent.adapters.effects import GitHubEffectExecutor, command_for_action
+from issue_agent.adapters.effects import (
+    GitHubEffectExecutor,
+    StaleExpectedRevision,
+    command_for_action,
+)
 from issue_agent.domain.actions import (
     AddDependency,
     CloseIssue,
@@ -399,7 +403,8 @@ def test_expected_revision_blocks_stale_effect(tmp_path) -> None:
     executor, gateway, store = _executor(tmp_path)
     gateway.head = "new-head"
 
-    assert executor.execute(RerunFailedChecks(7, "old-head", (42,))) is False
+    with pytest.raises(StaleExpectedRevision):
+        executor.execute(RerunFailedChecks(7, "old-head", (42,)))
 
     assert gateway.calls == []
     assert store.pending_commands() == ()
@@ -438,7 +443,8 @@ def test_issue_revision_change_blocks_stale_comment(tmp_path) -> None:
     )
     gateway.issue_revision = "issue-rev-2"
 
-    assert executor.execute(action) is False
+    with pytest.raises(StaleExpectedRevision):
+        executor.execute(action)
     assert gateway.calls == []
     assert store.pending_commands() == ()
 
@@ -455,7 +461,8 @@ def test_stale_claim_cannot_reconcile_from_newer_matching_labels(tmp_path) -> No
         "issue-rev-1",
     )
 
-    assert executor.execute(action) is False
+    with pytest.raises(StaleExpectedRevision):
+        executor.execute(action)
     assert gateway.calls == []
     assert store.pending_commands() == ()
 
@@ -478,7 +485,8 @@ def test_pr_relabel_captures_and_enforces_head_revision(tmp_path) -> None:
     )
     gateway.head = "head-2"
 
-    assert executor.execute(action) is False
+    with pytest.raises(StaleExpectedRevision):
+        executor.execute(action)
     assert gateway.calls == []
     assert store.pending_commands() == ()
 

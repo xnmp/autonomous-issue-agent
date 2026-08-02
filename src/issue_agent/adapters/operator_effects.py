@@ -12,6 +12,7 @@ import json
 import subprocess
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
+from urllib.parse import quote
 
 from .control_path import control_store_path
 from .control_store import SQLiteControlStore
@@ -162,16 +163,36 @@ class GitHubOperatorEffects:
                 _current, value = self._issue_labels(issue)
                 return value
 
-            argv = ["gh", "issue", "edit", str(issue), "-R", self.repository]
-            for label in removed:
-                argv.extend(("--remove-label", label))
-            for label in added:
-                argv.extend(("--add-label", label))
+            # REST, not `gh issue edit`: the edit path's GraphQL metadata query
+            # needs read:org, which a repo-scoped bot PAT lacks (same failure
+            # class as the PR #171 relabel wedge — see build_relabel_args).
+            # Adds first so a failing second call strands "both labels", never
+            # a label-less target; deletes are limited to labels observed
+            # present because `gh api` raises on the 404 an absent label earns.
+            argvs: list[list[str]] = []
+            if added:
+                argvs.append(
+                    ["gh", "api", "--method", "POST",
+                     f"repos/{self.repository}/issues/{issue}/labels"]
+                    + [arg for label in added for arg in ("-f", f"labels[]={label}")]
+                )
+            argvs.extend(
+                ["gh", "api", "--method", "DELETE",
+                 f"repos/{self.repository}/issues/{issue}/labels/"
+                 f"{quote(label, safe='')}"]
+                for label in removed
+                if label in labels
+            )
+
+            def apply() -> None:
+                for argv in argvs:
+                    self._mutate(argv)
+
             self._execute(
                 command,
                 reconcile=reconcile,
                 revision=current_revision,
-                apply=lambda: self._mutate(argv),
+                apply=apply,
             )
             return True, "ok"
         except Exception as exc:  # noqa: BLE001 - operator-facing result

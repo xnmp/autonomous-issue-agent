@@ -90,6 +90,18 @@ def _target_correlation(target: str) -> Correlation:
     return Correlation()
 
 
+class StaleExpectedRevision(RuntimeError):
+    """The command's revision guard no longer matches the remote target.
+
+    Deliberately NOT a transient write error: the mismatch is a fact about the
+    decision being stale, so the in-tick retry ladder (1s/3s/9s + a reconcile
+    read per attempt) cannot possibly succeed — it burned ~13s per discarded
+    repair for nothing (adversarial F2, 2026-08-02). The caller logs the
+    failure and the next tick re-decides from a fresh world, which mints a
+    fresh revision. The permanent-failure receipt is recorded BEFORE this is
+    raised, so the durable command is already settled when it propagates."""
+
+
 class UnknownEffectOutcome(RuntimeError):
     pass
 
@@ -332,13 +344,18 @@ class GitHubEffectExecutor:
         if pending.state == EffectStatus.PERMANENT_FAILURE.value:
             return False
         if pending.state == "pending" and not self._revision_matches(command):
-            return self.effects.execute(
+            self.effects.execute(
                 command,
                 lambda: EffectOutcome(
                     False,
                     EffectStatus.PERMANENT_FAILURE,
                     error="expected revision no longer matches remote target",
                 ),
+            )
+            raise StaleExpectedRevision(
+                f"{command.target}: expected revision "
+                f"{command.expected_revision!r} no longer matches the remote "
+                "target — decision stale, discarded; next tick re-decides"
             )
         repairing_partial_close = (
             pending.state != "pending"
@@ -377,13 +394,18 @@ class GitHubEffectExecutor:
             and not repairing_partial_close
             and not self._revision_matches(command)
         ):
-            return self.effects.execute(
+            self.effects.execute(
                 command,
                 lambda: EffectOutcome(
                     False,
                     EffectStatus.PERMANENT_FAILURE,
                     error="expected revision no longer matches remote target",
                 ),
+            )
+            raise StaleExpectedRevision(
+                f"{command.target}: expected revision "
+                f"{command.expected_revision!r} no longer matches the remote "
+                "target — decision stale, discarded; next tick re-decides"
             )
 
         def apply_and_verify() -> EffectOutcome[bool]:

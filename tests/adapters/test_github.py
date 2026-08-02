@@ -268,9 +268,22 @@ def test_write_command_builders_are_pure_contracts():
         "-f", "event=APPROVE", "-f", "body=lgtm",
         "-f", "commit_id=head",
     ]
+    # REST, not `gh <kind> edit`: GraphQL label edits need read:org, which the
+    # supported repo-scoped classic bot PAT lacks (PR #171 wedge, 2026-08-02).
+    # Add BEFORE remove: a permanently failing second call must strand "both
+    # labels" (visible to the world build), never a label-less target.
     assert build_relabel_args("o/r", "issue", 5, "ai-ready", "ai-working") == [
-        "issue", "edit", "5", "--repo", "o/r",
-        "--remove-label", "ai-ready", "--add-label", "ai-working",
+        ["api", "--method", "POST", "repos/o/r/issues/5/labels",
+         "-f", "labels[]=ai-working"],
+        ["api", "--method", "DELETE", "repos/o/r/issues/5/labels/ai-ready"],
+    ]
+    assert build_relabel_args("o/r", "pr", 171, None, "ai-pr-open") == [
+        ["api", "--method", "POST", "repos/o/r/issues/171/labels",
+         "-f", "labels[]=ai-pr-open"],
+    ]
+    assert build_relabel_args("o/r", "pr", 7, "needs human review?", None) == [
+        ["api", "--method", "DELETE",
+         "repos/o/r/issues/7/labels/needs%20human%20review%3F"],
     ]
     assert build_relabel_args("o/r", "issue", 5, None, None) is None
     assert build_comment_args("o/r", "pr", 100, "hi") == [
@@ -299,10 +312,16 @@ def test_relabel_builds_correct_argv():
     fr = FakeRunner()
     gw = GitHubGateway("o/r", Identity(static_token="t"), runner=fr)
     gw.relabel("issue", 5, "ai-ready", "ai-working")
-    argv, token = fr.calls[0]
-    assert argv[:5] == ["gh", "issue", "edit", "5", "--repo"]
-    assert "--remove-label" in argv and "ai-ready" in argv
-    assert "--add-label" in argv and "ai-working" in argv
+    assert len(fr.calls) == 2
+    add_argv, token = fr.calls[0]
+    assert add_argv == [
+        "gh", "api", "--method", "POST", "repos/o/r/issues/5/labels",
+        "-f", "labels[]=ai-working",
+    ]
+    remove_argv, _ = fr.calls[1]
+    assert remove_argv == [
+        "gh", "api", "--method", "DELETE", "repos/o/r/issues/5/labels/ai-ready",
+    ]
     assert token == "t"
 
 

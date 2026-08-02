@@ -278,9 +278,17 @@ def _flags(row: IssueRow) -> str:
         parts.append(f"{row.recurrences} recurrence(s)")
     errored = [leg for leg in row.legs if leg_failed(leg.is_error, leg.exit_reason)]
     if errored:
+        # A leg can be selected by is_error while carrying a clean-looking
+        # exit_reason ("ok"/""); label it by the flag that flagged it, or the
+        # row reads "exits: ok" for a leg shown as errored.
         parts.append(
             "exits: "
-            + ",".join(sorted({leg.exit_reason or "is_error" for leg in errored}))
+            + ",".join(sorted({
+                leg.exit_reason
+                if leg.exit_reason and leg.exit_reason != "ok"
+                else "is_error"
+                for leg in errored
+            }))
         )
     if row.models:
         parts.append("models: " + ",".join(row.models))

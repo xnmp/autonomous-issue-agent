@@ -2194,6 +2194,15 @@ def build_fix_daemon(
         )
         return issue, paths
 
+    # Sampled by observe() immediately BEFORE the world fetch. A leg that
+    # finishes mid-fetch releases its reservation while the already-fetched
+    # world still shows its ai-working label; a post-fetch snapshot then reads
+    # "nothing active" against a stale world and reap_actions repairs an issue
+    # that was never orphaned (keifu #18/#25 dual-label race, 2026-08-02 —
+    # cost a duplicate route leg). Merging the pre-fetch sample fails toward
+    # "busy", which defers work by one poll instead of duplicating it.
+    pre_fetch_inflight: list[tuple[InFlightFix, ...]] = []
+
     def decide(world):
         # Report BEFORE deciding: if decide_fix raises, the tick still leaves a
         # record of what it was holding, which is the state hardest to diagnose.
@@ -2201,7 +2210,9 @@ def build_fix_daemon(
         # state decide_fix decides on, so the two can never describe different
         # worlds (and the store reads happen once, not twice).
         world = _inject_predicted_paths(store, world)
-        inflight = reservations.snapshot()
+        held = {f.issue: f for f in pre_fetch_inflight[0]} if pre_fetch_inflight else {}
+        held.update({f.issue: f for f in reservations.snapshot()})
+        inflight = tuple(held.values())
         state = _fix_state(
             store,
             world,
@@ -2270,11 +2281,17 @@ def build_fix_daemon(
         worktrees,
         owner_id=owner_id,
     )
+    reported_world = _reported_world(
+        gateway.build_world, control, cfg, "fix", _log("fix")
+    )
+
+    def observe_with_prefetch_reservations():
+        pre_fetch_inflight[:] = [reservations.snapshot()]
+        return reported_world()
+
     daemon = Daemon(
         "fix",
-        _reported_world(
-            gateway.build_world, control, cfg, "fix", _log("fix")
-        ),
+        observe_with_prefetch_reservations,
         decide,
         executor,
         cfg.tick_interval_seconds,

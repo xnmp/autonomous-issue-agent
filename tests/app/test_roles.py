@@ -1376,6 +1376,105 @@ def test_daemon_holds_predicted_overlap_before_every_resolve_dispatch(tmp_path):
     )
 
 
+def test_reaper_ignores_a_leg_that_finishes_during_the_world_fetch(tmp_path):
+    """The relabel race (keifu #18/#25 dual labels, 2026-08-02): a leg that
+    completes while build_world is in flight releases its reservation, and the
+    already-fetched world still shows the issue's ai-working label with no PR.
+    A reservation snapshot taken after the fetch reads "nothing active" against
+    that stale world, so the reaper requeued — and the next poll paid for — an
+    issue that was never orphaned. Reservations sampled BEFORE the fetch must
+    protect the issue for the tick that consumes that world."""
+    import sqlite3
+
+    from issue_agent.app.config import HarnessConfig
+    from issue_agent.app.roles import build_fix_daemon
+
+    release = threading.Event()
+    runner_returned = threading.Event()
+
+    class BlockingRunner:
+        def __init__(self):
+            self.tasks = []
+
+        async def run(self, task):
+            self.tasks.append(task)
+            await asyncio.to_thread(release.wait)
+            runner_returned.set()
+            return AgentResult(is_error=False)
+
+    state_dir = tmp_path / "state"
+
+    def dispatch_claims_released() -> bool:
+        # The in-memory reservation is dropped BEFORE its durable claim row
+        # (DispatchPathReservations.finish), so an empty dispatch_claims table
+        # proves the in-memory release the race needs has already happened.
+        for path in state_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                with sqlite3.connect(path) as db:
+                    count = db.execute(
+                        "SELECT count(*) FROM dispatch_claims"
+                    ).fetchone()[0]
+                return count == 0
+            except sqlite3.Error:
+                continue
+        return False
+
+    ready = WorldState(issues=(
+        IssueView(8, labels=frozenset({Label.AI_READY}),
+                  updated_at="2026-08-02T00:00:00Z"),
+    ))
+    # What GitHub served while the leg was still running: claimed, no PR yet.
+    stale = WorldState(issues=(
+        IssueView(8, labels=frozenset({Label.AI_WORKING}),
+                  updated_at="2026-08-02T00:10:00Z"),
+    ))
+
+    class RacingGateway(FakeGateway):
+        def __init__(self):
+            super().__init__(issues={8: ready.issues[0]})
+            self.fetches = 0
+
+        def build_world(self):
+            self.fetches += 1
+            if self.fetches == 1:
+                return ready
+            if self.fetches == 2:
+                # The fetch is "in flight" and the leg completes under it.
+                release.set()
+                assert runner_returned.wait(20), "leg never completed"
+                deadline = time.monotonic() + 20
+                while not dispatch_claims_released():
+                    assert time.monotonic() < deadline, "claim never released"
+                    time.sleep(0.02)
+                return stale
+            return stale
+
+    daemon = build_fix_daemon(
+        HarnessConfig(
+            repo="o/r", fix_bot=FIX_BOT, target_dir=str(tmp_path),
+            state_dir=str(state_dir),
+        ),
+        RacingGateway(), Store(str(state_dir)), FakeWorktrees(),
+        BlockingRunner(),
+    )
+
+    first = daemon.tick()
+    assert any(isinstance(a, RunAgent) and a.number == 8 for a in first)
+
+    second = daemon.tick()
+    stale_repairs = [
+        a for a in second
+        if isinstance(a, Relabel) and a.number == 8
+        and a.remove is Label.AI_WORKING
+    ]
+    assert stale_repairs == [], (
+        "the reaper repaired an issue whose leg finished during the fetch"
+    )
+    assert not any(isinstance(a, RunAgent) and a.number == 8 for a in second)
+
+
 def test_terminal_pr_journals_router_prediction_against_actual_changed_files(tmp_path):
     store = Store(str(tmp_path))
     store.save_predicted_paths(522, frozenset({"backend/app/x.py", "wrong.py"}))

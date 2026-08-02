@@ -361,6 +361,36 @@ def budget_actions(issue: int) -> list[Action]:
     ]
 
 
+def pr_budget_actions(pr: int) -> list[Action]:
+    """Stop a budget-capped PR-repair leg (address-review / fix-ci / rebase)
+    for an operator cap review — the #98 class on the PR path (#155).
+
+    A BUDGET_EXHAUSTED here is very often a DETERMINISTIC admission rejection
+    (settled daily spend + one full reservation no longer fits the cap), so
+    retrying is guaranteed to fail at $0 while marching the review/CI breaker:
+    observed live 2026-08-02 (keifu PRs #171/#174 walked to needs-human-review
+    on three instant `error_max_budget_usd` rejections each). A cap decision,
+    not an agent breaker, controls continuation. ai-blocked stops re-dispatch;
+    needs-budget-review names WHICH decision unblocks it (remove both labels
+    after raising the cap, or wait for the daily window to roll)."""
+    return [
+        PostComment(
+            Target.PR,
+            pr,
+            unblock_prompt(
+                "**Agent needs input:**",
+                "**Budget review needed:** the repair leg hit its configured "
+                "spend cap (or the daily cap left no admission headroom for "
+                "its reservation) before finishing. Raise the cap or wait for "
+                "the daily window, then remove `ai-blocked` and "
+                "`needs-budget-review` to resume.",
+            ),
+        ),
+        Relabel(Target.PR, pr, None, Label.AI_BLOCKED),
+        Relabel(Target.PR, pr, None, Label.NEEDS_BUDGET_REVIEW),
+    ]
+
+
 def resolve_actions(
     issue: int,
     result: AgentResult,
@@ -577,6 +607,10 @@ def address_review_actions(pr: int, result: AgentResult) -> AddressReviewOutcome
         # a machine under memory pressure walks a healthy PR to
         # needs-human-review without the fixer ever having read the review.
         return AddressReviewOutcome([], bump_retry=False)
+    if budget_exhausted(result.exit_reason):
+        # Not an attempt either — and frequently deterministic (admission
+        # rejection). Route to the budget surface instead of the breaker.
+        return AddressReviewOutcome(pr_budget_actions(pr), bump_retry=False)
     if classify_outcome(result) is Outcome.BLOCKED:
         body = (
             "**Agent needs clarification on review:**\n\n"
@@ -603,6 +637,10 @@ def fix_ci_actions(pr: int, result: AgentResult) -> list[Action]:
     is GONE (review M22/D9) — see `address_review_actions` for why."""
     if infra_death(result.exit_reason):
         return []
+    if budget_exhausted(result.exit_reason):
+        # Same rule as address-review: a cap decision, not the CI breaker,
+        # controls continuation (#155 — the caller also skips its retry bump).
+        return pr_budget_actions(pr)
     if classify_outcome(result) is Outcome.BLOCKED:
         # Post the agent's 'needs' alongside the label, same as the resolve
         # path's blocked arm. Without it a blocked rebase/fix-ci escalated to a

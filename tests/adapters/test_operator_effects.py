@@ -51,13 +51,20 @@ class Remote:
                     }
                 )
             )
-        if argv[:3] == ["gh", "issue", "edit"]:
+        if (
+            argv[:3] == ["gh", "api", "--method"]
+            and "/issues/" in argv[4]
+            and "/labels" in argv[4]
+        ):
             self._before_mutation()
-            for index, value in enumerate(argv):
-                if value == "--remove-label":
-                    self.issue_labels.discard(argv[index + 1])
-                elif value == "--add-label":
-                    self.issue_labels.add(argv[index + 1])
+            if argv[3] == "POST":
+                for index, value in enumerate(argv):
+                    if value == "-f":
+                        self.issue_labels.add(argv[index + 1].split("=", 1)[1])
+            elif argv[3] == "DELETE":
+                from urllib.parse import unquote
+
+                self.issue_labels.discard(unquote(argv[4].rsplit("/", 1)[-1]))
             self.issue_revision += 1
             if self.lose_issue_reply:
                 self.lose_issue_reply = False
@@ -151,8 +158,13 @@ def test_issue_label_mutation_is_committed_before_gh_and_deduplicated(
         remove=("P2", "P3"),
     ) == (True, "ok")
 
-    edits = [call for call in remote.calls if call[:3] == ("gh", "issue", "edit")]
+    edits = [
+        call for call in remote.calls
+        if call[:3] == ("gh", "api", "--method") and "/labels" in call[4]
+    ]
     assert observed == ["executing"]
+    # One POST for the add; P2/P3 were never present, so no DELETEs are
+    # issued (gh api raises on the 404 an absent label earns).
     assert len(edits) == 1
     assert store.pending_commands() == ()
 
@@ -163,7 +175,10 @@ def test_lost_mutation_reply_is_reconciled_without_a_blind_retry(tmp_path) -> No
 
     assert effects.set_issue_labels(9, add=("ai-ready",)) == (True, "ok")
 
-    edits = [call for call in remote.calls if call[:3] == ("gh", "issue", "edit")]
+    edits = [
+        call for call in remote.calls
+        if call[:3] == ("gh", "api", "--method") and "/labels" in call[4]
+    ]
     assert len(edits) == 1
     assert "ai-ready" in remote.issue_labels
     assert store.pending_commands() == ()

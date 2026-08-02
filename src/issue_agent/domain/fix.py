@@ -723,10 +723,17 @@ def reap_actions(
         n for pr in world.prs if pr.state == "OPEN"
         and (n := _issue_for_pr(pr)) is not None
     }
+    # expected_revision comes from the OBSERVED issue, not a live read at
+    # command creation (which is a self-fulfilling CAS): a leg completing
+    # between this decision and the write performs its own relabel, bumping
+    # updated_at, so the stale repair is discarded instead of clobbering the
+    # fresh label (keifu #18/#25 dual-label race, 2026-08-02). An issue
+    # observed without updated_at carries "" and fails closed by design.
     return [
         Relabel(
             Target.ISSUE, issue.number, Label.AI_WORKING,
             Label.AI_PR_OPEN if issue.number in with_open_pr else Label.AI_READY,
+            expected_revision=issue.updated_at,
         )
         for issue in world.issues_with(Label.AI_WORKING)
         if issue.number not in active_issues

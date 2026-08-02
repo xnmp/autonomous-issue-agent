@@ -29,7 +29,9 @@ inf() { printf '\033[36m▸ %s\033[0m\n' "$1"; }
 console_scripts() {
   awk '
     /^[[:space:]]*\[/ {
-      in_scripts = ($0 ~ /^[[:space:]]*\[project\.scripts\][[:space:]]*$/)
+      # Tolerate a trailing comment after the table header — TOML allows it,
+      # and requiring end-of-line here made the install fail on one.
+      in_scripts = ($0 ~ /^[[:space:]]*\[project\.scripts\][[:space:]]*(#.*)?$/)
       next
     }
     !in_scripts { next }

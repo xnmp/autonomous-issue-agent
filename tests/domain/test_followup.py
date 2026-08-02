@@ -141,6 +141,32 @@ def test_address_review_error_bumps_retry():
     assert out.bump_retry is True
 
 
+# ── budget exhaustion on PR-repair legs (#155: the #98 class on the PR path) ──
+# A BUDGET_EXHAUSTED repair leg is frequently a DETERMINISTIC admission
+# rejection (daily cap + full reservation no longer fit), so counting it walks
+# a healthy PR to needs-human-review at $0 per strike — keifu PRs #171/#174
+# did exactly that on 2026-08-02. The budget surface, not the breaker, owns it.
+def _capped(**kw):
+    return AgentResult(
+        is_error=True, exit_reason=ExitReason.BUDGET_EXHAUSTED, **kw
+    )
+
+
+def test_address_review_budget_exhaustion_is_no_strike_and_blocks_for_cap_review():
+    out = address_review_actions(100, _capped())
+    assert out.bump_retry is False
+    assert Relabel(Target.PR, 100, None, Label.AI_BLOCKED) in out.actions
+    assert Relabel(Target.PR, 100, None, Label.NEEDS_BUDGET_REVIEW) in out.actions
+    prompt = next(a.body for a in out.actions if isinstance(a, PostComment))
+    assert "Budget review needed" in prompt
+
+
+def test_fix_ci_budget_exhaustion_blocks_for_cap_review():
+    acts = fix_ci_actions(100, _capped())
+    assert Relabel(Target.PR, 100, None, Label.AI_BLOCKED) in acts
+    assert Relabel(Target.PR, 100, None, Label.NEEDS_BUDGET_REVIEW) in acts
+
+
 # ── fix-ci tail ──
 def test_fix_ci_pushed_writes_no_label():
     # review M22/D9: a pushed fix-CI leg leaves the PR's labels alone — CI re-runs
