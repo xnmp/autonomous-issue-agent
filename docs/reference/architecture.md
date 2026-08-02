@@ -453,7 +453,8 @@ module requires placing it in the appropriate tier and explaining it here.
 adapters live under `adapters/dashweb/`.
 
 `app/` — composition and use-case orchestration:
-`app/cli.py`, `app/config.py`, `app/dashboard.py`, `app/dispatch.py`,
+`app/cli.py`, `app/codex_resolution.py`, `app/config.py`, `app/dashboard.py`,
+`app/dispatch.py`,
 `app/execute.py`, `app/launchd_main.py`, `app/loop.py`, `app/main.py`,
 `app/mcp.py`, `app/recovery.py`, `app/roles.py`, `app/webhook.py`,
 `app/world_probe.py`, and `app/world_reporter.py`.

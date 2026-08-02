@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from ..adapters.env_file import source_env_file
 from ..adapters.operator_effects import build_operator_effects
 from ..domain.repository import canonical_repository, repository_equal
+from .codex_resolution import CodexResolutionReport, codex_resolution_report
 from .config import (
     REPOINT_HISTORY_ENV,
     default_state_dir as config_default_state_dir,
@@ -706,22 +707,39 @@ def detect_claude_auth() -> bool:
     )
 
 
-def detect_codex_auth() -> tuple[bool, str]:
-    """(codex on PATH, auth mode). Mode is 'chatgpt', 'apikey', or '' when
-    unknown/unreadable. Only the auth MODE is read out of ~/.codex/auth.json —
-    never the token material it also holds."""
-    present = bool(shutil.which("codex"))
+def detect_codex_auth() -> str:
+    """The codex auth mode: 'chatgpt', 'apikey', or '' when unknown/unreadable.
+    Only the auth MODE is read out of ~/.codex/auth.json — never the token
+    material it also holds.
+
+    Presence deliberately does NOT live here: `shutil.which` answers for the
+    OPERATOR'S shell, and the 2026-08-02 keifu incident was exactly a case where
+    that answer did not describe the daemons. See report_codex_resolution."""
     try:
         with open(os.path.expanduser("~/.codex/auth.json")) as handle:
             data = json.load(handle)
     except (OSError, ValueError):
-        return present, ""
+        return ""
     if not isinstance(data, dict):
-        return present, ""
+        return ""
     mode = str(data.get("auth_mode") or "").strip().lower()
     if mode in ("chatgpt", "apikey"):
-        return present, mode
-    return present, "apikey" if data.get("OPENAI_API_KEY") else ""
+        return mode
+    return "apikey" if data.get("OPENAI_API_KEY") else ""
+
+
+def report_codex_resolution(codex_bin: str) -> CodexResolutionReport:
+    """Print which codex binary would actually run, plus every finding about it.
+    Shared by `doctor` and the `init` wizard so both speak from one resolution."""
+    report = codex_resolution_report(codex_bin)
+    if report.resolved_path:
+        line = (f"codex: {report.resolved_path} "
+                f"({report.version or 'version unknown'}, "
+                f"{'pinned' if report.pinned else 'via PATH'})")
+        ok(line) if report.healthy else info(line)
+    for finding in report.findings:
+        (err if finding.level == "error" else warn)(f"codex: {finding.message}")
+    return report
 
 
 def remote_branch_exists(repo: str, branch: str, cwd: str | None = None) -> bool:
@@ -2227,7 +2245,37 @@ def cmd_doctor(args) -> int:
         warn(f"no overlay config/repos/{name}.env yet — checking config/shared.env "
              f"against the detected repo. `issue-agent start` writes the overlay "
              f"(TEST_CMD, BASE_BRANCH, state dirs); re-run doctor after that.")
+    _doctor_codex_binary(env)
     return subprocess.run([_BASH, _bin("doctor.sh")], env=env).returncode
+
+
+CODEX_RUNTIME_KEYS = ("FIXER_RUNTIME", "REVIEWER_RUNTIME", "STEWARD_RUNTIME")
+
+
+def _doctor_codex_binary(env: dict) -> CodexResolutionReport | None:
+    """Report codex binary resolution when the composed env actually selects a
+    codex runtime (or pins CODEX_BIN). doctor.sh cannot do this: it checks the
+    codex CONTRACT, not which of several installed codex binaries the daemons
+    will exec, which is what broke keifu on 2026-08-02."""
+    composed = dict(env)
+    agent_env = env.get("AGENT_ENV", "")
+    if agent_env:
+        try:
+            composed = source_env_file(agent_env, env)
+        except ValueError:
+            # Unreadable/unsourceable env is doctor.sh's error to report; the
+            # binary check just falls back to the inherited environment rather
+            # than pre-empting it with a second, less informative failure.
+            composed = dict(env)
+    selects_codex = any(
+        (composed.get(key) or "").strip().lower() == "codex"
+        for key in CODEX_RUNTIME_KEYS
+    )
+    codex_bin = (composed.get("CODEX_BIN") or "").strip()
+    if not selects_codex and not codex_bin:
+        return None
+    info("codex binary resolution")
+    return report_codex_resolution(codex_bin or "codex")
 
 
 def _label_issues(args, label: str) -> int:
@@ -2516,20 +2564,32 @@ def cmd_init(args) -> int:
         fields.append(("JIRA_CLOUD_ID", ask("Jira cloud id / host", "")))
     print()
     claude_ready = detect_claude_auth()
-    codex_present, codex_mode = detect_codex_auth()
+    codex_mode = detect_codex_auth()
     if claude_ready:
         ok("claude: credentials found (~/.claude or ANTHROPIC_API_KEY/AUTH_TOKEN)")
     else:
         warn("claude: no credentials found — run `claude` once to log in, or export "
              "ANTHROPIC_API_KEY, before selecting it as a runtime.")
+    codex = report_codex_resolution("codex")
+    codex_present = bool(codex.resolved_path)
     if not codex_present:
-        warn("codex: not on PATH — install it before selecting it as a runtime.")
+        warn("codex: install it before selecting it as a runtime.")
     elif codex_mode == "chatgpt":
         ok("codex: ChatGPT subscription auth")
     elif codex_mode == "apikey":
         ok("codex: API-key auth")
     else:
-        ok("codex: on PATH (auth mode unknown — `codex login` if it is not signed in)")
+        ok("codex: auth mode unknown — `codex login` if it is not signed in")
+    # An unpinned or shadowed codex is written out as an absolute CODEX_BIN by
+    # default: the wizard runs in the operator's shell, the daemons run under
+    # systemd's minimal PATH, and on 2026-08-02 that gap silently downgraded
+    # keifu's codex to a version the provider refuses to serve.
+    if codex_present and not codex.healthy and codex.recommended_bin:
+        if ask(f"Pin CODEX_BIN={codex.recommended_bin}? (Y/n)", "Y").lower().startswith("y"):
+            fields.append(("CODEX_BIN", codex.recommended_bin))
+        else:
+            warn("CODEX_BIN left unpinned — the daemons' PATH decides which codex "
+                 "runs, and `issue-agent doctor` re-checks it.")
     fields.append((
         "FIXER_RUNTIME",
         ask("Fixer runtime (claude|codex)", "claude" if claude_ready or not codex_present else "codex"),
