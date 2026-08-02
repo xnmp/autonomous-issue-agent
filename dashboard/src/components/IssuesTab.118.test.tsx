@@ -107,3 +107,38 @@ describe("human-owned actions", () => {
     expect(screen.getByTitle(/ADDRESS_REVIEW · blocked · blocked/)).toHaveClass("chip-fail");
   });
 });
+
+describe("historical flags do not alarm", () => {
+  it("keeps a re-armed, approved row calm despite a lifetime escalated flag", () => {
+    // keifu #25 (2026-08-02): escalated twice, re-armed, approved, awaiting
+    // merge — `escalated` is a fold-lifetime counter, so the row stayed red
+    // for life and buried the real alarms.
+    const rearmed: IssueCard = {
+      ...card,
+      stage: "awaiting merge",
+      human_action: null,
+      human_wait_since_ts: null,
+      human_wait_s: null,
+      flags: ["escalated", "spend-blocked"],
+    };
+
+    const { container } = render(
+      <IssuesTab
+        repo="demo"
+        sub="inflight"
+        issues={polled({
+          in_flight: [rearmed],
+          pending: [],
+          done: [],
+          backlog: [],
+          gh_ok: true,
+          notifications: [],
+          warnings: [],
+        })}
+        onOpenIssue={vi.fn()}
+      />,
+    );
+
+    expect(container.querySelector("tbody > tr")).not.toHaveClass("row-alert");
+  });
+});

@@ -157,6 +157,12 @@ let tickTimer: number | null = null;
 let tickValue = Date.now();
 
 function subscribeTick(cb: () => void): () => void {
+  // The module-load snapshot goes stale whenever no interval is running:
+  // first subscriber after an idle stretch (or after fake timers replace the
+  // clock in tests) would otherwise render an age computed from import time.
+  if (tickListeners.size === 0) {
+    tickValue = Date.now();
+  }
   tickListeners.add(cb);
   if (tickTimer === null) {
     tickTimer = window.setInterval(() => {

@@ -388,13 +388,18 @@ function InFlightTable({
               ? null
               : card.idle_s + (card.idle_active ? offset : 0);
             const open = expanded === card.issue;
+            // Alarm means "a human is needed NOW". `escalated`/`spend-blocked`
+            // flags are lifetime counters — an issue that escalated once and
+            // was re-armed carries them forever, and painting it red for life
+            // buried the real alarms (keifu #25: approved, awaiting merge,
+            // still red, 2026-08-02). Current attention arrives as
+            // human_action or a blocked stage/leg; history stays visible as
+            // chips without the row alarm.
             const alert = (
               humanOwned
               || card.stage === "blocked"
               || card.stage === "escalated"
-              || card.flags.some(
-                (flag) => flag === "escalated" || flag === "spend-blocked" || flag === "blocked",
-              )
+              || card.flags.some((flag) => flag === "blocked")
             );
             // Merge-ready is attention, not alarm: same treatment, green.
             const alertClass = !alert
