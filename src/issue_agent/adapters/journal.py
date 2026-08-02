@@ -299,7 +299,9 @@ def _legacy_event_record(event: TelemetryEvent) -> tuple[str, dict[str, object]]
             "action_quarantined",
             "action_reconcile_skipped",
             "branch_refresh",
+            "ci_cancel",
             "ci_rerun",
+            "ci_stall_step",
             "cost_blindspot",
         } else "telemetry_warning"
         return name, {

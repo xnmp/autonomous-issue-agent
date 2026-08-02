@@ -12,8 +12,10 @@ from issue_agent.adapters.effects import (
     StaleExpectedRevision,
     command_for_action,
 )
+from issue_agent.adapters.effects import UnknownEffectOutcome
 from issue_agent.domain.actions import (
     AddDependency,
+    CancelWorkflowRuns,
     CloseIssue,
     EnableAutoMerge,
     PostComment,
@@ -34,6 +36,7 @@ class Gateway:
         self.issue_revision = "issue-rev-1"
         self.auto_merge = set()
         self.run_attempt = 0
+        self.run_states = {}
         self.dependencies = set()
         self.reviews = set()
         self.advance_before_auto_merge = ""
@@ -80,6 +83,26 @@ class Gateway:
         self.calls.append(("rerun", head, run_ids))
         self.run_attempt += 1
         return run_ids
+
+    def workflow_run_states(self, head, run_ids):
+        if head != self.head:
+            return None
+        return {
+            run_id: self.run_states.get(run_id, "in_progress")
+            for run_id in run_ids
+        }
+
+    def cancel_workflow_runs(self, head, run_ids):
+        states = self.workflow_run_states(head, run_ids)
+        if states is None:
+            return None
+        self.calls.append(("cancel", head, run_ids))
+        # Asynchronous, like the real endpoint: the run is NOT down when the
+        # POST returns. Tests flip run_states themselves to model GitHub
+        # catching up.
+        return tuple(
+            run_id for run_id, status in states.items() if status != "completed"
+        )
 
     def workflow_run_attempts(self, head, run_ids):
         del head
@@ -854,3 +877,90 @@ def test_boot_drain_cannot_claim_another_repository_or_role_command(
     assert wrong_role_gateway.calls == []
     assert owner.drain_pending_commands() == 1
     assert owner_gateway.calls == [("comment", "issue", 4, "owned")]
+
+
+# ── wedged-run cancel (keifu PR #177) ────────────────────────────────────────
+def test_cancelling_wedged_runs_is_receipted_like_any_other_remote_mutation(
+    tmp_path,
+) -> None:
+    executor, gateway, store = _executor(tmp_path)
+
+    assert executor.execute(CancelWorkflowRuns(7, "head-1", (42,))) is True
+    assert gateway.calls == [("cancel", "head-1", (42,))]
+    assert store.pending_commands() == ()
+
+
+def test_a_lost_cancel_reply_replays_safely_and_settles(tmp_path) -> None:
+    # A cancel whose reply was lost cannot be told from one never sent, so the
+    # replay re-issues it. That is safe by construction: the gateway re-verifies
+    # the head SHA and skips runs GitHub has already completed, so the repeat can
+    # neither touch a newer push's run nor 409 on a finished one.
+    executor, gateway, store = _executor(tmp_path)
+    action = CancelWorkflowRuns(7, "head-1", (42,))
+    original = gateway.cancel_workflow_runs
+
+    def committed_then_lost(*args):
+        original(*args)
+        raise RuntimeError("reply lost")
+
+    gateway.cancel_workflow_runs = committed_then_lost
+    with pytest.raises(RuntimeError):
+        executor.execute(action)
+    gateway.cancel_workflow_runs = original
+
+    assert executor.execute(action)
+    assert gateway.calls == [
+        ("cancel", "head-1", (42,)), ("cancel", "head-1", (42,))
+    ]
+    assert store.pending_commands() == ()
+
+    # Once GitHub has taken it down, nothing further is issued.
+    gateway.run_states[42] = "completed"
+    assert executor.execute(action)
+    assert len(gateway.calls) == 2
+
+
+def test_a_run_github_already_completed_needs_no_cancel_at_all(tmp_path) -> None:
+    # Reconcile-first: the run is already in the state the command wants, so it
+    # is receipted without a POST.
+    executor, gateway, store = _executor(tmp_path)
+    gateway.run_states[42] = "completed"
+
+    assert executor.execute(CancelWorkflowRuns(7, "head-1", (42,))) is True
+    assert gateway.calls == []
+    assert store.pending_commands() == ()
+
+
+def test_a_cancel_github_has_not_finished_yet_is_still_a_success(tmp_path) -> None:
+    # The regression this exists for (adversarial review S1): GitHub takes a
+    # cancelled run down asynchronously. Verifying "the run is down" right after
+    # the POST failed EVERY successful cancel — re-POSTing it to the retry
+    # ceiling and raising an operator alert that pointed at token scopes.
+    executor, gateway, store = _executor(tmp_path)
+
+    assert executor.execute(CancelWorkflowRuns(7, "head-1", (42,))) is True
+    assert gateway.calls == [("cancel", "head-1", (42,))]
+    assert store.pending_commands() == ()
+
+    # …and the run coming down later does not re-issue anything.
+    gateway.run_states[42] = "completed"
+    assert executor.execute(CancelWorkflowRuns(7, "head-1", (42,))) is True
+    assert gateway.calls == [("cancel", "head-1", (42,))]
+
+
+def test_a_run_from_a_newer_head_never_reaches_a_cancel_command(tmp_path) -> None:
+    executor, gateway, _store = _executor(tmp_path)
+
+    with pytest.raises(UnknownEffectOutcome):
+        executor.execute(CancelWorkflowRuns(7, "stale-head", (42,)))
+
+    assert gateway.calls == []
+
+
+def test_a_cancel_without_run_identities_is_refused(tmp_path) -> None:
+    executor, gateway, _store = _executor(tmp_path)
+
+    with pytest.raises(UnknownEffectOutcome):
+        executor.execute(CancelWorkflowRuns(7, "head-1", ()))
+
+    assert gateway.calls == []

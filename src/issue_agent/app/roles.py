@@ -54,7 +54,8 @@ from ..domain.fix import (
     InFlightFix,
     breaker_key,
     ci_flakes,
-    ci_pending_stalls,
+    CiStallStep,
+    ci_stall_remedies,
     decide_fix,
     duplicate_pr_guards,
     issue_holds,
@@ -1561,6 +1562,9 @@ def _fix_state(
     # breaker-keyed) because a re-run is an act on a PR's check runs, and a PR
     # with no resolvable issue has check runs like any other.
     ci_rerun_head = {p.number: store.get_ci_rerun_head(p.number) for p in world.prs}
+    # keifu PR #177: the head whose wedged runs were already sent a cancel, so
+    # the deadline waits for GitHub instead of re-cancelling every poll.
+    ci_cancel_head = {p.number: store.get_ci_cancel_head(p.number) for p in world.prs}
     update_branch_head = {
         p.number: store.get_update_branch_head(p.number) for p in world.prs
     }
@@ -1576,6 +1580,7 @@ def _fix_state(
         ci_retries=ci_retries, review_retries=review_retries,
         rebase_retries=rebase_retries, resolve_retries=resolve_retries,
         infra_deaths=infra_deaths, ci_rerun_head=ci_rerun_head,
+        ci_cancel_head=ci_cancel_head,
         update_branch_head=update_branch_head,
         ci_pending_escalated=ci_pending_escalated,
         inflight=inflight,
@@ -1747,20 +1752,51 @@ def _ci_stall_reporter(
     """
     seen: set[str] = set()
 
-    def report(world) -> None:
-        for stall in ci_pending_stalls(world, fix_cfg):
+    def report(world, state: FixState) -> None:
+        for remedy in ci_stall_remedies(world, fix_cfg, state):
+            stall = remedy.stall
             checks = ", ".join(stall.checks) or "unnamed"
             log(
                 f"CI STALL: PR #{stall.pr} has been pending {stall.seconds}s "
-                f"({checks}) — pending deadline breached"
+                f"({checks}) \u2014 pending deadline breached; "
+                f"{remedy.step.value}: {remedy.detail}"
             )
-            key = f"ci-pending:{repo}:{stall.pr}:{stall.head}"
+            # The STEP is part of the key: cancel, the wait it opens and the
+            # escalation that bounds it are three distinct facts about one head,
+            # and ADR 0012 wants the wait journalled \u2014 once, not every poll.
+            key = f"ci-pending:{repo}:{stall.pr}:{stall.head}:{remedy.step.value}"
             if key in seen:
                 continue
             if control is not None and not control.claim("ci-pending", repo, key):
                 continue
             seen.add(key)
             if journal is None:
+                continue
+            correlation = Correlation(issue=remedy.issue or None, pr=stall.pr)
+            if remedy.step is not CiStallStep.ESCALATE:
+                # `ci_pending_deadline` counts ESCALATIONS — escalation rate is
+                # a named power guardrail, and a rate counted from duplicated
+                # events is not a rate. A wedge the harness heals itself must
+                # therefore NOT emit one, or the change would appear to worsen
+                # the very guardrail it protects (adversarial review S4). The
+                # self-healing steps get their own code instead.
+                journal.emit(
+                    TelemetryEvent(
+                        TelemetryWarning(
+                            "ci_stall_step",
+                            f"stalled CI: {remedy.step.value}",
+                            {
+                                "head": stall.head,
+                                "seconds": stall.seconds,
+                                "step": remedy.step.value,
+                                "detail": remedy.detail,
+                                "run_ids": list(remedy.run_ids),
+                                "block_key": key,
+                            },
+                        ),
+                        correlation,
+                    )
+                )
                 continue
             journal.emit(
                 TelemetryEvent(
@@ -1770,7 +1806,7 @@ def _ci_stall_reporter(
                         tuple(stall.checks),
                         key,
                     ),
-                    Correlation(pr=stall.pr),
+                    correlation,
                 )
             )
 
@@ -2093,6 +2129,7 @@ def build_fix_daemon(
     executor = Executor(
         gateway, remove_worktree=worktrees.remove, log=_log("fix"),
         mark_automerge=store.mark_automerge, mark_ci_rerun=store.set_ci_rerun_head,
+        mark_ci_cancel=store.set_ci_cancel_head,
         mark_branch_update=store.set_update_branch_head,
         mark_ci_pending_escalated=store.set_ci_pending_escalated_head,
         clear_issue_state=store.cleanup_pr,
@@ -2221,7 +2258,7 @@ def build_fix_daemon(
         )
         report_holds(world, inflight)
         report_prediction_outcomes(world)
-        report_ci_stalls(world)
+        report_ci_stalls(world, state)
         report_duplicates(world)
         report_ci_flakes(world, state)
         report_stalls(world)

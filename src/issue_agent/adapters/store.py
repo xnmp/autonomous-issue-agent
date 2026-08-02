@@ -49,6 +49,7 @@ _ISSUE_SUFFIXES = (
 )
 _PR_SUFFIXES = (
     "session", "last-sha", "round", "automerge", "patch-id", "ci-rerun-head",
+    "ci-cancel-head",
     "update-branch-head", "ci-pending-escalated-head", "resumed-at",
     "stall-sig",
 )
@@ -388,6 +389,21 @@ class Store:
     def set_ci_rerun_head(self, pr: int, sha: str) -> None:
         if sha:
             self._write(self.pr_path(pr, "ci-rerun-head"), sha)
+
+    # ── wedged-run cancel marker (keifu PR #177) ──
+    # The head SHA whose stuck workflow runs have already been sent a cancel, so
+    # the harness waits for GitHub to take the run down instead of re-cancelling
+    # every poll. Head-keyed and written BEFORE the cancel call for the same
+    # reasons as the re-run marker above: a push is a new head with a fresh
+    # remediation, marked-but-not-cancelled costs one bounded wait, and
+    # cancelled-but-not-marked is an unbounded cancel loop. "" (absent) = never
+    # cancelled, the sole reading a fresh PR must have.
+    def get_ci_cancel_head(self, pr: int) -> str:
+        return self._read(self.pr_path(pr, "ci-cancel-head"))
+
+    def set_ci_cancel_head(self, pr: int, sha: str) -> None:
+        if sha:
+            self._write(self.pr_path(pr, "ci-cancel-head"), sha)
 
     # PR → head a branch-refresh (advisory-UNSTABLE arm) was last dispatched
     # for. Same head-keyed shape and same write-before-execute ordering as the

@@ -33,6 +33,7 @@ from ..domain.actions import (
     PostComment,
     Relabel,
     RemoveWorktree,
+    CancelWorkflowRuns,
     RerunFailedChecks,
     RunAgent,
     Target,
@@ -58,11 +59,30 @@ _PRIVILEGED_ACTIONS = (
     CloseIssue,
     EnableAutoMerge,
     UpdateBranch,
+    CancelWorkflowRuns,
     RerunFailedChecks,
     EscalateCiPending,
     AddDependency,
 )
 _DEFAULT_RETRY_DELAYS = (1.0, 3.0, 9.0)
+
+
+def _effect_run_ids(outcome: object) -> tuple[int, ...]:
+    """The workflow-run ids an effect reports having touched.
+
+    Only the immediate adapter returns them; the durable executor normalises
+    every outcome to a bool receipt. The journal must degrade to "ids unknown"
+    rather than crash on that bool - an observability field may never take a
+    remote mutation down with it.
+    """
+    return tuple(outcome) if isinstance(outcome, tuple) else ()
+
+
+def _effect_refused(outcome: object) -> bool:
+    """Whether the remote refused the effect, across both executors: None (the
+    immediate adapter could not act) and False (the durable one got no
+    confirmation) are the same operational fact."""
+    return outcome is None or outcome is False
 
 
 def _ignore_log(_message: str) -> None:
@@ -133,6 +153,13 @@ def _action_spec(action: Action) -> tuple[str, str, int | None, dict]:
             "head": action.head,
             "run_ids": list(action.run_ids),
         }
+    if isinstance(action, CancelWorkflowRuns):
+        return "cancel_workflow_runs", "pr", action.pr, {
+            "type": "cancel_workflow_runs",
+            "pr": action.pr,
+            "head": action.head,
+            "run_ids": list(action.run_ids),
+        }
     if isinstance(action, AddDependency):
         return "add_dependency", "issue", action.issue, {
             "type": "add_dependency",
@@ -176,7 +203,13 @@ def _action_correlation(action: Action) -> Correlation:
         return Correlation(issue=action.number)
     if isinstance(
         action,
-        (EnableAutoMerge, UpdateBranch, RerunFailedChecks, EscalateCiPending),
+        (
+            EnableAutoMerge,
+            UpdateBranch,
+            RerunFailedChecks,
+            CancelWorkflowRuns,
+            EscalateCiPending,
+        ),
     ):
         return Correlation(pr=action.pr)
     if isinstance(action, AddDependency):
@@ -242,6 +275,7 @@ class Executor:
         log: Callable[[str], None] | None = None,
         mark_automerge: Callable[[int], None] | None = None,
         mark_ci_rerun: Callable[[int, str], None] | None = None,
+        mark_ci_cancel: Callable[[int, str], None] | None = None,
         mark_branch_update: Callable[[int, str], None] | None = None,
         mark_ci_pending_escalated: Callable[[int, str], None] | None = None,
         clear_issue_state: Callable[[int, int | None, bool], None] | None = None,
@@ -270,6 +304,13 @@ class Executor:
         # loop forever, which is why the arm below refuses to call gh at all
         # when it is absent — see there.
         self._mark_ci_rerun = mark_ci_rerun
+        # Persists "a cancel has been sent for this head's wedged runs"
+        # (FixState.ci_cancel_head). Written BEFORE the cancel call for the same
+        # reason the ci-rerun marker is: marked-but-not-cancelled costs one
+        # await-cancel wait and then the bounded escalation, whereas cancelled-
+        # but-not-marked re-cancels the run every poll forever. Unwired = the
+        # arm refuses to call gh at all, exactly like the re-run above.
+        self._mark_ci_cancel = mark_ci_cancel
         # Persists the head an advisory-UNSTABLE branch-refresh was dispatched
         # for (FixState.update_branch_head). Written BEFORE the update call,
         # same ordering rationale as the ci-rerun marker: marked-but-not-
@@ -344,6 +385,12 @@ class Executor:
             runs = ",".join(str(run_id) for run_id in action.run_ids)
             return (
                 f"re-run failed checks PR #{action.pr} "
+                f"({action.head[:7]}; runs {runs or '?'})"
+            )
+        if isinstance(action, CancelWorkflowRuns):
+            runs = ",".join(str(run_id) for run_id in action.run_ids)
+            return (
+                f"cancel wedged CI runs PR #{action.pr} "
                 f"({action.head[:7]}; runs {runs or '?'})"
             )
         if isinstance(action, EscalateCiPending):
@@ -443,6 +490,25 @@ class Executor:
                     )
                     return
                 self._mark_ci_rerun(action.pr, action.head)
+            if isinstance(action, CancelWorkflowRuns):
+                if self._mark_ci_cancel is None:
+                    self._log(
+                        f"CI cancel PR #{action.pr}: skipped (no marker writer "
+                        "wired) - the stalled-CI escalation stands"
+                    )
+                    return
+                # `<head>@<decided_at>` — the marker dates the cancel so the
+                # await-cancel wait is bounded by time SINCE THE CANCEL. The
+                # stall clock cannot bound it: cancelling is what lets follow-on
+                # jobs start, and one fresh pending check resets that clock
+                # (adversarial review S2). An unstamped world writes the bare
+                # SHA, which the domain reads as an undated marker.
+                self._mark_ci_cancel(
+                    action.pr,
+                    f"{action.head}@{action.decided_at}"
+                    if action.decided_at
+                    else action.head,
+                )
             if isinstance(action, UpdateBranch) and self._mark_branch_update is not None:
                 self._mark_branch_update(
                     action.pr, f"{action.head}:{action.base}"
@@ -495,13 +561,13 @@ class Executor:
                         )
                     )
             elif isinstance(action, RerunFailedChecks):
-                if outcome is None:
+                if _effect_refused(outcome):
                     self._log(
                         f"CI re-run PR #{action.pr}: captured workflow runs were "
                         "not executable — the paid CI-fix leg dispatches next poll"
                     )
                 if self._journal is not None:
-                    rerun_ids = tuple(outcome or ())
+                    rerun_ids = _effect_run_ids(outcome)
                     self._journal.emit(
                         TelemetryEvent(
                             TelemetryWarning(
@@ -511,7 +577,31 @@ class Executor:
                                     "head": action.head,
                                     "run_id": rerun_ids[0] if rerun_ids else 0,
                                     "run_ids": list(rerun_ids),
-                                    "ok": outcome is not None,
+                                    "ok": not _effect_refused(outcome),
+                                },
+                            ),
+                            Correlation(pr=action.pr),
+                        )
+                    )
+            elif isinstance(action, CancelWorkflowRuns):
+                if _effect_refused(outcome):
+                    self._log(
+                        f"CI cancel PR #{action.pr}: wedged runs were not "
+                        "cancellable (head moved, or gh failed) - the pending "
+                        "deadline escalates once the cancel grace expires"
+                    )
+                if self._journal is not None:
+                    cancelled = _effect_run_ids(outcome)
+                    self._journal.emit(
+                        TelemetryEvent(
+                            TelemetryWarning(
+                                "ci_cancel",
+                                "wedged CI runs cancelled",
+                                {
+                                    "head": action.head,
+                                    "run_ids": list(cancelled),
+                                    "requested_run_ids": list(action.run_ids),
+                                    "ok": not _effect_refused(outcome),
                                 },
                             ),
                             Correlation(pr=action.pr),

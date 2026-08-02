@@ -18,6 +18,7 @@ from ..domain.actions import (
     EscalateCiPending,
     PostComment,
     Relabel,
+    CancelWorkflowRuns,
     RerunFailedChecks,
     Target,
     UpdateBranch,
@@ -65,6 +66,7 @@ _OWNED_COMMAND_KINDS = frozenset(
         CommandKind.ENABLE_AUTO_MERGE,
         CommandKind.UPDATE_BRANCH,
         CommandKind.RERUN_CHECKS,
+        CommandKind.CANCEL_CHECKS,
         CommandKind.ADD_DEPENDENCY,
         CommandKind.SUBMIT_REVIEW,
     }
@@ -138,6 +140,13 @@ class ChecksRerunVerifier(Protocol):
     def workflow_run_attempts(
         self, head: str, run_ids: tuple[int, ...]
     ) -> dict[int, int] | None: ...
+
+
+@runtime_checkable
+class WorkflowRunCancelVerifier(Protocol):
+    def workflow_run_states(
+        self, head: str, run_ids: tuple[int, ...]
+    ) -> dict[int, str] | None: ...
 
 
 @runtime_checkable
@@ -219,6 +228,8 @@ class ImmediateGitHubEffectExecutor:
             return bool(self.gateway.update_branch(action.pr, action.head))
         if isinstance(action, RerunFailedChecks):
             return self.gateway.rerun_failed_checks(action.head, action.run_ids)
+        if isinstance(action, CancelWorkflowRuns):
+            return self.gateway.cancel_workflow_runs(action.head, action.run_ids)
         if isinstance(action, EscalateCiPending):
             if (
                 not isinstance(self.gateway, CommentVerifier)
@@ -316,6 +327,7 @@ class GitHubEffectExecutor:
                 EnableAutoMerge,
                 UpdateBranch,
                 RerunFailedChecks,
+                CancelWorkflowRuns,
                 EscalateCiPending,
                 AddDependency,
             ),
@@ -410,7 +422,16 @@ class GitHubEffectExecutor:
 
         def apply_and_verify() -> EffectOutcome[bool]:
             applied = self._apply(action, command)
-            if not applied:
+            if isinstance(action, CancelWorkflowRuns):
+                # This effect's postcondition is that GitHub ACCEPTED the cancel
+                # for runs still belonging to the observed head — which is what
+                # `_apply` returns. Verifying "the run is down" here instead
+                # would fail every successful cancel, because GitHub takes the
+                # run down asynchronously (adversarial review S1). The harness
+                # tracks that convergence itself, in the await-cancel step
+                # bounded by `cancel_grace_breached`.
+                outcome = bool(applied)
+            elif not applied:
                 outcome = False
             else:
                 outcome = self._reconcile(action, command)
@@ -728,6 +749,14 @@ class GitHubEffectExecutor:
             return self.gateway.rerun_failed_checks(
                 action.head, action.run_ids, baseline
             )
+        elif isinstance(action, CancelWorkflowRuns):
+            # `()` is SUCCESS, not a refusal: it means every targeted run was
+            # already completed, which is exactly the postcondition asked for.
+            # Only None (the head-SHA guard, or an untrustworthy read) is a
+            # failure. `_reconcile` verifies the real state either way.
+            return self.gateway.cancel_workflow_runs(
+                action.head, action.run_ids
+            ) is not None
         elif isinstance(action, EscalateCiPending):
             if not isinstance(self.gateway, CommentVerifier) or not self.gateway.has_comment(
                 "pr", action.pr, action.body
@@ -841,6 +870,26 @@ class GitHubEffectExecutor:
             if any(advanced):
                 return None
             return False
+        if isinstance(action, CancelWorkflowRuns):
+            # "Are these runs already down?" — the right question BEFORE acting
+            # (skip a run GitHub finished on its own) and on an unknown-outcome
+            # replay (if it is not down, re-cancelling is safe: the gateway
+            # re-verifies the head SHA and skips completed runs).
+            #
+            # It is NOT the question after a cancel we just issued: GitHub
+            # completes a cancelled run asynchronously, and that lag is the whole
+            # reason the await-cancel step exists. See `apply_and_verify`, where
+            # acceptance is the postcondition instead (adversarial review S1 —
+            # every successful cancel was otherwise receipted as a failure,
+            # re-POSTed to the retry ceiling and alerted to the operator).
+            if not isinstance(self.gateway, WorkflowRunCancelVerifier):
+                return None
+            states = self.gateway.workflow_run_states(
+                action.head, action.run_ids
+            )
+            if states is None:
+                return None
+            return all(status == "completed" for status in states.values())
         if isinstance(action, AddDependency):
             if not isinstance(self.gateway, DependencyVerifier):
                 return None
@@ -915,6 +964,28 @@ class GitHubEffectExecutor:
                 str(run_id): attempt
                 for run_id, attempt in attempts.items()
             }
+        if isinstance(action, CancelWorkflowRuns):
+            if not action.run_ids:
+                raise UnknownEffectOutcome(
+                    f"pr:{action.pr}: wedged workflow runs are unavailable"
+                )
+            if not isinstance(self.gateway, WorkflowRunCancelVerifier):
+                raise UnknownEffectOutcome(
+                    f"pr:{action.pr}: workflow-run verification is unavailable"
+                )
+            states = self.gateway.workflow_run_states(
+                action.head, action.run_ids
+            )
+            if states is None:
+                # Includes the head-SHA guard: a run belonging to a newer push
+                # is NOT this decision's to cancel, so no command is minted.
+                raise UnknownEffectOutcome(
+                    f"pr:{action.pr}: wedged workflow runs do not match "
+                    "the observed head"
+                )
+            extra["prior_run_states"] = dict(
+                (str(run_id), status) for run_id, status in states.items()
+            )
         return command_for_action(
             action,
             self.config_version,
@@ -1060,6 +1131,12 @@ def action_from_command(command: LifecycleCommand) -> Action:
             str(payload["head"]),
             tuple(int(run_id) for run_id in payload.get("run_ids", ())),
         )
+    if command.kind is CommandKind.CANCEL_CHECKS:
+        return CancelWorkflowRuns(
+            int(payload["pr"]),
+            str(payload["head"]),
+            tuple(int(run_id) for run_id in payload.get("run_ids", ())),
+        )
     if command.kind is CommandKind.ADD_DEPENDENCY:
         return AddDependency(int(payload["issue"]), int(payload["blocker"]))
     raise ValueError(f"command kind cannot be reconstructed as Action: {command.kind}")
@@ -1078,6 +1155,8 @@ def _command_identity(action: Action) -> tuple[CommandKind, str]:
         return CommandKind.UPDATE_BRANCH, f"pr:{action.pr}"
     if isinstance(action, RerunFailedChecks):
         return CommandKind.RERUN_CHECKS, f"pr:{action.pr}"
+    if isinstance(action, CancelWorkflowRuns):
+        return CommandKind.CANCEL_CHECKS, f"pr:{action.pr}"
     if isinstance(action, EscalateCiPending):
         return CommandKind.RELABEL, f"pr:{action.pr}"
     if isinstance(action, AddDependency):
@@ -1096,6 +1175,7 @@ def _expected_revision(action: Action) -> str | None:
                 EnableAutoMerge,
                 UpdateBranch,
                 RerunFailedChecks,
+                CancelWorkflowRuns,
                 EscalateCiPending,
             ),
         )

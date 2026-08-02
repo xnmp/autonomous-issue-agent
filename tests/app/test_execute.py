@@ -15,6 +15,7 @@ from issue_agent.domain.actions import (
     PostComment,
     Relabel,
     RemoveWorktree,
+    CancelWorkflowRuns,
     RerunFailedChecks,
     RunAgent,
     AgentKind,
@@ -230,6 +231,101 @@ def test_rejected_exact_rerun_still_keeps_the_marker_and_says_so():
     assert marked == [(100, "sha-1")]
     assert any("not executable" in line for line in logged)
     assert next(f for e, f in j.events if e == "ci_rerun")["ok"] is False
+
+
+# ── wedged-run cancel (keifu PR #177) ───────────────────────────────────────
+def _wedged_gateway(status="in_progress"):
+    gw = FakeGateway()
+    gw.run_states["sha-1"] = {4242: status}
+    return gw
+
+
+def test_cancel_marks_the_head_before_asking_github():
+    # Same ordering property as the re-run marker: marker THEN gh. Reversed, a
+    # death in between leaves a cancel nothing recorded, and the next poll
+    # cancels again, forever.
+    gw = _wedged_gateway()
+    marked = []
+    ex = Executor(gw, mark_ci_cancel=lambda pr, head: marked.append((pr, head)))
+
+    ex.execute(CancelWorkflowRuns(100, "sha-1", (4242,)))
+
+    assert marked == [(100, "sha-1")]
+    assert gw.calls == [("cancel", "sha-1", (4242,))]
+
+
+def test_cancel_journals_the_runs_it_took_down():
+    gw = _wedged_gateway()
+    j = _Journal()
+    ex = Executor(gw, mark_ci_cancel=lambda pr, head: None, journal=j)
+
+    ex.execute(CancelWorkflowRuns(100, "sha-1", (4242,)))
+
+    _kind, fields = next(e for e in j.events if e[0] == "ci_cancel")
+    assert (fields["pr"], fields["head"], fields["run_ids"], fields["ok"]) == (
+        100, "sha-1", [4242], True
+    )
+
+
+def test_a_refused_cancel_is_logged_and_journalled_not_silent():
+    # The runs belong to a head this gateway does not know — the SHA guard
+    # refuses. The marker is still spent, so the bounded escalation follows;
+    # what must not happen is that being invisible.
+    gw = FakeGateway()
+    marked, logged = [], []
+    j = _Journal()
+    ex = Executor(gw, mark_ci_cancel=lambda pr, head: marked.append((pr, head)),
+                  journal=j, log=logged.append)
+
+    ex.execute(CancelWorkflowRuns(100, "sha-1", (4242,)))
+
+    assert marked == [(100, "sha-1")]
+    assert any("not cancellable" in line for line in logged)
+    assert next(f for e, f in j.events if e == "ci_cancel")["ok"] is False
+
+
+def test_cancel_without_a_marker_writer_does_not_touch_github():
+    # An Executor with no marker writer cannot bound the loop, so it must not
+    # start one — the stalled-CI escalation stands instead.
+    gw = _wedged_gateway()
+    logged = []
+    ex = Executor(gw, log=logged.append)
+
+    ex.execute(CancelWorkflowRuns(100, "sha-1", (4242,)))
+
+    assert gw.calls == []
+    assert any("no marker writer" in line for line in logged)
+
+
+def test_a_bool_effect_receipt_never_crashes_the_run_id_journal():
+    # The durable executor normalises every outcome to a bool; an observability
+    # field may not take a remote mutation down with it.
+    gw = _wedged_gateway()
+    j = _Journal()
+    ex = Executor(gw, mark_ci_cancel=lambda pr, head: None,
+                  mark_ci_rerun=lambda pr, head: None, journal=j,
+                  effect_executor=_BoolReceiptExecutor(gw))
+
+    ex.execute(CancelWorkflowRuns(100, "sha-1", (4242,)))
+    ex.execute(RerunFailedChecks(100, "sha-1", (4242,)))
+
+    cancelled = next(f for e, f in j.events if e == "ci_cancel")
+    assert (cancelled["run_ids"], cancelled["requested_run_ids"],
+            cancelled["ok"]) == ([], [4242], True)
+    assert next(f for e, f in j.events if e == "ci_rerun")["run_ids"] == []
+
+
+class _BoolReceiptExecutor:
+    """Stands in for the durable executor's bool-only receipt."""
+
+    def __init__(self, gateway):
+        self.gateway = gateway
+
+    def handles(self, action) -> bool:
+        return isinstance(action, (CancelWorkflowRuns, RerunFailedChecks))
+
+    def execute(self, action) -> bool:
+        return True
 
 
 def test_rerun_without_a_marker_writer_does_not_touch_github():

@@ -31,6 +31,7 @@ REMOTE_WRITES = frozenset(
         "merge_pr",
         "push",
         "relabel",
+        "cancel_workflow_runs",
         "rerun_failed_checks",
         "submit_review",
         "update_branch",

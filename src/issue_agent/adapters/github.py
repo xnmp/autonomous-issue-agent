@@ -1501,6 +1501,74 @@ class GitHubGateway:
             attempts[run_id] = attempt
         return attempts
 
+    def workflow_run_states(
+        self, head: str, run_ids: tuple[int, ...]
+    ) -> dict[int, str] | None:
+        """Lifecycle status per workflow run, after SHA verification.
+
+        `queued`/`in_progress`/`requested`/`waiting`/`pending` = still running;
+        `completed` = down. None means the observation is not trustworthy —
+        unknown id, malformed answer, or (the guard this exists for) a run whose
+        `head_sha` is NOT the commit the decision was made about, which is how a
+        push landing mid-tick is prevented from having its fresh run cancelled.
+        """
+
+        if not head or not run_ids or any(run_id <= 0 for run_id in run_ids):
+            return None
+        states: dict[int, str] = {}
+        for run_id in dict.fromkeys(run_ids):
+            raw = self._gh_json(
+                ["api", f"repos/{self.repo}/actions/runs/{run_id}"]
+            )
+            if (
+                not isinstance(raw, dict)
+                or int(raw.get("id") or 0) != run_id
+                or str(raw.get("head_sha") or "") != head
+            ):
+                return None
+            status = str(raw.get("status") or "").strip().lower()
+            if not status:
+                return None
+            states[run_id] = status
+        return states
+
+    def cancel_workflow_runs(
+        self, head: str, run_ids: tuple[int, ...]
+    ) -> tuple[int, ...] | None:
+        """Cancel the still-running workflow runs among `run_ids`.
+
+        GitHub refuses `rerun-failed-jobs` while a run is `in_progress` (403
+        "already running"), so a wedged run must come down before the harness's
+        re-run can do anything at all (keifu PR #177).
+
+        Every run is re-read and SHA-verified first: a cancel is a destructive
+        act on someone's CI, and cancelling a run belonging to a NEWER head would
+        destroy work the decision never looked at. A mismatch aborts the whole
+        cancel (None) rather than cancelling the subset that matched — a partial
+        cancel leaves the real pin in place while reading as handled.
+
+        An already-`completed` run is skipped, not re-cancelled: idempotent
+        replay of a durable command must not fail because GitHub got there first.
+        """
+
+        states = self.workflow_run_states(head, run_ids)
+        if states is None:
+            return None
+        cancelled: list[int] = []
+        for run_id, status in states.items():
+            if status == "completed":
+                continue
+            self._gh(
+                [
+                    "api",
+                    f"repos/{self.repo}/actions/runs/{run_id}/cancel",
+                    "--method",
+                    "POST",
+                ]
+            )
+            cancelled.append(run_id)
+        return tuple(cancelled)
+
     def rerun_failed_checks(
         self,
         head: str,

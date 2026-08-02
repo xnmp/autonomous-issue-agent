@@ -6,6 +6,7 @@ from tests.domain.builders import Check, Comment, Review, closing_ref, issue, pr
 
 from issue_agent.domain.actions import (
     AgentKind,
+    CancelWorkflowRuns,
     ClearIssueState,
     CloseIssue,
     EnableAutoMerge,
@@ -20,6 +21,7 @@ from issue_agent.domain.actions import (
 )
 from issue_agent.domain.fix import (
     CiFlake,
+    CiStallStep,
     FixConfig,
     FixState,
     InFlightFix,
@@ -30,6 +32,7 @@ from issue_agent.domain.fix import (
     breaker_key,
     ci_flakes,
     ci_pending_stalls,
+    ci_stall_remedies,
     cleanup_actions,
     decide_fix,
     duplicate_pr_guards,
@@ -1965,6 +1968,340 @@ def test_stalls_are_reported_as_the_values_the_escalation_acts_on():
 
 def test_no_stalls_reported_when_nothing_is_stalled():
     assert ci_pending_stalls(world(prs=[_wedged_pr()], now=_stall_now(60)), CFG) == ()
+
+
+# ── wedged-run cancel → re-run (keifu PR #177) ───────────────────────────────
+# The deadline used to hand every wedged run to a human because GitHub refuses
+# `rerun-failed-jobs` on a run that is still in_progress (403 "already
+# running"): the harness HAD a re-run budget and could not spend it on the one
+# state that needed it. The operator's manual repair — cancel, wait for the run
+# to complete, re-run the failed jobs — is now the harness's, spending that same
+# budget, with escalation still bounding it.
+def _wedged_run_pr(run_id: int = 77, head: str = "sha-aaa", **kw):
+    return pr(
+        100, "ai-pr-open", state="OPEN", head_ref_name="fix/5-x",
+        head_ref_oid=head,
+        checks=(
+            Check("unit", bucket="pass", started_at=_STALL_T0),
+            Check("Test (windows-latest)", state="IN_PROGRESS",
+                  started_at=_STALL_T0, run_id=run_id),
+        ),
+        **kw,
+    )
+
+
+def _cancels(actions):
+    return [a for a in actions if isinstance(a, CancelWorkflowRuns)]
+
+
+def test_a_wedged_run_is_cancelled_instead_of_handed_to_a_human():
+    w = world(prs=[_wedged_run_pr()], now=_stall_now(3601))
+
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+
+    assert _cancels(actions) == [
+        CancelWorkflowRuns(100, "sha-aaa", (77,), _stall_now(3601))
+    ]
+    assert not _escalated(actions)
+
+
+def test_the_cancel_names_only_the_runs_pinning_this_head():
+    # Two wedged jobs of the same run must not produce two cancels, and a check
+    # that already passed is not this remediation's business.
+    p = pr(
+        100, "ai-pr-open", state="OPEN", head_ref_name="fix/5-x",
+        head_ref_oid="sha-aaa",
+        checks=(
+            Check("unit", bucket="pass", started_at=_STALL_T0, run_id=41),
+            Check("win", state="IN_PROGRESS", started_at=_STALL_T0, run_id=77),
+            Check("mac", state="QUEUED", started_at=_STALL_T0, run_id=77),
+            Check("lin", state="QUEUED", started_at=_STALL_T0, run_id=78),
+        ),
+    )
+    actions = decide_fix(world(prs=[p], now=_stall_now(3601)), CFG, FixState(),
+                         fixer_busy=False)
+    assert [(a.head, a.run_ids) for a in _cancels(actions)] == [
+        ("sha-aaa", (77, 78))
+    ]
+
+
+def test_a_stale_cancel_marker_does_not_suppress_the_new_head_s_cancel():
+    # A push mid-remediation leaves the OLD head's marker behind. The new head is
+    # a new fact and gets its own cancel, named for ITS commit — the adapter's
+    # head_sha check is what stops the old head's runs being touched.
+    state = FixState(ci_cancel_head={100: f"sha-old@{_stall_now(0)}"})
+    w = world(prs=[_wedged_run_pr(head="sha-new")], now=_stall_now(3601))
+
+    actions = decide_fix(w, CFG, state, fixer_busy=False)
+
+    assert [(a.head, a.run_ids) for a in _cancels(actions)] == [
+        ("sha-new", (77,))
+    ]
+
+
+def test_the_cancel_carries_the_poll_clock_that_will_bound_the_wait():
+    w = world(prs=[_wedged_run_pr()], now=_stall_now(3601))
+    assert [a.decided_at for a in _cancels(
+        decide_fix(w, CFG, FixState(), fixer_busy=False)
+    )] == [_stall_now(3601)]
+
+
+def test_a_cancel_already_sent_waits_for_the_run_instead_of_re_cancelling():
+    # Cancellation completing is the NEXT tick's observation, never a blocking
+    # wait inside a poll: this tick simply does nothing about the PR.
+    state = FixState(ci_cancel_head={100: f"sha-aaa@{_stall_now(3601)}"})
+    w = world(prs=[_wedged_run_pr()], now=_stall_now(3700))
+
+    actions = decide_fix(w, CFG, state, fixer_busy=False)
+
+    assert _cancels(actions) == [] and not _escalated(actions)
+    assert not any(isinstance(a, RunAgent) for a in actions)
+
+
+def test_the_cancelled_run_is_then_re_run_from_the_existing_budget():
+    # GitHub reports a cancelled run as a settled failure, which is exactly the
+    # state the #38 free re-run acts on — so the re-run happens through the
+    # pre-existing budget rather than a second one.
+    settled = pr(
+        100, "ai-pr-open", state="OPEN", head_ref_name="fix/5-x",
+        head_ref_oid="sha-aaa",
+        checks=(
+            Check("Test (windows-latest)", state="COMPLETED", bucket="fail",
+                  started_at=_STALL_T0, run_id=77),
+        ),
+    )
+    state = FixState(ci_cancel_head={100: f"sha-aaa@{_stall_now(3601)}"})
+
+    actions = decide_fix(world(prs=[settled], now=_stall_now(3700)), CFG, state,
+                         fixer_busy=False)
+
+    assert RerunFailedChecks(100, "sha-aaa", (77,)) in actions
+    assert not _escalated(actions)
+
+
+def test_a_head_whose_re_run_budget_is_spent_escalates_on_the_next_wedge():
+    # The ceiling: cancel + re-run are ONE unit of the head's single free
+    # re-run, so a head that wedges again after spending it reaches a human on
+    # the same schedule as before this path existed.
+    state = FixState(
+        ci_cancel_head={100: f"sha-aaa@{_stall_now(3601)}"},
+        ci_rerun_head={100: "sha-aaa"},
+    )
+    w = world(prs=[_wedged_run_pr()], now=_stall_now(3601))
+
+    actions = decide_fix(w, CFG, state, fixer_busy=False)
+
+    assert _cancels(actions) == []
+    assert [(r.target, r.number, r.add) for r in _escalated(actions)] == [
+        (Target.PR, 100, Label.NEEDS_HUMAN_REVIEW)
+    ]
+
+
+def test_a_cancel_that_never_takes_effect_escalates_within_a_bounded_wait():
+    # ADR 0012: the await-cancel wait has a ceiling — one further full deadline
+    # — so a cancel GitHub silently ignores cannot become the new deadlock.
+    state = FixState(ci_cancel_head={100: f"sha-aaa@{_stall_now(3601)}"})
+    w = world(prs=[_wedged_run_pr()], now=_stall_now(3601 + 3600))
+
+    actions = decide_fix(w, CFG, state, fixer_busy=False)
+
+    assert _cancels(actions) == []
+    escalations = [a for a in actions if isinstance(a, EscalateCiPending)]
+    assert escalations and "cancelled" in escalations[0].body
+
+
+def test_the_wait_is_bounded_even_when_new_jobs_keep_resetting_the_stall_clock():
+    # The regression (adversarial review S2): cancelling a wedged run is exactly
+    # what lets follow-on jobs start, and one fresh pending check resets
+    # `pending_age_seconds`. Bounding the wait on THAT clock left a PR in
+    # await_cancel for 11 simulated days — no cancel, no escalation, no leg.
+    state = FixState(ci_cancel_head={100: f"sha-aaa@{_stall_now(3601)}"})
+    follow_on = pr(
+        100, "ai-pr-open", state="OPEN", head_ref_name="fix/5-x",
+        head_ref_oid="sha-aaa",
+        checks=(Check("late-job", state="IN_PROGRESS",
+                      started_at=_stall_now(100_000), run_id=78),),
+    )
+
+    actions = decide_fix(
+        world(prs=[follow_on], now=_stall_now(103_601)), CFG, state,
+        fixer_busy=False,
+    )
+
+    assert [a.pr for a in actions if isinstance(a, EscalateCiPending)] == [100]
+
+
+def test_an_undated_legacy_marker_still_terminates_on_the_stall_clock():
+    # Markers written before the cancel carried a timestamp are bare SHAs. They
+    # must keep converging on the weaker bound rather than wait forever.
+    state = FixState(ci_cancel_head={100: "sha-aaa"})
+    w = world(prs=[_wedged_run_pr()], now=_stall_now(7200))
+
+    actions = decide_fix(w, CFG, state, fixer_busy=False)
+
+    assert [a.pr for a in actions if isinstance(a, EscalateCiPending)] == [100]
+
+
+def test_disabling_free_re_runs_disables_the_cancel_that_feeds_them():
+    # Otherwise the operator's switch buys the worst of both: a destroyed run
+    # AND a paid repair leg pointed at a failure the harness itself caused.
+    cfg = FixConfig(fix_bot="fix-bot", ci_free_rerun=False)
+    w = world(prs=[_wedged_run_pr()], now=_stall_now(3601))
+
+    actions = decide_fix(w, cfg, FixState(), fixer_busy=False)
+
+    assert _cancels(actions) == [] and _escalated(actions)
+
+
+def test_a_zero_deadline_disables_the_remediation_along_with_the_escalation():
+    # The deadline is the only thing that detects a wedge, so disabling it must
+    # disable the cancel too — not leave a cancel arm running with no bound.
+    cfg = FixConfig(fix_bot="fix-bot", ci_pending_max_seconds=0)
+    state = FixState(ci_cancel_head={100: f"sha-aaa@{_stall_now(0)}"})
+    w = world(prs=[_wedged_run_pr()], now=_stall_now(10**6))
+
+    assert decide_fix(w, cfg, state, fixer_busy=False) == []
+
+
+def test_a_wedged_check_with_no_run_identity_still_escalates():
+    # An external status has no immutable Actions run to cancel; the human path
+    # that predates this remediation is the fail-safe, not an unguarded cancel.
+    w = world(prs=[_wedged_pr()], now=_stall_now(3601))
+
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
+
+    assert _cancels(actions) == [] and _escalated(actions)
+
+
+def test_a_wedged_pr_with_an_unknown_head_is_never_cancelled():
+    # No SHA means no way to prove a cancel targets this commit's runs, and an
+    # empty marker would compare equal to an empty head.
+    p = pr(
+        100, "ai-pr-open", state="OPEN", head_ref_name="fix/5-x",
+        head_ref_oid="",
+        checks=(Check("win", state="IN_PROGRESS", started_at=_STALL_T0,
+                      run_id=77),),
+    )
+    actions = decide_fix(world(prs=[p], now=_stall_now(3601)), CFG, FixState(),
+                         fixer_busy=False)
+    assert _cancels(actions) == [] and _escalated(actions)
+
+
+def test_no_repair_leg_is_dispatched_at_a_pr_being_unwedged():
+    # Cancelling CI and paying an agent to "fix" the same PR in one tick is
+    # incoherent, exactly as escalating and dispatching was.
+    p = _wedged_run_pr(mergeable="CONFLICTING")
+    actions = decide_fix(world(prs=[p], now=_stall_now(3601)), CFG, FixState(),
+                         fixer_busy=False)
+    assert _cancels(actions)
+    assert not any(isinstance(a, RunAgent) for a in actions)
+    assert not any(isinstance(a, (EnableAutoMerge, UpdateBranch)) for a in actions)
+
+
+def test_remediation_is_lock_free_like_the_deadline_it_replaces():
+    w = world(prs=[_wedged_run_pr()], now=_stall_now(3601))
+    assert _cancels(decide_fix(w, CFG, FixState(), fixer_busy=True)) == _cancels(
+        decide_fix(w, CFG, FixState(), fixer_busy=False)
+    ) != []
+
+
+def test_an_already_escalated_head_is_left_alone_entirely():
+    state = FixState(ci_pending_escalated=frozenset({(100, "sha-aaa")}))
+    w = world(prs=[_wedged_run_pr()], now=_stall_now(10**6))
+    actions = decide_fix(w, CFG, state, fixer_busy=False)
+    assert _cancels(actions) == [] and not _escalated(actions)
+
+
+def test_a_cancelled_run_that_comes_back_green_is_never_treated_as_evidence():
+    """Adversarial review S3. Jobs that had not started when a run is cancelled
+    are reported `skipped`, and `skipped` buckets as PASS — so a run stalled in
+    `queued` can come back with nothing red at all. Auto-merging on that would
+    mean merging on the strength of CI the harness itself cancelled."""
+    approved = pr(
+        100, "ai-pr-open", state="OPEN", head_ref_name="fix/5-x",
+        head_ref_oid="sha-aaa", mergeable="MERGEABLE",
+        reviews=(Review("APPROVED", "review-bot", "t1", commit_id="sha-aaa"),),
+        checks=(Check("Test (windows-latest)", state="COMPLETED",
+                      bucket="pass", started_at=_STALL_T0, run_id=77),),
+    )
+    state = FixState(ci_cancel_head={100: f"sha-aaa@{_stall_now(3601)}"})
+
+    actions = decide_fix(world(prs=[approved], now=_stall_now(3700)), CFG,
+                         state, fixer_busy=False)
+
+    assert not any(isinstance(a, EnableAutoMerge) for a in actions)
+    escalations = [a for a in actions if isinstance(a, EscalateCiPending)]
+    assert escalations and "artefact of the cancellation" in escalations[0].body
+
+
+def test_a_green_head_the_harness_never_cancelled_is_untouched():
+    # Anti-vacuity for the guard above: it keys on the cancel marker, so an
+    # ordinary green PR still arms auto-merge.
+    approved = pr(
+        100, "ai-pr-open", state="OPEN", head_ref_name="fix/5-x",
+        head_ref_oid="sha-aaa", mergeable="MERGEABLE",
+        reviews=(Review("APPROVED", "review-bot", "t1", commit_id="sha-aaa"),),
+        checks=(Check("Test (windows-latest)", state="COMPLETED",
+                      bucket="pass", started_at=_STALL_T0, run_id=77),),
+    )
+
+    actions = decide_fix(world(prs=[approved], now=_stall_now(3700)), CFG,
+                         FixState(), fixer_busy=False)
+
+    assert any(isinstance(a, EnableAutoMerge) for a in actions)
+    assert not any(isinstance(a, EscalateCiPending) for a in actions)
+
+
+def test_a_spent_re_run_hands_the_verdict_back_to_github():
+    # Once the re-run has been spent on this head, the green is GitHub's answer
+    # to a real run, not an artefact of the cancel — the guard must let go.
+    approved = pr(
+        100, "ai-pr-open", state="OPEN", head_ref_name="fix/5-x",
+        head_ref_oid="sha-aaa", mergeable="MERGEABLE",
+        reviews=(Review("APPROVED", "review-bot", "t1", commit_id="sha-aaa"),),
+        checks=(Check("Test (windows-latest)", state="COMPLETED",
+                      bucket="pass", started_at=_STALL_T0, run_id=77),),
+    )
+    state = FixState(
+        ci_cancel_head={100: f"sha-aaa@{_stall_now(3601)}"},
+        ci_rerun_head={100: "sha-aaa"},
+    )
+
+    actions = decide_fix(world(prs=[approved], now=_stall_now(3700)), CFG,
+                         state, fixer_busy=False)
+
+    assert any(isinstance(a, EnableAutoMerge) for a in actions)
+    assert not any(isinstance(a, EscalateCiPending) for a in actions)
+
+
+def test_the_green_illusion_escalation_is_one_shot():
+    approved = pr(
+        100, "ai-pr-open", state="OPEN", head_ref_name="fix/5-x",
+        head_ref_oid="sha-aaa", mergeable="MERGEABLE",
+        checks=(Check("Test (windows-latest)", state="COMPLETED",
+                      bucket="pass", started_at=_STALL_T0, run_id=77),),
+    )
+    state = FixState(
+        ci_cancel_head={100: f"sha-aaa@{_stall_now(3601)}"},
+        ci_pending_escalated=frozenset({(100, "sha-aaa")}),
+    )
+
+    actions = decide_fix(world(prs=[approved], now=_stall_now(3700)), CFG,
+                         state, fixer_busy=False)
+
+    assert not any(isinstance(a, EscalateCiPending) for a in actions)
+
+
+def test_remedies_are_the_values_the_decision_acts_on():
+    # The journal reads this derivation and the decision emits it, so the two
+    # can never disagree about what happened to a stalled head.
+    w = world(prs=[_wedged_run_pr()], now=_stall_now(3601))
+    remedies = ci_stall_remedies(w, CFG, FixState())
+    assert [r.action() for r in remedies] == _cancels(
+        decide_fix(w, CFG, FixState(), fixer_busy=False)
+    )
+    assert remedies[0].step is CiStallStep.CANCEL
+    assert remedies[0].pr == 100 and remedies[0].issue == 5
 
 
 # ── duplicate-PR guard (#39) ─────────────────────────────────────────────────
