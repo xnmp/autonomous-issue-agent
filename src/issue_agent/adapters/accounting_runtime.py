@@ -27,12 +27,14 @@ from ..domain.contracts import (
     daily_budget_scope,
 )
 from ..domain.outcome import AgentResult, ExitReason, MAX_BUDGET_STATUS
+from ..domain.ports import StaleReservationReconciler
 from ..domain.pricing import BudgetPolicy, RateTable, price
 from ..domain.refs import is_governed_branch
 from .control_store import (
     AccountingDisposition,
     BudgetLimit,
     ReservationRequest,
+    ReservationResult,
     SQLiteControlStore,
     SettlementRequest,
 )
@@ -74,6 +76,7 @@ class AccountingRuntime(AgentRuntime):
     github_host: str = "github.com"
     approved_base_branch: str = "dev"
     require_dispatch_claim: bool = False
+    reservation_reconciler: StaleReservationReconciler | None = None
     _context: contextvars.ContextVar[
         tuple[int | None, str, int, int | None]
     ] = field(
@@ -103,6 +106,94 @@ class AccountingRuntime(AgentRuntime):
         claim_target: int | None = None,
     ) -> None:
         self._context.set((issue, kind, number, claim_target))
+
+    def _reserve_reclaiming_dead_headroom(
+        self,
+        request: ReservationRequest,
+    ) -> ReservationResult:
+        """Reserve, reclaiming provably dead headroom before conceding a trip.
+
+        keifu #34 (2026-08-02): three fix legs died on a broken provider binary
+        having spent nothing. Each retained its reservation because trusted
+        usage was unavailable -- correct conservatism -- but the next resolve
+        was then denied against that phantom headroom and escalated to a human
+        at $0 real spend. `needs-budget-review` is human-terminal, so the issue
+        stayed blocked even after a later sweep released every reservation.
+
+        Exhaustion therefore runs the standing recovery sweep once and retries
+        admission once. The sweep is the same pass boot, wake, and periodic
+        recovery run, so this grants no new release authority: only runs that
+        recovery already deems dead and usage-blind lose their reservation.
+
+        Scope of the fix, stated precisely. Reclaimable headroom is reclaimed
+        at dispatch instead of at the next periodic sweep, which closes the
+        window in which a trip escalates something reconciliation was about to
+        free. It does NOT rescue a leg that dies inside the reconciliation
+        grace: those reservations are not yet releasable by anyone, so the very
+        next dispatch still escalates exactly as before. Shortening that grace,
+        or proving an exec failure is $0, is a retention-policy change and does
+        not belong on the admission path.
+
+        Only EXHAUSTED qualifies. UNAVAILABLE, CORRUPT, and CONFLICT report
+        accounting that cannot be trusted or an identity clash, and neither is
+        repairable by reconciliation -- retrying them would trade conservatism
+        for nothing.
+
+        ADR 0012 ceiling: exactly one reconcile and one retry per dispatch
+        attempt, expressed as straight-line code so no loop can form. A second
+        exhaustion in the same tick escalates immediately.
+        """
+
+        reservation = self.store.reserve(request)
+        if (
+            reservation.disposition is not AccountingDisposition.EXHAUSTED
+            or self.reservation_reconciler is None
+        ):
+            return reservation
+        try:
+            released = (
+                self.reservation_reconciler.reconcile_stale_reservations()
+            )
+        except Exception as exc:  # noqa: BLE001 - escalate exactly as before
+            self._journal_reconciled(
+                request,
+                reservation,
+                0,
+                False,
+                f"reconciliation unavailable: {exc}",
+            )
+            return reservation
+        retried = self.store.reserve(request)
+        self._journal_reconciled(
+            request,
+            reservation,
+            released,
+            retried.disposition is AccountingDisposition.AVAILABLE,
+            reservation.detail,
+        )
+        return retried
+
+    def _journal_reconciled(
+        self,
+        request: ReservationRequest,
+        exhausted: ReservationResult,
+        released: int,
+        admitted: bool,
+        reason: str,
+    ) -> None:
+        # The journalled scope names the limit that tripped, not the primary
+        # one: a leg carrying repository, global, and issue caps can be denied
+        # by any of them, and an operator reads this to decide which cap moves.
+        try:
+            self.store.record_admission_reconciled(
+                request.run_id,
+                exhausted.tripped_dimension or request.scope.dimension,
+                released,
+                admitted,
+                reason,
+            )
+        except Exception:  # noqa: BLE001 - telemetry never fails a dispatch
+            pass
 
     def set_run_identity(self, run_id: str, leg_id: str) -> None:
         if not run_id or not leg_id:
@@ -209,7 +300,7 @@ class AccountingRuntime(AgentRuntime):
         # Paid child ownership is recorded by the runtime's ProcessSupervisor.
         # The daemon itself must not be registered as the reservation lease:
         # doing so makes a transport failure look live until daemon restart.
-        reservation = self.store.reserve(request)
+        reservation = self._reserve_reclaiming_dead_headroom(request)
         if reservation.disposition is not AccountingDisposition.AVAILABLE:
             return AgentResult(
                 is_error=True,

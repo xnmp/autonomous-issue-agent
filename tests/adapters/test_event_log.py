@@ -514,6 +514,8 @@ _SAMPLE = {
     "rate_card_version": None,
     "scope": "repository",
     "cap_micros": None,
+    "released_runs": 1,
+    "admitted": True,
     "code": "warning",
     "warning": "warning",
     "detail": "detail",

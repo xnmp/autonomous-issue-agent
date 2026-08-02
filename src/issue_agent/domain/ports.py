@@ -290,6 +290,20 @@ class SpendReconciler(Protocol):
     def reconcile(self, run_id: RunId) -> bool: ...
 
 
+class StaleReservationReconciler(Protocol):
+    """Run the standing reservation recovery sweep on demand.
+
+    Admission uses this to reclaim headroom held by provably dead runs before
+    escalating a budget trip to a human. It grants no new release authority:
+    implementations must delegate to the same recovery pass boot, wake, and
+    periodic reconciliation already run, under identical eligibility rules.
+
+    Returns the number of runs the sweep left without an active reservation.
+    """
+
+    def reconcile_stale_reservations(self) -> int: ...
+
+
 class RunAbandonmentSink(Protocol):
     """Emit a correction for a durable run proven dead by recovery.
 
