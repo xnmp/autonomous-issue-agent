@@ -609,11 +609,30 @@ def resolve(command: str, repository: str = "") -> Resolution:
                 and inner[1:3] == ["git", "push"]
             ) or (
                 len(inner) >= 4
-                and inner[1:4] == ["gh", "pr", "create"]
+                and inner[1:4] in (["gh", "pr", "create"], ["gh", "pr", "edit"])
             )
             if not supported:
                 return Unresolvable(
-                    "issue-agent-publish supports only git push or gh pr create"
+                    "issue-agent-publish supports only git push, "
+                    "gh pr create, or gh pr edit"
+                )
+            # `bypass_reason` refuses an authority-env override on the two forms
+            # `classify` governs, but `gh pr edit` is deliberately ungoverned
+            # there (no checker script owns it). Refuse the same overrides at
+            # this seam so ALL brokered forms are covered uniformly, and the
+            # coverage cannot lapse if a later form is added to `supported`.
+            spoofed = sorted(
+                {
+                    item.partition("=")[0]
+                    for item in (*(_env or []), *_extra_env)
+                    if "=" in item
+                }
+                & _PUBLICATION_AUTHORITY_ENV
+            )
+            if spoofed:
+                return Unresolvable(
+                    "publication authority cannot be overridden by the paid "
+                    f"child: {', '.join(spoofed)}"
                 )
         classified = classify(words)
         if classified is not None:
@@ -623,6 +642,13 @@ def resolve(command: str, repository: str = "") -> Resolution:
             base not in _LITERAL_CONSUMERS
             and base not in _PASSTHROUGH_WRAPPERS
             and base != "env"
+            # `issue-agent-publish` is a RECOGNISED wrapper: the branch above
+            # already pinned its argv to one of three exact forms, so the
+            # governed binary that follows is not an unresolved escape. It is
+            # only reached here by the form `classify` leaves ungoverned
+            # (`gh pr edit`), which the broker — not a checker script —
+            # constrains to the leg's own pull request.
+            and base != "issue-agent-publish"
             and any(_basename(word) in _GOVERNED_BINARIES for word in inner[1:])
         ):
             return Unresolvable(

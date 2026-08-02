@@ -1,8 +1,9 @@
 """Durable publication broker invoked by paid agent children.
 
-The child proposes a narrowly classified push or PR creation. The command is
-committed before the subprocess starts, and an ambiguous prior attempt is
-reconciled against the remote before any retry.
+The child proposes a narrowly classified push, PR creation, or a body update to
+the pull request that same run already owns. The command is committed before the
+subprocess starts, and an ambiguous prior attempt is reconciled against the
+remote before any retry.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from .deployment_authority import DeploymentAuthority, deployment_role
 from .durable_effects import DurableEffectRunner, EffectOutcome
 from .event_log import EventLog
 from ..domain.events import Producer
+from ..domain import gate
 from ..domain.refs import is_governed_branch, issue_from_branch
 from ..domain.repository import canonical_repository
 
@@ -131,8 +133,35 @@ def _publication_environment(
     return environment
 
 
+_BROKERED_KINDS = frozenset(
+    {
+        CommandKind.PUBLISH_BRANCH,
+        CommandKind.OPEN_PULL_REQUEST,
+        CommandKind.UPDATE_PULL_REQUEST_BODY,
+    }
+)
+
+# GitHub caps an issue/PR body at 65536 characters. This bound is measured in
+# BYTES, which is the conservative direction (a multi-byte body is refused
+# sooner than GitHub would), so an oversize body gets a readable broker message
+# instead of a remote 422 the child would retry against.
+MAX_PR_BODY_BYTES = 60_000
+
+
+def _normalized_body(value: str) -> str:
+    """Compare bodies the way GitHub round-trips them.
+
+    GitHub rewrites submitted LF as CRLF and does not preserve a trailing
+    newline, so a byte-exact readback comparison reports a spurious divergence
+    and strands an edit that in fact succeeded. ONLY those two transformations
+    are absorbed — a lone CR is left alone, so replacing a stray CR with LF is
+    still a real difference the reconcile must act on.
+    """
+    return value.replace("\r\n", "\n").rstrip("\n")
+
+
 class AgentPublicationBroker:
-    """Execute and recover the two remote mutations required by fixer agents."""
+    """Execute and recover the remote mutations required by fixer agents."""
 
     def __init__(
         self,
@@ -226,10 +255,7 @@ class AgentPublicationBroker:
             repository=self.repository,
             executor_identity=self.owner,
         ):
-            if pending.command.kind not in {
-                CommandKind.PUBLISH_BRANCH,
-                CommandKind.OPEN_PULL_REQUEST,
-            }:
+            if pending.command.kind not in _BROKERED_KINDS:
                 continue
             try:
                 result = self._run_pending(pending)
@@ -370,6 +396,38 @@ class AgentPublicationBroker:
                         stderr=(
                             "remote branch revision changed; refusing stale "
                             "pull-request creation"
+                        ),
+                    ),
+                    EffectStatus.PERMANENT_FAILURE,
+                    error=error,
+                )
+        if command.kind is CommandKind.UPDATE_PULL_REQUEST_BODY:
+            # Re-read under held authority, immediately before the write. The
+            # pre-flight reconcile in `_run_pending` runs before authority is
+            # taken, leaving a window in which an operator edit lands and is
+            # then silently overwritten — the post-hoc reconcile would compare
+            # against OUR body and report a clean success.
+            current = self._pull_request_body(
+                int(payload["number"]), cwd
+            )
+            if current is None:
+                error = "cannot re-read the pull-request body before updating it"
+                return EffectOutcome(
+                    CommandResult(75, stderr=error),
+                    EffectStatus.RETRYABLE_FAILURE,
+                    error=error,
+                )
+            if _normalized_body(current) not in {
+                _normalized_body(str(payload["body"])),
+                _normalized_body(str(payload["prior_body"])),
+            }:
+                error = "pull-request body changed before the update was applied"
+                return EffectOutcome(
+                    CommandResult(
+                        75,
+                        stderr=(
+                            "the pull-request body was rewritten by someone "
+                            "else; refusing to discard it"
                         ),
                     ),
                     EffectStatus.PERMANENT_FAILURE,
@@ -608,9 +666,92 @@ class AgentPublicationBroker:
                 "remote": remote,
                 "remote_url": remote_url,
             }
+        elif argv[:3] == ("gh", "pr", "edit"):
+            number, body = _validated_pr_edit(argv)
+            # PROVENANCE: `body` is the paid child's own output, so it is
+            # untrusted inbound content by the same posture that already covers
+            # the brokered `gh pr create --body`. It is carried as one literal
+            # argv element (never a file, template, or shell expansion), bounded
+            # above, and can only ever land on the pull request this supervised
+            # run already owns — the number is adjudicated against GitHub's own
+            # list of open PRs for the authorized branch, not against a claim
+            # the child makes.
+            # The create gate (`gate.check_pr_body`, via check-pr.sh) is what
+            # makes a PR body carry its acceptance criteria and its closing
+            # keyword. Making the body MUTABLE would demote that from an
+            # invariant to a create-time formality — an edit could strip
+            # `Fixes #N`, and the merged PR would leave its issue open for the
+            # steward to re-triage into fresh paid legs. Re-run the check on
+            # every replacement so the property survives the edit.
+            verdict = gate.check_pr_body(body)
+            if not verdict.ok:
+                raise ValueError(
+                    f"pull-request body update rejected: {verdict.reason}"
+                )
+            rows = self._open_pull_requests(branch, resolved_cwd)
+            if rows is None:
+                raise RuntimeError(
+                    "cannot verify pull-request ownership before a body update"
+                )
+            # Own-PR adjudication mirrors the create path's predicate: same head
+            # branch AND the approved base. `--head <branch>` alone can match
+            # more than one open PR (a second PR from the same head onto another
+            # base, or a fork whose head ref shares the name), and "any open PR
+            # with this branch name" is weaker than "the PR this run owns".
+            owned = [
+                row
+                for row in rows
+                if row.get("number") == number
+                and str(row.get("baseRefName") or "") == self.base_branch
+            ]
+            if len(owned) != 1:
+                raise ValueError(
+                    f"pull request #{number} is not the one open pull request "
+                    f"for branch {branch} onto {self.base_branch}; the broker "
+                    "edits only this run's own PR"
+                )
+            prior_body = self._pull_request_body(number, resolved_cwd)
+            if prior_body is None:
+                raise RuntimeError(
+                    "cannot read the current pull-request body before updating it"
+                )
+            remote = "origin"
+            remote_url = self._required_output(
+                ("git", "remote", "get-url", "--push", remote),
+                resolved_cwd,
+                "origin push URL",
+            )
+            _require_repository_remote(
+                remote_url, self.repository, self.host
+            )
+            normalized = (
+                "gh",
+                "pr",
+                "edit",
+                str(number),
+                "--repo",
+                f"{self.host}/{self.repository}",
+                "--body",
+                body,
+            )
+            kind = CommandKind.UPDATE_PULL_REQUEST_BODY
+            target = f"pull-request-body:{self.repository}:{number}"
+            payload = {
+                "argv": list(normalized),
+                "cwd": resolved_cwd,
+                "branch": branch,
+                "number": number,
+                "body": body,
+                "prior_body": prior_body,
+                "issue": issue_from_branch(branch) or 0,
+                "owner": self.owner,
+                "remote": remote,
+                "remote_url": remote_url,
+            }
         else:
             raise ValueError(
-                "durable publisher supports only `git push` and `gh pr create`"
+                "durable publisher supports only `git push`, `gh pr create`, "
+                "and `gh pr edit --body`"
             )
         return _lifecycle_command(
             kind,
@@ -689,13 +830,50 @@ class AgentPublicationBroker:
             if not str(payload.get("prior_remote_object") or ""):
                 return False
             return None
+        if command.kind is CommandKind.UPDATE_PULL_REQUEST_BODY:
+            current = self._pull_request_body(int(payload["number"]), cwd)
+            if current is None:
+                return None
+            if _normalized_body(current) == _normalized_body(
+                str(payload["body"])
+            ):
+                return True
+            if _normalized_body(current) == _normalized_body(
+                str(payload["prior_body"])
+            ):
+                return False  # untouched since capture — safe to (re)apply
+            # Someone else rewrote the body between capture and execution.
+            # Overwriting would silently discard their edit, so refuse.
+            return None
         return None
 
+    def _pull_request_body(self, number: int, cwd: str) -> str | None:
+        result = self._execute(
+            (
+                "gh",
+                "pr",
+                "view",
+                str(number),
+                "--repo",
+                f"{self.host}/{self.repository}",
+                "--json",
+                "body",
+            ),
+            cwd,
+        )
+        if result.code != 0:
+            return None
+        try:
+            parsed = json.loads(result.stdout or "null")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        body = parsed.get("body")
+        return body if isinstance(body, str) else None
+
     def _origin_authority_error(self, command: LifecycleCommand) -> str:
-        if command.kind not in {
-            CommandKind.PUBLISH_BRANCH,
-            CommandKind.OPEN_PULL_REQUEST,
-        }:
+        if command.kind not in _BROKERED_KINDS:
             return "publication command kind is outside broker authority"
         payload = command.payload
         cwd = str(payload.get("cwd") or "")
@@ -971,6 +1149,8 @@ class AgentPublicationBroker:
     def _remote_object(self, command: LifecycleCommand) -> str | None:
         if command.kind is CommandKind.PUBLISH_BRANCH:
             return str(command.payload["branch"])
+        if command.kind is CommandKind.UPDATE_PULL_REQUEST_BODY:
+            return str(command.payload["number"])
         return self._pull_request(
             str(command.payload["branch"]),
             str(command.expected_revision),
@@ -1199,10 +1379,101 @@ def _normalized_pr_create(
     )
 
 
+def _validated_pr_edit(argv: tuple[str, ...]) -> tuple[int, str]:
+    """Reduce `gh pr edit …` to the ONE operation the broker supports.
+
+    Exactly one decimal PR selector and one literal `--body` value. `--repo` is
+    tolerated (agents restate the ambient target) but discarded — the durable
+    command pins it. Every other option is refused rather than ignored: `--title`
+    and the label/reviewer/milestone flags are separate remote mutations, and
+    `--add-*`/`--remove-*` would let one brokered call mutate state no reviewer
+    asked about.
+
+    `--body-file`/`-F` is refused so the durable payload stays SELF-CONTAINED:
+    the committed command must record the exact bytes that will be published, and
+    a path re-read at execution time can change between commit and retry. It is
+    not a confidentiality boundary — the child may still spell the body
+    `--body "$(cat body.md)"`, which its own shell expands before the broker
+    ever runs, and that is the supported way to send long markdown.
+    """
+
+    selector: str | None = None
+    body: str | None = None
+    index = 3
+    while index < len(argv):
+        arg = argv[index]
+        # `--` is refused, not honoured: after it gh treats every remaining
+        # token as a positional, so accepting it here would make this parser
+        # and gh's disagree about which token is the selector. The broker
+        # rebuilds argv from scratch, so there is nothing `--` could express.
+        if arg in {"--body-file", "-F"} or arg.startswith(("--body-file=", "-F")):
+            raise ValueError(
+                "durable pull-request body updates accept literal --body only; "
+                "file-reading options are forbidden"
+            )
+        if arg in {"--body", "-b"}:
+            if index + 1 >= len(argv):
+                raise ValueError("--body requires a literal value")
+            if body is not None:
+                raise ValueError("--body may be given only once")
+            body = argv[index + 1]
+            index += 2
+            continue
+        if arg.startswith("--body=") or (arg.startswith("-b") and arg != "-b"):
+            if body is not None:
+                raise ValueError("--body may be given only once")
+            # `-bfoo=bar` is pflag's attached-shorthand form, whose value is the
+            # whole `foo=bar`; only the long `--body=` form splits on `=`.
+            # Splitting both truncated a body that legitimately began with an
+            # `=`-bearing token.
+            body = (
+                arg.split("=", 1)[1]
+                if arg.startswith("--body=")
+                else arg[2:]
+            )
+            index += 1
+            continue
+        if arg in {"--repo", "-R"}:
+            if index + 1 >= len(argv):
+                raise ValueError(f"{arg} requires a value")
+            index += 2
+            continue
+        if arg.startswith("--repo=") or (arg.startswith("-R") and arg != "-R"):
+            index += 1
+            continue
+        if arg.startswith("-"):
+            raise ValueError(
+                f"unsupported pull-request edit option: {arg}"
+            )
+        if selector is not None:
+            raise ValueError(
+                "durable pull-request body updates accept one PR selector"
+            )
+        selector = arg
+        index += 1
+    if body is None:
+        raise ValueError(
+            "durable pull-request body updates require a literal --body"
+        )
+    if len(body.encode()) > MAX_PR_BODY_BYTES:
+        raise ValueError("pull-request body exceeds the durable limit")
+    # ASCII-only: `str.isdigit()` accepts "٤" and "²", and `int()` accepts the
+    # former — a non-ASCII selector is never something gh produced.
+    if selector is None or not re.fullmatch(r"[0-9]{1,9}", selector):
+        raise ValueError(
+            "durable pull-request body updates require a decimal PR number; "
+            "URL and branch selectors are not accepted"
+        )
+    number = int(selector)
+    if number <= 0:
+        raise ValueError("pull-request number must be positive")
+    return number, body
+
+
 def _validated_pr_arguments(
     argv: tuple[str, ...],
 ) -> tuple[str, ...]:
-    max_body_bytes = 60_000
+    max_body_bytes = MAX_PR_BODY_BYTES
     max_title_bytes = 512
     title_seen = False
     body_seen = False

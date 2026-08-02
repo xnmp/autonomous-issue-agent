@@ -203,8 +203,18 @@ don't keep going back to edit it — each re-plan costs a full model round-trip.
    - **Observable seam untested** — the acceptance criterion names a user-visible
      or contract-level result, but no test asserts at that seam.
 9. Publish remote changes only through the durable broker: use
-   `issue-agent-publish git push …` for every push and
-   `issue-agent-publish gh pr create …` to open the PR. The broker commits a
+   `issue-agent-publish git push …` for every push,
+   `issue-agent-publish gh pr create …` to open the PR, and
+   `issue-agent-publish gh pr edit <your PR number> --body '…'` to REPLACE your
+   own PR's body (the whole body — the flag overwrites, it does not append).
+   That is the supported way to keep the acceptance-criteria checklist and its
+   evidence references current after a repair; the broker refuses any PR number
+   other than the one on your branch. A replacement body must still pass the
+   same body gate `gh pr create` does — keep the `## Acceptance Criteria`
+   section and the `Fixes #<issue>` line, or the edit is refused. For a long
+   markdown body, write it to a scratch file and pass `--body "$(cat body.md)"`
+   — the broker takes a literal value only, so `--body-file` is rejected. The
+   broker commits a
    lifecycle command before the network effect and reconciles an ambiguous
    outcome before retrying. Open the PR with an EXPLICIT base of
    `$BASE_BRANCH` — always pass `--base "$BASE_BRANCH"` to the brokered

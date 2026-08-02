@@ -4579,6 +4579,23 @@ def _command_correlation(command: LifecycleCommand) -> Correlation:
     kind, separator, raw_number = command.target.partition(":")
     if not separator:
         return Correlation()
+    if kind == "pull-request-body":
+        # Broker targets are `<kind>:<owner/repo>:<number>` — the repository
+        # segment sits in the middle, so the number is the LAST field, not the
+        # first one after the kind. Without this the dashboard folded every
+        # body-update transition with an EMPTY correlation and the edit could
+        # not be traced back to its PR or issue.
+        issue = command.payload.get("issue")
+        try:
+            pr = int(command.target.rpartition(":")[2])
+        except ValueError:
+            return Correlation()
+        if pr <= 0:
+            return Correlation()
+        return Correlation(
+            pr=pr,
+            issue=issue if isinstance(issue, int) and issue > 0 else None,
+        )
     try:
         number = int(raw_number)
     except ValueError:
