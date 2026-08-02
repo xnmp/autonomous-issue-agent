@@ -87,16 +87,24 @@ def test_dashboard_label_actions_use_the_durable_operator_effect_port(
     monkeypatch.setattr(service.system, "remote_repo", lambda _root: "harness/repo")
     backend = service.Backend(effects_factory=factory)
     monkeypatch.setattr(backend, "known", lambda _name: True)
-    values = {
-        "REPO": "o/r",
-        "STATE_DIR": "/state/fix",
-        "REVIEW_STATE_DIR": "/state/review",
-        "STEWARD_STATE_DIR": "/state/steward",
-    }
+    # Only REPO comes from the overlay. The state dirs must come from the
+    # journal_paths derivation: a standard deployment never sets the STATE_DIR
+    # overlay keys, and reading them raw broke every journaled operator action
+    # live (keifu 2026-08-02) while this test's overlay mock hid the gap.
+    values = {"REPO": "o/r"}
     monkeypatch.setattr(
         backend,
         "overlay_field",
         lambda _name, field: values[field],
+    )
+    monkeypatch.setattr(
+        service.cli,
+        "journal_paths",
+        lambda _name: [
+            "/state/fix/journal.jsonl",
+            "/state/review/journal.jsonl",
+            "/state/steward/journal.jsonl",
+        ],
     )
 
     assert backend.promote("demo", 9) == (True, "ok")

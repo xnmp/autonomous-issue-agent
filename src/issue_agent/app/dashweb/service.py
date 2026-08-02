@@ -490,9 +490,14 @@ class Backend:
         return list(row.prs) if row is not None else []
 
     def _operator_effects(self, name: str, repo: str, *, journalled: bool = True):
+        # Derived from journal_paths like _clear_retries, NOT read raw from the
+        # overlay: the STATE_DIR keys are optional and standard deployments
+        # never set them, so the raw read produced () and control_store_path
+        # refused — every journaled operator action (promote/priority/unblock)
+        # 500'd on a normal deployment (keifu 2026-08-02). journal_paths
+        # resolves snapshot → overlay → the daemon's own default per role.
         state_dirs = tuple(
-            self.overlay_field(name, field)
-            for field in ("STATE_DIR", "REVIEW_STATE_DIR", "STEWARD_STATE_DIR")
+            os.path.dirname(path) for path in cli.journal_paths(name)
         )
         return self.effects_factory(
             repo,
