@@ -464,9 +464,18 @@ def check_tests_immutable(
     `exists_at_base(path)` reports whether the file existed at the base ref."""
     for f in changed:
         if looks_like_test(f) and exists_at_base(f):
+            # The recovery is scripted into the message: an agent that ADDED
+            # its new tests inside an existing file (benign in intent,
+            # indistinguishable cheaply from weakening) burned a leg + a
+            # human question asking how to comply (keifu #126, 2026-08-03).
+            # The diff is evaluated NET against base, so restoring the file
+            # clears this deny without invalidating red/green history.
             return deny(
                 f"existing test file '{f}' was modified/deleted — add NEW tests "
-                "instead of changing existing ones"
+                "instead of changing existing ones. If you only ADDED tests "
+                f"there: move them to a new test file and restore '{f}' to its "
+                "exact base-branch content (git checkout <base> -- path); the "
+                "gate reads the net diff, so this needs no history rewrite"
             )
     return ALLOW
 

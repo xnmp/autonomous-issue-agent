@@ -269,7 +269,7 @@ prc_check_tests_immutable() {  # prc_check_tests_immutable "<changed-file-list>"
     [ -n "$f" ] || continue
     printf '%s' "$f" | grep -qE "$PR_TEST_FILE_RE" || continue
     if git cat-file -e "origin/$base:$f" 2>/dev/null || git cat-file -e "$base:$f" 2>/dev/null; then
-      fail "existing test file '$f' was modified/deleted — add NEW tests instead of changing existing ones"
+      fail "existing test file '$f' was modified/deleted — add NEW tests instead of changing existing ones. If you only ADDED tests there: move them to a new test file and restore '$f' to its exact base-branch content (git checkout <base> -- path); the gate reads the net diff, so this needs no history rewrite"
     fi
   done <<< "$1"
 }
