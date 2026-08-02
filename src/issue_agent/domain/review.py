@@ -27,6 +27,15 @@ from .world import PRView, Review, WorldState, REVIEW_APPROVED, REVIEW_CHANGES_R
 # forever.
 DEFAULT_MAX_UNPRODUCTIVE_ROUNDS = 5
 
+# Ceiling on the reviewer's OWN change requests since its last APPROVE. Mirrors
+# `HarnessConfig.max_review_rejections` (REVIEW_MAX_REJECTIONS) so the decide
+# side can reason about the same breaker the submission side applies; a missing
+# knob must never read as "no ceiling".
+DEFAULT_MAX_REVIEW_REJECTIONS = 4
+
+REVIEW_COMMENTED = "COMMENTED"
+REVIEW_DISMISSED = "DISMISSED"
+
 
 def latest_reviewer_verdict(pr: PRView, reviewer: str) -> Review | None:
     """The reviewer's latest non-dismissed submitted verdict, if known."""
@@ -142,6 +151,11 @@ class ReviewConfig:
     # fan-out) is paid for again on the very next poll, forever. This is the
     # bound. See ReviewState.unproductive_rounds for what is counted.
     max_unproductive_rounds: int = DEFAULT_MAX_UNPRODUCTIVE_ROUNDS
+    # The submission-side rejection ceiling (REVIEW_MAX_REJECTIONS), mirrored
+    # here so the decide side can recognise a PR that is PAST it. <=0 disables,
+    # like every other breaker. Only `reviewer_abandoned_at_ceiling` reads it;
+    # the ceiling is still APPLIED in `review_submission`.
+    max_rejections: int = DEFAULT_MAX_REVIEW_REJECTIONS
 
 
 @dataclass(frozen=True)
@@ -265,6 +279,66 @@ def count_prior_rejections(reviews: tuple, review_bot: str) -> int:
     )
 
 
+@dataclass(frozen=True)
+class SubmittedReview:
+    """One review as GitHub's REST list returns it, carrying the id a dismissal
+    needs. `world.Review` deliberately has no id (nothing in the decide path may
+    address an individual review); the operator re-arm does, so it gets its own
+    value object rather than widening the world model."""
+
+    review_id: str
+    state: str
+    author: str
+    submitted_at: str = ""
+
+
+def stale_rejections(
+    reviews: tuple[SubmittedReview, ...],
+    review_bot: str,
+    limit: int = 0,
+) -> tuple[SubmittedReview, ...]:
+    """Exactly the reviews an operator re-arm must dismiss: the review bot's
+    CHANGES_REQUESTED verdicts that still COUNT toward the rejection ceiling.
+
+    Same suffix rule as `count_prior_rejections` — an APPROVE satisfied every
+    rejection before it — so dismissing this set and nothing else is what makes
+    `count_prior_rejections` read zero again. Anything outside it (a human's
+    change request, a rejection already answered by an APPROVE, an
+    already-dismissed review) is not the harness's to retract.
+
+    keifu PR #173 (2026-08-02): the dashboard unblock cleared the attention
+    labels and the retry counters but left these reviews standing, so the
+    ceiling was still tripped the instant the daemon looked again — an
+    invisible dead state no amount of unblocking could clear.
+
+    `limit` (<=0 disables) keeps only the newest `limit` of them, so a
+    pathological history cannot turn one operator click into an unbounded
+    dismissal fan-out. At the ceiling's own value this discards nothing that
+    could still be holding the breaker down.
+    """
+    # States are compared EXACTLY, like `count_prior_rejections` — the two must
+    # select the same set or the re-arm's contract ("dismiss these and the
+    # ceiling reads zero") quietly stops holding. GitHub returns them
+    # upper-case; anything else is a shape this harness does not count and must
+    # therefore not retract either.
+    mine = [
+        review
+        for review in reviews
+        if login_eq(review.author, review_bot)
+        and review.state not in {"", "PENDING", "DISMISSED"}
+    ]
+    last_approve = max(
+        (i for i, r in enumerate(mine) if r.state == REVIEW_APPROVED),
+        default=-1,
+    )
+    counted = tuple(
+        r for r in mine[last_approve + 1:] if r.state == REVIEW_CHANGES_REQUESTED
+    )
+    if limit > 0 and len(counted) > limit:
+        return counted[-limit:]
+    return counted
+
+
 def count_outstanding_change_requests(reviews: tuple, fix_bot: str) -> int:
     """`count_prior_rejections` read from the FIXER's side of the PR (#16).
 
@@ -335,6 +409,74 @@ def unproductive_ceiling_hit(state: ReviewState, cfg: ReviewConfig, pr: int) -> 
     ).tripped
 
 
+def reviewer_abandoned_at_ceiling(pr: PRView, cfg: ReviewConfig) -> bool:
+    """This PR is at the rejection ceiling, the reviewer has already given up on
+    its current head, and NOTHING now holds it on a human.
+
+    That combination is a dead state, not a hold (keifu PR #173 / issue #25,
+    2026-08-02). The ceiling escalation posts a COMMENT review and swaps the
+    trigger label for needs-human-review; a dashboard unblock then removes
+    needs-human-review and adds nothing, so the PR carries no lifecycle label at
+    all. The reviewer will not re-review (its verdict is already on this head),
+    the fixer will not dispatch address-review (the latest review is a COMMENT,
+    not CHANGES_REQUESTED), and the escalation event stays frozen at the moment
+    before the unblock. Recognising it is what lets the reviewer re-emit the
+    escalation instead of going quiet forever.
+
+    The three conjuncts are what keep this from firing on a HEALTHY loop:
+
+      * `prior + 1 >= max_rejections` — the next rejection could only escalate,
+        so no round remains to be spent;
+      * the reviewer's newest review is a COMMENT on the CURRENT head — only
+        the ceiling/verdict escalation posts COMMENT, and pinning it to the head
+        means a fixer push still earns a real re-review (which may APPROVE and
+        reset the count) rather than an instant re-escalation;
+      * needs-human-review is absent — its presence IS the hold, and it is also
+        what makes the re-emission self-dedup: escalating re-applies the label,
+        so this reads False again until the next operator unblock (ADR 0012:
+        one journalled re-emission per unblock generation, never per tick).
+
+    An unknown commit_id ("" — the adapter could not resolve it) fails CLOSED:
+    the unproductive-rounds breaker is the backstop, and re-escalating a PR we
+    cannot place is worse than leaving it to that bound.
+    """
+    if cfg.max_rejections <= 0 or pr.state != "OPEN":
+        return False
+    if pr.has(Label.NEEDS_HUMAN_REVIEW):
+        return False
+    # A PR that still carries the trigger label is not abandoned — the
+    # reviewer's own loop still owns it, and the labelled arm above decides
+    # whether it gets a round. Excluding it also removes the only window in
+    # which this arm and that one could act on the same PR in one tick.
+    if pr.has(cfg.trigger_label):
+        return False
+    if count_prior_rejections(pr.reviews, cfg.review_bot) + 1 < cfg.max_rejections:
+        return False
+    mine = [r for r in pr.reviews if login_eq(r.author, cfg.review_bot)]
+    newest = next(
+        (r for r in reversed(mine) if r.state != REVIEW_DISMISSED),
+        None,
+    )
+    return bool(
+        newest is not None
+        and newest.state == REVIEW_COMMENTED
+        and pr.head_ref_oid
+        and newest.commit_id == pr.head_ref_oid
+    )
+
+
+def abandoned_escalation_reason(cap: int) -> str:
+    """Human-facing text for the re-emitted escalation. It must say what an
+    operator has to DO differently, because the obvious move (unblock again) is
+    exactly the one that already failed: the ceiling counts GitHub review state,
+    so only dismissing the reviewer's change requests re-arms it."""
+    return (
+        f"the reviewer's rejection ceiling ({cap}) is still in force and the "
+        "attention label was cleared without its change requests being "
+        "dismissed, so no role can advance this PR."
+    )
+
+
 def unproductive_escalation_reason(cap: int) -> str:
     """Human-facing text for a reviewer ceiling escalation. Names both causes,
     because the operator's next move differs: repeated pre-result deaths point
@@ -371,7 +513,14 @@ def decide_review(
     `pr_escalation` every other breaker uses (so the Executor's funnel emits the
     escalation event + ALERT_CMD). The escalation is edge-triggered on the
     needs-human-review label: a PR already carrying it is silently skipped, so a
-    stuck relabel cannot turn the paid loop into a comment loop."""
+    stuck relabel cannot turn the paid loop into a comment loop.
+
+    **Re-arm (keifu #173/#25).** A PR left at the rejection ceiling with its
+    attention label cleared belongs to nobody: see
+    `reviewer_abandoned_at_ceiling`. It is escalated again — free, no paid leg —
+    which is what puts a fresh event on the dashboard and restores the hold. The
+    escalation re-applies needs-human-review, so the arm is edge-triggered on
+    exactly the same label as every other one here."""
     if cfg.identity_mode == IdentityMode.SOLO:
         return []
     actions: list[Action] = []
@@ -394,6 +543,18 @@ def decide_review(
             continue
         actions.append(RunAgent(kind, pr.number))
     for pr in world.prs:
+        # Before adoption, deliberately: an abandoned-at-ceiling PR matches
+        # `should_adopt` too (no trigger label, no needs-human-review), and
+        # adopting it re-labels and re-dispatches a review that can only skip
+        # (the reviewer's verdict is already on this head) — the silent half of
+        # the keifu #173 dead state. Handing it back to a human wins.
+        if reviewer_abandoned_at_ceiling(pr, cfg):
+            actions.extend(pr_escalation(
+                pr.number,
+                abandoned_escalation_reason(cfg.max_rejections),
+                from_label=cfg.trigger_label,
+            ).actions())
+            continue
         # A rogue PR is adopted AND reviewed the same tick, so the ceiling must be
         # checked here too — otherwise adoption is a second, unbounded entrance to
         # exactly the loop above. No escalation on this arm: the PR carries no

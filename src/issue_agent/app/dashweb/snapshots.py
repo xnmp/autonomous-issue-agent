@@ -46,6 +46,11 @@ _ESCALATION_COMMENT_WINDOW = 4
 OPERATOR_ACTION_STEPS = {
     "operator_unblock": "unblock",
     "operator_relabel": "relabel (operator)",
+    # Dismissing the reviewer's standing change requests is the half of an
+    # unblock that actually re-arms the rejection ceiling; when it FAILS the
+    # unblock still reports ok, so the step is the only place an operator can
+    # see that the PR is still wedged (keifu #173).
+    "operator_dismiss_review": "review re-arm",
 }
 
 
@@ -189,6 +194,13 @@ def _operator_note(action: dict) -> str | None:
     ]
     if action.get("retries_cleared"):
         changes.append("reset retry counters")
+    if "dismissed" in action:
+        review = str(action.get("review_id") or "")
+        changes.append(
+            f"dismissed review {review}".strip()
+            if action.get("dismissed")
+            else f"NOT dismissed: {action.get('detail') or 'unknown'}"
+        )
     return _reason_line("; ".join(changes))
 
 

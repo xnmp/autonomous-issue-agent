@@ -197,6 +197,11 @@ def _unblock_backend(
     pr_labels=(),
     gh_ok=True,
     applied=(True, "ok"),
+    reviews=(),
+    reviews_error=None,
+    dismissed=(True, "ok"),
+    review_bot="reviewer[bot]",
+    pr_state="OPEN",
 ):
     """A Backend whose three role state dirs are real, with a journalled row
     that links issue 7 to `prs` and a GitHub reader that answers with
@@ -222,6 +227,15 @@ def _unblock_backend(
             calls.append((issue, kwargs))
             return applied
 
+        def pr_reviews(self, pr):
+            if reviews_error is not None:
+                raise RuntimeError(reviews_error)
+            return tuple(reviews)
+
+        def dismiss_review(self, pr, review, message):
+            calls.append(("dismiss", pr, review.review_id, message))
+            return dismissed
+
     def factory(repo, state_dirs, *, identity, journal=None):
         calls.append(("factory", journal is not None))
         return Effects()
@@ -239,10 +253,16 @@ def _unblock_backend(
         def prs(self, _repo):
             return ([{
                 "number": pr,
+                "state": pr_state,
                 "labels": [{"name": name} for name in pr_labels],
             } for pr in prs], "")
 
     monkeypatch.setattr(service.system, "remote_repo", lambda _root: "harness/repo")
+    monkeypatch.setattr(
+        cli,
+        "deployment_env_field",
+        lambda _name, field: review_bot if field == "REVIEW_BOT" else "",
+    )
     backend = service.Backend(gh=Gh(), effects_factory=factory)
     monkeypatch.setattr(backend, "known", lambda _name: True)
     monkeypatch.setattr(backend, "overlay_field", lambda _name, _field: "o/r")
@@ -426,3 +446,219 @@ def test_unblock_of_an_unknown_deployment_never_reaches_github(monkeypatch, tmp_
     monkeypatch.setattr(backend, "known", lambda _name: False)
     ok, detail = backend.unblock("nope", 7)
     assert ok is False and "unknown" in detail and calls == []
+
+
+# ── unblock is a re-arm (keifu PR #173 / issue #25, 2026-08-02) ───────────────
+def _rejection(review_id, state="CHANGES_REQUESTED", author="reviewer[bot]"):
+    from issue_agent.domain.review import SubmittedReview
+
+    return SubmittedReview(review_id, state, author, f"2026-08-02T0{review_id}:00:00Z")
+
+
+def _at_ceiling(*ids):
+    """A review history the ceiling (4) is holding: three rejections stand, so
+    the next one can only escalate."""
+    return tuple(_rejection(i) for i in ("1", "2", *ids))
+
+
+def test_unblock_dismisses_the_change_requests_that_still_arm_the_ceiling(
+    monkeypatch, tmp_path
+):
+    """The ceiling is recomputed from GitHub review state, so clearing labels
+    and counters left it tripped: the very next round was at the ceiling again
+    with no attention label to edge-trigger an escalation."""
+    backend, dirs, calls = _unblock_backend(
+        monkeypatch,
+        tmp_path,
+        reviews=(
+            _rejection("1"),
+            _rejection("2", state="APPROVED"),
+            _rejection("3"),
+            _rejection("4"),
+            _rejection("5"),
+            _rejection("6", author="a-human"),
+            _rejection("7", state="COMMENTED"),
+        ),
+    )
+
+    assert backend.unblock("demo", 7) == (True, "ok")
+
+    dismissals = [c for c in calls if c[0] == "dismiss"]
+    # Only the bot's OWN change requests SINCE its last approve: the pre-approve
+    # rejection was satisfied, the human's is not ours to retract, and the
+    # COMMENT is the escalation itself.
+    assert [(c[1], c[2]) for c in dismissals] == [(12, "3"), (12, "4"), (12, "5")]
+    assert "re-arm" in dismissals[0][3]
+
+
+def test_a_live_change_request_below_the_ceiling_is_never_retracted(
+    monkeypatch, tmp_path
+):
+    """An outstanding rejection is the FIXER's next instruction — `domain.fix`
+    dispatches ADDRESS_REVIEW off exactly that state and reads a dismissed
+    review as nothing to do. Retracting one because a rebase or CI breaker held
+    the same issue would destroy the feedback and wedge the PR for good."""
+    backend, dirs, calls = _unblock_backend(
+        monkeypatch, tmp_path, reviews=(_rejection("1"),),
+    )
+
+    assert backend.unblock("demo", 7) == (True, "ok")
+
+    assert [c for c in calls if c[0] == "dismiss"] == []
+    assert [p.kind for p in _journalled(dirs)] == ["operator_unblock"]
+
+
+def test_a_disabled_rejection_ceiling_has_nothing_to_re_arm(monkeypatch, tmp_path):
+    backend, _dirs, calls = _unblock_backend(
+        monkeypatch,
+        tmp_path,
+        reviews=tuple(_rejection(str(n)) for n in range(1, 6)),
+    )
+    monkeypatch.setattr(
+        service.cli,
+        "deployment_env_field",
+        lambda _name, field: "reviewer[bot]" if field == "REVIEW_BOT" else "0",
+    )
+
+    assert backend.unblock("demo", 7) == (True, "ok")
+    assert [c for c in calls if c[0] == "dismiss"] == []
+
+
+def test_each_dismissal_is_journalled_against_the_issue_and_the_pr(
+    monkeypatch, tmp_path
+):
+    backend, dirs, _calls = _unblock_backend(
+        monkeypatch, tmp_path, reviews=_at_ceiling("3"),
+    )
+
+    backend.unblock("demo", 7)
+
+    _one, _two, dismissal, unblock = _journalled(dirs)
+    assert dismissal.kind == "operator_dismiss_review"
+    assert dismissal.target == "pr" and dismissal.number == 12
+    assert dismissal.attributes["review_id"] == "3"
+    assert dismissal.attributes["dismissed"] is True
+    assert dismissal.attributes["operator"] == "o/r:dashboard"
+    assert unblock.kind == "operator_unblock"
+
+
+def test_the_dismissal_fan_out_is_bounded_by_the_configured_ceiling(
+    monkeypatch, tmp_path
+):
+    """One operator click may not turn a pathological review history into an
+    unbounded run of GitHub mutations (ADR 0012)."""
+    backend, _dirs, calls = _unblock_backend(
+        monkeypatch,
+        tmp_path,
+        reviews=tuple(_rejection(str(n)) for n in range(1, 6)),
+    )
+    monkeypatch.setattr(
+        service.cli,
+        "deployment_env_field",
+        lambda _name, field: "reviewer[bot]" if field == "REVIEW_BOT" else "2",
+    )
+
+    backend.unblock("demo", 7)
+
+    assert [c[2] for c in calls if c[0] == "dismiss"] == ["4", "5"]
+
+
+def test_a_healthy_issue_with_no_change_requests_dismisses_nothing(
+    monkeypatch, tmp_path
+):
+    backend, dirs, calls = _unblock_backend(
+        monkeypatch, tmp_path, reviews=(_rejection("1", state="APPROVED"),),
+    )
+
+    backend.unblock("demo", 7)
+
+    assert [c for c in calls if c[0] == "dismiss"] == []
+    (payload,) = _journalled(dirs)
+    assert payload.kind == "operator_unblock"
+
+
+def test_an_issue_with_no_pr_has_nothing_to_re_arm(monkeypatch, tmp_path):
+    backend, dirs, calls = _unblock_backend(
+        monkeypatch, tmp_path, prs=(), reviews=(_rejection("3"),),
+    )
+
+    assert backend.unblock("demo", 7) == (True, "ok")
+    assert [c for c in calls if c[0] == "dismiss"] == []
+    assert [p.kind for p in _journalled(dirs)] == ["operator_unblock"]
+
+
+def test_a_closed_pr_is_not_re_armed(monkeypatch, tmp_path):
+    """A merged/closed PR has no review loop left to unwedge, and GitHub
+    refuses the dismissal anyway."""
+    backend, dirs, calls = _unblock_backend(
+        monkeypatch,
+        tmp_path,
+        pr_state="MERGED",
+        reviews=_at_ceiling("3"),
+    )
+
+    assert backend.unblock("demo", 7) == (True, "ok")
+    assert [c for c in calls if c[0] == "dismiss"] == []
+
+
+def test_unreadable_reviews_are_journalled_and_never_wedge_the_unblock(
+    monkeypatch, tmp_path
+):
+    backend, dirs, calls = _unblock_backend(
+        monkeypatch, tmp_path, reviews_error="gh: 503",
+    )
+    (dirs["fix"] / "issue-7.ci-retries").write_text("3")
+
+    ok, detail = backend.unblock("demo", 7)
+
+    # The operator is told the re-arm did not happen, not just "ok"…
+    assert ok is True and "gh: 503" in detail
+    # …the labels and counters still cleared…
+    assert not (dirs["fix"] / "issue-7.ci-retries").exists()
+    assert [c for c in calls if c[0] != "factory" and c[0] != "dismiss"]
+    # …and the operator can see the ceiling was NOT re-armed.
+    failure, unblock = _journalled(dirs)
+    assert failure.kind == "operator_dismiss_review"
+    assert failure.attributes["dismissed"] is False
+    assert "gh: 503" in failure.attributes["detail"]
+    assert unblock.kind == "operator_unblock"
+
+
+def test_a_failed_dismissal_is_journalled_and_the_labels_still_clear(
+    monkeypatch, tmp_path
+):
+    backend, dirs, calls = _unblock_backend(
+        monkeypatch,
+        tmp_path,
+        reviews=_at_ceiling("3"),
+        dismissed=(False, "OperatorEffectError: 403 forbidden"),
+    )
+    (dirs["fix"] / "issue-7.ci-retries").write_text("3")
+
+    ok, detail = backend.unblock("demo", 7)
+
+    assert ok is True and "403" in detail
+    assert not (dirs["fix"] / "issue-7.ci-retries").exists()
+    assert [c[2] for c in calls if c[0] == "dismiss"] == ["1", "2", "3"]
+    failure = _journalled(dirs)[0]
+    assert failure.attributes["dismissed"] is False
+    assert "403" in failure.attributes["detail"]
+
+
+def test_an_unconfigured_review_bot_says_so_rather_than_dismissing_blindly(
+    monkeypatch, tmp_path
+):
+    """Whose change requests count is the review bot's login; without it the
+    only safe set is the empty one — and an operator must hear that the ceiling
+    is still armed."""
+    backend, dirs, calls = _unblock_backend(
+        monkeypatch, tmp_path, review_bot="", reviews=_at_ceiling("3"),
+    )
+
+    ok, detail = backend.unblock("demo", 7)
+
+    assert ok is True and "REVIEW_BOT" in detail
+    assert [c for c in calls if c[0] == "dismiss"] == []
+    failure, _unblock = _journalled(dirs)
+    assert failure.attributes["dismissed"] is False
+    assert "REVIEW_BOT" in failure.attributes["detail"]
