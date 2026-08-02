@@ -150,30 +150,60 @@ def leg_state(leg: dash.RunSummary) -> str:
 
 
 def collapse_steps(row: dash.IssueRow) -> list[dict]:
-    """The card's compact step strip: one entry per kind, newest state winning,
-    with the kind's costs SUMMED (three FIX_CI attempts cost three legs' money,
-    and a strip that showed only the last one would understate repair spend).
-    Running legs are appended last, in dispatch order."""
-    collapsed: dict[str, dict] = {}
-    for leg in row.legs:
-        entry = collapsed.get(leg.kind)
-        cost = round((entry["cost_usd"] if entry else 0.0) + leg.cost_usd, 4)
-        collapsed[leg.kind] = {
+    """The card's compact story strip: the issue's history in timestamp order,
+    with CONSECUTIVE runs of the same kind folded into one episode — attempts
+    counted, costs SUMMED (three FIX_CI tries are one episode whose cost is
+    three legs' money and whose state is how the last try ended). A kind that
+    recurs after something else ran stays its own episode: "review, fix,
+    review again" is the story the strip exists to tell, and the old
+    one-entry-per-kind collapse erased it. Operator interventions interleave
+    where they happened; running legs close the strip."""
+    ordered = [
+        {
             "kind": leg.kind,
             "state": leg_state(leg),
             "status": leg.status or None,
-            "cost_usd": cost,
+            "cost_usd": leg.cost_usd,
+            "ts": leg.ts,
         }
-    steps = list(collapsed.values())
-    steps.extend(
-        {"kind": r.kind, "state": "running", "status": None, "cost_usd": 0.0}
+        for leg in row.legs
+    ]
+    ordered.extend(
+        {
+            "kind": kind,
+            "state": "done",
+            "status": None,
+            "cost_usd": 0.0,
+            "ts": dash.parse_ts(event.get("ts")),
+        }
+        for event, kind, _note in _operator_steps(row)
+    )
+    ordered.sort(
+        key=lambda step: step["ts"] or datetime.max.replace(tzinfo=timezone.utc)
+    )
+    episodes: list[dict] = []
+    for step in ordered:
+        last = episodes[-1] if episodes else None
+        if last is not None and last["kind"] == step["kind"]:
+            last["count"] += 1
+            last["cost_usd"] = round(last["cost_usd"] + step["cost_usd"], 4)
+            last["state"] = step["state"]
+            last["status"] = step["status"]
+            continue
+        episodes.append(
+            {
+                "kind": step["kind"],
+                "state": step["state"],
+                "status": step["status"],
+                "cost_usd": round(step["cost_usd"], 4),
+                "count": 1,
+            }
+        )
+    episodes.extend(
+        {"kind": r.kind, "state": "running", "status": None, "cost_usd": 0.0, "count": 1}
         for r in row.running
     )
-    steps.extend(
-        {"kind": kind, "state": "done", "status": None, "cost_usd": 0.0}
-        for kind in dict.fromkeys(kind for _event, kind, _note in _operator_steps(row))
-    )
-    return steps
+    return episodes
 
 
 def _label_list(value: object) -> tuple:
@@ -1133,6 +1163,7 @@ def issue_card(
         "pr_url": (gh_pr or {}).get("url"),
         "pr_state": _pr_state(gh_pr),
         "pr_review_state": _pr_review_state(gh_pr),
+        "pr_ci_state": _pr_ci_state(gh_pr),
         "stage": _display_stage(row),
         "attention_reason": _blocked_reason(row),
         "escalation_reason": _escalation_reason(row),
@@ -1173,6 +1204,38 @@ def _pr_state(gh_pr: dict | None) -> str | None:
         return "merged"
     state = str(gh_pr.get("state") or "").lower()
     return state or None
+
+
+_CI_FAILURE = {
+    "FAILURE",
+    "ERROR",
+    "TIMED_OUT",
+    "CANCELLED",
+    "ACTION_REQUIRED",
+    "STARTUP_FAILURE",
+}
+_CI_SUCCESS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+
+
+def _pr_ci_state(gh_pr: dict | None) -> str | None:
+    """CI's one-word answer for the PR chip: failing beats pending beats
+    passing, and no checks (or an unreadable rollup) is None — an unknown must
+    render as no signal, never as green."""
+    checks = (gh_pr or {}).get("statusCheckRollup")
+    if not isinstance(checks, list):
+        return None
+    verdicts = [
+        str(check.get("conclusion") or check.get("state") or "").upper()
+        for check in checks
+        if isinstance(check, dict)
+    ]
+    if not verdicts:
+        return None
+    if any(verdict in _CI_FAILURE for verdict in verdicts):
+        return "failing"
+    if all(verdict in _CI_SUCCESS for verdict in verdicts):
+        return "passing"
+    return "pending"
 
 
 def _pr_review_state(gh_pr: dict | None) -> str | None:

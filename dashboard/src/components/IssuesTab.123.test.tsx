@@ -14,7 +14,7 @@ const card: IssueCard = {
   pr_state: null,
   stage: "blocked",
   done: false,
-  steps: [{ kind: "RESUME", state: "running", status: null, cost_usd: null }],
+  steps: [{ kind: "RESUME", state: "running", status: null, cost_usd: null, count: 1 }],
   cost_usd: 2,
   estimated: false,
   projected_cost_usd: 2,

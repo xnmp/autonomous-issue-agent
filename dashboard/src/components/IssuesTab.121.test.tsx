@@ -15,7 +15,7 @@ const card: IssueCard = {
   stage: "awaiting human reply",
   attention_reason: "Choose endpoint A or B.",
   done: false,
-  steps: [{ kind: "RESUME", state: "blocked", status: "blocked", cost_usd: 2 }],
+  steps: [{ kind: "RESUME", state: "blocked", status: "blocked", cost_usd: 2, count: 1 }],
   cost_usd: 2,
   estimated: false,
   projected_cost_usd: 2,

@@ -15,7 +15,7 @@ const doneCard: IssueCard = {
   pr_state: "merged",
   stage: "done",
   done: true,
-  steps: [{ kind: "RESOLVE", state: "ok", status: "ok", cost_usd: 2 }],
+  steps: [{ kind: "RESOLVE", state: "ok", status: "ok", cost_usd: 2, count: 1 }],
   cost_usd: 2,
   estimated: false,
   projected_cost_usd: 2,

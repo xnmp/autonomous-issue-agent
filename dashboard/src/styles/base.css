@@ -376,6 +376,24 @@ button {
   gap: var(--s1);
   flex-wrap: wrap;
 }
+/* The tasks cell reads left-to-right as time: episode chips joined by faint
+   chevrons, a condensed rendering of the drill-down's chronological steps. */
+.step-flow {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  flex-wrap: wrap;
+}
+.step-arrow {
+  color: var(--ink-faint);
+  font-size: 0.85em;
+  user-select: none;
+}
+.step-count {
+  margin-left: 0.3em;
+  opacity: 0.75;
+  font-size: 0.85em;
+}
 .col {
   display: flex;
   flex-direction: column;

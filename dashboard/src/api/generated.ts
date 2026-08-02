@@ -284,6 +284,11 @@ export interface components {
         CardStep: {
             /** Cost Usd */
             cost_usd: number | null;
+            /**
+             * Count
+             * @default 1
+             */
+            count: number;
             /** Kind */
             kind: string;
             /** State */
@@ -447,6 +452,8 @@ export interface components {
             models: string[];
             /** Pr */
             pr: number | null;
+            /** Pr Ci State */
+            pr_ci_state?: ("passing" | "failing" | "pending") | null;
             /** Pr Review State */
             pr_review_state?: ("mergeable" | "changes_requested") | null;
             /** Pr State */

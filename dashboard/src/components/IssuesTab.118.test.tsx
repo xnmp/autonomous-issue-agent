@@ -17,7 +17,7 @@ const card: IssueCard = {
   human_wait_since_ts: new Date(Date.now() - 310_000).toISOString(),
   human_wait_s: 310,
   done: false,
-  steps: [{ kind: "REVIEW", state: "ok", status: "APPROVE", cost_usd: 2 }],
+  steps: [{ kind: "REVIEW", state: "ok", status: "APPROVE", cost_usd: 2, count: 1 }],
   cost_usd: 2,
   estimated: false,
   projected_cost_usd: 2,
@@ -83,6 +83,7 @@ describe("human-owned actions", () => {
         state: "blocked",
         status: "blocked",
         cost_usd: 2,
+        count: 1,
       }],
     };
 

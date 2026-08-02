@@ -52,6 +52,7 @@ const ModelBadge = z
 const CardStep = z
   .object({
     cost_usd: z.union([z.number(), z.null()]),
+    count: z.number().int().optional().default(1),
     kind: z.string(),
     state: z.string(),
     status: z.union([z.string(), z.null()]),
@@ -82,6 +83,9 @@ const IssueCard = z
     model_badges: z.array(ModelBadge).optional().default([]),
     models: z.array(z.string()),
     pr: z.union([z.number(), z.null()]),
+    pr_ci_state: z
+      .union([z.enum(["passing", "failing", "pending"]), z.null()])
+      .optional(),
     pr_review_state: z
       .union([z.enum(["mergeable", "changes_requested"]), z.null()])
       .optional(),

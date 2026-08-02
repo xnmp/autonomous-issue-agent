@@ -172,6 +172,8 @@ class CardStep(Contract):
     state: str
     status: str | None
     cost_usd: float | None
+    # Consecutive same-kind attempts folded into this episode (retries).
+    count: int = 1
 
 
 class ModelBadge(Contract):
@@ -190,6 +192,9 @@ class IssueCard(Contract):
     pr_url: str | None
     pr_state: str | None
     pr_review_state: Literal["mergeable", "changes_requested"] | None = None
+    # None when the PR has no checks or the rollup was unreadable: the chip
+    # must show no CI signal rather than a guessed green.
+    pr_ci_state: Literal["passing", "failing", "pending"] | None = None
     stage: str | None
     attention_reason: str | None = None
     escalation_reason: str | None = None

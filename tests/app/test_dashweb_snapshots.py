@@ -236,7 +236,50 @@ def test_a_running_leg_is_appended_as_a_running_step():
     events = [RESOLVE, {"ts": ts(minutes=5), "event": "agent_run_start", "role": "fix",
                         "kind": "REVIEW", "number": 12, "issue": 7, "dispatch": "d1"}]
     steps = snapshots.collapse_steps(row_for(events, 7))
-    assert steps[-1] == {"kind": "REVIEW", "state": "running", "status": None, "cost_usd": 0.0}
+    assert steps[-1] == {"kind": "REVIEW", "state": "running", "status": None,
+                         "cost_usd": 0.0, "count": 1}
+
+
+def test_the_strip_keeps_a_recurring_kind_as_separate_episodes():
+    # review → fix → review again is the story; the old one-entry-per-kind
+    # collapse folded both reviews into one chip and erased it.
+    review_1 = {"ts": ts(hours=3), "event": "agent_run", "role": "review",
+                "kind": "REVIEW", "number": 12, "issue": 7, "cost_usd": 0.2,
+                "status": "REQUEST_CHANGES", "exit_reason": "ok"}
+    fix = {"ts": ts(hours=2), "event": "agent_run", "role": "fix",
+           "kind": "ADDRESS_REVIEW", "number": 12, "issue": 7, "cost_usd": 1.0,
+           "exit_reason": "ok"}
+    review_2 = {"ts": ts(hours=1), "event": "agent_run", "role": "review",
+                "kind": "REVIEW", "number": 12, "issue": 7, "cost_usd": 0.3,
+                "status": "APPROVE", "exit_reason": "ok"}
+    steps = snapshots.collapse_steps(row_for([review_1, fix, review_2], 7))
+    assert [(s["kind"], s["count"]) for s in steps] == [
+        ("REVIEW", 1), ("ADDRESS_REVIEW", 1), ("REVIEW", 1)
+    ]
+    assert steps[0]["status"] == "REQUEST_CHANGES"
+    assert steps[2]["status"] == "APPROVE"
+
+
+def test_consecutive_retries_fold_into_one_episode_with_count_and_summed_cost():
+    steps = snapshots.collapse_steps(row_for([RESOLVE, FIX_CI_1, FIX_CI_2], 7))
+    episode = next(s for s in steps if s["kind"] == "FIX_CI")
+    assert episode["count"] == 2
+    assert episode["cost_usd"] == 1.5
+    assert episode["state"] == "ok"
+
+
+def test_the_strip_interleaves_an_intervention_where_it_happened():
+    mid_unblock = {
+        "ts": ts(hours=2, minutes=30), "event": "action", "issue": 7,
+        "role": "dashboard",
+        "desc": "operator unblock issue #7",
+        "action": {"type": "operator_unblock", "target": "ISSUE", "number": 7,
+                   "add": [], "remove": ["needs-human-review"]},
+    }
+    row = row_view([mid_unblock], legs=[RESOLVE, FIX_CI_1, FIX_CI_2])
+    assert [(s["kind"], s["count"]) for s in snapshots.collapse_steps(row)] == [
+        ("RESOLVE", 1), ("unblock", 1), ("FIX_CI", 2)
+    ]
 
 
 def test_detailed_steps_keep_every_retry_and_carry_the_drill_down_fields():
@@ -1307,6 +1350,42 @@ def test_unknown_or_unreadable_review_data_claims_nothing(pr_fields):
 
 def test_a_card_with_no_pull_request_has_no_review_state():
     assert snapshots.issue_card(row_for([RESOLVE], 7), NOW)["pr_review_state"] is None
+
+
+# ── PR CI state ───────────────────────────────────────────────────────────────
+def test_all_green_checks_read_as_passing():
+    card = review_card(statusCheckRollup=[
+        {"conclusion": "SUCCESS"}, {"conclusion": "SKIPPED"}, {"state": "NEUTRAL"},
+    ])
+    assert card["pr_ci_state"] == "passing"
+
+
+@pytest.mark.parametrize(
+    "verdict", ["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"]
+)
+def test_one_bad_check_reads_as_failing_even_beside_greens_and_pendings(verdict):
+    card = review_card(statusCheckRollup=[
+        {"conclusion": "SUCCESS"}, {"conclusion": verdict}, {"state": "PENDING"},
+    ])
+    assert card["pr_ci_state"] == "failing"
+
+
+def test_a_still_running_check_reads_as_pending_not_passing():
+    card = review_card(statusCheckRollup=[
+        {"conclusion": "SUCCESS"}, {"state": "IN_PROGRESS", "conclusion": None},
+    ])
+    assert card["pr_ci_state"] == "pending"
+
+
+@pytest.mark.parametrize(
+    "rollup", [None, [], "nonsense", [7, "not-a-check"], [{}]],
+)
+def test_missing_or_unreadable_checks_claim_no_ci_state(rollup):
+    # [{}] normalises to one empty verdict, which must not read as green.
+    card = review_card(statusCheckRollup=rollup)
+    assert card["pr_ci_state"] in (None, "pending")
+    if rollup in (None, [], "nonsense"):
+        assert card["pr_ci_state"] is None
 
 
 # ── hourly spend ──────────────────────────────────────────────────────────────

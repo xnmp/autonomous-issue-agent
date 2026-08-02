@@ -15,7 +15,7 @@ const base: IssueCard = {
   pr_state: null,
   stage: "escalated",
   done: false,
-  steps: [{ kind: "RESOLVE", state: "ok", status: "ok", cost_usd: 1 }],
+  steps: [{ kind: "RESOLVE", state: "ok", status: "ok", cost_usd: 1, count: 1 }],
   cost_usd: 1,
   estimated: false,
   projected_cost_usd: 2,

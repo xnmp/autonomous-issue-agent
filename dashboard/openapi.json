@@ -215,6 +215,11 @@
             ],
             "title": "Cost Usd"
           },
+          "count": {
+            "default": 1,
+            "title": "Count",
+            "type": "integer"
+          },
           "kind": {
             "title": "Kind",
             "type": "string"
@@ -832,6 +837,22 @@
               }
             ],
             "title": "Pr"
+          },
+          "pr_ci_state": {
+            "anyOf": [
+              {
+                "enum": [
+                  "passing",
+                  "failing",
+                  "pending"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr Ci State"
           },
           "pr_review_state": {
             "anyOf": [

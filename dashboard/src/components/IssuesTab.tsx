@@ -1188,13 +1188,24 @@ const TimeSinceDone = memo(function TimeSinceDone({ card }: { card: IssueCard })
 function PrLink({ card }: { card: IssueCard }) {
   if (card.pr === null) return null;
   const review = prReviewMark(card.pr_review_state);
+  // The chip's number is CI's answer at a glance: green passing, red failing,
+  // amber running. No checks or unknown → inherit, claiming nothing.
+  const ciTone =
+    card.pr_ci_state === "passing" ? "ok"
+    : card.pr_ci_state === "failing" ? "fail"
+    : card.pr_ci_state === "pending" ? "running"
+    : null;
   const chip = (
     <Chip
       tone={prStateTone(card.pr_state)}
       square
-      title={[card.pr_state ?? "pull request", review?.label].filter(Boolean).join(" · ")}
+      title={[
+        card.pr_state ?? "pull request",
+        card.pr_ci_state ? `CI ${card.pr_ci_state}` : null,
+        review?.label,
+      ].filter(Boolean).join(" · ")}
     >
-      PR #{card.pr}
+      <span className={ciTone ? `tone-${ciTone}` : undefined}>PR #{card.pr}</span>
       {review ? (
         <span className={`pr-review-mark tone-${review.tone}`} role="img" aria-label={review.label}>
           {review.glyph}
