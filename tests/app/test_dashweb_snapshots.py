@@ -945,6 +945,76 @@ def test_working_time_stops_accruing_once_the_issue_is_on_a_human():
     assert card["human_wait_s"] == 7_200  # and still waiting, live
 
 
+def test_the_clock_freezes_without_any_github_label_view():
+    """keifu PRs #173/#177 (2026-08-02): the escalation relabel lived on the
+    PR, and the schema-v2 enrichment strips PRs to title/url — so the row read
+    "escalated" while the work clock ran to NOW. The journal alone must freeze
+    the clock."""
+    events = [
+        {"ts": ts(hours=3), "event": "agent_run_start", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
+        RESOLVE,
+        {"ts": ts(hours=2), "event": "action", "role": "review", "issue": 7,
+         "desc": "relabel pr #12: -ai-pr-open +needs-human-review"},
+    ]
+    card = snapshots.issue_card(
+        row_view(events), NOW,
+        gh_issue={"title": "t", "url": "u"},   # v2 enrichment: no labels
+        gh_prs={12: {"title": "t", "url": "u"}},
+    )
+
+    assert card["human_action"] == "escalated"
+    assert card["elapsed_s"] == 3_600
+    assert card["human_wait_s"] == 7_200
+
+
+def test_a_lifecycle_add_resumes_the_clock_after_an_escalation():
+    events = [
+        {"ts": ts(hours=3), "event": "agent_run_start", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
+        RESOLVE,
+        {"ts": ts(hours=2), "event": "action", "role": "review", "issue": 7,
+         "desc": "relabel pr #12: -ai-pr-open +needs-human-review"},
+        {"ts": ts(hours=1), "event": "action", "role": "fix", "issue": 7,
+         "desc": "relabel issue #7: -ai-ready +ai-working"},
+    ]
+    card = snapshots.issue_card(row_view(events), NOW)
+    assert card["human_action"] is None
+    assert card["human_wait_s"] is None
+
+
+def test_an_operator_unblock_event_resumes_the_clock():
+    events = [
+        {"ts": ts(hours=3), "event": "agent_run_start", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
+        RESOLVE,
+        {"ts": ts(hours=2), "event": "action", "role": "review", "issue": 7,
+         "desc": "relabel pr #12: -ai-pr-open +needs-human-review"},
+        {"ts": ts(hours=1), "event": "action", "role": "fix", "issue": 7,
+         "desc": "operator unblock issue #7: -needs-human-review"},
+    ]
+    card = snapshots.issue_card(row_view(events), NOW)
+    assert card["human_action"] is None
+
+
+def test_a_journal_block_freezes_the_clock_and_a_cleared_one_does_not():
+    start = {"ts": ts(hours=3), "event": "agent_run_start", "role": "fix",
+             "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"}
+    blocked = {"ts": ts(hours=2), "event": "action", "role": "fix", "issue": 7,
+               "desc": "relabel issue #7: -ai-working +ai-blocked"}
+    card = snapshots.issue_card(row_view([start, RESOLVE, blocked]), NOW)
+    assert card["human_action"] == "awaiting-reply"
+    assert card["elapsed_s"] == 3_600
+
+    cleared = {"ts": ts(hours=1), "event": "action", "role": "fix", "issue": 7,
+               "desc": "relabel issue #7: -ai-blocked +ai-working"}
+    card = snapshots.issue_card(
+        row_view([start, RESOLVE, blocked, cleared]), NOW
+    )
+    assert card["human_action"] is None
+    assert card["human_wait_s"] is None
+
+
 def test_the_detail_view_freezes_the_same_clock_as_the_card():
     events = [
         {"ts": ts(hours=3), "event": "agent_run_start", "role": "fix",

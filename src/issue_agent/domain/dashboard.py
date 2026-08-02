@@ -56,6 +56,9 @@ ISSUE_NUMBERED = RESOLVE_KINDS | STEWARD_KINDS
 # fields to read. Parsing the sentence back is the only way to attribute those
 # events to an issue, so the grammar lives here, in one place, table-tested.
 _RE_RELABEL = re.compile(r"^relabel (issue|pr) #(\d+): (.*)$")
+# The dashboard's journaled unblock is semantically a relabel (removal-only);
+# parsing it as one lets attention-stage/clock derivations see the clear.
+_RE_OPERATOR_UNBLOCK = re.compile(r"^operator unblock (issue|pr) #(\d+): (.*)$")
 _RE_DISPATCH = re.compile(r"^dispatch ([A-Z_]+) #(\d+)$")
 _RE_CLEAR = re.compile(
     r"^clear state for pr #(\d+)(?:, issue #(\d+))? \((merged|closed-unmerged)\)$"
@@ -90,7 +93,7 @@ def parse_action(desc: str) -> ActionFact | None:
     dashboard one unattributed event rather than a crash.
     """
     desc = (desc or "").strip()
-    m = _RE_RELABEL.match(desc)
+    m = _RE_RELABEL.match(desc) or _RE_OPERATOR_UNBLOCK.match(desc)
     if m:
         target, number, moves = m.group(1), int(m.group(2)), m.group(3)
         added = tuple(t[1:] for t in moves.split() if t.startswith("+"))

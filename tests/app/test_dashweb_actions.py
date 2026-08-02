@@ -308,18 +308,25 @@ def test_an_unblock_journals_one_event_naming_what_it_actually_reset(
 def test_a_counter_reset_is_journalled_even_when_github_changed_nothing(
     monkeypatch, tmp_path
 ):
-    """The hold lives on the PR, so the issue's own labels already match and
-    the GitHub edit is a no-op — the breakers were still reset, and an
-    intervention with no trace is exactly what this feature exists to end."""
-    backend, dirs, _calls = _unblock_backend(
+    """The hold lives on the PR (keifu #173/#177): the PR's own labels must be
+    removed — an unblock that edits only the issue returns ok while the
+    reviewer stays withheld — and the breaker reset still journals."""
+    backend, dirs, calls = _unblock_backend(
         monkeypatch, tmp_path, issue_labels=(), pr_labels=("needs-human-review",),
     )
     (dirs["fix"] / "issue-7.ci-retries").write_text("3")
 
     assert backend.unblock("demo", 7)[0] is True
 
-    (payload,) = _journalled(dirs)
-    assert payload.attributes["retries_cleared"] == 1
+    label_edits = [c for c in calls if c[0] != "factory"]
+    assert label_edits == [
+        (12, {"add": (), "remove": ("needs-human-review",)})
+    ]
+    issue_event, pr_event = _journalled(dirs)
+    assert issue_event.attributes["retries_cleared"] == 1
+    assert pr_event.target == "pr"
+    assert pr_event.attributes["remove"] == ["needs-human-review"]
+    assert "pr #12" in pr_event.display
 
 
 def test_a_refused_unblock_journals_nothing_and_resets_nothing(

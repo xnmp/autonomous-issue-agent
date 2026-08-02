@@ -372,10 +372,10 @@ class Backend:
         repo = self.overlay_field(name, "REPO")
         if not repo:
             return False, f"no REPO configured for deployment '{name}'"
-        held, unreadable = self._attention_labels(name, repo, number)
+        held, pr_held, unreadable = self._attention_labels(name, repo, number)
         if unreadable:
             return False, unreadable
-        if not held:
+        if not held and not pr_held:
             return False, f"nothing to unblock on #{number}"
         add, remove = actions.unblock_change()
         # Counters first: a cleared counter with the labels still on holds the
@@ -386,13 +386,30 @@ class Backend:
         # because the counter reset happened whatever GitHub then did with the
         # labels — including the no-op path, which emits nothing of its own.
         effects = self._operator_effects(name, repo, journalled=False)
-        applied, detail = effects.set_issue_labels(number, add=add, remove=remove)
-        self._journal_unblock(name, repo, number, held, cleared, applied)
+        applied, detail = True, "ok"
+        if held:
+            applied, detail = effects.set_issue_labels(
+                number, add=add, remove=remove
+            )
+        # PR-level escalations hold the PR, not the issue (keifu #173/#177,
+        # 2026-08-02: unblock returned ok while the PR kept
+        # needs-human-review and the reviewer stayed withheld). Remove only
+        # the labels each PR actually carries — an unfiltered DELETE 404s
+        # and settles unknown_outcome.
+        for pr, labels in pr_held.items():
+            pr_applied, pr_detail = effects.set_issue_labels(
+                pr, add=(), remove=labels
+            )
+            if not pr_applied:
+                applied, detail = False, f"pr #{pr}: {pr_detail}"
+        self._journal_unblock(
+            name, repo, number, held, cleared, applied, pr_held=pr_held
+        )
         return applied, detail
 
     def _attention_labels(
         self, name: str, repo: str, number: int
-    ) -> tuple[tuple[str, ...], str]:
+    ) -> tuple[tuple[str, ...], dict[int, tuple[str, ...]], str]:
         """The labels currently holding this issue (or its PRs) on a human, and
         a detail when they cannot be read at all.
 
@@ -403,19 +420,27 @@ class Backend:
         try:
             gh_issues, gh_prs, warnings = self._gh_context(repo)
         except Exception as exc:  # noqa: BLE001 - operator-facing result
-            return (), f"could not read labels for #{number}: {exc}"
+            return (), {}, f"could not read labels for #{number}: {exc}"
         issue = gh_issues.get(number)
         if issue is None:
-            return (), (
+            return (), {}, (
                 warnings[0] if warnings
                 else f"issue #{number} is not open on {repo}"
             )
-        labels = set(snapshots.labels_of(issue))
+        issue_held = tuple(
+            label
+            for label in actions.UNBLOCK_LABELS
+            if label in set(snapshots.labels_of(issue))
+        )
+        pr_held: dict[int, tuple[str, ...]] = {}
         for pr in self._issue_prs(name, number):
-            labels.update(snapshots.labels_of(gh_prs.get(pr) or {}))
-        return tuple(
-            label for label in actions.UNBLOCK_LABELS if label in labels
-        ), ""
+            labels = set(snapshots.labels_of(gh_prs.get(pr) or {}))
+            held = tuple(
+                label for label in actions.UNBLOCK_LABELS if label in labels
+            )
+            if held:
+                pr_held[pr] = held
+        return issue_held, pr_held, ""
 
     def _journal_unblock(
         self,
@@ -425,10 +450,14 @@ class Backend:
         held: tuple[str, ...],
         cleared: int,
         applied: bool,
+        pr_held: dict[int, tuple[str, ...]] | None = None,
     ) -> None:
         journal = self._operator_journal(name, repo)
         if journal is None:
             return
+        # One desc per target so parse_action sees each clear (the PR's labels
+        # are what actually held keifu #173/#177); the issue desc leads.
+        removed = " ".join(f"-{label}" for label in held)
         try:
             journal.emit(
                 TelemetryEvent(
@@ -437,7 +466,7 @@ class Backend:
                         "operator_unblock",
                         "issue",
                         f"operator unblock issue #{number}: "
-                        + " ".join(f"-{label}" for label in held),
+                        + (removed or "(none)"),
                         number,
                         {
                             "add": [],
@@ -450,6 +479,26 @@ class Backend:
                     Correlation(issue=number),
                 )
             )
+            for pr, labels in (pr_held or {}).items():
+                journal.emit(
+                    TelemetryEvent(
+                        ActionApplied(
+                            f"operator-unblock:{uuid.uuid4().hex}",
+                            "operator_unblock",
+                            "pr",
+                            f"operator unblock pr #{pr}: "
+                            + " ".join(f"-{label}" for label in labels),
+                            pr,
+                            {
+                                "add": [],
+                                "remove": list(labels),
+                                "operator": f"{repo}:dashboard",
+                                "labels_applied": applied,
+                            },
+                        ),
+                        Correlation(issue=number, pr=pr),
+                    )
+                )
         except Exception:  # noqa: BLE001 - telemetry never fails the action
             pass
 

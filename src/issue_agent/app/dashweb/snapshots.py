@@ -837,6 +837,62 @@ def _merge_ready_since(pr: dict) -> datetime | None:
     return max(stamps, default=dash.parse_ts(pr.get("updatedAt")))
 
 
+def _journal_attention_at(
+    row: dash.IssueRow,
+) -> tuple[str | None, datetime | None]:
+    """Human-attention stamp from the row's own journal, label views unseen.
+
+    Escalations (event or +needs-human-review/+needs-budget-review relabel)
+    and blocks (+ai-blocked relabel) are tracked separately: removing one
+    label class must not clear the other's stamp. An active escalation wins
+    over an active block — the escalation is the harder stop.
+    """
+    escalated_at: datetime | None = None
+    blocked_at: datetime | None = None
+    for event in row.events:
+        name = event.get("event")
+        if name == "escalation":
+            escalated_at = dash.parse_ts(event.get("ts"))
+            continue
+        if name != "action":
+            continue
+        fact = dash.parse_action(str(event.get("desc") or ""))
+        if fact is None:
+            continue
+        if fact.verb == "clear":
+            # A closed/merged PR ends the attention hold the same way the
+            # stage derivation treats it; the re-queue may be an unjournalled
+            # GitHub write, so waiting for a label removal freezes forever.
+            escalated_at = None
+            blocked_at = None
+            continue
+        if fact.verb != "relabel":
+            continue
+        added, removed = set(fact.added), set(fact.removed)
+        stamp = dash.parse_ts(event.get("ts"))
+        # An add with an unparseable ts must not read as "no escalation".
+        if added & {"needs-human-review", "needs-budget-review"} and stamp:
+            escalated_at = stamp
+        if "ai-blocked" in added and stamp:
+            blocked_at = stamp
+        if removed & {"needs-human-review", "needs-budget-review"}:
+            escalated_at = None
+        if "ai-blocked" in removed:
+            blocked_at = None
+        # A later lifecycle label supersedes attention wholesale: the daemon
+        # re-derives queued/working/pr-open AFTER an operator clears the hold
+        # (the clearing itself may be an unjournalled GitHub write), so the
+        # add is the journal's proof the issue resumed.
+        if added & {"ai-ready", "ai-working", "ai-pr-open", "ai-done"}:
+            escalated_at = None
+            blocked_at = None
+    if escalated_at is not None:
+        return "escalated", escalated_at
+    if blocked_at is not None:
+        return "awaiting-reply", blocked_at
+    return None, None
+
+
 def _active_escalation_at(row: dash.IssueRow) -> datetime | None:
     """Newest escalation not superseded by a recorded label transition."""
     active_at: datetime | None = None
@@ -891,6 +947,15 @@ def _human_action(
     ]
     if prompt_times:
         return "awaiting-reply", max(prompt_times)
+    # Journal-truth fallback: the schema-v2 GitHub enrichment strips PR labels
+    # (title/url only), so a PR-level escalation or block was invisible to the
+    # arms above — the row read "escalated" (journal) while the work clock ran
+    # to NOW (keifu PRs #173/#177, 2026-08-02). The journal is authority; an
+    # escalation/block it records and never clears freezes the clock even when
+    # no GitHub label view carries it.
+    journal_kind, journal_at = _journal_attention_at(row)
+    if journal_kind is not None and journal_at is not None:
+        return journal_kind, journal_at
     if (
         gh_pr
         and str(gh_pr.get("state") or "").upper() == "OPEN"
