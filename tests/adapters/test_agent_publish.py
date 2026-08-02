@@ -35,6 +35,8 @@ class Remote:
         self.pr_head = ""
         self.pr_base = ""
         self.pr_auto_merge = False
+        self.pr_body = "## Acceptance Criteria\n- [ ] a\n\nFixes #42"
+        self.body_view_fails = False
         self.effects = []
         self.crash_after_push = False
         self.intervene_before_push = ""
@@ -100,6 +102,15 @@ class Remote:
                 else "[]"
             )
             return CommandResult(0, output)
+        if argv[:3] == ("gh", "pr", "view") and "--json" in argv:
+            if self.body_view_fails:
+                return CommandResult(1, "", "not found")
+            return CommandResult(0, json.dumps({"body": self.pr_body}))
+        if argv[:3] == ("gh", "pr", "edit"):
+            self.effects.append(argv)
+            # GitHub stores CRLF for content submitted with LF.
+            self.pr_body = argv[argv.index("--body") + 1].replace("\n", "\r\n")
+            return CommandResult(0, "https://example.test/pull/42\n")
         if argv[:3] == ("gh", "pr", "create"):
             self.effects.append(argv)
             self.pr = "https://example.test/pull/42"
@@ -1152,3 +1163,465 @@ def test_publication_environment_without_gh_still_forbids_prompts(monkeypatch):
     env = agent_publish._publication_environment("/usr/bin", host="github.com")
     assert "GIT_CONFIG_COUNT" not in env
     assert env["GIT_TERMINAL_PROMPT"] == "0"
+
+
+
+# ── PR body updates (keifu #177 / issue #162, 2026-08-02) ────────────────────
+# An address-review leg was required by its reviewer to map an evidence
+# screenshot to an acceptance criterion in the PR BODY, had no brokered
+# operation for it, and escalated to a human who ran the PATCH by hand.
+
+# Every replacement body must still satisfy the create-time PR body gate, so
+# the fixtures below are gate-valid unless a test is about that rule.
+GOOD_BODY = "## Acceptance Criteria\n- [x] a ![ac](evidence/a.png)\n\nFixes #42"
+
+
+def _open_pr(remote: Remote) -> Remote:
+    remote.pr = "https://example.test/pull/42"
+    remote.pr_state = "OPEN"
+    return remote
+
+
+def test_body_update_on_own_pr_is_committed_then_receipted(tmp_path):
+    remote = _open_pr(Remote())
+    control = store(tmp_path)
+    events = EventLog(
+        str(tmp_path / "events-v2.jsonl"),
+        Producer("deployment", "o/r", "fix", 123, "boot"),
+    )
+    control.bind_event_outbox(
+        events.prepare,
+        events.append_committed,
+        destination=events.producer.feed_identity,
+    )
+    publisher = AgentPublicationBroker(
+        control,
+        repository="o/r",
+        base_branch="dev",
+        owner="o/r:fix",
+        run=remote.run,
+    )
+
+    result = publisher.publish(
+        ("gh", "pr", "edit", "42", "--body", GOOD_BODY), str(tmp_path)
+    )
+
+    assert result.code == 0
+    assert remote.pr_body == GOOD_BODY.replace("\n", "\r\n")
+    edit = next(e for e in remote.effects if e[:3] == ("gh", "pr", "edit"))
+    # The durable command pins the repository regardless of what the child said.
+    assert edit[3] == "42"
+    assert edit[edit.index("--repo") + 1] == "github.com/o/r"
+
+    with control._connect() as db:
+        kind, state, target = db.execute(
+            "SELECT kind, state, target FROM lifecycle_commands"
+        ).fetchone()
+        status, remote_object = db.execute(
+            "SELECT status, remote_object_id FROM effect_receipts"
+        ).fetchone()
+    assert kind == CommandKind.UPDATE_PULL_REQUEST_BODY.value
+    assert state == "succeeded"
+    assert target == "pull-request-body:o/r:42"
+    assert (status, remote_object) == ("succeeded", "42")
+
+    emitted = tuple(
+        decode_event_line(line)
+        for line in Path(events.path).read_text().splitlines()
+    )
+    transitions = [
+        event
+        for event in emitted
+        if isinstance(event.payload, ControlTransitionCommitted)
+        and event.payload.entity_kind == "lifecycle_command"
+    ]
+    assert [event.payload.state for event in transitions] == [
+        "pending",
+        "executing",
+        "succeeded",
+    ]
+    # Journalled with BOTH correlation identifiers, on the fold the dashboard
+    # actually reads — not merely inside the command payload. The `executing`
+    # transition is exempt: `begin_command_execution` is keyed by command id
+    # alone and emits an empty correlation for EVERY kind, which is a
+    # pre-existing gap this change does not widen.
+    correlations = {
+        (event.correlation.issue, event.correlation.pr)
+        for event in transitions
+    }
+    assert (42, 42) in correlations
+    assert correlations <= {(42, 42), (None, None)}
+
+
+def test_body_update_correlates_the_issue_its_branch_names(tmp_path):
+    """Issue and PR correlation are distinct fields, so a fixture where both
+    happen to be 42 cannot show the issue is really derived from the branch."""
+    remote = _open_pr(Remote())
+    remote.branch = "fix/7-issue"
+    control = store(tmp_path)
+    events = EventLog(
+        str(tmp_path / "events-v2.jsonl"),
+        Producer("deployment", "o/r", "fix", 123, "boot"),
+    )
+    control.bind_event_outbox(
+        events.prepare,
+        events.append_committed,
+        destination=events.producer.feed_identity,
+    )
+    publisher = AgentPublicationBroker(
+        control,
+        repository="o/r",
+        base_branch="dev",
+        owner="o/r:fix",
+        run=remote.run,
+    )
+
+    assert publisher.publish(
+        ("gh", "pr", "edit", "42", "--body", GOOD_BODY), str(tmp_path)
+    ).code == 0
+
+    correlations = {
+        (event.correlation.issue, event.correlation.pr)
+        for event in (
+            decode_event_line(line)
+            for line in Path(events.path).read_text().splitlines()
+        )
+        if isinstance(event.payload, ControlTransitionCommitted)
+        and event.payload.entity_kind == "lifecycle_command"
+    }
+    assert (7, 42) in correlations          # branch names the issue, not the PR
+    assert correlations <= {(7, 42), (None, None)}
+
+
+@pytest.mark.parametrize("number", ("41", "43", "1", "999999"))
+def test_body_update_refuses_a_pull_request_this_run_does_not_own(
+    tmp_path, number
+):
+    remote = _open_pr(Remote())
+    original = remote.pr_body
+
+    with pytest.raises(ValueError, match="own PR"):
+        broker(tmp_path, remote).publish(
+            ("gh", "pr", "edit", number, "--body", GOOD_BODY), str(tmp_path)
+        )
+
+    assert remote.pr_body == original
+    assert not any(e[:3] == ("gh", "pr", "edit") for e in remote.effects)
+
+
+def test_body_update_refuses_an_own_branch_pr_onto_another_base(tmp_path):
+    """`--head <branch>` alone can match a second open PR aimed at another
+    base; only the PR onto the approved base belongs to this run."""
+    remote = _open_pr(Remote())
+    remote.pr_base = "main"
+    original = remote.pr_body
+
+    with pytest.raises(ValueError, match="own PR"):
+        broker(tmp_path, remote).publish(
+            ("gh", "pr", "edit", "42", "--body", GOOD_BODY), str(tmp_path)
+        )
+
+    assert remote.pr_body == original
+
+
+def test_body_update_refuses_a_cross_repository_selector(tmp_path):
+    remote = _open_pr(Remote())
+    original = remote.pr_body
+
+    with pytest.raises(ValueError):
+        broker(tmp_path, remote).publish(
+            (
+                "gh",
+                "pr",
+                "edit",
+                "https://github.com/attacker/other/pull/42",
+                "--body",
+                GOOD_BODY,
+            ),
+            str(tmp_path),
+        )
+    assert remote.pr_body == original
+
+
+def test_body_update_pins_repository_even_when_the_child_names_another(
+    tmp_path,
+):
+    remote = _open_pr(Remote())
+
+    result = broker(tmp_path, remote).publish(
+        ("gh", "pr", "edit", "42", "-Rattacker/other", "--body", GOOD_BODY),
+        str(tmp_path),
+    )
+
+    assert result.code == 0
+    edit = next(e for e in remote.effects if e[:3] == ("gh", "pr", "edit"))
+    assert "attacker/other" not in edit
+    assert edit[edit.index("--repo") + 1] == "github.com/o/r"
+
+
+# The create-time body gate must survive the body becoming mutable: an edit
+# that strips `Fixes #N` would leave the merged PR's issue open for the steward
+# to re-triage into fresh paid legs.
+@pytest.mark.parametrize(
+    "body",
+    (
+        "",
+        "x",
+        "just some prose with no sections at all",
+        "## Acceptance Criteria\n- [x] a",          # no closing keyword
+        "Fixes #42",                                 # no criteria section
+        "## Acceptance criteria\n- [x] a\n\nFixes #42",  # wrong case
+    ),
+)
+def test_body_update_still_enforces_the_pull_request_body_gate(tmp_path, body):
+    remote = _open_pr(Remote())
+    original = remote.pr_body
+
+    with pytest.raises(ValueError, match="body update rejected"):
+        broker(tmp_path, remote).publish(
+            ("gh", "pr", "edit", "42", "--body", body), str(tmp_path)
+        )
+
+    assert remote.pr_body == original
+    assert not any(e[:3] == ("gh", "pr", "edit") for e in remote.effects)
+
+
+def test_body_update_bounds_an_oversize_body(tmp_path):
+    remote = _open_pr(Remote())
+    original = remote.pr_body
+    oversize = GOOD_BODY + "x" * agent_publish.MAX_PR_BODY_BYTES
+
+    with pytest.raises(ValueError, match="exceeds the durable limit"):
+        broker(tmp_path, remote).publish(
+            ("gh", "pr", "edit", "42", "--body", oversize), str(tmp_path)
+        )
+    assert remote.pr_body == original
+
+
+def test_body_update_measures_the_bound_in_bytes_not_characters(tmp_path):
+    remaining = agent_publish.MAX_PR_BODY_BYTES - len(GOOD_BODY.encode())
+    # "é" is two bytes, so an odd remainder needs one ASCII filler to land
+    # exactly on the boundary.
+    at_limit = GOOD_BODY + "x" * (remaining % 2) + "é" * (remaining // 2)
+    assert len(at_limit.encode()) == agent_publish.MAX_PR_BODY_BYTES
+
+    assert broker(tmp_path, _open_pr(Remote())).publish(
+        ("gh", "pr", "edit", "42", "--body", at_limit), str(tmp_path)
+    ).code == 0
+
+    # One more CHARACTER is two more bytes — over the byte bound.
+    with pytest.raises(ValueError, match="exceeds the durable limit"):
+        broker(tmp_path, _open_pr(Remote())).publish(
+            ("gh", "pr", "edit", "42", "--body", at_limit + "é"),
+            str(tmp_path),
+        )
+
+
+@pytest.mark.parametrize(
+    "args",
+    (
+        ("gh", "pr", "edit", "42"),                       # no body
+        ("gh", "pr", "edit", "--body", GOOD_BODY),        # no selector
+        ("gh", "pr", "edit", "42", "--body"),             # dangling value
+        ("gh", "pr", "edit", "42", "--body-file", "/etc/passwd"),
+        ("gh", "pr", "edit", "42", "-F", "/etc/passwd"),
+        ("gh", "pr", "edit", "42", "--body", GOOD_BODY, "--title", "t"),
+        ("gh", "pr", "edit", "42", "--body", GOOD_BODY, "--add-label", "ok"),
+        ("gh", "pr", "edit", "42", "--body", GOOD_BODY, "--add-reviewer", "x"),
+        ("gh", "pr", "edit", "42", "--body", GOOD_BODY, "--base", "main"),
+        ("gh", "pr", "edit", "42", "43", "--body", GOOD_BODY),  # two selectors
+        ("gh", "pr", "edit", "42", "--body", GOOD_BODY, "--body", GOOD_BODY),
+        ("gh", "pr", "edit", "fix/42-issue", "--body", GOOD_BODY),
+        ("gh", "pr", "edit", "0", "--body", GOOD_BODY),
+        ("gh", "pr", "edit", "-1", "--body", GOOD_BODY),
+        ("gh", "pr", "edit", "4٢", "--body", GOOD_BODY),   # non-ASCII digits
+        ("gh", "pr", "edit", "42.0", "--body", GOOD_BODY),
+        # `--` disagrees with gh about which token is the selector.
+        ("gh", "pr", "edit", "--", "42", "--body", GOOD_BODY),
+        ("gh", "pr", "edit", ""),
+        ("gh", "pr", "merge", "42"),
+        ("gh", "issue", "edit", "42", "--body", GOOD_BODY),
+    ),
+)
+def test_body_update_refuses_malformed_or_widened_invocations(tmp_path, args):
+    remote = _open_pr(Remote())
+    original = remote.pr_body
+
+    with pytest.raises((ValueError, RuntimeError)):
+        broker(tmp_path, remote).publish(args, str(tmp_path))
+
+    assert remote.pr_body == original
+    assert not any(e[:3] == ("gh", "pr", "edit") for e in remote.effects)
+
+
+def test_attached_shorthand_body_keeps_its_whole_value(tmp_path):
+    """pflag reads `-bVALUE` as the entire VALUE; splitting it on `=` silently
+    truncated a body whose first line carried one."""
+    body = "## Acceptance Criteria\n- [x] a=b holds\n\nFixes #42"
+    remote = _open_pr(Remote())
+
+    assert broker(tmp_path, remote).publish(
+        ("gh", "pr", "edit", "42", "-b" + body), str(tmp_path)
+    ).code == 0
+    assert remote.pr_body == body.replace("\n", "\r\n")
+
+
+def test_body_update_refuses_when_someone_else_rewrote_the_body(tmp_path):
+    remote = _open_pr(Remote())
+    publisher = broker(tmp_path, remote)
+    original_run = remote.run
+    intervened = {"done": False}
+
+    def intervene(argv, cwd):
+        result = original_run(argv, cwd)
+        if argv[:3] == ("gh", "pr", "view") and not intervened["done"]:
+            intervened["done"] = True
+            remote.pr_body = "an operator rewrote this"
+        return result
+
+    publisher.run = intervene
+
+    result = publisher.publish(
+        ("gh", "pr", "edit", "42", "--body", GOOD_BODY), str(tmp_path)
+    )
+
+    assert result.code == 75
+    assert remote.pr_body == "an operator rewrote this"
+    assert not any(e[:3] == ("gh", "pr", "edit") for e in remote.effects)
+
+
+def test_body_update_refuses_a_rewrite_landing_after_the_preflight(tmp_path):
+    """The pre-flight reconcile runs before authority is held; an operator edit
+    inside that window must not be silently overwritten."""
+    remote = _open_pr(Remote())
+    publisher = broker(tmp_path, remote)
+    original_run = remote.run
+    views = {"count": 0}
+
+    def intervene(argv, cwd):
+        result = original_run(argv, cwd)
+        if argv[:3] == ("gh", "pr", "view"):
+            views["count"] += 1
+            if views["count"] == 2:  # after capture AND after the pre-flight
+                remote.pr_body = "an operator rewrote this"
+        return result
+
+    publisher.run = intervene
+
+    result = publisher.publish(
+        ("gh", "pr", "edit", "42", "--body", GOOD_BODY), str(tmp_path)
+    )
+
+    assert result.code != 0
+    assert remote.pr_body == "an operator rewrote this"
+    assert not any(e[:3] == ("gh", "pr", "edit") for e in remote.effects)
+
+
+def test_body_update_already_applied_is_not_written_twice(tmp_path):
+    remote = _open_pr(Remote())
+    # Stored the way GitHub stores it — CRLF, no trailing newline — so this
+    # asserts the round-trip normalization, not string identity.
+    remote.pr_body = GOOD_BODY.replace("\n", "\r\n") + "\r\n"
+
+    result = broker(tmp_path, remote).publish(
+        ("gh", "pr", "edit", "42", "--body", GOOD_BODY), str(tmp_path)
+    )
+
+    assert result.code == 0
+    assert not any(e[:3] == ("gh", "pr", "edit") for e in remote.effects)
+
+
+def test_body_update_refuses_when_the_current_body_is_unreadable(tmp_path):
+    remote = _open_pr(Remote())
+    remote.body_view_fails = True
+
+    with pytest.raises(RuntimeError, match="current pull-request body"):
+        broker(tmp_path, remote).publish(
+            ("gh", "pr", "edit", "42", "--body", GOOD_BODY), str(tmp_path)
+        )
+
+
+def test_body_update_refuses_when_the_branch_has_no_open_pull_request(tmp_path):
+    remote = Remote()  # pr_state is unset — gh pr list returns []
+
+    with pytest.raises(ValueError, match="own PR"):
+        broker(tmp_path, remote).publish(
+            ("gh", "pr", "edit", "42", "--body", GOOD_BODY), str(tmp_path)
+        )
+
+
+def test_pending_body_update_is_drained_by_the_broker(tmp_path):
+    """The kind must be in the broker's drain set, or a body update interrupted
+    mid-flight is stranded pending forever."""
+    remote = _open_pr(Remote())
+    control = store(tmp_path)
+    publisher = AgentPublicationBroker(
+        control,
+        repository="o/r",
+        base_branch="dev",
+        owner="o/r:fix",
+        run=remote.run,
+    )
+    crashed = {"done": False}
+
+    def crash_once(argv, cwd):
+        if argv[:3] == ("gh", "pr", "edit") and not crashed["done"]:
+            crashed["done"] = True
+            raise KeyboardInterrupt
+        return remote.run(argv, cwd)
+
+    publisher.run = crash_once
+    with pytest.raises(KeyboardInterrupt):
+        publisher.publish(
+            ("gh", "pr", "edit", "42", "--body", GOOD_BODY), str(tmp_path)
+        )
+    assert control.pending_commands() != ()
+
+    recovered = AgentPublicationBroker(
+        control,
+        repository="o/r",
+        base_branch="dev",
+        owner="o/r:fix",
+        run=remote.run,
+    )
+
+    assert recovered.drain_pending_commands() == 1
+    assert remote.pr_body == GOOD_BODY.replace("\n", "\r\n")
+    assert control.pending_commands() == ()
+
+
+def test_body_update_refuses_after_origin_is_switched(tmp_path):
+    remote = _open_pr(Remote())
+    control = store(tmp_path)
+    publisher = AgentPublicationBroker(
+        control,
+        repository="o/r",
+        base_branch="dev",
+        owner="o/r:fix",
+        run=remote.run,
+    )
+    crashed = {"done": False}
+
+    def crash_once(argv, cwd):
+        if argv[:3] == ("gh", "pr", "edit") and not crashed["done"]:
+            crashed["done"] = True
+            raise KeyboardInterrupt
+        return remote.run(argv, cwd)
+
+    publisher.run = crash_once
+    with pytest.raises(KeyboardInterrupt):
+        publisher.publish(
+            ("gh", "pr", "edit", "42", "--body", GOOD_BODY), str(tmp_path)
+        )
+
+    remote.origin_url = "git@github.com:attacker/other.git"
+    recovered = AgentPublicationBroker(
+        control,
+        repository="o/r",
+        base_branch="dev",
+        owner="o/r:fix",
+        run=remote.run,
+    )
+
+    assert recovered.drain_pending_commands() == 0
+    assert remote.pr_body != GOOD_BODY.replace("\n", "\r\n")

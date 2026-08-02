@@ -596,6 +596,91 @@ def test_bash_hook_blocks_every_durable_publication_authority_override(
     assert assignment in result.stderr
 
 
+# ── brokered PR body updates (keifu #177 / issue #162, 2026-08-02) ───────────
+# The gap the incident exposed: an address-review leg whose reviewer required a
+# PR-body change had no permitted command for it and escalated to a human.
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "issue-agent-publish gh pr edit 177 --body 'new body'",
+        "issue-agent-publish gh pr edit 177 --body='new body'",
+        "issue-agent-publish gh pr edit --body 'new body' 177",
+        "issue-agent-publish gh pr edit 177 -R o/r --body 'new body'",
+    ),
+)
+def test_brokered_pull_request_body_update_is_resolvable(command):
+    assert gov.find_violations(command) == []
+    # `classify` deliberately leaves this form ungoverned — no checker script
+    # owns it; the broker constrains it. Pinning the exact resolution keeps a
+    # future `Governed("gh-pr-edit")` from silently routing to no checker.
+    assert isinstance(gov.resolve(command), gov.Ungoverned)
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        # The broker is the ONLY route: a bare gh write stays outside the
+        # portable read/create allowlist.
+        "gh pr edit 177 --body 'new body'",
+        "gh pr edit 177 --add-label approved",
+        "env gh pr edit 177 --body x",
+        "exec gh pr edit 177 --body x",
+        # …and the broker itself still refuses everything else.
+        "issue-agent-publish gh pr merge 177",
+        "issue-agent-publish gh pr close 177",
+        "issue-agent-publish gh pr review 177 --approve",
+        "issue-agent-publish gh issue edit 177 --body x",
+        "issue-agent-publish gh pr",
+        "issue-agent-publish git commit -m x",
+    ),
+)
+def test_unbrokered_or_widened_pull_request_writes_stay_unresolvable(command):
+    assert isinstance(gov.resolve(command), gov.Unresolvable)
+
+
+@pytest.mark.parametrize("assignment", sorted(gov._PUBLICATION_AUTHORITY_ENV))
+def test_body_update_cannot_carry_a_publication_authority_override(assignment):
+    command = (
+        f"env {assignment}=attacker "
+        "issue-agent-publish gh pr edit 177 --body x"
+    )
+    resolution = gov.resolve(command)
+
+    assert isinstance(resolution, gov.Unresolvable)
+    assert assignment in resolution.reason
+
+
+def test_bash_hook_allows_a_brokered_body_update(tmp_path):
+    payload = json.dumps(
+        {
+            "tool_input": {
+                "command": "issue-agent-publish gh pr edit 177 --body 'x'"
+            }
+        }
+    )
+
+    result = subprocess.run(
+        [sys.executable, HOOK], input=payload, text=True, capture_output=True
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_bash_hook_blocks_an_unbrokered_body_update():
+    payload = json.dumps(
+        {"tool_input": {"command": "gh pr edit 177 --body 'x'"}}
+    )
+
+    result = subprocess.run(
+        [sys.executable, HOOK], input=payload, text=True, capture_output=True
+    )
+
+    assert result.returncode == 2
+    assert "allowlist" in result.stderr
+
+
 @pytest.mark.parametrize(
     "arguments",
     (
