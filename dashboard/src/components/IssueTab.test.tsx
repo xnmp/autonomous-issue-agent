@@ -118,6 +118,79 @@ describe("IssueTab", () => {
     );
   });
 
+  it("expands from a click anywhere on the row and leads with a human summary", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation((input: RequestInfo | URL) => {
+        const url = String(input);
+        const body = url.includes("/steps/0/events")
+          ? {
+              events: [
+                { ts: "2026-08-02T13:55:00Z", event: "action",
+                  desc: "relabel issue #34: +difficulty:medium +impact:high" },
+                { ts: "2026-08-02T13:55:01Z", kind: "control.transition.committed.v1" },
+              ],
+              warnings: [],
+            }
+          : {
+              issue: 34,
+              title: "Triaged issue",
+              url: null,
+              stage: "done",
+              done: true,
+              prs: [],
+              pull_requests: [],
+              cost_usd: 1,
+              elapsed_s: 60,
+              working_s: 45,
+              idle_s: 15,
+              idle_active: false,
+              steps: [{
+                idx: 0,
+                kind: "TRIAGE",
+                role: "steward",
+                state: "ok",
+                model: "gpt-5.6-terra",
+                status: "done",
+                exit_reason: "ok",
+                duration_s: 142,
+                cost_usd: 0.75,
+                estimated: false,
+                session_id: null,
+                has_transcript: false,
+                turns: 14,
+                usage: null,
+                ts: "2026-08-02T13:55:00Z",
+                note: null,
+              }],
+              events: [],
+              warnings: [],
+            };
+        return Promise.resolve(
+          new Response(JSON.stringify(body), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+        );
+      }),
+    );
+
+    render(<IssueTab repo="demo" issue={34} />);
+
+    // Click the status cell, not the disclosure chevron — the whole row toggles.
+    await screen.findByRole("button", { name: "Triage" });
+    await userEvent.click(screen.getByText("2:22"));
+    // The Summary pane is the default and narrates what the task DID —
+    // the steward's triage labels — not the raw event soup.
+    expect(
+      await screen.findByText("relabel issue #34: +difficulty:medium +impact:high"),
+    ).toBeVisible();
+    expect(screen.getByRole("tab", { name: "Summary" })).toHaveAttribute(
+      "aria-selected", "true",
+    );
+    expect(screen.queryByText("control.transition.committed.v1")).not.toBeInTheDocument();
+  });
+
   it("gives compact task columns their own resize floors", async () => {
     vi.stubGlobal(
       "fetch",

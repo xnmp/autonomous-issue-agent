@@ -11,7 +11,7 @@ import {
   statusTone,
   stepKindTone,
 } from "../lib/semantics";
-import { duration, localTime, num, tokens, usd } from "../lib/format";
+import { clockTime, duration, localTime, num, tokens, usd } from "../lib/format";
 import { shortModel } from "../lib/models";
 import { Chip } from "./ui/Chip";
 import { JsonBlock } from "./ui/Json";
@@ -364,13 +364,21 @@ function StepRow({
   const detailId = `task-detail-${issue}-${step.idx}`;
   return (
     <>
-      <tr className={open ? "expanded" : undefined}>
+      <tr
+        className={`clickable${open ? " expanded" : ""}`}
+        onClick={onToggle}
+      >
         <td className="step-operation">
           <button
             className="step-disclosure"
             aria-expanded={open}
             aria-controls={detailId}
-            onClick={onToggle}
+            onClick={(event) => {
+              // The row handles the toggle; without this the click counts twice
+              // and the row reopens in the same gesture.
+              event.stopPropagation();
+              onToggle();
+            }}
           >
             <span className={`chev${open ? " open" : ""}`} aria-hidden="true">
               ▸
@@ -450,7 +458,19 @@ function StepRow({
   );
 }
 
-type DetailPane = "events" | "cost" | "raw";
+type DetailPane = "summary" | "events" | "cost" | "raw";
+
+/** The prose lines a task's window carries: what the agent actually did to
+ * the world (relabels, comments, PR opens), in order. Everything else in the
+ * window is machine bookkeeping and stays in the Events/Raw panes. */
+function narrateWindow(events: { [key: string]: unknown }[]): { ts: string | null; desc: string }[] {
+  return events
+    .filter((e) => typeof e.desc === "string" && e.desc.trim() !== "")
+    .map((e) => ({
+      ts: typeof e.ts === "string" ? e.ts : null,
+      desc: (e.desc as string).trim(),
+    }));
+}
 
 function StepDetail({
   id,
@@ -463,9 +483,11 @@ function StepDetail({
   issue: number;
   step: IssueStep;
 }) {
-  const [pane, setPane] = useState<DetailPane>("events");
+  const [pane, setPane] = useState<DetailPane>("summary");
   const events = usePolled(
-    pane === "events" ? `stepev:${repo}:${issue}:${step.idx}` : null,
+    pane === "summary" || pane === "events"
+      ? `stepev:${repo}:${issue}:${step.idx}`
+      : null,
     (signal) => api.stepEvents(repo, issue, step.idx, signal),
     step.state === "running" ? POLL_MS : 0,
   );
@@ -475,7 +497,7 @@ function StepDetail({
   return (
     <div className="stepdetail" id={id}>
       <div className="subtabs stepdetail-tabs" role="tablist" aria-label="Task detail">
-        {(["events", "cost", "raw"] as DetailPane[]).map((p) => (
+        {(["summary", "events", "cost", "raw"] as DetailPane[]).map((p) => (
           <button
             key={p}
             id={`${id}-${p}-tab`}
@@ -487,10 +509,53 @@ function StepDetail({
             onClick={() => setPane(p)}
             onKeyDown={(event) => moveTabFocus(event, p, setPane)}
           >
-            {p === "events" ? "Events" : p === "cost" ? "Cost chart" : "Raw"}
+            {p === "summary" ? "Summary" : p === "events" ? "Events" : p === "cost" ? "Cost chart" : "Raw"}
           </button>
         ))}
       </div>
+
+      {pane === "summary" ? (
+        <div
+          id={`${id}-summary-panel`}
+          role="tabpanel"
+          aria-labelledby={`${id}-summary-tab`}
+          className="step-summary"
+        >
+          {step.note ? <p className="task-note step-summary-note">{step.note}</p> : null}
+          {step.exit_reason && step.exit_reason.toLowerCase() !== "ok" ? (
+            <p className="step-summary-exit">
+              ended: <span className="mono">{step.exit_reason}</span>
+            </p>
+          ) : null}
+          {events.error ? (
+            <ErrorBanner message={events.error} onRetry={events.refresh} />
+          ) : null}
+          {events.loading ? (
+            <Loading what="task actions" />
+          ) : (
+            (() => {
+              const lines = narrateWindow(events.data?.events ?? []);
+              if (lines.length === 0 && !step.note) {
+                return (
+                  <EmptyState>
+                    this task changed nothing visible — see Events for the bookkeeping
+                  </EmptyState>
+                );
+              }
+              return lines.length > 0 ? (
+                <ul className="step-summary-actions">
+                  {lines.map((line, index) => (
+                    <li key={index}>
+                      <span className="mono faint step-summary-when">{clockTime(line.ts)}</span>
+                      <span>{line.desc}</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : null;
+            })()
+          )}
+        </div>
+      ) : null}
 
       {pane === "events" ? (
         <div
@@ -558,7 +623,7 @@ function moveTabFocus(
   pane: DetailPane,
   select: (pane: DetailPane) => void,
 ) {
-  const panes: DetailPane[] = ["events", "cost", "raw"];
+  const panes: DetailPane[] = ["summary", "events", "cost", "raw"];
   const current = panes.indexOf(pane);
   let next: number | null = null;
   if (event.key === "ArrowRight") next = (current + 1) % panes.length;

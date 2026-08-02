@@ -934,6 +934,11 @@
 }
 .resizable-table {
   table-layout: fixed;
+  /* Preferred column widths, but never a scrollbar the content didn't earn:
+     when the summed widths exceed the container, the fixed layout compresses
+     columns proportionally and cell text truncates instead of scrolling
+     (done tab, 2026-08-03: a permanent scrollbar at every window size). */
+  max-width: 100%;
 }
 .resizable-table th {
   position: sticky;
@@ -1210,6 +1215,35 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.step-summary {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+}
+.step-summary-note {
+  margin: 0;
+}
+.step-summary-exit {
+  margin: 0;
+  color: var(--ink-faint);
+}
+.step-summary-actions {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s1);
+}
+.step-summary-actions li {
+  display: flex;
+  gap: var(--s2);
+  align-items: baseline;
+}
+.step-summary-when {
+  flex: none;
+  font-size: var(--fs-xs);
 }
 .task-cost,
 .task-took {

@@ -36,8 +36,12 @@ export function num(v: number | null | undefined, digits = 0): string {
 
 export function tokens(v: number | null | undefined): string {
   if (v === null || v === undefined || !Number.isFinite(v)) return DASH;
-  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
-  if (v >= 1_000) return `${(v / 1_000).toFixed(1)}K`;
+  // One decimal only while it carries signal: 9.4K reads, 665.7K is noise.
+  const scaled = (value: number, suffix: string) =>
+    `${value >= 10 ? Math.round(value) : value.toFixed(1)}${suffix}`;
+  // 999_500+ rounds K to 1000 — promote to M instead of rendering "1000K".
+  if (v >= 999_500) return scaled(v / 1_000_000, "M");
+  if (v >= 1_000) return scaled(v / 1_000, "K");
   return String(v);
 }
 
