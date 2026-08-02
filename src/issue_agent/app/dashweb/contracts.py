@@ -87,6 +87,7 @@ class VerificationRow(Contract):
     status: str | None
     evidence: str | None
     raw: str
+    reason: str | None = None
 
 
 class VerificationPayload(Warned):
@@ -137,6 +138,11 @@ class HealthTrendDay(Contract):
     first_observation: bool
 
 
+class SpendBucket(Contract):
+    hour_start_iso: str
+    usd: float
+
+
 class OverviewPayload(Warned):
     metrics: Metrics | None
     cost_mix: CostMix | None
@@ -145,6 +151,7 @@ class OverviewPayload(Warned):
     unattributed: list[dict[str, Any]]
     health_trend: list[HealthTrendDay]
     first_observed_day: str | None = None
+    spend_per_hour: list[SpendBucket] = []
 
 
 class CardStep(Contract):
@@ -166,6 +173,7 @@ class IssueCard(Contract):
     pr: int | None
     pr_url: str | None
     pr_state: str | None
+    pr_review_state: Literal["mergeable", "changes_requested"] | None = None
     stage: str | None
     attention_reason: str | None = None
     escalation_reason: str | None = None
@@ -191,6 +199,8 @@ class IssueCard(Contract):
     flags: list[str]
     issue_verification: str | None = None
     pr_verification: str | None = None
+    issue_verification_reason: str | None = None
+    pr_verification_reason: str | None = None
     merged_ts: str | None = None
 
 

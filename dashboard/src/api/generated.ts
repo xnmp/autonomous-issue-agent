@@ -418,6 +418,8 @@ export interface components {
             issue: number;
             /** Issue Verification */
             issue_verification?: string | null;
+            /** Issue Verification Reason */
+            issue_verification_reason?: string | null;
             /** Last Ts */
             last_ts: string | null;
             /** Merged Ts */
@@ -431,12 +433,16 @@ export interface components {
             models: string[];
             /** Pr */
             pr: number | null;
+            /** Pr Review State */
+            pr_review_state?: ("mergeable" | "changes_requested") | null;
             /** Pr State */
             pr_state: string | null;
             /** Pr Url */
             pr_url: string | null;
             /** Pr Verification */
             pr_verification?: string | null;
+            /** Pr Verification Reason */
+            pr_verification_reason?: string | null;
             /** Projected Cost Usd */
             projected_cost_usd: number | null;
             /** Projected Eta S */
@@ -623,6 +629,11 @@ export interface components {
             /** Health Trend */
             health_trend: components["schemas"]["HealthTrendDay"][];
             metrics: components["schemas"]["Metrics"] | null;
+            /**
+             * Spend Per Hour
+             * @default []
+             */
+            spend_per_hour: components["schemas"]["SpendBucket"][];
             /** Unattributed */
             unattributed: {
                 [key: string]: unknown;
@@ -717,6 +728,15 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** SpendBucket */
+        SpendBucket: {
+            /** Hour Start Iso */
+            hour_start_iso: string;
+            /** Usd */
+            usd: number;
+        } & {
+            [key: string]: unknown;
+        };
         /** StepEventsPayload */
         StepEventsPayload: {
             /** Events */
@@ -805,6 +825,8 @@ export interface components {
             id: string | null;
             /** Raw */
             raw: string;
+            /** Reason */
+            reason?: string | null;
             /** Shipped */
             shipped: string | null;
             /** Status */

@@ -75,14 +75,19 @@ const IssueCard = z
     idle_s: z.union([z.number(), z.null()]),
     issue: z.number().int(),
     issue_verification: z.union([z.string(), z.null()]).optional(),
+    issue_verification_reason: z.union([z.string(), z.null()]).optional(),
     last_ts: z.union([z.string(), z.null()]),
     merged_ts: z.union([z.string(), z.null()]).optional(),
     model_badges: z.array(ModelBadge).optional().default([]),
     models: z.array(z.string()),
     pr: z.union([z.number(), z.null()]),
+    pr_review_state: z
+      .union([z.enum(["mergeable", "changes_requested"]), z.null()])
+      .optional(),
     pr_state: z.union([z.string(), z.null()]),
     pr_url: z.union([z.string(), z.null()]),
     pr_verification: z.union([z.string(), z.null()]).optional(),
+    pr_verification_reason: z.union([z.string(), z.null()]).optional(),
     projected_cost_usd: z.union([z.number(), z.null()]),
     projected_eta_s: z.union([z.number(), z.null()]),
     projected_model: z.union([z.string(), z.null()]).optional(),
@@ -254,6 +259,9 @@ const Metrics = z
     total_cost_usd: z.union([z.number(), z.null()]),
   })
   .passthrough();
+const SpendBucket = z
+  .object({ hour_start_iso: z.string(), usd: z.number() })
+  .passthrough();
 const OverviewPayload = z
   .object({
     caps: z.union([Caps, z.null()]),
@@ -262,6 +270,7 @@ const OverviewPayload = z
     health: z.array(RoleHealth),
     health_trend: z.array(HealthTrendDay),
     metrics: z.union([Metrics, z.null()]),
+    spend_per_hour: z.array(SpendBucket).optional().default([]),
     unattributed: z.array(z.object({}).partial().passthrough()),
     warnings: z.array(z.string()),
   })
@@ -316,6 +325,7 @@ const VerificationRow = z
     evidence: z.union([z.string(), z.null()]),
     id: z.union([z.string(), z.null()]),
     raw: z.string(),
+    reason: z.union([z.string(), z.null()]).optional(),
     shipped: z.union([z.string(), z.null()]),
     status: z.union([z.string(), z.null()]),
   })
@@ -349,6 +359,7 @@ export const schemas = {
   HealthTrendDay,
   KindCost,
   Metrics,
+  SpendBucket,
   OverviewPayload,
   ClaudeUsage,
   CodexUsage,
@@ -643,6 +654,7 @@ const endpoints = makeApi([
         health: z.array(RoleHealth),
         health_trend: z.array(HealthTrendDay),
         metrics: z.union([Metrics, z.null()]),
+        spend_per_hour: z.array(SpendBucket).optional().default([]),
         unattributed: z.array(z.object({}).partial().passthrough()),
         warnings: z.array(z.string()),
       })

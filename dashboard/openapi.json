@@ -747,6 +747,17 @@
             ],
             "title": "Issue Verification"
           },
+          "issue_verification_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Issue Verification Reason"
+          },
           "last_ts": {
             "anyOf": [
               {
@@ -795,6 +806,21 @@
             ],
             "title": "Pr"
           },
+          "pr_review_state": {
+            "anyOf": [
+              {
+                "enum": [
+                  "mergeable",
+                  "changes_requested"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr Review State"
+          },
           "pr_state": {
             "anyOf": [
               {
@@ -827,6 +853,17 @@
               }
             ],
             "title": "Pr Verification"
+          },
+          "pr_verification_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr Verification Reason"
           },
           "projected_cost_usd": {
             "anyOf": [
@@ -1604,6 +1641,14 @@
               }
             ]
           },
+          "spend_per_hour": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/SpendBucket"
+            },
+            "title": "Spend Per Hour",
+            "type": "array"
+          },
           "unattributed": {
             "items": {
               "additionalProperties": true,
@@ -1947,6 +1992,25 @@
         "title": "RoleHealth",
         "type": "object"
       },
+      "SpendBucket": {
+        "additionalProperties": true,
+        "properties": {
+          "hour_start_iso": {
+            "title": "Hour Start Iso",
+            "type": "string"
+          },
+          "usd": {
+            "title": "Usd",
+            "type": "number"
+          }
+        },
+        "required": [
+          "hour_start_iso",
+          "usd"
+        ],
+        "title": "SpendBucket",
+        "type": "object"
+      },
       "StepEventsPayload": {
         "additionalProperties": true,
         "properties": {
@@ -2250,6 +2314,17 @@
           "raw": {
             "title": "Raw",
             "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
           },
           "shipped": {
             "anyOf": [

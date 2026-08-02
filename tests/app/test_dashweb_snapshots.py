@@ -1093,3 +1093,197 @@ def test_a_note_is_bounded_for_a_compact_row():
         "needs": "x" * 900,
     }
     assert len(snapshots.detailed_steps(row_for([blocked], 7))[0]["note"]) == 240
+
+
+# ── PR merge readiness ────────────────────────────────────────────────────────
+def review_card(**pr_fields):
+    events = [RESOLVE, {"ts": ts(hours=1), "event": "agent_run", "role": "review",
+                        "kind": "REVIEW", "issue": 7, "number": 12,
+                        "cost_usd": 0.5, "status": "done", "exit_reason": "ok",
+                        "model": "m", "session_id": "s"}]
+    return snapshots.issue_card(
+        row_for(events, 7), NOW,
+        gh_prs={12: {"url": "u/12", "state": "OPEN", **pr_fields}},
+    )
+
+
+def test_an_approved_mergeable_pr_reads_as_mergeable():
+    card = review_card(reviewDecision="APPROVED", mergeable="MERGEABLE")
+    assert card["pr_review_state"] == "mergeable"
+
+
+def test_requested_changes_outrank_a_clean_merge_state():
+    card = review_card(reviewDecision="CHANGES_REQUESTED", mergeable="MERGEABLE")
+    assert card["pr_review_state"] == "changes_requested"
+
+
+@pytest.mark.parametrize(
+    "pr_fields",
+    [
+        {},
+        {"reviewDecision": None, "mergeable": None},
+        {"reviewDecision": "APPROVED"},
+        {"reviewDecision": "APPROVED", "mergeable": "CONFLICTING"},
+        {"reviewDecision": "APPROVED", "mergeable": "UNKNOWN"},
+        {"reviewDecision": "REVIEW_REQUIRED", "mergeable": "MERGEABLE"},
+        {"reviewDecision": 7, "mergeable": ["nonsense"]},
+    ],
+)
+def test_unknown_or_unreadable_review_data_claims_nothing(pr_fields):
+    assert review_card(**pr_fields)["pr_review_state"] is None
+
+
+def test_a_card_with_no_pull_request_has_no_review_state():
+    assert snapshots.issue_card(row_for([RESOLVE], 7), NOW)["pr_review_state"] is None
+
+
+# ── hourly spend ──────────────────────────────────────────────────────────────
+def charge(hours_ago: float, usd):
+    return NOW - timedelta(hours=hours_ago), usd
+
+
+def bucket_at(series, hours_ago: int) -> dict:
+    hour = (NOW - timedelta(hours=hours_ago)).replace(
+        minute=0, second=0, microsecond=0
+    )
+    return next(b for b in series if b["hour_start_iso"] == hour.isoformat())
+
+
+def test_an_empty_journal_still_yields_a_dense_zeroed_window():
+    series = snapshots.spend_buckets([], NOW)
+    assert len(series) == snapshots.SPEND_WINDOW_HOURS
+    assert {b["usd"] for b in series} == {0.0}
+    assert [b["hour_start_iso"] for b in series] == sorted(
+        b["hour_start_iso"] for b in series
+    )
+
+
+def test_a_single_charge_lands_in_the_hour_it_happened():
+    series = snapshots.spend_buckets([charge(3.5, 1.25)], NOW)
+    assert bucket_at(series, 4)["usd"] == 1.25
+    assert sum(b["usd"] for b in series) == 1.25
+
+
+def test_charges_either_side_of_an_hour_edge_land_in_different_buckets():
+    just_before = NOW.replace(minute=0, second=0, microsecond=0) - timedelta(seconds=1)
+    on_the_hour = NOW.replace(minute=0, second=0, microsecond=0)
+    series = snapshots.spend_buckets(
+        [(just_before, 1.0), (on_the_hour, 2.0)], NOW
+    )
+    assert bucket_at(series, 1)["usd"] == 1.0
+    assert bucket_at(series, 0)["usd"] == 2.0
+
+
+def test_charges_outside_the_window_are_dropped_not_clamped():
+    series = snapshots.spend_buckets(
+        [charge(200, 9.0), charge(-5, 9.0), charge(1, 3.0)], NOW
+    )
+    assert sum(b["usd"] for b in series) == 3.0
+
+
+@pytest.mark.parametrize(
+    "bad", [None, "", "1.5", float("nan"), float("inf"), {"usd": 1}, [2.0]]
+)
+def test_unpriceable_charges_are_skipped_rather_than_poisoning_the_series(bad):
+    series = snapshots.spend_buckets([(NOW, bad), charge(0, 2.0)], NOW)
+    assert sum(b["usd"] for b in series) == 2.0
+
+
+def test_an_undated_charge_is_skipped():
+    assert sum(b["usd"] for b in snapshots.spend_buckets([(None, 5.0)], NOW)) == 0.0
+
+
+def test_a_non_positive_window_is_an_empty_series():
+    assert snapshots.spend_buckets([charge(1, 1.0)], NOW, hours=0) == []
+
+
+def test_spend_per_hour_counts_estimated_legs_and_deployment_level_runs():
+    estimated = {**RESOLVE, "ts": ts(hours=1), "cost_usd": 0.5, "estimated": True}
+    dep = build([
+        estimated,
+        {"ts": ts(hours=1), "event": "agent_run", "role": "steward",
+         "kind": "TRIAGE", "cost_usd": 0.25, "status": "done",
+         "exit_reason": "ok", "model": "m", "session_id": "s"},
+    ])
+
+    series = snapshots.spend_per_hour(dep, NOW)
+
+    assert bucket_at(series, 1)["usd"] == 0.75
+    assert sum(b["usd"] for b in series) == 0.75
+
+
+def test_spend_per_hour_totals_a_huge_journal_without_losing_charges():
+    dep = build([
+        {**RESOLVE, "ts": ts(hours=n % 47, minutes=n % 60), "cost_usd": 0.01}
+        for n in range(2000)
+    ])
+    assert round(sum(b["usd"] for b in snapshots.spend_per_hour(dep, NOW)), 2) == 20.0
+
+
+# ── v2 GitHub enrichment ──────────────────────────────────────────────────────
+REVIEW_LEG = {"ts": ts(hours=1), "event": "agent_run", "role": "review",
+              "kind": "REVIEW", "issue": 7, "number": 12, "cost_usd": 0.5,
+              "status": "done", "exit_reason": "ok", "model": "m",
+              "session_id": "s"}
+
+
+def v2_backend(monkeypatch, ledger_rows=(), **pr_fields):
+    deployment = replace(build([RESOLVE, REVIEW_LEG]), schema_version=2)
+    snapshot = dash.Snapshot("demo", "o/r", "/target", deployment, (NOW,))
+
+    class Gh:
+        def issues(self, _repo):
+            return ([{"number": 7, "state": "OPEN", "title": "the bug",
+                      "url": "u/7"}], "")
+
+        def prs(self, _repo):
+            return ([{"number": 12, "url": "u/12", "state": "OPEN",
+                      **pr_fields}], "")
+
+    backend = service.Backend(gh=Gh(), now_fn=lambda: NOW)
+    monkeypatch.setattr(backend, "snapshot", lambda _name: snapshot)
+    monkeypatch.setattr(
+        backend, "verification", lambda: {"rows": list(ledger_rows)}
+    )
+    return backend
+
+
+def card_for(payload, issue=7):
+    everything = payload["in_flight"] + payload["done"]
+    return next(card for card in everything if card["issue"] == issue)
+
+
+def test_v2_cards_carry_pr_state_and_merge_readiness_from_github(monkeypatch):
+    backend = v2_backend(monkeypatch, reviewDecision="APPROVED", mergeable="MERGEABLE")
+
+    card = card_for(backend.issues("demo"))
+
+    assert (card["pr"], card["pr_state"]) == (12, "open")
+    assert card["pr_review_state"] == "mergeable"
+
+
+def test_v2_cards_report_no_merge_readiness_when_github_withholds_it(monkeypatch):
+    card = card_for(v2_backend(monkeypatch).issues("demo"))
+
+    assert card["pr_state"] == "open" and card["pr_review_state"] is None
+
+
+def test_cards_carry_the_verification_reason_for_issue_and_pr(monkeypatch):
+    ledger = [{"change": "#7 the bug", "shipped": "PR #12", "status": "VERIFIED",
+               "reason": "probe stayed green over two deployments"}]
+
+    card = card_for(v2_backend(monkeypatch, ledger_rows=ledger).issues("demo"))
+
+    assert card["issue_verification"] == "VERIFIED"
+    assert card["issue_verification_reason"] == "probe stayed green over two deployments"
+    assert card["pr_verification_reason"] == "probe stayed green over two deployments"
+
+
+def test_cards_omit_a_verification_reason_the_ledger_does_not_give(monkeypatch):
+    ledger = [{"change": "#7 the bug", "shipped": "PR #12", "status": "VERIFIED",
+               "reason": None}]
+
+    card = card_for(v2_backend(monkeypatch, ledger_rows=ledger).issues("demo"))
+
+    assert card["issue_verification"] == "VERIFIED"
+    assert card["issue_verification_reason"] is None

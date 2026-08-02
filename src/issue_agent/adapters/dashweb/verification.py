@@ -11,11 +11,18 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from typing import TypeVar
 
 # The three verdicts plus the default. Ordered longest-first so `MISBEHAVED`
 # cannot be swallowed by a prefix match.
 _STATUS_RE = re.compile(r"\b(MISBEHAVED|VERIFIED|RETIRED|pending)\b", re.IGNORECASE)
+# A verdict cell usually reads "VERIFIED — <why>"; the badge already shows the
+# verdict, so only the prose after it is worth surfacing.
+_VERDICT_PREFIX_RE = re.compile(
+    r"^\W*(?:MISBEHAVED|VERIFIED|RETIRED|pending)\b[\s\-—–:;,.]*", re.IGNORECASE
+)
 _SEPARATOR_RE = re.compile(r"^\|[\s:|-]+\|$")
 _ID_RE = re.compile(r"#\d+")
 _PR_RE = re.compile(r"\bPR\s+#(\d+)\b", re.IGNORECASE)
@@ -30,6 +37,7 @@ class VerificationRow:
     status: str
     evidence: str
     raw: str
+    reason: str | None = None
 
 
 def default_path(harness_root: str) -> str:
@@ -60,6 +68,17 @@ def status_of(text: str) -> str:
     return word.lower() if word.lower() == "pending" else word.upper()
 
 
+def reason_of(verdict_text: str, evidence: str = "") -> str | None:
+    """Why a row claims its verdict, verdict keyword stripped.
+
+    Ledger columns drift, so this falls back to the evidence cell rather than
+    guessing: a three-column table puts the reasoning there. Nothing to say is
+    `None`, never an empty badge tooltip.
+    """
+    trimmed = _VERDICT_PREFIX_RE.sub("", verdict_text.strip()).strip(" -—–:;,.")
+    return trimmed or evidence.strip() or None
+
+
 def parse_verification(text: str) -> list[VerificationRow]:
     """Every table row in the document, header and separator rows excluded."""
     rows: list[VerificationRow] = []
@@ -80,14 +99,17 @@ def parse_verification(text: str) -> list[VerificationRow]:
         if not change:
             continue
         ident = _ID_RE.search(change)
+        evidence = _clean(cells[2]) if len(cells) > 2 else ""
+        verdict_cell = _clean(cells[-1]) if len(cells) > 3 else ""
         rows.append(
             VerificationRow(
                 id=ident.group(0) if ident else change,
                 change=change,
                 shipped=_clean(cells[1]) if len(cells) > 1 else "",
-                evidence=_clean(cells[2]) if len(cells) > 2 else "",
-                status=status_of(_clean(cells[-1]) if len(cells) > 3 else stripped),
+                evidence=evidence,
+                status=status_of(verdict_cell if len(cells) > 3 else stripped),
                 raw=stripped,
+                reason=reason_of(verdict_cell, evidence),
             )
         )
     return rows
@@ -106,16 +128,34 @@ def verification_payload(path: str) -> dict:
     return {"rows": [asdict(r) for r in parse_verification(text)], "warnings": []}
 
 
-def status_indexes(rows: list[dict]) -> tuple[dict[int, str], dict[int, str]]:
-    """Newest ledger verdict by issue and PR reference."""
-    issues: dict[int, str] = {}
-    prs: dict[int, str] = {}
+_T = TypeVar("_T")
+
+
+def _indexes(
+    rows: list[dict], value_of: Callable[[dict], _T]
+) -> tuple[dict[int, _T], dict[int, _T]]:
+    issues: dict[int, _T] = {}
+    prs: dict[int, _T] = {}
     for row in rows:
         change = str(row.get("change") or "")
         shipped = str(row.get("shipped") or "")
-        status = str(row.get("status") or "pending")
+        value = value_of(row)
         for match in _PR_RE.finditer(f"{change} {shipped}"):
-            prs[int(match.group(1))] = status
+            prs[int(match.group(1))] = value
         for match in _ISSUE_RE.finditer(change):
-            issues[int(match.group(1))] = status
+            issues[int(match.group(1))] = value
     return issues, prs
+
+
+def status_indexes(rows: list[dict]) -> tuple[dict[int, str], dict[int, str]]:
+    """Newest ledger verdict by issue and PR reference."""
+    return _indexes(rows, lambda row: str(row.get("status") or "pending"))
+
+
+def reason_indexes(
+    rows: list[dict],
+) -> tuple[dict[int, str | None], dict[int, str | None]]:
+    """Newest ledger reason text by issue and PR reference."""
+    return _indexes(
+        rows, lambda row: str(row["reason"]) if row.get("reason") else None
+    )
