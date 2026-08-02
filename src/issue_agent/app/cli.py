@@ -42,6 +42,7 @@ from .config import (
     default_state_dir as config_default_state_dir,
     parse_repoint_history,
 )
+from .identity_pools import IdentityPoolReport, identity_pool_report
 
 # HARNESS_ROOT: …/src/issue_agent/app/cli.py → repo root. Same walk main.py uses.
 # This is what makes the CLI checkout-resident: plugin/ + config/ are siblings.
@@ -697,6 +698,74 @@ def prompt_review_bot_token(review_bot: str, attempts: int = _PROMPT_ATTEMPTS) -
     return unproven
 
 
+def prompt_fix_bot_token(attempts: int = _PROMPT_ATTEMPTS) -> str:
+    """Ask for FIX_BOT_TOKEN and report which account it authenticates as.
+
+    Unlike the reviewer's token there is no login to match against — FIX_BOT is
+    documented as the ambient `gh auth` user, and a dedicated fixer PAT is
+    deliberately a DIFFERENT account from that. So the contract here is weaker
+    and stated rather than enforced: a token GitHub answered about and rejected
+    is never stored (it would wedge every fixer call), a token gh could not be
+    asked about is kept once and loudly, and skipping is allowed with the
+    consequence named."""
+    for attempt in range(1, attempts + 1):
+        try:
+            raw = getpass.getpass(
+                "  Fixer token FIX_BOT_TOKEN (paste, or @path to a file; "
+                "Enter to skip): "
+            ).strip()
+        except EOFError:
+            raw = ""
+        if not raw:
+            warn(
+                "no FIX_BOT_TOKEN stored — the fixer will act as the ambient `gh "
+                "auth` account and spend that account's rate-limit pool. "
+                "`issue-agent doctor` re-reports this."
+            )
+            return ""
+        token, problem = read_token_input(raw)
+        if problem:
+            warn(problem)
+        else:
+            login, answered = gh_login_for_token(token)
+            if not answered:
+                # Unlike the reviewer's loop there is no login to converge ON, so
+                # re-prompting would only ask the operator to paste the same
+                # secret again on a box where gh simply is not installed. Keep it
+                # once, loudly, and let doctor be the authority.
+                warn(
+                    "could not run `gh` to validate that token — storing it "
+                    "unverified; `issue-agent doctor` must confirm it."
+                )
+                return token
+            if not login:
+                warn(
+                    "GitHub rejected that token — expired, revoked, or lacking "
+                    "read:user. It will NOT be stored."
+                )
+            else:
+                ok(f"fixer token authenticates as '{login}'")
+                return token
+        if attempt < attempts:
+            info(f"try again ({attempts - attempt} attempt(s) left).")
+    warn(
+        f"no FIX_BOT_TOKEN stored after {attempts} attempts — the fixer will act "
+        "as the ambient `gh auth` account. `issue-agent doctor` re-reports this."
+    )
+    return ""
+
+
+def _wizard_pool_summary(fields: list[tuple[str, str]]) -> IdentityPoolReport:
+    """Replay doctor's identity/pool analysis over what the wizard just
+    collected, so the operator learns at CONFIG time — not after an hour of
+    exhausted quota — which roles share a credential and what that costs.
+
+    POLL_SECONDS is a per-repo knob the wizard never asks about and shared.env
+    never holds, so it is left absent on purpose: the estimate then says out loud
+    that it assumed the default."""
+    return report_identity_pools({key: value for key, value in fields if value})
+
+
 def detect_claude_auth() -> bool:
     """Is a Claude credential present? Either the CLI's stored login or an API
     key/token in the environment the daemons inherit."""
@@ -739,6 +808,21 @@ def report_codex_resolution(codex_bin: str) -> CodexResolutionReport:
         ok(line) if report.healthy else info(line)
     for finding in report.findings:
         (err if finding.level == "error" else warn)(f"codex: {finding.message}")
+    return report
+
+
+def report_identity_pools(env: dict) -> IdentityPoolReport:
+    """Print which credential each role runs on and whose rate-limit pool it
+    spends. Shared by `doctor` and the `init` wizard so both speak from one
+    resolution. Offline by construction — doctor.sh already probes the tokens it
+    can see; what it cannot see is the RESOLUTION, which is config alone."""
+    report = identity_pool_report(env)
+    for role in report.roles:
+        line = f"identity: {role.role} → {role.source}"
+        (info if role.ambient else ok)(line)
+    for finding in report.findings:
+        emit = {"error": err, "warn": warn}.get(finding.level, info)
+        emit(f"identity: {finding.message}")
     return report
 
 
@@ -2254,28 +2338,52 @@ def cmd_doctor(args) -> int:
         warn(f"no overlay config/repos/{name}.env yet — checking config/shared.env "
              f"against the detected repo. `issue-agent start` writes the overlay "
              f"(TEST_CMD, BASE_BRANCH, state dirs); re-run doctor after that.")
-    _doctor_codex_binary(env)
-    return subprocess.run([_BASH, _bin("doctor.sh")], env=env).returncode
+    composed = _composed_env(env)
+    _doctor_codex_binary(composed)
+    identity = _doctor_identity_pools(composed)
+    rc = subprocess.run([_BASH, _bin("doctor.sh")], env=env).returncode
+    # An error-level identity finding must redden the EXIT CODE, not only the
+    # terminal. doctor is used as a gate (bin/point-at.sh, CI); a config whose
+    # fixer token is present-but-unusable 401s every call with no fallback, and
+    # returning doctor.sh's 0 for it is the false green this check replaces.
+    if rc == 0 and any(f.level == "error" for f in identity.findings):
+        return 1
+    return rc
 
 
 CODEX_RUNTIME_KEYS = ("FIXER_RUNTIME", "REVIEWER_RUNTIME", "STEWARD_RUNTIME")
 
 
-def _doctor_codex_binary(env: dict) -> CodexResolutionReport | None:
+def _composed_env(env: dict) -> dict:
+    """The env the DAEMONS will see: the composed snapshot AGENT_ENV names, or
+    the inherited environment when there is none.
+
+    An unreadable or unsourceable snapshot is doctor.sh's error to report; the
+    Python-side checks fall back to the inherited environment rather than
+    pre-empting it with a second, less informative failure."""
+    agent_env = env.get("AGENT_ENV", "")
+    if not agent_env:
+        return dict(env)
+    try:
+        return source_env_file(agent_env, env)
+    except ValueError:
+        return dict(env)
+
+
+def _doctor_identity_pools(composed: dict) -> IdentityPoolReport:
+    """Report which credential each role resolves to and whose GitHub rate-limit
+    pool it spends. doctor.sh checks the tokens it can SEE — it cannot see the
+    fixer falling through to ambient `gh auth`, nor that two roles pointed at one
+    token share one 5,000-point/hour pool (both keifu, 2026-08-02)."""
+    info("identity and rate-limit pools")
+    return report_identity_pools(composed)
+
+
+def _doctor_codex_binary(composed: dict) -> CodexResolutionReport | None:
     """Report codex binary resolution when the composed env actually selects a
     codex runtime (or pins CODEX_BIN). doctor.sh cannot do this: it checks the
     codex CONTRACT, not which of several installed codex binaries the daemons
     will exec, which is what broke keifu on 2026-08-02."""
-    composed = dict(env)
-    agent_env = env.get("AGENT_ENV", "")
-    if agent_env:
-        try:
-            composed = source_env_file(agent_env, env)
-        except ValueError:
-            # Unreadable/unsourceable env is doctor.sh's error to report; the
-            # binary check just falls back to the inherited environment rather
-            # than pre-empting it with a second, less informative failure.
-            composed = dict(env)
     selects_codex = any(
         (composed.get(key) or "").strip().lower() == "codex"
         for key in CODEX_RUNTIME_KEYS
@@ -2566,6 +2674,20 @@ def cmd_init(args) -> int:
         else:
             warn("no REVIEW_BOT_TOKEN set — the reviewer will act as the ambient gh "
                  "account and GitHub will 422 its approvals.")
+    if identity_mode == "three":
+        # Asked regardless of the App answer: the App covers review+steward only,
+        # and the fixer's credential is FIX_BOT_TOKEN or nothing. Skipping this
+        # is what put keifu's fixer on a human account and its personal quota.
+        print()
+        print("  The fixer needs its OWN token too. Without FIX_BOT_TOKEN the fix")
+        print("  daemon falls through to the ambient `gh auth` credential: its")
+        print("  branches, comments and PRs are attributed to that human account,")
+        print("  and its GraphQL calls come out of that account's personal")
+        print("  5,000-point/hour pool.")
+        fix_token = prompt_fix_bot_token()
+        if fix_token:
+            fields.append(("FIX_BOT_TOKEN", fix_token))
+    _wizard_pool_summary(fields)
     print()
     if ask("Enable Jira sync? (y/N)", "N").lower().startswith("y"):
         fields.append(("JIRA_SYNC", "1"))

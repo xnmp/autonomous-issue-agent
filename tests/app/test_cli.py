@@ -1671,7 +1671,11 @@ def test_cmd_init_discards_a_rejected_token_at_the_attempt_ceiling(
     text = shared.read_text()
     assert "REVIEW_BOT_TOKEN" not in _shared_values(text)
     assert "t3" not in text
-    assert secrets.items == ["t4"]  # bounded at three attempts
+    assert secrets.items == []  # reviewer bounded at three, then the fixer prompt
+    # The fixer prompt has the same contract: t4 is rejected by the same stub, so
+    # neither identity may end up holding a token GitHub refused.
+    assert "FIX_BOT_TOKEN" not in _shared_values(text)
+    assert "t4" not in text
     assert "no REVIEW_BOT_TOKEN stored" in capsys.readouterr().err
 
 
@@ -1772,21 +1776,80 @@ def test_cmd_init_never_echoes_token_material(tmp_path, monkeypatch, capsys):
     assert "s3cret-pat" in _shared_values(shared.read_text())["REVIEW_BOT_TOKEN"]
 
 
-def test_cmd_init_skips_the_token_prompt_when_a_github_app_is_configured(
+def test_cmd_init_collects_a_fixer_token_and_reports_the_account_it_belongs_to(
+    tmp_path, monkeypatch, capsys
+):
+    """2026-08-02 keifu: with FIX_BOT_TOKEN unset the fix daemon fell through to
+    the ambient `gh auth` credential, acted as the human operator, and burned
+    that account's personal GraphQL pool. The wizard now asks."""
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch, answers=_wizard_answers(),
+        secrets=["review-pat", "fixer-pat"],
+        gh=_gh_stub(token_logins={
+            "review-pat": "review-bot", "fixer-pat": "fix-bot-account",
+        }),
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    values = _shared_values(shared.read_text())
+    assert values["FIX_BOT_TOKEN"] == "fixer-pat"
+    out = capsys.readouterr()
+    assert "fixer token authenticates as 'fix-bot-account'" in out.out
+    # …and with both identities distinct, the attribution finding is gone.
+    assert "FIX_BOT_TOKEN is not set" not in out.err
+
+
+def test_cmd_init_names_the_consequence_when_the_fixer_token_is_skipped(
+    tmp_path, monkeypatch, capsys
+):
+    shared, _asked, _s = _init_env(
+        tmp_path, monkeypatch, answers=_wizard_answers(),
+        secrets=["review-pat"],
+        gh=_gh_stub(token_logins={"review-pat": "review-bot"}),
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert "FIX_BOT_TOKEN" not in _shared_values(shared.read_text())
+    stderr = capsys.readouterr().err
+    assert "no FIX_BOT_TOKEN stored" in stderr
+    assert "FIX_BOT_TOKEN is not set" in stderr  # the doctor finding, at config time
+
+
+def test_cmd_init_does_not_ask_for_a_fixer_token_in_solo_mode(tmp_path, monkeypatch):
+    """solo mode has no bot identities: the human IS the reviewer and ambient is
+    the documented arrangement, so there is nothing to attribute away."""
+    shared, _asked, secrets = _init_env(
+        tmp_path, monkeypatch,
+        answers=_wizard_answers(mode="solo"), secrets=["never-read"],
+    )
+
+    assert cli.cmd_init(argparse.Namespace(force=False)) == 0
+    assert "FIX_BOT_TOKEN" not in _shared_values(shared.read_text())
+    assert secrets.prompts == []
+
+
+def test_cmd_init_skips_the_reviewer_token_prompt_when_a_github_app_is_configured(
     tmp_path, monkeypatch
 ):
+    """The App supplies the review+steward identity, so REVIEW_BOT_TOKEN is not
+    asked for. The FIXER's is: the App covers review and steward only, and
+    `main` builds the fix gateway from FIX_BOT_TOKEN or nothing (2026-08-02
+    keifu — an App-configured deployment still ran its fixer on the operator's
+    ambient credential)."""
     shared, _asked, secrets = _init_env(
         tmp_path, monkeypatch,
         answers=["three", "fix-bot", "review-bot", "review-bot", "y",
                  "123", "456", "/keys/app.pem", "N", "claude", "claude"],
-        secrets=["never-read"],
+        secrets=["fixer-pat"],
+        gh=_gh_stub(token_logins={"fixer-pat": "fix-bot"}),
     )
 
     assert cli.cmd_init(argparse.Namespace(force=False)) == 0
     values = _shared_values(shared.read_text())
     assert values["GH_APP_ID"] == "123"
     assert "REVIEW_BOT_TOKEN" not in values
-    assert secrets.prompts == []
+    assert values["FIX_BOT_TOKEN"] == "fixer-pat"
+    assert [p for p in secrets.prompts if "REVIEW_BOT_TOKEN" in p] == []
 
 
 def test_cmd_init_pins_codex_bin_when_the_path_hides_a_newer_install(
