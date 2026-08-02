@@ -51,6 +51,13 @@ class Backend:
         # data that cannot have changed. A few seconds of staleness is free —
         # the daemons themselves tick every 20s.
         self._snapshots = ghdata.TtlCache(ttl_s=snapshot_ttl_s)
+        # Behind the TTL, because the TTL only bounds how often we ask: on
+        # expiry the old collector re-read and re-folded all three feeds from
+        # byte zero, so a single polling browser tab held a core at 100% and
+        # the cost grew with the deployment's history (keifu, 2026-08-02). The
+        # collector answers an unchanged deployment from its own fingerprint
+        # and parses only appended bytes otherwise.
+        self._collector = system.SnapshotCollector()
         self._self_repo = system.remote_repo(self.harness_root)
         self.effects_factory = effects_factory
         self.control_db_path = control_db_path
@@ -75,7 +82,7 @@ class Backend:
             return cached
         return self._snapshots.put(
             name,
-            system.collect_snapshot(
+            self._collector.collect(
                 name=name,
                 repo=self.overlay_field(name, "REPO"),
                 target_dir=self.overlay_field(name, "TARGET_DIR"),

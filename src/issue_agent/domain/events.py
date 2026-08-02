@@ -12,6 +12,7 @@ import uuid
 from dataclasses import MISSING, dataclass, fields
 from datetime import datetime, timezone
 from enum import Enum
+from functools import lru_cache
 from types import MappingProxyType
 from typing import Any, ClassVar, Mapping, TypeVar, get_origin, get_type_hints
 
@@ -605,20 +606,40 @@ def event_registry() -> Mapping[str, type[EventPayload]]:
     return MappingProxyType(dict(_REGISTRY))
 
 
+@lru_cache(maxsize=None)
+def _decode_plan(cls: type) -> tuple[tuple[str, bool, bool], ...]:
+    """Per-field ``(name, listify_to_tuple, required)`` resolved once per class.
+
+    `get_type_hints` compiles and evaluates the class's string annotations
+    (this module is `from __future__ import annotations`). Doing that per
+    decoded event — three times, for the payload, producer and correlation —
+    cost ~0.46ms/event and was ~95% of `read_event_log`, which pinned a CPU
+    core on the dashboard's periodic re-fold (keifu, 2026-08-02). A class's
+    fields and annotations cannot change after definition, so the plan is a
+    pure function of the class and safe to memoize for the process lifetime.
+    """
+    type_hints = get_type_hints(cls)
+    return tuple(
+        (
+            field.name,
+            isinstance(field.default, tuple)
+            or get_origin(type_hints.get(field.name, field.type)) is tuple,
+            field.default is MISSING and field.default_factory is MISSING,
+        )
+        for field in fields(cls)
+    )
+
+
 def _construct(cls: type[PayloadT], raw: Mapping[str, Any]) -> PayloadT:
     kwargs: dict[str, Any] = {}
-    type_hints = get_type_hints(cls)
-    for field in fields(cls):
-        if field.name in raw:
-            value = raw[field.name]
-            field_type = type_hints.get(field.name, field.type)
-            if isinstance(value, list) and (
-                isinstance(field.default, tuple) or get_origin(field_type) is tuple
-            ):
+    for name, listify, required in _decode_plan(cls):
+        if name in raw:
+            value = raw[name]
+            if listify and isinstance(value, list):
                 value = tuple(value)
-            kwargs[field.name] = value
-        elif field.default is MISSING and field.default_factory is MISSING:
-            raise ValueError(f"{cls.__name__}.{field.name} is required")
+            kwargs[name] = value
+        elif required:
+            raise ValueError(f"{cls.__name__}.{name} is required")
     return cls(**kwargs)
 
 
