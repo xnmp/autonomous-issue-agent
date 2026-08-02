@@ -2432,6 +2432,10 @@ def build_review_daemon(
         # applies — a missing knob must never mean "no ceiling", which is the
         # unbounded state P0R-3 describes.
         max_unproductive_rounds=review_runtime.max_unproductive_rounds,
+        # The SAME value the submission side applies (dcfg.max_review_rejections
+        # below), so the decide side's abandoned-at-ceiling arm can never
+        # disagree with the breaker that created the state it is healing.
+        max_rejections=review_runtime.max_rejections,
     )
     dcfg = DispatchConfig(
         base_branch=repo_cfg.base_branch,

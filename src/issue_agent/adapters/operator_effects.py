@@ -27,6 +27,7 @@ from ..domain.contracts import (
 from ..domain.events import ActionApplied, Correlation, TelemetryEvent
 from ..domain.ports import EventSink
 from ..domain.repository import canonical_repository
+from ..domain.review import SubmittedReview
 
 EFFECT_TIMEOUT_SECONDS = 60.0
 
@@ -255,6 +256,101 @@ class GitHubOperatorEffects:
             self.journal.emit(event)
         except Exception:  # noqa: BLE001 - telemetry never fails the mutation
             pass
+
+    def pr_reviews(self, pr: int) -> tuple[SubmittedReview, ...]:
+        """Every submitted review on `pr`, oldest first, as GitHub reports it.
+
+        Raises rather than returning () on an unreadable answer: "no reviews"
+        and "could not read the reviews" lead to opposite operator decisions,
+        and the caller must be able to tell them apart.
+        """
+        rows = self._json(
+            [
+                "gh",
+                "api",
+                "--paginate",
+                f"repos/{self.repository}/pulls/{pr}/reviews",
+            ]
+        )
+        if not isinstance(rows, list):
+            raise OperatorEffectError(
+                f"pr #{pr} reviews returned an invalid payload"
+            )
+        return tuple(
+            SubmittedReview(
+                str(row.get("id") or ""),
+                str(row.get("state") or ""),
+                str((row.get("user") or {}).get("login") or "")
+                if isinstance(row.get("user"), dict)
+                else "",
+                str(row.get("submitted_at") or ""),
+            )
+            for row in rows
+            if isinstance(row, dict) and row.get("id") is not None
+        )
+
+    def dismiss_review(
+        self,
+        pr: int,
+        review: SubmittedReview,
+        message: str,
+    ) -> tuple[bool, str]:
+        """Retract one of OUR OWN standing change requests, durably.
+
+        Provenance (ADR 0012): the dismissal is executed by the harness's own
+        `gh` credential — the same trust domain that submitted the review and
+        that already owns every other operator effect here — and the caller
+        bounds the set to reviews `domain.review.stale_rejections` says count
+        toward the ceiling. Nothing below the harness can ask for a dismissal,
+        and no review authored outside the harness is reachable through this
+        method's contract.
+
+        Dismissing is the ONLY thing that re-arms the rejection ceiling: it is
+        computed from GitHub review state, so clearing labels and counters (all
+        an unblock used to do) left it tripped (keifu PR #173, 2026-08-02).
+        """
+        if pr <= 0 or not review.review_id:
+            return False, "a positive pr and a review id are required"
+        try:
+            command = self._command(
+                CommandKind.DISMISS_REVIEW,
+                f"review:{self.repository}:{pr}:{review.review_id}",
+                review.state.upper(),
+                {
+                    "pr": pr,
+                    "review_id": review.review_id,
+                    "message": message,
+                },
+            )
+            self._execute(
+                command,
+                reconcile=lambda: self._review_state(pr, review.review_id)
+                in {"DISMISSED", "absent"},
+                revision=lambda: self._review_state(pr, review.review_id),
+                apply=lambda: self._mutate(
+                    [
+                        "gh",
+                        "api",
+                        "--method",
+                        "PUT",
+                        f"repos/{self.repository}/pulls/{pr}/reviews/"
+                        f"{quote(review.review_id, safe='')}/dismissals",
+                        "-f",
+                        f"message={message}",
+                        "-f",
+                        "event=DISMISS",
+                    ]
+                ),
+            )
+            return True, "ok"
+        except Exception as exc:  # noqa: BLE001 - operator-facing result
+            return False, _detail(exc)
+
+    def _review_state(self, pr: int, review_id: str) -> str:
+        for review in self.pr_reviews(pr):
+            if review.review_id == review_id:
+                return review.state.upper()
+        return "absent"
 
     def set_repository_auto_merge(self, enabled: bool) -> tuple[bool, str]:
         try:

@@ -14,6 +14,7 @@ from ...adapters.operator_effects import build_operator_effects
 from ...adapters.store import Store
 from ...adapters.typed_journal import TypedJournal
 from ...domain import dashboard as dash
+from ...domain import review as review_dom
 from ...domain.events import (
     ActionApplied,
     Correlation,
@@ -26,6 +27,22 @@ from . import snapshots
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _positive_int(raw: str, default: int) -> int:
+    """A configured ceiling, or the domain default when the knob is absent or
+    malformed. A configured 0 is returned as 0 and means the breaker is OFF —
+    the harness-wide convention every other ceiling uses. Guessing a number
+    there would invent a breaker the daemons do not have."""
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+    return max(value, 0)
+
+
+def _detail(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"[:400]
 
 
 class Backend:
@@ -373,9 +390,18 @@ class Backend:
         )
 
     def unblock(self, name: str, number: int) -> tuple[bool, str]:
-        """Undo a hold a human is expected to clear: drop the labels that stop
-        re-dispatch and hand back the retry budget the wedge consumed. Nothing
-        is added — `decide()` re-derives the next lifecycle label itself.
+        """Undo a hold a human is expected to clear: dismiss the reviewer's
+        standing change requests, drop the labels that stop re-dispatch, and
+        hand back the retry budget the wedge consumed. No lifecycle label is
+        added — `decide()` re-derives the next one itself.
+
+        The dismissal is what makes this a RE-ARM rather than a cosmetic clear.
+        The rejection ceiling is computed from GitHub review state, not from a
+        counter, so labels-and-counters alone left it tripped: the next review
+        round was immediately at the ceiling again, and because the escalation
+        is edge-triggered on the label it had just removed, nothing was
+        journalled, relabelled or dispatched (keifu PR #173 / issue #25,
+        2026-08-02 — an invisible dead state with both clocks frozen).
 
         Refused unless the issue is actually held. Resetting breakers is not a
         neutral act: on a healthy issue it would silently buy retries nobody
@@ -400,6 +426,12 @@ class Backend:
         # because the counter reset happened whatever GitHub then did with the
         # labels — including the no-op path, which emits nothing of its own.
         effects = self._operator_effects(name, repo, journalled=False)
+        # Before the labels, and never allowed to wedge them: the counters and
+        # labels are still worth clearing when a dismissal cannot happen. But a
+        # re-arm that failed must NOT read as a clean unblock — the whole
+        # incident was a green result over a dead PR — so its notes ride back
+        # in the operator-facing detail as well as the journal.
+        rearm_failures = self._rearm_rejections(name, repo, number, effects)
         applied, detail = True, "ok"
         if held:
             applied, detail = effects.set_issue_labels(
@@ -419,7 +451,192 @@ class Backend:
         self._journal_unblock(
             name, repo, number, held, cleared, applied, pr_held=pr_held
         )
+        if applied and rearm_failures:
+            return True, "ok — but " + "; ".join(rearm_failures)
         return applied, detail
+
+    def _rearm_rejections(
+        self, name: str, repo: str, number: int, effects
+    ) -> list[str]:
+        """Dismiss the review bot's standing change requests on this issue's
+        open PRs, but ONLY where the rejection ceiling is what is holding them.
+
+        Bounded four ways: only this issue's projected PRs, only PRs whose next
+        rejection could no longer bounce back to the fixer, only the reviews
+        `stale_rejections` says count toward that ceiling, and never more of
+        them than the ceiling itself. Every outcome — including "the review bot
+        is not configured" and "GitHub would not say" — is journalled and
+        returned; none of them may fail the unblock, because the labels and
+        counters are still worth clearing when the dismissal cannot happen.
+
+        The below-ceiling exclusion is not caution, it is correctness: a live
+        change request is the fixer's next instruction (`domain.fix` dispatches
+        ADDRESS_REVIEW off exactly that state, and reads a DISMISSED review as
+        nothing to do). Retracting one because an unrelated breaker — a rebase
+        or CI ceiling — held the same issue would destroy the feedback and
+        strand the PR in a NEW dead state of the same family as #173.
+
+        Returns one note per outcome the operator must know about — an
+        empty list means the ceiling is not what is holding anything here, or
+        it was fully re-armed.
+        """
+        review_bot = cli.deployment_env_field(name, "REVIEW_BOT")
+        ceiling = _positive_int(
+            cli.deployment_env_field(name, "REVIEW_MAX_REJECTIONS"),
+            review_dom.DEFAULT_MAX_REVIEW_REJECTIONS,
+        )
+        prs = self._issue_prs(name, number)
+        # A disabled ceiling (REVIEW_MAX_REJECTIONS=0, the harness-wide
+        # "breaker off" convention) can never be what holds a PR, so there is
+        # never anything here to re-arm.
+        if not prs or ceiling <= 0:
+            return []
+        message = (
+            f"Dismissed by an operator re-arm of issue #{number} from the "
+            "harness dashboard: the rejection ceiling is recomputed from "
+            "GitHub review state, so this review had to be retracted for the "
+            "review loop to resume."
+        )
+        failures: list[str] = []
+        closed = self._closed_prs(repo)
+        for pr in prs:
+            # A merged or closed PR has no live review loop to re-arm, and
+            # GitHub refuses the dismissal anyway. A PR whose state could not be
+            # read is NOT assumed closed — the dismissal attempt reports the
+            # real error instead of silently skipping.
+            if pr <= 0 or pr in closed:
+                continue
+            try:
+                reviews = effects.pr_reviews(pr)
+            except Exception as exc:  # noqa: BLE001 - operator-facing result
+                note = f"pr #{pr} reviews unreadable: {_detail(exc)}"
+                failures.append(note)
+                self._journal_rearm_failure(name, repo, number, pr, note)
+                continue
+            # A PR carrying no change request at all has no ceiling to re-arm:
+            # say nothing rather than journal a "could not dismiss" line on
+            # every unblock of a perfectly healthy issue.
+            if not any(
+                r.state == review_dom.REVIEW_CHANGES_REQUESTED for r in reviews
+            ):
+                continue
+            if not review_bot:
+                note = (
+                    f"pr #{pr}: no REVIEW_BOT configured — standing change "
+                    "requests were left in place, so the rejection ceiling is "
+                    "still armed"
+                )
+                failures.append(note)
+                self._journal_rearm_failure(name, repo, number, pr, note)
+                continue
+            counted = review_dom.stale_rejections(
+                reviews, review_bot, limit=ceiling
+            )
+            # The same arithmetic `review_submission` applies: this many
+            # rejections stand, so the NEXT one escalates instead of bouncing
+            # back to the fixer. Below that the loop still has a round to give
+            # and the feedback must survive.
+            if len(counted) + 1 < ceiling:
+                continue
+            for review in counted:
+                ok, detail = effects.dismiss_review(pr, review, message)
+                if not ok:
+                    failures.append(
+                        f"pr #{pr} review {review.review_id} not dismissed: "
+                        f"{detail}"
+                    )
+                self._journal_dismissal(
+                    name, repo, number, pr, review, ok, detail
+                )
+        return failures
+
+    def _closed_prs(self, repo: str) -> frozenset[int]:
+        """PRs GitHub says are NOT open. An absent or unreadable state is
+        omitted deliberately: "closed" here suppresses a dismissal, and
+        suppressing one on a guess is how a re-arm silently does nothing."""
+        try:
+            payload, _error = self.gh.prs(repo)
+        except Exception:  # noqa: BLE001 - unknown state is not "closed"
+            return frozenset()
+        return frozenset(
+            number
+            for number, pr in ghdata.index_by_number(payload).items()
+            if str(pr.get("state") or "").strip() and not ghdata.is_open(pr)
+        )
+
+    def _journal_dismissal(
+        self,
+        name: str,
+        repo: str,
+        number: int,
+        pr: int,
+        review,
+        ok: bool,
+        detail: str,
+    ) -> None:
+        journal = self._operator_journal(name, repo)
+        if journal is None:
+            return
+        try:
+            journal.emit(
+                TelemetryEvent(
+                    ActionApplied(
+                        f"operator-dismiss-review:{uuid.uuid4().hex}",
+                        "operator_dismiss_review",
+                        "pr",
+                        f"operator re-arm pr #{pr}: "
+                        + (
+                            f"dismissed review {review.review_id}"
+                            if ok
+                            else f"review {review.review_id} NOT dismissed "
+                            f"({detail})"
+                        ),
+                        pr,
+                        {
+                            "add": [],
+                            "remove": [],
+                            "operator": f"{repo}:dashboard",
+                            "review_id": review.review_id,
+                            "review_state": review.state,
+                            "dismissed": ok,
+                            "detail": detail,
+                        },
+                    ),
+                    Correlation(issue=number, pr=pr),
+                )
+            )
+        except Exception:  # noqa: BLE001 - telemetry never fails the action
+            pass
+
+    def _journal_rearm_failure(
+        self, name: str, repo: str, number: int, pr: int, detail: str
+    ) -> None:
+        journal = self._operator_journal(name, repo)
+        if journal is None:
+            return
+        try:
+            journal.emit(
+                TelemetryEvent(
+                    ActionApplied(
+                        f"operator-dismiss-review:{uuid.uuid4().hex}",
+                        "operator_dismiss_review",
+                        "pr" if pr else "issue",
+                        f"operator re-arm of #{number} could not dismiss "
+                        f"change requests: {detail}",
+                        pr or number,
+                        {
+                            "add": [],
+                            "remove": [],
+                            "operator": f"{repo}:dashboard",
+                            "dismissed": False,
+                            "detail": detail,
+                        },
+                    ),
+                    Correlation(issue=number, pr=pr or None),
+                )
+            )
+        except Exception:  # noqa: BLE001 - telemetry never fails the action
+            pass
 
     def _attention_labels(
         self, name: str, repo: str, number: int

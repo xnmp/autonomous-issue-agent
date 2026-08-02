@@ -654,3 +654,192 @@ def test_a_removed_index_like_body_line_is_not_stripped():
     with_body = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-index 1111111..2222222 100644\n+x\n"
     without = "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n+x\n"
     assert patch_signature(with_body) != patch_signature(without)
+
+
+# ── operator re-arm: which reviews still arm the ceiling ─────────────────────
+def _sub(review_id, state="CHANGES_REQUESTED", author="review-bot"):
+    from issue_agent.domain.review import SubmittedReview
+
+    return SubmittedReview(review_id, state, author, f"2026-08-02T0{review_id}:00Z")
+
+
+def test_only_the_bots_change_requests_since_its_approve_still_count():
+    from issue_agent.domain.review import stale_rejections
+
+    reviews = (
+        _sub("1"),
+        _sub("2", state="APPROVED"),
+        _sub("3"),
+        _sub("4", author="a-human"),
+        _sub("5", state="COMMENTED"),
+        _sub("6"),
+    )
+    assert [r.review_id for r in stale_rejections(reviews, "review-bot")] == ["3", "6"]
+
+
+def test_an_already_dismissed_rejection_is_not_dismissed_again():
+    from issue_agent.domain.review import stale_rejections
+
+    reviews = (_sub("1", state="DISMISSED"), _sub("2"))
+    assert [r.review_id for r in stale_rejections(reviews, "review-bot")] == ["2"]
+
+
+def test_the_dismissal_set_matches_what_the_ceiling_counts():
+    """The re-arm's contract: dismiss exactly these and the ceiling reads zero."""
+    from issue_agent.domain.review import stale_rejections
+
+    reviews = (_sub("1"), _sub("2"), _sub("3", state="COMMENTED"))
+    counted = count_prior_rejections(
+        tuple(Review(r.state, r.author, r.submitted_at) for r in reviews),
+        "review-bot",
+    )
+    assert len(stale_rejections(reviews, "review-bot")) == counted
+
+
+def test_the_dismissal_set_is_bounded_newest_first():
+    from issue_agent.domain.review import stale_rejections
+
+    reviews = tuple(_sub(str(n)) for n in range(1, 6))
+    assert [r.review_id for r in stale_rejections(reviews, "review-bot", limit=2)] == [
+        "4", "5",
+    ]
+
+
+def test_an_empty_or_foreign_review_history_dismisses_nothing():
+    from issue_agent.domain.review import stale_rejections
+
+    assert stale_rejections((), "review-bot") == ()
+    assert stale_rejections((_sub("1", author="someone-else"),), "review-bot") == ()
+    # An unset review bot must select NOTHING: dismissing on a guess retracts
+    # verdicts that are not the harness's.
+    assert stale_rejections((_sub("1"),), "") == ()
+
+
+def test_a_state_the_ceiling_does_not_count_is_never_dismissed():
+    """The two must select the same set, or "dismiss these and the ceiling
+    reads zero" quietly stops holding. A lower-case state is not counted by
+    `count_prior_rejections`, so it must not be retracted here either."""
+    from issue_agent.domain.review import stale_rejections
+
+    weird = (_sub("1", state=""), _sub("2", state="changes_requested"),
+             _sub("3"))
+    assert [r.review_id for r in stale_rejections(weird, "review-bot")] == ["3"]
+    assert count_prior_rejections(
+        tuple(Review(r.state, r.author, r.submitted_at) for r in weird),
+        "review-bot",
+    ) == 1
+
+
+# ── self-healing: at ceiling with no attention label (keifu #173 / #25) ───────
+CEILING_CFG = ReviewConfig(review_bot="review-bot", max_rejections=4)
+
+
+def _abandoned_pr(number=9, *labels_, head="head1", rejections=3, escalation=True):
+    reviews = tuple(
+        Review("CHANGES_REQUESTED", "review-bot", f"2026-08-02T0{n}:00Z",
+               commit_id="head1")
+        for n in range(rejections)
+    )
+    if escalation:
+        reviews += (
+            Review("COMMENTED", "review-bot", "2026-08-02T09:00Z", commit_id=head),
+        )
+    return pr(number, *labels_, reviews=reviews, head_ref_oid=head)
+
+
+def _escalations(actions):
+    return [a for a in actions if isinstance(a, PostComment)]
+
+
+def test_a_ceiling_pr_whose_attention_label_was_cleared_is_escalated_again():
+    """The dead state: the ceiling escalation posted a COMMENT and swapped the
+    trigger label for needs-human-review; an operator unblock removed that label
+    and added none, so the reviewer would not review, the fixer would not fix,
+    and no further escalation could ever be emitted."""
+    actions = decide_review(
+        world(prs=(_abandoned_pr(),)), CEILING_CFG, ReviewState()
+    )
+    comments = _escalations(actions)
+    assert len(comments) == 1
+    assert "rejection ceiling (4)" in comments[0].body
+    relabels = [a for a in actions if isinstance(a, Relabel)]
+    assert [(r.target, r.number, r.add) for r in relabels] == [
+        (Target.PR, 9, Label.NEEDS_HUMAN_REVIEW)
+    ]
+
+
+def test_the_re_emission_happens_once_per_unblock_not_once_per_tick():
+    """Escalating re-applies needs-human-review, and the label's presence is the
+    dedup key: the very next poll sees a held PR and says nothing (ADR 0012)."""
+    held = _abandoned_pr(9, Label.NEEDS_HUMAN_REVIEW.value)
+    assert decide_review(world(prs=(held,)), CEILING_CFG, ReviewState()) == []
+
+
+def test_a_pr_below_the_ceiling_is_never_re_escalated():
+    below = _abandoned_pr(rejections=1)
+    assert _escalations(
+        decide_review(world(prs=(below,)), CEILING_CFG, ReviewState())
+    ) == []
+
+
+def test_a_reviewer_that_has_not_given_up_on_this_head_still_gets_its_round():
+    """At 3 of 4 rejections the reviewer may still APPROVE the next revision —
+    re-escalating there would cut a healthy loop a round short."""
+    still_working = _abandoned_pr(escalation=False)
+    assert _escalations(
+        decide_review(world(prs=(still_working,)), CEILING_CFG, ReviewState())
+    ) == []
+
+
+def test_a_fixer_push_past_the_escalation_earns_a_re_review_not_a_re_escalation():
+    moved = _abandoned_pr(head="head1")
+    moved = replace(moved, head_ref_oid="head2")
+    assert _escalations(
+        decide_review(world(prs=(moved,)), CEILING_CFG, ReviewState())
+    ) == []
+
+
+def test_a_disabled_ceiling_never_re_escalates():
+    cfg = replace(CEILING_CFG, max_rejections=0)
+    assert _escalations(
+        decide_review(world(prs=(_abandoned_pr(),)), cfg, ReviewState())
+    ) == []
+
+
+def test_a_closed_pr_is_left_alone():
+    closed = replace(_abandoned_pr(), state="CLOSED")
+    assert decide_review(world(prs=(closed,)), CEILING_CFG, ReviewState()) == []
+
+
+def test_an_abandoned_pr_is_escalated_rather_than_adopted():
+    """Adoption matches the same shape (no trigger label, no needs-human-review)
+    and would pay for a review that can only skip — the silent half of #173."""
+    cfg = replace(CEILING_CFG, adopt_unlabeled=True)
+    actions = decide_review(
+        world(prs=(_abandoned_pr(),)), cfg, ReviewState()
+    )
+    assert not [a for a in actions if isinstance(a, RunAgent)]
+    assert len(_escalations(actions)) == 1
+
+
+def test_an_unplaceable_escalation_comment_falls_through_to_the_round_breaker():
+    """commit_id unknown ("" — the adapter could not resolve it) fails CLOSED:
+    the unproductive-rounds ceiling is the backstop."""
+    unplaceable = _abandoned_pr()
+    unplaceable = replace(
+        unplaceable,
+        reviews=unplaceable.reviews[:-1]
+        + (Review("COMMENTED", "review-bot", "2026-08-02T09:00Z"),),
+    )
+    assert _escalations(
+        decide_review(world(prs=(unplaceable,)), CEILING_CFG, ReviewState())
+    ) == []
+
+
+def test_a_pr_still_carrying_the_trigger_label_belongs_to_the_review_loop():
+    """The reviewer's own labelled arm decides whether it gets a round; acting
+    on it here would be a second decision about the same PR in one tick."""
+    labelled = _abandoned_pr(9, CEILING_CFG.trigger_label.value)
+    assert _escalations(
+        decide_review(world(prs=(labelled,)), CEILING_CFG, ReviewState())
+    ) == []

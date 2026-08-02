@@ -292,6 +292,7 @@ class CommandKind(str, Enum):
     RERUN_CHECKS = "rerun_checks"
     ADD_DEPENDENCY = "add_dependency"
     SUBMIT_REVIEW = "submit_review"
+    DISMISS_REVIEW = "dismiss_review"
     PUBLISH_BRANCH = "publish_branch"
     OPEN_PULL_REQUEST = "open_pull_request"
     UPDATE_PULL_REQUEST_BODY = "update_pull_request_body"

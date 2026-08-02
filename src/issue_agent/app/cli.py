@@ -116,6 +116,9 @@ _OVERLAY_FIELDS = (
     "REPO", "TARGET_DIR", "STATE_DIR", "REVIEW_STATE_DIR", "STEWARD_STATE_DIR",
     "TEST_CMD", "BASE_BRANCH", "DAILY_SPEND_CAP_USD", "GLOBAL_DAILY_SPEND_CAP_USD",
     "FIXER_RUNTIME", "REVIEWER_RUNTIME", "STEWARD_RUNTIME", "REVIEW_MODE",
+    # Read by the dashboard's operator re-arm: which login's change requests
+    # count toward the rejection ceiling, and how many of them it takes.
+    "REVIEW_BOT", "REVIEW_MAX_REJECTIONS",
     REPOINT_HISTORY_ENV,
 )
 
@@ -1867,6 +1870,16 @@ def _deployment_env_field(name: str, field: str) -> str:
         if value:
             return value
     return ""
+
+
+def deployment_env_field(name: str, field: str) -> str:
+    """Public read of one composed config field (snapshot, then overlay).
+
+    `read_repo_env_field` alone goes blind to anything set only in
+    `config/shared.env` or only in the launch snapshot, which is where a
+    deployment's REVIEW_BOT normally lives.
+    """
+    return _deployment_env_field(name, field)
 
 
 def journal_paths(name: str) -> list[str]:
