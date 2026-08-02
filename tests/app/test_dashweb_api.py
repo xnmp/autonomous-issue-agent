@@ -89,7 +89,12 @@ class StubBackend:
             "caps": {
                 "issue_cap_usd": None, "daily_cap_usd": None, "today_usd": 1.0,
             },
-            "health": [], "unattributed": [], "health_trend": [], "warnings": [],
+            "health": [], "unattributed": [], "health_trend": [],
+            "spend_per_hour": [
+                {"hour_start_iso": "2026-07-29T11:00:00+00:00", "usd": 1.0},
+                {"hour_start_iso": "2026-07-29T12:00:00+00:00", "usd": 0.0},
+            ],
+            "warnings": [],
         }
 
     def issues(self, name):
@@ -177,6 +182,18 @@ def test_verification_returns_rows():
 def test_overview_carries_metrics_cost_mix_caps_and_health():
     body = client().get("/api/repos/demo/overview").json()
     assert set(body) >= {"metrics", "cost_mix", "caps", "health", "unattributed"}
+
+
+def test_overview_carries_the_hourly_spend_series():
+    series = client().get("/api/repos/demo/overview").json()["spend_per_hour"]
+    assert [bucket["usd"] for bucket in series] == [1.0, 0.0]
+    assert series[0]["hour_start_iso"] == "2026-07-29T11:00:00+00:00"
+
+
+def test_a_degraded_overview_still_answers_with_an_empty_spend_series():
+    backend = StubBackend(explode="overview")
+    body = client(backend).get("/api/repos/demo/overview").json()
+    assert body["spend_per_hour"] == [] and body["warnings"]
 
 
 def test_overview_forwards_the_browser_timezone():

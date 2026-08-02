@@ -50,10 +50,45 @@ async function decodeError(res: Response): Promise<never> {
   throw new ApiError(detail, res.status);
 }
 
+/**
+ * A closed enum in the contract must not be able to blank a whole tab.
+ *
+ * `pr_review_state` is a narrow `Literal` on the backend, so the generated
+ * schema rejects any third value — and one unknown string in one card would
+ * fail the whole payload's `safeParse` and leave the Issues tab showing an
+ * error instead of fifty perfectly readable rows. A value this client does not
+ * understand means exactly what a missing one means: no merge-readiness mark.
+ * Widening happens here rather than in the generated file, which is only ever
+ * written by `npm run generate:api`.
+ */
+const KNOWN_PR_REVIEW_STATES = new Set(["mergeable", "changes_requested"]);
+
+function normaliseIssueCard(card: unknown): unknown {
+  if (!card || typeof card !== "object") return card;
+  const state = (card as { pr_review_state?: unknown }).pr_review_state;
+  if (state === null || state === undefined || KNOWN_PR_REVIEW_STATES.has(state as string)) {
+    return card;
+  }
+  return { ...card, pr_review_state: null };
+}
+
+export function normaliseIssuesPayload(payload: unknown): unknown {
+  if (!payload || typeof payload !== "object") return payload;
+  const body = payload as Record<string, unknown>;
+  const lanes = ["in_flight", "done"] as const;
+  const patched = Object.fromEntries(
+    lanes
+      .filter((lane) => Array.isArray(body[lane]))
+      .map((lane) => [lane, (body[lane] as unknown[]).map(normaliseIssueCard)]),
+  );
+  return { ...body, ...patched };
+}
+
 async function request<T>(
   path: string,
   init: RequestInit & { signal?: AbortSignal },
   schema?: z.ZodTypeAny,
+  normalise?: (payload: unknown) => unknown,
 ): Promise<T> {
   let res: Response;
   try {
@@ -68,7 +103,8 @@ async function request<T>(
     );
   }
   if (!res.ok) await decodeError(res);
-  const payload: unknown = await res.json();
+  const body: unknown = await res.json();
+  const payload = normalise ? normalise(body) : body;
   if (!schema) return payload as T;
   const parsed = schema.safeParse(payload);
   if (!parsed.success) {
@@ -84,8 +120,9 @@ export function getJson<T>(
   path: string,
   schema: z.ZodTypeAny,
   signal?: AbortSignal,
+  normalise?: (payload: unknown) => unknown,
 ): Promise<T> {
-  return request<T>(path, { method: "GET", signal }, schema);
+  return request<T>(path, { method: "GET", signal }, schema, normalise);
 }
 
 export function postJson<T>(
@@ -128,7 +165,12 @@ export const api = {
     ),
 
   issues: (name: string, s?: AbortSignal) =>
-    getJson<IssuesPayload>(`/api/repos/${enc(name)}/issues`, schemas.IssuesPayload, s),
+    getJson<IssuesPayload>(
+      `/api/repos/${enc(name)}/issues`,
+      schemas.IssuesPayload,
+      s,
+      normaliseIssuesPayload,
+    ),
 
   issue: (name: string, n: number, s?: AbortSignal) =>
     getJson<IssueDetailPayload>(

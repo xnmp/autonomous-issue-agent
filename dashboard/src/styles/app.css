@@ -742,6 +742,43 @@
   text-align: right;
 }
 
+/* ---------- histogram (dense hourly series) ---------- */
+.hist {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+}
+.hist-plot {
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+  height: 84px;
+  /* the shared baseline is the chart's only rule — no gridlines behind 48 bars */
+  border-bottom: 1px solid var(--border-strong);
+}
+.hist-col {
+  flex: 1 1 0;
+  min-width: 2px;
+  height: 100%;
+  display: flex;
+  align-items: flex-end;
+}
+.hist-bar {
+  width: 100%;
+  min-height: 2px;
+  border-radius: 1px 1px 0 0;
+}
+.hist-axis {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s2);
+  font-size: var(--fs-xs);
+}
+.hist-axis-peak {
+  color: var(--ink-muted);
+}
+
 /* ---------- eta progress ---------- */
 .eta {
   display: flex;
@@ -1196,6 +1233,12 @@
 .issue-context {
   max-width: 75ch;
   color: var(--ink-muted);
+  /* A long backlog description must not push the next row off the screen: the
+   * body scrolls inside its own box, and the scroll stops at its edge rather
+   * than chaining to the table behind it. */
+  max-height: 22rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .issue-context p,
 .issue-context ul,

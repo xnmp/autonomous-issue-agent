@@ -145,6 +145,9 @@ class Backend:
             local_tz=local_tz,
         )
         payload["first_observed_day"] = first_observed_day
+        payload["spend_per_hour"] = snapshots.spend_per_hour(
+            snapshot.deployment, self.now_fn()
+        )
         if issue_error:
             payload["warnings"].append(issue_error)
         elif isinstance(issues, list) and len(issues) >= ghdata.ISSUE_HISTORY_LIMIT:
@@ -171,7 +174,7 @@ class Backend:
         gh_issues, gh_prs, warnings = self._gh_context(snap.repo)
         if snap.deployment.schema_version == 2:
             gh_issues = {
-                number: _github_enrichment(issue)
+                number: _github_issue_enrichment(issue)
                 for number, issue in gh_issues.items()
             }
             gh_prs = {
@@ -182,9 +185,9 @@ class Backend:
         projected_by_model = snapshots.projected_cost_by_model(rows)
         projected_eta = snapshots.mean_wall_clock_s(rows)
         verification_payload = self.verification()
-        issue_status, pr_status = verification.status_indexes(
-            verification_payload.get("rows", [])
-        )
+        ledger_rows = verification_payload.get("rows", [])
+        issue_status, pr_status = verification.status_indexes(ledger_rows)
+        issue_reason, pr_reason = verification.reason_indexes(ledger_rows)
 
         def card(row):
             model = snapshots.projection_model(row)
@@ -199,6 +202,10 @@ class Backend:
                 projected_model=model,
                 issue_verification=issue_status.get(row.issue),
                 pr_verification=pr_status.get(pr) if pr is not None else None,
+                issue_verification_reason=issue_reason.get(row.issue),
+                pr_verification_reason=(
+                    pr_reason.get(pr) if pr is not None else None
+                ),
             )
 
         row_by_issue = {row.issue: row for row in rows}
@@ -294,7 +301,7 @@ class Backend:
         gh_issues, gh_prs, warnings = self._gh_context(snap.repo)
         if snap.deployment.schema_version == 2:
             gh_issues = {
-                key: _github_enrichment(value)
+                key: _github_issue_enrichment(value)
                 for key, value in gh_issues.items()
             }
             gh_prs = {
@@ -595,14 +602,35 @@ class Backend:
         return journal
 
 
-def _github_enrichment(value: dict) -> dict:
-    """Only fields GitHub may add to an authoritative v2 projection."""
+# Only fields GitHub may add to an authoritative v2 projection. Every key is
+# presentational: the v2 world projection decides which bucket a card sits in,
+# and none of these can move it.
+#
+# A pull request has no v2-projected lifecycle of its own, so its merge/review
+# fields come from GitHub — without them a v2 deployment showed a PR chip with
+# no state at all. An *issue* does: `state` and `mergedAt` are the projection's
+# to own, and letting a GitHub read supply them would put a second, contradicting
+# answer in the same dict key the projection already filled.
+_PR_ENRICHMENT_FIELDS = (
+    "title", "url", "state", "mergedAt", "reviewDecision", "mergeable",
+)
+_ISSUE_ENRICHMENT_FIELDS = ("title", "url")
 
-    return {
-        key: value[key]
-        for key in ("title", "url")
-        if value.get(key) is not None
-    }
+
+def _enrichment(value: dict, fields: tuple[str, ...]) -> dict:
+    return {key: value[key] for key in fields if value.get(key) is not None}
+
+
+def _github_enrichment(value: dict) -> dict:
+    """PR-side enrichment: everything a PR chip renders."""
+
+    return _enrichment(value, _PR_ENRICHMENT_FIELDS)
+
+
+def _github_issue_enrichment(value: dict) -> dict:
+    """Issue-side enrichment: only what the v2 projection cannot supply."""
+
+    return _enrichment(value, _ISSUE_ENRICHMENT_FIELDS)
 
 
 def _projected_issue(row: dash.IssueRow, enrichment: dict) -> dict:

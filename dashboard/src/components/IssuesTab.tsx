@@ -1,6 +1,7 @@
 import {
   Fragment,
   lazy,
+  memo,
   Suspense,
   useMemo,
   useState,
@@ -20,17 +21,35 @@ import type {
 } from "../api/types";
 import type { IssuesSub } from "../routing/hash";
 import {
+  blocksOnHuman,
   combinedVerificationStatus,
+  difficultyTone,
   familyVar,
   flagTone,
+  impactTone,
+  issueTypeTone,
+  labelTone,
   modelTone,
+  prReviewMark,
   prStateTone,
   stateTone,
   stepKindTone,
+  verificationGlyph,
+  verificationSummary,
   verificationTone,
+  type Tone,
 } from "../lib/semantics";
-import { ageCompact, duration, localDate, localTime, num, usd } from "../lib/format";
+import {
+  ageCompact,
+  duration,
+  localDate,
+  localTime,
+  num,
+  parseTs,
+  usd,
+} from "../lib/format";
 import { shortModel } from "../lib/models";
+import { readFlag, writeFlag } from "../lib/prefs";
 import { Chip } from "./ui/Chip";
 import { EtaProgress } from "./ui/Charts";
 import { StepBadgeRow } from "./ui/StepBadge";
@@ -86,6 +105,8 @@ const COLUMN_CHOICES: Record<IssuesSub, ColumnChoice[]> = {
     { key: "verification", label: "Verification" },
     { key: "model", label: "Model" },
     { key: "rounds", label: "Rounds" },
+    { key: "labels", label: "Labels" },
+    { key: "since", label: "Time since done" },
     { key: "merged", label: "Date" },
   ],
   backlog: [
@@ -101,8 +122,13 @@ const COLUMN_CHOICES: Record<IssuesSub, ColumnChoice[]> = {
 
 const DEFAULT_VISIBILITY: Visibility = {
   inflight: Object.fromEntries(COLUMN_CHOICES.inflight.map(({ key }) => [key, true])),
+  // "how long ago" is what an operator scanning the done list actually asks;
+  // the absolute date is available beside it, off by default.
   done: Object.fromEntries(
-    COLUMN_CHOICES.done.map(({ key }) => [key, key !== "rounds"]),
+    COLUMN_CHOICES.done.map(({ key }) => [
+      key,
+      key !== "rounds" && key !== "merged" && key !== "labels",
+    ]),
   ),
   backlog: Object.fromEntries(
     COLUMN_CHOICES.backlog.map(({ key }) => [
@@ -111,6 +137,10 @@ const DEFAULT_VISIBILITY: Visibility = {
     ]),
   ),
 };
+
+/** Done rows carry one wordy badge (the verification verdict); an operator
+ * scanning fifty merged issues wants the column narrow, not readable. */
+const ICON_BADGES_STORAGE = "issue-agent.dashboard.done-icon-badges";
 
 function storedVisibility(): Visibility {
   try {
@@ -135,6 +165,7 @@ export function IssuesTab({
   showDurationSeconds = true,
 }: IssuesTabProps) {
   const [visibility, setVisibility] = useState<Visibility>(storedVisibility);
+  const [iconBadges, setIconBadges] = useState(() => readFlag(ICON_BADGES_STORAGE, false));
   const [columnMenuAt, setColumnMenuAt] = useState<{ x: number; y: number } | null>(null);
   const data = issues.data;
   const ghOk = data?.gh_ok ?? true;
@@ -142,16 +173,23 @@ export function IssuesTab({
     () => new Set(Object.entries(visibility[sub]).filter(([, shown]) => shown).map(([key]) => key)),
     [sub, visibility],
   );
+  // One in-flight payload, split by who owns the next move. The backend already
+  // decided that per card; the board only groups by it.
+  const [blocked, running] = useMemo(() => {
+    const cards = data?.in_flight ?? [];
+    return [cards.filter(blocksOnHuman), cards.filter((card) => !blocksOnHuman(card))];
+  }, [data?.in_flight]);
+  // Persisted by the handler, never by the state updater: React may invoke an
+  // updater more than once for a single click, and a reducer that writes to
+  // storage is not a pure function of its input.
   const setColumn = (key: string, shown: boolean) => {
-    setVisibility((current) => {
-      const next = { ...current, [sub]: { ...current[sub], [key]: shown } };
-      try {
-        localStorage.setItem(COLUMN_STORAGE, JSON.stringify(next));
-      } catch {
-        // URL navigation and in-memory preferences remain usable without storage.
-      }
-      return next;
-    });
+    const next = { ...visibility, [sub]: { ...visibility[sub], [key]: shown } };
+    setVisibility(next);
+    try {
+      localStorage.setItem(COLUMN_STORAGE, JSON.stringify(next));
+    } catch {
+      // URL navigation and in-memory preferences remain usable without storage.
+    }
   };
   const openColumnMenu = (event: MouseEvent<HTMLDivElement>) => {
     if (!(event.target instanceof Element) || !event.target.closest("th")) return;
@@ -180,10 +218,31 @@ export function IssuesTab({
 
       {sub === "inflight" ? (
         <>
+          {/* Blocked leads the board: it is the only section whose rows cannot
+              move until a person acts, so it must not be scrolled past. It
+              disappears entirely when nothing is waiting, rather than standing
+              as a permanent empty heading. */}
+          {blocked.length > 0 ? (
+            <>
+              <SectionTitle>Blocked</SectionTitle>
+              <InFlightTable
+                storageKey="issues-blocked"
+                repo={repo}
+                cards={blocked}
+                onRefresh={issues.refresh}
+                anchorMs={issues.updatedAt}
+                loading={issues.loading}
+                visible={visible}
+                onOpen={onOpenIssue}
+                showProjectedCost={showProjectedCost}
+                showDurationSeconds={showDurationSeconds}
+              />
+            </>
+          ) : null}
           <SectionTitle>In flight</SectionTitle>
           <InFlightTable
             repo={repo}
-            cards={data?.in_flight ?? []}
+            cards={running}
             onRefresh={issues.refresh}
             anchorMs={issues.updatedAt}
             loading={issues.loading}
@@ -205,15 +264,37 @@ export function IssuesTab({
       ) : null}
 
       {sub === "done" ? (
-        <DoneTable
-          repo={repo}
-          cards={data?.done ?? []}
-          loading={issues.loading}
-          visible={visible}
-          onOpen={onOpenIssue}
-          onRefresh={issues.refresh}
-          showDurationSeconds={showDurationSeconds}
-        />
+        <>
+          <SectionTitle
+            right={
+              <button
+                className="btn btn-xs"
+                type="button"
+                aria-pressed={iconBadges}
+                title="Show the verification verdict as an icon only; the full verdict and its reason stay on hover"
+                onClick={() => {
+                  const next = !iconBadges;
+                  setIconBadges(next);
+                  writeFlag(ICON_BADGES_STORAGE, next);
+                }}
+              >
+                Badges: {iconBadges ? "icons" : "words"}
+              </button>
+            }
+          >
+            Done
+          </SectionTitle>
+          <DoneTable
+            repo={repo}
+            cards={data?.done ?? []}
+            loading={issues.loading}
+            visible={visible}
+            iconBadges={iconBadges}
+            onOpen={onOpenIssue}
+            onRefresh={issues.refresh}
+            showDurationSeconds={showDurationSeconds}
+          />
+        </>
       ) : null}
 
       {sub === "backlog" ? (
@@ -241,6 +322,10 @@ function InFlightTable({
   onRefresh,
   showProjectedCost,
   showDurationSeconds,
+  // Two of these are on screen at once. Sharing one storage key would give a
+  // single stored width/order/sort two live owners, and a drag in one table
+  // would leave the other showing the old layout until the next reload.
+  storageKey = "issues-inflight",
 }: {
   repo: string;
   cards: IssueCard[];
@@ -249,10 +334,12 @@ function InFlightTable({
   visible: ReadonlySet<string>;
   onOpen: (issue: number) => void;
   onRefresh: () => void;
+  storageKey?: string;
   showProjectedCost: boolean;
   showDurationSeconds: boolean;
 }) {
   const [expanded, setExpanded] = useState<number | null>(null);
+  const sortableAndShown = useMemo(() => new Set(["issue", ...visible]), [visible]);
   const sorted = useSortedRows(cards, {
     issue: (card) => card.issue,
     tasks: (card) => card.steps.length,
@@ -264,7 +351,7 @@ function InFlightTable({
         : null
     ),
     model: (card) => card.models.join(" "),
-  }, { key: "issue", direction: "asc" });
+  }, { key: "issue", direction: "asc" }, storageKey, sortableAndShown);
   const now = useClock();
   if (loading) return <SkeletonRows what="in-flight issues" rows={5} />;
   if (cards.length === 0) return <EmptyState>no issues in flight — the fixer is idle</EmptyState>;
@@ -281,7 +368,7 @@ function InFlightTable({
   return (
     <div className="tbl-wrap panel">
       <ResizableTable
-        storageKey="issues-inflight"
+        storageKey={storageKey}
         columns={columns}
         className="issue-list-table"
         sort={sorted.sort}
@@ -402,13 +489,23 @@ function PendingTable({
 }) {
   const [busyIssue, setBusyIssue] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // This table's column choices are namespaced (`pending-*`) because it shares
+  // the in-flight sub-tab's menu, so the visible set has to be translated into
+  // this table's own sort keys.
+  const sortableAndShown = useMemo(() => new Set([
+    "issue",
+    ...(visible.has("pending-priority") ? ["priority"] : []),
+    ...(visible.has("pending-overlap") ? ["overlap"] : []),
+    ...(visible.has("pending-hold") ? ["state"] : []),
+    ...(visible.has("pending-labels") ? ["labels"] : []),
+  ]), [visible]);
   const sorted = useSortedRows(cards, {
     issue: (card) => card.issue,
     priority: (card) => card.priority,
     overlap: (card) => card.overlap === null ? null : String(card.overlap),
     state: (card) => card.hold_reason ?? "pending",
     labels: (card) => card.labels.join(" "),
-  }, { key: "issue", direction: "asc" });
+  }, { key: "issue", direction: "asc" }, "issues-pending", sortableAndShown);
   if (loading) return <SkeletonRows what="pending issues" rows={3} />;
   if (cards.length === 0) {
     return <EmptyState>{ghOk ? "nothing is pending" : "pending needs GitHub data"}</EmptyState>;
@@ -515,6 +612,7 @@ function DoneTable({
   cards,
   loading,
   visible,
+  iconBadges,
   onOpen,
   onRefresh,
   showDurationSeconds,
@@ -523,11 +621,15 @@ function DoneTable({
   cards: IssueCard[];
   loading: boolean;
   visible: ReadonlySet<string>;
+  iconBadges: boolean;
   onOpen: (issue: number) => void;
   onRefresh: () => void;
   showDurationSeconds: boolean;
 }) {
   const [expanded, setExpanded] = useState<number | null>(null);
+  // The issue column is always rendered, so it is always a legal remembered
+  // sort; everything else is the reader's current column choice.
+  const sortableAndShown = useMemo(() => new Set(["issue", ...visible]), [visible]);
   const sorted = useSortedRows(cards, {
     issue: (card) => card.issue,
     cost: (card) => card.cost_usd,
@@ -538,8 +640,11 @@ function DoneTable({
     ),
     model: (card) => card.models.join(" "),
     rounds: (card) => card.rounds,
-    merged: (card) => card.merged_ts ?? card.last_ts,
-  }, { key: "merged", direction: "desc" });
+    labels: (card) => card.labels.join(" "),
+    // One clock, two renderings: "5d ago" and the calendar date sort together.
+    since: (card) => doneAtMs(card),
+    merged: (card) => doneAtMs(card),
+  }, { key: "since", direction: "desc" }, "issues-done", sortableAndShown);
   if (loading) return <SkeletonRows what="done issues" rows={5} />;
   if (cards.length === 0) return <EmptyState>nothing merged by the harness in this deployment yet</EmptyState>;
   const columns: TableColumn[] = [
@@ -549,6 +654,8 @@ function DoneTable({
     ...(visible.has("verification") ? [{ key: "verification", label: "Verification", width: 160 }] : []),
     ...(visible.has("model") ? [{ key: "model", label: "Model", width: 170 }] : []),
     ...(visible.has("rounds") ? [{ key: "rounds", label: "Rounds", className: "r", width: 90 }] : []),
+    ...(visible.has("labels") ? [{ key: "labels", label: "Labels", width: 240 }] : []),
+    ...(visible.has("since") ? [{ key: "since", label: "Since done", className: "r", width: 110 }] : []),
     ...(visible.has("merged") ? [{ key: "merged", label: "Date", width: 140 }] : []),
   ];
 
@@ -590,10 +697,16 @@ function DoneTable({
                     </td>
                   ) : null}
                   {visible.has("verification") ? (
-                    <td><VerificationStatus card={card} /></td>
+                    <td><VerificationStatus card={card} iconOnly={iconBadges} /></td>
                   ) : null}
                   {visible.has("model") ? <td><ModelList models={card.model_badges ?? card.models.map((model) => ({ model, effort: null }))} /></td> : null}
                   {visible.has("rounds") ? <td className="r num">{num(card.rounds)}</td> : null}
+                  {visible.has("labels") ? <td><LabelList labels={card.labels} /></td> : null}
+                  {visible.has("since") ? (
+                    <td className="r num" title={card.merged_ts ?? card.last_ts ?? ""}>
+                      <TimeSinceDone card={card} />
+                    </td>
+                  ) : null}
                   {visible.has("merged") ? (
                     <td className="mono faint" title={card.merged_ts ?? card.last_ts ?? ""}>
                       {localDate(card.merged_ts ?? card.last_ts)}
@@ -638,6 +751,7 @@ function BacklogTable({
   const [expanded, setExpanded] = useState<number | null>(null);
   const [promote, setPromote] = useState<BacklogCard | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const sortableAndShown = useMemo(() => new Set(["issue", ...visible]), [visible]);
   const sorted = useSortedRows(cards, {
     issue: (card) => card.issue,
     type: (card) => card.issue_type,
@@ -647,7 +761,7 @@ function BacklogTable({
     age: (card) => card.age_s ?? (card.age_days === null ? null : card.age_days * 86_400),
     comments: (card) => card.comments,
     labels: (card) => card.labels.join(" "),
-  }, { key: "issue", direction: "asc" });
+  }, { key: "issue", direction: "asc" }, "issues-backlog", sortableAndShown);
   if (loading) return <SkeletonRows what="backlog" rows={5} />;
   if (cards.length === 0) {
     return <EmptyState>{ghOk ? "no unlabelled open issues — the backlog is clear" : "backlog needs GitHub data, which is unavailable"}</EmptyState>;
@@ -730,9 +844,15 @@ function BacklogTable({
                         </div>
                       </div>
                     </td>
-                    {visible.has("type") ? <td className="mono">{card.issue_type ?? <span className="faint">—</span>}</td> : null}
-                    {visible.has("difficulty") ? <td className="mono">{card.difficulty ?? <span className="faint">—</span>}</td> : null}
-                    {visible.has("impact") ? <td className="mono">{card.impact ?? <span className="faint">—</span>}</td> : null}
+                    {visible.has("type") ? (
+                      <td><TriageValue value={card.issue_type} tone={issueTypeTone(card.issue_type)} axis="type" /></td>
+                    ) : null}
+                    {visible.has("difficulty") ? (
+                      <td><TriageValue value={card.difficulty} tone={difficultyTone(card.difficulty)} axis="difficulty" /></td>
+                    ) : null}
+                    {visible.has("impact") ? (
+                      <td><TriageValue value={card.impact} tone={impactTone(card.impact)} axis="impact" /></td>
+                    ) : null}
                     {visible.has("recurrence") ? (
                       <td>
                         {card.recurrence_count > 0 ? (
@@ -817,8 +937,7 @@ function TaskDetailRow({
     card.done ? 0 : 5_000,
   );
   const steps = detail.data?.steps ?? null;
-  const unblockable = card.human_action === "escalated"
-    || card.human_action === "awaiting-reply";
+  const unblockable = blocksOnHuman(card);
 
   const doUnblock = async () => {
     setBusy(true);
@@ -1040,11 +1159,42 @@ function IssueNumber({ issue, url }: { issue: number; url: string | null }) {
   );
 }
 
+/**
+ * When the harness finished with this issue: the merge stamp when gh knows it,
+ * otherwise the last journalled event. Null when neither is parseable — an
+ * unknown instant must render as "—", never as "0s ago".
+ */
+function doneAtMs(card: IssueCard): number | null {
+  return parseTs(card.merged_ts ?? card.last_ts);
+}
+
+/**
+ * Subscribes to the clock itself rather than taking `now` from the table.
+ * A "3d" string changes once a day, but a table-level clock re-rendered every
+ * merged issue — chips, badges, expanded detail and all — once a second.
+ */
+const TimeSinceDone = memo(function TimeSinceDone({ card }: { card: IssueCard }) {
+  const nowMs = useClock();
+  const at = doneAtMs(card);
+  if (at === null) return <span className="faint">—</span>;
+  return <>{ageCompact(Math.max(0, (nowMs - at) / 1000))}</>;
+});
+
 function PrLink({ card }: { card: IssueCard }) {
   if (card.pr === null) return null;
+  const review = prReviewMark(card.pr_review_state);
   const chip = (
-    <Chip tone={prStateTone(card.pr_state)} square title={card.pr_state ?? "pull request"}>
+    <Chip
+      tone={prStateTone(card.pr_state)}
+      square
+      title={[card.pr_state ?? "pull request", review?.label].filter(Boolean).join(" · ")}
+    >
       PR #{card.pr}
+      {review ? (
+        <span className={`pr-review-mark tone-${review.tone}`} role="img" aria-label={review.label}>
+          {review.glyph}
+        </span>
+      ) : null}
     </Chip>
   );
   if (!card.pr_url) return chip;
@@ -1073,18 +1223,38 @@ function ModelList({ models }: { models: NonNullable<IssueCard["model_badges"]> 
   );
 }
 
-function VerificationStatus({ card }: { card: IssueCard }) {
+/**
+ * The verdict badge. Its title is the only place the ledger's *reason* is
+ * readable, so the icon-only form must keep both the word and the prose there —
+ * a glyph with no hover text would be a verdict nobody can question.
+ */
+function VerificationStatus({
+  card,
+  iconOnly = false,
+}: {
+  card: IssueCard;
+  iconOnly?: boolean;
+}) {
   const status = combinedVerificationStatus(
     card.issue_verification,
     card.pr_verification,
   );
   if (!status) return <span className="faint">—</span>;
+  const title = verificationSummary({
+    issueStatus: card.issue_verification,
+    issueReason: card.issue_verification_reason,
+    prStatus: card.pr_verification,
+    prReason: card.pr_verification_reason,
+  });
   return (
     <Chip
       tone={verificationTone(status)}
-      title={`Issue: ${card.issue_verification ?? "unavailable"} · PR: ${card.pr_verification ?? "unavailable"}`}
+      title={`${status}\n${title}`}
+      className={iconOnly ? "chip-icon" : undefined}
     >
-      {status}
+      {iconOnly ? (
+        <span role="img" aria-label={status}>{verificationGlyph(status)}</span>
+      ) : status}
     </Chip>
   );
 }
@@ -1119,11 +1289,26 @@ function FlagList({ flags }: { flags: string[] }) {
   );
 }
 
+/** One triage axis value. Unclassified reads as an absence, not as a value. */
+function TriageValue({
+  value,
+  tone,
+  axis,
+}: {
+  value: string | null | undefined;
+  tone: Tone;
+  axis: string;
+}) {
+  if (!value) return <span className="faint">—</span>;
+  return <Chip tone={tone} square title={`${axis}: ${value}`}>{value}</Chip>;
+}
+
+/** Labels carry the triage colours too, so a chip and its column agree. */
 function LabelList({ labels }: { labels: string[] }) {
   if (labels.length === 0) return <span className="faint">—</span>;
   return (
     <span className="row-wrap">
-      {labels.map((label) => <Chip key={label} tone="neutral">{label}</Chip>)}
+      {labels.map((label) => <Chip key={label} tone={labelTone(label)}>{label}</Chip>)}
     </span>
   );
 }

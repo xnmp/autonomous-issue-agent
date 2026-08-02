@@ -1,11 +1,17 @@
 import { describe, expect, it } from "vitest";
 import {
   combinedVerificationStatus,
+  difficultyTone,
+  impactTone,
+  issueTypeTone,
   kindLabel,
+  labelTone,
   modelTone,
+  prReviewMark,
   roleHealth,
   stageTone,
   stepKindTone,
+  verificationSummary,
 } from "./semantics";
 
 describe("dashboard semantics", () => {
@@ -52,6 +58,102 @@ describe("dashboard semantics", () => {
     ["claude-opus-5", "xhigh", "tier-high"],
   ])("colors %s at %s by capability tier", (model, effort, tone) => {
     expect(modelTone(model, effort)).toBe(tone);
+  });
+
+  it.each([
+    ["gpt-5.6-luna", "high"],
+    ["gpt-5.6-terra", "xhigh"],
+    ["claude-haiku-5", "HIGH"],
+    ["some-unknown-model", "max"],
+  ])("alarms %s at %s effort whatever tier it runs on", (model, effort) => {
+    expect(modelTone(model, effort)).toBe("tier-high");
+  });
+
+  it.each([
+    ["gpt-5.6-terra", "  medium  ", "tier-terra"],
+    ["gpt-5.6-luna", "hgih", "tier-luna"],
+    ["gpt-5.6-luna", "", "tier-luna"],
+    ["gpt-5.6-terra", undefined, "tier-terra"],
+  ])(
+    "keeps %s at %s off the alarm colour when the stance is not elevated",
+    (model, effort, tone) => {
+      expect(modelTone(model, effort)).toBe(tone);
+    },
+  );
+
+  it.each([
+    ["mergeable", "✓"],
+    ["changes_requested", "±"],
+  ])("marks a %s PR with %s", (state, glyph) => {
+    expect(prReviewMark(state)?.glyph).toBe(glyph);
+  });
+
+  it.each([[null], [undefined], ["MERGEABLE"], ["unknown"]])(
+    "shows no merge-readiness mark for %s, because absent data is not a verdict",
+    (state) => {
+      expect(prReviewMark(state)).toBeNull();
+    },
+  );
+
+  it("puts both verdicts and their reasons in one hover text", () => {
+    expect(
+      verificationSummary({
+        issueStatus: "VERIFIED",
+        issueReason: "probe stayed green",
+        prStatus: "MISBEHAVED",
+        prReason: "reverted next day",
+      }),
+    ).toBe("Issue: VERIFIED — probe stayed green\nPR: MISBEHAVED — reverted next day");
+  });
+
+  it("names a verdict that has no recorded reason instead of reading as missing", () => {
+    expect(verificationSummary({ issueStatus: "VERIFIED", issueReason: "  " })).toBe(
+      "Issue: VERIFIED\nPR: unavailable",
+    );
+  });
+
+  // Not the tables themselves — restating a lookup map asserts nothing. What is
+  // worth pinning is the behaviour around them: an unrecognised or absent value
+  // is never coloured as if it were understood, and the reader's casing and
+  // whitespace do not decide a chip's colour.
+  it.each([
+    ["bug", "fail"],
+    ["  BUG  ", "fail"],
+    ["speculative", "neutral"],
+    [null, "neutral"],
+    [undefined, "neutral"],
+    ["", "neutral"],
+  ])("tones the %s type as %s", (value, tone) => {
+    expect(issueTypeTone(value)).toBe(tone);
+  });
+
+  it("scales difficulty and impact in opposite directions", () => {
+    // Difficulty is what a task costs us, so more is worse; impact is what it
+    // is worth, so more is better. The two "high"s must not share a colour.
+    expect(difficultyTone("high")).toBe("fail");
+    expect(impactTone("high")).toBe("ok");
+  });
+
+  it.each([["banana"], [null], [undefined], [""]])(
+    "leaves the unrecognised difficulty or impact %s uncoloured",
+    (value) => {
+      expect(difficultyTone(value)).toBe("neutral");
+      expect(impactTone(value)).toBe("neutral");
+    },
+  );
+
+  it.each([
+    // A label encoding a triage axis takes that axis's colour, prefixed or bare.
+    ["type:bug", "fail"],
+    ["effort:trivial", "ok"],
+    ["bug", "fail"],
+    // A prefix with nothing after it names no value, and most labels are not
+    // triage axes at all.
+    ["type:", "neutral"],
+    ["ai-ready", "neutral"],
+    ["", "neutral"],
+  ])("colours the %s label to match its column", (label, tone) => {
+    expect(labelTone(label)).toBe(tone);
   });
 
   it.each([

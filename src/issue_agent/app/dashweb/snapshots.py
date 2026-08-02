@@ -1089,6 +1089,8 @@ def issue_card(
     projected_model: str | None = None,
     issue_verification: str | None = None,
     pr_verification: str | None = None,
+    issue_verification_reason: str | None = None,
+    pr_verification_reason: str | None = None,
 ) -> dict:
     started = _started(row)
     pr = row.prs[-1] if row.prs else None
@@ -1107,9 +1109,11 @@ def issue_card(
         "issue": row.issue,
         "title": (gh_issue or {}).get("title"),
         "url": (gh_issue or {}).get("url"),
+        "labels": card_labels(row, gh_issue),
         "pr": pr,
         "pr_url": (gh_pr or {}).get("url"),
         "pr_state": _pr_state(gh_pr),
+        "pr_review_state": _pr_review_state(gh_pr),
         "stage": _display_stage(row),
         "attention_reason": _blocked_reason(row),
         "escalation_reason": _escalation_reason(row),
@@ -1135,6 +1139,8 @@ def issue_card(
         "flags": _flags(row, human_action),
         "issue_verification": issue_verification,
         "pr_verification": pr_verification,
+        "issue_verification_reason": issue_verification_reason,
+        "pr_verification_reason": pr_verification_reason,
     }
     if row.done and gh_pr and gh_pr.get("mergedAt"):
         card["merged_ts"] = gh_pr["mergedAt"]
@@ -1148,6 +1154,25 @@ def _pr_state(gh_pr: dict | None) -> str | None:
         return "merged"
     state = str(gh_pr.get("state") or "").lower()
     return state or None
+
+
+def _pr_review_state(gh_pr: dict | None) -> str | None:
+    """Whether review says this PR can merge, or asked for changes.
+
+    Both inputs are optional at GitHub's end — a PAT without the scopes to read
+    `reviewDecision`/`mergeable` returns nulls, and a merge queue can leave
+    `mergeable` UNKNOWN mid-computation. An unknown answer must read as "no
+    badge": claiming mergeable on missing data is the one wrong answer here.
+    """
+    if not gh_pr:
+        return None
+    decision = str(gh_pr.get("reviewDecision") or "").upper()
+    if decision == "CHANGES_REQUESTED":
+        return "changes_requested"
+    mergeable = str(gh_pr.get("mergeable") or "").upper()
+    if decision == "APPROVED" and mergeable == "MERGEABLE":
+        return "mergeable"
+    return None
 
 
 def pending_card(issue: dict, row: dash.IssueRow | None) -> dict:
@@ -1377,6 +1402,22 @@ def labels_of(issue: dict) -> list[str]:
     return out
 
 
+def card_labels(row: dash.IssueRow, gh_issue: dict | None) -> list[str]:
+    """An issue card's labels, the v2 world projection first.
+
+    A v2 deployment's GitHub enrichment deliberately carries no labels — the
+    projection owns them — so reading only the enrichment left every v2 card
+    unlabelled. A v1 row has no projected facts and only GitHub can answer.
+    Purely presentational either way: nothing here moves a card between lanes.
+    """
+    projected = row.facts.get("labels")
+    if isinstance(projected, (set, frozenset)):
+        return sorted(str(label) for label in projected)
+    if isinstance(projected, (tuple, list)):
+        return [str(label) for label in projected]
+    return labels_of(gh_issue or {})
+
+
 def priority_of(labels) -> str | None:
     for p in PRIORITY_LABELS:
         if p in labels:
@@ -1458,6 +1499,76 @@ def health_trend(
         row["net_open"] = row["opened"] - row["closed"]
         row["first_observation"] = row["day"] == first_observed_day
     return [days[day] for day in sorted(days)]
+
+
+SPEND_WINDOW_HOURS = 48
+
+
+def _hour_floor(ts: datetime) -> datetime:
+    return ts.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
+
+
+def spend_buckets(
+    charges,
+    now: datetime,
+    *,
+    hours: int = SPEND_WINDOW_HOURS,
+) -> list[dict]:
+    """Hourly USD totals over the trailing window, oldest bucket first.
+
+    Empty hours are emitted as zero: a sparse series would let the client
+    re-space points and read a quiet night as a busy one. A charge outside the
+    window — including one stamped in the future by a skewed clock — is dropped
+    rather than clamped into an hour it did not happen in.
+    """
+    if hours <= 0:
+        return []
+    end = _hour_floor(now)
+    totals = {end - timedelta(hours=offset): 0.0 for offset in range(hours)}
+    for ts, usd in charges:
+        if ts is None:
+            continue
+        # Only a real number is money. A stringified or absent cost is an
+        # unpriceable leg, and coercing one would invent spend rather than
+        # report the gap.
+        if isinstance(usd, bool) or not isinstance(usd, (int, float)):
+            continue
+        amount = float(usd)
+        if not math.isfinite(amount):
+            continue
+        bucket = _hour_floor(ts)
+        if bucket in totals:
+            totals[bucket] += amount
+    return [
+        {"hour_start_iso": iso(hour), "usd": round(total, 6)}
+        for hour, total in sorted(totals.items())
+    ]
+
+
+def spend_per_hour(
+    deployment: dash.Deployment,
+    now: datetime,
+    *,
+    hours: int = SPEND_WINDOW_HOURS,
+) -> list[dict]:
+    """Settled agent-run spend by hour, issue-attributed and deployment-level.
+
+    Estimated (subscription) dollars are spend and are counted. The basis is the
+    same legs, over the same rows, that feed `metrics.by_kind` — rows the
+    present/done filter hides included, deployment-level runs billed the same
+    way — so the series and the headline totals cannot disagree about what a
+    leg cost.
+    """
+    charges = [
+        (leg.ts, leg.cost_usd)
+        for row in deployment.metrics_issues
+        for leg in row.legs
+    ]
+    charges += [
+        (leg.ts, leg.cost_usd)
+        for leg in dash.unattributed_legs(deployment.unattributed)
+    ]
+    return spend_buckets(charges, now, hours=hours)
 
 
 def first_observed_day(

@@ -25,6 +25,7 @@ export function VerificationTab() {
       evidence: (row) => row.evidence,
     },
     { key: "id", direction: "asc" },
+    "verification-ledger",
   );
 
   const counts = rows.reduce<Record<string, number>>((acc, r) => {

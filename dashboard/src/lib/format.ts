@@ -125,6 +125,26 @@ export function localDate(ts: string | null | undefined): string {
   });
 }
 
+/**
+ * An hour bucket in the reader's own timezone: `Aug 02, 14:00`.
+ *
+ * The minutes are formatted, never assumed to be `:00`: a UTC hour boundary
+ * lands on :30 or :45 local time in India, Nepal and the Chatham Islands, and
+ * the raw `getHours()` also disagreed with the locale's own hour cycle.
+ */
+export function localHour(ts: string | null | undefined): string {
+  const ms = parseTs(ts);
+  if (ms === null) return DASH;
+  const at = new Date(ms);
+  const day = at.toLocaleDateString(undefined, { month: "short", day: "2-digit" });
+  const time = at.toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  return `${day}, ${time}`;
+}
+
 export function clockTime(ts: string | null | undefined): string {
   const ms = parseTs(ts);
   if (ms === null) return DASH;

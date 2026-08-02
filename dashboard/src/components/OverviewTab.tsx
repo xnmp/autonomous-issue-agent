@@ -1,6 +1,6 @@
 import { api } from "../api/client";
 import { usePolled, useClock } from "../api/hooks";
-import type { HealthTrendDay, JournalEvent, RoleHealth } from "../api/types";
+import type { HealthTrendDay, JournalEvent, OverviewPayload, RoleHealth } from "../api/types";
 import {
   HEALTH_LABEL,
   HEALTH_TONE,
@@ -8,9 +8,9 @@ import {
   roleHealth,
   utilTone,
 } from "../lib/semantics";
-import { ago, localTime, num, rate, usd, usdCompact } from "../lib/format";
+import { ago, localHour, localTime, num, rate, usd, usdCompact } from "../lib/format";
 import { Chip } from "./ui/Chip";
-import { Meter, StackedBar, StatTile } from "./ui/Charts";
+import { Histogram, Meter, StackedBar, StatTile } from "./ui/Charts";
 import { EmptyState, ErrorBanner, Loading, SectionTitle, SkeletonRows, WarningList } from "./ui/Feedback";
 import { ResizableTable, useSortedRows } from "./ui/ResizableTable";
 
@@ -48,6 +48,7 @@ export function OverviewTab({
       "per-task": (row) => row.runs > 0 ? row.usd / row.runs : null,
     },
     { key: "usd", direction: "desc" },
+    "overview-spend",
   );
 
   const escalations = m?.escalations ?? 0;
@@ -183,6 +184,8 @@ export function OverviewTab({
         </section>
       </div>
 
+      <SpendPerHour buckets={ov.data?.spend_per_hour ?? []} />
+
       <HealthTrend rows={ov.data?.health_trend ?? []} loading={ov.loading} />
 
       <SectionTitle>Daemon health</SectionTitle>
@@ -235,6 +238,35 @@ export function OverviewTab({
   );
 }
 
+/**
+ * Where the last two days of money went, hour by hour. The series arrives
+ * dense (every empty hour is an explicit 0.0) precisely so the shape is
+ * honest, so it is rendered as-is: no gap-filling, no re-spacing, no dropping
+ * of quiet hours.
+ */
+function SpendPerHour({ buckets }: { buckets: OverviewPayload["spend_per_hour"] }) {
+  const bars = buckets.map((bucket) => ({
+    key: bucket.hour_start_iso,
+    label: localHour(bucket.hour_start_iso),
+    value: bucket.usd,
+  }));
+  return (
+    <section className="panel">
+      <div className="panel-hd">
+        <span className="panel-title">Spend per hour</span>
+        <span className="faint">last {bars.length || 48} hours, journal-settled</span>
+      </div>
+      <div className="panel-bd">
+        <Histogram
+          bars={bars}
+          unit="spend"
+          emptyText="no journalled spend in the last 48 hours"
+        />
+      </div>
+    </section>
+  );
+}
+
 function HealthTrend({ rows, loading }: { rows: HealthTrendDay[]; loading: boolean }) {
   const sorted = useSortedRows(
     rows,
@@ -246,6 +278,7 @@ function HealthTrend({ rows, loading }: { rows: HealthTrendDay[]; loading: boole
       recurrences: (row) => row.recurrences,
     },
     { key: "day", direction: "desc" },
+    "overview-health-trend",
   );
   return (
     <section className="panel">
@@ -335,6 +368,7 @@ function UnattributedList({ events, loading }: { events: JournalEvent[]; loading
       event: (event) => String(event.kind ?? event.event ?? "event"),
     },
     { key: "when", direction: "desc" },
+    "overview-unattributed",
   );
   if (loading) return <Loading what="events" />;
   if (events.length === 0) return <EmptyState>no deployment-level events</EmptyState>;

@@ -142,9 +142,16 @@ by `last_activity_ts`.
 
 Parses `docs/field-verification.md` tables → `{ "rows": [{ "id", "change",
 "shipped", "status" ("VERIFIED"|"MISBEHAVED"|"pending"|...), "evidence",
-"raw": "…" }], "warnings": [] }`. Parser must survive column drift: treat the
-first table column as id/change, map a case-insensitive VERIFIED/MISBEHAVED/
-pending match anywhere in the row to `status`, and keep the raw row text.
+"reason": "…"|null, "raw": "…" }], "warnings": [] }`. Parser must survive column
+drift: treat the first table column as id/change, map a case-insensitive
+VERIFIED/MISBEHAVED/pending match anywhere in the row to `status`, and keep the
+raw row text.
+
+`reason` is the verdict prose with the leading verdict keyword stripped
+("VERIFIED — probe stayed green" → "probe stayed green"), falling back to the
+evidence column when the verdict cell says nothing beyond the keyword, and
+`null` when the row offers no prose at all. It is the hover text behind the
+verified/misbehaved badge; the badge itself still comes from `status`.
 
 ### GET /api/repos/{name}/overview
 
@@ -163,6 +170,7 @@ run family:
   "health": [ ...same role objects as /api/repos... ],
   "health_trend": [{ "day": "2026-07-29", "opened": 3, "closed": 1,
                      "net_open": 2, "recurrences": 0, "first_observation": true }],
+  "spend_per_hour": [{ "hour_start_iso": "2026-07-29T11:00:00+00:00", "usd": 1.2 }],
   "unattributed": [ last 20 deployment-level events ],
   "warnings": [] }
 ```
@@ -182,6 +190,16 @@ journal recurrences with a warning. The reader paginates up to 1,000 issues;
 reaching that bound emits a warning so a potentially incomplete long-run trend
 is never presented as complete.
 
+`spend_per_hour` is a dense 48-bucket UTC-hour series ending at the current
+hour, oldest first, journal-only: every settled `agent_run` in the fold — issue
+attributed legs plus deployment-level ones — bucketed by its settlement stamp.
+Estimated (subscription) dollars count; unpriceable legs are skipped rather
+than coerced, so the series and `metrics.by_kind` share one basis. Empty hours
+are emitted as `0.0` so a client cannot re-space a quiet night into a busy one.
+Charges outside the window, including future-stamped ones, are dropped, never
+clamped. control.db is not read: this is the same journal projection as every
+other number on the page.
+
 ### GET /api/repos/{name}/issues
 
 One call returns all four buckets (the UI splits sub-tabs client-side):
@@ -197,7 +215,11 @@ One call returns all four buckets (the UI splits sub-tabs client-side):
 ```json
 { "issue": 7, "title": "…", "url": "https://github.com/o/r/issues/7",
   "pr": 12, "pr_url": "…", "pr_state": "open|merged|closed|null",
+  "pr_review_state": "mergeable|changes_requested|null",
   "stage": "reviewing", "done": false,
+  "issue_verification": "VERIFIED|MISBEHAVED|pending|null",
+  "pr_verification": "…|null",
+  "issue_verification_reason": "…|null", "pr_verification_reason": "…|null",
   "steps": [{ "kind": "RESOLVE", "state": "ok|failed|running",
               "status": "APPROVE|REQUEST_CHANGES|…", "cost_usd": 1.2 }],
   "cost_usd": 4.2, "estimated": false,
@@ -208,6 +230,18 @@ One call returns all four buckets (the UI splits sub-tabs client-side):
   "models": ["claude-sonnet-5"], "rounds": 1,
   "flags": ["escalated", "recurred", "spend-blocked", "held"] }
 ```
+
+`pr_review_state` is merge readiness for the card's newest PR, from the same
+cached `gh pr list` query (`reviewDecision`, `mergeable` — no extra gh call):
+`changes_requested` when review asked for changes, `mergeable` when review
+approved AND GitHub reports the branch mergeable, otherwise `null`. A PAT
+without the scopes for those fields, or a mergeability answer still computing,
+degrades to `null`; claiming mergeable on absent data is the one wrong answer.
+
+`issue_verification`/`pr_verification` are the ledger verdicts for the card's
+issue and newest PR; `*_verification_reason` carry the matching `reason` prose
+from `/api/verification` for the badge's hover text, `null` when the ledger
+gives none.
 
 `steps` = the issue's settled legs in ts order collapsed by kind (latest state
 per kind wins) plus any running leg last. Title/urls come from gh; when gh is
@@ -228,7 +262,9 @@ Under schema v2, bucket membership and labels come only from the current
 retirement produce no card, even when historical run events remain. A current
 open issue with no lifecycle label is backlog; `ai-ready` is pending; owned
 lifecycle states are in flight; closed/`ai-done` issues are done. GitHub reads
-may enrich title and URL but cannot move a card between buckets. This keeps an
+may enrich presentational fields only — title, URL, and for PRs `state`,
+`mergedAt`, `reviewDecision`, `mergeable` — and cannot move a card between
+buckets. This keeps an
 unavailable or differently timed dashboard GitHub read from overriding daemon
 reality.
 
@@ -335,6 +371,17 @@ index.html). If dist is missing, `/` returns a plain-HTML instruction page.
   blue = informational/queued, magenta = steward/meta, cyan = links/models.
   The self-repo sidebar entry gets a magenta left border + prominent
   `issue-agent` chip.
+- View state the operator sets by clicking is remembered in `localStorage`,
+  keyed per table/section, and every read is fault-tolerant: a disabled or full
+  store degrades to defaults, never to a broken view. Today that covers column
+  widths, order, visibility, sort (column + direction, ignored when the
+  remembered column no longer exists) and the Done section's icon-badge mode.
+- Backlog triage colours are one mapping in `lib/semantics.ts`, shared by the
+  type/difficulty/impact columns and the label chips: difficulty tones by what
+  it costs (trivial ok → complex fail), impact by what it is worth (low neutral
+  → high ok), type by identity (bug fail, enhancement ok, feature info,
+  housekeeping meta). Unknown values tone neutral. Frontend only — the steward's
+  label taxonomy is unchanged.
 - Every list renders an explicit empty state ("no issues in flight") — never a
   blank pane. Every gh-degraded view shows the "GitHub data unavailable" chip.
 - Status badges for steps: kind abbreviation (RES, REV, CI, ADR, REB, TRI) in

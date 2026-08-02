@@ -304,6 +304,18 @@ class Deployment:
     unattributed: tuple[dict, ...]  # events naming no issue (daily caps, ticks)
     schema_version: int = 1
     warnings: tuple[str, ...] = ()
+    # Every row the fold produced, including the ones the present/done filter
+    # keeps out of `issues` — a retired or no longer observable issue whose legs
+    # were still paid for. Metrics charge this set, so any second view of the
+    # same money (the hourly spend series above all) must read it too, or the
+    # chart and the headline total disagree about what the deployment spent.
+    historical_issues: tuple[IssueRow, ...] = ()
+
+    @property
+    def metrics_issues(self) -> tuple[IssueRow, ...]:
+        """The rows `build_metrics` charged. Falls back to the display rows for
+        a Deployment assembled without a separate historical set."""
+        return self.historical_issues or self.issues
 
 
 @dataclass(frozen=True)
@@ -411,6 +423,7 @@ def build_deployment_v2(
         unattributed=unattributed,
         schema_version=2,
         warnings=warnings,
+        historical_issues=historical_rows,
     )
 
 
@@ -1091,6 +1104,21 @@ def _running_leg(e: dict) -> RunningLeg:
     )
 
 
+def unattributed_legs(unattributed) -> list[RunSummary]:
+    """Deployment-level paid legs — the runs naming no issue.
+
+    Shared so that every view of this money reads the same billed figure:
+    `_leg` prefers the true cost and falls back to the token estimate, and a
+    caller that read `cost_usd` off the raw event would silently drop every
+    subscription-priced leg.
+    """
+    return [
+        _leg(e)
+        for e in unattributed
+        if isinstance(e, dict) and e.get("event") == "agent_run"
+    ]
+
+
 def first_pass_verdicts(rows) -> tuple[int, int]:
     """(approvals, changes-requested) over the FIRST review verdict per PR.
 
@@ -1120,9 +1148,7 @@ def build_metrics(
     today_usd: float | None,
 ) -> Metrics:
     legs = [leg for row in rows for leg in row.legs]
-    legs += [
-        _leg(e) for e in unattributed if e.get("event") == "agent_run"
-    ]
+    legs += unattributed_legs(unattributed)
     by_kind: dict[str, tuple[float, int]] = {}
     for leg in legs:
         cost, n = by_kind.get(leg.kind, (0.0, 0))

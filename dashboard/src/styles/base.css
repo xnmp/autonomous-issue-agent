@@ -277,6 +277,20 @@ button {
 .chip-warn {
   --chip-c: var(--running);
 }
+/* Icon-only badge: a square the width of its glyph, so a column of them reads
+ * as one scannable stripe. The verdict and its reason stay in the title. */
+.chip-icon {
+  padding: 1px 5px;
+  min-width: 22px;
+  justify-content: center;
+  font-size: var(--fs-sm);
+}
+/* Merge readiness rides ON the PR chip in its own tone — the chip itself keeps
+ * saying what the PR's *state* is, never what review thinks of it. */
+.pr-review-mark {
+  margin-left: 2px;
+  font-weight: 700;
+}
 
 /* A running step pulses; reduced motion gets a static, still-distinguishable
  * treatment (the chip keeps its yellow + a dot). */

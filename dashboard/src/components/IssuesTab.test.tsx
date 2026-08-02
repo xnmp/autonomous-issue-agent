@@ -9,6 +9,7 @@ const doneCard: IssueCard = {
   issue: 50,
   title: "Explain completed work",
   url: "https://github.com/o/r/issues/50",
+  labels: [],
   pr: 75,
   pr_url: "https://github.com/o/r/pull/75",
   pr_state: "merged",
@@ -70,12 +71,12 @@ describe("IssuesTab", () => {
 
     expect(screen.queryByRole("columnheader", { name: "Rounds" })).not.toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: /Verification/ })).toBeVisible();
-    expect(screen.getByRole("columnheader", { name: /Date/ })).toBeVisible();
+    expect(screen.getByRole("columnheader", { name: /Since done/ })).toBeVisible();
     const verification = screen.getByRole("cell", { name: "pending" });
     expect(verification).toBeVisible();
     expect(screen.getByText("pending", { exact: true })).toHaveAttribute(
       "title",
-      "Issue: VERIFIED · PR: pending",
+      "pending\nIssue: VERIFIED\nPR: pending",
     );
     const row = screen.getByRole("row", { name: /Explain completed work.*#50.*PR #75/ });
     await userEvent.click(row);

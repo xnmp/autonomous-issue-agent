@@ -88,3 +88,64 @@ def test_status_indexes_distinguish_issue_and_pr_references():
     ])
     assert issue_status == {62: "VERIFIED"}
     assert pr_status == {76: "pending"}
+
+
+def test_reason_is_the_verdict_prose_with_the_keyword_removed():
+    assert [r.reason for r in rows()] == [
+        "never fired",
+        "2026-07-27 (fifth)",
+        "2026-07-28 → #49",
+        "n/a",
+    ]
+
+
+def test_a_bare_verdict_falls_back_to_the_evidence_column():
+    row = verification.parse_verification(
+        "| change | landed | why it matters | status |\n"
+        "|---|---|---|---|\n"
+        "| #9 thing | abc | probe never fired again | VERIFIED |\n"
+    )[0]
+    assert row.reason == "probe never fired again"
+
+
+def test_a_row_with_nothing_to_say_reports_no_reason():
+    row = verification.parse_verification(
+        "| change | landed | evidence | status |\n"
+        "|---|---|---|---|\n"
+        "| #9 thing |  |  | VERIFIED |\n"
+    )[0]
+    assert row.reason is None
+
+
+def test_a_three_column_table_reports_its_reason_without_the_verdict_word():
+    """The badge beside the reason already says VERIFIED; repeating it in the
+    tooltip is noise whichever column the ledger happened to put it in."""
+    row = verification.parse_verification(
+        "| #9 thing | abc | VERIFIED — probe stayed green |\n"
+    )[0]
+    assert (row.status, row.reason) == ("VERIFIED", "probe stayed green")
+
+
+def test_a_reason_longer_than_a_tooltip_is_bounded():
+    row = verification.parse_verification(
+        f"| #9 thing | abc | evidence | VERIFIED — {'y' * 5000} |\n"
+    )[0]
+    assert row.reason is not None and len(row.reason) == 240
+
+
+def test_a_bounded_reason_is_taken_from_the_fallback_column_too():
+    row = verification.parse_verification(
+        f"| #9 thing | abc | {'z' * 5000} |\n"
+    )[0]
+    assert row.reason is not None and len(row.reason) == 240
+
+
+def test_reason_indexes_distinguish_issue_and_pr_references():
+    issue_reason, pr_reason = verification.reason_indexes([
+        {"change": "#62 capability ceiling", "shipped": "PR #76",
+         "status": "pending", "reason": "never fired"},
+        {"change": "#63 relabel", "shipped": None, "status": "VERIFIED",
+         "reason": None},
+    ])
+    assert issue_reason == {62: "never fired", 63: None}
+    assert pr_reason == {76: "never fired"}

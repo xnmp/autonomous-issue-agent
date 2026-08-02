@@ -8,6 +8,7 @@ const card: IssueCard = {
   issue: 118,
   title: "Ready for the operator",
   url: "https://github.com/o/r/issues/118",
+  labels: [],
   pr: 75,
   pr_url: "https://github.com/o/r/pull/75",
   pr_state: "open",
