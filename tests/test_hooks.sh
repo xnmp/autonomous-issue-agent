@@ -382,7 +382,8 @@ setup_visual_repo() {  # setup_visual_repo <n-screenshots> [<n-read>]
     : > .harness/visual-ac
     i=1
     while [ "$i" -le "$n" ]; do
-      printf '\x89PNG' > "evidence/ac-$i.png"
+      # Distinct bytes per shot: the gate rejects byte-identical evidence.
+      printf '\x89PNG shot %s' "$i" > "evidence/ac-$i.png"
       [ "$i" -le "$read_n" ] && echo "ac-$i.png" >> "$d.trusted-screenshots-read"
       i=$((i + 1))
     done
@@ -438,14 +439,44 @@ out=$( cd "$d" && HARNESS_SCREENSHOTS_READ="$d.trusted-screenshots-read" BASE_BR
   && ok "unread screenshot blocked" || no "visual-ac floor (all shots read)" "rc=$rc out=${out:0:200}"
 rm -rf "$d"
 
-# An agent-authored worktree marker cannot substitute for the harness receipt.
+# Receipt-less runtime (HARNESS_SCREENSHOTS_READ unset — codex, #153): the
+# read check is skipped and committed evidence passes the fixer gate; the
+# independent reviewer is the sole content verifier (keifu #142/#156). An
+# agent-authored worktree marker is simply irrelevant, not a bypass vector.
 d=$(setup_visual_repo 1)
 rm -f "$d.trusted-screenshots-read"
 printf '%s\n' "ac-1.png" > "$d/.harness/screenshots-read"
 out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'trusted screenshot-read receipt'; } \
-  && ok "worktree screenshot-read forgery blocked" \
-  || no "trusted screenshot receipt required" "rc=$rc out=${out:0:200}"
+[ "$rc" -eq 0 ] && ok "receipt-less runtime passes evidence through to review" \
+  || no "receipt-less visual path must not dead-end" "rc=$rc out=${out:0:200}"
+rm -rf "$d"
+
+# Receipt-less runtime keeps the committed floor: no screenshot → still blocked.
+d=$(setup_visual_repo 0)
+out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_LINKED" 2>&1 ); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'no screenshot is committed'; } \
+  && ok "receipt-less runtime still requires a committed screenshot" \
+  || no "receipt-less floor (>=1 shot)" "rc=$rc out=${out:0:200}"
+rm -rf "$d"
+
+# Runtime that DOES mint receipts, but this read failed (var set, file gone) →
+# recoverable deny, never the capability dead-end.
+d=$(setup_visual_repo 1)
+rm -f "$d.trusted-screenshots-read"
+out=$( cd "$d" && HARNESS_SCREENSHOTS_READ="$d.trusted-screenshots-read" BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'receipt is unavailable'; } \
+  && ok "minted-but-unreadable receipt blocked as recoverable" \
+  || no "unreadable receipt deny" "rc=$rc out=${out:0:200}"
+rm -rf "$d"
+
+# Byte-identical evidence images → blocked on EVERY runtime (#153 reuse gaming).
+d=$(setup_visual_repo 2)
+cp "$d/evidence/ac-1.png" "$d/evidence/ac-2.png"
+( cd "$d" && git add evidence && git -c core.hooksPath=/dev/null commit -qm "evidence: dupe" )
+out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'byte-identical'; } \
+  && ok "byte-identical evidence images blocked" \
+  || no "byte-identical evidence deny" "rc=$rc out=${out:0:200}"
 rm -rf "$d"
 
 # No .harness/visual-ac → the whole rule is inert, even with a 3-item checklist.

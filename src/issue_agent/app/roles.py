@@ -90,7 +90,7 @@ from ..domain.actions import AgentKind, Relabel, RunAgent, Target
 from ..adapters.runtime_plan import AgentRuntime, RuntimePlan
 from ..domain.effect_retry import DEFAULT_EFFECT_RETRY_CEILING
 from ..domain.outcome import AgentResult
-from ..domain.agent_task import RuntimeName
+from ..domain.agent_task import RUNTIME_CAPABILITIES, RuntimeName
 from ..domain.contracts import BudgetScope, Money
 from ..domain.pricing import (
     BudgetPolicy,
@@ -2208,6 +2208,9 @@ def build_fix_daemon(
             repo_cfg.repo, repo_cfg.base_branch, cfg.agent_md,
             fix_runtime.budget_usd, fix_runtime.model, fix_runtime.effort,
             router_budget_usd=cfg.router_budget_usd,
+            mints_visual_receipts=RUNTIME_CAPABILITIES[
+                RuntimeName(cfg.fixer_runtime)
+            ].mints_visual_receipts,
         ),
         max_review_rejections=cfg.max_review_rejections,
         author_tests_split=fix_runtime.author_tests_split,

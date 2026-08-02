@@ -30,7 +30,7 @@ import re
 import signal
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -106,6 +106,10 @@ class GateContext:
     screenshots_read: tuple[str, ...] = ()   # evidence images the agent actually read
     screenshots_receipt_available: bool = True
     screenshots_receipt_unreadable: bool = False
+    # path → sha256 of committed evidence images, digested by the harness from
+    # the worktree (never agent-reported). None = digesting failed; the
+    # byte-identical rule is skipped rather than guessed (#153 reuse gaming).
+    image_digests: Mapping[str, str] | None = None
     harness_test_cmd: str | None = None
     env_test_cmd: str | None = None
     # Operator opt-out for a genuinely test-less repo (ALLOW_UNTESTED=1 in the
@@ -429,6 +433,7 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
             body,
             receipt_available=ctx.screenshots_receipt_available,
             receipt_unreadable=ctx.screenshots_receipt_unreadable,
+            image_digests=ctx.image_digests,
         ),
         lambda: gate.check_required_test(ctx.branch, ctx.changed_files),
         lambda: gate.check_commit_log(ctx.branch_subjects),

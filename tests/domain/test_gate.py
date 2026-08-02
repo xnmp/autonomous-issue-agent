@@ -247,6 +247,76 @@ def test_visual_evidence_all_images_must_be_read():
     assert not res.ok and "b.png" in res.reason
 
 
+# ── receipt-less runtimes (codex, #153): reviewer is the sole verifier ────────
+def test_visual_evidence_receiptless_runtime_skips_the_read_check():
+    # No receipts minted → committed-but-unread evidence PASSES the fixer gate;
+    # the independent review leg is the content authority (keifu #142/#156 —
+    # denying here manufactured deterministic dead-ends).
+    assert check_visual_evidence(
+        True, ["evidence/tab.png"], [], receipt_available=False
+    ).ok
+
+
+def test_visual_evidence_receiptless_runtime_keeps_the_committed_floor():
+    # Loosening the READ check must not loosen the COMMIT floor.
+    res = check_visual_evidence(True, ["src/x.ts"], [], receipt_available=False)
+    assert not res.ok and "no screenshot" in res.reason
+
+
+def test_visual_evidence_unreadable_receipt_only_matters_when_minted():
+    # receipt_unreadable describes a failed read of a receipt the runtime DOES
+    # mint; on a receipt-less runtime the flag is meaningless and must not deny.
+    denied = check_visual_evidence(
+        True, ["evidence/tab.png"], [],
+        receipt_available=True, receipt_unreadable=True,
+    )
+    assert not denied.ok and "unavailable" in denied.reason
+    assert check_visual_evidence(
+        True, ["evidence/tab.png"], [],
+        receipt_available=False, receipt_unreadable=True,
+    ).ok
+
+
+# ── byte-identical evidence (runtime-independent, #153 reuse gaming) ──────────
+def test_visual_evidence_rejects_byte_identical_images():
+    res = check_visual_evidence(
+        True, ["evidence/a.png", "evidence/b.png"], ["a.png", "b.png"],
+        image_digests={"evidence/a.png": "d1", "evidence/b.png": "d1"},
+    )
+    assert not res.ok and "byte-identical" in res.reason
+    assert "evidence/a.png" in res.reason and "evidence/b.png" in res.reason
+
+
+def test_visual_evidence_distinct_digests_pass():
+    assert check_visual_evidence(
+        True, ["evidence/a.png", "evidence/b.png"], ["a.png", "b.png"],
+        image_digests={"evidence/a.png": "d1", "evidence/b.png": "d2"},
+    ).ok
+
+
+def test_visual_evidence_digest_rule_skipped_when_caller_could_not_digest():
+    # None (I/O failure) and missing entries both fail-soft: the rule never
+    # guesses, it only fires on two POSITIVELY matching digests.
+    dupe = ["evidence/a.png", "evidence/b.png"]
+    assert check_visual_evidence(True, dupe, ["a.png", "b.png"], image_digests=None).ok
+    assert check_visual_evidence(
+        True, dupe, ["a.png", "b.png"], image_digests={}
+    ).ok
+    assert check_visual_evidence(
+        True, dupe, ["a.png", "b.png"],
+        image_digests={"evidence/a.png": "", "evidence/b.png": ""},
+    ).ok
+
+
+def test_visual_evidence_byte_identical_applies_on_receiptless_runtimes_too():
+    res = check_visual_evidence(
+        True, ["evidence/a.png", "evidence/b.png"], [],
+        receipt_available=False,
+        image_digests={"evidence/a.png": "d1", "evidence/b.png": "d1"},
+    )
+    assert not res.ok and "byte-identical" in res.reason
+
+
 # ── AC-item counting + one screenshot PER AC item (P3.6-lite) ─────────────────
 def test_count_ac_items_counts_checklist_items_inside_the_section():
     body = (

@@ -747,6 +747,12 @@ def build_gate_context(
     # instructs deleting committed evidence over a recoverable condition).
     screenshots_receipt_unreadable = False
     if screenshots_read_path:
+        # A CONFIGURED path IS the capability statement: this runtime mints
+        # receipts, whatever happens to the read below. Anything less fails
+        # OPEN — e.g. a transient `git rev-parse HEAD` failure used to leave
+        # this False, which under receipt-less-pass-through gate semantics
+        # silently disables the read check on the SDK path (adversarial P1-1).
+        screenshots_receipt_available = True
         try:
             with open(screenshots_read_path, encoding="utf-8") as receipt:
                 lines = tuple(receipt.read(64 * 1024).splitlines())
@@ -756,7 +762,6 @@ def build_gate_context(
                 screenshots_read = tuple(
                     line.strip() for line in lines if line.strip()
                 )
-                screenshots_receipt_available = True
             else:
                 head_result = git(["rev-parse", "HEAD"], cwd)
                 if head_result.code == 0 and head_result.out.strip():
@@ -820,10 +825,30 @@ def build_gate_context(
                         ):
                             continue
                     screenshots_read = tuple(verified)
-                    screenshots_receipt_available = True
         except OSError:
             screenshots_read = ()
             screenshots_receipt_unreadable = True
+
+    # Harness-side digests of committed evidence images: the byte-identical
+    # reuse check (#153) must not depend on receipts, so it reads the worktree
+    # directly on EVERY runtime. Per-file fail-soft: `changed` includes paths
+    # deleted later on the branch, and killing the whole map on one miss both
+    # disabled the rule (agent-triggerable: commit-then-delete a spare image)
+    # and diverged from check-pr.sh's `[ -f ] || continue` (adversarial P1-2).
+    # Guarded on the visual-ac marker because this runs on EVERY Bash call the
+    # agent makes — no I/O tax on the non-visual common case.
+    image_digests: dict[str, str] = {}
+    if markers.visual_ac():
+        for path in changed:
+            if not path.startswith("evidence/"):
+                continue
+            try:
+                with open(os.path.join(cwd, path), "rb") as image:
+                    image_digests[path] = hashlib.sha256(
+                        image.read()
+                    ).hexdigest()
+            except OSError:
+                continue
 
     def open_pr(target_branch: str) -> OpenPrLookup:
         """Resolved ONLY when the governor actually gates a push (see
@@ -1001,6 +1026,7 @@ def build_gate_context(
         screenshots_read=screenshots_read,
         screenshots_receipt_available=screenshots_receipt_available,
         screenshots_receipt_unreadable=screenshots_receipt_unreadable,
+        image_digests=image_digests,
         harness_test_cmd=markers.test_cmd(),
         env_test_cmd=env_test_cmd,
         exists_at_base=exists_at_base,

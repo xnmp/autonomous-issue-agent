@@ -67,6 +67,12 @@ class FixTaskConfig:
     # resolve/CI failures. It belongs in the appended system prompt, not issue data.
     difficulty_notice: str = ""
     router_budget_usd: float = 0.10
+    # Whether this fixer runtime can mint trusted screenshot-read receipts.
+    # When it cannot (codex), the visual-evidence PR gate is unpassable by
+    # construction (#153), so the leg must be told UP FRONT never to declare
+    # `.harness/visual-ac` — keifu #156 burned two paid legs and #142 burned a
+    # leg plus a human question dead-ending on this after the fact.
+    mints_visual_receipts: bool = True
 
 
 # ── fixer tool policy ─────────────────────────────────────────────────────────
@@ -138,11 +144,32 @@ _RESUME_REMINDER = (
 )
 
 
+# Adjusts AGENT.md's visual-evidence instructions for runtimes that cannot mint
+# trusted read receipts (#153): the gate no longer requires receipts there, so
+# the independent reviewer is the only content verifier the evidence will meet.
+# Appended on fresh AND resumed sessions: the contract text the resumed
+# transcript already carries describes the receipted path, so the override must
+# survive the resume path too.
+_UNRECEIPTED_VISUAL_NOTICE = (
+    "\n\nRUNTIME NOTE — visual evidence: this runtime cannot record trusted "
+    "screenshot-read receipts, so your evidence goes straight to the "
+    "independent reviewer, who opens every image and REQUESTS CHANGES on any "
+    "that fails to show its criterion met. Before committing a screenshot under "
+    "`evidence/`, actually look at it and confirm it shows the right screen in "
+    "the right state; capture a DISTINCT screenshot per acceptance criterion "
+    "(byte-identical images are rejected by the gate). Where a visually-shaped "
+    "criterion can be asserted in a test instead, prefer that — it is IN SCOPE "
+    "and needs no permission."
+)
+
+
 def _fix_system_prompt(cfg: FixTaskConfig, session_id: str | None) -> str:
     """The appended system prompt for a fixer leg: the full AGENT.md on a fresh
     session, the short reminder when a session id is carried (resumed OR forked —
     both inherit the server-side transcript that already contains AGENT.md)."""
     base = _RESUME_REMINDER if (session_id or "").strip() else cfg.agent_md
+    if not cfg.mints_visual_receipts:
+        base += _UNRECEIPTED_VISUAL_NOTICE
     return base + _difficulty_notice(cfg)
 
 
@@ -874,6 +901,22 @@ def _location_paths(location: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(out))
 
 
+# On receipt-less runtimes (codex, #153) the fixer gate no longer verifies that
+# evidence images were read — the reviewer is the SOLE content authority for
+# visual evidence, so this note must make it act like one, not a rubber stamp.
+_VISUAL_REVIEW_NOTE = (
+    "If the PR commits screenshots under `evidence/` for a visual acceptance "
+    "criterion, you are the ONLY verifier of that evidence — the fixer gate "
+    "does not judge image content. READ each image and judge whether it "
+    "actually substantiates its criterion (right screen, right state, the "
+    "criterion visibly met). REQUEST_CHANGES if a screenshot is missing, "
+    "irrelevant, or does not show the behaviour the criterion claims — and "
+    "also if two images are the same capture wearing different names, an image "
+    "shows a stale or pre-change state, or an image was clearly reused from an "
+    "earlier round without reflecting the current diff."
+)
+
+
 def build_review_task(
     pr_number: int,
     title: Untrusted,
@@ -886,11 +929,7 @@ def build_review_task(
     prompt = (
         f"Review PR #{pr_number}.\n\n"
         f"{_fenced('title', title)}\n\n{_fenced('description', body)}\n\n"
-        "If the PR commits screenshots under `evidence/` for a visual acceptance "
-        "criterion, READ each one and judge whether it actually substantiates that "
-        "criterion (right screen, right state, the criterion visibly met). "
-        "REQUEST_CHANGES if a screenshot is missing, irrelevant, or does not show the "
-        "behaviour the criterion claims.\n\n"
+        f"{_VISUAL_REVIEW_NOTE}\n\n"
         f"{checkout_note}\n\n{_fenced_diff(diff)}"
     )
     return PlannedRun(
@@ -1052,11 +1091,7 @@ def build_delegated_review_task(
         f"Review PR #{pr_number}.\n\n"
         f"{_fenced('title', title)}\n\n{_fenced('description', body)}\n\n"
         f"{_DELEGATE_NOTE}\n\n"
-        "If the PR commits screenshots under `evidence/` for a visual acceptance "
-        "criterion, READ each one and judge whether it actually substantiates that "
-        "criterion (right screen, right state, the criterion visibly met). "
-        "REQUEST_CHANGES if a screenshot is missing, irrelevant, or does not show the "
-        "behaviour the criterion claims.\n\n"
+        f"{_VISUAL_REVIEW_NOTE}\n\n"
         f"{checkout_note}\n\n{_fenced_diff(diff)}"
     )
     return PlannedRun(

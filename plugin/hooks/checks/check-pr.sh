@@ -80,11 +80,18 @@ printf '%s' "$body" | grep -qiE '(fix(es|ed)?|close[sd]?|resolve[sd]?) +#[0-9]+'
 # Two layers, in this order:
 #   FLOOR (unconditional): the agent declared a visual criterion
 #   (.harness/visual-ac), so ≥1 screenshot image must be COMMITTED under
-#   evidence/, and EVERY committed image must have been READ by the agent
-#   (basename recorded in the harness-owned $HARNESS_SCREENSHOTS_READ receipt
-#   by the PostToolUse(Read) hook) — an unread capture is unverified proof.
+#   evidence/. Where the runtime mints trusted read receipts (the harness-owned
+#   $HARNESS_SCREENSHOTS_READ file, written by the PostToolUse(Read) hook),
+#   EVERY committed image must also have been READ by the agent. On a
+#   receipt-less runtime ($HARNESS_SCREENSHOTS_READ unset — codex, whose hooks
+#   run inside the paid child, so a receipt would be self-report) the read
+#   check is SKIPPED and the independent reviewer is the sole content verifier
+#   (xnmp/autonomous-issue-agent#153; keifu #142/#156 — closing the path here
+#   manufactured dead-ends a later checkpoint already covers).
+#   BYTE-IDENTICAL (every runtime): two evidence images with the same sha256
+#   are one screenshot wearing two names (#153 reuse gaming) — deny.
 #   PER-AC (additive, only when the body's AC section parses into N ≥ 1 items):
-#   N read+committed images AND N distinct evidence/ paths referenced in the
+#   N committed images AND N distinct evidence/ paths referenced in the
 #   body. One shot for a five-criterion PR proves one criterion, and a shot
 #   nobody links is invisible to the reviewer who must check each against its AC.
 # An unparseable AC section counts 0 and therefore only applies the floor — a
@@ -111,25 +118,42 @@ if [ -f .harness/visual-ac ] \
   shots=$(printf '%s\n' "$changed" | grep -iE '^evidence/.*\.(png|jpg|jpeg|gif|webp)$' || true)
   [ -n "$shots" ] \
     || fail "a visual acceptance criterion was declared (.harness/visual-ac) but no screenshot is committed under evidence/ — capture one with agent-browser"
-  [ -n "${HARNESS_SCREENSHOTS_READ:-}" ] \
-    || fail "this runtime cannot produce trusted screenshot-read receipts, so the visual-evidence path CANNOT pass (xnmp/autonomous-issue-agent#153) — convert each visual acceptance criterion to a test-asserted one (assert the rendered output/state in a test, reference the test by name next to the AC item), remove .harness/visual-ac and any evidence/ images, and re-run gh pr create"
-  [ -r "$HARNESS_SCREENSHOTS_READ" ] \
-    || fail "trusted screenshot-read receipt is unavailable — open each evidence image with the Read tool before opening the PR"
+  # Receipt-less runtime (var unset): skip the read check — the reviewer is
+  # the sole content verifier. When the var IS set the receipt must be
+  # readable and cover every committed image.
+  if [ -n "${HARNESS_SCREENSHOTS_READ:-}" ]; then
+    [ -r "$HARNESS_SCREENSHOTS_READ" ] \
+      || fail "trusted screenshot-read receipt is unavailable — open each evidence image with the Read tool before opening the PR"
 
-  unread=""
-  while IFS= read -r shot; do
-    [ -n "$shot" ] || continue
-    b="$(basename "$shot")"
-    grep -qxF "$b" "$HARNESS_SCREENSHOTS_READ" 2>/dev/null || unread="$unread $b"
-  done <<< "$shots"
-  [ -z "$unread" ] \
-    || fail "committed screenshot(s) were never read/verified by the agent:$unread — open each with the Read tool and confirm it shows the criterion met before opening the PR"
+    unread=""
+    while IFS= read -r shot; do
+      [ -n "$shot" ] || continue
+      b="$(basename "$shot")"
+      grep -qxF "$b" "$HARNESS_SCREENSHOTS_READ" 2>/dev/null || unread="$unread $b"
+    done <<< "$shots"
+    [ -z "$unread" ] \
+      || fail "committed screenshot(s) were never read/verified by the agent:$unread — open each with the Read tool and confirm it shows the criterion met before opening the PR"
+  fi
+
+  # Byte-identical evidence images (runtime-independent; fail-soft when no
+  # sha256 tool exists — mirror of image_digests=None in gate.py).
+  if command -v sha256sum >/dev/null 2>&1; then
+    dupe=$(while IFS= read -r shot; do
+        [ -n "$shot" ] && [ -f "$shot" ] || continue
+        printf '%s %s\n' "$(sha256sum <"$shot" | cut -d' ' -f1)" "$shot"
+      done <<< "$shots" | sort | awk '
+        { path = $0; sub(/^[^ ]+ /, "", path) }
+        seen[$1] { print prev[$1] " / " path; exit }
+        { seen[$1] = 1; prev[$1] = path }')
+    [ -z "$dupe" ] \
+      || fail "evidence images '$dupe' are byte-identical — one screenshot proves one criterion; capture a distinct screenshot for each AC item"
+  fi
 
   ac_items=$(count_ac_items "$body")
   if [ "$ac_items" -gt 0 ]; then
     n_shots=$(printf '%s\n' "$shots" | grep -c '.')
     [ "$n_shots" -ge "$ac_items" ] \
-      || fail "$ac_items AC items but only $n_shots read+committed screenshots — capture one per AC item and reference each in the PR body (name the file after the criterion it proves, e.g. evidence/ac-2-empty-state.png)"
+      || fail "$ac_items AC items but only $n_shots committed screenshots — capture one per AC item and reference each in the PR body (name the file after the criterion it proves, e.g. evidence/ac-2-empty-state.png)"
     # Distinct evidence/ image paths REFERENCED in the body (kept in sync with
     # domain/gate.py:_EVIDENCE_REF_RE).
     n_refs=$(printf '%s\n' "$body" \

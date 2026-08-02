@@ -451,6 +451,13 @@ def _forged_screenshot_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def _duplicate_evidence_repo(tmp_path: Path) -> Path:
+    repo = _visual_repo(tmp_path)
+    commit_evidence(repo, "evidence/ac-1.png", b"\x89PNG same bytes")
+    commit_evidence(repo, "evidence/ac-2.png", b"\x89PNG same bytes")
+    return repo
+
+
 def _weakened_test_repo(tmp_path: Path) -> Path:
     repo = fresh_repo(tmp_path)
     (repo / "tests").mkdir()
@@ -517,13 +524,27 @@ GOLDEN: tuple[Case, ...] = (
         True,
         env={"HARNESS_SCREENSHOTS_READ": "../screenshots-read"},
     ),
+    # Receipt-less runtime (no HARNESS_SCREENSHOTS_READ — codex, #153): the
+    # read check is skipped and committed evidence passes through to the
+    # independent reviewer, the sole content verifier (keifu #142/#156). The
+    # agent-authored worktree marker is irrelevant either way — it proves the
+    # forgery grants nothing, not that it is punished.
     Case(
-        "visual_ac_with_forged_worktree_receipt",
+        "visual_ac_receiptless_passes_through",
         "pr",
         _forged_screenshot_repo,
         _pr_argv(),
+        True,
+    ),
+    # Byte-identical evidence images deny on EVERY runtime (#153 reuse gaming),
+    # receipts or none.
+    Case(
+        "visual_ac_byte_identical_evidence",
+        "pr",
+        _duplicate_evidence_repo,
+        _pr_argv(),
         False,
-        reason_contains="trusted screenshot-read receipt",
+        reason_contains="byte-identical",
     ),
     Case("existing_test_weakened", "pr", _weakened_test_repo, _pr_argv(), False,
          env={"TEST_CMD": "true"}, reason_contains="existing test file"),
@@ -701,7 +722,8 @@ def test_golden_covers_every_rule_family() -> None:
         "visual_ac_without_screenshot": "evidence",
         "visual_ac_receipt_unreadable": "evidence",
         "visual_ac_with_read_screenshot": "evidence",
-        "visual_ac_with_forged_worktree_receipt": "evidence",
+        "visual_ac_receiptless_passes_through": "evidence",
+        "visual_ac_byte_identical_evidence": "evidence",
         "existing_test_weakened": "evidence",
         "adr_governed_path_uncited": "adr", "adr_governed_path_cited": "adr",
         "adr_governs_untouched_path": "adr",

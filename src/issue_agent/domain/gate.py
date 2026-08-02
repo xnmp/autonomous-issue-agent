@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 
@@ -363,24 +363,40 @@ def check_visual_evidence(
     *,
     receipt_available: bool = True,
     receipt_unreadable: bool = False,
+    image_digests: Mapping[str, str] | None = None,
 ) -> GateResult:
     """When the agent declared a visual acceptance criterion (.harness/visual-ac),
-    the PR must commit screenshots under evidence/ AND the agent must have actually
-    READ each committed screenshot (loaded it into its vision context, recorded by
-    the PostToolUse(Read) hook in a harness-owned receipt). A captured-but-unread
-    screenshot is unverified proof → blocked. Non-visual issues (the common case)
-    → ALLOW.
+    the PR must commit screenshots under evidence/ — and where the runtime can
+    mint trusted read receipts, prove the agent actually READ each one (loaded
+    it into its vision context, recorded by the PostToolUse(Read) hook in a
+    harness-owned receipt). Non-visual issues (the common case) → ALLOW.
+
+    On a runtime that CANNOT mint receipts (codex — its hooks run inside the
+    paid child, so a receipt would be the agent reporting on itself), the read
+    check is skipped and the INDEPENDENT REVIEWER is the sole content verifier:
+    the review prompt directs it to open every evidence image and reject any
+    that fail to show the criterion met. Closing the path outright here
+    manufactured deterministic dead-ends and operator questions out of a gap a
+    later, stronger checkpoint already covers (#153; keifu #142/#156). The
+    receipt, where available, remains a cheap pre-publication floor that spares
+    a paid review round.
 
     ONE SCREENSHOT PER AC ITEM (P3.6-lite). One screenshot for a five-criterion PR
     proves one criterion, so when the body's `## Acceptance Criteria` section parses
-    into N checklist items the PR must carry N read+committed images AND reference N
+    into N checklist items the PR must carry N committed images AND reference N
     distinct evidence/ paths in the body — an image nobody links is invisible to the
-    reviewer, who verifies each shot against its criterion.
+    reviewer, who verifies each shot against its criterion. `image_digests`
+    (path → content digest, from the caller's filesystem read) additionally
+    rejects byte-identical images wearing different names on every runtime.
+    That catches only the LAZIEST form of the reuse gaming #153 documented —
+    a 1-bit edit defeats it — so the reviewer prompt, not this rule, is the
+    content guard. None/missing digests mean the caller could not digest
+    (the rule is skipped, never guessed).
 
-    The floor is unconditional and comes FIRST: ≥1 committed image, all of them read.
-    The per-AC rule is additive and only fires when the section actually parses
-    (N ≥ 1); an unparseable/prose AC section (N = 0) leaves exactly today's
-    behaviour, so a parsing miss can never deny by itself. `pr_body` defaults to ""
+    The floor is unconditional and comes FIRST: ≥1 committed image. The per-AC
+    rule is additive and only fires when the section actually parses (N ≥ 1);
+    an unparseable/prose AC section (N = 0) leaves exactly today's behaviour,
+    so a parsing miss can never deny by itself. `pr_body` defaults to ""
     (⇒ N = 0) so a caller that has no body in hand still gets the floor."""
     if not visual_ac:
         return ALLOW
@@ -390,38 +406,43 @@ def check_visual_evidence(
             "a visual acceptance criterion was declared (.harness/visual-ac) but no "
             "screenshot is committed under evidence/ — capture one with agent-browser"
         )
-    if receipt_unreadable:
+    if receipt_available and receipt_unreadable:
         # The runtime mints receipts; THIS read failed. Recoverable — never
-        # the capability dead-end advice (which says to delete evidence).
+        # capability advice.
         return deny(
             "trusted screenshot-read receipt is unavailable — open each "
             "evidence image with the Read tool before opening the PR"
         )
-    if not receipt_available:
-        return deny(
-            "this runtime cannot produce trusted screenshot-read receipts, so "
-            "the visual-evidence path CANNOT pass "
-            "(xnmp/autonomous-issue-agent#153) — convert each visual "
-            "acceptance criterion to a test-asserted one (assert the rendered "
-            "output/state in a test, reference the test by name next to the "
-            "AC item), remove .harness/visual-ac and any evidence/ images, "
-            "and retry"
-        )
-    read = set(screenshots_read)
-    unread = [os.path.basename(f) for f in images if os.path.basename(f) not in read]
-    if unread:
-        return deny(
-            "committed screenshot(s) were never read/verified by the agent: "
-            f"{', '.join(unread)} — open each with the Read tool and confirm it shows "
-            "the criterion met before opening the PR"
-        )
-    # Every image is read+committed by here, so len(images) IS the verified count.
+    if receipt_available:
+        read = set(screenshots_read)
+        unread = [
+            os.path.basename(f) for f in images if os.path.basename(f) not in read
+        ]
+        if unread:
+            return deny(
+                "committed screenshot(s) were never read/verified by the agent: "
+                f"{', '.join(unread)} — open each with the Read tool and confirm "
+                "it shows the criterion met before opening the PR"
+            )
+    if image_digests:
+        seen: dict[str, str] = {}
+        for image in images:
+            digest = image_digests.get(image, "")
+            if not digest:
+                continue
+            if digest in seen:
+                return deny(
+                    f"evidence images '{seen[digest]}' and '{image}' are "
+                    "byte-identical — one screenshot proves one criterion; "
+                    "capture a distinct screenshot for each AC item"
+                )
+            seen[digest] = image
     ac_items = count_ac_items(pr_body)
     if ac_items == 0:
         return ALLOW  # no parsable checklist → the ≥1 floor above is the whole rule
     if len(images) < ac_items:
         return deny(
-            f"{ac_items} AC items but only {len(images)} read+committed screenshots — "
+            f"{ac_items} AC items but only {len(images)} committed screenshots — "
             "capture one per AC item and reference each in the PR body (name the file "
             "after the criterion it proves, e.g. evidence/ac-2-empty-state.png)"
         )

@@ -88,6 +88,17 @@ def test_codex_declares_sdk_only_containment_fields_unsupported():
     assert not capabilities.supports("subagents")
 
 
+def test_sdk_bound_runtimes_declare_harness_side_visual_receipts():
+    # GLM binds through the same SDK runner as claude, so its hooks run
+    # harness-side and its receipts are trusted. Defaulting the flag False told
+    # the fixer "the independent reviewer is your only verifier" while the gate
+    # went on enforcing reads — a prompt/gate contradiction (adversarial P1-3).
+    assert RUNTIME_CAPABILITIES[RuntimeName.GLM].mints_visual_receipts is True
+    assert RUNTIME_CAPABILITIES[RuntimeName.CLAUDE].mints_visual_receipts is True
+    # Codex hooks run inside its own CLI, outside the harness trust domain.
+    assert RUNTIME_CAPABILITIES[RuntimeName.CODEX].mints_visual_receipts is False
+
+
 def test_successful_structured_envelope_contract_is_shared():
     structured = {"status": "pr_opened", "summary": "opened", "needs": ""}
 

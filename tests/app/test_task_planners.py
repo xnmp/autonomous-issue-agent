@@ -2,6 +2,7 @@
 
 import json
 import re
+from dataclasses import replace
 from typing import Any, cast
 
 import issue_agent.app.planners.tasks as tasks_module
@@ -64,6 +65,29 @@ def test_resolve_task():
     assert "issue #5" in t.prompt and "off dev" in t.prompt
     assert "crashes" in t.prompt
     assert t.resume is None
+
+
+def test_receiptless_runtime_gets_the_visual_evidence_note():
+    # Codex cannot mint screenshot-read receipts (#153): the fixer must be told
+    # the reviewer is its evidence's only verifier, and that the visual path is
+    # OPEN (keifu #142 burned a leg + a human question on a prompt that forbade
+    # it). Receipted runtimes (claude) keep AGENT.md untouched.
+    cfg = replace(FIX_CFG, mints_visual_receipts=False)
+    prompt = build_resolve_task(5, U("t"), U("b"), "/wt", cfg).append_system_prompt
+    assert prompt.startswith("AGENTMD")
+    assert "independent reviewer" in prompt
+    assert "NEVER" not in prompt          # the path is open, not forbidden
+    receipted = build_resolve_task(5, U("t"), U("b"), "/wt", FIX_CFG)
+    assert receipted.append_system_prompt == "AGENTMD"
+
+
+def test_review_prompt_makes_the_reviewer_the_sole_evidence_verifier():
+    t = build_review_task(
+        7, U("t"), U("b"), U("diff"),
+        ReviewTaskConfig(repo="o/r", review_prompt="rules"),
+    )
+    assert "ONLY verifier" in t.prompt
+    assert "REQUEST_CHANGES" in t.prompt
 
 
 def test_raw_text_cannot_cross_the_prompt_boundary():

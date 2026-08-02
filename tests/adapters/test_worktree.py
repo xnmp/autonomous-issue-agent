@@ -422,6 +422,80 @@ def test_agent_forged_screenshot_receipt_has_no_authority(tmp_path) -> None:
     assert context.screenshots_receipt_available is True
 
 
+def test_receipt_capability_survives_a_failed_head_read(tmp_path) -> None:
+    # A CONFIGURED receipt path IS the capability statement. A failing
+    # `rev-parse HEAD` left it False, and receipt-less pass-through gate
+    # semantics then read that as "this runtime cannot mint receipts" and
+    # silently dropped the read check on the SDK path (adversarial P1-1).
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    (evidence / "ac.png").write_bytes(b"pixels")
+    receipt = tmp_path / "receipt"
+    key = b"k" * 32
+    _signed_screenshot_receipt(
+        receipt,
+        key=key,
+        head="head-1",
+        image_path="evidence/ac.png",
+        digest=hashlib.sha256(b"pixels").hexdigest(),
+    )
+
+    for head_result in (GitResult(128, ""), GitResult(0, "\n")):
+        git = _builder_git(changed="evidence/ac.png")
+        git.table["rev-parse HEAD"] = head_result
+
+        context = build_gate_context(
+            str(tmp_path),
+            base_branch="dev",
+            git=git,
+            screenshots_read_path=str(receipt),
+            screenshots_receipt_key=key,
+        )
+
+        assert context.screenshots_receipt_available is True
+        # Nothing is verified without a HEAD to bind against, so the gate must
+        # demand the read rather than treat the capability as absent.
+        assert context.screenshots_read == ()
+
+
+def test_image_digests_skip_only_the_evidence_file_that_is_gone(tmp_path) -> None:
+    # `changed` names paths committed then deleted later on the branch. Killing
+    # the whole map on one miss disabled the byte-identical reuse rule (#153)
+    # outright — agent-triggerable by committing and deleting a spare image
+    # (adversarial P1-2). check-pr.sh's `[ -f ] || continue` is the parity peer.
+    (tmp_path / ".harness").mkdir()
+    (tmp_path / ".harness" / "visual-ac").touch()
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    (evidence / "present.png").write_bytes(b"pixels")
+
+    context = build_gate_context(
+        str(tmp_path),
+        base_branch="dev",
+        git=_builder_git(changed="evidence/gone.png\nevidence/present.png"),
+    )
+
+    assert context.image_digests == {
+        "evidence/present.png": hashlib.sha256(b"pixels").hexdigest()
+    }
+
+
+def test_image_digests_stay_empty_without_a_visual_ac_declaration(tmp_path) -> None:
+    # This builder runs on EVERY Bash call the agent makes; the non-visual
+    # common case must not pay a per-call read of every changed evidence file.
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    (evidence / "present.png").write_bytes(b"pixels")
+
+    context = build_gate_context(
+        str(tmp_path),
+        base_branch="dev",
+        git=_builder_git(changed="evidence/present.png"),
+    )
+
+    assert context.image_digests == {}
+
+
 # ── default run_tests: timeout (P0.5 — a hung TEST_CMD must not wedge the gate) ──
 def test_default_run_tests_denies_on_timeout(tmp_path, monkeypatch, capsys):
     """A hung TEST_CMD must resolve to FAILURE (False), not hang forever and not

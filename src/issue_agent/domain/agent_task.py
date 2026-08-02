@@ -23,11 +23,13 @@ class RuntimeCapabilities:
     requires_external_governor: bool
     supported_task_fields: frozenset[str]
     # Whether the runtime can produce TRUSTED screenshot-read receipts (the
-    # PostToolUse(Read) hook running in the harness trust domain). A runtime
-    # without this cannot pass the visual-evidence PR gate — visual-AC work
-    # must be routed elsewhere or asserted by tests instead of pixels
-    # (xnmp/autonomous-issue-agent#153; keifu #156 burned ~$3 dead-ending on
-    # this before escalating).
+    # PostToolUse(Read) hook running in the harness trust domain). Where it
+    # can, the PR gate proves the fixer read each evidence image; where it
+    # can't (codex — its hooks run inside the paid child, so a receipt would
+    # be self-report), the gate passes committed evidence through and the
+    # independent reviewer is the sole content verifier
+    # (xnmp/autonomous-issue-agent#153; keifu #142/#156). True for every SDK
+    # runtime — the flag tracks WHERE hooks run, not the model behind them.
     mints_visual_receipts: bool = False
 
     def supports(self, field_name: str) -> bool:
@@ -85,6 +87,11 @@ RUNTIME_CAPABILITIES = {
         native_budget_enforcement=True,
         requires_external_governor=False,
         supported_task_fields=TASK_FIELD_NAMES,
+        # GLM binds through the same SDK runner as claude (_bind_glm_fix_
+        # runtime), so its hooks run harness-side and receipts ARE trusted;
+        # defaulting False here told the fixer "the reviewer is your only
+        # verifier" while the gate enforced reads (adversarial P1-3).
+        mints_visual_receipts=True,
     ),
 }
 
