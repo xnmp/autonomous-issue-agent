@@ -114,8 +114,33 @@
   overflow: hidden;
   position: relative;
 }
-.sidebar.collapsed {
-  min-width: 52px;
+/* Collapsed: the rail is gone entirely; only the quota button floats over
+   the board, with the expand affordance tucked under it. */
+.sidebar-float {
+  position: fixed;
+  z-index: 30;
+  left: var(--s2);
+  bottom: var(--s2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s1);
+  width: 40px;
+}
+.sidebar-float .rail-btn.icon-only {
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  justify-content: center;
+  background: var(--elevated);
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3);
+}
+.sidebar-toggle-float {
+  position: static;
+  width: 40px;
+  height: 24px;
+  color: var(--ink-faint);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3);
 }
 .sidebar-toggle {
   position: absolute;
@@ -128,9 +153,6 @@
   border-radius: var(--radius-sm);
   background: var(--elevated);
   color: var(--ink);
-}
-.sidebar.collapsed .sidebar-toggle {
-  right: 10px;
 }
 .sidebar-resizer {
   position: absolute;
@@ -160,16 +182,6 @@
   display: flex;
   flex-direction: column;
   gap: var(--s1);
-}
-.sidebar-foot.collapsed {
-  padding: var(--s1);
-  align-items: center;
-}
-.sidebar-foot.collapsed .rail-btn.icon-only {
-  width: 40px;
-  height: 40px;
-  padding: 0;
-  justify-content: center;
 }
 
 .rail-group + .rail-group {
@@ -341,8 +353,7 @@
   position: relative;
   width: 100%;
 }
-.usage-inline.collapsed,
-.sidebar-foot.collapsed .options-menu {
+.usage-inline.collapsed {
   width: 40px;
 }
 .quota-card {
@@ -1015,14 +1026,6 @@
   border-color: var(--border-strong);
   box-shadow: 0 12px 28px rgba(0, 0, 0, 0.32);
 }
-.sidebar-foot.collapsed .options-popover {
-  position: fixed;
-  left: 60px;
-  right: auto;
-  bottom: var(--s2);
-  max-height: calc(100dvh - var(--s4));
-  width: 240px;
-}
 .options-theme {
   display: grid;
   gap: var(--s1);
@@ -1210,7 +1213,8 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.task-cost {
+.task-cost,
+.task-took {
   font-size: var(--fs-xs);
   opacity: 0.7;
 }

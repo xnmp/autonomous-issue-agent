@@ -58,6 +58,65 @@ function summarize(e: JournalEvent): { k: string; v: string }[] {
   return out;
 }
 
+/** Observation heartbeats: individually meaningless, collectively noise. */
+function isObservation(e: JournalEvent): boolean {
+  return /world\.observed/.test(eventKind(e));
+}
+
+type TimelineEntry =
+  | { grouped: false; event: JournalEvent }
+  | { grouped: true; events: JournalEvent[] };
+
+/**
+ * Fold consecutive world-observed heartbeats into one entry. A lone
+ * observation stays a plain item; only runs collapse, so an observation that
+ * sits between two real transitions still reads in place.
+ */
+export function foldObservations(events: JournalEvent[]): TimelineEntry[] {
+  const out: TimelineEntry[] = [];
+  for (const e of events) {
+    const last = out[out.length - 1];
+    if (isObservation(e)) {
+      if (last?.grouped) last.events.push(e);
+      else out.push({ grouped: true, events: [e] });
+    } else {
+      out.push({ grouped: false, event: e });
+    }
+  }
+  return out.map((entry) => {
+    if (!entry.grouped || entry.events.length !== 1) return entry;
+    const only = entry.events[0];
+    return only ? { grouped: false as const, event: only } : entry;
+  });
+}
+
+function ObservationGroup({ events }: { events: JournalEvent[] }) {
+  const first = events[0];
+  const last = events[events.length - 1] ?? first;
+  if (!first || !last) return null;
+  return (
+    <li className="tl-item tl-item-grouped">
+      <span className="tl-time mono faint" title={localTime(first.ts)}>
+        {clockTime(first.ts)}
+      </span>
+      <span className="tl-rail" aria-hidden="true" />
+      <div className="tl-body">
+        <div className="row-wrap">
+          <Chip tone="meta" square>
+            {eventKind(first)} ×{events.length}
+          </Chip>
+          <span className="faint">
+            {clockTime(first.ts)} – {clockTime(last.ts)}
+          </span>
+        </div>
+        <Collapsible title={<span className="faint">raw ({events.length})</span>}>
+          <JsonBlock value={events} />
+        </Collapsible>
+      </div>
+    </li>
+  );
+}
+
 /**
  * Journal events as a readable timeline: timestamp, kind chip, the handful of
  * fields that carry meaning, and the raw record one click away. The raw JSON is
@@ -76,7 +135,10 @@ export function EventTimeline({
   if (events.length === 0) return <EmptyState>{emptyText}</EmptyState>;
   return (
     <ol className={`timeline${dense ? " dense" : ""}`}>
-      {events.map((e, i) => (
+      {foldObservations(events).map((entry, i) => {
+        if (entry.grouped) return <ObservationGroup key={i} events={entry.events} />;
+        const e = entry.event;
+        return (
         <li key={i} className="tl-item">
           <span className="tl-time mono faint" title={localTime(e.ts)}>
             {clockTime(e.ts)}
@@ -104,7 +166,8 @@ export function EventTimeline({
             </Collapsible>
           </div>
         </li>
-      ))}
+        );
+      })}
     </ol>
   );
 }

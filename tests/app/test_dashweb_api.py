@@ -139,8 +139,9 @@ class StubBackend:
         self._maybe("promote")
         return (True, "ok")
 
-    def unblock(self, name, number):
+    def unblock(self, name, number, channel="api"):
         self._maybe("unblock")
+        self.unblock_channel = channel
         return (True, "ok")
 
     def priority(self, name, number, priority):
@@ -306,6 +307,20 @@ def test_unblock_reports_success():
     assert client().post("/api/repos/demo/issues/9/unblock").json() == {
         "ok": True, "detail": "ok"
     }
+
+
+def test_unblock_stamps_the_channel_from_the_user_agent():
+    # A browser (the dashboard UI) journals channel=ui; anything else — curl,
+    # an agent — journals channel=api and wears the louder badge downstream.
+    backend = StubBackend()
+    c = TestClient(server.create_app(backend=backend), headers=WRITE_HEADERS, base_url=BASE_URL)
+    c.post("/api/repos/demo/issues/9/unblock",
+           headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64)"})
+    assert backend.unblock_channel == "ui"
+    c.post("/api/repos/demo/issues/9/unblock", headers={"User-Agent": "curl/8.5"})
+    assert backend.unblock_channel == "api"
+    c.post("/api/repos/demo/issues/9/unblock", headers={"User-Agent": ""})
+    assert backend.unblock_channel == "api"
 
 
 def test_an_unblock_whose_collectors_fail_is_refused_not_a_500():

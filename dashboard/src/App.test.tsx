@@ -124,7 +124,7 @@ describe("App navigation", () => {
     expect(await screen.findByText("Verification ledger", { selector: ".section-title span" })).toBeVisible();
   });
 
-  it("keeps quota and theme settings in the sidebar when collapsed", async () => {
+  it("collapses the sidebar to a floating quota button and nothing else", async () => {
     window.location.hash = "#/repo/demo/issues/done";
     vi.stubGlobal(
       "fetch",
@@ -142,11 +142,17 @@ describe("App navigation", () => {
     await screen.findByRole("button", { name: "Settings" });
     expect(screen.queryByText("Operations")).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+
+    // The rail is fully gone: no repo list, no settings, no verification —
+    // just the floating quota button and the way back.
+    expect(screen.queryByRole("button", { name: "Settings" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Verification ledger" })).not.toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Quota" }));
     expect(screen.getByRole("region", { name: "Quota" })).toHaveClass("compact");
     expect(screen.queryByText("Quota", { selector: ".panel-title" })).not.toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "Settings" }));
+    await userEvent.click(screen.getByRole("button", { name: "Expand sidebar" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Settings" }));
     await userEvent.selectOptions(screen.getByLabelText("Theme"), "nord");
     const seconds = screen.getByRole("checkbox", { name: "Show seconds in durations" });
     await userEvent.click(seconds);

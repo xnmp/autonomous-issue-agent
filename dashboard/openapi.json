@@ -1752,6 +1752,17 @@
       "PendingCard": {
         "additionalProperties": true,
         "properties": {
+          "body": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Body"
+          },
           "held": {
             "title": "Held",
             "type": "boolean"

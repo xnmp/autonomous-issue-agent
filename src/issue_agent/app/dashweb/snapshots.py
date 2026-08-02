@@ -248,6 +248,12 @@ def _operator_steps(row: dash.IssueRow) -> list[tuple[dict, str, str | None]]:
             continue
         kind = OPERATOR_ACTION_STEPS.get(str(action.get("type") or ""))
         if kind is not None:
+            # Channel provenance: an unblock driven over the bare API (an
+            # agent, curl) wears its channel so it is never mistaken for a
+            # human's judgement call. Events older than the stamp have no
+            # channel and stay unmarked.
+            if action.get("channel") == "api":
+                kind = f"{kind} (api)"
             steps.append((event, kind, _operator_note(action)))
     return steps
 
@@ -1264,6 +1270,7 @@ def pending_card(issue: dict, row: dash.IssueRow | None) -> dict:
         "issue": int(issue.get("number") or 0),
         "title": issue.get("title"),
         "url": issue.get("url"),
+        "body": issue.get("body"),
         "priority": priority_of(labels),
         "labels": labels,
         "held": bool(defer),

@@ -493,6 +493,7 @@ function PendingTable({
   onRefresh: () => void;
 }) {
   const [busyIssue, setBusyIssue] = useState<number | null>(null);
+  const [expanded, setExpanded] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   // This table's column choices are namespaced (`pending-*`) because it shares
   // the in-flight sub-tab's menu, so the visible set has to be translated into
@@ -547,29 +548,58 @@ function PendingTable({
           onSort={sorted.onSort}
         >
           <tbody>
-            {sorted.rows.map((card) => (
-              <tr key={card.issue}>
-                <td><CompactIssue issue={card.issue} title={card.title} url={card.url} /></td>
-                {visible.has("pending-priority") ? <td>
-                  <PrioritySelector
-                    value={card.priority}
-                    busy={busyIssue === card.issue}
-                    onChange={(priority) => void setPriority(card.issue, priority)}
-                  />
-                </td> : null}
-                {visible.has("pending-overlap") ? (
-                  <td><span className="faint" title="steward overlap prediction not built yet">n/a</span></td>
-                ) : null}
-                {visible.has("pending-hold") ? <td>
-                  {card.held ? (
-                    <Chip tone="info" title={card.hold_reason ?? "pending"}>
-                      {card.hold_reason ?? "pending"}
-                    </Chip>
-                  ) : <Chip tone="info">pending</Chip>}
-                </td> : null}
-                {visible.has("pending-labels") ? <td><LabelList labels={card.labels} /></td> : null}
-              </tr>
-            ))}
+            {sorted.rows.map((card) => {
+              const open = expanded === card.issue;
+              return (
+                <Fragment key={card.issue}>
+                  <tr
+                    className={`clickable${open ? " expanded" : ""}`}
+                    tabIndex={0}
+                    aria-expanded={open}
+                    onClick={() => setExpanded(open ? null : card.issue)}
+                    onKeyDown={(event) => toggleRowFromKeyboard(event, () => setExpanded(open ? null : card.issue))}
+                  >
+                    <td>
+                      <div className="issue-summary">
+                        <span className={`chev${open ? " open" : ""}`} aria-hidden="true">▸</span>
+                        <CompactIssue issue={card.issue} title={card.title} url={card.url} />
+                      </div>
+                    </td>
+                    {visible.has("pending-priority") ? <td onClick={(event) => event.stopPropagation()}>
+                      <PrioritySelector
+                        value={card.priority}
+                        busy={busyIssue === card.issue}
+                        onChange={(priority) => void setPriority(card.issue, priority)}
+                      />
+                    </td> : null}
+                    {visible.has("pending-overlap") ? (
+                      <td><span className="faint" title="steward overlap prediction not built yet">n/a</span></td>
+                    ) : null}
+                    {visible.has("pending-hold") ? <td>
+                      {card.held ? (
+                        <Chip tone="info" title={card.hold_reason ?? "pending"}>
+                          {card.hold_reason ?? "pending"}
+                        </Chip>
+                      ) : <Chip tone="info">pending</Chip>}
+                    </td> : null}
+                    {visible.has("pending-labels") ? <td><LabelList labels={card.labels} /></td> : null}
+                  </tr>
+                  {open ? (
+                    <tr className="detail-row">
+                      <td colSpan={columns.length}>
+                        <div className="row-detail">
+                          <div className="row-detail-hd">
+                            <strong>Issue context</strong>
+                            {card.url ? <a href={card.url} target="_blank" rel="noreferrer">Open on GitHub ↗</a> : null}
+                          </div>
+                          <FormattedIssueBody body={card.body ?? null} />
+                        </div>
+                      </td>
+                    </tr>
+                  ) : null}
+                </Fragment>
+              );
+            })}
           </tbody>
         </ResizableTable>
       </div>
@@ -1020,6 +1050,7 @@ function TaskStoryLine({ step }: { step: CardStep | IssueStep }) {
   const tone = stateTone(step.state);
   const note = stepNote(step);
   const cost = step.cost_usd ?? 0;
+  const took = stepDuration(step);
   return (
     <li className={`task-story-line tone-border-${tone}`}>
       <Chip
@@ -1030,11 +1061,16 @@ function TaskStoryLine({ step }: { step: CardStep | IssueStep }) {
       >
         {taskName(step)}
       </Chip>
-      <span className={`task-state tone-${tone}`}>
-        {step.state === "ok" ? "done" : step.state}
-      </span>
+      {/* Success is already the chip's tone; the word "done" beside every
+          finished task was pure noise (and in the Done tab, doubly so). */}
+      {step.state === "ok" || step.state === "done" ? null : (
+        <span className={`task-state tone-${tone}`}>{step.state}</span>
+      )}
       {note ? <span className="task-note" title={note}>{note}</span> : null}
       <span className="spacer" />
+      {took !== null ? (
+        <span className="mono faint task-took" title="task wall time">{duration(took)}</span>
+      ) : null}
       {cost > 0 ? <span className="mono faint task-cost">{usd(step.cost_usd)}</span> : null}
     </li>
   );
@@ -1044,6 +1080,12 @@ function TaskStoryLine({ step }: { step: CardStep | IssueStep }) {
 function stepNote(step: CardStep | IssueStep): string | null {
   const value = (step as { note?: unknown }).note;
   return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+/** Only detailed steps carry timing; a still-running task has none yet. */
+function stepDuration(step: CardStep | IssueStep): number | null {
+  const value = (step as { duration_s?: unknown }).duration_s;
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
 }
 
 function taskName(step: CardStep | IssueStep): string {

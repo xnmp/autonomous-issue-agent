@@ -118,6 +118,7 @@ const ToastNotification = z
   .passthrough();
 const PendingCard = z
   .object({
+    body: z.union([z.string(), z.null()]).optional(),
     held: z.boolean(),
     hold_reason: z.union([z.string(), z.null()]),
     issue: z.number().int(),

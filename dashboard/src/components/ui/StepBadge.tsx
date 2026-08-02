@@ -3,6 +3,19 @@ import type { CardStep } from "../../api/types";
 import { kindLabel, stepKindTone, isOperatorStep } from "../../lib/semantics";
 import { usd } from "../../lib/format";
 import { Chip } from "./Chip";
+import { tipProps } from "./Tip";
+
+/**
+ * A review that finished by asking for changes did its job, but green would
+ * read as "converged" — the verdict outranks the exit for the badge's colour.
+ * Yellow = the loop is still going; green stays for approvals and clean legs.
+ */
+function episodeTone(step: CardStep) {
+  if (step.state === "ok" && step.status?.toUpperCase().includes("REQUEST_CHANGES")) {
+    return "running";
+  }
+  return stepKindTone(step.kind, step.state);
+}
 
 function episodeTitle(step: CardStep): string {
   const count = step.count ?? 1;
@@ -22,7 +35,7 @@ function episodeTitle(step: CardStep): string {
  * decode RES/RTE/ADR while diagnosing an incident.
  */
 export function StepBadge({ step }: { step: CardStep }) {
-  const tone = stepKindTone(step.kind, step.state);
+  const tone = episodeTone(step);
   const count = step.count ?? 1;
   return (
     <Chip tone={tone} square pulse={step.state === "running"} title={episodeTitle(step)}>
@@ -43,12 +56,12 @@ const TAIL_CHIPS = 3;
 const MAX_DOTS = 14;
 
 function HistoryDot({ step }: { step: CardStep }) {
-  const tone = stepKindTone(step.kind, step.state);
+  const tone = episodeTone(step);
   const operator = isOperatorStep(step.kind);
   return (
     <span
       className={`step-dot step-dot-${tone}${operator ? " step-dot-op" : ""}`}
-      title={episodeTitle(step)}
+      {...tipProps(episodeTitle(step), { labelled: true })}
     />
   );
 }
@@ -86,7 +99,7 @@ export function StepBadgeRow({ steps }: { steps: CardStep[] }) {
   return (
     <span className="step-flow">
       {elided > 0 ? (
-        <span className="step-elided faint" title={`${elided} earlier steps — expand the row for the full timeline`}>
+        <span className="step-elided faint" {...tipProps(`${elided} earlier steps — expand the row for the full timeline`, { labelled: true })}>
           +{elided}
         </span>
       ) : null}

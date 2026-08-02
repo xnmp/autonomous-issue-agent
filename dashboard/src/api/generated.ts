@@ -678,6 +678,8 @@ export interface components {
         };
         /** PendingCard */
         PendingCard: {
+            /** Body */
+            body?: string | null;
             /** Held */
             held: boolean;
             /** Hold Reason */

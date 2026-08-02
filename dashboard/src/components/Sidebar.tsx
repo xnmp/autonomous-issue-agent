@@ -132,20 +132,35 @@ export function Sidebar({
     }
   };
 
+  // Fully out of the way when collapsed: no rail, no border — just a floating
+  // quota button (the one thing worth glancing at while reading the board) and
+  // the affordance to bring the sidebar back.
+  if (collapsed) {
+    return (
+      <div className="sidebar-float">
+        <UsageBlock usage={usage} collapsed />
+        <button
+          className="sidebar-toggle sidebar-toggle-float"
+          onClick={toggleCollapsed}
+          aria-label="Expand sidebar"
+          title="Expand sidebar"
+        >
+          ›
+        </button>
+      </div>
+    );
+  }
+
   return (
-    <aside
-      className={`sidebar${collapsed ? " collapsed" : ""}`}
-      style={{ width: collapsed ? 52 : width }}
-    >
+    <aside className="sidebar" style={{ width }}>
       <button
         className="sidebar-toggle"
         onClick={toggleCollapsed}
-        aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-        title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+        aria-label="Collapse sidebar"
+        title="Collapse sidebar"
       >
-        {collapsed ? "›" : "‹"}
+        ‹
       </button>
-      {!collapsed ? (
       <div className="sidebar-scroll">
         {repos.data?.liveness === "unknown" ? (
           <Chip tone="neutral" title="/proc scan unavailable — daemon liveness is unknown">
@@ -217,9 +232,8 @@ export function Sidebar({
           </details>
         ) : null}
       </div>
-      ) : null}
-      <div className={`sidebar-foot${collapsed ? " collapsed" : ""}`}>
-        {!collapsed && notice ? (
+      <div className="sidebar-foot">
+        {notice ? (
           <div className="banner banner-ok" role="status">
             <span className="banner-msg trunc" title={notice}>
               {notice}
@@ -229,36 +243,30 @@ export function Sidebar({
             </button>
           </div>
         ) : null}
-        <UsageBlock usage={usage} collapsed={collapsed} />
-        <OptionsMenu
-          options={options}
-          onChange={onOptionsChange}
-          collapsed={collapsed}
-        />
+        <UsageBlock usage={usage} />
+        <OptionsMenu options={options} onChange={onOptionsChange} />
         <button
-          className={`rail-btn${verificationActive ? " active" : ""}${collapsed ? " icon-only" : ""}`}
+          className={`rail-btn${verificationActive ? " active" : ""}`}
           onClick={onOpenVerification}
           aria-label="Verification ledger"
           title="Verification ledger"
         >
           <span className="rail-btn-mark" aria-hidden="true">✓</span>
-          {!collapsed ? <span>Verification ledger</span> : null}
+          <span>Verification ledger</span>
         </button>
       </div>
-      {!collapsed ? (
-        <div
-          className="sidebar-resizer"
-          role="separator"
-          aria-label="Resize sidebar"
-          aria-orientation="vertical"
-          aria-valuemin={220}
-          aria-valuemax={480}
-          aria-valuenow={width}
-          tabIndex={0}
-          onPointerDown={beginResize}
-          onKeyDown={resizeFromKeyboard}
-        />
-      ) : null}
+      <div
+        className="sidebar-resizer"
+        role="separator"
+        aria-label="Resize sidebar"
+        aria-orientation="vertical"
+        aria-valuemin={220}
+        aria-valuemax={480}
+        aria-valuenow={width}
+        tabIndex={0}
+        onPointerDown={beginResize}
+        onKeyDown={resizeFromKeyboard}
+      />
 
       {confirmStart ? (
         <ConfirmModal

@@ -72,10 +72,23 @@ export function stateTone(state: StepState | null | undefined): Tone {
  * `meta` — the same tone the contract already reserves for steward/self work —
  * so a human intervention is never mistaken for an agent leg.
  */
-export const OPERATOR_STEP_KINDS = new Set(["unblock", "relabel (operator)"]);
+export const OPERATOR_STEP_KINDS = new Set([
+  "unblock",
+  "unblock (api)",
+  "relabel (operator)",
+  "review re-arm",
+  "review re-arm (api)",
+]);
 
 export function isOperatorStep(kind: string): boolean {
   return OPERATOR_STEP_KINDS.has(kind.toLowerCase());
+}
+
+/** An operator action driven over the bare API (an agent, a script) rather
+ * than a human in the UI. Badged distinctly so automation's hand on the
+ * levers is never mistaken for the operator's judgement. */
+export function isApiOperatorStep(kind: string): boolean {
+  return isOperatorStep(kind) && kind.toLowerCase().endsWith("(api)");
 }
 
 /** A step's chip tone: who ran it first, then how it ended. */
@@ -83,6 +96,7 @@ export function stepKindTone(
   kind: string,
   state: StepState | null | undefined,
 ): Tone {
+  if (isApiOperatorStep(kind)) return "running";
   return isOperatorStep(kind) ? "meta" : stateTone(state);
 }
 

@@ -105,7 +105,7 @@ describe("human-owned actions", () => {
     );
 
     expect(container.querySelector("tbody > tr")).toHaveClass("row-alert");
-    expect(screen.getByTitle(/ADDRESS_REVIEW · blocked · blocked/)).toHaveClass("chip-fail");
+    expect(document.querySelector('[data-tip^="ADDRESS_REVIEW · blocked"]')).toHaveClass("chip-fail");
   });
 });
 

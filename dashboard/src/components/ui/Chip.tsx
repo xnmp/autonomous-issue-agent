@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import type { Tone } from "../../lib/semantics";
+import { tipProps } from "./Tip";
 
 interface ChipProps {
   tone?: Tone;
@@ -34,7 +35,7 @@ export function Chip({
     .filter(Boolean)
     .join(" ");
   return (
-    <span className={cls} title={title}>
+    <span className={cls} {...tipProps(title)}>
       {children}
     </span>
   );
@@ -43,5 +44,5 @@ export function Chip({
 /** A bare status dot (sidebar role health). Always paired with a title/label —
  * colour alone is never the only channel. */
 export function Dot({ tone, title }: { tone: Tone; title: string }) {
-  return <span className={`dot dot-${tone}`} title={title} aria-label={title} role="img" />;
+  return <span className={`dot dot-${tone}`} {...tipProps(title, { labelled: true })} role="img" />;
 }

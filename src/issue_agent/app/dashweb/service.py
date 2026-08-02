@@ -389,7 +389,9 @@ class Backend:
             remove=remove,
         )
 
-    def unblock(self, name: str, number: int) -> tuple[bool, str]:
+    def unblock(
+        self, name: str, number: int, channel: str = "api"
+    ) -> tuple[bool, str]:
         """Undo a hold a human is expected to clear: dismiss the reviewer's
         standing change requests, drop the labels that stop re-dispatch, and
         hand back the retry budget the wedge consumed. No lifecycle label is
@@ -449,7 +451,8 @@ class Backend:
             if not pr_applied:
                 applied, detail = False, f"pr #{pr}: {pr_detail}"
         self._journal_unblock(
-            name, repo, number, held, cleared, applied, pr_held=pr_held
+            name, repo, number, held, cleared, applied, pr_held=pr_held,
+            channel=channel,
         )
         if applied and rearm_failures:
             return True, "ok — but " + "; ".join(rearm_failures)
@@ -682,6 +685,7 @@ class Backend:
         cleared: int,
         applied: bool,
         pr_held: dict[int, tuple[str, ...]] | None = None,
+        channel: str = "api",
     ) -> None:
         journal = self._operator_journal(name, repo)
         if journal is None:
@@ -703,6 +707,7 @@ class Backend:
                             "add": [],
                             "remove": list(held),
                             "operator": f"{repo}:dashboard",
+                            "channel": channel,
                             "retries_cleared": cleared,
                             "labels_applied": applied,
                         },
@@ -724,6 +729,7 @@ class Backend:
                                 "add": [],
                                 "remove": list(labels),
                                 "operator": f"{repo}:dashboard",
+                                "channel": channel,
                                 "labels_applied": applied,
                             },
                         ),
@@ -841,7 +847,11 @@ _PR_ENRICHMENT_FIELDS = (
     # here every v2 card rendered pr_ci_state=None while CI was visibly red.
     "statusCheckRollup",
 )
-_ISSUE_ENRICHMENT_FIELDS = ("title", "url")
+# `body` and `createdAt` are presentational fields the projection does not
+# carry: the backlog drill-down renders the issue text, and its age column
+# needs the creation instant. Dropping them here blanked every expanded
+# backlog row (2026-08-02).
+_ISSUE_ENRICHMENT_FIELDS = ("title", "url", "body", "createdAt")
 
 
 def _enrichment(value: dict, fields: tuple[str, ...]) -> dict:

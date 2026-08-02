@@ -229,6 +229,8 @@ class PendingCard(Contract):
     issue: int
     title: str | None
     url: str | None
+    # The drill-down renders the issue text, same as backlog rows.
+    body: str | None = None
     priority: Literal["P1", "P2", "P3"] | None
     labels: list[str]
     held: bool

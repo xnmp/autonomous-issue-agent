@@ -2,6 +2,7 @@ import type { ReactNode } from "react";
 import type { Tone } from "../../lib/semantics";
 import { utilTone } from "../../lib/semantics";
 import { pct as fmtPct, usd } from "../../lib/format";
+import { tipProps } from "./Tip";
 
 /* --------------------------------------------------------------- Meter ---
  * A single-value magnitude bar (usage windows, caps utilization).
@@ -90,14 +91,14 @@ export function StatTile({
     return (
       <button
         className={`tile tile-action${alert ? " tile-alert" : ""}`}
-        title={title}
+        {...tipProps(title)}
         onClick={onClick}
       >
         {content}
       </button>
     );
   }
-  return <div className={`tile${alert ? " tile-alert" : ""}`} title={title}>{content}</div>;
+  return <div className={`tile${alert ? " tile-alert" : ""}`} {...tipProps(title)}>{content}</div>;
 }
 
 /* --------------------------------------------------------- Stacked bar ---

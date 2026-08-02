@@ -758,6 +758,13 @@ def test_pending_card_with_no_journal_history_is_not_held():
     assert (card["held"], card["priority"]) == (False, None)
 
 
+def test_pending_card_carries_the_issue_body_for_the_drill_down():
+    card = snapshots.pending_card(
+        {"number": 9, "labels": ["ai-ready"], "body": "repro steps"}, None)
+    assert card["body"] == "repro steps"
+    assert snapshots.pending_card({"number": 9, "labels": []}, None)["body"] is None
+
+
 def test_backlog_excludes_any_issue_the_harness_lifecycle_already_owns():
     assert snapshots.is_backlog({"labels": [{"name": "bug"}]}) is True
     assert snapshots.is_backlog({"labels": [{"name": "ai-working"}]}) is False
@@ -1225,6 +1232,23 @@ def test_an_operator_relabel_is_its_own_step_kind():
     assert steps[-1]["note"] == "added P1"
 
 
+def test_an_api_channel_unblock_wears_its_channel_in_the_step_kind():
+    # An unblock journaled by a bare API caller (curl, an agent) must never be
+    # mistaken for a deliberate human clicking the dashboard button.
+    api_unblock = {**UNBLOCK, "action": {**UNBLOCK["action"], "channel": "api"}}
+    steps = snapshots.detailed_steps(row_view([api_unblock]))
+    assert steps[-1]["kind"] == "unblock (api)"
+
+
+@pytest.mark.parametrize("channel", ["ui", None, 7, ""])
+def test_a_ui_or_unstamped_channel_keeps_the_plain_operator_kind(channel):
+    action = {**UNBLOCK["action"]}
+    if channel is not None:
+        action["channel"] = channel
+    steps = snapshots.detailed_steps(row_view([{**UNBLOCK, "action": action}]))
+    assert steps[-1]["kind"] == "unblock"
+
+
 @pytest.mark.parametrize(
     "action",
     ["not-a-dict", {}, {"type": "comment"}, {"type": None}, None],
@@ -1602,6 +1626,25 @@ def test_a_github_read_cannot_displace_the_projected_issue_state():
     assert issue["state"] == "OPEN"
     assert (issue["title"], issue["url"]) == ("the bug", "u/7")
     assert "mergedAt" not in issue
+
+
+def test_issue_enrichment_carries_the_body_the_projection_cannot_supply():
+    # The v2 facts have no `body`/`createdAt`; without GitHub's, every
+    # expanded backlog row rendered empty (2026-08-02).
+    row = replace(row_for([RESOLVE], 7), facts={"state": "OPEN", "labels": ()})
+    enrichment = service._github_issue_enrichment({
+        "number": 7, "title": "the bug", "url": "u/7",
+        "body": "## What happened\n\nit broke",
+        "createdAt": "2026-08-01T00:00:00+00:00",
+        "state": "CLOSED",
+    })
+
+    issue = service._projected_issue(row, enrichment)
+    card = snapshots.backlog_card(issue, NOW)
+
+    assert card["body"] == "## What happened\n\nit broke"
+    assert card["age_days"] is not None
+    assert issue["state"] == "OPEN"
 
 
 def test_pull_request_enrichment_still_carries_its_merge_and_review_state():

@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import type { CardStep } from "../../api/types";
 import { StepBadgeRow } from "./StepBadge";
@@ -31,8 +31,22 @@ describe("the tasks strip as a condensed timeline", () => {
 
   it("shows an episode's retries as a multiplier, with the full story on hover", () => {
     render(<StepBadgeRow steps={[step({ kind: "FIX_CI", count: 3, cost_usd: 1.5 })]} />);
-    const chip = screen.getByTitle(/FIX_CI · 3 attempts · ok · \$1\.50/);
+    const chip = document.querySelector('[data-tip^="FIX_CI · 3 attempts"]');
     expect(chip).toHaveTextContent("×3");
+  });
+
+  it("colours a completed review that requested changes as still-going, not green", () => {
+    const { container } = render(
+      <StepBadgeRow
+        steps={[
+          step({ kind: "REVIEW", state: "ok", status: "REQUEST_CHANGES" }),
+          step({ kind: "RE_REVIEW", state: "ok", status: "APPROVE" }),
+        ]}
+      />,
+    );
+    const chips = [...container.querySelectorAll(".chip")];
+    expect(chips[0]).toHaveClass("chip-running");
+    expect(chips[1]).toHaveClass("chip-ok");
   });
 
   it("tones an operator intervention as meta, never as an agent leg", () => {
@@ -40,6 +54,16 @@ describe("the tasks strip as a condensed timeline", () => {
       <StepBadgeRow steps={[step({ kind: "unblock", state: "done", cost_usd: 0 })]} />,
     );
     expect(container.querySelector(".chip")).toHaveClass("chip-meta");
+  });
+
+  it("singles out an api-channel unblock from a human one", () => {
+    // An unblock journaled by a bare API caller is "unsanctioned" until a
+    // human blesses it — it must not wear the quiet human-operator tone.
+    const { container } = render(
+      <StepBadgeRow steps={[step({ kind: "unblock (api)", state: "done", cost_usd: 0 })]} />,
+    );
+    expect(container.querySelector(".chip")).toHaveClass("chip-running");
+    expect(container.querySelector(".chip")).not.toHaveClass("chip-meta");
   });
 
   it("compresses a long history into dots and keeps labels on the tail", () => {

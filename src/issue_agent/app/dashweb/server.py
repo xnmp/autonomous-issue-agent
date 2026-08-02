@@ -70,7 +70,7 @@ def create_app(
     harness_root: str | None = None,
     offload_backend: bool | None = None,
 ):
-    from fastapi import Body, FastAPI, HTTPException, Query
+    from fastapi import Body, FastAPI, Header, HTTPException, Query
     from fastapi.responses import HTMLResponse, JSONResponse, Response
     from starlette.concurrency import run_in_threadpool
 
@@ -248,14 +248,23 @@ def create_app(
         "/api/repos/{name}/issues/{number}/unblock",
         response_model=contracts.ActionResult,
     )
-    async def api_unblock(name: str, number: int):
+    async def api_unblock(
+        name: str,
+        number: int,
+        user_agent: str = Header(default="", include_in_schema=False),
+    ):
         if number < 1:
             raise HTTPException(400, "issue number must be positive")
+        # Which hand pulled the lever: the browser UI or a bare API caller
+        # (curl, an agent). A courtesy provenance stamp, not authentication —
+        # the drill-down badges API-channel unblocks so operator history and
+        # automation history stay tellable apart.
+        channel = "ui" if user_agent.startswith("Mozilla") else "api"
         # Unlike the other actions this one reads (snapshot + GitHub) before it
         # writes, so it has collector failure modes: report them as a refused
         # action, never as a 500 the operator cannot read.
         try:
-            ok, detail = await invoke(backend.unblock, name, number)
+            ok, detail = await invoke(backend.unblock, name, number, channel)
         except Exception as exc:  # noqa: BLE001
             ok, detail = False, f"unblock unavailable ({type(exc).__name__}: {exc})"
         return JSONResponse({"ok": ok, "detail": detail}, status_code=200 if ok else 400)

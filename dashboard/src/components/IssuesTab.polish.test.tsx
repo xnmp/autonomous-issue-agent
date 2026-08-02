@@ -107,7 +107,7 @@ describe("done verification badge", () => {
     });
 
     expect(screen.getByText("verified")).toHaveAttribute(
-      "title",
+      "data-tip",
       "verified\nIssue: VERIFIED — probe stayed green for a week\nPR: VERIFIED — no follow-up defect filed",
     );
   });
@@ -116,7 +116,7 @@ describe("done verification badge", () => {
     board("done", { done: [done] });
 
     expect(screen.getByText("verified")).toHaveAttribute(
-      "title",
+      "data-tip",
       "verified\nIssue: VERIFIED\nPR: VERIFIED",
     );
   });
@@ -129,7 +129,7 @@ describe("done verification badge", () => {
     const glyph = screen.getByRole("img", { name: "verified" });
     expect(glyph).toHaveTextContent("✓");
     expect(screen.queryByText("verified")).not.toBeInTheDocument();
-    expect(glyph.closest(".chip")).toHaveAttribute("title", expect.stringContaining("VERIFIED"));
+    expect(glyph.closest(".chip")).toHaveAttribute("data-tip", expect.stringContaining("VERIFIED"));
 
     unmount();
     board("done", { done: [done] });
@@ -293,9 +293,9 @@ describe("backlog triage taxonomy", () => {
   it("colours each axis value and its matching label with one mapping", () => {
     board("backlog", { backlog: [backlog] });
 
-    expect(screen.getByTitle("type: enhancement")).toHaveClass("chip-ok");
-    expect(screen.getByTitle("difficulty: complex")).toHaveClass("chip-fail");
-    expect(screen.getByTitle("impact: high")).toHaveClass("chip-ok");
+    expect(document.querySelector('[data-tip="type: enhancement"]')).toHaveClass("chip-ok");
+    expect(document.querySelector('[data-tip="difficulty: complex"]')).toHaveClass("chip-fail");
+    expect(document.querySelector('[data-tip="impact: high"]')).toHaveClass("chip-ok");
   });
 
   it("renders an unclassified axis as an absence rather than a coloured value", () => {
@@ -303,7 +303,7 @@ describe("backlog triage taxonomy", () => {
       backlog: [{ ...backlog, issue_type: null, difficulty: null, impact: null }],
     });
 
-    expect(screen.queryByTitle(/^type:/)).not.toBeInTheDocument();
+    expect(document.querySelector('[data-tip^="type:"]')).toBeNull();
     expect(screen.getAllByText("—").length).toBeGreaterThan(0);
   });
 

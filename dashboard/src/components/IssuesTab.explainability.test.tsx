@@ -207,7 +207,13 @@ describe("board explainability", () => {
 
     expect(await screen.findByText("REQUEST_CHANGES round 2")).toBeVisible();
     expect(screen.getByText("removed ai-blocked; reset retry counters")).toBeVisible();
-    expect(screen.getByTitle("unblock")).toHaveClass("chip-meta");
+    expect(document.querySelector('[data-tip="unblock"]')).toHaveClass("chip-meta");
+    // Successful steps stay quiet: no "ok"/"done" word next to every badge.
+    expect(document.querySelector(".task-state")).toBeNull();
+    // Each task line shows how long it took next to what it cost; the free
+    // operator step (no duration) shows neither.
+    expect(screen.getByText("0:30")).toBeVisible();
+    expect(document.querySelectorAll(".task-took")).toHaveLength(1);
     vi.unstubAllGlobals();
   });
 });

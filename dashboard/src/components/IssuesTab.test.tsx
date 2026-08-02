@@ -75,7 +75,7 @@ describe("IssuesTab", () => {
     const verification = screen.getByRole("cell", { name: "pending" });
     expect(verification).toBeVisible();
     expect(screen.getByText("pending", { exact: true })).toHaveAttribute(
-      "title",
+      "data-tip",
       "pending\nIssue: VERIFIED\nPR: pending",
     );
     const row = screen.getByRole("row", { name: /Explain completed work.*#50.*PR #75/ });
@@ -165,6 +165,85 @@ describe("IssuesTab", () => {
     expect(screen.getByText("incident notes").tagName).toBe("STRONG");
     expect(screen.getByText("logs").tagName).toBe("CODE");
     expect(screen.getByRole("button", { name: "Promote #63 to ai-ready" })).toBeVisible();
+  });
+
+  it("expands a pending row to show the issue text, same as backlog", async () => {
+    render(
+      <IssuesTab
+        repo="demo"
+        sub="inflight"
+        issues={polled({
+          in_flight: [],
+          pending: [{
+            issue: 81,
+            title: "Waiting its turn",
+            url: "https://github.com/o/r/issues/81",
+            body: "## Context\n\nthe queue is long",
+            priority: "P2",
+            labels: ["ai-ready"],
+            held: true,
+            hold_reason: "waiting on PR #179",
+            overlap: null,
+          }],
+          done: [],
+          backlog: [],
+          gh_ok: true,
+          notifications: [],
+          warnings: [],
+        })}
+        onOpenIssue={vi.fn()}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("row", { name: /Waiting its turn/ }));
+    // MarkdownBody arrives via React.lazy — same load-tolerant timeout as the
+    // backlog expansion test.
+    expect(
+      await screen.findByRole("heading", { name: "Context" }, { timeout: 10_000 }),
+    ).toBeVisible();
+    expect(screen.getByText("the queue is long")).toBeVisible();
+  });
+
+  it("does not toggle a pending row when a priority button is clicked", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({ ok: true, detail: "" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+      ),
+    );
+    render(
+      <IssuesTab
+        repo="demo"
+        sub="inflight"
+        issues={polled({
+          in_flight: [],
+          pending: [{
+            issue: 81,
+            title: "Waiting its turn",
+            url: null,
+            body: "text",
+            priority: null,
+            labels: ["ai-ready"],
+            held: false,
+            hold_reason: null,
+            overlap: null,
+          }],
+          done: [],
+          backlog: [],
+          gh_ok: true,
+          notifications: [],
+          warnings: [],
+        })}
+        onOpenIssue={vi.fn()}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "P3" }));
+    expect(screen.queryByText("Issue context")).not.toBeInTheDocument();
+    vi.unstubAllGlobals();
   });
 
   it("does not toggle a backlog row when its promote button is keyboard-activated", async () => {
