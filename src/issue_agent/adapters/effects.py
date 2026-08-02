@@ -44,6 +44,32 @@ from .journal import alert
 
 _TARGET = {Target.ISSUE: "issue", Target.PR: "pr"}
 
+# The lifecycle command kinds this executor owns: every kind it mints from an
+# Action (`_command_identity`) and can reconstruct (`action_from_command`),
+# plus SUBMIT_REVIEW, which the drain runs through its own path.
+#
+# Deliberately an ALLOW-list, not a broker-kinds deny-list. The control store
+# is shared, so the drain also sees publish_branch/open_pull_request
+# (AgentPublicationBroker), the operator effect kinds, and the Jira kinds. A
+# deny-list would silently inherit every kind a future ADR adds and hand it to
+# `action_from_command`, which raises — that is exactly the per-tick
+# "command kind cannot be reconstructed as Action: CommandKind.PUBLISH_BRANCH"
+# noise this replaces (#156). A kind outside the set is LEFT QUEUED for its
+# owner — never receipted, never dropped — and reported once per process, so a
+# kind nobody owns stays visible instead of silently stranded.
+_OWNED_COMMAND_KINDS = frozenset(
+    {
+        CommandKind.RELABEL,
+        CommandKind.POST_COMMENT,
+        CommandKind.CLOSE_ISSUE,
+        CommandKind.ENABLE_AUTO_MERGE,
+        CommandKind.UPDATE_BRANCH,
+        CommandKind.RERUN_CHECKS,
+        CommandKind.ADD_DEPENDENCY,
+        CommandKind.SUBMIT_REVIEW,
+    }
+)
+
 
 def _stderr_log(line: str) -> None:
     sys.stderr.write(f"effects: {line}\n")
@@ -256,6 +282,7 @@ class GitHubEffectExecutor:
         self.journal = journal
         self.alert_cmd = alert_cmd
         self.log = log if log is not None else _stderr_log
+        self._unowned_kinds_seen: set[CommandKind] = set()
         self.effects = DurableEffectRunner(
             store,
             DeploymentAuthority(
@@ -504,6 +531,9 @@ class GitHubEffectExecutor:
             executor_identity=self.identity,
         ):
             command = pending.command
+            if command.kind not in _OWNED_COMMAND_KINDS:
+                self._note_unowned_kind(command.kind)
+                continue
             try:
                 if command.kind is CommandKind.SUBMIT_REVIEW:
                     applied = self._run_review_command(pending)
@@ -526,6 +556,21 @@ class GitHubEffectExecutor:
             if applied:
                 completed += 1
         return completed
+
+    def _note_unowned_kind(self, kind: CommandKind) -> None:
+        """Report a queued kind belonging to another executor once per process.
+
+        Once, not per tick: the command legitimately stays pending until its
+        owner drains it, so a per-tick line is pure noise on a log an operator
+        has to read (#156). Once still surfaces a kind that NO executor owns.
+        """
+        if kind in self._unowned_kinds_seen:
+            return
+        self._unowned_kinds_seen.add(kind)
+        self.log(
+            f"lifecycle command kind {kind.value} is not owned by the GitHub "
+            "effect executor; leaving it queued for its owner"
+        )
 
     def _retire_if_exhausted(self, pending) -> bool:
         """Retire a command that has burned its retry ceiling, once.

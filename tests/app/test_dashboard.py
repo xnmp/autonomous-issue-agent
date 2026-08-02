@@ -86,6 +86,8 @@ def write_v2_run(
     status: str = "ok",
     number: int = 7,
     issue: int = 7,
+    exit_reason: str | None = None,
+    is_error: bool = False,
 ) -> str:
     state_dir.mkdir(parents=True, exist_ok=True)
     log = EventLog(
@@ -122,8 +124,8 @@ def write_v2_run(
     log.emit(
         AgentRunCompleted(
             status,
-            False,
-            None,
+            is_error,
+            exit_reason,
             30_000,
             "model",
             "codex",
@@ -372,6 +374,45 @@ def test_stage_table():
     ]
     for events, expected in cases:
         assert dash.stage_for(events) == expected, events
+
+
+# (exit_reason, is_error, renders as failed?) — one table, both mapping sites.
+# Codex settles a clean leg as `ok` and claude settles it empty, so the presence
+# of an exit reason says nothing about success (#158). Only the envelope's error
+# signal does: `is_error`, or a reason that is not a clean sentinel.
+GARBAGE_EXIT_REASON = "!" + "x" * 4000
+FAILURE_SIGNAL_CASES = [
+    pytest.param("ok", False, False, id="codex-clean"),      # the #158 regression
+    pytest.param("OK", False, False, id="clean-uppercased"),
+    pytest.param("", False, False, id="claude-clean"),
+    pytest.param("", True, True, id="error-without-reason"),
+    pytest.param("budget_exhausted", True, True, id="budget"),
+    pytest.param("agent_error", False, True, id="agent-error"),
+    pytest.param("transport_death", False, True, id="infra-death"),
+    pytest.param(GARBAGE_EXIT_REASON, False, True, id="unknown-huge-reason"),
+]
+
+
+@pytest.mark.parametrize("exit_reason,is_error,failed", FAILURE_SIGNAL_CASES)
+def test_stage_of_a_settled_leg_keys_on_the_error_signal(exit_reason, is_error, failed):
+    events = [run(kind="RESOLVE", exit_reason=exit_reason, is_error=is_error)]
+    expected = "run failed" if failed else "awaiting review"
+    assert dash.stage_for(events) == expected
+
+
+@pytest.mark.parametrize("exit_reason,is_error,failed", FAILURE_SIGNAL_CASES)
+def test_v2_stage_of_a_settled_leg_keys_on_the_error_signal(
+    tmp_path, exit_reason, is_error, failed
+):
+    path = write_v2_run(
+        tmp_path / "fix", exit_reason=exit_reason or None, is_error=is_error
+    )
+    dep = dash.collect(
+        "n", "o/r", [path], str(tmp_path / "logs"),
+        str(tmp_path / "ledger.jsonl"), now_fn=_now,
+    )
+    (row,) = dep.issues
+    assert row.stage == ("run failed" if failed else "awaiting review")
 
 
 def test_stage_uses_the_newest_decisive_event():

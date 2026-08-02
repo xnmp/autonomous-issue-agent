@@ -37,6 +37,21 @@ for c in claude gh jq git uv; do
   if command -v "$c" >/dev/null 2>&1; then ok "$c: $($c --version 2>/dev/null | head -1)"; else bad "$c not found on PATH"; fi
 done
 
+# #156: the installer used to shim only `issue-agent` while pyproject declares
+# `issue-agent-publish` too — the executable the governor instructs every fixer
+# to publish through — so paid resolve legs blocked on a missing binary. Gated
+# on `issue-agent` resolving: that (and only that) means this box runs the
+# INSTALLED flavour, so a dev checkout that never ran `make install` stays
+# quiet. `issue-agent` present + a sibling absent is the broken-installer
+# signature exactly; the fix is to re-run `make install`.
+if command -v issue-agent >/dev/null 2>&1; then
+  if command -v issue-agent-publish >/dev/null 2>&1; then
+    ok "issue-agent-publish on PATH"
+  else
+    bad "issue-agent-publish not on PATH though issue-agent is — stale/partial install, re-run 'make install'"
+  fi
+fi
+
 echo "== governor self-test =="
 if command -v uv >/dev/null 2>&1; then
   out=$(printf '{"tool_input":{"command":"git commit --no-verify -m x"}}' | uv run --quiet "$HARNESS_ROOT/plugin/hooks/bash_governor.py" 2>&1); rc=$?

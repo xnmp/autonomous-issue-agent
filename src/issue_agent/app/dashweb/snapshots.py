@@ -122,10 +122,11 @@ def repos_payload(
 
 # ── legs → steps ──────────────────────────────────────────────────────────────
 def leg_state(leg: dash.RunSummary) -> str:
-    """A settled leg is `failed` when it exited for any reason other than a
-    clean finish. `status` is the AGENT's claim; `exit_reason` is the
-    envelope's, and only the envelope can see a run that died."""
-    if leg.exit_reason not in ("", "ok"):
+    """A settled leg is `failed` when the envelope reports an error or a
+    terminal reason in the error taxonomy. `status` is the AGENT's claim;
+    `is_error`/`exit_reason` are the envelope's, and only the envelope can see
+    a run that died."""
+    if dash.leg_failed(leg.is_error, leg.exit_reason):
         return "failed"
     return "blocked" if leg.status.lower() == "blocked" else "ok"
 

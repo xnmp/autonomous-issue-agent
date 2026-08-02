@@ -30,6 +30,7 @@ from ..domain.dashboard import (
     build_metrics,
     event_issue,
     first_pass_verdicts,
+    leg_failed,
     parse_action,
     pr_issue_map,
     stage_for,
@@ -275,9 +276,12 @@ def _flags(row: IssueRow) -> str:
         parts.append(f"{row.spend_blocks} spend block(s)")
     if row.recurrences:
         parts.append(f"{row.recurrences} recurrence(s)")
-    errored = [leg for leg in row.legs if leg.exit_reason not in ("", "ok")]
+    errored = [leg for leg in row.legs if leg_failed(leg.is_error, leg.exit_reason)]
     if errored:
-        parts.append("exits: " + ",".join(sorted({leg.exit_reason for leg in errored})))
+        parts.append(
+            "exits: "
+            + ",".join(sorted({leg.exit_reason or "is_error" for leg in errored}))
+        )
     if row.models:
         parts.append("models: " + ",".join(row.models))
     return " · ".join(parts)

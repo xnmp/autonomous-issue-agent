@@ -28,6 +28,7 @@ from .events import (
     encode_event,
 )
 from .labels import LIFECYCLE_LABELS
+from .outcome import ExitReason
 from .projection import ReadModel
 
 # The three role daemons, in the order `journal_paths` returns their journals.
@@ -188,6 +189,34 @@ class RunSummary:
     cost_usd: float
     estimated: bool
     session_id: str
+    # The envelope's semantic error signal. Defaulted so pre-existing positional
+    # constructions keep working; every producer in this module sets it.
+    is_error: bool = False
+
+
+# The two ways a leg can say "this run ended cleanly": claude settles the happy
+# path with no exit reason at all, codex settles it as `ok`. Keying failure on
+# "the field is non-empty" therefore rendered every healthy codex leg as "run
+# failed" (#158) — a claude-shaped default, not a real signal.
+_CLEAN_EXIT_REASONS = frozenset({"", ExitReason.OK.value})
+
+
+def leg_failed(is_error: bool, exit_reason: str) -> bool:
+    """Whether a settled leg should render as failed.
+
+    Keys on the semantic error signal: the envelope's `is_error`, or an exit
+    reason that is not one of the clean sentinels. An `is_error` leg with no
+    exit reason still fails; `ok` with `is_error=False` renders whatever
+    lifecycle state the leg would have had without the field.
+
+    An unrecognised reason (a legacy journal, a runtime the taxonomy has not
+    caught up with) counts as failed. Only a clean sentinel is evidence of a
+    clean finish, and a silently-swallowed death is the worse failure mode for
+    a dashboard whose job is showing which legs died.
+    """
+    if is_error:
+        return True
+    return exit_reason.strip().casefold() not in _CLEAN_EXIT_REASONS
 
 
 @dataclass(frozen=True)
@@ -490,6 +519,7 @@ def _v2_issue_row(
                     model=completion_payload.model,
                     status=completion_payload.status,
                     exit_reason=completion_payload.exit_reason or "",
+                    is_error=completion_payload.is_error,
                     duration_s=completion_payload.duration_ms / 1000,
                     cost_usd=(completion_payload.cost_micros or 0) / 1_000_000,
                     estimated=completion_payload.pricing_basis
@@ -763,7 +793,7 @@ def _v2_stage(
         return "blocked (spend)"
     if legs:
         leg = legs[-1]
-        if leg.exit_reason:
+        if leg_failed(leg.is_error, leg.exit_reason):
             return "run failed"
         if leg.status == "blocked":
             return "awaiting human reply"
@@ -897,7 +927,7 @@ def _stage_of_event(e: dict) -> str:
     if name == "agent_run":
         kind = str(e.get("kind") or "")
         status = str(e.get("status") or "")
-        if e.get("is_error"):
+        if leg_failed(bool(e.get("is_error")), str(e.get("exit_reason") or "")):
             return "run failed"
         if status == "blocked":
             return "awaiting human reply"
@@ -1029,6 +1059,7 @@ def _leg(e: dict) -> RunSummary:
         model=str(e.get("model") or ""),
         status=str(e.get("status") or ""),
         exit_reason=str(e.get("exit_reason") or ""),
+        is_error=bool(e.get("is_error")),
         duration_s=_float(e.get("duration_s")),
         # The BILLED figure, exactly as `JournalingRuntime` computes it for the
         # ledger: the true cost when there is one, else the token estimate. A

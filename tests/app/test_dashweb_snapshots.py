@@ -231,6 +231,41 @@ def test_a_leg_that_exited_for_any_reason_but_ok_reads_as_failed():
     assert snapshots.leg_state(leg) == "failed"
 
 
+# (exit_reason, is_error, failed?) — codex settles a clean leg as `ok`, claude
+# settles it empty, so an exit reason's presence is not a failure signal (#158).
+@pytest.mark.parametrize(
+    "exit_reason,is_error,failed",
+    [
+        pytest.param("ok", False, False, id="codex-clean"),
+        pytest.param("OK", False, False, id="clean-uppercased"),
+        pytest.param("", False, False, id="claude-clean"),
+        pytest.param("", True, True, id="error-without-reason"),
+        pytest.param("budget_exhausted", True, True, id="budget"),
+        pytest.param("agent_error", False, True, id="agent-error"),
+        pytest.param("transport_death", False, True, id="infra-death"),
+        pytest.param("!" + "x" * 100_000, False, True, id="unknown-huge-reason"),
+    ],
+)
+def test_leg_state_keys_on_the_error_signal_not_the_exit_reasons_presence(
+    exit_reason, is_error, failed
+):
+    leg = dash.RunSummary(
+        ts=None, role="steward", kind="TRIAGE", number=7, issue=7, model="gpt-5",
+        status="done", exit_reason=exit_reason, duration_s=1.0, cost_usd=0.68,
+        estimated=False, session_id="s", is_error=is_error,
+    )
+    assert snapshots.leg_state(leg) == ("failed" if failed else "ok")
+
+
+def test_a_blocked_leg_with_a_clean_codex_exit_reason_still_reads_as_blocked():
+    leg = dash.RunSummary(
+        ts=None, role="fix", kind="RESOLVE", number=7, issue=7, model="gpt-5",
+        status="blocked", exit_reason="ok", duration_s=1.0, cost_usd=0.1,
+        estimated=False, session_id="s", is_error=False,
+    )
+    assert snapshots.leg_state(leg) == "blocked"
+
+
 def test_step_window_events_are_bounded_by_the_legs_dispatch_and_settlement():
     events = [
         {"ts": ts(hours=5), "event": "action", "desc": "relabel issue #7: +ai-working"},
