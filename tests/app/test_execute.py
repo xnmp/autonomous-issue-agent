@@ -17,6 +17,7 @@ from issue_agent.domain.actions import (
     RemoveWorktree,
     CancelWorkflowRuns,
     RerunFailedChecks,
+    ResetCiRetries,
     RunAgent,
     AgentKind,
     Target,
@@ -395,6 +396,24 @@ def test_clear_issue_state_action_invokes_injected_callable():
     )
     ex.execute(ClearIssueState(pr=100, issue=9, merged=True))
     assert calls == [(100, 9, True)]
+
+
+# ── ResetCiRetries wiring (per-episode CI breaker, keifu PR #181) ───────────
+def test_reset_ci_retries_action_invokes_injected_callable():
+    gw = FakeGateway()
+    reset = []
+    ex = Executor(gw, reset_ci_retries=reset.append)
+    ex.execute(ResetCiRetries(9))
+    assert reset == [9]
+
+
+def test_reset_ci_retries_is_a_no_op_when_unwired():
+    # Unlike ClearIssueState, an unwired reset must not raise: only the fix
+    # daemon owns the counter, and the cost of skipping it is a stale count —
+    # the pre-fix behaviour — not a broken batch for every other role.
+    ex, gw, removed, ran = _exec()
+    ex.execute(ResetCiRetries(9))
+    assert gw.calls == [] and removed == [] and ran == []
 
 
 def test_clear_issue_state_requires_operational_wiring():

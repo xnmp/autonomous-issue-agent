@@ -16,6 +16,7 @@ from issue_agent.domain.actions import (
     Relabel,
     RemoveWorktree,
     RerunFailedChecks,
+    ResetCiRetries,
     RunAgent,
     Target,
 )
@@ -1304,6 +1305,56 @@ def test_fix_ci_under_cap_still_dispatches():
     st = FixState(ci_retries={9: 2})
     actions = decide_fix(world(prs=[_ci_fail_pr()]), CFG, st, fixer_busy=False)
     assert RunAgent(AgentKind.FIX_CI, 100) in _run_agents(actions)
+
+
+# ── the CI breaker's counter is per-EPISODE, not per-issue lifetime ──────────
+# The breaker's escalation text is "CI fix failed N× without going green", but
+# the counter was lifetime-per-issue: a PR that DID go green kept its spent
+# budget, so a later unrelated red episode (base drift, a new review round's
+# push) could escalate on its first repair attempt (keifu PR #181 diagnosis,
+# 2026-08-03). Settled green closes the episode by emitting ResetCiRetries.
+def _ci_green_pr():
+    return pr(100, "ai-pr-open", closing_issue=9, checks=(Check("unit", bucket="pass"),))
+
+
+def test_settled_green_closes_the_red_ci_episode():
+    st = FixState(ci_retries={9: 2})
+    actions = decide_fix(world(prs=[_ci_green_pr()]), CFG, st, fixer_busy=False)
+    assert ResetCiRetries(9) in actions
+
+
+def test_green_with_an_unspent_counter_writes_nothing():
+    # anti-churn twin: without this, every poll of every green PR would issue a
+    # redundant reset write.
+    actions = decide_fix(world(prs=[_ci_green_pr()]), CFG, FixState(ci_retries={}),
+                         fixer_busy=False)
+    assert not any(isinstance(a, ResetCiRetries) for a in actions)
+
+
+def test_red_episode_after_a_green_one_is_repaired_not_escalated():
+    # The class itself: state as it stands AFTER the reset above. A fresh
+    # failure buys a fresh repair budget instead of inheriting the spent one.
+    st = FixState(ci_retries={9: 0})
+    actions = decide_fix(world(prs=[_ci_fail_pr()]), CFG, st, fixer_busy=False)
+    assert RunAgent(AgentKind.FIX_CI, 100) in _run_agents(actions)
+    assert not any(isinstance(a, Relabel) and a.add == Label.NEEDS_HUMAN_REVIEW
+                   for a in actions)
+    # The breaker still bites at the cap — see
+    # test_fix_ci_at_cap_escalates_not_dispatches above; the reset relaxes WHEN
+    # the count starts, never the ceiling.
+
+
+def test_pending_checks_are_neither_green_nor_red_at_the_cap():
+    # PENDING outranks a sibling FAILURE (#49): no escalation (the verdict
+    # isn't in), no FIX_CI (nothing settled to repair), and no reset (pending
+    # is not green — resetting here would refund the budget mid-episode).
+    p = pr(100, "ai-pr-open", closing_issue=9,
+           checks=(Check("unit", bucket="fail"), Check("e2e", state="QUEUED")))
+    actions = decide_fix(world(prs=[p]), CFG, FixState(ci_retries={9: 3}), fixer_busy=False)
+    assert _run_agents(actions) == []
+    assert not any(isinstance(a, Relabel) and a.add == Label.NEEDS_HUMAN_REVIEW
+                   for a in actions)
+    assert not any(isinstance(a, ResetCiRetries) for a in actions)
 
 
 # ── infra-death ceiling (review C3/D2c) ──────────────────────────────────────

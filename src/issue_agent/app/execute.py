@@ -35,6 +35,7 @@ from ..domain.actions import (
     RemoveWorktree,
     CancelWorkflowRuns,
     RerunFailedChecks,
+    ResetCiRetries,
     RunAgent,
     Target,
 )
@@ -178,6 +179,11 @@ def _action_spec(action: Action) -> tuple[str, str, int | None, dict]:
             "issue": action.issue,
             "merged": action.merged,
         }
+    if isinstance(action, ResetCiRetries):
+        return "reset_ci_retries", "state", action.issue, {
+            "type": "reset_ci_retries",
+            "issue": action.issue,
+        }
     if isinstance(action, RunAgent):
         payload: dict[str, object] = {
             "type": "run_agent",
@@ -218,6 +224,8 @@ def _action_correlation(action: Action) -> Correlation:
         return Correlation(issue=action.issue)
     if isinstance(action, ClearIssueState):
         return Correlation(issue=action.issue, pr=action.pr)
+    if isinstance(action, ResetCiRetries):
+        return Correlation(issue=action.issue)
     if isinstance(action, RunAgent):
         issue_kinds = {"RESOLVE", "RESUME", "TRIAGE", "GROOM"}
         if action.number <= 0:
@@ -279,6 +287,7 @@ class Executor:
         mark_branch_update: Callable[[int, str], None] | None = None,
         mark_ci_pending_escalated: Callable[[int, str], None] | None = None,
         clear_issue_state: Callable[[int, int | None, bool], None] | None = None,
+        reset_ci_retries: Callable[[int], None] | None = None,
         journal=None,
         alert_cmd: str = "",
         retry_delays: tuple[float, ...] = _DEFAULT_RETRY_DELAYS,
@@ -328,6 +337,12 @@ class Executor:
         self._clear_issue_state = clear_issue_state or _missing_handler(
             "clear_issue_state"
         )
+        # Closes a red-CI episode (ResetCiRetries): green settles → the FIX_CI
+        # breaker starts the next episode from zero. Only the fix daemon wires
+        # it (Store.set_ci_retries(issue, 0)); default no-op keeps other
+        # roles' Executors quiet — an unwired reset costs nothing but a stale
+        # count, which is exactly the pre-fix behaviour.
+        self._reset_ci_retries = reset_ci_retries
         # Log EVERY applied action so state changes (label moves, comments, close,
         # auto-merge, worktree removal, agent dispatch) are visible instead of
         # inferred. One funnel = one audit trail. Default no-op keeps tests quiet.
@@ -403,6 +418,8 @@ class Executor:
             scope = "merged" if action.merged else "closed-unmerged"
             issue_part = f", issue #{action.issue}" if action.issue is not None else ""
             return f"clear state for pr #{action.pr}{issue_part} ({scope})"
+        if isinstance(action, ResetCiRetries):
+            return f"reset CI-repair count for #{action.issue} (went green)"
         if isinstance(action, RunAgent):
             return f"dispatch {action.kind.name} #{action.number}"
         return repr(action)
@@ -630,6 +647,9 @@ class Executor:
             self._remove_worktree(action.issue)
         elif isinstance(action, ClearIssueState):
             self._clear_issue_state(action.pr, action.issue, action.merged)
+        elif isinstance(action, ResetCiRetries):
+            if self._reset_ci_retries is not None:
+                self._reset_ci_retries(action.issue)
         elif isinstance(action, RunAgent):
             if self._run_agent is None:
                 raise RuntimeError("RunAgent executed before dispatch was bound")

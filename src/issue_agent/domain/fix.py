@@ -31,6 +31,7 @@ from .actions import (
     Relabel,
     RemoveWorktree,
     RerunFailedChecks,
+    ResetCiRetries,
     RunAgent,
     Target,
 )
@@ -1674,10 +1675,20 @@ def decide_fix(
             # was deleted with the rest of the phantom PR busy-marker — review
             # M22/D9: nothing ever adds ai-working to a PR, so it was
             # permanently true. See decide_fix's docstring for the live lease.)
-            if (
-                ci_state(pr.checks, cfg.ci_ignore_checks, known=pr.checks_known)
-                == CIState.FAILURE
-            ):
+            current_ci = ci_state(
+                pr.checks, cfg.ci_ignore_checks, known=pr.checks_known
+            )
+            # Settled GREEN closes the red-CI episode: the breaker's text is
+            # "without going green", so going green must reset it. The counter
+            # was lifetime-per-issue, so a later unrelated red episode (base
+            # drift, a new review round's push) inherited the spent budget and
+            # could escalate on its FIRST repair attempt (latent class, keifu
+            # PR #181 diagnosis 2026-08-03; review_retries' submitted_at key
+            # is the same episode idea). OK only — NONE means "no checks
+            # reported", which is absence of a verdict, not a green one.
+            if current_ci == CIState.OK and state.ci_retries.get(bkey, 0) > 0:
+                actions.append(ResetCiRetries(issue_n))
+            if current_ci == CIState.FAILURE:
                 paths = pr.changed_files | issue_paths(issue_n)
                 if not dispatchable(issue_n, paths):
                     continue

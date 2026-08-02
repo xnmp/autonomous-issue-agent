@@ -238,6 +238,22 @@ class ClearIssueState:
 
 
 @dataclass(frozen=True)
+class ResetCiRetries:
+    """Close a red-CI episode: the PR's checks settled GREEN, so the FIX_CI
+    circuit breaker starts the next episode from zero.
+
+    Without this the counter was lifetime-per-issue — a PR that went red,
+    was repaired, went green, then went red again later (base drift, a new
+    review round's push) inherited the old count and could escalate on the
+    FIRST attempt of the new episode, contradicting the escalation text
+    "without going green" (latent class found via keifu PR #181,
+    2026-08-03; `review_retries` solved the same class with its
+    submitted_at episode key)."""
+
+    issue: int
+
+
+@dataclass(frozen=True)
 class NoOp:
     reason: str = ""
 
@@ -255,6 +271,7 @@ Action = Union[
     RunAgent,
     RemoveWorktree,
     ClearIssueState,
+    ResetCiRetries,
     NoOp,
 ]
 
@@ -281,6 +298,7 @@ __all__ = [
     "RunAgent",
     "RemoveWorktree",
     "ClearIssueState",
+    "ResetCiRetries",
     "NoOp",
     "Action",
 ]

@@ -2254,6 +2254,7 @@ def build_fix_daemon(
         mark_branch_update=store.set_update_branch_head,
         mark_ci_pending_escalated=store.set_ci_pending_escalated_head,
         clear_issue_state=store.cleanup_pr,
+        reset_ci_retries=lambda issue: store.set_ci_retries(issue, 0),
         journal=journal, alert_cmd=cfg.alert_cmd,
         effect_executor=effect_executor.actions,
     )
