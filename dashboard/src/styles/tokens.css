@@ -39,7 +39,7 @@
   --elevated: var(--c-elevated);
   --ink: var(--c-fg);
   --ink-muted: var(--c-muted);
-  --ink-faint: color-mix(in srgb, var(--c-muted) 72%, var(--c-bg));
+  --ink-faint: color-mix(in srgb, var(--c-muted) 82%, var(--c-bg));
   --selection: var(--c-selection);
 
   --border: rgba(216, 220, 232, 0.08);

@@ -109,9 +109,12 @@ export function statusTone(status: string | null | undefined): Tone {
 /** Every flag is a problem; severity splits red from orange-ish yellow. */
 export function flagTone(flag: IssueFlag): Tone {
   if (flag === "waiting") return "info";
-  return flag === "escalated" || flag === "spend-blocked" || flag === "blocked"
-    ? "fail"
-    : "running";
+  if (flag === "blocked") return "fail";
+  // `escalated` / `spend-blocked` are lifetime counters, not live state: the
+  // row-alert treatment owns "human needed NOW", so history reads as meta —
+  // a done row that once escalated must not shout red forever.
+  if (flag === "escalated" || flag === "spend-blocked") return "meta";
+  return "running";
 }
 
 /**

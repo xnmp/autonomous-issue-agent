@@ -1285,17 +1285,19 @@
 /* A row that needs a human is read as one object: the whole row is tinted and
  * bordered, not just a chip inside it. `--row-attn` is the single knob so the
  * ready variant only restates the colour. */
+/* One alarm signal per row: the edge stripe. The stage text already names the
+   problem in --fail; stripe + tint + red text tripled the same message and
+   made every alarmed row a wall of red. */
 .row-alert {
   --row-attn: var(--fail);
-  box-shadow: inset 3px 0 0 var(--row-attn);
-  background: color-mix(in srgb, var(--row-attn) 9%, transparent);
+  box-shadow: inset 2px 0 0 var(--row-attn);
 }
 .row-alert-ready {
   --row-attn: var(--ok);
 }
 .tbl tbody tr.row-alert:hover,
 .tbl tbody tr.row-alert.expanded {
-  background: color-mix(in srgb, var(--row-attn) 14%, transparent);
+  background: color-mix(in srgb, var(--row-attn) 8%, transparent);
 }
 .attention-stage {
   color: var(--fail);

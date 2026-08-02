@@ -228,8 +228,8 @@ button {
   gap: 4px;
   padding: 1px 7px;
   border-radius: var(--radius-pill);
-  border: 1px solid color-mix(in srgb, var(--chip-c, var(--ink-muted)) 40%, transparent);
-  background: color-mix(in srgb, var(--chip-c, var(--ink-muted)) 13%, transparent);
+  border: 1px solid color-mix(in srgb, var(--chip-c, var(--ink-muted)) 32%, transparent);
+  background: color-mix(in srgb, var(--chip-c, var(--ink-muted)) 10%, transparent);
   color: var(--chip-c, var(--ink-muted));
   font-size: var(--fs-xs);
   font-weight: 600;

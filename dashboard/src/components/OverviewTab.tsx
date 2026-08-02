@@ -132,17 +132,20 @@ export function OverviewTab({
           tone={(m?.interventions_per_merged_pr ?? 0) > 0 ? "running" : "ok"}
           title="journalled operator re-arms per merged PR — the unattended-operation metric; policy promotes are counted but excluded from the ratio"
         />
+        {/* Lifetime counters, not live alarms: the value carries the tone,
+            the tile frame stays quiet. A red-bordered tile that can never go
+            calm again teaches the operator to ignore red. */}
         <StatTile
           label="Escalations"
           value={num(escalations)}
           sub={spendBlocks > 0 ? `${spendBlocks} spend-blocked` : null}
-          alert={escalations > 0 || spendBlocks > 0}
+          tone={escalations > 0 || spendBlocks > 0 ? "fail" : "neutral"}
           title="needs-human-review relabels, retry exhaustion, infra deaths"
         />
         <StatTile
           label="Recurrences"
           value={num(recurrences)}
-          alert={recurrences > 0}
+          tone={recurrences > 0 ? "fail" : "neutral"}
           title="harness-resolved issues that came back — the ground-truth guardrail"
         />
       </div>
