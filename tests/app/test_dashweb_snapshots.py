@@ -1199,6 +1199,27 @@ def test_step_indices_address_the_step_list_after_interventions_are_appended():
     assert [s["idx"] for s in steps] == [0, 1, 2]
 
 
+def test_the_history_interleaves_interventions_with_the_legs_they_preceded():
+    # An unblock BETWEEN two legs must render between them, not at the end of
+    # the drill-down (keifu batch 3: every operator action showed after every
+    # leg, however early it happened).
+    mid_unblock = {
+        **UNBLOCK,
+        "ts": ts(hours=2, minutes=30),  # after RESOLVE (3h ago), before FIX_CI_1 (2h ago)
+    }
+    steps = snapshots.detailed_steps(
+        row_view([mid_unblock], legs=[RESOLVE, FIX_CI_1, FIX_CI_2])
+    )
+    assert [s["kind"] for s in steps] == ["RESOLVE", "unblock", "FIX_CI", "FIX_CI"]
+    assert [s["idx"] for s in steps] == [0, 1, 2, 3]
+
+
+def test_a_step_with_an_unparseable_stamp_sorts_last_instead_of_crashing():
+    stampless = {**UNBLOCK, "ts": "not-a-time"}
+    steps = snapshots.detailed_steps(row_view([stampless], legs=[RESOLVE, FIX_CI_1]))
+    assert [s["kind"] for s in steps] == ["RESOLVE", "FIX_CI", "unblock"]
+
+
 # ── per-step notes ────────────────────────────────────────────────────────────
 def test_a_review_step_notes_its_verdict_and_round():
     reviews = [

@@ -250,7 +250,7 @@ def _leg_note(row: dash.IssueRow, leg: dash.RunSummary) -> str | None:
 
 
 def detailed_steps(row: dash.IssueRow) -> list[dict]:
-    """One row per leg, ts order, settled first then anything still running.
+    """One row per leg plus operator interventions, in timestamp order.
     Not collapsed: the drill-down's whole job is showing the retries."""
     steps = [
         {
@@ -326,6 +326,13 @@ def detailed_steps(row: dash.IssueRow) -> list[dict]:
             "note": note,
         }
         for i, (event, kind, note) in enumerate(_operator_steps(row))
+    )
+    # The three sources above each arrive in their own order; without this
+    # sort every operator intervention rendered after every leg, however early
+    # it actually happened (keifu batch 3, 2026-08-02). Unparseable stamps
+    # sort last, keeping their relative order.
+    steps.sort(
+        key=lambda step: dash.parse_ts(step.get("ts")) or datetime.max.replace(tzinfo=timezone.utc)
     )
     # `idx` is the drill-down's cursor: `step_window_events` resolves it by list
     # position, so it must be the position and not a running total taken while
