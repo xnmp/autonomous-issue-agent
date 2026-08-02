@@ -491,6 +491,7 @@ _SAMPLE = {
     "corrects": "event-id",
     "reason": "reason",
     "stall_id": "stall-id",
+    "infra_deaths": 1,
     "suspended_ms": 1,
     "command_id": "command-id",
     "kind": "kind",

@@ -1135,9 +1135,11 @@ def infra_escalation_reason(cap: int) -> str:
     saw (deaths before any result) so the human looks at the runtime/daemon,
     not at the code the agent never got to touch."""
     return (
-        f"the agent session died {cap}× before returning a result — a transport "
-        "drop, an external kill, or a daemon restart mid-run, so no attempt was "
-        "ever recorded. The harness/runtime needs a human look."
+        f"INFRA: the agent session died {cap}× before returning a result — a "
+        "transport drop, an external kill, a daemon restart mid-run, a refused "
+        "admission, or a runtime that could not start at all, so no attempt was "
+        "ever recorded. This measures the harness, not the issue: the "
+        "harness/runtime needs a human look, and the issue itself may be fine."
     )
 
 

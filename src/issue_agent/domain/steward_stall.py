@@ -42,31 +42,48 @@ from __future__ import annotations
 
 from .actions import Action, PostComment, Relabel, Target
 from .labels import Label
-from .outcome import ExitReason, infra_death
+from .outcome import (
+    ADMISSION_REFUSAL_SUBTYPES,
+    ExitReason,
+    infra_death,
+)
+
+__all__ = [
+    "ADMISSION_REFUSAL_SUBTYPES",
+    "DEFAULT_STEWARD_ERROR_CEILING",
+    "stall_charge",
+    "steward_stall_actions",
+    "steward_stall_tripped",
+]
 
 # Three, not ten: unlike a denied label write (one gh call), each of these
 # attempts is a paid agent leg. Two failures are plausibly bad luck; a third on
 # the identical issue text is a pattern no further spend will resolve.
 DEFAULT_STEWARD_ERROR_CEILING = 3
 
-# Envelope subtypes the ADMISSION path mints when a leg is refused before the
-# agent runs. They are reported as `AGENT_ERROR` because they end a dispatch,
-# but nothing about the ISSUE caused them, so they must not march a per-issue
-# ceiling (see the module docstring). Matched on the envelope subtype the
-# accounting runtime sets, which is harness-owned — never on agent-supplied
-# text.
-ADMISSION_REFUSAL_SUBTYPES: frozenset[str] = frozenset(
-    {
-        "dispatch_claim_unavailable",
-        "publication_authority_unavailable",
-    }
-)
-
-
 def stall_charge(
     exit_reason: ExitReason | None, envelope_subtype: str = ""
 ) -> int:
-    """How much a failed steward leg costs its issue's stall counter."""
+    """How much a failed steward leg costs its issue's stall counter.
+
+    The admission-refusal list now lives in `domain.outcome` beside the rest of
+    the exit taxonomy: the fix role's quality breakers need the identical
+    exemption (keifu #130), and two copies of "which failures are the harness's
+    fault" is exactly the drift this module was written to prevent.
+
+    Deliberately NOT exempting `RUNTIME_UNAVAILABLE`, even though it is
+    infra-class everywhere in the fix role. The two roles bound their loops
+    differently: a fix-role exemption pairs with a `bump_infra_deaths` that
+    still escalates, while a zero charge here returns without recording the
+    issue's baseline, so the issue stays selected and the identical paid leg is
+    bought again every sweep — with no counter of its own to stop it (the
+    steward's `exhausted()` reads an infra counter that only the RAISE path
+    writes). Charging it keeps the loop bounded at the cost of a
+    `needs-human-review` on an issue whose only sin was a broken deployment.
+    Bounded-and-mislabelled beats unbounded-and-silent; the pre-existing
+    `infra_death` exemption has the same hole and wants the same fix, which is
+    the steward's own change to make.
+    """
     if infra_death(exit_reason):
         return 0
     if envelope_subtype in ADMISSION_REFUSAL_SUBTYPES:
