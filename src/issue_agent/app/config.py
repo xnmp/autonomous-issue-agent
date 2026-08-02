@@ -606,7 +606,7 @@ class HarnessConfig:
     # current-period host-global spend.
     # 0 disables any of them.
     issue_spend_cap_usd: float = 25.0
-    daily_spend_cap_usd: float = 50.0
+    daily_spend_cap_usd: float = 700.0
     global_daily_spend_cap_usd: float = 0.0
     # Shell command fed each spend_block / escalation event as JSON on stdin.
     # Blank = no alerting (the events are still journalled).

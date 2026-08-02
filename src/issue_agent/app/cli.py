@@ -1825,7 +1825,7 @@ def _env_cap(name: str, key: str, default: float) -> float:
 
 def daily_cap(name: str) -> float:
     """DAILY_SPEND_CAP_USD — today's spend on THIS overlay's repo (#32)."""
-    return _env_cap(name, "DAILY_SPEND_CAP_USD", 50.0)
+    return _env_cap(name, "DAILY_SPEND_CAP_USD", 700.0)
 
 
 def global_daily_cap(name: str) -> float:
