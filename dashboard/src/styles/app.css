@@ -135,7 +135,8 @@
   border: 1px solid var(--border-strong);
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.3);
 }
-.sidebar-toggle-float {
+/* Beats .sidebar-toggle's absolute positioning (same file, later block). */
+.sidebar-float .sidebar-toggle-float {
   position: static;
   width: 40px;
   height: 24px;
