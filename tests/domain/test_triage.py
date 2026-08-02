@@ -3,7 +3,13 @@ and the two-audience verdict→action mapping."""
 
 from tests.domain.builders import issue, world
 
-from issue_agent.domain.actions import AddDependency, PostComment, Relabel, Target
+from issue_agent.domain.actions import (
+    AddDependency,
+    CloseIssue,
+    PostComment,
+    Relabel,
+    Target,
+)
 from issue_agent.domain.labels import Label
 from issue_agent.domain.gate import Adr
 from issue_agent.domain.triage import (
@@ -321,6 +327,195 @@ def test_the_recurrence_label_is_not_a_lifecycle_label():
     # An observation, not a pipeline position: labelling an issue `recurrence`
     # must not make it look triaged nor drop it out of any selection set.
     assert is_untriaged(issue(1, "recurrence")) is True
+
+
+# ── the `close` disposition (keifu #143) ─────────────────────────────────────
+# Closing is gated by the same STEWARD_PROMOTE authority as promotion to
+# ai-ready: a deployment that keeps a human in the loop must not gain autonomous
+# closing — the strictly more destructive act — merely by upgrading the harness.
+CLOSE_CFG = TriageConfig(steward_bot="steward-bot", enabled=True, promote=True)
+
+
+def _close(**extra):
+    fields = {
+        "verdict": "close",
+        "close_reason": "PR #170 already ships this; the CSV export works on main.",
+        "reopen_if": "the export still fails on a build newer than PR #170",
+    }
+    fields.update(extra)
+    return TriageVerdict(**fields)
+
+
+def _closes(acts):
+    return [a for a in acts if isinstance(a, CloseIssue)]
+
+
+def test_a_well_evidenced_close_closes_the_issue_with_its_reason_and_reopen_rule():
+    """The incident: triage concluded 'close as resolved by merged PR #170' and the
+    harness had no way to say it. It must now comment, close, and mark terminally
+    — with no paid resolve leg and no PR."""
+    acts = actions_for_verdict(143, "alice", _close(), CLOSE_CFG)
+
+    closed = _closes(acts)
+    assert len(closed) == 1
+    assert closed[0].number == 143
+    assert "PR #170" in closed[0].comment
+    assert "Reopen this issue if:" in closed[0].comment
+    assert "still fails on a build newer than PR #170" in closed[0].comment
+    assert Relabel(Target.ISSUE, 143, Label.AI_TRIAGE, Label.AI_CLOSED) in acts
+    # The explanation rides ON the close command — not a second, separately
+    # retried comment effect.
+    assert not any(isinstance(a, PostComment) for a in acts)
+
+
+def test_the_terminal_close_label_is_not_ai_done():
+    """ai-done means a harness PR merged; the recurrence reporter reads exactly
+    open+ai-done+reopened. A steward close ships no code, so reusing ai-done would
+    book every human reopen of a wontfix as a shipped-work regression."""
+    acts = actions_for_verdict(143, "alice", _close(), CLOSE_CFG)
+    assert not any(getattr(a, "add", None) is Label.AI_DONE for a in acts)
+
+
+def test_a_closed_then_reopened_issue_is_a_fresh_triage_candidate():
+    assert is_untriaged(issue(1, "ai-closed")) is True
+
+
+def test_close_state_reason_completed_is_earned_and_everything_else_is_not_planned():
+    assert _close(close_state_reason="completed").close_state == "completed"
+    assert _close(close_state_reason="COMPLETED ").close_state == "completed"
+    assert _close().close_state == "not_planned"
+    assert _close(close_state_reason="wontfix").close_state == "not_planned"
+    assert _close(close_state_reason="x" * 100_000).close_state == "not_planned"
+    assert (
+        _closes(actions_for_verdict(1, "a", _close(close_state_reason="completed"), CLOSE_CFG))[0].reason
+        == "completed"
+    )
+    assert _closes(actions_for_verdict(1, "a", _close(), CLOSE_CFG))[0].reason == "not_planned"
+
+
+def test_a_close_with_no_reason_is_refused_and_handed_to_a_maintainer():
+    acts = actions_for_verdict(143, "alice", _close(close_reason=""), CLOSE_CFG)
+
+    assert _closes(acts) == []
+    assert Relabel(Target.ISSUE, 143, None, Label.AI_TRIAGE) in acts
+    body = next(a for a in acts if isinstance(a, PostComment)).body
+    assert "@alice" in body and "stays open for a maintainer" in body
+
+
+def test_a_close_with_no_reopen_condition_is_refused():
+    assert _closes(actions_for_verdict(143, "alice", _close(reopen_if=""), CLOSE_CFG)) == []
+
+
+def test_a_close_whose_evidence_is_only_whitespace_is_refused():
+    blank = _close(close_reason="   \n", reopen_if="\t")
+    assert blank.is_close is False
+    assert _closes(actions_for_verdict(143, "alice", blank, CLOSE_CFG)) == []
+
+
+def test_an_under_evidenced_close_never_falls_through_to_ready():
+    """A malformed close must not read as 'ready': ready buys a resolve leg for an
+    issue the classifier just said needs no work."""
+    cfg = TriageConfig(steward_bot="sb", enabled=True, promote=True)
+    acts = actions_for_verdict(143, "alice", _close(close_reason=""), cfg)
+    assert not any(getattr(a, "add", None) is Label.AI_READY for a in acts)
+    assert "Ready to build" not in next(
+        a for a in acts if isinstance(a, PostComment)
+    ).body
+
+
+def test_the_harness_never_re_closes_an_issue_a_human_reopened():
+    """stateReason='reopened' is the deterministic record that a human overruled a
+    close. Reopen → fresh triage → one comment, never a second close."""
+    acts = actions_for_verdict(
+        143, "alice", _close(), CLOSE_CFG, state_reason="reopened"
+    )
+
+    assert _closes(acts) == []
+    assert Relabel(Target.ISSUE, 143, None, Label.AI_TRIAGE) in acts
+    assert "reopened by a human" in next(
+        a for a in acts if isinstance(a, PostComment)
+    ).body
+
+
+def test_reopened_state_reason_is_matched_regardless_of_case_or_padding():
+    for raw in (" Reopened ", "REOPENED", "reopened"):
+        assert _closes(
+            actions_for_verdict(143, "a", _close(), CLOSE_CFG, state_reason=raw)
+        ) == []
+    # A never-closed issue ("") and a previously COMPLETED close are not overrules.
+    for raw in ("", "completed", "not_planned"):
+        assert len(
+            _closes(actions_for_verdict(143, "a", _close(), CLOSE_CFG, state_reason=raw))
+        ) == 1
+
+
+def test_a_close_emits_no_dependencies_and_no_acceptance_criteria():
+    acts = actions_for_verdict(
+        143, "alice",
+        _close(blocked_by_issues=(7, 9), acceptance_criteria=("AC",)),
+        CLOSE_CFG,
+    )
+    assert not any(isinstance(a, AddDependency) for a in acts)
+    assert "AC" not in _closes(acts)[0].comment
+
+
+def test_closing_requires_the_same_authority_as_promoting():
+    """CFG has promote off — the shipped default. Closing an issue is strictly
+    more destructive than queueing one, so it must not arrive by upgrade."""
+    acts = actions_for_verdict(143, "alice", _close(), CFG)
+
+    assert _closes(acts) == []
+    assert Relabel(Target.ISSUE, 143, None, Label.AI_TRIAGE) in acts
+    assert "STEWARD_PROMOTE is off" in next(
+        a for a in acts if isinstance(a, PostComment)
+    ).body
+
+
+def test_re_triaging_an_issue_retires_its_stale_close_marker():
+    """A reopened issue that triages to anything but `close` is back in the
+    pipeline; leaving ai-closed on it would read as terminal to every consumer
+    that maps labels to a phase (Jira among them)."""
+    ready = TriageVerdict(verdict="ready", plain_summary="Clear.")
+    labels = frozenset({Label.AI_CLOSED})
+
+    acts = actions_for_verdict(143, "alice", ready, CLOSE_CFG, labels=labels)
+
+    assert acts[0] == Relabel(Target.ISSUE, 143, Label.AI_CLOSED, None)
+    # …and a fresh close does not fight its own marker.
+    assert Relabel(Target.ISSUE, 143, Label.AI_CLOSED, None) not in actions_for_verdict(
+        143, "alice", _close(), CLOSE_CFG, labels=labels
+    )
+    # An issue that never carried it is unchanged.
+    assert actions_for_verdict(143, "alice", ready, CLOSE_CFG) == acts[1:]
+
+
+def test_the_close_comment_neutralises_mentions_and_bounds_classifier_prose():
+    """The close comment republishes text derived from an attacker-writable issue
+    body, and it accompanies a destructive act: no mass pings, no unbounded body."""
+    hostile = _close(
+        close_reason="@everyone @org/team ping " + "x" * 50_000,
+        reopen_if="ask @alice " + "y" * 50_000,
+    )
+
+    body = _closes(actions_for_verdict(143, "bob", hostile, CLOSE_CFG))[0].comment
+
+    assert "`@everyone`" in body and "`@org`" in body and "`@alice`" in body
+    # …and no handle survives outside the neutralising backticks.
+    for handle in ("`@everyone`", "`@org`", "`@alice`"):
+        assert handle.strip("`") not in body.replace(handle, "")
+    assert "@bob" in body                      # the harness's own greeting stands
+    assert len(body) < 5_000
+
+
+def test_ready_and_blocked_verdicts_are_untouched_by_the_close_disposition():
+    ready = TriageVerdict(verdict="ready", plain_summary="Clear.",
+                          acceptance_criteria=("AC",))
+    blocked = TriageVerdict(verdict="blocked", creator_questions=("Which?",))
+    for v in (ready, blocked):
+        assert _closes(actions_for_verdict(7, "alice", v, CLOSE_CFG)) == []
+        assert actions_for_verdict(7, "alice", v, CLOSE_CFG) == actions_for_verdict(
+            7, "alice", v, CLOSE_CFG, state_reason="reopened"
+        )
 
 
 # ── CODEOWNERS parsing ────────────────────────────────────────────────────────

@@ -23,6 +23,7 @@ from issue_agent.domain.actions import (
     UpdateBranch,
 )
 from issue_agent.domain.labels import Label
+from issue_agent.domain.triage import TriageConfig, TriageVerdict, close_actions
 
 
 class Gateway:
@@ -854,3 +855,61 @@ def test_boot_drain_cannot_claim_another_repository_or_role_command(
     assert wrong_role_gateway.calls == []
     assert owner.drain_pending_commands() == 1
     assert owner_gateway.calls == [("comment", "issue", 4, "owned")]
+
+
+# ── steward triage `close` disposition (keifu #143) ───────────────────────────
+def test_steward_close_actions_are_durable_commands_with_receipts(tmp_path) -> None:
+    """The close is a remote lifecycle mutation, so it rides the same durable
+    command + receipt path as every other relabel/comment — not a direct gh call."""
+    executor, gateway, store = _executor(tmp_path)
+    verdict = TriageVerdict(
+        verdict="close",
+        close_reason="PR #170 already ships this.",
+        reopen_if="the export still fails after PR #170",
+        close_state_reason="completed",
+    )
+
+    actions = close_actions(143, "alice", verdict, TriageConfig(steward_bot="sb"))
+    for action in actions:
+        assert executor.execute(action)
+
+    assert gateway.calls == [
+        ("relabel", "issue", 143, "ai-triage", "ai-closed"),
+        ("comment", "issue", 143, actions[1].comment),
+        ("close", 143, "completed", ""),
+    ]
+    assert gateway.issue_closure(143) == (True, "completed")
+    assert store.pending_commands() == ()
+    with store._connect() as db:
+        kinds = tuple(
+            row[0]
+            for row in db.execute(
+                "SELECT kind FROM lifecycle_commands ORDER BY occurrence"
+            )
+        )
+        statuses = tuple(
+            row[0] for row in db.execute("SELECT status FROM effect_receipts")
+        )
+    assert kinds == ("relabel", "close_issue")
+    assert statuses == ("succeeded", "succeeded")
+
+
+def test_a_replayed_steward_close_neither_re_comments_nor_re_closes(tmp_path) -> None:
+    """A daemon restart mid-close must converge, not post a second obituary."""
+    executor, gateway, store = _executor(tmp_path)
+    verdict = TriageVerdict(
+        verdict="close",
+        close_reason="Duplicate of #12.",
+        reopen_if="#12 is closed without covering this",
+    )
+    actions = close_actions(143, "alice", verdict, TriageConfig(steward_bot="sb"))
+
+    for _ in range(2):
+        for action in actions:
+            executor.execute(action)
+
+    assert gateway.calls == [
+        ("relabel", "issue", 143, "ai-triage", "ai-closed"),
+        ("comment", "issue", 143, actions[1].comment),
+        ("close", 143, "not_planned", ""),
+    ]

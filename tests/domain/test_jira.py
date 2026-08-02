@@ -34,6 +34,19 @@ def test_done_label():
     assert jira_phase({Label.AI_DONE}) is JiraPhase.DONE
 
 
+def test_a_steward_triage_close_is_terminal_for_the_ticket_too():
+    # Otherwise the ticket for an issue the harness closed stays To Do forever.
+    assert jira_phase({Label.AI_CLOSED}) is JiraPhase.DONE
+
+
+def test_a_stale_close_marker_never_outranks_a_live_phase():
+    # A reopened issue can briefly carry ai-closed alongside an active label; a
+    # ticket must not read Done while the fixer is building the issue.
+    assert jira_phase({Label.AI_CLOSED, Label.AI_WORKING}) is JiraPhase.IN_PROGRESS
+    assert jira_phase({Label.AI_CLOSED, Label.AI_READY}) is JiraPhase.TODO
+    assert jira_phase({Label.AI_CLOSED, Label.AI_TRIAGE}) is JiraPhase.TODO
+
+
 def test_precedence_done_beats_in_progress():
     # a transient multi-label issue maps to its furthest-along phase.
     assert jira_phase({Label.AI_DONE, Label.AI_PR_OPEN}) is JiraPhase.DONE

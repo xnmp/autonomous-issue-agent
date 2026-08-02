@@ -2435,6 +2435,7 @@ REMOTE_LABELS = (
     "ai-blocked",
     "ai-pr-open",
     "ai-done",
+    "ai-closed",
     "ai-suggestion",
     "maybe-resolved",
     "needs-budget-review",

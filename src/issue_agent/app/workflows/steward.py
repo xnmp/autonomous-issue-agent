@@ -63,6 +63,11 @@ class StewardWorkflowConfig:
     error_ceiling: int = DEFAULT_STEWARD_ERROR_CEILING
 
 
+def _text(value: object) -> str:
+    """An agent-supplied field as a string, or "" for every other shape."""
+    return value if isinstance(value, str) else ""
+
+
 def _merge_lines(merged) -> str:
     """The merged-issue reference set, rendered for the prompt. One line per
     issue, newest first — the order `gh pr list` already returns."""
@@ -145,6 +150,30 @@ class StewardWorkflow:
             TelemetryEvent(
                 IssueGroomed(key, kind, fields),
                 Correlation(issue=issue, pr=(pr or None)),
+            )
+        )
+
+    def _journal_triage_close(self, issue: int, kind: str, detail: str) -> None:
+        """One event per (repo, issue, disposition) for a triage `close` verdict.
+
+        `detail` is HARNESS-minted (a normalized stateReason, or the token naming
+        why a close was refused) — never the classifier's close_reason prose,
+        which is agent-authored and reads attacker-writable issue text.
+        """
+        key = f"triage_close:{self.cfg.repo}:{issue}:{kind}"
+        if key in self._emitted:
+            return
+        self._emitted.add(key)
+        journal = self.cfg.journal
+        if journal is None:
+            return
+        dedupe = self.cfg.dedupe
+        if dedupe is not None and not dedupe.claim("triage_close", self.cfg.repo, key):
+            return
+        journal.emit(
+            TelemetryEvent(
+                IssueGroomed(key, kind, {"issue": issue, "detail": detail}),
+                Correlation(issue=issue),
             )
         )
 
@@ -459,9 +488,28 @@ class StewardWorkflow:
                 and not isinstance(s.get("recurrence_of"), bool)
                 else None
             ),
+            # Strings only. Structured output is enforced provider-side, so a
+            # non-conforming runtime can hand back a list or a number here; a
+            # close is the one disposition where a TypeError deep in the domain
+            # would abort a leg that had already been paid for.
+            close_reason=_text(s.get("close_reason")),
+            reopen_if=_text(s.get("reopen_if")),
+            close_state_reason=_text(s.get("close_state_reason")),
         )
         promote = bool(self.cfg.triage_cfg and self.cfg.triage_cfg.promote)
-        if verdict.is_blocked:
+        # Mirrors `triage.actions_for_verdict`'s close gate, so the log line, the
+        # journal and the actions can never disagree about what happened.
+        closing = (
+            promote
+            and verdict.is_close
+            and iss.state_reason.strip().casefold() != "reopened"
+        )
+        if verdict.verdict == "close":
+            disp = (
+                f"close ({verdict.close_state})" if closing
+                else "close refused — handed to a maintainer"
+            )
+        elif verdict.is_blocked:
             disp = (
                 f"blocked ({len(verdict.creator_questions)} creator + "
                 f"{len(verdict.owner_questions)} owner question(s)"
@@ -472,17 +520,28 @@ class StewardWorkflow:
                 "ready → ai-ready" if (promote and not verdict.blocked_by_issues)
                 else "ready (awaiting human promote)"
             )
-        if verdict.blocked_by_issues:
+        if verdict.blocked_by_issues and verdict.verdict != "close":
             disp += f"; blocked-by {sorted(verdict.blocked_by_issues)}"
         merged_by_issue = {m.issue: m.pr for m in merged}
-        rec = triage_dom.recurrence_actions(issue, verdict, merged_by_issue)
+        # The recurrence marker asks a human to judge an OPEN issue. A close
+        # already states its own disposition, so the two would contradict each
+        # other on the same thread; the close comment names the merged PR itself.
+        rec = (
+            [] if closing
+            else triage_dom.recurrence_actions(issue, verdict, merged_by_issue)
+        )
         if rec:
             disp += f"; possible recurrence of #{verdict.recurrence_of}"
         self.cfg.log(f"triage #{issue}: {disp}")
         if not self.executor.execute_all(
             [
                 *triage_dom.actions_for_verdict(
-                    issue, iss.author, verdict, self.cfg.triage_cfg
+                    issue,
+                    iss.author,
+                    verdict,
+                    self.cfg.triage_cfg,
+                    state_reason=iss.state_reason,
+                    labels=iss.labels,
                 ),
                 *rec,
             ]
@@ -497,7 +556,25 @@ class StewardWorkflow:
         if rec:
             of = verdict.recurrence_of or 0
             self._journal_recurrence(issue, of, merged_by_issue.get(of, 0))
-        self.store.set_triage_at(issue, self.gateway.get_issue(issue).updated_at)
+        after = self.gateway.get_issue(issue)
+        if closing:
+            # `execute_all` reports "no action raised", not "every remote write
+            # landed" — a durable command retired as a permanent failure returns
+            # False and is swallowed. The close metric must never claim a close
+            # the remote never took, so it is journalled from the OBSERVED state.
+            self._journal_triage_close(
+                issue,
+                "closed" if after.state == "closed" else "close_unconfirmed",
+                verdict.close_state,
+            )
+        elif verdict.verdict == "close":
+            self._journal_triage_close(
+                issue,
+                "close_declined",
+                "promote_off" if not promote
+                else ("reopened" if verdict.is_close else "incomplete_verdict"),
+            )
+        self.store.set_triage_at(issue, after.updated_at)
         # This issue produced a verdict AND landed it: the consecutive-failure
         # series is over, so a future failure starts counting from zero.
         self.store.clear_steward_stalls(issue, "triage")

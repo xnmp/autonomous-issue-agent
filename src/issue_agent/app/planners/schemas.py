@@ -151,12 +151,26 @@ REVIEW_VALIDATION_SCHEMA: dict = {
 # issue author; owner_questions are technical/architectural decisions a repo
 # maintainer must make (e.g. "add a User to the domain model", pick an auth model,
 # approve a schema change) and must NOT be put to the author. Either list non-empty
-# → blocked.
+# → blocked. verdict="close" is the third disposition: the issue needs no work at
+# all, and the steward closes it itself rather than paying a resolve leg to post a
+# comment (keifu #143).
 TRIAGE_SCHEMA: dict = {
     "type": "object",
     "properties": {
-        "verdict": {"type": "string", "enum": ["ready", "blocked"]},
+        "verdict": {"type": "string", "enum": ["ready", "blocked", "close"]},
         "plain_summary": {"type": "string"},
+        # verdict="close" only — the issue needs no work at all. Both of these are
+        # required BY THE STEWARD (not by the schema, which would only pressure a
+        # ready/blocked verdict into inventing them): a close missing either one
+        # is refused and handed back to a human.
+        "close_reason": {"type": "string"},
+        "reopen_if": {"type": "string"},
+        # GitHub stateReason. "completed" claims the reported work actually
+        # shipped; anything else (including absent) is treated as not_planned.
+        "close_state_reason": {
+            "type": "string",
+            "enum": ["completed", "not_planned"],
+        },
         "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
         # Plain-language clarifications the issue author can answer: what the feature
         # should do, which behaviour they want, scope — no code/architecture terms.

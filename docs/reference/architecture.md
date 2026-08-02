@@ -36,6 +36,23 @@ worktrees live below the hidden `.claude/worktrees` scratch path and that path i
 also excluded by the primary checkout's shared `.git/info/exclude`, but their type
 gate must be identical to the primary checkout's.
 
+Triage returns one of three dispositions: `ready`, `blocked`, or `close`.
+Closing is gated by `STEWARD_PROMOTE`, the same authority switch that gates
+promotion to `ai-ready`: a deployment that keeps a human on lifecycle decisions
+does not acquire autonomous closing by upgrading. A
+`close` verdict must carry both a concrete reason and a reopen condition; the
+steward then comments, closes the issue (`completed` only when the work actually
+shipped, otherwise `not_planned`), and applies the terminal `ai-closed` label —
+deliberately not `ai-done`, which means "a harness PR merged" and drives the
+reopen-based recurrence metric. A close missing either field, or a close on an
+issue whose `stateReason` is `reopened`, is refused and left open under
+`ai-triage` for a maintainer. Because `ai-closed` is not a lifecycle label, a
+human reopening a steward-closed issue puts it back into ordinary triage, and
+the next non-close disposition retires the stale marker. Existing deployments
+must create the `ai-closed` label (`issue-agent prepare-remote`) before enabling
+closing; the relabel fails otherwise and the issue re-enters triage until the
+ADR 0012 stall ceiling escalates it.
+
 The steward optionally grooms open issue bodies (`STEWARD_GROOM=1`): it emits
 advisory comments and the orthogonal `maybe-resolved` label for verified recent
 merge matches or stale references, never a close action. Grooming is capped at
