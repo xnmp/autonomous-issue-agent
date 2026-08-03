@@ -489,10 +489,16 @@ class Backend:
         def _pr_labels(pr: int) -> set[str]:
             return set(snapshots.labels_of(gh_prs.get(pr) or {}))
 
+        # needs-human-review counts: an ESCALATED PR already swapped
+        # ai-pr-open away, and "blocked with an open PR" is the exact state
+        # park exists for — refusing it forced label surgery by hand
+        # (keifu PRs #182/#183, 2026-08-03).
         parkable = [
             pr for pr in prs
             if str((gh_prs.get(pr) or {}).get("state", "")).upper() == "OPEN"
-            and _pr_labels(pr) & {"ai-pr-open", actions.PARKED_LABEL}
+            and _pr_labels(pr) & {
+                "ai-pr-open", "needs-human-review", actions.PARKED_LABEL
+            }
         ]
         if not parkable:
             return False, f"nothing to park on #{number}: no open harness PR"
