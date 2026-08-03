@@ -695,6 +695,24 @@ def _v2_issue_facts(
     return historical
 
 
+def _run_number(
+    view: dict[str, JsonValue],
+    correlation,
+) -> JsonValue:
+    """The number a run leg is ABOUT, preferring what the leg itself recorded.
+
+    2026-08-03 (keifu): the review of PR #186 for issue #185 rendered as "PR
+    #185 approved" and taught `pr_issue` 185→185, because the correlation
+    fallback overwrote the attribute the leg had already journalled. A review
+    leg whose correlation carries no `pr` still knows its PR number.
+    """
+    raw = view.get("number")
+    recorded = None if isinstance(raw, bool) else _int(raw)
+    if recorded is not None and recorded > 0:
+        return recorded
+    return correlation.pr or correlation.issue
+
+
 def _dashboard_event_view(
     event: EventEnvelope,
     model: ReadModel,
@@ -726,11 +744,11 @@ def _dashboard_event_view(
     if isinstance(payload, AgentRunStarted):
         view.update(dict(payload.attributes or {}))
         view["event"] = "agent_run_start"
-        view["number"] = correlation.pr or correlation.issue
+        view["number"] = _run_number(view, correlation)
     elif isinstance(payload, AgentRunCompleted):
         view.update(dict(payload.attributes or {}))
         view["event"] = "agent_run"
-        view["number"] = correlation.pr or correlation.issue
+        view["number"] = _run_number(view, correlation)
         view["duration_s"] = payload.duration_ms / 1000
         view["cost_usd"] = (
             payload.cost_micros / 1_000_000

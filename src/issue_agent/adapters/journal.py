@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 
 from .runtime_plan import ContextualRuntime, RunIdentityRuntime, RuntimePlan
 from ..domain.contracts import Money
+from ..domain.dashboard import ISSUE_NUMBERED
 from ..domain.events import (
     ActionApplied,
     ActionFailed,
@@ -408,13 +409,22 @@ def _run_correlation(
     leg_id: str,
     session_id: str | None = None,
 ) -> Correlation:
+    # 2026-08-03 (keifu): this used to claim a `pr` only when `issue` was
+    # unknown, which conflated "the number is a PR" with "the issue is
+    # unknown" — a REVIEW leg knows both, so PR #186 for issue #185 journalled
+    # pr=None and the dashboard relabelled the run "PR #185". The kind decides.
+    # `number == issue` is treated as issue-numbered regardless of kind: GitHub
+    # numbers issues and PRs from one sequence, so they can never coincide, and
+    # kinds absent from `ISSUE_NUMBERED` (GROOM, an unset kind) would otherwise
+    # claim their own issue as a PR.
+    numbers_a_pr = (
+        context.number > 0
+        and context.kind not in ISSUE_NUMBERED
+        and context.number != context.issue
+    )
     return Correlation(
         issue=context.issue,
-        pr=(
-            context.number
-            if context.issue is None and context.number > 0
-            else None
-        ),
+        pr=context.number if numbers_a_pr else None,
         dispatch_id=context.dispatch_id or None,
         run_id=run_id,
         leg_id=leg_id,
