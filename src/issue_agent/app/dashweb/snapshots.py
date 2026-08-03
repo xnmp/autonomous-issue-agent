@@ -796,8 +796,16 @@ def _escalation_reason(row: dash.IssueRow) -> str | None:
                 min(len(events), index + _ESCALATION_COMMENT_WINDOW + 1),
             )
             if isinstance(action := events[offset].get("action"), dict)
-            and action.get("type") == "comment"
-            and (not numbers or action.get("number") in numbers)
+            # escalate_ci_pending carries its reason in its own body — the
+            # pending-stall path posts no separate comment, so keying on
+            # "comment" alone left those escalations reasonless and the UI
+            # fell back to a generic line (keifu PRs #182/#183, 2026-08-03).
+            and action.get("type") in ("comment", "escalate_ci_pending")
+            and (
+                not numbers
+                or action.get("number") in numbers
+                or action.get("pr") in numbers
+            )
             # A body-less comment beside the escalation is not the reason, and
             # must not shadow the real one a little further out.
             and (reason := _reason_line(action.get("body"))) is not None

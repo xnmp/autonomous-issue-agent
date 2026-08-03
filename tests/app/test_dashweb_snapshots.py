@@ -1048,6 +1048,28 @@ def test_escalation_reason_is_the_comment_the_escalating_pass_posted():
     )
 
 
+def test_escalation_reason_reads_the_ci_pending_stall_body():
+    # The pending-stall path escalates via escalate_ci_pending, which carries
+    # its reason in its OWN body and posts no separate comment — keying on
+    # "comment" alone left those escalations reasonless and the UI fell back
+    # to a generic line (keifu PRs #182/#183, 2026-08-03).
+    stall = {
+        "ts": ts(hours=2), "event": "action", "issue": 7, "role": "fix",
+        "desc": "escalate stalled CI PR #12",
+        "action": {
+            "type": "escalate_ci_pending", "pr": 12, "head": "abc1234",
+            "body": "CI has been pending for 60 minutes without settling "
+                    "(Test (windows-latest)) — a stuck check pins this PR "
+                    "indefinitely.\ndetail line",
+        },
+    }
+    card = snapshots.issue_card(row_view([stall, ESCALATION]), NOW)
+    assert card["escalation_reason"] == (
+        "CI has been pending for 60 minutes without settling "
+        "(Test (windows-latest)) — a stuck check pins this PR indefinitely."
+    )
+
+
 def test_an_escalation_with_no_comment_beside_it_has_no_reason():
     card = snapshots.issue_card(row_view([ESCALATION]), NOW)
     assert card["escalation_reason"] is None
