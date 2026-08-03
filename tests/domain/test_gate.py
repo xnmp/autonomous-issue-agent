@@ -421,6 +421,52 @@ def test_existing_test_must_not_change():
     assert check_tests_immutable(["tests/test_new.py"], lambda f: f in existed).ok
 
 
+# ── #124 exemption REQUEST path: a declared edit is let into the PR ──────────
+def test_declared_existing_test_edit_passes_the_commit_gate():
+    # The declaration makes the edit explicit; it authorizes nothing — the
+    # MERGE gate (exemptions.exemption_permits_merge) withholds until granted.
+    existed = {"tests/test_app.py"}
+    assert check_tests_immutable(
+        ["tests/test_app.py", "src/app.py"],
+        lambda f: f in existed,
+        declared=("tests/test_app.py",),
+    ).ok
+
+
+def test_undeclared_edit_still_denies_with_the_recovery_script():
+    # Anti-regression for the keifu #126 message extension: the deny must keep
+    # telling a benign agent HOW to comply (move tests out + restore the file).
+    existed = {"tests/test_app.py", "tests/test_other.py"}
+    res = check_tests_immutable(
+        ["tests/test_other.py"],
+        lambda f: f in existed,
+        declared=("tests/test_app.py",),  # declares a DIFFERENT file
+    )
+    assert not res.ok
+    assert "tests/test_other.py" in res.reason
+    assert "move them to a new test file" in res.reason
+    assert "git checkout <base>" in res.reason
+
+
+def test_more_than_the_bound_declared_denies_regardless():
+    existed = {f"tests/test_{i}.py" for i in range(4)}
+    res = check_tests_immutable(
+        sorted(existed),
+        lambda f: f in existed,
+        declared=tuple(sorted(existed)),  # 4 > MAX_TEST_IMMUTABILITY_EXCEPTIONS
+    )
+    assert not res.ok
+    assert "exemption" in res.reason
+
+
+def test_no_declaration_keeps_todays_behaviour_exactly():
+    # Anti-vacuity: the default () must reproduce the pre-#124 results verbatim
+    # (the shell twin and the parity goldens know nothing of declarations).
+    existed = {"tests/test_app.py"}
+    assert not check_tests_immutable(["tests/test_app.py"], lambda f: f in existed).ok
+    assert check_tests_immutable(["src/app.py"], lambda f: f in existed).ok
+
+
 # ── test command resolution + §1 ──────────────────────────────────────────────
 # P1R-18: `check_tests` is the push gate's only real teeth and the GATED AGENT
 # writes `.harness/test-cmd` (under bypassPermissions, with a governor that only

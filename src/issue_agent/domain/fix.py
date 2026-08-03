@@ -44,6 +44,7 @@ from .ci import (
     pending_checks,
     pending_deadline_breached,
 )
+from .exemptions import ExemptionFacts, exemption_permits_merge
 from .identity import login_eq
 from .labels import Label, priority_rank
 from .lifecycle import (
@@ -75,6 +76,12 @@ class FixConfig:
     # A plain "three"/"solo" string still compares equal (str-Enum), so a
     # hand-built config keeps working; the config boundary hands over a member.
     identity_mode: IdentityMode = IdentityMode.THREE
+    # REVIEW_BOT's login, needed ONLY by the #124 test-immutability exemption
+    # rule in should_automerge (the fixer must prove the granter is a distinct
+    # identity, never itself). "" is safe: with no declared exemptions the rule
+    # is inert, and WITH declarations an unknown reviewer identity fails closed
+    # (the trust anchor cannot be verified, so no exemption is available).
+    review_bot: str = ""
     auto_merge: bool = True
     merge_method: str = "squash"
     ci_ignore_checks: str = ""
@@ -136,6 +143,13 @@ class FixState:
     # thread and PR thread, whose timestamps are unrelated.
     pr_resumed_at: dict[int, str] = field(default_factory=dict)
     automerge_enabled: frozenset[int] = frozenset()  # PRs already auto-merge-enabled (marker)
+    # PR → the #124 test-immutability-exemption facts the app layer observed:
+    # declared test files (from the change's tracked declaration), REVIEW_BOT-
+    # authenticated grants, and the PR's current patch id. Absent key = nothing
+    # observed = no declarations, which leaves should_automerge untouched (the
+    # anti-vacuity contract). Grants must be authorship-filtered BEFORE they
+    # land here — see exemptions.ExemptionFacts (ADR 0012).
+    test_exemptions: dict[int, ExemptionFacts] = field(default_factory=dict)
     # Per-issue retry counters (issue → count). Drive the circuit breakers: an
     # unbounded fix-CI / address-review loop burns budget forever, so at the cap
     # we escalate to a human instead of re-dispatching. Default 0 (no attempts).
@@ -619,6 +633,21 @@ def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
         or review.state != REVIEW_APPROVED
         or not review.commit_id
         or review.commit_id != pr.head_ref_oid
+    ):
+        return False
+    # #124: a PR whose change declares test-immutability exemptions may EXIST
+    # (the commit gate lets a declared edit through so the reviewer can see
+    # it) but must not LAND until REVIEW_BOT grants every declared file
+    # against the current patch id. Withheld ≠ denied: the PR just never
+    # auto-merges, and the rejection ceiling escalates it on the normal path.
+    # A PR with no observed facts (absent key) is completely unaffected.
+    facts = state.test_exemptions.get(pr.number)
+    if facts is not None and not exemption_permits_merge(
+        facts,
+        issue_number=issue_from_branch(pr.head_ref_name),
+        identity_mode=cfg.identity_mode,
+        fix_bot=cfg.fix_bot,
+        review_bot=cfg.review_bot,
     ):
         return False
     # known=False → UNKNOWN, which is deliberately NOT in the allowed pair: an

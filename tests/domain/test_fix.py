@@ -20,6 +20,7 @@ from issue_agent.domain.actions import (
     RunAgent,
     Target,
 )
+from issue_agent.domain.exemptions import ExemptionGrant, ExemptionFacts
 from issue_agent.domain.fix import (
     CiFlake,
     CiStallStep,
@@ -704,6 +705,61 @@ def test_no_automerge_when_ci_pending():
 def test_automerge_marker_never_suppresses_remote_reconciliation():
     st = FixState(automerge_enabled=frozenset({100}))
     assert should_automerge(_approved_green_pr(), st, CFG) is True
+
+
+# ── #124: declared test-immutability exemptions withhold auto-merge until
+#    REVIEW_BOT grants each file against the CURRENT patch id ────────────────
+EXEMPT_CFG = replace(CFG, review_bot="review-bot")
+
+
+def _exemption_state(declared=("tests/test_app.py",), grants=(), patch_id="patch-1"):
+    return FixState(test_exemptions={
+        100: ExemptionFacts(declared=tuple(declared), grants=tuple(grants),
+                                patch_id=patch_id),
+    })
+
+
+def test_declared_exemption_without_grant_withholds_automerge():
+    # The PR is approved + green — everything ELSE says merge — and it still
+    # must not land until the declared edit is granted.
+    assert should_automerge(_approved_green_pr(), _exemption_state(), EXEMPT_CFG) is False
+
+
+def test_matching_grant_restores_automerge():
+    # _approved_green_pr's branch is fix/100-x, so the branch issue is 100.
+    st = _exemption_state(
+        grants=(ExemptionGrant(100, "tests/test_app.py", "patch-1"),))
+    assert should_automerge(_approved_green_pr(), st, EXEMPT_CFG) is True
+
+
+def test_new_push_voids_the_grant_until_regranted():
+    st = _exemption_state(
+        grants=(ExemptionGrant(100, "tests/test_app.py", "patch-STALE"),))
+    assert should_automerge(_approved_green_pr(), st, EXEMPT_CFG) is False
+
+
+def test_grant_for_wrong_issue_or_file_never_authorizes():
+    for grant in (ExemptionGrant(999, "tests/test_app.py", "patch-1"),
+                  ExemptionGrant(100, "tests/test_other.py", "patch-1")):
+        st = _exemption_state(grants=(grant,))
+        assert should_automerge(_approved_green_pr(), st, EXEMPT_CFG) is False
+
+
+def test_exemption_needs_a_distinct_reviewer_identity():
+    # CFG carries no review_bot: the trust anchor is unverifiable, so a PR WITH
+    # declarations never self-authorizes — even fully granted.
+    st = _exemption_state(
+        grants=(ExemptionGrant(100, "tests/test_app.py", "patch-1"),))
+    assert should_automerge(_approved_green_pr(), st, CFG) is False
+    same = replace(EXEMPT_CFG, review_bot="fix-bot")
+    assert should_automerge(_approved_green_pr(), st, same) is False
+
+
+def test_no_declaration_pr_is_completely_unaffected():
+    # Anti-vacuity twin, both shapes: absent key and observed-but-empty facts.
+    assert should_automerge(_approved_green_pr(), FixState(), EXEMPT_CFG) is True
+    st = FixState(test_exemptions={100: ExemptionFacts()})
+    assert should_automerge(_approved_green_pr(), st, EXEMPT_CFG) is True
 
 
 def test_stale_or_unattributed_approval_never_authorizes_current_head():

@@ -443,7 +443,9 @@ module requires placing it in the appropriate tier and explaining it here.
 `domain/` — pure values and policy:
 `domain/actions.py`, `domain/agent_task.py`, `domain/ci.py`,
 `domain/contracts.py`, `domain/dashboard.py`, `domain/effect_retry.py`,
-`domain/effort.py`,
+`domain/effort.py`, `domain/exemptions.py`
+(the #124 reviewer-granted test-immutability exemption: grant grammar +
+merge-withholding rule),
 `domain/events.py`, `domain/fix.py`, `domain/gate.py`,
 `domain/governor_policy.py`, `domain/identity.py`,
 `domain/infra_breaker.py`, `domain/jira.py`,

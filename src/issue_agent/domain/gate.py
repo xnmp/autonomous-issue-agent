@@ -19,11 +19,12 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 
 from .contracts import TestExecution, TestExecutionStatus
+from .exemptions import MAX_TEST_IMMUTABILITY_EXCEPTIONS, check_declaration_scope
 from .refs import is_governed_branch
 
 
@@ -458,12 +459,38 @@ def check_visual_evidence(
 
 
 def check_tests_immutable(
-    changed: Iterable[str], exists_at_base: Callable[[str], bool]
+    changed: Iterable[str],
+    exists_at_base: Callable[[str], bool],
+    declared: Collection[str] = (),
 ) -> GateResult:
     """Existing test files must not be modified/deleted; only NEW tests added.
-    `exists_at_base(path)` reports whether the file existed at the base ref."""
+    `exists_at_base(path)` reports whether the file existed at the base ref.
+
+    #124 exemption REQUEST path: `declared` are the test files a tracked
+    per-file declaration in the change names. A declared edit passes THIS
+    check — the declaration makes the edit explicit and visible in the diff so
+    the reviewer can judge it — but it authorizes nothing: enforcement moves to
+    MERGE, where `exemptions.exemption_permits_merge` withholds auto-merge
+    until REVIEW_BOT grants each declared file against the current patch id.
+    An UNdeclared edit denies exactly as before, and more declared files than
+    the scope bound denies regardless (a mass rewrite is not a correction).
+    Default () keeps every existing caller — and the shell twin's parity
+    goldens — byte-identical until the integration pass wires declarations."""
+    if not check_declaration_scope(declared):
+        return deny(
+            f"more than {MAX_TEST_IMMUTABILITY_EXCEPTIONS} existing test files "
+            "declared for a test-immutability exemption — the exemption is a "
+            "narrow per-file correction path, not a rewrite license; reduce the "
+            "change's scope (or split it) so at most "
+            f"{MAX_TEST_IMMUTABILITY_EXCEPTIONS} existing test files are touched"
+        )
+    declared_set = frozenset(declared)
     for f in changed:
         if looks_like_test(f) and exists_at_base(f):
+            if f in declared_set:
+                # Declared → visible-and-explicit; the merge gate withholds
+                # until the reviewer grants (see exemptions.py).
+                continue
             # The recovery is scripted into the message: an agent that ADDED
             # its new tests inside an existing file (benign in intent,
             # indistinguishable cheaply from weakening) burned a leg + a
