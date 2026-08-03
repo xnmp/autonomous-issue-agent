@@ -36,6 +36,12 @@ from typing import Any
 
 from ..domain import gate
 from ..domain.contracts import TestExecution, TestExecutionStatus
+from ..domain.exemptions import (
+    ExemptionDeclaration,
+    RULE_REQUIRED_TEST,
+    RULE_TESTS_IMMUTABLE,
+    declared_subjects,
+)
 from ..domain.refs import is_governed_branch
 from ..domain import governor_policy
 
@@ -81,6 +87,15 @@ class GateContext:
     # Subjects already on the observed remote PR branch (base..origin/<branch>);
     # published history the commit-log gate must not re-police (keifu #182).
     published_subjects: tuple[str, ...] = ()
+    # #124 exemption declarations from Gate-Exemption commit trailers on the
+    # branch. A declaration only makes the violation visible (the merge rule
+    # withholds until REVIEW_BOT grants); () = none declared.
+    declared_exemptions: tuple[ExemptionDeclaration, ...] = ()
+    # Lines that LOOK like Gate-Exemption trailers but failed to parse
+    # (typo'd rule, out-of-charset subject like `@scope/pkg`). They are
+    # rightly inert, but silently so — the denial hint below keeps a typo
+    # from recreating the #126 comply-how loop.
+    malformed_exemption_lines: int = 0
     base_resolvable: bool = True
     changed_files: tuple[str, ...] = ()      # diff vs base
     # Push-gate precondition, as a LAZY probe rather than a value (review
@@ -438,13 +453,27 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
             receipt_unreadable=ctx.screenshots_receipt_unreadable,
             image_digests=ctx.image_digests,
         ),
-        lambda: gate.check_required_test(ctx.branch, ctx.changed_files),
+        lambda: _hint_malformed_declarations(
+            gate.check_required_test(
+                ctx.branch,
+                ctx.changed_files,
+                declared_subjects(ctx.declared_exemptions, RULE_REQUIRED_TEST),
+            ),
+            ctx,
+        ),
         lambda: gate.check_commit_log(
             ctx.branch_subjects, ctx.published_subjects
         ),
         lambda: gate.check_no_evidence(ctx.changed_files),
         lambda: gate.check_no_harness_state(ctx.changed_files),
-        lambda: gate.check_tests_immutable(ctx.changed_files, ctx.exists_at_base),
+        lambda: _hint_malformed_declarations(
+            gate.check_tests_immutable(
+                ctx.changed_files,
+                ctx.exists_at_base,
+                declared_subjects(ctx.declared_exemptions, RULE_TESTS_IMMUTABLE),
+            ),
+            ctx,
+        ),
         # §9 — ported from bash in wave P1-2 (review M6). Cheap only in the sense
         # that matters here (no test run), but it does touch the filesystem, so
         # it sits LAST among the cheap checks: a repo with no docs/adr/ pays one
@@ -527,7 +556,14 @@ def _push_gate_for_branch(branch: str, ctx: GateContext) -> list[str]:
         ),
         lambda: gate.check_no_evidence(ctx.changed_files),
         lambda: gate.check_no_harness_state(ctx.changed_files),
-        lambda: gate.check_tests_immutable(ctx.changed_files, ctx.exists_at_base),
+        lambda: _hint_malformed_declarations(
+            gate.check_tests_immutable(
+                ctx.changed_files,
+                ctx.exists_at_base,
+                declared_subjects(ctx.declared_exemptions, RULE_TESTS_IMMUTABLE),
+            ),
+            ctx,
+        ),
     )
     for check in cheap_checks:
         result = check()
@@ -539,6 +575,28 @@ def _push_gate_for_branch(branch: str, ctx: GateContext) -> list[str]:
     if not tests.ok:
         return [_annotate(tests.reason, branch, mode)]
     return []
+
+
+def _hint_malformed_declarations(
+    result: gate.GateResult, ctx: GateContext
+) -> gate.GateResult:
+    """Append a hint to an exemptable rule's DENIAL when the branch carries
+    Gate-Exemption-looking lines that failed to parse. The parser's silence
+    is correct (malformed ⇒ not a declaration, fail closed) but unteachable:
+    without this, an agent that typo'd the rule name or used an
+    out-of-charset subject sees the same denial as one that never declared,
+    and loops on 'how do I comply' (#126 class)."""
+    if result.ok or not ctx.malformed_exemption_lines:
+        return result
+    n = ctx.malformed_exemption_lines
+    return gate.deny(
+        result.reason
+        + f" NOTE: {n} Gate-Exemption line(s) in your commit messages did "
+        "not parse and were ignored — the format is exactly "
+        "'Gate-Exemption: <rule> <subject>' where <rule> is an exemptable "
+        "rule (tests-immutable, required-test) and <subject> is a plain "
+        "path of [A-Za-z0-9._/+-] (or * for required-test)."
+    )
 
 
 def _annotate(reason: str, branch: str, mode: gate.PushGateMode) -> str:

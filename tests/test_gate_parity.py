@@ -539,6 +539,64 @@ def _weakened_test_repo(tmp_path: Path) -> Path:
     return repo
 
 
+# ── #124 reviewer-exemption DECLARATIONS ─────────────────────────────────────
+# A `Gate-Exemption: <rule> <subject>` commit trailer is a REQUEST: it lets the
+# declared violation through the gate so the reviewer can see and judge it, and
+# authorizes nothing (merge is withheld until REVIEW_BOT grants). The trailer
+# lives in commit history, which BOTH stacks read for themselves — bash from
+# `git log <base>..HEAD --format=%B`, Python from the same log through
+# `parse_exemption_declarations`. Two independent parsers over one input is
+# exactly the drift shape this module exists to catch, so each rule gets both
+# directions.
+def _corrected_test_repo(trailer: str = ""):
+    """A branch that MODIFIES an existing test file (the §7b violation), with
+    `trailer` appended to the implementing commit's message."""
+
+    def build(tmp_path: Path) -> Path:
+        repo = fresh_repo(tmp_path)
+        (repo / "tests").mkdir()
+        (repo / "tests" / "test_keep.py").write_text("def test_keep(): assert True\n")
+        _git(repo, "add", "tests/test_keep.py")
+        _git(repo, "commit", "-qm", "test: baseline")
+        (repo / ".harness").mkdir()
+        _git(repo, "switch", "-qc", "fix/13-modtest")
+        (repo / "tests" / "test_new_regression.py").write_text("def test_new(): assert True\n")
+        _git(repo, "add", "tests/test_new_regression.py")
+        _git(repo, "commit", "-qm", "red: new")
+        (repo / "tests" / "test_keep.py").write_text("def test_keep(): assert True  # corrected\n")
+        (repo / "impl.py").write_text("x = 1\n")
+        _git(repo, "add", "tests/test_keep.py", "impl.py")
+        message = "green: impl + correct the existing test"
+        if trailer:
+            message = f"{message}\n\n{trailer}"
+        _git(repo, "commit", "-qm", message)
+        return repo
+
+    return build
+
+
+def _notest_repo(trailer: str = ""):
+    """A fix/ branch whose diff contains NO test file at all — the §5
+    violation — with `trailer` appended to the implementing commit."""
+
+    def build(tmp_path: Path) -> Path:
+        repo = fresh_repo(tmp_path)
+        (repo / ".harness").mkdir()
+        _git(repo, "switch", "-qc", "fix/9-notest")
+        (repo / "x.py").write_text("x = 1\n")
+        _git(repo, "add", "x.py")
+        _git(repo, "commit", "-qm", "red: placeholder")
+        (repo / "y.py").write_text("y = 2\n")
+        _git(repo, "add", "y.py")
+        message = "green: impl"
+        if trailer:
+            message = f"{message}\n\n{trailer}"
+        _git(repo, "commit", "-qm", message)
+        return repo
+
+    return build
+
+
 GOLDEN: tuple[Case, ...] = (
     # ── the happy path: everything the harness asks for, allowed by both ─────
     Case("good_pr", "pr", compliant_pr_repo, _pr_argv(), True),
@@ -611,6 +669,60 @@ GOLDEN: tuple[Case, ...] = (
     ),
     Case("existing_test_weakened", "pr", _weakened_test_repo, _pr_argv(), False,
          env={"TEST_CMD": "true"}, reason_contains="existing test file"),
+
+    # ── #124 exemption declarations (§7b + §5). Both stacks parse the SAME
+    #    trailer out of the SAME commit range with two different parsers, so
+    #    each rule carries its declared/undeclared pair. The undeclared rows
+    #    are the anti-vacuity half: an exemption that swallowed the rule
+    #    outright would pass the ALLOW rows alone. ─────────────────────────────
+    Case("tests_immutable_declared", "pr", _corrected_test_repo(
+             "Gate-Exemption: tests-immutable tests/test_keep.py"),
+         _pr_argv(), True, env={"TEST_CMD": "test -f impl.py"}),
+    Case("tests_immutable_undeclared", "pr", _corrected_test_repo(),
+         _pr_argv(), False, env={"TEST_CMD": "test -f impl.py"},
+         reason_contains="existing test file"),
+    # Per-file, not branch-wide: a declaration naming another path leaves this
+    # edit denied on both stacks.
+    Case("tests_immutable_declared_other_path", "pr", _corrected_test_repo(
+             "Gate-Exemption: tests-immutable tests/test_other.py"),
+         _pr_argv(), False, env={"TEST_CMD": "test -f impl.py"},
+         reason_contains="existing test file"),
+    # Scope bound: 4 distinct subjects is a rewrite, not a correction.
+    Case("tests_immutable_over_scope", "pr", _corrected_test_repo(
+             "Gate-Exemption: tests-immutable tests/test_keep.py\n"
+             "Gate-Exemption: tests-immutable tests/test_a.py\n"
+             "Gate-Exemption: tests-immutable tests/test_b.py\n"
+             "Gate-Exemption: tests-immutable tests/test_c.py"),
+         _pr_argv(), False, env={"TEST_CMD": "test -f impl.py"},
+         reason_contains="more than 3"),
+    Case("required_test_declared", "pr",
+         _notest_repo("Gate-Exemption: required-test *"),
+         _pr_argv(), True, env={"TEST_CMD": "true"}),
+    Case("required_test_undeclared", "pr", _notest_repo(), _pr_argv(), False,
+         env={"TEST_CMD": "true"}, reason_contains="regression test"),
+    # The exemptable set is a closed domain decision: an invented rule id is
+    # inert on both stacks, so a fixer cannot waive itself through.
+    Case("unknown_rule_declaration_inert", "pr",
+         _notest_repo("Gate-Exemption: made-up-rule *"),
+         _pr_argv(), False, env={"TEST_CMD": "true"},
+         reason_contains="regression test"),
+    # Scope applies to required-test too (round-3 MAJOR 3): `*` plus a second
+    # subject exceeds its cap of 1, and an out-of-scope declaration is no
+    # exemption — both stacks must deny rather than pass a change the merge
+    # rule then wedges forever.
+    Case("required_test_over_scope", "pr",
+         _notest_repo("Gate-Exemption: required-test *\n"
+                      "Gate-Exemption: required-test src/x.py"),
+         _pr_argv(), False, env={"TEST_CMD": "true"},
+         reason_contains="regression test"),
+    # An out-of-charset subject (`@scope/pkg` — a real path in a JS repo) is
+    # not declarable in either parser, so the declaration is absent and the
+    # underlying rule denies. Two independent regexes over one charset is
+    # exactly the drift shape this module exists to catch.
+    Case("declaration_subject_out_of_charset", "pr", _corrected_test_repo(
+             "Gate-Exemption: tests-immutable @scope/pkg"),
+         _pr_argv(), False, env={"TEST_CMD": "test -f impl.py"},
+         reason_contains="existing test file"),
 
     # ── ADR citation (§9) — PORTED to Python in wave P1-2. Before the port the
     #    Python column of these two rows was ALLOW/ALLOW: the rule was dead on
@@ -781,6 +893,7 @@ def test_golden_covers_every_rule_family() -> None:
     expected_families = {
         "pr-shape", "base-range", "evidence", "adr", "project-commands",
         "commit-hygiene", "test-cmd-precedence", "untested", "push", "body-file",
+        "exemptions",
     }
     family_of = {
         "good_pr": "pr-shape", "bad_base": "pr-shape", "no_base": "pr-shape",
@@ -796,6 +909,15 @@ def test_golden_covers_every_rule_family() -> None:
         "visual_ac_receiptless_passes_through": "evidence",
         "visual_ac_byte_identical_evidence": "evidence",
         "existing_test_weakened": "evidence",
+        "tests_immutable_declared": "exemptions",
+        "tests_immutable_undeclared": "exemptions",
+        "tests_immutable_declared_other_path": "exemptions",
+        "tests_immutable_over_scope": "exemptions",
+        "required_test_declared": "exemptions",
+        "required_test_undeclared": "exemptions",
+        "unknown_rule_declaration_inert": "exemptions",
+        "required_test_over_scope": "exemptions",
+        "declaration_subject_out_of_charset": "exemptions",
         "adr_governed_path_uncited": "adr", "adr_governed_path_cited": "adr",
         "adr_governs_untouched_path": "adr",
         "lint_fails": "project-commands", "lint_passes": "project-commands",

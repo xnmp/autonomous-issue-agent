@@ -196,6 +196,18 @@ Two smaller ones worth doing whenever the files are next touched:
   witnesses). Residual exposure = pre-feature behavior for that tick.
   Trigger: a paid dispatch observed into a known-open blocker's wedge.
 
+- The ADR 0014 UNVERIFIABLE exemption verdict (2026-08-03) — commit messages
+  unreadable this tick, or patch id uncomputable this tick — withholds the
+  merge and retries every tick with a per-tick log line but NO ceiling: a
+  PERSISTENTLY unverifiable merge-ready PR withholds silently forever from
+  the dashboard's point of view. (Durable causes are OUT of this class:
+  >100-commit truncation and a missing MAC key map to WITHHELD and escalate
+  one-shot with accurate reasons.) Accepted because the remaining causes are
+  shared-infra failures (gh outage) that trip other, louder alarms, and a
+  ceiling needs a new persistent counter surface. Trigger: one observed
+  instance of a merge-ready PR unverifiable for more than an hour adds the
+  counter + journal event per the retry-loop rule (ADR 0012 / CLAUDE.md).
+
 ## 5. Per-incident notes
 
 `docs/open/issues/` holds three unresolved incident write-ups

@@ -4,6 +4,10 @@ from issue_agent.domain.contracts import (
     TestExecution as ExecutionReceipt,
     TestExecutionStatus as ExecutionStatus,
 )
+from issue_agent.domain.exemptions import (
+    MAX_TEST_IMMUTABILITY_EXCEPTIONS,
+    SUBJECT_WHOLE_CHANGE,
+)
 from issue_agent.domain.gate import (
     OpenPrLookup,
     PushGateMode,
@@ -255,6 +259,65 @@ def test_chore_branch_needs_no_test():
     assert check_required_test("chore/1-x", ["package.json"]).ok
 
 
+# ── #124 exemption REQUEST path for required-test ────────────────────────────
+def test_declared_whole_change_exemption_lets_a_testless_change_into_the_pr():
+    # The declaration authorizes nothing: it only makes the test-less change
+    # visible so the reviewer can judge it. Merge is withheld until granted.
+    for branch in ("feat/1-x", "fix/1-x"):
+        assert check_required_test(
+            branch, ["src/app.py"], declared=(SUBJECT_WHOLE_CHANGE,)
+        ).ok, branch
+
+
+def test_undeclared_testless_change_denies_and_teaches_the_trailer():
+    for branch in ("feat/1-x", "fix/1-x"):
+        res = check_required_test(branch, ["src/app.py"])
+        assert not res.ok, branch
+        assert "Gate-Exemption: required-test" in res.reason, branch
+
+
+def test_a_non_whole_change_subject_does_not_exempt_required_test():
+    # required-test is not per-file: only "*" is meaningful. A declaration
+    # naming anything else must leave the deny in place.
+    for declared in (("src/app.py",), ("tests/test_app.py",), ("something-else",), ()):
+        for branch in ("feat/1-x", "fix/1-x"):
+            assert not check_required_test(
+                branch, ["src/app.py"], declared=declared
+            ).ok, (branch, declared)
+
+
+def test_required_test_declaration_does_not_change_branches_that_need_no_test():
+    # Anti-vacuity: chore/ was already allowed; the exemption path must not be
+    # what makes it pass, nor may it start denying.
+    assert check_required_test("chore/1-x", ["package.json"]).ok
+    assert check_required_test(
+        "chore/1-x", ["package.json"], declared=(SUBJECT_WHOLE_CHANGE,)
+    ).ok
+    # ...and a branch that DID supply a test is unaffected either way.
+    assert check_required_test("fix/1-x", ["tests/test_app.py"], declared=()).ok
+
+
+def test_required_test_exemption_dies_when_the_declaration_exceeds_its_scope():
+    # required-test's bound is ONE subject. `*` plus anything else is over the
+    # bound, and an out-of-scope declaration is no exemption at all — the gate
+    # must deny HERE rather than pass a change the merge rule then wedges
+    # forever (round-3 MAJOR 3). Both stacks share `check_declaration_scope`.
+    for branch in ("feat/1-x", "fix/1-x"):
+        assert not check_required_test(
+            branch, ["src/app.py"], declared=(SUBJECT_WHOLE_CHANGE, "a.py")
+        ).ok, branch
+        # Anti-vacuity twin: `*` alone is within scope and still exempts.
+        assert check_required_test(
+            branch, ["src/app.py"], declared=(SUBJECT_WHOLE_CHANGE,)
+        ).ok, branch
+    # Repeating the same subject is not extra scope.
+    assert check_required_test(
+        "fix/1-x",
+        ["src/app.py"],
+        declared=(SUBJECT_WHOLE_CHANGE, SUBJECT_WHOLE_CHANGE),
+    ).ok
+
+
 # ── evidence + test immutability ──────────────────────────────────────────────
 def test_evidence_non_image_not_committed():
     assert not check_no_evidence(["evidence/run.log"]).ok   # logs stay gitignored
@@ -487,7 +550,7 @@ def test_existing_test_must_not_change():
 # ── #124 exemption REQUEST path: a declared edit is let into the PR ──────────
 def test_declared_existing_test_edit_passes_the_commit_gate():
     # The declaration makes the edit explicit; it authorizes nothing — the
-    # MERGE gate (exemptions.exemption_permits_merge) withholds until granted.
+    # MERGE gate (exemptions.exemptions_permit_merge) withholds until granted.
     existed = {"tests/test_app.py"}
     assert check_tests_immutable(
         ["tests/test_app.py", "src/app.py"],
@@ -509,17 +572,25 @@ def test_undeclared_edit_still_denies_with_the_recovery_script():
     assert "tests/test_other.py" in res.reason
     assert "move them to a new test file" in res.reason
     assert "git checkout <base>" in res.reason
+    # ...and it must teach the generalized trailer, naming the offending file.
+    assert "Gate-Exemption: tests-immutable tests/test_other.py" in res.reason
 
 
 def test_more_than_the_bound_declared_denies_regardless():
-    existed = {f"tests/test_{i}.py" for i in range(4)}
+    n = MAX_TEST_IMMUTABILITY_EXCEPTIONS + 1
+    existed = {f"tests/test_{i}.py" for i in range(n)}
     res = check_tests_immutable(
         sorted(existed),
         lambda f: f in existed,
-        declared=tuple(sorted(existed)),  # 4 > MAX_TEST_IMMUTABILITY_EXCEPTIONS
+        declared=tuple(sorted(existed)),
     )
     assert not res.ok
     assert "exemption" in res.reason
+    # exactly at the bound, the same declared edits pass
+    at_bound = sorted(existed)[:MAX_TEST_IMMUTABILITY_EXCEPTIONS]
+    assert check_tests_immutable(
+        at_bound, lambda f: f in existed, declared=tuple(at_bound)
+    ).ok
 
 
 def test_no_declaration_keeps_todays_behaviour_exactly():

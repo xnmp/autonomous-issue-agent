@@ -252,6 +252,11 @@ class HarnessConfig:
     identity_mode: IdentityMode = IdentityMode.THREE
     fix_bot: str = ""
     review_bot: str = "my-reviewer-bot[bot]"
+    # ADR 0014 grant-authentication key: derived key material, NOT the raw
+    # token (see _derive_exemption_mac_key). repr=False keeps it out of any
+    # accidental dataclass dump; describe() never prints it. "" disables
+    # grants (declared PRs withhold with an accurate reason).
+    exemption_mac_key: str = field(default="", repr=False, compare=False)
     steward_bot: str = "my-reviewer-bot[bot]"
     state_dir: str = ""
     review_state_dir: str = ""
@@ -1680,5 +1685,27 @@ def from_env(env: dict | None = None) -> HarnessConfig:
         errors.append(str(exc))
         values["repointed_from_deployments"] = ()
     values["control_authority_root"] = machine_control_authority_root()
+    values["exemption_mac_key"] = _derive_exemption_mac_key(e)
     values["parse_errors"] = tuple(errors)
     return HarnessConfig(**values)
+
+
+def _derive_exemption_mac_key(e: dict) -> str:
+    """Key material for authenticating ADR 0014 grant lines.
+
+    An explicit EXEMPTION_MAC_KEY wins; otherwise the key is DERIVED (one-way,
+    versioned) from REVIEW_BOT_TOKEN, which both daemons already share via the
+    env snapshot — no new secret to provision, and rotating the token rotates
+    the key (voiding open grants, which a re-review re-mints). The derivation
+    means the stored value cannot recover the token. Neither the raw token
+    nor this key is ever placed in an agent environment or prompt; the
+    HMAC is computed harness-side only (round-3 BLOCKER 1)."""
+    explicit = str(e.get("EXEMPTION_MAC_KEY") or "")
+    if explicit:
+        return explicit
+    token = str(e.get("REVIEW_BOT_TOKEN") or "")
+    if not token:
+        return ""
+    return hashlib.sha256(
+        b"issue-agent exemption-grant-mac v1:" + token.encode()
+    ).hexdigest()

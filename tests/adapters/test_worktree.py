@@ -1285,3 +1285,57 @@ def test_review_checkout_defers_when_a_refresh_step_fails():
     )
     with pytest.raises(WorktreeUnavailable):
         rc.ensure(165, SHA)
+
+
+# ── Gate-Exemption trailers off the branch's commit bodies (ADR 0014) ────────
+_BODY_LOG = "log origin/dev..HEAD --format=%B"
+
+
+def _bodies_git(bodies: str):
+    """`_builder_git` plus a scripted `--format=%B` read. The %B key must come
+    FIRST: FakeGit matches by prefix in insertion order, and the subjects key
+    ('log origin/dev..HEAD') would otherwise swallow it."""
+    fg = FakeGit({_BODY_LOG: GitResult(0, bodies)})
+    fg.table.update(_builder_git().table)
+    return fg
+
+
+def test_build_gate_context_reads_declared_exemptions_from_commit_bodies():
+    ctx = build_gate_context(
+        "/wt",
+        base_branch="dev",
+        git=_bodies_git(
+            "fix: the expectation was wrong\n\n"
+            "Gate-Exemption: tests-immutable tests/test_x.py\n"
+        ),
+    )
+    assert [(d.rule, d.subject) for d in ctx.declared_exemptions] == [
+        ("tests-immutable", "tests/test_x.py")
+    ]
+    assert ctx.malformed_exemption_lines == 0
+
+
+def test_build_gate_context_counts_a_malformed_declaration_for_the_denial_hint():
+    # `@scope/pkg` is a real path in a JS repo and outside the declarable
+    # subject charset. It declares nothing — and the count is what lets the
+    # gate say so instead of denying silently (#126 class).
+    ctx = build_gate_context(
+        "/wt",
+        base_branch="dev",
+        git=_bodies_git(
+            "fix: thing\n\nGate-Exemption: tests-immutable @scope/pkg\n"
+        ),
+    )
+    assert ctx.declared_exemptions == ()
+    assert ctx.malformed_exemption_lines == 1
+
+
+def test_build_gate_context_declares_nothing_when_the_body_log_fails():
+    # Fail toward the stricter, pre-exemption behaviour: no declarations, no
+    # hint, and the rest of the context still built.
+    fg = _bodies_git("")
+    fg.table[_BODY_LOG] = GitResult(1, "fatal: bad revision")
+    ctx = build_gate_context("/wt", base_branch="dev", git=fg)
+    assert ctx.declared_exemptions == ()
+    assert ctx.malformed_exemption_lines == 0
+    assert ctx.branch_subjects == ("red: t", "green: impl")

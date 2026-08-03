@@ -44,7 +44,12 @@ from .ci import (
     pending_checks,
     pending_deadline_breached,
 )
-from .exemptions import ExemptionFacts, exemption_permits_merge
+from .exemptions import (
+    EXEMPTIONS_PERMIT,
+    EXEMPTIONS_WITHHELD,
+    ExemptionFacts,
+    exemption_status,
+)
 from .identity import login_eq
 from .labels import Label, priority_rank
 from .lifecycle import (
@@ -82,6 +87,10 @@ class FixConfig:
     # is inert, and WITH declarations an unknown reviewer identity fails closed
     # (the trust anchor cannot be verified, so no exemption is available).
     review_bot: str = ""
+    # HMAC key authenticating reviewer grant lines (ADR 0014): harness-held,
+    # never placed in any agent environment or prompt. "" fails closed —
+    # declared PRs withhold with a "no grant-authentication key" reason.
+    exemption_mac_key: str = ""
     auto_merge: bool = True
     merge_method: str = "squash"
     ci_ignore_checks: str = ""
@@ -604,23 +613,13 @@ def prs_needing_resume(
     return out
 
 
-def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
-    """Port of watcher-lib.sh:maybe_automerge gating. Requires: AUTO_MERGE on, a
-    branch the harness itself authored, three-identity mode, an exact-head
-    approval by a distinct actor, and exact-head CI ok|none.
-
-    The boot-verified strict server gate (arm_on_open) is deliberately NOT a
-    precondition: it is defense-in-depth that additionally closes the
-    base-advance race where the base can carry protection. Requiring it
-    unconditionally (2026-07-31 hardening) disabled merging entirely on repos
-    whose base cannot carry verifiable protection — a private free-plan repo
-    403s on the protection API itself — zeroing merges-per-deployment on
-    every current target (observed 2026-08-01). The exact-head preconditions
-    below are the whole client-side gate either way; the executor merges only
-    the observed head (`--match-head-commit`) and never arms persistent
-    GitHub auto-merge (its approval would survive later pushes without
-    last-push protection). Residual on unprotected bases: the base may
-    advance between observation and merge (see residuals.md)."""
+def automerge_in_scope(pr: PRView, cfg: FixConfig) -> bool:
+    """Is this PR one the harness would EVER auto-merge, config and identity
+    aside from readiness? Shared by `should_automerge` and the ADR 0014
+    withheld-exemption escalation so the escalation cannot fire on a PR the
+    harness would not have merged anyway (AUTO_MERGE off, a stranger's
+    branch, two-identity mode, conflicted/non-CLEAN) — there "withheld" is
+    not what stands between the PR and a merge, and the message would lie."""
     if not cfg.auto_merge:
         return False
     if not pr.head_ref_oid:
@@ -649,7 +648,27 @@ def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
     # first poll after the branch is mergeable again.
     if pr.is_conflicting():
         return False
-    if pr.merge_state.upper() != "CLEAN":
+    return pr.merge_state.upper() == "CLEAN"
+
+
+def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
+    """Port of watcher-lib.sh:maybe_automerge gating. Requires: AUTO_MERGE on, a
+    branch the harness itself authored, three-identity mode, an exact-head
+    approval by a distinct actor, and exact-head CI ok|none.
+
+    The boot-verified strict server gate (arm_on_open) is deliberately NOT a
+    precondition: it is defense-in-depth that additionally closes the
+    base-advance race where the base can carry protection. Requiring it
+    unconditionally (2026-07-31 hardening) disabled merging entirely on repos
+    whose base cannot carry verifiable protection — a private free-plan repo
+    403s on the protection API itself — zeroing merges-per-deployment on
+    every current target (observed 2026-08-01). The exact-head preconditions
+    below are the whole client-side gate either way; the executor merges only
+    the observed head (`--match-head-commit`) and never arms persistent
+    GitHub auto-merge (its approval would survive later pushes without
+    last-push protection). Residual on unprotected bases: the base may
+    advance between observation and merge (see residuals.md)."""
+    if not automerge_in_scope(pr, cfg):
         return False
     # arm_on_open: branch protection (verified at boot) already refuses the
     # merge until a review approves and the required checks pass, so waiting
@@ -661,6 +680,27 @@ def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
     # against a protected base every poll (#534-class noise). The review/CI
     # preconditions below are the whole client-side gate; server protection,
     # where present, independently re-checks them at merge time.
+    if not merge_preconditions_met(pr, cfg):
+        return False
+    # #124/ADR 0014: a PR whose change declares gate exemptions may EXIST
+    # (the commit gate lets a declared violation through so the reviewer can
+    # see it) but must not LAND until REVIEW_BOT grants every declaration
+    # against the current patch id. Durably withheld is TERMINAL for this
+    # head — the PR is already reviewed, nothing re-runs the reviewer — so
+    # decide_fix pairs that verdict with a one-shot escalation; UNVERIFIABLE
+    # facts (a gh outage, an oversized fetch) also refuse the merge but are
+    # retried next tick, never escalated with a false "reviewer refused"
+    # reason. A PR with no observed facts (absent key) is unaffected.
+    return exemption_merge_status(pr, state, cfg)[0] == EXEMPTIONS_PERMIT
+
+
+def merge_preconditions_met(pr: PRView, cfg: FixConfig) -> bool:
+    """Distinct APPROVED review at the exact head + CI ok/none — the
+    merge-readiness half of `should_automerge`, shared with the app-layer
+    exemption-facts collector so the two can never disagree about WHICH PRs
+    need facts before a merge decision (a collector predicate looser or
+    tighter than this one would either waste gh calls or let a declared PR
+    merge factless)."""
     review = latest_other_review(pr.reviews, cfg.fix_bot)
     if (
         review is None
@@ -669,27 +709,31 @@ def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
         or review.commit_id != pr.head_ref_oid
     ):
         return False
-    # #124: a PR whose change declares test-immutability exemptions may EXIST
-    # (the commit gate lets a declared edit through so the reviewer can see
-    # it) but must not LAND until REVIEW_BOT grants every declared file
-    # against the current patch id. Withheld ≠ denied: the PR just never
-    # auto-merges, and the rejection ceiling escalates it on the normal path.
-    # A PR with no observed facts (absent key) is completely unaffected.
-    facts = state.test_exemptions.get(pr.number)
-    if facts is not None and not exemption_permits_merge(
-        facts,
-        issue_number=issue_from_branch(pr.head_ref_name),
-        identity_mode=cfg.identity_mode,
-        fix_bot=cfg.fix_bot,
-        review_bot=cfg.review_bot,
-    ):
-        return False
     # known=False → UNKNOWN, which is deliberately NOT in the allowed pair: an
     # unread checks fetch must never arm a merge (#48). Honest NONE (a repo with
     # no CI, successfully read) stays mergeable.
     return ci_state(
         pr.checks, cfg.ci_ignore_checks, known=pr.checks_known
     ) in (CIState.OK, CIState.NONE)
+
+
+def exemption_merge_status(
+    pr: PRView, state: FixState, cfg: FixConfig
+) -> tuple[str, str]:
+    """(verdict, reason) from the observed exemption facts (ADR 0014).
+    A PR with no observed facts permits — merge-readiness alone never
+    withholds."""
+    facts = state.test_exemptions.get(pr.number)
+    if facts is None:
+        return (EXEMPTIONS_PERMIT, "")
+    return exemption_status(
+        facts,
+        issue_number=issue_from_branch(pr.head_ref_name),
+        identity_mode=cfg.identity_mode,
+        fix_bot=cfg.fix_bot,
+        review_bot=cfg.review_bot,
+        mac_key=cfg.exemption_mac_key,
+    )
 
 
 def update_branch_marker(pr: PRView, base_head: str) -> str:
@@ -1938,6 +1982,30 @@ def decide_fix(
                     pr.number, cfg.merge_method, pr.head_ref_oid
                 )
             )
+        elif automerge_in_scope(pr, cfg) and merge_preconditions_met(pr, cfg):
+            # ADR 0014: approved at head, CI green, but exemption facts
+            # refuse the merge. Only a DURABLE refusal escalates: the
+            # reviewer already reviewed this head and nothing dispatches
+            # another round, so "wait" means "poll forever, silently"
+            # (adversarial review BLOCKER 2). UNVERIFIABLE facts (gh outage,
+            # oversized fetch) withhold WITHOUT escalating — retried next
+            # tick, and the collector journals the cause; escalating them
+            # would hand a human a healthy PR with a false reason (round-2
+            # MAJOR). The label swap makes the escalation one-shot, and a
+            # new push voids the whole situation anyway (grants re-bind to
+            # the new patch id).
+            verdict, reason = exemption_merge_status(pr, state, cfg)
+            if verdict == EXEMPTIONS_WITHHELD:
+                actions.extend(_escalate_pr(
+                    pr.number,
+                    f"this PR is otherwise merge-ready, but {reason} — "
+                    "auto-merge is withheld by design (ADR 0014). A human "
+                    "must either merge by hand (accepting the declared "
+                    "violation), dismiss the review to force a fresh "
+                    "round, or close the PR. Note: unparking without "
+                    "changing anything re-escalates immediately — the "
+                    "facts have not changed.",
+                ))
         if should_update_branch(pr, state, cfg, world.base_head):
             actions.append(
                 UpdateBranch(pr.number, pr.head_ref_oid, world.base_head)

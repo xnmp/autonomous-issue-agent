@@ -24,7 +24,13 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .contracts import TestExecution, TestExecutionStatus
-from .exemptions import MAX_TEST_IMMUTABILITY_EXCEPTIONS, check_declaration_scope
+from .exemptions import (
+    MAX_TEST_IMMUTABILITY_EXCEPTIONS,
+    RULE_REQUIRED_TEST,
+    RULE_TESTS_IMMUTABLE,
+    SUBJECT_WHOLE_CHANGE,
+    check_declaration_scope,
+)
 from .refs import is_governed_branch
 
 
@@ -331,19 +337,43 @@ def check_no_web(argv: Iterable[str]) -> GateResult:
 
 
 # ── required test in the diff (check-pr.sh §5) ────────────────────────────────
-def check_required_test(branch: str, changed: Iterable[str]) -> GateResult:
+def check_required_test(
+    branch: str, changed: Iterable[str], declared: Collection[str] = ()
+) -> GateResult:
     """feat/ ⇒ an e2e/integration (or conventional) test; fix/ ⇒ a regression
-    test. chore/refactor need none. Derived from the branch + diff, not prefixes."""
+    test. chore/refactor need none. Derived from the branch + diff, not prefixes.
+
+    `declared` are the subjects a `Gate-Exemption: required-test *` trailer
+    names (only the whole-change subject is meaningful). A declared exemption
+    passes THIS check — the reviewer must be able to see and judge the
+    test-less change — but authorizes nothing: auto-merge is withheld until
+    REVIEW_BOT grants it against the current patch id (exemptions.py). The
+    scope bound applies here exactly as in `check_tests_immutable` (round-3
+    MAJOR 3: without it, `*` plus junk subjects passed the gate and then
+    wedged at merge)."""
+    if SUBJECT_WHOLE_CHANGE in declared and check_declaration_scope(
+        RULE_REQUIRED_TEST, declared
+    ):
+        return ALLOW
     files = list(changed)
     if branch.startswith("feat/"):
         if not any(FEAT_TEST_RE.search(f) for f in files):
             return deny(
                 "feat/ branch must add an e2e/integration (or conventional) test "
-                "(none found in the diff)"
+                "(none found in the diff). If this change GENUINELY needs no "
+                "test, request a reviewer exemption: add a commit with the "
+                "trailer line 'Gate-Exemption: required-test *' — the reviewer "
+                "must then explicitly grant it before the PR can merge"
             )
     elif branch.startswith("fix/"):
         if not any(looks_like_test(f) for f in files):
-            return deny("fix/ branch must add a regression test (none found in the diff)")
+            return deny(
+                "fix/ branch must add a regression test (none found in the "
+                "diff). If this change GENUINELY needs no test, request a "
+                "reviewer exemption: add a commit with the trailer line "
+                "'Gate-Exemption: required-test *' — the reviewer must then "
+                "explicitly grant it before the PR can merge"
+            )
     return ALLOW
 
 
@@ -500,7 +530,7 @@ def check_tests_immutable(
     the scope bound denies regardless (a mass rewrite is not a correction).
     Default () keeps every existing caller — and the shell twin's parity
     goldens — byte-identical until the integration pass wires declarations."""
-    if not check_declaration_scope(declared):
+    if not check_declaration_scope(RULE_TESTS_IMMUTABLE, declared):
         return deny(
             f"more than {MAX_TEST_IMMUTABILITY_EXCEPTIONS} existing test files "
             "declared for a test-immutability exemption — the exemption is a "
@@ -526,7 +556,12 @@ def check_tests_immutable(
                 "instead of changing existing ones. If you only ADDED tests "
                 f"there: move them to a new test file and restore '{f}' to its "
                 "exact base-branch content (git checkout <base> -- path); the "
-                "gate reads the net diff, so this needs no history rewrite"
+                "gate reads the net diff, so this needs no history rewrite. "
+                "If the EXISTING test is itself the bug (a wrong expectation), "
+                "request a reviewer exemption instead: add a commit with the "
+                f"trailer line 'Gate-Exemption: tests-immutable {f}' — the "
+                "edit then enters the PR for the reviewer to judge, and the "
+                "PR cannot merge until the reviewer explicitly grants it"
             )
     return ALLOW
 

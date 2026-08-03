@@ -15,6 +15,7 @@ from enum import Enum
 
 from .identity import is_bot_login
 from .labels import Label
+from .lifecycle import pr_lifecycle
 
 
 class CIState(str, Enum):
@@ -268,13 +269,25 @@ def normalize_predicted_paths(raw: object) -> frozenset[str]:
 def paths_overlap_open_prs(
     declared: frozenset[str], prs: "tuple[PRView, ...]"
 ) -> bool:
-    """True iff any declared path is changed by an OPEN PR. The overlap test is
-    exact-path (both sides are repo-relative). Empty `declared` → False
-    (unpredictable → fail-open, never block on no signal)."""
+    """True iff any declared path is changed by an OPEN, UNBLOCKED PR. The
+    overlap test is exact-path (both sides are repo-relative). Empty
+    `declared` → False (unpredictable → fail-open, never block on no signal).
+
+    A BLOCKED PR (ai-blocked / needs-human-review) does not hold the path
+    lock: it is not moving until a human acts, and that wait is unbounded —
+    keifu #163/#164 sat deferred behind escalated PR #181 for the length of
+    a human decision (2026-08-03), converting one PR's human latency into a
+    pipeline-wide stall. The risk this accepts is bounded and recoverable:
+    if the human later merges the blocked PR by hand, an overlapping
+    in-flight branch may conflict, and the REBASE leg already owns that."""
     if not declared:
         return False
     for pr in prs:
-        if pr.state == "OPEN" and declared & pr.changed_files:
+        if (
+            pr.state == "OPEN"
+            and not pr_lifecycle(pr).is_blocked
+            and declared & pr.changed_files
+        ):
             return True
     return False
 

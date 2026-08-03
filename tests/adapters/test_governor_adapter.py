@@ -893,3 +893,45 @@ def test_read_record_fails_open():
         {"tool_input": {"file_path": "evidence/a.png"}, "cwd": "/x"}, "id", None
     ))
     assert out == {}  # recorder error never wedges the agent
+
+
+# ── malformed Gate-Exemption hint (ADR 0014) ─────────────────────────────────
+# The declaration parser is silent about lines it rejects, which is correct
+# (malformed ⇒ not a declaration, fail closed) but unteachable: an agent that
+# typo'd the rule or used an out-of-charset subject sees the same denial as one
+# that never declared, and loops on "how do I comply" (keifu #126). The gate
+# surfaces the count on the denial for the rules a declaration could have
+# affected.
+def _immutable_ctx(**overrides):
+    """A PR that edits an EXISTING test file — the tests-immutable denial."""
+    return GateContext(**{
+        **_good_pr_ctx().__dict__,
+        "exists_at_base": lambda f: f.startswith("tests/"),
+        **overrides,
+    })
+
+
+def test_a_tests_immutable_denial_names_unparsed_gate_exemption_lines():
+    v = evaluate_command(_good_pr_cmd(), _immutable_ctx(malformed_exemption_lines=2))
+    assert not v.allowed
+    assert "existing test file" in v.reason      # the rule still speaks first
+    assert "Gate-Exemption" in v.reason
+    assert "did not parse" in v.reason
+    assert "2" in v.reason
+
+
+def test_the_same_denial_without_malformed_lines_is_left_alone():
+    # Anti-vacuity twin: the hint is driven by the observed count, not bolted
+    # onto every denial.
+    v = evaluate_command(_good_pr_cmd(), _immutable_ctx(malformed_exemption_lines=0))
+    assert not v.allowed
+    assert "did not parse" not in v.reason
+    assert v.reason == evaluate_command(_good_pr_cmd(), _immutable_ctx()).reason
+
+
+def test_malformed_lines_never_turn_an_allow_into_a_denial():
+    # A hint is a hint. A compliant change with sloppy trailers still passes.
+    ctx_with_junk = GateContext(**{
+        **_good_pr_ctx().__dict__, "malformed_exemption_lines": 3
+    })
+    assert evaluate_command(_good_pr_cmd(), ctx_with_junk).allowed

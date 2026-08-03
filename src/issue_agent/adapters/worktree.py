@@ -32,6 +32,11 @@ from ..domain.contracts import (
     TestExecutionStatus,
     classify_test_exit_code,
 )
+from ..domain.exemptions import (
+    ExemptionDeclaration,
+    count_malformed_declarations,
+    parse_exemption_declarations,
+)
 from ..domain.gate import OpenPrLookup, resolve_test_cmd
 from .governor import GateContext, run_target_command
 from .store import HarnessMarkers
@@ -732,10 +737,24 @@ def build_gate_context(
 
     subjects: tuple[str, ...] = ()
     published_subjects: tuple[str, ...] = ()
+    declared_exemptions: tuple[ExemptionDeclaration, ...] = ()
+    malformed_exemption_lines = 0
     changed: tuple[str, ...] = ()
     if baseref:
         log = git(["log", f"{baseref}..HEAD", "--reverse", "--format=%s"], cwd)
         subjects = tuple(s for s in log.out.splitlines() if s)
+        # #124 declarations are Gate-Exemption trailers anywhere on the
+        # branch's commits: tracked history the agent cannot edit without
+        # changing the branch, and nothing left in the repo after merge.
+        bodies = git(["log", f"{baseref}..HEAD", "--format=%B"], cwd)
+        if bodies.code == 0:
+            seen_decl: dict[ExemptionDeclaration, None] = {}
+            for declaration in parse_exemption_declarations(bodies.out):
+                seen_decl.setdefault(declaration)
+            declared_exemptions = tuple(seen_decl)
+            malformed_exemption_lines = count_malformed_declarations(
+                bodies.out
+            )
         diff = git(["diff", "--name-only", f"{baseref}...HEAD"], cwd)
         changed = tuple(f for f in diff.out.splitlines() if f)
         # Commits already on the observed remote PR branch are published
@@ -1040,6 +1059,8 @@ def build_gate_context(
         branch=branch,
         branch_subjects=subjects,
         published_subjects=published_subjects,
+        declared_exemptions=declared_exemptions,
+        malformed_exemption_lines=malformed_exemption_lines,
         base_resolvable=base_resolvable,
         changed_files=changed,
         open_pr=open_pr,

@@ -7,6 +7,8 @@ into RuntimePlan.schema → ClaudeAgentOptions.output_format.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 # agent/lib.sh FIX_SCHEMA — resolve / resume / address-review / fix-ci.
 FIX_SCHEMA: dict = {
     "type": "object",
@@ -89,6 +91,41 @@ REVIEW_SCHEMA: dict = {
     },
     "required": ["decision", "body"],
 }
+
+
+def review_schema_with_exemptions(
+    declarations: Sequence[tuple[str, str]],
+) -> dict:
+    """REVIEW_SCHEMA extended with `exemption_grants` (ADR 0014), constrained
+    so an invalid grant is UNREPRESENTABLE: the field exists only when the PR
+    actually declares exemptions, and each entry is an object-level enum over
+    exactly the declared {rule, subject} pairs — the model cannot emit an
+    undeclared rule, a cross-matched subject, or free text. Granting is a
+    structured decision, never prose: the harness renders the authenticated
+    grant lines itself, binding the patch id the model never sees (round-2
+    adversarial review showed string-matching authority out of free text
+    survives fence-quoting tricks). Harness-side validation in the review
+    workflow stays as defense in depth for runtimes that enforce schemas
+    loosely."""
+    allowed = [
+        {"rule": rule, "subject": subject} for rule, subject in declarations
+    ]
+    return {
+        **REVIEW_SCHEMA,
+        "properties": {
+            **REVIEW_SCHEMA["properties"],
+            "exemption_grants": {
+                "type": "array",
+                "items": {"enum": allowed},
+                "description": (
+                    "Gate-exemption declarations you GRANT, verbatim from "
+                    "the declared list in the prompt. Only meaningful with "
+                    "decision APPROVE. Omit or [] to refuse; refusal needs "
+                    "no entry."
+                ),
+            },
+        },
+    }
 
 # ── multi-agent review (REVIEW_MODE=multi) ───────────────────────────────────
 # The /code-review pattern ported as dispatcher-level orchestration: a cheap

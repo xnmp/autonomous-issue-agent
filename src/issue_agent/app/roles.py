@@ -48,6 +48,8 @@ from ..adapters.store import Store
 from ..adapters.spend_recovery import CodexSpendReconciler, spend_evidence_dir
 from ..adapters.wake import WakeSignal, wake_path
 from ..adapters.worktree import ReviewCheckouts, Worktrees
+_PR_COMMITS_FETCH_CEILING = 100  # gh pr view --json commits silent cap
+
 from ..domain.fix import (
     FixConfig,
     FixState,
@@ -59,9 +61,21 @@ from ..domain.fix import (
     decide_fix,
     duplicate_pr_guards,
     issue_holds,
+    automerge_in_scope,
+    merge_preconditions_met,
 )
+from ..domain.review import REVIEW_APPROVED
 from ..domain.labels import Label
-from ..domain.lifecycle import retry_breaker
+from ..domain.lifecycle import pr_lifecycle, retry_breaker
+from ..domain import review as review_dom
+from ..domain.exemptions import (
+    ExemptionDeclaration,
+    ExemptionFacts,
+    ExemptionGrant,
+    parse_exemption_declarations,
+    parse_exemption_grants,
+)
+from ..domain.identity import login_eq
 from ..domain.review import (
     DEFAULT_MAX_UNPRODUCTIVE_ROUNDS,
     IdentityMode,
@@ -1610,11 +1624,116 @@ def _prediction_outcome_reporter(
     return report
 
 
+def _collect_test_exemptions(
+    gateway, world, cfg, review_bot: str, log
+) -> dict[int, "ExemptionFacts"]:
+    """#124 merge-side facts for every OPEN ai-pr-open PR. Declarations come
+    from Gate-Exemption commit trailers (one extra gh call per open harness
+    PR per tick — bounded by the concurrency cap in practice); grants come
+    from the PR's reviews and comments ALREADY in the world, filtered to
+    REVIEW_BOT's authorship before anything reaches the domain (the ADR 0012
+    laundering point — anyone can comment on a PR); the patch id is the
+    revision-checked diff's signature.
+
+    Fail directions, all CLOSED: unreadable commit messages mark the facts
+    UNVERIFIABLE — the merge stays withheld this tick and is retried next
+    (never escalated: a gh outage is not a reviewer refusal, adversarial
+    review round 2); an uncomputable diff leaves patch_id "" which the merge
+    rule likewise treats as unverifiable-retry. A PR with no declarations
+    gets NO entry — absent facts leave should_automerge untouched."""
+    facts: dict[int, ExemptionFacts] = {}
+    unreadable = ExemptionFacts(unverifiable=True)
+    for p in world.prs:
+        if p.state != "OPEN" or Label.AI_PR_OPEN not in p.labels:
+            continue
+        # Only the fixer's own unblocked PRs can auto-merge, so only they
+        # need facts — a stranger's or escalated PR here would burn a gh
+        # call per tick for a decision that can never fire.
+        if not login_eq(p.author, cfg.fix_bot) or pr_lifecycle(p).is_blocked:
+            continue
+        # Facts matter only where a merge decision could read them: the gate
+        # side reads trailers from the worktree, not from here. Collecting
+        # for merge-candidates ONLY — the SAME predicates should_automerge
+        # composes (in-scope AND merge-ready), so the two can never disagree
+        # about which PRs need facts — keeps this at ~one extra gh call per
+        # merge-ready PR per tick instead of one per open PR (2026-08-02
+        # GraphQL quota burn; round-3 MAJOR 4: without the in-scope half,
+        # AUTO_MERGE=0 or a CONFLICTING approved PR paid that call forever).
+        if not automerge_in_scope(p, cfg) or not merge_preconditions_met(
+            p, cfg
+        ):
+            continue
+        try:
+            messages = gateway.pr_commit_messages(p.number)
+        except Exception as exc:  # noqa: BLE001 — one PR ≠ the tick
+            log(
+                f"pr #{p.number}: exemption declarations unreadable ({exc}) "
+                "— merge withheld this tick, retrying next (fail closed)"
+            )
+            facts[p.number] = unreadable
+            continue
+        if len(messages) >= _PR_COMMITS_FETCH_CEILING:
+            # gh pr view fetches at most 100 commits and silently drops the
+            # tail — a declaration there would be invisible here while the
+            # worktree gate saw it. Fail closed, rather than merge a
+            # possibly-declared PR on a truncated read. DURABLE (retrying
+            # never shrinks the branch), so this is `truncated`, which the
+            # merge rule maps to WITHHELD → a one-shot escalation with an
+            # accurate reason — not unverifiable-retry-forever (round-3
+            # MAJOR 2: the old sentinel silently unmerged every ≥100-commit
+            # PR with no escalation, declared or not).
+            log(
+                f"pr #{p.number}: {len(messages)} commits reaches the gh "
+                "fetch ceiling — declarations unverifiable; merge withheld "
+                "and escalated (fail closed)"
+            )
+            facts[p.number] = ExemptionFacts(truncated=True)
+            continue
+        declared_seen: dict[ExemptionDeclaration, None] = {}
+        for message in messages:
+            for declaration in parse_exemption_declarations(message):
+                declared_seen.setdefault(declaration)
+        if not declared_seen:
+            continue
+        # Grants count ONLY from APPROVED reviews authored by REVIEW_BOT —
+        # never from comments or REQUEST_CHANGES bodies. A grant is an
+        # authorization, and the only body whose intent unambiguously says
+        # "this may land" is the approval itself (ADR 0014 adversarial
+        # review, BLOCKER 1: a refusal that QUOTED the grant line minted it).
+        grants: list[ExemptionGrant] = []
+        for review in p.reviews:
+            if review.state == REVIEW_APPROVED and login_eq(
+                review.author, review_bot
+            ):
+                grants.extend(parse_exemption_grants(review.body))
+        patch_id = ""
+        if p.base_ref_oid and p.head_ref_oid:
+            try:
+                evidence = gateway.pr_diff(
+                    p.number, p.base_ref_oid, p.head_ref_oid
+                )
+                if (
+                    evidence.base_oid == p.base_ref_oid
+                    and evidence.head_oid == p.head_ref_oid
+                    and evidence.text.strip()
+                ):
+                    patch_id = review_dom.patch_signature(evidence.text)
+            except Exception as exc:  # noqa: BLE001 — "" stays unverifiable
+                log(f"pr #{p.number}: exemption patch id unavailable ({exc})")
+        facts[p.number] = ExemptionFacts(
+            declarations=tuple(declared_seen),
+            grants=tuple(grants),
+            patch_id=patch_id,
+        )
+    return facts
+
+
 def _fix_state(
     store: Store,
     world,
     inflight: tuple[InFlightFix, ...] = (),
     process_deaths: Mapping[int, int] | None = None,
+    test_exemptions: dict[int, "ExemptionFacts"] | None = None,
 ) -> FixState:
     """Read the per-issue/PR orchestration state the fix decision needs."""
     sessions = frozenset(i.number for i in world.issues if store.has_session(i.number))
@@ -1691,6 +1810,7 @@ def _fix_state(
         update_branch_head=update_branch_head,
         ci_pending_escalated=ci_pending_escalated,
         inflight=inflight,
+        test_exemptions=dict(test_exemptions or {}),
     )
 
 
@@ -2186,6 +2306,8 @@ def build_fix_daemon(
     codex_runtime = cfg.codex_runtime
     fix_cfg = FixConfig(
         fix_bot=fix_runtime.bot,
+        review_bot=cfg.review_bot,
+        exemption_mac_key=cfg.exemption_mac_key,
         identity_mode=repo_cfg.identity_mode,
         auto_merge=cfg.auto_merge,
         merge_method=cfg.merge_method,
@@ -2381,6 +2503,9 @@ def build_fix_daemon(
             world,
             inflight,
             control.abandoned_dispatch_counts(owner_id),
+            _collect_test_exemptions(
+                gateway, world, fix_cfg, fix_cfg.review_bot, _log("fix")
+            ),
         )
         report_holds(world, inflight)
         report_prediction_outcomes(world)
@@ -2561,6 +2686,7 @@ def build_review_daemon(
         ),
         max_review_rejections=review_runtime.max_rejections,
         review_bot=review_runtime.bot,
+        exemption_mac_key=cfg.exemption_mac_key,
         reviewer_runtime=review_runtime.runtime,
         review_trigger_label=review_runtime.trigger_label,
         review_mode=review_runtime.mode,

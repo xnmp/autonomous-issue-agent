@@ -67,6 +67,7 @@ from issue_agent.app.roles import (
     _REVIEW_RUNTIME_REGISTRY,
     _ci_flake_reporter,
     _ci_stall_reporter,
+    _collect_test_exemptions,
     _control_store,
     _control_store_path,
     _duplicate_pr_reporter,
@@ -2893,3 +2894,149 @@ def test_fix_state_reads_the_ci_rerun_marker_the_executor_wrote(tmp_path):
     # ...and that is exactly what stops a second free re-run on the same head.
     actions = decide_fix(world, _GUARD_CFG, _fix_state(store, world), fixer_busy=False)
     assert RunAgent(AgentKind.FIX_CI, 144) in actions
+
+
+# ── ADR 0014 exemption-fact collection (which PRs cost a gh call) ────────────
+# `_collect_test_exemptions` is the READ half of the merge-side exemption rule.
+# Its predicate must track `merge_preconditions_met` exactly: looser burns a gh
+# call per open PR per tick (the 2026-08-02 GraphQL quota burn), tighter lets a
+# declared PR reach the merge decision with no facts at all.
+_EXEMPT_CFG = FixConfig(
+    fix_bot="fix-bot", review_bot="review-bot", arm_on_open=True
+)
+
+
+class _CommitMessageGateway(FakeGateway):
+    """FakeGateway plus the commit-message read the collector needs. Records
+    every PR it was asked about, so "no entry" can be distinguished from
+    "asked and got nothing" — the point of the predicate is the CALL."""
+
+    def __init__(self, messages=(), raises=None, **kw):
+        super().__init__(**kw)
+        self.messages = tuple(messages)
+        self.raises = raises
+        self.commit_message_calls: list[int] = []
+
+    def pr_commit_messages(self, pr: int) -> tuple[str, ...]:
+        self.commit_message_calls.append(pr)
+        if self.raises is not None:
+            raise self.raises
+        return self.messages
+
+
+_DECLARING_COMMIT = "fix: the expectation was wrong\n\nGate-Exemption: tests-immutable tests/test_x.py"
+
+
+def _merge_ready_pr(**kw) -> PRView:
+    fields = dict(
+        number=100,
+        state="OPEN",
+        labels=frozenset({Label.AI_PR_OPEN}),
+        author="fix-bot",
+        head_ref_name="fix/100-x",
+        head_ref_oid="head-100",
+        base_ref_oid="base-100",
+        merge_state="CLEAN",
+        reviews=(Review("APPROVED", "review-bot", "t1", commit_id="head-100"),),
+        checks=(Check("build", bucket="pass"),),
+    )
+    fields.update(kw)
+    return PRView(**fields)
+
+
+def _collect(gw, pr_view):
+    return _collect_test_exemptions(
+        gw, WorldState(prs=(pr_view,)), _EXEMPT_CFG, "review-bot", lambda _m: None
+    )
+
+
+def test_a_declaring_merge_ready_pr_gets_facts_the_merge_rule_can_read():
+    # Anti-vacuity twin for the two exclusions below: the collector DOES work
+    # on the PRs the merge decision will actually consult.
+    gw = _CommitMessageGateway(messages=(_DECLARING_COMMIT,))
+    facts = _collect(gw, _merge_ready_pr())
+    assert gw.commit_message_calls == [100]
+    assert facts[100].declarations and not facts[100].unverifiable
+
+
+def test_a_pr_authored_by_someone_else_is_never_fact_collected():
+    # Only the fixer's own PRs can auto-merge; a stranger's would burn a gh
+    # call per tick for a decision that can never fire.
+    gw = _CommitMessageGateway(messages=(_DECLARING_COMMIT,))
+    facts = _collect(gw, _merge_ready_pr(author="a-human"))
+    assert facts == {}
+    assert gw.commit_message_calls == []
+
+
+def test_a_blocked_pr_is_never_fact_collected():
+    # needs-human-review means a human owns the next move — nothing will merge
+    # it, so nothing needs the facts.
+    gw = _CommitMessageGateway(messages=(_DECLARING_COMMIT,))
+    facts = _collect(
+        gw,
+        _merge_ready_pr(
+            labels=frozenset({Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW})
+        ),
+    )
+    assert facts == {}
+    assert gw.commit_message_calls == []
+
+
+def test_a_pr_not_yet_merge_ready_is_never_fact_collected():
+    gw = _CommitMessageGateway(messages=(_DECLARING_COMMIT,))
+    pending = _merge_ready_pr(checks=(Check("build", state="IN_PROGRESS"),))
+    assert _collect(gw, pending) == {}
+    assert gw.commit_message_calls == []
+
+
+def test_a_pr_out_of_automerge_scope_is_never_fact_collected():
+    # The collector composes the SAME predicates should_automerge does. Without
+    # the in-scope half, AUTO_MERGE=0 or a CONFLICTING approved PR paid a gh
+    # call every tick forever for a decision that can never fire (round-3
+    # MAJOR 4).
+    gw = _CommitMessageGateway(messages=(_DECLARING_COMMIT,))
+    off = _collect_test_exemptions(
+        gw,
+        WorldState(prs=(_merge_ready_pr(),)),
+        replace(_EXEMPT_CFG, auto_merge=False),
+        "review-bot",
+        lambda _m: None,
+    )
+    assert off == {} and gw.commit_message_calls == []
+
+    conflicted = _CommitMessageGateway(messages=(_DECLARING_COMMIT,))
+    assert _collect(conflicted, _merge_ready_pr(merge_state="CONFLICTING")) == {}
+    assert conflicted.commit_message_calls == []
+
+    behind = _CommitMessageGateway(messages=(_DECLARING_COMMIT,))
+    assert _collect(behind, _merge_ready_pr(merge_state="BEHIND")) == {}
+    assert behind.commit_message_calls == []
+
+
+def test_a_branch_past_the_commit_fetch_ceiling_is_truncated_not_unverifiable():
+    # Truncation is DURABLE — retrying never shrinks the branch — so it must
+    # reach the merge rule as `truncated` (escalate once with an accurate
+    # reason), never as `unverifiable` (retry silently forever).
+    gw = _CommitMessageGateway(messages=("chore: x",) * 100)
+    facts = _collect(gw, _merge_ready_pr())
+    assert facts[100].truncated is True
+    assert facts[100].unverifiable is False
+    assert facts[100].declarations == ()
+
+
+def test_a_branch_just_under_the_ceiling_is_read_normally():
+    # Anti-vacuity twin for the boundary: 99 commits is a normal read.
+    gw = _CommitMessageGateway(messages=("chore: x",) * 98 + (_DECLARING_COMMIT,))
+    facts = _collect(gw, _merge_ready_pr())
+    assert facts[100].truncated is False
+    assert facts[100].declarations
+
+
+def test_an_unreadable_commit_log_yields_unverifiable_facts_not_silence():
+    # Silence would leave should_automerge untouched and merge a possibly
+    # declared PR on a failed read. The record must exist and say "unreadable",
+    # which the merge rule treats as withhold-and-retry (never escalate).
+    gw = _CommitMessageGateway(raises=RuntimeError("gh exploded"))
+    facts = _collect(gw, _merge_ready_pr())
+    assert facts[100].unverifiable is True
+    assert facts[100].declarations == ()

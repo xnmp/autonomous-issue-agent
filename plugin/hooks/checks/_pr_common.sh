@@ -294,13 +294,53 @@ prc_check_no_generated_instructions() {  # "<changed-file-list>"
 }
 
 # §7b — existing test files must not be modified/deleted; only NEW tests added.
+# #124: reviewer-granted gate exemptions. The fixer DECLARES via a
+# `Gate-Exemption: <rule> <subject>` commit trailer (tracked history — visible
+# in the PR, nothing left in the repo after merge); the gate lets a DECLARED
+# violation through so the reviewer can judge it, and the merge side withholds
+# auto-merge until REVIEW_BOT grants each declaration against the current
+# patch id. Twin of domain/exemptions.py — keep the rule ids, the exemptable
+# set (tests-immutable, required-test) and the tests-immutable cap of 3 in
+# lockstep. Unknown rules are inert.
+prc_declared_exemption_subjects() {  # $1 rule → prints declared subjects, deduped
+  # Subject charset/bound mirrors domain/exemptions.py _SUBJECT_TOKEN: `*` or
+  # a bounded path-ish token — never arbitrary non-space text (it reaches the
+  # reviewer prompt).
+  git log "$log_range" --format='%B' 2>/dev/null \
+    | sed -nE "s#^[ \t]*Gate-Exemption:[ \t]+$1[ \t]+(\*|[A-Za-z0-9._/+-]{1,200})[ \t]*\$#\1#p" \
+    | sort -u
+}
+
+# Lines that LOOK like Gate-Exemption trailers but don't parse (typo'd rule,
+# out-of-charset subject like `@scope/pkg`). Rightly inert, but silently so —
+# the denial hint keeps a typo from recreating the #126 comply-how loop.
+# Twin of domain/exemptions.py count_malformed_declarations.
+prc_malformed_exemption_hint() {  # prints a hint suffix, or nothing
+  local n
+  # [[:blank:]] not [ \t]: grep -E does not expand \t inside a bracket
+  # expression (the class would be {space, backslash, t} — round-3 MINOR 8),
+  # while the sed twin above DOES expand it. [[:blank:]] is space+tab in both.
+  n=$(git log "$log_range" --format='%B' 2>/dev/null \
+    | grep -E '^[[:blank:]]*Gate-Exemption:' \
+    | grep -cvE "^[[:blank:]]*Gate-Exemption:[[:blank:]]+(tests-immutable|required-test)[[:blank:]]+(\*|[A-Za-z0-9._/+-]{1,200})[[:blank:]]*\$" || true)
+  [ "${n:-0}" -gt 0 ] || return 0
+  printf '%s' " NOTE: $n Gate-Exemption line(s) in your commit messages did not parse and were ignored — the format is exactly 'Gate-Exemption: <rule> <subject>' where <rule> is an exemptable rule (tests-immutable, required-test) and <subject> is a plain path of [A-Za-z0-9._/+-] (or * for required-test)."
+}
+
 prc_check_tests_immutable() {  # prc_check_tests_immutable "<changed-file-list>"
-  local f
+  local f declared n_declared
+  declared="$(prc_declared_exemption_subjects tests-immutable)"
+  n_declared=$(printf '%s\n' "$declared" | grep -c '.' || true)
+  [ "${n_declared:-0}" -le 3 ] \
+    || fail "more than 3 existing test files declared for a test-immutability exemption — the exemption is a narrow per-file correction path, not a rewrite license; reduce the change's scope (or split it) so at most 3 existing test files are touched"
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     printf '%s' "$f" | grep -qE "$PR_TEST_FILE_RE" || continue
     if git cat-file -e "origin/$base:$f" 2>/dev/null || git cat-file -e "$base:$f" 2>/dev/null; then
-      fail "existing test file '$f' was modified/deleted — add NEW tests instead of changing existing ones. If you only ADDED tests there: move them to a new test file and restore '$f' to its exact base-branch content (git checkout <base> -- path); the gate reads the net diff, so this needs no history rewrite"
+      # Declared → visible-and-explicit; the merge gate withholds until the
+      # reviewer grants (domain/exemptions.py).
+      printf '%s\n' "$declared" | grep -qxF "$f" && continue
+      fail "existing test file '$f' was modified/deleted — add NEW tests instead of changing existing ones. If you only ADDED tests there: move them to a new test file and restore '$f' to its exact base-branch content (git checkout <base> -- path); the gate reads the net diff, so this needs no history rewrite. If the EXISTING test is itself the bug (a wrong expectation), request a reviewer exemption instead: add a commit with the trailer line 'Gate-Exemption: tests-immutable $f' — the edit then enters the PR for the reviewer to judge, and the PR cannot merge until the reviewer explicitly grants it.$(prc_malformed_exemption_hint)"
     fi
   done <<< "$1"
 }

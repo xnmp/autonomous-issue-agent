@@ -165,17 +165,28 @@ if [ -f .harness/visual-ac ] \
 fi
 
 # ── 5. Branch type ⇒ required new test in the diff (derive from git, not prefix) ─
-case "$branch" in
-  feat/*)
-    # Prefer an explicit e2e/integration test, but accept any conventional test
-    # file path (test_*.py, *_test.go, tests/…) so projects without "e2e" in the
-    # filename are not falsely blocked.
-    printf '%s\n' "$changed" | grep -qE '(e2e|integration).*\.(spec|test)\.|(^|/)test_.*\.py|.*_test\.(py|go|ts|js|rs)|tests?/.*\.(py|rs|spec|test)' \
-      || fail "feat/ branch must add an e2e/integration (or conventional) test (none found in the diff)" ;;
-  fix/*)
-    printf '%s\n' "$changed" | grep -qE "$PR_TEST_FILE_RE" \
-      || fail "fix/ branch must add a regression test (none found in the diff)" ;;
-esac
+# A declared `Gate-Exemption: required-test *` trailer passes this check so the
+# reviewer can judge the test-less change; the merge side withholds auto-merge
+# until the reviewer explicitly grants it (twin of gate.check_required_test).
+# Scope bound applies exactly as in tests-immutable: `*` plus extra subjects
+# exceeds the rule's cap of 1 and is NOT an exemption (round-3 MAJOR 3).
+rt_declared="$(prc_declared_exemption_subjects required-test)"
+rt_count=$(printf '%s\n' "$rt_declared" | grep -c '.' || true)
+if printf '%s\n' "$rt_declared" | grep -qxF '*' && [ "${rt_count:-0}" -le 1 ]; then
+  :
+else
+  case "$branch" in
+    feat/*)
+      # Prefer an explicit e2e/integration test, but accept any conventional test
+      # file path (test_*.py, *_test.go, tests/…) so projects without "e2e" in the
+      # filename are not falsely blocked.
+      printf '%s\n' "$changed" | grep -qE '(e2e|integration).*\.(spec|test)\.|(^|/)test_.*\.py|.*_test\.(py|go|ts|js|rs)|tests?/.*\.(py|rs|spec|test)' \
+        || fail "feat/ branch must add an e2e/integration (or conventional) test (none found in the diff). If this change GENUINELY needs no test, request a reviewer exemption: add a commit with the trailer line 'Gate-Exemption: required-test *' — the reviewer must then explicitly grant it before the PR can merge.$(prc_malformed_exemption_hint)" ;;
+    fix/*)
+      printf '%s\n' "$changed" | grep -qE "$PR_TEST_FILE_RE" \
+        || fail "fix/ branch must add a regression test (none found in the diff). If this change GENUINELY needs no test, request a reviewer exemption: add a commit with the trailer line 'Gate-Exemption: required-test *' — the reviewer must then explicitly grant it before the PR can merge.$(prc_malformed_exemption_hint)" ;;
+  esac
+fi
 
 # ── 6/7/7b. Commit hygiene + evidence + test-immutability (shared, state-derived) ─
 prc_check_commit_log

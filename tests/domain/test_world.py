@@ -9,6 +9,8 @@ import pytest
 
 from tests.domain.builders import issue, pr, world
 
+from issue_agent.domain.labels import Label
+
 from issue_agent.domain.world import (
     Comment,
     PRView,
@@ -90,6 +92,40 @@ def test_overlap_ignores_non_open_prs():
 def test_overlap_empty_declared_is_failopen():
     prs = (_pr(1, "OPEN", {"a.py"}),)
     assert paths_overlap_open_prs(frozenset(), prs) is False
+
+
+# A PR escalated to a human (ai-blocked / needs-human-review) is not moving,
+# and the wait is unbounded — it must not serialize new work behind it
+# (keifu #163/#164 deferred behind escalated PR #181, 2026-08-03). A later
+# hand-merge conflict is the REBASE leg's job.
+def test_overlap_ignores_blocked_prs():
+    blocked = PRView(
+        number=1,
+        state="OPEN",
+        changed_files=frozenset({"a.py"}),
+        labels=frozenset({Label.AI_PR_OPEN, Label.AI_BLOCKED}),
+    )
+    assert paths_overlap_open_prs(frozenset({"a.py"}), (blocked,)) is False
+
+
+def test_overlap_ignores_needs_human_review_prs():
+    escalated = PRView(
+        number=1,
+        state="OPEN",
+        changed_files=frozenset({"a.py"}),
+        labels=frozenset({Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW}),
+    )
+    assert paths_overlap_open_prs(frozenset({"a.py"}), (escalated,)) is False
+
+
+def test_overlap_still_holds_on_unblocked_labeled_pr():
+    open_pr = PRView(
+        number=1,
+        state="OPEN",
+        changed_files=frozenset({"a.py"}),
+        labels=frozenset({Label.AI_PR_OPEN}),
+    )
+    assert paths_overlap_open_prs(frozenset({"a.py"}), (open_pr,)) is True
 
 
 # ── fix_probe_safe (#3: when may the fixer coast on the cheap signature?) ────
