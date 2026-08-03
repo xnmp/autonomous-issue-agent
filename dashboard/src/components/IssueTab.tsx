@@ -1,6 +1,7 @@
 import { useMemo, useState, type KeyboardEvent, type MouseEvent } from "react";
 import { api } from "../api/client";
-import { usePolled, useLiveElapsed } from "../api/hooks";
+import { usePolled } from "../api/hooks";
+import { liveClocks, offsetSince, useNow } from "../lib/clock";
 import type { IssueStep } from "../api/types";
 import {
   kindLabel,
@@ -110,10 +111,12 @@ export function IssueTab({
   };
 
   const d = detail.data;
-  const liveWorking = useLiveElapsed(d?.working_s ?? null, detail.updatedAt);
-  const liveIdle = useLiveElapsed(d?.idle_s ?? null, detail.updatedAt);
-  const working = d?.done || d?.idle_active ? (d?.working_s ?? null) : liveWorking;
-  const idle = d?.done || !d?.idle_active ? (d?.idle_s ?? null) : liveIdle;
+  // Same rule as the board's rows, from the same module: whichever clock the
+  // server says is still moving is the one that ticks here.
+  const { working, idle } = liveClocks(
+    d ?? {},
+    offsetSince(detail.updatedAt, useNow()),
+  );
   const sortedSteps = useSortedRows(d?.steps ?? [], {
     operation: (step) => step.kind,
     role: (step) => step.role,

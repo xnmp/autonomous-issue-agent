@@ -1447,6 +1447,103 @@ def test_a_journal_block_freezes_the_clock_and_a_cleared_one_does_not():
     assert card["human_wait_s"] is None
 
 
+# ── a live label view outranks the sticky journal fallback ────────────────────
+_BLOCK_START = {"ts": ts(hours=3), "event": "agent_run_start", "role": "fix",
+                "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"}
+_BLOCK_RELABEL = {"ts": ts(hours=2), "event": "action", "role": "fix", "issue": 7,
+                  "desc": "relabel pr #12: -ai-pr-open +ai-blocked"}
+_BLOCKED_EVENTS = [_BLOCK_START, RESOLVE, _BLOCK_RELABEL]
+
+
+def _blocked_row():
+    """A row whose journal blocked PR #12 two hours ago and never cleared it."""
+    return replace(row_view(_BLOCKED_EVENTS), prs=(12,))
+
+
+def test_a_live_label_view_without_the_hold_releases_the_journals_stale_block():
+    """keifu #142/#181 (2026-08-03): the journal witnesses only the harness's
+    own writes, so an operator clearing ai-blocked with a plain `gh` write left
+    the fallback holding the row forever — both clocks frozen at the block
+    stamp while paid legs kept spending."""
+    card = snapshots.issue_card(
+        _blocked_row(), NOW,
+        gh_issue={"title": "t", "url": "u", "labels": [{"name": "ai-working"}]},
+        gh_prs={12: {"title": "t", "url": "u", "labels": [{"name": "ai-pr-open"}]}},
+    )
+
+    assert not card["human_action"]
+    assert card["human_wait_s"] is None
+    # The clock is no longer pinned to the 2h-ago block: it runs to now.
+    assert card["elapsed_s"] == 10_800
+
+
+def test_a_legacy_enrichment_without_labels_keeps_the_journal_fallback():
+    """The pre-#181 enrichment shape carried title/url only. With no live label
+    view to contradict it the journal remains the only block signal, and must
+    still freeze the clock (keifu PRs #173/#177)."""
+    card = snapshots.issue_card(
+        _blocked_row(), NOW,
+        gh_issue={"title": "t", "url": "u"},
+        gh_prs={12: {"title": "t", "url": "u"}},
+    )
+
+    assert card["human_action"] == "awaiting-reply"
+    assert card["human_wait_s"] == 7_200
+    assert card["elapsed_s"] == 3_600
+
+
+def test_a_live_label_view_that_still_carries_the_hold_keeps_the_row_held():
+    card = snapshots.issue_card(
+        _blocked_row(), NOW,
+        gh_issue={"title": "t", "url": "u", "labels": []},
+        gh_prs={12: {"title": "t", "url": "u", "labels": [{"name": "ai-blocked"}]}},
+    )
+
+    assert card["human_action"] == "awaiting-reply"
+    assert card["human_wait_s"] == 7_200
+    assert card["elapsed_s"] == 3_600
+
+
+def test_a_partial_live_view_cannot_release_the_hold_the_journal_recorded():
+    # Only the issue carries labels; the PR the block lives on is still the old
+    # title/url shape, so nothing observed contradicts the journal.
+    card = snapshots.issue_card(
+        _blocked_row(), NOW,
+        gh_issue={"title": "t", "url": "u", "labels": [{"name": "ai-working"}]},
+        gh_prs={12: {"title": "t", "url": "u"}},
+    )
+    assert card["human_action"] == "awaiting-reply"
+    assert card["elapsed_s"] == 3_600
+
+
+# ── the card says outright whether a paid leg is executing ────────────────────
+def test_a_card_reports_a_running_leg_so_the_client_keeps_the_work_clock_moving():
+    row = row_for([_BLOCK_START], 7)
+    assert row.running  # the start was never settled
+    assert snapshots.issue_card(row, NOW)["leg_running"] is True
+    assert snapshots.issue_detail(row, NOW)["leg_running"] is True
+
+
+def test_a_done_card_never_reports_a_running_leg():
+    row = replace(row_for([_BLOCK_START], 7), done=True)
+    assert row.running  # a stale start survives the completion
+    assert snapshots.issue_card(row, NOW)["leg_running"] is False
+    assert snapshots.issue_detail(row, NOW)["leg_running"] is False
+
+
+def test_a_settled_row_with_no_live_leg_reports_no_running_leg():
+    assert snapshots.issue_card(row_for([RESOLVE], 7), NOW)["leg_running"] is False
+
+
+def test_a_held_row_still_reports_the_leg_that_is_spending_on_it():
+    # The bug's shape: human_action set AND a leg running. The card must carry
+    # both, so the client can tick work rather than dead-stop on the hold.
+    row = replace(row_for([_BLOCK_START], 7), events=tuple(_BLOCKED_EVENTS))
+    card = snapshots.issue_card(row, NOW)
+    assert card["human_action"] == "awaiting-reply"
+    assert card["leg_running"] is True
+
+
 def test_the_detail_view_freezes_the_same_clock_as_the_card():
     events = [
         {"ts": ts(hours=3), "event": "agent_run_start", "role": "fix",

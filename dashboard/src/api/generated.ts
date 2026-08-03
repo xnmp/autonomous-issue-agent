@@ -475,6 +475,11 @@ export interface components {
             labels: string[];
             /** Last Ts */
             last_ts: string | null;
+            /**
+             * Leg Running
+             * @default false
+             */
+            leg_running: boolean;
             /** Merged Ts */
             merged_ts?: string | null;
             /**
@@ -543,6 +548,11 @@ export interface components {
             idle_s: number | null;
             /** Issue */
             issue: number;
+            /**
+             * Leg Running
+             * @default false
+             */
+            leg_running: boolean;
             /** Prs */
             prs: number[];
             /** Pull Requests */

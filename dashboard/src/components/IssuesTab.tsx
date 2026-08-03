@@ -9,7 +9,8 @@ import {
   type MouseEvent,
 } from "react";
 import { api } from "../api/client";
-import { useClock, usePolled, type Polled } from "../api/hooks";
+import { usePolled, type Polled } from "../api/hooks";
+import { liveClocks, SnapshotAnchor, useNow, useSnapshotOffset } from "../lib/clock";
 import { tipProps } from "./ui/Tip";
 import type {
   BacklogCard,
@@ -202,6 +203,10 @@ export function IssuesTab({
   };
 
   return (
+    // Every live duration below this point ticks from the instant THIS
+    // snapshot was received, so no descendant needs its own clock or its own
+    // anchor prop, and none of them can drift apart.
+    <SnapshotAnchor.Provider value={issues.updatedAt}>
     <div className="tabbody" onContextMenu={openColumnMenu}>
       {!ghOk ? <div className="row"><span className="spacer" /><GhUnavailableChip /></div> : null}
       <ColumnMenu
@@ -231,7 +236,6 @@ export function IssuesTab({
                 repo={repo}
                 cards={blocked}
                 onRefresh={issues.refresh}
-                anchorMs={issues.updatedAt}
                 loading={issues.loading}
                 visible={visible}
                 onOpen={onOpenIssue}
@@ -245,7 +249,6 @@ export function IssuesTab({
             repo={repo}
             cards={running}
             onRefresh={issues.refresh}
-            anchorMs={issues.updatedAt}
             loading={issues.loading}
             visible={visible}
             onOpen={onOpenIssue}
@@ -310,13 +313,13 @@ export function IssuesTab({
         />
       ) : null}
     </div>
+    </SnapshotAnchor.Provider>
   );
 }
 
 function InFlightTable({
   repo,
   cards,
-  anchorMs,
   loading,
   visible,
   onOpen,
@@ -330,7 +333,6 @@ function InFlightTable({
 }: {
   repo: string;
   cards: IssueCard[];
-  anchorMs: number | null;
   loading: boolean;
   visible: ReadonlySet<string>;
   onOpen: (issue: number) => void;
@@ -353,10 +355,9 @@ function InFlightTable({
     ),
     model: (card) => card.models.join(" "),
   }, { key: "issue", direction: "asc" }, storageKey, sortableAndShown);
-  const now = useClock();
+  const offset = useSnapshotOffset();
   if (loading) return <SkeletonRows what="in-flight issues" rows={5} />;
   if (cards.length === 0) return <EmptyState>no issues in flight — the fixer is idle</EmptyState>;
-  const offset = anchorMs === null ? 0 : Math.max(0, (now - anchorMs) / 1000);
   const columns: TableColumn[] = [
     { key: "issue", label: "Issue / PR", width: 320 },
     ...(visible.has("tasks") ? [{ key: "tasks", label: "Tasks", width: 190 }] : []),
@@ -377,17 +378,11 @@ function InFlightTable({
       >
         <tbody>
           {sorted.rows.map((card) => {
-            const elapsed = card.elapsed_s === null ? null : card.elapsed_s + offset;
-            // A human-owned issue has a work clock the server already stopped:
-            // ticking it locally would invent minutes nobody worked. The wait
-            // clock on the human-action chip is the one that still moves.
+            // Which clock moves is one rule, stated once, in lib/clock.ts:
+            // a running leg ticks work, an idle row ticks idle, and only a
+            // genuinely quiescent row freezes both.
+            const { elapsed, working, idle } = liveClocks(card, offset);
             const humanOwned = !!card.human_action;
-            const working = card.working_s === null
-              ? null
-              : card.working_s + (card.idle_active || humanOwned ? 0 : offset);
-            const idle = card.idle_s === null
-              ? null
-              : card.idle_s + (card.idle_active ? offset : 0);
             const open = expanded === card.issue;
             // Alarm means "a human is needed NOW". `escalated`/`spend-blocked`
             // flags are lifetime counters — an issue that escalated once and
@@ -1166,10 +1161,15 @@ function overBudget(card: IssueCard): boolean {
 }
 
 function IssueSummary({ card, open }: { card: IssueCard; open: boolean }) {
-  const now = useClock();
-  const humanWait = card.human_wait_since_ts
-    ? Math.max(0, (now - Date.parse(card.human_wait_since_ts)) / 1000)
-    : (card.human_wait_s ?? null);
+  // Ticked from the server's own measurement plus the age of this snapshot,
+  // not from parsing the server's timestamp against the browser's clock: a
+  // client a few minutes off would otherwise show a wait that never matches
+  // the one the harness is acting on.
+  const offset = useSnapshotOffset();
+  const waitS = card.human_wait_s;
+  const humanWait = typeof waitS === "number" && Number.isFinite(waitS)
+    ? Math.max(0, waitS) + offset
+    : null;
   const secondaryFlags = card.flags.filter((flag) => flag !== card.human_action);
   const status = humanStatus(card);
   return (
@@ -1283,7 +1283,7 @@ function doneAtMs(card: IssueCard): number | null {
  * merged issue — chips, badges, expanded detail and all — once a second.
  */
 const TimeSinceDone = memo(function TimeSinceDone({ card }: { card: IssueCard }) {
-  const nowMs = useClock();
+  const nowMs = useNow();
   const at = doneAtMs(card);
   if (at === null) return <span className="faint">—</span>;
   return <>{ageCompact(Math.max(0, (nowMs - at) / 1000))}</>;

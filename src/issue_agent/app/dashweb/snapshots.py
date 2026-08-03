@@ -1126,15 +1126,27 @@ def _human_action(
     ]
     if prompt_times:
         return "awaiting-reply", max(prompt_times)
-    # Journal-truth fallback: the schema-v2 GitHub enrichment strips PR labels
-    # (title/url only), so a PR-level escalation or block was invisible to the
-    # arms above — the row read "escalated" (journal) while the work clock ran
-    # to NOW (keifu PRs #173/#177, 2026-08-02). The journal is authority; an
-    # escalation/block it records and never clears freezes the clock even when
-    # no GitHub label view carries it.
+    # Journal-truth fallback for entities whose LIVE label view is absent:
+    # before the PR enrichment carried labels, a PR-level escalation or block
+    # was invisible to the arms above — the row read "escalated" (journal)
+    # while the work clock ran to NOW (keifu PRs #173/#177, 2026-08-02). The
+    # fallback must NOT outlive a live view that contradicts it: the journal
+    # records only the harness's OWN writes, so an operator clearing
+    # ai-blocked with a plain gh write left the fallback holding the row
+    # "awaiting-reply" forever, freezing both clocks while paid legs ran
+    # (keifu #142/#181, 2026-08-03). GitHub is authority for labels; the
+    # journal is a witness for windows where GitHub wasn't fetched.
     journal_kind, journal_at = _journal_attention_at(row)
     if journal_kind is not None and journal_at is not None:
-        return journal_kind, journal_at
+        views = [v for v in (gh_issue, gh_pr) if v is not None]
+        live_labels_everywhere = bool(views) and all(
+            "labels" in v for v in views
+        )
+        contradicted = live_labels_everywhere and not (
+            (attention | {"ai-blocked"}) & (issue_labels | pr_labels)
+        )
+        if not contradicted:
+            return journal_kind, journal_at
     if (
         gh_pr
         and str(gh_pr.get("state") or "").upper() == "OPEN"
@@ -1309,6 +1321,10 @@ def issue_card(
         "working_s": round(working) if working is not None else None,
         "idle_s": round(idle) if idle is not None else None,
         "idle_active": idle_active,
+        # A paid leg is executing RIGHT NOW. The client tick predicate needs
+        # this directly: human_action alone must not dead-stop both clocks
+        # while a leg is visibly spending (keifu #142/#181, 2026-08-03).
+        "leg_running": bool(row.running) and not row.done,
         "human_action": human_action,
         "human_wait_since_ts": iso(human_wait_since),
         "human_wait_s": round(human_wait_s) if human_wait_s is not None else None,
@@ -1903,6 +1919,10 @@ def issue_detail(
         "working_s": round(working) if working is not None else None,
         "idle_s": round(idle) if idle is not None else None,
         "idle_active": idle_active,
+        # A paid leg is executing RIGHT NOW. The client tick predicate needs
+        # this directly: human_action alone must not dead-stop both clocks
+        # while a leg is visibly spending (keifu #142/#181, 2026-08-03).
+        "leg_running": bool(row.running) and not row.done,
         "steps": detailed_steps(row),
         "events": list(row.events),
         "warnings": [],

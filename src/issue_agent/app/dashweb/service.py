@@ -1046,6 +1046,12 @@ _PR_ENRICHMENT_FIELDS = (
     # The chip's CI colour: ghdata already fetches the rollup, and without it
     # here every v2 card rendered pr_ci_state=None while CI was visibly red.
     "statusCheckRollup",
+    # Labels feed `_human_action`'s attention/ai-blocked arms. Without them
+    # the journal fallback was the ONLY block signal for PRs — and it is
+    # sticky: an operator clearing ai-blocked with a plain gh write (never
+    # journalled) left the fold believing a human owned the row forever,
+    # freezing both clocks while paid legs ran (keifu #142/#181, 2026-08-03).
+    "labels",
 )
 # `body` and `createdAt` are presentational fields the projection does not
 # carry: the backlog drill-down renders the issue text, and its age column

@@ -26,6 +26,7 @@ const base: IssueCard = {
   working_s: 45,
   idle_s: 555,
   idle_active: true,
+  leg_running: false,
   projected_eta_s: 900,
   models: ["gpt-5.6-terra"],
   model_badges: [{ model: "gpt-5.6-terra", effort: "medium" }],
@@ -86,6 +87,7 @@ describe("board explainability", () => {
             stage: "escalated", done: false, prs: [], pull_requests: [],
             cost_usd: 1, elapsed_s: 600, working_s: 45, idle_s: 555,
             idle_active: true, steps: [], events: [], warnings: [],
+            leg_running: false,
           }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         ),
@@ -115,6 +117,7 @@ describe("board explainability", () => {
             stage: "escalated", done: false, prs: [], pull_requests: [],
             cost_usd: 1, elapsed_s: 600, working_s: 45, idle_s: 555,
             idle_active: true, steps: [], events: [], warnings: [],
+            leg_running: false,
           }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         ),
@@ -168,7 +171,10 @@ describe("board explainability", () => {
 
   it("keeps ticking the work clock for an issue the harness still owns", () => {
     const stale = Date.now() - 600_000;
-    board(polled([{ ...base, stage: "resolving", idle_active: false }], stale));
+    board(polled(
+      [{ ...base, stage: "resolving", idle_active: false, leg_running: true }],
+      stale,
+    ));
 
     // The shared 1 Hz clock may lag the anchor by a tick, so allow the second.
     expect(workClock()).toHaveTextContent(/work 10:4\d/);
@@ -205,6 +211,7 @@ describe("board explainability", () => {
             working_s: 45,
             idle_s: 555,
             idle_active: true,
+            leg_running: false,
             steps: [
               {
                 idx: 0,

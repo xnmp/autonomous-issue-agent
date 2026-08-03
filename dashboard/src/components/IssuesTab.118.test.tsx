@@ -28,6 +28,7 @@ const card: IssueCard = {
   working_s: 45,
   idle_s: 15,
   idle_active: false,
+  leg_running: false,
   projected_eta_s: 60,
   models: ["gpt-5.6-terra"],
   model_badges: [{ model: "gpt-5.6-terra", effort: "medium" }],
@@ -42,7 +43,8 @@ function polled(data: IssuesPayload): Polled<IssuesPayload> {
     data,
     error: null,
     loading: false,
-    updatedAt: 0,
+    // A real receive instant: every live duration is measured from it.
+    updatedAt: Date.now(),
     refresh: vi.fn(),
   };
 }

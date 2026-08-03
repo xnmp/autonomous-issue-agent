@@ -150,58 +150,6 @@ export function usePolled<T>(
   };
 }
 
-/* ------------------------------------------------------- live 1 s ticker */
-
-let tickListeners = new Set<() => void>();
-let tickTimer: number | null = null;
-let tickValue = Date.now();
-
-function subscribeTick(cb: () => void): () => void {
-  // The module-load snapshot goes stale whenever no interval is running:
-  // first subscriber after an idle stretch (or after fake timers replace the
-  // clock in tests) would otherwise render an age computed from import time.
-  if (tickListeners.size === 0) {
-    tickValue = Date.now();
-  }
-  tickListeners.add(cb);
-  if (tickTimer === null) {
-    tickTimer = window.setInterval(() => {
-      tickValue = Date.now();
-      tickListeners.forEach((l) => l());
-    }, 1000);
-  }
-  return () => {
-    tickListeners.delete(cb);
-    if (tickListeners.size === 0 && tickTimer !== null) {
-      window.clearInterval(tickTimer);
-      tickTimer = null;
-    }
-  };
-}
-
-/**
- * Shared 1 Hz clock — one interval for the whole app, however many elapsed
- * timers are on screen. Returns the current wall-clock ms.
- */
-export function useClock(): number {
-  return useSyncExternalStore(
-    subscribeTick,
-    () => tickValue,
-    () => tickValue,
-  );
-}
-
-/**
- * Server-computed `elapsed_s` ticked forward locally. `anchor` is the ms
- * timestamp at which the server value was received, so a slow poll never makes
- * the timer jump backwards by more than one refresh.
- */
-export function useLiveElapsed(
-  elapsedS: number | null | undefined,
-  anchorMs: number | null,
-): number | null {
-  const now = useClock();
-  if (elapsedS === null || elapsedS === undefined) return null;
-  if (anchorMs === null) return elapsedS;
-  return elapsedS + Math.max(0, (now - anchorMs) / 1000);
-}
+/* The 1 Hz ticker used to live here. It now lives in `lib/clock.ts` beside
+   the pure tick rules it feeds, so the whole app has one clock and one place
+   that decides which durations move. */

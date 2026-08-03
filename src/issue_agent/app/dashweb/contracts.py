@@ -210,6 +210,10 @@ class IssueCard(Contract):
     working_s: float | None
     idle_s: float | None
     idle_active: bool
+    # A paid leg is executing right now. The client tick predicate reads this
+    # directly: human_action alone must not dead-stop both clocks while a leg
+    # is visibly spending (keifu #142/#181, 2026-08-03).
+    leg_running: bool = False
     human_action: Literal["merge-ready", "awaiting-reply", "escalated"] | None = None
     human_wait_since_ts: str | None = None
     human_wait_s: float | None = None
@@ -321,6 +325,8 @@ class IssueDetailPayload(Warned):
     working_s: float | None
     idle_s: float | None
     idle_active: bool
+    # See IssueCard.leg_running.
+    leg_running: bool = False
     steps: list[IssueStep]
     events: list[dict[str, Any]]
 

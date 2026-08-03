@@ -25,6 +25,7 @@ const card: IssueCard = {
   working_s: 45,
   idle_s: 15,
   idle_active: false,
+  leg_running: false,
   projected_eta_s: 60,
   models: ["gpt-5.6-terra"],
   model_badges: [{ model: "gpt-5.6-terra", effort: "medium" }],

@@ -801,6 +801,11 @@
             ],
             "title": "Last Ts"
           },
+          "leg_running": {
+            "default": false,
+            "title": "Leg Running",
+            "type": "boolean"
+          },
           "merged_ts": {
             "anyOf": [
               {
@@ -1124,6 +1129,11 @@
           "issue": {
             "title": "Issue",
             "type": "integer"
+          },
+          "leg_running": {
+            "default": false,
+            "title": "Leg Running",
+            "type": "boolean"
           },
           "prs": {
             "items": {

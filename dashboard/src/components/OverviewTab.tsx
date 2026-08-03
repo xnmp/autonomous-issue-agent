@@ -1,5 +1,6 @@
 import { api } from "../api/client";
-import { usePolled, useClock } from "../api/hooks";
+import { usePolled } from "../api/hooks";
+import { useNow } from "../lib/clock";
 import type { HealthTrendDay, JournalEvent, OverviewPayload, RoleHealth } from "../api/types";
 import {
   HEALTH_LABEL,
@@ -329,7 +330,7 @@ function HealthTrend({ rows, loading }: { rows: HealthTrendDay[]; loading: boole
 function HealthCard({ health }: { health: RoleHealth }) {
   const h = roleHealth(health);
   const tone = HEALTH_TONE[h];
-  useClock(); // keeps the "last event Nm ago" honest without a re-fetch
+  useNow(); // keeps the "last event Nm ago" honest without a re-fetch
   return (
     <div className={`hcard tone-border-${tone}`}>
       <div className="hcard-hd">
