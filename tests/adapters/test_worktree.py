@@ -321,6 +321,45 @@ def test_build_gate_context_exists_at_base_uses_cat_file():
     assert ctx.exists_at_base("tests/test_new.py") is False  # default rc≠0 path
 
 
+# ── published subjects (base..origin/<branch>) — keifu #182 ──
+# The commit-log gate must not re-police history that is already on the remote
+# PR branch (GitHub's own Update-branch merge commit lives there). The builder
+# reads it from the LOCAL remote-tracking ref only — never a fetch, because this
+# context is rebuilt on every Bash call — and every failure mode falls back to
+# the stricter, pre-exemption behaviour of an empty tuple.
+_PUBLISHED_LOG = "log origin/dev..refs/remotes/origin/fix/5-x"
+
+
+def test_build_gate_context_reads_published_subjects_from_the_remote_branch():
+    fg = _builder_git()
+    fg.table[_PUBLISHED_LOG] = GitResult(
+        0, "red: t\nMerge branch 'dev' into fix/5-x\n"
+    )
+    ctx = build_gate_context("/wt", base_branch="dev", git=fg)
+    assert ctx.published_subjects == ("red: t", "Merge branch 'dev' into fix/5-x")
+
+
+def test_build_gate_context_drops_published_subjects_when_the_remote_log_fails():
+    fg = _builder_git()
+    fg.table[_PUBLISHED_LOG] = GitResult(1, "fatal: bad revision")
+    ctx = build_gate_context("/wt", base_branch="dev", git=fg)
+    assert ctx.published_subjects == ()
+    assert ctx.branch_subjects == ("red: t", "green: impl")  # rest still built
+
+
+def test_build_gate_context_never_asks_for_published_subjects_on_a_detached_head():
+    # "HEAD" is the literal rev-parse answer on a detached HEAD (a conflicted
+    # rebase). `refs/remotes/origin/HEAD` is a REAL ref pointing at the default
+    # branch, so asking would hand the gate an unrelated branch's history as
+    # "published" and exempt it.
+    fg = _builder_git(branch="HEAD")
+    ctx = build_gate_context("/wt", base_branch="dev", git=fg)
+    assert ctx.published_subjects == ()
+    assert not any(
+        any("refs/remotes/origin/" in arg for arg in args) for args, _cwd in fg.calls
+    )
+
+
 def test_build_gate_context_wires_run_tests():
     ctx = build_gate_context("/wt", base_branch="dev", git=_builder_git(),
                              run_tests=lambda cmd: cmd == "pytest")

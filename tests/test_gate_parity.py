@@ -382,6 +382,69 @@ def _base_advanced_bad_branch_commit_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def _with_origin(repo: Path, tmp_path: Path) -> Path:
+    """Give `repo` a real bare `origin` carrying both branches, then advance the
+    BASE on the remote — the state in which GitHub offers "Update branch"."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(
+        ["git", "init", "-q", "--bare", str(origin)],
+        check=True, capture_output=True, text=True,
+    )
+    _git(repo, "remote", "add", "origin", str(origin))
+    _git(repo, "push", "-q", "origin", "dev", "fix/7-token")
+    _git(repo, "switch", "-q", "dev")
+    (repo / "CHANGELOG.md").write_text("# changelog\n")
+    _git(repo, "add", "CHANGELOG.md")
+    _git(repo, "commit", "-qm", "chore: base moves on")
+    _git(repo, "push", "-q", "origin", "dev")
+    _git(repo, "switch", "-q", "fix/7-token")
+    return origin
+
+
+UPDATE_BRANCH_SUBJECT = "Merge branch 'dev' into fix/7-token"
+
+
+def _published_merge_repo(tmp_path: Path) -> Path:
+    """keifu #182: GitHub's "Update branch" button writes an UNPREFIXED merge
+    commit onto the PR branch, and the publish broker then requires it as an
+    ancestor — so a gate that denied its subject deadlocked the PR against the
+    broker, with no move the agent could make. The merge is made on a CLONE and
+    pushed, exactly as GitHub does it, then fetched: the local branch holds a
+    subject it did not author and cannot rewrite."""
+    repo = compliant_pr_repo(tmp_path)
+    origin = _with_origin(repo, tmp_path)
+    clone = tmp_path / "clone"
+    subprocess.run(
+        ["git", "clone", "-q", "--branch", "fix/7-token", str(origin), str(clone)],
+        check=True, capture_output=True, text=True,
+    )
+    _git(clone, "config", "user.email", "t@t")
+    _git(clone, "config", "user.name", "t")
+    _git(clone, "config", "commit.gpgsign", "false")
+    _git(clone, "merge", "-q", "--no-ff", "-m", UPDATE_BRANCH_SUBJECT, "origin/dev")
+    _git(clone, "push", "-q", "origin", "fix/7-token")
+    _git(repo, "fetch", "-q", "origin")
+    _git(repo, "merge", "-q", "--ff-only", "refs/remotes/origin/fix/7-token")
+    (repo / "token.py").write_text("def token(): return 2\n")
+    _git(repo, "add", "token.py")
+    _git(repo, "commit", "-qm", "green: refine token")
+    return repo
+
+
+def _unpublished_merge_repo(tmp_path: Path) -> Path:
+    """The twin: the SAME unprefixed subject, authored locally and never pushed.
+    The exemption is "already published", not "looks like a merge" — without
+    this row the rule could degrade to skipping every merge subject."""
+    repo = compliant_pr_repo(tmp_path)
+    _with_origin(repo, tmp_path)
+    _git(repo, "merge", "-q", "--no-ff", "-m", UPDATE_BRANCH_SUBJECT,
+         "refs/remotes/origin/dev")
+    (repo / "token.py").write_text("def token(): return 2\n")
+    _git(repo, "add", "token.py")
+    _git(repo, "commit", "-qm", "green: refine token")
+    return repo
+
+
 def _non_image_evidence_repo(tmp_path: Path) -> Path:
     repo = compliant_pr_repo(tmp_path)
     (repo / "evidence").mkdir()
@@ -577,6 +640,14 @@ GOLDEN: tuple[Case, ...] = (
          reason_contains="allowed prefix"),
     Case("green_without_red", "commit", _no_red_repo, ["commit", "-m", "green: impl"], False,
          reason_contains="TDD ordering"),
+    # keifu #182: history already on origin/<branch> is exempt from the prefix
+    # rule; the same subject authored locally is not. Both stacks read the
+    # remote-tracking ref themselves, so this pair is what keeps the shell
+    # pool and the Python multiset in lockstep.
+    Case("published_merge_commit_exempt", "pr", _published_merge_repo,
+         _pr_argv(), True),
+    Case("unpublished_merge_commit_denied", "pr", _unpublished_merge_repo,
+         _pr_argv(), False, reason_contains="allowed prefix"),
 
     # ── test-command precedence (P1R-18). The operator's TEST_CMD must win, on
     #    BOTH stacks: the agent writes `.harness/test-cmd` under
@@ -731,6 +802,8 @@ def test_golden_covers_every_rule_family() -> None:
         "typecheck_fails": "project-commands",
         "no_project_commands_configured": "project-commands",
         "commit_bad_prefix": "commit-hygiene", "green_without_red": "commit-hygiene",
+        "published_merge_commit_exempt": "commit-hygiene",
+        "unpublished_merge_commit_denied": "commit-hygiene",
         "operator_test_cmd_wins": "test-cmd-precedence",
         "operator_tautological_test_cmd_blocks": "test-cmd-precedence",
         "marker_used_when_operator_has_none": "test-cmd-precedence",
@@ -751,11 +824,13 @@ def test_golden_covers_every_rule_family() -> None:
     for case in GOLDEN:
         by_family.setdefault(family_of[case.name], set()).add(case.expect_allowed)
     single_sided = {f for f, verdicts in by_family.items() if len(verdicts) < 2}
-    assert single_sided == {"commit-hygiene"}, (
+    # 'commit-hygiene' used to be the one accepted exception (DENY-only; its
+    # ALLOW direction was implicit in every other case's clean commit log). The
+    # published-history exemption (keifu #182) gave it an explicit ALLOW row,
+    # so the exception is gone and every family is now two-sided.
+    assert single_sided == set(), (
         "every rule family needs an ALLOW case and a DENY case (the anti-vacuity "
-        f"twin). Single-sided: {sorted(single_sided)}. 'commit-hygiene' is the one "
-        "accepted exception — its ALLOW direction is covered by every other "
-        "commit/pr case, all of which have clean commit logs."
+        f"twin). Single-sided: {sorted(single_sided)}."
     )
 
 

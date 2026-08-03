@@ -78,6 +78,9 @@ class GateContext:
     repository: str = ""                     # deployment repo (owner/name)
     branch: str = ""                         # current HEAD branch
     branch_subjects: tuple[str, ...] = ()    # commit subjects on branch since base
+    # Subjects already on the observed remote PR branch (base..origin/<branch>);
+    # published history the commit-log gate must not re-police (keifu #182).
+    published_subjects: tuple[str, ...] = ()
     base_resolvable: bool = True
     changed_files: tuple[str, ...] = ()      # diff vs base
     # Push-gate precondition, as a LAZY probe rather than a value (review
@@ -436,7 +439,9 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
             image_digests=ctx.image_digests,
         ),
         lambda: gate.check_required_test(ctx.branch, ctx.changed_files),
-        lambda: gate.check_commit_log(ctx.branch_subjects),
+        lambda: gate.check_commit_log(
+            ctx.branch_subjects, ctx.published_subjects
+        ),
         lambda: gate.check_no_evidence(ctx.changed_files),
         lambda: gate.check_no_harness_state(ctx.changed_files),
         lambda: gate.check_tests_immutable(ctx.changed_files, ctx.exists_at_base),
@@ -517,7 +522,9 @@ def _push_gate_for_branch(branch: str, ctx: GateContext) -> list[str]:
     # caller only ever reads `reasons[0]`, so returning one element changes
     # nothing observable. check-push.sh runs the same four in the same order.
     cheap_checks: tuple[Callable[[], gate.GateResult], ...] = (
-        lambda: gate.check_commit_log(ctx.branch_subjects),
+        lambda: gate.check_commit_log(
+            ctx.branch_subjects, ctx.published_subjects
+        ),
         lambda: gate.check_no_evidence(ctx.changed_files),
         lambda: gate.check_no_harness_state(ctx.changed_files),
         lambda: gate.check_tests_immutable(ctx.changed_files, ctx.exists_at_base),

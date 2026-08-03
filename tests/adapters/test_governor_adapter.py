@@ -282,6 +282,43 @@ def test_pr_web_blocked():
     assert not v.allowed and "--web" in v.reason
 
 
+def test_pr_gate_exempts_a_commit_already_published_on_the_remote_branch():
+    """keifu #182: GitHub's Update-branch merge commit carries no allowed
+    prefix, yet the publish broker requires it as an ancestor — the PR wedged
+    between the two. Both halves are asserted: without the published fact the
+    same branch is still denied, so the exemption is the wiring under test and
+    not a rule that stopped firing."""
+    update = "Merge branch 'dev' into fix/5-x"
+    base = GateContext(**{
+        **_good_pr_ctx().__dict__,
+        "branch_subjects": ("red: t", update, "green: impl"),
+    })
+
+    denied = evaluate_command(_good_pr_cmd(), base)
+    assert not denied.allowed and "allowed prefix" in denied.reason
+
+    exempt = GateContext(**{**base.__dict__, "published_subjects": (update,)})
+    assert evaluate_command(_good_pr_cmd(), exempt).allowed
+
+
+def test_push_gate_exempts_a_commit_already_published_on_the_remote_branch():
+    """The same fact must reach the PUSH gate: the agent has to push the
+    continuation commit before the broker can merge anything."""
+    update = "Merge branch 'dev' into fix/5-x"
+    probe, _ = _probe(OpenPrLookup.OPEN)
+    subjects = ("red: t", update)
+
+    denied = evaluate_command("git push", _push_ctx(probe, branch_subjects=subjects))
+    assert not denied.allowed and "allowed prefix" in denied.reason
+
+    probe, _ = _probe(OpenPrLookup.OPEN)
+    allowed = evaluate_command(
+        "git push",
+        _push_ctx(probe, branch_subjects=subjects, published_subjects=(update,)),
+    )
+    assert allowed.allowed
+
+
 def test_self_authored_marker_fields_cannot_enter_gate_context():
     names = set(GateContext.__dataclass_fields__)
     assert names.isdisjoint(

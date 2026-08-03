@@ -211,9 +211,40 @@ prc_check_tests() {
 # therefore also fed it the base branch's own commits (review M6). See the header.
 prc_check_commit_log() {
   local seen_red=0 green_before_red=0 s log_subjects phase
-  log_subjects=$(git log "$log_range" --reverse --format='%s' 2>/dev/null || true)
+  # Commits already on the observed remote PR branch are published history the
+  # agent cannot rewrite (the broker requires them as ancestors), so their
+  # subjects are exempt from the prefix rule — GitHub's own "Update branch"
+  # merge commit ("Merge branch '<base>' into <branch>") wedged keifu PR #182
+  # (2026-08-03) between the broker and this gate. A red: among them still
+  # counts for ordering; each published subject exempts ONE occurrence (twin
+  # of domain/gate.py:check_commit_log — keep the two in lockstep).
+  local branch published_ref="" published_subjects=""
+  branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+  if [ -n "$branch" ] && [ "$branch" != "HEAD" ] \
+    && git rev-parse -q --verify "refs/remotes/origin/$branch" >/dev/null 2>&1; then
+    published_ref="refs/remotes/origin/$branch"
+    published_subjects=$(git log "${log_range%%..*}..$published_ref" --reverse --format='%s' 2>/dev/null || true)
+  fi
+  # Plain array, not declare -A: macOS deployments may run bash 3.2.
+  local -a published_pool=()
   while IFS= read -r s; do
     [ -n "$s" ] || continue
+    published_pool+=("$s")
+    if [ "$(commit_phase "$s")" = red ]; then seen_red=1; fi
+  done <<< "$published_subjects"
+  log_subjects=$(git log "$log_range" --reverse --format='%s' 2>/dev/null || true)
+  local matched i
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    matched=0
+    for i in "${!published_pool[@]}"; do
+      if [ "${published_pool[$i]}" = "$s" ]; then
+        unset "published_pool[$i]"
+        matched=1
+        break
+      fi
+    done
+    if [ "$matched" = 1 ]; then continue; fi
     [[ "$s" =~ $PR_VALID_PREFIX_RE ]] \
       || fail "commit '${s:0:60}' lacks an allowed prefix (plan|red|green|evidence|docs|chore|refactor|test|fix|feat:, bare or scoped e.g. test(red):)"
     phase="$(commit_phase "$s")"

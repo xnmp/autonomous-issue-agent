@@ -299,6 +299,65 @@ out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-pr.sh" pr 
   && ok "PR gate catches green-without-red" || no "PR gate catches green-without-red" "rc=$rc out=${out:0:160}"
 rm -rf "$d"
 
+echo "== published history is exempt from the prefix rule (keifu #182) =="
+# GitHub's "Update branch" button writes an UNPREFIXED merge commit onto the PR
+# branch. The publish broker then requires it as an ancestor, so a gate that
+# denied its subject wedged the PR (keifu #182, 2026-08-03) with no move the
+# agent could make. A subject already on origin/<branch> is published history
+# outside the agent's unilateral control and is skipped — but ONLY there.
+#
+# Fixture: setup_pr_repo + a real bare `origin` both branches are pushed to, and
+# a base that has since advanced (which is what makes an update-branch merge a
+# merge at all). Echoes the worktree dir; origin lives at <dir>.origin.
+setup_published_repo() {
+  local d; d=$(setup_pr_repo)
+  git init -q --bare "$d.origin"
+  (
+    cd "$d"
+    git remote add origin "$d.origin"
+    git push -q origin dev fix/7-token
+    git switch -q dev
+    echo changelog > CHANGELOG.md
+    git add CHANGELOG.md
+    git -c core.hooksPath=/dev/null commit -qm "chore: base moves on"
+    git push -q origin dev
+    git switch -q fix/7-token
+  )
+  echo "$d"
+}
+
+# (a) the merge commit is created on the REMOTE (a clone standing in for
+#     GitHub's button) and fetched back → the PR gate passes.
+d=$(setup_published_repo)
+git clone -q --branch fix/7-token "$d.origin" "$d.clone"
+( cd "$d.clone"
+  git config user.email t@t; git config user.name t; git config commit.gpgsign false
+  git -c core.hooksPath=/dev/null merge -q --no-ff -m "Merge branch 'dev' into fix/7-token" origin/dev
+  git push -q origin fix/7-token )
+( cd "$d"
+  git fetch -q origin
+  git merge -q --ff-only refs/remotes/origin/fix/7-token
+  echo "def token2(): return 2" >> token.py
+  git add token.py
+  git -c core.hooksPath=/dev/null commit -qm "green: refine token" )
+out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] && ok "published update-branch merge is exempt" || no "published update-branch merge is exempt" "rc=$rc out=${out:0:200}"
+rm -rf "$d" "$d.origin" "$d.clone"
+
+# (b) twin: the SAME unprefixed subject, made locally and never pushed → denied.
+#     Without this the exemption could be "skip every merge commit", which is
+#     the rule the incident did NOT ask for.
+d=$(setup_published_repo)
+( cd "$d"
+  git -c core.hooksPath=/dev/null merge -q --no-ff -m "Merge branch 'dev' into fix/7-token" refs/remotes/origin/dev
+  echo "def token2(): return 2" >> token.py
+  git add token.py
+  git -c core.hooksPath=/dev/null commit -qm "green: refine token" )
+out=$( cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'lacks an allowed prefix'; } \
+  && ok "unpublished merge commit still blocked" || no "unpublished merge commit still blocked" "rc=$rc out=${out:0:200}"
+rm -rf "$d" "$d.origin"
+
 echo "== check-pr.sh §0b (PR base must equal BASE_BRANCH) =="
 # No --base at all → blocked (gh would default to the repo's default branch).
 d=$(setup_pr_repo)

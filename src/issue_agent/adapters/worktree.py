@@ -731,12 +731,34 @@ def build_gate_context(
     base_resolvable = baseref is not None
 
     subjects: tuple[str, ...] = ()
+    published_subjects: tuple[str, ...] = ()
     changed: tuple[str, ...] = ()
     if baseref:
         log = git(["log", f"{baseref}..HEAD", "--reverse", "--format=%s"], cwd)
         subjects = tuple(s for s in log.out.splitlines() if s)
         diff = git(["diff", "--name-only", f"{baseref}...HEAD"], cwd)
         changed = tuple(f for f in diff.out.splitlines() if f)
+        # Commits already on the observed remote PR branch are published
+        # history the agent cannot rewrite (the broker requires them as
+        # ancestors), so the commit-log gate must not re-police their
+        # subjects — GitHub's Update-branch merge commit wedged keifu PR
+        # #182 (2026-08-03). Local origin/<branch> only, never a fetch:
+        # this context is built on every Bash call. A stale or absent ref
+        # fails toward the stricter, pre-exemption behavior.
+        if branch and branch != "HEAD":
+            plog = git(
+                [
+                    "log",
+                    f"{baseref}..refs/remotes/origin/{branch}",
+                    "--reverse",
+                    "--format=%s",
+                ],
+                cwd,
+            )
+            if plog.code == 0:
+                published_subjects = tuple(
+                    s for s in plog.out.splitlines() if s
+                )
 
     markers = HarnessMarkers(cwd)
     screenshots_read: tuple[str, ...] = ()
@@ -1017,6 +1039,7 @@ def build_gate_context(
         repository=repo,
         branch=branch,
         branch_subjects=subjects,
+        published_subjects=published_subjects,
         base_resolvable=base_resolvable,
         changed_files=changed,
         open_pr=open_pr,

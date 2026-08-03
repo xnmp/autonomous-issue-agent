@@ -159,6 +159,69 @@ def test_commit_log_rejects_bad_prefix():
     assert not check_commit_log(["wip: stuff"]).ok
 
 
+# ── published history is exempt from the prefix rule (keifu #182) ─────────────
+# GitHub's "Update branch" button writes an UNPREFIXED merge commit onto the PR
+# branch. The publish broker then requires it as an ancestor, so a gate that
+# denied its subject deadlocked the PR against the broker with no move the agent
+# could make. A subject already on `base..origin/<branch>` is published history
+# outside the agent's unilateral control, so the prefix rule skips it — once per
+# published occurrence, and never at the cost of the TDD ordering rule.
+UPDATE_BRANCH = "Merge branch 'chong-dev' into fix/130-caps-lock"
+
+
+def test_commit_log_allows_a_subject_already_published_on_the_remote_branch():
+    assert check_commit_log(
+        ["red: t", UPDATE_BRANCH, "green: impl"], published=[UPDATE_BRANCH]
+    ).ok
+
+
+def test_commit_log_exempts_each_published_subject_only_once():
+    # Two local copies of a subject published once: the second is un-exempt and
+    # denies, so re-using a published subject verbatim smuggles at most one.
+    assert not check_commit_log(
+        ["red: t", UPDATE_BRANCH, UPDATE_BRANCH], published=[UPDATE_BRANCH]
+    ).ok
+    assert check_commit_log(
+        ["red: t", UPDATE_BRANCH, UPDATE_BRANCH],
+        published=[UPDATE_BRANCH, UPDATE_BRANCH],
+    ).ok
+
+
+def test_published_red_keeps_a_continuation_branch_green_legal():
+    # A continuation branch whose red: is already pushed: the local log may or
+    # may not still show it, and the green must be legal either way.
+    assert check_commit_log(["green: pass"], published=["red: failing test"]).ok
+    assert check_commit_log(
+        ["red: failing test", "green: pass"], published=["red: failing test"]
+    ).ok
+
+
+def test_published_green_does_not_unlock_the_ordering_rule():
+    # Only a red: relaxes ordering. A published green must not, or a branch that
+    # ever pushed a green would be exempt from TDD ordering forever after.
+    assert not check_commit_log(["green: new"], published=["green: old"]).ok
+    assert not check_commit_log(
+        ["green: new"], published=["green: old", UPDATE_BRANCH]
+    ).ok
+
+
+def test_commit_log_with_empty_published_behaves_exactly_as_before():
+    assert check_commit_log(["plan: x", "red: y", "green: z"], published=()).ok
+    assert not check_commit_log(["plan: x", "green: y", "red: z"], published=()).ok
+    assert not check_commit_log(["wip: stuff"], published=()).ok
+    assert not check_commit_log([UPDATE_BRANCH]).ok  # default: no exemption
+
+
+def test_commit_log_tolerates_malformed_and_huge_inputs():
+    assert check_commit_log([], published=["", "red: t"]).ok
+    assert check_commit_log(["", "red: t", ""], published=["", ""]).ok
+    # An empty published subject exempts nothing — it must never match a real one.
+    assert not check_commit_log(["wip: stuff"], published=["", "", ""]).ok
+    huge = tuple(f"Merge branch 'dev' into fix/130 ({n})" for n in range(1000))
+    assert check_commit_log(huge, published=huge).ok
+    assert not check_commit_log(("wip: unpublished", *huge), published=huge).ok
+
+
 # ── PR base + body ──────────────────────────────────────────────────────────
 def test_pr_base_must_be_explicit_and_match():
     assert not check_pr_base("", "dev").ok

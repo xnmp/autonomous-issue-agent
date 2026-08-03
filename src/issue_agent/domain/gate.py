@@ -223,13 +223,37 @@ def check_commit_order(
     )
 
 
-def check_commit_log(subjects: Iterable[str]) -> GateResult:
+def check_commit_log(
+    subjects: Iterable[str], published: Iterable[str] = ()
+) -> GateResult:
     """Re-derived from the git LOG (closes the -F bypass): every subject has an
     allowed prefix AND no green: precedes the first red:. Port of
-    _pr_common.sh:prc_check_commit_log."""
+    _pr_common.sh:prc_check_commit_log.
+
+    `published` is the subjects already on the OBSERVED remote PR branch
+    (base..origin/<branch>). Those commits are outside the agent's unilateral
+    control — the publish broker or a human put them there — so the prefix rule
+    does not re-police them: GitHub's own "Update branch" merge commit
+    ("Merge branch 'chong-dev' into fix/130-…") deadlocked keifu PR #182
+    (2026-08-03) between the broker, which required it as an ancestor, and this
+    gate, which forbade publishing it. A red: among the published commits still
+    counts for TDD ordering (a continuation branch's greens stay legal), and
+    each published subject exempts only ONE occurrence — an agent re-using a
+    published subject verbatim can smuggle at most an unprefixed no-op subject,
+    never skip the ordering rule."""
+    remaining: dict[str, int] = {}
     seen_red = False
+    for s in published:
+        if not s:
+            continue
+        remaining[s] = remaining.get(s, 0) + 1
+        if is_red(s):
+            seen_red = True
     for s in subjects:
         if not s:
+            continue
+        if remaining.get(s, 0) > 0:
+            remaining[s] -= 1
             continue
         if not VALID_COMMIT_PREFIX.match(s):
             return deny(
