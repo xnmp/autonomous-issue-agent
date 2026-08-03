@@ -36,6 +36,7 @@ from ..domain.events import (
     DaemonStateChanged,
     DuplicatePrPrevented,
     EscalationRaised,
+    EventEnvelope,
     GithubUnavailable,
     HandoverWritten,
     InfraBreakerCleared,
@@ -47,6 +48,7 @@ from ..domain.events import (
     RecurrenceDetected,
     ReviewSkipped,
     RoutingEscalated,
+    SpendBlocked,
     StallDetected,
     TelemetryEvent,
     TelemetryWarning,
@@ -284,6 +286,16 @@ def _legacy_event_record(event: TelemetryEvent) -> tuple[str, dict[str, object]]
             "leg": payload.leg,
             "exit_reason": payload.exit_reason,
         }
+    if isinstance(payload, SpendBlocked):
+        return "spend_block", {
+            **common,
+            "scope": payload.scope,
+            "status": payload.status,
+            "amount_micros": payload.amount_micros,
+            "cap_micros": payload.cap_micros,
+            "currency": payload.currency,
+            "reason": payload.reason,
+        }
     if isinstance(payload, InfraPathEntered):
         return "infra_path", {
             **common,
@@ -339,6 +351,22 @@ def _legacy_event_record(event: TelemetryEvent) -> tuple[str, dict[str, object]]
     return "telemetry_warning", {
         **common,
         "warning": payload.event_type,
+    }
+
+
+def legacy_event_view(event: EventEnvelope) -> dict[str, object]:
+    """One schema-v2 envelope as the bounded legacy telemetry projection.
+
+    Live producers no longer write the v1 journal, but a few read-only
+    operator summaries intentionally retain its compact vocabulary. Keeping
+    this projection beside the exhaustive payload mapping prevents each reader
+    from inventing a partial second translation.
+    """
+    event_name, fields = _legacy_event_record(event)
+    return {
+        "ts": event.occurred_at.isoformat(),
+        "event": event_name,
+        **fields,
     }
 
 

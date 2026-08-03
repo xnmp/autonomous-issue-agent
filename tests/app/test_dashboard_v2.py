@@ -763,6 +763,52 @@ def test_v2_health_uses_scheduler_heartbeat_when_events_are_quiet(
     assert fix_health.last_ts == NOW
 
 
+def test_v2_health_rejects_future_heartbeat_timestamp(
+    tmp_path,
+) -> None:
+    state = tmp_path / "fix"
+    state.mkdir()
+    future = NOW + timedelta(seconds=1)
+    events = EventLog(
+        str(state / "events-v2.jsonl"),
+        Producer("deployment", "owner/repo", "fix", 100, "boot"),
+    )
+    old = NOW - timedelta(hours=2)
+    events.emit(
+        WorldObserved("issue", 7, "hash", {"state": "open"}),
+        correlation=Correlation(issue=7),
+        causation_time=old,
+    )
+    (state / "heartbeat.json").write_text(
+        json.dumps(
+            {
+                "pid": 100,
+                "state": "running",
+                "in_flight": [],
+                "updated_at": future.isoformat(),
+            }
+        )
+    )
+
+    deployment = collect(
+        "demo",
+        "owner/repo",
+        (
+            str(state / "journal.jsonl"),
+            str(tmp_path / "review" / "journal.jsonl"),
+            str(tmp_path / "steward" / "journal.jsonl"),
+        ),
+        str(tmp_path / "logs"),
+        str(tmp_path / "spend.jsonl"),
+        now_fn=lambda: NOW,
+        stale_after_s=60,
+    )
+
+    fix_health = next(item for item in deployment.health if item.role == "fix")
+    assert fix_health.stale is True
+    assert fix_health.last_ts == old
+
+
 def test_v2_emit_fold_issue_detail_preserves_run_drilldown_fields(
     tmp_path,
 ) -> None:

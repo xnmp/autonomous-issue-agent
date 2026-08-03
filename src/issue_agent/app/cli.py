@@ -32,9 +32,12 @@ import tempfile
 import time
 from collections import Counter
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from ..adapters.env_file import source_env_file
+from ..adapters.heartbeat import read_heartbeat_time
 from ..adapters.operator_effects import build_operator_effects
+from ..domain.dashboard import STALE_AFTER_S
 from ..domain.repository import canonical_repository, repository_equal
 from .codex_resolution import CodexResolutionReport, codex_resolution_report
 from .config import (
@@ -1539,6 +1542,33 @@ def _role_pids(name: str) -> dict[str, list[int]]:
     }
 
 
+def _fresh_role_heartbeats(
+    name: str,
+    *,
+    now_fn=None,
+    stale_after_s: float = STALE_AFTER_S,
+) -> dict[str, datetime]:
+    """Fresh scheduler heartbeats for roles hidden from this PID namespace.
+
+    Installed services and sandboxed operator shells may occupy different PID
+    namespaces, so an empty ``pgrep`` result is not evidence that a daemon is
+    stopped. The heartbeat is daemon-authored, moves once per scheduler tick,
+    and records terminal states; bounding its age keeps a dead daemon from
+    looking alive forever. This is the same liveness authority and ceiling the
+    dashboard uses.
+    """
+    now = (now_fn or (lambda: datetime.now(timezone.utc)))()
+    result: dict[str, datetime] = {}
+    for role, journal in zip(ROLES, journal_paths(name)):
+        stamp = read_heartbeat_time(
+            os.path.join(os.path.dirname(journal), "heartbeat.json")
+        )
+        age_s = (now - stamp).total_seconds() if stamp is not None else -1.0
+        if stamp is not None and 0 <= age_s <= stale_after_s:
+            result[role] = stamp
+    return result
+
+
 # ── subcommand implementations ────────────────────────────────────────────────
 # NixOS has no /bin/bash: resolve the interpreter from PATH once.
 _BASH = shutil.which("bash") or "/bin/bash"
@@ -1984,8 +2014,10 @@ def spend_status_lines(
     """
     from datetime import datetime, timezone
 
+    from ..adapters.event_log import read_event_log
     from ..adapters.journal import (
         events_within,
+        legacy_event_view,
         parse_ts,
         read_events,
         repeated_dispatch_warning,
@@ -1994,14 +2026,21 @@ def spend_status_lines(
     now_fn = now_fn or (lambda: datetime.now(timezone.utc))
     paths = [journal_file] if isinstance(journal_file, str) else list(journal_file)
     events: list[dict] = []
+    malformed_typed_lines = 0
     for path in paths:
-        events.extend(read_events(path))
+        typed_path = os.path.join(os.path.dirname(path), "events-v2.jsonl")
+        typed = read_event_log(typed_path)
+        if typed.source_files:
+            malformed_typed_lines += typed.malformed_lines
+            events.extend(legacy_event_view(event) for event in typed.events)
+        else:
+            events.extend(read_events(path))
     # Global order across files. A missing/garbled `ts` sorts first (never
     # corrupts the ordering of the events after it) rather than raising —
     # readers tolerating garbage is the module's own contract (journal.py).
     events.sort(key=lambda e: parse_ts(e.get("ts")) or datetime.min.replace(tzinfo=timezone.utc))
     spent = all_repositories_spent
-    if not events and not spent:
+    if not events and not spent and not malformed_typed_lines:
         return []
 
     lines = ["", _c("36", "── spend & health ──")]
@@ -2034,6 +2073,10 @@ def spend_status_lines(
             )
 
     warnings: list[str] = []
+    if malformed_typed_lines:
+        warnings.append(
+            f"skipped {malformed_typed_lines} malformed schema-v2 event line(s)"
+        )
     hour = events_within(events, 3600, now_fn)
     loop = repeated_dispatch_warning(hour, 3600, 4)
     if loop:
@@ -2066,12 +2109,18 @@ def cmd_status(args) -> int:
         warn(f"config/repos/{name}.env does not match this checkout — showing it anyway (status is read-only):")
         warn(f"  {mismatch}")
     roles = _role_pids(name)
+    heartbeats = _fresh_role_heartbeats(name)
     launchers = _launcher_pids(name)
     print(_c("36", f"▸ status for '{name}'" + (f"  ({repo})" if repo else "")))
     print(f"  launcher (point-at.sh): {'running ' + str(launchers) if launchers else 'stopped'}")
     for role in ROLES:
         pids = roles[role]
-        state = _c("32", "running") + f" {pids}" if pids else _c("33", "stopped")
+        if pids:
+            state = _c("32", "running") + f" {pids}"
+        elif role in heartbeats:
+            state = _c("32", "running") + " (fresh heartbeat; PID not visible)"
+        else:
+            state = _c("33", "stopped")
         print(f"  {role:8s}: {state}")
     logs = log_dir()
     for role in ROLES:

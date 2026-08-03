@@ -821,6 +821,129 @@ def test_status_merge_anti_vacuity_single_populated_journal_unchanged(tmp_path):
     assert out_single != []  # sanity: the fixture actually produced output
 
 
+def test_status_prefers_live_v2_runs_over_retired_legacy_journal(tmp_path):
+    from issue_agent.adapters.event_log import EventLog
+    from issue_agent.domain.events import (
+        AgentRunCompleted,
+        Correlation,
+        Producer,
+    )
+
+    state = tmp_path / "fix"
+    state.mkdir()
+    legacy = state / "journal.jsonl"
+    _write_jsonl(
+        str(legacy),
+        json.dumps({
+            "ts": "2026-07-24T10:00:00+00:00",
+            "event": "agent_run",
+            "kind": "RESOLVE",
+            "number": 1,
+            "cost_usd": 99.0,
+            "status": "old",
+        }),
+    )
+    EventLog(
+        str(state / "events-v2.jsonl"),
+        Producer("deployment", "owner/repo", "fix", 100, "boot"),
+    ).emit(
+        AgentRunCompleted(
+            "ok",
+            False,
+            None,
+            1_000,
+            "model",
+            "codex",
+            500_000,
+            "USD",
+            "configured_rate_card",
+            None,
+            None,
+            "REBASE",
+            {"number": 7},
+        ),
+        correlation=Correlation(issue=7),
+    )
+
+    output = "\n".join(
+        cli.spend_status_lines(
+            str(legacy),
+            now_fn=lambda: datetime.now(timezone.utc),
+            all_repositories_spent=0.5,
+        )
+    )
+
+    assert "REBASE" in output and "#7" in output and "$  0.50" in output
+    assert "RESOLVE" not in output and "$ 99.00" not in output
+
+
+def test_status_v2_summary_reports_spend_blocks_and_rotated_runs(tmp_path):
+    from issue_agent.adapters.event_log import EventLog
+    from issue_agent.domain.events import (
+        AgentRunCompleted,
+        Correlation,
+        Producer,
+        SpendBlocked,
+    )
+
+    state = tmp_path / "fix"
+    state.mkdir()
+    events = EventLog(
+        str(state / "events-v2.jsonl"),
+        Producer("deployment", "owner/repo", "fix", 100, "boot"),
+        max_bytes=1,
+    )
+    events.emit(
+        AgentRunCompleted(
+            "ok", False, None, 1_000, "model", "codex", 250_000, "USD",
+            "configured_rate_card", None, None, "REVIEW", {"number": 9},
+        ),
+        correlation=Correlation(pr=9),
+    )
+    events.emit(
+        SpendBlocked("issue", "exhausted", 2_000_000, 1_000_000, "USD", "cap"),
+        correlation=Correlation(issue=9),
+    )
+
+    output = "\n".join(
+        cli.spend_status_lines(
+            str(state / "journal.jsonl"),
+            now_fn=lambda: datetime.now(timezone.utc),
+            all_repositories_spent=0.25,
+        )
+    )
+
+    assert "REVIEW" in output and "#9" in output
+    assert "1 spend block(s) today (scope: issue)" in output
+
+
+def test_status_v2_summary_surfaces_all_malformed_typed_history(tmp_path):
+    state = tmp_path / "fix"
+    state.mkdir()
+    (state / "events-v2.jsonl").write_text("not json\n{truncated")
+    _write_jsonl(
+        str(state / "journal.jsonl"),
+        json.dumps({
+            "ts": "2026-07-24T10:00:00+00:00",
+            "event": "agent_run",
+            "kind": "RESOLVE",
+            "number": 1,
+            "cost_usd": 99.0,
+            "status": "old",
+        }),
+    )
+
+    output = "\n".join(
+        cli.spend_status_lines(
+            str(state / "journal.jsonl"),
+            now_fn=lambda: datetime.now(timezone.utc),
+        )
+    )
+
+    assert "skipped 2 malformed schema-v2 event line(s)" in output
+    assert "RESOLVE" not in output and "$ 99.00" not in output
+
+
 def test_status_merge_agent_run_start_does_not_appear_in_last_runs(tmp_path):
     """The journal now also carries `agent_run_start` events (wave A's
     pre-await receipt). The merged 'last runs' listing must only show settled
@@ -1093,6 +1216,90 @@ def test_role_pid_discovery_is_scoped_to_requested_deployment(
         "review": [202],
         "steward": [301],
     }
+
+
+def test_fresh_role_heartbeats_are_bounded_and_ignore_terminal_state(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime(2026, 8, 3, 22, 30, tzinfo=timezone.utc)
+    state_dirs = [tmp_path / role for role in cli.ROLES]
+    for state_dir in state_dirs:
+        state_dir.mkdir()
+    (state_dirs[0] / "heartbeat.json").write_text(
+        json.dumps({
+            "state": "running",
+            "updated_at": (now - timedelta(seconds=10)).isoformat(),
+        })
+    )
+    (state_dirs[1] / "heartbeat.json").write_text(
+        json.dumps({
+            "state": "running",
+            "updated_at": (now - timedelta(seconds=31)).isoformat(),
+        })
+    )
+    (state_dirs[2] / "heartbeat.json").write_text(
+        json.dumps({
+            "state": "running",
+            "updated_at": (now + timedelta(seconds=1)).isoformat(),
+        })
+    )
+    monkeypatch.setattr(
+        cli,
+        "journal_paths",
+        lambda _name: [str(path / "journal.jsonl") for path in state_dirs],
+    )
+
+    assert cli._fresh_role_heartbeats(
+        "app", now_fn=lambda: now, stale_after_s=30
+    ) == {"fix": now - timedelta(seconds=10)}
+
+    (state_dirs[2] / "heartbeat.json").write_text(
+        json.dumps({"state": "stopped", "updated_at": now.isoformat()})
+    )
+    assert "steward" not in cli._fresh_role_heartbeats(
+        "app", now_fn=lambda: now, stale_after_s=30
+    )
+
+
+def test_cmd_status_reports_heartbeat_when_pid_namespace_hides_daemon(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    _prep_mismatch_overlay(tmp_path, monkeypatch)
+    heartbeat = datetime(2026, 8, 3, 22, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(
+        cli,
+        "_role_pids",
+        lambda _name: {role: [] for role in cli.ROLES},
+    )
+    monkeypatch.setattr(cli, "_launcher_pids", lambda _name: [])
+    monkeypatch.setattr(
+        cli,
+        "_fresh_role_heartbeats",
+        lambda _name: {"fix": heartbeat, "review": heartbeat},
+    )
+    monkeypatch.setattr(cli, "log_dir", lambda: str(tmp_path / "logs"))
+    monkeypatch.setattr(
+        cli,
+        "interventions_status_line",
+        lambda _name, _repo: "  interventions: 0",
+    )
+
+    rc = cli.cmd_status(
+        argparse.Namespace(
+            repo="acme/app", target_dir="/srv/acme-app", name="app", lines=5
+        )
+    )
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "fix     : running (fresh heartbeat; PID not visible)" in output
+    assert "review  : running (fresh heartbeat; PID not visible)" in output
+    assert "steward : stopped" in output
 
 
 def test_launcher_pid_discovery_uses_exact_deployment_argv_token(

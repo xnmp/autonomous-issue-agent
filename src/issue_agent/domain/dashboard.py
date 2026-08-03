@@ -472,8 +472,12 @@ def _v2_health(
         key=lambda event: event.order_key,
     )
     last_event_at = ordered[-1].occurred_at if ordered else None
+    # A timestamp from the future is not liveness evidence. Clock rollback or
+    # one corrupt write must not keep a dead daemon healthy indefinitely.
     candidates = tuple(
-        stamp for stamp in (last_event_at, heartbeat_at) if stamp is not None
+        stamp
+        for stamp in (last_event_at, heartbeat_at)
+        if stamp is not None and (now - stamp).total_seconds() >= 0
     )
     last = max(candidates) if candidates else None
     daemon_states = tuple(
