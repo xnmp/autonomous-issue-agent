@@ -35,6 +35,10 @@ PRIORITY_LABELS = ("P1", "P2", "P3")
 _AGENT_KINDS = frozenset(kind.name for kind in AgentKind)
 _DISPATCH_AGENT_KINDS = _AGENT_KINDS - {"ROUTE"}
 _PR_AGENT_KINDS = dash.REVIEW_KINDS | dash.REPAIR_KINDS | {"PR_RESUME"}
+# Legs the steward runs before an issue is admitted to the fix pipeline. An
+# issue can be triaged and then wait hours in the backlog for `ai-ready`, and
+# that wait belongs to the operator's queue, not to the pipeline's clock.
+_PRE_ADMISSION_KINDS = dash.STEWARD_KINDS | {"GROOM"}
 
 # Compact-row text budget: one line, bounded, for prose the harness did not
 # author (agent summaries, escalation comments, operator input).
@@ -604,8 +608,15 @@ def _suspension_partition(
     row: dash.IssueRow,
     max_seconds: float,
     idle_intervals: list[tuple[datetime, datetime]] | None = None,
+    window: tuple[datetime, datetime] | None = None,
 ) -> tuple[float, float]:
-    """Valid suspension corrections, counted once across role detectors."""
+    """Valid suspension corrections, counted once across role detectors.
+
+    `window` bounds which part of a suspension can correct anything: only the
+    portion inside the measured span shortened that span. A correction is
+    validated against `max_seconds` as reported, before clipping, so a
+    malformed duration cannot be rescued by falling partly inside the window.
+    """
     intervals: list[tuple[datetime, datetime, float]] = []
     identified: list[tuple[float, float, datetime, datetime]] = []
     idle = idle_intervals or []
@@ -633,6 +644,12 @@ def _suspension_partition(
             ended_at = started_at + timedelta(seconds=seconds)
         except OverflowError:
             continue
+        if window is not None:
+            began, finished = max(started_at, window[0]), min(ended_at, window[1])
+            if began >= finished:
+                continue
+            started_at, ended_at = began, finished
+            seconds = (finished - began).total_seconds()
         if math.isfinite(clock_offset):
             identified.append((clock_offset, seconds, started_at, ended_at))
         else:
@@ -665,19 +682,32 @@ def _union_intervals(
     return merged
 
 
-def _leg_intervals(
+def _clip_intervals(
+    intervals: list[tuple[datetime, datetime]],
+    begin: datetime,
+    finish: datetime,
+) -> list[tuple[datetime, datetime]]:
+    clipped = [(max(b, begin), min(f, finish)) for b, f in intervals]
+    return [iv for iv in clipped if iv[0] < iv[1]]
+
+
+def _total_seconds(intervals: list[tuple[datetime, datetime]]) -> float:
+    return sum(max(0.0, (f - b).total_seconds()) for b, f in intervals)
+
+
+def _leg_spans(
     row: dash.IssueRow,
     start: datetime,
     end: datetime,
-) -> list[tuple[datetime, datetime]]:
-    """When the harness was actually inside a task, as a disjoint union.
+) -> list[tuple[str, datetime, datetime]]:
+    """Every leg's occupied window, kind-tagged, clamped to [start, end].
 
     A settled leg's journal stamp is its settlement; its runtime is the
     reported duration walked back from there. A leg running right now extends
-    to `end`. Everything is clamped to the issue's [start, end] window so a
-    malformed duration cannot mint work time outside the issue's life.
+    to `end`. The clamp keeps a malformed duration from minting work time
+    outside the issue's life.
     """
-    intervals: list[tuple[datetime, datetime]] = []
+    spans: list[tuple[str, datetime, datetime]] = []
     for leg in row.legs:
         if leg.ts is None:
             continue
@@ -688,12 +718,31 @@ def _leg_intervals(
             begin = leg.ts - timedelta(seconds=seconds)
         except OverflowError:
             begin = start
-        intervals.append((max(begin, start), min(leg.ts, end)))
+        spans.append((leg.kind.upper(), max(begin, start), min(leg.ts, end)))
     for leg in row.running:
         if leg.ts is None:
             continue
-        intervals.append((max(leg.ts, start), end))
-    return _union_intervals([iv for iv in intervals if iv[0] < iv[1]])
+        spans.append((leg.kind.upper(), max(leg.ts, start), end))
+    return [span for span in spans if span[1] < span[2]]
+
+
+def _leg_intervals(
+    row: dash.IssueRow,
+    start: datetime,
+    end: datetime,
+) -> list[tuple[datetime, datetime]]:
+    """When the harness was actually inside a task, as a disjoint union."""
+    return _union_intervals([(b, f) for _, b, f in _leg_spans(row, start, end)])
+
+
+def _pipeline_anchor(
+    spans: list[tuple[str, datetime, datetime]],
+) -> datetime | None:
+    """Where the pipeline clock starts: the first non-steward leg."""
+    return min(
+        (b for kind, b, _ in spans if kind not in _PRE_ADMISSION_KINDS),
+        default=None,
+    )
 
 
 def _duration_breakdown(
@@ -703,25 +752,40 @@ def _duration_breakdown(
 ) -> tuple[float | None, float | None, float | None, bool]:
     """Working time is time spent inside tasks — the same durations the
     drill-down lists, so the per-task times sum (modulo overlap and clamping)
-    to the card's work clock. Everything else the issue lived through —
+    to the card's work clock. Everything else the pipeline lived through —
     waiting on CI, on a review slot, on a dependency, on a human — is idle.
     The work clock ticks only while a leg is actually running (#34 sat
     "awaiting merge" with a ticking work clock and 6h of invented work).
+
+    The wall clock anchors at the first fix-pipeline leg, not the issue's first
+    event. Pre-admission legs contribute their own runtime and nothing around
+    it: keifu #185 (2026-08-03) was triaged at 00:24 and admitted at 01:25, and
+    charged that backlog hour to idle the moment its resolve began. Queueing
+    for admission is not pipeline idleness.
     """
     if start is None:
         return None, None, None, False
-    wall_seconds = max(0.0, (end - start).total_seconds())
-    work_intervals = _leg_intervals(row, start, end)
+    spans = _leg_spans(row, start, end)
+    work_intervals = _union_intervals([(b, f) for _, b, f in spans])
+    raw_working = _total_seconds(work_intervals)
+    anchor = _pipeline_anchor(spans)
+    if anchor is None:
+        if spans:
+            # Triaged and sitting in the backlog: the pipeline clock has not
+            # started, so there is no span for idleness to live in.
+            return raw_working, raw_working, 0.0, False
+        # No legs at all: nothing to anchor on, so the issue's own window is
+        # the only measure available.
+        anchor = start
+    pre_seconds = _total_seconds(_clip_intervals(work_intervals, start, anchor))
+    wall_seconds = max(0.0, (end - anchor).total_seconds())
     suspended, suspended_while_working = _suspension_partition(
         row,
-        wall_seconds,
-        work_intervals,
+        max(0.0, (end - start).total_seconds()),
+        _clip_intervals(work_intervals, anchor, end),
+        window=(anchor, end),
     )
-    elapsed = max(0.0, wall_seconds - suspended)
-    raw_working = sum(
-        max(0.0, (finish - begin).total_seconds())
-        for begin, finish in work_intervals
-    )
+    elapsed = pre_seconds + max(0.0, wall_seconds - suspended)
     working = min(elapsed, max(0.0, raw_working - suspended_while_working))
     idle = max(0.0, elapsed - working)
     idle_active = not row.done and not row.running

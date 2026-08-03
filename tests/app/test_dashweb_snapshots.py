@@ -651,6 +651,127 @@ def test_issue_detail_uses_the_same_working_idle_partition_as_cards():
     assert detail["idle_active"] is True
 
 
+def test_backlog_dwell_before_admission_is_not_pipeline_idle():
+    # keifu #185 (2026-08-03): filed and triaged at 00:24, admitted and routed
+    # at 01:25. The card showed idle 1:00 the instant its resolve began. The
+    # clock anchors at the first fix-pipeline leg; the triage's own five
+    # minutes still count as work, the backlog hour around it counts as
+    # nothing.
+    events = [
+        {"ts": ts(hours=3), "event": "agent_run_start", "role": "steward",
+         "kind": "TRIAGE", "issue": 7, "number": 7, "dispatch": "t1"},
+        {"ts": ts(hours=2, minutes=55), "event": "agent_run", "role": "steward",
+         "kind": "TRIAGE", "issue": 7, "number": 7, "dispatch": "t1",
+         "cost_usd": 0.1, "status": "done", "exit_reason": "ok",
+         "duration_s": 300},
+        {"ts": ts(hours=2), "event": "agent_run_start", "role": "fix",
+         "kind": "ROUTE", "issue": 7, "number": 7, "dispatch": "d1"},
+        {"ts": ts(hours=1), "event": "agent_run", "role": "fix",
+         "kind": "ROUTE", "issue": 7, "number": 7, "dispatch": "d1",
+         "cost_usd": 2.0, "status": "done", "exit_reason": "ok",
+         "duration_s": 3600},
+    ]
+
+    card = snapshots.issue_card(row_for(events, 7), NOW)
+
+    assert card["working_s"] == 3_900
+    assert card["idle_s"] == 3_600
+    assert card["elapsed_s"] == 7_500
+    assert card["idle_active"] is True
+
+
+def test_a_triaged_issue_waiting_in_the_backlog_reports_no_idle():
+    events = [
+        {"ts": ts(hours=3), "event": "agent_run_start", "role": "steward",
+         "kind": "TRIAGE", "issue": 7, "number": 7, "dispatch": "t1"},
+        {"ts": ts(hours=2, minutes=55), "event": "agent_run", "role": "steward",
+         "kind": "TRIAGE", "issue": 7, "number": 7, "dispatch": "t1",
+         "cost_usd": 0.1, "status": "done", "exit_reason": "ok",
+         "duration_s": 300},
+    ]
+
+    card = snapshots.issue_card(row_for(events, 7), NOW)
+
+    assert card["elapsed_s"] == 300
+    assert card["working_s"] == 300
+    assert card["idle_s"] == 0
+    assert card["idle_active"] is False
+
+
+def test_a_groom_leg_is_pre_admission_like_triage():
+    events = [
+        {"ts": ts(hours=4), "event": "agent_run_start", "role": "steward",
+         "kind": "GROOM", "issue": 7, "number": 7, "dispatch": "g1"},
+        {"ts": ts(hours=3, minutes=50), "event": "agent_run", "role": "steward",
+         "kind": "GROOM", "issue": 7, "number": 7, "dispatch": "g1",
+         "cost_usd": 0.1, "status": "done", "exit_reason": "ok",
+         "duration_s": 600},
+        {"ts": ts(hours=1), "event": "agent_run_start", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
+        {"ts": ts(minutes=30), "event": "agent_run", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1",
+         "cost_usd": 2.0, "status": "done", "exit_reason": "ok",
+         "duration_s": 1800},
+    ]
+
+    card = snapshots.issue_card(row_for(events, 7), NOW)
+
+    assert card["elapsed_s"] == 4_200  # 600 grooming + the hour since resolve
+    assert card["working_s"] == 2_400
+    assert card["idle_s"] == 1_800
+
+
+def test_the_clock_anchors_on_the_first_leg_not_the_first_journal_line():
+    # Was: elapsed measured from the row's first event, so any journal line
+    # emitted before admission (a relabel, an observation) started the idle
+    # clock. Anchoring on the first fix-pipeline leg means the hour between
+    # the label and the dispatch is charged to nobody.
+    events = [
+        {"ts": ts(hours=3), "event": "action", "role": "steward",
+         "desc": "relabel issue #7: +ai-ready"},
+        {"ts": ts(hours=2), "event": "agent_run_start", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
+        {"ts": ts(hours=1), "event": "agent_run", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1",
+         "cost_usd": 2.0, "status": "done", "exit_reason": "ok",
+         "duration_s": 3600},
+    ]
+
+    card = snapshots.issue_card(row_for(events, 7), NOW)
+
+    assert card["elapsed_s"] == 7_200
+    assert card["working_s"] == 3_600
+    assert card["idle_s"] == 3_600
+
+
+def test_a_stall_before_admission_does_not_shorten_the_pipeline_clock():
+    # The suspension correction applies to the anchored span only; the
+    # pre-admission contribution is leg runtime and has no gaps to correct.
+    events = [
+        {"ts": ts(hours=4), "event": "agent_run_start", "role": "steward",
+         "kind": "TRIAGE", "issue": 7, "number": 7, "dispatch": "t1"},
+        {"ts": ts(hours=3, minutes=55), "event": "agent_run", "role": "steward",
+         "kind": "TRIAGE", "issue": 7, "number": 7, "dispatch": "t1",
+         "cost_usd": 0.1, "status": "done", "exit_reason": "ok",
+         "duration_s": 300},
+        {"ts": ts(hours=3), "event": "agent_run_stall", "role": "steward",
+         "issue": 7, "dispatch": "t1", "stall_started_at": ts(hours=3.5),
+         "suspended_seconds": 1800},
+        {"ts": ts(hours=2), "event": "agent_run_start", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1"},
+        {"ts": ts(hours=1), "event": "agent_run", "role": "fix",
+         "kind": "RESOLVE", "issue": 7, "number": 7, "dispatch": "d1",
+         "cost_usd": 2.0, "status": "done", "exit_reason": "ok",
+         "duration_s": 3600},
+    ]
+
+    card = snapshots.issue_card(row_for(events, 7), NOW)
+
+    assert card["elapsed_s"] == 7_500
+    assert card["working_s"] == 3_900
+    assert card["idle_s"] == 3_600
+
+
 def test_issue_card_carries_gh_title_pr_state_and_merge_stamp():
     events = [RESOLVE, {"ts": ts(hours=1), "event": "action",
                         "desc": "clear state for pr #12, issue #7 (merged)"}]
