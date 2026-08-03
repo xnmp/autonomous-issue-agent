@@ -821,6 +821,23 @@ def test_structured_defer_stays_active_until_its_clear_transition():
     assert snapshots.pending_card({}, row_for([waiting, cleared], 7))["held"] is False
 
 
+def test_dependency_hold_reads_blocked_by_not_waiting_on():
+    # A GitHub blocked-by dependency hold names its blocker in the operator's
+    # own words ("blocked by #185" — keifu #130/#157, 2026-08-03); the overlap
+    # hold keeps "waiting on" because its blocker is our own in-flight work.
+    blocker = {
+        "ts": ts(hours=3), "event": "deferred", "state": "waiting",
+        "issue": 130, "reason": "blocker", "blocker_issue": 185,
+    }
+    overlap = {**blocker, "reason": "overlap"}
+    assert snapshots.pending_card(
+        {}, row_for([blocker], 130)
+    )["hold_reason"] == "blocked by #185"
+    assert snapshots.pending_card(
+        {}, row_for([overlap], 130)
+    )["hold_reason"] == "waiting on #185"
+
+
 def test_structured_clear_supersedes_a_legacy_hold():
     legacy = {
         "ts": ts(hours=4), "event": "hold", "issue": 7,
@@ -1194,6 +1211,86 @@ def test_escalation_reason_reads_the_ci_pending_stall_body():
 def test_an_escalation_with_no_comment_beside_it_has_no_reason():
     card = snapshots.issue_card(row_view([ESCALATION]), NOW)
     assert card["escalation_reason"] is None
+
+
+def _UNPARK(hours: float) -> dict:
+    # The real journal shape: the display line names only the park label; the
+    # actual moves live in the structured attributes (keifu #130, 2026-08-03 —
+    # the row stayed "escalated" with the stale CI-pending reason after an
+    # unpark re-armed it and CI went green).
+    return {
+        "ts": ts(hours=hours), "event": "action", "issue": 7,
+        "desc": "operator unpark issue #7: -ai-parked",
+        "action": {
+            "type": "operator_unpark", "target": "ISSUE", "number": 7,
+            "add": ["ai-pr-open"], "remove": ["ai-parked"],
+        },
+    }
+
+
+def test_operator_unpark_retires_the_escalation_and_its_reason():
+    stall = {
+        "ts": ts(hours=3), "event": "action", "issue": 7, "role": "fix",
+        "desc": "escalate stalled CI PR #12",
+        "action": {
+            "type": "escalate_ci_pending", "pr": 12, "head": "abc1234",
+            "body": "CI has been pending for 60 minutes without settling.",
+        },
+    }
+    card = snapshots.issue_card(
+        row_view([stall, ESCALATION, _UNPARK(hours=1)]), NOW
+    )
+    assert card["escalation_reason"] is None
+    assert card["human_action"] is None
+
+
+def test_the_escalation_stands_until_the_unpark_actually_happens():
+    card = snapshots.issue_card(row_view([ESCALATION]), NOW)
+    assert card["human_action"] == "escalated"
+
+
+def test_a_daemon_relabel_does_not_strip_the_reason_off_a_live_escalation():
+    # -ai-blocked +ai-working lands when the operator replies, while GitHub
+    # may still carry needs-human-review on the PR — the escalation is live
+    # and its reason (and unblock affordance) must survive (adversarial
+    # review F6, 2026-08-03).
+    stall = {
+        "ts": ts(hours=3), "event": "action", "issue": 7, "role": "fix",
+        "desc": "escalate stalled CI PR #12",
+        "action": {
+            "type": "escalate_ci_pending", "pr": 12, "head": "abc1234",
+            "body": "CI has been pending for 60 minutes without settling.",
+        },
+    }
+    resume = {
+        "ts": ts(hours=1), "event": "action", "issue": 7,
+        "desc": "relabel issue #7: +ai-working -ai-blocked",
+    }
+    card = snapshots.issue_card(row_view([stall, ESCALATION, resume]), NOW)
+    assert card["escalation_reason"] == (
+        "CI has been pending for 60 minutes without settling."
+    )
+
+
+def test_issue_only_unpark_keeps_a_live_awaiting_reply_stamp():
+    # An unpark that re-armed no PR journals add=[] (real moves only). The
+    # PR-level ai-blocked stamp — a question still awaiting the operator's
+    # answer — must survive it (adversarial review F5, 2026-08-03: a
+    # fabricated +ai-pr-open wiped it).
+    blocked = {
+        "ts": ts(hours=3), "event": "action", "issue": 7,
+        "desc": "relabel pr #12: +ai-blocked",
+    }
+    unpark = {
+        "ts": ts(hours=1), "event": "action", "issue": 7,
+        "desc": "operator unpark issue #7: -ai-parked",
+        "action": {
+            "type": "operator_unpark", "target": "ISSUE", "number": 7,
+            "add": [], "remove": ["ai-parked"],
+        },
+    }
+    card = snapshots.issue_card(row_view([blocked, unpark]), NOW)
+    assert card["human_action"] == "awaiting-reply"
 
 
 def test_escalation_reason_ignores_a_comment_about_another_target():

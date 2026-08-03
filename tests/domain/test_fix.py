@@ -231,6 +231,176 @@ def test_dependency_hold_names_the_blocking_issue():
     assert issue_holds(w) == (Hold(3, HOLD_BLOCKER, blocker_issue=42),)
 
 
+# ── the blocked-by dependency also holds the PR REPAIR arm ───────────────────
+# keifu #130/#157 (2026-08-03): both issues already had an OPEN PR when their
+# blocker #185 (a Windows CI wedge) was filed. The admission-stage gate only
+# covers ai-ready issues, so unparking them would have re-dispatched FIX_CI
+# straight into the wedge the blocker existed to fix.
+def _blocked_pr_world(*, blocked: bool, blockers=(185,), **pr_kw):
+    """One OPEN fixer PR with red CI, linked to an OPEN issue whose GitHub
+    dependency is (or isn't) still open."""
+    linked = issue(
+        130,
+        "ai-pr-open",
+        blocked_by_open=blocked,
+        open_blocker_numbers=blockers if blocked else (),
+    )
+    pr_kw.setdefault("checks", (Check("unit", bucket="fail"),))
+    repair = pr(100, "ai-pr-open", state="OPEN", head_ref_name="fix/130-x",
+                closing_issue=130, **pr_kw)
+    return world(issues=[linked], prs=[repair])
+
+
+def test_open_blocker_withholds_every_repair_leg_on_the_linked_pr():
+    actions = decide_fix(
+        _blocked_pr_world(blocked=True), CFG, FixState(), fixer_busy=False
+    )
+    assert _run_agents(actions) == []
+    assert not any(isinstance(a, RerunFailedChecks) for a in actions)
+
+
+def test_the_same_pr_is_repaired_once_its_blocker_closes():
+    # Anti-vacuity twin: identical world, blocker closed → the normal red-CI
+    # repair path fires, so the test above is asserting the gate and not a
+    # world that could never dispatch.
+    actions = decide_fix(
+        _blocked_pr_world(blocked=False), CFG, FixState(), fixer_busy=False
+    )
+    assert _run_agents(actions) == [RunAgent(AgentKind.FIX_CI, 100)]
+
+
+def test_a_closed_linked_issue_never_holds_its_open_pr():
+    # An operator closing a blocked issue while its PR is open must not wedge
+    # the PR permanently AND invisibly: the world carries the closed
+    # ai-pr-open slice, cleanup skips a covered PR, and holds skip closed
+    # issues — so a decide-side hold here would be silent forever
+    # (adversarial review F2, 2026-08-03; decide and report share
+    # `dependency_blocked`).
+    w = _blocked_pr_world(blocked=True)
+    closed = replace(w.issues[0], state="closed")
+    w = replace(w, issues=(closed,))
+    assert _run_agents(decide_fix(w, CFG, FixState(), fixer_busy=False)) == [
+        RunAgent(AgentKind.FIX_CI, 100)
+    ]
+
+
+def test_settled_green_still_closes_its_breaker_episode_while_held():
+    # The blocker hold is not allowed to freeze breaker bookkeeping: a PR that
+    # settles green while held must still emit ResetCiRetries, or the lifetime
+    # counter defect returns (adversarial review F4, 2026-08-03).
+    w = _blocked_pr_world(blocked=True, checks=(Check("unit", bucket="pass"),))
+    actions = decide_fix(
+        w, CFG, FixState(ci_retries={130: 2}), fixer_busy=False
+    )
+    assert ResetCiRetries(130) in actions
+    assert _run_agents(actions) == []
+
+
+def test_open_blocker_withholds_address_review_and_rebase_too():
+    # The gate is the whole arm, not just the CI branch.
+    for extra in (
+        {"reviews": (Review("CHANGES_REQUESTED", "review-bot", "t1"),),
+         "checks": ()},
+        {"mergeable": "CONFLICTING", "checks": ()},
+    ):
+        held = decide_fix(_blocked_pr_world(blocked=True, **extra), CFG,
+                          FixState(), fixer_busy=False)
+        free = decide_fix(_blocked_pr_world(blocked=False, **extra), CFG,
+                          FixState(), fixer_busy=False)
+        assert _run_agents(held) == [], extra
+        assert _run_agents(free) != [], extra
+
+
+def test_a_blocked_issues_pr_that_went_green_and_approved_still_merges():
+    # Deliberately ungated: the blocker holds paid repair, not a PR that is
+    # already merge-ready — holding that would strand finished work.
+    linked = issue(130, "ai-pr-open", blocked_by_open=True,
+                   open_blocker_numbers=(185,))
+    ready = pr(
+        100, "ai-pr-open", state="OPEN", head_ref_name="fix/130-x",
+        closing_issue=130, head_ref_oid="head-100",
+        reviews=(Review("APPROVED", "review-bot", "t1", commit_id="head-100"),),
+        checks=(Check("build", bucket="pass"),),
+    )
+    actions = decide_fix(world(issues=[linked], prs=[ready]), CFG, FixState(),
+                         fixer_busy=False)
+    assert EnableAutoMerge(100, "squash", "head-100") in actions
+
+
+def test_pr_stage_blocker_hold_names_the_issue_and_its_blocker():
+    # The wait must be as visible as the admission-stage one: an issue whose PR
+    # is up and whose dependency is open is NOT ai-ready, so only the PR-stage
+    # report can explain why the fixer looks idle.
+    assert issue_holds(_blocked_pr_world(blocked=True)) == (
+        Hold(130, HOLD_BLOCKER, blocker_issue=185),
+    )
+
+
+def test_pr_stage_blocker_hold_with_no_nameable_blocker():
+    # blocked_by_open is settled true but no number was collected.
+    w = _blocked_pr_world(blocked=True, blockers=())
+    w = world(issues=[replace(w.issues[0], open_blocker_numbers=())], prs=w.prs)
+    assert issue_holds(w) == (Hold(130, HOLD_BLOCKER, blocker_issue=None),)
+
+
+def test_pr_stage_blocker_hold_reports_only_the_first_open_blocker():
+    w = _blocked_pr_world(blocked=True, blockers=(185, 186))
+    assert issue_holds(w) == (Hold(130, HOLD_BLOCKER, blocker_issue=185),)
+
+
+def test_no_pr_stage_hold_for_a_closed_pr_or_a_closed_issue():
+    # Nothing is being withheld in either case: a non-OPEN PR gets no repair
+    # legs anyway, and a closed issue is done.
+    for issues, prs in (
+        ([issue(130, "ai-pr-open", blocked_by_open=True,
+                open_blocker_numbers=(185,))],
+         [pr(100, state="MERGED", head_ref_name="fix/130-x", closing_issue=130)]),
+        ([issue(130, "ai-pr-open", state="closed", blocked_by_open=True,
+                open_blocker_numbers=(185,))],
+         [pr(100, "ai-pr-open", state="OPEN", head_ref_name="fix/130-x",
+             closing_issue=130)]),
+    ):
+        assert issue_holds(world(issues=issues, prs=prs)) == ()
+
+
+def test_an_issue_held_at_both_stages_is_reported_once():
+    # ai-ready AND linked from an open PR: one hold, not a duplicate pair.
+    linked = issue(130, "ai-ready", blocked_by_open=True,
+                   open_blocker_numbers=(185,))
+    open_pr = pr(100, "ai-pr-open", state="OPEN", head_ref_name="fix/130-x",
+                 closing_issue=130)
+    assert issue_holds(world(issues=[linked], prs=[open_pr])) == (
+        Hold(130, HOLD_BLOCKER, blocker_issue=185),
+    )
+
+
+def test_two_open_prs_on_one_blocked_issue_report_one_hold():
+    linked = issue(130, "ai-pr-open", blocked_by_open=True,
+                   open_blocker_numbers=(185,))
+    prs = [pr(n, "ai-pr-open", state="OPEN", head_ref_name="fix/130-x",
+              closing_issue=130) for n in (100, 101)]
+    assert issue_holds(world(issues=[linked], prs=prs)) == (
+        Hold(130, HOLD_BLOCKER, blocker_issue=185),
+    )
+
+
+def test_an_unresolvable_or_unobserved_pr_link_holds_nothing():
+    # No closing ref and a non-numeric branch (a Jira-keyed PR), and a PR whose
+    # linked issue is outside every slice this world fetched: neither can be
+    # judged blocked, and neither may crash the report or the repair arm.
+    unlinked = pr(100, "ai-pr-open", state="OPEN",
+                  head_ref_name="feat/ACME-2468-thing")
+    unobserved = pr(101, "ai-pr-open", state="OPEN", head_ref_name="fix/999-x",
+                    closing_issue=999)
+    w = world(prs=[unlinked, unobserved])
+    assert issue_holds(w) == ()
+    decide_fix(w, CFG, FixState(), fixer_busy=False)  # no crash
+
+
+def test_pr_stage_hold_ignores_an_issue_whose_blocker_is_closed():
+    assert issue_holds(_blocked_pr_world(blocked=False)) == ()
+
+
 def test_resolve_dispatch_relabels_then_runs():
     w = world(issues=[issue(5, "ai-ready", updated_at="issue-rev-5")])
     actions = decide_fix(w, CFG, FixState(), fixer_busy=False)

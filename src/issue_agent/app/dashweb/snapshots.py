@@ -512,6 +512,11 @@ def waiting_label(event: dict) -> str | None:
     if event.get("blocker_pr") is not None:
         return f"waiting on PR #{event['blocker_pr']}"
     if event.get("blocker_issue") is not None:
+        # A GitHub dependency hold reads "blocked by", matching the language
+        # the operator used when they parked the issue; the overlap hold keeps
+        # "waiting on" because the blocker there is our own in-flight work.
+        if event.get("reason") == "blocker":
+            return f"blocked by #{event['blocker_issue']}"
         return f"waiting on #{event['blocker_issue']}"
     if event.get("event") == "hold":
         blocker = str(event.get("blocker") or "")
@@ -976,6 +981,30 @@ def _merge_ready_since(pr: dict) -> datetime | None:
     return max(stamps, default=dash.parse_ts(pr.get("updatedAt")))
 
 
+def _action_label_moves(event: dict) -> tuple[set[str], set[str]] | None:
+    """Label adds/removes an action event performed, structured first.
+
+    Operator park/unpark journal their real moves as `add`/`remove` attribute
+    lists while their display line names only the park label ("operator unpark
+    issue #130: -ai-parked" omitted the +ai-pr-open that should have retired
+    the escalation — keifu #130, 2026-08-03, stayed in the blocked section
+    with a stale CI-pending reason after CI went green). The parsed relabel
+    desc remains the fallback for events older than the structured form.
+    """
+    action = event.get("action")
+    if isinstance(action, dict):
+        add, remove = action.get("add"), action.get("remove")
+        if isinstance(add, list) or isinstance(remove, list):
+            return (
+                {item for item in (add or ()) if isinstance(item, str)},
+                {item for item in (remove or ()) if isinstance(item, str)},
+            )
+    fact = dash.parse_action(str(event.get("desc") or ""))
+    if fact is not None and fact.verb == "relabel":
+        return set(fact.added), set(fact.removed)
+    return None
+
+
 def _journal_attention_at(
     row: dash.IssueRow,
 ) -> tuple[str | None, datetime | None]:
@@ -996,18 +1025,17 @@ def _journal_attention_at(
         if name != "action":
             continue
         fact = dash.parse_action(str(event.get("desc") or ""))
-        if fact is None:
-            continue
-        if fact.verb == "clear":
+        if fact is not None and fact.verb == "clear":
             # A closed/merged PR ends the attention hold the same way the
             # stage derivation treats it; the re-queue may be an unjournalled
             # GitHub write, so waiting for a label removal freezes forever.
             escalated_at = None
             blocked_at = None
             continue
-        if fact.verb != "relabel":
+        moves = _action_label_moves(event)
+        if moves is None:
             continue
-        added, removed = set(fact.added), set(fact.removed)
+        added, removed = moves
         stamp = dash.parse_ts(event.get("ts"))
         # An add with an unparseable ts must not read as "no escalation".
         if added & {"needs-human-review", "needs-budget-review"} and stamp:
@@ -1033,18 +1061,30 @@ def _journal_attention_at(
 
 
 def _active_escalation_at(row: dash.IssueRow) -> datetime | None:
-    """Newest escalation not superseded by a recorded label transition."""
+    """Newest escalation not superseded by a recorded label transition.
+
+    Retirement: taking needs-human-review away ends the escalation, and so
+    does an explicit operator unpark — after re-arming, offering the stale
+    escalation reason ("CI pending 60 minutes") misdescribes a row the
+    pipeline is actively driving again (keifu #130, 2026-08-03). Deliberately
+    NOT any lifecycle-label add: a daemon relabel (-ai-blocked +ai-working on
+    an operator reply) can land while GitHub still carries needs-human-review
+    on the PR, and stripping the reason then would take the unblock
+    affordance off a live escalation (adversarial review F6)."""
     active_at: datetime | None = None
     for event in row.events:
         if event.get("event") == "escalation":
             active_at = dash.parse_ts(event.get("ts"))
         elif event.get("event") == "action":
-            fact = dash.parse_action(str(event.get("desc") or ""))
+            action = event.get("action")
             if (
-                fact is not None
-                and fact.verb == "relabel"
-                and "needs-human-review" in fact.removed
+                isinstance(action, dict)
+                and action.get("type") == "operator_unpark"
             ):
+                active_at = None
+                continue
+            moves = _action_label_moves(event)
+            if moves is not None and "needs-human-review" in moves[1]:
                 active_at = None
     return active_at
 

@@ -927,6 +927,112 @@ def test_build_world_enriches_only_ready_issues_with_blocker_gate():
     assert by_num[6].blocked_by_open is False    # working issue never gated
 
 
+def test_build_world_gates_issues_linked_from_an_open_pr_on_their_blockers():
+    # keifu #130/#157 (2026-08-03): the repair arm is gated on the same
+    # blocked-by read as admission, so an issue that already has an OPEN PR
+    # must pay it too — via the PR's closing reference (#130) or, absent one,
+    # its numeric branch (#157). An ai-working issue with no PR still doesn't.
+    calls = []
+
+    def runner(argv, token):
+        calls.append(" ".join(argv))
+        key = " ".join(argv)
+        if "issue list" in key and "ai-pr-open" in key:
+            return json.dumps([{"number": 130}, {"number": 157}])
+        if "issue list" in key and "ai-working" in key:
+            return json.dumps([{"number": 6}])
+        if "issue list" in key:
+            return "[]"
+        if "pr list" in key:
+            return json.dumps([{"number": 100, "state": "OPEN"},
+                               {"number": 101, "state": "OPEN"}])
+        if "pr view 100" in key:
+            return json.dumps({
+                "number": 100, "state": "OPEN", "labels": [{"name": "ai-pr-open"}],
+                "headRefName": "fix/999-unrelated",
+                "closingIssuesReferences": [{"number": 130}],
+            })
+        if "pr view 101" in key:
+            return json.dumps({
+                "number": 101, "state": "OPEN", "labels": [{"name": "ai-pr-open"}],
+                "headRefName": "fix/157-something", "closingIssuesReferences": [],
+            })
+        for n in (130, 157, 6):
+            if f"issue view {n}" in key:
+                return json.dumps({"number": n, "state": "OPEN",
+                                   "labels": [{"name": "ai-pr-open"}]})
+        if "issues/130/dependencies/blocked_by" in key:
+            return json.dumps([185])
+        if "issues/157/dependencies/blocked_by" in key:
+            return json.dumps([185, 186])
+        if "issues/130" in key or "issues/157" in key:
+            return "1"
+        return ""
+
+    gw = GitHubGateway("o/r", runner=runner)
+    by_num = {i.number: i for i in gw.build_world().issues}
+
+    # linked by closing reference…
+    assert by_num[130].blocked_by_open is True
+    assert by_num[130].open_blocker_numbers == (185,)
+    # …and linked only by a numeric branch name.
+    assert by_num[157].blocked_by_open is True
+    assert by_num[157].open_blocker_numbers == (185, 186)
+    # The un-linked, non-ready issue never pays the read.
+    assert by_num[6].blocked_by_open is False
+    assert by_num[6].open_blocker_numbers == ()
+    assert not any("issues/6" in c for c in calls)
+
+
+def test_build_world_does_not_gate_an_issue_whose_only_pr_is_closed():
+    # A non-OPEN PR gets no repair legs, so its issue buys nothing from the read.
+    calls = []
+
+    def runner(argv, token):
+        calls.append(" ".join(argv))
+        key = " ".join(argv)
+        if "issue list" in key and "ai-pr-open" in key and "closed" not in key:
+            return json.dumps([{"number": 130}])
+        if "issue list" in key:
+            return "[]"
+        if "pr list" in key:
+            return json.dumps([{"number": 100, "state": "MERGED"}])
+        if "pr view 100" in key:
+            return json.dumps({
+                "number": 100, "state": "MERGED", "labels": [{"name": "ai-pr-open"}],
+                "headRefName": "fix/130-x",
+            })
+        if "issue view 130" in key:
+            return json.dumps({"number": 130, "state": "OPEN",
+                               "labels": [{"name": "ai-pr-open"}]})
+        return ""
+
+    gw = GitHubGateway("o/r", runner=runner)
+    assert gw.build_world().issues[0].blocked_by_open is False
+    assert not any("dependencies/blocked_by" in c for c in calls)
+
+
+def test_build_world_survives_an_open_pr_with_no_resolvable_issue():
+    # A Jira-keyed branch and no closing reference: nothing to gate, and the
+    # linkage scan must not raise on it.
+    def runner(argv, token):
+        key = " ".join(argv)
+        if "issue list" in key:
+            return "[]"
+        if "pr list" in key:
+            return json.dumps([{"number": 100, "state": "OPEN"}])
+        if "pr view 100" in key:
+            return json.dumps({
+                "number": 100, "state": "OPEN", "labels": [{"name": "ai-pr-open"}],
+                "headRefName": "feat/ACME-2468-thing",
+            })
+        return ""
+
+    gw = GitHubGateway("o/r", runner=runner)
+    w = gw.build_world()
+    assert [p.number for p in w.prs] == [100] and w.issues == ()
+
+
 def test_build_world_drops_an_open_pr_the_stale_search_still_labels():
     # keifu PR #179 (2026-08-03): an operator park removed ai-pr-open, but the
     # search-backed label list kept returning the PR for minutes, so every
@@ -1617,9 +1723,13 @@ def test_build_world_isolates_a_timed_out_issue_but_not_a_rate_limit(capsys):
 
 
 def test_build_world_isolates_a_wedged_blocker_read(capsys):
-    """The ai-ready dependency read shares the issue's isolation boundary: a
-    `gh api …/dependencies/blocked_by` that wedges on ONE issue drops that issue
-    for a tick (safer than dispatching it ungated) instead of killing the poll."""
+    """A wedged `gh api …/dependencies/blocked_by` neither kills the poll nor
+    drops the issue: it marks the issue blocked with no witnesses (fail-closed
+    for BOTH admission and the PR repair arm) until a clean tick re-derives
+    the truth. Dropping used to be the safe direction when only
+    pick_ready_issue consumed the flag; the repair arm fails OPEN for a
+    missing issue, so a drop would have dispatched into the very wedge the
+    blocker tracks (adversarial review F1, 2026-08-03)."""
     def runner(argv, token):
         key = " ".join(argv)
         if "issue list" in key:
@@ -1635,8 +1745,12 @@ def test_build_world_isolates_a_wedged_blocker_read(capsys):
         return "0"                      # #8: no declared blockers
 
     gw = GitHubGateway("o/r", runner=runner)
-    assert [i.number for i in gw.build_world().issues] == [8]
-    assert "skip issue #7" in capsys.readouterr().err
+    world = gw.build_world()
+    assert [i.number for i in world.issues] == [7, 8]
+    seven = world.issues[0]
+    assert (seven.blocked_by_open, seven.open_blocker_numbers) == (True, ())
+    assert world.issues[1].blocked_by_open is False
+    assert "skip issue-blockers #7" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("build", ["build_triage_world", "build_steward_world"])

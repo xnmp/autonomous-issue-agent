@@ -188,6 +188,14 @@ Two smaller ones worth doing whenever the files are next touched:
 
 ---
 
+- The blocked-by dependency gate on the PR repair arm (2026-08-03) fails OPEN
+  for one tick when the linked issue's own fetch times out and the issue drops
+  from the world: "dropped" and "issueless PR" are indistinguishable at the
+  decision layer, and holding issueless PRs forever is the worse failure. A
+  blocker-READ failure alone now fails closed (issue marked blocked, no
+  witnesses). Residual exposure = pre-feature behavior for that tick.
+  Trigger: a paid dispatch observed into a known-open blocker's wedge.
+
 ## 5. Per-incident notes
 
 `docs/open/issues/` holds three unresolved incident write-ups

@@ -14,6 +14,9 @@ from ...adapters.operator_effects import build_operator_effects
 from ...adapters.store import Store
 from ...adapters.typed_journal import TypedJournal
 from ...domain import dashboard as dash
+
+# (target, number, labels added, labels removed) — one applied park/unpark move.
+_ParkMove = tuple[str, int, tuple[str, ...], tuple[str, ...]]
 from ...domain import review as review_dom
 from ...domain.events import (
     ActionApplied,
@@ -511,14 +514,14 @@ class Backend:
         if not ensured:
             return False, ensure_detail
         applied, detail = True, "ok"
-        moves: list[tuple[str, int, tuple[str, ...]]] = []
+        moves: list[_ParkMove] = []
         for pr in parkable:
             remove = tuple(x for x in actions.PARK_REMOVES if x in _pr_labels(pr))
             pr_ok, pr_detail = effects.set_issue_labels(
                 pr, add=(actions.PARKED_LABEL,), remove=remove
             )
             if pr_ok:
-                moves.append(("pr", pr, remove))
+                moves.append(("pr", pr, (actions.PARKED_LABEL,), remove))
             else:
                 applied, detail = False, f"pr #{pr}: {pr_detail}"
         remove = tuple(x for x in actions.PARK_REMOVES if x in issue_labels)
@@ -526,7 +529,7 @@ class Backend:
             number, add=(actions.PARKED_LABEL,), remove=remove
         )
         if issue_ok:
-            moves.append(("issue", number, remove))
+            moves.append(("issue", number, (actions.PARKED_LABEL,), remove))
         else:
             applied, detail = False, issue_detail
         self._journal_park(
@@ -555,13 +558,13 @@ class Backend:
             return False, f"#{number} is not parked"
         effects = self._operator_effects(name, repo, journalled=False)
         applied, detail = True, "ok"
-        moves: list[tuple[str, int, tuple[str, ...]]] = []
+        moves: list[_ParkMove] = []
         for pr in parked:
             pr_ok, pr_detail = effects.set_issue_labels(
                 pr, add=("ai-pr-open",), remove=(actions.PARKED_LABEL,)
             )
             if pr_ok:
-                moves.append(("pr", pr, (actions.PARKED_LABEL,)))
+                moves.append(("pr", pr, ("ai-pr-open",), (actions.PARKED_LABEL,)))
             else:
                 applied, detail = False, f"pr #{pr}: {pr_detail}"
         if actions.PARKED_LABEL in issue_labels:
@@ -570,7 +573,7 @@ class Backend:
                 number, add=add, remove=(actions.PARKED_LABEL,)
             )
             if issue_ok:
-                moves.append(("issue", number, (actions.PARKED_LABEL,)))
+                moves.append(("issue", number, add, (actions.PARKED_LABEL,)))
             else:
                 applied, detail = False, issue_detail
         self._journal_park(
@@ -612,7 +615,7 @@ class Backend:
         repo: str,
         number: int,
         kind: str,
-        moves: list[tuple[str, int, tuple[str, ...]]],
+        moves: list[_ParkMove],
         applied: bool,
         channel: str,
     ) -> None:
@@ -621,8 +624,8 @@ class Backend:
             return
         verb = "park" if kind == "operator_park" else "unpark"
         try:
-            for target, target_number, removed in moves or [
-                ("issue", number, ())
+            for target, target_number, added, removed in moves or [
+                ("issue", number, (), ())
             ]:
                 journal.emit(
                     TelemetryEvent(
@@ -634,11 +637,12 @@ class Backend:
                             + (" ".join(f"-{x}" for x in removed) or "(none)"),
                             target_number,
                             {
-                                "add": [
-                                    actions.PARKED_LABEL
-                                    if kind == "operator_park"
-                                    else "ai-pr-open"
-                                ],
+                                # The moves that actually reached GitHub —
+                                # never reconstructed: a fabricated
+                                # +ai-pr-open here wiped a live PR-level
+                                # awaiting-reply stamp downstream
+                                # (adversarial review F5, 2026-08-03).
+                                "add": list(added),
                                 "remove": list(removed),
                                 "operator": f"{repo}:dashboard",
                                 "channel": channel,

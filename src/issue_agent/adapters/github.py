@@ -1111,14 +1111,6 @@ class GitHubGateway:
         than either dispatching it ungated or killing the poll."""
         try:
             issue = self.get_issue(number)
-            if blocker_gate:
-                blockers = self.open_blockers(number)
-                issue = replace(
-                    issue,
-                    blocked_by_open=bool(blockers),
-                    open_blocker_numbers=blockers,
-                )
-            return issue
         except GhUnavailable as exc:
             if not exc.timed_out:
                 raise
@@ -1127,6 +1119,35 @@ class GitHubGateway:
         except Exception as exc:  # noqa: BLE001 — deliberately broad: one issue ≠ whole pass
             self._skip_item("issue", number, exc)
             return None
+        if not blocker_gate:
+            return issue
+        try:
+            blockers = self.open_blockers(number)
+        except GhUnavailable as exc:
+            if not exc.timed_out:
+                raise
+            # Fail CLOSED, not dropped: dropping the issue used to be the safe
+            # direction when only pick_ready_issue consumed the flag, but the
+            # PR repair arm fails OPEN for an issue the world does not carry
+            # (adversarial review F1, 2026-08-03 — one wedged blocked_by read
+            # would have dispatched FIX_CI straight into the wedge the blocker
+            # tracks). An issue marked blocked with no witnesses holds both
+            # stages and reports "waiting on an open dependency"; the next
+            # clean tick re-derives the truth.
+            self._skip_item("issue-blockers", number, exc)
+            return replace(
+                issue, blocked_by_open=True, open_blocker_numbers=()
+            )
+        except Exception as exc:  # noqa: BLE001 — same boundary as above
+            self._skip_item("issue-blockers", number, exc)
+            return replace(
+                issue, blocked_by_open=True, open_blocker_numbers=()
+            )
+        return replace(
+            issue,
+            blocked_by_open=bool(blockers),
+            open_blocker_numbers=blockers,
+        )
 
     @staticmethod
     def _skip_item(kind: str, number: int, exc: BaseException) -> None:
@@ -1238,21 +1259,39 @@ class GitHubGateway:
         for state in ("open", "all"):
             for n, s in self.list_pr_states("ai-pr-open", state):
                 pr_states.setdefault(n, s)
-        # Only ai-ready issues are gated on dependencies (pick_ready_issue), so
-        # only they pay the blocked-by read — an ai-working/blocked issue never
-        # needs it. Cheapest-first inside has_open_blocker keeps it ~1 call each.
-        issues = tuple(
-            i for n in sorted(issue_numbers)
-            if (i := self._safe_get_issue(n, blocker_gate=n in ready_numbers)) is not None
-        )
         # Non-OPEN PRs (the stale --state all tail) get the cheap fetch: no
         # mergeable (hang-class) and no checks call — see list_pr_states.
+        # PRs are fetched BEFORE issues: the blocked-by gate below needs to
+        # know which issues have an OPEN PR, and that linkage lives on the PR.
         prs = tuple(
             p for n in sorted(pr_states)
             if (p := self._safe_get_pr(
                 n,
                 mergeability=pr_states[n] == "OPEN",
                 checks=pr_states[n] == "OPEN",
+            )) is not None
+        )
+        # Dependencies gate paid dispatch at BOTH stages: pick_ready_issue for
+        # admission, and the decide_fix repair arm for issues with an OPEN PR
+        # (unparked keifu #130/#157 would otherwise re-dispatch FIX_CI into the
+        # wedge their blocker existed to fix, 2026-08-03). Only those two
+        # slices pay the blocked-by read — an ai-working/blocked issue without
+        # a PR never needs it. Cheapest-first keeps it ~1 call each.
+        # The domain's own linkage rule, not a re-statement — if the two
+        # drifted, the gate would silently under-cover and the repair arm's
+        # documented fail-open for unlinked issues would become the default.
+        from ..domain.fix import _issue_for_pr as domain_issue_for_pr
+
+        pr_linked = {
+            linked
+            for p in prs
+            if p.state == "OPEN"
+            and (linked := domain_issue_for_pr(p)) is not None
+        }
+        issues = tuple(
+            i for n in sorted(issue_numbers)
+            if (i := self._safe_get_issue(
+                n, blocker_gate=n in ready_numbers or n in pr_linked
             )) is not None
         )
         # The label lists above are SEARCH-backed and serve stale results: an

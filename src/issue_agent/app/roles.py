@@ -1752,6 +1752,8 @@ def _hold_reporter(
         if blocker_pr is not None:
             return f"issue #{issue} waiting on PR #{blocker_pr}"
         if blocker_issue is not None:
+            if reason == "blocker":
+                return f"issue #{issue} blocked by #{blocker_issue}"
             return f"issue #{issue} waiting on #{blocker_issue}"
         return f"issue #{issue} waiting on an open dependency"
 

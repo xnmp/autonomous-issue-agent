@@ -300,18 +300,52 @@ def issue_holds(
     world: WorldState, inflight: tuple[InFlightFix, ...] = ()
 ) -> tuple[Hold, ...]:
     """Every hold in force this poll: for each OPEN, ai-ready issue that
-    `pick_ready_issue` will skip, why. Pure; ordered by the world's issue order,
-    then blocker-before-overlap for a doubly-held issue.
+    `pick_ready_issue` will skip, why — plus one blocker hold per OPEN-PR
+    issue whose open dependency gates the repair arm. Pure; ordered by the
+    world's issue order, then blocker-before-overlap for a doubly-held issue.
 
     Reported, not acted on — the wiring journals these (deduped per
     issue/reason/blocker) so a harness that looks idle can be told apart from a
     harness that is deliberately waiting."""
-    return tuple(
+    ready_holds = tuple(
         hold
         for issue in world.open_issues()
         if issue_lifecycle(issue).is_ready
         for hold in _holds(issue, world, inflight)
     )
+    # PR-stage twin of the blocker hold: an OPEN issue whose PR is already up
+    # but whose GitHub dependency is still open gets no repair legs (see the
+    # decide_fix open-PR loop, which skips on this same predicate), and that
+    # wait must be as visible as the admission-stage one. One hold per issue.
+    reported = {hold.issue for hold in ready_holds}
+    pr_stage: list[Hold] = []
+    for pr in world.prs:
+        # ai-pr-open only: a hold says "the fixer is deliberately waiting",
+        # so a PR the repair arm would never touch must not generate one
+        # (adversarial review F3: reviewer-adopted human PRs produced
+        # DEFERRED lines for dispatches that were never going to happen).
+        # The author!=fix_bot slice still slips through — cfg does not reach
+        # this reporter — and is accepted noise.
+        if pr.state != "OPEN" or Label.AI_PR_OPEN not in pr.labels:
+            continue
+        held = _observed_issue(world, _issue_for_pr(pr))
+        if (
+            held is None
+            or held.number in reported
+            or not dependency_blocked(held)
+        ):
+            continue
+        reported.add(held.number)
+        pr_stage.append(
+            Hold(
+                held.number,
+                HOLD_BLOCKER,
+                blocker_issue=held.open_blocker_numbers[0]
+                if held.open_blocker_numbers
+                else None,
+            )
+        )
+    return ready_holds + tuple(pr_stage)
 
 
 # ── duplicate-PR guard (#39) ─────────────────────────────────────────────────
@@ -958,6 +992,22 @@ def _issue_carries_ai_pr_open(world: WorldState, issue_number: int | None) -> bo
     return observed is not None and observed.has(Label.AI_PR_OPEN)
 
 
+def dependency_blocked(issue: IssueView | None) -> bool:
+    """THE predicate for "this issue's open GitHub dependency holds the PR
+    repair arm" — `decide_fix`'s skip and `issue_holds`' PR-stage report both
+    call it, so the journal can never disagree with the decision it explains
+    (the `_overlapping_open_pr` witness pattern). Closed issues are excluded:
+    an operator closing a blocked issue while its PR stays open would
+    otherwise wedge that PR permanently AND invisibly (adversarial review
+    F2, 2026-08-03 — cleanup skips it as covered, holds skipped it as
+    closed)."""
+    return (
+        issue is not None
+        and issue.state == "open"
+        and issue.blocked_by_open
+    )
+
+
 def _issue_for_pr(pr: PRView) -> int | None:
     """Linked issue: prefer GitHub's closing-reference, fall back to the branch
     number. Port of issue_for_pr || issue_from_branch."""
@@ -1595,6 +1645,38 @@ def decide_fix(
     # expensive resolve. Under continuous ready-issue load, the old resolve-first
     # order starved ADDRESS_REVIEW/FIX_CI/REBASE for 88 minutes (#56).
     for pr in open_prs:
+        # An open GitHub "blocked by" dependency holds the WHOLE repair arm,
+        # not just fresh resolves. Unparking keifu #130/#157 (2026-08-03) would
+        # have re-dispatched FIX_CI straight into the Windows CI wedge their
+        # blocker #185 existed to fix. Same predicate as the `issue_holds`
+        # PR-stage report, so the journal names the wait ("blocked by #N")
+        # instead of the fixer looking idle; it clears itself when the blocker
+        # closes. Auto-merge and lock-free cleanup are deliberately NOT gated —
+        # a PR that went green and approved despite the blocker may land.
+        # An issue the world does not carry fails OPEN (the repair arm runs
+        # ungated, exactly the pre-feature behavior): "dropped for a tick" and
+        # "issueless PR" are indistinguishable here, and holding issueless PRs
+        # forever is the worse failure. The residual — one ungated tick when
+        # the issue fetch itself times out — is named in docs/open/residuals.md;
+        # a blocker-READ failure alone no longer drops the issue (the adapter
+        # marks it blocked instead, failing closed).
+        held = _observed_issue(world, _issue_for_pr(pr))
+        if dependency_blocked(held):
+            # A settled-green episode still closes its breaker while held:
+            # the reset is bookkeeping, not a dispatch, and skipping it
+            # re-introduced the lifetime-counter defect ResetCiRetries fixed
+            # (adversarial review F4, 2026-08-03).
+            held_issue = _issue_for_pr(pr)
+            if held_issue is not None:
+                held_ci = ci_state(
+                    pr.checks, cfg.ci_ignore_checks, known=pr.checks_known
+                )
+                if (
+                    held_ci == CIState.OK
+                    and state.ci_retries.get(breaker_key(pr), 0) > 0
+                ):
+                    actions.append(ResetCiRetries(held_issue))
+            continue
         lifecycle = pr_lifecycle(pr)
         if lifecycle.is_blocked:
             # PR-stage blockers are answered on the PR, while the saved agent
