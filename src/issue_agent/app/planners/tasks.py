@@ -162,12 +162,40 @@ _UNRECEIPTED_VISUAL_NOTICE = (
     "and needs no permission."
 )
 
+# The autonomy contract (operator directive, 2026-08-03): technical decisions
+# belong to the fixer, in service of the acceptance criteria; an independent
+# reviewer and the gates bound the damage of a wrong call, while a question
+# costs unbounded human latency. Blocking is legal on exactly two grounds.
+_STANDING_POLICY_NOTICE = (
+    "\n\nAUTONOMY CONTRACT — decide, don't ask. Every technical choice "
+    "(tooling, test strategy, evidence capture, environment handling, "
+    "modifying an existing test whose expectation is wrong) is YOURS to "
+    "make in service of the acceptance criteria; an independent reviewer "
+    "judges the result, so a defensible wrong call costs one review round "
+    "while a question stalls the issue indefinitely. When requirements are "
+    "ambiguous, choose the most reasonable reading, PROCEED, and state the "
+    "assumption prominently in the PR description for the reviewer. The "
+    "human operator is non-technical: never surface mechanics to them. "
+    "Blocking is permitted on exactly two grounds:\n"
+    "1. MISSING CAPABILITY — a credential, external account, or resource "
+    "you cannot obtain or work around.\n"
+    "2. CONTRADICTION — two acceptance criteria that cannot both hold, "
+    "where any guess would build the wrong thing.\n"
+    "Anything else phrased as a question is a defect. (A wrong acceptance "
+    "criterion is neither: it has its own machine-adjudicated path — see "
+    "the contract escape hatch in your task. A wrong existing TEST is not "
+    "a petition at all: correct it and say so in the PR.)"
+)
+
 
 def _fix_system_prompt(cfg: FixTaskConfig, session_id: str | None) -> str:
     """The appended system prompt for a fixer leg: the full AGENT.md on a fresh
     session, the short reminder when a session id is carried (resumed OR forked —
     both inherit the server-side transcript that already contains AGENT.md)."""
     base = _RESUME_REMINDER if (session_id or "").strip() else cfg.agent_md
+    # Appended on fresh AND resumed sessions, same reasoning as the visual
+    # notice: a resumed transcript predates whatever policy was added since.
+    base += _STANDING_POLICY_NOTICE
     if not cfg.mints_visual_receipts:
         base += _UNRECEIPTED_VISUAL_NOTICE
     return base + _difficulty_notice(cfg)

@@ -25,10 +25,35 @@ ADR adopts.
 One general mechanism in `domain/exemptions.py`, split into two artifacts
 with different authors and different powers:
 
-- **Declaration** (fixer): a `Gate-Exemption: <rule> <subject>` commit
-  trailer. Tracked history — visible in the PR, unforgeable-in-place, gone
-  from the repo after merge. It lets the DECLARED violation through the gate
-  so the reviewer can see it. It authorizes nothing.
+- **Declaration** — how a change requests an exemption. Revised 2026-08-03
+  (operator directive: the trailer ceremony produced comply-how loops —
+  keifu #126/#163 — with no security value, since the grant is what
+  authorizes):
+  - `tests-immutable` is **AUTO-DECLARED from the diff**: every modified or
+    deleted existing test file IS the request. The gate only bounds scope
+    (>3 such files denies as a rewrite) and refuses paths that cannot be
+    written as a grant subject; the fixer edits tests on its own judgment
+    and the machinery frames the hazard for review.
+
+    Because absence of a derived subject now MEANS "no grant needed", the
+    derivation must never under-report. Subjects come from `diff --git`
+    records — emitted unconditionally for every changed path — and NOT from
+    `--- a/` hunk headers, which git omits for binary files, pure renames,
+    mode-only changes, and paths suppressed by `.gitattributes -diff`: one
+    `tests/** -diff` line would otherwise have disabled the whole regime
+    and blinded the reviewer's own diff (round-4 adversarial review). A
+    rename reports its OLD path (renaming a test out of the tree removes it
+    from the suite). A record whose path cannot be resolved yields an
+    UNDECIDABLE count that withholds and escalates — never "touched no
+    tests". The gate derives from the worktree instead of a diff blob and
+    can disagree at the margins; both directions are safe by construction
+    (gate stricter → denied pre-publish; merge stricter → withheld with a
+    named reason), and the shell twin uses the same old-side derivation.
+  - `required-test` stays a `Gate-Exemption: required-test *` commit
+    trailer: absence of tests is ambiguous between "forgot" and "genuinely
+    untestable", so the fixer's stated intent carries information the diff
+    cannot, and the free gate denial remains the cheapest teacher.
+  A declaration authorizes nothing either way.
 - **Grant** (REVIEW_BOT only): the reviewer grants via a STRUCTURED output
   field (`exemption_grants: [{rule, subject}]` in the review schema), never
   via prose — a first cut that asked the model to copy grant lines into its
@@ -95,10 +120,15 @@ three-valued:
   logged by the collector. Escalating these would hand a human a healthy
   PR with a false "reviewer refused" reason.
 
-Declared PRs under `REVIEW_MODE=multi` or on a runtime with no structured
-verdict channel cannot be granted (the notice and schema are not attached);
-they escalate via the withheld arm. Fail closed, but operators should know
-enabling MULTI converts every declaration into a human interrupt.
+**MULTI-mode is incompatible with this design and must not be enabled until
+its synthesis carries a grant channel.** A PR whose exemption cannot be
+granted (no notice, no structured field) escalates via the withheld arm. Under
+the trailer design that hit only opt-in declarations — rare. Under
+auto-declaration it hits EVERY PR that modifies any existing test, which is a
+large share of them, so `REVIEW_MODE=multi` would convert routine test
+corrections into a stream of human interrupts. The same applies to any
+reviewer runtime whose task carries no structured verdict schema. SINGLE and
+DELEGATED modes are the supported configurations.
 
 **Which rules are exemptable is a domain decision, made once:**
 

@@ -32,6 +32,7 @@ from issue_agent.domain.exemptions import (
     parse_exemption_declarations,
     parse_exemption_grants,
     render_grant_line,
+    valid_subject,
 )
 from issue_agent.domain.review import IdentityMode
 
@@ -825,3 +826,88 @@ def test_closing_a_dangling_fence_is_what_lets_an_appended_grant_parse():
     assert marker is not None
     repaired = truncated_body + f"\n{marker}" + "\n\n" + GRANT
     assert parse_exemption_grants(repaired) != ()
+
+
+# ── valid_subject: the guard on AUTO-DECLARED diff paths ────────────────────
+# Auto-declared subjects come from diff paths, which the trailer grammar never
+# bounded. A path outside the charset would render an UNPARSEABLE grant line —
+# silently losing a granted exemption and escalating with a false reason — so
+# the renderer checks first.
+def test_valid_subject_accepts_ordinary_paths_and_the_whole_change_token():
+    for subject in (
+        "tests/test_app.py",
+        "tests/x_test.py",
+        "a.py",
+        "src/sub-dir/file_name+1.rs",
+        SUBJECT_WHOLE_CHANGE,
+        "a" * 200,
+    ):
+        assert valid_subject(subject) is True, subject
+
+
+def test_valid_subject_rejects_anything_the_grant_grammar_cannot_carry():
+    for subject in (
+        "tests/my test.py",      # space: would truncate the line's fields
+        "@scope/pkg",            # real JS path, outside the charset
+        "tests/tëst.py",         # non-ASCII
+        "tests/t.py\ttrailing",  # embedded tab
+        "IGNORE`ALL~PRIOR",      # injection-shaped token
+        "a" * 201,               # over the length bound
+        "",
+        "**",
+    ):
+        assert valid_subject(subject) is False, subject
+
+
+def test_valid_subject_is_total_on_junk_input():
+    for junk in (None, 42, b"a.py", ["a.py"], {"subject": "a.py"}):
+        assert valid_subject(junk) is False
+
+
+def test_a_subject_valid_subject_rejects_could_never_round_trip_a_grant_line():
+    # The invariant the guard protects: anything it accepts renders a line the
+    # parser reads back identically; anything it rejects does not.
+    good = "tests/test_app.py"
+    line = render_grant_line(MAC_KEY, RULE_TESTS_IMMUTABLE, 89, good, "abc123")
+    assert parse_exemption_grants(line)[0].subject == good
+    bad = "tests/my test.py"
+    assert parse_exemption_grants(
+        render_grant_line(MAC_KEY, RULE_TESTS_IMMUTABLE, 89, bad, "abc123")
+    ) == ()
+
+
+# ── an unreadable diff SHAPE is durable, not transient (round-4 BLOCKER 2) ───
+def test_an_undecidable_diff_withholds_with_its_own_reason():
+    # "We could not tell which paths this record touched" must never read as
+    # "it touched no tests". Re-deriving the same diff gives the same answer,
+    # so this is durable: withhold and escalate, never retry forever.
+    verdict, reason = _status(ExemptionFacts(undecidable_diff=True))
+    assert verdict == EXEMPTIONS_WITHHELD
+    assert "cannot" in reason and "tests" in reason
+
+
+def test_an_undecidable_diff_withholds_even_with_nothing_declared():
+    assert _permits(ExemptionFacts(undecidable_diff=True)) is False
+
+
+def test_an_undecidable_diff_outranks_truncation():
+    # Both are durable, but the diff shape is the more specific truth and the
+    # one a human can act on directly.
+    verdict, reason = _status(
+        ExemptionFacts(undecidable_diff=True, truncated=True)
+    )
+    assert verdict == EXEMPTIONS_WITHHELD
+    assert "rename" in reason or "path encoding" in reason
+    assert "100" not in reason
+
+
+def test_unreadable_facts_still_outrank_every_durable_condition():
+    # unverifiable is transient; reporting a durable reason for what is
+    # actually a gh outage would escalate a healthy PR with a false cause.
+    verdict, reason = _status(
+        ExemptionFacts(
+            unverifiable=True, undecidable_diff=True, truncated=True
+        )
+    )
+    assert verdict == EXEMPTIONS_UNVERIFIABLE
+    assert "could not be read" in reason

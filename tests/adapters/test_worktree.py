@@ -330,6 +330,31 @@ def test_build_gate_context_exists_at_base_uses_cat_file():
 _PUBLISHED_LOG = "log origin/dev..refs/remotes/origin/fix/5-x"
 
 
+# A rename reports only its NEW path under `--name-only`, so three tests
+# renamed out of the test tree once left the tests-immutable gate seeing
+# nothing test-shaped while the merge side saw three subjects (round-4
+# adversarial review). The old-side list closes that, and must stay SEPARATE
+# from changed_files: a deleted test path there would read as an ADDED test
+# and satisfy check_required_test.
+_OLD_SIDE = "diff --no-renames --diff-filter=MDRT --name-only"
+
+
+def test_build_gate_context_reports_old_side_paths_for_renamed_tests():
+    fg = _builder_git(changed="docs/old.txt")
+    fg.table[_OLD_SIDE] = GitResult(0, "tests/test_renamed.py\n")
+    ctx = build_gate_context("/wt", base_branch="dev", git=fg)
+    assert ctx.touched_at_base == ("tests/test_renamed.py",)
+    assert "tests/test_renamed.py" not in ctx.changed_files
+
+
+def test_build_gate_context_leaves_old_side_empty_when_that_git_call_fails():
+    fg = _builder_git()
+    fg.table[_OLD_SIDE] = GitResult(1, "fatal: bad revision")
+    ctx = build_gate_context("/wt", base_branch="dev", git=fg)
+    assert ctx.touched_at_base == ()
+    assert ctx.changed_files == ("src/x.py", "tests/test_x.py")
+
+
 def test_build_gate_context_reads_published_subjects_from_the_remote_branch():
     fg = _builder_git()
     fg.table[_PUBLISHED_LOG] = GitResult(

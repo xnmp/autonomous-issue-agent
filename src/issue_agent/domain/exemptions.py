@@ -277,6 +277,18 @@ def render_grant_line(
     )
 
 
+_SUBJECT_FULL_RE = re.compile(rf"^{_SUBJECT_TOKEN}$")
+
+
+def valid_subject(subject: object) -> bool:
+    """Can this subject appear in a grant line? Auto-declared subjects come
+    from diff paths, which are not bounded by the trailer grammar — a path
+    outside the charset would render an UNPARSEABLE grant line, silently
+    losing a granted exemption and escalating with a false reason. The
+    renderer checks first and reports the real problem instead."""
+    return isinstance(subject, str) and bool(_SUBJECT_FULL_RE.match(subject))
+
+
 def count_malformed_declarations(message: object) -> int:
     """Lines that LOOK like a Gate-Exemption trailer but don't parse — bad
     charset in the subject (`@scope/pkg`, unicode), missing fields, or an
@@ -348,6 +360,12 @@ class ExemptionFacts:
     # unverifiable-retry-forever (round-3 MAJOR 2: the old sentinel silently
     # unmerged every ≥100-commit PR, declared or not, with no escalation).
     truncated: bool = False
+    # The diff carried a record whose touched path could not be resolved, so
+    # the auto-declared subject set is not trustworthy. DURABLE for this head
+    # (the same diff re-derives the same way), so it escalates rather than
+    # retrying forever — "unreadable shape" must never merge as "touched no
+    # tests" (round-4 adversarial review, BLOCKER 2).
+    undecidable_diff: bool = False
 
 
 # Merge-side verdicts from `exemption_status`. Distinct because they demand
@@ -429,6 +447,15 @@ def exemption_status(
         return (
             EXEMPTIONS_UNVERIFIABLE,
             "its gate-exemption declarations could not be read this tick",
+        )
+    if facts.undecidable_diff:
+        return (
+            EXEMPTIONS_WITHHELD,
+            "its diff contains a change record whose touched path the "
+            "harness cannot resolve (an unusual rename or path encoding), "
+            "so it cannot prove which existing tests the change modifies — "
+            "merge by hand after checking, or simplify the change's file "
+            "moves",
         )
     if facts.truncated:
         return (

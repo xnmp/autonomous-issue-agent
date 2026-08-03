@@ -119,6 +119,7 @@ from issue_agent.domain.world import (
     ClosingRef,
     IssueView,
     PRView,
+    PullRequestDiff,
     Review,
     REVIEW_CHANGES_REQUESTED,
     WorldState,
@@ -2898,24 +2899,58 @@ def test_fix_state_reads_the_ci_rerun_marker_the_executor_wrote(tmp_path):
 
 # ── ADR 0014 exemption-fact collection (which PRs cost a gh call) ────────────
 # `_collect_test_exemptions` is the READ half of the merge-side exemption rule.
-# Its predicate must track `merge_preconditions_met` exactly: looser burns a gh
-# call per open PR per tick (the 2026-08-02 GraphQL quota burn), tighter lets a
+# Its predicate must track `should_automerge`'s exactly: looser burns a gh call
+# per open PR per tick (the 2026-08-02 GraphQL quota burn), tighter lets a
 # declared PR reach the merge decision with no facts at all.
+#
+# Since 2026-08-03 tests-immutable subjects are AUTO-DECLARED from the
+# revision-checked DIFF (the same text that yields the patch id) and
+# required-test stays trailer-declared — so the diff, not the commit log, is
+# the load-bearing read.
 _EXEMPT_CFG = FixConfig(
     fix_bot="fix-bot", review_bot="review-bot", arm_on_open=True
 )
 
+_MODIFIED_TEST = "tests/x_test.py"
+_MODIFIED_TEST_DIFF = (
+    f"diff --git a/{_MODIFIED_TEST} b/{_MODIFIED_TEST}\n"
+    f"--- a/{_MODIFIED_TEST}\n"
+    f"+++ b/{_MODIFIED_TEST}\n"
+    "@@ -1 +1 @@\n"
+    "-assert x == 1\n"
+    "+assert x == 2\n"
+)
+_CLEAN_DIFF = (
+    "diff --git a/src/app.py b/src/app.py\n"
+    "--- a/src/app.py\n"
+    "+++ b/src/app.py\n"
+    "@@ -1 +1 @@\n"
+    "-x = 1\n"
+    "+x = 2\n"
+)
+# A record whose touched path cannot be resolved: unquoted spaces on the
+# header line and no `--- a/` witness (binary). The collector must withhold.
+_UNDECIDABLE_DIFF = (
+    "diff --git a/tests/my test.py b/tests/my test.py\n"
+    "index 1111111..2222222 100644\n"
+    "Binary files a/tests/my test.py and b/tests/my test.py differ\n"
+)
+
 
 class _CommitMessageGateway(FakeGateway):
-    """FakeGateway plus the commit-message read the collector needs. Records
-    every PR it was asked about, so "no entry" can be distinguished from
-    "asked and got nothing" — the point of the predicate is the CALL."""
+    """FakeGateway plus the two reads the collector needs: commit messages
+    (required-test trailers) and the revision-checked diff (tests-immutable
+    subjects + the patch id). Records which PRs it was asked about, so "no
+    entry" can be distinguished from "asked and got nothing" — the point of
+    the collector's predicate is the CALL."""
 
-    def __init__(self, messages=(), raises=None, **kw):
+    def __init__(self, messages=(), raises=None, diff=_CLEAN_DIFF, **kw):
         super().__init__(**kw)
         self.messages = tuple(messages)
         self.raises = raises
+        self.diff = diff
         self.commit_message_calls: list[int] = []
+        self.diff_calls: list[int] = []
 
     def pr_commit_messages(self, pr: int) -> tuple[str, ...]:
         self.commit_message_calls.append(pr)
@@ -2923,8 +2958,17 @@ class _CommitMessageGateway(FakeGateway):
             raise self.raises
         return self.messages
 
+    def pr_diff(self, pr: int, base_oid: str, head_oid: str):
+        self.diff_calls.append(pr)
+        if self.diff is None:
+            raise RuntimeError("gh pr diff exploded")
+        return PullRequestDiff(base_oid, head_oid, self.diff)
 
-_DECLARING_COMMIT = "fix: the expectation was wrong\n\nGate-Exemption: tests-immutable tests/test_x.py"
+
+_REQUIRED_TEST_TRAILER = "feat: config only\n\nGate-Exemption: required-test *"
+_IMMUTABLE_TRAILER = (
+    f"fix: correct it\n\nGate-Exemption: tests-immutable {_MODIFIED_TEST}"
+)
 
 
 def _merge_ready_pr(**kw) -> PRView:
@@ -2937,6 +2981,7 @@ def _merge_ready_pr(**kw) -> PRView:
         head_ref_oid="head-100",
         base_ref_oid="base-100",
         merge_state="CLEAN",
+        changed_files=frozenset({_MODIFIED_TEST, "src/app.py"}),
         reviews=(Review("APPROVED", "review-bot", "t1", commit_id="head-100"),),
         checks=(Check("build", bucket="pass"),),
     )
@@ -2950,19 +2995,73 @@ def _collect(gw, pr_view):
     )
 
 
-def test_a_declaring_merge_ready_pr_gets_facts_the_merge_rule_can_read():
-    # Anti-vacuity twin for the two exclusions below: the collector DOES work
-    # on the PRs the merge decision will actually consult.
-    gw = _CommitMessageGateway(messages=(_DECLARING_COMMIT,))
+def _subjects(facts, rule):
+    return sorted(d.subject for d in facts.declarations if d.rule == rule)
+
+
+def test_a_modified_existing_test_in_the_diff_is_an_automatic_declaration():
+    # The diff IS the declaration: no trailer anywhere, and the merge rule
+    # still learns it must require a grant for that file.
+    gw = _CommitMessageGateway(messages=("fix: correct it",), diff=_MODIFIED_TEST_DIFF)
     facts = _collect(gw, _merge_ready_pr())
-    assert gw.commit_message_calls == [100]
-    assert facts[100].declarations and not facts[100].unverifiable
+    assert _subjects(facts[100], "tests-immutable") == [_MODIFIED_TEST]
+    assert facts[100].patch_id and not facts[100].unverifiable
+
+
+def test_a_tests_immutable_trailer_declares_nothing_any_more():
+    # The trailer path for this rule is gone. A fixer that writes one (or a
+    # stale branch that carries one) must not be able to declare a subject
+    # the diff does not actually contain.
+    gw = _CommitMessageGateway(messages=(_IMMUTABLE_TRAILER,), diff=_CLEAN_DIFF)
+    assert _collect(gw, _merge_ready_pr()) == {}
+
+
+def test_a_required_test_trailer_is_still_collected():
+    # Absence of tests is ambiguous between "forgot" and "genuinely
+    # untestable", so the fixer's stated intent still carries information the
+    # diff cannot.
+    gw = _CommitMessageGateway(messages=(_REQUIRED_TEST_TRAILER,), diff=_CLEAN_DIFF)
+    facts = _collect(gw, _merge_ready_pr())
+    assert _subjects(facts[100], "required-test") == ["*"]
+    assert _subjects(facts[100], "tests-immutable") == []
+
+
+def test_both_rules_can_be_requested_by_one_change():
+    gw = _CommitMessageGateway(
+        messages=(_REQUIRED_TEST_TRAILER,), diff=_MODIFIED_TEST_DIFF
+    )
+    facts = _collect(gw, _merge_ready_pr())
+    assert _subjects(facts[100], "required-test") == ["*"]
+    assert _subjects(facts[100], "tests-immutable") == [_MODIFIED_TEST]
+
+
+def test_a_change_requesting_nothing_gets_no_entry_at_all():
+    # Anti-vacuity: absent facts leave should_automerge untouched, so an
+    # ordinary PR is completely unaffected by this machinery.
+    gw = _CommitMessageGateway(messages=("fix: ordinary",), diff=_CLEAN_DIFF)
+    assert _collect(gw, _merge_ready_pr()) == {}
+
+
+def test_an_unreadable_diff_is_unverifiable_even_with_nothing_declared():
+    # The diff is now REQUIRED to know the declarations: without it the
+    # harness can know neither the subjects nor the patch id, so "no
+    # declarations" is not something it may conclude. Withhold and retry.
+    gw = _CommitMessageGateway(messages=("fix: ordinary",), diff=None)
+    facts = _collect(gw, _merge_ready_pr())
+    assert facts[100].unverifiable is True
+    assert facts[100].declarations == ()
+
+
+def test_a_pr_with_no_diff_range_is_unverifiable_rather_than_undeclared():
+    gw = _CommitMessageGateway(messages=("fix: ordinary",), diff=_MODIFIED_TEST_DIFF)
+    facts = _collect(gw, _merge_ready_pr(base_ref_oid=""))
+    assert facts[100].unverifiable is True
 
 
 def test_a_pr_authored_by_someone_else_is_never_fact_collected():
     # Only the fixer's own PRs can auto-merge; a stranger's would burn a gh
     # call per tick for a decision that can never fire.
-    gw = _CommitMessageGateway(messages=(_DECLARING_COMMIT,))
+    gw = _CommitMessageGateway(diff=_MODIFIED_TEST_DIFF)
     facts = _collect(gw, _merge_ready_pr(author="a-human"))
     assert facts == {}
     assert gw.commit_message_calls == []
@@ -2971,7 +3070,7 @@ def test_a_pr_authored_by_someone_else_is_never_fact_collected():
 def test_a_blocked_pr_is_never_fact_collected():
     # needs-human-review means a human owns the next move — nothing will merge
     # it, so nothing needs the facts.
-    gw = _CommitMessageGateway(messages=(_DECLARING_COMMIT,))
+    gw = _CommitMessageGateway(diff=_MODIFIED_TEST_DIFF)
     facts = _collect(
         gw,
         _merge_ready_pr(
@@ -2983,7 +3082,7 @@ def test_a_blocked_pr_is_never_fact_collected():
 
 
 def test_a_pr_not_yet_merge_ready_is_never_fact_collected():
-    gw = _CommitMessageGateway(messages=(_DECLARING_COMMIT,))
+    gw = _CommitMessageGateway(diff=_MODIFIED_TEST_DIFF)
     pending = _merge_ready_pr(checks=(Check("build", state="IN_PROGRESS"),))
     assert _collect(gw, pending) == {}
     assert gw.commit_message_calls == []
@@ -2994,7 +3093,7 @@ def test_a_pr_out_of_automerge_scope_is_never_fact_collected():
     # the in-scope half, AUTO_MERGE=0 or a CONFLICTING approved PR paid a gh
     # call every tick forever for a decision that can never fire (round-3
     # MAJOR 4).
-    gw = _CommitMessageGateway(messages=(_DECLARING_COMMIT,))
+    gw = _CommitMessageGateway(diff=_MODIFIED_TEST_DIFF)
     off = _collect_test_exemptions(
         gw,
         WorldState(prs=(_merge_ready_pr(),)),
@@ -3004,11 +3103,11 @@ def test_a_pr_out_of_automerge_scope_is_never_fact_collected():
     )
     assert off == {} and gw.commit_message_calls == []
 
-    conflicted = _CommitMessageGateway(messages=(_DECLARING_COMMIT,))
+    conflicted = _CommitMessageGateway(diff=_MODIFIED_TEST_DIFF)
     assert _collect(conflicted, _merge_ready_pr(merge_state="CONFLICTING")) == {}
     assert conflicted.commit_message_calls == []
 
-    behind = _CommitMessageGateway(messages=(_DECLARING_COMMIT,))
+    behind = _CommitMessageGateway(diff=_MODIFIED_TEST_DIFF)
     assert _collect(behind, _merge_ready_pr(merge_state="BEHIND")) == {}
     assert behind.commit_message_calls == []
 
@@ -3017,7 +3116,9 @@ def test_a_branch_past_the_commit_fetch_ceiling_is_truncated_not_unverifiable():
     # Truncation is DURABLE — retrying never shrinks the branch — so it must
     # reach the merge rule as `truncated` (escalate once with an accurate
     # reason), never as `unverifiable` (retry silently forever).
-    gw = _CommitMessageGateway(messages=("chore: x",) * 100)
+    gw = _CommitMessageGateway(
+        messages=("chore: x",) * 100, diff=_MODIFIED_TEST_DIFF
+    )
     facts = _collect(gw, _merge_ready_pr())
     assert facts[100].truncated is True
     assert facts[100].unverifiable is False
@@ -3026,10 +3127,12 @@ def test_a_branch_past_the_commit_fetch_ceiling_is_truncated_not_unverifiable():
 
 def test_a_branch_just_under_the_ceiling_is_read_normally():
     # Anti-vacuity twin for the boundary: 99 commits is a normal read.
-    gw = _CommitMessageGateway(messages=("chore: x",) * 98 + (_DECLARING_COMMIT,))
+    gw = _CommitMessageGateway(
+        messages=("chore: x",) * 99, diff=_MODIFIED_TEST_DIFF
+    )
     facts = _collect(gw, _merge_ready_pr())
     assert facts[100].truncated is False
-    assert facts[100].declarations
+    assert _subjects(facts[100], "tests-immutable") == [_MODIFIED_TEST]
 
 
 def test_an_unreadable_commit_log_yields_unverifiable_facts_not_silence():
@@ -3039,4 +3142,63 @@ def test_an_unreadable_commit_log_yields_unverifiable_facts_not_silence():
     gw = _CommitMessageGateway(raises=RuntimeError("gh exploded"))
     facts = _collect(gw, _merge_ready_pr())
     assert facts[100].unverifiable is True
+    assert facts[100].declarations == ()
+
+
+def test_a_pr_touching_no_test_file_never_pays_for_a_diff():
+    # Round-4 MAJOR 3, the cost + availability fix: a PR that touches no
+    # test-shaped path can carry no tests-immutable request and needs no patch
+    # id, so it must not download a diff every tick — and, crucially, a diff
+    # failure must not be able to stall it.
+    gw = _CommitMessageGateway(messages=("fix: ordinary",), diff=_MODIFIED_TEST_DIFF)
+    facts = _collect(
+        gw, _merge_ready_pr(changed_files=frozenset({"src/app.py", "README.md"}))
+    )
+    assert facts == {}
+    assert gw.diff_calls == []
+
+
+def test_a_diff_outage_cannot_stall_a_pr_that_touches_no_test():
+    # The same PR with the diff endpoint broken still merges: nothing about it
+    # was ever unverifiable.
+    gw = _CommitMessageGateway(messages=("fix: ordinary",), diff=None)
+    facts = _collect(
+        gw, _merge_ready_pr(changed_files=frozenset({"src/app.py"}))
+    )
+    assert facts == {}
+    assert gw.diff_calls == []
+
+
+def test_a_trailer_alone_is_enough_to_pay_for_the_diff():
+    # A required-test request needs the patch id to bind a grant, so the diff
+    # is fetched even when no test-shaped path is touched.
+    gw = _CommitMessageGateway(
+        messages=(_REQUIRED_TEST_TRAILER,), diff=_CLEAN_DIFF
+    )
+    facts = _collect(
+        gw, _merge_ready_pr(changed_files=frozenset({"src/app.py"}))
+    )
+    assert gw.diff_calls == [100]
+    assert _subjects(facts[100], "required-test") == ["*"]
+
+
+def test_a_test_shaped_path_in_the_world_is_what_buys_the_diff():
+    # Anti-vacuity twin for the two skips above: the gate on the fetch is the
+    # observed file list, and a test path there does buy the call.
+    gw = _CommitMessageGateway(messages=("fix: x",), diff=_MODIFIED_TEST_DIFF)
+    facts = _collect(
+        gw, _merge_ready_pr(changed_files=frozenset({_MODIFIED_TEST}))
+    )
+    assert gw.diff_calls == [100]
+    assert _subjects(facts[100], "tests-immutable") == [_MODIFIED_TEST]
+
+
+def test_a_diff_record_with_an_unresolvable_path_withholds_durably():
+    # "We could not tell what this record touched" must not read as "it
+    # touched no tests" (round-4 BLOCKER 2). Durable, so the merge rule
+    # escalates it with an accurate reason rather than retrying forever.
+    gw = _CommitMessageGateway(messages=("fix: x",), diff=_UNDECIDABLE_DIFF)
+    facts = _collect(gw, _merge_ready_pr())
+    assert facts[100].undecidable_diff is True
+    assert facts[100].unverifiable is False
     assert facts[100].declarations == ()

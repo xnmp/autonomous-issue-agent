@@ -398,7 +398,9 @@ out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-pr.sh" pr 
   && ok "PR gate catches -F bad-prefix commit" || no "PR gate catches -F bad-prefix commit" "rc=$rc out=${out:0:160}"
 rm -rf "$d"
 
-# Modifying an EXISTING test file is blocked (only new test files allowed).
+# Modifying an EXISTING test file is ADMITTED (ADR 0014 revised, 2026-08-03):
+# the edit is an automatic exemption request the reviewer must grant before the
+# PR can merge. Denying it here was the #126/#163 comply-how loop.
 d=$(fresh_repo)
 ( cd "$d"
   # seed an existing test on dev
@@ -411,9 +413,9 @@ d=$(fresh_repo)
   echo "def test_keep(): assert False  # weakened" > tests/test_keep.py
   echo impl>impl.py; git add tests/test_keep.py impl.py
   git -c core.hooksPath=/dev/null commit -qm "green: impl + weaken existing test" )
-out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'existing test file'; } \
-  && ok "modifying existing test blocked" || no "modifying existing test blocked" "rc=$rc out=${out:0:160}"
+out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='test -f impl.py' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] \
+  && ok "modifying existing test admitted" || no "modifying existing test admitted" "rc=$rc out=${out:0:300}"
 rm -rf "$d"
 
 echo "== check-pr.sh #124 (reviewer-exemption DECLARATIONS) =="
@@ -453,61 +455,138 @@ setup_exempt_repo() {  # setup_exempt_repo "<trailer-lines>"
 # otherwise "blocked" here would stop proving anything about §7b.
 EXEMPT_TEST_CMD='test -f impl.py'
 
-# (a) the modified file IS declared → §7b lets it through.
-d=$(setup_exempt_repo "Gate-Exemption: tests-immutable tests/test_keep.py")
-out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD="$EXEMPT_TEST_CMD" bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-[ "$rc" -eq 0 ] && ok "declared tests-immutable exemption passes the PR gate" \
-  || no "declared tests-immutable exemption passes the PR gate" "rc=$rc out=${out:0:200}"
-rm -rf "$d" "$d.msg"
-
-# (b) a declaration naming a DIFFERENT path does not cover this edit — the
-#     exemption is per-file, not a branch-wide switch.
-d=$(setup_exempt_repo "Gate-Exemption: tests-immutable tests/test_other.py")
-out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD="$EXEMPT_TEST_CMD" bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'existing test file'; } \
-  && ok "declaration for another path still blocks this edit" \
-  || no "declaration for another path still blocks this edit" "rc=$rc out=${out:0:200}"
-rm -rf "$d" "$d.msg"
-
-# (c) the deny message teaches the trailer (the agent's only move out of §7b
-#     when the existing expectation is the bug).
+# (a) a modified existing test file is ADMITTED — the diff itself is the
+#     request, and the reviewer must grant it before the PR can merge.
 d=$(setup_exempt_repo "")
 out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD="$EXEMPT_TEST_CMD" bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -qF 'Gate-Exemption: tests-immutable tests/test_keep.py'; } \
-  && ok "§7b deny names the exact trailer to add" \
-  || no "§7b deny names the exact trailer to add" "rc=$rc out=${out:0:300}"
+[ "$rc" -eq 0 ] && ok "modified existing test passes the PR gate" \
+  || no "modified existing test passes the PR gate" "rc=$rc out=${out:0:300}"
 rm -rf "$d" "$d.msg"
 
-# (d) scope bound: MORE than 3 distinct declared subjects is a rewrite, not a
-#     correction — denied regardless of which files the diff touches.
-d=$(setup_exempt_repo "Gate-Exemption: tests-immutable tests/test_keep.py
-Gate-Exemption: tests-immutable tests/test_a.py
-Gate-Exemption: tests-immutable tests/test_b.py
-Gate-Exemption: tests-immutable tests/test_c.py")
-out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD="$EXEMPT_TEST_CMD" bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'more than 3'; } \
-  && ok "4 declared tests-immutable subjects blocked" \
-  || no "4 declared tests-immutable subjects blocked" "rc=$rc out=${out:0:200}"
+# (b) the deny message is GONE for this shape: nothing to teach, nothing to
+#     comply with. A gate that still named `Gate-Exemption: tests-immutable`
+#     would send the fixer after syntax that no longer exists.
+d=$(setup_exempt_repo "")
+out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD="$EXEMPT_TEST_CMD" bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 )
+printf '%s' "$out" | grep -qF 'Gate-Exemption: tests-immutable' \
+  && no "no tests-immutable trailer is taught any more" "out=${out:0:300}" \
+  || ok "no tests-immutable trailer is taught any more"
 rm -rf "$d" "$d.msg"
+
+# (c) a stale trailer neither helps nor harms: the rule reads the diff only.
+d=$(setup_exempt_repo "Gate-Exemption: tests-immutable tests/test_other.py")
+out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD="$EXEMPT_TEST_CMD" bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] && ok "a stale tests-immutable trailer changes nothing" \
+  || no "a stale tests-immutable trailer changes nothing" "rc=$rc out=${out:0:300}"
+rm -rf "$d" "$d.msg"
+
+# (d) scope bound: MORE than 3 modified existing test files is a rewrite, not a
+#     correction — denied, with no trailer syntax in the message.
+setup_rewrite_repo() {  # modifies $1 existing test files on the branch
+  local d n; d=$(fresh_repo); n=$1
+  (
+    cd "$d"
+    mkdir -p tests
+    for i in $(seq 1 "$n"); do echo "def test_$i(): assert True" > "tests/test_$i.py"; done
+    git add tests
+    git -c core.hooksPath=/dev/null commit -qm "test: baseline"
+    mkdir -p .claude .harness
+    git switch -qc fix/13-modtest
+    echo "def test_new_regression(): assert True" > tests/test_new_regression.py
+    git add tests/test_new_regression.py
+    git -c core.hooksPath=/dev/null commit -qm "red: new"
+    for i in $(seq 1 "$n"); do echo "def test_$i(): assert True  # corrected" > "tests/test_$i.py"; done
+    echo impl > impl.py
+    git add tests impl.py
+    git -c core.hooksPath=/dev/null commit -qm "green: impl + correct the existing tests"
+  )
+  echo "$d"
+}
+
+d=$(setup_rewrite_repo 4)
+out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD="$EXEMPT_TEST_CMD" bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'existing test files'; } \
+  && ok "4 modified existing test files blocked" \
+  || no "4 modified existing test files blocked" "rc=$rc out=${out:0:300}"
+printf '%s' "$out" | grep -qF 'Gate-Exemption' \
+  && no "the rewrite denial teaches no trailer" "out=${out:0:300}" \
+  || ok "the rewrite denial teaches no trailer"
+rm -rf "$d"
 
 # (e) exactly 3 is still within scope (the bound is the boundary, not 'any
-#     multiple declaration is suspicious').
-d=$(setup_exempt_repo "Gate-Exemption: tests-immutable tests/test_keep.py
-Gate-Exemption: tests-immutable tests/test_a.py
-Gate-Exemption: tests-immutable tests/test_b.py")
+#     multiple edit is suspicious').
+d=$(setup_rewrite_repo 3)
 out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD="$EXEMPT_TEST_CMD" bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-[ "$rc" -eq 0 ] && ok "3 declared tests-immutable subjects allowed" \
-  || no "3 declared tests-immutable subjects allowed" "rc=$rc out=${out:0:200}"
-rm -rf "$d" "$d.msg"
+[ "$rc" -eq 0 ] && ok "3 modified existing test files allowed" \
+  || no "3 modified existing test files allowed" "rc=$rc out=${out:0:300}"
+rm -rf "$d"
 
-# (f) a trailer is a LINE, not a substring: surrounding whitespace parses, so a
-#     git client (or a fixer) that indents the trailer block still gets its
-#     declaration read. Both regexes allow [ \t] on either side.
-d=$(setup_exempt_repo "   Gate-Exemption: tests-immutable tests/test_keep.py   ")
+# (f) a renamed-away existing test is COUNTED: moving a test out of the suite
+#     removes it as surely as deleting it, and deriving from the NEW-side name
+#     list alone let it escape entirely (round-4 adversarial review). Three
+#     renames plus one in-place edit is four subjects → over the bound.
+d=$(fresh_repo)
+( cd "$d"
+  mkdir -p tests docs
+  for i in 1 2 3 4; do echo "def test_$i(): assert True" > "tests/test_$i.py"; done
+  git add tests && git -c core.hooksPath=/dev/null commit -qm "test: baseline"
+  mkdir -p .claude .harness && git switch -qc fix/13-renames
+  echo "def test_new_regression(): assert True" > tests/test_new_regression.py
+  git add tests/test_new_regression.py
+  git -c core.hooksPath=/dev/null commit -qm "red: new"
+  for i in 1 2 3; do git mv "tests/test_$i.py" "docs/old_$i.txt"; done
+  echo "def test_4(): assert True  # corrected" > tests/test_4.py
+  echo impl > impl.py
+  git add -A
+  git -c core.hooksPath=/dev/null commit -qm "green: impl + move three tests out" )
 out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD="$EXEMPT_TEST_CMD" bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-[ "$rc" -eq 0 ] && ok "trailer with surrounding whitespace still parses" \
-  || no "trailer with surrounding whitespace still parses" "rc=$rc out=${out:0:200}"
-rm -rf "$d" "$d.msg"
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'existing test files'; } \
+  && ok "renamed-away tests count toward the scope bound" \
+  || no "renamed-away tests count toward the scope bound" "rc=$rc out=${out:0:300}"
+rm -rf "$d"
+
+# (f2) anti-vacuity twin for (f): the same branch with only TWO renames plus
+#      one edit is three subjects — within the bound, so it passes. Without
+#      this, "renames are counted" could be satisfied by denying everything.
+d=$(fresh_repo)
+( cd "$d"
+  mkdir -p tests docs
+  for i in 1 2 3 4; do echo "def test_$i(): assert True" > "tests/test_$i.py"; done
+  git add tests && git -c core.hooksPath=/dev/null commit -qm "test: baseline"
+  mkdir -p .claude .harness && git switch -qc fix/13-renames
+  echo "def test_new_regression(): assert True" > tests/test_new_regression.py
+  git add tests/test_new_regression.py
+  git -c core.hooksPath=/dev/null commit -qm "red: new"
+  for i in 1 2; do git mv "tests/test_$i.py" "docs/old_$i.txt"; done
+  echo "def test_4(): assert True  # corrected" > tests/test_4.py
+  echo impl > impl.py
+  git add -A
+  git -c core.hooksPath=/dev/null commit -qm "green: impl + move two tests out" )
+out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD="$EXEMPT_TEST_CMD" bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] && ok "two renames plus one edit stay within the bound" \
+  || no "two renames plus one edit stay within the bound" "rc=$rc out=${out:0:300}"
+rm -rf "$d"
+
+# (f3) a modified existing test whose path cannot be written as a grant subject
+#      is DENIED here, where the message can name the file — admitting it would
+#      guarantee a permanent merge withhold and a confusing escalation later.
+d=$(fresh_repo)
+( cd "$d"
+  mkdir -p tests && echo "def test_keep(): assert True" > "tests/my test.py"
+  git add "tests/my test.py" && git -c core.hooksPath=/dev/null commit -qm "test: baseline"
+  mkdir -p .claude .harness && git switch -qc fix/13-spacey
+  echo "def test_new_regression(): assert True" > tests/test_new_regression.py
+  git add tests/test_new_regression.py
+  git -c core.hooksPath=/dev/null commit -qm "red: new"
+  echo "def test_keep(): assert True  # corrected" > "tests/my test.py"
+  echo impl > impl.py
+  git add -A
+  git -c core.hooksPath=/dev/null commit -qm "green: impl + correct the spacey test" )
+out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD="$EXEMPT_TEST_CMD" bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'cannot be carried in a reviewer grant'; } \
+  && ok "an ungrantable test path denies with the charset message" \
+  || no "an ungrantable test path denies with the charset message" "rc=$rc out=${out:0:300}"
+rm -rf "$d"
 
 # ── §5 required-test: the whole-change subject `*` ────────────────────────────
 # A fix/ branch with NO test file anywhere in the diff. $1 is appended verbatim
@@ -554,13 +633,13 @@ out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-pr.sh" pr 
   || no "unknown-rule declaration is inert" "rc=$rc out=${out:0:200}"
 rm -rf "$d" "$d.msg"
 
-# (j) a required-test declaration does NOT bleed into §7b (subjects are read
-#     per rule, so `*` for one rule is not `*` for every rule).
-d=$(setup_exempt_repo "Gate-Exemption: required-test *")
-out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD="$EXEMPT_TEST_CMD" bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'existing test file'; } \
-  && ok "required-test declaration does not waive tests-immutable" \
-  || no "required-test declaration does not waive tests-immutable" "rc=$rc out=${out:0:200}"
+# (j) a trailer is a LINE, not a substring: surrounding whitespace parses, so a
+#     git client (or a fixer) that indents the trailer block still gets its
+#     declaration read. Both regexes allow [[:blank:]] on either side.
+d=$(setup_notest_repo "   Gate-Exemption: required-test *   ")
+out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] && ok "trailer with surrounding whitespace still parses" \
+  || no "trailer with surrounding whitespace still parses" "rc=$rc out=${out:0:200}"
 rm -rf "$d" "$d.msg"
 
 # (k) round-3 MAJOR 3: `*` PLUS another subject exceeds required-test's cap of
@@ -578,9 +657,10 @@ rm -rf "$d" "$d.msg"
 # (l) the malformed-trailer HINT must see a TAB-indented line too. `\s`/` ` in
 #     the grep class silently missed tabs, so an agent whose editor indents
 #     trailers with a tab got the bare denial and looped on "how do I comply"
-#     (#126 class). [[:blank:]] is the fix; this pins it.
-d=$(setup_exempt_repo "$(printf '\tGate-Exemption: tests-immutable @scope/pkg')")
-out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD="$EXEMPT_TEST_CMD" bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
+#     (#126 class). [[:blank:]] is the fix; this pins it. The hint rides the
+#     required-test denial — the only rule a trailer still governs.
+d=$(setup_notest_repo "$(printf '\tGate-Exemption: required-test @scope/pkg')")
+out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
 { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'did not parse'; } \
   && ok "tab-indented malformed trailer is counted in the hint" \
   || no "tab-indented malformed trailer is counted in the hint" "rc=$rc out=${out:0:400}"
@@ -588,12 +668,17 @@ rm -rf "$d" "$d.msg"
 
 # (m) anti-vacuity twin for (l): a WELL-FORMED trailer earns no hint, so the
 #     note means "your trailer is broken", not "trailers exist".
-d=$(setup_exempt_repo "Gate-Exemption: tests-immutable tests/test_other.py")
-out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD="$EXEMPT_TEST_CMD" bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-{ [ "$rc" -eq 1 ] && ! printf '%s' "$out" | grep -q 'did not parse'; } \
-  && ok "a well-formed trailer earns no malformed hint" \
-  || no "a well-formed trailer earns no malformed hint" "rc=$rc out=${out:0:400}"
-rm -rf "$d" "$d.msg"
+d=$(setup_notest_repo "Gate-Exemption: made-up-rule *")
+out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 )
+printf '%s' "$out" | grep -q 'did not parse' \
+  && ok "an unknown rule id is counted as a malformed trailer" \
+  || no "an unknown rule id is counted as a malformed trailer" "out=${out:0:400}"
+d2=$(setup_notest_repo "")
+out=$( cd "$d2" && BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 )
+printf '%s' "$out" | grep -q 'did not parse' \
+  && no "a branch with no trailers earns no malformed hint" "out=${out:0:400}" \
+  || ok "a branch with no trailers earns no malformed hint"
+rm -rf "$d" "$d.msg" "$d2" "$d2.msg"
 
 # feat/ branch accepts a conventionally-named test (test_*.py), not just e2e/integration.
 d=$(fresh_repo)
@@ -887,28 +972,31 @@ out=$( cd "$d" && PATH="$d/bin:$PATH" BASE_BRANCH=dev TEST_CMD='true' bash "$CHE
 [ "$rc" -eq 0 ] && ok "push w/ open PR + green allowed" || no "push w/ open PR + green allowed" "rc=$rc out=${out:0:160}"
 rm -rf "$d"
 
-# (d) open PR + a pre-existing (base-branch) test file modified → blocked.
+# (d) open PR + a pre-existing (base-branch) test file modified → ADMITTED.
+#     The push gate shares §7b with check-pr.sh; a rule the PR gate honours and
+#     the push gate denies would wedge the fixer between two gates with no
+#     legal move.
 d=$(fresh_repo); make_gh_stub "$d" "7"
 ( cd "$d"
   mkdir -p tests && echo "def test_keep(): assert True" > tests/test_keep.py
   git add tests/test_keep.py && git -c core.hooksPath=/dev/null commit -qm "test: baseline"
   git switch -qc fix/13-modtest
+  echo "def test_new(): assert True" > tests/test_new.py
+  git add tests/test_new.py && git -c core.hooksPath=/dev/null commit -qm "red: new"
   echo "def test_keep(): assert False  # weakened" > tests/test_keep.py
   echo impl>impl.py; git add tests/test_keep.py impl.py
   git -c core.hooksPath=/dev/null commit -qm "green: weaken existing test" )
 out=$( cd "$d" && PATH="$d/bin:$PATH" BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-push.sh" push 2>&1 ); rc=$?
-[ "$rc" -eq 1 ] && ok "push modifying existing test blocked" || no "push modifying existing test blocked" "rc=$rc out=${out:0:160}"
+[ "$rc" -eq 0 ] && ok "push modifying existing test admitted" || no "push modifying existing test admitted" "rc=$rc out=${out:0:300}"
 rm -rf "$d"
 
-# (d2) …and the same edit DECLARED (#124) is let through on the push gate too.
-#      §7b is shared code, but only check-pr.sh's call site was exercised above;
-#      an exemption the PR gate honours and the push gate denies would wedge the
-#      fixer between two gates with no legal move.
-d=$(setup_exempt_repo "Gate-Exemption: tests-immutable tests/test_keep.py"); make_gh_stub "$d" "7"
+# (d2) …and the scope bound still bites on the push gate, same as on the PR one.
+d=$(setup_rewrite_repo 4); make_gh_stub "$d" "7"
 out=$( cd "$d" && PATH="$d/bin:$PATH" BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-push.sh" push 2>&1 ); rc=$?
-[ "$rc" -eq 0 ] && ok "push with a declared tests-immutable exemption allowed" \
-  || no "push with a declared tests-immutable exemption allowed" "rc=$rc out=${out:0:200}"
-rm -rf "$d" "$d.msg"
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'existing test files'; } \
+  && ok "push rewriting 4 existing tests blocked" \
+  || no "push rewriting 4 existing tests blocked" "rc=$rc out=${out:0:300}"
+rm -rf "$d"
 
 # (e) non-governed branch → allow regardless (and never even calls gh).
 d=$(fresh_repo); ( cd "$d" && git switch -qc scratch-branch )

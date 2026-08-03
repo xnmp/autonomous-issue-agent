@@ -19,6 +19,7 @@ from issue_agent.app.planners.schemas import (
     review_schema_with_exemptions,
 )
 from issue_agent.domain.exemptions import (
+    MAX_DECLARATIONS_PER_CHANGE,
     ExemptionDeclaration,
     ExemptionFacts,
     exemptions_permit_merge,
@@ -1570,22 +1571,49 @@ def test_an_empty_head_sha_defers_rather_than_reviewing_the_live_checkout():
 # The harness renders the canonical grant line itself, binding the patch id the
 # model never sees — so a hallucinated or prompt-injected "grant" in the body
 # cannot bind, and a real grant cannot be forged by quoting.
+#
+# Since 2026-08-03 tests-immutable requests are AUTO-DECLARED from the same
+# revision-checked diff the reviewer is shown; required-test stays
+# trailer-declared. The reviewer is therefore always asked about exactly the
+# subject set the merge-side collector will require a grant for.
 _DECLARED_SUBJECT = "tests/test_x.py"
-_DECLARING_COMMIT = (
-    "fix: the expectation was wrong\n\n"
-    f"Gate-Exemption: tests-immutable {_DECLARED_SUBJECT}"
+_MODIFYING_DIFF = (
+    f"diff --git a/{_DECLARED_SUBJECT} b/{_DECLARED_SUBJECT}\n"
+    f"--- a/{_DECLARED_SUBJECT}\n"
+    f"+++ b/{_DECLARED_SUBJECT}\n"
+    "@@ -1 +1 @@\n"
+    "-assert x == 1\n"
+    "+assert x == 2\n"
 )
+_CLEAN_DIFF = (
+    "diff --git a/src/app.py b/src/app.py\n"
+    "--- a/src/app.py\n"
+    "+++ b/src/app.py\n"
+    "@@ -1 +1 @@\n"
+    "-x = 1\n"
+    "+x = 2\n"
+)
+_REQUIRED_TEST_TRAILER = "chore: config only\n\nGate-Exemption: required-test *"
 
 
 class _DeclaringGateway(FakeGateway):
-    """FakeGateway whose PR's commits declare a gate exemption."""
+    """FakeGateway whose PR's diff modifies an existing test file — the
+    automatic tests-immutable request. `messages` supplies commit trailers
+    (required-test only, these days); `raises` makes that read fail."""
 
-    def __init__(self, messages=(_DECLARING_COMMIT,), **kw):
+    def __init__(self, messages=(), diff=_MODIFYING_DIFF, raises=None, **kw):
         super().__init__(**kw)
         self.messages = tuple(messages)
+        self.diff = diff
+        self.raises = raises
 
     def pr_commit_messages(self, pr: int) -> tuple[str, ...]:
+        if self.raises is not None:
+            raise self.raises
         return self.messages
+
+    def pr_diff(self, pr: int, base_oid: str, head_oid: str):
+        return PullRequestDiff(base_oid, head_oid, self.diff)
 
 
 def _declaring_pr():
@@ -1620,9 +1648,13 @@ def _review_with(structured, gw=None, **cfg_overrides):
     return gw
 
 
-def _expected_grant_line(key=_MAC_KEY):
+def _expected_grant_line(key=_MAC_KEY, rule="tests-immutable", subject=None):
     return render_grant_line(
-        key, "tests-immutable", 5, _DECLARED_SUBJECT, patch_signature("diff text")
+        key,
+        rule,
+        5,
+        _DECLARED_SUBJECT if subject is None else subject,
+        patch_signature(_MODIFYING_DIFF),
     )
 
 
@@ -1724,7 +1756,9 @@ def test_the_review_task_of_a_declared_pr_carries_the_constrained_schema():
 
 
 def test_the_review_task_of_an_undeclared_pr_keeps_the_base_schema():
-    gw = _DeclaringGateway(messages=(), prs={100: _declaring_pr()})
+    gw = _DeclaringGateway(
+        messages=(), diff=_CLEAN_DIFF, prs={100: _declaring_pr()}
+    )
     runner = FakeRunner(
         AgentResult(is_error=False, structured={"decision": "APPROVE", "body": "ok"})
     )
@@ -1747,7 +1781,7 @@ def test_the_minted_grant_actually_authorizes_the_merge_it_is_bound_to():
     facts = ExemptionFacts(
         declarations=(ExemptionDeclaration("tests-immutable", _DECLARED_SUBJECT),),
         grants=grants,
-        patch_id=patch_signature("diff text"),
+        patch_id=patch_signature(_MODIFYING_DIFF),
     )
     assert exemptions_permit_merge(
         facts,
@@ -1854,3 +1888,196 @@ async def _a_review_task(gw, runner):
     """The real review task the workflow builds, borrowed for the unit above."""
     await _workflow(gw, FakeStore(), runner, exemption_mac_key=_MAC_KEY).review(100)
     return runner.tasks[0]
+
+
+def test_a_modified_existing_test_earns_the_notice_with_no_trailer_anywhere():
+    # The diff IS the request (ADR 0014 revised): a PR that carries no
+    # Gate-Exemption trailer at all still gets the notice and the enum schema,
+    # because the merge rule will require a grant for that file.
+    gw = _review_with({"decision": "APPROVE", "body": "ok"})
+    task = gw.dispatched_tasks[0]
+    assert "Gate exemption REQUESTED" in task.prompt
+    assert _DECLARED_SUBJECT in task.prompt
+    assert task.intent.schema["properties"]["exemption_grants"]["items"] == {
+        "enum": [{"rule": "tests-immutable", "subject": _DECLARED_SUBJECT}]
+    }
+
+
+def test_an_unreadable_commit_log_no_longer_costs_the_auto_declared_notice():
+    # The trailer read only carries required-test now, so its failure must not
+    # hide the tests-immutable request the diff already proves. Previously the
+    # reviewer was shown nothing and the PR escalated as ungranted.
+    gw = _DeclaringGateway(
+        raises=RuntimeError("gh exploded"), prs={100: _declaring_pr()}
+    )
+    gw = _review_with({"decision": "APPROVE", "body": "ok"}, gw=gw)
+    task = gw.dispatched_tasks[0]
+    assert "Gate exemption REQUESTED" in task.prompt
+    assert task.intent.schema["properties"]["exemption_grants"]["items"] == {
+        "enum": [{"rule": "tests-immutable", "subject": _DECLARED_SUBJECT}]
+    }
+
+
+def test_a_required_test_trailer_still_reaches_the_reviewer():
+    gw = _DeclaringGateway(
+        messages=(_REQUIRED_TEST_TRAILER,),
+        diff=_CLEAN_DIFF,
+        prs={100: _declaring_pr()},
+    )
+    gw = _review_with({"decision": "APPROVE", "body": "ok"}, gw=gw)
+    task = gw.dispatched_tasks[0]
+    assert "Gate exemption REQUESTED" in task.prompt
+    assert task.intent.schema["properties"]["exemption_grants"]["items"] == {
+        "enum": [{"rule": "required-test", "subject": "*"}]
+    }
+
+
+def test_a_tests_immutable_trailer_alone_requests_nothing():
+    # The trailer path for this rule is gone: a stale or hand-written trailer
+    # must not add a subject the diff does not contain.
+    gw = _DeclaringGateway(
+        messages=(
+            f"fix: x\n\nGate-Exemption: tests-immutable {_DECLARED_SUBJECT}",
+        ),
+        diff=_CLEAN_DIFF,
+        prs={100: _declaring_pr()},
+    )
+    gw = _review_with({"decision": "APPROVE", "body": "ok"}, gw=gw)
+    task = gw.dispatched_tasks[0]
+    assert "Gate exemption REQUESTED" not in task.prompt
+    assert task.intent.schema == REVIEW_SCHEMA
+
+
+def test_the_reviewer_can_grant_both_rules_in_one_round():
+    gw = _DeclaringGateway(
+        messages=(_REQUIRED_TEST_TRAILER,),
+        diff=_MODIFYING_DIFF,
+        prs={100: _declaring_pr()},
+    )
+    gw = _review_with(
+        {
+            "decision": "APPROVE",
+            "body": "ok",
+            "exemption_grants": [
+                {"rule": "tests-immutable", "subject": _DECLARED_SUBJECT},
+                {"rule": "required-test", "subject": "*"},
+            ],
+        },
+        gw=gw,
+    )
+    granted = {
+        (g.rule, g.subject) for g in parse_exemption_grants(_submitted_body(gw))
+    }
+    assert granted == {
+        ("tests-immutable", _DECLARED_SUBJECT),
+        ("required-test", "*"),
+    }
+
+
+def test_a_diff_path_outside_the_grant_charset_is_never_offered_for_granting():
+    # Auto-declared subjects come from diff paths, which the trailer grammar
+    # never bounded. An unrenderable path must not reach the reviewer at all
+    # (belt and braces — the publish gate denies this shape pre-merge), and
+    # must certainly never produce a broken grant line.
+    hostile = "tests/my test.py"
+    gw = _DeclaringGateway(
+        diff=(
+            f"diff --git a/{hostile} b/{hostile}\n"
+            f"--- a/{hostile}\n"
+            f"+++ b/{hostile}\n"
+        ),
+        prs={100: _declaring_pr()},
+    )
+    gw = _review_with(
+        {
+            "decision": "APPROVE",
+            "body": "ok",
+            "exemption_grants": [
+                {"rule": "tests-immutable", "subject": hostile}
+            ],
+        },
+        gw=gw,
+    )
+    task = gw.dispatched_tasks[0]
+    # The diff itself is (untrusted) prompt content; what must be absent is the
+    # REQUEST — the declared list and the grantable enum.
+    assert "Gate exemption REQUESTED" not in task.prompt
+    assert f'subject="{hostile}"' not in task.prompt
+    assert task.intent.schema == REVIEW_SCHEMA
+    body = _submitted_body(gw)
+    assert "gate-exemption: granted" not in body
+    assert parse_exemption_grants(body) == ()
+
+
+def test_an_ungrantable_path_does_not_suppress_its_grantable_neighbour():
+    # Anti-vacuity twin: filtering one subject must not cost the others.
+    hostile = "tests/my test.py"
+    gw = _DeclaringGateway(
+        diff=(
+            f"diff --git a/{hostile} b/{hostile}\n"
+            f"--- a/{hostile}\n"
+            f"+++ b/{hostile}\n"
+            + _MODIFYING_DIFF
+        ),
+        prs={100: _declaring_pr()},
+    )
+    gw = _review_with({"decision": "APPROVE", "body": "ok"}, gw=gw)
+    task = gw.dispatched_tasks[0]
+    assert task.intent.schema["properties"]["exemption_grants"]["items"] == {
+        "enum": [{"rule": "tests-immutable", "subject": _DECLARED_SUBJECT}]
+    }
+    assert f'subject="{hostile}"' not in task.prompt
+
+
+def test_the_reviewer_is_never_handed_more_subjects_than_the_declaration_cap():
+    # Every subject lands in the reviewer's TRUSTED prompt tail and in the
+    # schema enum, so the auto-declared set is bounded exactly like the
+    # trailer-parsed one (round-4 MINOR 7). A change over the cap is denied by
+    # the gate and withheld at merge anyway.
+    many = "".join(
+        f"diff --git a/tests/test_{i}.py b/tests/test_{i}.py\n"
+        f"--- a/tests/test_{i}.py\n"
+        f"+++ b/tests/test_{i}.py\n"
+        for i in range(MAX_DECLARATIONS_PER_CHANGE + 7)
+    )
+    gw = _DeclaringGateway(diff=many, prs={100: _declaring_pr()})
+    gw = _review_with({"decision": "APPROVE", "body": "ok"}, gw=gw)
+    enum = gw.dispatched_tasks[0].intent.schema["properties"][
+        "exemption_grants"
+    ]["items"]["enum"]
+    assert len(enum) == MAX_DECLARATIONS_PER_CHANGE
+    assert gw.dispatched_tasks[0].prompt.count('rule="tests-immutable"') == (
+        MAX_DECLARATIONS_PER_CHANGE
+    )
+
+
+def test_the_auto_declared_request_round_trips_from_diff_to_merge_permission():
+    # End to end across the seam: the diff declares, the reviewer grants
+    # structurally, the harness mints the MACed line, and the merge rule —
+    # deriving the SAME subject from the SAME diff — permits.
+    gw = _review_with({
+        "decision": "APPROVE",
+        "body": "the old assertion encoded the defect",
+        "exemption_grants": [
+            {"rule": "tests-immutable", "subject": _DECLARED_SUBJECT}
+        ],
+    })
+    from issue_agent.domain.gate import modified_existing_tests_from_diff
+
+    subjects, undecidable = modified_existing_tests_from_diff(_MODIFYING_DIFF)
+    assert subjects == (_DECLARED_SUBJECT,) and undecidable == 0
+    facts = ExemptionFacts(
+        declarations=tuple(
+            ExemptionDeclaration("tests-immutable", s) for s in subjects
+        ),
+        grants=parse_exemption_grants(_submitted_body(gw)),
+        patch_id=patch_signature(_MODIFYING_DIFF),
+    )
+    assert exemptions_permit_merge(
+        facts,
+        issue_number=5,
+        identity_mode=IdentityMode.THREE,
+        fix_bot="fix-bot",
+        review_bot="review-bot",
+        mac_key=_MAC_KEY,
+    ) is True

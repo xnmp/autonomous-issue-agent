@@ -33,6 +33,8 @@ from issue_agent.domain.gate import (
     check_tests,
     check_tests_immutable,
     gate_is_toothless,
+    modified_existing_tests,
+    modified_existing_tests_from_diff,
     head_is_detached,
     partition_changed,
     push_gate_mode,
@@ -539,66 +541,329 @@ def test_visual_evidence_body_defaults_to_the_floor_rule():
     assert check_visual_evidence(True, ["evidence/tab.png"], ["tab.png"]).ok
 
 
-def test_existing_test_must_not_change():
+def test_editing_an_existing_test_is_an_automatic_exemption_request():
+    # ADR 0014 revised (2026-08-03): the diff IS the declaration. Within the
+    # scope bound the edit is ADMITTED so the reviewer can judge it — it
+    # authorizes nothing, because the MERGE rule still withholds until
+    # REVIEW_BOT grants each modified file. Denying here produced the
+    # #126/#163 comply-how loops.
     existed = {"tests/test_app.py"}
-    res = check_tests_immutable(["tests/test_app.py"], lambda f: f in existed)
-    assert not res.ok
-    # a NEW test file (not at base) is fine
-    assert check_tests_immutable(["tests/test_new.py"], lambda f: f in existed).ok
-
-
-# ── #124 exemption REQUEST path: a declared edit is let into the PR ──────────
-def test_declared_existing_test_edit_passes_the_commit_gate():
-    # The declaration makes the edit explicit; it authorizes nothing — the
-    # MERGE gate (exemptions.exemptions_permit_merge) withholds until granted.
-    existed = {"tests/test_app.py"}
+    assert check_tests_immutable(["tests/test_app.py"], lambda f: f in existed).ok
     assert check_tests_immutable(
-        ["tests/test_app.py", "src/app.py"],
-        lambda f: f in existed,
-        declared=("tests/test_app.py",),
+        ["tests/test_app.py", "src/app.py"], lambda f: f in existed
     ).ok
+    # a NEW test file (not at base) was never the subject of this rule
+    assert check_tests_immutable(["tests/test_new.py"], lambda f: f in existed).ok
+    # ...and a change touching no test at all is untouched by it either way.
+    assert check_tests_immutable(["src/app.py"], lambda f: f in existed).ok
 
 
-def test_undeclared_edit_still_denies_with_the_recovery_script():
-    # Anti-regression for the keifu #126 message extension: the deny must keep
-    # telling a benign agent HOW to comply (move tests out + restore the file).
-    existed = {"tests/test_app.py", "tests/test_other.py"}
-    res = check_tests_immutable(
-        ["tests/test_other.py"],
-        lambda f: f in existed,
-        declared=("tests/test_app.py",),  # declares a DIFFERENT file
-    )
-    assert not res.ok
-    assert "tests/test_other.py" in res.reason
-    assert "move them to a new test file" in res.reason
-    assert "git checkout <base>" in res.reason
-    # ...and it must teach the generalized trailer, naming the offending file.
-    assert "Gate-Exemption: tests-immutable tests/test_other.py" in res.reason
-
-
-def test_more_than_the_bound_declared_denies_regardless():
+def test_a_mass_test_rewrite_is_still_denied_at_the_scope_bound():
+    # The one thing the gate still refuses: beyond the bound this reads as a
+    # rewrite, not a correction, and an unbounded auto-declaration would hand
+    # the reviewer an unreviewable hazard list.
     n = MAX_TEST_IMMUTABILITY_EXCEPTIONS + 1
     existed = {f"tests/test_{i}.py" for i in range(n)}
-    res = check_tests_immutable(
-        sorted(existed),
-        lambda f: f in existed,
-        declared=tuple(sorted(existed)),
-    )
+    res = check_tests_immutable(sorted(existed), lambda f: f in existed)
     assert not res.ok
-    assert "exemption" in res.reason
-    # exactly at the bound, the same declared edits pass
+    assert str(MAX_TEST_IMMUTABILITY_EXCEPTIONS) in res.reason
+    # The message must point at the way out (reduce scope / add new files),
+    # never at trailer syntax — there is no trailer for this rule any more.
+    assert "reduce the change's scope" in res.reason
+    assert "Gate-Exemption" not in res.reason
+    # Exactly at the bound still passes: the bound is the boundary, not
+    # "more than one existing test is suspicious".
     at_bound = sorted(existed)[:MAX_TEST_IMMUTABILITY_EXCEPTIONS]
+    assert check_tests_immutable(at_bound, lambda f: f in existed).ok
+
+
+def test_only_existing_test_files_count_toward_the_bound():
+    # Anti-vacuity for the bound: new test files and non-test files are not
+    # subjects, so a big change is not denied for touching many of them.
+    existed = {"tests/test_app.py", "src/a.py", "src/b.py", "src/c.py", "src/d.py"}
+    changed = [
+        "tests/test_app.py",
+        "tests/test_new_1.py",
+        "tests/test_new_2.py",
+        "src/a.py", "src/b.py", "src/c.py", "src/d.py",
+    ]
+    assert check_tests_immutable(changed, lambda f: f in existed).ok
+
+
+# ── auto-declared subjects: the diff IS the declaration ─────────────────────
+def test_modified_existing_tests_names_exactly_the_edited_existing_tests():
+    existed = {"tests/test_app.py", "tests/test_other.py"}
+    assert modified_existing_tests(
+        ["tests/test_app.py", "tests/test_new.py", "src/app.py"],
+        lambda f: f in existed,
+    ) == ("tests/test_app.py",)
+    assert modified_existing_tests([], lambda f: f in existed) == ()
+
+
+def _record(header: str, *body: str) -> str:
+    """One `diff --git` record, as git actually renders it."""
+    return "\n".join((f"diff --git {header}",) + body) + "\n"
+
+
+def test_diff_derived_subjects_come_from_the_record_header_not_the_minus_line():
+    # Round-4 BLOCKER 1: deriving from `--- a/` made ABSENCE of that line mean
+    # "no exemption needed", so every record git emits without one — binary,
+    # rename, mode-only, `.gitattributes -diff` — silently disabled the whole
+    # regime. `diff --git` is emitted unconditionally, so that is the anchor.
+    diff = (
+        _record(
+            "a/tests/x_test.py b/tests/x_test.py",
+            "index 1111111..2222222 100644",
+            "--- a/tests/x_test.py",
+            "+++ b/tests/x_test.py",
+            "@@ -1 +1 @@",
+            "-assert x == 1",
+            "+assert x == 2",
+        )
+        + _record(
+            "a/src/app.py b/src/app.py",
+            "--- a/src/app.py",
+            "+++ b/src/app.py",
+        )
+    )
+    assert modified_existing_tests_from_diff(diff) == (("tests/x_test.py",), 0)
+
+
+def test_a_binary_test_record_still_declares_its_subject():
+    # A binary (or `-diff`-suppressed) record carries NO `--- a/` line at all.
+    # One `tests/** -diff` attribute used to turn the whole rule off.
+    binary = _record(
+        "a/tests/x_test.py b/tests/x_test.py",
+        "index 1111111..2222222 100644",
+        "Binary files a/tests/x_test.py and b/tests/x_test.py differ",
+    )
+    assert modified_existing_tests_from_diff(binary) == (("tests/x_test.py",), 0)
+
+
+def test_a_diff_suppressed_record_still_declares_its_subject():
+    # `.gitattributes: tests/** -diff` renders exactly this shape.
+    suppressed = _record(
+        "a/tests/y_test.py b/tests/y_test.py",
+        "index 1111111..2222222 100644",
+        "Binary files a/tests/y_test.py and b/tests/y_test.py differ",
+    )
+    assert modified_existing_tests_from_diff(suppressed) == (
+        ("tests/y_test.py",),
+        0,
+    )
+
+
+def test_renaming_a_test_out_of_the_suite_declares_the_OLD_path():
+    # Renaming a test to a non-test path removes it from the suite as surely
+    # as deleting it, and the NEW path is not test-shaped — so only the old
+    # path can be the subject.
+    renamed = _record(
+        "a/tests/y_test.py b/docs/old.txt",
+        "similarity index 100%",
+        "rename from tests/y_test.py",
+        "rename to docs/old.txt",
+    )
+    assert modified_existing_tests_from_diff(renamed) == (
+        ("tests/y_test.py",),
+        0,
+    )
+
+
+def test_a_mode_only_change_to_an_existing_test_still_declares_it():
+    # No content hunk, no `--- a/` line — but the file existed at base and the
+    # change touches it. `new mode` must not be mistaken for `new file mode`.
+    mode_only = _record(
+        "a/tests/z_test.py b/tests/z_test.py",
+        "old mode 100644",
+        "new mode 100755",
+    )
+    assert modified_existing_tests_from_diff(mode_only) == (
+        ("tests/z_test.py",),
+        0,
+    )
+
+
+def test_an_added_test_file_declares_nothing():
+    # Anti-vacuity for every case above: `new file mode` is the one marker
+    # that means "nothing existed at base", so a brand-new test is not a
+    # subject and the fixer pays no grant for writing one.
+    added = _record(
+        "a/tests/test_added.py b/tests/test_added.py",
+        "new file mode 100644",
+        "index 0000000..1111111",
+        "--- /dev/null",
+        "+++ b/tests/test_added.py",
+    )
+    assert modified_existing_tests_from_diff(added) == ((), 0)
+
+
+def test_a_deleted_test_file_is_a_subject():
+    deleted = _record(
+        "a/tests/test_gone.py b/tests/test_gone.py",
+        "deleted file mode 100644",
+        "--- a/tests/test_gone.py",
+        "+++ /dev/null",
+    )
+    assert modified_existing_tests_from_diff(deleted) == (
+        ("tests/test_gone.py",),
+        0,
+    )
+
+
+def test_a_c_quoted_non_ascii_path_is_decoded_not_dropped():
+    # Git C-quotes non-ASCII paths. Dropping the record would let a renamed
+    # `tests/test_café.py` edit through unrequested.
+    quoted = _record(
+        '"a/tests/test_caf\\303\\251.py" "b/tests/test_caf\\303\\251.py"',
+        "index 1111111..2222222 100644",
+        "Binary files differ",
+    )
+    subjects, undecidable = modified_existing_tests_from_diff(quoted)
+    assert subjects == ("tests/test_café.py",)
+    assert undecidable == 0
+
+
+def test_an_unresolvable_path_is_counted_undecidable_never_dropped():
+    # An unquoted path containing spaces has no unique split on the header
+    # line, and a binary record carries no `--- a/` witness. "We could not
+    # tell what this touched" must NOT read as "it touched no tests"
+    # (round-4 BLOCKER 2) — it is counted so the caller withholds.
+    ambiguous = _record(
+        "a/tests/my test.py b/tests/my test.py",
+        "index 1111111..2222222 100644",
+        "Binary files a/tests/my test.py and b/tests/my test.py differ",
+    )
+    subjects, undecidable = modified_existing_tests_from_diff(ambiguous)
+    assert subjects == ()
+    assert undecidable >= 1
+
+
+def test_a_spaced_path_with_a_minus_witness_resolves_instead_of_counting():
+    # Anti-vacuity twin: the fallback is real. A textual record names the old
+    # path unambiguously on its `--- a/` line, so it is resolved, not counted.
+    witnessed = _record(
+        "a/tests/my test.py b/tests/my test.py",
+        "index 1111111..2222222 100644",
+        "--- a/tests/my test.py",
+        "+++ b/tests/my test.py",
+        "@@ -1 +1 @@",
+        "-assert x == 1",
+        "+assert x == 2",
+    )
+    assert modified_existing_tests_from_diff(witnessed) == (
+        ("tests/my test.py",),
+        0,
+    )
+
+
+def test_an_unreadable_diff_is_undecidable_not_empty():
+    # The most dangerous default: `((), 0)` on junk would read as "this change
+    # touches no existing test" and merge.
+    for junk in (None, 42, b"diff --git a/tests/t_test.py b/tests/t_test.py", ["x"]):
+        assert modified_existing_tests_from_diff(junk) == ((), 1), junk
+    # An EMPTY string is a str, so it parses honestly: no records, nothing
+    # undecidable.
+    assert modified_existing_tests_from_diff("") == ((), 0)
+    assert modified_existing_tests_from_diff("no records here") == ((), 0)
+
+
+def test_mixed_records_are_each_classified_on_their_own_evidence():
+    diff = (
+        _record(
+            "a/tests/a_test.py b/tests/a_test.py",
+            "Binary files a/tests/a_test.py and b/tests/a_test.py differ",
+        )
+        + _record(
+            "a/tests/test_added.py b/tests/test_added.py",
+            "new file mode 100644",
+            "--- /dev/null",
+            "+++ b/tests/test_added.py",
+        )
+        + _record(
+            "a/tests/b_test.py b/docs/moved.txt",
+            "rename from tests/b_test.py",
+            "rename to docs/moved.txt",
+        )
+        + _record(
+            "a/tests/weird name.py b/tests/weird name.py",
+            "Binary files a/tests/weird name.py and b/tests/weird name.py differ",
+        )
+        + _record(
+            "a/src/app.py b/src/app.py",
+            "--- a/src/app.py",
+            "+++ b/src/app.py",
+        )
+    )
+    subjects, undecidable = modified_existing_tests_from_diff(diff)
+    assert subjects == ("tests/a_test.py", "tests/b_test.py")
+    assert undecidable == 1
+
+
+def test_diff_derived_subjects_dedupe_and_preserve_order():
+    diff = (
+        _record("a/tests/test_b.py b/tests/test_b.py", "--- a/tests/test_b.py")
+        + _record("a/tests/test_a.py b/tests/test_a.py", "--- a/tests/test_a.py")
+        + _record("a/tests/test_b.py b/tests/test_b.py", "--- a/tests/test_b.py")
+    )
+    assert modified_existing_tests_from_diff(diff) == (
+        ("tests/test_b.py", "tests/test_a.py"),
+        0,
+    )
+
+
+def test_the_two_subject_derivations_agree_on_the_same_change():
+    # The gate reads a worktree, the collector and the reviewer notice read a
+    # diff. Both must name the SAME subjects or the merge rule asks for a
+    # grant the reviewer was never shown.
+    existed = {"tests/test_app.py"}
+    changed = ["tests/test_app.py", "tests/test_new.py", "src/app.py"]
+    diff = (
+        _record(
+            "a/tests/test_app.py b/tests/test_app.py",
+            "--- a/tests/test_app.py",
+            "+++ b/tests/test_app.py",
+        )
+        + _record(
+            "a/tests/test_new.py b/tests/test_new.py",
+            "new file mode 100644",
+            "--- /dev/null",
+            "+++ b/tests/test_new.py",
+        )
+        + _record(
+            "a/src/app.py b/src/app.py",
+            "--- a/src/app.py",
+            "+++ b/src/app.py",
+        )
+    )
+    subjects, undecidable = modified_existing_tests_from_diff(diff)
+    assert undecidable == 0
+    assert modified_existing_tests(changed, lambda f: f in existed) == subjects
+
+
+# ── an ungrantable path is denied at the gate, not admitted then wedged ──────
+def test_a_modified_test_whose_path_cannot_be_granted_is_denied():
+    # Round-4 MINOR 6: admitting it would guarantee a permanent merge withhold
+    # and a confusing escalation later. Deny where the message can name the
+    # file and the fix is cheap.
+    for bad in ("tests/my test.py", "tests/test_café.py", "tests/@scope/t_test.py"):
+        res = check_tests_immutable([bad], lambda f: f == bad)
+        assert not res.ok, bad
+        assert bad in res.reason, bad
+        assert "charset" in res.reason or "letters, digits" in res.reason, bad
+
+
+def test_an_ungrantable_path_that_is_not_an_existing_test_denies_nothing():
+    # Anti-vacuity: the charset rule only governs the subjects this rule
+    # auto-declares. A weird path that is NOT an existing test is untouched.
+    assert check_tests_immutable(["src/my file.py"], lambda f: True).ok
     assert check_tests_immutable(
-        at_bound, lambda f: f in existed, declared=tuple(at_bound)
+        ["tests/my new test.py"], lambda f: False
     ).ok
 
 
-def test_no_declaration_keeps_todays_behaviour_exactly():
-    # Anti-vacuity: the default () must reproduce the pre-#124 results verbatim
-    # (the shell twin and the parity goldens know nothing of declarations).
-    existed = {"tests/test_app.py"}
-    assert not check_tests_immutable(["tests/test_app.py"], lambda f: f in existed).ok
-    assert check_tests_immutable(["src/app.py"], lambda f: f in existed).ok
+def test_ordinary_paths_within_the_bound_still_pass_the_charset_check():
+    existed = {"tests/test_a.py", "tests/test_b.py", "tests/c_test.py"}
+    assert check_tests_immutable(sorted(existed), lambda f: f in existed).ok
 
 
 # ── test command resolution + §1 ──────────────────────────────────────────────

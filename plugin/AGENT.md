@@ -228,7 +228,14 @@ don't keep going back to edit it — each re-plan costs a full model round-trip.
 ## Hard rules
 - Do NOT use `--no-verify`, `-n` on commit, `HUSKY=0`, or override
   `core.hooksPath`. The gate is mandatory and these are blocked anyway.
-- Do NOT skip, disable, or modify existing tests. Do NOT refactor unrelated code.
+- Prefer ADDING tests over changing existing ones, and never skip or disable a
+  test to go green. You MAY correct an existing test whose expectation is
+  itself wrong (including making it self-isolating so it passes on any host):
+  do it directly — no trailer, no permission request — and explain the
+  correction in the PR description. The gate admits up to 3 modified existing
+  test files (more reads as a rewrite and is denied), and the independent
+  reviewer must explicitly approve every one of them before the PR can merge,
+  so a weakened test cannot land unnoticed. Do NOT refactor unrelated code.
 - Do NOT suppress a quality/security signal for the code THIS change adds or
   modifies in order to go green. The default is to fix the underlying cause:
   exclusions, threshold drops, `nosec`/`noqa`/`eslint-disable`/`# type: ignore`,

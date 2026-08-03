@@ -30,6 +30,7 @@ from .exemptions import (
     RULE_TESTS_IMMUTABLE,
     SUBJECT_WHOLE_CHANGE,
     check_declaration_scope,
+    valid_subject,
 )
 from .refs import is_governed_branch
 
@@ -512,57 +513,164 @@ def check_visual_evidence(
     return ALLOW
 
 
+def modified_existing_tests(
+    changed: Iterable[str],
+    exists_at_base: Callable[[str], bool],
+) -> tuple[str, ...]:
+    """The existing test files this change modifies or deletes — the
+    AUTO-DECLARED tests-immutable exemption subjects (ADR 0014, revised
+    2026-08-03). The diff itself is the declaration: no trailer ceremony,
+    nothing for the fixer to get syntactically wrong, no comply-how loop.
+    Shared by the gate (scope bound), the merge-side facts collector, and
+    the reviewer notice, so all three always name the same subjects."""
+    return tuple(
+        f for f in changed if looks_like_test(f) and exists_at_base(f)
+    )
+
+
+# Per-file records. `diff --git` is emitted UNCONDITIONALLY for every changed
+# path — including binary files, pure renames, mode-only changes, and paths
+# suppressed by `.gitattributes -diff`, all of which emit NO `--- a/` line.
+# Deriving from `--- a/` instead made absence-of-header mean "no exemption
+# needed", so one `tests/** -diff` attribute disabled the whole regime
+# (round-4 adversarial review, BLOCKER 1). Anchored at column 0 with the
+# `diff --git ` prefix, which diff CONTENT can never produce (content lines
+# carry a leading +/-/space).
+_DIFF_RECORD_RE = re.compile(r"^diff --git (.+)$", re.MULTILINE)
+_DIFF_NEW_FILE_RE = re.compile(r"^new file mode ", re.MULTILINE)
+_DIFF_RENAME_FROM_RE = re.compile(r"^rename from (.+)$", re.MULTILINE)
+
+
+def _unquote_diff_path(raw: str) -> str | None:
+    """One side of a `diff --git` header → repo-relative path, or None when
+    the rendering is ambiguous. Git C-quotes paths containing non-ASCII or
+    special characters; unquoted paths containing SPACES are genuinely
+    ambiguous on this line (`a/x y.py b/x y.py` has no unique split), so those
+    resolve via the record body instead of a guess."""
+    raw = raw.strip()
+    if raw.startswith('"'):
+        end = raw.find('"', 1)
+        while end > 0 and raw[end - 1] == "\\":
+            end = raw.find('"', end + 1)
+        if end < 0:
+            return None
+        try:
+            decoded = (
+                raw[1:end]
+                .encode("latin-1", "backslashreplace")
+                .decode("unicode_escape")
+                .encode("latin-1")
+                .decode("utf-8")
+            )
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            return None
+        return decoded[2:] if decoded.startswith(("a/", "b/")) else decoded
+    if " " in raw:
+        return None  # ambiguous split; the caller falls back
+    return raw[2:] if raw.startswith(("a/", "b/")) else raw
+
+
+def modified_existing_tests_from_diff(
+    diff_text: object,
+) -> tuple[tuple[str, ...], int]:
+    """(subjects, undecidable) — `modified_existing_tests` derived from a
+    unified diff instead of a worktree, for the merge-side collector and the
+    reviewer notice, which hold the revision-checked diff and no checkout.
+
+    A record counts when it touches a path that existed at base (anything but
+    `new file mode`) and looks like a test — covering binary, rename-away,
+    mode-only and `-diff`-suppressed records that emit no `--- a/` line. A
+    rename's OLD path is the subject: renaming a test out of the test tree
+    removes it from the suite as surely as deleting it.
+
+    `undecidable` counts records whose old path could not be resolved
+    (ambiguous unquoted spaces with no `rename from`/`--- a/` witness). It is
+    never silently zero-valued: callers treat non-zero as WITHHELD, because
+    "we could not tell what this touched" must not read as "it touched no
+    tests"."""
+    if not isinstance(diff_text, str):
+        return (), 1  # unreadable ⇒ undecidable, never "nothing to declare"
+    subjects: dict[str, None] = {}
+    undecidable = 0
+    records = list(_DIFF_RECORD_RE.finditer(diff_text))
+    for index, match in enumerate(records):
+        start = match.end()
+        end = (
+            records[index + 1].start()
+            if index + 1 < len(records)
+            else len(diff_text)
+        )
+        body = diff_text[start:end]
+        if _DIFF_NEW_FILE_RE.search(body):
+            continue  # added file: nothing existed at base
+        old = None
+        rename = _DIFF_RENAME_FROM_RE.search(body)
+        if rename:
+            old = rename.group(1).strip()
+        else:
+            header = match.group(1)
+            # `a/<p> b/<p>` for the common same-path case: take the a-side by
+            # splitting at the LAST ` b/` so paths containing " b/" resolve.
+            split = header.rfind(" b/")
+            candidate = header[:split] if split > 0 else header
+            old = _unquote_diff_path(candidate)
+            if old is None:
+                minus = re.search(
+                    r"^--- (?:a/)?(.+)$", body, re.MULTILINE
+                )
+                if minus and minus.group(1) != "/dev/null":
+                    old = minus.group(1).rstrip("\t")
+        if old is None:
+            undecidable += 1
+            continue
+        if looks_like_test(old):
+            subjects.setdefault(old)
+    return tuple(subjects), undecidable
+
+
 def check_tests_immutable(
     changed: Iterable[str],
     exists_at_base: Callable[[str], bool],
-    declared: Collection[str] = (),
 ) -> GateResult:
-    """Existing test files must not be modified/deleted; only NEW tests added.
-    `exists_at_base(path)` reports whether the file existed at the base ref.
+    """Existing-test edits are AUTO-DECLARED exemption requests, bounded by
+    scope. `exists_at_base(path)` reports whether the file existed at the
+    base ref.
 
-    #124 exemption REQUEST path: `declared` are the test files a tracked
-    per-file declaration in the change names. A declared edit passes THIS
-    check — the declaration makes the edit explicit and visible in the diff so
-    the reviewer can judge it — but it authorizes nothing: enforcement moves to
-    MERGE, where `exemptions.exemption_permits_merge` withholds auto-merge
-    until REVIEW_BOT grants each declared file against the current patch id.
-    An UNdeclared edit denies exactly as before, and more declared files than
-    the scope bound denies regardless (a mass rewrite is not a correction).
-    Default () keeps every existing caller — and the shell twin's parity
-    goldens — byte-identical until the integration pass wires declarations."""
-    if not check_declaration_scope(RULE_TESTS_IMMUTABLE, declared):
+    Within the scope bound, the edit passes THIS check — visible in the diff,
+    framed for the reviewer by the exemption notice — but authorizes nothing:
+    enforcement sits at MERGE, where auto-merge is withheld until REVIEW_BOT
+    grants each modified file against the current patch id (exemptions.py).
+    Beyond the bound the gate denies: a mass rewrite is not a correction, and
+    an unbounded auto-declaration would hand the reviewer an unreviewable
+    hazard list. The former trailer path (deny undeclared edits, teach the
+    `Gate-Exemption:` syntax) produced the #126/#163 comply-how loops — the
+    fixer could not act on its own judgment; now it can, and the reviewer
+    still explicitly approves every touched test file."""
+    subjects = modified_existing_tests(changed, exists_at_base)
+    # A path that cannot be written as a grant subject can never be granted,
+    # so admitting it would guarantee a permanent withhold and a confusing
+    # escalation later. Deny HERE, where the message can name the file and
+    # the fix is cheap (round-4 MINOR 6).
+    unrepresentable = [f for f in subjects if not valid_subject(f)]
+    if unrepresentable:
         return deny(
-            f"more than {MAX_TEST_IMMUTABILITY_EXCEPTIONS} existing test files "
-            "declared for a test-immutability exemption — the exemption is a "
-            "narrow per-file correction path, not a rewrite license; reduce the "
-            "change's scope (or split it) so at most "
-            f"{MAX_TEST_IMMUTABILITY_EXCEPTIONS} existing test files are touched"
+            f"existing test file '{unrepresentable[0]}' was modified, but "
+            "its path cannot be carried in a reviewer grant (allowed: "
+            "letters, digits, and . _ / + - up to 200 characters). Restore "
+            "that file and put the change in a test file whose path is "
+            "within the charset, or rename the file in a separate PR"
         )
-    declared_set = frozenset(declared)
-    for f in changed:
-        if looks_like_test(f) and exists_at_base(f):
-            if f in declared_set:
-                # Declared → visible-and-explicit; the merge gate withholds
-                # until the reviewer grants (see exemptions.py).
-                continue
-            # The recovery is scripted into the message: an agent that ADDED
-            # its new tests inside an existing file (benign in intent,
-            # indistinguishable cheaply from weakening) burned a leg + a
-            # human question asking how to comply (keifu #126, 2026-08-03).
-            # The diff is evaluated NET against base, so restoring the file
-            # clears this deny without invalidating red/green history.
-            return deny(
-                f"existing test file '{f}' was modified/deleted — add NEW tests "
-                "instead of changing existing ones. If you only ADDED tests "
-                f"there: move them to a new test file and restore '{f}' to its "
-                "exact base-branch content (git checkout <base> -- path); the "
-                "gate reads the net diff, so this needs no history rewrite. "
-                "If the EXISTING test is itself the bug (a wrong expectation), "
-                "request a reviewer exemption instead: add a commit with the "
-                f"trailer line 'Gate-Exemption: tests-immutable {f}' — the "
-                "edit then enters the PR for the reviewer to judge, and the "
-                "PR cannot merge until the reviewer explicitly grants it"
-            )
+    if not check_declaration_scope(RULE_TESTS_IMMUTABLE, subjects):
+        return deny(
+            f"more than {MAX_TEST_IMMUTABILITY_EXCEPTIONS} existing test "
+            "files modified/deleted — changing an existing test is allowed "
+            "(the reviewer must explicitly approve each one before merge), "
+            "but this many reads as a rewrite, not a correction; reduce the "
+            "change's scope (or split it) so at most "
+            f"{MAX_TEST_IMMUTABILITY_EXCEPTIONS} existing test files are "
+            "touched, and prefer ADDING tests in new files wherever the old "
+            "expectation is still right"
+        )
     return ALLOW
 
 

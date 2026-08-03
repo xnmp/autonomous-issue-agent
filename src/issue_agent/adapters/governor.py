@@ -39,7 +39,6 @@ from ..domain.contracts import TestExecution, TestExecutionStatus
 from ..domain.exemptions import (
     ExemptionDeclaration,
     RULE_REQUIRED_TEST,
-    RULE_TESTS_IMMUTABLE,
     declared_subjects,
 )
 from ..domain.refs import is_governed_branch
@@ -96,6 +95,12 @@ class GateContext:
     # rightly inert, but silently so — the denial hint below keeps a typo
     # from recreating the #126 comply-how loop.
     malformed_exemption_lines: int = 0
+    # OLD-side paths of modified/deleted/renamed files. Kept apart from
+    # `changed_files` (new-side): a deleted test path there would read as an
+    # ADDED test and satisfy check_required_test. Only the tests-immutable
+    # check consults it, so a rename out of the test tree is still an
+    # exemption request (round-4 adversarial review + parity check).
+    touched_at_base: tuple[str, ...] = ()
     base_resolvable: bool = True
     changed_files: tuple[str, ...] = ()      # diff vs base
     # Push-gate precondition, as a LAZY probe rather than a value (review
@@ -466,13 +471,11 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
         ),
         lambda: gate.check_no_evidence(ctx.changed_files),
         lambda: gate.check_no_harness_state(ctx.changed_files),
-        lambda: _hint_malformed_declarations(
-            gate.check_tests_immutable(
-                ctx.changed_files,
-                ctx.exists_at_base,
-                declared_subjects(ctx.declared_exemptions, RULE_TESTS_IMMUTABLE),
-            ),
-            ctx,
+        # tests-immutable subjects are AUTO-DECLARED from the diff — no
+        # trailer, so no malformed-trailer hint applies here.
+        lambda: gate.check_tests_immutable(
+            tuple(dict.fromkeys(ctx.changed_files + ctx.touched_at_base)),
+            ctx.exists_at_base,
         ),
         # §9 — ported from bash in wave P1-2 (review M6). Cheap only in the sense
         # that matters here (no test run), but it does touch the filesystem, so
@@ -556,13 +559,9 @@ def _push_gate_for_branch(branch: str, ctx: GateContext) -> list[str]:
         ),
         lambda: gate.check_no_evidence(ctx.changed_files),
         lambda: gate.check_no_harness_state(ctx.changed_files),
-        lambda: _hint_malformed_declarations(
-            gate.check_tests_immutable(
-                ctx.changed_files,
-                ctx.exists_at_base,
-                declared_subjects(ctx.declared_exemptions, RULE_TESTS_IMMUTABLE),
-            ),
-            ctx,
+        lambda: gate.check_tests_immutable(
+            tuple(dict.fromkeys(ctx.changed_files + ctx.touched_at_base)),
+            ctx.exists_at_base,
         ),
     )
     for check in cheap_checks:

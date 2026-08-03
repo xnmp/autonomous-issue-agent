@@ -740,6 +740,7 @@ def build_gate_context(
     declared_exemptions: tuple[ExemptionDeclaration, ...] = ()
     malformed_exemption_lines = 0
     changed: tuple[str, ...] = ()
+    touched_at_base: tuple[str, ...] = ()
     if baseref:
         log = git(["log", f"{baseref}..HEAD", "--reverse", "--format=%s"], cwd)
         subjects = tuple(s for s in log.out.splitlines() if s)
@@ -757,6 +758,30 @@ def build_gate_context(
             )
         diff = git(["diff", "--name-only", f"{baseref}...HEAD"], cwd)
         changed = tuple(f for f in diff.out.splitlines() if f)
+        # OLD-side paths of modified/deleted/renamed files, tracked SEPARATELY
+        # from `changed`. `--name-only` reports a rename by its NEW path only,
+        # so three tests renamed out of the test tree left the suite with the
+        # tests-immutable gate seeing nothing test-shaped, while the
+        # merge-side and shell derivations (both old-side) saw three subjects
+        # — the gate admitted what merge would then withhold, and on the SDK
+        # path nothing stopped the removal pre-publish (round-4 adversarial
+        # review + parity check). It must NOT be folded into `changed`: a
+        # DELETED test path there would read as an ADDED test and satisfy
+        # check_required_test. `-M` off so a rename is delete+add.
+        old_side = git(
+            [
+                "diff",
+                "--no-renames",
+                "--diff-filter=MDRT",
+                "--name-only",
+                f"{baseref}...HEAD",
+            ],
+            cwd,
+        )
+        if old_side.code == 0:
+            touched_at_base = tuple(
+                f for f in old_side.out.splitlines() if f
+            )
         # Commits already on the observed remote PR branch are published
         # history the agent cannot rewrite (the broker requires them as
         # ancestors), so the commit-log gate must not re-police their
@@ -1061,6 +1086,7 @@ def build_gate_context(
         published_subjects=published_subjects,
         declared_exemptions=declared_exemptions,
         malformed_exemption_lines=malformed_exemption_lines,
+        touched_at_base=touched_at_base,
         base_resolvable=base_resolvable,
         changed_files=changed,
         open_pr=open_pr,

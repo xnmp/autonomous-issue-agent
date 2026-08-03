@@ -60,7 +60,10 @@ U = as_untrusted
 def test_resolve_task():
     t = build_resolve_task(5, U("Null token"), U("crashes"), "/wt/issue-5", FIX_CFG)
     assert t.schema is FIX_SCHEMA
-    assert t.append_system_prompt == "AGENTMD"
+    # AGENT.md first, then the standing autonomy contract (operator directive
+    # 2026-08-03): technical calls are the fixer's, and a question is a defect.
+    assert t.append_system_prompt.startswith("AGENTMD")
+    assert "AUTONOMY CONTRACT" in t.append_system_prompt
     assert t.cwd == "/wt/issue-5"
     assert "issue #5" in t.prompt and "off dev" in t.prompt
     assert "crashes" in t.prompt
@@ -75,10 +78,14 @@ def test_receiptless_runtime_gets_the_visual_evidence_note():
     cfg = replace(FIX_CFG, mints_visual_receipts=False)
     prompt = build_resolve_task(5, U("t"), U("b"), "/wt", cfg).append_system_prompt
     assert prompt.startswith("AGENTMD")
-    assert "independent reviewer" in prompt
+    # Assert on text unique to the VISUAL note: "independent reviewer" alone
+    # now also appears in the standing autonomy contract, so it would pass
+    # vacuously on a runtime that never got this note.
+    assert "RUNTIME NOTE — visual evidence" in prompt
+    assert "cannot record trusted screenshot-read receipts" in prompt
     assert "NEVER" not in prompt          # the path is open, not forbidden
     receipted = build_resolve_task(5, U("t"), U("b"), "/wt", FIX_CFG)
-    assert receipted.append_system_prompt == "AGENTMD"
+    assert "RUNTIME NOTE — visual evidence" not in receipted.append_system_prompt
 
 
 def test_review_prompt_makes_the_reviewer_the_sole_evidence_verifier():
@@ -100,7 +107,7 @@ def test_raw_text_cannot_cross_the_prompt_boundary():
 def test_author_task_writes_tests_not_impl():
     t = build_author_task(5, U("Null token"), U("crashes"), "/wt/issue-5", FIX_CFG)
     assert t.schema is AUTHOR_SCHEMA          # terminal is tests_authored, not pr_opened
-    assert t.append_system_prompt == "AGENTMD"
+    assert t.append_system_prompt.startswith("AGENTMD")
     assert t.cwd == "/wt/issue-5"
     assert t.resume is None                   # fresh session
     # T5 (review): "AUTHOR" / "Do NOT write the implementation" were prose-only —
@@ -304,7 +311,10 @@ def test_resumed_legs_do_not_repay_for_agent_md():
         # …but the contract must still be asserted as in force.
         low = task.append_system_prompt.lower()
         assert "still applies" in low and "agent.md" in low, name
-        assert len(task.append_system_prompt) < 1000, f"{name} reminder is not short"
+        # The reminder itself stays short; the standing policy notice appended
+        # after it is separately bounded and applies to every leg.
+        reminder = task.append_system_prompt.split("\n\nAUTONOMY CONTRACT")[0]
+        assert len(reminder) < 1000, f"{name} reminder is not short"
 
 
 def test_forked_legs_also_skip_agent_md():
@@ -317,9 +327,14 @@ def test_forked_legs_also_skip_agent_md():
 def test_fresh_legs_still_get_the_full_agent_md():
     # No session id → nothing is in context yet; the full contract must be sent.
     for name, task in _resuming_builders("").items():
-        assert task.append_system_prompt == "AGENTMD", f"{name} dropped AGENT.md"
+        assert task.append_system_prompt.startswith("AGENTMD"), (
+            f"{name} dropped AGENT.md"
+        )
+        assert "still applies" not in task.append_system_prompt.lower(), name
     for name in ("resolve", "author", "implement", "adjudicate"):
-        assert _every_fixer_task()[name].append_system_prompt == "AGENTMD", name
+        prompt = _every_fixer_task()[name].append_system_prompt
+        assert prompt.startswith("AGENTMD"), name
+        assert "AUTONOMY CONTRACT" in prompt, name
 
 
 # ── diff scoping (P4.2) ──

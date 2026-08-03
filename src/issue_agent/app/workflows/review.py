@@ -30,10 +30,15 @@ from ...domain.agent_task import (
 )
 from ...domain.exemptions import (
     ExemptionDeclaration,
+    MAX_DECLARATIONS_PER_CHANGE,
+    RULE_REQUIRED_TEST,
+    RULE_TESTS_IMMUTABLE,
     open_fence_marker,
     parse_exemption_declarations,
     render_grant_line,
+    valid_subject,
 )
+from ...domain.gate import modified_existing_tests_from_diff
 from ...domain.fix import breaker_key
 from ...domain.refs import issue_from_branch
 from ...domain.labels import Label
@@ -391,7 +396,7 @@ class ReviewWorkflow:
                 as_untrusted(diff),
                 self.cfg.review,
             )
-        notice, declared_exemptions = self._exemption_grant_notice(p)
+        notice, declared_exemptions = self._exemption_grant_notice(p, diff)
         if notice:
             task = self._with_exemption_notice(task, notice, declared_exemptions)
         result = await self._run_logged("review", pr, task, p.head_ref_oid)
@@ -502,7 +507,7 @@ class ReviewWorkflow:
                     as_untrusted(diff),
                     session_id, self.cfg.review,
                 )
-        notice, declared_exemptions = self._exemption_grant_notice(p)
+        notice, declared_exemptions = self._exemption_grant_notice(p, diff)
         if notice:
             task = self._with_exemption_notice(task, notice, declared_exemptions)
         result = await self._run_logged("re-review", pr, task, p.head_ref_oid)
@@ -594,7 +599,7 @@ class ReviewWorkflow:
     }
 
     def _exemption_grant_notice(
-        self, p
+        self, p, diff: str
     ) -> tuple[str, tuple[ExemptionDeclaration, ...]]:
         """ADR 0014: when the PR's commits declare gate exemptions, tell the
         reviewer to grant via the STRUCTURED `exemption_grants` field — never
@@ -604,34 +609,51 @@ class ReviewWorkflow:
         authority (round-2 adversarial review: string-matching grants out of
         prose survived fence-quoting tricks).
 
-        Returns (notice, declarations); ("", ()) when there are none, when
+        Returns (notice, declarations); ("", ()) when there are none or when
         the branch resolves no issue (the merge rule would treat any grant
-        as unbindable), or when the commit read fails (the merge side fails
-        closed on its own read).
+        as unbindable).
 
-        The declared subjects come from commit messages the fixer wrote —
-        untrusted, but the parser's bounded path-ish charset limits each to
-        a single token, and a granted subject is re-validated by the merge
-        rule against rule, issue, subject and patch id, so a fabricated
-        subject can only name something the reviewer then sees (or doesn't)
-        in the diff.
+        tests-immutable subjects are AUTO-DECLARED from the same
+        revision-checked diff being reviewed — the merge-side collector
+        derives its subjects from the identical text, so the reviewer is
+        always asked about exactly the set the merge rule will require.
+        required-test stays trailer-declared (stated intent the diff cannot
+        carry); a trailer read failure only costs that rule's notice.
 
         MULTI-mode reviews do not carry the notice yet — their verdict body
         is synthesized, not authored in one leg; a declared PR under MULTI
         escalates via the withheld-exemption arm in decide_fix."""
+        declared: dict[ExemptionDeclaration, None] = {}
+        auto_subjects, _undecidable = modified_existing_tests_from_diff(diff)
+        for path in auto_subjects:
+            # Auto-declared subjects are diff-derived, so unlike trailer
+            # subjects they never passed the grammar; one that cannot be
+            # minted must not be offered for granting (the gate denies these
+            # pre-publish, so this is belt-and-braces for pre-existing PRs).
+            if valid_subject(path):
+                declared.setdefault(
+                    ExemptionDeclaration(RULE_TESTS_IMMUTABLE, path)
+                )
         try:
             messages = self.gateway.pr_commit_messages(p.number)
         except Exception as exc:  # noqa: BLE001 — notice is an arm, not a gate
             self.cfg.log(
-                f"review #{p.number}: exemption declarations unreadable ({exc})"
+                f"review #{p.number}: exemption trailers unreadable ({exc})"
             )
-            return "", ()
-        declared: dict[ExemptionDeclaration, None] = {}
+            messages = ()
         for message in messages:
             for declaration in parse_exemption_declarations(message):
-                declared.setdefault(declaration)
+                if declaration.rule == RULE_REQUIRED_TEST:
+                    declared.setdefault(declaration)
         if not declared:
             return "", ()
+        # The auto-declared set is not bounded by the trailer parser's cap,
+        # and every subject lands in the reviewer's TRUSTED prompt tail plus
+        # the schema enum. Bound it here too (round-4 MINOR 7); a change over
+        # the cap is denied by the gate and withheld at merge anyway.
+        declared = dict(
+            list(declared.items())[:MAX_DECLARATIONS_PER_CHANGE]
+        )
         if issue_from_branch(p.head_ref_name) is None:
             return "", ()
         judgments = "\n".join(
@@ -643,11 +665,13 @@ class ReviewWorkflow:
         )
         notice = (
             "\n\n## Gate exemption REQUESTED\n"
-            "This change declares gate exemptions:\n"
+            "This change requests gate exemptions (modified existing test "
+            "files are automatic requests; `required-test` is declared by "
+            "trailer):\n"
             f"{declared_list}\n"
-            "The gate let the declared violation into the PR so you can "
-            "judge it; the PR cannot auto-merge until you explicitly grant "
-            "each declaration. DEFAULT IS REFUSE. Judgment per rule:\n"
+            "The gate admitted the change so you can judge it; the PR "
+            "cannot auto-merge until you explicitly grant "
+            "each request. DEFAULT IS REFUSE. Judgment per rule:\n"
             f"{judgments}\n"
             "To grant a declaration, your verdict must be APPROVE and your "
             "structured output must list that exact {rule, subject} pair in "
@@ -736,6 +760,17 @@ class ReviewWorkflow:
                         f"exemption rule={candidate.rule!r} "
                         f"subject={candidate.subject!r} — dropped"
                     )
+                continue
+            if not valid_subject(candidate.subject):
+                # An auto-declared diff path outside the grant grammar's
+                # charset cannot be rendered; report the real cause instead
+                # of silently losing the grant (the PR then escalates with
+                # this subject named as ungranted).
+                self.cfg.log(
+                    f"review #{p.number}: granted subject "
+                    f"{candidate.subject!r} is outside the grant grammar "
+                    "charset — cannot mint; the merge side will withhold"
+                )
                 continue
             lines.setdefault(
                 render_grant_line(

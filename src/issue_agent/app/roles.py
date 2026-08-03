@@ -72,9 +72,12 @@ from ..domain.exemptions import (
     ExemptionDeclaration,
     ExemptionFacts,
     ExemptionGrant,
+    RULE_REQUIRED_TEST,
+    RULE_TESTS_IMMUTABLE,
     parse_exemption_declarations,
     parse_exemption_grants,
 )
+from ..domain.gate import looks_like_test, modified_existing_tests_from_diff
 from ..domain.identity import login_eq
 from ..domain.review import (
     DEFAULT_MAX_UNPRODUCTIVE_ROUNDS,
@@ -1690,9 +1693,64 @@ def _collect_test_exemptions(
             facts[p.number] = ExemptionFacts(truncated=True)
             continue
         declared_seen: dict[ExemptionDeclaration, None] = {}
+        # required-test is still trailer-declared: absence of tests is
+        # ambiguous between "forgot" and "genuinely untestable", so the
+        # fixer's stated intent carries information the diff cannot.
         for message in messages:
             for declaration in parse_exemption_declarations(message):
-                declared_seen.setdefault(declaration)
+                if declaration.rule == RULE_REQUIRED_TEST:
+                    declared_seen.setdefault(declaration)
+        # tests-immutable is AUTO-DECLARED from the diff (ADR 0014 revised):
+        # the same revision-checked evidence that yields the patch id names
+        # every modified existing test file.
+        #
+        # The diff is fetched ONLY when the PR's observed file list contains
+        # something test-shaped. A PR touching no test file can neither carry
+        # a tests-immutable request nor need a patch id, so it merges without
+        # paying a diff download per tick — and, crucially, without a diff
+        # failure being able to stall it (round-4 MAJOR 3). `changed_files`
+        # is the same world data the path-overlap serializer already reads.
+        touches_tests = any(
+            looks_like_test(f) for f in (p.changed_files or frozenset())
+        )
+        if not touches_tests and not declared_seen:
+            continue
+        diff_text: str | None = None
+        patch_id = ""
+        if p.base_ref_oid and p.head_ref_oid:
+            try:
+                evidence = gateway.pr_diff(
+                    p.number, p.base_ref_oid, p.head_ref_oid
+                )
+                if (
+                    evidence.base_oid == p.base_ref_oid
+                    and evidence.head_oid == p.head_ref_oid
+                    and evidence.text.strip()
+                ):
+                    diff_text = evidence.text
+                    patch_id = review_dom.patch_signature(diff_text)
+            except Exception as exc:  # noqa: BLE001 — unverifiable, retried
+                log(f"pr #{p.number}: exemption diff unavailable ({exc})")
+        if diff_text is None:
+            facts[p.number] = unreadable
+            continue
+        auto_subjects, undecidable = modified_existing_tests_from_diff(
+            diff_text
+        )
+        if undecidable:
+            # "We could not tell what this record touched" must never read as
+            # "it touched no tests". Withhold durably and escalate with the
+            # real reason rather than merging on an unreadable diff shape.
+            log(
+                f"pr #{p.number}: {undecidable} diff record(s) with an "
+                "unresolvable path — merge withheld (fail closed)"
+            )
+            facts[p.number] = ExemptionFacts(undecidable_diff=True)
+            continue
+        for path in auto_subjects:
+            declared_seen.setdefault(
+                ExemptionDeclaration(RULE_TESTS_IMMUTABLE, path)
+            )
         if not declared_seen:
             continue
         # Grants count ONLY from APPROVED reviews authored by REVIEW_BOT —
@@ -1706,20 +1764,6 @@ def _collect_test_exemptions(
                 review.author, review_bot
             ):
                 grants.extend(parse_exemption_grants(review.body))
-        patch_id = ""
-        if p.base_ref_oid and p.head_ref_oid:
-            try:
-                evidence = gateway.pr_diff(
-                    p.number, p.base_ref_oid, p.head_ref_oid
-                )
-                if (
-                    evidence.base_oid == p.base_ref_oid
-                    and evidence.head_oid == p.head_ref_oid
-                    and evidence.text.strip()
-                ):
-                    patch_id = review_dom.patch_signature(evidence.text)
-            except Exception as exc:  # noqa: BLE001 — "" stays unverifiable
-                log(f"pr #{p.number}: exemption patch id unavailable ({exc})")
         facts[p.number] = ExemptionFacts(
             declarations=tuple(declared_seen),
             grants=tuple(grants),

@@ -328,21 +328,25 @@ prc_malformed_exemption_hint() {  # prints a hint suffix, or nothing
 }
 
 prc_check_tests_immutable() {  # prc_check_tests_immutable "<changed-file-list>"
-  local f declared n_declared
-  declared="$(prc_declared_exemption_subjects tests-immutable)"
-  n_declared=$(printf '%s\n' "$declared" | grep -c '.' || true)
-  [ "${n_declared:-0}" -le 3 ] \
-    || fail "more than 3 existing test files declared for a test-immutability exemption — the exemption is a narrow per-file correction path, not a rewrite license; reduce the change's scope (or split it) so at most 3 existing test files are touched"
+  # AUTO-DECLARED (ADR 0014 revised 2026-08-03): every modified/deleted
+  # existing test file is itself the exemption request — no trailer. The gate
+  # only bounds SCOPE (>3 reads as a rewrite); the merge side withholds until
+  # the reviewer explicitly grants each file. Twin of gate.check_tests_immutable.
+  # OLD-side paths (--diff-filter excludes additions; -M off so a renamed-away
+  # test still reports its old path). The python twin derives the same set from
+  # `diff --git` records, which likewise survive renames, binary files and
+  # `.gitattributes -diff` — deriving from the NEW-side name list alone let a
+  # renamed-away test escape entirely (round-4 adversarial review).
+  local f n_modified=0
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     printf '%s' "$f" | grep -qE "$PR_TEST_FILE_RE" || continue
-    if git cat-file -e "origin/$base:$f" 2>/dev/null || git cat-file -e "$base:$f" 2>/dev/null; then
-      # Declared → visible-and-explicit; the merge gate withholds until the
-      # reviewer grants (domain/exemptions.py).
-      printf '%s\n' "$declared" | grep -qxF "$f" && continue
-      fail "existing test file '$f' was modified/deleted — add NEW tests instead of changing existing ones. If you only ADDED tests there: move them to a new test file and restore '$f' to its exact base-branch content (git checkout <base> -- path); the gate reads the net diff, so this needs no history rewrite. If the EXISTING test is itself the bug (a wrong expectation), request a reviewer exemption instead: add a commit with the trailer line 'Gate-Exemption: tests-immutable $f' — the edit then enters the PR for the reviewer to judge, and the PR cannot merge until the reviewer explicitly grants it.$(prc_malformed_exemption_hint)"
-    fi
-  done <<< "$1"
+    n_modified=$((n_modified + 1))
+    printf '%s' "$f" | grep -qE '^[A-Za-z0-9._/+-]{1,200}$' \
+      || fail "existing test file '$f' was modified, but its path cannot be carried in a reviewer grant (allowed: letters, digits, and . _ / + - up to 200 characters). Restore that file and put the change in a test file whose path is within the charset, or rename the file in a separate PR"
+  done <<< "$(git diff --no-renames --diff-filter=MDRT --name-only "$log_range" 2>/dev/null || printf '%s' "$1")"
+  [ "$n_modified" -le 3 ] \
+    || fail "more than 3 existing test files modified/deleted — changing an existing test is allowed (the reviewer must explicitly approve each one before merge), but this many reads as a rewrite, not a correction; reduce the change's scope (or split it) so at most 3 existing test files are touched, and prefer ADDING tests in new files wherever the old expectation is still right"
 }
 
 # §10 — the NEW tests must ACTUALLY FAIL without the implementation (real red).
