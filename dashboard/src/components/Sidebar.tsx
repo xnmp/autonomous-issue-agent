@@ -10,6 +10,38 @@ import { EmptyState, ErrorBanner, SkeletonRows, WarningList } from "./ui/Feedbac
 import { UsageBlock } from "./UsageBlock";
 import { OptionsMenu, type DashboardOptions } from "./ui/OptionsMenu";
 
+const WIDTH_KEY = "issue-agent.dashboard.sidebar-width";
+const MIN_WIDTH = 220;
+const MAX_WIDTH = 480;
+const DEFAULT_WIDTH = 264;
+
+/** The rail's width is a whole number of CSS pixels, always within the range
+ * the stylesheet is built for — including when it comes back from storage,
+ * where anything at all may have been written. */
+function clampWidth(value: number): number {
+  if (!Number.isFinite(value)) return DEFAULT_WIDTH;
+  return Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, Math.round(value)));
+}
+
+function storedWidth(): number {
+  try {
+    const raw = localStorage.getItem(WIDTH_KEY);
+    // `Number("")` is 0, and a blank entry is an absent width, not a width of
+    // zero: everything unusable has to reach clampWidth as NaN.
+    return clampWidth(raw === null || raw.trim() === "" ? Number.NaN : Number(raw));
+  } catch {
+    return DEFAULT_WIDTH;
+  }
+}
+
+function rememberWidth(value: number): void {
+  try {
+    localStorage.setItem(WIDTH_KEY, String(value));
+  } catch {
+    // The resized width remains active for this session.
+  }
+}
+
 interface SidebarProps {
   repos: Polled<ReposPayload>;
   usage: Polled<UsagePayload>;
@@ -50,14 +82,7 @@ export function Sidebar({
       return false;
     }
   });
-  const [width, setWidth] = useState(() => {
-    try {
-      const stored = Number(localStorage.getItem("issue-agent.dashboard.sidebar-width"));
-      return Number.isFinite(stored) && stored >= 220 ? stored : 264;
-    } catch {
-      return 264;
-    }
-  });
+  const [width, setWidth] = useState(storedWidth);
 
   const list = repos.data?.repos ?? [];
   const active = list.filter((r) => r.active === true);
@@ -76,25 +101,23 @@ export function Sidebar({
       return !current;
     });
   };
+  // What gets remembered is the width the drag asked for, never the width the
+  // rail was measured at: a measurement is in fractional CSS pixels once the
+  // browser is zoomed, and at a narrow viewport the stylesheet caps the rail —
+  // reading either back would have quietly rewritten the operator's choice.
   const beginResize = (event: PointerEvent<HTMLDivElement>) => {
     event.preventDefault();
     const originX = event.clientX;
     const originWidth = width;
+    let latest = originWidth;
     const move = (next: globalThis.PointerEvent) => {
-      const value = Math.min(480, Math.max(220, originWidth + next.clientX - originX));
-      setWidth(value);
+      latest = clampWidth(originWidth + next.clientX - originX);
+      setWidth(latest);
     };
     const stop = () => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", stop);
-      try {
-        localStorage.setItem(
-          "issue-agent.dashboard.sidebar-width",
-          String(document.querySelector(".sidebar")?.getBoundingClientRect().width ?? width),
-        );
-      } catch {
-        // The resized width remains active for this session.
-      }
+      rememberWidth(latest);
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", stop, { once: true });
@@ -102,18 +125,9 @@ export function Sidebar({
   const resizeFromKeyboard = (event: KeyboardEvent<HTMLDivElement>) => {
     if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
     event.preventDefault();
-    setWidth((current) => {
-      const next = Math.min(
-        480,
-        Math.max(220, current + (event.key === "ArrowRight" ? 12 : -12)),
-      );
-      try {
-        localStorage.setItem("issue-agent.dashboard.sidebar-width", String(next));
-      } catch {
-        // The resized width remains active for this session.
-      }
-      return next;
-    });
+    const next = clampWidth(width + (event.key === "ArrowRight" ? 12 : -12));
+    setWidth(next);
+    rememberWidth(next);
   };
 
   const doStart = async () => {
@@ -260,8 +274,8 @@ export function Sidebar({
         role="separator"
         aria-label="Resize sidebar"
         aria-orientation="vertical"
-        aria-valuemin={220}
-        aria-valuemax={480}
+        aria-valuemin={MIN_WIDTH}
+        aria-valuemax={MAX_WIDTH}
         aria-valuenow={width}
         tabIndex={0}
         onPointerDown={beginResize}

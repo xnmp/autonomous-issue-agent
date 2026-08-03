@@ -538,3 +538,38 @@ test("serves a validated operator workflow through FastAPI and the production bu
     fullPage: true,
   });
 });
+
+/**
+ * Browser zoom shrinks the viewport in CSS pixels at an unchanged window size,
+ * so an operator at 150–200% lands in the narrow-viewport rules without ever
+ * resizing the window. The rail's width is React state and its grid track is
+ * `auto`; anything that narrows the rail has to narrow the element, or the
+ * remembered width overhangs the track and covers the left edge of the board.
+ */
+test("the rail never covers the board at the viewport widths browser zoom produces", async ({
+  page,
+}) => {
+  await mockApi(page);
+  await page.goto("/#/repo/self/issues/in-flight");
+  await expect(page.locator(".repo-name", { hasText: "self" })).toBeVisible();
+
+  // 1366 CSS px at 100%, then the same laptop at 125 / 175 / 200%.
+  for (const width of [1366, 1093, 781, 683]) {
+    await page.setViewportSize({ width, height: 700 });
+    const rail = await page.locator(".sidebar").boundingBox();
+    const board = await page.locator(".main").boundingBox();
+    expect(rail, `no rail at ${width}px`).not.toBeNull();
+    expect(board, `no board at ${width}px`).not.toBeNull();
+    expect(
+      rail!.x + rail!.width,
+      `the rail overhangs the board at a ${width}px viewport`,
+    ).toBeLessThanOrEqual(board!.x + 0.5);
+    expect(
+      await page.evaluate(() => {
+        const de = document.documentElement;
+        return de.scrollWidth - de.clientWidth;
+      }),
+      `the page scrolls sideways at a ${width}px viewport`,
+    ).toBeLessThanOrEqual(0);
+  }
+});

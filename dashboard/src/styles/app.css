@@ -1782,9 +1782,18 @@
   box-shadow: 0 8px 20px rgba(0, 0, 0, 0.28);
 }
 
+/* A narrow viewport is not only a narrow window: browser zoom shrinks the
+ * viewport in CSS pixels at an unchanged window size, so every operator at
+ * 150%+ lands here. The rail column is `auto` — it is whatever the sidebar
+ * element renders at, and the sidebar's width is React state (the operator's
+ * remembered drag). Narrowing the *track* here instead of the element left
+ * that state overhanging its own column and covering the left edge of the
+ * board; the rail is constrained on the element so the one width stays the
+ * one source of truth. */
 @media (max-width: 900px) {
-  .app {
-    grid-template-columns: 216px minmax(0, 1fr);
+  .sidebar {
+    min-width: 0;
+    max-width: 216px;
   }
   .title-cell {
     max-width: 240px;
