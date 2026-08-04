@@ -1110,9 +1110,7 @@ function TaskDetailRow({
 
 /**
  * Blocked and live rows are operational queues, so their expansion optimises
- * for scanning when work happened, what it cost, and how old it is. The task
- * identity and note stay with the timestamp rather than consuming a fourth
- * column and squeezing the two numeric fields off narrow screens.
+ * for scanning what happened, when, what it cost, and how old it is.
  */
 function TaskStoryTable({
   issue,
@@ -1127,6 +1125,7 @@ function TaskStoryTable({
       <table className="task-story-table" aria-label={`Issue #${issue} task history`}>
         <thead>
           <tr>
+            <th scope="col">Task</th>
             <th scope="col">Time</th>
             <th scope="col" className="r">Cost</th>
             <th scope="col" className="r">Time since</th>
@@ -1143,12 +1142,6 @@ function TaskStoryTable({
             return (
               <tr key={key}>
                 <td className={`task-story-context tone-border-${tone}`}>
-                  <div className="task-story-when">
-                    <time dateTime={ts ?? undefined}>{localTime(ts)}</time>
-                    {took !== null ? (
-                      <span className="faint" title="task wall time">took {duration(took)}</span>
-                    ) : null}
-                  </div>
                   <div className="task-story-event">
                     <Chip
                       tone={stepKindTone(step.kind, step.state)}
@@ -1162,6 +1155,14 @@ function TaskStoryTable({
                       <span className={`task-state tone-${tone}`}>{step.state}</span>
                     )}
                     {note ? <span className="task-note" title={note}>{note}</span> : null}
+                  </div>
+                </td>
+                <td>
+                  <div className="task-story-when">
+                    <time dateTime={ts ?? undefined}>{localTime(ts)}</time>
+                    {took !== null ? (
+                      <span className="faint" title="task wall time">took {duration(took)}</span>
+                    ) : null}
                   </div>
                 </td>
                 <td className="r mono nowrap">{usd(step.cost_usd)}</td>

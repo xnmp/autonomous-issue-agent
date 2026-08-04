@@ -598,12 +598,21 @@ test("the in-flight history remains usable at a phone-width viewport", async ({ 
   const history = page.getByRole("table", { name: "Issue #49 task history" });
   await expect(history).toBeVisible();
   const headers = history.getByRole("columnheader");
-  await expect(headers).toHaveCount(3);
-  for (const header of await headers.all()) {
+  const cells = history.locator("tbody tr").first().getByRole("cell");
+  await expect(headers).toHaveCount(4);
+  await expect(cells).toHaveCount(4);
+  for (let index = 0; index < 4; index += 1) {
+    const header = headers.nth(index);
+    const cell = cells.nth(index);
     const bounds = await header.boundingBox();
+    const cellBounds = await cell.boundingBox();
     expect(bounds).not.toBeNull();
+    expect(cellBounds).not.toBeNull();
     expect(bounds!.x).toBeGreaterThanOrEqual(0);
     expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(320);
+    expect(await header.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+    expect(Math.abs(cellBounds!.x - bounds!.x)).toBeLessThanOrEqual(1);
+    expect(Math.abs(cellBounds!.width - bounds!.width)).toBeLessThanOrEqual(1);
   }
   const scroller = page.locator(".task-story-table-wrap");
   const dimensions = await scroller.evaluate((element) => ({
@@ -612,6 +621,6 @@ test("the in-flight history remains usable at a phone-width viewport", async ({ 
   }));
   expect(dimensions.clientWidth).toBeGreaterThanOrEqual(240);
   // Intrinsic monospace widths may leave a few pixels of scroll, but a return
-  // to the old 520px minimum would hide Cost and Time since entirely.
+  // to the desktop minimum would hide Cost and Time since entirely.
   expect(dimensions.scrollWidth - dimensions.clientWidth).toBeLessThanOrEqual(32);
 });

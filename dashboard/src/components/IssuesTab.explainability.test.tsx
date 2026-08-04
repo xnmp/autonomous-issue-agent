@@ -271,7 +271,7 @@ describe("board explainability", () => {
     expect(document.querySelector(".task-state")).toBeNull();
     const history = screen.getByRole("table", { name: "Issue #200 task history" });
     expect(within(history).getAllByRole("columnheader").map((cell) => cell.textContent))
-      .toEqual(["Time", "Cost", "Time since"]);
+      .toEqual(["Task", "Time", "Cost", "Time since"]);
     expect(within(history).getByText("took 0:30")).toBeVisible();
     expect(within(history).getByText("$1.00")).toBeVisible();
     expect(within(history).getByText("$0.00")).toBeVisible();
@@ -281,7 +281,7 @@ describe("board explainability", () => {
     vi.unstubAllGlobals();
   });
 
-  it("gives simultaneous blocked and in-flight histories distinct table names", async () => {
+  it("gives simultaneous blocked and in-flight histories distinct four-column tables", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
@@ -340,9 +340,9 @@ describe("board explainability", () => {
     const blockedHistory = await screen.findByRole("table", { name: "Issue #200 task history" });
     const liveHistory = await screen.findByRole("table", { name: "Issue #201 task history" });
     expect(within(blockedHistory).getAllByRole("columnheader").map((cell) => cell.textContent))
-      .toEqual(["Time", "Cost", "Time since"]);
+      .toEqual(["Task", "Time", "Cost", "Time since"]);
     expect(within(liveHistory).getAllByRole("columnheader").map((cell) => cell.textContent))
-      .toEqual(["Time", "Cost", "Time since"]);
+      .toEqual(["Task", "Time", "Cost", "Time since"]);
     expect(within(liveHistory).getByText("resolve")).toBeVisible();
     vi.unstubAllGlobals();
   });
@@ -403,7 +403,7 @@ describe("board explainability", () => {
     expect(malformed!.querySelector("time")).not.toHaveAttribute("datetime");
     expect(within(future!).getByText("0s")).toBeVisible();
     expect(future!.querySelector("time")).toHaveAttribute("datetime", "2099-01-01T00:00:00Z");
-    expect(future!.querySelectorAll("td").item(1).textContent).toMatch(/^\$[\d.e+]+$/);
+    expect(future!.querySelectorAll("td").item(2).textContent).toMatch(/^\$[\d.e+]+$/);
     vi.unstubAllGlobals();
   });
 });
