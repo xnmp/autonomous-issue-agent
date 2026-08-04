@@ -13,9 +13,11 @@ import hashlib
 import re
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Literal, final
 
 from .actions import Action, AgentKind, Relabel, RunAgent, Target
-from .identity import login_eq
+from .exemptions import AuthenticatedGrantPairs
+from .identity import IdentityMode, login_eq
 from .labels import Label
 from .lifecycle import pr_escalation, retry_breaker
 from .world import PRView, Review, WorldState, REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED
@@ -55,42 +57,6 @@ def reviewer_verdict_on_head(pr: PRView, reviewer: str) -> bool:
     """Whether `reviewer`'s latest submitted verdict targets this exact head."""
     latest = latest_reviewer_verdict(pr, reviewer)
     return bool(latest and pr.head_ref_oid and latest.commit_id == pr.head_ref_oid)
-
-
-class IdentityMode(str, Enum):
-    """How many GitHub identities the harness runs under.
-
-      THREE — fix, review and steward are DISTINCT logins, so the reviewer can
-              approve the fixer's PR and auto-merge can land it.
-      SOLO  — one login does everything; GitHub 422s self-approval, so the
-              reviewer is disabled and a human reviews + merges.
-
-    An enum, not a bare string (review M16): the two guards that read this knob
-    have OPPOSITE polarity (`!= three` disables auto-merge, `== solo` disables
-    the reviewer), so an unrecognised value such as `Three` used to fall
-    BETWEEN them — the reviewer ran and spent, approvals landed, and nothing
-    ever merged, with nothing in the log saying why.
-    """
-
-    THREE = "three"
-    SOLO = "solo"
-
-    @classmethod
-    def from_env(cls, mode: str) -> "IdentityMode":
-        """Resolve IDENTITY_MODE. Whitespace is trimmed; anything else must
-        match a member EXACTLY or this raises ValueError for the config
-        boundary to turn into a validation error (review M16).
-
-        Deliberately stricter than `ReviewMode.from_env`, which falls back to
-        SINGLE. ReviewMode has a safe default — the cheapest, most-proven
-        review path. This knob has none: guessing THREE makes every approval
-        422 on a solo install, guessing SOLO silently disables the reviewer.
-        Case is NOT folded either, because the bash half of the harness
-        (`bin/doctor.sh`, `agent/watcher-lib.sh`, `review/review-watcher.sh`)
-        compares this env var with `[ "$IDENTITY_MODE" = three ]` — accepting
-        `Three` here while bash rejects it would just move the divergence."""
-        raw = (mode or "").strip()
-        return cls(raw)  # ValueError on anything unrecognised — see docstring
 
 
 class ReviewMode(str, Enum):
@@ -641,21 +607,153 @@ def decide_review(
 
 
 # ── review verdict → submission effect (review-pr.sh / re-review-pr.sh tails) ─
-@dataclass(frozen=True)
-class ReviewSubmission:
-    """What to do with a review verdict. `event` is the gh review event to POST
-    (APPROVE / REQUEST_CHANGES / COMMENT); `escalate` adds needs-human-review and
-    drops ai-pr-open. The dispatcher submits the review then applies the labels."""
+GrantRequest = tuple[str, str]
+_COMPLETE_GRANTS_PROOF = object()
 
-    event: str
+
+@dataclass(frozen=True)
+class ReviewTarget:
+    """The issue and patch whose review verdict will be submitted."""
+
+    issue_number: int | None
+    patch_id: str
+
+
+@final
+class CompleteGrants:
+    """Opaque proof that every exemption required by one patch is authenticated."""
+
+    __slots__ = ("_issue_number", "_patch_id", "_requests")
+
+    def __init__(
+        self,
+        issue_number: int | None,
+        patch_id: str,
+        requests: tuple[GrantRequest, ...],
+        proof: object,
+    ) -> None:
+        if proof is not _COMPLETE_GRANTS_PROOF:
+            raise TypeError(
+                "complete grants must come from authenticated grant resolution"
+            )
+        object.__setattr__(self, "_issue_number", issue_number)
+        object.__setattr__(self, "_patch_id", patch_id)
+        object.__setattr__(self, "_requests", requests)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("complete grant proof is immutable")
+
+    @property
+    def issue_number(self) -> int | None:
+        return self._issue_number
+
+    @property
+    def patch_id(self) -> str:
+        return self._patch_id
+
+    @property
+    def requests(self) -> tuple[GrantRequest, ...]:
+        return self._requests
+
+
+@dataclass(frozen=True)
+class RejectedExemptions:
+    """The non-empty exemption set that prevents an approval."""
+
+    requests: tuple[GrantRequest, ...]
+
+    def __post_init__(self) -> None:
+        if not self.requests:
+            raise ValueError("rejected exemptions require at least one request")
+        object.__setattr__(self, "requests", tuple(dict.fromkeys(self.requests)))
+
+
+GrantResolution = CompleteGrants | RejectedExemptions
+
+
+def resolve_authenticated_grants(
+    required: tuple[GrantRequest, ...],
+    authenticated: AuthenticatedGrantPairs,
+    *,
+    target: ReviewTarget,
+) -> GrantResolution:
+    """Mint a patch-bound proof only when authenticated grants cover the request."""
+    normalized = tuple(dict.fromkeys(required))
+    proof_matches = (
+        authenticated.issue_number == target.issue_number
+        and authenticated.patch_id == target.patch_id
+    )
+    missing = tuple(
+        request
+        for request in normalized
+        if not proof_matches or request not in authenticated
+    )
+    if missing or normalized and (target.issue_number is None or not target.patch_id):
+        return RejectedExemptions(missing or normalized)
+    return CompleteGrants(
+        target.issue_number,
+        target.patch_id,
+        normalized,
+        _COMPLETE_GRANTS_PROOF,
+    )
+
+
+@dataclass(frozen=True)
+class ApprovedSubmission:
+    """A GitHub approval whose required exemptions are proven complete."""
+
     body: str
-    escalate: bool = False
-    # Why escalate is set: "verdict" (the reviewer returned ESCALATE) or
-    # "ceiling" (this rejection reached max_rejections). The escalation comment
-    # and journal reason must name the real cause — keifu PR #177 (2026-08-02)
-    # escalated on a round-3 ESCALATE verdict but the breaker comment blamed
-    # the ceiling ("3 time(s) ... ceiling 4"), reading like a fencepost bug.
-    escalate_cause: str = ""
+    grants: CompleteGrants
+    target: ReviewTarget
+    event: Literal["APPROVE"] = field(default="APPROVE", init=False)
+    escalate: Literal[False] = field(default=False, init=False)
+    escalate_cause: Literal[""] = field(default="", init=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.grants, CompleteGrants):
+            raise TypeError("an approval requires complete exemption grants")
+        if (self.grants.issue_number, self.grants.patch_id) != (
+            self.target.issue_number,
+            self.target.patch_id,
+        ):
+            raise ValueError("approval grant proof belongs to a different review target")
+
+
+@dataclass(frozen=True)
+class ChangesRequestedSubmission:
+    """A rejecting verdict, optionally caused by refused exemption requests."""
+
+    body: str
+    rejected_exemptions: RejectedExemptions | None = None
+    event: Literal["REQUEST_CHANGES"] = field(
+        default="REQUEST_CHANGES", init=False
+    )
+    escalate: Literal[False] = field(default=False, init=False)
+    escalate_cause: Literal[""] = field(default="", init=False)
+
+
+EscalationCause = Literal["verdict", "ceiling"]
+
+
+@dataclass(frozen=True)
+class EscalatedSubmission:
+    """A comment verdict that transfers the PR to a human."""
+
+    body: str
+    escalate_cause: EscalationCause
+    event: Literal["COMMENT"] = field(default="COMMENT", init=False)
+    escalate: Literal[True] = field(default=True, init=False)
+
+    def __post_init__(self) -> None:
+        if self.escalate_cause not in {"verdict", "ceiling"}:
+            raise ValueError("an escalation requires a recognized cause")
+
+
+ReviewSubmission = (
+    ApprovedSubmission
+    | ChangesRequestedSubmission
+    | EscalatedSubmission
+)
 
 
 def review_submission(
@@ -664,7 +762,8 @@ def review_submission(
     prior_rejections: int,
     max_rejections: int,
     *,
-    ungranted_exemptions: tuple[tuple[str, str], ...] = (),
+    grant_resolution: GrantResolution,
+    target: ReviewTarget,
 ) -> ReviewSubmission:
     """Port of the review-pr.sh / re-review-pr.sh decision tails.
 
@@ -687,12 +786,17 @@ def review_submission(
     model voluntarily returning ESCALATE; this makes the ceiling a real breaker
     keyed on genuine dissatisfaction.
 
-    `ungranted_exemptions` is harness-derived, not model prose. Keeping this
+    `grant_resolution` is harness-derived, not model prose. Keeping this
     contradiction repair here makes the submitted GitHub verdict and rejection
     accounting agree: an unmergeable approval must not reset the rejection
     sequence or strand the PR behind a later merge-side escalation."""
-    if decision == "APPROVE" and ungranted_exemptions:
-        unique = tuple(dict.fromkeys(ungranted_exemptions))
+    rejected_exemptions = (
+        grant_resolution
+        if isinstance(grant_resolution, RejectedExemptions)
+        else None
+    )
+    if decision == "APPROVE" and rejected_exemptions is not None:
+        unique = rejected_exemptions.requests
         requests = "\n".join(
             f"- `{rule}` for `{subject}`" for rule, subject in unique
         )
@@ -709,7 +813,7 @@ def review_submission(
         body = f"{guidance}\n\nUngranted requests:\n{requests}{rationale}"
         decision = "REQUEST_CHANGES"
     if decision == "APPROVE":
-        return ReviewSubmission(event="APPROVE", body=body)
+        return ApprovedSubmission(body, grant_resolution, target)
     this_rejection = prior_rejections + 1
     ceiling_hit = max_rejections > 0 and this_rejection >= max_rejections
     if decision == "ESCALATE" or ceiling_hit:
@@ -725,15 +829,11 @@ def review_submission(
                 f"Through {this_rejection} rounds of requested changes without "
                 "resolution. Requesting human review."
             )
-        return ReviewSubmission(
-            event="COMMENT",
-            body=f"{preamble}\n\n{body}",
-            escalate=True,
-            escalate_cause=(
-                "verdict" if decision == "ESCALATE" else "ceiling"
-            ),
+        return EscalatedSubmission(
+            f"{preamble}\n\n{body}",
+            "verdict" if decision == "ESCALATE" else "ceiling",
         )
-    return ReviewSubmission(event="REQUEST_CHANGES", body=body)
+    return ChangesRequestedSubmission(body, rejected_exemptions)
 
 
 # ── multi-agent review synthesis (REVIEW_MODE=multi) ──────────────────────────
@@ -812,7 +912,13 @@ def _render_body(confirmed: list[Finding], approving: bool) -> str:
     return "\n".join(parts)
 
 
-def gate_submission(prior_rejections: int, max_rejections: int) -> ReviewSubmission:
+def gate_submission(
+    prior_rejections: int,
+    max_rejections: int,
+    *,
+    grant_resolution: GrantResolution,
+    target: ReviewTarget,
+) -> ReviewSubmission:
     """A non-reviewable PR (the skip-gate found no behavioural change: docs /
     formatting / config only) → APPROVE. Pure so the gate→verdict mapping is a
     tested domain decision, not an inline dispatcher policy (same contract as
@@ -822,12 +928,17 @@ def gate_submission(prior_rejections: int, max_rejections: int) -> ReviewSubmiss
         "APPROVE",
         "No behavioural change to review (docs/formatting/config only).",
         prior_rejections, max_rejections,
+        grant_resolution=grant_resolution,
+        target=target,
     )
 
 
 def synthesize_review(
     findings: list[Finding], prior_rejections: int, max_rejections: int,
     complete: bool = True,
+    *,
+    grant_resolution: GrantResolution,
+    target: ReviewTarget,
 ) -> ReviewSubmission | None:
     """Pure synthesis of validated findings into a verdict, then through the same
     round-ceiling breaker as the single-pass reviewer.
@@ -848,4 +959,11 @@ def synthesize_review(
         return None  # incomplete + nothing found → do not approve; retry next poll
     decision = "REQUEST_CHANGES" if has_blocking else "APPROVE"
     body = _render_body(confirmed, approving=not has_blocking)
-    return review_submission(decision, body, prior_rejections, max_rejections)
+    return review_submission(
+        decision,
+        body,
+        prior_rejections,
+        max_rejections,
+        grant_resolution=grant_resolution,
+        target=target,
+    )

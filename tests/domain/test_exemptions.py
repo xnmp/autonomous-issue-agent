@@ -9,6 +9,10 @@ declarations must be completely unaffected.
 
 from builders import *  # noqa: F401,F403  (sys.path setup)
 
+from dataclasses import replace
+
+import pytest
+
 from issue_agent.domain.exemptions import (
     EXEMPTABLE_RULES,
     EXEMPTIONS_PERMIT,
@@ -18,6 +22,7 @@ from issue_agent.domain.exemptions import (
     RULE_REQUIRED_TEST,
     RULE_TESTS_IMMUTABLE,
     SUBJECT_WHOLE_CHANGE,
+    AuthenticatedGrantPairs,
     ExemptionDeclaration,
     ExemptionFacts,
     ExemptionGrant,
@@ -322,7 +327,7 @@ def test_authenticated_grant_pairs_requires_issue_patch_and_matching_mac():
         issue_number=89,
         patch_id="abc123",
         mac_key=MAC_KEY,
-    ) == frozenset({(RULE_TESTS_IMMUTABLE, TEST_FILE)})
+    ).pairs == frozenset({(RULE_TESTS_IMMUTABLE, TEST_FILE)})
     for issue, patch, key in (
         (None, "abc123", MAC_KEY),
         (89, "", MAC_KEY),
@@ -332,7 +337,29 @@ def test_authenticated_grant_pairs_requires_issue_patch_and_matching_mac():
     ):
         assert authenticated_grant_pairs(
             (valid,), issue_number=issue, patch_id=patch, mac_key=key
-        ) == frozenset()
+        ).pairs == frozenset()
+
+
+def test_authenticated_grant_pairs_cannot_be_constructed_by_callers():
+    with pytest.raises(TypeError, match="MAC verification"):
+        AuthenticatedGrantPairs(
+            89,
+            "abc123",
+            frozenset({(RULE_TESTS_IMMUTABLE, TEST_FILE)}),
+            object(),
+        )
+
+
+def test_authenticated_grant_pairs_cannot_be_rebound_with_dataclass_replace():
+    verified = authenticated_grant_pairs(
+        (), issue_number=89, patch_id="abc123", mac_key=MAC_KEY
+    )
+
+    with pytest.raises(TypeError):
+        replace(
+            verified,
+            pairs=frozenset({(RULE_TESTS_IMMUTABLE, TEST_FILE)}),
+        )
 
 
 # ── declared_subjects ────────────────────────────────────────────────────────

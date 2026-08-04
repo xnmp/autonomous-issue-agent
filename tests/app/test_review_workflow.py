@@ -1684,6 +1684,75 @@ def _expected_grant_items(rule="tests-immutable", subject=_DECLARED_SUBJECT):
     }
 
 
+def test_multi_review_cannot_approve_while_an_exemption_is_rejected():
+    gw = _DeclaringGateway(prs={100: _declaring_pr()})
+    runner = SchemaRunner(
+        gate=_gate(),
+        dimension=lambda _task: _dim([]),
+        validation=lambda _task: _val(True),
+    )
+
+    asyncio.run(
+        _workflow(
+            gw,
+            FakeStore(),
+            runner,
+            review_mode=ReviewMode.MULTI,
+            exemption_mac_key=_MAC_KEY,
+        ).review(100)
+    )
+
+    submitted = next(call for call in gw.calls if call[0] == "review")
+    assert submitted[2] == "REQUEST_CHANGES"
+    assert "Ungranted requests" in submitted[3]
+    assert _DECLARED_SUBJECT in submitted[3]
+
+
+def test_multi_skip_gate_reports_the_normalized_exemption_verdict():
+    gw = _DeclaringGateway(prs={100: _declaring_pr()})
+    logs: list[str] = []
+    runner = SchemaRunner(
+        gate=_gate(reviewable=False, reason="config only"),
+    )
+
+    asyncio.run(
+        _workflow(
+            gw,
+            FakeStore(),
+            runner,
+            review_mode=ReviewMode.MULTI,
+            exemption_mac_key=_MAC_KEY,
+            log=logs.append,
+        ).review(100)
+    )
+
+    assert any(call[:3] == ("review", 100, "REQUEST_CHANGES") for call in gw.calls)
+    assert any("gate says non-reviewable" in line and "→ REQUEST_CHANGES" in line
+               for line in logs)
+
+
+def test_multi_skip_gate_failed_post_names_the_normalized_event():
+    gw = _DeclaringGateway(prs={100: _declaring_pr()}, submit_ok=False)
+    logs: list[str] = []
+    runner = SchemaRunner(
+        gate=_gate(reviewable=False, reason="config only"),
+    )
+
+    asyncio.run(
+        _workflow(
+            gw,
+            FakeStore(),
+            runner,
+            review_mode=ReviewMode.MULTI,
+            exemption_mac_key=_MAC_KEY,
+            log=logs.append,
+        ).review(100)
+    )
+
+    assert any("gate REQUEST_CHANGES POST failed" in line for line in logs)
+    assert not any("gate APPROVE POST failed" in line for line in logs)
+
+
 def test_existing_incomplete_approval_is_reviewed_instead_of_reconciled():
     existing = Review(
         "APPROVED",

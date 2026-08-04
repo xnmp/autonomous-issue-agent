@@ -42,11 +42,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import re
-from collections.abc import Collection, Iterable
+from collections.abc import Collection, Iterable, Iterator
 from dataclasses import dataclass
+from typing import final
 
-from .identity import login_eq
-from .review import IdentityMode
+from .identity import IdentityMode, login_eq
 
 # Stable rule ids. These appear verbatim in trailers, grant lines, and gate
 # messages — changing one orphans every declaration in flight.
@@ -266,13 +266,60 @@ def grant_mac(
     return hmac.new(key.encode(), message, hashlib.sha256).hexdigest()
 
 
+_AUTHENTICATED_GRANTS_PROOF = object()
+
+
+@final
+class AuthenticatedGrantPairs(Collection[tuple[str, str]]):
+    """Opaque MAC-verified grant pairs bound to one issue and patch."""
+
+    __slots__ = ("_issue_number", "_patch_id", "_pairs")
+
+    def __init__(
+        self,
+        issue_number: int | None,
+        patch_id: str,
+        pairs: frozenset[tuple[str, str]],
+        proof: object,
+    ) -> None:
+        if proof is not _AUTHENTICATED_GRANTS_PROOF:
+            raise TypeError("authenticated grants must come from MAC verification")
+        object.__setattr__(self, "_issue_number", issue_number)
+        object.__setattr__(self, "_patch_id", patch_id)
+        object.__setattr__(self, "_pairs", pairs)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        raise AttributeError("authenticated grant proof is immutable")
+
+    @property
+    def issue_number(self) -> int | None:
+        return self._issue_number
+
+    @property
+    def patch_id(self) -> str:
+        return self._patch_id
+
+    @property
+    def pairs(self) -> frozenset[tuple[str, str]]:
+        return self._pairs
+
+    def __contains__(self, item: object) -> bool:
+        return item in self._pairs
+
+    def __iter__(self) -> Iterator[tuple[str, str]]:
+        return iter(self._pairs)
+
+    def __len__(self) -> int:
+        return len(self._pairs)
+
+
 def authenticated_grant_pairs(
     grants: Iterable[ExemptionGrant],
     *,
     issue_number: int | None,
     patch_id: str,
     mac_key: str,
-) -> frozenset[tuple[str, str]]:
+) -> AuthenticatedGrantPairs:
     """The declaration identities authorized for one issue and patch.
 
     Parsing proves only syntax. This helper applies the freshness and
@@ -281,22 +328,29 @@ def authenticated_grant_pairs(
     under a weaker rule than the eventual merge.
     """
     if issue_number is None or not patch_id or not mac_key:
-        return frozenset()
-    return frozenset(
-        (grant.rule, grant.subject)
-        for grant in grants
-        if grant.issue == issue_number
-        and grant.patch == patch_id
-        and hmac.compare_digest(
-            grant.mac,
-            grant_mac(
-                mac_key,
-                grant.rule,
-                grant.issue,
-                grant.subject,
-                grant.patch,
-            ),
+        pairs: frozenset[tuple[str, str]] = frozenset()
+    else:
+        pairs = frozenset(
+            (grant.rule, grant.subject)
+            for grant in grants
+            if grant.issue == issue_number
+            and grant.patch == patch_id
+            and hmac.compare_digest(
+                grant.mac,
+                grant_mac(
+                    mac_key,
+                    grant.rule,
+                    grant.issue,
+                    grant.subject,
+                    grant.patch,
+                ),
+            )
         )
+    return AuthenticatedGrantPairs(
+        issue_number,
+        patch_id,
+        pairs,
+        _AUTHENTICATED_GRANTS_PROOF,
     )
 
 

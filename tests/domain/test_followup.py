@@ -2,6 +2,7 @@
 
 from issue_agent.domain.actions import PostComment, Relabel, Target
 from issue_agent.domain.labels import Label
+from issue_agent.domain.exemptions import authenticated_grant_pairs
 from issue_agent.domain.outcome import (
     AgentResult,
     Adjudication,
@@ -18,7 +19,23 @@ from issue_agent.domain.outcome import (
     resolve_actions,
     resume_actions,
 )
-from issue_agent.domain.review import review_submission
+from issue_agent.domain.review import (
+    CompleteGrants,
+    ReviewTarget,
+    resolve_authenticated_grants,
+    review_submission,
+)
+
+
+REVIEW_TARGET = ReviewTarget(42, "test-patch")
+COMPLETE_GRANTS = resolve_authenticated_grants(
+    (),
+    authenticated_grant_pairs(
+        (), issue_number=42, patch_id="test-patch", mac_key="test-key"
+    ),
+    target=REVIEW_TARGET,
+)
+assert isinstance(COMPLETE_GRANTS, CompleteGrants)
 
 
 def _ok(status="pr_opened", **kw):
@@ -187,17 +204,28 @@ def test_fix_ci_blocked_adds_blocked():
 
 # ── review submission tail (args: decision, body, prior_rejections, max_rejections) ──
 def test_review_approve():
-    s = review_submission("APPROVE", "lgtm", 0, 4)
+    s = review_submission(
+        "APPROVE", "lgtm", 0, 4,
+        grant_resolution=COMPLETE_GRANTS, target=REVIEW_TARGET,
+    )
     assert s.event == "APPROVE" and s.escalate is False
 
 
 def test_review_request_changes():
-    s = review_submission("REQUEST_CHANGES", "fix x", 1, 4)
+    s = review_submission(
+        "REQUEST_CHANGES", "fix x", 1, 4,
+        grant_resolution=COMPLETE_GRANTS,
+        target=REVIEW_TARGET,
+    )
     assert s.event == "REQUEST_CHANGES" and s.escalate is False
 
 
 def test_review_escalate_comments_and_flags():
-    s = review_submission("ESCALATE", "still broken", 3, 4)
+    s = review_submission(
+        "ESCALATE", "still broken", 3, 4,
+        grant_resolution=COMPLETE_GRANTS,
+        target=REVIEW_TARGET,
+    )
     assert s.event == "COMMENT" and s.escalate is True
     # The body names the verdict, not exhausted rounds (keifu #177: verdict
     # escalations phrased as round exhaustion read like a fencepost bug).

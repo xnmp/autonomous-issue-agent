@@ -51,6 +51,11 @@ that removes it.
 - `app/` is the composition/orchestration layer.
 - Decisions return immutable `Action` values. Remote lifecycle mutations go
   through durable commands and effect receipts.
+- Make broken lifecycle states unrepresentable where practical: use explicit
+  typed variants/discriminated unions instead of independent booleans, status
+  strings, or optional fields that permit contradictions. Parse and validate
+  untrusted inputs before constructing a trusted variant; retain runtime
+  validation at external boundaries.
 - SQLite is authority for admission, spend, leases, runs, deduplication,
   lifecycle commands, and receipts. JSONL is telemetry/projection input only.
 - Tests assert public behavior and observable outputs. Business rules include

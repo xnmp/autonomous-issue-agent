@@ -14,6 +14,10 @@ Non-negotiables when working on this repo:
 - Hexagonal boundaries are enforced by import-linter: `domain/` stays pure
   (no I/O, no adapters imports), `adapters/` does I/O, `app/` wires. Put
   classification/decision logic in domain, side effects in adapters.
+- Make broken lifecycle states unrepresentable where practical: prefer
+  explicit typed variants/discriminated unions over independent booleans,
+  status strings, and contradictory optional fields. Validate external input
+  before constructing a trusted variant, with runtime checks at the boundary.
 - Live daemons hot-reload from this checkout's HEAD **between ticks**: a
   commit to the checked-out branch restarts them. Commit only coherent,
   tested states; never commit a half-edit "to save it".

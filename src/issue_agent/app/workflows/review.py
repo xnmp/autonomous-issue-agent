@@ -1152,6 +1152,17 @@ class ReviewWorkflow:
                 return
         signature = review_dom.patch_signature(diff)
         rcfg = self.cfg.review
+        exemption_request = self._exemption_grant_notice(p, diff)
+        if exemption_request is None:
+            self._evidence_deferral(p, "exemption declarations unreadable")
+            return
+        _notice, declared_exemptions = exemption_request
+        grant_resolution = self._grant_resolution(
+            p,
+            signature,
+            body_suffix="",
+            declared_exemptions=declared_exemptions,
+        )
         # Escalation counts the reviewer's OWN prior rejections, not pushes (a
         # rebase that lands here without a prior REQUEST_CHANGES must not consume a
         # round). Derived from GitHub review state, robust across daemon restarts.
@@ -1184,16 +1195,31 @@ class ReviewWorkflow:
         # full review, never to silently APPROVE unreviewed code. Only an explicit
         # reviewable=false short-circuits.
         if not gate.field_bool("reviewable", default=True):
-            self.cfg.log(f"review #{pr}: gate says non-reviewable "
-                         f"({gate.field('reason') or 'no behavioural change'}) → APPROVE")
-            sub = review_dom.gate_submission(prior, self.cfg.max_review_rejections)
+            target = review_dom.ReviewTarget(
+                issue_from_branch(p.head_ref_name), signature
+            )
+            sub = review_dom.gate_submission(
+                prior,
+                self.cfg.max_review_rejections,
+                grant_resolution=grant_resolution,
+                target=target,
+            )
+            self.cfg.log(
+                f"review #{pr}: gate says non-reviewable "
+                f"({gate.field('reason') or 'no behavioural change'}) "
+                f"→ {sub.event}"
+            )
             if self.executor.submit_review(
                 pr, sub.event, sub.body, p.head_ref_oid
             ):
+                if sub.escalate:
+                    self._escalate(
+                        pr, prior + 1, cause=sub.escalate_cause
+                    )
                 self._persist_review_state(pr, p.head_ref_oid, round_number, signature)
                 self._progress(p, claim_target)
             else:
-                self._no_progress(p, "gate APPROVE POST failed")
+                self._no_progress(p, f"gate {sub.event} POST failed")
             return
 
         # 2. dimension specialists — parallel, independent, each hunts one lens.
@@ -1277,7 +1303,15 @@ class ReviewWorkflow:
         # review was incomplete AND nothing blocking survived → submit nothing,
         # retry next poll (mirrors the gate.is_error path; never a silent APPROVE).
         sub = review_dom.synthesize_review(
-            validated, prior, self.cfg.max_review_rejections, complete=complete)
+            validated,
+            prior,
+            self.cfg.max_review_rejections,
+            complete=complete,
+            grant_resolution=grant_resolution,
+            target=review_dom.ReviewTarget(
+                issue_from_branch(p.head_ref_name), signature
+            ),
+        )
         if sub is None:
             self.cfg.log(f"review #{pr}: incomplete and no blocking finding — "
                          "submitting nothing, will retry next poll")
@@ -1381,6 +1415,67 @@ class ReviewWorkflow:
         plus the current suffix: ADR 0014 binds authority to patch content, so
         a later omission cannot revoke an earlier valid grant for this patch."""
         pr = p.number
+        grant_resolution = self._grant_resolution(
+            p,
+            patch_id,
+            body_suffix=body_suffix,
+            declared_exemptions=declared_exemptions,
+        )
+        rejected_exemptions = (
+            grant_resolution.requests
+            if isinstance(grant_resolution, review_dom.RejectedExemptions)
+            else ()
+        )
+        # A partial grant cannot survive a REQUEST_CHANGES review: the merge
+        # collector intentionally trusts grant lines only in APPROVED reviews.
+        # Drop all newly minted lines on this round and require a complete set
+        # across existing approvals plus the next approval, rather than publishing
+        # authority-shaped text in a review whose actual event denies the patch.
+        effective_suffix = "" if rejected_exemptions else body_suffix
+        body = result.field("body") or ""
+        if effective_suffix:
+            # A model body ending inside an unclosed fence would swallow the
+            # harness's grant lines and later escalate with a false "the
+            # reviewer did not grant" (round-3 MINOR 7). Close it first.
+            dangling = open_fence_marker(body)
+            if dangling:
+                body += f"\n{dangling}"
+        sub = review_dom.review_submission(
+            result.field("decision"), body + effective_suffix,
+            prior_rejections, self.cfg.max_review_rejections,
+            grant_resolution=grant_resolution,
+            target=review_dom.ReviewTarget(
+                issue_from_branch(p.head_ref_name), patch_id
+            ),
+        )
+        if not self.executor.submit_review(
+            pr, sub.event, sub.body, expected_head
+        ):
+            return False
+        # Log the OUTCOME of a successful submit — always on (not DEBUG-gated).
+        escalated = " → escalated (needs-human-review)" if sub.escalate else ""
+        # Show the rejection tally that actually drives escalation, not merely
+        # the push-derived round number.
+        tally = (
+            f", rejection {prior_rejections + 1}/{self.cfg.max_review_rejections}"
+            if sub.event != "APPROVE" else ""
+        )
+        self.cfg.log(
+            f"review #{pr} r{round_number}{tally}: submitted {sub.event}{escalated}"
+        )
+        if sub.escalate:
+            self._escalate(pr, prior_rejections + 1, cause=sub.escalate_cause)
+        return True
+
+    def _grant_resolution(
+        self,
+        p,
+        patch_id: str,
+        *,
+        body_suffix: str,
+        declared_exemptions: tuple[ExemptionDeclaration, ...],
+    ) -> review_dom.GrantResolution:
+        """Prove complete grants or return the exact requests that forbid APPROVE."""
         grants = [
             grant
             for review in p.reviews
@@ -1395,50 +1490,14 @@ class ReviewWorkflow:
             patch_id=patch_id,
             mac_key=self.cfg.exemption_mac_key,
         )
-        ungranted = tuple(
+        required = tuple(
             (declaration.rule, declaration.subject)
             for declaration in declared_exemptions
-            if (declaration.rule, declaration.subject) not in granted
         )
-        # A partial grant cannot survive a REQUEST_CHANGES review: the merge
-        # collector intentionally trusts grant lines only in APPROVED reviews.
-        # Drop all newly minted lines on this round and require a complete set
-        # across existing approvals plus the next approval, rather than publishing
-        # authority-shaped text in a review whose actual event denies the patch.
-        effective_suffix = "" if ungranted else body_suffix
-        body = result.field("body") or ""
-        if effective_suffix:
-            # A model body ending inside an unclosed fence would swallow the
-            # harness's grant lines and later escalate with a false "the
-            # reviewer did not grant" (round-3 MINOR 7). Close it first.
-            dangling = open_fence_marker(body)
-            if dangling:
-                body += f"\n{dangling}"
-        sub = review_dom.review_submission(
-            result.field("decision"), body + effective_suffix,
-            prior_rejections, self.cfg.max_review_rejections,
-            ungranted_exemptions=ungranted,
+        return review_dom.resolve_authenticated_grants(
+            required,
+            granted,
+            target=review_dom.ReviewTarget(
+                issue_from_branch(p.head_ref_name), patch_id
+            ),
         )
-        if not self.executor.submit_review(
-            pr, sub.event, sub.body, expected_head
-        ):
-            return False
-        # Log the OUTCOME of a successful submit — always on (not DEBUG-gated). Without
-        # this, a clean review was invisible on stdout: `dispatch` then silence until
-        # the next poll (the per-message sdk: trace is DEBUG-only, and only the ERROR
-        # path logged). The verdict is the one line an operator needs to see land.
-        escalated = " → escalated (needs-human-review)" if sub.escalate else ""
-        # Show the rejection tally (what actually drives escalation) for a
-        # REQUEST_CHANGES/escalate, not just the push-based round_number — the
-        # latter is derived from stored state and reads wrong after a STATE_DIR
-        # wipe, whereas prior_rejections is recomputed from GitHub every time.
-        tally = (
-            f", rejection {prior_rejections + 1}/{self.cfg.max_review_rejections}"
-            if sub.event != "APPROVE" else ""
-        )
-        self.cfg.log(
-            f"review #{pr} r{round_number}{tally}: submitted {sub.event}{escalated}"
-        )
-        if sub.escalate:
-            self._escalate(pr, prior_rejections + 1, cause=sub.escalate_cause)
-        return True
