@@ -22,7 +22,6 @@ from ..adapters.control_store import (
     RetiredOwnerError,
 )
 from ..adapters.env_file import source_env_file
-from ..adapters.app_token import AppCredentials, AppTokenMinter, default_mint_fn
 from ..adapters.codex_hook import evidence_receipt_path
 from ..adapters.github import GhUnavailable, GitHubGateway, Identity
 from ..adapters.governor import build_hooks
@@ -44,6 +43,7 @@ from .roles import (
     prior_process_supervision_state_dirs,
     process_supervision_state_dir,
 )
+from .review_identity import review_identity as _app_identity
 from .world_probe import WorldProbe
 
 
@@ -62,10 +62,6 @@ def _load_agent_env(env: dict) -> dict:
     loaded = source_env_file(path, env)
     loaded["AGENT_ENV"] = path
     return loaded
-
-
-def _ignore_log(_message: str) -> None:
-    pass
 
 
 def _recover_pre_adapter_processes(
@@ -116,64 +112,6 @@ class _TerminationHandler:
             return
         self._requested = True
         raise SystemExit(ExitCode.CLEAN)
-
-
-def _app_identity(
-    cfg_env: dict, warn: Callable[[str], None] = _ignore_log
-) -> Identity:
-    """review/steward identity: GitHub App installation token if configured AND
-    USABLE, else a static bot token, else ambient. Mirrors gh_review/gh_steward
-    priority.
-
-    "Configured" has to mean more than "the three vars are non-empty".
-    config/shared.example.env ships GH_APP_* as literal `<your-app-id>` /
-    `$HOME/.config/<your-app>/private-key.pem` placeholders, and PATH A (bot
-    account + REVIEW_BOT_TOKEN) is documented as leaving them alone. Selecting the
-    App branch on non-emptiness alone commits to a key file that does not exist,
-    and `AppTokenMinter.get` then raises ENOENT on EVERY poll pass — observed on
-    the first real deployment as an endless `review: poll pass failed (continuing)`
-    with the reviewer never reviewing anything. So gate the branch on the key being
-    READABLE and fall through when it is not.
-
-    Fall through AUDIBLY, and proportionately. Demoting to ambient silently would
-    make review == FIX_BOT, and under IDENTITY_MODE=three every approval is then a
-    GitHub 422 self-approval — a failure that surfaces far from its cause, so that
-    case stays a warning. Falling through to a configured REVIEW_BOT_TOKEN is a
-    working identity, not a fault; it states which identity is live instead (#46).
-    """
-    if cfg_env.get("GH_APP_ID") and cfg_env.get("GH_APP_KEY_FILE") and cfg_env.get("GH_APP_INSTALL_ID"):
-        key_file = os.path.expanduser(cfg_env["GH_APP_KEY_FILE"])
-        if os.access(key_file, os.R_OK):
-            creds = AppCredentials(
-                app_id=cfg_env["GH_APP_ID"],
-                install_id=cfg_env["GH_APP_INSTALL_ID"],
-                key_file=key_file,
-                cache_path=cfg_env.get("GH_APP_TOKEN_CACHE", os.path.expanduser("~/.local/state/issue-agent-bot/app-token.json")),
-            )
-            minter = AppTokenMinter(creds, default_mint_fn, now_fn=lambda: int(time.time()))
-            return Identity(token_provider=minter.get)
-        # Two very different situations, and printing the SAME alarm for both
-        # (#46) trains operators to ignore it. With a bot token configured the
-        # static-token path is a supported, complete identity — the missing key
-        # file is then almost always the shipped GH_APP_* placeholder, and the
-        # line should confirm which identity is live, not read as a fault on
-        # every boot of all three daemons. With no bot token the fallback is
-        # ambient == FIX_BOT and every approval 422s: that stays loud.
-        if cfg_env.get("REVIEW_BOT_TOKEN"):
-            warn(
-                "identity: static token (REVIEW_BOT_TOKEN) — GH_APP_KEY_FILE "
-                f"'{key_file}' is not present, so the GitHub App identity is "
-                "not in use"
-            )
-        else:
-            warn(
-                f"GH_APP_KEY_FILE '{key_file}' is missing or unreadable — ignoring "
-                "the GitHub App identity and falling back to ambient `gh auth` "
-                "(which is FIX_BOT — approvals will 422)"
-            )
-    if cfg_env.get("REVIEW_BOT_TOKEN"):
-        return Identity(static_token=cfg_env["REVIEW_BOT_TOKEN"])
-    return Identity()
 
 
 def _agent_md(cfg: HarnessConfig) -> str:

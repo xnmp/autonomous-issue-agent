@@ -120,8 +120,10 @@ _OVERLAY_FIELDS = (
     "TEST_CMD", "BASE_BRANCH", "DAILY_SPEND_CAP_USD", "GLOBAL_DAILY_SPEND_CAP_USD",
     "FIXER_RUNTIME", "REVIEWER_RUNTIME", "STEWARD_RUNTIME", "REVIEW_MODE",
     # Read by the dashboard's operator re-arm: which login's change requests
-    # count toward the rejection ceiling, and how many of them it takes.
-    "REVIEW_BOT", "REVIEW_MAX_REJECTIONS",
+    # count toward the rejection ceiling, how many of them it takes, and the
+    # same App → token identity the review daemon used to author them.
+    "REVIEW_BOT", "REVIEW_MAX_REJECTIONS", "REVIEW_BOT_TOKEN",
+    "GH_APP_ID", "GH_APP_INSTALL_ID", "GH_APP_KEY_FILE", "GH_APP_TOKEN_CACHE",
     REPOINT_HISTORY_ENV,
 )
 

@@ -486,7 +486,7 @@ adapters live under `adapters/dashweb/`.
 `app/execute.py`, `app/identity_pools.py`, `app/infra_breaker.py`,
 `app/launchd_main.py`,
 `app/loop.py`, `app/main.py`,
-`app/mcp.py`, `app/recovery.py`, `app/roles.py`, `app/webhook.py`,
+`app/mcp.py`, `app/recovery.py`, `app/review_identity.py`, `app/roles.py`, `app/webhook.py`,
 `app/world_probe.py`, and `app/world_reporter.py`.
 Provider-neutral task construction is isolated in `app/planners/`; paid
 workflow sequencing and the single `run_leg` path are in `app/workflows/`;

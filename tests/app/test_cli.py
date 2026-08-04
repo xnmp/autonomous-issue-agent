@@ -304,6 +304,29 @@ def test_read_repo_env_field_does_not_leak_ambient_env(tmp_path, monkeypatch):
     assert cli.read_repo_env_field(str(p), "REPO") == ""
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("REVIEW_BOT_TOKEN", "review-secret"),
+        ("GH_APP_ID", "123"),
+        ("GH_APP_INSTALL_ID", "456"),
+        ("GH_APP_KEY_FILE", "/keys/review.pem"),
+        ("GH_APP_TOKEN_CACHE", "/state/app-token.json"),
+    ],
+)
+def test_rearm_identity_fields_are_read_from_the_composed_file_only(
+    tmp_path, monkeypatch, field, value
+):
+    overlay = tmp_path / "r.env"
+    overlay.write_text(f'{field}="{value}"\n')
+    monkeypatch.setenv(field, "ambient-secret-must-not-win")
+
+    assert cli.read_repo_env_field(str(overlay), field) == value
+
+    overlay.write_text('OTHER="x"\n')
+    assert cli.read_repo_env_field(str(overlay), field) == ""
+
+
 def test_resolve_name_matches_overlay_despite_trailing_comment(tmp_path):
     (tmp_path / "myapp.env").write_text('REPO="acme/App"  # prod\n')
     assert cli.resolve_name("ACME/app", repos_dir=str(tmp_path)) == "myapp"

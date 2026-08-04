@@ -295,7 +295,7 @@ def _unblock_backend(
             calls.append(("dismiss", pr, review.review_id, message))
             return dismissed
 
-    def factory(repo, state_dirs, *, identity, journal=None):
+    def factory(repo, state_dirs, *, identity, journal=None, run=None):
         calls.append(("factory", journal is not None))
         return Effects()
 
@@ -406,7 +406,7 @@ def test_unblock_drops_the_holding_labels_and_names_the_operator_action(
 
     assert backend.unblock("demo", 7) == (True, "ok")
 
-    issue, kwargs = calls[1]
+    issue, kwargs = next(call for call in calls if isinstance(call[0], int))
     assert issue == 7
     assert kwargs["add"] == ("ai-ready",)
     assert kwargs["add_unless_present"] == actions.SELECTABLE_ISSUE_LABELS
@@ -774,6 +774,116 @@ def test_unblock_dismisses_the_change_requests_that_still_arm_the_ceiling(
     # COMMENT is the escalation itself.
     assert [(c[1], c[2]) for c in dismissals] == [(12, "3"), (12, "4"), (12, "5")]
     assert "re-arm" in dismissals[0][3]
+
+
+def test_review_dismissals_use_the_configured_review_identity(
+    monkeypatch, tmp_path
+):
+    from issue_agent.adapters.operator_effects import LabelEffect
+
+    real_deployment_env_field = service.cli.deployment_env_field
+    reviews = _at_ceiling("3")
+    backend, _dirs, _calls = _unblock_backend(
+        monkeypatch, tmp_path, reviews=_at_ceiling("3"),
+    )
+    effects_calls = []
+
+    class CredentialEffects:
+        def __init__(self, identity, run):
+            self.identity = identity
+            self.run = run
+
+        def pr_reviews(self, pr):
+            effects_calls.append(("reviews", self.identity, self.run, pr))
+            return reviews
+
+        def dismiss_review(self, pr, review, message):
+            effects_calls.append(("dismiss", self.identity, self.run, pr))
+            if self.run is not None:
+                self.run(["gh", "api", "user"], capture_output=True)
+            return True, "ok"
+
+        def set_issue_labels_effect(self, issue, **kwargs):
+            effects_calls.append(("labels", self.identity, self.run, issue))
+            return LabelEffect(
+                True,
+                "ok",
+                tuple(kwargs.get("add", ())),
+                ("needs-human-review",),
+            )
+
+    def credential_factory(
+        _repo, _state_dirs, *, identity, journal=None, run=None
+    ):
+        return CredentialEffects(identity, run)
+
+    backend.effects_factory = credential_factory
+    active = tmp_path / "active.env"
+    active.write_text(
+        'REPO="o/r"\nREVIEW_BOT="reviewer[bot]"\n'
+        'REVIEW_BOT_TOKEN="review-secret"\n'
+    )
+    monkeypatch.setattr(service.cli, "deployment_env_field", real_deployment_env_field)
+    monkeypatch.setattr(service.cli, "_active_env_path", lambda _name: str(active))
+    monkeypatch.setattr(service.cli, "REPOS_DIR", str(tmp_path / "repos"))
+    subprocess_calls = []
+    real_subprocess_run = service.subprocess.run
+
+    def fake_run(argv, **kwargs):
+        if argv[0] != "gh":
+            return real_subprocess_run(argv, **kwargs)
+        subprocess_calls.append((argv, kwargs))
+        return object()
+
+    monkeypatch.setattr(service.subprocess, "run", fake_run)
+
+    assert backend.unblock("demo", 7) == (True, "ok")
+
+    review_calls = [call for call in effects_calls if call[0] in {"reviews", "dismiss"}]
+    assert review_calls
+    assert all(call[1].endswith(":review:review_bot_token") for call in review_calls)
+    assert all(call[2] is not None for call in review_calls)
+    (label_call,) = [call for call in effects_calls if call[0] == "labels"]
+    assert label_call[1] == "o/r:dashboard" and label_call[2] is None
+    _argv, run_options = subprocess_calls[0]
+    assert run_options["env"]["GH_TOKEN"] == "review-secret"
+    assert run_options["env"]["GITHUB_TOKEN"] == "review-secret"
+
+
+def test_review_operator_effects_use_the_app_identity_when_configured(
+    monkeypatch, tmp_path
+):
+    from issue_agent.adapters.github import Identity
+
+    backend, _dirs, _calls = _unblock_backend(monkeypatch, tmp_path)
+    captured = []
+    factory = backend.effects_factory
+
+    def capture_factory(*args, **kwargs):
+        captured.append(kwargs)
+        return factory(*args, **kwargs)
+
+    backend.effects_factory = capture_factory
+    monkeypatch.setattr(
+        service,
+        "review_identity",
+        lambda _env: Identity(token_provider=lambda: "app-secret"),
+    )
+    subprocess_calls = []
+    monkeypatch.setattr(
+        service.subprocess,
+        "run",
+        lambda argv, **kwargs: subprocess_calls.append((argv, kwargs)),
+    )
+
+    backend._operator_effects(
+        "demo", "o/r", journalled=False, credential_role="review"
+    )
+
+    (options,) = captured
+    assert options["identity"].endswith(":review:github_app")
+    options["run"](["gh", "api", "user"])
+    assert subprocess_calls[0][1]["env"]["GH_TOKEN"] == "app-secret"
 
 
 def test_a_live_change_request_below_the_ceiling_is_never_retracted(

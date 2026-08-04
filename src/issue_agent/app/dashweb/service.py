@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import uuid
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -26,6 +27,7 @@ from ...domain.events import (
     TelemetryEvent,
 )
 from .. import cli
+from ..review_identity import review_identity
 from . import snapshots
 
 
@@ -47,6 +49,22 @@ def _positive_int(raw: str, default: int) -> int:
 
 def _detail(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"[:400]
+
+
+def _identity_run(identity):
+    """A subprocess runner that keeps a role identity in the child env."""
+
+    def run(argv, **kwargs):
+        configured = kwargs.pop("env", None)
+        env = dict(os.environ if configured is None else configured)
+        token = identity.env_token()
+        if not token:
+            return subprocess.run(argv, env=env, **kwargs)
+        env["GH_TOKEN"] = token
+        env["GITHUB_TOKEN"] = token
+        return subprocess.run(argv, env=env, **kwargs)
+
+    return run
 
 
 class Backend:
@@ -461,12 +479,20 @@ class Backend:
         # because the counter reset happened whatever GitHub then did with the
         # labels — including the no-op path, which emits nothing of its own.
         effects = self._operator_effects(name, repo, journalled=False)
+        review_effects = self._operator_effects(
+            name,
+            repo,
+            journalled=False,
+            credential_role="review",
+        )
         # Before the labels, and never allowed to wedge them: the counters and
         # labels are still worth clearing when a dismissal cannot happen. But a
         # re-arm that failed must NOT read as a clean unblock — the whole
         # incident was a green result over a dead PR — so its notes ride back
         # in the operator-facing detail as well as the journal.
-        rearm_failures = self._rearm_rejections(name, repo, number, effects)
+        rearm_failures = self._rearm_rejections(
+            name, repo, number, review_effects
+        )
         issue_applied, issue_detail = True, "ok"
         issue_actual_add: tuple[str, ...] = ()
         issue_actual_remove: tuple[str, ...] = ()
@@ -1156,7 +1182,14 @@ class Backend:
             return []
         return list(row.prs) if row is not None else []
 
-    def _operator_effects(self, name: str, repo: str, *, journalled: bool = True):
+    def _operator_effects(
+        self,
+        name: str,
+        repo: str,
+        *,
+        journalled: bool = True,
+        credential_role: str = "",
+    ):
         # Derived from journal_paths like _clear_retries, NOT read raw from the
         # overlay: the STATE_DIR keys are optional and standard deployments
         # never set them, so the raw read produced () and control_store_path
@@ -1166,11 +1199,45 @@ class Backend:
         state_dirs = tuple(
             os.path.dirname(path) for path in cli.journal_paths(name)
         )
+        journal = self._operator_journal(name, repo) if journalled else None
+        if credential_role == "review":
+            env = {
+                field: cli.deployment_env_field(name, field)
+                for field in (
+                    "GH_APP_ID",
+                    "GH_APP_INSTALL_ID",
+                    "GH_APP_KEY_FILE",
+                    "GH_APP_TOKEN_CACHE",
+                    "REVIEW_BOT_TOKEN",
+                )
+            }
+            identity = review_identity(env)
+            source = (
+                "github_app"
+                if identity.token_provider is not None
+                else "review_bot_token"
+                if identity.static_token
+                else "ambient"
+            )
+            if identity.token_provider is not None or identity.static_token:
+                return self.effects_factory(
+                    repo,
+                    state_dirs,
+                    identity=f"{repo}:dashboard:review:{source}",
+                    journal=journal,
+                    run=_identity_run(identity),
+                )
+            return self.effects_factory(
+                repo,
+                state_dirs,
+                identity=f"{repo}:dashboard:review:ambient",
+                journal=journal,
+            )
         return self.effects_factory(
             repo,
             state_dirs,
             identity=f"{repo}:dashboard",
-            journal=self._operator_journal(name, repo) if journalled else None,
+            journal=journal,
         )
 
     def _operator_journal(self, name: str, repo: str) -> TypedJournal | None:
