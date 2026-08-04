@@ -422,13 +422,13 @@ def reviewer_abandoned_at_ceiling(pr: PRView, cfg: ReviewConfig) -> bool:
 
     That combination is a dead state, not a hold (keifu PR #173 / issue #25,
     2026-08-02). The ceiling escalation posts a COMMENT review and swaps the
-    trigger label for needs-human-review; a dashboard unblock then removes
-    needs-human-review and adds nothing, so the PR carries no lifecycle label at
-    all. The reviewer will not re-review (its verdict is already on this head),
-    the fixer will not dispatch address-review (the latest review is a COMMENT,
-    not CHANGES_REQUESTED), and the escalation event stays frozen at the moment
-    before the unblock. Recognising it is what lets the reviewer re-emit the
-    escalation instead of going quiet forever.
+    trigger label for needs-human-review; a legacy/manual clear can then remove
+    needs-human-review without restoring the trigger, so the PR carries no
+    lifecycle label at all. The reviewer will not re-review (its verdict is
+    already on this head), the fixer will not dispatch address-review (the
+    latest review is a COMMENT, not CHANGES_REQUESTED), and the escalation event
+    stays frozen at the moment before the clear. Recognising it is what lets the
+    reviewer re-emit the escalation instead of going quiet forever.
 
     The three conjuncts are what keep this from firing on a HEALTHY loop:
 

@@ -1608,6 +1608,31 @@ def test_a_manual_unblock_is_rendered_as_a_free_step_that_says_what_it_did():
     )
 
 
+def test_a_failed_unblock_intent_does_not_retire_journal_attention():
+    escalation = {
+        "ts": ts(hours=2), "event": "action", "issue": 7, "role": "fix",
+        "desc": "relabel issue #7: +needs-human-review",
+    }
+    failed = {
+        **UNBLOCK,
+        "action": {
+            **UNBLOCK["action"],
+            "labels_applied": False,
+            # Retain the attempted move to reproduce old/foreign writers; the
+            # fold must key on the explicit outcome, not merely empty lists.
+            "remove": ["needs-human-review", "ai-blocked"],
+        },
+    }
+    row = row_for([escalation, failed], 7)
+
+    assert snapshots._journal_attention_at(row)[0] == "escalated"
+    step = snapshots.detailed_steps(row_view([failed]))[-1]
+    assert step["state"] == "failed"
+    assert step["note"] == "label edit failed; reset retry counters"
+    assert "removed" not in step["note"]
+    assert snapshots.collapse_steps(row_view([failed]))[-1]["state"] == "failed"
+
+
 def test_the_card_strip_shows_the_intervention_too():
     steps = snapshots.collapse_steps(row_view([UNBLOCK]))
     assert [s["kind"] for s in steps] == ["RESOLVE", "unblock"]

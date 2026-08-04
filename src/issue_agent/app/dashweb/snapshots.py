@@ -176,12 +176,12 @@ def collapse_steps(row: dash.IssueRow) -> list[dict]:
     ordered.extend(
         {
             "kind": kind,
-            "state": "done",
+            "state": state,
             "status": None,
             "cost_usd": 0.0,
             "ts": dash.parse_ts(event.get("ts")),
         }
-        for event, kind, _note in _operator_steps(row)
+        for event, kind, _note, state in _operator_steps(row)
     )
     ordered.sort(
         key=lambda step: step["ts"] or datetime.max.replace(tzinfo=timezone.utc)
@@ -216,17 +216,37 @@ def _label_list(value: object) -> tuple:
 
 
 def _operator_note(action: dict) -> str | None:
-    changes = [
-        f"{verb} {', '.join(labels)}"
-        for verb, key in (("removed", "remove"), ("added", "add"))
-        if (
-            labels := [
-                str(label)
-                for label in _label_list(action.get(key))
-                if str(label)
-            ]
-        )
-    ]
+    if action.get("labels_applied") is False:
+        requested = [
+            f"{verb} {', '.join(labels)}"
+            for verb, key in (
+                ("remove", "requested_remove"),
+                ("add", "requested_add"),
+            )
+            if (
+                labels := [
+                    str(label)
+                    for label in _label_list(action.get(key))
+                    if str(label)
+                ]
+            )
+        ]
+        changes = [
+            "label edit failed"
+            + (f" (requested {'; '.join(requested)})" if requested else "")
+        ]
+    else:
+        changes = [
+            f"{verb} {', '.join(labels)}"
+            for verb, key in (("removed", "remove"), ("added", "add"))
+            if (
+                labels := [
+                    str(label)
+                    for label in _label_list(action.get(key))
+                    if str(label)
+                ]
+            )
+        ]
     if action.get("retries_cleared"):
         changes.append("reset retry counters")
     if "dismissed" in action:
@@ -239,8 +259,10 @@ def _operator_note(action: dict) -> str | None:
     return _reason_line("; ".join(changes))
 
 
-def _operator_steps(row: dash.IssueRow) -> list[tuple[dict, str, str | None]]:
-    """Journalled operator interventions, as (event, step kind, note).
+def _operator_steps(
+    row: dash.IssueRow,
+) -> list[tuple[dict, str, str | None, str]]:
+    """Journalled operator interventions, as (event, kind, note, state).
 
     A manual unblock costs nothing but changes what the harness does next, so
     it belongs in the step list beside the paid legs rather than only in the
@@ -259,7 +281,8 @@ def _operator_steps(row: dash.IssueRow) -> list[tuple[dict, str, str | None]]:
             # channel and stay unmarked.
             if action.get("channel") == "api":
                 kind = f"{kind} (api)"
-            steps.append((event, kind, _operator_note(action)))
+            state = "failed" if action.get("labels_applied") is False else "done"
+            steps.append((event, kind, _operator_note(action), state))
     return steps
 
 
@@ -352,7 +375,7 @@ def detailed_steps(row: dash.IssueRow) -> list[dict]:
             "kind": kind,
             "role": event.get("role"),
             "ts": event.get("ts"),
-            "state": "done",
+            "state": state,
             "status": None,
             "exit_reason": None,
             "duration_s": None,
@@ -366,7 +389,7 @@ def detailed_steps(row: dash.IssueRow) -> list[dict]:
             "has_transcript": False,
             "note": note,
         }
-        for i, (event, kind, note) in enumerate(_operator_steps(row))
+        for i, (event, kind, note, state) in enumerate(_operator_steps(row))
     )
     # The three sources above each arrive in their own order; without this
     # sort every operator intervention rendered after every leg, however early
@@ -993,6 +1016,12 @@ def _action_label_moves(event: dict) -> tuple[set[str], set[str]] | None:
     """
     action = event.get("action")
     if isinstance(action, dict):
+        # Operator effects journal their attempted move even when GitHub
+        # rejected it so the reset remains auditable.  A failed intent is not
+        # an observed label transition and must never retire dashboard
+        # attention while the live label view is unavailable.
+        if action.get("labels_applied") is False:
+            return set(), set()
         add, remove = action.get("add"), action.get("remove")
         if isinstance(add, list) or isinstance(remove, list):
             return (

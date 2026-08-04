@@ -11,6 +11,7 @@ import hashlib
 import json
 import subprocess
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
 
@@ -38,6 +39,14 @@ class OperatorEffectError(RuntimeError):
 
 class UnknownOperatorEffect(OperatorEffectError):
     pass
+
+
+@dataclass(frozen=True)
+class LabelEffect:
+    applied: bool
+    detail: str
+    added: tuple[str, ...] = ()
+    removed: tuple[str, ...] = ()
 
 
 def build_operator_effects(
@@ -143,17 +152,57 @@ class GitHubOperatorEffects:
         *,
         add: Iterable[str] = (),
         remove: Iterable[str] = (),
+        add_unless_present: Iterable[str] = (),
         action_kind: str = "operator_relabel",
         action_attributes: Mapping[str, Any] | None = None,
     ) -> tuple[bool, str]:
-        added = tuple(dict.fromkeys(add))
-        removed = tuple(label for label in dict.fromkeys(remove) if label not in added)
-        if issue <= 0 or not added and not removed:
-            return False, "a positive issue and at least one label change are required"
+        effect = self.set_issue_labels_effect(
+            issue,
+            add=add,
+            remove=remove,
+            add_unless_present=add_unless_present,
+            action_kind=action_kind,
+            action_attributes=action_attributes,
+        )
+        return effect.applied, effect.detail
+
+    def set_issue_labels_effect(
+        self,
+        issue: int,
+        *,
+        add: Iterable[str] = (),
+        remove: Iterable[str] = (),
+        add_unless_present: Iterable[str] = (),
+        action_kind: str = "operator_relabel",
+        action_attributes: Mapping[str, Any] | None = None,
+    ) -> LabelEffect:
+        """Apply labels and report the move resolved from the command read."""
+        requested_add = tuple(dict.fromkeys(add))
+        suppress_add = frozenset(add_unless_present)
+        removed = tuple(
+            label for label in dict.fromkeys(remove) if label not in requested_add
+        )
+        if issue <= 0 or not requested_add and not removed:
+            return LabelEffect(
+                False,
+                "a positive issue and at least one label change are required",
+            )
         try:
             labels, revision = self._issue_labels(issue)
+            # Some transitions must restore a fallback label only when no
+            # equivalent lifecycle arm survives.  Resolve that condition from
+            # this revision-bound read, not from a caller's earlier snapshot:
+            # the latter can race an add-first daemon relabel and strand the
+            # target with no selectable label.
+            added = (
+                ()
+                if requested_add and suppress_add.intersection(labels)
+                else requested_add
+            )
+            effective_added = tuple(label for label in added if label not in labels)
+            effective_removed = tuple(label for label in removed if label in labels)
             if _labels_match(labels, added, removed):
-                return True, "ok"
+                return LabelEffect(True, "ok")
             payload = {
                 "issue": issue,
                 "add": list(added),
@@ -208,9 +257,9 @@ class GitHubOperatorEffects:
             self._journal_label_action(
                 command, issue, added, removed, action_kind, action_attributes
             )
-            return True, "ok"
+            return LabelEffect(True, "ok", effective_added, effective_removed)
         except Exception as exc:  # noqa: BLE001 - operator-facing result
-            return False, _detail(exc)
+            return LabelEffect(False, _detail(exc))
 
     def _journal_label_action(
         self,

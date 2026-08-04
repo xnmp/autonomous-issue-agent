@@ -183,10 +183,45 @@ def test_a_generated_chart_is_returned_verbatim(monkeypatch, tmp_path):
 
 
 # ── unblock ───────────────────────────────────────────────────────────────────
-def test_unblock_removes_every_label_that_holds_an_issue_and_adds_none():
-    add, remove = actions.unblock_change()
-    assert add == ()
+def test_unblock_rearms_a_lifecycle_held_issue_for_the_fixer():
+    add, remove = actions.issue_unblock_change(("needs-human-review",))
+    assert add == ("ai-ready",)
     assert set(remove) == {"needs-human-review", "needs-budget-review", "ai-blocked"}
+
+
+def test_clearing_only_an_advisory_budget_hold_preserves_the_current_stage():
+    add, remove = actions.issue_unblock_change(("needs-budget-review",))
+    assert add == ()
+    assert set(remove) == set(actions.UNBLOCK_LABELS)
+
+
+def test_pr_unblock_restores_the_trigger_even_when_adoption_is_disabled():
+    add, remove = actions.pr_unblock_change(
+        ("needs-human-review",), "ai-pr-open", "review"
+    )
+    assert add == ("ai-pr-open",)
+    assert remove == ("needs-human-review",)
+
+
+def test_pr_budget_unblock_restores_the_fixer_arm_without_duplicate_labels():
+    add, remove = actions.pr_unblock_change(
+        ("ai-blocked", "needs-budget-review"), "ai-pr-open"
+    )
+    assert add == ("ai-pr-open",)
+    assert remove == ("ai-blocked", "needs-budget-review")
+
+
+def test_a_terminal_mixed_hold_restores_only_its_durable_source_role():
+    add, remove = actions.pr_unblock_change(
+        ("ai-blocked", "needs-human-review"), "ai-review", "review"
+    )
+    assert add == ("ai-review",)
+    assert remove == ("ai-blocked", "needs-human-review")
+
+
+def test_a_custom_trigger_without_hold_provenance_is_refused():
+    with pytest.raises(ValueError, match="source is unknown"):
+        actions.pr_unblock_change(("needs-human-review",), "ai-review")
 
 
 def _unblock_backend(
@@ -202,6 +237,11 @@ def _unblock_backend(
     dismissed=(True, "ok"),
     review_bot="reviewer[bot]",
     pr_state="OPEN",
+    hold_role="",
+    composite_hold=False,
+    prior_unblock=False,
+    applied_by_target=None,
+    effective_by_target=None,
 ):
     """A Backend whose three role state dirs are real, with a journalled row
     that links issue 7 to `prs` and a GitHub reader that answers with
@@ -223,9 +263,28 @@ def _unblock_backend(
     calls = []
 
     class Effects:
-        def set_issue_labels(self, issue, **kwargs):
+        def set_issue_labels_effect(self, issue, **kwargs):
+            from issue_agent.adapters.operator_effects import LabelEffect
+
             calls.append((issue, kwargs))
-            return applied
+            ok, detail = (applied_by_target or {}).get(issue, applied)
+            if not ok:
+                return LabelEffect(False, detail)
+            current = set(issue_labels if issue == 7 else pr_labels)
+            requested_add = tuple(kwargs.get("add", ()))
+            suppressors = set(kwargs.get("add_unless_present", ()))
+            resolved_add = (
+                ()
+                if requested_add and suppressors.intersection(current)
+                else tuple(label for label in requested_add if label not in current)
+            )
+            resolved_remove = tuple(
+                label for label in kwargs.get("remove", ()) if label in current
+            )
+            effective_add, effective_remove = (effective_by_target or {}).get(
+                issue, (resolved_add, resolved_remove)
+            )
+            return LabelEffect(True, detail, effective_add, effective_remove)
 
         def pr_reviews(self, pr):
             if reviews_error is not None:
@@ -267,13 +326,64 @@ def _unblock_backend(
     monkeypatch.setattr(backend, "known", lambda _name: True)
     monkeypatch.setattr(backend, "overlay_field", lambda _name, _field: "o/r")
 
-    events = [
+    role_events = {role: [] for role in dash.ROLE_NAMES}
+    role_events["fix"] = [
         {"ts": "2026-07-29T09:00:00+00:00", "event": "agent_run", "role": "fix",
          "kind": "FIX_CI", "issue": 7, "number": pr, "cost_usd": 0.0}
         for pr in prs
     ]
-    feeds = (("fix", "/j", "/l", events), ("review", "/j", "/l", []),
-             ("steward", "/j", "/l", []))
+    if hold_role:
+        role_events[hold_role].extend(
+            {
+                "ts": "2026-07-29T09:01:00+00:00",
+                "event": "action",
+                "role": hold_role,
+                "pr": pr,
+                "desc": (
+                    f"relabel pr #{pr}: -ai-pr-open +needs-human-review"
+                ),
+                "action": (
+                    {
+                        "type": "escalate_ci_pending",
+                        "target": "PR",
+                        "number": pr,
+                        "pr": pr,
+                        "head": "abc1234",
+                    }
+                    if composite_hold
+                    else {
+                        "type": "relabel",
+                        "target": "PR",
+                        "number": pr,
+                        "remove": "ai-pr-open",
+                        "add": "needs-human-review",
+                    }
+                ),
+            }
+            for pr in prs
+        )
+    if prior_unblock:
+        role_events["fix"].extend(
+            {
+                "ts": "2026-07-29T09:02:00+00:00",
+                "event": "action",
+                "role": "dashboard",
+                "pr": pr,
+                "desc": f"relabel pr #{pr}: -needs-human-review",
+                "action": {
+                    "type": "operator_unblock",
+                    "target": "PR",
+                    "number": pr,
+                    "add": [],
+                    "remove": ["needs-human-review"],
+                    "labels_applied": True,
+                },
+            }
+            for pr in prs
+        )
+    feeds = tuple(
+        (role, "/j", "/l", role_events[role]) for role in dash.ROLE_NAMES
+    )
     deployment = dash.build_deployment(
         "demo", "o/r", feeds, (),
         now_fn=lambda: datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc),
@@ -281,7 +391,9 @@ def _unblock_backend(
     monkeypatch.setattr(
         backend,
         "snapshot",
-        lambda _name: dash.Snapshot("demo", "o/r", "/t", deployment, ()),
+        lambda _name, **_kwargs: dash.Snapshot(
+            "demo", "o/r", "/t", deployment, ()
+        ),
     )
     return backend, dirs, calls
 
@@ -296,7 +408,8 @@ def test_unblock_drops_the_holding_labels_and_names_the_operator_action(
 
     issue, kwargs = calls[1]
     assert issue == 7
-    assert kwargs["add"] == ()
+    assert kwargs["add"] == ("ai-ready",)
+    assert kwargs["add_unless_present"] == actions.SELECTABLE_ISSUE_LABELS
     assert set(kwargs["remove"]) == set(actions.UNBLOCK_LABELS)
 
 
@@ -325,6 +438,24 @@ def test_an_unblock_journals_one_event_naming_what_it_actually_reset(
     assert payload.attributes["labels_applied"] is True
 
 
+def test_unblock_journals_the_resolved_fallback_not_the_stale_request(
+    monkeypatch, tmp_path
+):
+    backend, dirs, _calls = _unblock_backend(
+        monkeypatch,
+        tmp_path,
+        issue_labels=("needs-human-review", "ai-working"),
+    )
+
+    assert backend.unblock("demo", 7) == (True, "ok")
+
+    (payload,) = _journalled(dirs)
+    assert payload.attributes["add"] == []
+    assert payload.attributes["requested_add"] == ["ai-ready"]
+    assert payload.attributes["remove"] == ["needs-human-review"]
+    assert "+ai-ready" not in payload.display
+
+
 def test_a_counter_reset_is_journalled_even_when_github_changed_nothing(
     monkeypatch, tmp_path
 ):
@@ -340,13 +471,136 @@ def test_a_counter_reset_is_journalled_even_when_github_changed_nothing(
 
     label_edits = [c for c in calls if c[0] != "factory"]
     assert label_edits == [
-        (12, {"add": (), "remove": ("needs-human-review",)})
+        (12, {"add": ("ai-pr-open",), "remove": ("needs-human-review",)})
     ]
     issue_event, pr_event = _journalled(dirs)
     assert issue_event.attributes["retries_cleared"] == 1
     assert pr_event.target == "pr"
+    assert pr_event.attributes["add"] == ["ai-pr-open"]
     assert pr_event.attributes["remove"] == ["needs-human-review"]
     assert "pr #12" in pr_event.display
+
+
+def test_pr_unblock_restores_a_custom_reviewer_trigger(monkeypatch, tmp_path):
+    """The trigger removed by escalation is deployment policy, not always the
+    fixer's ai-pr-open label.  Re-arm exactly what this reviewer observes."""
+    backend, _dirs, calls = _unblock_backend(
+        monkeypatch, tmp_path, issue_labels=(), pr_labels=("needs-human-review",),
+        hold_role="review",
+    )
+    monkeypatch.setattr(
+        service.cli,
+        "deployment_env_field",
+        lambda _name, field: (
+            "reviewer[bot]" if field == "REVIEW_BOT"
+            else "ai-review" if field == "REVIEW_TRIGGER_LABEL"
+            else ""
+        ),
+    )
+
+    assert backend.unblock("demo", 7) == (True, "ok")
+
+    label_edits = [c for c in calls if c[0] != "factory"]
+    assert label_edits == [
+        (12, {"add": ("ai-review",), "remove": ("needs-human-review",)})
+    ]
+
+
+def test_custom_trigger_restores_fixer_source_for_a_fixer_escalation(
+    monkeypatch, tmp_path
+):
+    backend, _dirs, calls = _unblock_backend(
+        monkeypatch, tmp_path, issue_labels=(), pr_labels=("needs-human-review",),
+        hold_role="fix",
+    )
+    monkeypatch.setattr(
+        service.cli,
+        "deployment_env_field",
+        lambda _name, field: (
+            "reviewer[bot]" if field == "REVIEW_BOT"
+            else "ai-review" if field == "REVIEW_TRIGGER_LABEL"
+            else ""
+        ),
+    )
+
+    assert backend.unblock("demo", 7) == (True, "ok")
+
+    label_edits = [c for c in calls if c[0] != "factory"]
+    assert label_edits == [
+        (12, {"add": ("ai-pr-open",), "remove": ("needs-human-review",)})
+    ]
+
+
+def test_custom_trigger_restores_fixer_after_stalled_ci_escalation(
+    monkeypatch, tmp_path
+):
+    backend, _dirs, calls = _unblock_backend(
+        monkeypatch, tmp_path, issue_labels=(), pr_labels=("needs-human-review",),
+        hold_role="fix", composite_hold=True,
+    )
+    monkeypatch.setattr(
+        service.cli,
+        "deployment_env_field",
+        lambda _name, field: (
+            "reviewer[bot]" if field == "REVIEW_BOT"
+            else "ai-review" if field == "REVIEW_TRIGGER_LABEL"
+            else ""
+        ),
+    )
+
+    assert backend.unblock("demo", 7) == (True, "ok")
+
+    label_edits = [c for c in calls if c[0] != "factory"]
+    assert label_edits == [
+        (12, {"add": ("ai-pr-open",), "remove": ("needs-human-review",)})
+    ]
+
+
+def test_ambiguous_custom_trigger_refuses_before_resetting_counters(
+    monkeypatch, tmp_path
+):
+    backend, dirs, calls = _unblock_backend(
+        monkeypatch, tmp_path, issue_labels=(), pr_labels=("needs-human-review",)
+    )
+    monkeypatch.setattr(
+        service.cli,
+        "deployment_env_field",
+        lambda _name, field: "ai-review" if field == "REVIEW_TRIGGER_LABEL" else "",
+    )
+    counter = dirs["review"] / "issue--12.infra-deaths"
+    counter.write_text("5")
+
+    ok, detail = backend.unblock("demo", 7)
+
+    assert ok is False and "source is unknown" in detail
+    assert counter.read_text() == "5"
+    assert calls == [] and _journalled(dirs) == []
+
+
+def test_a_prior_hold_episode_cannot_supply_provenance_to_a_new_hold(
+    monkeypatch, tmp_path
+):
+    backend, dirs, calls = _unblock_backend(
+        monkeypatch,
+        tmp_path,
+        issue_labels=(),
+        pr_labels=("needs-human-review",),
+        hold_role="review",
+        prior_unblock=True,
+    )
+    monkeypatch.setattr(
+        service.cli,
+        "deployment_env_field",
+        lambda _name, field: "ai-review" if field == "REVIEW_TRIGGER_LABEL" else "",
+    )
+    counter = dirs["review"] / "issue--12.infra-deaths"
+    counter.write_text("5")
+
+    ok, detail = backend.unblock("demo", 7)
+
+    assert ok is False and "source is unknown" in detail
+    assert counter.read_text() == "5"
+    assert calls == [] and _journalled(dirs) == []
 
 
 def test_a_refused_unblock_journals_nothing_and_resets_nothing(
@@ -383,11 +637,42 @@ def test_a_failed_label_edit_still_records_the_reset_it_already_made(
     )
     (dirs["fix"] / "issue-7.ci-retries").write_text("3")
 
-    assert backend.unblock("demo", 7) == (False, "network down")
+    assert backend.unblock("demo", 7) == (False, "issue #7: network down")
 
     (payload,) = _journalled(dirs)
     assert payload.attributes["labels_applied"] is False
+    assert payload.attributes["add"] == []
+    assert payload.attributes["remove"] == []
+    assert payload.attributes["requested_add"] == ["ai-ready"]
+    assert payload.attributes["requested_remove"] == ["needs-human-review"]
     assert payload.attributes["retries_cleared"] == 1
+
+
+def test_each_target_journals_its_own_label_result(monkeypatch, tmp_path):
+    backend, dirs, _calls = _unblock_backend(
+        monkeypatch,
+        tmp_path,
+        prs=(12, 13),
+        issue_labels=(),
+        pr_labels=("needs-human-review",),
+        applied_by_target={
+            12: (False, "first PR failed"),
+            13: (True, "ok"),
+        },
+    )
+
+    ok, detail = backend.unblock("demo", 7)
+
+    assert ok is False and detail == "pr #12: first PR failed"
+    issue_event, failed, succeeded = _journalled(dirs)
+    assert issue_event.attributes["labels_applied"] is True
+    assert failed.number == 12 and failed.attributes["labels_applied"] is False
+    assert failed.attributes["add"] == [] and failed.attributes["remove"] == []
+    assert failed.attributes["requested_add"] == ["ai-pr-open"]
+    assert failed.attributes["requested_remove"] == ["needs-human-review"]
+    assert succeeded.number == 13 and succeeded.attributes["labels_applied"] is True
+    assert succeeded.attributes["add"] == ["ai-pr-open"]
+    assert succeeded.attributes["remove"] == ["needs-human-review"]
 
 
 def test_unblock_hands_back_the_retry_budget_in_every_role_state_dir(

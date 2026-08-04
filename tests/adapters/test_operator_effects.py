@@ -207,6 +207,37 @@ def test_lost_mutation_reply_is_reconciled_without_a_blind_retry(tmp_path) -> No
     assert store.pending_commands() == ()
 
 
+def test_conditional_fallback_uses_the_command_revision_label_read(tmp_path) -> None:
+    effects, remote, _store = _effects(tmp_path)
+    # This is the state after an add-first escalator removes ai-working in the
+    # dashboard's observation-to-command window.  The durable adapter must
+    # repair the now-missing lifecycle arm from its own fresh read.
+    remote.issue_labels = {"needs-human-review"}
+
+    assert effects.set_issue_labels(
+        9,
+        add=("ai-ready",),
+        remove=("needs-human-review",),
+        add_unless_present=("ai-ready", "ai-working", "ai-pr-open"),
+    ) == (True, "ok")
+
+    assert remote.issue_labels == {"ai-ready"}
+
+
+def test_conditional_fallback_preserves_a_surviving_lifecycle_arm(tmp_path) -> None:
+    effects, remote, _store = _effects(tmp_path)
+    remote.issue_labels = {"needs-human-review", "ai-working"}
+
+    assert effects.set_issue_labels(
+        9,
+        add=("ai-ready",),
+        remove=("needs-human-review",),
+        add_unless_present=("ai-ready", "ai-working", "ai-pr-open"),
+    ) == (True, "ok")
+
+    assert remote.issue_labels == {"ai-working"}
+
+
 def test_remote_bootstrap_mutations_all_receive_terminal_receipts(tmp_path) -> None:
     effects, remote, store = _effects(tmp_path)
 

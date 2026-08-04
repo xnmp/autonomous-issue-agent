@@ -14,6 +14,7 @@ from ...adapters.operator_effects import build_operator_effects
 from ...adapters.store import Store
 from ...adapters.typed_journal import TypedJournal
 from ...domain import dashboard as dash
+from ...domain.labels import Label
 
 # (target, number, labels added, labels removed) — one applied park/unpark move.
 _ParkMove = tuple[str, int, tuple[str, ...], tuple[str, ...]]
@@ -96,10 +97,11 @@ class Backend:
         that does not exist, and pins a cache entry)."""
         return name in self.names()
 
-    def snapshot(self, name: str) -> dash.Snapshot:
-        cached = self._snapshots.get(name)
-        if cached is not None:
-            return cached
+    def snapshot(self, name: str, *, refresh: bool = False) -> dash.Snapshot:
+        if not refresh:
+            cached = self._snapshots.get(name)
+            if cached is not None:
+                return cached
         return self._snapshots.put(
             name,
             self._collector.collect(
@@ -397,8 +399,9 @@ class Backend:
     ) -> tuple[bool, str]:
         """Undo a hold a human is expected to clear: dismiss the reviewer's
         standing change requests, drop the labels that stop re-dispatch, and
-        hand back the retry budget the wedge consumed. No lifecycle label is
-        added — `decide()` re-derives the next one itself.
+        hand back the retry budget the wedge consumed. A lifecycle hold is
+        atomically replaced with the role's selectable trigger; an advisory
+        budget label on an otherwise healthy target is only removed.
 
         The dismissal is what makes this a RE-ARM rather than a cosmetic clear.
         The rejection ceiling is computed from GitHub review state, not from a
@@ -417,12 +420,39 @@ class Backend:
         repo = self.overlay_field(name, "REPO")
         if not repo:
             return False, f"no REPO configured for deployment '{name}'"
-        held, pr_held, unreadable = self._attention_labels(name, repo, number)
+        held, pr_held, unreadable = self._attention_labels(
+            name, repo, number
+        )
         if unreadable:
             return False, unreadable
         if not held and not pr_held:
             return False, f"nothing to unblock on #{number}"
-        add, remove = actions.unblock_change()
+        issue_add, issue_remove = actions.issue_unblock_change(held)
+        raw_trigger = (
+            cli.deployment_env_field(name, "REVIEW_TRIGGER_LABEL")
+            or Label.AI_PR_OPEN.value
+        )
+        try:
+            review_trigger = Label(raw_trigger).value
+        except ValueError:
+            # Match ReviewWorkflow._trigger_label: an invalid configured label
+            # falls back to ai-pr-open rather than creating an unreadable arm.
+            review_trigger = Label.AI_PR_OPEN.value
+        pr_changes: dict[int, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+        candidate_pr = 0
+        try:
+            for pr, labels in pr_held.items():
+                candidate_pr = pr
+                pr_changes[pr] = actions.pr_unblock_change(
+                    labels,
+                    review_trigger,
+                    self._pr_hold_role(name, number, pr),
+                )
+        except ValueError as exc:
+            # Resolve every admission decision before counters or labels move:
+            # an ambiguous custom-trigger re-arm is safer left held than half
+            # admitted to a role that cannot advance it.
+            return False, f"pr #{candidate_pr}: {exc}"
         # Counters first: a cleared counter with the labels still on holds the
         # issue exactly as before, while the reverse order would re-admit it
         # against a breaker that is still tripped.
@@ -437,24 +467,57 @@ class Backend:
         # incident was a green result over a dead PR — so its notes ride back
         # in the operator-facing detail as well as the journal.
         rearm_failures = self._rearm_rejections(name, repo, number, effects)
-        applied, detail = True, "ok"
+        issue_applied, issue_detail = True, "ok"
+        issue_actual_add: tuple[str, ...] = ()
+        issue_actual_remove: tuple[str, ...] = ()
         if held:
-            applied, detail = effects.set_issue_labels(
-                number, add=add, remove=remove
+            issue_effect = effects.set_issue_labels_effect(
+                number,
+                add=issue_add,
+                remove=issue_remove,
+                add_unless_present=actions.SELECTABLE_ISSUE_LABELS,
             )
+            issue_applied, issue_detail = (
+                issue_effect.applied,
+                issue_effect.detail,
+            )
+            issue_actual_add = issue_effect.added
+            issue_actual_remove = issue_effect.removed
         # PR-level escalations hold the PR, not the issue (keifu #173/#177,
         # 2026-08-02: unblock returned ok while the PR kept
         # needs-human-review and the reviewer stayed withheld). Remove only
         # the labels each PR actually carries — an unfiltered DELETE 404s
         # and settles unknown_outcome.
+        pr_added: dict[int, tuple[str, ...]] = {}
+        pr_removed: dict[int, tuple[str, ...]] = {}
+        pr_requested_added: dict[int, tuple[str, ...]] = {}
+        pr_applied: dict[int, bool] = {}
+        failures = [] if issue_applied else [f"issue #{number}: {issue_detail}"]
         for pr, labels in pr_held.items():
-            pr_applied, pr_detail = effects.set_issue_labels(
-                pr, add=(), remove=labels
+            add, remove = pr_changes[pr]
+            pr_requested_added[pr] = add
+            pr_effect = effects.set_issue_labels_effect(
+                pr, add=add, remove=remove
             )
-            if not pr_applied:
-                applied, detail = False, f"pr #{pr}: {pr_detail}"
+            target_applied, pr_detail = pr_effect.applied, pr_effect.detail
+            pr_added[pr] = pr_effect.added
+            pr_removed[pr] = pr_effect.removed
+            pr_applied[pr] = target_applied
+            if not target_applied:
+                failures.append(f"pr #{pr}: {pr_detail}")
+        applied = issue_applied and all(pr_applied.values())
+        detail = "; ".join(failures) if failures else "ok"
         self._journal_unblock(
-            name, repo, number, held, cleared, applied, pr_held=pr_held,
+            name, repo, number, held, cleared, applied,
+            issue_added=issue_actual_add,
+            issue_removed=issue_actual_remove,
+            issue_requested_added=issue_add,
+            issue_applied=issue_applied,
+            pr_held=pr_held,
+            pr_added=pr_added,
+            pr_removed=pr_removed,
+            pr_requested_added=pr_requested_added,
+            pr_applied=pr_applied,
             channel=channel,
         )
         if applied and rearm_failures:
@@ -843,7 +906,9 @@ class Backend:
 
     def _attention_labels(
         self, name: str, repo: str, number: int
-    ) -> tuple[tuple[str, ...], dict[int, tuple[str, ...]], str]:
+    ) -> tuple[
+        tuple[str, ...], dict[int, tuple[str, ...]], str
+    ]:
         """The labels currently holding this issue (or its PRs) on a human, and
         a detail when they cannot be read at all.
 
@@ -861,10 +926,11 @@ class Backend:
                 warnings[0] if warnings
                 else f"issue #{number} is not open on {repo}"
             )
+        issue_labels = tuple(snapshots.labels_of(issue))
         issue_held = tuple(
             label
             for label in actions.UNBLOCK_LABELS
-            if label in set(snapshots.labels_of(issue))
+            if label in set(issue_labels)
         )
         pr_held: dict[int, tuple[str, ...]] = {}
         for pr in self._issue_prs(name, number):
@@ -876,6 +942,86 @@ class Backend:
                 pr_held[pr] = held
         return issue_held, pr_held, ""
 
+    def _pr_hold_role(self, name: str, issue: int, pr: int) -> str:
+        """Role whose successful relabel placed this PR on human review.
+
+        ``needs-human-review`` is a shared destination but custom review
+        deployments have two different source labels.  The typed lifecycle
+        event preserves the producer role and the exact relabel, so use that
+        durable provenance rather than guessing from the current one-label
+        GitHub state.  Missing provenance returns ``""`` and the caller may
+        proceed only when both roles share the same trigger.
+        """
+        try:
+            # Admission safety cannot use the UI's short stale cache: a fresh
+            # GitHub hold may arrive just after the prior unblock event was
+            # journalled, and reusing the previous episode's source label can
+            # admit the wrong role on custom-trigger deployments.
+            row = snapshots.find_row(self.snapshot(name, refresh=True), issue)
+        except OSError:
+            return ""
+        if row is None:
+            return ""
+        source = ""
+        for event in row.events:
+            action = event.get("action")
+            action = action if isinstance(action, dict) else {}
+            if action.get("labels_applied") is False:
+                continue
+            attributes = event.get("attributes")
+            attributes = attributes if isinstance(attributes, dict) else {}
+            kind = str(action.get("type") or event.get("kind") or "").lower()
+            target = str(action.get("target") or event.get("target") or "").upper()
+            raw_number = event.get("pr") or action.get("number") or event.get("number")
+            try:
+                event_pr = int(raw_number)
+            except (TypeError, ValueError):
+                continue
+            raw_add = action.get("add", attributes.get("add"))
+            if isinstance(raw_add, str):
+                added = {raw_add}
+            elif isinstance(raw_add, (list, tuple, set, frozenset)):
+                added = {str(label) for label in raw_add}
+            else:
+                added = set()
+            raw_remove = action.get("remove", attributes.get("remove"))
+            if isinstance(raw_remove, str):
+                removed = {raw_remove}
+            elif isinstance(raw_remove, (list, tuple, set, frozenset)):
+                removed = {str(label) for label in raw_remove}
+            else:
+                removed = set()
+            if not added and not removed:
+                fact = dash.parse_action(str(event.get("desc") or ""))
+                if fact is not None and fact.verb == "relabel":
+                    kind = fact.verb
+                    target = fact.target.upper()
+                    event_pr = fact.number
+                    added = set(fact.added)
+                    removed = set(fact.removed)
+            if event_pr != pr or not target.startswith("PR"):
+                continue
+            if Label.NEEDS_HUMAN_REVIEW.value in removed:
+                source = ""
+            if kind == "escalate_ci_pending":
+                # The fixer's stalled-CI action is a compound comment/relabel
+                # operation.  Its typed journal payload intentionally has no
+                # generic add/remove fields, but the action contract moves
+                # ai-pr-open to needs-human-review.
+                producer = event.get("producer")
+                producer = producer if isinstance(producer, dict) else {}
+                role = str(event.get("role") or producer.get("role") or "")
+                source = "fix" if role == "fix" else ""
+            elif (
+                kind == "relabel"
+                and Label.NEEDS_HUMAN_REVIEW.value in added
+            ):
+                producer = event.get("producer")
+                producer = producer if isinstance(producer, dict) else {}
+                role = str(event.get("role") or producer.get("role") or "")
+                source = role if role in {"fix", "review"} else ""
+        return source
+
     def _journal_unblock(
         self,
         name: str,
@@ -884,7 +1030,15 @@ class Backend:
         held: tuple[str, ...],
         cleared: int,
         applied: bool,
+        issue_added: tuple[str, ...] = (),
+        issue_removed: tuple[str, ...] = (),
+        issue_requested_added: tuple[str, ...] = (),
+        issue_applied: bool = True,
         pr_held: dict[int, tuple[str, ...]] | None = None,
+        pr_added: dict[int, tuple[str, ...]] | None = None,
+        pr_removed: dict[int, tuple[str, ...]] | None = None,
+        pr_requested_added: dict[int, tuple[str, ...]] | None = None,
+        pr_applied: dict[int, bool] | None = None,
         channel: str = "api",
     ) -> None:
         journal = self._operator_journal(name, repo)
@@ -892,7 +1046,18 @@ class Backend:
             return
         # One desc per target so parse_action sees each clear (the PR's labels
         # are what actually held keifu #173/#177); the issue desc leads.
-        removed = " ".join(f"-{label}" for label in held)
+        issue_intent = " ".join(
+            [*(f"+{label}" for label in issue_requested_added),
+             *(f"-{label}" for label in held)]
+        )
+        issue_effect = " ".join(
+            [*(f"+{label}" for label in issue_added),
+             *(f"-{label}" for label in issue_removed)]
+        )
+        issue_moves = (
+            issue_effect if issue_applied
+            else "label edit failed: " + issue_intent
+        )
         try:
             journal.emit(
                 TelemetryEvent(
@@ -901,36 +1066,52 @@ class Backend:
                         "operator_unblock",
                         "issue",
                         f"operator unblock issue #{number}: "
-                        + (removed or "(none)"),
+                        + (issue_moves or "(none)"),
                         number,
                         {
-                            "add": [],
-                            "remove": list(held),
+                            "add": list(issue_added) if issue_applied else [],
+                            "remove": list(issue_removed) if issue_applied else [],
+                            "requested_add": list(issue_requested_added),
+                            "requested_remove": list(held),
                             "operator": f"{repo}:dashboard",
                             "channel": channel,
                             "retries_cleared": cleared,
-                            "labels_applied": applied,
+                            "labels_applied": issue_applied,
                         },
                     ),
                     Correlation(issue=number),
                 )
             )
             for pr, labels in (pr_held or {}).items():
+                added = (pr_added or {}).get(pr, ())
+                removed = (pr_removed or {}).get(pr, ())
+                requested_added = (pr_requested_added or {}).get(pr, ())
+                target_applied = (pr_applied or {}).get(pr, applied)
+                intent = " ".join(
+                    [*(f"+{label}" for label in requested_added),
+                     *(f"-{label}" for label in labels)]
+                )
+                effect = " ".join(
+                    [*(f"+{label}" for label in added),
+                     *(f"-{label}" for label in removed)]
+                )
+                moves = effect if target_applied else "label edit failed: " + intent
                 journal.emit(
                     TelemetryEvent(
                         ActionApplied(
                             f"operator-unblock:{uuid.uuid4().hex}",
                             "operator_unblock",
                             "pr",
-                            f"operator unblock pr #{pr}: "
-                            + " ".join(f"-{label}" for label in labels),
+                            f"operator unblock pr #{pr}: " + moves,
                             pr,
                             {
-                                "add": [],
-                                "remove": list(labels),
+                                "add": list(added) if target_applied else [],
+                                "remove": list(removed) if target_applied else [],
+                                "requested_add": list(requested_added),
+                                "requested_remove": list(labels),
                                 "operator": f"{repo}:dashboard",
                                 "channel": channel,
-                                "labels_applied": applied,
+                                "labels_applied": target_applied,
                             },
                         ),
                         Correlation(issue=number, pr=pr),
