@@ -26,7 +26,9 @@ WatchdogSec=300
 KillSignal=SIGTERM
 FinalKillSignal=SIGKILL
 MemoryMax=4G
-TasksMax=512
+# Independent review reruns Chromium acceptance suites under this cgroup.
+# Preserve observation headroom while MemoryMax remains the hard boundary.
+TasksMax=1024
 StandardOutput=journal
 StandardError=journal
 

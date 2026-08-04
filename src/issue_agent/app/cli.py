@@ -1584,7 +1584,10 @@ def _resolve_context(args) -> tuple[str, str, str]:
     target_dir = args.target_dir or detect_target_dir(cwd)
     if target_dir:
         target_dir = os.path.realpath(target_dir)
-    repo = canonical_repository(args.repo or detect_repo(cwd))
+    # An explicit target is the repository authority. Operators commonly run
+    # status/install commands from the harness checkout; detecting REPO from
+    # that cwd reports a false overlay mismatch and can select the wrong name.
+    repo = canonical_repository(args.repo or detect_repo(target_dir or cwd))
     # Pass target_dir so a repo with several overlays resolves to the one for THIS
     # working copy (cwd wins), not the alphabetically-first REPO match.
     name = resolve_name(repo, getattr(args, "name", "") or "", target_dir=target_dir)
@@ -2098,6 +2101,99 @@ def spend_status_lines(
     return lines
 
 
+_SYSTEMD_ROLE_UNITS = {
+    "fix": "issue-agent-fix-watcher-{name}.service",
+    "review": "issue-agent-review-watcher-{name}.service",
+    "steward": "issue-agent-steward-{name}.service",
+}
+_STATUS_COMMAND_TIMEOUT_S = 2.0
+
+
+def _systemd_status_log(
+    name: str,
+    role: str,
+    lines: int,
+) -> tuple[str, str] | None:
+    """The authoritative log tail for an installed Linux user service.
+
+    Foreground point-at deployments write files, but systemd units explicitly
+    send stdout/stderr to the journal. Falling through to an old foreground log
+    while a unit is live makes `status` show stale incidents as current ones.
+    """
+
+    if not sys.platform.startswith("linux"):
+        return None
+    unit = _SYSTEMD_ROLE_UNITS[role].format(name=name)
+    state_command = [
+        "systemctl",
+        "--user",
+        "show",
+        unit,
+        "--property=LoadState",
+        "--property=ActiveState",
+    ]
+    try:
+        state = subprocess.run(
+            state_command,
+            capture_output=True,
+            text=True,
+            timeout=_STATUS_COMMAND_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return (
+            f"systemd status unavailable: {unit}",
+            f"  systemctl failed: {exc}",
+        )
+    if state.returncode != 0:
+        detail = (state.stderr or state.stdout).strip() or (
+            f"systemctl exited {state.returncode}"
+        )
+        return f"systemd status unavailable: {unit}", f"  {detail}"
+    properties = dict(
+        line.split("=", 1)
+        for line in state.stdout.splitlines()
+        if "=" in line
+    )
+    if properties.get("LoadState") != "loaded":
+        return None
+    if properties.get("ActiveState") not in {
+        "active",
+        "activating",
+        "reloading",
+        "deactivating",
+        "failed",
+    }:
+        return None
+    journal_command = [
+        "journalctl",
+        "--user",
+        "--unit",
+        unit,
+        "--lines",
+        str(lines),
+        "--no-pager",
+        "--output=cat",
+    ]
+    try:
+        journal = subprocess.run(
+            journal_command,
+            capture_output=True,
+            text=True,
+            timeout=_STATUS_COMMAND_TIMEOUT_S,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return (
+            f"systemd journal unavailable: {unit}",
+            f"  journalctl failed: {exc}",
+        )
+    if journal.returncode != 0:
+        detail = (journal.stderr or journal.stdout).strip() or (
+            f"journalctl exited {journal.returncode}"
+        )
+        return f"systemd journal unavailable: {unit}", f"  {detail}"
+    return f"systemd journal: {unit}", journal.stdout.strip()
+
+
 def cmd_status(args) -> int:
     repo, target_dir, name = _resolve_context(args)
     # P0R-2: warn, don't refuse — status is read-only (no SIGTERM, no service
@@ -2124,6 +2220,20 @@ def cmd_status(args) -> int:
         print(f"  {role:8s}: {state}")
     logs = log_dir()
     for role in ROLES:
+        # A foreground launcher may own only a subset of roles. Query each
+        # installed unit independently; inactive units return None and fall
+        # through to that role's foreground file.
+        service_log = _systemd_status_log(name, role, args.lines)
+        if service_log is not None:
+            source, output = service_log
+            print(_c("36", f"\n── {source} ──"))
+            print(output or "  (empty)")
+            # A foreground launcher can replace one failed role while other
+            # roles stay service-owned. Ownership is ambiguous per role, so
+            # show both labeled sources instead of hiding the live file behind
+            # a failed/unavailable unit diagnostic.
+            if not launchers:
+                continue
         # Same default as point-at.sh's LOG_DIR; the old /tmp path is checked as
         # a fallback so status still tails logs of a daemon started pre-move.
         log = os.path.join(logs, f"{role}-{name}.log")

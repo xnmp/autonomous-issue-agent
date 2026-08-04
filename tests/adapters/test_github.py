@@ -4,6 +4,7 @@ The parsers are the real-vs-fake seam, so they are asserted directly against the
 documented gh --json shapes. The gateway is driven with a fake runner that
 records argv and returns canned JSON (no network, no real gh)."""
 
+import errno
 import json
 
 from issue_agent.adapters.github import (
@@ -1444,6 +1445,107 @@ def test_runner_raises_network(monkeypatch, stderr):
     with pytest.raises(GhUnavailable) as ei:
         _run_with(monkeypatch, stderr)()
     assert ei.value.kind == "network"
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "runtime/cgo: pthread_create failed: Resource temporarily unavailable",
+        "runtime: failed to create new OS thread\nfatal error: newosproc",
+        "fork/exec /usr/bin/gh: cannot allocate memory",
+    ],
+)
+def test_runner_raises_on_local_resource_exhaustion(monkeypatch, stderr):
+    """A local process/thread failure returned no GitHub answer. Treating it as
+    an ordinary empty response releases dependency gates under peak load."""
+
+    with pytest.raises(GhUnavailable) as error:
+        _run_with(monkeypatch, stderr)()
+    assert error.value.kind == "local-resource"
+
+
+def test_runner_bounds_a_local_crash_dump_in_the_operator_log(
+    monkeypatch,
+    capsys,
+) -> None:
+    stderr = (
+        "runtime/cgo: pthread_create failed: Resource temporarily unavailable\n"
+        + "register dump line\n" * 10_000
+    )
+
+    with pytest.raises(GhUnavailable):
+        _run_with(monkeypatch, stderr)()
+
+    logged = capsys.readouterr().err
+    assert "pthread_create failed" in logged
+    assert "[gh stderr truncated]" in logged
+    assert len(logged.encode()) < 9_000
+
+
+def test_runner_redacts_and_bounds_a_large_publication_body(
+    monkeypatch,
+    capsys,
+) -> None:
+    body = "untrusted body " * 10_000
+
+    with pytest.raises(GhUnavailable):
+        _run_with(
+            monkeypatch,
+            "runtime/cgo: pthread_create failed: Resource temporarily unavailable",
+        )(["gh", "issue", "comment", "7", "--body", body])
+
+    logged = capsys.readouterr().err
+    assert body[:100] not in logged
+    assert "<body redacted:" in logged
+    assert len(logged.encode()) < 9_000
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable"),
+        OSError(errno.ENOMEM, "Cannot allocate memory"),
+    ],
+)
+def test_runner_raises_when_local_exhaustion_prevents_gh_from_starting(
+    monkeypatch,
+    capsys,
+    error,
+) -> None:
+    def fail_to_start(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(_subprocess, "run", fail_to_start)
+
+    with pytest.raises(GhUnavailable) as unavailable:
+        _subprocess_runner(["gh", "issue", "list"], None)
+
+    assert unavailable.value.kind == "local-resource"
+    assert unavailable.value.argv == ("gh", "issue", "list")
+    assert "gh failed to start" in capsys.readouterr().err
+
+
+def test_spawn_failure_redacts_a_large_graphql_body_field(
+    monkeypatch,
+    capsys,
+) -> None:
+    body = "untrusted review " * 10_000
+
+    def fail_to_start(*_args, **_kwargs):
+        raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
+
+    monkeypatch.setattr(_subprocess, "run", fail_to_start)
+
+    with pytest.raises(GhUnavailable):
+        _subprocess_runner(
+            ["gh", "api", "graphql", "-f", f"body={body}"],
+            None,
+        )
+
+    logged = capsys.readouterr().err
+    assert body[:100] not in logged
+    assert "body=<redacted:" in logged
+    assert len(logged.encode()) < 3_000
 
 
 @pytest.mark.parametrize(

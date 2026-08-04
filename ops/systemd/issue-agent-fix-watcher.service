@@ -26,7 +26,10 @@ WatchdogSec=300
 KillSignal=SIGTERM
 FinalKillSignal=SIGKILL
 MemoryMax=4G
-TasksMax=512
+# Chromium-based acceptance suites routinely use hundreds of threads. Keep
+# enough headroom for the watcher and GitHub observations while MemoryMax
+# remains the hard resource boundary.
+TasksMax=1024
 StandardOutput=journal
 StandardError=journal
 

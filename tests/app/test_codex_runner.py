@@ -39,7 +39,12 @@ from tests.fakes.legacy_journal import Journal
 from issue_agent.adapters.journal import JournalingRuntime, read_events
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.app.config import from_env
-from issue_agent.app.planners.schemas import AUTHOR_SCHEMA, FIX_SCHEMA, IMPLEMENT_SCHEMA
+from issue_agent.app.planners.schemas import (
+    AUTHOR_SCHEMA,
+    FIX_SCHEMA,
+    IMPLEMENT_SCHEMA,
+    review_schema_with_exemptions,
+)
 from issue_agent.domain.outcome import AgentResult, ExitReason, Outcome, classify_outcome, infra_death
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.effort import Effort
@@ -251,6 +256,28 @@ def test_strict_schema_recurses_nested_objects():
 
 def test_strict_schema_passthrough_non_object():
     assert _strict_schema({"type": "string"}) == {"type": "string"}
+
+
+def test_strict_schema_closes_objects_nested_under_array_combinators():
+    schema = review_schema_with_exemptions(
+        [("tests-immutable", "tests/example.test.ts")]
+    )
+
+    strict = _strict_schema(schema)
+
+    assert strict["additionalProperties"] is False
+    assert set(strict["required"]) == {
+        "decision",
+        "body",
+        "exemption_grants",
+    }
+    assert strict["properties"]["exemption_grants"]["type"] == [
+        "array",
+        "null",
+    ]
+    pair = strict["properties"]["exemption_grants"]["items"]["anyOf"][0]
+    assert pair["additionalProperties"] is False
+    assert pair["required"] == ["rule", "subject"]
 
 
 def test_a_previously_optional_property_stays_sayable_as_null():

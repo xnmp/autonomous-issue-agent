@@ -1658,6 +1658,22 @@ def _expected_grant_line(key=_MAC_KEY, rule="tests-immutable", subject=None):
     )
 
 
+def _expected_grant_items(rule="tests-immutable", subject=_DECLARED_SUBJECT):
+    return {
+        "anyOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "rule": {"type": "string", "enum": [rule]},
+                    "subject": {"type": "string", "enum": [subject]},
+                },
+                "required": ["rule", "subject"],
+                "additionalProperties": False,
+            }
+        ]
+    }
+
+
 def test_an_approved_structured_grant_is_rendered_as_the_canonical_line():
     gw = _review_with({
         "decision": "APPROVE",
@@ -1729,12 +1745,12 @@ def test_the_base_review_schema_offers_no_exemption_field_at_all():
 
 
 def test_the_declared_schema_enumerates_exactly_the_declared_pairs():
-    # Object-level enum: an undeclared rule, a cross-matched subject, or free
+    # Closed pair schemas: an undeclared rule, a cross-matched subject, or free
     # text is unrepresentable at generation time, not merely dropped later.
     schema = review_schema_with_exemptions([("tests-immutable", "tests/a_test.rs")])
-    assert schema["properties"]["exemption_grants"]["items"] == {
-        "enum": [{"rule": "tests-immutable", "subject": "tests/a_test.rs"}]
-    }
+    assert schema["properties"]["exemption_grants"]["items"] == (
+        _expected_grant_items(subject="tests/a_test.rs")
+    )
     assert schema["required"] == ["decision", "body"]
     assert "decision" in schema["properties"] and "body" in schema["properties"]
 
@@ -1746,12 +1762,21 @@ def test_building_the_declared_schema_never_mutates_the_base_schema():
     assert REVIEW_SCHEMA == before
 
 
+def test_an_empty_declaration_set_uses_the_base_review_contract():
+    schema = review_schema_with_exemptions([])
+
+    assert schema == REVIEW_SCHEMA
+    assert schema is not REVIEW_SCHEMA
+    assert schema["properties"] is not REVIEW_SCHEMA["properties"]
+    assert "exemption_grants" not in schema["properties"]
+
+
 def test_the_review_task_of_a_declared_pr_carries_the_constrained_schema():
     gw = _review_with({"decision": "APPROVE", "body": "ok"})
     task = gw.dispatched_tasks[0]
-    assert task.intent.schema["properties"]["exemption_grants"]["items"] == {
-        "enum": [{"rule": "tests-immutable", "subject": _DECLARED_SUBJECT}]
-    }
+    assert task.intent.schema["properties"]["exemption_grants"]["items"] == (
+        _expected_grant_items()
+    )
     assert "Gate exemption REQUESTED" in task.prompt
 
 
@@ -1898,9 +1923,9 @@ def test_a_modified_existing_test_earns_the_notice_with_no_trailer_anywhere():
     task = gw.dispatched_tasks[0]
     assert "Gate exemption REQUESTED" in task.prompt
     assert _DECLARED_SUBJECT in task.prompt
-    assert task.intent.schema["properties"]["exemption_grants"]["items"] == {
-        "enum": [{"rule": "tests-immutable", "subject": _DECLARED_SUBJECT}]
-    }
+    assert task.intent.schema["properties"]["exemption_grants"]["items"] == (
+        _expected_grant_items()
+    )
 
 
 def test_an_unreadable_commit_log_no_longer_costs_the_auto_declared_notice():
@@ -1913,9 +1938,9 @@ def test_an_unreadable_commit_log_no_longer_costs_the_auto_declared_notice():
     gw = _review_with({"decision": "APPROVE", "body": "ok"}, gw=gw)
     task = gw.dispatched_tasks[0]
     assert "Gate exemption REQUESTED" in task.prompt
-    assert task.intent.schema["properties"]["exemption_grants"]["items"] == {
-        "enum": [{"rule": "tests-immutable", "subject": _DECLARED_SUBJECT}]
-    }
+    assert task.intent.schema["properties"]["exemption_grants"]["items"] == (
+        _expected_grant_items()
+    )
 
 
 def test_a_required_test_trailer_still_reaches_the_reviewer():
@@ -1927,9 +1952,9 @@ def test_a_required_test_trailer_still_reaches_the_reviewer():
     gw = _review_with({"decision": "APPROVE", "body": "ok"}, gw=gw)
     task = gw.dispatched_tasks[0]
     assert "Gate exemption REQUESTED" in task.prompt
-    assert task.intent.schema["properties"]["exemption_grants"]["items"] == {
-        "enum": [{"rule": "required-test", "subject": "*"}]
-    }
+    assert task.intent.schema["properties"]["exemption_grants"]["items"] == (
+        _expected_grant_items(rule="required-test", subject="*")
+    )
 
 
 def test_a_tests_immutable_trailer_alone_requests_nothing():
@@ -2023,15 +2048,15 @@ def test_an_ungrantable_path_does_not_suppress_its_grantable_neighbour():
     )
     gw = _review_with({"decision": "APPROVE", "body": "ok"}, gw=gw)
     task = gw.dispatched_tasks[0]
-    assert task.intent.schema["properties"]["exemption_grants"]["items"] == {
-        "enum": [{"rule": "tests-immutable", "subject": _DECLARED_SUBJECT}]
-    }
+    assert task.intent.schema["properties"]["exemption_grants"]["items"] == (
+        _expected_grant_items()
+    )
     assert f'subject="{hostile}"' not in task.prompt
 
 
 def test_the_reviewer_is_never_handed_more_subjects_than_the_declaration_cap():
     # Every subject lands in the reviewer's TRUSTED prompt tail and in the
-    # schema enum, so the auto-declared set is bounded exactly like the
+    # schema pair alternatives, so the auto-declared set is bounded exactly like the
     # trailer-parsed one (round-4 MINOR 7). A change over the cap is denied by
     # the gate and withheld at merge anyway.
     many = "".join(
@@ -2042,10 +2067,10 @@ def test_the_reviewer_is_never_handed_more_subjects_than_the_declaration_cap():
     )
     gw = _DeclaringGateway(diff=many, prs={100: _declaring_pr()})
     gw = _review_with({"decision": "APPROVE", "body": "ok"}, gw=gw)
-    enum = gw.dispatched_tasks[0].intent.schema["properties"][
+    alternatives = gw.dispatched_tasks[0].intent.schema["properties"][
         "exemption_grants"
-    ]["items"]["enum"]
-    assert len(enum) == MAX_DECLARATIONS_PER_CHANGE
+    ]["items"]["anyOf"]
+    assert len(alternatives) == MAX_DECLARATIONS_PER_CHANGE
     assert gw.dispatched_tasks[0].prompt.count('rule="tests-immutable"') == (
         MAX_DECLARATIONS_PER_CHANGE
     )

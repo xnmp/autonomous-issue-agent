@@ -19,6 +19,7 @@ bucket,startedAt,link) so the mapping is mechanical and auditable.
 
 from __future__ import annotations
 
+import errno
 import json
 import re
 import subprocess
@@ -47,6 +48,7 @@ from ..domain.world import (
 # far above a healthy call (<2s), below the service watchdog interval, and
 # paired with a scheduler-progress callback after every call.
 _GH_TIMEOUT_S = 30.0
+_LOGGED_GH_ARGV_BYTES = 2 * 1024
 
 # Cap on `gh issue list` / `gh pr list` world-building calls. gh has no
 # "there were more" signal short of paginating (cursor-following, unshipped
@@ -195,7 +197,8 @@ class GhUnavailable(RuntimeError):
     on a failed read is a lie, so the daemon skips the tick and the poll loop —
     which IS the retry — looks again next interval. No backoff lives here.
 
-    `kind` is one of "auth" | "rate-limit" | "network" | "server";
+    `kind` is one of "auth" | "rate-limit" | "network" | "server" |
+    "local-resource";
     `timed_out` marks the
     one sub-case that is per-CALL rather than systemic (the `_GH_TIMEOUT_S` kill
     of a single hung `gh pr view`), which `_safe_get_pr` still isolates per PR.
@@ -206,6 +209,7 @@ class GhUnavailable(RuntimeError):
         "rate-limit": "rate-limited",
         "network": "unreachable (network)",
         "server": "server error (5xx)",
+        "local-resource": "unavailable (local resource exhaustion)",
     }
     _MAX_DETAIL_BYTES = 8 * 1024
 
@@ -291,6 +295,14 @@ _SERVER_PATTERNS = (
     "gateway time-out",
     "internal server error",
 )
+_LOCAL_RESOURCE_PATTERNS = (
+    "pthread_create failed",
+    "resource temporarily unavailable",
+    "failed to create new os thread",
+    "fatal error: newosproc",
+    "cannot allocate memory",
+    "out of memory",
+)
 # Match the STATUS TOKEN only next to an explicit "HTTP": gh prints "HTTP 503
 # (https://api.github.com/…)". A bare "502" is not enough — it could be an issue
 # number in "issue #502 not found", and misreading that as an outage would skip
@@ -300,8 +312,9 @@ _SERVER_RE = re.compile(r"http[/ ]?\s*5\d\d")
 
 def classify_gh_failure(detail: str) -> str | None:
     """Map a failed `gh` invocation's stderr/stdout to an infra kind
-    ("rate-limit" | "network" | "server"), or None when the failure is an
-    ordinary API answer the caller should keep treating as "" (fail-soft).
+    ("rate-limit" | "network" | "server" | "local-resource"), or None when
+    the failure is an ordinary API answer the caller should keep treating as
+    "" (fail-soft).
 
     Order matters: auth → rate-limit → server → network. "504 Gateway Timeout" contains
     "timeout", so the 5xx test must run before the network test or a GitHub
@@ -316,7 +329,31 @@ def classify_gh_failure(detail: str) -> str | None:
         return "server"
     if any(p in text for p in _NETWORK_PATTERNS):
         return "network"
+    if any(p in text for p in _LOCAL_RESOURCE_PATTERNS):
+        return "local-resource"
     return None
+
+
+def _printable_gh_argv(argv: list[str]) -> str:
+    """Bound command diagnostics without logging untrusted publication bodies."""
+
+    rendered: list[str] = []
+    redact_next = False
+    field_value = False
+    for arg in argv:
+        if redact_next:
+            rendered.append(f"<body redacted: {len(arg.encode())} bytes>")
+            redact_next = False
+            continue
+        if field_value and arg.startswith("body="):
+            body = arg.removeprefix("body=")
+            rendered.append(f"body=<redacted: {len(body.encode())} bytes>")
+            field_value = False
+            continue
+        rendered.append(arg)
+        redact_next = arg in {"--body", "-b"}
+        field_value = arg in {"-f", "-F", "--field", "--raw-field"}
+    return _cap_bytes(" ".join(rendered), _LOGGED_GH_ARGV_BYTES)
 
 
 def no_checks_answer(argv: list[str], detail: str) -> bool:
@@ -2093,10 +2130,25 @@ def _subprocess_runner(argv: list[str], token: str | None) -> str:
             argv=argv,
             timed_out=True,
         ) from exc
+    except OSError as exc:
+        if exc.errno not in {errno.EAGAIN, errno.ENOMEM}:
+            raise
+        printable = _printable_gh_argv(argv)
+        detail = str(exc) or "process creation failed"
+        logged_detail = _cap_bytes(detail, GhUnavailable._MAX_DETAIL_BYTES)
+        sys.stderr.write(
+            f"gh failed to start: {printable}\n"
+            f"  {logged_detail}\n"
+        )
+        raise GhUnavailable(
+            "local-resource",
+            detail,
+            argv=argv,
+        ) from exc
     if res.returncode != 0:
         # redact a token if one ever appears in argv (it shouldn't — gh reads GH_TOKEN
         # from env, not argv — but be defensive about logging command lines).
-        printable = " ".join(argv)
+        printable = _printable_gh_argv(argv)
         detail = (res.stderr or res.stdout or "").strip()
         # A KNOWN-benign failure — `gh pr checks` reading statusCheckRollup with an
         # App token that lacks the checks read scope ("Resource not accessible by
@@ -2112,7 +2164,16 @@ def _subprocess_runner(argv: list[str], token: str | None) -> str:
         )
         debug_on = os.environ.get("ISSUE_AGENT_DEBUG", "0") not in ("", "0", "false", "False")
         if not benign_checks_rollup or debug_on:
-            sys.stderr.write(f"gh failed (exit {res.returncode}): {printable}\n  {detail}\n")
+            logged_detail = _cap_bytes(detail, GhUnavailable._MAX_DETAIL_BYTES)
+            truncated = (
+                "\n  [gh stderr truncated]"
+                if logged_detail != detail
+                else ""
+            )
+            sys.stderr.write(
+                f"gh failed (exit {res.returncode}): {printable}\n"
+                f"  {logged_detail}{truncated}\n"
+            )
         # Infra? Then this is NOT an answer — raise so the caller can refuse to
         # act on a world it never actually observed. The stderr line above is
         # kept for the raise path too: some callers legitimately swallow

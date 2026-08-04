@@ -111,6 +111,9 @@ def test_systemd_units_run_python_from_harness_root_with_target_dir_env():
         assert "TARGET_DIR=@TARGET_DIR@" in service["Environment"]
         assert service["Restart"] == ["on-failure"]
         assert service["RestartPreventExitStatus"] == ["0 2 3 4 5 6"]
+        expected_tasks = "1024" if role in {"fix", "review"} else "512"
+        assert service["TasksMax"] == [expected_tasks]
+        assert service["MemoryMax"] == ["4G"]
         unit = _parse_unit(_read(path))["Unit"]
         assert unit["StartLimitIntervalSec"] == ["300"]
         assert unit["StartLimitBurst"] == ["3"]

@@ -1302,6 +1302,208 @@ def test_cmd_status_reports_heartbeat_when_pid_namespace_hides_daemon(
     assert "steward : stopped" in output
 
 
+def test_systemd_status_log_reads_the_installed_unit_journal(monkeypatch) -> None:
+    calls: list[tuple[list[str], float]] = []
+
+    class Result:
+        def __init__(self, stdout: str):
+            self.returncode = 0
+            self.stdout = stdout
+            self.stderr = ""
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs["timeout"]))
+        if command[0] == "systemctl":
+            return Result("ActiveState=active\nLoadState=loaded\n")
+        if command[0] == "journalctl":
+            return Result("fix: live service output\n")
+        raise AssertionError(command)
+
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.setattr(cli.subprocess, "run", run)
+
+    assert cli._systemd_status_log("app", "fix", 7) == (
+        "systemd journal: issue-agent-fix-watcher-app.service",
+        "fix: live service output",
+    )
+    assert calls == [
+        ([
+            "systemctl",
+            "--user",
+            "show",
+            "issue-agent-fix-watcher-app.service",
+            "--property=LoadState",
+            "--property=ActiveState",
+        ], cli._STATUS_COMMAND_TIMEOUT_S),
+        ([
+            "journalctl",
+            "--user",
+            "--unit",
+            "issue-agent-fix-watcher-app.service",
+            "--lines",
+            "7",
+            "--no-pager",
+            "--output=cat",
+        ], cli._STATUS_COMMAND_TIMEOUT_S),
+    ]
+
+
+def test_systemd_status_log_reports_query_failure_instead_of_falling_back(
+    monkeypatch,
+) -> None:
+    class Result:
+        returncode = 1
+        stdout = ""
+        stderr = "Failed to connect to user bus"
+
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda _command, **_kwargs: Result(),
+    )
+
+    source, output = cli._systemd_status_log("app", "fix", 7) or ("", "")
+    assert source == (
+        "systemd status unavailable: issue-agent-fix-watcher-app.service"
+    )
+    assert output == "  Failed to connect to user bus"
+
+
+def test_cmd_status_prefers_service_journal_over_stale_foreground_log(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    _prep_mismatch_overlay(tmp_path, monkeypatch)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "fix-app.log").write_text("stale canary incident\n")
+    monkeypatch.setattr(cli, "log_dir", lambda: str(logs))
+    monkeypatch.setattr(
+        cli,
+        "_role_pids",
+        lambda _name: {"fix": [101], "review": [], "steward": []},
+    )
+    monkeypatch.setattr(cli, "_launcher_pids", lambda _name: [])
+    monkeypatch.setattr(cli, "_fresh_role_heartbeats", lambda _name: {})
+    monkeypatch.setattr(
+        cli,
+        "_systemd_status_log",
+        lambda _name, role, _lines: (
+            ("systemd journal: fix.service", "live service output")
+            if role == "fix"
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "interventions_status_line",
+        lambda _name, _repo: "  interventions: 0",
+    )
+
+    assert cli.cmd_status(
+        argparse.Namespace(
+            repo="acme/app",
+            target_dir="/srv/acme-app",
+            name="app",
+            lines=5,
+        )
+    ) == 0
+
+    output = capsys.readouterr().out
+    assert "live service output" in output
+    assert "stale canary incident" not in output
+
+
+def test_cmd_status_prefers_live_foreground_log_over_inactive_installed_unit(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    _prep_mismatch_overlay(tmp_path, monkeypatch)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "fix-app.log").write_text("live foreground output\n")
+    monkeypatch.setattr(cli, "log_dir", lambda: str(logs))
+    monkeypatch.setattr(
+        cli,
+        "_role_pids",
+        lambda _name: {"fix": [101], "review": [], "steward": []},
+    )
+    monkeypatch.setattr(cli, "_launcher_pids", lambda _name: [99])
+    monkeypatch.setattr(cli, "_fresh_role_heartbeats", lambda _name: {})
+    service_queries: list[str] = []
+
+    def inactive_service(_name, role, _lines):
+        service_queries.append(role)
+        return None
+
+    monkeypatch.setattr(cli, "_systemd_status_log", inactive_service)
+    monkeypatch.setattr(
+        cli,
+        "interventions_status_line",
+        lambda _name, _repo: "  interventions: 0",
+    )
+
+    assert cli.cmd_status(
+        argparse.Namespace(
+            repo="acme/app",
+            target_dir="/srv/acme-app",
+            name="app",
+            lines=5,
+        )
+    ) == 0
+    assert "live foreground output" in capsys.readouterr().out
+    assert service_queries == ["fix", "review", "steward"]
+
+
+def test_cmd_status_shows_foreground_log_alongside_unavailable_systemd(
+    tmp_path,
+    monkeypatch,
+    capsys,
+) -> None:
+    _prep_mismatch_overlay(tmp_path, monkeypatch)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "fix-app.log").write_text("live foreground output\n")
+    monkeypatch.setattr(cli, "log_dir", lambda: str(logs))
+    monkeypatch.setattr(
+        cli,
+        "_role_pids",
+        lambda _name: {"fix": [101], "review": [], "steward": []},
+    )
+    monkeypatch.setattr(cli, "_launcher_pids", lambda _name: [99])
+    monkeypatch.setattr(cli, "_fresh_role_heartbeats", lambda _name: {})
+    monkeypatch.setattr(
+        cli,
+        "_systemd_status_log",
+        lambda _name, role, _lines: (
+            ("systemd status unavailable: fix.service", "user bus failed")
+            if role == "fix"
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "interventions_status_line",
+        lambda _name, _repo: "  interventions: 0",
+    )
+
+    assert cli.cmd_status(
+        argparse.Namespace(
+            repo="acme/app",
+            target_dir="/srv/acme-app",
+            name="app",
+            lines=5,
+        )
+    ) == 0
+
+    output = capsys.readouterr().out
+    assert "user bus failed" in output
+    assert "live foreground output" in output
+
+
 def test_launcher_pid_discovery_uses_exact_deployment_argv_token(
     monkeypatch,
 ) -> None:
@@ -1407,6 +1609,39 @@ def test_cmd_status_warns_but_proceeds_on_wrong_repo_overlay(tmp_path, monkeypat
     assert "acme/app" in captured.err
     assert "other/app" in captured.err
     assert "status for 'app'" in captured.out  # ... and still rendered status
+
+
+def test_explicit_target_dir_is_the_repository_detection_authority(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    monkeypatch.chdir(tmp_path)
+    detected_from: list[str] = []
+    monkeypatch.setattr(cli, "detect_target_dir", lambda _cwd: "/wrong/cwd")
+
+    def detect_repo(path: str) -> str:
+        detected_from.append(path)
+        return "acme/target"
+
+    monkeypatch.setattr(cli, "detect_repo", detect_repo)
+    monkeypatch.setattr(
+        cli,
+        "resolve_name",
+        lambda repo, explicit, target_dir: "target-deployment",
+    )
+
+    context = cli._resolve_context(
+        argparse.Namespace(repo="", target_dir=str(target), name="")
+    )
+
+    assert context == (
+        "acme/target",
+        str(target.resolve()),
+        "target-deployment",
+    )
+    assert detected_from == [str(target.resolve())]
 
 
 # ── review M12/A4 fold-in: cmd_install_service fails loud on compose failure ──

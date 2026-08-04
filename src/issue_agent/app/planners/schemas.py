@@ -107,8 +107,29 @@ def review_schema_with_exemptions(
     survives fence-quoting tricks). Harness-side validation in the review
     workflow stays as defense in depth for runtimes that enforce schemas
     loosely."""
+    if not declarations:
+        return {
+            **REVIEW_SCHEMA,
+            "properties": dict(REVIEW_SCHEMA["properties"]),
+            "required": list(REVIEW_SCHEMA["required"]),
+        }
     allowed = [
         {"rule": rule, "subject": subject} for rule, subject in declarations
+    ]
+    allowed_pair_schemas = [
+        {
+            "type": "object",
+            "properties": {
+                "rule": {"type": "string", "enum": [grant["rule"]]},
+                "subject": {
+                    "type": "string",
+                    "enum": [grant["subject"]],
+                },
+            },
+            "required": ["rule", "subject"],
+            "additionalProperties": False,
+        }
+        for grant in allowed
     ]
     return {
         **REVIEW_SCHEMA,
@@ -116,7 +137,10 @@ def review_schema_with_exemptions(
             **REVIEW_SCHEMA["properties"],
             "exemption_grants": {
                 "type": "array",
-                "items": {"enum": allowed},
+                # OpenAI's structured-output subset rejects object-valued enum.
+                # `anyOf` over closed object schemas keeps each rule/subject
+                # pair exact instead of allowing a cross-product.
+                "items": {"anyOf": allowed_pair_schemas},
                 "description": (
                     "Gate-exemption declarations you GRANT, verbatim from "
                     "the declared list in the prompt. Only meaningful with "

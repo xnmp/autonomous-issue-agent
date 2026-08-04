@@ -188,13 +188,25 @@ def _strict_schema(schema: dict) -> dict:
     Nullable keeps strict mode satisfied while leaving "nothing found" sayable;
     every consumer already treats null exactly like absent.
     """
-    if not isinstance(schema, dict) or schema.get("type") != "object":
+    if not isinstance(schema, dict):
         return schema
+    out = dict(schema)
+    items = schema.get("items")
+    if isinstance(items, dict):
+        out["items"] = _strict_schema(items)
+    for keyword in ("anyOf", "oneOf", "allOf"):
+        alternatives = schema.get(keyword)
+        if isinstance(alternatives, list):
+            out[keyword] = [
+                _strict_schema(alternative)
+                for alternative in alternatives
+            ]
+    if schema.get("type") != "object":
+        return out
     props = schema.get("properties")
     if not isinstance(props, dict):
-        return schema
+        return out
     optional = set(props) - set(schema.get("required") or ())
-    out = dict(schema)
     out["additionalProperties"] = False
     out["required"] = list(props.keys())
     out["properties"] = {
