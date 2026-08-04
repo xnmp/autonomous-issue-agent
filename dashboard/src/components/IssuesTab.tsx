@@ -1341,15 +1341,6 @@ function overBudget(card: IssueCard): boolean {
 }
 
 function IssueSummary({ card, open }: { card: IssueCard; open: boolean }) {
-  // Ticked from the server's own measurement plus the age of this snapshot,
-  // not from parsing the server's timestamp against the browser's clock: a
-  // client a few minutes off would otherwise show a wait that never matches
-  // the one the harness is acting on.
-  const offset = useSnapshotOffset();
-  const waitS = card.human_wait_s;
-  const humanWait = typeof waitS === "number" && Number.isFinite(waitS)
-    ? Math.max(0, waitS) + offset
-    : null;
   const secondaryFlags = card.flags.filter((flag) => flag !== card.human_action);
   const status = humanStatus(card);
   return (
@@ -1364,7 +1355,8 @@ function IssueSummary({ card, open }: { card: IssueCard; open: boolean }) {
             className={`issue-attention${card.human_action === "merge-ready" ? " issue-attention-ready" : ""}`}
             title={status}
           >
-            {status}
+            <span className="issue-attention-label">Harness</span>
+            <span className="issue-attention-text">{status}</span>
           </span>
         ) : null}
         <div className="row-wrap">
@@ -1376,7 +1368,6 @@ function IssueSummary({ card, open }: { card: IssueCard; open: boolean }) {
           {card.human_action ? (
             <span className={`human-action human-action-${card.human_action}`}>
               {card.human_action.replace("-", " ")}
-              {humanWait !== null ? ` · ${duration(humanWait, false)}` : ""}
             </span>
           ) : null}
           {secondaryFlags.length > 0 ? <FlagList flags={secondaryFlags} /> : null}

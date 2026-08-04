@@ -49,6 +49,14 @@ describe("the tasks strip as a condensed timeline", () => {
     expect(chips[1]).toHaveClass("chip-ok");
   });
 
+  it("colours an advisory route overrun yellow without pulsing as active", () => {
+    const { container } = render(
+      <StepBadgeRow steps={[step({ kind: "ROUTE", state: "advisory" })]} />,
+    );
+    expect(container.querySelector(".chip")).toHaveClass("chip-running");
+    expect(container.querySelector(".chip")).not.toHaveClass("pulse");
+  });
+
   it("tones an operator intervention as meta, never as an agent leg", () => {
     const { container } = render(
       <StepBadgeRow steps={[step({ kind: "unblock", state: "done", cost_usd: 0 })]} />,

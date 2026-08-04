@@ -108,6 +108,39 @@ def test_budget_timeout_and_escalation_demand_attention():
     assert {item["severity"] for item in notifications} == {"attention"}
 
 
+def test_a_failed_envelope_with_parsed_approval_never_emits_approved():
+    event = {
+        "ts": ts(1),
+        "event": "agent_run",
+        "kind": "REVIEW",
+        "number": 12,
+        "issue": 7,
+        "status": "APPROVE",
+        "exit_reason": "agent_error",
+        "is_error": True,
+    }
+
+    notifications = snapshots.journal_notifications(rows_for([event]))
+
+    assert [(item["severity"], item["title"], item["detail"])
+            for item in notifications] == [
+        ("attention", "Issue #7 run stopped", "Agent run failed")
+    ]
+
+
+def test_a_failed_blocked_envelope_reports_failure_not_human_input():
+    event = {
+        "ts": ts(1), "event": "agent_run", "kind": "REVIEW_GATE",
+        "number": 12, "issue": 7, "status": "blocked",
+        "exit_reason": "agent_error", "is_error": True,
+    }
+
+    (notification,) = snapshots.journal_notifications(rows_for([event]))
+
+    assert notification["title"] == "Issue #7 run stopped"
+    assert notification["detail"] == "Agent run failed"
+
+
 def test_unknown_and_malformed_events_fail_open_and_history_is_bounded():
     events = [
         {"ts": "not-a-time", "event": "agent_run", "issue": 7, "status": "blocked"},

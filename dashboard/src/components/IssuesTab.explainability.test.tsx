@@ -74,7 +74,10 @@ describe("board explainability", () => {
     const { container } = board(polled([card]));
 
     expect(container.querySelector("tbody > tr")).toHaveClass("row-alert");
-    expect(screen.getByText("3 infra deaths in a row on the same PR")).toBeVisible();
+    const message = screen.getByText("3 infra deaths in a row on the same PR");
+    expect(message).toBeVisible();
+    expect(message).toHaveClass("issue-attention-text");
+    expect(screen.getByText("Harness")).toHaveClass("issue-attention-label");
   });
 
   it("offers Park beside Unblock only when a blocked issue has an open PR", async () => {

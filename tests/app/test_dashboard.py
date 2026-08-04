@@ -11,6 +11,7 @@ garbage.
 import argparse
 import json
 import os
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -444,6 +445,91 @@ def test_issue_row_sums_cost_counts_rounds_and_finds_the_pr():
     assert row.done is False
 
 
+def test_review_runtime_failures_without_a_verdict_do_not_consume_rounds():
+    events = [
+        run(
+            role="review", kind="REVIEW", number=90, status="APPROVE",
+            exit_reason="agent_error", is_error=True, ts=at(20 - attempt),
+        )
+        for attempt in range(5)
+    ]
+    events.append(run(
+        role="review", kind="REVIEW", number=90,
+        status="REQUEST_CHANGES", ts=at(10),
+    ))
+
+    (row,) = dash.build_issue_rows(events, [])
+
+    assert row.rounds == 1
+    assert row.approvals == 0
+    assert row.changes_requested == 1
+
+
+def test_settled_run_union_cannot_turn_a_failed_approval_into_a_verdict():
+    raw = dash.RunSummary(
+        ts=None,
+        role="review",
+        kind="REVIEW",
+        number=90,
+        issue=7,
+        model="gpt-5.6-sol",
+        status="APPROVE",
+        exit_reason="budget_exhausted",
+        duration_s=1.0,
+        cost_usd=1.0,
+        estimated=False,
+        session_id="session",
+        is_error=True,
+    )
+
+    failed = dash.settled_run(raw)
+    approved = dash.settled_run(
+        replace(raw, exit_reason="ok", is_error=False)
+    )
+
+    assert isinstance(failed, dash.FailedRun)
+    assert failed.reason.value == "budget_exhausted"
+    assert not isinstance(failed, dash.ReviewVerdict)
+    assert isinstance(approved, dash.ReviewVerdict)
+    assert approved.decision.value == "APPROVE"
+
+
+def test_failed_dynamic_review_subleg_is_still_a_typed_failure():
+    raw = dash.RunSummary(
+        ts=None, role="review", kind="REVIEW_CORRECTNESS", number=90, issue=7,
+        model="gpt-5.6-sol", status="APPROVE", exit_reason="agent_error",
+        duration_s=1.0, cost_usd=1.0, estimated=False, session_id="session",
+        is_error=True,
+    )
+
+    outcome = dash.settled_run(raw)
+
+    assert isinstance(outcome, dash.FailedRun)
+    assert isinstance(outcome.kind, dash.OtherAgentKind)
+    assert outcome.kind.value == "REVIEW_CORRECTNESS"
+    assert dash.stage_for([{
+        "event": "agent_run", "kind": raw.kind, "status": raw.status,
+        "exit_reason": raw.exit_reason, "is_error": raw.is_error,
+    }]) == "run failed"
+
+
+def test_blocked_is_a_separate_variant_only_after_a_clean_envelope():
+    raw = dash.RunSummary(
+        ts=None, role="fix", kind="RESOLVE", number=7, issue=7,
+        model="gpt-5.6-terra", status="blocked", exit_reason="ok",
+        duration_s=1.0, cost_usd=1.0, estimated=False, session_id="session",
+        is_error=False,
+    )
+
+    blocked = dash.settled_run(raw)
+    failed = dash.settled_run(
+        replace(raw, exit_reason="agent_error", is_error=True)
+    )
+
+    assert isinstance(blocked, dash.BlockedRun)
+    assert isinstance(failed, dash.FailedRun)
+
+
 def test_done_is_the_merge_or_ai_done_trace():
     events = [
         run(kind="RESOLVE", cost_usd=3.0),
@@ -503,6 +589,20 @@ def test_first_pass_verdicts_counts_one_verdict_per_pr():
     ]
     rows = dash.build_issue_rows(events, [])
     assert dash.first_pass_verdicts(rows) == (1, 1)
+
+
+def test_first_pass_metric_ignores_a_parsed_verdict_from_a_failed_envelope():
+    events = [
+        run(role="review", kind="REVIEW", number=90, issue=7,
+            status="APPROVE", exit_reason="budget_exhausted", is_error=True,
+            ts=at(30)),
+        run(role="review", kind="REVIEW", number=90, issue=7,
+            status="REQUEST_CHANGES", ts=at(20)),
+    ]
+
+    rows = dash.build_issue_rows(events, [])
+
+    assert dash.first_pass_verdicts(rows) == (0, 1)
 
 
 def test_metrics_cost_mix_and_cost_per_done_issue():

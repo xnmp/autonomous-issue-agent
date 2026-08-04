@@ -46,7 +46,7 @@ export type VerificationStatus =
   | "MISBEHAVED"
   | "pending"
   | (string & {});
-export type StepState = "ok" | "failed" | "running" | (string & {});
+export type StepState = "ok" | "failed" | "running" | "advisory" | (string & {});
 export type IssueFlag =
   | "escalated"
   | "recurred"

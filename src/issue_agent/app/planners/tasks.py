@@ -66,7 +66,7 @@ class FixTaskConfig:
     # A concise, evidence-derived warning for legs with at least two completed
     # resolve/CI failures. It belongs in the appended system prompt, not issue data.
     difficulty_notice: str = ""
-    router_budget_usd: float = 0.10
+    router_budget_usd: float = 1.0
     # Whether this fixer runtime can mint trusted screenshot-read receipts.
     # When it cannot (codex), the visual-evidence PR gate is unpassable by
     # construction (#153), so the leg must be told UP FRONT never to declare
@@ -683,7 +683,7 @@ def build_router_task(
     body: Untrusted,
     model: str = "",
     runtime: str = "claude",
-    max_budget_usd: float = 0.10,
+    max_budget_usd: float = 1.0,
     cwd: str | None = None,
 ) -> PlannedRun:
     """route_model: cheap difficulty classifier (no system prompt, no tools).

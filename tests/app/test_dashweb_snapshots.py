@@ -337,6 +337,21 @@ def test_a_leg_that_exited_for_any_reason_but_ok_reads_as_failed():
     assert snapshots.leg_state(leg) == "failed"
 
 
+def test_an_advisory_route_budget_overrun_is_a_warning_not_a_failure():
+    route = {
+        "ts": ts(hours=2), "event": "agent_run", "role": "fix", "kind": "ROUTE",
+        "issue": 7, "number": 7, "exit_reason": "budget_exhausted",
+        "is_error": True, "summary": "router result retained",
+    }
+
+    row = row_for([route], 7)
+
+    assert snapshots.collapse_steps(row)[0]["state"] == "advisory"
+    step = snapshots.detailed_steps(row)[0]
+    assert step["state"] == "advisory"
+    assert step["note"] == "budget_exhausted — router result retained"
+
+
 # (exit_reason, is_error, failed?) — codex settles a clean leg as `ok`, claude
 # settles it empty, so an exit reason's presence is not a failure signal (#158).
 @pytest.mark.parametrize(
@@ -1720,6 +1735,26 @@ def test_a_review_step_notes_its_verdict_and_round():
     ]
     notes = [s["note"] for s in snapshots.detailed_steps(row_for(reviews, 7))]
     assert notes == ["REQUEST_CHANGES round 1", "APPROVE round 2"]
+
+
+def test_failed_review_attempts_do_not_inflate_the_first_verdict_round():
+    failures = [
+        {
+            "ts": ts(hours=8 - attempt), "event": "agent_run", "role": "review",
+            "kind": "REVIEW", "issue": 7, "number": 12, "status": "APPROVE",
+            "exit_reason": "agent_error", "is_error": True,
+        }
+        for attempt in range(5)
+    ]
+    verdict = {
+        "ts": ts(hours=2), "event": "agent_run", "role": "review", "kind": "REVIEW",
+        "issue": 7, "number": 12, "status": "REQUEST_CHANGES", "exit_reason": "ok",
+    }
+
+    row = row_for([*failures, verdict], 7)
+
+    assert row.rounds == 1
+    assert snapshots.detailed_steps(row)[-1]["note"] == "REQUEST_CHANGES round 1"
 
 
 def test_a_blocked_step_notes_the_question_it_asked():

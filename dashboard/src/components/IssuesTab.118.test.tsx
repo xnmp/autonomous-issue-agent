@@ -50,7 +50,7 @@ function polled(data: IssuesPayload): Polled<IssuesPayload> {
 }
 
 describe("human-owned actions", () => {
-  it("surfaces the action and wait duration without offering merge", () => {
+  it("surfaces the action without an unexplained wait timer or merge control", () => {
     render(
       <IssuesTab
         repo="demo"
@@ -68,7 +68,8 @@ describe("human-owned actions", () => {
       />,
     );
 
-    expect(screen.getByText(/merge ready · 5m/)).toBeVisible();
+    expect(screen.getByText("merge ready")).toBeVisible();
+    expect(screen.queryByText(/merge ready ·/)).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /merge/i })).not.toBeInTheDocument();
   });
 

@@ -60,6 +60,7 @@ export function stateTone(state: StepState | null | undefined): Tone {
     case "blocked":
       return "fail";
     case "running":
+    case "advisory":
       return "running";
     default:
       return "neutral";

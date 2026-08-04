@@ -15,14 +15,20 @@ from ..adapters.journal import read_events
 from ..domain.projection import fold
 from ..domain.dashboard import (
     ActionFact,
+    BlockedRun,
+    CompletedRun,
     DaemonHealth,
     Deployment,
+    FailedRun,
     IssueRow,
     Metrics,
+    OtherAgentKind,
     REVIEW_KINDS,
     ROLE_NAMES,
     RunSummary,
     RunningLeg,
+    ReviewVerdict,
+    SettledRun,
     STALE_AFTER_S,
     build_deployment,
     build_deployment_v2,
@@ -35,6 +41,8 @@ from ..domain.dashboard import (
     parse_action,
     pr_issue_map,
     stage_for,
+    settled_run,
+    settled_run_from_event,
 )
 
 
@@ -527,10 +535,16 @@ def _table(headers, rows) -> str:
 
 __all__ = [
     "ActionFact",
+    "BlockedRun",
+    "CompletedRun",
     "DaemonHealth",
     "Deployment",
+    "FailedRun",
     "IssueRow",
+    "OtherAgentKind",
     "RunSummary",
+    "ReviewVerdict",
+    "SettledRun",
     "Metrics",
     "RunningLeg",
     "STALE_AFTER_S",
@@ -547,4 +561,6 @@ __all__ = [
     "render_text",
     "serve",
     "stage_for",
+    "settled_run",
+    "settled_run_from_event",
 ]

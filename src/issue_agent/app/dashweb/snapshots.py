@@ -15,10 +15,13 @@ from datetime import datetime, timedelta, timezone, tzinfo
 import hashlib
 import json
 import math
+from typing import assert_never
 
 from ...domain import dashboard as dash
 from ...domain.actions import AgentKind
 from ...domain.identity import is_bot_login, login_eq
+from ...domain.outcome import ExitReason
+from ...domain.world import ReviewDecision
 
 # Frecency windows: (seconds, weight). An event inside 24h counts in all three,
 # which is the intended pile-up — a repo that moved this morning must outrank a
@@ -149,6 +152,13 @@ def leg_state(leg: dash.RunSummary) -> str:
     terminal reason in the error taxonomy. `status` is the AGENT's claim;
     `is_error`/`exit_reason` are the envelope's, and only the envelope can see
     a run that died."""
+    if (
+        leg.kind == "ROUTE"
+        and leg.exit_reason.strip().casefold() == "budget_exhausted"
+    ):
+        # Routing is advisory: its fallback still dispatches the fixer. Show
+        # the overrun without presenting the issue as a failed execution.
+        return "advisory"
     if dash.leg_failed(leg.is_error, leg.exit_reason):
         return "failed"
     return "blocked" if leg.status.lower() == "blocked" else "ok"
@@ -287,10 +297,10 @@ def _operator_steps(
 
 
 def _review_round(row: dash.IssueRow, leg: dash.RunSummary) -> int | None:
-    """1-based ordinal of this review among the reviews of the same PR."""
+    """1-based verdict ordinal for this PR; failed attempts consume none."""
     ordinal = 0
     for other in row.legs:
-        if other.kind in dash.REVIEW_KINDS and other.number == leg.number:
+        if dash.review_verdict(other) is not None and other.number == leg.number:
             ordinal += 1
             if other is leg:
                 return ordinal
@@ -302,14 +312,15 @@ def _leg_note(row: dash.IssueRow, leg: dash.RunSummary) -> str | None:
     A leg that did what it was asked adds nothing."""
     settled = _settled_event(row, leg)
     summary = _reason_line(settled.get("needs") or settled.get("summary"))
-    if leg_state(leg) == "failed":
+    if leg_state(leg) in {"failed", "advisory"}:
         reason = str(leg.exit_reason or "").strip() or "failed without a reason"
         return _reason_line(f"{reason} — {summary}" if summary else reason)
     if leg.status.lower() == "blocked":
         return summary
-    if leg.kind in dash.REVIEW_KINDS and leg.status:
+    if (verdict := dash.review_verdict(leg)) is not None:
         ordinal = _review_round(row, leg)
-        return leg.status if ordinal is None else f"{leg.status} round {ordinal}"
+        decision = verdict.decision.value
+        return decision if ordinal is None else f"{decision} round {ordinal}"
     return None
 
 
@@ -1197,7 +1208,13 @@ def _model_effort(row: dash.IssueRow, model: str) -> str | None:
         for event in row.events
         if event.get("model") == model and event.get("effort")
     ]
-    return str(matches[-1]["effort"]) if matches else None
+    fixer_matches = [
+        event
+        for event in matches
+        if event.get("role") == "fix" and event.get("kind") != "ROUTE"
+    ]
+    selected = fixer_matches or matches
+    return str(selected[-1]["effort"]) if selected else None
 
 
 def model_badges(row: dash.IssueRow, models=None) -> list[dict]:
@@ -1207,25 +1224,21 @@ def model_badges(row: dash.IssueRow, models=None) -> list[dict]:
     ]
 
 
-def active_card_models(row: dash.IssueRow) -> list[str]:
-    """Models doing issue work, excluding models used only for review."""
-    review_models = {
-        str(event.get("model"))
-        for event in row.events
-        if event.get("kind") in dash.REVIEW_KINDS and event.get("model")
-    }
-    issue_work_models = {
-        str(event.get("model"))
-        for event in row.events
-        if event.get("kind") not in dash.REVIEW_KINDS
-        and event.get("kind") != "ROUTE"
-        and event.get("model")
-    }
-    return [
-        model
-        for model in row.models
-        if model not in review_models or model in issue_work_models
-    ]
+def fixer_card_models(row: dash.IssueRow) -> list[str]:
+    """Fixer models used by non-routing legs, in first-seen order."""
+    settled = (
+        _model_for_leg(row, leg)
+        for leg in row.legs
+        if leg.role == "fix" and leg.kind != "ROUTE"
+    )
+    running = (
+        leg.model
+        for leg in row.running
+        if leg.role == "fix" and leg.kind != "ROUTE"
+    )
+    return list(dict.fromkeys(
+        model for model in (*settled, *running) if model
+    ))
 
 
 def projection_model(row: dash.IssueRow) -> str | None:
@@ -1319,7 +1332,7 @@ def issue_card(
     elapsed, working, idle, idle_active = _duration_breakdown(
         row, started, _clock_end(row, started, now, human_wait_since)
     )
-    displayed_models = list(row.models) if row.done else active_card_models(row)
+    displayed_models = fixer_card_models(row)
     human_wait_s = (
         max(0.0, (now - human_wait_since).total_seconds())
         if human_wait_since is not None
@@ -1593,7 +1606,32 @@ def _journal_notification(event: dict, issue: int) -> dict | None:
     status = str(event.get("status") or "")
     kind = str(event.get("kind") or "")
     number = _event_number(event.get("number"))
-    if status == "blocked":
+    failure = " ".join(
+        str(event.get(field) or "").lower()
+        for field in ("status", "envelope_subtype", "exit_reason")
+    )
+    outcome = dash.settled_run_from_event(event)
+    if isinstance(outcome, dash.FailedRun):
+        budget = (
+            outcome.reason is ExitReason.BUDGET_EXHAUSTED
+            or "error_max_budget_usd" in failure
+        )
+        timed_out = outcome.reason in {
+            ExitReason.IDLE_TIMEOUT,
+            ExitReason.WALL_TIMEOUT,
+        } or "timeout" in failure
+        return {
+            "severity": "attention",
+            "title": f"Issue #{issue} run stopped",
+            "detail": (
+                "Budget limit reached"
+                if budget
+                else "Run timed out" if timed_out else "Agent run failed"
+            ),
+            "issue": issue,
+            "pr": number if kind in dash.REVIEW_KINDS | dash.REPAIR_KINDS else None,
+        }
+    if isinstance(outcome, dash.BlockedRun):
         return {
             "severity": "attention",
             "title": f"Issue #{issue} needs input",
@@ -1601,10 +1639,6 @@ def _journal_notification(event: dict, issue: int) -> dict | None:
             "issue": issue,
             "pr": None,
         }
-    failure = " ".join(
-        str(event.get(field) or "").lower()
-        for field in ("status", "envelope_subtype", "exit_reason")
-    )
     if "error_max_budget_usd" in failure or "timeout" in failure:
         budget = "error_max_budget_usd" in failure
         return {
@@ -1618,14 +1652,22 @@ def _journal_notification(event: dict, issue: int) -> dict | None:
             "issue": issue,
             "pr": number if kind in dash.REVIEW_KINDS | dash.REPAIR_KINDS else None,
         }
-    if kind in dash.REVIEW_KINDS and status in {"APPROVE", "REQUEST_CHANGES"}:
+    if isinstance(outcome, dash.ReviewVerdict):
+        if outcome.decision is ReviewDecision.APPROVE:
+            approved = True
+        elif outcome.decision is ReviewDecision.REQUEST_CHANGES:
+            approved = False
+        elif outcome.decision is ReviewDecision.ESCALATE:
+            return None
+        else:
+            assert_never(outcome.decision)
         if number is None:
             return None
         return {
-            "severity": "info" if status == "APPROVE" else "attention",
+            "severity": "info" if approved else "attention",
             "title": (
                 f"PR #{number} approved"
-                if status == "APPROVE"
+                if approved
                 else f"PR #{number} needs changes"
             ),
             "detail": "Review verdict submitted",

@@ -42,6 +42,10 @@ def test_review_mode_defaults_single():
     assert from_env({"REPO": "x"}).review_scout_model == "sonnet"
 
 
+def test_router_budget_defaults_to_one_dollar():
+    assert from_env({"REPO": "x"}).router_budget_usd == 1.0
+
+
 def test_reviewer_runtime_defaults_to_codex_with_a_mid_tier_model():
     """The deployment default is visible in the task-producing config, not
     merely documented in an example overlay."""

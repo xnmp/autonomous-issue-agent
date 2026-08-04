@@ -9,8 +9,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, Mapping
+from typing import Iterable, Literal, Mapping
 
+from .actions import AgentKind
 from .events import (
     ActionApplied,
     AgentRunCompleted,
@@ -30,6 +31,7 @@ from .events import (
 from .labels import LIFECYCLE_LABELS, Label
 from .outcome import ExitReason
 from .projection import ReadModel
+from .world import ReviewDecision
 
 # The three role daemons, in the order `journal_paths` returns their journals.
 ROLE_NAMES = ("fix", "review", "steward")
@@ -197,6 +199,58 @@ class RunSummary:
     is_error: bool = False
 
 
+@dataclass(frozen=True)
+class OtherAgentKind:
+    """A legitimate extension/legacy kind outside the dispatch enum."""
+
+    value: str
+
+
+AgentRunKind = AgentKind | OtherAgentKind
+
+
+@dataclass(frozen=True)
+class FailedRun:
+    """An agent run whose envelope did not settle cleanly."""
+
+    kind: AgentRunKind
+    reason: ExitReason
+
+
+@dataclass(frozen=True)
+class BlockedRun:
+    """A clean agent response that explicitly needs human input."""
+
+    kind: AgentRunKind
+
+
+@dataclass(frozen=True)
+class ReviewVerdict:
+    """A clean reviewer decision. Failed runs cannot inhabit this variant."""
+
+    kind: Literal[AgentKind.REVIEW, AgentKind.RE_REVIEW]
+    decision: ReviewDecision
+
+
+@dataclass(frozen=True)
+class CompletedRun:
+    """A clean run that is not a structured review verdict."""
+
+    kind: AgentKind
+
+
+@dataclass(frozen=True)
+class UnrecognizedRun:
+    """A legacy/corrupt kind retained for display but denied typed meaning."""
+
+    kind: str
+
+
+SettledRun = (
+    FailedRun | BlockedRun | ReviewVerdict | CompletedRun | UnrecognizedRun
+)
+
+
 # The two ways a leg can say "this run ended cleanly": claude settles the happy
 # path with no exit reason at all, codex settles it as `ok`. Keying failure on
 # "the field is non-empty" therefore rendered every healthy codex leg as "run
@@ -220,6 +274,89 @@ def leg_failed(is_error: bool, exit_reason: str) -> bool:
     if is_error:
         return True
     return exit_reason.strip().casefold() not in _CLEAN_EXIT_REASONS
+
+
+def _agent_kind(raw: str) -> AgentKind | None:
+    try:
+        return AgentKind[raw]
+    except KeyError:
+        return None
+
+
+def _failure_reason(leg: RunSummary) -> ExitReason:
+    raw = leg.exit_reason.strip().casefold()
+    if raw in _CLEAN_EXIT_REASONS:
+        return ExitReason.AGENT_ERROR
+    try:
+        return ExitReason(raw)
+    except ValueError:
+        return ExitReason.AGENT_ERROR
+
+
+def settled_run(leg: RunSummary) -> SettledRun:
+    """Parse the permissive journal projection into a closed outcome union.
+
+    Failure is classified first. A runtime may preserve parsed structured
+    output beside ``is_error=True``; that raw contradiction becomes only a
+    ``FailedRun`` here, so no downstream typed value can expose its APPROVE as
+    a verdict.
+    """
+    if leg_failed(leg.is_error, leg.exit_reason):
+        kind = _agent_kind(leg.kind) or OtherAgentKind(leg.kind)
+        return FailedRun(kind, _failure_reason(leg))
+    kind = _agent_kind(leg.kind)
+    if leg.status.casefold() == "blocked":
+        return BlockedRun(kind or OtherAgentKind(leg.kind))
+    if kind is None:
+        return UnrecognizedRun(leg.kind)
+    if kind in {AgentKind.REVIEW, AgentKind.RE_REVIEW}:
+        try:
+            decision = ReviewDecision(leg.status)
+        except ValueError:
+            return CompletedRun(kind)
+        if kind is AgentKind.REVIEW:
+            return ReviewVerdict(AgentKind.REVIEW, decision)
+        return ReviewVerdict(AgentKind.RE_REVIEW, decision)
+    return CompletedRun(kind)
+
+
+def review_verdict(leg: RunSummary) -> ReviewVerdict | None:
+    if leg.kind not in REVIEW_KINDS:
+        return None
+    outcome = settled_run(leg)
+    return outcome if isinstance(outcome, ReviewVerdict) else None
+
+
+def _settled_leg_stage(leg: RunSummary) -> str:
+    outcome = settled_run(leg)
+    if isinstance(outcome, FailedRun):
+        return "run failed"
+    if isinstance(outcome, BlockedRun):
+        return "awaiting human reply"
+    if isinstance(outcome, ReviewVerdict):
+        if outcome.decision is ReviewDecision.APPROVE:
+            return "awaiting merge"
+        if outcome.decision is ReviewDecision.REQUEST_CHANGES:
+            return "changes requested"
+        return "reviewed"
+    if (
+        isinstance(outcome, CompletedRun)
+        and outcome.kind in {AgentKind.REVIEW, AgentKind.RE_REVIEW}
+    ):
+        return "reviewed"
+    if leg.kind in RESOLVE_KINDS | REPAIR_KINDS:
+        return "awaiting review"
+    return ""
+
+
+def _review_verdict_legs(
+    legs: Iterable[RunSummary],
+) -> list[tuple[RunSummary, ReviewVerdict]]:
+    result = []
+    for leg in legs:
+        if (verdict := review_verdict(leg)) is not None:
+            result.append((leg, verdict))
+    return result
 
 
 @dataclass(frozen=True)
@@ -567,12 +704,12 @@ def _v2_issue_row(
                 RunSummary(
                     ts=run.completion.occurred_at,
                     role=run.completion.producer.role,
-                    kind=completion_payload.kind,
+                    kind=str(completion_payload.kind),
                     number=correlation.pr or correlation.issue,
                     issue=issue,
-                    model=completion_payload.model,
-                    status=completion_payload.status,
-                    exit_reason=completion_payload.exit_reason or "",
+                    model=str(completion_payload.model),
+                    status=str(completion_payload.status),
+                    exit_reason=str(completion_payload.exit_reason or ""),
                     is_error=completion_payload.is_error,
                     duration_s=completion_payload.duration_ms / 1000,
                     cost_usd=(completion_payload.cost_micros or 0) / 1_000_000,
@@ -625,7 +762,7 @@ def _v2_issue_row(
             }
         )
     )
-    review_legs = [leg for leg in legs if leg.kind in REVIEW_KINDS]
+    review_legs = _review_verdict_legs(legs)
     spend_events = [
         event.payload
         for event in ordered
@@ -643,9 +780,13 @@ def _v2_issue_row(
         legs=tuple(legs),
         running=() if done else tuple(running),
         rounds=len(review_legs),
-        approvals=sum(leg.status == "APPROVE" for leg in review_legs),
+        approvals=sum(
+            verdict.decision is ReviewDecision.APPROVE
+            for _leg, verdict in review_legs
+        ),
         changes_requested=sum(
-            leg.status == "REQUEST_CHANGES" for leg in review_legs
+            verdict.decision is ReviewDecision.REQUEST_CHANGES
+            for _leg, verdict in review_legs
         ),
         escalations=sum(
             isinstance(event.payload, EscalationRaised) for event in ordered
@@ -868,19 +1009,8 @@ def _v2_stage(
     if any(isinstance(event.payload, SpendBlocked) for event in events):
         return "blocked (spend)"
     if legs:
-        leg = legs[-1]
-        if leg_failed(leg.is_error, leg.exit_reason):
-            return "run failed"
-        if leg.status == "blocked":
-            return "awaiting human reply"
-        if leg.kind in REVIEW_KINDS:
-            if leg.status == "APPROVE":
-                return "awaiting merge"
-            if leg.status == "REQUEST_CHANGES":
-                return "changes requested"
-            return "reviewed"
-        if leg.kind in RESOLVE_KINDS | REPAIR_KINDS:
-            return "awaiting review"
+        if stage := _settled_leg_stage(legs[-1]):
+            return stage
     for label, stage in (
         ("ai-pr-open", "pr open"),
         ("ai-working", "working"),
@@ -1001,21 +1131,7 @@ def _stage_of_event(e: dict) -> str:
     if name == "hold":
         return "held"
     if name == "agent_run":
-        kind = str(e.get("kind") or "")
-        status = str(e.get("status") or "")
-        if leg_failed(bool(e.get("is_error")), str(e.get("exit_reason") or "")):
-            return "run failed"
-        if status == "blocked":
-            return "awaiting human reply"
-        if kind in REVIEW_KINDS:
-            if status == "APPROVE":
-                return "awaiting merge"
-            if status == "REQUEST_CHANGES":
-                return "changes requested"
-            return "reviewed"
-        if kind in RESOLVE_KINDS or kind in REPAIR_KINDS:
-            return "awaiting review"
-        return ""
+        return _settled_leg_stage(_leg(e))
     return ""
 
 
@@ -1074,7 +1190,7 @@ def _done_state(events: list[dict]) -> bool:
 
 def _issue_row(issue: int, events: list[dict], running: tuple[RunningLeg, ...]) -> IssueRow:
     legs = tuple(_leg(e) for e in events if e.get("event") == "agent_run")
-    reviews = [leg for leg in legs if leg.kind in REVIEW_KINDS]
+    reviews = _review_verdict_legs(legs)
     facts = [
         parse_action(str(e.get("desc") or ""))
         for e in events
@@ -1099,8 +1215,14 @@ def _issue_row(issue: int, events: list[dict], running: tuple[RunningLeg, ...]) 
         legs=legs,
         running=effective_running,
         rounds=len(reviews),
-        approvals=sum(1 for leg in reviews if leg.status == "APPROVE"),
-        changes_requested=sum(1 for leg in reviews if leg.status == "REQUEST_CHANGES"),
+        approvals=sum(
+            verdict.decision is ReviewDecision.APPROVE
+            for _leg, verdict in reviews
+        ),
+        changes_requested=sum(
+            verdict.decision is ReviewDecision.REQUEST_CHANGES
+            for _leg, verdict in reviews
+        ),
         escalations=sum(1 for e in events if e.get("event") == "escalation"),
         recurrences=sum(1 for e in events if e.get("event") == "recurrence"),
         spend_blocks=sum(1 for e in events if e.get("event") == "spend_block"),
@@ -1147,6 +1269,11 @@ def _leg(e: dict) -> RunSummary:
     )
 
 
+def settled_run_from_event(event: dict) -> SettledRun:
+    """Typed outcome at the legacy journal-dict boundary."""
+    return settled_run(_leg(event))
+
+
 def _running_leg(e: dict) -> RunningLeg:
     return RunningLeg(
         ts=parse_ts(e.get("ts")),
@@ -1181,18 +1308,17 @@ def first_pass_verdicts(rows) -> tuple[int, int]:
     rejection — must not be counted again or a bad PR reviewed four times reads
     as three-quarters healthy.
     """
-    first: dict[tuple[int, int | None], str] = {}
+    first: dict[tuple[int, int | None], ReviewDecision] = {}
     for row in rows:
         for leg in row.legs:
-            if leg.kind not in REVIEW_KINDS or leg.status not in (
-                "APPROVE", "REQUEST_CHANGES"
-            ):
+            verdict = review_verdict(leg)
+            if verdict is None or verdict.decision is ReviewDecision.ESCALATE:
                 continue
-            first.setdefault((row.issue, leg.number), leg.status)
+            first.setdefault((row.issue, leg.number), verdict.decision)
     verdicts = list(first.values())
     return (
-        verdicts.count("APPROVE"),
-        verdicts.count("REQUEST_CHANGES"),
+        verdicts.count(ReviewDecision.APPROVE),
+        verdicts.count(ReviewDecision.REQUEST_CHANGES),
     )
 
 

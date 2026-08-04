@@ -1,6 +1,6 @@
 # Handover — tauri-explorer six-issue run
 
-Snapshot: 2026-08-04 21:46 AEST
+Snapshot: 2026-08-04 23:10 AEST
 
 ## Objective
 
@@ -36,6 +36,13 @@ otherwise mutated during this final harness-only pass.
   ceiling recovery, and zero-valued rejection ceilings. The full `make test`
   suite is green. The two findings from the fourth adversarial pass were fixed
   with non-vacuous regressions; the final complete-diff adversarial review
+  returned PASS.
+- The final dashboard/config follow-up is complete: the default router ceiling
+  is `$1`; advisory router overruns are yellow; issue-card models are
+  fixer-only; failed reviewer envelopes cannot become typed verdicts; #495's
+  first real request-changes now reads as round 1; harness notices are visually
+  distinct from issue titles; and unexplained wait timers were removed from
+  action badges. Full backend and frontend suites pass and adversarial review
   returned PASS.
 
 ## Live service and configuration state
@@ -102,6 +109,11 @@ The harness checkout is on `dev`. Relevant recent commits:
   - Credential resolution matches the daemon's App/token/ambient precedence.
   - The final adversarial review for this committed change returned PASS and
     the full suite passed before commit.
+- `d92fe6c fix: prevent unmergeable approval dead ends`
+  - Makes grant-incomplete approvals actionable request-changes rather than
+    posting an approval the merge gate must reject.
+  - Carries that rule through current-head reconciliation, mechanical rebases,
+    abandoned-ceiling recovery, and operator rearm.
 
 The existing untracked user documents must be preserved and must not be swept
 into a harness commit:
@@ -109,23 +121,11 @@ into a harness commit:
 - `docs/open/2026-08-02-handover-keifu-batch2-drained.md`
 - `docs/open/2026-08-03-handover-exemptions-deployed.md`
 
-## Harness fix completed in this handoff
+## Approval/exemption fix completed in this handoff
 
-Current modified files:
-
-- `src/issue_agent/app/dashweb/service.py`
-- `src/issue_agent/app/workflows/review.py`
-- `src/issue_agent/domain/exemptions.py`
-- `src/issue_agent/domain/ports.py`
-- `src/issue_agent/domain/review.py`
-- `tests/app/test_dashweb_actions.py`
-- `tests/app/test_review_workflow.py`
-- `tests/domain/test_exemptions.py`
-- `tests/domain/test_review.py`
-- `tests/fakes/in_memory_github.py`
-
-Current code/test diff size before the handover document: 1,045 insertions and
-98 deletions across ten files. The patch is coherent and fully tested.
+The approval/exemption repair described below is committed as `d92fe6c`. The
+later dashboard/config follow-up is described in its own section below. Both
+were reviewed as complete diffs and passed the project-required full suite.
 
 ### Root incident being fixed
 
@@ -208,6 +208,101 @@ the declared `tree-sitter` dependency; the approved network retry completed
 successfully. Final complete-diff adversarial review: **PASS**, with explicit
 confirmation that budget, `ai-blocked`, fixer, and unknown-provenance holds
 retain normal approval-reset semantics.
+
+## Final dashboard/config follow-up
+
+### Router and model presentation
+
+- The default `ROUTER_BUDGET_USD` is now `$1.00` in runtime config, planner
+  config, and the generated environment reference. The Tauri overlay does not
+  override it, so the new default applies on daemon reload.
+- A `ROUTE` leg ending in `budget_exhausted` remains honestly recorded with its
+  envelope and cost, but its task badge is `advisory`: yellow and non-pulsing,
+  not red. Routing already falls back to the fixer.
+- The issue-card Model column now shows only models used by non-routing fixer
+  legs. Reviewer-only Sol is hidden on both active and completed cards. Sol is
+  retained if it actually ran a fixer leg. Legacy settlements recover their
+  model from the matching start event, and effort is taken from the fixer use.
+
+### Typed settled-run outcomes and #495 reporting
+
+The permissive raw journal envelope is parsed once into a closed domain union:
+
+```text
+SettledRun = FailedRun | BlockedRun | ReviewVerdict |
+             CompletedRun | UnrecognizedRun
+```
+
+Only `ReviewVerdict` contains a `ReviewDecision`. Failure is classified first,
+including dynamic multi-agent kinds represented by `OtherAgentKind`. Thus an
+envelope with both `is_error=true` and parsed `status=APPROVE` is a
+`FailedRun`; it cannot contribute an approval, round, first-pass approval,
+approval notification, approval stage, or review ordinal. `BlockedRun` is also
+distinct, so a failed `status=blocked` envelope cannot claim the agent is
+waiting for human input.
+
+This fixes #495's dashboard history: five review runtime/schema errors produced
+no verdict and consume no rounds. The first submitted `REQUEST_CHANGES` is
+round 1, not round 6. Legacy and schema-v2 aggregation, per-step notes,
+first-pass metrics, stages, and notifications share the typed verdict value.
+
+### Attention presentation
+
+- Circuit-breaker and similar harness prose is now a labelled `Harness`
+  callout with its own border, background, and typography, distinct from the
+  issue title.
+- The `1:58`, `2:15`, and similar suffixes were elapsed human-wait timers. They
+  were removed from action badges. Working/idle timing remains in the duration
+  columns and detail views.
+
+### Verification
+
+- dashboard Vitest/build checks: 207 tests passed;
+- hooks: 116 passed;
+- point-at: 11 passed;
+- domain: 993 passed;
+- adapters: 1,083 passed;
+- app: 2,073 passed;
+- gate parity and all four import-linter contracts passed;
+- pyrefly: zero errors;
+- `git diff --check`: passed;
+- final complete-diff adversarial review: **PASS**.
+
+The adversarial pass found and drove fixes for contradictory errored verdicts,
+dynamic `REVIEW_GATE`/dimension kinds, and errored `blocked` envelopes before
+returning PASS.
+
+## Exemption decision contract
+
+Missing required grants must block approval. A grant is authorization to bypass
+a gate rule, not merely proof that the reviewer saw the declaration. Treating
+an omitted grant as sufficient would make the grant field non-authoritative and
+let any generic approval bypass policy.
+
+For `tests-immutable`, a reviewer may conclude the behavior is correct while
+also concluding that additive coverage belongs in a new test file. That is an
+actionable policy rejection: the submitted verdict must be `REQUEST_CHANGES`,
+not `APPROVE`. The deterministic submission boundary now enforces that. If
+“reviewer looked at it” should be sufficient, the correct change is to remove
+or redefine the gate rule—not silently accept a missing grant.
+
+## Unblock status for #495 and #508
+
+Read-only GitHub verification at 22:42 AEST showed:
+
+- #495 / PR #579: issue has `ai-pr-open`; PR has `needs-human-review`; PR is
+  open, mergeable, `CLEAN`, `APPROVED`, with all checks green.
+- #508 / PR #581: issue has `ai-pr-open`; PR has `needs-human-review`; PR is
+  open, mergeable, `CHANGES_REQUESTED`, with `invocation` and `frontend`
+  failed.
+
+One dashboard **Unblock** click per issue is the intended rearm operation. It
+clears retry counters, dismisses ceiling-counted reviewer change requests with
+the reviewer credential when required, removes the PR hold, restores
+`ai-pr-open`, and journals the result. It does not approve, merge, or guarantee
+the next attempt succeeds. #495 re-enters the grant-aware review/fix loop;
+#508 re-enters with a real code/CI defect still to fix. Check the returned
+action detail after each click. No unblock was performed in this handoff.
 
 ## Resolved adversarial-review findings
 
@@ -324,10 +419,9 @@ the CI pending/retry breaker before changing the target manually.
    real path also clears retry counters, dismisses reviewer-bot change requests
    with the reviewer credential, restores lifecycle triggers, writes durable
    commands/receipts, and journals the outcome.
-4. The prior attempt to execute these unblocks was rejected by the external
-   safety approval because the targets are human-held. Obtain an explicit user
-   approval to rearm those three targets before applying the operator action;
-   do not bypass that decision with raw `gh label` or review-dismissal calls.
+4. A human can do this with one dashboard Unblock click per issue. Do not bypass
+   the operator action with raw label edits or review-dismissal calls; those omit
+   counter resets, identity selection, durable receipts, and outcome reporting.
 5. Let `#579` and `#582` return to the fixer as actionable exemption refusals;
    verify the additive tests move to new files or a reviewer grants the exact
    current-patch pairs. Let `#581` fix the terminating PowerShell diagnostics.

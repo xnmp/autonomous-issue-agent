@@ -422,7 +422,7 @@ class HarnessConfig:
     review_model: str | None = "gpt-5.6-terra"
     steward_triage_model: str | None = "sonnet"
     fix_budget_usd: float = 10.0
-    router_budget_usd: float = 0.10
+    router_budget_usd: float = 1.0
     review_budget_usd: float = 8.0
     triage_budget_usd: float = 0.75
     # REVIEW_MODE: single (default) | multi | delegated.
