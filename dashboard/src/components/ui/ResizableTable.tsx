@@ -199,6 +199,7 @@ export function ResizableTable({
   columns,
   children,
   className = "",
+  ariaLabel,
   sort,
   onSort,
 }: {
@@ -206,6 +207,7 @@ export function ResizableTable({
   columns: TableColumn[];
   children: ReactNode;
   className?: string;
+  ariaLabel?: string;
   sort?: TableSort;
   onSort?: (key: string) => void;
 }) {
@@ -329,6 +331,7 @@ export function ResizableTable({
     <table
       className={`tbl resizable-table ${className}`.trim()}
       style={{ width: tableWidth }}
+      aria-label={ariaLabel}
     >
       <caption className="sr-only">
         Columns are resizable and rearrangeable. Drag a column header to move it,

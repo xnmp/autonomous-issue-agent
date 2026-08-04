@@ -42,6 +42,7 @@ import {
   type Tone,
 } from "../lib/semantics";
 import {
+  DASH,
   ageCompact,
   duration,
   localDate,
@@ -89,6 +90,14 @@ interface IssuesTabProps {
 type Visibility = Record<IssuesSub, Record<string, boolean>>;
 
 const COLUMN_STORAGE = "issue-agent.dashboard.columns";
+const TASK_HISTORY_COLUMN_STORAGE = "issue-agent.dashboard.task-history-columns";
+// Task is the row identity and remains visible, like Issue in the parent
+// tables. The menu controls the three optional measurements beside it.
+const TASK_HISTORY_COLUMN_CHOICES: ColumnChoice[] = [
+  { key: "time", label: "Time" },
+  { key: "cost", label: "Cost" },
+  { key: "since", label: "Time since" },
+];
 const COLUMN_CHOICES: Record<IssuesSub, ColumnChoice[]> = {
   inflight: [
     { key: "tasks", label: "Tasks" },
@@ -154,6 +163,37 @@ function storedVisibility(): Visibility {
     };
   } catch {
     return DEFAULT_VISIBILITY;
+  }
+}
+
+function storedTaskHistoryVisibility(storageKey: string): Record<string, boolean> {
+  const defaults = Object.fromEntries(
+    TASK_HISTORY_COLUMN_CHOICES.map(({ key }) => [key, true]),
+  );
+  try {
+    const all = JSON.parse(
+      localStorage.getItem(TASK_HISTORY_COLUMN_STORAGE) ?? "{}",
+    ) as Record<string, Record<string, boolean>>;
+    return { ...defaults, ...all[storageKey] };
+  } catch {
+    return defaults;
+  }
+}
+
+function persistTaskHistoryVisibility(
+  storageKey: string,
+  visibility: Record<string, boolean>,
+) {
+  try {
+    const all = JSON.parse(
+      localStorage.getItem(TASK_HISTORY_COLUMN_STORAGE) ?? "{}",
+    ) as Record<string, Record<string, boolean>>;
+    localStorage.setItem(
+      TASK_HISTORY_COLUMN_STORAGE,
+      JSON.stringify({ ...all, [storageKey]: visibility }),
+    );
+  } catch {
+    // This table remains configurable for the mounted session without storage.
   }
 }
 
@@ -462,7 +502,7 @@ function InFlightTable({
                     colSpan={columns.length}
                     onOpen={() => onOpen(card.issue)}
                     onRefresh={onRefresh}
-                    tabular
+                    taskTableStorageKey={`${storageKey}-task-history`}
                   />
                 ) : null}
               </Fragment>
@@ -984,14 +1024,14 @@ function TaskDetailRow({
   colSpan,
   onOpen,
   onRefresh,
-  tabular = false,
+  taskTableStorageKey,
 }: {
   repo: string;
   card: IssueCard;
   colSpan: number;
   onOpen: () => void;
   onRefresh: () => void;
-  tabular?: boolean;
+  taskTableStorageKey?: string;
 }) {
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -1075,15 +1115,19 @@ function TaskDetailRow({
           {card.escalation_reason ? (
             <div className="task-escalation">{card.escalation_reason}</div>
           ) : null}
-          {tabular && (steps ?? card.steps).length > 0 ? (
-            <TaskStoryTable issue={card.issue} steps={steps ?? card.steps} />
+          {taskTableStorageKey && (steps ?? card.steps).length > 0 ? (
+            <TaskStoryTable
+              issue={card.issue}
+              steps={steps ?? card.steps}
+              storageKey={taskTableStorageKey}
+            />
           ) : null}
-          {!tabular && steps !== null && steps.length > 0 ? (
+          {!taskTableStorageKey && steps !== null && steps.length > 0 ? (
             <ol className="task-story">
               {steps.map((step) => <TaskStoryLine key={step.idx} step={step} />)}
             </ol>
           ) : null}
-          {!tabular && steps === null && card.steps.length > 0 ? (
+          {!taskTableStorageKey && steps === null && card.steps.length > 0 ? (
             <ol className="task-story">
               {card.steps.map((step, index) => (
                 <TaskStoryLine key={`${step.kind}-${index}`} step={step} />
@@ -1115,23 +1159,70 @@ function TaskDetailRow({
 function TaskStoryTable({
   issue,
   steps,
+  storageKey,
 }: {
   issue: number;
   steps: (CardStep | IssueStep)[];
+  storageKey: string;
 }) {
   const nowMs = useNow(60_000);
+  const [columnVisibility, setColumnVisibility] = useState(
+    () => storedTaskHistoryVisibility(storageKey),
+  );
+  const [columnMenuAt, setColumnMenuAt] = useState<{ x: number; y: number } | null>(null);
+  const visible = useMemo(
+    () => new Set(
+      Object.entries(columnVisibility)
+        .filter(([, shown]) => shown)
+        .map(([key]) => key),
+    ),
+    [columnVisibility],
+  );
+  const columns: TableColumn[] = [
+    { key: "task", label: "Task", width: 260, minWidth: 140 },
+    ...(visible.has("time")
+      ? [{ key: "time", label: "Time", width: 120, minWidth: 84 }]
+      : []),
+    ...(visible.has("cost")
+      ? [{ key: "cost", label: "Cost", className: "r", width: 90, minWidth: 76 }]
+      : []),
+    ...(visible.has("since")
+      ? [{ key: "since", label: "Time since", className: "r", width: 110, minWidth: 92 }]
+      : []),
+  ];
+  const setColumn = (key: string, shown: boolean) => {
+    const next = { ...columnVisibility, [key]: shown };
+    setColumnVisibility(next);
+    persistTaskHistoryVisibility(storageKey, next);
+  };
+  const openColumnMenu = (event: MouseEvent<HTMLDivElement>) => {
+    if (!(event.target instanceof Element) || !event.target.closest("th")) return;
+    event.preventDefault();
+    // The board owns a separate parent-table menu on the same bubbling path.
+    event.stopPropagation();
+    setColumnMenuAt({
+      x: Math.min(event.clientX, window.innerWidth - 220),
+      y: Math.min(event.clientY, window.innerHeight - 220),
+    });
+  };
+
   return (
-    <div className="task-story-table-wrap">
-      <table className="task-story-table" aria-label={`Issue #${issue} task history`}>
-        <thead>
-          <tr>
-            <th scope="col">Task</th>
-            <th scope="col">Time</th>
-            <th scope="col" className="r">Cost</th>
-            <th scope="col" className="r">Time since</th>
-          </tr>
-        </thead>
-        <tbody>
+    <div className="task-story-table-shell" onContextMenu={openColumnMenu}>
+      <ColumnMenu
+        columns={TASK_HISTORY_COLUMN_CHOICES}
+        visible={visible}
+        onChange={setColumn}
+        position={columnMenuAt}
+        onClose={() => setColumnMenuAt(null)}
+      />
+      <div className="task-story-table-wrap">
+        <ResizableTable
+          storageKey={storageKey}
+          columns={columns}
+          className="task-story-table"
+          ariaLabel={`Issue #${issue} task history`}
+        >
+          <tbody>
           {steps.map((step, index) => {
             const ts = stepTimestamp(step);
             const tone = stateTone(step.state);
@@ -1157,14 +1248,21 @@ function TaskStoryTable({
                     {note ? <span className="task-note" title={note}>{note}</span> : null}
                   </div>
                 </td>
-                <td className="mono nowrap" title="task wall time">{duration(took)}</td>
-                <td className="r mono nowrap">{usd(step.cost_usd)}</td>
-                <td className="r mono nowrap">{timeSince(ts, nowMs)}</td>
+                {visible.has("time") ? (
+                  <td className="mono nowrap" title="task wall time">{duration(took)}</td>
+                ) : null}
+                {visible.has("cost") ? (
+                  <td className="r mono nowrap">{taskCost(step.cost_usd)}</td>
+                ) : null}
+                {visible.has("since") ? (
+                  <td className="r mono nowrap">{timeSince(ts, nowMs)}</td>
+                ) : null}
               </tr>
             );
           })}
-        </tbody>
-      </table>
+          </tbody>
+        </ResizableTable>
+      </div>
     </div>
   );
 }
@@ -1221,6 +1319,10 @@ function stepTimestamp(step: CardStep | IssueStep): string | null {
 function timeSince(ts: string | null, nowMs: number): string {
   const at = parseTs(ts);
   return at === null ? ageCompact(null) : ageCompact(Math.max(0, (nowMs - at) / 1000));
+}
+
+function taskCost(cost: number | null | undefined): string {
+  return cost === 0 ? DASH : usd(cost);
 }
 
 function taskName(step: CardStep | IssueStep): string {

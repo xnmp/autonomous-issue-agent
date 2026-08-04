@@ -9,6 +9,7 @@ describe("ResizableTable", () => {
       <ResizableTable
         storageKey="test-table"
         columns={[{ key: "issue", label: "Issue", width: 100 }]}
+        ariaLabel="Test issues"
       >
         <tbody><tr><td>#1</td></tr></tbody>
       </ResizableTable>,
@@ -19,6 +20,7 @@ describe("ResizableTable", () => {
     await userEvent.keyboard("{ArrowRight}");
 
     expect(container.querySelector("col")).toHaveStyle({ width: "124px" });
+    expect(screen.getByRole("table", { name: "Test issues" })).toBeVisible();
     expect(screen.getByRole("cell", { name: "#1" })).toBeVisible();
   });
 

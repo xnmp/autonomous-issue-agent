@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { Polled } from "../api/hooks";
@@ -276,9 +276,31 @@ describe("board explainability", () => {
     expect(within(history).queryByText(/Aug 01/)).not.toBeInTheDocument();
     expect(history.querySelector("time")).toBeNull();
     expect(within(history).getByText("$1.00")).toBeVisible();
-    expect(within(history).getByText("$0.00")).toBeVisible();
+    expect(within(history).queryByText("$0.00")).not.toBeInTheDocument();
+    const unblockRow = within(history).getByText("unblock").closest("tr");
+    expect(unblockRow).not.toBeNull();
+    expect(unblockRow!.querySelectorAll("td").item(2)).toHaveTextContent("—");
     expect(within(history).getByText("2h")).toBeVisible();
     expect(within(history).getByText("1h")).toBeVisible();
+
+    for (const label of ["Task", "Time", "Cost", "Time since"]) {
+      expect(within(history).getByRole("separator", { name: `Resize ${label} column` }))
+        .toBeVisible();
+    }
+    const timeResize = within(history).getByRole("separator", { name: "Resize Time column" });
+    expect(timeResize).toHaveAttribute("aria-valuenow", "120");
+    fireEvent.keyDown(timeResize, { key: "ArrowRight" });
+    expect(timeResize).toHaveAttribute("aria-valuenow", "132");
+
+    fireEvent.contextMenu(within(history).getByRole("columnheader", { name: /Task/ }));
+    const menu = screen.getByRole("menu", { name: "Visible columns" });
+    expect(within(menu).getByRole("checkbox", { name: "Time" })).toBeChecked();
+    expect(within(menu).getByRole("checkbox", { name: "Cost" })).toBeChecked();
+    expect(within(menu).getByRole("checkbox", { name: "Time since" })).toBeChecked();
+    expect(within(menu).queryByRole("checkbox", { name: "Tasks" })).not.toBeInTheDocument();
+    expect(within(menu).queryByRole("checkbox", { name: "Progress" })).not.toBeInTheDocument();
+    await userEvent.click(within(menu).getByRole("checkbox", { name: "Cost" }));
+    expect(within(history).queryByRole("columnheader", { name: /Cost/ })).not.toBeInTheDocument();
     now.mockRestore();
     vi.unstubAllGlobals();
   });
@@ -332,20 +354,60 @@ describe("board explainability", () => {
       ),
     );
 
-    board(polled([
+    const cards: IssueCard[] = [
       { ...base, human_action: "escalated" },
       { ...base, issue: 201, title: "Ordinary live work", stage: "resolving", leg_running: true },
-    ]));
+    ];
+    const view = board(polled(cards));
     await userEvent.click(screen.getByRole("row", { name: /Explain the board/ }));
     await userEvent.click(screen.getByRole("row", { name: /Ordinary live work/ }));
 
-    const blockedHistory = await screen.findByRole("table", { name: "Issue #200 task history" });
-    const liveHistory = await screen.findByRole("table", { name: "Issue #201 task history" });
+    let blockedHistory = await screen.findByRole("table", { name: "Issue #200 task history" });
+    let liveHistory = await screen.findByRole("table", { name: "Issue #201 task history" });
     expect(within(blockedHistory).getAllByRole("columnheader").map((cell) => cell.textContent))
       .toEqual(["Task", "Time", "Cost", "Time since"]);
     expect(within(liveHistory).getAllByRole("columnheader").map((cell) => cell.textContent))
       .toEqual(["Task", "Time", "Cost", "Time since"]);
     expect(within(liveHistory).getByText("resolve")).toBeVisible();
+
+    fireEvent.keyDown(
+      within(blockedHistory).getByRole("separator", { name: "Resize Time column" }),
+      { key: "ArrowRight" },
+    );
+    for (let move = 0; move < 2; move += 1) {
+      fireEvent.keyDown(
+        within(blockedHistory).getByRole("columnheader", { name: /Time since/ }),
+        { key: "ArrowLeft", altKey: true },
+      );
+    }
+    fireEvent.contextMenu(
+      within(blockedHistory).getByRole("columnheader", { name: /Task/ }),
+    );
+    await userEvent.click(screen.getByRole("checkbox", { name: "Cost" }));
+
+    const keys = (table: HTMLElement) => within(table)
+      .getAllByRole("columnheader")
+      .map((header) => header.dataset.columnKey);
+    expect(keys(blockedHistory)).toEqual(["task", "since", "time"]);
+    expect(keys(liveHistory)).toEqual(["task", "time", "cost", "since"]);
+    expect(within(blockedHistory).getByRole("separator", { name: "Resize Time column" }))
+      .toHaveAttribute("aria-valuenow", "132");
+    expect(within(liveHistory).getByRole("separator", { name: "Resize Time column" }))
+      .toHaveAttribute("aria-valuenow", "120");
+
+    view.unmount();
+    board(polled(cards));
+    await userEvent.click(screen.getByRole("row", { name: /Explain the board/ }));
+    await userEvent.click(screen.getByRole("row", { name: /Ordinary live work/ }));
+    blockedHistory = await screen.findByRole("table", { name: "Issue #200 task history" });
+    liveHistory = await screen.findByRole("table", { name: "Issue #201 task history" });
+
+    expect(keys(blockedHistory)).toEqual(["task", "since", "time"]);
+    expect(keys(liveHistory)).toEqual(["task", "time", "cost", "since"]);
+    expect(within(blockedHistory).getByRole("separator", { name: "Resize Time column" }))
+      .toHaveAttribute("aria-valuenow", "132");
+    expect(within(liveHistory).getByRole("separator", { name: "Resize Time column" }))
+      .toHaveAttribute("aria-valuenow", "120");
     vi.unstubAllGlobals();
   });
 

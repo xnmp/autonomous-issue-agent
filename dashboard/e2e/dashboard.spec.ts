@@ -603,6 +603,18 @@ test("the in-flight history remains usable at a phone-width viewport", async ({ 
   await expect(cells).toHaveCount(4);
   await expect(cells.nth(1)).toHaveText("1:17:18");
   await expect(history).not.toContainText("Jul 29");
+  await headers.first().click({ button: "right" });
+  const historyMenu = page.getByRole("menu", { name: "Visible columns" });
+  await expect(historyMenu.getByRole("checkbox", { name: "Time", exact: true })).toBeChecked();
+  await expect(historyMenu.getByRole("checkbox", { name: "Cost", exact: true })).toBeChecked();
+  await expect(historyMenu.getByRole("checkbox", { name: "Time since", exact: true })).toBeChecked();
+  await expect(historyMenu.getByRole("checkbox", { name: "Tasks", exact: true })).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  const timeResizer = history.getByRole("separator", { name: "Resize Time column" });
+  await expect(timeResizer).toHaveAttribute("aria-valuenow", "120");
+  await timeResizer.focus();
+  await page.keyboard.press("ArrowRight");
+  await expect(timeResizer).toHaveAttribute("aria-valuenow", "132");
   for (let index = 0; index < 4; index += 1) {
     const header = headers.nth(index);
     const cell = cells.nth(index);
@@ -610,9 +622,10 @@ test("the in-flight history remains usable at a phone-width viewport", async ({ 
     const cellBounds = await cell.boundingBox();
     expect(bounds).not.toBeNull();
     expect(cellBounds).not.toBeNull();
-    expect(bounds!.x).toBeGreaterThanOrEqual(0);
-    expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(320);
-    expect(await header.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true);
+    expect(
+      await header.locator(".column-heading")
+        .evaluate((element) => element.scrollWidth <= element.clientWidth),
+    ).toBe(true);
     expect(Math.abs(cellBounds!.x - bounds!.x)).toBeLessThanOrEqual(1);
     expect(Math.abs(cellBounds!.width - bounds!.width)).toBeLessThanOrEqual(1);
   }
@@ -622,7 +635,12 @@ test("the in-flight history remains usable at a phone-width viewport", async ({ 
     scrollWidth: element.scrollWidth,
   }));
   expect(dimensions.clientWidth).toBeGreaterThanOrEqual(240);
-  // Intrinsic monospace widths may leave a few pixels of scroll, but a return
-  // to the desktop minimum would hide Cost and Time since entirely.
-  expect(dimensions.scrollWidth - dimensions.clientWidth).toBeLessThanOrEqual(32);
+  expect(dimensions.scrollWidth).toBeGreaterThan(dimensions.clientWidth);
+  await scroller.evaluate((element) => {
+    element.scrollLeft = element.scrollWidth;
+  });
+  const lastHeader = await headers.last().boundingBox();
+  expect(lastHeader).not.toBeNull();
+  expect(lastHeader!.x).toBeGreaterThanOrEqual(0);
+  expect(lastHeader!.x + lastHeader!.width).toBeLessThanOrEqual(320);
 });
