@@ -1270,14 +1270,6 @@
   gap: var(--s2);
   min-width: 0;
 }
-.task-story-when {
-  display: flex;
-  align-items: baseline;
-  flex-wrap: wrap;
-  gap: var(--s1);
-  color: var(--ink-muted);
-  font-size: var(--fs-xs);
-}
 .task-note {
   min-width: 0;
   color: var(--ink);

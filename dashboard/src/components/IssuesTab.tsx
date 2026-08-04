@@ -1157,14 +1157,7 @@ function TaskStoryTable({
                     {note ? <span className="task-note" title={note}>{note}</span> : null}
                   </div>
                 </td>
-                <td>
-                  <div className="task-story-when">
-                    <time dateTime={ts ?? undefined}>{localTime(ts)}</time>
-                    {took !== null ? (
-                      <span className="faint" title="task wall time">took {duration(took)}</span>
-                    ) : null}
-                  </div>
-                </td>
+                <td className="mono nowrap" title="task wall time">{duration(took)}</td>
                 <td className="r mono nowrap">{usd(step.cost_usd)}</td>
                 <td className="r mono nowrap">{timeSince(ts, nowMs)}</td>
               </tr>

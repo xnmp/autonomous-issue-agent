@@ -272,7 +272,9 @@ describe("board explainability", () => {
     const history = screen.getByRole("table", { name: "Issue #200 task history" });
     expect(within(history).getAllByRole("columnheader").map((cell) => cell.textContent))
       .toEqual(["Task", "Time", "Cost", "Time since"]);
-    expect(within(history).getByText("took 0:30")).toBeVisible();
+    expect(within(history).getByText("0:30")).toBeVisible();
+    expect(within(history).queryByText(/Aug 01/)).not.toBeInTheDocument();
+    expect(history.querySelector("time")).toBeNull();
     expect(within(history).getByText("$1.00")).toBeVisible();
     expect(within(history).getByText("$0.00")).toBeVisible();
     expect(within(history).getByText("2h")).toBeVisible();
@@ -400,9 +402,8 @@ describe("board explainability", () => {
     expect(malformed).not.toBeNull();
     expect(future).not.toBeNull();
     expect(within(malformed!).getAllByText("—")).toHaveLength(3);
-    expect(malformed!.querySelector("time")).not.toHaveAttribute("datetime");
     expect(within(future!).getByText("0s")).toBeVisible();
-    expect(future!.querySelector("time")).toHaveAttribute("datetime", "2099-01-01T00:00:00Z");
+    expect(history.querySelector("time")).toBeNull();
     expect(future!.querySelectorAll("td").item(2).textContent).toMatch(/^\$[\d.e+]+$/);
     vi.unstubAllGlobals();
   });

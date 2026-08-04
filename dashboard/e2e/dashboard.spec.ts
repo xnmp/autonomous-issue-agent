@@ -601,6 +601,8 @@ test("the in-flight history remains usable at a phone-width viewport", async ({ 
   const cells = history.locator("tbody tr").first().getByRole("cell");
   await expect(headers).toHaveCount(4);
   await expect(cells).toHaveCount(4);
+  await expect(cells.nth(1)).toHaveText("1:17:18");
+  await expect(history).not.toContainText("Jul 29");
   for (let index = 0; index < 4; index += 1) {
     const header = headers.nth(index);
     const cell = cells.nth(index);
