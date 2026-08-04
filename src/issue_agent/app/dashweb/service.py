@@ -457,14 +457,17 @@ class Backend:
             # falls back to ai-pr-open rather than creating an unreadable arm.
             review_trigger = Label.AI_PR_OPEN.value
         pr_changes: dict[int, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+        pr_hold_roles: dict[int, str] = {}
         candidate_pr = 0
         try:
             for pr, labels in pr_held.items():
                 candidate_pr = pr
+                hold_role = self._pr_hold_role(name, number, pr)
+                pr_hold_roles[pr] = hold_role
                 pr_changes[pr] = actions.pr_unblock_change(
                     labels,
                     review_trigger,
-                    self._pr_hold_role(name, number, pr),
+                    hold_role,
                 )
         except ValueError as exc:
             # Resolve every admission decision before counters or labels move:
@@ -491,7 +494,16 @@ class Backend:
         # incident was a green result over a dead PR — so its notes ride back
         # in the operator-facing detail as well as the journal.
         rearm_failures = self._rearm_rejections(
-            name, repo, number, review_effects
+            name,
+            repo,
+            number,
+            review_effects,
+            reviewer_held_prs=frozenset(
+                pr
+                for pr, labels in pr_held.items()
+                if Label.NEEDS_HUMAN_REVIEW.value in labels
+                and pr_hold_roles.get(pr) == "review"
+            ),
         )
         issue_applied, issue_detail = True, "ok"
         issue_actual_add: tuple[str, ...] = ()
@@ -748,7 +760,13 @@ class Backend:
             pass
 
     def _rearm_rejections(
-        self, name: str, repo: str, number: int, effects
+        self,
+        name: str,
+        repo: str,
+        number: int,
+        effects,
+        *,
+        reviewer_held_prs: frozenset[int] = frozenset(),
     ) -> list[str]:
         """Dismiss the review bot's standing change requests on this issue's
         open PRs, but ONLY where the rejection ceiling is what is holding them.
@@ -822,7 +840,10 @@ class Backend:
                 self._journal_rearm_failure(name, repo, number, pr, note)
                 continue
             counted = review_dom.stale_rejections(
-                reviews, review_bot, limit=ceiling
+                reviews,
+                review_bot,
+                limit=ceiling,
+                trailing_approvals_reset=pr not in reviewer_held_prs,
             )
             # The same arithmetic `review_submission` applies: this many
             # rejections stand, so the NEXT one escalates instead of bouncing

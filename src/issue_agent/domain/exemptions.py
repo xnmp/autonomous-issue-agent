@@ -266,6 +266,40 @@ def grant_mac(
     return hmac.new(key.encode(), message, hashlib.sha256).hexdigest()
 
 
+def authenticated_grant_pairs(
+    grants: Iterable[ExemptionGrant],
+    *,
+    issue_number: int | None,
+    patch_id: str,
+    mac_key: str,
+) -> frozenset[tuple[str, str]]:
+    """The declaration identities authorized for one issue and patch.
+
+    Parsing proves only syntax. This helper applies the freshness and
+    harness-authorship checks shared by merge enforcement and review
+    reconciliation, so an external or recovered approval cannot be accepted
+    under a weaker rule than the eventual merge.
+    """
+    if issue_number is None or not patch_id or not mac_key:
+        return frozenset()
+    return frozenset(
+        (grant.rule, grant.subject)
+        for grant in grants
+        if grant.issue == issue_number
+        and grant.patch == patch_id
+        and hmac.compare_digest(
+            grant.mac,
+            grant_mac(
+                mac_key,
+                grant.rule,
+                grant.issue,
+                grant.subject,
+                grant.patch,
+            ),
+        )
+    )
+
+
 def render_grant_line(
     key: str, rule: str, issue: int, subject: str, patch: str
 ) -> str:
@@ -510,16 +544,12 @@ def exemption_status(
     # the fixer can compute, so patch-binding alone proves freshness, not
     # that the HARNESS minted the line (round-3 BLOCKER 1). compare_digest
     # keeps the check constant-time.
-    granted = {
-        (g.rule, g.subject)
-        for g in facts.grants
-        if g.issue == issue_number
-        and g.patch == facts.patch_id
-        and hmac.compare_digest(
-            g.mac,
-            grant_mac(mac_key, g.rule, g.issue, g.subject, g.patch),
-        )
-    }
+    granted = authenticated_grant_pairs(
+        facts.grants,
+        issue_number=issue_number,
+        patch_id=facts.patch_id,
+        mac_key=mac_key,
+    )
     ungranted = [
         d for d in facts.declarations if (d.rule, d.subject) not in granted
     ]

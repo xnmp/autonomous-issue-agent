@@ -251,14 +251,19 @@ def patch_signature(diff_text: object) -> str:
     return hashlib.sha256("\n".join(normalized).encode("utf-8", "replace")).hexdigest()
 
 
-def count_prior_rejections(reviews: tuple, review_bot: str) -> int:
+def count_prior_rejections(
+    reviews: tuple,
+    review_bot: str,
+    *,
+    non_resetting_approval_commits: frozenset[str] = frozenset(),
+) -> int:
     """How many times the review bot has REQUESTED_CHANGES on this PR SINCE its
     most recent APPROVE. This — not the number of author pushes — is what the
     escalation ceiling counts, with two properties:
 
       * a rebase or a post-approval housekeeping push advances the push counter
         but is not a rejection, so it never consumes a round; and
-      * an APPROVE resets the count. If the bot approved and the author then
+      * a mergeable APPROVE resets the count. If the bot approved and the author then
         re-opened work (a new commit on an approved-but-unmerged PR — CI failed,
         auto-merge off, etc.), the prior rejections were SATISFIED; the reviewer
         rejecting the new revision starts a fresh cycle, not the ceiling-breaker.
@@ -268,10 +273,18 @@ def count_prior_rejections(reviews: tuple, review_bot: str) -> int:
     Derived purely from GitHub review state (no persisted counter), so it is
     correct across daemon restarts. `reviews` is chronologically ordered (gh
     returns oldest-first / by submittedAt), so 'since the last APPROVE' is the
-    suffix after the last APPROVE index."""
+    suffix after the last APPROVE index. `non_resetting_approval_commits`
+    carries current-head approvals the workflow has already proven cannot
+    merge because required grants are absent; those must not manufacture a
+    reset merely because GitHub calls their raw event APPROVED."""
     mine = [r for r in reviews if login_eq(r.author, review_bot)]
     last_approve = max(
-        (i for i, r in enumerate(mine) if r.state == REVIEW_APPROVED),
+        (
+            i
+            for i, r in enumerate(mine)
+            if r.state == REVIEW_APPROVED
+            and r.commit_id not in non_resetting_approval_commits
+        ),
         default=-1,
     )
     return sum(
@@ -296,15 +309,24 @@ def stale_rejections(
     reviews: tuple[SubmittedReview, ...],
     review_bot: str,
     limit: int = 0,
+    *,
+    trailing_approvals_reset: bool = True,
 ) -> tuple[SubmittedReview, ...]:
     """Exactly the reviews an operator re-arm must dismiss: the review bot's
     CHANGES_REQUESTED verdicts that still COUNT toward the rejection ceiling.
 
-    Same suffix rule as `count_prior_rejections` — an APPROVE satisfied every
-    rejection before it — so dismissing this set and nothing else is what makes
-    `count_prior_rejections` read zero again. Anything outside it (a human's
-    change request, a rejection already answered by an APPROVE, an
-    already-dismissed review) is not the harness's to retract.
+    Same suffix rule as `count_prior_rejections` by default — an APPROVE
+    satisfied every rejection before it — so dismissing this set and nothing
+    else is what makes `count_prior_rejections` read zero again. Anything
+    outside it (a human's change request, a rejection already answered by an
+    APPROVE, an already-dismissed review) is not the harness's to retract.
+
+    A PR durably attributed to a reviewer escalation may instead set
+    `trailing_approvals_reset=False`. This recovers the rejection sequence
+    preceding a trailing APPROVE that did not actually settle the PR (for
+    example, because required authenticated exemption grants were absent).
+    Retracting those resolved bot verdicts is safe only on that reviewer-held
+    operator path; the default preserves live feedback.
 
     keifu PR #173 (2026-08-02): the dashboard unblock cleared the attention
     labels and the retry counters but left these reviews standing, so the
@@ -327,8 +349,17 @@ def stale_rejections(
         if login_eq(review.author, review_bot)
         and review.state not in {"", "PENDING", "DISMISSED"}
     ]
+    last_rejection = max(
+        (i for i, r in enumerate(mine) if r.state == REVIEW_CHANGES_REQUESTED),
+        default=-1,
+    )
     last_approve = max(
-        (i for i, r in enumerate(mine) if r.state == REVIEW_APPROVED),
+        (
+            i
+            for i, r in enumerate(mine)
+            if r.state == REVIEW_APPROVED
+            and (trailing_approvals_reset or i < last_rejection)
+        ),
         default=-1,
     )
     counted = tuple(
@@ -432,8 +463,10 @@ def reviewer_abandoned_at_ceiling(pr: PRView, cfg: ReviewConfig) -> bool:
 
     The three conjuncts are what keep this from firing on a HEALTHY loop:
 
-      * `prior + 1 >= max_rejections` — the next rejection could only escalate,
-        so no round remains to be spent;
+      * the rejection sequence before the escalation reached the ceiling. A
+        trailing APPROVE is deliberately not a reset here: a mergeable approval
+        settles the workflow, so a later reviewer COMMENT on the same head is
+        durable evidence that the approval did not settle it;
       * the reviewer's newest review is a COMMENT on the CURRENT head — only
         the ceiling/verdict escalation posts COMMENT, and pinning it to the head
         means a fixer push still earns a real re-review (which may APPROVE and
@@ -457,19 +490,45 @@ def reviewer_abandoned_at_ceiling(pr: PRView, cfg: ReviewConfig) -> bool:
     # which this arm and that one could act on the same PR in one tick.
     if pr.has(cfg.trigger_label):
         return False
-    if count_prior_rejections(pr.reviews, cfg.review_bot) + 1 < cfg.max_rejections:
-        return False
     mine = [r for r in pr.reviews if login_eq(r.author, cfg.review_bot)]
     newest = next(
         (r for r in reversed(mine) if r.state != REVIEW_DISMISSED),
         None,
     )
-    return bool(
+    if not (
         newest is not None
         and newest.state == REVIEW_COMMENTED
         and pr.head_ref_oid
         and newest.commit_id == pr.head_ref_oid
+    ):
+        return False
+    active = [
+        review
+        for review in mine
+        if review.state not in {"", "PENDING", REVIEW_DISMISSED}
+    ]
+    last_rejection = max(
+        (
+            i
+            for i, review in enumerate(active)
+            if review.state == REVIEW_CHANGES_REQUESTED
+        ),
+        default=-1,
     )
+    last_approve_before_rejection = max(
+        (
+            i
+            for i, review in enumerate(active)
+            if review.state == REVIEW_APPROVED and i < last_rejection
+        ),
+        default=-1,
+    )
+    prior_rejections = sum(
+        1
+        for review in active[last_approve_before_rejection + 1 :]
+        if review.state == REVIEW_CHANGES_REQUESTED
+    )
+    return prior_rejections + 1 >= cfg.max_rejections
 
 
 def abandoned_escalation_reason(cap: int) -> str:
@@ -600,27 +659,60 @@ class ReviewSubmission:
 
 
 def review_submission(
-    decision: str, body: str, prior_rejections: int, max_rejections: int
+    decision: str,
+    body: str,
+    prior_rejections: int,
+    max_rejections: int,
+    *,
+    ungranted_exemptions: tuple[tuple[str, str], ...] = (),
 ) -> ReviewSubmission:
     """Port of the review-pr.sh / re-review-pr.sh decision tails.
 
-    APPROVE → APPROVE; ESCALATE (or the ceiling reached) → a COMMENT review +
-    needs-human-review; anything else → REQUEST_CHANGES.
+    APPROVE → APPROVE only when every gate exemption required by the current
+    patch was granted. An approval that omits one or more required grants is an
+    actionable REQUEST_CHANGES: revise the patch so it no longer needs those
+    exemptions, or grant them on the next review. ESCALATE (or the ceiling
+    reached) → a COMMENT review + needs-human-review; anything else →
+    REQUEST_CHANGES.
 
-    Rejection ceiling: an APPROVE always wins (a satisfied reviewer ends the
-    loop), but a REQUEST_CHANGES that would be the `max_rejections`-th rejection
-    can no longer bounce the PR back to the fixer — it escalates. The ceiling
+    Rejection ceiling: a mergeable APPROVE always wins (a satisfied reviewer
+    ends the loop), but a REQUEST_CHANGES — including a grant-incomplete
+    approval normalized above — that would be the `max_rejections`-th rejection
+    can no longer bounce the PR back to the fixer; it escalates. The ceiling
     counts the reviewer's OWN prior REQUEST_CHANGES verdicts (`prior_rejections`),
     NOT author pushes: a rebase or a post-approval housekeeping push that never
     drew a rejection does not consume a round toward the human handoff. This
     verdict is the (prior_rejections + 1)-th rejection, so escalate when that
     reaches the cap. Previously escalation counted every push and depended on the
     model voluntarily returning ESCALATE; this makes the ceiling a real breaker
-    keyed on genuine dissatisfaction."""
+    keyed on genuine dissatisfaction.
+
+    `ungranted_exemptions` is harness-derived, not model prose. Keeping this
+    contradiction repair here makes the submitted GitHub verdict and rejection
+    accounting agree: an unmergeable approval must not reset the rejection
+    sequence or strand the PR behind a later merge-side escalation."""
+    if decision == "APPROVE" and ungranted_exemptions:
+        unique = tuple(dict.fromkeys(ungranted_exemptions))
+        requests = "\n".join(
+            f"- `{rule}` for `{subject}`" for rule, subject in unique
+        )
+        guidance = (
+            "The reviewer returned APPROVE but did not grant every gate "
+            "exemption required by the current patch. This is therefore "
+            "REQUEST_CHANGES, not a mergeable approval. Either revise the "
+            "patch so these exemptions are no longer required, or explicitly "
+            "grant each pair on the next review. For `tests-immutable`, "
+            "additive coverage belongs in a new test file when changing an "
+            "existing test is not itself justified."
+        )
+        rationale = f"\n\nReviewer rationale:\n{body}" if body else ""
+        body = f"{guidance}\n\nUngranted requests:\n{requests}{rationale}"
+        decision = "REQUEST_CHANGES"
     if decision == "APPROVE":
         return ReviewSubmission(event="APPROVE", body=body)
     this_rejection = prior_rejections + 1
-    if decision == "ESCALATE" or this_rejection >= max_rejections:
+    ceiling_hit = max_rejections > 0 and this_rejection >= max_rejections
+    if decision == "ESCALATE" or ceiling_hit:
         # The posted body names the real cause too — a verdict escalation
         # phrased as exhausted rounds reads like a fencepost bug (keifu #177).
         if decision == "ESCALATE":

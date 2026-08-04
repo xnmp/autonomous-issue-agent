@@ -43,6 +43,7 @@ class InMemoryGitHub:
         self.run_states: dict[str, dict[int, str]] = {}
         self.dependencies: set[tuple[int, int]] = set()
         self.submitted_reviews: set[tuple[int, str, str, str]] = set()
+        self.diff_text = "diff text"
 
     def _maybe_fail(self, name: str) -> None:
         if name in self.fail_on:
@@ -81,7 +82,11 @@ class InMemoryGitHub:
         self, pr: int, base_oid: str, head_oid: str
     ) -> PullRequestDiff:
         self._maybe_fail("pr_diff")
-        return PullRequestDiff(base_oid, head_oid, "diff text")
+        return PullRequestDiff(base_oid, head_oid, self.diff_text)
+
+    def pr_commit_messages(self, pr: int) -> tuple[str, ...]:
+        self._maybe_fail("pr_commit_messages")
+        return ()
 
     def has_label(self, kind: str, number: int, label: str) -> bool:
         views = self.issues if kind == "issue" else self.prs

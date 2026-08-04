@@ -33,13 +33,16 @@ from ...domain.exemptions import (
     MAX_DECLARATIONS_PER_CHANGE,
     RULE_REQUIRED_TEST,
     RULE_TESTS_IMMUTABLE,
+    authenticated_grant_pairs,
     open_fence_marker,
     parse_exemption_declarations,
+    parse_exemption_grants,
     render_grant_line,
     valid_subject,
 )
 from ...domain.gate import modified_existing_tests_from_diff
 from ...domain.fix import breaker_key
+from ...domain.identity import login_eq
 from ...domain.refs import issue_from_branch
 from ...domain.labels import Label
 from ...domain.lifecycle import pr_escalation
@@ -66,6 +69,25 @@ _PIN_DEFERRED_STATUS = "review_checkout_deferred"
 # Past this consecutive-deferral streak, further deferrals count as
 # unproductive rounds again, restoring the escalation bound.
 _MAX_FREE_PIN_DEFERRALS = 5
+
+# Commit-message evidence is needed to discover `required-test` declarations.
+# A transient read failure must not be interpreted as "none declared", but an
+# outage also cannot create a silent forever-loop. As with checkout pinning,
+# the first few free deferrals retry without consuming a paid-round breaker;
+# a persistent failure eventually enters the existing bounded escalation path.
+_MAX_FREE_REVIEW_EVIDENCE_DEFERRALS = 5
+
+
+@dataclass(frozen=True)
+class _PatchShortcut:
+    """Outcome of the mechanical-rebase shortcut.
+
+    An incomplete prior approval is not settled, but its old revision must
+    remain visible to rejection accounting when the normal review runs.
+    """
+
+    settled: bool = False
+    non_resetting_approval_commits: frozenset[str] = frozenset()
 
 
 def _pin_deferred(result) -> bool:
@@ -130,6 +152,7 @@ class ReviewWorkflow:
     # Consecutive pin-deferral streak per PR (daemon lifetime; a restart
     # resets it, and a permanently broken config re-earns it within minutes).
     _pin_deferrals: dict[int, int] = field(default_factory=dict)
+    _evidence_deferrals: dict[int, int] = field(default_factory=dict)
 
     def _trigger_label(self) -> Label:
         """The reviewer's trigger label as a domain Label. Both the default
@@ -276,6 +299,44 @@ class ReviewWorkflow:
             self._no_progress(p, f"pin deferral streak {n}")
         return True
 
+    def _evidence_deferral(self, p, reason: str) -> None:
+        """Defer a review whose approval evidence could not be read.
+
+        This happens before a paid leg, so a short GitHub outage gets a small
+        free retry window. The streak is journalled and bounded: persistent
+        unreadability feeds the existing unproductive-round breaker instead
+        of leaving the PR invisible forever.
+        """
+        n = self._evidence_deferrals.get(p.number, 0) + 1
+        self._evidence_deferrals[p.number] = n
+        self.cfg.log(
+            f"review #{p.number}: approval evidence unavailable ({reason}) — "
+            f"deferral {n} in a row"
+        )
+        if self.cfg.journal is not None:
+            try:
+                self.cfg.journal.emit(
+                    TelemetryEvent(
+                        TelemetryWarning(
+                            "review_exemption_evidence_deferred",
+                            f"review #{p.number}: {reason} — deferral {n} in a row",
+                            {
+                                "streak": n,
+                                "head": p.head_ref_oid,
+                                "reason": reason,
+                            },
+                        ),
+                        Correlation(pr=p.number),
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 — telemetry must not block
+                self.cfg.log(
+                    f"review #{p.number}: evidence deferral not journalled "
+                    f"({exc})"
+                )
+        if n > _MAX_FREE_REVIEW_EVIDENCE_DEFERRALS:
+            self._no_progress(p, f"approval evidence deferral streak {n}")
+
     async def _run_logged(self, label: str, pr: int, task, head_sha: str = ""):
         task = self._prepare_task(task, pr, head_sha)
         if isinstance(task, AgentResult):
@@ -363,14 +424,17 @@ class ReviewWorkflow:
         p = self.gateway.get_pr(pr)
         if not self._claim_matches(p, claim_target):
             return
-        if self._already_reviewed(p):
+        reconciled = self._already_reviewed(p, claim_target)
+        if reconciled is not False:
             return
+        non_resetting_approvals = self._non_resetting_approval_commits(p)
         if self.cfg.review_mode is review_dom.ReviewMode.MULTI:
             await self._review_multi(
                 pr,
                 round_number=1,
                 p=p,
                 claim_target=claim_target,
+                non_resetting_approval_commits=non_resetting_approvals,
             )
             return
         # SINGLE and DELEGATED share the submit-before-persist contract; they differ
@@ -396,7 +460,11 @@ class ReviewWorkflow:
                 as_untrusted(diff),
                 self.cfg.review,
             )
-        notice, declared_exemptions = self._exemption_grant_notice(p, diff)
+        exemption_request = self._exemption_grant_notice(p, diff)
+        if exemption_request is None:
+            self._evidence_deferral(p, "exemption declarations unreadable")
+            return
+        notice, declared_exemptions = exemption_request
         if notice:
             task = self._with_exemption_notice(task, notice, declared_exemptions)
         result = await self._run_logged("review", pr, task, p.head_ref_oid)
@@ -415,12 +483,19 @@ class ReviewWorkflow:
         # self-approval from a misconfigured identity), we must NOT record a session/
         # sha — otherwise the PR looks reviewed-once and never gets retried, with no
         # review on it. State advances only on a confirmed submit.
-        prior = review_dom.count_prior_rejections(p.reviews, self.cfg.review_bot)
+        prior = review_dom.count_prior_rejections(
+            p.reviews,
+            self.cfg.review_bot,
+            non_resetting_approval_commits=non_resetting_approvals,
+        )
+        grant_suffix = self._grant_suffix(
+            p, signature, result, declared_exemptions
+        )
         if not self._submit_review(
-            pr, p.head_ref_oid, result, 1, prior,
-            body_suffix=self._grant_suffix(
-                p, signature, result, declared_exemptions
-            ),
+            p, p.head_ref_oid, result, 1, prior,
+            patch_id=signature,
+            body_suffix=grant_suffix,
+            declared_exemptions=declared_exemptions,
         ):
             self._no_progress(p, "review POST failed")
             return
@@ -447,15 +522,23 @@ class ReviewWorkflow:
         p = self.gateway.get_pr(pr)
         if not self._claim_matches(p, claim_target):
             return
-        if self._already_reviewed(p):
+        reconciled = self._already_reviewed(p, claim_target)
+        if reconciled is not False:
             return
+        non_resetting_approvals = self._non_resetting_approval_commits(p)
         diff = self._revision_bound_diff(p)
         if diff is None:
             self._no_progress(p, "revision-bound diff unavailable")
             return
         signature = review_dom.patch_signature(diff)
-        if self._patch_unchanged(p, signature):
+        patch_shortcut = self._patch_unchanged(
+            p, diff, signature, claim_target
+        )
+        if patch_shortcut.settled:
             return
+        non_resetting_approvals |= (
+            patch_shortcut.non_resetting_approval_commits
+        )
         round_number = self.store.get_round(pr) + 1
         if self.cfg.review_mode is review_dom.ReviewMode.MULTI:
             await self._review_multi(
@@ -464,6 +547,7 @@ class ReviewWorkflow:
                 p=p,
                 diff=diff,
                 claim_target=claim_target,
+                non_resetting_approval_commits=non_resetting_approvals,
             )
             return
         last_sha = self.store.get_last_sha(pr)
@@ -507,7 +591,11 @@ class ReviewWorkflow:
                     as_untrusted(diff),
                     session_id, self.cfg.review,
                 )
-        notice, declared_exemptions = self._exemption_grant_notice(p, diff)
+        exemption_request = self._exemption_grant_notice(p, diff)
+        if exemption_request is None:
+            self._evidence_deferral(p, "exemption declarations unreadable")
+            return
+        notice, declared_exemptions = exemption_request
         if notice:
             task = self._with_exemption_notice(task, notice, declared_exemptions)
         result = await self._run_logged("re-review", pr, task, p.head_ref_oid)
@@ -525,12 +613,19 @@ class ReviewWorkflow:
             self._no_progress(p, f"agent error: {result.status or 'error'}")
             return
         # Submit first; advance sha/round only on a confirmed submit (see _review).
-        prior = review_dom.count_prior_rejections(p.reviews, self.cfg.review_bot)
+        prior = review_dom.count_prior_rejections(
+            p.reviews,
+            self.cfg.review_bot,
+            non_resetting_approval_commits=non_resetting_approvals,
+        )
+        grant_suffix = self._grant_suffix(
+            p, signature, result, declared_exemptions
+        )
         if not self._submit_review(
-            pr, p.head_ref_oid, result, round_number, prior,
-            body_suffix=self._grant_suffix(
-                p, signature, result, declared_exemptions
-            ),
+            p, p.head_ref_oid, result, round_number, prior,
+            patch_id=signature,
+            body_suffix=grant_suffix,
+            declared_exemptions=declared_exemptions,
         ):
             self._no_progress(p, "review POST failed")
             return
@@ -548,10 +643,42 @@ class ReviewWorkflow:
         self.store.set_round(pr, round_number)
         self._progress(p, claim_target)
 
-    def _already_reviewed(self, p) -> bool:
-        """Settle a retried dispatch when GitHub already has our verdict on HEAD."""
-        if not review_dom.reviewer_verdict_on_head(p, self.cfg.review_bot):
+    def _already_reviewed(
+        self, p, claim_target: int | None = None
+    ) -> bool | None:
+        """Settle a retried dispatch when GitHub has a usable verdict on HEAD.
+
+        True means settled, False means no usable verdict and the ordinary
+        review should run, and None means current evidence was unreadable so
+        this tick was explicitly deferred. An APPROVED review is usable only
+        when its authenticated grants cover every declaration derived from the
+        current revision; REQUEST_CHANGES already fails closed and needs no
+        grant validation.
+        """
+        latest = review_dom.latest_reviewer_verdict(p, self.cfg.review_bot)
+        if not latest or latest.commit_id != p.head_ref_oid:
             return False
+        if latest.state == "APPROVED":
+            diff = self._revision_bound_diff(p)
+            if diff is None:
+                self._evidence_deferral(
+                    p, "revision-bound diff unavailable for existing approval"
+                )
+                return None
+            complete = self._approval_grants_complete(p, diff)
+            if complete is None:
+                self._evidence_deferral(
+                    p, "exemption declarations unreadable for existing approval"
+                )
+                return None
+            if not complete:
+                self.cfg.log(
+                    f"review #{p.number}: existing approval on head "
+                    f"{p.head_ref_oid[:8]} lacks required authenticated grants "
+                    "— reviewing normally"
+                )
+                return False
+            self._record_patch(p.number, review_dom.patch_signature(diff))
         self.store.save_pr_session(
             p.number, self.store.get_pr_session(p.number) or _EXTERNAL_REVIEW_SESSION
         )
@@ -571,7 +698,58 @@ class ReviewWorkflow:
                     Correlation(pr=p.number),
                 )
             )
+        self._progress(p, claim_target)
         return True
+
+    def _approval_grants_complete(self, p, diff: str) -> bool | None:
+        """Whether existing approvals authorize every current declaration.
+
+        None is transient evidence failure, not an empty declaration set.
+        Grant syntax is aggregated across every reviewer-bot approval and then
+        MAC-, issue-, and patch-checked exactly as at merge. A later refusal or
+        omission does not revoke authority already granted for identical patch
+        content (ADR 0014).
+        """
+        request = self._exemption_grant_notice(p, diff)
+        if request is None:
+            return None
+        _notice, declarations = request
+        if not declarations:
+            return True
+        patch_id = review_dom.patch_signature(diff)
+        grants = tuple(
+            grant
+            for review in p.reviews
+            if review.state == "APPROVED"
+            and login_eq(review.author, self.cfg.review_bot)
+            for grant in parse_exemption_grants(review.body)
+        )
+        granted = authenticated_grant_pairs(
+            grants,
+            issue_number=issue_from_branch(p.head_ref_name),
+            patch_id=patch_id,
+            mac_key=self.cfg.exemption_mac_key,
+        )
+        return all(
+            (declaration.rule, declaration.subject) in granted
+            for declaration in declarations
+        )
+
+    def _non_resetting_approval_commits(self, p) -> frozenset[str]:
+        """Current approval commits known incomplete by `_already_reviewed`.
+
+        Call only after reconciliation returned False. A current-head approval
+        on that path was proven to lack aggregate authenticated grants; raw
+        GitHub APPROVED state must not erase unresolved prior rejections.
+        """
+        latest = review_dom.latest_reviewer_verdict(p, self.cfg.review_bot)
+        if (
+            latest is not None
+            and latest.state == "APPROVED"
+            and latest.commit_id == p.head_ref_oid
+        ):
+            return frozenset({p.head_ref_oid})
+        return frozenset()
 
     # ── rebase short-circuit (harness #2) ────────────────────────────────────
     def _record_patch(self, pr: int, signature: str) -> None:
@@ -587,9 +765,9 @@ class ReviewWorkflow:
         "tests-immutable": (
             "grant ONLY if the existing test encodes a wrong expectation "
             "(the test itself is the bug) and this diff corrects it without "
-            "weakening what the suite verifies; adding new tests never "
-            "needs a grant, and wholesale rewriting existing tests is "
-            "refused"
+            "weakening what the suite verifies; additive coverage belongs "
+            "in a new test file and does not justify modifying an existing "
+            "test file; wholesale rewriting existing tests is refused"
         ),
         "required-test": (
             "grant ONLY if this change GENUINELY cannot be covered by a "
@@ -600,7 +778,7 @@ class ReviewWorkflow:
 
     def _exemption_grant_notice(
         self, p, diff: str
-    ) -> tuple[str, tuple[ExemptionDeclaration, ...]]:
+    ) -> tuple[str, tuple[ExemptionDeclaration, ...]] | None:
         """ADR 0014: when the PR's commits declare gate exemptions, tell the
         reviewer to grant via the STRUCTURED `exemption_grants` field — never
         via body text. The harness renders the authenticated grant lines
@@ -609,9 +787,13 @@ class ReviewWorkflow:
         authority (round-2 adversarial review: string-matching grants out of
         prose survived fence-quoting tricks).
 
-        Returns (notice, declarations); ("", ()) when there are none or when
-        the branch resolves no issue (the merge rule would treat any grant
-        as unbindable).
+        Returns (notice, declarations); ("", ()) when there are none; None
+        when commit-message evidence is unreadable. That last state is not
+        declaration absence: a hidden `required-test` trailer would otherwise
+        produce an approved-but-unmergeable review. A branch with no issue
+        binding still returns its declarations: no grant can be minted for it,
+        so an approval must become REQUEST_CHANGES rather than repeat that
+        same dead end.
 
         tests-immutable subjects are AUTO-DECLARED from the same
         revision-checked diff being reviewed — the merge-side collector
@@ -638,9 +820,10 @@ class ReviewWorkflow:
             messages = self.gateway.pr_commit_messages(p.number)
         except Exception as exc:  # noqa: BLE001 — notice is an arm, not a gate
             self.cfg.log(
-                f"review #{p.number}: exemption trailers unreadable ({exc})"
+                f"review #{p.number}: exemption trailers unreadable ({exc}) — "
+                "deferring without a verdict"
             )
-            messages = ()
+            return None
         for message in messages:
             for declaration in parse_exemption_declarations(message):
                 if declaration.rule == RULE_REQUIRED_TEST:
@@ -654,8 +837,6 @@ class ReviewWorkflow:
         declared = dict(
             list(declared.items())[:MAX_DECLARATIONS_PER_CHANGE]
         )
-        if issue_from_branch(p.head_ref_name) is None:
-            return "", ()
         judgments = "\n".join(
             f"- `{rule}`: {self._EXEMPTION_JUDGMENT.get(rule, 'no guidance — refuse')}"
             for rule in {d.rule for d in declared}
@@ -817,8 +998,21 @@ class ReviewWorkflow:
             return None
         return evidence.text
 
-    def _patch_unchanged(self, p, signature: str) -> bool:
-        """True — and the skip is already committed — when the head SHA advanced
+    def _patch_unchanged(
+        self,
+        p,
+        diff: str,
+        signature: str,
+        claim_target: int | None = None,
+    ) -> _PatchShortcut:
+        """A settled shortcut when the head advanced but the patch did not.
+
+        `non_resetting_approval_commits` carries an incomplete approval on the
+        prior head into the normal review path. Without that evidence a
+        mechanical rebase would make the raw APPROVED verdict reset the live
+        rejection ceiling even though it never made the PR mergeable.
+
+        The skip is already committed when `settled` is true: the head SHA advanced
         but the PATCH did not: a rebase/amend whose diff against the base is
         identical modulo blob hashes and hunk offsets. The re-review could only
         reach the verdict already sitting on the PR, so the approval is carried
@@ -841,16 +1035,16 @@ class ReviewWorkflow:
             stored = self.store.get_last_patch_id(p.number)
         except Exception as exc:  # noqa: BLE001 — an unreadable cache means "review it"
             self.cfg.log(f"re-review #{p.number}: reviewed-patch id unreadable ({exc})")
-            return False
+            return _PatchShortcut()
         if not stored or stored != signature:
-            return False
+            return _PatchShortcut()
         try:
             prior_sha = self.store.get_last_sha(p.number)
         except Exception as exc:  # noqa: BLE001 — an unreadable cache means "review it"
             self.cfg.log(
                 f"re-review #{p.number}: reviewed revision unreadable ({exc})"
             )
-            return False
+            return _PatchShortcut()
         prior = review_dom.latest_reviewer_verdict(
             p, self.cfg.review_bot
         )
@@ -860,7 +1054,22 @@ class ReviewWorkflow:
             or not prior_sha
             or prior.commit_id != prior_sha
         ):
-            return False
+            return _PatchShortcut()
+        if prior.state == "APPROVED":
+            complete = self._approval_grants_complete(p, diff)
+            if complete is None:
+                self._evidence_deferral(
+                    p, "exemption declarations unreadable for unchanged patch"
+                )
+                return _PatchShortcut(settled=True)
+            if not complete:
+                self.cfg.log(
+                    f"re-review #{p.number}: unchanged prior approval lacks "
+                    "required authenticated grants — reviewing normally"
+                )
+                return _PatchShortcut(
+                    non_resetting_approval_commits=frozenset({prior_sha})
+                )
         event = {
             "APPROVED": "APPROVE",
             "CHANGES_REQUESTED": "REQUEST_CHANGES",
@@ -876,7 +1085,7 @@ class ReviewWorkflow:
                 f"re-review #{p.number}: unchanged patch verdict could not be "
                 "bound to the new head — reviewing normally"
             )
-            return False
+            return _PatchShortcut()
         try:
             self.store.set_last_sha(p.number, p.head_ref_oid)
         except Exception as exc:  # noqa: BLE001 — without this write the skip would repeat
@@ -885,13 +1094,14 @@ class ReviewWorkflow:
                 f"new head, but last-sha could not be advanced ({exc}) — "
                 "GitHub reconciliation will settle it next poll"
             )
-            return True
+            return _PatchShortcut(settled=True)
         self.cfg.log(
             f"re-review #{p.number}: head moved to {p.head_ref_oid[:8] or '?'} but the "
             "patch is unchanged (mechanical rebase) — copied the existing verdict "
             "to the new head, no review agent run"
         )
-        return True
+        self._progress(p, claim_target)
+        return _PatchShortcut(settled=True)
 
     async def _gather_legs(self, coros: list) -> list:
         """asyncio.gather that never lets one leg's exception abort the fan-out.
@@ -915,6 +1125,7 @@ class ReviewWorkflow:
         p=None,
         diff: str | None = None,
         claim_target: int | None = None,
+        non_resetting_approval_commits: frozenset[str] = frozenset(),
     ) -> None:
         """The /code-review pattern as dispatcher orchestration: skip-gate →
         parallel dimension specialists → per-finding adversarial validation →
@@ -944,7 +1155,11 @@ class ReviewWorkflow:
         # Escalation counts the reviewer's OWN prior rejections, not pushes (a
         # rebase that lands here without a prior REQUEST_CHANGES must not consume a
         # round). Derived from GitHub review state, robust across daemon restarts.
-        prior = review_dom.count_prior_rejections(p.reviews, self.cfg.review_bot)
+        prior = review_dom.count_prior_rejections(
+            p.reviews,
+            self.cfg.review_bot,
+            non_resetting_approval_commits=non_resetting_approval_commits,
+        )
 
         # 1. skip-gate — a pure doc/format/config diff short-circuits to APPROVE.
         gate = await self._run_logged("review-gate", pr, head_sha=p.head_ref_oid, task=
@@ -1117,6 +1332,7 @@ class ReviewWorkflow:
         # when a later dimension defers the round, and a pin-time reset would
         # let that loop evade the deferral bound forever.
         self._pin_deferrals.pop(p.number, None)
+        self._evidence_deferrals.pop(p.number, None)
         # A settled round no longer needs its pinned checkout; the next round
         # recreates one at the then-current head. Best-effort — a leftover
         # worktree is a directory, not a correctness hazard.
@@ -1143,12 +1359,14 @@ class ReviewWorkflow:
 
     def _submit_review(
         self,
-        pr: int,
+        p,
         expected_head: str,
         result,
         round_number: int,
         prior_rejections: int,
+        patch_id: str,
         body_suffix: str = "",
+        declared_exemptions: tuple[ExemptionDeclaration, ...] = (),
     ) -> bool:
         """Submit the verdict; return True iff the gh POST succeeded. On a failed
         submit, return False WITHOUT escalating/relabelling — the caller leaves state
@@ -1157,9 +1375,39 @@ class ReviewWorkflow:
         (the reviewer's own prior REQUEST_CHANGES count) drives the escalation
         ceiling. `body_suffix` is HARNESS-authored trusted text appended after
         the model's body — today the ADR 0014 grant lines from `_grant_suffix`,
-        the only place grant syntax is minted."""
+        the only place grant syntax is minted. `declared_exemptions` is the
+        revision-derived set the same review was asked to grant. Completeness
+        aggregates authenticated grants from every existing reviewer approval
+        plus the current suffix: ADR 0014 binds authority to patch content, so
+        a later omission cannot revoke an earlier valid grant for this patch."""
+        pr = p.number
+        grants = [
+            grant
+            for review in p.reviews
+            if review.state == "APPROVED"
+            and login_eq(review.author, self.cfg.review_bot)
+            for grant in parse_exemption_grants(review.body)
+        ]
+        grants.extend(parse_exemption_grants(body_suffix))
+        granted = authenticated_grant_pairs(
+            grants,
+            issue_number=issue_from_branch(p.head_ref_name),
+            patch_id=patch_id,
+            mac_key=self.cfg.exemption_mac_key,
+        )
+        ungranted = tuple(
+            (declaration.rule, declaration.subject)
+            for declaration in declared_exemptions
+            if (declaration.rule, declaration.subject) not in granted
+        )
+        # A partial grant cannot survive a REQUEST_CHANGES review: the merge
+        # collector intentionally trusts grant lines only in APPROVED reviews.
+        # Drop all newly minted lines on this round and require a complete set
+        # across existing approvals plus the next approval, rather than publishing
+        # authority-shaped text in a review whose actual event denies the patch.
+        effective_suffix = "" if ungranted else body_suffix
         body = result.field("body") or ""
-        if body_suffix:
+        if effective_suffix:
             # A model body ending inside an unclosed fence would swallow the
             # harness's grant lines and later escalate with a false "the
             # reviewer did not grant" (round-3 MINOR 7). Close it first.
@@ -1167,8 +1415,9 @@ class ReviewWorkflow:
             if dangling:
                 body += f"\n{dangling}"
         sub = review_dom.review_submission(
-            result.field("decision"), body + body_suffix,
+            result.field("decision"), body + effective_suffix,
             prior_rejections, self.cfg.max_review_rejections,
+            ungranted_exemptions=ungranted,
         )
         if not self.executor.submit_review(
             pr, sub.event, sub.body, expected_head

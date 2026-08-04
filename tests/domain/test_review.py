@@ -391,6 +391,41 @@ def test_count_prior_rejections_all_before_approve_is_zero():
     assert count_prior_rejections(reviews, "review-bot") == 0
 
 
+def test_incomplete_current_head_approval_does_not_reset_rejections():
+    reviews = (
+        Review(
+            state="CHANGES_REQUESTED",
+            author="review-bot",
+            submitted_at="t1",
+            commit_id="head",
+        ),
+        Review(
+            state="CHANGES_REQUESTED",
+            author="review-bot",
+            submitted_at="t2",
+            commit_id="head",
+        ),
+        Review(
+            state="CHANGES_REQUESTED",
+            author="review-bot",
+            submitted_at="t3",
+            commit_id="head",
+        ),
+        Review(
+            state="APPROVED",
+            author="review-bot",
+            submitted_at="t4",
+            commit_id="head",
+        ),
+    )
+
+    assert count_prior_rejections(
+        reviews,
+        "review-bot",
+        non_resetting_approval_commits=frozenset({"head"}),
+    ) == 3
+
+
 # ── review_submission: verdict → effect, with the rejection ceiling ───────────
 # The verdict under test is the (prior_rejections + 1)-th rejection; cap here is 4.
 def test_submission_approve_wins_even_at_ceiling():
@@ -398,6 +433,77 @@ def test_submission_approve_wins_even_at_ceiling():
     # prior rejection count.
     sub = review_submission("APPROVE", "lgtm", prior_rejections=3, max_rejections=4)
     assert sub.event == "APPROVE" and sub.escalate is False
+
+
+def test_submission_approval_without_required_grants_requests_changes():
+    sub = review_submission(
+        "APPROVE",
+        "No code findings; additive tests need no exemption.",
+        prior_rejections=0,
+        max_rejections=4,
+        ungranted_exemptions=(("tests-immutable", "tests/existing.spec.ts"),),
+    )
+
+    assert sub.event == "REQUEST_CHANGES"
+    assert sub.escalate is False
+    assert "not a mergeable approval" in sub.body
+    assert "`tests-immutable` for `tests/existing.spec.ts`" in sub.body
+    assert "additive coverage belongs in a new test file" in sub.body
+    assert "Reviewer rationale:" in sub.body
+
+
+def test_submission_ungranted_approval_obeys_rejection_ceiling():
+    sub = review_submission(
+        "APPROVE",
+        "refused",
+        prior_rejections=3,
+        max_rejections=4,
+        ungranted_exemptions=(("required-test", "*"),),
+    )
+
+    assert sub.event == "COMMENT"
+    assert sub.escalate is True
+    assert sub.escalate_cause == "ceiling"
+
+
+def test_submission_zero_disables_ceiling_for_ungranted_approval():
+    sub = review_submission(
+        "APPROVE",
+        "refused",
+        prior_rejections=10_000,
+        max_rejections=0,
+        ungranted_exemptions=(("required-test", "*"),),
+    )
+
+    assert sub.event == "REQUEST_CHANGES"
+    assert sub.escalate is False
+
+
+def test_submission_zero_disables_ceiling_for_ordinary_rejection():
+    sub = review_submission(
+        "REQUEST_CHANGES",
+        "still wrong",
+        prior_rejections=10_000,
+        max_rejections=0,
+    )
+
+    assert sub.event == "REQUEST_CHANGES"
+    assert sub.escalate is False
+
+
+def test_submission_deduplicates_ungranted_requests_and_allows_empty_body():
+    request = ("tests-immutable", "tests/existing.spec.ts")
+    sub = review_submission(
+        "APPROVE",
+        "",
+        prior_rejections=0,
+        max_rejections=4,
+        ungranted_exemptions=(request, request),
+    )
+
+    assert sub.event == "REQUEST_CHANGES"
+    assert sub.body.count("`tests-immutable` for `tests/existing.spec.ts`") == 1
+    assert "Reviewer rationale:" not in sub.body
 
 
 def test_submission_request_changes_below_ceiling_bounces_back():
@@ -685,6 +791,24 @@ def test_only_the_bots_change_requests_since_its_approve_still_count():
     assert [r.review_id for r in stale_rejections(reviews, "review-bot")] == ["3", "6"]
 
 
+def test_an_operator_held_pr_can_rearm_rejections_before_a_trailing_approval():
+    from issue_agent.domain.review import stale_rejections
+
+    reviews = (
+        _sub("1"),
+        _sub("2"),
+        _sub("3"),
+        _sub("4", state="APPROVED"),
+        _sub("5", state="COMMENTED"),
+    )
+    assert [
+        review.review_id
+        for review in stale_rejections(
+            reviews, "review-bot", trailing_approvals_reset=False
+        )
+    ] == ["1", "2", "3"]
+
+
 def test_an_already_dismissed_rejection_is_not_dismissed_again():
     from issue_agent.domain.review import stale_rejections
 
@@ -788,6 +912,32 @@ def test_a_pr_below_the_ceiling_is_never_re_escalated():
     assert _escalations(
         decide_review(world(prs=(below,)), CEILING_CFG, ReviewState())
     ) == []
+
+
+def test_an_incomplete_trailing_approval_does_not_hide_an_abandoned_ceiling():
+    abandoned = _abandoned_pr(escalation=False)
+    abandoned = replace(
+        abandoned,
+        reviews=abandoned.reviews
+        + (
+            Review(
+                "APPROVED",
+                "review-bot",
+                "2026-08-02T08:00Z",
+                commit_id="head1",
+            ),
+            Review(
+                "COMMENTED",
+                "review-bot",
+                "2026-08-02T09:00Z",
+                commit_id="head1",
+            ),
+        ),
+    )
+
+    assert len(
+        _escalations(decide_review(world(prs=(abandoned,)), CEILING_CFG, ReviewState()))
+    ) == 1
 
 
 def test_a_reviewer_that_has_not_given_up_on_this_head_still_gets_its_round():

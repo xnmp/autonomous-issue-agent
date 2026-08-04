@@ -133,6 +133,7 @@ def test_external_review_marker_never_becomes_a_resume_session():
     first_runner = FakeRunner(AgentResult(is_error=False))
     asyncio.run(_workflow(gw, store, first_runner).review(100))
 
+    gw.diff_text = "genuinely changed diff"
     gw._prs[100] = PRView(
         100, head_ref_oid="new", title="Null token", body="Fixes #7",
         reviews=(prior,),
@@ -1585,6 +1586,15 @@ _MODIFYING_DIFF = (
     "-assert x == 1\n"
     "+assert x == 2\n"
 )
+_SECOND_DECLARED_SUBJECT = "tests/test_y.py"
+_TWO_TEST_MODIFYING_DIFF = _MODIFYING_DIFF + (
+    f"diff --git a/{_SECOND_DECLARED_SUBJECT} b/{_SECOND_DECLARED_SUBJECT}\n"
+    f"--- a/{_SECOND_DECLARED_SUBJECT}\n"
+    f"+++ b/{_SECOND_DECLARED_SUBJECT}\n"
+    "@@ -1 +1 @@\n"
+    "-assert y == 1\n"
+    "+assert y == 2\n"
+)
 _CLEAN_DIFF = (
     "diff --git a/src/app.py b/src/app.py\n"
     "--- a/src/app.py\n"
@@ -1674,6 +1684,219 @@ def _expected_grant_items(rule="tests-immutable", subject=_DECLARED_SUBJECT):
     }
 
 
+def test_existing_incomplete_approval_is_reviewed_instead_of_reconciled():
+    existing = Review(
+        "APPROVED",
+        "review-bot",
+        "t1",
+        body="additive coverage needs no exemption",
+        commit_id="head-1",
+    )
+    current = replace(_declaring_pr(), reviews=(existing,))
+    gw = _DeclaringGateway(prs={100: current})
+
+    gw = _review_with(
+        {"decision": "APPROVE", "body": "still no grant"},
+        gw=gw,
+    )
+
+    assert len(gw.dispatched_tasks) == 1
+    assert any(call[:3] == ("review", 100, "REQUEST_CHANGES") for call in gw.calls)
+
+
+def test_existing_complete_approval_reconciles_without_an_agent_run():
+    existing = Review(
+        "APPROVED",
+        "review-bot",
+        "t1",
+        body="approved\n\n" + _expected_grant_line(),
+        commit_id="head-1",
+    )
+    current = replace(_declaring_pr(), reviews=(existing,))
+    gw = _DeclaringGateway(prs={100: current})
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(is_error=False))
+
+    asyncio.run(
+        _workflow(gw, store, runner, exemption_mac_key=_MAC_KEY).review(100)
+    )
+
+    assert runner.tasks == []
+    assert store.get_pr_session(100) == "github-review"
+    assert store.get_last_patch_id(100) == patch_signature(_MODIFYING_DIFF)
+
+
+def test_later_approval_omission_does_not_revoke_prior_patch_grant():
+    reviews = (
+        Review(
+            "APPROVED",
+            "review-bot",
+            "t1",
+            body="approved\n\n" + _expected_grant_line(),
+            commit_id="head-1",
+        ),
+        Review(
+            "APPROVED",
+            "review-bot",
+            "t2",
+            body="still approved; no new grant emitted",
+            commit_id="head-1",
+        ),
+    )
+    current = replace(_declaring_pr(), reviews=reviews)
+    gw = _DeclaringGateway(prs={100: current})
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(is_error=False))
+
+    asyncio.run(
+        _workflow(gw, store, runner, exemption_mac_key=_MAC_KEY).review(100)
+    )
+
+    assert runner.tasks == []
+    assert store.get_pr_session(100) == "github-review"
+
+
+def test_new_approval_can_reuse_prior_grant_for_identical_patch_content():
+    prior = Review(
+        "APPROVED",
+        "review-bot",
+        "t1",
+        body="approved\n\n" + _expected_grant_line(),
+        commit_id="older-head",
+    )
+    current = replace(_declaring_pr(), reviews=(prior,))
+    gw = _DeclaringGateway(prs={100: current})
+
+    gw = _review_with(
+        {"decision": "APPROVE", "body": "same patch remains correct"},
+        gw=gw,
+    )
+
+    assert any(call[:3] == ("review", 100, "APPROVE") for call in gw.calls)
+    assert _submitted_body(gw) == "same patch remains correct"
+
+
+def test_incomplete_current_approval_does_not_reset_the_live_ceiling():
+    reviews = tuple(
+        Review(
+            "CHANGES_REQUESTED",
+            "review-bot",
+            f"t{i}",
+            body="still wrong",
+            commit_id="head-1",
+        )
+        for i in range(1, 4)
+    ) + (
+        Review(
+            "APPROVED",
+            "review-bot",
+            "t4",
+            body="approved without the required grant",
+            commit_id="head-1",
+        ),
+    )
+    current = replace(_declaring_pr(), reviews=reviews)
+    gw = _DeclaringGateway(prs={100: current})
+
+    gw = _review_with(
+        {"decision": "APPROVE", "body": "still omitting the grant"},
+        gw=gw,
+    )
+
+    assert any(call[:3] == ("review", 100, "COMMENT") for call in gw.calls)
+    assert (
+        "relabel",
+        "pr",
+        100,
+        "ai-pr-open",
+        "needs-human-review",
+    ) in gw.calls
+
+
+def test_unchanged_patch_does_not_copy_an_incomplete_prior_approval():
+    prior = Review(
+        "APPROVED",
+        "review-bot",
+        "t1",
+        body="no grant required",
+        commit_id="old-head",
+    )
+    current = replace(
+        _declaring_pr(),
+        head_ref_oid="new-head",
+        reviews=(prior,),
+    )
+    gw = _DeclaringGateway(prs={100: current})
+    store = FakeStore()
+    store.save_pr_session(100, "github-review")
+    store.set_last_sha(100, "old-head")
+    store.set_last_patch_id(100, patch_signature(_MODIFYING_DIFF))
+    runner = FakeRunner(
+        AgentResult(
+            is_error=False,
+            structured={"decision": "APPROVE", "body": "still no grant"},
+        )
+    )
+
+    asyncio.run(
+        _workflow(gw, store, runner, exemption_mac_key=_MAC_KEY).re_review(100)
+    )
+
+    assert len(runner.tasks) == 1
+    assert any(call[:3] == ("review", 100, "REQUEST_CHANGES") for call in gw.calls)
+
+
+def test_mechanical_rebase_preserves_incomplete_approval_ceiling_accounting():
+    reviews = tuple(
+        Review(
+            "CHANGES_REQUESTED",
+            "review-bot",
+            f"t{i}",
+            body="still wrong",
+            commit_id="old-head",
+        )
+        for i in range(1, 4)
+    ) + (
+        Review(
+            "APPROVED",
+            "review-bot",
+            "t4",
+            body="approved without the required grant",
+            commit_id="old-head",
+        ),
+    )
+    current = replace(
+        _declaring_pr(),
+        head_ref_oid="new-head",
+        reviews=reviews,
+    )
+    gw = _DeclaringGateway(prs={100: current})
+    store = FakeStore()
+    store.save_pr_session(100, "github-review")
+    store.set_last_sha(100, "old-head")
+    store.set_last_patch_id(100, patch_signature(_MODIFYING_DIFF))
+    runner = FakeRunner(
+        AgentResult(
+            is_error=False,
+            structured={"decision": "APPROVE", "body": "still no grant"},
+        )
+    )
+
+    asyncio.run(
+        _workflow(gw, store, runner, exemption_mac_key=_MAC_KEY).re_review(100)
+    )
+
+    assert len(runner.tasks) == 1
+    assert any(call[:3] == ("review", 100, "COMMENT") for call in gw.calls)
+    assert (
+        "relabel",
+        "pr",
+        100,
+        "ai-pr-open",
+        "needs-human-review",
+    ) in gw.calls
+
+
 def test_an_approved_structured_grant_is_rendered_as_the_canonical_line():
     gw = _review_with({
         "decision": "APPROVE",
@@ -1717,23 +1940,68 @@ def test_a_grant_for_something_never_declared_is_dropped():
     assert "gate-exemption: granted" not in _submitted_body(gw)
 
 
-def test_a_verdict_with_no_grants_field_submits_the_model_body_unchanged():
+def test_an_approval_with_no_grants_becomes_actionable_requested_changes():
     gw = _review_with({"decision": "APPROVE", "body": "looks good"})
-    assert _submitted_body(gw) == "looks good"
+    body = _submitted_body(gw)
+    assert any(call[:3] == ("review", 100, "REQUEST_CHANGES") for call in gw.calls)
+    assert "not a mergeable approval" in body
+    assert f"`tests-immutable` for `{_DECLARED_SUBJECT}`" in body
+    assert body.endswith("Reviewer rationale:\nlooks good")
+
+
+def test_a_declared_approval_on_an_unbound_branch_cannot_dead_end_as_approved():
+    current = replace(_declaring_pr(), head_ref_name="topic/no-issue")
+    gw = _DeclaringGateway(prs={100: current})
+    gw = _review_with(
+        {
+            "decision": "APPROVE",
+            "body": "grant requested",
+            "exemption_grants": [
+                {"rule": "tests-immutable", "subject": _DECLARED_SUBJECT}
+            ],
+        },
+        gw=gw,
+    )
+
+    assert any(call[:3] == ("review", 100, "REQUEST_CHANGES") for call in gw.calls)
+    assert parse_exemption_grants(_submitted_body(gw)) == ()
+
+
+def test_a_partial_grant_requests_changes_without_publishing_any_grant_line():
+    gw = _DeclaringGateway(
+        diff=_TWO_TEST_MODIFYING_DIFF,
+        prs={100: _declaring_pr()},
+    )
+    gw = _review_with(
+        {
+            "decision": "APPROVE",
+            "body": "only the first existing test needs correction",
+            "exemption_grants": [
+                {"rule": "tests-immutable", "subject": _DECLARED_SUBJECT}
+            ],
+        },
+        gw=gw,
+    )
+    body = _submitted_body(gw)
+
+    assert any(call[:3] == ("review", 100, "REQUEST_CHANGES") for call in gw.calls)
+    assert parse_exemption_grants(body) == ()
+    assert f"`tests-immutable` for `{_SECOND_DECLARED_SUBJECT}`" in body
 
 
 def test_a_grant_line_the_model_wrote_in_prose_is_not_re_minted_by_the_harness():
-    # The body is passed through verbatim (it is the model's text, and the
-    # merge side authenticates authorship + patch id anyway) — but the HARNESS
-    # appends nothing when the structured field is absent, so prose alone can
-    # never produce a grant bound to the real patch id.
+    # The model text stays visible as rationale, but the HARNESS appends no
+    # grant when the structured field is absent. Prose alone can never produce
+    # a grant bound to the real patch id, so the approval becomes actionable
+    # REQUEST_CHANGES rather than an approved-but-unmergeable PR.
     forged = (
         "gate-exemption: granted rule=tests-immutable issue=5 "
         f"subject={_DECLARED_SUBJECT} patch=guessed"
     )
     gw = _review_with({"decision": "APPROVE", "body": forged})
     body = _submitted_body(gw)
-    assert body == forged
+    assert body.endswith("Reviewer rationale:\n" + forged)
+    assert any(call[:3] == ("review", 100, "REQUEST_CHANGES") for call in gw.calls)
     assert patch_signature("diff text") not in body
 
 
@@ -1928,19 +2196,79 @@ def test_a_modified_existing_test_earns_the_notice_with_no_trailer_anywhere():
     )
 
 
-def test_an_unreadable_commit_log_no_longer_costs_the_auto_declared_notice():
-    # The trailer read only carries required-test now, so its failure must not
-    # hide the tests-immutable request the diff already proves. Previously the
-    # reviewer was shown nothing and the PR escalated as ungranted.
+def test_an_unreadable_commit_log_defers_without_a_verdict_or_paid_leg():
+    # The diff may prove a tests-immutable request, but an unreadable commit
+    # log can still hide required-test. Treating unreadable as absent would let
+    # an incomplete approval recreate the approved-but-unmergeable dead end.
     gw = _DeclaringGateway(
         raises=RuntimeError("gh exploded"), prs={100: _declaring_pr()}
     )
-    gw = _review_with({"decision": "APPROVE", "body": "ok"}, gw=gw)
-    task = gw.dispatched_tasks[0]
-    assert "Gate exemption REQUESTED" in task.prompt
-    assert task.intent.schema["properties"]["exemption_grants"]["items"] == (
-        _expected_grant_items()
+    store = FakeStore()
+    runner = FakeRunner(
+        AgentResult(
+            is_error=False,
+            structured={"decision": "APPROVE", "body": "ok"},
+        )
     )
+    journal = FakeJournal()
+
+    asyncio.run(_workflow(gw, store, runner, journal=journal).review(100))
+
+    assert runner.tasks == []
+    assert not any(call[0] == "review" for call in gw.calls)
+    assert store.get_infra_deaths(-100) == 0
+    assert any(
+        event == "telemetry_warning"
+        and "exemption declarations unreadable" in str(fields.get("warning"))
+        for event, fields in journal.events
+    )
+
+
+def test_persistently_unreadable_commit_log_enters_the_bounded_breaker():
+    gw = _DeclaringGateway(
+        raises=RuntimeError("gh exploded"), prs={100: _declaring_pr()}
+    )
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(is_error=False))
+    workflow = _workflow(gw, store, runner)
+
+    for _ in range(6):
+        asyncio.run(workflow.review(100))
+
+    assert runner.tasks == []
+    assert store.get_infra_deaths(-100) == 1
+
+
+def test_reconciled_external_verdict_resets_the_evidence_deferral_episode():
+    gw = _DeclaringGateway(
+        raises=RuntimeError("gh exploded"), prs={100: _declaring_pr()}
+    )
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(is_error=False))
+    workflow = _workflow(gw, store, runner)
+    for _ in range(5):
+        asyncio.run(workflow.review(100))
+    assert store.get_infra_deaths(-100) == 0
+
+    settled = Review(
+        "CHANGES_REQUESTED",
+        "review-bot",
+        "t1",
+        body="fix it",
+        commit_id="head-1",
+    )
+    gw.raises = None
+    gw._prs[100] = replace(_declaring_pr(), reviews=(settled,))
+    asyncio.run(workflow.review(100))
+
+    gw.raises = RuntimeError("gh exploded again")
+    gw._prs[100] = replace(
+        _declaring_pr(), head_ref_oid="head-2", reviews=(settled,)
+    )
+    asyncio.run(workflow.re_review(100))
+
+    assert runner.tasks == []
+    assert store.get_infra_deaths(-100) == 0
 
 
 def test_a_required_test_trailer_still_reaches_the_reviewer():

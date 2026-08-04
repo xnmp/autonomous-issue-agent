@@ -22,6 +22,7 @@ from issue_agent.domain.exemptions import (
     ExemptionFacts,
     ExemptionGrant,
     MAX_DECLARATIONS_PER_CHANGE,
+    authenticated_grant_pairs,
     check_declaration_scope,
     count_malformed_declarations,
     declared_subjects,
@@ -304,6 +305,34 @@ def test_grant_parser_does_not_filter_by_rule():
 def test_grant_parser_is_total_on_junk_input():
     for junk in (None, 42, b"granted", ["x"], ""):
         assert parse_exemption_grants(junk) == ()
+
+
+def test_authenticated_grant_pairs_requires_issue_patch_and_matching_mac():
+    valid = signed_grant(RULE_TESTS_IMMUTABLE, 89, TEST_FILE, "abc123")
+    forged = signed_grant(
+        RULE_REQUIRED_TEST,
+        89,
+        SUBJECT_WHOLE_CHANGE,
+        "abc123",
+        key="attacker-key",
+    )
+
+    assert authenticated_grant_pairs(
+        (valid, forged),
+        issue_number=89,
+        patch_id="abc123",
+        mac_key=MAC_KEY,
+    ) == frozenset({(RULE_TESTS_IMMUTABLE, TEST_FILE)})
+    for issue, patch, key in (
+        (None, "abc123", MAC_KEY),
+        (89, "", MAC_KEY),
+        (89, "abc123", ""),
+        (90, "abc123", MAC_KEY),
+        (89, "different", MAC_KEY),
+    ):
+        assert authenticated_grant_pairs(
+            (valid,), issue_number=issue, patch_id=patch, mac_key=key
+        ) == frozenset()
 
 
 # ── declared_subjects ────────────────────────────────────────────────────────

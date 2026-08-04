@@ -776,6 +776,48 @@ def test_unblock_dismisses_the_change_requests_that_still_arm_the_ceiling(
     assert "re-arm" in dismissals[0][3]
 
 
+def test_unblock_rearms_a_held_pr_despite_a_trailing_approval(
+    monkeypatch, tmp_path
+):
+    backend, _dirs, calls = _unblock_backend(
+        monkeypatch,
+        tmp_path,
+        issue_labels=(),
+        pr_labels=("needs-human-review",),
+        hold_role="review",
+        reviews=(
+            _rejection("1"),
+            _rejection("2"),
+            _rejection("3"),
+            _rejection("4", state="APPROVED"),
+            _rejection("5", state="COMMENTED"),
+        ),
+    )
+
+    assert backend.unblock("demo", 7) == (True, "ok")
+    assert [call[2] for call in calls if call[0] == "dismiss"] == ["1", "2", "3"]
+
+
+def test_unrelated_pr_hold_preserves_rejections_satisfied_by_an_approval(
+    monkeypatch, tmp_path
+):
+    backend, _dirs, calls = _unblock_backend(
+        monkeypatch,
+        tmp_path,
+        issue_labels=(),
+        pr_labels=("needs-budget-review",),
+        reviews=(
+            _rejection("1"),
+            _rejection("2"),
+            _rejection("3"),
+            _rejection("4", state="APPROVED"),
+        ),
+    )
+
+    assert backend.unblock("demo", 7) == (True, "ok")
+    assert [call for call in calls if call[0] == "dismiss"] == []
+
+
 def test_review_dismissals_use_the_configured_review_identity(
     monkeypatch, tmp_path
 ):
