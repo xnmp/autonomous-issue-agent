@@ -396,15 +396,22 @@ def test_shutdown_reaps_killed_worker_before_final_spend_reconciliation():
     from issue_agent.domain.actions import AgentKind, RunAgent
 
     release = threading.Event()
+    worker_accounted = threading.Event()
     order = []
 
     def run_agent(_action):
         assert release.wait(timeout=5)
         order.append("worker_accounted")
+        worker_accounted.set()
 
     def kill():
         order.append("kill")
         release.set()
+
+    def finalize():
+        # Lifecycle replay cannot race the dispatch's final remote receipt.
+        assert worker_accounted.is_set()
+        order.append("persist")
 
     daemon = Daemon(
         "fix",
@@ -417,7 +424,7 @@ def test_shutdown_reaps_killed_worker_before_final_spend_reconciliation():
         poll_seconds=1,
         dispatch_capacity=1,
         shutdown_timeout_seconds=0.1,
-        finalize=lambda: order.append("persist"),
+        finalize=finalize,
         force_kill_dispatches=kill,
         terminalize=lambda: order.append("terminalize"),
     )
@@ -428,8 +435,131 @@ def test_shutdown_reaps_killed_worker_before_final_spend_reconciliation():
         max_ticks=1,
     )
 
-    assert order == ["persist", "kill", "worker_accounted", "terminalize"]
+    assert order == ["kill", "worker_accounted", "persist", "terminalize"]
     daemon.wait_for_dispatches()
+
+
+def test_shutdown_retry_finishes_cleanup_after_dispatch_owner_settles():
+    from issue_agent.domain.actions import AgentKind, RunAgent
+
+    started = threading.Event()
+    release = threading.Event()
+    settled = threading.Event()
+    finalized = []
+    terminalized = []
+
+    def run_agent(_action):
+        started.set()
+        assert release.wait(timeout=5)
+        settled.set()
+
+    def kill_then_settle_after_first_wait():
+        threading.Timer(0.04, release.set).start()
+
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _world: [RunAgent(AgentKind.RESOLVE, 7)],
+        Executor(FakeGateway(), run_agent=run_agent),
+        dispatch_capacity=1,
+        shutdown_timeout_seconds=0.2,
+        force_kill_dispatches=kill_then_settle_after_first_wait,
+        finalize=lambda: finalized.append("finalized"),
+        terminalize=lambda: terminalized.append("terminalized"),
+    )
+    daemon.tick()
+    assert started.wait(timeout=1)
+
+    assert daemon.shutdown_dispatches(cancel=False) is False
+    assert settled.wait(timeout=1)
+    daemon.wait_for_dispatches()
+    assert daemon.shutdown_dispatches(cancel=False) is True
+
+    assert finalized == ["finalized"]
+    assert terminalized == ["terminalized"]
+
+
+def test_timed_out_finalizer_never_overlaps_terminalization():
+    from issue_agent.domain.actions import AgentKind, RunAgent
+
+    started = threading.Event()
+    release_dispatch = threading.Event()
+    finalizer_started = threading.Event()
+    release_finalizer = threading.Event()
+    terminalized = threading.Event()
+
+    def run_agent(_action):
+        started.set()
+        assert release_dispatch.wait(timeout=5)
+
+    def finalize():
+        finalizer_started.set()
+        assert release_finalizer.wait(timeout=5)
+
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _world: [RunAgent(AgentKind.RESOLVE, 7)],
+        Executor(FakeGateway(), run_agent=run_agent),
+        dispatch_capacity=1,
+        shutdown_timeout_seconds=0.2,
+        force_kill_dispatches=release_dispatch.set,
+        finalize=finalize,
+        terminalize=terminalized.set,
+    )
+    daemon.tick()
+    assert started.wait(timeout=1)
+
+    assert daemon.shutdown_dispatches(cancel=True) is False
+
+    assert finalizer_started.is_set()
+    assert not terminalized.is_set()
+    release_finalizer.set()
+    daemon.wait_for_dispatches()
+
+
+def test_concurrent_shutdown_retry_cannot_pass_running_finalizer():
+    finalizer_started = threading.Event()
+    release_finalizer = threading.Event()
+    terminalized = threading.Event()
+    first_done = threading.Event()
+    second_done = threading.Event()
+    results = []
+
+    def finalize():
+        finalizer_started.set()
+        assert release_finalizer.wait(timeout=5)
+
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        lambda _world: [],
+        Executor(FakeGateway()),
+        dispatch_capacity=1,
+        shutdown_timeout_seconds=0.1,
+        finalize=finalize,
+        terminalize=terminalized.set,
+    )
+
+    def shut_down(done):
+        results.append(daemon.shutdown_dispatches(cancel=True))
+        done.set()
+
+    first = threading.Thread(target=shut_down, args=(first_done,))
+    second = threading.Thread(target=shut_down, args=(second_done,))
+    first.start()
+    assert finalizer_started.wait(timeout=1)
+    second.start()
+
+    assert not second_done.wait(timeout=0.02)
+    assert first_done.wait(timeout=1)
+    assert second_done.wait(timeout=1)
+    assert results == [False, False]
+    assert not terminalized.is_set()
+
+    release_finalizer.set()
+    first.join(timeout=1)
+    second.join(timeout=1)
 
 
 def test_shutdown_deadline_preserves_indeterminate_spend_for_boot_recovery(
@@ -503,11 +633,11 @@ def test_shutdown_deadline_preserves_indeterminate_spend_for_boot_recovery(
         poll_seconds=1,
         dispatch_capacity=1,
         shutdown_timeout_seconds=0.1,
-        force_kill_dispatches=lambda: None,
-        terminalize=lambda: control.record_owned_cancellation_intents(
+        prepare_shutdown=lambda: control.record_owned_cancellation_intents(
             "o/r:fix",
             "shutdown_deadline_spend_unknown",
         ),
+        force_kill_dispatches=lambda: None,
     )
 
     with pytest.raises(SystemExit):
@@ -765,6 +895,68 @@ def test_run_forever_warns_on_suspend_stall():
     times = iter([0, 100_000, 100_060])
     d.run_forever(sleep=lambda s: None, now=lambda: next(times), max_ticks=2)
     assert any("suspended/stalled" in m for m in logs)
+
+
+def test_suspend_recovery_waits_for_active_dispatch_owner():
+    from issue_agent.domain.actions import AgentKind, RunAgent
+
+    started = threading.Event()
+    release = threading.Event()
+    settled = threading.Event()
+    recoveries = []
+    started_actions = []
+    decisions = 0
+
+    def decide(_world):
+        nonlocal decisions
+        decisions += 1
+        if decisions == 1:
+            return [RunAgent(AgentKind.RESOLVE, 7)]
+        if decisions == 2:
+            assert daemon.active_dispatches == ()
+            assert daemon.available_dispatch_slots == 0
+            return [RunAgent(AgentKind.RESOLVE, 8)]
+        return []
+
+    def run_agent(action):
+        started_actions.append(action.number)
+        started.set()
+        assert release.wait(timeout=5)
+        settled.set()
+
+    def log(message):
+        if "wake recovery deferred" in message:
+            release.set()
+            assert settled.wait(timeout=1)
+            daemon.wait_for_dispatches()
+
+    daemon = Daemon(
+        "fix",
+        lambda: WorldState(),
+        decide,
+        Executor(FakeGateway(), run_agent=run_agent),
+        poll_seconds=60,
+        dispatch_capacity=1,
+        log=log,
+    )
+
+    def reconcile(trigger):
+        assert daemon.active_dispatches == ()
+        recoveries.append(trigger)
+
+    daemon.reconcile = reconcile
+    wall_times = iter([0, 0, 240, 300])
+    active_times = iter([0, 0, 60, 120])
+    daemon.run_forever(
+        sleep=lambda _seconds: None,
+        now=lambda: next(wall_times),
+        active_now=lambda: next(active_times),
+        max_ticks=3,
+    )
+
+    assert started.is_set()
+    assert started_actions == [7]
+    assert recoveries == [RecoveryTrigger.WAKE]
 
 
 def test_suspend_recovery_never_replays_actions_from_telemetry(tmp_path):

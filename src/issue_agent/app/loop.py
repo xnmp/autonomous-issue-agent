@@ -151,6 +151,9 @@ class Daemon:
     _dispatch_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
     )
+    _shutdown_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
     _dispatches: dict[Future[None], tuple[RunAgent, Hashable]] = field(
         default_factory=dict, init=False, repr=False
     )
@@ -161,10 +164,14 @@ class Daemon:
     _requires_hard_exit: bool = field(default=False, init=False, repr=False)
     _shutdown_prepared: bool = field(default=False, init=False, repr=False)
     _shutdown_prepare_clean: bool = field(default=True, init=False, repr=False)
+    _shutdown_terminalization_required: bool = field(
+        default=False, init=False, repr=False
+    )
     _finalized: bool = field(default=False, init=False, repr=False)
     _finalize_clean: bool = field(default=True, init=False, repr=False)
     _terminalized: bool = field(default=False, init=False, repr=False)
     _terminalize_clean: bool = field(default=True, init=False, repr=False)
+    _wake_recovery_pending: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.dispatch_capacity < 0:
@@ -255,14 +262,18 @@ class Daemon:
     def available_dispatch_slots(self) -> int:
         """Capacity visible to the decision layer.
 
-        A pending hot reload closes admission while existing work drains, so
-        the domain never emits a claim relabel for work this process will not
-        start.
+        Pending recovery or hot reload closes admission while existing work
+        drains, so the domain never emits a claim relabel for work this process
+        will not start.
         """
         if self._dispatch_pool is None:
             return 1
         with self._dispatch_lock:
-            if not self._accept_dispatches or self._dispatch_closed:
+            if (
+                not self._accept_dispatches
+                or self._dispatch_closed
+                or self._wake_recovery_pending
+            ):
                 return 0
             return max(0, self.dispatch_capacity - len(self._dispatches))
 
@@ -290,6 +301,7 @@ class Daemon:
             if (
                 not self._accept_dispatches
                 or self._dispatch_closed
+                or self._wake_recovery_pending
                 or len(self._dispatches) >= self.dispatch_capacity
                 or key in active_keys
             ):
@@ -328,21 +340,28 @@ class Daemon:
         tidying: without cancellation Ctrl-C leaves the child agent session
         alive and interpreter shutdown waits for its worker indefinitely.
         """
+        with self._shutdown_lock:
+            return self._shutdown_dispatches(cancel=cancel)
+
+    def _shutdown_dispatches(self, *, cancel: bool) -> bool:
         pool = self._dispatch_pool
         if pool is None:
             return self._finalize()
+        self._shutdown_terminalization_required |= cancel
         if self._shutdown_deadline is None:
             self._shutdown_deadline = (
                 time.monotonic() + self.shutdown_timeout_seconds
             )
         with self._dispatch_lock:
             if self._dispatch_closed:
-                return not self._dispatches
+                pending = tuple(self._dispatches)
+                if pending:
+                    return False
+                return self._finish_shutdown()
             self._dispatch_closed = True
             self._accept_dispatches = False
-        prepared = True
         if cancel:
-            prepared = self._prepare_shutdown()
+            self._prepare_shutdown()
         if cancel and self.cancel_active_dispatches is not None:
             try:
                 self.cancel_active_dispatches()
@@ -364,57 +383,75 @@ class Daemon:
                 f"{self.name}: shutdown deadline expired with "
                 f"{len(unfinished)} dispatch(es) still active"
             )
-            # Persist/reconcile already-started effects before destroying the
-            # process groups that may be carrying their final acknowledgements.
-            finalized = self._finalize(
-                reserve_seconds=min(
-                    _SHUTDOWN_FINALIZE_RESERVE_SECONDS,
-                    self.shutdown_timeout_seconds * 0.2,
-                )
+            self._shutdown_terminalization_required = True
+            # Persist cancellation intent before teardown, but do not replay
+            # lifecycle commands while the dispatch that owns them can still
+            # be applying or receipting the same remote effect.
+            self._prepare_shutdown()
+            finalize_reserve = min(
+                _SHUTDOWN_FINALIZE_RESERVE_SECONDS,
+                self.shutdown_timeout_seconds * 0.2,
             )
+            terminalize_reserve = min(
+                _SHUTDOWN_TERMINALIZE_RESERVE_SECONDS,
+                self.shutdown_timeout_seconds * 0.2,
+            )
+            finalized = False
+            terminalized = False
             if self.force_kill_dispatches is not None:
-                terminalize_reserve = min(
-                    _SHUTDOWN_TERMINALIZE_RESERVE_SECONDS,
-                    self.shutdown_timeout_seconds * 0.2,
-                )
                 killed = self._bounded_shutdown_call(
                     self.force_kill_dispatches,
                     "forced process teardown",
                     max_seconds=max(
                         0.0,
                         self._remaining_shutdown_time()
+                        - finalize_reserve
                         - terminalize_reserve,
                     ),
                 )
                 if killed:
                     # A killed provider flushes its final rollout evidence while
-                    # the worker unwinds. Let that worker settle first, then run
-                    # the durable reconciliation backstop before any hard exit.
+                    # the worker unwinds. The worker must settle before either
+                    # lifecycle replay or spend reconciliation: both consume
+                    # state the dispatch is still authorized to write.
                     _done, unfinished = wait(
                         unfinished,
                         timeout=max(
                             0.0,
                             self._remaining_shutdown_time()
+                            - finalize_reserve
                             - terminalize_reserve,
                         ),
                     )
-                    terminalized = self._terminalize()
-                    if unfinished:
-                        _done, unfinished = wait(
-                            unfinished,
-                            timeout=self._remaining_shutdown_time(),
+                    if not unfinished:
+                        finalized = self._finalize(
+                            reserve_seconds=terminalize_reserve,
                         )
-                else:
-                    terminalized = False
-            else:
-                terminalized = False
+                        terminalized = (
+                            self._terminalize() if finalized else False
+                        )
         else:
             finalized = self._finalize()
-            terminalized = self._terminalize() if cancel else True
+            terminalized = (
+                self._terminalize()
+                if self._shutdown_terminalization_required and finalized
+                else not self._shutdown_terminalization_required
+            )
         pool.shutdown(wait=False, cancel_futures=cancel)
         if unfinished:
             return False
-        return prepared and finalized and terminalized
+        return self._shutdown_prepare_clean and finalized and terminalized
+
+    def _finish_shutdown(self) -> bool:
+        """Finish deferred cleanup after every dispatch owner has settled."""
+
+        finalized = self._finalize()
+        terminalized = (
+            self._terminalize()
+            if self._shutdown_terminalization_required and finalized
+            else not self._shutdown_terminalization_required
+        )
+        return self._shutdown_prepare_clean and finalized and terminalized
 
     def _remaining_shutdown_time(self) -> float:
         if self._shutdown_deadline is None:
@@ -504,6 +541,22 @@ class Daemon:
             if self.journal is not None:
                 self.journal.emit(TelemetryEvent(TickGated(reason)))
         return True
+
+    def _reconcile_wake(self) -> None:
+        """Run wake recovery only after live dispatch owners have settled."""
+
+        if self.reconcile is None:
+            return
+        if self.active_dispatches:
+            if not self._wake_recovery_pending:
+                self.log(
+                    f"{self.name}: wake recovery deferred until active "
+                    "dispatches settle"
+                )
+            self._wake_recovery_pending = True
+            return
+        self.reconcile(RecoveryTrigger.WAKE)
+        self._wake_recovery_pending = False
 
     def tick(
         self,
@@ -611,7 +664,7 @@ class Daemon:
                         self.log(
                             f"{self.name}: dispatch {action.kind.name} "
                             f"#{action.number} not submitted — slot full, "
-                            "duplicate target, or hot reload draining"
+                            "duplicate target, or recovery/reload draining"
                         )
                 else:
                     taken.append(action)
@@ -661,6 +714,8 @@ class Daemon:
             while max_ticks is None or ticks < max_ticks:
                 cur = now()
                 cur_active = active_now()
+                if self._wake_recovery_pending:
+                    self._reconcile_wake()
                 elapsed = cur - last
                 active_elapsed = cur_active - last_active
                 previous = last
@@ -709,8 +764,7 @@ class Daemon:
                                 )
                             )
                         )
-                    if self.reconcile is not None:
-                        self.reconcile(RecoveryTrigger.WAKE)
+                    self._reconcile_wake()
                     last_logged = cur
                 elif cur - last_logged >= heartbeat_seconds:
                     self.log(f"{self.name}: ♥ alive (poll {self.poll_seconds}s)")
