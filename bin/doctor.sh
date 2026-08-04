@@ -179,6 +179,10 @@ if [ -d "$_REPOS_DIR" ] && compgen -G "$_REPOS_DIR/*.env" >/dev/null 2>&1; then
     # per-repo overlay) in an isolated subshell, so nothing here leaks into
     # doctor's own environment or the next overlay's resolution.
     _vals="$(
+      # point-at invokes doctor after exporting the active snapshot. Missing
+      # keys in another overlay must resolve from shared/defaults, not inherit
+      # that active deployment's state directories.
+      unset REPO STATE_DIR REVIEW_STATE_DIR STEWARD_STATE_DIR
       set -a
       [ -f "$HARNESS_ROOT/config/shared.env" ] && . "$HARNESS_ROOT/config/shared.env"
       . "$_ov"

@@ -723,6 +723,39 @@ def test_doctor_passes_when_overlays_have_distinct_state_dirs(tmp_path):
     assert "no state-dir collisions across 2 overlay(s)" in result.stdout
 
 
+def test_doctor_state_dir_scan_ignores_active_overlay_environment(tmp_path):
+    """The scan must compose each overlay from files, not the active config.
+
+    ``doctor.sh`` is normally invoked after point-at has sourced the active
+    overlay. An older overlay that omits explicit state directories must still
+    receive its repository-derived defaults rather than inherit the active
+    deployment's exported values.
+    """
+    fake_bin = _fake_tool_path(tmp_path)
+    harness = tmp_path / "harness"
+    repos_dir = harness / "config" / "repos"
+    repos_dir.mkdir(parents=True)
+    (repos_dir / "older.env").write_text('REPO="acme/widget"\n')
+    (repos_dir / "active.env").write_text(
+        'REPO="other/thing"\n'
+        'STATE_DIR="/active/fix"\n'
+        'REVIEW_STATE_DIR="/active/review"\n'
+        'STEWARD_STATE_DIR="/active/steward"\n'
+    )
+
+    result = _run_doctor({
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+        "HARNESS_ROOT": str(harness),
+        "REPO": "other/thing",
+        "STATE_DIR": "/active/fix",
+        "REVIEW_STATE_DIR": "/active/review",
+        "STEWARD_STATE_DIR": "/active/steward",
+    })
+
+    assert "state-dir collision:" not in result.stdout
+    assert "no state-dir collisions across 2 overlay(s)" in result.stdout
+
+
 def test_doctor_skips_state_dir_check_with_no_overlays(tmp_path):
     fake_bin = _fake_tool_path(tmp_path)
     harness = tmp_path / "harness"
