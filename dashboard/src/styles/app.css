@@ -1163,7 +1163,13 @@
   display: flex;
   flex-direction: column;
   gap: var(--s2);
-  max-width: calc(100vw - 300px);
+  /* The 300px desktop rail allowance collapses to almost nothing on a phone.
+   * Keep enough width to reach the nested horizontal scrollbar, without ever
+   * demanding more than the viewport itself can provide. */
+  max-width: max(
+    calc(100vw - 300px),
+    min(280px, calc(100vw - 2 * var(--s3)))
+  );
   padding: var(--s3);
   background: var(--bg);
 }
@@ -1191,7 +1197,8 @@
   font-size: var(--fs-xs);
   font-weight: 600;
 }
-/* One task per line, in order: the expansion is a story, not a ledger. */
+/* Done issues retain the prose-first story; active/blocked issues use the
+ * timestamp ledger below because operators scan those for recency and spend. */
 .task-story {
   display: flex;
   flex-direction: column;
@@ -1208,6 +1215,62 @@
   padding: var(--s1) var(--s2);
   border-radius: var(--radius-sm);
   background: var(--panel);
+}
+.task-story-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+}
+.task-story-table {
+  width: 100%;
+  min-width: 520px;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+.task-story-table th,
+.task-story-table td {
+  padding: var(--s2) var(--s3);
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.task-story-table th {
+  color: var(--ink-muted);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  position: static;
+  z-index: auto;
+  text-align: left;
+}
+.task-story-table th:first-child,
+.task-story-table td:first-child {
+  width: 68%;
+}
+.task-story-table th:nth-child(2),
+.task-story-table td:nth-child(2) {
+  width: 14%;
+}
+.task-story-table th:nth-child(3),
+.task-story-table td:nth-child(3) {
+  width: 18%;
+}
+.task-story-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+.task-story-context {
+  border-left: 2px solid transparent;
+}
+.task-story-when,
+.task-story-event {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s2);
+  min-width: 0;
+}
+.task-story-when {
+  margin-bottom: var(--s1);
+  color: var(--ink-muted);
+  font-size: var(--fs-xs);
 }
 .task-note {
   min-width: 0;
@@ -1797,5 +1860,29 @@
   }
   .title-cell {
     max-width: 240px;
+  }
+}
+@media (max-width: 480px) {
+  .task-story-table {
+    min-width: 0;
+  }
+  .task-story-table th,
+  .task-story-table td {
+    padding: var(--s1) var(--s2);
+  }
+  .task-story-table th:first-child,
+  .task-story-table td:first-child {
+    width: 54%;
+  }
+  .task-story-table th:nth-child(2),
+  .task-story-table td:nth-child(2) {
+    width: 23%;
+  }
+  .task-story-table th:nth-child(3),
+  .task-story-table td:nth-child(3) {
+    width: 23%;
+  }
+  .task-story-event {
+    flex-wrap: wrap;
   }
 }

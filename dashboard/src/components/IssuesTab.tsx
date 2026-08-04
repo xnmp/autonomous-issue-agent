@@ -462,6 +462,7 @@ function InFlightTable({
                     colSpan={columns.length}
                     onOpen={() => onOpen(card.issue)}
                     onRefresh={onRefresh}
+                    tabular
                   />
                 ) : null}
               </Fragment>
@@ -983,12 +984,14 @@ function TaskDetailRow({
   colSpan,
   onOpen,
   onRefresh,
+  tabular = false,
 }: {
   repo: string;
   card: IssueCard;
   colSpan: number;
   onOpen: () => void;
   onRefresh: () => void;
+  tabular?: boolean;
 }) {
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -1072,12 +1075,15 @@ function TaskDetailRow({
           {card.escalation_reason ? (
             <div className="task-escalation">{card.escalation_reason}</div>
           ) : null}
-          {steps !== null && steps.length > 0 ? (
+          {tabular && (steps ?? card.steps).length > 0 ? (
+            <TaskStoryTable issue={card.issue} steps={steps ?? card.steps} />
+          ) : null}
+          {!tabular && steps !== null && steps.length > 0 ? (
             <ol className="task-story">
               {steps.map((step) => <TaskStoryLine key={step.idx} step={step} />)}
             </ol>
           ) : null}
-          {steps === null && card.steps.length > 0 ? (
+          {!tabular && steps === null && card.steps.length > 0 ? (
             <ol className="task-story">
               {card.steps.map((step, index) => (
                 <TaskStoryLine key={`${step.kind}-${index}`} step={step} />
@@ -1100,6 +1106,73 @@ function TaskDetailRow({
       </td>
     </tr>
     );
+}
+
+/**
+ * Blocked and live rows are operational queues, so their expansion optimises
+ * for scanning when work happened, what it cost, and how old it is. The task
+ * identity and note stay with the timestamp rather than consuming a fourth
+ * column and squeezing the two numeric fields off narrow screens.
+ */
+function TaskStoryTable({
+  issue,
+  steps,
+}: {
+  issue: number;
+  steps: (CardStep | IssueStep)[];
+}) {
+  const nowMs = useNow(60_000);
+  return (
+    <div className="task-story-table-wrap">
+      <table className="task-story-table" aria-label={`Issue #${issue} task history`}>
+        <thead>
+          <tr>
+            <th scope="col">Time</th>
+            <th scope="col" className="r">Cost</th>
+            <th scope="col" className="r">Time since</th>
+          </tr>
+        </thead>
+        <tbody>
+          {steps.map((step, index) => {
+            const ts = stepTimestamp(step);
+            const tone = stateTone(step.state);
+            const note = stepNote(step);
+            const took = stepDuration(step);
+            const rawIndex = (step as { idx?: unknown }).idx;
+            const key = typeof rawIndex === "number" ? rawIndex : `${step.kind}-${index}`;
+            return (
+              <tr key={key}>
+                <td className={`task-story-context tone-border-${tone}`}>
+                  <div className="task-story-when">
+                    <time dateTime={ts ?? undefined}>{localTime(ts)}</time>
+                    {took !== null ? (
+                      <span className="faint" title="task wall time">took {duration(took)}</span>
+                    ) : null}
+                  </div>
+                  <div className="task-story-event">
+                    <Chip
+                      tone={stepKindTone(step.kind, step.state)}
+                      square
+                      pulse={step.state === "running"}
+                      title={step.kind}
+                    >
+                      {taskName(step)}
+                    </Chip>
+                    {step.state === "ok" || step.state === "done" ? null : (
+                      <span className={`task-state tone-${tone}`}>{step.state}</span>
+                    )}
+                    {note ? <span className="task-note" title={note}>{note}</span> : null}
+                  </div>
+                </td>
+                <td className="r mono nowrap">{usd(step.cost_usd)}</td>
+                <td className="r mono nowrap">{timeSince(ts, nowMs)}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
 }
 
 /** One task, one line. `note` is the payload; everything else is context. */
@@ -1143,6 +1216,17 @@ function stepNote(step: CardStep | IssueStep): string | null {
 function stepDuration(step: CardStep | IssueStep): number | null {
   const value = (step as { duration_s?: unknown }).duration_s;
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+/** Card summaries have no timestamp; detailed rows do. */
+function stepTimestamp(step: CardStep | IssueStep): string | null {
+  const value = (step as { ts?: unknown }).ts;
+  return typeof value === "string" && parseTs(value) !== null ? value : null;
+}
+
+function timeSince(ts: string | null, nowMs: number): string {
+  const at = parseTs(ts);
+  return at === null ? ageCompact(null) : ageCompact(Math.max(0, (nowMs - at) / 1000));
 }
 
 function taskName(step: CardStep | IssueStep): string {

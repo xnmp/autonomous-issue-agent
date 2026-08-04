@@ -53,7 +53,7 @@ function polled(data: IssuesPayload): Polled<IssuesPayload> {
 describe("IssuesTab", () => {
   it("expands done rows before opening the full issue and hides rounds by default", async () => {
     const onOpenIssue = vi.fn();
-    render(
+    const { container } = render(
       <IssuesTab
         repo="demo"
         sub="done"
@@ -83,6 +83,8 @@ describe("IssuesTab", () => {
     await userEvent.click(row);
     expect(onOpenIssue).not.toHaveBeenCalled();
     expect(screen.getByText("resolve")).toBeVisible();
+    expect(container.querySelector("ol.task-story")).toBeVisible();
+    expect(screen.queryByRole("table", { name: /task history/ })).not.toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "Open full issue" }));
     expect(onOpenIssue).toHaveBeenCalledWith(50);

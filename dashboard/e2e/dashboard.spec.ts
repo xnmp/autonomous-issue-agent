@@ -215,6 +215,20 @@ async function mockApi(page: Page, reposDelayMs = 0) {
       });
     }
     if (path === "/api/repos/self/issues/50") return json(route, issue);
+    if (path === "/api/repos/self/issues/49")
+      return json(route, {
+        ...issue,
+        issue: 49,
+        title: "Exercise model wrapping",
+        stage: "reviewing",
+        done: false,
+        prs: [74],
+        pull_requests: [{
+          number: 74,
+          url: "https://github.com/openai/autonomous-issue-agent/pull/74",
+          state: "open",
+        }],
+      });
     if (path === "/api/repos/self/issues/50/steps/0/events")
       return json(route, {
         events: [{
@@ -572,4 +586,32 @@ test("the rail never covers the board at the viewport widths browser zoom produc
       `the page scrolls sideways at a ${width}px viewport`,
     ).toBeLessThanOrEqual(0);
   }
+});
+
+test("the in-flight history remains usable at a phone-width viewport", async ({ page }) => {
+  await mockApi(page);
+  await page.setViewportSize({ width: 320, height: 700 });
+  await page.goto("/#/repo/self/issues/inflight");
+  await page.getByRole("button", { name: "Collapse sidebar" }).click();
+  await page.getByRole("row", { name: /Exercise model wrapping/ }).click();
+
+  const history = page.getByRole("table", { name: "Issue #49 task history" });
+  await expect(history).toBeVisible();
+  const headers = history.getByRole("columnheader");
+  await expect(headers).toHaveCount(3);
+  for (const header of await headers.all()) {
+    const bounds = await header.boundingBox();
+    expect(bounds).not.toBeNull();
+    expect(bounds!.x).toBeGreaterThanOrEqual(0);
+    expect(bounds!.x + bounds!.width).toBeLessThanOrEqual(320);
+  }
+  const scroller = page.locator(".task-story-table-wrap");
+  const dimensions = await scroller.evaluate((element) => ({
+    clientWidth: element.clientWidth,
+    scrollWidth: element.scrollWidth,
+  }));
+  expect(dimensions.clientWidth).toBeGreaterThanOrEqual(240);
+  // Intrinsic monospace widths may leave a few pixels of scroll, but a return
+  // to the old 520px minimum would hide Cost and Time since entirely.
+  expect(dimensions.scrollWidth - dimensions.clientWidth).toBeLessThanOrEqual(32);
 });

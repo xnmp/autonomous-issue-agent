@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { Polled } from "../api/hooks";
@@ -193,6 +193,7 @@ describe("board explainability", () => {
   });
 
   it("tells the story of the issue, notes and all, when the row is expanded", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-08-01T09:11:00Z"));
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
@@ -268,10 +269,141 @@ describe("board explainability", () => {
     expect(document.querySelector('[data-tip="unblock"]')).toHaveClass("chip-meta");
     // Successful steps stay quiet: no "ok"/"done" word next to every badge.
     expect(document.querySelector(".task-state")).toBeNull();
-    // Each task line shows how long it took next to what it cost; the free
-    // operator step (no duration) shows neither.
-    expect(screen.getByText("0:30")).toBeVisible();
-    expect(document.querySelectorAll(".task-took")).toHaveLength(1);
+    const history = screen.getByRole("table", { name: "Issue #200 task history" });
+    expect(within(history).getAllByRole("columnheader").map((cell) => cell.textContent))
+      .toEqual(["Time", "Cost", "Time since"]);
+    expect(within(history).getByText("took 0:30")).toBeVisible();
+    expect(within(history).getByText("$1.00")).toBeVisible();
+    expect(within(history).getByText("$0.00")).toBeVisible();
+    expect(within(history).getByText("2h")).toBeVisible();
+    expect(within(history).getByText("1h")).toBeVisible();
+    now.mockRestore();
+    vi.unstubAllGlobals();
+  });
+
+  it("gives simultaneous blocked and in-flight histories distinct table names", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            issue: 200,
+            title: "Explain the board",
+            url: null,
+            stage: "resolving",
+            escalation_reason: null,
+            done: false,
+            prs: [],
+            pull_requests: [],
+            cost_usd: 1,
+            elapsed_s: 600,
+            working_s: 45,
+            idle_s: 555,
+            idle_active: true,
+            leg_running: true,
+            steps: [
+              {
+                idx: 0,
+                kind: "RESOLVE",
+                role: "fix",
+                ts: "2026-08-01T07:10:00Z",
+                state: "running",
+                status: null,
+                exit_reason: null,
+                duration_s: null,
+                cost_usd: 1,
+                estimated: false,
+                model: "gpt-5.6-terra",
+                effort: "medium",
+                session_id: null,
+                turns: null,
+                usage: null,
+                has_transcript: false,
+                note: null,
+              },
+            ],
+            events: [],
+            warnings: [],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+
+    board(polled([
+      { ...base, human_action: "escalated" },
+      { ...base, issue: 201, title: "Ordinary live work", stage: "resolving", leg_running: true },
+    ]));
+    await userEvent.click(screen.getByRole("row", { name: /Explain the board/ }));
+    await userEvent.click(screen.getByRole("row", { name: /Ordinary live work/ }));
+
+    const blockedHistory = await screen.findByRole("table", { name: "Issue #200 task history" });
+    const liveHistory = await screen.findByRole("table", { name: "Issue #201 task history" });
+    expect(within(blockedHistory).getAllByRole("columnheader").map((cell) => cell.textContent))
+      .toEqual(["Time", "Cost", "Time since"]);
+    expect(within(liveHistory).getAllByRole("columnheader").map((cell) => cell.textContent))
+      .toEqual(["Time", "Cost", "Time since"]);
+    expect(within(liveHistory).getByText("resolve")).toBeVisible();
+    vi.unstubAllGlobals();
+  });
+
+  it("degrades malformed and absent values and clamps future time since", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(
+          JSON.stringify({
+            issue: 200,
+            title: "Explain the board",
+            url: null,
+            stage: "resolving",
+            escalation_reason: null,
+            done: false,
+            prs: [],
+            pull_requests: [],
+            cost_usd: null,
+            elapsed_s: null,
+            working_s: null,
+            idle_s: null,
+            idle_active: false,
+            leg_running: false,
+            steps: [
+              {
+                idx: 0, kind: "ROUTE", role: "fix", ts: "not-a-time",
+                state: "ok", status: null, exit_reason: null, duration_s: null,
+                cost_usd: null, estimated: false, model: null, effort: null,
+                session_id: null, turns: null, usage: null,
+                has_transcript: false, note: null,
+              },
+              {
+                idx: 1, kind: "REVIEW", role: "review", ts: "2099-01-01T00:00:00Z",
+                state: "ok", status: null, exit_reason: null, duration_s: null,
+                cost_usd: Number.MAX_VALUE, estimated: false, model: null, effort: null,
+                session_id: null, turns: null, usage: null,
+                has_transcript: false, note: null,
+              },
+            ],
+            events: [],
+            warnings: [],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+
+    board(polled([{ ...base, stage: "resolving" }]));
+    await userEvent.click(screen.getByRole("row", { name: /Explain the board/ }));
+
+    const history = await screen.findByRole("table", { name: "Issue #200 task history" });
+    const malformed = within(history).getByText("route").closest("tr");
+    const future = within(history).getByText("review").closest("tr");
+    expect(malformed).not.toBeNull();
+    expect(future).not.toBeNull();
+    expect(within(malformed!).getAllByText("—")).toHaveLength(3);
+    expect(malformed!.querySelector("time")).not.toHaveAttribute("datetime");
+    expect(within(future!).getByText("0s")).toBeVisible();
+    expect(future!.querySelector("time")).toHaveAttribute("datetime", "2099-01-01T00:00:00Z");
+    expect(future!.querySelectorAll("td").item(1).textContent).toMatch(/^\$[\d.e+]+$/);
     vi.unstubAllGlobals();
   });
 });
