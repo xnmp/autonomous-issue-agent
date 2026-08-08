@@ -160,12 +160,27 @@ class SpendBucket(Contract):
     usd: float
 
 
+class InterventionEvent(Contract):
+    ts: str | None
+    # One of domain.dashboard.INTERVENTION_TIMELINE_CLASSES — rearm, guidance,
+    # relabel, policy, other. Open-typed for the same reason as
+    # InterventionCount.name: an unknown class must render, not 500.
+    action_class: str
+    kind: str
+    issue: int | None = None
+    pr: int | None = None
+    detail: str | None = None
+
+
 class OverviewPayload(Warned):
     metrics: Metrics | None
     cost_mix: CostMix | None
     caps: Caps | None
     health: list[RoleHealth]
-    unattributed: list[dict[str, Any]]
+    interventions: list[InterventionEvent] = []
+    # Events the fold could correlate to no issue. Nonzero is a telemetry bug
+    # signal, so the number is published while the bodies stay in the journal.
+    unattributed_count: int = 0
     health_trend: list[HealthTrendDay]
     first_observed_day: str | None = None
     spend_per_hour: list[SpendBucket] = []

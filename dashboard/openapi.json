@@ -641,6 +641,70 @@
         "title": "InterventionCount",
         "type": "object"
       },
+      "InterventionEvent": {
+        "additionalProperties": true,
+        "properties": {
+          "action_class": {
+            "title": "Action Class",
+            "type": "string"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "issue": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Issue"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "pr": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr"
+          },
+          "ts": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ts"
+          }
+        },
+        "required": [
+          "ts",
+          "action_class",
+          "kind"
+        ],
+        "title": "InterventionEvent",
+        "type": "object"
+      },
       "IssueCard": {
         "additionalProperties": true,
         "properties": {
@@ -1713,6 +1777,14 @@
             "title": "Health Trend",
             "type": "array"
           },
+          "interventions": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/InterventionEvent"
+            },
+            "title": "Interventions",
+            "type": "array"
+          },
           "metrics": {
             "anyOf": [
               {
@@ -1731,13 +1803,10 @@
             "title": "Spend Per Hour",
             "type": "array"
           },
-          "unattributed": {
-            "items": {
-              "additionalProperties": true,
-              "type": "object"
-            },
-            "title": "Unattributed",
-            "type": "array"
+          "unattributed_count": {
+            "default": 0,
+            "title": "Unattributed Count",
+            "type": "integer"
           },
           "warnings": {
             "items": {
@@ -1753,7 +1822,6 @@
           "cost_mix",
           "caps",
           "health",
-          "unattributed",
           "health_trend"
         ],
         "title": "OverviewPayload",
@@ -2251,6 +2319,26 @@
           "cache_creation_input_tokens"
         ],
         "title": "TokenUsage",
+        "type": "object"
+      },
+      "UnblockRequest": {
+        "additionalProperties": false,
+        "description": "The unblock body. `guidance` is tri-state: absent/null leaves any stored\nnote alone, `\"\"` clears it, text sets it (see `guidance.parse_guidance`).\n\n`extra=\"forbid\"`, unlike every response contract above: a response gains\nfields over time and a client must tolerate them, but a REQUEST field the\nserver does not know is an operator whose note went nowhere \u2014 `{\"note\":\n...}` must 422, not succeed silently having stored nothing.",
+        "properties": {
+          "guidance": {
+            "anyOf": [
+              {
+                "maxLength": 4000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Guidance"
+          }
+        },
+        "title": "UnblockRequest",
         "type": "object"
       },
       "UsagePayload": {
@@ -2858,6 +2946,23 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/UnblockRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {

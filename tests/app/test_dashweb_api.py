@@ -89,7 +89,8 @@ class StubBackend:
             "caps": {
                 "issue_cap_usd": None, "daily_cap_usd": None, "today_usd": 1.0,
             },
-            "health": [], "unattributed": [], "health_trend": [],
+            "health": [], "interventions": [], "unattributed_count": 0,
+            "health_trend": [],
             "spend_per_hour": [
                 {"hour_start_iso": "2026-07-29T11:00:00+00:00", "usd": 1.0},
                 {"hour_start_iso": "2026-07-29T12:00:00+00:00", "usd": 0.0},
@@ -193,7 +194,10 @@ def test_verification_returns_rows():
 
 def test_overview_carries_metrics_cost_mix_caps_and_health():
     body = client().get("/api/repos/demo/overview").json()
-    assert set(body) >= {"metrics", "cost_mix", "caps", "health", "unattributed"}
+    assert set(body) >= {
+        "metrics", "cost_mix", "caps", "health", "interventions",
+        "unattributed_count",
+    }
 
 
 def test_overview_carries_the_hourly_spend_series():

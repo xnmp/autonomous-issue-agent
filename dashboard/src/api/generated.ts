@@ -436,6 +436,23 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** InterventionEvent */
+        InterventionEvent: {
+            /** Action Class */
+            action_class: string;
+            /** Detail */
+            detail?: string | null;
+            /** Issue */
+            issue?: number | null;
+            /** Kind */
+            kind: string;
+            /** Pr */
+            pr?: number | null;
+            /** Ts */
+            ts: string | null;
+        } & {
+            [key: string]: unknown;
+        };
         /** IssueCard */
         IssueCard: {
             /** Attention Reason */
@@ -705,16 +722,22 @@ export interface components {
             health: components["schemas"]["RoleHealth"][];
             /** Health Trend */
             health_trend: components["schemas"]["HealthTrendDay"][];
+            /**
+             * Interventions
+             * @default []
+             */
+            interventions: components["schemas"]["InterventionEvent"][];
             metrics: components["schemas"]["Metrics"] | null;
             /**
              * Spend Per Hour
              * @default []
              */
             spend_per_hour: components["schemas"]["SpendBucket"][];
-            /** Unattributed */
-            unattributed: {
-                [key: string]: unknown;
-            }[];
+            /**
+             * Unattributed Count
+             * @default 0
+             */
+            unattributed_count: number;
             /** Warnings */
             warnings: string[];
         } & {
@@ -861,6 +884,20 @@ export interface components {
             output_tokens: number | null;
         } & {
             [key: string]: unknown;
+        };
+        /**
+         * UnblockRequest
+         * @description The unblock body. `guidance` is tri-state: absent/null leaves any stored
+         *     note alone, `""` clears it, text sets it (see `guidance.parse_guidance`).
+         *
+         *     `extra="forbid"`, unlike every response contract above: a response gains
+         *     fields over time and a client must tolerate them, but a REQUEST field the
+         *     server does not know is an operator whose note went nowhere — `{"note":
+         *     ...}` must 422, not succeed silently having stored nothing.
+         */
+        UnblockRequest: {
+            /** Guidance */
+            guidance?: string | null;
         };
         /** UsagePayload */
         UsagePayload: {
@@ -1184,7 +1221,11 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody?: never;
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["UnblockRequest"] | null;
+            };
+        };
         responses: {
             /** @description Successful Response */
             200: {

@@ -1751,6 +1751,41 @@ def age_seconds(created_at, now: datetime) -> int | None:
 
 
 # ── overview ──────────────────────────────────────────────────────────────────
+# One screenful of history. The interventions-per-PR tile answers "how much
+# hand-holding"; this list answers "what did the operator actually have to do",
+# and past a screenful nobody reads it — the journal is the archive.
+INTERVENTION_TIMELINE_LIMIT = 50
+
+
+def intervention_timeline(
+    metrics: dash.Metrics,
+    limit: int = INTERVENTION_TIMELINE_LIMIT,
+) -> list[dict]:
+    """The fold's itemized operator actions, newest first and bounded."""
+    items = metrics.interventions
+    if limit >= 0:
+        items = items[len(items) - limit:] if limit else ()
+    rows = []
+    for item in reversed(items):
+        action = dict(item.action)
+        kind = OPERATOR_ACTION_STEPS.get(item.kind, item.kind or "operator action")
+        # Channel provenance, same rule as the per-issue step list: an action
+        # driven over the bare API is never shown as a human's judgement call.
+        if action.get("channel") == "api":
+            kind = f"{kind} (api)"
+        rows.append(
+            {
+                "ts": item.ts.isoformat() if item.ts is not None else None,
+                "action_class": item.action_class,
+                "kind": kind,
+                "issue": item.issue,
+                "pr": item.pr,
+                "detail": _operator_note(action),
+            }
+        )
+    return rows
+
+
 def cost_mix(metrics: dash.Metrics) -> dict:
     """Spend split into the four families the Direction section tracks. Kinds in
     none of them land nowhere by design — `by_kind` already reports them
@@ -1946,7 +1981,11 @@ def overview_payload(
             "today_usd": dep.metrics.today_usd,
         },
         "health": [health_json(h, alive[h.role]) for h in dep.health],
-        "unattributed": list(dep.unattributed[-20:]),
+        "interventions": intervention_timeline(dep.metrics),
+        # A count, not the rows: an event naming no issue is a correlation the
+        # producer failed to stamp, so the number is a telemetry-bug signal and
+        # the bodies belong in the journal, not on the operator's overview.
+        "unattributed_count": len(dep.unattributed),
         "warnings": [
             *dep.warnings,
             *([] if scan_ok else ["daemon liveness is unknown"]),

@@ -221,6 +221,13 @@ const StepEventsPayload = z
     warnings: z.array(z.string()),
   })
   .passthrough();
+const UnblockRequest = z
+  .object({ guidance: z.union([z.string(), z.null()]) })
+  .partial();
+const api_unblock_api_repos__name__issues__number__unblock_post_Body = z.union([
+  UnblockRequest,
+  z.null(),
+]);
 const timezone = z.union([z.string(), z.null()]).optional();
 const Caps = z
   .object({
@@ -245,6 +252,16 @@ const HealthTrendDay = z
     net_open: z.number().int(),
     opened: z.number().int(),
     recurrences: z.number().int(),
+  })
+  .passthrough();
+const InterventionEvent = z
+  .object({
+    action_class: z.string(),
+    detail: z.union([z.string(), z.null()]).optional(),
+    issue: z.union([z.number(), z.null()]).optional(),
+    kind: z.string(),
+    pr: z.union([z.number(), z.null()]).optional(),
+    ts: z.union([z.string(), z.null()]),
   })
   .passthrough();
 const KindCost = z
@@ -283,9 +300,10 @@ const OverviewPayload = z
     first_observed_day: z.union([z.string(), z.null()]).optional(),
     health: z.array(RoleHealth),
     health_trend: z.array(HealthTrendDay),
+    interventions: z.array(InterventionEvent).optional().default([]),
     metrics: z.union([Metrics, z.null()]),
     spend_per_hour: z.array(SpendBucket).optional().default([]),
-    unattributed: z.array(z.object({}).partial().passthrough()),
+    unattributed_count: z.number().int().optional().default(0),
     warnings: z.array(z.string()),
   })
   .passthrough();
@@ -367,10 +385,13 @@ export const schemas = {
   IssueDetailPayload,
   ActionResult,
   StepEventsPayload,
+  UnblockRequest,
+  api_unblock_api_repos__name__issues__number__unblock_post_Body,
   timezone,
   Caps,
   CostMix,
   HealthTrendDay,
+  InterventionEvent,
   KindCost,
   InterventionCount,
   Metrics,
@@ -652,6 +673,11 @@ const endpoints = makeApi([
     requestFormat: "json",
     parameters: [
       {
+        name: "body",
+        type: "Body",
+        schema: api_unblock_api_repos__name__issues__number__unblock_post_Body,
+      },
+      {
         name: "name",
         type: "Path",
         schema: z.string(),
@@ -721,9 +747,10 @@ const endpoints = makeApi([
         first_observed_day: z.union([z.string(), z.null()]).optional(),
         health: z.array(RoleHealth),
         health_trend: z.array(HealthTrendDay),
+        interventions: z.array(InterventionEvent).optional().default([]),
         metrics: z.union([Metrics, z.null()]),
         spend_per_hour: z.array(SpendBucket).optional().default([]),
-        unattributed: z.array(z.object({}).partial().passthrough()),
+        unattributed_count: z.number().int().optional().default(0),
         warnings: z.array(z.string()),
       })
       .passthrough(),

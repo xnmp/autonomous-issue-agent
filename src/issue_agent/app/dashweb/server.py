@@ -172,7 +172,8 @@ def create_app(
                 cost_mix=None,
                 caps=None,
                 health=[],
-                unattributed=[],
+                interventions=[],
+                unattributed_count=0,
                 health_trend=[],
             )
 

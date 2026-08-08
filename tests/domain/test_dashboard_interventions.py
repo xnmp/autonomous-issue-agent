@@ -18,6 +18,7 @@ from issue_agent.domain.dashboard import (
     build_deployment_v2,
     classify_intervention,
     intervention_counts,
+    intervention_items,
     interventions_line,
     operator_action,
 )
@@ -431,3 +432,148 @@ def test_the_status_line_says_so_when_there_is_nothing_to_divide_by() -> None:
     line = interventions_line(_metrics([_unblock(20, 7)]))
 
     assert line == "interventions: 1 (rearm 1, policy 0, other 0) — no merged PRs yet"
+
+
+# ── itemized timeline ─────────────────────────────────────────────────────────
+def _classes(metrics: Metrics) -> list[str]:
+    return [item.action_class for item in metrics.interventions]
+
+
+def test_the_timeline_itemizes_every_counted_intervention_oldest_first() -> None:
+    metrics = _metrics(
+        [
+            *_merged_issue(1, 7, 70),
+            _unblock(20, 7),
+            _dismiss(21, 7, 70),
+            _promote(22, 7),
+        ]
+    )
+
+    items = metrics.interventions
+
+    assert [item.kind for item in items] == [
+        "operator_unblock",
+        "operator_dismiss_review",
+        "operator_relabel",
+    ]
+    assert [item.issue for item in items] == [7, 7, 7]
+    assert [item.pr for item in items] == [None, 70, None]
+    assert [item.ts for item in items] == sorted(item.ts for item in items)
+
+
+def test_the_timeline_and_the_tile_never_disagree_about_the_split() -> None:
+    metrics = _metrics(
+        [
+            *_merged_issue(1, 7, 70),
+            _unblock(20, 7),
+            _priority(21, 7),
+            _promote(22, 7),
+            _harness_relabel(23, 7),
+        ]
+    )
+
+    per_class: dict[str, int] = dict.fromkeys(INTERVENTION_CLASSES, 0)
+    for item in metrics.interventions:
+        per_class[item.metric_class] += 1
+
+    assert per_class == _by_class(metrics)
+    assert len(metrics.interventions) == metrics.interventions_total
+
+
+def test_a_rearm_that_moved_the_scope_note_reads_as_guidance() -> None:
+    guided = _event(
+        ActionApplied(
+            "operator-unblock:beef",
+            "operator_unblock",
+            "issue",
+            "operator unblock issue #7: -ai-blocked",
+            7,
+            {
+                "add": [],
+                "remove": ["ai-blocked"],
+                "operator": OPERATOR,
+                "labels_applied": True,
+                "guidance": "set",
+            },
+        ),
+        20,
+        Correlation(issue=7),
+    )
+
+    metrics = _metrics([*_merged_issue(1, 7, 70), guided])
+
+    assert _classes(metrics) == ["guidance"]
+    # A display refinement, never a contradiction: the guardrail still counts
+    # this as the re-arm it was.
+    assert metrics.interventions[0].metric_class == "rearm"
+    assert _by_class(metrics)["rearm"] == 1
+
+
+def test_an_operator_label_move_outside_the_grammar_reads_as_relabel() -> None:
+    moved = _event(
+        ActionApplied(
+            "operator-relabel:cafe",
+            "operator_relabel",
+            "issue",
+            "operator relabel issue #7: +needs-design",
+            7,
+            {"add": ["needs-design"], "remove": [], "operator": OPERATOR},
+        ),
+        20,
+        Correlation(issue=7),
+    )
+
+    metrics = _metrics([*_merged_issue(1, 7, 70), moved])
+
+    assert _classes(metrics) == ["relabel"]
+    assert metrics.interventions[0].metric_class == "other"
+
+
+def test_a_promote_stays_policy_and_a_priority_nudge_stays_rearm() -> None:
+    metrics = _metrics(
+        [*_merged_issue(1, 7, 70), _promote(20, 7), _priority(21, 7)]
+    )
+
+    assert sorted(_classes(metrics)) == ["policy", "rearm"]
+
+
+def test_an_undated_or_malformed_operator_event_still_yields_one_item() -> None:
+    """Journal rows the fold cannot date must not vanish from the timeline —
+    an intervention nobody can see is worse than one with an unknown clock."""
+    rows = (
+        {
+            "event": "action",
+            "event_id": "no-ts",
+            "action": {"type": "operator_unblock", "operator": OPERATOR},
+        },
+        {
+            "event": "action",
+            "event_id": "bad-ts",
+            "ts": "not-a-timestamp",
+            "issue": "seven",
+            "action": {"type": "operator_relabel", "operator": OPERATOR,
+                       "add": None, "remove": 7},
+        },
+    )
+
+    items = intervention_items((), rows)
+
+    assert [item.ts for item in items] == [None, None]
+    assert [item.action_class for item in items] == ["rearm", "relabel"]
+    assert [item.issue for item in items] == [None, None]
+
+
+def test_one_action_projected_onto_two_rows_is_one_timeline_item() -> None:
+    shared = {
+        "event": "action",
+        "event_id": "shared",
+        "ts": "2026-08-02T10:00:00+00:00",
+        "issue": 7,
+        "pr": 70,
+        "action": {"type": "operator_unblock", "operator": OPERATOR},
+    }
+
+    items = intervention_items((), (dict(shared), dict(shared)))
+
+    assert len(items) == 1
+    assert (items[0].issue, items[0].pr) == (7, 70)

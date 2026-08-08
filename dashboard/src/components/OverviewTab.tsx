@@ -1,7 +1,12 @@
 import { api } from "../api/client";
 import { usePolled } from "../api/hooks";
 import { useNow } from "../lib/clock";
-import type { HealthTrendDay, JournalEvent, OverviewPayload, RoleHealth } from "../api/types";
+import type {
+  HealthTrendDay,
+  InterventionEvent,
+  OverviewPayload,
+  RoleHealth,
+} from "../api/types";
 import {
   HEALTH_LABEL,
   HEALTH_TONE,
@@ -212,13 +217,18 @@ export function OverviewTab({
         ))}
       </div>
 
+      <UnattributedCount count={ov.data?.unattributed_count ?? 0} />
+
       <section className="panel">
         <div className="panel-hd">
-          <span className="panel-title">Recent unattributed events</span>
-          <span className="faint">deployment-level, not tied to an issue</span>
+          <span className="panel-title">Operator actions</span>
+          <span className="faint">what a human had to do, newest first</span>
         </div>
         <div className="panel-bd flush">
-          <UnattributedList events={ov.data?.unattributed ?? []} loading={ov.loading} />
+          <InterventionList
+            rows={ov.data?.interventions ?? []}
+            loading={ov.loading}
+          />
         </div>
       </section>
 
@@ -360,52 +370,82 @@ function HealthCard({ health }: { health: RoleHealth }) {
   );
 }
 
-function eventSummary(e: JournalEvent): string {
-  const parts: string[] = [];
-  for (const k of ["desc", "reason", "detail", "error", "block_key"] as const) {
-    const v = (e as Record<string, unknown>)[k];
-    if (typeof v === "string" && v) parts.push(v);
-  }
-  for (const k of ["issue", "pr", "number"] as const) {
-    const v = (e as Record<string, unknown>)[k];
-    if (typeof v === "number") parts.push(`${k} #${v}`);
-  }
-  return parts.slice(0, 2).join(" · ");
+const INTERVENTION_TONE: Record<string, "fail" | "running" | "meta" | "info"> = {
+  rearm: "fail",
+  guidance: "running",
+  relabel: "info",
+  policy: "meta",
+  other: "info",
+};
+
+/**
+ * An event the fold could correlate to no issue is a producer that failed to
+ * stamp its correlation — a telemetry bug, not deployment news. The number
+ * stays visible so the bug is noticeable; the bodies live in the journal.
+ */
+function UnattributedCount({ count }: { count: number }) {
+  return (
+    <div className="usage-line">
+      <span className="muted">Uncorrelated journal events</span>
+      <span className="spacer" />
+      <span
+        className={`mono num${count > 0 ? " tone-fail" : ""}`}
+        title="events naming no issue — nonzero means a producer is not stamping correlation"
+      >
+        {num(count)}
+      </span>
+    </div>
+  );
 }
 
-function UnattributedList({ events, loading }: { events: JournalEvent[]; loading: boolean }) {
+function InterventionList({
+  rows,
+  loading,
+}: {
+  rows: InterventionEvent[];
+  loading: boolean;
+}) {
   const sorted = useSortedRows(
-    events,
+    rows,
     {
-      when: (event) => event.ts,
-      role: (event) => event.role,
-      event: (event) => String(event.kind ?? event.event ?? "event"),
+      when: (row) => row.ts,
+      class: (row) => row.action_class,
+      target: (row) => row.issue ?? row.pr,
+      action: (row) => row.kind,
     },
     { key: "when", direction: "desc" },
-    "overview-unattributed",
+    "overview-interventions",
   );
-  if (loading) return <Loading what="events" />;
-  if (events.length === 0) return <EmptyState>no deployment-level events</EmptyState>;
+  if (loading) return <Loading what="operator actions" />;
+  if (rows.length === 0) {
+    return <EmptyState>no journalled operator actions — the harness ran unattended</EmptyState>;
+  }
   return (
-    <ResizableTable storageKey="overview-unattributed" columns={[
+    <ResizableTable storageKey="overview-interventions" columns={[
       { key: "when", label: "When", width: 160 },
-      { key: "role", label: "Role", width: 100 },
-      { key: "event", label: "Event", width: 500 },
+      { key: "class", label: "Class", width: 110 },
+      { key: "target", label: "Target", width: 110 },
+      { key: "action", label: "Action", width: 420 },
     ]} sort={sorted.sort} onSort={sorted.onSort}>
       <tbody>
-        {sorted.rows.map((e, i) => (
-          <tr key={i}>
-            <td className="mono faint" title={e.ts ?? ""}>
-              {localTime(e.ts)}
-            </td>
+        {sorted.rows.map((row, i) => (
+          <tr key={`${row.ts ?? "?"}-${i}`}>
+            <td className="mono faint" title={row.ts ?? ""}>{localTime(row.ts)}</td>
             <td>
-              <Chip tone={e.role === "steward" ? "meta" : "info"} square>
-                {e.role ?? "—"}
+              <Chip tone={INTERVENTION_TONE[row.action_class] ?? "info"} square>
+                {row.action_class}
               </Chip>
             </td>
-            <td className="mono trunc" title={JSON.stringify(e)}>
-              <span>{String(e.kind ?? e.event ?? "event")}</span>
-              {eventSummary(e) && <span className="faint"> — {eventSummary(e)}</span>}
+            <td className="mono">
+              {row.issue !== null && row.issue !== undefined ? `#${row.issue}` : null}
+              {row.pr !== null && row.pr !== undefined ? (
+                <span className="faint"> PR #{row.pr}</span>
+              ) : null}
+              {row.issue == null && row.pr == null ? <span className="faint">—</span> : null}
+            </td>
+            <td className="trunc" title={row.detail ?? row.kind}>
+              <span className="mono">{row.kind}</span>
+              {row.detail ? <span className="faint"> — {row.detail}</span> : null}
             </td>
           </tr>
         ))}

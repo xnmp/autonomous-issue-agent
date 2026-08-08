@@ -27,6 +27,7 @@ export type Metrics = Schema["Metrics"];
 export type CostMix = Schema["CostMix"];
 export type Caps = Schema["Caps"];
 export type HealthTrendDay = Schema["HealthTrendDay"];
+export type InterventionEvent = Schema["InterventionEvent"];
 export type OverviewPayload = Schema["OverviewPayload"];
 export type CardStep = Schema["CardStep"];
 export type IssueCard = Schema["IssueCard"];

@@ -426,6 +426,10 @@ class Metrics:
     today_usd: float | None  # settled SQLite spend, or unknown
     # (class, count) for every class in INTERVENTION_CLASSES, always all three.
     interventions_by_class: tuple[tuple[str, int], ...] = ()
+    # The same interventions, itemized and oldest first. `interventions_by_class`
+    # is a fold of this, so a tile that disagreed with the timeline would be a
+    # bug in one reading rather than two independent classifications.
+    interventions: tuple["InterventionItem", ...] = ()
 
     @property
     def first_pass_rate(self) -> float | None:
@@ -1353,6 +1357,41 @@ INTERVENTION_CLASSES = (
     INTERVENTION_OTHER,
 )
 
+# Two further DISPLAY classes, for the itemized timeline only. Each refines one
+# metric class rather than competing with it (see `timeline_class`), so the
+# guardrail series keeps its three-class history while the timeline can say
+# which kind of re-arm or which kind of unrecognised action this row was.
+INTERVENTION_GUIDANCE = "guidance"   # a re-arm that also moved the scope note
+INTERVENTION_RELABEL = "relabel"     # an operator label move outside the grammar
+INTERVENTION_TIMELINE_CLASSES = (
+    INTERVENTION_REARM,
+    INTERVENTION_GUIDANCE,
+    INTERVENTION_RELABEL,
+    INTERVENTION_POLICY,
+    INTERVENTION_OTHER,
+)
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+@dataclass(frozen=True)
+class InterventionItem:
+    """One journalled operator action, retained rather than counted away.
+
+    `action` is the raw projected payload: the fold has no vocabulary for
+    operator prose, and the view tier already owns the one-line rendering of a
+    label move, a scope note, or a failed dismissal.
+    """
+
+    identity: str
+    ts: datetime | None
+    metric_class: str    # one of INTERVENTION_CLASSES — what the tile counts
+    action_class: str    # one of INTERVENTION_TIMELINE_CLASSES — what the row says
+    kind: str            # the endpoint's `ActionApplied.kind`, verbatim
+    issue: int | None
+    pr: int | None
+    action: Mapping[str, JsonValue]
+
 # `ActionApplied.kind` values and `command_id` prefixes minted by the
 # dashboard's operator endpoints (app/dashweb/service.py). The relabel path
 # routes through a durable command whose id is a content digest, so its class
@@ -1428,16 +1467,38 @@ def classify_intervention(action, command_id="") -> str:
     return INTERVENTION_OTHER
 
 
-def intervention_counts(rows, unattributed=()) -> tuple[tuple[str, int], ...]:
-    """Operator interventions per class, in `INTERVENTION_CLASSES` order.
+def timeline_class(action, metric_class: str) -> str:
+    """The finer DISPLAY class for one operator action.
 
-    Every class is present with an explicit zero: a missing key and a real zero
-    read identically in a dashboard tile, and the difference matters when the
-    question is "did anyone touch this deployment".
+    Strict refinement of `classify_intervention`, never a contradiction of it:
+    `guidance` is a `rearm` that also moved the stored scope note, `relabel` is
+    an `other` that came from the relabel endpoint. A timeline row and the
+    intervention tile therefore never disagree about what happened — the tile
+    just says less. The metric keeps the coarse three so the guardrail series
+    stays comparable across deployments that predate this view.
     """
-    counts = dict.fromkeys(INTERVENTION_CLASSES, 0)
+    if not isinstance(action, Mapping):
+        return INTERVENTION_OTHER
+    if metric_class == INTERVENTION_REARM:
+        if _text(action.get("guidance")):
+            return INTERVENTION_GUIDANCE
+        return INTERVENTION_REARM
+    if metric_class == INTERVENTION_OTHER:
+        if _text(action.get("type")) == _RELABEL_ACTION_KIND:
+            return INTERVENTION_RELABEL
+        return INTERVENTION_OTHER
+    return metric_class
+
+
+def intervention_items(rows, unattributed=()) -> tuple[InterventionItem, ...]:
+    """Every journalled operator intervention, oldest first, deduplicated.
+
+    The counts below are a fold of this list, so the tile and the timeline
+    cannot drift: one classification pass, two readings of it.
+    """
     events = [event for row in rows for event in row.events]
     events.extend(unattributed)
+    items: list[InterventionItem] = []
     seen: set[str] = set()
     for index, event in enumerate(events):
         action = operator_action(event)
@@ -1449,7 +1510,35 @@ def intervention_counts(rows, unattributed=()) -> tuple[tuple[str, int], ...]:
         if identity in seen:
             continue
         seen.add(identity)
-        counts[classify_intervention(action, event.get("command_id"))] += 1
+        metric_class = classify_intervention(action, event.get("command_id"))
+        items.append(
+            InterventionItem(
+                identity=identity,
+                ts=parse_ts(event.get("ts")),
+                metric_class=metric_class,
+                action_class=timeline_class(action, metric_class),
+                kind=_text(action.get("type")),
+                issue=_int(event.get("issue")),
+                pr=_int(event.get("pr")),
+                action=action,
+            )
+        )
+    # Chronological, with a stable tie-break for the several targets one
+    # endpoint journals in the same pass (an issue and each of its PRs).
+    items.sort(key=lambda item: (item.ts is not None, item.ts or _EPOCH))
+    return tuple(items)
+
+
+def intervention_counts(rows, unattributed=()) -> tuple[tuple[str, int], ...]:
+    """Operator interventions per class, in `INTERVENTION_CLASSES` order.
+
+    Every class is present with an explicit zero: a missing key and a real zero
+    read identically in a dashboard tile, and the difference matters when the
+    question is "did anyone touch this deployment".
+    """
+    counts = dict.fromkeys(INTERVENTION_CLASSES, 0)
+    for item in intervention_items(rows, unattributed):
+        counts[item.metric_class] += 1
     return tuple((name, counts[name]) for name in INTERVENTION_CLASSES)
 
 
@@ -1499,6 +1588,10 @@ def build_metrics(
     done = [row for row in rows if row.done]
     approvals, changes = first_pass_verdicts(rows)
     reviewed = [row for row in rows if row.rounds]
+    interventions = intervention_items(rows, unattributed)
+    counts = dict.fromkeys(INTERVENTION_CLASSES, 0)
+    for item in interventions:
+        counts[item.metric_class] += 1
     return Metrics(
         done_issues=len(done),
         in_flight_issues=sum(
@@ -1525,7 +1618,10 @@ def build_metrics(
         spend_blocks=sum(row.spend_blocks for row in rows)
         + sum(1 for e in unattributed if e.get("event") == "spend_block"),
         today_usd=round(today_usd, 4) if today_usd is not None else None,
-        interventions_by_class=intervention_counts(rows, unattributed),
+        interventions_by_class=tuple(
+            (name, counts[name]) for name in INTERVENTION_CLASSES
+        ),
+        interventions=interventions,
     )
 
 

@@ -1171,6 +1171,98 @@ def test_metrics_json_carries_the_intervention_split_and_ratio():
     assert payload["interventions_per_merged_pr"] is None  # nothing merged yet
 
 
+# ── operator-actions timeline ─────────────────────────────────────────────────
+def _operator_event(ts_value, action, **extra):
+    return {"ts": ts_value, "event": "action", "role": "fix", "action": action,
+            **extra}
+
+
+UNBLOCK_WITH_NOTE = _operator_event(
+    ts(hours=2),
+    {
+        "type": "operator_unblock", "operator": "o/r:dashboard",
+        "add": [], "remove": ["ai-blocked"], "labels_applied": True,
+        "retries_cleared": True, "guidance": "set",
+    },
+    event_id="a", issue=7,
+)
+PROMOTE = _operator_event(
+    ts(hours=1),
+    {"type": "operator_relabel", "operator": "o/r:dashboard",
+     "add": ["ai-ready"], "remove": []},
+    event_id="b", issue=8,
+)
+API_UNBLOCK = _operator_event(
+    ts(hours=3),
+    {"type": "operator_unblock", "operator": "o/r:dashboard",
+     "add": [], "remove": ["ai-blocked"], "labels_applied": True,
+     "channel": "api"},
+    event_id="c", issue=9, pr=90,
+)
+
+
+def _timeline(events):
+    metrics = dash.build_metrics((), tuple(events), 0.0)
+    return snapshots.intervention_timeline(metrics)
+
+
+def test_the_operator_timeline_is_newest_first_and_says_what_was_done():
+    rows = _timeline([UNBLOCK_WITH_NOTE, PROMOTE, API_UNBLOCK])
+
+    assert [row["issue"] for row in rows] == [8, 7, 9]
+    assert [row["action_class"] for row in rows] == ["policy", "guidance", "rearm"]
+    assert rows[1]["detail"] == (
+        "removed ai-blocked; reset retry counters; with scope note"
+    )
+    assert rows[0]["kind"] == "relabel (operator)"
+
+
+def test_an_api_driven_action_is_never_shown_as_a_humans_judgement_call():
+    row = _timeline([API_UNBLOCK])[0]
+
+    assert row["kind"] == "unblock (api)"
+    assert (row["issue"], row["pr"]) == (9, 90)
+
+
+def test_the_operator_timeline_is_bounded_to_one_screenful():
+    events = [
+        _operator_event(
+            ts(minutes=index),
+            {"type": "operator_unblock", "operator": "o/r:dashboard"},
+            event_id=f"e{index}", issue=index + 1,
+        )
+        for index in range(400)
+    ]
+
+    rows = snapshots.intervention_timeline(dash.build_metrics((), tuple(events), 0.0))
+
+    assert len(rows) == snapshots.INTERVENTION_TIMELINE_LIMIT
+    # Newest first means the most recent action survives the cut, not the first.
+    assert rows[0]["ts"] == ts(minutes=0)
+
+
+def test_a_deployment_nobody_touched_has_an_empty_timeline_not_a_missing_one():
+    payload = snapshots.overview_payload(
+        dash.Snapshot("demo", "o/r", "/t", build([RESOLVE]), ()), {}, True
+    )
+
+    assert payload["interventions"] == []
+    assert payload["unattributed_count"] == 0
+
+
+def test_the_overview_reports_uncorrelated_events_as_a_count_not_as_rows():
+    payload = snapshots.overview_payload(
+        dash.Snapshot(
+            "demo", "o/r", "/t",
+            build([RESOLVE, {"ts": ts(hours=1), "event": "tick_gated"}]), (),
+        ),
+        {}, True,
+    )
+
+    assert payload["unattributed_count"] == 1
+    assert "unattributed" not in payload
+
+
 @pytest.mark.parametrize("events", [[], [{"garbage": True}], [{"ts": "not-a-date"}]])
 def test_a_deployment_with_no_usable_events_still_produces_a_payload(events):
     dep = build(events)
