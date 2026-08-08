@@ -20,6 +20,7 @@ from issue_agent.domain.events import (
     Producer,
     WorldObserved,
 )
+from issue_agent.domain.labels import LIFECYCLE_LABELS
 from issue_agent.domain.projection import fold
 
 NOW = datetime(2026, 7, 29, 12, 0, 0, tzinfo=timezone.utc)
@@ -982,6 +983,15 @@ def test_pending_card_carries_the_issue_body_for_the_drill_down():
 def test_backlog_excludes_any_issue_the_harness_lifecycle_already_owns():
     assert snapshots.is_backlog({"labels": [{"name": "bug"}]}) is True
     assert snapshots.is_backlog({"labels": [{"name": "ai-working"}]}) is False
+
+
+@pytest.mark.parametrize("label", sorted(label.value for label in LIFECYCLE_LABELS))
+def test_backlog_uses_the_canonical_lifecycle_label_set(label):
+    """#144: the dashboard kept its own copy of the lifecycle set and omitted
+    `ai-pr-open`, so an issue with a live PR showed in both In Flight and
+    Backlog. Parametrized over the canonical set so a lifecycle label added
+    later cannot drift out of the dashboard's definition again."""
+    assert snapshots.is_backlog({"labels": [{"name": label}]}) is False
 
 
 def test_backlog_card_ages_the_issue_and_marks_recurrences():

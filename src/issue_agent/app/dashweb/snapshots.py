@@ -20,6 +20,7 @@ from typing import assert_never
 from ...domain import dashboard as dash
 from ...domain.actions import AgentKind
 from ...domain.identity import is_bot_login, login_eq
+from ...domain.labels import LIFECYCLE_LABELS as _CANONICAL_LIFECYCLE_LABELS
 from ...domain.outcome import ExitReason
 from ...domain.world import ReviewDecision
 
@@ -29,11 +30,10 @@ from ...domain.world import ReviewDecision
 FRECENCY_WINDOWS = ((86400.0, 3.0), (7 * 86400.0, 1.0), (30 * 86400.0, 0.25))
 
 # The lifecycle labels the harness owns. An open issue carrying none of them has
-# never been offered to the harness — that is the backlog.
-LIFECYCLE_LABELS = frozenset(
-    {"ai-ready", "ai-working", "ai-done", "ai-blocked", "needs-human-review",
-     "ai-parked"}
-)
+# never been offered to the harness — that is the backlog. Read from the
+# canonical set rather than restated: a local copy silently omitted `ai-pr-open`
+# and put every issue with a live PR in both In Flight and Backlog (#144).
+LIFECYCLE_LABELS = frozenset(label.value for label in _CANONICAL_LIFECYCLE_LABELS)
 PRIORITY_LABELS = ("P1", "P2", "P3")
 _AGENT_KINDS = frozenset(kind.name for kind in AgentKind)
 _DISPATCH_AGENT_KINDS = _AGENT_KINDS - {"ROUTE"}
