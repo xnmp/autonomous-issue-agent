@@ -18,10 +18,11 @@ from ...domain.events import (
     TelemetryWarning,
 )
 from ...domain.leg import Leg, LegTarget
-from ...domain.trust import as_untrusted
+from ...domain.trust import Untrusted, as_untrusted
 from ..planners import tasks as task_builders
 from ..planners.schemas import review_schema_with_exemptions
 from ..planners.tasks import ReviewTaskConfig
+from ...adapters.github import format_pr_discussion
 from ...adapters.runtime_plan import AgentRuntime
 from ...domain.agent_task import (
     RUNTIME_CAPABILITIES,
@@ -445,6 +446,7 @@ class ReviewWorkflow:
             return
         signature = review_dom.patch_signature(diff)
         guidance = self.store.get_operator_guidance(pr)
+        discussion = self._pr_discussion(p)
         if self.cfg.review_mode is review_dom.ReviewMode.DELEGATED:
             task = task_builders.build_delegated_review_task(
                 pr,
@@ -453,6 +455,7 @@ class ReviewWorkflow:
                 as_untrusted(diff),
                 self.cfg.review,
                 operator_guidance=guidance,
+                discussion=discussion,
             )
         else:
             task = task_builders.build_review_task(
@@ -462,6 +465,7 @@ class ReviewWorkflow:
                 as_untrusted(diff),
                 self.cfg.review,
                 operator_guidance=guidance,
+                discussion=discussion,
             )
         exemption_request = self._exemption_grant_notice(p, diff)
         if exemption_request is None:
@@ -555,6 +559,7 @@ class ReviewWorkflow:
             return
         last_sha = self.store.get_last_sha(pr)
         guidance = self.store.get_operator_guidance(pr)
+        discussion = self._pr_discussion(p)
         if self.cfg.review_mode is review_dom.ReviewMode.DELEGATED:
             # Fresh session (no resume) → feed the prior review body as reference
             # instead of replaying the transcript. Use the most recent review with a
@@ -571,6 +576,7 @@ class ReviewWorkflow:
                 as_untrusted(prior_review),
                 self.cfg.review,
                 operator_guidance=guidance,
+                discussion=discussion,
             )
         else:
             session_id = self.store.get_pr_session(pr)
@@ -587,6 +593,7 @@ class ReviewWorkflow:
                     as_untrusted(prior.body if prior else ""),
                     self.cfg.review,
                     operator_guidance=guidance,
+                    discussion=discussion,
                 )
             else:
                 task = task_builders.build_re_review_task(
@@ -597,6 +604,7 @@ class ReviewWorkflow:
                     as_untrusted(diff),
                     session_id, self.cfg.review,
                     operator_guidance=guidance,
+                    discussion=discussion,
                 )
         exemption_request = self._exemption_grant_notice(p, diff)
         if exemption_request is None:
@@ -982,6 +990,20 @@ class ReviewWorkflow:
         )
         return "\n\n" + "\n".join(lines)
 
+    def _pr_discussion(self, p) -> Untrusted | None:
+        """The PR conversation as bounded UNTRUSTED data, or None when empty.
+
+        Comments already ride on the PRView the review world fetched (`gh pr
+        view --json comments`), so this costs no extra GitHub call. None — not
+        an empty string — for an empty thread, so the builders render no
+        section at all rather than an empty labelled one.
+
+        Incident 2026-08-08 (tauri #613/#614): the fixer answered a demand for
+        impossible evidence on the operator-block channel, which the reviewer
+        cannot see, and the review rejected to its ceiling twice."""
+        text = format_pr_discussion(p.comments)
+        return as_untrusted(text) if text else None
+
     def _revision_bound_diff(self, p) -> str | None:
         if not p.base_ref_oid or not p.head_ref_oid:
             return None
@@ -1160,6 +1182,7 @@ class ReviewWorkflow:
         signature = review_dom.patch_signature(diff)
         rcfg = self.cfg.review
         guidance = self.store.get_operator_guidance(pr)
+        discussion = self._pr_discussion(p)
         exemption_request = self._exemption_grant_notice(p, diff)
         if exemption_request is None:
             self._evidence_deferral(p, "exemption declarations unreadable")
@@ -1181,6 +1204,9 @@ class ReviewWorkflow:
         )
 
         # 1. skip-gate — a pure doc/format/config diff short-circuits to APPROVE.
+        # No PR conversation here on purpose: its only failure direction ends
+        # the review in an APPROVE, and a comment is the wrong evidence for
+        # "is this diff behavioural?" (see build_review_gate_task).
         gate = await self._run_logged("review-gate", pr, head_sha=p.head_ref_oid, task=
             task_builders.build_review_gate_task(
                 pr,
@@ -1247,6 +1273,7 @@ class ReviewWorkflow:
                     as_untrusted(diff),
                     rcfg,
                     operator_guidance=guidance,
+                    discussion=discussion,
                 )
             )
             for key, focus in dims

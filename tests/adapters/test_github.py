@@ -18,6 +18,7 @@ from issue_agent.adapters.github import (
     GitHubGateway,
     Identity,
     MissingListLimit,
+    format_pr_discussion,
     format_review_comments,
     build_add_blocked_by_args,
     build_blocker_id_args,
@@ -1196,6 +1197,51 @@ def test_rerun_failed_checks_preserves_transport_failure_for_durable_recovery():
         gw.rerun_failed_checks("head-1", (4242,))
 
 
+def _pr_with_red_run(conclusion: str):
+    def runner(argv, token):
+        key = " ".join(argv)
+        if "pr view 581" in key:
+            return json.dumps({
+                "number": 581, "state": "OPEN", "headRefOid": "head-581",
+            })
+        if "/commits/head-581/check-runs" in key:
+            return json.dumps([{"check_runs": [{
+                "name": "invocation",
+                "status": "completed",
+                "conclusion": conclusion,
+                "details_url": (
+                    "https://github.com/o/r/actions/runs/4242/job/99"
+                ),
+            }]}])
+        if "/commits/head-581/statuses" in key:
+            return json.dumps([[]])
+        if "actions/runs/4242" in key:
+            return json.dumps({
+                "id": 4242,
+                "head_sha": "head-581",
+                "run_attempt": 1,
+                "conclusion": conclusion,
+            })
+        return ""
+
+    return GitHubGateway("o/r", runner=runner)
+
+
+def test_every_rerunnable_conclusion_is_found_by_run_id_at_the_observed_head():
+    """#177: the free re-run's candidates are the failed runs of the CURRENT
+    head. Each red conclusion must carry its workflow-run identity, and that id
+    must resolve at the head the decision observed — an unidentified failure
+    falls through to the paid leg instead of re-running a stranger's run."""
+    for conclusion in ("failure", "timed_out", "startup_failure"):
+        gw = _pr_with_red_run(conclusion)
+        pr = gw.get_pr(581)
+
+        assert ci_state(pr.checks) is CIState.FAILURE, conclusion
+        assert pr.checks[0].run_id == 4242, conclusion
+        assert gw.workflow_run_attempts("head-581", (4242,)) == {4242: 1}
+        assert gw.workflow_run_attempts("some-other-head", (4242,)) is None
+
+
 def test_a_cancelled_run_reads_as_a_settled_failure_not_as_green():
     """The load-bearing half of the wedged-run remediation (keifu PR #177).
 
@@ -1875,6 +1921,51 @@ def test_steward_issue_worlds_survive_one_unreadable_issue(build, capsys):
     w = getattr(gw, build)()
     assert [i.number for i in w.issues] == [8]
     assert "skip issue #7" in capsys.readouterr().err
+
+
+# ── PR conversation → review prompt (2026-08-08, tauri #613/#614) ─────────────
+def test_pr_discussion_is_newest_first_and_keeps_bot_authors():
+    # Newest first because the byte ceiling truncates the tail and the answer to
+    # "was this demand already addressed?" is at the recent end. Bot comments
+    # stay: the fixer's own blocked-reason comment is the one that matters here.
+    text = format_pr_discussion((
+        Comment(author="author", body="opened"),
+        Comment(author="harness-fixer[bot]", body="no display in this deployment"),
+    ))
+    assert text.index("no display in this deployment") < text.index("opened")
+    assert "@harness-fixer[bot]" in text
+
+
+def test_an_empty_thread_renders_nothing():
+    assert format_pr_discussion(()) == ""
+    assert format_pr_discussion((Comment(author="a", body="   "),)) == ""
+
+
+def test_a_long_thread_is_truncated_with_an_explicit_marker():
+    comments = tuple(
+        Comment(author="rev", body=f"comment {n} " + "x" * 400) for n in range(200)
+    )
+    text = format_pr_discussion(comments)
+    assert "[older comments truncated]" in text
+    # The NEWEST survives, the oldest is what fell off.
+    assert "comment 199" in text
+    assert "comment 0 " not in text
+
+
+def test_one_huge_comment_is_capped_and_says_so():
+    text = format_pr_discussion((
+        Comment(author="rev", body="old point"),
+        Comment(author="spam", body="A" * 50_000),
+    ))
+    # Marked, not silently amputated — an unmarked cut reads as a whole comment.
+    assert "[…comment truncated]" in text
+    assert len(text.encode()) < 2_500          # one capped comment + the short one
+    assert "old point" in text                 # the rest of the thread survives
+
+
+def test_a_comment_under_the_ceiling_is_never_marked():
+    text = format_pr_discussion((Comment(author="rev", body="short and whole"),))
+    assert text == "@rev: short and whole"
 
 
 # ── review M13 / D6: the two repair legs' prompt inputs ───────────────────────

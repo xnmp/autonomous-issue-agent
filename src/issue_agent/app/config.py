@@ -29,6 +29,7 @@ from ..domain.infra_breaker import (
     DEFAULT_BREAKER_WINDOW_SECONDS,
 )
 from ..domain.effort import EFFORT_LADDER, Effort, parse_effort
+from ..domain.environment import EVIDENCE_STACKS
 from ..domain.identity import normalize_login
 from ..domain.pricing import parse_model_rate_table
 from ..domain.review import IdentityMode, ReviewMode
@@ -434,6 +435,23 @@ class HarnessConfig:
     #            delegates codebase search to (REVIEW_SCOUT_MODEL, default sonnet),
     #            so the expensive reviewer reasons over summaries not raw files.
     review_mode: ReviewMode = ReviewMode.SINGLE
+    # EVIDENCE_STACK: which GUI/e2e evidence toolchain this deployment declares.
+    # The boot probe (adapters/environment.py) knows exactly one — WebKitGTK/
+    # tauri — and its readings are attested into every review and fixer prompt.
+    # Unset (default) those readings are stated as FACTS ONLY: a repo driving
+    # headless Chromium through Playwright needs none of the probed binaries, so
+    # a categorical "live evidence is impossible here" would be a
+    # harness-attested falsehood that lowers the evidence bar globally. Declaring
+    # the stack is the operator asserting the probe covers this repo, which is
+    # what makes its silence conclusive rather than merely uninformed.
+    evidence_stack: str = field(
+        default="",
+        metadata={
+            "env": "EVIDENCE_STACK",
+            "coerce": "choice",
+            "choices": EVIDENCE_STACKS,
+        },
+    )
     # Adopt rogue PRs (opened directly, no trigger label) into review. Default on:
     # a PR reviewed by nobody is the worse failure. Opt out per-PR with no-ai-review.
     review_adopt_unlabeled: bool = True

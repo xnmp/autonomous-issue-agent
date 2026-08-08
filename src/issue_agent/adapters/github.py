@@ -633,6 +633,50 @@ def format_review_comments(raw: object, limit: int = _INLINE_COMMENT_LIMIT) -> s
     return _cap_bytes("\n".join(out), _REVIEW_COMMENTS_TOTAL_BYTES)
 
 
+def _marked_cap(text: str, max_bytes: int) -> str:
+    """`_cap_bytes` that says so when it cut. An unmarked truncation reads as a
+    complete statement that happens to trail off mid-sentence."""
+    capped = _cap_bytes(text, max_bytes)
+    return capped if capped == text else f"{capped} […comment truncated]"
+
+
+def format_pr_discussion(
+    comments: tuple[Comment, ...],
+    *,
+    body_bytes: int = _REVIEW_COMMENT_BODY_BYTES,
+    total_bytes: int = _REVIEW_COMMENTS_TOTAL_BYTES,
+) -> str:
+    """The PR's conversation thread → the block the reviewer reads as DATA.
+
+    NEWEST FIRST, unlike the triage thread's oldest-first ordering: the byte
+    ceiling truncates the tail, and on a PR the answer to "did the author
+    already respond to this demand?" is at the recent end (2026-08-08 tauri
+    #613/#614 — the reviewer re-demanded evidence the thread had answered two
+    rounds earlier). Truncation is marked in-band so a bounded view is never
+    mistaken for the whole conversation.
+
+    Bot comments are KEPT: the harness's own fixer posts its blocked-reason
+    comment as a bot, and that comment is the one this exists to deliver.
+
+    Same ceilings as the inline-review-comment block — a PR comment is writable
+    by anyone with read access to the repo, so the comment COUNT does not bound
+    the paste. Both cuts (per comment, whole block) are MARKED: a reviewer
+    reading a silently amputated answer would re-raise the point it made, which
+    is the loop this whole feature exists to break."""
+    rendered = [
+        f"@{c.author or '(unknown)'}: {_marked_cap(c.body.strip(), body_bytes)}"
+        for c in reversed(comments)
+        if c.body.strip()
+    ]
+    if not rendered:
+        return ""
+    joined = "\n\n---\n\n".join(rendered)
+    capped = _cap_bytes(joined, total_bytes)
+    if capped != joined:
+        capped += "\n\n---\n\n[older comments truncated]"
+    return capped
+
+
 def build_time() -> str:
     """The stamp every world builder puts in `WorldState.now`. The domain may not
     read a clock, so this is the one place a poll's notion of "now" is taken —

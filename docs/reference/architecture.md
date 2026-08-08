@@ -443,7 +443,10 @@ module requires placing it in the appropriate tier and explaining it here.
 `domain/` — pure values and policy:
 `domain/actions.py`, `domain/agent_task.py`, `domain/ci.py`,
 `domain/contracts.py`, `domain/dashboard.py`, `domain/effect_retry.py`,
-`domain/effort.py`, `domain/exemptions.py`
+`domain/effort.py`, `domain/environment.py`
+(the harness-attested capability manifest: what the boot probe saw, and the
+narrow conditions under which it may state a verdict rather than facts),
+`domain/exemptions.py`
 (the #124 reviewer-granted gate exemptions: declaration/grant grammar, the
 exemptable-vs-security rule classification, and the merge-withholding rule),
 `domain/events.py`, `domain/fix.py`, `domain/gate.py`,
@@ -467,7 +470,8 @@ exemptable-vs-security rule classification, and the merge-withholding rule),
 `adapters/control_path.py`, `adapters/control_store.py`,
 `adapters/deployment_authority.py`, `adapters/durable_effects.py`,
 `adapters/effects.py`,
-`adapters/env_file.py`, `adapters/event_log.py`, `adapters/github.py`,
+`adapters/env_file.py`, `adapters/environment.py`,
+`adapters/event_log.py`, `adapters/github.py`,
 `adapters/governor.py`, `adapters/handover.py`,
 `adapters/heartbeat.py`, `adapters/journal.py`,
 `adapters/operator_effects.py`, `adapters/process_supervisor.py`,

@@ -37,7 +37,7 @@ from issue_agent.domain.review import (
 )
 from issue_agent.app.planners.tasks import ReviewTaskConfig
 from issue_agent.app.planners.tasks import REVIEW_DIMENSIONS
-from issue_agent.domain.world import PRView, PullRequestDiff, Review
+from issue_agent.domain.world import Comment, PRView, PullRequestDiff, Review
 
 from test_dispatch import FakeGateway, FakeRunner, FakeStore, SchemaRunner, _dim, _gate, _val
 
@@ -97,6 +97,46 @@ def test_initial_review_skips_when_our_verdict_already_targets_head():
         "head_sha": "abc",
         "reason": "reviewer-verdict-on-head",
     }) in journal.events
+
+
+def test_the_pr_conversation_reaches_every_review_round_as_untrusted_data():
+    # Incident 2026-08-08 (tauri #613/#614): the fixer answered a demand for
+    # impossible evidence on the operator-block channel the reviewer cannot see,
+    # so the review re-raised the same demand to its round ceiling. The thread
+    # now rides into the prompt — as DATA, never as instruction.
+    prior = Review("CHANGES_REQUESTED", "review-bot", "t1", commit_id="old")
+    thread = (
+        Comment(author="human", body="please attach a screenshot"),
+        Comment(author="fixer[bot]", body="this deployment has no display"),
+    )
+    pr = PRView(100, head_ref_oid="new", reviews=(prior,), comments=thread)
+    gw = FakeGateway(prs={100: pr})
+    store = FakeStore()
+    store.save_pr_session(100, "rs")
+    store.set_last_sha(100, "old")
+    runner = FakeRunner(AgentResult(
+        is_error=False, structured={"decision": "APPROVE", "body": "ok"},
+    ))
+
+    asyncio.run(_workflow(gw, store, runner).re_review(100))
+    asyncio.run(_workflow(gw, FakeStore(), runner).review(100))
+
+    for task in runner.tasks:
+        assert "<untrusted_pr_discussion_json>" in task.prompt
+        assert "this deployment has no display" in task.prompt
+        # Newest first: the answer, not the demand, is what a bounded view keeps.
+        assert task.prompt.index("no display") < task.prompt.index("attach a screenshot")
+
+
+def test_a_pr_with_no_comments_gets_no_discussion_section():
+    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="new")})
+    runner = FakeRunner(AgentResult(
+        is_error=False, structured={"decision": "APPROVE", "body": "ok"},
+    ))
+
+    asyncio.run(_workflow(gw, FakeStore(), runner).review(100))
+
+    assert "pr_discussion" not in runner.tasks[0].prompt
 
 
 def test_stored_operator_guidance_reaches_the_review_and_re_review_prompts():
@@ -635,6 +675,34 @@ def test_multi_review_carries_the_operator_guidance_to_gate_and_dimensions():
     # gate + every dimension specialist, and NOT the validator legs
     assert len(scoped) == 1 + len(REVIEW_DIMENSIONS)
     assert len(scoped) < len(runner.tasks)
+
+
+def test_multi_review_carries_the_pr_conversation_to_the_dimensions_only():
+    # The specialists are where findings are born. The gate is deliberately
+    # excluded — its only failure direction ends the review in an APPROVE, and a
+    # comment is the wrong evidence for "is this diff behavioural?". Validators
+    # adjudicate one claim on its merits and stay unscoped too.
+    pr = PRView(
+        100, head_ref_oid="abc", title="t", body="b",
+        comments=(Comment(author="fixer[bot]", body="no display in this deployment"),),
+    )
+    gw = FakeGateway(prs={100: pr})
+    runner = SchemaRunner(
+        gate=_gate(),
+        dimension=lambda t: _dim([{"location": "a.py:1", "claim": "bug", "severity": "blocking"}]),
+        validation=lambda t: _val(True),
+    )
+
+    asyncio.run(
+        _workflow(gw, FakeStore(), runner, review_mode=ReviewMode.MULTI).review(100)
+    )
+
+    carried = [t for t in runner.tasks if "<untrusted_pr_discussion_json>" in t.prompt]
+    assert len(carried) == len(REVIEW_DIMENSIONS)
+    assert len(carried) < len(runner.tasks)
+    # The gate leg ran, and ran without it.
+    gate = next(t for t in runner.tasks if "needs a full code review" in t.prompt)
+    assert "pr_discussion" not in gate.prompt
 
 
 def test_multi_review_gate_short_circuits_non_reviewable_diff_to_approve():

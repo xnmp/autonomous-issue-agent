@@ -35,6 +35,7 @@ from ..adapters.control_store import (
 from ..adapters.control_path import control_store_path
 from ..adapters.effects import GitHubEffectExecutor
 from ..adapters.accounting_runtime import AccountingRuntime
+from ..adapters.environment import boot_manifest
 from ..adapters.event_log import EventLog
 from ..adapters.typed_journal import TypedJournal
 from ..adapters.github import GitHubGateway, Identity
@@ -2379,6 +2380,11 @@ def build_fix_daemon(
             mints_visual_receipts=RUNTIME_CAPABILITIES[
                 RuntimeName(cfg.fixer_runtime)
             ].mints_visual_receipts,
+            # Harness-attested, probed once per daemon process (ADR 0012
+            # provenance: the boot probe, never PR content). "" when the probe
+            # could not run → the prompts say nothing rather than attest a
+            # capability that may not hold.
+            environment_manifest=boot_manifest(cfg.evidence_stack),
         ),
         max_review_rejections=cfg.max_review_rejections,
         author_tests_split=fix_runtime.author_tests_split,
@@ -2727,6 +2733,10 @@ def build_review_daemon(
             dimension_budget_usd=review_runtime.dimension_budget_usd,
             validation_budget_usd=review_runtime.validation_budget_usd,
             scout_model=review_runtime.scout_model,
+            # Same harness-attested manifest the fixer carries, so both sides
+            # of a review round argue from one set of facts about the machine
+            # (2026-08-08 tauri #613/#614).
+            environment_manifest=boot_manifest(cfg.evidence_stack),
         ),
         max_review_rejections=review_runtime.max_rejections,
         review_bot=review_runtime.bot,
