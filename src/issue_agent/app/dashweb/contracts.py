@@ -169,6 +169,14 @@ class AttentionItem(Contract):
     detail: str | None = None
 
 
+class EscalationReason(Contract):
+    issue: int
+    # None when the escalating pass recorded no comment: the escalation is
+    # still real, so the row is listed with an unrecorded reason rather than
+    # dropped.
+    reason: str | None = None
+
+
 class InterventionEvent(Contract):
     ts: str | None
     # One of domain.dashboard.INTERVENTION_TIMELINE_CLASSES — rearm, guidance,
@@ -187,6 +195,7 @@ class OverviewPayload(Warned):
     caps: Caps | None
     health: list[RoleHealth]
     needs_attention: list[AttentionItem] = []
+    escalation_reasons: list[EscalationReason] = []
     interventions: list[InterventionEvent] = []
     # Events the fold could correlate to no issue. Nonzero is a telemetry bug
     # signal, so the number is published while the bodies stay in the journal.

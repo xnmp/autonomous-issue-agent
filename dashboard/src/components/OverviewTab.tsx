@@ -3,6 +3,7 @@ import { usePolled } from "../api/hooks";
 import { useNow } from "../lib/clock";
 import type {
   AttentionItem,
+  EscalationReason,
   HealthTrendDay,
   InterventionEvent,
   OverviewPayload,
@@ -147,7 +148,12 @@ export function OverviewTab({
         <StatTile
           label="Escalations"
           value={num(escalations)}
-          sub={spendBlocks > 0 ? `${spendBlocks} spend-blocked` : null}
+          sub={
+            <EscalationDetail
+              reasons={ov.data?.escalation_reasons ?? []}
+              spendBlocks={spendBlocks}
+            />
+          }
           tone={escalations > 0 || spendBlocks > 0 ? "fail" : "neutral"}
           title="needs-human-review relabels, retry exhaustion, infra deaths"
         />
@@ -370,6 +376,40 @@ function HealthCard({ health }: { health: RoleHealth }) {
         </div>
       ) : null}
     </div>
+  );
+}
+
+/**
+ * The escalation count on its own says a human was needed, never what for.
+ * The reasons are the currently-live ones only, so the list shrinks as they
+ * are cleared — a count that only ever grows teaches the operator to ignore it.
+ */
+function EscalationDetail({
+  reasons,
+  spendBlocks,
+}: {
+  reasons: EscalationReason[];
+  spendBlocks: number;
+}) {
+  const blocked = spendBlocks > 0 ? `${spendBlocks} spend-blocked` : null;
+  if (reasons.length === 0) return blocked ? <>{blocked}</> : null;
+  return (
+    <details>
+      <summary>
+        {blocked ? `${blocked} · ` : ""}
+        {reasons.length} still open
+      </summary>
+      <ul className="tile-reasons">
+        {reasons.map((row) => (
+          <li key={row.issue}>
+            <span className="mono">#{row.issue}</span>
+            <span className="trunc" title={row.reason ?? undefined}>
+              {row.reason ?? <span className="faint">reason unrecorded</span>}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </details>
   );
 }
 

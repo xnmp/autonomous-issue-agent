@@ -394,6 +394,15 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** EscalationReason */
+        EscalationReason: {
+            /** Issue */
+            issue: number;
+            /** Reason */
+            reason?: string | null;
+        } & {
+            [key: string]: unknown;
+        };
         /** HTTPValidationError */
         HTTPValidationError: {
             /** Detail */
@@ -729,6 +738,11 @@ export interface components {
         OverviewPayload: {
             caps: components["schemas"]["Caps"] | null;
             cost_mix: components["schemas"]["CostMix"] | null;
+            /**
+             * Escalation Reasons
+             * @default []
+             */
+            escalation_reasons: components["schemas"]["EscalationReason"][];
             /** First Observed Day */
             first_observed_day?: string | null;
             /** Health */

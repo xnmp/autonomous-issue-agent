@@ -521,6 +521,31 @@
         "title": "CostMix",
         "type": "object"
       },
+      "EscalationReason": {
+        "additionalProperties": true,
+        "properties": {
+          "issue": {
+            "title": "Issue",
+            "type": "integer"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          }
+        },
+        "required": [
+          "issue"
+        ],
+        "title": "EscalationReason",
+        "type": "object"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -1792,6 +1817,14 @@
                 "type": "null"
               }
             ]
+          },
+          "escalation_reasons": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/EscalationReason"
+            },
+            "title": "Escalation Reasons",
+            "type": "array"
           },
           "first_observed_day": {
             "anyOf": [

@@ -28,6 +28,7 @@ export type CostMix = Schema["CostMix"];
 export type Caps = Schema["Caps"];
 export type HealthTrendDay = Schema["HealthTrendDay"];
 export type AttentionItem = Schema["AttentionItem"];
+export type EscalationReason = Schema["EscalationReason"];
 export type InterventionEvent = Schema["InterventionEvent"];
 export type OverviewPayload = Schema["OverviewPayload"];
 export type CardStep = Schema["CardStep"];

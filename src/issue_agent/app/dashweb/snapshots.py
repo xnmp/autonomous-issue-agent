@@ -1862,6 +1862,21 @@ def needs_attention(deployment: dash.Deployment) -> list[dict]:
     )
 
 
+def escalation_reasons(deployment: dash.Deployment) -> list[dict]:
+    """Why each currently-escalated issue was handed to a human.
+
+    The same extraction the issue card and the drill-down use, so the tile's
+    sub-lines and the row an operator opens next cannot state different
+    reasons. An escalation whose reason the journal never recorded is still
+    listed — "escalated, reason unrecorded" is itself worth seeing.
+    """
+    return [
+        {"issue": row.issue, "reason": _escalation_reason(row)}
+        for row in deployment.issues
+        if not row.done and _active_escalation_at(row) is not None
+    ]
+
+
 def cost_mix(metrics: dash.Metrics) -> dict:
     """Spend split into the four families the Direction section tracks. Kinds in
     none of them land nowhere by design — `by_kind` already reports them
@@ -2058,6 +2073,7 @@ def overview_payload(
         },
         "health": [health_json(h, alive[h.role]) for h in dep.health],
         "needs_attention": needs_attention(dep),
+        "escalation_reasons": escalation_reasons(dep),
         "interventions": intervention_timeline(dep.metrics),
         # A count, not the rows: an event naming no issue is a correlation the
         # producer failed to stamp, so the number is a telemetry-bug signal and

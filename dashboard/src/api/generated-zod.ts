@@ -244,6 +244,12 @@ const CostMix = z
     steward_usd: z.union([z.number(), z.null()]),
   })
   .passthrough();
+const EscalationReason = z
+  .object({
+    issue: z.number().int(),
+    reason: z.union([z.string(), z.null()]).optional(),
+  })
+  .passthrough();
 const HealthTrendDay = z
   .object({
     closed: z.number().int(),
@@ -305,6 +311,7 @@ const OverviewPayload = z
   .object({
     caps: z.union([Caps, z.null()]),
     cost_mix: z.union([CostMix, z.null()]),
+    escalation_reasons: z.array(EscalationReason).optional().default([]),
     first_observed_day: z.union([z.string(), z.null()]).optional(),
     health: z.array(RoleHealth),
     health_trend: z.array(HealthTrendDay),
@@ -399,6 +406,7 @@ export const schemas = {
   timezone,
   Caps,
   CostMix,
+  EscalationReason,
   HealthTrendDay,
   InterventionEvent,
   KindCost,
@@ -754,6 +762,7 @@ const endpoints = makeApi([
       .object({
         caps: z.union([Caps, z.null()]),
         cost_mix: z.union([CostMix, z.null()]),
+        escalation_reasons: z.array(EscalationReason).optional().default([]),
         first_observed_day: z.union([z.string(), z.null()]).optional(),
         health: z.array(RoleHealth),
         health_trend: z.array(HealthTrendDay),

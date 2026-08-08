@@ -681,6 +681,24 @@
   font-size: var(--fs-xs);
   margin-top: 2px;
 }
+.tile-reasons {
+  list-style: none;
+  margin: var(--s2) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.tile-reasons li {
+  display: flex;
+  gap: var(--s2);
+  min-width: 0;
+}
+.tile-reasons summary {
+  cursor: pointer;
+}
 
 .grid-2 {
   display: grid;

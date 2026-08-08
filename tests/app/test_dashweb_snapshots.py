@@ -1171,6 +1171,57 @@ def test_metrics_json_carries_the_intervention_split_and_ratio():
     assert payload["interventions_per_merged_pr"] is None  # nothing merged yet
 
 
+# ── escalation reasons ────────────────────────────────────────────────────────
+def _deployment_of(*rows):
+    return replace(build([RESOLVE]), issues=tuple(rows))
+
+
+def test_the_overview_aggregates_a_reason_per_escalated_issue():
+    dep = _deployment_of(
+        row_view([BREAKER_COMMENT, ESCALATION], issue=7),
+        replace(row_view([BREAKER_COMMENT, ESCALATION], issue=7), issue=9),
+    )
+
+    assert [item["issue"] for item in snapshots.escalation_reasons(dep)] == [7, 9]
+    assert snapshots.escalation_reasons(dep)[0]["reason"] == (
+        "Circuit breaker: 5 review rounds on this PR ended without a verdict "
+        "— a human must decide."
+    )
+
+
+def test_an_escalation_whose_reason_was_never_recorded_is_still_listed():
+    dep = _deployment_of(row_view([ESCALATION], issue=7))
+
+    assert snapshots.escalation_reasons(dep) == [{"issue": 7, "reason": None}]
+
+
+def test_a_retired_escalation_leaves_the_overview_list():
+    dep = _deployment_of(row_view([
+        BREAKER_COMMENT,
+        ESCALATION,
+        {"ts": ts(minutes=30), "event": "action", "issue": 7,
+         "desc": "relabel issue #7: -needs-human-review",
+         "action": {"type": "relabel", "target": "ISSUE", "number": 7,
+                    "add": [], "remove": ["needs-human-review"]}},
+    ], issue=7))
+
+    assert snapshots.escalation_reasons(dep) == []
+
+
+def test_a_finished_issue_is_not_still_escalated_on_the_overview():
+    row = replace(row_view([BREAKER_COMMENT, ESCALATION], issue=7), done=True)
+
+    assert snapshots.escalation_reasons(_deployment_of(row)) == []
+
+
+def test_the_tile_sub_lines_and_the_issue_card_state_the_same_reason():
+    row = row_view([BREAKER_COMMENT, ESCALATION], issue=7)
+
+    assert snapshots.escalation_reasons(_deployment_of(row))[0]["reason"] == (
+        snapshots.issue_card(row, NOW)["escalation_reason"]
+    )
+
+
 # ── needs attention ───────────────────────────────────────────────────────────
 def _observed(issue: int, labels, seq: int, *, title="a title", present=True):
     return v2_event(

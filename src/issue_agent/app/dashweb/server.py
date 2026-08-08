@@ -173,6 +173,7 @@ def create_app(
                 caps=None,
                 health=[],
                 needs_attention=[],
+                escalation_reasons=[],
                 interventions=[],
                 unattributed_count=0,
                 health_trend=[],
