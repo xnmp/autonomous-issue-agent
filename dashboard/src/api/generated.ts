@@ -272,6 +272,19 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** AttentionItem */
+        AttentionItem: {
+            /** Detail */
+            detail?: string | null;
+            /** Issue */
+            issue: number;
+            /** Kind */
+            kind: string;
+            /** Title */
+            title?: string | null;
+        } & {
+            [key: string]: unknown;
+        };
         /** BacklogCard */
         BacklogCard: {
             /** Age Days */
@@ -728,6 +741,11 @@ export interface components {
              */
             interventions: components["schemas"]["InterventionEvent"][];
             metrics: components["schemas"]["Metrics"] | null;
+            /**
+             * Needs Attention
+             * @default []
+             */
+            needs_attention: components["schemas"]["AttentionItem"][];
             /**
              * Spend Per Hour
              * @default []

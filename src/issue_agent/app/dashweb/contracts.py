@@ -160,6 +160,15 @@ class SpendBucket(Contract):
     usd: float
 
 
+class AttentionItem(Contract):
+    issue: int
+    title: str | None = None
+    # One of snapshots.ATTENTION_ORDER. Open-typed: a class this build does not
+    # know must still render rather than fail the overview.
+    kind: str
+    detail: str | None = None
+
+
 class InterventionEvent(Contract):
     ts: str | None
     # One of domain.dashboard.INTERVENTION_TIMELINE_CLASSES — rearm, guidance,
@@ -177,6 +186,7 @@ class OverviewPayload(Warned):
     cost_mix: CostMix | None
     caps: Caps | None
     health: list[RoleHealth]
+    needs_attention: list[AttentionItem] = []
     interventions: list[InterventionEvent] = []
     # Events the fold could correlate to no issue. Nonzero is a telemetry bug
     # signal, so the number is published while the bodies stay in the journal.

@@ -290,6 +290,14 @@ const Metrics = z
     total_cost_usd: z.union([z.number(), z.null()]),
   })
   .passthrough();
+const AttentionItem = z
+  .object({
+    detail: z.union([z.string(), z.null()]).optional(),
+    issue: z.number().int(),
+    kind: z.string(),
+    title: z.union([z.string(), z.null()]).optional(),
+  })
+  .passthrough();
 const SpendBucket = z
   .object({ hour_start_iso: z.string(), usd: z.number() })
   .passthrough();
@@ -302,6 +310,7 @@ const OverviewPayload = z
     health_trend: z.array(HealthTrendDay),
     interventions: z.array(InterventionEvent).optional().default([]),
     metrics: z.union([Metrics, z.null()]),
+    needs_attention: z.array(AttentionItem).optional().default([]),
     spend_per_hour: z.array(SpendBucket).optional().default([]),
     unattributed_count: z.number().int().optional().default(0),
     warnings: z.array(z.string()),
@@ -395,6 +404,7 @@ export const schemas = {
   KindCost,
   InterventionCount,
   Metrics,
+  AttentionItem,
   SpendBucket,
   OverviewPayload,
   ClaudeUsage,
@@ -749,6 +759,7 @@ const endpoints = makeApi([
         health_trend: z.array(HealthTrendDay),
         interventions: z.array(InterventionEvent).optional().default([]),
         metrics: z.union([Metrics, z.null()]),
+        needs_attention: z.array(AttentionItem).optional().default([]),
         spend_per_hour: z.array(SpendBucket).optional().default([]),
         unattributed_count: z.number().int().optional().default(0),
         warnings: z.array(z.string()),

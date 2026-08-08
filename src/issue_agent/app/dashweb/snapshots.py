@@ -1452,10 +1452,25 @@ def _pr_review_state(gh_pr: dict | None) -> str | None:
     return None
 
 
+def hold_state(
+    row: dash.IssueRow | None,
+    labels,
+) -> tuple[bool, str | None]:
+    """Whether this issue is waiting rather than working, and why.
+
+    Parked outranks any journalled dependency hold: the operator's decision is
+    the reason the issue is waiting, not the hold that preceded it. One
+    definition, because a pending card that said "held" while the attention
+    panel stayed silent would be two answers to the same question.
+    """
+    parked = "ai-parked" in set(labels)
+    defer = {} if parked else (_deferred_event(row) if row else {})
+    return (parked or bool(defer), "parked" if parked else waiting_label(defer))
+
+
 def pending_card(issue: dict, row: dash.IssueRow | None) -> dict:
     labels = labels_of(issue)
-    parked = "ai-parked" in labels
-    defer = {} if parked else (_deferred_event(row) if row else {})
+    held, hold_reason = hold_state(row, labels)
     return {
         "issue": int(issue.get("number") or 0),
         "title": issue.get("title"),
@@ -1463,11 +1478,8 @@ def pending_card(issue: dict, row: dash.IssueRow | None) -> dict:
         "body": issue.get("body"),
         "priority": priority_of(labels),
         "labels": labels,
-        # Parked outranks any journalled dependency hold: the operator's
-        # decision is the reason this issue is waiting, not the hold that
-        # preceded it.
-        "held": parked or bool(defer),
-        "hold_reason": "parked" if parked else waiting_label(defer),
+        "held": held,
+        "hold_reason": hold_reason,
         "overlap": None,
     }
 
@@ -1786,6 +1798,70 @@ def intervention_timeline(
     return rows
 
 
+# The attention classes, most urgent first: the harness has literally asked a
+# question, then a human owns the outcome, then money, then the queue is merely
+# waiting. Ordering is the panel's whole point — a flat list nobody can triage
+# is the state the overview already had.
+ATTENTION_ORDER = (
+    "blocked",
+    "escalated",
+    "needs-budget-review",
+    "spend-blocked",
+    "held",
+)
+
+
+def _row_labels(row: dash.IssueRow) -> set[str]:
+    labels = row.facts.get("labels", ())
+    if isinstance(labels, (tuple, list, set, frozenset)):
+        return {str(label) for label in labels}
+    return set()
+
+
+def _attention_reasons(row: dash.IssueRow) -> list[tuple[str, str | None]]:
+    """Every reason this open issue is waiting on a person, richest detail
+    first. An issue can be several at once (blocked AND out of budget), and
+    collapsing that to one row would hide the half the operator must act on."""
+    labels = _row_labels(row)
+    reasons: list[tuple[str, str | None]] = []
+    if "ai-blocked" in labels:
+        reasons.append(("blocked", _blocked_reason(row)))
+    if "needs-human-review" in labels:
+        reasons.append(("escalated", _escalation_reason(row)))
+    if "needs-budget-review" in labels:
+        reasons.append(("needs-budget-review", None))
+    if row.spend_blocks:
+        reasons.append(("spend-blocked", f"{row.spend_blocks} spend block(s)"))
+    held, hold_reason = hold_state(row, labels)
+    if held:
+        reasons.append(("held", hold_reason))
+    return reasons
+
+
+def needs_attention(deployment: dash.Deployment) -> list[dict]:
+    """Open issues waiting on a person, with the reason each one is waiting."""
+    items = []
+    for row in deployment.issues:
+        if row.done:
+            continue
+        for kind, detail in _attention_reasons(row):
+            items.append(
+                {
+                    "issue": row.issue,
+                    # The world projection carries the title but no URL, and
+                    # the overview deliberately makes no GitHub call: an
+                    # at-a-glance panel must not depend on a network read.
+                    "title": row.facts.get("title"),
+                    "kind": kind,
+                    "detail": detail,
+                }
+            )
+    return sorted(
+        items,
+        key=lambda item: (ATTENTION_ORDER.index(item["kind"]), item["issue"]),
+    )
+
+
 def cost_mix(metrics: dash.Metrics) -> dict:
     """Spend split into the four families the Direction section tracks. Kinds in
     none of them land nowhere by design — `by_kind` already reports them
@@ -1981,6 +2057,7 @@ def overview_payload(
             "today_usd": dep.metrics.today_usd,
         },
         "health": [health_json(h, alive[h.role]) for h in dep.health],
+        "needs_attention": needs_attention(dep),
         "interventions": intervention_timeline(dep.metrics),
         # A count, not the rows: an event naming no issue is a correlation the
         # producer failed to stamp, so the number is a telemetry-bug signal and

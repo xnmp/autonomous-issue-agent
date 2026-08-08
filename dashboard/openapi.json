@@ -20,6 +20,47 @@
         "title": "ActionResult",
         "type": "object"
       },
+      "AttentionItem": {
+        "additionalProperties": true,
+        "properties": {
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "issue": {
+            "title": "Issue",
+            "type": "integer"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "issue",
+          "kind"
+        ],
+        "title": "AttentionItem",
+        "type": "object"
+      },
       "BacklogCard": {
         "additionalProperties": true,
         "properties": {
@@ -1794,6 +1835,14 @@
                 "type": "null"
               }
             ]
+          },
+          "needs_attention": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/AttentionItem"
+            },
+            "title": "Needs Attention",
+            "type": "array"
           },
           "spend_per_hour": {
             "default": [],

@@ -2,6 +2,7 @@ import { api } from "../api/client";
 import { usePolled } from "../api/hooks";
 import { useNow } from "../lib/clock";
 import type {
+  AttentionItem,
   HealthTrendDay,
   InterventionEvent,
   OverviewPayload,
@@ -88,6 +89,8 @@ export function OverviewTab({
       ) : null}
       <WarningList warnings={ov.data?.warnings} />
       {ov.loading ? <SkeletonRows what="overview" rows={5} /> : null}
+
+      <NeedsAttention items={ov.data?.needs_attention ?? []} loading={ov.loading} />
 
       <div className="tiles">
         <StatTile
@@ -367,6 +370,60 @@ function HealthCard({ health }: { health: RoleHealth }) {
         </div>
       ) : null}
     </div>
+  );
+}
+
+const ATTENTION_TONE: Record<string, "fail" | "running" | "meta" | "info"> = {
+  blocked: "fail",
+  escalated: "fail",
+  "needs-budget-review": "running",
+  "spend-blocked": "running",
+  held: "meta",
+};
+
+const ATTENTION_LABEL: Record<string, string> = {
+  blocked: "asked a question",
+  escalated: "escalated",
+  "needs-budget-review": "needs budget review",
+  "spend-blocked": "spend blocked",
+  held: "held",
+};
+
+/**
+ * What is waiting on a person right now — first thing on the page, because
+ * every other panel on this tab describes the past. An empty panel is the
+ * good outcome and says so rather than disappearing, so "nothing needs me"
+ * and "the overview failed to load" never look alike.
+ */
+function NeedsAttention({ items, loading }: { items: AttentionItem[]; loading: boolean }) {
+  return (
+    <section className="panel">
+      <div className="panel-hd">
+        <span className="panel-title">Needs attention</span>
+        <span className="faint">{items.length > 0 ? `${items.length} waiting on a human` : "nothing waiting"}</span>
+      </div>
+      <div className="panel-bd col" style={{ gap: "var(--s2)" }}>
+        {loading && items.length === 0 ? <Loading what="attention" /> : null}
+        {!loading && items.length === 0 ? (
+          <EmptyState>no issue is waiting on a human</EmptyState>
+        ) : null}
+        {items.map((item) => (
+          <div className="usage-line" key={`${item.issue}-${item.kind}`}>
+            <Chip tone={ATTENTION_TONE[item.kind] ?? "info"} square>
+              {ATTENTION_LABEL[item.kind] ?? item.kind}
+            </Chip>
+            <span className="mono">#{item.issue}</span>
+            <span className="trunc" title={item.title ?? undefined}>
+              {item.title ?? <span className="faint">title unavailable</span>}
+            </span>
+            <span className="spacer" />
+            {item.detail ? (
+              <span className="faint trunc" title={item.detail}>{item.detail}</span>
+            ) : null}
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 

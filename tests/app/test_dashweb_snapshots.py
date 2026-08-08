@@ -1171,6 +1171,110 @@ def test_metrics_json_carries_the_intervention_split_and_ratio():
     assert payload["interventions_per_merged_pr"] is None  # nothing merged yet
 
 
+# ── needs attention ───────────────────────────────────────────────────────────
+def _observed(issue: int, labels, seq: int, *, title="a title", present=True):
+    return v2_event(
+        WorldObserved(
+            "issue", issue, f"h{issue}",
+            {"present": present, "state": "OPEN", "title": title,
+             "labels": list(labels)},
+        ),
+        f"w{issue}-{seq}", seq, issue=issue,
+    )
+
+
+def _attention(events):
+    return snapshots.needs_attention(v2_deployment(events))
+
+
+def test_needs_attention_names_the_issue_and_why_it_is_waiting():
+    items = _attention([
+        _observed(7, ["ai-blocked"], 0),
+        _observed(8, ["needs-human-review"], 1, title="escalated one"),
+        _observed(9, ["needs-budget-review", "ai-working"], 2),
+    ])
+
+    assert [(item["issue"], item["kind"]) for item in items] == [
+        (7, "blocked"), (8, "escalated"), (9, "needs-budget-review"),
+    ]
+    assert items[1]["title"] == "escalated one"
+
+
+def test_a_blocked_issue_carries_the_question_the_agent_actually_asked():
+    items = _attention([
+        _observed(7, ["ai-blocked"], 0),
+        v2_event(AgentRunStarted("m", kind="RESOLVE"), "s", 1, issue=7, run_id="r"),
+        v2_event(
+            AgentRunCompleted(
+                "blocked", False, "ok", 1000, "m", "codex",
+                kind="RESOLVE", cost_micros=0, currency="USD",
+                pricing_basis="api",
+                attributes={
+                    "needs": "Which database should the migration target?\nmore"
+                },
+            ),
+            "c", 2, issue=7, run_id="r",
+        ),
+    ])
+
+    assert [item["kind"] for item in items] == ["blocked"]
+    assert items[0]["detail"] == "Which database should the migration target?"
+
+
+def test_one_issue_waiting_for_two_reasons_is_reported_as_both():
+    items = _attention([
+        _observed(7, ["ai-blocked", "needs-budget-review"], 0),
+    ])
+
+    assert [item["kind"] for item in items] == ["blocked", "needs-budget-review"]
+
+
+def test_a_parked_issue_is_reported_as_held_with_the_operators_reason():
+    items = _attention([_observed(7, ["ai-parked"], 0)])
+
+    assert [(item["kind"], item["detail"]) for item in items] == [("held", "parked")]
+
+
+def test_the_attention_panel_is_ordered_by_urgency_then_issue_number():
+    items = _attention([
+        _observed(30, ["ai-parked"], 0),
+        _observed(20, ["needs-human-review"], 1),
+        _observed(12, ["ai-blocked"], 2),
+        _observed(11, ["ai-blocked"], 3),
+    ])
+
+    assert [item["kind"] for item in items] == [
+        "blocked", "blocked", "escalated", "held",
+    ]
+    assert [item["issue"] for item in items][:2] == [11, 12]
+
+
+def test_a_finished_or_untouched_issue_needs_no_attention():
+    assert _attention([_observed(7, ["ai-done"], 0)]) == []
+    assert _attention([_observed(7, [], 0)]) == []
+
+
+def test_needs_attention_tolerates_an_issue_with_no_observed_labels():
+    """A row the world reporter never described must not crash the overview —
+    it simply has nothing to say about who is waiting."""
+    dep = v2_deployment([
+        v2_event(AgentRunStarted("m", kind="RESOLVE"), "a", 0, issue=7, run_id="r"),
+    ])
+
+    assert snapshots.needs_attention(dep) == []
+
+
+def test_the_pending_card_and_the_attention_panel_share_one_hold_definition():
+    row = v2_deployment([_observed(7, ["ai-parked"], 0)]).issues[0]
+    card = snapshots.pending_card(
+        {"number": 7, "labels": ["ai-parked", "ai-ready"]}, row
+    )
+
+    assert card["held"] is True
+    assert card["hold_reason"] == "parked"
+    assert snapshots.hold_state(row, ["ai-parked"]) == (True, "parked")
+
+
 # ── operator-actions timeline ─────────────────────────────────────────────────
 def _operator_event(ts_value, action, **extra):
     return {"ts": ts_value, "event": "action", "role": "fix", "action": action,
