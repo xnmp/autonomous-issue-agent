@@ -577,6 +577,18 @@ def test_a_mass_test_rewrite_is_still_denied_at_the_scope_bound():
     assert check_tests_immutable(at_bound, lambda f: f in existed).ok
 
 
+def test_four_mechanically_updated_specs_pass_the_gate_589():
+    # tauri #589 (2026-08-09): a shared interaction change (AI actions moved
+    # into a submenu) forced path updates in four existing e2e specs — an
+    # unsplittable, rewrite-free change the old bound of 3 turned into an
+    # operator decision. Four modified existing tests must pass the gate;
+    # authorization stays with the per-file reviewer grants at merge.
+    existed = {f"e2e/ai-{name}.spec.ts" for name in ("organize", "rename", "banana", "upscale")}
+    res = check_tests_immutable(sorted(existed), lambda f: f in existed)
+    assert res.ok
+    assert MAX_TEST_IMMUTABILITY_EXCEPTIONS >= 4
+
+
 def test_only_existing_test_files_count_toward_the_bound():
     # Anti-vacuity for the bound: new test files and non-test files are not
     # subjects, so a big change is not denied for touching many of them.

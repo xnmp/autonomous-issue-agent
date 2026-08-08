@@ -958,11 +958,11 @@ def test_tests_renamed_out_of_the_tree_count_toward_the_scope_bound():
     renamed = GateContext(**{
         **_good_pr_ctx().__dict__,
         # A NEW test keeps required-test satisfied; the point here is the
-        # four renamed-away OLD paths. (That the old paths alone do NOT
+        # nine renamed-away OLD paths. (That the old paths alone do NOT
         # satisfy required-test is the separation this field exists for.)
-        "changed_files": tuple(f"docs/old_{i}.txt" for i in range(4))
+        "changed_files": tuple(f"docs/old_{i}.txt" for i in range(9))
         + ("tests/test_new.py",),
-        "touched_at_base": tuple(f"tests/test_{i}.py" for i in range(4)),
+        "touched_at_base": tuple(f"tests/test_{i}.py" for i in range(9)),
         "exists_at_base": lambda f: f.startswith("tests/"),
     })
     v = evaluate_command(_good_pr_cmd(), renamed)
@@ -987,7 +987,7 @@ def test_a_mass_test_rewrite_still_denies_and_teaches_no_trailer():
     # carries unparsed Gate-Exemption lines.
     many = GateContext(**{
         **_good_pr_ctx().__dict__,
-        "changed_files": tuple(f"tests/test_{i}.py" for i in range(4)) + ("src/x.py",),
+        "changed_files": tuple(f"tests/test_{i}.py" for i in range(9)) + ("src/x.py",),
         "exists_at_base": lambda f: f.startswith("tests/"),
         "malformed_exemption_lines": 2,
     })

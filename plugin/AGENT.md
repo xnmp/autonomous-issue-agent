@@ -232,7 +232,7 @@ don't keep going back to edit it — each re-plan costs a full model round-trip.
   test to go green. You MAY correct an existing test whose expectation is
   itself wrong (including making it self-isolating so it passes on any host):
   do it directly — no trailer, no permission request — and explain the
-  correction in the PR description. The gate admits up to 3 modified existing
+  correction in the PR description. The gate admits up to 8 modified existing
   test files (more reads as a rewrite and is denied), and the independent
   reviewer must explicitly approve every one of them before the PR can merge,
   so a weakened test cannot land unnoticed. Do NOT refactor unrelated code.

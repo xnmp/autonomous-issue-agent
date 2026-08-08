@@ -56,19 +56,6 @@ RULE_REQUIRED_TEST = "required-test"
 # The whole-change subject for rules that are not per-file.
 SUBJECT_WHOLE_CHANGE = "*"
 
-# rule id → maximum DISTINCT subjects one PR may declare for it. The bound is
-# about scope, not authorization — a change rewriting four existing test files
-# is a rewrite, not a correction (from #134, the one part of it that
-# survives). Membership here IS the exemptable classification.
-EXEMPTABLE_RULES: dict[str, int] = {
-    RULE_TESTS_IMMUTABLE: 3,
-    RULE_REQUIRED_TEST: 1,
-}
-
-# Kept under its historical name — the tests-immutable cap predates the
-# generalization and the shell twin names it.
-MAX_TEST_IMMUTABILITY_EXCEPTIONS = EXEMPTABLE_RULES[RULE_TESTS_IMMUTABLE]
-
 # Total declarations one change may carry, across all rules. Declarations are
 # fixer-authored and each one becomes a line in the reviewer's TRUSTED prompt
 # tail plus an enum member in the review schema — unbounded count is a paid
@@ -76,6 +63,26 @@ MAX_TEST_IMMUTABILITY_EXCEPTIONS = EXEMPTABLE_RULES[RULE_TESTS_IMMUTABLE]
 # schema per round). Anything beyond the cap is dropped at parse, which fails
 # CLOSED: an undeclared violation is still denied by its gate.
 MAX_DECLARATIONS_PER_CHANGE = 8
+
+# rule id → maximum DISTINCT subjects one PR may declare for it. Membership
+# here IS the exemptable classification. The tests-immutable bound was 3 as a
+# rewrite heuristic ("four rewritten tests is a rewrite, not a correction",
+# #134); tauri #589 (2026-08-09) falsified the heuristic — a shared
+# interaction change forced mechanical path updates in four e2e specs, an
+# unsplittable change with no rewrite in it, and the wall turned it into an
+# operator decision. Authorization was never the count: every modified test
+# file needs its own authenticated, patch-bound REVIEW_BOT grant before
+# auto-merge. So the scope bound now defers to the declaration-inflation cap,
+# keeping the reviewer's per-file hazard list bounded while the count stops
+# encoding policy.
+EXEMPTABLE_RULES: dict[str, int] = {
+    RULE_TESTS_IMMUTABLE: MAX_DECLARATIONS_PER_CHANGE,
+    RULE_REQUIRED_TEST: 1,
+}
+
+# Kept under its historical name — the tests-immutable cap predates the
+# generalization and the shell twin names it.
+MAX_TEST_IMMUTABILITY_EXCEPTIONS = EXEMPTABLE_RULES[RULE_TESTS_IMMUTABLE]
 
 
 @dataclass(frozen=True)
@@ -162,10 +169,8 @@ def parse_exemption_declarations(
         if m and m.group(1) in EXEMPTABLE_RULES:
             seen.setdefault(ExemptionDeclaration(m.group(1), m.group(2)))
             if len(seen) >= MAX_DECLARATIONS_PER_CHANGE:
-                # Anything past the cap is dropped — fail closed, the
-                # undeclared violation is still denied by its gate — and a
-                # capped set already exceeds every per-rule scope bound, so
-                # the merge side withholds regardless.
+                # Anything past the cap is dropped — fail closed: the
+                # undeclared violation is still denied by its gate.
                 break
     return tuple(seen)
 

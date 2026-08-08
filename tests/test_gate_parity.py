@@ -597,11 +597,12 @@ def _notest_repo(trailer: str = ""):
 
 
 def _rewritten_tests_repo(tmp_path: Path) -> Path:
-    """A branch that MODIFIES four existing test files — past the scope bound,
-    which is the one thing tests-immutable still denies on both stacks."""
+    """A branch that MODIFIES nine existing test files — past the scope bound
+    (8 since tauri #589), which is the one thing tests-immutable still denies
+    on both stacks."""
     repo = fresh_repo(tmp_path)
     (repo / "tests").mkdir()
-    for i in range(4):
+    for i in range(9):
         (repo / "tests" / f"test_{i}.py").write_text(f"def test_{i}(): assert True\n")
     _git(repo, "add", "tests")
     _git(repo, "commit", "-qm", "test: baseline")
@@ -610,7 +611,7 @@ def _rewritten_tests_repo(tmp_path: Path) -> Path:
     (repo / "tests" / "test_new_regression.py").write_text("def test_new(): assert True\n")
     _git(repo, "add", "tests/test_new_regression.py")
     _git(repo, "commit", "-qm", "red: new")
-    for i in range(4):
+    for i in range(9):
         (repo / "tests" / f"test_{i}.py").write_text(
             f"def test_{i}(): assert True  # corrected\n"
         )
