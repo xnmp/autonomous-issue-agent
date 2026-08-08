@@ -313,7 +313,12 @@ def test_a_bool_effect_receipt_never_crashes_the_run_id_journal():
     cancelled = next(f for e, f in j.events if e == "ci_cancel")
     assert (cancelled["run_ids"], cancelled["requested_run_ids"],
             cancelled["ok"]) == ([], [4242], True)
-    assert next(f for e, f in j.events if e == "ci_rerun")["run_ids"] == []
+    # #177: a bool receipt still names the runs the re-run targeted — reading
+    # them off the outcome alone reported `run_ids:[]` for every durable-path
+    # re-run, success included, which read as "the lookup found nothing".
+    rerun = next(f for e, f in j.events if e == "ci_rerun")
+    assert (rerun["run_ids"], rerun["requested_run_ids"], rerun["run_id"],
+            rerun["ok"]) == ([4242], [4242], 4242, True)
 
 
 class _BoolReceiptExecutor:

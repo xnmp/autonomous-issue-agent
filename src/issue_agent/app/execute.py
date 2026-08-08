@@ -584,7 +584,16 @@ class Executor:
                         "not executable — the paid CI-fix leg dispatches next poll"
                     )
                 if self._journal is not None:
-                    rerun_ids = _effect_run_ids(outcome)
+                    # The durable executor normalises its outcome to a bool, so
+                    # the ids it re-ran can only come from the request itself —
+                    # which names them exactly. Reading them off the outcome
+                    # alone reported `run_ids:[]` for every re-run the durable
+                    # path made, success included (issue #177), and that empty
+                    # field was read as "the failed-run lookup found nothing".
+                    refused = _effect_refused(outcome)
+                    rerun_ids = _effect_run_ids(outcome) or (
+                        () if refused else action.run_ids
+                    )
                     self._journal.emit(
                         TelemetryEvent(
                             TelemetryWarning(
@@ -594,7 +603,8 @@ class Executor:
                                     "head": action.head,
                                     "run_id": rerun_ids[0] if rerun_ids else 0,
                                     "run_ids": list(rerun_ids),
-                                    "ok": not _effect_refused(outcome),
+                                    "requested_run_ids": list(action.run_ids),
+                                    "ok": not refused,
                                 },
                             ),
                             Correlation(pr=action.pr),

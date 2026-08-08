@@ -156,6 +156,10 @@ class InMemoryGitHub:
         # a failure (adversarial review S1). `complete_runs` models the lag.
         return cancelled
 
+    def advance_run_attempts(self, head: str) -> None:
+        """Let GitHub start the queued re-run (next tick)."""
+        self.run_attempts[head] = self.run_attempts.get(head, 0) + 1
+
     def complete_runs(self, head: str) -> None:
         """Let GitHub finish taking the cancelled runs down (next tick)."""
         for run_id in self.run_states.get(head, {}):
@@ -249,7 +253,11 @@ class InMemoryGitHub:
         ):
             return None
         self.calls.append(("rerun", head, run_ids))
-        self.run_attempts[head] = self.run_attempts.get(head, 0) + 1
+        # Deliberately does NOT bump the attempt counter: GitHub queues the
+        # re-run and increments `run_attempt` asynchronously, and a fake that
+        # increments it synchronously hides the bug where every successful free
+        # re-run is receipted as "GitHub did not confirm" (issue #177).
+        # `advance_run_attempts` models the lag.
         if self.rerun_run_id is None:
             return None
         return run_ids

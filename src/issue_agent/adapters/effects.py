@@ -422,14 +422,19 @@ class GitHubEffectExecutor:
 
         def apply_and_verify() -> EffectOutcome[bool]:
             applied = self._apply(action, command)
-            if isinstance(action, CancelWorkflowRuns):
-                # This effect's postcondition is that GitHub ACCEPTED the cancel
-                # for runs still belonging to the observed head — which is what
-                # `_apply` returns. Verifying "the run is down" here instead
-                # would fail every successful cancel, because GitHub takes the
-                # run down asynchronously (adversarial review S1). The harness
-                # tracks that convergence itself, in the await-cancel step
-                # bounded by `cancel_grace_breached`.
+            if isinstance(action, (CancelWorkflowRuns, RerunFailedChecks)):
+                # These effects' postcondition is that GitHub ACCEPTED the
+                # request for runs still belonging to the observed head — which
+                # is what `_apply` returns. Verifying convergence here instead
+                # fails every successful call, because GitHub applies both
+                # asynchronously: a cancelled run comes down later (adversarial
+                # review S1), and `run_attempt` increments later (issue #177 —
+                # on xnmp/tauri-explorer 2026-08-08 EVERY free re-run landed
+                # yet was receipted `ok:false` / "did not confirm", because the
+                # counter caught up ~20s after the POST). The harness tracks
+                # convergence itself: the cancel in the await-cancel step
+                # bounded by `cancel_grace_breached`, the re-run through the
+                # checks flipping to PENDING and the one-shot head marker.
                 outcome = bool(applied)
             elif not applied:
                 outcome = False
@@ -439,19 +444,28 @@ class GitHubEffectExecutor:
                 raise UnknownEffectOutcome(
                     f"{command.command_id}: remote postcondition is unavailable"
                 )
-            retryable = not outcome
+            if outcome:
+                return EffectOutcome(True, EffectStatus.SUCCEEDED)
+            if isinstance(action, RerunFailedChecks):
+                # Terminal, not retryable (ADR 0012 ceiling, issue #177). A
+                # refusal means the captured runs no longer match the observed
+                # head — a fact no retry changes — and the free re-run's one
+                # attempt for this head is already spent (the marker is written
+                # before the call). Redriving it would re-POST a re-run the
+                # decision layer will never ask for again; the paid FIX_CI leg
+                # is the designed successor.
+                return EffectOutcome(
+                    False,
+                    EffectStatus.PERMANENT_FAILURE,
+                    error=(
+                        "captured failed runs are no longer rerunnable at "
+                        "this head"
+                    ),
+                )
             return EffectOutcome(
-                outcome,
-                (
-                    EffectStatus.RETRYABLE_FAILURE
-                    if retryable
-                    else EffectStatus.SUCCEEDED
-                ),
-                error=(
-                    "GitHub did not confirm the requested remote state"
-                    if retryable
-                    else None
-                ),
+                False,
+                EffectStatus.RETRYABLE_FAILURE,
+                error="GitHub did not confirm the requested remote state",
             )
 
         return self.effects.execute(command, apply_and_verify)
@@ -743,9 +757,14 @@ class GitHubEffectExecutor:
                 )
             baseline = _run_attempt_baseline(command, action.run_ids)
             if baseline is None:
-                raise UnknownEffectOutcome(
-                    f"pr:{action.pr}: rerun attempt baseline is unavailable"
-                )
+                # A refusal, not an ambiguity (issue #177). The baseline is the
+                # command's OWN captured payload: if it is missing or malformed
+                # it will still be missing or malformed next tick, so raising
+                # here parked the command in `unknown_outcome` and every drain
+                # re-raised it — a loop with no ceiling, because unknown
+                # outcomes do not count refusals. Refusing is terminal for this
+                # head, which the free re-run has already spent.
+                return None
             return self.gateway.rerun_failed_checks(
                 action.head, action.run_ids, baseline
             )

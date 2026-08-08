@@ -83,8 +83,13 @@ class Gateway:
     def rerun_failed_checks(self, head, run_ids, expected_attempts=None):
         assert expected_attempts in (None, {run_id: self.run_attempt for run_id in run_ids})
         self.calls.append(("rerun", head, run_ids))
-        self.run_attempt += 1
+        # Asynchronous, like the real endpoint: `run_attempt` is NOT yet
+        # incremented when the POST returns (issue #177). Tests call
+        # `advance_run_attempts` to model GitHub catching up.
         return run_ids
+
+    def advance_run_attempts(self):
+        self.run_attempt += 1
 
     def workflow_run_states(self, head, run_ids):
         if head != self.head:
@@ -575,6 +580,7 @@ def test_ambiguous_check_rerun_is_reconciled_by_attempt_number(tmp_path) -> None
     except RuntimeError:
         pass
     gateway.rerun_failed_checks = original
+    gateway.advance_run_attempts()  # GitHub started the queued re-run
 
     assert executor.execute(action)
     assert gateway.calls == [("rerun", "head-1", (42,))]
@@ -612,7 +618,23 @@ def test_partially_applied_multi_run_rerun_is_never_blindly_retried(
     assert store.pending_commands()[0].state == "unknown_outcome"
 
 
-def test_unconfirmed_check_rerun_stays_retryable(tmp_path) -> None:
+def test_accepted_check_rerun_succeeds_before_the_attempt_counter_moves(
+    tmp_path,
+) -> None:
+    """#177: GitHub queues the re-run and bumps `run_attempt` seconds later.
+    Acceptance is the postcondition; convergence is observed from the world."""
+    executor, gateway, store = _executor(tmp_path)
+
+    assert executor.execute(RerunFailedChecks(7, "head-1", (42,))) is True
+
+    assert gateway.calls == [("rerun", "head-1", (42,))]
+    assert gateway.run_attempt == 0
+    assert store.pending_commands() == ()
+
+
+def test_refused_check_rerun_is_terminal_for_this_head(tmp_path) -> None:
+    """The free re-run's one attempt per head is spent by the request itself,
+    so a refusal must not be redriven next tick (ADR 0012 ceiling)."""
     executor, gateway, store = _executor(tmp_path)
     action = RerunFailedChecks(7, "head-1", (42,))
     original = gateway.rerun_failed_checks
@@ -621,11 +643,45 @@ def test_unconfirmed_check_rerun_stays_retryable(tmp_path) -> None:
     )
 
     assert executor.execute(action) is False
-    assert store.pending_commands()[0].state == "retryable_failure"
+    assert store.pending_commands() == ()
 
     gateway.rerun_failed_checks = original
-    assert executor.execute(action) is True
-    assert gateway.calls == [("rerun", "head-1", (42,))]
+    assert executor.execute(action) is False
+    assert gateway.calls == []
+
+
+def test_an_unreadable_run_observation_mints_no_rerun_command(tmp_path) -> None:
+    """Fail closed: with no observation at all there is nothing to verify
+    against, so no command exists for a later tick to redrive."""
+    executor, gateway, store = _executor(tmp_path)
+    gateway.workflow_run_attempts = lambda _head, _run_ids: None
+
+    with pytest.raises(UnknownEffectOutcome):
+        executor.execute(RerunFailedChecks(7, "head-1", (42,)))
+
+    assert gateway.calls == []
+    assert store.pending_commands() == ()
+
+
+@pytest.mark.parametrize(
+    "attempts",
+    (
+        lambda _head, run_ids: {r: "3" for r in run_ids},   # malformed payload
+        lambda _head, _run_ids: {},                         # nothing at head
+    ),
+)
+def test_a_malformed_run_observation_refuses_the_rerun_without_a_loop(
+    tmp_path, attempts
+) -> None:
+    """#177: a baseline that cannot be parsed cannot become parseable, so the
+    re-run is refused terminally instead of parking in `unknown_outcome` and
+    re-raising on every drain."""
+    executor, gateway, store = _executor(tmp_path)
+    gateway.workflow_run_attempts = attempts
+
+    assert executor.execute(RerunFailedChecks(7, "head-1", (42,))) is False
+
+    assert gateway.calls == []
     assert store.pending_commands() == ()
 
 
