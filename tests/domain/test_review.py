@@ -37,6 +37,11 @@ from issue_agent.domain.review import (
     synthesize_review,
     unproductive_ceiling_hit,
     unproductive_escalation_reason,
+    FIX_HOLD_CEILING_SECONDS,
+    FIX_HOLD_SETTLE_SECONDS,
+    FixHold,
+    fix_hold_ceiling_seconds,
+    hold_review_dispatch,
 )
 from tests.domain.builders import Review
 
@@ -1180,3 +1185,80 @@ def test_a_pr_still_carrying_the_trigger_label_belongs_to_the_review_loop():
     assert _escalations(
         decide_review(world(prs=(labelled,)), CEILING_CFG, ReviewState())
     ) == []
+
+
+# ── review dispatch defers while a fix leg holds the same PR (#176) ───────────
+_CEILING = fix_hold_ceiling_seconds(2700.0)
+
+
+def _held(pr_number: int, seconds: float, claim: str = "claim-1") -> FixHold:
+    return FixHold(pr_number, claim, seconds)
+
+
+def test_the_ceiling_sits_above_the_longest_leg_the_harness_permits():
+    """A ceiling below the fixer's own total-runtime cap fires on healthy legs,
+    which recreates the race this exists to prevent."""
+    assert fix_hold_ceiling_seconds(2700.0) == 2700.0 + FIX_HOLD_SETTLE_SECONDS
+    assert fix_hold_ceiling_seconds(2700.0) > 2700.0
+
+
+def test_a_disabled_runtime_cap_falls_back_to_a_declared_ceiling():
+    assert fix_hold_ceiling_seconds(0.0) == FIX_HOLD_CEILING_SECONDS
+    assert fix_hold_ceiling_seconds(-1.0) == FIX_HOLD_CEILING_SECONDS
+
+
+def test_review_dispatch_is_withheld_while_a_fix_leg_holds_the_pr():
+    p = pr(100, "ai-pr-open", head_ref_oid="abc")
+    actions = decide_review(world(prs=[p]), CFG, ReviewState())
+    plan = hold_review_dispatch(actions, {100: _held(100, 30.0)})
+    assert plan.actions == ()
+    assert plan.deferred == (_held(100, 30.0),)
+    assert plan.forced == ()
+
+
+def test_a_finished_fix_leg_releases_the_review_on_the_next_tick():
+    p = pr(100, "ai-pr-open", head_ref_oid="abc")
+    actions = decide_review(world(prs=[p]), CFG, ReviewState())
+    assert hold_review_dispatch(actions, {}).actions == tuple(actions)
+
+
+def test_a_re_review_is_withheld_by_the_same_hold():
+    p = pr(100, "ai-pr-open", head_ref_oid="def")
+    st = ReviewState(sessions=frozenset({100}), last_sha={100: "abc"})
+    actions = decide_review(world(prs=[p]), CFG, st)
+    assert hold_review_dispatch(actions, {100: _held(100, 5.0)}).actions == ()
+
+
+def test_a_hold_past_the_ceiling_dispatches_anyway_and_is_reported():
+    p = pr(100, "ai-pr-open", head_ref_oid="abc")
+    actions = decide_review(world(prs=[p]), CFG, ReviewState())
+    stuck = _held(100, _CEILING)
+    plan = hold_review_dispatch(actions, {100: stuck}, ceiling_seconds=_CEILING)
+    assert RunAgent(AgentKind.REVIEW, 100) in plan.actions
+    assert plan.forced == (stuck,)
+    assert plan.deferred == ()
+
+
+def test_a_hold_never_defers_another_prs_review_in_the_same_tick():
+    held = pr(100, "ai-pr-open", head_ref_oid="abc")
+    free = pr(101, "ai-pr-open", head_ref_oid="abc")
+    actions = decide_review(world(prs=[held, free]), CFG, ReviewState())
+    plan = hold_review_dispatch(actions, {100: _held(100, 30.0)})
+    assert plan.actions == (RunAgent(AgentKind.REVIEW, 101),)
+
+
+def test_a_deferred_adoption_withholds_its_claim_label_too():
+    # Labelling without reviewing would mark the PR in-pipeline a tick before
+    # anyone looks at it; the whole adoption waits for the fix leg instead.
+    p = pr(200, head_ref_oid="abc", author="human")
+    actions = decide_review(world(prs=[p]), ADOPT, ReviewState())
+    assert hold_review_dispatch(actions, {200: _held(200, 1.0)}).actions == ()
+
+
+def test_a_hold_does_not_withhold_a_non_dispatch_action():
+    escalations = decide_review(
+        world(prs=(_abandoned_pr(),)), CEILING_CFG, ReviewState()
+    )
+    plan = hold_review_dispatch(escalations, {9: _held(9, 1.0)})
+    assert escalations and plan.actions == tuple(escalations)
+    assert plan.deferred == ()

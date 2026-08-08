@@ -2696,3 +2696,132 @@ def test_legacy_spend_import_rejects_invalid_authority_rows_atomically(
         assert db.execute(
             "SELECT COUNT(*) FROM runs WHERE kind='legacy-import'"
         ).fetchone() == (0,)
+
+
+# ── cross-role observation of live claims (#176) ──────────────────────────────
+def test_active_dispatch_claims_report_live_fix_targets(tmp_path) -> None:
+    store = _store(tmp_path)
+    assert store.claim_dispatch(
+        "o/r", "fix", 42, "ADDRESS_REVIEW", "owner-a", frozenset({"a.py"})
+    )
+    assert store.claim_dispatch(
+        "o/r", "fix", -7, "FIX_CI", "owner-a", frozenset({"b.py"})
+    )
+    assert store.claim_dispatch(
+        "o/r", "review", 99, "REVIEW", "owner-a", frozenset({"c.py"})
+    )
+
+    claims = store.active_dispatch_claims("o/r", "fix")
+
+    assert {claim.target_key: claim.leg for claim in claims} == {
+        42: "ADDRESS_REVIEW",
+        -7: "FIX_CI",
+    }
+    assert all(claim.claimed_at == NOW for claim in claims)
+
+
+def test_released_and_dead_claims_are_not_reported_as_active(tmp_path) -> None:
+    store = _store(tmp_path)
+    assert store.claim_dispatch(
+        "o/r", "fix", 42, "ADDRESS_REVIEW", "owner-a", frozenset({"a.py"})
+    )
+    assert store.claim_dispatch(
+        "o/r", "fix", 43, "ADDRESS_REVIEW", "owner-a", frozenset({"b.py"})
+    )
+    assert store.release_dispatch_claim("o/r", "fix", 42, "owner-a")
+    # A leaked row whose owner process is gone and which never bound a run: the
+    # claim is dead, so review must not wait on it.
+    with store._connect() as db:
+        db.execute(
+            "UPDATE dispatch_claims SET owner_pid=?, owner_start_ticks=? "
+            "WHERE target='issue:43'",
+            (2_000_000_000, 1),
+        )
+
+    assert store.active_dispatch_claims("o/r", "fix") == ()
+
+
+def test_a_claim_with_an_unreadable_row_is_skipped(tmp_path) -> None:
+    """Fail open: this reader only withholds paid work, so one corrupt row must
+    not be able to starve review."""
+    store = _store(tmp_path)
+    assert store.claim_dispatch(
+        "o/r", "fix", 42, "ADDRESS_REVIEW", "owner-a", frozenset({"a.py"})
+    )
+    assert store.claim_dispatch(
+        "o/r", "fix", 43, "ADDRESS_REVIEW", "owner-a", frozenset({"b.py"})
+    )
+    with store._connect() as db:
+        db.execute(
+            "UPDATE dispatch_claims SET target='not-a-target' "
+            "WHERE target='issue:42'"
+        )
+        db.execute(
+            "UPDATE dispatch_claims SET claimed_at='whenever' "
+            "WHERE target='issue:43'"
+        )
+
+    assert store.active_dispatch_claims("o/r", "fix") == ()
+
+
+def test_a_claim_stays_active_and_keyed_the_same_once_a_run_binds(tmp_path) -> None:
+    """A claim is taken at decision time and bound to a run later. Keying the
+    observation on the run id changed it mid-hold, which double-journalled one
+    deferral (#176); the key must survive binding."""
+    store = _store(tmp_path)
+    owner = "o/r:fix:checkout-a"
+    run_id = RunId("bound-child")
+    request = dataclasses.replace(
+        _request(1),
+        run_id=run_id,
+        reservation_id=ReservationId("bound-child-reservation"),
+        owner_id=owner,
+        kind="ADDRESS_REVIEW",
+    )
+    assert store.claim_dispatch(
+        "o/r", "fix", 42, "ADDRESS_REVIEW", owner, frozenset({"a.py"})
+    )
+    before = store.active_dispatch_claims("o/r", "fix")
+
+    assert store.reserve(request).admitted
+    assert store.bind_dispatch_claim("o/r", "fix", 42, owner, run_id)
+    after = store.active_dispatch_claims("o/r", "fix")
+
+    assert [claim.claim_key for claim in before] == [
+        claim.claim_key for claim in after
+    ]
+
+
+def test_a_dead_owner_with_a_live_bound_run_is_still_an_active_claim(
+    tmp_path,
+) -> None:
+    """The cross-deployment case: the claiming daemon is gone but its child leg
+    is still running and still pushing, so review must still wait on it."""
+    store = _store(tmp_path)
+    owner = "o/r:fix:checkout-a"
+    run_id = RunId("bound-child")
+    request = dataclasses.replace(
+        _request(1),
+        run_id=run_id,
+        reservation_id=ReservationId("bound-child-reservation"),
+        owner_id=owner,
+        kind="ADDRESS_REVIEW",
+    )
+    assert store.claim_dispatch(
+        "o/r", "fix", 42, "ADDRESS_REVIEW", owner, frozenset({"a.py"})
+    )
+    assert store.reserve(request).admitted
+    assert store.bind_dispatch_claim("o/r", "fix", 42, owner, run_id)
+    with store._connect() as db:
+        db.execute(
+            "UPDATE dispatch_claims SET owner_pid=?, owner_start_ticks=?",
+            (2_000_000_000, 1),
+        )
+
+    assert [
+        claim.target_key for claim in store.active_dispatch_claims("o/r", "fix")
+    ] == [42]
+
+    # Once that run reaches a terminal state nothing keeps the claim alive.
+    assert store.release(run_id, "spend_unknown").disposition.value == "available"
+    assert store.active_dispatch_claims("o/r", "fix") == ()

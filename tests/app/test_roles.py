@@ -71,6 +71,8 @@ from issue_agent.app.roles import (
     _control_store,
     _control_store_path,
     _duplicate_pr_reporter,
+    _fix_hold_reporter,
+    _fix_holds,
     _fix_state,
     _hold_reporter,
     _inject_predicted_paths,
@@ -113,7 +115,14 @@ from issue_agent.domain.contracts import (
 )
 from issue_agent.domain.refs import issue_from_branch
 from issue_agent.domain.recovery import RecoveryTrigger
-from issue_agent.domain.review import ReviewConfig, ReviewMode, decide_review
+from issue_agent.domain.review import (
+    FixHold,
+    ReviewConfig,
+    ReviewMode,
+    decide_review,
+    fix_hold_ceiling_seconds,
+    hold_review_dispatch,
+)
 from issue_agent.domain.world import (
     Check,
     ClosingRef,
@@ -3202,3 +3211,193 @@ def test_a_diff_record_with_an_unresolvable_path_withholds_durably():
     assert facts[100].undecidable_diff is True
     assert facts[100].unverifiable is False
     assert facts[100].declarations == ()
+
+
+# ── review defers while the fixer holds the same PR (#176) ────────────────────
+def _held_pr(number=581, issue=500):
+    return PRView(
+        number, head_ref_name=f"fix/{issue}-x", closing_issue=issue,
+        head_ref_oid="abc", labels=frozenset({Label.AI_PR_OPEN}),
+        author=FIX_BOT, state="OPEN",
+    )
+
+
+def _review_cfg():
+    return ReviewConfig(review_bot="review-bot")
+
+
+def _decide(tmp_path, control, world_state, now):
+    actions = decide_review(
+        world_state, _review_cfg(), _review_state(Store(state_dir=str(tmp_path)), world_state)
+    )
+    return hold_review_dispatch(
+        actions,
+        _fix_holds(control, "o/r", world_state, now),
+        ceiling_seconds=fix_hold_ceiling_seconds(2700.0),
+    )
+
+
+def test_an_active_fix_leg_defers_the_review_of_the_same_pr(tmp_path):
+    """The 2026-08-08 tauri batch burned four complete paid review legs on PRs
+    the fixer was still pushing to. The claim the fixer already holds is enough
+    to know that at dispatch time."""
+    control = _control(tmp_path)
+    now = datetime.now(timezone.utc)
+    world_state = WorldState(prs=(_held_pr(),))
+    assert control.claim_dispatch(
+        "o/r", "fix", 500, "ADDRESS_REVIEW", "owner-a", frozenset({"a.py"})
+    )
+
+    plan = _decide(tmp_path, control, world_state, now)
+
+    assert plan.actions == ()
+    assert [hold.pr for hold in plan.deferred] == [581]
+
+    # The fix leg finishes between ticks; nothing persistent has to be undone.
+    assert control.release_dispatch_claim("o/r", "fix", 500, "owner-a")
+    assert _decide(tmp_path, control, world_state, now).actions == (
+        RunAgent(AgentKind.REVIEW, 581),
+    )
+
+
+def test_a_fix_hold_past_the_ceiling_stops_starving_the_review(tmp_path):
+    control = _control(tmp_path)
+    world_state = WorldState(prs=(_held_pr(),))
+    assert control.claim_dispatch(
+        "o/r", "fix", 500, "ADDRESS_REVIEW", "owner-a", frozenset({"a.py"})
+    )
+    wedged = datetime.now(timezone.utc) + timedelta(
+        seconds=fix_hold_ceiling_seconds(2700.0) + 1
+    )
+
+    plan = _decide(tmp_path, control, world_state, wedged)
+
+    assert plan.actions == (RunAgent(AgentKind.REVIEW, 581),)
+    assert [hold.pr for hold in plan.forced] == [581]
+
+
+def test_a_fix_hold_leaves_every_other_prs_review_alone(tmp_path):
+    control = _control(tmp_path)
+    world_state = WorldState(prs=(_held_pr(), _held_pr(614, 610)))
+    assert control.claim_dispatch(
+        "o/r", "fix", 500, "ADDRESS_REVIEW", "owner-a", frozenset({"a.py"})
+    )
+
+    plan = _decide(tmp_path, control, world_state, datetime.now(timezone.utc))
+
+    assert plan.actions == (RunAgent(AgentKind.REVIEW, 614),)
+
+
+def test_a_dead_fix_claim_does_not_defer_the_review(tmp_path):
+    control = _control(tmp_path)
+    assert control.claim_dispatch(
+        "o/r", "fix", 500, "ADDRESS_REVIEW", "owner-a", frozenset({"a.py"})
+    )
+    with control._connect() as db:
+        db.execute(
+            "UPDATE dispatch_claims SET owner_pid=?, owner_start_ticks=?",
+            (2_000_000_000, 1),
+        )
+
+    plan = _decide(tmp_path, control, WorldState(prs=(_held_pr(),)), datetime.now(timezone.utc))
+
+    assert plan.actions == (RunAgent(AgentKind.REVIEW, 581),)
+
+
+def test_an_unreadable_control_store_fails_open_to_dispatch(tmp_path):
+    """Withholding is the only thing this reader does, and the submit-time head
+    fence still protects correctness — so an unreadable store must not be able
+    to stop review."""
+    class Broken:
+        def active_dispatch_claims(self, repository, role):
+            raise RuntimeError("control store unavailable")
+
+    assert _fix_holds(
+        Broken(), "o/r", WorldState(prs=(_held_pr(),)), datetime.now(timezone.utc)
+    ) == {}
+
+
+def _fix_holds_in(journal):
+    return [
+        event
+        for event in read_events(journal.path)
+        if event.get("event") == "deferred"
+        and event.get("reason") == "fix_leg_active"
+    ]
+
+
+def test_a_review_deferral_is_journaled_once_per_blocking_claim(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    logs = []
+    report = _fix_hold_reporter(journal, "o/r", logs.append, _control(tmp_path))
+    hold = FixHold(581, "claim-1", 30.0)
+
+    for seconds in (30.0, 50.0, 70.0):
+        report((replace(hold, held_seconds=seconds),), ())
+
+    events = _fix_holds_in(journal)
+    assert [(e["state"], e["blocker_pr"], e["blocking_claim"]) for e in events] == [
+        ("waiting", 581, "claim-1")
+    ]
+    assert len(logs) == 1
+
+
+def test_the_ceiling_override_is_journaled_on_the_same_key(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    report = _fix_hold_reporter(journal, "o/r", lambda _m: None)
+    report((FixHold(581, "claim-1", 30.0),), ())
+    report((), (FixHold(581, "claim-1", 3000.0),))
+    report((), (FixHold(581, "claim-1", 3020.0),))  # still wedged, still forcing
+    report((), ())                                   # claim finally released
+
+    # "stopped" is a CLOSING level (a forced dispatch is not an open deferral),
+    # so a released claim owes no second close and a still-wedged one owes no
+    # per-tick repeat.
+    assert [e["state"] for e in _fix_holds_in(journal)] == ["waiting", "stopped"]
+
+
+def test_a_persisted_review_deferral_clears_after_a_restart(tmp_path):
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    control = _control(tmp_path)
+    control.replace_level_state(
+        "review_fix_hold", "o/r", {"581:claim-1": {"state": "waiting"}}
+    )
+
+    _fix_hold_reporter(journal, "o/r", lambda _m: None, control)((), ())
+
+    assert [e["state"] for e in _fix_holds_in(journal)] == ["cleared"]
+    assert control.load_level_state("review_fix_hold", "o/r") == {}
+
+
+def test_a_malformed_persisted_deferral_still_clears(tmp_path):
+    """A level-state row without a readable state must not wedge the tick; the
+    reporter's only job is journalling, so it treats it as an unknown level and
+    clears it."""
+    journal = Journal(str(tmp_path / "journal.jsonl"))
+    control = _control(tmp_path)
+    control.replace_level_state("review_fix_hold", "o/r", {"581:claim-1": {}})
+
+    _fix_hold_reporter(journal, "o/r", lambda _m: None, control)((), ())
+
+    assert [e["state"] for e in _fix_holds_in(journal)] == ["cleared"]
+
+
+def test_a_pr_with_no_resolvable_issue_is_still_deferred(tmp_path):
+    """`breaker_key` falls back to -PR for a PR with no closing ref and a
+    non-numeric branch; the fixer claims under that key, so the review side has
+    to address it the same way."""
+    control = _control(tmp_path)
+    issueless = PRView(
+        617, head_ref_name="feat/ACME-2468-x", head_ref_oid="abc",
+        labels=frozenset({Label.AI_PR_OPEN}), author=FIX_BOT, state="OPEN",
+    )
+    assert control.claim_dispatch(
+        "o/r", "fix", -617, "FIX_CI", "owner-a", frozenset({"a.py"})
+    )
+
+    plan = _decide(
+        tmp_path, control, WorldState(prs=(issueless,)), datetime.now(timezone.utc)
+    )
+
+    assert plan.actions == ()
+    assert [hold.pr for hold in plan.deferred] == [617]

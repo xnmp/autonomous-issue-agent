@@ -338,6 +338,27 @@ class _DispatchClaimObservation:
 
 
 @dataclass(frozen=True)
+class ActiveDispatchClaim:
+    """One live paid claim, as another role observes it.
+
+    ``target_key`` uses the harness-wide signed convention: positive is an
+    issue number, negative is ``-pr`` for a PR with no resolvable issue.
+    ``claim_key`` identifies this CLAIM EPISODE for once-per-key journalling.
+    Deliberately NOT the bound run id: a claim is taken at decision time and
+    bound to a run later (and may bind several), so a run-derived key changes
+    under an observer mid-hold and can be picked nondeterministically when two
+    runs are live.
+    """
+
+    target_key: int
+    role: str
+    leg: str
+    owner_id: str
+    claimed_at: datetime
+    claim_key: str
+
+
+@dataclass(frozen=True)
 class PublicationAuthority:
     run_id: RunId
     repository: str
@@ -2577,6 +2598,74 @@ class SQLiteControlStore:
             )
             return cursor.rowcount == 1
 
+    def active_dispatch_claims(
+        self, repository: str, role: str
+    ) -> tuple[ActiveDispatchClaim, ...]:
+        """Live paid targets one role currently holds (harness #176).
+
+        Read-only cross-role observation: the reviewer asks whether the fixer is
+        mid-push on a PR before paying for a review that the freshness fence
+        would then reject. Liveness uses the same rule `claim_dispatch` applies
+        when it garbage-collects — owner process alive, or a bound run still
+        non-terminal.
+
+        A row whose target or timestamp cannot be parsed is SKIPPED rather than
+        reported. This reader only withholds work, so an unreadable row must
+        fail open to dispatch: the submit-time head fence still protects
+        correctness, whereas failing closed would let one corrupt row starve
+        review indefinitely.
+        """
+
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT dc.target, dc.leg, dc.owner_id, dc.owner_pid, "
+                "dc.owner_start_ticks, dc.claimed_at, dcr.run_id, r.state "
+                "FROM dispatch_claims dc "
+                "LEFT JOIN dispatch_claim_runs dcr "
+                "ON dcr.repository=dc.repository AND dcr.role=dc.role "
+                "AND dcr.target=dc.target "
+                "LEFT JOIN runs r ON r.run_id=dcr.run_id "
+                "WHERE dc.repository=? AND dc.role=? "
+                "ORDER BY dc.target, dcr.run_id",
+                (repository, role),
+            ).fetchall()
+        grouped: dict[str, tuple[sqlite3.Row, list[tuple[str, str]]]] = {}
+        for row in rows:
+            _base, bindings = grouped.setdefault(str(row["target"]), (row, []))
+            if row["run_id"] is not None:
+                bindings.append((str(row["run_id"]), str(row["state"])))
+        from .process_supervisor import ProcessSupervisor
+
+        claims: list[ActiveDispatchClaim] = []
+        for target, (base, bindings) in grouped.items():
+            target_key = _dispatch_claim_issue(target)
+            if target_key is None:
+                continue
+            try:
+                claimed_at = _parse_stamp(str(base["claimed_at"]))
+            except ValueError:
+                continue
+            live_run = any(
+                state in {"reserved", "starting", "running"}
+                for _run_id, state in bindings
+            )
+            if not live_run and not ProcessSupervisor.matches_identity(
+                int(base["owner_pid"]), int(base["owner_start_ticks"])
+            ):
+                continue
+            owner_id = str(base["owner_id"])
+            claims.append(
+                ActiveDispatchClaim(
+                    target_key=target_key,
+                    role=role,
+                    leg=str(base["leg"]),
+                    owner_id=owner_id,
+                    claimed_at=claimed_at,
+                    claim_key=f"{owner_id}@{target}@{_stamp(claimed_at)}",
+                )
+            )
+        return tuple(claims)
+
     def receipt(
         self,
         namespace: str,
@@ -4684,6 +4773,17 @@ def _dispatch_claim_target(issue: int) -> str:
     if issue == 0:
         raise ValueError("dispatch claim target cannot be zero")
     return f"issue:{issue}" if issue > 0 else f"pr:{-issue}"
+
+
+def _dispatch_claim_issue(target: str) -> int | None:
+    """Inverse of `_dispatch_claim_target`; None when the row is unreadable."""
+    prefix, _, number = target.partition(":")
+    if prefix not in {"issue", "pr"} or not number.isdigit():
+        return None
+    value = int(number)
+    if value <= 0:
+        return None
+    return value if prefix == "issue" else -value
 
 
 def _receipt_digest(receipt: EffectReceipt) -> str:

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Literal, final
@@ -604,6 +605,125 @@ def decide_review(
             actions.append(claim)
             actions.append(RunAgent(AgentKind.REVIEW, pr.number, claim))
     return actions
+
+
+# ── review dispatch vs. an in-flight fix leg (harness #176) ───────────────────
+# 2026-08-08, tauri-explorer: four complete paid review legs (PRs #581 twice,
+# #614, #617) died at submit with "review head changed before submission"
+# because the reviewer dispatched while the fixer's ADDRESS_REVIEW leg on the
+# same PR was still running and about to push. The submit-time fence is correct
+# and stays; this is the upstream half that stops paying for the round at all.
+
+# Margin added to the fixer's own total-runtime cap to get the deferral ceiling
+# (ADR 0012). The ceiling MUST sit above the longest leg the harness will let
+# run, or it fires on healthy work and re-creates the very race it prevents:
+# `agent_max_runtime` is that cap, and the margin covers what happens after the
+# session ends but before the claim is released (teardown, push, spend settle).
+FIX_HOLD_SETTLE_SECONDS = 300.0
+
+# Fallback when the total-runtime cap is disabled (0): only the idle watchdog
+# bounds a leg then, so there is nothing to derive from and the ceiling is a
+# declared operator choice instead.
+FIX_HOLD_CEILING_SECONDS = 3600.0
+
+
+def fix_hold_ceiling_seconds(agent_max_runtime: float) -> float:
+    """Wall-time bound on a review deferral, derived from the fixer's leg cap.
+
+    Past it the review dispatches anyway: a wedged or leaked claim must not
+    starve review forever, and a wasted review round is cheaper than a PR
+    nothing will ever look at again.
+
+    The bound is per HOLD, so a fixer dispatching back-to-back legs on one PR
+    restarts it. That is not a starvation hole: each of those legs pushes (which
+    is what would have invalidated the review anyway), and the fixer's own
+    retry/infra-death breakers cap how many it may run — ADDRESS_REVIEW in
+    particular needs a non-superseded review to address, which only a dispatched
+    review can create.
+    """
+    if agent_max_runtime <= 0:
+        return FIX_HOLD_CEILING_SECONDS
+    return agent_max_runtime + FIX_HOLD_SETTLE_SECONDS
+
+
+@dataclass(frozen=True)
+class FixHold:
+    """A live fix-role claim on the same target as a pending review dispatch.
+
+    `claim_key` identifies the CLAIM EPISODE, not whichever run is bound to it:
+    a claim is taken at decision time and bound to a run later, so keying the
+    journal on the run id emitted the same deferral twice under two keys.
+    """
+
+    pr: int
+    claim_key: str
+    held_seconds: float
+
+
+@dataclass(frozen=True)
+class ReviewDispatchPlan:
+    """What survives the fix-hold filter, and what the journal owes."""
+
+    actions: tuple[Action, ...]
+    deferred: tuple[FixHold, ...]
+    forced: tuple[FixHold, ...]
+
+
+def hold_review_dispatch(
+    actions: list[Action] | tuple[Action, ...],
+    holds: Mapping[int, FixHold],
+    *,
+    ceiling_seconds: float = FIX_HOLD_CEILING_SECONDS,
+) -> ReviewDispatchPlan:
+    """Withhold this tick's review dispatches for PRs the fixer still holds.
+
+    Only REVIEW/RE_REVIEW dispatches are withheld, and only for the held PR —
+    every other PR's review is decided independently, as it always was. An
+    adoption `Relabel` is dropped with its dispatch (as the reservation filter
+    does), so a deferred PR is not claimed a tick before anyone reviews it.
+
+    A hold older than the ceiling forces the dispatch through and is reported
+    as `forced`; nothing here consumes state, so the next tick re-derives the
+    whole answer from the store and a finished leg releases itself.
+
+    A forced dispatch can still lose the submit-time head race, and the next
+    tick will force it again. That loop is NOT unbounded: a review round that
+    fails to submit persists nothing, which is exactly what
+    `ReviewState.unproductive_rounds` counts, so `max_unproductive_rounds`
+    withholds the dispatch and hands the PR to a human. The ceiling here only
+    decides who bounds a wedged claim — it never removes the bound.
+    """
+    withheld: dict[int, FixHold] = {}
+    forced: list[FixHold] = []
+    for action in actions:
+        if not isinstance(action, RunAgent):
+            continue
+        if action.kind not in {AgentKind.REVIEW, AgentKind.RE_REVIEW}:
+            continue
+        hold = holds.get(action.number)
+        if hold is None:
+            continue
+        if hold.held_seconds >= ceiling_seconds:
+            forced.append(hold)
+            continue
+        withheld[action.number] = hold
+    if not withheld:
+        return ReviewDispatchPlan(tuple(actions), (), tuple(forced))
+    kept = tuple(
+        action
+        for action in actions
+        if not (
+            isinstance(action, RunAgent)
+            and action.kind in {AgentKind.REVIEW, AgentKind.RE_REVIEW}
+            and action.number in withheld
+        )
+        and not (
+            isinstance(action, Relabel)
+            and action.target is Target.PR
+            and action.number in withheld
+        )
+    )
+    return ReviewDispatchPlan(kept, tuple(withheld.values()), tuple(forced))
 
 
 # ── review verdict → submission effect (review-pr.sh / re-review-pr.sh tails) ─

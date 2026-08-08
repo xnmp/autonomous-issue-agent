@@ -82,10 +82,13 @@ from ..domain.gate import looks_like_test, modified_existing_tests_from_diff
 from ..domain.identity import login_eq
 from ..domain.review import (
     DEFAULT_MAX_UNPRODUCTIVE_ROUNDS,
+    FixHold,
     IdentityMode,
     ReviewConfig,
     ReviewState,
     decide_review,
+    fix_hold_ceiling_seconds,
+    hold_review_dispatch,
 )
 from .planners.tasks import (
     REVIEW_DIMENSIONS,
@@ -2701,6 +2704,137 @@ def _review_state(
     )
 
 
+def _fix_holds(control, repository: str, world, now: datetime) -> dict[int, FixHold]:
+    """PRs a live fix-role claim currently owns, keyed by PR number (#176).
+
+    Both roles derive a claim target from `breaker_key`, so the fixer's claim on
+    a PR (or on the issue that PR closes) is addressable from the review side
+    without any new state. Two open PRs closing one issue therefore share a
+    target and defer together — the same coarseness the dispatch reservation
+    itself has, deliberately not a second, finer notion of "same work".
+
+    A store that cannot answer is treated as no holds: this reader only
+    withholds paid work, and the submit-time head fence still protects
+    correctness, so it must never be the thing that stops review.
+    """
+    try:
+        claims = control.active_dispatch_claims(repository, "fix")
+    except Exception:  # noqa: BLE001 - see docstring: fail open to dispatch
+        return {}
+    by_target = {claim.target_key: claim for claim in claims}
+    holds: dict[int, FixHold] = {}
+    for pr in world.prs:
+        claim = by_target.get(breaker_key(pr))
+        if claim is None:
+            continue
+        holds[pr.number] = FixHold(
+            pr.number,
+            claim.claim_key,
+            max(0.0, (now - claim.claimed_at).total_seconds()),
+        )
+    return holds
+
+
+# The deferral is an OPEN level; both ways out of it are CLOSING levels the
+# projection's `_open_levels` recognises. "forced" would read as a level still
+# open, which is the opposite of what a forced dispatch means.
+_HOLD_OPEN = "waiting"
+_HOLD_FORCED = "stopped"
+_HOLD_RELEASED = "cleared"
+
+
+def _fix_hold_reporter(journal: EventSink | None, repo: str, log, control=None):
+    """Journal review deferrals at most once per (PR, blocking claim) (#176).
+
+    Same shape as the fixer's hold reporter: the emitted set is persisted as
+    level state, so a deferral spanning many ticks is one event and survives a
+    restart. Telemetry only — every control-store interaction here is contained,
+    because a journalling failure must not take down the review tick that
+    `_fix_holds` went out of its way to keep dispatching.
+    """
+    active: dict[str, str] | None = None
+
+    def _load() -> dict[str, str]:
+        if control is None:
+            return {}
+        try:
+            return {
+                key: str(fields.get("state") or "")
+                for key, fields in control.load_level_state(
+                    "review_fix_hold", repo
+                ).items()
+            }
+        except Exception:  # noqa: BLE001 - see docstring: telemetry only
+            return {}
+
+    def _emit(key: str, state: str, pr: int, attributes) -> None:
+        if journal is None:
+            return
+        journal.emit(
+            TelemetryEvent(
+                LevelChanged(
+                    f"review_fix_hold:{key}", state, "fix_leg_active", attributes
+                ),
+                Correlation(pr=pr),
+            )
+        )
+
+    def report(deferred, forced) -> None:
+        nonlocal active
+        if active is None:
+            active = _load()
+        held = {
+            f"{hold.pr}:{hold.claim_key}": (state, hold)
+            for state, holds in ((_HOLD_OPEN, deferred), (_HOLD_FORCED, forced))
+            for hold in holds
+        }
+        current = {key: state for key, (state, _hold) in held.items()}
+        for key, (state, hold) in held.items():
+            if active.get(key) == state:
+                continue
+            if state == _HOLD_OPEN:
+                log(
+                    f"DEFERRED: review of PR #{hold.pr} waits on fix claim "
+                    f"{hold.claim_key}; dispatches once that leg finishes"
+                )
+            else:
+                log(
+                    f"review of PR #{hold.pr} dispatched despite fix claim "
+                    f"{hold.claim_key} ({hold.held_seconds:.0f}s): deferral "
+                    "ceiling reached"
+                )
+            _emit(
+                key,
+                state,
+                hold.pr,
+                {
+                    "blocker_pr": hold.pr,
+                    "blocking_claim": hold.claim_key,
+                    "held_seconds": round(hold.held_seconds, 3),
+                },
+            )
+        for key, previous in active.items():
+            if key in current or previous == _HOLD_FORCED:
+                continue  # a forced hold already emitted its closing level
+            pr = int(key.split(":", 1)[0])
+            log(f"review of PR #{pr} no longer waits on a fix leg")
+            _emit(key, _HOLD_RELEASED, pr, {"blocker_pr": pr})
+        if current == active:
+            return  # the common case: no write transaction on a quiet poll
+        if control is not None:
+            try:
+                control.replace_level_state(
+                    "review_fix_hold",
+                    repo,
+                    {key: {"state": state} for key, state in current.items()},
+                )
+            except Exception:  # noqa: BLE001 - see docstring: telemetry only
+                return  # keep memory on the last persisted set and retry next tick
+        active = dict(current)
+
+    return report
+
+
 def build_review_daemon(
     cfg: HarnessConfig, gateway: GitHubGateway, store: Store, runner: AgentRuntime
 ) -> Daemon:
@@ -2837,6 +2971,10 @@ def build_review_daemon(
     )
     executor.bind_dispatch(dispatch_runtime)
 
+    report_fix_holds = _fix_hold_reporter(
+        journal, cfg.repo, _log("review"), control
+    )
+
     def decide(world):
         actions = decide_review(
             world,
@@ -2847,6 +2985,13 @@ def build_review_daemon(
                 control.abandoned_dispatch_counts(owner_id),
             ),
         )
+        plan = hold_review_dispatch(
+            actions,
+            _fix_holds(control, cfg.repo, world, datetime.now(timezone.utc)),
+            ceiling_seconds=fix_hold_ceiling_seconds(cfg.agent_max_runtime),
+        )
+        report_fix_holds(plan.deferred, plan.forced)
+        actions = list(plan.actions)
         prs = {pr.number: pr for pr in world.prs}
         rejected_prs: set[int] = set()
         for action in actions:
