@@ -28,9 +28,11 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from ..domain.contracts import (
+    DEFAULT_TEST_FAILURE_EXIT_CODES,
     TestExecution,
     TestExecutionStatus,
     classify_test_exit_code,
+    parse_test_failure_exit_codes,
 )
 from ..domain.exemptions import (
     ExemptionDeclaration,
@@ -555,23 +557,15 @@ _DEFAULT_TEST_TIMEOUT_S = 600.0
 
 
 def _test_failure_exit_codes() -> frozenset[int]:
-    """Trusted runner exit codes that mean an asserted test failed.
+    """Trusted runner exit codes that mean an asserted test failed, as this
+    deployment declares them. Parsing lives in the domain so doctor reports on
+    exactly the set the gate enforces."""
 
-    One is the portable default used by pytest, unittest, npm, and simple shell
-    predicates. A deployment whose runner has a different documented contract
-    can declare space/comma-separated codes. Malformed or infrastructure codes
-    fail closed to no accepted failure codes.
-    """
-
-    raw = os.environ.get("GATE_TEST_FAILURE_EXIT_CODES", "1")
-    tokens = tuple(token for token in re.split(r"[\s,]+", raw.strip()) if token)
-    try:
-        codes = frozenset(int(token) for token in tokens)
-    except ValueError:
-        return frozenset()
-    if any(code <= 0 or code >= 124 for code in codes):
-        return frozenset()
-    return codes
+    return parse_test_failure_exit_codes(
+        os.environ.get(
+            "GATE_TEST_FAILURE_EXIT_CODES", DEFAULT_TEST_FAILURE_EXIT_CODES
+        )
+    )
 
 
 def _test_timeout_s() -> float:

@@ -1090,6 +1090,190 @@ def _prep_mismatch_overlay(tmp_path, monkeypatch) -> None:
     )
 
 
+# ── start self-heals a stale/partial install (#156 follow-up, 2026-08-08) ─────
+def _install_state(
+    monkeypatch,
+    present,
+    install_rc=0,
+    after=None,
+    live=(),
+    foreign=(),
+    timeout=False,
+):
+    """PATH resolution for the declared console scripts, plus a recording stub
+    for `make install` that can flip what PATH resolves afterwards. `foreign`
+    names scripts that resolve to ANOTHER checkout's shim; `live` is what the
+    deployment-liveness probe reports."""
+    calls: list[list[str]] = []
+    state = {"present": set(present), "foreign": set(foreign)}
+    scripts = set(cli.declared_console_scripts())
+    real_which, real_run = cli.shutil.which, cli.subprocess.run
+    venv_bin = os.path.join(cli.HARNESS_ROOT, ".venv", "bin")
+
+    def which(name, *args, **kwargs):
+        if name not in scripts:
+            return real_which(name, *args, **kwargs)
+        if name not in state["present"]:
+            return None
+        base = (
+            "/opt/other-checkout/.venv/bin"
+            if name in state["foreign"]
+            else venv_bin
+        )
+        return os.path.join(base, name)
+
+    def run(cmd, **kwargs):
+        if list(cmd)[:2] != ["make", "install"]:
+            return real_run(cmd, **kwargs)
+        calls.append(list(cmd))
+        if after is not None:  # a successful install rewrites every shim
+            state["present"] = set(after)
+            state["foreign"] = set()
+        if timeout:
+            raise subprocess.TimeoutExpired(cmd, 300, output=b"sync log\nboom")
+        return subprocess.CompletedProcess(cmd, install_rc, "", "boom")
+
+    monkeypatch.setattr(cli.shutil, "which", which)
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    monkeypatch.setattr(cli, "live_deployment_names", lambda: tuple(live))
+    return calls
+
+
+def test_start_reinstalls_when_only_one_entry_point_resolves(monkeypatch, capsys):
+    """Live incident: doctor said 're-run make install' and killed the launch;
+    the operator ran exactly that by hand. `start` now does it."""
+    calls = _install_state(
+        monkeypatch,
+        present=("issue-agent",),
+        after=("issue-agent", "issue-agent-publish"),
+    )
+
+    assert cli.heal_entrypoint_drift() is True
+    assert [c[:2] for c in calls] == [["make", "install"]]
+    assert "auto-fixed stale/partial install" in capsys.readouterr().out
+
+
+def test_start_does_not_reinstall_when_the_entry_points_are_intact(monkeypatch):
+    calls = _install_state(
+        monkeypatch, present=("issue-agent", "issue-agent-publish")
+    )
+
+    assert cli.heal_entrypoint_drift() is True
+    assert calls == []
+
+
+def test_start_does_not_reinstall_a_checkout_that_never_installed(monkeypatch):
+    """Neither script on PATH is a dev checkout, not drift — doctor stays quiet
+    there too, and `make install` must not be run behind the operator's back."""
+    calls = _install_state(monkeypatch, present=())
+
+    assert cli.heal_entrypoint_drift() is True
+    assert calls == []
+
+
+def test_start_gives_up_after_one_failed_reinstall(monkeypatch, capsys):
+    calls = _install_state(
+        monkeypatch, present=("issue-agent",), install_rc=2
+    )
+
+    assert cli.heal_entrypoint_drift() is False
+    assert len(calls) == 1  # one attempt, never a retry loop
+    assert "auto-repair failed" in capsys.readouterr().err
+
+
+def test_start_gives_up_when_the_reinstall_does_not_clear_the_drift(
+    monkeypatch, capsys
+):
+    calls = _install_state(
+        monkeypatch, present=("issue-agent",), after=("issue-agent",)
+    )
+
+    assert cli.heal_entrypoint_drift() is False
+    assert len(calls) == 1
+    assert "still drifted" in capsys.readouterr().err
+
+
+def test_start_refuses_to_reinstall_under_a_live_deployment(monkeypatch, capsys):
+    """`make install` runs `uv sync` on the ONE .venv every deployment's daemons
+    execute from; pruning it mid-tick breaks the running ones."""
+    calls = _install_state(
+        monkeypatch, present=("issue-agent",), live=("keifu", "sol")
+    )
+
+    assert cli.heal_entrypoint_drift() is False
+    assert calls == []  # never touched the shared .venv
+    captured = capsys.readouterr().err
+    assert "keifu, sol" in captured
+    assert "uv sync" in captured
+
+
+def test_start_treats_a_shim_from_another_checkout_as_drift(monkeypatch, capsys):
+    """Presence-only reads healthy while another checkout's shim shadows ours —
+    the daemon then execs a different tree's plugin/ and config/."""
+    calls = _install_state(
+        monkeypatch,
+        present=("issue-agent", "issue-agent-publish"),
+        foreign=("issue-agent-publish",),
+        after=("issue-agent", "issue-agent-publish"),
+    )
+
+    assert cli.heal_entrypoint_drift() is True
+    assert len(calls) == 1
+    assert "/opt/other-checkout" in capsys.readouterr().out
+
+
+def test_start_gives_up_when_the_reinstall_times_out(monkeypatch, capsys):
+    calls = _install_state(monkeypatch, present=("issue-agent",), timeout=True)
+
+    assert cli.heal_entrypoint_drift() is False
+    assert len(calls) == 1
+    captured = capsys.readouterr().err
+    assert "exceeded 300s" in captured
+    assert "boom" in captured  # output tail still reaches the operator
+
+
+def test_entrypoint_drift_covers_every_declared_console_script():
+    """Derived from pyproject's [project.scripts], not a second hardcoded list
+    that can disagree with the one bin/install.sh materialises."""
+    assert set(cli.declared_console_scripts()) == {
+        "issue-agent",
+        "issue-agent-publish",
+    }
+
+
+def test_live_deployment_names_ignores_stopped_deployments(tmp_path, monkeypatch):
+    monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
+    (tmp_path / "keifu.env").write_text("")
+    (tmp_path / "notes.txt").write_text("")
+    monkeypatch.setattr(cli, "_launcher_pids", lambda _n: [])
+    monkeypatch.setattr(cli, "_role_pids", lambda _n: {"fix": []})
+    monkeypatch.setattr(cli, "_fresh_role_heartbeats", lambda _n: {})
+
+    assert cli.live_deployment_names() == ()
+
+    monkeypatch.setattr(cli, "_launcher_pids", lambda n: [7] if n == "keifu" else [])
+
+    assert cli.live_deployment_names() == ("keifu",)
+
+
+def test_start_still_launches_the_preflight_after_a_failed_reinstall(
+    tmp_path, monkeypatch, capsys
+):
+    """Fallback is today's behaviour: the preflight runs and reports the
+    stale/partial install verbatim, rather than a second Python-side error."""
+    _prep_mismatch_overlay(tmp_path, monkeypatch)
+    execve_calls: list = []
+    monkeypatch.setattr(cli.os, "execve", lambda *a: execve_calls.append(a))
+    _install_state(monkeypatch, present=("issue-agent",), install_rc=1)
+
+    cli.cmd_start(
+        _start_args(repo="acme/app", target_dir="/srv/acme-app", name="app")
+    )
+
+    assert len(execve_calls) == 1
+    assert "point-at.sh" in " ".join(execve_calls[0][1])
+
+
 def test_cmd_start_refuses_wrong_repo_overlay(tmp_path, monkeypatch, capsys):
     """P0R-2 exact repro at the `cmd_start` level: resolving to the app.env
     overlay (whether via an explicit --name or a stale collision) while the
@@ -2695,6 +2879,102 @@ def test_gate_failure_exit_codes_left_default_for_other_toolchains():
 
 def test_gate_failure_exit_codes_tolerates_an_unparseable_command():
     assert cli.gate_failure_exit_codes("cargo test 'unbalanced") == "101"
+
+
+# ── doctor: declared red-test exit codes vs. the runners TEST_CMD actually runs
+def test_doctor_warns_when_cargos_failure_code_is_not_trusted():
+    """tauri 2026-08-08: `… && cargo test` under the default set {1} reads every
+    assertion failure (101) as INFRA_ERROR, so the red-fail gate never converges."""
+    findings = cli.test_failure_exit_code_findings(
+        "npm run build && cargo test --workspace", None, "tauri"
+    )
+
+    assert [f.level for f in findings] == ["warn"]
+    assert "cargo test" in findings[0].message
+    assert "101" in findings[0].message
+    assert 'GATE_TEST_FAILURE_EXIT_CODES="1 101"' in findings[0].message
+    assert "config/repos/tauri.env" in findings[0].message
+
+
+def test_doctor_warns_that_make_fails_with_2_not_1():
+    """GNU make exits 2 on a failing recipe — this harness's own `make test`
+    deployment would deadlock the red-fail gate under the default set {1}."""
+    findings = cli.test_failure_exit_code_findings("make test", None, "self")
+
+    assert [f.level for f in findings] == ["warn"]
+    assert "'make'" in findings[0].message
+    assert "exit 2" in findings[0].message
+    assert 'GATE_TEST_FAILURE_EXIT_CODES="1 2"' in findings[0].message
+
+
+def test_doctor_is_silent_when_every_runner_code_is_declared():
+    assert cli.test_failure_exit_code_findings("cargo test", "1 101", "tauri") == ()
+    assert cli.test_failure_exit_code_findings("uv run pytest -q", None, "app") == ()
+    assert cli.test_failure_exit_code_findings("bunx vitest run", "1", "app") == ()
+    assert cli.test_failure_exit_code_findings("make test", "1,2", "self") == ()
+
+
+def test_doctor_says_nothing_without_a_test_command():
+    assert cli.test_failure_exit_code_findings("", None, "app") == ()
+    assert cli.test_failure_exit_code_findings("   ", "1 101", "app") == ()
+
+
+def test_doctor_errors_on_a_malformed_declaration():
+    """Parity with the gate: a malformed or reserved-code declaration trusts
+    NOTHING (adapters/worktree.py), so even pytest's 1 stops being evidence."""
+    findings = cli.test_failure_exit_code_findings("uv run pytest -q", "oops", "app")
+
+    assert findings[0].level == "error"
+    assert "fails closed" in findings[0].message
+    assert 'GATE_TEST_FAILURE_EXIT_CODES="1"' in findings[0].message
+    assert any("pytest" in f.message for f in findings)
+
+
+def test_doctor_errors_on_an_empty_declaration_with_no_known_runner():
+    """Total deadlock and no runner to hang the warning on: the empty trusted set
+    is itself the finding. A PRESENT-but-empty key is a declaration, not an
+    absent one, and the gate parses it to the empty set."""
+    findings = cli.test_failure_exit_code_findings("./run-everything.sh", "", "app")
+
+    assert [f.level for f in findings] == ["error"]
+    assert "fails closed" in findings[0].message
+
+
+def test_doctor_treats_a_reserved_infrastructure_code_as_fail_closed():
+    findings = cli.test_failure_exit_code_findings("cargo test", "1 124", "tauri")
+
+    assert findings[0].level == "error"
+    assert "fails closed" in findings[0].message
+
+
+def test_doctor_reports_every_runner_a_sequenced_test_cmd_drives():
+    findings = cli.test_failure_exit_code_findings(
+        "npm test && cargo test", None, "mixed"
+    )
+
+    assert len(findings) == 1  # npm's 1 is already trusted; cargo's 101 is not
+    assert "cargo test" in findings[0].message
+
+
+def test_doctor_finds_runners_behind_a_wrapper_or_a_path():
+    assert cli.test_cmd_runners("uv run pytest -q") == (("pytest", 1),)
+    assert cli.test_cmd_runners("./node_modules/.bin/vitest run") == (("vitest", 1),)
+    assert cli.test_cmd_runners("make test") == (("make", 2),)
+    assert cli.test_cmd_runners("cargo test 'unbalanced") == (("cargo test", 101),)
+    assert cli.test_cmd_runners("./run-everything.sh") == ()
+
+
+def test_doctor_exit_code_check_reads_absent_and_empty_declarations_apart(capsys):
+    """The composed env distinguishes 'key not set' (harness default applies)
+    from 'key set to empty' (a declaration the gate fails closed on)."""
+    absent = cli._doctor_test_failure_exit_codes({"TEST_CMD": "pytest"}, "app")
+    empty = cli._doctor_test_failure_exit_codes(
+        {"TEST_CMD": "pytest", "GATE_TEST_FAILURE_EXIT_CODES": ""}, "app"
+    )
+
+    assert absent == ()
+    assert [f.level for f in empty] == ["error", "warn"]
+    assert "fails closed" in capsys.readouterr().err
 
 
 # ── discovery probe: lint + typecheck alongside the test command ──────────────

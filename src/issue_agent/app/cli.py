@@ -37,9 +37,17 @@ from datetime import datetime, timezone
 from ..adapters.env_file import source_env_file
 from ..adapters.heartbeat import read_heartbeat_time
 from ..adapters.operator_effects import build_operator_effects
+from ..domain.contracts import (
+    DEFAULT_TEST_FAILURE_EXIT_CODES,
+    parse_test_failure_exit_codes,
+)
 from ..domain.dashboard import STALE_AFTER_S
 from ..domain.repository import canonical_repository, repository_equal
-from .codex_resolution import CodexResolutionReport, codex_resolution_report
+from .codex_resolution import (
+    CodexResolutionReport,
+    Finding,
+    codex_resolution_report,
+)
 from .config import (
     REPOINT_HISTORY_ENV,
     default_state_dir as config_default_state_dir,
@@ -930,6 +938,108 @@ def gate_failure_exit_codes(test_cmd: str) -> str:
     return "101" if tokens and os.path.basename(tokens[0]) == "cargo" else ""
 
 
+# ── declared vs. required red-test exit codes (doctor) ───────────────────────
+# tauri, 2026-08-08: a TEST_CMD ending in `cargo test` under the default trusted
+# set {1} makes every honest assertion failure (101) read as INFRA_ERROR, so the
+# red-fail gate can never be satisfied and every seam issue deadlocks. Caught by
+# the operator; doctor now says it. `cargo test` reserves 1 for build/usage
+# errors and reports assertion failures as 101; GNU make exits 2 when a recipe
+# fails (1 only under --question), so a `make test` deployment — this harness's
+# own — is in the same trap; the rest use the portable 1.
+_RUNNER_FAILURE_EXIT_CODES: tuple[tuple[tuple[str, ...], int], ...] = (
+    (("cargo", "test"), 101),
+    (("go", "test"), 1),
+    (("npm", "test"), 1),
+    (("bun", "test"), 1),
+    (("bunx", "vitest"), 1),
+    (("pytest",), 1),
+    (("vitest",), 1),
+    (("jest",), 1),
+    (("make",), 2),
+)
+
+
+def _test_cmd_tokens(test_cmd: str) -> tuple[str, ...]:
+    """TEST_CMD as bare command words. An unbalanced quote still has to be read
+    (an operator's half-written command is exactly when this check matters)."""
+    try:
+        tokens = shlex.split(test_cmd)
+    except ValueError:
+        tokens = test_cmd.split()
+    return tuple(os.path.basename(token) for token in tokens)
+
+
+def test_cmd_runners(test_cmd: str) -> tuple[tuple[str, int], ...]:
+    """Every known runner in TEST_CMD with the exit code it reports an asserted
+    failure as, in command order and without duplicates. A sequenced command
+    (`npm test && cargo test`) runs several; each one's contract must hold."""
+    tokens = _test_cmd_tokens(test_cmd)
+    found: list[tuple[str, int]] = []
+    for index in range(len(tokens)):
+        for words, code in _RUNNER_FAILURE_EXIT_CODES:
+            if tuple(tokens[index:index + len(words)]) != words:
+                continue
+            entry = (" ".join(words), code)
+            if entry not in found:
+                found.append(entry)
+            break
+    return tuple(found)
+
+
+def test_failure_exit_code_findings(
+    test_cmd: str, declared_raw: str | None, name: str
+) -> tuple[Finding, ...]:
+    """Doctor's findings about GATE_TEST_FAILURE_EXIT_CODES vs TEST_CMD.
+
+    Empty when TEST_CMD is unset or every runner's failure code is trusted.
+    `declared_raw` is the deployment's raw declaration and None means the key is
+    ABSENT: only then does the harness default apply. A key that is PRESENT and
+    empty is a declaration the gate parses to the empty set (adapters/worktree.py
+    reads it the same way), so it must reach the parser rather than be papered
+    over with the default here.
+
+    An empty trusted set is an error, not a warning: nothing at all can count as
+    red-test evidence, so every red-fail check deadlocks regardless of which
+    runner TEST_CMD drives — reported even when no runner is recognised.
+    """
+    if not test_cmd.strip():
+        return ()
+    raw = DEFAULT_TEST_FAILURE_EXIT_CODES if declared_raw is None else declared_raw
+    declared = parse_test_failure_exit_codes(raw)
+    runners = test_cmd_runners(test_cmd)
+    missing = tuple(
+        (runner, code) for runner, code in runners if code not in declared
+    )
+    if declared and not missing:
+        return ()
+    wanted = sorted(declared | {code for _, code in missing}) or [
+        int(DEFAULT_TEST_FAILURE_EXIT_CODES)
+    ]
+    remedy = (
+        f"set GATE_TEST_FAILURE_EXIT_CODES=\"{' '.join(str(c) for c in wanted)}\" "
+        f"in config/repos/{name}.env"
+    )
+    findings: list[Finding] = []
+    if not declared:
+        findings.append(Finding(
+            "error",
+            f"GATE_TEST_FAILURE_EXIT_CODES={raw!r} is empty, malformed, or names "
+            "a reserved infrastructure code, so the gate fails closed: NO exit "
+            "code counts as trusted red-test evidence and every red-fail check "
+            f"deadlocks — {remedy}",
+        ))
+    for runner, code in missing:
+        findings.append(Finding(
+            "warn",
+            f"TEST_CMD runs '{runner}', which reports an asserted failure as "
+            f"exit {code}, but GATE_TEST_FAILURE_EXIT_CODES trusts "
+            f"{{{', '.join(str(c) for c in sorted(declared)) or 'nothing'}}} — "
+            "the red-fail gate reads a genuine test failure as INFRA_ERROR and "
+            f"never converges; {remedy}",
+        ))
+    return tuple(findings)
+
+
 def _ask(prompt: str, default: str = "") -> str:
     """One operator question. EOF (piped stdin, Ctrl-D) takes the default rather
     than exploding mid-wizard."""
@@ -1636,6 +1746,168 @@ def _stop_deployment(name: str) -> int:
     return 0
 
 
+# #156 follow-up (live incident 2026-08-08): doctor's stale/partial-install
+# check aborted a launch that one `make install` fixes, and the operator ran
+# exactly the command the message named and relaunched. `start` now performs
+# that remediation itself — once, never in a loop — and leaves the preflight to
+# report the drift verbatim if it does not take. Bare `issue-agent doctor` stays
+# report-only: it diagnoses, it does not mutate the install.
+_PRIMARY_ENTRYPOINT = "issue-agent"
+# `make install` runs `uv sync`, which PRUNES packages from the shared .venv the
+# daemons of every deployment on this box are executing out of. Bounded so a
+# wedged resolver cannot hold a launch open forever.
+_INSTALL_TIMEOUT_S = 300.0
+
+
+def declared_console_scripts() -> tuple[str, ...]:
+    """The console scripts `make install` materialises, read from the ONE
+    declaration bin/install.sh also reads (pyproject's `[project.scripts]`), so
+    adding an entry point stays a single edit. Falls back to this distribution's
+    installed metadata when the checkout's pyproject cannot be parsed (Python
+    3.10 has no tomllib), and to nothing when neither can answer — an unknown
+    contract must not be reported as drift."""
+    path = os.path.join(HARNESS_ROOT, "pyproject.toml")
+    try:
+        import tomllib
+
+        with open(path, "rb") as stream:
+            table = (tomllib.load(stream).get("project") or {}).get("scripts")
+    except (ImportError, OSError, ValueError):
+        table = None
+    names = tuple(str(k) for k in (table or {}) if str(k).strip())
+    return names or _installed_console_scripts()
+
+
+def _installed_console_scripts() -> tuple[str, ...]:
+    from importlib.metadata import PackageNotFoundError, distribution
+
+    try:
+        entries = distribution("issue-agent").entry_points
+    except PackageNotFoundError:
+        return ()
+    return tuple(e.name for e in entries if e.group == "console_scripts")
+
+
+def _resolves_into_this_checkout(script: str) -> bool:
+    """Whether `script` on PATH actually runs THIS checkout's venv entry point.
+
+    Presence alone reads healthy while another checkout's shim shadows ours —
+    the daemon then execs a different tree's plugin/ and config/. The generated
+    shim (bin/install.sh) bakes the absolute venv path in, so either PATH
+    resolves straight to that binary or the shim names it."""
+    found = shutil.which(script)
+    if not found:
+        return False
+    entry = os.path.join(HARNESS_ROOT, ".venv", "bin", script)
+    if os.path.realpath(found) == os.path.realpath(entry):
+        return True
+    try:
+        with open(found, encoding="utf-8", errors="replace") as stream:
+            return entry in stream.read(8192)
+    except OSError:
+        return False
+
+
+def entrypoint_drift() -> str:
+    """Why this box's install is stale/partial, '' when it is coherent.
+
+    doctor.sh's signature generalised: gated on `issue-agent` resolving, which
+    (and only which) means this box runs the INSTALLED flavour — a dev checkout
+    that never ran `make install` has none of the scripts and is not drift."""
+    scripts = declared_console_scripts()
+    if _PRIMARY_ENTRYPOINT not in scripts or not shutil.which(_PRIMARY_ENTRYPOINT):
+        return ""
+    for script in scripts:
+        if not shutil.which(script):
+            return (
+                f"{script} is not on PATH though {_PRIMARY_ENTRYPOINT} is "
+                "— stale/partial install"
+            )
+        if not _resolves_into_this_checkout(script):
+            return (
+                f"{script} on PATH resolves to {shutil.which(script)}, which is "
+                f"not this checkout's .venv/bin/{script} — a stale shim from "
+                "another checkout shadows this deployment"
+            )
+    return ""
+
+
+def live_deployment_names() -> tuple[str, ...]:
+    """Deployments with a running launcher, role process, or fresh heartbeat.
+
+    `make install` runs `uv sync` against the ONE .venv every deployment's
+    daemons execute from, and a sync prunes packages mid-tick. Same liveness
+    authority `status`/`stop` use, heartbeats included so daemons in another PID
+    namespace (installed services) still count."""
+    try:
+        entries = sorted(os.listdir(REPOS_DIR))
+    except OSError:
+        return ()
+    live: list[str] = []
+    for entry in entries:
+        if not entry.endswith(".env"):
+            continue
+        other = entry[: -len(".env")]
+        if (
+            _launcher_pids(other)
+            or any(_role_pids(other).values())
+            or _fresh_role_heartbeats(other)
+        ):
+            live.append(other)
+    return tuple(live)
+
+
+def heal_entrypoint_drift() -> bool:
+    """Re-run the installer once when the entry points have drifted. True when
+    there was nothing to fix or the fix worked; False leaves the drift for the
+    preflight to report as today."""
+    drift = entrypoint_drift()
+    if not drift:
+        return True
+    live = live_deployment_names()
+    if live:
+        err(f"stale/partial install detected ({drift}), but NOT auto-repairing: "
+            f"deployment(s) {', '.join(live)} are live and `make install` runs "
+            "`uv sync` against the .venv their daemons execute from. Stop them "
+            "(`issue-agent stop --name <n>`) and re-run `make install`.")
+        return False
+    info(f"stale/partial install detected ({drift}) — running `make install` "
+         "once before launch")
+    try:
+        result = subprocess.run(
+            ["make", "install"],
+            cwd=HARNESS_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=_INSTALL_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as expired:
+        err(f"auto-repair failed: `make install` exceeded {_INSTALL_TIMEOUT_S:.0f}s")
+        _echo_tail(_decoded(expired.stderr) or _decoded(expired.stdout))
+        return False
+    if result.returncode != 0:
+        err(f"auto-repair failed: `make install` exited {result.returncode}")
+        _echo_tail(result.stderr or result.stdout or "")
+        return False
+    if entrypoint_drift():
+        err("auto-repair failed: `make install` succeeded but the install is "
+            f"still drifted ({entrypoint_drift()})")
+        return False
+    ok(f"auto-fixed stale/partial install: re-ran `make install` ({drift})")
+    return True
+
+
+def _decoded(stream: str | bytes | None) -> str:
+    if isinstance(stream, bytes):
+        return stream.decode(errors="replace")
+    return stream or ""
+
+
+def _echo_tail(output: str, lines: int = 5) -> None:
+    for line in output.strip().splitlines()[-lines:]:
+        err(f"  {line}")
+
+
 def cmd_start(args) -> int:
     repo, target_dir, name = _resolve_context(args)
     if not repo:
@@ -1851,6 +2123,7 @@ def cmd_start(args) -> int:
         env["ROLES"] = " ".join(args.roles)
     if args.max_ticks is not None:
         env["ISSUE_AGENT_MAX_TICKS"] = str(args.max_ticks)
+    heal_entrypoint_drift()
     info(f"delegating to bin/point-at.sh {name}")
     # exec — hand over the terminal (Ctrl-C trap, log tail live in point-at.sh).
     os.execve(_BASH, [_BASH, _bin("point-at.sh"), name], env)
@@ -2541,13 +2814,16 @@ def cmd_doctor(args) -> int:
              f"(TEST_CMD, BASE_BRANCH, state dirs); re-run doctor after that.")
     composed = _composed_env(env)
     _doctor_codex_binary(composed)
+    exit_codes = _doctor_test_failure_exit_codes(composed, name)
     identity = _doctor_identity_pools(composed)
     rc = subprocess.run([_BASH, _bin("doctor.sh")], env=env).returncode
     # An error-level identity finding must redden the EXIT CODE, not only the
     # terminal. doctor is used as a gate (bin/point-at.sh, CI); a config whose
     # fixer token is present-but-unusable 401s every call with no fallback, and
     # returning doctor.sh's 0 for it is the false green this check replaces.
-    if rc == 0 and any(f.level == "error" for f in identity.findings):
+    if rc == 0 and any(
+        f.level == "error" for f in tuple(identity.findings) + exit_codes
+    ):
         return 1
     return rc
 
@@ -2578,6 +2854,24 @@ def _doctor_identity_pools(composed: dict) -> IdentityPoolReport:
     token share one 5,000-point/hour pool (both keifu, 2026-08-02)."""
     info("identity and rate-limit pools")
     return report_identity_pools(composed)
+
+
+def _doctor_test_failure_exit_codes(composed: dict, name: str) -> tuple[Finding, ...]:
+    """Report runners in TEST_CMD whose assertion-failure exit code the gate does
+    not trust. doctor.sh only echoes TEST_CMD; it cannot parse the declaration
+    the Python gate enforces. The raw value is passed through verbatim — absent
+    (None) and present-but-empty mean different things to the gate."""
+    declared = composed.get("GATE_TEST_FAILURE_EXIT_CODES")
+    findings = test_failure_exit_code_findings(
+        composed.get("TEST_CMD") or "",
+        declared if declared is None else str(declared),
+        name,
+    )
+    if findings:
+        info("project commands: red-test exit codes")
+        for finding in findings:
+            (err if finding.level == "error" else warn)(finding.message)
+    return findings
 
 
 def _doctor_codex_binary(composed: dict) -> CodexResolutionReport | None:

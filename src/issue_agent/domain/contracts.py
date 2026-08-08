@@ -213,6 +213,33 @@ class TestExecutionStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+DEFAULT_TEST_FAILURE_EXIT_CODES = "1"
+
+
+def parse_test_failure_exit_codes(raw: str) -> frozenset[int]:
+    """Parse a declared `GATE_TEST_FAILURE_EXIT_CODES` value.
+
+    One is the portable default used by pytest, unittest, npm, and simple shell
+    predicates. A deployment whose runner has a different documented contract
+    can declare space/comma-separated codes. Malformed or infrastructure codes
+    fail closed to no accepted failure codes, so nothing counts as trusted
+    red-test evidence until an operator fixes the declaration.
+
+    The single parse: the gate adapter reads it from the environment and doctor
+    reports on it, and a second copy of these rules could disagree with the one
+    the gate enforces.
+    """
+
+    tokens = tuple(token for token in re.split(r"[\s,]+", raw.strip()) if token)
+    try:
+        codes = frozenset(int(token) for token in tokens)
+    except ValueError:
+        return frozenset()
+    if any(code <= 0 or code >= 124 for code in codes):
+        return frozenset()
+    return codes
+
+
 def classify_test_exit_code(
     exit_code: int | None,
     confirmed_failure_codes: frozenset[int] = frozenset({1}),
