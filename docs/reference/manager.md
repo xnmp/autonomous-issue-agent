@@ -9,7 +9,42 @@ Whoever babysits a deployment — today an interactive session, eventually the
 #11 daemon — owns this lifecycle. Scope boundary: everything here is
 **reversible or additive** (comments, labels, restarts, filed issues, reports);
 the moment a fix needs harness code, file an issue with journal evidence and
-stop. Never self-modify mid-batch.
+stop — **unless the operator has explicitly directed fixing gaps on the spot**
+(2026-08-08 batch ran under that directive and it worked). Mid-batch harness
+fixes then follow their own discipline: reproduce the failure before fixing
+(two of three filed hypotheses that day were wrong — #177's reruns were all
+landing, #178 was a two-dot/three-dot diff bug, and repro-before-fix caught
+both); adversarially review the diff in an unbiased subagent; commit only
+`make test`-green coherent states (hot reload picks them up between ticks);
+and regenerate the composed env snapshot when the fix adds a knob the live
+daemons must see.
+
+## Direction: toward an unsupervised harness
+
+The long-term goal is a harness that runs without supervision, where every
+remaining operator action genuinely requires human judgment. Two standing
+obligations follow (operator, 2026-08-08):
+
+- **Triage every operator action in the batch readout**: for each unblock,
+  restart, or hand-fix, say whether it needed a human (product ambiguity,
+  platform the box can't reach, spend policy) or only needed knowledge the
+  harness could have had (an exit code, a capability probe, a stale install).
+  The second kind is a gap — file or fix it; it must not recur as an operator
+  action.
+- **Apply the surface-area test to every fix**: a good fix is *subtractive* —
+  it removes a piece of knowledge or intervention the operator previously had
+  to supply. A fix that adds a knob, a flag, or a per-incident special case
+  increases the surface and is presumptively wrong; if shipped as a
+  transitional measure, name the structural fix that supersedes it and the
+  measurement that proves the knob is no longer needed. Gap severity should
+  fall across deployments ($126/merge → $5.49/merge over eight); if a class
+  recurs, the prior fix treated the instance, not the generator.
+
+Accepted residuals live in [docs/open/residuals.md](../open/residuals.md) with
+named triggers — e.g. platform-invisible CI (a Windows-only failure cannot be
+reproduced by a Linux leg; the environment manifest keeps legs from burning
+spend on impossible local repro, and true convergence is an operator decision
+about paid runners, not a harness fix).
 
 - **Before**: read the pending rows of
   [docs/field-verification.md](docs/field-verification.md) (the append-only
@@ -92,6 +127,23 @@ stop. Never self-modify mid-batch.
   the `operator-action` label.
 - **`gh` label/state searches are stale for recently closed objects** —
   verify with a direct `gh issue view` before acting on a search result.
+- **Pre-launch overlay checklist grew two entries (2026-08-08)**:
+  `GATE_TEST_FAILURE_EXIT_CODES` must cover every runner in TEST_CMD (cargo
+  fails with 101, make with 2 — doctor now errors/warns on gaps, but the
+  overlay is where the fix goes) and `EVIDENCE_STACK` should be declared when
+  the target's live-evidence toolchain is known (lets the environment manifest
+  attest "cannot produce live evidence here" as a verdict, ending
+  unproducible-evidence review wedges without a scope note). Entrypoint drift
+  no longer needs a manual `make install` — `issue-agent start` self-heals it
+  unless another deployment is live.
+- **The dashboard unblock endpoint is keyed by ISSUE number, not PR number**
+  (`/api/repos/<name>/issues/<issue>/unblock`) — posting the PR number returns
+  "issue #N is not open". The optional `guidance` field scopes the next review
+  round (absent=keep, ""=clear, text=set); prefer no note now that review
+  prompts carry the PR discussion and the capability manifest.
+- **Never run `issue-agent dashboard` from a sandboxed assistant shell** — the
+  server inherits the sandbox and every `gh` write dies with an h2 "stream
+  CANCEL". Spawn it unsandboxed or the unblock lever silently can't write.
 - **Terminal GitHub writes are durable.** A comment/relabel/close that exhausts
   transient retries remains a `lifecycle_commands` row in the SQLite control
   store. The daemon drains that authority before its next world read, reaper
