@@ -567,6 +567,72 @@ out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD="$EXEMPT_TEST_CMD" bash "$CHECKS/chec
   || no "two renames plus one edit stay within the bound" "rc=$rc out=${out:0:300}"
 rm -rf "$d"
 
+# (f4) #178 — the bound counts the NET diff vs the base, at evaluation time.
+#      Two independent ways a branch can look bigger than it is:
+#        1. its own history transiently touched more test files and then
+#           restored them (the fixer consolidating an approach);
+#        2. the BASE advanced past the merge-base with other PRs that touched
+#           other test files.
+#      (2) blocked tauri PR #614 with a net diff of two modified test files:
+#      the check ran `git diff <base>..HEAD` (two dots = the ENDPOINT diff), so
+#      dev's own test edits counted, in reverse, as this branch's.
+setup_transient_repo() {  # branch touches 5 tests then restores 3; base moves too
+  local d; d=$(fresh_repo)
+  (
+    cd "$d"
+    mkdir -p tests
+    for i in 1 2 3 4 5; do echo "def test_$i(): assert True" > "tests/test_$i.py"; done
+    git add tests && git -c core.hooksPath=/dev/null commit -qm "test: baseline"
+    mkdir -p .claude .harness && git switch -qc fix/13-transient
+    echo "def test_new_regression(): assert True" > tests/test_new_regression.py
+    git add tests/test_new_regression.py
+    git -c core.hooksPath=/dev/null commit -qm "red: new"
+    # first approach: rewrite five existing tests
+    for i in 1 2 3 4 5; do echo "def test_$i(): assert True  # wip" > "tests/test_$i.py"; done
+    echo impl > impl.py
+    git add -A && git -c core.hooksPath=/dev/null commit -qm "green: first approach"
+    # consolidate: restore all but two, so the NET diff is two modified tests
+    for i in 3 4 5; do echo "def test_$i(): assert True" > "tests/test_$i.py"; done
+    git add -A && git -c core.hooksPath=/dev/null commit -qm "refactor: consolidate, restore the rest"
+    # meanwhile the base advances with unrelated PRs touching OTHER test files
+    git switch -q dev
+    for i in 3 4 5; do echo "def test_$i(): assert True  # another PR" > "tests/test_$i.py"; done
+    git add -A && git -c core.hooksPath=/dev/null commit -qm "chore: unrelated work merged into dev"
+    git switch -q fix/13-transient
+  )
+  echo "$d"
+}
+d=$(setup_transient_repo)
+out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD="$EXEMPT_TEST_CMD" bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] \
+  && ok "restored tests and base-side test churn drop out of the scope bound" \
+  || no "restored tests and base-side test churn drop out of the scope bound" "rc=$rc out=${out:0:300}"
+rm -rf "$d"
+
+# (f5) anti-vacuity twin for (f4): a base that advanced does NOT excuse a
+#      branch that really does rewrite four existing tests in its net diff.
+d=$(fresh_repo)
+( cd "$d"
+  mkdir -p tests
+  for i in 1 2 3 4 5; do echo "def test_$i(): assert True" > "tests/test_$i.py"; done
+  git add tests && git -c core.hooksPath=/dev/null commit -qm "test: baseline"
+  mkdir -p .claude .harness && git switch -qc fix/13-transient
+  echo "def test_new_regression(): assert True" > tests/test_new_regression.py
+  git add tests/test_new_regression.py
+  git -c core.hooksPath=/dev/null commit -qm "red: new"
+  for i in 1 2 3 4; do echo "def test_$i(): assert True  # rewritten" > "tests/test_$i.py"; done
+  echo impl > impl.py
+  git add -A && git -c core.hooksPath=/dev/null commit -qm "green: rewrite four tests"
+  git switch -q dev
+  echo "def test_5(): assert True  # another PR" > tests/test_5.py
+  git add -A && git -c core.hooksPath=/dev/null commit -qm "chore: unrelated work merged into dev"
+  git switch -q fix/13-transient )
+out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD="$EXEMPT_TEST_CMD" bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'existing test files'; } \
+  && ok "a genuine four-test rewrite is still blocked when the base advanced" \
+  || no "a genuine four-test rewrite is still blocked when the base advanced" "rc=$rc out=${out:0:300}"
+rm -rf "$d"
+
 # (f3) a modified existing test whose path cannot be written as a grant subject
 #      is DENIED here, where the message can name the file — admitting it would
 #      guarantee a permanent merge withhold and a confusing escalation later.
@@ -996,6 +1062,17 @@ out=$( cd "$d" && PATH="$d/bin:$PATH" BASE_BRANCH=dev TEST_CMD='true' bash "$CHE
 { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'existing test files'; } \
   && ok "push rewriting 4 existing tests blocked" \
   || no "push rewriting 4 existing tests blocked" "rc=$rc out=${out:0:300}"
+rm -rf "$d"
+
+# (d3) #178 on the push gate: the address-review push is exactly when the base
+#      HAS advanced and when the branch has consolidated an earlier approach,
+#      so this is where the endpoint-diff bug fired (tauri PR #614). Shares
+#      setup_transient_repo with the PR-gate case (f4) above.
+d=$(setup_transient_repo); make_gh_stub "$d" "7"
+out=$( cd "$d" && PATH="$d/bin:$PATH" BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-push.sh" push 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] \
+  && ok "push with restored tests and base-side churn stays within the bound" \
+  || no "push with restored tests and base-side churn stays within the bound" "rc=$rc out=${out:0:300}"
 rm -rf "$d"
 
 # (e) non-governed branch → allow regardless (and never even calls gh).

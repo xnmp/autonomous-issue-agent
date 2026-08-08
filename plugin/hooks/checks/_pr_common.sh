@@ -337,14 +337,25 @@ prc_check_tests_immutable() {  # prc_check_tests_immutable "<changed-file-list>"
   # `diff --git` records, which likewise survive renames, binary files and
   # `.gitattributes -diff` — deriving from the NEW-side name list alone let a
   # renamed-away test escape entirely (round-4 adversarial review).
-  local f n_modified=0
+  #
+  # THREE-dot `diff_range`, never the two-dot `log_range` (#178). For `git diff`
+  # two dots means the ENDPOINT diff `base HEAD`, so every test file the BASE
+  # advanced past this branch's merge-base counted as "modified by this branch",
+  # in reverse. tauri PR #614 (2026-08-08) was blocked with a net diff of two
+  # modified test files because dev had merged other PRs touching five more:
+  # the endpoint diff reported seven, the branch's own diff two. Same class as
+  # the review-M6 two-dot/three-dot mix-up documented in this file's header,
+  # here in the opposite direction. The python twin counts from the three-dot
+  # `changed` list (gate.check_tests_immutable), which is what $1 carries.
+  local f n_modified=0 mdrt_range="${diff_range:-}"
+  [ -n "$mdrt_range" ] || mdrt_range="${log_range%%..*}...HEAD"
   while IFS= read -r f; do
     [ -n "$f" ] || continue
     printf '%s' "$f" | grep -qE "$PR_TEST_FILE_RE" || continue
     n_modified=$((n_modified + 1))
     printf '%s' "$f" | grep -qE '^[A-Za-z0-9._/+-]{1,200}$' \
       || fail "existing test file '$f' was modified, but its path cannot be carried in a reviewer grant (allowed: letters, digits, and . _ / + - up to 200 characters). Restore that file and put the change in a test file whose path is within the charset, or rename the file in a separate PR"
-  done <<< "$(git diff --no-renames --diff-filter=MDRT --name-only "$log_range" 2>/dev/null || printf '%s' "$1")"
+  done <<< "$(git diff --no-renames --diff-filter=MDRT --name-only "$mdrt_range" 2>/dev/null || printf '%s' "$1")"
   [ "$n_modified" -le 3 ] \
     || fail "more than 3 existing test files modified/deleted — changing an existing test is allowed (the reviewer must explicitly approve each one before merge), but this many reads as a rewrite, not a correction; reduce the change's scope (or split it) so at most 3 existing test files are touched, and prefer ADDING tests in new files wherever the old expectation is still right"
 }
