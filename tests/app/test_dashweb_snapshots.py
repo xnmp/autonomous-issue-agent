@@ -1181,6 +1181,64 @@ def test_metrics_json_carries_the_intervention_split_and_ratio():
     assert payload["interventions_per_merged_pr"] is None  # nothing merged yet
 
 
+# ── settled-leg stage in the fold ─────────────────────────────────────────────
+# The third mapping site for the #158 class, and the one an operator actually
+# reads: the stage the fold puts on the issue row. Claude settles a clean leg
+# with an empty exit reason and codex settles it `ok`, so keying failure on the
+# field's presence rendered whole healthy codex batches as "run failed".
+@pytest.mark.parametrize(
+    "exit_reason,is_error,stage",
+    [
+        pytest.param("ok", False, "working", id="codex-clean"),
+        pytest.param("OK", False, "working", id="clean-uppercased"),
+        pytest.param(None, False, "working", id="claude-clean"),
+        pytest.param("ok", True, "run failed", id="error-despite-clean-reason"),
+        pytest.param("budget_exhausted", True, "run failed", id="budget"),
+        pytest.param("agent_error", False, "run failed", id="agent-error"),
+        pytest.param("wall_cap", False, "run failed", id="infra-death"),
+        pytest.param("!" + "x" * 10_000, False, "run failed", id="huge-unknown"),
+    ],
+)
+def test_the_fold_stages_a_settled_leg_by_its_error_signal(
+    exit_reason, is_error, stage
+):
+    dep = v2_deployment([
+        v2_event(AgentRunStarted("m", kind="TRIAGE"), "a", 0, issue=7, run_id="r"),
+        v2_event(
+            AgentRunCompleted(
+                "done", is_error, exit_reason, 1000, "m", "codex",
+                kind="TRIAGE", cost_micros=680_000, currency="USD",
+                pricing_basis="api",
+            ),
+            "b", 1, issue=7, run_id="r",
+        ),
+        _observed(7, ["ai-working"], 2),
+    ])
+
+    # A clean settle renders the issue's lifecycle state; only an error signal
+    # renders "run failed".
+    assert dep.issues[0].stage == stage
+
+
+def test_a_clean_codex_leg_does_not_flag_the_card_as_failed():
+    dep = v2_deployment([
+        v2_event(AgentRunStarted("m", kind="RESOLVE"), "a", 0, issue=7, run_id="r"),
+        v2_event(
+            AgentRunCompleted(
+                "done", False, "ok", 1000, "m", "codex", kind="RESOLVE",
+                cost_micros=680_000, currency="USD", pricing_basis="api",
+            ),
+            "b", 1, issue=7, run_id="r",
+        ),
+        _observed(7, ["ai-pr-open"], 2),
+    ])
+
+    card = snapshots.issue_card(dep.issues[0], NOW)
+
+    assert card["stage"] == "awaiting review"
+    assert [step["state"] for step in card["steps"]] == ["ok"]
+
+
 # ── escalation reasons ────────────────────────────────────────────────────────
 def _deployment_of(*rows):
     return replace(build([RESOLVE]), issues=tuple(rows))
