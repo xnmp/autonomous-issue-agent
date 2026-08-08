@@ -1623,6 +1623,26 @@ def test_a_manual_unblock_is_rendered_as_a_free_step_that_says_what_it_did():
     )
 
 
+@pytest.mark.parametrize(
+    "action,expected",
+    [("set", "with scope note"), ("cleared", "scope note cleared")],
+)
+def test_an_unblock_that_rescoped_the_review_says_so_in_history(action, expected):
+    # Three identical "unblock" rows read as an operator going in circles; the
+    # marker is what shows the third one changed what the reviewer was asked.
+    rescoped = {
+        **UNBLOCK,
+        "action": {**UNBLOCK["action"], "guidance": action},
+    }
+    step = snapshots.detailed_steps(row_view([rescoped]))[-1]
+    assert step["note"].endswith(expected)
+
+
+def test_an_unblock_that_left_the_note_alone_adds_no_marker():
+    step = snapshots.detailed_steps(row_view([UNBLOCK]))[-1]
+    assert "scope note" not in step["note"]
+
+
 def test_a_failed_unblock_intent_does_not_retire_journal_attention():
     escalation = {
         "ts": ts(hours=2), "event": "action", "issue": 7, "role": "fix",

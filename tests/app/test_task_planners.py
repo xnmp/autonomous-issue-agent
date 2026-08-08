@@ -53,6 +53,8 @@ from issue_agent.app.planners.tasks import (
     scope_diff,
 )
 
+from issue_agent.app.dashweb import guidance as guidance_rules
+
 FIX_CFG = FixTaskConfig(repo="o/r", base_branch="dev", agent_md="AGENTMD", max_budget_usd=3.0)
 U = as_untrusted
 
@@ -444,6 +446,108 @@ def test_re_review_task_substitutes_round_and_resumes():
     # (round substitution + resume), prose-only, and the adversarial-refute
     # framing itself is the NAMED point of test_review_validation_task_is_adversarial.
     assert "old → new" in t.prompt
+
+
+# ── operator guidance (dashboard unblock → review prompt) ──
+def test_review_task_carries_the_operator_guidance_as_trusted_scope():
+    t = build_review_task(
+        100, U("PR title"), U("desc"), U("the diff"), RCFG,
+        operator_guidance="native screenshots are impossible; accept the log",
+    )
+    assert "native screenshots are impossible; accept the log" in t.prompt
+    assert "OPERATOR_GUIDANCE" in t.prompt
+    # Bounded authority: an operator may narrow evidence expectations, never
+    # buy an approval or waive a trust-boundary rule.
+    assert "approve code you find defective" in t.prompt
+    assert "security or trust-boundary" in t.prompt
+
+
+def test_re_review_task_carries_the_operator_guidance():
+    t = build_re_review_task(
+        100, 3, "old", "new", U("delta"), "rs", RCFG,
+        operator_guidance="scope: the parser only",
+    )
+    assert "scope: the parser only" in t.prompt
+    assert "OPERATOR_GUIDANCE" in t.prompt
+
+
+@pytest.mark.parametrize("guidance", ["", "   ", "\n\t "])
+def test_no_guidance_leaves_no_operator_section_at_all(guidance):
+    # An empty labelled section reads as "the operator said nothing", which is
+    # worse than silence — it invites the reviewer to infer unbounded scope.
+    for prompt in (
+        build_review_task(
+            100, U("t"), U("b"), U("d"), RCFG, operator_guidance=guidance
+        ).prompt,
+        build_re_review_task(
+            100, 2, "old", "new", U("d"), "rs", RCFG, operator_guidance=guidance
+        ).prompt,
+    ):
+        assert "OPERATOR_GUIDANCE" not in prompt
+        assert "deployment operator has scoped" not in prompt
+
+
+def test_default_review_prompts_have_no_operator_section():
+    assert "OPERATOR_GUIDANCE" not in build_review_task(
+        100, U("t"), U("b"), U("d"), RCFG
+    ).prompt
+    assert "OPERATOR_GUIDANCE" not in build_re_review_task(
+        100, 2, "old", "new", U("d"), "rs", RCFG
+    ).prompt
+
+
+def test_a_note_at_the_ceiling_is_carried_whole():
+    note = "x" * guidance_rules.GUIDANCE_MAX_CHARS  # exactly the permitted max
+    t = build_review_task(
+        100, U("t"), U("b"), U("d"), RCFG, operator_guidance=note
+    )
+    assert note in t.prompt
+
+
+def test_multi_mode_gate_and_dimension_legs_carry_the_guidance():
+    # The gate can END a review (reviewable=false short-circuits to APPROVE) and
+    # the specialists are where findings are born, so both must see the scope.
+    gate = build_review_gate_task(
+        100, U("t"), U("b"), U("d"), RCFG,
+        operator_guidance="accept the recorded log as visual evidence",
+    )
+    dim = build_review_dimension_task(
+        100, "correctness", "logic bugs", U("t"), U("b"), U("d"), RCFG,
+        operator_guidance="accept the recorded log as visual evidence",
+    )
+    for t in (gate, dim):
+        assert "accept the recorded log as visual evidence" in t.prompt
+        assert "OPERATOR_GUIDANCE" in t.prompt
+
+
+def test_the_finding_validator_stays_unscoped():
+    # It adjudicates one already-raised claim on its technical merits; scope
+    # text there would only widen a refuter's licence to dismiss a real defect.
+    t = build_review_validation_task(
+        100, "correctness", U("src/a.py:1"), U("claim"), U("d"), RCFG
+    )
+    assert "OPERATOR_GUIDANCE" not in t.prompt
+
+
+def test_fresh_and_delegated_review_prompts_carry_the_guidance_too():
+    # The note must not depend on REVIEW_MODE or on whether the session could
+    # be resumed — an operator who scoped a review once has scoped every later
+    # round of it.
+    fresh = build_fresh_re_review_task(
+        100, 3, U("t"), U("b"), "old", "new", U("d"), U("prior"), RCFG,
+        operator_guidance="use the recorded terminal log",
+    )
+    delegated = build_delegated_review_task(
+        100, U("t"), U("b"), U("d"), DCFG,
+        operator_guidance="use the recorded terminal log",
+    )
+    delegated_re = build_delegated_re_review_task(
+        100, 3, "old", "new", U("d"), U("prior"), DCFG,
+        operator_guidance="use the recorded terminal log",
+    )
+    for t in (fresh, delegated, delegated_re):
+        assert "use the recorded terminal log" in t.prompt
+        assert "OPERATOR_GUIDANCE" in t.prompt
 
 
 # ── delegated review (REVIEW_MODE=delegated) ──

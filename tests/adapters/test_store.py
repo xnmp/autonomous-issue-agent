@@ -256,6 +256,44 @@ def test_ci_rerun_head_ignores_an_empty_sha():
     assert s.get_ci_rerun_head(100) == "sha-1"
 
 
+def test_operator_guidance_roundtrip_and_overwrite():
+    s, _ = _store()
+    assert s.get_operator_guidance(100) == ""     # default: unscoped review
+    s.set_operator_guidance(100, "accept the log as evidence")
+    assert s.get_operator_guidance(100) == "accept the log as evidence"
+    s.set_operator_guidance(100, "scope: the parser only")
+    assert s.get_operator_guidance(100) == "scope: the parser only"
+
+
+def test_operator_guidance_is_utf8_regardless_of_the_daemon_locale():
+    # It is the first free-text value in the state dir; a daemon started under a
+    # C/POSIX locale must still write and re-read exactly what was typed.
+    s, _ = _store()
+    note = "accept the log — naïve screenshots are impossible 🚫"
+    s.set_operator_guidance(100, note)
+    assert s.get_operator_guidance(100) == note
+    with open(s.pr_path(100, "operator-guidance"), "rb") as f:
+        assert f.read() == note.encode("utf-8")
+
+
+def test_a_cleared_operator_guidance_leaves_no_file_behind():
+    s, _ = _store()
+    s.set_operator_guidance(100, "accept the log")
+    s.clear_operator_guidance(100)
+    assert s.get_operator_guidance(100) == ""
+    assert not os.path.exists(s.pr_path(100, "operator-guidance"))
+    s.clear_operator_guidance(100)  # idempotent: clearing an absent note is fine
+
+
+def test_cleanup_pr_merged_clears_the_operator_guidance():
+    # A note scoped to a merged PR must not be inherited by whatever occupies
+    # that number next — the reviewer would obey a scope nobody set.
+    s, _ = _store()
+    s.set_operator_guidance(100, "accept the log as evidence")
+    s.cleanup_pr(100, 9, merged=True)
+    assert s.get_operator_guidance(100) == ""
+
+
 def test_ci_pending_escalated_head_marker_roundtrip():
     s, _ = _store()
     assert s.get_ci_pending_escalated_head(100) == ""

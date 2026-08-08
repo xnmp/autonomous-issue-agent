@@ -99,6 +99,27 @@ def test_initial_review_skips_when_our_verdict_already_targets_head():
     }) in journal.events
 
 
+def test_stored_operator_guidance_reaches_the_review_and_re_review_prompts():
+    # The end of the operator's unblock path: the dashboard wrote the note into
+    # the review role's state dir, so every later round of THAT PR must carry
+    # it — otherwise the re-armed loop repeats the round that wedged it.
+    prior = Review("CHANGES_REQUESTED", "review-bot", "t1", commit_id="old")
+    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="new", reviews=(prior,))})
+    store = FakeStore()
+    store.set_operator_guidance(100, "native screenshots are impossible here")
+    store.save_pr_session(100, "rs")
+    store.set_last_sha(100, "old")
+    runner = FakeRunner(AgentResult(
+        is_error=False, structured={"decision": "APPROVE", "body": "fixed"},
+    ))
+
+    asyncio.run(_workflow(gw, store, runner).re_review(100))
+    asyncio.run(_workflow(gw, FakeStore(), runner).review(100))
+
+    assert "native screenshots are impossible here" in runner.tasks[0].prompt
+    assert "native screenshots are impossible here" not in runner.tasks[1].prompt
+
+
 def test_re_review_skips_same_head_but_reviews_a_genuinely_new_head():
     prior = Review("CHANGES_REQUESTED", "review-bot", "t1", commit_id="old")
     gw = FakeGateway(prs={
@@ -589,6 +610,31 @@ def test_multi_review_confirmed_blocking_finding_requests_changes_and_persists()
     assert any(c[0] == "review" and c[2] == "REQUEST_CHANGES" for c in gw.calls)
     assert store.pr_sessions[100] == "multi"
     assert store.last_sha[100] == "abc"
+
+
+def test_multi_review_carries_the_operator_guidance_to_gate_and_dimensions():
+    # MULTI returns into its own dispatcher before the single-pass path, so the
+    # note has to be read there too — otherwise an unblock journals a scope it
+    # never delivered.
+    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    gw = FakeGateway(prs={100: pr})
+    store = FakeStore()
+    store.set_operator_guidance(100, "accept the recorded log as visual evidence")
+    runner = SchemaRunner(
+        gate=_gate(),
+        dimension=lambda t: _dim([{"location": "a.py:1", "claim": "bug", "severity": "blocking"}]),
+        validation=lambda t: _val(True),
+    )
+
+    asyncio.run(_workflow(gw, store, runner, review_mode=ReviewMode.MULTI).review(100))
+
+    scoped = [
+        t for t in runner.tasks
+        if "accept the recorded log as visual evidence" in t.prompt
+    ]
+    # gate + every dimension specialist, and NOT the validator legs
+    assert len(scoped) == 1 + len(REVIEW_DIMENSIONS)
+    assert len(scoped) < len(runner.tasks)
 
 
 def test_multi_review_gate_short_circuits_non_reviewable_diff_to_approve():

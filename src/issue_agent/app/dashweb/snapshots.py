@@ -259,6 +259,13 @@ def _operator_note(action: dict) -> str | None:
         ]
     if action.get("retries_cleared"):
         changes.append("reset retry counters")
+    # A re-arm that rescoped the review and one that merely repeated the last
+    # one look identical in history otherwise — and "we unblocked it three
+    # times" reads very differently once you can see the third carried a note.
+    if action.get("guidance") == "set":
+        changes.append("with scope note")
+    elif action.get("guidance") == "cleared":
+        changes.append("scope note cleared")
     if "dismissed" in action:
         review = str(action.get("review_id") or "")
         changes.append(

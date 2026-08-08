@@ -444,6 +444,7 @@ class ReviewWorkflow:
             self._no_progress(p, "revision-bound diff unavailable")
             return
         signature = review_dom.patch_signature(diff)
+        guidance = self.store.get_operator_guidance(pr)
         if self.cfg.review_mode is review_dom.ReviewMode.DELEGATED:
             task = task_builders.build_delegated_review_task(
                 pr,
@@ -451,6 +452,7 @@ class ReviewWorkflow:
                 as_untrusted(p.body),
                 as_untrusted(diff),
                 self.cfg.review,
+                operator_guidance=guidance,
             )
         else:
             task = task_builders.build_review_task(
@@ -459,6 +461,7 @@ class ReviewWorkflow:
                 as_untrusted(p.body),
                 as_untrusted(diff),
                 self.cfg.review,
+                operator_guidance=guidance,
             )
         exemption_request = self._exemption_grant_notice(p, diff)
         if exemption_request is None:
@@ -551,6 +554,7 @@ class ReviewWorkflow:
             )
             return
         last_sha = self.store.get_last_sha(pr)
+        guidance = self.store.get_operator_guidance(pr)
         if self.cfg.review_mode is review_dom.ReviewMode.DELEGATED:
             # Fresh session (no resume) → feed the prior review body as reference
             # instead of replaying the transcript. Use the most recent review with a
@@ -566,6 +570,7 @@ class ReviewWorkflow:
                 as_untrusted(diff),
                 as_untrusted(prior_review),
                 self.cfg.review,
+                operator_guidance=guidance,
             )
         else:
             session_id = self.store.get_pr_session(pr)
@@ -581,6 +586,7 @@ class ReviewWorkflow:
                     as_untrusted(diff),
                     as_untrusted(prior.body if prior else ""),
                     self.cfg.review,
+                    operator_guidance=guidance,
                 )
             else:
                 task = task_builders.build_re_review_task(
@@ -590,6 +596,7 @@ class ReviewWorkflow:
                     p.head_ref_oid,
                     as_untrusted(diff),
                     session_id, self.cfg.review,
+                    operator_guidance=guidance,
                 )
         exemption_request = self._exemption_grant_notice(p, diff)
         if exemption_request is None:
@@ -1152,6 +1159,7 @@ class ReviewWorkflow:
                 return
         signature = review_dom.patch_signature(diff)
         rcfg = self.cfg.review
+        guidance = self.store.get_operator_guidance(pr)
         exemption_request = self._exemption_grant_notice(p, diff)
         if exemption_request is None:
             self._evidence_deferral(p, "exemption declarations unreadable")
@@ -1180,6 +1188,7 @@ class ReviewWorkflow:
                 as_untrusted(p.body),
                 as_untrusted(diff),
                 rcfg,
+                operator_guidance=guidance,
             ),
         )
         if self._pin_deferral(p, gate):
@@ -1237,6 +1246,7 @@ class ReviewWorkflow:
                     as_untrusted(p.body),
                     as_untrusted(diff),
                     rcfg,
+                    operator_guidance=guidance,
                 )
             )
             for key, focus in dims
@@ -1260,8 +1270,14 @@ class ReviewWorkflow:
         self.cfg.log(f"review #{pr}: {len(candidates)} candidate finding(s) "
                      f"across {len(dims)} dimensions")
 
-        # 3. adversarial validation — one refuter per candidate, in parallel. A
-        # validator transport error is NOT a refutation: it also marks the review
+        # 3. adversarial validation — one refuter per candidate, in parallel.
+        # Deliberately NOT given the operator's scope note: it adjudicates one
+        # already-raised claim on its technical merits, and scope text there
+        # only widens a refuter's licence to dismiss a real defect. A
+        # scope-inappropriate finding is prevented at the specialist, not
+        # argued away at the validator.
+        #
+        # A validator transport error is NOT a refutation: it also marks the review
         # incomplete (so a genuine finding whose validator died is not silently
         # dropped into an APPROVE), while confirmed stays False so it isn't reported
         # as a fact either — the PR is simply retried next poll.

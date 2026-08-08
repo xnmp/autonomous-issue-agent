@@ -71,6 +71,8 @@ def create_app(
     offload_backend: bool | None = None,
 ):
     from fastapi import Body, FastAPI, Header, HTTPException, Query
+    from fastapi.encoders import jsonable_encoder
+    from fastapi.exceptions import RequestValidationError
     from fastapi.responses import HTMLResponse, JSONResponse, Response
     from starlette.concurrency import run_in_threadpool
 
@@ -94,6 +96,22 @@ def create_app(
             **empty,
             "warnings": [f"{kind} unavailable ({type(exc).__name__}: {exc})"],
         }
+
+    @app.exception_handler(RequestValidationError)
+    async def rejected_body(_request, exc: RequestValidationError):
+        """A refused body must render as a 422, never as a 500.
+
+        FastAPI's default handler echoes the offending `input` back, and a body
+        can legally carry text that JSON accepts but UTF-8 cannot encode (a lone
+        surrogate such as "\\ud800"): rendering it raises UnicodeEncodeError
+        INSIDE the error response, and the operator gets a 500 for a validation
+        failure. Sanitizing every string in the payload fixes the class rather
+        than the one field that surfaced it.
+        """
+        return JSONResponse(
+            {"detail": _encodable(jsonable_encoder(exc.errors()))},
+            status_code=422,
+        )
 
     @app.middleware("http")
     async def guard(request, call_next):
@@ -251,10 +269,22 @@ def create_app(
     async def api_unblock(
         name: str,
         number: int,
+        body: contracts.UnblockRequest | None = None,
         user_agent: str = Header(default="", include_in_schema=False),
     ):
         if number < 1:
             raise HTTPException(400, "issue number must be positive")
+        # Tri-state, normalized by the contract (see guidance.parse_guidance):
+        # None = leave any stored note alone, "" = clear it, text = set it.
+        # An over-long, fence-bearing or unencodable note is a 422 raised
+        # BEFORE this body runs, so it can never half-land — no counter reset,
+        # no label edit, no state file.
+        #
+        # API-only lever, deliberately: the SPA and its generated clients are
+        # unchanged, so the field is optional and every existing caller keeps
+        # working. Regenerate them (`npm run generate:api`) when the dashboard
+        # UI grows a textarea for this.
+        guidance = body.guidance if body else None
         # Which hand pulled the lever: the browser UI or a bare API caller
         # (curl, an agent). A courtesy provenance stamp, not authentication —
         # the drill-down badges API-channel unblocks so operator history and
@@ -264,7 +294,9 @@ def create_app(
         # writes, so it has collector failure modes: report them as a refused
         # action, never as a 500 the operator cannot read.
         try:
-            ok, detail = await invoke(backend.unblock, name, number, channel)
+            ok, detail = await invoke(
+                backend.unblock, name, number, channel, guidance
+            )
         except Exception as exc:  # noqa: BLE001
             ok, detail = False, f"unblock unavailable ({type(exc).__name__}: {exc})"
         return JSONResponse({"ok": ok, "detail": detail}, status_code=200 if ok else 400)
@@ -330,6 +362,18 @@ def create_app(
         return Response(content, media_type=media_type)
 
     return app
+
+
+def _encodable(value):
+    """The same structure with every string forced to encodable UTF-8, so a
+    JSONResponse over it cannot raise. Lone surrogates become U+FFFD."""
+    if isinstance(value, str):
+        return value.encode("utf-8", "replace").decode("utf-8")
+    if isinstance(value, dict):
+        return {_encodable(k): _encodable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_encodable(v) for v in value]
+    return value
 
 
 def _safe_asset(dist: str, relative: str) -> str:

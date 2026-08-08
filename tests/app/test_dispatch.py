@@ -53,6 +53,7 @@ class FakeStore:
         self.models = {}
         self.branches = {}
         self.predicted_paths = {}
+        self.operator_guidance = {}
 
     def save_branch(self, issue, branch):
         self.branches[issue] = branch
@@ -93,6 +94,12 @@ class FakeStore:
 
     def get_last_patch_id(self, p):
         return self.last_patch_id.get(p, "")
+
+    def set_operator_guidance(self, p, guidance):
+        self.operator_guidance[p] = guidance
+
+    def get_operator_guidance(self, p):
+        return self.operator_guidance.get(p, "")
 
     def set_round(self, p, n):
         self.rounds[p] = n

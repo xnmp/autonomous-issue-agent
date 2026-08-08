@@ -29,6 +29,7 @@ from ...domain.events import (
 from .. import cli
 from ..review_identity import review_identity
 from . import snapshots
+from .guidance import GuidanceError, parse_guidance
 
 
 def _utcnow() -> datetime:
@@ -413,7 +414,11 @@ class Backend:
         )
 
     def unblock(
-        self, name: str, number: int, channel: str = "api"
+        self,
+        name: str,
+        number: int,
+        channel: str = "api",
+        guidance: str | None = None,
     ) -> tuple[bool, str]:
         """Undo a hold a human is expected to clear: dismiss the reviewer's
         standing change requests, drop the labels that stop re-dispatch, and
@@ -432,9 +437,29 @@ class Backend:
         Refused unless the issue is actually held. Resetting breakers is not a
         neutral act: on a healthy issue it would silently buy retries nobody
         asked for, so "nothing to unblock" must cost nothing.
+
+        `guidance` is the optional scope note the operator attaches to the
+        re-arm. Without it the re-armed loop can only repeat the round that
+        wedged it — the reviewer's prompt has no channel a human can speak
+        through (keifu 2026-08-08: a reviewer demanded evidence the environment
+        cannot produce, rode its rejection ceiling, and every unblock bought
+        the same four rounds again). It is stored per held PR in the review
+        role's state dir and injected into that PR's later review prompts.
+        Tri-state: `None` leaves any stored note alone, `""` clears it, text
+        sets it — a note must be retractable by the operator who wrote it, and
+        blank-as-keep would make it permanent until the PR merged.
+
+        This is an API-only lever for now (the dashboard SPA sends no body), so
+        every existing caller keeps working unchanged.
         """
         if not self.known(name):
             return False, f"unknown deployment '{name}'"
+        try:
+            # Defense in depth: the HTTP boundary already parsed this, but the
+            # service is callable directly and a note reaches an agent prompt.
+            guidance = parse_guidance(guidance)
+        except GuidanceError as exc:
+            return False, str(exc)
         repo = self.overlay_field(name, "REPO")
         if not repo:
             return False, f"no REPO configured for deployment '{name}'"
@@ -476,8 +501,13 @@ class Backend:
             return False, f"pr #{candidate_pr}: {exc}"
         # Counters first: a cleared counter with the labels still on holds the
         # issue exactly as before, while the reverse order would re-admit it
-        # against a breaker that is still tripped.
+        # against a breaker that is still tripped. The guidance lands in the
+        # same window and for the same reason: a PR re-armed before its scope
+        # note is durable would run one more unscoped round.
         cleared = self._clear_retry_counters(name, number)
+        guidance_action, guided_prs, guidance_failures = (
+            self._apply_operator_guidance(name, tuple(pr_held), guidance)
+        )
         # Unjournalled effects: this flow writes its own single event below,
         # because the counter reset happened whatever GitHub then did with the
         # labels — including the no-op path, which emits nothing of its own.
@@ -557,9 +587,18 @@ class Backend:
             pr_requested_added=pr_requested_added,
             pr_applied=pr_applied,
             channel=channel,
+            guidance_action=guidance_action,
+            guided_prs=guided_prs,
         )
-        if applied and rearm_failures:
-            return True, "ok — but " + "; ".join(rearm_failures)
+        # A guidance write that failed leaves the re-arm itself intact, so it
+        # reads like a failed dismissal: the action still happened, and the
+        # operator is told exactly what did not, rather than being handed a
+        # green "ok" over a review that will run unscoped.
+        notes = [*rearm_failures, *guidance_failures]
+        if applied and notes:
+            return True, "ok — but " + "; ".join(notes)
+        if notes:
+            return applied, "; ".join([detail, *notes])
         return applied, detail
 
     def park(
@@ -1087,6 +1126,8 @@ class Backend:
         pr_requested_added: dict[int, tuple[str, ...]] | None = None,
         pr_applied: dict[int, bool] | None = None,
         channel: str = "api",
+        guidance_action: str = "",
+        guided_prs: tuple[int, ...] = (),
     ) -> None:
         journal = self._operator_journal(name, repo)
         if journal is None:
@@ -1124,6 +1165,10 @@ class Backend:
                             "channel": channel,
                             "retries_cleared": cleared,
                             "labels_applied": issue_applied,
+                            # "set"/"cleared", absent when the re-arm left the
+                            # stored note alone — so a repeated unblock is
+                            # tellable from a rescoped one in history.
+                            **({"guidance": guidance_action} if guided_prs else {}),
                         },
                     ),
                     Correlation(issue=number),
@@ -1159,6 +1204,11 @@ class Backend:
                                 "operator": f"{repo}:dashboard",
                                 "channel": channel,
                                 "labels_applied": target_applied,
+                                **(
+                                    {"guidance": guidance_action}
+                                    if pr in guided_prs
+                                    else {}
+                                ),
                             },
                         ),
                         Correlation(issue=number, pr=pr),
@@ -1166,6 +1216,59 @@ class Backend:
                 )
         except Exception:  # noqa: BLE001 - telemetry never fails the action
             pass
+
+    def _apply_operator_guidance(
+        self, name: str, prs: tuple[int, ...], guidance: str | None
+    ) -> tuple[str, tuple[int, ...], list[str]]:
+        """Set or clear the operator's scope note for each held PR, in the
+        review role's state dir (the reviewer is the only reader).
+
+        `guidance` is already normalized: None = no change, "" = clear, text =
+        set (overwriting — the operator's latest word on a PR is the one the
+        next round obeys).
+
+        Returns (action, PRs touched, failures) where action is "set",
+        "cleared" or "" — what HAPPENED, not what was asked for: an issue-only
+        hold has no PR to carry a note, and the state dir may be unresolvable.
+
+        A write can fail (full disk, permissions). It must not raise: the retry
+        counters are already reset by the time this runs, so an escaping
+        exception would leave a half-applied unblock reported to the operator as
+        a generic refusal. Failures ride back in the detail like the re-arm's
+        dismissal failures do.
+        """
+        if guidance is None or not prs:
+            return "", (), []
+        state_dir = next(
+            (
+                os.path.dirname(path)
+                for role, path in zip(dash.ROLE_NAMES, cli.journal_paths(name))
+                if role == "review"
+            ),
+            "",
+        )
+        if not state_dir:
+            return "", (), ["review state dir unresolvable: guidance not stored"]
+        store = Store(state_dir)
+        action = "set" if guidance else "cleared"
+        touched: list[int] = []
+        failures: list[str] = []
+        for pr in prs:
+            try:
+                if guidance:
+                    store.set_operator_guidance(pr, guidance)
+                else:
+                    store.clear_operator_guidance(pr)
+            except Exception as exc:  # noqa: BLE001 - reported, never raised
+                failures.append(
+                    f"pr #{pr}: guidance not {action} "
+                    f"({type(exc).__name__}: {exc})"
+                )
+            else:
+                touched.append(pr)
+        if not touched:
+            return "", (), failures
+        return action, tuple(touched), failures
 
     def _clear_retry_counters(self, name: str, number: int) -> int:
         """Reset the per-attempt ceilings in every role's state dir.
