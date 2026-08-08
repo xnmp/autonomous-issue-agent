@@ -208,6 +208,20 @@ Two smaller ones worth doing whenever the files are next touched:
   instance of a merge-ready PR unverifiable for more than an hour adds the
   counter + journal event per the retry-loop rule (ADR 0012 / CLAUDE.md).
 
+- Platform-invisible CI (2026-08-08) — the local gate runs on Linux, so
+  windows-latest/macos-latest job failures can never be reproduced or fixed
+  by evidence available to a local leg; each one costs either non-converging
+  FIX_CI legs or an operator (tauri PR #581: a BOM/codepage failure only
+  Windows PowerShell 5.1 could exhibit took the batch's single hardest human
+  intervention). Doctor warns at launch; the environment manifest (85c98ff)
+  now tells legs what they cannot reproduce so they reason from CI logs
+  instead of attempting local repro. Accepted residual: true convergence
+  needs paid platform runners or per-repo CI_IGNORE_CHECKS policy — an
+  operator decision per target, not a harness fix. Trigger: a second
+  cross-platform non-convergence incident adds a FIX_CI prompt hint that
+  names the unreproducible platform and caps local attempts at one leg
+  before escalating with the CI log attached.
+
 ## 5. Per-incident notes
 
 `docs/open/issues/` holds three unresolved incident write-ups
