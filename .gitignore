@@ -31,6 +31,7 @@ examples/demo-target/.git/
 
 # Agent runtime state (when testing in-tree)
 .claude/worktrees/
+.worktrees/
 .claude/scheduled_tasks.lock
 .claude/scheduled_tasks.json
 evidence/
