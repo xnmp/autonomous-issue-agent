@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
+import time
 import uuid
 from collections.abc import Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -65,6 +69,79 @@ _FIX_BUDGET_KINDS = (
     "RESOLVE", "RESUME", "PR_RESUME", "ADDRESS_REVIEW", "FIX_CI", "REBASE",
 )
 
+_GH_ENRICHMENT_TTL_S = ghdata.DEFAULT_TTL_S
+_GHContext = tuple[dict[int, dict], dict[int, dict], list[str]]
+
+
+@dataclass
+class _DeferredGhEntry:
+    value: _GHContext | None
+    refreshed_at: float
+    future: Future[_GHContext] | None
+
+
+class _DeferredGhContexts:
+    """Non-blocking stale-while-revalidate store for optional GitHub fields.
+
+    Journal folds are the dashboard's first-paint contract. GitHub titles,
+    links, reviews and check state are enrichment, and a cold ``gh`` process
+    can take tens of seconds. The first read therefore schedules enrichment
+    and returns no optional fields; later polls atomically pick up the result.
+    Once populated, callers keep the last value while its refresh runs so data
+    never flashes back to absent at the TTL boundary.
+    """
+
+    def __init__(
+        self,
+        *,
+        ttl_s: float = _GH_ENRICHMENT_TTL_S,
+        clock=time.monotonic,
+        executor: ThreadPoolExecutor | None = None,
+    ) -> None:
+        self._ttl_s = ttl_s
+        self._clock = clock
+        self._executor = executor or ThreadPoolExecutor(
+            max_workers=4,
+            thread_name_prefix="dashboard-gh",
+        )
+        self._lock = threading.Lock()
+        self._entries: dict[tuple, _DeferredGhEntry] = {}
+
+    def get(self, key: tuple, load) -> tuple[_GHContext, bool]:
+        """Return ``(context, enriched)`` without waiting on ``load``."""
+        now = self._clock()
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                self._entries[key] = _DeferredGhEntry(
+                    value=None,
+                    refreshed_at=0.0,
+                    future=self._executor.submit(load),
+                )
+                return ({}, {}, []), False
+
+            if entry.future is not None and entry.future.done():
+                try:
+                    entry.value = entry.future.result()
+                except Exception as exc:  # noqa: BLE001 - enrichment degrades
+                    entry.value = (
+                        {},
+                        {},
+                        [f"GitHub enrichment unavailable ({_detail(exc)})"],
+                    )
+                entry.refreshed_at = now
+                entry.future = None
+
+            if entry.value is None:
+                return ({}, {}, []), False
+
+            if (
+                entry.future is None
+                and now - entry.refreshed_at >= self._ttl_s
+            ):
+                entry.future = self._executor.submit(load)
+            return entry.value, True
+
 
 def _detail_limits(name: str, repo: str) -> tuple[dict[str, float], int]:
     configured = {
@@ -119,6 +196,8 @@ class Backend:
         stale_after_s: float = dash.STALE_AFTER_S,
         snapshot_ttl_s: float = 3.0,
         detail_config_ttl_s: float = 60.0,
+        gh_enrichment_ttl_s: float = _GH_ENRICHMENT_TTL_S,
+        gh_enrichment_executor: ThreadPoolExecutor | None = None,
         effects_factory=build_operator_effects,
         control_db_path: str = "",
     ):
@@ -133,6 +212,10 @@ class Backend:
         # the daemons themselves tick every 20s.
         self._snapshots = ghdata.TtlCache(ttl_s=snapshot_ttl_s)
         self._detail_configs = ghdata.TtlCache(ttl_s=detail_config_ttl_s)
+        self._gh_enrichment = _DeferredGhContexts(
+            ttl_s=gh_enrichment_ttl_s,
+            executor=gh_enrichment_executor,
+        )
         # Behind the TTL, because the TTL only bounds how often we ask: on
         # expiry the old collector re-read and re-folded all three feeds from
         # byte zero, so a single polling browser tab held a core at 100% and
@@ -249,14 +332,48 @@ class Backend:
 
     # ── gh-augmented ──
     def _gh_context(self, repo: str) -> tuple[dict, dict, list[str]]:
-        issues_payload, issues_error = self.gh.issues(repo)
-        prs_payload, prs_error = self.gh.prs(repo)
+        # These are independent network reads. On the measured cold path they
+        # took 15s and 9s respectively; running them side by side keeps the
+        # eventual enrichment latency at the slower call rather than their sum.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            issues_future = executor.submit(self.gh.issues, repo)
+            prs_future = executor.submit(self.gh.prs, repo)
+            issues_payload, issues_error = issues_future.result()
+            prs_payload, prs_error = prs_future.result()
         warnings = [m for m in (issues_error, prs_error) if m]
         return (
             ghdata.index_by_number(issues_payload),
             ghdata.index_by_number(prs_payload),
             warnings,
         )
+
+    def _gh_issue_context(
+        self,
+        repo: str,
+        prs: tuple[int, ...],
+    ) -> _GHContext:
+        gh_issues, gh_prs, warnings = self._gh_context(repo)
+        if not prs:
+            return gh_issues, gh_prs, warnings
+        with ThreadPoolExecutor(max_workers=min(4, len(prs))) as executor:
+            details = {
+                number: executor.submit(self.gh.pr, repo, number)
+                for number in prs
+            }
+            for number, future in details.items():
+                payload, error = future.result()
+                if isinstance(payload, dict):
+                    gh_prs[number] = {**gh_prs.get(number, {}), **payload}
+                if error:
+                    warnings.append(f"PR #{number} change details: {error}")
+        return gh_issues, gh_prs, warnings
+
+    def _deferred_gh_context(
+        self,
+        key: tuple,
+        load,
+    ) -> tuple[_GHContext, bool]:
+        return self._gh_enrichment.get(key, load)
 
     def _cached_detail_limits(
         self, name: str, repo: str
@@ -334,7 +451,10 @@ class Backend:
     def issues(self, name: str) -> dict:
         snap = self.snapshot(name)
         now = self.now_fn()
-        gh_issues, gh_prs, warnings = self._gh_context(snap.repo)
+        (gh_issues, gh_prs, warnings), enriched = self._deferred_gh_context(
+            ("issues", snap.repo),
+            lambda: self._gh_context(snap.repo),
+        )
         if snap.deployment.schema_version == 2:
             gh_issues = {
                 number: _github_issue_enrichment(issue)
@@ -451,6 +571,9 @@ class Backend:
             "pending": pending,
             "done": [card(row) for row in rows if row.done],
             "backlog": backlog,
+            # A pending background read is not a GitHub failure. Optional
+            # fields are absent until the next poll, while an actual completed
+            # failure still drives the existing degraded-state affordance.
             "gh_ok": not warnings,
             "notifications": snapshots.journal_notifications(rows),
             "warnings": warnings,
@@ -461,13 +584,10 @@ class Backend:
         row = snapshots.find_row(snap, number)
         if row is None:
             return None
-        gh_issues, gh_prs, warnings = self._gh_context(snap.repo)
-        for pr in row.prs:
-            payload, error = self.gh.pr(snap.repo, pr)
-            if isinstance(payload, dict):
-                gh_prs[pr] = {**gh_prs.get(pr, {}), **payload}
-            if error:
-                warnings.append(f"PR #{pr} change details: {error}")
+        (gh_issues, gh_prs, warnings), enriched = self._deferred_gh_context(
+            ("issue", snap.repo, row.issue, row.prs),
+            lambda: self._gh_issue_context(snap.repo, row.prs),
+        )
         if snap.deployment.schema_version == 2:
             gh_issues = {
                 key: _github_issue_enrichment(value)
@@ -480,9 +600,13 @@ class Backend:
         budget_caps, unproductive_cap = self._cached_detail_limits(
             name, snap.repo
         )
-        unproductive_rounds, breaker_warnings = self._review_unproductive_rounds(
-            name, snap, row, gh_prs
-        )
+        if enriched:
+            unproductive_rounds, breaker_warnings = self._review_unproductive_rounds(
+                name, snap, row, gh_prs
+            )
+        else:
+            unproductive_rounds = {pr: None for pr in row.prs}
+            breaker_warnings = []
         warnings.extend(breaker_warnings)
         detail = snapshots.issue_detail(
             row,
