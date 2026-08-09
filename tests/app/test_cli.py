@@ -1297,6 +1297,7 @@ def test_cmd_start_reuses_matching_overlay_no_warning(tmp_path, monkeypatch, cap
     """Anti-vacuity twin: same overlay, but the detected repo/checkout IS
     acme/app at /srv/acme-app — proceeds and reuses, no refusal, no warning."""
     _prep_mismatch_overlay(tmp_path, monkeypatch)
+    _install_state(monkeypatch, present=())
     execve_calls: list = []
     monkeypatch.setattr(cli.os, "execve", lambda *a: execve_calls.append(a))
 
