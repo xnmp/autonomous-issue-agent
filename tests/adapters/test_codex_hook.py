@@ -293,6 +293,41 @@ def test_gov_script_exports_the_deployment_repository(tmp_path):
     assert "export REPO=xnmp/keifu" in text
 
 
+def test_gov_script_bakes_trusted_red_exit_codes_from_daemon_env(
+    tmp_path, monkeypatch
+):
+    """tauri #604 (2026-08-09): the overlay declared '1,101' but the codex
+    child env is allowlist-scrubbed, so the commit-time red verify defaulted
+    to '1' and denied a cargo (101) red commit as INFRA_ERROR — while doctor,
+    validating the daemon env, reported the knob covered. Same class and same
+    remedy as BASE_BRANCH/REPO: bake the daemon's value into the generated
+    hook the agent cannot edit."""
+    monkeypatch.setenv("GATE_TEST_FAILURE_EXIT_CODES", "1,101")
+    config = write_hook_config(
+        str(tmp_path),
+        governor_path="/gov/bash_governor.py",
+        state_dir=str(tmp_path / "state"),
+    )
+    text = (Path(config).parent / "hooks" / "gov.sh").read_text()
+    assert "export GATE_TEST_FAILURE_EXIT_CODES=1,101" in text
+
+
+def test_gov_script_omits_red_exit_codes_when_daemon_env_unset(
+    tmp_path, monkeypatch
+):
+    # Absent knob → no export baked → the hook's own {:-1} default applies,
+    # exactly the pre-overlay behavior. An empty export would instead read
+    # as "trust nothing" and deadlock every red commit.
+    monkeypatch.delenv("GATE_TEST_FAILURE_EXIT_CODES", raising=False)
+    config = write_hook_config(
+        str(tmp_path),
+        governor_path="/gov/bash_governor.py",
+        state_dir=str(tmp_path / "state"),
+    )
+    text = (Path(config).parent / "hooks" / "gov.sh").read_text()
+    assert "GATE_TEST_FAILURE_EXIT_CODES" not in text
+
+
 def test_gov_script_omits_repo_export_when_unset(tmp_path):
     config = write_hook_config(
         str(tmp_path),

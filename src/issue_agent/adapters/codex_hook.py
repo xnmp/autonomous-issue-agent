@@ -74,6 +74,7 @@ def _gov_script(
     review_only: bool = False,
     base_branch: str = "",
     repository: str = "",
+    test_failure_exit_codes: str = "",
 ) -> str:
     gate_base = (
         f"export BASE_BRANCH={shlex.quote(base_branch)}"
@@ -88,6 +89,20 @@ def _gov_script(
     gate_repo = (
         f"export REPO={shlex.quote(repository)}" if repository else ""
     )
+    # Same class as BASE_BRANCH/REPO: the operator's trusted red-test exit
+    # codes are daemon-env authority the scrub rightly withholds from the
+    # agent, so the commit-time red verify defaulted to '1' regardless of the
+    # overlay — a cargo (101) red commit was denied as INFRA_ERROR while
+    # doctor validated the daemon env and reported the knob covered (tauri
+    # #604, 2026-08-09). Baked here, in the harness-generated hook the agent
+    # cannot edit, never via an agent-writable marker: this value DEFINES
+    # what counts as red evidence.
+    gate_red_codes = (
+        "export GATE_TEST_FAILURE_EXIT_CODES="
+        f"{shlex.quote(test_failure_exit_codes)}"
+        if test_failure_exit_codes
+        else ""
+    )
     return f"""#!/usr/bin/env bash
 # Codex PreToolUse hook → harness governor (auto-generated; do not edit).
 if ! command -v uv >/dev/null 2>&1; then
@@ -95,9 +110,10 @@ if ! command -v uv >/dev/null 2>&1; then
   exit 2
 fi
 {('export ISSUE_AGENT_REVIEW_READ_ONLY=1' if review_only else '')}
-# Gate-local operator authority: target commands never inherit BASE_BRANCH.
+# Gate-local operator authority: target commands never inherit these.
 {gate_base}
 {gate_repo}
+{gate_red_codes}
 # Codex PostToolUse executes inside the paid child and cannot mint trusted
 # visual evidence. Remove an ambient/exported path on every governed command.
 unset HARNESS_SCREENSHOTS_READ
@@ -208,8 +224,19 @@ def write_hook_config(
     _link_codex_auth(codex_dir, auth_file)
 
     gov_script_path = os.path.join(hooks_dir, "gov.sh")
+    # Read at write time from the daemon env (the composed snapshot's
+    # authority), mirroring worktree.py's Python-gate read of the same knob —
+    # one source of truth for what counts as trusted red on both stacks.
     with open(gov_script_path, "w") as f:
-        f.write(_gov_script(governor_path, review_only, base_branch, repository))
+        f.write(_gov_script(
+            governor_path,
+            review_only,
+            base_branch,
+            repository,
+            test_failure_exit_codes=os.environ.get(
+                "GATE_TEST_FAILURE_EXIT_CODES", ""
+            ),
+        ))
     os.chmod(
         gov_script_path,
         os.stat(gov_script_path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH,
