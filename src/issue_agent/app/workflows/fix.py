@@ -39,6 +39,7 @@ from ...domain.ports import (
     WorkflowState,
 )
 from ...domain.ci import latest_other_review
+from ...domain.ci_history import make_attempt
 from ...domain.effort import (
     DEFAULT_EFFORT,
     DEFAULT_TIER,
@@ -1075,6 +1076,14 @@ class FixWorkflow:
         mcp_servers = mcp_servers_for_checks(
             self.cfg.fix_mcp_config, [c.name for c in p.checks], self.cfg.harness_root
         )
+        # PRIOR attempts only — the current one is the prompt's own subject, and
+        # a history that always contained it could never be empty. `_try`-wrapped
+        # because history is context, not authority: an unreadable store must
+        # cost the leg its extra section, never its dispatch (`_signals`' rule).
+        prior_attempts = self._try(lambda: self.store.get_ci_history(issue), ()) or ()
+        attempt = make_attempt(
+            p.head_ref_oid, [c.name for c in p.checks if c.bucket == "fail"]
+        )
         task = task_builders.build_fix_ci_task(
             pr,
             as_untrusted(failed),
@@ -1088,6 +1097,7 @@ class FixWorkflow:
             # reviewer's objections. Recurrence and resolve retries still apply.
             self._repair_fix_cfg(issue, "fix-ci"),
             mcp_servers=mcp_servers,
+            ci_history=prior_attempts,
         )
         result = await self._run_logged("fix-ci", issue, task, kind="FIX_CI")
         self.store.save_session(issue, result.session_id)
@@ -1098,7 +1108,18 @@ class FixWorkflow:
         # counting it walks a healthy PR to needs-human-review at $0 per strike
         # (keifu PR #174, 2026-08-02) — fix_ci_actions routes it to the budget
         # surface instead.
-        if outcome.budget_exhausted(result.exit_reason):
+        # The attempt history obeys the SAME rule as the counter above, for the
+        # same reason: a budget-capped tick is a deterministic $0 non-attempt
+        # (#155), and it does not advance the breaker — so `decide_fix`
+        # re-dispatches it every poll. Recording those would let five capped
+        # ticks evict the whole real record and leave five identical
+        # zero-information rows, i.e. the blindness this exists to remove,
+        # disguised as a populated history. An infra death and an agent error
+        # DO get recorded: those legs ran, and their failure is the evidence.
+        capped = outcome.budget_exhausted(result.exit_reason)
+        if not capped:
+            self._try(lambda: self.store.append_ci_attempt(issue, attempt), None)
+        if capped:
             pass
         elif not outcome.infra_class_failure(result):
             self.store.set_ci_retries(issue, self.store.get_ci_retries(issue) + 1)

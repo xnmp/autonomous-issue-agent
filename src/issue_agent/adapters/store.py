@@ -22,6 +22,12 @@ import subprocess
 from dataclasses import dataclass
 
 from ..domain.agent_task import RuntimeName
+from ..domain.ci_history import (
+    CiAttempt,
+    append_attempt,
+    ci_history_payload,
+    parse_ci_history,
+)
 from ..domain.world import normalize_predicted_paths
 
 # ── suffix universe (review M4/D8) ──────────────────────────────────────────
@@ -42,7 +48,8 @@ from ..domain.world import normalize_predicted_paths
 # automerge_enabled always used pr_path), so clear_issue's removal was a no-op
 # and the real pr-N.automerge marker was cleared by NEITHER cleaner.
 _ISSUE_SUFFIXES = (
-    "session", "resumed-at", "resumes", "ci-retries", "resolve-retries",
+    "session", "resumed-at", "resumes", "ci-retries", "ci-history",
+    "resolve-retries",
     "rebase-retries", "infra-deaths", "review-retries", "phase", "jira",
     "jira-phase", "model", "predicted-paths", "branch", "stall-sig",
     "steward-stalls-triage", "steward-stalls-groom",
@@ -59,7 +66,13 @@ _PR_SUFFIXES = (
 # DELIBERATELY kept (fewer retries after a human closed the PR). This is a
 # strict subset of _ISSUE_SUFFIXES, not a third partition member, so it does
 # not participate in the "exactly one cleaner" coverage test above.
-_RESUME_STATE_SUFFIXES = ("session", "phase", "resumed-at")
+#
+# `ci-history` joins them for the same reason the session does: the requeue's
+# next lifecycle opens a NEW PR, and an attempt list describing a dead PR's head
+# SHAs would tell that PR's first repair leg it is on attempt four of a loop it
+# has never been in. Unlike resolve-retries it is context, not budget, so
+# carrying it forward has no deterrent value — only a wrong diagnosis.
+_RESUME_STATE_SUFFIXES = ("session", "phase", "resumed-at", "ci-history")
 
 # Operator unblock (`clear_retries`): the per-attempt ceilings only. Also a
 # strict subset of _ISSUE_SUFFIXES — resolve-retries and infra-deaths are
@@ -263,6 +276,44 @@ class Store:
     def set_ci_retries(self, issue: int, retries: int) -> None:
         self._write(self.issue_path(issue, "ci-retries"), str(retries))
 
+    def reset_ci_episode(self, issue: int) -> None:
+        """Close a red-CI episode (the `ResetCiRetries` action): checks settled
+        GREEN, so the breaker AND the attempt history it annotates both start
+        the next episode from zero.
+
+        The two must move together. A later unrelated red episode (base drift,
+        a new review round's push) inheriting the old attempt list would tell
+        its first repair leg that the check "keeps failing" across attempts that
+        a green run has already resolved — the same lifetime-vs-episode bug
+        `ResetCiRetries` exists to fix, one layer up in the prompt."""
+        self.set_ci_retries(issue, 0)
+        self._remove(self.issue_path(issue, "ci-history"))
+
+    # ── CI attempt history (tauri PR #620) ──────────────────────────────────
+    # The counter above says HOW MANY repair legs ran; this says what each of
+    # them was looking at. Provenance and bounding: see domain/ci_history.py.
+    def get_ci_history(self, issue: int) -> tuple[CiAttempt, ...]:
+        """Recorded FIX_CI attempts, oldest first — () when absent or corrupt."""
+        try:
+            raw = json.loads(self._read(self.issue_path(issue, "ci-history")))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return ()
+        return parse_ci_history(raw)
+
+    def append_ci_attempt(
+        self, issue: int, attempt: CiAttempt
+    ) -> tuple[CiAttempt, ...]:
+        """Record one dispatched attempt, keeping the last CI_HISTORY_LIMIT.
+
+        Returns the persisted history so a caller can report what it wrote
+        rather than re-read it."""
+        history = append_attempt(self.get_ci_history(issue), attempt)
+        self._write(
+            self.issue_path(issue, "ci-history"),
+            json.dumps(ci_history_payload(history)),
+        )
+        return history
+
     def get_resolve_retries(self, issue: int) -> int:
         return self._read_int(self.issue_path(issue, "resolve-retries"))
 
@@ -358,6 +409,12 @@ class Store:
             path = self.issue_path(key, suffix)
             removed += os.path.exists(path)
             self._remove(path)
+        # The CI attempt history annotates the ci-retries counter, so it is
+        # retired with it — an operator handing back the budget is saying the
+        # previous attempts should not steer the next one either. Deliberately
+        # NOT counted in `removed`: that number reports retired ceilings, and
+        # inflating it would misreport how much budget the unblock handed back.
+        self._remove(self.issue_path(key, "ci-history"))
         return removed
 
     # ── pr review head-sha + round ──

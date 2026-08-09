@@ -21,9 +21,10 @@ transcript already holds AGENT.md and re-appending it is billed every round.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
+from ...domain.ci_history import CiAttempt
 from ...domain.environment import EnvironmentManifest
 from ...domain.trust import Untrusted, as_untrusted, untrusted_block
 from ...adapters.runtime_plan import McpServer, SubagentDef
@@ -571,6 +572,58 @@ narrowly. Never suppress code that is the point of the change or that your tests
 prove is testable."""
 
 
+# Shown when this PR has already had at least one FIX_CI leg. Framed as the
+# harness's own record of what it dispatched and what was red — information the
+# leg could not otherwise obtain (each leg sees one tick's checks, and `gh api`
+# is denied by the governor). Deliberately NOT authority-granting, in the tone of
+# `_REPLY_AUTHORITY` above: it names a pattern and what that pattern usually
+# means, and leaves the call with the agent's own instructions. tauri PR #620
+# (2026-08-09) is the incident: three legs at ~$6 each each re-diagnosed the same
+# red check from scratch, missing that the symptom changed every time inside a
+# spec file the PR itself added — a flaky test it wrote, which a human named in
+# one read of the run history and a $0.35 round then fixed.
+_CI_HISTORY_GUIDANCE = (
+    "Read this history before diagnosing. If the SAME check has failed on "
+    "multiple attempts with a DIFFERENT symptom each time, that is the "
+    "signature of a non-deterministic test rather than a stable defect — and "
+    "when the flapping assertions live in test files THIS PR adds or changes, "
+    "the test you wrote is the likely defect, not the program logic under it. "
+    "In that case make the test deterministic (wait for the observable "
+    "condition instead of sleeping a fixed interval; assert a tolerant range "
+    "or invariant instead of an exact count or timing) rather than changing "
+    "program behaviour to satisfy an unstable assertion, and say in the PR "
+    "body which test you de-flaked and why. A check failing the same way every "
+    "time is the opposite signal: that is a real, reproducible defect — fix the "
+    "cause."
+)
+
+
+def _ci_history_section(history: Sequence[CiAttempt]) -> str:
+    """The prior-attempts block, or "" when this is the first repair leg.
+
+    FENCED (P1R-14, the same rule as `failed_checks` three lines below): the
+    attempt numbers and head SHAs are the harness's own, but the check names
+    inside them are repository-authored — a workflow file on the PR's own branch
+    names its jobs, and a fixer leg writes that branch. Fencing the live copy
+    while interpolating the RECORDED copy raw would just move the injection
+    surface to the weaker-guarded field, and this is the persisted one: a forged
+    line would be replayed into every later leg on the issue."""
+    if not history:
+        return ""
+    lines = [
+        f"attempt {n} @ {attempt.short_sha()}: "
+        f"{', '.join(attempt.failed_checks) or 'unrecorded'}"
+        for n, attempt in enumerate(history, start=1)
+    ]
+    return (
+        "The harness's own record of the previous FIX_CI attempts on this PR, "
+        "oldest first — attempt numbers and head SHAs are harness-written, the "
+        "check names are repository-authored strings.\n"
+        + _fenced("previous ci attempts", as_untrusted("\n".join(lines)))
+        + f"\n\n{_CI_HISTORY_GUIDANCE}\n\n"
+    )
+
+
 def build_fix_ci_task(
     pr_number: int,
     failed_checks: Untrusted,
@@ -578,6 +631,7 @@ def build_fix_ci_task(
     cwd: str,
     session_id: str,
     cfg: FixTaskConfig, mcp_servers: tuple[McpServer, ...] = (), fork: bool = False,
+    ci_history: Sequence[CiAttempt] = (),
 ) -> PlannedRun:
     """fix-ci.sh: repair failing CI on an open PR.
 
@@ -601,6 +655,7 @@ def build_fix_ci_task(
         f"`issue-agent-publish gh pr edit {pr_number} --body '<full new body>'`, "
         "which REPLACES it.\n\n"
         f"{_FIX_CI_DIAGNOSE}\n\n"
+        f"{_ci_history_section(ci_history)}"
         f"{_fenced('failed check names', failed_checks)}\n\n"
         f"{_fenced('ci log tail', failed_log)}"
     )

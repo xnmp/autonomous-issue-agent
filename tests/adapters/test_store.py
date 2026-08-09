@@ -8,6 +8,7 @@ import tempfile
 from issue_agent.adapters import store as store_module
 from issue_agent.adapters.store import HarnessMarkers, Store
 from issue_agent.domain.agent_task import RuntimeName
+from issue_agent.domain.ci_history import CiAttempt
 from issue_agent.domain.triage import grooming_candidates, grooming_content
 from issue_agent.domain.world import IssueView, WorldState
 
@@ -53,6 +54,94 @@ def test_ci_retries():
     assert s.get_ci_retries(5) == 0
     s.set_ci_retries(5, 3)
     assert s.get_ci_retries(5) == 3
+
+
+# ── CI attempt history (tauri PR #620) ──────────────────────────────────────
+def test_ci_history_survives_the_process_that_wrote_it():
+    # The whole point is that attempt N sees attempts 1..N-1, which earlier
+    # polls (possibly earlier daemon processes) recorded.
+    _, d = _store()
+    Store(state_dir=d).append_ci_attempt(5, CiAttempt("abc1234", ("unit",)))
+    assert Store(state_dir=d).get_ci_history(5) == (CiAttempt("abc1234", ("unit",)),)
+
+
+def test_ci_history_is_empty_before_any_attempt():
+    s, _ = _store()
+    assert s.get_ci_history(5) == ()
+
+
+def test_ci_history_keeps_only_the_last_five_attempts():
+    s, _ = _store()
+    for n in range(8):
+        s.append_ci_attempt(5, CiAttempt(f"sha{n}", ("unit",)))
+    assert [a.head_sha for a in s.get_ci_history(5)] == [f"sha{n}" for n in range(3, 8)]
+
+
+def test_ci_history_is_per_issue():
+    s, _ = _store()
+    s.append_ci_attempt(5, CiAttempt("aaa", ("unit",)))
+    s.append_ci_attempt(6, CiAttempt("bbb", ("unit",)))
+    assert [a.head_sha for a in s.get_ci_history(5)] == ["aaa"]
+    assert [a.head_sha for a in s.get_ci_history(6)] == ["bbb"]
+
+
+def test_a_corrupt_ci_history_file_reads_as_no_history():
+    # It is repair CONTEXT, not authority: damage costs the next leg its extra
+    # section, and must never raise out of a dispatch.
+    s, _ = _store()
+    for junk in ("not json at all", "{}", "[1, 2]", ""):
+        with open(s.issue_path(5, "ci-history"), "w") as f:
+            f.write(junk)
+        assert s.get_ci_history(5) == ()
+
+
+def test_appending_over_a_corrupt_ci_history_starts_a_fresh_record():
+    s, _ = _store()
+    with open(s.issue_path(5, "ci-history"), "w") as f:
+        f.write("}{ torn")
+    assert s.append_ci_attempt(5, CiAttempt("abc", ("unit",))) == (
+        CiAttempt("abc", ("unit",)),
+    )
+    assert s.get_ci_history(5) == (CiAttempt("abc", ("unit",)),)
+
+
+def test_an_operator_retry_unblock_also_forgets_the_attempt_history():
+    s, _ = _store()
+    s.set_ci_retries(5, 3)
+    s.append_ci_attempt(5, CiAttempt("abc", ("unit",)))
+
+    assert s.clear_retries(5) == 1  # counters retired — history is not one
+
+    assert s.get_ci_history(5) == ()
+
+
+def test_green_ci_closes_the_episode_for_the_counter_and_the_history_together():
+    # ResetCiRetries' episode rule, extended to the history: a later unrelated
+    # red episode must not read attempts a green run already resolved.
+    s, _ = _store()
+    s.set_ci_retries(5, 2)
+    s.append_ci_attempt(5, CiAttempt("abc", ("unit",)))
+
+    s.reset_ci_episode(5)
+
+    assert s.get_ci_retries(5) == 0
+    assert s.get_ci_history(5) == ()
+
+
+def test_a_merged_pr_forgets_its_attempt_history():
+    s, _ = _store()
+    s.append_ci_attempt(9, CiAttempt("abc", ("unit",)))
+    s.cleanup_pr(100, 9, merged=True)
+    assert s.get_ci_history(9) == ()
+
+
+def test_a_requeued_issue_does_not_inherit_the_dead_prs_attempt_history():
+    # A closed-unmerged requeue opens a NEW PR; carrying the old PR's attempts
+    # would tell its first repair leg it is mid-loop on failures it never had.
+    s, _ = _store()
+    s.append_ci_attempt(9, CiAttempt("abc", ("unit",)))
+    s.cleanup_pr(100, 9, merged=False)
+    assert s.get_ci_history(9) == ()
 
 
 def test_malformed_numeric_state_fails_soft_to_defaults():
