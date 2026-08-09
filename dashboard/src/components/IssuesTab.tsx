@@ -34,8 +34,7 @@ import {
   modelTone,
   prReviewMark,
   prStateTone,
-  stateTone,
-  stepKindTone,
+  stepOutcomeTone,
   verificationGlyph,
   verificationSummary,
   verificationTone,
@@ -55,7 +54,8 @@ import { shortModel } from "../lib/models";
 import { readFlag, writeFlag } from "../lib/prefs";
 import { Chip } from "./ui/Chip";
 import { EtaProgress } from "./ui/Charts";
-import { StepBadgeRow } from "./ui/StepBadge";
+import { StepBadge, StepBadgeRow } from "./ui/StepBadge";
+import { TableFilter } from "./ui/TableFilter";
 import { ColumnMenu, type ColumnChoice } from "./ui/ColumnMenu";
 import {
   ResizableTable,
@@ -207,20 +207,50 @@ export function IssuesTab({
   showDurationSeconds = true,
 }: IssuesTabProps) {
   const [visibility, setVisibility] = useState<Visibility>(storedVisibility);
+  const [queries, setQueries] = useState<Record<IssuesSub, string>>({
+    inflight: "",
+    done: "",
+    backlog: "",
+  });
   const [iconBadges, setIconBadges] = useState(() => readFlag(ICON_BADGES_STORAGE, false));
   const [columnMenuAt, setColumnMenuAt] = useState<{ x: number; y: number } | null>(null);
   const data = issues.data;
   const ghOk = data?.gh_ok ?? true;
+  const query = queries[sub];
+  const normalizedQuery = query.trim().toLowerCase();
   const visible = useMemo(
     () => new Set(Object.entries(visibility[sub]).filter(([, shown]) => shown).map(([key]) => key)),
     [sub, visibility],
   );
   // One in-flight payload, split by who owns the next move. The backend already
   // decided that per card; the board only groups by it.
+  const filteredInFlight = useMemo(
+    () => filterCards(data?.in_flight ?? [], normalizedQuery),
+    [data?.in_flight, normalizedQuery],
+  );
+  const filteredPending = useMemo(
+    () => filterCards(data?.pending ?? [], normalizedQuery),
+    [data?.pending, normalizedQuery],
+  );
+  const filteredDone = useMemo(
+    () => filterCards(data?.done ?? [], normalizedQuery),
+    [data?.done, normalizedQuery],
+  );
+  const filteredBacklog = useMemo(
+    () => filterCards(data?.backlog ?? [], normalizedQuery),
+    [data?.backlog, normalizedQuery],
+  );
   const [blocked, running] = useMemo(() => {
-    const cards = data?.in_flight ?? [];
+    const cards = filteredInFlight;
     return [cards.filter(blocksOnHuman), cards.filter((card) => !blocksOnHuman(card))];
-  }, [data?.in_flight]);
+  }, [filteredInFlight]);
+  const sourceCount = sub === "inflight"
+    ? (data?.in_flight.length ?? 0) + (data?.pending.length ?? 0)
+    : sub === "done" ? (data?.done.length ?? 0) : (data?.backlog.length ?? 0);
+  const filteredCount = sub === "inflight"
+    ? filteredInFlight.length + filteredPending.length
+    : sub === "done" ? filteredDone.length : filteredBacklog.length;
+  const hasMatches = !normalizedQuery || filteredCount > 0;
   // Persisted by the handler, never by the state updater: React may invoke an
   // updater more than once for a single click, and a reducer that writes to
   // storage is not a pure function of its input.
@@ -261,8 +291,18 @@ export function IssuesTab({
         <ErrorBanner message={issues.error} onRetry={issues.refresh} stale={!!data} />
       ) : null}
       <WarningList warnings={data?.warnings} />
+      {sourceCount > 10 ? (
+        <TableFilter
+          label={`Filter ${sub === "inflight" ? "active issues" : `${sub} issues`}`}
+          value={query}
+          onChange={(value) => setQueries((current) => ({ ...current, [sub]: value }))}
+          shown={filteredCount}
+          total={sourceCount}
+        />
+      ) : null}
+      {!hasMatches ? <EmptyState>no issues match “{query.trim()}”</EmptyState> : null}
 
-      {sub === "inflight" ? (
+      {sub === "inflight" && hasMatches ? (
         <>
           {/* Blocked leads the board: it is the only section whose rows cannot
               move until a person acts, so it must not be scrolled past. It
@@ -298,7 +338,7 @@ export function IssuesTab({
           <SectionTitle>Pending</SectionTitle>
           <PendingTable
             repo={repo}
-            cards={data?.pending ?? []}
+            cards={filteredPending}
             loading={issues.loading}
             ghOk={ghOk}
             visible={visible}
@@ -307,7 +347,7 @@ export function IssuesTab({
         </>
       ) : null}
 
-      {sub === "done" ? (
+      {sub === "done" && hasMatches ? (
         <>
           <SectionTitle
             right={
@@ -330,7 +370,7 @@ export function IssuesTab({
           </SectionTitle>
           <DoneTable
             repo={repo}
-            cards={data?.done ?? []}
+            cards={filteredDone}
             loading={issues.loading}
             visible={visible}
             iconBadges={iconBadges}
@@ -341,10 +381,10 @@ export function IssuesTab({
         </>
       ) : null}
 
-      {sub === "backlog" ? (
+      {sub === "backlog" && hasMatches ? (
         <BacklogTable
           repo={repo}
-          cards={data?.backlog ?? []}
+          cards={filteredBacklog}
           loading={issues.loading}
           ghOk={ghOk}
           visible={visible}
@@ -355,6 +395,32 @@ export function IssuesTab({
     </div>
     </SnapshotAnchor.Provider>
   );
+}
+
+type FilterableCard = IssueCard | PendingCard | BacklogCard;
+
+/** Search only operator-facing fields, not arbitrary payload internals. */
+function filterCards<T extends FilterableCard>(cards: T[], query: string): T[] {
+  if (!query) return cards;
+  return cards.filter((card) => {
+    const issue = `#${card.issue}`;
+    const common = [issue, card.issue, card.title, ...card.labels];
+    const details = isIssueCard(card)
+      ? [card.stage, card.pr, ...card.models, ...card.flags]
+      : isPendingCard(card)
+        ? [card.priority, card.hold_reason]
+        : [card.issue_type, card.difficulty, card.impact, card.body];
+    return [...common, ...details]
+      .some((value) => String(value ?? "").toLowerCase().includes(query));
+  });
+}
+
+function isIssueCard(card: FilterableCard): card is IssueCard {
+  return typeof (card as IssueCard).done === "boolean";
+}
+
+function isPendingCard(card: FilterableCard): card is PendingCard {
+  return typeof (card as PendingCard).held === "boolean";
 }
 
 function InFlightTable({
@@ -1225,7 +1291,7 @@ function TaskStoryTable({
           <tbody>
           {steps.map((step, index) => {
             const ts = stepTimestamp(step);
-            const tone = stateTone(step.state);
+            const tone = stepOutcomeTone(step.kind, step.state, step.status);
             const note = stepNote(step);
             const took = stepDuration(step);
             const rawIndex = (step as { idx?: unknown }).idx;
@@ -1234,14 +1300,7 @@ function TaskStoryTable({
               <tr key={key}>
                 <td className={`task-story-context tone-border-${tone}`}>
                   <div className="task-story-event">
-                    <Chip
-                      tone={stepKindTone(step.kind, step.state)}
-                      square
-                      pulse={step.state === "running"}
-                      title={step.kind}
-                    >
-                      {taskName(step)}
-                    </Chip>
+                    <StepBadge step={step} label={taskName(step)} title={step.kind} />
                     {step.state === "ok" || step.state === "done" ? null : (
                       <span className={`task-state tone-${tone}`}>{step.state}</span>
                     )}
@@ -1269,20 +1328,13 @@ function TaskStoryTable({
 
 /** One task, one line. `note` is the payload; everything else is context. */
 function TaskStoryLine({ step }: { step: CardStep | IssueStep }) {
-  const tone = stateTone(step.state);
+  const tone = stepOutcomeTone(step.kind, step.state, step.status);
   const note = stepNote(step);
   const cost = step.cost_usd ?? 0;
   const took = stepDuration(step);
   return (
     <li className={`task-story-line tone-border-${tone}`}>
-      <Chip
-        tone={stepKindTone(step.kind, step.state)}
-        square
-        pulse={step.state === "running"}
-        title={step.kind}
-      >
-        {taskName(step)}
-      </Chip>
+      <StepBadge step={step} label={taskName(step)} title={step.kind} />
       {/* Success is already the chip's tone; the word "done" beside every
           finished task was pure noise (and in the Done tab, doubly so). */}
       {step.state === "ok" || step.state === "done" ? null : (
@@ -1545,7 +1597,16 @@ function VerificationStatus({
     >
       {iconOnly ? (
         <span role="img" aria-label={status}>{verificationGlyph(status)}</span>
-      ) : status}
+      ) : (
+        <>
+          <span
+            className="status-mark"
+            data-status-glyph={verificationGlyph(status)}
+            aria-hidden="true"
+          />
+          {status}
+        </>
+      )}
     </Chip>
   );
 }

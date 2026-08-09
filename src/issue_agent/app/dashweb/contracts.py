@@ -322,6 +322,30 @@ class TokenUsage(Contract):
     cache_creation_input_tokens: int | None
 
 
+class IssueStepEscalation(Contract):
+    notches: int
+    from_effort: str | None = None
+    to_effort: str | None = None
+    after_review_round: int | None = None
+
+
+class IssueStepReview(Contract):
+    # Agent-authored and therefore untrusted. The server bounds it before it
+    # reaches a client; clients must render it as text, never as Markdown/HTML.
+    verdict_excerpt: str | None = None
+    rejection: int | None = None
+    unproductive_rounds: int | None = None
+    unproductive_cap: int | None = None
+
+
+class IssueStepChange(Contract):
+    pr: int
+    branch: str | None = None
+    head_sha: str | None = None
+    commit_subjects: list[str] = Field(default_factory=list)
+    files_changed_count: int | None = None
+
+
 class IssueStep(Contract):
     idx: int
     kind: str
@@ -335,11 +359,17 @@ class IssueStep(Contract):
     estimated: bool
     model: str | None
     effort: str | None = None
+    runtime: str | None = None
     session_id: str | None
     turns: int | None
     usage: TokenUsage | None
     has_transcript: bool
     note: str | None = None
+    pricing_basis: str | None = None
+    budget_cap_usd: float | None = None
+    escalation: IssueStepEscalation | None = None
+    review: IssueStepReview | None = None
+    change: IssueStepChange | None = None
 
 
 class PullRequestLink(Contract):

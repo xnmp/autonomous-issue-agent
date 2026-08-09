@@ -1,6 +1,6 @@
 import { Fragment } from "react";
-import type { CardStep } from "../../api/types";
-import { kindLabel, stepKindTone, isOperatorStep } from "../../lib/semantics";
+import type { CardStep, IssueStep } from "../../api/types";
+import { isOperatorStep, kindLabel, stepOutcomeMark } from "../../lib/semantics";
 import { usd } from "../../lib/format";
 import { Chip } from "./Chip";
 import { tipProps } from "./Tip";
@@ -10,15 +10,16 @@ import { tipProps } from "./Tip";
  * read as "converged" — the verdict outranks the exit for the badge's colour.
  * Yellow = the loop is still going; green stays for approvals and clean legs.
  */
-function episodeTone(step: CardStep) {
-  if (step.state === "ok" && step.status?.toUpperCase().includes("REQUEST_CHANGES")) {
-    return "running";
-  }
-  return stepKindTone(step.kind, step.state);
+type BadgeStep = Pick<CardStep, "kind" | "state" | "status" | "cost_usd"> & {
+  count?: number | null;
+};
+
+function episodeCount(step: BadgeStep | IssueStep): number {
+  return typeof step.count === "number" ? step.count : 1;
 }
 
-function episodeTitle(step: CardStep): string {
-  const count = step.count ?? 1;
+function episodeTitle(step: BadgeStep): string {
+  const count = episodeCount(step);
   return [
     step.kind,
     count > 1 ? `${count} attempts` : null,
@@ -34,13 +35,36 @@ function episodeTitle(step: CardStep): string {
  * A leg badge uses the explicit operation name: operators should not need to
  * decode RES/RTE/ADR while diagnosing an incident.
  */
-export function StepBadge({ step }: { step: CardStep }) {
-  const tone = episodeTone(step);
-  const count = step.count ?? 1;
+export function StepBadge({
+  step,
+  label,
+  title,
+}: {
+  step: BadgeStep | IssueStep;
+  label?: string;
+  title?: string;
+}) {
+  const mark = stepOutcomeMark(step.kind, step.state, step.status);
+  const count = episodeCount(step);
   return (
-    <Chip tone={tone} square pulse={step.state === "running"} title={episodeTitle(step)}>
-      {kindLabel(step.kind)}
+    <Chip tone={mark.tone} square pulse={step.state === "running"} title={title ?? episodeTitle(step)}>
+      <span className="status-mark" data-status-glyph={mark.glyph} aria-hidden="true" />
+      <span className="step-label">{label ?? kindLabel(step.kind)}</span>
       {count > 1 ? <span className="step-count">×{count}</span> : null}
+    </Chip>
+  );
+}
+
+/** A verdict chip uses the same mark and tone as the leg chip beside it. */
+export function StepStatusChip({ step }: { step: BadgeStep | IssueStep }) {
+  const mark = stepOutcomeMark(step.kind, step.state, step.status);
+  const label = step.status === "ok" || (!step.status && step.state === "ok")
+    ? "done"
+    : (step.status ?? step.state);
+  return (
+    <Chip tone={mark.tone} title={mark.label}>
+      <span className="status-mark" data-status-glyph={mark.glyph} aria-hidden="true" />
+      {label}
     </Chip>
   );
 }
@@ -56,7 +80,7 @@ const TAIL_CHIPS = 3;
 const MAX_DOTS = 14;
 
 function HistoryDot({ step }: { step: CardStep }) {
-  const tone = episodeTone(step);
+  const tone = stepOutcomeMark(step.kind, step.state, step.status).tone;
   const operator = isOperatorStep(step.kind);
   return (
     <span

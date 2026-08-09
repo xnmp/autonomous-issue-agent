@@ -24,16 +24,16 @@
 }
 
 .tone-border-ok {
-  border-left: 2px solid var(--ok);
+  border-left: 1px solid var(--ok);
 }
 .tone-border-running {
-  border-left: 2px solid var(--running);
+  border-left: 1px solid var(--running);
 }
 .tone-border-fail {
-  border-left: 2px solid var(--fail);
+  border-left: 1px solid var(--fail);
 }
 .tone-border-neutral {
-  border-left: 2px solid var(--border-strong);
+  border-left: 1px solid var(--border-strong);
 }
 
 .dot {
@@ -636,6 +636,64 @@
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: var(--s2);
+}
+.attention-panel,
+.operator-actions-panel {
+  border-color: var(--border-strong);
+}
+.attention-panel-active {
+  border-color: color-mix(in srgb, var(--fail) 52%, var(--border));
+  background: color-mix(in srgb, var(--fail) 4%, var(--panel));
+}
+.attention-panel-active .panel-title {
+  color: var(--fail-br);
+}
+.attention-panel-clear .panel-bd {
+  padding-block: var(--s2);
+}
+.attention-panel-clear .empty {
+  padding-block: var(--s2);
+  text-align: left;
+}
+.attention-row {
+  min-height: 30px;
+  padding-block: var(--s1);
+}
+.attention-row + .attention-row {
+  border-top: 1px solid var(--border);
+}
+.operator-actions-panel {
+  background: var(--elevated);
+}
+.operator-actions-active {
+  border-color: color-mix(in srgb, var(--running) 42%, var(--border));
+}
+.operator-actions-panel .panel-hd {
+  min-height: 42px;
+}
+.operator-actions-table {
+  max-height: 320px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.panel-table-tools {
+  padding: var(--s2) var(--s3) 0;
+}
+.panel-table-tools .table-filter {
+  margin-bottom: var(--s2);
+}
+.overview-metrics {
+  grid-template-columns: repeat(auto-fit, minmax(138px, 1fr));
+}
+.overview-metrics .tile {
+  border-color: color-mix(in srgb, var(--border) 72%, transparent);
+  background: color-mix(in srgb, var(--panel) 76%, transparent);
+}
+.overview-metrics .tile-value {
+  font-size: 22px;
+}
+.overview-support .panel {
+  border-color: color-mix(in srgb, var(--border) 78%, transparent);
 }
 .tile {
   padding: var(--s3);
@@ -1298,6 +1356,44 @@
   flex-direction: column;
   gap: var(--s2);
 }
+.step-summary-facts {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--s2) var(--s4);
+  margin: 0;
+  padding: 0 0 var(--s3);
+  border-bottom: 1px solid var(--border);
+}
+.step-summary-fact {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--s1);
+  min-width: 0;
+}
+.step-summary-fact dt {
+  color: var(--ink-faint);
+  font-size: var(--fs-xs);
+}
+.step-summary-fact dd {
+  min-width: 0;
+  margin: 0;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+.step-context-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s1);
+  margin: 0;
+  color: var(--ink-muted);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+}
+.step-context-separator {
+  margin-right: var(--s1);
+  color: var(--ink-faint);
+}
 .step-summary-note {
   margin: 0;
 }
@@ -1322,6 +1418,57 @@
   flex: none;
   font-size: var(--fs-xs);
 }
+.step-review-quote {
+  max-width: 75ch;
+  margin: var(--s1) 0 0;
+  padding: var(--s3) var(--s4);
+  border: 1px solid color-mix(in srgb, var(--running) 52%, var(--border));
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--running) 7%, var(--panel));
+}
+.step-review-quote-label {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  margin-bottom: var(--s2);
+  color: var(--running-br);
+  font-size: var(--fs-xs);
+  font-weight: 650;
+}
+.step-review-quote p {
+  margin: 0;
+  color: var(--ink);
+  line-height: 1.55;
+  white-space: pre-wrap;
+}
+.step-change-summary {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+  padding: var(--s2) 0;
+}
+.step-change-facts {
+  margin: 0;
+  color: var(--ink-muted);
+  font-size: var(--fs-xs);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.step-commit-progression {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.step-commit-progression li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: baseline;
+  gap: var(--s2);
+  max-width: 75ch;
+}
 .task-cost,
 .task-took {
   font-size: var(--fs-xs);
@@ -1329,7 +1476,7 @@
 }
 .task-escalation {
   padding: var(--s2);
-  border-left: 3px solid var(--fail);
+  border-left: 1px solid var(--fail);
   border-radius: var(--radius-sm);
   background: color-mix(in srgb, var(--fail) 9%, transparent);
   color: var(--ink);
@@ -1403,7 +1550,7 @@
    made every alarmed row a wall of red. */
 .row-alert {
   --row-attn: var(--fail);
-  box-shadow: inset 2px 0 0 var(--row-attn);
+  box-shadow: inset 1px 0 0 var(--row-attn);
 }
 .row-alert-ready {
   --row-attn: var(--ok);
@@ -1594,8 +1741,57 @@
   flex-direction: column;
   gap: var(--s2);
   padding: var(--s3);
-  border-left: 2px solid var(--info);
+  border-left: 1px solid var(--info);
   background: var(--bg);
+}
+
+/* One outcome mark everywhere a leg or verdict appears. The adjacent word is
+   always present, so the glyph and colour remain redundant scan aids. */
+.status-mark::before {
+  content: attr(data-status-glyph);
+  display: inline-block;
+  width: 1ch;
+  color: currentColor;
+  font-family: var(--font-mono);
+  font-weight: 750;
+  text-align: center;
+}
+
+.table-filter {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  width: min(440px, 100%);
+  margin: 0 0 var(--s2) auto;
+  color: var(--ink-muted);
+  font-size: var(--fs-xs);
+}
+.table-filter-label {
+  font-weight: 600;
+}
+.table-filter input {
+  min-width: 0;
+  flex: 1;
+  padding: var(--s1) var(--s2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  outline: none;
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit;
+}
+.table-filter input::placeholder {
+  color: var(--ink-faint);
+}
+.table-filter input:focus-visible {
+  border-color: var(--info-br);
+  box-shadow: 0 0 0 1px var(--info-br);
+}
+.table-filter-count {
+  min-width: 5ch;
+  color: var(--ink-faint);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 .stepdetail-tabs {
   align-self: flex-start;

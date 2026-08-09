@@ -55,6 +55,7 @@ export function familyOf(kind: string): LegFamily {
 export function stateTone(state: StepState | null | undefined): Tone {
   switch (state) {
     case "ok":
+    case "done":
       return "ok";
     case "failed":
     case "blocked":
@@ -101,6 +102,50 @@ export function stepKindTone(
   return isOperatorStep(kind) ? "meta" : stateTone(state);
 }
 
+/**
+ * A leg has two outcomes: process state and, for reviews, a verdict. The
+ * verdict wins only when the process itself did not fail or remain active.
+ * Keeping that precedence here prevents a successful review invocation that
+ * requested changes from appearing green in one view and yellow in another.
+ */
+export function stepOutcomeTone(
+  kind: string,
+  state: StepState | null | undefined,
+  status: string | null | undefined,
+): Tone {
+  const processTone = stateTone(state);
+  if (processTone === "fail" || processTone === "running") return processTone;
+  if (isApiOperatorStep(kind)) return "running";
+  if (isOperatorStep(kind)) return "meta";
+  const verdictTone = statusTone(status);
+  return verdictTone === "neutral" ? processTone : verdictTone;
+}
+
+export interface StatusMark {
+  glyph: string;
+  label: string;
+  tone: Tone;
+}
+
+/** The shared icon + colour vocabulary for task outcomes and verdicts. */
+export function stepOutcomeMark(
+  kind: string,
+  state: StepState | null | undefined,
+  status: string | null | undefined,
+): StatusMark {
+  const tone = stepOutcomeTone(kind, state, status);
+  const verdict = status?.trim().toUpperCase();
+  if (tone === "fail") return { glyph: "×", label: "failed", tone };
+  if (verdict === "REQUEST_CHANGES" || verdict === "CHANGES_REQUESTED") {
+    return { glyph: "±", label: "changes requested", tone };
+  }
+  if (state === "running") return { glyph: "…", label: "running", tone };
+  if (state === "advisory") return { glyph: "±", label: "advisory", tone };
+  if (isOperatorStep(kind)) return { glyph: "◆", label: "operator action", tone };
+  if (tone === "ok") return { glyph: "✓", label: "completed", tone };
+  return { glyph: "•", label: "informational", tone };
+}
+
 /** `stage_for` is a heuristic string; classify it rather than enumerate it. */
 export function stageTone(stage: string | null | undefined): Tone {
   if (!stage) return "neutral";
@@ -119,6 +164,14 @@ export function statusTone(status: string | null | undefined): Tone {
   if (s === "REQUEST_CHANGES" || s === "CHANGES_REQUESTED") return "running";
   if (/(FAIL|ERROR|BLOCK|ABORT|TIMEOUT|KILLED)/.test(s)) return "fail";
   return "info";
+}
+
+/** Test-driven commit subjects use the harness's red/green vocabulary. */
+export function commitSubjectTone(subject: string): Tone {
+  const prefix = subject.trim().split(":", 1)[0]?.toLowerCase();
+  if (prefix === "red") return "fail";
+  if (prefix === "green") return "ok";
+  return "neutral";
 }
 
 /** Every flag is a problem; severity splits red from orange-ish yellow. */
@@ -178,7 +231,7 @@ export function prReviewMark(state: string | null | undefined): ReviewMark | nul
 
 const VERIFICATION_GLYPH: Record<string, string> = {
   verified: "✓",
-  misbehaved: "✕",
+  misbehaved: "×",
   pending: "…",
   retired: "⊘",
 };

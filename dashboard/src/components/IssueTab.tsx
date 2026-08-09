@@ -4,13 +4,11 @@ import { usePolled } from "../api/hooks";
 import { liveClocks, offsetSince, useNow } from "../lib/clock";
 import type { IssueStep } from "../api/types";
 import {
-  kindLabel,
+  commitSubjectTone,
   modelTone,
   prStateTone,
-  stateTone,
   stageTone,
-  statusTone,
-  stepKindTone,
+  stepOutcomeTone,
 } from "../lib/semantics";
 import { clockTime, duration, localTime, num, tokens, usd } from "../lib/format";
 import { shortModel } from "../lib/models";
@@ -20,6 +18,8 @@ import { EmptyState, ErrorBanner, Loading, SkeletonRows, WarningList } from "./u
 import { EventTimeline } from "./EventTimeline";
 import { UnblockModal } from "./UnblockModal";
 import { ColumnMenu, type ColumnChoice } from "./ui/ColumnMenu";
+import { StepBadge, StepStatusChip } from "./ui/StepBadge";
+import { TableFilter } from "./ui/TableFilter";
 import {
   ResizableTable,
   useSortedRows,
@@ -40,7 +40,7 @@ const ISSUE_COLUMNS: ColumnChoice[] = [
 
 function storedIssueColumns(): Record<string, boolean> {
   const defaults = Object.fromEntries(
-    ISSUE_COLUMNS.map(({ key }) => [key, key !== "role" && key !== "model"]),
+    ISSUE_COLUMNS.map(({ key }) => [key, key !== "role"]),
   );
   try {
     return {
@@ -74,6 +74,7 @@ export function IssueTab({
   const [unblocking, setUnblocking] = useState(false);
   const [unblockError, setUnblockError] = useState<string | null>(null);
   const [pane, setPane] = useState<"tasks" | "events">("tasks");
+  const [taskQuery, setTaskQuery] = useState("");
   const [columnVisibility, setColumnVisibility] = useState(storedIssueColumns);
   const [columnMenuAt, setColumnMenuAt] = useState<{ x: number; y: number } | null>(null);
   const visible = useMemo(
@@ -81,7 +82,7 @@ export function IssueTab({
     [columnVisibility],
   );
   const columns: TableColumn[] = [
-    { key: "operation", label: "Operation", width: 130 },
+    { key: "operation", label: "Operation", width: 158, minWidth: 142 },
     ...(visible.has("role") ? [{ key: "role", label: "Role", width: 90 }] : []),
     ...(visible.has("model") ? [{ key: "model", label: "Model", width: 160, minWidth: 100 }] : []),
     ...(visible.has("status") ? [{ key: "status", label: "Status", width: 190, minWidth: 96 }] : []),
@@ -117,7 +118,22 @@ export function IssueTab({
     d ?? {},
     offsetSince(detail.updatedAt, useNow()),
   );
-  const sortedSteps = useSortedRows(d?.steps ?? [], {
+  const filteredSteps = useMemo(() => {
+    const query = taskQuery.trim().toLowerCase();
+    if (!query) return d?.steps ?? [];
+    return (d?.steps ?? []).filter((step) => [
+      step.idx,
+      step.kind,
+      step.role,
+      step.model,
+      step.effort,
+      step.status,
+      step.state,
+      step.note,
+      step.session_id,
+    ].some((value) => String(value ?? "").toLowerCase().includes(query)));
+  }, [d?.steps, taskQuery]);
+  const sortedSteps = useSortedRows(filteredSteps, {
     operation: (step) => step.kind,
     role: (step) => step.role,
     model: (step) => step.model,
@@ -284,35 +300,45 @@ export function IssueTab({
             </div>
           ) : null}
           {pane === "tasks" && d.steps.length > 0 ? (
-            <div
-              className="panel steps"
-              id={`issue-${issue}-tasks-panel`}
-              role="tabpanel"
-              aria-labelledby={`issue-${issue}-tasks-tab`}
-            >
-              <div className="tbl-wrap">
-                <ResizableTable
-                  storageKey="issue-tasks"
-                  columns={columns}
-                  sort={sortedSteps.sort}
-                  onSort={sortedSteps.onSort}
-                >
-                  <tbody>
-                    {sortedSteps.rows.map((s) => (
-                      <StepRow
-                        key={s.idx}
-                        repo={repo}
-                        issue={issue}
-                        step={s}
-                        open={openStep === s.idx}
-                        onToggle={() => setOpenStep((cur) => (cur === s.idx ? null : s.idx))}
-                        visible={visible}
-                        colSpan={columns.length}
-                        showDurationSeconds={showDurationSeconds}
-                      />
-                    ))}
-                  </tbody>
-                </ResizableTable>
+            <div id={`issue-${issue}-tasks-panel`} role="tabpanel" aria-labelledby={`issue-${issue}-tasks-tab`}>
+              {d.steps.length > 10 ? (
+                <TableFilter
+                  label="Filter tasks"
+                  value={taskQuery}
+                  onChange={setTaskQuery}
+                  shown={filteredSteps.length}
+                  total={d.steps.length}
+                />
+              ) : null}
+              <div className="panel steps">
+                {filteredSteps.length === 0 ? (
+                  <EmptyState>no tasks match “{taskQuery.trim()}”</EmptyState>
+                ) : (
+                  <div className="tbl-wrap">
+                    <ResizableTable
+                      storageKey="issue-tasks"
+                      columns={columns}
+                      sort={sortedSteps.sort}
+                      onSort={sortedSteps.onSort}
+                    >
+                      <tbody>
+                        {sortedSteps.rows.map((s) => (
+                          <StepRow
+                            key={s.idx}
+                            repo={repo}
+                            issue={issue}
+                            step={s}
+                            open={openStep === s.idx}
+                            onToggle={() => setOpenStep((cur) => (cur === s.idx ? null : s.idx))}
+                            visible={visible}
+                            colSpan={columns.length}
+                            showDurationSeconds={showDurationSeconds}
+                          />
+                        ))}
+                      </tbody>
+                    </ResizableTable>
+                  </div>
+                )}
               </div>
             </div>
           ) : null}
@@ -362,7 +388,7 @@ function StepRow({
   colSpan: number;
   showDurationSeconds: boolean;
 }) {
-  const tone = stateTone(step.state);
+  const tone = stepOutcomeTone(step.kind, step.state, step.status);
   const u = step.usage;
   const detailId = `task-detail-${issue}-${step.idx}`;
   return (
@@ -386,14 +412,7 @@ function StepRow({
             <span className={`chev${open ? " open" : ""}`} aria-hidden="true">
               ▸
             </span>
-            <Chip
-              tone={stepKindTone(step.kind, step.state)}
-              square
-              pulse={step.state === "running"}
-              title={step.kind}
-            >
-              {kindLabel(step.kind)}
-            </Chip>
+            <StepBadge step={step} />
           </button>
         </td>
         {visible.has("role") ? <td>
@@ -415,11 +434,7 @@ function StepRow({
           )}
         </td> : null}
         {visible.has("status") ? <td className="row-wrap">
-          <Chip tone={step.state === "running" ? "running" : statusTone(step.status)}>
-            {step.status === "ok" || (!step.status && step.state === "ok")
-              ? "done"
-              : (step.status ?? step.state)}
-          </Chip>
+          <StepStatusChip step={step} />
           {step.exit_reason && step.exit_reason.toLowerCase() !== "ok" ? (
             <span className="faint mono trunc" title={step.exit_reason}>
               {step.exit_reason}
@@ -524,12 +539,24 @@ function StepDetail({
           aria-labelledby={`${id}-summary-tab`}
           className="step-summary"
         >
+          <StepSummaryHeader step={step} />
+          <StepContextLine step={step} />
           {step.note ? <p className="task-note step-summary-note">{step.note}</p> : null}
           {step.exit_reason && step.exit_reason.toLowerCase() !== "ok" ? (
             <p className="step-summary-exit">
               ended: <span className="mono">{step.exit_reason}</span>
             </p>
           ) : null}
+          {step.review?.verdict_excerpt ? (
+            <blockquote className="step-review-quote">
+              <div className="step-review-quote-label">
+                <span>Reviewer output</span>
+                <Chip tone="running">untrusted</Chip>
+              </div>
+              <p>{step.review.verdict_excerpt}</p>
+            </blockquote>
+          ) : null}
+          {step.change ? <StepChangeSummary change={step.change} /> : null}
           {events.error ? (
             <ErrorBanner message={events.error} onRetry={events.refresh} />
           ) : null}
@@ -538,7 +565,12 @@ function StepDetail({
           ) : (
             (() => {
               const lines = narrateWindow(events.data?.events ?? []);
-              if (lines.length === 0 && !step.note) {
+              if (
+                lines.length === 0
+                && !step.note
+                && !step.review?.verdict_excerpt
+                && !step.change
+              ) {
                 return (
                   <EmptyState>
                     this task changed nothing visible — see Events for the bookkeeping
@@ -618,6 +650,128 @@ function StepDetail({
         </div>
       ) : null}
     </div>
+  );
+}
+
+function StepSummaryHeader({ step }: { step: IssueStep }) {
+  const escalation = step.escalation;
+  const escalationPath = escalation?.from_effort && escalation.to_effort
+    ? `${escalation.from_effort}→${escalation.to_effort}`
+    : escalation?.to_effort
+      ? `→${escalation.to_effort}`
+      : "tier";
+  const escalationValue = escalation
+    ? `+${escalation.notches} ${escalationPath}${
+      escalation.after_review_round ? ` after r${escalation.after_review_round}` : ""
+    }`
+    : null;
+  const facts = [
+    { label: "model", value: step.model, mono: true },
+    { label: "effort", value: step.effort, mono: false },
+    { label: "runtime", value: step.runtime, mono: false },
+    { label: "escalation", value: escalationValue, mono: false },
+    { label: "session id", value: step.session_id, mono: true },
+    step.exit_reason && step.exit_reason.toLowerCase() !== "ok"
+      ? { label: "exit", value: step.exit_reason, mono: true }
+      : null,
+  ].filter((fact): fact is { label: string; value: string; mono: boolean } => (
+    fact !== null && typeof fact.value === "string" && fact.value.trim() !== ""
+  ));
+
+  return facts.length > 0 ? (
+    <dl className="step-summary-facts" role="group" aria-label="Task execution details">
+      {facts.map((fact) => (
+        <div className="step-summary-fact" key={fact.label}>
+          <dt>{fact.label}</dt>
+          <dd className={fact.mono ? "mono" : undefined}>{fact.value}</dd>
+        </div>
+      ))}
+    </dl>
+  ) : null;
+}
+
+function capFraction(value: number, cap: number | null | undefined): string {
+  if (cap === 0) return `${value} / off`;
+  return cap === null || cap === undefined ? String(value) : `${value}/${cap}`;
+}
+
+function StepContextLine({ step }: { step: IssueStep }) {
+  const segments: string[] = [];
+  if (step.review?.rejection !== null && step.review?.rejection !== undefined) {
+    segments.push(`change-request verdicts observed ${step.review.rejection}`);
+  }
+  if (
+    step.review?.unproductive_rounds !== null
+    && step.review?.unproductive_rounds !== undefined
+  ) {
+    segments.push(
+      `unproductive rounds ${capFraction(
+        step.review.unproductive_rounds,
+        step.review.unproductive_cap,
+      )}`,
+    );
+  }
+  if (step.cost_usd !== null && step.cost_usd !== undefined) {
+    segments.push(
+      step.budget_cap_usd === 0
+        ? `leg ${usd(step.cost_usd)} · cap off`
+        : step.budget_cap_usd !== null && step.budget_cap_usd !== undefined
+          ? `leg ${usd(step.cost_usd)} / ${usd(step.budget_cap_usd)} cap`
+          : `leg ${usd(step.cost_usd)}`,
+    );
+  }
+  if (step.pricing_basis) {
+    segments.push(
+      `${step.pricing_basis.replaceAll("_", " ")}${step.estimated ? " · estimated" : ""}`,
+    );
+  } else if (step.estimated) {
+    segments.push("estimated pricing");
+  }
+  return segments.length > 0 ? (
+    <p className="step-context-line mono">
+      {segments.map((segment, index) => (
+        <span key={segment}>
+          {index > 0 ? (
+            <span className="step-context-separator" aria-hidden="true">·</span>
+          ) : null}
+          {segment}
+        </span>
+      ))}
+    </p>
+  ) : null;
+}
+
+function StepChangeSummary({
+  change,
+}: {
+  change: NonNullable<IssueStep["change"]>;
+}) {
+  const subjects = change.commit_subjects ?? [];
+  const changeFacts = [
+    change.branch ? `pushed ${change.branch}` : `PR #${change.pr}`,
+    change.files_changed_count !== null && change.files_changed_count !== undefined
+      ? `${num(change.files_changed_count)} file${change.files_changed_count === 1 ? "" : "s"} changed`
+      : null,
+  ].filter((value): value is string => value !== null);
+  return (
+    <section className="step-change-summary" aria-label="Pushed change summary">
+      <p className="step-change-facts mono">{changeFacts.join(" · ")}</p>
+      {subjects.length > 0 ? (
+        <ol className="step-commit-progression">
+          {subjects.map((subject, index) => {
+            const match = /^(red|green):\s*/i.exec(subject);
+            return (
+              <li key={`${subject}-${index}`}>
+                <Chip tone={commitSubjectTone(subject)} square>
+                  {match?.[1]?.toLowerCase() ?? "commit"}
+                </Chip>
+                <span>{match ? subject.slice(match[0].length) : subject}</span>
+              </li>
+            );
+          })}
+        </ol>
+      ) : null}
+    </section>
   );
 }
 

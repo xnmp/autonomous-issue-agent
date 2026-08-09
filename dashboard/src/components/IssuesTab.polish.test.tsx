@@ -120,6 +120,8 @@ describe("done verification badge", () => {
       "data-tip",
       "verified\nIssue: VERIFIED\nPR: VERIFIED",
     );
+    expect(screen.getByText("verified").querySelector(".status-mark"))
+      .toHaveAttribute("data-status-glyph", "✓");
   });
 
   it("collapses to a glyph on request and keeps the verdict readable and remembered", async () => {
@@ -216,6 +218,27 @@ describe("done labels column", () => {
       .getAllByRole("columnheader")
       .findIndex((header) => header.textContent?.includes("Labels"));
     expect(screen.getAllByRole("cell")[column]).toHaveTextContent("—");
+  });
+});
+
+describe("long-table filtering", () => {
+  it("filters a long done table by issue-facing text and reports the result count", async () => {
+    const cards = Array.from({ length: 12 }, (_, index) => ({
+      ...done,
+      issue: 100 + index,
+      title: index === 7 ? "Needle migration" : `Routine change ${index}`,
+    }));
+    board("done", { done: cards });
+
+    const filter = screen.getByRole("searchbox", { name: "Filter done issues" });
+    expect(filter).toBeVisible();
+    expect(screen.getByText("12/12")).toBeVisible();
+
+    await userEvent.type(filter, "needle");
+
+    expect(screen.getByText("Needle migration")).toBeVisible();
+    expect(screen.queryByText("Routine change 0")).not.toBeInTheDocument();
+    expect(screen.getByText("1/12")).toBeVisible();
   });
 });
 

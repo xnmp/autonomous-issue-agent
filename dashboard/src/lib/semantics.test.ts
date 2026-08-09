@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   combinedVerificationStatus,
+  commitSubjectTone,
   difficultyTone,
   impactTone,
   issueTypeTone,
@@ -11,6 +12,8 @@ import {
   roleHealth,
   stageTone,
   stepKindTone,
+  stepOutcomeMark,
+  stepOutcomeTone,
   verificationSummary,
 } from "./semantics";
 
@@ -26,6 +29,14 @@ describe("dashboard semantics", () => {
 
   it("treats done as terminal success", () => {
     expect(stageTone("done")).toBe("ok");
+  });
+
+  it.each([
+    ["red: reproduce the race", "fail"],
+    ["green: serialize watcher writes", "ok"],
+    ["docs: explain the invariant", "neutral"],
+  ])("maps commit subject %s into the shared status vocabulary", (subject, tone) => {
+    expect(commitSubjectTone(subject)).toBe(tone);
   });
 
   it.each([
@@ -165,6 +176,20 @@ describe("dashboard semantics", () => {
   ])("tones %s (%s) by who ran it, then how it ended", (kind, state, tone) => {
     expect(stepKindTone(kind, state)).toBe(tone);
   });
+
+  it.each([
+    ["REVIEW", "ok", "REQUEST_CHANGES", "running", "±"],
+    ["RE_REVIEW", "ok", "APPROVE", "ok", "✓"],
+    ["RESOLVE", "failed", "SUCCESS", "fail", "×"],
+    ["RESOLVE", "running", null, "running", "…"],
+    ["unblock", "done", null, "meta", "◆"],
+  ])(
+    "marks %s with state %s and verdict %s as %s %s",
+    (kind, state, status, tone, glyph) => {
+      expect(stepOutcomeTone(kind, state, status)).toBe(tone);
+      expect(stepOutcomeMark(kind, state, status)).toMatchObject({ tone, glyph });
+    },
+  );
 
   it("keeps unavailable process liveness distinct from dead", () => {
     expect(

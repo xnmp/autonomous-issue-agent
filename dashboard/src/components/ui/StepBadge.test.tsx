@@ -47,6 +47,8 @@ describe("the tasks strip as a condensed timeline", () => {
     const chips = [...container.querySelectorAll(".chip")];
     expect(chips[0]).toHaveClass("chip-running");
     expect(chips[1]).toHaveClass("chip-ok");
+    expect(chips[0]?.querySelector(".status-mark")).toHaveAttribute("data-status-glyph", "±");
+    expect(chips[1]?.querySelector(".status-mark")).toHaveAttribute("data-status-glyph", "✓");
   });
 
   it("colours an advisory route overrun yellow without pulsing as active", () => {

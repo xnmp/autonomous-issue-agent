@@ -1,3 +1,4 @@
+import { useMemo, useState } from "react";
 import { api } from "../api/client";
 import { usePolled } from "../api/hooks";
 import { useNow } from "../lib/clock";
@@ -21,15 +22,14 @@ import { Chip } from "./ui/Chip";
 import { Histogram, Meter, StackedBar, StatTile } from "./ui/Charts";
 import { EmptyState, ErrorBanner, Loading, SectionTitle, SkeletonRows, WarningList } from "./ui/Feedback";
 import { ResizableTable, useSortedRows } from "./ui/ResizableTable";
+import { TableFilter } from "./ui/TableFilter";
 
 const POLL_MS = 10_000;
 
 /**
- * The "is this on rails?" view. Reading order is deliberate: the stat tiles
- * answer *how much and how well*, the cost mix answers *where the money went*,
- * the caps answer *how much runway is left*, and the health cards answer *is
- * anything dead* — with red accents on escalations, recurrences, stale daemons
- * and near-limit caps so trouble is visible without reading a number.
+ * The "is this on rails?" view. Live human blockers and operator actions lead;
+ * measurements and historical diagnostics follow in progressively quieter
+ * groups so urgent work never competes with lifetime counters.
  */
 export function OverviewTab({
   repo,
@@ -47,8 +47,14 @@ export function OverviewTab({
   const m = ov.data?.metrics ?? null;
   const caps = ov.data?.caps ?? null;
   const mix = ov.data?.cost_mix ?? null;
+  const [spendQuery, setSpendQuery] = useState("");
+  const filteredSpend = useMemo(() => {
+    const query = spendQuery.trim().toLowerCase();
+    if (!query) return m?.by_kind ?? [];
+    return (m?.by_kind ?? []).filter((row) => row.kind.toLowerCase().includes(query));
+  }, [m?.by_kind, spendQuery]);
   const spendRows = useSortedRows(
-    m?.by_kind ?? [],
+    filteredSpend,
     {
       kind: (row) => row.kind,
       tasks: (row) => row.runs,
@@ -93,7 +99,20 @@ export function OverviewTab({
 
       <NeedsAttention items={ov.data?.needs_attention ?? []} loading={ov.loading} />
 
-      <div className="tiles">
+      <section className={`panel operator-actions-panel${(ov.data?.interventions ?? []).length > 0 ? " operator-actions-active" : ""}`}>
+        <div className="panel-hd">
+          <span className="panel-title">Operator actions</span>
+          <span className="faint">what a human had to do, newest first</span>
+        </div>
+        <div className="panel-bd flush">
+          <InterventionList
+            rows={ov.data?.interventions ?? []}
+            loading={ov.loading}
+          />
+        </div>
+      </section>
+
+      <div className="tiles overview-metrics">
         <StatTile
           label="Done"
           value={num(m?.done_issues)}
@@ -165,7 +184,7 @@ export function OverviewTab({
         />
       </div>
 
-      <div className="grid-2">
+      <div className="grid-2 overview-support">
         <section className="panel">
           <div className="panel-hd">
             <span className="panel-title">Cost mix by task family</span>
@@ -228,43 +247,45 @@ export function OverviewTab({
 
       <UnattributedCount count={ov.data?.unattributed_count ?? 0} />
 
-      <section className="panel">
-        <div className="panel-hd">
-          <span className="panel-title">Operator actions</span>
-          <span className="faint">what a human had to do, newest first</span>
-        </div>
-        <div className="panel-bd flush">
-          <InterventionList
-            rows={ov.data?.interventions ?? []}
-            loading={ov.loading}
-          />
-        </div>
-      </section>
-
       <div className="by-kind">
         <SectionTitle>Spend by task type</SectionTitle>
         {(m?.by_kind ?? []).length === 0 ? (
           <EmptyState>no tasks recorded yet</EmptyState>
         ) : (
-          <div className="tbl-wrap panel">
-            <ResizableTable storageKey="overview-spend" columns={[
-              { key: "kind", label: "Kind", width: 220 },
-              { key: "tasks", label: "Tasks", className: "r", width: 90 },
-              { key: "usd", label: "USD", className: "r", width: 100 },
-              { key: "per-task", label: "$/task", className: "r", width: 100 },
-            ]} sort={spendRows.sort} onSort={spendRows.onSort}>
-              <tbody>
-                {spendRows.rows.map((k) => (
-                  <tr key={k.kind}>
-                    <td className="mono">{k.kind}</td>
-                    <td className="r num">{num(k.runs)}</td>
-                    <td className="r mono">{usd(k.usd)}</td>
-                    <td className="r mono faint">{k.runs > 0 ? usd(k.usd / k.runs) : "—"}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </ResizableTable>
-          </div>
+          <>
+            {(m?.by_kind ?? []).length > 10 ? (
+              <TableFilter
+                label="Filter task types"
+                value={spendQuery}
+                onChange={setSpendQuery}
+                shown={filteredSpend.length}
+                total={(m?.by_kind ?? []).length}
+              />
+            ) : null}
+            <div className="tbl-wrap panel">
+              {filteredSpend.length === 0 ? (
+                <EmptyState>no task types match “{spendQuery.trim()}”</EmptyState>
+              ) : (
+                <ResizableTable storageKey="overview-spend" columns={[
+                  { key: "kind", label: "Kind", width: 220 },
+                  { key: "tasks", label: "Tasks", className: "r", width: 90 },
+                  { key: "usd", label: "USD", className: "r", width: 100 },
+                  { key: "per-task", label: "$/task", className: "r", width: 100 },
+                ]} sort={spendRows.sort} onSort={spendRows.onSort}>
+                  <tbody>
+                    {spendRows.rows.map((k) => (
+                      <tr key={k.kind}>
+                        <td className="mono">{k.kind}</td>
+                        <td className="r num">{num(k.runs)}</td>
+                        <td className="r mono">{usd(k.usd)}</td>
+                        <td className="r mono faint">{k.runs > 0 ? usd(k.usd / k.runs) : "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </ResizableTable>
+              )}
+            </div>
+          </>
         )}
       </div>
     </div>
@@ -301,8 +322,15 @@ function SpendPerHour({ buckets }: { buckets: OverviewPayload["spend_per_hour"] 
 }
 
 function HealthTrend({ rows, loading }: { rows: HealthTrendDay[]; loading: boolean }) {
+  const [query, setQuery] = useState("");
+  const filtered = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return rows;
+    return rows.filter((row) => [row.day, row.opened, row.closed, row.net_open, row.recurrences]
+      .some((value) => String(value).toLowerCase().includes(needle)));
+  }, [query, rows]);
   const sorted = useSortedRows(
-    rows,
+    filtered,
     {
       day: (row) => row.day,
       opened: (row) => row.opened,
@@ -319,8 +347,21 @@ function HealthTrend({ rows, loading }: { rows: HealthTrendDay[]; loading: boole
         <span className="panel-title">Issue health trend</span>
       </div>
       <div className="panel-bd flush">
+        {rows.length > 10 ? (
+          <div className="panel-table-tools">
+            <TableFilter
+              label="Filter health trend"
+              value={query}
+              onChange={setQuery}
+              shown={filtered.length}
+              total={rows.length}
+            />
+          </div>
+        ) : null}
         {rows.length === 0 && !loading ? (
           <EmptyState>no issue activity or recurrences recorded yet</EmptyState>
+        ) : rows.length > 0 && filtered.length === 0 ? (
+          <EmptyState>no health rows match “{query.trim()}”</EmptyState>
         ) : (
           <div className="tbl-wrap">
             <ResizableTable storageKey="overview-health-trend" columns={[
@@ -437,7 +478,7 @@ const ATTENTION_LABEL: Record<string, string> = {
  */
 function NeedsAttention({ items, loading }: { items: AttentionItem[]; loading: boolean }) {
   return (
-    <section className="panel">
+    <section className={`panel attention-panel${items.length > 0 ? " attention-panel-active" : " attention-panel-clear"}`}>
       <div className="panel-hd">
         <span className="panel-title">Needs attention</span>
         <span className="faint">{items.length > 0 ? `${items.length} waiting on a human` : "nothing waiting"}</span>
@@ -448,7 +489,7 @@ function NeedsAttention({ items, loading }: { items: AttentionItem[]; loading: b
           <EmptyState>no issue is waiting on a human</EmptyState>
         ) : null}
         {items.map((item) => (
-          <div className="usage-line" key={`${item.issue}-${item.kind}`}>
+          <div className="usage-line attention-row" key={`${item.issue}-${item.kind}`}>
             <Chip tone={ATTENTION_TONE[item.kind] ?? "info"} square>
               {ATTENTION_LABEL[item.kind] ?? item.kind}
             </Chip>
@@ -502,8 +543,21 @@ function InterventionList({
   rows: InterventionEvent[];
   loading: boolean;
 }) {
+  const [query, setQuery] = useState("");
+  const filtered = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return rows;
+    return rows.filter((row) => [
+      row.ts,
+      row.action_class,
+      row.issue,
+      row.pr,
+      row.kind,
+      row.detail,
+    ].some((value) => String(value ?? "").toLowerCase().includes(needle)));
+  }, [query, rows]);
   const sorted = useSortedRows(
-    rows,
+    filtered,
     {
       when: (row) => row.ts,
       class: (row) => row.action_class,
@@ -518,35 +572,54 @@ function InterventionList({
     return <EmptyState>no journalled operator actions — the harness ran unattended</EmptyState>;
   }
   return (
-    <ResizableTable storageKey="overview-interventions" columns={[
-      { key: "when", label: "When", width: 160 },
-      { key: "class", label: "Class", width: 110 },
-      { key: "target", label: "Target", width: 110 },
-      { key: "action", label: "Action", width: 420 },
-    ]} sort={sorted.sort} onSort={sorted.onSort}>
-      <tbody>
-        {sorted.rows.map((row, i) => (
-          <tr key={`${row.ts ?? "?"}-${i}`}>
-            <td className="mono faint" title={row.ts ?? ""}>{localTime(row.ts)}</td>
-            <td>
-              <Chip tone={INTERVENTION_TONE[row.action_class] ?? "info"} square>
-                {row.action_class}
-              </Chip>
-            </td>
-            <td className="mono">
-              {row.issue !== null && row.issue !== undefined ? `#${row.issue}` : null}
-              {row.pr !== null && row.pr !== undefined ? (
-                <span className="faint"> PR #{row.pr}</span>
-              ) : null}
-              {row.issue == null && row.pr == null ? <span className="faint">—</span> : null}
-            </td>
-            <td className="trunc" title={row.detail ?? row.kind}>
-              <span className="mono">{row.kind}</span>
-              {row.detail ? <span className="faint"> — {row.detail}</span> : null}
-            </td>
-          </tr>
-        ))}
-      </tbody>
-    </ResizableTable>
+    <>
+      {rows.length > 10 ? (
+        <div className="panel-table-tools">
+          <TableFilter
+            label="Filter operator actions"
+            value={query}
+            onChange={setQuery}
+            shown={filtered.length}
+            total={rows.length}
+          />
+        </div>
+      ) : null}
+      {filtered.length === 0 ? (
+        <EmptyState>no operator actions match “{query.trim()}”</EmptyState>
+      ) : (
+        <div className="operator-actions-table">
+          <ResizableTable storageKey="overview-interventions" columns={[
+            { key: "when", label: "When", width: 160 },
+            { key: "class", label: "Class", width: 110 },
+            { key: "target", label: "Target", width: 110 },
+            { key: "action", label: "Action", width: 420 },
+          ]} sort={sorted.sort} onSort={sorted.onSort}>
+            <tbody>
+              {sorted.rows.map((row, i) => (
+                <tr key={`${row.ts ?? "?"}-${i}`}>
+                  <td className="mono faint" title={row.ts ?? ""}>{localTime(row.ts)}</td>
+                  <td>
+                    <Chip tone={INTERVENTION_TONE[row.action_class] ?? "info"} square>
+                      {row.action_class}
+                    </Chip>
+                  </td>
+                  <td className="mono">
+                    {row.issue !== null && row.issue !== undefined ? `#${row.issue}` : null}
+                    {row.pr !== null && row.pr !== undefined ? (
+                      <span className="faint"> PR #{row.pr}</span>
+                    ) : null}
+                    {row.issue == null && row.pr == null ? <span className="faint">—</span> : null}
+                  </td>
+                  <td className="trunc" title={row.detail ?? row.kind}>
+                    <span className="mono">{row.kind}</span>
+                    {row.detail ? <span className="faint"> — {row.detail}</span> : null}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </ResizableTable>
+        </div>
+      )}
+    </>
   );
 }

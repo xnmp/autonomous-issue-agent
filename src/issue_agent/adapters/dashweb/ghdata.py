@@ -24,6 +24,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 DEFAULT_TTL_S = 45.0
+PR_DETAIL_TTL_S = 180.0
 GH_TIMEOUT_S = 30.0
 
 ISSUE_FIELDS = (
@@ -35,7 +36,11 @@ ISSUE_HISTORY_LIMIT = 1000
 PR_FIELDS = (
     "number,title,url,state,mergedAt,updatedAt,reviewDecision,"
     "statusCheckRollup,autoMergeRequest,latestReviews,labels,comments,"
-    "isDraft,mergeable,mergeStateStatus"
+    "isDraft,mergeable,mergeStateStatus,headRefName,closingIssuesReferences"
+)
+PR_DETAIL_FIELDS = (
+    "number,url,state,headRefName,headRefOid,closingIssuesReferences,"
+    "commits,files"
 )
 
 
@@ -48,7 +53,15 @@ class TtlCache:
     ttl_s: float = DEFAULT_TTL_S
     clock: Callable[[], float] = time.monotonic
     _entries: dict = field(default_factory=dict)
+    _inflight: dict = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def _sweep_expired(self, now: float) -> None:
+        self._entries = {
+            key: entry
+            for key, entry in self._entries.items()
+            if now < entry[0]
+        }
 
     def get(self, key):
         # Locked, and `pop` rather than `del`: routes are sync `def`, so they
@@ -66,7 +79,42 @@ class TtlCache:
 
     def put(self, key, value):
         with self._lock:
-            self._entries[key] = (self.clock() + self.ttl_s, value)
+            now = self.clock()
+            self._sweep_expired(now)
+            self._entries[key] = (now + self.ttl_s, value)
+        return value
+
+    def get_or_load(self, key, load: Callable[[], object]):
+        """Return one cached/load result while concurrent misses wait for it."""
+        while True:
+            with self._lock:
+                entry = self._entries.get(key)
+                if entry is not None and self.clock() < entry[0]:
+                    return entry[1]
+                self._entries.pop(key, None)
+                pending = self._inflight.get(key)
+                if pending is None:
+                    pending = threading.Event()
+                    self._inflight[key] = pending
+                    break
+            pending.wait()
+
+        try:
+            value = load()
+        except BaseException:
+            with self._lock:
+                completed = self._inflight.pop(key, None)
+                if completed is not None:
+                    completed.set()
+            raise
+
+        with self._lock:
+            now = self.clock()
+            self._sweep_expired(now)
+            self._entries[key] = (now + self.ttl_s, value)
+            completed = self._inflight.pop(key, None)
+            if completed is not None:
+                completed.set()
         return value
 
 
@@ -90,25 +138,38 @@ def run_gh(args: list[str]) -> tuple[str, str]:
 class GhReader:
     """Read-only `gh` façade. `run` is injectable so tests never shell out."""
 
-    def __init__(self, run=None, ttl_s: float = DEFAULT_TTL_S, clock=time.monotonic):
+    def __init__(
+        self,
+        run=None,
+        ttl_s: float = DEFAULT_TTL_S,
+        clock=time.monotonic,
+        pr_ttl_s: float = PR_DETAIL_TTL_S,
+    ):
         self._run = run or run_gh
         self._cache = TtlCache(ttl_s=ttl_s, clock=clock)
+        self._pr_cache = TtlCache(ttl_s=pr_ttl_s, clock=clock)
 
     def json(self, repo: str, args: list[str]) -> tuple[object | None, str]:
+        return self._cached_json(self._cache, repo, args)
+
+    def _cached_json(
+        self, cache: TtlCache, repo: str, args: list[str]
+    ) -> tuple[object | None, str]:
         if not repo:
             return None, "no REPO configured for this deployment"
         key = (repo, tuple(args))
-        cached = self._cache.get(key)
-        if cached is not None:
-            return cached
-        out, error = self._run([*args, "-R", repo])
-        if error:
-            return self._cache.put(key, (None, error))
-        try:
-            payload = json.loads(out or "null")
-        except ValueError:
-            return self._cache.put(key, (None, "gh returned unparseable JSON"))
-        return self._cache.put(key, (payload, ""))
+
+        def load() -> tuple[object | None, str]:
+            out, error = self._run([*args, "-R", repo])
+            if error:
+                return None, error
+            try:
+                payload = json.loads(out or "null")
+            except ValueError:
+                return None, "gh returned unparseable JSON"
+            return payload, ""
+
+        return cache.get_or_load(key, load)
 
     def issues(self, repo: str, limit: int = ISSUE_HISTORY_LIMIT) -> tuple[object | None, str]:
         """Open AND closed issues in one call: the done cards need titles for
@@ -125,6 +186,14 @@ class GhReader:
             repo,
             ["pr", "list", "--state", "all", "--limit", str(limit),
              "--json", PR_FIELDS],
+        )
+
+    def pr(self, repo: str, number: int) -> tuple[object | None, str]:
+        """One PR's change history, fetched only for the issue detail view."""
+        return self._cached_json(
+            self._pr_cache,
+            repo,
+            ["pr", "view", str(number), "--json", PR_DETAIL_FIELDS],
         )
 
 
