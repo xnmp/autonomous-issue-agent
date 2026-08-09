@@ -219,6 +219,27 @@ describe("done labels column", () => {
   });
 });
 
+describe("long-table filtering", () => {
+  it("filters a long done table by issue-facing text and reports the result count", async () => {
+    const cards = Array.from({ length: 12 }, (_, index) => ({
+      ...done,
+      issue: 100 + index,
+      title: index === 7 ? "Needle migration" : `Routine change ${index}`,
+    }));
+    board("done", { done: cards });
+
+    const filter = screen.getByRole("searchbox", { name: "Filter done issues" });
+    expect(filter).toBeVisible();
+    expect(screen.getByText("12/12")).toBeVisible();
+
+    await userEvent.type(filter, "needle");
+
+    expect(screen.getByText("Needle migration")).toBeVisible();
+    expect(screen.queryByText("Routine change 0")).not.toBeInTheDocument();
+    expect(screen.getByText("1/12")).toBeVisible();
+  });
+});
+
 describe("blocked section", () => {
   const working: IssueCard = {
     ...done,

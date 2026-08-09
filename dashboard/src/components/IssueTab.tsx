@@ -5,13 +5,10 @@ import { liveClocks, offsetSince, useNow } from "../lib/clock";
 import type { IssueStep } from "../api/types";
 import {
   commitSubjectTone,
-  kindLabel,
   modelTone,
   prStateTone,
-  stateTone,
   stageTone,
-  statusTone,
-  stepKindTone,
+  stepOutcomeTone,
 } from "../lib/semantics";
 import { clockTime, duration, localTime, num, tokens, usd } from "../lib/format";
 import { shortModel } from "../lib/models";
@@ -21,6 +18,8 @@ import { EmptyState, ErrorBanner, Loading, SkeletonRows, WarningList } from "./u
 import { EventTimeline } from "./EventTimeline";
 import { UnblockModal } from "./UnblockModal";
 import { ColumnMenu, type ColumnChoice } from "./ui/ColumnMenu";
+import { StepBadge, StepStatusChip } from "./ui/StepBadge";
+import { TableFilter } from "./ui/TableFilter";
 import {
   ResizableTable,
   useSortedRows,
@@ -75,6 +74,7 @@ export function IssueTab({
   const [unblocking, setUnblocking] = useState(false);
   const [unblockError, setUnblockError] = useState<string | null>(null);
   const [pane, setPane] = useState<"tasks" | "events">("tasks");
+  const [taskQuery, setTaskQuery] = useState("");
   const [columnVisibility, setColumnVisibility] = useState(storedIssueColumns);
   const [columnMenuAt, setColumnMenuAt] = useState<{ x: number; y: number } | null>(null);
   const visible = useMemo(
@@ -118,7 +118,22 @@ export function IssueTab({
     d ?? {},
     offsetSince(detail.updatedAt, useNow()),
   );
-  const sortedSteps = useSortedRows(d?.steps ?? [], {
+  const filteredSteps = useMemo(() => {
+    const query = taskQuery.trim().toLowerCase();
+    if (!query) return d?.steps ?? [];
+    return (d?.steps ?? []).filter((step) => [
+      step.idx,
+      step.kind,
+      step.role,
+      step.model,
+      step.effort,
+      step.status,
+      step.state,
+      step.note,
+      step.session_id,
+    ].some((value) => String(value ?? "").toLowerCase().includes(query)));
+  }, [d?.steps, taskQuery]);
+  const sortedSteps = useSortedRows(filteredSteps, {
     operation: (step) => step.kind,
     role: (step) => step.role,
     model: (step) => step.model,
@@ -285,35 +300,45 @@ export function IssueTab({
             </div>
           ) : null}
           {pane === "tasks" && d.steps.length > 0 ? (
-            <div
-              className="panel steps"
-              id={`issue-${issue}-tasks-panel`}
-              role="tabpanel"
-              aria-labelledby={`issue-${issue}-tasks-tab`}
-            >
-              <div className="tbl-wrap">
-                <ResizableTable
-                  storageKey="issue-tasks"
-                  columns={columns}
-                  sort={sortedSteps.sort}
-                  onSort={sortedSteps.onSort}
-                >
-                  <tbody>
-                    {sortedSteps.rows.map((s) => (
-                      <StepRow
-                        key={s.idx}
-                        repo={repo}
-                        issue={issue}
-                        step={s}
-                        open={openStep === s.idx}
-                        onToggle={() => setOpenStep((cur) => (cur === s.idx ? null : s.idx))}
-                        visible={visible}
-                        colSpan={columns.length}
-                        showDurationSeconds={showDurationSeconds}
-                      />
-                    ))}
-                  </tbody>
-                </ResizableTable>
+            <div id={`issue-${issue}-tasks-panel`} role="tabpanel" aria-labelledby={`issue-${issue}-tasks-tab`}>
+              {d.steps.length > 10 ? (
+                <TableFilter
+                  label="Filter tasks"
+                  value={taskQuery}
+                  onChange={setTaskQuery}
+                  shown={filteredSteps.length}
+                  total={d.steps.length}
+                />
+              ) : null}
+              <div className="panel steps">
+                {filteredSteps.length === 0 ? (
+                  <EmptyState>no tasks match “{taskQuery.trim()}”</EmptyState>
+                ) : (
+                  <div className="tbl-wrap">
+                    <ResizableTable
+                      storageKey="issue-tasks"
+                      columns={columns}
+                      sort={sortedSteps.sort}
+                      onSort={sortedSteps.onSort}
+                    >
+                      <tbody>
+                        {sortedSteps.rows.map((s) => (
+                          <StepRow
+                            key={s.idx}
+                            repo={repo}
+                            issue={issue}
+                            step={s}
+                            open={openStep === s.idx}
+                            onToggle={() => setOpenStep((cur) => (cur === s.idx ? null : s.idx))}
+                            visible={visible}
+                            colSpan={columns.length}
+                            showDurationSeconds={showDurationSeconds}
+                          />
+                        ))}
+                      </tbody>
+                    </ResizableTable>
+                  </div>
+                )}
               </div>
             </div>
           ) : null}
@@ -363,7 +388,7 @@ function StepRow({
   colSpan: number;
   showDurationSeconds: boolean;
 }) {
-  const tone = stateTone(step.state);
+  const tone = stepOutcomeTone(step.kind, step.state, step.status);
   const u = step.usage;
   const detailId = `task-detail-${issue}-${step.idx}`;
   return (
@@ -387,14 +412,7 @@ function StepRow({
             <span className={`chev${open ? " open" : ""}`} aria-hidden="true">
               ▸
             </span>
-            <Chip
-              tone={stepKindTone(step.kind, step.state)}
-              square
-              pulse={step.state === "running"}
-              title={step.kind}
-            >
-              {kindLabel(step.kind)}
-            </Chip>
+            <StepBadge step={step} />
           </button>
         </td>
         {visible.has("role") ? <td>
@@ -416,11 +434,7 @@ function StepRow({
           )}
         </td> : null}
         {visible.has("status") ? <td className="row-wrap">
-          <Chip tone={step.state === "running" ? "running" : statusTone(step.status)}>
-            {step.status === "ok" || (!step.status && step.state === "ok")
-              ? "done"
-              : (step.status ?? step.state)}
-          </Chip>
+          <StepStatusChip step={step} />
           {step.exit_reason && step.exit_reason.toLowerCase() !== "ok" ? (
             <span className="faint mono trunc" title={step.exit_reason}>
               {step.exit_reason}

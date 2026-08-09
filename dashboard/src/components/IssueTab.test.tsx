@@ -374,4 +374,50 @@ describe("IssueTab", () => {
       .toHaveAttribute("aria-valuemin", "76");
     expect(screen.getAllByText("1:17")).toHaveLength(2);
   });
+
+  it("filters a long task history across model and task context", async () => {
+    const steps = Array.from({ length: 11 }, (_, idx) => ({
+      idx,
+      kind: idx === 8 ? "REVIEW" : "RESOLVE",
+      role: idx === 8 ? "review" : "fix",
+      state: "ok",
+      model: idx === 8 ? "gpt-5.6-needle" : "gpt-5.6-terra",
+      status: idx === 8 ? "REQUEST_CHANGES" : "done",
+      exit_reason: "ok",
+      duration_s: 60,
+      cost_usd: 0.2,
+      estimated: false,
+      session_id: `session-${idx}`,
+      has_transcript: false,
+      turns: 2,
+      usage: null,
+      ts: `2026-07-29T08:${String(idx).padStart(2, "0")}:00Z`,
+    }));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      issue: 50,
+      title: "Long task history",
+      url: null,
+      stage: "done",
+      done: true,
+      prs: [],
+      pull_requests: [],
+      cost_usd: 2,
+      elapsed_s: 660,
+      working_s: 660,
+      idle_s: 0,
+      idle_active: false,
+      steps,
+      events: [],
+      warnings: [],
+    }), { status: 200, headers: { "Content-Type": "application/json" } })));
+
+    render(<IssueTab repo="demo" issue={50} />);
+    const filter = await screen.findByRole("searchbox", { name: "Filter tasks" });
+    expect(screen.getByText("11/11")).toBeVisible();
+    await userEvent.type(filter, "needle");
+
+    expect(screen.getByText("gpt-5.6-needle")).toBeVisible();
+    expect(screen.queryByText("gpt-5.6-terra")).not.toBeInTheDocument();
+    expect(screen.getByText("1/11")).toBeVisible();
+  });
 });
