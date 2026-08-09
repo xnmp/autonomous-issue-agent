@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { IssueTab } from "./IssueTab";
@@ -71,6 +71,7 @@ describe("IssueTab", () => {
                 role: "fix",
                 state: "ok",
                 model: "claude-sonnet-5",
+                effort: "high",
                 status: "done",
                 exit_reason: "ok",
                 duration_s: 60,
@@ -105,10 +106,17 @@ describe("IssueTab", () => {
     expect(stepDetail).toBeInstanceOf(HTMLElement);
     const detailEventsTab = within(stepDetail as HTMLElement).getByRole("tab", { name: "Events" });
     const detail = detailEventsTab.closest("td");
-    expect(detail).toHaveAttribute("colspan", "6");
+    expect(detail).toHaveAttribute("colspan", "7");
     expect(detail).not.toHaveClass("step-operation");
     expect(screen.queryByRole("columnheader", { name: /Role/ })).not.toBeInTheDocument();
-    expect(screen.queryByRole("columnheader", { name: /Model/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("columnheader", { name: /Model/ })).toBeVisible();
+    const executionDetails = within(stepDetail as HTMLElement).getByRole("group", {
+      name: "Task execution details",
+    });
+    expect(within(executionDetails).getByText("claude-sonnet-5")).toBeVisible();
+    expect(within(executionDetails).getByText("high")).toBeVisible();
+    expect(within(executionDetails).getByText("session-50")).toBeVisible();
+    expect(within(executionDetails).queryByText("ok")).not.toBeInTheDocument();
 
     detailEventsTab?.focus();
     await userEvent.keyboard("{ArrowRight}");
@@ -191,7 +199,7 @@ describe("IssueTab", () => {
     expect(screen.queryByText("control.transition.committed.v1")).not.toBeInTheDocument();
   });
 
-  it("gives compact task columns their own resize floors", async () => {
+  it("shows a sortable model column by default and keeps compact resize floors", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
@@ -224,6 +232,22 @@ describe("IssueTab", () => {
             turns: 3,
             usage: null,
             ts: "2026-07-29T08:00:00Z",
+          }, {
+            idx: 1,
+            kind: "REVIEW",
+            role: "review",
+            state: "ok",
+            model: "gpt-5.6-luna",
+            status: "APPROVE",
+            exit_reason: "ok",
+            duration_s: 60,
+            cost_usd: 0.2,
+            estimated: false,
+            session_id: null,
+            has_transcript: false,
+            turns: 2,
+            usage: null,
+            ts: "2026-07-29T08:01:00Z",
           }],
           events: [],
           warnings: [],
@@ -235,9 +259,14 @@ describe("IssueTab", () => {
     );
 
     render(<IssueTab repo="demo" issue={50} showDurationSeconds={false} />);
-    const operation = await screen.findByRole("columnheader", { name: /Operation/ });
-    fireEvent.contextMenu(operation);
-    await userEvent.click(screen.getByRole("checkbox", { name: "Model" }));
+    const modelHeader = await screen.findByRole("columnheader", { name: /Model/ });
+    await userEvent.click(within(modelHeader).getByRole("button", { name: "Sort by Model" }));
+    expect(modelHeader).toHaveAttribute("aria-sort", "ascending");
+    await userEvent.click(within(modelHeader).getByRole("button", { name: "Sort by Model" }));
+    expect(modelHeader).toHaveAttribute("aria-sort", "descending");
+    const rows = screen.getAllByRole("row").slice(1);
+    expect(within(rows[0]!).getByText("gpt-5.6-luna")).toBeVisible();
+    expect(within(rows[1]!).getByText("sonnet-5")).toBeVisible();
 
     expect(screen.getByRole("separator", { name: "Resize Model column" }))
       .toHaveAttribute("aria-valuemin", "100");

@@ -40,7 +40,7 @@ const ISSUE_COLUMNS: ColumnChoice[] = [
 
 function storedIssueColumns(): Record<string, boolean> {
   const defaults = Object.fromEntries(
-    ISSUE_COLUMNS.map(({ key }) => [key, key !== "role" && key !== "model"]),
+    ISSUE_COLUMNS.map(({ key }) => [key, key !== "role"]),
   );
   try {
     return {
@@ -524,6 +524,7 @@ function StepDetail({
           aria-labelledby={`${id}-summary-tab`}
           className="step-summary"
         >
+          <StepSummaryHeader step={step} />
           {step.note ? <p className="task-note step-summary-note">{step.note}</p> : null}
           {step.exit_reason && step.exit_reason.toLowerCase() !== "ok" ? (
             <p className="step-summary-exit">
@@ -619,6 +620,30 @@ function StepDetail({
       ) : null}
     </div>
   );
+}
+
+function StepSummaryHeader({ step }: { step: IssueStep }) {
+  const facts = [
+    { label: "model", value: step.model, mono: true },
+    { label: "effort", value: step.effort, mono: false },
+    { label: "session", value: step.session_id, mono: true },
+    step.exit_reason && step.exit_reason.toLowerCase() !== "ok"
+      ? { label: "exit", value: step.exit_reason, mono: true }
+      : null,
+  ].filter((fact): fact is { label: string; value: string; mono: boolean } => (
+    fact !== null && typeof fact.value === "string" && fact.value.trim() !== ""
+  ));
+
+  return facts.length > 0 ? (
+    <dl className="step-summary-facts" role="group" aria-label="Task execution details">
+      {facts.map((fact) => (
+        <div className="step-summary-fact" key={fact.label}>
+          <dt>{fact.label}</dt>
+          <dd className={fact.mono ? "mono" : undefined}>{fact.value}</dd>
+        </div>
+      ))}
+    </dl>
+  ) : null;
 }
 
 function moveTabFocus(
