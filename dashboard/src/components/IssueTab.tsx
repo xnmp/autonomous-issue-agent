@@ -58,10 +58,12 @@ function storedIssueColumns(): Record<string, boolean> {
  */
 export function IssueTab({
   repo,
+  githubRepo = repo,
   issue,
   showDurationSeconds = true,
 }: {
   repo: string;
+  githubRepo?: string;
   issue: number;
   showDurationSeconds?: boolean;
 }) {
@@ -182,7 +184,15 @@ export function IssueTab({
         <>
           <header className="issue-hd panel">
             <div className="issue-hd-line issue-hd-primary">
-              <span className="issue-num mono">#{d.issue}</span>
+              <a
+                className="issue-num mono"
+                href={`https://github.com/${githubRepo.split("/").map(encodeURIComponent).join("/")}/issues/${d.issue}`}
+                target="_blank"
+                rel="noopener"
+                title={`Open issue #${d.issue} on GitHub`}
+              >
+                #{d.issue}
+              </a>
               <span className="issue-title trunc" title={d.title ?? undefined}>
                 {d.title ?? <span className="faint">title unavailable (GitHub data)</span>}
               </span>
@@ -565,7 +575,6 @@ function StepDetail({
         >
           <StepSummaryHeader step={step} />
           <StepContextLine step={step} />
-          {step.note ? <p className="task-note step-summary-note">{step.note}</p> : null}
           {step.exit_reason && step.exit_reason.toLowerCase() !== "ok" ? (
             <p className="step-summary-exit">
               ended: <span className="mono">{step.exit_reason}</span>
@@ -589,18 +598,6 @@ function StepDetail({
           ) : (
             (() => {
               const lines = narrateWindow(events.data?.events ?? []);
-              if (
-                lines.length === 0
-                && !step.note
-                && !step.review?.verdict_excerpt
-                && !step.change
-              ) {
-                return (
-                  <EmptyState>
-                    this task changed nothing visible — see Events for the bookkeeping
-                  </EmptyState>
-                );
-              }
               return lines.length > 0 ? (
                 <ul className="step-summary-actions">
                   {lines.map((line, index) => (

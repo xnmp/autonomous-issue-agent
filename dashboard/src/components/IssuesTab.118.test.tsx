@@ -69,6 +69,9 @@ describe("human-owned actions", () => {
     );
 
     expect(screen.getByText("merge ready")).toBeVisible();
+    expect(screen.getByRole("columnheader", { name: /Lifecycle/ })).toBeVisible();
+    expect(screen.queryByRole("columnheader", { name: /Tasks/ })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Issue #118 lifecycle")).toBeVisible();
     expect(screen.queryByText(/merge ready ·/)).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /merge/i })).not.toBeInTheDocument();
   });
@@ -108,7 +111,9 @@ describe("human-owned actions", () => {
     );
 
     expect(container.querySelector("tbody > tr")).toHaveClass("row-alert");
-    expect(document.querySelector('[data-tip^="ADDRESS_REVIEW · blocked"]')).toHaveClass("chip-fail");
+    expect(
+      document.querySelector('[data-tip^="ADDRESS_REVIEW"]')?.closest("li"),
+    ).toHaveClass("life-blocked", "life-tone-fail");
   });
 });
 

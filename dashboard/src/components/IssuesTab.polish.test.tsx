@@ -41,7 +41,7 @@ const backlog: BacklogCard = {
   title: "The board is hard to read",
   url: "https://github.com/o/r/issues/63",
   body: "long body",
-  labels: ["type:enhancement", "difficulty:complex", "ai-triaged"],
+  labels: ["type:enhancement", "difficulty:complex", "ai-triage"],
   recurrence: false,
   recurrence_count: 0,
   age_days: 1,
@@ -314,6 +314,20 @@ describe("blocked section", () => {
 });
 
 describe("backlog triage taxonomy", () => {
+  it("makes steward-processed and raw intake visibly distinct", () => {
+    const { container } = board("backlog", {
+      backlog: [
+        backlog,
+        { ...backlog, issue: 64, title: "Unprocessed intake", labels: [] },
+      ],
+    });
+
+    expect(screen.getByText("AC + test plan written")).toBeVisible();
+    expect(screen.getByText("awaiting steward")).toBeVisible();
+    expect(container.querySelector(".backlog-processed")).toBeInTheDocument();
+    expect(container.querySelector(".backlog-raw")).toBeInTheDocument();
+  });
+
   it("colours each axis value and its matching label with one mapping", () => {
     board("backlog", { backlog: [backlog] });
 

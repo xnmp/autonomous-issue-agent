@@ -347,6 +347,7 @@ export default function App() {
           <Body
             route={route}
             selectedRepo={selectedRepo}
+            githubRepo={selectedRepoSummary?.repo ?? null}
             issues={displayedIssues}
             onSetSub={setSub}
             onOpenIssue={openIssue}
@@ -371,6 +372,7 @@ export default function App() {
 function Body({
   route,
   selectedRepo,
+  githubRepo,
   issues,
   onSetSub,
   onOpenIssue,
@@ -382,6 +384,7 @@ function Body({
 }: {
   route: Route;
   selectedRepo: string | null;
+  githubRepo: string | null;
   issues: ReturnType<typeof useIssues>;
   onSetSub: (s: IssuesSub) => void;
   onOpenIssue: (n: number) => void;
@@ -396,6 +399,7 @@ function Body({
     return (
       <IssueTab
         repo={route.repo}
+        githubRepo={githubRepo ?? route.repo}
         issue={route.issue}
         showDurationSeconds={showDurationSeconds}
       />
@@ -418,9 +422,6 @@ function Body({
       <OverviewTab
         repo={selectedRepo}
         onOpenIssues={onSetSub}
-        activeIssues={issues.data?.in_flight ?? []}
-        activeIssuesLoading={issues.loading}
-        onOpenIssue={onOpenIssue}
       />
     );
   }

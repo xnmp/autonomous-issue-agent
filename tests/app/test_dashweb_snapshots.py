@@ -4,6 +4,7 @@ Every assertion is on what the API promises a client — a sort order, a flag, a
 step's state — never on how the aggregation stores it.
 """
 
+import time
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
@@ -19,12 +20,23 @@ from issue_agent.domain.events import (
     Correlation,
     EventEnvelope,
     Producer,
+    SpendBlocked,
     WorldObserved,
 )
 from issue_agent.domain.labels import LIFECYCLE_LABELS
 from issue_agent.domain.projection import fold
 
 NOW = datetime(2026, 7, 29, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def eventually(load, predicate):
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        value = load()
+        if predicate(value):
+            return value
+        time.sleep(0.01)
+    raise AssertionError("GitHub enrichment did not reach a later poll")
 
 
 def ts(**delta) -> str:
@@ -890,8 +902,13 @@ def test_ai_ready_issue_with_historical_activity_is_pending_not_in_flight(monkey
     monkeypatch.setattr(backend, "snapshot", lambda _name: snapshot)
     monkeypatch.setattr(backend, "verification", lambda: {"rows": []})
 
-    payload = backend.issues("demo")
+    first = backend.issues("demo")
+    assert [card["issue"] for card in first["in_flight"]] == [7]
 
+    payload = eventually(
+        lambda: backend.issues("demo"),
+        lambda current: bool(current["pending"]),
+    )
     assert [card["issue"] for card in payload["pending"]] == [7]
     assert payload["in_flight"] == []
 
@@ -1372,6 +1389,22 @@ def test_the_attention_panel_is_ordered_by_urgency_then_issue_number():
 def test_a_finished_or_untouched_issue_needs_no_attention():
     assert _attention([_observed(7, ["ai-done"], 0)]) == []
     assert _attention([_observed(7, [], 0)]) == []
+
+
+def test_a_resolved_spend_block_drops_out_of_current_attention():
+    events = [
+        v2_event(
+            SpendBlocked("issue", "exhausted", 2_000_000, 1_000_000, "USD", "cap"),
+            "spend-block",
+            0,
+            issue=7,
+        ),
+        _observed(7, ["ai-working"], 1),
+    ]
+    deployment = v2_deployment(events)
+
+    assert deployment.issues[0].spend_blocks == 1
+    assert snapshots.needs_attention(deployment) == []
 
 
 def test_needs_attention_tolerates_an_issue_with_no_observed_labels():
@@ -2560,14 +2593,24 @@ def card_for(payload, issue=7):
 def test_v2_cards_carry_pr_state_and_merge_readiness_from_github(monkeypatch):
     backend = v2_backend(monkeypatch, reviewDecision="APPROVED", mergeable="MERGEABLE")
 
-    card = card_for(backend.issues("demo"))
+    first = card_for(backend.issues("demo"))
+    assert (first["pr"], first["pr_state"]) == (12, None)
+
+    card = eventually(
+        lambda: card_for(backend.issues("demo")),
+        lambda current: current["pr_state"] is not None,
+    )
 
     assert (card["pr"], card["pr_state"]) == (12, "open")
     assert card["pr_review_state"] == "mergeable"
 
 
 def test_v2_cards_report_no_merge_readiness_when_github_withholds_it(monkeypatch):
-    card = card_for(v2_backend(monkeypatch).issues("demo"))
+    backend = v2_backend(monkeypatch)
+    card = eventually(
+        lambda: card_for(backend.issues("demo")),
+        lambda current: current["pr_state"] is not None,
+    )
 
     assert card["pr_state"] == "open" and card["pr_review_state"] is None
 
@@ -2627,8 +2670,17 @@ def test_issue_detail_matches_both_durable_review_breaker_sources(
 
     monkeypatch.setattr(service, "SQLiteControlStore", Control)
 
-    detail = backend.issue("demo", 7)
+    first = backend.issue("demo", 7)
+    assert first is not None
+    assert first["steps"][1]["review"]["unproductive_rounds"] is None
 
+    detail = eventually(
+        lambda: backend.issue("demo", 7),
+        lambda current: (
+            current is not None
+            and current["steps"][1]["review"]["unproductive_rounds"] is not None
+        ),
+    )
     assert detail is not None
     assert detail["steps"][1]["review"]["unproductive_rounds"] == 12
     assert owners == ["o/r:review:621811f2e56e1555"]

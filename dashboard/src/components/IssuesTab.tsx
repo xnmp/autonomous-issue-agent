@@ -54,7 +54,7 @@ import { shortModel } from "../lib/models";
 import { readFlag, writeFlag } from "../lib/prefs";
 import { Chip } from "./ui/Chip";
 import { EtaProgress } from "./ui/Charts";
-import { StepBadge, StepBadgeRow } from "./ui/StepBadge";
+import { StepBadge } from "./ui/StepBadge";
 import { LifecycleStepper } from "./ui/LifecycleStepper";
 import { TableFilter } from "./ui/TableFilter";
 import { ColumnMenu, type ColumnChoice } from "./ui/ColumnMenu";
@@ -101,7 +101,7 @@ const TASK_HISTORY_COLUMN_CHOICES: ColumnChoice[] = [
 ];
 const COLUMN_CHOICES: Record<IssuesSub, ColumnChoice[]> = {
   inflight: [
-    { key: "tasks", label: "Tasks" },
+    { key: "lifecycle", label: "Lifecycle" },
     { key: "cost", label: "Cost" },
     { key: "elapsed", label: "Duration" },
     { key: "progress", label: "Progress" },
@@ -122,6 +122,7 @@ const COLUMN_CHOICES: Record<IssuesSub, ColumnChoice[]> = {
     { key: "merged", label: "Date" },
   ],
   backlog: [
+    { key: "steward", label: "Steward state" },
     { key: "type", label: "Type" },
     { key: "difficulty", label: "Difficulty" },
     { key: "impact", label: "Impact" },
@@ -459,7 +460,7 @@ function InFlightTable({
   const sortableAndShown = useMemo(() => new Set(["issue", ...visible]), [visible]);
   const sorted = useSortedRows(cards, {
     issue: (card) => card.issue,
-    tasks: (card) => card.steps.length,
+    lifecycle: (card) => card.steps.length,
     cost: (card) => card.cost_usd,
     elapsed: (card) => card.elapsed_s,
     progress: (card) => (
@@ -474,11 +475,13 @@ function InFlightTable({
   if (cards.length === 0) return <EmptyState>no issues in flight — the fixer is idle</EmptyState>;
   const columns: TableColumn[] = [
     { key: "issue", label: "Issue / PR", width: 360 },
-    ...(visible.has("tasks") ? [{ key: "tasks", label: "Tasks", width: 190 }] : []),
-    ...(visible.has("cost") ? [{ key: "cost", label: "Cost", className: "r", width: 120 }] : []),
-    ...(visible.has("elapsed") ? [{ key: "elapsed", label: "Duration", className: "r", width: 150 }] : []),
-    ...(visible.has("progress") ? [{ key: "progress", label: "Progress", width: 150 }] : []),
-    ...(visible.has("model") ? [{ key: "model", label: "Model", width: 180 }] : []),
+    ...(visible.has("lifecycle")
+      ? [{ key: "lifecycle", label: "Lifecycle", width: 280, minWidth: 240 }]
+      : []),
+    ...(visible.has("cost") ? [{ key: "cost", label: "Cost", className: "r", width: 105, minWidth: 88 }] : []),
+    ...(visible.has("elapsed") ? [{ key: "elapsed", label: "Duration", className: "r", width: 135 }] : []),
+    ...(visible.has("progress") ? [{ key: "progress", label: "Progress", width: 135 }] : []),
+    ...(visible.has("model") ? [{ key: "model", label: "Model", width: 135 }] : []),
   ];
 
   return (
@@ -525,7 +528,9 @@ function InFlightTable({
                   onKeyDown={(event) => toggleRowFromKeyboard(event, () => setExpanded(open ? null : card.issue))}
                 >
                   <td><IssueSummary card={card} open={open} /></td>
-                  {visible.has("tasks") ? <td><StepBadgeRow steps={card.steps} /></td> : null}
+                  {visible.has("lifecycle") ? (
+                    <td className="lifecycle-column"><IssueLifecycle card={card} /></td>
+                  ) : null}
                   {visible.has("cost") ? (
                     <td
                       className={`r mono nowrap cost-cell${overBudget(card) ? " cost-over" : ""}`}
@@ -931,6 +936,7 @@ function BacklogTable({
   const sortableAndShown = useMemo(() => new Set(["issue", ...visible]), [visible]);
   const sorted = useSortedRows(cards, {
     issue: (card) => card.issue,
+    steward: (card) => stewardProcessed(card),
     type: (card) => card.issue_type,
     difficulty: (card) => card.difficulty,
     impact: (card) => card.impact,
@@ -945,6 +951,9 @@ function BacklogTable({
   }
   const columns: TableColumn[] = [
     { key: "issue", label: "Issue", width: 350 },
+    ...(visible.has("steward")
+      ? [{ key: "steward", label: "Steward state", width: 180 }]
+      : []),
     ...(visible.has("type") ? [{ key: "type", label: "Type", width: 100 }] : []),
     ...(visible.has("difficulty") ? [{ key: "difficulty", label: "Difficulty", width: 120 }] : []),
     ...(visible.has("impact") ? [{ key: "impact", label: "Impact", width: 100 }] : []),
@@ -984,10 +993,11 @@ function BacklogTable({
           <tbody>
             {sorted.rows.map((card) => {
               const open = expanded === card.issue;
+              const processed = stewardProcessed(card);
               return (
                 <Fragment key={card.issue}>
                   <tr
-                    className={`clickable${open ? " expanded" : ""}`}
+                    className={`clickable backlog-${processed ? "processed" : "raw"}${open ? " expanded" : ""}`}
                     tabIndex={0}
                     aria-expanded={open}
                     onClick={() => setExpanded(open ? null : card.issue)}
@@ -1021,6 +1031,18 @@ function BacklogTable({
                         </div>
                       </div>
                     </td>
+                    {visible.has("steward") ? (
+                      <td>
+                        <div className="steward-state">
+                          <Chip tone={processed ? "meta" : "neutral"} square>
+                            {processed ? "triaged" : "raw intake"}
+                          </Chip>
+                          <span className={processed ? "steward-ready" : "faint"}>
+                            {processed ? "AC + test plan written" : "awaiting steward"}
+                          </span>
+                        </div>
+                      </td>
+                    ) : null}
                     {visible.has("type") ? (
                       <td><TriageValue value={card.issue_type} tone={issueTypeTone(card.issue_type)} axis="type" /></td>
                     ) : null}
@@ -1403,13 +1425,6 @@ function overBudget(card: IssueCard): boolean {
 function IssueSummary({ card, open }: { card: IssueCard; open: boolean }) {
   const secondaryFlags = card.flags.filter((flag) => flag !== card.human_action);
   const status = humanStatus(card);
-  const attention = card.human_action === "awaiting-reply"
-    ? "blocked"
-    : card.human_action === "escalated"
-        || card.stage === "blocked"
-        || card.stage === "escalated"
-      ? "escalated"
-      : null;
   return (
     <div className="issue-cell">
       <div className="issue-summary">
@@ -1442,17 +1457,32 @@ function IssueSummary({ card, open }: { card: IssueCard; open: boolean }) {
           </div>
         </div>
       </div>
-      <LifecycleStepper
-        compact
-        steps={card.steps}
-        stage={card.stage}
-        done={card.done}
-        hasPullRequest={card.pr !== null}
-        attention={attention}
-        label={`Issue #${card.issue} lifecycle`}
-      />
     </div>
   );
+}
+
+function IssueLifecycle({ card }: { card: IssueCard }) {
+  const attention = card.human_action === "awaiting-reply"
+    ? "blocked"
+    : card.human_action === "escalated"
+        || card.stage === "blocked"
+        || card.stage === "escalated"
+      ? "escalated"
+      : null;
+  return (
+    <LifecycleStepper
+      compact
+      steps={card.steps}
+      stage={card.stage}
+      hasPullRequest={card.pr !== null}
+      attention={attention}
+      label={`Issue #${card.issue} lifecycle`}
+    />
+  );
+}
+
+function stewardProcessed(card: BacklogCard): boolean {
+  return card.labels.some((label) => label.toLowerCase() === "ai-triage");
 }
 
 /**

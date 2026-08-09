@@ -2159,7 +2159,6 @@ ATTENTION_ORDER = (
     "blocked",
     "escalated",
     "needs-budget-review",
-    "spend-blocked",
     "held",
 )
 
@@ -2183,8 +2182,9 @@ def _attention_reasons(row: dash.IssueRow) -> list[tuple[str, str | None]]:
         reasons.append(("escalated", _escalation_reason(row)))
     if "needs-budget-review" in labels:
         reasons.append(("needs-budget-review", None))
-    if row.spend_blocks:
-        reasons.append(("spend-blocked", f"{row.spend_blocks} spend block(s)"))
+    # ``row.spend_blocks`` is a lifetime counter. The latest folded
+    # ``needs-budget-review`` label above is the current budget hold; using the
+    # counter here kept resolved incidents in Needs attention forever.
     held, hold_reason = hold_state(row, labels)
     if held:
         reasons.append(("held", hold_reason))

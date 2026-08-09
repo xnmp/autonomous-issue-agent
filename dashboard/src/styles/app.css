@@ -241,6 +241,9 @@
   left: var(--s2);
   right: auto;
 }
+.sidebar-float + .main .mainbar {
+  padding-left: 52px;
+}
 .sidebar-toggle {
   position: absolute;
   z-index: 6;
@@ -830,98 +833,6 @@
   overflow: auto;
   overscroll-behavior: contain;
 }
-.overview-live-work {
-  overflow: hidden;
-  border-color: var(--border-emphasis);
-  background: var(--surface-sunken);
-  box-shadow: var(--shadow-md);
-}
-.overview-live-work .panel-hd {
-  background: var(--panel);
-}
-.overview-live-work .panel-title {
-  color: var(--accent);
-}
-.overview-live-list {
-  display: flex;
-  flex-direction: column;
-}
-.overview-live-row {
-  display: grid;
-  grid-template-columns: minmax(210px, 0.8fr) minmax(520px, 2.4fr) minmax(82px, 0.35fr);
-  align-items: center;
-  min-width: 0;
-  padding: var(--space-4) var(--space-5);
-  background: var(--panel);
-  border-left: 2px solid var(--accent);
-}
-.overview-live-row + .overview-live-row {
-  border-top: 1px solid var(--border);
-}
-.overview-live-summary {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-4);
-  min-width: 0;
-}
-.overview-live-title,
-.overview-live-title button {
-  min-width: 0;
-  color: var(--ink);
-  font-size: var(--text-lg);
-  font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-tight);
-}
-.overview-live-title button {
-  display: flex;
-  gap: var(--space-3);
-  text-align: left;
-}
-.overview-live-title button:hover {
-  color: var(--accent-br);
-}
-.overview-live-title button span:last-child {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.overview-live-title .mono {
-  color: var(--accent);
-}
-.overview-live-meta {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3);
-}
-.overview-live-row .lifecycle {
-  padding: var(--space-6) 0 var(--space-7);
-}
-.overview-live-row .life-node-ring {
-  width: 30px;
-  height: 30px;
-}
-.overview-live-row .life-stage:not(:first-child)::before {
-  top: 15px;
-}
-.overview-live-row .life-label {
-  font-size: var(--text-2xs);
-}
-.overview-live-row .life-state-label {
-  display: none;
-}
-.overview-live-measure {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: var(--space-2);
-  padding-left: var(--space-5);
-  border-left: 1px solid var(--border);
-  font-size: var(--text-xs);
-}
-.overview-live-measure strong {
-  color: var(--ink);
-  font-size: var(--text-lg);
-}
 .panel-table-tools {
   padding: var(--s2) var(--s3) 0;
 }
@@ -1197,9 +1108,6 @@
 }
 
 @media (max-width: 1080px) {
-  .overview-live-row {
-    grid-template-columns: minmax(180px, 0.8fr) minmax(380px, 2fr) 80px;
-  }
   .overview-metrics-primary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -1224,13 +1132,6 @@
   }
   .attention-panel-active .panel-bd {
     grid-template-columns: 1fr;
-  }
-  .overview-live-row {
-    grid-template-columns: 1fr;
-    gap: var(--space-4);
-  }
-  .overview-live-measure {
-    display: none;
   }
 }
 
@@ -1402,10 +1303,8 @@
 }
 .resizable-table {
   table-layout: fixed;
-  /* Preferred column widths, but never a scrollbar the content didn't earn:
-     when the summed widths exceed the container, the fixed layout compresses
-     columns proportionally and cell text truncates instead of scrolling
-     (done tab, 2026-08-03: a permanent scrollbar at every window size). */
+  /* The table always reaches the panel edge, while an over-wide configuration
+     still compresses to the panel instead of clipping its final column. */
   max-width: 100%;
 }
 .resizable-table th {
@@ -1543,6 +1442,9 @@
 .issue-list-table th[data-column-key="issue"] {
   min-width: 360px;
 }
+.issue-list-table td.lifecycle-column {
+  background: var(--surface-sunken);
+}
 .issue-cell {
   display: flex;
   flex-direction: column;
@@ -1591,6 +1493,7 @@
 }
 .life-stage {
   --life-color: var(--ink-faint);
+  --life-glow: color-mix(in srgb, var(--ink-faint) 12%, transparent);
   position: relative;
   flex: 1 1 0;
   min-width: 54px;
@@ -1620,6 +1523,29 @@
 }
 .life-blocked {
   --life-color: var(--running);
+}
+.life-tone-ok {
+  --life-color: var(--ok);
+  --life-glow: color-mix(in srgb, var(--ok) 14%, transparent);
+}
+.life-tone-running {
+  --life-color: var(--running);
+  --life-glow: color-mix(in srgb, var(--running) 14%, transparent);
+}
+.life-tone-fail {
+  --life-color: var(--fail);
+  --life-glow: color-mix(in srgb, var(--fail) 14%, transparent);
+}
+.life-tone-meta {
+  --life-color: var(--meta);
+  --life-glow: color-mix(in srgb, var(--meta) 14%, transparent);
+}
+.life-tone-info {
+  --life-color: var(--info);
+  --life-glow: color-mix(in srgb, var(--info) 14%, transparent);
+}
+.life-tone-neutral {
+  --life-color: var(--ink-faint);
 }
 .life-node {
   position: relative;
@@ -1668,6 +1594,31 @@
   border-color: var(--running);
   background: color-mix(in srgb, var(--running) 12%, var(--surface-sunken));
   color: var(--running-br);
+}
+.life-tone-ok .life-node-ring {
+  border-color: var(--ok);
+  background: var(--ok);
+  color: var(--c-fg);
+}
+.life-tone-running .life-node-ring {
+  border-color: var(--running);
+  background: color-mix(in srgb, var(--running) 12%, var(--surface-sunken));
+  color: var(--running-br);
+}
+.life-tone-fail .life-node-ring {
+  border-color: var(--fail);
+  background: color-mix(in srgb, var(--fail) 12%, var(--surface-sunken));
+  color: var(--fail-br);
+}
+.life-tone-meta .life-node-ring {
+  border-color: var(--meta);
+  background: color-mix(in srgb, var(--meta) 12%, var(--surface-sunken));
+  color: var(--meta-br);
+}
+.life-tone-info .life-node-ring {
+  border-color: var(--info);
+  background: color-mix(in srgb, var(--info) 12%, var(--surface-sunken));
+  color: var(--info-br);
 }
 .life-node-ring svg {
   width: 17px;
@@ -1767,14 +1718,17 @@
   font-size: 9px;
 }
 .life-compact-label {
+  display: block;
+  max-width: 64px;
   color: var(--ink-faint);
   font-size: 9px;
   font-weight: var(--weight-medium);
   line-height: 1;
+  overflow-wrap: anywhere;
 }
 @keyframes lifecycle-active {
-  0%, 100% { box-shadow: 0 0 0 3px var(--accent-soft); }
-  50% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent) 7%, transparent); }
+  0%, 100% { box-shadow: 0 0 0 3px var(--life-glow); }
+  50% { box-shadow: 0 0 0 5px var(--life-glow); }
 }
 @media (prefers-reduced-motion: reduce) {
   .life-active .life-node-ring {
@@ -1794,9 +1748,27 @@
 }
 .issue-attention-text {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.steward-state {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+  line-height: var(--leading-tight);
+}
+.steward-ready {
+  color: var(--meta-br);
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-medium);
+}
+.tbl tbody tr.backlog-processed {
+  box-shadow: inset 1px 0 0 var(--meta);
+  background: color-mix(in srgb, var(--meta) 5%, transparent);
+}
+.tbl tbody tr.backlog-raw .issue-summary-title {
+  color: var(--ink-muted);
 }
 .human-action {
   font-size: var(--text-xs);
@@ -1993,9 +1965,6 @@
 .step-context-separator {
   margin-right: var(--s1);
   color: var(--ink-faint);
-}
-.step-summary-note {
-  margin: 0;
 }
 .step-summary-exit {
   margin: 0;

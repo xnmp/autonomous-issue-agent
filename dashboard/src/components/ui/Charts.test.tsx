@@ -19,6 +19,10 @@ describe("Histogram", () => {
     expect(screen.getByTitle("Aug 02, 09:00 · $1.00")).toBeInTheDocument();
     expect(screen.getByTitle("Aug 02, 10:00 · $0.00")).toBeInTheDocument();
     expect(screen.getByTitle("Aug 02, 11:00 · $4.00")).toBeInTheDocument();
+    expect(screen.getByTitle("Aug 02, 11:00 · $4.00")).toHaveAttribute(
+      "data-tip",
+      "Aug 02, 11:00 · $4.00 spent",
+    );
   });
 
   it("scales bars against the peak, not against the total", () => {

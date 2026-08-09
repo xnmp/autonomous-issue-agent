@@ -48,11 +48,11 @@ describe("LifecycleStepper", () => {
     ]);
   });
 
-  it("surfaces repeated review and CI attempts as circle-back counts", () => {
+  it("surfaces retry counts for every task family", () => {
     render(
       <LifecycleStepper
         steps={[
-          cardStep({ kind: "RESOLVE" }),
+          cardStep({ kind: "RESOLVE", count: 4 }),
           cardStep({ kind: "REVIEW", status: "REQUEST_CHANGES", count: 2 }),
           cardStep({ kind: "FIX_CI", state: "running", status: null, count: 3 }),
         ]}
@@ -61,6 +61,7 @@ describe("LifecycleStepper", () => {
       />,
     );
 
+    expect(screen.getByLabelText("4 attempts")).toHaveTextContent("×4");
     expect(screen.getByLabelText("2 attempts")).toHaveTextContent("×2");
     expect(screen.getByLabelText("3 attempts")).toHaveTextContent("×3");
   });
@@ -89,23 +90,69 @@ describe("LifecycleStepper", () => {
 
     const review = screen.getByRole("button", { name: /^Review/ });
     expect(review).toHaveAttribute("data-tip", expect.stringContaining("model gpt-5.6-terra"));
+    expect(review).toHaveAttribute(
+      "data-tip",
+      expect.stringContaining("tasks REVIEW · ok · REQUEST_CHANGES → RE_REVIEW · ok · APPROVE"),
+    );
     expect(review).toHaveAttribute("data-tip", expect.stringContaining("verdict REQUEST_CHANGES → APPROVE"));
     expect(review).toHaveAttribute("data-tip", expect.stringContaining("duration 2:46"));
     expect(review).toHaveAttribute("data-tip", expect.stringContaining("cost $0.73"));
+  });
+
+  it("uses the same outcome tones and glyphs as task chips", () => {
+    render(
+      <LifecycleStepper
+        compact
+        steps={[
+          cardStep({ kind: "REVIEW", status: "REQUEST_CHANGES" }),
+          cardStep({ kind: "unblock", state: "done", status: null }),
+        ]}
+      />,
+    );
+
+    const review = screen.getByLabelText(/REVIEW · ok · REQUEST_CHANGES/).closest("li");
+    const operator = screen.getByLabelText(/^unblock · done/).closest("li");
+    expect(review).toHaveClass("life-tone-running");
+    expect(review?.querySelector(".status-mark")).toHaveAttribute("data-status-glyph", "±");
+    expect(operator).toHaveClass("life-tone-meta");
+  });
+
+  it("bounds long compact histories without dropping their earlier details", () => {
+    render(
+      <LifecycleStepper
+        compact
+        steps={Array.from({ length: 8 }, (_, index) => cardStep({
+          kind: index % 2 === 0 ? "RESOLVE" : "REVIEW",
+          status: index % 2 === 0 ? "done" : "APPROVE",
+        }))}
+      />,
+    );
+
+    expect(screen.getByText("+3")).toBeVisible();
+    const earlier = document.querySelector(".life-elided .life-node");
+    expect(earlier).toHaveAttribute("data-tip", expect.stringContaining("RESOLVE · ok · done"));
+    expect(earlier).toHaveAttribute("data-tip", expect.stringContaining("REVIEW · ok · APPROVE"));
+    expect(document.querySelectorAll(".lifecycle-task-compact .life-stage")).toHaveLength(6);
   });
 
   it("distinguishes waiting-on-human from failure without relying on color", () => {
     render(
       <LifecycleStepper
         compact
-        steps={[cardStep({ kind: "RESOLVE" }), cardStep({ kind: "REVIEW" })]}
+        steps={[
+          cardStep({ kind: "RESOLVE" }),
+          cardStep({ kind: "REVIEW", state: "blocked", status: "blocked" }),
+        ]}
         stage="awaiting human reply"
         attention="blocked"
         hasPullRequest
       />,
     );
 
-    expect(screen.getByLabelText(/Review · blocked/).closest("li")).toHaveClass("life-blocked");
+    expect(screen.getByLabelText(/REVIEW · blocked/).closest("li")).toHaveClass(
+      "life-blocked",
+      "life-tone-fail",
+    );
   });
 
   it("selects the latest detailed task when a full node is clicked", async () => {

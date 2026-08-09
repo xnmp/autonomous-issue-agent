@@ -223,6 +223,7 @@ export function Histogram({
             key={bar.key}
             className="hist-col"
             title={`${bar.label} · ${formatValue(bar.value)}`}
+            {...tipProps(`${bar.label} · ${formatValue(bar.value)} spent`)}
           >
             {bar.value > 0 ? (
               <div
