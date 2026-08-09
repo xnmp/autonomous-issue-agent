@@ -1,52 +1,60 @@
 /*
- * Design tokens — wezterm "Cosmic Dusk", defined exactly once.
- *
- * Nothing else in the app may hardcode a hex value. Two layers:
- *   1. --c-*  raw palette (the terminal theme, verbatim)
- *   2. semantic aliases (--ok, --running, --fail, --info, --meta, --link)
- * Components consume ONLY layer 2 plus the surface/ink tokens, so the semantic
- * mapping (green=ok, yellow=running, red=failed, blue=info, magenta=meta/self,
- * cyan=links/models) is enforced structurally rather than by convention.
+ * Dashboard design tokens. This is the only color and scale authority.
+ * Themes replace the raw palette; components consume semantic surface, ink,
+ * state, spacing, radius, shadow, motion, and type tokens below it.
  */
 :root {
   color-scheme: dark;
 
   /* ---- raw palette ---- */
-  --c-bg: #0e1330;
-  --c-panel: #141a3d;
-  --c-elevated: #1a2148;
-  --c-fg: #d8dce8;
-  --c-muted: #8a91b4;
-  --c-selection: #2a3060;
+  --c-bg: #080b12;
+  --c-panel: #0f1622;
+  --c-elevated: #151f2e;
+  --c-fg: #edf1f7;
+  --c-muted: #9aa6b6;
+  --c-selection: #253052;
 
-  --c-red: #d4607a;
-  --c-green: #69db7c;
-  --c-yellow: #fbbf24;
-  --c-blue: #6a7acc;
-  --c-magenta: #b09ac0;
-  --c-cyan: #7aadcc;
+  --c-red: #f06475;
+  --c-green: #4fca9a;
+  --c-yellow: #e9b35a;
+  --c-blue: #7382f4;
+  --c-magenta: #aa82dc;
+  --c-cyan: #6fbee8;
 
-  --c-red-br: #e87898;
-  --c-green-br: #7eeea0;
-  --c-yellow-br: #ffd43b;
-  --c-blue-br: #7a8ae0;
-  --c-magenta-br: #c4b0d8;
-  --c-cyan-br: #8ac0e0;
+  --c-red-br: #ff7d8d;
+  --c-green-br: #69ddb0;
+  --c-yellow-br: #f6c773;
+  --c-blue-br: #8c98ff;
+  --c-magenta-br: #c09aef;
+  --c-cyan-br: #8bd0f4;
 
   /* ---- surfaces & ink ---- */
   --bg: var(--c-bg);
+  --surface-sidebar: color-mix(in srgb, var(--c-panel) 72%, var(--c-bg));
   --panel: var(--c-panel);
   --elevated: var(--c-elevated);
+  --surface-overlay: color-mix(in srgb, var(--c-elevated) 88%, var(--c-fg));
+  --surface-sunken: color-mix(in srgb, var(--c-bg) 76%, var(--c-panel));
   --ink: var(--c-fg);
   --ink-muted: var(--c-muted);
-  --ink-faint: color-mix(in srgb, var(--c-muted) 82%, var(--c-bg));
+  --ink-faint: color-mix(in srgb, var(--c-muted) 72%, var(--c-bg));
   --selection: var(--c-selection);
 
-  --border: rgba(216, 220, 232, 0.08);
-  --border-strong: rgba(216, 220, 232, 0.16);
-  --hover: rgba(216, 220, 232, 0.045);
+  --border: color-mix(in srgb, var(--ink) 8%, transparent);
+  --border-strong: color-mix(in srgb, var(--ink) 15%, transparent);
+  --border-emphasis: color-mix(in srgb, var(--ink) 24%, transparent);
+  --hover: color-mix(in srgb, var(--ink) 4.5%, transparent);
+  --pressed: color-mix(in srgb, var(--ink) 8%, transparent);
+  --scrim: color-mix(in srgb, var(--c-bg) 78%, transparent);
+  --shadow-color: color-mix(in srgb, var(--c-bg) 82%, transparent);
+  --shadow-sm: 0 2px 8px var(--shadow-color);
+  --shadow-md: 0 10px 28px var(--shadow-color);
+  --shadow-lg: 0 18px 48px var(--shadow-color);
 
   /* ---- semantic ---- */
+  --accent: var(--c-blue-br);
+  --accent-soft: color-mix(in srgb, var(--accent) 14%, transparent);
+  --focus-ring: color-mix(in srgb, var(--accent) 48%, transparent);
   --ok: var(--c-green);
   --ok-br: var(--c-green-br);
   --running: var(--c-yellow);
@@ -81,28 +89,60 @@
   --meter-low: var(--c-green);
   --meter-mid: var(--c-yellow);
   --meter-high: var(--c-red);
-  --meter-track: rgba(216, 220, 232, 0.09);
+  --meter-track: color-mix(in srgb, var(--ink) 9%, transparent);
 
-  /* ---- spacing scale (4 / 8 / 12 / 16) ---- */
-  --s1: 4px;
-  --s2: 8px;
-  --s3: 12px;
-  --s4: 16px;
-  --s5: 24px;
+  /* ---- spacing scale ---- */
+  --space-0: 0;
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 6px;
+  --space-4: 8px;
+  --space-5: 12px;
+  --space-6: 16px;
+  --space-7: 20px;
+  --space-8: 24px;
+  --space-9: 32px;
+  --s1: var(--space-2);
+  --s2: var(--space-4);
+  --s3: var(--space-5);
+  --s4: var(--space-6);
+  --s5: var(--space-8);
 
-  --radius: 8px;
-  --radius-sm: 5px;
+  --radius-xs: 4px;
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 12px;
   --radius-pill: 999px;
 
-  --t: 150ms cubic-bezier(0.4, 0, 0.2, 1);
+  --duration-fast: 120ms;
+  --duration-normal: 150ms;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --t: var(--duration-normal) var(--ease-out);
 
   --font-sans:
-    ui-sans-serif, system-ui, -apple-system, "Inter", "Segoe UI", Roboto,
-    sans-serif;
-  --font-mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, monospace;
+    ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica,
+    Arial, sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", "Cascadia Code", Consolas,
+    "Liberation Mono", monospace;
+  --text-2xs: 10px;
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 13px;
+  --text-lg: 15px;
+  --text-xl: 18px;
+  --text-2xl: 24px;
+  --text-3xl: 32px;
   --fs-base: 13px;
   --fs-sm: 12px;
   --fs-xs: 11px;
+  --weight-normal: 400;
+  --weight-medium: 520;
+  --weight-semibold: 620;
+  --weight-bold: 720;
+  --leading-tight: 1.2;
+  --leading-normal: 1.45;
+  --tracking-tight: -0.02em;
+  --tracking-caps: 0.075em;
 }
 
 :root[data-theme="hacker"] {
