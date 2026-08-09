@@ -278,6 +278,22 @@ def test_undeclared_testless_change_denies_and_teaches_the_trailer():
         assert "Gate-Exemption: required-test" in res.reason, branch
 
 
+def test_an_overscoped_declaration_names_its_own_void_and_the_remedy():
+    # tauri #457 (2026-08-09): `*` in one commit plus `instrumentation-only`
+    # in another voided the exemption (cap 1), but the generic denial told the
+    # fixer to add the trailer it already had — it blocked blaming the
+    # harness. A declared-but-void exemption must be self-diagnosing.
+    res = check_required_test(
+        "fix/457-x", ["src/app.py"],
+        declared=(SUBJECT_WHOLE_CHANGE, "instrumentation-only"),
+    )
+    assert not res.ok
+    assert "VOID" in res.reason
+    assert "instrumentation-only" in res.reason
+    assert "exactly one" in res.reason
+    assert "reword" in res.reason
+
+
 def test_a_non_whole_change_subject_does_not_exempt_required_test():
     # required-test is not per-file: only "*" is meaningful. A declaration
     # naming anything else must leave the deny in place.

@@ -352,10 +352,22 @@ def check_required_test(
     scope bound applies here exactly as in `check_tests_immutable` (round-3
     MAJOR 3: without it, `*` plus junk subjects passed the gate and then
     wedged at merge)."""
-    if SUBJECT_WHOLE_CHANGE in declared and check_declaration_scope(
-        RULE_REQUIRED_TEST, declared
-    ):
-        return ALLOW
+    if SUBJECT_WHOLE_CHANGE in declared:
+        if check_declaration_scope(RULE_REQUIRED_TEST, declared):
+            return ALLOW
+        # A declared-but-VOID exemption must say WHY it is void, or the agent
+        # re-reads "add the trailer" it already added and files a harness bug
+        # (tauri #457, 2026-08-09: `*` plus a second subject in another commit
+        # voided the exemption; the generic denial sent the fixer in circles).
+        subjects = ", ".join(sorted(declared))
+        return deny(
+            "required-test exemption declared but VOID: this branch declares "
+            f"{len(set(declared))} subjects for required-test ({subjects}) and "
+            "the rule accepts exactly one, the whole-change '*'. Trailers "
+            "accumulate across ALL commits on the branch — reword or drop the "
+            "commit message(s) declaring the extra subject(s) so exactly one "
+            "'Gate-Exemption: required-test *' remains"
+        )
     files = list(changed)
     if branch.startswith("feat/"):
         if not any(FEAT_TEST_RE.search(f) for f in files):

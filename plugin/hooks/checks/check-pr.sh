@@ -174,6 +174,11 @@ rt_declared="$(prc_declared_exemption_subjects required-test)"
 rt_count=$(printf '%s\n' "$rt_declared" | grep -c '.' || true)
 if printf '%s\n' "$rt_declared" | grep -qxF '*' && [ "${rt_count:-0}" -le 1 ]; then
   :
+elif printf '%s\n' "$rt_declared" | grep -qxF '*'; then
+  # Declared but VOID (over-scope): name the actual failure, or the agent
+  # re-reads "add the trailer" it already added and files a harness bug
+  # (tauri #457; twin of gate.check_required_test's VOID branch).
+  fail "required-test exemption declared but VOID: this branch declares ${rt_count} subjects for required-test ($(printf '%s' "$rt_declared" | tr '\n' ',' | sed 's/,$//; s/,/, /g')) and the rule accepts exactly one, the whole-change '*'. Trailers accumulate across ALL commits on the branch — reword or drop the commit message(s) declaring the extra subject(s) so exactly one 'Gate-Exemption: required-test *' remains"
 else
   case "$branch" in
     feat/*)

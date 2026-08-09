@@ -727,12 +727,15 @@ GOLDEN: tuple[Case, ...] = (
     # Scope applies to required-test too (round-3 MAJOR 3): `*` plus a second
     # subject exceeds its cap of 1, and an out-of-scope declaration is no
     # exemption — both stacks must deny rather than pass a change the merge
-    # rule then wedges forever.
+    # rule then wedges forever. Since tauri #457 (2026-08-09) the denial is
+    # self-diagnosing on BOTH stacks: it names the void, the subjects, and
+    # the reword remedy, instead of re-teaching the trailer the branch
+    # already carries.
     Case("required_test_over_scope", "pr",
          _notest_repo("Gate-Exemption: required-test *\n"
                       "Gate-Exemption: required-test src/x.py"),
          _pr_argv(), False, env={"TEST_CMD": "true"},
-         reason_contains="regression test"),
+         reason_contains="declared but VOID"),
     # An out-of-charset subject (`@scope/pkg` — a real path in a JS repo) is
     # not declarable in either parser, so the declaration is absent and the
     # underlying rule denies. Two independent regexes over one charset is

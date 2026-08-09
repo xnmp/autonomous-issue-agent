@@ -759,9 +759,10 @@ rm -rf "$d" "$d.msg"
 d=$(setup_notest_repo "Gate-Exemption: required-test *
 Gate-Exemption: required-test src/x.py")
 out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'regression test'; } \
-  && ok "over-scope required-test declaration does not exempt" \
-  || no "over-scope required-test declaration does not exempt" "rc=$rc out=${out:0:300}"
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'declared but VOID' \
+    && printf '%s' "$out" | grep -q 'src/x.py'; } \
+  && ok "over-scope required-test declaration denies with self-diagnosing VOID" \
+  || no "over-scope required-test declaration denies with self-diagnosing VOID" "rc=$rc out=${out:0:300}"
 rm -rf "$d" "$d.msg"
 
 # (l) the malformed-trailer HINT must see a TAB-indented line too. `\s`/` ` in
