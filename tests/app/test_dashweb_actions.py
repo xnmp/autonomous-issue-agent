@@ -968,6 +968,80 @@ def test_unblock_dismisses_the_change_requests_that_still_arm_the_ceiling(
     assert "re-arm" in dismissals[0][3]
 
 
+def test_dismissing_the_last_live_verdict_resets_the_review_baseline(
+    monkeypatch, tmp_path
+):
+    """Dismissal retracts the fixer's signal, so the re-arm must hand the move
+    back to the reviewer. With `last-sha` still bound to the current head (the
+    re-review copy shortcut does exactly that) nothing would ever dispatch
+    again — tauri #634 (2026-08-09) sat labeled-open until hand surgery."""
+    backend, dirs, _calls = _unblock_backend(
+        monkeypatch, tmp_path, reviews=_at_ceiling("3")
+    )
+    (dirs["review"] / "pr-12.last-sha").write_text("current-head-sha")
+
+    assert backend.unblock("demo", 7) == (True, "ok")
+
+    assert (dirs["review"] / "pr-12.last-sha").read_text() == "", \
+        "the baseline must read 'unreviewed' so a fresh round dispatches"
+
+
+def test_unblock_of_already_dismissed_verdicts_resets_the_baseline(
+    monkeypatch, tmp_path
+):
+    """The two-step wedge: a PREVIOUS unblock dismissed everything, so this one
+    finds no change request to retract — but the PR is still held and the
+    baseline still pins the head. The re-arm must reset it, not shrug."""
+    backend, dirs, calls = _unblock_backend(
+        monkeypatch,
+        tmp_path,
+        reviews=(
+            _rejection("1", state="DISMISSED"),
+            _rejection("2", state="DISMISSED"),
+        ),
+    )
+    (dirs["review"] / "pr-12.last-sha").write_text("current-head-sha")
+
+    assert backend.unblock("demo", 7) == (True, "ok")
+
+    assert [c for c in calls if c[0] == "dismiss"] == []
+    assert (dirs["review"] / "pr-12.last-sha").read_text() == ""
+
+
+def test_a_live_trailing_approval_keeps_the_review_baseline(
+    monkeypatch, tmp_path
+):
+    """A standing APPROVE is the merge path's to consume — resetting the
+    baseline under it would buy a redundant paid review round."""
+    backend, dirs, _calls = _unblock_backend(
+        monkeypatch,
+        tmp_path,
+        issue_labels=(),
+        pr_labels=("needs-budget-review",),
+        reviews=(
+            _rejection("1"),
+            _rejection("2"),
+            _rejection("3"),
+            _rejection("4", state="APPROVED"),
+        ),
+    )
+    (dirs["review"] / "pr-12.last-sha").write_text("current-head-sha")
+
+    assert backend.unblock("demo", 7) == (True, "ok")
+
+    assert (dirs["review"] / "pr-12.last-sha").read_text() == "current-head-sha"
+
+
+def test_a_pr_the_bot_never_reviewed_gets_no_baseline_file(
+    monkeypatch, tmp_path
+):
+    backend, dirs, _calls = _unblock_backend(monkeypatch, tmp_path, reviews=())
+
+    assert backend.unblock("demo", 7) == (True, "ok")
+
+    assert not (dirs["review"] / "pr-12.last-sha").exists()
+
+
 def test_unblock_rearms_a_held_pr_despite_a_trailing_approval(
     monkeypatch, tmp_path
 ):
@@ -1162,12 +1236,14 @@ def test_each_dismissal_is_journalled_against_the_issue_and_the_pr(
 
     backend.unblock("demo", 7)
 
-    _one, _two, dismissal, unblock = _journalled(dirs)
+    _one, _two, dismissal, baseline, unblock = _journalled(dirs)
     assert dismissal.kind == "operator_dismiss_review"
     assert dismissal.target == "pr" and dismissal.number == 12
     assert dismissal.attributes["review_id"] == "3"
     assert dismissal.attributes["dismissed"] is True
     assert dismissal.attributes["operator"] == "o/r:dashboard"
+    assert baseline.kind == "operator_rearm_baseline"
+    assert baseline.target == "pr" and baseline.number == 12
     assert unblock.kind == "operator_unblock"
 
 

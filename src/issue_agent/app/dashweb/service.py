@@ -1125,10 +1125,34 @@ class Backend:
                 continue
             # A PR carrying no change request at all has no ceiling to re-arm:
             # say nothing rather than journal a "could not dismiss" line on
-            # every unblock of a perfectly healthy issue.
+            # every unblock of a perfectly healthy issue. But if the review bot
+            # HAS reviewed and every one of its verdicts is retracted — the
+            # state a previous unblock's dismissals leave behind — the re-arm
+            # must also reset the review baseline: the copy shortcut may have
+            # bound `last-sha` to the current head, so with no live verdict and
+            # no head movement neither daemon has any signal left and the PR is
+            # stranded in a labeled-open dead state (tauri #634, 2026-08-09).
+            bot_live = [
+                r
+                for r in reviews
+                if review_bot
+                and r.author == review_bot
+                and r.state
+                in (
+                    review_dom.REVIEW_CHANGES_REQUESTED,
+                    review_dom.REVIEW_APPROVED,
+                )
+            ]
+            bot_reviewed = review_bot and any(
+                r.author == review_bot for r in reviews
+            )
             if not any(
                 r.state == review_dom.REVIEW_CHANGES_REQUESTED for r in reviews
             ):
+                if bot_reviewed and not bot_live:
+                    failures.extend(
+                        self._reset_review_baseline(name, repo, number, pr)
+                    )
                 continue
             if not review_bot:
                 note = (
@@ -1151,9 +1175,12 @@ class Backend:
             # and the feedback must survive.
             if len(counted) + 1 < ceiling:
                 continue
+            dismissed_ids: set[str] = set()
             for review in counted:
                 ok, detail = effects.dismiss_review(pr, review, message)
-                if not ok:
+                if ok:
+                    dismissed_ids.add(review.review_id)
+                else:
                     failures.append(
                         f"pr #{pr} review {review.review_id} not dismissed: "
                         f"{detail}"
@@ -1161,7 +1188,77 @@ class Backend:
                 self._journal_dismissal(
                     name, repo, number, pr, review, ok, detail
                 )
+            # If the dismissals just retracted the bot's LAST live verdict, the
+            # fixer has nothing to address and the reviewer thinks this head is
+            # already reviewed — reset the baseline so a fresh round dispatches
+            # (same dead state as above, reached in one unblock instead of two).
+            if dismissed_ids and not any(
+                r.review_id not in dismissed_ids for r in bot_live
+            ):
+                failures.extend(
+                    self._reset_review_baseline(name, repo, number, pr)
+                )
         return failures
+
+    def _reset_review_baseline(
+        self, name: str, repo: str, number: int, pr: int
+    ) -> list[str]:
+        """Clear the review role's `last-sha` for `pr` so `needs_re_review`
+        reads the current head as unreviewed and dispatches a fresh round.
+
+        Part of the unblock re-arm contract: dismissing the standing verdict
+        removes the fixer's signal, so the re-arm must hand the move back to
+        the reviewer. Without this, a verdict already bound to the current head
+        (e.g. by the re-review copy shortcut) left `last-sha == head` after the
+        dismissal and NOTHING could ever fire again — tauri #634 (2026-08-09)
+        sat labeled-open with operator guidance parked until hand surgery.
+
+        Returns operator-facing notes on failure; an empty list means the
+        baseline is cleared (or there was no state dir to clear it in, which is
+        itself a failure worth surfacing)."""
+        state_dir = self._review_state_dir(name)
+        if not state_dir:
+            note = (
+                f"pr #{pr}: review state dir unresolvable — baseline not "
+                "reset, a fresh review round may not dispatch"
+            )
+            self._journal_rearm_failure(name, repo, number, pr, note)
+            return [note]
+        try:
+            Store(state_dir).set_last_sha(pr, "")
+        except Exception as exc:  # noqa: BLE001 - reported, never raised
+            note = (
+                f"pr #{pr}: review baseline not reset "
+                f"({type(exc).__name__}: {exc}) — a fresh review round may "
+                "not dispatch"
+            )
+            self._journal_rearm_failure(name, repo, number, pr, note)
+            return [note]
+        journal = self._operator_journal(name, repo)
+        if journal is not None:
+            try:
+                journal.emit(
+                    TelemetryEvent(
+                        ActionApplied(
+                            f"operator-rearm-baseline:{uuid.uuid4().hex}",
+                            "operator_rearm_baseline",
+                            "pr",
+                            f"operator re-arm pr #{pr}: review baseline "
+                            "reset — no live reviewer verdict remains, next "
+                            "poll dispatches a fresh review round",
+                            pr,
+                            {
+                                "add": [],
+                                "remove": [],
+                                "operator": f"{repo}:dashboard",
+                            },
+                        ),
+                        Correlation(issue=number, pr=pr),
+                    )
+                )
+            except Exception:  # noqa: BLE001 - telemetry never fails the action
+                pass
+        return []
 
     def _closed_prs(self, repo: str) -> frozenset[int]:
         """PRs GitHub says are NOT open. An absent or unreadable state is
@@ -1500,14 +1597,7 @@ class Backend:
         """
         if guidance is None or not prs:
             return "", (), []
-        state_dir = next(
-            (
-                os.path.dirname(path)
-                for role, path in zip(dash.ROLE_NAMES, cli.journal_paths(name))
-                if role == "review"
-            ),
-            "",
-        )
+        state_dir = self._review_state_dir(name)
         if not state_dir:
             return "", (), ["review state dir unresolvable: guidance not stored"]
         store = Store(state_dir)
@@ -1530,6 +1620,18 @@ class Backend:
         if not touched:
             return "", (), failures
         return action, tuple(touched), failures
+
+    def _review_state_dir(self, name: str) -> str:
+        """The review role's state dir — where operator guidance and the
+        re-review baseline live. Empty string when unresolvable."""
+        return next(
+            (
+                os.path.dirname(path)
+                for role, path in zip(dash.ROLE_NAMES, cli.journal_paths(name))
+                if role == "review"
+            ),
+            "",
+        )
 
     def _clear_retry_counters(self, name: str, number: int) -> int:
         """Reset the per-attempt ceilings in every role's state dir.
