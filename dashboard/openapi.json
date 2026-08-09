@@ -1265,6 +1265,22 @@
             "title": "Leg Running",
             "type": "boolean"
           },
+          "pr_ci_state": {
+            "anyOf": [
+              {
+                "enum": [
+                  "passing",
+                  "failing",
+                  "pending"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr Ci State"
+          },
           "prs": {
             "items": {
               "type": "integer"

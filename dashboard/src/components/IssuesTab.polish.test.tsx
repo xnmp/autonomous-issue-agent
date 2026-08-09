@@ -93,7 +93,7 @@ describe("merge readiness on the PR chip", () => {
     board("done", { done: [{ ...done, pr_review_state: null }] });
 
     expect(screen.queryByRole("img", { name: /merge|changes/ })).not.toBeInTheDocument();
-    expect(screen.getByText("PR #75")).toBeVisible();
+    expect(screen.getByText(/PR #75/)).toBeVisible();
   });
 });
 
@@ -288,6 +288,23 @@ describe("blocked section", () => {
     expect(rowsUnder(container, "In flight")).not.toContain("Needs a human decision");
   });
 
+  it.each(["needs-human-review", "ai-blocked"])(
+    "highlights a live %s label even before human-action enrichment catches up",
+    (label) => {
+      const held = {
+        ...working,
+        issue: 63,
+        title: `Held by ${label}`,
+        labels: [label],
+      };
+      const { container } = board("inflight", { in_flight: [held] });
+
+      expect(rowsUnder(container, "Blocked")).toContain(`Held by ${label}`);
+      expect(screen.getByRole("row", { name: new RegExp(`Held by ${label}`) }))
+        .toHaveClass("row-alert");
+    },
+  );
+
   it("leads the board with what a person has to act on", () => {
     const { container } = board("inflight", { in_flight: [working, escalated] });
 
@@ -310,6 +327,13 @@ describe("blocked section", () => {
 
     expect(screen.queryByText("Blocked")).not.toBeInTheDocument();
     expect(rowsUnder(container, "In flight")).toContain("Still being worked");
+  });
+
+  it("omits the redundant Issues page heading and shown-count line", () => {
+    board("inflight", { in_flight: [working] });
+
+    expect(screen.queryByRole("heading", { name: "Issues" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/shown$/)).not.toBeInTheDocument();
   });
 });
 

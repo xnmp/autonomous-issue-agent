@@ -2394,7 +2394,10 @@ def test_all_green_checks_read_as_passing():
 
 
 @pytest.mark.parametrize(
-    "verdict", ["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"]
+    "verdict",
+    # STALE is terminal (the check will not re-run on this head): without it a
+    # stale check read "pending" forever.
+    ["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STALE"],
 )
 def test_one_bad_check_reads_as_failing_even_beside_greens_and_pendings(verdict):
     card = review_card(statusCheckRollup=[
@@ -2419,6 +2422,22 @@ def test_missing_or_unreadable_checks_claim_no_ci_state(rollup):
     assert card["pr_ci_state"] in (None, "pending")
     if rollup in (None, [], "nonsense"):
         assert card["pr_ci_state"] is None
+
+
+def test_issue_detail_uses_the_current_pr_check_rollup_for_ci_state():
+    detail = snapshots.issue_detail(
+        row_for([RESOLVE, FIX_CI_2], 7),
+        NOW,
+        gh_prs={12: {
+            "state": "OPEN",
+            "statusCheckRollup": [
+                {"conclusion": "SUCCESS"},
+                {"state": "IN_PROGRESS", "conclusion": None},
+            ],
+        }},
+    )
+
+    assert detail["pr_ci_state"] == "pending"
 
 
 # ── hourly spend ──────────────────────────────────────────────────────────────

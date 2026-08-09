@@ -268,6 +268,7 @@ export function IssueTab({
               stage={d.stage}
               done={d.done}
               hasPullRequest={d.prs.length > 0 || d.pull_requests.length > 0}
+              ciState={d.pr_ci_state ?? null}
               attention={d.stage === "awaiting human reply" || d.stage === "blocked"
                 ? "blocked"
                 : d.escalation_reason || d.stage === "escalated"

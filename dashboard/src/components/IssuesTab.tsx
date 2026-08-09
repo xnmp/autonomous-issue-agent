@@ -33,7 +33,6 @@ import {
   labelTone,
   modelTone,
   prReviewMark,
-  prStateTone,
   stepOutcomeTone,
   verificationGlyph,
   verificationSummary,
@@ -244,7 +243,7 @@ export function IssuesTab({
   );
   const [blocked, running] = useMemo(() => {
     const cards = filteredInFlight;
-    return [cards.filter(blocksOnHuman), cards.filter((card) => !blocksOnHuman(card))];
+    return [cards.filter(isOperatorHold), cards.filter((card) => !isOperatorHold(card))];
   }, [filteredInFlight]);
   const sourceCount = sub === "inflight"
     ? (data?.in_flight.length ?? 0) + (data?.pending.length ?? 0)
@@ -280,13 +279,11 @@ export function IssuesTab({
     // anchor prop, and none of them can drift apart.
     <SnapshotAnchor.Provider value={issues.updatedAt}>
     <div className="tabbody" onContextMenu={openColumnMenu}>
-      <header className="page-heading">
-        <div>
-          <h1>Issues</h1>
-          <p><span className="mono">{repo}</span> · {sub === "inflight" ? "live work and operator holds" : sub === "done" ? "merged execution history" : "unadmitted work"}</p>
-        </div>
-        <span className="page-heading-status num">{filteredCount} shown</span>
-      </header>
+      {/* The visible <h1> was removed by design; screen-reader heading
+          navigation still needs the page identified. */}
+      <h1 className="sr-only">
+        {sub === "inflight" ? "In-flight issues" : sub === "done" ? "Done issues" : "Backlog"}
+      </h1>
       {!ghOk ? <div className="row"><span className="spacer" /><GhUnavailableChip /></div> : null}
       <ColumnMenu
         columns={COLUMN_CHOICES[sub]}
@@ -432,6 +429,22 @@ function isPendingCard(card: FilterableCard): card is PendingCard {
   return typeof (card as PendingCard).held === "boolean";
 }
 
+const OPERATOR_HOLD_LABELS = new Set([
+  "ai-blocked",
+  "ai-parked",
+  "needs-budget-review",
+  "needs-human-review",
+]);
+
+function isOperatorHold(card: IssueCard): boolean {
+  return blocksOnHuman(card)
+    || card.stage === "blocked"
+    || card.stage === "escalated"
+    || card.stage === "awaiting human reply"
+    || card.flags.includes("blocked")
+    || card.labels.some((label) => OPERATOR_HOLD_LABELS.has(label.toLowerCase()));
+}
+
 function InFlightTable({
   repo,
   cards,
@@ -501,19 +514,10 @@ function InFlightTable({
             const { elapsed, working, idle } = liveClocks(card, offset);
             const humanOwned = !!card.human_action;
             const open = expanded === card.issue;
-            // Alarm means "a human is needed NOW". `escalated`/`spend-blocked`
-            // flags are lifetime counters — an issue that escalated once and
-            // was re-armed carries them forever, and painting it red for life
-            // buried the real alarms (keifu #25: approved, awaiting merge,
-            // still red, 2026-08-02). Current attention arrives as
-            // human_action or a blocked stage/leg; history stays visible as
-            // chips without the row alarm.
-            const alert = (
-              humanOwned
-              || card.stage === "blocked"
-              || card.stage === "escalated"
-              || card.flags.some((flag) => flag === "blocked")
-            );
+            // Current operator ownership is redundant across the reconciled
+            // action, stage and live labels because GitHub enrichment can lag
+            // one poll. Lifetime escalation counters alone are not an alarm.
+            const alert = humanOwned || isOperatorHold(card);
             // Merge-ready is attention, not alarm: same treatment, green.
             const alertClass = !alert
               ? ""
@@ -1571,24 +1575,24 @@ const TimeSinceDone = memo(function TimeSinceDone({ card }: { card: IssueCard })
 function PrLink({ card }: { card: IssueCard }) {
   if (card.pr === null) return null;
   const review = prReviewMark(card.pr_review_state);
-  // The chip's number is CI's answer at a glance: green passing, red failing,
-  // amber running. No checks or unknown → inherit, claiming nothing.
-  const ciTone =
+  // The complete control carries CI's answer; the review glyph remains a
+  // redundant second signal when GitHub has also published that decision.
+  const ciTone: Tone =
     card.pr_ci_state === "passing" ? "ok"
     : card.pr_ci_state === "failing" ? "fail"
     : card.pr_ci_state === "pending" ? "running"
-    : null;
+    : "neutral";
   const chip = (
     <Chip
-      tone={prStateTone(card.pr_state)}
+      tone={ciTone}
       square
       title={[
         card.pr_state ?? "pull request",
-        card.pr_ci_state ? `CI ${card.pr_ci_state}` : null,
+        `CI ${card.pr_ci_state ?? "unknown"}`,
         review?.label,
       ].filter(Boolean).join(" · ")}
     >
-      <span className={ciTone ? `tone-${ciTone}` : undefined}>PR #{card.pr}</span>
+      <span>PR #{card.pr}{card.pr_url ? " ↗" : ""}</span>
       {review ? (
         <span className={`pr-review-mark tone-${review.tone}`} role="img" aria-label={review.label}>
           {review.glyph}

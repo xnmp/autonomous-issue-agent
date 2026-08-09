@@ -172,6 +172,13 @@ const round3Issues = {
     steps: [
       { kind: "RESOLVE", state: "ok", status: "done", cost_usd: 1.22, count: 1 },
       { kind: "REVIEW", state: "ok", status: "REQUEST_CHANGES", cost_usd: 0.48, count: 2 },
+      { kind: "ADDRESS_REVIEW", state: "ok", status: "done", cost_usd: 0.31, count: 1 },
+      { kind: "RE_REVIEW", state: "ok", status: "REQUEST_CHANGES", cost_usd: 0.36, count: 1 },
+      { kind: "ADDRESS_REVIEW", state: "ok", status: "done", cost_usd: 0.28, count: 1 },
+      { kind: "RE_REVIEW", state: "ok", status: "REQUEST_CHANGES", cost_usd: 0.34, count: 1 },
+      { kind: "ADDRESS_REVIEW", state: "ok", status: "done", cost_usd: 0.27, count: 1 },
+      { kind: "RE_REVIEW", state: "ok", status: "REQUEST_CHANGES", cost_usd: 0.33, count: 1 },
+      { kind: "FIX_CI", state: "ok", status: "done", cost_usd: 0.22, count: 1 },
       { kind: "ADDRESS_REVIEW", state: "running", status: "running", cost_usd: 0.31, count: 1 },
     ],
   }],
@@ -753,8 +760,11 @@ test("captures the round-three operator states at 1440px", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto("/#/repo/self/overview");
 
-  await expect(page.getByText("Needs attention")).toBeVisible();
+  await expect(page.getByText("Needs attention")).toHaveCount(0);
+  await expect(page.getByRole("region", { name: "Spending caps" })).toContainText("$6.42");
   await expect(page.getByText("Daemon health")).toBeVisible();
+  await expect(page.getByText("last", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("searchbox", { name: "Filter operator actions" })).toHaveCount(0);
   await expect(page.getByText("Active lifecycle")).toHaveCount(0);
   await page.screenshot({
     path: "../evidence-facelift/after-overview.png",
@@ -769,9 +779,41 @@ test("captures the round-three operator states at 1440px", async ({ page }) => {
     element.scrollTop = 0;
   });
 
+  await page.evaluate(() => {
+    const minimums = {
+      issue: 360,
+      lifecycle: 240,
+      cost: 88,
+      elapsed: 112,
+      progress: 112,
+      model: 112,
+    };
+    localStorage.setItem(
+      "issue-agent.dashboard.column-widths",
+      JSON.stringify({ "issues-blocked": minimums, "issues-inflight": minimums }),
+    );
+  });
   await page.getByRole("tab", { name: /In flight/ }).click();
   await expect(page.getByRole("columnheader", { name: /Lifecycle/ })).toBeVisible();
   await expect(page.getByText(/Harness issue: required-test gate rejects/)).toBeVisible();
+  const issueScroller = page.locator(".tbl-wrap.panel").filter({
+    has: page.locator("table.issue-list-table"),
+  }).first();
+  const issueDimensions = await issueScroller.evaluate((element) => ({
+    clientWidth: element.clientWidth,
+    scrollWidth: element.scrollWidth,
+  }));
+  expect(issueDimensions.scrollWidth).toBe(issueDimensions.clientWidth);
+
+  const earlier = page.locator(".life-elided .life-node");
+  await expect(earlier).toContainText("+5");
+  await earlier.hover();
+  const tip = page.locator(".tip.tip-on");
+  await expect(tip).toContainText("RESOLVE · ok · done");
+  const tipBounds = await tip.boundingBox();
+  expect(tipBounds).not.toBeNull();
+  expect(tipBounds!.x).toBeGreaterThanOrEqual(8);
+  expect(tipBounds!.x + tipBounds!.width).toBeLessThanOrEqual(1432);
   await page.screenshot({
     path: "../evidence-facelift/after-issues-inflight.png",
     fullPage: true,
@@ -791,6 +833,22 @@ test("captures the round-three operator states at 1440px", async ({ page }) => {
   await expect(page.getByText("awaiting steward")).toBeVisible();
   await page.screenshot({
     path: "../evidence-facelift/after-issues-backlog.png",
+    fullPage: true,
+    animations: "disabled",
+  });
+
+  await page.setViewportSize({ width: 320, height: 700 });
+  await page.getByRole("tab", { name: "Overview" }).click();
+  await expect(page.getByRole("tab", { name: "Overview" })).toHaveAttribute("aria-selected", "true");
+  await page.screenshot({
+    path: "../evidence-facelift/after-overview-mobile.png",
+    fullPage: true,
+    animations: "disabled",
+  });
+  await page.getByRole("tab", { name: /In flight/ }).click();
+  await expect(page.getByRole("tab", { name: /In flight/ })).toHaveAttribute("aria-selected", "true");
+  await page.screenshot({
+    path: "../evidence-facelift/after-issues-inflight-mobile.png",
     fullPage: true,
     animations: "disabled",
   });

@@ -1761,6 +1761,9 @@ _CI_FAILURE = {
     "CANCELLED",
     "ACTION_REQUIRED",
     "STARTUP_FAILURE",
+    # STALE is terminal too (the check was invalidated and will not re-run on
+    # this head); leaving it out let a stale check read "pending" forever.
+    "STALE",
 }
 _CI_SUCCESS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 
@@ -2481,6 +2484,7 @@ def issue_detail(
             }
             for number in row.prs
         ],
+        "pr_ci_state": _pr_ci_state(gh_pr),
         "cost_usd": row.cost_usd,
         "elapsed_s": round(elapsed) if elapsed is not None else None,
         "working_s": round(working) if working is not None else None,

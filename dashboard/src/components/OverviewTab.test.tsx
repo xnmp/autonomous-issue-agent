@@ -1,7 +1,17 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { OverviewTab } from "./OverviewTab";
+
+const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+
+afterEach(() => {
+  if (originalClipboard) {
+    Object.defineProperty(navigator, "clipboard", originalClipboard);
+  } else {
+    Reflect.deleteProperty(navigator, "clipboard");
+  }
+});
 
 function overview(interventionCount = 0) {
   vi.stubGlobal(
@@ -10,7 +20,15 @@ function overview(interventionCount = 0) {
       metrics: null,
       cost_mix: null,
       caps: { issue_cap_usd: 5, daily_cap_usd: 10, today_usd: 2 },
-      health: [],
+      health: [{
+        role: "fix",
+        alive: true,
+        stale: false,
+        last_event_ts: "2026-08-01T08:00:00Z",
+        last_event: "tick",
+        events: 4,
+        log_path: "/logs/fix.log",
+      }],
       health_trend: [],
       needs_attention: [{ issue: 50, kind: "blocked", title: "Needs a decision" }],
       interventions: Array.from({ length: interventionCount }, (_, index) => ({
@@ -31,38 +49,54 @@ function overview(interventionCount = 0) {
 }
 
 describe("OverviewTab hierarchy", () => {
-  it("keeps attention and KPIs ahead of daemon health and operator history", async () => {
+  it("leads with compact metrics and removes redundant page and attention headings", async () => {
     const { container } = overview();
 
-    const attention = (await screen.findByText("Needs attention")).closest("section");
-    const health = screen.getByText("Daemon health").closest("section");
+    const health = (await screen.findByText("Daemon health")).closest("section");
     const actions = screen.getByText("Operator actions").closest("section");
     const metrics = container.querySelector(".overview-metrics");
 
-    expect(attention).not.toBeNull();
     expect(health).not.toBeNull();
     expect(actions).not.toBeNull();
     expect(metrics).not.toBeNull();
-    expect(attention!.compareDocumentPosition(metrics!) & Node.DOCUMENT_POSITION_FOLLOWING)
-      .toBeTruthy();
     expect(metrics!.compareDocumentPosition(health!) & Node.DOCUMENT_POSITION_FOLLOWING)
       .toBeTruthy();
     expect(metrics!.compareDocumentPosition(actions!) & Node.DOCUMENT_POSITION_FOLLOWING)
       .toBeTruthy();
+    // No VISIBLE page heading — but screen-reader heading navigation keeps one.
+    expect(screen.getByRole("heading", { name: "Overview" })).toHaveClass("sr-only");
+    expect(screen.queryByText("Needs attention")).not.toBeInTheDocument();
+    expect(screen.queryByText(/Reconciles every/)).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Spending caps" })).toHaveTextContent(
+      "$2.00today / $10.00",
+    );
+    expect(screen.queryByText("$ today")).not.toBeInTheDocument();
     expect(screen.queryByText("Active lifecycle")).not.toBeInTheDocument();
     expect(screen.queryByText("Cost mix by task family")).not.toBeInTheDocument();
     expect(screen.queryByText("Spend by task type")).not.toBeInTheDocument();
   });
 
-  it("filters a long operator-action timeline without hiding its total", async () => {
+  it("shows the operator-action timeline without a filter control", async () => {
     overview(12);
 
-    const filter = await screen.findByRole("searchbox", { name: "Filter operator actions" });
-    expect(screen.getByText("12/12")).toBeVisible();
-    await userEvent.type(filter, "needle");
+    expect(await screen.findByText("promote needle")).toBeVisible();
+    expect(screen.getByText("rearm 0")).toBeVisible();
+    expect(screen.queryByRole("searchbox", { name: "Filter operator actions" }))
+      .not.toBeInTheDocument();
+  });
 
-    expect(screen.getByText("promote needle")).toBeVisible();
-    expect(screen.queryByText("rearm 0")).not.toBeInTheDocument();
-    expect(screen.getByText("1/12")).toBeVisible();
+  it("copies a daemon log path from its icon and confirms the action", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    overview();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Copy fix log path" }));
+
+    expect(writeText).toHaveBeenCalledWith("/logs/fix.log");
+    expect(screen.getByRole("status")).toHaveTextContent("Log path copied");
+    expect(document.querySelector(".health-row")).not.toHaveTextContent("/logs/fix.log");
   });
 });

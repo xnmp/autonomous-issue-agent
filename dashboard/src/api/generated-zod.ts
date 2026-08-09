@@ -234,6 +234,9 @@ const IssueDetailPayload = z
     idle_s: z.union([z.number(), z.null()]),
     issue: z.number().int(),
     leg_running: z.boolean().optional().default(false),
+    pr_ci_state: z
+      .union([z.enum(["passing", "failing", "pending"]), z.null()])
+      .optional(),
     prs: z.array(z.number().int()),
     pull_requests: z.array(PullRequestLink),
     stage: z.union([z.string(), z.null()]),
@@ -550,6 +553,9 @@ const endpoints = makeApi([
         idle_s: z.union([z.number(), z.null()]),
         issue: z.number().int(),
         leg_running: z.boolean().optional().default(false),
+        pr_ci_state: z
+          .union([z.enum(["passing", "failing", "pending"]), z.null()])
+          .optional(),
         prs: z.array(z.number().int()),
         pull_requests: z.array(PullRequestLink),
         stage: z.union([z.string(), z.null()]),

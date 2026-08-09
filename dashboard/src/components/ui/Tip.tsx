@@ -32,14 +32,30 @@ function showTip(target: HTMLElement, text: string): void {
   const node = element();
   node.textContent = text;
   const rect = target.getBoundingClientRect();
-  // Above the anchor by default; below when the anchor hugs the viewport top.
-  node.style.left = `${Math.round(rect.left + rect.width / 2)}px`;
-  if (rect.top > 56) {
-    node.style.top = `${Math.round(rect.top - 6)}px`;
+  const gap = 6;
+  const viewportPadding = 8;
+  const bounds = node.getBoundingClientRect();
+  const halfWidth = bounds.width / 2;
+  const anchorCenter = rect.left + rect.width / 2;
+  const left = Math.max(
+    viewportPadding + halfWidth,
+    Math.min(window.innerWidth - viewportPadding - halfWidth, anchorCenter),
+  );
+  const roomAbove = rect.top - viewportPadding;
+  const roomBelow = window.innerHeight - rect.bottom - viewportPadding;
+  const above = roomAbove >= bounds.height + gap
+    || (roomBelow < bounds.height + gap && roomAbove > roomBelow);
+
+  node.style.left = `${Math.round(left)}px`;
+  if (above) {
+    node.style.top = `${Math.round(Math.max(viewportPadding + bounds.height, rect.top - gap))}px`;
     node.classList.add("tip-above");
     node.classList.remove("tip-below");
   } else {
-    node.style.top = `${Math.round(rect.bottom + 6)}px`;
+    node.style.top = `${Math.round(Math.min(
+      window.innerHeight - viewportPadding - bounds.height,
+      rect.bottom + gap,
+    ))}px`;
     node.classList.add("tip-below");
     node.classList.remove("tip-above");
   }

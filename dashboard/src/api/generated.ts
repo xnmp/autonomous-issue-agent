@@ -592,6 +592,8 @@ export interface components {
              * @default false
              */
             leg_running: boolean;
+            /** Pr Ci State */
+            pr_ci_state?: ("passing" | "failing" | "pending") | null;
             /** Prs */
             prs: number[];
             /** Pull Requests */
