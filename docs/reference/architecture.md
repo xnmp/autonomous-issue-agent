@@ -442,6 +442,10 @@ module requires placing it in the appropriate tier and explaining it here.
 
 `domain/` — pure values and policy:
 `domain/actions.py`, `domain/agent_task.py`, `domain/ci.py`,
+`domain/ci_history.py`
+(the bounded per-issue record of what each FIX_CI leg was pointed at and what
+was red, so attempt N can see the pattern across attempts 1..N-1 instead of
+re-diagnosing one tick's failure blind),
 `domain/contracts.py`, `domain/dashboard.py`, `domain/effect_retry.py`,
 `domain/effort.py`, `domain/environment.py`
 (the harness-attested capability manifest: what the boot probe saw, and the

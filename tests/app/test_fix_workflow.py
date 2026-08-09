@@ -422,6 +422,122 @@ def _ci_pr():
                   checks=(Check("unit", bucket="fail"),))
 
 
+# ── CI attempt history (tauri PR #620) ──────────────────────────────────────
+def _ci_pr_at(sha, *check_names):
+    return PRView(
+        100, head_ref_name="fix/5-token", head_ref_oid=sha, closing_issue=5,
+        checks=tuple(Check(n, bucket="fail") for n in check_names),
+    )
+
+
+def _pushed_runner():
+    return FakeRunner(AgentResult(is_error=False, status="pushed", session_id="c5"))
+
+
+def test_fix_ci_records_what_each_attempt_was_pointed_at(tmp_path):
+    gw = FakeGateway(prs={100: _ci_pr_at("a" * 40, "e2e tests")})
+    store = Store(state_dir=str(tmp_path))
+
+    asyncio.run(_workflow(gw, store, _pushed_runner()).fix_ci(100))
+
+    assert [(a.head_sha, a.failed_checks) for a in store.get_ci_history(5)] == [
+        ("a" * 40, ("e2e tests",))
+    ]
+
+
+def test_fix_ci_history_is_bounded_to_the_last_five_attempts(tmp_path):
+    store = Store(state_dir=str(tmp_path))
+    for n in range(7):
+        gw = FakeGateway(prs={100: _ci_pr_at(f"sha{n}", "e2e tests")})
+        asyncio.run(_workflow(gw, store, _pushed_runner()).fix_ci(100))
+
+    assert [a.head_sha for a in store.get_ci_history(5)] == [
+        f"sha{n}" for n in range(2, 7)
+    ]
+
+
+def test_the_second_fix_ci_leg_sees_what_the_first_one_faced(tmp_path):
+    """The incident in one test: leg two must be able to see that the SAME check
+    already failed on a different head, which is the pattern nobody had."""
+    store = Store(state_dir=str(tmp_path))
+    first = _pushed_runner()
+    asyncio.run(_workflow(
+        FakeGateway(prs={100: _ci_pr_at("a" * 40, "e2e tests")}), store, first
+    ).fix_ci(100))
+    assert "Previous FIX_CI attempts" not in first.tasks[0].prompt
+
+    second = _pushed_runner()
+    asyncio.run(_workflow(
+        FakeGateway(prs={100: _ci_pr_at("b" * 40, "e2e tests")}), store, second
+    ).fix_ci(100))
+
+    prompt = second.tasks[0].prompt
+    assert "attempt 1 @ aaaaaaa: e2e tests" in prompt
+    assert "bbbbbbb" not in prompt  # the CURRENT head is the prompt's subject
+
+
+def test_fix_ci_records_the_attempt_even_when_the_leg_dies(tmp_path):
+    # Write-before-execute: a killed leg still consumed a round, and its failure
+    # is exactly the evidence the next leg needs.
+    gw = FakeGateway(prs={100: _ci_pr_at("a" * 40, "e2e tests")})
+    store = Store(state_dir=str(tmp_path))
+    runner = FakeRunner(AgentResult(is_error=True, status="timeout",
+                                    exit_reason=ExitReason.TRANSPORT_DEATH))
+
+    asyncio.run(_workflow(gw, store, runner).fix_ci(100))
+
+    assert len(store.get_ci_history(5)) == 1
+
+
+def test_a_store_that_cannot_serve_the_history_still_dispatches_the_leg(tmp_path):
+    """History is context, not authority. A corrupt file (and a store that
+    raises outright) must cost the leg its extra section, never the repair."""
+    store = Store(state_dir=str(tmp_path))
+    (tmp_path / "issue-5.ci-history").write_text("}{ torn")
+    gw = FakeGateway(prs={100: _ci_pr_at("a" * 40, "e2e tests")})
+    runner = _pushed_runner()
+
+    asyncio.run(_workflow(gw, store, runner).fix_ci(100))
+
+    assert "Previous FIX_CI attempts" not in runner.tasks[0].prompt
+    assert runner.tasks  # the leg ran
+
+    class ExplodingHistoryStore(Store):
+        def get_ci_history(self, issue):
+            raise OSError("state dir unreadable")
+
+        def append_ci_attempt(self, issue, attempt):
+            raise OSError("state dir unwritable")
+
+    runner2 = _pushed_runner()
+    asyncio.run(_workflow(
+        FakeGateway(prs={100: _ci_pr_at("b" * 40, "e2e tests")}),
+        ExplodingHistoryStore(state_dir=str(tmp_path)),
+        runner2,
+    ).fix_ci(100))
+
+    assert "Previous FIX_CI attempts" not in runner2.tasks[0].prompt
+    assert runner2.tasks[0].prompt  # still dispatched
+
+
+def test_a_merged_pr_leaves_no_history_for_the_next_one(tmp_path):
+    store = Store(state_dir=str(tmp_path))
+    gw = FakeGateway(prs={100: _ci_pr_at("a" * 40, "e2e tests")})
+    asyncio.run(_workflow(gw, store, _pushed_runner()).fix_ci(100))
+
+    store.cleanup_pr(100, 5, merged=True)
+
+    runner = _pushed_runner()
+    asyncio.run(_workflow(
+        FakeGateway(prs={101: PRView(101, head_ref_name="fix/5-token",
+                                     head_ref_oid="c" * 40, closing_issue=5,
+                                     checks=(Check("e2e tests", bucket="fail"),))}),
+        store, runner,
+    ).fix_ci(101))
+
+    assert "Previous FIX_CI attempts" not in runner.tasks[0].prompt
+
+
 def test_fix_ci_error_advances_the_breaker():
     # Baseline for the exemption below: a genuine failed attempt DOES count.
     gw = FakeGateway(prs={100: _ci_pr()})

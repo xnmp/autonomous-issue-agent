@@ -55,6 +55,7 @@ from issue_agent.app.planners.tasks import (
 )
 
 from issue_agent.app.dashweb import guidance as guidance_rules
+from issue_agent.domain.ci_history import CiAttempt
 from issue_agent.domain import environment as domain_env
 
 FIX_CFG = FixTaskConfig(repo="o/r", base_branch="dev", agent_md="AGENTMD", max_budget_usd=3.0)
@@ -233,6 +234,55 @@ def test_fix_ci_task_includes_diagnosis_and_mcp():
     assert "unit FAIL" in t.prompt and "traceback" in t.prompt
     assert t.mcp_servers == mcp
     assert "mcp__sonarqube__*" in t.all_allowed_tools()
+
+
+def test_fix_ci_task_omits_the_history_section_on_the_first_attempt():
+    t = build_fix_ci_task(100, U("unit FAIL"), U("log"), "/wt", "s1", FIX_CFG)
+    assert "Previous FIX_CI attempts" not in t.prompt
+    assert "de-flaked" not in t.prompt
+
+
+def test_fix_ci_task_shows_prior_attempts_and_the_flaky_test_diagnosis():
+    # tauri PR #620: three blind legs missed "same check, different symptom,
+    # every time, in a spec file this PR adds".
+    t = build_fix_ci_task(
+        100, U("unit FAIL"), U("log"), "/wt", "s1", FIX_CFG,
+        ci_history=(
+            CiAttempt("aaaaaaaaaa11", ("e2e tests",)),
+            CiAttempt("bbbbbbbbbb22", ("e2e tests", "lint")),
+        ),
+    )
+    assert "Previous FIX_CI attempts" in t.prompt
+    assert "attempt 1 @ aaaaaaa: e2e tests" in t.prompt
+    assert "attempt 2 @ bbbbbbb: e2e tests, lint" in t.prompt
+    # the diagnosis the human made, stated as information the leg can weigh
+    assert "DIFFERENT symptom" in t.prompt
+    assert "test you wrote is the likely defect" in t.prompt
+    assert "instead of sleeping a fixed interval" in t.prompt
+    assert "say in the PR body which test you de-flaked" in t.prompt
+    # …and the opposite reading is stated too, so it cannot be read as a
+    # standing licence to weaken any failing test.
+    assert "same way every time" in t.prompt
+
+
+def test_fix_ci_history_section_grants_no_authority_the_leg_lacked():
+    t = build_fix_ci_task(
+        100, U("unit FAIL"), U("log"), "/wt", "s1", FIX_CFG,
+        ci_history=(CiAttempt("aaaaaaaaaa11", ("e2e tests",)),),
+    )
+    # It must not license the suppression the standing guardrail forbids.
+    assert "Do NOT suppress" in t.prompt
+    lowered = t.prompt.lower()
+    assert "you may ignore" not in lowered
+    assert "you are authorized" not in lowered
+
+
+def test_fix_ci_history_section_tolerates_an_attempt_with_nothing_recorded():
+    t = build_fix_ci_task(
+        100, U("unit FAIL"), U("log"), "/wt", "s1", FIX_CFG,
+        ci_history=(CiAttempt("", ()),),
+    )
+    assert "attempt 1 @ unknown: unrecorded" in t.prompt
 
 
 def test_rebase_task_resumes_session_and_names_base():

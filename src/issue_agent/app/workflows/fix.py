@@ -39,6 +39,7 @@ from ...domain.ports import (
     WorkflowState,
 )
 from ...domain.ci import latest_other_review
+from ...domain.ci_history import make_attempt
 from ...domain.effort import (
     DEFAULT_EFFORT,
     DEFAULT_TIER,
@@ -1075,6 +1076,23 @@ class FixWorkflow:
         mcp_servers = mcp_servers_for_checks(
             self.cfg.fix_mcp_config, [c.name for c in p.checks], self.cfg.harness_root
         )
+        # PRIOR attempts only — the current one is the prompt's own subject, and
+        # a history that always contained it could never be empty. Recorded
+        # BEFORE the leg runs, on the same write-before-execute discipline as
+        # the ci-rerun marker: a leg killed mid-flight still consumed a round
+        # and its failure is still evidence, whereas an attempt recorded only on
+        # success would hide exactly the repeated failures this exists to show.
+        # Both halves are `_try`-wrapped — history is context, not authority, so
+        # an unreadable/unwritable store must cost the leg its extra section,
+        # never its dispatch (see `_signals` for the same rule).
+        prior_attempts = self._try(lambda: self.store.get_ci_history(issue), ()) or ()
+        self._try(
+            lambda: self.store.append_ci_attempt(
+                issue,
+                make_attempt(p.head_ref_oid, [c.name for c in p.checks if c.bucket == "fail"]),
+            ),
+            None,
+        )
         task = task_builders.build_fix_ci_task(
             pr,
             as_untrusted(failed),
@@ -1088,6 +1106,7 @@ class FixWorkflow:
             # reviewer's objections. Recurrence and resolve retries still apply.
             self._repair_fix_cfg(issue, "fix-ci"),
             mcp_servers=mcp_servers,
+            ci_history=prior_attempts,
         )
         result = await self._run_logged("fix-ci", issue, task, kind="FIX_CI")
         self.store.save_session(issue, result.session_id)
