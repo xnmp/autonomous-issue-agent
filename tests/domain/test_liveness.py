@@ -49,6 +49,52 @@ def test_the_level_escalates_with_age():
     assert stalls[0].level == 3  # 91 min = three whole 30-min thresholds
 
 
+def test_a_pr_open_issue_does_not_stall_while_its_pr_moves():
+    # #185 (tauri #482): the issue's own labels/updated_at froze for 3 hours
+    # while its PR churned through pushes, verdicts and CI — six stall levels
+    # of noise on a healthy issue. PR movement must reset the issue's clock.
+    # Linkage here is the BRANCH-NAME fallback (closing_issue=None): GitHub's
+    # closing-reference graph is default-branch-only, so on a repo whose base
+    # is not the default (the self-hosting repo) it is the only linkage that
+    # exists — keying on closing_issue alone made this fix a silent no-op
+    # exactly there (#185 review F1).
+    from dataclasses import replace
+
+    i = issue(482, "ai-pr-open", updated_at="2026-08-01T08:00:00Z")
+    p = replace(_open_pr(), head_ref_name="fix/482-backoff", closing_issue=None)
+    _, seen = detect_stalls(_world(0, issues=[i], prs=[p]), {})
+    moved = replace(p, head_ref_oid="head-2")
+    stalls, _ = detect_stalls(_world(35, issues=[i], prs=[moved]), seen)
+    assert [s for s in stalls if s.kind == "issue"] == []
+
+
+def test_a_contradictory_label_pair_keeps_its_own_stall_clock():
+    # The #482 stall signal was the ONLY detector of the ai-ready+ai-pr-open
+    # contradiction — PR churn must not silence an issue that wears any watched
+    # label BESIDES ai-pr-open, or the class this fold's own change set repairs
+    # becomes invisible (#185 review F5).
+    from dataclasses import replace
+
+    i = issue(482, "ai-ready", "ai-pr-open", updated_at="2026-08-01T08:00:00Z")
+    p = replace(_open_pr(), closing_issue=482)
+    _, seen = detect_stalls(_world(0, issues=[i], prs=[p]), {})
+    moved = replace(p, head_ref_oid="head-2")
+    stalls, _ = detect_stalls(_world(35, issues=[i], prs=[moved]), seen)
+    assert [s.number for s in stalls if s.kind == "issue"] == [482]
+
+
+def test_a_pr_open_issue_with_a_quiet_pr_still_stalls():
+    # Anti-vacuity twin: delegation is to PR PROGRESS, not to PR existence —
+    # both quiet past the threshold is exactly "nothing is moving it".
+    from dataclasses import replace
+
+    i = issue(482, "ai-pr-open", updated_at="2026-08-01T08:00:00Z")
+    p = replace(_open_pr(), closing_issue=482)
+    _, seen = detect_stalls(_world(0, issues=[i], prs=[p]), {})
+    stalls, _ = detect_stalls(_world(35, issues=[i], prs=[p]), seen)
+    assert [s.number for s in stalls if s.kind == "issue"] == [482]
+
+
 def test_any_observable_change_resets_the_clock():
     from dataclasses import replace
 

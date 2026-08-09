@@ -16,6 +16,7 @@ from enum import Enum
 from .identity import is_bot_login
 from .labels import Label
 from .lifecycle import pr_lifecycle
+from .refs import issue_from_branch
 
 
 class CIState(str, Enum):
@@ -202,6 +203,17 @@ class PRView:
         """Clean but stale: mergeable (no conflict) yet the base advanced. Needs an
         update-branch before an armed auto-merge can land it."""
         return self.merge_state.upper() == "BEHIND" and not self.is_conflicting()
+
+
+def issue_for_pr(pr: PRView) -> int | None:
+    """THE PR→issue linkage rule: prefer GitHub's closing-reference, fall back
+    to the branch number. `closing_issue` is default-branch-only (failure
+    modes #34/#35) — a consumer keying on it alone silently no-ops on any repo
+    whose working base is not the default branch (the self-hosting repo:
+    default main, base dev). Every linkage consumer must go through here."""
+    if pr.closing_issue is not None:
+        return pr.closing_issue
+    return issue_from_branch(pr.head_ref_name)
 
 
 @dataclass(frozen=True)

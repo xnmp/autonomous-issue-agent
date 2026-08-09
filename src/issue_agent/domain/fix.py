@@ -71,6 +71,7 @@ from .world import (
     WorldState,
     REVIEW_APPROVED,
     REVIEW_CHANGES_REQUESTED,
+    issue_for_pr,
     paths_overlap_open_prs,
 )
 
@@ -806,6 +807,59 @@ def should_update_branch(
     ) in (CIState.OK, CIState.NONE)
 
 
+def _issues_with_open_prs(world: WorldState) -> frozenset[int]:
+    """Issue numbers with an OPEN PR pointing at them. Deliberately NOT
+    filtered by author: whoever opened it, a second PR for the same issue is
+    the harm. `closing_refs` is unioned in because `world.prs` carries only
+    OPEN PRs wearing ai-pr-open (fresh-label authority, keifu #179) — a
+    parked or hand-unlabelled PR would otherwise vanish from this set, the
+    reaper would requeue its issue to ai-ready, and a full RESOLVE would buy
+    the duplicate PR this guard exists to prevent (adversarial P1-4)."""
+    return frozenset(
+        n for pr in world.prs if pr.state == "OPEN"
+        and (n := _issue_for_pr(pr)) is not None
+    ) | frozenset(ref.issue for ref in world.closing_refs)
+
+
+def label_repair_actions(world: WorldState) -> list[Action]:
+    """Repair the one contradictory lifecycle-label pair observed in the wild:
+    ai-ready coexisting with ai-pr-open while the issue really has an open PR
+    (#185; tauri #482 carried the pair for 3+ hours). The stale ai-ready made
+    every tick consider re-dispatching, the dup-PR guard refused, and the
+    standoff read as a level-6 stall and a phantom dashboard "pending" row.
+
+    Remove-only (add=None): the issue's true state is already on it. The CAS
+    revision guard makes a mid-transition observation safe — a completing
+    label swap bumps updated_at and the stale repair is discarded, so this
+    never fights an in-flight two-call transition. Scoped to the pair with an
+    OPEN PR confirmed in the same snapshot: ai-ready + ai-pr-open with NO
+    open PR is a different (cleanup) state that closed-PR handling owns.
+
+    Deliberately NOT `_issues_with_open_prs`: that set unions `closing_refs`,
+    whose over-inclusiveness is fail-safe only for consumers that do LESS on a
+    false positive (the reaper). A repair does MORE — it removes a label — so
+    its evidence is only `world.prs` (fresh ai-pr-open-labeled OPEN PRs), never
+    a possibly stale repo-wide closing ref (#185 review F4). Journal coverage
+    is the executed action's own line; no ceiling by design — this is a
+    world-derived reconciliation (idempotent, precondition-scoped), not a
+    retry loop, same class as reap_actions."""
+    with_open_pr = frozenset(
+        n for pr in world.prs
+        if pr.state == "OPEN" and (n := _issue_for_pr(pr)) is not None
+    )
+    return [
+        Relabel(
+            Target.ISSUE, issue.number, Label.AI_READY, None,
+            expected_revision=issue.updated_at,
+        )
+        for issue in world.issues
+        if issue.state == "open"
+        and Label.AI_READY in issue.labels
+        and Label.AI_PR_OPEN in issue.labels
+        and issue.number in with_open_pr
+    ]
+
+
 def reap_actions(
     world: WorldState, active_issues: frozenset[int] = frozenset()
 ) -> list[Action]:
@@ -834,17 +888,7 @@ def reap_actions(
     looked like protection for a busy-marker that does not exist. If a PR-side
     busy marker is ever reintroduced (P2 parallel dispatch), restore this arm
     WITH the code that adds the label, not before."""
-    # Issues with an OPEN PR pointing at them. Deliberately NOT filtered by
-    # author: whoever opened it, a second PR for the same issue is the harm.
-    # `closing_refs` is unioned in because `world.prs` now carries only OPEN
-    # PRs wearing ai-pr-open (fresh-label authority, keifu #179) — a parked or
-    # hand-unlabelled PR would otherwise vanish from this set, the reaper
-    # would requeue its issue to ai-ready, and a full RESOLVE would buy the
-    # duplicate PR this guard exists to prevent (adversarial P1-4).
-    with_open_pr = {
-        n for pr in world.prs if pr.state == "OPEN"
-        and (n := _issue_for_pr(pr)) is not None
-    } | {ref.issue for ref in world.closing_refs}
+    with_open_pr = _issues_with_open_prs(world)
     # expected_revision comes from the OBSERVED issue, not a live read at
     # command creation (which is a self-fulfilling CAS): a leg completing
     # between this decision and the write performs its own relabel, bumping
@@ -1053,11 +1097,9 @@ def dependency_blocked(issue: IssueView | None) -> bool:
 
 
 def _issue_for_pr(pr: PRView) -> int | None:
-    """Linked issue: prefer GitHub's closing-reference, fall back to the branch
-    number. Port of issue_for_pr || issue_from_branch."""
-    if pr.closing_issue is not None:
-        return pr.closing_issue
-    return issue_from_branch(pr.head_ref_name)
+    """Linked issue: the shared linkage rule (closing-ref, then branch number)
+    lives in world.issue_for_pr so liveness and the gate share one source."""
+    return issue_for_pr(pr)
 
 
 def breaker_key(pr: PRView) -> int:
@@ -1615,6 +1657,19 @@ def decide_fix(
     # identities and can safely reap every other orphan.
     if not fixer_busy or state.inflight:
         actions.extend(reap_actions(world, active_issues))
+    # Lock-free like the guards below: a label repair consumes no fixer and
+    # must not wait for one — the contradiction it clears is exactly what
+    # keeps looking dispatch-worthy every tick (#185). The repaired issues are
+    # folded into `guarded` below: an issue still LOOKS ai-ready this tick
+    # (is_ready reads labels, and the repair's CAS write lands later), so
+    # without the guard the same tick emits the repair AND a RESOLVE claim for
+    # the same issue — a race the claim's CAS usually, but not provably, loses
+    # (#185 review F2).
+    repairs = label_repair_actions(world)
+    actions.extend(repairs)
+    repaired = frozenset(
+        r.number for r in repairs if isinstance(r, Relabel)
+    )
 
     remaining = (
         (0 if fixer_busy else 1)
@@ -1680,8 +1735,16 @@ def decide_fix(
     # names the issues that pass must not dispatch — refusing an issue and
     # resolving it in the same tick would be incoherent, and the whole point is
     # that the resolve never happens.
-    guarded: set[int] = set()
+    guarded: set[int] = set(repaired)
     for dup in duplicate_pr_guards(world, cfg):
+        # A repaired issue is already being resolved toward its true state;
+        # letting the guard ALSO fire would stack a second Relabel on the same
+        # label in one tick and park the issue at ai-blocked + ai-pr-open — a
+        # new contradictory pair minted by the repair feature itself (#185
+        # review F3). The guard's outcome (this issue must not dispatch) is
+        # preserved via `guarded`.
+        if dup.issue in repaired:
+            continue
         actions.extend(dup.actions())
         guarded.add(dup.issue)
 

@@ -22,7 +22,7 @@ from datetime import datetime
 from collections.abc import Mapping
 
 from .labels import Label
-from .world import IssueView, PRView, WorldState
+from .world import IssueView, PRView, WorldState, issue_for_pr
 
 # One signal per crossed multiple of this threshold (level 1 at 30 min,
 # level 2 at 60, …), so a long stall stays visible without per-poll spam.
@@ -81,12 +81,35 @@ def issue_signature(issue: IssueView) -> str:
 
 def _watched(world: WorldState) -> list[tuple[str, int, str]]:
     targets: list[tuple[str, int, str]] = []
+    # An issue wearing ai-pr-open — and NOTHING else watched — has delegated
+    # its progress to its PR: its own signature going quiet for hours is the
+    # EXPECTED shape of a healthy review/CI cycle, not a stall. Folding the
+    # linked open PR's signature into the issue's resets the issue clock on
+    # any PR movement (pushes, verdicts, checks), so only both-quiet reads as
+    # stalled. #185: tauri #482 climbed six stall levels while its approved PR
+    # churned through FIX_CI rounds two feet away. The fold is narrowed to the
+    # sole-label case on purpose: a contradictory pair (ai-ready + ai-pr-open)
+    # or a human-wait (ai-blocked) keeps its OWN clock — the #482 stall signal
+    # was the only detector of the label contradiction this same change set
+    # fixes, and PR churn must not silence that class (#185 review F5).
+    # Linkage goes through issue_for_pr (closing-ref, then branch number):
+    # closing_issue alone is default-branch-only and silently empty on repos
+    # whose base is not the default (#185 review F1).
+    pr_sig_by_issue: dict[int, str] = {}
     for pr in world.prs:
         if pr.state == "OPEN":
-            targets.append(("pr", pr.number, pr_signature(pr)))
+            sig = pr_signature(pr)
+            targets.append(("pr", pr.number, sig))
+            linked = issue_for_pr(pr)
+            if linked is not None:
+                pr_sig_by_issue[linked] = sig
     for issue in world.issues:
-        if issue.state == "open" and issue.labels & _WATCHED_ISSUE_LABELS:
-            targets.append(("issue", issue.number, issue_signature(issue)))
+        watched_on = issue.labels & _WATCHED_ISSUE_LABELS
+        if issue.state == "open" and watched_on:
+            sig = issue_signature(issue)
+            if watched_on == {Label.AI_PR_OPEN}:
+                sig = "|".join((sig, pr_sig_by_issue.get(issue.number, "")))
+            targets.append(("issue", issue.number, sig))
     return targets
 
 

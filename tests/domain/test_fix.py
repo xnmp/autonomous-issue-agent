@@ -45,6 +45,7 @@ from issue_agent.domain.fix import (
     ci_remediations,
     ci_stall_remedies,
     cleanup_actions,
+    label_repair_actions,
     decide_fix,
     duplicate_pr_guards,
     issue_holds,
@@ -1838,6 +1839,102 @@ def test_infra_ceiling_does_not_escalate_a_pr_with_no_work_to_do():
 # relabel, so the stale repair is discarded instead of resurrecting ai-ready
 # next to the leg's fresh label (keifu #18/#25 dual-label race, 2026-08-02).
 _REV = "2026-08-02T00:00:00Z"
+
+
+def test_contradictory_ready_plus_pr_open_repairs_to_pr_open_only():
+    # #185 (tauri #482, 2026-08-09): ai-ready + ai-pr-open coexisted for 3+
+    # hours — every tick considered dispatch, the dup-PR guard refused, and
+    # the standoff read as a level-6 stall and a phantom "pending" row. With
+    # the open PR confirmed in the same snapshot, the stale ai-ready is
+    # removed (remove-only: the true state is already on the issue), CAS-bound
+    # to the observed revision so a mid-transition observation is discarded.
+    w = world(
+        issues=[issue(482, "ai-ready", "ai-pr-open", updated_at=_REV)],
+        prs=[pr(620, "ai-pr-open", head_ref_name="fix/482-backoff", closing_issue=482)],
+    )
+    assert Relabel(
+        Target.ISSUE, 482, Label.AI_READY, None, expected_revision=_REV
+    ) in label_repair_actions(w)
+    # ...and decide_fix emits it lock-free even with the fixer busy.
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=True, dispatch_slots=0)
+    assert Relabel(
+        Target.ISSUE, 482, Label.AI_READY, None, expected_revision=_REV
+    ) in actions
+
+
+def test_no_repair_without_an_open_pr_or_without_the_pair():
+    # ai-ready + ai-pr-open with NO open PR is closed-PR-cleanup's state, not
+    # a repair target; single-label issues are untouched (anti-vacuity).
+    orphan_pair = world(
+        issues=[issue(7, "ai-ready", "ai-pr-open", updated_at=_REV)]
+    )
+    assert label_repair_actions(orphan_pair) == []
+    healthy = world(
+        issues=[
+            issue(8, "ai-ready", updated_at=_REV),
+            issue(9, "ai-pr-open", updated_at=_REV),
+        ],
+        prs=[pr(90, "ai-pr-open", closing_issue=9)],
+    )
+    assert label_repair_actions(healthy) == []
+
+
+def test_a_closing_ref_alone_is_not_evidence_for_a_repair():
+    # #185 review F4: `closing_refs` over-inclusiveness (any author, possibly
+    # stale) is fail-safe for the reaper, which does LESS on a false positive.
+    # A repair does MORE — it removes a label — so a repo-wide closing ref
+    # with no in-snapshot OPEN PR must not fire it: a half-landed requeue plus
+    # a stale/foreign ref would strand the issue at ai-pr-open forever.
+    w = world(
+        issues=[issue(500, "ai-ready", "ai-pr-open", updated_at=_REV)],
+        closing_refs=[closing_ref(700, 500, author="human")],
+    )
+    assert label_repair_actions(w) == []
+
+
+def test_a_repaired_issue_is_not_claimed_or_dispatched_in_the_same_tick():
+    # #185 review F2: the repaired issue still LOOKS ai-ready this tick, and
+    # is_ready does not exclude ai-pr-open — without the guard, decide_fix
+    # emitted the repair AND a RESOLVE claim CAS-bound to the same revision,
+    # leaving a paid duplicate dispatch to lose a write race instead of being
+    # refused outright.
+    w = world(
+        issues=[issue(482, "ai-ready", "ai-pr-open", updated_at=_REV)],
+        prs=[pr(620, "ai-pr-open", head_ref_name="fix/482-backoff")],
+    )
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False, dispatch_slots=1)
+    assert Relabel(
+        Target.ISSUE, 482, Label.AI_READY, None, expected_revision=_REV
+    ) in actions
+    assert RunAgent(AgentKind.RESOLVE, 482) not in _run_agents(actions)
+    assert not any(
+        isinstance(a, Relabel) and a.number == 482 and a.add is not None
+        for a in actions
+    )
+
+
+def test_a_repair_preempts_the_duplicate_pr_guard_for_the_same_issue():
+    # #185 review F3: repair + dup guard co-firing stacked two Relabels on the
+    # same label in one tick and parked the issue at ai-blocked + ai-pr-open —
+    # a NEW contradictory pair minted by the repair feature. The repair wins;
+    # the guard's real outcome (no dispatch this tick) is kept via `guarded`.
+    w = world(
+        issues=[issue(500, "ai-ready", "ai-pr-open", updated_at=_REV)],
+        prs=[pr(700, "ai-pr-open", head_ref_name="fix/500-x")],
+        closing_refs=[closing_ref(701, 500, author="human")],
+    )
+    actions = decide_fix(w, CFG, FixState(), fixer_busy=False, dispatch_slots=1)
+    relabels = [
+        a for a in actions
+        if isinstance(a, Relabel) and a.number == 500
+    ]
+    assert relabels == [
+        Relabel(Target.ISSUE, 500, Label.AI_READY, None, expected_revision=_REV)
+    ]
+    assert not any(
+        isinstance(a, PostComment) and a.number == 500 for a in actions
+    )
+    assert RunAgent(AgentKind.RESOLVE, 500) not in _run_agents(actions)
 
 
 def test_reap_requeues_orphaned_issue_to_ready():
