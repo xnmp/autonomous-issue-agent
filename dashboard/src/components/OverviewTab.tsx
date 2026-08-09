@@ -91,28 +91,52 @@ export function OverviewTab({
 
   return (
     <div className="tabbody">
+      <header className="page-heading">
+        <div>
+          <h1>Overview</h1>
+          <p>Live operating state for <span className="mono">{repo}</span></p>
+        </div>
+        <span className="page-heading-status"><span className="repo-live-dot" />Reconciles every 10s</span>
+      </header>
       {ov.error ? (
         <ErrorBanner message={ov.error} onRetry={ov.refresh} stale={!!ov.data} />
       ) : null}
       <WarningList warnings={ov.data?.warnings} />
       {ov.loading ? <SkeletonRows what="overview" rows={5} /> : null}
 
-      <NeedsAttention items={ov.data?.needs_attention ?? []} loading={ov.loading} />
+      <div className="overview-watch-grid">
+        <NeedsAttention items={ov.data?.needs_attention ?? []} loading={ov.loading} />
 
-      <section className={`panel operator-actions-panel${(ov.data?.interventions ?? []).length > 0 ? " operator-actions-active" : ""}`}>
+        <section className={`panel operator-actions-panel${(ov.data?.interventions ?? []).length > 0 ? " operator-actions-active" : ""}`}>
+          <div className="panel-hd">
+            <span className="panel-title">Operator actions</span>
+            <span className="faint">newest first</span>
+          </div>
+          <div className="panel-bd flush">
+            <InterventionList
+              rows={ov.data?.interventions ?? []}
+              loading={ov.loading}
+            />
+          </div>
+        </section>
+      </div>
+
+      <section className="overview-health panel">
         <div className="panel-hd">
-          <span className="panel-title">Operator actions</span>
-          <span className="faint">what a human had to do, newest first</span>
+          <span className="panel-title">Daemon health</span>
+          <span className="faint">live role journals</span>
         </div>
-        <div className="panel-bd flush">
-          <InterventionList
-            rows={ov.data?.interventions ?? []}
-            loading={ov.loading}
-          />
+        <div className="panel-bd health-cards">
+          {(ov.data?.health ?? []).length === 0 && !ov.loading ? (
+            <EmptyState>no role journals found for this deployment</EmptyState>
+          ) : null}
+          {(ov.data?.health ?? []).map((h) => (
+            <HealthCard key={h.role} health={h} />
+          ))}
         </div>
       </section>
 
-      <div className="tiles overview-metrics">
+      <div className="tiles overview-metrics overview-metrics-primary">
         <StatTile
           label="Done"
           value={num(m?.done_issues)}
@@ -120,6 +144,7 @@ export function OverviewTab({
           tone="ok"
           title="open done issues"
           onClick={() => onOpenIssues("done")}
+          primary
         />
         <StatTile
           label="In flight"
@@ -127,6 +152,7 @@ export function OverviewTab({
           tone={(m?.in_flight_issues ?? 0) > 0 ? "running" : "neutral"}
           title="open in-flight and pending issues"
           onClick={() => onOpenIssues("inflight")}
+          primary
         />
         <StatTile
           label="$ per done"
@@ -134,6 +160,7 @@ export function OverviewTab({
           sub={m?.total_cost_usd != null ? `${usd(m.total_cost_usd)} total` : null}
           tone="info"
           title="the primary efficiency number: total journalled spend / done issues"
+          primary
         />
         <StatTile
           label="$ today"
@@ -141,7 +168,10 @@ export function OverviewTab({
           sub={caps?.daily_cap_usd != null ? `cap ${usd(caps.daily_cap_usd)}` : "no daily cap"}
           tone={utilTone(dailyPct) === "ok" ? "neutral" : utilTone(dailyPct)}
           alert={dailyPct !== null && dailyPct >= 85}
+          primary
         />
+      </div>
+      <div className="tiles overview-metrics overview-metrics-secondary">
         <StatTile
           label="First-pass rate"
           value={rate(m?.first_pass_rate)}
@@ -234,16 +264,6 @@ export function OverviewTab({
       <SpendPerHour buckets={ov.data?.spend_per_hour ?? []} />
 
       <HealthTrend rows={ov.data?.health_trend ?? []} loading={ov.loading} />
-
-      <SectionTitle>Daemon health</SectionTitle>
-      <div className="health-cards">
-        {(ov.data?.health ?? []).length === 0 && !ov.loading ? (
-          <EmptyState>no role journals found for this deployment</EmptyState>
-        ) : null}
-        {(ov.data?.health ?? []).map((h) => (
-          <HealthCard key={h.role} health={h} />
-        ))}
-      </div>
 
       <UnattributedCount count={ov.data?.unattributed_count ?? 0} />
 
