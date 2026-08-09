@@ -24,6 +24,7 @@ from issue_agent.domain.review import (
     ReviewMode,
     ReviewState,
     ReviewTarget,
+    UNGRANTED_DOWNGRADE_MARKER,
     count_prior_rejections,
     decide_review,
     gate_submission,
@@ -485,6 +486,10 @@ def test_submission_approval_without_required_grants_requests_changes():
     assert sub.escalate is False
     assert sub.rejected_exemptions is not None
     assert "not a mergeable approval" in sub.body
+    # The re-review copy shortcut recognizes a downgrade by this marker; if the
+    # body ever stops carrying it, an unchanged patch re-copies the downgrade
+    # forever and livelocks to the rejection ceiling (tauri #634).
+    assert UNGRANTED_DOWNGRADE_MARKER in sub.body
     assert "`tests-immutable` for `tests/existing.spec.ts`" in sub.body
     assert "additive coverage belongs in a new test file" in sub.body
     assert "Reviewer rationale:" in sub.body

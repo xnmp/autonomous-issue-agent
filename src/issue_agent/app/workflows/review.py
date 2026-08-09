@@ -1089,6 +1089,21 @@ class ReviewWorkflow:
             or prior.commit_id != prior_sha
         ):
             return _PatchShortcut()
+        if (
+            prior.state == "CHANGES_REQUESTED"
+            and review_dom.UNGRANTED_DOWNGRADE_MARKER in prior.body
+        ):
+            # A downgrade-for-ungranted-exemptions is reviewer-remediable
+            # only: the fixer has nothing to change, so copying it onto every
+            # mechanical rebase walks an approved-on-the-merits patch straight
+            # to the rejection ceiling (tauri #634). A fresh reviewer run is
+            # the one act that can grant — take the normal path.
+            self.cfg.log(
+                f"re-review #{p.number}: unchanged patch, but the standing "
+                "verdict is an ungranted-exemption downgrade — reviewing "
+                "normally so the reviewer can grant, not copying it"
+            )
+            return _PatchShortcut()
         if prior.state == "APPROVED":
             complete = self._approval_grants_complete(p, diff)
             if complete is None:

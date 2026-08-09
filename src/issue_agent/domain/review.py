@@ -39,6 +39,17 @@ DEFAULT_MAX_REVIEW_REJECTIONS = 4
 REVIEW_COMMENTED = "COMMENTED"
 REVIEW_DISMISSED = "DISMISSED"
 
+# Round-trip-stable marker inside a downgraded-for-ungranted-exemptions
+# verdict body. The re-review patch-id shortcut must NEVER copy such a
+# verdict onto a new head: its remedy is reviewer-side (emit the grant), so
+# copying it denies the one thing that can clear it — a fresh reviewer run —
+# and an unchanged patch livelocks to the rejection ceiling (tauri #634,
+# 2026-08-09: reviewer approved on the merits, forgot the grant line, and
+# every mechanical rebase re-copied the downgrade until needs-human-review).
+UNGRANTED_DOWNGRADE_MARKER = (
+    "did not grant every gate exemption required by the current patch"
+)
+
 
 def latest_reviewer_verdict(pr: PRView, reviewer: str) -> Review | None:
     """The reviewer's latest non-dismissed submitted verdict, if known."""
@@ -921,8 +932,9 @@ def review_submission(
             f"- `{rule}` for `{subject}`" for rule, subject in unique
         )
         guidance = (
-            "The reviewer returned APPROVE but did not grant every gate "
-            "exemption required by the current patch. This is therefore "
+            "The reviewer returned APPROVE but "
+            + UNGRANTED_DOWNGRADE_MARKER
+            + ". This is therefore "
             "REQUEST_CHANGES, not a mergeable approval. Either revise the "
             "patch so these exemptions are no longer required, or explicitly "
             "grant each pair on the next review. For `tests-immutable`, "

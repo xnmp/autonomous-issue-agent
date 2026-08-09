@@ -26,6 +26,7 @@ from issue_agent.domain.exemptions import (
     parse_exemption_grants,
     render_grant_line,
 )
+from issue_agent.domain import review as review_dom
 from issue_agent.domain.review import IdentityMode
 from issue_agent.app.workflows.review import ReviewWorkflow, ReviewWorkflowConfig
 from issue_agent.domain.outcome import AgentResult
@@ -1308,6 +1309,58 @@ def test_unchanged_patch_does_not_copy_verdict_from_unrelated_revision():
     asyncio.run(_workflow(gw, store, runner).re_review(100))
 
     assert len(runner.tasks) == 1
+
+
+def _downgraded_pr(head: str = "new-sha", prior_head: str = "old-sha",
+                   body: str = "fix this"):
+    return PRView(
+        100,
+        head_ref_oid=head,
+        base_ref_oid="base-sha",
+        reviews=(
+            Review(
+                "CHANGES_REQUESTED",
+                "review-bot",
+                "t1",
+                body=body,
+                commit_id=prior_head,
+            ),
+        ),
+    )
+
+
+def test_unchanged_patch_does_not_copy_an_ungranted_exemption_downgrade():
+    """An APPROVE downgraded for missing grants is remediable ONLY by a fresh
+    reviewer run that emits the grant. Copying it across mechanical rebases
+    denies that forever and livelocks to the rejection ceiling (tauri #634)."""
+    store = PatchStore()
+    _reviewed_pr(store, _REVIEWED)
+    downgrade = (
+        "The reviewer returned APPROVE but "
+        + review_dom.UNGRANTED_DOWNGRADE_MARKER
+        + ". This is therefore REQUEST_CHANGES, not a mergeable approval."
+    )
+    gw = DiffGateway(_REBASED, prs={100: _downgraded_pr(body=downgrade)})
+    runner = FakeRunner(_approved())
+
+    asyncio.run(_workflow(gw, store, runner).re_review(100))
+
+    assert len(runner.tasks) == 1, \
+        "a downgraded verdict must trigger a fresh reviewer run, not a copy"
+
+
+def test_unchanged_patch_still_copies_an_ordinary_rejection():
+    """The anti-vacuity twin: a genuine CHANGES_REQUESTED (real findings the
+    fixer must address) is still carried across a mechanical rebase for free."""
+    store = PatchStore()
+    _reviewed_pr(store, _REVIEWED)
+    gw = DiffGateway(_REBASED, prs={100: _downgraded_pr()})
+    runner = FakeRunner(_approved())
+
+    asyncio.run(_workflow(gw, store, runner).re_review(100))
+
+    assert runner.tasks == []
+    assert any(call[0] == "review" for call in gw.calls)
 
 
 def test_a_pr_with_no_recorded_patch_is_always_reviewed():
