@@ -29,7 +29,7 @@ from ..adapters.single_instance import AlreadyRunning, UnsafeLockFile, acquire
 from ..adapters.systemd_notify import SystemdNotifier
 from ..adapters.store import Store
 from ..adapters.worktree import Worktrees, build_gate_context
-from ..domain.world import WorldState, fix_probe_safe
+from ..domain.world import HeadSignal, ProbeSignals, WorldState
 from ..domain.supervision import ExitCode
 from ..domain.contracts import RunId
 from ..domain.recovery import RecoveryArm, RecoveryTrigger, recovery_plan
@@ -44,7 +44,7 @@ from .roles import (
     process_supervision_state_dir,
 )
 from .review_identity import review_identity as _app_identity
-from .world_probe import WorldProbe
+from .world_probe import WorldProbe, fix_probe_hooks
 
 
 def _load_agent_env(env: dict) -> dict:
@@ -266,13 +266,21 @@ def build_role(
     # fixer coast on the cheap signature (new work always bumps updated_at).
     # Anything no signature can see (Jira-side edits the steward mirrors, when
     # sync is on) is picked up at the probe's TTL reconciliation cadence.
-    def _probed(daemon, gw, probe_when: Callable[[WorldState], bool] | None = None):
+    def _probed(
+        daemon,
+        gw,
+        probe_when: Callable[[WorldState, ProbeSignals], bool] | None = None,
+        read_signals: (
+            Callable[[WorldState], tuple[HeadSignal, ...] | None] | None
+        ) = None,
+    ):
         if not cfg.world_probe:
             return daemon
         probe = WorldProbe(
             gw.change_signature,
             float(cfg.world_probe_ttl_seconds),
             probe_when=probe_when,
+            read_signals=read_signals,
         )
         # Daemon owns live pool state. The fix role's decision closure also
         # retains this exact instance to read capacity and in-flight paths, so
@@ -318,9 +326,12 @@ def build_role(
                     "exact-head client gate alone (base-advance residual)\n"
                 )
             )
+        fix_daemon = build_fix_daemon(cfg, gw, store, worktrees, runner)
+        probe_when, read_signals = fix_probe_hooks(
+            lambda: bool(fix_daemon.active_dispatches), gw.head_signals
+        )
         return _probed(
-            build_fix_daemon(cfg, gw, store, worktrees, runner), gw,
-            probe_when=fix_probe_safe,
+            fix_daemon, gw, probe_when=probe_when, read_signals=read_signals
         )
     if role == "review":
         gw = GitHubGateway(

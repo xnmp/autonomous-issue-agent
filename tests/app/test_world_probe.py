@@ -24,7 +24,7 @@ class Clock:
         return self.t
 
 
-def _probe(sigs, clock, ttl=300.0, probe_when=None, fetches=None):
+def _probe(sigs, clock, ttl=300.0, probe_when=None, fetches=None, read_signals=None):
     """A probe whose fetch pops canned signatures (a callable raises instead)."""
     feed = list(sigs)
 
@@ -36,7 +36,13 @@ def _probe(sigs, clock, ttl=300.0, probe_when=None, fetches=None):
             raise nxt
         return nxt
 
-    return WorldProbe(fetch, ttl_seconds=ttl, clock=clock, probe_when=probe_when)
+    return WorldProbe(
+        fetch,
+        ttl_seconds=ttl,
+        clock=clock,
+        probe_when=probe_when,
+        read_signals=read_signals,
+    )
 
 
 def _observe(probe, builds, world="w"):
@@ -60,7 +66,9 @@ def _observe_seq(probe, builds, worlds):
 
 
 IDLE, BUSY = "idle", "busy"
-_idle_only = (lambda w: w == IDLE)  # stands in for domain.world.fix_probe_safe
+# Stands in for domain.world.fix_probe_safe, which reads the world AND the
+# blind-spot signals the gate re-read this tick (#163).
+_idle_only = (lambda w, _signals: w == IDLE)
 
 
 def test_first_tick_always_builds_and_unchanged_ticks_then_skip():
@@ -223,3 +231,170 @@ def test_a_failed_build_does_not_commit_the_new_signature():
     with pytest.raises(GhUnavailable):
         observe()                    # same sig again, but nothing was committed
     assert len(calls) == 2
+
+
+# ── read_signals: folding the CI/mergeability blind spot into the gate (#163) ─
+# The fixer used to refuse to probe whenever ANY open harness PR existed, so a
+# PR waiting on CI cost a full GraphQL build every tick. The gate now re-reads
+# that blind spot cheaply and hands both readings to the predicate, which gates
+# only when nothing moved.
+def _stable_when_unmoved(_world, signals):
+    """Stand-in for fix_probe_safe's in-flight arm: gate only on two readings
+    that both exist and agree."""
+    return (
+        signals.current is not None
+        and signals.previous is not None
+        and signals.current == signals.previous
+    )
+
+
+def test_unchanged_blind_spot_readings_let_an_in_flight_world_skip():
+    clock, builds, reads = Clock(), [], []
+
+    def read(world):
+        reads.append(world)
+        return ("ci=green",)
+
+    observe = _observe_seq(
+        _probe(["5@t1", "5@t1", "5@t1"], clock,
+               probe_when=_stable_when_unmoved, read_signals=read),
+        builds, [BUSY],
+    )
+    observe()                        # 1: no world yet → build, nothing read
+    observe()                        # 2: first reading, none committed → build
+    observe()                        # 3: readings agree → probe, no signature yet
+    with pytest.raises(WorldUnchanged):
+        observe()                    # 4: reading AND signature both unchanged
+    assert (len(builds), reads) == (3, [BUSY, BUSY, BUSY])
+
+
+def test_a_moved_blind_spot_reading_rebuilds_even_on_an_unchanged_signature():
+    """CI completion moves no updated_at — this reading is the only witness."""
+    clock, builds = Clock(), []
+    feed = [("ci=pending",), ("ci=pending",), ("ci=green",)]
+    observe = _observe_seq(
+        _probe(["5@t1", "5@t1", "5@t1"], clock,
+               probe_when=_stable_when_unmoved,
+               read_signals=lambda _w: feed.pop(0)),
+        builds, [BUSY],
+    )
+    observe()
+    observe()
+    observe()                        # green ≠ pending → full build despite 5@t1
+    assert len(builds) == 3
+
+
+def test_an_unreadable_blind_spot_builds_instead_of_skipping():
+    """Fail toward observation: a failed read is NOT "nothing changed"."""
+    clock, builds = Clock(), []
+    observe = _observe_seq(
+        _probe(["5@t1", "5@t1", "5@t1"], clock,
+               probe_when=_stable_when_unmoved, read_signals=lambda _w: None),
+        builds, [BUSY],
+    )
+    observe()
+    observe()
+    observe()
+    assert len(builds) == 3
+
+
+def test_the_first_tick_reads_no_blind_spot_at_all():
+    """Nothing has been observed, so there are no in-flight heads to read."""
+    clock, builds, reads = Clock(), [], []
+    observe = _observe_seq(
+        _probe([], clock, probe_when=_stable_when_unmoved,
+               read_signals=lambda w: reads.append(w) or ()),
+        builds, [BUSY],
+    )
+    observe()
+    assert (len(builds), reads) == (1, [])
+
+
+def test_the_committed_reading_is_the_one_taken_before_the_build():
+    """A CI flip inside the read→build window must cost one redundant build, not
+    a skipped tick: the value committed alongside a world is the PRE-build read,
+    so the next tick sees a difference rather than absorbing the flip."""
+    clock, builds, seen = Clock(), [], []
+    feed = [("t1",), ("t2",), ("t2",)]
+
+    def probe_when(_world, signals):
+        seen.append((signals.current, signals.previous))
+        return _stable_when_unmoved(_world, signals)
+
+    observe = _observe_seq(
+        _probe(["5@t1", "5@t1", "5@t1"], clock,
+               probe_when=probe_when, read_signals=lambda _w: feed.pop(0)),
+        builds, [BUSY],
+    )
+    observe()                        # build 1 commits nothing (no world yet)
+    observe()                        # reads ("t1",) → commits it with build 2
+    observe()                        # reads ("t2",) vs committed ("t1",) → build 3
+    assert seen == [(("t1",), None), (("t2",), ("t1",))]
+    assert len(builds) == 3
+
+
+# ── fix_probe_hooks: the paid-dispatch guard (#163) ──────────────────────────
+# A running leg can finish, die or be cancelled without touching any issue or
+# PR, so no GitHub reading can speak for it: while one is in flight the tick
+# must build, and the reading must not even be bought.
+from issue_agent.app.world_probe import fix_probe_hooks  # noqa: E402
+from issue_agent.domain.labels import Label  # noqa: E402
+from issue_agent.domain.world import (  # noqa: E402
+    Check,
+    HeadRef,
+    HeadSignal,
+    PRView,
+    ProbeSignals,
+    WorldState,
+)
+
+
+def _in_flight_world():
+    return WorldState(
+        prs=(
+            PRView(
+                number=7,
+                state="OPEN",
+                labels=frozenset({Label.AI_PR_OPEN}),
+                checks=(Check(name="ci", state="COMPLETED", bucket="pass"),),
+            ),
+        )
+    )
+
+
+def test_a_running_leg_forces_a_build_and_buys_no_reading():
+    reads = []
+    probe_when, read_signals = fix_probe_hooks(
+        lambda: True, lambda heads: reads.append(heads) or ()
+    )
+    world = _in_flight_world()
+    signal = (HeadSignal(number=7, ci="same"),)
+    assert read_signals(world) is None
+    assert probe_when(world, ProbeSignals(signal, signal)) is False
+    assert reads == []
+
+
+def test_with_no_leg_running_the_reading_is_taken_for_the_in_flight_heads():
+    reads = []
+
+    def read(heads):
+        reads.append(tuple(heads))
+        return (HeadSignal(number=7, ci="same"),)
+
+    probe_when, read_signals = fix_probe_hooks(lambda: False, read)
+    world = _in_flight_world()
+    current = read_signals(world)
+    assert reads == [(HeadRef(7),)]
+    assert probe_when(world, ProbeSignals(current, current)) is True
+    assert probe_when(world, ProbeSignals(current, None)) is False
+
+
+def test_an_idle_world_buys_no_reading_but_still_gates():
+    reads = []
+    probe_when, read_signals = fix_probe_hooks(
+        lambda: False, lambda heads: reads.append(heads) or ()
+    )
+    idle = WorldState()
+    assert read_signals(idle) == ()
+    assert reads == [()]  # the adapter is asked for nothing
+    assert probe_when(idle, ProbeSignals((), ())) is True

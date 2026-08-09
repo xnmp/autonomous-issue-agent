@@ -30,6 +30,7 @@ from issue_agent.adapters.github import (
     parse_closing_refs,
     parse_issue,
     parse_pr,
+    parse_terminal_pr,
     parse_world,
 )
 from issue_agent.domain.actions import (
@@ -2660,3 +2661,361 @@ def test_a_skipped_checks_call_is_unread_not_empty():
     fr = FakeRunner({"pr view 100": pr_resp})
     pr = GitHubGateway("o/r", runner=fr).get_pr(100, checks=False)
     assert pr.checks_known is False
+
+
+# ── #163: the stale merged tail is built from the list payload, not `pr view` ─
+# GitHub's search index keeps serving merged PRs for about a day after their
+# label is removed. Nineteen of them cost a `gh pr view` EACH, in the fix build
+# AND the review build — ~38 of ~71 GraphQL points per tick round. The labelled
+# list costs the same two requests whatever fields it selects, so the same facts
+# come back for free.
+_TERMINAL_ROW = {
+    "number": 60,
+    "state": "MERGED",
+    "labels": [{"name": "ai-done"}],
+    "headRefName": "fix/12-thing",
+    "headRefOid": "abc123",
+    "baseRefName": "dev",
+    "baseRefOid": "def456",
+    "title": "fix: the thing",
+    "isDraft": False,
+    "author": {"login": "fix-bot"},
+    "closingIssuesReferences": [{"number": 12}],
+}
+
+
+def test_a_list_built_terminal_pr_decides_exactly_like_the_view_built_one():
+    """The guardrail. The `gh pr view` payload is strictly RICHER than the list
+    row (body/comments/reviews/files), so this compares the cheap view against a
+    realistic full one and pins field-by-field which facts must be identical —
+    every one a lifecycle decision reads off a non-OPEN PR — and which are
+    honestly marked unread rather than defaulted to empty."""
+    view_payload = {
+        **_TERMINAL_ROW,
+        "body": "Fixes #12",
+        "comments": [{"author": {"login": "reviewer"}, "body": "lgtm"}],
+        "reviews": [{"author": {"login": "reviewer"}, "state": "APPROVED"}],
+        "files": [{"path": "src/thing.py"}],
+        "mergeable": "MERGEABLE",
+        "mergeStateStatus": "CLEAN",
+    }
+    cheap = parse_terminal_pr(_TERMINAL_ROW, label="ai-pr-open")
+    full = parse_pr(view_payload)
+    decision_fields = (
+        "number", "state", "labels", "closing_issue", "head_ref_name",
+        "head_ref_oid", "base_ref_name", "base_ref_oid", "title", "is_draft",
+        "author",
+    )
+    assert [getattr(cheap, f) for f in decision_fields] == [
+        getattr(full, f) for f in decision_fields
+    ]
+    assert (cheap.number, cheap.state, cheap.closing_issue) == (60, "MERGED", 12)
+    assert cheap.labels == frozenset({Label.AI_DONE})
+    # UNREAD, never read-as-empty (#48): both flags say so, and the values the
+    # richer payload would have carried are absent rather than wrong.
+    assert (cheap.checks_known, cheap.content_known) == (False, False)
+    assert (cheap.body, cheap.comments, cheap.reviews, cheap.changed_files) == (
+        "", (), (), frozenset()
+    )
+    assert full.content_known is True
+
+
+def test_a_terminal_pr_still_wearing_the_label_keeps_its_full_fetch():
+    """A PR that can still DRIVE cleanup is decided on authoritative labels: the
+    search index is stale in the "still listed" direction, so a row showing the
+    label cannot distinguish fresh from stale."""
+    row = {**_TERMINAL_ROW, "labels": [{"name": "ai-pr-open"}]}
+    assert parse_terminal_pr(row, label="ai-pr-open") is None
+
+
+def test_an_open_or_unknown_state_keeps_its_full_fetch():
+    assert parse_terminal_pr({**_TERMINAL_ROW, "state": "OPEN"}, label="x") is None
+    assert parse_terminal_pr({**_TERMINAL_ROW, "state": ""}, label="x") is None
+    assert parse_terminal_pr({**_TERMINAL_ROW, "state": None}, label="x") is None
+
+
+def test_a_malformed_or_partial_row_keeps_its_full_fetch():
+    """Never launder partial data into a trusted view."""
+    for key in _TERMINAL_ROW:
+        partial = {k: v for k, v in _TERMINAL_ROW.items() if k != key}
+        assert parse_terminal_pr(partial, label="ai-pr-open") is None, key
+    assert parse_terminal_pr({**_TERMINAL_ROW, "labels": "ai-done"}, label="x") is None
+    assert parse_terminal_pr(
+        {**_TERMINAL_ROW, "closingIssuesReferences": {}}, label="x"
+    ) is None
+    assert parse_terminal_pr({**_TERMINAL_ROW, "number": "sixty"}, label="x") is None
+    assert parse_terminal_pr(None, label="x") is None
+    assert parse_terminal_pr([_TERMINAL_ROW], label="x") is None
+
+
+def test_a_hostile_row_can_never_raise_out_of_a_world_build():
+    """The real contract: a world build has no per-item isolation around this
+    call, so an oddly-shaped row must degrade to "fetch it properly" — never to
+    a dead poll (the V10 class)."""
+    hostile = [
+        {**_TERMINAL_ROW, "author": "fix-bot"},              # str, not {login}
+        {**_TERMINAL_ROW, "author": None},
+        {**_TERMINAL_ROW, "labels": [None, 7, {"nope": 1}]},
+        {**_TERMINAL_ROW, "closingIssuesReferences": [{"number": "twelve"}]},
+        {**_TERMINAL_ROW, "headRefName": None, "title": None},
+        {**_TERMINAL_ROW, "isDraft": {"weird": True}},
+        {**_TERMINAL_ROW, "number": None},
+        {**_TERMINAL_ROW, "state": ["MERGED"]},
+    ]
+    for row in hostile:
+        parse_terminal_pr(row, label="ai-pr-open")  # must not raise
+
+
+def test_a_bare_string_label_list_still_blocks_the_cheap_path():
+    """The gate and the view parser must never disagree about "carries the
+    label": reading a bare-string list as "no labels" would take the cheap path
+    for a PR whose PRView then DOES carry the trigger label."""
+    row = {**_TERMINAL_ROW, "labels": ["ai-pr-open"]}
+    assert parse_terminal_pr(row, label="ai-pr-open") is None
+    # …and an operator-configured trigger label the Label enum never heard of.
+    rogue = {**_TERMINAL_ROW, "labels": ["team-review"]}
+    assert parse_terminal_pr(rogue, label="team-review") is None
+    assert parse_terminal_pr(rogue, label="ai-pr-open") is not None
+
+
+def _tail_runner(rows, views=None, calls=None):
+    def runner(argv, token):
+        key = " ".join(argv)
+        if calls is not None:
+            calls.append(key)
+        if "issue list" in key:
+            return "[]"
+        if "pr list" in key:
+            return json.dumps(rows)
+        for number, payload in (views or {}).items():
+            if f"pr view {number}" in key:
+                return json.dumps(payload)
+        return ""
+
+    return runner
+
+
+def test_build_world_spends_no_pr_view_on_the_stale_unlabelled_tail():
+    calls = []
+    gw = GitHubGateway("o/r", runner=_tail_runner([_TERMINAL_ROW], calls=calls))
+    prs = gw.build_world().prs
+    assert [(p.number, p.state) for p in prs] == [(60, "MERGED")]
+    assert not [c for c in calls if "pr view" in c]
+
+
+def test_build_review_world_spends_no_pr_view_on_the_stale_unlabelled_tail():
+    calls = []
+    gw = GitHubGateway(
+        "o/r", runner=_tail_runner([_TERMINAL_ROW], calls=calls),
+        review_pr_label="ai-review",
+    )
+    prs = gw.build_review_world().prs
+    assert [(p.number, p.state) for p in prs] == [(60, "MERGED")]
+    assert not [c for c in calls if "pr view" in c]
+
+
+def test_the_stale_tail_still_leaves_the_orphaned_cleanup_arm_free_to_repair():
+    """#28 class guardrail: the ISSUE-driven repair fires precisely because the
+    unlabelled merged PR does not "cover" its issue. Building that PR from the
+    list payload must not change which issues are covered."""
+    from issue_agent.domain.fix import orphaned_cleanup_actions
+
+    def runner(argv, token):
+        key = " ".join(argv)
+        if "issue list" in key:
+            return json.dumps([{"number": 12}])
+        if "pr list" in key:
+            return json.dumps([_TERMINAL_ROW])
+        if "issue view 12" in key:
+            return json.dumps({
+                "number": 12, "state": "CLOSED",
+                "labels": [{"name": "ai-pr-open"}],
+            })
+        return ""
+
+    world = GitHubGateway("o/r", runner=runner).build_world()
+    assert [type(a).__name__ for a in orphaned_cleanup_actions(world)] == [
+        "RemoveWorktree", "Relabel", "ClearIssueState",
+    ]
+
+
+def test_a_terminal_pr_still_wearing_the_label_is_fetched_and_drives_cleanup():
+    calls = []
+    row = {**_TERMINAL_ROW, "labels": [{"name": "ai-pr-open"}]}
+    gw = GitHubGateway(
+        "o/r",
+        runner=_tail_runner(
+            [row],
+            views={60: {"number": 60, "state": "MERGED",
+                        "labels": [{"name": "ai-pr-open"}]}},
+            calls=calls,
+        ),
+    )
+    prs = gw.build_world().prs
+    assert [(p.number, p.state, Label.AI_PR_OPEN in p.labels) for p in prs] == [
+        (60, "MERGED", True)
+    ]
+    assert [c for c in calls if "pr view 60" in c]
+
+
+# ── #163: the fixer's blind-spot reading (CI + mergeability over REST) ────────
+def _signal_runner(pull, checks=(), statuses=()):
+    def runner(argv, token):
+        key = " ".join(argv)
+        if "/pulls/" in key:
+            return pull
+        if "/check-runs" in key:
+            return json.dumps([{"check_runs": list(checks)}])
+        if "/statuses" in key:
+            return json.dumps([list(statuses)])
+        return ""
+
+    return runner
+
+
+def _per_head_runner(per_head):
+    """A runner that serves a DIFFERENT pull object and check set per PR number,
+    so a reading is pinned to the head it was taken for."""
+    last = {"number": None}
+
+    def runner(argv, token):
+        key = " ".join(argv)
+        for number in per_head:
+            if f"/pulls/{number}" in key:
+                last["number"] = number
+                return per_head[number]["pull"]
+        if "/check-runs" in key:
+            return json.dumps(
+                [{"check_runs": per_head[last["number"]].get("checks", [])}]
+            )
+        if "/statuses" in key:
+            return json.dumps([[]])
+        return ""
+
+    return runner
+
+
+def test_head_signals_reads_ci_and_mergeability_for_each_head():
+    from issue_agent.domain.world import HeadRef
+
+    gw = GitHubGateway(
+        "o/r",
+        runner=_per_head_runner({
+            7: {
+                "pull": "OPEN\tfalse\ttrue\tclean\tsha7",
+                "checks": [
+                    {"name": "ci", "status": "completed", "conclusion": "success"}
+                ],
+            },
+            9: {
+                "pull": "OPEN\tfalse\tfalse\tdirty\tsha9",
+                "checks": [{"name": "ci", "status": "queued"}],
+            },
+        }),
+    )
+    signals = gw.head_signals((HeadRef(7), HeadRef(9)))
+    assert signals is not None
+    assert [(s.number, s.head_ref_oid) for s in signals] == [(7, "sha7"), (9, "sha9")]
+    assert signals[0].mergeable != signals[1].mergeable
+    assert signals[0].ci != signals[1].ci
+    assert [s.failing for s in signals] == [False, False]
+
+
+def test_one_unreadable_head_makes_the_whole_reading_unread():
+    """Partial coverage would let the predicate gate on a head it never saw."""
+    from issue_agent.domain.world import HeadRef
+
+    gw = GitHubGateway(
+        "o/r",
+        runner=_per_head_runner({
+            7: {"pull": "OPEN\tfalse\ttrue\tclean\tsha7"},
+            9: {"pull": "garbage"},
+        }),
+    )
+    assert gw.head_signals((HeadRef(7), HeadRef(9))) is None
+
+
+def test_a_rerun_that_lands_on_the_same_bucket_still_moves_the_reading():
+    """`startedAt` is the only field that separates a re-run from the original
+    when name/state/bucket are identical."""
+    from issue_agent.domain.world import HeadRef
+
+    def gw_for(started):
+        return GitHubGateway(
+            "o/r",
+            runner=_signal_runner(
+                "OPEN\tfalse\ttrue\tclean\tsha9",
+                checks=[{
+                    "name": "ci", "status": "completed", "conclusion": "success",
+                    "started_at": started,
+                }],
+            ),
+        )
+
+    first = gw_for("2026-08-09T10:00:00Z").head_signals((HeadRef(7),))
+    rerun = gw_for("2026-08-09T11:00:00Z").head_signals((HeadRef(7),))
+    assert first != rerun
+
+
+def test_a_timed_out_head_is_unread_and_does_not_kill_the_tick():
+    """One wedged `gh api` must not skip EVERY fix tick for as long as it stays
+    wedged — the read lives outside the build's per-PR isolation now."""
+    from issue_agent.domain.world import HeadRef
+
+    def wedged(argv, token):
+        raise GhUnavailable("network", "timeout", timed_out=True)
+
+    assert GitHubGateway("o/r", runner=wedged).head_signals((HeadRef(7),)) is None
+
+
+def test_a_systemic_gh_failure_still_propagates_to_the_skip_tick_arm():
+    """Anti-regression twin: a rate limit is not one head's problem."""
+    from issue_agent.domain.world import HeadRef
+
+    def throttled(argv, token):
+        raise GhUnavailable("rate-limit", "secondary limit")
+
+    with pytest.raises(GhUnavailable):
+        GitHubGateway("o/r", runner=throttled).head_signals((HeadRef(7),))
+
+
+def test_head_signals_flags_a_failing_check_so_the_tick_rebuilds():
+    from issue_agent.domain.world import HeadRef
+
+    gw = GitHubGateway(
+        "o/r",
+        runner=_signal_runner(
+            "OPEN\tfalse\ttrue\tunstable\tsha9",
+            checks=[{"name": "ci", "status": "completed", "conclusion": "failure"}],
+        ),
+    )
+    assert gw.head_signals((HeadRef(7),))[0].failing is True
+
+
+def test_head_signals_are_none_when_a_head_is_unreadable():
+    from issue_agent.domain.world import HeadRef
+
+    short = GitHubGateway("o/r", runner=_signal_runner("OPEN\ttrue"))
+    assert short.head_signals((HeadRef(7),)) is None
+    no_sha = GitHubGateway("o/r", runner=_signal_runner("OPEN\tfalse\ttrue\tclean\t"))
+    assert no_sha.head_signals((HeadRef(7),)) is None
+
+    def broken_checks(argv, token):
+        if "/pulls/" in " ".join(argv):
+            return "OPEN\tfalse\ttrue\tclean\tsha9"
+        return "not json at all"
+
+    assert GitHubGateway("o/r", runner=broken_checks).head_signals(
+        (HeadRef(7),)
+    ) is None
+
+
+def test_head_signals_spend_nothing_without_heads():
+    calls = []
+
+    def runner(argv, token):
+        calls.append(argv)
+        return ""
+
+    assert GitHubGateway("o/r", runner=runner).head_signals(()) == ()
+    assert calls == []

@@ -987,10 +987,12 @@ def _wake_check(cfg: HarnessConfig, store: Store):
     Interaction with the world probe: a webhook-shortened tick lands inside the
     probe's TTL, and check_suite/status deliveries move NO issue/PR updated_at —
     change_signature reads unchanged and the tick observes nothing. That is fine
-    for review/steward (neither reads checks), and the FIXER only stays correct
-    because `fix_probe_safe` refuses to gate whenever an ai-pr-open PR exists —
-    exactly when a checks event matters. Weaken that predicate and CI-completion
-    wakes silently become no-ops until the TTL expires."""
+    for review/steward (neither reads checks). For the FIXER the load-bearing
+    invariant is now `WorldProbe.read_signals`: since #163 the fixer DOES gate
+    with an ai-pr-open PR open, and a CI-completion wake turns into a build only
+    because that hook re-reads the head's CI directly and `fix_probe_safe`
+    refuses to gate on a changed reading. Remove or weaken that reading and
+    CI-completion wakes silently become no-ops until the TTL expires."""
     if not cfg.webhook_wake:
         return None
     return WakeSignal(wake_path(store.state_dir)).pending
@@ -1593,6 +1595,12 @@ def _prediction_outcome_reporter(
             return
         for pr in world.prs:
             if pr.state not in ("MERGED", "CLOSED") or pr.closing_issue is None:
+                continue
+            # `changed_files` UNREAD is not "no files changed": the terminal-PR
+            # fast path (#163) builds a view without them, and this claim is
+            # durable and deduped, so a false 0/N would permanently corrupt the
+            # predicted-path hit rate (adversarial review F4).
+            if not pr.content_known:
                 continue
             try:
                 predicted = frozenset(
