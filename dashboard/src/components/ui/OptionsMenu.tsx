@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { Icon } from "./Icon";
 
 export const DASHBOARD_THEMES = [
   ["cosmic-dusk", "Cosmic Dusk"],
@@ -51,7 +52,7 @@ export function OptionsMenu({
         title="Settings"
         onClick={() => setOpen((current) => !current)}
       >
-        <span className="rail-btn-mark settings-icon" aria-hidden="true">⚙</span>
+        <span className="rail-btn-mark settings-icon" aria-hidden="true"><Icon name="settings" /></span>
         {!collapsed ? <span>Settings</span> : null}
       </button>
       {open ? (

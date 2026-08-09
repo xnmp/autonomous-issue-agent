@@ -26,8 +26,8 @@ import type {
 import { IssueTab } from "./components/IssueTab";
 import { VerificationTab } from "./components/VerificationTab";
 import { EmptyState } from "./components/ui/Feedback";
-import { Chip } from "./components/ui/Chip";
-import { stageTone } from "./lib/semantics";
+import { Chip, Dot } from "./components/ui/Chip";
+import { HEALTH_LABEL, HEALTH_TONE, roleHealth, stageTone } from "./lib/semantics";
 import {
   DASHBOARD_THEMES,
   type DashboardOptions,
@@ -317,7 +317,30 @@ export default function App() {
           {route.view === "verification" ? (
             <span className="global-view-title">Verification ledger</span>
           ) : (
-            <TabStrip tabs={tabs} />
+            <>
+              <div className="repo-context">
+                <div className="repo-context-title">
+                  <span className="repo-context-name mono">{selectedRepo ?? "No deployment"}</span>
+                  {selectedRepoSummary?.active ? (
+                    <span className="repo-live"><span className="repo-live-dot" />Live</span>
+                  ) : null}
+                </div>
+                <div className="repo-context-meta">
+                  {selectedRepoSummary?.repo ?? "Select a deployment"}
+                  {selectedRepoSummary?.roles.map((role) => {
+                    const health = roleHealth(role);
+                    return (
+                      <Dot
+                        key={role.role}
+                        tone={HEALTH_TONE[health]}
+                        title={`${role.role}: ${HEALTH_LABEL[health]}`}
+                      />
+                    );
+                  })}
+                </div>
+              </div>
+              <TabStrip tabs={tabs} />
+            </>
           )}
         </div>
         <div className="mainbody">

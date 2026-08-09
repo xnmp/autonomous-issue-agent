@@ -53,8 +53,8 @@ describe("sidebar width", () => {
     resizer().focus();
     await userEvent.keyboard("{ArrowRight}{ArrowRight}");
 
-    expect(resizer()).toHaveAttribute("aria-valuenow", "288");
-    expect(localStorage.getItem(WIDTH_KEY)).toBe("288");
+    expect(resizer()).toHaveAttribute("aria-valuenow", "272");
+    expect(localStorage.getItem(WIDTH_KEY)).toBe("272");
   });
 
   it("keeps the remembered width whole and inside the range the stylesheet supports", async () => {
@@ -70,11 +70,11 @@ describe("sidebar width", () => {
   });
 
   it.each([
-    ["a fractional width from a zoomed browser", "263.991455078125", "264"],
+    ["a fractional width from a zoomed browser", "247.991455078125", "248"],
     ["a width wider than the rail may be", "9000", "480"],
     ["a width narrower than the rail may be", "12", "220"],
-    ["a corrupt entry", "not-a-number", "264"],
-    ["an empty entry", "", "264"],
+    ["a corrupt entry", "not-a-number", "248"],
+    ["an empty entry", "", "248"],
   ])("recovers from %s", (_name, stored, expected) => {
     localStorage.setItem(WIDTH_KEY, stored);
     renderSidebar();
@@ -83,6 +83,6 @@ describe("sidebar width", () => {
 
   it("starts at the default width when nothing is remembered", () => {
     renderSidebar();
-    expect(resizer()).toHaveAttribute("aria-valuenow", "264");
+    expect(resizer()).toHaveAttribute("aria-valuenow", "248");
   });
 });
