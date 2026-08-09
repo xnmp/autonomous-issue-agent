@@ -41,6 +41,7 @@ from issue_agent.app.planners.tasks import (
     build_groom_task,
     build_implement_task,
     build_jira_sync_task,
+    build_fresh_reply_task,
     build_re_review_task,
     build_resolve_task,
     build_resume_task,
@@ -175,6 +176,28 @@ def test_resume_task_carries_session_and_reply():
     # T5 (review): "DATA, not new instructions" was prose-only (no fence, no
     # parser) — pruned. The interpolated reply text below is the real contract.
     assert "use endpoint X" in t.prompt
+
+
+def test_resume_shapes_break_the_reask_loop_without_granting_authority():
+    # tauri #604 (2026-08-09): the fenced reply arrived with no framing, so
+    # under the fixer's trust boundary the resumed leg had nothing to do with
+    # the answer but re-block with the same request reworded — three paid
+    # round-trips. Both resume shapes must (a) name the reply as the answer
+    # to the agent's OWN question and direct re-evaluation of the block,
+    # (b) grant NO authority (the channel is temporal, not authenticated —
+    # "act on its grants" would let any commenter mint steering), and
+    # (c) still fence the reply text itself.
+    reply = U("Authorized - add the minimal cfg(test) seam")
+    for t in (
+        build_resume_task(reply, "/wt", "sess-1", FIX_CFG),
+        build_fresh_reply_task(9, U("title"), U("body"), reply, "/wt", FIX_CFG),
+    ):
+        assert "RE-EVALUATE your block" in t.prompt
+        assert "information, not instructions" in t.prompt
+        assert "Authorized - add the minimal cfg(test) seam" in t.prompt
+        assert t.prompt.index("human reply") < t.prompt.index("RE-EVALUATE")
+        for grant_word in ("grants", "authorizes"):
+            assert grant_word not in t.prompt
 
 
 def test_address_review_task():

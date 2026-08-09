@@ -232,7 +232,7 @@ don't keep going back to edit it — each re-plan costs a full model round-trip.
   test to go green. You MAY correct an existing test whose expectation is
   itself wrong (including making it self-isolating so it passes on any host):
   do it directly — no trailer, no permission request — and explain the
-  correction in the PR description. The gate admits up to 8 modified existing
+  correction in the PR description. The gate admits up to 7 modified existing
   test files (more reads as a rewrite and is denied), and the independent
   reviewer must explicitly approve every one of them before the PR can merge,
   so a weakened test cannot land unnoticed. Do NOT refactor unrelated code.
@@ -257,6 +257,19 @@ don't keep going back to edit it — each re-plan costs a full model round-trip.
 - Do NOT open a PR unless all hooks pass.
 - If you genuinely cannot proceed, return `status=blocked` and state EXACTLY what
   you need. Do not guess.
+- **Never block to request permission for a code decision reviewable in the
+  PR.** Adding a minimal test seam (a `cfg(test)` constructor, a small public
+  test hook, an integration-test harness), correcting an existing test, or
+  touching more files than you expected are ENGINEERING decisions inside your
+  authority: make the change, keep it minimal, and justify it in the PR body —
+  the independent reviewer is the authority that judges it, and an unjustified
+  seam costs you a review round, not a rule violation. Blocking is for things
+  no PR reviewer can resolve: product ambiguity (two contradictory readings of
+  the issue), missing environment/credentials, or a harness rule that denies
+  every legal move. Asking "may I add X to the code" burns a paid round-trip
+  to a human who will read your PR anyway (tauri #604, 2026-08-09: three
+  permission round-trips for a cfg(test) constructor the reviewer was always
+  going to see).
 - If a hook blocks a legitimate action, do NOT call `gh issue create`: fixer
   publication authority is intentionally limited to its branch and PR. Work
   around the block if possible. If it prevents completion, return
