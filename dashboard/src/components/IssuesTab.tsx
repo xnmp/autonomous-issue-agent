@@ -55,6 +55,7 @@ import { readFlag, writeFlag } from "../lib/prefs";
 import { Chip } from "./ui/Chip";
 import { EtaProgress } from "./ui/Charts";
 import { StepBadge, StepBadgeRow } from "./ui/StepBadge";
+import { LifecycleStepper } from "./ui/LifecycleStepper";
 import { TableFilter } from "./ui/TableFilter";
 import { ColumnMenu, type ColumnChoice } from "./ui/ColumnMenu";
 import {
@@ -278,6 +279,13 @@ export function IssuesTab({
     // anchor prop, and none of them can drift apart.
     <SnapshotAnchor.Provider value={issues.updatedAt}>
     <div className="tabbody" onContextMenu={openColumnMenu}>
+      <header className="page-heading">
+        <div>
+          <h1>Issues</h1>
+          <p><span className="mono">{repo}</span> · {sub === "inflight" ? "live work and operator holds" : sub === "done" ? "merged execution history" : "unadmitted work"}</p>
+        </div>
+        <span className="page-heading-status num">{filteredCount} shown</span>
+      </header>
       {!ghOk ? <div className="row"><span className="spacer" /><GhUnavailableChip /></div> : null}
       <ColumnMenu
         columns={COLUMN_CHOICES[sub]}
@@ -1395,36 +1403,54 @@ function overBudget(card: IssueCard): boolean {
 function IssueSummary({ card, open }: { card: IssueCard; open: boolean }) {
   const secondaryFlags = card.flags.filter((flag) => flag !== card.human_action);
   const status = humanStatus(card);
+  const attention = card.human_action === "awaiting-reply"
+    ? "blocked"
+    : card.human_action === "escalated"
+        || card.stage === "blocked"
+        || card.stage === "escalated"
+      ? "escalated"
+      : null;
   return (
-    <div className="issue-summary">
-      <span className={`chev${open ? " open" : ""}`} aria-hidden="true">▸</span>
-      <div className="issue-summary-main">
-        <span className="issue-summary-title" title={card.title ?? undefined}>
-          {card.title ?? <span className="faint">title unavailable</span>}
-        </span>
-        {status ? (
-          <span
-            className={`issue-attention${card.human_action === "merge-ready" ? " issue-attention-ready" : ""}`}
-            title={status}
-          >
-            <span className="issue-attention-label">Harness</span>
-            <span className="issue-attention-text">{status}</span>
+    <div className="issue-cell">
+      <div className="issue-summary">
+        <span className={`chev${open ? " open" : ""}`} aria-hidden="true">▸</span>
+        <div className="issue-summary-main">
+          <span className="issue-summary-title" title={card.title ?? undefined}>
+            {card.title ?? <span className="faint">title unavailable</span>}
           </span>
-        ) : null}
-        <div className="row-wrap">
-          <IssueNumber issue={card.issue} url={card.url} />
-          <PrLink card={card} />
-          {card.stage === "blocked" || card.stage === "escalated" ? (
-            <span className="attention-stage">{card.stage}</span>
-          ) : null}
-          {card.human_action ? (
-            <span className={`human-action human-action-${card.human_action}`}>
-              {card.human_action.replace("-", " ")}
+          {status ? (
+            <span
+              className={`issue-attention${card.human_action === "merge-ready" ? " issue-attention-ready" : ""}`}
+              title={status}
+            >
+              <span className="issue-attention-label">Harness</span>
+              <span className="issue-attention-text">{status}</span>
             </span>
           ) : null}
-          {secondaryFlags.length > 0 ? <FlagList flags={secondaryFlags} /> : null}
+          <div className="row-wrap">
+            <IssueNumber issue={card.issue} url={card.url} />
+            <PrLink card={card} />
+            {card.stage === "blocked" || card.stage === "escalated" ? (
+              <span className="attention-stage">{card.stage}</span>
+            ) : null}
+            {card.human_action ? (
+              <span className={`human-action human-action-${card.human_action}`}>
+                {card.human_action.replace("-", " ")}
+              </span>
+            ) : null}
+            {secondaryFlags.length > 0 ? <FlagList flags={secondaryFlags} /> : null}
+          </div>
         </div>
       </div>
+      <LifecycleStepper
+        compact
+        steps={card.steps}
+        stage={card.stage}
+        done={card.done}
+        hasPullRequest={card.pr !== null}
+        attention={attention}
+        label={`Issue #${card.issue} lifecycle`}
+      />
     </div>
   );
 }

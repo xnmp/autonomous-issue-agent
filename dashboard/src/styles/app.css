@@ -1188,7 +1188,7 @@
   padding: var(--s1);
   background: var(--elevated);
   border-color: var(--border-strong);
-  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.32);
+  box-shadow: var(--shadow-lg);
 }
 .column-menu-title {
   padding: var(--s1) var(--s2);
@@ -1309,7 +1309,7 @@
   padding: var(--s2);
   background: var(--elevated);
   border-color: var(--border-strong);
-  box-shadow: 0 12px 28px rgba(0, 0, 0, 0.32);
+  box-shadow: var(--shadow-lg);
 }
 .options-theme {
   display: grid;
@@ -1357,6 +1357,12 @@
 .issue-list-table th[data-column-key="issue"] {
   min-width: 320px;
 }
+.issue-cell {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
 .issue-summary {
   display: flex;
   align-items: center;
@@ -1370,7 +1376,7 @@
   min-width: 0;
 }
 .issue-summary-title {
-  font-weight: 600;
+  font-weight: var(--weight-semibold);
   overflow-wrap: anywhere;
 }
 .issue-attention {
@@ -1379,13 +1385,208 @@
   align-items: baseline;
   gap: var(--s2);
   padding: 2px var(--s2);
-  border-left: 2px solid var(--attention-colour);
+  border-left: 1px solid var(--attention-colour);
   border-radius: 2px;
   background: color-mix(in srgb, var(--attention-colour) 7%, transparent);
   color: var(--ink-muted);
   font-size: var(--text-xs);
-  font-weight: 500;
+  font-weight: var(--weight-medium);
   line-height: 1.35;
+}
+
+/* ---------- lifecycle topology ---------- */
+.lifecycle {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: var(--space-2) 0 var(--space-7);
+  list-style: none;
+}
+.life-stage {
+  --life-color: var(--ink-faint);
+  position: relative;
+  flex: 1 1 0;
+  min-width: 54px;
+  color: var(--life-color);
+  text-align: center;
+}
+.life-stage:not(:first-child)::before {
+  content: "";
+  position: absolute;
+  z-index: 0;
+  top: 17px;
+  right: 50%;
+  width: 100%;
+  height: 1px;
+  background: var(--border-emphasis);
+  transition: background var(--t);
+}
+.life-stage.life-connected::before {
+  background: var(--accent);
+}
+.life-completed,
+.life-active {
+  --life-color: var(--accent);
+}
+.life-failed {
+  --life-color: var(--fail);
+}
+.life-blocked {
+  --life-color: var(--running);
+}
+.life-node {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 48px;
+  color: inherit;
+}
+.life-node-ring {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border: 1.5px solid var(--border-emphasis);
+  border-radius: 50%;
+  background: var(--surface-sunken);
+  color: var(--ink-muted);
+  transition: border-color var(--t), background var(--t), color var(--t), box-shadow var(--t);
+}
+.life-node:hover .life-node-ring {
+  border-color: currentColor;
+  background: var(--elevated);
+}
+.life-completed .life-node-ring {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--c-fg);
+}
+.life-active .life-node-ring {
+  border: 2px solid var(--accent);
+  background: var(--surface-sunken);
+  box-shadow: 0 0 0 4px var(--accent-soft);
+  color: var(--accent);
+  animation: lifecycle-active 2s var(--ease-out) infinite;
+}
+.life-failed .life-node-ring {
+  border-color: var(--fail);
+  background: color-mix(in srgb, var(--fail) 12%, var(--surface-sunken));
+  color: var(--fail-br);
+}
+.life-blocked .life-node-ring {
+  border-color: var(--running);
+  background: color-mix(in srgb, var(--running) 12%, var(--surface-sunken));
+  color: var(--running-br);
+}
+.life-node-ring svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.8;
+}
+.life-node-core {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+.life-label {
+  color: var(--ink);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+}
+.life-state-label {
+  color: var(--ink-faint);
+  font-size: var(--text-2xs);
+  line-height: 1;
+  text-transform: capitalize;
+}
+.life-retry {
+  position: absolute;
+  z-index: 2;
+  top: 39px;
+  left: 50%;
+  display: flex;
+  align-items: center;
+  transform: translateX(-50%);
+  color: inherit;
+  pointer-events: none;
+}
+.life-retry svg {
+  width: 38px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.4;
+  opacity: 0.78;
+}
+.life-retry-count {
+  min-width: 22px;
+  margin-left: -3px;
+  padding: 1px 4px;
+  border: 1px solid color-mix(in srgb, currentColor 38%, transparent);
+  border-radius: var(--radius-pill);
+  background: var(--panel);
+  color: currentColor;
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-semibold);
+  line-height: 1.2;
+}
+.lifecycle-compact {
+  max-width: 260px;
+  padding: 0 0 var(--space-5) var(--space-2);
+}
+.lifecycle-compact .life-stage {
+  min-width: 30px;
+}
+.lifecycle-compact .life-stage:not(:first-child)::before {
+  top: 10px;
+}
+.lifecycle-compact .life-node {
+  min-width: 24px;
+}
+.lifecycle-compact .life-node-ring {
+  width: 21px;
+  height: 21px;
+  border-width: 1.5px;
+}
+.lifecycle-compact .life-node-ring svg {
+  width: 12px;
+  height: 12px;
+}
+.lifecycle-compact .life-active .life-node-ring {
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.lifecycle-compact .life-retry {
+  top: 19px;
+}
+.lifecycle-compact .life-retry svg {
+  width: 24px;
+  height: 11px;
+}
+.lifecycle-compact .life-retry-count {
+  min-width: 18px;
+  padding-inline: 3px;
+  font-size: 9px;
+}
+@keyframes lifecycle-active {
+  0%, 100% { box-shadow: 0 0 0 3px var(--accent-soft); }
+  50% { box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent) 7%, transparent); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .life-active .life-node-ring {
+    animation: none;
+  }
 }
 .issue-attention-ready {
   --attention-colour: var(--ok);
@@ -1771,7 +1972,7 @@
   letter-spacing: .01em;
 }
 .tbl tbody tr.expanded {
-  background: var(--hover);
+  background: var(--pressed);
 }
 .detail-row > td {
   padding: 0;
