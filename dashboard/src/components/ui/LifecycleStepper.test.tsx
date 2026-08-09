@@ -159,15 +159,19 @@ describe("LifecycleStepper", () => {
         compact
         steps={[
           cardStep({ kind: "REVIEW", status: "REQUEST_CHANGES" }),
+          cardStep({ kind: "FIX_CI", state: "running", status: null }),
           cardStep({ kind: "unblock", state: "done", status: null }),
         ]}
       />,
     );
 
     const review = screen.getByLabelText(/REVIEW · ok · REQUEST_CHANGES/).closest("li");
+    const running = screen.getByLabelText(/^FIX_CI · running/).closest("li");
     const operator = screen.getByLabelText(/^unblock · done/).closest("li");
     expect(review).toHaveClass("life-tone-running");
+    expect(review).not.toHaveClass("life-active");
     expect(review?.querySelector(".status-mark")).toHaveAttribute("data-status-glyph", "±");
+    expect(running).toHaveClass("life-tone-running", "life-active");
     expect(operator).toHaveClass("life-tone-meta");
   });
 

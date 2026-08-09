@@ -229,7 +229,7 @@ export function IssueTab({
                     title={`open PR #${pr.number} on GitHub`}
                   >
                     <Chip tone={prStateTone(pr.state)} square>
-                      PR #{pr.number} ↗
+                      PR #{pr.number}
                     </Chip>
                   </a>
                 ) : (

@@ -228,7 +228,7 @@ describe("long-table filtering", () => {
     );
 
     expect(screen.getByText("Parked pull request")).toBeVisible();
-    expect(screen.getByText("PR #179 ↗")).toBeVisible();
+    expect(screen.getByText("PR #179")).toBeVisible();
     expect(screen.queryByText("Waiting issue 0")).not.toBeInTheDocument();
     expect(screen.getByText("1/11")).toBeVisible();
   });
@@ -353,7 +353,7 @@ describe("backlog triage taxonomy", () => {
     expect(screen.getByText("AC + test plan written")).toBeVisible();
     expect(screen.getByText("awaiting steward")).toBeVisible();
     expect(screen.getByText("awaiting human reply")).toHaveClass("chip-fail");
-    expect(screen.getByText("steward questions need answers")).toBeVisible();
+    expect(screen.queryByText("steward questions need answers")).not.toBeInTheDocument();
     expect(screen.getAllByText("awaiting human reply")).toHaveLength(1);
     expect(container.querySelector(".backlog-processed")).not.toBeInTheDocument();
     expect(container.querySelector(".backlog-raw")).not.toBeInTheDocument();

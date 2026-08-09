@@ -259,9 +259,8 @@ function taskDetailFor(step: TimelineStep): string {
 }
 
 function taskLifecycleState(step: TimelineStep, tone: Tone): LifecycleStageState {
-  if (tone === "fail") return step.state === "blocked" ? "blocked" : "failed";
-  if (tone === "running") return "active";
   if (step.state === "running") return "active";
+  if (tone === "fail") return step.state === "blocked" ? "blocked" : "failed";
   return "completed";
 }
 

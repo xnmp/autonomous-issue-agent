@@ -249,7 +249,7 @@ describe("IssuesTab", () => {
     );
 
     expect(screen.getByText("parked")).toBeVisible();
-    const pr = screen.getByText("PR #179 ↗").closest(".chip");
+    const pr = screen.getByText("PR #179").closest(".chip");
     expect(pr).toHaveClass("chip-fail");
     expect(pr?.closest("a")).toHaveAttribute(
       "href",

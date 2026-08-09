@@ -37,6 +37,8 @@ describe("IssueTab", () => {
 
     const pr = await screen.findByRole("link", { name: /PR #75/ });
     expect(pr).toHaveAttribute("href", "https://github.com/o/r/pull/75");
+    expect(pr).toHaveTextContent("PR #75");
+    expect(pr).not.toHaveTextContent("↗");
     const issue = screen.getByRole("link", { name: "#50" });
     expect(issue).toHaveAttribute("href", "https://github.com/o/r/issues/50");
     expect(issue).toHaveAttribute("target", "_blank");

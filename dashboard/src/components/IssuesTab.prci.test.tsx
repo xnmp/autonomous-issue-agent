@@ -69,7 +69,8 @@ describe("the PR control wears CI's verdict", () => {
   it("reads ok when every check passed", () => {
     const { container } = board({ pr_ci_state: "passing" });
     expect(prChip(container)).toHaveClass("chip-ok");
-    expect(prChip(container)).toHaveTextContent("PR #179 ↗");
+    expect(prChip(container)).toHaveTextContent("PR #179");
+    expect(prChip(container)).not.toHaveTextContent("↗");
   });
 
   it("reads fail when any check failed", () => {

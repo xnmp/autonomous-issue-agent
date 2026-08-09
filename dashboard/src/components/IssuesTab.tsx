@@ -713,7 +713,7 @@ function PendingTable({
                                   Unpark
                                 </button>
                               ) : null}
-                              {card.url ? <a href={card.url} target="_blank" rel="noreferrer">Open on GitHub ↗</a> : null}
+                              {card.url ? <a href={card.url} target="_blank" rel="noreferrer">Open on GitHub</a> : null}
                             </span>
                           </div>
                           <FormattedIssueBody body={card.body ?? null} />
@@ -1007,11 +1007,11 @@ function BacklogTable({
                               ? "awaiting human reply"
                               : processed ? "triaged" : "raw intake"}
                           </Chip>
-                          <span className={blocked ? "steward-attention" : processed ? "steward-ready" : "faint"}>
-                            {blocked
-                              ? "steward questions need answers"
-                              : processed ? "AC + test plan written" : "awaiting steward"}
-                          </span>
+                          {blocked ? null : (
+                            <span className={processed ? "steward-ready" : "faint"}>
+                              {processed ? "AC + test plan written" : "awaiting steward"}
+                            </span>
+                          )}
                         </div>
                       </td>
                     ) : null}
@@ -1043,7 +1043,7 @@ function BacklogTable({
                         <div className="row-detail">
                           <div className="row-detail-hd">
                             <strong>Issue context</strong>
-                            {card.url ? <a href={card.url} target="_blank" rel="noreferrer">Open on GitHub ↗</a> : null}
+                            {card.url ? <a href={card.url} target="_blank" rel="noreferrer">Open on GitHub</a> : null}
                           </div>
                           <FormattedIssueBody body={card.body} />
                         </div>
@@ -1564,7 +1564,7 @@ function PrLink({ card }: { card: PrLinkCard }) {
         review?.label,
       ].filter(Boolean).join(" · ")}
     >
-      <span>PR #{card.pr}{card.pr_url ? " ↗" : ""}</span>
+      <span>PR #{card.pr}</span>
       {review ? (
         <span className={`pr-review-mark tone-${review.tone}`} role="img" aria-label={review.label}>
           {review.glyph}

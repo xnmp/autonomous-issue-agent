@@ -808,6 +808,23 @@ test("captures the round-three operator states at 1440px", async ({ page }) => {
   await page.getByRole("tab", { name: /In flight/ }).click();
   await expect(page.getByRole("columnheader", { name: /Lifecycle/ })).toBeVisible();
   await expect(page.getByText(/Harness issue: required-test gate rejects/)).toBeVisible();
+  const activeIssueRow = page.getByRole("row", {
+    name: /Required-test gate rejects diagnostic output/,
+  });
+  const issueCell = activeIssueRow.locator("td").first();
+  const lifecycleCell = activeIssueRow.locator("td.lifecycle-column");
+  const backgroundBeforeSelection = await issueCell.evaluate(
+    (element) => getComputedStyle(element).backgroundColor,
+  );
+  await expect(lifecycleCell).toHaveCSS("background-color", backgroundBeforeSelection);
+  await activeIssueRow.click();
+  await expect(activeIssueRow).toHaveAttribute("aria-expanded", "true");
+  const backgroundAfterSelection = await issueCell.evaluate(
+    (element) => getComputedStyle(element).backgroundColor,
+  );
+  await expect(lifecycleCell).toHaveCSS("background-color", backgroundAfterSelection);
+  expect(backgroundAfterSelection).not.toBe(backgroundBeforeSelection);
+  await expect(page.locator("body")).not.toContainText("↗");
   const issueScroller = page.locator(".tbl-wrap.panel").filter({
     has: page.locator("table.issue-list-table"),
   }).first();
@@ -864,6 +881,38 @@ test("captures the round-three operator states at 1440px", async ({ page }) => {
     fullPage: true,
     animations: "disabled",
   });
+});
+
+test("reserves strong task emphasis for the task that is actually running", async ({ page }) => {
+  await mockApi(page, 0, {
+    issuesPayload: {
+      ...issues,
+      in_flight: [{
+        ...issues.in_flight[0],
+        steps: [
+          { kind: "REVIEW", state: "ok", status: "REQUEST_CHANGES", cost_usd: 0.2 },
+          { kind: "ADDRESS_REVIEW", state: "running", status: null, cost_usd: 0.1 },
+        ],
+      }],
+    },
+  });
+  await page.goto("/#/repo/self/issues/inflight");
+
+  const completedYellowTask = page.getByLabel(/REVIEW · ok · REQUEST_CHANGES/).locator("..");
+  const runningTask = page.getByLabel(/^ADDRESS_REVIEW · running/).locator("..");
+  await expect(completedYellowTask).toHaveClass(/life-tone-running/);
+  await expect(completedYellowTask).not.toHaveClass(/life-active/);
+  await expect(runningTask).toHaveClass(/life-tone-running/);
+  await expect(runningTask).toHaveClass(/life-active/);
+  await expect(runningTask.locator(".life-compact-label")).toHaveCSS("font-weight", "720");
+  await expect(runningTask.locator(".life-node-ring")).toHaveCSS(
+    "animation-name",
+    "task-lifecycle-active",
+  );
+
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await expect(runningTask.locator(".life-node-ring")).toHaveCSS("animation-name", "none");
+  await expect(runningTask.locator(".life-node-ring")).not.toHaveCSS("box-shadow", "none");
 });
 
 test("shows a skeleton before the deployment request resolves", async ({ page }) => {

@@ -1489,9 +1489,6 @@
 .issue-list-table th[data-column-key="issue"] {
   min-width: 360px;
 }
-.issue-list-table td.lifecycle-column {
-  background: var(--surface-sunken);
-}
 .issue-cell {
   display: flex;
   flex-direction: column;
@@ -1756,6 +1753,19 @@
 .lifecycle-compact .life-active .life-node-ring {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
+.lifecycle-task-compact .life-active.life-tone-running {
+  --life-glow: color-mix(in srgb, var(--running) 30%, transparent);
+}
+.lifecycle-task-compact .life-active.life-tone-running .life-node-ring {
+  border-color: var(--running-br);
+  background: var(--running);
+  color: var(--bg);
+  animation: task-lifecycle-active 1.6s var(--ease-out) infinite;
+}
+.lifecycle-task-compact .life-active .life-compact-label {
+  color: var(--running-br);
+  font-weight: var(--weight-bold);
+}
 .lifecycle-compact .life-retry {
   top: 34px;
 }
@@ -1781,9 +1791,17 @@
   0%, 100% { box-shadow: 0 0 0 3px var(--life-glow); }
   50% { box-shadow: 0 0 0 5px var(--life-glow); }
 }
+@keyframes task-lifecycle-active {
+  0%, 100% { box-shadow: 0 0 0 4px var(--life-glow); }
+  50% { box-shadow: 0 0 0 7px var(--life-glow); }
+}
 @media (prefers-reduced-motion: reduce) {
   .life-active .life-node-ring {
     animation: none;
+  }
+  .lifecycle-task-compact .life-active.life-tone-running .life-node-ring {
+    animation: none;
+    box-shadow: 0 0 0 5px var(--life-glow);
   }
 }
 .issue-attention-ready {
@@ -1811,11 +1829,6 @@
 }
 .steward-ready {
   color: var(--meta-br);
-  font-size: var(--text-2xs);
-  font-weight: var(--weight-medium);
-}
-.steward-attention {
-  color: var(--fail-br);
   font-size: var(--text-2xs);
   font-weight: var(--weight-medium);
 }
@@ -2173,9 +2186,6 @@
 .tbl tbody tr.row-alert > td {
   background: color-mix(in srgb, var(--row-attn) 5%, var(--panel));
 }
-.tbl tbody tr.row-alert > td.lifecycle-column {
-  background: color-mix(in srgb, var(--row-attn) 5%, var(--surface-sunken));
-}
 .tbl tbody tr.row-alert:hover,
 .tbl tbody tr.row-alert.expanded {
   background: color-mix(in srgb, var(--row-attn) 9%, transparent);
@@ -2183,10 +2193,6 @@
 .tbl tbody tr.row-alert:hover > td,
 .tbl tbody tr.row-alert.expanded > td {
   background: color-mix(in srgb, var(--row-attn) 9%, var(--panel));
-}
-.tbl tbody tr.row-alert:hover > td.lifecycle-column,
-.tbl tbody tr.row-alert.expanded > td.lifecycle-column {
-  background: color-mix(in srgb, var(--row-attn) 9%, var(--surface-sunken));
 }
 .attention-stage {
   color: var(--fail);
