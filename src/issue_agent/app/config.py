@@ -451,7 +451,10 @@ class HarnessConfig:
     # $15 not $8 since 2026-08-09: the sol default reviews at ~2.5x terra's
     # token rates; $8 sized for terra would clip sol mid-review.
     review_budget_usd: float = 15.0
-    triage_budget_usd: float = 0.75
+    # $2 not $0.75 since 2026-08-09: real triage legs (AC + test plan + repo
+    # orientation) exhausted $0.75 mid-run (tauri #635, budget_exhausted at 4
+    # turns) and burned their retries re-doing the same partial work.
+    triage_budget_usd: float = 2.0
     # REVIEW_MODE: single (default) | multi | delegated.
     #   multi  — the /code-review fan-out (skip-gate → parallel dimension
     #            specialists → per-finding adversarial validation → synthesis).
