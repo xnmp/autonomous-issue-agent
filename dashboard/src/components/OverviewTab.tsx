@@ -1,9 +1,7 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { api } from "../api/client";
 import { usePolled } from "../api/hooks";
-import { useNow } from "../lib/clock";
 import type {
-  AttentionItem,
   EscalationReason,
   HealthTrendDay,
   InterventionEvent,
@@ -16,12 +14,14 @@ import {
   roleHealth,
   utilTone,
 } from "../lib/semantics";
-import { ago, localHour, localTime, num, rate, usd, usdCompact } from "../lib/format";
+import { localHour, localTime, num, rate, usd, usdCompact } from "../lib/format";
 import { Chip } from "./ui/Chip";
 import { Histogram, Meter, StatTile } from "./ui/Charts";
 import { EmptyState, ErrorBanner, Loading, SkeletonRows, WarningList } from "./ui/Feedback";
+import { Icon } from "./ui/Icon";
 import { ResizableTable, useSortedRows } from "./ui/ResizableTable";
 import { TableFilter } from "./ui/TableFilter";
+import { tipProps } from "./ui/Tip";
 
 const POLL_MS = 10_000;
 
@@ -53,27 +53,19 @@ export function OverviewTab({
     (m?.interventions_by_class ?? []).map((row) => [row.name, row.count]),
   );
 
+  const todayUsd = caps?.today_usd ?? m?.today_usd ?? null;
   const dailyPct =
-    caps?.today_usd != null && caps?.daily_cap_usd != null && caps.daily_cap_usd > 0
-      ? (caps.today_usd / caps.daily_cap_usd) * 100
+    todayUsd != null && caps?.daily_cap_usd != null && caps.daily_cap_usd > 0
+      ? (todayUsd / caps.daily_cap_usd) * 100
       : null;
 
   return (
     <div className="tabbody">
-      <header className="page-heading">
-        <div>
-          <h1>Overview</h1>
-          <p>Live operating state for <span className="mono">{repo}</span></p>
-        </div>
-        <span className="page-heading-status"><span className="repo-live-dot" />Reconciles every 10s</span>
-      </header>
       {ov.error ? (
         <ErrorBanner message={ov.error} onRetry={ov.refresh} stale={!!ov.data} />
       ) : null}
       <WarningList warnings={ov.data?.warnings} />
       {ov.loading ? <SkeletonRows what="overview" rows={5} /> : null}
-
-      <NeedsAttention items={ov.data?.needs_attention ?? []} loading={ov.loading} />
 
       <div className="tiles overview-metrics overview-metrics-primary">
         <StatTile
@@ -101,13 +93,12 @@ export function OverviewTab({
           title="the primary efficiency number: total journalled spend / done issues"
           primary
         />
-        <StatTile
-          label="$ today"
-          value={usdCompact(m?.today_usd)}
-          sub={caps?.daily_cap_usd != null ? `cap ${usd(caps.daily_cap_usd)}` : "no daily cap"}
-          tone={utilTone(dailyPct) === "ok" ? "neutral" : utilTone(dailyPct)}
-          alert={dailyPct !== null && dailyPct >= 85}
-          primary
+        <CapsTile
+          todayUsd={todayUsd}
+          dailyCapUsd={caps?.daily_cap_usd ?? null}
+          issueCapUsd={caps?.issue_cap_usd ?? null}
+          spendBlocks={spendBlocks}
+          dailyPct={dailyPct}
         />
       </div>
       <div className="tiles overview-metrics overview-metrics-secondary">
@@ -158,12 +149,12 @@ export function OverviewTab({
           <span className="panel-title">Daemon health</span>
           <span className="faint">live role journals</span>
         </div>
-        <div className="panel-bd health-cards">
+        <div className="panel-bd health-list">
           {(ov.data?.health ?? []).length === 0 && !ov.loading ? (
             <EmptyState>no role journals found for this deployment</EmptyState>
           ) : null}
           {(ov.data?.health ?? []).map((h) => (
-            <HealthCard key={h.role} health={h} />
+            <HealthRow key={h.role} health={h} />
           ))}
         </div>
       </section>
@@ -181,45 +172,59 @@ export function OverviewTab({
         </div>
       </section>
 
-      <div className="overview-support">
-        <section className="panel overview-caps">
-          <div className="panel-hd">
-            <span className="panel-title">Caps</span>
-          </div>
-          <div className="panel-bd col" style={{ gap: "var(--s3)" }}>
-            <Meter
-              label="Daily cap"
-              pct={dailyPct}
-              unavailableReason="no daily cap configured for this deployment"
-              note={
-                <span className="num">
-                  {usd(caps?.today_usd)} today
-                  {caps?.daily_cap_usd != null ? ` of ${usd(caps.daily_cap_usd)}` : " (uncapped)"}
-                </span>
-              }
-            />
-            <div className="usage-line">
-              <span className="muted">Per-issue cap</span>
-              <span className="spacer" />
-              <span className="mono num">{usd(caps?.issue_cap_usd)}</span>
-            </div>
-            <div className="usage-line">
-              <span className="muted">Spend blocks</span>
-              <span className="spacer" />
-              <span className={`mono num${spendBlocks > 0 ? " tone-fail" : ""}`}>
-                {num(spendBlocks)}
-              </span>
-            </div>
-          </div>
-        </section>
-      </div>
-
       <SpendPerHour buckets={ov.data?.spend_per_hour ?? []} />
 
       <HealthTrend rows={ov.data?.health_trend ?? []} loading={ov.loading} />
 
       <UnattributedCount count={ov.data?.unattributed_count ?? 0} />
     </div>
+  );
+}
+
+function CapsTile({
+  todayUsd,
+  dailyCapUsd,
+  issueCapUsd,
+  spendBlocks,
+  dailyPct,
+}: {
+  todayUsd: number | null;
+  dailyCapUsd: number | null;
+  issueCapUsd: number | null;
+  spendBlocks: number;
+  dailyPct: number | null;
+}) {
+  const tone = utilTone(dailyPct);
+  const alert = dailyPct !== null && dailyPct >= 85;
+  return (
+    <section
+      className={`tile tile-primary overview-cap-tile${alert ? " tile-alert" : ""}`}
+      aria-label="Spending caps"
+    >
+      <div className="tile-label">
+        <span className={`tile-signal tone-bg-${alert ? "fail" : tone}`} aria-hidden="true" />
+        Caps
+      </div>
+      <div className="cap-spend">
+        <span className={`tile-value tone-${alert ? "fail" : tone}`}>
+          {usdCompact(todayUsd)}
+        </span>
+        <span className="faint">
+          today {dailyCapUsd !== null ? `/ ${usd(dailyCapUsd)}` : "· uncapped"}
+        </span>
+      </div>
+      <Meter
+        label="Daily spend"
+        pct={dailyPct}
+        unavailableReason="no daily cap configured for this deployment"
+      />
+      <div className="cap-meta">
+        <span className="faint">Per issue <span className="mono">{usd(issueCapUsd)}</span></span>
+        <span className={spendBlocks > 0 ? "tone-fail" : "faint"}>
+          {num(spendBlocks)} {spendBlocks === 1 ? "block" : "blocks"}
+        </span>
+      </div>
+    </section>
   );
 }
 
@@ -318,36 +323,56 @@ function HealthTrend({ rows, loading }: { rows: HealthTrendDay[]; loading: boole
   );
 }
 
-function HealthCard({ health }: { health: RoleHealth }) {
+function HealthRow({ health }: { health: RoleHealth }) {
   const h = roleHealth(health);
   const tone = HEALTH_TONE[h];
-  useNow(); // keeps the "last event Nm ago" honest without a re-fetch
   return (
-    <div className={`hcard tone-border-${tone}`}>
-      <div className="hcard-hd">
-        <span className={`dot dot-${tone}`} aria-hidden="true" />
-        <span className="hcard-role">{health.role}</span>
-        <Chip tone={tone}>{HEALTH_LABEL[h]}</Chip>
-        <span className="spacer" />
-        <span className="faint num">{num(health.events)} ev</span>
-      </div>
-      <div className="hcard-line">
-        <span className="muted">last</span>
-        <span className="mono trunc">{health.last_event ?? "—"}</span>
-        <span className="spacer" />
-        <span className="num faint" title={health.last_event_ts ?? ""}>
-          {ago(health.last_event_ts)}
-        </span>
-      </div>
-      {health.log_path ? (
-        <div className="hcard-line">
-          <span className="muted">log</span>
-          <span className="mono faint trunc" title={health.log_path}>
-            {health.log_path}
-          </span>
-        </div>
-      ) : null}
+    <div className={`health-row tone-border-${tone}`}>
+      <span className={`dot dot-${tone}`} aria-hidden="true" />
+      <span className="health-role">{health.role}</span>
+      <Chip tone={tone}>{HEALTH_LABEL[h]}</Chip>
+      <span className="spacer" />
+      <span className="faint num">{num(health.events)} ev</span>
+      {health.log_path ? <CopyLogPathButton path={health.log_path} role={health.role} /> : null}
     </div>
+  );
+}
+
+function CopyLogPathButton({ path, role }: { path: string; role: string }) {
+  const [notice, setNotice] = useState<"copied" | "failed" | null>(null);
+  useEffect(() => {
+    if (notice === null) return;
+    const timer = window.setTimeout(() => setNotice(null), 2_200);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
+  const copy = async () => {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
+      await navigator.clipboard.writeText(path);
+      setNotice("copied");
+    } catch {
+      setNotice("failed");
+    }
+  };
+
+  return (
+    <span className="log-copy">
+      <button
+        className="log-copy-button"
+        type="button"
+        aria-label={`Copy ${role} log path`}
+        {...tipProps(path)}
+        onClick={() => void copy()}
+      >
+        <Icon name="copy" size={15} />
+      </button>
+      {notice ? (
+        <span className={`log-copy-toast${notice === "failed" ? " tone-fail" : ""}`} role="status">
+          {notice === "copied" ? "Log path copied" : "Couldn’t copy log path"}
+        </span>
+      ) : null}
+    </span>
   );
 }
 
@@ -382,60 +407,6 @@ function EscalationDetail({
         ))}
       </ul>
     </details>
-  );
-}
-
-const ATTENTION_TONE: Record<string, "fail" | "running" | "meta" | "info"> = {
-  blocked: "fail",
-  escalated: "fail",
-  "needs-budget-review": "running",
-  "spend-blocked": "running",
-  held: "meta",
-};
-
-const ATTENTION_LABEL: Record<string, string> = {
-  blocked: "asked a question",
-  escalated: "escalated",
-  "needs-budget-review": "needs budget review",
-  "spend-blocked": "spend blocked",
-  held: "held",
-};
-
-/**
- * What is waiting on a person right now — first thing on the page, because
- * every other panel on this tab describes the past. An empty panel is the
- * good outcome and says so rather than disappearing, so "nothing needs me"
- * and "the overview failed to load" never look alike.
- */
-function NeedsAttention({ items, loading }: { items: AttentionItem[]; loading: boolean }) {
-  return (
-    <section className={`panel attention-panel${items.length > 0 ? " attention-panel-active" : " attention-panel-clear"}`}>
-      <div className="panel-hd">
-        <span className="panel-title">Needs attention</span>
-        <span className="faint">{items.length > 0 ? `${items.length} waiting on a human` : "nothing waiting"}</span>
-      </div>
-      <div className="panel-bd col" style={{ gap: "var(--s2)" }}>
-        {loading && items.length === 0 ? <Loading what="attention" /> : null}
-        {!loading && items.length === 0 ? (
-          <EmptyState>no issue is waiting on a human</EmptyState>
-        ) : null}
-        {items.map((item) => (
-          <div className="usage-line attention-row" key={`${item.issue}-${item.kind}`}>
-            <Chip tone={ATTENTION_TONE[item.kind] ?? "info"} square>
-              {ATTENTION_LABEL[item.kind] ?? item.kind}
-            </Chip>
-            <span className="mono">#{item.issue}</span>
-            <span className="trunc" title={item.title ?? undefined}>
-              {item.title ?? <span className="faint">title unavailable</span>}
-            </span>
-            <span className="spacer" />
-            {item.detail ? (
-              <span className="faint trunc" title={item.detail}>{item.detail}</span>
-            ) : null}
-          </div>
-        ))}
-      </div>
-    </section>
   );
 }
 
@@ -474,21 +445,8 @@ function InterventionList({
   rows: InterventionEvent[];
   loading: boolean;
 }) {
-  const [query, setQuery] = useState("");
-  const filtered = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    if (!needle) return rows;
-    return rows.filter((row) => [
-      row.ts,
-      row.action_class,
-      row.issue,
-      row.pr,
-      row.kind,
-      row.detail,
-    ].some((value) => String(value ?? "").toLowerCase().includes(needle)));
-  }, [query, rows]);
   const sorted = useSortedRows(
-    filtered,
+    rows,
     {
       when: (row) => row.ts,
       class: (row) => row.action_class,
@@ -503,54 +461,37 @@ function InterventionList({
     return <EmptyState>no journalled operator actions — the harness ran unattended</EmptyState>;
   }
   return (
-    <>
-      {rows.length > 10 ? (
-        <div className="panel-table-tools">
-          <TableFilter
-            label="Filter operator actions"
-            value={query}
-            onChange={setQuery}
-            shown={filtered.length}
-            total={rows.length}
-          />
-        </div>
-      ) : null}
-      {filtered.length === 0 ? (
-        <EmptyState>no operator actions match “{query.trim()}”</EmptyState>
-      ) : (
-        <div className="operator-actions-table">
-          <ResizableTable storageKey="overview-interventions" columns={[
-            { key: "when", label: "When", width: 160 },
-            { key: "class", label: "Class", width: 110 },
-            { key: "target", label: "Target", width: 110 },
-            { key: "action", label: "Action", width: 420 },
-          ]} sort={sorted.sort} onSort={sorted.onSort}>
-            <tbody>
-              {sorted.rows.map((row, i) => (
-                <tr key={`${row.ts ?? "?"}-${i}`}>
-                  <td className="mono faint" title={row.ts ?? ""}>{localTime(row.ts)}</td>
-                  <td>
-                    <Chip tone={INTERVENTION_TONE[row.action_class] ?? "info"} square>
-                      {row.action_class}
-                    </Chip>
-                  </td>
-                  <td className="mono">
-                    {row.issue !== null && row.issue !== undefined ? `#${row.issue}` : null}
-                    {row.pr !== null && row.pr !== undefined ? (
-                      <span className="faint"> PR #{row.pr}</span>
-                    ) : null}
-                    {row.issue == null && row.pr == null ? <span className="faint">—</span> : null}
-                  </td>
-                  <td className="trunc" title={row.detail ?? row.kind}>
-                    <span className="mono">{row.kind}</span>
-                    {row.detail ? <span className="faint"> — {row.detail}</span> : null}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </ResizableTable>
-        </div>
-      )}
-    </>
+    <div className="operator-actions-table">
+      <ResizableTable storageKey="overview-interventions" columns={[
+        { key: "when", label: "When", width: 160 },
+        { key: "class", label: "Class", width: 110 },
+        { key: "target", label: "Target", width: 110 },
+        { key: "action", label: "Action", width: 420 },
+      ]} sort={sorted.sort} onSort={sorted.onSort}>
+        <tbody>
+          {sorted.rows.map((row, i) => (
+            <tr key={`${row.ts ?? "?"}-${i}`}>
+              <td className="mono faint" title={row.ts ?? ""}>{localTime(row.ts)}</td>
+              <td>
+                <Chip tone={INTERVENTION_TONE[row.action_class] ?? "info"} square>
+                  {row.action_class}
+                </Chip>
+              </td>
+              <td className="mono">
+                {row.issue !== null && row.issue !== undefined ? `#${row.issue}` : null}
+                {row.pr !== null && row.pr !== undefined ? (
+                  <span className="faint"> PR #{row.pr}</span>
+                ) : null}
+                {row.issue == null && row.pr == null ? <span className="faint">—</span> : null}
+              </td>
+              <td className="trunc" title={row.detail ?? row.kind}>
+                <span className="mono">{row.kind}</span>
+                {row.detail ? <span className="faint"> — {row.detail}</span> : null}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </ResizableTable>
+    </div>
   );
 }

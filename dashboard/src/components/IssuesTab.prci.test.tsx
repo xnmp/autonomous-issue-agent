@@ -59,32 +59,32 @@ function board(over: Partial<IssueCard>) {
   );
 }
 
-function prText(container: HTMLElement): Element | null {
-  const chip = [...container.querySelectorAll(".chip")].find((c) =>
+function prChip(container: HTMLElement): Element | null {
+  return [...container.querySelectorAll(".chip")].find((c) =>
     c.textContent?.includes("PR #179"),
-  );
-  return chip?.querySelector("span") ?? null;
+  ) ?? null;
 }
 
-describe("the PR chip's number wears CI's verdict", () => {
+describe("the PR control wears CI's verdict", () => {
   it("reads ok when every check passed", () => {
     const { container } = board({ pr_ci_state: "passing" });
-    expect(prText(container)).toHaveClass("tone-ok");
+    expect(prChip(container)).toHaveClass("chip-ok");
+    expect(prChip(container)).toHaveTextContent("PR #179 ↗");
   });
 
   it("reads fail when any check failed", () => {
     const { container } = board({ pr_ci_state: "failing" });
-    expect(prText(container)).toHaveClass("tone-fail");
+    expect(prChip(container)).toHaveClass("chip-fail");
   });
 
   it("reads running while checks are still going", () => {
     const { container } = board({ pr_ci_state: "pending" });
-    expect(prText(container)).toHaveClass("tone-running");
+    expect(prChip(container)).toHaveClass("chip-running");
   });
 
   it("claims nothing when CI state is unknown", () => {
     const { container } = board({ pr_ci_state: null });
-    const span = prText(container);
-    expect(span?.className ?? "").not.toMatch(/tone-/);
+    expect(prChip(container)).toHaveClass("chip-neutral");
+    expect(prChip(container)).toHaveAttribute("data-tip", expect.stringContaining("CI unknown"));
   });
 });

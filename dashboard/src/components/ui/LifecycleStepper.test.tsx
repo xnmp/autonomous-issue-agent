@@ -66,6 +66,48 @@ describe("LifecycleStepper", () => {
     expect(screen.getByLabelText("3 attempts")).toHaveTextContent("×3");
   });
 
+  it("does not complete CI from a successful repair leg while review is still active", () => {
+    const steps = [
+      cardStep({ kind: "RESOLVE" }),
+      cardStep({ kind: "REVIEW", status: "REQUEST_CHANGES", count: 4 }),
+      cardStep({ kind: "ADDRESS_REVIEW" }),
+      cardStep({ kind: "RE_REVIEW", status: "REQUEST_CHANGES", count: 3 }),
+      cardStep({ kind: "FIX_CI", state: "ok", status: "done" }),
+      cardStep({ kind: "RE_REVIEW", state: "running", status: null }),
+    ];
+
+    const withoutGreenChecks = deriveLifecycleStages({
+      steps,
+      stage: "reviewing",
+      hasPullRequest: true,
+      ciState: null,
+    });
+    expect(withoutGreenChecks.find(({ id }) => id === "review")?.state).toBe("active");
+    expect(withoutGreenChecks.find(({ id }) => id === "ci")?.state).toBe("future");
+
+    const withGreenChecks = deriveLifecycleStages({
+      steps,
+      stage: "reviewing",
+      hasPullRequest: true,
+      ciState: "passing",
+    });
+    expect(withGreenChecks.find(({ id }) => id === "ci")?.state).toBe("completed");
+  });
+
+  it.each([
+    ["failing", "failed"],
+    ["pending", "active"],
+  ] as const)("maps a %s current-head check rollup to %s CI", (ciState, expected) => {
+    const stages = deriveLifecycleStages({
+      steps: [cardStep({ kind: "FIX_CI", state: "ok", status: "done" })],
+      stage: "reviewing",
+      hasPullRequest: true,
+      ciState,
+    });
+
+    expect(stages.find(({ id }) => id === "ci")?.state).toBe(expected);
+  });
+
   it("exposes model, verdict, duration, and cost in detailed node help", () => {
     render(
       <LifecycleStepper
@@ -132,6 +174,8 @@ describe("LifecycleStepper", () => {
     const earlier = document.querySelector(".life-elided .life-node");
     expect(earlier).toHaveAttribute("data-tip", expect.stringContaining("RESOLVE · ok · done"));
     expect(earlier).toHaveAttribute("data-tip", expect.stringContaining("REVIEW · ok · APPROVE"));
+    expect(earlier).not.toHaveAttribute("title");
+    expect(earlier).toHaveAttribute("tabindex", "0");
     expect(document.querySelectorAll(".lifecycle-task-compact .life-stage")).toHaveLength(6);
   });
 

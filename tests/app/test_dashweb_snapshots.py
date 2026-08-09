@@ -2421,6 +2421,22 @@ def test_missing_or_unreadable_checks_claim_no_ci_state(rollup):
         assert card["pr_ci_state"] is None
 
 
+def test_issue_detail_uses_the_current_pr_check_rollup_for_ci_state():
+    detail = snapshots.issue_detail(
+        row_for([RESOLVE, FIX_CI_2], 7),
+        NOW,
+        gh_prs={12: {
+            "state": "OPEN",
+            "statusCheckRollup": [
+                {"conclusion": "SUCCESS"},
+                {"state": "IN_PROGRESS", "conclusion": None},
+            ],
+        }},
+    )
+
+    assert detail["pr_ci_state"] == "pending"
+
+
 # ── hourly spend ──────────────────────────────────────────────────────────────
 def charge(hours_ago: float, usd):
     return NOW - timedelta(hours=hours_ago), usd

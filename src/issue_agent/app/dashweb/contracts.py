@@ -388,6 +388,9 @@ class IssueDetailPayload(Warned):
     done: bool
     prs: list[int]
     pull_requests: list[PullRequestLink]
+    # Current-head check rollup for the newest PR. A completed repair leg is
+    # not evidence that GitHub checks subsequently passed.
+    pr_ci_state: Literal["passing", "failing", "pending"] | None = None
     cost_usd: float | None
     elapsed_s: float | None
     working_s: float | None

@@ -458,7 +458,7 @@ summary:focus-visible,
 .tip {
   position: fixed;
   transform: translateX(-50%);
-  max-width: 380px;
+  max-width: min(380px, calc(100vw - 16px));
   width: max-content;
   padding: 3px 9px;
   background: var(--elevated);

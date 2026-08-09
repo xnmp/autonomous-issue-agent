@@ -730,36 +730,6 @@
   max-width: 1720px;
   padding: var(--space-6);
 }
-.page-heading {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: var(--space-6);
-  min-height: 48px;
-  padding: var(--space-2) 0 var(--space-4);
-  border-bottom: 1px solid var(--border);
-}
-.page-heading h1 {
-  margin: 0;
-  color: var(--ink);
-  font-size: var(--text-3xl);
-  font-weight: var(--weight-bold);
-  line-height: var(--leading-tight);
-  letter-spacing: var(--tracking-tight);
-}
-.page-heading p {
-  margin: var(--space-2) 0 0;
-  color: var(--ink-muted);
-  font-size: var(--text-sm);
-}
-.page-heading-status {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-3);
-  margin-top: var(--space-3);
-  color: var(--ink-faint);
-  font-size: var(--text-xs);
-}
 .section-title {
   display: flex;
   align-items: baseline;
@@ -784,40 +754,11 @@
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: var(--s2);
 }
-.attention-panel,
 .operator-actions-panel {
   border-color: var(--border-strong);
 }
-.attention-panel-active {
-  border-color: color-mix(in srgb, var(--fail) 52%, var(--border));
-  background: color-mix(in srgb, var(--fail) 4%, var(--panel));
-  box-shadow: var(--shadow-md);
-}
-.attention-panel-active .panel-title {
-  color: var(--fail-br);
-}
-.attention-panel-clear .panel-bd {
-  padding-block: var(--s2);
-}
-.attention-panel-clear .empty {
-  padding-block: var(--s2);
-  text-align: left;
-}
-.attention-panel .panel-bd,
 .operator-actions-panel .panel-bd {
   min-height: 82px;
-}
-.attention-panel-active .panel-bd {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 0 var(--space-6) !important;
-}
-.attention-row {
-  min-height: 30px;
-  padding-block: var(--s1);
-}
-.attention-row + .attention-row {
-  border-top: 1px solid var(--border);
 }
 .operator-actions-panel {
   background: var(--surface-sunken);
@@ -866,8 +807,29 @@
   line-height: 1;
   letter-spacing: -0.03em;
 }
-.overview-support .panel {
-  border-color: color-mix(in srgb, var(--border) 78%, transparent);
+.overview-cap-tile {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.overview-cap-tile .cap-spend {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+  min-width: 0;
+}
+.overview-cap-tile .tile-value {
+  margin-top: 0;
+  font-size: var(--text-xl);
+}
+.overview-cap-tile .meter {
+  gap: 2px;
+}
+.cap-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+  font-size: var(--text-2xs);
 }
 .tile {
   padding: var(--space-5);
@@ -1065,46 +1027,64 @@
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--fail) 70%, transparent);
 }
 
-/* ---------- health cards ---------- */
-.health-cards {
+/* ---------- daemon health ---------- */
+.health-list {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-  gap: var(--space-4);
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 0;
+  padding: 0;
 }
-.overview-health .health-cards {
-  padding: var(--space-4);
-}
-.overview-health .hcard {
-  border: 0;
-  border-left: 1px solid var(--border);
-  border-radius: 0;
-  background: transparent;
-}
-.hcard {
-  padding: var(--space-4) var(--space-5);
-  background: var(--surface-sunken);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-3);
-  min-width: 0;
-}
-.hcard-hd {
+.health-row {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: var(--s2);
+  gap: var(--space-3);
+  min-width: 0;
+  min-height: 42px;
+  padding: var(--space-3) var(--space-5);
+  border-right: 1px solid var(--border);
 }
-.hcard-role {
+.health-row:last-child {
+  border-right: 0;
+}
+.health-role {
   font-weight: var(--weight-semibold);
   text-transform: capitalize;
 }
-.hcard-line {
-  display: flex;
-  align-items: center;
-  gap: var(--s2);
+.log-copy {
+  position: relative;
+  display: inline-flex;
+}
+.log-copy-button {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--ink-faint);
+}
+.log-copy-button:hover,
+.log-copy-button:focus-visible {
+  border-color: var(--border-strong);
+  background: var(--hover);
+  color: var(--ink);
+}
+.log-copy-toast {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + var(--space-2));
+  right: 0;
+  width: max-content;
+  max-width: min(220px, calc(100vw - 16px));
+  padding: var(--space-2) var(--space-4);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--elevated);
+  box-shadow: var(--shadow-md);
+  color: var(--ok-br);
   font-size: var(--text-xs);
-  min-width: 0;
+  white-space: nowrap;
 }
 
 @media (max-width: 1080px) {
@@ -1124,14 +1104,26 @@
   .overview-metrics-secondary {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
-  .page-heading-status {
-    display: none;
+  .overview-cap-tile .cap-spend {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 0;
+  }
+  .overview-cap-tile .cap-spend .faint {
+    white-space: nowrap;
   }
   .repo-context {
     display: none;
   }
-  .attention-panel-active .panel-bd {
+  .health-list {
     grid-template-columns: 1fr;
+  }
+  .health-row {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .health-row:last-child {
+    border-bottom: 0;
   }
 }
 
@@ -1233,8 +1225,7 @@
   border: none;
   background: transparent;
 }
-.empty-inline .empty-icon,
-.attention-panel-clear .empty-icon {
+.empty-inline .empty-icon {
   display: none;
 }
 .loading-inline {
@@ -1303,9 +1294,9 @@
 }
 .resizable-table {
   table-layout: fixed;
-  /* The table always reaches the panel edge, while an over-wide configuration
-     still compresses to the panel instead of clipping its final column. */
-  max-width: 100%;
+  /* Inline width is the sum of the operator's columns; min-width: 100% fills
+     spare panel space. Wider configurations must remain horizontally
+     scrollable instead of silently compressing their chosen widths. */
 }
 .resizable-table th {
   position: sticky;
@@ -1355,6 +1346,13 @@
   width: 9px;
   cursor: col-resize;
   touch-action: none;
+}
+.resizable-table th:last-child .column-resizer {
+  /* The ordinary handle straddles the column edge. On the final column its
+     negative right edge created four pixels of overflow — and therefore a
+     scrollbar — even when the table itself fit the panel. */
+  right: 0;
+  width: 5px;
 }
 .column-resizer::after {
   content: "";
@@ -2111,12 +2109,9 @@
   background: var(--panel);
   border-left: 1px solid var(--border);
 }
-/* A row that needs a human is read as one object: the whole row is tinted and
- * bordered, not just a chip inside it. `--row-attn` is the single knob so the
- * ready variant only restates the colour. */
-/* One alarm signal per row: the edge stripe. The stage text already names the
-   problem in --fail; stripe + tint + red text tripled the same message and
-   made every alarmed row a wall of red. */
+/* A live operator hold is read as one object. The edge remains the primary
+ * signal; a low tint keeps the row findable across wide tables without
+ * turning historical escalation counters into permanent alarms. */
 .row-alert {
   --row-attn: var(--fail);
   box-shadow: inset 1px 0 0 var(--row-attn);
@@ -2124,9 +2119,23 @@
 .row-alert-ready {
   --row-attn: var(--ok);
 }
+.tbl tbody tr.row-alert > td {
+  background: color-mix(in srgb, var(--row-attn) 5%, var(--panel));
+}
+.tbl tbody tr.row-alert > td.lifecycle-column {
+  background: color-mix(in srgb, var(--row-attn) 5%, var(--surface-sunken));
+}
 .tbl tbody tr.row-alert:hover,
 .tbl tbody tr.row-alert.expanded {
-  background: color-mix(in srgb, var(--row-attn) 8%, transparent);
+  background: color-mix(in srgb, var(--row-attn) 9%, transparent);
+}
+.tbl tbody tr.row-alert:hover > td,
+.tbl tbody tr.row-alert.expanded > td {
+  background: color-mix(in srgb, var(--row-attn) 9%, var(--panel));
+}
+.tbl tbody tr.row-alert:hover > td.lifecycle-column,
+.tbl tbody tr.row-alert.expanded > td.lifecycle-column {
+  background: color-mix(in srgb, var(--row-attn) 9%, var(--surface-sunken));
 }
 .attention-stage {
   color: var(--fail);

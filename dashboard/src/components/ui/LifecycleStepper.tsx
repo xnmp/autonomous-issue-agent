@@ -5,6 +5,7 @@ import { tipProps } from "./Tip";
 
 export type LifecycleStageId = "triage" | "resolve" | "review" | "ci" | "merge";
 export type LifecycleStageState = "completed" | "active" | "failed" | "blocked" | "future";
+export type LifecycleCiState = "passing" | "failing" | "pending" | null;
 
 type TimelineStep = CardStep | IssueStep;
 
@@ -97,12 +98,14 @@ export function deriveLifecycleStages({
   done = false,
   hasPullRequest = false,
   attention = null,
+  ciState = null,
 }: {
   steps: TimelineStep[];
   stage?: string | null;
   done?: boolean;
   hasPullRequest?: boolean;
   attention?: "blocked" | "escalated" | null;
+  ciState?: LifecycleCiState;
 }): LifecycleStage[] {
   const grouped = new Map<LifecycleStageId, TimelineStep[]>();
   for (const step of steps) {
@@ -126,6 +129,13 @@ export function deriveLifecycleStages({
     let state: LifecycleStageState = "future";
     if (!done && attention && id === attentionTarget) {
       state = attention === "blocked" ? "blocked" : "failed";
+    } else if (id === "ci") {
+      if (ciState === "passing") state = "completed";
+      else if (ciState === "failing") state = "failed";
+      else if (ciState === "pending") state = "active";
+      else if (!done && id === current) state = "active";
+      else if (latest && isRunning(latest)) state = "active";
+      else if (latest && isFailed(latest)) state = "failed";
     } else if (!done && id === current) {
       state = latest && isFailed(latest) ? "failed" : "active";
     } else if (latest && isRunning(latest)) {
@@ -135,12 +145,19 @@ export function deriveLifecycleStages({
     } else if (
       done
       || (currentIndex > canonicalIndex && canonicalIndex >= 0)
-      || (lastObservedIndex > canonicalIndex && stageSteps.every(isComplete))
+      || (
+        lastObservedIndex > canonicalIndex
+        && stageSteps.length > 0
+        && stageSteps.every(isComplete)
+      )
       || (stageSteps.length > 0 && stageSteps.every(isComplete) && id !== attentionTarget)
     ) {
       state = "completed";
     }
-    const mark = latest
+    // A FIX_CI task's outcome describes the repair agent, not the checks on
+    // the resulting head. CI's node must therefore take both its state and
+    // glyph from the current-head rollup above.
+    const mark = latest && id !== "ci"
       ? stepOutcomeMark(latest.kind, latest.state, latest.status)
       : null;
     return {
@@ -266,6 +283,7 @@ function CompactTaskLifecycle({
         <li className="life-stage life-future life-tone-neutral life-elided">
           <span
             className="life-node"
+            tabIndex={0}
             {...tipProps(hidden.map(taskDetailFor).join("\n"), { labelled: true })}
           >
             <span className="life-node-ring life-elided-count">+{hidden.length}</span>
@@ -302,6 +320,7 @@ export function LifecycleStepper({
   done = false,
   hasPullRequest = false,
   attention = null,
+  ciState = null,
   compact = false,
   label = "Issue lifecycle",
   onSelectStep,
@@ -311,12 +330,20 @@ export function LifecycleStepper({
   done?: boolean;
   hasPullRequest?: boolean;
   attention?: "blocked" | "escalated" | null;
+  ciState?: LifecycleCiState;
   compact?: boolean;
   label?: string;
   onSelectStep?: (index: number) => void;
 }) {
   if (compact) return <CompactTaskLifecycle steps={steps} label={label} />;
-  const stages = deriveLifecycleStages({ steps, stage, done, hasPullRequest, attention });
+  const stages = deriveLifecycleStages({
+    steps,
+    stage,
+    done,
+    hasPullRequest,
+    attention,
+    ciState,
+  });
   return (
     <ol className={`lifecycle${compact ? " lifecycle-compact" : ""}`} aria-label={label}>
       {stages.map((item, index) => {

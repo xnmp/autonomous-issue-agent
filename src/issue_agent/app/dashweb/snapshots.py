@@ -2481,6 +2481,7 @@ def issue_detail(
             }
             for number in row.prs
         ],
+        "pr_ci_state": _pr_ci_state(gh_pr),
         "cost_usd": row.cost_usd,
         "elapsed_s": round(elapsed) if elapsed is not None else None,
         "working_s": round(working) if working is not None else None,
