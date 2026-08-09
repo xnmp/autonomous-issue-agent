@@ -1,5 +1,6 @@
 import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import userEvent from "@testing-library/user-event";
+import { describe, expect, it, vi } from "vitest";
 import type { CardStep, IssueStep } from "../../api/types";
 import { deriveLifecycleStages, LifecycleStepper } from "./LifecycleStepper";
 
@@ -105,5 +106,23 @@ describe("LifecycleStepper", () => {
     );
 
     expect(screen.getByLabelText(/Review · blocked/).closest("li")).toHaveClass("life-blocked");
+  });
+
+  it("selects the latest detailed task when a full node is clicked", async () => {
+    const onSelectStep = vi.fn();
+    render(
+      <LifecycleStepper
+        steps={[
+          issueStep(3, { kind: "REVIEW", status: "REQUEST_CHANGES" }),
+          issueStep(5, { kind: "RE_REVIEW", status: "APPROVE" }),
+        ]}
+        stage="reviewing"
+        hasPullRequest
+        onSelectStep={onSelectStep}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: /^Review/ }));
+    expect(onSelectStep).toHaveBeenCalledWith(5);
   });
 });

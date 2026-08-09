@@ -37,7 +37,7 @@ function stageForKind(kind: string): LifecycleStageId | null {
 function stageForStatus(stage: string | null | undefined): LifecycleStageId | null {
   const normalized = stage?.trim().toLowerCase() ?? "";
   if (/(triage|steward|backlog|route)/.test(normalized)) return "triage";
-  if (/(review|address)/.test(normalized)) return "review";
+  if (/(review|address|change.*request)/.test(normalized)) return "review";
   if (/(\bci\b|check|rebase)/.test(normalized)) return "ci";
   if (/(merge|done|complete)/.test(normalized)) return "merge";
   if (/(resolve|fix|implement|running)/.test(normalized)) return "resolve";

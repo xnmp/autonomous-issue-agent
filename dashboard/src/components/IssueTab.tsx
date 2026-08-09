@@ -19,6 +19,7 @@ import { EventTimeline } from "./EventTimeline";
 import { UnblockModal } from "./UnblockModal";
 import { ColumnMenu, type ColumnChoice } from "./ui/ColumnMenu";
 import { StepBadge, StepStatusChip } from "./ui/StepBadge";
+import { LifecycleStepper } from "./ui/LifecycleStepper";
 import { TableFilter } from "./ui/TableFilter";
 import {
   ResizableTable,
@@ -246,6 +247,29 @@ export function IssueTab({
               </span>
             </div>
           </header>
+
+          <section className="panel issue-lifecycle-panel" aria-labelledby={`issue-${issue}-lifecycle-title`}>
+            <div className="panel-hd">
+              <span className="panel-title" id={`issue-${issue}-lifecycle-title`}>Lifecycle</span>
+              <span className="faint num">{d.steps.length} execution legs</span>
+            </div>
+            <LifecycleStepper
+              steps={d.steps}
+              stage={d.stage}
+              done={d.done}
+              hasPullRequest={d.prs.length > 0 || d.pull_requests.length > 0}
+              attention={d.stage === "awaiting human reply" || d.stage === "blocked"
+                ? "blocked"
+                : d.escalation_reason || d.stage === "escalated"
+                  ? "escalated"
+                  : null}
+              label={`Issue #${issue} lifecycle`}
+              onSelectStep={(index) => {
+                setPane("tasks");
+                setOpenStep(index);
+              }}
+            />
+          </section>
 
           {d.escalation_reason ? (
             <div className="banner banner-error" role="status">
