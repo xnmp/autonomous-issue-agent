@@ -46,13 +46,16 @@ def test_router_budget_defaults_to_one_dollar():
     assert from_env({"REPO": "x"}).router_budget_usd == 1.0
 
 
-def test_reviewer_runtime_defaults_to_codex_with_a_mid_tier_model():
+def test_reviewer_runtime_defaults_to_codex_at_the_fixer_tier_or_above():
     """The deployment default is visible in the task-producing config, not
-    merely documented in an example overlay."""
+    merely documented in an example overlay. Sol + $15 since 2026-08-09: the
+    independent reviewer must be at least the fixer's tier, and the budget is
+    sized for sol's token rates (terra-sized $8 clipped sol mid-review)."""
     cfg = from_env({"REPO": "x"})
 
     assert cfg.reviewer_runtime == "codex"
-    assert cfg.review_model == "gpt-5.6-terra"
+    assert cfg.review_model == "gpt-5.6-sol"
+    assert cfg.review_budget_usd == 15.0
 
 
 def test_reviewer_runtime_accepts_an_explicit_claude_diversity_posture():
