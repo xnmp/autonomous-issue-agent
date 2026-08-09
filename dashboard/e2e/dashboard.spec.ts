@@ -122,6 +122,7 @@ const issues = {
     labels: ["feature", "effort:medium", "impact:high"],
     recurrence: false,
     recurrence_count: 0,
+    steward_state: "raw",
     age_days: 0,
     age_s: 1800,
     comments: 2,
@@ -189,6 +190,7 @@ const round3Issues = {
       title: "Add OAuth token refresh diagnostics",
       url: "https://github.com/openai/autonomous-issue-agent/issues/119",
       labels: ["ai-triage", "feature", "effort:medium", "impact:high"],
+      steward_state: "processed",
     },
     issues.backlog[0],
   ],
@@ -533,6 +535,9 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await page.getByRole("button", { name: "Quota", exact: true }).click();
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   await expectVerticallyContained(".options-popover");
+  const issueHealthTrend = page.getByRole("checkbox", { name: "Issue health trend" });
+  await expect(issueHealthTrend).not.toBeChecked();
+  await issueHealthTrend.check();
   await page.getByRole("button", { name: "Settings", exact: true }).click();
 
   await page.getByRole("button", { name: "Collapse sidebar" }).click();
@@ -762,7 +767,14 @@ test("captures the round-three operator states at 1440px", async ({ page }) => {
 
   await expect(page.getByText("Needs attention")).toHaveCount(0);
   await expect(page.getByRole("region", { name: "Spending caps" })).toContainText("$6.42");
-  await expect(page.getByText("Daemon health")).toBeVisible();
+  const daemonHealthPanel = page.locator(".panel-title", { hasText: "Daemon health" });
+  await expect(daemonHealthPanel).toHaveCount(0);
+  await page.getByRole("button", { name: "Settings" }).click();
+  const daemonHealth = page.getByRole("checkbox", { name: "Daemon health" });
+  await expect(daemonHealth).not.toBeChecked();
+  await daemonHealth.check();
+  await expect(daemonHealthPanel).toBeVisible();
+  await page.getByRole("button", { name: "Settings" }).click();
   await expect(page.getByText("last", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("searchbox", { name: "Filter operator actions" })).toHaveCount(0);
   await expect(page.getByText("Active lifecycle")).toHaveCount(0);
@@ -866,6 +878,11 @@ test("serves a validated operator workflow through FastAPI and the production bu
 }) => {
   await page.goto("http://127.0.0.1:4174/#/repo/self/issues/done");
   await page.getByRole("tab", { name: "Overview" }).click();
+  await page.getByRole("button", { name: "Settings" }).click();
+  const issueHealthTrend = page.getByRole("checkbox", { name: "Issue health trend" });
+  await expect(issueHealthTrend).not.toBeChecked();
+  await issueHealthTrend.check();
+  await page.getByRole("button", { name: "Settings" }).click();
   await expect(
     page.getByRole("row", { name: /2026-07-29.*3.*1.*\+2/ }),
   ).toBeVisible();

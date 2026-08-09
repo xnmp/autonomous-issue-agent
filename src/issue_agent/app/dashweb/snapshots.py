@@ -1869,10 +1869,51 @@ def backlog_card(
         "age_days": age_days(issue.get("createdAt"), now),
         "age_s": age_seconds(issue.get("createdAt"), now),
         "comments": _comment_count(issue.get("comments")),
+        "steward_state": backlog_steward_state(labels, row),
         "issue_type": _label_value(labels, ("type:",), exact=("bug", "feature")),
         "difficulty": _label_value(labels, ("difficulty:", "effort:")),
         "impact": _label_value(labels, ("impact:",)),
     }
+
+
+def backlog_steward_state(labels: list[str], row: dash.IssueRow | None) -> str:
+    """Return the latest durable steward disposition for a backlog issue.
+
+    ``triage_disposition`` is minted by the steward after the verdict actions
+    succeed; issue authors cannot forge it through labels or comment prose. The
+    label fallback preserves the processed state for journals predating the
+    marker, but only a marker can claim that a human reply is outstanding. A
+    removed ``ai-triage`` label retires every historical disposition.
+    """
+    if "ai-triage" not in labels:
+        return "raw"
+    if row is not None:
+        for event in reversed(row.events):
+            if event.get("event") != "triage_disposition":
+                continue
+            state = event.get("triage_state")
+            if state in {"processed", "blocked_on_human_reply"}:
+                return str(state)
+        # Pre-marker deployments still expose GitHub's durable comment thread
+        # through the schema-v2 world fold. The fixed headers are an explicitly
+        # untrusted, presentation-only migration hint: unlike the harness-minted
+        # event above, they can never authorize or trigger an effect.
+        comments = row.facts.get("comments")
+        if isinstance(comments, (list, tuple)):
+            for comment in reversed(comments):
+                if not isinstance(comment, Mapping):
+                    continue
+                body = comment.get("body")
+                if not isinstance(body, str):
+                    continue
+                if body.startswith("**A quick check before we start**"):
+                    return "blocked_on_human_reply"
+                if body.startswith((
+                    "**Ready to build ✅**",
+                    "**Triage needs a human here**",
+                )):
+                    return "processed"
+    return "processed"
 
 
 def _label_value(

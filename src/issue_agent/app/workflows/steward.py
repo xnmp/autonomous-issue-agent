@@ -13,6 +13,7 @@ from ...domain.events import (
     LevelChanged,
     RecurrenceDetected,
     TelemetryEvent,
+    TriageDispositionRecorded,
 )
 from ...domain.outcome import AgentResult, MAX_BUDGET_STATUS, budget_exhausted
 from ...domain.steward_stall import (
@@ -173,6 +174,20 @@ class StewardWorkflow:
         journal.emit(
             TelemetryEvent(
                 IssueGroomed(key, kind, {"issue": issue, "detail": detail}),
+                Correlation(issue=issue),
+            )
+        )
+
+    def _journal_triage_disposition(self, issue: int, *, blocked: bool) -> None:
+        """Record the steward state only after its remote disposition lands."""
+        journal = self.cfg.journal
+        if journal is None:
+            return
+        journal.emit(
+            TelemetryEvent(
+                TriageDispositionRecorded(
+                    "blocked_on_human_reply" if blocked else "processed"
+                ),
                 Correlation(issue=issue),
             )
         )
@@ -551,6 +566,7 @@ class StewardWorkflow:
             # committed — `_write_unconfirmed` is the adjudication.
             self._write_unconfirmed(issue, "triage", iss)
             return
+        self._journal_triage_disposition(issue, blocked=verdict.is_blocked)
         # After the actions, so a journalled recurrence always has its label and
         # comment behind it — and only ever for a recurrence the DOMAIN validated.
         if rec:

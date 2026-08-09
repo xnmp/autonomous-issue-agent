@@ -160,6 +160,15 @@
             "title": "Recurrence Count",
             "type": "integer"
           },
+          "steward_state": {
+            "enum": [
+              "raw",
+              "processed",
+              "blocked_on_human_reply"
+            ],
+            "title": "Steward State",
+            "type": "string"
+          },
           "title": {
             "anyOf": [
               {
@@ -192,7 +201,8 @@
           "recurrence",
           "recurrence_count",
           "age_days",
-          "comments"
+          "comments",
+          "steward_state"
         ],
         "title": "BacklogCard",
         "type": "object"

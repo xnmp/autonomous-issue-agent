@@ -2,7 +2,12 @@ import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Polled } from "../api/hooks";
-import type { BacklogCard, IssueCard, IssuesPayload } from "../api/types";
+import type {
+  BacklogCard,
+  IssueCard,
+  IssuesPayload,
+  PendingCard,
+} from "../api/types";
 import { IssuesTab } from "./IssuesTab";
 
 const done: IssueCard = {
@@ -44,6 +49,7 @@ const backlog: BacklogCard = {
   labels: ["type:enhancement", "difficulty:complex", "ai-triage"],
   recurrence: false,
   recurrence_count: 0,
+  steward_state: "processed",
   age_days: 1,
   comments: 0,
   issue_type: "enhancement",
@@ -197,6 +203,35 @@ describe("long-table filtering", () => {
     expect(screen.queryByText("Routine change 0")).not.toBeInTheDocument();
     expect(screen.getByText("1/12")).toBeVisible();
   });
+
+  it("finds a visible parked PR by its number", async () => {
+    const pending: PendingCard[] = Array.from({ length: 11 }, (_, index) => ({
+      issue: 200 + index,
+      title: index === 6 ? "Parked pull request" : `Waiting issue ${index}`,
+      url: null,
+      body: null,
+      priority: null,
+      labels: index === 6 ? ["ai-parked"] : ["ai-ready"],
+      held: index === 6,
+      hold_reason: index === 6 ? "parked" : null,
+      overlap: null,
+      pr: index === 6 ? 179 : null,
+      pr_url: index === 6 ? "https://github.com/o/r/pull/179" : null,
+      pr_state: index === 6 ? "open" : null,
+      pr_ci_state: index === 6 ? "passing" : null,
+    }));
+    board("inflight", { pending });
+
+    await userEvent.type(
+      screen.getByRole("searchbox", { name: "Filter active issues" }),
+      "179",
+    );
+
+    expect(screen.getByText("Parked pull request")).toBeVisible();
+    expect(screen.getByText("PR #179 ↗")).toBeVisible();
+    expect(screen.queryByText("Waiting issue 0")).not.toBeInTheDocument();
+    expect(screen.getByText("1/11")).toBeVisible();
+  });
 });
 
 describe("blocked section", () => {
@@ -299,14 +334,30 @@ describe("backlog triage taxonomy", () => {
     const { container } = board("backlog", {
       backlog: [
         backlog,
-        { ...backlog, issue: 64, title: "Unprocessed intake", labels: [] },
+        {
+          ...backlog,
+          issue: 64,
+          title: "Unprocessed intake",
+          labels: [],
+          steward_state: "raw",
+        },
+        {
+          ...backlog,
+          issue: 65,
+          title: "Needs clarification",
+          steward_state: "blocked_on_human_reply",
+        },
       ],
     });
 
     expect(screen.getByText("AC + test plan written")).toBeVisible();
     expect(screen.getByText("awaiting steward")).toBeVisible();
+    expect(screen.getByText("awaiting human reply")).toHaveClass("chip-fail");
+    expect(screen.getByText("steward questions need answers")).toBeVisible();
+    expect(screen.getAllByText("awaiting human reply")).toHaveLength(1);
     expect(container.querySelector(".backlog-processed")).not.toBeInTheDocument();
     expect(container.querySelector(".backlog-raw")).not.toBeInTheDocument();
+    expect(container.querySelector(".backlog-blocked")).not.toBeInTheDocument();
   });
 
   it("colours each axis value and its matching label with one mapping", () => {

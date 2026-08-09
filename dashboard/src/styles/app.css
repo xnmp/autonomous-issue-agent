@@ -1687,7 +1687,7 @@
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
 }
-.life-active .life-label,
+.life-label-active,
 .life-active .life-compact-label {
   font-weight: var(--weight-bold);
 }
@@ -1811,6 +1811,11 @@
 }
 .steward-ready {
   color: var(--meta-br);
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-medium);
+}
+.steward-attention {
+  color: var(--fail-br);
   font-size: var(--text-2xs);
   font-weight: var(--weight-medium);
 }

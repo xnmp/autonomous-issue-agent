@@ -74,7 +74,8 @@ describe("LifecycleStepper", () => {
       />,
     );
 
-    expect(screen.getByText("Resolve").closest("li")).toHaveClass("life-active");
+    const label = screen.getByText("Resolve");
+    expect(label).toHaveClass("life-label-active");
   });
 
   it("does not complete CI from a successful repair leg while review is still active", () => {

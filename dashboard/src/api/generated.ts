@@ -309,6 +309,11 @@ export interface components {
             recurrence: boolean;
             /** Recurrence Count */
             recurrence_count: number;
+            /**
+             * Steward State
+             * @enum {string}
+             */
+            steward_state: "raw" | "processed" | "blocked_on_human_reply";
             /** Title */
             title: string | null;
             /** Url */

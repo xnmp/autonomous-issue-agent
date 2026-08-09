@@ -8,6 +8,7 @@ from issue_agent.domain.events import (
     Correlation,
     EventEnvelope,
     Producer,
+    TriageDispositionRecorded,
     decode_event,
     decode_event_line,
     encode_event,
@@ -76,3 +77,8 @@ def test_registry_is_exhaustive_and_read_only():
     assert registry["agent.run.completed.v1"] is AgentRunCompleted
     with pytest.raises(TypeError):
         registry["new"] = AgentRunCompleted  # type: ignore[index]
+
+
+def test_triage_disposition_rejects_an_untrusted_state():
+    with pytest.raises(ValueError, match="triage disposition state"):
+        TriageDispositionRecorded("waiting")  # type: ignore[arg-type]

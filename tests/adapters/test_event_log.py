@@ -505,6 +505,7 @@ _SAMPLE = {
     "number": 1,
     "state_key": "state-key",
     "state": "waiting",
+    "triage_state": "processed",
     "run_id": "run-id",
     "amount_micros": 1,
     "quoted_micros": 1,

@@ -710,6 +710,7 @@ def test_v2_dashboard_places_current_unowned_open_issue_in_backlog(
             "age_days": None,
             "age_s": None,
             "comments": 3,
+            "steward_state": "raw",
             "issue_type": "bug",
             "difficulty": None,
             "impact": None,

@@ -227,6 +227,47 @@ describe("App navigation", () => {
     expect(screen.getByText("Issue health trend", { selector: ".panel-title" })).toBeVisible();
   });
 
+  it("does not treat corrupt stored option strings as enabled booleans", async () => {
+    window.location.hash = "#/repo/demo/overview";
+    localStorage.setItem(
+      "issue-agent.dashboard.options",
+      JSON.stringify({
+        showOverviewDaemonHealth: "false",
+        showOverviewIssueHealthTrend: "true",
+        showProjectedCost: "true",
+      }),
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input);
+        if (path === "/api/repos") return json(repos);
+        if (path === "/api/usage") return json(usage);
+        if (path.endsWith("/issues")) return json(issues);
+        return json({
+          metrics: null,
+          cost_mix: null,
+          caps: null,
+          health: [],
+          health_trend: [],
+          needs_attention: [],
+          interventions: [],
+          spend_per_hour: [],
+          unattributed: [],
+          warnings: [],
+        });
+      }),
+    );
+
+    render(<App />);
+
+    expect(await screen.findByText("Done", { selector: ".tile-label" })).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Settings" }));
+    expect(screen.getByRole("checkbox", { name: "Daemon health" })).not.toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Issue health trend" })).not.toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Show projected cost" })).not.toBeChecked();
+  });
+
   it("optimistically removes a promoted backlog issue and updates its tab count", async () => {
     window.location.hash = "#/repo/demo/issues/backlog";
     let finishPromotion: (response: Response) => void = () => {};
@@ -251,6 +292,7 @@ describe("App navigation", () => {
               labels: ["feature"],
               recurrence: false,
               recurrence_count: 0,
+              steward_state: "raw",
               age_days: 0,
               comments: 0,
               issue_type: "feature",

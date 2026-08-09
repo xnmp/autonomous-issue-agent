@@ -24,6 +24,7 @@ from .events import (
     RecurrenceDetected,
     SpendBlocked,
     SpendRecorded,
+    TriageDispositionRecorded,
     WorldObserved,
     JsonValue,
     encode_event,
@@ -958,6 +959,8 @@ def _dashboard_event_view(
                 "suspended_seconds": payload.suspended_ms / 1000,
             }
         )
+    elif isinstance(payload, TriageDispositionRecorded):
+        view["event"] = "triage_disposition"
     else:
         view["event"] = event.type
     return view

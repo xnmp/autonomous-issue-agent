@@ -297,6 +297,9 @@ class BacklogCard(Contract):
     age_days: int | None
     age_s: int | None = None
     comments: int | None
+    steward_state: Literal[
+        "raw", "processed", "blocked_on_human_reply"
+    ]
     issue_type: str | None = None
     difficulty: str | None = None
     impact: str | None = None

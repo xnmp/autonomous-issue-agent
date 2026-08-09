@@ -384,7 +384,7 @@ function filterCards<T extends FilterableCard>(cards: T[], query: string): T[] {
     const details = isIssueCard(card)
       ? [card.stage, card.pr, ...card.models, ...card.flags]
       : isPendingCard(card)
-        ? [card.priority, card.hold_reason]
+        ? [card.priority, card.hold_reason, card.pr]
         : [card.issue_type, card.difficulty, card.impact, card.body];
     return [...common, ...details]
       .some((value) => String(value ?? "").toLowerCase().includes(query));
@@ -903,7 +903,7 @@ function BacklogTable({
   const sortableAndShown = useMemo(() => new Set(["issue", ...visible]), [visible]);
   const sorted = useSortedRows(cards, {
     issue: (card) => card.issue,
-    steward: (card) => stewardProcessed(card),
+    steward: (card) => card.steward_state,
     type: (card) => card.issue_type,
     difficulty: (card) => card.difficulty,
     impact: (card) => card.impact,
@@ -960,7 +960,8 @@ function BacklogTable({
           <tbody>
             {sorted.rows.map((card) => {
               const open = expanded === card.issue;
-              const processed = stewardProcessed(card);
+              const blocked = card.steward_state === "blocked_on_human_reply";
+              const processed = card.steward_state === "processed";
               return (
                 <Fragment key={card.issue}>
                   <tr
@@ -1001,11 +1002,15 @@ function BacklogTable({
                     {visible.has("steward") ? (
                       <td>
                         <div className="steward-state">
-                          <Chip tone={processed ? "meta" : "neutral"} square>
-                            {processed ? "triaged" : "raw intake"}
+                          <Chip tone={blocked ? "fail" : processed ? "meta" : "neutral"} square>
+                            {blocked
+                              ? "awaiting human reply"
+                              : processed ? "triaged" : "raw intake"}
                           </Chip>
-                          <span className={processed ? "steward-ready" : "faint"}>
-                            {processed ? "AC + test plan written" : "awaiting steward"}
+                          <span className={blocked ? "steward-attention" : processed ? "steward-ready" : "faint"}>
+                            {blocked
+                              ? "steward questions need answers"
+                              : processed ? "AC + test plan written" : "awaiting steward"}
                           </span>
                         </div>
                       </td>
@@ -1446,10 +1451,6 @@ function IssueLifecycle({ card }: { card: IssueCard }) {
       label={`Issue #${card.issue} lifecycle`}
     />
   );
-}
-
-function stewardProcessed(card: BacklogCard): boolean {
-  return card.labels.some((label) => label.toLowerCase() === "ai-triage");
 }
 
 /**

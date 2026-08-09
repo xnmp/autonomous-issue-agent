@@ -354,7 +354,11 @@ export function LifecycleStepper({
         const content = (
           <>
             <span className="life-node-ring"><StateGlyph state={item.state} glyph={item.glyph} /></span>
-            {!compact ? <span className="life-label">{item.label}</span> : null}
+            {!compact ? (
+              <span className={`life-label${item.state === "active" ? " life-label-active" : ""}`}>
+                {item.label}
+              </span>
+            ) : null}
             {!compact ? <span className="life-state-label">{item.state}</span> : null}
           </>
         );

@@ -42,6 +42,7 @@ const BacklogCard = z
     labels: z.array(z.string()),
     recurrence: z.boolean(),
     recurrence_count: z.number().int(),
+    steward_state: z.enum(["raw", "processed", "blocked_on_human_reply"]),
     title: z.union([z.string(), z.null()]),
     url: z.union([z.string(), z.null()]),
   })
