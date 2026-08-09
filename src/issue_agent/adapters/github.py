@@ -23,7 +23,7 @@ import errno
 import json
 import re
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from urllib.parse import quote
@@ -33,6 +33,8 @@ from ..domain.world import (
     Check,
     ClosingRef,
     Comment,
+    HeadRef,
+    HeadSignal,
     IssueView,
     PRView,
     PullRequestDiff,
@@ -370,13 +372,26 @@ def no_checks_answer(argv: list[str], detail: str) -> bool:
 
 
 # ── pure parsers ──────────────────────────────────────────────────────────────
+def _label_names(raw: list | None) -> frozenset[str]:
+    """Raw label names, in gh's two shapes: [{"name": "ai-ready"}, …] (issue/pr
+    view) or bare strings (some fakes). The name-level twin of `_labels`, for
+    callers that must ask about a label the `Label` enum does not know — the
+    reviewer's configurable trigger label. ONE extraction so a shape the two
+    read differently cannot exist (adversarial review F3)."""
+    out = set()
+    for item in raw or []:
+        name = item.get("name") if isinstance(item, dict) else item
+        if isinstance(name, str) and name:
+            out.add(name)
+    return frozenset(out)
+
+
 def _labels(raw: list | None) -> frozenset[Label]:
     """gh returns labels as [{"name": "ai-ready"}, …] (issue/pr view) or as bare
     strings (some fakes). Map known names to Label; silently drop unknown ones so
     a stray repo label never crashes the parse."""
     out = set()
-    for item in raw or []:
-        name = item.get("name") if isinstance(item, dict) else item
+    for name in _label_names(raw):
         try:
             out.add(Label(name))
         except ValueError:
@@ -440,6 +455,27 @@ def _checks(raw: list | None) -> tuple[Check, ...]:
             run_id=_workflow_run_id(c),
         )
         for c in raw or []
+    )
+
+
+def _checks_digest(raw: list[dict[str, object]]) -> str:
+    """A stable, order-free string for one commit's check state (#163 probe).
+
+    Only ever compared against another digest of the same source, so it carries
+    the fields whose movement must wake the fixer — the per-check name, state and
+    pass/fail/pending bucket — and nothing timing-dependent (startedAt, links)
+    that would churn the digest without changing any decision."""
+    return "\n".join(
+        sorted(
+            f"{c.get('name') or ''}\t{c.get('state') or ''}\t{c.get('bucket') or ''}"
+            # `startedAt` is CONSTANT for a given run and changes only when the
+            # check is re-run, so it discriminates a re-run that lands on the
+            # same name/state/bucket triple without churning otherwise
+            # (adversarial review F12).
+            f"\t{c.get('startedAt') or ''}"
+            for c in raw
+            if isinstance(c, dict)
+        )
     )
 
 
@@ -539,6 +575,81 @@ def parse_pr(d: dict) -> PRView:
         is_draft=bool(d.get("isDraft", False)),
         author=((d.get("author") or {}).get("login", "") or ""),
     )
+
+
+# Every DECISION field a terminal (MERGED/CLOSED) PRView needs, in one labelled
+# list call. Kept in lockstep with `parse_terminal_pr`'s required-key check: a
+# field this list stops carrying must make the parse FAIL (→ full `gh pr view`),
+# never silently default.
+#
+# Deliberately ABSENT, and therefore never defaulted-in silently either: the
+# connection-shaped fields (body, comments, reviews, files), whose GraphQL cost
+# scales with page size. A view built from this list carries
+# `content_known=False` so telemetry can tell "unread" from "empty"; no
+# lifecycle decision reads any of them off a non-OPEN PR.
+_PR_LIST_FIELDS = (
+    "number,state,labels,headRefName,headRefOid,baseRefName,baseRefOid,"
+    "title,isDraft,author,closingIssuesReferences"
+)
+
+_TERMINAL_STATES = ("MERGED", "CLOSED")
+
+
+def parse_terminal_pr(row: object, *, label: str) -> PRView | None:
+    """A MERGED/CLOSED `PRView` built from a `gh pr list` row instead of a
+    per-PR `gh pr view` (#163) — or None, meaning "fetch it properly".
+
+    None on EVERY doubt, because a PRView is a trusted value that lifecycle
+    decisions read:
+
+    * a row missing any requested key, or with the wrong shape — partial data
+      must never be laundered into a trusted view;
+    * a state that is not terminal — an OPEN (or reopened, or unknown) PR keeps
+      the full fetch, including the mergeability and checks a terminal PR has no
+      use for;
+    * a row still showing `label`. The labelled `--state all` search index keeps
+      serving PRs for about a day after their label is removed, so membership is
+      untrustworthy — but a row whose own label set no longer carries the label
+      is a PR every cleanup arm already ignores, and one that still shows it is
+      exactly the PR whose cleanup must run off authoritative labels. So the
+      cheap path is taken only for the stale tail, and every PR that can still
+      DRIVE a decision keeps its `gh pr view`.
+
+    `checks_known=False` / `content_known=False`: not fetching something is
+    UNREAD, never read-as-empty (#48 review F3) — the same contract
+    `get_pr(checks=False)` upholds.
+
+    It must also never RAISE. A world build has no per-item isolation around
+    this call (unlike `_safe_get_pr`), so one oddly-shaped row would otherwise
+    kill the whole poll — the V10 incident class (adversarial review F3)."""
+    if not isinstance(row, dict):
+        return None
+    required = ("number", "state", "labels", "headRefName", "headRefOid",
+                "baseRefName", "baseRefOid", "title", "isDraft", "author",
+                "closingIssuesReferences")
+    if any(key not in row for key in required):
+        return None
+    if not isinstance(row.get("labels"), list) or not isinstance(
+        row.get("closingIssuesReferences"), list
+    ):
+        return None
+    try:
+        number = int(row["number"])
+        state = str(row["state"] or "").upper()
+        if state not in _TERMINAL_STATES:
+            return None
+        # The label gate reads the SAME extraction the view path uses, so the
+        # two can never disagree about what "this PR carries the label" means
+        # (a bare-string label list used to read as "no labels" here and as the
+        # label there — adversarial review F3). Name-level, because the
+        # reviewer's trigger label is operator-configured and need not be a
+        # known `Label`.
+        if label in _label_names(row["labels"]):
+            return None
+        view = parse_pr({**row, "number": number, "state": state})
+    except Exception:  # noqa: BLE001 — see the docstring: never raise
+        return None
+    return replace(view, checks_known=False, content_known=False)
 
 
 def _changed_files(files: object) -> frozenset[str]:
@@ -911,6 +1022,65 @@ class GitHubGateway:
         ])
         return out.strip()
 
+    def head_signals(self, heads: Sequence[HeadRef]) -> tuple[HeadSignal, ...] | None:
+        """CI + mergeability of the given in-flight PR heads, over REST only —
+        the two facts `change_signature` cannot see (#163). Feeds
+        `domain.world.fix_probe_safe`, which compares this reading against the
+        one taken for the last full build; nothing here interprets it.
+
+        Three REST calls per head (the pull object, its check-runs, its commit
+        statuses) against a pool the GraphQL world builds never touch. It
+        replaces a ~45-point GraphQL build per tick while a PR waits on CI.
+
+        `None` means UNREADABLE — any head whose pull object or checks did not
+        parse — and the predicate turns that into a full build. `GhUnavailable`
+        propagates: that is the whole world being unreadable, which is the
+        tick's call, not this method's."""
+        out: list[HeadSignal] = []
+        for head in heads:
+            try:
+                raw = self._gh(
+                    ["api", f"repos/{self.repo}/pulls/{head.number}", "--jq",
+                     r'[.state, (.merged|tostring), (.mergeable|tostring), '
+                     r'(.mergeable_state // ""), .head.sha] | @tsv']
+                ).strip()
+                fields = raw.split("\t")
+                if len(fields) != 5 or not fields[4]:
+                    return None
+                state, merged, mergeable, merge_state, sha = fields
+                checks = self._checks_for_head(sha)
+            except GhUnavailable as exc:
+                # A TIMED-OUT call is the one per-CALL sub-case (see the class
+                # docstring): one wedged head must not skip every fix tick for
+                # as long as it stays wedged — that is strictly worse than the
+                # per-PR isolation `_safe_get_pr` gives the same read inside a
+                # build (adversarial review F1). Unread → the predicate builds.
+                if exc.timed_out:
+                    return None
+                raise
+            except Exception:  # noqa: BLE001 — an answered-but-odd read is UNREAD
+                return None
+            if checks is None:
+                return None
+            out.append(
+                HeadSignal(
+                    number=head.number,
+                    head_ref_oid=sha,
+                    state=f"{state}/{merged}",
+                    ci=_checks_digest(checks),
+                    mergeable=f"{mergeable}/{merge_state}",
+                    # A failing check's meaning depends on the advisory-UNSTABLE
+                    # workflow-conclusion enrichment the world build does and this
+                    # digest does not carry, so it forces a build rather than
+                    # risking a skipped tick on a red PR.
+                    failing=any(
+                        isinstance(c, dict) and c.get("bucket") == "fail"
+                        for c in checks
+                    ),
+                )
+            )
+        return tuple(out)
+
     def merge_gate_protection(self, base_branch: str) -> bool:
         """True iff the base branch's protection makes a merge conditional on
         BOTH ≥1 approving review AND ≥1 required status check — the precondition
@@ -1238,6 +1408,25 @@ class GitHubGateway:
             "— re-derived next tick\n"
         )
 
+    def _pr_for_world(
+        self, row: dict, label: str, *, mergeability: bool = True
+    ) -> PRView | None:
+        """One PR for a world build: the list payload when that is provably
+        enough (`parse_terminal_pr`), a `gh pr view` otherwise.
+
+        `mergeability` is the OPEN-slice knob the review build turns off; a
+        terminal PR never asks for it either way."""
+        terminal = parse_terminal_pr(row, label=label)
+        if terminal is not None:
+            return terminal
+        number = int(row["number"])
+        is_open = str(row.get("state", "")).upper() == "OPEN"
+        return self._safe_get_pr(
+            number,
+            mergeability=mergeability and is_open,
+            checks=is_open,
+        )
+
     def list_pr_numbers(self, label: str, state: str = "open") -> list[int]:
         return [n for n, _ in self.list_pr_states(label, state)]
 
@@ -1251,12 +1440,42 @@ class GitHubGateway:
         (a hang-class lazy computation) nor a `gh pr checks` call. Nine stale
         merged PRs were costing ~18 wasted gh calls per fix tick, growing with
         every merge."""
+        return [
+            (int(row["number"]), str(row.get("state", "")))
+            for row in self.list_pr_rows(label, state)
+        ]
+
+    def list_pr_rows(self, label: str, state: str = "open") -> list[dict]:
+        """The same labelled list, carrying every field a TERMINAL PRView needs.
+
+        Costs what `--json number,state` costs: a labelled list is two GraphQL
+        requests (a SearchType introspection plus the search itself) whatever the
+        selection set, measured against the live repo on 2026-08-09. That is the
+        whole lever behind #163 — the stale merged tail (19 PRs on the flagship
+        target) was paying a `gh pr view` EACH, in both the fix and the review
+        build, for facts this payload already carries.
+
+        Connection-shaped fields (comments, reviews, files) are deliberately NOT
+        requested: they are the ones whose cost scales with page size, and no
+        lifecycle decision reads them off a non-OPEN PR (audit in the #163
+        commit)."""
         data = self._gh_json(
             ["pr", "list", "--repo", self.repo, "--label", label,
-             "--state", state, "--json", "number,state", "--limit", str(_LIST_LIMIT)]
+             "--state", state, "--json", _PR_LIST_FIELDS,
+             "--limit", str(_LIST_LIMIT)]
         ) or []
         _warn_if_list_truncated(f"gh pr list --label {label} --state {state}", len(data))
-        return [(int(p["number"]), str(p.get("state", ""))) for p in data]
+        rows = [r for r in data if isinstance(r, dict) and "number" in r]
+        if len(rows) != len(data):
+            # A dropped row is a PR the world will not carry — "could not look"
+            # must never be silently equal to "nothing to do".
+            import sys
+            sys.stderr.write(
+                f"gh pr list --label {label} --state {state}: "
+                f"{len(data) - len(rows)} unusable row(s) dropped — those PRs "
+                "are absent from this world\n"
+            )
+        return rows
 
     def list_all_open_pr_numbers(self) -> list[int]:
         """Every OPEN PR number, no label filter — feeds rogue-PR adoption."""
@@ -1336,21 +1555,19 @@ class GitHubGateway:
         issue_numbers.update(
             self.list_issue_numbers("ai-pr-open", "closed", _CLOSED_CLEANUP_LIMIT)
         )
-        pr_states: dict[int, str] = {}
+        pr_rows: dict[int, dict] = {}
         for state in ("open", "all"):
-            for n, s in self.list_pr_states("ai-pr-open", state):
-                pr_states.setdefault(n, s)
-        # Non-OPEN PRs (the stale --state all tail) get the cheap fetch: no
-        # mergeable (hang-class) and no checks call — see list_pr_states.
+            for row in self.list_pr_rows("ai-pr-open", state):
+                pr_rows.setdefault(int(row["number"]), row)
+        # The unlabelled terminal tail is built straight from the list payload
+        # (#163). Everything else is fetched; non-OPEN PRs (a terminal PR that
+        # still carries the label — the cleanup this arm exists for) get the
+        # cheap fetch: no mergeable (hang-class) and no checks call.
         # PRs are fetched BEFORE issues: the blocked-by gate below needs to
         # know which issues have an OPEN PR, and that linkage lives on the PR.
         prs = tuple(
-            p for n in sorted(pr_states)
-            if (p := self._safe_get_pr(
-                n,
-                mergeability=pr_states[n] == "OPEN",
-                checks=pr_states[n] == "OPEN",
-            )) is not None
+            p for n in sorted(pr_rows)
+            if (p := self._pr_for_world(pr_rows[n], "ai-pr-open")) is not None
         )
         # Dependencies gate paid dispatch at BOTH stages: pick_ready_issue for
         # admission, and the decide_fix repair arm for issues with an OPEN PR
@@ -1434,10 +1651,10 @@ class GitHubGateway:
         at an EXTERNAL repo (which has none of the harness's issue labels) and trigger
         on a configurable PR tag. `gh pr list --label <missing>` returns [] (exit 0),
         so an absent label degrades to "nothing to review" rather than crashing."""
-        pr_states: dict[int, str] = {}
+        pr_rows: dict[int, dict] = {}
         for state in ("open", "all"):
-            for n, s in self.list_pr_states(self.review_pr_label, state):
-                pr_states.setdefault(n, s)
+            for row in self.list_pr_rows(self.review_pr_label, state):
+                pr_rows.setdefault(int(row["number"]), row)
         # Rogue-PR adoption: also pull EVERY open PR (no label filter) so a PR that
         # never went through the pipeline (opened directly, no trigger label) is
         # visible to decide_review, which labels+adopts it. Draft/own-bot/opt-out
@@ -1446,17 +1663,18 @@ class GitHubGateway:
         # adopt a closed rogue PR).
         if self.review_adopt_unlabeled:
             for n in self.list_all_open_pr_numbers():
-                pr_states.setdefault(n, "OPEN")
+                pr_rows.setdefault(n, {"number": n, "state": "OPEN"})
         # mergeability=False: the reviewer never reads mergeable/merge_state (only the
         # fixer's rebase logic does), and requesting them can hang gh indefinitely on a
         # just-merged PR — which previously froze the whole review poll. Fetch without
         # them so a comment can always be left. Non-OPEN PRs (the stale --state all
         # tail, see list_pr_states) also skip the checks call — session cleanup
-        # reads only number/state/labels.
+        # reads only number/state/labels — and the UNLABELLED half of that tail
+        # skips the `gh pr view` entirely, built from the list payload (#163).
         prs = tuple(
-            p for n in sorted(pr_states)
-            if (p := self._safe_get_pr(
-                n, mergeability=False, checks=pr_states[n] == "OPEN"
+            p for n in sorted(pr_rows)
+            if (p := self._pr_for_world(
+                pr_rows[n], self.review_pr_label, mergeability=False
             )) is not None
         )
         return WorldState(issues=(), prs=prs, now=build_time())

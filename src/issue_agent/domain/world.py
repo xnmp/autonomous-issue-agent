@@ -192,6 +192,14 @@ class PRView:
     # Appended to preserve the positional compatibility of the historical
     # PRView fields while binding review evidence to an immutable base.
     base_ref_oid: str = ""
+    # False when the connection-shaped fields (body, comments, reviews,
+    # changed_files) were NOT fetched — the terminal-PR fast path builds a view
+    # from the `gh pr list` payload, which carries none of them (#163). Same
+    # contract as `checks_known`: absent ≠ empty. No lifecycle decision reads
+    # them off a non-OPEN PR, but telemetry does, and a metric that cannot tell
+    # "no files" from "files unread" reports a false zero (adversarial review
+    # F4: the predicted-path hit rate is a primary metric).
+    content_known: bool = True
 
     def has(self, label: Label) -> bool:
         return label in self.labels
@@ -372,30 +380,147 @@ class WorldState:
         return tuple(p for p in self.prs if p.has(label))
 
 
-def fix_probe_safe(world: WorldState) -> bool:
-    """True iff the fixer's world has nothing in flight: no OPEN `ai-working`
-    issue and no OPEN `ai-pr-open` PR.
+@dataclass(frozen=True)
+class HeadRef:
+    """One in-flight PR whose head the change signature cannot speak for. Carries
+    the PR number only: the head SHA a reading must be taken against is whatever
+    GitHub serves at read time, and a head that moved since the world was built
+    shows up as a CHANGED reading, which is exactly the answer wanted."""
 
-    The cheap change-probe signature (newest `updated_at` across issues+PRs) is
-    blind to CI check-run completion and mergeable/mergeStateStatus flips, which
-    GitHub recomputes without bumping `updated_at`. That blindness is why the
-    fixer can't be gated unconditionally — but it only MATTERS when there is a
-    harness PR whose checks/mergeability the fixer would act on, or an issue a
-    fixer already holds. In this idle shape there is neither, so the blind spot
-    is moot and the 1-point signature is a sound stand-in for a full build.
+    number: int
 
-    Work arriving into an idle world always bumps `updated_at`: labelling an
-    issue `ai-ready` (or any human comment/edit) defeats the probe by
-    construction, so the fixer wakes on the very next tick.
+
+@dataclass(frozen=True)
+class HeadSignal:
+    """What the change signature is blind to, for ONE in-flight PR head, read
+    outside the world build (cheap REST, a different pool from the GraphQL world).
+
+    Compared tick-over-tick against the reading taken for the last full build:
+    the fields only have to be internally consistent between two readings of the
+    same source, never equal to the GraphQL world's own encoding of the same
+    facts. `failing` is separate from `ci` because a failing check is exactly the
+    state whose meaning depends on enrichment the signature does not carry (the
+    advisory-UNSTABLE workflow-conclusion read), so it forces a full build."""
+
+    number: int
+    head_ref_oid: str = ""
+    state: str = ""
+    ci: str = ""
+    mergeable: str = ""
+    failing: bool = False
+
+
+@dataclass(frozen=True)
+class ProbeSignals:
+    """The blind-spot readings a probe-gated tick has in hand: `current` taken
+    this tick, `previous` taken for the last full build. `None` on either side
+    means NOT READ (never taken, or the read failed) — never "nothing to see"."""
+
+    current: tuple[HeadSignal, ...] | None = None
+    previous: tuple[HeadSignal, ...] | None = None
+
+
+# Above this many in-flight heads the reading stops being cheap: it costs three
+# REST calls each, EVERY tick, on the same pool the probe's own signature uses,
+# and exhausting that pool blinds the daemon outright (adversarial review F2).
+# Ten open harness PRs at a 20s poll would be ~5,000 REST calls/hour — the
+# primary limit. Past the ceiling the tick simply builds, which is the
+# pre-#163 behaviour.
+PROBE_HEAD_CEILING = 4
+
+
+def _inflight_prs(world: WorldState) -> tuple[PRView, ...]:
+    return tuple(
+        p for p in world.prs if p.state == "OPEN" and p.has(Label.AI_PR_OPEN)
+    )
+
+
+def probe_signal_heads(world: WorldState) -> tuple[HeadRef, ...]:
+    """The heads a probing tick should re-read for `fix_probe_safe` to be
+    answerable. NOT a statement about safety — `()` means "reading these cannot
+    gate this tick", which for a world with in-flight PRs means a full build.
+
+    Empty when the reading could not pay for itself:
+
+    * an idle world (nothing in flight) — the signature already answers;
+    * an OPEN `ai-working` issue — unsafe for reasons no GitHub read covers;
+    * more heads than `PROBE_HEAD_CEILING` — see the constant;
+    * a head the last build already saw RED or with checks unread. A red PR is
+      one the fixer is about to act on (and whose meaning depends on the
+      advisory enrichment the reading cannot carry), so the reading would be
+      bought every tick for a structurally impossible pass."""
+    if any(i.has(Label.AI_WORKING) for i in world.issues if i.state == "open"):
+        return ()
+    inflight = _inflight_prs(world)
+    if not inflight or len(inflight) > PROBE_HEAD_CEILING:
+        return ()
+    for pr in inflight:
+        if not pr.checks_known:
+            return ()
+        if any(c.bucket == "fail" for c in pr.checks):
+            return ()
+    return tuple(HeadRef(p.number) for p in inflight)
+
+
+def fix_probe_safe(world: WorldState, signals: ProbeSignals | None = None) -> bool:
+    """True iff the cheap change signature is a sound stand-in for a full fix
+    world build, given the last fully-built world and the blind-spot readings.
+
+    The signature (newest `updated_at` across issues+PRs) is blind to CI
+    check-run completion and mergeable/mergeStateStatus flips, which GitHub
+    recomputes without bumping `updated_at`. Two shapes answer that blindness:
+
+    * Nothing in flight — no OPEN `ai-working` issue and no OPEN `ai-pr-open`
+      PR. There is no PR whose checks/mergeability the fixer would act on and no
+      issue a fixer already holds, so the blind spot is moot. Work arriving into
+      an idle world always bumps `updated_at` (labelling `ai-ready`, a comment,
+      an edit), so the fixer wakes on the very next tick.
+    * In-flight PRs whose blind spot was RE-READ this tick and is UNCHANGED
+      since the last full build. The reading (`ProbeSignals`) folds CI and
+      mergeability into the signature, so the fixer coasts through a CI wait —
+      the ~180 full builds/hour that made the fixer the dominant GraphQL
+      consumer — and builds the instant any of it moves.
+
+    An OPEN `ai-working` issue is still unconditionally unsafe: a fixer holds it,
+    and what the tick must not miss there is the leg's own progress, which no
+    GitHub read describes.
+
+    Fails toward observation at every ambiguity — no reading, a failed reading,
+    a head the reading does not cover, a head the reading covers but the world
+    does not, a failing check whose advisory enrichment the reading cannot
+    carry, or a world `probe_signal_heads` refuses to plan a reading for — all
+    return False, i.e. a full build. A wasted build costs points; a wrongly
+    skipped tick costs a stalled PR.
+
+    What a gated tick DOES delay, bounded by the probe's TTL: any fix decision
+    driven by the wall clock alone rather than by an observable GitHub change
+    (the CI-pending escalation on a genuinely stuck check, stall markers, a
+    capacity- or overlap-deferred `ai-ready` retry). All are recoverable and
+    none exceed the TTL.
 
     `state` is checked explicitly because `issues_with`/`prs_with` filter by
     label only — a closed issue or a merged PR can keep its lifecycle label.
     """
     if any(i.has(Label.AI_WORKING) for i in world.issues if i.state == "open"):
         return False
-    if any(p.has(Label.AI_PR_OPEN) for p in world.prs if p.state == "OPEN"):
+    inflight = _inflight_prs(world)
+    if not inflight:
+        return True
+    # Non-empty in flight: only a reading can answer, and only the heads
+    # `probe_signal_heads` deems readable count — an empty plan there means the
+    # reading cannot gate this world (ceiling, red CI, unread checks) → build.
+    if not probe_signal_heads(world):
         return False
-    return True
+    if signals is None or signals.current is None or signals.previous is None:
+        return False
+    if any(s.failing for s in signals.current):
+        return False
+    wanted = {p.number for p in inflight}
+    current = {s.number: s for s in signals.current}
+    previous = {s.number: s for s in signals.previous}
+    if set(current) != wanted or set(previous) != wanted:
+        return False
+    return all(current[n] == previous[n] for n in wanted)
 
 
 # Convenience re-export so callers can `from .world import replace`.
@@ -412,6 +537,10 @@ __all__ = [
     "PRView",
     "ClosingRef",
     "WorldState",
+    "HeadRef",
+    "HeadSignal",
+    "ProbeSignals",
+    "probe_signal_heads",
     "fix_probe_safe",
     "replace",
 ]

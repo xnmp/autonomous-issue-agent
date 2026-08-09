@@ -27,9 +27,20 @@ while any in-flight work restores full builds until it lands. The TTL
 reconciliation build below is defence in depth on top of that analysis, not a
 substitute for it.
 
+`read_signals` closes the remaining hole (#163): "an open harness PR exists" was
+the fixer's whole in-flight test, so the fixer NEVER probed while a PR waited on
+CI — ~180 full GraphQL builds an hour, the largest single term in the 2026-08-02
+pool exhaustion. The blind spot there is only the CI and mergeability of ≤3
+heads, and both are readable over cheap REST. This hook re-reads them each tick;
+`fix_probe_safe` compares the reading against the one committed with the last
+full build and gates only when NOTHING moved. The extra reads run only when the
+last world actually had in-flight heads.
+
 Failure posture, in one line each:
-  * probe_when(last world) is False → build, WITHOUT probing (a wasted REST call
-    on top of the GraphQL build is strictly worse than not probing at all).
+  * probe_when(last world, signals) is False → build, WITHOUT probing (a wasted
+    REST call on top of the GraphQL build is strictly worse than not probing).
+  * read_signals returns None (a failed blind-spot read) → the predicate sees
+    "not read" → build. It raising GhUnavailable propagates like any observation.
   * probe raises GhUnavailable (rate limit / network / 5xx) → propagates, the
     daemon's existing skip-tick arm answers; nothing here retries.
   * probe returns "" (benign gh failure, empty repo) → build — fail OPEN; a
@@ -44,7 +55,46 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from ..domain.world import WorldState
+from collections.abc import Sequence
+
+from ..domain.world import (
+    HeadRef,
+    HeadSignal,
+    ProbeSignals,
+    WorldState,
+    fix_probe_safe,
+    probe_signal_heads,
+)
+
+
+def fix_probe_hooks(
+    has_active_dispatch: Callable[[], bool],
+    read_heads: Callable[[Sequence[HeadRef]], tuple[HeadSignal, ...] | None],
+) -> tuple[
+    Callable[[WorldState, ProbeSignals], bool],
+    Callable[[WorldState], tuple[HeadSignal, ...] | None],
+]:
+    """The fixer's `(probe_when, read_signals)` pair.
+
+    Adds the one in-flight fact no GitHub read describes: a PAID DISPATCH. A leg
+    can finish, die or be cancelled without touching any issue or PR, so a tick
+    is never skippable while one is running — and the blind-spot reading is not
+    bought either, since the answer could not gate the tick anyway.
+
+    Composed here rather than inline in `main.py` so the guard is testable
+    without standing up a daemon."""
+
+    def probe_when(world: WorldState, signals: ProbeSignals) -> bool:
+        if has_active_dispatch():
+            return False
+        return fix_probe_safe(world, signals)
+
+    def read_signals(world: WorldState) -> tuple[HeadSignal, ...] | None:
+        if has_active_dispatch():
+            return None
+        return read_heads(probe_signal_heads(world))
+
+    return probe_when, read_signals
 
 
 class WorldUnchanged(Exception):
@@ -67,18 +117,31 @@ class WorldProbe:
     # the signature is a sound stand-in for a build?". None = always probe (the
     # review/steward wiring). False for the last world = build unconditionally,
     # and don't even spend the REST point on a probe whose answer can't be used.
-    probe_when: Callable[[WorldState], bool] | None = None
+    probe_when: Callable[[WorldState, ProbeSignals], bool] | None = None
+    # Re-reads what the signature cannot see (CI + mergeability of the last
+    # world's in-flight heads) over a DIFFERENT, cheap pool. Returning None means
+    # the read failed; the predicate then fails toward a build. Not called at all
+    # when the last world has no such heads, so an idle fixer stays at one point.
+    read_signals: Callable[[WorldState], tuple[HeadSignal, ...] | None] | None = None
     _sig: str | None = field(default=None, init=False)
     _last_full: float | None = field(default=None, init=False)
     _last_world: WorldState | None = field(default=None, init=False)
+    _signals: tuple[HeadSignal, ...] | None = field(default=None, init=False)
 
     def gate(self, build: Callable[[], WorldState]) -> Callable[[], WorldState]:
         def observe() -> WorldState:
             # With no predicate the gate is unconditional (review/steward: their
             # first tick probes, finds no committed signature, and builds). With
             # one, a world must exist to judge — and it must pass.
+            current: tuple[HeadSignal, ...] | None = None
+            if self._last_world is not None and self.read_signals is not None:
+                # GhUnavailable propagates like every other observation failure.
+                current = self.read_signals(self._last_world)
             gated = self.probe_when is None or (
-                self._last_world is not None and self.probe_when(self._last_world)
+                self._last_world is not None
+                and self.probe_when(
+                    self._last_world, ProbeSignals(current, self._signals)
+                )
             )
             if gated:
                 fresh = (
@@ -100,6 +163,13 @@ class WorldProbe:
             self._sig = sig or self._sig
             self._last_full = self.clock()
             self._last_world = world
+            # Committed from the reading taken BEFORE this build, deliberately:
+            # a blind-spot flip inside the read→build window then shows up as a
+            # DIFFERENCE on the next tick (one redundant build) instead of being
+            # absorbed into the committed value and skipped until the TTL. A
+            # failed reading commits None, which the predicate reads as "not
+            # read" and answers with a build.
+            self._signals = current
             return world
 
         return observe

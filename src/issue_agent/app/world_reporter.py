@@ -125,19 +125,26 @@ class WorldReporter:
             "draft": pr.is_draft,
             "author": _bounded_text(pr.author),
             "closing_issue": pr.closing_issue,
-            "changed_files_total": len(pr.changed_files),
-            "changed_files": _bounded_paths(pr.changed_files),
-            "comments_total": len(pr.comments),
-            "comments": [
+        }
+        # Absent ≠ empty, exactly as for checks below: a terminal PR built from
+        # the list payload (#163) never had these read, and publishing zeros for
+        # them would rewrite a merged PR's history on the dashboard as "no
+        # files, no comments, no reviews" (adversarial review F8).
+        if pr.content_known:
+            facts["content_known"] = True
+            facts["changed_files_total"] = len(pr.changed_files)
+            facts["changed_files"] = _bounded_paths(pr.changed_files)
+            facts["comments_total"] = len(pr.comments)
+            facts["comments"] = [
                 {
                     "author": _bounded_text(comment.author),
                     "body": _bounded_body(comment.body),
                     "created_at": _bounded_text(comment.created_at),
                 }
                 for comment in pr.comments[-_MAX_INTERACTIONS:]
-            ],
-            "reviews_total": len(pr.reviews),
-            "reviews": [
+            ]
+            facts["reviews_total"] = len(pr.reviews)
+            facts["reviews"] = [
                 {
                     "author": _bounded_text(review.author),
                     "state": _bounded_text(review.state),
@@ -146,8 +153,7 @@ class WorldReporter:
                     "commit_id": _bounded_text(review.commit_id),
                 }
                 for review in pr.reviews[-_MAX_INTERACTIONS:]
-            ],
-        }
+            ]
         if pr.checks_known:
             facts["checks_known"] = True
             facts["checks_total"] = len(pr.checks)
