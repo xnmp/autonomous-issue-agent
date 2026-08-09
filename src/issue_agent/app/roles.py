@@ -15,7 +15,6 @@ remain on the daemon thread. Review and steward keep synchronous dispatch.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import os
 import threading
 import uuid
@@ -149,6 +148,8 @@ from .config import (
     HarnessConfig,
     ReviewRuntimeConfig,
     StewardRuntimeConfig,
+    deployment_identity_for_target,
+    owner_identity_for_target,
 )
 from .dispatch import AgentDispatcher, DispatchConfig
 from .infra_breaker import InfraBreaker
@@ -187,10 +188,7 @@ def _deployment_identity_for_target(
     target_dir: str,
     role: str,
 ) -> str:
-    checkout = os.path.realpath(target_dir) if target_dir else ""
-    return hashlib.sha256(
-        f"{repository}:{checkout}:{role}".encode()
-    ).hexdigest()[:16]
+    return deployment_identity_for_target(repository, target_dir, role)
 
 
 def _deployment_identity_for_repository(
@@ -268,7 +266,7 @@ def prior_process_supervision_state_dirs(
 
 
 def _owner_identity(cfg: HarnessConfig, role: str) -> str:
-    return f"{cfg.repo}:{role}:{_deployment_identity(cfg, role)}"
+    return owner_identity_for_target(cfg.repo, cfg.target_dir, role)
 
 
 def _control_store(

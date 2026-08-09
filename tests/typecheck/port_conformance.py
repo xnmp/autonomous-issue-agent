@@ -12,6 +12,7 @@ from issue_agent.adapters.control_store import (
     ReleaseResult,
     SQLiteControlStore,
 )
+from issue_agent.adapters.dashweb.ghdata import GhReader
 from issue_agent.adapters.effects import GitHubEffectExecutor
 from issue_agent.adapters.github import GitHubGateway, MergedRef
 from issue_agent.adapters.journal import LegacyJournalLocator
@@ -23,6 +24,7 @@ from issue_agent.adapters.store import Store
 from issue_agent.adapters.typed_journal import TypedJournal
 from issue_agent.adapters.worktree import Worktrees
 from issue_agent.app.execute import Executor
+from issue_agent.app.dashweb.ports import GitHubQueries
 from issue_agent.app.infra_breaker import InfraBreaker
 from issue_agent.app.recovery import NoWorktreeRecovery
 from issue_agent.app.roles import (
@@ -113,6 +115,9 @@ EXEMPT_PORTS = frozenset(
 
 def workflow_state(store: Store) -> WorkflowState:
     return store
+
+
+dashboard_github_queries: GitHubQueries = GhReader()
 
 
 def control_store(store: SQLiteControlStore) -> ControlStore:

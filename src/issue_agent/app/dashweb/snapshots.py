@@ -508,20 +508,16 @@ def _review_excerpt(row: dash.IssueRow, leg: dash.RunSummary) -> str | None:
 
 def _review_contexts(
     row: dash.IssueRow,
-    rejection_cap: int | None,
     unproductive_cap: int | None,
+    unproductive_counts: Mapping[int, int | None] | None,
 ) -> list[dict | None]:
     contexts: list[dict | None] = [None] * len(row.legs)
     rejections: dict[int | None, int] = {}
-    unproductive: dict[int | None, int] = {}
     for index, leg in enumerate(row.legs):
         if leg.kind not in dash.REVIEW_KINDS:
             continue
         verdict = dash.review_verdict(leg)
-        if verdict is None:
-            unproductive[leg.number] = unproductive.get(leg.number, 0) + 1
-        else:
-            unproductive[leg.number] = 0
+        if verdict is not None:
             if verdict.decision is ReviewDecision.APPROVE:
                 rejections[leg.number] = 0
             elif verdict.decision is ReviewDecision.REQUEST_CHANGES:
@@ -534,8 +530,7 @@ def _review_contexts(
                 and verdict.decision is ReviewDecision.REQUEST_CHANGES
                 else None
             ),
-            "rejection_cap": rejection_cap,
-            "unproductive_rounds": unproductive.get(leg.number, 0),
+            "unproductive_rounds": (unproductive_counts or {}).get(leg.number),
             "unproductive_cap": unproductive_cap,
         }
     return contexts
@@ -636,7 +631,8 @@ def _change_contexts(
             ),
             None,
         )
-        if current_index is None:
+        unknown_range = bool(previous) and previous_index is None
+        if current_index is None or unknown_range:
             subjects: list[str] = []
         else:
             begin = previous_index + 1 if previous_index is not None else 0
@@ -650,7 +646,9 @@ def _change_contexts(
             "branch": branch or None,
             "head_sha": head or None,
             "commit_subjects": subjects,
-            "files_changed_count": _files_changed(facts, gh_pr),
+            "files_changed_count": (
+                None if unknown_range else _files_changed(facts, gh_pr)
+            ),
         }
     return contexts
 
@@ -659,14 +657,16 @@ def detailed_steps(
     row: dash.IssueRow,
     *,
     budget_caps: Mapping[str, float] | None = None,
-    review_rejection_cap: int | None = None,
     unproductive_round_cap: int | None = None,
+    unproductive_round_counts: Mapping[int, int | None] | None = None,
     gh_prs: Mapping[int, Mapping] | None = None,
 ) -> list[dict]:
     """One row per leg plus operator interventions, in timestamp order.
     Not collapsed: the drill-down's whole job is showing the retries."""
     review_contexts = _review_contexts(
-        row, review_rejection_cap, unproductive_round_cap
+        row,
+        unproductive_round_cap,
+        unproductive_round_counts,
     )
     change_contexts = _change_contexts(row, gh_prs)
     steps = []
@@ -2454,8 +2454,8 @@ def issue_detail(
     gh_prs: dict[int, dict] | None = None,
     *,
     budget_caps: Mapping[str, float] | None = None,
-    review_rejection_cap: int | None = None,
     unproductive_round_cap: int | None = None,
+    unproductive_round_counts: Mapping[int, int | None] | None = None,
 ) -> dict:
     started = _started(row)
     pr = row.prs[-1] if row.prs else None
@@ -2493,8 +2493,8 @@ def issue_detail(
         "steps": detailed_steps(
             row,
             budget_caps=budget_caps,
-            review_rejection_cap=review_rejection_cap,
             unproductive_round_cap=unproductive_round_cap,
+            unproductive_round_counts=unproductive_round_counts,
             gh_prs=gh_prs,
         ),
         "events": list(row.events),

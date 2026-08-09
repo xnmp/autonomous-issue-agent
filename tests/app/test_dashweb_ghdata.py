@@ -1,7 +1,11 @@
 """The cached read-only gh façade: one call per (repo, query) per TTL, and a
 failure that degrades to `(None, error)` instead of raising."""
 
+import gc
 import json
+import threading
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 
 from issue_agent.adapters.dashweb import ghdata
 
@@ -14,14 +18,19 @@ class Clock:
         return self.t
 
 
-def reader(responses, clock=None, ttl_s=45.0):
+def reader(responses, clock=None, ttl_s=45.0, pr_ttl_s=180.0):
     calls = []
 
     def run(argv):
         calls.append(argv)
         return responses.pop(0) if responses else ("[]", "")
 
-    return ghdata.GhReader(run=run, ttl_s=ttl_s, clock=clock or Clock()), calls
+    return ghdata.GhReader(
+        run=run,
+        ttl_s=ttl_s,
+        clock=clock or Clock(),
+        pr_ttl_s=pr_ttl_s,
+    ), calls
 
 
 def test_repeated_reads_inside_the_ttl_shell_out_once():
@@ -50,6 +59,46 @@ def test_the_cache_expires_after_the_ttl():
     assert len(calls) == 2
 
 
+def test_concurrent_cold_misses_share_one_gh_invocation():
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def run(argv):
+        calls.append(argv)
+        entered.set()
+        assert release.wait(timeout=2)
+        return '[{"number": 1}]', ""
+
+    gh = ghdata.GhReader(run=run, clock=Clock())
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        futures = [pool.submit(gh.issues, "o/r") for _ in range(12)]
+        assert entered.wait(timeout=2)
+        release.set()
+        results = [future.result(timeout=2) for future in futures]
+
+    assert len(calls) == 1
+    assert results == [([{"number": 1}], "")] * 12
+
+
+def test_a_write_releases_expired_values_from_other_keys():
+    class Payload:
+        pass
+
+    clock = Clock()
+    cache = ghdata.TtlCache(ttl_s=45.0, clock=clock)
+    payload = Payload()
+    retained = weakref.ref(payload)
+    cache.put("old", payload)
+    del payload
+
+    clock.t = 46.0
+    cache.put("new", "live")
+    gc.collect()
+
+    assert retained() is None
+
+
 def test_different_repos_do_not_share_a_cache_entry():
     gh, calls = reader([('[{"number": 1}]', ""), ('[{"number": 2}]', "")])
     assert gh.issues("o/a")[0] == [{"number": 1}]
@@ -73,6 +122,25 @@ def test_pr_detail_fetches_change_history_without_expanding_the_list_query():
     assert argv[:3] == ["pr", "view", "12"]
     fields = argv[argv.index("--json") + 1]
     assert "commits" in fields and "headRefName" in fields and "files" in fields
+
+
+def test_pr_detail_uses_the_longer_change_history_ttl():
+    clock = Clock()
+    gh, calls = reader(
+        [(json.dumps({"number": 12}), ""), (json.dumps({"number": 12}), "")],
+        clock=clock,
+        ttl_s=45.0,
+        pr_ttl_s=180.0,
+    )
+
+    gh.pr("o/r", 12)
+    clock.t = 179.0
+    gh.pr("o/r", 12)
+    assert len(calls) == 1
+
+    clock.t = 181.0
+    gh.pr("o/r", 12)
+    assert len(calls) == 2
 
 
 def test_a_gh_failure_degrades_to_an_error_string():

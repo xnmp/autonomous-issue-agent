@@ -5,16 +5,20 @@ from __future__ import annotations
 import os
 import subprocess
 import uuid
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ...adapters.dashweb import actions, costchart, ghdata, system, usage, verification
+from ...adapters.control_store import SQLiteControlStore
 from ...adapters.event_log import EventLog
+from ...adapters.github import parse_pr
 from ...adapters.journal import default_ledger_path
 from ...adapters.operator_effects import build_operator_effects
 from ...adapters.store import Store
 from ...adapters.typed_journal import TypedJournal
 from ...domain import dashboard as dash
+from ...domain.fix import breaker_key
 from ...domain.labels import Label
 
 # (target, number, labels added, labels removed) — one applied park/unpark move.
@@ -30,6 +34,7 @@ from .. import cli, config
 from ..review_identity import review_identity
 from . import snapshots
 from .guidance import GuidanceError, parse_guidance
+from .ports import GitHubQueries
 
 
 def _utcnow() -> datetime:
@@ -54,7 +59,6 @@ _DETAIL_CONFIG_FIELDS = (
     "REVIEW_BUDGET_USD",
     "STEWARD_TRIAGE_BUDGET_USD",
     "JIRA_SYNC_BUDGET_USD",
-    "REVIEW_MAX_REJECTIONS",
     "MAX_UNPRODUCTIVE_REVIEW_ROUNDS",
 )
 _FIX_BUDGET_KINDS = (
@@ -62,7 +66,7 @@ _FIX_BUDGET_KINDS = (
 )
 
 
-def _detail_limits(name: str, repo: str) -> tuple[dict[str, float], int, int]:
+def _detail_limits(name: str, repo: str) -> tuple[dict[str, float], int]:
     configured = {
         field: value
         for field in _DETAIL_CONFIG_FIELDS
@@ -80,7 +84,6 @@ def _detail_limits(name: str, repo: str) -> tuple[dict[str, float], int, int]:
     }
     return (
         caps,
-        max(0, cfg.max_review_rejections),
         max(0, cfg.max_unproductive_review_rounds),
     )
 
@@ -111,10 +114,11 @@ class Backend:
     def __init__(
         self,
         harness_root: str | None = None,
-        gh: ghdata.GhReader | None = None,
+        gh: GitHubQueries | None = None,
         now_fn=None,
         stale_after_s: float = dash.STALE_AFTER_S,
         snapshot_ttl_s: float = 3.0,
+        detail_config_ttl_s: float = 60.0,
         effects_factory=build_operator_effects,
         control_db_path: str = "",
     ):
@@ -128,6 +132,7 @@ class Backend:
         # data that cannot have changed. A few seconds of staleness is free —
         # the daemons themselves tick every 20s.
         self._snapshots = ghdata.TtlCache(ttl_s=snapshot_ttl_s)
+        self._detail_configs = ghdata.TtlCache(ttl_s=detail_config_ttl_s)
         # Behind the TTL, because the TTL only bounds how often we ask: on
         # expiry the old collector re-read and re-folded all three feeds from
         # byte zero, so a single polling browser tab held a core at 100% and
@@ -252,6 +257,79 @@ class Backend:
             ghdata.index_by_number(prs_payload),
             warnings,
         )
+
+    def _cached_detail_limits(
+        self, name: str, repo: str
+    ) -> tuple[dict[str, float], int]:
+        key = (name, repo)
+        return self._detail_configs.get_or_load(
+            key, lambda: _detail_limits(name, repo)
+        )
+
+    def _review_unproductive_rounds(
+        self,
+        name: str,
+        snapshot: dash.Snapshot,
+        row: dash.IssueRow,
+        gh_prs: Mapping[int, Mapping],
+    ) -> tuple[dict[int, int | None], list[str]]:
+        """Read the same two durable sources as ``roles._review_state``.
+
+        File counters cover failures the process survived. Abandoned dispatches
+        in the control database cover deaths it did not. Both key namespaces
+        are summed because a transient closing-issue lookup failure can write a
+        death under ``-PR`` while the next successful poll reads the issue key.
+        """
+        if not row.prs:
+            return {}, []
+        counts: dict[int, int | None] = {number: None for number in row.prs}
+        warnings: list[str] = []
+        review_path = next(
+            (
+                path
+                for role, path in zip(dash.ROLE_NAMES, cli.journal_paths(name))
+                if role == "review"
+            ),
+            "",
+        )
+        state_dir = os.path.dirname(review_path)
+        if not state_dir:
+            return counts, ["review breaker state directory is unavailable"]
+
+        process_deaths: dict[int, int] = {}
+        if self.control_db_path:
+            owner_id = config.owner_identity_for_target(
+                snapshot.repo, snapshot.target_dir, "review"
+            )
+            try:
+                process_deaths = SQLiteControlStore(
+                    self.control_db_path
+                ).abandoned_dispatch_counts(owner_id)
+            except Exception as exc:  # noqa: BLE001 - detail degrades honestly
+                return counts, [
+                    f"review abandoned-dispatch counts unavailable ({_detail(exc)})"
+                ]
+
+        store = Store(state_dir)
+        for number in row.prs:
+            raw = gh_prs.get(number)
+            if not isinstance(raw, Mapping) or not {
+                "headRefName", "closingIssuesReferences"
+            }.issubset(raw):
+                warnings.append(
+                    f"PR #{number} breaker key unavailable from GitHub details"
+                )
+                continue
+            try:
+                pr = parse_pr({**raw, "number": number})
+            except (AttributeError, TypeError, ValueError):
+                warnings.append(f"PR #{number} breaker key is malformed")
+                continue
+            counts[number] = sum(
+                store.get_infra_deaths(key) + process_deaths.get(key, 0)
+                for key in {breaker_key(pr), -number}
+            )
+        return counts, warnings
 
     def issues(self, name: str) -> dict:
         snap = self.snapshot(name)
@@ -384,14 +462,12 @@ class Backend:
         if row is None:
             return None
         gh_issues, gh_prs, warnings = self._gh_context(snap.repo)
-        detail_reader = getattr(self.gh, "pr", None)
-        if callable(detail_reader):
-            for pr in row.prs:
-                payload, error = detail_reader(snap.repo, pr)
-                if isinstance(payload, dict):
-                    gh_prs[pr] = {**gh_prs.get(pr, {}), **payload}
-                if error:
-                    warnings.append(f"PR #{pr} change details: {error}")
+        for pr in row.prs:
+            payload, error = self.gh.pr(snap.repo, pr)
+            if isinstance(payload, dict):
+                gh_prs[pr] = {**gh_prs.get(pr, {}), **payload}
+            if error:
+                warnings.append(f"PR #{pr} change details: {error}")
         if snap.deployment.schema_version == 2:
             gh_issues = {
                 key: _github_issue_enrichment(value)
@@ -401,17 +477,21 @@ class Backend:
                 key: _github_enrichment(value)
                 for key, value in gh_prs.items()
             }
-        budget_caps, rejection_cap, unproductive_cap = _detail_limits(
+        budget_caps, unproductive_cap = self._cached_detail_limits(
             name, snap.repo
         )
+        unproductive_rounds, breaker_warnings = self._review_unproductive_rounds(
+            name, snap, row, gh_prs
+        )
+        warnings.extend(breaker_warnings)
         detail = snapshots.issue_detail(
             row,
             self.now_fn(),
             gh_issues.get(number),
             gh_prs,
             budget_caps=budget_caps,
-            review_rejection_cap=rejection_cap,
             unproductive_round_cap=unproductive_cap,
+            unproductive_round_counts=unproductive_rounds,
         )
         detail["warnings"] = warnings
         return detail
@@ -1481,7 +1561,7 @@ _PR_ENRICHMENT_FIELDS = (
     # Fetched only by GhReader.pr for an open issue detail. Keeping them in the
     # v2 enrichment is necessary because `_github_enrichment` deliberately
     # strips list-query fields that cannot affect the projected lifecycle.
-    "headRefName", "headRefOid", "commits", "files",
+    "headRefName", "headRefOid", "closingIssuesReferences", "commits", "files",
 )
 # `body` and `createdAt` are presentational fields the projection does not
 # carry: the backlog drill-down renders the issue text, and its age column

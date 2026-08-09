@@ -19,6 +19,7 @@ config/.active*.env
 
 # Dashboard SPA build output + deps (built by `make dashboard-ui`)
 dashboard/dist/
+evidence-facelift/
 dashboard/node_modules/
 dashboard/.build.lock
 dashboard/test-results/

@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from issue_agent.adapters.dashweb import ghdata, system
+from issue_agent.adapters.store import Store
 from issue_agent.app.dashweb import service, snapshots
 from issue_agent.domain import dashboard as dash
 from issue_agent.domain.events import (
@@ -2166,7 +2167,7 @@ def test_a_step_exposes_runtime_budget_and_its_evidence_escalation():
     }
 
 
-def test_review_context_pairs_requested_changes_and_tracks_both_breakers():
+def test_review_context_labels_leg_verdicts_and_uses_authoritative_round_count():
     first = {
         "ts": ts(hours=4), "event": "agent_run", "role": "review",
         "kind": "REVIEW", "number": 12, "issue": 7,
@@ -2210,15 +2211,17 @@ def test_review_context_pairs_requested_changes_and_tracks_both_breakers():
     )
 
     steps = snapshots.detailed_steps(
-        row, review_rejection_cap=4, unproductive_round_cap=5
+        row,
+        unproductive_round_cap=5,
+        unproductive_round_counts={12: 4},
     )
 
     assert steps[0]["review"]["verdict_excerpt"] == first_body
     assert steps[0]["review"]["rejection"] == 1
-    assert steps[1]["review"]["unproductive_rounds"] == 1
+    assert steps[1]["review"]["unproductive_rounds"] == 4
     assert steps[2]["review"]["rejection"] == 2
-    assert steps[2]["review"]["unproductive_rounds"] == 0
-    assert steps[2]["review"]["rejection_cap"] == 4
+    assert steps[2]["review"]["unproductive_rounds"] == 4
+    assert "rejection_cap" not in steps[2]["review"]
     assert steps[2]["review"]["unproductive_cap"] == 5
     assert len(steps[2]["review"]["verdict_excerpt"]) == 500
     assert steps[2]["review"]["verdict_excerpt"].endswith("…")
@@ -2269,6 +2272,42 @@ def test_change_context_splits_commit_progression_across_fix_legs():
         "green: serialize watcher writes"
     ]
     assert steps[1]["change"]["files_changed_count"] == 5
+
+
+def test_change_context_does_not_attribute_history_across_a_force_push():
+    first = {**RESOLVE, "ts": ts(hours=4), "status": "pr_opened"}
+    second = {
+        "ts": ts(hours=2), "event": "agent_run", "role": "fix",
+        "kind": "ADDRESS_REVIEW", "number": 12, "issue": 7,
+        "status": "done", "exit_reason": "ok",
+    }
+    before = {
+        "ts": ts(hours=3), "type": "world.observed.v1",
+        "subject_kind": "pr", "subject_number": 12,
+        "facts": {"head_ref": "feat/7", "head_sha": "a" * 40},
+    }
+    after = {
+        "ts": ts(hours=1), "type": "world.observed.v1",
+        "subject_kind": "pr", "subject_number": 12,
+        "facts": {
+            "head_ref": "feat/7", "head_sha": "c" * 40,
+            "changed_files_total": 9,
+        },
+    }
+    row = replace(
+        row_for([first, second], 7),
+        prs=(12,),
+        events=(first, before, second, after),
+    )
+    gh_prs = {12: {"commits": [
+        {"oid": "b" * 40, "messageHeadline": "unrelated rewritten history"},
+        {"oid": "c" * 40, "messageHeadline": "actual repair"},
+    ], "files": [{"path": "a.py"}] * 9}}
+
+    change = snapshots.detailed_steps(row, gh_prs=gh_prs)[1]["change"]
+
+    assert change["commit_subjects"] == []
+    assert change["files_changed_count"] is None
 
 
 # ── PR merge readiness ────────────────────────────────────────────────────────
@@ -2495,6 +2534,16 @@ def v2_backend(monkeypatch, ledger_rows=(), **pr_fields):
             return ([{"number": 12, "url": "u/12", "state": "OPEN",
                       **pr_fields}], "")
 
+        def pr(self, _repo, number):
+            return ({
+                "number": number,
+                "headRefName": "feat/7-dashboard",
+                "closingIssuesReferences": [{"number": 7}],
+                "commits": [],
+                "files": [],
+                **pr_fields,
+            }, "")
+
     backend = service.Backend(gh=Gh(), now_fn=lambda: NOW)
     monkeypatch.setattr(backend, "snapshot", lambda _name: snapshot)
     monkeypatch.setattr(
@@ -2523,28 +2572,66 @@ def test_v2_cards_report_no_merge_readiness_when_github_withholds_it(monkeypatch
     assert card["pr_state"] == "open" and card["pr_review_state"] is None
 
 
-def test_issue_detail_uses_the_deployments_leg_and_review_caps(monkeypatch):
+def test_issue_detail_uses_cached_deployment_leg_and_unproductive_caps(monkeypatch):
     backend = v2_backend(monkeypatch)
     configured = {
         "MAX_BUDGET_USD": "6.5",
         "REVIEW_BUDGET_USD": "2.5",
-        "REVIEW_MAX_REJECTIONS": "3",
         "MAX_UNPRODUCTIVE_REVIEW_ROUNDS": "2",
     }
+    reads = []
     monkeypatch.setattr(
         service.cli,
         "deployment_env_field",
-        lambda _name, field: configured.get(field, ""),
+        lambda _name, field: reads.append(field) or configured.get(field, ""),
     )
 
     detail = backend.issue("demo", 7)
+    backend.issue("demo", 7)
 
     assert detail is not None
     resolve, review = detail["steps"]
     assert resolve["budget_cap_usd"] == 6.5
     assert review["budget_cap_usd"] == 2.5
-    assert review["review"]["rejection_cap"] == 3
     assert review["review"]["unproductive_cap"] == 2
+    assert len(reads) == len(service._DETAIL_CONFIG_FIELDS)
+
+
+def test_issue_detail_matches_both_durable_review_breaker_sources(
+    monkeypatch, tmp_path
+):
+    backend = v2_backend(monkeypatch)
+    backend.control_db_path = str(tmp_path / "control.db")
+    review_dir = tmp_path / "review"
+    review_dir.mkdir()
+    Store(str(review_dir)).set_infra_deaths(7, 2)
+    Store(str(review_dir)).set_infra_deaths(-12, 1)
+    monkeypatch.setattr(
+        service.cli,
+        "journal_paths",
+        lambda _name: [
+            str(tmp_path / "fix" / "journal.jsonl"),
+            str(review_dir / "journal.jsonl"),
+            str(tmp_path / "steward" / "journal.jsonl"),
+        ],
+    )
+    owners = []
+
+    class Control:
+        def __init__(self, path):
+            assert path == backend.control_db_path
+
+        def abandoned_dispatch_counts(self, owner_id):
+            owners.append(owner_id)
+            return {7: 4, -12: 5}
+
+    monkeypatch.setattr(service, "SQLiteControlStore", Control)
+
+    detail = backend.issue("demo", 7)
+
+    assert detail is not None
+    assert detail["steps"][1]["review"]["unproductive_rounds"] == 12
+    assert owners == ["o/r:review:621811f2e56e1555"]
 
 
 def test_cards_carry_the_verification_reason_for_issue_and_pr(monkeypatch):

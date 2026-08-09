@@ -206,7 +206,6 @@ const issue = {
       review: {
         verdict_excerpt: "The implementation still hides the actual review findings. Surface the requested-change body as untrusted text and preserve the rejection and spend context so an operator can decide whether another round is productive.",
         rejection: 2,
-        rejection_cap: 4,
         unproductive_rounds: 0,
         unproductive_cap: 5,
       },
@@ -269,7 +268,6 @@ const issue = {
       review: {
         verdict_excerpt: null,
         rejection: null,
-        rejection_cap: 4,
         unproductive_rounds: 0,
         unproductive_cap: 5,
       },

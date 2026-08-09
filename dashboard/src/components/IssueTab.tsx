@@ -698,9 +698,12 @@ function capFraction(value: number, cap: number | null | undefined): string {
 function StepContextLine({ step }: { step: IssueStep }) {
   const segments: string[] = [];
   if (step.review?.rejection !== null && step.review?.rejection !== undefined) {
-    segments.push(`rejection ${capFraction(step.review.rejection, step.review.rejection_cap)}`);
+    segments.push(`change-request verdicts observed ${step.review.rejection}`);
   }
-  if (step.review) {
+  if (
+    step.review?.unproductive_rounds !== null
+    && step.review?.unproductive_rounds !== undefined
+  ) {
     segments.push(
       `unproductive rounds ${capFraction(
         step.review.unproductive_rounds,

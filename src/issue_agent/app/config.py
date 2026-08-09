@@ -45,6 +45,27 @@ REPOINT_HISTORY_ENV = "REPOINTED_FROM_DEPLOYMENTS"
 MAX_REPOINT_HISTORY = 32
 
 
+def deployment_identity_for_target(
+    repository: str,
+    target_dir: str,
+    role: str,
+) -> str:
+    """Stable identity for one repository checkout and daemon role."""
+    checkout = os.path.realpath(target_dir) if target_dir else ""
+    return hashlib.sha256(
+        f"{repository}:{checkout}:{role}".encode()
+    ).hexdigest()[:16]
+
+
+def owner_identity_for_target(
+    repository: str,
+    target_dir: str,
+    role: str,
+) -> str:
+    deployment = deployment_identity_for_target(repository, target_dir, role)
+    return f"{repository}:{role}:{deployment}"
+
+
 def parse_repoint_history(raw: str) -> tuple[tuple[str, str], ...]:
     """Decode the explicit repository/checkout lineage written by the CLI."""
 

@@ -690,12 +690,10 @@ export interface components {
         IssueStepReview: {
             /** Rejection */
             rejection?: number | null;
-            /** Rejection Cap */
-            rejection_cap?: number | null;
             /** Unproductive Cap */
             unproductive_cap?: number | null;
             /** Unproductive Rounds */
-            unproductive_rounds: number;
+            unproductive_rounds?: number | null;
             /** Verdict Excerpt */
             verdict_excerpt?: string | null;
         } & {

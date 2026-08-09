@@ -180,12 +180,12 @@ const IssueStepEscalation = z
   .passthrough();
 const IssueStepReview = z
   .object({
-    rejection: z.union([z.number(), z.null()]).optional(),
-    rejection_cap: z.union([z.number(), z.null()]).optional(),
-    unproductive_cap: z.union([z.number(), z.null()]).optional(),
-    unproductive_rounds: z.number().int(),
-    verdict_excerpt: z.union([z.string(), z.null()]).optional(),
+    rejection: z.union([z.number(), z.null()]),
+    unproductive_cap: z.union([z.number(), z.null()]),
+    unproductive_rounds: z.union([z.number(), z.null()]),
+    verdict_excerpt: z.union([z.string(), z.null()]),
   })
+  .partial()
   .passthrough();
 const TokenUsage = z
   .object({

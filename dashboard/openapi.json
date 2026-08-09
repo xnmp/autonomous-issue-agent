@@ -1711,17 +1711,6 @@
             ],
             "title": "Rejection"
           },
-          "rejection_cap": {
-            "anyOf": [
-              {
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Rejection Cap"
-          },
           "unproductive_cap": {
             "anyOf": [
               {
@@ -1734,8 +1723,15 @@
             "title": "Unproductive Cap"
           },
           "unproductive_rounds": {
-            "title": "Unproductive Rounds",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unproductive Rounds"
           },
           "verdict_excerpt": {
             "anyOf": [
@@ -1749,9 +1745,6 @@
             "title": "Verdict Excerpt"
           }
         },
-        "required": [
-          "unproductive_rounds"
-        ],
         "title": "IssueStepReview",
         "type": "object"
       },

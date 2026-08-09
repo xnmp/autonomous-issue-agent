@@ -5,6 +5,18 @@ from __future__ import annotations
 from typing import Protocol
 
 
+class GitHubQueries(Protocol):
+    """Complete GitHub read seam required by dashboard issue detail."""
+
+    def issues(
+        self, repo: str, limit: int = 1000
+    ) -> tuple[object | None, str]: ...
+    def prs(
+        self, repo: str, limit: int = 200
+    ) -> tuple[object | None, str]: ...
+    def pr(self, repo: str, number: int) -> tuple[object | None, str]: ...
+
+
 class RepositoryQueries(Protocol):
     def known(self, name: str) -> bool: ...
     def repos(self) -> dict: ...
