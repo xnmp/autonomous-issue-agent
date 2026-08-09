@@ -71,15 +71,10 @@ describe("IssuesTab", () => {
     );
 
     expect(screen.queryByRole("columnheader", { name: "Rounds" })).not.toBeInTheDocument();
-    expect(screen.getByRole("columnheader", { name: /Verification/ })).toBeVisible();
+    expect(screen.queryByRole("columnheader", { name: /Verification/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: "Verification" })).not.toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: /Since done/ })).toBeVisible();
     expect(screen.queryByLabelText("Issue #50 lifecycle")).not.toBeInTheDocument();
-    const verification = screen.getByRole("cell", { name: "pending" });
-    expect(verification).toBeVisible();
-    expect(screen.getByText("pending", { exact: true })).toHaveAttribute(
-      "data-tip",
-      "pending\nIssue: VERIFIED\nPR: pending",
-    );
     const row = screen.getByRole("row", { name: /Explain completed work.*#50.*PR #75/ });
     await userEvent.click(row);
     expect(onOpenIssue).not.toHaveBeenCalled();
@@ -230,13 +225,17 @@ describe("IssuesTab", () => {
           pending: [{
             issue: 34,
             title: "Parked work",
-            url: null,
+            url: "https://github.com/o/r/issues/34",
             body: "text",
             priority: null,
             labels: ["ai-parked"],
             held: true,
             hold_reason: "parked",
             overlap: null,
+            pr: 179,
+            pr_url: "https://github.com/o/r/pull/179",
+            pr_state: "open",
+            pr_ci_state: "failing",
           }],
           done: [],
           backlog: [],
@@ -249,6 +248,12 @@ describe("IssuesTab", () => {
     );
 
     expect(screen.getByText("parked")).toBeVisible();
+    const pr = screen.getByText("PR #179 ↗").closest(".chip");
+    expect(pr).toHaveClass("chip-fail");
+    expect(pr?.closest("a")).toHaveAttribute(
+      "href",
+      "https://github.com/o/r/pull/179",
+    );
     await userEvent.click(screen.getByRole("row", { name: /Parked work/ }));
     await userEvent.click(await screen.findByRole("button", { name: "Unpark" }));
     expect(calls.some((url) => url.endsWith("/issues/34/unpark"))).toBe(true);

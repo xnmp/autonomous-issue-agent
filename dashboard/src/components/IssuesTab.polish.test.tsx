@@ -97,49 +97,6 @@ describe("merge readiness on the PR chip", () => {
   });
 });
 
-describe("done verification badge", () => {
-  it("shows the ledger's reason for both verdicts on hover", () => {
-    board("done", {
-      done: [{
-        ...done,
-        issue_verification_reason: "probe stayed green for a week",
-        pr_verification_reason: "no follow-up defect filed",
-      }],
-    });
-
-    expect(screen.getByText("verified")).toHaveAttribute(
-      "data-tip",
-      "verified\nIssue: VERIFIED — probe stayed green for a week\nPR: VERIFIED — no follow-up defect filed",
-    );
-  });
-
-  it("still names the verdict when the ledger recorded no reason", () => {
-    board("done", { done: [done] });
-
-    expect(screen.getByText("verified")).toHaveAttribute(
-      "data-tip",
-      "verified\nIssue: VERIFIED\nPR: VERIFIED",
-    );
-    expect(screen.getByText("verified").querySelector(".status-mark"))
-      .toHaveAttribute("data-status-glyph", "✓");
-  });
-
-  it("collapses to a glyph on request and keeps the verdict readable and remembered", async () => {
-    const { unmount } = board("done", { done: [done] });
-
-    await userEvent.click(screen.getByRole("button", { name: /Badges/ }));
-
-    const glyph = screen.getByRole("img", { name: "verified" });
-    expect(glyph).toHaveTextContent("✓");
-    expect(screen.queryByText("verified")).not.toBeInTheDocument();
-    expect(glyph.closest(".chip")).toHaveAttribute("data-tip", expect.stringContaining("VERIFIED"));
-
-    unmount();
-    board("done", { done: [done] });
-    expect(screen.getByRole("img", { name: "verified" })).toBeVisible();
-  });
-});
-
 describe("done timing columns", () => {
   beforeEach(() => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
@@ -338,7 +295,7 @@ describe("blocked section", () => {
 });
 
 describe("backlog triage taxonomy", () => {
-  it("makes steward-processed and raw intake visibly distinct", () => {
+  it("keeps steward state explicit without row-level highlighting", () => {
     const { container } = board("backlog", {
       backlog: [
         backlog,
@@ -348,8 +305,8 @@ describe("backlog triage taxonomy", () => {
 
     expect(screen.getByText("AC + test plan written")).toBeVisible();
     expect(screen.getByText("awaiting steward")).toBeVisible();
-    expect(container.querySelector(".backlog-processed")).toBeInTheDocument();
-    expect(container.querySelector(".backlog-raw")).toBeInTheDocument();
+    expect(container.querySelector(".backlog-processed")).not.toBeInTheDocument();
+    expect(container.querySelector(".backlog-raw")).not.toBeInTheDocument();
   });
 
   it("colours each axis value and its matching label with one mapping", () => {

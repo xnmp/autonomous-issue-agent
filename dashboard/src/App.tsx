@@ -84,6 +84,8 @@ function storedOptions(): DashboardOptions {
     showProjectedCost: true,
     showPerRepoQuotas: true,
     showDurationSeconds: true,
+    showOverviewDaemonHealth: false,
+    showOverviewIssueHealthTrend: false,
     theme: "cosmic-dusk",
   };
   try {
@@ -356,6 +358,8 @@ export default function App() {
             reposLoading={repos.loading}
             showProjectedCost={options.showProjectedCost}
             showDurationSeconds={options.showDurationSeconds}
+            showOverviewDaemonHealth={options.showOverviewDaemonHealth}
+            showOverviewIssueHealthTrend={options.showOverviewIssueHealthTrend}
           />
         </div>
       </main>
@@ -381,6 +385,8 @@ function Body({
   reposLoading,
   showProjectedCost,
   showDurationSeconds,
+  showOverviewDaemonHealth,
+  showOverviewIssueHealthTrend,
 }: {
   route: Route;
   selectedRepo: string | null;
@@ -393,6 +399,8 @@ function Body({
   reposLoading: boolean;
   showProjectedCost: boolean;
   showDurationSeconds: boolean;
+  showOverviewDaemonHealth: boolean;
+  showOverviewIssueHealthTrend: boolean;
 }) {
   if (route.view === "verification") return <VerificationTab />;
   if (route.view === "issue") {
@@ -422,6 +430,8 @@ function Body({
       <OverviewTab
         repo={selectedRepo}
         onOpenIssues={onSetSub}
+        showDaemonHealth={showOverviewDaemonHealth}
+        showIssueHealthTrend={showOverviewIssueHealthTrend}
       />
     );
   }

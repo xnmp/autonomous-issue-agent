@@ -278,6 +278,12 @@ class PendingCard(Contract):
     held: bool
     hold_reason: str | None
     overlap: Any | None
+    # A parked issue remains human-owned work on an open PR. Moving it to the
+    # pending lane must not discard the link or current-head CI rollup.
+    pr: int | None = None
+    pr_url: str | None = None
+    pr_state: str | None = None
+    pr_ci_state: Literal["passing", "failing", "pending"] | None = None
 
 
 class BacklogCard(Contract):

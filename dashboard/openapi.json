@@ -2189,6 +2189,55 @@
             ],
             "title": "Overlap"
           },
+          "pr": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr"
+          },
+          "pr_ci_state": {
+            "anyOf": [
+              {
+                "enum": [
+                  "passing",
+                  "failing",
+                  "pending"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr Ci State"
+          },
+          "pr_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr State"
+          },
+          "pr_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr Url"
+          },
           "priority": {
             "anyOf": [
               {

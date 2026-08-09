@@ -841,6 +841,14 @@ export interface components {
             labels: string[];
             /** Overlap */
             overlap: unknown | null;
+            /** Pr */
+            pr?: number | null;
+            /** Pr Ci State */
+            pr_ci_state?: ("passing" | "failing" | "pending") | null;
+            /** Pr State */
+            pr_state?: string | null;
+            /** Pr Url */
+            pr_url?: string | null;
             /** Priority */
             priority: ("P1" | "P2" | "P3") | null;
             /** Title */

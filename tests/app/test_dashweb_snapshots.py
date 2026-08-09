@@ -966,6 +966,29 @@ def test_a_parked_issue_renders_as_a_held_pending_row_with_the_parked_reason():
     assert (card["held"], card["hold_reason"]) == (True, "parked")
 
 
+def test_a_parked_pending_card_keeps_its_pr_link_and_ci_state():
+    row = replace(row_for([RESOLVE], 7), prs=(179,))
+    card = snapshots.pending_card(
+        {"number": 7, "labels": ["ai-parked", "ai-triage"]},
+        row,
+        gh_prs={
+            179: {
+                "url": "https://github.com/o/r/pull/179",
+                "state": "OPEN",
+                "statusCheckRollup": [
+                    {"conclusion": "SUCCESS"},
+                    {"conclusion": "NEUTRAL"},
+                ],
+            }
+        },
+    )
+
+    assert card["pr"] == 179
+    assert card["pr_url"] == "https://github.com/o/r/pull/179"
+    assert card["pr_state"] == "open"
+    assert card["pr_ci_state"] == "passing"
+
+
 def test_a_parked_issue_leaves_the_in_flight_lane_for_pending():
     # Park moves an issue off the active board even mid-history: an operator
     # decision outranks whatever legs or holds the journal accumulated.

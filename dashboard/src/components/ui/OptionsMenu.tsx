@@ -18,6 +18,8 @@ export interface DashboardOptions {
   showProjectedCost: boolean;
   showPerRepoQuotas: boolean;
   showDurationSeconds: boolean;
+  showOverviewDaemonHealth: boolean;
+  showOverviewIssueHealthTrend: boolean;
   theme: DashboardTheme;
 }
 
@@ -71,6 +73,31 @@ export function OptionsMenu({
               ))}
             </select>
           </label>
+          <fieldset className="options-section">
+            <legend>Overview</legend>
+            <label className="column-menu-item">
+              <input
+                type="checkbox"
+                checked={options.showOverviewDaemonHealth}
+                onChange={(event) => onChange({
+                  ...options,
+                  showOverviewDaemonHealth: event.target.checked,
+                })}
+              />
+              <span>Daemon health</span>
+            </label>
+            <label className="column-menu-item">
+              <input
+                type="checkbox"
+                checked={options.showOverviewIssueHealthTrend}
+                onChange={(event) => onChange({
+                  ...options,
+                  showOverviewIssueHealthTrend: event.target.checked,
+                })}
+              />
+              <span>Issue health trend</span>
+            </label>
+          </fieldset>
           <label className="column-menu-item">
             <input
               type="checkbox"

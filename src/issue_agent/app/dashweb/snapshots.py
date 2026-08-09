@@ -1824,9 +1824,16 @@ def hold_state(
     return (parked or bool(defer), "parked" if parked else waiting_label(defer))
 
 
-def pending_card(issue: dict, row: dash.IssueRow | None) -> dict:
+def pending_card(
+    issue: dict,
+    row: dash.IssueRow | None,
+    *,
+    gh_prs: Mapping[int, dict] | None = None,
+) -> dict:
     labels = labels_of(issue)
     held, hold_reason = hold_state(row, labels)
+    pr = row.prs[-1] if row and row.prs else None
+    gh_pr = (gh_prs or {}).get(pr) if pr is not None else None
     return {
         "issue": int(issue.get("number") or 0),
         "title": issue.get("title"),
@@ -1837,6 +1844,10 @@ def pending_card(issue: dict, row: dash.IssueRow | None) -> dict:
         "held": held,
         "hold_reason": hold_reason,
         "overlap": None,
+        "pr": pr,
+        "pr_url": (gh_pr or {}).get("url"),
+        "pr_state": _pr_state(gh_pr),
+        "pr_ci_state": _pr_ci_state(gh_pr),
     }
 
 
