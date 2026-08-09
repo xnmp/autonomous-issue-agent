@@ -266,7 +266,16 @@ don't keep going back to edit it — each re-plan costs a full model round-trip.
   seam costs you a review round, not a rule violation. Blocking is for things
   no PR reviewer can resolve: product ambiguity (two contradictory readings of
   the issue), missing environment/credentials, or a harness rule that denies
-  every legal move. Asking "may I add X to the code" burns a paid round-trip
+  every legal move. "Missing environment" means an environment NOBODY in this
+  pipeline has: before blocking for a platform you can't run locally, check
+  whether CI already runs it — a branch with diagnostic instrumentation
+  (fail-fast timeouts, verbose logs, `always()` artifact upload) makes the CI
+  runner your environment, and reading its artifacts back is a normal,
+  bounded iteration (two inconclusive diagnostic runs → implement the best
+  defensive fix with what was captured, and say so in the PR). Blocking for a
+  Windows/macOS box while a Windows/macOS CI job runs on every push burns a
+  human round-trip for evidence you could have collected yourself (tauri
+  #457, 2026-08-09). Asking "may I add X to the code" burns a paid round-trip
   to a human who will read your PR anyway (tauri #604, 2026-08-09: three
   permission round-trips for a cfg(test) constructor the reviewer was always
   going to see).
