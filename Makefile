@@ -82,6 +82,11 @@ test-app:
 dashboard-ui:
 	@PYTHONPATH=src uv run --offline --no-sync python scripts/build_dashboard.py
 
+# Run the operator dashboard with its extras guaranteed present, whatever a
+# prior exact sync pruned. This is the supported way to (re)start it.
+dashboard:
+	@uv run --quiet --extra sdk --extra dash issue-agent dashboard
+
 # Gate parity (review M6). The harness has TWO gate implementations — the bash
 # checkers (live for codex) and domain/gate.py + adapters/governor.py (live for
 # the SDK/Claude path, the reviewer and the steward) — that shared a spec, not

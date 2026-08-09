@@ -56,8 +56,14 @@ grn "  ✓ uv / git / gh present"
 # `uv sync --extra sdk` creates/updates .venv from pyproject and installs the
 # project itself (editable), which materialises .venv/bin/issue-agent from the
 # [project.scripts] entry. This is the SAME .venv point-at.sh's `uv run` uses.
-inf "uv sync --extra sdk  (in $HARNESS_ROOT)"
-( cd "$HARNESS_ROOT" && uv sync --extra sdk ) || { red "uv sync failed"; exit 1; }
+# `--extra dash` rides along on purpose: the dashboard's FastAPI stack is an
+# optional extra, so any exact sync that omits it (this one, or a later
+# `uv run --extra sdk` from the test targets) prunes it and the next
+# `issue-agent dashboard` restart silently degrades to the static v1 snapshot
+# (observed twice, 2026-08-09). Installing both removes the remember-the-extra
+# knob; a repo that never runs the dashboard just carries a few idle packages.
+inf "uv sync --extra sdk --extra dash  (in $HARNESS_ROOT)"
+( cd "$HARNESS_ROOT" && uv sync --extra sdk --extra dash ) || { red "uv sync failed"; exit 1; }
 
 SCRIPTS="$(console_scripts "$HARNESS_ROOT/pyproject.toml")"
 [ -n "$SCRIPTS" ] || {
