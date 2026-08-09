@@ -366,6 +366,8 @@ describe("IssueTab", () => {
 
     expect(screen.getByRole("separator", { name: "Resize Model column" }))
       .toHaveAttribute("aria-valuemin", "100");
+    expect(screen.getByRole("separator", { name: "Resize Operation column" }))
+      .toHaveAttribute("aria-valuemin", "142");
     expect(screen.getByRole("separator", { name: "Resize Status column" }))
       .toHaveAttribute("aria-valuemin", "96");
     expect(screen.getByRole("separator", { name: "Resize Duration column" }))

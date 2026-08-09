@@ -1597,7 +1597,16 @@ function VerificationStatus({
     >
       {iconOnly ? (
         <span role="img" aria-label={status}>{verificationGlyph(status)}</span>
-      ) : status}
+      ) : (
+        <>
+          <span
+            className="status-mark"
+            data-status-glyph={verificationGlyph(status)}
+            aria-hidden="true"
+          />
+          {status}
+        </>
+      )}
     </Chip>
   );
 }

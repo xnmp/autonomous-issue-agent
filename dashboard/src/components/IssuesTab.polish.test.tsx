@@ -120,6 +120,8 @@ describe("done verification badge", () => {
       "data-tip",
       "verified\nIssue: VERIFIED\nPR: VERIFIED",
     );
+    expect(screen.getByText("verified").querySelector(".status-mark"))
+      .toHaveAttribute("data-status-glyph", "✓");
   });
 
   it("collapses to a glyph on request and keeps the verdict readable and remembered", async () => {

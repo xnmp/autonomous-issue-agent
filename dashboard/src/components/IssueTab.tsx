@@ -82,7 +82,7 @@ export function IssueTab({
     [columnVisibility],
   );
   const columns: TableColumn[] = [
-    { key: "operation", label: "Operation", width: 130 },
+    { key: "operation", label: "Operation", width: 158, minWidth: 142 },
     ...(visible.has("role") ? [{ key: "role", label: "Role", width: 90 }] : []),
     ...(visible.has("model") ? [{ key: "model", label: "Model", width: 160, minWidth: 100 }] : []),
     ...(visible.has("status") ? [{ key: "status", label: "Status", width: 190, minWidth: 96 }] : []),

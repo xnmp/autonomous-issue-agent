@@ -231,7 +231,7 @@ export function prReviewMark(state: string | null | undefined): ReviewMark | nul
 
 const VERIFICATION_GLYPH: Record<string, string> = {
   verified: "✓",
-  misbehaved: "✕",
+  misbehaved: "×",
   pending: "…",
   retired: "⊘",
 };
