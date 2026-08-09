@@ -4,6 +4,7 @@ import { usePolled } from "../api/hooks";
 import { liveClocks, offsetSince, useNow } from "../lib/clock";
 import type { IssueStep } from "../api/types";
 import {
+  commitSubjectTone,
   kindLabel,
   modelTone,
   prStateTone,
@@ -525,12 +526,23 @@ function StepDetail({
           className="step-summary"
         >
           <StepSummaryHeader step={step} />
+          <StepContextLine step={step} />
           {step.note ? <p className="task-note step-summary-note">{step.note}</p> : null}
           {step.exit_reason && step.exit_reason.toLowerCase() !== "ok" ? (
             <p className="step-summary-exit">
               ended: <span className="mono">{step.exit_reason}</span>
             </p>
           ) : null}
+          {step.review?.verdict_excerpt ? (
+            <blockquote className="step-review-quote">
+              <div className="step-review-quote-label">
+                <span>Reviewer output</span>
+                <Chip tone="running">untrusted</Chip>
+              </div>
+              <p>{step.review.verdict_excerpt}</p>
+            </blockquote>
+          ) : null}
+          {step.change ? <StepChangeSummary change={step.change} /> : null}
           {events.error ? (
             <ErrorBanner message={events.error} onRetry={events.refresh} />
           ) : null}
@@ -539,7 +551,12 @@ function StepDetail({
           ) : (
             (() => {
               const lines = narrateWindow(events.data?.events ?? []);
-              if (lines.length === 0 && !step.note) {
+              if (
+                lines.length === 0
+                && !step.note
+                && !step.review?.verdict_excerpt
+                && !step.change
+              ) {
                 return (
                   <EmptyState>
                     this task changed nothing visible — see Events for the bookkeeping
@@ -623,10 +640,23 @@ function StepDetail({
 }
 
 function StepSummaryHeader({ step }: { step: IssueStep }) {
+  const escalation = step.escalation;
+  const escalationPath = escalation?.from_effort && escalation.to_effort
+    ? `${escalation.from_effort}→${escalation.to_effort}`
+    : escalation?.to_effort
+      ? `→${escalation.to_effort}`
+      : "tier";
+  const escalationValue = escalation
+    ? `+${escalation.notches} ${escalationPath}${
+      escalation.after_review_round ? ` after r${escalation.after_review_round}` : ""
+    }`
+    : null;
   const facts = [
     { label: "model", value: step.model, mono: true },
     { label: "effort", value: step.effort, mono: false },
-    { label: "session", value: step.session_id, mono: true },
+    { label: "runtime", value: step.runtime, mono: false },
+    { label: "escalation", value: escalationValue, mono: false },
+    { label: "session id", value: step.session_id, mono: true },
     step.exit_reason && step.exit_reason.toLowerCase() !== "ok"
       ? { label: "exit", value: step.exit_reason, mono: true }
       : null,
@@ -644,6 +674,88 @@ function StepSummaryHeader({ step }: { step: IssueStep }) {
       ))}
     </dl>
   ) : null;
+}
+
+function capFraction(value: number, cap: number | null | undefined): string {
+  if (cap === 0) return `${value} / off`;
+  return cap === null || cap === undefined ? String(value) : `${value}/${cap}`;
+}
+
+function StepContextLine({ step }: { step: IssueStep }) {
+  const segments: string[] = [];
+  if (step.review?.rejection !== null && step.review?.rejection !== undefined) {
+    segments.push(`rejection ${capFraction(step.review.rejection, step.review.rejection_cap)}`);
+  }
+  if (step.review) {
+    segments.push(
+      `unproductive rounds ${capFraction(
+        step.review.unproductive_rounds,
+        step.review.unproductive_cap,
+      )}`,
+    );
+  }
+  if (step.cost_usd !== null && step.cost_usd !== undefined) {
+    segments.push(
+      step.budget_cap_usd === 0
+        ? `leg ${usd(step.cost_usd)} · cap off`
+        : step.budget_cap_usd !== null && step.budget_cap_usd !== undefined
+          ? `leg ${usd(step.cost_usd)} / ${usd(step.budget_cap_usd)} cap`
+          : `leg ${usd(step.cost_usd)}`,
+    );
+  }
+  if (step.pricing_basis) {
+    segments.push(
+      `${step.pricing_basis.replaceAll("_", " ")}${step.estimated ? " · estimated" : ""}`,
+    );
+  } else if (step.estimated) {
+    segments.push("estimated pricing");
+  }
+  return segments.length > 0 ? (
+    <p className="step-context-line mono">
+      {segments.map((segment, index) => (
+        <span key={segment}>
+          {index > 0 ? (
+            <span className="step-context-separator" aria-hidden="true">·</span>
+          ) : null}
+          {segment}
+        </span>
+      ))}
+    </p>
+  ) : null;
+}
+
+function StepChangeSummary({
+  change,
+}: {
+  change: NonNullable<IssueStep["change"]>;
+}) {
+  const subjects = change.commit_subjects ?? [];
+  const changeFacts = [
+    change.branch ? `pushed ${change.branch}` : `PR #${change.pr}`,
+    change.files_changed_count !== null && change.files_changed_count !== undefined
+      ? `${num(change.files_changed_count)} file${change.files_changed_count === 1 ? "" : "s"} changed`
+      : null,
+  ].filter((value): value is string => value !== null);
+  return (
+    <section className="step-change-summary" aria-label="Pushed change summary">
+      <p className="step-change-facts mono">{changeFacts.join(" · ")}</p>
+      {subjects.length > 0 ? (
+        <ol className="step-commit-progression">
+          {subjects.map((subject, index) => {
+            const match = /^(red|green):\s*/i.exec(subject);
+            return (
+              <li key={`${subject}-${index}`}>
+                <Chip tone={commitSubjectTone(subject)} square>
+                  {match?.[1]?.toLowerCase() ?? "commit"}
+                </Chip>
+                <span>{match ? subject.slice(match[0].length) : subject}</span>
+              </li>
+            );
+          })}
+        </ol>
+      ) : null}
+    </section>
+  );
 }
 
 function moveTabFocus(

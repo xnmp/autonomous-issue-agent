@@ -72,11 +72,30 @@ describe("IssueTab", () => {
                 state: "ok",
                 model: "claude-sonnet-5",
                 effort: "high",
+                runtime: "codex",
                 status: "done",
                 exit_reason: "ok",
                 duration_s: 60,
                 cost_usd: 2,
                 estimated: false,
+                pricing_basis: "configured_rate_card",
+                budget_cap_usd: 10,
+                escalation: {
+                  notches: 1,
+                  from_effort: "medium",
+                  to_effort: "high",
+                  after_review_round: 2,
+                },
+                change: {
+                  pr: 75,
+                  branch: "feat/50-detail",
+                  head_sha: "abc1234",
+                  commit_subjects: [
+                    "red: reproduce empty summary",
+                    "green: expose execution facts",
+                  ],
+                  files_changed_count: 4,
+                },
                 session_id: "session-50",
                 has_transcript: false,
                 turns: 3,
@@ -115,8 +134,16 @@ describe("IssueTab", () => {
     });
     expect(within(executionDetails).getByText("claude-sonnet-5")).toBeVisible();
     expect(within(executionDetails).getByText("high")).toBeVisible();
+    expect(within(executionDetails).getByText("codex")).toBeVisible();
+    expect(within(executionDetails).getByText("+1 medium→high after r2")).toBeVisible();
     expect(within(executionDetails).getByText("session-50")).toBeVisible();
     expect(within(executionDetails).queryByText("ok")).not.toBeInTheDocument();
+    expect(within(stepDetail as HTMLElement).getByText("leg $2.00 / $10.00 cap")).toBeVisible();
+    expect(within(stepDetail as HTMLElement).getByText("configured rate card")).toBeVisible();
+    expect(within(stepDetail as HTMLElement).getByText("pushed feat/50-detail · 4 files changed"))
+      .toBeVisible();
+    expect(within(stepDetail as HTMLElement).getByText("reproduce empty summary")).toBeVisible();
+    expect(within(stepDetail as HTMLElement).getByText("expose execution facts")).toBeVisible();
 
     detailEventsTab?.focus();
     await userEvent.keyboard("{ArrowRight}");
@@ -124,6 +151,75 @@ describe("IssueTab", () => {
     expect(within(stepDetail as HTMLElement).getByRole("tabpanel")).toHaveAccessibleName(
       "Cost chart",
     );
+  });
+
+  it("renders requested changes as bounded untrusted text with round context", async () => {
+    const verdict = "<script>operator input is not executable</script>";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation((input: RequestInfo | URL) => {
+        const body = String(input).includes("/steps/0/events")
+          ? { events: [], warnings: [] }
+          : {
+              issue: 50,
+              title: "Review substance",
+              url: null,
+              stage: "changes requested",
+              done: false,
+              prs: [75],
+              pull_requests: [],
+              cost_usd: 0.4,
+              elapsed_s: 60,
+              working_s: 45,
+              idle_s: 15,
+              idle_active: false,
+              steps: [{
+                idx: 0,
+                kind: "RE_REVIEW",
+                role: "review",
+                state: "ok",
+                model: "gpt-5.6-terra",
+                status: "REQUEST_CHANGES",
+                exit_reason: "ok",
+                duration_s: 60,
+                cost_usd: 0.4,
+                estimated: true,
+                pricing_basis: "learned_estimate",
+                budget_cap_usd: 8,
+                session_id: "review-50",
+                has_transcript: false,
+                turns: 3,
+                usage: null,
+                ts: "2026-07-29T08:00:00Z",
+                note: "REQUEST_CHANGES round 2",
+                review: {
+                  verdict_excerpt: verdict,
+                  rejection: 2,
+                  rejection_cap: 4,
+                  unproductive_rounds: 0,
+                  unproductive_cap: 5,
+                },
+              }],
+              events: [],
+              warnings: [],
+            };
+        return Promise.resolve(new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }));
+      }),
+    );
+
+    render(<IssueTab repo="demo" issue={50} />);
+    await userEvent.click(await screen.findByRole("button", { name: "Re-review" }));
+
+    expect(screen.getByText("untrusted")).toBeVisible();
+    expect(screen.getByText(verdict)).toBeVisible();
+    expect(document.querySelector("script")).not.toBeInTheDocument();
+    expect(screen.getByText("rejection 2/4")).toBeVisible();
+    expect(screen.getByText("unproductive rounds 0/5")).toBeVisible();
+    expect(screen.getByText("leg $0.40 / $8.00 cap")).toBeVisible();
+    expect(screen.getByText("learned estimate · estimated")).toBeVisible();
   });
 
   it("expands from a click anywhere on the row and leads with a human summary", async () => {

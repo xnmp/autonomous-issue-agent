@@ -121,6 +121,14 @@ export function statusTone(status: string | null | undefined): Tone {
   return "info";
 }
 
+/** Test-driven commit subjects use the harness's red/green vocabulary. */
+export function commitSubjectTone(subject: string): Tone {
+  const prefix = subject.trim().split(":", 1)[0]?.toLowerCase();
+  if (prefix === "red") return "fail";
+  if (prefix === "green") return "ok";
+  return "neutral";
+}
+
 /** Every flag is a problem; severity splits red from orange-ish yellow. */
 export function flagTone(flag: IssueFlag): Tone {
   if (flag === "waiting") return "info";

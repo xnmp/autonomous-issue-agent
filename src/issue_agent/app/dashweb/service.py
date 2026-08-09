@@ -26,7 +26,7 @@ from ...domain.events import (
     Producer,
     TelemetryEvent,
 )
-from .. import cli
+from .. import cli, config
 from ..review_identity import review_identity
 from . import snapshots
 from .guidance import GuidanceError, parse_guidance
@@ -46,6 +46,43 @@ def _positive_int(raw: str, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return max(value, 0)
+
+
+_DETAIL_CONFIG_FIELDS = (
+    "MAX_BUDGET_USD",
+    "ROUTER_BUDGET_USD",
+    "REVIEW_BUDGET_USD",
+    "STEWARD_TRIAGE_BUDGET_USD",
+    "JIRA_SYNC_BUDGET_USD",
+    "REVIEW_MAX_REJECTIONS",
+    "MAX_UNPRODUCTIVE_REVIEW_ROUNDS",
+)
+_FIX_BUDGET_KINDS = (
+    "RESOLVE", "RESUME", "PR_RESUME", "ADDRESS_REVIEW", "FIX_CI", "REBASE",
+)
+
+
+def _detail_limits(name: str, repo: str) -> tuple[dict[str, float], int, int]:
+    configured = {
+        field: value
+        for field in _DETAIL_CONFIG_FIELDS
+        if (value := cli.deployment_env_field(name, field))
+    }
+    cfg = config.from_env({"REPO": repo, **configured})
+    caps = {
+        **{kind: max(0.0, cfg.fix_budget_usd) for kind in _FIX_BUDGET_KINDS},
+        "ROUTE": max(0.0, cfg.router_budget_usd),
+        "REVIEW": max(0.0, cfg.review_budget_usd),
+        "RE_REVIEW": max(0.0, cfg.review_budget_usd),
+        "TRIAGE": max(0.0, cfg.triage_budget_usd),
+        "GROOM": max(0.0, cfg.triage_budget_usd),
+        "JIRA_SYNC": max(0.0, cfg.jira_budget_usd),
+    }
+    return (
+        caps,
+        max(0, cfg.max_review_rejections),
+        max(0, cfg.max_unproductive_review_rounds),
+    )
 
 
 def _detail(exc: BaseException) -> str:
@@ -347,6 +384,14 @@ class Backend:
         if row is None:
             return None
         gh_issues, gh_prs, warnings = self._gh_context(snap.repo)
+        detail_reader = getattr(self.gh, "pr", None)
+        if callable(detail_reader):
+            for pr in row.prs:
+                payload, error = detail_reader(snap.repo, pr)
+                if isinstance(payload, dict):
+                    gh_prs[pr] = {**gh_prs.get(pr, {}), **payload}
+                if error:
+                    warnings.append(f"PR #{pr} change details: {error}")
         if snap.deployment.schema_version == 2:
             gh_issues = {
                 key: _github_issue_enrichment(value)
@@ -356,8 +401,17 @@ class Backend:
                 key: _github_enrichment(value)
                 for key, value in gh_prs.items()
             }
+        budget_caps, rejection_cap, unproductive_cap = _detail_limits(
+            name, snap.repo
+        )
         detail = snapshots.issue_detail(
-            row, self.now_fn(), gh_issues.get(number), gh_prs
+            row,
+            self.now_fn(),
+            gh_issues.get(number),
+            gh_prs,
+            budget_caps=budget_caps,
+            review_rejection_cap=rejection_cap,
+            unproductive_round_cap=unproductive_cap,
         )
         detail["warnings"] = warnings
         return detail
@@ -1424,6 +1478,10 @@ _PR_ENRICHMENT_FIELDS = (
     # journalled) left the fold believing a human owned the row forever,
     # freezing both clocks while paid legs ran (keifu #142/#181, 2026-08-03).
     "labels",
+    # Fetched only by GhReader.pr for an open issue detail. Keeping them in the
+    # v2 enrichment is necessary because `_github_enrichment` deliberately
+    # strips list-query fields that cannot affect the projected lifecycle.
+    "headRefName", "headRefOid", "commits", "files",
 )
 # `body` and `createdAt` are presentational fields the projection does not
 # carry: the backlog drill-down renders the issue text, and its age column

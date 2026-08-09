@@ -63,6 +63,18 @@ def test_the_repo_is_always_passed_to_gh_explicitly():
     assert calls[0][-2:] == ["-R", "o/r"]
 
 
+def test_pr_detail_fetches_change_history_without_expanding_the_list_query():
+    gh, calls = reader([(json.dumps({"number": 12, "commits": []}), "")])
+
+    payload, error = gh.pr("o/r", 12)
+
+    assert error == "" and payload == {"number": 12, "commits": []}
+    argv = calls[0]
+    assert argv[:3] == ["pr", "view", "12"]
+    fields = argv[argv.index("--json") + 1]
+    assert "commits" in fields and "headRefName" in fields and "files" in fields
+
+
 def test_a_gh_failure_degrades_to_an_error_string():
     gh, _calls = reader([("", "gh: not authenticated")])
     payload, error = gh.prs("o/r")

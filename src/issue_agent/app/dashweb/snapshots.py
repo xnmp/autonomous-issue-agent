@@ -11,6 +11,7 @@ passes them here for projection into API payloads.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone, tzinfo
 import hashlib
 import json
@@ -46,6 +47,9 @@ _PRE_ADMISSION_KINDS = dash.STEWARD_KINDS | {"GROOM"}
 # Compact-row text budget: one line, bounded, for prose the harness did not
 # author (agent summaries, escalation comments, operator input).
 _REASON_CHARS = 240
+# Review bodies can contain entire reports. A leg summary needs enough to make
+# the verdict useful without turning the operator table into a document view.
+_VERDICT_EXCERPT_CHARS = 500
 # An escalation and the comment that explains it are journalled by the same
 # executor pass, so only a handful of events can separate them. A wider window
 # would pair an escalation with an unrelated comment from a later leg.
@@ -60,6 +64,8 @@ OPERATOR_ACTION_STEPS = {
     # see that the PR is still wedged (keifu #173).
     "operator_dismiss_review": "review re-arm",
 }
+
+_CHANGE_SUMMARY_KINDS = frozenset({"RESOLVE", "RESUME", "PR_RESUME", "ADDRESS_REVIEW"})
 
 
 def _utcnow() -> datetime:
@@ -331,11 +337,342 @@ def _leg_note(row: dash.IssueRow, leg: dash.RunSummary) -> str | None:
     return None
 
 
-def detailed_steps(row: dash.IssueRow) -> list[dict]:
+def _event_kind(event: Mapping) -> str:
+    return str(event.get("type") or event.get("event") or "")
+
+
+def _normalise_leg(raw: object) -> str:
+    return str(raw or "").strip().replace("_", "-").lower()
+
+
+def _start_for_leg(row: dash.IssueRow, leg: dash.RunSummary) -> dict | None:
+    settled = _settled_event(row, leg)
+    run_id = str(settled.get("run_id") or "")
+    dispatch = str(settled.get("dispatch") or "")
+    candidates = [
+        event
+        for event in row.events
+        if event.get("event") == "agent_run_start"
+        and (
+            (run_id and str(event.get("run_id") or "") == run_id)
+            or (dispatch and str(event.get("dispatch") or "") == dispatch)
+        )
+    ]
+    if candidates:
+        return candidates[-1]
+    return next(
+        (
+            event
+            for event in reversed(row.events)
+            if event.get("event") == "agent_run_start"
+            and event.get("kind") == leg.kind
+            and event.get("number") == leg.number
+            and (
+                leg.ts is None
+                or (stamp := dash.parse_ts(event.get("ts"))) is None
+                or stamp <= leg.ts
+            )
+        ),
+        None,
+    )
+
+
+def _context_int(raw: object) -> int | None:
+    if isinstance(raw, bool) or not isinstance(raw, (str, int, float)):
+        return None
+    try:
+        value = int(raw)
+    except (OverflowError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def _escalation_for_leg(row: dash.IssueRow, leg: dash.RunSummary) -> dict | None:
+    start = _start_for_leg(row, leg)
+    start_at = dash.parse_ts(start.get("ts")) if start is not None else None
+    if start is None or start_at is None:
+        return None
+    starts = [
+        event
+        for event in row.events
+        if event.get("event") == "agent_run_start"
+        and _normalise_leg(event.get("kind")) == _normalise_leg(leg.kind)
+        and dash.parse_ts(event.get("ts")) is not None
+    ]
+    candidates = []
+    for event in row.events:
+        if _event_kind(event) != "routing.escalated.v1":
+            continue
+        if _normalise_leg(event.get("leg")) != _normalise_leg(leg.kind):
+            continue
+        escalated_at = dash.parse_ts(event.get("ts"))
+        if escalated_at is None or escalated_at > start_at:
+            continue
+        next_start = min(
+            (
+                candidate
+                for candidate in starts
+                if dash.parse_ts(candidate.get("ts")) >= escalated_at
+            ),
+            key=lambda candidate: dash.parse_ts(candidate.get("ts")),
+            default=None,
+        )
+        if next_start is start:
+            candidates.append((escalated_at, event))
+    if not candidates:
+        return None
+    event = max(candidates, key=lambda item: item[0])[1]
+    evidence = event.get("evidence")
+    evidence = evidence if isinstance(evidence, Mapping) else {}
+    notches = _context_int(evidence.get("notches")) or 1
+    return {
+        "notches": notches,
+        "from_effort": event.get("from_effort") or None,
+        "to_effort": event.get("to_effort") or None,
+        "after_review_round": _context_int(evidence.get("review_rounds")),
+    }
+
+
+def _pr_fact_observations(
+    row: dash.IssueRow,
+    pr: int,
+) -> list[tuple[datetime | None, Mapping]]:
+    observations = []
+    for event in row.events:
+        if _event_kind(event) != "world.observed.v1":
+            continue
+        if event.get("subject_kind") != "pr" or event.get("subject_number") != pr:
+            continue
+        facts = event.get("facts")
+        if isinstance(facts, Mapping):
+            observations.append((dash.parse_ts(event.get("ts")), facts))
+    return observations
+
+
+def _bounded_excerpt(text: str) -> str:
+    cleaned = text.strip()
+    if len(cleaned) <= _VERDICT_EXCERPT_CHARS:
+        return cleaned
+    return cleaned[: _VERDICT_EXCERPT_CHARS - 1].rstrip() + "…"
+
+
+def _review_excerpt(row: dash.IssueRow, leg: dash.RunSummary) -> str | None:
+    verdict = dash.review_verdict(leg)
+    if verdict is None or verdict.decision is not ReviewDecision.REQUEST_CHANGES:
+        return None
+    if leg.number is None:
+        return None
+    candidates: list[tuple[datetime | None, int, str]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    order = 0
+    for observed_at, facts in _pr_fact_observations(row, leg.number):
+        reviews = facts.get("reviews")
+        if not isinstance(reviews, list):
+            continue
+        for review in reviews:
+            if not isinstance(review, Mapping):
+                continue
+            state = str(review.get("state") or "").upper()
+            body = review.get("body")
+            if state not in {"CHANGES_REQUESTED", "REQUEST_CHANGES"}:
+                continue
+            if not isinstance(body, str) or not body.strip():
+                continue
+            submitted_raw = str(review.get("submitted_at") or "")
+            key = (
+                state,
+                submitted_raw,
+                str(review.get("commit_id") or ""),
+                body,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(
+                (dash.parse_ts(submitted_raw) or observed_at, order, body)
+            )
+            order += 1
+    if not candidates:
+        return None
+    selected = min(
+        candidates,
+        key=lambda item: (
+            abs((item[0] - leg.ts).total_seconds())
+            if item[0] is not None and leg.ts is not None
+            else math.inf,
+            item[1],
+        ),
+    )
+    return _bounded_excerpt(selected[2])
+
+
+def _review_contexts(
+    row: dash.IssueRow,
+    rejection_cap: int | None,
+    unproductive_cap: int | None,
+) -> list[dict | None]:
+    contexts: list[dict | None] = [None] * len(row.legs)
+    rejections: dict[int | None, int] = {}
+    unproductive: dict[int | None, int] = {}
+    for index, leg in enumerate(row.legs):
+        if leg.kind not in dash.REVIEW_KINDS:
+            continue
+        verdict = dash.review_verdict(leg)
+        if verdict is None:
+            unproductive[leg.number] = unproductive.get(leg.number, 0) + 1
+        else:
+            unproductive[leg.number] = 0
+            if verdict.decision is ReviewDecision.APPROVE:
+                rejections[leg.number] = 0
+            elif verdict.decision is ReviewDecision.REQUEST_CHANGES:
+                rejections[leg.number] = rejections.get(leg.number, 0) + 1
+        contexts[index] = {
+            "verdict_excerpt": _review_excerpt(row, leg),
+            "rejection": (
+                rejections.get(leg.number, 0)
+                if verdict is not None
+                and verdict.decision is ReviewDecision.REQUEST_CHANGES
+                else None
+            ),
+            "rejection_cap": rejection_cap,
+            "unproductive_rounds": unproductive.get(leg.number, 0),
+            "unproductive_cap": unproductive_cap,
+        }
+    return contexts
+
+
+def _same_sha(left: object, right: object) -> bool:
+    a, b = str(left or "").strip(), str(right or "").strip()
+    is_prefix = min(len(a), len(b)) >= 7 and (
+        a.startswith(b) or b.startswith(a)
+    )
+    return bool(a and b and (a == b or is_prefix))
+
+
+def _commit_rows(pr: Mapping) -> list[tuple[str, str]]:
+    commits = pr.get("commits")
+    if not isinstance(commits, list):
+        return []
+    rows = []
+    for commit in commits:
+        if not isinstance(commit, Mapping):
+            continue
+        oid = str(commit.get("oid") or "").strip()
+        subject = str(
+            commit.get("messageHeadline") or commit.get("message") or ""
+        ).strip()
+        if oid and subject:
+            rows.append((oid, subject[:200]))
+    return rows
+
+
+def _change_pr(row: dash.IssueRow, leg: dash.RunSummary) -> int | None:
+    if isinstance(leg.number, int) and leg.number in row.prs:
+        return leg.number
+    candidates = []
+    for pr in row.prs:
+        for stamp, _facts in _pr_fact_observations(row, pr):
+            if stamp is not None and (leg.ts is None or stamp >= leg.ts):
+                candidates.append((stamp, pr))
+                break
+    if candidates:
+        return min(candidates)[1]
+    return row.prs[-1] if row.prs else None
+
+
+def _facts_after_leg(row: dash.IssueRow, pr: int, leg: dash.RunSummary) -> Mapping:
+    observations = _pr_fact_observations(row, pr)
+    if not observations:
+        return {}
+    after = [
+        (stamp, facts)
+        for stamp, facts in observations
+        if stamp is not None and (leg.ts is None or stamp >= leg.ts)
+    ]
+    if after:
+        return min(after, key=lambda item: item[0])[1]
+    return observations[-1][1]
+
+
+def _files_changed(facts: Mapping, gh_pr: Mapping) -> int | None:
+    value = _context_int(facts.get("changed_files_total"))
+    if value is not None:
+        return value
+    files = gh_pr.get("files")
+    return len(files) if isinstance(files, list) else None
+
+
+def _change_contexts(
+    row: dash.IssueRow,
+    gh_prs: Mapping[int, Mapping] | None,
+) -> list[dict | None]:
+    contexts: list[dict | None] = [None] * len(row.legs)
+    previous_heads: dict[int, str] = {}
+    for index, leg in enumerate(row.legs):
+        if leg.kind.upper() not in _CHANGE_SUMMARY_KINDS:
+            continue
+        pr = _change_pr(row, leg)
+        if pr is None:
+            continue
+        facts = _facts_after_leg(row, pr, leg)
+        gh_pr = (gh_prs or {}).get(pr, {})
+        head = str(facts.get("head_sha") or gh_pr.get("headRefOid") or "").strip()
+        branch = str(facts.get("head_ref") or gh_pr.get("headRefName") or "").strip()
+        commits = _commit_rows(gh_pr)
+        current_index = next(
+            (
+                offset
+                for offset, (oid, _subject) in enumerate(commits)
+                if _same_sha(oid, head)
+            ),
+            None,
+        )
+        previous = previous_heads.get(pr, "")
+        previous_index = next(
+            (
+                offset
+                for offset, (oid, _subject) in enumerate(commits)
+                if _same_sha(oid, previous)
+            ),
+            None,
+        )
+        if current_index is None:
+            subjects: list[str] = []
+        else:
+            begin = previous_index + 1 if previous_index is not None else 0
+            subjects = [
+                subject for _oid, subject in commits[begin : current_index + 1]
+            ][-12:]
+        if head:
+            previous_heads[pr] = head
+        contexts[index] = {
+            "pr": pr,
+            "branch": branch or None,
+            "head_sha": head or None,
+            "commit_subjects": subjects,
+            "files_changed_count": _files_changed(facts, gh_pr),
+        }
+    return contexts
+
+
+def detailed_steps(
+    row: dash.IssueRow,
+    *,
+    budget_caps: Mapping[str, float] | None = None,
+    review_rejection_cap: int | None = None,
+    unproductive_round_cap: int | None = None,
+    gh_prs: Mapping[int, Mapping] | None = None,
+) -> list[dict]:
     """One row per leg plus operator interventions, in timestamp order.
     Not collapsed: the drill-down's whole job is showing the retries."""
-    steps = [
-        {
+    review_contexts = _review_contexts(
+        row, review_rejection_cap, unproductive_round_cap
+    )
+    change_contexts = _change_contexts(row, gh_prs)
+    steps = []
+    for idx, leg in enumerate(row.legs):
+        settled = _settled_event(row, leg)
+        steps.append({
             "idx": idx,
             "kind": leg.kind,
             "role": leg.role,
@@ -348,14 +685,18 @@ def detailed_steps(row: dash.IssueRow) -> list[dict]:
             "estimated": leg.estimated,
             "model": _model_for_leg(row, leg),
             "effort": _effort_for_leg(row, leg),
+            "runtime": settled.get("runtime") or None,
             "session_id": leg.session_id or None,
             "turns": _turns(row, leg),
             "usage": _usage(row, leg),
             "has_transcript": bool(leg.session_id),
             "note": _leg_note(row, leg),
-        }
-        for idx, leg in enumerate(row.legs)
-    ]
+            "pricing_basis": settled.get("pricing_basis") or None,
+            "budget_cap_usd": (budget_caps or {}).get(leg.kind.upper()),
+            "escalation": _escalation_for_leg(row, leg),
+            "review": review_contexts[idx],
+            "change": change_contexts[idx],
+        })
     steps.extend(
         {
             "idx": len(steps) + i,
@@ -379,11 +720,17 @@ def detailed_steps(row: dash.IssueRow) -> list[dict]:
                 ),
                 None,
             ),
+            "runtime": None,
             "session_id": None,
             "turns": None,
             "usage": None,
             "has_transcript": False,
             "note": None,
+            "pricing_basis": None,
+            "budget_cap_usd": (budget_caps or {}).get(r.kind.upper()),
+            "escalation": None,
+            "review": None,
+            "change": None,
         }
         for i, r in enumerate(row.running)
     )
@@ -401,11 +748,17 @@ def detailed_steps(row: dash.IssueRow) -> list[dict]:
             "estimated": False,
             "model": None,
             "effort": None,
+            "runtime": None,
             "session_id": None,
             "turns": None,
             "usage": None,
             "has_transcript": False,
             "note": note,
+            "pricing_basis": None,
+            "budget_cap_usd": None,
+            "escalation": None,
+            "review": None,
+            "change": None,
         }
         for i, (event, kind, note, state) in enumerate(_operator_steps(row))
     )
@@ -2099,6 +2452,10 @@ def issue_detail(
     now: datetime,
     gh_issue: dict | None = None,
     gh_prs: dict[int, dict] | None = None,
+    *,
+    budget_caps: Mapping[str, float] | None = None,
+    review_rejection_cap: int | None = None,
+    unproductive_round_cap: int | None = None,
 ) -> dict:
     started = _started(row)
     pr = row.prs[-1] if row.prs else None
@@ -2133,7 +2490,13 @@ def issue_detail(
         # this directly: human_action alone must not dead-stop both clocks
         # while a leg is visibly spending (keifu #142/#181, 2026-08-03).
         "leg_running": bool(row.running) and not row.done,
-        "steps": detailed_steps(row),
+        "steps": detailed_steps(
+            row,
+            budget_caps=budget_caps,
+            review_rejection_cap=review_rejection_cap,
+            unproductive_round_cap=unproductive_round_cap,
+            gh_prs=gh_prs,
+        ),
         "events": list(row.events),
         "warnings": [],
     }

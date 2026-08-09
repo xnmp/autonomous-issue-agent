@@ -613,12 +613,16 @@ export interface components {
         };
         /** IssueStep */
         IssueStep: {
+            /** Budget Cap Usd */
+            budget_cap_usd?: number | null;
+            change?: components["schemas"]["IssueStepChange"] | null;
             /** Cost Usd */
             cost_usd: number | null;
             /** Duration S */
             duration_s: number | null;
             /** Effort */
             effort?: string | null;
+            escalation?: components["schemas"]["IssueStepEscalation"] | null;
             /** Estimated */
             estimated: boolean;
             /** Exit Reason */
@@ -633,8 +637,13 @@ export interface components {
             model: string | null;
             /** Note */
             note?: string | null;
+            /** Pricing Basis */
+            pricing_basis?: string | null;
+            review?: components["schemas"]["IssueStepReview"] | null;
             /** Role */
             role: string | null;
+            /** Runtime */
+            runtime?: string | null;
             /** Session Id */
             session_id: string | null;
             /** State */
@@ -646,6 +655,49 @@ export interface components {
             /** Turns */
             turns: number | null;
             usage: components["schemas"]["TokenUsage"] | null;
+        } & {
+            [key: string]: unknown;
+        };
+        /** IssueStepChange */
+        IssueStepChange: {
+            /** Branch */
+            branch?: string | null;
+            /** Commit Subjects */
+            commit_subjects?: string[];
+            /** Files Changed Count */
+            files_changed_count?: number | null;
+            /** Head Sha */
+            head_sha?: string | null;
+            /** Pr */
+            pr: number;
+        } & {
+            [key: string]: unknown;
+        };
+        /** IssueStepEscalation */
+        IssueStepEscalation: {
+            /** After Review Round */
+            after_review_round?: number | null;
+            /** From Effort */
+            from_effort?: string | null;
+            /** Notches */
+            notches: number;
+            /** To Effort */
+            to_effort?: string | null;
+        } & {
+            [key: string]: unknown;
+        };
+        /** IssueStepReview */
+        IssueStepReview: {
+            /** Rejection */
+            rejection?: number | null;
+            /** Rejection Cap */
+            rejection_cap?: number | null;
+            /** Unproductive Cap */
+            unproductive_cap?: number | null;
+            /** Unproductive Rounds */
+            unproductive_rounds: number;
+            /** Verdict Excerpt */
+            verdict_excerpt?: string | null;
         } & {
             [key: string]: unknown;
         };

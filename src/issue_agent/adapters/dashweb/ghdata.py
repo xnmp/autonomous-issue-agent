@@ -37,6 +37,9 @@ PR_FIELDS = (
     "statusCheckRollup,autoMergeRequest,latestReviews,labels,comments,"
     "isDraft,mergeable,mergeStateStatus"
 )
+PR_DETAIL_FIELDS = (
+    "number,url,state,headRefName,headRefOid,commits,files"
+)
 
 
 @dataclass
@@ -125,6 +128,13 @@ class GhReader:
             repo,
             ["pr", "list", "--state", "all", "--limit", str(limit),
              "--json", PR_FIELDS],
+        )
+
+    def pr(self, repo: str, number: int) -> tuple[object | None, str]:
+        """One PR's change history, fetched only for the issue detail view."""
+        return self.json(
+            repo,
+            ["pr", "view", str(number), "--json", PR_DETAIL_FIELDS],
         )
 
 

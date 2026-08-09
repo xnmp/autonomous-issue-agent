@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   combinedVerificationStatus,
+  commitSubjectTone,
   difficultyTone,
   impactTone,
   issueTypeTone,
@@ -26,6 +27,14 @@ describe("dashboard semantics", () => {
 
   it("treats done as terminal success", () => {
     expect(stageTone("done")).toBe("ok");
+  });
+
+  it.each([
+    ["red: reproduce the race", "fail"],
+    ["green: serialize watcher writes", "ok"],
+    ["docs: explain the invariant", "neutral"],
+  ])("maps commit subject %s into the shared status vocabulary", (subject, tone) => {
+    expect(commitSubjectTone(subject)).toBe(tone);
   });
 
   it.each([

@@ -1361,6 +1361,27 @@
       "IssueStep": {
         "additionalProperties": true,
         "properties": {
+          "budget_cap_usd": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Budget Cap Usd"
+          },
+          "change": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IssueStepChange"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "cost_usd": {
             "anyOf": [
               {
@@ -1393,6 +1414,16 @@
               }
             ],
             "title": "Effort"
+          },
+          "escalation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IssueStepEscalation"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "estimated": {
             "title": "Estimated",
@@ -1443,6 +1474,27 @@
             ],
             "title": "Note"
           },
+          "pricing_basis": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pricing Basis"
+          },
+          "review": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IssueStepReview"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "role": {
             "anyOf": [
               {
@@ -1453,6 +1505,17 @@
               }
             ],
             "title": "Role"
+          },
+          "runtime": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Runtime"
           },
           "session_id": {
             "anyOf": [
@@ -1531,6 +1594,165 @@
           "has_transcript"
         ],
         "title": "IssueStep",
+        "type": "object"
+      },
+      "IssueStepChange": {
+        "additionalProperties": true,
+        "properties": {
+          "branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Branch"
+          },
+          "commit_subjects": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Commit Subjects",
+            "type": "array"
+          },
+          "files_changed_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Files Changed Count"
+          },
+          "head_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Head Sha"
+          },
+          "pr": {
+            "title": "Pr",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pr"
+        ],
+        "title": "IssueStepChange",
+        "type": "object"
+      },
+      "IssueStepEscalation": {
+        "additionalProperties": true,
+        "properties": {
+          "after_review_round": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "After Review Round"
+          },
+          "from_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "From Effort"
+          },
+          "notches": {
+            "title": "Notches",
+            "type": "integer"
+          },
+          "to_effort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "To Effort"
+          }
+        },
+        "required": [
+          "notches"
+        ],
+        "title": "IssueStepEscalation",
+        "type": "object"
+      },
+      "IssueStepReview": {
+        "additionalProperties": true,
+        "properties": {
+          "rejection": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rejection"
+          },
+          "rejection_cap": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rejection Cap"
+          },
+          "unproductive_cap": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unproductive Cap"
+          },
+          "unproductive_rounds": {
+            "title": "Unproductive Rounds",
+            "type": "integer"
+          },
+          "verdict_excerpt": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Verdict Excerpt"
+          }
+        },
+        "required": [
+          "unproductive_rounds"
+        ],
+        "title": "IssueStepReview",
         "type": "object"
       },
       "IssuesPayload": {

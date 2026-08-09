@@ -161,6 +161,32 @@ const PullRequestLink = z
     url: z.union([z.string(), z.null()]),
   })
   .passthrough();
+const IssueStepChange = z
+  .object({
+    branch: z.union([z.string(), z.null()]).optional(),
+    commit_subjects: z.array(z.string()).optional(),
+    files_changed_count: z.union([z.number(), z.null()]).optional(),
+    head_sha: z.union([z.string(), z.null()]).optional(),
+    pr: z.number().int(),
+  })
+  .passthrough();
+const IssueStepEscalation = z
+  .object({
+    after_review_round: z.union([z.number(), z.null()]).optional(),
+    from_effort: z.union([z.string(), z.null()]).optional(),
+    notches: z.number().int(),
+    to_effort: z.union([z.string(), z.null()]).optional(),
+  })
+  .passthrough();
+const IssueStepReview = z
+  .object({
+    rejection: z.union([z.number(), z.null()]).optional(),
+    rejection_cap: z.union([z.number(), z.null()]).optional(),
+    unproductive_cap: z.union([z.number(), z.null()]).optional(),
+    unproductive_rounds: z.number().int(),
+    verdict_excerpt: z.union([z.string(), z.null()]).optional(),
+  })
+  .passthrough();
 const TokenUsage = z
   .object({
     cache_creation_input_tokens: z.union([z.number(), z.null()]),
@@ -171,9 +197,12 @@ const TokenUsage = z
   .passthrough();
 const IssueStep = z
   .object({
+    budget_cap_usd: z.union([z.number(), z.null()]).optional(),
+    change: z.union([IssueStepChange, z.null()]).optional(),
     cost_usd: z.union([z.number(), z.null()]),
     duration_s: z.union([z.number(), z.null()]),
     effort: z.union([z.string(), z.null()]).optional(),
+    escalation: z.union([IssueStepEscalation, z.null()]).optional(),
     estimated: z.boolean(),
     exit_reason: z.union([z.string(), z.null()]),
     has_transcript: z.boolean(),
@@ -181,7 +210,10 @@ const IssueStep = z
     kind: z.string(),
     model: z.union([z.string(), z.null()]),
     note: z.union([z.string(), z.null()]).optional(),
+    pricing_basis: z.union([z.string(), z.null()]).optional(),
+    review: z.union([IssueStepReview, z.null()]).optional(),
     role: z.union([z.string(), z.null()]),
+    runtime: z.union([z.string(), z.null()]).optional(),
     session_id: z.union([z.string(), z.null()]),
     state: z.string(),
     status: z.union([z.string(), z.null()]),
@@ -396,6 +428,9 @@ export const schemas = {
   ValidationError,
   HTTPValidationError,
   PullRequestLink,
+  IssueStepChange,
+  IssueStepEscalation,
+  IssueStepReview,
   TokenUsage,
   IssueStep,
   IssueDetailPayload,

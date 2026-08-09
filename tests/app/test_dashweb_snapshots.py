@@ -2127,6 +2127,150 @@ def test_a_note_is_bounded_for_a_compact_row():
     assert len(snapshots.detailed_steps(row_for([blocked], 7))[0]["note"]) == 240
 
 
+def test_a_step_exposes_runtime_budget_and_its_evidence_escalation():
+    routing = {
+        "ts": ts(hours=3, minutes=1),
+        "type": "routing.escalated.v1",
+        "leg": "address-review",
+        "from_effort": "medium",
+        "to_effort": "high",
+        "evidence": {"notches": 1, "review_rounds": 2},
+    }
+    started = {
+        "ts": ts(hours=3), "event": "agent_run_start", "role": "fix",
+        "kind": "ADDRESS_REVIEW", "number": 12, "issue": 7,
+        "run_id": "run-2", "model": "gpt-5.6-terra", "effort": "high",
+    }
+    settled = {
+        "ts": ts(hours=2), "event": "agent_run", "role": "fix",
+        "kind": "ADDRESS_REVIEW", "number": 12, "issue": 7,
+        "run_id": "run-2", "model": "gpt-5.6-terra", "effort": "high",
+        "runtime": "codex", "pricing_basis": "configured_rate_card",
+        "cost_usd": 0.8, "status": "done", "exit_reason": "ok",
+    }
+    base = row_for([started, settled], 7)
+    row = replace(base, prs=(12,), events=(routing, started, settled))
+
+    step = snapshots.detailed_steps(
+        row, budget_caps={"ADDRESS_REVIEW": 10.0}
+    )[0]
+
+    assert step["runtime"] == "codex"
+    assert step["pricing_basis"] == "configured_rate_card"
+    assert step["budget_cap_usd"] == 10.0
+    assert step["escalation"] == {
+        "notches": 1,
+        "from_effort": "medium",
+        "to_effort": "high",
+        "after_review_round": 2,
+    }
+
+
+def test_review_context_pairs_requested_changes_and_tracks_both_breakers():
+    first = {
+        "ts": ts(hours=4), "event": "agent_run", "role": "review",
+        "kind": "REVIEW", "number": 12, "issue": 7,
+        "status": "REQUEST_CHANGES", "exit_reason": "ok",
+    }
+    failed = {
+        "ts": ts(hours=3), "event": "agent_run", "role": "review",
+        "kind": "RE_REVIEW", "number": 12, "issue": 7,
+        "status": "", "exit_reason": "agent_error", "is_error": True,
+    }
+    second = {
+        "ts": ts(hours=2), "event": "agent_run", "role": "review",
+        "kind": "RE_REVIEW", "number": 12, "issue": 7,
+        "status": "REQUEST_CHANGES", "exit_reason": "ok",
+    }
+    first_body = "first requested change"
+    second_body = "second requested change " + "x" * 700
+    first_review = {
+        "state": "CHANGES_REQUESTED", "body": first_body,
+        "commit_id": "a", "submitted_at": ts(hours=3, minutes=59),
+    }
+    second_review = {
+        "state": "CHANGES_REQUESTED", "body": second_body,
+        "commit_id": "b", "submitted_at": ts(hours=1, minutes=59),
+    }
+    observed_first = {
+        "ts": ts(hours=3, minutes=58), "type": "world.observed.v1",
+        "subject_kind": "pr", "subject_number": 12,
+        "facts": {"reviews": [first_review]},
+    }
+    observed_second = {
+        "ts": ts(hours=1, minutes=58), "type": "world.observed.v1",
+        "subject_kind": "pr", "subject_number": 12,
+        "facts": {"reviews": [first_review, second_review]},
+    }
+    base = row_for([first, failed, second], 7)
+    row = replace(
+        base,
+        prs=(12,),
+        events=(first, observed_first, failed, second, observed_second),
+    )
+
+    steps = snapshots.detailed_steps(
+        row, review_rejection_cap=4, unproductive_round_cap=5
+    )
+
+    assert steps[0]["review"]["verdict_excerpt"] == first_body
+    assert steps[0]["review"]["rejection"] == 1
+    assert steps[1]["review"]["unproductive_rounds"] == 1
+    assert steps[2]["review"]["rejection"] == 2
+    assert steps[2]["review"]["unproductive_rounds"] == 0
+    assert steps[2]["review"]["rejection_cap"] == 4
+    assert steps[2]["review"]["unproductive_cap"] == 5
+    assert len(steps[2]["review"]["verdict_excerpt"]) == 500
+    assert steps[2]["review"]["verdict_excerpt"].endswith("…")
+
+
+def test_change_context_splits_commit_progression_across_fix_legs():
+    resolve = {
+        **RESOLVE, "ts": ts(hours=4), "status": "pr_opened",
+    }
+    address = {
+        "ts": ts(hours=2), "event": "agent_run", "role": "fix",
+        "kind": "ADDRESS_REVIEW", "number": 12, "issue": 7,
+        "status": "done", "exit_reason": "ok",
+    }
+    opened = {
+        "ts": ts(hours=3), "type": "world.observed.v1",
+        "subject_kind": "pr", "subject_number": 12,
+        "facts": {
+            "head_ref": "feat/7-fix", "head_sha": "a" * 40,
+            "changed_files_total": 3,
+        },
+    }
+    repaired = {
+        "ts": ts(hours=1), "type": "world.observed.v1",
+        "subject_kind": "pr", "subject_number": 12,
+        "facts": {
+            "head_ref": "feat/7-fix", "head_sha": "b" * 40,
+            "changed_files_total": 5,
+        },
+    }
+    base = row_for([resolve, address], 7)
+    row = replace(base, prs=(12,), events=(resolve, opened, address, repaired))
+    gh_prs = {12: {"commits": [
+        {"oid": "a" * 40, "messageHeadline": "red: reproduce reload race"},
+        {"oid": "b" * 40, "messageHeadline": "green: serialize watcher writes"},
+    ]}}
+
+    steps = snapshots.detailed_steps(row, gh_prs=gh_prs)
+
+    assert steps[0]["change"] == {
+        "pr": 12,
+        "branch": "feat/7-fix",
+        "head_sha": "a" * 40,
+        "commit_subjects": ["red: reproduce reload race"],
+        "files_changed_count": 3,
+    }
+    assert steps[1]["change"]["commit_subjects"] == [
+        "green: serialize watcher writes"
+    ]
+    assert steps[1]["change"]["files_changed_count"] == 5
+
+
 # ── PR merge readiness ────────────────────────────────────────────────────────
 def review_card(**pr_fields):
     events = [RESOLVE, {"ts": ts(hours=1), "event": "agent_run", "role": "review",
@@ -2377,6 +2521,30 @@ def test_v2_cards_report_no_merge_readiness_when_github_withholds_it(monkeypatch
     card = card_for(v2_backend(monkeypatch).issues("demo"))
 
     assert card["pr_state"] == "open" and card["pr_review_state"] is None
+
+
+def test_issue_detail_uses_the_deployments_leg_and_review_caps(monkeypatch):
+    backend = v2_backend(monkeypatch)
+    configured = {
+        "MAX_BUDGET_USD": "6.5",
+        "REVIEW_BUDGET_USD": "2.5",
+        "REVIEW_MAX_REJECTIONS": "3",
+        "MAX_UNPRODUCTIVE_REVIEW_ROUNDS": "2",
+    }
+    monkeypatch.setattr(
+        service.cli,
+        "deployment_env_field",
+        lambda _name, field: configured.get(field, ""),
+    )
+
+    detail = backend.issue("demo", 7)
+
+    assert detail is not None
+    resolve, review = detail["steps"]
+    assert resolve["budget_cap_usd"] == 6.5
+    assert review["budget_cap_usd"] == 2.5
+    assert review["review"]["rejection_cap"] == 3
+    assert review["review"]["unproductive_cap"] == 2
 
 
 def test_cards_carry_the_verification_reason_for_issue_and_pr(monkeypatch):
