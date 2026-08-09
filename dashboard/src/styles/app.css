@@ -637,6 +637,64 @@
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: var(--s2);
 }
+.attention-panel,
+.operator-actions-panel {
+  border-color: var(--border-strong);
+}
+.attention-panel-active {
+  border-color: color-mix(in srgb, var(--fail) 52%, var(--border));
+  background: color-mix(in srgb, var(--fail) 4%, var(--panel));
+}
+.attention-panel-active .panel-title {
+  color: var(--fail-br);
+}
+.attention-panel-clear .panel-bd {
+  padding-block: var(--s2);
+}
+.attention-panel-clear .empty {
+  padding-block: var(--s2);
+  text-align: left;
+}
+.attention-row {
+  min-height: 30px;
+  padding-block: var(--s1);
+}
+.attention-row + .attention-row {
+  border-top: 1px solid var(--border);
+}
+.operator-actions-panel {
+  background: var(--elevated);
+}
+.operator-actions-active {
+  border-color: color-mix(in srgb, var(--running) 42%, var(--border));
+}
+.operator-actions-panel .panel-hd {
+  min-height: 42px;
+}
+.operator-actions-table {
+  max-height: 320px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.panel-table-tools {
+  padding: var(--s2) var(--s3) 0;
+}
+.panel-table-tools .table-filter {
+  margin-bottom: var(--s2);
+}
+.overview-metrics {
+  grid-template-columns: repeat(auto-fit, minmax(138px, 1fr));
+}
+.overview-metrics .tile {
+  border-color: color-mix(in srgb, var(--border) 72%, transparent);
+  background: color-mix(in srgb, var(--panel) 76%, transparent);
+}
+.overview-metrics .tile-value {
+  font-size: 22px;
+}
+.overview-support .panel {
+  border-color: color-mix(in srgb, var(--border) 78%, transparent);
+}
 .tile {
   padding: var(--s3);
   border: 1px solid var(--border);
