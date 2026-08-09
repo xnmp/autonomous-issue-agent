@@ -3,7 +3,7 @@
 SHELL := bash
 HARNESS_ROOT := $(shell pwd)
 
-.PHONY: help test test-config-generated test-governor test-residuals test-hooks test-deployment-env test-point-at test-domain test-adapters test-app test-parity arch typecheck doctor dashboard-ui \
+.PHONY: help test test-config-generated test-governor test-residuals test-hooks test-deployment-env test-point-at test-domain test-adapters test-app test-parity arch typecheck doctor dashboard-ui dashboard \
 	        install point-at run-fix run-review run-steward demo-gate \
         install-launchd install-systemd \
         uninstall-launchd uninstall-systemd demo-init lint clean
