@@ -868,7 +868,20 @@ class FixWorkflow:
             )
         )
         result = await self._run_logged("resume", issue, task, kind="RESUME")
-        self.store.save_session(issue, result.session_id)
+        # A resumed session that re-blocks is a poor target for the NEXT
+        # resume: its history is dominated by its own block turns, and each
+        # further resume amplifies the pattern (tauri #604, 2026-08-09 — the
+        # fourth consecutive resume blocked in 7s asking for "additional
+        # execution time" on a leg with its full wall budget unspent).
+        # Dropping the handle makes the next reply rebuild from the thread
+        # and the persistent worktree (fresh-recovery, the #71 path) instead
+        # of re-entering the blocked groove. A blocked FRESH leg stores its
+        # new session as before — first blocks keep their context; only a
+        # block that survived a resume forfeits it.
+        if result.status == "blocked":
+            self.store.save_session(issue, "")
+        else:
+            self.store.save_session(issue, result.session_id)
         pr = self.gateway.pr_for_issue(issue)
         if outcome.infra_class_failure(result):
             # review C3/D2c, RETURNED-result half. Reads `infra_class_failure`

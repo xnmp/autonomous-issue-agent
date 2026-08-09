@@ -311,6 +311,46 @@ def test_resume_writes_resumed_at_mark():
     assert "the answer" in runner.tasks[0].prompt
 
 
+def test_blocked_resume_forfeits_its_session_so_the_next_reply_goes_fresh():
+    # tauri #604 (2026-08-09): four consecutive resumes of one session each
+    # re-blocked faster and cheaper than the last (the fourth in 7s, asking
+    # for "additional execution time" with its wall budget unspent) — a
+    # session whose history is its own block turns amplifies the pattern on
+    # every resume. A resume that settles blocked must drop the stored
+    # session so the NEXT reply rebuilds from the thread and worktree
+    # (fresh-recovery) instead of re-entering the groove.
+    iss = IssueView(5, title="t", body="b", comments=(
+        Comment("fix-bot", "**Agent needs input:** x\n\n_Reply to unblock._", "t1"),
+        Comment("alice", "answered", "t2"),
+    ))
+    gw = FakeGateway(issues={5: iss}, pr_for_issue={})
+    store = FakeStore()
+    store.save_session(5, "poisoned")
+    runner = FakeRunner(AgentResult(is_error=False, status="blocked", session_id="poisoned"))
+
+    asyncio.run(_workflow(gw, store, runner, fix_bot="fix-bot").resume(5))
+
+    assert runner.tasks[0].resume == "poisoned"
+    assert store.get_session(5) == ""
+
+
+def test_productive_resume_keeps_its_session():
+    # Anti-vacuity twin: forfeiture is for blocked resumes only — a resume
+    # that pushes keeps its context for the next round.
+    iss = IssueView(5, title="t", body="b", comments=(
+        Comment("fix-bot", "**Agent needs input:** x\n\n_Reply to unblock._", "t1"),
+        Comment("alice", "answered", "t2"),
+    ))
+    gw = FakeGateway(issues={5: iss}, pr_for_issue={})
+    store = FakeStore()
+    store.save_session(5, "healthy")
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="healthy"))
+
+    asyncio.run(_workflow(gw, store, runner, fix_bot="fix-bot").resume(5))
+
+    assert store.get_session(5) == "healthy"
+
+
 def test_pr_resume_uses_pr_reply_and_linked_issue_session_once():
     prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
     iss = IssueView(5, title="t", body="b")
