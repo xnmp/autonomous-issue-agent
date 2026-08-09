@@ -410,6 +410,16 @@ def test_required_test_cap_is_one():
     assert MAX_TEST_IMMUTABILITY_EXCEPTIONS == EXEMPTABLE_RULES[RULE_TESTS_IMMUTABLE]
 
 
+def test_per_rule_caps_sum_within_the_total_declaration_cap():
+    # A change legitimately at EVERY rule's bound must survive the review
+    # side's declarations[:MAX_DECLARATIONS_PER_CHANGE] slice intact: a
+    # declaration truncated there vanishes from the grant schema, cannot be
+    # granted, and wedges the merge durably (adversarial review of the
+    # tests-immutable cap raise, MAJOR 1 — 8 modified tests + required-test
+    # made required-test ungrantable).
+    assert sum(EXEMPTABLE_RULES.values()) <= MAX_DECLARATIONS_PER_CHANGE
+
+
 # ── merge withholding predicate ──────────────────────────────────────────────
 def _permits(facts, **kw):
     kw.setdefault("issue_number", 89)

@@ -72,11 +72,19 @@ MAX_DECLARATIONS_PER_CHANGE = 8
 # unsplittable change with no rewrite in it, and the wall turned it into an
 # operator decision. Authorization was never the count: every modified test
 # file needs its own authenticated, patch-bound REVIEW_BOT grant before
-# auto-merge. So the scope bound now defers to the declaration-inflation cap,
-# keeping the reviewer's per-file hazard list bounded while the count stops
-# encoding policy.
+# auto-merge. The count only bounds the reviewer's per-file hazard list.
+#
+# INVARIANT: the per-rule caps must SUM to at most
+# MAX_DECLARATIONS_PER_CHANGE. A change legitimately at every rule's bound
+# must survive the total cap intact — the review side offers
+# declarations[:MAX_DECLARATIONS_PER_CHANGE] to the model's grant schema, so
+# a sum above the total silently truncates whichever rule sorts last, making
+# it ungrantable and wedging the merge for that head (adversarial review of
+# this bound's raise, MAJOR 1: 8 modified tests + required-test * = 9 → the
+# required-test declaration vanished from the schema). Pinned by a domain
+# test.
 EXEMPTABLE_RULES: dict[str, int] = {
-    RULE_TESTS_IMMUTABLE: MAX_DECLARATIONS_PER_CHANGE,
+    RULE_TESTS_IMMUTABLE: MAX_DECLARATIONS_PER_CHANGE - 1,
     RULE_REQUIRED_TEST: 1,
 }
 
@@ -170,7 +178,13 @@ def parse_exemption_declarations(
             seen.setdefault(ExemptionDeclaration(m.group(1), m.group(2)))
             if len(seen) >= MAX_DECLARATIONS_PER_CHANGE:
                 # Anything past the cap is dropped — fail closed: the
-                # undeclared violation is still denied by its gate.
+                # undeclared violation is still denied by its gate. The shell
+                # twin (prc_declared_exemption_subjects) applies the SAME
+                # first-N-in-order cap: without it, 8 inert filler trailers
+                # ahead of a real `required-test *` passed the shell §5 gate
+                # while this parser dropped the declaration, so the merge
+                # side saw nothing to withhold on (adversarial review,
+                # MEDIUM 2 — the trailer-order starvation bypass).
                 break
     return tuple(seen)
 

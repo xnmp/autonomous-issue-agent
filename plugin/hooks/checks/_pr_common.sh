@@ -300,17 +300,24 @@ prc_check_no_generated_instructions() {  # "<changed-file-list>"
 # violation through so the reviewer can judge it, and the merge side withholds
 # auto-merge until REVIEW_BOT grants each declaration against the current
 # patch id. Twin of domain/exemptions.py — keep the rule ids, the exemptable
-# set (tests-immutable, required-test) and the tests-immutable cap of 8 in
-# lockstep (raised from 3 after tauri #589, 2026-08-09: a shared interaction
-# change forced mechanical path updates in four e2e specs; per-file grants are
-# the authorization, the count only bounds the reviewer's hazard list). Unknown
-# rules are inert.
+# set (tests-immutable, required-test), the tests-immutable cap of 7 and the
+# total-declaration cap of 8 in lockstep (cap raised from 3 after tauri #589,
+# 2026-08-09: a shared interaction change forced mechanical path updates in
+# four e2e specs; per-file grants are the authorization, the count only bounds
+# the reviewer's hazard list). Unknown rules are inert.
 prc_declared_exemption_subjects() {  # $1 rule → prints declared subjects, deduped
   # Subject charset/bound mirrors domain/exemptions.py _SUBJECT_TOKEN: `*` or
   # a bounded path-ish token — never arbitrary non-space text (it reaches the
-  # reviewer prompt).
+  # reviewer prompt). The total cap mirrors parse_exemption_declarations'
+  # first-8-in-order semantics EXACTLY: without it, 8 filler trailers ahead
+  # of a real `required-test *` passed this gate while the Python parser
+  # dropped the declaration, so the merge side never saw it to withhold on
+  # (trailer-order starvation). Dedupe must happen BEFORE the cap, like the
+  # parser's setdefault, so repeats cannot consume slots.
   git log "$log_range" --format='%B' 2>/dev/null \
-    | sed -nE "s#^[ \t]*Gate-Exemption:[ \t]+$1[ \t]+(\*|[A-Za-z0-9._/+-]{1,200})[ \t]*\$#\1#p" \
+    | sed -nE "s#^[ \t]*Gate-Exemption:[ \t]+(tests-immutable|required-test)[ \t]+(\*|[A-Za-z0-9._/+-]{1,200})[ \t]*\$#\1 \2#p" \
+    | awk '!seen[$0]++' | head -8 \
+    | awk -v rule="$1" '$1 == rule { print $2 }' \
     | sort -u
 }
 
@@ -333,7 +340,7 @@ prc_malformed_exemption_hint() {  # prints a hint suffix, or nothing
 prc_check_tests_immutable() {  # prc_check_tests_immutable "<changed-file-list>"
   # AUTO-DECLARED (ADR 0014 revised 2026-08-03): every modified/deleted
   # existing test file is itself the exemption request — no trailer. The gate
-  # only bounds SCOPE (>8 overflows the reviewer's per-file hazard list); the
+  # only bounds SCOPE (>7 overflows the reviewer's per-file hazard list); the
   # merge side withholds until the reviewer explicitly grants each file. Twin
   # of gate.check_tests_immutable.
   # OLD-side paths (--diff-filter excludes additions; -M off so a renamed-away
@@ -360,8 +367,8 @@ prc_check_tests_immutable() {  # prc_check_tests_immutable "<changed-file-list>"
     printf '%s' "$f" | grep -qE '^[A-Za-z0-9._/+-]{1,200}$' \
       || fail "existing test file '$f' was modified, but its path cannot be carried in a reviewer grant (allowed: letters, digits, and . _ / + - up to 200 characters). Restore that file and put the change in a test file whose path is within the charset, or rename the file in a separate PR"
   done <<< "$(git diff --no-renames --diff-filter=MDRT --name-only "$mdrt_range" 2>/dev/null || printf '%s' "$1")"
-  [ "$n_modified" -le 8 ] \
-    || fail "more than 8 existing test files modified/deleted — changing existing tests is allowed (the reviewer must explicitly approve each one before merge), but this many reads as a rewrite, not a correction; reduce the change's scope (or split it) so at most 8 existing test files are touched, and prefer ADDING tests in new files wherever the old expectation is still right"
+  [ "$n_modified" -le 7 ] \
+    || fail "more than 7 existing test files modified/deleted — changing existing tests is allowed (the reviewer must explicitly approve each one before merge), but this many reads as a rewrite, not a correction; reduce the change's scope (or split it) so at most 7 existing test files are touched, and prefer ADDING tests in new files wherever the old expectation is still right"
 }
 
 # §10 — the NEW tests must ACTUALLY FAIL without the implementation (real red).

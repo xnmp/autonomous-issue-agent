@@ -31,7 +31,13 @@ with different authors and different powers:
   authorizes):
   - `tests-immutable` is **AUTO-DECLARED from the diff**: every modified or
     deleted existing test file IS the request. The gate only bounds scope
-    (>3 such files denies as a rewrite) and refuses paths that cannot be
+    (>7 such files denies as a rewrite; raised from 3 after tauri #589,
+    2026-08-09, where four mechanical spec-path updates from one shared
+    interaction change hit the wall — 7 keeps the per-rule caps summing
+    below the total declaration cap of 8, so a change at every bound still
+    fits the reviewer grant schema. Guardrail to watch: grants per merged
+    PR and reviewer refusal rate — a single sloppy APPROVE now mints up to
+    7 test-file grants in one round) and refuses paths that cannot be
     written as a grant subject; the fixer edits tests on its own judgment
     and the machinery frames the hazard for review.
 
@@ -133,7 +139,7 @@ DELEGATED modes are the supported configurations.
 **Which rules are exemptable is a domain decision, made once:**
 
 - Exemptable (quality rules, reviewer judgment is the right authority):
-  `tests-immutable` (max 3 declared files), `required-test` (whole-change
+  `tests-immutable` (max 7 declared files), `required-test` (whole-change
   subject `*` only).
 - Never exemptable (security / trust-boundary rules): `.harness/` repo
   content, non-image `evidence/`, broker provenance and force-push fences,

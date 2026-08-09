@@ -847,8 +847,13 @@ class ReviewWorkflow:
             return "", ()
         # The auto-declared set is not bounded by the trailer parser's cap,
         # and every subject lands in the reviewer's TRUSTED prompt tail plus
-        # the schema enum. Bound it here too (round-4 MINOR 7); a change over
-        # the cap is denied by the gate and withheld at merge anyway.
+        # the schema enum. Bound it here too (round-4 MINOR 7). This slice
+        # must stay UNREACHABLE for a change within every rule's scope bound:
+        # the per-rule caps sum to at most MAX_DECLARATIONS_PER_CHANGE (the
+        # exemptions.py invariant), because a declaration truncated here is
+        # ungrantable — it vanishes from the schema, the reviewer cannot
+        # grant it, and the merge withholds durably for this head. Over-bound
+        # changes are denied by the gate before reaching review.
         declared = dict(
             list(declared.items())[:MAX_DECLARATIONS_PER_CHANGE]
         )

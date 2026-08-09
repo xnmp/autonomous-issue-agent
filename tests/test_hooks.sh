@@ -480,10 +480,12 @@ out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD="$EXEMPT_TEST_CMD" bash "$CHECKS/chec
   || no "a stale tests-immutable trailer changes nothing" "rc=$rc out=${out:0:300}"
 rm -rf "$d" "$d.msg"
 
-# (d) scope bound: MORE than 8 modified existing test files is a rewrite, not a
+# (d) scope bound: MORE than 7 modified existing test files is a rewrite, not a
 #     correction — denied, with no trailer syntax in the message. (Bound raised
 #     from 3 after tauri #589: four mechanical spec-path updates are a
-#     correction; per-file reviewer grants carry the authorization.)
+#     correction; per-file reviewer grants carry the authorization. 7, not 8:
+#     the per-rule caps must sum below the total declaration cap of 8 or a
+#     change at every bound truncates required-test out of the grant schema.)
 setup_rewrite_repo() {  # modifies $1 existing test files on the branch
   local d n; d=$(fresh_repo); n=$1
   (
@@ -505,11 +507,11 @@ setup_rewrite_repo() {  # modifies $1 existing test files on the branch
   echo "$d"
 }
 
-d=$(setup_rewrite_repo 9)
+d=$(setup_rewrite_repo 8)
 out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD="$EXEMPT_TEST_CMD" bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
 { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'existing test files'; } \
-  && ok "9 modified existing test files blocked" \
-  || no "9 modified existing test files blocked" "rc=$rc out=${out:0:300}"
+  && ok "8 modified existing test files blocked (past the bound)" \
+  || no "8 modified existing test files blocked (past the bound)" "rc=$rc out=${out:0:300}"
 printf '%s' "$out" | grep -qF 'Gate-Exemption' \
   && no "the rewrite denial teaches no trailer" "out=${out:0:300}" \
   || ok "the rewrite denial teaches no trailer"
@@ -523,12 +525,12 @@ out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD="$EXEMPT_TEST_CMD" bash "$CHECKS/chec
   || no "4 modified existing test files allowed (the #589 shape)" "rc=$rc out=${out:0:300}"
 rm -rf "$d"
 
-# (e2) exactly 8 is still within scope (the bound is the boundary, not 'many
+# (e2) exactly 7 is still within scope (the bound is the boundary, not 'many
 #      edits are suspicious').
-d=$(setup_rewrite_repo 8)
+d=$(setup_rewrite_repo 7)
 out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD="$EXEMPT_TEST_CMD" bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-[ "$rc" -eq 0 ] && ok "8 modified existing test files allowed (at the bound)" \
-  || no "8 modified existing test files allowed (at the bound)" "rc=$rc out=${out:0:300}"
+[ "$rc" -eq 0 ] && ok "7 modified existing test files allowed (at the bound)" \
+  || no "7 modified existing test files allowed (at the bound)" "rc=$rc out=${out:0:300}"
 rm -rf "$d"
 
 # (f) a renamed-away existing test is COUNTED: moving a test out of the suite
@@ -687,6 +689,38 @@ d=$(setup_notest_repo "Gate-Exemption: required-test *")
 out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
 [ "$rc" -eq 0 ] && ok "declared required-test exemption passes §5" \
   || no "declared required-test exemption passes §5" "rc=$rc out=${out:0:200}"
+rm -rf "$d" "$d.msg"
+
+# (g2) trailer-order starvation parity: 8 filler tests-immutable trailers
+#      (inert — no diff behind them) consume every slot of the total
+#      declaration cap IN ORDER, so a required-test declared after them is
+#      dropped by BOTH stacks — the shell §5 must deny exactly as the Python
+#      parser starves it, or the merge side sees nothing to withhold on and
+#      the ungranted exemption slips through (adversarial review, MEDIUM 2).
+_filler=""
+for i in 1 2 3 4 5 6 7 8; do
+  _filler="${_filler}Gate-Exemption: tests-immutable tests/filler_$i.py
+"
+done
+d=$(setup_notest_repo "${_filler}Gate-Exemption: required-test *")
+out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'regression test'; } \
+  && ok "required-test starved past the declaration cap is denied (parity)" \
+  || no "required-test starved past the declaration cap is denied (parity)" "rc=$rc out=${out:0:300}"
+rm -rf "$d" "$d.msg"
+
+# (g3) anti-vacuity twin for (g2): 7 fillers + required-test = 8 total fits
+#      the cap, so the declaration survives and §5 passes.
+_filler=""
+for i in 1 2 3 4 5 6 7; do
+  _filler="${_filler}Gate-Exemption: tests-immutable tests/filler_$i.py
+"
+done
+d=$(setup_notest_repo "${_filler}Gate-Exemption: required-test *")
+out=$( cd "$d" && BASE_BRANCH=dev TEST_CMD='true' bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
+[ "$rc" -eq 0 ] \
+  && ok "required-test within the declaration cap still passes §5" \
+  || no "required-test within the declaration cap still passes §5" "rc=$rc out=${out:0:300}"
 rm -rf "$d" "$d.msg"
 
 # (h) twin: no trailer → still denied, and the deny teaches the trailer.
