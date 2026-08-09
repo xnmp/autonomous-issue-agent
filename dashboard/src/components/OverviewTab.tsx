@@ -7,6 +7,7 @@ import type {
   EscalationReason,
   HealthTrendDay,
   InterventionEvent,
+  IssueCard,
   OverviewPayload,
   RoleHealth,
 } from "../api/types";
@@ -15,6 +16,7 @@ import {
   HEALTH_TONE,
   mixSlices,
   roleHealth,
+  stageTone,
   utilTone,
 } from "../lib/semantics";
 import { ago, localHour, localTime, num, rate, usd, usdCompact } from "../lib/format";
@@ -23,6 +25,7 @@ import { Histogram, Meter, StackedBar, StatTile } from "./ui/Charts";
 import { EmptyState, ErrorBanner, Loading, SectionTitle, SkeletonRows, WarningList } from "./ui/Feedback";
 import { ResizableTable, useSortedRows } from "./ui/ResizableTable";
 import { TableFilter } from "./ui/TableFilter";
+import { LifecycleStepper } from "./ui/LifecycleStepper";
 
 const POLL_MS = 10_000;
 
@@ -34,9 +37,15 @@ const POLL_MS = 10_000;
 export function OverviewTab({
   repo,
   onOpenIssues,
+  activeIssues = [],
+  activeIssuesLoading = false,
+  onOpenIssue,
 }: {
   repo: string;
   onOpenIssues: (sub: "inflight" | "done") => void;
+  activeIssues?: IssueCard[];
+  activeIssuesLoading?: boolean;
+  onOpenIssue?: (issue: number) => void;
 }) {
   const ov = usePolled(
     `overview:${repo}`,
@@ -91,6 +100,13 @@ export function OverviewTab({
 
   return (
     <div className="tabbody">
+      <header className="page-heading">
+        <div>
+          <h1>Overview</h1>
+          <p>Live operating state for <span className="mono">{repo}</span></p>
+        </div>
+        <span className="page-heading-status"><span className="repo-live-dot" />Reconciles every 10s</span>
+      </header>
       {ov.error ? (
         <ErrorBanner message={ov.error} onRetry={ov.refresh} stale={!!ov.data} />
       ) : null}
@@ -99,10 +115,31 @@ export function OverviewTab({
 
       <NeedsAttention items={ov.data?.needs_attention ?? []} loading={ov.loading} />
 
+      <section className="overview-health panel">
+        <div className="panel-hd">
+          <span className="panel-title">Daemon health</span>
+          <span className="faint">live role journals</span>
+        </div>
+        <div className="panel-bd health-cards">
+          {(ov.data?.health ?? []).length === 0 && !ov.loading ? (
+            <EmptyState>no role journals found for this deployment</EmptyState>
+          ) : null}
+          {(ov.data?.health ?? []).map((h) => (
+            <HealthCard key={h.role} health={h} />
+          ))}
+        </div>
+      </section>
+
+      <LiveWorkPanel
+        cards={activeIssues}
+        loading={activeIssuesLoading}
+        onOpenIssue={onOpenIssue}
+      />
+
       <section className={`panel operator-actions-panel${(ov.data?.interventions ?? []).length > 0 ? " operator-actions-active" : ""}`}>
         <div className="panel-hd">
           <span className="panel-title">Operator actions</span>
-          <span className="faint">what a human had to do, newest first</span>
+          <span className="faint">newest first</span>
         </div>
         <div className="panel-bd flush">
           <InterventionList
@@ -112,7 +149,7 @@ export function OverviewTab({
         </div>
       </section>
 
-      <div className="tiles overview-metrics">
+      <div className="tiles overview-metrics overview-metrics-primary">
         <StatTile
           label="Done"
           value={num(m?.done_issues)}
@@ -120,6 +157,7 @@ export function OverviewTab({
           tone="ok"
           title="open done issues"
           onClick={() => onOpenIssues("done")}
+          primary
         />
         <StatTile
           label="In flight"
@@ -127,6 +165,7 @@ export function OverviewTab({
           tone={(m?.in_flight_issues ?? 0) > 0 ? "running" : "neutral"}
           title="open in-flight and pending issues"
           onClick={() => onOpenIssues("inflight")}
+          primary
         />
         <StatTile
           label="$ per done"
@@ -134,6 +173,7 @@ export function OverviewTab({
           sub={m?.total_cost_usd != null ? `${usd(m.total_cost_usd)} total` : null}
           tone="info"
           title="the primary efficiency number: total journalled spend / done issues"
+          primary
         />
         <StatTile
           label="$ today"
@@ -141,7 +181,10 @@ export function OverviewTab({
           sub={caps?.daily_cap_usd != null ? `cap ${usd(caps.daily_cap_usd)}` : "no daily cap"}
           tone={utilTone(dailyPct) === "ok" ? "neutral" : utilTone(dailyPct)}
           alert={dailyPct !== null && dailyPct >= 85}
+          primary
         />
+      </div>
+      <div className="tiles overview-metrics overview-metrics-secondary">
         <StatTile
           label="First-pass rate"
           value={rate(m?.first_pass_rate)}
@@ -234,16 +277,6 @@ export function OverviewTab({
       <SpendPerHour buckets={ov.data?.spend_per_hour ?? []} />
 
       <HealthTrend rows={ov.data?.health_trend ?? []} loading={ov.loading} />
-
-      <SectionTitle>Daemon health</SectionTitle>
-      <div className="health-cards">
-        {(ov.data?.health ?? []).length === 0 && !ov.loading ? (
-          <EmptyState>no role journals found for this deployment</EmptyState>
-        ) : null}
-        {(ov.data?.health ?? []).map((h) => (
-          <HealthCard key={h.role} health={h} />
-        ))}
-      </div>
 
       <UnattributedCount count={ov.data?.unattributed_count ?? 0} />
 
@@ -417,6 +450,78 @@ function HealthCard({ health }: { health: RoleHealth }) {
         </div>
       ) : null}
     </div>
+  );
+}
+
+function attentionFor(card: IssueCard): "blocked" | "escalated" | null {
+  if (card.human_action === "escalated") return "escalated";
+  if (
+    card.human_action === "awaiting-reply"
+    || card.stage === "blocked"
+    || card.flags.includes("blocked")
+  ) return "blocked";
+  return null;
+}
+
+function LiveWorkPanel({
+  cards,
+  loading,
+  onOpenIssue,
+}: {
+  cards: IssueCard[];
+  loading: boolean;
+  onOpenIssue?: (issue: number) => void;
+}) {
+  return (
+    <section className="panel overview-live-work">
+      <div className="panel-hd">
+        <span className="panel-title">Active lifecycle</span>
+        <span className="faint num">{cards.length} running</span>
+      </div>
+      <div className="overview-live-list">
+        {loading && cards.length === 0 ? <Loading what="active work" /> : null}
+        {!loading && cards.length === 0 ? (
+          <EmptyState>no lifecycle is active — the deployment is on rails and idle</EmptyState>
+        ) : null}
+        {cards.map((card) => (
+          <article className="overview-live-row" key={card.issue}>
+            <div className="overview-live-summary">
+              <div className="overview-live-title">
+                {onOpenIssue ? (
+                  <button type="button" onClick={() => onOpenIssue(card.issue)}>
+                    <span className="mono">#{card.issue}</span>
+                    <span>{card.title ?? "Untitled issue"}</span>
+                  </button>
+                ) : (
+                  <span>
+                    <span className="mono">#{card.issue}</span>{" "}
+                    {card.title ?? "Untitled issue"}
+                  </span>
+                )}
+              </div>
+              <div className="overview-live-meta">
+                <Chip tone={stageTone(card.stage)}>{card.stage ?? "active"}</Chip>
+                {card.pr ? <span className="mono faint">PR #{card.pr}</span> : null}
+              </div>
+            </div>
+            <LifecycleStepper
+              steps={card.steps}
+              stage={card.stage}
+              done={card.done}
+              hasPullRequest={card.pr !== null}
+              attention={attentionFor(card)}
+              label={`Issue #${card.issue} lifecycle`}
+              onSelectStep={onOpenIssue ? () => onOpenIssue(card.issue) : undefined}
+            />
+            <div className="overview-live-measure">
+              <span className="faint">spend</span>
+              <strong className="mono num">{usd(card.cost_usd)}</strong>
+              <span className="faint">{card.steps.length} legs</span>
+            </div>
+          </article>
+        ))}
+      </div>
+    </section>
   );
 }
 

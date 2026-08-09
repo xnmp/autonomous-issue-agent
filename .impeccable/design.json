@@ -1,0 +1,151 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-08-09T00:00:00+10:00",
+  "title": "Design System: Issue Agent Operator Console",
+  "extensions": {
+    "colorMeta": {
+      "primary": { "role": "primary", "displayName": "Route Periwinkle", "canonical": "#8c98ff", "tonalRamp": ["oklch(15% 0.08 275)", "oklch(25% 0.08 275)", "oklch(35% 0.08 275)", "oklch(48% 0.08 275)", "oklch(60% 0.08 275)", "oklch(72% 0.08 275)", "oklch(84% 0.08 275)", "oklch(95% 0.08 275)"] },
+      "primary-muted": { "role": "primary", "displayName": "Muted Periwinkle", "canonical": "#7382f4", "tonalRamp": ["oklch(15% 0.1 275)", "oklch(25% 0.1 275)", "oklch(35% 0.1 275)", "oklch(48% 0.1 275)", "oklch(60% 0.1 275)", "oklch(72% 0.1 275)", "oklch(84% 0.1 275)", "oklch(95% 0.1 275)"] },
+      "neutral-canvas": { "role": "neutral", "displayName": "Graphite Canvas", "canonical": "#080b12", "tonalRamp": ["oklch(15% 0.015 260)", "oklch(25% 0.015 260)", "oklch(35% 0.015 260)", "oklch(48% 0.015 260)", "oklch(60% 0.015 260)", "oklch(72% 0.015 260)", "oklch(84% 0.015 260)", "oklch(95% 0.015 260)"] },
+      "neutral-panel": { "role": "neutral", "displayName": "Navy Panel", "canonical": "#0f1622", "tonalRamp": ["oklch(15% 0.025 255)", "oklch(25% 0.025 255)", "oklch(35% 0.025 255)", "oklch(48% 0.025 255)", "oklch(60% 0.025 255)", "oklch(72% 0.025 255)", "oklch(84% 0.025 255)", "oklch(95% 0.025 255)"] },
+      "neutral-elevated": { "role": "neutral", "displayName": "Raised Navy", "canonical": "#151f2e", "tonalRamp": ["oklch(15% 0.03 255)", "oklch(25% 0.03 255)", "oklch(35% 0.03 255)", "oklch(48% 0.03 255)", "oklch(60% 0.03 255)", "oklch(72% 0.03 255)", "oklch(84% 0.03 255)", "oklch(95% 0.03 255)"] },
+      "neutral-ink": { "role": "neutral", "displayName": "Cold White", "canonical": "#edf1f7", "tonalRamp": ["oklch(15% 0.01 250)", "oklch(25% 0.01 250)", "oklch(35% 0.01 250)", "oklch(48% 0.01 250)", "oklch(60% 0.01 250)", "oklch(72% 0.01 250)", "oklch(84% 0.01 250)", "oklch(95% 0.01 250)"] },
+      "neutral-muted": { "role": "neutral", "displayName": "Steel Muted", "canonical": "#9aa6b6", "tonalRamp": ["oklch(15% 0.025 250)", "oklch(25% 0.025 250)", "oklch(35% 0.025 250)", "oklch(48% 0.025 250)", "oklch(60% 0.025 250)", "oklch(72% 0.025 250)", "oklch(84% 0.025 250)", "oklch(95% 0.025 250)"] },
+      "neutral-selection": { "role": "neutral", "displayName": "Selection Navy", "canonical": "#253052", "tonalRamp": ["oklch(15% 0.055 270)", "oklch(25% 0.055 270)", "oklch(35% 0.055 270)", "oklch(48% 0.055 270)", "oklch(60% 0.055 270)", "oklch(72% 0.055 270)", "oklch(84% 0.055 270)", "oklch(95% 0.055 270)"] },
+      "success": { "role": "secondary", "displayName": "Healthy Mint", "canonical": "#4fca9a", "tonalRamp": ["oklch(15% 0.1 165)", "oklch(25% 0.1 165)", "oklch(35% 0.1 165)", "oklch(48% 0.1 165)", "oklch(60% 0.1 165)", "oklch(72% 0.1 165)", "oklch(84% 0.1 165)", "oklch(95% 0.1 165)"] },
+      "success-bright": { "role": "secondary", "displayName": "Bright Healthy Mint", "canonical": "#69ddb0", "tonalRamp": ["oklch(15% 0.11 165)", "oklch(25% 0.11 165)", "oklch(35% 0.11 165)", "oklch(48% 0.11 165)", "oklch(60% 0.11 165)", "oklch(72% 0.11 165)", "oklch(84% 0.11 165)", "oklch(95% 0.11 165)"] },
+      "attention": { "role": "secondary", "displayName": "Watch Amber", "canonical": "#e9b35a", "tonalRamp": ["oklch(15% 0.1 80)", "oklch(25% 0.1 80)", "oklch(35% 0.1 80)", "oklch(48% 0.1 80)", "oklch(60% 0.1 80)", "oklch(72% 0.1 80)", "oklch(84% 0.1 80)", "oklch(95% 0.1 80)"] },
+      "attention-bright": { "role": "secondary", "displayName": "Bright Watch Amber", "canonical": "#f6c773", "tonalRamp": ["oklch(15% 0.1 80)", "oklch(25% 0.1 80)", "oklch(35% 0.1 80)", "oklch(48% 0.1 80)", "oklch(60% 0.1 80)", "oklch(72% 0.1 80)", "oklch(84% 0.1 80)", "oklch(95% 0.1 80)"] },
+      "danger": { "role": "tertiary", "displayName": "Fault Coral", "canonical": "#f06475", "tonalRamp": ["oklch(15% 0.13 20)", "oklch(25% 0.13 20)", "oklch(35% 0.13 20)", "oklch(48% 0.13 20)", "oklch(60% 0.13 20)", "oklch(72% 0.13 20)", "oklch(84% 0.13 20)", "oklch(95% 0.13 20)"] },
+      "danger-bright": { "role": "tertiary", "displayName": "Bright Fault Coral", "canonical": "#ff7d8d", "tonalRamp": ["oklch(15% 0.14 20)", "oklch(25% 0.14 20)", "oklch(35% 0.14 20)", "oklch(48% 0.14 20)", "oklch(60% 0.14 20)", "oklch(72% 0.14 20)", "oklch(84% 0.14 20)", "oklch(95% 0.14 20)"] },
+      "metadata": { "role": "tertiary", "displayName": "Metadata Violet", "canonical": "#aa82dc", "tonalRamp": ["oklch(15% 0.11 305)", "oklch(25% 0.11 305)", "oklch(35% 0.11 305)", "oklch(48% 0.11 305)", "oklch(60% 0.11 305)", "oklch(72% 0.11 305)", "oklch(84% 0.11 305)", "oklch(95% 0.11 305)"] },
+      "metadata-bright": { "role": "tertiary", "displayName": "Bright Metadata Violet", "canonical": "#c09aef", "tonalRamp": ["oklch(15% 0.11 305)", "oklch(25% 0.11 305)", "oklch(35% 0.11 305)", "oklch(48% 0.11 305)", "oklch(60% 0.11 305)", "oklch(72% 0.11 305)", "oklch(84% 0.11 305)", "oklch(95% 0.11 305)"] },
+      "link": { "role": "tertiary", "displayName": "Evidence Cyan", "canonical": "#6fbee8", "tonalRamp": ["oklch(15% 0.09 230)", "oklch(25% 0.09 230)", "oklch(35% 0.09 230)", "oklch(48% 0.09 230)", "oklch(60% 0.09 230)", "oklch(72% 0.09 230)", "oklch(84% 0.09 230)", "oklch(95% 0.09 230)"] },
+      "link-bright": { "role": "tertiary", "displayName": "Bright Evidence Cyan", "canonical": "#8bd0f4", "tonalRamp": ["oklch(15% 0.09 230)", "oklch(25% 0.09 230)", "oklch(35% 0.09 230)", "oklch(48% 0.09 230)", "oklch(60% 0.09 230)", "oklch(72% 0.09 230)", "oklch(84% 0.09 230)", "oklch(95% 0.09 230)"] }
+    },
+    "typographyMeta": {
+      "headline": { "displayName": "Headline", "purpose": "Page-level view names." },
+      "title": { "displayName": "Title", "purpose": "Issue titles and prominent local headings." },
+      "body": { "displayName": "Body", "purpose": "Default operational prose and interface text." },
+      "label": { "displayName": "Label", "purpose": "Tracked uppercase panel, rail, and table labels." },
+      "machine": { "displayName": "Machine", "purpose": "IDs, repositories, paths, time, money, tokens, models, and serialized evidence." }
+    },
+    "shadows": [
+      { "name": "compact-float", "value": "0 2px 8px color-mix(in srgb, #080b12 82%, transparent)", "purpose": "Small floating controls." },
+      { "name": "working-lift", "value": "0 10px 28px color-mix(in srgb, #080b12 82%, transparent)", "purpose": "Active work, tooltips, and medium overlays." },
+      { "name": "overlay-lift", "value": "0 18px 48px color-mix(in srgb, #080b12 82%, transparent)", "purpose": "Menus, modals, quota cards, and toasts." }
+    ],
+    "motion": [
+      { "name": "duration-fast", "value": "120ms", "purpose": "Short hover and disclosure feedback." },
+      { "name": "duration-normal", "value": "150ms", "purpose": "Default state transition." },
+      { "name": "ease-out", "value": "cubic-bezier(0.16, 1, 0.3, 1)", "purpose": "Default responsive deceleration." },
+      { "name": "lifecycle-active", "value": "2s cubic-bezier(0.16, 1, 0.3, 1) infinite", "purpose": "Reduced-motion-safe active lifecycle halo." }
+    ],
+    "breakpoints": [
+      { "name": "wide-board", "value": "1080px" },
+      { "name": "stacked-live-work", "value": "720px" },
+      { "name": "compact-rail", "value": "900px" },
+      { "name": "mobile-control-strip", "value": "480px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Default Button",
+      "kind": "button",
+      "refersTo": "button-default",
+      "description": "Compact operational action with a raised navy surface.",
+      "html": "<button class=\"ds-btn\">Open evidence</button>",
+      "css": ".ds-btn { min-height: 30px; padding: 6px 12px; border: 1px solid color-mix(in srgb, var(--ink) 15%, transparent); border-radius: var(--radius-sm); background: var(--elevated); color: var(--ink); font: 520 12px/1.45 var(--font-sans); transition: background var(--t), border-color var(--t), color var(--t); } .ds-btn:hover { background: var(--pressed); border-color: var(--border-emphasis); } .ds-btn:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; } .ds-btn:active { background: var(--pressed); }"
+    },
+    {
+      "name": "Ghost Button",
+      "kind": "button",
+      "refersTo": "button-ghost",
+      "description": "Quiet secondary action that materializes on hover.",
+      "html": "<button class=\"ds-btn-ghost\">Retry</button>",
+      "css": ".ds-btn-ghost { min-height: 30px; padding: 6px 12px; border: 1px solid transparent; border-radius: var(--radius-sm); background: transparent; color: var(--ink-muted); font: 520 12px/1.45 var(--font-sans); transition: background var(--t), color var(--t); } .ds-btn-ghost:hover { background: var(--hover); color: var(--ink); } .ds-btn-ghost:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; } .ds-btn-ghost:active { background: var(--pressed); }"
+    },
+    {
+      "name": "Filter Field",
+      "kind": "input",
+      "refersTo": "input-filter",
+      "description": "Compact filter field for dense tables.",
+      "html": "<label class=\"ds-field-label\">Filter issues <input class=\"ds-field\" placeholder=\"Title, state, model…\"></label>",
+      "css": ".ds-field-label { display: grid; gap: 4px; color: var(--ink-muted); font: 600 11px/1.2 var(--font-sans); } .ds-field { padding: 4px 8px; border: 1px solid var(--border-strong); border-radius: var(--radius-sm); outline: none; background: var(--panel); color: var(--ink); font: 400 11px/1.45 var(--font-sans); } .ds-field:hover { border-color: var(--border-emphasis); } .ds-field:focus-visible { border-color: var(--accent); box-shadow: 0 0 0 2px var(--focus-ring); }"
+    },
+    {
+      "name": "Semantic Chip",
+      "kind": "chip",
+      "refersTo": "chip-neutral",
+      "description": "A compact label whose color is always tied to semantic state.",
+      "html": "<span class=\"ds-chip\"><span class=\"ds-chip-dot\"></span>running</span>",
+      "css": ".ds-chip { display: inline-flex; align-items: center; gap: 4px; min-height: 22px; padding: 1px 8px; border: 1px solid color-mix(in srgb, var(--running) 32%, transparent); border-radius: var(--radius-pill); background: color-mix(in srgb, var(--running) 10%, transparent); color: var(--running); font: 620 11px/1.6 var(--font-sans); letter-spacing: .02em; } .ds-chip-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; } .ds-chip:hover { border-color: color-mix(in srgb, var(--running) 55%, transparent); } .ds-chip:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }"
+    },
+    {
+      "name": "Panel",
+      "kind": "card",
+      "refersTo": "panel",
+      "description": "The default matte container, separated by tone and a hairline border.",
+      "html": "<section class=\"ds-panel\"><header class=\"ds-panel-hd\">Active lifecycle</header><div class=\"ds-panel-bd\">Operational evidence stays compact and attached.</div></section>",
+      "css": ".ds-panel { overflow: hidden; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel); color: var(--ink); } .ds-panel-hd { min-height: 42px; padding: 8px 12px; border-bottom: 1px solid var(--border); color: var(--ink-muted); font: 620 11px/1.2 var(--font-sans); letter-spacing: .075em; text-transform: uppercase; } .ds-panel-bd { padding: 12px; color: var(--ink-muted); font: 400 13px/1.45 var(--font-sans); } .ds-panel:hover { border-color: var(--border-strong); } .ds-panel:focus-within { border-color: var(--border-emphasis); }"
+    },
+    {
+      "name": "Route Tab",
+      "kind": "nav",
+      "refersTo": "tab-active",
+      "description": "Rectangular navigation tab with a periwinkle route edge.",
+      "html": "<nav class=\"ds-tabs\"><button class=\"ds-tab\">Overview</button><button class=\"ds-tab ds-tab-active\">Issues <span class=\"ds-tab-count\">8</span></button></nav>",
+      "css": ".ds-tabs { display: flex; height: 55px; background: var(--surface-sidebar); } .ds-tab { position: relative; padding: 0 12px; border: 0; background: transparent; color: var(--ink-muted); font: 400 12px/1 var(--font-sans); } .ds-tab:hover { background: var(--hover); color: var(--ink); } .ds-tab:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: -2px; } .ds-tab-active { background: var(--accent-soft); color: var(--ink); font-weight: 620; } .ds-tab-active::after { content: ''; position: absolute; inset: auto 0 0; height: 2px; background: var(--accent); } .ds-tab-count { padding: 0 5px; border-radius: var(--radius-pill); background: var(--selection); color: var(--ink-muted); }"
+    },
+    {
+      "name": "Lifecycle Topology",
+      "kind": "custom",
+      "description": "The signature route from completed through active and future issue stages.",
+      "html": "<ol class=\"ds-life\"><li class=\"ds-stage ds-complete\"><span class=\"ds-node\">✓</span><span>Resolve</span></li><li class=\"ds-stage ds-active\"><span class=\"ds-node\">•</span><span>Review</span></li><li class=\"ds-stage\"><span class=\"ds-node\">•</span><span>CI</span></li></ol>",
+      "css": ".ds-life { display: flex; width: 100%; margin: 0; padding: 8px 0 20px; list-style: none; color: var(--ink-faint); } .ds-stage { position: relative; display: flex; flex: 1; min-width: 54px; flex-direction: column; align-items: center; gap: 6px; color: var(--ink-faint); font: 520 11px/1.2 var(--font-sans); } .ds-stage:not(:first-child)::before { content: ''; position: absolute; top: 17px; right: 50%; width: 100%; height: 1px; background: var(--border-emphasis); } .ds-node { z-index: 1; display: grid; width: 34px; height: 34px; place-items: center; border: 1.5px solid var(--border-emphasis); border-radius: 50%; background: var(--surface-sunken); color: var(--ink-muted); } .ds-complete, .ds-active { color: var(--accent); } .ds-complete::before, .ds-active::before { background: var(--accent) !important; } .ds-complete .ds-node { border-color: var(--accent); background: var(--accent); color: var(--c-fg); } .ds-active .ds-node { border: 2px solid var(--accent); box-shadow: 0 0 0 4px var(--accent-soft); color: var(--accent); } .ds-stage:hover .ds-node { border-color: currentColor; background: var(--elevated); } .ds-stage:focus-within .ds-node { outline: 2px solid var(--focus-ring); outline-offset: 2px; }"
+    },
+    {
+      "name": "Error Banner",
+      "kind": "custom",
+      "description": "Local failure treatment that preserves surrounding data and offers recovery.",
+      "html": "<div class=\"ds-banner\" role=\"status\"><span class=\"ds-banner-mark\">!</span><span>Issue data could not refresh; showing last known data.</span><button class=\"ds-banner-action\">Retry</button></div>",
+      "css": ".ds-banner { display: flex; min-height: 40px; align-items: center; gap: 8px; padding: 8px 12px; border: 1px solid color-mix(in srgb, var(--fail) 34%, transparent); border-radius: var(--radius-sm); background: color-mix(in srgb, var(--fail) 8%, var(--panel)); color: var(--ink); font: 400 12px/1.45 var(--font-sans); } .ds-banner-mark { display: grid; width: 24px; height: 24px; flex: none; place-items: center; border-radius: var(--radius-sm); background: color-mix(in srgb, var(--fail) 12%, transparent); color: var(--fail); font-weight: 700; } .ds-banner-action { margin-left: auto; padding: 2px 8px; border: 1px solid transparent; border-radius: var(--radius-sm); background: transparent; color: var(--ink-muted); } .ds-banner-action:hover { background: var(--hover); color: var(--ink); } .ds-banner-action:focus-visible { outline: 2px solid var(--focus-ring); outline-offset: 2px; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Version-Control Topology Board",
+    "overview": "Issue Agent is a compact, dark operations surface whose visual model is a live execution graph rather than a collection of generic dashboard tiles. Matte graphite and navy layers create a calm working field; one restrained periwinkle route line carries navigation, selection, and lifecycle progress through it.\n\nThe interface is deliberately dense, crisp, and operational. Attention, daemon health, active work, ownership, and the next intervention lead; aggregate metrics and historical trends remain quieter and lower in the reading order. Detail is progressively disclosed without removing the surrounding execution context.",
+    "keyCharacteristics": [
+      "Matte graphite/navy tonal layering with fine, low-contrast borders.",
+      "Periwinkle topology lines and active markers used as a route, not decoration.",
+      "Red, amber, green, violet, and cyan reserved for stable semantic roles.",
+      "Compact square controls and dense tables built for repeated scanning.",
+      "Monospace restricted to machine data; human language stays sans-serif."
+    ],
+    "rules": [
+      { "name": "The One Route Rule", "body": "Periwinkle connects navigation and lifecycle progress; it is not a general-purpose fill for large surfaces.", "section": "colors" },
+      { "name": "The Semantic Redundancy Rule", "body": "Never communicate operational state with color alone; pair it with a label, glyph, edge, or topology position.", "section": "colors" },
+      { "name": "The Quiet History Rule", "body": "Historical totals stay neutral at the container level; only the meaningful value receives semantic color.", "section": "colors" },
+      { "name": "The Machine Data Rule", "body": "Use monospace only when the content is generated, measured, addressed, or serialized by the system.", "section": "typography" },
+      { "name": "The Compact Hierarchy Rule", "body": "Create hierarchy with weight, tone, tracking, and grouping before increasing type size.", "section": "typography" },
+      { "name": "The Operational Order Rule", "body": "Attention, live health, active lifecycle, and operator actions precede metrics, spend, and trends.", "section": "layout" },
+      { "name": "The Evidence-in-Place Rule", "body": "Expanded evidence stays attached to its row or lifecycle stage and remains readable inside horizontal scrollers.", "section": "layout" },
+      { "name": "The Tonal-First Rule", "body": "Use surface steps and hairline borders for ordinary hierarchy; a shadow means the element floats, overlays, or demands attention.", "section": "elevation" },
+      { "name": "The Compact Control Rule", "body": "Controls remain square-leaning and precise; do not turn buttons, inputs, or panels into pills.", "section": "shapes" }
+    ],
+    "dos": [
+      "Do lead operational screens with required human action, live health, and active lifecycle state.",
+      "Do reuse the semantic tone vocabulary and provide a label, glyph, edge, or position alongside every color signal.",
+      "Do keep rows compact, numbers tabular, and long evidence progressively disclosed in place.",
+      "Do preserve visible keyboard focus and reduced-motion alternatives.",
+      "Do use the 2–32px spacing scale and the 4/6/10/12px corner hierarchy."
+    ],
+    "donts": [
+      "Don't replace topology and issue lanes with a generic grid of equal-weight metric cards.",
+      "Don't use periwinkle as broad decoration or let historical analytics compete with live work.",
+      "Don't apply monospace to prose, navigation labels, or headings simply to make the console feel technical.",
+      "Don't use pills for ordinary buttons, inputs, panels, or tabs.",
+      "Don't blank the whole screen for a local fetch error or hide the reason an area is empty."
+    ]
+  }
+}

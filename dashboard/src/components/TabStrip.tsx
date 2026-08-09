@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { Icon } from "./ui/Icon";
 
 export interface TabDef {
   key: string;
@@ -19,7 +20,10 @@ export function TabStrip({ tabs }: { tabs: TabDef[] }) {
   return (
     <div className="tabstrip" role="tablist">
       {tabs.map((t) => (
-        <div key={t.key} className={`tab${t.active ? " active" : ""}`}>
+        <div
+          key={t.key}
+          className={`tab${t.active ? " active" : ""}${t.onClose ? " tab-closeable" : ""}`}
+        >
           <button
             className="tab-main"
             role="tab"
@@ -39,7 +43,7 @@ export function TabStrip({ tabs }: { tabs: TabDef[] }) {
                 t.onClose?.();
               }}
             >
-              ✕
+              <Icon name="close" size={13} />
             </button>
           ) : null}
         </div>

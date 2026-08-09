@@ -9,11 +9,12 @@ import { ConfirmModal } from "./ui/Modal";
 import { EmptyState, ErrorBanner, SkeletonRows, WarningList } from "./ui/Feedback";
 import { UsageBlock } from "./UsageBlock";
 import { OptionsMenu, type DashboardOptions } from "./ui/OptionsMenu";
+import { Icon } from "./ui/Icon";
 
 const WIDTH_KEY = "issue-agent.dashboard.sidebar-width";
 const MIN_WIDTH = 220;
 const MAX_WIDTH = 480;
-const DEFAULT_WIDTH = 264;
+const DEFAULT_WIDTH = 248;
 
 /** The rail's width is a whole number of CSS pixels, always within the range
  * the stylesheet is built for — including when it comes back from storage,
@@ -159,7 +160,7 @@ export function Sidebar({
           aria-label="Expand sidebar"
           title="Expand sidebar"
         >
-          ›
+          <Icon name="chevron-right" />
         </button>
       </div>
     );
@@ -167,13 +168,20 @@ export function Sidebar({
 
   return (
     <aside className="sidebar" style={{ width }}>
+      <div className="sidebar-brand">
+        <span className="brand-mark" aria-hidden="true"><Icon name="agent" size={18} /></span>
+        <span className="brand-copy">
+          <strong>Issue Agent</strong>
+          <span>Operator console</span>
+        </span>
+      </div>
       <button
         className="sidebar-toggle"
         onClick={toggleCollapsed}
         aria-label="Collapse sidebar"
         title="Collapse sidebar"
       >
-        ‹
+        <Icon name="chevron-left" />
       </button>
       <div className="sidebar-scroll">
         {repos.data?.liveness === "unknown" ? (
@@ -253,7 +261,7 @@ export function Sidebar({
               {notice}
             </span>
             <button className="btn btn-xs btn-ghost" onClick={() => setNotice(null)}>
-              ✕
+              <Icon name="close" size={13} />
             </button>
           </div>
         ) : null}
@@ -265,7 +273,7 @@ export function Sidebar({
           aria-label="Verification ledger"
           title="Verification ledger"
         >
-          <span className="rail-btn-mark" aria-hidden="true">✓</span>
+          <span className="rail-btn-mark" aria-hidden="true"><Icon name="check-circle" /></span>
           <span>Verification ledger</span>
         </button>
       </div>
@@ -385,7 +393,7 @@ function RepoRow({
           title="start daemons"
           aria-label={`Start daemons for ${repo.name}`}
         >
-          ▶
+          <Icon name="play" size={13} />
         </button>
       ) : null}
     </div>

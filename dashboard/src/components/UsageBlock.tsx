@@ -5,6 +5,7 @@ import { Meter } from "./ui/Charts";
 import { ErrorBanner } from "./ui/Feedback";
 import { pct, untilLabel, usd } from "../lib/format";
 import { utilTone } from "../lib/semantics";
+import { Icon } from "./ui/Icon";
 
 /**
  * Compact quota block: the three subscription windows plus harness dollars.
@@ -84,7 +85,7 @@ export function UsageBlock({
         ) : (
         <>
         <div className="usage-hd">
-          <button className="btn btn-xs btn-ghost" aria-label="Close quota" onClick={() => setOpen(false)}>×</button>
+          <button className="btn btn-xs btn-ghost" aria-label="Close quota" onClick={() => setOpen(false)}><Icon name="close" size={13} /></button>
         </div>
         <div className="usage-body">
         {usage.error ? (
