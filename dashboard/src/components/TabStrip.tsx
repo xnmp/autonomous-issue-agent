@@ -20,7 +20,10 @@ export function TabStrip({ tabs }: { tabs: TabDef[] }) {
   return (
     <div className="tabstrip" role="tablist">
       {tabs.map((t) => (
-        <div key={t.key} className={`tab${t.active ? " active" : ""}`}>
+        <div
+          key={t.key}
+          className={`tab${t.active ? " active" : ""}${t.onClose ? " tab-closeable" : ""}`}
+        >
           <button
             className="tab-main"
             role="tab"

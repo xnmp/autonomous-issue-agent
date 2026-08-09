@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { Chip } from "./Chip";
+import { Icon } from "./Icon";
 
 /**
  * Per-panel error banner. The rule the whole app follows: a failed fetch
@@ -17,9 +18,7 @@ export function ErrorBanner({
 }) {
   return (
     <div className="banner banner-error" role="status">
-      <span className="banner-mark" aria-hidden="true">
-        !
-      </span>
+      <span className="banner-mark" aria-hidden="true"><Icon name="alert-triangle" size={15} /></span>
       <span className="banner-msg">{message}</span>
       {stale ? <span className="faint">showing last known data</span> : null}
       {onRetry ? (
@@ -36,9 +35,7 @@ export function WarningList({ warnings }: { warnings: string[] | undefined }) {
   if (!warnings || warnings.length === 0) return null;
   return (
     <div className="banner banner-warn" role="status">
-      <span className="banner-mark" aria-hidden="true">
-        ⚠
-      </span>
+      <span className="banner-mark" aria-hidden="true"><Icon name="alert-triangle" size={15} /></span>
       <span className="banner-msg">
         {warnings.length === 1 ? warnings[0] : `${warnings.length} collector warnings`}
       </span>
@@ -58,11 +55,21 @@ export function WarningList({ warnings }: { warnings: string[] | undefined }) {
 
 /** Never a blank pane: every list says why it is empty. */
 export function EmptyState({ children }: { children: ReactNode }) {
-  return <div className="empty">{children}</div>;
+  return (
+    <div className="empty">
+      <span className="empty-icon" aria-hidden="true"><Icon name="inbox" size={17} /></span>
+      <span className="empty-message">{children}</span>
+    </div>
+  );
 }
 
 export function Loading({ what }: { what: string }) {
-  return <div className="empty">loading {what}…</div>;
+  return (
+    <div className="loading-inline" role="status">
+      <span className="loading-spinner" aria-hidden="true" />
+      <span>Loading {what}…</span>
+    </div>
+  );
 }
 
 export function SkeletonRows({

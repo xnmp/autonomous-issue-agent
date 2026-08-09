@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Icon } from "./Icon";
 
 export const DASHBOARD_THEMES = [
-  ["cosmic-dusk", "Cosmic Dusk"],
+  ["cosmic-dusk", "Operator"],
   ["hacker", "Hacker"],
   ["monokai", "Monokai"],
   ["ayu-mirage", "Ayu Mirage"],

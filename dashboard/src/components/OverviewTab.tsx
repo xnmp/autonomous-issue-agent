@@ -7,6 +7,7 @@ import type {
   EscalationReason,
   HealthTrendDay,
   InterventionEvent,
+  IssueCard,
   OverviewPayload,
   RoleHealth,
 } from "../api/types";
@@ -15,6 +16,7 @@ import {
   HEALTH_TONE,
   mixSlices,
   roleHealth,
+  stageTone,
   utilTone,
 } from "../lib/semantics";
 import { ago, localHour, localTime, num, rate, usd, usdCompact } from "../lib/format";
@@ -23,6 +25,7 @@ import { Histogram, Meter, StackedBar, StatTile } from "./ui/Charts";
 import { EmptyState, ErrorBanner, Loading, SectionTitle, SkeletonRows, WarningList } from "./ui/Feedback";
 import { ResizableTable, useSortedRows } from "./ui/ResizableTable";
 import { TableFilter } from "./ui/TableFilter";
+import { LifecycleStepper } from "./ui/LifecycleStepper";
 
 const POLL_MS = 10_000;
 
@@ -34,9 +37,15 @@ const POLL_MS = 10_000;
 export function OverviewTab({
   repo,
   onOpenIssues,
+  activeIssues = [],
+  activeIssuesLoading = false,
+  onOpenIssue,
 }: {
   repo: string;
   onOpenIssues: (sub: "inflight" | "done") => void;
+  activeIssues?: IssueCard[];
+  activeIssuesLoading?: boolean;
+  onOpenIssue?: (issue: number) => void;
 }) {
   const ov = usePolled(
     `overview:${repo}`,
@@ -104,22 +113,7 @@ export function OverviewTab({
       <WarningList warnings={ov.data?.warnings} />
       {ov.loading ? <SkeletonRows what="overview" rows={5} /> : null}
 
-      <div className="overview-watch-grid">
-        <NeedsAttention items={ov.data?.needs_attention ?? []} loading={ov.loading} />
-
-        <section className={`panel operator-actions-panel${(ov.data?.interventions ?? []).length > 0 ? " operator-actions-active" : ""}`}>
-          <div className="panel-hd">
-            <span className="panel-title">Operator actions</span>
-            <span className="faint">newest first</span>
-          </div>
-          <div className="panel-bd flush">
-            <InterventionList
-              rows={ov.data?.interventions ?? []}
-              loading={ov.loading}
-            />
-          </div>
-        </section>
-      </div>
+      <NeedsAttention items={ov.data?.needs_attention ?? []} loading={ov.loading} />
 
       <section className="overview-health panel">
         <div className="panel-hd">
@@ -133,6 +127,25 @@ export function OverviewTab({
           {(ov.data?.health ?? []).map((h) => (
             <HealthCard key={h.role} health={h} />
           ))}
+        </div>
+      </section>
+
+      <LiveWorkPanel
+        cards={activeIssues}
+        loading={activeIssuesLoading}
+        onOpenIssue={onOpenIssue}
+      />
+
+      <section className={`panel operator-actions-panel${(ov.data?.interventions ?? []).length > 0 ? " operator-actions-active" : ""}`}>
+        <div className="panel-hd">
+          <span className="panel-title">Operator actions</span>
+          <span className="faint">newest first</span>
+        </div>
+        <div className="panel-bd flush">
+          <InterventionList
+            rows={ov.data?.interventions ?? []}
+            loading={ov.loading}
+          />
         </div>
       </section>
 
@@ -437,6 +450,78 @@ function HealthCard({ health }: { health: RoleHealth }) {
         </div>
       ) : null}
     </div>
+  );
+}
+
+function attentionFor(card: IssueCard): "blocked" | "escalated" | null {
+  if (card.human_action === "escalated") return "escalated";
+  if (
+    card.human_action === "awaiting-reply"
+    || card.stage === "blocked"
+    || card.flags.includes("blocked")
+  ) return "blocked";
+  return null;
+}
+
+function LiveWorkPanel({
+  cards,
+  loading,
+  onOpenIssue,
+}: {
+  cards: IssueCard[];
+  loading: boolean;
+  onOpenIssue?: (issue: number) => void;
+}) {
+  return (
+    <section className="panel overview-live-work">
+      <div className="panel-hd">
+        <span className="panel-title">Active lifecycle</span>
+        <span className="faint num">{cards.length} running</span>
+      </div>
+      <div className="overview-live-list">
+        {loading && cards.length === 0 ? <Loading what="active work" /> : null}
+        {!loading && cards.length === 0 ? (
+          <EmptyState>no lifecycle is active — the deployment is on rails and idle</EmptyState>
+        ) : null}
+        {cards.map((card) => (
+          <article className="overview-live-row" key={card.issue}>
+            <div className="overview-live-summary">
+              <div className="overview-live-title">
+                {onOpenIssue ? (
+                  <button type="button" onClick={() => onOpenIssue(card.issue)}>
+                    <span className="mono">#{card.issue}</span>
+                    <span>{card.title ?? "Untitled issue"}</span>
+                  </button>
+                ) : (
+                  <span>
+                    <span className="mono">#{card.issue}</span>{" "}
+                    {card.title ?? "Untitled issue"}
+                  </span>
+                )}
+              </div>
+              <div className="overview-live-meta">
+                <Chip tone={stageTone(card.stage)}>{card.stage ?? "active"}</Chip>
+                {card.pr ? <span className="mono faint">PR #{card.pr}</span> : null}
+              </div>
+            </div>
+            <LifecycleStepper
+              steps={card.steps}
+              stage={card.stage}
+              done={card.done}
+              hasPullRequest={card.pr !== null}
+              attention={attentionFor(card)}
+              label={`Issue #${card.issue} lifecycle`}
+              onSelectStep={onOpenIssue ? () => onOpenIssue(card.issue) : undefined}
+            />
+            <div className="overview-live-measure">
+              <span className="faint">spend</span>
+              <strong className="mono num">{usd(card.cost_usd)}</strong>
+              <span className="faint">{card.steps.length} legs</span>
+            </div>
+          </article>
+        ))}
+      </div>
+    </section>
   );
 }
 

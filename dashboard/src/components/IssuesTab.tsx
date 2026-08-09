@@ -473,7 +473,7 @@ function InFlightTable({
   if (loading) return <SkeletonRows what="in-flight issues" rows={5} />;
   if (cards.length === 0) return <EmptyState>no issues in flight — the fixer is idle</EmptyState>;
   const columns: TableColumn[] = [
-    { key: "issue", label: "Issue / PR", width: 320 },
+    { key: "issue", label: "Issue / PR", width: 360 },
     ...(visible.has("tasks") ? [{ key: "tasks", label: "Tasks", width: 190 }] : []),
     ...(visible.has("cost") ? [{ key: "cost", label: "Cost", className: "r", width: 120 }] : []),
     ...(visible.has("elapsed") ? [{ key: "elapsed", label: "Duration", className: "r", width: 150 }] : []),

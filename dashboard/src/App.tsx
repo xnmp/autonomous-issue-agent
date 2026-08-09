@@ -413,7 +413,17 @@ function Body({
         showDurationSeconds={showDurationSeconds}
       />
     );
-  if (selectedRepo) return <OverviewTab repo={selectedRepo} onOpenIssues={onSetSub} />;
+  if (selectedRepo) {
+    return (
+      <OverviewTab
+        repo={selectedRepo}
+        onOpenIssues={onSetSub}
+        activeIssues={issues.data?.in_flight ?? []}
+        activeIssuesLoading={issues.loading}
+        onOpenIssue={onOpenIssue}
+      />
+    );
+  }
   return (
     <div className="tabbody">
       <EmptyState>

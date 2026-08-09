@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { RoleHealth, ToastNotification } from "../api/types";
+import { Icon } from "./ui/Icon";
 
 const VISIBLE_TOASTS = 4;
 const RETAINED_TOASTS = 20;
@@ -109,7 +110,7 @@ export function ToastStack({
           role={toast.severity === "attention" ? "alert" : "status"}
         >
           <span className="toast-mark" aria-hidden="true">
-            {toast.severity === "attention" ? "!" : "✓"}
+            <Icon name={toast.severity === "attention" ? "alert-triangle" : "check-circle"} size={15} />
           </span>
           <span className="toast-copy">
             <strong>{toast.title}</strong>
@@ -123,7 +124,7 @@ export function ToastStack({
               setToasts((current) => current.filter((item) => item.id !== toast.id));
             }}
           >
-            ×
+            <Icon name="close" size={15} />
           </button>
         </div>
       ))}

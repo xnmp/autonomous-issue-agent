@@ -35,6 +35,12 @@ examples/demo-target/.git/
 .claude/scheduled_tasks.json
 evidence/
 
+# Impeccable's generated visual studies remain local; durable design authority
+# lives in PRODUCT.md, DESIGN.md, the sidecar, and surface briefs.
+.impeccable/mocks/
+.impeccable/inspection/
+.impeccable/surface-dashboard-body.md
+
 
 # CI-fix MCP server configs (hold tokens)
 config/mcp/

@@ -225,6 +225,7 @@ export function LifecycleStepper({
             <span className="life-node-ring"><StateGlyph state={item.state} /></span>
             {!compact ? <span className="life-label">{item.label}</span> : null}
             {!compact ? <span className="life-state-label">{item.state}</span> : null}
+            {compact ? <span className="life-compact-label">{item.label}</span> : null}
           </>
         );
         return (

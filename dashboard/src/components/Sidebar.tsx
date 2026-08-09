@@ -261,7 +261,7 @@ export function Sidebar({
               {notice}
             </span>
             <button className="btn btn-xs btn-ghost" onClick={() => setNotice(null)}>
-              ✕
+              <Icon name="close" size={13} />
             </button>
           </div>
         ) : null}
