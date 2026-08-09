@@ -3,7 +3,7 @@
 SHELL := bash
 HARNESS_ROOT := $(shell pwd)
 
-.PHONY: help test test-config-generated test-governor test-residuals test-hooks test-deployment-env test-point-at test-domain test-adapters test-app test-parity arch typecheck doctor dashboard-ui dashboard \
+.PHONY: help test test-config-generated test-governor test-residuals test-hooks test-compose-env test-deployment-env test-point-at test-domain test-adapters test-app test-parity arch typecheck doctor dashboard-ui dashboard \
 	        install point-at run-fix run-review run-steward demo-gate \
         install-launchd install-systemd \
         uninstall-launchd uninstall-systemd demo-init lint clean
@@ -30,7 +30,7 @@ help:
 # test-deployment-env is NOT in this chain: it re-runs the hook and adapter
 # suites under a hostile env, substantially increasing wall clock — and `make test` is the
 # self-hosted TEST_CMD paid on every gate run. CI runs it as its own step.
-test: test-config-generated test-governor test-residuals test-hooks test-point-at test-domain test-adapters test-app test-parity arch typecheck
+test: test-config-generated test-governor test-residuals test-hooks test-compose-env test-point-at test-domain test-adapters test-app test-parity arch typecheck
 	@echo ""
 	@echo "✓ all suites passed"
 
@@ -50,6 +50,10 @@ test-residuals:
 test-hooks:
 	@echo "== hooks (bash) =="
 	@bash tests/test_hooks.sh
+
+test-compose-env:
+	@echo "== compose-env (TARGET_ENV_ pass-through contract) =="
+	@bash tests/test_compose_env_passthrough.sh
 
 test-deployment-env:
 	@echo "== deployment environment sanitization =="

@@ -127,12 +127,15 @@ def _install_compose_env(tmp_path: Path) -> Path:
     """Copy the REAL compose-env.sh into <tmp_path>/bin/ so its self-locating
     root (`dirname "${BASH_SOURCE[0]}"/..`) resolves to the scratch tree, not
     the real repo's config/. Reads the current file content each run, so the
-    test always exercises the shipped script."""
+    test always exercises the shipped script. point-at.sh rides along because
+    compose-env parses the TARGET_ENV_ scrub floor from it (fail-closed)."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     dest = bin_dir / "compose-env.sh"
     dest.write_text(COMPOSE_ENV_SH.read_text())
     dest.chmod(dest.stat().st_mode | stat.S_IEXEC)
+    point_at = bin_dir / "point-at.sh"
+    point_at.write_text((ROOT / "bin" / "point-at.sh").read_text())
     return dest
 
 
