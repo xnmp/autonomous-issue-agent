@@ -101,6 +101,12 @@ class GateContext:
     # check consults it, so a rename out of the test tree is still an
     # exemption request (round-4 adversarial review + parity check).
     touched_at_base: tuple[str, ...] = ()
+    # Modified files whose branch diff adds lines only (numstat deletions 0).
+    # Only check_tests_immutable consults it: a purely additive edit to an
+    # existing test is refused at commit time (the reviewer refuses those
+    # grants on policy — 2026-08-09 tauri batch, 4 paid rounds). () = the
+    # builder could not tell → pre-existing reviewer-caught behavior.
+    additive_only: tuple[str, ...] = ()
     base_resolvable: bool = True
     changed_files: tuple[str, ...] = ()      # diff vs base
     # Push-gate precondition, as a LAZY probe rather than a value (review
@@ -476,6 +482,7 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
         lambda: gate.check_tests_immutable(
             tuple(dict.fromkeys(ctx.changed_files + ctx.touched_at_base)),
             ctx.exists_at_base,
+            ctx.additive_only,
         ),
         # §9 — ported from bash in wave P1-2 (review M6). Cheap only in the sense
         # that matters here (no test run), but it does touch the filesystem, so
@@ -562,6 +569,7 @@ def _push_gate_for_branch(branch: str, ctx: GateContext) -> list[str]:
         lambda: gate.check_tests_immutable(
             tuple(dict.fromkeys(ctx.changed_files + ctx.touched_at_base)),
             ctx.exists_at_base,
+            ctx.additive_only,
         ),
     )
     for check in cheap_checks:

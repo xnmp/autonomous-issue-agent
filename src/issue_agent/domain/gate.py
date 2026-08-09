@@ -184,6 +184,51 @@ def referenced_evidence_images(body: str) -> tuple[str, ...]:
     return tuple(seen.values())
 
 
+# An embedded evidence image WITH a claim: markdown image syntax whose alt text
+# is at least 12 characters — the fixer's own statement of what the shot shows.
+# 2026-08-09 tauri batch: 6 of 23 review rejections were evidence that existed
+# but demonstrated nothing (#627 wrong zoom, #632/#639 unmapped ACs). Forcing
+# the claim moves that self-audit to commit time, where it is free.
+# Keep in sync with check-pr.sh (AC claim awk).
+_AC_CLAIM_RE = re.compile(
+    r"!\[[^\]]{12,}\]\([^)]*evidence/[\w./-]+\.(?:png|jpe?g|gif|webp)\)",
+    re.IGNORECASE,
+)
+
+
+def ac_items_without_claimed_evidence(body: str) -> tuple[int, ...]:
+    """1-based indexes of AC checklist items whose block (the item line plus
+    the lines under it, up to the next item or heading) embeds no evidence
+    image with a claim (alt text ≥ 12 chars). Section/item grammar is exactly
+    `count_ac_items`'s."""
+    missing: list[int] = []
+    in_ac = False
+    item = 0
+    claimed = True  # vacuously true before the first item
+    def _close() -> None:
+        if item and not claimed:
+            missing.append(item)
+    for line in (body or "").splitlines():
+        if _AC_HEADING_RE.match(line):
+            in_ac = True
+            continue
+        if in_ac and _ANY_HEADING_RE.match(line):
+            _close()
+            in_ac = False
+            item = 0
+            claimed = True
+            continue
+        if in_ac and _AC_ITEM_RE.match(line):
+            _close()
+            item += 1
+            claimed = bool(_AC_CLAIM_RE.search(line))
+            continue
+        if in_ac and item and not claimed and _AC_CLAIM_RE.search(line):
+            claimed = True
+    _close()
+    return tuple(missing)
+
+
 # ── branch name (check-branch-name.sh) ────────────────────────────────────────
 def check_branch_name(name: str) -> GateResult:
     """Branch must be <type>/<issue>-<desc>. Empty name → allow (not a
@@ -522,6 +567,17 @@ def check_visual_evidence(
             "(e.g. '![AC 2](evidence/ac-2-empty-state.png)' under that checklist "
             "item); a screenshot nobody links is invisible to the reviewer"
         )
+    unclaimed = ac_items_without_claimed_evidence(pr_body)
+    if unclaimed:
+        return deny(
+            f"AC item {unclaimed[0]} carries no evidence claim — embed its "
+            "screenshot UNDER that checklist item with alt text stating what "
+            "the image shows (12+ characters), e.g. '![context menu beside "
+            "cursor at 200% zoom](evidence/ac-2-menu-zoom.png)'. The reviewer "
+            "verifies each image against exactly its claim; before committing, "
+            "re-open the image and confirm the claim is true at the asserted "
+            "state (zoom level, data, theme)"
+        )
     return ALLOW
 
 
@@ -643,6 +699,7 @@ def modified_existing_tests_from_diff(
 def check_tests_immutable(
     changed: Iterable[str],
     exists_at_base: Callable[[str], bool],
+    additive_only: Iterable[str] = (),
 ) -> GateResult:
     """Existing-test edits are AUTO-DECLARED exemption requests, bounded by
     scope. `exists_at_base(path)` reports whether the file existed at the
@@ -682,6 +739,22 @@ def check_tests_immutable(
             f"{MAX_TEST_IMMUTABILITY_EXCEPTIONS} existing test files are "
             "touched, and prefer ADDING tests in new files wherever the old "
             "expectation is still right"
+        )
+    # Purely additive edits to an existing test file are the one shape the
+    # reviewer refuses on POLICY, not judgment ("additive coverage belongs in
+    # a new test file" — 2026-08-09 tauri batch: #620/#621/#622/#633 each
+    # burned a paid round on exactly this). Denying here converts that round
+    # into a free local move; a genuine correction (any removed/changed line)
+    # still auto-declares and goes to the reviewer as before.
+    additive = set(additive_only)
+    additive_subjects = [f for f in subjects if f in additive]
+    if additive_subjects:
+        return deny(
+            f"existing test file '{additive_subjects[0]}' was changed by "
+            "ADDING lines only — additive coverage belongs in a NEW test "
+            "file (the reviewer refuses tests-immutable grants for pure "
+            "additions); move the new tests into a new file, and modify an "
+            "existing test only where its old expectation is wrong"
         )
     return ALLOW
 

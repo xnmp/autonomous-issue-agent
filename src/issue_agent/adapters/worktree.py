@@ -735,6 +735,7 @@ def build_gate_context(
     malformed_exemption_lines = 0
     changed: tuple[str, ...] = ()
     touched_at_base: tuple[str, ...] = ()
+    additive_only: tuple[str, ...] = ()
     if baseref:
         log = git(["log", f"{baseref}..HEAD", "--reverse", "--format=%s"], cwd)
         subjects = tuple(s for s in log.out.splitlines() if s)
@@ -776,6 +777,32 @@ def build_gate_context(
             touched_at_base = tuple(
                 f for f in old_side.out.splitlines() if f
             )
+        # Modified files whose branch diff ADDS lines only (numstat deletions
+        # 0). Only check_tests_immutable consults it (pure additions to an
+        # existing test belong in a new file — the reviewer refuses those
+        # grants on policy, so the gate now says so at commit time). Binary
+        # files report "-" and are never counted; a failed numstat leaves the
+        # set empty, i.e. the pre-existing (reviewer-caught) behavior.
+        numstat = git(
+            [
+                "diff",
+                "--no-renames",
+                "--diff-filter=M",
+                "--numstat",
+                f"{baseref}...HEAD",
+            ],
+            cwd,
+        )
+        if numstat.code == 0:
+            additive: list[str] = []
+            for row in numstat.out.splitlines():
+                parts = row.split("\t", 2)
+                if len(parts) != 3:
+                    continue
+                added, deleted, path = parts
+                if deleted == "0" and added.isdigit() and added != "0":
+                    additive.append(path)
+            additive_only = tuple(additive)
         # Commits already on the observed remote PR branch are published
         # history the agent cannot rewrite (the broker requires them as
         # ancestors), so the commit-log gate must not re-police their
@@ -1081,6 +1108,7 @@ def build_gate_context(
         declared_exemptions=declared_exemptions,
         malformed_exemption_lines=malformed_exemption_lines,
         touched_at_base=touched_at_base,
+        additive_only=additive_only,
         base_resolvable=base_resolvable,
         changed_files=changed,
         open_pr=open_pr,

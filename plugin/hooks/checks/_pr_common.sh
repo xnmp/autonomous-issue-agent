@@ -369,6 +369,20 @@ prc_check_tests_immutable() {  # prc_check_tests_immutable "<changed-file-list>"
   done <<< "$(git diff --no-renames --diff-filter=MDRT --name-only "$mdrt_range" 2>/dev/null || printf '%s' "$1")"
   [ "$n_modified" -le 7 ] \
     || fail "more than 7 existing test files modified/deleted — changing existing tests is allowed (the reviewer must explicitly approve each one before merge), but this many reads as a rewrite, not a correction; reduce the change's scope (or split it) so at most 7 existing test files are touched, and prefer ADDING tests in new files wherever the old expectation is still right"
+  # Purely additive edits to an existing test file (numstat deletions 0) are
+  # the one shape the reviewer refuses on POLICY, not judgment — "additive
+  # coverage belongs in a new test file" (2026-08-09 tauri batch: 4 paid
+  # rounds). Deny at commit time, where the move is free. Twin of the
+  # additive_only branch in gate.check_tests_immutable; binary files report
+  # "-" and never count; a failed numstat keeps the old behavior.
+  local added deleted path
+  while IFS=$'\t' read -r added deleted path; do
+    [ -n "$path" ] || continue
+    printf '%s' "$path" | grep -qE "$PR_TEST_FILE_RE" || continue
+    [ "$deleted" = 0 ] || continue
+    case "$added" in ''|*[!0-9]*) continue;; 0) continue;; esac
+    fail "existing test file '$path' was changed by ADDING lines only — additive coverage belongs in a NEW test file (the reviewer refuses tests-immutable grants for pure additions); move the new tests into a new file, and modify an existing test only where its old expectation is wrong"
+  done <<< "$(git diff --no-renames --diff-filter=M --numstat "$mdrt_range" 2>/dev/null || true)"
 }
 
 # §10 — the NEW tests must ACTUALLY FAIL without the implementation (real red).

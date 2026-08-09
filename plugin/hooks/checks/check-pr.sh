@@ -161,6 +161,30 @@ if [ -f .harness/visual-ac ] \
       | sort -fu | grep -c '.')
     [ "${n_refs:-0}" -ge "$ac_items" ] \
       || fail "$ac_items AC items but the PR body references only ${n_refs:-0} evidence/ image path(s) — embed each screenshot next to its AC item (e.g. '![AC 2](evidence/ac-2-empty-state.png)' under that checklist item); a screenshot nobody links is invisible to the reviewer"
+    # Each AC item block (the item line plus the lines under it, to the next
+    # item/heading) must embed an evidence image whose ALT TEXT (≥ 12 chars)
+    # states what the shot shows — the fixer's own claim, verified against the
+    # image by the reviewer. 2026-08-09 tauri batch: 6 of 23 rejections were
+    # evidence that existed but demonstrated nothing. Twin of
+    # gate.ac_items_without_claimed_evidence / _AC_CLAIM_RE.
+    unclaimed=$(printf '%s\n' "$body" | awk '
+      function claim(s) { return tolower(s) ~ /!\[[^]]{12,}\]\([^)]*evidence\/[a-z0-9._\/-]+\.(png|jpg|jpeg|gif|webp)\)/ }
+      tolower($0) ~ /^[[:space:]]*#+[[:space:]]*acceptance criteria/ { in_ac = 1; next }
+      in_ac && /^[[:space:]]*#+[[:space:]]/ {
+        if (item && !claimed && !miss) miss = item
+        in_ac = 0; item = 0; claimed = 1; next
+      }
+      in_ac && /^[[:space:]]*[-*+][[:space:]]+\[[ xX]\]/ {
+        if (item && !claimed && !miss) miss = item
+        item++; claimed = claim($0); next
+      }
+      in_ac && item && !claimed && claim($0) { claimed = 1 }
+      END {
+        if (in_ac && item && !claimed && !miss) miss = item
+        if (miss) print miss
+      }')
+    [ -z "$unclaimed" ] \
+      || fail "AC item $unclaimed carries no evidence claim — embed its screenshot UNDER that checklist item with alt text stating what the image shows (12+ characters), e.g. '![context menu beside cursor at 200% zoom](evidence/ac-2-menu-zoom.png)'. The reviewer verifies each image against exactly its claim; before committing, re-open the image and confirm the claim is true at the asserted state (zoom level, data, theme)"
   fi
 fi
 

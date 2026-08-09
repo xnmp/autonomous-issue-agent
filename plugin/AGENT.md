@@ -112,15 +112,20 @@ don't keep going back to edit it — each re-plan costs a full model round-trip.
 
          ## Acceptance Criteria
          - [ ] the browser tab title reads "My App"
-           ![AC 1](evidence/ac-1-tab-title.png)
+           ![tab title reads "My App" on the running branch](evidence/ac-1-tab-title.png)
          - [ ] the empty list shows the "Add your first item" CTA
-           ![AC 2](evidence/ac-2-empty-state.png)
+           ![empty list with the "Add your first item" CTA visible](evidence/ac-2-empty-state.png)
 
-     The PR gate counts those checklist items and requires that many read+committed
-     screenshots AND that many `evidence/…` references in the body — a screenshot
-     nobody links is invisible to the reviewer. (A prose, non-checklist AC section
-     falls back to requiring a single screenshot, but then the reviewer has to guess
-     which criterion it proves — write the checklist.)
+     The image's ALT TEXT is your CLAIM (12+ characters): state what the shot
+     shows that proves the criterion — the state, zoom, data, or theme the
+     criterion asserts. The PR gate counts the checklist items and requires
+     that many read+committed screenshots, that many `evidence/…` references,
+     AND a claim under every item; the reviewer verifies each image against
+     exactly its claim. Before committing, re-open each image and confirm your
+     claim is actually true in it — a screenshot that exists but demonstrates
+     nothing costs a full review round. (A prose, non-checklist AC section
+     falls back to requiring a single screenshot, but then the reviewer has to
+     guess which criterion it proves — write the checklist.)
    - **Repair legs carry unaffected evidence forward.** On address-review or
      fix-CI, keep the existing capture for every acceptance criterion whose
      behavior the repair does not change. Re-capture only criteria touched by the
@@ -235,7 +240,11 @@ don't keep going back to edit it — each re-plan costs a full model round-trip.
   correction in the PR description. The gate admits up to 7 modified existing
   test files (more reads as a rewrite and is denied), and the independent
   reviewer must explicitly approve every one of them before the PR can merge,
-  so a weakened test cannot land unnoticed. Do NOT refactor unrelated code.
+  so a weakened test cannot land unnoticed. NEVER modify an existing test file
+  just to ADD tests: the gate denies a purely additive edit to an existing
+  test file outright — additive coverage goes in a NEW file (the reviewer
+  refuses those grants on policy, so it would cost a paid round anyway).
+  Do NOT refactor unrelated code.
 - Do NOT suppress a quality/security signal for the code THIS change adds or
   modifies in order to go green. The default is to fix the underlying cause:
   exclusions, threshold drops, `nosec`/`noqa`/`eslint-disable`/`# type: ignore`,

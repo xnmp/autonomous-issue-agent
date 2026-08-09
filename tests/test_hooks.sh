@@ -827,7 +827,7 @@ setup_visual_repo() {  # setup_visual_repo <n-screenshots> [<n-read>]
     fi )
   echo "$d"
 }
-AC3_LINKED=$'## Acceptance Criteria\n- [ ] one\n  ![AC 1](evidence/ac-1.png)\n- [ ] two\n  ![AC 2](evidence/ac-2.png)\n- [ ] three\n  ![AC 3](evidence/ac-3.png)\n\nFixes #7'
+AC3_LINKED=$'## Acceptance Criteria\n- [ ] one\n  ![the one state rendered](evidence/ac-1.png)\n- [ ] two\n  ![the two state rendered](evidence/ac-2.png)\n- [ ] three\n  ![the three state rendered](evidence/ac-3.png)\n\nFixes #7'
 AC3_ONE_LINK=$'## Acceptance Criteria\n- [ ] one\n- [ ] two\n- [ ] three\n\n![only one](evidence/ac-1.png)\n\nFixes #7'
 
 # 3 AC items but only 2 screenshots → blocked, message names both counts.
@@ -842,6 +842,16 @@ rm -rf "$d"
 d=$(setup_visual_repo 3)
 out=$( cd "$d" && HARNESS_SCREENSHOTS_READ="$d.trusted-screenshots-read" BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_LINKED" 2>&1 ); rc=$?
 [ "$rc" -eq 0 ] && ok "one screenshot per AC item passes" || no "one screenshot per AC item passes" "rc=$rc out=${out:0:200}"
+
+# 3 AC items, images referenced but item 1's embed carries no claim (alt text
+# under 12 chars) → blocked, message names the item and the remedy.
+AC3_UNCLAIMED=$'## Acceptance Criteria\n- [ ] one\n  ![AC 1](evidence/ac-1.png)\n- [ ] two\n  ![the two state rendered](evidence/ac-2.png)\n- [ ] three\n  ![the three state rendered](evidence/ac-3.png)\n\nFixes #7'
+d=$(setup_visual_repo 3)
+out=$( cd "$d" && HARNESS_SCREENSHOTS_READ="$d.trusted-screenshots-read" BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$AC3_UNCLAIMED" 2>&1 ); rc=$?
+{ [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q 'AC item 1 carries no evidence claim'; } \
+  && ok "AC item without an evidence claim blocked (item named)" \
+  || no "AC item without an evidence claim blocked" "rc=$rc out=${out:0:200}"
+rm -rf "$d"
 rm -rf "$d"
 
 # Enough screenshots, but the body links only one → blocked (unlinked shots are

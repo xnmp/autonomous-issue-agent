@@ -500,8 +500,12 @@ def test_referenced_evidence_images_are_distinct_paths():
 
 
 _AC3 = "## Acceptance Criteria\n- [ ] one\n- [ ] two\n- [ ] three\n\nFixes #7\n"
-_AC3_LINKED = _AC3 + (
-    "![AC 1](evidence/ac-1.png)\n![AC 2](evidence/ac-2.png)\n![AC 3](evidence/ac-3.png)\n"
+_AC3_LINKED = (
+    "## Acceptance Criteria\n"
+    "- [ ] one\n  ![the one state rendered](evidence/ac-1.png)\n"
+    "- [ ] two\n  ![the two state rendered](evidence/ac-2.png)\n"
+    "- [ ] three\n  ![the three state rendered](evidence/ac-3.png)\n"
+    "\nFixes #7\n"
 )
 
 
@@ -557,6 +561,53 @@ def test_visual_evidence_body_defaults_to_the_floor_rule():
     assert check_visual_evidence(True, ["evidence/tab.png"], ["tab.png"]).ok
 
 
+def test_visual_evidence_requires_a_claim_under_each_ac_item():
+    """Refs counted globally passed while items 1–2 carried nothing — the
+    2026-08-09 tauri batch burned 6 paid rounds on evidence that existed but
+    demonstrated nothing. The claim (alt text ≥ 12 chars) is the self-audit."""
+    body = _AC3 + (
+        "![short](evidence/ac-1.png)\n"
+        "evidence/ac-2.png\nevidence/ac-3.png\n"
+    )
+    res = check_visual_evidence(
+        True,
+        ["evidence/ac-1.png", "evidence/ac-2.png", "evidence/ac-3.png"],
+        ["ac-1.png", "ac-2.png", "ac-3.png"],
+        body,
+    )
+    assert not res.ok
+    assert "AC item 1 carries no evidence claim" in res.reason
+    assert "alt text" in res.reason
+
+
+def test_a_claimed_embed_on_the_item_line_itself_counts():
+    body = (
+        "## Acceptance Criteria\n"
+        "- [ ] one ![the one state rendered](evidence/ac-1.png)\n"
+        "\nFixes #7\n"
+    )
+    assert check_visual_evidence(
+        True, ["evidence/ac-1.png"], ["ac-1.png"], body
+    ).ok
+
+
+def test_the_first_unclaimed_item_is_named_even_mid_list():
+    body = (
+        "## Acceptance Criteria\n"
+        "- [ ] one\n  ![the one state rendered](evidence/ac-1.png)\n"
+        "- [ ] two\n  ![](evidence/ac-2.png)\n"
+        "- [ ] three\n  ![the three state rendered](evidence/ac-3.png)\n"
+    )
+    res = check_visual_evidence(
+        True,
+        ["evidence/ac-1.png", "evidence/ac-2.png", "evidence/ac-3.png"],
+        ["ac-1.png", "ac-2.png", "ac-3.png"],
+        body,
+    )
+    assert not res.ok
+    assert "AC item 2 carries no evidence claim" in res.reason
+
+
 def test_editing_an_existing_test_is_an_automatic_exemption_request():
     # ADR 0014 revised (2026-08-03): the diff IS the declaration. Within the
     # scope bound the edit is ADMITTED so the reviewer can judge it — it
@@ -572,6 +623,49 @@ def test_editing_an_existing_test_is_an_automatic_exemption_request():
     assert check_tests_immutable(["tests/test_new.py"], lambda f: f in existed).ok
     # ...and a change touching no test at all is untouched by it either way.
     assert check_tests_immutable(["src/app.py"], lambda f: f in existed).ok
+
+
+def test_a_purely_additive_edit_to_an_existing_test_is_denied_with_the_move():
+    """2026-08-09 tauri batch: 4 paid rounds were the reviewer refusing
+    tests-immutable grants for pure additions ('additive coverage belongs in a
+    new test file'). The gate now says so at commit time, where the move is
+    free."""
+    existed = {"tests/test_app.py"}
+    res = check_tests_immutable(
+        ["tests/test_app.py"],
+        lambda f: f in existed,
+        additive_only=("tests/test_app.py",),
+    )
+    assert not res.ok
+    assert "ADDING lines only" in res.reason
+    assert "tests/test_app.py" in res.reason
+    assert "NEW test file" in res.reason
+
+
+def test_a_correction_with_removed_lines_still_auto_declares():
+    # Any non-test additive file in the set must not trip the rule, and a test
+    # file with real removals (not in additive_only) keeps the ADR 0014 path.
+    existed = {"tests/test_app.py"}
+    assert check_tests_immutable(
+        ["tests/test_app.py", "src/app.py"],
+        lambda f: f in existed,
+        additive_only=("src/app.py",),
+    ).ok
+    assert check_tests_immutable(
+        ["tests/test_app.py"],
+        lambda f: f in existed,
+        additive_only=(),
+    ).ok
+
+
+def test_a_new_test_file_is_never_denied_for_being_additive():
+    # A brand-new test file is additive by definition and is the REMEDY the
+    # denial names — it must never itself trip the rule.
+    assert check_tests_immutable(
+        ["tests/test_new.py"],
+        lambda f: False,
+        additive_only=("tests/test_new.py",),
+    ).ok
 
 
 def test_a_mass_test_rewrite_is_still_denied_at_the_scope_bound():

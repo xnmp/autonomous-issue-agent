@@ -514,6 +514,38 @@ def _forged_screenshot_repo(tmp_path: Path) -> Path:
     return repo
 
 
+def _evidence_repo(tmp_path: Path) -> Path:
+    """A visual PR with one committed evidence image and no receipt file —
+    the receiptless pass-through shape, for body-side (claim) cases."""
+    repo = _visual_repo(tmp_path)
+    commit_evidence(repo, "evidence/ac-1.png")
+    return repo
+
+
+def _additive_test_repo(tmp_path: Path) -> Path:
+    """A branch that appends a NEW test to an EXISTING test file — a purely
+    additive edit (numstat deletions 0). Both stacks must deny with the
+    move-to-a-new-file remedy (2026-08-09 tauri batch: 4 paid review rounds
+    were the reviewer refusing exactly this shape)."""
+    repo = fresh_repo(tmp_path)
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_keep.py").write_text("def test_keep(): assert True\n")
+    _git(repo, "add", "tests/test_keep.py")
+    _git(repo, "commit", "-qm", "test: baseline")
+    (repo / ".harness").mkdir()
+    _git(repo, "switch", "-qc", "fix/13-additive")
+    (repo / "tests" / "test_new_regression.py").write_text("def test_new(): assert True\n")
+    _git(repo, "add", "tests/test_new_regression.py")
+    _git(repo, "commit", "-qm", "red: new")
+    (repo / "tests" / "test_keep.py").write_text(
+        "def test_keep(): assert True\ndef test_more(): assert True\n"
+    )
+    (repo / "impl.py").write_text("x = 1\n")
+    _git(repo, "add", "tests/test_keep.py", "impl.py")
+    _git(repo, "commit", "-qm", "green: impl + append a test")
+    return repo
+
+
 def _duplicate_evidence_repo(tmp_path: Path) -> Path:
     repo = _visual_repo(tmp_path)
     commit_evidence(repo, "evidence/ac-1.png", b"\x89PNG same bytes")
@@ -691,6 +723,32 @@ GOLDEN: tuple[Case, ...] = (
         False,
         reason_contains="byte-identical",
     ),
+    # Each AC checklist item must embed its evidence with a CLAIM (alt text
+    # ≥ 12 chars stating what the image shows). 2026-08-09 tauri batch: 6 of
+    # 23 review rejections were evidence that existed but demonstrated
+    # nothing — the claim moves that self-audit to commit time.
+    Case(
+        "visual_ac_item_without_claim",
+        "pr",
+        _evidence_repo,
+        _pr_argv(
+            body="## Acceptance Criteria\n- [ ] token works\n"
+            "![AC 1](evidence/ac-1.png)\n\nFixes #7"
+        ),
+        False,
+        reason_contains="carries no evidence claim",
+    ),
+    Case(
+        "visual_ac_item_with_claim",
+        "pr",
+        _evidence_repo,
+        _pr_argv(
+            body="## Acceptance Criteria\n- [ ] token works\n"
+            "![token banner rendered on the running branch](evidence/ac-1.png)\n"
+            "\nFixes #7"
+        ),
+        True,
+    ),
     # tests-immutable is AUTO-DECLARED from the diff since 2026-08-03: a
     # modified existing test is admitted (the reviewer must grant it before
     # merge), and only a mass rewrite past the scope bound denies. Both stacks
@@ -704,6 +762,12 @@ GOLDEN: tuple[Case, ...] = (
     # this file before merge) is the authority that can.
     Case("existing_test_weakened_admitted", "pr", _weakened_test_repo,
          _pr_argv(), True, env={"TEST_CMD": "test -f impl.py"}),
+    # …but a PURELY ADDITIVE edit (no removed/changed line) denies on both
+    # stacks: the reviewer refuses those grants on policy, so the gate says
+    # "new file" at commit time instead of costing a paid round.
+    Case("existing_test_purely_additive_denied", "pr", _additive_test_repo,
+         _pr_argv(), False, env={"TEST_CMD": "test -f impl.py"},
+         reason_contains="ADDING lines only"),
     Case("existing_tests_mass_rewrite", "pr", _rewritten_tests_repo,
          _pr_argv(), False, env={"TEST_CMD": "test -f impl.py"},
          reason_contains="existing test files"),
@@ -929,7 +993,10 @@ def test_golden_covers_every_rule_family() -> None:
         "visual_ac_with_read_screenshot": "evidence",
         "visual_ac_receiptless_passes_through": "evidence",
         "visual_ac_byte_identical_evidence": "evidence",
+        "visual_ac_item_without_claim": "evidence",
+        "visual_ac_item_with_claim": "evidence",
         "existing_test_modified_admitted": "exemptions",
+        "existing_test_purely_additive_denied": "exemptions",
         "existing_test_weakened_admitted": "exemptions",
         "existing_tests_mass_rewrite": "exemptions",
         "required_test_declared": "exemptions",
