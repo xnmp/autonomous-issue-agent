@@ -63,7 +63,8 @@ describe("OverviewTab hierarchy", () => {
       .toBeTruthy();
     expect(metrics!.compareDocumentPosition(actions!) & Node.DOCUMENT_POSITION_FOLLOWING)
       .toBeTruthy();
-    expect(screen.queryByRole("heading", { name: "Overview" })).not.toBeInTheDocument();
+    // No VISIBLE page heading — but screen-reader heading navigation keeps one.
+    expect(screen.getByRole("heading", { name: "Overview" })).toHaveClass("sr-only");
     expect(screen.queryByText("Needs attention")).not.toBeInTheDocument();
     expect(screen.queryByText(/Reconciles every/)).not.toBeInTheDocument();
     expect(screen.getByRole("region", { name: "Spending caps" })).toHaveTextContent(

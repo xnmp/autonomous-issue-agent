@@ -279,6 +279,11 @@ export function IssuesTab({
     // anchor prop, and none of them can drift apart.
     <SnapshotAnchor.Provider value={issues.updatedAt}>
     <div className="tabbody" onContextMenu={openColumnMenu}>
+      {/* The visible <h1> was removed by design; screen-reader heading
+          navigation still needs the page identified. */}
+      <h1 className="sr-only">
+        {sub === "inflight" ? "In-flight issues" : sub === "done" ? "Done issues" : "Backlog"}
+      </h1>
       {!ghOk ? <div className="row"><span className="spacer" /><GhUnavailableChip /></div> : null}
       <ColumnMenu
         columns={COLUMN_CHOICES[sub]}

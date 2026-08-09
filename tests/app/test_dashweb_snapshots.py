@@ -2394,7 +2394,10 @@ def test_all_green_checks_read_as_passing():
 
 
 @pytest.mark.parametrize(
-    "verdict", ["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"]
+    "verdict",
+    # STALE is terminal (the check will not re-run on this head): without it a
+    # stale check read "pending" forever.
+    ["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STALE"],
 )
 def test_one_bad_check_reads_as_failing_even_beside_greens_and_pendings(verdict):
     card = review_card(statusCheckRollup=[

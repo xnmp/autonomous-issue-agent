@@ -61,6 +61,9 @@ export function OverviewTab({
 
   return (
     <div className="tabbody">
+      {/* The visible <h1> was removed by design; screen-reader heading
+          navigation still needs the page identified. */}
+      <h1 className="sr-only">Overview</h1>
       {ov.error ? (
         <ErrorBanner message={ov.error} onRetry={ov.refresh} stale={!!ov.data} />
       ) : null}
@@ -369,7 +372,9 @@ function CopyLogPathButton({ path, role }: { path: string; role: string }) {
       </button>
       {notice ? (
         <span className={`log-copy-toast${notice === "failed" ? " tone-fail" : ""}`} role="status">
-          {notice === "copied" ? "Log path copied" : "Couldn’t copy log path"}
+          {/* No clipboard (non-localhost http) must still hand over the path:
+              show it selectable instead of a dead-end error. */}
+          {notice === "copied" ? "Log path copied" : `Couldn’t copy — ${path}`}
         </span>
       ) : null}
     </span>

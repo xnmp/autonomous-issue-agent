@@ -1087,6 +1087,15 @@
   white-space: nowrap;
 }
 
+/* Must out-rank the earlier .tone-fail AND the toast's own green: the failure
+   toast carries the path itself, so it wraps instead of clipping. */
+.log-copy-toast.tone-fail {
+  color: var(--fail);
+  white-space: normal;
+  word-break: break-all;
+  user-select: text;
+}
+
 @media (max-width: 1080px) {
   .overview-metrics-primary {
     grid-template-columns: repeat(2, minmax(0, 1fr));

@@ -1761,6 +1761,9 @@ _CI_FAILURE = {
     "CANCELLED",
     "ACTION_REQUIRED",
     "STARTUP_FAILURE",
+    # STALE is terminal too (the check was invalidated and will not re-run on
+    # this head); leaving it out let a stale check read "pending" forever.
+    "STALE",
 }
 _CI_SUCCESS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 
