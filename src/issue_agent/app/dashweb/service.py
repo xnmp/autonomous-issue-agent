@@ -535,7 +535,11 @@ class Backend:
                     gh_issues.get(number, {}),
                 )
                 pending.append(
-                    snapshots.pending_card(issue, row_by_issue.get(number))
+                    snapshots.pending_card(
+                        issue,
+                        row_by_issue.get(number),
+                        gh_prs=gh_prs,
+                    )
                 )
             for number in sorted(backlog_numbers):
                 issue = _projected_issue(
@@ -557,7 +561,9 @@ class Backend:
                 if "ai-ready" in labels:
                     pending.append(
                         snapshots.pending_card(
-                            issue, row_by_issue.get(number)
+                            issue,
+                            row_by_issue.get(number),
+                            gh_prs=gh_prs,
                         )
                     )
                 elif snapshots.is_backlog(issue):

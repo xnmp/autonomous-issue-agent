@@ -35,6 +35,16 @@ describe("Histogram", () => {
     expect(bars[1]).toHaveStyle({ height: "100%" });
   });
 
+  it("draws two subtly labelled y-axis gridlines", () => {
+    const { container } = render(
+      <Histogram bars={[bar("a", 3), bar("b", 9)]} />,
+    );
+
+    expect(container.querySelectorAll(".hist-gridline")).toHaveLength(2);
+    expect(screen.getByText("$3.00")).toBeInTheDocument();
+    expect(screen.getByText("$6.00")).toBeInTheDocument();
+  });
+
   it("states the window, the total and the peak for a screen reader", () => {
     render(
       <Histogram

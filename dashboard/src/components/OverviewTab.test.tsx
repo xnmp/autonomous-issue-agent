@@ -45,7 +45,14 @@ function overview(interventionCount = 0) {
       headers: { "Content-Type": "application/json" },
     })),
   );
-  return render(<OverviewTab repo="demo" onOpenIssues={vi.fn()} />);
+  return render(
+    <OverviewTab
+      repo="demo"
+      onOpenIssues={vi.fn()}
+      showDaemonHealth
+      showIssueHealthTrend
+    />,
+  );
 }
 
 describe("OverviewTab hierarchy", () => {

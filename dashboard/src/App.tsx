@@ -37,6 +37,18 @@ import { ToastStack } from "./components/ToastStack";
 const TOP_POLL_MS = 10_000;
 const OPTIONS_STORAGE = "issue-agent.dashboard.options";
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function storedBoolean(
+  stored: Record<string, unknown>,
+  key: keyof DashboardOptions,
+  fallback: boolean,
+): boolean {
+  return stored[key] === undefined ? fallback : stored[key] === true;
+}
+
 function priorityFromLabels(labels: string[]): Priority {
   const priority = labels
     .map((label) => label.toUpperCase())
@@ -84,16 +96,38 @@ function storedOptions(): DashboardOptions {
     showProjectedCost: true,
     showPerRepoQuotas: true,
     showDurationSeconds: true,
+    showOverviewDaemonHealth: false,
+    showOverviewIssueHealthTrend: false,
     theme: "cosmic-dusk",
   };
   try {
-    const stored = {
-      ...defaults,
-      ...JSON.parse(localStorage.getItem(OPTIONS_STORAGE) ?? "{}"),
-    } as DashboardOptions;
-    return DASHBOARD_THEMES.some(([theme]) => theme === stored.theme)
-      ? stored
-      : defaults;
+    const parsed: unknown = JSON.parse(
+      localStorage.getItem(OPTIONS_STORAGE) ?? "{}",
+    );
+    if (!isRecord(parsed)) return defaults;
+    const theme = DASHBOARD_THEMES.some(([candidate]) => candidate === parsed.theme)
+      ? parsed.theme as DashboardOptions["theme"]
+      : defaults.theme;
+    return {
+      showProjectedCost: storedBoolean(
+        parsed, "showProjectedCost", defaults.showProjectedCost,
+      ),
+      showPerRepoQuotas: storedBoolean(
+        parsed, "showPerRepoQuotas", defaults.showPerRepoQuotas,
+      ),
+      showDurationSeconds: storedBoolean(
+        parsed, "showDurationSeconds", defaults.showDurationSeconds,
+      ),
+      showOverviewDaemonHealth: storedBoolean(
+        parsed, "showOverviewDaemonHealth", defaults.showOverviewDaemonHealth,
+      ),
+      showOverviewIssueHealthTrend: storedBoolean(
+        parsed,
+        "showOverviewIssueHealthTrend",
+        defaults.showOverviewIssueHealthTrend,
+      ),
+      theme,
+    };
   } catch {
     return defaults;
   }
@@ -356,6 +390,8 @@ export default function App() {
             reposLoading={repos.loading}
             showProjectedCost={options.showProjectedCost}
             showDurationSeconds={options.showDurationSeconds}
+            showOverviewDaemonHealth={options.showOverviewDaemonHealth}
+            showOverviewIssueHealthTrend={options.showOverviewIssueHealthTrend}
           />
         </div>
       </main>
@@ -381,6 +417,8 @@ function Body({
   reposLoading,
   showProjectedCost,
   showDurationSeconds,
+  showOverviewDaemonHealth,
+  showOverviewIssueHealthTrend,
 }: {
   route: Route;
   selectedRepo: string | null;
@@ -393,6 +431,8 @@ function Body({
   reposLoading: boolean;
   showProjectedCost: boolean;
   showDurationSeconds: boolean;
+  showOverviewDaemonHealth: boolean;
+  showOverviewIssueHealthTrend: boolean;
 }) {
   if (route.view === "verification") return <VerificationTab />;
   if (route.view === "issue") {
@@ -422,6 +462,8 @@ function Body({
       <OverviewTab
         repo={selectedRepo}
         onOpenIssues={onSetSub}
+        showDaemonHealth={showOverviewDaemonHealth}
+        showIssueHealthTrend={showOverviewIssueHealthTrend}
       />
     );
   }

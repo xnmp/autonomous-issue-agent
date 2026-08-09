@@ -21,6 +21,7 @@ from issue_agent.domain.events import (
     EventEnvelope,
     Producer,
     SpendBlocked,
+    TriageDispositionRecorded,
     WorldObserved,
 )
 from issue_agent.domain.labels import LIFECYCLE_LABELS
@@ -966,6 +967,29 @@ def test_a_parked_issue_renders_as_a_held_pending_row_with_the_parked_reason():
     assert (card["held"], card["hold_reason"]) == (True, "parked")
 
 
+def test_a_parked_pending_card_keeps_its_pr_link_and_ci_state():
+    row = replace(row_for([RESOLVE], 7), prs=(179,))
+    card = snapshots.pending_card(
+        {"number": 7, "labels": ["ai-parked", "ai-triage"]},
+        row,
+        gh_prs={
+            179: {
+                "url": "https://github.com/o/r/pull/179",
+                "state": "OPEN",
+                "statusCheckRollup": [
+                    {"conclusion": "SUCCESS"},
+                    {"conclusion": "NEUTRAL"},
+                ],
+            }
+        },
+    )
+
+    assert card["pr"] == 179
+    assert card["pr_url"] == "https://github.com/o/r/pull/179"
+    assert card["pr_state"] == "open"
+    assert card["pr_ci_state"] == "passing"
+
+
 def test_a_parked_issue_leaves_the_in_flight_lane_for_pending():
     # Park moves an issue off the active board even mid-history: an operator
     # decision outranks whatever legs or holds the journal accumulated.
@@ -1031,6 +1055,91 @@ def test_backlog_card_uses_journal_recurrence_count_when_available():
         row,
     )
     assert card["recurrence_count"] == 2
+
+
+@pytest.mark.parametrize(
+    ("labels", "expected"),
+    [([], "raw"), (["ai-triage"], "processed")],
+)
+def test_backlog_card_preserves_pre_marker_steward_states(labels, expected):
+    card = snapshots.backlog_card({"number": 3, "labels": labels}, NOW)
+
+    assert card["steward_state"] == expected
+
+
+@pytest.mark.parametrize(
+    ("states", "expected"),
+    [
+        (["blocked_on_human_reply"], "blocked_on_human_reply"),
+        (["blocked_on_human_reply", "processed"], "processed"),
+    ],
+)
+def test_backlog_card_uses_the_latest_folded_triage_disposition(states, expected):
+    events = [
+        v2_event(
+            WorldObserved(
+                "issue", 3, "issue-hash",
+                {"present": True, "state": "OPEN", "labels": ["ai-triage"]},
+            ),
+            "world", 0, issue=3,
+        ),
+        *[
+            v2_event(
+                TriageDispositionRecorded(state),
+                f"triage-{index}", index, role="steward", issue=3,
+            )
+            for index, state in enumerate(states, start=1)
+        ],
+    ]
+    row = v2_deployment(events).issues[0]
+    card = snapshots.backlog_card(
+        {"number": 3, "labels": ["ai-triage"]}, NOW, row,
+    )
+
+    assert card["steward_state"] == expected
+    assert snapshots.backlog_card(
+        {"number": 3, "labels": []}, NOW, row,
+    )["steward_state"] == "raw"
+
+
+@pytest.mark.parametrize(
+    ("comments", "expected"),
+    [
+        (
+            [{"body": "**A quick check before we start** 🛠️\n\nQuestion"}],
+            "blocked_on_human_reply",
+        ),
+        (
+            [
+                {"body": "**A quick check before we start** 🛠️\n\nQuestion"},
+                {"body": "**Ready to build ✅**\n\nThanks"},
+            ],
+            "processed",
+        ),
+        ([{"body": ["malformed"]}, "not a comment"], "processed"),
+    ],
+)
+def test_backlog_card_migrates_pre_marker_state_from_folded_comments(
+    comments, expected,
+):
+    row = v2_deployment([
+        v2_event(
+            WorldObserved(
+                "issue", 3, "issue-hash",
+                {
+                    "present": True,
+                    "state": "OPEN",
+                    "labels": ["ai-triage"],
+                    "comments": comments,
+                },
+            ),
+            "world", 0, issue=3,
+        ),
+    ]).issues[0]
+
+    assert snapshots.backlog_card(
+        {"number": 3, "labels": ["ai-triage"]}, NOW, row,
+    )["steward_state"] == expected
 
 
 def test_backlog_card_survives_a_missing_created_at_and_list_shaped_comments():

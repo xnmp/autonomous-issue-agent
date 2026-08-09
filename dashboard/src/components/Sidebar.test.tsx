@@ -27,6 +27,8 @@ const options: DashboardOptions = {
   showProjectedCost: false,
   showPerRepoQuotas: false,
   showDurationSeconds: false,
+  showOverviewDaemonHealth: false,
+  showOverviewIssueHealthTrend: false,
   theme: "cosmic-dusk" as DashboardOptions["theme"],
 };
 

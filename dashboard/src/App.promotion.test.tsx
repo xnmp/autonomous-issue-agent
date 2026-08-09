@@ -48,6 +48,7 @@ const backlogIssue = {
   labels: ["feature"],
   recurrence: false,
   recurrence_count: 0,
+  steward_state: "raw",
   age_days: 0,
   comments: 0,
   issue_type: "feature",

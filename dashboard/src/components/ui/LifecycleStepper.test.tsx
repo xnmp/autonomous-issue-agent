@@ -66,6 +66,18 @@ describe("LifecycleStepper", () => {
     expect(screen.getByLabelText("3 attempts")).toHaveTextContent("×3");
   });
 
+  it("marks the currently running stage for bold label treatment", () => {
+    render(
+      <LifecycleStepper
+        steps={[cardStep({ state: "running", status: null })]}
+        stage="resolving"
+      />,
+    );
+
+    const label = screen.getByText("Resolve");
+    expect(label).toHaveClass("life-label-active");
+  });
+
   it("does not complete CI from a successful repair leg while review is still active", () => {
     const steps = [
       cardStep({ kind: "RESOLVE" }),

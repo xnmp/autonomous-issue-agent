@@ -42,6 +42,7 @@ const BacklogCard = z
     labels: z.array(z.string()),
     recurrence: z.boolean(),
     recurrence_count: z.number().int(),
+    steward_state: z.enum(["raw", "processed", "blocked_on_human_reply"]),
     title: z.union([z.string(), z.null()]),
     url: z.union([z.string(), z.null()]),
   })
@@ -125,6 +126,12 @@ const PendingCard = z
     issue: z.number().int(),
     labels: z.array(z.string()),
     overlap: z.union([z.unknown(), z.null()]),
+    pr: z.union([z.number(), z.null()]).optional(),
+    pr_ci_state: z
+      .union([z.enum(["passing", "failing", "pending"]), z.null()])
+      .optional(),
+    pr_state: z.union([z.string(), z.null()]).optional(),
+    pr_url: z.union([z.string(), z.null()]).optional(),
     priority: z.union([z.enum(["P1", "P2", "P3"]), z.null()]),
     title: z.union([z.string(), z.null()]),
     url: z.union([z.string(), z.null()]),

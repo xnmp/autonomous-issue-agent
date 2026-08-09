@@ -173,10 +173,11 @@ export function StackedBar({
 }
 
 /* ----------------------------------------------------------- Histogram ---
- * One series over evenly spaced, dense buckets (spend per hour). Per the
- * dataviz mark spec: a shared baseline, no gridlines behind 48 thin bars, one
- * fixed slot colour (a single series never cycles), and a value in every
- * bucket's tooltip. Empty buckets render as a gap ON the baseline rather than
+ * One series over evenly spaced, dense buckets (spend per hour). Two quiet,
+ * directly labelled gridlines make magnitudes comparable without turning the
+ * compact plot into graph paper. A fixed slot colour (a single series never
+ * cycles) and a value in every bucket's tooltip carry the series. Empty
+ * buckets render as a gap ON the baseline rather than
  * as a hairline — the series is dense precisely so a quiet night cannot be
  * re-spaced into a busy one, and a stub bar would read as a small charge.
  */
@@ -218,6 +219,17 @@ export function Histogram({
         role="img"
         aria-label={`${subject}across ${bars.length} buckets from ${bars[0]!.label} to ${bars[bars.length - 1]!.label}: ${formatValue(total)} in total, peaking at ${formatValue(peak.value)} in ${peak.label}`}
       >
+        <div className="hist-grid" aria-hidden="true">
+          {[1 / 3, 2 / 3].map((ratio) => (
+            <span
+              className="hist-gridline"
+              key={ratio}
+              style={{ bottom: `${ratio * 100}%` }}
+            >
+              <span className="hist-grid-label num">{formatValue(max * ratio)}</span>
+            </span>
+          ))}
+        </div>
         {bars.map((bar) => (
           <div
             key={bar.key}

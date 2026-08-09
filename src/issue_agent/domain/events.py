@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache
 from types import MappingProxyType
-from typing import Any, ClassVar, Mapping, TypeVar, get_origin, get_type_hints
+from typing import Any, ClassVar, Literal, Mapping, TypeVar, get_origin, get_type_hints
 
 from .repository import canonical_repository
 
@@ -376,6 +376,18 @@ class RecurrenceDetected(EventPayload):
     kind: str
     original_issue: int | None
     signature: str = ""
+
+
+@event_type("issue.triage.disposition.v1")
+@dataclass(frozen=True)
+class TriageDispositionRecorded(EventPayload):
+    """Harness-minted state marker; no classifier prose crosses this boundary."""
+
+    triage_state: Literal["processed", "blocked_on_human_reply"]
+
+    def __post_init__(self) -> None:
+        if self.triage_state not in {"processed", "blocked_on_human_reply"}:
+            raise ValueError("triage disposition state is invalid")
 
 
 @event_type("review.skipped.v1")

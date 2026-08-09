@@ -53,6 +53,7 @@ from ..domain.events import (
     TelemetryEvent,
     TelemetryWarning,
     TickGated,
+    TriageDispositionRecorded,
     Correlation,
 )
 from ..domain.outcome import AgentResult, ExitReason, deterministic_death
@@ -240,6 +241,11 @@ def _legacy_event_record(event: TelemetryEvent) -> tuple[str, dict[str, object]]
             "kind": payload.kind,
             "of_issue": payload.original_issue,
             "block_key": payload.signature,
+        }
+    if isinstance(payload, TriageDispositionRecorded):
+        return "triage_disposition", {
+            **common,
+            "triage_state": payload.triage_state,
         }
     if isinstance(payload, ReviewSkipped):
         return "review_skip", {

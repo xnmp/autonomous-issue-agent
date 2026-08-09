@@ -160,6 +160,15 @@
             "title": "Recurrence Count",
             "type": "integer"
           },
+          "steward_state": {
+            "enum": [
+              "raw",
+              "processed",
+              "blocked_on_human_reply"
+            ],
+            "title": "Steward State",
+            "type": "string"
+          },
           "title": {
             "anyOf": [
               {
@@ -192,7 +201,8 @@
           "recurrence",
           "recurrence_count",
           "age_days",
-          "comments"
+          "comments",
+          "steward_state"
         ],
         "title": "BacklogCard",
         "type": "object"
@@ -2188,6 +2198,55 @@
               }
             ],
             "title": "Overlap"
+          },
+          "pr": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr"
+          },
+          "pr_ci_state": {
+            "anyOf": [
+              {
+                "enum": [
+                  "passing",
+                  "failing",
+                  "pending"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr Ci State"
+          },
+          "pr_state": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr State"
+          },
+          "pr_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Pr Url"
           },
           "priority": {
             "anyOf": [

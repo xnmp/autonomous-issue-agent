@@ -14,11 +14,21 @@ from issue_agent.app.workflows.jira import JiraSyncWorkflow, JiraSyncWorkflowCon
 from issue_agent.app.workflows.steward import StewardWorkflow, StewardWorkflowConfig
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
+from issue_agent.domain.events import TriageDispositionRecorded
 from issue_agent.app.planners.tasks import GroomTaskConfig, JiraTaskConfig, TriageTaskConfig
 from issue_agent.domain.triage import TriageConfig
 from issue_agent.domain.world import Comment, IssueView
 
 from test_dispatch import FakeGateway, FakeRunner, FakeStore, FakeWorktrees
+
+
+class RecordingJournal:
+    def __init__(self):
+        self.events = []
+
+    def emit(self, event):
+        assert isinstance(event.payload, TriageDispositionRecorded)
+        self.events.append(event)
 
 
 def test_steward_triage_promotes_ready_issue_and_records_post_action_updated_at():
@@ -52,10 +62,12 @@ def test_steward_triage_promotes_ready_issue_and_records_post_action_updated_at(
         "blocked_by_issues": [],
         "rationale": "enough detail",
     }))
+    journal = RecordingJournal()
     cfg = StewardWorkflowConfig(
         triage=TriageTaskConfig("steward-bot", triage_prompt="T"),
         triage_cfg=TriageConfig("steward-bot", enabled=True, promote=True),
         log=lambda _m: None,
+        journal=journal,
     )
     executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
 
@@ -63,6 +75,7 @@ def test_steward_triage_promotes_ready_issue_and_records_post_action_updated_at(
 
     assert any(c[0] == "relabel" and c[4] == "ai-ready" for c in gw.calls)
     assert store.triage_at[7] == "after"
+    assert [event.payload.triage_state for event in journal.events] == ["processed"]
 
 
 def test_steward_triage_blocked_asks_author_and_records_updated_at():
@@ -86,10 +99,12 @@ def test_steward_triage_blocked_asks_author_and_records_updated_at():
             "acceptance_criteria": [],
         },
     ))
+    journal = RecordingJournal()
     cfg = StewardWorkflowConfig(
         triage=TriageTaskConfig("steward-bot", triage_prompt="T"),
         triage_cfg=TriageConfig("steward-bot", enabled=True),
         log=lambda _m: None,
+        journal=journal,
     )
     executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
 
@@ -98,6 +113,9 @@ def test_steward_triage_blocked_asks_author_and_records_updated_at():
     assert any(c[0] == "comment" and "@alice" in c[3] for c in gw.calls)
     assert ("relabel", "issue", 7, None, "ai-triage") in gw.calls
     assert store.triage_at[7] == "t_post"
+    assert [event.payload.triage_state for event in journal.events] == [
+        "blocked_on_human_reply"
+    ]
 
 
 def test_steward_triage_error_leaves_state_untouched():

@@ -33,9 +33,13 @@ const POLL_MS = 10_000;
 export function OverviewTab({
   repo,
   onOpenIssues,
+  showDaemonHealth = false,
+  showIssueHealthTrend = false,
 }: {
   repo: string;
   onOpenIssues: (sub: "inflight" | "done") => void;
+  showDaemonHealth?: boolean;
+  showIssueHealthTrend?: boolean;
 }) {
   const ov = usePolled(
     `overview:${repo}`,
@@ -147,20 +151,22 @@ export function OverviewTab({
         />
       </div>
 
-      <section className="overview-health panel">
-        <div className="panel-hd">
-          <span className="panel-title">Daemon health</span>
-          <span className="faint">live role journals</span>
-        </div>
-        <div className="panel-bd health-list">
-          {(ov.data?.health ?? []).length === 0 && !ov.loading ? (
-            <EmptyState>no role journals found for this deployment</EmptyState>
-          ) : null}
-          {(ov.data?.health ?? []).map((h) => (
-            <HealthRow key={h.role} health={h} />
-          ))}
-        </div>
-      </section>
+      {showDaemonHealth ? (
+        <section className="overview-health panel">
+          <div className="panel-hd">
+            <span className="panel-title">Daemon health</span>
+            <span className="faint">live role journals</span>
+          </div>
+          <div className="panel-bd health-list">
+            {(ov.data?.health ?? []).length === 0 && !ov.loading ? (
+              <EmptyState>no role journals found for this deployment</EmptyState>
+            ) : null}
+            {(ov.data?.health ?? []).map((h) => (
+              <HealthRow key={h.role} health={h} />
+            ))}
+          </div>
+        </section>
+      ) : null}
 
       <section className={`panel operator-actions-panel${(ov.data?.interventions ?? []).length > 0 ? " operator-actions-active" : ""}`}>
         <div className="panel-hd">
@@ -177,7 +183,9 @@ export function OverviewTab({
 
       <SpendPerHour buckets={ov.data?.spend_per_hour ?? []} />
 
-      <HealthTrend rows={ov.data?.health_trend ?? []} loading={ov.loading} />
+      {showIssueHealthTrend ? (
+        <HealthTrend rows={ov.data?.health_trend ?? []} loading={ov.loading} />
+      ) : null}
 
       <UnattributedCount count={ov.data?.unattributed_count ?? 0} />
     </div>

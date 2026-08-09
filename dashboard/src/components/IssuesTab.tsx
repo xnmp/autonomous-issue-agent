@@ -24,7 +24,6 @@ import type {
 import type { IssuesSub } from "../routing/hash";
 import {
   blocksOnHuman,
-  combinedVerificationStatus,
   difficultyTone,
   familyVar,
   flagTone,
@@ -34,9 +33,6 @@ import {
   modelTone,
   prReviewMark,
   stepOutcomeTone,
-  verificationGlyph,
-  verificationSummary,
-  verificationTone,
   type Tone,
 } from "../lib/semantics";
 import {
@@ -50,7 +46,6 @@ import {
   usd,
 } from "../lib/format";
 import { shortModel } from "../lib/models";
-import { readFlag, writeFlag } from "../lib/prefs";
 import { Chip } from "./ui/Chip";
 import { EtaProgress } from "./ui/Charts";
 import { StepBadge } from "./ui/StepBadge";
@@ -113,7 +108,6 @@ const COLUMN_CHOICES: Record<IssuesSub, ColumnChoice[]> = {
   done: [
     { key: "cost", label: "Cost" },
     { key: "duration", label: "Duration" },
-    { key: "verification", label: "Verification" },
     { key: "model", label: "Model" },
     { key: "rounds", label: "Rounds" },
     { key: "labels", label: "Labels" },
@@ -149,10 +143,6 @@ const DEFAULT_VISIBILITY: Visibility = {
     ]),
   ),
 };
-
-/** Done rows carry one wordy badge (the verification verdict); an operator
- * scanning fifty merged issues wants the column narrow, not readable. */
-const ICON_BADGES_STORAGE = "issue-agent.dashboard.done-icon-badges";
 
 function storedVisibility(): Visibility {
   try {
@@ -213,7 +203,6 @@ export function IssuesTab({
     done: "",
     backlog: "",
   });
-  const [iconBadges, setIconBadges] = useState(() => readFlag(ICON_BADGES_STORAGE, false));
   const [columnMenuAt, setColumnMenuAt] = useState<{ x: number; y: number } | null>(null);
   const data = issues.data;
   const ghOk = data?.gh_ok ?? true;
@@ -355,31 +344,12 @@ export function IssuesTab({
 
       {sub === "done" && hasMatches ? (
         <>
-          <SectionTitle
-            right={
-              <button
-                className="btn btn-xs"
-                type="button"
-                aria-pressed={iconBadges}
-                title="Show the verification verdict as an icon only; the full verdict and its reason stay on hover"
-                onClick={() => {
-                  const next = !iconBadges;
-                  setIconBadges(next);
-                  writeFlag(ICON_BADGES_STORAGE, next);
-                }}
-              >
-                Badges: {iconBadges ? "icons" : "words"}
-              </button>
-            }
-          >
-            Done
-          </SectionTitle>
+          <SectionTitle>Done</SectionTitle>
           <DoneTable
             repo={repo}
             cards={filteredDone}
             loading={issues.loading}
             visible={visible}
-            iconBadges={iconBadges}
             onOpen={onOpenIssue}
             onRefresh={issues.refresh}
             showDurationSeconds={showDurationSeconds}
@@ -414,7 +384,7 @@ function filterCards<T extends FilterableCard>(cards: T[], query: string): T[] {
     const details = isIssueCard(card)
       ? [card.stage, card.pr, ...card.models, ...card.flags]
       : isPendingCard(card)
-        ? [card.priority, card.hold_reason]
+        ? [card.priority, card.hold_reason, card.pr]
         : [card.issue_type, card.difficulty, card.impact, card.body];
     return [...common, ...details]
       .some((value) => String(value ?? "").toLowerCase().includes(query));
@@ -694,7 +664,10 @@ function PendingTable({
                     <td>
                       <div className="issue-summary">
                         <span className={`chev${open ? " open" : ""}`} aria-hidden="true">▸</span>
-                        <CompactIssue issue={card.issue} title={card.title} url={card.url} />
+                        <div className="issue-summary-main">
+                          <CompactIssue issue={card.issue} title={card.title} url={card.url} />
+                          <div className="row-wrap"><PrLink card={card} /></div>
+                        </div>
                       </div>
                     </td>
                     {visible.has("pending-priority") ? <td onClick={(event) => event.stopPropagation()}>
@@ -798,7 +771,6 @@ function DoneTable({
   cards,
   loading,
   visible,
-  iconBadges,
   onOpen,
   onRefresh,
   showDurationSeconds,
@@ -807,7 +779,6 @@ function DoneTable({
   cards: IssueCard[];
   loading: boolean;
   visible: ReadonlySet<string>;
-  iconBadges: boolean;
   onOpen: (issue: number) => void;
   onRefresh: () => void;
   showDurationSeconds: boolean;
@@ -820,10 +791,6 @@ function DoneTable({
     issue: (card) => card.issue,
     cost: (card) => card.cost_usd,
     duration: (card) => card.elapsed_s,
-    verification: (card) => combinedVerificationStatus(
-      card.issue_verification,
-      card.pr_verification,
-    ),
     model: (card) => card.models.join(" "),
     rounds: (card) => card.rounds,
     labels: (card) => card.labels.join(" "),
@@ -837,7 +804,6 @@ function DoneTable({
     { key: "issue", label: "Issue / PR", width: 340 },
     ...(visible.has("cost") ? [{ key: "cost", label: "Cost", className: "r", width: 100 }] : []),
     ...(visible.has("duration") ? [{ key: "duration", label: "Duration", className: "r", width: 150 }] : []),
-    ...(visible.has("verification") ? [{ key: "verification", label: "Verification", width: 160 }] : []),
     ...(visible.has("model") ? [{ key: "model", label: "Model", width: 170 }] : []),
     ...(visible.has("rounds") ? [{ key: "rounds", label: "Rounds", className: "r", width: 90 }] : []),
     ...(visible.has("labels") ? [{ key: "labels", label: "Labels", width: 240 }] : []),
@@ -881,9 +847,6 @@ function DoneTable({
                         showSeconds={showDurationSeconds}
                       />
                     </td>
-                  ) : null}
-                  {visible.has("verification") ? (
-                    <td><VerificationStatus card={card} iconOnly={iconBadges} /></td>
                   ) : null}
                   {visible.has("model") ? <td><ModelList models={card.model_badges ?? card.models.map((model) => ({ model, effort: null }))} /></td> : null}
                   {visible.has("rounds") ? <td className="r num">{num(card.rounds)}</td> : null}
@@ -940,7 +903,7 @@ function BacklogTable({
   const sortableAndShown = useMemo(() => new Set(["issue", ...visible]), [visible]);
   const sorted = useSortedRows(cards, {
     issue: (card) => card.issue,
-    steward: (card) => stewardProcessed(card),
+    steward: (card) => card.steward_state,
     type: (card) => card.issue_type,
     difficulty: (card) => card.difficulty,
     impact: (card) => card.impact,
@@ -997,11 +960,12 @@ function BacklogTable({
           <tbody>
             {sorted.rows.map((card) => {
               const open = expanded === card.issue;
-              const processed = stewardProcessed(card);
+              const blocked = card.steward_state === "blocked_on_human_reply";
+              const processed = card.steward_state === "processed";
               return (
                 <Fragment key={card.issue}>
                   <tr
-                    className={`clickable backlog-${processed ? "processed" : "raw"}${open ? " expanded" : ""}`}
+                    className={`clickable${open ? " expanded" : ""}`}
                     tabIndex={0}
                     aria-expanded={open}
                     onClick={() => setExpanded(open ? null : card.issue)}
@@ -1038,11 +1002,15 @@ function BacklogTable({
                     {visible.has("steward") ? (
                       <td>
                         <div className="steward-state">
-                          <Chip tone={processed ? "meta" : "neutral"} square>
-                            {processed ? "triaged" : "raw intake"}
+                          <Chip tone={blocked ? "fail" : processed ? "meta" : "neutral"} square>
+                            {blocked
+                              ? "awaiting human reply"
+                              : processed ? "triaged" : "raw intake"}
                           </Chip>
-                          <span className={processed ? "steward-ready" : "faint"}>
-                            {processed ? "AC + test plan written" : "awaiting steward"}
+                          <span className={blocked ? "steward-attention" : processed ? "steward-ready" : "faint"}>
+                            {blocked
+                              ? "steward questions need answers"
+                              : processed ? "AC + test plan written" : "awaiting steward"}
                           </span>
                         </div>
                       </td>
@@ -1485,10 +1453,6 @@ function IssueLifecycle({ card }: { card: IssueCard }) {
   );
 }
 
-function stewardProcessed(card: BacklogCard): boolean {
-  return card.labels.some((label) => label.toLowerCase() === "ai-triage");
-}
-
 /**
  * The row's second line: what a human would have to read the issue to learn.
  *
@@ -1572,8 +1536,16 @@ const TimeSinceDone = memo(function TimeSinceDone({ card }: { card: IssueCard })
   return <>{ageCompact(Math.max(0, (nowMs - at) / 1000))}</>;
 });
 
-function PrLink({ card }: { card: IssueCard }) {
-  if (card.pr === null) return null;
+interface PrLinkCard {
+  pr?: number | null;
+  pr_url?: string | null;
+  pr_state?: string | null;
+  pr_review_state?: IssueCard["pr_review_state"];
+  pr_ci_state?: IssueCard["pr_ci_state"];
+}
+
+function PrLink({ card }: { card: PrLinkCard }) {
+  if (card.pr == null) return null;
   const review = prReviewMark(card.pr_review_state);
   // The complete control carries CI's answer; the review glyph remains a
   // redundant second signal when GitHub has also published that decision.
@@ -1623,51 +1595,6 @@ function ModelList({ models }: { models: NonNullable<IssueCard["model_badges"]> 
         </Chip>
       ))}
     </span>
-  );
-}
-
-/**
- * The verdict badge. Its title is the only place the ledger's *reason* is
- * readable, so the icon-only form must keep both the word and the prose there —
- * a glyph with no hover text would be a verdict nobody can question.
- */
-function VerificationStatus({
-  card,
-  iconOnly = false,
-}: {
-  card: IssueCard;
-  iconOnly?: boolean;
-}) {
-  const status = combinedVerificationStatus(
-    card.issue_verification,
-    card.pr_verification,
-  );
-  if (!status) return <span className="faint">—</span>;
-  const title = verificationSummary({
-    issueStatus: card.issue_verification,
-    issueReason: card.issue_verification_reason,
-    prStatus: card.pr_verification,
-    prReason: card.pr_verification_reason,
-  });
-  return (
-    <Chip
-      tone={verificationTone(status)}
-      title={`${status}\n${title}`}
-      className={iconOnly ? "chip-icon" : undefined}
-    >
-      {iconOnly ? (
-        <span role="img" aria-label={status}>{verificationGlyph(status)}</span>
-      ) : (
-        <>
-          <span
-            className="status-mark"
-            data-status-glyph={verificationGlyph(status)}
-            aria-hidden="true"
-          />
-          {status}
-        </>
-      )}
-    </Chip>
   );
 }
 

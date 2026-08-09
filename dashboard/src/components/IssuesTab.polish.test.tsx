@@ -2,7 +2,12 @@ import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Polled } from "../api/hooks";
-import type { BacklogCard, IssueCard, IssuesPayload } from "../api/types";
+import type {
+  BacklogCard,
+  IssueCard,
+  IssuesPayload,
+  PendingCard,
+} from "../api/types";
 import { IssuesTab } from "./IssuesTab";
 
 const done: IssueCard = {
@@ -44,6 +49,7 @@ const backlog: BacklogCard = {
   labels: ["type:enhancement", "difficulty:complex", "ai-triage"],
   recurrence: false,
   recurrence_count: 0,
+  steward_state: "processed",
   age_days: 1,
   comments: 0,
   issue_type: "enhancement",
@@ -94,49 +100,6 @@ describe("merge readiness on the PR chip", () => {
 
     expect(screen.queryByRole("img", { name: /merge|changes/ })).not.toBeInTheDocument();
     expect(screen.getByText(/PR #75/)).toBeVisible();
-  });
-});
-
-describe("done verification badge", () => {
-  it("shows the ledger's reason for both verdicts on hover", () => {
-    board("done", {
-      done: [{
-        ...done,
-        issue_verification_reason: "probe stayed green for a week",
-        pr_verification_reason: "no follow-up defect filed",
-      }],
-    });
-
-    expect(screen.getByText("verified")).toHaveAttribute(
-      "data-tip",
-      "verified\nIssue: VERIFIED — probe stayed green for a week\nPR: VERIFIED — no follow-up defect filed",
-    );
-  });
-
-  it("still names the verdict when the ledger recorded no reason", () => {
-    board("done", { done: [done] });
-
-    expect(screen.getByText("verified")).toHaveAttribute(
-      "data-tip",
-      "verified\nIssue: VERIFIED\nPR: VERIFIED",
-    );
-    expect(screen.getByText("verified").querySelector(".status-mark"))
-      .toHaveAttribute("data-status-glyph", "✓");
-  });
-
-  it("collapses to a glyph on request and keeps the verdict readable and remembered", async () => {
-    const { unmount } = board("done", { done: [done] });
-
-    await userEvent.click(screen.getByRole("button", { name: /Badges/ }));
-
-    const glyph = screen.getByRole("img", { name: "verified" });
-    expect(glyph).toHaveTextContent("✓");
-    expect(screen.queryByText("verified")).not.toBeInTheDocument();
-    expect(glyph.closest(".chip")).toHaveAttribute("data-tip", expect.stringContaining("VERIFIED"));
-
-    unmount();
-    board("done", { done: [done] });
-    expect(screen.getByRole("img", { name: "verified" })).toBeVisible();
   });
 });
 
@@ -240,6 +203,35 @@ describe("long-table filtering", () => {
     expect(screen.queryByText("Routine change 0")).not.toBeInTheDocument();
     expect(screen.getByText("1/12")).toBeVisible();
   });
+
+  it("finds a visible parked PR by its number", async () => {
+    const pending: PendingCard[] = Array.from({ length: 11 }, (_, index) => ({
+      issue: 200 + index,
+      title: index === 6 ? "Parked pull request" : `Waiting issue ${index}`,
+      url: null,
+      body: null,
+      priority: null,
+      labels: index === 6 ? ["ai-parked"] : ["ai-ready"],
+      held: index === 6,
+      hold_reason: index === 6 ? "parked" : null,
+      overlap: null,
+      pr: index === 6 ? 179 : null,
+      pr_url: index === 6 ? "https://github.com/o/r/pull/179" : null,
+      pr_state: index === 6 ? "open" : null,
+      pr_ci_state: index === 6 ? "passing" : null,
+    }));
+    board("inflight", { pending });
+
+    await userEvent.type(
+      screen.getByRole("searchbox", { name: "Filter active issues" }),
+      "179",
+    );
+
+    expect(screen.getByText("Parked pull request")).toBeVisible();
+    expect(screen.getByText("PR #179 ↗")).toBeVisible();
+    expect(screen.queryByText("Waiting issue 0")).not.toBeInTheDocument();
+    expect(screen.getByText("1/11")).toBeVisible();
+  });
 });
 
 describe("blocked section", () => {
@@ -338,18 +330,34 @@ describe("blocked section", () => {
 });
 
 describe("backlog triage taxonomy", () => {
-  it("makes steward-processed and raw intake visibly distinct", () => {
+  it("keeps steward state explicit without row-level highlighting", () => {
     const { container } = board("backlog", {
       backlog: [
         backlog,
-        { ...backlog, issue: 64, title: "Unprocessed intake", labels: [] },
+        {
+          ...backlog,
+          issue: 64,
+          title: "Unprocessed intake",
+          labels: [],
+          steward_state: "raw",
+        },
+        {
+          ...backlog,
+          issue: 65,
+          title: "Needs clarification",
+          steward_state: "blocked_on_human_reply",
+        },
       ],
     });
 
     expect(screen.getByText("AC + test plan written")).toBeVisible();
     expect(screen.getByText("awaiting steward")).toBeVisible();
-    expect(container.querySelector(".backlog-processed")).toBeInTheDocument();
-    expect(container.querySelector(".backlog-raw")).toBeInTheDocument();
+    expect(screen.getByText("awaiting human reply")).toHaveClass("chip-fail");
+    expect(screen.getByText("steward questions need answers")).toBeVisible();
+    expect(screen.getAllByText("awaiting human reply")).toHaveLength(1);
+    expect(container.querySelector(".backlog-processed")).not.toBeInTheDocument();
+    expect(container.querySelector(".backlog-raw")).not.toBeInTheDocument();
+    expect(container.querySelector(".backlog-blocked")).not.toBeInTheDocument();
   });
 
   it("colours each axis value and its matching label with one mapping", () => {

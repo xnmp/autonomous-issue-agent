@@ -309,6 +309,11 @@ export interface components {
             recurrence: boolean;
             /** Recurrence Count */
             recurrence_count: number;
+            /**
+             * Steward State
+             * @enum {string}
+             */
+            steward_state: "raw" | "processed" | "blocked_on_human_reply";
             /** Title */
             title: string | null;
             /** Url */
@@ -841,6 +846,14 @@ export interface components {
             labels: string[];
             /** Overlap */
             overlap: unknown | null;
+            /** Pr */
+            pr?: number | null;
+            /** Pr Ci State */
+            pr_ci_state?: ("passing" | "failing" | "pending") | null;
+            /** Pr State */
+            pr_state?: string | null;
+            /** Pr Url */
+            pr_url?: string | null;
             /** Priority */
             priority: ("P1" | "P2" | "P3") | null;
             /** Title */

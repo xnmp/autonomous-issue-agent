@@ -52,6 +52,10 @@ function json(body: unknown): Response {
 describe("App navigation", () => {
   it("uses top-level issue-state tabs and keeps verification out of the tab strip", async () => {
     window.location.hash = "#/repo/demo/issues/done";
+    localStorage.setItem(
+      "issue-agent.dashboard.options",
+      JSON.stringify({ showOverviewIssueHealthTrend: true }),
+    );
     let overviewCalls = 0;
     vi.stubGlobal(
       "fetch",
@@ -160,6 +164,110 @@ describe("App navigation", () => {
     expect(seconds).not.toBeChecked();
   });
 
+  it("defaults optional Overview sections off and persists their toggles", async () => {
+    window.location.hash = "#/repo/demo/overview";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input);
+        if (path === "/api/repos") return json(repos);
+        if (path === "/api/usage") return json(usage);
+        if (path.endsWith("/issues")) return json(issues);
+        return json({
+          metrics: null,
+          cost_mix: null,
+          caps: null,
+          health: [{
+            role: "fix",
+            alive: true,
+            stale: false,
+            last_event_ts: "2026-08-09T01:00:00Z",
+            last_event: "tick",
+            events: 1,
+            log_path: "/logs/fix.log",
+          }],
+          health_trend: [],
+          needs_attention: [],
+          interventions: [],
+          spend_per_hour: [],
+          unattributed: [],
+          warnings: [],
+        });
+      }),
+    );
+
+    const first = render(<App />);
+
+    expect(await screen.findByText("Done", { selector: ".tile-label" })).toBeVisible();
+    expect(screen.queryByText("Daemon health", { selector: ".panel-title" }))
+      .not.toBeInTheDocument();
+    expect(screen.queryByText("Issue health trend", { selector: ".panel-title" }))
+      .not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Settings" }));
+    const daemonHealth = screen.getByRole("checkbox", { name: "Daemon health" });
+    const issueHealthTrend = screen.getByRole("checkbox", { name: "Issue health trend" });
+    expect(daemonHealth).not.toBeChecked();
+    expect(issueHealthTrend).not.toBeChecked();
+
+    await userEvent.click(daemonHealth);
+    await userEvent.click(issueHealthTrend);
+    expect(await screen.findByText("Daemon health", { selector: ".panel-title" })).toBeVisible();
+    expect(screen.getByText("Issue health trend", { selector: ".panel-title" })).toBeVisible();
+    expect(JSON.parse(localStorage.getItem("issue-agent.dashboard.options") ?? "{}"))
+      .toMatchObject({
+        showOverviewDaemonHealth: true,
+        showOverviewIssueHealthTrend: true,
+      });
+
+    first.unmount();
+    render(<App />);
+
+    expect(await screen.findByText("Daemon health", { selector: ".panel-title" })).toBeVisible();
+    expect(screen.getByText("Issue health trend", { selector: ".panel-title" })).toBeVisible();
+  });
+
+  it("does not treat corrupt stored option strings as enabled booleans", async () => {
+    window.location.hash = "#/repo/demo/overview";
+    localStorage.setItem(
+      "issue-agent.dashboard.options",
+      JSON.stringify({
+        showOverviewDaemonHealth: "false",
+        showOverviewIssueHealthTrend: "true",
+        showProjectedCost: "true",
+      }),
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const path = String(input);
+        if (path === "/api/repos") return json(repos);
+        if (path === "/api/usage") return json(usage);
+        if (path.endsWith("/issues")) return json(issues);
+        return json({
+          metrics: null,
+          cost_mix: null,
+          caps: null,
+          health: [],
+          health_trend: [],
+          needs_attention: [],
+          interventions: [],
+          spend_per_hour: [],
+          unattributed: [],
+          warnings: [],
+        });
+      }),
+    );
+
+    render(<App />);
+
+    expect(await screen.findByText("Done", { selector: ".tile-label" })).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Settings" }));
+    expect(screen.getByRole("checkbox", { name: "Daemon health" })).not.toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Issue health trend" })).not.toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Show projected cost" })).not.toBeChecked();
+  });
+
   it("optimistically removes a promoted backlog issue and updates its tab count", async () => {
     window.location.hash = "#/repo/demo/issues/backlog";
     let finishPromotion: (response: Response) => void = () => {};
@@ -184,6 +292,7 @@ describe("App navigation", () => {
               labels: ["feature"],
               recurrence: false,
               recurrence_count: 0,
+              steward_state: "raw",
               age_days: 0,
               comments: 0,
               issue_type: "feature",
