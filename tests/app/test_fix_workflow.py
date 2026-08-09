@@ -464,7 +464,7 @@ def test_the_second_fix_ci_leg_sees_what_the_first_one_faced(tmp_path):
     asyncio.run(_workflow(
         FakeGateway(prs={100: _ci_pr_at("a" * 40, "e2e tests")}), store, first
     ).fix_ci(100))
-    assert "Previous FIX_CI attempts" not in first.tasks[0].prompt
+    assert "previous FIX_CI attempts" not in first.tasks[0].prompt
 
     second = _pushed_runner()
     asyncio.run(_workflow(
@@ -474,6 +474,26 @@ def test_the_second_fix_ci_leg_sees_what_the_first_one_faced(tmp_path):
     prompt = second.tasks[0].prompt
     assert "attempt 1 @ aaaaaaa: e2e tests" in prompt
     assert "bbbbbbb" not in prompt  # the CURRENT head is the prompt's subject
+
+
+def test_a_budget_capped_tick_is_not_recorded_as_an_attempt(tmp_path):
+    """#155's rule, applied to the history: an admission rejection is a $0
+    non-attempt that does not advance the breaker, so decide_fix re-dispatches
+    it every poll. Recording them would let capped ticks evict the whole real
+    record and leave identical zero-information rows behind."""
+    store = Store(state_dir=str(tmp_path))
+    asyncio.run(_workflow(
+        FakeGateway(prs={100: _ci_pr_at("a" * 40, "e2e tests")}), store, _pushed_runner()
+    ).fix_ci(100))
+
+    for _ in range(6):
+        capped = FakeRunner(AgentResult(
+            is_error=True, exit_reason=ExitReason.BUDGET_EXHAUSTED))
+        asyncio.run(_workflow(
+            FakeGateway(prs={100: _ci_pr_at("b" * 40, "e2e tests")}), store, capped
+        ).fix_ci(100))
+
+    assert [a.head_sha for a in store.get_ci_history(5)] == ["a" * 40]
 
 
 def test_fix_ci_records_the_attempt_even_when_the_leg_dies(tmp_path):
@@ -499,8 +519,7 @@ def test_a_store_that_cannot_serve_the_history_still_dispatches_the_leg(tmp_path
 
     asyncio.run(_workflow(gw, store, runner).fix_ci(100))
 
-    assert "Previous FIX_CI attempts" not in runner.tasks[0].prompt
-    assert runner.tasks  # the leg ran
+    assert runner.tasks and "previous FIX_CI attempts" not in runner.tasks[0].prompt
 
     class ExplodingHistoryStore(Store):
         def get_ci_history(self, issue):
@@ -516,7 +535,7 @@ def test_a_store_that_cannot_serve_the_history_still_dispatches_the_leg(tmp_path
         runner2,
     ).fix_ci(100))
 
-    assert "Previous FIX_CI attempts" not in runner2.tasks[0].prompt
+    assert "previous FIX_CI attempts" not in runner2.tasks[0].prompt
     assert runner2.tasks[0].prompt  # still dispatched
 
 
@@ -535,7 +554,7 @@ def test_a_merged_pr_leaves_no_history_for_the_next_one(tmp_path):
         store, runner,
     ).fix_ci(101))
 
-    assert "Previous FIX_CI attempts" not in runner.tasks[0].prompt
+    assert "previous FIX_CI attempts" not in runner.tasks[0].prompt
 
 
 def test_fix_ci_error_advances_the_breaker():

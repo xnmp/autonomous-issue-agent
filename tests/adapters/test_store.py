@@ -79,8 +79,9 @@ def test_ci_history_keeps_only_the_last_five_attempts():
 
 def test_ci_history_is_per_issue():
     s, _ = _store()
-    s.append_ci_attempt(5, CiAttempt("aaa"))
-    s.append_ci_attempt(6, CiAttempt("bbb"))
+    s.append_ci_attempt(5, CiAttempt("aaa", ("unit",)))
+    s.append_ci_attempt(6, CiAttempt("bbb", ("unit",)))
+    assert [a.head_sha for a in s.get_ci_history(5)] == ["aaa"]
     assert [a.head_sha for a in s.get_ci_history(6)] == ["bbb"]
 
 

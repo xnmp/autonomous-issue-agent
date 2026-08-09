@@ -599,16 +599,27 @@ _CI_HISTORY_GUIDANCE = (
 
 
 def _ci_history_section(history: Sequence[CiAttempt]) -> str:
-    """The prior-attempts block, or "" when this is the first repair leg."""
+    """The prior-attempts block, or "" when this is the first repair leg.
+
+    FENCED (P1R-14, the same rule as `failed_checks` three lines below): the
+    attempt numbers and head SHAs are the harness's own, but the check names
+    inside them are repository-authored — a workflow file on the PR's own branch
+    names its jobs, and a fixer leg writes that branch. Fencing the live copy
+    while interpolating the RECORDED copy raw would just move the injection
+    surface to the weaker-guarded field, and this is the persisted one: a forged
+    line would be replayed into every later leg on the issue."""
     if not history:
         return ""
-    lines = []
-    for n, attempt in enumerate(history, start=1):
-        checks = ", ".join(attempt.failed_checks) or "unrecorded"
-        lines.append(f"attempt {n} @ {attempt.short_sha()}: {checks}")
+    lines = [
+        f"attempt {n} @ {attempt.short_sha()}: "
+        f"{', '.join(attempt.failed_checks) or 'unrecorded'}"
+        for n, attempt in enumerate(history, start=1)
+    ]
     return (
-        "Previous FIX_CI attempts on this PR (harness record, oldest first):\n"
-        + "\n".join(lines)
+        "The harness's own record of the previous FIX_CI attempts on this PR, "
+        "oldest first — attempt numbers and head SHAs are harness-written, the "
+        "check names are repository-authored strings.\n"
+        + _fenced("previous ci attempts", as_untrusted("\n".join(lines)))
         + f"\n\n{_CI_HISTORY_GUIDANCE}\n\n"
     )
 

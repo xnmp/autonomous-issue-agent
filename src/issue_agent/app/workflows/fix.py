@@ -1077,21 +1077,12 @@ class FixWorkflow:
             self.cfg.fix_mcp_config, [c.name for c in p.checks], self.cfg.harness_root
         )
         # PRIOR attempts only — the current one is the prompt's own subject, and
-        # a history that always contained it could never be empty. Recorded
-        # BEFORE the leg runs, on the same write-before-execute discipline as
-        # the ci-rerun marker: a leg killed mid-flight still consumed a round
-        # and its failure is still evidence, whereas an attempt recorded only on
-        # success would hide exactly the repeated failures this exists to show.
-        # Both halves are `_try`-wrapped — history is context, not authority, so
-        # an unreadable/unwritable store must cost the leg its extra section,
-        # never its dispatch (see `_signals` for the same rule).
+        # a history that always contained it could never be empty. `_try`-wrapped
+        # because history is context, not authority: an unreadable store must
+        # cost the leg its extra section, never its dispatch (`_signals`' rule).
         prior_attempts = self._try(lambda: self.store.get_ci_history(issue), ()) or ()
-        self._try(
-            lambda: self.store.append_ci_attempt(
-                issue,
-                make_attempt(p.head_ref_oid, [c.name for c in p.checks if c.bucket == "fail"]),
-            ),
-            None,
+        attempt = make_attempt(
+            p.head_ref_oid, [c.name for c in p.checks if c.bucket == "fail"]
         )
         task = task_builders.build_fix_ci_task(
             pr,
@@ -1117,7 +1108,18 @@ class FixWorkflow:
         # counting it walks a healthy PR to needs-human-review at $0 per strike
         # (keifu PR #174, 2026-08-02) — fix_ci_actions routes it to the budget
         # surface instead.
-        if outcome.budget_exhausted(result.exit_reason):
+        # The attempt history obeys the SAME rule as the counter above, for the
+        # same reason: a budget-capped tick is a deterministic $0 non-attempt
+        # (#155), and it does not advance the breaker — so `decide_fix`
+        # re-dispatches it every poll. Recording those would let five capped
+        # ticks evict the whole real record and leave five identical
+        # zero-information rows, i.e. the blindness this exists to remove,
+        # disguised as a populated history. An infra death and an agent error
+        # DO get recorded: those legs ran, and their failure is the evidence.
+        capped = outcome.budget_exhausted(result.exit_reason)
+        if not capped:
+            self._try(lambda: self.store.append_ci_attempt(issue, attempt), None)
+        if capped:
             pass
         elif not outcome.infra_class_failure(result):
             self.store.set_ci_retries(issue, self.store.get_ci_retries(issue) + 1)
