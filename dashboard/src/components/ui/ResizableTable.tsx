@@ -330,7 +330,7 @@ export function ResizableTable({
   return (
     <table
       className={`tbl resizable-table ${className}`.trim()}
-      style={{ width: tableWidth }}
+      style={{ width: tableWidth, minWidth: "100%" }}
       aria-label={ariaLabel}
     >
       <caption className="sr-only">

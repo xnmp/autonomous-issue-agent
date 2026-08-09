@@ -24,6 +24,23 @@ describe("ResizableTable", () => {
     expect(screen.getByRole("cell", { name: "#1" })).toBeVisible();
   });
 
+  it("fills the panel when the configured columns are narrower than it", () => {
+    render(
+      <ResizableTable
+        storageKey="full-width-table"
+        columns={[{ key: "issue", label: "Issue", width: 112 }]}
+        ariaLabel="Full-width issues"
+      >
+        <tbody><tr><td>#1</td></tr></tbody>
+      </ResizableTable>,
+    );
+
+    expect(screen.getByRole("table", { name: "Full-width issues" })).toHaveStyle({
+      width: "112px",
+      minWidth: "100%",
+    });
+  });
+
   it("shrinks columns to a readable floor", async () => {
     const { container } = render(
       <ResizableTable

@@ -61,6 +61,9 @@ describe("issue explainability", () => {
       await screen.findByText(/budget cap reached — approve more spend/),
     ).toBeVisible();
     expect(screen.getByText("REQUEST_CHANGES round 2")).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Review" }));
+    expect(screen.getAllByText("REQUEST_CHANGES round 2")).toHaveLength(1);
+    expect(screen.queryByText(/changed nothing visible/i)).not.toBeInTheDocument();
   });
 
   it("unblocks a held issue only after the operator confirms", async () => {

@@ -7,25 +7,21 @@ import type {
   EscalationReason,
   HealthTrendDay,
   InterventionEvent,
-  IssueCard,
   OverviewPayload,
   RoleHealth,
 } from "../api/types";
 import {
   HEALTH_LABEL,
   HEALTH_TONE,
-  mixSlices,
   roleHealth,
-  stageTone,
   utilTone,
 } from "../lib/semantics";
 import { ago, localHour, localTime, num, rate, usd, usdCompact } from "../lib/format";
 import { Chip } from "./ui/Chip";
-import { Histogram, Meter, StackedBar, StatTile } from "./ui/Charts";
-import { EmptyState, ErrorBanner, Loading, SectionTitle, SkeletonRows, WarningList } from "./ui/Feedback";
+import { Histogram, Meter, StatTile } from "./ui/Charts";
+import { EmptyState, ErrorBanner, Loading, SkeletonRows, WarningList } from "./ui/Feedback";
 import { ResizableTable, useSortedRows } from "./ui/ResizableTable";
 import { TableFilter } from "./ui/TableFilter";
-import { LifecycleStepper } from "./ui/LifecycleStepper";
 
 const POLL_MS = 10_000;
 
@@ -37,15 +33,9 @@ const POLL_MS = 10_000;
 export function OverviewTab({
   repo,
   onOpenIssues,
-  activeIssues = [],
-  activeIssuesLoading = false,
-  onOpenIssue,
 }: {
   repo: string;
   onOpenIssues: (sub: "inflight" | "done") => void;
-  activeIssues?: IssueCard[];
-  activeIssuesLoading?: boolean;
-  onOpenIssue?: (issue: number) => void;
 }) {
   const ov = usePolled(
     `overview:${repo}`,
@@ -55,24 +45,6 @@ export function OverviewTab({
 
   const m = ov.data?.metrics ?? null;
   const caps = ov.data?.caps ?? null;
-  const mix = ov.data?.cost_mix ?? null;
-  const [spendQuery, setSpendQuery] = useState("");
-  const filteredSpend = useMemo(() => {
-    const query = spendQuery.trim().toLowerCase();
-    if (!query) return m?.by_kind ?? [];
-    return (m?.by_kind ?? []).filter((row) => row.kind.toLowerCase().includes(query));
-  }, [m?.by_kind, spendQuery]);
-  const spendRows = useSortedRows(
-    filteredSpend,
-    {
-      kind: (row) => row.kind,
-      tasks: (row) => row.runs,
-      usd: (row) => row.usd,
-      "per-task": (row) => row.runs > 0 ? row.usd / row.runs : null,
-    },
-    { key: "usd", direction: "desc" },
-    "overview-spend",
-  );
 
   const escalations = m?.escalations ?? 0;
   const recurrences = m?.recurrences ?? 0;
@@ -85,18 +57,6 @@ export function OverviewTab({
     caps?.today_usd != null && caps?.daily_cap_usd != null && caps.daily_cap_usd > 0
       ? (caps.today_usd / caps.daily_cap_usd) * 100
       : null;
-
-  const slices = mixSlices(mix).map((s) => ({
-    key: s.family,
-    label: s.label,
-    value: s.usd,
-    varName: s.varName,
-  }));
-  const repairShare = (() => {
-    const total = slices.reduce((a, s) => a + s.value, 0);
-    const repair = slices.find((s) => s.key === "repair")?.value ?? 0;
-    return total > 0 ? repair / total : null;
-  })();
 
   return (
     <div className="tabbody">
@@ -114,40 +74,6 @@ export function OverviewTab({
       {ov.loading ? <SkeletonRows what="overview" rows={5} /> : null}
 
       <NeedsAttention items={ov.data?.needs_attention ?? []} loading={ov.loading} />
-
-      <section className="overview-health panel">
-        <div className="panel-hd">
-          <span className="panel-title">Daemon health</span>
-          <span className="faint">live role journals</span>
-        </div>
-        <div className="panel-bd health-cards">
-          {(ov.data?.health ?? []).length === 0 && !ov.loading ? (
-            <EmptyState>no role journals found for this deployment</EmptyState>
-          ) : null}
-          {(ov.data?.health ?? []).map((h) => (
-            <HealthCard key={h.role} health={h} />
-          ))}
-        </div>
-      </section>
-
-      <LiveWorkPanel
-        cards={activeIssues}
-        loading={activeIssuesLoading}
-        onOpenIssue={onOpenIssue}
-      />
-
-      <section className={`panel operator-actions-panel${(ov.data?.interventions ?? []).length > 0 ? " operator-actions-active" : ""}`}>
-        <div className="panel-hd">
-          <span className="panel-title">Operator actions</span>
-          <span className="faint">newest first</span>
-        </div>
-        <div className="panel-bd flush">
-          <InterventionList
-            rows={ov.data?.interventions ?? []}
-            loading={ov.loading}
-          />
-        </div>
-      </section>
 
       <div className="tiles overview-metrics overview-metrics-primary">
         <StatTile
@@ -227,22 +153,36 @@ export function OverviewTab({
         />
       </div>
 
-      <div className="grid-2 overview-support">
-        <section className="panel">
-          <div className="panel-hd">
-            <span className="panel-title">Cost mix by task family</span>
-            {repairShare !== null ? (
-              <Chip tone={repairShare > 0.25 ? "fail" : "neutral"} title="repair tasks are pure overhead; their share should shrink">
-                repair {rate(repairShare)}
-              </Chip>
-            ) : null}
-          </div>
-          <div className="panel-bd">
-            <StackedBar segments={slices} emptyText="no journalled spend for this deployment yet" />
-          </div>
-        </section>
+      <section className="overview-health panel">
+        <div className="panel-hd">
+          <span className="panel-title">Daemon health</span>
+          <span className="faint">live role journals</span>
+        </div>
+        <div className="panel-bd health-cards">
+          {(ov.data?.health ?? []).length === 0 && !ov.loading ? (
+            <EmptyState>no role journals found for this deployment</EmptyState>
+          ) : null}
+          {(ov.data?.health ?? []).map((h) => (
+            <HealthCard key={h.role} health={h} />
+          ))}
+        </div>
+      </section>
 
-        <section className="panel">
+      <section className={`panel operator-actions-panel${(ov.data?.interventions ?? []).length > 0 ? " operator-actions-active" : ""}`}>
+        <div className="panel-hd">
+          <span className="panel-title">Operator actions</span>
+          <span className="faint">newest first</span>
+        </div>
+        <div className="panel-bd flush">
+          <InterventionList
+            rows={ov.data?.interventions ?? []}
+            loading={ov.loading}
+          />
+        </div>
+      </section>
+
+      <div className="overview-support">
+        <section className="panel overview-caps">
           <div className="panel-hd">
             <span className="panel-title">Caps</span>
           </div>
@@ -279,48 +219,6 @@ export function OverviewTab({
       <HealthTrend rows={ov.data?.health_trend ?? []} loading={ov.loading} />
 
       <UnattributedCount count={ov.data?.unattributed_count ?? 0} />
-
-      <div className="by-kind">
-        <SectionTitle>Spend by task type</SectionTitle>
-        {(m?.by_kind ?? []).length === 0 ? (
-          <EmptyState>no tasks recorded yet</EmptyState>
-        ) : (
-          <>
-            {(m?.by_kind ?? []).length > 10 ? (
-              <TableFilter
-                label="Filter task types"
-                value={spendQuery}
-                onChange={setSpendQuery}
-                shown={filteredSpend.length}
-                total={(m?.by_kind ?? []).length}
-              />
-            ) : null}
-            <div className="tbl-wrap panel">
-              {filteredSpend.length === 0 ? (
-                <EmptyState>no task types match “{spendQuery.trim()}”</EmptyState>
-              ) : (
-                <ResizableTable storageKey="overview-spend" columns={[
-                  { key: "kind", label: "Kind", width: 220 },
-                  { key: "tasks", label: "Tasks", className: "r", width: 90 },
-                  { key: "usd", label: "USD", className: "r", width: 100 },
-                  { key: "per-task", label: "$/task", className: "r", width: 100 },
-                ]} sort={spendRows.sort} onSort={spendRows.onSort}>
-                  <tbody>
-                    {spendRows.rows.map((k) => (
-                      <tr key={k.kind}>
-                        <td className="mono">{k.kind}</td>
-                        <td className="r num">{num(k.runs)}</td>
-                        <td className="r mono">{usd(k.usd)}</td>
-                        <td className="r mono faint">{k.runs > 0 ? usd(k.usd / k.runs) : "—"}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </ResizableTable>
-              )}
-            </div>
-          </>
-        )}
-      </div>
     </div>
   );
 }
@@ -450,78 +348,6 @@ function HealthCard({ health }: { health: RoleHealth }) {
         </div>
       ) : null}
     </div>
-  );
-}
-
-function attentionFor(card: IssueCard): "blocked" | "escalated" | null {
-  if (card.human_action === "escalated") return "escalated";
-  if (
-    card.human_action === "awaiting-reply"
-    || card.stage === "blocked"
-    || card.flags.includes("blocked")
-  ) return "blocked";
-  return null;
-}
-
-function LiveWorkPanel({
-  cards,
-  loading,
-  onOpenIssue,
-}: {
-  cards: IssueCard[];
-  loading: boolean;
-  onOpenIssue?: (issue: number) => void;
-}) {
-  return (
-    <section className="panel overview-live-work">
-      <div className="panel-hd">
-        <span className="panel-title">Active lifecycle</span>
-        <span className="faint num">{cards.length} running</span>
-      </div>
-      <div className="overview-live-list">
-        {loading && cards.length === 0 ? <Loading what="active work" /> : null}
-        {!loading && cards.length === 0 ? (
-          <EmptyState>no lifecycle is active — the deployment is on rails and idle</EmptyState>
-        ) : null}
-        {cards.map((card) => (
-          <article className="overview-live-row" key={card.issue}>
-            <div className="overview-live-summary">
-              <div className="overview-live-title">
-                {onOpenIssue ? (
-                  <button type="button" onClick={() => onOpenIssue(card.issue)}>
-                    <span className="mono">#{card.issue}</span>
-                    <span>{card.title ?? "Untitled issue"}</span>
-                  </button>
-                ) : (
-                  <span>
-                    <span className="mono">#{card.issue}</span>{" "}
-                    {card.title ?? "Untitled issue"}
-                  </span>
-                )}
-              </div>
-              <div className="overview-live-meta">
-                <Chip tone={stageTone(card.stage)}>{card.stage ?? "active"}</Chip>
-                {card.pr ? <span className="mono faint">PR #{card.pr}</span> : null}
-              </div>
-            </div>
-            <LifecycleStepper
-              steps={card.steps}
-              stage={card.stage}
-              done={card.done}
-              hasPullRequest={card.pr !== null}
-              attention={attentionFor(card)}
-              label={`Issue #${card.issue} lifecycle`}
-              onSelectStep={onOpenIssue ? () => onOpenIssue(card.issue) : undefined}
-            />
-            <div className="overview-live-measure">
-              <span className="faint">spend</span>
-              <strong className="mono num">{usd(card.cost_usd)}</strong>
-              <span className="faint">{card.steps.length} legs</span>
-            </div>
-          </article>
-        ))}
-      </div>
-    </section>
   );
 }
 

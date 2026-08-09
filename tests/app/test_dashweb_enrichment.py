@@ -168,3 +168,37 @@ def test_issue_detail_defers_list_and_per_pr_enrichment_together() -> None:
     assert enriched is not None
     assert enriched["title"] == "Enriched issue title"
     assert enriched["pull_requests"][0]["url"].endswith("/pull/12")
+
+
+def test_issue_detail_does_not_append_poll_warnings_into_the_enrichment_cache() -> None:
+    gh = BlockingGh()
+    backend = _backend(
+        _snapshot(
+            _run("RESOLVE", 7, hours=2),
+            _run("REVIEW", 12, hours=1),
+        ),
+        gh,
+    )
+    backend._review_unproductive_rounds = (  # type: ignore[method-assign]
+        lambda _name, _snapshot, _row, _prs: (
+            {12: 0},
+            ["review breaker state unavailable"],
+        )
+    )
+
+    backend.issue("demo", 7)
+    assert gh.issues_started.wait(1)
+    assert gh.prs_started.wait(1)
+    gh.base_release.set()
+    assert gh.pr_started.wait(1)
+    gh.detail_release.set()
+    _eventually(
+        lambda: backend.issue("demo", 7),
+        lambda payload: payload is not None and bool(payload["warnings"]),
+    )
+
+    first = backend.issue("demo", 7)
+    second = backend.issue("demo", 7)
+    assert first is not None and second is not None
+    assert first["warnings"] == ["review breaker state unavailable"]
+    assert second["warnings"] == ["review breaker state unavailable"]

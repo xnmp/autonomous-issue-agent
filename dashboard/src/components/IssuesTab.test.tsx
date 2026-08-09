@@ -73,6 +73,7 @@ describe("IssuesTab", () => {
     expect(screen.queryByRole("columnheader", { name: "Rounds" })).not.toBeInTheDocument();
     expect(screen.getByRole("columnheader", { name: /Verification/ })).toBeVisible();
     expect(screen.getByRole("columnheader", { name: /Since done/ })).toBeVisible();
+    expect(screen.queryByLabelText("Issue #50 lifecycle")).not.toBeInTheDocument();
     const verification = screen.getByRole("cell", { name: "pending" });
     expect(verification).toBeVisible();
     expect(screen.getByText("pending", { exact: true })).toHaveAttribute(
@@ -153,6 +154,7 @@ describe("IssuesTab", () => {
     expect(screen.getByRole("columnheader", { name: /Type/ })).toBeVisible();
     expect(screen.getByRole("columnheader", { name: /Difficulty/ })).toBeVisible();
     expect(screen.getByRole("columnheader", { name: /Impact/ })).toBeVisible();
+    expect(screen.getByRole("columnheader", { name: /Steward state/ })).toBeVisible();
     expect(screen.getByText("medium")).toBeVisible();
     expect(screen.getByText("high")).toBeVisible();
     expect(screen.getByText("The incident came back")).toHaveClass("recurrence-2");

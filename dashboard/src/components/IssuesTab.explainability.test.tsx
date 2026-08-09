@@ -80,6 +80,21 @@ describe("board explainability", () => {
     expect(screen.getByText("Harness")).toHaveClass("issue-attention-label");
   });
 
+  it("keeps the complete harness annotation on the collapsed card", () => {
+    const reason = "Harness issue: required-test gate rejects diagnostic output even after the operator supplied the complete acceptance plan";
+    board(polled([{
+      ...base,
+      human_action: "escalated",
+      escalation_reason: reason,
+      flags: ["escalated"],
+    }]));
+
+    const annotation = screen.getByText(reason);
+    expect(annotation).toBeVisible();
+    expect(annotation).toHaveClass("issue-attention-text");
+    expect(annotation).not.toHaveClass("trunc");
+  });
+
   it("offers Park beside Unblock only when a blocked issue has an open PR", async () => {
     vi.stubGlobal(
       "fetch",

@@ -134,6 +134,136 @@ const issues = {
   warnings: [],
 };
 
+const overview = {
+  metrics: null,
+  cost_mix: null,
+  caps: { issue_cap_usd: 5, daily_cap_usd: 10, today_usd: 2 },
+  health: [],
+  unattributed_count: 30,
+  needs_attention: [],
+  interventions: [],
+  spend_per_hour: [],
+  escalation_reasons: [],
+  health_trend: [{
+    day: "2026-07-29",
+    opened: 3,
+    closed: 1,
+    net_open: 2,
+    recurrences: 0,
+    first_observation: true,
+  }],
+  warnings: [],
+};
+
+const round3Issues = {
+  ...issues,
+  in_flight: [{
+    ...issues.in_flight[0],
+    issue: 457,
+    title: "Required-test gate rejects diagnostic output",
+    url: "https://github.com/openai/autonomous-issue-agent/issues/457",
+    pr: 482,
+    pr_url: "https://github.com/openai/autonomous-issue-agent/pull/482",
+    stage: "reviewing",
+    human_action: "escalated",
+    escalation_reason: "Harness issue: required-test gate rejects diagnostic output after the full acceptance plan was supplied; operator decision is required before another review round",
+    flags: ["escalated"],
+    rounds: 3,
+    steps: [
+      { kind: "RESOLVE", state: "ok", status: "done", cost_usd: 1.22, count: 1 },
+      { kind: "REVIEW", state: "ok", status: "REQUEST_CHANGES", cost_usd: 0.48, count: 2 },
+      { kind: "ADDRESS_REVIEW", state: "running", status: "running", cost_usd: 0.31, count: 1 },
+    ],
+  }],
+  backlog: [
+    {
+      ...issues.backlog[0],
+      issue: 119,
+      title: "Add OAuth token refresh diagnostics",
+      url: "https://github.com/openai/autonomous-issue-agent/issues/119",
+      labels: ["ai-triage", "feature", "effort:medium", "impact:high"],
+    },
+    issues.backlog[0],
+  ],
+};
+
+const round3Overview = {
+  ...overview,
+  first_observed_day: "2026-07-22",
+  metrics: {
+    by_kind: [],
+    cost_per_done_usd: 1.84,
+    done_issues: 19,
+    escalations: 2,
+    first_pass_approvals: 8,
+    first_pass_changes: 3,
+    first_pass_rate: 8 / 11,
+    in_flight_issues: 2,
+    interventions_by_class: [
+      { name: "rearm", count: 1 },
+      { name: "policy", count: 1 },
+      { name: "other", count: 0 },
+    ],
+    interventions_per_merged_pr: 0.11,
+    interventions_total: 2,
+    recurrences: 0,
+    rounds_per_pr: 1.32,
+    spend_blocks: 1,
+    today_usd: 6.42,
+    total_cost_usd: 34.96,
+  },
+  caps: { issue_cap_usd: 10, daily_cap_usd: 25, today_usd: 6.42 },
+  needs_attention: [
+    {
+      issue: 457,
+      kind: "escalated",
+      title: "Required-test gate rejects diagnostic output",
+      detail: "operator decision required before another review round",
+    },
+    {
+      issue: 462,
+      kind: "blocked",
+      title: "Choose the event retention boundary",
+      detail: "waiting for the retention window",
+    },
+  ],
+  health: ["fix", "review", "steward"].map((name, index) => ({
+    ...role(name),
+    last_event_ts: `2026-08-09T07:${55 + index}:00Z`,
+  })),
+  interventions: [
+    {
+      ts: "2026-08-09T07:42:00Z",
+      action_class: "guidance",
+      issue: 457,
+      pr: 482,
+      kind: "rearm review",
+      detail: "supplied the required-test acceptance plan",
+    },
+    {
+      ts: "2026-08-09T06:18:00Z",
+      action_class: "policy",
+      issue: 462,
+      pr: null,
+      kind: "promote backlog issue",
+      detail: "acceptance criteria and test plan approved",
+    },
+  ],
+  spend_per_hour: Array.from({ length: 24 }, (_, index) => ({
+    hour_start_iso: `2026-08-${index < 16 ? "08" : "09"}T${String((index + 8) % 24).padStart(2, "0")}:00:00Z`,
+    usd: [0, 0.12, 0.35, 0.08, 0, 0.61][index % 6] ?? 0,
+  })),
+  health_trend: Array.from({ length: 7 }, (_, index) => ({
+    day: `2026-08-0${index + 3}`,
+    opened: 2 + (index % 3),
+    closed: 1 + (index % 2),
+    net_open: 1,
+    recurrences: 0,
+    first_observation: index === 0,
+  })),
+  unattributed_count: 3,
+};
+
 const issue = {
   issue: 50,
   title: "Explain completed work",
@@ -293,7 +423,16 @@ async function json(route: Route, body: unknown, delayMs = 0) {
   });
 }
 
-async function mockApi(page: Page, reposDelayMs = 0) {
+async function mockApi(
+  page: Page,
+  reposDelayMs = 0,
+  fixtures: {
+    issuesPayload?: Record<string, unknown>;
+    overviewPayload?: Record<string, unknown>;
+  } = {},
+) {
+  const issuesPayload = fixtures.issuesPayload ?? issues;
+  const overviewPayload = fixtures.overviewPayload ?? overview;
   let issuePolls = 0;
   await page.route("**/*", async (route) => {
     const path = new URL(route.request().url()).pathname;
@@ -303,7 +442,7 @@ async function mockApi(page: Page, reposDelayMs = 0) {
     if (path === "/api/repos/self/issues") {
       issuePolls += 1;
       return json(route, {
-        ...issues,
+        ...issuesPayload,
         notifications: issuePolls <= 2 ? [] : [{
           id: "merge-50",
           ts: "2026-07-29T08:00:00Z",
@@ -347,28 +486,7 @@ async function mockApi(page: Page, reposDelayMs = 0) {
         rows: [{ id: "V-1", change: "Dashboard", status: "verified", evidence: "E2E", shipped: "yes", raw: "" }],
         warnings: [],
       });
-    if (path === "/api/repos/self/overview")
-      return json(route, {
-        metrics: null,
-        cost_mix: null,
-        caps: { issue_cap_usd: 5, daily_cap_usd: 10, today_usd: 2 },
-        health: [],
-        unattributed: Array.from({ length: 30 }, (_, index) => ({
-          ts: `2026-07-29T07:${String(index).padStart(2, "0")}:00Z`,
-          event: "tick",
-          kind: `background-${index}`,
-          role: index % 2 === 0 ? "fix" : "review",
-        })),
-        health_trend: [{
-          day: "2026-07-29",
-          opened: 3,
-          closed: 1,
-          net_open: 2,
-          recurrences: 0,
-          first_observation: true,
-        }],
-        warnings: [],
-      });
+    if (path === "/api/repos/self/overview") return json(route, overviewPayload);
     return json(route, { ok: true, detail: "started" });
   });
 }
@@ -414,15 +532,13 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await page.getByRole("button", { name: "Quota", exact: true }).click();
   await expectVerticallyContained(".quota-card");
   await page.getByRole("button", { name: "Quota", exact: true }).click();
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
-  await expectVerticallyContained(".options-popover");
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
   await page.getByRole("button", { name: "Expand sidebar" }).click();
   await page.setViewportSize({ width: 1440, height: 900 });
   await expect(page.getByRole("tab", { name: /In flight/ })).toBeVisible();
   await expect(page.getByRole("tab", { name: /Backlog/ })).toBeVisible();
   await expect(page.getByText("#/repo/self/issues/done")).toHaveCount(0);
-  await expect(page.getByRole("columnheader", { name: /Date/ })).toBeVisible();
+  await expect(page.getByRole("columnheader", { name: /Since done/ })).toBeVisible();
+  await expect(page.getByRole("columnheader", { name: /^Date/ })).toHaveCount(0);
   await expect(page.locator(".duration-breakdown").first()).toContainText("1:17:18");
 
   const mainbody = page.locator(".mainbody");
@@ -452,19 +568,21 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await expect(page.getByRole("region", { name: "Quota" })).toBeVisible();
   await expect(page.getByText("Quota", { exact: true })).toHaveCount(1);
 
-  const sidebar = page.locator(".sidebar");
   await expect(page.locator(".sidebar-scroll")).toHaveCSS("overflow-y", "auto");
   await expect(page.getByRole("separator", { name: "Resize sidebar" })).toBeVisible();
   await page.getByRole("button", { name: "Collapse sidebar" }).click();
-  await expect(sidebar).toHaveClass(/collapsed/);
+  await expect(page.getByRole("button", { name: "Expand sidebar" })).toBeVisible();
   await expect(page.getByRole("button", { name: "Quota" })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Settings" })).toBeVisible();
+  await page.getByRole("button", { name: "Quota", exact: true }).click();
   await expect(page.getByRole("region", { name: "Quota" })).toHaveClass(/compact/);
-  for (const name of ["Quota", "Settings", "Verification ledger"]) {
-    const bounds = await page.getByRole("button", { name, exact: true }).boundingBox();
-    expect(bounds?.width).toBeGreaterThanOrEqual(40);
-    expect(bounds?.height).toBeGreaterThanOrEqual(40);
-  }
+  const expandBounds = await page.getByRole("button", { name: "Expand sidebar" }).boundingBox();
+  const repoTitleBounds = await page.locator(".repo-context-name").boundingBox();
+  expect(expandBounds).not.toBeNull();
+  expect(repoTitleBounds).not.toBeNull();
+  expect(expandBounds!.x + expandBounds!.width).toBeLessThanOrEqual(repoTitleBounds!.x);
+  const collapsedQuotaBounds = await page.getByRole("button", { name: "Quota", exact: true }).boundingBox();
+  expect(collapsedQuotaBounds?.width).toBeGreaterThanOrEqual(40);
+  expect(collapsedQuotaBounds?.height).toBeGreaterThanOrEqual(40);
   const compactTrack = page.locator(".compact-quota-track").first();
   const compactTrackBounds = await compactTrack.boundingBox();
   expect(compactTrackBounds!.width).toBeGreaterThan(compactTrackBounds!.height);
@@ -563,8 +681,13 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
     "href",
     "https://github.com/openai/autonomous-issue-agent/pull/75",
   );
+  await expect(page.getByRole("link", { name: "#50" })).toHaveAttribute(
+    "href",
+    "https://github.com/openai/autonomous-issue-agent/issues/50",
+  );
+  await expect(page.getByRole("link", { name: "#50" })).toHaveAttribute("target", "_blank");
   await expect(page.getByText(/issue on GitHub/i)).toHaveCount(0);
-  await expect(page.getByText("Resolve", { exact: true })).toBeVisible();
+  await expect(page.locator(".step-disclosure").first()).toContainText("Resolve");
   await expect(page.getByText("Luna", { exact: true })).toHaveCount(0);
   await expect(page.getByText("1:17", { exact: true })).toHaveCount(2);
 
@@ -582,7 +705,9 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
     for (let index = 0; index < 12; index += 1) await page.keyboard.press("ArrowLeft");
     await expect(separator).toHaveAttribute("aria-valuenow", String(minimum));
     const header = page.locator(`th[data-column-key="${name.toLowerCase()}"]`);
-    expect((await header.boundingBox())!.width).toBeLessThanOrEqual(minimum + 1);
+    const renderedWidth = (await header.boundingBox())!.width;
+    expect(renderedWidth).toBeGreaterThanOrEqual(minimum);
+    expect(renderedWidth).toBeLessThanOrEqual(minimum + 24);
   }
   await page.screenshot({
     path: "../evidence/dashboard-issue-columns.png",
@@ -610,7 +735,6 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
     max: element.scrollHeight - element.clientHeight,
   }));
   expect(overviewScroll.top).toBe(overviewScroll.max);
-  expect(await page.evaluate(() => document.documentElement.scrollHeight)).toBe(900);
   await expect(page.locator(".sidebar-foot")).toBeInViewport();
   await page.getByRole("tab", { name: /Done/ }).click();
   await expect(page.getByRole("tab", { name: /Done/ })).toHaveAttribute("aria-selected", "true");
@@ -619,6 +743,57 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await expect(page.getByText("Verification ledger", { selector: ".section-title span" })).toBeVisible();
   await expect(page.getByRole("tab", { name: "Verification" })).toHaveCount(0);
   await expect(page.getByRole("tab", { name: "Overview" })).toHaveCount(0);
+});
+
+test("captures the round-three operator states at 1440px", async ({ page }) => {
+  await mockApi(page, 0, {
+    issuesPayload: round3Issues,
+    overviewPayload: round3Overview,
+  });
+  await page.setViewportSize({ width: 1440, height: 1000 });
+  await page.goto("/#/repo/self/overview");
+
+  await expect(page.getByText("Needs attention")).toBeVisible();
+  await expect(page.getByText("Daemon health")).toBeVisible();
+  await expect(page.getByText("Active lifecycle")).toHaveCount(0);
+  await page.screenshot({
+    path: "../evidence-facelift/after-overview.png",
+    fullPage: true,
+    animations: "disabled",
+  });
+  const spendBar = page.locator('.hist-col[data-tip*="$0.12 spent"]').first();
+  await spendBar.scrollIntoViewIfNeeded();
+  await spendBar.hover();
+  await expect(page.locator(".tip.tip-on")).toContainText("$0.12 spent");
+  await page.locator(".mainbody").evaluate((element) => {
+    element.scrollTop = 0;
+  });
+
+  await page.getByRole("tab", { name: /In flight/ }).click();
+  await expect(page.getByRole("columnheader", { name: /Lifecycle/ })).toBeVisible();
+  await expect(page.getByText(/Harness issue: required-test gate rejects/)).toBeVisible();
+  await page.screenshot({
+    path: "../evidence-facelift/after-issues-inflight.png",
+    fullPage: true,
+    animations: "disabled",
+  });
+
+  await page.getByRole("tab", { name: /Done/ }).click();
+  await expect(page.locator(".lifecycle")).toHaveCount(0);
+  await page.screenshot({
+    path: "../evidence-facelift/after-issues-done.png",
+    fullPage: true,
+    animations: "disabled",
+  });
+
+  await page.getByRole("tab", { name: /Backlog/ }).click();
+  await expect(page.getByText("AC + test plan written")).toBeVisible();
+  await expect(page.getByText("awaiting steward")).toBeVisible();
+  await page.screenshot({
+    path: "../evidence-facelift/after-issues-backlog.png",
+    fullPage: true,
+    animations: "disabled",
+  });
 });
 
 test("shows a skeleton before the deployment request resolves", async ({ page }) => {

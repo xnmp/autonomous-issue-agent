@@ -373,7 +373,10 @@ class Backend:
         key: tuple,
         load,
     ) -> tuple[_GHContext, bool]:
-        return self._gh_enrichment.get(key, load)
+        (issues, prs, warnings), enriched = self._gh_enrichment.get(key, load)
+        # Response-specific diagnostics are composed below. Never let a poll
+        # append into the cached enrichment value shared by every request.
+        return (issues, prs, list(warnings)), enriched
 
     def _cached_detail_limits(
         self, name: str, repo: str

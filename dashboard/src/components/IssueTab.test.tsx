@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { IssueTab } from "./IssueTab";
 
 describe("IssueTab", () => {
-  it("links the PR badge to GitHub and omits the redundant issue link", async () => {
+  it("links both issue reference and PR badge to GitHub in new tabs", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(
@@ -33,11 +33,14 @@ describe("IssueTab", () => {
       ),
     );
 
-    render(<IssueTab repo="demo" issue={50} />);
+    render(<IssueTab repo="o/r" issue={50} />);
 
     const pr = await screen.findByRole("link", { name: /PR #75/ });
     expect(pr).toHaveAttribute("href", "https://github.com/o/r/pull/75");
-    expect(screen.queryByText(/issue on GitHub/i)).not.toBeInTheDocument();
+    const issue = screen.getByRole("link", { name: "#50" });
+    expect(issue).toHaveAttribute("href", "https://github.com/o/r/issues/50");
+    expect(issue).toHaveAttribute("target", "_blank");
+    expect(issue).toHaveAttribute("rel", "noopener");
     expect(screen.getAllByText("done")).toHaveLength(1);
     expect(screen.getByRole("tab", { name: /Tasks/ })).toBeVisible();
     expect(screen.getByRole("tab", { name: /Events/ })).toBeVisible();

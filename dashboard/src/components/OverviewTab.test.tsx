@@ -31,20 +31,27 @@ function overview(interventionCount = 0) {
 }
 
 describe("OverviewTab hierarchy", () => {
-  it("puts live attention and operator actions before historical metrics", async () => {
+  it("keeps attention and KPIs ahead of daemon health and operator history", async () => {
     const { container } = overview();
 
     const attention = (await screen.findByText("Needs attention")).closest("section");
+    const health = screen.getByText("Daemon health").closest("section");
     const actions = screen.getByText("Operator actions").closest("section");
     const metrics = container.querySelector(".overview-metrics");
 
     expect(attention).not.toBeNull();
+    expect(health).not.toBeNull();
     expect(actions).not.toBeNull();
     expect(metrics).not.toBeNull();
-    expect(attention!.compareDocumentPosition(actions!) & Node.DOCUMENT_POSITION_FOLLOWING)
+    expect(attention!.compareDocumentPosition(metrics!) & Node.DOCUMENT_POSITION_FOLLOWING)
       .toBeTruthy();
-    expect(actions!.compareDocumentPosition(metrics!) & Node.DOCUMENT_POSITION_FOLLOWING)
+    expect(metrics!.compareDocumentPosition(health!) & Node.DOCUMENT_POSITION_FOLLOWING)
       .toBeTruthy();
+    expect(metrics!.compareDocumentPosition(actions!) & Node.DOCUMENT_POSITION_FOLLOWING)
+      .toBeTruthy();
+    expect(screen.queryByText("Active lifecycle")).not.toBeInTheDocument();
+    expect(screen.queryByText("Cost mix by task family")).not.toBeInTheDocument();
+    expect(screen.queryByText("Spend by task type")).not.toBeInTheDocument();
   });
 
   it("filters a long operator-action timeline without hiding its total", async () => {
