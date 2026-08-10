@@ -48,7 +48,7 @@ class AgentKind(Enum):
     REVIEW = auto()          # review-pr.sh
     RE_REVIEW = auto()       # re-review-pr.sh
     TRIAGE = auto()          # steward triage_once (per issue)
-    GROOM = auto()           # steward advisory issue grooming (per issue)
+    GROOM = auto()           # steward bounded issue grooming (per issue)
     STEWARD_DRIVE = auto()   # steward drive_once
     JIRA_SYNC = auto()       # steward: mirror an issue's lifecycle into its Jira ticket
 

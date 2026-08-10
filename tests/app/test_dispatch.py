@@ -135,6 +135,12 @@ class FakeStore:
     def set_resolve_retries(self, i, n):
         self.__dict__.setdefault("resolve_retries", {})[i] = n
 
+    def get_last_resolve_error(self, i):
+        return getattr(self, "last_resolve_error", {}).get(i, "")
+
+    def set_last_resolve_error(self, i, summary):
+        self.__dict__.setdefault("last_resolve_error", {})[i] = summary
+
     def set_triage_at(self, i, at):
         self.triage_at[i] = at
 

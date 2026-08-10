@@ -1,0 +1,36 @@
+# Linux systemd unit (user service) TEMPLATE — do not install by hand, the
+# placeholder tokens below (wrapped in "at" signs) are filled in and this file
+# is copied to ~/.config/systemd/user/issue-agent-dashboard.service by:
+#   bin/install-systemd.sh
+# Logs go to the journal — tail with:
+#   journalctl --user -u issue-agent-dashboard -f
+[Unit]
+Description=Autonomous issue agent — dashboard (all repositories)
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStart=@UV_BIN@ run --extra sdk --extra dash issue-agent dashboard
+WorkingDirectory=@HARNESS_ROOT@
+# The operator's PATH, captured at install time. Re-run install-service after
+# moving a toolchain so the singleton follows the latest harness installation.
+Environment=PATH=@INSTALL_PATH@
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=0 2 3 4 5 6
+# Exit 87 is the designed hot-reload path. It is successful for reporting but
+# still forces systemd to restart the dashboard on the newly committed code.
+SuccessExitStatus=87
+RestartForceExitStatus=87
+TimeoutStopSec=90
+KillSignal=SIGTERM
+FinalKillSignal=SIGKILL
+MemoryMax=4G
+TasksMax=512
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

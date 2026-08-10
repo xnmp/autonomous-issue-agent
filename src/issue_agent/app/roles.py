@@ -3300,7 +3300,9 @@ def build_steward_daemon(
         and isinstance(gateway, IssueStateReasonReads),
     ))
     if cfg.steward_groom_edit:
-        steward_log("STEWARD_GROOM_EDIT=1 is inert: grooming currently comments only; issue bodies are never edited")
+        steward_log(
+            "STEWARD_GROOM_EDIT=1 is inert: grooming never edits issue bodies"
+        )
 
     def decide(world):
         # Before the pure decide, as in the fixer: if the decision raises, the

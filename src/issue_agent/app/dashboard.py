@@ -466,7 +466,51 @@ def _details(row: IssueRow) -> str:
 
 
 # ── serving ───────────────────────────────────────────────────────────────────
-def serve(port: int, build_html, host: str = "127.0.0.1") -> None:
+def _serve_until_reload(server, reload_check, poll_seconds: float) -> int:
+    import threading
+
+    if reload_check is None:
+        server.serve_forever()
+        return 0
+
+    stopped = threading.Event()
+    reload_requested = threading.Event()
+
+    def watch() -> None:
+        while not stopped.wait(poll_seconds):
+            if not reload_check():
+                continue
+            reload_requested.set()
+            server.shutdown()
+            return
+
+    watcher = threading.Thread(
+        target=watch,
+        name="issue-agent-dashboard-fallback-reload",
+        daemon=True,
+    )
+    watcher.start()
+    try:
+        server.serve_forever()
+    finally:
+        stopped.set()
+        server.server_close()
+        watcher.join(timeout=max(1.0, poll_seconds * 2))
+    if reload_requested.is_set():
+        from ..adapters.reload import RELOAD_EXIT_CODE
+
+        return RELOAD_EXIT_CODE
+    return 0
+
+
+def serve(
+    port: int,
+    build_html,
+    host: str = "127.0.0.1",
+    *,
+    reload_check=None,
+    poll_seconds: float = 1.0,
+) -> int:
     """Serve a freshly regenerated snapshot on every GET, forever (Ctrl-C stops).
 
     `build_html` is called per request rather than once at startup so a browser
@@ -493,7 +537,11 @@ def serve(port: int, build_html, host: str = "127.0.0.1") -> None:
         def log_message(self, format: str, *args: object) -> None:
             del format, args  # keep the terminal for the dashboard
 
-    HTTPServer((host, port), Handler).serve_forever()
+    return _serve_until_reload(
+        HTTPServer((host, port), Handler),
+        reload_check,
+        poll_seconds,
+    )
 
 
 # ── small helpers ─────────────────────────────────────────────────────────────

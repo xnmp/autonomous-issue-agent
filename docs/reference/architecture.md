@@ -55,9 +55,13 @@ ADR 0012 stall ceiling escalates it.
 
 The steward optionally grooms open issue bodies (`STEWARD_GROOM=1`): it emits
 advisory comments and the orthogonal `maybe-resolved` label for verified recent
-merge matches or stale references, never a close action. Grooming is capped at
-five candidates per changed tick and persists a title/body signature after a
-successful delivery, preventing harness comments from self-amplifying spend.
+merge matches or stale references. A structured `duplicate_of` claim may close
+an issue only when `STEWARD_PROMOTE=1` and a separate harness-owned GitHub read
+proves the target is a different, closed issue. The close travels through the
+same durable `CloseIssue` rail as triage and always uses the harness-selected
+`completed` reason. Grooming is capped at five candidates per changed tick and
+persists a title/body signature after a successful delivery, preventing harness
+comments from self-amplifying spend.
 It also performs a free reconciliation over open PR metadata and posts one
 advisory flag when a changed path is governed by an ADR that the PR description
 does not cite. The shell governor is advisory defense-in-depth; durable
@@ -462,7 +466,7 @@ exemptable-vs-security rule classification, and the merge-withholding rule),
 `domain/projection.py`, `domain/refs.py`, `domain/repository.py`,
 `domain/recovery.py`, `domain/reservation_recovery.py`,
 `domain/review.py`,
-`domain/steward_stall.py`,
+`domain/steward.py`, `domain/steward_stall.py`,
 `domain/supervision.py`, `domain/triage.py`, `domain/trust.py`, and
 `domain/world.py`.
 

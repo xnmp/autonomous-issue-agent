@@ -491,10 +491,10 @@ class HarnessConfig:
     review_dimension_budget_usd: float = 0.75
     review_validation_budget_usd: float = 0.20
     steward_triage: bool = True
-    # Advisory grooming is opt-in; it never closes or edits issue bodies.
+    # Grooming is opt-in; validated duplicate closure also needs STEWARD_PROMOTE.
     steward_groom: bool = False
-    # Reserved explicit opt-in for future body rewrites; current grooming only
-    # comments, regardless of this setting.
+    # Reserved explicit opt-in for future body rewrites; grooming never edits
+    # issue bodies, regardless of this setting.
     steward_groom_edit: bool = False
     steward_promote: bool = False
     # Handle triage @-mentions for OWNER-level (technical/architectural) questions —

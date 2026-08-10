@@ -1397,7 +1397,7 @@ def recurrence_keys(events) -> set[str]:
 
 
 def groomed_keys(events) -> set[str]:
-    """Durable one-shot keys for advisory steward grooming findings."""
+    """Durable one-shot keys for harness-adjudicated steward grooming findings."""
     return _emitted_block_keys(events, "groomed")
 
 

@@ -260,14 +260,29 @@ TRIAGE_SCHEMA: dict = {
     ],
 }
 
-# Steward grooming is deliberately a narrow advisory classifier. The optional
-# fields keep the default verdict "no finding", avoiding pressure to invent a
-# match from attacker-controlled issue text.
+# Steward grooming is deliberately narrow. Every field is optional so "no
+# finding" remains the default, avoiding pressure to invent a match from
+# attacker-controlled issue text. ``disposition`` is still only a claim until
+# the workflow launders it through a harness-owned GitHub observation.
 GROOM_SCHEMA: dict = {
     "type": "object",
     "properties": {
         "resolved_by": {"type": "integer"},
         "stale_reference": {"type": "string"},
+        # An agent-authored claim only. The steward independently reads the
+        # target issue and permits lifecycle mutation only when it is distinct
+        # and closed. ``already_fixed`` is omitted until the world can prove a
+        # merged harness PR fixed the specific defect.
+        "disposition": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["duplicate_of"]},
+                "issue": {"type": "integer", "minimum": 1},
+                "reason": {"type": "string", "minLength": 1, "maxLength": 500},
+            },
+            "required": ["kind", "issue", "reason"],
+            "additionalProperties": False,
+        },
     },
 }
 

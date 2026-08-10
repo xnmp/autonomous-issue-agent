@@ -131,6 +131,25 @@ def test_systemd_units_run_python_from_harness_root_with_target_dir_env():
         assert not any("watcher.sh" in v for v in exec_start.split())
 
 
+def test_systemd_dashboard_is_a_hot_reloading_host_singleton():
+    unit = _parse_unit(
+        _read("ops/systemd/issue-agent-dashboard.service")
+    )
+    service = unit["Service"]
+    exec_start = service["ExecStart"][0].split()
+
+    assert exec_start[0] == "@UV_BIN@"
+    assert exec_start[-2:] == ["issue-agent", "dashboard"]
+    assert service["WorkingDirectory"] == ["@HARNESS_ROOT@"]
+    assert service["Environment"] == ["PATH=@INSTALL_PATH@"]
+    assert service["Restart"] == ["on-failure"]
+    assert service["RestartPreventExitStatus"] == ["0 2 3 4 5 6"]
+    assert service["SuccessExitStatus"] == ["87"]
+    assert service["RestartForceExitStatus"] == ["87"]
+    assert unit["Unit"]["StartLimitIntervalSec"] == ["300"]
+    assert unit["Unit"]["StartLimitBurst"] == ["10"]
+
+
 # ── launchd plists: plistlib gives a real ProgramArguments list ──────────────
 def test_launchd_plists_run_python_from_harness_root_with_target_dir_env():
     plists = {

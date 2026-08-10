@@ -1630,7 +1630,7 @@ def build_groom_task(
     cfg: GroomTaskConfig,
     recent_merges: Untrusted | None = None,
 ) -> PlannedRun:
-    """Classify one existing open issue for advisory grooming only."""
+    """Classify one existing open issue for bounded steward grooming."""
     prompt = (
         f"Open issue #{issue_number}\n{_fenced('issue title', title)}\n"
         f"{_fenced('issue body', body)}\n\n"
@@ -1640,8 +1640,12 @@ def build_groom_task(
         "by one numbered item in that list; otherwise omit it. Use Read and rg to "
         "check whether an explicitly referenced repository path, flag, or UI artifact "
         "is gone; return that exact reference in `stale_reference` only when verified. "
-        "Do not infer staleness merely because the issue is old. This is advisory: do "
-        "not propose closing, editing, relabelling, or dispatching the issue."
+        "Do not infer staleness merely because the issue is old. When this issue is "
+        "clearly a duplicate of a DIFFERENT issue, return `disposition` with kind "
+        "`duplicate_of`, that issue number, and a short reason. Never claim a duplicate "
+        "merely because the reports look similar, and omit `disposition` when unsure. "
+        "The harness will independently verify the target's lifecycle state. Do not "
+        "directly close, edit, relabel, or dispatch any issue."
     )
     return PlannedRun(
         prompt=prompt, schema=GROOM_SCHEMA, allowed_tools=TRIAGE_TOOLS,

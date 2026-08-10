@@ -61,7 +61,7 @@ def test_dashboard_reports_a_stale_frontend_bundle_before_falling_back(
     monkeypatch.setattr(
         dashboard,
         "serve",
-        lambda _port, _render: (_ for _ in ()).throw(KeyboardInterrupt()),
+        lambda _port, _render, **_kw: (_ for _ in ()).throw(KeyboardInterrupt()),
     )
 
     assert cli.cmd_dashboard(args) == 0

@@ -1,14 +1,20 @@
 """Hot reload — commit-gated (partial edits cannot load), fires only between
-ticks, and a broken watch costs hot reload, never the daemon."""
+units of work, and a broken watch costs hot reload, never the process."""
 from __future__ import annotations
 
 import os
 import subprocess
+import sys
+import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
 from issue_agent.adapters.reload import RELOAD_EXIT_CODE, ReloadWatch
+from issue_agent.app import dashboard
+from issue_agent.app.dashweb import server as dashweb_server
+from issue_agent.app.dashweb.server import _run_server_until_reload
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.loop import Daemon
 from issue_agent.domain.world import WorldState
@@ -28,6 +34,15 @@ def _repo(tmp_path):
     _git(tmp_path, "add", "-A")
     _git(tmp_path, "commit", "-qm", "one")
     return tmp_path
+
+
+def _wait_until(predicate, timeout: float = 1.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.001)
+    return False
 
 
 def test_uncommitted_edits_do_not_trigger_but_a_commit_does(tmp_path):
@@ -117,3 +132,88 @@ def test_daemon_without_reload_check_never_exits_early():
     )
     d.run_forever(sleep=lambda s: None, now=lambda: 0, max_ticks=3)
     assert len(ticked) == 3
+
+
+def test_dashboard_source_change_gracefully_stops_server_with_reload_code():
+    class GracefulServer:
+        should_exit = False
+
+        def __init__(self):
+            self.request_started = threading.Event()
+            self.request_drained = False
+
+        def run(self):
+            self.request_started.set()
+            assert _wait_until(lambda: self.should_exit)
+            # uvicorn's Server.run has the same contract: should_exit closes
+            # listeners, then the call returns only after active requests drain.
+            self.request_drained = True
+
+    server = GracefulServer()
+    logs = []
+
+    code = _run_server_until_reload(
+        server,
+        lambda: server.request_started.is_set(),
+        poll_seconds=0.001,
+        log=logs.append,
+    )
+
+    assert code == RELOAD_EXIT_CODE
+    assert server.should_exit
+    assert server.request_drained
+    assert logs == [
+        "dashboard: source changed — exiting for supervisor restart; "
+        "re-run `issue-agent dashboard` if unsupervised"
+    ]
+
+
+def test_dashboard_uvicorn_config_bounds_graceful_shutdown(monkeypatch):
+    captured = {}
+
+    class Config:
+        def __init__(self, _app, **kwargs):
+            captured.update(kwargs)
+
+    class Server:
+        def __init__(self, _config):
+            self.should_exit = False
+
+        def run(self):
+            return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "uvicorn",
+        SimpleNamespace(Config=Config, Server=Server),
+    )
+    monkeypatch.setenv("HOT_RELOAD", "0")
+    monkeypatch.setattr(dashweb_server, "create_app", lambda backend=None: backend)
+
+    assert dashweb_server.serve(8321, backend=object()) == 0
+    assert captured["timeout_graceful_shutdown"] == 30
+
+
+def test_fallback_dashboard_exits_for_supervisor_reload():
+    class Server:
+        def __init__(self):
+            self.stopped = threading.Event()
+            self.closed = False
+
+        def serve_forever(self):
+            assert self.stopped.wait(timeout=1)
+
+        def shutdown(self):
+            self.stopped.set()
+
+        def server_close(self):
+            self.closed = True
+
+    server = Server()
+
+    assert dashboard._serve_until_reload(
+        server,
+        reload_check=lambda: True,
+        poll_seconds=0.001,
+    ) == RELOAD_EXIT_CODE
+    assert server.closed

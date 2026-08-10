@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Install the three systemd user services (Linux). Mirrors install-launchd.sh.
+# Install the three per-repo role services and host-wide dashboard service
+# (Linux). Mirrors install-launchd.sh for the role services.
 #
-#   bin/install-systemd.sh                # install + enable + start all three,
+#   bin/install-systemd.sh                # install + enable + start all roles,
+#                                          # plus the singleton dashboard,
 #                                          # for the repo config AGENT_ENV points at
 #   bin/install-systemd.sh uninstall      # stop + disable + remove ALL issue-agent
 #                                          # units (every repo installed this way)
@@ -33,6 +35,7 @@ canonical_deployment_id() {
 }
 
 services=(issue-agent-fix-watcher issue-agent-review-watcher issue-agent-steward)
+DASHBOARD_SERVICE=issue-agent-dashboard
 DRY_RUN=0
 [ "${1:-}" != "--dry-run" ] || DRY_RUN=1
 
@@ -152,9 +155,16 @@ for index in "${!services[@]}"; do
       -e "s#@UV_BIN@#$UV_BIN#g" "$src" > "$candidate"
   "$SYSTEMD_ANALYZE" --user verify "$candidate"
 done
+dashboard_candidate="$STAGE/$DASHBOARD_SERVICE.service"
+sed -e "s#@HARNESS_ROOT@#$HARNESS_ROOT#g" \
+    -e "s|@INSTALL_PATH@|$_install_path_escaped|g" \
+    -e "s#@UV_BIN@#$UV_BIN#g" \
+    "$HARNESS_ROOT/ops/systemd/$DASHBOARD_SERVICE.service" \
+    > "$dashboard_candidate"
+"$SYSTEMD_ANALYZE" --user verify "$dashboard_candidate"
 
 if [ "$DRY_RUN" -eq 1 ]; then
-  echo "validated ${#services[@]} unit(s) for deployment '$NAME'"
+  echo "validated $((${#services[@]} + 1)) unit(s) for deployment '$NAME'"
   echo "executable: $UV_BIN"
   echo "config snapshot: $SNAP_CONFIG"
   exit 0
@@ -336,5 +346,111 @@ for s in "${services[@]}"; do
   echo "✓ enabled+started $s-$NAME: active (running)"
 done
 trap - ERR INT TERM
+
+dashboard_port_owner() {
+  port="$1"
+  # Injectable for tests: set to a command to delegate the probe; set EMPTY to
+  # assert the port is free (the suite runs on hosts where a real dashboard is
+  # legitimately listening — the probe must not read the host).
+  if [ "${ISSUE_AGENT_DASHBOARD_PORT_CHECK+set}" = "set" ]; then
+    if [ -n "$ISSUE_AGENT_DASHBOARD_PORT_CHECK" ]; then
+      "$ISSUE_AGENT_DASHBOARD_PORT_CHECK" "$port"
+      return
+    fi
+    return 1
+  fi
+
+  owner_pid=""
+  if command -v ss >/dev/null 2>&1; then
+    socket_line="$(ss -H -ltnp "sport = :$port" 2>/dev/null | head -n 1)"
+    [ -n "$socket_line" ] || return 1
+    owner_pid="$(printf '%s' "$socket_line" \
+      | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p')"
+  elif command -v lsof >/dev/null 2>&1; then
+    owner_pid="$(lsof -nP -t -iTCP:"$port" -sTCP:LISTEN 2>/dev/null \
+      | head -n 1)"
+    [ -n "$owner_pid" ] || return 1
+  elif command -v fuser >/dev/null 2>&1; then
+    owner_pid="$(fuser -n tcp "$port" 2>/dev/null | awk '{print $1}')"
+    [ -n "$owner_pid" ] || return 1
+  elif (: <> "/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+    owner_pid="unknown"
+  else
+    return 1
+  fi
+
+  owner_command="unknown command"
+  if [ "$owner_pid" != "unknown" ]; then
+    owner_command="$(ps -p "$owner_pid" -o args= 2>/dev/null || true)"
+    owner_command="${owner_command:-unknown command}"
+  fi
+  printf '%s\t%s\n' "$owner_pid" "$owner_command"
+}
+
+dashboard_owner=""
+if dashboard_owner="$(dashboard_port_owner 8321)"; then
+  dashboard_owner_pid="${dashboard_owner%%$'\t'*}"
+  dashboard_owner_command="${dashboard_owner#*$'\t'}"
+  dashboard_unit_pid=""
+  if systemctl --user is-active --quiet "$DASHBOARD_SERVICE.service"; then
+    dashboard_unit_pid="$(
+      systemctl --user show "$DASHBOARD_SERVICE.service" \
+        --property=MainPID --value
+    )"
+  fi
+  if [ -z "$dashboard_unit_pid" ] \
+     || [ "$dashboard_unit_pid" = "0" ] \
+     || [ "$dashboard_owner_pid" != "$dashboard_unit_pid" ]; then
+    echo "dashboard install failed: TCP 8321 is already bound by PID $dashboard_owner_pid ($dashboard_owner_command), not $DASHBOARD_SERVICE.service. Stop the manual \`issue-agent dashboard\` process and rerun this installer; role units remain installed." >&2
+    exit 1
+  fi
+fi
+
+dashboard_dst="$UD/$DASHBOARD_SERVICE.service"
+[ ! -f "$dashboard_dst" ] || cp "$dashboard_dst" "$STAGE/dashboard.previous"
+dashboard_active=0
+dashboard_enabled=0
+systemctl --user is-active --quiet "$DASHBOARD_SERVICE.service" \
+  && dashboard_active=1 || true
+systemctl --user is-enabled --quiet "$DASHBOARD_SERVICE.service" \
+  && dashboard_enabled=1 || true
+if [ ! -f "$dashboard_dst" ] \
+   && { [ "$dashboard_active" -eq 1 ] || [ "$dashboard_enabled" -eq 1 ]; }; then
+  echo "REFUSING dashboard cutover: active/enabled unit $DASHBOARD_SERVICE.service has no recoverable definition at $dashboard_dst; role units remain installed" >&2
+  exit 2
+fi
+[ "$dashboard_active" -ne 1 ] || touch "$STAGE/dashboard.active"
+[ "$dashboard_enabled" -ne 1 ] || touch "$STAGE/dashboard.enabled"
+
+dashboard_rollback() {
+  status=$?
+  [ "$status" -ne 0 ] || status=1
+  trap - ERR INT TERM
+  set +e
+  systemctl --user disable --now "$DASHBOARD_SERVICE.service" >/dev/null 2>&1
+  if [ -f "$STAGE/dashboard.previous" ]; then
+    mv "$STAGE/dashboard.previous" "$dashboard_dst"
+  else
+    rm -f -- "$dashboard_dst"
+  fi
+  systemctl --user daemon-reload >/dev/null 2>&1
+  [ ! -f "$STAGE/dashboard.enabled" ] \
+    || systemctl --user enable "$DASHBOARD_SERVICE.service" >/dev/null 2>&1
+  [ ! -f "$STAGE/dashboard.active" ] \
+    || systemctl --user restart "$DASHBOARD_SERVICE.service" >/dev/null 2>&1
+  echo "dashboard installation failed; restored its previous unit; role units remain installed" >&2
+  exit "$status"
+}
+trap dashboard_rollback ERR INT TERM
+
+stop_unit "$DASHBOARD_SERVICE.service"
+mv "$dashboard_candidate" "$dashboard_dst"
+systemctl --user daemon-reload
+systemctl --user enable "$DASHBOARD_SERVICE.service"
+systemctl --user restart "$DASHBOARD_SERVICE.service"
+systemctl --user is-active --quiet "$DASHBOARD_SERVICE.service"
+assert_running "$DASHBOARD_SERVICE.service"
+echo "✓ enabled+started $DASHBOARD_SERVICE: active (running)"
+trap - ERR INT TERM
 echo "Done. 'systemctl --user status issue-agent-*-$NAME' or"
-echo "'journalctl --user -u issue-agent-fix-watcher-$NAME -f' to confirm."
+echo "'systemctl --user status issue-agent-dashboard' to confirm."

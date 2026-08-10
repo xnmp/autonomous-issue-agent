@@ -98,7 +98,10 @@ issue-agent install-service
 
 The installer renders deployment-specific systemd user units on Linux or
 launchd jobs on macOS, validates them, and retains the previous known-good
-artifacts on failure. Rendered service definitions pin the absolute `uv`
+artifacts on failure. On Linux it also refreshes and restarts the host-wide
+`issue-agent-dashboard.service`; the most recent repository installation owns
+that singleton definition, while every repository's role units remain
+independent. Rendered service definitions pin the absolute `uv`
 executable found during installation; the installers' `--dry-run` mode
 validates candidates without replacing live definitions. Each
 role/repository/checkout owns a distinct lock and identity.
@@ -200,6 +203,12 @@ issue-agent dashboard                 # interactive server
 issue-agent dashboard --text
 issue-agent dashboard --html
 ```
+
+The Linux service installer keeps the interactive server running as the
+host-wide `issue-agent-dashboard.service`. The server watches this harness
+checkout's committed HEAD and exits 87 after active requests drain so systemd
+can restart it on the new code. A manually started server exits the same way
+and prints the command to re-run when no supervisor is present.
 
 For deployments with `events-v2.jsonl`, all dashboard surfaces use the one pure
 `domain/projection.py::fold`. GitHub calls may enrich links/titles but do not

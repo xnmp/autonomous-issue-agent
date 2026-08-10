@@ -19,6 +19,9 @@ from __future__ import annotations
 import html
 import mimetypes
 import os
+import sys
+import threading
+from collections.abc import Callable
 
 from ...adapters.dashweb import actions, costchart
 from ...adapters.dashweb.bundle import bundle_snapshot, published_dist
@@ -34,6 +37,7 @@ HOST = "127.0.0.1"
 # requiring this header on every write is what stops a page the operator merely
 # VISITS from launching daemons or relabelling issues.
 CSRF_HEADER = "x-issue-agent-dashboard"
+GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 30
 LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "[::1]", "::1")
 
 
@@ -406,11 +410,74 @@ def instructions_page(harness_root: str | None = None) -> str:
     )
 
 
+def _run_server_until_reload(
+    server,
+    reload_check: Callable[[], bool] | None,
+    *,
+    poll_seconds: float = 1.0,
+    log: Callable[[str], None] | None = None,
+) -> int:
+    """Run one uvicorn instance and request its graceful shutdown on reload.
+
+    Setting ``should_exit`` makes uvicorn close its listeners and wait for
+    active requests before ``run`` returns. Only then do we return exit 87 to
+    the process supervisor, so no response is cut in half.
+    """
+    if reload_check is None:
+        server.run()
+        return 0
+
+    stopped = threading.Event()
+    reload_requested = threading.Event()
+
+    def watch() -> None:
+        while not stopped.wait(poll_seconds):
+            if not reload_check():
+                continue
+            reload_requested.set()
+            message = (
+                "dashboard: source changed — exiting for supervisor restart; "
+                "re-run `issue-agent dashboard` if unsupervised"
+            )
+            (log or (lambda value: print(value, file=sys.stderr)))(message)
+            server.should_exit = True
+            return
+
+    watcher = threading.Thread(
+        target=watch,
+        name="issue-agent-dashboard-reload",
+        daemon=True,
+    )
+    watcher.start()
+    try:
+        server.run()
+    finally:
+        stopped.set()
+        watcher.join(timeout=max(1.0, poll_seconds * 2))
+    if reload_requested.is_set():
+        from ...adapters.reload import RELOAD_EXIT_CODE
+
+        return RELOAD_EXIT_CODE
+    return 0
+
+
 def serve(
     port: int, host: str = HOST, backend: DashboardBackend | None = None
-) -> None:
+) -> int:
     """Run the dashboard on loopback. Loopback is not a default but a
     constraint: the POST actions launch daemons and relabel issues."""
     import uvicorn
 
-    uvicorn.run(create_app(backend=backend), host=host, port=port, log_level="warning")
+    reload_check = None
+    if os.environ.get("HOT_RELOAD", "1") != "0":
+        from ...adapters.reload import ReloadWatch
+
+        reload_check = ReloadWatch(cli.HARNESS_ROOT).changed
+    config = uvicorn.Config(
+        create_app(backend=backend),
+        host=host,
+        port=port,
+        log_level="warning",
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS,
+    )
+    return _run_server_until_reload(uvicorn.Server(config), reload_check)

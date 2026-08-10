@@ -2778,7 +2778,7 @@ def cmd_dashboard(args) -> int:
 
         info(f"serving the interactive dashboard at {url} (Ctrl-C to stop)")
         try:
-            dashweb_serve(args.serve)
+            return dashweb_serve(args.serve)
         except KeyboardInterrupt:
             print()
         return 0
@@ -2786,8 +2786,17 @@ def cmd_dashboard(args) -> int:
     warn(f"  {preparation.detail}")
     warn(f"  {dashboard_build_command()}")
     info(f"serving the dashboard at {url} (Ctrl-C to stop) — regenerated per request")
+    reload_check = None
+    if os.environ.get("HOT_RELOAD", "1") != "0":
+        from ..adapters.reload import ReloadWatch
+
+        reload_check = ReloadWatch(HARNESS_ROOT).changed
     try:
-        dash.serve(args.serve, lambda: dash.render_html(build()))
+        return dash.serve(
+            args.serve,
+            lambda: dash.render_html(build()),
+            reload_check=reload_check,
+        )
     except KeyboardInterrupt:
         print()
     return 0

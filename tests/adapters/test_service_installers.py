@@ -41,6 +41,7 @@ if [ "${1:-}" = "disable" ] && [ -n "${FAIL_UNINSTALL_PATTERN:-}" ]; then
   esac
 fi
 if [ "${1:-}" = "stop" ] \
+  && [ "${2:-}" != "issue-agent-dashboard.service" ] \
   && [ "${REQUIRE_OLD_SNAPSHOT_DURING_STOP:-0}" = "1" ]; then
   grep -q 'KNOWN_GOOD=1' "$CUTOVER_SNAPSHOT" || exit 9
 fi
@@ -126,6 +127,7 @@ exit 0
         "REQUIRE_OLD_SNAPSHOT_DURING_UNLOAD": "0",
         "REQUIRE_OLD_SNAPSHOT_DURING_STOP": "0",
         "CUTOVER_SNAPSHOT": "",
+        "ISSUE_AGENT_DASHBOARD_PORT_CHECK": "",
     }
     return env, home, fake_bin / "uv"
 
@@ -224,7 +226,7 @@ def test_service_uninstall_preserves_every_definition_when_stop_fails(
         else home / "Library/LaunchAgents"
     )
     artifacts = tuple(artifact_dir.glob("*"))
-    assert len(artifacts) == 3
+    assert len(artifacts) == (4 if systemd else 3)
 
     env["FAIL_UNINSTALL_PATTERN"] = "review-watcher"
     uninstall = subprocess.run(
@@ -257,15 +259,80 @@ def test_systemd_installer_renders_validated_units_with_absolute_uv(tmp_path):
 
     assert result.returncode == 0, result.stderr
     units = sorted((home / ".config/systemd/user").glob("*.service"))
-    assert len(units) == 3
+    assert len(units) == 4
     assert all(f"ExecStart={uv} " in unit.read_text() for unit in units)
-    assert all("NotifyAccess=all" in unit.read_text() for unit in units)
-    assert all("WatchdogSec=300" in unit.read_text() for unit in units)
+    role_units = tuple(
+        unit for unit in units
+        if unit.name != "issue-agent-dashboard.service"
+    )
+    assert all("NotifyAccess=all" in unit.read_text() for unit in role_units)
+    assert all("WatchdogSec=300" in unit.read_text() for unit in role_units)
     assert all(
         "Environment=ISSUE_AGENT_DEPLOYMENT_ID=target-repo"
         in unit.read_text()
-        for unit in units
+        for unit in role_units
     )
+    dashboard = home / ".config/systemd/user/issue-agent-dashboard.service"
+    assert "Environment=AGENT_ENV=" not in dashboard.read_text()
+    assert "Environment=TARGET_DIR=" not in dashboard.read_text()
+    assert result.stdout.count("active (running)") == 4
+
+
+def test_systemd_dashboard_install_is_singleton_and_latest_install_wins(tmp_path):
+    env, home, _first_uv = _environment(tmp_path, systemd=True)
+    script = str(ROOT / "bin/install-systemd.sh")
+
+    first = subprocess.run(
+        ["bash", script], env=env, capture_output=True, text=True
+    )
+    assert first.returncode == 0, first.stderr
+
+    latest_bin = tmp_path / "latest-bin"
+    latest_bin.mkdir()
+    latest_uv = latest_bin / "uv"
+    _executable(latest_uv, "exit 0")
+    second_env = {
+        **env,
+        "ISSUE_AGENT_DEPLOYMENT_ID": "repo-b",
+        "PATH": f"{latest_bin}:{env['PATH']}",
+    }
+    second = subprocess.run(
+        ["bash", script], env=second_env, capture_output=True, text=True
+    )
+    assert second.returncode == 0, second.stderr
+
+    unit_dir = home / ".config/systemd/user"
+    dashboards = tuple(unit_dir.glob("issue-agent-dashboard.service"))
+    assert len(dashboards) == 1
+    assert f"ExecStart={latest_uv} " in dashboards[0].read_text()
+    assert len(tuple(unit_dir.glob("*.service"))) == 7
+    calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
+    assert calls.count("restart issue-agent-dashboard.service") == 2
+
+
+def test_systemd_dashboard_port_conflict_preserves_installed_roles(tmp_path):
+    env, home, _uv = _environment(tmp_path, systemd=True)
+    port_check = tmp_path / "bin" / "dashboard-port-check"
+    _executable(
+        port_check,
+        "printf '4242\\tpython issue-agent dashboard\\n'; exit 0",
+    )
+    env["ISSUE_AGENT_DASHBOARD_PORT_CHECK"] = str(port_check)
+
+    result = subprocess.run(
+        ["bash", str(ROOT / "bin/install-systemd.sh")],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "TCP 8321 is already bound" in result.stderr
+    assert "PID 4242 (python issue-agent dashboard)" in result.stderr
+    assert "Stop the manual `issue-agent dashboard`" in result.stderr
+    units = tuple((home / ".config/systemd/user").glob("*.service"))
+    assert len(units) == 3
+    assert all(path.name != "issue-agent-dashboard.service" for path in units)
     assert result.stdout.count("active (running)") == 3
 
 
@@ -296,6 +363,8 @@ def test_systemd_scoped_uninstall_preserves_other_deployments(tmp_path):
             (unit_dir / f"issue-agent-{role}-{deployment}.service").write_text(
                 deployment
             )
+    dashboard = unit_dir / "issue-agent-dashboard.service"
+    dashboard.write_text("singleton")
 
     result = subprocess.run(
         [
@@ -311,8 +380,11 @@ def test_systemd_scoped_uninstall_preserves_other_deployments(tmp_path):
 
     assert result.returncode == 0, result.stderr
     remaining = tuple(unit_dir.glob("*.service"))
-    assert len(remaining) == 3
-    assert all(path.name.endswith("-other-app.service") for path in remaining)
+    assert len(remaining) == 4
+    assert dashboard in remaining
+    assert sum(
+        path.name.endswith("-other-app.service") for path in remaining
+    ) == 3
 
 
 @pytest.mark.parametrize("state_var", ("ACTIVE_UNITS", "ENABLED_UNITS"))
@@ -396,9 +468,10 @@ def test_systemd_upgrade_stops_and_removes_every_legacy_unit_name(
     )
 
     assert result.returncode == 0, result.stderr
-    assert sorted(path.name for path in unit_dir.glob("*.service")) == [
-        f"{service}-stable-name.service" for service in services
-    ]
+    assert sorted(path.name for path in unit_dir.glob("*.service")) == sorted([
+        *(f"{service}-stable-name.service" for service in services),
+        "issue-agent-dashboard.service",
+    ])
     calls = Path(env["SERVICE_LOG"]).read_text().splitlines()
     for service in services:
         assert f"stop {service}.service" in calls
@@ -446,7 +519,7 @@ def test_systemd_deployment_ids_do_not_collide_and_reject_repointing(
     )
     assert second.returncode == 0, second.stderr
     units = tuple((home / ".config/systemd/user").glob("*.service"))
-    assert len(units) == 6
+    assert len(units) == 7
     assert sum(path.name.endswith("-acme-app.service") for path in units) == 3
     assert sum(path.name.endswith("-other-app.service") for path in units) == 3
 
@@ -505,21 +578,25 @@ def test_systemd_same_name_repoint_replaces_all_units_atomically(
     assert second.returncode == 0, second.stderr
     unit_dir = home / ".config/systemd/user"
     units = tuple(unit_dir.glob("*.service"))
-    assert len(units) == 3
-    assert all(path.name.endswith("-acme-app.service") for path in units)
+    assert len(units) == 4
+    role_units = tuple(
+        path for path in units
+        if path.name != "issue-agent-dashboard.service"
+    )
+    assert all(path.name.endswith("-acme-app.service") for path in role_units)
     assert all(
         f"Environment=TARGET_DIR={second_target}" in path.read_text()
-        for path in units
+        for path in role_units
     )
     assert str(second_target) in snapshot.read_text()
     second_calls = service_log.read_text().splitlines()[first_call_count:]
     stops = [
         second_calls.index(f"stop {path.name}")
-        for path in units
+        for path in role_units
     ]
     restarts = [
         second_calls.index(f"restart {path.name}")
-        for path in units
+        for path in role_units
     ]
     assert max(stops) < min(restarts)
 
@@ -557,7 +634,7 @@ def test_systemd_second_checkout_preserves_same_repo_deployment(
 
     assert second.returncode == 0, second.stderr
     units = tuple((home / ".config/systemd/user").glob("*.service"))
-    assert len(units) == 6
+    assert len(units) == 7
     assert sum(path.name.endswith("-acme-app.service") for path in units) == 3
     assert sum(
         path.name.endswith("-acme-app-wt.service") for path in units
@@ -585,6 +662,8 @@ def test_systemd_failed_activation_rolls_back_units_and_config(tmp_path):
     )
     for name in names:
         (unit_dir / f"{name}-target-repo.service").write_text("known-good")
+    dashboard = unit_dir / "issue-agent-dashboard.service"
+    dashboard.write_text("known-good-dashboard")
     snapshot = config_dir / "target-repo.env"
     snapshot.write_text("KNOWN_GOOD=1\n")
 
@@ -600,6 +679,7 @@ def test_systemd_failed_activation_rolls_back_units_and_config(tmp_path):
         (unit_dir / f"{name}-target-repo.service").read_text() == "known-good"
         for name in names
     )
+    assert dashboard.read_text() == "known-good-dashboard"
     assert snapshot.read_text() == "KNOWN_GOOD=1\n"
 
 

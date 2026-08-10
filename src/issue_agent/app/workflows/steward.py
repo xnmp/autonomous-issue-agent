@@ -5,8 +5,11 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from ...domain import triage as triage_dom
+from ...adapters.github import GhUnavailable
 from ...adapters.runtime_plan import AgentRuntime
+from ...domain import triage as triage_dom
+from ...domain import steward as steward_dom
+from ...domain.contracts import EffectStatus
 from ...domain.events import (
     Correlation,
     IssueGroomed,
@@ -15,6 +18,8 @@ from ...domain.events import (
     TelemetryEvent,
     TriageDispositionRecorded,
 )
+from ...domain.labels import Label
+from ...domain.leg import Leg, LegTarget
 from ...domain.outcome import AgentResult, MAX_BUDGET_STATUS, budget_exhausted
 from ...domain.steward_stall import (
     DEFAULT_STEWARD_ERROR_CEILING,
@@ -22,8 +27,6 @@ from ...domain.steward_stall import (
     steward_stall_actions,
     steward_stall_tripped,
 )
-from ...domain.leg import Leg, LegTarget
-from ...domain.contracts import EffectStatus
 from ...domain.ports import (
     ActionExecutor,
     ControlStore,
@@ -153,6 +156,48 @@ class StewardWorkflow:
                 Correlation(issue=issue, pr=(pr or None)),
             )
         )
+
+    def _journal_groom_disposition(
+        self, issue: int, target: int, outcome: str
+    ) -> None:
+        """Record a harness-adjudicated GROOM lifecycle claim.
+
+        ``outcome`` is always minted from closed enums or observed issue state;
+        agent prose is intentionally excluded from the journal authority rail.
+        """
+        key = f"groomed:{self.cfg.repo}:{issue}:duplicate_of:{target}:{outcome}"
+        if key in self._emitted:
+            return
+        self._emitted.add(key)
+        journal = self.cfg.journal
+        if journal is None:
+            return
+        try:
+            dedupe = self.cfg.dedupe
+            if dedupe is not None and not dedupe.claim(
+                "groomed", self.cfg.repo, key
+            ):
+                return
+            journal.emit(
+                TelemetryEvent(
+                    IssueGroomed(
+                        key,
+                        "duplicate_of",
+                        {
+                            "kind": "duplicate_of",
+                            "issue": issue,
+                            "duplicate_of": target,
+                            "outcome": outcome,
+                            "block_key": key,
+                        },
+                    ),
+                    Correlation(issue=issue),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — telemetry never blocks effects
+            self.cfg.log(
+                f"groom #{issue}: duplicate disposition not journalled ({exc})"
+            )
 
     def _journal_triage_close(self, issue: int, kind: str, detail: str) -> None:
         """One event per (repo, issue, disposition) for a triage `close` verdict.
@@ -389,7 +434,7 @@ class StewardWorkflow:
         self.store.clear_steward_stalls(issue, leg)
 
     async def groom(self, issue: int) -> None:
-        """Classify an existing issue for one-shot, advisory queue cleanup."""
+        """Classify an issue once per content version and apply safe findings."""
         if self.cfg.groom is None:
             return
         iss = self.gateway.get_issue(issue)
@@ -416,6 +461,31 @@ class StewardWorkflow:
             self._charge_stall(issue, "groom", result, iss)
             return
         raw = result.structured
+        claim = steward_dom.parse_groom_disposition(raw.get("disposition"))
+        duplicate_decision: steward_dom.DuplicateDecision | None = None
+        if claim is not None:
+            promote = bool(self.cfg.triage_cfg and self.cfg.triage_cfg.promote)
+            referenced = None
+            if promote and claim.issue != issue:
+                try:
+                    referenced = self.gateway.get_issue(claim.issue)
+                except GhUnavailable:
+                    self._stall(
+                        issue,
+                        "groom",
+                        "validation_read_failed",
+                        "validation_read_failed",
+                        iss,
+                        budget=False,
+                    )
+                    return
+                except (AttributeError, KeyError, TypeError, ValueError):
+                    # A benign "not found" read is evidence that the claim does
+                    # not meet the existence gate, not a daemon failure.
+                    referenced = None
+            duplicate_decision = steward_dom.validate_duplicate_of(
+                iss, claim, referenced, promote=promote
+            )
         resolved_by = raw.get("resolved_by")
         resolved_by = resolved_by if isinstance(resolved_by, int) and not isinstance(resolved_by, bool) else None
         stale_reference = raw.get("stale_reference")
@@ -432,16 +502,67 @@ class StewardWorkflow:
         # prevents a malformed verdict from inserting an unrelated repo claim.
         if stale_reference.strip() and stale_reference.strip() not in iss.body:
             stale_reference = ""
-        actions = triage_dom.grooming_actions(
-            issue, resolved_by=resolved_by, stale_reference=stale_reference,
-            merged_by_issue=merged_by_issue,
-        )
+        action_issue = iss
+        if isinstance(duplicate_decision, steward_dom.ValidatedDuplicateOf):
+            # The paid result authorizes nothing by itself. Refresh both sides
+            # at the last possible point so a reopen or lifecycle transition
+            # during the leg cannot be overwritten by the close batch.
+            try:
+                action_issue = self.gateway.get_issue(issue)
+                action_reference = self.gateway.get_issue(claim.issue)
+            except GhUnavailable:
+                self._stall(
+                    issue,
+                    "groom",
+                    "revalidation_read_failed",
+                    "revalidation_read_failed",
+                    iss,
+                    budget=False,
+                )
+                return
+            except (AttributeError, KeyError, TypeError, ValueError):
+                action_reference = None
+            duplicate_decision = steward_dom.validate_duplicate_of(
+                action_issue,
+                claim,
+                action_reference,
+                promote=bool(self.cfg.triage_cfg and self.cfg.triage_cfg.promote),
+            )
+        if isinstance(duplicate_decision, steward_dom.ValidatedDuplicateOf):
+            self._journal_groom_disposition(
+                issue, duplicate_decision.issue, "accepted"
+            )
+        elif isinstance(duplicate_decision, steward_dom.RefusedDuplicateOf):
+            self._journal_groom_disposition(
+                issue, duplicate_decision.issue, duplicate_decision.refusal.value
+            )
+        if isinstance(duplicate_decision, steward_dom.ValidatedDuplicateOf):
+            triage_label = (
+                self.cfg.triage_cfg.triage_label
+                if self.cfg.triage_cfg is not None
+                else Label.AI_TRIAGE
+            )
+            actions = list(steward_dom.duplicate_close_actions(
+                action_issue, duplicate_decision, triage_label=triage_label
+            ))
+        else:
+            actions = triage_dom.grooming_actions(
+                issue, resolved_by=resolved_by, stale_reference=stale_reference,
+                merged_by_issue=merged_by_issue,
+            )
         if not self.executor.execute_all(actions):
             self._write_unconfirmed(issue, "groom", iss)
             return
-        if resolved_by is not None and resolved_by in merged_by_issue and resolved_by != issue:
+        if (
+            not isinstance(duplicate_decision, steward_dom.ValidatedDuplicateOf)
+            and resolved_by is not None
+            and resolved_by in merged_by_issue
+            and resolved_by != issue
+        ):
             self._journal_groomed(issue, "resolved_by", pr=merged_by_issue[resolved_by])
-        if stale_reference.strip():
+        if not isinstance(
+            duplicate_decision, steward_dom.ValidatedDuplicateOf
+        ) and stale_reference.strip():
             self._journal_groomed(issue, "stale", ref=stale_reference.strip())
         # Record after writes because comments update GitHub's timestamp. That
         # makes an unchanged issue one-shot while a later human edit reopens the

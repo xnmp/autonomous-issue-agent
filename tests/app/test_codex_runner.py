@@ -308,9 +308,14 @@ def test_the_groom_schema_admits_an_all_null_no_finding_object():
     from issue_agent.app.planners.schemas import GROOM_SCHEMA, TRIAGE_SCHEMA
 
     groom = _strict_schema(GROOM_SCHEMA)
-    assert set(groom["required"]) == {"resolved_by", "stale_reference"}
+    assert set(groom["required"]) == {
+        "resolved_by", "stale_reference", "disposition",
+    }
     assert groom["properties"]["resolved_by"]["type"] == ["integer", "null"]
     assert groom["properties"]["stale_reference"]["type"] == ["string", "null"]
+    disposition = groom["properties"]["disposition"]
+    assert disposition["type"] == ["object", "null"]
+    assert set(disposition["required"]) == {"kind", "issue", "reason"}
 
     triage = _strict_schema(TRIAGE_SCHEMA)
     assert triage["properties"]["recurrence_of"]["type"] == ["integer", "null"]
