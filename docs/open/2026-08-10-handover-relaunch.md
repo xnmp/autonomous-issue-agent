@@ -69,3 +69,24 @@ state=closed state_reason=completed` works from an assistant shell; the
 (eyeball a failure-looping drill-down), 9bd47da (next real env fault; dry-run
 against both live deployments correctly reports 0 findings), 70c0bea
 (lifecycle active-state precedence), plus older pendings in the ledger.
+
+## Addendum 2 (20:25) — gap sweep complete
+
+The post-batch gaps are all resolved and their issues closed:
+
+- Judgment-vs-gap test added to docs/reference/manager.md; repo-scoped
+  `/manage` skill created at `.claude/skills/manage/SKILL.md` (06b8522).
+- #192 env-claim proof-of-execution and #188 layer 1 (escalation quotes the
+  last terminal error, bounded via `last-error` state suffix) — 06b8522.
+- #190 steward duplicate-close rail (`domain/steward.py`: refusals incl.
+  LIFECYCLE_ACTIVE and REFERENCE_NOT_HARNESS_DONE, mutation-time
+  revalidation, journal-before-execute, code-span reason) and #191 dashboard
+  systemd unit (exit-87 source reload, port-8321 preflight with separate
+  rollback scope, 30s graceful bound, fallback reload) — fa3bfb0, with all
+  10 adversarial-review dispositions applied; accepted findings recorded as
+  a residuals row (471e269). Ledger rows for all four added.
+- keifu PR #181 escalated to needs-human-review at rejection 4/4 (19:18) —
+  correct outcome for the disputed PR; operator adjudicates.
+- Dashboard systemd unit NOT installed on this host: manual dashboard
+  (PID 1105177) holds 8321 and the preflight will refuse; cut over only on
+  operator instruction.
