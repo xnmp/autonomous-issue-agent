@@ -136,6 +136,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The installer's PATH is baked into the units (@INSTALL_PATH@): the daemons
+# must resolve the operator's toolchain (codex under nvm, bunx, rustup shims)
+# that systemd's minimal default PATH cannot. Escaped for the sed RHS — PATH
+# entries may legitimately contain '&', '\' or the '|' delimiter.
+_install_path_escaped="$(printf '%s' "$PATH" | sed -e 's/[&|\\]/\\&/g')"
 for index in "${!services[@]}"; do
   s="${services[$index]}"
   src="$HARNESS_ROOT/ops/systemd/$s.service"
@@ -143,6 +148,7 @@ for index in "${!services[@]}"; do
   sed -e "s#@HARNESS_ROOT@#$HARNESS_ROOT#g" -e "s#@CONFIG@#$SNAP_CONFIG#g" \
       -e "s#@TARGET_DIR@#${TARGET_DIR:-/}#g" -e "s#@NAME@#$NAME#g" \
       -e "s#@DEPLOYMENT_ID@#$DEPLOYMENT_NAME#g" \
+      -e "s|@INSTALL_PATH@|$_install_path_escaped|g" \
       -e "s#@UV_BIN@#$UV_BIN#g" "$src" > "$candidate"
   "$SYSTEMD_ANALYZE" --user verify "$candidate"
 done

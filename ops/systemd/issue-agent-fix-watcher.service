@@ -18,6 +18,12 @@ WorkingDirectory=@HARNESS_ROOT@
 Environment=AGENT_ENV=@CONFIG@
 Environment=ISSUE_AGENT_DEPLOYMENT_ID=@DEPLOYMENT_ID@
 Environment=TARGET_DIR=@TARGET_DIR@
+# The operator's PATH, captured at install time: daemons spawn the target
+# toolchain (codex via nvm, bunx, cargo/rustup shims) that a minimal systemd
+# PATH cannot resolve — first systemd deployment 2026-08-10 killed every
+# resolve leg at spawn (issue #650) until this. Re-run install-service after
+# moving a toolchain (doctor's codex check names the drift).
+Environment=PATH=@INSTALL_PATH@
 Restart=on-failure
 RestartSec=30
 RestartPreventExitStatus=0 2 3 4 5 6
