@@ -295,8 +295,9 @@ def test_write_command_builders_are_pure_contracts():
     assert build_close_issue_args("o/r", 5, "completed", "done") == [
         "issue", "close", "5", "--repo", "o/r", "--reason", "completed", "--comment", "done",
     ]
+    # gh's CLI vocabulary, not the GraphQL enum: "not_planned" exits 1 (keifu #193).
     assert build_close_issue_args("o/r", 5, "not_planned", "") == [
-        "issue", "close", "5", "--repo", "o/r", "--reason", "not_planned",
+        "issue", "close", "5", "--repo", "o/r", "--reason", "not planned",
     ]
     assert build_enable_auto_merge_args(
         "o/r", 100, "squash", "head"

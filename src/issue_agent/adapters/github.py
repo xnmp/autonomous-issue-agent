@@ -862,7 +862,11 @@ def build_comment_args(repo: str, kind: str, number: int, body: str) -> list[str
 
 
 def build_close_issue_args(repo: str, number: int, reason: str, comment: str) -> list[str]:
-    args = ["issue", "close", str(number), "--repo", repo, "--reason", reason]
+    # The domain speaks GitHub's GraphQL stateReason enum ("not_planned"), but
+    # `gh issue close --reason` wants the CLI spelling ("not planned") and exits
+    # 1 on the enum token — keifu #193 sat labelled ai-closed but open for it.
+    args = ["issue", "close", str(number), "--repo", repo,
+            "--reason", reason.replace("_", " ")]
     if comment:
         args += ["--comment", comment]
     return args
