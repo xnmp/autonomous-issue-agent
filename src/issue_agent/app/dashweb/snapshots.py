@@ -1470,11 +1470,25 @@ def _active_escalation_at(row: dash.IssueRow) -> datetime | None:
     NOT any lifecycle-label add: a daemon relabel (-ai-blocked +ai-working on
     an operator reply) can land while GitHub still carries needs-human-review
     on the PR, and stripping the reason then would take the unblock
-    affordance off a live escalation (adversarial review F6)."""
+    affordance off a live escalation (adversarial review F6).
+
+    The observed world also retires: a label removed out-of-band (GitHub UI,
+    raw `gh api`) journals no action event, and replaying actions alone kept
+    the banner up forever on a re-armed issue (tauri #650, 2026-08-10). A
+    `world.observed` of the escalated target, later in the stream than the
+    escalation, whose labels no longer carry needs-human-review is the same
+    fact stage/lane already trust — the replay order makes it race-safe (an
+    observation from before the escalation cannot retire it)."""
     active_at: datetime | None = None
+    # (kind, number) the newest escalation held; None means target unrecorded,
+    # which falls back to this row's own issue observations.
+    target: tuple[str, int] | None = None
     for event in row.events:
         if event.get("event") == "escalation":
             active_at = dash.parse_ts(event.get("ts"))
+            number = event.get("number")
+            kind = str(event.get("target") or "issue")
+            target = (kind, number) if isinstance(number, int) else None
         elif event.get("event") == "action":
             action = event.get("action")
             if (
@@ -1485,6 +1499,21 @@ def _active_escalation_at(row: dash.IssueRow) -> datetime | None:
                 continue
             moves = _action_label_moves(event)
             if moves is not None and "needs-human-review" in moves[1]:
+                active_at = None
+        elif event.get("event") == "world.observed" and active_at is not None:
+            facts = event.get("facts")
+            if not isinstance(facts, dict) or facts.get("present") is False:
+                continue
+            observed = (
+                str(event.get("subject_kind") or ""),
+                event.get("subject_number"),
+            )
+            if observed != (target or ("issue", row.issue)):
+                continue
+            labels = facts.get("labels")
+            if isinstance(
+                labels, (tuple, list, set, frozenset)
+            ) and "needs-human-review" not in {str(label) for label in labels}:
                 active_at = None
     return active_at
 

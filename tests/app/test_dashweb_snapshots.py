@@ -1403,6 +1403,69 @@ def test_a_retired_escalation_leaves_the_overview_list():
     assert snapshots.escalation_reasons(dep) == []
 
 
+def _observed_view(labels, *, hours, kind="issue", number=7, present=True):
+    return {
+        "ts": ts(hours=hours), "event": "world.observed", "issue": 7,
+        "subject_kind": kind, "subject_number": number,
+        "facts": {"present": present, "labels": list(labels)},
+    }
+
+
+def test_a_label_removed_out_of_band_retires_the_escalation():
+    # GitHub UI / raw-API removals journal no action event; the observed
+    # world is the retirement authority (tauri #650, 2026-08-10).
+    row = row_view([
+        BREAKER_COMMENT, ESCALATION,
+        _observed_view(["ai-pr-open"], hours=3),
+    ])
+
+    assert snapshots.escalation_reasons(_deployment_of(row)) == []
+    assert snapshots.issue_card(row, NOW)["escalation_reason"] is None
+
+
+def test_an_observation_from_before_the_escalation_cannot_retire_it():
+    row = row_view([
+        _observed_view(["ai-ready"], hours=1),
+        BREAKER_COMMENT, ESCALATION,
+    ])
+
+    assert snapshots.issue_card(row, NOW)["escalation_reason"] is not None
+
+
+def test_an_observation_still_carrying_the_label_keeps_the_escalation():
+    row = row_view([
+        BREAKER_COMMENT, ESCALATION,
+        _observed_view(["needs-human-review"], hours=3),
+    ])
+
+    assert snapshots.issue_card(row, NOW)["escalation_reason"] is not None
+
+
+def test_a_pr_escalation_survives_issue_observations_but_not_pr_ones():
+    # F6: the issue can look healthy while the PR still carries the hold.
+    pr_escalation = {**ESCALATION, "target": "pr", "number": 12}
+    held = row_view([
+        BREAKER_COMMENT, pr_escalation,
+        _observed_view(["ai-pr-open"], hours=3),
+    ])
+    released = row_view([
+        BREAKER_COMMENT, pr_escalation,
+        _observed_view(["ai-pr-open"], hours=3, kind="pr", number=12),
+    ])
+
+    assert snapshots.issue_card(held, NOW)["escalation_reason"] is not None
+    assert snapshots.issue_card(released, NOW)["escalation_reason"] is None
+
+
+def test_a_tombstoned_observation_does_not_retire_the_escalation():
+    row = row_view([
+        BREAKER_COMMENT, ESCALATION,
+        _observed_view([], hours=3, present=False),
+    ])
+
+    assert snapshots.issue_card(row, NOW)["escalation_reason"] is not None
+
+
 def test_a_finished_issue_is_not_still_escalated_on_the_overview():
     row = replace(row_view([BREAKER_COMMENT, ESCALATION], issue=7), done=True)
 

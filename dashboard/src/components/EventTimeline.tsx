@@ -67,6 +67,14 @@ type TimelineEntry =
   | { grouped: false; event: JournalEvent }
   | { grouped: true; events: JournalEvent[] };
 
+type FactorizedTimelineEntry =
+  | TimelineEntry
+  | {
+      cycleKinds: string[];
+      events: JournalEvent[];
+      repetitions: number;
+    };
+
 /**
  * Fold consecutive world-observed heartbeats into one entry. A lone
  * observation stays a plain item; only runs collapse, so an observation that
@@ -90,6 +98,77 @@ export function foldObservations(events: JournalEvent[]): TimelineEntry[] {
   });
 }
 
+/** Collapse maximal adjacent runs whose event-kind period is one or two. */
+function foldRepeatedCycles(entries: TimelineEntry[]): FactorizedTimelineEntry[] {
+  const out: FactorizedTimelineEntry[] = [];
+  let i = 0;
+  while (i < entries.length) {
+    const first = entries[i];
+    if (!first || first.grouped) {
+      if (first) out.push(first);
+      i += 1;
+      continue;
+    }
+
+    const firstKind = eventKind(first.event);
+    let sameKindCount = 1;
+    while (i + sameKindCount < entries.length) {
+      const next = entries[i + sameKindCount];
+      if (!next || next.grouped || eventKind(next.event) !== firstKind) break;
+      sameKindCount += 1;
+    }
+    if (sameKindCount >= 2) {
+      const run = entries.slice(i, i + sameKindCount) as { grouped: false; event: JournalEvent }[];
+      out.push({
+        cycleKinds: [firstKind],
+        events: run.map((entry) => entry.event),
+        repetitions: sameKindCount,
+      });
+      i += sameKindCount;
+      continue;
+    }
+
+    const second = entries[i + 1];
+    if (!second || second.grouped) {
+      out.push(first);
+      i += 1;
+      continue;
+    }
+    const secondKind = eventKind(second.event);
+    let repetitions = 1;
+    while (i + repetitions * 2 + 1 < entries.length) {
+      const nextFirst = entries[i + repetitions * 2];
+      const nextSecond = entries[i + repetitions * 2 + 1];
+      if (
+        !nextFirst ||
+        nextFirst.grouped ||
+        !nextSecond ||
+        nextSecond.grouped ||
+        eventKind(nextFirst.event) !== firstKind ||
+        eventKind(nextSecond.event) !== secondKind
+      ) {
+        break;
+      }
+      repetitions += 1;
+    }
+    if (firstKind !== secondKind && repetitions >= 2) {
+      const length = repetitions * 2;
+      const run = entries.slice(i, i + length) as { grouped: false; event: JournalEvent }[];
+      out.push({
+        cycleKinds: [firstKind, secondKind],
+        events: run.map((entry) => entry.event),
+        repetitions,
+      });
+      i += length;
+      continue;
+    }
+
+    out.push(first);
+    i += 1;
+  }
+  return out;
+}
+
 function ObservationGroup({ events }: { events: JournalEvent[] }) {
   const first = events[0];
   const last = events[events.length - 1] ?? first;
@@ -104,6 +183,42 @@ function ObservationGroup({ events }: { events: JournalEvent[] }) {
         <div className="row-wrap">
           <Chip tone="meta" square>
             {eventKind(first)} ×{events.length}
+          </Chip>
+          <span className="faint">
+            {clockTime(first.ts)} – {clockTime(last.ts)}
+          </span>
+        </div>
+        <Collapsible title={<span className="faint">raw ({events.length})</span>}>
+          <JsonBlock value={events} />
+        </Collapsible>
+      </div>
+    </li>
+  );
+}
+
+function RepeatedCycleGroup({
+  cycleKinds,
+  events,
+  repetitions,
+}: {
+  cycleKinds: string[];
+  events: JournalEvent[];
+  repetitions: number;
+}) {
+  const first = events[0];
+  const last = events[events.length - 1] ?? first;
+  if (!first || !last) return null;
+  const cycle = cycleKinds.length === 1 ? cycleKinds[0] : `(${cycleKinds.join(" / ")})`;
+  return (
+    <li className="tl-item tl-item-grouped">
+      <span className="tl-time mono faint" title={localTime(first.ts)}>
+        {clockTime(first.ts)}
+      </span>
+      <span className="tl-rail" aria-hidden="true" />
+      <div className="tl-body">
+        <div className="row-wrap">
+          <Chip tone={toneFor(first)} square>
+            {cycle} ×{repetitions}
           </Chip>
           <span className="faint">
             {clockTime(first.ts)} – {clockTime(last.ts)}
@@ -135,7 +250,17 @@ export function EventTimeline({
   if (events.length === 0) return <EmptyState>{emptyText}</EmptyState>;
   return (
     <ol className={`timeline${dense ? " dense" : ""}`}>
-      {foldObservations(events).map((entry, i) => {
+      {foldRepeatedCycles(foldObservations(events)).map((entry, i) => {
+        if ("cycleKinds" in entry) {
+          return (
+            <RepeatedCycleGroup
+              key={i}
+              cycleKinds={entry.cycleKinds}
+              events={entry.events}
+              repetitions={entry.repetitions}
+            />
+          );
+        }
         if (entry.grouped) return <ObservationGroup key={i} events={entry.events} />;
         const e = entry.event;
         return (
