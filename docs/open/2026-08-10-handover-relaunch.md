@@ -50,8 +50,15 @@ state=closed state_reason=completed` works from an assistant shell; the
 - Playwright false missing-deps class (2 asks on one issue): if it recurs, add
   `TARGET_ENV_PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=1` to the tauri
   overlay (host deps verified present; headless shell launches env-scrubbed).
+  Class filed as #192 (probe env claims before a human ask).
 - #188 layer 1 still open: escalation comments should quote the last terminal
   error.
+- Remaining operator-action gaps filed post-batch: #190 (steward groom has no
+  sanctioned duplicate-close pathway — keifu #196), #191 (dashboard server
+  needs supervision/hot-reload — three manual restarts today).
+- keifu #142/PR #181 re-armed by the operator via dashboard Unblock 18:11 —
+  journal `operator_unblock` channel=ui, rebase dispatched; watch it consume
+  the ADR 0014 exemption instructions.
 - Review POST transport failure cost one unproductive round on #652 (bounded);
   keifu `branches/chong-dev/protection` 404 log noise each boot is expected
   (branch unprotected).
