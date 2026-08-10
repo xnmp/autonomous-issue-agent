@@ -8,7 +8,7 @@
 Description=Autonomous issue agent — architecture steward (@NAME@)
 After=network-online.target
 StartLimitIntervalSec=300
-StartLimitBurst=3
+StartLimitBurst=10
 
 [Service]
 Type=notify
@@ -27,6 +27,13 @@ Environment=PATH=@INSTALL_PATH@
 Restart=on-failure
 RestartSec=30
 RestartPreventExitStatus=0 2 3 4 5 6
+# Exit 87 is the designed hot-reload path (harness source changed; daemon
+# drains and asks to be restarted on new code). Without these lines every
+# reload logs as 'Failed' and counts against StartLimitBurst — three commits
+# inside 300s would permanently kill all units mid-batch (observed 2026-08-10:
+# four units 'Failed' simultaneously on one commit's reload).
+SuccessExitStatus=87
+RestartForceExitStatus=87
 TimeoutStopSec=90
 WatchdogSec=300
 KillSignal=SIGTERM
