@@ -1405,7 +1405,7 @@ def test_a_retired_escalation_leaves_the_overview_list():
 
 def _observed_view(labels, *, hours, kind="issue", number=7, present=True):
     return {
-        "ts": ts(hours=hours), "event": "world.observed", "issue": 7,
+        "ts": ts(hours=hours), "event": "world.observed.v1", "issue": 7,
         "subject_kind": kind, "subject_number": number,
         "facts": {"present": present, "labels": list(labels)},
     }

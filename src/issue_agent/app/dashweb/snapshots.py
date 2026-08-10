@@ -1500,7 +1500,12 @@ def _active_escalation_at(row: dash.IssueRow) -> datetime | None:
             moves = _action_label_moves(event)
             if moves is not None and "needs-human-review" in moves[1]:
                 active_at = None
-        elif event.get("event") == "world.observed" and active_at is not None:
+        elif (
+            # The view keeps WorldObserved under its raw type string
+            # ("world.observed.v1"); match the family, not one version.
+            str(event.get("event") or "").startswith("world.observed")
+            and active_at is not None
+        ):
             facts = event.get("facts")
             if not isinstance(facts, dict) or facts.get("present") is False:
                 continue
