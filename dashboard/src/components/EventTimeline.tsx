@@ -98,7 +98,12 @@ export function foldObservations(events: JournalEvent[]): TimelineEntry[] {
   });
 }
 
-/** Collapse maximal adjacent runs whose event-kind period is one or two. */
+/**
+ * Collapse adjacent runs whose event-kind period is one or two. Greedy
+ * left-to-right: a same-kind run is taken before an overlapping pair cycle
+ * is considered (A A B A B groups "A ×2" and leaves B A B alone), so the
+ * result is not globally maximal — acceptable for a readability fold.
+ */
 function foldRepeatedCycles(entries: TimelineEntry[]): FactorizedTimelineEntry[] {
   const out: FactorizedTimelineEntry[] = [];
   let i = 0;

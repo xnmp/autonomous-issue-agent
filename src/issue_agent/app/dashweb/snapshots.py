@@ -1472,20 +1472,31 @@ def _active_escalation_at(row: dash.IssueRow) -> datetime | None:
     on the PR, and stripping the reason then would take the unblock
     affordance off a live escalation (adversarial review F6).
 
-    The observed world also retires: a label removed out-of-band (GitHub UI,
-    raw `gh api`) journals no action event, and replaying actions alone kept
-    the banner up forever on a re-armed issue (tauri #650, 2026-08-10). A
-    `world.observed` of the escalated target, later in the stream than the
-    escalation, whose labels no longer carry needs-human-review is the same
-    fact stage/lane already trust — the replay order makes it race-safe (an
-    observation from before the escalation cannot retire it)."""
+    The observed world both retires and re-arms: a label removed out-of-band
+    (GitHub UI, raw `gh api`) journals no action event, and replaying actions
+    alone kept the banner up forever on a re-armed issue (tauri #650,
+    2026-08-10). Observation is level-triggered — the newest observation of
+    the escalated target decides — because a single clearing observation can
+    be causally stale (fetched before the label landed, published after the
+    escalation event; observed_at is stamped at journal write, so freshness
+    cannot be proven per event). A stale clear therefore self-heals on the
+    next poll instead of silently killing a live affordance. Truncated
+    observations (`observation_truncated`, world_reporter clips labels to
+    five) can prove the label's presence but never its absence. Residual: a
+    target the feeds tombstone while still escalated (`present: false`, e.g.
+    an operator-closed PR) is never observed again and keeps its banner —
+    per-feed absence is not closure, so it cannot retire anything."""
     active_at: datetime | None = None
+    # Newest escalation's own timestamp survives observation flapping so a
+    # label seen again re-arms to the original escalation, not to "now".
+    escalated_at: datetime | None = None
     # (kind, number) the newest escalation held; None means target unrecorded,
     # which falls back to this row's own issue observations.
     target: tuple[str, int] | None = None
     for event in row.events:
         if event.get("event") == "escalation":
             active_at = dash.parse_ts(event.get("ts"))
+            escalated_at = active_at
             number = event.get("number")
             kind = str(event.get("target") or "issue")
             target = (kind, number) if isinstance(number, int) else None
@@ -1500,12 +1511,11 @@ def _active_escalation_at(row: dash.IssueRow) -> datetime | None:
             moves = _action_label_moves(event)
             if moves is not None and "needs-human-review" in moves[1]:
                 active_at = None
-        elif (
-            # The view keeps WorldObserved under its raw type string
-            # ("world.observed.v1"); match the family, not one version.
-            str(event.get("event") or "").startswith("world.observed")
-            and active_at is not None
-        ):
+        # The view keeps WorldObserved under its raw type string
+        # ("world.observed.v1"); match the family, not one version.
+        elif str(event.get("event") or "").startswith("world.observed"):
+            if escalated_at is None:
+                continue
             facts = event.get("facts")
             if not isinstance(facts, dict) or facts.get("present") is False:
                 continue
@@ -1516,9 +1526,11 @@ def _active_escalation_at(row: dash.IssueRow) -> datetime | None:
             if observed != (target or ("issue", row.issue)):
                 continue
             labels = facts.get("labels")
-            if isinstance(
-                labels, (tuple, list, set, frozenset)
-            ) and "needs-human-review" not in {str(label) for label in labels}:
+            if not isinstance(labels, (tuple, list, set, frozenset)):
+                continue
+            if "needs-human-review" in {str(label) for label in labels}:
+                active_at = escalated_at
+            elif not facts.get("observation_truncated"):
                 active_at = None
     return active_at
 

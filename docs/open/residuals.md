@@ -222,6 +222,17 @@ Two smaller ones worth doing whenever the files are next touched:
   names the unreproducible platform and caps local attempts at one leg
   before escalating with the CI log attached.
 
+- Escalations on feed-tombstoned targets never retire (2026-08-10) — the
+  dashboard's escalation banner retires on observations of the escalated
+  target (b1ea5bd + observed-world level-trigger), but a target the role
+  feeds stop selecting (`present: false` — e.g. an operator closes an
+  escalated PR unmerged while its issue stays open) is never observed again,
+  so its banner and Unblock affordance outlive the hold. Per-feed absence is
+  not closure, so it must not retire anything. Trigger: a second stale
+  banner traced to a tombstoned target adds an explicit terminal-state
+  retirement (closed-PR observation or issue-close) distinct from feed
+  absence.
+
 ## 5. Per-incident notes
 
 `docs/open/issues/` holds three unresolved incident write-ups

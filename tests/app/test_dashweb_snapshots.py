@@ -1403,11 +1403,18 @@ def test_a_retired_escalation_leaves_the_overview_list():
     assert snapshots.escalation_reasons(dep) == []
 
 
-def _observed_view(labels, *, hours, kind="issue", number=7, present=True):
+def _observed_view(
+    labels, *, hours, kind="issue", number=7, present=True, truncated=False
+):
+    # ts() counts BACKWARDS: smaller `hours` is later. ESCALATION sits at
+    # ts(hours=2); observations after it use hours<2, before it hours>2.
+    facts = {"present": present, "labels": list(labels)}
+    if truncated:
+        facts["observation_truncated"] = True
     return {
         "ts": ts(hours=hours), "event": "world.observed.v1", "issue": 7,
         "subject_kind": kind, "subject_number": number,
-        "facts": {"present": present, "labels": list(labels)},
+        "facts": facts,
     }
 
 
@@ -1416,7 +1423,7 @@ def test_a_label_removed_out_of_band_retires_the_escalation():
     # world is the retirement authority (tauri #650, 2026-08-10).
     row = row_view([
         BREAKER_COMMENT, ESCALATION,
-        _observed_view(["ai-pr-open"], hours=3),
+        _observed_view(["ai-pr-open"], hours=1),
     ])
 
     assert snapshots.escalation_reasons(_deployment_of(row)) == []
@@ -1425,7 +1432,7 @@ def test_a_label_removed_out_of_band_retires_the_escalation():
 
 def test_an_observation_from_before_the_escalation_cannot_retire_it():
     row = row_view([
-        _observed_view(["ai-ready"], hours=1),
+        _observed_view(["ai-ready"], hours=3),
         BREAKER_COMMENT, ESCALATION,
     ])
 
@@ -1435,10 +1442,40 @@ def test_an_observation_from_before_the_escalation_cannot_retire_it():
 def test_an_observation_still_carrying_the_label_keeps_the_escalation():
     row = row_view([
         BREAKER_COMMENT, ESCALATION,
-        _observed_view(["needs-human-review"], hours=3),
+        _observed_view(["needs-human-review"], hours=1),
     ])
 
     assert snapshots.issue_card(row, NOW)["escalation_reason"] is not None
+
+
+def test_a_stale_clearing_observation_self_heals_on_the_next_poll():
+    # A fetch that started before the label landed can publish after the
+    # escalation event; observation is level-triggered so the next fresh
+    # poll restores the affordance instead of losing it forever.
+    row = row_view([
+        BREAKER_COMMENT, ESCALATION,
+        _observed_view(["ai-pr-open"], hours=1),
+        _observed_view(["needs-human-review"], hours=0),
+    ])
+
+    assert snapshots.issue_card(row, NOW)["escalation_reason"] is not None
+
+
+def test_a_truncated_observation_proves_presence_but_never_absence():
+    # world_reporter clips label lists to five when facts overflow; a
+    # clipped list omitting needs-human-review says nothing about the hold.
+    clipped = row_view([
+        BREAKER_COMMENT, ESCALATION,
+        _observed_view(["a", "b", "c", "d", "e"], hours=1, truncated=True),
+    ])
+    held = row_view([
+        BREAKER_COMMENT, ESCALATION,
+        _observed_view(["ai-pr-open"], hours=1),
+        _observed_view(["needs-human-review"], hours=0, truncated=True),
+    ])
+
+    assert snapshots.issue_card(clipped, NOW)["escalation_reason"] is not None
+    assert snapshots.issue_card(held, NOW)["escalation_reason"] is not None
 
 
 def test_a_pr_escalation_survives_issue_observations_but_not_pr_ones():
@@ -1446,11 +1483,11 @@ def test_a_pr_escalation_survives_issue_observations_but_not_pr_ones():
     pr_escalation = {**ESCALATION, "target": "pr", "number": 12}
     held = row_view([
         BREAKER_COMMENT, pr_escalation,
-        _observed_view(["ai-pr-open"], hours=3),
+        _observed_view(["ai-pr-open"], hours=1),
     ])
     released = row_view([
         BREAKER_COMMENT, pr_escalation,
-        _observed_view(["ai-pr-open"], hours=3, kind="pr", number=12),
+        _observed_view(["ai-pr-open"], hours=1, kind="pr", number=12),
     ])
 
     assert snapshots.issue_card(held, NOW)["escalation_reason"] is not None
@@ -1460,7 +1497,7 @@ def test_a_pr_escalation_survives_issue_observations_but_not_pr_ones():
 def test_a_tombstoned_observation_does_not_retire_the_escalation():
     row = row_view([
         BREAKER_COMMENT, ESCALATION,
-        _observed_view([], hours=3, present=False),
+        _observed_view([], hours=1, present=False),
     ])
 
     assert snapshots.issue_card(row, NOW)["escalation_reason"] is not None
