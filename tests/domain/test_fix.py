@@ -1667,6 +1667,22 @@ def test_resolve_at_cap_escalates_issue_not_dispatches():
     assert any(isinstance(a, PostComment) and a.number == 5 for a in actions)
 
 
+# ── operator re-arm is the dashboard's, not the label's (#98, ADR 0012) ──────
+# A restored ai-ready with the counter still at ceiling re-escalates: a mutable
+# GitHub label is not operator provenance, and reading it as a grant would let
+# any label-writer (agent children included) convert relabels into unbounded
+# paid budgets. The sanctioned re-arm path is the dashboard unblock, which
+# resets the counter BEFORE the label comes back — so decide_fix never sees
+# this state on that path. The escalation comment routes the operator there.
+def test_resolve_at_cap_relabelled_ai_ready_reescalates_and_names_the_remedy():
+    st = FixState(resolve_retries={5: 3})
+    actions = decide_fix(world(issues=[issue(5, "ai-ready")]), CFG, st, fixer_busy=False)
+    assert _run_agents(actions) == []
+    assert Relabel(Target.ISSUE, 5, Label.AI_READY, Label.NEEDS_HUMAN_REVIEW) in actions
+    comments = [a for a in actions if isinstance(a, PostComment) and a.number == 5]
+    assert comments and "Unblock" in comments[0].body
+
+
 def test_fix_ci_at_cap_escalates_not_dispatches():
     st = FixState(ci_retries={9: 3})
     actions = decide_fix(world(prs=[_ci_fail_pr()]), CFG, st, fixer_busy=False)

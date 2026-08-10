@@ -109,14 +109,25 @@ def test_systemd_units_run_python_from_harness_root_with_target_dir_env():
         assert exec_start.split()[-3:] == ["-m", "issue_agent.app.main", role]
         assert service["WorkingDirectory"] == ["@HARNESS_ROOT@"]
         assert "TARGET_DIR=@TARGET_DIR@" in service["Environment"]
+        # Daemons must resolve the operator's toolchain (codex under nvm,
+        # bunx, rustup shims): the installer substitutes its own PATH — the
+        # 2026-08-10 incident where systemd's minimal default PATH killed
+        # every resolve leg at spawn (#650).
+        assert "PATH=@INSTALL_PATH@" in service["Environment"]
         assert service["Restart"] == ["on-failure"]
         assert service["RestartPreventExitStatus"] == ["0 2 3 4 5 6"]
+        # Hot-reload exit (87) is a designed restart, not a crash: it must log
+        # clean AND still restart, and must not march the start-limit counter
+        # toward a mid-batch permanent kill (observed 2026-08-10: one commit's
+        # reload marked four units failed at once under Burst=3).
+        assert service["SuccessExitStatus"] == ["87"]
+        assert service["RestartForceExitStatus"] == ["87"]
         expected_tasks = "1024" if role in {"fix", "review"} else "512"
         assert service["TasksMax"] == [expected_tasks]
         assert service["MemoryMax"] == ["4G"]
         unit = _parse_unit(_read(path))["Unit"]
         assert unit["StartLimitIntervalSec"] == ["300"]
-        assert unit["StartLimitBurst"] == ["3"]
+        assert unit["StartLimitBurst"] == ["10"]
         assert not any("watcher.sh" in v for v in exec_start.split())
 
 

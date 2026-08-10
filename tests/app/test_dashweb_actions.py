@@ -884,11 +884,15 @@ def test_unblock_hands_back_the_retry_budget_in_every_role_state_dir(
     assert not (dirs["fix"] / "issue-7.ci-retries").exists()
     assert not (dirs["fix"] / "issue-7.rebase-retries").exists()
     assert not (dirs["review"] / "issue-7.review-retries").exists()
-    # The review role's dead-session ceiling is what an unblock answers; the
-    # resolve ceiling and the fix role's death tally are not.
     assert not (dirs["review"] / "issue-7.infra-deaths").exists()
     assert not (dirs["review"] / "issue--12.infra-deaths").exists()
-    assert (dirs["fix"] / "issue-7.resolve-retries").read_text() == "4"
+    # The operator's click closes the resolve episode too (#98, 2026-08-10):
+    # keeping the counter turned every unblock of a resolve-escalated issue
+    # into a silent re-escalation one tick later. The click is the harness-
+    # minted grant a bare GitHub relabel deliberately is NOT (ADR 0012), and
+    # it is bounded — the breaker trips again after max_resolve_retries fresh
+    # failures. Only the fix role's dead-session tally survives an unblock.
+    assert not (dirs["fix"] / "issue-7.resolve-retries").exists()
     assert (dirs["fix"] / "issue-7.infra-deaths").read_text() == "5"
 
 

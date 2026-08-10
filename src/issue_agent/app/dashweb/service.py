@@ -1650,6 +1650,14 @@ class Backend:
         no resolvable issue. `Store.clear_retries` itself keeps infra-deaths,
         since no automatic path may reset that ceiling.
 
+        The RESOLVE episode resets too (#98, 2026-08-10): it used to survive on
+        the "a human retrying does not make an unresolvable issue cheaper"
+        conservatism, but that turned every unblock of a resolve-escalated
+        issue into a silent re-escalation on the next tick — the counter was
+        still at its ceiling when the label came back. The operator's click is
+        an explicit grant of ONE more bounded budget (`max_resolve_retries`
+        fresh attempts), not an unbounded loop: the breaker trips again.
+
         Returns how many counters were actually retired, so the journalled
         event reports what happened rather than what was attempted.
         """
@@ -1663,6 +1671,11 @@ class Backend:
             store = Store(state_dir)
             for key in keys:
                 cleared += store.clear_retries(key)
+                if role == "fix":
+                    cleared += os.path.exists(
+                        store.issue_path(key, "resolve-retries")
+                    )
+                    store.reset_resolve_episode(key)
                 if role == "review":
                     cleared += os.path.exists(store.issue_path(key, "infra-deaths"))
                     store.clear_infra_deaths(key)

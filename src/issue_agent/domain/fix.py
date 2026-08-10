@@ -1990,10 +1990,20 @@ def decide_fix(
             if breaker_tripped(
                 state.resolve_retries.get(n, 0), cfg.max_resolve_retries
             ):
+                # The counter deliberately survives a bare GitHub relabel: a
+                # mutable label is not operator provenance (ADR 0012 — agent
+                # children can write labels), so a restored ai-ready alone
+                # re-escalates here rather than granting budget. The sanctioned
+                # re-arm is the dashboard Unblock — an authenticated harness
+                # mint that resets the counter BEFORE restoring the label —
+                # and the escalation comment points the operator at it (#98).
                 actions.extend(issue_escalation(
                     n,
                     f"resolve failed {cfg.max_resolve_retries}× without "
-                    "opening a PR — this issue needs a human look.",
+                    "opening a PR — this issue needs a human look. To grant "
+                    f"another {cfg.max_resolve_retries} attempts, use the "
+                    "dashboard's Unblock on this issue (a bare ai-ready "
+                    "relabel re-escalates without resetting the budget).",
                     Label.AI_READY,
                 ).actions())
                 break

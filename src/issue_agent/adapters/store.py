@@ -320,6 +320,18 @@ class Store:
     def set_resolve_retries(self, issue: int, retries: int) -> None:
         self._write(self.issue_path(issue, "resolve-retries"), str(retries))
 
+    def reset_resolve_episode(self, issue: int) -> None:
+        """Operator re-arm (#98): close the resolve episode so the breaker
+        grants a fresh, still-bounded budget of attempts. Reachable ONLY from
+        the dashboard unblock — an authenticated harness mint that resets this
+        BEFORE restoring ai-ready — never from label observation: a mutable
+        GitHub label is not operator provenance (ADR 0012; agent children can
+        write labels, and inferring a grant from one would let any label-writer
+        convert relabels into unbounded paid budgets). Removal form, not "0":
+        absent already reads as 0 and a removal cannot leave a torn file
+        behind (see clear_infra_deaths)."""
+        self._remove(self.issue_path(issue, "resolve-retries"))
+
     def get_rebase_retries(self, issue: int) -> int:
         return self._read_int(self.issue_path(issue, "rebase-retries"))
 
