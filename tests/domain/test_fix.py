@@ -1697,6 +1697,25 @@ def test_resolve_at_cap_relabelled_ai_ready_reescalates_and_names_the_remedy():
     assert comments and "Unblock" in comments[0].body
 
 
+def test_resolve_escalation_quotes_the_last_terminal_error():
+    """#188: 'failed 3×' with no why sent the operator grepping journals for a
+    config fix the harness had already diagnosed verbatim (tauri #650)."""
+    st = FixState(
+        resolve_retries={5: 3},
+        last_resolve_error={5: "codex binary 'codex' not found on PATH"},
+    )
+    actions = decide_fix(world(issues=[issue(5, "ai-ready")]), CFG, st, fixer_busy=False)
+    comments = [a for a in actions if isinstance(a, PostComment) and a.number == 5]
+    assert comments and "codex binary 'codex' not found on PATH" in comments[0].body
+    # No recorded error (legacy state) still escalates, without an empty quote.
+    bare = decide_fix(
+        world(issues=[issue(5, "ai-ready")]), CFG,
+        FixState(resolve_retries={5: 3}), fixer_busy=False,
+    )
+    bare_comments = [a for a in bare if isinstance(a, PostComment) and a.number == 5]
+    assert bare_comments and "Last attempt's error" not in bare_comments[0].body
+
+
 def test_fix_ci_at_cap_escalates_not_dispatches():
     st = FixState(ci_retries={9: 3})
     actions = decide_fix(world(prs=[_ci_fail_pr()]), CFG, st, fixer_busy=False)

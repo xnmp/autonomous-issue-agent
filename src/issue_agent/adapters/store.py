@@ -49,7 +49,7 @@ from ..domain.world import normalize_predicted_paths
 # and the real pr-N.automerge marker was cleared by NEITHER cleaner.
 _ISSUE_SUFFIXES = (
     "session", "resumed-at", "resumes", "ci-retries", "ci-history",
-    "resolve-retries",
+    "resolve-retries", "last-error",
     "rebase-retries", "infra-deaths", "review-retries", "phase", "jira",
     "jira-phase", "model", "predicted-paths", "branch", "stall-sig",
     "steward-stalls-triage", "steward-stalls-groom",
@@ -331,6 +331,21 @@ class Store:
         absent already reads as 0 and a removal cannot leave a torn file
         behind (see clear_infra_deaths)."""
         self._remove(self.issue_path(issue, "resolve-retries"))
+
+    # #188: the last terminal error of a failed resolve-family leg, kept so the
+    # circuit-breaker escalation can quote WHY instead of only "failed N×" —
+    # the operator read that as "failed without a reason" and had to grep
+    # journals for a config fix the harness had already diagnosed verbatim.
+    # One bounded line: the comment is operator-facing, not a log dump.
+    _LAST_ERROR_MAX = 400
+
+    def get_last_resolve_error(self, issue: int) -> str:
+        return self._read(self.issue_path(issue, "last-error"))
+
+    def set_last_resolve_error(self, issue: int, summary: str) -> None:
+        line = " ".join((summary or "").split())[: self._LAST_ERROR_MAX]
+        if line:
+            self._write(self.issue_path(issue, "last-error"), line)
 
     def get_rebase_retries(self, issue: int) -> int:
         return self._read_int(self.issue_path(issue, "rebase-retries"))

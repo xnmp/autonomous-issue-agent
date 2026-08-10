@@ -176,6 +176,10 @@ class FixState:
     # requeues ai-ready each round; without a breaker that is a full paid
     # session per poll, forever — #39's shape on the most expensive leg.
     resolve_retries: dict[int, int] = field(default_factory=dict)
+    # #188: the last terminal error of the failed leg, beside its counter, so
+    # the breaker escalation names the WHY. Absent = never recorded (legacy
+    # state or a pre-#188 daemon) — the comment then omits the quote.
+    last_resolve_error: dict[int, str] = field(default_factory=dict)
     # Pre-result session deaths (review C3), keyed the same way the retry
     # counters are: issue number for the issue legs, `breaker_key(pr)` for the
     # PR legs. Written by the dispatcher (on a raised handler) and by the fix
@@ -2004,13 +2008,19 @@ def decide_fix(
                 # re-arm is the dashboard Unblock — an authenticated harness
                 # mint that resets the counter BEFORE restoring the label —
                 # and the escalation comment points the operator at it (#98).
+                # #188: quote the last attempt's terminal error — "failed 3×"
+                # alone read as "failed without a reason" and sent the
+                # operator grepping journals for a fix the harness had
+                # already diagnosed verbatim.
+                last_error = state.last_resolve_error.get(n, "")
+                why = f"\n\nLast attempt's error: {last_error}" if last_error else ""
                 actions.extend(issue_escalation(
                     n,
                     f"resolve failed {cfg.max_resolve_retries}× without "
                     "opening a PR — this issue needs a human look. To grant "
                     f"another {cfg.max_resolve_retries} attempts, use the "
                     "dashboard's Unblock on this issue (a bare ai-ready "
-                    "relabel re-escalates without resetting the budget).",
+                    f"relabel re-escalates without resetting the budget).{why}",
                     Label.AI_READY,
                 ).actions())
                 break

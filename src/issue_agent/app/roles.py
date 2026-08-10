@@ -1806,6 +1806,11 @@ def _fix_state(
     review_retries = {k: store.get_review_retry(k) for k in keys}
     rebase_retries = {k: store.get_rebase_retries(k) for k in keys}
     resolve_retries = {i.number: store.get_resolve_retries(i.number) for i in world.issues}
+    last_resolve_error = {
+        i.number: err
+        for i in world.issues
+        if (err := store.get_last_resolve_error(i.number))
+    }
     # Infra deaths (review C3) span BOTH key spaces: the issue legs (resolve /
     # resume) escalate on the issue number, the PR legs on breaker_key(pr) —
     # and the dispatcher writes under whichever one the dying leg used. Read the
@@ -1859,6 +1864,7 @@ def _fix_state(
         automerge_enabled=automerge,
         ci_retries=ci_retries, review_retries=review_retries,
         rebase_retries=rebase_retries, resolve_retries=resolve_retries,
+        last_resolve_error=last_resolve_error,
         infra_deaths=infra_deaths, ci_rerun_head=ci_rerun_head,
         ci_cancel_head=ci_cancel_head,
         update_branch_head=update_branch_head,

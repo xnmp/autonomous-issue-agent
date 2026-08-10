@@ -743,6 +743,9 @@ class FixWorkflow:
             self._charge_infra_death(issue, leg, result)
             return
         self.store.set_resolve_retries(issue, self.store.get_resolve_retries(issue) + 1)
+        # #188: keep the WHY beside the counter, so the breaker's escalation
+        # comment can quote the last terminal error instead of only "failed N×".
+        self.store.set_last_resolve_error(issue, getattr(result, "summary", "") or "")
 
     def _charge_infra_death(self, issue: int, leg: str, result) -> None:
         """Bill an infra-class failure to the infra ceiling, and journal it.

@@ -31,6 +31,18 @@ obligations follow (operator, 2026-08-08):
   harness could have had (an exit code, a capability probe, a stale install).
   The second kind is a gap — file or fix it; it must not recur as an operator
   action.
+
+  The test (operator, 2026-08-10): **an operator action is a gap unless its
+  irreducible core is a judgment call** — granting spend/budget, a policy or
+  permission decision (gate exemptions, skip-a-validator), resolving a
+  dispute, or repo governance (what merges/pushes where). Everything
+  mechanical wrapped around such a call is still a gap even when the call
+  itself is legitimate: the 2026-08-10 re-arms were judgment (grant more
+  budget) wrapped in label/counter surgery (gap → one-click #98), and the
+  "missing libglib" replies were judgment (skip-validator policy) wrapped in
+  `ldd`/launch verification any probe could run (gap → #192). When
+  classifying, name the judgment kernel explicitly; if you cannot, the whole
+  action is a gap.
 - **Apply the surface-area test to every fix**: a good fix is *subtractive* —
   it removes a piece of knowledge or intervention the operator previously had
   to supply. A fix that adds a knob, a flag, or a per-incident special case
