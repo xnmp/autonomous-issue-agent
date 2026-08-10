@@ -35,6 +35,11 @@ from issue_agent.adapters.codex_runner import (
     parse_codex_envelope,
     parse_codex_usage,
 )
+from issue_agent.domain.outcome import (
+    Outcome,
+    classify_outcome,
+    infra_class_reason,
+)
 from tests.fakes.legacy_journal import Journal
 from issue_agent.adapters.journal import JournalingRuntime, read_events
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
@@ -1414,12 +1419,20 @@ def test_preflight_ok_when_bin_and_key_present():
 
 
 def test_run_returns_blocked_result_when_not_ready(monkeypatch):
-    """A misconfigured codex runtime fails LOUD (blocked + reason), not opaque."""
+    """A misconfigured codex runtime fails LOUD (blocked + reason), not opaque.
+
+    is_error stays True — a non-error result reads as a completed leg to the
+    review gate and could synthesize APPROVE on an unreviewed PR — but the
+    result is INFRA-class via RUNTIME_UNAVAILABLE, so a spawn precondition
+    bills the infra ceiling instead of burning three resolve retries into a
+    reasonless escalation (tauri #650, harness #188)."""
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     logged: list[str] = []
     r = CodexRunner(codex_bin="nope-not-real-bin", log=logged.append)
     res = asyncio.run(r.run(RuntimePlan(prompt="x")))
     assert res.is_error and res.status == "blocked"
+    assert classify_outcome(res) == Outcome.ERROR
+    assert infra_class_reason(res) == "runtime_unavailable"
     assert "not found on PATH" in res.summary
     assert any("NOT READY" in m for m in logged)
 

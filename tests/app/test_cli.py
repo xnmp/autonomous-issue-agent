@@ -1222,6 +1222,48 @@ def test_start_treats_a_shim_from_another_checkout_as_drift(monkeypatch, capsys)
     assert "/opt/other-checkout" in capsys.readouterr().out
 
 
+def test_drift_flags_an_install_resolving_into_a_transient_worktree(monkeypatch):
+    """#187: `make install` inside an agent worktree bakes the transient venv
+    into the launcher; from inside that process every other check reads
+    coherent, so the path itself is the signature."""
+    monkeypatch.setattr(
+        cli, "HARNESS_ROOT", "/home/u/repo/.claude/worktrees/agent-x"
+    )
+    _install_state(
+        monkeypatch, present=("issue-agent", "issue-agent-publish")
+    )
+
+    assert "transient agent worktree" in cli.entrypoint_drift()
+
+
+def test_heal_refuses_to_reinstall_from_a_transient_worktree(monkeypatch, capsys):
+    """`make install` from the transient process would reinstall the transient
+    tree — the exact state being healed."""
+    monkeypatch.setattr(
+        cli, "HARNESS_ROOT", "/home/u/repo/.claude/worktrees/agent-x"
+    )
+    calls = _install_state(
+        monkeypatch, present=("issue-agent", "issue-agent-publish")
+    )
+
+    assert cli.heal_entrypoint_drift() is False
+    assert calls == []
+    assert "canonical checkout" in capsys.readouterr().err
+
+
+def test_doctor_refuses_to_render_from_a_transient_worktree(monkeypatch, capsys):
+    """#187: doctor from a stale worktree venv reported four confidently wrong
+    errors about the deployment. Wrong-checkout red is worse than no output —
+    but ONLY the transient case refuses; other drift renders with the drift
+    leading, because doctor still runs the code the operator invoked."""
+    monkeypatch.setattr(cli, "entrypoint_drift", lambda: "runs a transient tree")
+    monkeypatch.setattr(cli, "running_from_transient_checkout", lambda: True)
+
+    assert cli.cmd_doctor(object()) == 2
+    captured = capsys.readouterr().err
+    assert "REFUSING" in captured and "runs a transient tree" in captured
+
+
 def test_start_gives_up_when_the_reinstall_times_out(monkeypatch, capsys):
     calls = _install_state(monkeypatch, present=("issue-agent",), timeout=True)
 

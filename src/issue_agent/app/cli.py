@@ -54,6 +54,7 @@ from .config import (
     parse_repoint_history,
 )
 from .identity_pools import IdentityPoolReport, identity_pool_report
+from .service_doctor import installed_service_findings
 
 # HARNESS_ROOT: …/src/issue_agent/app/cli.py → repo root. Same walk main.py uses.
 # This is what makes the CLI checkout-resident: plugin/ + config/ are siblings.
@@ -1788,6 +1789,14 @@ def _installed_console_scripts() -> tuple[str, ...]:
     return tuple(e.name for e in entries if e.group == "console_scripts")
 
 
+_TRANSIENT_CHECKOUT_MARKER = f"{os.sep}.claude{os.sep}worktrees{os.sep}"
+
+
+def running_from_transient_checkout() -> bool:
+    """Whether this process's code lives in a `.claude/worktrees/` transient."""
+    return _TRANSIENT_CHECKOUT_MARKER in HARNESS_ROOT + os.sep
+
+
 def _resolves_into_this_checkout(script: str) -> bool:
     """Whether `script` on PATH actually runs THIS checkout's venv entry point.
 
@@ -1817,6 +1826,16 @@ def entrypoint_drift() -> str:
     scripts = declared_console_scripts()
     if _PRIMARY_ENTRYPOINT not in scripts or not shutil.which(_PRIMARY_ENTRYPOINT):
         return ""
+    # #187: a `make install` run inside an agent worktree bakes that transient
+    # tree's venv into the launcher. From INSIDE that stale process the checks
+    # below read coherent — the launcher resolves into "this" checkout, which
+    # is exactly the wrong one — so the transient path itself is the signature.
+    if running_from_transient_checkout():
+        return (
+            f"the installed {_PRIMARY_ENTRYPOINT} runs {HARNESS_ROOT} — a "
+            "transient agent worktree (`make install` ran inside it); run "
+            "`make install` from the canonical checkout"
+        )
     for script in scripts:
         if not shutil.which(script):
             return (
@@ -1864,6 +1883,13 @@ def heal_entrypoint_drift() -> bool:
     drift = entrypoint_drift()
     if not drift:
         return True
+    if running_from_transient_checkout():
+        # `make install` here would reinstall the transient tree — the exact
+        # state being healed. Only a human in the canonical checkout can fix it.
+        err(f"stale install detected ({drift}); NOT auto-repairing — `make "
+            "install` from this process would reinstall the transient worktree "
+            "itself. Run `make install` from the canonical checkout.")
+        return False
     live = live_deployment_names()
     if live:
         err(f"stale/partial install detected ({drift}), but NOT auto-repairing: "
@@ -2123,7 +2149,14 @@ def cmd_start(args) -> int:
         env["ROLES"] = " ".join(args.roles)
     if args.max_ticks is not None:
         env["ISSUE_AGENT_MAX_TICKS"] = str(args.max_ticks)
-    heal_entrypoint_drift()
+    if not heal_entrypoint_drift() and running_from_transient_checkout():
+        # Launching from here would run every daemon out of the transient
+        # tree; other heal failures keep today's behavior (the preflight
+        # reports them) because the canonical checkout is still what executes.
+        err("refusing to launch from a transient worktree checkout — run "
+            "`make install` from the canonical checkout, then `issue-agent "
+            "start` there.")
+        return 1
     info(f"delegating to bin/point-at.sh {name}")
     # exec — hand over the terminal (Ctrl-C trap, log tail live in point-at.sh).
     os.execve(_BASH, [_BASH, _bin("point-at.sh"), name], env)
@@ -2763,6 +2796,21 @@ def cmd_dashboard(args) -> int:
 def cmd_doctor(args) -> int:
     """Compose env for this repo (if detectable) then run bin/doctor.sh, which
     reads AGENT_ENV. With no repo context it still runs tooling/identity checks."""
+    # #187: doctor once ran from a stale worktree venv and reported four
+    # confidently wrong errors about the deployment's config. Only the
+    # transient-worktree case refuses outright — there every path below IS the
+    # wrong checkout's. Other drift shapes (a foreign shim shadowing this
+    # checkout) still render: doctor runs from the code the operator invoked,
+    # and the drift leads as its first, exit-reddening finding.
+    drift = entrypoint_drift()
+    if drift and running_from_transient_checkout():
+        err(f"REFUSING to run doctor — stale/partial install: {drift}")
+        err("Doctor would validate the wrong checkout's config (#187). Run "
+            "`make install` from the canonical checkout, then re-run doctor.")
+        return 2
+    if drift:
+        err(f"install drift: {drift} — heal before trusting anything below "
+            "(`make install`, or `issue-agent start` with no live deployment).")
     repo, target_dir, name = _resolve_context(args)
     # P0R-2: fatal, not a warning. doctor.sh's own per-repo state-dir collision
     # check (bin/doctor.sh) can only compare MULTIPLE overlays against each
@@ -2816,16 +2864,33 @@ def cmd_doctor(args) -> int:
     _doctor_codex_binary(composed)
     exit_codes = _doctor_test_failure_exit_codes(composed, name)
     identity = _doctor_identity_pools(composed)
+    services = _doctor_installed_services(composed, name)
     rc = subprocess.run([_BASH, _bin("doctor.sh")], env=env).returncode
     # An error-level identity finding must redden the EXIT CODE, not only the
     # terminal. doctor is used as a gate (bin/point-at.sh, CI); a config whose
     # fixer token is present-but-unusable 401s every call with no fallback, and
     # returning doctor.sh's 0 for it is the false green this check replaces.
-    if rc == 0 and any(
-        f.level == "error" for f in tuple(identity.findings) + exit_codes
-    ):
+    if rc == 0 and (drift or any(
+        f.level == "error"
+        for f in tuple(identity.findings) + exit_codes + services
+    )):
         return 1
     return rc
+
+
+def _doctor_installed_services(composed: dict, name: str) -> tuple[Finding, ...]:
+    """Findings about the INSTALLED services' env, not this shell's. The 2026-08-10
+    relaunch proved the divergence class: doctor green interactively while the
+    units ran a PATH with no codex (#650) and an install-time config copy that
+    re-composition never reaches."""
+    findings = installed_service_findings(
+        name, composed, _active_env_path(name)
+    )
+    if findings:
+        info("installed services (systemd/launchd)")
+        for finding in findings:
+            (err if finding.level == "error" else warn)(finding.message)
+    return findings
 
 
 CODEX_RUNTIME_KEYS = ("FIXER_RUNTIME", "REVIEWER_RUNTIME", "STEWARD_RUNTIME")

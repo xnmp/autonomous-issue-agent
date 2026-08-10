@@ -1442,10 +1442,24 @@ class CodexRunner(AgentRuntime):
     async def run(self, task: RuntimePlan) -> AgentResult:
         # Fail LOUD, not opaque: if the runtime isn't set up, surface the exact
         # reason as the result summary (and log it) instead of a bare exit-1.
+        # RUNTIME_UNAVAILABLE is what routes this to the infra ceiling instead
+        # of the per-issue quality breaker: without it, three preflight
+        # failures on an unchanged environment burned the resolve budget and
+        # escalated "failed 3× without a reason" (tauri #650, harness #188) —
+        # the same classification bug the stillborn-exec path below already
+        # fixed. is_error stays True: every workflow's error path knows how to
+        # retry/hold safely, whereas a non-error "blocked" reads as a
+        # completed leg to the review gate (adversarial review 2026-08-10:
+        # an unreviewed PR could synthesize APPROVE).
         reason = self.preflight()
         if reason is not None:
             self._log(f"codex: NOT READY — {reason}")
-            return AgentResult(is_error=True, status="blocked", summary=reason)
+            return AgentResult(
+                is_error=True,
+                status="blocked",
+                summary=reason,
+                exit_reason=ExitReason.RUNTIME_UNAVAILABLE,
+            )
 
         # Review M17: the per-run scratch dir used to be an un-removed mkdtemp, so
         # a long-lived daemon leaked one `codex-run-*` directory (schema + the last
