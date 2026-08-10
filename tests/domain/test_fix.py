@@ -49,6 +49,7 @@ from issue_agent.domain.fix import (
     decide_fix,
     duplicate_pr_guards,
     issue_holds,
+    issues_needing_any_resume,
     issues_needing_resume,
     orphaned_cleanup_actions,
     pick_ready_issue,
@@ -541,6 +542,19 @@ def test_resume_skips_already_resumed_reply():
     iss = issue(7, "ai-blocked", comments=(Comment("alice", "x", "t2"),))
     st = FixState(sessions=frozenset({7}), resumed_at={7: "t2"})
     assert issues_needing_resume(world(issues=[iss]), st, CFG) == []
+
+
+def test_resume_never_fires_on_a_closed_issue():
+    """A closed issue is terminal even while it still carries ai-blocked: the
+    operator's closing comment on a duplicate read as an unconsumed reply and
+    bought a paid resume leg that could only re-ask (keifu #196, 2026-08-10)."""
+    iss = issue(
+        7, "ai-blocked", state="closed",
+        comments=(Comment("alice", "closing as duplicate of #192", "t2"),),
+    )
+    st = FixState(sessions=frozenset({7}))
+    assert issues_needing_resume(world(issues=[iss]), st, CFG) == []
+    assert issues_needing_any_resume(world(issues=[iss]), st, CFG) == []
 
 
 def test_resume_ignores_bot_and_fixer_comments():

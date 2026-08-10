@@ -550,6 +550,13 @@ def _issues_needing_resume(
 ) -> list[tuple[int, str]]:
     out: list[tuple[int, str]] = []
     for issue in world.issues:
+        # A closed issue is terminal for the fixer even while it still carries
+        # ai-blocked: any comment on it (an operator closing a duplicate,
+        # keifu #196 2026-08-10) read as an unconsumed reply and bought a paid
+        # resume leg that could only re-ask. The PR selector already gets this
+        # for free from `fixer_prs` being OPEN-only.
+        if issue.state == "closed":
+            continue
         lifecycle = issue_lifecycle(issue)
         has_session = issue.number in state.sessions
         if not lifecycle.is_blocked or has_session != require_session:
