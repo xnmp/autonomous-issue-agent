@@ -26,7 +26,12 @@ from ..domain.contracts import (
     UsageSource,
     daily_budget_scope,
 )
-from ..domain.outcome import AgentResult, ExitReason, MAX_BUDGET_STATUS
+from ..domain.outcome import (
+    AdmissionBudgetBlock,
+    AgentResult,
+    ExitReason,
+    MAX_BUDGET_STATUS,
+)
 from ..domain.ports import StaleReservationReconciler
 from ..domain.pricing import BudgetPolicy, RateTable, price
 from ..domain.refs import is_governed_branch
@@ -302,6 +307,9 @@ class AccountingRuntime(AgentRuntime):
         # doing so makes a transport failure look live until daemon restart.
         reservation = self._reserve_reclaiming_dead_headroom(request)
         if reservation.disposition is not AccountingDisposition.AVAILABLE:
+            headroom = max(
+                0, reservation.cap.micros - reservation.committed.micros
+            )
             return AgentResult(
                 is_error=True,
                 status=MAX_BUDGET_STATUS,
@@ -310,7 +318,24 @@ class AccountingRuntime(AgentRuntime):
                     "paid admission blocked: "
                     f"{reservation.disposition.value} ({reservation.detail})"
                 ),
+                structured={
+                    "budget_block": {
+                        "scope": reservation.tripped_dimension or primary.scope.dimension,
+                        "committed_micros": reservation.committed.micros,
+                        "reservation_micros": reservation.requested.micros,
+                        "cap_micros": reservation.cap.micros,
+                        "old_headroom_micros": headroom,
+                        "currency": reservation.cap.currency,
+                    }
+                },
                 exit_reason=ExitReason.BUDGET_EXHAUSTED,
+                admission_budget_block=AdmissionBudgetBlock(
+                    reservation.tripped_dimension or primary.scope.dimension,
+                    reservation.requested.micros,
+                    reservation.cap.micros,
+                    reservation.committed.micros,
+                    reservation.cap.currency,
+                ),
             )
         if self.require_dispatch_claim and not self.store.bind_dispatch_claim(
             self.repository,

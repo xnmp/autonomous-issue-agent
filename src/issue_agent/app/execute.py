@@ -26,7 +26,10 @@ from ..domain.actions import (
     AddDependency,
     ClearIssueState,
     CloseIssue,
+    DiscardSelfClearMarker,
     EnableAutoMerge,
+    FinalizeBudgetBlockRetirement,
+    FinalizeMachineBlockRetirement,
     EscalateCiPending,
     UpdateBranch,
     NoOp,
@@ -36,6 +39,7 @@ from ..domain.actions import (
     CancelWorkflowRuns,
     RerunFailedChecks,
     ResetCiRetries,
+    ReportSelfClearCeiling,
     RunAgent,
     Target,
 )
@@ -44,9 +48,12 @@ from ..domain.events import (
     ActionApplied,
     ActionFailed,
     ActionRetried,
+    BlockRetired,
+    BudgetBlockRetired,
     Correlation,
     EscalationRaised,
     LevelChanged,
+    SelfClearCeilingReached,
     TelemetryEvent,
     TelemetryWarning,
 )
@@ -99,7 +106,7 @@ def _missing_handler(name: str):
 
 def _is_advisory_relabel(action: Relabel) -> bool:
     return (
-        action.remove in ADVISORY_LABELS
+        any(label in ADVISORY_LABELS for label in action.removed_labels)
         or action.add in ADVISORY_LABELS
     )
 
@@ -108,13 +115,16 @@ def _action_spec(action: Action) -> tuple[str, str, int | None, dict]:
     """Return one structured telemetry shape for every action verb."""
 
     if isinstance(action, Relabel):
-        return "relabel", action.target.name.lower(), action.number, {
+        payload: dict[str, object] = {
             "type": "relabel",
             "target": action.target.name,
             "number": action.number,
             "remove": action.remove.value if action.remove else None,
             "add": action.add.value if action.add else None,
         }
+        if action.removes:
+            payload["removes"] = [label.value for label in action.removes]
+        return "relabel", action.target.name.lower(), action.number, payload
     if isinstance(action, PostComment):
         return "comment", action.target.name.lower(), action.number, {
             "type": "comment",
@@ -184,6 +194,39 @@ def _action_spec(action: Action) -> tuple[str, str, int | None, dict]:
             "type": "reset_ci_retries",
             "issue": action.issue,
         }
+    if isinstance(action, FinalizeMachineBlockRetirement):
+        return "block_retired", "state", action.issue, {
+            "type": "block_retired",
+            "issue": action.issue,
+            "target": action.target.name.lower(),
+            "number": action.number,
+            "blocker": action.blocker,
+            "blocked_head": action.blocked_head,
+            "observed_head": action.observed_head,
+        }
+    if isinstance(action, FinalizeBudgetBlockRetirement):
+        return "budget_block_retired", "state", action.issue, {
+            "type": "budget_block_retired",
+            "issue": action.issue,
+            "target": action.target.name.lower(),
+            "number": action.number,
+            "scope": action.scope,
+        }
+    if isinstance(action, ReportSelfClearCeiling):
+        return "self_clear_ceiling", "state", action.issue, {
+            "type": "self_clear_ceiling",
+            "issue": action.issue,
+            "target": action.target.name.lower(),
+            "number": action.number,
+            "blocker": action.blocker,
+            "ceiling": action.ceiling,
+        }
+    if isinstance(action, DiscardSelfClearMarker):
+        return "discard_self_clear_marker", "state", action.issue, {
+            "type": "discard_self_clear_marker",
+            "issue": action.issue,
+            "marker": action.marker,
+        }
     if isinstance(action, RunAgent):
         payload: dict[str, object] = {
             "type": "run_agent",
@@ -225,6 +268,20 @@ def _action_correlation(action: Action) -> Correlation:
     if isinstance(action, ClearIssueState):
         return Correlation(issue=action.issue, pr=action.pr)
     if isinstance(action, ResetCiRetries):
+        return Correlation(issue=action.issue)
+    if isinstance(
+        action,
+        (
+            FinalizeMachineBlockRetirement,
+            FinalizeBudgetBlockRetirement,
+            ReportSelfClearCeiling,
+        ),
+    ):
+        return Correlation(
+            issue=action.issue,
+            pr=action.number if action.target is Target.PR else None,
+        )
+    if isinstance(action, DiscardSelfClearMarker):
         return Correlation(issue=action.issue)
     if isinstance(action, RunAgent):
         issue_kinds = {"RESOLVE", "RESUME", "TRIAGE", "GROOM"}
@@ -288,6 +345,11 @@ class Executor:
         mark_ci_pending_escalated: Callable[[int, str], None] | None = None,
         clear_issue_state: Callable[[int, int | None, bool], None] | None = None,
         reset_ci_retries: Callable[[int], None] | None = None,
+        retire_machine_block: Callable[[int], int] | None = None,
+        retire_budget_block: Callable[[int], int] | None = None,
+        mark_self_clear_ceiling: Callable[[int], None] | None = None,
+        discard_machine_block: Callable[[int], None] | None = None,
+        discard_budget_block: Callable[[int], None] | None = None,
         journal=None,
         alert_cmd: str = "",
         retry_delays: tuple[float, ...] = _DEFAULT_RETRY_DELAYS,
@@ -343,6 +405,21 @@ class Executor:
         # roles' Executors quiet — an unwired reset costs nothing but a stale
         # count, which is exactly the pre-fix behaviour.
         self._reset_ci_retries = reset_ci_retries
+        self._retire_machine_block = retire_machine_block or _missing_handler(
+            "retire_machine_block"
+        )
+        self._retire_budget_block = retire_budget_block or _missing_handler(
+            "retire_budget_block"
+        )
+        self._mark_self_clear_ceiling = (
+            mark_self_clear_ceiling or _missing_handler("mark_self_clear_ceiling")
+        )
+        self._discard_machine_block = discard_machine_block or _missing_handler(
+            "discard_machine_block"
+        )
+        self._discard_budget_block = discard_budget_block or _missing_handler(
+            "discard_budget_block"
+        )
         # Log EVERY applied action so state changes (label moves, comments, close,
         # auto-merge, worktree removal, agent dispatch) are visible instead of
         # inferred. One funnel = one audit trail. Default no-op keeps tests quiet.
@@ -384,9 +461,16 @@ class Executor:
         """Human-readable one-liner for the action being applied."""
         if isinstance(action, Relabel):
             k = _KIND[action.target]
-            rm = action.remove.value if action.remove else None
+            removed = ",".join(label.value for label in action.removed_labels)
             add = action.add.value if action.add else None
-            move = " ".join(p for p in (f"-{rm}" if rm else "", f"+{add}" if add else "") if p)
+            move = " ".join(
+                part
+                for part in (
+                    f"-{removed}" if removed else "",
+                    f"+{add}" if add else "",
+                )
+                if part
+            )
             return f"relabel {k} #{action.number}: {move or '(no-op)'}"
         if isinstance(action, PostComment):
             return f"comment {_KIND[action.target]} #{action.number} ({len(action.body)} chars)"
@@ -420,6 +504,14 @@ class Executor:
             return f"clear state for pr #{action.pr}{issue_part} ({scope})"
         if isinstance(action, ResetCiRetries):
             return f"reset CI-repair count for #{action.issue} (went green)"
+        if isinstance(action, FinalizeMachineBlockRetirement):
+            return f"finalize {action.blocker} block retirement for #{action.issue}"
+        if isinstance(action, FinalizeBudgetBlockRetirement):
+            return f"finalize budget block retirement for #{action.issue}"
+        if isinstance(action, ReportSelfClearCeiling):
+            return f"report self-clear ceiling for #{action.issue} ({action.blocker})"
+        if isinstance(action, DiscardSelfClearMarker):
+            return f"discard stale {action.marker} block marker for #{action.issue}"
         if isinstance(action, RunAgent):
             return f"dispatch {action.kind.name} #{action.number}"
         return repr(action)
@@ -450,7 +542,7 @@ class Executor:
         if action.add is Label.AI_BLOCKED:
             state = "waiting"
         elif (
-            action.remove is Label.AI_BLOCKED
+            Label.AI_BLOCKED in action.removed_labels
             and action.add is Label.AI_WORKING
         ):
             state = "cleared"
@@ -660,6 +752,67 @@ class Executor:
         elif isinstance(action, ResetCiRetries):
             if self._reset_ci_retries is not None:
                 self._reset_ci_retries(action.issue)
+        elif isinstance(action, FinalizeMachineBlockRetirement):
+            kind = _KIND[action.target]
+            if self.gateway.has_label(kind, action.number, Label.AI_BLOCKED.value):
+                raise LifecycleWriteUnverified(
+                    f"{kind} #{action.number} is still ai-blocked"
+                )
+            count = self._retire_machine_block(action.issue)
+            if self._journal is not None:
+                self._journal.emit(TelemetryEvent(
+                    BlockRetired(
+                        action.blocker,
+                        action.blocked_head,
+                        action.observed_head,
+                        count,
+                    ),
+                    _action_correlation(action),
+                ))
+        elif isinstance(action, FinalizeBudgetBlockRetirement):
+            kind = _KIND[action.target]
+            remaining = tuple(
+                label.value
+                for label in (Label.AI_BLOCKED, Label.NEEDS_BUDGET_REVIEW)
+                if self.gateway.has_label(kind, action.number, label.value)
+            )
+            if remaining:
+                raise LifecycleWriteUnverified(
+                    f"{kind} #{action.number} still has {', '.join(remaining)}"
+                )
+            count = self._retire_budget_block(action.issue)
+            if self._journal is not None:
+                self._journal.emit(TelemetryEvent(
+                    BudgetBlockRetired(
+                        action.scope,
+                        action.old_headroom_micros,
+                        action.new_headroom_micros,
+                        action.reservation_micros,
+                        action.cap_micros,
+                        action.currency,
+                        count,
+                    ),
+                    _action_correlation(action),
+                ))
+        elif isinstance(action, ReportSelfClearCeiling):
+            self._mark_self_clear_ceiling(action.issue)
+            if self._journal is not None:
+                self._journal.emit(TelemetryEvent(
+                    SelfClearCeilingReached(
+                        action.blocker,
+                        _KIND[action.target],
+                        action.number,
+                        action.ceiling,
+                    ),
+                    _action_correlation(action),
+                ))
+        elif isinstance(action, DiscardSelfClearMarker):
+            if action.marker == "machine":
+                self._discard_machine_block(action.issue)
+            elif action.marker == "budget":
+                self._discard_budget_block(action.issue)
+            else:
+                raise ValueError(f"unknown self-clear marker {action.marker!r}")
         elif isinstance(action, RunAgent):
             if self._run_agent is None:
                 raise RuntimeError("RunAgent executed before dispatch was bound")

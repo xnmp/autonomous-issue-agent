@@ -50,6 +50,7 @@ from ...domain.effort import (
     escalate,
 )
 from ...domain.labels import Label
+from ...domain.self_clear import BudgetBlock, MachineBlock, MachineBlocker
 from ...domain.refs import slugify
 from ...domain.review import count_outstanding_change_requests
 from ...domain.trust import as_untrusted
@@ -114,6 +115,62 @@ class FixWorkflow:
     # Atomic application-level reservation update for router-expanded paths.
     # None keeps standalone workflow tests and serial callers unchanged.
     reserve_paths: Callable[[int, frozenset[str]], bool] | None = None
+
+    def _clear_block_markers(self, issue: int) -> None:
+        for name in ("clear_machine_block", "clear_budget_block"):
+            writer = getattr(self.store, name, None)
+            if writer is not None:
+                writer(issue)
+
+    def _record_block_state(
+        self,
+        issue: int,
+        target: Target,
+        number: int,
+        result,
+        *,
+        pr: int | None = None,
+        blocked_head: str = "",
+    ) -> None:
+        """Persist only typed blocker claims; never classify the prose in needs."""
+
+        if outcome.infra_class_failure(result) and not outcome.budget_exhausted(
+            result.exit_reason
+        ):
+            return
+        if outcome.budget_exhausted(result.exit_reason):
+            facts = result.admission_budget_block
+            if facts is None:
+                # A per-leg spend kill is not an admission predicate. Replaying
+                # it under the same per-leg ceiling would only repeat the kill.
+                return
+            self._clear_block_markers(issue)
+            block = BudgetBlock(
+                issue,
+                target,
+                number,
+                facts.reservation_micros,
+                facts.scope,
+                facts.cap_micros,
+                max(0, facts.cap_micros - facts.committed_micros),
+                facts.currency,
+            )
+            writer = getattr(self.store, "set_budget_block", None)
+            if writer is not None:
+                writer(block)
+            return
+        self._clear_block_markers(issue)
+        if result.status != "blocked" or pr is None or not blocked_head:
+            return
+        try:
+            blocker = MachineBlocker(result.field("blocker"))
+        except ValueError:
+            return
+        writer = getattr(self.store, "set_machine_block", None)
+        if writer is not None:
+            writer(MachineBlock(
+                issue, target, number, pr, blocker, blocked_head
+            ))
 
     def _ensure_cwd(self, issue: int, branch: str) -> str:
         cwd = self.worktrees.ensure(issue, branch)
@@ -562,6 +619,7 @@ class FixWorkflow:
         self.store.save_session(issue, result.session_id)
         self._decay_infra_deaths(issue, result)
         pr = self.gateway.pr_for_issue(issue)
+        self._record_block_state(issue, Target.ISSUE, issue, result, pr=pr)
         self._journal_budget_path(issue, "resolve", result.exit_reason, pr)
         if outcome.resolve_followup(result, pr is not None) is outcome.ResolveFollowup.RETRY:
             self._bump_resolve_retry(issue, result)
@@ -620,6 +678,7 @@ class FixWorkflow:
             fu_author = outcome.author_followup(author)
             if fu_author is not outcome.AuthorFollowup.AUTHORED:
                 pr = self.gateway.pr_for_issue(issue)
+                self._record_block_state(issue, Target.ISSUE, issue, author, pr=pr)
                 self._journal_budget_path(issue, "author", author.exit_reason, pr)
                 if fu_author is outcome.AuthorFollowup.RETRY:
                     self._bump_resolve_retry(issue, author, "author")
@@ -670,6 +729,7 @@ class FixWorkflow:
             pr = self.gateway.pr_for_issue(issue)
             fu = outcome.implement_followup(impl, pr is not None)
             if fu is not outcome.ImplementFollowup.CONTRACT_CHANGE:
+                self._record_block_state(issue, Target.ISSUE, issue, impl, pr=pr)
                 self._journal_budget_path(issue, "implement", impl.exit_reason, pr)
                 if fu is outcome.ImplementFollowup.RETRY:
                     self._bump_resolve_retry(issue, impl, "implement")
@@ -887,6 +947,7 @@ class FixWorkflow:
         else:
             self.store.save_session(issue, result.session_id)
         pr = self.gateway.pr_for_issue(issue)
+        self._record_block_state(issue, Target.ISSUE, issue, result, pr=pr)
         if outcome.infra_class_failure(result):
             # review C3/D2c, RETURNED-result half. Reads `infra_class_failure`
             # so a runtime that could not start the leg counts here, not as a
@@ -995,6 +1056,9 @@ class FixWorkflow:
         result = await self._run_logged(
             "pr-resume", issue, task, kind="PR_RESUME"
         )
+        self._record_block_state(
+            issue, Target.PR, pr, result, pr=pr, blocked_head=p.head_ref_oid
+        )
         self.store.save_session(issue, result.session_id)
         if outcome.infra_class_failure(result):
             self._charge_infra_death(issue, "pr-resume", result)
@@ -1033,6 +1097,9 @@ class FixWorkflow:
         )
         result = await self._run_logged(
             "address-review", issue, task, kind="ADDRESS_REVIEW"
+        )
+        self._record_block_state(
+            issue, Target.PR, pr, result, pr=pr, blocked_head=p.head_ref_oid
         )
         self.store.save_session(issue, result.session_id)
         out = outcome.address_review_actions(pr, result)
@@ -1103,6 +1170,9 @@ class FixWorkflow:
             ci_history=prior_attempts,
         )
         result = await self._run_logged("fix-ci", issue, task, kind="FIX_CI")
+        self._record_block_state(
+            issue, Target.PR, pr, result, pr=pr, blocked_head=p.head_ref_oid
+        )
         self.store.save_session(issue, result.session_id)
         # An externally-killed session made no attempt, so it must not march the
         # CI breaker toward needs-human-review (FAILURE-MODES #58: six SIGKILLs on
@@ -1151,6 +1221,9 @@ class FixWorkflow:
             self._repair_fix_cfg(issue, "rebase")
         )
         result = await self._run_logged("rebase", issue, task, kind="REBASE")
+        self._record_block_state(
+            issue, Target.PR, pr, result, pr=pr, blocked_head=p.head_ref_oid
+        )
         self.store.save_session(issue, result.session_id)
         # Same rule as fix_ci: neither an infra kill nor a budget-capped
         # admission/leg is a failed rebase attempt (#155).

@@ -144,21 +144,23 @@ def test_a_silent_deployment_still_goes_stale(tmp_path) -> None:
     assert all(health.stale for health in dead.deployment.health)
 
 
-def test_a_new_utc_day_invalidates_the_cached_snapshot(tmp_path) -> None:
-    """Today's spend is bucketed by UTC day; midnight must not be cached over."""
+def test_a_new_local_day_invalidates_the_cached_snapshot(tmp_path) -> None:
+    """Today's spend is bucketed by host day; local midnight cannot be cached over."""
 
     _emit(tmp_path, "fix", 7)
     collector = system.SnapshotCollector()
-    late = NOW.replace(hour=23, minute=59, second=59)
+    local = timezone(timedelta(hours=10))
+    late = NOW.replace(hour=13, minute=59, second=59)
     first = collector.collect(
-        **_kwargs(tmp_path, now=late, stale_after_s=10**9)
+        **_kwargs(tmp_path, now=late, stale_after_s=10**9), local_tz=local
     )
     assert collector.collect(
-        **_kwargs(tmp_path, now=late, stale_after_s=10**9)
+        **_kwargs(tmp_path, now=late, stale_after_s=10**9), local_tz=local
     ) is first
 
     tomorrow = collector.collect(
-        **_kwargs(tmp_path, now=late + timedelta(seconds=2), stale_after_s=10**9)
+        **_kwargs(tmp_path, now=late + timedelta(seconds=2), stale_after_s=10**9),
+        local_tz=local,
     )
 
     assert tomorrow is not first

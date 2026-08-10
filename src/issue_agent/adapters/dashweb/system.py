@@ -5,7 +5,8 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
-from datetime import datetime, timedelta, timezone
+from collections.abc import Callable
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 from glob import glob
 from pathlib import Path
 
@@ -19,6 +20,25 @@ from ...adapters.heartbeat import read_heartbeat_time
 from ...adapters.journal import read_events
 from ...domain import dashboard as dash
 from ...domain.projection import fold
+
+
+def _system_local_date(timestamp: float) -> date:
+    return datetime.fromtimestamp(timestamp).date()
+
+
+def _system_local_midnight(day: date) -> float:
+    return datetime.combine(day, time.min).timestamp()
+
+
+def _local_time_functions(
+    local_tz: tzinfo | None,
+) -> tuple[Callable[[float], date], Callable[[date], float]]:
+    if local_tz is None:
+        return _system_local_date, _system_local_midnight
+    return (
+        lambda timestamp: datetime.fromtimestamp(timestamp, local_tz).date(),
+        lambda day: datetime.combine(day, time.min, local_tz).timestamp(),
+    )
 
 
 def deployment_names(repos_dir: str) -> tuple[str, ...]:
@@ -100,12 +120,16 @@ def collect_snapshot(
     now_fn,
     stale_after_s: float,
     control_db_path: str | None = None,
+    local_tz: tzinfo | None = None,
     read_log=None,
 ) -> dash.Snapshot:
     read_log = read_log or read_event_log
     now = now_fn()
+    to_local_date, local_midnight = _local_time_functions(local_tz)
     settled_today_usd, settled_today_unavailable, spend_warnings = (
-        _settled_today_usd(control_db_path, repo, now)
+        _settled_today_usd(
+            control_db_path, repo, now, to_local_date, local_midnight
+        )
     )
     typed_paths = tuple(
         os.path.join(os.path.dirname(path), "events-v2.jsonl")
@@ -137,6 +161,7 @@ def collect_snapshot(
             ),
             settled_today_usd,
             settled_today_unavailable,
+            to_local_date,
         )
         timestamps = tuple(
             stamp
@@ -190,6 +215,7 @@ def collect_snapshot(
         warnings=warnings,
         settled_today_usd=settled_today_usd,
         settled_today_unavailable=settled_today_unavailable,
+        to_local_date=to_local_date,
     )
     timestamps = tuple(
         event.observed_at
@@ -253,7 +279,11 @@ def _argument_key(**kwargs) -> tuple:
 
 
 def _valid_until(
-    snapshot: dash.Snapshot, now: datetime, stale_after_s: float
+    snapshot: dash.Snapshot,
+    now: datetime,
+    stale_after_s: float,
+    local_midnight: Callable[[date], float],
+    to_local_date: Callable[[float], date],
 ) -> datetime:
     """The instant up to which this snapshot stays correct with no file change.
 
@@ -264,8 +294,8 @@ def _valid_until(
       within `stale_after_s`, so it flips at `last_ts + stale_after_s`. It can
       never flip back without a new event or heartbeat write, and both move the
       fingerprint — an already-stale role therefore imposes no bound.
-    * today's spend is bucketed by UTC calendar day, so it can only change at
-      the next UTC midnight.
+    * today's spend is bucketed by the host calendar day, so it can only change
+      at the next local midnight.
 
     Bounding reuse this way is what keeps the short-circuit from freezing the
     liveness indicators: a deployment whose daemons died writes nothing further,
@@ -279,9 +309,8 @@ def _valid_until(
     """
     if snapshot.deployment.schema_version != 2:
         return now
-    midnight = now.astimezone(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    ) + timedelta(days=1)
+    next_day = to_local_date(now.timestamp()) + timedelta(days=1)
+    midnight = datetime.fromtimestamp(local_midnight(next_day), timezone.utc)
     deadlines = [midnight]
     for health in snapshot.deployment.health:
         last = health.last_ts
@@ -332,10 +361,13 @@ class SnapshotCollector:
         now_fn,
         stale_after_s: float,
         control_db_path: str | None = None,
+        local_tz: tzinfo | None = None,
         **kwargs,
     ) -> dash.Snapshot:
         lock, reader = self._for(name)
         with lock:
+            now = now_fn()
+            to_local_date, local_midnight = _local_time_functions(local_tz)
             # The caller's arguments are half the fingerprint, not just the
             # files: `repo`, `target_dir` and the state-dir paths come from an
             # overlay the operator can edit, and an edited overlay moves no
@@ -346,6 +378,7 @@ class SnapshotCollector:
                     ledger_path=ledger_path,
                     control_db_path=control_db_path,
                     stale_after_s=stale_after_s,
+                    local_tz=local_tz,
                     **kwargs,
                 ),
                 source_fingerprint(
@@ -354,7 +387,6 @@ class SnapshotCollector:
                     control_db_path=control_db_path,
                 ),
             )
-            now = now_fn()
             entry = self._cached.get(name)
             if entry is not None and entry[0] == fingerprint and now < entry[1]:
                 return entry[2]
@@ -365,27 +397,42 @@ class SnapshotCollector:
                 now_fn=now_fn,
                 stale_after_s=stale_after_s,
                 control_db_path=control_db_path,
+                local_tz=local_tz,
                 read_log=reader.read,
                 **kwargs,
             )
             self._cached[name] = (
                 fingerprint,
-                _valid_until(snapshot, now, stale_after_s),
+                _valid_until(
+                    snapshot,
+                    now,
+                    stale_after_s,
+                    local_midnight,
+                    to_local_date,
+                ),
                 snapshot,
             )
             return snapshot
 
 
-def _settled_today_usd(control_db_path, repository, now):
+def _settled_today_usd(
+    control_db_path,
+    repository,
+    now,
+    to_local_date: Callable[[float], date],
+    local_midnight: Callable[[date], float],
+):
     if not control_db_path:
         return None, False, ()
-    start = now.astimezone(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0
+    today = to_local_date(now.timestamp())
+    start = datetime.fromtimestamp(local_midnight(today), timezone.utc)
+    end = datetime.fromtimestamp(
+        local_midnight(today + timedelta(days=1)), timezone.utc
     )
     spend = read_settled_spend(
         control_db_path,
         start,
-        start + timedelta(days=1),
+        end,
     )
     amount = spend.for_repository(repository)
     if amount is None:

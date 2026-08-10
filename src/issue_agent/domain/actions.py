@@ -71,6 +71,15 @@ class Relabel:
     # harness authored — never agent- or user-supplied. Do NOT set it on a
     # write whose correctness depends on the target being unchanged.
     harness_signal: bool = False
+    # Additional removals are part of this same durable lifecycle command.
+    # This is intentionally not represented as multiple Relabel actions: they
+    # would share one observed revision, so the first mutation would stale the
+    # second command and could strand a half-completed label transition.
+    removes: tuple[Label, ...] = ()
+
+    @property
+    def removed_labels(self) -> tuple[Label, ...]:
+        return ((self.remove,) if self.remove is not None else ()) + self.removes
 
 
 @dataclass(frozen=True)
@@ -254,6 +263,52 @@ class ResetCiRetries:
 
 
 @dataclass(frozen=True)
+class FinalizeMachineBlockRetirement:
+    """Commit local self-clear state after the observed label move landed."""
+
+    issue: int
+    target: Target
+    number: int
+    blocker: str
+    blocked_head: str
+    observed_head: str
+
+
+@dataclass(frozen=True)
+class FinalizeBudgetBlockRetirement:
+    """Commit local budget self-clear state after both labels were removed."""
+
+    issue: int
+    target: Target
+    number: int
+    scope: str
+    old_headroom_micros: int | None
+    new_headroom_micros: int | None
+    reservation_micros: int
+    cap_micros: int | None
+    currency: str
+
+
+@dataclass(frozen=True)
+class ReportSelfClearCeiling:
+    """One-shot journal edge when a fourth automatic clear is withheld."""
+
+    issue: int
+    target: Target
+    number: int
+    blocker: str
+    ceiling: int
+
+
+@dataclass(frozen=True)
+class DiscardSelfClearMarker:
+    """Retire a marker after presence proves its remote block is already gone."""
+
+    issue: int
+    marker: str
+
+
+@dataclass(frozen=True)
 class NoOp:
     reason: str = ""
 
@@ -272,6 +327,10 @@ Action = Union[
     RemoveWorktree,
     ClearIssueState,
     ResetCiRetries,
+    FinalizeMachineBlockRetirement,
+    FinalizeBudgetBlockRetirement,
+    ReportSelfClearCeiling,
+    DiscardSelfClearMarker,
     NoOp,
 ]
 
@@ -299,6 +358,10 @@ __all__ = [
     "RemoveWorktree",
     "ClearIssueState",
     "ResetCiRetries",
+    "FinalizeMachineBlockRetirement",
+    "FinalizeBudgetBlockRetirement",
+    "ReportSelfClearCeiling",
+    "DiscardSelfClearMarker",
     "NoOp",
     "Action",
 ]

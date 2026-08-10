@@ -35,6 +35,12 @@ from .actions import (
     RunAgent,
     Target,
 )
+from .self_clear import (
+    BudgetBlock,
+    BudgetWorld,
+    MachineBlock,
+    self_clear_actions,
+)
 from .ci import (
     ci_state,
     failed_checks,
@@ -212,6 +218,11 @@ class FixState:
     # the label-based one-shot used by older breakers, this survives an
     # operator deliberately restoring ai-pr-open while the same check runs.
     ci_pending_escalated: frozenset[tuple[int, str]] = frozenset()
+    machine_blocks: dict[int, MachineBlock] = field(default_factory=dict)
+    budget_blocks: dict[int, BudgetBlock] = field(default_factory=dict)
+    budget_worlds: dict[int, BudgetWorld] = field(default_factory=dict)
+    self_clear_counts: dict[int, int] = field(default_factory=dict)
+    self_clear_ceiling_reported: frozenset[int] = frozenset()
 
 
 # ── holds (why a ready issue was NOT picked) ─────────────────────────────────
@@ -970,6 +981,7 @@ def cleanup_actions(
     recurrence reporter selects exactly `open + ai-done + reopened`, so ai-done on
     a reopened issue is what MAKES the signal readable."""
     actions: list[Action] = []
+
     merged = pr.state == "MERGED"
     issue_arm = issue_number is not None and issue_observed_pr_open
     if issue_arm:
@@ -1662,6 +1674,27 @@ def decide_fix(
     """
     actions: list[Action] = []
 
+    retiring = self_clear_actions(
+        world,
+        state.machine_blocks,
+        state.budget_blocks,
+        state.budget_worlds,
+        state.self_clear_counts,
+        state.self_clear_ceiling_reported,
+        cfg.ci_ignore_checks,
+    )
+    actions.extend(retiring)
+    retiring_issues = {
+        action.issue for action in retiring if hasattr(action, "issue")
+    }
+    retiring_prs = {
+        action.number
+        for action in retiring
+        if hasattr(action, "target")
+        and action.target is Target.PR
+        and hasattr(action, "number")
+    }
+
     active_issues = frozenset(active.issue for active in state.inflight)
     # A legacy external lock exposes only a boolean, so it cannot identify the
     # issue to protect and retains global suppression. Pool state carries exact
@@ -1712,7 +1745,7 @@ def decide_fix(
         return view.declared_paths | view.predicted_paths
 
     # Only the fixer's OWN PRs are actionable here — see `fixer_prs`.
-    open_prs = list(fixer_prs(world, cfg))
+    open_prs = [p for p in fixer_prs(world, cfg) if p.number not in retiring_prs]
     pr_resume_replies = {
         pr: (issue, reply_at)
         for pr, issue, reply_at in prs_needing_resume(world, state, cfg)
@@ -1968,6 +2001,8 @@ def decide_fix(
     if remaining:
         needing = issues_needing_any_resume(world, state, cfg)
         for n, _at in needing:
+            if n in retiring_issues:
+                continue
             if not remaining:
                 break
             paths = issue_paths(n)

@@ -206,6 +206,36 @@ class EscalationRaised(EventPayload):
     number: int
 
 
+@event_type("lifecycle.block_retired.v1")
+@dataclass(frozen=True)
+class BlockRetired(EventPayload):
+    blocker: str
+    blocked_head: str
+    observed_head: str
+    self_clear_count: int
+
+
+@event_type("accounting.budget_block_retired.v1")
+@dataclass(frozen=True)
+class BudgetBlockRetired(EventPayload):
+    scope: str
+    old_headroom_micros: int | None
+    new_headroom_micros: int | None
+    reservation_micros: int
+    cap_micros: int | None
+    currency: str
+    self_clear_count: int
+
+
+@event_type("lifecycle.self_clear_ceiling_reached.v1")
+@dataclass(frozen=True)
+class SelfClearCeilingReached(EventPayload):
+    blocker: str
+    target: str
+    number: int
+    ceiling: int
+
+
 @event_type("state.level.changed.v1")
 @dataclass(frozen=True)
 class LevelChanged(EventPayload):

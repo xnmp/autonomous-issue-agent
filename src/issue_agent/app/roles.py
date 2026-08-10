@@ -112,6 +112,11 @@ from ..domain.effect_retry import DEFAULT_EFFECT_RETRY_CEILING
 from ..domain.outcome import AgentResult
 from ..domain.agent_task import RUNTIME_CAPABILITIES, RuntimeName
 from ..domain.contracts import BudgetScope, Money
+from ..domain.self_clear import (
+    BudgetBlock,
+    BudgetLimitObservation,
+    BudgetWorld,
+)
 from ..domain.pricing import (
     BudgetPolicy,
     ModelRates,
@@ -1859,6 +1864,26 @@ def _fix_state(
         if isinstance(store, CiPendingState)
         and (head := store.get_ci_pending_escalated_head(p.number))
     )
+    issue_keys = {
+        *[i.number for i in world.issues],
+        *[key for p in world.prs if (key := breaker_key(p)) > 0],
+    }
+    machine_blocks = {
+        issue: block
+        for issue in issue_keys
+        if (block := store.get_machine_block(issue)) is not None
+    }
+    budget_blocks = {
+        issue: block
+        for issue in issue_keys
+        if (block := store.get_budget_block(issue)) is not None
+    }
+    self_clear_counts = {
+        issue: store.get_self_clear_count(issue) for issue in issue_keys
+    }
+    self_clear_ceiling_reported = frozenset(
+        issue for issue in issue_keys if store.self_clear_ceiling_reported(issue)
+    )
     return FixState(
         sessions=sessions, resumed_at=resumed, pr_resumed_at=pr_resumed,
         automerge_enabled=automerge,
@@ -1871,7 +1896,91 @@ def _fix_state(
         ci_pending_escalated=ci_pending_escalated,
         inflight=inflight,
         test_exemptions=dict(test_exemptions or {}),
+        machine_blocks=machine_blocks,
+        budget_blocks=budget_blocks,
+        self_clear_counts=self_clear_counts,
+        self_clear_ceiling_reported=self_clear_ceiling_reported,
     )
+
+
+def _budget_self_clear_worlds(
+    control: SQLiteControlStore,
+    cfg: HarnessConfig,
+    world,
+    stored: dict[int, BudgetBlock],
+) -> tuple[dict[int, BudgetBlock], dict[int, BudgetWorld]]:
+    """Observe caps only for harness-authored budget-block markers.
+
+    GitHub labels are a cross-check and may select a full or half-cleared
+    transition, but they never synthesize the admission evidence (ADR 0012).
+    """
+
+    targets: dict[int, tuple[Target, int]] = {}
+    issues = {issue.number: issue for issue in world.issues}
+    prs = {pr.number: pr for pr in world.prs}
+    for issue, block in stored.items():
+        observed = (
+            issues.get(block.number)
+            if block.target is Target.ISSUE
+            else prs.get(block.number)
+        )
+        if observed is not None and (
+            observed.has(Label.AI_BLOCKED)
+            or observed.has(Label.NEEDS_BUDGET_REVIEW)
+        ):
+            targets[issue] = (block.target, block.number)
+
+    blocks = dict(stored)
+    now = datetime.now(timezone.utc)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    worlds: dict[int, BudgetWorld] = {}
+    for issue, (target, number) in targets.items():
+        scopes: list[tuple[BudgetScope, float]] = []
+        if cfg.issue_spend_cap_usd > 0:
+            scopes.append((
+                BudgetScope(
+                    cfg.repo,
+                    f"issue:{issue}",
+                    "USD",
+                    f"lifetime:{issue}",
+                    datetime(1970, 1, 1, tzinfo=timezone.utc),
+                    datetime.max.replace(tzinfo=timezone.utc),
+                    ZoneInfo("UTC"),
+                ),
+                cfg.issue_spend_cap_usd,
+            ))
+        for repository, dimension, cap in (
+            (cfg.repo, "repository", cfg.daily_spend_cap_usd),
+            ("*", "global", cfg.global_daily_spend_cap_usd),
+        ):
+            if cap > 0:
+                scopes.append((
+                    BudgetScope(
+                        repository,
+                        dimension,
+                        "USD",
+                        day_start.date().isoformat(),
+                        day_start,
+                        day_start + timedelta(days=1),
+                        ZoneInfo("UTC"),
+                    ),
+                    cap,
+                ))
+        observations: list[BudgetLimitObservation] = []
+        complete = True
+        for scope, cap in scopes:
+            snapshot = control.snapshot(scope)
+            disposition = snapshot.disposition.value
+            complete = complete and disposition == "available"
+            observations.append(BudgetLimitObservation(
+                scope.dimension,
+                disposition,
+                snapshot.committed.micros,
+                Money.from_major("USD", cap).micros,
+                "USD",
+            ))
+        worlds[issue] = BudgetWorld(tuple(observations), complete)
+    return blocks, worlds
 
 
 def _hold_reporter(
@@ -2444,6 +2553,11 @@ def build_fix_daemon(
         mark_ci_pending_escalated=store.set_ci_pending_escalated_head,
         clear_issue_state=store.cleanup_pr,
         reset_ci_retries=store.reset_ci_episode,
+        retire_machine_block=store.complete_machine_self_clear,
+        retire_budget_block=store.complete_budget_self_clear,
+        mark_self_clear_ceiling=store.mark_self_clear_ceiling_reported,
+        discard_machine_block=store.clear_machine_block,
+        discard_budget_block=store.clear_budget_block,
         journal=journal, alert_cmd=cfg.alert_cmd,
         effect_executor=effect_executor.actions,
     )
@@ -2571,6 +2685,14 @@ def build_fix_daemon(
             _collect_test_exemptions(
                 gateway, world, fix_cfg, fix_cfg.review_bot, _log("fix")
             ),
+        )
+        budget_blocks, budget_worlds = _budget_self_clear_worlds(
+            control, cfg, world, state.budget_blocks
+        )
+        state = replace(
+            state,
+            budget_blocks=budget_blocks,
+            budget_worlds=budget_worlds,
         )
         report_holds(world, inflight)
         report_prediction_outcomes(world)

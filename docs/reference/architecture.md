@@ -465,7 +465,9 @@ exemptable-vs-security rule classification, and the merge-withholding rule),
 `domain/outcome.py`, `domain/ports.py`, `domain/pricing.py`,
 `domain/projection.py`, `domain/refs.py`, `domain/repository.py`,
 `domain/recovery.py`, `domain/reservation_recovery.py`,
-`domain/review.py`,
+`domain/review.py`, `domain/self_clear.py`
+(level-triggered retirement of machine-checkable blocks — #180 publication/checks
+blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/steward.py`, `domain/steward_stall.py`,
 `domain/supervision.py`, `domain/triage.py`, `domain/trust.py`, and
 `domain/world.py`.

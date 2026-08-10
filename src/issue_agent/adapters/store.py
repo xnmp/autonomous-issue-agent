@@ -29,6 +29,8 @@ from ..domain.ci_history import (
     parse_ci_history,
 )
 from ..domain.world import normalize_predicted_paths
+from ..domain.actions import Target
+from ..domain.self_clear import BudgetBlock, MachineBlock, MachineBlocker
 
 # ── suffix universe (review M4/D8) ──────────────────────────────────────────
 # Every accessor below writes `issue-N.<suffix>` or `pr-N.<suffix>` via
@@ -49,7 +51,8 @@ from ..domain.world import normalize_predicted_paths
 # and the real pr-N.automerge marker was cleared by NEITHER cleaner.
 _ISSUE_SUFFIXES = (
     "session", "resumed-at", "resumes", "ci-retries", "ci-history",
-    "resolve-retries", "last-error",
+    "resolve-retries", "last-error", "machine-block", "budget-block",
+    "self-clears", "self-clear-ceiling",
     "rebase-retries", "infra-deaths", "review-retries", "phase", "jira",
     "jira-phase", "model", "predicted-paths", "branch", "stall-sig",
     "steward-stalls-triage", "steward-stalls-groom",
@@ -346,6 +349,104 @@ class Store:
         line = " ".join((summary or "").split())[: self._LAST_ERROR_MAX]
         if line:
             self._write(self.issue_path(issue, "last-error"), line)
+
+    def get_machine_block(self, issue: int) -> MachineBlock | None:
+        raw = self._read(self.issue_path(issue, "machine-block"))
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+            return MachineBlock(
+                issue=issue,
+                target=Target[str(value["target"])],
+                number=int(value["number"]),
+                pr=int(value["pr"]),
+                blocker=MachineBlocker(str(value["blocker"])),
+                blocked_head=str(value["blocked_head"]),
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    def set_machine_block(self, block: MachineBlock) -> None:
+        self._write(
+            self.issue_path(block.issue, "machine-block"),
+            json.dumps(
+                {
+                    "target": block.target.name,
+                    "number": block.number,
+                    "pr": block.pr,
+                    "blocker": block.blocker.value,
+                    "blocked_head": block.blocked_head,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
+    def clear_machine_block(self, issue: int) -> None:
+        self._remove(self.issue_path(issue, "machine-block"))
+
+    def get_budget_block(self, issue: int) -> BudgetBlock | None:
+        raw = self._read(self.issue_path(issue, "budget-block"))
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+            old = value.get("old_headroom_micros")
+            return BudgetBlock(
+                issue=issue,
+                target=Target[str(value["target"])],
+                number=int(value["number"]),
+                reservation_micros=int(value["reservation_micros"]),
+                scope=str(value["scope"]),
+                cap_micros=int(value["cap_micros"]),
+                old_headroom_micros=None if old is None else int(old),
+                currency=str(value.get("currency", "USD")),
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+
+    def set_budget_block(self, block: BudgetBlock) -> None:
+        self._write(
+            self.issue_path(block.issue, "budget-block"),
+            json.dumps(
+                {
+                    "target": block.target.name,
+                    "number": block.number,
+                    "reservation_micros": block.reservation_micros,
+                    "scope": block.scope,
+                    "cap_micros": block.cap_micros,
+                    "old_headroom_micros": block.old_headroom_micros,
+                    "currency": block.currency,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+
+    def clear_budget_block(self, issue: int) -> None:
+        self._remove(self.issue_path(issue, "budget-block"))
+
+    def get_self_clear_count(self, issue: int) -> int:
+        return self._read_int(self.issue_path(issue, "self-clears"))
+
+    def complete_machine_self_clear(self, issue: int) -> int:
+        count = self.get_self_clear_count(issue) + 1
+        self._write(self.issue_path(issue, "self-clears"), str(count))
+        self.clear_machine_block(issue)
+        return count
+
+    def complete_budget_self_clear(self, issue: int) -> int:
+        count = self.get_self_clear_count(issue) + 1
+        self._write(self.issue_path(issue, "self-clears"), str(count))
+        self.clear_budget_block(issue)
+        return count
+
+    def self_clear_ceiling_reported(self, issue: int) -> bool:
+        return bool(self._read(self.issue_path(issue, "self-clear-ceiling")))
+
+    def mark_self_clear_ceiling_reported(self, issue: int) -> None:
+        self._write(self.issue_path(issue, "self-clear-ceiling"), "1")
 
     def get_rebase_retries(self, issue: int) -> int:
         return self._read_int(self.issue_path(issue, "rebase-retries"))

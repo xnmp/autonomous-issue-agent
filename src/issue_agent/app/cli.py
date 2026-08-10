@@ -2682,6 +2682,21 @@ def dashboard_build_command(harness_root: str | None = None) -> str:
     return f"cd {root} && uv sync --extra sdk --extra dash && make dashboard-ui"
 
 
+def dashboard_frontend_build_command(harness_root: str | None = None) -> str:
+    """The direct recovery command for an absent generated SPA bundle."""
+    root = shlex.quote(os.path.join(harness_root or HARNESS_ROOT, "dashboard"))
+    return f"cd {root} && npm run build"
+
+
+def _dashboard_startup_error(detail: str) -> int:
+    err("interactive dashboard startup failed:")
+    err(f"  {detail}")
+    err("  install server dependencies: uv sync --extra dash (or make install)")
+    err(f"  build a missing frontend bundle: {dashboard_frontend_build_command()}")
+    err("  from the harness checkout, that build is: cd dashboard && npm run build")
+    return 2
+
+
 def _prepare_dashweb() -> DashwebPreparation:
     """Ensure the interactive dashboard can serve the current checkout.
 
@@ -2772,34 +2787,50 @@ def cmd_dashboard(args) -> int:
         return 0
 
     url = f"http://127.0.0.1:{args.serve}/"
-    preparation = _prepare_dashweb()
-    if preparation.ready:
-        from .dashweb.server import serve as dashweb_serve
+    if getattr(args, "legacy", False):
+        info(f"serving the legacy dashboard at {url} (Ctrl-C to stop)")
+        reload_check = None
+        if os.environ.get("HOT_RELOAD", "1") != "0":
+            from ..adapters.reload import ReloadWatch
 
-        info(f"serving the interactive dashboard at {url} (Ctrl-C to stop)")
+            reload_check = ReloadWatch(HARNESS_ROOT).changed
         try:
-            return dashweb_serve(args.serve)
+            return dash.serve(
+                args.serve,
+                lambda: dash.render_html(build()),
+                reload_check=reload_check,
+            )
         except KeyboardInterrupt:
             print()
         return 0
-    warn("interactive dashboard unavailable — serving the v1 snapshot instead:")
-    warn(f"  {preparation.detail}")
-    warn(f"  {dashboard_build_command()}")
-    info(f"serving the dashboard at {url} (Ctrl-C to stop) — regenerated per request")
-    reload_check = None
-    if os.environ.get("HOT_RELOAD", "1") != "0":
-        from ..adapters.reload import ReloadWatch
 
-        reload_check = ReloadWatch(HARNESS_ROOT).changed
     try:
-        return dash.serve(
-            args.serve,
-            lambda: dash.render_html(build()),
-            reload_check=reload_check,
+        preparation = _prepare_dashweb()
+    except Exception as exc:
+        return _dashboard_startup_error(str(exc))
+    if not preparation.ready:
+        return _dashboard_startup_error(preparation.detail)
+
+    try:
+        from .dashweb.server import serve as dashweb_serve
+        from ..adapters.reload import RELOAD_EXIT_CODE
+
+        info(f"serving the interactive dashboard at {url} (Ctrl-C to stop)")
+        result = dashweb_serve(args.serve)
+        if result in {0, RELOAD_EXIT_CODE}:
+            return result
+        return _dashboard_startup_error(
+            f"dashboard server exited with status {result}"
         )
     except KeyboardInterrupt:
         print()
-    return 0
+        return 0
+    except SystemExit as exc:
+        return _dashboard_startup_error(
+            f"dashboard server exited during startup with status {exc.code}"
+        )
+    except Exception as exc:
+        return _dashboard_startup_error(str(exc))
 
 
 def cmd_doctor(args) -> int:
@@ -3438,6 +3469,8 @@ def build_parser() -> argparse.ArgumentParser:
                          "default mode — pass --text for the one-shot text report)")
     sp.add_argument("--text", action="store_true",
                     help="print the text report and exit instead of serving")
+    sp.add_argument("--legacy", action="store_true",
+                    help="explicitly serve the legacy snapshot renderer instead of the SPA")
     sp.add_argument("--details", action="store_true", help="text mode: also dump each issue's raw journal events")
     sp.add_argument("--stale-minutes", type=int, default=30,
                     help="flag a daemon STALE after this long with no journal event (default: 30)")

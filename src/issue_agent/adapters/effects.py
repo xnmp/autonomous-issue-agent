@@ -173,12 +173,17 @@ class ImmediateGitHubEffectExecutor:
 
     def execute(self, action: Action):
         if isinstance(action, Relabel):
+            removals = action.removed_labels
             self.gateway.relabel(
                 _TARGET[action.target],
                 action.number,
-                action.remove.value if action.remove else None,
+                removals[0].value if removals else None,
                 action.add.value if action.add else None,
             )
+            for label in removals[1:]:
+                self.gateway.relabel(
+                    _TARGET[action.target], action.number, label.value, None
+                )
             if not isinstance(self.gateway, LabelVerifier):
                 return True
             return (
@@ -189,9 +194,11 @@ class ImmediateGitHubEffectExecutor:
                     )
                 )
                 and (
-                    action.remove is None
-                    or not self.gateway.has_label(
-                        _TARGET[action.target], action.number, action.remove.value
+                    all(
+                        not self.gateway.has_label(
+                            _TARGET[action.target], action.number, label.value
+                        )
+                        for label in action.removed_labels
                     )
                 )
             )
@@ -699,12 +706,17 @@ class GitHubEffectExecutor:
         command: LifecycleCommand | None = None,
     ):
         if isinstance(action, Relabel):
+            removals = action.removed_labels
             self.gateway.relabel(
                 _TARGET[action.target],
                 action.number,
-                action.remove.value if action.remove else None,
+                removals[0].value if removals else None,
                 action.add.value if action.add else None,
             )
+            for label in removals[1:]:
+                self.gateway.relabel(
+                    _TARGET[action.target], action.number, label.value, None
+                )
             return True
         elif isinstance(action, PostComment):
             self.gateway.comment(_TARGET[action.target], action.number, action.body)
@@ -806,11 +818,11 @@ class GitHubEffectExecutor:
                     _TARGET[action.target], action.number, action.add.value
                 )
             )
-            removed = (
-                action.remove is None
-                or not self.gateway.has_label(
-                    _TARGET[action.target], action.number, action.remove.value
+            removed = all(
+                not self.gateway.has_label(
+                    _TARGET[action.target], action.number, label.value
                 )
+                for label in action.removed_labels
             )
             return added and removed
         if isinstance(action, PostComment):
@@ -1111,6 +1123,7 @@ def action_from_command(command: LifecycleCommand) -> Action:
                 else command.expected_revision
             ),
             bool(payload.get("harness_signal", False)),
+            tuple(Label(str(label)) for label in payload.get("removes", ())),
         )
     if command.kind is CommandKind.POST_COMMENT:
         return PostComment(

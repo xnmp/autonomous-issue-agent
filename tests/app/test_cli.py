@@ -34,9 +34,38 @@ def test_overlay_reviewer_runtime_overrides_and_scrubs_ambient_value(tmp_path, m
 
 
 # ── parse_remote_url ──────────────────────────────────────────────────────────
-def test_dashboard_reports_a_stale_frontend_bundle_before_falling_back(
+def test_dashboard_reports_a_stale_frontend_bundle_and_exits_nonzero(
     monkeypatch, capsys
 ):
+    args = type(
+        "Args",
+        (),
+        {
+            "names": ["demo"],
+            "html": None,
+            "text": False,
+            "serve": 8321,
+            "details": False,
+            "stale_minutes": 5.0,
+            "legacy": False,
+        },
+    )()
+    monkeypatch.setattr(
+        cli,
+        "_prepare_dashweb",
+        lambda: cli.DashwebPreparation(
+            False, "automatic dashboard rebuild failed with exit 2", True
+        ),
+    )
+    assert cli.cmd_dashboard(args) == 2
+    output = capsys.readouterr()
+    combined = output.out + output.err
+    assert "automatic dashboard rebuild failed with exit 2" in combined
+    assert "uv sync --extra dash" in combined
+    assert "npm run build" in combined
+
+
+def test_dashboard_legacy_flag_keeps_snapshot_server_reload(monkeypatch):
     from issue_agent.app import dashboard
 
     args = type(
@@ -49,26 +78,66 @@ def test_dashboard_reports_a_stale_frontend_bundle_before_falling_back(
             "serve": 8321,
             "details": False,
             "stale_minutes": 5.0,
+            "legacy": True,
         },
     )()
-    monkeypatch.setattr(
-        cli,
-        "_prepare_dashweb",
-        lambda: cli.DashwebPreparation(
-            False, "automatic dashboard rebuild failed with exit 2", True
-        ),
-    )
+    changed = object()
+    served = []
+    monkeypatch.setattr(cli, "_prepare_dashweb", lambda: pytest.fail("SPA prepared"))
+    monkeypatch.setattr("issue_agent.adapters.reload.ReloadWatch.changed", changed)
     monkeypatch.setattr(
         dashboard,
         "serve",
-        lambda _port, _render, **_kw: (_ for _ in ()).throw(KeyboardInterrupt()),
+        lambda port, render, **kwargs: served.append((port, render, kwargs)) or 87,
     )
 
-    assert cli.cmd_dashboard(args) == 0
-    output = capsys.readouterr()
-    combined = output.out + output.err
-    assert "automatic dashboard rebuild failed with exit 2" in combined
-    assert "make dashboard-ui" in combined
+    assert cli.cmd_dashboard(args) == 87
+    assert served[0][0] == 8321
+    assert served[0][2]["reload_check"] is changed
+
+
+def test_dashboard_server_startup_failure_is_loud_and_nonzero(monkeypatch, capsys):
+    args = type(
+        "Args",
+        (),
+        {
+            "names": ["demo"],
+            "html": None,
+            "text": False,
+            "serve": 8321,
+            "details": False,
+            "stale_minutes": 5.0,
+            "legacy": False,
+        },
+    )()
+    monkeypatch.setattr(
+        cli, "_prepare_dashweb", lambda: cli.DashwebPreparation(True, "ready")
+    )
+    monkeypatch.setattr(
+        "issue_agent.app.dashweb.server.serve",
+        lambda _port: (_ for _ in ()).throw(RuntimeError("socket unavailable")),
+    )
+
+    assert cli.cmd_dashboard(args) == 2
+    assert "socket unavailable" in capsys.readouterr().err
+
+
+def test_dashboard_server_nonzero_startup_exit_is_not_silent(monkeypatch, capsys):
+    args = type(
+        "Args",
+        (),
+        {
+            "names": ["demo"], "html": None, "text": False, "serve": 8321,
+            "details": False, "stale_minutes": 5.0, "legacy": False,
+        },
+    )()
+    monkeypatch.setattr(
+        cli, "_prepare_dashweb", lambda: cli.DashwebPreparation(True, "ready")
+    )
+    monkeypatch.setattr("issue_agent.app.dashweb.server.serve", lambda _port: 1)
+
+    assert cli.cmd_dashboard(args) == 2
+    assert "dashboard server exited with status 1" in capsys.readouterr().err
 
 
 def test_prepare_dashboard_rebuilds_from_harness_root_and_revalidates(

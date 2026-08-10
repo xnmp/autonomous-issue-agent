@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from collections.abc import Callable
+from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, Literal, Mapping
 
 from .actions import AgentKind
@@ -33,6 +34,11 @@ from .labels import LIFECYCLE_LABELS, Label
 from .outcome import ExitReason
 from .projection import ReadModel
 from .world import ReviewDecision
+
+
+def _utc_date(timestamp: float) -> date:
+    return datetime.fromtimestamp(timestamp, timezone.utc).date()
+
 
 # The three role daemons, in the order `journal_paths` returns their journals.
 ROLE_NAMES = ("fix", "review", "steward")
@@ -517,6 +523,7 @@ def build_deployment_v2(
     warnings: tuple[str, ...] = (),
     settled_today_usd: float | None = None,
     settled_today_unavailable: bool = False,
+    to_local_date: Callable[[float], date] = _utc_date,
 ) -> Deployment:
     """Build the dashboard exclusively from the canonical schema-v2 fold.
 
@@ -565,7 +572,7 @@ def build_deployment_v2(
         for row in historical_rows
         if row.facts.get("present") is True or row.done
     )
-    today = now.astimezone(timezone.utc).date()
+    today = to_local_date(now.timestamp())
     today_usd = (
         None
         if settled_today_unavailable
@@ -575,7 +582,7 @@ def build_deployment_v2(
             else sum(
                 payload.amount_micros / 1_000_000
                 for event in model.events
-                if event.occurred_at.astimezone(timezone.utc).date() == today
+                if to_local_date(event.occurred_at.timestamp()) == today
                 and isinstance((payload := event.payload), SpendRecorded)
             )
         )
@@ -1638,6 +1645,7 @@ def build_deployment(
     warnings: tuple[str, ...] = (),
     settled_today_usd: float | None = None,
     settled_today_unavailable: bool = False,
+    to_local_date: Callable[[float], date] = _utc_date,
 ) -> Deployment:
     """Assemble one deployment's report. Pure: `feeds` is
     `(role, journal_path, log_path, events)` tuples already read off disk.
@@ -1660,7 +1668,7 @@ def build_deployment(
     rows = build_issue_rows(merged, running)
     pr_issue = pr_issue_map(merged)
     unattributed = tuple(e for e in merged if event_issue(e, pr_issue) is None)
-    today = _stamp_date(now)
+    today = to_local_date(now.timestamp()).isoformat()
     today_usd = (
         None
         if settled_today_unavailable
@@ -1671,7 +1679,10 @@ def build_deployment(
                 _float(e.get("cost_usd"))
                 for e in ledger_events
                 if e.get("event") == "spend"
-                and str(e.get("ts", ""))[:10] == today
+                and (
+                    (stamp := parse_ts(e.get("ts"))) is not None
+                    and to_local_date(stamp.timestamp()).isoformat() == today
+                )
                 and (not repo or e.get("repo") == repo)
             )
         )
@@ -1706,10 +1717,6 @@ def _health(role, journal_path, log_path, events, now, stale_after_s) -> DaemonH
     )
 
 
-
-
-def _stamp_date(now: datetime) -> str:
-    return now.astimezone(timezone.utc).date().isoformat()
 
 
 def _int(value) -> int | None:

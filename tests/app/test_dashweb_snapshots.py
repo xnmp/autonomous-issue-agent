@@ -21,6 +21,7 @@ from issue_agent.domain.events import (
     EventEnvelope,
     Producer,
     SpendBlocked,
+    SpendRecorded,
     TriageDispositionRecorded,
     WorldObserved,
 )
@@ -377,6 +378,7 @@ def test_an_advisory_route_budget_overrun_is_a_warning_not_a_failure():
         pytest.param("", False, False, id="claude-clean"),
         pytest.param("", True, True, id="error-without-reason"),
         pytest.param("budget_exhausted", True, True, id="budget"),
+        pytest.param("runtime_unavailable", False, True, id="runtime-unavailable"),
         pytest.param("agent_error", False, True, id="agent-error"),
         pytest.param("transport_death", False, True, id="infra-death"),
         pytest.param("!" + "x" * 100_000, False, True, id="unknown-huge-reason"),
@@ -1195,6 +1197,40 @@ def test_health_trend_uses_the_native_timezone_day_boundary():
         "recurrences": 0,
         "first_observation": True,
     }]
+
+
+def test_v2_today_spend_uses_the_injected_local_day_boundary():
+    local = timezone(timedelta(hours=10))
+    now = datetime(2026, 7, 2, 0, 30, tzinfo=timezone.utc)
+    stamp = datetime(2026, 7, 1, 23, 30, tzinfo=timezone.utc)
+    event = EventEnvelope(
+        SpendRecorded("run", 700_000, "USD", "configured", "card", "v1"),
+        "spend-local-day",
+        1,
+        stamp,
+        stamp,
+        1,
+        Producer("demo", "o/r", "fix", 10, "boot"),
+        Correlation(run_id="run"),
+    )
+    feeds = (
+        ("fix", "/j/fix", "/l/fix", (event,)),
+        ("review", "/j/rev", "/l/rev", ()),
+        ("steward", "/j/std", "/l/std", ()),
+    )
+
+    deployment = dash.build_deployment_v2(
+        "demo",
+        "o/r",
+        feeds,
+        fold((event,)),
+        lambda: now,
+        to_local_date=lambda timestamp: datetime.fromtimestamp(
+            timestamp, local
+        ).date(),
+    )
+
+    assert deployment.metrics.today_usd == 0.7
 
 
 def test_overview_projects_lifecycle_recurrence_and_first_observed_day(monkeypatch):

@@ -14,12 +14,15 @@ import os
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from issue_agent.adapters import control_path
+from issue_agent.adapters.dashweb import system as dashweb_system
 from issue_agent.adapters.event_log import EventLog
 from issue_agent.app import cli, dashboard as dash
+from issue_agent.domain.contracts import Money
 from issue_agent.domain import dashboard as dashboard_domain
 from issue_agent.domain.events import (
     AgentRunCompleted,
@@ -651,6 +654,62 @@ def test_today_usd_scopes_the_global_ledger_to_this_repo():
     assert dep.metrics.today_usd == 3.0
 
 
+def test_today_usd_uses_the_injected_local_day_boundary():
+    local = timezone(timedelta(hours=10))
+    now = datetime(2026, 7, 2, 0, 30, tzinfo=timezone.utc)
+    ledger = [
+        {"ts": "2026-07-01T13:59:59Z", "event": "spend", "repo": "o/r",
+         "cost_usd": 100.0},
+        {"ts": "2026-07-01T14:00:00Z", "event": "spend", "repo": "o/r",
+         "cost_usd": 2.0},
+        {"ts": "2026-07-01T23:30:00Z", "event": "spend", "repo": "o/r",
+         "cost_usd": 3.0},
+        {"ts": "not-a-date", "event": "spend", "repo": "o/r",
+         "cost_usd": 1000.0},
+    ]
+
+    dep = dash.build_deployment(
+        "n",
+        "o/r",
+        feeds(),
+        ledger,
+        now_fn=lambda: now,
+        to_local_date=lambda timestamp: datetime.fromtimestamp(
+            timestamp, local
+        ).date(),
+    )
+
+    assert dep.metrics.today_usd == 5.0
+
+
+@pytest.mark.parametrize("module", [dash, dashweb_system])
+def test_settled_spend_uses_dst_correct_local_day_bounds(monkeypatch, module):
+    local = ZoneInfo("Australia/Sydney")
+    observed = []
+
+    class Spend:
+        detail = ""
+
+        def for_repository(self, repository):
+            assert repository == "o/r"
+            return Money("USD", 0)
+
+    def read_spend(_path, start, end):
+        observed.append((start, end))
+        return Spend()
+
+    monkeypatch.setattr(module, "read_settled_spend", read_spend)
+    to_local_date, local_midnight = module._local_time_functions(local)
+    now = datetime(2026, 10, 4, 12, 0, tzinfo=local)
+
+    module._settled_today_usd(
+        "control.db", "o/r", now, to_local_date, local_midnight
+    )
+
+    start, end = observed[0]
+    assert end - start == timedelta(hours=23)
+
+
 # ── daemon health ─────────────────────────────────────────────────────────────
 def test_health_marks_a_quiet_daemon_stale_and_a_live_one_ok():
     dep = dash.build_deployment(
@@ -801,7 +860,7 @@ def test_render_html_empty_deployment_list():
 # ── CLI wiring ────────────────────────────────────────────────────────────────
 def _args(**kw):
     base = dict(names=[], html="", serve=cli.DASHBOARD_PORT, text=True,
-                details=False, stale_minutes=30)
+                details=False, stale_minutes=30, legacy=False)
     base.update(kw)
     return argparse.Namespace(**base)
 
@@ -820,6 +879,12 @@ def test_a_bare_dashboard_invocation_serves_on_the_default_port():
     silently back to text mode would strand anyone who bookmarked the port."""
     args = cli.build_parser().parse_args(["dashboard"])
     assert args.serve == cli.DASHBOARD_PORT == 8321 and args.text is False
+    assert args.legacy is False
+
+
+def test_legacy_dashboard_requires_an_explicit_flag():
+    args = cli.build_parser().parse_args(["dashboard", "--legacy"])
+    assert args.legacy is True
 
 
 def test_serve_takes_an_optional_port_and_keeps_the_default_bare():

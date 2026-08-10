@@ -6,7 +6,8 @@ import html as _html
 import json
 import os
 import glob
-from datetime import datetime, timedelta, timezone
+from collections.abc import Callable
+from datetime import date, datetime, time, timedelta, timezone, tzinfo
 
 from ..adapters.control_store import read_settled_spend
 from ..adapters.event_log import read_event_log
@@ -49,6 +50,25 @@ from ..domain.dashboard import (
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
+
+def _system_local_date(timestamp: float) -> date:
+    return datetime.fromtimestamp(timestamp).date()
+
+
+def _system_local_midnight(day: date) -> float:
+    return datetime.combine(day, time.min).timestamp()
+
+
+def _local_time_functions(
+    local_tz: tzinfo | None,
+) -> tuple[Callable[[float], date], Callable[[date], float]]:
+    if local_tz is None:
+        return _system_local_date, _system_local_midnight
+    return (
+        lambda timestamp: datetime.fromtimestamp(timestamp, local_tz).date(),
+        lambda day: datetime.combine(day, time.min, local_tz).timestamp(),
+    )
+
 # ── collection (the only I/O) ─────────────────────────────────────────────────
 def deployment_names(repos_dir: str) -> tuple[str, ...]:
     """Every overlay in `config/repos/` — one deployment each, sorted. A missing
@@ -70,13 +90,16 @@ def collect(
     now_fn=None,
     stale_after_s: float = STALE_AFTER_S,
     control_db_path: str | None = None,
+    local_tz: tzinfo | None = None,
 ) -> Deployment:
     """Read one deployment's journals + the global ledger and report on them.
     Read-only; every missing file is an empty history (`read_events`'s rule)."""
     now_fn = now_fn or _utcnow
+    now = now_fn()
+    to_local_date, local_midnight = _local_time_functions(local_tz)
     settled_today_usd, settled_today_unavailable, spend_warnings = (
         _settled_today_usd(
-            control_db_path, repo, now_fn()
+            control_db_path, repo, now, to_local_date, local_midnight
         )
     )
     legacy_paths = tuple(journal_paths)
@@ -110,6 +133,7 @@ def collect(
             ),
             settled_today_usd,
             settled_today_unavailable,
+            to_local_date,
         )
     typed_feeds = tuple(
         (
@@ -154,6 +178,7 @@ def collect(
         warnings,
         settled_today_usd,
         settled_today_unavailable,
+        to_local_date,
     )
 
 
@@ -161,16 +186,20 @@ def _settled_today_usd(
     control_db_path: str | None,
     repository: str,
     now: datetime,
+    to_local_date: Callable[[float], date],
+    local_midnight: Callable[[date], float],
 ) -> tuple[float | None, bool, tuple[str, ...]]:
     if not control_db_path:
         return None, False, ()
-    start = now.astimezone(timezone.utc).replace(
-        hour=0, minute=0, second=0, microsecond=0
+    today = to_local_date(now.timestamp())
+    start = datetime.fromtimestamp(local_midnight(today), timezone.utc)
+    end = datetime.fromtimestamp(
+        local_midnight(today + timedelta(days=1)), timezone.utc
     )
     spend = read_settled_spend(
         control_db_path,
         start,
-        start + timedelta(days=1),
+        end,
     )
     amount = spend.for_repository(repository)
     if amount is None:

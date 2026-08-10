@@ -322,6 +322,31 @@ def offending_path(last_trace: str) -> str:
 
 
 @dataclass(frozen=True)
+class AdmissionBudgetBlock:
+    """Harness-authored facts from a paid-admission denial.
+
+    Agent structured output is not allowed to populate this field. It is minted
+    only by the accounting adapter after its authoritative reservation check.
+    """
+
+    scope: str
+    reservation_micros: int
+    cap_micros: int
+    committed_micros: int
+    currency: str
+
+    def __post_init__(self) -> None:
+        if not self.scope or not self.currency:
+            raise ValueError("admission budget facts require scope and currency")
+        if min(
+            self.reservation_micros,
+            self.cap_micros,
+            self.committed_micros,
+        ) < 0:
+            raise ValueError("admission budget facts cannot be negative")
+
+
+@dataclass(frozen=True)
 class AgentResult:
     """Normalised result of a headless agent run (the SDK ResultMessage, or the
     CLI JSON envelope). Adapter populates this; the domain reads only this.
@@ -378,6 +403,11 @@ class AgentResult:
     # structurally missing telemetry. Journaling persists this as a dedicated
     # warning event; blank means the runtime observed no telemetry fault.
     telemetry_warning: str = ""
+    # Harness-authored admission evidence. Unlike `structured`, this cannot be
+    # supplied by the agent and is the only budget result allowed to authorize
+    # a future cap re-evaluation. Last for positional compatibility with the
+    # established result envelope.
+    admission_budget_block: AdmissionBudgetBlock | None = None
 
     def field(self, name: str, default: str = "") -> str:
         if isinstance(self.structured, dict):

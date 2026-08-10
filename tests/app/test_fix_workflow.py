@@ -11,9 +11,11 @@ from issue_agent.adapters.store import Store
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.workflows.fix import FixWorkflow, FixWorkflowConfig
 from issue_agent.domain.events import Correlation, TelemetryWarning
-from issue_agent.domain.outcome import AgentResult, ExitReason
+from issue_agent.domain.outcome import AdmissionBudgetBlock, AgentResult, ExitReason
 from issue_agent.app.planners.tasks import FixTaskConfig
 from issue_agent.domain.world import Check, Comment, IssueView, PRView, Review, WorldState
+from issue_agent.domain.actions import Target
+from issue_agent.domain.self_clear import BudgetBlock
 
 from test_dispatch import FakeGateway, FakeRunner, FakeStore, FakeWorktrees, SeqRunner
 from issue_agent.adapters.github import GhUnavailable
@@ -2003,3 +2005,94 @@ def test_a_runner_that_cannot_name_its_legs_still_resolves():
     ).resolve(5))
 
     assert runner.tasks[1].model == "sonnet"
+
+
+def test_fix_ci_persists_structured_publication_block_for_reconciliation(tmp_path):
+    pr = PRView(
+        100,
+        head_ref_name="fix/5-token",
+        head_ref_oid="blocked-head",
+        closing_issue=5,
+        checks=(Check("unit", bucket="fail"),),
+    )
+    store = Store(str(tmp_path))
+    result = AgentResult(
+        is_error=False,
+        status="blocked",
+        needs="publication denied",
+        structured={"blocker": "publication"},
+    )
+
+    asyncio.run(
+        _workflow(FakeGateway(prs={100: pr}), store, FakeRunner(result)).fix_ci(100)
+    )
+
+    marker = store.get_machine_block(5)
+    assert marker is not None
+    assert marker.blocker.value == "publication"
+    assert marker.blocked_head == "blocked-head"
+
+
+def test_fix_ci_persists_harness_budget_facts_for_re_evaluation(tmp_path):
+    pr = PRView(
+        100,
+        head_ref_name="fix/5-token",
+        head_ref_oid="head",
+        closing_issue=5,
+        checks=(Check("unit", bucket="fail"),),
+    )
+    store = Store(str(tmp_path))
+    result = AgentResult(
+        is_error=True,
+        status="error_max_budget_usd",
+        exit_reason=ExitReason.BUDGET_EXHAUSTED,
+        structured={
+            "budget_block": {
+                "scope": "issue:5",
+                "reservation_micros": 2_000_000,
+                "old_headroom_micros": 250_000,
+                "currency": "USD",
+            }
+        },
+        admission_budget_block=AdmissionBudgetBlock(
+            "issue:5", 2_000_000, 5_000_000, 4_750_000, "USD"
+        ),
+    )
+
+    asyncio.run(
+        _workflow(FakeGateway(prs={100: pr}), store, FakeRunner(result)).fix_ci(100)
+    )
+
+    assert store.get_budget_block(5) == BudgetBlock(
+        5, Target.PR, 100, 2_000_000, "issue:5", 5_000_000, 250_000, "USD"
+    )
+
+
+def test_in_run_budget_kill_does_not_create_a_re_evaluable_marker(tmp_path):
+    pr = PRView(
+        100,
+        head_ref_name="fix/5-token",
+        head_ref_oid="head",
+        closing_issue=5,
+        checks=(Check("unit", bucket="fail"),),
+    )
+    store = Store(str(tmp_path))
+    result = AgentResult(
+        is_error=True,
+        status="error_max_budget_usd",
+        exit_reason=ExitReason.BUDGET_EXHAUSTED,
+        # Even a forged agent payload is not admission authority.
+        structured={
+            "budget_block": {
+                "scope": "issue:5",
+                "reservation_micros": 2_000_000,
+                "cap_micros": 5_000_000,
+            }
+        },
+    )
+
+    asyncio.run(
+        _workflow(FakeGateway(prs={100: pr}), store, FakeRunner(result)).fix_ci(100)
+    )
+
+    assert store.get_budget_block(5) is None

@@ -199,6 +199,10 @@ _STANDING_POLICY_NOTICE = (
     "criterion is neither: it has its own machine-adjudicated path — see "
     "the contract escape hatch in your task. A wrong existing TEST is not "
     "a petition at all: correct it and say so in the PR.)"
+    "\nFor structured output, set blocker=publication only when completed work "
+    "cannot be pushed/published, blocker=checks only when an external CI/check "
+    "state is the sole wait, blocker=clarification for a genuine human decision, "
+    "and blocker=none for every non-blocked status."
 )
 
 
