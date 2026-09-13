@@ -39,7 +39,7 @@ def test_effort_order_is_not_the_lexicographic_order_of_its_values():
 
 
 def test_tier_ladder_orders_cheapest_to_strongest():
-    assert TIER_LADDER == ("trivial", "standard", "complex")
+    assert TIER_LADDER == ("trivial", "standard", "complex", "exceptional")
     assert tier_rank("trivial") < tier_rank("standard") < tier_rank("complex")
 
 

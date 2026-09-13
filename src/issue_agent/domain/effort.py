@@ -55,7 +55,7 @@ EFFORT_LADDER: tuple[Effort, ...] = (Effort.LOW, Effort.MEDIUM, Effort.HIGH)
 
 # Difficulty tiers, weakest → strongest. `app.planners.tasks.MODEL_TIERS` maps
 # each to a model per fixer runtime; this module only needs their ORDER.
-TIER_LADDER: tuple[str, ...] = ("trivial", "standard", "complex")
+TIER_LADDER: tuple[str, ...] = ("trivial", "standard", "complex", "exceptional")
 
 # What an unclassifiable tier prices as. Same choice `route_model` makes for an
 # unknown tier: a classifier misfire must degrade to a sane middle, never raise.

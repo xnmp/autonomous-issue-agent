@@ -371,7 +371,7 @@ class FixWorkflow:
         tier fields are therefore null rather than the DEFAULT_TIER placeholder
         `_escalated` needs internally. `ceiling` is true only when a fresh
         resolve actually selected the capability-ceiling model, separating
-        Fable/Sol from normal `complex` routing in the load-bearing tier split.
+        Fable/Astra from normal `complex` routing in the load-bearing tier split.
         `model` is the model that ran — None when the leg named none and the
         runtime picked its own — so the split is derived from dispatch facts.
 
@@ -419,7 +419,7 @@ class FixWorkflow:
         leg inherited a model (a pinned FIX_MODEL or resumed session), so only
         the effort half of the ladder applies. The capability ceiling is a
         fresh-resolve routing decision: repair legs keep the model that built
-        their transcript, including a Codex Terra session after Sol becomes the
+        their transcript, including a Codex Terra session after Astra becomes the
         current ceiling, while still receiving HIGH effort for hard evidence.
 
         Returns `cfg` untouched when there is no evidence, so the common path

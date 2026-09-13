@@ -57,6 +57,22 @@ fi
 HARNESS_ROOT="$ROOT"
 export HARNESS_ROOT
 
+watcher_rc=0
+(exit 6) & failed_watcher=$!
+(exit 0) & healthy_watcher=$!
+wait_for_watchers "$failed_watcher" "$healthy_watcher" 2>/dev/null || watcher_rc=$?
+if [ "$watcher_rc" -eq 6 ]; then
+  ok "an earlier watcher failure survives a later successful watcher exit"
+else
+  no "an earlier watcher failure survives a later successful watcher exit" "rc=$watcher_rc"
+fi
+(exit 0) & healthy_watcher=$!
+if wait_for_watchers "$healthy_watcher"; then
+  ok "a clean bounded watcher run succeeds"
+else
+  no "a clean bounded watcher run succeeds"
+fi
+
 timestamped="$(printf 'one\ntwo\n' | timestamp_lines)"
 timestamp_line_one="${timestamped%%$'\n'*}"
 timestamp_line_two="${timestamped#*$'\n'}"

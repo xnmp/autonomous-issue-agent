@@ -364,6 +364,10 @@ class AccountingRuntime(AgentRuntime):
         authority = {
             "ISSUE_AGENT_RUN_ID": str(run_id),
             "ISSUE_AGENT_CONFIG_VERSION": self.config_version,
+            **({
+                "ISSUE_AGENT_RATE_CARD_ID": self.rate_table.rate_card_id,
+                "ISSUE_AGENT_RATE_CARD_VERSION": self.rate_table.version,
+            } if self.rate_table is not None else {}),
             "ISSUE_AGENT_CONTROL_DB": self.store.path,
             "ISSUE_AGENT_REPOSITORY": self.repository,
             "ISSUE_AGENT_OWNER_ID": request.owner_id,

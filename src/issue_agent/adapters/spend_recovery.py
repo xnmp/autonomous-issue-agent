@@ -71,8 +71,9 @@ class CodexSpendReconciler:
                     PricingBasis.RECONCILED,
                     f"codex-recovered:{session_id}:{run_id}",
                     _token_usage(usage),
-                    "codex-config",
-                    str(evidence.get("config_version") or "recovered"),
+                    str(evidence.get("rate_card_id") or "codex-config"),
+                    str(evidence.get("rate_card_version")
+                        or evidence.get("config_version") or "recovered"),
                 )
             )
             if result.disposition is not AccountingDisposition.AVAILABLE:

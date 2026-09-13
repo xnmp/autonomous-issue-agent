@@ -35,6 +35,7 @@ from ..domain.pricing import (
     BudgetSentinel,
     ModelRates,
     usd_per_million_to_micros,
+    with_default_model_rates,
 )
 from ..domain.outcome import (
     AgentResult,
@@ -834,8 +835,8 @@ def rates_for_model(
 
     key = (model or "").strip().casefold()
     if key:
-        for name, rate_in, rate_out in table or ():
-            if name == key:
+        for name, rate_in, rate_out in with_default_model_rates(table or ()):
+            if name.strip().casefold() == key:
                 return rate_in, rate_out
     return fallback_in, fallback_out
 
@@ -1721,6 +1722,8 @@ class CodexRunner(AgentRuntime):
             "cost_per_mtok_cached_in": rate_cached_in,
             "codex_home": proc_env.get("CODEX_HOME", ""),
             "config_version": proc_env.get("ISSUE_AGENT_CONFIG_VERSION", ""),
+            "rate_card_id": proc_env.get("ISSUE_AGENT_RATE_CARD_ID", ""),
+            "rate_card_version": proc_env.get("ISSUE_AGENT_RATE_CARD_VERSION", ""),
         }
         write_spend_evidence(
             self.spend_evidence_dir, accounting_run_id, evidence

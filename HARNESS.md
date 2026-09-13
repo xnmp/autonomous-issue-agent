@@ -76,6 +76,14 @@ Important fields:
   resolves to `sonnet` under claude and to the Codex runner's own default
   under codex).
 - `MAX_BUDGET_USD` / `REVIEW_BUDGET_USD` bound a leg.
+- Unpinned implementers route by difficulty: `complex` uses Sol/Opus;
+  `exceptional` uses Astra/Fable under Codex/Claude. Recurrence or two
+  completed resolve/CI failures also select that exceptional ceiling. A pinned
+  `FIX_MODEL` wins, and repair legs retain the model of their existing session.
+  Astra has built-in standard-context accounting estimates ($10/$50 per
+  million input/output tokens, $1 cached input); existing configured model
+  rates override them. These estimates are not provider invoices and do not
+  model the provider's long-context surcharges.
 - `ISSUE_SPEND_CAP_USD`, `DAILY_SPEND_CAP_USD`, and
   `GLOBAL_DAILY_SPEND_CAP_USD` are enforced transactionally by SQLite.
   The database is fixed per operating-system service account at

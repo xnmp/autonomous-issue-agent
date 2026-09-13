@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from issue_agent.adapters.codex_runner import write_spend_evidence
 from issue_agent.adapters.control_store import (
     ReservationRequest,
@@ -46,8 +48,21 @@ def _reserved_store(tmp_path):
     return store, scope, run_id
 
 
-def test_reconciles_crashed_codex_reservation_from_rollout_usage(tmp_path):
+@pytest.mark.parametrize("card,expected", [
+    ({}, ("codex-config", "cfg")),
+    ({"rate_card_id": "codex-config", "rate_card_version": "effective-prices"},
+     ("codex-config", "effective-prices")),
+])
+def test_reconciles_crashed_codex_reservation_from_rollout_usage(tmp_path, monkeypatch, card, expected):
     store, scope, run_id = _reserved_store(tmp_path)
+    settlements = []
+    settle = store.settle
+
+    def record_settlement(request):
+        settlements.append(request)
+        return settle(request)
+
+    monkeypatch.setattr(store, "settle", record_settlement)
     codex_home = tmp_path / "codex-home"
     rollout_dir = codex_home / "sessions" / "2026" / "07" / "30"
     rollout_dir.mkdir(parents=True)
@@ -72,6 +87,7 @@ def test_reconciles_crashed_codex_reservation_from_rollout_usage(tmp_path):
             "cost_per_mtok_cached_in": 1,
             "codex_home": str(codex_home),
             "config_version": "cfg",
+            **card,
         },
     )
 
@@ -79,6 +95,7 @@ def test_reconciles_crashed_codex_reservation_from_rollout_usage(tmp_path):
 
     assert store.active_reservation_runs() == ()
     assert store.snapshot(scope).settled == Money("USD", 10_400)
+    assert (settlements[0].rate_card_id, settlements[0].rate_card_version) == expected
     assert not any(evidence_dir.iterdir())
 
 

@@ -5,6 +5,7 @@ shrinking into a router without losing behavior coverage.
 """
 
 import asyncio
+import pytest
 
 from issue_agent.adapters.journal import _legacy_event_record
 from issue_agent.adapters.store import Store
@@ -1281,6 +1282,23 @@ def test_resolve_routes_within_the_codex_family():
     assert runner.tasks[1].model == "gpt-5.6-sol"
 
 
+@pytest.mark.parametrize("runtime,model", [("codex", "gpt-6-astra"), ("claude", "fable")])
+def test_exceptional_first_attempt_dispatches_the_strongest_implementer(runtime, model):
+    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
+    runner = SeqRunner([
+        _router_result("exceptional"),
+        AgentResult(is_error=False, status="pr_opened", session_id="s5"),
+    ])
+
+    asyncio.run(_workflow(
+        gw, FakeStore(), runner, fixer_runtime=runtime,
+        fix=FixTaskConfig("o/r", agent_md="AM"),
+    ).resolve(5))
+
+    assert runner.tasks[1].model == model
+    assert "exceptional" in runner.tasks[0].schema["properties"]["tier"]["enum"]
+
+
 def test_garbage_router_output_degrades_to_standard():
     gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
     runner = SeqRunner([
@@ -1473,7 +1491,7 @@ def test_escalation_respects_the_fixer_runtime_family():
         fix=FixTaskConfig("o/r", agent_md="AM"),
     ).resolve(5))
 
-    assert runner.tasks[1].model == "gpt-5.6-sol"
+    assert runner.tasks[1].model == "gpt-6-astra"
 
 
 def test_a_pinned_model_still_thinks_harder_but_keeps_its_model():
@@ -1713,7 +1731,7 @@ def test_escalations_are_journalled_so_the_tier_split_stays_measurable():
     )
     assert fields["issue"] == 5
     assert (fields["from_effort"], fields["to_effort"]) == ("medium", "high")
-    assert (fields["from_tier"], fields["to_tier"]) == ("standard", "complex")
+    assert (fields["from_tier"], fields["to_tier"]) == ("standard", "exceptional")
     assert fields["model"] == "fable", "the split must be derivable from what RAN"
     assert fields["ceiling"] is True
     assert fields["recurrence"] is True

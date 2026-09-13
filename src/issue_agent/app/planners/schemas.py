@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from ...domain.effort import TIER_LADDER
+
 # agent/lib.sh FIX_SCHEMA — resolve / resume / address-review / fix-ci.
 FIX_SCHEMA: dict = {
     "type": "object",
@@ -80,7 +82,7 @@ ADJUDICATE_SCHEMA: dict = {
 ROUTER_SCHEMA: dict = {
     "type": "object",
     "properties": {
-        "tier": {"type": "string", "enum": ["trivial", "standard", "complex"]},
+        "tier": {"type": "string", "enum": list(TIER_LADDER)},
         "predicted_paths": {
             "type": "array",
             "items": {"type": "string"},

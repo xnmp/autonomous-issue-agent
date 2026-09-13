@@ -731,11 +731,15 @@ def build_rebase_task(
 # ORDER (which the escalation ladder walks, #16), this table owns the PRICES.
 # `_TIER_TABLE_COMPLETE` below keeps the two from drifting apart silently.
 MODEL_TIERS: dict[str, dict[str, str]] = {
-    "claude": {"trivial": "haiku", "standard": "sonnet", "complex": "opus"},
+    "claude": {
+        "trivial": "haiku", "standard": "sonnet", "complex": "opus",
+        "exceptional": "fable",
+    },
     "codex": {
         "trivial": "gpt-5.6-luna",
         "standard": "gpt-5.6-terra",
         "complex": "gpt-5.6-sol",
+        "exceptional": "gpt-6-astra",
     },
     # GLM ids come from the operator's own profile alias mapping (haiku→glm-4.7,
     # sonnet→glm-5.2, opus→glm-5.2[1m]); the runtime is the Claude SDK runner, so
@@ -745,6 +749,7 @@ MODEL_TIERS: dict[str, dict[str, str]] = {
         "trivial": "glm-4.7",
         "standard": "glm-5.2",
         "complex": "glm-5.2[1m]",
+        "exceptional": "glm-5.2[1m]",
     },
 }
 
@@ -783,8 +788,6 @@ def route_ceiling_model(runtime: str = "claude") -> str:
     while recurrence or repeated completed failure is the evidence that pays
     for the exceptional capability ceiling.
     """
-    if runtime == RuntimeName.CLAUDE:
-        return "fable"
     return route_model(TIER_LADDER[-1], runtime)
 
 
@@ -806,7 +809,11 @@ def build_router_task(
         "Classify this GitHub issue's implementation difficulty.\n"
         "trivial = one-liner / config / copy / doc change.\n"
         "standard = typical feature or bug fix touching a few files.\n"
-        "complex = architectural change, new subsystem, or deep debugging.\n\n"
+        "complex = architectural change, new subsystem, or deep debugging.\n"
+        "exceptional = exceptionally difficult work with interacting architectural "
+        "constraints or unresolved root causes across subsystems that requires "
+        "the strongest implementer. Reserve this tier for concrete difficulty "
+        "in the task, not merely a long description or high priority.\n\n"
         "Also predict the exact repository-relative files likely to be changed. "
         "Return [] when uncertain; never invent broad directories or paths outside "
         "the repository.\n\n"

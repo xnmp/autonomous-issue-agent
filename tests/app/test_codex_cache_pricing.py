@@ -63,6 +63,44 @@ def test_missing_or_zero_cache_read_tokens_keep_full_input_pricing(cache_read):
 FULL_RATE_ISSUE_71_COST = 20.155  # (3974000 * $5 + 9500 * $30) / 1e6
 
 
+@pytest.mark.parametrize("configured,expected", [
+    ("gpt-5.6-sol=5/30", (10.0, 50.0, 1.0)),
+    ("gpt-6-astra=12/60/2", (12.0, 60.0, 2.0)),
+])
+def test_astra_runtime_and_accounting_use_the_same_rates(configured, expected):
+    from issue_agent.app.roles import _rate_table
+    from issue_agent.domain.contracts import TokenUsage
+    from issue_agent.domain.pricing import price
+
+    cfg = from_env({"CODEX_COST_PER_MTOK": configured})
+    rates = rates_with_cache_for_model(
+        "gpt-6-astra", cfg.codex_cost_per_mtok, cfg.codex_cost_per_mtok_cached_in,
+        fallback_in=cfg.codex_cost_per_mtok_in,
+        fallback_out=cfg.codex_cost_per_mtok_out,
+    )
+    assert rates == expected
+    table = _rate_table(cfg, "codex")
+    assert table is not None
+    charge = price(TokenUsage(1_000_000, 1_000_000, cache_read_tokens=1_000_000),
+                   table.rates_for("gpt-6-astra"))
+    assert charge.micros == round(sum(expected) * 1_000_000)
+
+
+def test_rate_card_version_tracks_shipped_prices_without_an_overlay_edit(monkeypatch):
+    from issue_agent.app.roles import _rate_table
+    from issue_agent.domain import pricing
+
+    cfg = from_env({"CODEX_COST_PER_MTOK": "gpt-5.6-sol=5/30"})
+    current = _rate_table(cfg, "codex")
+    monkeypatch.setattr(pricing, "CODEX_DEFAULT_MODEL_RATES", (("gpt-6-astra", 12.0, 60.0),))
+    changed = _rate_table(cfg, "codex")
+
+    assert current is not None and changed is not None
+    assert current.rates_for("gpt-6-astra") != changed.rates_for("gpt-6-astra")
+    assert current.version != changed.version
+    assert current.rate_card_id == changed.rate_card_id
+
+
 @pytest.mark.parametrize("raw", [
     "gpt-5.6-sol=5/30/0",       # cache reads would price free
     "gpt-5.6-sol=5/30/-1",      # and negative would pay the leg back

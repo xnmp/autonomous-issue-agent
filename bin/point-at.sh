@@ -431,7 +431,8 @@ echo
 # Follow all role logs together until the daemons exit or Ctrl-C.
 tail -n +1 -F "$LOG_DIR"/*-"$NAME".log &
 tail_pid=$!
-wait "${pids[@]}"
+watcher_status=0
+wait_for_watchers "${pids[@]}" || watcher_status=$?
 # TERM on the supervising subshell alone would orphan its uv→python→gh chain
 # (a headless forwarder touching wake files and holding a relay hook), so
 # sweep the whole descendant tree. Ctrl-C never gets here — the trap's
@@ -443,3 +444,4 @@ kill_tree() {
 }
 [ -n "$webhook_pid" ] && kill_tree "$webhook_pid"
 kill "$tail_pid" 2>/dev/null || true
+exit "$watcher_status"

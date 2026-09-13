@@ -15,11 +15,13 @@ remain on the daemon thread. Review and steward keep synchronous dispatch.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
 import threading
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
@@ -123,6 +125,7 @@ from ..domain.pricing import (
     RateTable,
     UnknownModelPolicy,
     usd_per_million_to_micros,
+    with_default_model_rates,
 )
 from ..domain.recovery import RecoveryTrigger
 from ..domain.events import (
@@ -489,17 +492,28 @@ def _rate_table(
                 ),
                 usd_per_million_to_micros(rate_in),
             )
-            for model, rate_in, rate_out in cfg.codex_cost_per_mtok
+            for model, rate_in, rate_out in (
+                with_default_model_rates(cfg.codex_cost_per_mtok)
+                if runtime_name == RuntimeName.CODEX.value
+                else cfg.codex_cost_per_mtok
+            )
         }
     except ValueError:
         return None
+    # Shipped defaults can change without an overlay edit. Settlement receipts
+    # must identify the effective prices, not just the operator's input snapshot.
+    version = hashlib.sha256(json.dumps({
+        "config": cfg.config_version,
+        "rates": {model.strip().casefold(): asdict(value) for model, value in rates.items()},
+        "fallback": asdict(fallback),
+    }, sort_keys=True).encode()).hexdigest()[:16]
     return RateTable(
         (
             "codex-config"
             if runtime_name == RuntimeName.CODEX.value
             else f"{runtime_name}-synthetic-config"
         ),
-        cfg.config_version,
+        version,
         "USD",
         rates,
         UnknownModelPolicy.USE_FALLBACK,

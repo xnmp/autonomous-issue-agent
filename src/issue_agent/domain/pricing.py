@@ -20,6 +20,23 @@ from .contracts import Money, PriceQuote, TokenUsage
 TOKENS_PER_MILLION = 1_000_000
 DEFAULT_CACHE_READ_DISCOUNT = Decimal("0.1")
 
+# Configured accounting estimates for newly routed models must also work with
+# existing deployments' older rate tables. Explicit operator rates take priority.
+# Astra standard-context list rates, 2026-09-14:
+# https://developers.openai.com/api/docs/models/gpt-6-astra
+CODEX_DEFAULT_MODEL_RATES: tuple[tuple[str, float, float], ...] = (
+    ("gpt-6-astra", 10.0, 50.0),
+)
+
+
+def with_default_model_rates(
+    configured: tuple[tuple[str, float, float], ...],
+) -> tuple[tuple[str, float, float], ...]:
+    names = {name.strip().casefold() for name, _, _ in configured}
+    return configured + tuple(
+        row for row in CODEX_DEFAULT_MODEL_RATES if row[0] not in names
+    )
+
 
 class UnknownModelPolicy(str, Enum):
     REJECT = "reject"
