@@ -200,7 +200,7 @@ class _NoFixWorktrees:
         del issue
         raise self._unavailable()
 
-    def branch_for_issue(self, issue: int, fallback: str) -> str | None:
+    def branch_for_issue(self, issue: int, fallback: str, *, preferred: str = "") -> str | None:
         del issue, fallback
         raise self._unavailable()
 

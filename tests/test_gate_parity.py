@@ -70,6 +70,32 @@ from issue_agent.adapters.worktree import GitResult, build_gate_context  # noqa:
 
 CHECKS = ROOT / "plugin" / "hooks" / "checks"
 
+
+@pytest.mark.parametrize("branch,allowed", [
+    ("test/703-diagnostics", True), ("docs/703-runbook", True),
+    ("test/no-issue", False), ("wip/703-unknown", False),
+])
+def test_branch_creation_uses_the_same_policy_in_both_stacks(branch, allowed):
+    from issue_agent.domain.gate import check_branch_name
+
+    result = subprocess.run(
+        ["bash", str(CHECKS / "check-branch-name.sh"), "switch", "-c", branch],
+        capture_output=True, text=True, check=False,
+    )
+    assert (result.returncode == 0) is allowed
+    assert check_branch_name(branch).ok is allowed
+
+
+def test_test_branch_push_cannot_bypass_an_open_pr_test_gate(tmp_path):
+    repo = fresh_repo(tmp_path)
+    _git(repo, "switch", "-qc", "test/703-diagnostics")
+    stub = write_gh_stub(repo, "44")
+    env = {"PATH": f"{stub}{os.pathsep}{os.environ['PATH']}", "TEST_CMD": "false"}
+
+    shell = bash_verdict("push", repo, ["push"], env)
+    python = python_verdict("push", repo, ["push"], env, open_pr="44")
+    assert not shell.allowed and not python.allowed
+
 # Every environment knob either stack reads. Stripped from the inherited
 # environment before each case so a developer's exported TEST_CMD cannot change
 # a verdict — and so the two stacks are provably fed the SAME environment.

@@ -1176,7 +1176,7 @@ def test_triage_task_readonly_and_thread():
         cfg,
     )
     assert t.schema is TRIAGE_SCHEMA
-    assert t.append_system_prompt == "TRIAGE"
+    assert t.append_system_prompt.startswith("TRIAGE")
     assert t.model == "sonnet"
     assert "Edit" in t.disallowed_tools
     # T5 (review): "ANSWERS to your earlier" / "strangler fig" were prose-only

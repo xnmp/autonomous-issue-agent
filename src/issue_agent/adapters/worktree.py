@@ -40,6 +40,7 @@ from ..domain.exemptions import (
     parse_exemption_declarations,
 )
 from ..domain.gate import OpenPrLookup, resolve_test_cmd
+from ..domain.refs import issue_from_branch
 from .governor import GateContext, run_target_command
 from .store import HarnessMarkers
 
@@ -122,22 +123,22 @@ def worktree_list_contains_issue(listing: str, issue: int) -> bool:
     return False
 
 
-def _issue_worktree_branch(listing: str, issue: int) -> str:
-    """Harness-owned issue branch checked out by issue-N, or "" otherwise."""
-    expected = f"issue-{issue}"
+def _registered_branch(listing: str, expected_path: str) -> str | None:
+    """None means absent; an empty branch means a registered detached checkout."""
+    expected = os.path.realpath(expected_path)
     current = False
+    branch: str | None = None
     for line in listing.splitlines():
         if line.startswith("worktree "):
             path = line.removeprefix("worktree ").strip()
-            current = os.path.basename(path) == expected
+            current = os.path.realpath(path) == expected
+            if current:
+                branch = ""
         elif current and line.startswith("branch refs/heads/"):
-            branch = line.removeprefix("branch refs/heads/").strip()
-            if re.fullmatch(rf"(?:fix|feat|chore|refactor)/{issue}(?:-.+)?", branch):
-                return branch
-            return ""
+            return line.removeprefix("branch refs/heads/").strip()
         elif current and not line.strip():
             current = False
-    return ""
+    return branch
 
 
 class WorktreeUnavailable(RuntimeError):
@@ -226,7 +227,7 @@ class Worktrees:
                 )
             return len(paths)
 
-    def branch_for_issue(self, issue: int, fallback: str) -> str:
+    def branch_for_issue(self, issue: int, fallback: str, *, preferred: str = "") -> str:
         """Return a retained harness branch for an older issue leg.
 
         New legs persist their branch in Store. This local-ref lookup recovers
@@ -234,13 +235,25 @@ class Worktrees:
         non-synthetic branch wins over any stale fallback. An absent branch
         returns ""; genuine ambiguity raises rather than guessing.
         """
+        listing = self._git(["worktree", "list", "--porcelain"], self.repo_dir)
+        if listing.code != 0:
+            raise WorktreeUnavailable(f"cannot inspect worktrees for issue #{issue}")
+        current = _registered_branch(listing.out, os.path.join(self.repo_dir, self.path(issue)))
+        if current is not None:
+            if issue_from_branch(current) != issue:
+                raise WorktreeUnavailable(f"issue #{issue} checkout has foreign or detached branch {current!r}")
+            return current
         refs = self._git(
             ["for-each-ref", "--format=%(refname:short)", "refs/heads"], self.repo_dir
         )
+        if refs.code != 0:
+            raise WorktreeUnavailable(f"cannot inspect retained branches for issue #{issue}")
         matches = [
             ref for ref in refs.out.splitlines()
-            if re.fullmatch(rf"(?:fix|feat|chore|refactor)/{issue}-.+", ref)
+            if issue_from_branch(ref) == issue
         ]
+        if preferred in matches:
+            return preferred
         if len(matches) <= 1:
             return matches[0] if matches else ""
         synthetic = {fallback, f"fix/{issue}-issue"}
@@ -265,8 +278,18 @@ class Worktrees:
         returning a path that doesn't exist is a lie the caller has no way to
         catch before dispatching the agent into it."""
         wt = self.path(issue)
+        abs_path = os.path.join(self.repo_dir, wt)
+        if issue_from_branch(branch) != issue:
+            raise WorktreeUnavailable(f"branch {branch!r} does not belong to issue #{issue}")
         listing = self._git(["worktree", "list", "--porcelain"], self.repo_dir)
-        if not worktree_list_contains_issue(listing.out, issue):
+        if listing.code != 0:
+            raise WorktreeUnavailable(f"cannot inspect worktrees for issue #{issue}")
+        existing = _registered_branch(listing.out, abs_path)
+        if existing is not None and existing != branch:
+            raise WorktreeUnavailable(
+                f"issue #{issue} requires branch {branch!r}, but {abs_path!r} has {existing!r}"
+            )
+        if existing is None:
             self._git(["fetch", "origin", self.base_branch, "--quiet"], self.repo_dir)
             has_branch = self._git(
                 ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], self.repo_dir
@@ -283,13 +306,15 @@ class Worktrees:
                         ["worktree", "add", "-b", branch, wt, self.base_branch],
                         self.repo_dir,
                     )
-        abs_path = os.path.join(self.repo_dir, wt)
         if not self._path_exists(abs_path):
             raise WorktreeUnavailable(
                 f"worktree for issue #{issue} on branch '{branch}' is not ready at "
                 f"{abs_path!r} — every 'git worktree add' attempt failed (see the git "
                 "runner's stderr surfacing for why)."
             )
+        observed = self._git(["branch", "--show-current"], abs_path)
+        if observed.code != 0 or observed.out.strip() != branch:
+            raise WorktreeUnavailable(f"branch identity could not be verified at {abs_path!r}")
         return abs_path
 
     def remove(self, issue: int) -> None:
@@ -302,13 +327,15 @@ class Worktrees:
             raise WorktreeUnavailable(
                 f"cannot inspect worktrees before removing issue #{issue}"
             )
-        branch = _issue_worktree_branch(listing.out, issue)
         abs_path = os.path.join(self.repo_dir, self.path(issue))
+        branch = _registered_branch(listing.out, abs_path)
         if (
-            not worktree_list_contains_issue(listing.out, issue)
+            branch is None
             and not self._path_exists(abs_path)
         ):
             return
+        if branch is None or issue_from_branch(branch) != issue:
+            raise WorktreeUnavailable(f"refusing to remove unowned issue #{issue} checkout at {abs_path!r}")
         removed = self._git(
             ["worktree", "remove", self.path(issue), "--force"],
             self.repo_dir,
@@ -327,7 +354,7 @@ class Worktrees:
         )
         if (
             verified.code != 0
-            or worktree_list_contains_issue(verified.out, issue)
+            or _registered_branch(verified.out, abs_path) is not None
             or self._path_exists(abs_path)
         ):
             raise WorktreeUnavailable(

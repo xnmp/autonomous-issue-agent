@@ -21,7 +21,8 @@ from tests.app.test_fix_workflow import _workflow
 from tests.adapters.test_worktree import FakeGit
 
 
-def test_resume_recreates_removed_worktree_on_original_branch_with_blocked_commit(tmp_path):
+@pytest.mark.parametrize("original_branch", ["fix/5-preserve-blocked-work", "test/5-preserve-blocked-work"])
+def test_resume_recreates_removed_worktree_on_original_branch_with_blocked_commit(tmp_path, original_branch):
     """A retitled blocked issue resumes its original branch, not `fix/N-issue`."""
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -45,7 +46,6 @@ def test_resume_recreates_removed_worktree_on_original_branch_with_blocked_commi
         return _subprocess_git(args, cwd)
 
     issue = 5
-    original_branch = "fix/5-preserve-blocked-work"
     worktrees = Worktrees(str(repo), worktree_root="worktrees", run=worktree_git)
     original_cwd = Path(worktrees.ensure(issue, original_branch))
     (original_cwd / "blocked.txt").write_text("blocked work\n")
@@ -70,6 +70,7 @@ def test_resume_recreates_removed_worktree_on_original_branch_with_blocked_commi
     recovered_cwd = Path(runner.tasks[0].cwd)
     assert git("branch", "--show-current", cwd=recovered_cwd) == original_branch
     assert git("rev-parse", "HEAD", cwd=recovered_cwd) == blocked_commit
+    assert store.get_branch(issue) == original_branch
     assert subprocess.run(
         ["git", "show-ref", "--verify", "--quiet", "refs/heads/fix/5-issue"], cwd=repo,
     ).returncode == 1

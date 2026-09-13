@@ -46,7 +46,10 @@ class FakeGit:
 
 
 def test_ensure_reuses_existing_worktree():
-    fg = FakeGit({"worktree list": GitResult(0, "worktree /repo/.claude/worktrees/issue-5\n")})
+    fg = FakeGit({
+        "worktree list": GitResult(0, "worktree /repo/.claude/worktrees/issue-5\nbranch refs/heads/fix/5-x\n"),
+        "branch --show-current": GitResult(0, "fix/5-x\n"),
+    })
     # /repo isn't a real directory in the test environment — the honesty check
     # (M20, below) is exercised separately; these git-wiring tests fake it away.
     wt = Worktrees("/repo", run=fg, path_exists=lambda p: True)
@@ -69,6 +72,8 @@ def test_concurrent_worktree_setup_serializes_shared_git_metadata():
         time.sleep(0.002)
         with guard:
             active -= 1
+        if _args == ["branch", "--show-current"]:
+            return GitResult(0, "fix/5-x" if _cwd.endswith("issue-5") else "fix/6-y")
         return GitResult(0, "")
 
     worktrees = Worktrees("/repo", run=git, path_exists=lambda _path: True)
@@ -98,6 +103,7 @@ def test_ensure_does_not_reuse_issue_with_prefix_collision():
     fg = FakeGit({
         "worktree list": GitResult(0, "worktree /repo/.claude/worktrees/issue-50\n"),
         "show-ref": GitResult(1, ""),
+        "branch --show-current": GitResult(0, "fix/5-x"),
     })
     Worktrees("/repo", base_branch="dev", run=fg, path_exists=lambda p: True).ensure(5, "fix/5-x")
 
@@ -107,6 +113,7 @@ def test_ensure_does_not_reuse_issue_with_prefix_collision():
 def test_ensure_creates_from_base_when_no_branch():
     fg = FakeGit({
         "worktree list": GitResult(0, ""),                 # none yet
+        "branch --show-current": GitResult(0, "fix/5-x"),
         "show-ref": GitResult(1, ""),                       # branch doesn't exist
     })
     wt = Worktrees("/repo", base_branch="dev", run=fg, path_exists=lambda p: True)
@@ -148,6 +155,8 @@ def test_ensure_returns_real_path_when_worktree_add_actually_creates_it(tmp_path
             return GitResult(0, "")
         if args[0] == "show-ref":
             return GitResult(1, "")
+        if args == ["branch", "--show-current"]:
+            return GitResult(0, "fix/7-x")
         return GitResult(0, "")
 
     wt = Worktrees(repo_dir, base_branch="dev", run=git)
@@ -269,8 +278,10 @@ def test_remove_never_deletes_a_branch_when_the_issue_worktree_is_absent():
 def test_remove_never_deletes_an_arbitrary_branch_from_the_issue_worktree():
     git = RemovalGit(branch="dev")
 
-    Worktrees("/repo", run=git).remove(5)
+    with pytest.raises(WorktreeUnavailable, match="unowned"):
+        Worktrees("/repo", run=git).remove(5)
 
+    assert git.present
     assert not any(args[:2] == ["branch", "-D"] for args, _cwd in git.calls)
 
 

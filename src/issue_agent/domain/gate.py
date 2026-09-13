@@ -32,7 +32,7 @@ from .exemptions import (
     check_declaration_scope,
     valid_subject,
 )
-from .refs import is_governed_branch
+from .refs import BRANCH_PREFIXES, ISSUE_BRANCH_PATTERN, is_governed_branch
 
 
 # ── result type ──────────────────────────────────────────────────────────────
@@ -120,7 +120,7 @@ CLOSING_KEYWORD_RE = re.compile(
     r"(fix(es|ed)?|close[sd]?|resolve[sd]?) +#[0-9]+", re.IGNORECASE
 )
 
-_BRANCH_NAME_RE = re.compile(r"^(feat|fix|chore|refactor)/[0-9]+-")
+_BRANCH_NAME_RE = re.compile(ISSUE_BRANCH_PATTERN)
 
 
 def looks_like_test(path: str) -> bool:
@@ -238,7 +238,7 @@ def check_branch_name(name: str) -> GateResult:
     if not _BRANCH_NAME_RE.match(name):
         return deny(
             f"Branch name '{name}' is invalid. Use <type>/<issue>-<desc> where "
-            "type is feat|fix|chore|refactor, e.g. fix/42-null-token."
+            f"type is {'|'.join(BRANCH_PREFIXES)}, e.g. fix/42-null-token."
         )
     return ALLOW
 

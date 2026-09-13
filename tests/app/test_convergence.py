@@ -87,9 +87,9 @@ class _FakeWorktrees:
     def reset(self, issue: int) -> None:
         pass
 
-    def branch_for_issue(self, issue: int, fallback: str) -> str:
+    def branch_for_issue(self, issue: int, fallback: str, *, preferred: str = "") -> str:
         del issue
-        return fallback
+        return preferred or fallback
 
 
 class _FakeRunner:

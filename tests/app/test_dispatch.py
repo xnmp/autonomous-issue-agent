@@ -215,9 +215,9 @@ class FakeWorktrees:
     def reset(self, issue):
         self.resets.append(issue)
 
-    def branch_for_issue(self, issue, fallback):
+    def branch_for_issue(self, issue, fallback, *, preferred=""):
         del issue
-        return fallback
+        return preferred or fallback
 
     def prune_validate(self):
         return 0

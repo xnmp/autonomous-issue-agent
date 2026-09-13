@@ -1774,6 +1774,17 @@ def test_pr_for_issue_no_warning_below_limit(capsys):
     assert capsys.readouterr().err == ""
 
 
+def test_pr_discovery_uses_the_shared_branch_issue_policy():
+    from issue_agent.domain.refs import BRANCH_PREFIXES
+
+    for prefix in BRANCH_PREFIXES:
+        gw = GitHubGateway("o/r", runner=FakeRunner({"pr list": [
+            {"number": 1, "headRefName": f"{prefix}/7030-other"},
+            {"number": 2, "headRefName": f"{prefix}/703-work"},
+        ]}))
+        assert gw.pr_for_issue(703) == 2
+
+
 def test_gh_rejects_a_list_subcommand_without_limit():
     """review C2, made structural: a `gh … list` argv with no --limit is a BUG in
     this module (silent 30-item truncation), so it raises before gh ever runs

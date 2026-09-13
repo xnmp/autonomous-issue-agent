@@ -182,13 +182,10 @@ class FixWorkflow:
 
     def _resume_branch(self, issue: int, title: str) -> str:
         fallback = f"fix/{issue}-{slugify(title) or 'issue'}"
-        remembered = self.store.get_branch(issue)
-        if remembered:
-            return remembered
-        remembered = self.worktrees.branch_for_issue(issue, fallback)
-        if remembered:
-            return remembered
-        return fallback
+        remembered = self.store.get_branch(issue) or ""
+        return self.worktrees.branch_for_issue(
+            issue, fallback, preferred=remembered
+        ) or remembered or fallback
 
     def _review_comments(self, pr: int) -> str:
         """Best-effort fetch of a prompt INPUT (review M13/D6).
@@ -599,7 +596,7 @@ class FixWorkflow:
             await self.resolve_split(issue)
             return
         iss = self.gateway.get_issue(issue)
-        branch = f"fix/{issue}-{slugify(iss.title) or 'issue'}"
+        branch = self._resume_branch(issue, iss.title)
         cwd = self._ensure_cwd(issue, branch)
         fix_cfg, deferred_for_overlap = await self._routed_fix_cfg(issue, iss, cwd)
         if deferred_for_overlap:
@@ -642,7 +639,7 @@ class FixWorkflow:
 
     async def resolve_split(self, issue: int, human_reply: str = "") -> None:
         iss = self.gateway.get_issue(issue)
-        branch = f"fix/{issue}-{slugify(iss.title) or 'issue'}"
+        branch = self._resume_branch(issue, iss.title)
         cwd = self._ensure_cwd(issue, branch)
 
         if human_reply:

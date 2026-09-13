@@ -2,23 +2,23 @@
 
 The harness derives the issue number from the branch name when GitHub's
 closing-reference graph is unavailable (it's only populated for PRs against the
-DEFAULT branch; ours target `dev`). Keep the prefix set in sync with
-check-branch-name.sh, agent/lib.sh (pr_for_issue / issue_from_branch), and
-resume-issue.sh — they must all agree.
+DEFAULT branch; ours target `dev`). Python consumers use this policy directly;
+the shell policy is generated from it and checked by make test.
 """
 
 from __future__ import annotations
 
 import re
 
-BRANCH_PREFIXES = ("feat", "fix", "chore", "refactor")
+BRANCH_PREFIXES = ("feat", "fix", "chore", "refactor", "test", "docs", "build", "ci", "perf", "revert", "style")
 
-_BRANCH_RE = re.compile(r"^(feat|fix|chore|refactor)/(\d+)-")
+BRANCH_PREFIX_PATTERN = "(" + "|".join(BRANCH_PREFIXES) + ")"
+ISSUE_BRANCH_PATTERN = "^" + BRANCH_PREFIX_PATTERN + r"/([0-9]+)-"
+_BRANCH_RE = re.compile(ISSUE_BRANCH_PATTERN)
 
 
 def issue_from_branch(branch: str) -> int | None:
-    """Issue number parsed from a feat|fix|chore|refactor/<n>-… branch, or None.
-    Port of agent/lib.sh:issue_from_branch."""
+    """Issue number from a supported type/<n>-… branch, or None."""
     m = _BRANCH_RE.match(branch or "")
     return int(m.group(2)) if m else None
 

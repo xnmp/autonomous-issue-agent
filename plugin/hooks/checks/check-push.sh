@@ -12,15 +12,13 @@ set -uo pipefail
 fail() { echo "Push blocked: $1"; exit 1; }
 # shellcheck source=_pr_common.sh
 . "$(dirname "$0")/_pr_common.sh"
+. "$(dirname "$0")/_branch_policy.sh"
 
 branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 base="${BASE_BRANCH:-dev}"
 
 # Only governed-shape branches carry harness work; anything else → allow.
-case "$branch" in
-  feat/*|fix/*|chore/*|refactor/*) : ;;
-  *) exit 0 ;;
-esac
+[[ "$branch" =~ $HARNESS_BRANCH_PREFIX_RE ]] || exit 0
 
 # Is there an OPEN PR for this branch? If not, this is a pre-PR push → allow
 # (the create gate will enforce later).

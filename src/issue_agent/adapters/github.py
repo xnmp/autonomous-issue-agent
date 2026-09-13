@@ -1763,18 +1763,17 @@ class GitHubGateway:
         )
 
     def pr_for_issue(self, issue: int) -> int | None:
-        """Open PR whose head branch matches ^(feat|fix|chore|refactor)/<issue>-.
+        """Open PR whose head branch identifies this issue under domain policy.
         Port of agent/lib.sh:pr_for_issue (closing-ref graph is default-branch only)."""
         data = self._gh_json(
             ["pr", "list", "--repo", self.repo, "--state", "open",
              "--json", "number,headRefName", "--limit", str(_LIST_LIMIT)]
         ) or []
         _warn_if_list_truncated("gh pr list --state open (pr_for_issue)", len(data))
-        import re
+        from ..domain.refs import issue_from_branch
 
-        pat = re.compile(rf"^(feat|fix|chore|refactor)/{issue}-")
         for p in data:
-            if pat.match(p.get("headRefName", "")):
+            if issue_from_branch(p.get("headRefName", "")) == issue:
                 return int(p["number"])
         return None
 

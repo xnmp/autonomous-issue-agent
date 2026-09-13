@@ -37,6 +37,7 @@ test: test-config-generated test-governor test-residuals test-hooks test-compose
 test-config-generated:
 	@echo "== config (generated metadata reference) =="
 	@diff -u config/agent.env.example <(uv run --quiet python scripts/generate_config_example.py)
+	@diff -u plugin/hooks/checks/_branch_policy.sh <(uv run --quiet python scripts/generate_branch_policy.py)
 
 test-governor:
 	@echo "== governor (pytest) =="

@@ -19,6 +19,8 @@ Rules:
 
 | change | landed | evidence spec | status |
 |---|---|---|---|
+| Unified issue-branch policy and verified worktree identity | 2026-09-14 | Tauri #703 reuses its retained `test/703-…` branch, logs/persists that branch, and passes publication admission without another `publication_authority_unavailable`; PR discovery associates the resulting branch with #703 | **pending** |
+| Shared triage/implementation decision ownership | 2026-09-14 | Retriaged backlog turns routine column/branch UI architecture questions into criteria and promotes work, while explicit data-disclosure choices and missing Mac capability remain respected | **pending** |
 | Foreground canary propagates every watcher exit | 2026-09-14 | A failing foreground watcher makes `issue-agent start` exit nonzero even when another watcher and log cleanup exit zero; a successful bounded canary exits zero | **pending** — observed 2026-09-14 canary returned zero after all roles failed at boot |
 | Exceptional implementer tier and shared Astra pricing defaults | 2026-09-14 | A router-selected `exceptional` resolve or history-triggered ceiling dispatches `gpt-6-astra`/`fable`; its completed run records that model and a nonzero accounted charge. Ordinary `complex` dispatch remains Sol/Opus; repairs preserve their session model | **pending** |
 | #16 escalation ladder (`route_escalation`) | be49b1d 2026-07-27 | `route_escalation` journal event on a repair leg after RC/recurrence signals | VERIFIED 2026-08-08 (tauri 8-issue batch): `routing.escalated.v1` fired repeatedly — issue 605 address-review medium→high (01:53:02Z, notches=1, review_rounds=2), issue 508 fix-ci (03:23:19Z) and rebase (03:55:15Z); all `ceiling=false` |
