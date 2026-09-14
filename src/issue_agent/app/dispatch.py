@@ -121,6 +121,7 @@ class DispatchConfig:
     # Deployment-wide infra breaker (app.infra_breaker.InfraBreaker). None keeps
     # per-issue ceilings as the only bound, which is every hand-built config.
     infra_breaker: InfraBreakerPort | None = None
+    operator_guidance: Callable[[int], str] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.reviewer_runtime, RuntimeName):
@@ -142,6 +143,7 @@ class DispatchConfig:
             fixer_runtime=self.fixer_runtime,
             escalate_on_evidence=self.escalate_on_evidence,
             infra_breaker=self.infra_breaker,
+            operator_guidance=self.operator_guidance,
         )
 
     def review_workflow_config(self) -> ReviewWorkflowConfig:

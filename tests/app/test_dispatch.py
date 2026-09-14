@@ -101,6 +101,9 @@ class FakeStore:
     def get_operator_guidance(self, p):
         return self.operator_guidance.get(p, "")
 
+    def get_ci_rerun_head(self, p):
+        return ""
+
     def set_round(self, p, n):
         self.rounds[p] = n
 
@@ -427,11 +430,13 @@ def test_triage_routes_to_steward_workflow():
 
 
 def _ci_dispatcher(
-    gw, store, runner, fix_mcp_config="", dispatch_claim_target=None
+    gw, store, runner, fix_mcp_config="", dispatch_claim_target=None,
+    operator_guidance=None,
 ):
     cfg = DispatchConfig(
         fix=FixTaskConfig("o/r", agent_md="AM"),
         fix_mcp_config=fix_mcp_config, harness_root="/tmp/none",
+        operator_guidance=operator_guidance,
     )
     executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
     return AgentDispatcher(

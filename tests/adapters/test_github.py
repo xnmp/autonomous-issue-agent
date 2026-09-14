@@ -1360,13 +1360,16 @@ def test_cancel_workflow_runs_preserves_transport_failure_for_durable_recovery()
         gw.cancel_workflow_runs("head-1", (4242,))
 
 
-def test_failed_run_id_and_failed_run_log_agree_on_the_run():
-    # One lookup, two consumers — the CI-fix prompt and the re-run must never
-    # disagree about WHICH run failed.
-    fr = FakeRunner({"run list": [{"databaseId": 77}], "run view 77": "boom"})
+def test_failed_log_uses_the_same_verified_attempt_as_the_rerun_path():
+    fr = FakeRunner({
+        "api repos/o/r/actions/runs/77": {"id": 77, "head_sha": "head", "run_attempt": 2},
+        "run view 77": "boom",
+    })
     gw = GitHubGateway("o/r", runner=fr)
-    assert gw.failed_run_id(100, branch="b") == 77
-    assert gw.failed_run_log(100, branch="b") == "boom"
+    assert gw.workflow_run_attempts("head", (77,)) == {77: 2}
+    assert gw.failed_run_log("head", (77,)) == "boom"
+    assert "--attempt" in fr.calls[-1][0]
+    assert fr.calls[-1][0][fr.calls[-1][0].index("--attempt") + 1] == "2"
 
 
 # ── _subprocess_runner: benign statusCheckRollup noise gated behind debug ──────
@@ -2057,40 +2060,42 @@ def test_review_comments_fails_soft_to_empty_string(runner):
     assert GitHubGateway("o/r", runner=runner).review_comments(100) == ""
 
 
-def test_failed_run_log_tails_the_newest_failed_run_on_the_head_branch():
-    """review M13 / port of agent/fix-ci.sh:39-42. Keyed on the REAL head branch —
-    `gh run list` has no PR filter, and the bash's first version guessed the branch
-    from the issue number and read the wrong repo's runs."""
+def test_failed_run_log_tails_only_the_observed_revision_bound_run():
     log = "\n".join(f"line {i}" for i in range(1, 301))
-    fr = FakeRunner({"run list": [{"databaseId": 4242}], "run view 4242": log})
+    fr = FakeRunner({
+        "api repos/o/r/actions/runs/4242": {"id": 4242, "head_sha": "head", "run_attempt": 1},
+        "run view 4242": log,
+    })
     gw = GitHubGateway("o/r", runner=fr)
-    out = gw.failed_run_log(100, branch="fix/5-null-token")
+    out = gw.failed_run_log("head", (4242,))
     assert out.splitlines() == [f"line {i}" for i in range(301 - _FAILED_LOG_LINES, 301)]
-    list_argv = fr.calls[0][0]
-    assert list_argv[1:3] == ["run", "list"]
-    assert "fix/5-null-token" in list_argv
-    assert "--status" in list_argv and "failure" in list_argv
-    assert _limit_of(list_argv) is not None          # review C2 applies here too
     view_argv = fr.calls[1][0]
     assert view_argv[1:4] == ["run", "view", "4242"] and "--log-failed" in view_argv
 
 
-def test_failed_run_log_resolves_the_head_branch_when_not_supplied():
+@pytest.mark.parametrize("evidence", [
+    {"id": 1, "head_sha": "old-head", "run_attempt": 1},
+    {"id": 2, "head_sha": "head", "run_attempt": 1},
+    {"id": 1, "head_sha": "head", "run_attempt": True},
+    {"id": "bad", "head_sha": "head", "run_attempt": 1},
+    {}, None,
+])
+def test_failed_run_log_never_borrows_a_stale_or_unverified_run(evidence):
     fr = FakeRunner({
-        "pr view 100": {"number": 100, "headRefName": "fix/5-x", "state": "OPEN"},
-        "pr checks 100": [], "run list": [{"databaseId": 1}], "run view 1": "boom",
+        "api repos/o/r/actions/runs/1": evidence,
+        "run list": [{"databaseId": 2}], "run view 1": "wrong log",
     })
     gw = GitHubGateway("o/r", runner=fr)
-    assert gw.failed_run_log(100) == "boom"
-    run_list = [c[0] for c in fr.calls if c[0][1:3] == ["run", "list"]][0]
-    assert "fix/5-x" in run_list
+    assert gw.failed_run_log("head", (1,)) == ""
+    assert not any(c[0][1] == "run" for c in fr.calls)
 
 
-def test_failed_run_log_empty_when_no_run_failed():
+@pytest.mark.parametrize("head,run_ids", [("", (1,)), ("head", ()), ("head", (True,)), ("head", (-1,))])
+def test_failed_run_log_empty_when_identity_is_unknown(head, run_ids):
     fr = FakeRunner({"run list": []})
     gw = GitHubGateway("o/r", runner=fr)
-    assert gw.failed_run_log(100, branch="b") == ""
-    assert not any(c[0][1:3] == ["run", "view"] for c in fr.calls)   # no pointless fetch
+    assert gw.failed_run_log(head, run_ids) == ""
+    assert fr.calls == []
 
 
 @pytest.mark.parametrize(
@@ -2104,7 +2109,7 @@ def test_failed_run_log_empty_when_no_run_failed():
 def test_failed_run_log_fails_soft_to_empty_string(runner):
     """D6: a log fetch may never kill a dispatch — the fixer can rediscover the
     failure itself, but only if it is actually dispatched."""
-    assert GitHubGateway("o/r", runner=runner).failed_run_log(100, branch="b") == ""
+    assert GitHubGateway("o/r", runner=runner).failed_run_log("head", (1,)) == ""
 
 
 def test_failed_run_log_does_not_swallow_a_programmer_error():
@@ -2112,7 +2117,7 @@ def test_failed_run_log_does_not_swallow_a_programmer_error():
     without --limit is a bug in this module, not a transient gh failure."""
     gw = GitHubGateway("o/r", runner=_raising_runner(MissingListLimit("no --limit")))
     with pytest.raises(MissingListLimit):
-        gw.failed_run_log(100, branch="b")
+        gw.failed_run_log("head", (1,))
 
 
 # ── P1R-13: `tail -150` bounds LINE count, not bytes ──────────────────────────
@@ -2123,9 +2128,12 @@ def test_failed_run_log_bounds_by_bytes_not_just_lines():
     150,001,711-char prompt. ONE 5MB line (well within the 150-line cap) is
     enough to demonstrate the byte ceiling holds independently."""
     huge_line = "x" * 5_000_000
-    fr = FakeRunner({"run list": [{"databaseId": 1}], "run view 1": huge_line})
+    fr = FakeRunner({
+        "api repos/o/r/actions/runs/1": {"id": 1, "head_sha": "head", "run_attempt": 1},
+        "run view 1": huge_line,
+    })
     gw = GitHubGateway("o/r", runner=fr)
-    out = gw.failed_run_log(100, branch="b")
+    out = gw.failed_run_log("head", (1,))
     assert len(out.encode("utf-8")) <= _FAILED_LOG_BYTES
     assert out  # anti-vacuity: real (truncated) content survives, not wiped to ""
 
@@ -2134,9 +2142,12 @@ def test_failed_run_log_under_the_byte_cap_is_untouched():
     # anti-vacuity twin: a normal, small log is NOT truncated by the new cap —
     # the byte ceiling only bites the pathological case.
     log = "\n".join(f"line {i}" for i in range(1, 301))
-    fr = FakeRunner({"run list": [{"databaseId": 1}], "run view 1": log})
+    fr = FakeRunner({
+        "api repos/o/r/actions/runs/1": {"id": 1, "head_sha": "head", "run_attempt": 1},
+        "run view 1": log,
+    })
     gw = GitHubGateway("o/r", runner=fr)
-    out = gw.failed_run_log(100, branch="b")
+    out = gw.failed_run_log("head", (1,))
     assert out.splitlines() == [f"line {i}" for i in range(301 - _FAILED_LOG_LINES, 301)]
     assert len(out.encode("utf-8")) < _FAILED_LOG_BYTES
 

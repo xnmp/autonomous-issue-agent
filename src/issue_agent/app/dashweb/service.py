@@ -1585,7 +1585,7 @@ class Backend:
         self, name: str, prs: tuple[int, ...], guidance: str | None
     ) -> tuple[str, tuple[int, ...], list[str]]:
         """Set or clear the operator's scope note for each held PR, in the
-        review role's state dir (the reviewer is the only reader).
+        review role's state dir (review and repairs share this authority).
 
         `guidance` is already normalized: None = no change, "" = clear, text =
         set (overwriting — the operator's latest word on a PR is the one the

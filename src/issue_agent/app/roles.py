@@ -2531,6 +2531,8 @@ def build_fix_daemon(
         harness_root=cfg.runtime_paths.harness_root,
         log=_log("fix"),
         fix_bot=fix_runtime.bot,
+        # Scope notes keep one owner; repairs and review read the same record.
+        operator_guidance=Store(cfg.review_state_dir).get_operator_guidance,
         fixer_runtime=cfg.fixer_runtime,
         escalate_on_evidence=cfg.escalate_on_evidence,
         # The same ceiling `fix_cfg` escalates on, so a deterministic death can

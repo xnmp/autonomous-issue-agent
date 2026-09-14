@@ -19,6 +19,7 @@ Rules:
 
 | change | landed | evidence spec | status |
 |---|---|---|---|
+| Shared current PR repair context and revision-bound CI logs (#197) | 2026-09-14 | A re-armed PR #679 repair receives the single-owner operator scope, discussion, observed head/run identity, consumed rerun allowance and SHA/attempt-verified log; it investigates instead of repeating the stale rerun request. Reply-driven CI resume preserves the selected answer separately from bounded discussion | **pending** |
 | Unified issue-branch policy and verified worktree identity | 2026-09-14 | Tauri #703 reuses its retained `test/703-…` branch, logs/persists that branch, and passes publication admission without another `publication_authority_unavailable`; PR discovery associates the resulting branch with #703 | **pending** |
 | Shared triage/implementation decision ownership | 2026-09-14 | Retriaged backlog turns routine column/branch UI architecture questions into criteria and promotes work, while explicit data-disclosure choices and missing Mac capability remain respected | **pending** |
 | Foreground canary propagates every watcher exit | 2026-09-14 | A failing foreground watcher makes `issue-agent start` exit nonzero even when another watcher and log cleanup exit zero; a successful bounded canary exits zero | **pending** — observed 2026-09-14 canary returned zero after all roles failed at boot |

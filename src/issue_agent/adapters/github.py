@@ -1827,27 +1827,6 @@ class GitHubGateway:
     # agent can rediscover the failure itself) rather than not happen at all. A log
     # fetch may never kill a dispatch. The one exception is `MissingListLimit`,
     # which is a bug in this module, not a runtime condition (review C2).
-    def failed_run_id(self, pr: int, *, branch: str = "") -> int | None:
-        """databaseId of the newest FAILED Actions run on this PR's head branch,
-        or None (green branch; runs exist but none failed; no Actions run at all
-        — a red PR whose only red mark is an external status context).
-
-        Extracted from `failed_run_log` so the CI-fix prompt and the free re-run
-        (#38) can never disagree about WHICH run failed. Keyed on the REAL head
-        branch for the reason the bash comment gives: `gh run list` has no PR
-        filter, and deriving the branch from the issue number is what the bash
-        got wrong first. Raises nothing but `MissingListLimit` — see the section
-        comment above."""
-        head = branch or self.get_pr(pr, mergeability=False).head_ref_name
-        if not head:
-            return None
-        runs = self._gh_json(
-            ["run", "list", "--repo", self.repo, "--branch", head,
-             "--status", "failure", "--json", "databaseId", "--limit", "1"]
-        ) or []
-        run_id = runs[0].get("databaseId") if runs else None  # type: ignore[union-attr]
-        return int(run_id) if run_id else None
-
     def workflow_run_attempts(
         self, head: str, run_ids: tuple[int, ...]
     ) -> dict[int, int] | None:
@@ -1967,24 +1946,28 @@ class GitHubGateway:
         return tuple(completed)
 
     def failed_run_log(
-        self, pr: int, *, branch: str = "", lines: int = _FAILED_LOG_LINES
+        self, head: str, run_ids: tuple[int, ...], *, lines: int = _FAILED_LOG_LINES
     ) -> str:
-        """Tail of the newest FAILED Actions run on this PR's head branch.
+        """Bounded logs for the observed runs, verified against the observed head.
 
-        Port of agent/fix-ci.sh:39-42 (`gh run list --branch … --status failure`
-        → `gh run view <id> --log-failed | tail -150`). Keyed on the REAL head
-        branch, as the bash comment insists: `gh run list` has no PR filter, and
-        deriving the branch from the issue number is what the bash got wrong
-        first. Pass `branch` when the caller already holds the PRView, to save the
-        `gh pr view` round-trip."""
+        A branch's latest failed run may belong to an older revision. Reuse the
+        rerun authority's identity verifier and pin the log attempt so a later
+        rerun cannot silently change the evidence while it is being fetched.
+        """
+        if not head or not run_ids or any(type(n) is not int or n <= 0 for n in run_ids):
+            return ""
         try:
-            run_id = self.failed_run_id(pr, branch=branch)
-            if run_id is None:
-                return ""  # green branch, or runs exist but none failed
-            log = self._gh(
-                ["run", "view", str(run_id), "--repo", self.repo, "--log-failed"]
-            )
-            return _tail(log, lines, max_bytes=_FAILED_LOG_BYTES)
+            attempts = self.workflow_run_attempts(head, run_ids)
+            if attempts is None:
+                return ""
+            logs = []
+            for run_id, attempt in attempts.items():
+                log = self._gh([
+                    "run", "view", str(run_id), "--repo", self.repo,
+                    "--attempt", str(attempt), "--log-failed",
+                ])
+                logs.append(_tail(log, lines, max_bytes=_FAILED_LOG_BYTES))
+            return _tail("\n\n".join(logs), lines, max_bytes=_FAILED_LOG_BYTES)
         except MissingListLimit:
             raise
         except Exception:  # noqa: BLE001 — a missing log must not block the fix

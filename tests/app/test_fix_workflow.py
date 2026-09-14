@@ -476,7 +476,8 @@ def test_the_second_fix_ci_leg_sees_what_the_first_one_faced(tmp_path):
 
     prompt = second.tasks[0].prompt
     assert "attempt 1 @ aaaaaaa: e2e tests" in prompt
-    assert "bbbbbbb" not in prompt  # the CURRENT head is the prompt's subject
+    assert "attempt 2 @ bbbbbbb" not in prompt
+    assert "b" * 40 in prompt  # current observation is separate from prior attempts
 
 
 def test_a_budget_capped_tick_is_not_recorded_as_an_attempt(tmp_path):
@@ -919,10 +920,10 @@ class PromptInputGateway(FakeGateway):
         self._boom = boom
         self.log_args = []
 
-    def failed_run_log(self, pr, *, branch="", lines=150):
+    def failed_run_log(self, head, run_ids):
         if self._boom:
             raise RuntimeError("gh run list exploded")
-        self.log_args.append((pr, branch))
+        self.log_args.append((head, run_ids))
         return self._run_log
 
     def review_comments(self, pr, *, limit=20):
@@ -961,9 +962,7 @@ def test_fix_ci_prompt_carries_the_failed_run_log():
     asyncio.run(_workflow(gw, FakeStore(), runner).fix_ci(100))
 
     assert "E   assert 1 == 2  # SENTINEL" in runner.tasks[0].prompt
-    # keyed to the REAL head branch, and handed over so the gateway need not
-    # re-fetch the PR the workflow already holds
-    assert gw.log_args == [(100, "fix/5-token")]
+    assert gw.log_args == [("head-sha", ())]
 
 
 def test_fix_ci_dispatches_when_the_failed_run_log_is_empty():

@@ -28,6 +28,7 @@ from ..planners import tasks as task_builders
 from ..planners.tasks import FixTaskConfig
 from ...domain.actions import AgentKind, Relabel, Target
 from ...adapters.runtime_plan import AgentRuntime, RunTelemetryRuntime
+from ...adapters.github import format_pr_discussion
 from ...domain.ports import (
     ActionExecutor,
     CiPromptReads,
@@ -56,6 +57,7 @@ from ...domain.review import count_outstanding_change_requests
 from ...domain.trust import as_untrusted
 from ...domain.world import (
     REVIEW_CHANGES_REQUESTED,
+    PRView,
     normalize_predicted_paths,
     paths_overlap_open_prs,
 )
@@ -101,6 +103,7 @@ class FixWorkflowConfig:
     # and every returned result clears it. None = per-issue ceilings only,
     # which is the pre-breaker behaviour every hand-built config keeps.
     infra_breaker: InfraBreakerPort | None = None
+    operator_guidance: Callable[[int], str] | None = None
 
 
 @dataclass
@@ -207,11 +210,15 @@ class FixWorkflow:
             self.cfg.log(f"prompt input 'review_comments' unavailable: {exc}")
             return ""
 
-    def _failed_run_log(self, pr: int, branch: str) -> str:
+    def _failed_run_log(self, pr: PRView) -> str:
         if not isinstance(self.gateway, CiPromptReads):
             return ""
         try:
-            return self.gateway.failed_run_log(pr, branch=branch) or ""
+            run_ids = tuple(dict.fromkeys(
+                c.run_id for c in pr.checks
+                if c.bucket == "fail" and not c.advisory and c.run_id is not None
+            ))
+            return self.gateway.failed_run_log(pr.head_ref_oid, run_ids) or ""
         except Exception as exc:  # noqa: BLE001 — advisory prompt enrichment
             self.cfg.log(f"prompt input 'failed_run_log' unavailable: {exc}")
             return ""
@@ -1044,14 +1051,17 @@ class FixWorkflow:
         iss = self.gateway.get_issue(issue)
         cwd = self._ensure_cwd(issue, p.head_ref_name)
         fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
-        task = task_builders.build_resume_task(
-            as_untrusted(reply_comment.body),
-            cwd,
-            self.store.get_session(issue),
-            self._repair_fix_cfg(issue, "resume", iss=iss), fork=fork,
-        )
-        result = await self._run_logged(
-            "pr-resume", issue, task, kind="PR_RESUME"
+        if any(check.bucket == "fail" and not check.advisory for check in p.checks):
+            task = self._ci_task(p, issue, cwd, fork=fork)
+        else:
+            task = task_builders.build_resume_task(
+                as_untrusted(reply_comment.body),
+                cwd,
+                self.store.get_session(issue),
+                self._repair_fix_cfg(issue, "resume", iss=iss), fork=fork,
+            )
+        result = await self._run_pr_logged(
+            "pr-resume", issue, task, p, kind="PR_RESUME", reply=reply_comment.body
         )
         self._record_block_state(
             issue, Target.PR, pr, result, pr=pr, blocked_head=p.head_ref_oid
@@ -1092,8 +1102,8 @@ class FixWorkflow:
             ),
             fork=fork,
         )
-        result = await self._run_logged(
-            "address-review", issue, task, kind="ADDRESS_REVIEW"
+        result = await self._run_pr_logged(
+            "address-review", issue, task, p, kind="ADDRESS_REVIEW"
         )
         self._record_block_state(
             issue, Target.PR, pr, result, pr=pr, blocked_head=p.head_ref_oid
@@ -1123,23 +1133,21 @@ class FixWorkflow:
             base = n if at == review_at else 0
             self.store.set_review_retry(issue, review_at, base + 1)
 
-    async def fix_ci(
-        self, pr: int, *, issue_hint: int | None = None
-    ) -> None:
-        dispatch = self._dispatch_pr(pr, issue_hint)
-        if dispatch is None:
-            return
-        p, issue = dispatch
-        if issue is None:
-            return
-        cwd = self._ensure_cwd(issue, p.head_ref_name)
+    async def _run_pr_logged(self, label, issue, task, p: PRView, *, kind, reply=None):
+        guidance = self.cfg.operator_guidance or self.store.get_operator_guidance
+        current = task_builders.with_pr_repair_context(
+            task, p,
+            rerun_head=self.store.get_ci_rerun_head(p.number),
+            operator_guidance=guidance(p.number),
+            discussion=as_untrusted(format_pr_discussion(p.comments)),
+            human_reply=as_untrusted(reply) if reply is not None else None,
+        )
+        return await self._run_logged(label, issue, current, kind=kind)
+
+    def _ci_task(self, p: PRView, issue: int, cwd: str, *, fork: bool = False):
+        pr = p.number
         failed = "\n".join(c.name for c in p.checks if c.bucket == "fail")
-        # Check NAMES alone were all the prompt carried (review M13) — the agent
-        # had to rediscover every failure with `gh api` denied by the governor.
-        # `branch` is passed because the PRView is already in hand: it saves the
-        # gateway a `gh pr view` round-trip it would otherwise make to find the
-        # head branch `gh run list` needs.
-        failed_log = self._failed_run_log(pr, p.head_ref_name)
+        failed_log = self._failed_run_log(p)
         mcp_servers = mcp_servers_for_checks(
             self.cfg.fix_mcp_config, [c.name for c in p.checks], self.cfg.harness_root
         )
@@ -1148,10 +1156,7 @@ class FixWorkflow:
         # because history is context, not authority: an unreadable store must
         # cost the leg its extra section, never its dispatch (`_signals`' rule).
         prior_attempts = self._try(lambda: self.store.get_ci_history(issue), ()) or ()
-        attempt = make_attempt(
-            p.head_ref_oid, [c.name for c in p.checks if c.bucket == "fail"]
-        )
-        task = task_builders.build_fix_ci_task(
+        return task_builders.build_fix_ci_task(
             pr,
             as_untrusted(failed),
             as_untrusted(failed_log),
@@ -1165,8 +1170,24 @@ class FixWorkflow:
             self._repair_fix_cfg(issue, "fix-ci"),
             mcp_servers=mcp_servers,
             ci_history=prior_attempts,
+            fork=fork,
         )
-        result = await self._run_logged("fix-ci", issue, task, kind="FIX_CI")
+
+    async def fix_ci(
+        self, pr: int, *, issue_hint: int | None = None
+    ) -> None:
+        dispatch = self._dispatch_pr(pr, issue_hint)
+        if dispatch is None:
+            return
+        p, issue = dispatch
+        if issue is None:
+            return
+        cwd = self._ensure_cwd(issue, p.head_ref_name)
+        attempt = make_attempt(
+            p.head_ref_oid, [c.name for c in p.checks if c.bucket == "fail"]
+        )
+        task = self._ci_task(p, issue, cwd)
+        result = await self._run_pr_logged("fix-ci", issue, task, p, kind="FIX_CI")
         self._record_block_state(
             issue, Target.PR, pr, result, pr=pr, blocked_head=p.head_ref_oid
         )
@@ -1217,7 +1238,7 @@ class FixWorkflow:
             pr, self.cfg.base_branch, cwd, self.store.get_session(issue),
             self._repair_fix_cfg(issue, "rebase")
         )
-        result = await self._run_logged("rebase", issue, task, kind="REBASE")
+        result = await self._run_pr_logged("rebase", issue, task, p, kind="REBASE")
         self._record_block_state(
             issue, Target.PR, pr, result, pr=pr, blocked_head=p.head_ref_oid
         )
