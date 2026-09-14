@@ -110,6 +110,19 @@ Daemon/operator/dashboard wiring, explicit absence-authorized retry, activation
 import and full composed crash acceptance still remain. Focused tests passing
 do not establish phase acceptance or authorize a live migration/restart.
 
+The following bounded increment adds first-observation initialization only under
+an already activated epoch, with owner/freshness/duplicate checks and atomic
+evidence recording. Verified command absence now has a pure reconciliation policy
+that preserves the retry-authorization gate (or settles retired uncertainty),
+retains expiry history and schedules the next read. Independent review accepted
+the initializer and caught an immediately-due successful-read loop, now fixed
+with a behavioral regression. These pieces still require daemon integration;
+they are not a claim that expired-command retries or live activation are wired.
+Full verification passed: 1,274 domain, 1,328 adapter and 2,361 application tests,
+plus hooks, parity, import contracts and both Pyrefly passes. Final log:
+`/tmp/phase3-discovery-reconciliation-full-final.log`. The earlier run's sole
+failure was test-only union narrowing in Pyrefly; the complete rerun is green.
+
 Phase 1 replaces contradictory raw trigger checks with shared action-specific
 eligibility, replaces swallowed control corruption with per-target errors,
 and replaces separate triage/groom relabel-then-close choreography with guarded

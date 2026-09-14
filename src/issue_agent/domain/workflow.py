@@ -103,6 +103,16 @@ class RemoteOutcomeUncertain:
 
 
 @dataclass(frozen=True)
+class RetryAuthorizationRequired:
+    command_id: CommandId
+    absence_evidence_id: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.command_id, "retry command")
+        validate_workflow_identifier(self.absence_evidence_id, "absence evidence")
+
+
+@dataclass(frozen=True)
 class EvidenceUnavailable:
     required_fact: str
     unresolved_since: datetime
@@ -136,8 +146,8 @@ class RearmNeedsDecision:
             raise ValueError("rearm stop reason must be typed")
 
 
-GateCause = ResolveCeiling | RemoteOutcomeUncertain | EvidenceUnavailable | RearmNeedsDecision
-_CAUSES = (ResolveCeiling, RemoteOutcomeUncertain, EvidenceUnavailable, RearmNeedsDecision)
+GateCause = ResolveCeiling | RemoteOutcomeUncertain | RetryAuthorizationRequired | EvidenceUnavailable | RearmNeedsDecision
+_CAUSES = (ResolveCeiling, RemoteOutcomeUncertain, RetryAuthorizationRequired, EvidenceUnavailable, RearmNeedsDecision)
 
 
 class RemediationOperation(str, Enum):
@@ -774,6 +784,7 @@ class ResolveResultKind(str, Enum):
     BUDGET_REFUSAL = "budget_refusal"
     BLOCKED = "blocked"
     PR_OPENED = "pr_opened"
+    STAGE_PROGRESSED = "stage_progressed"
 
 
 @dataclass(frozen=True)

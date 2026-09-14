@@ -1,7 +1,7 @@
 # ADR 0015 — Generation-fenced gate re-arm authority
 
 Status: Proposed (2026-09-14). Phases 1–2 accepted at `1703195`; resolve
-foundations are under implementation and adversarial review. No phase 3 slice
+foundations accepted at `05aa54a`, with the vertical slice still under implementation. No phase 3 slice
 is accepted and no live workflow family has been activated.
 
 Governs: src/issue_agent/domain/workflow.py src/issue_agent/domain/workflow_policy.py src/issue_agent/adapters/workflow_control.py src/issue_agent/adapters/control_store.py
@@ -196,6 +196,13 @@ history. `evidence_id` resolves to a harness-owned,
 fresh, complete observation proving that specific current postcondition is absent;
 the API cannot supply its own proof. An unreadable target, missing review from
 a partial list or bare 404 is not that proof.
+
+A verified absence replaces that command's uncertainty cause with
+`RetryAuthorizationRequired`, retaining the same gate and reconciliation-only
+execution restriction. It neither falsely reports the current outcome as unknown
+nor clears the last blocker on an ordinary command. Successful read-only checks
+also advance the bounded polling schedule while retaining the original expiry
+history; waiting for authorization must not create an immediately-due read loop.
 
 Persist the authorization and its unique ID atomically. The daemon checks fresh
 absence and separately proves the original decision's current applicability under effect

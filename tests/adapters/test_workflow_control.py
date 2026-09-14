@@ -116,6 +116,104 @@ def test_read_requires_activation_and_distinguishes_verified_absence(control):
         adapter(control).load_workflow(WorkflowKey("other/repo", IssueRef(1)))
 
 
+def test_discovery_requires_explicit_activation_before_creating_authority(control):
+    with pytest.raises(WorkflowAuthorityError, match="migration"):
+        adapter(control).ensure_observed_workflow(observation(resolve_snapshot()))
+    with closing(control._connect()) as db:
+        assert db.execute("SELECT count(*) FROM workflows").fetchone()[0] == 0
+
+
+def test_new_issue_discovery_is_durable_and_repeated_observation_never_resets_it(control):
+    install_workflow(control, resolve_snapshot())
+    observed = observation(resolve_snapshot(2))
+    first = adapter(control).ensure_observed_workflow(observed)
+    assert not first.idempotent
+    assert first.snapshot.revision.fence.generation == first.snapshot.revision.version == 0
+    assert first.snapshot.episode.failures == 0
+    later = replace(observed, observed_at=NOW + timedelta(seconds=10))
+    control._now = lambda: later.observed_at
+    duplicate = adapter(control).ensure_observed_workflow(later)
+    assert duplicate.idempotent and duplicate.snapshot == first.snapshot
+    with closing(control._connect()) as db:
+        rows = db.execute("SELECT payload_json FROM workflow_evidence WHERE target_number=2").fetchall()
+    assert len(rows) == 1
+    assert decode_workflow(rows[0]["payload_json"], ObservedIssue) == observed
+
+
+def test_discovery_of_existing_exhausted_episode_preserves_gates_and_guidance(control):
+    before = held()
+    before = replace(before, episode=replace(before.episode, guidance="original decision", last_failure="prior failure"))
+    install_workflow(control, before)
+    result = adapter(control).ensure_observed_workflow(observation(before, frozenset({Label.AI_READY})))
+    assert result.idempotent and result.snapshot == before
+    assert adapter(control).held_projection(before.revision.fence.key).held
+
+
+def test_concurrent_first_observations_create_one_episode_and_audit(control):
+    install_workflow(control, resolve_snapshot())
+    observed = observation(resolve_snapshot(2))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: adapter(control).ensure_observed_workflow(observed), range(2)))
+    assert sum(not r.idempotent for r in results) == 1
+    assert results[0].snapshot == results[1].snapshot
+    with closing(control._connect()) as db:
+        assert db.execute("SELECT count(*) FROM workflow_evidence WHERE target_number=2").fetchone()[0] == 1
+
+
+def test_discovery_failure_rolls_back_initial_episode_and_audit(control):
+    install_workflow(control, resolve_snapshot())
+    observed = observation(resolve_snapshot(2))
+    with control.transaction() as db:
+        db.execute("CREATE TRIGGER fail_discovery BEFORE INSERT ON workflow_evidence BEGIN SELECT RAISE(ABORT, 'discovery crash'); END")
+    with pytest.raises(sqlite3.IntegrityError, match="discovery crash"):
+        adapter(control).ensure_observed_workflow(observed)
+    assert isinstance(adapter(control).load_workflow(observed.key), WorkflowAbsent)
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_corrupt_activation_cannot_create_or_reset_a_discovered_workflow(control, existing):
+    install_workflow(control, resolve_snapshot())
+    observed = observation(resolve_snapshot(1 if existing else 2))
+    with control.transaction() as db:
+        db.execute("UPDATE workflow_authority_epochs SET epoch='corrupt'")
+    with pytest.raises(WorkflowAuthorityError, match="epoch"):
+        adapter(control).ensure_observed_workflow(observed)
+
+
+def test_corrupt_existing_workflow_is_not_treated_as_undiscovered(control):
+    install_workflow(control, resolve_snapshot())
+    with control.transaction() as db:
+        db.execute("UPDATE workflows SET episode_json='{}'")
+    with pytest.raises(WorkflowAuthorityError, match="invalid"):
+        adapter(control).ensure_observed_workflow(observation(resolve_snapshot()))
+
+
+@pytest.mark.parametrize("offset", [-1, 301])
+def test_discovery_rechecks_observation_time_under_transaction(control, offset):
+    install_workflow(control, resolve_snapshot())
+    control._now = lambda: NOW + timedelta(seconds=offset)
+    with pytest.raises(ValueError, match="stale or from the future"):
+        adapter(control).ensure_observed_workflow(observation(resolve_snapshot(2)))
+
+
+def test_discovery_checks_bound_owner_and_repository(control):
+    install_workflow(control, resolve_snapshot())
+    foreign = replace(observation(resolve_snapshot(2)), key=WorkflowKey("foreign/repo", IssueRef(2)))
+    with pytest.raises(WorkflowAuthorityError, match="scope"):
+        adapter(control).ensure_observed_workflow(foreign)
+    control.adopt_legacy_owner("o/r", "fix", "o/r:fix:new", prior_owner_ids=(WRITER.owner_id,))
+    with pytest.raises(RetiredOwnerError):
+        adapter(control).ensure_observed_workflow(observation(resolve_snapshot(2)))
+
+
+def test_discovery_ignores_stale_legacy_files_after_activation(control):
+    from pathlib import Path
+    install_workflow(control, resolve_snapshot())
+    Path(control.path).parent.joinpath("issue-2.resolve-retries").write_text("999", encoding="utf-8")
+    result = adapter(control).ensure_observed_workflow(observation(resolve_snapshot(2)))
+    assert result.snapshot.episode.failures == 0
+
+
 def test_acceptance_restart_and_duplicate_request_grant_one_episode(control):
     before = held()
     install_workflow(control, before)

@@ -24,8 +24,31 @@ from .workflow import (
     WorkflowRejection, WorkflowSnapshot, WorkflowTransition, WorkflowUnchanged,
 )
 from .workflow_identity import (
-    WorkflowFence, WorkflowKey, WorkflowRevision, validate_workflow_identifier,
+    FamilyAuthority, WorkflowFence, WorkflowKey, WorkflowRevision, validate_workflow_identifier,
 )
+
+
+def initial_resolve_workflow(
+    observation: ObservedIssue, authority: FamilyAuthority, *, now: datetime,
+) -> WorkflowSnapshot:
+    """Initial state for proven new targets, never a substitute for a read.
+
+    The adapter proves absence under an activated epoch in the same transaction
+    that installs this value. Closed/held observations remain subject to normal
+    lifecycle eligibility; creating a record does not grant dispatch permission.
+    """
+    if not isinstance(observation, ObservedIssue) or not isinstance(authority, FamilyAuthority):
+        raise ValueError("workflow discovery requires a present typed issue and family authority")
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("workflow discovery requires an aware current time")
+    if not 0 <= (now - observation.observed_at).total_seconds() <= 300:
+        raise ValueError("workflow discovery observation is stale or from the future")
+    key = observation.key
+    material = f"{key.repository}\0{key.target.number}\0{authority.family.value}\0{authority.epoch}\0initial"
+    episode_id = "resolve-initial:" + hashlib.sha256(material.encode()).hexdigest()
+    return WorkflowSnapshot(
+        WorkflowRevision(WorkflowFence(key, 0), 0), authority, ResolveEpisode(episode_id),
+    )
 
 
 def resolve_projection_command_id(key: WorkflowKey, request_id: str) -> CommandId:

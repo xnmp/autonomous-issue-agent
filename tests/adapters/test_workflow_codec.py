@@ -8,7 +8,7 @@ from issue_agent.adapters.workflow_codec import (
     MAX_WORKFLOW_PAYLOAD_BYTES, WorkflowEncodingError, decode_workflow, encode_workflow,
 )
 from issue_agent.domain.workflow import (
-    NoAuthorizedRemediation, OpenGate, RemoteOutcomeUncertain, ResolveEpisode,
+    NoAuthorizedRemediation, OpenGate, RemoteOutcomeUncertain, ResolveEpisode, RetryAuthorizationRequired,
     WorkflowSnapshot,
 )
 from issue_agent.domain.contracts import CommandId
@@ -34,6 +34,25 @@ def test_roundtrip_preserves_scope_provenance_and_multiline_guidance():
     assert recovered == original
     assert recovered.binding == original.binding
     assert encode_workflow(recovered) == encode_workflow(original)
+
+
+def test_verified_absence_gate_survives_restart_without_becoming_unknown_or_open_for_execution():
+    original = snapshot()
+    original_gate = original.gates[0]
+    assert isinstance(original_gate, OpenGate)
+    gate = replace(original_gate, cause=RetryAuthorizationRequired(CommandId("command"), "absence-proof"))
+    original = replace(original, gates=(gate,))
+    recovered = decode_workflow(encode_workflow(original), WorkflowSnapshot)
+    assert recovered == original
+    assert recovered.gates[0].cause == RetryAuthorizationRequired(CommandId("command"), "absence-proof")
+
+
+@pytest.mark.parametrize("value", [None, "", " ", 1, "a" * 513, "proof\ninvalid"])
+def test_absence_gate_requires_a_valid_durable_evidence_identity(value):
+    raw = json.loads(encode_workflow(RetryAuthorizationRequired(CommandId("command"), "proof")))
+    raw["value"]["fields"]["absence_evidence_id"] = value
+    with pytest.raises(WorkflowEncodingError):
+        decode_workflow(json.dumps(raw), RetryAuthorizationRequired)
 
 
 @pytest.mark.parametrize("raw", [

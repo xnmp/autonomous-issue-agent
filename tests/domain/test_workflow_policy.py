@@ -24,7 +24,7 @@ from issue_agent.domain.workflow_policy import (
     cancel_resolve_rearm, classify_resolve_attempt, complete_resolve_rearm,
     continue_resolve_rearm, reconcile_resolve_ceiling, record_resolve_attempt, request_resolve_rearm,
     resolve_projection_command_id, supersede_resolve_rearm,
-    validate_resolve_transition,
+    initial_resolve_workflow, validate_resolve_transition,
 )
 from issue_agent.domain.world import IssueView
 
@@ -116,6 +116,38 @@ def test_explicit_changed_requirements_requeue_counts_even_if_agent_claimed_bloc
 
 def test_unadmitted_result_without_harness_attempt_cannot_consume_allowance():
     assert classify_resolve_attempt(AgentResult(is_error=True), ResolveFollowup.RETRY) is None
+
+
+def test_initial_workflow_identity_depends_on_target_and_epoch_not_observation_timestamp():
+    state = snapshot()
+    first = initial_resolve_workflow(observed(state), state.authority, now=NOW)
+    later = replace(observed(state), observed_at=NOW + timedelta(seconds=1))
+    assert initial_resolve_workflow(later, state.authority, now=later.observed_at) == first
+    assert first.revision.fence.generation == first.revision.version == 0
+    assert first.episode.failures == 0
+    another = initial_resolve_workflow(observed(snapshot(number=8)), state.authority, now=NOW)
+    next_epoch = initial_resolve_workflow(observed(state), replace(state.authority, epoch=2), now=NOW)
+    assert len({first.episode.episode_id, another.episode.episode_id, next_epoch.episode.episode_id}) == 3
+
+
+@pytest.mark.parametrize("seconds", [-1, 301])
+def test_initial_workflow_rejects_future_and_stale_observations(seconds):
+    state = snapshot()
+    with pytest.raises(ValueError, match="stale or from the future"):
+        initial_resolve_workflow(observed(state), state.authority, now=NOW + timedelta(seconds=seconds))
+
+
+@pytest.mark.parametrize("unavailable", [None, "issue:7"])
+def test_initial_workflow_requires_a_typed_verified_present_issue(unavailable):
+    with pytest.raises(ValueError, match="present typed issue"):
+        initial_resolve_workflow(unavailable, snapshot().authority, now=NOW)
+
+
+@pytest.mark.parametrize("now", [None, datetime(2026, 9, 14)])
+def test_initial_workflow_requires_a_valid_aware_transaction_clock(now):
+    state = snapshot()
+    with pytest.raises(ValueError, match="aware current time"):
+        initial_resolve_workflow(observed(state), state.authority, now=now)
 
 
 def test_prior_proposal_validation_rejects_arbitrary_counter_replacement():

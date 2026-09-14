@@ -1,15 +1,15 @@
 """Bounded reconciliation scheduling without inferring remote absence; ADR 0015."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 import hashlib
 
 from .contracts import CommandId
 from .workflow import (
-    ActiveReconciliation, CommandReconciliation, OpenGate, ReconciliationOnly,
+    ActiveReconciliation, CommandAbsenceEvidence, CommandReconciliation, OpenGate, ReconciliationOnly,
     ReconciliationPolicy, RemediationAttempted, RemediationOperation,
     RemediationOutcome, RemoteOutcomeUncertain, RetiredSettledCommand,
-    RetiredUncertainCommand,
+    RetiredUncertainCommand, RetryAuthorizationRequired,
 )
 from .workflow_identity import WorkflowBinding, validate_workflow_identifier
 
@@ -18,6 +18,53 @@ from .workflow_identity import WorkflowBinding, validate_workflow_identifier
 class ReconciliationProgress:
     state: CommandReconciliation
     gate: OpenGate | None
+
+
+def absent_reconciliation(
+    binding: WorkflowBinding,
+    command_id: CommandId,
+    prior: ReconciliationOnly | RetiredUncertainCommand,
+    evidence: CommandAbsenceEvidence,
+    *,
+    now: datetime,
+    policy: ReconciliationPolicy = ReconciliationPolicy(),
+) -> ReconciliationProgress:
+    """Resolve current uncertainty without reviving a command's write authority.
+
+    The caller persists the evidence, state and replacement (or removal) of the
+    existing uncertainty gate together. No historical non-execution is inferred.
+    """
+    validate_workflow_identifier(command_id, "command")
+    if not isinstance(binding, WorkflowBinding) or not isinstance(evidence, CommandAbsenceEvidence) or not isinstance(policy, ReconciliationPolicy):
+        raise ValueError("absence reconciliation requires validated authority and evidence")
+    if not isinstance(prior, (ReconciliationOnly, RetiredUncertainCommand)):
+        raise ValueError("absence reconciliation requires an expired or retired command")
+    if evidence.binding != binding or evidence.command_id != command_id:
+        raise ValueError("absence evidence belongs to another command or workflow")
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("reconciliation clock must be timezone-aware")
+    uncertainty = prior.uncertainty if isinstance(prior, RetiredUncertainCommand) else prior
+    if not 0 <= (now - evidence.observed_at).total_seconds() <= 300:
+        raise ValueError("absence evidence must be fresh and not from the future")
+    if evidence.observed_at < uncertainty.history.unresolved_since:
+        raise ValueError("absence evidence predates the command's uncertainty")
+    if isinstance(prior, RetiredUncertainCommand):
+        return ReconciliationProgress(
+            RetiredSettledCommand(prior.retirement_evidence_id, evidence.evidence_id), None,
+        )
+    return ReconciliationProgress(
+        replace(prior, history=replace(
+            prior.history, next_read_at=now + timedelta(seconds=policy.maximum_delay_seconds),
+        )),
+        OpenGate(
+            prior.gate_id, binding.fence.generation,
+            RetryAuthorizationRequired(command_id, evidence.evidence_id),
+            RemediationAttempted(
+                RemediationOperation.RECONCILE_REMOTE, (evidence.evidence_id,),
+                RemediationOutcome.VERIFIED_ABSENT,
+            ),
+        ),
+    )
 
 
 def reconciliation_due(state: CommandReconciliation, now: datetime) -> bool:

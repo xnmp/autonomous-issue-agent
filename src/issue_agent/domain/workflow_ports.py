@@ -5,7 +5,7 @@ from typing import Protocol
 from .contracts import CommandId
 from .workflow import (
     CommandAbsenceEvidence, CommandRetryApplicability, HeldProjection, RearmIntent, RetryAlreadyConsumed,
-    RetryBegan, ResolveAttemptResult, WorkflowChanged, WorkflowCommitted, WorkflowConflict, WorkflowRead,
+    RetryBegan, ObservedIssue, ResolveAttemptResult, WorkflowChanged, WorkflowCommitted, WorkflowConflict, WorkflowRead,
 )
 from .workflow_identity import (
     FamilyAuthority, WorkflowKey, WorkflowRevision, WorkflowWriter,
@@ -23,6 +23,8 @@ class WorkflowControl(Protocol):
     def writer(self) -> WorkflowWriter: ...
 
     def load_workflow(self, key: WorkflowKey) -> WorkflowRead: ...
+
+    def ensure_observed_workflow(self, observation: ObservedIssue) -> WorkflowCommitted: ...
 
     def commit_workflow(
         self,

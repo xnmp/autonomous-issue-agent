@@ -26,7 +26,7 @@ _VALUES = (
     identity.WorkflowFence, identity.FamilyAuthority, identity.WorkflowRevision,
     identity.WorkflowBinding, WorkflowAttemptIdentity,
     Comment, IssueView, w.ObservedIssue, w.NoLinkedPr, w.LinkedPrPresent, w.ResolveRearmPreflight,
-    w.ResolveEpisode, w.ResolveCeiling, w.RemoteOutcomeUncertain,
+    w.ResolveEpisode, w.ResolveCeiling, w.RemoteOutcomeUncertain, w.RetryAuthorizationRequired,
     w.EvidenceUnavailable, w.RearmNeedsDecision, w.NoAuthorizedRemediation,
     w.RemediationAttempted, w.OpenGate, w.RearmingGate,
     w.KeepGuidance, w.ClearGuidance, w.SetGuidance, w.OperatorActor,

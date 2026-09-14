@@ -24,10 +24,10 @@ from ..domain.workflow import (
     WorkflowUnchanged, WorkflowRejected,
 )
 from ..domain.workflow_identity import (
-    FamilyAuthority, IssueRef, WorkflowBinding, WorkflowKey, WorkflowRevision,
+    FamilyAuthority, IssueRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision,
     WorkflowWriter, validate_workflow_identifier, validate_workflow_integer,
 )
-from ..domain.workflow_policy import record_resolve_attempt, validate_resolve_transition
+from ..domain.workflow_policy import initial_resolve_workflow, record_resolve_attempt, validate_resolve_transition
 from .control_store import SQLiteControlStore
 from .deployment_authority import deployment_role
 from .workflow_codec import decode_workflow, encode_workflow
@@ -121,6 +121,39 @@ class SQLiteWorkflowControl:
                 return snapshot if snapshot is not None else WorkflowAbsent(key)
         except sqlite3.OperationalError as exc:
             return WorkflowUnavailable(key, f"workflow read unavailable: {exc}")
+
+    def ensure_observed_workflow(self, observation: ObservedIssue) -> WorkflowCommitted:
+        if not isinstance(observation, ObservedIssue):
+            raise ValueError("workflow discovery requires a verified present issue")
+        self._scope(observation.key)
+        with self._control.transaction() as db:
+            self._control._assert_owner_active(db, self.writer.owner_id)
+            prior = load_workflow_row(db, observation.key)
+            activation = db.execute(
+                "SELECT epoch FROM workflow_authority_epochs WHERE repository=? AND family=?",
+                (self.writer.repository, WorkflowFamily.RESOLVE.value),
+            ).fetchone()
+            if activation is None:
+                raise WorkflowAuthorityError("resolve workflow migration is required")
+            try:
+                authority = FamilyAuthority(WorkflowFamily.RESOLVE, activation["epoch"])
+            except ValueError as exc:
+                raise WorkflowAuthorityError("resolve activation epoch is invalid") from exc
+            snapshot = initial_resolve_workflow(observation, authority, now=self._control._now())
+            if prior is not None:
+                return WorkflowCommitted(prior, idempotent=True)
+            scope = workflow_scope(observation.key)
+            db.execute(
+                "INSERT INTO workflows VALUES (?, ?, ?, 0, 0, ?)",
+                (*scope, encode_workflow((authority, snapshot.episode))),
+            )
+            db.execute(
+                "INSERT INTO workflow_evidence VALUES (?, ?, ?, ?, NULL, 'observation', ?)",
+                (snapshot.episode.episode_id, *scope, encode_workflow(observation)),
+            )
+            self._control._transition(db, "workflow", encode_workflow(observation.key), "discovered",
+                                      {"generation": 0, "version": 0, "epoch": authority.epoch})
+            return WorkflowCommitted(snapshot)
 
     def lookup_rearm(self, key: WorkflowKey, request_id: str) -> RearmIntent | None:
         self._scope(key)
