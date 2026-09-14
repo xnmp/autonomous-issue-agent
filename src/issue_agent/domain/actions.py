@@ -21,11 +21,21 @@ from typing import Union
 
 from .eligibility import IssueCompletionGuard, LifecycleOperation
 from .labels import Label
+from .workflow_identity import IssueRef, WorkflowBinding
 
 
 class Target(Enum):
     ISSUE = auto()
     PR = auto()
+
+
+def _validate_action_workflow(workflow: WorkflowBinding | None, target: Target, number: int) -> None:
+    if workflow is None:
+        return
+    if not isinstance(workflow, WorkflowBinding):
+        raise ValueError("action requires a validated workflow binding")
+    if target is Target.ISSUE and workflow.fence.key.target != IssueRef(number):
+        raise ValueError("issue action disagrees with its captured workflow")
 
 
 class AgentKind(Enum):
@@ -78,6 +88,10 @@ class Relabel:
     # second command and could strand a half-completed label transition.
     removes: tuple[Label, ...] = ()
     completion_guard: IssueCompletionGuard | None = None
+    workflow: WorkflowBinding | None = None
+
+    def __post_init__(self) -> None:
+        _validate_action_workflow(self.workflow, self.target, self.number)
 
     @property
     def removed_labels(self) -> tuple[Label, ...]:
@@ -91,6 +105,10 @@ class PostComment:
     body: str
     # See Relabel.harness_signal.
     harness_signal: bool = False
+    workflow: WorkflowBinding | None = None
+
+    def __post_init__(self) -> None:
+        _validate_action_workflow(self.workflow, self.target, self.number)
 
 
 @dataclass(frozen=True)
@@ -103,6 +121,10 @@ class CloseIssue:
     remove_labels: tuple[Label, ...] = ()
     add_labels: tuple[Label, ...] = ()
     operation: LifecycleOperation = LifecycleOperation.CLOSE
+    workflow: WorkflowBinding | None = None
+
+    def __post_init__(self) -> None:
+        _validate_action_workflow(self.workflow, Target.ISSUE, self.number)
 
 
 @dataclass(frozen=True)
@@ -205,6 +227,17 @@ class RunAgent:
     kind: AgentKind
     number: int = 0
     requires: Relabel | None = field(default=None, compare=False, repr=False)
+    workflow: WorkflowBinding | None = None
+
+    def __post_init__(self) -> None:
+        if self.workflow is None:
+            return
+        if not isinstance(self.workflow, WorkflowBinding):
+            raise ValueError("agent workflow must be a validated binding")
+        if self.kind in (AgentKind.RESOLVE, AgentKind.RESUME) and (
+            self.workflow.fence.key.target != IssueRef(self.number)
+        ):
+            raise ValueError("resolve dispatch must retain its workflow issue identity")
 
 
 @dataclass(frozen=True)

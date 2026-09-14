@@ -17,11 +17,26 @@ from typing import Mapping, NewType
 from zoneinfo import ZoneInfo
 
 from .repository import canonical_repository
+from .workflow_identity import WorkflowBinding, validate_workflow_identifier
 
 RunId = NewType("RunId", str)
 DispatchId = NewType("DispatchId", str)
 CommandId = NewType("CommandId", str)
 ReservationId = NewType("ReservationId", str)
+
+
+@dataclass(frozen=True)
+class WorkflowAttemptIdentity:
+    binding: WorkflowBinding
+    run_id: RunId
+    leg_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.binding, WorkflowBinding):
+            raise ValueError("workflow attempt requires a validated binding")
+        for name, value in (("run_id", self.run_id), ("leg_id", self.leg_id)):
+            validate_workflow_identifier(value, f"workflow attempt {name}")
+
 
 _CURRENCY = re.compile(r"^[A-Z]{3}$")
 MAX_RECEIPT_ERROR_BYTES = 8 * 1024
@@ -344,6 +359,7 @@ class LifecycleCommand:
     config_version: str = ""
     repository: str = ""
     executor_identity: str = ""
+    workflow: WorkflowBinding | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -355,6 +371,11 @@ class LifecycleCommand:
             raise ValueError(
                 "command repository and executor identity are required"
             )
+        if self.workflow is not None and (
+            not isinstance(self.workflow, WorkflowBinding)
+            or self.workflow.fence.key.repository != self.repository
+        ):
+            raise ValueError("command workflow binding must match its repository")
         object.__setattr__(self, "payload", MappingProxyType(dict(self.payload)))
 
 

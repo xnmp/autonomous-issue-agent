@@ -1,0 +1,84 @@
+"""Transaction-local workflow reads shared by admission and progression; ADR 0015."""
+
+import sqlite3
+
+from ..domain.workflow import (
+    CancelledRearm, CompletedRearm, OpenGate, PendingRearm, RearmingGate,
+    ResolveEpisode, SupersededRearm, WorkflowSnapshot,
+)
+from ..domain.workflow_identity import (
+    FamilyAuthority, IssueRef, WorkflowBinding, WorkflowFamily, WorkflowFence,
+    WorkflowKey, WorkflowRevision,
+)
+from .workflow_codec import WorkflowEncodingError, decode_workflow
+
+
+class WorkflowAuthorityError(ValueError):
+    pass
+
+
+def workflow_scope(key: WorkflowKey) -> tuple[str, str, int]:
+    return key.repository, "issue" if isinstance(key.target, IssueRef) else "pr", key.target.number
+
+
+def load_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> WorkflowSnapshot | None:
+    """A missing row is absence only after this family's activation is verified."""
+    scope = workflow_scope(key)
+    activation = db.execute(
+        "SELECT epoch FROM workflow_authority_epochs WHERE repository=? AND family=?",
+        (key.repository, WorkflowFamily.RESOLVE.value),
+    ).fetchone()
+    if activation is None:
+        raise WorkflowAuthorityError("resolve workflow migration is required")
+    row = db.execute(
+        "SELECT * FROM workflows WHERE repository=? AND target_kind=? AND target_number=?", scope,
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        family = decode_workflow(row["episode_json"], tuple)
+        if len(family) != 2 or not isinstance(family[0], FamilyAuthority) or not isinstance(family[1], ResolveEpisode):
+            raise WorkflowEncodingError("invalid resolve family episode")
+        authority, episode = family
+        if authority != FamilyAuthority(WorkflowFamily.RESOLVE, activation["epoch"]):
+            raise WorkflowEncodingError("workflow activation epoch does not match its episode")
+        gates = []
+        for gate_row in db.execute(
+            "SELECT * FROM workflow_gates WHERE repository=? AND target_kind=? AND target_number=? "
+            "AND state<>'closed' ORDER BY gate_id", scope,
+        ):
+            gate = decode_workflow(gate_row["payload_json"], OpenGate | RearmingGate)
+            opened = gate.gate if isinstance(gate, RearmingGate) else gate
+            expected_state = "rearming" if isinstance(gate, RearmingGate) else "open"
+            if gate_row["gate_id"] != opened.gate_id or gate_row["opened_generation"] != opened.opened_generation or gate_row["state"] != expected_state:
+                raise WorkflowEncodingError("gate index disagrees with its validated payload")
+            gates.append(gate)
+        intent_row = db.execute(
+            "SELECT * FROM workflow_rearms WHERE repository=? AND target_kind=? AND target_number=? "
+            "ORDER BY to_generation DESC LIMIT 1", scope,
+        ).fetchone()
+        intent = None
+        if intent_row is not None:
+            intent = decode_workflow(intent_row["intent_json"], PendingRearm | CompletedRearm | SupersededRearm | CancelledRearm)
+            states = {PendingRearm: "pending", CompletedRearm: "completed", SupersededRearm: "superseded", CancelledRearm: "cancelled"}
+            if intent_row["request_id"] != intent.request_id or intent_row["gate_id"] != intent.gate_id or intent_row["to_generation"] != intent.to_generation or intent_row["state"] != states[type(intent)]:
+                raise WorkflowEncodingError("rearm index disagrees with its validated payload")
+        return WorkflowSnapshot(
+            WorkflowRevision(WorkflowFence(key, row["generation"]), row["version"]),
+            authority, episode, tuple(gates), intent,
+        )
+    except (ValueError, TypeError, KeyError) as exc:
+        raise WorkflowAuthorityError(f"invalid workflow authority: {exc}") from exc
+
+
+def require_workflow_binding(
+    db: sqlite3.Connection, binding: WorkflowBinding, *, allow_gated: bool = False,
+) -> WorkflowSnapshot:
+    snapshot = load_workflow_row(db, binding.fence.key)
+    if snapshot is None:
+        raise WorkflowAuthorityError("captured workflow is absent")
+    if snapshot.binding != binding:
+        raise WorkflowAuthorityError("captured workflow generation, epoch or episode is stale")
+    if snapshot.gates and not allow_gated:
+        raise WorkflowAuthorityError("workflow has unresolved gates")
+    return snapshot

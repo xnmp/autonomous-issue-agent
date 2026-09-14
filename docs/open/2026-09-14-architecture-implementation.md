@@ -97,6 +97,19 @@ Phase 3's Astra design assignment precedes its implementation; independent
 design findings must be resolved before its shared seams are integrated.
 Phases 4–6 remain dependency-gated, not silently omitted.
 
+Phase 3 foundation checkpoint: typed identity, validated transition proposals,
+bounded encoding, additive test-only v19 schema, captured admission/command/
+publication bindings and the first transactional resolve adapter passed the full
+`make test` and independent adversarial re-review. The review fixes cover request
+replay, receipt provenance/history, retired-command recurrence and cross-target
+publication authority. Full log: `/tmp/phase3-foundation-full.log`; the re-review
+also ran 302 focused tests and an additional adopted-receipt rollback diagnostic.
+This accepts the foundations only, not the complete resolve slice. The superseding
+[ADR 0015](../adr/0015-generation-fenced-gate-rearm.md) remains proposed.
+Daemon/operator/dashboard wiring, explicit absence-authorized retry, activation
+import and full composed crash acceptance still remain. Focused tests passing
+do not establish phase acceptance or authorize a live migration/restart.
+
 Phase 1 replaces contradictory raw trigger checks with shared action-specific
 eligibility, replaces swallowed control corruption with per-target errors,
 and replaces separate triage/groom relabel-then-close choreography with guarded

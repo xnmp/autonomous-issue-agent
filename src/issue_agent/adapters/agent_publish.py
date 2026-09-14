@@ -36,6 +36,8 @@ from ..domain.events import Producer
 from ..domain import gate
 from ..domain.refs import is_governed_branch, issue_from_branch
 from ..domain.repository import canonical_repository
+from ..domain.workflow_identity import WorkflowBinding
+from .workflow_codec import encode_workflow
 
 
 @dataclass(frozen=True)
@@ -176,6 +178,7 @@ class AgentPublicationBroker:
         authorized_cwd: str = "",
         authorized_branch: str = "",
         expected_issue: int | None = None,
+        run_id: RunId | None = None,
         git_binary: str = "git",
         gh_binary: str = "gh",
         trusted_path: str = "",
@@ -204,6 +207,13 @@ class AgentPublicationBroker:
             str(Path(authorized_cwd).resolve()) if authorized_cwd else ""
         )
         self.expected_issue = expected_issue
+        self.run_id = run_id
+        self.workflow: WorkflowBinding | None = None
+        if run_id is not None:
+            authority = store.publication_authority(run_id)
+            if authority is None or authority.repository != self.repository or authority.owner_id != owner or authority.issue != expected_issue or authority.cwd != self.authorized_cwd or authority.branch != authorized_branch:
+                raise ValueError("publication context disagrees with its supervised run")
+            self.workflow = authority.workflow
         self.authorized_branch = authorized_branch
         self.git_binary = git_binary
         self.gh_binary = gh_binary
@@ -228,7 +238,7 @@ class AgentPublicationBroker:
                 deployment_role(self.repository, owner),
                 owner,
             ),
-            executor_identity=identity,
+            executor_identity=owner,
         )
         self.run = (
             (
@@ -761,6 +771,8 @@ class AgentPublicationBroker:
             self.config_version,
             self.repository,
             self.owner,
+            workflow=self.workflow,
+            run_id=self.run_id,
         )
 
     def _command_for_existing_pr(
@@ -790,6 +802,8 @@ class AgentPublicationBroker:
             self.config_version,
             self.repository,
             self.owner,
+            workflow=self.workflow,
+            run_id=self.run_id,
         )
 
     def _reconcile(
@@ -1173,8 +1187,16 @@ def _lifecycle_command(
     config_version: str,
     repository: str,
     executor_identity: str,
+    *,
+    workflow: WorkflowBinding | None = None,
+    run_id: RunId | None = None,
 ) -> LifecycleCommand:
     repository = canonical_repository(repository)
+    if workflow is not None:
+        if run_id is None:
+            raise ValueError("bound publication requires its captured run identity")
+    if run_id is not None:
+        payload = {**payload, "run_id": str(run_id)}
     encoded = json.dumps(
         {
             "kind": kind.value,
@@ -1187,7 +1209,8 @@ def _lifecycle_command(
         sort_keys=True,
         separators=(",", ":"),
     )
-    digest = hashlib.sha256(encoded.encode()).hexdigest()
+    identity = encoded if workflow is None else encoded + "\n" + encode_workflow(workflow)
+    digest = hashlib.sha256(identity.encode()).hexdigest()
     return LifecycleCommand(
         CommandId(digest),
         f"agent-publication:{digest}",
@@ -1198,6 +1221,7 @@ def _lifecycle_command(
         config_version,
         repository,
         executor_identity,
+        workflow,
     )
 
 
@@ -1774,6 +1798,7 @@ def main(argv: list[str] | None = None) -> None:
         expected_issue=(
             int(authority_env["ISSUE_AGENT_PUBLICATION_ISSUE"]) or None
         ),
+        run_id=RunId(authority_env["ISSUE_AGENT_RUN_ID"]),
         git_binary=authority_env["ISSUE_AGENT_GIT_BIN"],
         gh_binary=authority_env["ISSUE_AGENT_GH_BIN"],
         trusted_path=authority_env["ISSUE_AGENT_EXEC_PATH"],

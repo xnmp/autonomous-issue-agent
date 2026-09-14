@@ -473,7 +473,11 @@ exemptable-vs-security rule classification, and the merge-withholding rule),
 blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/steward.py`, `domain/steward_stall.py`,
 `domain/supervision.py`, `domain/triage.py`, `domain/trust.py`, and
-`domain/world.py`.
+`domain/world.py`, `domain/workflow_identity.py`, `domain/workflow.py`,
+`domain/workflow_ports.py`, `domain/workflow_policy.py`,
+`domain/workflow_reconciliation.py`
+(cycle-free typed target, generation, epoch and episode identities for the
+incremental gate/re-arm authority migration).
 
 `adapters/` — filesystem, process, provider, and remote-I/O implementations:
 `adapters/accounting_runtime.py`, `adapters/agent_publish.py`,
@@ -494,7 +498,8 @@ blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `adapters/spend_recovery.py`, `adapters/store.py`,
 `adapters/supervised_exec.py`, `adapters/systemd_notify.py`,
 `adapters/typed_journal.py`, `adapters/untrusted.py`,
-`adapters/wake.py`, and `adapters/worktree.py`. Dashboard-specific read
+`adapters/wake.py`, `adapters/worktree.py`, `adapters/workflow_codec.py`,
+`adapters/workflow_rows.py`, and `adapters/workflow_control.py`. Dashboard-specific read
 adapters live under `adapters/dashweb/`.
 
 `app/` — composition and use-case orchestration:

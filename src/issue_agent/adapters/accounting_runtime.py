@@ -24,6 +24,7 @@ from ..domain.contracts import (
     RunId,
     TokenUsage,
     UsageSource,
+    WorkflowAttemptIdentity,
     daily_budget_scope,
 )
 from ..domain.outcome import (
@@ -35,6 +36,7 @@ from ..domain.outcome import (
 from ..domain.ports import StaleReservationReconciler
 from ..domain.pricing import BudgetPolicy, RateTable, price
 from ..domain.refs import is_governed_branch
+from ..domain.workflow_identity import WorkflowBinding
 from .control_store import (
     AccountingDisposition,
     BudgetLimit,
@@ -83,11 +85,11 @@ class AccountingRuntime(AgentRuntime):
     require_dispatch_claim: bool = False
     reservation_reconciler: StaleReservationReconciler | None = None
     _context: contextvars.ContextVar[
-        tuple[int | None, str, int, int | None]
+        tuple[int | None, str, int, int | None, WorkflowBinding | None]
     ] = field(
         default_factory=lambda: contextvars.ContextVar(
             f"accounting_context_{uuid.uuid4().hex}",
-            default=(None, "", 0, None),
+            default=(None, "", 0, None, None),
         ),
         init=False,
         repr=False,
@@ -109,8 +111,16 @@ class AccountingRuntime(AgentRuntime):
         number: int,
         issue: int | None,
         claim_target: int | None = None,
+        *,
+        workflow: WorkflowBinding | None = None,
     ) -> None:
-        self._context.set((issue, kind, number, claim_target))
+        if workflow is not None and not isinstance(workflow, WorkflowBinding):
+            raise ValueError("accounting context requires a validated workflow binding")
+        self._context.set((issue, kind, number, claim_target, workflow))
+
+    @property
+    def workflow_binding(self) -> WorkflowBinding | None:
+        return self._context.get()[4]
 
     def _reserve_reclaiming_dead_headroom(
         self,
@@ -207,7 +217,7 @@ class AccountingRuntime(AgentRuntime):
 
     async def run(self, task: RuntimePlan) -> AgentResult:
         now = datetime.now(timezone.utc)
-        issue, kind, number, claim_target = self._context.get()
+        issue, kind, number, claim_target, workflow = self._context.get()
         # ADR 0008: paid admission binds the decision-side target unchanged;
         # review convergence remains PR-owned even when spend is issue-scoped.
         target = (
@@ -266,6 +276,7 @@ class AccountingRuntime(AgentRuntime):
                 "repository": self.repository,
                 "role": self.role,
                 "kind": kind or "unknown",
+                "leg_id": _leg_id or str(run_id),
                 "number": number,
                 "issue": issue,
                 "breaker_key": retry_key,
@@ -301,6 +312,7 @@ class AccountingRuntime(AgentRuntime):
             tuple(additional),
             kind or "paid",
             self.owner_id or f"{self.repository}:{self.role}",
+            workflow=workflow,
         )
         # Paid child ownership is recorded by the runtime's ProcessSupervisor.
         # The daemon itself must not be registered as the reservation lease:
@@ -430,6 +442,13 @@ class AccountingRuntime(AgentRuntime):
         except BaseException:
             self._recover_or_release(run_id)
             raise
+        result = replace(
+            result,
+            workflow_attempt=(
+                WorkflowAttemptIdentity(workflow, run_id, _leg_id or str(run_id))
+                if workflow is not None else None
+            ),
+        )
         # Settlement/normalization failures retain the reservation. Releasing
         # here would turn an unavailable accounting authority into new budget
         # headroom even though the paid runtime already completed.

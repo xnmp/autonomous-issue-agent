@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 
 from .runtime_plan import ContextualRuntime, RunIdentityRuntime, RuntimePlan
 from ..domain.contracts import Money
+from ..domain.workflow_identity import WorkflowBinding
 from ..domain.dashboard import ISSUE_NUMBERED
 from ..domain.events import (
     ActionApplied,
@@ -435,6 +436,7 @@ class RunContext:
     issue: int | None = None
     claim_target: int | None = None
     dispatch_id: str = ""
+    workflow: WorkflowBinding | None = None
 
 
 def _run_correlation(
@@ -534,6 +536,10 @@ class JournalingRuntime:
     def context(self) -> RunContext:
         return self._context.get()
 
+    @property
+    def workflow_binding(self) -> WorkflowBinding | None:
+        return self.context.workflow
+
     @context.setter
     def context(self, value: RunContext) -> None:
         self._context.set(value)
@@ -545,6 +551,8 @@ class JournalingRuntime:
         number: int,
         issue: int | None,
         claim_target: int | None = None,
+        *,
+        workflow: WorkflowBinding | None = None,
     ) -> None:
         """Called by the dispatcher immediately before it hands off to a handler.
         Mutable state on purpose: journaling and paid admission consume the
@@ -561,6 +569,7 @@ class JournalingRuntime:
             issue=issue,
             claim_target=claim_target,
             dispatch_id=uuid.uuid4().hex[:12],
+            workflow=workflow,
         ))
         if isinstance(self.inner, ContextualRuntime):
             self.inner.set_context(
@@ -569,6 +578,7 @@ class JournalingRuntime:
                 number,
                 issue,
                 claim_target=claim_target,
+                workflow=workflow,
             )
 
     @contextlib.contextmanager
@@ -594,6 +604,7 @@ class JournalingRuntime:
                 previous.number,
                 previous.issue,
                 claim_target=previous.claim_target,
+                workflow=previous.workflow,
             )
         try:
             yield
@@ -605,6 +616,7 @@ class JournalingRuntime:
                     previous.number,
                     previous.issue,
                     claim_target=previous.claim_target,
+                    workflow=previous.workflow,
                 )
             self._context.reset(token)
 

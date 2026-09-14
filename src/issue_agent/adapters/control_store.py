@@ -38,6 +38,8 @@ from ..domain.contracts import (
     RunId,
     TokenUsage,
 )
+from ..domain.workflow_identity import WorkflowBinding
+from ..domain.workflow import ActiveReconciliation
 from ..domain.events import (
     ActionApplied,
     ActionFailed,
@@ -57,17 +59,21 @@ from ..domain.events import (
     encode_event_line,
 )
 from ..domain.repository import canonical_repository
+from ..domain.refs import issue_from_branch
 from .deployment_authority import (
     deployment_effect_barrier,
     deployment_role,
 )
+from .workflow_codec import decode_workflow, encode_workflow
+from .workflow_rows import WorkflowAuthorityError, require_workflow_binding
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 SCHEMA_BASELINE_VERSION = 9
 LEGACY_V8_SCHEMA_DIGEST = (
     "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
 )
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
+_RESOLVE_PAID_KINDS = frozenset({"RESOLVE", "RESUME", "AUTHOR", "IMPLEMENT", "ROUTE"})
 AUTHORITY_WITNESS_FORMAT = "issue-agent-control-authority-v1"
 
 
@@ -221,6 +227,7 @@ class ReservationRequest:
     additional_limits: tuple["BudgetLimit", ...] = ()
     kind: str = "paid"
     owner_id: str = "reservation"
+    workflow: WorkflowBinding | None = None
 
     def __post_init__(self) -> None:
         workload_repository = canonical_repository(
@@ -229,6 +236,11 @@ class ReservationRequest:
         object.__setattr__(
             self, "workload_repository", workload_repository
         )
+        if self.workflow is not None and (
+            not isinstance(self.workflow, WorkflowBinding)
+            or self.workflow.fence.key.repository != workload_repository
+        ):
+            raise ValueError("reservation workflow binding must match its workload repository")
         if self.scope.currency != self.quote.maximum_charge.currency:
             raise ValueError("reservation scope and quote currency differ")
         if self.cap.currency != self.scope.currency:
@@ -370,6 +382,7 @@ class PublicationAuthority:
     branch: str
     pgid: int
     process_start_ticks: int
+    workflow: WorkflowBinding | None = None
 
 
 @dataclass(frozen=True)
@@ -776,6 +789,100 @@ SET refusals = 1
 WHERE state='retryable_failure';
 """
 
+_MIGRATION_V19 = """
+CREATE TABLE workflow_authority_epochs (
+    repository TEXT NOT NULL,
+    family TEXT NOT NULL CHECK (length(family) BETWEEN 1 AND 64),
+    epoch INTEGER NOT NULL CHECK (epoch > 0),
+    source_digest TEXT NOT NULL,
+    inventory_digest TEXT NOT NULL,
+    activated_at TEXT NOT NULL,
+    PRIMARY KEY (repository, family)
+);
+CREATE TABLE workflows (
+    repository TEXT NOT NULL,
+    target_kind TEXT NOT NULL CHECK (target_kind IN ('issue', 'pr')),
+    target_number INTEGER NOT NULL CHECK (target_number > 0),
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    version INTEGER NOT NULL CHECK (version >= 0),
+    episode_json TEXT NOT NULL,
+    PRIMARY KEY (repository, target_kind, target_number)
+);
+CREATE TABLE workflow_gates (
+    gate_id TEXT PRIMARY KEY,
+    repository TEXT NOT NULL,
+    target_kind TEXT NOT NULL,
+    target_number INTEGER NOT NULL,
+    opened_generation INTEGER NOT NULL CHECK (opened_generation >= 0),
+    cause_key TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('open', 'rearming', 'closed')),
+    payload_json TEXT NOT NULL,
+    UNIQUE (repository, target_kind, target_number, opened_generation, cause_key),
+    FOREIGN KEY (repository, target_kind, target_number)
+        REFERENCES workflows (repository, target_kind, target_number)
+);
+CREATE TABLE workflow_rearms (
+    request_id TEXT PRIMARY KEY,
+    repository TEXT NOT NULL,
+    target_kind TEXT NOT NULL,
+    target_number INTEGER NOT NULL,
+    gate_id TEXT NOT NULL REFERENCES workflow_gates(gate_id),
+    from_generation INTEGER NOT NULL CHECK (from_generation >= 0),
+    to_generation INTEGER NOT NULL CHECK (to_generation = from_generation + 1),
+    state TEXT NOT NULL CHECK (state IN
+        ('pending', 'completed', 'superseded', 'cancelled')),
+    request_digest TEXT NOT NULL,
+    actor_json TEXT NOT NULL,
+    intent_json TEXT NOT NULL,
+    UNIQUE (repository, target_kind, target_number, to_generation),
+    FOREIGN KEY (repository, target_kind, target_number)
+        REFERENCES workflows (repository, target_kind, target_number)
+);
+CREATE UNIQUE INDEX workflow_one_pending_rearm
+    ON workflow_rearms(repository, target_kind, target_number)
+    WHERE state = 'pending';
+CREATE TABLE workflow_rearm_commands (
+    request_id TEXT NOT NULL REFERENCES workflow_rearms(request_id),
+    operation_key TEXT NOT NULL,
+    command_id TEXT NOT NULL UNIQUE REFERENCES lifecycle_commands(command_id),
+    disposition TEXT NOT NULL CHECK (disposition IN ('required', 'retired')),
+    disposition_evidence_json TEXT NOT NULL,
+    PRIMARY KEY (request_id, operation_key)
+);
+CREATE TABLE workflow_evidence (
+    evidence_id TEXT PRIMARY KEY,
+    repository TEXT NOT NULL,
+    target_kind TEXT NOT NULL,
+    target_number INTEGER NOT NULL,
+    command_id TEXT REFERENCES lifecycle_commands(command_id),
+    kind TEXT NOT NULL CHECK (kind IN ('observation', 'absence', 'retry_applicability', 'prior_receipt')),
+    payload_json TEXT NOT NULL,
+    CHECK (kind = 'observation' OR command_id IS NOT NULL),
+    FOREIGN KEY (repository, target_kind, target_number)
+        REFERENCES workflows (repository, target_kind, target_number)
+);
+CREATE TABLE workflow_retry_authorizations (
+    authorization_id TEXT PRIMARY KEY,
+    request_id TEXT REFERENCES workflow_rearms(request_id),
+    command_id TEXT NOT NULL REFERENCES lifecycle_commands(command_id),
+    gate_id TEXT NOT NULL REFERENCES workflow_gates(gate_id),
+    association_kind TEXT NOT NULL CHECK (association_kind IN ('standalone', 'rearm')),
+    binding_json TEXT NOT NULL,
+    evidence_id TEXT NOT NULL REFERENCES workflow_evidence(evidence_id),
+    request_digest TEXT NOT NULL,
+    actor_json TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    consumed_attempt INTEGER CHECK (consumed_attempt > 0),
+    CHECK ((association_kind = 'standalone' AND request_id IS NULL)
+        OR (association_kind = 'rearm' AND request_id IS NOT NULL))
+);
+ALTER TABLE runs ADD COLUMN workflow_binding_json TEXT;
+ALTER TABLE lifecycle_commands ADD COLUMN workflow_binding_json TEXT;
+ALTER TABLE lifecycle_commands ADD COLUMN workflow_reconciliation_json TEXT;
+ALTER TABLE lifecycle_commands ADD COLUMN attempt_owner TEXT;
+"""
+
+
 _SCHEMA_MIGRATIONS = (
     # Version 9 is the immutable adoption baseline shipped by the architectural
     # hardening cutover. Its exact source digest already exists in deployed
@@ -797,6 +904,7 @@ _SCHEMA_MIGRATIONS = (
     # exactly what that state asserts (the last receipt was a refusal) — rather
     # than to `attempts`, which would import the very over-count being fixed.
     SchemaMigration(18, _MIGRATION_V18),
+    SchemaMigration(19, _MIGRATION_V19),
 )
 
 if tuple(migration.version for migration in _SCHEMA_MIGRATIONS) != tuple(
@@ -1361,10 +1469,11 @@ class SQLiteControlStore:
                 )
 
         for row in db.execute(
-            "SELECT command_id, payload_json, payload_digest "
+            "SELECT * "
             "FROM lifecycle_commands"
         ).fetchall():
-            digest = hashlib.sha256(str(row["payload_json"]).encode()).hexdigest()
+            binding = row["workflow_binding_json"] if "workflow_binding_json" in row.keys() else None
+            digest = _encoded_payload_digest(str(row["payload_json"]), binding)
             if digest != row["payload_digest"]:
                 raise CorruptControlStore(
                     "control-store semantic integrity failed: lifecycle "
@@ -1870,7 +1979,7 @@ class SQLiteControlStore:
         with self._connect() as db:
             row = db.execute(
                 "SELECT b.repository, r.owner_id, r.dispatch_id, l.pgid, "
-                "l.process_start_ticks FROM runs r "
+                "l.process_start_ticks, r.workflow_binding_json FROM runs r "
                 "JOIN budget_reservations b ON b.run_id=r.run_id "
                 "JOIN leases l ON l.run_id=r.run_id "
                 "WHERE r.run_id=? "
@@ -1910,6 +2019,7 @@ class SQLiteControlStore:
             branch,
             int(row["pgid"]),
             int(row["process_start_ticks"]),
+            decode_workflow(row["workflow_binding_json"], WorkflowBinding) if row["workflow_binding_json"] is not None else None,
         )
 
     def reclaim_dead_leases(
@@ -3013,6 +3123,7 @@ class SQLiteControlStore:
                         request.cap,
                         "idempotent reservation" if identical else "conflicting reservation",
                     )
+                self._validate_workflow_reservation(db, request)
                 committed = Money.zero(request.scope.currency)
                 for limit in limits:
                     settled, reserved = self._balance(db, limit.scope)
@@ -3035,13 +3146,14 @@ class SQLiteControlStore:
                 now = _stamp(self._now())
                 db.execute(
                     "INSERT INTO runs(run_id, dispatch_id, kind, owner_id, state, "
-                    "config_version) VALUES (?, ?, ?, ?, 'reserved', ?)",
+                    "config_version, workflow_binding_json) VALUES (?, ?, ?, ?, 'reserved', ?, ?)",
                     (
                         str(request.run_id),
                         request.dispatch_id,
                         request.kind,
                         request.owner_id,
                         request.config_version,
+                        encode_workflow(request.workflow) if request.workflow is not None else None,
                     ),
                 )
                 db.execute(
@@ -3184,7 +3296,7 @@ class SQLiteControlStore:
                 request.cap,
                 str(exc),
             )
-        except (sqlite3.DatabaseError, OSError) as exc:
+        except (sqlite3.DatabaseError, OSError, WorkflowAuthorityError) as exc:
             return ReservationResult(
                 AccountingDisposition.UNAVAILABLE,
                 None,
@@ -3193,6 +3305,34 @@ class SQLiteControlStore:
                 request.cap,
                 str(exc),
             )
+
+    @staticmethod
+    def _validate_workflow_reservation(db: sqlite3.Connection, request: ReservationRequest) -> None:
+        binding = request.workflow
+        activation = db.execute(
+            "SELECT 1 FROM workflow_authority_epochs WHERE repository=? AND family='resolve'",
+            (request.workload_repository,),
+        ).fetchone()
+        if binding is None and activation is None:
+            return
+        try:
+            role = deployment_role(request.workload_repository, request.owner_id)
+        except ValueError as exc:
+            raise WorkflowAuthorityError(str(exc)) from exc
+        if binding is None:
+            affected = role == "fix" and request.kind in _RESOLVE_PAID_KINDS
+            if affected:
+                raise WorkflowAuthorityError("activated resolve admission requires a captured workflow binding")
+            return
+        if role != "fix":
+            raise WorkflowAuthorityError("resolve admission requires the repository's fix owner")
+        try:
+            require_workflow_binding(db, binding)
+            dispatch = json.loads(request.dispatch_id)
+            if not isinstance(dispatch, dict) or dispatch.get("repository") != binding.fence.key.repository or type(dispatch.get("issue")) is not int or dispatch["issue"] != binding.fence.key.target.number:
+                raise WorkflowAuthorityError("paid dispatch identity disagrees with its workflow")
+        except (ValueError, TypeError) as exc:
+            raise WorkflowAuthorityError(str(exc)) from exc
 
     @staticmethod
     def _reservation_request_matches(
@@ -3205,7 +3345,7 @@ class SQLiteControlStore:
         """Match the complete authority, not a convenient subset of its IDs."""
 
         run = db.execute(
-            "SELECT dispatch_id, kind, owner_id, state, config_version "
+            "SELECT dispatch_id, kind, owner_id, state, config_version, workflow_binding_json "
             "FROM runs WHERE run_id=?",
             (str(request.run_id),),
         ).fetchone()
@@ -3260,6 +3400,7 @@ class SQLiteControlStore:
                 "owner_id",
                 "state",
                 "config_version",
+                "workflow_binding_json",
             )
         )
         expected_run = (
@@ -3268,6 +3409,7 @@ class SQLiteControlStore:
             request.owner_id,
             "running" if lease is not None else "reserved",
             request.config_version,
+            encode_workflow(request.workflow) if request.workflow is not None else None,
         )
         actual_limits = [
             tuple(row)
@@ -3750,72 +3892,138 @@ class SQLiteControlStore:
         return ReleaseResult(AccountingDisposition.AVAILABLE, run_id)
 
     def enqueue_command(self, command: LifecycleCommand) -> PendingCommand:
-        payload = _json(command.payload)
-        digest = hashlib.sha256(payload.encode()).hexdigest()
-        now = _stamp(self._now())
         with self.transaction() as db:
-            self._assert_owner_active(db, command.executor_identity)
-            row = db.execute(
-                "SELECT * FROM lifecycle_commands WHERE idempotency_key=?",
-                (command.idempotency_key,),
-            ).fetchone()
-            if row is not None:
-                if (
-                    row["command_id"] != str(command.command_id)
-                    or row["kind"] != command.kind.value
-                    or row["target"] != command.target
-                    or row["expected_revision"] != command.expected_revision
-                    or row["repository"] != command.repository
-                    or row["executor_identity"] != command.executor_identity
-                    or row["payload_digest"] != digest
-                ):
-                    raise ControlStoreError(
-                        f"idempotency key {command.idempotency_key!r} conflicts"
-                    )
-                return PendingCommand(
-                    _command_from_row(row),
-                    row["state"],
-                    row["attempts"],
-                    int(row["refusals"]),
+            return self._enqueue_command(db, command)
+
+    def _enqueue_command(self, db: sqlite3.Connection, command: LifecycleCommand) -> PendingCommand:
+        """Use the existing outbox inside either a command or workflow transaction."""
+        payload = _json(command.payload)
+        digest = _command_payload_digest(command, payload)
+        now = _stamp(self._now())
+        self._assert_owner_active(db, command.executor_identity)
+        self._validate_workflow_command(db, command)
+        row = db.execute(
+            "SELECT * FROM lifecycle_commands WHERE idempotency_key=?",
+            (command.idempotency_key,),
+        ).fetchone()
+        if row is not None:
+            if (
+                row["command_id"] != str(command.command_id)
+                or row["kind"] != command.kind.value
+                or row["target"] != command.target
+                or row["expected_revision"] != command.expected_revision
+                or row["repository"] != command.repository
+                or row["executor_identity"] != command.executor_identity
+                or row["payload_digest"] != digest
+                or row["workflow_binding_json"] != _encoded_command_binding(command)
+            ):
+                raise ControlStoreError(
+                    f"idempotency key {command.idempotency_key!r} conflicts"
                 )
-            db.execute(
-                "INSERT INTO lifecycle_commands(command_id, idempotency_key, "
-                "logical_key, occurrence, kind, "
-                "target, expected_revision, config_version, repository, "
-                "executor_identity, payload_json, "
-                "payload_digest, state, created_at, updated_at) "
-                "VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
-                (
-                    str(command.command_id),
-                    command.idempotency_key,
-                    command.idempotency_key,
-                    command.kind.value,
-                    command.target,
-                    command.expected_revision,
-                    command.config_version,
-                    command.repository,
-                    command.executor_identity,
-                    payload,
-                    digest,
-                    now,
-                    now,
-                ),
+            return PendingCommand(
+                _command_from_row(row),
+                row["state"],
+                row["attempts"],
+                int(row["refusals"]),
             )
-            self._transition(
-                db,
-                "lifecycle_command",
+        db.execute(
+            "INSERT INTO lifecycle_commands(command_id, idempotency_key, "
+            "logical_key, occurrence, kind, "
+            "target, expected_revision, config_version, repository, "
+            "executor_identity, payload_json, "
+            "payload_digest, state, created_at, updated_at, workflow_binding_json) "
+            "VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+            (
                 str(command.command_id),
-                "pending",
-                {
-                    "kind": command.kind.value,
-                    "target": command.target,
-                    "idempotency_key": command.idempotency_key,
-                    "expected_revision": command.expected_revision,
-                    "config_version": command.config_version,
-                },
-                correlation=_command_correlation(command),
-            )
-            return PendingCommand(command, "pending", 0)
+                command.idempotency_key,
+                command.idempotency_key,
+                command.kind.value,
+                command.target,
+                command.expected_revision,
+                command.config_version,
+                command.repository,
+                command.executor_identity,
+                payload,
+                digest,
+                now,
+                now,
+                _encoded_command_binding(command),
+            ),
+        )
+        self._transition(
+            db,
+            "lifecycle_command",
+            str(command.command_id),
+            "pending",
+            {
+                "kind": command.kind.value,
+                "target": command.target,
+                "idempotency_key": command.idempotency_key,
+                "expected_revision": command.expected_revision,
+                "config_version": command.config_version,
+            },
+            correlation=_command_correlation(command),
+        )
+        return PendingCommand(command, "pending", 0)
+
+    def _validate_workflow_command(self, db: sqlite3.Connection, command: LifecycleCommand) -> None:
+        binding = command.workflow
+        publication = command.kind in {CommandKind.PUBLISH_BRANCH, CommandKind.OPEN_PULL_REQUEST, CommandKind.UPDATE_PULL_REQUEST_BODY}
+        captured_run = self._publication_command_run(db, command) if publication else None
+        if binding is None:
+            if publication:
+                branch = command.payload.get("branch")
+                issue = issue_from_branch(branch) if isinstance(branch, str) else None
+                activated = db.execute(
+                    "SELECT 1 FROM workflows JOIN workflow_authority_epochs USING(repository) "
+                    "WHERE repository=? AND target_kind='issue' AND target_number=? AND family='resolve'",
+                    (command.repository, issue),
+                ).fetchone()
+                if activated is not None:
+                    if captured_run is None or captured_run["kind"] in _RESOLVE_PAID_KINDS:
+                        raise ControlStoreError("activated resolve publication requires captured workflow authority")
+            if command.target.startswith("issue:") and db.execute(
+                "SELECT 1 FROM workflows JOIN workflow_authority_epochs USING(repository) "
+                "WHERE repository=? AND target_kind='issue' AND target_number=? AND family='resolve'",
+                (command.repository, command.target.partition(":")[2]),
+            ).fetchone() is not None:
+                if deployment_role(command.repository, command.executor_identity) == "fix":
+                    raise ControlStoreError("activated issue command requires captured workflow authority")
+            return
+        self._assert_owner_active(db, command.executor_identity)
+        try:
+            if deployment_role(command.repository, command.executor_identity) != "fix":
+                raise WorkflowAuthorityError("resolve commands require the repository's fix owner")
+            require_workflow_binding(db, binding, allow_gated=True)
+            if command.target.startswith("issue:") and command.target != f"issue:{binding.fence.key.target.number}":
+                raise WorkflowAuthorityError("issue command target disagrees with its workflow")
+            if publication and captured_run is None:
+                raise WorkflowAuthorityError("publication command lacks its captured run authority")
+        except (ValueError, TypeError) as exc:
+            raise ControlStoreError(str(exc)) from exc
+
+    @staticmethod
+    def _publication_command_run(db: sqlite3.Connection, command: LifecycleCommand) -> sqlite3.Row | None:
+        run_id = command.payload.get("run_id")
+        if run_id is None:
+            return None
+        if not isinstance(run_id, str) or not run_id:
+            raise ControlStoreError("publication run identity is malformed")
+        row = db.execute(
+            "SELECT kind, owner_id, dispatch_id, workflow_binding_json FROM runs WHERE run_id=?", (run_id,),
+        ).fetchone()
+        if row is None or row["owner_id"] != command.executor_identity or row["workflow_binding_json"] != _encoded_command_binding(command):
+            raise ControlStoreError("publication command lacks its captured run authority")
+        try:
+            dispatch = json.loads(row["dispatch_id"])
+        except (ValueError, TypeError) as exc:
+            raise ControlStoreError("publication run metadata is malformed") from exc
+        if not isinstance(dispatch, dict) or dispatch.get("repository") != command.repository or dispatch.get("role") != "fix" or dispatch.get("publication_branch") != command.payload.get("branch") or dispatch.get("cwd") != command.payload.get("cwd"):
+            raise ControlStoreError("publication command disagrees with captured branch authority")
+        issue = dispatch.get("issue")
+        if issue is not None and (type(issue) is not int or issue <= 0 or issue_from_branch(str(command.payload.get("branch", ""))) != issue):
+            raise ControlStoreError("publication branch disagrees with its captured issue")
+        return row
 
     def enqueue_command_occurrence(
         self, command: LifecycleCommand
@@ -3829,10 +4037,11 @@ class SQLiteControlStore:
         """
 
         payload = _json(command.payload)
-        payload_digest = hashlib.sha256(payload.encode()).hexdigest()
+        payload_digest = _command_payload_digest(command, payload)
         now = _stamp(self._now())
         with self.transaction() as db:
             self._assert_owner_active(db, command.executor_identity)
+            self._validate_workflow_command(db, command)
             existing = db.execute(
                 "SELECT logical_key FROM lifecycle_commands WHERE command_id=?",
                 (str(command.command_id),),
@@ -3847,6 +4056,12 @@ class SQLiteControlStore:
                 "ORDER BY occurrence DESC LIMIT 1",
                 (logical_key,),
             ).fetchone()
+            if latest is not None and (command.workflow is not None or latest["workflow_binding_json"] is not None):
+                self._validate_workflow_reexecution(latest)
+                if db.execute(
+                    "SELECT 1 FROM workflow_rearm_commands WHERE command_id=?", (latest["command_id"],),
+                ).fetchone() is not None:
+                    raise ControlStoreError("rearm obligations cannot acquire new command occurrences; use authorized retry or continuation")
             if latest is not None and latest["state"] in {
                 "pending",
                 "executing",
@@ -3860,6 +4075,7 @@ class SQLiteControlStore:
                     or latest["repository"] != command.repository
                     or latest["executor_identity"] != command.executor_identity
                     or latest["payload_digest"] != payload_digest
+                    or latest["workflow_binding_json"] != _encoded_command_binding(command)
                 ):
                     raise ControlStoreError(
                         f"logical command {logical_key!r} has a conflicting "
@@ -3888,13 +4104,14 @@ class SQLiteControlStore:
                 command.config_version,
                 command.repository,
                 command.executor_identity,
+                command.workflow,
             )
             db.execute(
                 "INSERT INTO lifecycle_commands(command_id, idempotency_key, "
                 "logical_key, occurrence, kind, target, expected_revision, "
                 "config_version, repository, executor_identity, payload_json, "
-                "payload_digest, state, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                "payload_digest, state, created_at, updated_at, workflow_binding_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
                 (
                     str(command_id),
                     occurrence_key,
@@ -3910,6 +4127,7 @@ class SQLiteControlStore:
                     payload_digest,
                     now,
                     now,
+                    _encoded_command_binding(command),
                 ),
             )
             self._transition(
@@ -4004,23 +4222,23 @@ class SQLiteControlStore:
     def begin_command(self, command_id: CommandId) -> None:
         with self.transaction() as db:
             row = db.execute(
-                "SELECT state FROM lifecycle_commands WHERE command_id=?",
+                "SELECT * FROM lifecycle_commands WHERE command_id=?",
                 (str(command_id),),
             ).fetchone()
             if row is None:
                 raise KeyError(str(command_id))
+            command = _command_from_row(row)
+            self._validate_workflow_command(db, command)
+            self._validate_workflow_reexecution(row)
             if row["state"] not in {"pending", "retryable_failure"}:
                 raise ControlStoreError(
                     f"command {command_id} cannot execute from {row['state']}"
                 )
             if row["state"] == "retryable_failure":
-                db.execute(
-                    "DELETE FROM effect_receipts WHERE command_id=?",
-                    (str(command_id),),
-                )
+                self._replace_effect_receipt(db, command)
             db.execute(
                 "UPDATE lifecycle_commands SET state='executing', attempts=attempts+1, "
-                "updated_at=? WHERE command_id=?",
+                "updated_at=?, attempt_owner=executor_identity WHERE command_id=?",
                 (_stamp(self._now()), str(command_id)),
             )
             self._transition(
@@ -4035,19 +4253,19 @@ class SQLiteControlStore:
 
         with self.transaction() as db:
             row = db.execute(
-                "SELECT state FROM lifecycle_commands WHERE command_id=?",
+                "SELECT * FROM lifecycle_commands WHERE command_id=?",
                 (str(command_id),),
             ).fetchone()
             if row is None:
                 raise KeyError(str(command_id))
+            command = _command_from_row(row)
+            self._validate_workflow_command(db, command)
+            self._validate_workflow_reexecution(row)
             if row["state"] not in {"executing", "unknown_outcome"}:
                 raise ControlStoreError(
                     f"command {command_id} cannot be reconciled from {row['state']}"
                 )
-            db.execute(
-                "DELETE FROM effect_receipts WHERE command_id=?",
-                (str(command_id),),
-            )
+            self._replace_effect_receipt(db, command)
             db.execute(
                 "UPDATE lifecycle_commands SET state='retryable_failure', "
                 "updated_at=? WHERE command_id=?",
@@ -4060,6 +4278,35 @@ class SQLiteControlStore:
                 "retryable_failure",
                 {"reason": "authoritative verification found no effect"},
             )
+
+    @staticmethod
+    def _validate_workflow_reexecution(row: sqlite3.Row) -> None:
+        raw = row["workflow_reconciliation_json"]
+        if raw is not None:
+            try:
+                decode_workflow(raw, ActiveReconciliation)
+            except ValueError as exc:
+                raise ControlStoreError("workflow command is reconciliation-only or retired; execution is not authorized") from exc
+
+    @staticmethod
+    def _archive_workflow_receipt(db: sqlite3.Connection, command: LifecycleCommand) -> None:
+        if command.workflow is None:
+            return
+        receipt = db.execute("SELECT * FROM effect_receipts WHERE command_id=?", (str(command.command_id),)).fetchone()
+        if receipt is None:
+            return
+        payload = _json(dict(receipt))
+        evidence_id = hashlib.sha256(f"prior-receipt:{command.command_id}:{payload}".encode()).hexdigest()
+        db.execute(
+            "INSERT OR IGNORE INTO workflow_evidence(evidence_id, repository, target_kind, target_number, command_id, kind, payload_json) "
+            "VALUES (?, ?, 'issue', ?, ?, 'prior_receipt', ?)",
+            (evidence_id, command.repository, command.workflow.fence.key.target.number, str(command.command_id), payload),
+        )
+
+    def _replace_effect_receipt(self, db: sqlite3.Connection, command: LifecycleCommand) -> None:
+        """All receipt replacement paths retain migrated authority evidence."""
+        self._archive_workflow_receipt(db, command)
+        db.execute("DELETE FROM effect_receipts WHERE command_id=?", (str(command.command_id),))
 
     def resolve_unknown_effect(self, receipt: EffectReceipt) -> bool:
         """Replace an ambiguous receipt after authoritative remote verification.
@@ -4105,7 +4352,7 @@ class SQLiteControlStore:
             raise ValueError("unknown effect can only resolve to succeeded here")
         with self.transaction() as db:
             row = db.execute(
-                "SELECT state FROM lifecycle_commands WHERE command_id=?",
+                "SELECT * FROM lifecycle_commands WHERE command_id=?",
                 (str(receipt.command_id),),
             ).fetchone()
             if row is None:
@@ -4137,10 +4384,13 @@ class SQLiteControlStore:
                 return False
             if state not in {"executing", EffectStatus.UNKNOWN_OUTCOME.value}:
                 raise ControlStoreError("command is not awaiting reconciliation")
-            db.execute(
-                "DELETE FROM effect_receipts WHERE command_id=?",
-                (str(receipt.command_id),),
-            )
+            command = _command_from_row(row)
+            if command.workflow is not None:
+                self._assert_owner_active(db, command.executor_identity)
+                if receipt.executor_identity != command.executor_identity:
+                    raise ControlStoreError("workflow reconciliation receipt requires the current command owner")
+                db.execute("UPDATE lifecycle_commands SET attempt_owner=? WHERE command_id=?", (receipt.executor_identity, str(receipt.command_id)))
+            self._replace_effect_receipt(db, command)
             self._insert_effect(db, receipt, _receipt_digest(receipt))
             return True
 
@@ -4172,17 +4422,20 @@ class SQLiteControlStore:
             raise ValueError("an exhausted command must receipt permanent_failure")
         with self.transaction() as db:
             row = db.execute(
-                "SELECT state FROM lifecycle_commands WHERE command_id=?",
+                "SELECT * FROM lifecycle_commands WHERE command_id=?",
                 (str(receipt.command_id),),
             ).fetchone()
             if row is None:
                 raise KeyError(str(receipt.command_id))
             if row["state"] != EffectStatus.RETRYABLE_FAILURE.value:
                 return False
-            db.execute(
-                "DELETE FROM effect_receipts WHERE command_id=?",
-                (str(receipt.command_id),),
-            )
+            command = _command_from_row(row)
+            if command.workflow is not None:
+                self._assert_owner_active(db, command.executor_identity)
+                if receipt.executor_identity != command.executor_identity:
+                    raise ControlStoreError("workflow exhaustion receipt requires the current command owner")
+                db.execute("UPDATE lifecycle_commands SET attempt_owner=? WHERE command_id=?", (receipt.executor_identity, str(receipt.command_id)))
+            self._replace_effect_receipt(db, command)
             self._insert_effect(db, receipt, _receipt_digest(receipt))
             return True
 
@@ -4201,6 +4454,16 @@ class SQLiteControlStore:
     def _insert_effect(
         self, db: sqlite3.Connection, receipt: EffectReceipt, digest: str
     ) -> None:
+        command_row = db.execute(
+            "SELECT * FROM lifecycle_commands WHERE command_id=?", (str(receipt.command_id),),
+        ).fetchone()
+        if command_row is None:
+            raise ControlStoreError(f"receipt {receipt.command_id} has no lifecycle command")
+        command = _command_from_row(command_row)
+        # Retiring/adopting a deployment changes the command executor, not the
+        # identity that actually began this attempt and may receipt its result.
+        if command.workflow is not None and (not command_row["attempt_owner"] or receipt.executor_identity != command_row["attempt_owner"]):
+            raise ControlStoreError("workflow effect receipt does not match the captured attempt owner")
         db.execute(
             "INSERT INTO effect_receipts(command_id, executor_identity, "
             "started_at, completed_at, status, remote_object_id, "
@@ -4240,15 +4503,6 @@ class SQLiteControlStore:
                 str(receipt.command_id),
             ),
         )
-        command_row = db.execute(
-            "SELECT * FROM lifecycle_commands WHERE command_id=?",
-            (str(receipt.command_id),),
-        ).fetchone()
-        if command_row is None:
-            raise ControlStoreError(
-                f"receipt {receipt.command_id} has no lifecycle command"
-            )
-        command = _command_from_row(command_row)
         if receipt.status is EffectStatus.SUCCEEDED:
             self._event(
                 db,
@@ -4693,7 +4947,21 @@ def _command_from_row(row: sqlite3.Row) -> LifecycleCommand:
         row["config_version"],
         row["repository"],
         row["executor_identity"],
+        decode_workflow(row["workflow_binding_json"], WorkflowBinding) if row["workflow_binding_json"] is not None else None,
     )
+
+
+def _encoded_command_binding(command: LifecycleCommand) -> str | None:
+    return encode_workflow(command.workflow) if command.workflow is not None else None
+
+
+def _command_payload_digest(command: LifecycleCommand, payload: str) -> str:
+    return _encoded_payload_digest(payload, _encoded_command_binding(command))
+
+
+def _encoded_payload_digest(payload: str, binding: str | None) -> str:
+    identity = payload if binding is None else payload + "\n" + binding
+    return hashlib.sha256(identity.encode()).hexdigest()
 
 
 def _command_correlation(command: LifecycleCommand) -> Correlation:

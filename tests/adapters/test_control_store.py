@@ -64,6 +64,7 @@ from issue_agent.domain.projection import fold
 
 
 NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
+EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 20))
 
 
 def _store(tmp_path: Path) -> SQLiteControlStore:
@@ -114,18 +115,56 @@ def _initialize_in_process(path: str, start, results) -> None:
         results.put("ok")
 
 
-def _drop_v18(db: sqlite3.Connection) -> None:
-    db.execute("ALTER TABLE lifecycle_commands DROP COLUMN refusals")
-    db.execute("DELETE FROM schema_migrations WHERE version=18")
-
-
-def _drop_v17(db: sqlite3.Connection) -> None:
-    _drop_v18(db)
-    db.execute(
-        "ALTER TABLE budget_reservations "
-        "DROP COLUMN workload_repository"
-    )
-    db.execute("DELETE FROM schema_migrations WHERE version=17")
+def _historical_fixture(db: sqlite3.Connection, version: int) -> None:
+    # This constructs test fixtures, not a production downgrade: migrations
+    # which rewrite rows need their historical inputs seeded by the caller.
+    removals = {
+        19: (
+            "DROP TABLE workflow_retry_authorizations",
+            "DROP TABLE workflow_evidence",
+            "DROP TABLE workflow_rearm_commands",
+            "DROP TABLE workflow_rearms",
+            "DROP TABLE workflow_gates",
+            "DROP TABLE workflows",
+            "DROP TABLE workflow_authority_epochs",
+            "ALTER TABLE runs DROP COLUMN workflow_binding_json",
+            "ALTER TABLE lifecycle_commands DROP COLUMN workflow_binding_json",
+            "ALTER TABLE lifecycle_commands DROP COLUMN workflow_reconciliation_json",
+            "ALTER TABLE lifecycle_commands DROP COLUMN attempt_owner",
+        ),
+        18: ("ALTER TABLE lifecycle_commands DROP COLUMN refusals",),
+        17: ("ALTER TABLE budget_reservations DROP COLUMN workload_repository",),
+        16: ("DROP TABLE reservation_recovery",),
+        15: ("DROP TABLE retired_owners",),
+        14: ("DROP TABLE dispatch_claim_runs",),
+        13: (),
+        12: (
+            "CREATE UNIQUE INDEX runs_active_dispatch_unique ON runs(dispatch_id) "
+            "WHERE state IN ('reserved', 'starting', 'running')",
+        ),
+        11: ("DROP INDEX runs_active_dispatch_unique", "DROP TABLE dispatch_claims"),
+        10: ("DROP TABLE run_cancellation_intents",),
+    }
+    assert version in {8, 9, 12, 15}
+    history = tuple(row[0] for row in db.execute(
+        "SELECT version FROM schema_migrations ORDER BY version"
+    ))
+    assert history == EXPECTED_SCHEMA_VERSIONS
+    assert set(removals) == set(EXPECTED_SCHEMA_VERSIONS[1:])
+    for applied in reversed(history):
+        if applied <= max(version, 9):
+            break
+        for statement in removals[applied]:
+            db.execute(statement)
+        db.execute("DELETE FROM schema_migrations WHERE version=?", (applied,))
+    if version == 8:
+        db.execute("DROP TABLE level_state")
+        db.execute("DELETE FROM schema_migrations")
+        db.execute(
+            "INSERT INTO schema_migrations(version, applied_at, source_digest) "
+            "VALUES (8, ?, ?)",
+            (NOW.isoformat(), LEGACY_V8_SCHEMA_DIGEST),
+        )
 
 
 def test_control_store_initializes_with_restrictive_permissions_and_integrity(tmp_path):
@@ -140,18 +179,7 @@ def test_control_store_initializes_with_restrictive_permissions_and_integrity(tm
             "SELECT version, length(source_digest) FROM schema_migrations "
             "ORDER BY version"
         ).fetchall()
-    assert history == [
-        (9, 64),
-        (10, 64),
-        (11, 64),
-        (12, 64),
-        (13, 64),
-        (14, 64),
-        (15, 64),
-        (16, 64),
-        (17, 64),
-        (18, 64),
-    ]
+    assert history == [(version, 64) for version in EXPECTED_SCHEMA_VERSIONS]
 
 
 def test_established_control_store_disappearance_is_not_fresh_initialized(
@@ -196,14 +224,7 @@ def test_repository_alias_migration_unifies_authoritative_rows(tmp_path):
     )
     store.enqueue_command(command)
     with store._connect() as db:
-        _drop_v17(db)
-        db.execute("DROP TABLE reservation_recovery")
-        db.execute("DELETE FROM schema_migrations WHERE version=16")
-        db.execute("DROP TABLE retired_owners")
-        db.execute("DELETE FROM schema_migrations WHERE version=15")
-        db.execute("DROP TABLE dispatch_claim_runs")
-        db.execute("DELETE FROM schema_migrations WHERE version=14")
-        db.execute("DELETE FROM schema_migrations WHERE version=13")
+        _historical_fixture(db, 12)
         db.execute(
             "UPDATE lifecycle_commands SET repository='O/R'"
         )
@@ -239,14 +260,7 @@ def test_repository_alias_claim_collision_fails_as_permanent_schema_error(
 ):
     store = _store(tmp_path)
     with store._connect() as db:
-        _drop_v17(db)
-        db.execute("DROP TABLE reservation_recovery")
-        db.execute("DELETE FROM schema_migrations WHERE version=16")
-        db.execute("DROP TABLE retired_owners")
-        db.execute("DELETE FROM schema_migrations WHERE version=15")
-        db.execute("DROP TABLE dispatch_claim_runs")
-        db.execute("DELETE FROM schema_migrations WHERE version=14")
-        db.execute("DELETE FROM schema_migrations WHERE version=13")
+        _historical_fixture(db, 12)
         claim = (
             "fix",
             "issue:7",
@@ -330,19 +344,7 @@ def test_shipped_v8_database_upgrades_without_rewriting_history_or_data(
     request = _request(1)
     assert store.reserve(request).admitted
     with sqlite3.connect(store.path) as db:
-        _drop_v17(db)
-        db.execute("DROP TABLE reservation_recovery")
-        db.execute("DROP TABLE retired_owners")
-        db.execute("DROP TABLE dispatch_claim_runs")
-        db.execute("DROP TABLE run_cancellation_intents")
-        db.execute("DROP TABLE level_state")
-        db.execute("DROP TABLE dispatch_claims")
-        db.execute("DELETE FROM schema_migrations")
-        db.execute(
-            "INSERT INTO schema_migrations("
-            "version, applied_at, source_digest) VALUES (8, ?, ?)",
-            (NOW.isoformat(), LEGACY_V8_SCHEMA_DIGEST),
-        )
+        _historical_fixture(db, 8)
         db.commit()
 
     SQLiteControlStore(store.path).initialize()
@@ -356,27 +358,22 @@ def test_shipped_v8_database_upgrades_without_rewriting_history_or_data(
             "SELECT state FROM budget_reservations WHERE run_id=?",
             (str(request.run_id),),
         ).fetchone()
+        workflow_binding = db.execute(
+            "SELECT workflow_binding_json FROM runs WHERE run_id=?",
+            (str(request.run_id),),
+        ).fetchone()
+        workflow_count = db.execute("SELECT COUNT(*) FROM workflows").fetchone()[0]
         level_state = db.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name='level_state'"
         ).fetchone()
-    assert [version for version, _digest in history] == [
-        8,
-        9,
-        10,
-        11,
-        12,
-        13,
-        14,
-        15,
-        16,
-        17,
-        18,
-    ]
+    assert tuple(version for version, _digest in history) == (8, *EXPECTED_SCHEMA_VERSIONS)
     assert history[0][1] == (
         "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
     )
     assert reserved == ("active",)
+    assert workflow_binding == (None,)
+    assert workflow_count == 0
     assert level_state == ("level_state",)
 
 
@@ -422,9 +419,7 @@ def test_v17_recovers_pre_v16_launch_proof(
     )
     assert store.reserve(request, lease=lease).admitted
     with sqlite3.connect(store.path) as db:
-        _drop_v17(db)
-        db.execute("DROP TABLE reservation_recovery")
-        db.execute("DELETE FROM schema_migrations WHERE version=16")
+        _historical_fixture(db, 15)
 
     reopened = SQLiteControlStore(store.path, now=lambda: NOW)
     reopened.initialize()
@@ -450,27 +445,7 @@ def test_concurrent_role_boot_serializes_schema_migrations(
     if starting_version != "fresh":
         SQLiteControlStore(str(path)).initialize()
         with sqlite3.connect(path) as db:
-            _drop_v17(db)
-            db.execute("DROP TABLE reservation_recovery")
-            db.execute("DELETE FROM schema_migrations WHERE version=16")
-            db.execute("DROP TABLE retired_owners")
-            db.execute("DELETE FROM schema_migrations WHERE version=15")
-            db.execute("DROP TABLE dispatch_claim_runs")
-            db.execute("DELETE FROM schema_migrations WHERE version=14")
-            db.execute("DELETE FROM schema_migrations WHERE version=13")
-            db.execute("DELETE FROM schema_migrations WHERE version=12")
-            db.execute("DROP TABLE dispatch_claims")
-            db.execute("DELETE FROM schema_migrations WHERE version=11")
-            db.execute("DROP TABLE run_cancellation_intents")
-            db.execute("DELETE FROM schema_migrations WHERE version=10")
-            if starting_version == "v8":
-                db.execute("DROP TABLE level_state")
-                db.execute("DELETE FROM schema_migrations")
-                db.execute(
-                    "INSERT INTO schema_migrations("
-                    "version, applied_at, source_digest) VALUES (8, ?, ?)",
-                    (NOW.isoformat(), LEGACY_V8_SCHEMA_DIGEST),
-                )
+            _historical_fixture(db, int(starting_version[1:]))
             db.commit()
     context = multiprocessing.get_context("spawn")
     start = context.Event()
@@ -498,9 +473,9 @@ def test_concurrent_role_boot_serializes_schema_migrations(
                 "SELECT version FROM schema_migrations ORDER BY version"
             )
         ) == (
-            (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18)
+            (8, *EXPECTED_SCHEMA_VERSIONS)
             if starting_version == "v8"
-            else (9, 10, 11, 12, 13, 14, 15, 16, 17, 18)
+            else EXPECTED_SCHEMA_VERSIONS
         )
 
 
@@ -1018,7 +993,7 @@ def test_publication_authority_requires_active_reservation_and_live_lease(
     assert authority.pgid == pgid
 
 
-@pytest.mark.parametrize("version", (9, 10, 11, 12, 13, 14, 15, 16, 17, 18))
+@pytest.mark.parametrize("version", EXPECTED_SCHEMA_VERSIONS)
 @pytest.mark.parametrize("stage", ("before_commit", "committed"))
 def test_schema_migration_restart_is_atomic_at_every_boundary(
     tmp_path,
@@ -1058,8 +1033,20 @@ def test_schema_migration_restart_is_atomic_at_every_boundary(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name='run_cancellation_intents'"
         ).fetchone()
-    assert versions == (9, 10, 11, 12, 13, 14, 15, 16, 17, 18)
+        tables = {row[0] for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+        run_columns = {row[1] for row in db.execute("PRAGMA table_info(runs)")}
+        command_columns = {row[1] for row in db.execute("PRAGMA table_info(lifecycle_commands)")}
+    assert versions == EXPECTED_SCHEMA_VERSIONS
     assert cancellation_table == ("run_cancellation_intents",)
+    assert {
+        "workflow_authority_epochs", "workflows", "workflow_gates",
+        "workflow_rearms", "workflow_rearm_commands", "workflow_evidence",
+        "workflow_retry_authorizations",
+    } <= tables
+    assert "workflow_binding_json" in run_columns
+    assert {"workflow_binding_json", "workflow_reconciliation_json", "attempt_owner"} <= command_columns
 
 
 def test_schema_migration_digest_and_contiguity_are_validated(tmp_path):

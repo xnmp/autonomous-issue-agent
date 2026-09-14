@@ -96,6 +96,7 @@ from .actions import (  # noqa: F401
     Target,
 )
 from .labels import Label
+from .contracts import WorkflowAttemptIdentity
 
 
 _DECLARED_STATUS_KEYS = ("status", "decision")
@@ -408,6 +409,8 @@ class AgentResult:
     # a future cap re-evaluation. Last for positional compatibility with the
     # established result envelope.
     admission_budget_block: AdmissionBudgetBlock | None = None
+    # Minted by accounting from captured admission context, never model output.
+    workflow_attempt: WorkflowAttemptIdentity | None = None
 
     def field(self, name: str, default: str = "") -> str:
         if isinstance(self.structured, dict):

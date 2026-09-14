@@ -17,7 +17,15 @@ from issue_agent.adapters.control_store import Lease, SQLiteControlStore
 from issue_agent.adapters.event_log import EventLog
 from issue_agent.adapters.journal import JournalingRuntime
 from issue_agent.adapters.runtime_plan import RuntimePlan
-from issue_agent.domain.contracts import Money, RunId
+from issue_agent.domain.contracts import Money, RunId, WorkflowAttemptIdentity
+from issue_agent.domain.workflow_identity import (
+    FamilyAuthority,
+    IssueRef,
+    WorkflowBinding,
+    WorkflowFamily,
+    WorkflowFence,
+    WorkflowKey,
+)
 from issue_agent.domain.events import (
     Producer,
     ReservationRetained,
@@ -32,6 +40,7 @@ from issue_agent.domain.pricing import (
     UnknownModelPolicy,
 )
 from tests.fakes.legacy_journal import Journal
+from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
 
 
 def _policy(maximum=2_000_000):
@@ -130,6 +139,98 @@ def test_paid_run_has_reservation_before_runtime_and_settles(tmp_path) -> None:
     blocked = asyncio.run(wrapper.run(RuntimePlan("more", max_budget_usd=4)))
     assert blocked.exit_reason is ExitReason.BUDGET_EXHAUSTED
     assert runtime.calls == 1
+
+
+def test_provider_cannot_mint_workflow_result_authority(tmp_path) -> None:
+    forged = WorkflowAttemptIdentity(
+        WorkflowBinding(
+            WorkflowFence(WorkflowKey("o/r", IssueRef(1)), 99),
+            FamilyAuthority(WorkflowFamily.RESOLVE, 1),
+            "provider-episode",
+        ),
+        RunId("provider-run"),
+        "provider-leg",
+    )
+    wrapper, _store = _wrapper(
+        tmp_path,
+        Runtime(AgentResult(False, status="ok", cost_usd=1, workflow_attempt=forged)),
+    )
+
+    result = asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
+
+    assert result.status == "ok"
+    assert result.workflow_attempt is None
+
+
+def test_captured_binding_is_persisted_and_mints_actual_attempt_identity(tmp_path) -> None:
+    state = resolve_snapshot()
+    forged = WorkflowAttemptIdentity(state.binding, RunId("provider-run"), "provider-leg")
+    wrapper, store = _wrapper(
+        tmp_path, Runtime(AgentResult(False, status="ok", cost_usd=1, workflow_attempt=forged)),
+    )
+    install_workflow(store, state)
+    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=state.binding)
+    wrapper.set_run_identity("harness-run", "harness-leg")
+
+    result = asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
+
+    assert result.status == "ok"
+    assert result.workflow_attempt == WorkflowAttemptIdentity(state.binding, RunId("harness-run"), "harness-leg")
+    from issue_agent.adapters.workflow_codec import decode_workflow
+    with store._connect() as db:
+        raw = db.execute("SELECT workflow_binding_json FROM runs WHERE run_id='harness-run'").fetchone()[0]
+    assert decode_workflow(raw, WorkflowBinding) == state.binding
+
+
+@pytest.mark.parametrize("invalid", ["missing", "generation", "episode", "epoch", "target"])
+def test_activated_resolve_rejects_missing_or_stale_authority_before_provider(tmp_path, invalid):
+    state = resolve_snapshot()
+    runtime = Runtime(AgentResult(False, status="ok", cost_usd=1))
+    wrapper, store = _wrapper(tmp_path, runtime)
+    install_workflow(store, state)
+    binding = state.binding
+    if invalid == "missing":
+        binding = None
+    elif invalid == "generation":
+        binding = dataclasses.replace(binding, fence=dataclasses.replace(binding.fence, generation=1))
+    elif invalid == "episode":
+        binding = dataclasses.replace(binding, episode_id="obsolete")
+    elif invalid == "epoch":
+        binding = dataclasses.replace(binding, authority=dataclasses.replace(binding.authority, epoch=2))
+    else:
+        binding = resolve_snapshot(999).binding
+    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=binding)
+
+    result = asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
+
+    assert result.is_error
+    assert runtime.calls == 0
+    assert store.active_reservation_runs() == ()
+
+
+@pytest.mark.parametrize("kind", ["ROUTE", "AUTHOR", "IMPLEMENT"])
+def test_workflow_binding_survives_nested_leg_context_and_exception(tmp_path, kind) -> None:
+    wrapper, _store = _wrapper(tmp_path, Runtime(AgentResult(False)))
+    journaled = JournalingRuntime(
+        wrapper, Journal(str(tmp_path / "events.jsonl")), repo="o/r", role="fix"
+    )
+    binding = WorkflowBinding(
+        WorkflowFence(WorkflowKey("o/r", IssueRef(1)), 2),
+        FamilyAuthority(WorkflowFamily.RESOLVE, 1),
+        "captured-episode",
+    )
+    journaled.set_context("fix", "RESOLVE", 1, 1, workflow=binding)
+
+    with pytest.raises(RuntimeError, match="leg failed"):
+        with journaled.leg_kind(kind):
+            assert wrapper.workflow_binding == binding
+            assert journaled.workflow_binding == binding
+            raise RuntimeError("leg failed")
+
+    assert journaled.workflow_binding == wrapper.workflow_binding == binding
+    journaled.set_context("fix", "RESOLVE", 2, 2)
+    assert journaled.workflow_binding is None
+    assert wrapper.workflow_binding is None
 
 
 def test_unpinned_codex_run_without_reported_model_uses_reserved_fallback(

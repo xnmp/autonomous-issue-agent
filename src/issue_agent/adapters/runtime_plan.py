@@ -17,6 +17,7 @@ from typing import Protocol, runtime_checkable
 from ..domain.agent_task import RunIntent, RuntimeName
 from ..domain.effort import Effort
 from ..domain.outcome import AgentResult
+from ..domain.workflow_identity import WorkflowBinding
 
 
 @dataclass(frozen=True)
@@ -147,6 +148,9 @@ class AgentRuntime(Protocol):
 
 @runtime_checkable
 class ContextualRuntime(AgentRuntime, Protocol):
+    @property
+    def workflow_binding(self) -> WorkflowBinding | None: ...
+
     def set_context(
         self,
         role: str,
@@ -154,6 +158,8 @@ class ContextualRuntime(AgentRuntime, Protocol):
         number: int,
         issue: int | None,
         claim_target: int | None = None,
+        *,
+        workflow: WorkflowBinding | None = None,
     ) -> None: ...
 
 

@@ -1,9 +1,12 @@
 import base64
 import json
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -13,11 +16,19 @@ from issue_agent.adapters.agent_publish import (
     CommandResult,
 )
 from issue_agent.adapters.control_store import (
+    ControlStoreError,
+    Lease,
+    ReservationRequest,
     RetiredOwnerError,
     SQLiteControlStore,
 )
 from issue_agent.adapters.event_log import EventLog
-from issue_agent.domain.contracts import CommandKind
+from issue_agent.domain.contracts import (
+    BudgetScope, CommandKind, Money, PriceQuote, ReservationId, RunId,
+)
+from issue_agent.adapters.workflow_codec import decode_workflow
+from issue_agent.domain.workflow_identity import WorkflowBinding
+from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
 from issue_agent.domain.events import (
     ControlTransitionCommitted,
     Producer,
@@ -143,6 +154,205 @@ def broker(tmp_path: Path, remote: Remote) -> AgentPublicationBroker:
         owner="o/r:fix",
         run=remote.run,
     )
+
+
+def _publication_run(control, cwd, *, workflow=None, kind="RESOLVE", issue=42,
+                     name="publication-run", owner="o/r:fix"):
+    now = datetime(2026, 9, 14, tzinfo=timezone.utc)
+    request = ReservationRequest(
+        ReservationId(f"reservation:{name}"), RunId(name),
+        json.dumps({"repository": "o/r", "role": "fix", "kind": kind,
+                    "number": issue, "issue": issue, "cwd": str(cwd),
+                    "publication_branch": f"fix/{issue}-issue"}),
+        BudgetScope("o/r", "daily", "USD", "2026-09-14", now,
+                    now + timedelta(days=1), ZoneInfo("UTC")),
+        PriceQuote("test", "test-card", "1", now, Money("USD", 1)),
+        Money("USD", 100), "test-config", "o/r", kind=kind,
+        owner_id=owner, workflow=workflow,
+    )
+    lease = Lease(request.run_id, request.dispatch_id, owner, 123, 123, now, 456)
+    assert control.reserve(request, lease=lease).admitted
+    return request.run_id
+
+
+def _supervised_broker(control, remote, cwd, run_id, *, issue=42, owner="o/r:fix"):
+    return AgentPublicationBroker(
+        control, repository="o/r", base_branch="dev", owner=owner,
+        run=lambda argv, path: remote.run((Path(argv[0]).name, *argv[1:]), path),
+        authorized_cwd=str(cwd), git_binary="/usr/bin/git", gh_binary="/usr/bin/gh",
+        trusted_path="/usr/bin",
+        authorized_branch=f"fix/{issue}-issue", expected_issue=issue, run_id=run_id,
+    )
+
+
+@pytest.mark.parametrize("operation", ["push", "create", "edit"])
+def test_supervised_publication_persists_its_captured_run_and_workflow(tmp_path, operation):
+    control = store(tmp_path)
+    snapshot = resolve_snapshot(42)
+    install_workflow(control, snapshot)
+    run_id = _publication_run(control, tmp_path, workflow=snapshot.binding)
+    remote = Remote()
+    publisher = _supervised_broker(control, remote, tmp_path, run_id)
+
+    assert publisher.publish(("git", "push", "origin", "HEAD:fix/42-issue"), str(tmp_path)).code == 0
+    if operation in {"create", "edit"}:
+        assert publisher.publish(("gh", "pr", "create", "--title", "Fix #42", "--body", remote.pr_body), str(tmp_path)).code == 0
+    if operation == "edit":
+        assert publisher.publish(("gh", "pr", "edit", "42", "--body", remote.pr_body + "\nUpdated evidence."), str(tmp_path)).code == 0
+
+    assert remote.remote == remote.head
+    with control._connect() as db:
+        rows = db.execute("SELECT payload_json, workflow_binding_json, state FROM lifecycle_commands").fetchall()
+    assert len(rows) == {"push": 1, "create": 2, "edit": 3}[operation]
+    assert all(json.loads(row["payload_json"])["run_id"] == str(run_id) for row in rows)
+    assert all(decode_workflow(row["workflow_binding_json"], WorkflowBinding) == snapshot.binding for row in rows)
+    assert all(row["state"] == "succeeded" for row in rows)
+    if operation in {"create", "edit"}:
+        assert remote.pr_state == "OPEN" and remote.pr_head == remote.head
+    if operation == "edit":
+        assert "Updated evidence." in remote.pr_body
+
+
+def test_queued_publication_cannot_write_after_its_generation_changes(tmp_path):
+    control = store(tmp_path)
+    snapshot = resolve_snapshot(42)
+    install_workflow(control, snapshot)
+    run_id = _publication_run(control, tmp_path, workflow=snapshot.binding)
+    remote = Remote()
+    publisher = _supervised_broker(control, remote, tmp_path, run_id)
+    command = publisher._command(("git", "push", "origin", "HEAD:fix/42-issue"), str(tmp_path))
+    control.enqueue_command(command)
+    with control.transaction() as db:
+        db.execute("UPDATE workflows SET generation=generation+1 WHERE target_number=42")
+
+    restarted = broker(tmp_path, remote)
+    assert restarted.drain_pending_commands() == 0
+
+    assert remote.effects == []
+    assert remote.remote == ""
+    assert control.effect_receipt(command.command_id) is None
+
+
+@pytest.mark.parametrize("change", ["unknown-run", "owner", "issue", "branch", "cwd"])
+def test_broker_rejects_context_borrowed_from_another_supervised_run(tmp_path, change):
+    control = store(tmp_path)
+    snapshot = resolve_snapshot(42)
+    install_workflow(control, snapshot)
+    run_id = _publication_run(control, tmp_path, workflow=snapshot.binding)
+    remote = Remote()
+    context = dict(
+        repository="o/r", base_branch="dev", owner="o/r:fix", run=remote.run,
+        run_id=run_id, expected_issue=42, authorized_branch="fix/42-issue",
+        authorized_cwd=str(tmp_path), git_binary="/usr/bin/git",
+        gh_binary="/usr/bin/gh", trusted_path="/usr/bin",
+    )
+    key, value = {
+        "unknown-run": ("run_id", RunId("missing")),
+        "owner": ("owner", "o/r:fix:other"),
+        "issue": ("expected_issue", 99),
+        "branch": ("authorized_branch", "fix/99-issue"),
+        "cwd": ("authorized_cwd", str(tmp_path / "other")),
+    }[change]
+    context[key] = value
+
+    with pytest.raises(ValueError, match="context disagrees"):
+        AgentPublicationBroker(control, **context)
+
+    assert remote.effects == []
+    assert control.pending_commands() == ()
+
+
+def test_queued_legacy_resolve_cannot_write_after_workflow_activation(tmp_path):
+    control = store(tmp_path)
+    run_id = _publication_run(control, tmp_path)
+    remote = Remote()
+    publisher = _supervised_broker(control, remote, tmp_path, run_id)
+    command = publisher._command(("git", "push", "origin", "HEAD:fix/42-issue"), str(tmp_path))
+    control.enqueue_command(command)
+    install_workflow(control, resolve_snapshot(42))
+
+    assert broker(tmp_path, remote).drain_pending_commands() == 0
+
+    assert remote.effects == []
+    assert control.effect_receipt(command.command_id) is None
+
+
+@pytest.mark.parametrize("change", ["missing-run", "unknown-run", "wrong-owner-run", "wrong-workflow-run", "foreign-branch", "foreign-cwd"])
+def test_bound_publication_cannot_borrow_another_run_or_workspace(tmp_path, change):
+    control = store(tmp_path)
+    snapshot = resolve_snapshot(42)
+    install_workflow(control, snapshot)
+    run_id = _publication_run(control, tmp_path, workflow=snapshot.binding)
+    remote = Remote()
+    publisher = _supervised_broker(control, remote, tmp_path, run_id)
+    command = publisher._command(("git", "push", "origin", "HEAD:fix/42-issue"), str(tmp_path))
+    payload = dict(command.payload)
+    if change == "missing-run":
+        payload.pop("run_id")
+    elif change == "unknown-run":
+        payload["run_id"] = "missing"
+    elif change == "wrong-owner-run":
+        payload["run_id"] = str(_publication_run(
+            control, tmp_path, workflow=snapshot.binding,
+            name="another-run", owner="o/r:fix:other",
+        ))
+    elif change == "wrong-workflow-run":
+        other = resolve_snapshot(99)
+        install_workflow(control, other)
+        payload["run_id"] = str(_publication_run(
+            control, tmp_path, workflow=other.binding, issue=99, name="another-run",
+        ))
+    elif change == "foreign-branch":
+        payload["branch"] = "fix/99-issue"
+    else:
+        payload["cwd"] = str(tmp_path / "another-worktree")
+
+    with pytest.raises(ControlStoreError, match="publication command"):
+        control.enqueue_command(replace(command, payload=payload))
+
+    assert control.pending_commands() == ()
+    assert remote.effects == []
+
+
+@pytest.mark.parametrize("kind", ["RESOLVE", "FIX_CI"])
+def test_activation_fences_unbound_resolve_but_preserves_pr_repair(tmp_path, kind):
+    control = store(tmp_path)
+    run_id = _publication_run(control, tmp_path, kind=kind)
+    install_workflow(control, resolve_snapshot(42))
+    remote = Remote()
+    publisher = _supervised_broker(control, remote, tmp_path, run_id)
+
+    if kind == "RESOLVE":
+        with pytest.raises(ControlStoreError, match="captured workflow authority"):
+            publisher.publish(("git", "push", "origin", "HEAD:fix/42-issue"), str(tmp_path))
+        assert remote.effects == []
+        assert control.pending_commands() == ()
+    else:
+        assert publisher.publish(("git", "push", "origin", "HEAD:fix/42-issue"), str(tmp_path)).code == 0
+        assert remote.remote == remote.head
+
+
+@pytest.mark.parametrize("change", ["foreign-issue", "foreign-cwd"])
+def test_unbound_repair_run_cannot_authorize_another_issues_publication(tmp_path, change):
+    control = store(tmp_path)
+    run_id = _publication_run(
+        control, tmp_path if change == "foreign-issue" else tmp_path / "other",
+        kind="FIX_CI", issue=99 if change == "foreign-issue" else 42,
+    )
+    install_workflow(control, resolve_snapshot(42))
+    remote = Remote()
+    # A stored command must validate captured authority independently of the
+    # broker's preflight; replay consumes persisted commands after a restart.
+    command = broker(tmp_path, remote)._command(
+        ("git", "push", "origin", "HEAD:fix/42-issue"), str(tmp_path),
+    )
+    command = replace(command, payload={**command.payload, "run_id": str(run_id)})
+
+    with pytest.raises(ControlStoreError, match="publication"):
+        control.enqueue_command(command)
+
+    assert broker(tmp_path, remote).drain_pending_commands() == 0
+    assert remote.effects == []
 
 
 def test_push_is_committed_then_receipted(tmp_path):

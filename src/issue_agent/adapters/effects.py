@@ -30,6 +30,7 @@ from ..domain.lifecycle import (
     completion_eligibility,
 )
 from ..domain.repository import canonical_repository
+from ..domain.workflow_identity import WorkflowBinding
 from ..domain.contracts import (
     CommandId,
     CommandKind,
@@ -47,6 +48,7 @@ from ..domain.ports import EventSink
 from .deployment_authority import DeploymentAuthority, deployment_role
 from .durable_effects import DurableEffectRunner, EffectOutcome
 from .journal import alert
+from .workflow_codec import encode_workflow
 
 _TARGET = {Target.ISSUE: "issue", Target.PR: "pr"}
 
@@ -1156,10 +1158,17 @@ def command_for_action(
     payload_extra: Mapping[str, object] | None = None,
     repository: str,
     executor_identity: str,
+    workflow: WorkflowBinding | None = None,
 ) -> LifecycleCommand:
     repository = canonical_repository(repository)
+    captured = action.workflow if isinstance(action, (Relabel, PostComment, CloseIssue)) else None
+    if captured is not None and workflow is not None and captured != workflow:
+        raise ValueError("command cannot replace an action's captured workflow binding")
+    workflow = captured if captured is not None else workflow
     kind, target = _command_identity(action)
-    payload = {**_jsonable(action), **dict(payload_extra or {})}
+    action_payload = _jsonable(action)
+    action_payload.pop("workflow", None)
+    payload = {**action_payload, **dict(payload_extra or {})}
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     revision = (
         expected_revision
@@ -1170,6 +1179,7 @@ def command_for_action(
         (
             f"{repository}:{executor_identity}:{kind.value}:{target}:"
             f"{revision or ''}:{encoded}"
+            + (f":{encode_workflow(workflow)}" if workflow is not None else "")
         ).encode()
     ).hexdigest()
     return LifecycleCommand(
@@ -1182,6 +1192,7 @@ def command_for_action(
         config_version=config_version,
         repository=repository,
         executor_identity=executor_identity,
+        workflow=workflow,
     )
 
 
@@ -1213,6 +1224,7 @@ def action_from_command(command: LifecycleCommand) -> Action:
             bool(payload.get("harness_signal", False)),
             tuple(Label(str(label)) for label in payload.get("removes", ())),
             _completion_guard_from_payload(payload.get("completion_guard")),
+            workflow=command.workflow,
         )
     if command.kind is CommandKind.POST_COMMENT:
         return PostComment(
@@ -1220,6 +1232,7 @@ def action_from_command(command: LifecycleCommand) -> Action:
             int(payload["number"]),
             str(payload["body"]),
             bool(payload.get("harness_signal", False)),
+            workflow=command.workflow,
         )
     if command.kind is CommandKind.CLOSE_ISSUE:
         operation = LifecycleOperation(payload.get("operation", LifecycleOperation.CLOSE.value))
@@ -1237,6 +1250,7 @@ def action_from_command(command: LifecycleCommand) -> Action:
             remove_labels=tuple(Label(label) for label in payload.get("remove_labels", ())),
             add_labels=tuple(Label(label) for label in payload.get("add_labels", ())),
             operation=operation,
+            workflow=command.workflow,
         )
     if command.kind is CommandKind.ENABLE_AUTO_MERGE:
         return EnableAutoMerge(

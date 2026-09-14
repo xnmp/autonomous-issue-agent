@@ -456,6 +456,7 @@ class AgentDispatcher:
                 action.number,
                 issue,
                 claim_target=claim_target,
+                workflow=action.workflow,
             )
         try:
             await handler(action.number)

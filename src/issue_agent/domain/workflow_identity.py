@@ -1,0 +1,125 @@
+"""Stable workflow identities, independent of command and episode payloads."""
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import Literal
+
+from .repository import canonical_repository, repository_validation_error
+
+
+def validate_workflow_integer(value: int, name: str, *, minimum: int = 0) -> None:
+    if type(value) is not int or not minimum <= value <= 2**63 - 1:
+        raise ValueError(f"{name} must be an integer in [{minimum}, 2**63 - 1]")
+
+
+def validate_workflow_identifier(value: str, name: str) -> None:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > 512
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise ValueError(f"{name} must be a nonempty bounded identifier")
+
+
+def _repository(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("workflow repository must be a string")
+    repository = canonical_repository(value)
+    if repository.count("/") != 1 or repository_validation_error(repository):
+        raise ValueError("workflow repository must be a canonical owner/name slug")
+    return repository
+
+
+@dataclass(frozen=True)
+class IssueRef:
+    number: int
+
+    def __post_init__(self) -> None:
+        validate_workflow_integer(self.number, "issue number", minimum=1)
+
+
+@dataclass(frozen=True)
+class PullRequestRef:
+    number: int
+
+    def __post_init__(self) -> None:
+        validate_workflow_integer(self.number, "pull request number", minimum=1)
+
+
+WorkflowTarget = IssueRef | PullRequestRef
+
+
+@dataclass(frozen=True)
+class WorkflowKey:
+    repository: str
+    target: WorkflowTarget
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "repository", _repository(self.repository))
+        if not isinstance(self.target, (IssueRef, PullRequestRef)):
+            raise ValueError("workflow target must be an issue or pull request identity")
+
+
+class WorkflowFamily(str, Enum):
+    RESOLVE = "resolve"
+
+
+@dataclass(frozen=True)
+class WorkflowFence:
+    key: WorkflowKey
+    generation: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.key, WorkflowKey):
+            raise ValueError("workflow fence requires a validated workflow key")
+        validate_workflow_integer(self.generation, "workflow generation")
+
+
+@dataclass(frozen=True)
+class FamilyAuthority:
+    family: WorkflowFamily
+    epoch: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.family, WorkflowFamily):
+            raise ValueError("workflow family must be a recognized variant")
+        validate_workflow_integer(self.epoch, "family authority epoch", minimum=1)
+
+
+@dataclass(frozen=True)
+class WorkflowRevision:
+    fence: WorkflowFence
+    version: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.fence, WorkflowFence):
+            raise ValueError("workflow revision requires a validated fence")
+        validate_workflow_integer(self.version, "workflow version")
+
+
+@dataclass(frozen=True)
+class WorkflowBinding:
+    fence: WorkflowFence
+    authority: FamilyAuthority
+    episode_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.fence, WorkflowFence) or not isinstance(self.authority, FamilyAuthority):
+            raise ValueError("workflow binding requires a validated fence and authority")
+        if self.authority.family is WorkflowFamily.RESOLVE and not isinstance(self.fence.key.target, IssueRef):
+            raise ValueError("resolve episodes belong to issues, not pull requests")
+        validate_workflow_identifier(self.episode_id, "workflow episode")
+
+
+@dataclass(frozen=True)
+class WorkflowWriter:
+    repository: str
+    role: Literal["fix", "review", "steward"]
+    owner_id: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "repository", _repository(self.repository))
+        if self.role not in ("fix", "review", "steward"):
+            raise ValueError("workflow writer requires a deployment role")
+        validate_workflow_identifier(self.owner_id, "workflow writer owner")
